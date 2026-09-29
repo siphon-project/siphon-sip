@@ -829,6 +829,36 @@ class _RtpEngineNamespace:
             return decorator(func_or_none)
         return decorator
 
+    def on_media_started(self, func_or_none=None, *, call_id=None, from_tag=None):
+        """Register a handler for media-started events.
+
+        Fires when the first packet on one of a call's engine legs clears the
+        engine's source gate: media is flowing toward the engine on that leg.
+        Once per leg, and not again on a re-latch or a re-offer.
+
+        ``leg`` is ``"near"`` (the offerer's side) or ``"far"`` (the
+        answerer's). ``source`` is the latched ``"ip:port"`` and ``signalled``
+        the one the SDP gave; they differ behind a NAT, and either is ``None``
+        when the engine did not report it. siphon-rtp backend only.
+
+        Usage:
+            @rtpengine.on_media_started
+            def handle_any(call_id, from_tag, to_tag, leg, source, signalled):
+                ...
+
+            @rtpengine.on_media_started(call_id="abc")
+            def handle_specific(call_id, from_tag, to_tag, leg, source, signalled):
+                ...
+        """
+        def decorator(fn):
+            is_async = _asyncio.iscoroutinefunction(fn)
+            metadata = {"call_id": call_id, "from_tag": from_tag}
+            _registry.register("rtpengine.on_media_started", None, fn, is_async, metadata)
+            return fn
+        if func_or_none is not None:
+            return decorator(func_or_none)
+        return decorator
+
     def on_ws_tee_started(self, func_or_none=None, *, call_id=None, from_tag=None):
         """Register a handler for WebSocket tee started events.
 

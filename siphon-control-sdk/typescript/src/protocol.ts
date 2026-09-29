@@ -248,6 +248,7 @@ export type SipEventKind =
   | "WsBridgeStarted"
   | "WsBridgeEnded"
   | "MediaSummary"
+  | "MediaStarted"
   | "DialBranch"
   | "DialBranchFailed"
   | "DialAnswered"
@@ -731,6 +732,33 @@ export interface MediaLegSummary {
   remote_address?: string;
   egress_ssrc?: number;
   payload_type?: number;
+  /**
+   * When this party's first packet reached the engine, as Unix milliseconds.
+   * Absent for a leg that never carried media.
+   */
+  media_started_at_unix_ms?: number;
+}
+
+/**
+ * The `payload` of a `MediaStarted` event: the first packet on one of the
+ * channel's media legs reached the media engine. Once per leg, not again on a
+ * re-latch or re-INVITE; on a bridged pair each leg's report goes to that
+ * leg's channel only.
+ */
+export interface MediaStartedPayload {
+  /**
+   * `near` (facing the offerer, `from_tag`) or `far` (facing the answerer,
+   * `to_tag`). The engine leg, not a party.
+   */
+  leg: "near" | "far";
+  from_tag: string;
+  to_tag?: string;
+  /** Where the first packet came from (`ip:port`), when latched. */
+  source?: string;
+  /** The address the SDP signalled for this leg (`ip:port`). */
+  signalled?: string;
+  /** `source` differs from `signalled`: a NAT. Absent unless both are known. */
+  nat_rewritten?: boolean;
 }
 
 /**

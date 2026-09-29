@@ -2,80 +2,6 @@
 //! the inbound `Replaces` bridge, and completing or failing either.
 use crate::dispatcher::*;
 
-/// Execute an accepted REFER transfer (`accept_refer()`), in the resolved mode.
-///
-/// rtpengine `offer` for a siphon-terminated transfer (Phase 1): anchor the
-/// survivor's media (`survivor_sdp`, offered under `survivor_tag`) on the FRESH
-/// rtpengine call-id `cid_new` using `profile_name`'s offer flags, and return
-/// the SDP to place in the transfer target's INVITE. `None` if media control is
-/// not configured or the offer failed (the caller then dials with the survivor's
-/// raw SDP). Awaited with the same `block_in_place` idiom as the bridged
-/// re-INVITE path.
-pub fn b2bua_transfer_rtpengine_offer(
-    state: &DispatcherState,
-    cid_new: &str,
-    survivor_tag: &str,
-    survivor_sdp: &[u8],
-    profile_name: &str,
-) -> Option<Vec<u8>> {
-    let backend = state.rtpengine_set.as_ref()?;
-    let profiles = state.rtpengine_profiles.as_ref()?;
-    let profile = profiles.get(profile_name)?;
-    let offer_flags = profile.offer.clone();
-    match tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(backend.offer(
-            cid_new,
-            survivor_tag,
-            survivor_sdp,
-            &offer_flags,
-        ))
-    }) {
-        Ok(rewritten) => Some(rewritten),
-        Err(error) => {
-            warn!(rtpengine_call_id = %cid_new, "REFER terminate: rtpengine offer failed: {error}");
-            None
-        }
-    }
-}
-
-/// rtpengine `answer` for a siphon-terminated transfer (Phase 2): complete the
-/// survivor↔target media on the fresh rtpengine call-id `cid_new` with the
-/// target's answer SDP (`target_sdp`, under `target_tag`) against the offerer
-/// (`survivor_tag`), and return the SDP to re-INVITE the survivor with. `None`
-/// if media control is not configured or the answer failed.
-///
-/// It also completes an anchored delayed offer with the caller's answer
-/// (`send_delayed_offer_ack`): the offerer is then the callee, and the answer the
-/// caller's.
-pub fn b2bua_transfer_rtpengine_answer(
-    state: &DispatcherState,
-    cid_new: &str,
-    survivor_tag: &str,
-    target_tag: &str,
-    target_sdp: &[u8],
-    profile_name: &str,
-) -> Option<Vec<u8>> {
-    let backend = state.rtpengine_set.as_ref()?;
-    let profiles = state.rtpengine_profiles.as_ref()?;
-    let profile = profiles.get(profile_name)?;
-    let answer_flags = profile.answer.clone();
-    match tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(backend.answer(
-            cid_new,
-            survivor_tag,
-            target_tag,
-            target_sdp,
-            &answer_flags,
-        ))
-    }) {
-        Ok(rewritten) => Some(rewritten),
-        Err(error) => {
-            warn!(rtpengine_call_id = %cid_new, "rtpengine answer failed: {error}");
-            None
-        }
-    }
-}
-
 /// Hand an existing call's dialog over to the party that sent an INVITE with
 /// `Replaces` (RFC 3891 §3 / RFC 5589 §7 attended transfer).
 ///
@@ -222,6 +148,7 @@ pub fn b2bua_bridge_inbound_replaces(
                 &cid_new,
                 &new_tag,
                 &invite.body,
+                &cid_new,
                 &session.profile,
             );
             let to_new_party = b2bua_transfer_rtpengine_answer(
@@ -230,6 +157,7 @@ pub fn b2bua_bridge_inbound_replaces(
                 &new_tag,
                 &survivor_tag,
                 &survivor_sdp,
+                &survivor.dialog.call_id,
                 &session.profile,
             );
             match (to_survivor, to_new_party) {
@@ -736,6 +664,10 @@ pub fn b2bua_start_leg_replacement(
         .as_ref()
         .and_then(|leg| leg.dialog.remote_tag.clone());
     let survivor_sdp = survivor.as_ref().and_then(|leg| leg.last_sdp.clone());
+    let survivor_sip_call_id = survivor
+        .as_ref()
+        .map(|leg| leg.dialog.call_id.clone())
+        .unwrap_or_default();
 
     // If the call is media-anchored, re-anchor the survivor on a FRESH
     // rtpengine call-id so the survivor↔target media stays on the anchor;
@@ -789,7 +721,14 @@ pub fn b2bua_start_leg_replacement(
         (Some(profile), Some(sdp), Some(tag)) => {
             // Anchored: rtpengine-offer the survivor's media on the
             // fresh call-id → the SDP to put in the target's INVITE.
-            match b2bua_transfer_rtpengine_offer(state, &fresh_cid, tag, sdp, profile) {
+            match b2bua_transfer_rtpengine_offer(
+                state,
+                &fresh_cid,
+                tag,
+                sdp,
+                &survivor_sip_call_id,
+                profile,
+            ) {
                 Some(anchored) => (Some(anchored), Some(fresh_cid.as_str())),
                 None => {
                     warn!(call_id = %call_id, "leg replacement: rtpengine offer for the target failed — falling back to raw survivor SDP");
@@ -1222,6 +1161,7 @@ pub fn b2bua_complete_terminated_transfer(
                     surv_tag,
                     tgt_tag,
                     &response.body,
+                    response.headers.call_id().map_or("", String::as_str),
                     // The pairing the transfer created, not the one the call
                     // started as — see `accept_refer(profile=…)`.
                     transfer_profile.as_deref().unwrap_or(&old_session.profile),

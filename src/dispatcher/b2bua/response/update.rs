@@ -160,6 +160,9 @@ pub fn forward_update_response(
                         if let Some((answer_from, answer_to)) = session.answer_tags(is_a2b) {
                             let mut answer_flags = profile.answer.clone();
                             answer_flags.stamp_received_from(response_source.ip());
+                            if let Some(responder_call_id) = responder_headers.call_id() {
+                                answer_flags.stamp_sip_call_id(responder_call_id);
+                            }
                             match tokio::task::block_in_place(|| {
                                 tokio::runtime::Handle::current().block_on(rtpengine_set.answer(
                                     session.rtpengine_id(),

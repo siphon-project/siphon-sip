@@ -51,6 +51,10 @@ pub(super) struct AnswerExchange {
     sdp: Vec<u8>,
     /// The call-id the engine knows the call by: see [`engine_call_id`].
     engine_call_id: String,
+    /// The Call-ID of the reply whose SDP this is: the answering party's own
+    /// dialog, which on a B2BUA is not the INVITE's. `None` in raw mode, where
+    /// the far side is not a SIP dialog.
+    pub(super) answerer_sip_call_id: Option<String>,
 }
 
 impl AnswerExchange {
@@ -87,6 +91,7 @@ impl AnswerExchange {
                     // caller's address would gate the far side's media to it.
                     source_ip: None,
                     delayed_offer: false,
+                    answerer_sip_call_id: None,
                 })
             }
             None => {
@@ -108,24 +113,26 @@ impl AnswerExchange {
                         .ok()
                         .and_then(|py_reply| py_reply.borrow().a_leg_message()),
                 };
-                let (call_id, from_tag, to_tag, sdp, delayed_offer) = match &a_leg_message {
-                    Some(a_leg) => {
-                        // Only the INVITE's identifiers: on a delayed offer it has no
-                        // SDP, and that is what makes the reply's SDP the offer.
-                        let (call_id, from_tag, delayed_offer) = {
-                            let invite = lock_message(a_leg)?;
-                            let (call_id, from_tag) = dialog_ids(&invite)?;
-                            (call_id, from_tag, invite.body.is_empty())
-                        };
-                        let (_reply_call_id, _reply_from_tag, to_tag, sdp) =
-                            extract_answer_params(&message)?;
-                        (call_id, from_tag, to_tag, sdp, delayed_offer)
-                    }
-                    None => {
-                        let (call_id, from_tag, to_tag, sdp) = extract_answer_params(&message)?;
-                        (call_id, from_tag, to_tag, sdp, false)
-                    }
-                };
+                let (call_id, from_tag, to_tag, sdp, delayed_offer, reply_call_id) =
+                    match &a_leg_message {
+                        Some(a_leg) => {
+                            // Only the INVITE's identifiers: on a delayed offer it has no
+                            // SDP, and that is what makes the reply's SDP the offer.
+                            let (call_id, from_tag, delayed_offer) = {
+                                let invite = lock_message(a_leg)?;
+                                let (call_id, from_tag) = dialog_ids(&invite)?;
+                                (call_id, from_tag, invite.body.is_empty())
+                            };
+                            let (reply_call_id, _reply_from_tag, to_tag, sdp) =
+                                extract_answer_params(&message)?;
+                            (call_id, from_tag, to_tag, sdp, delayed_offer, reply_call_id)
+                        }
+                        None => {
+                            let (call_id, from_tag, to_tag, sdp) = extract_answer_params(&message)?;
+                            let reply_call_id = call_id.clone();
+                            (call_id, from_tag, to_tag, sdp, false, reply_call_id)
+                        }
+                    };
                 Ok(Self {
                     engine_call_id: engine_call_id(sessions, &call_id),
                     call_id,
@@ -138,6 +145,7 @@ impl AnswerExchange {
                     // passed `call=`, that object does.
                     source_ip: call.and_then(|object| extract_source_ip(object)),
                     delayed_offer,
+                    answerer_sip_call_id: Some(reply_call_id),
                 })
             }
         }
@@ -433,6 +441,7 @@ mod tests {
             to_tag: "callee-tag".to_string(),
             sdp: CALLEE_SDP.as_bytes().to_vec(),
             engine_call_id: ANCHORED_CALL_ID.to_string(),
+            answerer_sip_call_id: None,
         }
     }
 
@@ -569,6 +578,10 @@ mod tests {
             assert!(exchange.body.is_none());
             assert!(exchange.source_ip.is_none());
             assert!(!exchange.delayed_offer, "a raw SDP answers an offer");
+            assert!(
+                exchange.answerer_sip_call_id.is_none(),
+                "a raw far side is no SIP dialog"
+            );
         });
     }
 
@@ -615,6 +628,8 @@ mod tests {
             assert!(!exchange.delayed_offer);
             assert_eq!(exchange.call_id, "a-leg-call");
             assert_eq!(exchange.to_tag, "tag-b");
+            // The answer is the callee's, on the callee's own dialog.
+            assert_eq!(exchange.answerer_sip_call_id.as_deref(), Some("b-leg-call"));
         });
     }
 

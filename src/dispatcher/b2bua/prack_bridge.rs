@@ -738,6 +738,7 @@ pub(super) fn anchored_caller_offer(
     };
     let mut flags = profile.offer.clone();
     flags.stamp_received_from(inbound.remote_addr.ip());
+    flags.stamp_sip_call_id_of(caller_prack);
     match tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current().block_on(backend.reoffer(
             session.rtpengine_id(),
@@ -787,6 +788,7 @@ fn anchored_answer_to_caller_offer(
     };
     let mut flags = profile.answer.clone();
     flags.stamp_received_from(source.ip());
+    flags.stamp_sip_call_id_of(response);
     match tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current().block_on(backend.answer(
             session.rtpengine_id(),

@@ -223,6 +223,54 @@ async fn a_bridged_phone_is_offered_what_its_own_profile_describes() {
     assert_drained(state);
 }
 
+/// Every command the pair's media takes names the dialog whose SDP it carries:
+/// the phone's pickup and its answer under the phone's Call-ID, the bridge's
+/// offer (the caller's SDP) under the caller's, though all but the pickup run
+/// on an engine call-id of the pair's own.
+#[tokio::test(flavor = "multi_thread")]
+async fn each_engine_command_names_the_dialog_whose_sdp_it_carries() {
+    const PHONE: &str = "198.51.100.163:5060";
+    let contact = format!("sip:bm3603@{PHONE}");
+    let engine = NativeTestEngine::start().await;
+    let dispatcher = bridging_dispatcher(&engine);
+    let caller = answered_caller(&dispatcher, "media-callid@192.0.2.10");
+    let controller = controller_owning("media-callid", dispatcher, &caller, "callid", "hangup");
+    let state = &controller.dispatcher.state;
+    let udp = &controller.dispatcher.udp;
+    let (reply, _) = dial(
+        &controller,
+        "callid",
+        serde_json::json!({ "targets": [contact], "on_answer": "bridge" }),
+    )
+    .await;
+    assert_eq!(reply["status"], "ok", "{reply}");
+    let invite = invite_to(&drain(udp), PHONE);
+    let phone_call_id = invite.headers.call_id().cloned().expect("a Call-ID");
+    phone_answers(state, PHONE, &invite, &contact);
+    let offer = bridge_offer_to(udp, PHONE).await;
+    accepts(state, PHONE, &offer, &contact);
+    caller_accepts(state, udp, &caller).await;
+
+    let pickup = last(&engine, "answer_local");
+    assert_eq!(pickup.sip_call_id.as_deref(), Some(phone_call_id.as_str()));
+    let engine_offer = last(&engine, "offer");
+    assert_ne!(
+        engine_offer.call_id, caller.call_id,
+        "the pair's own call-id"
+    );
+    assert_eq!(
+        engine_offer.sip_call_id.as_deref(),
+        Some(caller.call_id.as_str())
+    );
+    let engine_answer = last(&engine, "answer");
+    assert_eq!(
+        engine_answer.sip_call_id.as_deref(),
+        Some(phone_call_id.as_str())
+    );
+    assert!(eventually(|| state.dial_bridges.ringing_count() == 0).await);
+    assert_drained(state);
+}
+
 /// A profile that does not ask for `received_from` sends none, on either
 /// command — the positive control for the test above.
 #[tokio::test(flavor = "multi_thread")]

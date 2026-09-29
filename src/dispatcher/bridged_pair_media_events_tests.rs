@@ -20,8 +20,9 @@ use super::dial_bridge_test_harness::{
 use super::originate_test_harness::drain;
 use super::*;
 use crate::rtpengine::events::{
-    CallSummary, DtmfEvent, PlayEndReason, PlayFinishedEvent, RecordingFinished, WsBridgeEndReason,
-    WsBridgeEnded, WsBridgeStarted, WsTeeEndReason, WsTeeEnded, WsTeeStarted,
+    CallSummary, DtmfEvent, MediaLeg, MediaStartedEvent, PlayEndReason, PlayFinishedEvent,
+    RecordingFinished, WsBridgeEndReason, WsBridgeEnded, WsBridgeStarted, WsTeeEndReason,
+    WsTeeEnded, WsTeeStarted,
 };
 use crate::rtpengine::profile::WsTeeDirection;
 use crate::rtpengine::test_native_engine::NativeTestEngine;
@@ -245,6 +246,51 @@ async fn per_party_media_events_on_a_pair_reach_the_leg_they_name() {
             "WsBridgeEnded"
         ]
     );
+}
+
+/// Media starting on the pair's engine call reaches the leg it started on: the
+/// near leg faces the caller (the pair's offerer), the far leg the phone. The
+/// event carries both tags whichever leg it is about, so the leg picks the
+/// party, and each report reaches one channel only.
+#[tokio::test(flavor = "multi_thread")]
+async fn media_started_on_a_pair_reaches_the_leg_it_started_on() {
+    let pair = formed_pair("pair-started", "198.51.100.195:5060").await;
+    let _ = pair.published();
+    let started = |leg| MediaStartedEvent {
+        call_id: pair.engine_call_id.clone(),
+        from_tag: pair.caller_tag.clone(),
+        to_tag: Some(pair.phone_tag.clone()),
+        leg,
+        source: Some("203.0.113.7:40000".parse().expect("an address")),
+        signalled: Some("192.0.2.10:4000".parse().expect("an address")),
+    };
+
+    publish_media_started(pair.state(), &started(MediaLeg::Far));
+    let (caller, phone) = pair.published();
+    assert!(
+        caller.is_empty(),
+        "the caller's leg did not start: {caller:?}"
+    );
+    assert_eq!(names(&phone), ["MediaStarted"]);
+    assert_eq!(phone[0].1["leg"], "far");
+    assert_eq!(phone[0].1["nat_rewritten"], true);
+
+    publish_media_started(pair.state(), &started(MediaLeg::Near));
+    let (caller, phone) = pair.published();
+    assert_eq!(names(&caller), ["MediaStarted"]);
+    assert_eq!(caller[0].1["leg"], "near");
+    assert!(phone.is_empty(), "{phone:?}");
+
+    // A far leg with no answerer tag names no party of the pair.
+    publish_media_started(
+        pair.state(),
+        &MediaStartedEvent {
+            to_tag: None,
+            ..started(MediaLeg::Far)
+        },
+    );
+    let (caller, phone) = pair.published();
+    assert!(caller.is_empty() && phone.is_empty());
 }
 
 /// The engine reaping the pair on media timeout clears the entry the pair is

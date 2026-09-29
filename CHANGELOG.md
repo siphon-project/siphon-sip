@@ -15,6 +15,25 @@ entry, but a working config keeps working.
 
 ### Added
 
+- **`MediaStarted` when media starts flowing on a leg (siphon-rtp 0.10).** The
+  engine reports the first packet on each of a call's legs once, and siphon
+  publishes it to the controller that owns the call as `MediaStarted {leg,
+  from_tag, to_tag, source, signalled, nat_rewritten}`: `leg` is `near` or
+  `far`, `source` the address the engine latched, `signalled` the one in the
+  SDP, and `nat_rewritten` whether they differ. On a bridged pair each leg's
+  report goes to that leg's channel only. Scripts get it as
+  `@rtpengine.on_media_started(call_id, from_tag, to_tag, leg, source,
+  signalled)`. Each party's start time also lands in `MediaSummary` and the
+  media CDR as `media_started_at_unix_ms`, absent for a leg that never carried
+  media. Typed as `SipEvent::MediaStarted` / `MediaStartedPayload` in the Rust
+  proto crate and `MediaStartedPayload` in the TypeScript SDK.
+- **Each leg's SIP Call-ID reaches the media engine.** Every offer, answer,
+  re-offer and local answer names the Call-ID of the dialog whose SDP it
+  carries, so siphon-rtp files the HEP captures it exports for a leg (RTCP and
+  QoS reports) under that leg's own dialog. A B2BUA's two legs, a bridged pair
+  and a transfer re-anchor no longer correlate to an engine call-id no
+  collector knows. A Call-ID over 256 bytes is left off rather than failing the
+  offer.
 - **`MediaSummary` on the control rail.** The media engine's summary of a
   session it ended (per-leg packet and byte counters, loss, jitter, RTT and
   MOS where measured) is now published to the controller that owns the call,

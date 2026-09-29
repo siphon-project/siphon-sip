@@ -26,7 +26,7 @@ src/server/mod.rs            2627  # run_async is one 2,214-line fn; decomposed 
 # A large share of each is `///` docstrings, which are the SDK's LLM context and
 # are load-bearing rather than padding.
 src/script/api/diameter.rs   3560  # single #[pymethods] block; kwargs marshalling per interface. +110 for making all 19 methods awaitable: each grows the owned-argument prep a future needs plus the Python::attach that rebuilds its dict on the way out, and the no-peer arm becomes a resolved coroutine; +76 for the per-method note saying so, which is the docstring a script author and the SDK both read; +12 for the located-node keys s6c_srr now returns and the destination_host/realm kwargs that address the SGd MT-Forward at that node
-src/script/api/rtpengine.rs  2800  # same; profile-precedence extraction scheduled post-1.9.0
+src/script/api/rtpengine.rs  2650  # same; profile-precedence extraction scheduled post-1.9.0. The nine media-event decorators now share one builder in rtpengine/decorators.rs, which took the file under the previous 2800 budget, so this lowers it
 src/script/api/call.rs       2600  # same; ~40% docstrings
 src/script/api/request.rs    2091  # same; +43 for the client-transport accessors and their docs; +11 for the reply gate the dispatcher attaches to a SUBSCRIBE (one field plus a setter and a crate-visible getter), which is what lets subscribe_state hold a NOTIFY behind the 200 that accepted it; +80 for the R-URI write surface (set_ruri, the ruri assignment setter, and validated set_ruri_user/set_ruri_host) routing every write through one check, so a script cannot emit a malformed R-URI such as an unbracketed IPv6 host — mostly the docstrings the SDK mirrors
 src/script/api/registrar.rs  1520  # same; PyContact/PyFlow views + the save/save_proxy capture
@@ -35,5 +35,5 @@ src/script/api/auth.rs       2530  # UAS digest authenticator moves to src/auth/
 # ── Cohesive today, split when next touched ─────────────────────────────────
 src/b2bua/actor/store.rs     1600  # one impl CallActorStore over one map; ~100 thin delegations
 src/registrar/mod.rs         2250  # one impl Registrar over one store; contact/store split when touched
-src/rtpengine/siphon_rtp.rs  2340  # one backend; client/set/events/connection split when touched — control identity + auth handshake now live in siphon_rtp/identity.rs, which took the file back under the previous 2410 budget, so this lowers it rather than leaving the headroom as a silent licence
+src/rtpengine/siphon_rtp.rs  1960  # one backend; client/set/events/connection split when touched — control identity + auth handshake now live in siphon_rtp/identity.rs, which took the file back under the previous 2410 budget, so this lowers it rather than leaving the headroom as a silent licence; the proto event mapping now lives in siphon_rtp/events.rs, lowered again to match
 src/ipsec/mod.rs             2100  # types + impl IpsecManager; manager.rs split when touched

@@ -834,6 +834,7 @@ pub fn anchored_answer(
         &session.from_tag,
         &caller_tag,
         &caller_ack.body,
+        caller_ack.headers.call_id().map_or("", String::as_str),
         &session.profile,
     ) {
         Some(answer) => {

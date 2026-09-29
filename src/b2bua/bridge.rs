@@ -436,6 +436,10 @@ pub enum MediaStep {
         /// profile's offer half carries `received_from`: the SDP in this offer
         /// is the anchor's.
         received_from: Option<IpAddr>,
+        /// The anchor's SIP Call-ID: the SDP in this offer is the anchor's, so
+        /// the engine files the offerer leg's captures under the anchor's dialog
+        /// rather than the pair's engine call-id.
+        sip_call_id: String,
     },
     /// Renegotiate the anchor leg's **live, relaying** session on the ports it
     /// already holds, yielding the SDP to offer the peer. Never a repeat
@@ -452,6 +456,8 @@ pub enum MediaStep {
         sdp: Vec<u8>,
         /// The anchor's signalling source, as for [`MediaStep::Offer`].
         received_from: Option<IpAddr>,
+        /// The anchor's SIP Call-ID, as for [`MediaStep::Offer`].
+        sip_call_id: String,
     },
 }
 
@@ -490,6 +496,8 @@ pub struct AnchorOffer<'a> {
     pub pair_profile: Option<&'a str>,
     /// The anchor's signalling source address.
     pub source: Option<IpAddr>,
+    /// The anchor's SIP Call-ID, the dialog the offered SDP belongs to.
+    pub sip_call_id: &'a str,
 }
 
 /// The ordered media work a bridge performs before it puts anything on the SIP
@@ -543,6 +551,7 @@ pub fn bridge_media_plan(
         let profile = bridge_offer_profile(anchor_offer.pair_profile, anchor, peer).to_string();
         let sdp = anchor_offer.sdp.to_vec();
         let received_from = anchor_offer.source;
+        let sip_call_id = anchor_offer.sip_call_id.to_string();
         steps.push(if anchor.relaying {
             MediaStep::Reoffer {
                 media_call_id: anchor.media_call_id.clone(),
@@ -550,6 +559,7 @@ pub fn bridge_media_plan(
                 profile,
                 sdp,
                 received_from,
+                sip_call_id,
             }
         } else {
             MediaStep::Offer {
@@ -558,6 +568,7 @@ pub fn bridge_media_plan(
                 profile,
                 sdp,
                 received_from,
+                sip_call_id,
             }
         });
     }
@@ -739,6 +750,7 @@ mod tests {
             sdp,
             pair_profile: None,
             source: None,
+            sip_call_id: "anchor-dialog@192.0.2.10",
         }
     }
 
@@ -827,12 +839,14 @@ mod tests {
                 profile,
                 sdp,
                 received_from,
+                sip_call_id,
             } => {
                 assert_eq!(media_call_id, "cid-a");
                 assert_eq!(from_tag, "tag-a");
                 assert_eq!(profile, "rtp_passthrough");
                 assert_eq!(sdp, b"v=0\r\no=- 1 1 IN IP4 192.0.2.1\r\n");
                 assert_eq!(*received_from, None);
+                assert_eq!(sip_call_id, "anchor-dialog@192.0.2.10");
             }
             other => panic!("expected Reoffer, got {other:?}"),
         }
@@ -851,9 +865,14 @@ mod tests {
             MediaStep::Offer {
                 media_call_id,
                 from_tag,
+                sip_call_id,
                 ..
             } => {
                 assert_eq!(media_call_id, "cid-fresh");
+                assert_eq!(
+                    sip_call_id, "anchor-dialog@192.0.2.10",
+                    "the pair's own call-id, the anchor's dialog"
+                );
                 assert_ne!(
                     media_call_id, "cid-a",
                     "the offer must not reuse the live id"
@@ -1157,6 +1176,7 @@ mod tests {
             profile: "rtp_passthrough".to_string(),
             sdp: b"v=0\r\n".to_vec(),
             received_from: None,
+            sip_call_id: "anchor-dialog@192.0.2.10".to_string(),
         };
         assert_eq!(
             classify_media_failure(&step, false, true, "backend cannot reoffer"),
@@ -1177,6 +1197,7 @@ mod tests {
             profile: "rtp_passthrough".to_string(),
             sdp: b"v=0\r\n".to_vec(),
             received_from: None,
+            sip_call_id: "anchor-dialog@192.0.2.10".to_string(),
         };
         assert_eq!(
             classify_media_failure(&offer, false, true, "backend cannot offer"),

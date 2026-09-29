@@ -215,6 +215,11 @@ class MediaLeg:
     """SSRC of the stream the engine *sent* this party (RFC 3550), when a
     userspace actor originated it. :attr:`ssrc` is the inbound counterpart."""
 
+    media_started_at_unix_ms: Optional[int] = None
+    """When this party's first packet cleared the engine's source gate, as Unix
+    milliseconds. ``None`` when none ever did: a leg that never carried media,
+    told apart from one that carried silence."""
+
     packets_in: int = 0
     bytes_in: int = 0
     packets_out: int = 0
@@ -282,6 +287,7 @@ class MediaLeg:
             local_address=get("local_address"),
             payload_type=_as_int(get("payload_type")),
             egress_ssrc=_as_int(get("egress_ssrc")),
+            media_started_at_unix_ms=_as_int(get("media_started_at_unix_ms")),
             packets_in=_as_int(get("packets_in")) or 0,
             bytes_in=_as_int(get("bytes_in")) or 0,
             packets_out=_as_int(get("packets_out")) or 0,

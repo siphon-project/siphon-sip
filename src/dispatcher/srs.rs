@@ -330,10 +330,12 @@ pub(super) fn handle_srs_invite(
                     let mut offer_flags = profile.offer.clone();
                     offer_flags.record_call = true;
                     offer_flags.record_path = Some(recording_dir_str.clone());
+                    offer_flags.stamp_sip_call_id(&call_id);
 
                     let mut answer_flags = profile.answer.clone();
                     answer_flags.record_call = true;
                     answer_flags.record_path = Some(recording_dir_str);
+                    answer_flags.stamp_sip_call_id(&call_id);
 
                     // Step 1: offer() with first m= line (caller stream).
                     let offer_result = rtpengine_set

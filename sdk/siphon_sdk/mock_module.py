@@ -3564,6 +3564,7 @@ class MockRtpEngine:
         self._ws_bridge_ended_handlers: list[dict[str, Any]] = []
         self._text_handlers: list[dict[str, Any]] = []
         self._beep_handlers: list[dict[str, Any]] = []
+        self._media_started_handlers: list[dict[str, Any]] = []
         self._play_overlay_id: Optional[int] = 1
         self.media_overrides: list[tuple[str, dict[str, Any]]] = []
         """``(operation, overrides)`` per offer/answer/answer_local.
@@ -4735,6 +4736,69 @@ class MockRtpEngine:
             fired += 1
         return fired
 
+    def on_media_started(self, func_or_none: Any = None, *,
+                         call_id: Optional[str] = None,
+                         from_tag: Optional[str] = None) -> Any:
+        """Register a handler for **media started** events.
+
+        Fires when the first packet on one of a call's engine legs clears the
+        engine's source gate, within about 20 ms of it arriving: media is
+        flowing toward the engine on that leg. Once per leg, so a two-party
+        call raises two, and not again on a re-latch or a re-offer.
+
+        ``leg`` is ``"near"`` (the offerer's side, ``from_tag``) or ``"far"``
+        (the answerer's, ``to_tag``). It names the engine leg rather than a
+        party: before an answer the far leg carries the callee's early media on
+        a relayed call. ``source`` is the ``"ip:port"`` the engine latched and
+        ``signalled`` the one the SDP gave; they differ behind a NAT. Either is
+        ``None`` when the engine did not report it.
+
+        Delivered by the native **siphon-rtp** backend only.
+
+        Usage::
+
+            @rtpengine.on_media_started
+            def flowing(call_id, from_tag, to_tag, leg, source, signalled):
+                if source and signalled and source != signalled:
+                    log.info(f"{call_id}: {leg} leg is behind a NAT ({source})")
+
+            @rtpengine.on_media_started(call_id="abc", from_tag="ftag1")
+            def flowing_specific(call_id, from_tag, to_tag, leg, source, signalled):
+                ...
+        """
+        def decorator(fn: Any) -> Any:
+            self._media_started_handlers.append({
+                "fn": fn,
+                "call_id": call_id,
+                "from_tag": from_tag,
+            })
+            return fn
+        if func_or_none is not None:
+            return decorator(func_or_none)
+        return decorator
+
+    def fire_media_started(self, call_id: str, from_tag: str,
+                           to_tag: Optional[str] = None,
+                           leg: str = "near",
+                           source: Optional[str] = None,
+                           signalled: Optional[str] = None) -> int:
+        """Test helper: fire a media-started event.  Returns the number of
+        handlers that matched (and were invoked).
+
+        ``leg`` must be ``"near"`` or ``"far"``, the only two the engine sends.
+        """
+        if leg not in ("near", "far"):
+            raise ValueError(f"leg must be 'near' or 'far', got {leg!r}")
+        fired = 0
+        for entry in self._media_started_handlers:
+            if entry["call_id"] is not None and entry["call_id"] != call_id:
+                continue
+            if entry["from_tag"] is not None and entry["from_tag"] != from_tag:
+                continue
+            entry["fn"](call_id, from_tag, to_tag, leg, source, signalled)
+            fired += 1
+        return fired
+
     def on_ws_tee_started(self, func_or_none: Any = None, *,
                           call_id: Optional[str] = None,
                           from_tag: Optional[str] = None) -> Any:
@@ -5038,6 +5102,7 @@ class MockRtpEngine:
         self._ws_bridge_ended_handlers.clear()
         self._text_handlers.clear()
         self._beep_handlers.clear()
+        self._media_started_handlers.clear()
         self._answer_local_no_codec = False
 
 

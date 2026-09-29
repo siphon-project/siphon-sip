@@ -462,6 +462,7 @@ pub fn handle_b2bua_reinvite(
                 &a_leg.dialog.call_id,
                 from_a_leg,
                 inbound.remote_addr.ip(),
+                &sip_call_id,
                 &forwarded.body,
             ) {
                 ReofferOutcome::NotAnchored => {}
@@ -762,6 +763,7 @@ pub fn answer_one_legged_reoffer(
     // Pin media ingress where this request actually came from, as the offer path
     // does: a handset that changed network re-offers from a new public address.
     answer_flags.stamp_received_from(inbound.remote_addr.ip());
+    answer_flags.stamp_sip_call_id_of(message);
 
     let answer_sdp = tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current().block_on(rtpengine_set.answer_local(
@@ -846,7 +848,9 @@ pub enum ReofferOutcome {
 
 /// Re-offer `offer`, from the caller when `from_a_leg` and else from the callee,
 /// through the media engine anchoring the call keyed by `a_leg_call_id`, with
-/// media ingress pinned to `received_from` where the profile asks for it.
+/// media ingress pinned to `received_from` where the profile asks for it and the
+/// offer filed under `offerer_sip_call_id`, the Call-ID of the offering party's
+/// own dialog.
 ///
 /// The offering party is named by its own tag: the engine resolves the
 /// re-offering party by tag and answers with the leg facing the other one, so the
@@ -856,6 +860,7 @@ pub fn reoffer_through_media_engine(
     a_leg_call_id: &str,
     from_a_leg: bool,
     received_from: std::net::IpAddr,
+    offerer_sip_call_id: &str,
     offer: &[u8],
 ) -> ReofferOutcome {
     let (Some(rtpengine_set), Some(media_sessions), Some(profiles)) = (
@@ -879,6 +884,7 @@ pub fn reoffer_through_media_engine(
     // offer does: a client that changed network re-offers from a new public
     // address, and the engine gates the leg on the last hint it was given.
     offer_flags.stamp_received_from(received_from);
+    offer_flags.stamp_sip_call_id(offerer_sip_call_id);
     match tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current().block_on(rtpengine_set.reoffer(
             session.rtpengine_id(),

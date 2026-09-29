@@ -545,8 +545,9 @@ From-tag, the answerer's To-tag): `packets_in`, `bytes_in`, `packets_out`,
 always, and, where the engine measured them, `codec`, `payload_type`, `ssrc`,
 `egress_ssrc`, `packets_lost`, `loss_percent`, `jitter_ms`, `rtt_ms`,
 `mos_average` / `mos_min` / `mos_max` with `mos_basis` (`full` or
-`loss+jitter`), `text` (RFC 4103 counters), `local_address` and
-`remote_address`. A figure the engine did not measure (a leg on the in-kernel
+`loss+jitter`), `text` (RFC 4103 counters), `local_address`,
+`remote_address` and `media_started_at_unix_ms` (when that party's first
+packet reached the engine). A figure the engine did not measure (a leg on the in-kernel
 relay, or one that never received media) is **absent**, not zero.
 
 When you see it:
@@ -584,8 +585,34 @@ channel is gone and any verb on it answers `not_found`. Nothing else crosses
 `RecordingFinished` the teardown itself causes finds no channel and is not
 delivered.
 
-A call no controller owns publishes nothing. There is no event for media
-*starting* on a leg: the engine reports none.
+A call no controller owns publishes nothing.
+
+### Media started
+
+When the first packet on one of a call's media legs clears the engine's source
+gate, siphon publishes `MediaStarted` on the channel of the party that leg
+faces (siphon-rtp only). The engine reports it within about 20 ms of the
+packet, once per leg: a two-party call raises two, and a re-latch or a
+re-INVITE raises none.
+
+```json
+{"leg": "far", "from_tag": "9fd3a1", "to_tag": "77c0be",
+ "source": "203.0.113.7:40000", "signalled": "192.0.2.10:4000",
+ "nat_rewritten": true}
+```
+
+`leg` is `near` (the leg facing the engine session's offerer, `from_tag`) or
+`far` (the answerer's, `to_tag`). It names the engine leg, not a party: before
+an answer the far leg carries the callee's early media. `source` is where the
+first packet came from and `signalled` where the SDP said it would;
+`nat_rewritten` says whether they differ, which is a NAT between the party and
+the engine. An address the engine did not report is absent, and so is
+`nat_rewritten` unless both are there.
+
+On a **bridged pair** both legs relay through one engine session: the near
+leg's report goes to the anchor's channel and the far leg's to the peer's,
+never to both. Each party's start time is also in `MediaSummary` and the media
+CDR as `media_started_at_unix_ms`, absent for a leg that never carried media.
 
 ### Application-level events
 

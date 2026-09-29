@@ -95,6 +95,9 @@ pub(crate) struct NativeCommand {
     pub(crate) transport_protocol: Option<String>,
     /// The profile's per-call `received_from` on the same four.
     pub(crate) received_from: Option<IpAddr>,
+    /// The profile's per-call `sip_call_id` on the same four: the Call-ID of
+    /// the dialog whose SDP the command carried.
+    pub(crate) sip_call_id: Option<String>,
     /// Whether the engine refused the command because it holds no such call.
     pub(crate) refused: bool,
 }
@@ -326,6 +329,10 @@ impl NativeTestEngine {
                                         .profile
                                         .as_ref()
                                         .and_then(|profile| profile.received_from),
+                                    sip_call_id: record
+                                        .profile
+                                        .as_ref()
+                                        .and_then(|profile| profile.sip_call_id.clone()),
                                     refused,
                                 });
                             }

@@ -241,6 +241,12 @@ pub(super) fn media_summary_to_cdr(
         if let Some(egress_ssrc) = leg.egress_ssrc {
             put("egress_ssrc", egress_ssrc.to_string());
         }
+        // When the party's first packet cleared the engine's source gate.
+        // Absent on a leg that never carried media, which is what tells it
+        // apart from one that carried silence.
+        if let Some(started_at) = leg.media_started_at_unix_ms {
+            put("media_started_at_unix_ms", started_at.to_string());
+        }
         put("packets_in", leg.packets_in.to_string());
         put("bytes_in", leg.bytes_in.to_string());
         put("packets_out", leg.packets_out.to_string());

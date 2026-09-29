@@ -205,6 +205,14 @@ pub enum HandlerKind {
         call_id: Option<String>,
         from_tag: Option<String>,
     },
+    /// `@rtpengine.on_media_started` — the first packet on one of a call's
+    /// engine legs cleared the source gate. Fires once per leg.
+    ///
+    /// ``call_id`` and ``from_tag`` are optional filters.
+    RtpEngineOnMediaStarted {
+        call_id: Option<String>,
+        from_tag: Option<String>,
+    },
     /// Open extension point for handler kinds owned by host extensions.
     /// The string is the registry key the extension wrote (e.g.
     /// `"audit.sink"`); siphon-core does not interpret it. Per-handler
@@ -1084,6 +1092,17 @@ fn extract_handlers(_python: Python<'_>, registry: &Bound<'_, PyAny>) -> Result<
                     .and_then(|v| v.extract().ok());
                 HandlerKind::RtpEngineOnBeep { call_id, from_tag }
             }
+            "rtpengine.on_media_started" => {
+                let call_id: Option<String> = metadata
+                    .as_ref()
+                    .and_then(|meta| meta.get_item("call_id").ok())
+                    .and_then(|v| v.extract().ok());
+                let from_tag: Option<String> = metadata
+                    .as_ref()
+                    .and_then(|meta| meta.get_item("from_tag").ok())
+                    .and_then(|v| v.extract().ok());
+                HandlerKind::RtpEngineOnMediaStarted { call_id, from_tag }
+            }
             "rtpengine.on_ws_tee_ended" => {
                 let call_id: Option<String> = metadata
                     .as_ref()
@@ -1950,6 +1969,40 @@ async def specific_text(call_id, from_tag, to_tag, text, direction):
                 )
             })
             .expect("filtered text handler registered");
+        assert!(specific.is_async);
+    }
+
+    #[test]
+    fn rtpengine_on_media_started_decorator_registers_and_filters() {
+        let source = r#"
+from siphon import rtpengine
+
+@rtpengine.on_media_started
+def any_start(call_id, from_tag, to_tag, leg, source, signalled):
+    pass
+
+@rtpengine.on_media_started(call_id="abc", from_tag="ftag1")
+async def specific_start(call_id, from_tag, to_tag, leg, source, signalled):
+    pass
+"#;
+        let state = compile_temp_script(source).unwrap();
+        assert_eq!(state.handlers.len(), 2);
+        assert_eq!(state.media_started_handlers("xyz", "other").len(), 1);
+        assert_eq!(state.media_started_handlers("abc", "ftag1").len(), 2);
+        assert_eq!(state.media_started_handlers("abc", "wrong").len(), 1);
+        // Not picked up by the sibling hooks, and they are not picked up by it.
+        assert_eq!(state.beep_handlers("abc", "ftag1").len(), 0);
+        assert_eq!(state.dtmf_handlers("abc", "ftag1").len(), 0);
+        let specific = state
+            .handlers
+            .iter()
+            .find(|h| {
+                matches!(
+                    &h.kind,
+                    HandlerKind::RtpEngineOnMediaStarted { call_id: Some(c), .. } if c == "abc"
+                )
+            })
+            .expect("filtered media-started handler registered");
         assert!(specific.is_async);
     }
 

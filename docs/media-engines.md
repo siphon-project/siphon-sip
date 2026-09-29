@@ -227,6 +227,31 @@ Detection needs decoded audio, so like `noise_suppression` it promotes a
 same-codec plaintext call onto the userspace media pipeline, and it is inert on
 a codec whose native rate is neither 8 nor 16 kHz.
 
+### Media started
+
+The native engine reports the first packet on each of a call's legs, within
+about 20 ms of it arriving. `@rtpengine.on_media_started` hears it once per leg,
+never again on a re-latch or a re-offer:
+
+```python
+@rtpengine.on_media_started
+def flowing(call_id, from_tag, to_tag, leg, source, signalled):
+    if source and signalled and source != signalled:
+        log.info(f"{call_id}: {leg} leg is behind a NAT ({source})")
+```
+
+`leg` is `"near"` (the offerer's side) or `"far"` (the answerer's). `source` is
+the address the engine latched and `signalled` the one in the SDP, each
+`"ip:port"` or `None`. The same report reaches a controller as `MediaStarted`,
+and each party's start time lands in the media CDR as
+`{near,far}_media_started_at_unix_ms`.
+
+siphon names each leg's SIP Call-ID to the engine on the offer and the answer,
+so the HEP captures the engine exports for a leg (its RTCP and QoS reports) are
+filed under that leg's own dialog. That matters on a B2BUA, whose two legs are
+two dialogs, and on a bridged pair or a transfer, which run on an engine call-id
+of their own.
+
 ---
 
 ## Prompts, tones and overlays

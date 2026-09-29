@@ -58,6 +58,7 @@ pub fn originate_anchor_2xx(
         );
     }
     flags.stamp_received_from(response_source.ip());
+    flags.stamp_sip_call_id(sip_call_id);
     let unsupported = backend.unsupported_flags(&flags);
     if !unsupported.is_empty() {
         return Err(format!(

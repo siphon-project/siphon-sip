@@ -62,6 +62,9 @@ pub fn spawn_rtpengine_events(
                     crate::rtpengine::events::RtpEngineEvent::X3Ended(ended) => {
                         on_x3_ended(&state_for_events, ended).await;
                     }
+                    crate::rtpengine::events::RtpEngineEvent::MediaStarted(started) => {
+                        on_media_started(&state_for_events, started).await;
+                    }
                     crate::rtpengine::events::RtpEngineEvent::Unknown {
                         event, call_id, ..
                     } => {
@@ -768,6 +771,67 @@ async fn on_beep_detected(
                         tracing::error!(
                             %error,
                             "rtpengine.on_beep handler failed"
+                        );
+                    }
+                }
+            }
+        });
+    })
+    .await;
+}
+
+/// Media started flowing on one engine leg: `MediaStarted` to the channel of
+/// the party the leg faces, then the `@rtpengine.on_media_started` handlers.
+async fn on_media_started(
+    state: &Arc<DispatcherState>,
+    started: crate::rtpengine::events::MediaStartedEvent,
+) {
+    tracing::debug!(
+        call_id = %started.call_id,
+        from_tag = %started.from_tag,
+        leg = started.leg.as_str(),
+        source = ?started.source,
+        signalled = ?started.signalled,
+        "media engine saw media start on a leg"
+    );
+    publish_media_started(state, &started);
+    let engine_state = state.engine.state();
+    let handlers = engine_state.media_started_handlers(&started.call_id, &started.from_tag);
+    if handlers.is_empty() {
+        return;
+    }
+    let state_ref = Arc::clone(state);
+    run_event_handler("rtpengine.on_media_started", move || {
+        let engine_state = state_ref.engine.state();
+        let handlers = engine_state.media_started_handlers(&started.call_id, &started.from_tag);
+        let source = started.source.map(|address| address.to_string());
+        let signalled = started.signalled.map(|address| address.to_string());
+        pyo3::Python::attach(|python| {
+            for handler in handlers {
+                let callable = handler.callable.bind(python);
+                let result = callable.call1((
+                    started.call_id.as_str(),
+                    started.from_tag.as_str(),
+                    started.to_tag.as_deref(),
+                    started.leg.as_str(),
+                    source.as_deref(),
+                    signalled.as_deref(),
+                ));
+                match result {
+                    Ok(ret) => {
+                        if handler.is_async {
+                            if let Err(error) = run_coroutine(python, &ret) {
+                                tracing::error!(
+                                    %error,
+                                    "async rtpengine.on_media_started handler error"
+                                );
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        tracing::error!(
+                            %error,
+                            "rtpengine.on_media_started handler failed"
                         );
                     }
                 }
