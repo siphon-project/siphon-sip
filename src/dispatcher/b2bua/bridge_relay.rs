@@ -56,6 +56,10 @@ struct RelayMedia {
     sender_side: crate::rtpengine::session::SideFlags,
     /// What shapes SDP the engine sends the receiver.
     receiver_side: crate::rtpengine::session::SideFlags,
+    /// The sender's SIP Call-ID: the dialog the re-offered SDP belongs to.
+    sender_sip_call_id: String,
+    /// The receiver's SIP Call-ID: the dialog the answer belongs to.
+    receiver_sip_call_id: String,
 }
 
 /// A relay in flight: the sender's request waits for the receiver's answer.
@@ -311,14 +315,17 @@ fn relay_media(
         return Ok(None);
     };
     let from_anchor = context.role == BridgeRole::Anchor;
+    // The sending leg's own dialog, and the other leg's as its bridge names it.
+    let sender_sip_call_id = state
+        .call_actors
+        .get_call(call_id)
+        .map(|call| call.a_leg.dialog.call_id.clone())
+        .ok_or("the leg is gone")?;
+    let receiver_sip_call_id = context.peer_sip_call_id.clone();
     let anchor_key = if from_anchor {
-        state
-            .call_actors
-            .get_call(call_id)
-            .map(|call| call.a_leg.dialog.call_id.clone())
-            .ok_or("the leg is gone")?
+        sender_sip_call_id.clone()
     } else {
-        context.peer_sip_call_id.clone()
+        receiver_sip_call_id.clone()
     };
     let session = state
         .rtpengine_sessions
@@ -347,6 +354,8 @@ fn relay_media(
             receiver_tag: peer_tag,
             sender_side: sides.anchor,
             receiver_side: sides.peer,
+            sender_sip_call_id,
+            receiver_sip_call_id,
         }
     } else {
         RelayMedia {
@@ -355,15 +364,19 @@ fn relay_media(
             receiver_tag: anchor_tag,
             sender_side: sides.peer,
             receiver_side: sides.anchor,
+            sender_sip_call_id,
+            receiver_sip_call_id,
         }
     }))
 }
 
-/// `flags` resolved, with `received_from` stamped where they ask for it.
+/// `flags` resolved, with `received_from` stamped where they ask for it and
+/// the Call-ID of the dialog whose SDP the command carries.
 fn side_flags(
     state: &DispatcherState,
     side: &crate::rtpengine::session::SideFlags,
     source: std::net::IpAddr,
+    sip_call_id: &str,
 ) -> Result<crate::rtpengine::profile::NgFlags, String> {
     let mut flags = state
         .rtpengine_profiles
@@ -371,6 +384,7 @@ fn side_flags(
         .and_then(|registry| side.resolve(registry))
         .ok_or_else(|| format!("unknown media profile '{}'", side.profile))?;
     flags.stamp_received_from(source);
+    flags.stamp_sip_call_id(sip_call_id);
     Ok(flags)
 }
 
@@ -386,7 +400,7 @@ fn reoffer(
         .rtpengine_set
         .as_ref()
         .ok_or("no media backend is configured")?;
-    let flags = side_flags(state, toward, sender_source)?;
+    let flags = side_flags(state, toward, sender_source, &media.sender_sip_call_id)?;
     tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current().block_on(backend.reoffer(
             &media.media_call_id,
@@ -409,7 +423,12 @@ fn answer(
         .rtpengine_set
         .as_ref()
         .ok_or("no media backend is configured")?;
-    let flags = side_flags(state, &media.sender_side, receiver_source)?;
+    let flags = side_flags(
+        state,
+        &media.sender_side,
+        receiver_source,
+        &media.receiver_sip_call_id,
+    )?;
     tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current().block_on(backend.answer(
             &media.media_call_id,

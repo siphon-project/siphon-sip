@@ -211,6 +211,7 @@ pub async fn bridge_run_media_step(
             profile,
             sdp,
             received_from,
+            sip_call_id,
         }
         | MediaStep::Reoffer {
             media_call_id,
@@ -218,6 +219,7 @@ pub async fn bridge_run_media_step(
             profile,
             sdp,
             received_from,
+            sip_call_id,
         } => {
             // A profile the registry no longer carries is a deployment this
             // build cannot serve, not a transport hiccup — refuse before the
@@ -234,6 +236,7 @@ pub async fn bridge_run_media_step(
             if let Some(source) = received_from {
                 flags.stamp_received_from(*source);
             }
+            flags.stamp_sip_call_id(sip_call_id);
             // `offer` on the fresh call-id the plan minted; `reoffer` on the
             // live relaying one. The plan decides which — never both, and never
             // an `offer` over something live.
@@ -402,6 +405,7 @@ pub(crate) async fn bridge_calls_with_state(
             sdp: &anchor_sdp,
             pair_profile,
             source: Some(anchor.source_ip),
+            sip_call_id: &anchor.sip_call_id,
         },
         &fresh_media_call_id,
     );
@@ -958,6 +962,9 @@ pub fn bridge_advance_to_anchor(
             {
                 flags.stamp_received_from(source);
             }
+            // The peer's own dialog: this is the peer's answer, on the pair's
+            // engine call-id.
+            flags.stamp_sip_call_id_of(response);
             let answered = tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(backend.answer(
                     media_call_id,

@@ -942,6 +942,7 @@ fn media_summary_to_cdr_flattens_legs() {
             remote_address: Some("198.51.100.20:40000".parse().expect("remote addr")),
             egress_ssrc: Some(0x0506_0708),
             payload_type: Some(9),
+            media_started_at_unix_ms: Some(1_790_000_000_123),
         }
     }
 
@@ -971,6 +972,8 @@ fn media_summary_to_cdr_flattens_legs() {
         remote_address: Some("203.0.113.30:40002".parse().expect("remote addr")),
         egress_ssrc: None,
         payload_type: Some(8),
+        // Never carried media: absent from the record, not zero.
+        media_started_at_unix_ms: None,
     };
 
     let summary = CallSummary {
@@ -1077,6 +1080,15 @@ fn media_summary_to_cdr_flattens_legs() {
     );
     // Absent on a leg no userspace actor originated a stream for.
     assert!(!cdr.extra.contains_key("far_egress_ssrc"));
+    // When each leg's media started: present where it did, absent where it
+    // never did.
+    assert_eq!(
+        cdr.extra
+            .get("near_media_started_at_unix_ms")
+            .map(String::as_str),
+        Some("1790000000123")
+    );
+    assert!(!cdr.extra.contains_key("far_media_started_at_unix_ms"));
 }
 
 #[test]
@@ -1106,6 +1118,7 @@ fn media_summary_to_cdr_indexes_extra_legs() {
             remote_address: None,
             egress_ssrc: None,
             payload_type: None,
+            media_started_at_unix_ms: None,
         }
     }
 
@@ -1158,6 +1171,7 @@ fn media_summary_to_cdr_handles_a_single_leg_call() {
         remote_address: None,
         egress_ssrc: None,
         payload_type: None,
+        media_started_at_unix_ms: None,
     };
     let summary = CallSummary {
         call_id: "voice-ai-1".to_string(),

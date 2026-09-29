@@ -213,11 +213,18 @@ fn offer_toward_other_party(
         .call_actors
         .get_call(call_id)
         .map(|call| call.a_leg.dialog.call_id.clone())?;
+    // The offer is the refreshed party's, in the response on its own dialog.
+    let offerer_sip_call_id = state
+        .call_actors
+        .clone_leg(call_id, refreshed_on_a_leg)?
+        .dialog
+        .call_id;
     let mut body = match reoffer_through_media_engine(
         state,
         &a_leg_call_id,
         refreshed_on_a_leg,
         response_source.ip(),
+        &offerer_sip_call_id,
         &offer,
     ) {
         ReofferOutcome::NotAnchored => offer,

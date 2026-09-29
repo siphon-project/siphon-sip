@@ -38,6 +38,7 @@ fn measured_leg() -> CallLegSummary {
         remote_address: Some("198.51.100.20:40000".parse().expect("an address")),
         egress_ssrc: Some(0x0506_0708),
         payload_type: Some(0),
+        media_started_at_unix_ms: Some(1_790_000_000_123),
     }
 }
 
@@ -65,6 +66,7 @@ fn counters_only_leg() -> CallLegSummary {
         remote_address: None,
         egress_ssrc: None,
         payload_type: None,
+        media_started_at_unix_ms: None,
     }
 }
 
@@ -111,6 +113,7 @@ fn the_payload_carries_each_legs_counters_and_quality() {
     assert_eq!(measured["remote_address"], "198.51.100.20:40000");
     assert_eq!(measured["egress_ssrc"], 0x0506_0708);
     assert_eq!(measured["payload_type"], 0);
+    assert_eq!(measured["media_started_at_unix_ms"], 1_790_000_000_123_u64);
 
     let counters_only = legs[1].as_object().expect("a leg object");
     assert_eq!(counters_only["packets_in"], 2099);
@@ -131,6 +134,7 @@ fn the_payload_carries_each_legs_counters_and_quality() {
         "remote_address",
         "egress_ssrc",
         "payload_type",
+        "media_started_at_unix_ms",
     ] {
         assert!(
             !counters_only.contains_key(absent),

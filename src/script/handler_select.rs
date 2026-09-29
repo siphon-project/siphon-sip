@@ -220,6 +220,25 @@ impl ScriptState {
             .collect()
     }
 
+    /// Return all `RtpEngineOnMediaStarted` handlers whose optional
+    /// call-id/from-tag filters match the event.  `None` filters match
+    /// everything.
+    pub fn media_started_handlers(&self, call_id: &str, from_tag: &str) -> Vec<&HandlerEntry> {
+        self.handlers
+            .iter()
+            .filter(|h| match &h.kind {
+                HandlerKind::RtpEngineOnMediaStarted {
+                    call_id: filter_cid,
+                    from_tag: filter_ftag,
+                } => {
+                    filter_cid.as_deref().map_or(true, |v| v == call_id)
+                        && filter_ftag.as_deref().map_or(true, |v| v == from_tag)
+                }
+                _ => false,
+            })
+            .collect()
+    }
+
     /// Return all `RtpEngineOnBeep` handlers whose optional call-id/from-tag
     /// filters match the event.  `None` filters match everything.
     pub fn beep_handlers(&self, call_id: &str, from_tag: &str) -> Vec<&HandlerEntry> {

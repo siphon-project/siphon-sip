@@ -270,6 +270,11 @@ async fn a_carrier_hold_is_relayed_to_the_phone_on_each_sides_media() {
     );
     assert_eq!(reoffer[0].transport_protocol.as_deref(), Some("RTP/SAVP"));
     assert_eq!(reoffer[0].received_from, Some(socket(CALLER).ip()));
+    assert_eq!(
+        reoffer[0].sip_call_id.as_deref(),
+        Some(pair.caller.call_id.as_str()),
+        "the carrier's SDP, filed under the carrier's dialog"
+    );
 
     accept_with(&pair, PHONE, &to_phone, "recvonly");
     let sent = wait_for(&pair, |sent| !finals_to(sent, CALLER).is_empty()).await;
@@ -290,6 +295,11 @@ async fn a_carrier_hold_is_relayed_to_the_phone_on_each_sides_media() {
     assert_eq!(answer.from_tag, "caller-tag");
     assert_eq!(answer.transport_protocol.as_deref(), Some("RTP/AVP"));
     assert_eq!(answer.received_from, Some(socket(PHONE).ip()));
+    assert_eq!(
+        answer.sip_call_id.as_ref(),
+        pair.phone_dialog.headers.call_id(),
+        "the phone's SDP, filed under the phone's dialog"
+    );
     assert_no_local_answer_on_the_pair(&pair);
 }
 
@@ -357,6 +367,10 @@ async fn a_phone_reinvite_is_relayed_to_the_carrier_on_each_sides_media() {
     );
     assert_eq!(reoffer.transport_protocol.as_deref(), Some("RTP/AVP"));
     assert_eq!(reoffer.received_from, Some(socket(PHONE).ip()));
+    assert_eq!(
+        reoffer.sip_call_id.as_ref(),
+        pair.phone_dialog.headers.call_id()
+    );
 
     accept_with(&pair, CALLER, &to_carrier, "recvonly");
     let sent = wait_for(&pair, |sent| !finals_to(sent, PHONE).is_empty()).await;
@@ -370,6 +384,10 @@ async fn a_phone_reinvite_is_relayed_to_the_carrier_on_each_sides_media() {
     let answer = last(&pair.engine, "answer");
     assert_eq!(answer.transport_protocol.as_deref(), Some("RTP/SAVP"));
     assert_eq!(answer.received_from, Some(socket(CALLER).ip()));
+    assert_eq!(
+        answer.sip_call_id.as_deref(),
+        Some(pair.caller.call_id.as_str())
+    );
     assert_no_local_answer_on_the_pair(&pair);
 }
 

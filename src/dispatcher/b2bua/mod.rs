@@ -49,6 +49,7 @@ pub mod shutdown;
 mod terminate;
 mod timeouts;
 mod transfer;
+mod transfer_media;
 mod update;
 
 pub use ack::*;
@@ -88,6 +89,7 @@ pub use session_timer::*;
 pub use terminate::*;
 pub use timeouts::*;
 pub use transfer::*;
+pub use transfer_media::*;
 pub use update::*;
 
 /// Whether B2BUA mode handles this call.

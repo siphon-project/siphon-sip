@@ -52,6 +52,8 @@ pub fn control_dial_media_offer(
         .ok_or("dial offer has no From tag")?;
     let mut flags = profile.offer.clone();
     flags.stamp_received_from(source_ip);
+    // The engine call-id is minted below, so the caller's dialog is named.
+    flags.stamp_sip_call_id(call_id);
     for half in [&flags, &profile.answer] {
         let unsupported = backend.unsupported_flags(half);
         if !unsupported.is_empty() {
@@ -152,6 +154,7 @@ pub fn control_dial_media_answer(
         .ok_or("dial answer has no To tag")?;
     let mut flags = profile.answer.clone();
     flags.stamp_received_from(source_ip);
+    flags.stamp_sip_call_id_of(response);
     let body = tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current().block_on(backend.answer(
             session.rtpengine_id(),

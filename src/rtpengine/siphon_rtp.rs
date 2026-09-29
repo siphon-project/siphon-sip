@@ -28,11 +28,9 @@ use std::time::Duration;
 use dashmap::DashMap;
 use futures_util::future::join_all;
 use siphon_rtp_proto::{
-    frame, CmdResult, Command, Event, LegSummary as ProtoLegSummary, PlayEndReason,
-    PlayMediaSource as ProtoPlayMediaSource, ProfileFlags, Request, Response,
-    WsBridgeEndReason as ProtoWsBridgeEndReason, WsTeeDirection as ProtoWsTeeDirection,
-    WsTeeEndReason as ProtoWsTeeEndReason, WsVadEngine as ProtoWsVadEngine, X3EndReason,
-    X3TargetLeg, Xid,
+    frame, CmdResult, Command, Event, PlayEndReason, PlayMediaSource as ProtoPlayMediaSource,
+    ProfileFlags, Request, Response, WsTeeDirection as ProtoWsTeeDirection,
+    WsVadEngine as ProtoWsVadEngine, X3TargetLeg, Xid,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
@@ -42,19 +40,17 @@ use tracing::{debug, info, trace, warn};
 
 use super::client::PlayMediaSource;
 use super::error::RtpEngineError;
-use super::events::{
-    BeepDetectedEvent, CallLegSummary, CallSummary, DtmfEvent,
-    PlayEndReason as SiphonPlayEndReason, PlayFinishedEvent, RecordingChannels, RecordingDirection,
-    RecordingFinished, RecordingRequest, RtpEngineEvent, TextEvent, TextStreamStats,
-    WsBridgeEndReason, WsBridgeEnded, WsBridgeStarted, WsTeeEndReason, WsTeeEnded, WsTeeStarted,
-    X3EndedEvent, X3LossEvent, X3StartedEvent,
-};
+use super::events::{RecordingChannels, RecordingDirection, RecordingRequest, RtpEngineEvent};
 use super::profile::{NgFlags, WsTeeDirection, WsVadEngine};
 
 /// Reserved request id for the auth handshake (real requests start at 1).
 const AUTH_REQUEST_ID: u64 = 0;
 
+mod events;
 mod identity;
+use events::convert_event;
+#[cfg(test)]
+use events::{convert_leg_summary, play_end_reason_from_proto, ws_bridge_end_reason_from_proto};
 pub use identity::set_controller_id;
 use identity::{auth_frame_for, authenticate, controller_id};
 
@@ -121,6 +117,12 @@ pub(crate) fn profile_flags_from_ng(flags: &NgFlags) -> ProfileFlags {
         received_from: flags.received_from,
         rtcp_mux: flags.rtcp_mux.clone(),
         text_events: flags.text_events,
+        // Per-call, stamped by whichever path built the command from the SIP
+        // message whose SDP it carries.
+        sip_call_id: flags.sip_call_id.clone(),
+        // No profile carries a fax pin yet: `false` is what every call already
+        // got, and a profile field for it is its own change.
+        fax_passthrough: false,
     }
 }
 
@@ -1703,383 +1705,6 @@ fn result_kind(result: &CmdResult) -> &'static str {
     }
 }
 
-/// Convert a proto [`Event`] to siphon's [`RtpEngineEvent`].
-///
-/// `Event::Dtmf` is a field-for-field twin of [`DtmfEvent`]; `MediaTimeout`
-/// maps to the dedicated variant. The conference/quality events
-/// (`ActiveSpeaker`, `CallQuality`) are not modelled by a typed handler yet, so
-/// they surface through `Unknown` (logged, not dropped) carrying their stream
-/// identifiers — a typed Python handler is a follow-up.
-fn convert_event(event: Event) -> RtpEngineEvent {
-    match event {
-        Event::Dtmf {
-            call_id,
-            from_tag,
-            to_tag,
-            digit,
-            duration_ms,
-            volume,
-            source,
-        } => RtpEngineEvent::Dtmf(DtmfEvent {
-            call_id,
-            from_tag,
-            to_tag,
-            digit,
-            duration_ms,
-            volume,
-            source,
-        }),
-        Event::RecordingFinished {
-            call_id,
-            from_tag,
-            recording_id,
-            path,
-            reason,
-            duration_ms,
-            // Room recording names a conference instead of a call; siphon-sip
-            // has no conference concept to map it onto yet.
-            ..
-        } => RtpEngineEvent::RecordingFinished(RecordingFinished {
-            call_id,
-            from_tag,
-            recording_id,
-            path,
-            reason: recording_end_reason_from_proto(reason),
-            duration_ms,
-        }),
-        Event::MediaTimeout {
-            call_id,
-            from_tag,
-            reason,
-        } => RtpEngineEvent::MediaTimeout {
-            call_id,
-            from_tag,
-            reason: match reason {
-                siphon_rtp_proto::MediaTimeoutReason::NoMedia => "no_media",
-                siphon_rtp_proto::MediaTimeoutReason::HeldTooLong => "held_too_long",
-                // The reason set can grow; an unrecognised one is still a
-                // timeout, and naming it that is better than refusing to build.
-                _ => "unknown",
-            },
-        },
-        Event::CallSummary {
-            call_id,
-            reason,
-            duration_ms,
-            // The wall-clock bounds feed an RFC 6035 report, which siphon does
-            // not send; named rather than `..` so the next field is a decision.
-            started_at_unix_ms: _,
-            ended_at_unix_ms: _,
-            legs,
-        } => RtpEngineEvent::CallSummary(CallSummary {
-            call_id,
-            reason,
-            duration_ms,
-            legs: legs.into_iter().map(convert_leg_summary).collect(),
-        }),
-        Event::Text {
-            call_id,
-            from_tag,
-            to_tag,
-            text,
-            direction,
-        } => RtpEngineEvent::Text(TextEvent {
-            call_id,
-            from_tag,
-            to_tag,
-            text,
-            direction,
-        }),
-        Event::ActiveSpeaker {
-            conference_id,
-            from_tag,
-        } => RtpEngineEvent::Unknown {
-            event: "active_speaker".to_string(),
-            call_id: Some(conference_id),
-            from_tag,
-        },
-        Event::CallQuality {
-            conference_id,
-            call_id,
-            from_tag,
-            ..
-        } => RtpEngineEvent::Unknown {
-            event: "call_quality".to_string(),
-            call_id: call_id.or(conference_id),
-            from_tag: Some(from_tag),
-        },
-        Event::PlayFinished {
-            call_id,
-            from_tag,
-            to_tag,
-            play_id,
-            reason,
-            played_ms,
-            // Room playback (`conference_id`) has no siphon-sip concept to map
-            // onto yet — it lands with the conference verbs, not here.
-            ..
-        } => RtpEngineEvent::PlayFinished(PlayFinishedEvent {
-            call_id,
-            from_tag,
-            to_tag,
-            play_id,
-            reason: play_end_reason_from_proto(reason),
-            played_ms,
-        }),
-        Event::WsTeeStarted {
-            call_id,
-            from_tag,
-            stream_id,
-            ws_uri,
-            direction,
-            channels,
-            sample_rate,
-        } => RtpEngineEvent::WsTeeStarted(WsTeeStarted {
-            call_id,
-            from_tag,
-            stream_id,
-            ws_uri,
-            direction: ws_tee_direction_from_proto(direction),
-            channels,
-            sample_rate,
-        }),
-        Event::WsTeeEnded {
-            call_id,
-            from_tag,
-            stream_id,
-            reason,
-            frames_sent,
-            frames_dropped,
-        } => RtpEngineEvent::WsTeeEnded(WsTeeEnded {
-            call_id,
-            from_tag,
-            stream_id,
-            reason: ws_tee_end_reason_from_proto(reason),
-            frames_sent,
-            frames_dropped,
-        }),
-        Event::WsBridgeStarted {
-            call_id,
-            from_tag,
-            stream_id,
-            ws_uri,
-            sample_rate,
-        } => RtpEngineEvent::WsBridgeStarted(WsBridgeStarted {
-            call_id,
-            from_tag,
-            stream_id,
-            ws_uri,
-            sample_rate,
-        }),
-        Event::WsBridgeEnded {
-            call_id,
-            from_tag,
-            stream_id,
-            reason,
-        } => RtpEngineEvent::WsBridgeEnded(WsBridgeEnded {
-            call_id,
-            from_tag,
-            stream_id,
-            reason: ws_bridge_end_reason_from_proto(reason),
-        }),
-        Event::BeepDetected {
-            call_id,
-            from_tag,
-            to_tag,
-            frequency_hz,
-            duration_ms,
-            offset_ms,
-        } => RtpEngineEvent::BeepDetected(BeepDetectedEvent {
-            call_id,
-            from_tag,
-            to_tag,
-            frequency_hz,
-            duration_ms,
-            offset_ms,
-        }),
-        Event::X3Started {
-            call_id,
-            from_tag,
-            delivery,
-            xid,
-            correlation_id,
-            // The target leg is what siphon told the engine, so it carries no
-            // information back; the compliance record already has it.
-            target_leg: _,
-        } => RtpEngineEvent::X3Started(X3StartedEvent {
-            call_id,
-            from_tag,
-            delivery,
-            xid: *xid.as_bytes(),
-            correlation_id,
-        }),
-        Event::X3Loss {
-            call_id,
-            from_tag,
-            dropped,
-            delivered,
-            dropped_since_ms,
-        } => RtpEngineEvent::X3Loss(X3LossEvent {
-            call_id,
-            from_tag,
-            dropped,
-            delivered,
-            dropped_since_ms,
-        }),
-        Event::X3Ended {
-            call_id,
-            from_tag,
-            reason,
-            delivered,
-            dropped,
-        } => RtpEngineEvent::X3Ended(X3EndedEvent {
-            call_id,
-            from_tag,
-            // `X3EndReason` is `#[non_exhaustive]`, so it is rendered rather
-            // than mirrored: a reason this build has not heard of still means
-            // delivery stopped, and the counts are what the record needs.
-            reason: format!("{reason:?}"),
-            // Only a controller-driven detach is an orderly end. A reason this
-            // build does not recognise is treated as *not* orderly, because
-            // assuming otherwise would silently downgrade a new failure mode
-            // into a clean shutdown and skip the report the agency is owed.
-            orderly: matches!(reason, X3EndReason::Detached),
-            delivered,
-            dropped,
-        }),
-        Event::Unknown => RtpEngineEvent::Unknown {
-            event: "unknown".to_string(),
-            call_id: None,
-            from_tag: None,
-        },
-        // `Event` is `#[non_exhaustive]` upstream, so a build newer than this one
-        // can push a variant this one has no arm for. Surfaced through `Unknown`
-        // (which the dispatcher logs) rather than dropped — the correlation ids
-        // are unreachable behind the wildcard, but the fact that an unmodelled
-        // event arrived is exactly what tells an operator siphon is behind the
-        // engine. A serde-level `Event::Unknown` (an event tag the *proto* did
-        // not recognise) is the arm above; this is a tag it did.
-        other => {
-            debug!(?other, "siphon-rtp event not modelled by this build");
-            RtpEngineEvent::Unknown {
-                event: "unmodelled".to_string(),
-                call_id: None,
-                from_tag: None,
-            }
-        }
-    }
-}
-
-/// Map the proto tee end-reason onto siphon's own enum.
-///
-/// `WsTeeEndReason` is `#[non_exhaustive]` upstream. The wildcard maps to
-/// [`WsTeeEndReason::TransportError`] rather than a silent
-/// [`WsTeeEndReason::Detached`]: `Detached` and `CallEnded` are the only
-/// orderly ends, and the dispatcher keys its WARN-when-unexpected logging on
-/// that distinction, so
-/// treating an unknown reason as orderly would hide a dead stream on a live
-/// call — the exact failure this event exists to surface.
-fn ws_tee_end_reason_from_proto(reason: ProtoWsTeeEndReason) -> WsTeeEndReason {
-    match reason {
-        ProtoWsTeeEndReason::Detached => WsTeeEndReason::Detached,
-        ProtoWsTeeEndReason::ServerClosed => WsTeeEndReason::ServerClosed,
-        ProtoWsTeeEndReason::ServerStopped => WsTeeEndReason::ServerStopped,
-        ProtoWsTeeEndReason::CallEnded => WsTeeEndReason::CallEnded,
-        ProtoWsTeeEndReason::TransportError => WsTeeEndReason::TransportError,
-        _ => WsTeeEndReason::TransportError,
-    }
-}
-
-/// Map the proto play end-reason onto siphon's own enum.
-///
-/// `PlayEndReason` is `#[non_exhaustive]` upstream. The wildcard maps to
-/// [`SiphonPlayEndReason::Error`] rather than [`SiphonPlayEndReason::Completed`], for the
-/// same reason the two stream mappings never guess "orderly": `Completed` is
-/// the only reason that means the prompt was actually heard in full, and an app
-/// that queues its next step on that would take an unknown ending as a
-/// successful one.
-/// Why a recording ended, as a stable string for the scripting and control
-/// surfaces.
-///
-/// `RecordingEndReason` is `#[non_exhaustive]`, so a reason the engine adds
-/// later reads as `unknown` rather than failing the build — the recording still
-/// finished and its file is still there.
-fn recording_end_reason_from_proto(reason: siphon_rtp_proto::RecordingEndReason) -> &'static str {
-    use siphon_rtp_proto::RecordingEndReason;
-    match reason {
-        RecordingEndReason::Stopped => "stopped",
-        RecordingEndReason::MaxDuration => "max_duration",
-        RecordingEndReason::Silence => "silence",
-        RecordingEndReason::CallEnded => "call_ended",
-        RecordingEndReason::Error => "error",
-        _ => "unknown",
-    }
-}
-
-fn play_end_reason_from_proto(reason: PlayEndReason) -> SiphonPlayEndReason {
-    match reason {
-        PlayEndReason::Completed => SiphonPlayEndReason::Completed,
-        PlayEndReason::Stopped => SiphonPlayEndReason::Stopped,
-        PlayEndReason::Superseded => SiphonPlayEndReason::Superseded,
-        PlayEndReason::Error => SiphonPlayEndReason::Error,
-        _ => SiphonPlayEndReason::Error,
-    }
-}
-
-/// Map the proto bridge end-reason onto siphon's own enum.
-///
-/// `WsBridgeEndReason` is `#[non_exhaustive]` upstream. The wildcard maps to
-/// [`WsBridgeEndReason::TransportError`] rather than a silent
-/// [`WsBridgeEndReason::Detached`], for the same reason
-/// [`ws_tee_end_reason_from_proto`] does and with more at stake: `Detached` and
-/// `CallEnded` are the only orderly ends, and a bridge is the call's *whole*
-/// media path, so
-/// reading an unknown reason as orderly hides a live call whose far side has
-/// gone away.
-fn ws_bridge_end_reason_from_proto(reason: ProtoWsBridgeEndReason) -> WsBridgeEndReason {
-    match reason {
-        ProtoWsBridgeEndReason::Detached => WsBridgeEndReason::Detached,
-        ProtoWsBridgeEndReason::ServerClosed => WsBridgeEndReason::ServerClosed,
-        ProtoWsBridgeEndReason::ServerStopped => WsBridgeEndReason::ServerStopped,
-        ProtoWsBridgeEndReason::CallEnded => WsBridgeEndReason::CallEnded,
-        ProtoWsBridgeEndReason::TransportError => WsBridgeEndReason::TransportError,
-        _ => WsBridgeEndReason::TransportError,
-    }
-}
-
-/// Convert a proto [`ProtoLegSummary`] into siphon's [`CallLegSummary`] — a
-/// field-for-field copy that keeps the generic event enum free of the proto type.
-fn convert_leg_summary(leg: ProtoLegSummary) -> CallLegSummary {
-    CallLegSummary {
-        tag: leg.tag,
-        codec: leg.codec,
-        packets_in: leg.packets_in,
-        bytes_in: leg.bytes_in,
-        packets_out: leg.packets_out,
-        bytes_out: leg.bytes_out,
-        packets_dropped: leg.packets_dropped,
-        ssrc: leg.ssrc,
-        packets_lost: leg.packets_lost,
-        loss_percent: leg.loss_percent,
-        jitter_ms: leg.jitter_ms,
-        rtt_ms: leg.rtt_ms,
-        mos_average: leg.mos_average,
-        mos_min: leg.mos_min,
-        mos_max: leg.mos_max,
-        mos_basis: leg.mos_basis,
-        text: leg.text.map(|stats| TextStreamStats {
-            packets: stats.packets,
-            characters: stats.characters,
-            missing_markers: stats.missing_markers,
-            recovered_from_redundancy: stats.recovered_from_redundancy,
-        }),
-        local_address: leg.local_address,
-        remote_address: leg.remote_address,
-        egress_ssrc: leg.egress_ssrc,
-        payload_type: leg.payload_type,
-    }
-}
-
 /// Background task: maintain the control connection, route responses/events, and
 /// reconnect (with backoff + re-auth) until the client is dropped.
 #[allow(clippy::too_many_arguments)]
@@ -2333,7 +1958,12 @@ async fn sleep_or_shutdown(duration: Duration, shutdown_rx: &mut mpsc::Receiver<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rtpengine::events::WsBridgeEndReason;
     use siphon_rtp_proto::SessionStats;
+    use siphon_rtp_proto::{
+        LegSummary as ProtoLegSummary, WsBridgeEndReason as ProtoWsBridgeEndReason,
+        WsTeeEndReason as ProtoWsTeeEndReason, X3EndReason,
+    };
     use tokio::net::TcpListener;
 
     /// Read exactly one framed value of type `T` off a stream, growing `buffer`.
@@ -2808,6 +2438,7 @@ mod tests {
             remote_address: None,
             egress_ssrc: None,
             payload_type: None,
+            media_started_at_unix_ms: None,
         };
         let converted = convert_leg_summary(with_text.clone());
         let stats = converted.text.expect("text stats carried");
@@ -2859,6 +2490,7 @@ mod tests {
             received_from: Some("198.51.100.7".parse().unwrap()),
             rtcp_mux: vec!["require".into()],
             text_events: true,
+            sip_call_id: Some("a84b4c76e66710@pc33.example.test".into()),
         };
 
         let expected = ProfileFlags {
@@ -2893,6 +2525,8 @@ mod tests {
             received_from: Some("198.51.100.7".parse().unwrap()),
             rtcp_mux: vec!["require".into()],
             text_events: true,
+            sip_call_id: Some("a84b4c76e66710@pc33.example.test".into()),
+            fax_passthrough: false,
         };
 
         assert_eq!(profile_flags_from_ng(&ng), expected);
@@ -3542,6 +3176,107 @@ mod tests {
         }
     }
 
+    /// `media_started` as the engine puts it on the wire decodes into the
+    /// typed event, field for field, the leg side included.
+    #[test]
+    fn convert_event_media_started_from_the_wire() {
+        let event: Event = serde_json::from_value(serde_json::json!({
+            "event": "media_started",
+            "call_id": "call-ms",
+            "from_tag": "caller-tag",
+            "to_tag": "phone-tag",
+            "leg": "far",
+            "source": "203.0.113.7:40000",
+            "signalled": "192.0.2.10:4000",
+        }))
+        .expect("the proto reads media_started");
+        match convert_event(event) {
+            RtpEngineEvent::MediaStarted(started) => {
+                assert_eq!(started.call_id, "call-ms");
+                assert_eq!(started.from_tag, "caller-tag");
+                assert_eq!(started.to_tag.as_deref(), Some("phone-tag"));
+                assert_eq!(started.leg, crate::rtpengine::events::MediaLeg::Far);
+                assert_eq!(started.leg_tag(), Some("phone-tag"));
+                assert_eq!(started.source, Some("203.0.113.7:40000".parse().unwrap()));
+                assert_eq!(started.signalled, Some("192.0.2.10:4000".parse().unwrap()));
+                assert_eq!(started.nat_rewritten(), Some(true));
+            }
+            other => panic!("expected MediaStarted, got {other:?}"),
+        }
+
+        // A near leg with nothing latched: its own tag is the offerer's, and a
+        // NAT cannot be judged without both addresses.
+        let bare: Event = serde_json::from_value(serde_json::json!({
+            "event": "media_started",
+            "call_id": "call-ms",
+            "from_tag": "caller-tag",
+            "leg": "near",
+        }))
+        .expect("the optional fields are optional");
+        match convert_event(bare) {
+            RtpEngineEvent::MediaStarted(started) => {
+                assert_eq!(started.leg_tag(), Some("caller-tag"));
+                assert_eq!(started.to_tag, None);
+                assert_eq!(started.nat_rewritten(), None);
+            }
+            other => panic!("expected MediaStarted, got {other:?}"),
+        }
+    }
+
+    /// The Call-ID a path stamps on the flags goes out on the offer, and a
+    /// command nobody stamped carries none.
+    #[tokio::test]
+    async fn offer_frame_carries_the_stamped_sip_call_id() {
+        let mut flags = NgFlags::default();
+        flags.stamp_sip_call_id("a84b4c76e66710@pc33.example.test");
+        let json = captured_offer_json(&flags).await;
+        assert!(
+            json.contains(r#""sip_call_id":"a84b4c76e66710@pc33.example.test""#),
+            "{json}"
+        );
+        let json = captured_offer_json(&NgFlags::default()).await;
+        assert!(!json.contains("sip_call_id"), "{json}");
+    }
+
+    /// A Call-ID past what the engine keeps is left off rather than failing
+    /// the offer; an empty one is never stamped.
+    #[test]
+    fn an_oversized_or_empty_call_id_is_not_stamped() {
+        let mut flags = NgFlags::default();
+        flags.stamp_sip_call_id(&"x".repeat(siphon_rtp_proto::MAX_SIP_CALL_ID_LEN + 1));
+        assert_eq!(flags.sip_call_id, None);
+        flags.stamp_sip_call_id("");
+        assert_eq!(flags.sip_call_id, None);
+        let longest = "y".repeat(siphon_rtp_proto::MAX_SIP_CALL_ID_LEN);
+        flags.stamp_sip_call_id(&longest);
+        assert_eq!(flags.sip_call_id.as_deref(), Some(longest.as_str()));
+    }
+
+    /// The engine refuses the whole offer over a `sip_call_id` it will not
+    /// keep, and RFC 3261 bounds neither a Call-ID's length nor, as parsed,
+    /// its bytes. So anything past the limit or outside visible ASCII is left
+    /// off, and the call still sets up on the engine's own call-id.
+    #[test]
+    fn a_call_id_the_engine_would_refuse_is_not_stamped() {
+        let mut flags = NgFlags::default();
+        flags.stamp_sip_call_id(&format!("{}@example.test", "a".repeat(300)));
+        assert_eq!(flags.sip_call_id, None, "a 300-byte Call-ID was stamped");
+        for refused in [
+            "has space@example.test",
+            "tab\there@example.test",
+            "caf\u{e9}@example.test",
+            "nul\0byte@example.test",
+        ] {
+            flags.stamp_sip_call_id(refused);
+            assert_eq!(flags.sip_call_id, None, "{refused:?} was stamped");
+        }
+        // Positive control: an ordinary Call-ID with the punctuation RFC 3261
+        // `word` allows is still stamped.
+        let ordinary = "a84b4c76e66710!%*_+`'~()<>:\\\"/[]?{}@pc33.example.test";
+        flags.stamp_sip_call_id(ordinary);
+        assert_eq!(flags.sip_call_id.as_deref(), Some(ordinary));
+    }
+
     #[test]
     fn convert_event_call_summary() {
         // A measured near leg (actor quality present) + a counters-only far leg
@@ -3568,6 +3303,7 @@ mod tests {
             remote_address: None,
             egress_ssrc: None,
             payload_type: None,
+            media_started_at_unix_ms: Some(1_790_000_000_123),
         };
         let far = ProtoLegSummary {
             tag: "far-tag".into(),
@@ -3591,6 +3327,7 @@ mod tests {
             remote_address: None,
             egress_ssrc: None,
             payload_type: None,
+            media_started_at_unix_ms: None,
         };
         match convert_event(Event::CallSummary {
             call_id: "call-9".into(),
@@ -3619,6 +3356,7 @@ mod tests {
                 assert_eq!(near.rtt_ms, Some(21.0));
                 assert_eq!(near.mos_average, Some(4.11));
                 assert_eq!(near.mos_basis.as_deref(), Some("full"));
+                assert_eq!(near.media_started_at_unix_ms, Some(1_790_000_000_123));
 
                 let far = &summary.legs[1];
                 assert_eq!(far.tag, "far-tag");
@@ -3627,6 +3365,8 @@ mod tests {
                 assert_eq!(far.packets_lost, None);
                 assert_eq!(far.mos_average, None);
                 assert_eq!(far.mos_basis, None);
+                // A leg that never carried media stays told apart from silence.
+                assert_eq!(far.media_started_at_unix_ms, None);
             }
             other => panic!("expected CallSummary, got {other:?}"),
         }

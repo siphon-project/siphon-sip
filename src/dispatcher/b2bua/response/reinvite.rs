@@ -204,6 +204,7 @@ pub fn forward_reinvite_response(
             snapshot,
             is_a2b,
             is_bridged_reinvite,
+            responder_dialog_call_id.as_deref(),
         );
 
         // The route set the re-INVITE itself carried, stored on the tracking leg
@@ -470,7 +471,9 @@ pub fn forward_reinvite_response(
 
 /// The SDP half of a forwarded re-INVITE answer: remember the answerer's own
 /// endpoint SDP raw, push the answer through rtpengine, and own the `o=`
-/// identity toward the originator (RFC 3264 §8).
+/// identity toward the originator (RFC 3264 §8). `responder_dialog_call_id`
+/// is the answering leg's own Call-ID, read before the response was rewritten
+/// toward the originator.
 pub fn rewrite_reinvite_answer_sdp(
     call_id: &str,
     message: &mut SipMessage,
@@ -480,6 +483,7 @@ pub fn rewrite_reinvite_answer_sdp(
     snapshot: &BLegResponseSnapshot,
     is_a2b: bool,
     is_bridged_reinvite: bool,
+    responder_dialog_call_id: Option<&str>,
 ) {
     // Track the ANSWERER's own endpoint SDP — raw, before the rtpengine
     // rewrite just below — so a later siphon-terminated transfer offers this
@@ -524,6 +528,9 @@ pub fn rewrite_reinvite_answer_sdp(
                         // Pin the answering party's ingress to where its own 2xx arrived from,
                         // as the offer side now does for the offerer.
                         answer_flags.stamp_received_from(response_source.ip());
+                        if let Some(responder_call_id) = responder_dialog_call_id {
+                            answer_flags.stamp_sip_call_id(responder_call_id);
+                        }
                         match tokio::task::block_in_place(|| {
                             tokio::runtime::Handle::current().block_on(rtpengine_set.answer(
                                 session.rtpengine_id(),

@@ -253,6 +253,11 @@ pub enum SipEvent {
     /// `StasisEnd`, so accept it for a channel already ended. A bridged pair's
     /// session carries both legs: its summary goes to both channels, once each.
     MediaSummary,
+    /// The first packet on one of the channel's media legs reached the media
+    /// engine ([`MediaStartedPayload`]): media is flowing toward the engine on
+    /// that leg. Once per leg, not again on a re-latch or re-INVITE. On a
+    /// bridged pair each leg's report goes to that leg's channel only.
+    MediaStarted,
     /// A branch of a `dial` was created ([`DialBranchPayload`]): its INVITE is
     /// about to go out. Every fork branch, and each attempt of a sequential
     /// hunt when the hunt places it.
@@ -298,6 +303,7 @@ impl SipEvent {
             SipEvent::WsBridgeStarted => "WsBridgeStarted",
             SipEvent::WsBridgeEnded => "WsBridgeEnded",
             SipEvent::MediaSummary => "MediaSummary",
+            SipEvent::MediaStarted => "MediaStarted",
             SipEvent::DialBranch => "DialBranch",
             SipEvent::DialBranchFailed => "DialBranchFailed",
             SipEvent::DialAnswered => "DialAnswered",
@@ -332,6 +338,7 @@ impl From<&str> for SipEvent {
             "WsBridgeStarted" => SipEvent::WsBridgeStarted,
             "WsBridgeEnded" => SipEvent::WsBridgeEnded,
             "MediaSummary" => SipEvent::MediaSummary,
+            "MediaStarted" => SipEvent::MediaStarted,
             "DialBranch" => SipEvent::DialBranch,
             "DialBranchFailed" => SipEvent::DialBranchFailed,
             "DialAnswered" => SipEvent::DialAnswered,
@@ -1295,6 +1302,38 @@ pub struct MediaLegSummary {
     pub egress_ssrc: Option<u32>,
     #[serde(default)]
     pub payload_type: Option<u8>,
+    /// When this party's first packet reached the engine, as Unix
+    /// milliseconds. `None` for a leg that never carried media, which is not
+    /// the same as one that carried silence.
+    #[serde(default)]
+    pub media_started_at_unix_ms: Option<u64>,
+}
+
+/// Payload of [`SipEvent::MediaStarted`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MediaStartedPayload {
+    /// `near` (the leg facing the offerer, `from_tag`) or `far` (the leg facing
+    /// the answerer, `to_tag`). Names the engine leg, not a party: before an
+    /// answer the far leg carries the callee's early media.
+    #[serde(default)]
+    pub leg: String,
+    /// The engine session's offerer tag, whichever leg this is about.
+    #[serde(default)]
+    pub from_tag: String,
+    /// The engine session's answerer tag, once there is one.
+    #[serde(default)]
+    pub to_tag: Option<String>,
+    /// Where the first packet came from (`ip:port`), when the engine latched
+    /// one.
+    #[serde(default)]
+    pub source: Option<String>,
+    /// The address the SDP signalled for this leg (`ip:port`).
+    #[serde(default)]
+    pub signalled: Option<String>,
+    /// Whether `source` differs from `signalled`: a NAT between the party and
+    /// the engine. `None` unless both were reported.
+    #[serde(default)]
+    pub nat_rewritten: Option<bool>,
 }
 
 /// Payload of [`SipEvent::WsBridgeStarted`].
@@ -1844,6 +1883,7 @@ mod tests {
             ("WsBridgeStarted", SipEvent::WsBridgeStarted),
             ("WsBridgeEnded", SipEvent::WsBridgeEnded),
             ("MediaSummary", SipEvent::MediaSummary),
+            ("MediaStarted", SipEvent::MediaStarted),
         ] {
             let parsed = SipEvent::from(wire);
             assert_eq!(parsed, expected, "{wire} must parse to its own variant");
@@ -1857,6 +1897,25 @@ mod tests {
                 "{wire} fell through to Other"
             );
         }
+    }
+
+    /// A leg behind a NAT reports both addresses and says they differ; a bare
+    /// report leaves every optional field `None`, not empty.
+    #[test]
+    fn media_started_payload_reads_the_leg_and_the_nat() {
+        let behind_nat: MediaStartedPayload = serde_json::from_value(serde_json::json!({
+            "leg": "far", "from_tag": "a", "to_tag": "b",
+            "source": "203.0.113.7:40000", "signalled": "192.0.2.10:4000",
+            "nat_rewritten": true
+        }))
+        .unwrap();
+        assert_eq!(behind_nat.leg, "far");
+        assert_eq!(behind_nat.to_tag.as_deref(), Some("b"));
+        assert_eq!(behind_nat.nat_rewritten, Some(true));
+        let bare: MediaStartedPayload =
+            serde_json::from_value(serde_json::json!({ "leg": "near", "from_tag": "a" })).unwrap();
+        assert_eq!(bare.source, None);
+        assert_eq!(bare.nat_rewritten, None);
     }
 
     /// A counters-only leg omits what the engine did not measure; it must read

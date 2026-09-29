@@ -82,6 +82,7 @@ def media_record() -> dict:
         "far_local_address": "192.0.2.10:30002",
         "far_payload_type": "9",
         "far_egress_ssrc": "84281096",
+        "far_media_started_at_unix_ms": "1790000000123",
         "far_packets_in": "8199",
         "far_bytes_in": "1230000",
         "far_packets_out": "8200",
@@ -229,6 +230,14 @@ def test_media_leg_carries_the_media_plane_addresses():
     assert far.remote_address == "203.0.113.30:40002"
     assert far.payload_type == 9
     assert far.egress_ssrc == 84281096
+
+
+def test_media_leg_carries_when_its_media_started():
+    # Present on a leg whose first packet cleared the engine's source gate,
+    # absent (None, not 0) on one that never carried media.
+    near, far = CallDetailRecord.from_dict(media_record()).media_legs
+    assert far.media_started_at_unix_ms == 1790000000123
+    assert near.media_started_at_unix_ms is None
 
 
 def test_unmeasured_leg_fields_stay_none():

@@ -2191,6 +2191,11 @@
         "kind": "method_descriptor",
         "sig": "($self, func_or_none=None, *, call_id=None, from_tag=None)"
       },
+      "on_media_started": {
+        "doc": "Register a handler for **media started** events.",
+        "kind": "method_descriptor",
+        "sig": "($self, func_or_none=None, *, call_id=None, from_tag=None)"
+      },
       "on_media_timeout": {
         "doc": "Register a handler for media-timeout events from the media engine.",
         "kind": "method_descriptor",

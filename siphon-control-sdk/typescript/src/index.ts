@@ -108,6 +108,7 @@ export type {
   WsBridgeEndedPayload,
   MediaSummaryPayload,
   MediaLegSummary,
+  MediaStartedPayload,
 } from "./protocol";
 
 export { ControlClient, EventStream } from "./client";

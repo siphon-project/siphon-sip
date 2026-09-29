@@ -12,7 +12,6 @@
 use std::sync::{Arc, Mutex};
 
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
 use tracing::{debug, warn};
 
 use crate::rtpengine::client::PlayMediaSource;
@@ -29,8 +28,10 @@ use super::reply::PyReply;
 use super::request::PyRequest;
 
 mod answer;
+mod decorators;
 
 use answer::AnswerExchange;
+use decorators::event_decorator;
 
 /// Python-visible RTPEngine namespace.
 ///
@@ -674,7 +675,7 @@ impl PyRtpEngine {
             ws_vad_min_speech_ms,
             ws_vad_engine,
         )?;
-        let flags = finalise_flags(
+        let mut flags = finalise_flags(
             flags,
             &self.client,
             resolved_ws_uri.clone(),
@@ -682,6 +683,8 @@ impl PyRtpEngine {
             source_ip.as_deref(),
             profile_name,
         )?;
+        // The offer is the message's own SDP.
+        flags.stamp_sip_call_id(&call_id);
 
         let client = Arc::clone(&self.client);
         let sessions = Arc::clone(&self.sessions);
@@ -903,7 +906,7 @@ impl PyRtpEngine {
             ws_vad_min_speech_ms,
             ws_vad_engine,
         )?;
-        let flags = finalise_flags(
+        let mut flags = finalise_flags(
             flags,
             &self.client,
             resolved_ws_uri.clone(),
@@ -911,6 +914,9 @@ impl PyRtpEngine {
             exchange.source_ip.as_deref(),
             &profile_name,
         )?;
+        if let Some(answerer_sip_call_id) = exchange.answerer_sip_call_id.as_deref() {
+            flags.stamp_sip_call_id(answerer_sip_call_id);
+        }
 
         let client = Arc::clone(&self.client);
         let sessions = Arc::clone(&self.sessions);
@@ -1048,7 +1054,7 @@ impl PyRtpEngine {
             ws_vad_min_speech_ms,
             ws_vad_engine,
         )?;
-        let flags = finalise_flags(
+        let mut flags = finalise_flags(
             flags,
             &self.client,
             resolved_ws_uri.clone(),
@@ -1056,6 +1062,8 @@ impl PyRtpEngine {
             source_ip.as_deref(),
             &profile_name,
         )?;
+        // The engine answers the message's own offer.
+        flags.stamp_sip_call_id(&call_id);
 
         // Capture an owned handle to the Call for the auto-488 path, cloned
         // while the GIL is held (free-threaded `Py::clone` rule).  `None` when
@@ -2054,31 +2062,7 @@ impl PyRtpEngine {
         call_id: Option<String>,
         from_tag: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        // Compose a Python-side decorator that registers via _siphon_registry
-        // with metadata describing the filters.
-        let code = r#"
-def make_decorator(call_id, from_tag):
-    import asyncio
-    import _siphon_registry
-    def decorator(fn):
-        is_async = asyncio.iscoroutinefunction(fn)
-        metadata = {"call_id": call_id, "from_tag": from_tag}
-        _siphon_registry.register("rtpengine.on_dtmf", None, fn, is_async, metadata)
-        return fn
-    return decorator
-"#;
-        let globals = PyDict::new(python);
-        python.run(&std::ffi::CString::new(code).unwrap(), Some(&globals), None)?;
-        let make_decorator = globals.get_item("make_decorator")?.ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err("failed to build on_dtmf decorator")
-        })?;
-        let decorator = make_decorator.call1((call_id, from_tag))?;
-
-        // Support both `@on_dtmf` (bare) and `@on_dtmf(call_id=...)` forms.
-        match func_or_none {
-            Some(func) => decorator.call1((func.bind(python),)),
-            None => Ok(decorator),
-        }
+        event_decorator(python, "rtpengine.on_dtmf", func_or_none, call_id, from_tag)
     }
 
     /// Register a handler for media-timeout events from the media engine.
@@ -2120,32 +2104,13 @@ def make_decorator(call_id, from_tag):
         call_id: Option<String>,
         from_tag: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        // Compose a Python-side decorator that registers via _siphon_registry
-        // with metadata describing the filters (mirrors `on_dtmf`).
-        let code = r#"
-def make_decorator(call_id, from_tag):
-    import asyncio
-    import _siphon_registry
-    def decorator(fn):
-        is_async = asyncio.iscoroutinefunction(fn)
-        metadata = {"call_id": call_id, "from_tag": from_tag}
-        _siphon_registry.register("rtpengine.on_media_timeout", None, fn, is_async, metadata)
-        return fn
-    return decorator
-"#;
-        let globals = PyDict::new(python);
-        python.run(&std::ffi::CString::new(code).unwrap(), Some(&globals), None)?;
-        let make_decorator = globals.get_item("make_decorator")?.ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err("failed to build on_media_timeout decorator")
-        })?;
-        let decorator = make_decorator.call1((call_id, from_tag))?;
-
-        // Support both `@on_media_timeout` (bare) and
-        // `@on_media_timeout(call_id=...)` forms.
-        match func_or_none {
-            Some(func) => decorator.call1((func.bind(python),)),
-            None => Ok(decorator),
-        }
+        event_decorator(
+            python,
+            "rtpengine.on_media_timeout",
+            func_or_none,
+            call_id,
+            from_tag,
+        )
     }
 
     /// Register a handler for **RFC 4103 real-time text** (T.140) increments.
@@ -2183,37 +2148,7 @@ def make_decorator(call_id, from_tag):
         call_id: Option<String>,
         from_tag: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let code = r#"
-def make_decorator(call_id, from_tag):
-    import asyncio
-    import _siphon_registry
-    def decorator(fn):
-        is_async = asyncio.iscoroutinefunction(fn)
-        metadata = {"call_id": call_id, "from_tag": from_tag}
-        _siphon_registry.register("rtpengine.on_text", None, fn, is_async, metadata)
-        return fn
-    return decorator
-"#;
-        let globals = PyDict::new(python);
-        python.run(
-            &std::ffi::CString::new(code).map_err(|error| {
-                pyo3::exceptions::PyRuntimeError::new_err(format!(
-                    "on_text decorator source: {error}"
-                ))
-            })?,
-            Some(&globals),
-            None,
-        )?;
-        let make_decorator = globals.get_item("make_decorator")?.ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err("failed to build on_text decorator")
-        })?;
-        let decorator = make_decorator.call1((call_id, from_tag))?;
-
-        // Support both `@on_text` (bare) and `@on_text(call_id=...)` forms.
-        match func_or_none {
-            Some(func) => decorator.call1((func.bind(python),)),
-            None => Ok(decorator),
-        }
+        event_decorator(python, "rtpengine.on_text", func_or_none, call_id, from_tag)
     }
 
     /// Register a handler for **WebSocket tee started** events.
@@ -2246,30 +2181,13 @@ def make_decorator(call_id, from_tag):
         call_id: Option<String>,
         from_tag: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let code = r#"
-def make_decorator(call_id, from_tag):
-    import asyncio
-    import _siphon_registry
-    def decorator(fn):
-        is_async = asyncio.iscoroutinefunction(fn)
-        metadata = {"call_id": call_id, "from_tag": from_tag}
-        _siphon_registry.register("rtpengine.on_ws_tee_started", None, fn, is_async, metadata)
-        return fn
-    return decorator
-"#;
-        let globals = PyDict::new(python);
-        python.run(&std::ffi::CString::new(code).unwrap(), Some(&globals), None)?;
-        let make_decorator = globals.get_item("make_decorator")?.ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err("failed to build on_ws_tee_started decorator")
-        })?;
-        let decorator = make_decorator.call1((call_id, from_tag))?;
-
-        // Support both `@on_ws_tee_started` (bare) and
-        // `@on_ws_tee_started(call_id=...)` forms.
-        match func_or_none {
-            Some(func) => decorator.call1((func.bind(python),)),
-            None => Ok(decorator),
-        }
+        event_decorator(
+            python,
+            "rtpengine.on_ws_tee_started",
+            func_or_none,
+            call_id,
+            from_tag,
+        )
     }
 
     /// Register a handler for **playback finished** events.
@@ -2308,35 +2226,13 @@ def make_decorator(call_id, from_tag):
         call_id: Option<String>,
         from_tag: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let code = r#"
-def make_decorator(call_id, from_tag):
-    import asyncio
-    import _siphon_registry
-    def decorator(fn):
-        is_async = asyncio.iscoroutinefunction(fn)
-        metadata = {"call_id": call_id, "from_tag": from_tag}
-        _siphon_registry.register("rtpengine.on_play_finished", None, fn, is_async, metadata)
-        return fn
-    return decorator
-"#;
-        let code = std::ffi::CString::new(code).map_err(|error| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "failed to build on_play_finished decorator source: {error}"
-            ))
-        })?;
-        let globals = PyDict::new(python);
-        python.run(&code, Some(&globals), None)?;
-        let make_decorator = globals.get_item("make_decorator")?.ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err("failed to build on_play_finished decorator")
-        })?;
-        let decorator = make_decorator.call1((call_id, from_tag))?;
-
-        // Support both `@on_play_finished` (bare) and
-        // `@on_play_finished(call_id=...)` forms.
-        match func_or_none {
-            Some(func) => decorator.call1((func.bind(python),)),
-            None => Ok(decorator),
-        }
+        event_decorator(
+            python,
+            "rtpengine.on_play_finished",
+            func_or_none,
+            call_id,
+            from_tag,
+        )
     }
 
     /// Register a handler for **WebSocket takeover bridge started** events.
@@ -2373,37 +2269,13 @@ def make_decorator(call_id, from_tag):
         call_id: Option<String>,
         from_tag: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let code = r#"
-def make_decorator(call_id, from_tag):
-    import asyncio
-    import _siphon_registry
-    def decorator(fn):
-        is_async = asyncio.iscoroutinefunction(fn)
-        metadata = {"call_id": call_id, "from_tag": from_tag}
-        _siphon_registry.register("rtpengine.on_ws_bridge_started", None, fn, is_async, metadata)
-        return fn
-    return decorator
-"#;
-        let code = std::ffi::CString::new(code).map_err(|error| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "failed to build on_ws_bridge_started decorator source: {error}"
-            ))
-        })?;
-        let globals = PyDict::new(python);
-        python.run(&code, Some(&globals), None)?;
-        let make_decorator = globals.get_item("make_decorator")?.ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err(
-                "failed to build on_ws_bridge_started decorator",
-            )
-        })?;
-        let decorator = make_decorator.call1((call_id, from_tag))?;
-
-        // Support both `@on_ws_bridge_started` (bare) and
-        // `@on_ws_bridge_started(call_id=...)` forms.
-        match func_or_none {
-            Some(func) => decorator.call1((func.bind(python),)),
-            None => Ok(decorator),
-        }
+        event_decorator(
+            python,
+            "rtpengine.on_ws_bridge_started",
+            func_or_none,
+            call_id,
+            from_tag,
+        )
     }
 
     /// Register a handler for **WebSocket takeover bridge ended** events.
@@ -2443,37 +2315,13 @@ def make_decorator(call_id, from_tag):
         call_id: Option<String>,
         from_tag: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let code = r#"
-def make_decorator(call_id, from_tag):
-    import asyncio
-    import _siphon_registry
-    def decorator(fn):
-        is_async = asyncio.iscoroutinefunction(fn)
-        metadata = {"call_id": call_id, "from_tag": from_tag}
-        _siphon_registry.register("rtpengine.on_ws_bridge_ended", None, fn, is_async, metadata)
-        return fn
-    return decorator
-"#;
-        let code = std::ffi::CString::new(code).map_err(|error| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "failed to build on_ws_bridge_ended decorator source: {error}"
-            ))
-        })?;
-        let globals = PyDict::new(python);
-        python.run(&code, Some(&globals), None)?;
-        let make_decorator = globals.get_item("make_decorator")?.ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err(
-                "failed to build on_ws_bridge_ended decorator",
-            )
-        })?;
-        let decorator = make_decorator.call1((call_id, from_tag))?;
-
-        // Support both `@on_ws_bridge_ended` (bare) and
-        // `@on_ws_bridge_ended(call_id=...)` forms.
-        match func_or_none {
-            Some(func) => decorator.call1((func.bind(python),)),
-            None => Ok(decorator),
-        }
+        event_decorator(
+            python,
+            "rtpengine.on_ws_bridge_ended",
+            func_or_none,
+            call_id,
+            from_tag,
+        )
     }
 
     /// Register a handler for **record-tone (voicemail beep)** events.
@@ -2518,29 +2366,53 @@ def make_decorator(call_id, from_tag):
         call_id: Option<String>,
         from_tag: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let code = r#"
-def make_decorator(call_id, from_tag):
-    import asyncio
-    import _siphon_registry
-    def decorator(fn):
-        is_async = asyncio.iscoroutinefunction(fn)
-        metadata = {"call_id": call_id, "from_tag": from_tag}
-        _siphon_registry.register("rtpengine.on_beep", None, fn, is_async, metadata)
-        return fn
-    return decorator
-"#;
-        let globals = PyDict::new(python);
-        python.run(&std::ffi::CString::new(code)?, Some(&globals), None)?;
-        let make_decorator = globals.get_item("make_decorator")?.ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err("failed to build on_beep decorator")
-        })?;
-        let decorator = make_decorator.call1((call_id, from_tag))?;
+        event_decorator(python, "rtpengine.on_beep", func_or_none, call_id, from_tag)
+    }
 
-        // Support both `@on_beep` (bare) and `@on_beep(call_id=...)` forms.
-        match func_or_none {
-            Some(func) => decorator.call1((func.bind(python),)),
-            None => Ok(decorator),
-        }
+    /// Register a handler for **media started** events.
+    ///
+    /// Fires when the first packet on one of a call's engine legs clears the
+    /// engine's source gate, within about 20 ms of it arriving: media is
+    /// flowing toward the engine on that leg. Once per leg, so a two-party
+    /// call raises two, and not again on a re-latch or a re-offer.
+    ///
+    /// ``leg`` is ``"near"`` (the offerer's side, ``from_tag``) or ``"far"``
+    /// (the answerer's, ``to_tag``). It names the engine leg rather than a
+    /// party: before an answer the far leg carries the callee's early media on
+    /// a relayed call. ``source`` is the ``"ip:port"`` the engine latched,
+    /// ``signalled`` the one the SDP gave; they differ behind a NAT. Either is
+    /// ``None`` when the engine did not report it.
+    ///
+    /// Delivered by the native **siphon-rtp** backend only.
+    ///
+    /// ```python,ignore
+    /// @rtpengine.on_media_started
+    /// def flowing(call_id, from_tag, to_tag, leg, source, signalled):
+    ///     if source and signalled and source != signalled:
+    ///         log.info(f"{call_id}: {leg} leg is behind a NAT ({source})")
+    /// ```
+    ///
+    /// Args:
+    ///     func_or_none: When applied directly (``@rtpengine.on_media_started``)
+    ///         this is the function.  When called with keyword filters the
+    ///         return value is a decorator.
+    ///     call_id: Optional engine call-id filter.
+    ///     from_tag: Optional from-tag filter.
+    #[pyo3(signature = (func_or_none=None, *, call_id=None, from_tag=None))]
+    fn on_media_started<'py>(
+        &self,
+        python: Python<'py>,
+        func_or_none: Option<Py<PyAny>>,
+        call_id: Option<String>,
+        from_tag: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        event_decorator(
+            python,
+            "rtpengine.on_media_started",
+            func_or_none,
+            call_id,
+            from_tag,
+        )
     }
 
     /// Register a handler for **WebSocket tee ended** events.
@@ -2583,30 +2455,13 @@ def make_decorator(call_id, from_tag):
         call_id: Option<String>,
         from_tag: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let code = r#"
-def make_decorator(call_id, from_tag):
-    import asyncio
-    import _siphon_registry
-    def decorator(fn):
-        is_async = asyncio.iscoroutinefunction(fn)
-        metadata = {"call_id": call_id, "from_tag": from_tag}
-        _siphon_registry.register("rtpengine.on_ws_tee_ended", None, fn, is_async, metadata)
-        return fn
-    return decorator
-"#;
-        let globals = PyDict::new(python);
-        python.run(&std::ffi::CString::new(code).unwrap(), Some(&globals), None)?;
-        let make_decorator = globals.get_item("make_decorator")?.ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err("failed to build on_ws_tee_ended decorator")
-        })?;
-        let decorator = make_decorator.call1((call_id, from_tag))?;
-
-        // Support both `@on_ws_tee_ended` (bare) and
-        // `@on_ws_tee_ended(call_id=...)` forms.
-        match func_or_none {
-            Some(func) => decorator.call1((func.bind(python),)),
-            None => Ok(decorator),
-        }
+        event_decorator(
+            python,
+            "rtpengine.on_ws_tee_ended",
+            func_or_none,
+            call_id,
+            from_tag,
+        )
     }
 
     /// Number of active media sessions being tracked.

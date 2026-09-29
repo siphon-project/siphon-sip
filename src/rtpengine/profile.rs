@@ -799,9 +799,57 @@ pub struct NgFlags {
     /// Honoured by rtpengine and `siphon-rtp`; the classic `rtpproxy` backend
     /// has no equivalent.
     pub rtcp_mux: Vec<String>,
+    /// The SIP `Call-ID` of the dialog whose SDP this command carries: the
+    /// offerer's on an `offer` / `reoffer` / `answer_local`, the answerer's on
+    /// an `answer`. Per-call data, never populated from YAML.
+    ///
+    /// The native `siphon-rtp` engine files every HEP capture it exports for
+    /// the leg (the raw RTCP and its QoS reports) under this id, so a collector
+    /// joins the media to the call's signalling. It matters where the engine
+    /// call-id is not that dialog's Call-ID: a bridged pair and a transfer
+    /// re-anchor run on an engine call-id of their own, and a B2BUA's two legs
+    /// are two dialogs with a Call-ID each. Absent, the engine correlates by its
+    /// own call-id. The rtpengine NG and rtpproxy backends carry the Call-ID as
+    /// the call-id itself and ignore it.
+    pub sip_call_id: Option<String>,
 }
 
 impl NgFlags {
+    /// Fill in [`NgFlags::sip_call_id`] with the Call-ID of the dialog whose SDP
+    /// this command carries.
+    ///
+    /// RFC 3261 §8.1.1.4 sets no length bound, and the parser does not police
+    /// a Call-ID's bytes; the native engine refuses the *whole* offer, answer or
+    /// answer_local over a `sip_call_id` that is empty, past
+    /// [`siphon_rtp_proto::MAX_SIP_CALL_ID_LEN`] bytes, or holds anything but
+    /// visible ASCII. Failing call setup over a correlation label is the wrong
+    /// trade, so such a Call-ID is left out and the engine files the leg's
+    /// captures under its own call-id instead.
+    pub fn stamp_sip_call_id(&mut self, sip_call_id: &str) {
+        if sip_call_id.is_empty() {
+            return;
+        }
+        if sip_call_id.len() > siphon_rtp_proto::MAX_SIP_CALL_ID_LEN
+            || !sip_call_id.bytes().all(|byte| byte.is_ascii_graphic())
+        {
+            tracing::debug!(
+                length = sip_call_id.len(),
+                "Call-ID the media engine would refuse, its captures are filed under the engine call-id"
+            );
+            return;
+        }
+        self.sip_call_id = Some(sip_call_id.to_string());
+    }
+
+    /// [`NgFlags::stamp_sip_call_id`] with the Call-ID of `message`, the SIP
+    /// message whose SDP this command carries. A message without one stamps
+    /// nothing.
+    pub fn stamp_sip_call_id_of(&mut self, message: &crate::sip::message::SipMessage) {
+        if let Some(sip_call_id) = message.headers.call_id() {
+            self.stamp_sip_call_id(sip_call_id);
+        }
+    }
+
     /// Fill in the per-call [`NgFlags::received_from`] with `source`, the
     /// signalling source of the party whose SDP this command carries — only
     /// when the profile's [`NgFlags::carry_received_from`] policy asks for it,
@@ -852,6 +900,7 @@ impl NgFlags {
             carry_received_from: config.received_from,
             received_from: None,
             rtcp_mux: config.rtcp_mux.clone(),
+            sip_call_id: None,
         }
     }
 

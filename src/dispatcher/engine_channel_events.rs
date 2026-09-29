@@ -193,3 +193,49 @@ pub(super) fn publish_ws_bridge_ended(
         }),
     );
 }
+
+/// The control plane's `MediaStarted` payload: which engine leg media started
+/// on, the engine call's tags, where the first packet came from and where the
+/// SDP said it would. `nat_rewritten` is present only when the engine reported
+/// both addresses, and says whether they differ; an address the engine did not
+/// report is absent rather than null.
+pub(super) fn media_started_payload(
+    started: &crate::rtpengine::events::MediaStartedEvent,
+) -> serde_json::Value {
+    let mut payload = serde_json::json!({
+        "leg": started.leg.as_str(),
+        "from_tag": started.from_tag,
+    });
+    if let Some(fields) = payload.as_object_mut() {
+        if let Some(to_tag) = &started.to_tag {
+            fields.insert("to_tag".into(), to_tag.as_str().into());
+        }
+        if let Some(source) = started.source {
+            fields.insert("source".into(), source.to_string().into());
+        }
+        if let Some(signalled) = started.signalled {
+            fields.insert("signalled".into(), signalled.to_string().into());
+        }
+        if let Some(nat_rewritten) = started.nat_rewritten() {
+            fields.insert("nat_rewritten".into(), nat_rewritten.into());
+        }
+    }
+    payload
+}
+
+/// Media started on one engine leg: `MediaStarted` to the channel of the party
+/// that leg faces. The event names the engine call's tags and the leg; the
+/// leg's own tag (the offerer's on the near leg, the answerer's on the far one)
+/// picks the party on a bridged pair. A call nobody controls publishes nothing.
+pub(super) fn publish_media_started(
+    state: &DispatcherState,
+    started: &crate::rtpengine::events::MediaStartedEvent,
+) {
+    publish_engine_event(
+        state,
+        &started.call_id,
+        started.leg_tag().unwrap_or_default(),
+        "MediaStarted",
+        media_started_payload(started),
+    );
+}

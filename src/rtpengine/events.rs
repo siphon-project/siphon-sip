@@ -101,6 +101,11 @@ pub enum RtpEngineEvent {
     /// A non-zero `dropped` means warranted content did not reach the agency.
     /// `siphon-rtp` native backend only.
     X3Ended(X3EndedEvent),
+    /// The first packet arrived on one of a call's engine legs and cleared the
+    /// source gate: media is flowing toward the engine on that leg. Emitted
+    /// once per leg, so a two-party call raises two, and not again on a
+    /// re-latch or a re-offer.  `siphon-rtp` native backend only.
+    MediaStarted(MediaStartedEvent),
     /// An event we didn't recognise — passed through for logging.
     Unknown {
         event: String,
@@ -223,6 +228,11 @@ pub struct CallLegSummary {
     /// wire, where `codec` is the name it was negotiated under.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub payload_type: Option<u8>,
+    /// When this party's first packet cleared the engine's source gate, as
+    /// Unix milliseconds. `None` when none ever did: a leg that never carried
+    /// media, told apart from one that carried silence.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub media_started_at_unix_ms: Option<u64>,
 }
 
 /// One increment of RFC 4103 real-time text (T.140), carried by
@@ -314,6 +324,72 @@ pub struct BeepDetectedEvent {
     /// event is emitted after the detector's cadence guard has elapsed, so it
     /// always trails this by roughly `beep_cadence_guard_ms`.
     pub offset_ms: u64,
+}
+
+/// Which of a call's two engine legs a [`MediaStartedEvent`] is about.
+///
+/// The engine names the leg rather than a party because on a call nobody has
+/// answered yet it cannot always tell who is sending: the far leg carries the
+/// callee's early media on a relayed call and the caller's own media on an
+/// offer-only one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaLeg {
+    /// The leg facing the offerer, the engine call's `from_tag` side.
+    Near,
+    /// The leg facing the answerer, the engine call's `to_tag` side.
+    Far,
+}
+
+impl MediaLeg {
+    /// The wire and script form: `near` or `far`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MediaLeg::Near => "near",
+            MediaLeg::Far => "far",
+        }
+    }
+}
+
+/// Media started flowing on one engine leg, carried by
+/// [`RtpEngineEvent::MediaStarted`].  A siphon-side mirror of the native
+/// backend's `siphon_rtp_proto::Event::MediaStarted` payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MediaStartedEvent {
+    /// The engine call-id: the SIP Call-ID, except on a bridged pair or a
+    /// re-anchored session.
+    pub call_id: String,
+    /// The engine call's offerer tag. Names the near leg's party whichever
+    /// leg this event is about.
+    pub from_tag: String,
+    /// The engine call's answerer tag, once there is one.
+    pub to_tag: Option<String>,
+    /// The leg the first packet arrived on.
+    pub leg: MediaLeg,
+    /// Where the first packet came from, when the engine latched one.
+    pub source: Option<SocketAddr>,
+    /// The address the SDP signalled for this leg's party.
+    pub signalled: Option<SocketAddr>,
+}
+
+impl MediaStartedEvent {
+    /// The engine tag of the party whose leg this is: `from_tag` on the near
+    /// leg, `to_tag` on the far one (`None` before anyone answered).
+    pub fn leg_tag(&self) -> Option<&str> {
+        match self.leg {
+            MediaLeg::Near => Some(self.from_tag.as_str()),
+            MediaLeg::Far => self.to_tag.as_deref(),
+        }
+    }
+
+    /// Whether the media arrived from somewhere other than where the SDP said
+    /// it would: a NAT between the party and the engine. `None` unless the
+    /// engine reported both addresses.
+    pub fn nat_rewritten(&self) -> Option<bool> {
+        match (self.source, self.signalled) {
+            (Some(source), Some(signalled)) => Some(source != signalled),
+            _ => None,
+        }
+    }
 }
 
 /// A WebSocket tee stopped, carried by [`RtpEngineEvent::WsTeeEnded`].
