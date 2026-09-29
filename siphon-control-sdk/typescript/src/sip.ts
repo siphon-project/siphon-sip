@@ -24,6 +24,7 @@ import {
 } from "./protocol";
 import type {
   ChannelSnapshot,
+  DialBranchPayload,
   EventFrame,
   PeerHangupPolicy,
   SipEventKind,
@@ -310,13 +311,80 @@ export interface Originated {
   sipCallId?: string;
 }
 
+/**
+ * How {@link SipClient.originateAor} rings the phones registered at an AoR.
+ * Anything left out takes the server's own default.
+ */
+export interface OriginateRing {
+  /**
+   * `"parallel"` (the server's default) rings every phone at once;
+   * `"sequential"` rings them one at a time in registration q-value order,
+   * moving on when one declines or rings out its own `timeout`.
+   */
+  strategy?: "parallel" | "sequential";
+  /**
+   * Seconds the whole group may ring before every phone still ringing is
+   * CANCELled. Server-side it defaults to `timeout` for a parallel group and to
+   * `timeout` times the number of phones for a sequential one; `0` is none.
+   */
+  totalTimeout?: number;
+}
+
+/**
+ * What the server answers an accepted `originate {aor}` with: every registered
+ * phone is being rung (`state: "calling"`) and none has answered yet.
+ */
+export interface OriginatedGroup {
+  /** The caller-supplied channel id the group is addressed by. */
+  channel: string;
+  /**
+   * siphon's id for the group of phones. Until one answers, the channel's
+   * events carry it as their `call_id` / `sip_call_id`, since no single dialog
+   * is the call yet; from `DialAnswered` on they carry the winning leg's own.
+   */
+  groupId?: string;
+  /** The AoR as it is registered (its canonical key), which every leg's To carries. */
+  aor?: string;
+  /** The strategy in force (the server's default when none was asked for). */
+  strategy?: string;
+  /** The group's deadline in force, in seconds (`0` = none). */
+  totalTimeout?: number;
+  /** One entry per phone INVITE built so far (a sequential group adds more as it hunts). */
+  branches: DialBranchPayload[];
+}
+
 export function originateArgs(
   channel: string,
   to: string,
   media: OriginateMedia,
   options?: OriginateOptions,
 ): Record<string, unknown> {
-  const args: Record<string, unknown> = { channel, to };
+  return originateCommonArgs({ channel, to }, media, options);
+}
+
+/**
+ * The args of an `originate {aor}`. `to` is never sent beside `aor` — the
+ * server refuses both — and the ring shaping goes only here, since beside a
+ * single `to` the server refuses it too.
+ */
+export function originateAorArgs(
+  channel: string,
+  aor: string,
+  media: OriginateMedia,
+  options?: OriginateOptions,
+  ring?: OriginateRing,
+): Record<string, unknown> {
+  const args = originateCommonArgs({ channel, aor }, media, options);
+  if (ring?.strategy !== undefined) args.strategy = ring.strategy;
+  if (ring?.totalTimeout !== undefined) args.total_timeout = ring.totalTimeout;
+  return args;
+}
+
+function originateCommonArgs(
+  args: Record<string, unknown>,
+  media: OriginateMedia,
+  options?: OriginateOptions,
+): Record<string, unknown> {
   if ("anchor" in media) {
     args.media = true;
     if (media.profile !== undefined) args.profile = media.profile;
@@ -435,6 +503,33 @@ export interface DialOptions {
    * identity in `pAssertedIdentity` for the trusted next hop.
    */
   privacy?: "allowed" | "restricted";
+  /**
+   * What happens when a phone picks up (`"connect"` server-side when unset).
+   *
+   * `"connect"` answers the caller with the phone's answer, so it is refused on
+   * a caller that is already answered. `"bridge"` is the end of an IVR flow: it
+   * is accepted **only** on an answered caller with an anchored media session
+   * (`answerAnchored`), rings each phone as a call siphon places itself, and
+   * bridges the first one to answer to the caller as {@link Call.bridge} would,
+   * with `onPeerHangup: "hangup"`. Its outcome arrives as `DialAnswered` (with
+   * the `channel` siphon minted for the phone) then `ChannelBridged`, or as
+   * `DialFailed` with the caller still answered and owned.
+   */
+  onAnswer?: "connect" | "bridge";
+  /**
+   * What the caller hears while the phones ring on an `onAnswer: "bridge"`
+   * dial: a tone preset or cadence (`"ringback_eu"`, `"425/1000,0/4000*inf"`,
+   * anything `play {tone}` takes), `true` for the default, or `false` for none
+   * (the caller hears whatever the app left playing). `"ringback_eu"`
+   * server-side when unset. It starts on the first 180-183 from any phone, never
+   * talks over a prompt the app started, and its `PlayStarted` / `PlayFinished`
+   * carry `origin: "ringback"`.
+   *
+   * Bridge-only: naming it without `onAnswer: "bridge"` throws a `TypeError`
+   * before anything is sent, since the server refuses it on a connecting dial
+   * (`bad_request`, `requires_bridge`).
+   */
+  ringback?: string | boolean;
 }
 
 /**
@@ -453,6 +548,19 @@ export interface Dialing {
   strategy?: string;
   /** The ring timeout in force, in seconds. */
   timeout?: number;
+  /** `"bridge"` on an `onAnswer: "bridge"` dial; absent on a connecting one. */
+  onAnswer?: string;
+  /** siphon's id for the group of phones a bridge dial rings. */
+  groupId?: string;
+  /**
+   * How long a bridge dial as a whole rings, in seconds: `timeout` (parallel)
+   * or `timeout` times the number of phones (sequential).
+   */
+  totalTimeout?: number;
+  /** The ringback in force on a bridge dial (a preset or cadence, or `false`). */
+  ringback?: string | boolean;
+  /** The phone INVITEs a bridge dial built, one per branch. */
+  branches?: DialBranchPayload[];
 }
 
 /** Which side of the call {@link Call.recordStart} writes. */
@@ -535,7 +643,39 @@ export function dialArgs(
     args.p_asserted_identity = options.pAssertedIdentity;
   }
   if (options.privacy !== undefined) args.privacy = options.privacy;
+  if (options.ringback !== undefined && options.onAnswer !== "bridge") {
+    throw new TypeError(
+      'dial "ringback" requires onAnswer: "bridge" — a connecting dial gives ' +
+        "the caller the phones' own ringback, and siphon refuses it there",
+    );
+  }
+  if (options.onAnswer !== undefined) args.on_answer = options.onAnswer;
+  if (options.ringback !== undefined) args.ringback = options.ringback;
   return args;
+}
+
+/**
+ * The branch identities a reply lists (`branches`), keeping only well-formed
+ * entries. `undefined` when the reply carries none.
+ */
+function branchList(value: unknown): DialBranchPayload[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const branches: DialBranchPayload[] = [];
+  for (const entry of value) {
+    if (typeof entry !== "object" || entry === null) continue;
+    const { leg_id, leg_sip_call_id, target, aor } = entry as Record<string, unknown>;
+    if (
+      typeof leg_id !== "string" ||
+      typeof leg_sip_call_id !== "string" ||
+      typeof target !== "string"
+    ) {
+      continue;
+    }
+    const branch: DialBranchPayload = { leg_id, leg_sip_call_id, target };
+    if (typeof aor === "string") branch.aor = aor;
+    branches.push(branch);
+  }
+  return branches;
 }
 
 export function recordStartArgs(options?: RecordOptions): Record<string, unknown> {
@@ -777,9 +917,27 @@ export class Call {
    * `reason` is for the record, not the wire: it reaches siphon's log and the
    * CDR (`sip_reason`, beside `disconnect_initiator: "control"` and no response
    * code), so a dropped call reads as deliberate rather than as a leak.
+   *
+   * `options.ban` makes the verdict stick: siphon also scores the caller's
+   * source address in the `security.failed_auth_ban` store, so a source the
+   * controller keeps dropping is banned at the transport before its next INVITE
+   * is parsed. The weight follows how far the address can be believed — a
+   * strong signal over TCP / TLS / WS / WSS, whose handshake proved it, and
+   * weight 1 over UDP, where one datagram can name any address. A no-op without
+   * `security.failed_auth_ban`; `trusted_cidrs` are never scored; only a
+   * successful drop scores, so a refused one leaves the source alone. Sent only
+   * when `true`.
    */
-  async drop(reason?: string): Promise<void> {
-    await this.sip(SipVerb.Drop, reason !== undefined ? { reason } : {});
+  async drop(reason?: string, options?: { ban?: boolean }): Promise<void> {
+    const args: Record<string, unknown> = {};
+    if (reason !== undefined) {
+      args.reason = reason;
+    }
+    // Off is the server's default, so only `true` goes on the wire.
+    if (options?.ban === true) {
+      args.ban = true;
+    }
+    await this.sip(SipVerb.Drop, args);
   }
 
   /**
@@ -883,6 +1041,23 @@ export class Call {
    * answered, which is what this verb exists to avoid), `"bad_request"` (an
    * empty or malformed target list) or `"unsupported_verb"` (a strategy siphon
    * does not implement).
+   *
+   * A caller the app answered on purpose, to play it prompts first, is what
+   * `onAnswer: "bridge"` is for (see {@link DialOptions.onAnswer}): the phones
+   * ring while the caller hears `ringback`, and the first to answer is bridged
+   * to it. The reply then also carries `onAnswer`, `groupId`, `totalTimeout`,
+   * `ringback` and the `branches` rung. It refuses with `"invalid_state"` a
+   * caller that is not answered, not anchored, already bridged or already has
+   * phones ringing for it.
+   *
+   * ```ts
+   * await call.answerAnchored();
+   * await call.play({ file: "/prompts/menu.wav" });
+   * await call.dial([{ aor: "sip:204@pbx.example" }], {
+   *   onAnswer: "bridge",
+   *   ringback: "ringback_eu",
+   * });
+   * ```
    */
   async dial(targets: DialTarget[], options?: DialOptions): Promise<Dialing> {
     const result = (await this.sip(SipVerb.Dial, dialArgs(targets, options))) as
@@ -903,6 +1078,14 @@ export class Call {
       targets: count("targets"),
       strategy: text("strategy"),
       timeout: count("timeout"),
+      onAnswer: text("on_answer"),
+      groupId: text("group_id"),
+      totalTimeout: count("total_timeout"),
+      ringback: (() => {
+        const value = result?.ringback;
+        return typeof value === "string" || typeof value === "boolean" ? value : undefined;
+      })(),
+      branches: branchList(result?.branches),
     };
   }
 
@@ -1457,6 +1640,69 @@ export class SipClient {
       channel: text("channel") ?? channel,
       callId: text("call_id"),
       sipCallId: text("sip_call_id"),
+    };
+  }
+
+  /**
+   * Ring every phone registered at `aor` under a caller-supplied channel id —
+   * {@link SipClient.originate} for a phone rather than a URI.
+   *
+   * A phone registered over TCP, TLS or WSS behind NAT is reachable only on the
+   * connection it registered over, and one registered through an edge proxy
+   * only through its Path, so resolving its Contact as a `to` reaches nothing.
+   * This rings each registered contact over its own flow and Path (RFC 5626
+   * §5.3, RFC 3327 §5.3), each as its own originated call with `options`
+   * applied. The first phone to answer wins; every other one still ringing is
+   * CANCELled. `ring` says how the phones are rung ({@link OriginateRing}).
+   *
+   * An AoR with nobody registered rejects with `code === "not_found"` and
+   * `details.reason === "no_contacts"`, with nothing on the wire.
+   *
+   * While the phones ring the channel is bound to the group: its events carry
+   * the {@link OriginatedGroup.groupId} as their `call_id`, and each leg's own
+   * Call-ID is in the payload (`DialBranch`, `DialBranchFailed`). From
+   * `DialAnswered` on, the channel is the winning phone's call. A `hangup`
+   * while they ring CANCELs every one; `drop` is refused (`invalid_state`),
+   * since siphon is their caller and there is no response to withhold.
+   *
+   * ```ts
+   * const group = await client.originateAor(
+   *   "wake-201",
+   *   "sip:201@pbx.example",
+   *   { anchor: true },
+   *   { from: "sip:reception@pbx.example", timeout: 25 },
+   *   { strategy: "parallel" },
+   * );
+   * ```
+   */
+  async originateAor(
+    channel: string,
+    aor: string,
+    media: OriginateMedia,
+    options?: OriginateOptions,
+    ring?: OriginateRing,
+  ): Promise<OriginatedGroup> {
+    const result = (await this.client.command(
+      MODULE_SIP,
+      "originate",
+      null,
+      originateAorArgs(channel, aor, media, options, ring),
+    )) as Record<string, unknown> | null;
+    const text = (name: string): string | undefined => {
+      const value = result?.[name];
+      return typeof value === "string" ? value : undefined;
+    };
+    const count = (name: string): number | undefined => {
+      const value = result?.[name];
+      return typeof value === "number" ? value : undefined;
+    };
+    return {
+      channel: text("channel") ?? channel,
+      groupId: text("group_id"),
+      aor: text("aor"),
+      strategy: text("strategy"),
+      totalTimeout: count("total_timeout"),
+      branches: branchList(result?.branches) ?? [],
     };
   }
 

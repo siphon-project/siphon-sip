@@ -397,6 +397,11 @@ pub struct PlayStartedPayload {
     /// the fetched body has arrived.
     #[serde(default)]
     pub duration_ms: Option<u64>,
+    /// Who started the playback, when it was not the app's own `play`:
+    /// `"ringback"` for the tone a `dial {on_answer: "bridge"}` plays while its
+    /// phones alert. Absent for a playback the app started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
 }
 
 /// The RFC 3891 `Replaces` triple embedded in a [`TransferRequestedPayload`]
@@ -811,6 +816,9 @@ pub enum DialBranchCause {
     Cancelled,
     /// The INVITE never reached the transport (`503`).
     Unsent,
+    /// It answered a `dial {on_answer: "bridge"}`, but the bridge to it failed,
+    /// so it was hung up and the dial went on without it.
+    BridgeFailed,
     /// Any other cause token (forward-compatible catch-all).
     Other(String),
 }
@@ -823,6 +831,7 @@ impl DialBranchCause {
             DialBranchCause::Timeout => "timeout",
             DialBranchCause::Cancelled => "cancelled",
             DialBranchCause::Unsent => "unsent",
+            DialBranchCause::BridgeFailed => "bridge_failed",
             DialBranchCause::Other(token) => token.as_str(),
         }
     }
@@ -835,6 +844,7 @@ impl From<&str> for DialBranchCause {
             "timeout" => DialBranchCause::Timeout,
             "cancelled" => DialBranchCause::Cancelled,
             "unsent" => DialBranchCause::Unsent,
+            "bridge_failed" => DialBranchCause::BridgeFailed,
             other => DialBranchCause::Other(other.to_string()),
         }
     }
@@ -902,6 +912,12 @@ pub struct DialAnsweredPayload {
     pub aor: Option<String>,
     /// The 2xx it answered with.
     pub code: u16,
+    /// On a `dial {on_answer: "bridge"}`, the channel siphon minted for the
+    /// phone that was bridged, registered to this app; the phone's own events
+    /// follow on it. `None` on a connecting dial, and when that channel has no
+    /// live owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
 }
 
 /// The `payload` of a [`SipEvent::DialFailed`] event: nobody answered the
@@ -913,6 +929,11 @@ pub struct DialFailedPayload {
     /// The reason phrase that goes with `code`.
     #[serde(default)]
     pub reason: String,
+    /// How the dial ended, on a `dial {on_answer: "bridge"}`: `rejected`,
+    /// `ring timeout`, `unsent`, `bridge_failed` or `caller_hangup`. `None` on
+    /// a connecting dial.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cause: Option<String>,
     /// Whether it ended at the ring timeout.
     #[serde(default)]
     pub timed_out: bool,
@@ -1832,5 +1853,50 @@ mod tests {
             serde_json::from_value(serde_json::json!({})).expect("sparse payload");
         assert_eq!(sparse.status, 0);
         assert!(!sparse.call_kept);
+    }
+
+    /// A bridge dial names the channel it minted for the bridged phone, says how
+    /// it ended, and marks its ringback; a connecting dial's payloads, which
+    /// carry none of that, still parse.
+    #[test]
+    fn bridge_dial_payloads_parse_from_the_wire_shape() {
+        let answered: DialAnsweredPayload = serde_json::from_value(serde_json::json!({
+            "leg_id": "leg-2", "leg_sip_call_id": "b2@host", "target": "sip:204@203.0.113.7",
+            "aor": "sip:204@example.com", "code": 200, "channel": "dial-abc",
+        }))
+        .expect("DialAnswered payload");
+        assert_eq!(answered.channel.as_deref(), Some("dial-abc"));
+
+        let unowned: DialAnsweredPayload = serde_json::from_value(serde_json::json!({
+            "leg_id": "leg-2", "code": 200, "channel": null,
+        }))
+        .expect("DialAnswered payload without an owner");
+        assert!(unowned.channel.is_none());
+
+        let failed: DialFailedPayload = serde_json::from_value(serde_json::json!({
+            "code": 408, "reason": "Request Timeout", "cause": "ring timeout",
+            "timed_out": true,
+            "branches": [{
+                "leg_id": "leg-1", "leg_sip_call_id": "b1@host", "target": "sip:204@203.0.113.7",
+                "code": 480, "reason": "Temporarily Unavailable", "cause": "bridge_failed",
+            }],
+        }))
+        .expect("DialFailed payload");
+        assert_eq!(failed.cause.as_deref(), Some("ring timeout"));
+        assert_eq!(failed.branches[0].cause, DialBranchCause::BridgeFailed);
+        assert_eq!(DialBranchCause::BridgeFailed.as_str(), "bridge_failed");
+
+        let connecting: DialFailedPayload =
+            serde_json::from_value(serde_json::json!({ "code": 486 })).expect("older payload");
+        assert!(connecting.cause.is_none());
+
+        let ringback: PlayStartedPayload = serde_json::from_value(serde_json::json!({
+            "source": "tone", "play_id": 7, "origin": "ringback",
+        }))
+        .expect("PlayStarted payload");
+        assert_eq!(ringback.origin.as_deref(), Some("ringback"));
+        let own: PlayStartedPayload =
+            serde_json::from_value(serde_json::json!({ "source": "file" })).expect("own play");
+        assert!(own.origin.is_none());
     }
 }

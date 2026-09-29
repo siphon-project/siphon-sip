@@ -8,8 +8,8 @@ use pyo3::prelude::*;
 
 use siphon_control_client::proto::sip::PeerHangupPolicy;
 use siphon_control_client::sip::{
-    DialStrategy, DialTarget, OriginateMedia, OriginatePrivacy, PlaySource, RecordChannels,
-    RecordDirection, RouteTarget, SessionRefresher, SessionTimer,
+    AorRing, DialOnAnswer, DialStrategy, DialTarget, OriginateMedia, OriginatePrivacy, PlaySource,
+    RecordChannels, RecordDirection, Ringback, RouteTarget, SessionRefresher, SessionTimer,
 };
 
 /// Extract one `route` target: a bare URI `str`, or a dict
@@ -165,6 +165,68 @@ pub(crate) fn extract_dial_strategy(strategy: Option<String>) -> PyResult<Option
             ))
         }),
     }
+}
+
+/// Parse `dial(on_answer=..., ringback=...)`.
+///
+/// A ringback is refused on a connecting dial, as the server refuses it
+/// (`requires_bridge`): it would otherwise be sent and fail the whole dial.
+pub(crate) fn extract_dial_on_answer(
+    on_answer: Option<String>,
+    ringback: Option<Bound<'_, PyAny>>,
+) -> PyResult<Option<DialOnAnswer>> {
+    let ringback = ringback
+        .map(|ringback| extract_ringback(&ringback))
+        .transpose()?;
+    match (on_answer.as_deref(), ringback) {
+        (None, None) => Ok(None),
+        (Some("connect"), None) => Ok(Some(DialOnAnswer::Connect)),
+        (Some("bridge"), ringback) => Ok(Some(DialOnAnswer::Bridge { ringback })),
+        (None | Some("connect"), Some(_)) => Err(PyValueError::new_err(
+            "dial ringback needs on_answer=\"bridge\": a connecting dial's caller hears the phones' own ringing",
+        )),
+        (Some(other), _) => Err(PyValueError::new_err(format!(
+            "dial on_answer must be \"connect\" or \"bridge\", not {other:?}"
+        ))),
+    }
+}
+
+/// A ringback: `True` for the server's default tone, `False` for none, or a
+/// tone preset / cadence string. A bool is checked first, since Python's `True`
+/// is also an int.
+fn extract_ringback(object: &Bound<'_, PyAny>) -> PyResult<Ringback> {
+    if let Ok(flag) = object.cast::<pyo3::types::PyBool>() {
+        return Ok(if flag.is_true() {
+            Ringback::Default
+        } else {
+            Ringback::Silent
+        });
+    }
+    match object.extract::<String>() {
+        Ok(tone) if !tone.is_empty() => Ok(Ringback::Tone(tone)),
+        _ => Err(PyTypeError::new_err(
+            "dial ringback must be a non-empty tone string or a bool",
+        )),
+    }
+}
+
+/// Parse `originate(aor=..., strategy=..., total_timeout=...)`'s ring options.
+pub(crate) fn extract_aor_ring(
+    strategy: Option<String>,
+    total_timeout: Option<u64>,
+) -> PyResult<AorRing> {
+    let strategy = match strategy {
+        None => None,
+        Some(name) => Some(DialStrategy::from_name(&name).ok_or_else(|| {
+            PyValueError::new_err(format!(
+                "originate strategy must be \"parallel\" or \"sequential\", not {name:?}"
+            ))
+        })?),
+    };
+    Ok(AorRing {
+        strategy,
+        total_timeout_secs: total_timeout,
+    })
 }
 
 /// Parse `record_start(direction=...)`.

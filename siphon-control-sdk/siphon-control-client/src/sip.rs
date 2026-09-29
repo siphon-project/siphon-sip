@@ -30,14 +30,14 @@ use siphon_control_proto::{ChannelSnapshot, EventFrame};
 
 use crate::client::{ClientConfig, ClientEvent, ControlClient};
 use crate::error::ControlError;
-use crate::originate::originate_on;
 pub use crate::originate::{
-    OriginateMedia, OriginateOptions, OriginatePrivacy, Originated, SessionRefresher, SessionTimer,
+    AorRing, OriginateMedia, OriginateOptions, OriginatePrivacy, Originated, OriginatedGroup,
+    SessionRefresher, SessionTimer,
 };
 // `dial` and the recording pair hang their verbs off `Call` from their own
 // modules; their argument types are re-exported here so every SIP type is
 // reachable under one path.
-pub use crate::dial::{DialOptions, DialStrategy, DialTarget, Dialing};
+pub use crate::dial::{DialOnAnswer, DialOptions, DialStrategy, DialTarget, Dialing, Ringback};
 pub use crate::recording::{RecordChannels, RecordDirection, RecordOptions, Recording};
 use crate::server::{ControlServer, ServerConfig};
 use crate::session::CommandTransport;
@@ -1300,7 +1300,8 @@ impl CallStream {
 /// # }
 /// ```
 pub struct SipClient {
-    client: Arc<ControlClient>,
+    // Reached by the `originate` verbs in their own module.
+    pub(crate) client: Arc<ControlClient>,
     facade: Arc<SipFacade>,
 }
 
@@ -1370,45 +1371,6 @@ impl SipClient {
     /// Fetch the registered adapters' schema (`describe`).
     pub async fn describe(&self) -> Result<serde_json::Value, ControlError> {
         self.client.describe().await
-    }
-
-    /// Place an outbound call under a caller-supplied channel id.
-    ///
-    /// The one verb that *creates* a channel rather than addressing one, which
-    /// is why it lives here and not on [`Call`]. It returns as soon as the
-    /// INVITE is on the wire — the call is `calling`, and the answer, failure or
-    /// timeout arrives later as an event on the channel, exactly as a handed-over
-    /// call's does.
-    ///
-    /// The channel id is yours to choose so the call is addressable before it is
-    /// answered (and before any server-assigned id could have reached you). A id
-    /// already in use is a `conflict`, never silently reused.
-    ///
-    /// ```no_run
-    /// # use siphon_control_client::sip::{OriginateMedia, OriginateOptions, SipClient};
-    /// # async fn example(client: &SipClient) -> Result<(), siphon_control_client::ControlError> {
-    /// let call = client
-    ///     .originate(
-    ///         "wake-up-42",
-    ///         "sip:1001@pbx.example",
-    ///         OriginateMedia::anchor(),
-    ///         OriginateOptions::default()
-    ///             .from("sip:alarm@pbx.example")
-    ///             .timeout(20),
-    ///     )
-    ///     .await?;
-    /// println!("ringing on {}", call.channel);
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub async fn originate(
-        &self,
-        channel: &str,
-        to: &str,
-        media: OriginateMedia,
-        options: OriginateOptions,
-    ) -> Result<Originated, ControlError> {
-        originate_on(&self.client.commander(), channel, to, media, options).await
     }
 
     /// Send a raw command on any module (the generic escape hatch).
@@ -1500,6 +1462,7 @@ impl SipServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::originate::originate_on;
     use siphon_control_proto::sip::{BridgeRole, BridgeStage, TransferStage};
     use siphon_control_proto::ChannelSnapshot;
     use std::collections::HashMap;

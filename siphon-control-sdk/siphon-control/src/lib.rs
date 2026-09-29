@@ -87,7 +87,8 @@ mod args;
 mod call;
 
 use args::{
-    extract_headers, extract_privacy, extract_session_timer, extract_string_pairs, originate_media,
+    extract_aor_ring, extract_headers, extract_privacy, extract_session_timer,
+    extract_string_pairs, originate_media,
 };
 use call::Call;
 
@@ -220,6 +221,12 @@ pub(crate) fn to_pyerr(error: ClientError) -> PyErr {
 // ControlClient pyclass
 // ---------------------------------------------------------------------------
 
+/// Where an `originate` rings: one URI as written, or every phone at an AoR.
+enum Destination {
+    To(String),
+    Aor(String, siphon_control_client::sip::AorRing),
+}
+
 struct ClientInner {
     config: ClientConfig,
     client: tokio::sync::Mutex<Option<Arc<SipClient>>>,
@@ -342,15 +349,33 @@ impl ControlClient {
     /// RFC 4028 session timer on it, each key left out taking the server's
     /// default; left out entirely, the configured timer runs.
     ///
+    /// `aor=` in place of `to` rings every phone registered at the AoR, each over
+    /// its own flow and Path (RFC 5626 §5.3, RFC 3327 §5.3), as a `dial` to an
+    /// AoR does; `to` is resolved as written and reaches nothing for a phone
+    /// registered over TCP, TLS or WSS behind NAT. The first phone to answer
+    /// becomes the channel's call and the rest are CANCELled. `strategy`
+    /// (`"parallel"` / `"sequential"`) and `total_timeout` (the group's bound in
+    /// seconds, `0` for none) go with `aor` only. It resolves to `{"channel",
+    /// "group_id", "aor", "strategy", "total_timeout", "branches"}`; until a
+    /// phone answers the channel's events carry the `group_id` as their call id.
+    /// An AoR with nobody registered is `ControlError` `not_found` with
+    /// `details["reason"] == "no_contacts"`. While the phones ring, `hangup`
+    /// CANCELs them all and `drop` is refused.
+    ///
     /// Raises `ValueError` before anything is sent for what the server would
     /// refuse (no media plan or two, an unknown privacy, a session timer siphon
-    /// cannot run), and `ControlError` for the server's own refusals (`conflict`
-    /// for a channel id in use, `not_found` for no route, ...).
+    /// cannot run, both or neither of `to` and `aor`, a `strategy` or
+    /// `total_timeout` beside `to`), and `ControlError` for the server's own
+    /// refusals (`conflict` for a channel id in use, `not_found` for no route,
+    /// ...).
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (
         channel,
-        to,
+        to=None,
         *,
+        aor=None,
+        strategy=None,
+        total_timeout=None,
         media=false,
         profile=None,
         ws_uri=None,
@@ -373,7 +398,10 @@ impl ControlClient {
         &self,
         py: Python<'py>,
         channel: String,
-        to: String,
+        to: Option<String>,
+        aor: Option<String>,
+        strategy: Option<String>,
+        total_timeout: Option<u64>,
         media: bool,
         profile: Option<String>,
         ws_uri: Option<String>,
@@ -392,6 +420,22 @@ impl ControlClient {
         vars: Option<Bound<'py, PyAny>>,
         session_timer: Option<Bound<'py, PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
+        let destination = match (to, aor) {
+            (Some(to), None) if strategy.is_none() && total_timeout.is_none() => {
+                Destination::To(to)
+            }
+            (Some(_), None) => {
+                return Err(PyValueError::new_err(
+                    "originate strategy and total_timeout go with aor=, not to",
+                ))
+            }
+            (None, Some(aor)) => Destination::Aor(aor, extract_aor_ring(strategy, total_timeout)?),
+            (Some(_), Some(_)) | (None, None) => {
+                return Err(PyValueError::new_err(
+                    "originate needs exactly one of to= and aor=",
+                ))
+            }
+        };
         let plan = originate_media(media, profile, ws_uri, sdp, body, content_type)?;
         let privacy = extract_privacy("originate", privacy)?;
         let options = OriginateOptions {
@@ -418,15 +462,33 @@ impl ControlClient {
         let inner = Arc::clone(&self.inner);
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let client = ensure_client(&inner).await?;
-            let placed = client
-                .originate(&channel, &to, plan, options)
-                .await
-                .map_err(to_pyerr)?;
-            let value = serde_json::json!({
-                "channel": placed.channel,
-                "call_id": placed.call_id,
-                "sip_call_id": placed.sip_call_id,
-            });
+            let value = match destination {
+                Destination::To(to) => {
+                    let placed = client
+                        .originate(&channel, &to, plan, options)
+                        .await
+                        .map_err(to_pyerr)?;
+                    serde_json::json!({
+                        "channel": placed.channel,
+                        "call_id": placed.call_id,
+                        "sip_call_id": placed.sip_call_id,
+                    })
+                }
+                Destination::Aor(aor, ring) => {
+                    let group = client
+                        .originate_aor(&channel, &aor, plan, options, ring)
+                        .await
+                        .map_err(to_pyerr)?;
+                    serde_json::json!({
+                        "channel": group.channel,
+                        "group_id": group.group_id,
+                        "aor": group.aor,
+                        "strategy": group.strategy,
+                        "total_timeout": group.total_timeout_secs,
+                        "branches": group.branches,
+                    })
+                }
+            };
             attach_if_running(|py| json_to_py(py, &value))
                 .unwrap_or_else(|| Err(interpreter_gone()))
         })

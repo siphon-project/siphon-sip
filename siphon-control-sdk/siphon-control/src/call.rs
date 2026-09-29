@@ -8,15 +8,43 @@
 use pyo3::prelude::*;
 
 use siphon_control_client::sip::{
-    Call as RustCall, DialOptions, DtmfOptions, PlayOptions, RecordOptions,
+    Call as RustCall, DialOptions, Dialing, DtmfOptions, PlayOptions, RecordOptions, Ringback,
 };
 
 use crate::args::{
-    build_play_source, extract_dial_strategy, extract_dial_targets, extract_headers,
-    extract_privacy, extract_record_channels, extract_record_direction, extract_route_target,
-    parse_peer_hangup,
+    build_play_source, extract_dial_on_answer, extract_dial_strategy, extract_dial_targets,
+    extract_headers, extract_privacy, extract_record_channels, extract_record_direction,
+    extract_route_target, parse_peer_hangup,
 };
 use crate::{attach_if_running, interpreter_gone, json_to_py, optional_json, to_pyerr};
+
+/// The dict `dial` resolves to. The bridge fields are added only for a bridge
+/// dial, so a connecting dial's dict keeps the four keys it always had.
+fn dialing_to_json(dialing: &Dialing) -> serde_json::Value {
+    let mut value = serde_json::json!({
+        "channel": dialing.channel,
+        "targets": dialing.targets,
+        "strategy": dialing.strategy,
+        "timeout": dialing.timeout_secs,
+    });
+    if let (Some(on_answer), Some(fields)) = (&dialing.on_answer, value.as_object_mut()) {
+        fields.insert("on_answer".into(), serde_json::json!(on_answer));
+        fields.insert("group_id".into(), serde_json::json!(dialing.group_id));
+        fields.insert(
+            "total_timeout".into(),
+            serde_json::json!(dialing.total_timeout_secs),
+        );
+        let ringback = match &dialing.ringback {
+            Some(Ringback::Default) => serde_json::json!(true),
+            Some(Ringback::Silent) => serde_json::json!(false),
+            Some(Ringback::Tone(tone)) => serde_json::json!(tone),
+            None => serde_json::Value::Null,
+        };
+        fields.insert("ringback".into(), ringback);
+        fields.insert("branches".into(), serde_json::json!(dialing.branches));
+    }
+    value
+}
 
 /// A handed-over SIP call. Async methods return awaitables.
 #[pyclass(module = "siphon_control", name = "Call")]
@@ -196,11 +224,29 @@ impl Call {
     /// `reason` is for the record, not the wire: it reaches siphon's log and the
     /// CDR (`sip_reason`, beside `disconnect_initiator: "control"` and no
     /// response code).
-    #[pyo3(signature = (reason=None))]
-    fn drop<'py>(&self, py: Python<'py>, reason: Option<String>) -> PyResult<Bound<'py, PyAny>> {
+    ///
+    /// ``ban=True`` also scores the caller's source address toward an auto-ban
+    /// in siphon's ``security.failed_auth_ban`` store, so a source the
+    /// controller keeps dropping is refused at the transport before its next
+    /// INVITE is parsed. One drop is a strong signal over TCP, TLS, WS or WSS,
+    /// whose handshake proved the address, and counts once over UDP, where a
+    /// datagram can name any address. A no-op without ``failed_auth_ban``;
+    /// ``trusted_cidrs`` are never scored; a refused drop scores nothing.
+    #[pyo3(signature = (reason=None, *, ban=false))]
+    fn drop<'py>(
+        &self,
+        py: Python<'py>,
+        reason: Option<String>,
+        ban: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let call = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            call.drop(reason.as_deref()).await.map_err(to_pyerr)
+            if ban {
+                call.drop_and_ban(reason.as_deref()).await
+            } else {
+                call.drop(reason.as_deref()).await
+            }
+            .map_err(to_pyerr)
         })
     }
 
@@ -688,12 +734,31 @@ impl Call {
     /// while ``p_asserted_identity`` keeps the real identity for the trusted
     /// next hop (RFC 3323 §4.1 / RFC 3325 §9.1 / TS 24.607).
     ///
+    /// ``on_answer="bridge"`` rings phones for a caller the app already
+    /// **answered** and anchored on the media engine (``answer_anchored()``),
+    /// which is what lets it play a greeting and a menu first, and bridges the
+    /// first phone to pick up to it. Each phone is a call siphon places itself,
+    /// and none of the caller's INVITE headers reach it. ``ringback`` is what
+    /// the caller hears while phones alert: a tone preset or cadence
+    /// (``"ringback_eu"``, ``"425/1000,0/4000*inf"``), ``True`` for the default
+    /// or ``False`` for none; left out, the server plays ``ringback_eu``. It
+    /// raises ``ValueError`` without ``on_answer="bridge"``. An answer is kept
+    /// only once its phone is bridged: a phone whose bridge fails is hung up
+    /// (``DialBranchFailed`` cause ``bridge_failed``) and the dial goes on.
+    /// ``DialAnswered`` names the bridged phone and a ``channel`` siphon minted
+    /// for it; ``DialFailed`` carries a ``cause`` and leaves the caller answered
+    /// and owned.
+    ///
     /// Returns ``{"channel", "targets", "strategy", "timeout"}``, where
     /// ``targets`` counts the **branches** the server resolved — one AoR
-    /// registered on three devices reports three. Raises ``ControlError`` with
-    /// ``code == "not_found"`` (the call is gone, or no target yielded a
-    /// branch), ``"invalid_state"`` (already answered), ``"bad_request"`` or
-    /// ``"unsupported_verb"``.
+    /// registered on three devices reports three. A bridge dial adds
+    /// ``"on_answer"``, ``"group_id"``, ``"total_timeout"``, ``"ringback"`` and
+    /// ``"branches"`` (one dict per phone, as its ``DialBranch`` event names
+    /// it). Raises ``ControlError`` with ``code == "not_found"`` (the call is
+    /// gone, or no target yielded a branch), ``"invalid_state"`` (already
+    /// answered; for a bridge, ``details["reason"]`` says ``not_answered``,
+    /// ``not_anchored``, ``already_bridged`` or ``dial_in_progress``),
+    /// ``"bad_request"`` or ``"unsupported_verb"``.
     #[pyo3(signature = (
         targets,
         strategy=None,
@@ -704,6 +769,8 @@ impl Call {
         from_display=None,
         p_asserted_identity=None,
         privacy=None,
+        on_answer=None,
+        ringback=None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn dial<'py>(
@@ -720,6 +787,8 @@ impl Call {
         from_display: Option<String>,
         p_asserted_identity: Option<String>,
         privacy: Option<String>,
+        on_answer: Option<String>,
+        ringback: Option<Bound<'py, PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let options = DialOptions {
             strategy: extract_dial_strategy(strategy)?,
@@ -733,17 +802,13 @@ impl Call {
             from_display,
             p_asserted_identity,
             privacy: extract_privacy("dial", privacy)?,
+            on_answer: extract_dial_on_answer(on_answer, ringback)?,
         };
         let dial_targets = extract_dial_targets(&targets)?;
         let call = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let dialing = call.dial(dial_targets, options).await.map_err(to_pyerr)?;
-            let value = serde_json::json!({
-                "channel": dialing.channel,
-                "targets": dialing.targets,
-                "strategy": dialing.strategy,
-                "timeout": dialing.timeout_secs,
-            });
+            let value = dialing_to_json(&dialing);
             attach_if_running(|py| json_to_py(py, &value))
                 .unwrap_or_else(|| Err(interpreter_gone()))
         })

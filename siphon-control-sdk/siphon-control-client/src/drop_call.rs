@@ -33,6 +33,9 @@ impl Call {
     /// response code), so a dropped call reads as deliberate rather than as a
     /// leak.
     ///
+    /// To also score the caller's source toward an auto-ban, use
+    /// [`Call::drop_and_ban`].
+    ///
     /// ```no_run
     /// # use siphon_control_client::sip::Call;
     /// # async fn example(call: &Call) -> Result<(), siphon_control_client::ControlError> {
@@ -41,12 +44,64 @@ impl Call {
     /// # }
     /// ```
     pub async fn drop(&self, reason: Option<&str>) -> Result<(), ControlError> {
-        let mut args = serde_json::Map::new();
-        if let Some(reason) = reason {
-            args.insert("reason".to_string(), json!(reason));
-        }
-        self.sip(SipVerb::Drop, serde_json::Value::Object(args))
+        self.sip(SipVerb::Drop, drop_args(reason, false))
             .await
             .map(|_| ())
+    }
+
+    /// [`Call::drop`], and also score the caller's source address toward an
+    /// auto-ban, so a source the controller keeps dropping is refused at the
+    /// transport before its next INVITE is parsed.
+    ///
+    /// Silence alone costs a scanner nothing: it moves on to the next number at
+    /// the same rate, below any sensible rate limit. The score goes into
+    /// siphon's `security.failed_auth_ban` store and is weighed by how far the
+    /// address can be believed: one drop is a strong signal over TCP, TLS, WS
+    /// or WSS, whose handshake proved the address, and counts once over UDP,
+    /// where a datagram can name any address. A no-op without
+    /// `failed_auth_ban`; `trusted_cidrs` are never scored; and only a drop that
+    /// succeeds scores, so a refused one leaves the source alone.
+    pub async fn drop_and_ban(&self, reason: Option<&str>) -> Result<(), ControlError> {
+        self.sip(SipVerb::Drop, drop_args(reason, true))
+            .await
+            .map(|_| ())
+    }
+}
+
+/// The `drop` arguments. `ban` goes on the wire only when set, so a plain drop
+/// stays the shape a server that predates it reads.
+fn drop_args(reason: Option<&str>, ban: bool) -> serde_json::Value {
+    let mut args = serde_json::Map::new();
+    if let Some(reason) = reason {
+        args.insert("reason".to_string(), json!(reason));
+    }
+    if ban {
+        args.insert("ban".to_string(), json!(true));
+    }
+    serde_json::Value::Object(args)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_plain_drop_carries_no_ban() {
+        assert_eq!(drop_args(None, false), json!({}));
+        assert_eq!(
+            drop_args(Some("no flow claims this number"), false),
+            json!({ "reason": "no flow claims this number" })
+        );
+    }
+
+    /// `ban` is a boolean on the wire: the server refuses anything else, since a
+    /// `"true"` read as false would drop the call and ban nothing.
+    #[test]
+    fn drop_and_ban_sends_a_boolean_ban() {
+        assert_eq!(
+            drop_args(Some("scanner"), true),
+            json!({ "reason": "scanner", "ban": true })
+        );
+        assert_eq!(drop_args(None, true), json!({ "ban": true }));
     }
 }

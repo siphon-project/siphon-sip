@@ -454,6 +454,8 @@ def test_media_header_refer_verbs_roundtrip():
                 # the log and the CDR — nothing about it reaches the wire.
                 await call.drop()
                 await call.drop("no flow claims this number")
+                # `ban` goes on the wire only when asked for, as a boolean.
+                await call.drop("scanner", ban=True)
                 await call.accept_refer(
                     target="sip:c@pbx", next_hop="sip:sbc", mode="terminate"
                 )
@@ -518,6 +520,7 @@ def test_media_header_refer_verbs_roundtrip():
             drop_args = [f["args"] for f in recorded if f["verb"] == "drop"]
             assert drop_args[0] == {}
             assert drop_args[1] == {"reason": "no flow claims this number"}
+            assert drop_args[2] == {"reason": "scanner", "ban": True}
             assert by_verb["accept_refer"] == {
                 "target": "sip:c@pbx",
                 "next_hop": "sip:sbc",
@@ -1299,5 +1302,215 @@ def test_record_verbs_roundtrip():
             client.shutdown()
             with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
                 await asyncio.wait_for(run_task, timeout=5)
+
+    asyncio.run(scenario())
+
+
+def test_bridge_dial_roundtrip():
+    """`call.dial(on_answer="bridge", ringback=...)` sends both under the server's
+    names, returns the group the server placed, and refuses a ringback on a
+    connecting dial before anything is sent."""
+
+    async def scenario():
+        frames = []
+        refused = []
+
+        def reply(frame):
+            if frame["args"].get("on_answer") != "bridge":
+                return {"channel": "ch1", "state": "dialing", "targets": 1,
+                        "strategy": "parallel", "timeout": 30}
+            return {
+                "channel": "ch1",
+                "state": "dialing",
+                "on_answer": "bridge",
+                "group_id": "originate-group-1",
+                "targets": 1,
+                "strategy": "parallel",
+                "timeout": 20,
+                "total_timeout": 20,
+                "ringback": frame["args"].get("ringback", "ringback_eu"),
+                "branches": [{
+                    "leg_id": "leg-1",
+                    "leg_sip_call_id": "b1@host",
+                    "target": "sip:204@203.0.113.7:5060",
+                    "aor": "sip:204@pbx.example",
+                }],
+            }
+
+        stub = _verb_stub({"dial"}, reply, frames)
+        async with websockets.serve(
+            stub, "127.0.0.1", 0, subprotocols=[SUBPROTOCOL]
+        ) as server:
+            port = server.sockets[0].getsockname()[1]
+            url = f"ws://127.0.0.1:{port}/control/ws"
+            client = ControlClient(app=APP, token=TOKEN, url=url)
+            done = asyncio.get_event_loop().create_future()
+
+            @client.on_call
+            async def handle(call):
+                result = await call.dial(
+                    [{"aor": "sip:204@pbx.example"}],
+                    timeout=20,
+                    on_answer="bridge",
+                    ringback="425/1000,0/4000*inf",
+                )
+                await call.dial([{"aor": "sip:204@pbx.example"}], on_answer="bridge")
+                await call.dial(
+                    [{"aor": "sip:204@pbx.example"}], on_answer="bridge", ringback=False
+                )
+                plain = await call.dial([{"aor": "sip:204@pbx.example"}])
+                for kwargs in (
+                    {"ringback": True},
+                    {"on_answer": "connect", "ringback": "ringback_eu"},
+                    {"on_answer": "hunt"},
+                ):
+                    try:
+                        call.dial([{"aor": "sip:204@pbx.example"}], **kwargs)
+                    except ValueError as error:
+                        refused.append(str(error))
+                for ringback in ("", 3):
+                    try:
+                        call.dial(
+                            [{"aor": "sip:204@pbx.example"}],
+                            on_answer="bridge",
+                            ringback=ringback,
+                        )
+                    except TypeError as error:
+                        refused.append(str(error))
+                if not done.done():
+                    done.set_result((result, plain))
+
+            await client.connect()
+            run_task = asyncio.ensure_future(client.run())
+            await asyncio.sleep(0.3)
+            await client.command("test_push_stasis")
+
+            result, plain = await asyncio.wait_for(done, timeout=5)
+            assert result == {
+                "channel": "ch1",
+                "targets": 1,
+                "strategy": "parallel",
+                "timeout": 20,
+                "on_answer": "bridge",
+                "group_id": "originate-group-1",
+                "total_timeout": 20,
+                "ringback": "425/1000,0/4000*inf",
+                "branches": [{
+                    "leg_id": "leg-1",
+                    "leg_sip_call_id": "b1@host",
+                    "target": "sip:204@203.0.113.7:5060",
+                    "aor": "sip:204@pbx.example",
+                }],
+            }
+            # A connecting dial's dict keeps the keys it always had.
+            assert plain == {"channel": "ch1", "targets": 1,
+                             "strategy": "parallel", "timeout": 30}
+
+            assert frames[0]["args"] == {
+                "targets": [{"aor": "sip:204@pbx.example"}],
+                "timeout": 20,
+                "on_answer": "bridge",
+                "ringback": "425/1000,0/4000*inf",
+            }
+            # No ringback asked for: the server's default tone plays.
+            assert frames[1]["args"] == {
+                "targets": [{"aor": "sip:204@pbx.example"}],
+                "on_answer": "bridge",
+            }
+            assert frames[2]["args"]["ringback"] is False
+            assert "on_answer" not in frames[3]["args"]
+            assert len(frames) == 4
+            assert len(refused) == 5, refused
+            assert "bridge" in refused[0], refused[0]
+            assert "on_answer" in refused[2], refused[2]
+
+            client.shutdown()
+            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+                await asyncio.wait_for(run_task, timeout=5)
+
+    asyncio.run(scenario())
+
+
+def test_originate_aor_roundtrip():
+    """`client.originate(channel, aor=...)` sends `aor` in place of `to` with its
+    ring options, resolves to the group, and refuses what the server would."""
+
+    async def scenario():
+        frames = []
+
+        def reply(frame):
+            return {
+                "channel": frame["args"]["channel"],
+                "group_id": "originate-group-1",
+                "aor": "sip:201@example.com",
+                "strategy": "sequential",
+                "total_timeout": 50,
+                "state": "calling",
+                "branches": [{
+                    "leg_id": "leg-1",
+                    "leg_sip_call_id": "b1@host",
+                    "target": "sip:201@203.0.113.7:5060",
+                    "aor": "sip:201@example.com",
+                }],
+            }
+
+        stub = _verb_stub({"originate"}, reply, frames)
+        async with websockets.serve(
+            stub, "127.0.0.1", 0, subprotocols=[SUBPROTOCOL]
+        ) as server:
+            port = server.sockets[0].getsockname()[1]
+            client = ControlClient(
+                app=APP, token=TOKEN, url=f"ws://127.0.0.1:{port}/control/ws"
+            )
+            await client.connect()
+
+            group = await client.originate(
+                "wake-201",
+                aor="sip:201@example.com",
+                media=True,
+                from_uri="sip:reception@example.com",
+                timeout=25,
+                strategy="sequential",
+                total_timeout=50,
+            )
+            assert group == {
+                "channel": "wake-201",
+                "group_id": "originate-group-1",
+                "aor": "sip:201@example.com",
+                "strategy": "sequential",
+                "total_timeout": 50,
+                "branches": [{
+                    "leg_id": "leg-1",
+                    "leg_sip_call_id": "b1@host",
+                    "target": "sip:201@203.0.113.7:5060",
+                    "aor": "sip:201@example.com",
+                }],
+            }
+
+            for kwargs in (
+                {"to": "sip:201@example.com", "aor": "sip:201@example.com"},
+                {},
+                {"to": "sip:201@example.com", "strategy": "parallel"},
+                {"to": "sip:201@example.com", "total_timeout": 10},
+                {"aor": "sip:201@example.com", "strategy": "hunt"},
+            ):
+                with pytest.raises(ValueError):
+                    await client.originate("wake-202", media=True, **kwargs)
+
+            assert len(frames) == 1
+            frame = frames[0]
+            assert frame["verb"] == "originate"
+            assert frame.get("target") is None
+            assert frame["args"] == {
+                "channel": "wake-201",
+                "aor": "sip:201@example.com",
+                "media": True,
+                "from": "sip:reception@example.com",
+                "timeout": 25,
+                "strategy": "sequential",
+                "total_timeout": 50,
+            }
+
+            client.close()
 
     asyncio.run(scenario())
