@@ -55,6 +55,14 @@ entry, but a working config keeps working.
   reason siphon does not know stay `unexpected: true`. The in-process
   `@rtpengine.on_ws_tee_ended` / `on_ws_bridge_ended` examples now treat
   `call_ended` as orderly too.
+- **The control-plane reference matches what the dial events carry.**
+  `DialBranchFailed`, `DialAnswered` and the `DialFailed.branches` entries list
+  `aor` (present when the branch was dialled for an `{aor}` target), the
+  `originate {aor}` table spells the fields out, and `DialFailed`'s
+  `unsupported` array, sent when the caller `Require`s an extension no branch
+  could honour, is documented with the `420`/`494` it comes with. The `drop`
+  section and its `describe` text now say that the `100 Trying` siphon sends on
+  every INVITE's arrival has already gone: `drop` withholds the final response.
 - **A bridge offers each leg the media its own profile describes.** A bridge
   offered the `with` leg media built from the *anchor's* profile, so a
   `dial {on_answer: "bridge"}` naming an SRTP profile for its phones still
