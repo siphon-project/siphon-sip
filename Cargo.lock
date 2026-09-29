@@ -2928,16 +2928,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "serde_bytes"
-version = "0.11.19"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a5d440709e79d88e51ac01c4b72fc6cb7314017bb7da9eeff678aa94c10e3ea8"
-dependencies = [
- "serde",
- "serde_core",
-]
-
-[[package]]
 name = "serde_core"
 version = "1.0.229"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3103,12 +3093,11 @@ checksum = "b2aa850e253778c88a04c3d7323b043aeda9d3e30d5971937c1855769763678e"
 
 [[package]]
 name = "siphon-rtp-proto"
-version = "0.8.0"
+version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "20e8dc62dc715812c712a65be41e434d3c7f35ffebb6ffb342f10952073272ab"
+checksum = "339e15226eb0145bdf34cbd2db6a1dcd9a839575342c5c92beecf8cdba7ec2d5"
 dependencies = [
  "serde",
- "serde_bytes",
  "serde_json",
  "thiserror 2.0.20",
 ]
