@@ -1974,8 +1974,9 @@ fn convert_event(event: Event) -> RtpEngineEvent {
 ///
 /// `WsTeeEndReason` is `#[non_exhaustive]` upstream. The wildcard maps to
 /// [`WsTeeEndReason::TransportError`] rather than a silent
-/// [`WsTeeEndReason::Detached`]: `Detached` is the *only* orderly end, and the
-/// dispatcher keys its WARN-when-unexpected logging on that distinction, so
+/// [`WsTeeEndReason::Detached`]: `Detached` and `CallEnded` are the only
+/// orderly ends, and the dispatcher keys its WARN-when-unexpected logging on
+/// that distinction, so
 /// treating an unknown reason as orderly would hide a dead stream on a live
 /// call — the exact failure this event exists to surface.
 fn ws_tee_end_reason_from_proto(reason: ProtoWsTeeEndReason) -> WsTeeEndReason {
@@ -2030,8 +2031,9 @@ fn play_end_reason_from_proto(reason: PlayEndReason) -> SiphonPlayEndReason {
 /// `WsBridgeEndReason` is `#[non_exhaustive]` upstream. The wildcard maps to
 /// [`WsBridgeEndReason::TransportError`] rather than a silent
 /// [`WsBridgeEndReason::Detached`], for the same reason
-/// [`ws_tee_end_reason_from_proto`] does and with more at stake: `Detached` is
-/// the only orderly end, and a bridge is the call's *whole* media path, so
+/// [`ws_tee_end_reason_from_proto`] does and with more at stake: `Detached` and
+/// `CallEnded` are the only orderly ends, and a bridge is the call's *whole*
+/// media path, so
 /// reading an unknown reason as orderly hides a live call whose far side has
 /// gone away.
 fn ws_bridge_end_reason_from_proto(reason: ProtoWsBridgeEndReason) -> WsBridgeEndReason {
@@ -3353,13 +3355,14 @@ mod tests {
         ] {
             assert_eq!(ws_bridge_end_reason_from_proto(proto), expected);
         }
-        // Only `detached` is orderly — everything else left a live call with no
+        // `detached` and `call_ended` are orderly: siphon or the call's own
+        // teardown ended the bridge. Everything else left a live call with no
         // far side, which is what the WARN and the handler exist for.
         assert!(!WsBridgeEndReason::Detached.is_unexpected());
+        assert!(!WsBridgeEndReason::CallEnded.is_unexpected());
         for reason in [
             WsBridgeEndReason::ServerClosed,
             WsBridgeEndReason::ServerStopped,
-            WsBridgeEndReason::CallEnded,
             WsBridgeEndReason::TransportError,
         ] {
             assert!(
@@ -3509,7 +3512,7 @@ mod tests {
             (ProtoWsTeeEndReason::Detached, "detached", false),
             (ProtoWsTeeEndReason::ServerClosed, "server_closed", true),
             (ProtoWsTeeEndReason::ServerStopped, "server_stopped", true),
-            (ProtoWsTeeEndReason::CallEnded, "call_ended", true),
+            (ProtoWsTeeEndReason::CallEnded, "call_ended", false),
             (ProtoWsTeeEndReason::TransportError, "transport_error", true),
         ];
         for (proto_reason, expected, expected_unexpected) in cases {
@@ -3526,8 +3529,8 @@ mod tests {
                     assert_eq!(tee.reason.as_str(), expected);
                     assert_eq!(tee.frames_sent, Some(4_200));
                     assert_eq!(tee.frames_dropped, Some(3));
-                    // Only an explicit detach is an orderly end; everything else
-                    // means audio stopped while the call is still up.
+                    // A detach or the call's own end is orderly; everything
+                    // else means audio stopped while the call is still up.
                     assert_eq!(
                         tee.reason.is_unexpected(),
                         expected_unexpected,

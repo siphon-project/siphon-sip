@@ -474,8 +474,8 @@ impl CallEvent {
     ///
     /// True for a tee whose audio stopped reaching the consumer mid-call, and
     /// for a bridge — where it is graver, because a bridge is the call's media
-    /// path, so both parties are now up and hearing nothing. `detached` is the
-    /// only orderly end of either.
+    /// path, so both parties are now up and hearing nothing. `detached` and
+    /// `call_ended` are the only orderly ends of either.
     pub fn is_unexpected_stream_end(&self) -> bool {
         match self.kind {
             SipEvent::WsTeeEnded => self.ws_tee_ended().is_some_and(|end| end.unexpected),

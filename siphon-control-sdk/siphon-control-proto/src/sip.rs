@@ -1205,8 +1205,9 @@ pub struct WsTeeEndedPayload {
     #[serde(default)]
     pub reason: String,
     /// Whether the tee ended for a reason the app did not ask for. `detached`
-    /// is the only orderly end; anything else means audio stopped reaching the
-    /// consumer while the call was still up.
+    /// and `call_ended` (an ordinary hang-up) are the orderly ends; anything
+    /// else means audio stopped reaching the consumer while the call was still
+    /// up.
     #[serde(default)]
     pub unexpected: bool,
     /// Wire frames handed to the transport over the tee's lifetime.
@@ -1250,8 +1251,8 @@ pub struct WsBridgeEndedPayload {
     /// Whether the bridge ended for a reason the app did not ask for.
     ///
     /// Weightier than the tee's flag of the same name: a bridge *is* the call's
-    /// media path, so anything but `detached` leaves both parties up and
-    /// hearing nothing. An app that branches on nothing else should branch on
+    /// media path, so anything but `detached` or `call_ended` leaves both
+    /// parties up and hearing nothing. An app that branches on nothing else should branch on
     /// this.
     #[serde(default)]
     pub unexpected: bool,
@@ -1779,8 +1780,8 @@ mod tests {
         }
     }
 
-    /// The end payloads carry `unexpected` because `detached` is the only
-    /// orderly end of either stream — an app that branches on nothing else
+    /// The end payloads carry `unexpected` because `detached` and `call_ended`
+    /// are the only orderly ends of either stream — an app that branches on nothing else
     /// still has to be able to see that one.
     #[test]
     fn stream_end_payloads_carry_the_unexpected_flag() {

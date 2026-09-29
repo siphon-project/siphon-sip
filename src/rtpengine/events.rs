@@ -322,7 +322,8 @@ pub enum WsTeeEndReason {
     ServerClosed,
     /// The WebSocket server sent a `stop` control frame.
     ServerStopped,
-    /// The call's media path went away, so no further audio can be teed.
+    /// The call's media path went away, so no further audio can be teed.  An
+    /// orderly end: the call ended.
     CallEnded,
     /// A WebSocket/transport error ended the stream.
     TransportError,
@@ -345,13 +346,20 @@ impl WsTeeEndReason {
         }
     }
 
-    /// Whether the tee ended for a reason the script did not ask for.
+    /// Whether the tee ended while its call was still up, for a reason neither
+    /// the script nor the call's teardown asked for.
     ///
-    /// `detached` is the only orderly end — every other reason means audio
-    /// stopped reaching the consumer while the call was still up, which is the
-    /// silent-failure case a handler exists to catch.
+    /// Two ends are orderly. `detached` is an explicit detach (and what the
+    /// engine reports for a tee it stops while tearing the call down).
+    /// `call_ended` is the tee's media source going away because the call did:
+    /// an ordinary hang-up, not a failure, and counting it as one would record
+    /// every normal call as a lost stream. `server_closed`, `server_stopped`
+    /// and `transport_error` mean audio stopped reaching the consumer while the
+    /// call carried on, which is the silent-failure case a handler exists to
+    /// catch. A reason this build does not know stays unexpected: guessing
+    /// "orderly" would hide exactly that case.
     pub fn is_unexpected(self) -> bool {
-        !matches!(self, Self::Detached)
+        !matches!(self, Self::Detached | Self::CallEnded)
     }
 }
 
@@ -463,14 +471,14 @@ pub struct WsBridgeEnded {
 /// backend's `siphon_rtp_proto::WsBridgeEndReason`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WsBridgeEndReason {
-    /// The script detached it, or re-pointed it at a different server.  The
-    /// only orderly end.
+    /// The script detached it, or re-pointed it at a different server.  An
+    /// orderly end.
     Detached,
     /// The WebSocket server closed the connection.
     ServerClosed,
     /// The WebSocket server sent a `stop` control frame.
     ServerStopped,
-    /// The call was torn down, so the bridge went with it.
+    /// The call was torn down, so the bridge went with it.  An orderly end.
     CallEnded,
     /// A WebSocket/transport error ended it.
     TransportError,
@@ -492,13 +500,16 @@ impl WsBridgeEndReason {
         }
     }
 
-    /// Whether the bridge ended for a reason the script did not ask for.
+    /// Whether the bridge ended while its call was still up, for a reason
+    /// neither the script nor the call's teardown asked for.
     ///
-    /// `detached` is the only orderly end — and unlike a tee, every other
-    /// reason leaves a live call whose far side has gone away, so a handler
-    /// that does nothing here strands both parties in silence.
+    /// Two ends are orderly: `detached` (an explicit detach or re-point) and
+    /// `call_ended` (the engine tearing the call down took the bridge with it,
+    /// an ordinary hang-up). Every other reason leaves a live call whose far
+    /// side has gone away, so a handler that does nothing here strands both
+    /// parties in silence. A reason this build does not know stays unexpected.
     pub fn is_unexpected(self) -> bool {
-        !matches!(self, Self::Detached)
+        !matches!(self, Self::Detached | Self::CallEnded)
     }
 }
 
@@ -734,6 +745,38 @@ pub struct X3EndedEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A stream is orderly when siphon or its call ended it: a detach, or the
+    /// call being torn down under it. Anything the far end or the transport did
+    /// while the call was still up, and any reason this build does not know, is
+    /// unexpected.
+    #[test]
+    fn a_tee_ending_with_its_call_is_orderly() {
+        assert!(!WsTeeEndReason::Detached.is_unexpected());
+        assert!(!WsTeeEndReason::CallEnded.is_unexpected());
+        for reason in [
+            WsTeeEndReason::ServerClosed,
+            WsTeeEndReason::ServerStopped,
+            WsTeeEndReason::TransportError,
+            WsTeeEndReason::Other("newer_reason"),
+        ] {
+            assert!(reason.is_unexpected(), "{}", reason.as_str());
+        }
+    }
+
+    #[test]
+    fn a_bridge_ending_with_its_call_is_orderly() {
+        assert!(!WsBridgeEndReason::Detached.is_unexpected());
+        assert!(!WsBridgeEndReason::CallEnded.is_unexpected());
+        for reason in [
+            WsBridgeEndReason::ServerClosed,
+            WsBridgeEndReason::ServerStopped,
+            WsBridgeEndReason::TransportError,
+            WsBridgeEndReason::Other("newer_reason"),
+        ] {
+            assert!(reason.is_unexpected(), "{}", reason.as_str());
+        }
+    }
 
     fn make_dtmf_dict(digit: &str) -> Vec<u8> {
         // d
