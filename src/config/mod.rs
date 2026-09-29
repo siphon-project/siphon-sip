@@ -492,6 +492,8 @@ impl Config {
         config.validate_max_message_bytes()?;
         config.validate_control_tls()?;
         config.validate_admin_tls()?;
+        config.validate_admin_listen()?;
+        config.validate_admin_log_tail()?;
         config.validate_control_connect_urls()?;
         config.validate_listen()?;
         config.validate_timer_intervals()?;
@@ -666,6 +668,53 @@ impl Config {
             "admin.tls",
         )
         .map_err(|error| SiphonError::Config(error.to_string()))?;
+        Ok(())
+    }
+
+    /// Reject an `admin.listen` that is not a socket address.
+    ///
+    /// At load, because the listener starts late in startup: an unparseable
+    /// value (`localhost:9091`, `:9091`, a bare address) used to be logged once
+    /// and skipped, leaving every other listener up, `/healthz` answering, and
+    /// no admin API at all. Kept a `String` rather than typed `SocketAddr` so
+    /// `${VAR}` expansion and existing configs built in code are unaffected.
+    fn validate_admin_listen(&self) -> Result<()> {
+        let Some(admin) = &self.admin else {
+            return Ok(());
+        };
+        admin
+            .listen
+            .parse::<std::net::SocketAddr>()
+            .map_err(|error| {
+                SiphonError::Config(format!(
+                    "admin.listen: '{}' is not an IP:port socket address ({error}); \
+                     write e.g. \"127.0.0.1:9091\" or \"0.0.0.0:9091\"",
+                    admin.listen
+                ))
+            })?;
+        Ok(())
+    }
+
+    /// Reject an `admin.log_tail.retain_level` that is not a log level.
+    ///
+    /// The query-side level parser forgives an unknown name as TRACE; here that
+    /// would turn a typo into "format and retain every event".
+    fn validate_admin_log_tail(&self) -> Result<()> {
+        let Some(log_tail) = self
+            .admin
+            .as_ref()
+            .and_then(|admin| admin.log_tail.as_ref())
+        else {
+            return Ok(());
+        };
+        if let Some(ref level) = log_tail.retain_level {
+            if crate::log_tail::parse_level(level).is_none() {
+                return Err(SiphonError::Config(format!(
+                    "admin.log_tail.retain_level: '{level}' is not a level; use info, debug or trace \
+                     (warn and error are always retained)"
+                )));
+            }
+        }
         Ok(())
     }
 

@@ -409,6 +409,10 @@ curl http://127.0.0.1:9091/admin/bans                        # list active bans
 curl -X DELETE http://127.0.0.1:9091/admin/bans/203.0.113.5  # lift one
 ```
 
+Both answer `404` with `"auto-ban not enabled"` when `security.failed_auth_ban`
+is off. `security.banned_ips` in `/admin/metrics.json` is `null` in that case,
+not `0`.
+
 `DELETE /admin/bans/{ip}` clears the userspace ban and, when the kernel firewall
 is enabled, removes the matching nf_tables element in the same step. (A ban left
 alone expires on its own; both the userspace store and the kernel element use the

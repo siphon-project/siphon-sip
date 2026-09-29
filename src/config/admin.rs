@@ -134,7 +134,7 @@ fn default_capture_max_messages() -> usize {
 /// log stream carries call-ids, numbers and peer addresses, so it is gated on
 /// the token regardless of `protect_reads` and there is nothing to gate it with
 /// when no token exists.
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct AdminLogTailConfig {
     /// Enable `GET /admin/logs` and `GET /admin/logs/stream`. Default false.
     #[serde(default)]
@@ -144,10 +144,52 @@ pub struct AdminLogTailConfig {
     /// limiting of its own. Default 4.
     #[serde(default = "default_log_tail_max_streams")]
     pub max_streams: usize,
+    /// Entries of WARN and above held for `GET /admin/logs` while nobody is
+    /// tailing. Default 512.
+    #[serde(default = "default_log_tail_warn_capacity")]
+    pub warn_capacity: usize,
+    /// Also retain lines below WARN, down to this level (`info`, `debug` or
+    /// `trace`), in a second ring of `retain_capacity` entries, so
+    /// `GET /admin/logs` can answer "what happened on that call" after the
+    /// fact. Unset = WARN and above only, and nothing below WARN is formatted
+    /// while nobody is tailing.
+    ///
+    /// Setting it moves that formatting cost onto every admitted event: with
+    /// `info` on a logging script that is a few lines per call. The node's
+    /// `log.level` still applies first, so `debug` here needs a node running at
+    /// debug.
+    #[serde(default)]
+    pub retain_level: Option<String>,
+    /// Size of the `retain_level` ring. Default 4096. Kept apart from the
+    /// warning ring so a busy INFO stream cannot evict the warnings.
+    #[serde(default = "default_log_tail_retain_capacity")]
+    pub retain_capacity: usize,
+}
+
+impl Default for AdminLogTailConfig {
+    /// Hand-written so the capacities default to what serde gives an omitted
+    /// field, not to zero.
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_streams: default_log_tail_max_streams(),
+            warn_capacity: default_log_tail_warn_capacity(),
+            retain_level: None,
+            retain_capacity: default_log_tail_retain_capacity(),
+        }
+    }
 }
 
 fn default_log_tail_max_streams() -> usize {
     4
+}
+
+fn default_log_tail_warn_capacity() -> usize {
+    512
+}
+
+fn default_log_tail_retain_capacity() -> usize {
+    4096
 }
 
 /// Bearer-token auth for the admin API (RFC 6750). When `token` is set, the

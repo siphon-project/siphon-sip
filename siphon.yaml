@@ -1504,9 +1504,13 @@ auth:
 #   GET    /admin/registrations/{aor} one AoR's contacts
 #   DELETE /admin/registrations/{aor} force-unregister an AoR
 #   GET    /admin/bans                list active auto-bans + remaining TTL
+#                                     (404 when security.failed_auth_ban is off)
 #   DELETE /admin/bans/{ip}           lift an auto-ban (also clears the kernel set)
 #   GET    /metrics                   Prometheus scrape (same body as the metrics port)
 # admin:
+#   # An IP:port socket address. Anything else (a hostname, ":9091") is refused
+#   # at startup, and so is a listener that cannot bind: siphon exits rather
+#   # than run without the admin API its probes live on.
 #   listen: "0.0.0.0:9091"
 #   # Optional CORS policy for the admin API (and the /metrics it also serves),
 #   # same shape as metrics.prometheus.cors. Prefer an explicit origin list
@@ -1555,9 +1559,18 @@ auth:
 #   # means running the node at debug. Capture is on-demand: with nobody
 #   # tailing, the cost is one atomic load per log event, so this is safe to
 #   # leave enabled on a busy node.
+#   #
+#   # GET /admin/logs reads what is retained: WARN and above always, in a ring
+#   # of warn_capacity. Set retain_level to also keep lines down to that level
+#   # (info/debug/trace) in a second ring, so a call can be read back after it
+#   # ended. That formats every admitted event at those levels, tailing or not.
+#   # /admin/logs takes level, contains, call_id, limit and before (a seq cursor).
 #   log_tail:
 #     enabled: true
 #     max_streams: 4            # concurrent tails; each holds a bounded queue
+#     warn_capacity: 512        # WARN+ lines retained
+#     # retain_level: info      # unset = WARN+ only
+#     retain_capacity: 4096     # size of the retain_level ring
 #   # Bounded SIP message capture, for the dashboard's per-call ladder and the
 #   # search box (find a call by the number dialled, not just by Call-ID).
 #   # Off by default, and REFUSED without auth.token — the captured messages

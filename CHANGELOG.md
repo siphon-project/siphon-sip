@@ -13,6 +13,33 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
+### Changed
+
+- **`GET /admin/bans` answers `404` when auto-ban is not configured**, as
+  `DELETE /admin/bans/{ip}` already did, and `security.banned_ips` in
+  `/admin/metrics.json` is `null` rather than `0`. An empty list and a zero
+  used to mean both "watching, nothing banned" and "not watching at all".
+  A client that treats any non-200 as a failure should read this 404 as
+  "not configured". The dashboard does.
+- **An unusable `admin.listen` stops startup.** A value that is not an
+  `IP:port` socket address is refused at config load. A listener that cannot
+  bind, or an admin API that cannot start, now ends the process. Before, it
+  logged one error and carried on, with calls flowing, `/healthz` answering,
+  and no admin API.
+
+### Added
+
+- **`GET /admin/logs` can be filtered and paged, and can hold more than
+  warnings.** It takes the stream's `level`, `contains` and `call_id`, plus
+  `limit` (the newest N that match) and `before` (a `seq` cursor, now on every
+  record). The answer carries `retained_level`, so an empty list reads as "no
+  warnings" and not as "nothing happened". New `admin.log_tail` keys:
+  `retain_level` (`info`/`debug`/`trace`) keeps a second ring below WARN so a
+  call can be read back after it ended, sized by `retain_capacity` (default
+  4096). `warn_capacity` (default 512) sizes the warning ring. The default is
+  unchanged: WARN+ only, with nothing below WARN formatted while nobody is
+  tailing.
+
 ## [1.11.3] — 2026-09-29
 
 ### Fixed

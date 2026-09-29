@@ -3,6 +3,7 @@
 //! Consumers create their own `main()`, optionally embed a Python script
 //! with `include_str!()`, and call `SiphonServer::builder().run()`.
 
+mod admin_start;
 mod bootstrap;
 mod shutdown_sequence;
 use shutdown_sequence::run_shutdown_sequence;
@@ -2433,102 +2434,7 @@ impl SiphonServer {
         let drain = Arc::new(dispatcher::DrainState::new());
 
         // --- HTTP admin API (health/readiness probes + registration inspection) ---
-        // Spawned here so it can share the drain signal: /admin/ready reports 503
-        // while draining. Independent of the Prometheus `metrics` listener above
-        // (the admin router also serves /metrics for convenience).
-        if let Some(ref admin_config) = config.admin {
-            match admin_config.listen.parse::<std::net::SocketAddr>() {
-                Ok(listen_addr) => {
-                    if let Some(registrar) = crate::script::api::registrar_arc() {
-                        let auth = admin_config.auth.clone().unwrap_or_default();
-                        let ui_enabled = admin_config
-                            .ui
-                            .as_ref()
-                            .map(|ui| ui.enabled)
-                            .unwrap_or(false);
-                        let instance_id = config
-                            .server
-                            .as_ref()
-                            .and_then(|server| server.instance_id.clone())
-                            .or_else(|| std::env::var("HOSTNAME").ok());
-
-                        // The log tail publishes signalling-adjacent content
-                        // (call-ids, numbers, peer addresses), so it is gated on
-                        // the bearer token regardless of `protect_reads`. With
-                        // no token there is nothing to gate it with, and
-                        // enabling it anyway would publish the node's log stream
-                        // to anyone who can reach the port — so refuse, loudly,
-                        // rather than silently serving it or silently ignoring
-                        // the setting.
-                        let has_token = auth.token.as_ref().is_some_and(|token| !token.is_empty());
-                        if let Some(ref log_tail) = admin_config.log_tail {
-                            if log_tail.enabled && has_token {
-                                crate::log_tail::enable(log_tail.max_streams);
-                                info!(max_streams = log_tail.max_streams, "admin log tail enabled");
-                            } else if log_tail.enabled {
-                                error!(
-                                    "admin.log_tail.enabled is set but admin.auth.token is not; \
-                                     refusing to expose the log stream unauthenticated"
-                                );
-                            }
-                        }
-
-                        if let Some(ref capture) = admin_config.capture {
-                            if capture.enabled && has_token {
-                                crate::capture::enable(crate::capture::CaptureLimits {
-                                    max_bytes: capture.max_bytes,
-                                    max_calls: capture.max_calls,
-                                    max_messages_per_call: capture.max_messages_per_call,
-                                    redact_bodies: capture.redact_bodies,
-                                });
-                                warn!(
-                                    max_bytes = capture.max_bytes,
-                                    max_calls = capture.max_calls,
-                                    redact_bodies = capture.redact_bodies,
-                                    "SIP message capture enabled — signalling is retained in \
-                                     memory and readable over the admin API; this is a debugging \
-                                     facility, not lawful intercept"
-                                );
-                            } else if capture.enabled {
-                                error!(
-                                    "admin.capture.enabled is set but admin.auth.token is not; \
-                                     refusing to expose captured signalling unauthenticated"
-                                );
-                            }
-                        }
-
-                        let admin_state = crate::admin::AdminState {
-                            registrar: Arc::clone(registrar),
-                            start_time: std::time::Instant::now(),
-                            draining: Some(Arc::clone(&drain)),
-                            auth_token: auth
-                                .token
-                                .filter(|token| !token.is_empty())
-                                .map(|token| std::sync::Arc::from(token.as_str())),
-                            protect_reads: auth.protect_reads,
-                            instance_id,
-                            features: crate::admin::AdminFeatures::from_config(&config),
-                            script_engine: Some(Arc::clone(&engine)),
-                            // Overwritten by `router` from its own argument;
-                            // set here only to satisfy the initializer.
-                            ui_enabled: false,
-                        };
-                        tokio::spawn(crate::admin::serve(
-                            listen_addr,
-                            admin_state,
-                            admin_config.cors.clone(),
-                            ui_enabled,
-                            admin_config.tls.clone(),
-                        ));
-                    } else {
-                        error!("admin API enabled but registrar is not initialized; not starting");
-                    }
-                }
-                Err(error) => {
-                    error!(listen = %admin_config.listen, "invalid admin.listen address: {error}");
-                }
-            }
-        }
+        admin_start::start_admin_api(&config, &drain, &engine);
 
         // --- External remote-control plane (ARI/ESL-class) ---
         // Installs the ControlBus, spawns the command consumer + inbound WS

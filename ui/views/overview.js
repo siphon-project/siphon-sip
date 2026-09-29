@@ -186,9 +186,9 @@ function renderHealth(snapshot) {
     lines.push(metaLine("Control apps", apps + " connected", { goto: "control" }));
   }
 
-  const banned = security.banned_ips || 0;
+  const banned = security.banned_ips;
   lines.push(
-    metaLine("Banned sources", banned + " active", {
+    metaLine("Banned sources", isAbsent(banned) ? "auto-ban off" : banned + " active", {
       color: banned > 0 ? "var(--warn)" : undefined,
       goto: "security",
     }),

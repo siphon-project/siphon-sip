@@ -22,13 +22,16 @@ use crate::config::CorsConfig;
 /// same-origin with the API. It only has an effect on a binary built with the
 /// `ui` cargo feature; without that feature a `true` here is a loud warning and
 /// nothing is served.
+///
+/// Returns only when the listener could not be set up or stopped serving. The
+/// error says which; the caller decides what that means for the process.
 pub async fn serve(
     listen_addr: SocketAddr,
     state: AdminState,
     cors: Option<CorsConfig>,
     ui_enabled: bool,
     tls: Option<crate::config::TlsServerConfig>,
-) {
+) -> Result<(), String> {
     #[cfg(not(feature = "ui"))]
     if ui_enabled {
         tracing::warn!(
@@ -48,31 +51,30 @@ pub async fn serve(
     let app = router(state, cors.as_ref(), ui_enabled);
 
     if let Some(tls) = tls {
-        serve_tls(listen_addr, app, &tls).await;
-        return;
+        return serve_tls(listen_addr, app, &tls).await;
     }
-
-    info!("Admin API listening on {}", listen_addr);
 
     let listener = match tokio::net::TcpListener::bind(listen_addr).await {
         Ok(listener) => listener,
         Err(error) => {
             error!("Failed to bind admin API on {}: {}", listen_addr, error);
-            return;
+            return Err(format!("cannot bind {listen_addr}: {error}"));
         }
     };
+    info!("Admin API listening on {}", listen_addr);
 
     // `into_make_service_with_connect_info` so the auth layer can attribute a
     // failed token to a source address and feed the auto-ban, the way the
     // control listener does.
-    if let Err(error) = axum::serve(
+    axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
     .await
-    {
+    .map_err(|error| {
         error!("Admin API server error: {}", error);
-    }
+        format!("server error: {error}")
+    })
 }
 
 /// The TLS half of [`serve`].
@@ -83,12 +85,16 @@ pub async fn serve(
 /// here as well as at config load: the files can change underneath a running
 /// process, and a key that has become unreadable must stop the listener rather
 /// than serve the admin API in the clear.
-async fn serve_tls(listen_addr: SocketAddr, app: Router, tls: &crate::config::TlsServerConfig) {
+async fn serve_tls(
+    listen_addr: SocketAddr,
+    app: Router,
+    tls: &crate::config::TlsServerConfig,
+) -> Result<(), String> {
     let acceptor = match crate::transport::tls::build_hot_reload_acceptor(tls) {
         Ok(acceptor) => acceptor,
         Err(error) => {
             error!(%listen_addr, %error, "admin.tls is configured but unusable — not listening");
-            return;
+            return Err(format!("admin.tls unusable: {error}"));
         }
     };
     let listener =
@@ -98,7 +104,7 @@ async fn serve_tls(listen_addr: SocketAddr, app: Router, tls: &crate::config::Tl
             Ok(listener) => listener,
             Err(error) => {
                 error!("Failed to bind admin API on {}: {}", listen_addr, error);
-                return;
+                return Err(format!("cannot bind {listen_addr}: {error}"));
             }
         };
     info!(
@@ -106,12 +112,13 @@ async fn serve_tls(listen_addr: SocketAddr, app: Router, tls: &crate::config::Tl
         mutual = tls.verify_client,
         "Admin API listening (TLS)"
     );
-    if let Err(error) = axum::serve(
+    axum::serve(
         listener,
         app.into_make_service_with_connect_info::<crate::transport::tls_listener::TlsPeer>(),
     )
     .await
-    {
+    .map_err(|error| {
         error!("Admin API server error: {}", error);
-    }
+        format!("server error: {error}")
+    })
 }
