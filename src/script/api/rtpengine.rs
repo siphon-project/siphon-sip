@@ -3166,10 +3166,10 @@ mod tests {
             message.headers.set("Call-ID", "call-xyz".to_string());
             message
                 .headers
-                .set("From", "<sip:alice@atlanta.com>;tag=ftag-1".to_string());
+                .set("From", "<sip:alice@example.test>;tag=ftag-1".to_string());
             message
                 .headers
-                .set("To", "<sip:bob@biloxi.com>".to_string());
+                .set("To", "<sip:bob@example.test>".to_string());
             let call = PyCall::new(
                 "id-1".to_string(),
                 Arc::new(Mutex::new(message)),
