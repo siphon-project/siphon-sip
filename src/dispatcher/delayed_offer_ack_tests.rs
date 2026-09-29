@@ -215,6 +215,7 @@ impl OfferlessCall {
             ws_uri: None,
             ws_tee: None,
             ws_bridge_attached: false,
+            bridge_sides: None,
             created_at: std::time::Instant::now(),
         });
         state.rtpengine_sessions = Some(sessions);

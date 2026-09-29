@@ -7427,6 +7427,7 @@ fn media_session_fixture(call_id: &str) -> crate::rtpengine::session::MediaSessi
         ws_uri: None,
         ws_tee: None,
         ws_bridge_attached: false,
+        bridge_sides: None,
         created_at: std::time::Instant::now(),
     }
 }

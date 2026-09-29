@@ -1142,6 +1142,7 @@ async fn the_strip_runs_on_the_sdp_the_media_engine_returns() {
         ws_uri: None,
         ws_tee: None,
         ws_bridge_attached: false,
+        bridge_sides: None,
         created_at: std::time::Instant::now(),
     });
     dispatcher.state.rtpengine_sessions = Some(Arc::new(sessions));

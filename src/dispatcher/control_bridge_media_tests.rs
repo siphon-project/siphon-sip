@@ -30,13 +30,13 @@ use crate::rtpengine::test_native_engine::{NativeCommand, NativeTestEngine};
 
 /// A plain-RTP profile a carrier caller is answered with, pinning media
 /// ingress to the signalling source.
-const CARRIER: &str = "carrier_plain";
+pub(super) const CARRIER: &str = "carrier_plain";
 /// An SRTP-only profile a phone is rung with, pinning ingress likewise.
-const SRTP_PHONE: &str = "srtp_phone";
+pub(super) const SRTP_PHONE: &str = "srtp_phone";
 
 /// The built-in profiles plus [`CARRIER`] and [`SRTP_PHONE`], each with the
 /// same transport on both halves.
-fn profiles() -> Arc<crate::rtpengine::ProfileRegistry> {
+pub(super) fn profiles() -> Arc<crate::rtpengine::ProfileRegistry> {
     let profile = |transport: &str| crate::config::MediaProfileConfig {
         offer: crate::config::NgFlagsConfig {
             transport_protocol: Some(transport.to_string()),
@@ -56,7 +56,7 @@ fn profiles() -> Arc<crate::rtpengine::ProfileRegistry> {
 }
 
 /// The last command of kind `name` the engine was sent.
-fn last(engine: &NativeTestEngine, name: &str) -> NativeCommand {
+pub(super) fn last(engine: &NativeTestEngine, name: &str) -> NativeCommand {
     engine
         .commands(name)
         .pop()
@@ -64,19 +64,27 @@ fn last(engine: &NativeTestEngine, name: &str) -> NativeCommand {
 }
 
 /// The engine session the store addresses the leg `sip_call_id` by.
-fn stored(state: &DispatcherState, sip_call_id: &str) -> Option<crate::rtpengine::MediaSession> {
+pub(super) fn stored(
+    state: &DispatcherState,
+    sip_call_id: &str,
+) -> Option<crate::rtpengine::MediaSession> {
     state
         .rtpengine_sessions
         .as_ref()
         .and_then(|store| store.get(sip_call_id))
 }
 
-fn host(address: &str) -> &str {
+pub(super) fn host(address: &str) -> &str {
     address.split(':').next().unwrap_or(address)
 }
 
 /// `phone` answers its INVITE `invite` with an offer of its own.
-fn phone_answers(state: &DispatcherState, phone: &str, invite: &SipMessage, contact: &str) {
+pub(super) fn phone_answers(
+    state: &DispatcherState,
+    phone: &str,
+    invite: &SipMessage,
+    contact: &str,
+) {
     phone_sends(
         state,
         socket(phone),
@@ -92,7 +100,10 @@ fn phone_answers(state: &DispatcherState, phone: &str, invite: &SipMessage, cont
 }
 
 /// The bridge's re-INVITE to `address`, waited for.
-async fn bridge_offer_to(udp: &flume::Receiver<OutboundMessage>, address: &str) -> SipMessage {
+pub(super) async fn bridge_offer_to(
+    udp: &flume::Receiver<OutboundMessage>,
+    address: &str,
+) -> SipMessage {
     let sent = sent_until(udp, |sent| !reinvites_to(sent, address).is_empty()).await;
     reinvites_to(&sent, address)
         .into_iter()
@@ -101,7 +112,7 @@ async fn bridge_offer_to(udp: &flume::Receiver<OutboundMessage>, address: &str) 
 }
 
 /// The party at `address` answers the bridge's re-INVITE `offer`.
-fn accepts(state: &DispatcherState, address: &str, offer: &SipMessage, contact: &str) {
+pub(super) fn accepts(state: &DispatcherState, address: &str, offer: &SipMessage, contact: &str) {
     phone_sends(
         state,
         socket(address),
@@ -110,7 +121,7 @@ fn accepts(state: &DispatcherState, address: &str, offer: &SipMessage, contact: 
 }
 
 /// The party at `address` refuses the bridge's re-INVITE `offer`.
-fn refuses(state: &DispatcherState, address: &str, offer: &SipMessage, contact: &str) {
+pub(super) fn refuses(state: &DispatcherState, address: &str, offer: &SipMessage, contact: &str) {
     phone_sends(
         state,
         socket(address),
@@ -119,7 +130,7 @@ fn refuses(state: &DispatcherState, address: &str, offer: &SipMessage, contact: 
 }
 
 /// The caller at `caller` accepts the bridge's re-INVITE to it.
-async fn caller_accepts(
+pub(super) async fn caller_accepts(
     state: &DispatcherState,
     udp: &flume::Receiver<OutboundMessage>,
     caller: &Caller,
@@ -370,7 +381,7 @@ fn bridge_failures(sip_call_id: &str) -> Vec<serde_json::Value> {
 }
 
 /// Two legs a controller owns, the second calling from `peer_address`.
-fn second_leg(
+pub(super) fn second_leg(
     controller: &super::control_originate_tests::Controller,
     call_id: &str,
     peer_address: &str,

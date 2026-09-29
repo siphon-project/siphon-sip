@@ -97,6 +97,8 @@ mod carrier_attribution_tests;
 #[cfg(test)]
 mod control_bridge_media_tests;
 #[cfg(test)]
+mod control_bridge_relay_tests;
+#[cfg(test)]
 mod control_dial_branch_events_tests;
 #[cfg(test)]
 mod control_dial_bridge_args_tests;
@@ -569,6 +571,7 @@ pub async fn run(
         cancelled_invites: Arc::new(DashMap::new()),
         originate_groups: Arc::new(crate::dispatcher::b2bua::OriginateGroupStore::new()),
         dial_bridges: Arc::new(crate::dispatcher::b2bua::DialBridgeStore::new()),
+        bridge_relays: Arc::new(crate::dispatcher::b2bua::BridgeRelayStore::new()),
         is_draining: drain.clone(),
         rf_charger,
         rf_sessions: Arc::new(DashMap::new()),

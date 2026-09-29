@@ -26,6 +26,19 @@ entry, but a working config keeps working.
 
 ### Fixed
 
+- **A re-offer on a formed controller bridge reaches the other leg.** Each leg
+  of a bridge is a call of its own, so an in-dialog re-INVITE or UPDATE on one
+  never reached the other: the target's was answered by the media engine
+  itself on the pair's call-id, which a native engine takes as a new
+  single-party call and so dropped the relay the other party was on, and the
+  `with` leg's was refused `488`. A hold from either party broke the bridge.
+  Both are now relayed to the other leg through the pair's media session,
+  each party's SDP shaped by the side of the bridge it is on, so an SRTP phone
+  and a plain-RTP caller each keep their own media through a hold and resume.
+  A refusal is relayed back and the media put back as it was; a crossing offer
+  is refused `491`; a bodyless refresh is answered from the session in force;
+  a hangup mid-relay answers the pending request `487` and a relay the other
+  leg never answers is answered `408`.
 - **A bridge offers each leg the media its own profile describes.** A bridge
   offered the `with` leg media built from the *anchor's* profile, so a
   `dial {on_answer: "bridge"}` naming an SRTP profile for its phones still

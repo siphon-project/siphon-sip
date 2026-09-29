@@ -983,6 +983,23 @@ bridge was refused can still be played to, rung back and recorded, and can be
 bridged again. A leg that hangs up while its bridge is forming takes the fresh
 session with it.
 
+**A re-offer on a formed bridge is relayed to the other leg.** A hold, a
+resume or any other re-INVITE or UPDATE carrying SDP on either leg is passed
+to the other leg as a re-INVITE (or UPDATE) of siphon's own, through the pair's
+media session, and the other leg's answer comes back as the 200. Each party
+keeps getting the media it was bridged with: the `with` leg's SDP is shaped as
+its bridge offer was, the target's as its bridge re-INVITE was, whichever of
+them re-offers, so a held SRTP phone is still offered SRTP and a held
+plain-RTP caller is still answered plain RTP. A refusal from the other leg goes
+back to the sender with the same status, and the pair's session is put back
+where it was. An offer that crosses one still being relayed, on either leg, is
+refused `491` (RFC 3261 §14.1). A re-INVITE or UPDATE without SDP is a session
+refresh and is answered at once with the session in force, without disturbing
+the other leg. A leg that hangs up mid-relay has the other's pending request
+answered `487`, and one the other leg never answers is answered `408`. The
+`with` leg still has no media session of its own once bridged: media verbs
+address the pair through the target.
+
 **`unbridge` parts without ending.** Both legs stay answered, owned and
 addressable, and are put on hold: siphon re-offers each `a=sendonly` (RFC 3264
 §8.4; RFC 6337 §3.1 prefers that to the `c=0.0.0.0` of RFC 2543, and §5.1 warns

@@ -31,6 +31,9 @@ pub(super) async fn sweep_stale_entries(state: &DispatcherState) {
     // pending entry — only a matching response or this sweep does. Without it
     // the map grows by one stranded oneshot::Sender per unanswered probe.
     let expired_uac = state.uac_sender.sweep_stale(ttl) as u64;
+    // A re-offer relayed across a controller bridge that the other leg never
+    // answered: the sender is answered 408 and the pair's media put back.
+    crate::dispatcher::b2bua::bridge_relay_sweep(state, now);
     let uac_pending = state.uac_sender.pending_count();
     let dialog_sessions = state.session_store.dialog_key_count();
     // Reap expired/abandoned SUBSCRIBE dialogs from the L1 store (L2 expires

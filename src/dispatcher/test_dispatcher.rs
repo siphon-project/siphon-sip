@@ -136,6 +136,7 @@ pub(super) fn test_dispatcher_with_script(source: &str) -> TestDispatcher {
         cancelled_invites: Arc::new(DashMap::new()),
         originate_groups: Arc::new(crate::dispatcher::b2bua::OriginateGroupStore::new()),
         dial_bridges: Arc::new(crate::dispatcher::b2bua::DialBridgeStore::new()),
+        bridge_relays: Arc::new(crate::dispatcher::b2bua::BridgeRelayStore::new()),
         is_draining: Arc::new(DrainState::new()),
         rf_charger: None,
         rf_sessions: Arc::new(DashMap::new()),

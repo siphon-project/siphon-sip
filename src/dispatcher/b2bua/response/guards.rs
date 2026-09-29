@@ -404,6 +404,24 @@ pub fn dispatch_bridge_reinvite_response(
     // `reinvite:` arm because a bridged pair has no originator leg to forward
     // the answer to: both sides are the A-leg of their own call actor, so the
     // response is absorbed and drives the bridge's next step instead.
+    // A re-offer relayed across a formed bridge: the answer goes to the
+    // engine and back to the leg that sent the offer.
+    if let Some(method) = snapshot
+        .b_leg_target
+        .as_deref()
+        .and_then(|t| t.strip_prefix("bridge_relay:"))
+    {
+        handle_bridge_relay_response(
+            call_id,
+            method,
+            branch,
+            message,
+            status_code,
+            snapshot,
+            state,
+        );
+        return true;
+    }
     if let Some(stage) = snapshot
         .b_leg_target
         .as_deref()
@@ -435,12 +453,12 @@ pub fn absorb_completed_bridge_retransmit(
 ) -> bool {
     // A retransmitted 200 for a bridge re-INVITE already handled: re-ACK it so
     // the responder's transaction stops, and do not re-run the bridge step.
-    if snapshot
-        .b_leg_target
-        .as_deref()
-        .is_some_and(|t| t.starts_with("bridge_done:"))
-    {
-        if (200..300).contains(&status_code) {
+    let done = snapshot.b_leg_target.as_deref().filter(|target| {
+        target.starts_with("bridge_done:") || target.starts_with("bridge_relay_done:")
+    });
+    if let Some(done) = done {
+        // An UPDATE's 2xx is not ACKed (RFC 3311 §5.4).
+        if (200..300).contains(&status_code) && done != BRIDGE_RELAY_DONE_UPDATE {
             if let Some(ack) = build_ack_for_owned_leg(
                 &snapshot.a_leg,
                 message,

@@ -276,6 +276,10 @@ pub struct DispatcherState {
     /// Every entry goes when its dial, bridge or ringback ends, or with the
     /// call it belongs to.
     pub dial_bridges: Arc<crate::dispatcher::b2bua::DialBridgeStore>,
+    /// Re-offers relayed across a formed controller bridge, each waiting for
+    /// the other leg's answer. Every entry goes when that answer arrives, when
+    /// either leg ends, or when the transaction times out.
+    pub bridge_relays: Arc<crate::dispatcher::b2bua::BridgeRelayStore>,
     /// Shared drain state — the server flips `drain.is_draining` on
     /// SIGTERM/SIGINT. While set, new INVITEs are rejected with 503 Service
     /// Unavailable; in-dialog requests (ACK, BYE, PRACK, re-INVITE) and

@@ -87,15 +87,6 @@ pub fn handle_b2bua_update(inbound: InboundMessage, message: SipMessage, state: 
         return;
     }
 
-    // Track the offerer's own new endpoint SDP (its UPDATE offer, raw) so a
-    // later siphon-terminated transfer offers this leg's current media if it is
-    // the survivor.
-    if !message.body.is_empty() {
-        state
-            .call_actors
-            .set_leg_last_sdp(&call_id, from_a_leg, &message.body);
-    }
-
     // Flow refresh (RFC 5626 / RFC 3261 §12.2.2): re-anchor the originating leg
     // on the arrival flow so the UPDATE 200 OK and later in-dialog requests reach
     // the live connection. Done before the snapshot so the clones carry it.
@@ -125,6 +116,23 @@ pub fn handle_b2bua_update(inbound: InboundMessage, message: SipMessage, state: 
                 leg.dialog.remote_contact = Some(contact.clone());
             }
         }
+    }
+
+    // A leg of a formed controller bridge: the other party is another call
+    // actor, and the offer is relayed to it there.
+    if from_a_leg
+        && crate::dispatcher::b2bua::relay_bridged_offer(&inbound, &message, &call_id, state)
+    {
+        return;
+    }
+
+    // Track the offerer's own new endpoint SDP (its UPDATE offer, raw) so a
+    // later siphon-terminated transfer offers this leg's current media if it is
+    // the survivor.
+    if !message.body.is_empty() {
+        state
+            .call_actors
+            .set_leg_last_sdp(&call_id, from_a_leg, &message.body);
     }
 
     // Snapshot routing info + per-leg contacts AFTER the flow refresh.

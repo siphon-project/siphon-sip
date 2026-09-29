@@ -52,19 +52,25 @@ pub(crate) const NATIVE_ENGINE_OFFER: &str = concat!(
     "a=sendrecv\r\n",
 );
 
-/// The SDP the engine returns for an `offer` or `reoffer` made with a profile
-/// naming `transport`: [`NATIVE_ENGINE_OFFER`] on that transport, with an
-/// RFC 4568 SDES key when it is a secure one — the shape the engine gives the
-/// leg a profile's `transport_protocol` asks for.
-pub(crate) fn native_engine_offer(transport: Option<&str>) -> String {
-    let Some(transport) = transport else {
-        return NATIVE_ENGINE_OFFER.to_string();
-    };
-    let mut sdp = NATIVE_ENGINE_OFFER.replace(
-        "m=audio 52000 RTP/AVP 0 101",
-        &format!("m=audio 52000 {transport} 0 101"),
-    );
-    if transport.contains("SAVP") {
+/// `base` as the engine shapes it for a command: on the profile's `transport`
+/// (with an RFC 4568 SDES key when it is a secure one), and carrying the
+/// direction the SDP it was given (`input`) states, the way an engine relays a
+/// party's `sendonly` hold to the other party and the other's `recvonly` back.
+fn native_engine_sdp(base: &str, port: &str, transport: Option<&str>, input: &str) -> String {
+    let mut sdp = base.to_string();
+    if let Some(transport) = transport {
+        sdp = sdp.replace(
+            &format!("m=audio {port} RTP/AVP 0 101"),
+            &format!("m=audio {port} {transport} 0 101"),
+        );
+    }
+    if let Some(direction) = ["sendonly", "recvonly", "inactive"]
+        .into_iter()
+        .find(|direction| input.contains(&format!("a={direction}")))
+    {
+        sdp = sdp.replace("a=sendrecv", &format!("a={direction}"));
+    }
+    if transport.is_some_and(|transport| transport.contains("SAVP")) {
         sdp.push_str(
             "a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:WVNfX19zZW1jdGwgKCkgewkyMjA7fQp9CnVubGVz\r\n",
         );
@@ -196,13 +202,18 @@ impl NativeTestEngine {
                                 call_id,
                                 from_tag,
                                 profile,
-                                ..
+                                sdp,
                             } => (
                                 Some(Recorded {
                                     profile: Some(profile.clone()),
                                     ..Recorded::new("offer", call_id, from_tag)
                                 }),
-                                Some(native_engine_offer(profile.transport_protocol.as_deref())),
+                                Some(native_engine_sdp(
+                                    NATIVE_ENGINE_OFFER,
+                                    "52000",
+                                    profile.transport_protocol.as_deref(),
+                                    sdp,
+                                )),
                                 true,
                                 false,
                             ),
@@ -210,13 +221,19 @@ impl NativeTestEngine {
                                 call_id,
                                 from_tag,
                                 profile,
+                                sdp,
                                 ..
                             } => (
                                 Some(Recorded {
                                     profile: Some(profile.clone()),
                                     ..Recorded::new("answer", call_id, from_tag)
                                 }),
-                                Some(NATIVE_ENGINE_ANSWER.to_string()),
+                                Some(native_engine_sdp(
+                                    NATIVE_ENGINE_ANSWER,
+                                    "51000",
+                                    profile.transport_protocol.as_deref(),
+                                    sdp,
+                                )),
                                 false,
                                 true,
                             ),
@@ -224,13 +241,18 @@ impl NativeTestEngine {
                                 call_id,
                                 from_tag,
                                 profile,
-                                ..
+                                sdp,
                             } => (
                                 Some(Recorded {
                                     profile: Some(profile.clone()),
                                     ..Recorded::new("reoffer", call_id, from_tag)
                                 }),
-                                Some(native_engine_offer(profile.transport_protocol.as_deref())),
+                                Some(native_engine_sdp(
+                                    NATIVE_ENGINE_OFFER,
+                                    "52000",
+                                    profile.transport_protocol.as_deref(),
+                                    sdp,
+                                )),
                                 false,
                                 true,
                             ),
