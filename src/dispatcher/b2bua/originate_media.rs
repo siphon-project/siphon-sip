@@ -84,6 +84,7 @@ pub fn originate_anchor_2xx(
             ws_uri: flags.ws_uri.clone(),
             ws_tee: flags.ws_tee.clone(),
             ws_bridge_attached: false,
+            bridge_sides: None,
             created_at: std::time::Instant::now(),
         });
     }

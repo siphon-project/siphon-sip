@@ -313,8 +313,8 @@ pub(crate) async fn bridge_calls_with_state(
     pair_profile: Option<&str>,
 ) -> Result<BridgeAccepted, crate::b2bua::bridge::BridgeError> {
     use crate::b2bua::bridge::{
-        bridge_answer_profile, bridge_media_plan, set_media_direction, AnchorOffer, BridgeContext,
-        BridgeError, BridgeRole, BridgeStage, MediaDirection,
+        bridge_answer_profile, bridge_media_plan, bridge_offer_profile, set_media_direction,
+        AnchorOffer, BridgeContext, BridgeError, BridgeRole, BridgeStage, MediaDirection,
     };
 
     if params.anchor_sip_call_id == params.peer_sip_call_id {
@@ -446,6 +446,10 @@ pub(crate) async fn bridge_calls_with_state(
         .media
         .as_ref()
         .map(|media| bridge_answer_profile(pair_profile, media).to_string());
+    let media_peer_profile = anchor
+        .media
+        .as_ref()
+        .map(|media| bridge_offer_profile(pair_profile, media, peer.media.as_ref()).to_string());
     let media_pending_adoption = anchor.media.as_ref().is_some_and(|media| !media.relaying);
     let half = |peer_call_id: &str, peer_sip_call_id: &str, role, last_local_offer| BridgeContext {
         peer_call_id: peer_call_id.to_string(),
@@ -456,6 +460,7 @@ pub(crate) async fn bridge_calls_with_state(
         media_call_id: media_call_id.clone(),
         media_from_tag: media_from_tag.clone(),
         media_profile: media_profile.clone(),
+        media_peer_profile: media_peer_profile.clone(),
         media_pending_adoption,
         last_local_offer,
         release_reason: None,
@@ -706,6 +711,8 @@ pub fn b2bua_bridge_peer_left(sip_call_id: &str, state: &DispatcherState) {
     let Some(internal_call_id) = state.call_actors.find_by_sip_call_id(sip_call_id) else {
         return;
     };
+    // A re-offer this leg sent or was being relayed is answered now.
+    bridge_relay_call_ended(&internal_call_id, state);
     let Some(context) = state.call_actors.take_bridge(&internal_call_id) else {
         return;
     };
@@ -743,6 +750,92 @@ pub fn b2bua_bridge_peer_left(sip_call_id: &str, state: &DispatcherState) {
     }
 }
 
+/// The request siphon sent on a leg's own dialog whose final response
+/// [`settle_owned_leg_response`] settles.
+pub struct OwnedLegRequest {
+    /// What the tracking entry is renamed to on a 2xx, so a retransmitted 2xx
+    /// is recognised and not run again.
+    pub done_target: String,
+    /// An INVITE is ACKed (RFC 3261 §13.2.2.4 / §17.1.1.3); an UPDATE is not
+    /// (RFC 3311 §5.4).
+    pub is_invite: bool,
+}
+
+/// Settle the leg side of a final response to a request siphon sent on a
+/// leg's own dialog (a bridged leg is the A-leg of its own call actor): ACK an
+/// INVITE's, keep a 2xx's tracking entry under `done_target` and drop a
+/// failure's, free the leg's offer/answer slot, make an accepted offer the
+/// session in force on the dialog, and let the response set the dialog's
+/// session timer (RFC 4028 §7.2).
+pub fn settle_owned_leg_response(
+    call_id: &str,
+    branch: &str,
+    message: &SipMessage,
+    status_code: u16,
+    snapshot: &BLegResponseSnapshot,
+    request: OwnedLegRequest,
+    state: &DispatcherState,
+) {
+    let a_leg = &snapshot.a_leg;
+    let b_leg_index = snapshot.b_leg_index;
+    let success = (200..300).contains(&status_code);
+    let ack_branch = if success {
+        TransactionKey::generate_branch()
+    } else {
+        branch.to_string()
+    };
+    if request.is_invite {
+        if let Some(ack) = build_ack_for_owned_leg(a_leg, message, &ack_branch, state) {
+            let (destination, transport) = resolve_in_dialog_destination(
+                &a_leg.dialog.route_set,
+                state,
+                a_leg.transport.remote_addr,
+                a_leg.transport.transport,
+            );
+            send_message_from(
+                ack,
+                transport,
+                destination,
+                a_leg.transport.connection_id,
+                a_leg.transport.local_addr,
+                state,
+            );
+        }
+    }
+    if let Some(index) = b_leg_index {
+        if success {
+            // Keep the entry so a retransmitted 200 is re-ACKed rather than
+            // treated as a response to an unknown branch.
+            state
+                .call_actors
+                .set_b_leg_target_uri(call_id, index, request.done_target);
+        } else {
+            state.call_actors.remove_b_leg(call_id, index);
+        }
+    }
+    state.call_actors.set_pending_reinvite(call_id, true, false);
+    // A final response to a request siphon sent on the leg's dialog, which
+    // asked for the dialog's session timer: a 2xx sets it, refresher included
+    // (RFC 4028 §7.2), and makes the offer it accepted the session in force
+    // there.
+    if success {
+        if let Some(offer) = &snapshot.b_leg_offered_sdp {
+            state
+                .call_actors
+                .set_leg_sent_sdp(call_id, true, offer.clone());
+        }
+    }
+    session_timer_on_response(
+        call_id,
+        true,
+        branch,
+        status_code,
+        &message.headers,
+        snapshot.b_leg_request_session_expires,
+        state,
+    );
+}
+
 /// Handle a response to one of a bridge's own re-INVITEs.
 ///
 /// The responder is always the call actor's A-leg — a bridged leg is the A-leg
@@ -763,60 +856,17 @@ pub fn handle_bridge_reinvite_response(
     if status_code < 200 {
         return;
     }
-    let a_leg = &snapshot.a_leg;
-    let b_leg_index = snapshot.b_leg_index;
     let success = (200..300).contains(&status_code);
-    let ack_branch = if success {
-        TransactionKey::generate_branch()
-    } else {
-        branch.to_string()
-    };
-    if let Some(ack) = build_ack_for_owned_leg(a_leg, message, &ack_branch, state) {
-        let (destination, transport) = resolve_in_dialog_destination(
-            &a_leg.dialog.route_set,
-            state,
-            a_leg.transport.remote_addr,
-            a_leg.transport.transport,
-        );
-        send_message_from(
-            ack,
-            transport,
-            destination,
-            a_leg.transport.connection_id,
-            a_leg.transport.local_addr,
-            state,
-        );
-    }
-    if let Some(index) = b_leg_index {
-        if success {
-            // Keep the entry so a retransmitted 200 is re-ACKed rather than
-            // treated as a response to an unknown branch.
-            state
-                .call_actors
-                .set_b_leg_target_uri(call_id, index, format!("bridge_done:{stage}"));
-        } else {
-            state.call_actors.remove_b_leg(call_id, index);
-        }
-    }
-    state.call_actors.set_pending_reinvite(call_id, true, false);
-    // A final response to a re-INVITE siphon sent on the leg's dialog, which
-    // asked for the dialog's session timer: a 2xx sets it, refresher included
-    // (RFC 4028 §7.2), and makes the offer it accepted the session in force
-    // there.
-    if success {
-        if let Some(offer) = &snapshot.b_leg_offered_sdp {
-            state
-                .call_actors
-                .set_leg_sent_sdp(call_id, true, offer.clone());
-        }
-    }
-    session_timer_on_response(
+    settle_owned_leg_response(
         call_id,
-        true,
         branch,
+        message,
         status_code,
-        &message.headers,
-        snapshot.b_leg_request_session_expires,
+        snapshot,
+        OwnedLegRequest {
+            done_target: format!("bridge_done:{stage}"),
+            is_invite: true,
+        },
         state,
     );
 
@@ -1042,6 +1092,20 @@ pub fn bridge_adopt_media(
         .get_call(&context.peer_call_id)
         .and_then(|call| call.a_leg.dialog.remote_tag.clone());
 
+    // What shapes each party from here on: the flags each was bridged with.
+    let bridge_sides = match (&context.media_profile, &context.media_peer_profile) {
+        (Some(anchor), Some(peer)) => Some(crate::rtpengine::session::BridgeSides {
+            anchor: crate::rtpengine::session::SideFlags {
+                profile: anchor.clone(),
+                half: crate::rtpengine::session::ProfileHalf::Answer,
+            },
+            peer: crate::rtpengine::session::SideFlags {
+                profile: peer.clone(),
+                half: crate::rtpengine::session::ProfileHalf::Offer,
+            },
+        }),
+        _ => None,
+    };
     let mut retired = Vec::new();
     if let Some(session) = store.remove(&context.peer_sip_call_id) {
         retired.push((session.rtpengine_id().to_string(), session.from_tag.clone()));
@@ -1069,6 +1133,7 @@ pub fn bridge_adopt_media(
             ws_uri: None,
             ws_tee: None,
             ws_bridge_attached: false,
+            bridge_sides,
             created_at: std::time::Instant::now(),
         });
         // Adopted: a later teardown must delete it through the store, never
@@ -1089,6 +1154,7 @@ pub fn bridge_adopt_media(
         if let Some(profile) = context.media_profile.clone() {
             session.profile = profile;
         }
+        session.bridge_sides = bridge_sides;
         store.insert(session);
     }
     bridge_delete_sessions(state, retired, "the bridge formed");

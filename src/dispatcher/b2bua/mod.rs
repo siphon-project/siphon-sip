@@ -14,6 +14,7 @@
 mod ack;
 mod b_leg;
 mod bridge;
+mod bridge_relay;
 mod builders;
 mod bye;
 mod cancel;
@@ -53,6 +54,7 @@ mod update;
 pub use ack::*;
 pub use b_leg::*;
 pub use bridge::*;
+pub use bridge_relay::*;
 pub use builders::*;
 pub use bye::*;
 pub use cancel::*;

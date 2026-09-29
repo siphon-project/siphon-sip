@@ -364,6 +364,7 @@ pub fn b2bua_bridge_inbound_replaces(
                 ws_uri: None,
                 ws_tee: None,
                 ws_bridge_attached: false,
+                bridge_sides: None,
                 created_at: std::time::Instant::now(),
             });
             store.remove(old_key);
@@ -1265,6 +1266,7 @@ pub fn b2bua_complete_terminated_transfer(
                         ws_uri: None,
                         ws_tee: None,
                         ws_bridge_attached: false,
+                        bridge_sides: None,
                         created_at: std::time::Instant::now(),
                     });
                     store.remove(old_key);

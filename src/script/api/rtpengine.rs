@@ -746,6 +746,7 @@ impl PyRtpEngine {
                     ws_uri: resolved_ws_uri,
                     ws_tee: flags.ws_tee.clone(),
                     ws_bridge_attached: false,
+                    bridge_sides: None,
                     created_at: std::time::Instant::now(),
                 });
             }
@@ -1097,6 +1098,7 @@ impl PyRtpEngine {
                         ws_uri: resolved_ws_uri,
                         ws_tee: flags.ws_tee.clone(),
                         ws_bridge_attached: false,
+                        bridge_sides: None,
                         created_at: std::time::Instant::now(),
                     });
                     Ok(Some(answer_sdp))
@@ -3146,6 +3148,7 @@ mod tests {
             ws_uri: None,
             ws_tee: None,
             ws_bridge_attached: false,
+            bridge_sides: None,
             created_at: std::time::Instant::now(),
         }
     }

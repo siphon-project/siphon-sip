@@ -78,15 +78,6 @@ pub fn handle_b2bua_reinvite(
         return;
     }
 
-    // Track the offerer's own new endpoint SDP (its re-INVITE offer, raw —
-    // before any topology/rtpengine rewrite) so a later siphon-terminated
-    // transfer offers this leg's *current* media if it is the survivor.
-    if !message.body.is_empty() {
-        state
-            .call_actors
-            .set_leg_last_sdp(&call_id, from_a_leg, &message.body);
-    }
-
     // Flow refresh (RFC 5626 / RFC 3261 §12.2.2): the peer may have sent this
     // in-dialog re-INVITE on a new flow (TLS reconnect / NAT rebind). Re-anchor
     // the originating leg's transport + remote target on the arrival flow so the
@@ -119,6 +110,21 @@ pub fn handle_b2bua_reinvite(
                 leg.dialog.remote_contact = Some(contact.clone());
             }
         }
+    }
+
+    // A leg of a formed controller bridge: the other party is another call
+    // actor, and the offer is relayed to it there.
+    if from_a_leg && relay_bridged_offer(&inbound, &message, &call_id, state) {
+        return;
+    }
+
+    // Track the offerer's own new endpoint SDP (its re-INVITE offer, raw —
+    // before any topology/rtpengine rewrite) so a later siphon-terminated
+    // transfer offers this leg's *current* media if it is the survivor.
+    if !message.body.is_empty() {
+        state
+            .call_actors
+            .set_leg_last_sdp(&call_id, from_a_leg, &message.body);
     }
 
     // Snapshot routing info + per-leg contacts AFTER the flow refresh.
@@ -790,7 +796,7 @@ pub fn answer_one_legged_reoffer(
 /// The re-offer is a session refresh request too (RFC 4028 §7.4). With no other
 /// party to relay it to, siphon answers it itself (§9): the 2xx answers the
 /// request's session timer and restarts the session on the dialog.
-fn send_one_legged_ok(
+pub fn send_one_legged_ok(
     inbound: &InboundMessage,
     message: &SipMessage,
     call_id: &str,

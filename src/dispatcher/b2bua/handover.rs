@@ -297,6 +297,7 @@ pub fn anchor_a_leg(
             ws_uri: plan.flags.ws_uri.clone(),
             ws_tee: plan.flags.ws_tee.clone(),
             ws_bridge_attached: false,
+            bridge_sides: None,
             created_at: std::time::Instant::now(),
         });
     }

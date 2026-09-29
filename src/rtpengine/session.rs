@@ -49,8 +49,62 @@ pub struct MediaSession {
     /// call's whole media path and the engine refuses to detach it, which is
     /// why the two are tracked apart rather than as one "has a bridge" flag.
     pub ws_bridge_attached: bool,
+    /// For the session of a formed controller bridge, which flags shape the SDP
+    /// the engine sends each party. `None` for every other session, which has
+    /// one [`MediaSession::profile`] describing the pair the way a dial's
+    /// profile does.
+    pub bridge_sides: Option<BridgeSides>,
     /// When this session was created.
     pub created_at: Instant,
+}
+
+/// Which half of a media profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProfileHalf {
+    /// The profile's `offer` flags.
+    Offer,
+    /// The profile's `answer` flags.
+    Answer,
+}
+
+/// The flags that shape the SDP the engine sends one party: a profile and the
+/// half of it the party was given.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SideFlags {
+    /// The media profile's name.
+    pub profile: String,
+    /// Which half of it.
+    pub half: ProfileHalf,
+}
+
+impl SideFlags {
+    /// The flags themselves, from `registry`; `None` for a profile it does
+    /// not carry.
+    pub fn resolve(
+        &self,
+        registry: &super::profile::ProfileRegistry,
+    ) -> Option<super::profile::NgFlags> {
+        registry.get(&self.profile).map(|entry| match self.half {
+            ProfileHalf::Offer => entry.offer.clone(),
+            ProfileHalf::Answer => entry.answer.clone(),
+        })
+    }
+}
+
+/// The two parties of a bridged pair's session and what shapes each.
+///
+/// A bridge offers its peer with one profile's `offer` half and re-INVITEs its
+/// anchor with one profile's `answer` half — the pair profile's two halves, or
+/// each party's own profile. Every SDP the engine later sends one of them, on
+/// a relayed re-offer in either direction, is shaped by the same flags that
+/// party was bridged with, so an SRTP phone keeps getting SRTP and a plain-RTP
+/// caller plain RTP whichever of them re-offers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BridgeSides {
+    /// The anchor: the party on [`MediaSession::from_tag`].
+    pub anchor: SideFlags,
+    /// The peer: the party on [`MediaSession::to_tag`].
+    pub peer: SideFlags,
 }
 
 impl MediaSession {
@@ -115,6 +169,7 @@ mod media_session_tests {
             ws_uri: None,
             ws_tee: None,
             ws_bridge_attached: false,
+            bridge_sides: None,
             created_at: Instant::now(),
         }
     }
@@ -268,6 +323,7 @@ mod tests {
             ws_uri: None,
             ws_tee: None,
             ws_bridge_attached: false,
+            bridge_sides: None,
             created_at: Instant::now(),
         }
     }

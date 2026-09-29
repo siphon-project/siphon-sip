@@ -204,6 +204,11 @@ pub struct BridgeContext {
     /// with, and which the pair's session carries once formed: the bridge's
     /// pair profile when it was given one, the anchor's own otherwise.
     pub media_profile: Option<String>,
+    /// The profile whose `offer` half shaped what the peer was offered
+    /// ([`bridge_offer_profile`]). With [`BridgeContext::media_profile`] it is
+    /// what the pair's session records per side once formed, so a re-offer
+    /// relayed to either party later is shaped the way that party was bridged.
+    pub media_peer_profile: Option<String>,
     /// Whether [`BridgeContext::media_call_id`] is a fresh session the anchor's
     /// store entry does not point at yet. It is adopted — the two single-party
     /// sessions deleted, the anchor's entry moved to it — when the bridge
