@@ -134,7 +134,10 @@ pub struct DtmfEvent {
 /// being native-only).
 #[derive(Debug, Clone)]
 pub struct CallSummary {
-    /// SIP Call-ID the media session was keyed on — correlates to the SIP CDR.
+    /// The engine call-id siphon addressed the session by: the SIP Call-ID,
+    /// except for a bridged pair or a re-anchored session, which have one of
+    /// their own ([`crate::rtpengine::MediaSessionStore::summary_parties`]
+    /// resolves it).
     pub call_id: String,
     /// Why the call ended: `"delete"` (controller teardown) or `"media_timeout"`
     /// (dead-path reap).
@@ -149,12 +152,16 @@ pub struct CallSummary {
 /// One leg's end-of-call figures in a [`CallSummary`].  The quality fields are
 /// `None` on a leg with no userspace actor (a plain in-kernel relay) or one that
 /// never received media, so a consumer can tell "counters only" from "measured".
-#[derive(Debug, Clone)]
+///
+/// Serialised as the `legs` of the control plane's `MediaSummary` event: a
+/// figure the engine did not measure is omitted, never sent as zero.
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct CallLegSummary {
     /// The leg's tag: the offerer's `from_tag` (near) or the answerer's `to_tag`
     /// (far).
     pub tag: String,
     /// The leg's negotiated audio codec name, if known.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub codec: Option<String>,
     pub packets_in: u64,
     pub bytes_in: u64,
@@ -164,30 +171,41 @@ pub struct CallLegSummary {
     /// jitter overflow), not network loss.
     pub packets_dropped: u64,
     /// The inbound stream's SSRC (RFC 3550), when measured.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub ssrc: Option<u32>,
     /// Cumulative network packets lost on the inbound stream (RFC 3550 §6.4.1),
     /// when measured.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub packets_lost: Option<u32>,
     /// Inbound network packet loss as a percentage, when measured.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub loss_percent: Option<f64>,
     /// Inbound interarrival jitter in milliseconds (RFC 3550 §6.4.1), when measured.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub jitter_ms: Option<f64>,
     /// Engine↔peer round-trip time in milliseconds, when a reception report
     /// yielded one.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub rtt_ms: Option<f64>,
     /// Mean / lowest / highest ITU-T G.107 MOS across the call, when measured.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub mos_average: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub mos_min: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub mos_max: Option<f64>,
     /// `"full"` (MOS includes the G.107 delay term) or `"loss+jitter"` — how the
     /// MOS was derived.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub mos_basis: Option<String>,
     /// RFC 4103 reception counters for this leg's inbound text stream, present
     /// only when the call negotiated a plaintext `m=text` stream *and* a text
     /// observability feature (recording, or `text_events`) promoted it.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<TextStreamStats>,
     /// The engine's media address toward this party — the advertised IP and the
     /// RTP port it received on.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub local_address: Option<SocketAddr>,
     /// Where this party's media actually came from: the source the datapath
     /// latched, else its signalled address.
@@ -195,12 +213,15 @@ pub struct CallLegSummary {
     /// The media-plane peer for this leg, which is the only egress address a
     /// record carries — the SIP-side `destination_ip` is the signalling next
     /// hop and a call anchored through a media engine need not share it.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub remote_address: Option<SocketAddr>,
     /// The SSRC of the stream the engine *sent* this party (RFC 3550), when a
     /// userspace actor originated it. `ssrc` is the inbound counterpart.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub egress_ssrc: Option<u32>,
     /// The RTP payload type of the leg's negotiated codec — the number on the
     /// wire, where `codec` is the name it was negotiated under.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub payload_type: Option<u8>,
 }
 
@@ -231,7 +252,7 @@ pub struct TextEvent {
 /// from the datapath's packet/byte counters: it reports what the receiver
 /// actually recovered, including redundancy repair and unrecoverable-loss
 /// markers.  `None` on a call with no observed text stream.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
 pub struct TextStreamStats {
     /// RTP packets accepted on this leg's inbound text stream.
     pub packets: u64,

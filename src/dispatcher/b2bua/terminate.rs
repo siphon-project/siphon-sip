@@ -266,9 +266,7 @@ pub fn b2bua_release_transferred_call(internal_call_id: &str, state: &Dispatcher
 /// Emit a control-plane `StasisEnd` for a controlled call at teardown (no-op
 /// when the control plane isn't configured or the call isn't controlled).
 pub fn control_notify_terminated(sip_call_id: &str, reason: &str) {
-    if let Some(bus) = crate::control::ControlBus::global() {
-        bus.on_call_terminated(sip_call_id, reason);
-    }
+    control_notify_terminated_with_cause(sip_call_id, reason, None, None);
 }
 
 /// [`control_notify_terminated`] carrying the SIP cause. Used by the originate
@@ -280,6 +278,14 @@ pub fn control_notify_terminated_with_cause(
     code: Option<u16>,
     response: Option<&str>,
 ) {
+    // The library tests install no process bus; they read the teardown's
+    // StasisEnd here, where it is published.
+    #[cfg(test)]
+    crate::control::channel_event_capture::record(
+        sip_call_id,
+        "StasisEnd",
+        &serde_json::json!({ "reason": reason }),
+    );
     if let Some(bus) = crate::control::ControlBus::global() {
         bus.on_call_terminated_with_cause(sip_call_id, reason, code, response);
     }

@@ -210,7 +210,7 @@ async fn on_media_timeout(
 }
 
 async fn on_call_summary(
-    _state: &Arc<DispatcherState>,
+    state: &Arc<DispatcherState>,
     summary: crate::rtpengine::events::CallSummary,
 ) {
     // The media engine reports the end-of-call byte/packet
@@ -228,6 +228,58 @@ async fn on_call_summary(
     );
     if crate::cdr::auto_emit_enabled() {
         crate::cdr::write(media_summary_to_cdr(&summary));
+    }
+    publish_media_summary(state, &summary);
+}
+
+/// The control plane's `MediaSummary` payload for an engine summary: why the
+/// media ended, how long it lived, and each leg's counters and measured
+/// quality, a figure the engine did not measure omitted rather than zeroed.
+pub(super) fn media_summary_payload(
+    summary: &crate::rtpengine::events::CallSummary,
+) -> serde_json::Value {
+    serde_json::json!({
+        "reason": summary.reason,
+        "duration_ms": summary.duration_ms,
+        "legs": summary.legs,
+    })
+}
+
+/// Publish an engine summary as `MediaSummary` to whoever owns each SIP
+/// Call-ID its engine call carried media for.
+///
+/// The summary names the engine call, which is the SIP Call-ID except for a
+/// bridged pair (one engine call on an id of its own, carrying both legs) and
+/// a re-anchored session; the media store resolves it
+/// ([`crate::rtpengine::MediaSessionStore::summary_parties`]), so a pair's
+/// summary reaches both legs, each once.
+///
+/// An ordinary hang-up emits `StasisEnd` and drops the channel synchronously,
+/// while the media session is deleted on a spawned task and the engine reports
+/// the summary only once that delete has run, so the summary usually arrives
+/// after the channel is gone. The control bus keeps the owner reachable for it
+/// for [`crate::control::CHANNEL_TOMBSTONE_GRACE`]; see
+/// [`crate::control::notify_media_summary`].
+pub(super) fn publish_media_summary(
+    state: &DispatcherState,
+    summary: &crate::rtpengine::events::CallSummary,
+) {
+    deliver_media_summary(state, summary, crate::control::notify_media_summary);
+}
+
+/// [`publish_media_summary`] handing each SIP Call-ID's payload to `deliver`.
+pub(super) fn deliver_media_summary(
+    state: &DispatcherState,
+    summary: &crate::rtpengine::events::CallSummary,
+    deliver: impl Fn(&str, serde_json::Value),
+) {
+    let parties = match state.rtpengine_sessions.as_ref() {
+        Some(store) => store.summary_parties(&summary.call_id),
+        None => vec![summary.call_id.clone()],
+    };
+    let payload = media_summary_payload(summary);
+    for sip_call_id in &parties {
+        deliver(sip_call_id, payload.clone());
     }
 }
 

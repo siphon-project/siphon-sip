@@ -183,6 +183,11 @@ impl ControlBus {
                 payload,
             ),
         );
+        // The engine's end-of-call summary follows the media delete, which runs
+        // after this; keep the owner reachable for it.
+        if let Some(entry) = self.channels.get(&channel_id) {
+            self.retain_tombstone(sip_call_id, &channel_id, &entry);
+        }
         self.remove_channel(&channel_id);
         debug!(%channel_id, %sip_call_id, reason, ?code, "control plane: StasisEnd + channel removed");
     }

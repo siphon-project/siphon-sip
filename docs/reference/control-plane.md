@@ -524,6 +524,60 @@ digits does not have to know which wire carried them. The INFO itself is relayed
 to the far leg on a two-leg call and answered `200` on a one-legged one; an INFO
 body that is not DTMF is relayed or answered but produces no event.
 
+### Media summary
+
+When the media engine ends a media session it reports what the session
+carried, and siphon publishes that on each channel whose media the session
+carried as `MediaSummary {reason, duration_ms, legs}` (siphon-rtp only).
+`reason` is `delete` or `media_timeout`; `duration_ms` has about one-second
+grain. `legs` has one entry per party, matched on `tag` (the offerer's
+From-tag, the answerer's To-tag): `packets_in`, `bytes_in`, `packets_out`,
+`bytes_out` and `packets_dropped` (the engine's own drops, not network loss)
+always, and, where the engine measured them, `codec`, `payload_type`, `ssrc`,
+`egress_ssrc`, `packets_lost`, `loss_percent`, `jitter_ms`, `rtt_ms`,
+`mos_average` / `mos_min` / `mos_max` with `mos_basis` (`full` or
+`loss+jitter`), `text` (RFC 4103 counters), `local_address` and
+`remote_address`. A figure the engine did not measure (a leg on the in-kernel
+relay, or one that never received media) is **absent**, not zero.
+
+When you see it:
+
+- A session the engine reaped on **media timeout**, or a single-party session a
+  **`bridge`** replaced with the pair's, ends while the call goes on; its
+  summary arrives on the live channel.
+- The end-of-call summary of an **ordinary hang-up** (a BYE, `hangup`, a
+  failure) arrives **after `StasisEnd`**. Teardown emits `StasisEnd` and
+  removes the channel at once, while the media delete runs on its own task, and
+  the engine produces the summary only after that delete. siphon keeps the
+  owning connection reachable for it for 30 seconds: the summary goes to that
+  connection, with the `channel` id the call had, even though the channel no
+  longer exists. After 30 seconds, or once that connection has disconnected,
+  a late summary is dropped (it is still in the media CDR, `method: MEDIA`,
+  when CDRs are enabled). No other connection or app ever receives it.
+- A **bridged pair** (`bridge`, or `dial {on_answer: "bridge"}`) relays
+  through one engine session of its own, which carries both legs, so its
+  summary goes to **both** channels, once each, and its `legs` cover both
+  parties. Each channel gets it under its own `channel` id, from its own
+  owner's 30-second window: a leg that ended more than 30 seconds before the
+  pair's session did (a peer that hung up while the anchor was held) misses it.
+  An `unbridge` does not change this: the parted legs stay on the pair's
+  session, held, until they hang up. A bridged channel therefore hears one
+  `MediaSummary` per engine session it was on: its own, replaced when the
+  bridge formed, and the pair's.
+
+**Events after `StasisEnd`.** `MediaSummary` is the only event that can follow
+a channel's `StasisEnd`, at most once, and only after a teardown (never after
+`StasisEnd {reason: "routed"}`, which hands a live call back to siphon). A
+controller must accept it for a channel it already considers ended, not treat
+it as an error or an unknown channel, and must not send commands in reply: the
+channel is gone and any verb on it answers `not_found`. Nothing else crosses
+`StasisEnd`; a `WsTeeEnded`, `WsBridgeEnded`, `PlayFinished` or
+`RecordingFinished` the teardown itself causes finds no channel and is not
+delivered.
+
+A call no controller owns publishes nothing. There is no event for media
+*starting* on a leg: the engine reports none.
+
 ### Application-level events
 
 Most events belong to a channel and reach its owner. `RegistrationChanged` does

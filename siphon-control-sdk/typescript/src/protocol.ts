@@ -247,6 +247,7 @@ export type SipEventKind =
   | "WsTeeEnded"
   | "WsBridgeStarted"
   | "WsBridgeEnded"
+  | "MediaSummary"
   | "DialBranch"
   | "DialBranchFailed"
   | "DialAnswered"
@@ -684,6 +685,52 @@ export interface WsTeeEndedPayload {
   unexpected: boolean;
   frames_sent?: number | null;
   frames_dropped?: number | null;
+}
+
+/**
+ * The `payload` of a `MediaSummary` event: the media engine's summary of a
+ * media session it ended on this channel. On an ordinary hang-up it arrives
+ * **after** `StasisEnd`, within 30 s, under the channel id the call had; it is
+ * the only event that can follow `StasisEnd`, so accept it for a channel that
+ * already ended. A bridged pair's session carries both legs: its summary goes
+ * to both channels, once each.
+ */
+export interface MediaSummaryPayload {
+  /** `delete` or `media_timeout`. */
+  reason: string;
+  duration_ms: number;
+  /** One entry per party, matched on `tag`. */
+  legs: MediaLegSummary[];
+}
+
+/**
+ * One party's figures in a {@link MediaSummaryPayload}. A quality field the
+ * engine did not measure is absent, which is not the same as perfect.
+ */
+export interface MediaLegSummary {
+  tag: string;
+  codec?: string;
+  packets_in: number;
+  bytes_in: number;
+  packets_out: number;
+  bytes_out: number;
+  /** Dropped on the engine's side of the leg, not network loss. */
+  packets_dropped: number;
+  ssrc?: number;
+  packets_lost?: number;
+  loss_percent?: number;
+  jitter_ms?: number;
+  rtt_ms?: number;
+  mos_average?: number;
+  mos_min?: number;
+  mos_max?: number;
+  /** `full` or `loss+jitter`. */
+  mos_basis?: string;
+  text?: Record<string, number>;
+  local_address?: string;
+  remote_address?: string;
+  egress_ssrc?: number;
+  payload_type?: number;
 }
 
 /**

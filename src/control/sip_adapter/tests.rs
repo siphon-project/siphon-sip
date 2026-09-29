@@ -1470,6 +1470,13 @@ fn describe_lists_a_lifecycle_for_every_stream_mode() {
     }
 }
 
+/// The media engine's summary is published on the rail, so it is discoverable.
+#[test]
+fn describe_lists_the_media_summary() {
+    let schema = SipControlAdapter::new().describe();
+    assert!(schema.events.iter().any(|event| event == "MediaSummary"));
+}
+
 #[test]
 fn every_advertised_verb_is_claimed_by_a_dispatch_table() {
     // The wire-level version of the split test below: `apply` picks a table

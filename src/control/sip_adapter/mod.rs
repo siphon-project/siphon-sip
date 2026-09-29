@@ -206,6 +206,12 @@ impl ControlAdapter for SipControlAdapter {
                 // the audio is exactly what these exist to prevent.
                 "WsTeeStarted".to_string(),
                 "WsTeeEnded".to_string(),
+                // The media engine's summary of a media session it ended:
+                // per-leg counters and measured quality. The only event that
+                // can follow `StasisEnd`: a hung-up call's summary comes from
+                // the engine after it, and reaches the owner that had the
+                // channel for CHANNEL_TOMBSTONE_GRACE.
+                "MediaSummary".to_string(),
             ],
         }
     }

@@ -1157,6 +1157,15 @@ pub fn bridge_adopt_media(
         session.bridge_sides = bridge_sides;
         store.insert(session);
     }
+    // Both parties relay through the pair's engine call now, and its summary
+    // names that call, not either leg: record both, so each leg's owner gets it.
+    if let Some(pair) = store.get(&anchor_key) {
+        store.record_parties(
+            &anchor_key,
+            pair.rtpengine_id(),
+            &[anchor_key.as_str(), context.peer_sip_call_id.as_str()],
+        );
+    }
     bridge_delete_sessions(state, retired, "the bridge formed");
 }
 
