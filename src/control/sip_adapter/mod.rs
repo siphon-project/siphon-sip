@@ -207,10 +207,10 @@ impl ControlAdapter for SipControlAdapter {
                 "WsTeeStarted".to_string(),
                 "WsTeeEnded".to_string(),
                 // The media engine's summary of a media session it ended:
-                // per-leg counters and measured quality. Reaches the channel
-                // only while it exists, so a session reaped on media timeout
-                // or replaced by a bridge, never the end-of-call summary of a
-                // hung-up call, which the engine sends after `StasisEnd`.
+                // per-leg counters and measured quality. The only event that
+                // can follow `StasisEnd`: a hung-up call's summary comes from
+                // the engine after it, and reaches the owner that had the
+                // channel for CHANNEL_TOMBSTONE_GRACE.
                 "MediaSummary".to_string(),
             ],
         }

@@ -39,9 +39,13 @@ mod events;
 mod queue;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tombstone_tests;
+mod tombstones;
 mod transfer;
 
 pub use queue::{OutboundFrame, OutboundQueue, PushOutcome, SlowConsumerPolicy};
+pub use tombstones::CHANNEL_TOMBSTONE_GRACE;
 pub use transfer::{TransferOutcome, TransferStage};
 
 /// Length-checked constant-time byte comparison (bearer tokens). Length may leak
@@ -222,6 +226,8 @@ pub struct ControlBus {
     reattach_grace_secs: u64,
     handoff_deadline_ms: u64,
     next_conn_id: AtomicU64,
+    /// Who owned a hung-up call, for its late media summary (see `tombstones`).
+    tombstones: tombstones::Tombstones,
 }
 
 static CONTROL_BUS: OnceLock<Arc<ControlBus>> = OnceLock::new();
@@ -256,6 +262,7 @@ impl ControlBus {
             reattach_grace_secs,
             handoff_deadline_ms,
             next_conn_id: AtomicU64::new(1),
+            tombstones: Default::default(),
         })
     }
 
@@ -356,6 +363,7 @@ impl ControlBus {
         conn.events.close();
         self.apps
             .remove_if(&conn.app, |_, fanout| fanout.is_empty());
+        self.drop_tombstones_of(conn.id);
 
         // Orphan every channel this connection owned + arm the grace timer.
         let orphaned: Vec<String> = self

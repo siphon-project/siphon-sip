@@ -534,20 +534,30 @@ always, and, where the engine measured them, `codec`, `payload_type`, `ssrc`,
 `remote_address`. A figure the engine did not measure (a leg on the in-kernel
 relay, or one that never received media) is **absent**, not zero.
 
-It reaches a channel only while the channel exists, and that decides when you
-see it:
+When you see it:
 
 - A session the engine reaped on **media timeout**, or a single-party session a
   **`bridge`** replaced with the pair's, ends while the call goes on; its
-  summary arrives on the channel.
-- The end-of-call summary of an **ordinary hang-up** does not. Every teardown
-  (a BYE, `hangup`, a failure) emits `StasisEnd` and removes the channel at
-  once, while the media delete runs on its own task, and the engine produces
-  the summary only after that delete. By then there is no channel, so nothing
-  is published; the figures are still written to the media CDR (`method:
-  MEDIA`, joined on the Call-ID) when CDRs are enabled. Holding `StasisEnd`
-  for the engine's answer is what delivering it would take, and siphon does
-  not do that.
+  summary arrives on the live channel.
+- The end-of-call summary of an **ordinary hang-up** (a BYE, `hangup`, a
+  failure) arrives **after `StasisEnd`**. Teardown emits `StasisEnd` and
+  removes the channel at once, while the media delete runs on its own task, and
+  the engine produces the summary only after that delete. siphon keeps the
+  owning connection reachable for it for 30 seconds: the summary goes to that
+  connection, with the `channel` id the call had, even though the channel no
+  longer exists. After 30 seconds, or once that connection has disconnected,
+  a late summary is dropped (it is still in the media CDR, `method: MEDIA`,
+  when CDRs are enabled). No other connection or app ever receives it.
+
+**Events after `StasisEnd`.** `MediaSummary` is the only event that can follow
+a channel's `StasisEnd`, at most once, and only after a teardown (never after
+`StasisEnd {reason: "routed"}`, which hands a live call back to siphon). A
+controller must accept it for a channel it already considers ended, not treat
+it as an error or an unknown channel, and must not send commands in reply: the
+channel is gone and any verb on it answers `not_found`. Nothing else crosses
+`StasisEnd`; a `WsTeeEnded`, `WsBridgeEnded`, `PlayFinished` or
+`RecordingFinished` the teardown itself causes finds no channel and is not
+delivered.
 
 A call no controller owns publishes nothing. There is no event for media
 *starting* on a leg: the engine reports none.

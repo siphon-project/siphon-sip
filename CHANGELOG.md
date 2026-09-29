@@ -17,11 +17,13 @@ entry, but a working config keeps working.
 
 - **`MediaSummary` on the control rail.** The media engine's summary of a
   session it ended (per-leg packet and byte counters, loss, jitter, RTT and
-  MOS where measured) is now published on the channel that owns the call, as
-  well as written to the media CDR. It arrives only while the channel exists:
-  a session reaped on media timeout or replaced by a `bridge`. The end-of-call
-  summary of an ordinary hang-up comes from the engine after `StasisEnd` has
-  removed the channel, so it still reaches only the CDR. Typed as
+  MOS where measured) is now published to the controller that owns the call,
+  as well as written to the media CDR. On an ordinary hang-up the engine
+  produces it after `StasisEnd` has removed the channel, so siphon keeps the
+  owning connection reachable for 30 s and delivers it there under the channel
+  id the call had. It is the only event that can follow `StasisEnd`; a
+  controller must accept it for a channel it already considers ended. Dropped
+  past the window or once the owner has disconnected. Typed as
   `SipEvent::MediaSummary` / `MediaSummaryPayload` in the Rust proto crate and
   `MediaSummaryPayload` in the TypeScript SDK.
 

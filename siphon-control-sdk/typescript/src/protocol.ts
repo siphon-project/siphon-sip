@@ -689,9 +689,10 @@ export interface WsTeeEndedPayload {
 
 /**
  * The `payload` of a `MediaSummary` event: the media engine's summary of a
- * media session it ended on this channel. Sent only while the channel exists
- * (a session reaped on media timeout, or one a bridge replaced), never for an
- * ordinary hang-up, whose summary the engine produces after `StasisEnd`.
+ * media session it ended on this channel. On an ordinary hang-up it arrives
+ * **after** `StasisEnd`, within 30 s, under the channel id the call had; it is
+ * the only event that can follow `StasisEnd`, so accept it for a channel that
+ * already ended.
  */
 export interface MediaSummaryPayload {
   /** `delete` or `media_timeout`. */

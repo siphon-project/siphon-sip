@@ -63,6 +63,7 @@ pub use protocol::{
 pub use registry::{
     ChannelRef, ConnHandle, ControlBus, ControlCommand, OfferOutcome, OutboundFrame, OutboundQueue,
     Ownership, PushOutcome, SlowConsumerPolicy, TransferOutcome, TransferStage,
+    CHANNEL_TOMBSTONE_GRACE,
 };
 
 /// Push an event to the control channel owning `sip_call_id`, if the call is
@@ -73,6 +74,18 @@ pub fn notify_channel_event(sip_call_id: &str, event: &str, payload: serde_json:
     channel_event_capture::record(sip_call_id, event, &payload);
     if let Some(bus) = ControlBus::global() {
         bus.forward_channel_event(sip_call_id, event, payload);
+    }
+}
+
+/// Deliver the media engine's summary for `sip_call_id` as `MediaSummary`: to
+/// the call's live channel, or, after `StasisEnd` removed it, to the connection
+/// that owned it within [`CHANNEL_TOMBSTONE_GRACE`]. A no-op when the control
+/// plane is not installed or nobody controlled the call.
+pub fn notify_media_summary(sip_call_id: &str, payload: serde_json::Value) {
+    #[cfg(test)]
+    channel_event_capture::record(sip_call_id, "MediaSummary", &payload);
+    if let Some(bus) = ControlBus::global() {
+        bus.forward_media_summary(sip_call_id, payload);
     }
 }
 

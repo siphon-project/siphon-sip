@@ -249,11 +249,36 @@ async fn only_the_owning_channel_hears_a_summary() {
         media_summary_payload(&summary("ms-uncontrolled@example.test")),
     ));
 
-    // A summary that arrives after the channel's StasisEnd finds no channel.
+    // After StasisEnd the channel is gone, but its owner still gets the
+    // summary, under the channel id the call had.
     bus.on_call_terminated("ms-owned@example.test", "bye");
     assert!(!bus.forward_channel_event(
         "ms-owned@example.test",
         "MediaSummary",
         media_summary_payload(&summary("ms-owned@example.test")),
     ));
+    assert!(bus.forward_media_summary(
+        "ms-owned@example.test",
+        media_summary_payload(&summary("ms-owned@example.test")),
+    ));
+    let frames = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        connection.events.recv_many(),
+    )
+    .await
+    .expect("frames for the owner");
+    let names: Vec<(String, Option<String>)> = frames
+        .into_iter()
+        .filter_map(|frame| match frame {
+            OutboundFrame::Event(event) => Some((event.event, event.channel)),
+            OutboundFrame::Reply(_) => None,
+        })
+        .collect();
+    assert_eq!(
+        names,
+        [
+            ("StasisEnd".to_string(), Some("ch-media".to_string())),
+            ("MediaSummary".to_string(), Some("ch-media".to_string())),
+        ]
+    );
 }

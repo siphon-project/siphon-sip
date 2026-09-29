@@ -245,23 +245,16 @@ pub(super) fn media_summary_payload(
     })
 }
 
-/// Publish an engine summary as `MediaSummary` on the channel that owns its
-/// SIP Call-ID, the way `PlayFinished` and `WsTeeEnded` reach theirs.
+/// Publish an engine summary as `MediaSummary` to whoever owns its SIP Call-ID.
 ///
-/// Delivered only while that channel exists. An ordinary hang-up emits
-/// `StasisEnd` and drops the channel synchronously, while the media session is
-/// deleted on a spawned task and the engine reports the summary only once that
-/// delete has run, so the end-of-call summary of a call torn down by a BYE, a
-/// `hangup` or a failure arrives after the channel is gone and publishes
-/// nothing (it is still in the media CDR). What reaches a channel is a summary
-/// of media that ended while the call went on: a session the engine reaped on
-/// media timeout, and a single-party session a `bridge` replaced.
+/// An ordinary hang-up emits `StasisEnd` and drops the channel synchronously,
+/// while the media session is deleted on a spawned task and the engine reports
+/// the summary only once that delete has run, so the summary usually arrives
+/// after the channel is gone. The control bus keeps the owner reachable for it
+/// for [`crate::control::CHANNEL_TOMBSTONE_GRACE`]; see
+/// [`crate::control::notify_media_summary`].
 pub(super) fn publish_media_summary(summary: &crate::rtpengine::events::CallSummary) {
-    crate::control::notify_channel_event(
-        &summary.call_id,
-        "MediaSummary",
-        media_summary_payload(summary),
-    );
+    crate::control::notify_media_summary(&summary.call_id, media_summary_payload(summary));
 }
 
 async fn on_text(state: &Arc<DispatcherState>, text_event: crate::rtpengine::events::TextEvent) {
