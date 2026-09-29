@@ -13,6 +13,8 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
+## [1.11.2] — 2026-09-29
+
 ### Added
 
 - **`MediaStarted` when media starts flowing on a leg (siphon-rtp 0.10).** The
