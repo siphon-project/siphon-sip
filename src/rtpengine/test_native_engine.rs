@@ -98,6 +98,9 @@ pub(crate) struct NativeCommand {
     /// The profile's per-call `sip_call_id` on the same four: the Call-ID of
     /// the dialog whose SDP the command carried.
     pub(crate) sip_call_id: Option<String>,
+    /// The profile's `ws_uri` and `ws_tee` on the same four.
+    pub(crate) ws_uri: Option<String>,
+    pub(crate) ws_tee: Option<String>,
     /// Whether the engine refused the command because it holds no such call.
     pub(crate) refused: bool,
 }
@@ -333,6 +336,14 @@ impl NativeTestEngine {
                                         .profile
                                         .as_ref()
                                         .and_then(|profile| profile.sip_call_id.clone()),
+                                    ws_uri: record
+                                        .profile
+                                        .as_ref()
+                                        .and_then(|profile| profile.ws_uri.clone()),
+                                    ws_tee: record
+                                        .profile
+                                        .as_ref()
+                                        .and_then(|profile| profile.ws_tee.clone()),
                                     refused,
                                 });
                             }

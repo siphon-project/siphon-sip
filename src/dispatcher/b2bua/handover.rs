@@ -185,8 +185,8 @@ pub fn control_handover(
 /// the RFC 3264 answer with the media engine as the far side, record the media
 /// session, and send the 2xx with that SDP. Returns `Err(reason)` (a short
 /// human string) on any failure so the caller rejects visibly instead of faking
-/// a 200. Reuses #131's `expand_ws_uri` + the profile registry — no duplicated
-/// media logic.
+/// a 200. Reuses [`crate::rtpengine::ws_uri`] + the profile registry — no
+/// duplicated media logic.
 ///
 /// `source_ip` rather than the `InboundMessage` it used to take: the only thing
 /// read off it is the A-leg's source address (the `received_from` gate), and the
@@ -399,48 +399,41 @@ pub fn answer_first_prepare(
                 .find_map(|part| part.trim().strip_prefix("tag=").map(|tag| tag.to_string()))
         })
         .unwrap_or_default();
-    let user_of = |name: &str| -> Option<String> {
-        invite
-            .headers
-            .get(name)
-            .and_then(|value| crate::sip::headers::nameaddr::NameAddr::parse(value).ok())
-            .and_then(|nameaddr| nameaddr.uri.user)
-    };
-    let from_user = user_of("From");
-    let to_user = user_of("To");
+    let (from_user, to_user) = crate::rtpengine::ws_uri::dialog_users(invite);
 
-    // ws_uri precedence: explicit arg → profile's own → none. Template it with
-    // #131's expander (unknown/empty placeholder is an error, not a literal).
-    let ws_uri_template = ws_uri.map(str::to_string).or_else(|| flags.ws_uri.clone());
-    match ws_uri_template {
-        Some(template) => {
-            let context = crate::script::api::rtpengine::WsUriContext {
-                call_id: &media_call_id,
-                from_tag: &from_tag,
-                from_user: from_user.as_deref(),
-                to_user: to_user.as_deref(),
-            };
-            let expanded = crate::script::api::rtpengine::expand_ws_uri(&template, &context)
-                .map_err(|error| format!("ws_uri templating failed: {error:?}"))?;
-            flags.ws_uri = Some(expanded);
-        }
-        None => {
-            // No bridge. The engine terminates the leg itself and siphon drives
-            // it with `play`, DTMF and recording — which is the IVR menu, the
-            // queue announcement, music on hold and the voicemail greeting, and
-            // none of them involve a WebSocket.
-            //
-            // Refusing here meant a controller could only anchor a leg by also
-            // opening an AI audio bridge it did not want, so most of what an
-            // application does to a caller before a person picks up was not
-            // reachable over the control rail at all.
-            debug!(
-                call_id = %media_call_id,
-                profile = %profile_name,
-                "answer-first: anchoring on the engine with no bridge"
-            );
-        }
+    // ws_uri precedence: explicit arg → profile's own → none. The bridge and the
+    // profile's tee are templated together below (an unknown or empty
+    // placeholder is an error, not a literal).
+    if let Some(template) = ws_uri {
+        flags.ws_uri = Some(template.to_string());
     }
+    if flags.ws_uri.is_none() {
+        // No bridge. The engine terminates the leg itself and siphon drives
+        // it with `play`, DTMF and recording — which is the IVR menu, the
+        // queue announcement, music on hold and the voicemail greeting, and
+        // none of them involve a WebSocket.
+        //
+        // Refusing here meant a controller could only anchor a leg by also
+        // opening an AI audio bridge it did not want, so most of what an
+        // application does to a caller before a person picks up was not
+        // reachable over the control rail at all.
+        debug!(
+            call_id = %media_call_id,
+            profile = %profile_name,
+            "answer-first: anchoring on the engine with no bridge"
+        );
+    }
+
+    crate::rtpengine::ws_uri::expand_flag_uris(
+        &mut flags,
+        &crate::rtpengine::ws_uri::WsUriContext {
+            call_id: &media_call_id,
+            from_tag: &from_tag,
+            from_user: from_user.as_deref(),
+            to_user: to_user.as_deref(),
+        },
+    )
+    .map_err(|error| format!("ws_uri templating failed: {error}"))?;
 
     // received_from gate: pin media ingress to the caller's real source IP.
     flags.stamp_received_from(source_ip);

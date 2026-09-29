@@ -623,6 +623,33 @@ class TestWebSocketTee:
         assert recorded["call_id"] == "call-5"
         assert recorded["from_tag"] == "ftag-5"
 
+    def test_attach_expands_call_id_to_the_sip_call_id(self, harness):
+        # `{call_id}` means the leg's SIP Call-ID here, as on a profile's ws_uri.
+        asyncio.run(
+            harness.rtpengine.attach_ws_tee(
+                ("call-6@example.invalid", "ftag-6"), "wss://asr.example.com/{call_id}"
+            )
+        )
+        recorded = harness.rtpengine.media_calls[-1]
+        assert recorded["ws_uri"] == "wss://asr.example.com/call-6@example.invalid"
+
+    def test_attach_refuses_a_misspelt_placeholder(self, harness):
+        with pytest.raises(ValueError, match="callid"):
+            asyncio.run(
+                harness.rtpengine.attach_ws_tee(
+                    ("call-7", "ftag-7"), "wss://asr.example.com/{callid}"
+                )
+            )
+
+    def test_bridge_attach_expands_like_a_tee(self, harness):
+        asyncio.run(
+            harness.rtpengine.attach_ws_bridge(
+                ("call-8@example.invalid", "ftag-8"), "wss://ai.example.com/{call_id}"
+            )
+        )
+        recorded = harness.rtpengine.media_calls[-1]
+        assert recorded["ws_uri"] == "wss://ai.example.com/call-8@example.invalid"
+
     def test_tee_started_handler_receives_the_wire_shape(self, harness):
         # The wire shape is the payload's point: a consumer decodes the binary
         # frames from these values rather than guessing.

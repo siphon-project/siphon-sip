@@ -173,34 +173,59 @@ fn validate_http_url(url: String) -> PyResult<String> {
 /// Default profile name when none is specified.
 const DEFAULT_PROFILE: &str = "rtp_passthrough";
 
-/// The per-call values a `ws_uri` template can interpolate.
-///
-/// `pub(crate)` so the dispatcher's answer-first handover path reuses the exact
-/// #131 templating (`expand_ws_uri`) instead of duplicating it.
-pub(crate) struct WsUriContext<'a> {
-    pub(crate) call_id: &'a str,
-    pub(crate) from_tag: &'a str,
-    pub(crate) from_user: Option<&'a str>,
-    pub(crate) to_user: Option<&'a str>,
+/// The From/To user parts of a message, for `ws_uri` templating.
+fn ws_uri_user_parts(message: &Arc<Mutex<SipMessage>>) -> (Option<String>, Option<String>) {
+    match message.lock() {
+        Ok(message) => crate::rtpengine::ws_uri::dialog_users(&message),
+        Err(_) => (None, None),
+    }
 }
 
-/// The From/To user parts of a message, for `ws_uri` templating.
-///
-/// Reuses [`NameAddr::parse`] rather than re-parsing name-addrs by hand, so a
-/// display-name-with-comma or an angle-bracketed URI is handled the same way the
-/// `request.from_uri` / `request.to_uri` getters handle it.
-fn ws_uri_user_parts(message: &Arc<Mutex<SipMessage>>) -> (Option<String>, Option<String>) {
-    let Ok(message) = message.lock() else {
-        return (None, None);
-    };
-    let user_of = |raw: Option<&String>| -> Option<String> {
-        raw.and_then(|value| crate::sip::headers::nameaddr::NameAddr::parse(value).ok())
-            .and_then(|nameaddr| nameaddr.uri.user)
-    };
-    (
-        user_of(message.headers.from()),
-        user_of(message.headers.to()),
+/// Template both stream URIs on `flags` (the takeover bridge's `ws_uri` and the
+/// tee's `ws_tee`) for the leg `call_id` / `from_tag`, with the dialog's user
+/// parts from `identity`. A bad template raises `ValueError` to the script.
+fn expand_stream_uris(
+    flags: &mut NgFlags,
+    call_id: &str,
+    from_tag: &str,
+    identity: Option<&Arc<Mutex<SipMessage>>>,
+) -> PyResult<()> {
+    let (from_user, to_user) = identity.map(ws_uri_user_parts).unwrap_or((None, None));
+    crate::rtpengine::ws_uri::expand_flag_uris(
+        flags,
+        &crate::rtpengine::ws_uri::WsUriContext {
+            call_id,
+            from_tag,
+            from_user: from_user.as_deref(),
+            to_user: to_user.as_deref(),
+        },
     )
+    .map_err(|error| pyo3::exceptions::PyValueError::new_err(error.to_string()))
+}
+
+/// The leg a stream verb (`attach_ws_tee` / `attach_ws_bridge`) addresses, and
+/// its `ws_uri` with the placeholders expanded for that leg, exactly as a
+/// profile's are at negotiation. A Request/Reply/Call target supplies the
+/// dialog's user parts; a `(call_id, from_tag)` pair or a bare `call_id` has
+/// none, so `{from_user}` / `{to_user}` raise on those.
+fn stream_target(target: &Bound<'_, PyAny>, ws_uri: &str) -> PyResult<(String, String, String)> {
+    let (call_id, from_tag) = resolve_call_from_tag(target)?;
+    let identity = extract_message(target).ok();
+    let (from_user, to_user) = identity
+        .as_ref()
+        .map(ws_uri_user_parts)
+        .unwrap_or((None, None));
+    let expanded = crate::rtpengine::ws_uri::expand_ws_uri(
+        ws_uri,
+        &crate::rtpengine::ws_uri::WsUriContext {
+            call_id: &call_id,
+            from_tag: &from_tag,
+            from_user: from_user.as_deref(),
+            to_user: to_user.as_deref(),
+        },
+    )
+    .map_err(|error| pyo3::exceptions::PyValueError::new_err(error.to_string()))?;
+    Ok((call_id, from_tag, expanded))
 }
 
 /// The source IP of the message a media verb was handed, for `received_from`.
@@ -218,60 +243,6 @@ fn extract_source_ip(object: &Bound<'_, PyAny>) -> Option<String> {
         return Some(call.borrow().cdr_source_ip());
     }
     None
-}
-
-/// Expand `{call_id}` / `{from_tag}` / `{from_user}` / `{to_user}` in a `ws_uri`.
-///
-/// An unrecognised placeholder is an **error**, not a literal: a typo'd
-/// `{callid}` passed through verbatim would reach the engine as part of the URI
-/// path and the inference server would answer a route nobody meant to call. A
-/// placeholder with no value for this call (no From user part, say) is the same
-/// error — silently emitting an empty path segment is the same class of bug.
-///
-/// A URI with no `{` is returned untouched, so the common non-templated case
-/// costs one scan and no allocation decisions.
-///
-/// `pub(crate)` so the dispatcher's answer-first handover path reuses it.
-pub(crate) fn expand_ws_uri(template: &str, context: &WsUriContext<'_>) -> PyResult<String> {
-    if !template.contains('{') {
-        return Ok(template.to_string());
-    }
-
-    let mut expanded = String::with_capacity(template.len());
-    let mut rest = template;
-
-    while let Some(open) = rest.find('{') {
-        expanded.push_str(&rest[..open]);
-        let after_open = &rest[open + 1..];
-        let Some(close) = after_open.find('}') else {
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "ws_uri has an unclosed '{{' placeholder: {template:?}"
-            )));
-        };
-        let name = &after_open[..close];
-        let value = match name {
-            "call_id" => Some(context.call_id),
-            "from_tag" => Some(context.from_tag),
-            "from_user" => context.from_user,
-            "to_user" => context.to_user,
-            other => {
-                return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                    "ws_uri has unknown placeholder {{{other}}}; supported: \
-                     {{call_id}}, {{from_tag}}, {{from_user}}, {{to_user}}"
-                )))
-            }
-        };
-        let Some(value) = value else {
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "ws_uri placeholder {{{name}}} has no value on this call"
-            )));
-        };
-        expanded.push_str(value);
-        rest = &after_open[close + 1..];
-    }
-    expanded.push_str(rest);
-
-    Ok(expanded)
 }
 
 /// Resolve which WebSocket bridge URI a call should use, before templating.
@@ -652,21 +623,6 @@ impl PyRtpEngine {
             &call_id,
             entry.offer.ws_uri.as_deref(),
         );
-        let resolved_ws_uri = match resolved_ws_uri {
-            Some(template) => {
-                let (from_user, to_user) = ws_uri_user_parts(&message);
-                Some(expand_ws_uri(
-                    &template,
-                    &WsUriContext {
-                        call_id: &call_id,
-                        from_tag: &from_tag,
-                        from_user: from_user.as_deref(),
-                        to_user: to_user.as_deref(),
-                    },
-                )?)
-            }
-            None => None,
-        };
         let overrides = MediaOverrides::parse(
             beep_detection,
             beep_cadence_guard_ms,
@@ -678,13 +634,15 @@ impl PyRtpEngine {
         let mut flags = finalise_flags(
             flags,
             &self.client,
-            resolved_ws_uri.clone(),
+            resolved_ws_uri,
             overrides,
             source_ip.as_deref(),
             profile_name,
         )?;
         // The offer is the message's own SDP.
         flags.stamp_sip_call_id(&call_id);
+        expand_stream_uris(&mut flags, &call_id, &from_tag, Some(&message))?;
+        let resolved_ws_uri = flags.ws_uri.clone();
 
         let client = Arc::clone(&self.client);
         let sessions = Arc::clone(&self.sessions);
@@ -879,25 +837,6 @@ impl PyRtpEngine {
             &exchange.call_id,
             side.ws_uri.as_deref(),
         );
-        let resolved_ws_uri = match resolved_ws_uri {
-            Some(template) => {
-                let (from_user, to_user) = exchange
-                    .identity
-                    .as_ref()
-                    .map(ws_uri_user_parts)
-                    .unwrap_or((None, None));
-                Some(expand_ws_uri(
-                    &template,
-                    &WsUriContext {
-                        call_id: &exchange.call_id,
-                        from_tag: &exchange.from_tag,
-                        from_user: from_user.as_deref(),
-                        to_user: to_user.as_deref(),
-                    },
-                )?)
-            }
-            None => None,
-        };
         let overrides = MediaOverrides::parse(
             beep_detection,
             beep_cadence_guard_ms,
@@ -909,7 +848,7 @@ impl PyRtpEngine {
         let mut flags = finalise_flags(
             flags,
             &self.client,
-            resolved_ws_uri.clone(),
+            resolved_ws_uri,
             overrides,
             exchange.source_ip.as_deref(),
             &profile_name,
@@ -917,6 +856,13 @@ impl PyRtpEngine {
         if let Some(answerer_sip_call_id) = exchange.answerer_sip_call_id.as_deref() {
             flags.stamp_sip_call_id(answerer_sip_call_id);
         }
+        expand_stream_uris(
+            &mut flags,
+            &exchange.call_id,
+            &exchange.from_tag,
+            exchange.identity.as_ref(),
+        )?;
+        let resolved_ws_uri = flags.ws_uri.clone();
 
         let client = Arc::clone(&self.client);
         let sessions = Arc::clone(&self.sessions);
@@ -1031,21 +977,6 @@ impl PyRtpEngine {
             &call_id,
             entry.answer.ws_uri.as_deref(),
         );
-        let resolved_ws_uri = match resolved_ws_uri {
-            Some(template) => {
-                let (from_user, to_user) = ws_uri_user_parts(&message);
-                Some(expand_ws_uri(
-                    &template,
-                    &WsUriContext {
-                        call_id: &call_id,
-                        from_tag: &from_tag,
-                        from_user: from_user.as_deref(),
-                        to_user: to_user.as_deref(),
-                    },
-                )?)
-            }
-            None => None,
-        };
         let overrides = MediaOverrides::parse(
             beep_detection,
             beep_cadence_guard_ms,
@@ -1057,13 +988,15 @@ impl PyRtpEngine {
         let mut flags = finalise_flags(
             flags,
             &self.client,
-            resolved_ws_uri.clone(),
+            resolved_ws_uri,
             overrides,
             source_ip.as_deref(),
             &profile_name,
         )?;
         // The engine answers the message's own offer.
         flags.stamp_sip_call_id(&call_id);
+        expand_stream_uris(&mut flags, &call_id, &from_tag, Some(&message))?;
+        let resolved_ws_uri = flags.ws_uri.clone();
 
         // Capture an owned handle to the Call for the auto-488 path, cloned
         // while the GIL is held (free-threaded `Py::clone` rule).  `None` when
@@ -1795,8 +1728,12 @@ impl PyRtpEngine {
     /// ```
     ///
     /// Args:
-    ///     target: Request, Reply or Call identifying the media session.
+    ///     target: Request, Reply or Call identifying the media session, a
+    ///         ``(call_id, from_tag)`` pair, or a bare ``call_id``.
     ///     ws_uri: ``ws://`` or ``wss://`` URI the engine dials as a client.
+    ///         ``{call_id}`` (the SIP Call-ID), ``{from_tag}``, ``{from_user}``
+    ///         and ``{to_user}`` expand as they do on a profile's ``ws_uri``;
+    ///         an unknown or valueless placeholder raises ``ValueError``.
     ///     direction: Which leg(s) to stream — ``"both"`` (default),
     ///         ``"caller"`` (the offerer) or ``"callee"`` (the answerer).
     ///     channels: Wire channel count — ``2`` interleaves caller/callee as
@@ -1818,7 +1755,7 @@ impl PyRtpEngine {
         channels: Option<u8>,
         sample_rate: Option<u32>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let (call_id, from_tag) = resolve_call_from_tag(target)?;
+        let (call_id, from_tag, ws_uri) = stream_target(target, &ws_uri)?;
 
         let direction = WsTeeDirection::parse(direction).ok_or_else(|| {
             pyo3::exceptions::PyValueError::new_err(format!(
@@ -1948,8 +1885,10 @@ impl PyRtpEngine {
     /// ```
     ///
     /// Args:
-    ///     target: Request, Reply or Call identifying the media session.
-    ///     ws_uri: ``ws://`` or ``wss://`` URI the engine dials as a client.
+    ///     target: Request, Reply or Call identifying the media session, a
+    ///         ``(call_id, from_tag)`` pair, or a bare ``call_id``.
+    ///     ws_uri: ``ws://`` or ``wss://`` URI the engine dials as a client,
+    ///         templated as for :meth:`attach_ws_tee`.
     #[pyo3(signature = (target, ws_uri))]
     fn attach_ws_bridge<'py>(
         &self,
@@ -1957,7 +1896,7 @@ impl PyRtpEngine {
         target: &Bound<'py, PyAny>,
         ws_uri: String,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let (call_id, from_tag) = resolve_call_from_tag(target)?;
+        let (call_id, from_tag, ws_uri) = stream_target(target, &ws_uri)?;
         let client = Arc::clone(&self.client);
         let sessions = Arc::clone(&self.sessions);
 
@@ -3018,83 +2957,6 @@ mod tests {
         }
     }
 
-    // -- ws_uri templating ----------------------------------------------------
-
-    fn ws_context<'a>() -> WsUriContext<'a> {
-        WsUriContext {
-            call_id: "abc123@example.invalid",
-            from_tag: "tag-a",
-            from_user: Some("1001"),
-            to_user: Some("2002"),
-        }
-    }
-
-    #[test]
-    fn expand_ws_uri_without_placeholder_is_untouched() {
-        let expanded = expand_ws_uri("wss://ai.invalid/stream", &ws_context()).unwrap();
-        assert_eq!(expanded, "wss://ai.invalid/stream");
-    }
-
-    #[test]
-    fn expand_ws_uri_substitutes_every_placeholder() {
-        let expanded = expand_ws_uri(
-            "wss://ai.invalid/{call_id}/{from_tag}?from={from_user}&to={to_user}",
-            &ws_context(),
-        )
-        .unwrap();
-        assert_eq!(
-            expanded,
-            "wss://ai.invalid/abc123@example.invalid/tag-a?from=1001&to=2002"
-        );
-    }
-
-    #[test]
-    fn expand_ws_uri_substitutes_repeated_placeholder() {
-        let expanded =
-            expand_ws_uri("wss://ai.invalid/{call_id}/{call_id}", &ws_context()).unwrap();
-        assert_eq!(
-            expanded,
-            "wss://ai.invalid/abc123@example.invalid/abc123@example.invalid"
-        );
-    }
-
-    /// A typo'd placeholder must not reach the engine as a literal path segment.
-    #[test]
-    fn expand_ws_uri_rejects_unknown_placeholder() {
-        pyo3::Python::initialize();
-        let error = expand_ws_uri("wss://ai.invalid/{callid}", &ws_context()).unwrap_err();
-        assert!(
-            error.to_string().contains("unknown placeholder {callid}"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[test]
-    fn expand_ws_uri_rejects_unclosed_placeholder() {
-        pyo3::Python::initialize();
-        let error = expand_ws_uri("wss://ai.invalid/{call_id", &ws_context()).unwrap_err();
-        assert!(
-            error.to_string().contains("unclosed"),
-            "unexpected error: {error}"
-        );
-    }
-
-    /// A placeholder with nothing to substitute is an error too — an empty path
-    /// segment is as wrong as a literal one, just harder to spot.
-    #[test]
-    fn expand_ws_uri_rejects_placeholder_with_no_value() {
-        pyo3::Python::initialize();
-        let context = WsUriContext {
-            from_user: None,
-            ..ws_context()
-        };
-        let error = expand_ws_uri("wss://ai.invalid/{from_user}", &context).unwrap_err();
-        assert!(
-            error.to_string().contains("has no value"),
-            "unexpected error: {error}"
-        );
-    }
-
     // -- ws_uri resolution precedence -----------------------------------------
 
     #[test]
@@ -3290,6 +3152,55 @@ mod tests {
             let number = 42i64.into_pyobject(py).unwrap();
             let error = resolve_call_from_tag(number.as_any()).unwrap_err();
             assert!(error.is_instance_of::<pyo3::exceptions::PyTypeError>(py));
+        });
+    }
+
+    /// `attach_ws_tee` / `attach_ws_bridge` expand a URI's placeholders the
+    /// way a profile's are expanded at negotiation: `{call_id}` is the SIP
+    /// Call-ID of the leg the verb addresses.
+    #[test]
+    fn stream_target_expands_the_uri_for_the_addressed_leg() {
+        pyo3::Python::initialize();
+        Python::attach(|py| {
+            let mut message = test_message(Some("application/sdp"), b"v=0\r\n");
+            message.headers.set("Call-ID", "call-xyz".to_string());
+            message
+                .headers
+                .set("From", "<sip:alice@atlanta.com>;tag=ftag-1".to_string());
+            message
+                .headers
+                .set("To", "<sip:bob@biloxi.com>".to_string());
+            let call = PyCall::new(
+                "id-1".to_string(),
+                Arc::new(Mutex::new(message)),
+                "192.0.2.1".to_string(),
+                "udp".to_string(),
+            );
+            let py_call = Py::new(py, call).unwrap();
+            let bound_call = py_call.bind(py).clone().into_any();
+            let (call_id, from_tag, uri) = stream_target(
+                &bound_call,
+                "wss://asr.invalid/{call_id}/{from_tag}?from={from_user}&to={to_user}",
+            )
+            .unwrap();
+            assert_eq!(
+                (call_id.as_str(), from_tag.as_str()),
+                ("call-xyz", "ftag-1")
+            );
+            assert_eq!(uri, "wss://asr.invalid/call-xyz/ftag-1?from=alice&to=bob");
+
+            // The `(call_id, from_tag)` form an event handler holds: its ids
+            // expand, and a user part it cannot supply is refused, not blanked.
+            let pair = pyo3::types::PyTuple::new(py, ["call-xyz", "ftag-1"]).unwrap();
+            let (_, _, uri) = stream_target(pair.as_any(), "wss://asr.invalid/{call_id}").unwrap();
+            assert_eq!(uri, "wss://asr.invalid/call-xyz");
+            let error = stream_target(pair.as_any(), "wss://asr.invalid/{from_user}").unwrap_err();
+            assert!(error.is_instance_of::<pyo3::exceptions::PyValueError>(py));
+
+            // A misspelt placeholder never reaches the engine.
+            let error = stream_target(&bound_call, "wss://asr.invalid/{callid}").unwrap_err();
+            assert!(error.is_instance_of::<pyo3::exceptions::PyValueError>(py));
+            assert!(error.to_string().contains("{callid}"), "{error}");
         });
     }
 
