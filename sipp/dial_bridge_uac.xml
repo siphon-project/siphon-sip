@@ -8,6 +8,8 @@
 
   INVITE -> 200 (the engine's answer) -> ACK
          -> re-INVITE (the bridge, handing this leg the phone) -> 200 -> ACK
+         -> re-INVITE (hold, sendonly) -> 200 (recvonly, the phone's answer) -> ACK
+         -> re-INVITE (resume, sendrecv) -> 200 (sendrecv) -> ACK
          -> BYE -> 200
 
   Asserted: the controller's answer is the engine's (the caller is anchored,
@@ -106,7 +108,120 @@ a=ptime:30
 
   <recv request="ACK" rtd="true" />
 
-  <pause milliseconds="2000" />
+  <pause milliseconds="1000" />
+
+  <!-- Hold and resume across the formed bridge: each is relayed to the phone
+       and its answer comes back through the engine. -->
+  <send retrans="500">
+    <![CDATA[
+INVITE [next_url] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: "Caller" <sip:15550000009@dialbridge.test>;tag=[pid]SIPpTag00[call_number]
+To: <sip:ivr@[remote_ip]>[peer_tag_param]
+Call-ID: [call_id]
+CSeq: 2 INVITE
+Contact: <sip:caller@[local_ip]:[local_port];transport=[transport]>
+[routes]
+Max-Forwards: 70
+Content-Type: application/sdp
+Content-Length: [len]
+
+v=0
+o=caller 53655765 2353687640 IN IP[local_ip_type] [local_ip]
+s=-
+c=IN IP[media_ip_type] [media_ip]
+t=0 0
+m=audio [media_port] RTP/AVP 8
+a=rtpmap:8 PCMA/8000
+a=ptime:30
+a=sendonly
+]]>
+  </send>
+
+  <recv response="100" optional="true" />
+
+  <recv response="200" crlf="true">
+    <action>
+      <ereg regexp="c=IN IP4 172\.20\.0\.130"
+            search_in="body" check_it="true" assign_to="relay_2_anchored" />
+      <ereg regexp="a=recvonly"
+            search_in="body" check_it="true" assign_to="relay_2_direction" />
+      <log message="relayed sendonly answered by the phone through the engine: [$relay_2_anchored] [$relay_2_direction]" />
+    </action>
+  </recv>
+
+  <send>
+    <![CDATA[
+ACK [next_url] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: "Caller" <sip:15550000009@dialbridge.test>;tag=[pid]SIPpTag00[call_number]
+To: <sip:ivr@[remote_ip]>[peer_tag_param]
+Call-ID: [call_id]
+CSeq: 2 ACK
+[routes]
+Max-Forwards: 70
+Content-Length: 0
+
+]]>
+  </send>
+
+  <pause milliseconds="500" />
+
+  <send retrans="500">
+    <![CDATA[
+INVITE [next_url] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: "Caller" <sip:15550000009@dialbridge.test>;tag=[pid]SIPpTag00[call_number]
+To: <sip:ivr@[remote_ip]>[peer_tag_param]
+Call-ID: [call_id]
+CSeq: 3 INVITE
+Contact: <sip:caller@[local_ip]:[local_port];transport=[transport]>
+[routes]
+Max-Forwards: 70
+Content-Type: application/sdp
+Content-Length: [len]
+
+v=0
+o=caller 53655765 2353687641 IN IP[local_ip_type] [local_ip]
+s=-
+c=IN IP[media_ip_type] [media_ip]
+t=0 0
+m=audio [media_port] RTP/AVP 8
+a=rtpmap:8 PCMA/8000
+a=ptime:30
+a=sendrecv
+]]>
+  </send>
+
+  <recv response="100" optional="true" />
+
+  <recv response="200" crlf="true">
+    <action>
+      <ereg regexp="c=IN IP4 172\.20\.0\.130"
+            search_in="body" check_it="true" assign_to="relay_3_anchored" />
+      <ereg regexp="a=sendrecv"
+            search_in="body" check_it="true" assign_to="relay_3_direction" />
+      <log message="relayed sendrecv answered by the phone through the engine: [$relay_3_anchored] [$relay_3_direction]" />
+    </action>
+  </recv>
+
+  <send>
+    <![CDATA[
+ACK [next_url] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: "Caller" <sip:15550000009@dialbridge.test>;tag=[pid]SIPpTag00[call_number]
+To: <sip:ivr@[remote_ip]>[peer_tag_param]
+Call-ID: [call_id]
+CSeq: 3 ACK
+[routes]
+Max-Forwards: 70
+Content-Length: 0
+
+]]>
+  </send>
+
+  <pause milliseconds="500" />
+
 
   <send retrans="500">
     <![CDATA[
@@ -115,7 +230,7 @@ Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
 From: "Caller" <sip:15550000009@dialbridge.test>;tag=[pid]SIPpTag00[call_number]
 To: <sip:ivr@[remote_ip]>[peer_tag_param]
 Call-ID: [call_id]
-CSeq: 2 BYE
+CSeq: 4 BYE
 [routes]
 Max-Forwards: 70
 Content-Length: 0
