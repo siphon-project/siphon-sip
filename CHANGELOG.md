@@ -26,7 +26,6 @@ entry, but a working config keeps working.
   past the window or once the owner has disconnected. Typed as
   `SipEvent::MediaSummary` / `MediaSummaryPayload` in the Rust proto crate and
   `MediaSummaryPayload` in the TypeScript SDK.
-
 - **`bridge {profile}` names one media profile for the pair.** Its `offer` half
   shapes what the `with` leg is offered and its `answer` half what the target
   is re-INVITEd with, the way one profile describes both parties of a
