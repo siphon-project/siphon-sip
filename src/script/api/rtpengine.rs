@@ -2412,7 +2412,8 @@ def make_decorator(call_id, from_tag):
     /// it.  ``reason`` is one of ``detached``, ``server_closed``,
     /// ``server_stopped``, ``call_ended`` or ``transport_error``.
     ///
-    /// Only ``detached`` is orderly.  Every other reason leaves a **live call
+    /// ``detached`` and ``call_ended`` (the call was torn down, taking the
+    /// bridge with it) are orderly.  Every other reason leaves a **live call
     /// with no media far side** — both parties are up and hearing nothing — so
     /// unlike the tee's equivalent this handler usually has to act: re-point
     /// with ``attach_ws_bridge``, fall back with ``detach_ws_bridge``, or tear
@@ -2424,7 +2425,7 @@ def make_decorator(call_id, from_tag):
     /// ```python,ignore
     /// @rtpengine.on_ws_bridge_ended
     /// async def bridge_down(call_id, from_tag, stream_id, reason):
-    ///     if reason != "detached":
+    ///     if reason not in ("detached", "call_ended"):
     ///         log.warn(f"{call_id}: bridge died ({reason}), falling back to relay")
     /// ```
     ///
@@ -2545,14 +2546,16 @@ def make_decorator(call_id, from_tag):
     /// Register a handler for **WebSocket tee ended** events.
     ///
     /// Fires exactly once per started tee, **including when the server ends
-    /// it**.  That is the point of the hook: any ``reason`` other than
-    /// ``"detached"`` means the audio stream died while the call is still up,
-    /// which is otherwise invisible — the call carries on and nothing reaches
-    /// the consumer.  Re-attach, fail over, or alert from here.
+    /// it**.  That is the point of the hook: ``"server_closed"``,
+    /// ``"server_stopped"`` and ``"transport_error"`` mean the audio stream
+    /// died while the call is still up, which is otherwise invisible — the
+    /// call carries on and nothing reaches the consumer.  Re-attach, fail
+    /// over, or alert from here.
     ///
     /// ``reason`` is one of ``"detached"`` (the script or the call teardown
-    /// asked for it — the only orderly end), ``"server_closed"``,
-    /// ``"server_stopped"``, ``"call_ended"`` or ``"transport_error"``.
+    /// asked for it), ``"call_ended"`` (the call ended under it — an ordinary
+    /// hang-up), ``"server_closed"``, ``"server_stopped"`` or
+    /// ``"transport_error"``.  The first two are the orderly ends.
     ///
     /// ``frames_dropped`` non-zero means the consumer could not keep up; the
     /// call itself was never affected.
@@ -2562,7 +2565,7 @@ def make_decorator(call_id, from_tag):
     /// ```python,ignore
     /// @rtpengine.on_ws_tee_ended
     /// async def tee_down(call_id, from_tag, stream_id, reason, frames_sent, frames_dropped):
-    ///     if reason != "detached":
+    ///     if reason not in ("detached", "call_ended"):
     ///         log.warn(f"tee {stream_id} died: {reason}")
     /// ```
     ///

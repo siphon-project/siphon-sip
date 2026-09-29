@@ -680,7 +680,7 @@ export interface WsTeeEndedPayload {
   stream_id: string;
   /** `detached`, `server_closed`, `server_stopped`, `call_ended` or `transport_error`. */
   reason: string;
-  /** `detached` is the only orderly end; anything else stopped the audio mid-call. */
+  /** `detached` and `call_ended` are the orderly ends; anything else stopped the audio mid-call. */
   unexpected: boolean;
   frames_sent?: number | null;
   frames_dropped?: number | null;
@@ -705,7 +705,8 @@ export interface WsBridgeStartedPayload {
  * followed by a fresh started.
  *
  * `unexpected` matters more here than on a tee: a bridge *is* the call's media
- * path, so anything but `detached` leaves both parties up and hearing nothing.
+ * path, so anything but `detached` or `call_ended` leaves both parties up and
+ * hearing nothing.
  */
 export interface WsBridgeEndedPayload {
   from_tag: string;

@@ -525,8 +525,8 @@ async fn on_ws_bridge_ended(
     bridge: crate::rtpengine::events::WsBridgeEnded,
 ) {
     // A bridge that ends for anything other than an explicit
-    // detach or re-point leaves a *live call with no far
-    // side* — worse than the tee case, where the call itself
+    // detach, a re-point or its call ending leaves a *live call
+    // with no far side* — worse than the tee case, where the call itself
     // was never in the streaming path.  WARN even with no
     // handler registered, so it is visible rather than
     // inferred from both parties going silent.
@@ -554,9 +554,9 @@ async fn on_ws_bridge_ended(
             "from_tag": bridge.from_tag,
             "stream_id": bridge.stream_id,
             "reason": bridge.reason.as_str(),
-            // Only `detached` is orderly. A controller that
-            // branches on nothing else still has to be able
-            // to see that this one needs acting on.
+            // Only `detached` and `call_ended` are orderly. A
+            // controller that branches on nothing else still
+            // has to be able to see that this one needs acting on.
             "unexpected": bridge.reason.is_unexpected(),
         }),
     );
@@ -606,8 +606,8 @@ async fn on_ws_bridge_ended(
 
 async fn on_ws_tee_ended(state: &Arc<DispatcherState>, tee: crate::rtpengine::events::WsTeeEnded) {
     // A tee that ends for anything other than an explicit
-    // detach means audio stopped reaching the consumer while
-    // the call is still up — the AI backend went away and the
+    // detach or its call ending means audio stopped reaching
+    // the consumer while the call is still up — the AI backend went away and the
     // caller is now talking to nothing.  Log that at WARN even
     // when no handler is registered, so it is visible rather
     // than inferred from missing audio.
@@ -639,9 +639,9 @@ async fn on_ws_tee_ended(state: &Arc<DispatcherState>, tee: crate::rtpengine::ev
             "from_tag": tee.from_tag,
             "stream_id": tee.stream_id,
             "reason": tee.reason.as_str(),
-            // `detached` is the only orderly end; anything
-            // else means audio stopped reaching the
-            // consumer while the call carried on.
+            // `detached` and `call_ended` are the orderly
+            // ends; anything else means audio stopped reaching
+            // the consumer while the call carried on.
             "unexpected": tee.reason.is_unexpected(),
             // Non-zero means the consumer could not keep
             // up. The call was never affected — this is the

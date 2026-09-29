@@ -46,6 +46,15 @@ entry, but a working config keeps working.
   callee's SDP, which is wrong for a phone behind NAT. It now pins the leg to
   the address the 2xx arrived from, the same source every other B-leg answer
   is pinned by.
+- **A WebSocket stream that ends with its call is no longer `unexpected`.**
+  `WsTeeEnded` and `WsBridgeEnded` (control rail) carried `unexpected: true`
+  for `reason: call_ended`, and siphon logged the end at WARN, so a controller
+  keying on the flag recorded every ordinary hang-up as a failed stream. The
+  observable value changes: `call_ended` now reports `unexpected: false`, like
+  `detached`. `server_closed`, `server_stopped`, `transport_error` and any
+  reason siphon does not know stay `unexpected: true`. The in-process
+  `@rtpengine.on_ws_tee_ended` / `on_ws_bridge_ended` examples now treat
+  `call_ended` as orderly too.
 - **A bridge offers each leg the media its own profile describes.** A bridge
   offered the `with` leg media built from the *anchor's* profile, so a
   `dial {on_answer: "bridge"}` naming an SRTP profile for its phones still

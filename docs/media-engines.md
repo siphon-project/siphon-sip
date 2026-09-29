@@ -98,9 +98,10 @@ siphon raises rather than answering success, because the alternative is a live
 call with no audio path at all. Re-point those instead, or end the call.
 
 Watch the lifecycle with `@rtpengine.on_ws_bridge_started` /
-`on_ws_bridge_ended`. Only `detached` is an orderly end; every other reason
-(`server_closed`, `server_stopped`, `call_ended`, `transport_error`) leaves both
-parties up and hearing nothing, which is why an unexpected end is logged at WARN
+`on_ws_bridge_ended`. `detached` and `call_ended` (the call was torn down and
+took the bridge with it) are the orderly ends; every other reason
+(`server_closed`, `server_stopped`, `transport_error`) leaves both parties up
+and hearing nothing, which is why an unexpected end is logged at WARN
 even when no handler is registered. A re-point arrives as an `ended` with reason
 `detached` followed by a fresh `started`.
 
@@ -155,7 +156,7 @@ this is invisible unless you watch for it:
 ```python
 @rtpengine.on_ws_tee_ended
 def tee_down(call_id, from_tag, stream_id, reason, frames_sent, frames_dropped):
-    if reason != "detached":                  # the only orderly end
+    if reason not in ("detached", "call_ended"):   # the orderly ends
         log.warn(f"tee {stream_id} died: {reason} after {frames_sent} frames")
     if frames_dropped:
         log.warn(f"tee {stream_id} dropped {frames_dropped} frames — consumer too slow")
