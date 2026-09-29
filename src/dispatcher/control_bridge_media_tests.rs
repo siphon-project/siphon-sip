@@ -168,10 +168,16 @@ async fn a_bridged_phone_is_offered_what_its_own_profile_describes() {
     let invite = invite_to(&drain(udp), PHONE);
     phone_answers(state, PHONE, &invite, &contact);
     let phone_call_id = invite.headers.call_id().cloned().expect("a Call-ID");
+    let anchored = last(&engine, "answer_local");
     assert_eq!(
-        last(&engine, "answer_local").transport_protocol.as_deref(),
+        anchored.transport_protocol.as_deref(),
         Some("RTP/SAVP"),
         "the phone was anchored with its own profile"
+    );
+    assert_eq!(
+        anchored.received_from,
+        Some(socket(PHONE).ip()),
+        "the phone's pickup pins its ingress to where its answer came from"
     );
 
     // The bridge offers the phone: shaped by the phone's profile, carrying the
@@ -241,7 +247,7 @@ async fn received_from_is_carried_only_where_the_profile_asks_for_it() {
     let offer = bridge_offer_to(udp, PHONE).await;
     accepts(state, PHONE, &offer, &contact);
     caller_accepts(state, udp, &caller).await;
-    for name in ["offer", "answer"] {
+    for name in ["answer_local", "offer", "answer"] {
         let sent = last(&engine, name);
         assert_eq!(sent.received_from, None, "{name}");
         assert_eq!(

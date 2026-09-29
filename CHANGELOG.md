@@ -39,6 +39,13 @@ entry, but a working config keeps working.
   is refused `491`; a bodyless refresh is answered from the session in force;
   a hangup mid-relay answers the pending request `487` and a relay the other
   leg never answers is answered `408`.
+- **An answered `originate` pins its media ingress like every other leg.**
+  When siphon anchored the callee's 2xx offer of an `originate {media: true}`,
+  or of a phone a bridging `dial` rang, a profile asking for `received_from`
+  was ignored: the engine was told nothing and latched on the address in the
+  callee's SDP, which is wrong for a phone behind NAT. It now pins the leg to
+  the address the 2xx arrived from, the same source every other B-leg answer
+  is pinned by.
 - **A bridge offers each leg the media its own profile describes.** A bridge
   offered the `with` leg media built from the *anchor's* profile, so a
   `dial {on_answer: "bridge"}` naming an SRTP profile for its phones still

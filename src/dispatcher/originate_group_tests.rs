@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 
 use super::originate_test_harness::{
     anchored_dispatcher, anchored_params, drain, phone_offer, phone_response, phone_sends,
-    requests_to, socket, with_stream_egress, Sent,
+    pinned_ingress_profiles, requests_to, socket, with_stream_egress, Sent, PINNED_INGRESS,
 };
 use super::test_dispatcher::TestDispatcher;
 use super::*;
@@ -128,9 +128,20 @@ fn ring(
     timeout_secs: u32,
     total_timeout_secs: u32,
 ) -> (String, Arc<Recorder>) {
-    let targets = dial_targets_for_aor(aor).expect("the AoR has contacts");
     let mut params = anchored_params(aor);
     params.timeout_secs = timeout_secs;
+    ring_with(state, aor, params, strategy, total_timeout_secs)
+}
+
+/// A group ringing `aor` with `strategy`, placing each leg with `params`.
+fn ring_with(
+    state: &DispatcherState,
+    aor: &str,
+    params: OriginateParams,
+    strategy: OriginateGroupStrategy,
+    total_timeout_secs: u32,
+) -> (String, Arc<Recorder>) {
+    let targets = dial_targets_for_aor(aor).expect("the AoR has contacts");
     let recorder = Arc::new(Recorder::default());
     let group_id = create_originate_group(
         state,
@@ -720,6 +731,68 @@ async fn a_phone_registered_over_a_flow_is_rung_on_that_flow() {
         recorder.take().as_slice(),
         [Reported::Answered(_)]
     ));
+    assert_drained(&dispatcher);
+}
+
+/// A phone registered over a flow behind NAT offers the address it believes it
+/// has. When it answers, a profile that pins ingress pins it to the flow the
+/// answer came in on, never to the SDP address.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_flow_pinned_phone_answering_pins_ingress_to_its_signalling_source() {
+    const NAT_SOURCE: &str = "203.0.113.81:41001";
+    let aor = "sip:3012@siphon.example.com";
+    register_over_flow(
+        aor,
+        "sip:3012@phone.invalid;transport=tcp",
+        Transport::Tcp,
+        NAT_SOURCE,
+        "192.0.2.1:5060",
+        4243,
+        Vec::new(),
+    );
+    let engine = NativeTestEngine::start().await;
+    let (mut dispatcher, stream) = with_stream_egress(anchored_dispatcher(&engine));
+    dispatcher.state.rtpengine_profiles = Some(pinned_ingress_profiles());
+    let mut params = anchored_params(aor);
+    params.media = OriginateMedia::Anchor {
+        profile: PINNED_INGRESS.to_string(),
+        ws_uri: None,
+    };
+    let (_group_id, recorder) = ring_with(
+        &dispatcher.state,
+        aor,
+        params,
+        OriginateGroupStrategy::Parallel,
+        30,
+    );
+    let invite = drain(&stream)
+        .into_iter()
+        .find(|frame| frame.is(Method::Invite))
+        .expect("the phone is rung on its flow")
+        .message;
+    dispatcher.state.stream_connections.register(
+        socket(NAT_SOURCE),
+        Transport::Tcp,
+        ConnectionId(4243),
+    );
+    // The SDP names an address behind the NAT; the answer arrives from the
+    // flow's public side.
+    let answer = phone_response(
+        &invite,
+        200,
+        "OK",
+        "phone-tag",
+        "sip:3012@phone.invalid;transport=tcp",
+        Some(&phone_offer("192.0.2.212")),
+    );
+    phone_sends(&dispatcher.state, socket(NAT_SOURCE), &answer);
+    let anchored = engine.commands("answer_local");
+    assert_eq!(anchored.len(), 1, "the 2xx offer was anchored once");
+    assert_eq!(anchored[0].received_from, Some(socket(NAT_SOURCE).ip()));
+    assert!(recorder
+        .take()
+        .iter()
+        .any(|reported| matches!(reported, Reported::Answered(_))));
     assert_drained(&dispatcher);
 }
 

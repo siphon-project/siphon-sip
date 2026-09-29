@@ -143,6 +143,8 @@ mod originate_auth_tests;
 #[cfg(test)]
 mod originate_group_tests;
 #[cfg(test)]
+mod originate_media_source_tests;
+#[cfg(test)]
 mod originate_test_harness;
 #[cfg(test)]
 mod originate_tests;
