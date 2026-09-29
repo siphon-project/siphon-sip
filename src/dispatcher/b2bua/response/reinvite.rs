@@ -523,9 +523,7 @@ pub fn rewrite_reinvite_answer_sdp(
                         let mut answer_flags = profile.answer.clone();
                         // Pin the answering party's ingress to where its own 2xx arrived from,
                         // as the offer side now does for the offerer.
-                        if answer_flags.carry_received_from {
-                            answer_flags.received_from = Some(response_source.ip());
-                        }
+                        answer_flags.stamp_received_from(response_source.ip());
                         match tokio::task::block_in_place(|| {
                             tokio::runtime::Handle::current().block_on(rtpengine_set.answer(
                                 session.rtpengine_id(),

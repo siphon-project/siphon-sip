@@ -120,18 +120,27 @@ pub(super) struct BridgeDialRequest {
 /// Where a bridge dial runs: the bus that owns the caller's channel and the
 /// dispatcher its phones are rung on. The running B2BUA's in production, a
 /// test's own when it drives the verb end to end.
-fn rail(app: &str) -> Option<(Arc<ControlBus>, Arc<dyn DispatcherHandle>)> {
+pub(super) fn rail(app: &str) -> Option<(Arc<ControlBus>, Arc<dyn DispatcherHandle>)> {
     #[cfg(test)]
     {
         if let Some(rail) = super::originate::staged::rail_for(app) {
             return Some((Arc::clone(&rail.bus), Arc::clone(&rail.dispatcher)));
         }
     }
+    Some((ControlBus::global()?, dispatcher_for(app)))
+}
+
+/// The dispatcher an app's verbs act on: the running B2BUA in production, a
+/// test's own when it drives the verb end to end.
+pub(super) fn dispatcher_for(app: &str) -> Arc<dyn DispatcherHandle> {
+    #[cfg(test)]
+    {
+        if let Some(rail) = super::originate::staged::rail_for(app) {
+            return Arc::clone(&rail.dispatcher);
+        }
+    }
     let _ = app;
-    Some((
-        ControlBus::global()?,
-        Arc::new(crate::dispatcher::RunningDispatcher),
-    ))
+    Arc::new(crate::dispatcher::RunningDispatcher)
 }
 
 /// Ring the phones for an answered caller. The reply says the INVITEs are on
@@ -557,10 +566,18 @@ impl Coordinator {
         if !ringing {
             return;
         }
-        if crate::rtpengine::MediaBackend::playback_started(
-            &self.caller.media_call_id,
-            &self.caller.from_tag,
-        ) {
+        // The caller's session as the store has it now, not as it was when the
+        // dial began: that is the one its audio is on.
+        let Some((media_call_id, from_tag)) = self.caller_media(state.rtpengine_sessions.as_ref())
+        else {
+            tracing::info!(
+                caller = %self.caller.sip_call_id,
+                "control plane: dial — the caller has no media session any more (it is being torn down); no ringback"
+            );
+            self.phase = Ringback::Done;
+            return;
+        };
+        if crate::rtpengine::MediaBackend::playback_started(&media_call_id, &from_tag) {
             self.phase = Ringback::Held;
             return;
         }
@@ -570,17 +587,30 @@ impl Coordinator {
         };
         let result = start_playback(
             &backend,
-            &self.caller.media_call_id,
-            &self.caller.from_tag,
+            &media_call_id,
+            &from_tag,
             &source,
             &PlayOptions::default(),
         )
         .await;
         let play_id = match &result {
             Ok(outcome) => outcome.play_id,
+            Err(error) if error.is_call_not_found() => {
+                // Not an engine fault: the session went away under the dial,
+                // which only a teardown of the caller does.
+                tracing::info!(
+                    caller = %self.caller.sip_call_id,
+                    %media_call_id,
+                    %error,
+                    "control plane: dial — the caller's media session is gone from the engine; no ringback"
+                );
+                self.phase = Ringback::Done;
+                return;
+            }
             Err(error) => {
                 tracing::warn!(
                     caller = %self.caller.sip_call_id,
+                    %media_call_id,
                     %error,
                     "control plane: dial — the media engine refused the ringback"
                 );
@@ -592,8 +622,8 @@ impl Coordinator {
         if let Some(play_id) = play_id {
             state.dial_bridges.record_ringback(
                 &self.caller.sip_call_id,
-                &self.caller.media_call_id,
-                &self.caller.from_tag,
+                &media_call_id,
+                &from_tag,
                 play_id,
             );
         }
@@ -616,23 +646,34 @@ impl Coordinator {
             return;
         };
         self.phase = Ringback::Done;
-        let Some(backend) = self
-            .dispatcher
-            .state()
-            .and_then(|state| state.rtpengine_set.clone())
-        else {
+        let dispatcher = Arc::clone(&self.dispatcher);
+        let Some(state) = dispatcher.state() else {
             return;
         };
-        if let Err(error) = backend
-            .stop_media(&self.caller.media_call_id, &self.caller.from_tag, play_id)
-            .await
-        {
+        let (Some(backend), Some((media_call_id, from_tag))) = (
+            state.rtpengine_set.clone(),
+            self.caller_media(state.rtpengine_sessions.as_ref()),
+        ) else {
+            return;
+        };
+        if let Err(error) = backend.stop_media(&media_call_id, &from_tag, play_id).await {
             tracing::warn!(
                 caller = %self.caller.sip_call_id,
                 %error,
                 "control plane: dial — the ringback could not be stopped"
             );
         }
+    }
+
+    /// The caller's media session as the store has it: its engine call-id and
+    /// tag. `None` once the caller is being torn down.
+    fn caller_media(
+        &self,
+        sessions: Option<&Arc<crate::rtpengine::MediaSessionStore>>,
+    ) -> Option<(String, String)> {
+        sessions
+            .and_then(|sessions| sessions.get(&self.caller.sip_call_id))
+            .map(|session| (session.rtpengine_id().to_string(), session.from_tag.clone()))
     }
 
     /// Nobody answered, or no answer could be bridged: the ringback stops

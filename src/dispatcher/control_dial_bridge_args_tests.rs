@@ -72,6 +72,7 @@ fn parked_caller(state: &DispatcherState, call_id: &str) -> Caller {
         call_id: call_id.to_string(),
         internal_call_id,
         answer: invite,
+        address: CALLER.to_string(),
     }
 }
 
@@ -296,6 +297,9 @@ async fn a_second_bridge_dial_or_a_bridged_caller_is_refused() {
             stage: crate::b2bua::bridge::BridgeStage::Bridged,
             on_peer_hangup: crate::b2bua::bridge::PeerHangupPolicy::default(),
             media_call_id: None,
+            media_from_tag: None,
+            media_profile: None,
+            media_pending_adoption: false,
             last_local_offer: Vec::new(),
             release_reason: None,
         },

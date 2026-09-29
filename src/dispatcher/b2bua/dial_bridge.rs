@@ -506,6 +506,12 @@ pub async fn dial_bridge_join(
         signals,
         listener,
     });
+    // No pair profile: the dial's profile is the one each *phone* was anchored
+    // with (its answer half answered the phone's offer), so it describes the
+    // phone, not the pair. The bridge offers the phone with it — the peer's own
+    // profile — and re-INVITEs the caller with the caller's own, which is what
+    // keeps an SRTP phone and a plain-RTP caller each on the media it took.
+    // Naming it as a pair profile would hand its answer half to the caller.
     let joined = bridge_calls_with_state(
         state,
         BridgeParams {
@@ -513,6 +519,7 @@ pub async fn dial_bridge_join(
             peer_sip_call_id: winner.sip_call_id.clone(),
             on_peer_hangup: crate::b2bua::bridge::PeerHangupPolicy::default(),
         },
+        None,
     )
     .await;
     if joined.is_err() {

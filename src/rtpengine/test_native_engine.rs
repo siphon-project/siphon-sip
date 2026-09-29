@@ -6,9 +6,16 @@
 //! backend, so a test that drives one end to end points a [`MediaBackend`] at
 //! this engine. It answers `answer_local` with [`NATIVE_ENGINE_ANSWER`], pings
 //! with a pong and everything else with a bare `ok`, and records the call-id and
-//! tag of every `answer_local` and `delete` it is sent.
+//! tag of every media command it is sent.
+//!
+//! It keeps the calls it holds the way the real engine does: `answer_local` and
+//! `offer` create one, `delete` ends it, and an `answer`, `reoffer`,
+//! `play_media`, `stop_media` or `delete` on a call it does not hold is refused
+//! with the engine's own `unknown call: <call-id>`. A test that deletes a
+//! session too early therefore sees the refusal a deployment would.
 
-use std::net::SocketAddr;
+use std::collections::HashSet;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 
 use siphon_rtp_proto::{frame, CmdResult, Command, Request, Response};
@@ -45,6 +52,26 @@ pub(crate) const NATIVE_ENGINE_OFFER: &str = concat!(
     "a=sendrecv\r\n",
 );
 
+/// The SDP the engine returns for an `offer` or `reoffer` made with a profile
+/// naming `transport`: [`NATIVE_ENGINE_OFFER`] on that transport, with an
+/// RFC 4568 SDES key when it is a secure one — the shape the engine gives the
+/// leg a profile's `transport_protocol` asks for.
+pub(crate) fn native_engine_offer(transport: Option<&str>) -> String {
+    let Some(transport) = transport else {
+        return NATIVE_ENGINE_OFFER.to_string();
+    };
+    let mut sdp = NATIVE_ENGINE_OFFER.replace(
+        "m=audio 52000 RTP/AVP 0 101",
+        &format!("m=audio 52000 {transport} 0 101"),
+    );
+    if transport.contains("SAVP") {
+        sdp.push_str(
+            "a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:WVNfX19zZW1jdGwgKCkgewkyMjA7fQp9CnVubGVz\r\n",
+        );
+    }
+    sdp
+}
+
 /// One media command the engine was sent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct NativeCommand {
@@ -57,6 +84,34 @@ pub(crate) struct NativeCommand {
     /// `play_media` plays (`None` for any other source), the `play_id` a
     /// `stop_media` targets (`None` for a stop of everything).
     pub(crate) detail: Option<String>,
+    /// The profile's `transport_protocol` on an `answer_local`, `offer`,
+    /// `answer` or `reoffer`.
+    pub(crate) transport_protocol: Option<String>,
+    /// The profile's per-call `received_from` on the same four.
+    pub(crate) received_from: Option<IpAddr>,
+    /// Whether the engine refused the command because it holds no such call.
+    pub(crate) refused: bool,
+}
+
+/// What a recorded command carried, before the engine decides on it.
+struct Recorded {
+    name: &'static str,
+    call_id: String,
+    from_tag: String,
+    detail: Option<String>,
+    profile: Option<siphon_rtp_proto::ProfileFlags>,
+}
+
+impl Recorded {
+    fn new(name: &'static str, call_id: &str, from_tag: &str) -> Self {
+        Recorded {
+            name,
+            call_id: call_id.to_string(),
+            from_tag: from_tag.to_string(),
+            detail: None,
+            profile: None,
+        }
+    }
 }
 
 /// The `play_id` the engine hands the first playback it accepts; each later one
@@ -67,6 +122,7 @@ pub(crate) const NATIVE_ENGINE_FIRST_PLAY_ID: u64 = 7001;
 pub(crate) struct NativeTestEngine {
     address: SocketAddr,
     commands: Arc<Mutex<Vec<NativeCommand>>>,
+    live: Arc<Mutex<HashSet<String>>>,
 }
 
 impl NativeTestEngine {
@@ -79,12 +135,15 @@ impl NativeTestEngine {
         let address = listener.local_addr().expect("the listener's address");
         let commands = Arc::new(Mutex::new(Vec::new()));
         let recorded = Arc::clone(&commands);
+        let live: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+        let held = Arc::clone(&live);
         let next_play_id = Arc::new(std::sync::atomic::AtomicU64::new(
             NATIVE_ENGINE_FIRST_PLAY_ID,
         ));
         tokio::spawn(async move {
             while let Ok((mut stream, _)) = listener.accept().await {
                 let recorded = Arc::clone(&recorded);
+                let held = Arc::clone(&held);
                 let next_play_id = Arc::clone(&next_play_id);
                 tokio::spawn(async move {
                     let mut buffer = Vec::new();
@@ -108,36 +167,72 @@ impl NativeTestEngine {
                             return;
                         };
                         let mut play_id = None;
-                        let (sdp, record) = match &request.command {
+                        // What the command is, what SDP an accepted one answers
+                        // with, and what it does to the calls the engine holds.
+                        let (record, sdp, creates, needs_call) = match &request.command {
                             Command::AnswerLocal {
-                                call_id, from_tag, ..
+                                call_id,
+                                from_tag,
+                                profile,
+                                ..
                             } => (
+                                Some(Recorded {
+                                    profile: Some(profile.clone()),
+                                    ..Recorded::new("answer_local", call_id, from_tag)
+                                }),
                                 Some(NATIVE_ENGINE_ANSWER.to_string()),
-                                Some(("answer_local", call_id.clone(), from_tag.clone(), None)),
+                                true,
+                                false,
                             ),
                             Command::Delete {
                                 call_id, from_tag, ..
                             } => (
+                                Some(Recorded::new("delete", call_id, from_tag)),
                                 None,
-                                Some(("delete", call_id.clone(), from_tag.clone(), None)),
+                                false,
+                                true,
                             ),
                             Command::Offer {
-                                call_id, from_tag, ..
+                                call_id,
+                                from_tag,
+                                profile,
+                                ..
                             } => (
-                                Some(NATIVE_ENGINE_OFFER.to_string()),
-                                Some(("offer", call_id.clone(), from_tag.clone(), None)),
+                                Some(Recorded {
+                                    profile: Some(profile.clone()),
+                                    ..Recorded::new("offer", call_id, from_tag)
+                                }),
+                                Some(native_engine_offer(profile.transport_protocol.as_deref())),
+                                true,
+                                false,
                             ),
                             Command::Answer {
-                                call_id, from_tag, ..
+                                call_id,
+                                from_tag,
+                                profile,
+                                ..
                             } => (
+                                Some(Recorded {
+                                    profile: Some(profile.clone()),
+                                    ..Recorded::new("answer", call_id, from_tag)
+                                }),
                                 Some(NATIVE_ENGINE_ANSWER.to_string()),
-                                Some(("answer", call_id.clone(), from_tag.clone(), None)),
+                                false,
+                                true,
                             ),
                             Command::Reoffer {
-                                call_id, from_tag, ..
+                                call_id,
+                                from_tag,
+                                profile,
+                                ..
                             } => (
-                                Some(NATIVE_ENGINE_OFFER.to_string()),
-                                Some(("reoffer", call_id.clone(), from_tag.clone(), None)),
+                                Some(Recorded {
+                                    profile: Some(profile.clone()),
+                                    ..Recorded::new("reoffer", call_id, from_tag)
+                                }),
+                                Some(native_engine_offer(profile.transport_protocol.as_deref())),
+                                false,
+                                true,
                             ),
                             Command::PlayMedia {
                                 call_id,
@@ -145,9 +240,6 @@ impl NativeTestEngine {
                                 source,
                                 ..
                             } => {
-                                play_id = Some(
-                                    next_play_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
-                                );
                                 let tone = match source {
                                     siphon_rtp_proto::PlayMediaSource::Tone { tone } => {
                                         Some(tone.clone())
@@ -155,8 +247,13 @@ impl NativeTestEngine {
                                     _ => None,
                                 };
                                 (
+                                    Some(Recorded {
+                                        detail: tone,
+                                        ..Recorded::new("play_media", call_id, from_tag)
+                                    }),
                                     None,
-                                    Some(("play_media", call_id.clone(), from_tag.clone(), tone)),
+                                    false,
+                                    true,
                                 )
                             }
                             Command::StopMedia {
@@ -164,28 +261,58 @@ impl NativeTestEngine {
                                 from_tag,
                                 play_id,
                             } => (
+                                Some(Recorded {
+                                    detail: play_id.map(|play_id| play_id.to_string()),
+                                    ..Recorded::new("stop_media", call_id, from_tag)
+                                }),
                                 None,
-                                Some((
-                                    "stop_media",
-                                    call_id.clone(),
-                                    from_tag.clone(),
-                                    play_id.map(|play_id| play_id.to_string()),
-                                )),
+                                false,
+                                true,
                             ),
-                            _ => (None, None),
+                            _ => (None, None, false, false),
                         };
-                        if let Some((name, call_id, from_tag, detail)) = record {
+                        let mut refused = false;
+                        if let (Some(record), Ok(mut live)) = (record.as_ref(), held.lock()) {
+                            if needs_call && !live.contains(&record.call_id) {
+                                refused = true;
+                            } else if creates {
+                                live.insert(record.call_id.clone());
+                            } else if record.name == "delete" {
+                                live.remove(&record.call_id);
+                            }
+                        }
+                        if !refused && matches!(request.command, Command::PlayMedia { .. }) {
+                            play_id = Some(
+                                next_play_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
+                            );
+                        }
+                        let unknown_call = record
+                            .as_ref()
+                            .map(|record| format!("unknown call: {}", record.call_id));
+                        if let Some(record) = record {
                             if let Ok(mut log) = recorded.lock() {
                                 log.push(NativeCommand {
-                                    name,
-                                    call_id,
-                                    from_tag,
-                                    detail,
+                                    name: record.name,
+                                    call_id: record.call_id,
+                                    from_tag: record.from_tag,
+                                    detail: record.detail,
+                                    transport_protocol: record
+                                        .profile
+                                        .as_ref()
+                                        .and_then(|profile| profile.transport_protocol.clone()),
+                                    received_from: record
+                                        .profile
+                                        .as_ref()
+                                        .and_then(|profile| profile.received_from),
+                                    refused,
                                 });
                             }
                         }
                         let result = match request.command {
                             Command::Ping => CmdResult::Pong,
+                            _ if refused => CmdResult::Error {
+                                reason: unknown_call.unwrap_or_default(),
+                            },
                             _ => CmdResult::Ok {
                                 sdp,
                                 duration_ms: None,
@@ -208,7 +335,24 @@ impl NativeTestEngine {
                 });
             }
         });
-        NativeTestEngine { address, commands }
+        NativeTestEngine {
+            address,
+            commands,
+            live,
+        }
+    }
+
+    /// Whether the engine holds `call_id`: created and not deleted.
+    pub(crate) fn holds(&self, call_id: &str) -> bool {
+        self.live
+            .lock()
+            .map(|live| live.contains(call_id))
+            .unwrap_or(false)
+    }
+
+    /// How many calls the engine holds.
+    pub(crate) fn held_count(&self) -> usize {
+        self.live.lock().map(|live| live.len()).unwrap_or(0)
     }
 
     /// A media backend that sends its commands to this engine.

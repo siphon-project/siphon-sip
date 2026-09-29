@@ -13,8 +13,8 @@ pub struct BridgeParams {
     /// The leg the verb is addressed to. It keeps its media session — its
     /// ports and everything attached to them (see [`crate::b2bua::bridge`]).
     pub anchor_sip_call_id: String,
-    /// The leg to join it to. Its own media session is deleted; it becomes the
-    /// second party on the anchor's.
+    /// The leg to join it to. It becomes the second party on the anchor's
+    /// media session, and its own is deleted once the bridge forms.
     pub peer_sip_call_id: String,
     /// What happens to the survivor when one of the two hangs up.
     pub on_peer_hangup: crate::b2bua::bridge::PeerHangupPolicy,
@@ -56,6 +56,9 @@ pub struct BridgeLegSnapshot {
     /// The endpoint's own current media description — what the engine is told
     /// the offerer looks like, and what a raw crossing hands the other leg.
     pub last_sdp: Vec<u8>,
+    /// Where the endpoint's signalling comes from — the address a profile's
+    /// `received_from` pins this party's media ingress to.
+    pub source_ip: std::net::IpAddr,
     /// The leg's engine session, when it is anchored.
     pub media: Option<crate::b2bua::bridge::LegMedia>,
 }
@@ -89,6 +92,7 @@ pub fn bridge_leg_snapshot(
     let originated = call.originated;
     let initial_acked = call.a_leg.initial_acked;
     let last_sdp = call.a_leg.last_sdp.clone().unwrap_or_default();
+    let source_ip = call.a_leg.transport.remote_addr.ip();
     drop(call);
 
     let media = state
@@ -122,6 +126,7 @@ pub fn bridge_leg_snapshot(
         originated,
         initial_acked,
         last_sdp,
+        source_ip,
         media,
     })
 }
@@ -205,23 +210,30 @@ pub async fn bridge_run_media_step(
             from_tag,
             profile,
             sdp,
+            received_from,
         }
         | MediaStep::Reoffer {
             media_call_id,
             from_tag,
             profile,
             sdp,
+            received_from,
         } => {
             // A profile the registry no longer carries is a deployment this
             // build cannot serve, not a transport hiccup — refuse before the
             // engine is touched.
-            let Some(flags) = profiles
+            let Some(mut flags) = profiles
                 .and_then(|registry| registry.get(profile).map(|entry| entry.offer.clone()))
             else {
                 return Err(BridgeError::Unsupported(format!(
                     "unknown media profile '{profile}' on the leg being bridged"
                 )));
             };
+            // The SDP in this offer is the anchor's, so its source is the
+            // ingress the profile asks to pin.
+            if let Some(source) = received_from {
+                flags.stamp_received_from(*source);
+            }
             // `offer` on the fresh call-id the plan minted; `reoffer` on the
             // live relaying one. The plan decides which — never both, and never
             // an `offer` over something live.
@@ -273,6 +285,10 @@ pub async fn bridge_run_media_step(
 /// The media work, by contrast, **is** awaited before returning: an attachment
 /// still live when the bridge forms is one-way audio, so the teardown is
 /// confirmed rather than assumed (see [`crate::b2bua::bridge`]).
+///
+/// Each party is shaped by the profile it was anchored with (see
+/// [`crate::b2bua::bridge::bridge_offer_profile`]); the control plane's
+/// `bridge` verb can name one profile for the pair instead.
 pub async fn b2bua_bridge_calls(
     params: BridgeParams,
 ) -> Result<BridgeAccepted, crate::b2bua::bridge::BridgeError> {
@@ -281,18 +297,24 @@ pub async fn b2bua_bridge_calls(
             "b2bua is not running — nothing to bridge".to_string(),
         ));
     };
-    bridge_calls_with_state(&control.state, params).await
+    bridge_calls_with_state(&control.state, params, None).await
 }
 
 /// [`b2bua_bridge_calls`] on a dispatcher already in hand: the running
 /// B2BUA's, or the one a bridge dial rang its phones on.
+///
+/// `pair_profile` names one media profile for the pair: its `offer` half
+/// shapes what the peer is offered and its `answer` half what the anchor is
+/// re-INVITEd with, the way one profile describes both parties of an ordinary
+/// dial. `None` shapes each party with the profile it was anchored with.
 pub(crate) async fn bridge_calls_with_state(
     state: &DispatcherState,
     params: BridgeParams,
+    pair_profile: Option<&str>,
 ) -> Result<BridgeAccepted, crate::b2bua::bridge::BridgeError> {
     use crate::b2bua::bridge::{
-        bridge_media_plan, set_media_direction, BridgeContext, BridgeError, BridgeRole,
-        BridgeStage, MediaDirection,
+        bridge_answer_profile, bridge_media_plan, set_media_direction, AnchorOffer, BridgeContext,
+        BridgeError, BridgeRole, BridgeStage, MediaDirection,
     };
 
     if params.anchor_sip_call_id == params.peer_sip_call_id {
@@ -317,6 +339,19 @@ pub(crate) async fn bridge_calls_with_state(
     };
     bridge_leg_validate(&anchor)?;
     bridge_leg_validate(&peer)?;
+    // A pair profile this deployment does not carry is refused before either
+    // leg is touched, rather than half-way through the media work.
+    if let Some(profile) = pair_profile {
+        let known = state
+            .rtpengine_profiles
+            .as_ref()
+            .is_some_and(|registry| registry.get(profile).is_some());
+        if !known {
+            return Err(BridgeError::Unsupported(format!(
+                "unknown media profile '{profile}' for the bridge"
+            )));
+        }
+    }
 
     // Claim both legs' re-INVITE slots before any media moves (RFC 3261 §14.1).
     // Take-and-set, so two `bridge` commands racing for the same leg cannot both
@@ -350,9 +385,10 @@ pub(crate) async fn bridge_calls_with_state(
             .set_pending_reinvite(&peer.internal_call_id, true, false);
     };
 
-    // Media: every attachment off both legs, the sessions in the way deleted,
-    // then the pair negotiated — on the anchor's live call-id when it already
-    // relays, otherwise on this fresh one (see `bridge_media_plan`).
+    // Media: every attachment off both legs, then the pair negotiated — on the
+    // anchor's live call-id when it already relays, otherwise on this fresh one
+    // beside the anchor's own session (see `bridge_media_plan`). Nothing is
+    // deleted until the peer has accepted.
     let fresh_media_call_id = crate::b2bua::actor::generate_call_id();
     // The anchor endpoint's description, restated as siphon's own direction
     // (RFC 3264 §6.1). It matters on a re-bridge: after an unbridge the leg
@@ -362,7 +398,11 @@ pub(crate) async fn bridge_calls_with_state(
     let plan = bridge_media_plan(
         anchor.media.as_ref(),
         peer.media.as_ref(),
-        &anchor_sdp,
+        AnchorOffer {
+            sdp: &anchor_sdp,
+            pair_profile,
+            source: Some(anchor.source_ip),
+        },
         &fresh_media_call_id,
     );
     let mut renegotiated: Option<Vec<u8>> = None;
@@ -385,39 +425,6 @@ pub(crate) async fn bridge_calls_with_state(
         }
     }
 
-    if let Some(store) = state.rtpengine_sessions.as_ref() {
-        // The peer's engine session is gone from the engine; drop the store
-        // entry too, or a later media verb (or a re-INVITE response's answer
-        // rewrite) would address a call-id the engine no longer has.
-        if peer.media.is_some() {
-            store.remove(&peer.sip_call_id);
-        }
-        // The anchor moved to a fresh engine call-id: re-key its entry to it.
-        // The store key stays the leg's SIP Call-ID — that is what every media
-        // verb and the teardown look up — and only the engine-facing id moves,
-        // which is exactly what `rtpengine_call_id` is decoupled for. `ws_uri`
-        // is deliberately not carried over: the tee died with the old call-id.
-        let moved_to_fresh_id = anchor
-            .media
-            .as_ref()
-            .is_some_and(|media| !media.relaying && renegotiated.is_some());
-        if moved_to_fresh_id {
-            if let Some(media) = anchor.media.as_ref() {
-                store.insert(crate::rtpengine::session::MediaSession {
-                    call_id: anchor.sip_call_id.clone(),
-                    rtpengine_call_id: fresh_media_call_id.clone(),
-                    from_tag: media.from_tag.clone(),
-                    to_tag: None,
-                    profile: media.profile.clone(),
-                    ws_uri: None,
-                    ws_tee: None,
-                    ws_bridge_attached: false,
-                    created_at: std::time::Instant::now(),
-                });
-            }
-        }
-    }
-
     // The offer that goes to the peer: the engine's own description when the
     // pair is anchored, otherwise the anchor endpoint's, restated as siphon's
     // own direction (RFC 3264 §6.1 — see `set_media_direction`).
@@ -434,31 +441,42 @@ pub(crate) async fn bridge_calls_with_state(
             fresh_media_call_id.clone()
         }
     });
+    let media_from_tag = anchor.media.as_ref().map(|media| media.from_tag.clone());
+    let media_profile = anchor
+        .media
+        .as_ref()
+        .map(|media| bridge_answer_profile(pair_profile, media).to_string());
+    let media_pending_adoption = anchor.media.as_ref().is_some_and(|media| !media.relaying);
+    let half = |peer_call_id: &str, peer_sip_call_id: &str, role, last_local_offer| BridgeContext {
+        peer_call_id: peer_call_id.to_string(),
+        peer_sip_call_id: peer_sip_call_id.to_string(),
+        role,
+        stage: BridgeStage::OfferingPeer,
+        on_peer_hangup: params.on_peer_hangup,
+        media_call_id: media_call_id.clone(),
+        media_from_tag: media_from_tag.clone(),
+        media_profile: media_profile.clone(),
+        media_pending_adoption,
+        last_local_offer,
+        release_reason: None,
+    };
     state.call_actors.set_bridge(
         &anchor.internal_call_id,
-        BridgeContext {
-            peer_call_id: peer.internal_call_id.clone(),
-            peer_sip_call_id: peer.sip_call_id.clone(),
-            role: BridgeRole::Anchor,
-            stage: BridgeStage::OfferingPeer,
-            on_peer_hangup: params.on_peer_hangup,
-            media_call_id: media_call_id.clone(),
-            last_local_offer: Vec::new(),
-            release_reason: None,
-        },
+        half(
+            &peer.internal_call_id,
+            &peer.sip_call_id,
+            BridgeRole::Anchor,
+            Vec::new(),
+        ),
     );
     state.call_actors.set_bridge(
         &peer.internal_call_id,
-        BridgeContext {
-            peer_call_id: anchor.internal_call_id.clone(),
-            peer_sip_call_id: anchor.sip_call_id.clone(),
-            role: BridgeRole::Peer,
-            stage: BridgeStage::OfferingPeer,
-            on_peer_hangup: params.on_peer_hangup,
-            media_call_id,
-            last_local_offer: offer.clone(),
-            release_reason: None,
-        },
+        half(
+            &anchor.internal_call_id,
+            &anchor.sip_call_id,
+            BridgeRole::Peer,
+            offer.clone(),
+        ),
     );
 
     if !b2bua_send_reinvite_on_leg(
@@ -468,7 +486,9 @@ pub(crate) async fn bridge_calls_with_state(
         BRIDGE_TRACKING_OFFER,
         state,
     ) {
-        state.call_actors.take_bridge(&anchor.internal_call_id);
+        if let Some(context) = state.call_actors.take_bridge(&anchor.internal_call_id) {
+            bridge_discard_pending_media(&context, state);
+        }
         state.call_actors.take_bridge(&peer.internal_call_id);
         release_claims();
         return Err(BridgeError::Unavailable(
@@ -480,7 +500,7 @@ pub(crate) async fn bridge_calls_with_state(
         anchor_call_id = %anchor.internal_call_id,
         peer_call_id = %peer.internal_call_id,
         anchored,
-        "B2BUA bridge: media re-pointed, offering the peer leg"
+        "B2BUA bridge: media negotiated, offering the peer leg"
     );
     Ok(BridgeAccepted {
         anchor_call_id: anchor.internal_call_id,
@@ -488,6 +508,57 @@ pub(crate) async fn bridge_calls_with_state(
         peer_call_id: peer.internal_call_id,
         anchored,
     })
+}
+
+/// Delete engine sessions a bridge no longer needs, off the signalling path.
+///
+/// Each is a [`crate::b2bua::bridge::MediaStep::DeleteSession`] run the way the
+/// bridge runs every media step, so a session already gone reads as done and
+/// any other refusal is logged with its cause. Fire-and-forget: the SIP side
+/// has already moved on, and nothing waits on the engine's reply.
+fn bridge_delete_sessions(state: &DispatcherState, sessions: Vec<(String, String)>, why: &str) {
+    use crate::b2bua::bridge::MediaStep;
+
+    if sessions.is_empty() {
+        return;
+    }
+    let Some(backend) = state.rtpengine_set.clone() else {
+        return;
+    };
+    let profiles = state.rtpengine_profiles.clone();
+    let why = why.to_string();
+    tokio::spawn(async move {
+        for (media_call_id, from_tag) in sessions {
+            let step = MediaStep::DeleteSession {
+                media_call_id: media_call_id.clone(),
+                from_tag,
+            };
+            if let Err(error) = bridge_run_media_step(&backend, profiles.as_ref(), &step).await {
+                warn!(%media_call_id, %why, %error, "B2BUA bridge: a media session could not be deleted");
+            }
+        }
+    });
+}
+
+/// A bridge that will not form: delete the session it negotiated on a fresh
+/// call-id, which only ever had the anchor's offer on it. The anchor's own
+/// session, which its store entry still points at, is not touched — so a bridge
+/// refused by its peer leaves the anchor's media exactly as it was.
+pub fn bridge_discard_pending_media(
+    context: &crate::b2bua::bridge::BridgeContext,
+    state: &DispatcherState,
+) {
+    if !context.media_pending_adoption {
+        return;
+    }
+    if let (Some(media_call_id), Some(from_tag)) = (&context.media_call_id, &context.media_from_tag)
+    {
+        bridge_delete_sessions(
+            state,
+            vec![(media_call_id.clone(), from_tag.clone())],
+            "the bridge did not form",
+        );
+    }
 }
 
 /// Tracking-leg target for the re-INVITE that offers the peer the anchor's
@@ -638,6 +709,9 @@ pub fn b2bua_bridge_peer_left(sip_call_id: &str, state: &DispatcherState) {
     let Some(context) = state.call_actors.take_bridge(&internal_call_id) else {
         return;
     };
+    // A bridge still forming on a fresh call-id will never adopt it: the
+    // session is in no store entry, so no teardown would ever delete it.
+    bridge_discard_pending_media(&context, state);
     let survivor = context.peer_call_id.clone();
     // The survivor's own half carries the policy that applies to *it*.
     let Some(survivor_context) = state.call_actors.take_bridge(&survivor) else {
@@ -804,59 +878,47 @@ pub fn bridge_advance_to_anchor(
         .call_actors
         .set_leg_last_sdp(peer_call_id, true, &response.body);
 
-    // Anchored: complete the offer/answer on the anchor's live engine call, so
-    // the pair now relays through the ports the anchor already held. Raw: cross
-    // the peer's own description, restated as siphon's direction.
-    let sdp_for_anchor = match (&context.media_call_id, state.rtpengine_set.as_ref()) {
-        (Some(media_call_id), Some(backend)) => {
-            let anchor_media = state
+    // Anchored: complete the offer/answer on the pair's engine call — the
+    // anchor's live one when it already relayed, the fresh one the bridge
+    // offered on otherwise. Nothing is adopted or deleted here: the anchor has
+    // not accepted yet. Raw: cross the peer's own description, restated as
+    // siphon's direction.
+    let sdp_for_anchor = match (
+        &context.media_call_id,
+        &context.media_from_tag,
+        state.rtpengine_set.as_ref(),
+    ) {
+        (Some(media_call_id), Some(from_tag), Some(backend)) => {
+            let profile = context.media_profile.clone().unwrap_or_default();
+            let flags = state
+                .rtpengine_profiles
+                .as_ref()
+                .and_then(|registry| registry.get(&profile).map(|entry| entry.answer.clone()));
+            let Some(mut flags) = flags else {
+                warn!(%profile, "B2BUA bridge: unknown media profile for the anchor's answer");
+                bridge_fail(peer_call_id, "offering_peer", 500, state);
+                return;
+            };
+            // The SDP in this answer is the peer's, so its signalling source is
+            // the ingress the profile asks to pin.
+            if let Some(source) = state
                 .call_actors
-                .get_call(&anchor_call_id)
-                .map(|call| call.a_leg.dialog.call_id.clone())
-                .and_then(|key| {
-                    state
-                        .rtpengine_sessions
-                        .as_ref()
-                        .and_then(|store| store.get(&key).map(|session| (key, session)))
-                });
-            let Some((anchor_key, session)) = anchor_media else {
-                warn!(%anchor_call_id, "B2BUA bridge: the anchor's media session vanished mid-bridge");
-                bridge_fail(peer_call_id, "offering_peer", 500, state);
-                return;
-            };
-            let flags = state.rtpengine_profiles.as_ref().and_then(|registry| {
-                registry
-                    .get(&session.profile)
-                    .map(|entry| entry.answer.clone())
-            });
-            let Some(flags) = flags else {
-                warn!(profile = %session.profile, "B2BUA bridge: unknown media profile on the anchor");
-                bridge_fail(peer_call_id, "offering_peer", 500, state);
-                return;
-            };
-            // Address the engine by the session's own id, not the context's
-            // copy: they agree, and the store is the one that stays right if a
-            // re-anchor ever moves it again.
-            debug_assert_eq!(session.rtpengine_id(), media_call_id);
+                .get_call(peer_call_id)
+                .map(|call| call.a_leg.transport.remote_addr.ip())
+            {
+                flags.stamp_received_from(source);
+            }
             let answered = tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(backend.answer(
-                    session.rtpengine_id(),
-                    &session.from_tag,
+                    media_call_id,
+                    from_tag,
                     &peer_answer_tag,
                     &response.body,
                     &flags,
                 ))
             });
             match answered {
-                Ok(sdp) => {
-                    // The pair is now two-sided on the engine; record the peer
-                    // as the answerer so a later hold / re-INVITE addresses the
-                    // right monologue.
-                    if let Some(store) = state.rtpengine_sessions.as_ref() {
-                        store.set_to_tag(&anchor_key, peer_answer_tag.clone());
-                    }
-                    sdp
-                }
+                Ok(sdp) => sdp,
                 Err(error) => {
                     warn!(%anchor_call_id, %error, "B2BUA bridge: the engine refused the peer's answer");
                     bridge_fail(peer_call_id, "offering_peer", 488, state);
@@ -903,6 +965,7 @@ pub fn bridge_complete(anchor_call_id: &str, response: &SipMessage, state: &Disp
         return;
     };
     let peer_call_id = context.peer_call_id.clone();
+    bridge_adopt_media(anchor_call_id, &context, state);
     state
         .call_actors
         .set_bridge_stage(anchor_call_id, BridgeStage::Bridged);
@@ -944,6 +1007,93 @@ pub fn bridge_complete(anchor_call_id: &str, response: &SipMessage, state: &Disp
     info!(%anchor_call_id, %peer_call_id, anchored, "B2BUA bridge: formed — media meets");
 }
 
+/// Both legs accepted the bridge: the pair's engine session becomes the one
+/// every media verb on the anchor addresses, and the sessions it replaces go.
+///
+/// Until now the anchor's store entry pointed at its own single-party session
+/// and the peer's at its own, so a bridge refused on the way here left both
+/// legs' media usable. Now the peer's session is deleted (its party relays
+/// through the pair's), and on a fresh call-id the anchor's old session is
+/// deleted and its entry moved over — the key stays the leg's SIP Call-ID, and
+/// only the engine-facing id moves, which is exactly what `rtpengine_call_id`
+/// is decoupled for. `ws_uri` and the tee are not carried over: they lived on
+/// the old call-id.
+pub fn bridge_adopt_media(
+    anchor_call_id: &str,
+    context: &crate::b2bua::bridge::BridgeContext,
+    state: &DispatcherState,
+) {
+    let (Some(store), Some(media_call_id), Some(from_tag)) = (
+        state.rtpengine_sessions.as_ref(),
+        context.media_call_id.as_ref(),
+        context.media_from_tag.as_ref(),
+    ) else {
+        return;
+    };
+    let Some(anchor_key) = state
+        .call_actors
+        .get_call(anchor_call_id)
+        .map(|call| call.a_leg.dialog.call_id.clone())
+    else {
+        return;
+    };
+    let peer_tag = state
+        .call_actors
+        .get_call(&context.peer_call_id)
+        .and_then(|call| call.a_leg.dialog.remote_tag.clone());
+
+    let mut retired = Vec::new();
+    if let Some(session) = store.remove(&context.peer_sip_call_id) {
+        retired.push((session.rtpengine_id().to_string(), session.from_tag.clone()));
+    }
+    let previous = store.get(&anchor_key);
+    if context.media_pending_adoption {
+        if let Some(previous) = previous.as_ref() {
+            if previous.rtpengine_id() != media_call_id {
+                retired.push((
+                    previous.rtpengine_id().to_string(),
+                    previous.from_tag.clone(),
+                ));
+            }
+        }
+        store.insert(crate::rtpengine::session::MediaSession {
+            call_id: anchor_key.clone(),
+            rtpengine_call_id: media_call_id.clone(),
+            from_tag: from_tag.clone(),
+            to_tag: peer_tag,
+            profile: context
+                .media_profile
+                .clone()
+                .or_else(|| previous.as_ref().map(|session| session.profile.clone()))
+                .unwrap_or_default(),
+            ws_uri: None,
+            ws_tee: None,
+            ws_bridge_attached: false,
+            created_at: std::time::Instant::now(),
+        });
+        // Adopted: a later teardown must delete it through the store, never
+        // discard it as a session no entry points at.
+        for leg in [anchor_call_id, context.peer_call_id.as_str()] {
+            if let Some(mut call) = state.call_actors.get_call_mut(leg) {
+                if let Some(bridge) = call.bridge.as_mut() {
+                    bridge.media_pending_adoption = false;
+                }
+            }
+        }
+    } else if let Some(mut session) = previous {
+        // The relay renegotiated in place: record the peer as the answerer so a
+        // later hold / re-INVITE addresses the right monologue.
+        if peer_tag.is_some() {
+            session.to_tag = peer_tag;
+        }
+        if let Some(profile) = context.media_profile.clone() {
+            session.profile = profile;
+        }
+        store.insert(session);
+    }
+    bridge_delete_sessions(state, retired, "the bridge formed");
+}
+
 /// A bridge step was refused. Drop both halves, release both re-INVITE slots and
 /// tell the controller which stage failed and with what — never a silent
 /// half-bridge, and never a teardown of calls the controller still owns.
@@ -956,6 +1106,10 @@ pub fn bridge_fail(call_id: &str, stage: &str, status_code: u16, state: &Dispatc
     state
         .call_actors
         .set_pending_reinvite(&peer_call_id, true, false);
+    // The fresh session only ever had the anchor's offer on it. The two legs'
+    // own sessions were never touched, so their media — a caller's prompts
+    // and ringback included — carries on as if the bridge had not been tried.
+    bridge_discard_pending_media(&context, state);
     let sip_call_id = state
         .call_actors
         .get_call(call_id)
