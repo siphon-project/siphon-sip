@@ -13,6 +13,23 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`{call_id}` in a WebSocket URI means the same thing everywhere.**
+  `stream_start` (tee and bridge) and a script's `rtpengine.attach_ws_tee` /
+  `attach_ws_bridge` passed their `ws_uri` to the engine as written, so a
+  `{call_id}` reached the WebSocket server literally, and a media profile's
+  `ws_tee` was never templated even though its `ws_uri` was. All of them now
+  expand `{call_id}`, `{from_tag}`, `{from_user}` and `{to_user}` in one
+  place, with `{call_id}` the call's SIP Call-ID (the event's `sip_call_id`),
+  as the negotiation paths already did. A misspelt or valueless placeholder is
+  refused (`bad_request` on `stream_start`, `ValueError` in a script) rather
+  than sent. An anchored `originate` now also fills `{from_user}` /
+  `{to_user}` from its dialog; they were refused there before. The control
+  SDKs' `stream_start` docs (Rust, Python, TypeScript) now say `{call_id}`
+  expands to the call's SIP Call-ID, and their examples use the template again
+  instead of building the URI by hand.
+
 ## [1.11.2] — 2026-09-29
 
 ### Added

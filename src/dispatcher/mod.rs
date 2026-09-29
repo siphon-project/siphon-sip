@@ -205,6 +205,8 @@ mod transfer_bye_tests;
 mod uas_bad_extension_tests;
 #[cfg(test)]
 mod unacked_answer_tests;
+#[cfg(test)]
+mod ws_uri_expansion_tests;
 
 // The imperative call-control surface the scripting, admin and control-plane
 // layers reach as `siphon::dispatcher::…`. It lives in `b2bua/` now, so each

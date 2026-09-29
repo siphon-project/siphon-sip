@@ -643,15 +643,15 @@ impl Call {
     /// multiple of 1000 within 8000-48000. A bad ``mode`` / ``direction`` /
     /// ``channels`` raises ``ValueError`` before anything is sent.
     ///
-    /// ``ws_uri`` is sent as written: placeholders such as ``{call_id}`` are
-    /// not expanded on ``stream_start`` at present, so pass a concrete URI
-    /// (built from ``call.sip_call_id``, say). siphon-rtp backend
-    /// only: rtpengine / rtpproxy raise ``ControlError``
-    /// (``code == "unsupported_verb"``).
+    /// ``ws_uri`` may use ``{call_id}`` / ``{from_tag}`` / ``{from_user}`` /
+    /// ``{to_user}``, which siphon expands before the engine sees it:
+    /// ``{call_id}`` expands to the call's SIP Call-ID (``call.sip_call_id``),
+    /// not the control-plane ``call_id``. siphon-rtp backend only: rtpengine /
+    /// rtpproxy raise ``ControlError`` (``code == "unsupported_verb"``).
     ///
     /// .. code-block:: python
     ///
-    ///     await call.stream_start(f"wss://ai.example/stream/{call.sip_call_id}",
+    ///     await call.stream_start("wss://ai.example/stream/{call_id}",
     ///                             direction="caller", sample_rate=16000)
     ///     await call.stream_start("wss://ai.example/agent", mode="bridge")
     #[pyo3(signature = (ws_uri, direction=None, channels=None, *, mode="tee", sample_rate=None))]

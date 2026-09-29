@@ -2,7 +2,7 @@ use super::bridge::{bridge_error, bridge_with_bus, unbridge};
 use super::call::{answer, drop_result, provisional_state, remove_header};
 use super::media::{
     dtmf, media_error, parse_play_source, parse_stream_channels, parse_stream_mode, play,
-    play_accept, play_source_kind, record_start, stream_start, StreamMode,
+    play_accept, play_source_kind, record_start, stream_start, stream_uri, StreamMode,
 };
 use super::originate::{
     default_total_timeout, originate, originate_error, originate_with_bus, parse_originate_media,
@@ -125,6 +125,50 @@ fn stream_mode_defaults_to_tee_and_rejects_anything_else() {
                 })
             ),
             "{bad} must be refused, got {result:?}"
+        );
+    }
+}
+
+/// `stream_start` expands its `ws_uri` like every other path that hands the
+/// engine one: `{call_id}` is the channel's SIP Call-ID.
+#[test]
+fn stream_start_expands_the_uri_for_the_channels_call() {
+    let uri = stream_uri(
+        "wss://asr.example.test/{call_id}/{from_tag}?from={from_user}",
+        "sipcid@host",
+        "caller-tag",
+        (Some("1001".to_string()), None),
+    )
+    .expect("expands");
+    assert_eq!(
+        uri,
+        "wss://asr.example.test/sipcid@host/caller-tag?from=1001"
+    );
+    // No placeholder: passed through as written.
+    assert_eq!(
+        stream_uri("wss://asr.example.test/s", "sipcid@host", "t", (None, None))
+            .expect("untouched"),
+        "wss://asr.example.test/s"
+    );
+    // A misspelt placeholder, or one this call has no value for, is refused.
+    for template in [
+        "wss://asr.example.test/{callid}",
+        "wss://asr.example.test/{to_user}",
+    ] {
+        assert!(
+            matches!(
+                stream_uri(
+                    template,
+                    "sipcid@host",
+                    "t",
+                    (Some("1001".to_string()), None)
+                ),
+                Err(ControlResult::Error {
+                    code: ControlErrorCode::BadRequest,
+                    ..
+                })
+            ),
+            "{template} must be refused"
         );
     }
 }

@@ -5,7 +5,7 @@ use crate::control::protocol::{ControlErrorCode, ControlResult};
 use crate::control::registry::ChannelRef;
 
 /// Fetch a clone of the stored A-leg INVITE Arc for a controlled call.
-fn stored_invite(
+pub(super) fn stored_invite(
     call_actor_id: &str,
 ) -> Option<std::sync::Arc<std::sync::Mutex<crate::sip::message::SipMessage>>> {
     let store = crate::b2bua::actor::global_call_store()?;

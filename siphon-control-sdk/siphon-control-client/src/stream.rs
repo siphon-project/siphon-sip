@@ -202,10 +202,11 @@ impl Call {
     /// default would turn every transcription into a takeover, with both
     /// parties hearing silence, the day that default moved.
     ///
-    /// `ws_uri` is sent as written: placeholders such as `{call_id}` are not
-    /// expanded on `stream_start` at present, so pass a concrete URI (built
-    /// from [`Call::sip_call_id`], say). siphon-rtp backend only: rtpengine /
-    /// rtpproxy answer [`ControlError::is_unsupported_verb`].
+    /// `ws_uri` may use `{call_id}` / `{from_tag}` / `{from_user}` /
+    /// `{to_user}`, which siphon expands before the engine sees it: `{call_id}`
+    /// expands to the call's SIP Call-ID ([`Call::sip_call_id`]), not the
+    /// control-plane call id. siphon-rtp backend only: rtpengine / rtpproxy
+    /// answer [`ControlError::is_unsupported_verb`].
     pub async fn stream_start(
         &self,
         ws_uri: &str,
@@ -222,14 +223,10 @@ impl Call {
     /// ```no_run
     /// # use siphon_control_client::sip::{Call, StreamDirection, StreamOptions};
     /// # async fn example(call: &Call) -> Result<(), siphon_control_client::ControlError> {
-    /// // Transcribe the caller at 16 kHz; the call keeps relaying. The URI is
-    /// // built here: `stream_start` does not expand placeholders.
-    /// let ws_uri = format!(
-    ///     "wss://ai.example/stream/{}",
-    ///     call.sip_call_id().unwrap_or_default()
-    /// );
+    /// // Transcribe the caller at 16 kHz; the call keeps relaying. siphon
+    /// // expands `{call_id}` to the call's SIP Call-ID.
     /// call.stream_start_with(
-    ///     &ws_uri,
+    ///     "wss://ai.example/stream/{call_id}",
     ///     StreamOptions::tee()
     ///         .direction(StreamDirection::Caller)
     ///         .sample_rate(16_000),
@@ -243,9 +240,9 @@ impl Call {
     /// ```
     ///
     /// A bridge on a leg that already has one re-points it in place. `ws_uri`
-    /// is sent as written: placeholders such as `{call_id}` are not expanded on
-    /// `stream_start` at present, so pass a concrete URI (built from
-    /// [`Call::sip_call_id`], say). A call with no anchored media session
+    /// is templated as for [`Call::stream_start`]: `{call_id}` expands to the
+    /// call's SIP Call-ID. An unknown placeholder, or one the call has no
+    /// value for, resolves to `bad_request`. A call with no anchored media session
     /// resolves to `not_found`; rtpengine / rtpproxy to
     /// [`ControlError::is_unsupported_verb`].
     pub async fn stream_start_with(

@@ -1344,8 +1344,8 @@ export class Call {
    *
    * ```ts
    * // Transcribe the caller at 16 kHz; the call keeps relaying.
-   * // The URI is built here: `stream_start` does not expand placeholders.
-   * await call.streamStart(`wss://ai.example/stream/${call.sipCallId}`, {
+   * // siphon expands `{call_id}` to the call's SIP Call-ID.
+   * await call.streamStart("wss://ai.example/stream/{call_id}", {
    *   direction: "caller",
    *   sampleRate: 16000,
    * });
@@ -1353,10 +1353,11 @@ export class Call {
    * await call.streamStart("wss://ai.example/agent", { mode: "bridge" });
    * ```
    *
-   * A bridge on a leg that already has one re-points it in place. `wsUri` is
-   * sent as written: placeholders such as `{call_id}` are not expanded on
-   * `stream_start` at present, so pass a concrete URI (built from
-   * {@link Call.sipCallId}, say). siphon-rtp backend only: rtpengine / rtpproxy
+   * A bridge on a leg that already has one re-points it in place. `wsUri` may
+   * use `{call_id}` / `{from_tag}` / `{from_user}` / `{to_user}`, which siphon
+   * expands before the engine sees it: `{call_id}` expands to the call's SIP
+   * Call-ID ({@link Call.sipCallId}), not the control-plane `callId`. An
+   * unknown placeholder rejects with `bad_request`. siphon-rtp backend only: rtpengine / rtpproxy
    * reject with `code === "unsupported_verb"` (`error.isUnsupportedVerb()`).
    */
   async streamStart(wsUri: string, options?: StreamOptions): Promise<void> {

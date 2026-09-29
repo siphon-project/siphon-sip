@@ -390,6 +390,20 @@ same way every other verb does — never a hang:
   arguments and refuses them with `bad_request`. An absent `mode` means `tee`,
   but the SDKs always send it, so a controller that asked for a tee never gets
   a takeover from a server whose default differs.
+- **WebSocket URI placeholders.** A `ws_uri` may name `{call_id}`,
+  `{from_tag}`, `{from_user}` and `{to_user}`, and siphon expands them before
+  the engine sees the URI, the same way on every path: `stream_start` (either
+  `mode`), `answer` / `progress` / `originate` with `ws_uri`, a media profile's
+  `ws_uri` or `ws_tee` applied by those verbs, and a script's `ws_uri=`,
+  `rtpengine.attach_ws_tee` and `attach_ws_bridge`.
+  `{call_id}` is the **SIP Call-ID** of the channel's call — the frame's
+  `sip_call_id`, not its `call_id` (siphon's own id for the call). For an
+  `originate` it is the placed leg's own Call-ID. `{from_tag}` is the tag the
+  engine keyed the leg on: the caller's From-tag on an inbound call, the
+  callee's To-tag on an `originate`. `{from_user}` / `{to_user}` are the user
+  parts of the call's From and To. A placeholder siphon does not know, or one
+  the call has no value for, is refused (`stream_start` answers `bad_request`)
+  rather than sent to the engine as written.
 - A call with no anchored media session answers `not_found`; a backend that
   cannot perform the op answers `unsupported_verb`; any other backend failure
   answers `unavailable`.

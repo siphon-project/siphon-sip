@@ -574,6 +574,10 @@ pub(super) async fn stream_start(channel: &ChannelRef, args: &serde_json::Value)
             Ok(target) => target,
             Err(result) => return result,
         };
+        let ws_uri = match channel_stream_uri(channel, &ws_uri, &from_tag) {
+            Ok(ws_uri) => ws_uri,
+            Err(result) => return result,
+        };
         return match backend.attach_ws_bridge(&call_id, &from_tag, &ws_uri).await {
             Ok(()) => {
                 crate::dispatcher::b2bua_media_set_ws_bridge_attached(&channel.sip_call_id, true);
@@ -628,6 +632,10 @@ pub(super) async fn stream_start(channel: &ChannelRef, args: &serde_json::Value)
         Ok(target) => target,
         Err(result) => return result,
     };
+    let ws_uri = match channel_stream_uri(channel, &ws_uri, &from_tag) {
+        Ok(ws_uri) => ws_uri,
+        Err(result) => return result,
+    };
     match backend
         .attach_ws_tee(
             &call_id,
@@ -649,6 +657,54 @@ pub(super) async fn stream_start(channel: &ChannelRef, args: &serde_json::Value)
         }
         Err(error) => media_error(error),
     }
+}
+
+/// `stream_start`'s `ws_uri` with its placeholders expanded for the channel's
+/// call, the same way a profile's `ws_uri` / `ws_tee` and a script's
+/// `attach_ws_tee` are: `{call_id}` is the channel's SIP Call-ID, `{from_tag}`
+/// the tag the engine keyed the leg on, `{from_user}` / `{to_user}` the user
+/// parts of the call's stored INVITE. A template that cannot be expanded is
+/// `bad_request`, never handed to the engine with a placeholder still in it.
+pub(super) fn stream_uri(
+    template: &str,
+    sip_call_id: &str,
+    from_tag: &str,
+    users: (Option<String>, Option<String>),
+) -> Result<String, ControlResult> {
+    let (from_user, to_user) = users;
+    crate::rtpengine::ws_uri::expand_ws_uri(
+        template,
+        &crate::rtpengine::ws_uri::WsUriContext {
+            call_id: sip_call_id,
+            from_tag,
+            from_user: from_user.as_deref(),
+            to_user: to_user.as_deref(),
+        },
+    )
+    .map_err(|error| {
+        ControlResult::error(
+            ControlErrorCode::BadRequest,
+            format!("stream_start {error}"),
+        )
+    })
+}
+
+/// [`stream_uri`] for `channel`'s call, the dialog's user parts read off the
+/// INVITE its call actor stored.
+fn channel_stream_uri(
+    channel: &ChannelRef,
+    template: &str,
+    from_tag: &str,
+) -> Result<String, ControlResult> {
+    let users = super::call::stored_invite(&channel.call_actor_id)
+        .and_then(|invite| {
+            invite
+                .lock()
+                .ok()
+                .map(|invite| crate::rtpengine::ws_uri::dialog_users(&invite))
+        })
+        .unwrap_or((None, None));
+    stream_uri(template, &channel.sip_call_id, from_tag, users)
 }
 
 /// `stream_stop` — detach the WebSocket audio tee (idempotent on siphon-rtp;

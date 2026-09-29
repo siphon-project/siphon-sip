@@ -3592,16 +3592,20 @@ class MockRtpEngine:
         """Expand ``{call_id}`` / ``{from_tag}`` / ``{from_user}`` /
         ``{to_user}`` in a ``ws_uri``, mirroring the real implementation.
 
-        An unknown placeholder raises ``ValueError`` rather than passing through
-        as a literal — a typo'd ``{callid}`` would otherwise reach the media
-        engine as part of the URI path.
+        ``{call_id}`` is the SIP Call-ID of the leg ``target`` names, which may
+        be a SIP object, a ``(call_id, from_tag)`` pair or a bare ``call_id``
+        (the last two supply no user parts). An unknown placeholder, or one the
+        call has no value for, raises ``ValueError`` rather than passing
+        through as a literal — a typo'd ``{callid}`` would otherwise reach the
+        media engine as part of the URI path.
         """
         if "{" not in template:
             return template
 
+        call_id, from_tag = _resolve_media_target(target)
         values = {
-            "call_id": getattr(target, "call_id", None),
-            "from_tag": getattr(target, "from_tag", None),
+            "call_id": call_id,
+            "from_tag": from_tag,
         }
         for name, attribute in (("from_user", "from_uri"), ("to_user", "to_uri")):
             uri = getattr(target, attribute, None)
@@ -4381,8 +4385,12 @@ class MockRtpEngine:
         backends raise rather than silently doing nothing.
 
         Args:
-            target: Request, Reply, or Call object.
+            target: Request, Reply, or Call object, a ``(call_id, from_tag)``
+                pair, or a bare ``call_id``.
             ws_uri: ``ws://`` or ``wss://`` URI the engine dials as a client.
+                ``{call_id}`` (the SIP Call-ID), ``{from_tag}``,
+                ``{from_user}`` and ``{to_user}`` expand as they do on a
+                profile's ``ws_uri``.
             direction: Which leg(s) to stream — ``"both"`` (default),
                 ``"caller"`` (the offerer) or ``"callee"`` (the answerer).
             channels: Wire channel count — ``2`` interleaves caller/callee as
@@ -4419,6 +4427,7 @@ class MockRtpEngine:
             )
         if sample_rate is not None:
             _validate_ws_sample_rate("attach_ws_tee sample_rate", sample_rate)
+        ws_uri = self._expand_ws_uri(ws_uri, target)
         call_id, from_tag = _resolve_media_target(target)
         self.operations.append(("attach_ws_tee", ws_uri))
         self.media_calls.append({
@@ -4477,8 +4486,10 @@ class MockRtpEngine:
         Requires ``media.backend: siphon-rtp``.
 
         Args:
-            target: Request, Reply, or Call object.
-            ws_uri: ``ws://`` or ``wss://`` URI the engine dials as a client.
+            target: Request, Reply, or Call object, a ``(call_id, from_tag)``
+                pair, or a bare ``call_id``.
+            ws_uri: ``ws://`` or ``wss://`` URI the engine dials as a client,
+                templated as for :meth:`attach_ws_tee`.
 
         Returns:
             ``True`` on success.
@@ -4489,6 +4500,7 @@ class MockRtpEngine:
             # ... later, hand the same caller to a different model session:
             await rtpengine.attach_ws_bridge(call, "wss://ai.internal/session-2")
         """
+        ws_uri = self._expand_ws_uri(ws_uri, target)
         call_id, from_tag = _resolve_media_target(target)
         self.operations.append(("attach_ws_bridge", ws_uri))
         self.media_calls.append({

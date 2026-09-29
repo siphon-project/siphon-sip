@@ -43,20 +43,23 @@ pub fn originate_anchor_2xx(
         return Err("the callee answered with no SDP offer — nothing to anchor".to_string());
     }
 
-    // ws_uri precedence: explicit per-call arg → the profile's own → none.
-    let template = anchor.ws_uri.clone().or_else(|| flags.ws_uri.clone());
-    if let Some(template) = template {
-        let context = crate::script::api::rtpengine::WsUriContext {
+    // ws_uri precedence: explicit per-call arg → the profile's own → none. The
+    // bridge and the profile's tee are templated with the originated leg's own
+    // SIP Call-ID and the tag the engine keys it on (the callee's).
+    if let Some(template) = anchor.ws_uri.clone() {
+        flags.ws_uri = Some(template);
+    }
+    let (from_user, to_user) = crate::rtpengine::ws_uri::dialog_users(response);
+    crate::rtpengine::ws_uri::expand_flag_uris(
+        &mut flags,
+        &crate::rtpengine::ws_uri::WsUriContext {
             call_id: sip_call_id,
             from_tag: remote_tag,
-            from_user: None,
-            to_user: None,
-        };
-        flags.ws_uri = Some(
-            crate::script::api::rtpengine::expand_ws_uri(&template, &context)
-                .map_err(|error| format!("ws_uri templating failed: {error:?}"))?,
-        );
-    }
+            from_user: from_user.as_deref(),
+            to_user: to_user.as_deref(),
+        },
+    )
+    .map_err(|error| format!("ws_uri templating failed: {error}"))?;
     flags.stamp_received_from(response_source.ip());
     flags.stamp_sip_call_id(sip_call_id);
     let unsupported = backend.unsupported_flags(&flags);
