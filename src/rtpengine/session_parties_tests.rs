@@ -23,6 +23,96 @@ fn session(call_id: &str, engine_call_id: &str) -> MediaSession {
     }
 }
 
+/// Record `sip_call_ids` as the parties of `engine_call_id`, with no tags:
+/// what the summary needs, which is all these tests read.
+fn record(store: &MediaSessionStore, call_id: &str, engine_call_id: &str, sip_call_ids: &[&str]) {
+    let parties: Vec<(&str, Option<&str>)> = sip_call_ids.iter().map(|id| (*id, None)).collect();
+    store.record_parties(call_id, engine_call_id, &parties);
+}
+
+/// A pair's per-party event goes to the party whose engine tag it names, and
+/// only that one; a tag no party (or both) carries goes nowhere. Nothing is
+/// spent: a call reports many.
+#[tokio::test]
+async fn a_per_party_event_goes_to_the_party_its_tag_names() {
+    let store = MediaSessionStore::new();
+    store.insert(session("event-anchor@example.test", "event-pair"));
+    store.record_parties(
+        "event-anchor@example.test",
+        "event-pair",
+        &[
+            ("event-anchor@example.test", Some("tag-anchor")),
+            ("event-peer@example.test", Some("tag-peer")),
+        ],
+    );
+    assert_eq!(
+        store.event_party("event-pair", "tag-peer").as_deref(),
+        Some("event-peer@example.test")
+    );
+    assert_eq!(
+        store.event_party("event-pair", "tag-anchor").as_deref(),
+        Some("event-anchor@example.test")
+    );
+    assert_eq!(store.event_party("event-pair", "tag-stranger"), None);
+    assert_eq!(store.engine_parties_count(), 1, "nothing spent");
+
+    // One party: every event is its own, whatever the tag.
+    store.insert(session("reanchor@example.test", "reanchor-engine"));
+    assert_eq!(
+        store.event_party("reanchor-engine", "any-tag").as_deref(),
+        Some("reanchor@example.test")
+    );
+    // Nothing recorded: the engine id is the SIP Call-ID.
+    assert_eq!(
+        store.event_party("plain@example.test", "tag-a").as_deref(),
+        Some("plain@example.test")
+    );
+}
+
+/// Two parties on one tag cannot be told apart: neither gets the event.
+#[tokio::test]
+async fn a_tag_both_parties_carry_names_neither() {
+    let store = MediaSessionStore::new();
+    store.insert(session("same-anchor@example.test", "same-pair"));
+    store.record_parties(
+        "same-anchor@example.test",
+        "same-pair",
+        &[
+            ("same-anchor@example.test", Some("shared-tag")),
+            ("same-peer@example.test", Some("shared-tag")),
+        ],
+    );
+    assert_eq!(store.event_party("same-pair", "shared-tag"), None);
+}
+
+/// The store key of the session on an engine call, whatever id the engine
+/// knows it by; none once it has left the store.
+#[tokio::test]
+async fn an_engine_call_resolves_to_the_key_its_session_is_stored_under() {
+    let store = MediaSessionStore::new();
+    store.insert(session("key-plain@example.test", "key-plain@example.test"));
+    store.insert(session("key-anchor@example.test", "key-pair"));
+    record(
+        &store,
+        "key-anchor@example.test",
+        "key-pair",
+        &["key-anchor@example.test", "key-peer@example.test"],
+    );
+    assert_eq!(
+        store
+            .session_key_for_engine_call("key-plain@example.test")
+            .as_deref(),
+        Some("key-plain@example.test")
+    );
+    assert_eq!(
+        store.session_key_for_engine_call("key-pair").as_deref(),
+        Some("key-anchor@example.test")
+    );
+    assert_eq!(store.session_key_for_engine_call("key-unknown"), None);
+    store.remove("key-anchor@example.test");
+    assert_eq!(store.session_key_for_engine_call("key-pair"), None);
+}
+
 /// A session on its own SIP Call-ID needs nothing recorded: its summary
 /// names the call it belongs to.
 #[tokio::test]
@@ -45,7 +135,8 @@ async fn a_session_on_its_own_call_id_is_its_own_party() {
 async fn a_bridged_pairs_summary_belongs_to_both_parties() {
     let store = MediaSessionStore::new();
     store.insert(session("anchor@example.test", "pair-fresh"));
-    store.record_parties(
+    record(
+        &store,
         "anchor@example.test",
         "pair-fresh",
         &["anchor@example.test", "peer@example.test"],
@@ -58,7 +149,8 @@ async fn a_bridged_pairs_summary_belongs_to_both_parties() {
 
     // After teardown: the summary follows the delete.
     store.insert(session("anchor2@example.test", "pair-fresh-2"));
-    store.record_parties(
+    record(
+        &store,
         "anchor2@example.test",
         "pair-fresh-2",
         &["anchor2@example.test", "peer2@example.test"],
@@ -78,7 +170,8 @@ async fn a_bridged_pairs_summary_belongs_to_both_parties() {
 async fn an_in_place_pair_names_each_party_once() {
     let store = MediaSessionStore::new();
     store.insert(session("inplace@example.test", "inplace@example.test"));
-    store.record_parties(
+    record(
+        &store,
         "inplace@example.test",
         "inplace@example.test",
         &[
@@ -99,9 +192,15 @@ async fn an_in_place_pair_names_each_party_once() {
 #[tokio::test]
 async fn parties_are_recorded_only_for_the_stored_engine_call() {
     let store = MediaSessionStore::new();
-    store.record_parties("absent@example.test", "ghost", &["absent@example.test"]);
+    record(
+        &store,
+        "absent@example.test",
+        "ghost",
+        &["absent@example.test"],
+    );
     store.insert(session("stored@example.test", "stored-engine"));
-    store.record_parties(
+    record(
+        &store,
         "stored@example.test",
         "other-engine",
         &["stored@example.test"],
@@ -135,7 +234,8 @@ async fn a_decoupled_session_resolves_to_its_call_id() {
 async fn a_replaced_session_keeps_its_parties_for_its_summary() {
     let store = MediaSessionStore::new();
     store.insert(session("rebridged@example.test", "first-pair"));
-    store.record_parties(
+    record(
+        &store,
         "rebridged@example.test",
         "first-pair",
         &["rebridged@example.test", "first-peer@example.test"],
@@ -158,7 +258,8 @@ async fn removed_parties_expire_after_the_grace_window() {
     let store = MediaSessionStore::new();
     store.insert(session("live@example.test", "live-pair"));
     store.insert(session("ended@example.test", "ended-pair"));
-    store.record_parties(
+    record(
+        &store,
         "ended@example.test",
         "ended-pair",
         &["ended@example.test", "ended-peer@example.test"],
@@ -203,7 +304,7 @@ async fn the_parties_map_drains_to_baseline() {
         let peer = format!("leak-peer-{index}@example.test");
         let engine = format!("leak-pair-{index}");
         store.insert(session(&anchor, &engine));
-        store.record_parties(&anchor, &engine, &[anchor.as_str(), peer.as_str()]);
+        record(&store, &anchor, &engine, &[anchor.as_str(), peer.as_str()]);
     }
     assert_eq!(store.engine_parties_count(), PAIRS);
     for index in 0..PAIRS {

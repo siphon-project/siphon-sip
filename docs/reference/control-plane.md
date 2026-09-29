@@ -517,6 +517,15 @@ additive to the in-process `@rtpengine.on_dtmf` dispatch: the digit fires both,
 and it needs no extra configuration beyond the DTMF-log wiring the media engine
 already uses.
 
+On a **bridged pair** both legs relay through one engine session, and the
+engine reports a digit on that session with the `from_tag` of the party that
+pressed it. siphon sends `ChannelDtmfReceived` to that party's channel only,
+never to both. The same holds for the other per-party media events on a pair:
+`PlayFinished`, `RecordingFinished`, `WsTeeStarted` / `WsTeeEnded` and
+`WsBridgeStarted` / `WsBridgeEnded` go to the channel of the party whose tag
+they carry (the anchor's for a prompt, recording or stream started on the
+anchor's channel). An event whose tag names neither party is not delivered.
+
 A digit signalled as **SIP INFO** rather than in the media (RFC 2976 / RFC 6086
 `application/dtmf-relay`, which some handsets and trunks send instead of
 RFC 4733) produces the same event, from the same code path — an app collecting

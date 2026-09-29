@@ -286,6 +286,38 @@ pub(super) fn media_summary_to_cdr(
     cdr
 }
 
+/// The media CDRs for an engine summary whose engine call carried the SIP
+/// Call-IDs in `parties`: one record per party, each on that party's Call-ID,
+/// so every leg's SIP CDR joins its media record on `call_id` the way a
+/// single call's does.
+///
+/// A bridged pair's engine call carries both legs, so both records hold the
+/// same figures. Each carries the engine call-id as `media_call_id` and the
+/// number of records written from it as `media_parties`, so a collector that
+/// sums media across records counts a pair once (group on `media_call_id`).
+/// On an ordinary call `media_call_id` equals `call_id` and `media_parties` is
+/// `1`.
+pub(super) fn media_summary_to_cdrs(
+    summary: &crate::rtpengine::events::CallSummary,
+    parties: &[String],
+) -> Vec<crate::cdr::Cdr> {
+    let mut record = media_summary_to_cdr(summary);
+    record
+        .extra
+        .insert("media_call_id".to_string(), summary.call_id.clone());
+    record
+        .extra
+        .insert("media_parties".to_string(), parties.len().to_string());
+    parties
+        .iter()
+        .map(|sip_call_id| {
+            let mut cdr = record.clone();
+            cdr.call_id = sip_call_id.clone();
+            cdr
+        })
+        .collect()
+}
+
 /// Proxy CDR START — open the record for an inbound INVITE, *before* the script
 /// handler runs, so `cdr.write(request, extra=…)` from that handler has a
 /// record to attach its fields to. What the script then decides is settled by

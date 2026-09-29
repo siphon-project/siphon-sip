@@ -285,6 +285,41 @@ def test_media_legs_empty_on_a_call_record():
     assert CallDetailRecord.from_dict(call_record()).media_legs == []
 
 
+def test_a_bridged_pairs_media_record_names_its_engine_call():
+    # A bridged pair's engine call carries both legs: siphon writes one MEDIA
+    # record per leg, each on that leg's Call-ID, both naming the engine call
+    # so a collector counts the shared figures once.
+    payload = media_record()
+    payload["media_call_id"] = "b2b-pair-0001"
+    payload["media_parties"] = "2"
+    record = CallDetailRecord.from_dict(payload)
+
+    assert record.call_id == "a84b4c76e66710@192.0.2.100"
+    assert record.media_call_id == "b2b-pair-0001"
+    assert record.media_parties == 2
+    assert record.is_shared_media is True
+
+
+def test_an_ordinary_media_record_is_its_own_engine_call():
+    payload = media_record()
+    payload["media_call_id"] = payload["call_id"]
+    payload["media_parties"] = "1"
+    record = CallDetailRecord.from_dict(payload)
+
+    assert record.media_call_id == record.call_id
+    assert record.media_parties == 1
+    assert record.is_shared_media is False
+
+
+def test_a_media_record_from_an_older_siphon_has_no_engine_call():
+    record = CallDetailRecord.from_dict(media_record())
+
+    assert record.media_call_id is None
+    assert record.media_parties is None
+    assert record.is_shared_media is False
+    assert CallDetailRecord.from_dict(call_record()).media_call_id is None
+
+
 def test_media_record_with_only_a_near_leg():
     # A call that never reached a B-leg (404/487) gets a MEDIA record with the
     # offerer's leg alone — the parse must stop there, not invent a far leg.

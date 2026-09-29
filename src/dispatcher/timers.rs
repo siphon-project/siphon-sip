@@ -12,21 +12,30 @@ use super::*;
 /// `if let Some(session) = rtpengine_sessions.remove(&…)`, so removing the
 /// record here makes those sites no-ops — no delete is issued.
 ///
+/// `call_id` is the engine call the event names. A bridged pair's is an id of
+/// its own, stored under the anchor's SIP Call-ID, so the record is found
+/// through the engine call rather than by that id as a key.
+///
 /// Returns true if a record was actually present (i.e. we cleared something).
 pub(super) fn clear_media_session_on_timeout(
     rtpengine_sessions: Option<&Arc<crate::rtpengine::session::MediaSessionStore>>,
     call_id: &str,
 ) -> bool {
-    match rtpengine_sessions {
-        Some(store) if store.remove(call_id).is_some() => {
-            debug!(
-                %call_id,
-                "media timeout: dropped media-session bookkeeping (engine already reaped call)"
-            );
-            true
-        }
-        _ => false,
+    let Some(store) = rtpengine_sessions else {
+        return false;
+    };
+    let Some(key) = store.session_key_for_engine_call(call_id) else {
+        return false;
+    };
+    if store.remove(&key).is_none() {
+        return false;
     }
+    debug!(
+        engine_call_id = %call_id,
+        call_id = %key,
+        "media timeout: dropped media-session bookkeeping (engine already reaped call)"
+    );
+    true
 }
 
 /// The local UDP socket [`send_to_target`] will egress from for `destination`,

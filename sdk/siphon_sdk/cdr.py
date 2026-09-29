@@ -35,7 +35,8 @@ type exists.
   (``cdr.auto_emit`` + ``cdr.include_register``);
 * a media record — ``MEDIA``, emitted by the media engine at end of call with
   per-leg quality figures in ``extra``. It carries no URIs: join it to the call
-  record on ``call_id``.
+  record on ``call_id``. A bridged pair gets one per leg, sharing
+  ``media_call_id``.
 
 Zero-dependency dataclasses (matching the rest of ``siphon_sdk``). Parsing is
 lenient — a missing field reads as empty/zero rather than raising, because the
@@ -595,6 +596,37 @@ class CallDetailRecord:
         ``media_timeout`` on a call the signalling side thinks completed is the
         one-way-audio / stalled-media signature worth alerting on."""
         return self.extra.get("media_reason")
+
+    @property
+    def media_call_id(self) -> Optional[str]:
+        """On a ``MEDIA`` record, the media engine's call-id for the session.
+        Equal to :attr:`call_id` on an ordinary call. A bridged pair relays both
+        legs through one engine call on an id of its own, and siphon writes one
+        ``MEDIA`` record per leg, each on that leg's :attr:`call_id`, both
+        carrying this id: group on it to count the pair's media once. ``None``
+        on other records and on records from a siphon that predates it."""
+        return self.extra.get("media_call_id")
+
+    @property
+    def media_parties(self) -> Optional[int]:
+        """On a ``MEDIA`` record, how many records were written from the same
+        engine call (:attr:`media_call_id`): ``1`` on an ordinary call, ``2``
+        for a bridged pair."""
+        return _as_int(self.extra.get("media_parties"))
+
+    @property
+    def is_shared_media(self) -> bool:
+        """Whether this ``MEDIA`` record's figures are shared with another
+        leg's record (a bridged pair): summing media across records should
+        count each :attr:`media_call_id` once::
+
+            seen = set()
+            for record in records:
+                if record.is_media and record.media_call_id not in seen:
+                    seen.add(record.media_call_id)
+                    total_bytes += sum(leg.bytes_in for leg in record.media_legs)
+        """
+        return (self.media_parties or 0) > 1
 
     @property
     def media_duration_ms(self) -> Optional[int]:

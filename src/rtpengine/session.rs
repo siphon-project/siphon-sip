@@ -219,10 +219,19 @@ pub struct MediaSessionStore {
 /// kept once no stored session is on it.
 #[derive(Debug)]
 struct EngineParties {
-    sip_call_ids: Vec<String>,
+    parties: Vec<EngineParty>,
     /// `None` while a stored session is on the engine call; set when it
     /// leaves the store, since the engine's summary follows that delete.
     expires_at: Option<tokio::time::Instant>,
+}
+
+/// One party of an engine call: its SIP Call-ID, and the engine tag its
+/// media is on, which is how the engine names the party in a per-party event
+/// (a digit, a playback, a stream).
+#[derive(Debug)]
+struct EngineParty {
+    sip_call_id: String,
+    tag: Option<String>,
 }
 
 impl MediaSessionStore {
@@ -249,7 +258,10 @@ impl MediaSessionStore {
                     self.parties.insert(
                         engine_call_id.clone(),
                         EngineParties {
-                            sip_call_ids: vec![call_id.clone()],
+                            parties: vec![EngineParty {
+                                sip_call_id: call_id.clone(),
+                                tag: Some(session.from_tag.clone()),
+                            }],
                             expires_at: None,
                         },
                     );
@@ -264,12 +276,17 @@ impl MediaSessionStore {
     }
 
     /// Record that the engine call `engine_call_id`, which the session stored
-    /// under `call_id` is on, carries the media of each SIP Call-ID in
-    /// `sip_call_ids`: a bridged pair's anchor and peer. Replaces what was
+    /// under `call_id` is on, carries the media of each `(SIP Call-ID, engine
+    /// tag)` in `parties`: a bridged pair's anchor and peer. Replaces what was
     /// recorded, and keeps a Call-ID listed twice once. Nothing is recorded
     /// unless the stored session is on that engine call, so nothing is recorded
     /// that no removal would ever release.
-    pub fn record_parties(&self, call_id: &str, engine_call_id: &str, sip_call_ids: &[&str]) {
+    pub fn record_parties(
+        &self,
+        call_id: &str,
+        engine_call_id: &str,
+        parties: &[(&str, Option<&str>)],
+    ) {
         let stored = self
             .sessions
             .get(call_id)
@@ -277,19 +294,71 @@ impl MediaSessionStore {
         if !stored {
             return;
         }
-        let mut unique: Vec<String> = Vec::with_capacity(sip_call_ids.len());
-        for sip_call_id in sip_call_ids {
-            if !unique.iter().any(|kept| kept == sip_call_id) {
-                unique.push((*sip_call_id).to_string());
+        let mut unique: Vec<EngineParty> = Vec::with_capacity(parties.len());
+        for (sip_call_id, tag) in parties {
+            if !unique.iter().any(|kept| kept.sip_call_id == *sip_call_id) {
+                unique.push(EngineParty {
+                    sip_call_id: (*sip_call_id).to_string(),
+                    tag: tag.map(str::to_string),
+                });
             }
         }
         self.parties.insert(
             engine_call_id.to_string(),
             EngineParties {
-                sip_call_ids: unique,
+                parties: unique,
                 expires_at: None,
             },
         );
+    }
+
+    /// The SIP Call-ID a per-party engine event on `engine_call_id` belongs
+    /// to — a digit, a playback, a recording, a stream — given the engine tag
+    /// `tag` the event names.
+    ///
+    /// On an engine call with one party, that party. On a bridged pair, the
+    /// party whose tag it is: a digit the peer pressed is the peer's alone.
+    /// `None` when no party, or more than one, carries the tag, since
+    /// guessing would hand one party's event to the other. On an engine call
+    /// with nothing recorded, `engine_call_id` itself, which is then the SIP
+    /// Call-ID. Unlike [`MediaSessionStore::summary_parties`] this spends
+    /// nothing: a call reports many such events.
+    pub fn event_party(&self, engine_call_id: &str, tag: &str) -> Option<String> {
+        let Some(recorded) = self.parties.get(engine_call_id) else {
+            return Some(engine_call_id.to_string());
+        };
+        if let [only] = recorded.parties.as_slice() {
+            return Some(only.sip_call_id.clone());
+        }
+        let mut named = recorded
+            .parties
+            .iter()
+            .filter(|party| party.tag.as_deref() == Some(tag));
+        match (named.next(), named.next()) {
+            (Some(party), None) => Some(party.sip_call_id.clone()),
+            _ => None,
+        }
+    }
+
+    /// The store key of the session on engine call `engine_call_id`: the SIP
+    /// Call-ID it is stored under, which for a bridged pair or a re-anchor is
+    /// not the engine id. `None` when no stored session is on that call.
+    pub fn session_key_for_engine_call(&self, engine_call_id: &str) -> Option<String> {
+        let on_call = |key: &str| {
+            self.sessions
+                .get(key)
+                .is_some_and(|session| session.rtpengine_id() == engine_call_id)
+        };
+        if on_call(engine_call_id) {
+            return Some(engine_call_id.to_string());
+        }
+        let recorded = self.parties.get(engine_call_id)?;
+        recorded
+            .parties
+            .iter()
+            .map(|party| party.sip_call_id.as_str())
+            .find(|key| on_call(key))
+            .map(str::to_string)
     }
 
     /// The SIP Call-IDs the engine's end-of-call summary for `engine_call_id`
@@ -309,7 +378,11 @@ impl MediaSessionStore {
                     .expires_at
                     .map_or(true, |expires_at| expires_at > tokio::time::Instant::now()) =>
             {
-                parties.sip_call_ids
+                parties
+                    .parties
+                    .into_iter()
+                    .map(|party| party.sip_call_id)
+                    .collect()
             }
             _ => vec![engine_call_id.to_string()],
         }
