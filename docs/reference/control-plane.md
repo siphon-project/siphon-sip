@@ -286,7 +286,7 @@ what lets a refused verb be lined up against a capture, a CDR and HEP.
 | `progress` | sip | `{code, reason?, body?, content_type?, anchor?, profile?, ws_uri?}` | a UAS 1xx, optionally opening an early-media path with SDP (RFC 3960 §3.1); defaults to `183 Session Progress`. With `anchor` (or a `profile` / `ws_uri`, which imply it) siphon synthesizes the early-media SDP against the media engine instead of taking a `body` (pass one or the other), and the later 2xx repeats that answer. An anchored progress needs a 101-199 code, since a 100 carries no body. On a media failure nothing is sent and it answers `unavailable`, with the call still parked |
 | `reject` | sip | `{code, reason?}` | final non-2xx + tear down |
 | `hangup` | sip | `{reason?}` | BYE an answered call, or reject an unanswered one |
-| `drop` | sip | `{reason?, ban?}` | abandon an **unanswered** call with nothing on the wire — no final response, no CANCEL — and release it; `ban: true` also scores the caller's source toward an auto-ban; refused (`invalid_state`) on an answered call, whose dialog is owed a BYE, and on an `originate {aor}` whose phones are still ringing, whose INVITEs are owed a CANCEL (`hangup`). See [dropping unsolicited traffic](#drop--abandon-a-call-without-answering-it) |
+| `drop` | sip | `{reason?, ban?}` | abandon an **unanswered** call with no final response and no CANCEL on the wire (the `100 Trying` siphon sent when the INVITE arrived has already gone) and release it; `ban: true` also scores the caller's source toward an auto-ban; refused (`invalid_state`) on an answered call, whose dialog is owed a BYE, and on an `originate {aor}` whose phones are still ringing, whose INVITEs are owed a CANCEL (`hangup`). See [dropping unsolicited traffic](#drop--abandon-a-call-without-answering-it) |
 | `refer` | sip | `{to, replaces?}` | in-dialog REFER on the A-leg |
 | `accept_refer` | sip | `{target?, next_hop?, mode?}` | accept a pending inbound REFER (from a `TransferRequested` event) and run the transfer |
 | `reject_refer` | sip | `{code?, reason?}` | reject a pending inbound REFER with a final non-2xx (default `603 Decline`) |
@@ -417,9 +417,14 @@ addresses, which by construction is not the first probe from a new one.
 
 The controller holds the only knowledge of which numbers are real, so it is the
 only thing that can decide an INVITE is unsolicited. `drop` is what it acts on
-that decision with: **nothing** goes to the caller, and the call is released.
-The `100 Trying` the transaction layer already sent stands — the open port
-disclosed that a server exists, which is all a `100` says.
+that decision with: **no final response** goes to the caller, and the call is
+released. "Nothing on the wire" means exactly that, and not less: siphon answers
+every INVITE it accepts with `100 Trying` as soon as it arrives (RFC 3261
+§8.2.6.1), before the call is created and so before a controller has heard of
+it, and that `100` has already gone by the time `drop` can be sent. It stands —
+the open port disclosed that a server exists, which is all a `100` says. What
+`drop` withholds is the `404`/`486`/`603` that would say whether the number is
+real.
 
 Not replying at all is **not** the same thing, which is why this is a verb and
 not a convention: the call would stay parked until the application's own
@@ -866,8 +871,8 @@ The events arrive on your channel id:
 |---|---|---|
 | `DialBranch` | `{leg_id, leg_sip_call_id, target, aor}` | a phone's INVITE was built (the later phones of a sequential group included) |
 | `ChannelStateChange` | `{state:"ringing"\|"progress", code, early_media, sdp?, leg_id, leg_sip_call_id, target, aor}` | a phone sent a 1xx, as a plain originate reports its callee's, naming the phone |
-| `DialBranchFailed` | `{…identity, code, reason, cause}` | a phone ended without answering: `rejected`, `timeout`, `cancelled` (another answered, or the group ended) or `unsent` |
-| `DialAnswered` | `{…identity, code}` | a phone answered and won |
+| `DialBranchFailed` | `{leg_id, leg_sip_call_id, target, aor, code, reason, cause}` | a phone ended without answering: `rejected`, `timeout`, `cancelled` (another answered, or the group ended) or `unsent` |
+| `DialAnswered` | `{leg_id, leg_sip_call_id, target, aor, code}` | a phone answered and won |
 | `ChannelStateChange` | `{state:"answered", code, sdp?}` | right after `DialAnswered`, as for a plain originate |
 | `StasisEnd` | `{reason, code, response}` | nobody answered: `rejected` with the best of the phones' statuses (RFC 3261 §16.7 step 6), `ring timeout` (408), `cancelled` (487), `unsent`, or `media_failed` when the winner's media could not be anchored |
 
@@ -1073,12 +1078,24 @@ the caller's own.
 | event | payload | when |
 |---|---|---|
 | `DialBranch` | `{leg_id, leg_sip_call_id, target, aor?}` | a branch was created; its INVITE goes out next |
-| `DialBranchFailed` | `{leg_id, leg_sip_call_id, target, code, reason, cause}` | a branch ended without answering. `cause` is `rejected` (the far end's final non-2xx, `code`/`reason` its own), `timeout` (`408`, it rang out), `cancelled` (`487`, siphon CANCELled it: another branch answered, a `6xx` ended the fork, or the caller hung up) or `unsent` (`503`, the INVITE never reached the transport) |
-| `DialAnswered` | `{leg_id, leg_sip_call_id, target, code}` | this branch answered; sent before the branches it beat are reported `cancelled` |
-| `DialFailed` | `{code, reason, timed_out, branches}` | nobody answered. `branches` lists every branch the dial rang as `{leg_id, leg_sip_call_id, target, code, reason, cause}` |
+| `DialBranchFailed` | `{leg_id, leg_sip_call_id, target, aor?, code, reason, cause}` | a branch ended without answering. `cause` is `rejected` (the far end's final non-2xx, `code`/`reason` its own), `timeout` (`408`, it rang out), `cancelled` (`487`, siphon CANCELled it: another branch answered, a `6xx` ended the fork, or the caller hung up) or `unsent` (`503`, the INVITE never reached the transport) |
+| `DialAnswered` | `{leg_id, leg_sip_call_id, target, aor?, code}` | this branch answered; sent before the branches it beat are reported `cancelled` |
+| `DialFailed` | `{code, reason, timed_out, branches, unsupported?}` | nobody answered. `branches` lists every branch the dial rang as `{leg_id, leg_sip_call_id, target, aor?, code, reason, cause}`. `unsupported` is present only when the dial was refused before any branch was rung (see below) |
 
 Each branch is reported once. A second `dial` on the same channel starts a
 fresh list, so its `DialFailed` carries only its own branches.
+
+**A caller that requires what no branch can honour.** When the caller's INVITE
+lists an option tag in `Require` that this call cannot honour under its header
+policy, no B-leg could ever connect it (RFC 3261 §8.2.2.3), and a controller
+cannot change that policy. The dial is refused before anything is rung:
+`DialFailed` arrives with `code: 420` (`reason: "Bad Extension"`), or `494`
+(`"Security Agreement Required"`) when one of the tags is `sec-agree`,
+which is hop-by-hop, `timed_out: false`, an empty `branches` since nothing rang, and `unsupported`, the
+array of the tags refused, in the order the INVITE listed them. Unlike every
+other `DialFailed`, the caller does **not** stay parked: siphon answers it with
+that same `420` (carrying the `Unsupported` header §8.2.2.3 requires) or `494`,
+and the channel ends with `StasisEnd`.
 
 Every branch event, and each `DialFailed.branches` entry, also carries `aor`
 when the branch was dialled at a contact an `{aor}` target resolved to: the
@@ -1197,11 +1214,11 @@ being bridged is seen through. `DialFailed` comes only once nothing is left.
 |---|---|---|
 | `DialBranch` | `{leg_id, leg_sip_call_id, target, aor?}` | a phone's INVITE goes out |
 | `PlayStarted` | `{source: "tone", origin: "ringback", play_id?, duration_ms?}` | a phone is alerting and the ringback started |
-| `DialBranchFailed` | `{leg_id, leg_sip_call_id, target, code, reason, cause}` | a phone ended without being kept: it never answered, it was CANCELled or released once another was bridged (`cancelled`), or it answered and its bridge failed (`bridge_failed`) |
+| `DialBranchFailed` | `{leg_id, leg_sip_call_id, target, aor?, code, reason, cause}` | a phone ended without being kept: it never answered, it was CANCELled or released once another was bridged (`cancelled`), or it answered and its bridge failed (`bridge_failed`) |
 | `BridgeFailed` | as for `bridge` | a bridge to a phone that answered failed. On the caller's channel only, since the phone was never given one; `stage: "setup"` with a `reason` when the bridge never started |
 | `DialAnswered` | `{leg_id, leg_sip_call_id, target, code, aor?, channel}` | the phone that was **bridged**, sent once, when the bridge forms and just before `ChannelBridged`: an answer is not reported until it is kept. `channel` is a channel siphon minted for it, registered to this app and connection with the caller's `on_lost` policy (`null` when that channel has no live owner); the phone's own events follow on it |
 | `ChannelBridged` | as for `bridge`, on both channels | the bridge formed |
-| `DialFailed` | `{code, reason, cause, timed_out, branches}` | nobody answered; the ringback is already stopped, and nothing was sent to the caller |
+| `DialFailed` | `{code, reason, cause, timed_out, branches}` | nobody answered; the ringback is already stopped, and nothing was sent to the caller. `branches` entries are `{leg_id, leg_sip_call_id, target, aor?, code, reason, cause}` |
 
 `cause` on `DialFailed` says how the dial ended: `rejected`, `ring timeout`,
 `unsent`, `bridge_failed`, or `caller_hangup` when the caller went away while
