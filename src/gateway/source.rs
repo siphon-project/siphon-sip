@@ -1629,4 +1629,98 @@ mod tests {
         }
         assert_eq!(health.consecutive_failures(), 3);
     }
+
+    // --- security.trust_gateways across a reconcile ---
+
+    /// The row helper's carrier address.
+    const CARRIER: &str = "203.0.113.10";
+
+    fn apiban_client(
+        manager: &Arc<DispatcherManager>,
+    ) -> (
+        crate::apiban::ApiBanClient,
+        tokio::sync::mpsc::Receiver<crate::firewall::Command>,
+    ) {
+        let (firewall, commands) = crate::firewall::KernelFirewall::capturing();
+        let config = crate::config::ApiBanConfig {
+            api_key: "test-key".to_string(),
+            interval_secs: 300,
+            ban_ttl_secs: 604_800,
+        };
+        let client = crate::apiban::ApiBanClient::new(&config, &[])
+            .expect("client builds")
+            .with_firewall(Some(firewall))
+            .with_gateway_trust(Some(manager.gateway_view()));
+        client.follow_gateway_view();
+        (client, commands)
+    }
+
+    #[tokio::test]
+    async fn the_reconcile_that_provisions_a_listed_carrier_evicts_it_from_apiban() {
+        let manager = manager();
+        let (client, mut commands) = apiban_client(&manager);
+        let carrier: std::net::IpAddr = CARRIER.parse().unwrap();
+
+        // The feed lists the address before any carrier holds it.
+        assert_eq!(client.ingest(&[CARRIER.to_string()]), 1);
+        assert!(client.banned().contains(&carrier));
+        assert!(matches!(
+            commands.try_recv(),
+            Ok(crate::firewall::Command::Ban { .. })
+        ));
+
+        apply_rows(&manager, &[row("carriers", "sip:gw1.carrier.example:5060")]);
+
+        assert!(!client.banned().contains(&carrier), "still in the store");
+        assert_eq!(
+            commands.try_recv().ok(),
+            Some(crate::firewall::Command::Unban { ip: carrier }),
+            "not lifted from the kernel set"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_carrier_removed_from_the_source_is_back_under_the_policy() {
+        let manager = manager();
+        let (client, _commands) = apiban_client(&manager);
+        let carrier: std::net::IpAddr = CARRIER.parse().unwrap();
+        let config = crate::config::SecurityConfig {
+            max_message_bytes: None,
+            rate_limit: Some(crate::config::RateLimitConfig {
+                window_secs: 60,
+                max_requests: 5,
+                ban_duration_secs: 600,
+            }),
+            scanner_block: None,
+            trusted_cidrs: Vec::new(),
+            trust_gateways: true,
+            failed_auth_ban: None,
+            apiban: None,
+            firewall: None,
+            connection_limits: Default::default(),
+        };
+        let filter = crate::security::SecurityFilter::from_config_with_gateways(
+            &config,
+            Some(manager.gateway_view()),
+        )
+        .expect("rate_limit is configured");
+        let allowed = |count: u32| {
+            (0..count)
+                .map(|_| filter.evaluate(carrier, None))
+                .filter(|verdict| *verdict == crate::security::SecurityVerdict::Allow)
+                .count()
+        };
+
+        apply_rows(&manager, &[row("carriers", "sip:gw1.carrier.example:5060")]);
+        assert_eq!(allowed(50), 50, "a provisioned carrier was rate-limited");
+        assert_eq!(client.ingest(&[CARRIER.to_string()]), 0);
+
+        // The reconcile that removes it.
+        apply_rows(&manager, &[]);
+        // Counted again from zero, not retroactively banned for the fifty.
+        assert_eq!(allowed(5), 5);
+        assert_eq!(allowed(1), 0, "a removed carrier is exempt still");
+        assert_eq!(client.ingest(&[CARRIER.to_string()]), 1);
+        assert!(client.banned().contains(&carrier));
+    }
 }

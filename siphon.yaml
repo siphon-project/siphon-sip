@@ -615,6 +615,23 @@ auth:
 #   trusted_cidrs:              # never rate-limited and never auto-banned
 #     - "10.0.0.0/8"            # own infra: AS, BGCF, trunks, monitoring
 #
+#   trust_gateways: false       # true: every source a gateway group admits is
+#                               # trusted like a trusted_cidrs entry (exempt
+#                               # from rate_limit, scanner_block,
+#                               # failed_auth_ban, connection_limits and
+#                               # APIBAN). "Admits" is what from_gateway()
+#                               # answers from and the kernel allow set holds:
+#                               # resolved destination addresses plus
+#                               # source_networks, for siphon.yaml, script and
+#                               # gateway.backend groups alike. A carrier the
+#                               # source provisions is trusted at the reconcile
+#                               # that adds it (an APIBAN entry or auto-ban on
+#                               # its address is lifted then, kernel set
+#                               # included) and back under every policy at the
+#                               # reconcile that removes it, counted from zero.
+#                               # A trusted gateway over rate_limit is logged
+#                               # (WARN, once per window), never dropped.
+#
 #   max_message_bytes: 262144   # largest single SIP message on a stream
 #                               # transport (TCP/TLS/WS/WSS). A peer declaring a
 #                               # larger Content-Length is answered 513 Message

@@ -124,6 +124,18 @@ exactly like a carrier that is down.
   membership for `from_gateway()` is re-resolved on the kernel allow set's floor
   tick when [that set](../kernel-firewall.md#gateway-allow-set) is on.
 
+## Exempting provisioned carriers from abuse controls
+
+A provisioned carrier is admitted by `from_gateway()` and the kernel allow set,
+but it is not in `security.trusted_cidrs`, so `rate_limit`, `scanner_block`,
+`failed_auth_ban`, the connection ceilings and APIBAN treat it like any other
+source. Set `security.trust_gateways: true` to trust every source a gateway
+group admits (destination addresses plus `source_networks`, whichever created
+the group). The reconcile that provisions a carrier makes it trusted and lifts
+any auto-ban or APIBAN entry on its address, kernel set included; the reconcile
+that removes it puts it back under every policy, counted from zero. See
+[Trusting gateways](../kernel-firewall.md#trusting-gateways).
+
 ```json
 {"group": "carriers", "uri": "sip:gw1.carrier.example:5060", "probe": false}
 ```

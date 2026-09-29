@@ -1195,6 +1195,25 @@ security:
     assert_eq!(fab.threshold, 10);
     assert_eq!(fab.ban_duration_secs, 300);
     assert_eq!(fab.window_secs, 600); // serde default when omitted
+                                      // Off unless asked for: a provisioned gateway stays under every policy.
+    assert!(!sec.trust_gateways);
+}
+
+#[test]
+fn security_trust_gateways_parses() {
+    let yaml = r#"
+listen:
+  udp: ["0.0.0.0:5060"]
+domain:
+  local:
+    - "example.com"
+script:
+  path: "scripts/proxy_default.py"
+security:
+  trust_gateways: true
+"#;
+    let config = Config::from_str(yaml).unwrap();
+    assert!(config.security.unwrap().trust_gateways);
 }
 
 #[test]
