@@ -290,7 +290,7 @@ what lets a refused verb be lined up against a capture, a CDR and HEP.
 | `refer` | sip | `{to, replaces?}` | in-dialog REFER on the A-leg |
 | `accept_refer` | sip | `{target?, next_hop?, mode?}` | accept a pending inbound REFER (from a `TransferRequested` event) and run the transfer |
 | `reject_refer` | sip | `{code?, reason?}` | reject a pending inbound REFER with a final non-2xx (default `603 Decline`) |
-| `bridge` | sip | `{with, on_peer_hangup?}` | join this channel to another the app owns; the reply says the media was re-pointed, `ChannelBridged` says the audio meets |
+| `bridge` | sip | `{with, on_peer_hangup?, profile?}` | join this channel to another the app owns; the reply says the media was negotiated, `ChannelBridged` says the audio meets. `profile` names one media profile for the pair — see [`bridge`](#joining-two-legs-bridge) |
 | `unbridge` | sip | `{reason?}` | break a bridge — both legs stay answered, owned and held |
 | `replace_peer` | sip | `{target, next_hop?, replace_a_leg?, profile?, timeout?}` | swap one party of this answered call for a freshly dialed target, no REFER involved; the replaced leg stays up while the target rings, `PeerReplaced` says the swap landed |
 | `dial` | sip | `{targets, strategy?, timeout?, headers?, profile?, from?, from_display?, p_asserted_identity?, privacy?, on_answer?, ringback?}` (identity fields also per target) | ring B-legs while the caller stays **unanswered** and the app keeps the channel; refused (`invalid_state`) on an answered call with `error.details: {verb: "dial", reason: "already_answered", call_state}` — see [`dial`](#dial--ring-while-the-caller-waits). With `on_answer: "bridge"`, ring phones for a caller the app already **answered** and anchored, play `ringback` while they alert, and bridge the one that picks up — see [`on_answer`](#dial-on_answer-bridge--ring-phones-for-an-answered-caller) |
@@ -903,7 +903,7 @@ a controller-driven transfer:
 { "id":"c-9", "type":"reply", "status":"ok",
   "result": { "channel":"ch_caller", "with":"cb-7f3a", "call_id":"<uuid>",
               "peer_call_id":"<uuid>", "anchored":true,
-              "on_peer_hangup":"hangup", "state":"bridging" } }
+              "on_peer_hangup":"hangup", "profile":null, "state":"bridging" } }
 ```
 
 **Both legs must be yours.** The target channel is resolved and
@@ -911,9 +911,28 @@ ownership-checked by the substrate; `args.with` is checked the same way here, so
 one application can never join another's call to its own (`forbidden`).
 
 **The target is the anchor.** It is the leg that keeps its media session — its
-ports, and anything still attached to them. The `with` leg's own session is
-deleted and it joins the anchor's as the second party. Which one you address is
-therefore a real choice, not a formality.
+ports, and anything still attached to them. The `with` leg joins the anchor's as
+the second party, and its own session is deleted once the bridge forms. Which
+one you address is therefore a real choice, not a formality.
+
+**Which profile shapes which leg.** The media engine produces two descriptions
+in a bridge: the offer the `with` leg is re-INVITEd with, and the answer the
+anchor is re-INVITEd with. Without `profile`, each is shaped by the profile of
+the party it goes to — the `with` leg's offer by the profile that leg was
+anchored with (an `originate {media: true, profile}`, or the phone of a bridge
+dial), the anchor's by the anchor's own — so an SRTP phone joined to a
+plain-RTP caller is offered SRTP and the caller keeps plain RTP. A `with` leg
+with no media session of its own is offered what the anchor's profile
+describes. `profile` names **one profile for the pair** instead, the way one
+profile describes both parties of a connecting dial: its `offer` half shapes
+what the `with` leg gets and its `answer` half what the anchor gets (the
+built-in `rtp_to_srtp`, for example, offers the `with` leg `RTP/SAVP` and
+answers the anchor `RTP/AVP`). A profile that asks for `received_from` pins each
+party's media ingress to that party's own signalling source. An unknown
+profile, or one that is not a non-empty string, is `bad_request` with
+`error.details: {verb: "bridge", argument: "profile", reason:
+"unknown_profile" | "invalid_value"}`, and nothing is touched. The reply echoes
+the `profile` it used (`null` for none).
 
 **Both legs get re-offered, and in that order.** siphon is a B2BUA, so each leg
 is its own offer/answer context (RFC 3264 §8) and siphon is the offerer on both
@@ -922,7 +941,7 @@ bridge is two RFC 3261 §14 re-INVITEs run back to back: the `with` leg first,
 carrying the anchor's current media, then the anchor carrying the answer that
 came back. The `with` leg goes first because that is the order in which a
 failure costs least — a peer that answers `488` leaves the anchor untouched and
-both calls exactly as they were.
+both calls exactly as they were, media included (see below).
 
 **The reply is the local action, not the outcome.** It comes back once the media
 has been re-pointed and the first re-INVITE is on the wire. The verdict arrives
@@ -931,7 +950,7 @@ as an event, and on **both** channels, because either party can refuse:
 | event | payload | when |
 |---|---|---|
 | `ChannelBridged` | `{peer_call_id, peer_sip_call_id, role:"anchor"\|"peer", anchored}` | both legs answered their re-INVITE — the media meets |
-| `BridgeFailed` | `{stage:"offering_peer"\|"offering_anchor", code, peer_sip_call_id}` | a leg refused; both calls are left as they were |
+| `BridgeFailed` | `{stage:"offering_peer"\|"offering_anchor", code, peer_sip_call_id}` | a leg refused. At `offering_peer` both calls are left as they were, media sessions included. At `offering_anchor` the anchor is too, but the `with` leg had already accepted the pair's media, which is now released: it is up and owned with no audio until it is bridged again or hung up |
 | `ChannelUnbridged` | `{peer_call_id, peer_sip_call_id, reason}` | this leg is parted **and** held — its hold offer has been answered. That is the point at which bridging it again is safe |
 
 **Media attachments come off first, and the teardown is confirmed.** An
@@ -952,9 +971,17 @@ them survive. A repeat `offer` there would be a *replacement* on the native
 backend. An anchor the engine answered itself (`answer_local` — which is how
 every controller-owned leg starts, both `handover(answer=True)` and
 `originate(media=true)`) has one party and no far leg, and the engine refuses an
-`answer` on it; that pair is therefore deleted, attachments and all, and offered
-onto a **fresh** engine call-id. The store key stays the leg's SIP Call-ID, so
-every media verb still resolves against it afterwards.
+`answer` on it; that pair is therefore offered onto a **fresh** engine call-id.
+
+**Nothing is taken away until the peer says yes.** The fresh session is built
+beside the two legs' own sessions, not in their place. Both stay on the engine,
+and both legs' media verbs keep addressing them, until the bridge forms: only
+then are the two single-party sessions deleted and the anchor moved onto the
+pair's (the store key stays the leg's SIP Call-ID, so every media verb still
+resolves). A bridge that fails deletes only the fresh session, so a caller whose
+bridge was refused can still be played to, rung back and recorded, and can be
+bridged again. A leg that hangs up while its bridge is forming takes the fresh
+session with it.
 
 **`unbridge` parts without ending.** Both legs stay answered, owned and
 addressable, and are put on hold: siphon re-offers each `a=sendonly` (RFC 3264
@@ -983,7 +1010,7 @@ tell them apart without parsing prose:
 
 | code | when |
 |---|---|
-| `bad_request` | no `args.with`, the same channel named twice, or an `on_peer_hangup` that is not `hangup` / `hold` |
+| `bad_request` | no `args.with`, the same channel named twice, an `on_peer_hangup` that is not `hangup` / `hold`, or a `profile` that is unknown or not a non-empty string |
 | `not_found` | no such channel, or the call is already gone |
 | `forbidden` | the `with` channel belongs to another application |
 | `invalid_state` | a leg has not answered, is already bridged, has a re-INVITE outstanding (RFC 3261 §14.1 glare), or carries no media description; and for `unbridge`, a leg that is not bridged |
@@ -1103,7 +1130,12 @@ the same rules as above. Unlike a connecting dial, none of the caller's other
 INVITE headers reach the phones: each leg is a fresh call. `timeout` is how long
 each phone rings; the dial as a whole rings for `timeout` (parallel) or
 `timeout` × the number of phones (sequential). `profile` names the media profile
-each phone is anchored with, the caller's own by default.
+each phone is anchored with, the caller's own by default. It describes the
+**phone**, not the pair: it shapes the phone's answer when it picks up and the
+bridge's offer to it, while the caller is re-INVITEd with its own profile's
+answer half. So a caller answered with plain RTP and a dial naming an SRTP
+profile join an SRTP phone to a plain-RTP caller, each on the media it was
+anchored with.
 
 **Ringback.** `ringback` is a tone preset or cadence (`"ringback_eu"`,
 `"425/1000,0/4000*inf"`, anything [`play {tone}`](#phase-1-verb-set) takes),
@@ -1118,7 +1150,8 @@ the phones are still ringing. (That needs an engine that reports a playback's
 end, siphon-rtp; with rtpengine a prompt that ends on its own is not seen to
 end, so the ringback is held until the dial ends.) It stops before the bridge
 re-points the caller's media, before `DialFailed`, and with the caller when it
-hangs up; when a bridge fails and phones still ring, it starts again. Its
+hangs up; when a bridge fails and phones still ring, it starts again, on the
+caller's own media session, which a failed bridge never touches. Its
 `PlayStarted` and `PlayFinished` carry `origin: "ringback"`, so
 the app can tell them from its own. With `ringback: false` the caller hears
 whatever the app leaves playing — its own tone or music on hold.

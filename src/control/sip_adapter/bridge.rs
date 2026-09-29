@@ -36,7 +36,7 @@ pub(super) async fn apply_bridge_verb(command: AdapterCommand) -> ControlResult 
 /// the far ends accept them is a far-end outcome — it arrives as exactly one
 /// `ChannelBridged` / `BridgeFailed` on both channels.
 async fn bridge(channel: &ChannelRef, command: &AdapterCommand) -> ControlResult {
-    let Some(bus) = ControlBus::global() else {
+    let Some((bus, _)) = super::dial_bridge::rail(&command.origin.app) else {
         return ControlResult::error(
             ControlErrorCode::Unavailable,
             "control plane is not installed",
@@ -93,6 +93,10 @@ pub(super) async fn bridge_with_bus(
             policy
         }
     };
+    let profile = match parse_bridge_profile(args.get("profile")) {
+        Ok(profile) => profile,
+        Err(refusal) => return refusal,
+    };
 
     // Ownership on the second leg is checked here, not by the substrate: it only
     // resolves `target`. Same exactly-one-owner rule, same typed answers.
@@ -112,12 +116,32 @@ pub(super) async fn bridge_with_bus(
         }
     };
 
+    let dispatcher = super::dial_bridge::dispatcher_for(&command.origin.app);
+    let Some(state) = dispatcher.state() else {
+        return ControlResult::error(
+            ControlErrorCode::Unavailable,
+            "b2bua is not running — nothing to bridge",
+        );
+    };
+    if let Some(name) = profile.as_deref() {
+        let known = state
+            .rtpengine_profiles
+            .as_ref()
+            .is_some_and(|registry| registry.get(name).is_some());
+        if !known {
+            return profile_refusal(
+                "unknown_profile",
+                format!("bridge args.profile names no media profile this deployment has: '{name}'"),
+                Some(name),
+            );
+        }
+    }
     let params = crate::dispatcher::BridgeParams {
         anchor_sip_call_id: channel.sip_call_id.clone(),
         peer_sip_call_id: with.sip_call_id.clone(),
         on_peer_hangup,
     };
-    match crate::dispatcher::b2bua_bridge_calls(params).await {
+    match crate::dispatcher::bridge_calls_with_state(state, params, profile.as_deref()).await {
         Ok(accepted) => {
             // Which of the two legs kept its media. Normally the target, but
             // the other one when only it had a session to keep.
@@ -134,11 +158,44 @@ pub(super) async fn bridge_with_bus(
                 "peer_call_id": accepted.peer_call_id,
                 "anchored": accepted.anchored,
                 "on_peer_hangup": on_peer_hangup.as_str(),
+                "profile": profile,
                 "state": "bridging",
             }))
         }
         Err(error) => bridge_error(error),
     }
+}
+
+/// Parse `args.profile`: one media profile for the pair — its `offer` half
+/// shapes what the `with` leg is offered, its `answer` half what the target is
+/// re-INVITEd with. Absent or `null` leaves each leg shaped by the profile it
+/// was anchored with.
+pub(super) fn parse_bridge_profile(
+    value: Option<&serde_json::Value>,
+) -> Result<Option<String>, ControlResult> {
+    match value {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(name)) if !name.trim().is_empty() => Ok(Some(name.clone())),
+        Some(_) => Err(profile_refusal(
+            "invalid_value",
+            "bridge args.profile must be a non-empty media profile name".to_string(),
+            None,
+        )),
+    }
+}
+
+/// A `bad_request` about `args.profile`, typed the way every verb's argument
+/// refusals are: the verb, the argument and why.
+fn profile_refusal(reason: &str, message: String, profile: Option<&str>) -> ControlResult {
+    let mut details = serde_json::json!({
+        "verb": "bridge",
+        "argument": "profile",
+        "reason": reason,
+    });
+    if let (Some(profile), Some(fields)) = (profile, details.as_object_mut()) {
+        fields.insert("profile".into(), profile.into());
+    }
+    ControlResult::error_with_details(ControlErrorCode::BadRequest, message, details)
 }
 
 /// Break the target channel's bridge. Both legs stay answered, owned and held.

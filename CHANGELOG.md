@@ -13,6 +13,40 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
+### Added
+
+- **`bridge {profile}` names one media profile for the pair.** Its `offer` half
+  shapes what the `with` leg is offered and its `answer` half what the target
+  is re-INVITEd with, the way one profile describes both parties of a
+  connecting dial, so a controller joining an `originate` to a caller by hand
+  can pick the pair's media (`rtp_to_srtp` for an SRTP leg on a plain-RTP
+  caller). An unknown profile, or one that is not a non-empty string, is
+  `bad_request` with `details: {verb: "bridge", argument: "profile", reason}`
+  and touches nothing. The reply echoes the `profile` it used.
+
+### Fixed
+
+- **A bridge offers each leg the media its own profile describes.** A bridge
+  offered the `with` leg media built from the *anchor's* profile, so a
+  `dial {on_answer: "bridge"}` naming an SRTP profile for its phones still
+  offered an SRTP-only phone plain `RTP/AVP` when joining it to a plain-RTP
+  caller; the phone answered `488` and was released. The offer to the `with`
+  leg now uses that leg's own profile (the dial's, for a bridge dial's phone),
+  and the anchor's re-INVITE keeps the anchor's own. When the profile asks for
+  `received_from`, each engine command now pins the ingress of the party whose
+  SDP it carries: the anchor's source on the offer, the `with` leg's on the
+  answer. Neither was set before.
+- **A bridge that fails no longer takes the caller's media with it.** The
+  bridge deleted both legs' own media sessions before the `with` leg had
+  accepted anything, so a `488` left an answered caller with no media session:
+  a bridge dial's ringback then failed on it with `unknown call` and every
+  later `play` or bridge did too. The pair's session is now negotiated beside
+  the two legs' own, which are deleted only once the bridge forms; a failed
+  bridge deletes only the new session, and a leg hanging up mid-bridge takes it
+  with it. The bridge dial resumes its ringback on the caller's intact session,
+  and a ringback that cannot start because the caller is being torn down is
+  logged as that, not as an engine fault.
+
 ## [1.11.1] — 2026-09-28
 
 ### Added

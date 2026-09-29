@@ -65,35 +65,43 @@ pub(super) struct Caller {
     pub(super) internal_call_id: String,
     /// The 200 siphon answered it with, whose dialog its requests are in.
     pub(super) answer: SipMessage,
+    /// Where it calls from.
+    pub(super) address: String,
 }
 
-/// The caller's INVITE, carrying an offer and a presented identity.
-fn caller_invite(call_id: &str) -> SipMessage {
-    let sdp = concat!(
-        "v=0\r\n",
-        "o=- 1 1 IN IP4 192.0.2.10\r\n",
-        "s=-\r\n",
-        "c=IN IP4 192.0.2.10\r\n",
-        "t=0 0\r\n",
-        "m=audio 40000 RTP/AVP 0 101\r\n",
-        "a=rtpmap:0 PCMU/8000\r\n",
-        "a=rtpmap:101 telephone-event/8000\r\n",
+/// The caller's INVITE from `address`, carrying an offer and a presented
+/// identity.
+fn caller_invite(call_id: &str, address: &str) -> SipMessage {
+    let host = address.split(':').next().unwrap_or(address);
+    let sdp = format!(
+        concat!(
+            "v=0\r\n",
+            "o=- 1 1 IN IP4 {host}\r\n",
+            "s=-\r\n",
+            "c=IN IP4 {host}\r\n",
+            "t=0 0\r\n",
+            "m=audio 40000 RTP/AVP 0 101\r\n",
+            "a=rtpmap:0 PCMU/8000\r\n",
+            "a=rtpmap:101 telephone-event/8000\r\n",
+        ),
+        host = host,
     );
     let raw = format!(
         concat!(
             "INVITE sip:4000@siphon.example.com SIP/2.0\r\n",
-            "Via: SIP/2.0/UDP 192.0.2.10:5060;branch=z9hG4bK-{call_id}\r\n",
+            "Via: SIP/2.0/UDP {address};branch=z9hG4bK-{call_id}\r\n",
             "Max-Forwards: 70\r\n",
             "From: \"Caller One\" <sip:15550100001@siphon.example.com>;tag=caller-tag\r\n",
             "To: <sip:4000@siphon.example.com>\r\n",
             "Call-ID: {call_id}\r\n",
             "CSeq: 1 INVITE\r\n",
-            "Contact: <sip:15550100001@192.0.2.10:5060>\r\n",
+            "Contact: <sip:15550100001@{address}>\r\n",
             "Content-Type: application/sdp\r\n",
             "Content-Length: {length}\r\n",
             "\r\n",
             "{sdp}",
         ),
+        address = address,
         call_id = call_id,
         length = sdp.len(),
         sdp = sdp,
@@ -104,14 +112,24 @@ fn caller_invite(call_id: &str) -> SipMessage {
 /// A caller on `call_id`, answered and anchored by siphon and ACKed, the way
 /// `answer {anchor: true}` leaves it. What siphon sent it is drained.
 pub(super) fn answered_caller(dispatcher: &TestDispatcher, call_id: &str) -> Caller {
+    answered_caller_from(dispatcher, call_id, CALLER, "rtp_passthrough")
+}
+
+/// [`answered_caller`] calling from `address`, answered with media `profile`.
+pub(super) fn answered_caller_from(
+    dispatcher: &TestDispatcher,
+    call_id: &str,
+    address: &str,
+    profile: &str,
+) -> Caller {
     let state = &dispatcher.state;
-    let invite = caller_invite(call_id);
+    let invite = caller_invite(call_id, address);
     let mut leg = Leg::new_a_leg(
         call_id.to_string(),
         "caller-tag".to_string(),
         format!("z9hG4bK-{call_id}"),
         LegTransport {
-            remote_addr: socket(CALLER),
+            remote_addr: socket(address),
             connection_id: ConnectionId::default(),
             transport: Transport::Udp,
             local_addr: None,
@@ -136,10 +154,10 @@ pub(super) fn answered_caller(dispatcher: &TestDispatcher, call_id: &str) -> Cal
     answer_first_anchor(
         &internal_call_id,
         &invite,
-        socket(CALLER).ip(),
+        socket(address).ip(),
         200,
         "OK",
-        Some("rtp_passthrough"),
+        Some(profile),
         None,
         state,
     )
@@ -153,6 +171,7 @@ pub(super) fn answered_caller(dispatcher: &TestDispatcher, call_id: &str) -> Cal
         call_id: call_id.to_string(),
         internal_call_id,
         answer,
+        address: address.to_string(),
     };
     caller_sends(state, &caller, "ACK", "1 ACK");
     caller
@@ -163,7 +182,7 @@ pub(super) fn caller_sends(state: &DispatcherState, caller: &Caller, method: &st
     let raw = format!(
         concat!(
             "{method} sip:192.0.2.1:5060;transport=udp SIP/2.0\r\n",
-            "Via: SIP/2.0/UDP 192.0.2.10:5060;branch=z9hG4bK-{call_id}-{branch}\r\n",
+            "Via: SIP/2.0/UDP {address};branch=z9hG4bK-{call_id}-{branch}\r\n",
             "Max-Forwards: 70\r\n",
             "From: {from}\r\n",
             "To: {to}\r\n",
@@ -173,6 +192,7 @@ pub(super) fn caller_sends(state: &DispatcherState, caller: &Caller, method: &st
             "\r\n",
         ),
         method = method,
+        address = caller.address,
         branch = method.to_ascii_lowercase(),
         cseq = cseq,
         from = caller.answer.headers.from().expect("a From"),
@@ -190,7 +210,7 @@ pub(super) fn caller_sends(state: &DispatcherState, caller: &Caller, method: &st
                 connection_id: ConnectionId::default(),
                 transport: Transport::Udp,
                 local_addr: socket("192.0.2.1:5060"),
-                remote_addr: socket(CALLER),
+                remote_addr: socket(&caller.address),
                 data: Bytes::from(raw),
             },
             message,
@@ -277,11 +297,22 @@ pub(super) async fn dial(
     channel_id: &str,
     args: serde_json::Value,
 ) -> (serde_json::Value, Vec<EventFrame>) {
+    command(controller, "dial", channel_id, args).await
+}
+
+/// Send the controller's `verb` for `channel_id` and return the reply and the
+/// events queued ahead of it.
+pub(super) async fn command(
+    controller: &Controller,
+    verb: &str,
+    channel_id: &str,
+    args: serde_json::Value,
+) -> (serde_json::Value, Vec<EventFrame>) {
     let frame = serde_json::json!({
-        "id": "c-dial",
+        "id": format!("c-{verb}"),
         "type": "command",
         "module": "sip",
-        "verb": "dial",
+        "verb": verb,
         "target": { "channel": channel_id },
         "args": args,
     });
@@ -302,7 +333,7 @@ pub(super) async fn dial(
             controller.connection.events.recv_many(),
         )
         .await
-        .expect("a reply to the dial");
+        .expect("a reply to the command");
         for frame in frames {
             match frame {
                 OutboundFrame::Reply(reply) => {

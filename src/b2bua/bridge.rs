@@ -24,8 +24,8 @@
 //!
 //! The *anchor* is the leg the verb is addressed to (`bridge` target), and it
 //! is the leg that keeps its media session — its ports, its recording fork,
-//! anything still riding on it. The peer's own media session is deleted; it
-//! joins the anchor's as the second party.
+//! anything still riding on it. The peer's own media session is deleted once
+//! the bridge forms; the peer joins the anchor's as the second party.
 //!
 //! ## Re-negotiation, not replacement
 //!
@@ -43,10 +43,31 @@
 //! ("no far leg to answer") rather than pointing the new party at the caller's
 //! own endpoint. Every leg a controller owns starts that way — an answer-first
 //! handover and an `originate(media=true)` both answer locally — so the bridge
-//! deletes both single-party sessions, attachments and all, and `offer`s the
-//! pair onto a **fresh** engine call-id ([`MediaStep::Offer`]). That is not the
-//! replacement bug above: nothing live is being offered over, and the store key
-//! stays the leg's SIP Call-ID so every later media verb still resolves.
+//! `offer`s the pair onto a **fresh** engine call-id ([`MediaStep::Offer`]).
+//! That is not the replacement bug above: nothing live is being offered over.
+//!
+//! ## Nothing is taken away until the peer has said yes
+//!
+//! The fresh session is built *beside* the two single-party sessions, not in
+//! place of them. Both stay on the engine, and the anchor's store entry keeps
+//! pointing at its own, until the bridge forms: only then are the two old
+//! sessions deleted and the anchor's entry moved to the fresh call-id (the
+//! store key stays the leg's SIP Call-ID, so every media verb still resolves).
+//! A peer that answers the bridge offer `488` therefore leaves the caller
+//! exactly as it was — its media, its prompts, its ringback all still work —
+//! and the fresh session, which only ever had one party, is deleted.
+//!
+//! ## Which profile shapes which leg
+//!
+//! The engine's `offer` produces the SDP the **peer** is offered, and its
+//! `answer` the SDP the **anchor** is re-INVITEd with, so the two halves of a
+//! media profile land on different parties. A bridge given a *pair* profile
+//! uses its `offer` half for the peer and its `answer` half for the anchor —
+//! the way one profile describes both parties of an ordinary dial. With none,
+//! each party is shaped by the profile it was anchored with: the peer's for
+//! the offer (an SRTP phone rung with an SRTP profile is offered SRTP), the
+//! anchor's for the answer (a caller answered with plain RTP is re-INVITEd with
+//! plain RTP). See [`bridge_offer_profile`].
 //!
 //! ## Attachments come off first, and the teardown is confirmed
 //!
@@ -64,6 +85,7 @@
 //! engine refused".
 
 use std::fmt;
+use std::net::IpAddr;
 
 /// Which side of a bridge a leg is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,8 +93,8 @@ pub enum BridgeRole {
     /// The leg the `bridge` was addressed to. Keeps its media session — its
     /// ports and everything attached to them survive the bridge.
     Anchor,
-    /// The leg named by `with`. Its own media session is deleted and it joins
-    /// the anchor's as the second party.
+    /// The leg named by `with`. It joins the anchor's media session as the
+    /// second party, and its own session is deleted once the bridge forms.
     Peer,
 }
 
@@ -174,6 +196,19 @@ pub struct BridgeContext {
     /// The media-engine call-id the bridged pair lives on (the anchor leg's),
     /// when the bridge is anchored. `None` for a raw SDP crossing.
     pub media_call_id: Option<String>,
+    /// The anchor's engine tag on [`BridgeContext::media_call_id`], kept here
+    /// because the session on a fresh call-id is in no store entry until the
+    /// bridge forms, and a failure or a hangup before then has to delete it.
+    pub media_from_tag: Option<String>,
+    /// The profile whose `answer` half shapes the SDP the anchor is re-INVITEd
+    /// with, and which the pair's session carries once formed: the bridge's
+    /// pair profile when it was given one, the anchor's own otherwise.
+    pub media_profile: Option<String>,
+    /// Whether [`BridgeContext::media_call_id`] is a fresh session the anchor's
+    /// store entry does not point at yet. It is adopted — the two single-party
+    /// sessions deleted, the anchor's entry moved to it — when the bridge
+    /// forms, and deleted when the bridge fails or a leg hangs up first.
+    pub media_pending_adoption: bool,
     /// The SDP siphon last **offered this leg**, kept because an unbridge has to
     /// re-offer the same media held (RFC 3264 §8.4) and the leg's own
     /// description is the far party's, not siphon's — offering it back would
@@ -369,8 +404,9 @@ pub enum MediaStep {
         /// The leg's engine tag.
         from_tag: String,
     },
-    /// Delete the peer leg's own media session — its ports, and anything still
-    /// on them, go away before it is re-pointed at the anchor's.
+    /// Delete a media session the pair no longer needs: the two single-party
+    /// sessions once the bridge has formed on a fresh call-id, or the fresh one
+    /// when the bridge failed before it could be adopted.
     DeleteSession {
         /// Engine call-id.
         media_call_id: String,
@@ -379,18 +415,22 @@ pub enum MediaStep {
     },
     /// Put the pair onto a **fresh** engine call-id, yielding the SDP to offer
     /// the peer. Used when the anchor's own session is one the engine answered
-    /// itself (`answer_local`) and so cannot become a relay, or when the anchor
-    /// had no session at all. Emitted only after that single-party session has
-    /// been deleted, so this never offers over a live call-id.
+    /// itself (`answer_local`) and so cannot become a relay. The anchor's own
+    /// session is left where it is until the bridge forms, and the call-id is
+    /// one nothing else uses, so this never offers over a live call.
     Offer {
         /// The fresh engine call-id the bridged pair will live on.
         media_call_id: String,
         /// The anchor leg's engine tag.
         from_tag: String,
-        /// The media profile whose offer flags to use.
+        /// The media profile whose offer flags to use ([`bridge_offer_profile`]).
         profile: String,
         /// The anchor endpoint's current media description.
         sdp: Vec<u8>,
+        /// The anchor's signalling source, pinned as the media ingress when the
+        /// profile's offer half carries `received_from`: the SDP in this offer
+        /// is the anchor's.
+        received_from: Option<IpAddr>,
     },
     /// Renegotiate the anchor leg's **live, relaying** session on the ports it
     /// already holds, yielding the SDP to offer the peer. Never a repeat
@@ -401,11 +441,50 @@ pub enum MediaStep {
         media_call_id: String,
         /// The anchor leg's engine tag.
         from_tag: String,
-        /// The media profile whose offer flags to use.
+        /// The media profile whose offer flags to use ([`bridge_offer_profile`]).
         profile: String,
         /// The anchor endpoint's current media description.
         sdp: Vec<u8>,
+        /// The anchor's signalling source, as for [`MediaStep::Offer`].
+        received_from: Option<IpAddr>,
     },
+}
+
+/// The profile whose `offer` half shapes what the peer is offered.
+///
+/// A pair profile, when the bridge was given one, describes both parties: its
+/// `offer` half is the peer's. Without one it is the profile the **peer** was
+/// anchored with, because that profile was chosen for that party — an SRTP
+/// phone rung with an SRTP profile has to be offered SRTP, whatever the caller
+/// it is joined to was answered with. A peer with no session of its own has no
+/// such choice to honour, so the anchor's profile shapes both sides.
+pub fn bridge_offer_profile<'a>(
+    pair_profile: Option<&'a str>,
+    anchor: &'a LegMedia,
+    peer: Option<&'a LegMedia>,
+) -> &'a str {
+    pair_profile
+        .or_else(|| peer.map(|peer| peer.profile.as_str()))
+        .unwrap_or(anchor.profile.as_str())
+}
+
+/// The profile whose `answer` half shapes what the anchor is re-INVITEd with:
+/// the pair profile when there is one, the anchor's own otherwise — the party
+/// being answered was anchored with it.
+pub fn bridge_answer_profile<'a>(pair_profile: Option<&'a str>, anchor: &'a LegMedia) -> &'a str {
+    pair_profile.unwrap_or(anchor.profile.as_str())
+}
+
+/// What the anchor side of a bridge brings to the engine's offer.
+#[derive(Debug, Clone, Copy)]
+pub struct AnchorOffer<'a> {
+    /// The anchor endpoint's current media description — what the engine is
+    /// told the offerer looks like now.
+    pub sdp: &'a [u8],
+    /// The pair profile the bridge was given, if any ([`bridge_offer_profile`]).
+    pub pair_profile: Option<&'a str>,
+    /// The anchor's signalling source address.
+    pub source: Option<IpAddr>,
 }
 
 /// The ordered media work a bridge performs before it puts anything on the SIP
@@ -413,25 +492,25 @@ pub enum MediaStep {
 ///
 /// Order is the whole point: every attachment on **both** legs comes off first
 /// (an announcement or a WebSocket bridge still live when the media is
-/// re-pointed is one-way audio), then the sessions that are in the way are
-/// deleted, and only then is the pair's media negotiated.
+/// re-pointed is one-way audio), and only then is the pair's media negotiated.
+/// No session is deleted here: the peer has not accepted anything yet, and a
+/// bridge it refuses must leave both legs' media where it was (see the module
+/// docs). The sessions the pair no longer needs go once it forms.
 ///
 /// The last step is the one that yields the SDP to offer the peer, and which
 /// verb it is depends on what the anchor's session already is:
 ///
 /// * **already relaying** → [`MediaStep::Reoffer`] on the call-id it holds, so
 ///   the ports and everything on them survive;
-/// * **answered by the engine itself, or absent** → the single-party session is
-///   deleted and the pair is [`MediaStep::Offer`]ed onto `fresh_call_id`.
+/// * **answered by the engine itself** → the pair is [`MediaStep::Offer`]ed
+///   onto `fresh_call_id`, beside the anchor's own session.
 ///
-/// `anchor_sdp` is the anchor endpoint's current media description — what the
-/// engine is told the offerer looks like now. Two unanchored legs yield an empty
-/// plan: nothing is attached and nothing needs negotiating, and the bridge
-/// crosses the endpoints' own descriptions instead.
+/// An unanchored anchor yields no negotiation: the bridge crosses the
+/// endpoints' own descriptions instead.
 pub fn bridge_media_plan(
     anchor: Option<&LegMedia>,
     peer: Option<&LegMedia>,
-    anchor_sdp: &[u8],
+    anchor_offer: AnchorOffer<'_>,
     fresh_call_id: &str,
 ) -> Vec<MediaStep> {
     let mut steps = Vec::new();
@@ -455,32 +534,27 @@ pub fn bridge_media_plan(
             });
         }
     }
-    if let Some(peer) = peer {
-        steps.push(MediaStep::DeleteSession {
-            media_call_id: peer.media_call_id.clone(),
-            from_tag: peer.from_tag.clone(),
-        });
-    }
-    match anchor {
-        Some(anchor) if anchor.relaying => steps.push(MediaStep::Reoffer {
-            media_call_id: anchor.media_call_id.clone(),
-            from_tag: anchor.from_tag.clone(),
-            profile: anchor.profile.clone(),
-            sdp: anchor_sdp.to_vec(),
-        }),
-        Some(anchor) => {
-            steps.push(MediaStep::DeleteSession {
+    if let Some(anchor) = anchor {
+        let profile = bridge_offer_profile(anchor_offer.pair_profile, anchor, peer).to_string();
+        let sdp = anchor_offer.sdp.to_vec();
+        let received_from = anchor_offer.source;
+        steps.push(if anchor.relaying {
+            MediaStep::Reoffer {
                 media_call_id: anchor.media_call_id.clone(),
                 from_tag: anchor.from_tag.clone(),
-            });
-            steps.push(MediaStep::Offer {
+                profile,
+                sdp,
+                received_from,
+            }
+        } else {
+            MediaStep::Offer {
                 media_call_id: fresh_call_id.to_string(),
                 from_tag: anchor.from_tag.clone(),
-                profile: anchor.profile.clone(),
-                sdp: anchor_sdp.to_vec(),
-            });
-        }
-        None => {}
+                profile,
+                sdp,
+                received_from,
+            }
+        });
     }
     steps
 }
@@ -653,6 +727,23 @@ mod tests {
     // Media plan — the ordering is the contract
     // -----------------------------------------------------------------------
 
+    /// What an anchor with this description, no pair profile and no known
+    /// source offers.
+    fn offer_of(sdp: &[u8]) -> AnchorOffer<'_> {
+        AnchorOffer {
+            sdp,
+            pair_profile: None,
+            source: None,
+        }
+    }
+
+    /// Whether a step deletes a session.
+    fn deletes(steps: &[MediaStep]) -> bool {
+        steps
+            .iter()
+            .any(|step| matches!(step, MediaStep::DeleteSession { .. }))
+    }
+
     #[test]
     fn plan_tears_every_attachment_down_before_it_re_points_the_media() {
         let anchor = LegMedia {
@@ -665,13 +756,18 @@ mod tests {
             has_playback: true,
             ..local_leg("cid-b", "tag-b")
         };
-        let steps = bridge_media_plan(Some(&anchor), Some(&peer), b"v=0\r\n", "cid-fresh");
+        let steps = bridge_media_plan(
+            Some(&anchor),
+            Some(&peer),
+            offer_of(b"v=0\r\n"),
+            "cid-fresh",
+        );
 
-        // Both legs' attachments first, then the peer's session, then the
-        // anchor's renegotiation. Anything else is one-way audio.
+        // Both legs' attachments first, then the anchor's renegotiation.
+        // Anything else is one-way audio.
         assert_eq!(
             kinds(&steps),
-            vec!["stop", "detach", "stop", "detach", "delete", "reoffer"]
+            vec!["stop", "detach", "stop", "detach", "reoffer"]
         );
     }
 
@@ -683,16 +779,26 @@ mod tests {
         // there is something to confirm.
         let anchor = relaying_leg("cid-a", "tag-a");
         let peer = local_leg("cid-b", "tag-b");
-        let steps = bridge_media_plan(Some(&anchor), Some(&peer), b"v=0\r\n", "cid-fresh");
-        assert_eq!(kinds(&steps), vec!["delete", "reoffer"]);
+        let steps = bridge_media_plan(
+            Some(&anchor),
+            Some(&peer),
+            offer_of(b"v=0\r\n"),
+            "cid-fresh",
+        );
+        assert_eq!(kinds(&steps), vec!["reoffer"]);
 
         // …and it still runs where there is: a playback on the anchor only.
         let playing = LegMedia {
             has_playback: true,
             ..relaying_leg("cid-a", "tag-a")
         };
-        let steps = bridge_media_plan(Some(&playing), Some(&peer), b"v=0\r\n", "cid-fresh");
-        assert_eq!(kinds(&steps), vec!["stop", "delete", "reoffer"]);
+        let steps = bridge_media_plan(
+            Some(&playing),
+            Some(&peer),
+            offer_of(b"v=0\r\n"),
+            "cid-fresh",
+        );
+        assert_eq!(kinds(&steps), vec!["stop", "reoffer"]);
     }
 
     #[test]
@@ -705,7 +811,7 @@ mod tests {
         let steps = bridge_media_plan(
             Some(&anchor),
             None,
-            b"v=0\r\no=- 1 1 IN IP4 192.0.2.1\r\n",
+            offer_of(b"v=0\r\no=- 1 1 IN IP4 192.0.2.1\r\n"),
             "cid-fresh",
         );
         assert_eq!(kinds(&steps), vec!["reoffer"]);
@@ -715,72 +821,164 @@ mod tests {
                 from_tag,
                 profile,
                 sdp,
+                received_from,
             } => {
                 assert_eq!(media_call_id, "cid-a");
                 assert_eq!(from_tag, "tag-a");
                 assert_eq!(profile, "rtp_passthrough");
                 assert_eq!(sdp, b"v=0\r\no=- 1 1 IN IP4 192.0.2.1\r\n");
+                assert_eq!(*received_from, None);
             }
             other => panic!("expected Reoffer, got {other:?}"),
         }
     }
 
     #[test]
-    fn plan_moves_a_locally_answered_anchor_to_a_fresh_call_and_deletes_the_old_one() {
+    fn plan_offers_a_locally_answered_anchor_on_a_fresh_call_beside_its_own() {
         // The engine refuses an `answer` on a call it answered itself — there is
         // no far leg to answer — so a single-party anchor cannot become a relay
-        // in place. It is deleted first and the pair offered onto a fresh id, so
-        // nothing live is ever offered over.
+        // in place. The pair is offered onto a fresh id, and the anchor's own
+        // session is left alone: the peer has accepted nothing yet.
         let anchor = local_leg("cid-a", "tag-a");
-        let steps = bridge_media_plan(Some(&anchor), None, b"v=0\r\n", "cid-fresh");
-        assert_eq!(kinds(&steps), vec!["delete", "offer"]);
-        match (&steps[0], &steps[1]) {
-            (
-                MediaStep::DeleteSession { media_call_id, .. },
-                MediaStep::Offer {
-                    media_call_id: fresh,
-                    from_tag,
-                    ..
-                },
-            ) => {
-                assert_eq!(media_call_id, "cid-a");
-                assert_eq!(fresh, "cid-fresh");
-                assert_ne!(fresh, media_call_id, "the offer must not reuse the live id");
+        let steps = bridge_media_plan(Some(&anchor), None, offer_of(b"v=0\r\n"), "cid-fresh");
+        assert_eq!(kinds(&steps), vec!["offer"]);
+        match &steps[0] {
+            MediaStep::Offer {
+                media_call_id,
+                from_tag,
+                ..
+            } => {
+                assert_eq!(media_call_id, "cid-fresh");
+                assert_ne!(
+                    media_call_id, "cid-a",
+                    "the offer must not reuse the live id"
+                );
                 assert_eq!(from_tag, "tag-a");
             }
-            other => panic!("expected delete then offer, got {other:?}"),
+            other => panic!("expected an offer, got {other:?}"),
         }
     }
 
     #[test]
-    fn plan_deletes_the_peer_session_before_the_anchor_is_negotiated() {
-        let anchor = relaying_leg("cid-a", "tag-a");
-        let peer = local_leg("cid-b", "tag-b");
-        let steps = bridge_media_plan(Some(&anchor), Some(&peer), b"v=0\r\n", "cid-fresh");
-        let deletes: Vec<String> = steps
-            .iter()
-            .filter_map(|step| match step {
-                MediaStep::DeleteSession { media_call_id, .. } => Some(media_call_id.clone()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(deletes, vec!["cid-b".to_string()]);
+    fn plan_never_deletes_a_session_before_the_peer_has_accepted() {
+        // A peer that refuses the bridge must find both legs' media where it
+        // was: the caller's prompts, ringback and recording all still work.
+        for anchor in [local_leg("cid-a", "tag-a"), relaying_leg("cid-a", "tag-a")] {
+            let peer = LegMedia {
+                has_playback: true,
+                ..local_leg("cid-b", "tag-b")
+            };
+            let steps = bridge_media_plan(
+                Some(&anchor),
+                Some(&peer),
+                offer_of(b"v=0\r\n"),
+                "cid-fresh",
+            );
+            assert!(!deletes(&steps), "{:?}", kinds(&steps));
+            // Positive control: the plan still negotiates and still clears
+            // what is attached.
+            assert!(kinds(&steps).contains(&"stop"));
+            assert!(kinds(&steps)
+                .iter()
+                .any(|kind| *kind == "offer" || *kind == "reoffer"));
+        }
     }
 
     #[test]
     fn plan_for_two_unanchored_legs_is_empty() {
-        assert!(bridge_media_plan(None, None, b"v=0\r\n", "cid-fresh").is_empty());
+        assert!(bridge_media_plan(None, None, offer_of(b"v=0\r\n"), "cid-fresh").is_empty());
     }
 
     #[test]
-    fn plan_with_only_a_peer_anchor_deletes_it_and_negotiates_nothing() {
+    fn plan_with_only_a_peer_anchor_clears_it_and_negotiates_nothing() {
         let peer = LegMedia {
             has_tee: true,
             has_playback: true,
             ..local_leg("cid-b", "tag-b")
         };
-        let steps = bridge_media_plan(None, Some(&peer), b"v=0\r\n", "cid-fresh");
-        assert_eq!(kinds(&steps), vec!["stop", "detach", "delete"]);
+        let steps = bridge_media_plan(None, Some(&peer), offer_of(b"v=0\r\n"), "cid-fresh");
+        assert_eq!(kinds(&steps), vec!["stop", "detach"]);
+    }
+
+    /// The profile named on a step, for either negotiation.
+    fn offered_profile(steps: &[MediaStep]) -> Option<&str> {
+        steps.iter().find_map(|step| match step {
+            MediaStep::Offer { profile, .. } | MediaStep::Reoffer { profile, .. } => {
+                Some(profile.as_str())
+            }
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn the_peer_is_offered_media_shaped_by_its_own_profile() {
+        // The bug: a plain-RTP caller bridged to an SRTP phone offered the
+        // phone RTP/AVP, because the offer was built from the caller's
+        // profile. The phone was anchored with its own; that is the one that
+        // describes it.
+        let anchor = local_leg("cid-a", "tag-a");
+        let peer = LegMedia {
+            profile: "srtp_phone".to_string(),
+            ..local_leg("cid-b", "tag-b")
+        };
+        for anchor in [anchor.clone(), relaying_leg("cid-a", "tag-a")] {
+            let steps = bridge_media_plan(
+                Some(&anchor),
+                Some(&peer),
+                offer_of(b"v=0\r\n"),
+                "cid-fresh",
+            );
+            assert_eq!(offered_profile(&steps), Some("srtp_phone"));
+        }
+        // A pair profile overrides both.
+        let steps = bridge_media_plan(
+            Some(&anchor),
+            Some(&peer),
+            AnchorOffer {
+                pair_profile: Some("rtp_to_srtp"),
+                ..offer_of(b"v=0\r\n")
+            },
+            "cid-fresh",
+        );
+        assert_eq!(offered_profile(&steps), Some("rtp_to_srtp"));
+        // Positive control: a peer with no session of its own leaves the
+        // anchor's profile in charge.
+        let steps = bridge_media_plan(Some(&anchor), None, offer_of(b"v=0\r\n"), "cid-fresh");
+        assert_eq!(offered_profile(&steps), Some("rtp_passthrough"));
+    }
+
+    #[test]
+    fn the_anchor_is_answered_with_its_own_profile_unless_a_pair_names_one() {
+        let anchor = local_leg("cid-a", "tag-a");
+        assert_eq!(bridge_answer_profile(None, &anchor), "rtp_passthrough");
+        assert_eq!(
+            bridge_answer_profile(Some("rtp_to_srtp"), &anchor),
+            "rtp_to_srtp"
+        );
+    }
+
+    #[test]
+    fn the_offer_carries_the_anchors_signalling_source() {
+        // The SDP in the bridge's offer is the anchor's, so the anchor is the
+        // party whose media ingress `received_from` pins.
+        let source: IpAddr = "192.0.2.10".parse().expect("an address");
+        for anchor in [local_leg("cid-a", "tag-a"), relaying_leg("cid-a", "tag-a")] {
+            let steps = bridge_media_plan(
+                Some(&anchor),
+                None,
+                AnchorOffer {
+                    source: Some(source),
+                    ..offer_of(b"v=0\r\n")
+                },
+                "cid-fresh",
+            );
+            let carried = steps.iter().find_map(|step| match step {
+                MediaStep::Offer { received_from, .. }
+                | MediaStep::Reoffer { received_from, .. } => Some(*received_from),
+                _ => None,
+            });
+            assert_eq!(carried, Some(Some(source)));
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -794,7 +992,7 @@ mod tests {
     fn a_leg_holding_a_takeover_bridge_has_it_detached_before_renegotiation() {
         let anchor = bridged_leg("call-a", "tag-a");
         let peer = relaying_leg("call-b", "tag-b");
-        let steps = bridge_media_plan(Some(&anchor), Some(&peer), b"v=0\r\n", "fresh");
+        let steps = bridge_media_plan(Some(&anchor), Some(&peer), offer_of(b"v=0\r\n"), "fresh");
         let kinds = kinds(&steps);
 
         let detach = kinds
@@ -819,7 +1017,7 @@ mod tests {
     #[test]
     fn a_takeover_bridge_is_never_mistaken_for_a_tee() {
         let anchor = bridged_leg("call-a", "tag-a");
-        let steps = bridge_media_plan(Some(&anchor), None, b"v=0\r\n", "fresh");
+        let steps = bridge_media_plan(Some(&anchor), None, offer_of(b"v=0\r\n"), "fresh");
         let kinds = kinds(&steps);
         assert!(
             kinds.contains(&"detach_bridge"),
@@ -840,7 +1038,7 @@ mod tests {
             has_tee: true,
             ..local_leg("call-a", "tag-a")
         };
-        let steps = bridge_media_plan(Some(&anchor), None, b"v=0\r\n", "fresh");
+        let steps = bridge_media_plan(Some(&anchor), None, offer_of(b"v=0\r\n"), "fresh");
         let kinds = kinds(&steps);
         assert!(
             kinds.contains(&"detach"),
@@ -862,7 +1060,7 @@ mod tests {
             has_tee: true,
             ..bridged_leg("call-a", "tag-a")
         };
-        let steps = bridge_media_plan(Some(&anchor), None, b"v=0\r\n", "fresh");
+        let steps = bridge_media_plan(Some(&anchor), None, offer_of(b"v=0\r\n"), "fresh");
         let kinds = kinds(&steps);
         let tee = kinds
             .iter()
@@ -953,6 +1151,7 @@ mod tests {
             from_tag: "tag".to_string(),
             profile: "rtp_passthrough".to_string(),
             sdp: b"v=0\r\n".to_vec(),
+            received_from: None,
         };
         assert_eq!(
             classify_media_failure(&step, false, true, "backend cannot reoffer"),
@@ -972,6 +1171,7 @@ mod tests {
             from_tag: "tag".to_string(),
             profile: "rtp_passthrough".to_string(),
             sdp: b"v=0\r\n".to_vec(),
+            received_from: None,
         };
         assert_eq!(
             classify_media_failure(&offer, false, true, "backend cannot offer"),

@@ -95,6 +95,8 @@ mod bad_extension_tests;
 #[cfg(test)]
 mod carrier_attribution_tests;
 #[cfg(test)]
+mod control_bridge_media_tests;
+#[cfg(test)]
 mod control_dial_branch_events_tests;
 #[cfg(test)]
 mod control_dial_bridge_args_tests;
@@ -211,14 +213,14 @@ pub use b2bua::{
 // does not grow a surface by accident, published or not.
 pub(crate) use b2bua::{
     b2bua_dial_call, b2bua_drop_call, b2bua_originate_group_create, b2bua_originate_group_start,
-    b2bua_set_session_timer, dial_answered_payload, dial_branch_identity, dial_branch_summary,
-    dial_bridge_caller, dial_bridge_join, dial_bridge_refuse_phone, dial_bridge_spec,
-    dial_bridge_start, dial_targets_for_aor, DialBridgeCaller, DialBridgeListener, DialBridgePlan,
-    DialBridgeRefusal, DialBridgeSender, DialBridgeSignal, DialBridgeStartError, DialError,
-    DialShaping, DialTarget, DispatcherHandle, DropOutcome, OriginateGroupAnswers,
-    OriginateGroupFailure, OriginateGroupSink, OriginateGroupSpec, OriginateGroupStrategy,
-    OriginateGroupWinner, OriginateLegProgress, RunningDispatcher, DIAL_BRIDGE_CALLER_GONE,
-    DIAL_RINGBACK_ORIGIN,
+    b2bua_set_session_timer, bridge_calls_with_state, dial_answered_payload, dial_branch_identity,
+    dial_branch_summary, dial_bridge_caller, dial_bridge_join, dial_bridge_refuse_phone,
+    dial_bridge_spec, dial_bridge_start, dial_targets_for_aor, DialBridgeCaller,
+    DialBridgeListener, DialBridgePlan, DialBridgeRefusal, DialBridgeSender, DialBridgeSignal,
+    DialBridgeStartError, DialError, DialShaping, DialTarget, DispatcherHandle, DropOutcome,
+    OriginateGroupAnswers, OriginateGroupFailure, OriginateGroupSink, OriginateGroupSpec,
+    OriginateGroupStrategy, OriginateGroupWinner, OriginateLegProgress, RunningDispatcher,
+    DIAL_BRIDGE_CALLER_GONE, DIAL_RINGBACK_ORIGIN,
 };
 pub use charging::{ro_authorize_b2bua, RoAuthorizeOutcome};
 pub(crate) use liveness::liveness_on_flow_close;
