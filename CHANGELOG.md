@@ -13,6 +13,8 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
+## [1.11.3] — 2026-09-29
+
 ### Fixed
 
 - **`{call_id}` in a WebSocket URI means the same thing everywhere.**
