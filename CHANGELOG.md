@@ -13,6 +13,8 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
+## [1.12.0] — 2026-09-30
+
 ### Changed
 
 - **`GET /admin/bans` answers `404` when auto-ban is not configured**, as
