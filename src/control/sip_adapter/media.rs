@@ -59,6 +59,48 @@ fn media_target(
     })
 }
 
+/// Resolve `stream_start` `args.profile` for a bridge: absent or `null` is no
+/// profile, a string must name a media profile this deployment has.
+fn stream_bridge_profile(
+    value: Option<&serde_json::Value>,
+) -> Result<Option<crate::rtpengine::NgFlags>, ControlResult> {
+    let name = match value {
+        None => return Ok(None),
+        Some(value) if value.is_null() => return Ok(None),
+        Some(value) => match value.as_str() {
+            Some(name) => name,
+            None => {
+                return Err(ControlResult::error(
+                    ControlErrorCode::BadRequest,
+                    "stream_start args.profile must be a string naming a media profile",
+                ))
+            }
+        },
+    };
+    crate::dispatcher::b2bua_media_profile(name)
+        .map(Some)
+        .map_err(|known| {
+            let known = if known.is_empty() {
+                "none configured".to_string()
+            } else {
+                known.join(", ")
+            };
+            ControlResult::error_with_details(
+                ControlErrorCode::BadRequest,
+                format!(
+                    "stream_start args.profile names no media profile this deployment has: \
+                     '{name}' (known: {known})"
+                ),
+                serde_json::json!({
+                    "verb": "stream_start",
+                    "argument": "profile",
+                    "reason": "unknown_profile",
+                    "profile": name,
+                }),
+            )
+        })
+}
+
 /// Map a [`crate::rtpengine::error::RtpEngineError`] to a typed control result —
 /// every media command answers, even on error, never a hang.
 ///   - the engine has no such call → `not_found` (the media session is gone),
@@ -570,6 +612,15 @@ pub(super) async fn stream_start(channel: &ChannelRef, args: &serde_json::Value)
                 );
             }
         }
+        // `profile` names the media profile whose bridge settings (wire rate,
+        // noise suppression, echo cancellation, VAD, barge-in) this bridge
+        // runs with, read as `answer` with `ws_uri` reads them. Without one the
+        // engine keeps the leg's rate with uplink processing off, or what a
+        // re-pointed bridge already had.
+        let profile = match stream_bridge_profile(args.get("profile")) {
+            Ok(profile) => profile,
+            Err(result) => return result,
+        };
         let (backend, call_id, from_tag) = match media_target(channel) {
             Ok(target) => target,
             Err(result) => return result,
@@ -578,7 +629,10 @@ pub(super) async fn stream_start(channel: &ChannelRef, args: &serde_json::Value)
             Ok(ws_uri) => ws_uri,
             Err(result) => return result,
         };
-        return match backend.attach_ws_bridge(&call_id, &from_tag, &ws_uri).await {
+        return match backend
+            .attach_ws_bridge(&call_id, &from_tag, &ws_uri, profile.as_ref())
+            .await
+        {
             Ok(()) => {
                 crate::dispatcher::b2bua_media_set_ws_bridge_attached(&channel.sip_call_id, true);
                 ControlResult::Ok(serde_json::json!({
@@ -588,6 +642,16 @@ pub(super) async fn stream_start(channel: &ChannelRef, args: &serde_json::Value)
             }
             Err(error) => media_error(error),
         };
+    }
+    // A tee's processing is shaped by `direction` / `channels` / `sample_rate`;
+    // a profile would be silently ignored, so it is refused, as the tee-only
+    // arguments are on a bridge.
+    if args.get("profile").is_some_and(|value| !value.is_null()) {
+        return ControlResult::error(
+            ControlErrorCode::BadRequest,
+            "stream_start args.profile applies to mode=bridge only; a tee takes \
+             direction, channels and sample_rate",
+        );
     }
     let direction = match args.get("direction").and_then(|value| value.as_str()) {
         None => crate::rtpengine::profile::WsTeeDirection::Both,

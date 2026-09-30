@@ -1547,6 +1547,9 @@ def test_stream_verbs_roundtrip():
                     sample_rate=16_000,
                 )
                 await call.stream_start("wss://ai.example/agent", mode="bridge")
+                await call.stream_start(
+                    "wss://ai.example/agent", mode="bridge", profile="voice_ai"
+                )
                 await call.stream_stop()
                 await call.stream_stop(mode="bridge")
                 for kwargs in (
@@ -1578,6 +1581,7 @@ def test_stream_verbs_roundtrip():
                 "stream_start",
                 "stream_start",
                 "stream_start",
+                "stream_start",
                 "stream_stop",
                 "stream_stop",
             ]
@@ -1598,8 +1602,13 @@ def test_stream_verbs_roundtrip():
                 "ws_uri": "wss://ai.example/agent",
                 "mode": "bridge",
             }
-            assert frames[3]["args"] == {"mode": "tee"}
-            assert frames[4]["args"] == {"mode": "bridge"}
+            assert frames[3]["args"] == {
+                "ws_uri": "wss://ai.example/agent",
+                "mode": "bridge",
+                "profile": "voice_ai",
+            }
+            assert frames[4]["args"] == {"mode": "tee"}
+            assert frames[5]["args"] == {"mode": "bridge"}
             # Refused before a frame goes out: nothing past the five above.
             assert len(refused) == 4, refused
 

@@ -4469,7 +4469,9 @@ class MockRtpEngine:
         })
         return True
 
-    async def attach_ws_bridge(self, target: Any, ws_uri: str) -> bool:
+    async def attach_ws_bridge(
+        self, target: Any, ws_uri: str, profile: Optional[str] = None,
+    ) -> bool:
         """Attach a **WebSocket takeover bridge** to a live call, or re-point an
         existing one at a different server.
 
@@ -4485,18 +4487,31 @@ class MockRtpEngine:
 
         Requires ``media.backend: siphon-rtp``.
 
+        Pass ``profile=`` to give the bridge a media profile's bridge settings
+        (``ws_sample_rate``, ``noise_suppression``, ``echo_cancellation``,
+        ``ws_vad``, ``ws_barge_in``), read as an answer with ``ws_uri`` reads
+        them. Without it the engine runs the bridge at the leg's own rate with
+        uplink processing off (a re-point keeps what the bridge had), so a bot
+        attached after a greeting gets no barge-in and 8 kHz on a G.711 leg.
+
         Args:
             target: Request, Reply, or Call object, a ``(call_id, from_tag)``
                 pair, or a bare ``call_id``.
             ws_uri: ``ws://`` or ``wss://`` URI the engine dials as a client,
                 templated as for :meth:`attach_ws_tee`.
+            profile: Name of a media profile (built-in such as ``"voice_ai"``,
+                or one from ``media.profiles``). siphon raises ``ValueError``
+                for an unknown name before anything reaches the engine.
 
         Returns:
             ``True`` on success.
 
         Example::
 
-            await rtpengine.attach_ws_bridge(call, "wss://ai.internal/session-1")
+            # Greet first, then hand the caller to the assistant with the
+            # settings it would have had at the answer:
+            await rtpengine.attach_ws_bridge(call, "wss://ai.internal/session-1",
+                                             profile="voice_ai")
             # ... later, hand the same caller to a different model session:
             await rtpengine.attach_ws_bridge(call, "wss://ai.internal/session-2")
         """
@@ -4508,6 +4523,7 @@ class MockRtpEngine:
             "call_id": call_id,
             "from_tag": from_tag,
             "ws_uri": ws_uri,
+            "profile": profile,
         })
         return True
 

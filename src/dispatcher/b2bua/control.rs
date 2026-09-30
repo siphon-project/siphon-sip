@@ -244,6 +244,28 @@ pub fn b2bua_media_target(
     ))
 }
 
+/// The answer half of a named media profile, for a runtime bridge attach: the
+/// half `answer_local` with a `ws_uri` reads its bridge settings from, so a bot
+/// reached at runtime gets what it would at the answer. `Err` lists the names.
+pub(crate) fn b2bua_media_profile(name: &str) -> Result<crate::rtpengine::NgFlags, Vec<String>> {
+    let registry = B2BUA_CONTROL
+        .get()
+        .and_then(|control| control.state.rtpengine_profiles.as_ref());
+    let Some(registry) = registry else {
+        return Err(Vec::new());
+    };
+    registry
+        .get(name)
+        .map(|entry| entry.answer.clone())
+        .ok_or_else(|| {
+            registry
+                .profile_names()
+                .into_iter()
+                .map(String::from)
+                .collect()
+        })
+}
+
 /// Record (or clear) the WebSocket **tee** attached to a control-plane channel's
 /// media session.
 ///

@@ -815,9 +815,14 @@ impl MediaBackend {
         call_id: &str,
         from_tag: &str,
         ws_uri: &str,
+        profile: Option<&NgFlags>,
     ) -> Result<(), RtpEngineError> {
         match self {
-            Self::SiphonRtp(client) => client.attach_ws_bridge(call_id, from_tag, ws_uri).await,
+            Self::SiphonRtp(client) => {
+                client
+                    .attach_ws_bridge(call_id, from_tag, ws_uri, profile)
+                    .await
+            }
             Self::RtpEngine(_) => Err(RtpEngineError::Unsupported {
                 operation: "attach_ws_bridge",
                 backend: "rtpengine",
@@ -1233,7 +1238,7 @@ mod tests {
 
         for (backend, name) in [(&rtpengine, "rtpengine"), (&rtpproxy, "rtpproxy")] {
             let error = backend
-                .attach_ws_bridge("call-1", "tag-a", "wss://ai.invalid/one")
+                .attach_ws_bridge("call-1", "tag-a", "wss://ai.invalid/one", None)
                 .await
                 .unwrap_err();
             assert!(

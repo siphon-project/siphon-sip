@@ -974,18 +974,21 @@ impl SiphonRtpClient {
     /// out.  Attaching to a call that already has a bridge is a **re-point**,
     /// not an error — the media path never drops, which is what lets one party
     /// be handed from one media server to another without the other party
-    /// hearing a gap.
+    /// hearing a gap. `profile` sets its wire rate and uplink processing as
+    /// `answer_local` reads them; `None` leaves the engine's (leg rate, all off).
     pub async fn attach_ws_bridge(
         &self,
         call_id: &str,
         from_tag: &str,
         ws_uri: &str,
+        profile: Option<&NgFlags>,
     ) -> Result<(), RtpEngineError> {
         expect_ok(
             self.request(Command::AttachWsBridge {
                 call_id: call_id.to_string(),
                 from_tag: from_tag.to_string(),
                 ws_uri: ws_uri.to_string(),
+                profile: profile.map(profile_flags_from_ng),
             })
             .await?,
         )
@@ -1558,9 +1561,10 @@ impl SiphonRtpClientSet {
         call_id: &str,
         from_tag: &str,
         ws_uri: &str,
+        profile: Option<&NgFlags>,
     ) -> Result<(), RtpEngineError> {
         self.select(call_id)
-            .attach_ws_bridge(call_id, from_tag, ws_uri)
+            .attach_ws_bridge(call_id, from_tag, ws_uri, profile)
             .await
     }
 
@@ -2934,12 +2938,54 @@ mod tests {
         }
     }
 
+    /// The emitted attach frame, as the raw JSON the engine receives.
+    async fn captured_attach_ws_bridge(profile: Option<&NgFlags>) -> serde_json::Value {
+        let (address, mut capture_rx) = spawn_capturing_server().await;
+        let (event_tx, _event_rx) = channel();
+        let client = SiphonRtpClient::new(address, None, 2_000, 5_000, event_tx);
+        client
+            .attach_ws_bridge("call-1", "tag-a", "wss://ai.invalid/agent", profile)
+            .await
+            .expect("attach_ws_bridge");
+        let frame = capture_rx.recv().await.expect("captured frame");
+        let request: serde_json::Value = serde_json::from_str(&frame).expect("frame is JSON");
+        // Framed as a request envelope, `command` flattened beside `id`.
+        request
+    }
+
+    #[tokio::test]
+    async fn attach_ws_bridge_without_a_profile_leaves_it_off_the_wire() {
+        // Wire-identical to before the field existed, so an older engine that
+        // predates it still reads the frame.
+        let frame = captured_attach_ws_bridge(None).await;
+        assert_eq!(frame["command"], "attach_ws_bridge");
+        assert_eq!(frame["ws_uri"], "wss://ai.invalid/agent");
+        assert!(frame.get("profile").is_none(), "no profile key: {frame}");
+    }
+
+    #[tokio::test]
+    async fn attach_ws_bridge_carries_the_profile_bridge_settings() {
+        // The built-in voice_ai answer half: the settings a bot reached at the
+        // answer gets, now reaching one attached at runtime.
+        let registry = crate::rtpengine::ProfileRegistry::new();
+        let mut flags = registry.get("voice_ai").expect("voice_ai").answer.clone();
+        flags.ws_sample_rate = Some(16_000);
+        let frame = captured_attach_ws_bridge(Some(&flags)).await;
+        let profile = &frame["profile"];
+        assert_eq!(profile["ws_sample_rate"], 16_000, "{frame}");
+        assert_eq!(profile["noise_suppression"], true, "{frame}");
+        assert_eq!(profile["echo_cancellation"], true, "{frame}");
+        assert_eq!(profile["ws_vad"], true, "{frame}");
+        assert_eq!(profile["ws_barge_in"], true, "{frame}");
+    }
+
     #[test]
     fn attach_ws_bridge_carries_the_ws_uri() {
         let json = serde_json::to_value(Command::AttachWsBridge {
             call_id: "call-bridge".into(),
             from_tag: "leg-a".into(),
             ws_uri: "wss://ai.invalid/session-1".into(),
+            profile: None,
         })
         .expect("serialize attach_ws_bridge");
         assert_eq!(json["command"], "attach_ws_bridge");

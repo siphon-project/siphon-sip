@@ -44,6 +44,7 @@ fn signatures_are_pinned() {
     let _: fn(&str, Option<&str>, bool) -> super::DropOutcome = super::b2bua_drop_call;
     let _: fn(&str, Option<String>) = super::b2bua_media_set_ws_tee;
     let _: fn(&str, bool) = super::b2bua_media_set_ws_bridge_attached;
+    let _: fn(&str) -> Result<crate::rtpengine::NgFlags, Vec<String>> = super::b2bua_media_profile;
     // Named, because clippy's type_complexity refuses the bare fn-pointer type.
     type AnchoredProgress = fn(&str, u16, &str, Option<&str>, Option<&str>) -> Result<(), String>;
     let _: AnchoredProgress = super::b2bua_progress_call_anchored;
@@ -139,13 +140,15 @@ fn the_public_surface_is_pinned() {
     // is bridged: the group's answer mode and the listener a bridged phone is
     // reported to, plus the crate-internal `bridge_calls_with_state` the
     // `bridge` verb names a pair media profile through (`BridgeParams` is
-    // published and built literally, so it gains no field). All additive, so a
-    // minor-compatible change — recorded here because that is the tripwire.
+    // published and built literally, so it gains no field), plus the
+    // crate-internal `b2bua_media_profile` a runtime `stream_start` bridge
+    // resolves its profile through. All additive, so a minor-compatible
+    // change — recorded here because that is the tripwire.
     assert_eq!(
         declared + re_exported,
-        78,
+        79,
         "the dispatcher's public surface is {} items ({declared} declared here, \
-         {re_exported} re-exported), not 78. Adding one is a semver commitment on a \
+         {re_exported} re-exported), not 79. Adding one is a semver commitment on a \
          published crate; removing one breaks embedders. An extraction should move the \
          declaration and add a `pub use`, leaving this total unchanged.",
         declared + re_exported,

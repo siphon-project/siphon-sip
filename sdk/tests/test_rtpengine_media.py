@@ -772,6 +772,16 @@ class TestWebSocketTakeoverBridge:
         assert recorded["op"] == "attach_ws_bridge"
         assert recorded["call_id"] == "bridge-1@example.invalid"
         assert recorded["ws_uri"] == "wss://ai.example.com/s1"
+        assert recorded["profile"] is None
+
+    def test_attach_records_the_profile(self, harness):
+        call = Call(call_id="bridge-3@example.invalid")
+        asyncio.run(
+            harness.rtpengine.attach_ws_bridge(
+                call, "wss://ai.example.com/s1", profile="voice_ai"
+            )
+        )
+        assert harness.rtpengine.media_calls[-1]["profile"] == "voice_ai"
 
     def test_reattaching_is_a_repoint_not_an_error(self, harness):
         """Moving a party from one model session to another is an attach on a
