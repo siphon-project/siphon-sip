@@ -5,7 +5,7 @@
 // connections refused by the per-source ceilings, broken down by reason.
 
 import { $, html, text, esc } from "../lib/dom.js";
-import { count } from "../lib/format.js";
+import { count, isAbsent } from "../lib/format.js";
 import { barList, tile } from "../lib/widgets.js";
 import * as api from "../lib/api.js";
 
@@ -22,7 +22,11 @@ export function render(snapshot) {
   html(
     "sec-kpis",
     [
-      tile("Banned now", count(security.banned_ips), "auto-ban active"),
+      tile(
+        "Banned now",
+        count(security.banned_ips),
+        isAbsent(security.banned_ips) ? "auto-ban not configured" : "auto-ban active",
+      ),
       tile("Auth failures", count(counters.auth_failures_total), "no credentials offered"),
       tile("Credential fails", count(counters.credential_failures_total), "bad digest response"),
       tile("Scanner blocked", count(counters.scanner_blocked_total), "bad UA / probe"),
@@ -88,12 +92,18 @@ export async function load() {
   try {
     entries = await api.bans();
   } catch (error) {
-    html(
-      "ban-rows",
-      '<tr><td colspan="3" class="empty">' +
-        (error instanceof api.Unauthorized ? "read access is protected — unlock first" : "failed to load") +
-        "</td></tr>",
-    );
+    // A 404 is "auto-ban is not configured", which is not the same statement
+    // as "configured and nothing banned" (an empty list) and must not read as
+    // it: one is healthy, the other is nobody watching a public SIP port.
+    const message =
+      error instanceof api.Unauthorized
+        ? "read access is protected — unlock first"
+        : error instanceof api.NotFound
+          ? "auto-ban is not configured on this node (security.failed_auth_ban)"
+          : "failed to load";
+    text("ban-count", "—");
+    text("nav-bans", "");
+    html("ban-rows", '<tr><td colspan="3" class="empty">' + message + "</td></tr>");
     return;
   }
   text("ban-count", entries.length);

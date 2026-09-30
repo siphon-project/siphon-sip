@@ -5192,3 +5192,98 @@ fn a_gateway_destination_with_no_transport_is_udp() {
 fn a_gateway_with_no_groups_loads() {
     base_yaml("gateway:\n  groups: []\n").expect("nothing to validate");
 }
+
+fn config_with_admin(admin_block: &str) -> String {
+    format!(
+        r#"
+listen:
+  udp:
+    - "0.0.0.0:5060"
+domain:
+  local:
+    - "example.com"
+script:
+  path: "scripts/main.py"
+admin:
+{admin_block}"#
+    )
+}
+
+#[test]
+fn admin_listen_that_is_not_a_socket_address_is_refused_at_load() {
+    for bad in ["localhost:9091", ":9091", "127.0.0.1", "9091", ""] {
+        let yaml = config_with_admin(&format!("  listen: \"{bad}\"\n"));
+        let error = Config::from_str(&yaml)
+            .err()
+            .unwrap_or_else(|| panic!("admin.listen {bad:?} must be refused"));
+        assert!(
+            error.to_string().contains("admin.listen"),
+            "error names the field: {error}"
+        );
+    }
+}
+
+#[test]
+fn admin_listen_socket_addresses_load() {
+    for good in ["127.0.0.1:9091", "0.0.0.0:0", "[::1]:9091", "[::]:9091"] {
+        let yaml = config_with_admin(&format!("  listen: \"{good}\"\n"));
+        assert!(Config::from_str(&yaml).is_ok(), "{good} must load");
+    }
+}
+
+#[test]
+fn admin_listen_is_checked_after_env_expansion() {
+    let yaml = config_with_admin("  listen: \"0.0.0.0:${SIPHON_TEST_UNSET_ADMIN_PORT:-9091}\"\n");
+    assert_eq!(
+        Config::from_str(&yaml).unwrap().admin.unwrap().listen,
+        "0.0.0.0:9091"
+    );
+}
+
+#[test]
+fn admin_log_tail_retention_defaults_to_warnings_only() {
+    let yaml = config_with_admin("  listen: \"127.0.0.1:9091\"\n  log_tail:\n    enabled: true\n");
+    let log_tail = Config::from_str(&yaml)
+        .unwrap()
+        .admin
+        .unwrap()
+        .log_tail
+        .unwrap();
+    assert_eq!(log_tail.retain_level, None);
+    assert_eq!(log_tail.warn_capacity, 512);
+    assert_eq!(log_tail.retain_capacity, 4096);
+    assert_eq!(log_tail.max_streams, 4);
+}
+
+#[test]
+fn admin_log_tail_retention_parses() {
+    let yaml = config_with_admin(concat!(
+        "  listen: \"127.0.0.1:9091\"\n",
+        "  log_tail:\n",
+        "    enabled: true\n",
+        "    retain_level: info\n",
+        "    retain_capacity: 20000\n",
+        "    warn_capacity: 1024\n",
+    ));
+    let log_tail = Config::from_str(&yaml)
+        .unwrap()
+        .admin
+        .unwrap()
+        .log_tail
+        .unwrap();
+    assert_eq!(log_tail.retain_level.as_deref(), Some("info"));
+    assert_eq!(log_tail.retain_capacity, 20000);
+    assert_eq!(log_tail.warn_capacity, 1024);
+}
+
+#[test]
+fn admin_log_tail_unknown_retain_level_is_refused() {
+    let yaml = config_with_admin(concat!(
+        "  listen: \"127.0.0.1:9091\"\n",
+        "  log_tail:\n",
+        "    enabled: true\n",
+        "    retain_level: verbose\n",
+    ));
+    let error = Config::from_str(&yaml).expect_err("an unknown level must be refused");
+    assert!(error.to_string().contains("retain_level"), "{error}");
+}

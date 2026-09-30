@@ -24,11 +24,15 @@ export function clearToken() {
 /** Raised for a 401, so callers can render "locked" rather than "failed". */
 export class Unauthorized extends Error {}
 
+/** Raised for a 404, so callers can render "not configured" rather than "failed". */
+export class NotFound extends Error {}
+
 async function request(path, options = {}) {
   const headers = Object.assign({}, options.headers || {});
   if (token) headers.Authorization = "Bearer " + token;
   const response = await fetch(path, Object.assign({}, options, { headers }));
   if (response.status === 401) throw new Unauthorized(path);
+  if (response.status === 404) throw new NotFound(path);
   if (!response.ok) throw new Error(path + " -> " + response.status);
   return response;
 }

@@ -19,6 +19,14 @@
 //! they are rare by construction and they are the context an operator wants
 //! *already collected* when they open the tail after something went wrong.
 //!
+//! An operator who wants the INFO lines kept too (to read what a call did
+//! after it ended, not only what went wrong) opts in with
+//! `admin.log_tail.retain_level`. That fills a second, separately sized ring,
+//! so a busy INFO stream cannot evict the warnings, and it moves the gate for
+//! the retained levels: they are formatted on every event from then on. The
+//! default stays WARN only, and the cost above is only paid by a node that
+//! asked for it.
+//!
 //! # Backpressure
 //!
 //! Each attached stream owns a bounded queue with a drop-oldest policy, the
@@ -37,7 +45,7 @@
 //! `RwLock` read on the per-event path.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use serde::Serialize;
@@ -47,8 +55,12 @@ use tracing::{Event, Level, Subscriber};
 use tracing_subscriber::layer::Context;
 use tracing_subscriber::Layer;
 
-/// Entries of WARN and above retained even when nobody is tailing.
+/// Entries of WARN and above retained even when nobody is tailing, unless
+/// `admin.log_tail.warn_capacity` says otherwise.
 const WARN_RING_CAPACITY: usize = 512;
+
+/// Default size of the optional below-WARN ring (`admin.log_tail.retain_capacity`).
+const RETAIN_RING_CAPACITY: usize = 4096;
 
 /// Per-stream queue depth before the oldest line is dropped.
 const STREAM_QUEUE_CAPACITY: usize = 2048;
@@ -56,6 +68,11 @@ const STREAM_QUEUE_CAPACITY: usize = 2048;
 /// One captured log event, as the admin API serializes it.
 #[derive(Debug, Clone, Serialize)]
 pub struct LogRecord {
+    /// Position in this process's log, increasing by one per captured record.
+    /// The cursor for paging `GET /admin/logs` backwards (`before=`), and the
+    /// order the two retained rings are merged in. Restarts at 0 with the
+    /// process.
+    pub seq: u64,
     /// Milliseconds since the UNIX epoch.
     pub timestamp_ms: u64,
     /// `ERROR` / `WARN` / `INFO` / `DEBUG` / `TRACE`.
@@ -113,6 +130,22 @@ fn level_rank(level: &str) -> u8 {
         "INFO" => 2,
         "DEBUG" => 3,
         _ => 4,
+    }
+}
+
+/// Parse a level name case-insensitively, refusing anything that is not one.
+///
+/// [`level_rank`] maps an unknown name to TRACE, which is the right forgiveness
+/// for a query filter but the wrong one for config: a misspelt `retain_level`
+/// would silently retain everything.
+pub fn parse_level(value: &str) -> Option<&'static str> {
+    match value.to_ascii_uppercase().as_str() {
+        "ERROR" => Some("ERROR"),
+        "WARN" | "WARNING" => Some("WARN"),
+        "INFO" => Some("INFO"),
+        "DEBUG" => Some("DEBUG"),
+        "TRACE" => Some("TRACE"),
+        _ => None,
     }
 }
 
@@ -244,8 +277,53 @@ impl TailStream {
     }
 }
 
+/// How the tail is sized and what it keeps, from `admin.log_tail`.
+#[derive(Debug, Clone, Copy)]
+pub struct LogTailSettings {
+    /// Concurrent streams allowed.
+    pub max_streams: usize,
+    /// Size of the WARN+ ring.
+    pub warn_capacity: usize,
+    /// Lowest level retained below WARN (`INFO` / `DEBUG` / `TRACE`), or `None`
+    /// to retain WARN and above only.
+    pub retain_level: Option<&'static str>,
+    /// Size of the below-WARN ring.
+    pub retain_capacity: usize,
+}
+
+impl Default for LogTailSettings {
+    fn default() -> Self {
+        Self {
+            max_streams: 4,
+            warn_capacity: WARN_RING_CAPACITY,
+            retain_level: None,
+            retain_capacity: RETAIN_RING_CAPACITY,
+        }
+    }
+}
+
+/// A read of the retained rings for `GET /admin/logs`.
+#[derive(Debug, Clone, Default)]
+pub struct RetainedQuery {
+    /// Level, substring and Call-ID filter, as the stream takes them.
+    pub filter: TailFilter,
+    /// Only records older than this `seq` (the page cursor).
+    pub before: Option<u64>,
+    /// At most this many records: the newest that match.
+    pub limit: Option<usize>,
+}
+
+/// The answer to a [`RetainedQuery`], oldest first.
+#[derive(Debug)]
+pub struct RetainedPage {
+    pub records: Vec<Arc<LogRecord>>,
+    /// Older matching records exist beyond this page. Pass the first record's
+    /// `seq` as `before` to read them.
+    pub truncated: bool,
+}
+
 /// Process-wide tail registry.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct LogTail {
     /// Attached streams. Small by construction (see `max_streams`), so a `Vec`
     /// behind a mutex beats a concurrent map here.
@@ -253,20 +331,60 @@ pub struct LogTail {
     /// Fast gate read on every event, kept in step with `streams.len()`.
     attached: AtomicUsize,
     warn_ring: Mutex<VecDeque<Arc<LogRecord>>>,
+    warn_capacity: AtomicUsize,
+    /// Records ranked below WARN, down to `retain_rank`. Empty unless
+    /// `retain_level` is configured.
+    retain_ring: Mutex<VecDeque<Arc<LogRecord>>>,
+    retain_capacity: AtomicUsize,
+    /// Lowest-severity rank retained. WARN's rank means the second ring is off,
+    /// which is the default and keeps the event gate where it always was.
+    retain_rank: AtomicU8,
+    next_seq: AtomicU64,
     enabled: AtomicBool,
     max_streams: AtomicUsize,
+}
+
+impl Default for LogTail {
+    fn default() -> Self {
+        Self {
+            streams: Mutex::new(Vec::new()),
+            attached: AtomicUsize::new(0),
+            warn_ring: Mutex::new(VecDeque::new()),
+            warn_capacity: AtomicUsize::new(WARN_RING_CAPACITY),
+            retain_ring: Mutex::new(VecDeque::new()),
+            retain_capacity: AtomicUsize::new(RETAIN_RING_CAPACITY),
+            retain_rank: AtomicU8::new(level_rank("WARN")),
+            next_seq: AtomicU64::new(0),
+            enabled: AtomicBool::new(false),
+            max_streams: AtomicUsize::new(0),
+        }
+    }
+}
+
+/// Lock a ring, recovering from poisoning: a panicked logger must not take the
+/// tail down with it.
+fn lock_ring(ring: &Mutex<VecDeque<Arc<LogRecord>>>) -> MutexGuard<'_, VecDeque<Arc<LogRecord>>> {
+    match ring.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+/// Push onto a bounded ring, evicting the oldest. A zero capacity keeps nothing.
+fn push_bounded(ring: &Mutex<VecDeque<Arc<LogRecord>>>, capacity: usize, record: &Arc<LogRecord>) {
+    if capacity == 0 {
+        return;
+    }
+    let mut ring = lock_ring(ring);
+    while ring.len() >= capacity {
+        ring.pop_front();
+    }
+    ring.push_back(Arc::clone(record));
 }
 
 impl LogTail {
     fn streams(&self) -> MutexGuard<'_, Vec<Arc<TailStream>>> {
         match self.streams.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        }
-    }
-
-    fn warn_ring(&self) -> MutexGuard<'_, VecDeque<Arc<LogRecord>>> {
-        match self.warn_ring.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         }
@@ -315,17 +433,67 @@ impl LogTail {
 
     /// The retained WARN+ ring, oldest first.
     pub fn recent_warnings(&self) -> Vec<Arc<LogRecord>> {
-        self.warn_ring().iter().cloned().collect()
+        lock_ring(&self.warn_ring).iter().cloned().collect()
     }
 
-    fn publish(&self, record: LogRecord) {
+    /// The lowest level the retained rings hold: `WARN` by default, or the
+    /// configured `retain_level`. `GET /admin/logs` reports it, so an empty
+    /// answer reads as "no warnings" rather than "nothing happened".
+    pub fn retained_level(&self) -> &'static str {
+        match self.retain_rank.load(Ordering::Relaxed) {
+            0 | 1 => "WARN",
+            2 => "INFO",
+            3 => "DEBUG",
+            _ => "TRACE",
+        }
+    }
+
+    /// Records held across both rings.
+    pub fn retained_count(&self) -> usize {
+        lock_ring(&self.warn_ring).len() + lock_ring(&self.retain_ring).len()
+    }
+
+    /// Read the retained rings: filtered, merged in `seq` order, and cut to the
+    /// newest `limit` records older than `before`.
+    pub fn retained(&self, query: &RetainedQuery) -> RetainedPage {
+        let admit = |record: &&Arc<LogRecord>| {
+            // `map_or(true, …)` not `is_none_or`: MSRV 1.80.
+            query.before.map_or(true, |before| record.seq < before) && record.matches(&query.filter)
+        };
+        let mut records: Vec<Arc<LogRecord>> = lock_ring(&self.warn_ring)
+            .iter()
+            .filter(admit)
+            .cloned()
+            .collect();
+        records.extend(lock_ring(&self.retain_ring).iter().filter(admit).cloned());
+        // Each ring is in push order, which can trail `seq` by a record when two
+        // threads log at once; the sort settles both that and the merge.
+        records.sort_by_key(|record| record.seq);
+
+        let truncated = query.limit.is_some_and(|limit| records.len() > limit);
+        if let Some(limit) = query.limit {
+            let excess = records.len().saturating_sub(limit);
+            records.drain(..excess);
+        }
+        RetainedPage { records, truncated }
+    }
+
+    fn publish(&self, mut record: LogRecord) {
+        record.seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
         let record = Arc::new(record);
-        if level_rank(record.level) <= level_rank("WARN") {
-            let mut ring = self.warn_ring();
-            if ring.len() >= WARN_RING_CAPACITY {
-                ring.pop_front();
-            }
-            ring.push_back(Arc::clone(&record));
+        let rank = level_rank(record.level);
+        if rank <= level_rank("WARN") {
+            push_bounded(
+                &self.warn_ring,
+                self.warn_capacity.load(Ordering::Relaxed),
+                &record,
+            );
+        } else if rank <= self.retain_rank.load(Ordering::Relaxed) {
+            push_bounded(
+                &self.retain_ring,
+                self.retain_capacity.load(Ordering::Relaxed),
+                &record,
+            );
         }
         for stream in self.streams().iter() {
             stream.offer(&record);
@@ -340,12 +508,58 @@ pub fn log_tail() -> &'static Arc<LogTail> {
     LOG_TAIL.get_or_init(|| Arc::new(LogTail::default()))
 }
 
+impl LogTail {
+    /// A tail configured and switched on, outside the process-wide one. For a
+    /// caller that wants its own (a test of the admin read path).
+    pub fn with_settings(settings: LogTailSettings) -> Self {
+        let tail = Self::default();
+        tail.configure(settings);
+        tail
+    }
+
+    /// Publish a record as the layer would, without a subscriber.
+    #[cfg(test)]
+    pub(crate) fn publish_for_test(
+        &self,
+        level: &'static str,
+        message: &str,
+        call_id: Option<&str>,
+    ) {
+        self.publish(LogRecord {
+            seq: 0,
+            timestamp_ms: 0,
+            level,
+            target: "siphon::test".to_string(),
+            message: message.to_string(),
+            call_id: call_id.map(String::from),
+            fields: Vec::new(),
+        });
+    }
+}
+
 /// Switch capture on. Called from the server once the admin config is known.
-pub fn enable(max_streams: usize) {
-    let tail = log_tail();
-    tail.max_streams
-        .store(max_streams.max(1), Ordering::Relaxed);
-    tail.enabled.store(true, Ordering::Relaxed);
+pub fn enable(settings: LogTailSettings) {
+    log_tail().configure(settings);
+}
+
+impl LogTail {
+    fn configure(&self, settings: LogTailSettings) {
+        self.max_streams
+            .store(settings.max_streams.max(1), Ordering::Relaxed);
+        self.warn_capacity
+            .store(settings.warn_capacity, Ordering::Relaxed);
+        self.retain_capacity
+            .store(settings.retain_capacity, Ordering::Relaxed);
+        // Never below WARN's rank: ERROR and WARN always go to the warning ring,
+        // and a `retain_level` of `warn` or `error` means no second ring.
+        let rank = settings
+            .retain_level
+            .map(level_rank)
+            .unwrap_or(0)
+            .max(level_rank("WARN"));
+        self.retain_rank.store(rank, Ordering::Relaxed);
+        self.enabled.store(true, Ordering::Relaxed);
+    }
 }
 
 /// Collects an event's fields into a [`LogRecord`].
@@ -410,11 +624,14 @@ impl<S: Subscriber> Layer<S> for LogTailLayer {
         }
 
         let level = level_name(event.metadata().level());
-        let is_warning = level_rank(level) <= level_rank("WARN");
+        let rank = level_rank(level);
 
-        // The gate. One relaxed load on the overwhelmingly common path (INFO
-        // and below with nobody watching), before anything is formatted.
-        if !is_warning && tail.attached.load(Ordering::Relaxed) == 0 {
+        // The gate. Two relaxed loads on the overwhelmingly common path (INFO
+        // and below, nobody watching, retention at its WARN default), before
+        // anything is formatted.
+        if rank > tail.retain_rank.load(Ordering::Relaxed)
+            && tail.attached.load(Ordering::Relaxed) == 0
+        {
             return;
         }
 
@@ -422,6 +639,7 @@ impl<S: Subscriber> Layer<S> for LogTailLayer {
         event.record(&mut visitor);
 
         tail.publish(LogRecord {
+            seq: 0, // assigned by publish()
             timestamp_ms: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|since| since.as_millis() as u64)
@@ -441,6 +659,7 @@ mod tests {
 
     fn record(level: &'static str, message: &str) -> LogRecord {
         LogRecord {
+            seq: 0,
             timestamp_ms: 0,
             level,
             target: "siphon::test".to_string(),
@@ -619,6 +838,183 @@ mod tests {
             visitor.fields,
             vec![("branch".to_string(), "z9hG4bK1".to_string())]
         );
+    }
+
+    fn retaining(level: Option<&'static str>, warn: usize, retain: usize) -> LogTail {
+        let tail = LogTail::default();
+        tail.configure(LogTailSettings {
+            max_streams: 4,
+            warn_capacity: warn,
+            retain_level: level,
+            retain_capacity: retain,
+        });
+        tail
+    }
+
+    fn messages(page: &RetainedPage) -> Vec<&str> {
+        page.records
+            .iter()
+            .map(|record| record.message.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn parse_level_accepts_the_five_levels_and_refuses_the_rest() {
+        assert_eq!(parse_level("info"), Some("INFO"));
+        assert_eq!(parse_level("Warning"), Some("WARN"));
+        assert_eq!(parse_level("TRACE"), Some("TRACE"));
+        assert_eq!(parse_level("verbose"), None);
+        assert_eq!(parse_level(""), None);
+    }
+
+    #[test]
+    fn default_retention_holds_warnings_only_and_says_so() {
+        let tail = retaining(None, 8, 8);
+        tail.publish(record("INFO", "not kept"));
+        tail.publish(record("WARN", "kept"));
+        assert_eq!(tail.retained_level(), "WARN");
+        assert_eq!(
+            messages(&tail.retained(&RetainedQuery::default())),
+            ["kept"]
+        );
+    }
+
+    #[test]
+    fn retain_level_warn_or_error_means_no_second_ring() {
+        for level in ["WARN", "ERROR"] {
+            let tail = retaining(Some(level), 8, 8);
+            tail.publish(record("INFO", "not kept"));
+            assert_eq!(tail.retained_level(), "WARN");
+            assert_eq!(tail.retained_count(), 0);
+        }
+    }
+
+    #[test]
+    fn retain_level_info_keeps_info_but_not_debug() {
+        let tail = retaining(Some("INFO"), 8, 8);
+        tail.publish(record("INFO", "flow step"));
+        tail.publish(record("DEBUG", "too verbose"));
+        assert_eq!(tail.retained_level(), "INFO");
+        assert_eq!(
+            messages(&tail.retained(&RetainedQuery::default())),
+            ["flow step"]
+        );
+    }
+
+    #[test]
+    fn a_busy_info_stream_does_not_evict_the_warnings() {
+        let tail = retaining(Some("INFO"), 4, 3);
+        tail.publish(record("WARN", "the warning"));
+        for index in 0..100 {
+            tail.publish(record("INFO", &format!("info {index}")));
+        }
+        let page = tail.retained(&RetainedQuery::default());
+        assert_eq!(
+            messages(&page),
+            ["the warning", "info 97", "info 98", "info 99"]
+        );
+    }
+
+    #[test]
+    fn retained_merges_both_rings_in_log_order() {
+        let tail = retaining(Some("INFO"), 8, 8);
+        tail.publish(record("INFO", "one"));
+        tail.publish(record("WARN", "two"));
+        tail.publish(record("INFO", "three"));
+        tail.publish(record("ERROR", "four"));
+        let page = tail.retained(&RetainedQuery::default());
+        assert_eq!(messages(&page), ["one", "two", "three", "four"]);
+        let seqs: Vec<u64> = page.records.iter().map(|record| record.seq).collect();
+        assert!(seqs.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    #[test]
+    fn retained_applies_the_stream_filters() {
+        let tail = retaining(Some("INFO"), 8, 8);
+        let mut on_call = record("INFO", "answered");
+        on_call.call_id = Some("call-a".to_string());
+        tail.publish(on_call);
+        let mut other_call = record("INFO", "answered");
+        other_call.call_id = Some("call-b".to_string());
+        tail.publish(other_call);
+        tail.publish(record("WARN", "gateway down"));
+
+        let by_call = RetainedQuery {
+            filter: TailFilter::new(None, None, Some("call-a")),
+            ..RetainedQuery::default()
+        };
+        let page = tail.retained(&by_call);
+        assert_eq!(page.records.len(), 1);
+        assert_eq!(page.records[0].call_id.as_deref(), Some("call-a"));
+
+        let by_level = RetainedQuery {
+            filter: TailFilter::new(Some("warn"), None, None),
+            ..RetainedQuery::default()
+        };
+        assert_eq!(messages(&tail.retained(&by_level)), ["gateway down"]);
+
+        let by_text = RetainedQuery {
+            filter: TailFilter::new(None, Some("GATEWAY"), None),
+            ..RetainedQuery::default()
+        };
+        assert_eq!(messages(&tail.retained(&by_text)), ["gateway down"]);
+    }
+
+    #[test]
+    fn limit_returns_the_newest_and_before_pages_back() {
+        let tail = retaining(Some("INFO"), 8, 16);
+        for index in 0..10 {
+            tail.publish(record("INFO", &format!("line {index}")));
+        }
+
+        let first = tail.retained(&RetainedQuery {
+            limit: Some(4),
+            ..RetainedQuery::default()
+        });
+        assert_eq!(messages(&first), ["line 6", "line 7", "line 8", "line 9"]);
+        assert!(first.truncated);
+
+        let second = tail.retained(&RetainedQuery {
+            limit: Some(4),
+            before: Some(first.records[0].seq),
+            ..RetainedQuery::default()
+        });
+        assert_eq!(messages(&second), ["line 2", "line 3", "line 4", "line 5"]);
+        assert!(second.truncated);
+
+        let last = tail.retained(&RetainedQuery {
+            limit: Some(4),
+            before: Some(second.records[0].seq),
+            ..RetainedQuery::default()
+        });
+        assert_eq!(messages(&last), ["line 0", "line 1"]);
+        assert!(!last.truncated);
+    }
+
+    #[test]
+    fn a_zero_capacity_ring_keeps_nothing() {
+        let tail = retaining(Some("INFO"), 0, 0);
+        tail.publish(record("WARN", "x"));
+        tail.publish(record("INFO", "y"));
+        assert_eq!(tail.retained_count(), 0);
+    }
+
+    #[test]
+    fn steady_state_does_not_grow_the_retained_rings() {
+        // Leak gate for the retention half: a long run of publishes leaves both
+        // rings at their configured bound, not above it.
+        let tail = retaining(Some("DEBUG"), 16, 32);
+        for index in 0..10_000 {
+            let level = match index % 3 {
+                0 => "WARN",
+                1 => "INFO",
+                _ => "DEBUG",
+            };
+            tail.publish(record(level, "traffic"));
+        }
+        assert_eq!(lock_ring(&tail.warn_ring).len(), 16);
+        assert_eq!(lock_ring(&tail.retain_ring).len(), 32);
+        assert_eq!(tail.retained_count(), 48);
     }
 
     #[test]

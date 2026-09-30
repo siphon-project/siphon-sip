@@ -70,7 +70,8 @@ admin:
 | `GET /admin/stats` | uptime + active registration count |
 | `GET /admin/registrations[/{aor}]` | inspect bindings |
 | `DELETE /admin/registrations/{aor}` | force-unregister |
-| `GET /admin/bans` / `DELETE /admin/bans/{ip}` | list / lift auto-bans |
+| `GET /admin/bans` / `DELETE /admin/bans/{ip}` | list / lift auto-bans (`404` on both when `security.failed_auth_ban` is off, so an empty list always means "watching, nothing banned") |
+| `GET /admin/logs` | retained log lines (WARN+, plus down to `admin.log_tail.retain_level`); filters `level`, `contains`, `call_id`, paging `limit` + `before=<seq>` |
 | `GET /admin/gateways` | per-group dispatcher status (destinations, health, weight, priority, missed health-checks) |
 | `POST /admin/gateways/{group}/{destination}/{up\|down}` | mark a gateway destination up/down (drain / restore a carrier) |
 | `POST /admin/registrants/refresh` | re-read a `registrant.backend: database` / `http` source and reconcile now |

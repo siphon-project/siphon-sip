@@ -561,27 +561,65 @@ fn capture_disabled() -> Response {
         .into_response()
 }
 
-/// `GET /admin/logs` — the retained WARN+ ring, newest last.
+/// `GET /admin/logs` — the retained log, newest last.
 ///
-/// The non-streaming half of the tail: it answers "what has already gone wrong
-/// on this node" without opening a stream, and it is what the log view renders
-/// before its stream produces a first line.
-async fn logs_handler() -> Response {
-    let tail = crate::log_tail::log_tail();
+/// The non-streaming half of the tail: it answers "what already happened on
+/// this node" without opening a stream, and it is what the log view renders
+/// before its stream produces a first line. Holds WARN and above, plus the
+/// levels down to `admin.log_tail.retain_level` when that is set;
+/// `retained_level` in the answer says which, so an empty list reads as "no
+/// warnings" rather than "nothing happened".
+///
+/// Takes the stream's `level` / `contains` / `call_id` filters, plus `limit`
+/// (the newest N that match) and `before` (a `seq` cursor). When `truncated` is
+/// true, pass the first record's `seq` as `before` for the page before it.
+async fn logs_handler(
+    axum::extract::Query(params): axum::extract::Query<LogReadParams>,
+) -> Response {
+    logs_response(crate::log_tail::log_tail(), &params)
+}
+
+fn logs_response(tail: &crate::log_tail::LogTail, params: &LogReadParams) -> Response {
     if !tail.is_enabled() {
         return log_tail_disabled();
     }
-    let retained = tail.recent_warnings();
+    let page = tail.retained(&crate::log_tail::RetainedQuery {
+        filter: crate::log_tail::TailFilter::new(
+            params.level.as_deref(),
+            params.contains.as_deref(),
+            params.call_id.as_deref(),
+        ),
+        before: params.before,
+        limit: params.limit,
+    });
     // `Arc<T>` only serializes under serde's `rc` feature, which is not enabled
     // (and should not be, for one endpoint) — borrow through instead.
     let records: Vec<&crate::log_tail::LogRecord> =
-        retained.iter().map(|record| record.as_ref()).collect();
+        page.records.iter().map(|record| record.as_ref()).collect();
     Json(serde_json::json!({
-        "retained": records.len(),
+        "retained": tail.retained_count(),
+        "retained_level": tail.retained_level(),
+        "returned": records.len(),
+        "truncated": page.truncated,
         "streams": tail.attached(),
         "records": records,
     }))
     .into_response()
+}
+
+/// Query parameters for `GET /admin/logs`, all optional.
+#[derive(Debug, Default, serde::Deserialize)]
+struct LogReadParams {
+    /// Minimum severity: `error` / `warn` / `info` / `debug` / `trace`.
+    level: Option<String>,
+    /// Case-insensitive substring over message, target and field values.
+    contains: Option<String>,
+    /// Exact Call-ID.
+    call_id: Option<String>,
+    /// Newest N matching records.
+    limit: Option<usize>,
+    /// Only records with a `seq` below this.
+    before: Option<u64>,
 }
 
 /// `GET /admin/logs/stream` — live tail as Server-Sent Events.
@@ -1015,7 +1053,9 @@ async fn metrics_json_handler(State(state): State<AdminState>) -> impl IntoRespo
             "sa_pairs": metrics.ipsec_sa_pairs.get(),
         })),
         "security": {
-            "banned_ips": metrics.banned_ips.get(),
+            // `null` when auto-ban is off: a zero would read as "watching, and
+            // nothing banned". The rest of this block is live either way.
+            "banned_ips": crate::security::auto_ban().is_some().then(|| metrics.banned_ips.get()),
             // TLS/WS handshakes that failed outright, and connections refused by
             // the per-source ceilings. Both were live and both were invisible.
             "handshake_failures": metrics.handshake_failures_total.get(),
@@ -1157,12 +1197,28 @@ async fn registration_delete_handler(
 }
 
 /// `GET /admin/bans` — list the sources currently auto-banned by
-/// `failed_auth_ban`, each with its remaining ban time in seconds. Empty when
-/// the feature is not configured.
-async fn bans_handler() -> impl IntoResponse {
-    let entries: Vec<serde_json::Value> = crate::security::auto_ban()
-        .map(|store| store.banned_sources())
-        .unwrap_or_default()
+/// `failed_auth_ban`, each with its remaining ban time in seconds.
+///
+/// 404 when the feature is not configured, the same answer `DELETE` gives.
+/// An empty list is the healthy "watching, nothing banned"; it used to be the
+/// answer for "not watching at all" too, and those have to render differently.
+async fn bans_handler() -> Response {
+    bans_response(crate::security::auto_ban().map(|store| store.as_ref()))
+}
+
+fn bans_response(store: Option<&crate::security::AutoBanStore>) -> Response {
+    let Some(store) = store else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "auto-ban not enabled",
+                "detail": "set security.failed_auth_ban in siphon.yaml",
+            })),
+        )
+            .into_response();
+    };
+    let entries: Vec<serde_json::Value> = store
+        .banned_sources()
         .into_iter()
         .map(|(address, remaining)| {
             serde_json::json!({
@@ -1171,7 +1227,7 @@ async fn bans_handler() -> impl IntoResponse {
             })
         })
         .collect();
-    Json(entries)
+    Json(entries).into_response()
 }
 
 /// `DELETE /admin/bans/:ip` — lift an auto-ban early (operator clearing a false
@@ -1864,26 +1920,170 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
-    // The auto-ban store is a process-global `OnceLock` that another test in the
-    // lib binary installs, so these assert only what holds regardless of whether
-    // a store is installed (list is always a JSON array; a bad IP is always 400).
-    // The unban / list-contents logic is covered by store-level tests in
-    // `crate::security` where a local store can be constructed deterministically.
-    #[tokio::test]
-    async fn bans_list_returns_json_array() {
-        let app = test_app();
-
-        let response = app
-            .oneshot(Request::get("/admin/bans").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
+    async fn response_json(response: Response) -> (StatusCode, serde_json::Value) {
+        let status = response.status();
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(json.is_array());
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    #[tokio::test]
+    async fn bans_list_is_404_when_auto_ban_is_not_configured() {
+        let (status, json) = response_json(bans_response(None)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(json["error"], "auto-ban not enabled");
+    }
+
+    #[tokio::test]
+    async fn bans_list_is_an_empty_array_when_configured_and_nothing_is_banned() {
+        let store = crate::security::AutoBanStore::new(5, 600, 60, &[], 1, 0, 180);
+        let (status, json) = response_json(bans_response(Some(&store))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json, serde_json::json!([]));
+    }
+
+    // The auto-ban store is a process-global `OnceLock` that another test in the
+    // lib binary installs, so the routed checks below assert the rule relative to
+    // whatever is installed: 404 and `null` together, or 200 and a number.
+    #[tokio::test]
+    async fn bans_route_and_metrics_json_agree_on_whether_auto_ban_is_configured() {
+        crate::metrics::init().ok();
+        let configured = crate::security::auto_ban().is_some();
+
+        let response = test_app()
+            .oneshot(Request::get("/admin/bans").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let (status, json) = response_json(response).await;
+        if configured {
+            assert_eq!(status, StatusCode::OK);
+            assert!(json.is_array());
+        } else {
+            assert_eq!(status, StatusCode::NOT_FOUND);
+        }
+
+        let response = test_app()
+            .oneshot(
+                Request::get("/admin/metrics.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let (_, snapshot) = response_json(response).await;
+        let banned = &snapshot["security"]["banned_ips"];
+        assert_eq!(banned.is_null(), !configured, "banned_ips: {banned}");
+        // The rest of the block stays live either way.
+        assert!(snapshot["security"]["handshake_failures"].is_number());
+    }
+
+    fn tail_retaining_info() -> crate::log_tail::LogTail {
+        let tail = crate::log_tail::LogTail::with_settings(crate::log_tail::LogTailSettings {
+            retain_level: Some("INFO"),
+            ..crate::log_tail::LogTailSettings::default()
+        });
+        tail.publish_for_test("INFO", "call one answered", Some("call-1"));
+        tail.publish_for_test("INFO", "call two answered", Some("call-2"));
+        tail.publish_for_test("WARN", "call two media timeout", Some("call-2"));
+        tail.publish_for_test("INFO", "call two ended", Some("call-2"));
+        tail
+    }
+
+    fn messages(json: &serde_json::Value) -> Vec<String> {
+        json["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|record| record["message"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn logs_default_read_states_what_the_ring_holds() {
+        let tail = crate::log_tail::LogTail::with_settings(Default::default());
+        tail.publish_for_test("INFO", "not retained", None);
+        let (status, json) = response_json(logs_response(&tail, &LogReadParams::default())).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["retained_level"], "WARN");
+        assert_eq!(json["retained"], 0);
+        assert_eq!(json["records"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn logs_read_after_the_fact_by_call_id() {
+        let tail = tail_retaining_info();
+        let params = LogReadParams {
+            call_id: Some("call-2".to_string()),
+            ..LogReadParams::default()
+        };
+        let (_, json) = response_json(logs_response(&tail, &params)).await;
+        assert_eq!(json["retained_level"], "INFO");
+        assert_eq!(json["retained"], 4);
+        assert_eq!(
+            messages(&json),
+            [
+                "call two answered",
+                "call two media timeout",
+                "call two ended"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn logs_level_and_contains_filters_apply() {
+        let tail = tail_retaining_info();
+        let warn_only = LogReadParams {
+            level: Some("warn".to_string()),
+            ..LogReadParams::default()
+        };
+        let (_, json) = response_json(logs_response(&tail, &warn_only)).await;
+        assert_eq!(messages(&json), ["call two media timeout"]);
+
+        let text = LogReadParams {
+            contains: Some("ANSWERED".to_string()),
+            ..LogReadParams::default()
+        };
+        let (_, json) = response_json(logs_response(&tail, &text)).await;
+        assert_eq!(messages(&json), ["call one answered", "call two answered"]);
+    }
+
+    #[tokio::test]
+    async fn logs_page_backwards_with_limit_and_before() {
+        let tail = tail_retaining_info();
+        let first = LogReadParams {
+            limit: Some(3),
+            ..LogReadParams::default()
+        };
+        let (_, json) = response_json(logs_response(&tail, &first)).await;
+        assert_eq!(json["returned"], 3);
+        assert_eq!(json["truncated"], true);
+        let cursor = json["records"][0]["seq"].as_u64().unwrap();
+
+        let second = LogReadParams {
+            limit: Some(3),
+            before: Some(cursor),
+            ..LogReadParams::default()
+        };
+        let (_, json) = response_json(logs_response(&tail, &second)).await;
+        assert_eq!(messages(&json), ["call one answered"]);
+        assert_eq!(json["truncated"], false);
+    }
+
+    #[tokio::test]
+    async fn logs_route_rejects_a_non_numeric_limit() {
+        crate::metrics::init().ok();
+        let app = router(authed_state("s3cret", false), None, false);
+        let response = app
+            .oneshot(
+                Request::get("/admin/logs?limit=lots")
+                    .header(header::AUTHORIZATION, "Bearer s3cret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
