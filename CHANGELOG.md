@@ -39,6 +39,20 @@ entry, but a working config keeps working.
   4096). `warn_capacity` (default 512) sizes the warning ring. The default is
   unchanged: WARN+ only, with nothing below WARN formatted while nobody is
   tailing.
+- **A bot attached at runtime can have a media profile.** A bridge attached
+  after the answer (`stream_start {mode: "bridge"}` on the control plane,
+  `rtpengine.attach_ws_bridge` in a script) ran at the leg's own rate with
+  noise suppression, echo cancellation, VAD and barge-in off, whatever the
+  controller would have got naming the same bot at the answer. So greet the
+  caller, then hand them to the assistant got an 8 kHz bot that talked over
+  its caller. Both now take `profile`, a media profile name whose bridge
+  settings are read as `answer` with `ws_uri` reads them. An unknown name is
+  refused before anything is sent (`bad_request` / `unknown_profile`, or
+  `ValueError` in a script), and `profile` on a tee is refused rather than
+  ignored. Without it nothing changes. Mirrored in the `siphon-sip` SDK mock
+  and all three control SDKs (`StreamOptions::profile`, `profile=`,
+  `StreamOptions.profile`). Requires siphon-rtp 0.11 or later
+  (`siphon-rtp-proto` 0.11).
 
 ## [1.11.3] — 2026-09-29
 

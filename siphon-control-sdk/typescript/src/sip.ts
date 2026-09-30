@@ -757,6 +757,14 @@ export interface StreamOptions {
    * engine's default when unset). Tee only; the server refuses anything else.
    */
   sampleRate?: number;
+  /**
+   * Bridge only: the name of a media profile on the server whose bridge
+   * settings (wire rate, noise suppression, echo cancellation, VAD, barge-in)
+   * the bridge runs with, as an `answer` with `wsUri` would. Unset, the bridge
+   * runs at the leg's own rate with uplink processing off. Refused on a tee,
+   * and an unknown name rejects with `bad_request`.
+   */
+  profile?: string;
 }
 
 /** Options for {@link Call.streamStop}. */
@@ -1349,8 +1357,9 @@ export class Call {
    *   direction: "caller",
    *   sampleRate: 16000,
    * });
-   * // Hand the leg to a voice agent; the agent is now the far side.
-   * await call.streamStart("wss://ai.example/agent", { mode: "bridge" });
+   * // Hand the leg to a voice agent; the agent is now the far side, with the
+   * // server's `voice_ai` profile's rate, echo cancellation and barge-in.
+   * await call.streamStart("wss://ai.example/agent", { mode: "bridge", profile: "voice_ai" });
    * ```
    *
    * A bridge on a leg that already has one re-points it in place. `wsUri` may
@@ -1373,6 +1382,9 @@ export class Call {
     }
     if (options?.sampleRate !== undefined) {
       args.sample_rate = options.sampleRate;
+    }
+    if (options?.profile !== undefined) {
+      args.profile = options.profile;
     }
     await this.sip(SipVerb.StreamStart, args);
   }

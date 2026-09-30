@@ -2661,3 +2661,77 @@ fn an_aor_originate_with_no_dispatcher_registers_no_channel() {
         "got {result:?}"
     );
 }
+
+fn bad_request_message(result: &ControlResult) -> String {
+    match result {
+        ControlResult::Error {
+            code: ControlErrorCode::BadRequest,
+            message,
+            ..
+        } => message.clone(),
+        other => panic!("expected bad_request, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn stream_start_tee_refuses_a_profile() {
+    // A tee is shaped by direction/channels/sample_rate; a profile would be
+    // dropped on the floor and the controller would believe it applied.
+    let result = stream_start(
+        &channel(),
+        &serde_json::json!({ "ws_uri": "ws://ai:9000", "profile": "voice_ai" }),
+    )
+    .await;
+    assert!(bad_request_message(&result).contains("mode=bridge only"));
+}
+
+#[tokio::test]
+async fn stream_start_bridge_refuses_a_profile_that_is_not_a_string() {
+    let result = stream_start(
+        &channel(),
+        &serde_json::json!({ "ws_uri": "ws://ai:9000", "mode": "bridge", "profile": 16000 }),
+    )
+    .await;
+    assert!(bad_request_message(&result).contains("must be a string"));
+}
+
+#[tokio::test]
+async fn stream_start_bridge_refuses_an_unknown_profile_before_touching_the_call() {
+    // Refused before the media target is resolved: an unknown name must not
+    // attach a bridge with default settings the controller did not ask for.
+    let result = stream_start(
+        &channel(),
+        &serde_json::json!({ "ws_uri": "ws://ai:9000", "mode": "bridge", "profile": "no_such_profile" }),
+    )
+    .await;
+    match result {
+        ControlResult::Error {
+            code: ControlErrorCode::BadRequest,
+            details,
+            ..
+        } => {
+            let details = details.expect("typed details");
+            assert_eq!(details["reason"], "unknown_profile");
+            assert_eq!(details["profile"], "no_such_profile");
+        }
+        other => panic!("expected bad_request, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn stream_start_bridge_with_a_null_profile_is_no_profile() {
+    // `null` is "not given", as for the tee-only arguments: the verb goes on to
+    // look for the call's media and answers not_found in a unit test with none.
+    let result = stream_start(
+        &channel(),
+        &serde_json::json!({ "ws_uri": "ws://ai:9000", "mode": "bridge", "profile": null }),
+    )
+    .await;
+    assert!(matches!(
+        result,
+        ControlResult::Error {
+            code: ControlErrorCode::NotFound,
+            ..
+        }
+    ));
+}

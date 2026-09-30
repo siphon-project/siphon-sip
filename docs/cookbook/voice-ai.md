@@ -172,6 +172,28 @@ is coming from somewhere else.
     `start` envelope. That is the only signal that says your server is in the
     path.
 
+## Greeting first, then the assistant
+
+The profile above applies when the bot is named at the answer. A bot attached
+later, after a greeting or a menu, goes through `stream_start {mode: "bridge"}`
+on the control plane or `rtpengine.attach_ws_bridge` in a script, and gets the
+profile's bridge settings only when it is named again:
+
+```python
+await rtpengine.attach_ws_bridge(call, "wss://ai.internal/agent/{call_id}",
+                                 profile="voice_ai")
+```
+
+```json
+{"verb": "stream_start", "args": {"ws_uri": "wss://ai.internal/agent/{call_id}",
+                                  "mode": "bridge", "profile": "voice_ai"}}
+```
+
+Without `profile` the bridge runs at the leg's own rate (8 kHz on G.711) with
+noise suppression, echo cancellation, VAD and barge-in off: a bot that talks
+over its caller. The attach answers `ok` either way. Needs a siphon-rtp engine
+with runtime-attach profiles (0.11 or later); an older engine ignores the field.
+
 ## Requirements
 
 The bridge needs `siphon-rtp` **0.1.5 or later** on both sides: siphon's pinned

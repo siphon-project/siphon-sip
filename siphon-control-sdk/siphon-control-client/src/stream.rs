@@ -115,7 +115,7 @@ impl StreamChannels {
 /// `direction`, `channels` and `sample_rate` shape a **tee**. A bridge
 /// negotiates its own wire shape with the server, which refuses any of them
 /// alongside `mode: bridge` with `bad_request` rather than silently dropping
-/// it.
+/// it. `profile` is the bridge's counterpart, refused on a tee the same way.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StreamOptions {
     /// Tee (the default) or bridge.
@@ -128,6 +128,12 @@ pub struct StreamOptions {
     /// A tee's L16 sample rate in Hz: a multiple of 1000 within 8000–48000
     /// (the engine's default when unset). The server refuses anything else.
     pub sample_rate: Option<u32>,
+    /// A bridge's media profile: the name of a profile on the server whose
+    /// bridge settings (wire rate, noise suppression, echo cancellation, VAD,
+    /// barge-in) the bridge runs with, as an `answer` with `ws_uri` would.
+    /// Unset, the bridge runs at the leg's own rate with uplink processing
+    /// off. An unknown name is `bad_request`.
+    pub profile: Option<String>,
 }
 
 impl StreamOptions {
@@ -161,6 +167,12 @@ impl StreamOptions {
         self.sample_rate = Some(hertz);
         self
     }
+
+    /// Run the bridge with this media profile's bridge settings.
+    pub fn profile(mut self, name: impl Into<String>) -> Self {
+        self.profile = Some(name.into());
+        self
+    }
 }
 
 /// The `stream_start` args. The untyped [`Call::stream_start`] and the typed
@@ -172,6 +184,7 @@ fn stream_start_args(
     direction: Option<&str>,
     channels: Option<u8>,
     sample_rate: Option<u32>,
+    profile: Option<&str>,
 ) -> serde_json::Value {
     let mut args = serde_json::Map::new();
     args.insert("ws_uri".to_string(), json!(ws_uri));
@@ -184,6 +197,9 @@ fn stream_start_args(
     }
     if let Some(sample_rate) = sample_rate {
         args.insert("sample_rate".to_string(), json!(sample_rate));
+    }
+    if let Some(profile) = profile {
+        args.insert("profile".to_string(), json!(profile));
     }
     serde_json::Value::Object(args)
 }
@@ -213,7 +229,7 @@ impl Call {
         direction: Option<&str>,
         channels: Option<u8>,
     ) -> Result<(), ControlError> {
-        let args = stream_start_args(ws_uri, StreamMode::Tee, direction, channels, None);
+        let args = stream_start_args(ws_uri, StreamMode::Tee, direction, channels, None, None);
         self.sip(SipVerb::StreamStart, args).await.map(drop)
     }
 
@@ -232,9 +248,13 @@ impl Call {
     ///         .sample_rate(16_000),
     /// )
     /// .await?;
-    /// // Hand the leg to a voice agent; the agent is now the far side.
-    /// call.stream_start_with("wss://ai.example/agent", StreamOptions::bridge())
-    ///     .await?;
+    /// // Hand the leg to a voice agent; the agent is now the far side, with
+    /// // the server's `voice_ai` profile's rate, echo cancellation and barge-in.
+    /// call.stream_start_with(
+    ///     "wss://ai.example/agent",
+    ///     StreamOptions::bridge().profile("voice_ai"),
+    /// )
+    /// .await?;
     /// # Ok(())
     /// # }
     /// ```
@@ -256,6 +276,7 @@ impl Call {
             options.direction.map(StreamDirection::as_str),
             options.channels.map(StreamChannels::count),
             options.sample_rate,
+            options.profile.as_deref(),
         );
         self.sip(SipVerb::StreamStart, args).await.map(drop)
     }

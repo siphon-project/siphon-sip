@@ -1884,25 +1884,56 @@ impl PyRtpEngine {
     /// await rtpengine.attach_ws_bridge(call, "wss://ai.internal/session-2")
     /// ```
     ///
+    /// Pass ``profile=`` to give the bridge a media profile's bridge settings:
+    /// ``ws_sample_rate``, ``noise_suppression``, ``echo_cancellation``,
+    /// ``ws_vad`` and ``ws_barge_in``, read as an answer with ``ws_uri`` reads
+    /// them. Without it the engine runs the bridge at the leg's own rate with
+    /// uplink processing off (a re-point keeps what the bridge had), so a bot
+    /// attached after a greeting gets no barge-in and 8 kHz on a G.711 leg.
+    ///
+    /// ```python,ignore
+    /// await rtpengine.attach_ws_bridge(call, "wss://ai.internal/agent",
+    ///                                  profile="voice_ai")
+    /// ```
+    ///
     /// Args:
     ///     target: Request, Reply or Call identifying the media session, a
     ///         ``(call_id, from_tag)`` pair, or a bare ``call_id``.
     ///     ws_uri: ``ws://`` or ``wss://`` URI the engine dials as a client,
     ///         templated as for :meth:`attach_ws_tee`.
-    #[pyo3(signature = (target, ws_uri))]
+    ///     profile: name of a media profile (built-in or ``media.profiles``).
+    ///         Raises ``ValueError`` for an unknown name.
+    #[pyo3(signature = (target, ws_uri, profile=None))]
     fn attach_ws_bridge<'py>(
         &self,
         python: Python<'py>,
         target: &Bound<'py, PyAny>,
         ws_uri: String,
+        profile: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let (call_id, from_tag, ws_uri) = stream_target(target, &ws_uri)?;
+        // The answer half, as for `answer` with a `ws_uri`, and resolved before
+        // anything is sent so an unknown name changes nothing on the call.
+        let flags = match profile.as_deref() {
+            None => None,
+            Some(name) => Some(
+                self.registry
+                    .get(name)
+                    .map(|entry| entry.answer.clone())
+                    .ok_or_else(|| {
+                        pyo3::exceptions::PyValueError::new_err(format!(
+                            "unknown RTP profile '{name}'; valid profiles: {}",
+                            self.registry.profile_names().join(", ")
+                        ))
+                    })?,
+            ),
+        };
         let client = Arc::clone(&self.client);
         let sessions = Arc::clone(&self.sessions);
 
         pyo3_async_runtimes::tokio::future_into_py(python, async move {
             client
-                .attach_ws_bridge(&call_id, &from_tag, &ws_uri)
+                .attach_ws_bridge(&call_id, &from_tag, &ws_uri, flags.as_ref())
                 .await
                 .map_err(|error| {
                     pyo3::exceptions::PyRuntimeError::new_err(format!(
@@ -3591,6 +3622,112 @@ mod tests {
             assert_eq!(refusals, vec![true; 5]);
             assert!(
                 engine.all_commands().is_empty(),
+                "nothing may reach the engine"
+            );
+        }
+
+        /// `await engine.attach_ws_bridge(target, ws_uri, **kwargs)` from inside
+        /// a coroutine, as a script calls it.
+        fn await_attach_ws_bridge(
+            python: Python<'_>,
+            engine: &Bound<'_, PyRtpEngine>,
+            kwargs: &Bound<'_, PyDict>,
+        ) -> PyResult<Py<PyAny>> {
+            let code = CString::new(
+                "async def run(engine, kwargs):\n\
+                 \x20\x20\x20\x20return await engine.attach_ws_bridge(\
+                 ('call-9', 'tag-a'), 'wss://ai.invalid/agent', **kwargs)\n",
+            )
+            .unwrap();
+            let globals = PyDict::new(python);
+            python.run(code.as_c_str(), Some(&globals), None)?;
+            let run = globals.get_item("run")?.unwrap();
+            let coroutine = run.call1((engine, kwargs))?;
+            crate::script::engine::run_coroutine_value(python, &coroutine)
+        }
+
+        async fn bridge_namespace() -> (PyRtpEngine, mpsc::UnboundedReceiver<serde_json::Value>) {
+            let (address, requests) = spawn_siphon_rtp_engine().await;
+            let (event_sender, _events) = mpsc::channel(16);
+            let set = crate::rtpengine::SiphonRtpClientSet::new(
+                vec![(address, 2_000, 1)],
+                None,
+                5_000,
+                event_sender,
+            )
+            .unwrap();
+            let engine = PyRtpEngine::new(
+                Arc::new(MediaBackend::SiphonRtp(set)),
+                Arc::new(MediaSessionStore::new()),
+                Arc::new(ProfileRegistry::new()),
+            );
+            (engine, requests)
+        }
+
+        async fn next_command(
+            requests: &mut mpsc::UnboundedReceiver<serde_json::Value>,
+            name: &str,
+        ) -> serde_json::Value {
+            loop {
+                let body = requests.recv().await.unwrap();
+                if body["command"] == name {
+                    return body;
+                }
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn attach_ws_bridge_with_a_profile_sends_its_bridge_settings() {
+            Python::initialize();
+            let (engine, mut requests) = bridge_namespace().await;
+            with_engine(engine, |python, engine| {
+                let kwargs = PyDict::new(python);
+                kwargs.set_item("profile", "voice_ai").unwrap();
+                await_attach_ws_bridge(python, engine, &kwargs).unwrap();
+            })
+            .await;
+
+            let attach = next_command(&mut requests, "attach_ws_bridge").await;
+            assert_eq!(attach["call_id"], "call-9");
+            assert_eq!(attach["ws_uri"], "wss://ai.invalid/agent");
+            let profile = &attach["profile"];
+            assert_eq!(profile["noise_suppression"], true, "{attach}");
+            assert_eq!(profile["echo_cancellation"], true, "{attach}");
+            assert_eq!(profile["ws_vad"], true, "{attach}");
+            assert_eq!(profile["ws_barge_in"], true, "{attach}");
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn attach_ws_bridge_without_a_profile_sends_none() {
+            Python::initialize();
+            let (engine, mut requests) = bridge_namespace().await;
+            with_engine(engine, |python, engine| {
+                await_attach_ws_bridge(python, engine, &PyDict::new(python)).unwrap();
+            })
+            .await;
+
+            let attach = next_command(&mut requests, "attach_ws_bridge").await;
+            assert!(attach.get("profile").is_none(), "{attach}");
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn attach_ws_bridge_with_an_unknown_profile_raises_and_sends_nothing() {
+            Python::initialize();
+            let (engine, mut requests) = bridge_namespace().await;
+            let raised = with_engine(engine, |python, engine| {
+                let kwargs = PyDict::new(python);
+                kwargs.set_item("profile", "no_such_profile").unwrap();
+                let error = await_attach_ws_bridge(python, engine, &kwargs)
+                    .expect_err("an unknown profile must raise");
+                assert!(error.is_instance_of::<pyo3::exceptions::PyValueError>(python));
+                error.to_string()
+            })
+            .await;
+            assert!(raised.contains("no_such_profile"), "{raised}");
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(200), requests.recv())
+                    .await
+                    .is_err(),
                 "nothing may reach the engine"
             );
         }

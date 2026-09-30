@@ -595,6 +595,7 @@ describe("Call verbs map to the in-process-mirrored wire verbs", () => {
       sampleRate: 16000,
     });
     await call.streamStart("wss://ai.example/agent", { mode: "bridge" });
+    await call.streamStart("wss://ai.example/agent", { mode: "bridge", profile: "voice_ai" });
     await call.streamStop();
     await call.streamStop({ mode: "bridge" });
     expect(transport.calls).toEqual([
@@ -608,6 +609,12 @@ describe("Call verbs map to the in-process-mirrored wire verbs", () => {
         args: { ws_uri: "wss://ai.example/stream", mode: "tee", direction: "caller", channels: 1, sample_rate: 16000 },
       },
       { module: MODULE_SIP, verb: "stream_start", target: { channel: "ch1" }, args: { ws_uri: "wss://ai.example/agent", mode: "bridge" } },
+      {
+        module: MODULE_SIP,
+        verb: "stream_start",
+        target: { channel: "ch1" },
+        args: { ws_uri: "wss://ai.example/agent", mode: "bridge", profile: "voice_ai" },
+      },
       { module: MODULE_SIP, verb: "stream_stop", target: { channel: "ch1" }, args: { mode: "tee" } },
       { module: MODULE_SIP, verb: "stream_stop", target: { channel: "ch1" }, args: { mode: "bridge" } },
     ]);

@@ -643,6 +643,12 @@ impl Call {
     /// multiple of 1000 within 8000-48000. A bad ``mode`` / ``direction`` /
     /// ``channels`` raises ``ValueError`` before anything is sent.
     ///
+    /// ``profile`` shapes a **bridge** only (refused on a tee): the name of a
+    /// media profile on the server whose bridge settings (wire rate, noise
+    /// suppression, echo cancellation, VAD, barge-in) the bridge runs with, as
+    /// an ``answer`` with ``ws_uri`` would. Without it the bridge runs at the
+    /// leg's own rate with uplink processing off.
+    ///
     /// ``ws_uri`` may use ``{call_id}`` / ``{from_tag}`` / ``{from_user}`` /
     /// ``{to_user}``, which siphon expands before the engine sees it:
     /// ``{call_id}`` expands to the call's SIP Call-ID (``call.sip_call_id``),
@@ -653,8 +659,10 @@ impl Call {
     ///
     ///     await call.stream_start("wss://ai.example/stream/{call_id}",
     ///                             direction="caller", sample_rate=16000)
-    ///     await call.stream_start("wss://ai.example/agent", mode="bridge")
-    #[pyo3(signature = (ws_uri, direction=None, channels=None, *, mode="tee", sample_rate=None))]
+    ///     await call.stream_start("wss://ai.example/agent", mode="bridge",
+    ///                             profile="voice_ai")
+    #[pyo3(signature = (ws_uri, direction=None, channels=None, *, mode="tee", sample_rate=None, profile=None))]
+    #[allow(clippy::too_many_arguments)]
     fn stream_start<'py>(
         &self,
         py: Python<'py>,
@@ -663,12 +671,14 @@ impl Call {
         channels: Option<u8>,
         mode: &str,
         sample_rate: Option<u32>,
+        profile: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let options = StreamOptions {
             mode: extract_stream_mode(mode)?,
             direction: extract_stream_direction(direction)?,
             channels: extract_stream_channels(channels)?,
             sample_rate,
+            profile,
         };
         let call = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {

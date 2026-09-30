@@ -2590,6 +2590,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stream_start_with_a_bridge_profile_sends_it() {
+        let recorder = recorder(json!({ "channel": "ch1", "state": "bridged" }));
+        let transport: Arc<dyn CommandTransport> = recorder.clone();
+        let call = make_call(transport);
+        call.stream_start_with(
+            "wss://ai.example/agent",
+            StreamOptions::bridge().profile("voice_ai"),
+        )
+        .await
+        .expect("stream_start");
+        assert_eq!(
+            lock(&recorder.calls)[0].args,
+            json!({ "ws_uri": "wss://ai.example/agent", "mode": "bridge", "profile": "voice_ai" })
+        );
+    }
+
+    #[tokio::test]
     async fn an_unshaped_stream_start_still_names_the_tee() {
         // A tee and a bridge are opposites, not two shapes of one stream, so
         // the mode goes out even when the caller asked for nothing: a server

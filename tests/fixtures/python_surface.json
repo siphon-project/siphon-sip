@@ -2140,7 +2140,7 @@
       "attach_ws_bridge": {
         "doc": "Attach a **WebSocket takeover bridge** to a live call, or re-point an",
         "kind": "method_descriptor",
-        "sig": "($self, target, ws_uri)"
+        "sig": "($self, target, ws_uri, profile=None)"
       },
       "attach_ws_tee": {
         "doc": "Attach a **WebSocket tee** to a live call \u2014 stream a copy of its decoded",

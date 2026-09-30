@@ -300,7 +300,7 @@ what lets a refused verb be lined up against a capture, a CDR and HEP.
 | `stop` | sip | — | stop the announcement currently playing |
 | `dtmf` | sip | `{digits, duration_ms?, volume_dbm0?, pause_ms?, to_tag?}` | inject DTMF digits toward the A-leg |
 | `hold` / `unhold` | sip | — | media hold via silence |
-| `stream_start` | sip | `{ws_uri, mode?, direction?, channels?, sample_rate?}` | attach a WebSocket audio tee (`mode: tee`, the default) or takeover bridge (`mode: bridge`) (siphon-rtp backend only) |
+| `stream_start` | sip | `{ws_uri, mode?, direction?, channels?, sample_rate?, profile?}` | attach a WebSocket audio tee (`mode: tee`, the default) or takeover bridge (`mode: bridge`) (siphon-rtp backend only) |
 | `stream_stop` | sip | `{mode?}` | detach the WebSocket audio tee (`mode: tee`, the default) or bridge |
 | `set_var` / `get_var` | — | `{key, value?}` | per-call variables (drain with the call) |
 | `resync` | — | — | re-attach + enumerate this app's owned calls |
@@ -387,7 +387,14 @@ same way every other verb does — never a hang:
   `sample_rate` is the L16 rate in Hz (a multiple of 1000 within 8000–48000).
   `mode: bridge` is the opposite operation, a takeover that makes the
   WebSocket server the leg's far side; it takes none of the tee's shaping
-  arguments and refuses them with `bad_request`. An absent `mode` means `tee`,
+  arguments and refuses them with `bad_request`. A bridge takes `profile`
+  instead (refused on a tee): the name of a media profile whose bridge
+  settings (`ws_sample_rate`, `noise_suppression`, `echo_cancellation`,
+  `ws_vad`, `ws_barge_in`) the bridge runs with, read as `answer` with
+  `ws_uri` reads them. Without it the engine runs the bridge at the leg's own
+  rate with uplink processing off, and a re-point keeps what the bridge had;
+  neither shows in the `ok` reply. An unknown name is `bad_request` with
+  `reason: unknown_profile`, and nothing reaches the call. An absent `mode` means `tee`,
   but the SDKs always send it, so a controller that asked for a tee never gets
   a takeover from a server whose default differs.
 - **WebSocket URI placeholders.** A `ws_uri` may name `{call_id}`,
