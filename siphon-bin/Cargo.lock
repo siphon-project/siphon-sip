@@ -2956,16 +2956,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "serde_bytes"
-version = "0.11.19"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a5d440709e79d88e51ac01c4b72fc6cb7314017bb7da9eeff678aa94c10e3ea8"
-dependencies = [
- "serde",
- "serde_core",
-]
-
-[[package]]
 name = "serde_core"
 version = "1.0.228"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3184,12 +3174,11 @@ dependencies = [
 
 [[package]]
 name = "siphon-rtp-proto"
-version = "0.8.0"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "20e8dc62dc715812c712a65be41e434d3c7f35ffebb6ffb342f10952073272ab"
+checksum = "543be7c0286b47d175c80c116e491a48cc98eb89c6deb1271d1d8c7835d0eea4"
 dependencies = [
  "serde",
- "serde_bytes",
  "serde_json",
  "thiserror 2.0.20",
 ]
@@ -3222,8 +3211,8 @@ dependencies = [
 
 [[package]]
 name = "siphon-sip"
-version = "1.10.0"
-source = "git+https://github.com/siphon-project/siphon-sip?branch=main#36fd186d6828d45572d4e1797fe78379d8724ca1"
+version = "1.12.0"
+source = "git+https://github.com/siphon-project/siphon-sip?branch=main#c8acaac5ee6c76593d7a75dfb2a448832cc64496"
 dependencies = [
  "aes",
  "arc-swap",
