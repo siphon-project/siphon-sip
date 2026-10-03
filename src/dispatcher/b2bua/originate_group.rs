@@ -1090,6 +1090,11 @@ fn leg_params(template: &OriginateParams, target: &DialTarget) -> OriginateParam
     } else if params.to.is_empty() {
         params.to = target.uri.clone();
     }
+    // A called party the target names outranks both: a divert reaches a
+    // different number from the one the AoR or the group names.
+    if let Some(to) = &target.to {
+        params.to = to.clone();
+    }
     if target.next_hop.is_some() {
         params.next_hop = target.next_hop.clone();
     }
@@ -1846,6 +1851,21 @@ mod tests {
             params.headers,
             vec![("x-queue".to_string(), "support".to_string())],
             "the target's header replaces the group's of the same name"
+        );
+    }
+
+    #[test]
+    fn a_targets_to_is_its_legs_called_party_over_the_aor_and_the_group() {
+        let template = group(OriginateGroupStrategy::Parallel, 0).params;
+        let target = DialTarget {
+            uri: "sip:201@198.51.100.7:5070".to_string(),
+            aor: Some("sip:201@siphon.example.com".to_string()),
+            to: Some("sip:15550100199@trunk.example.com".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            leg_params(&template, &target).to,
+            "sip:15550100199@trunk.example.com"
         );
     }
 }

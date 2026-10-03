@@ -46,6 +46,8 @@ pub enum DialTarget {
         headers: Vec<(String, String)>,
         /// Calling identity for this branch alone, over the dial's.
         identity: TargetIdentity,
+        /// Called party: the B-leg's `To` URI. See [`DialTarget::to`].
+        to: Option<String>,
     },
     /// An address of record, forked to every contact registered against it.
     ///
@@ -62,6 +64,9 @@ pub enum DialTarget {
         /// Calling identity for every branch the AoR expands to, over the
         /// dial's.
         identity: TargetIdentity,
+        /// Called party for every branch the AoR expands to. See
+        /// [`DialTarget::to`].
+        to: Option<String>,
     },
 }
 
@@ -92,6 +97,7 @@ impl DialTarget {
             next_hop: None,
             headers: Vec::new(),
             identity: TargetIdentity::default(),
+            to: None,
         }
     }
 
@@ -106,6 +112,7 @@ impl DialTarget {
             next_hop: Some(next_hop.into()),
             headers: Vec::new(),
             identity: TargetIdentity::default(),
+            to: None,
         }
     }
 
@@ -116,6 +123,7 @@ impl DialTarget {
             aor: aor.into(),
             headers: Vec::new(),
             identity: TargetIdentity::default(),
+            to: None,
         }
     }
 
@@ -166,14 +174,33 @@ impl DialTarget {
         self
     }
 
+    /// Address this branch to `to` as its called party: the B-leg's `To` URI.
+    ///
+    /// The target's URI is the B-leg's Request-URI. Without this the B-leg's
+    /// `To` keeps the caller's user at the target's host, which is right for a
+    /// forward and wrong for a divert: the call goes to a new number while `To`
+    /// still names the one the caller dialled, and a next hop that routes on
+    /// `To` serves it as a call to the original number and can send it back.
+    /// The server keeps it as the leg's dialog `To`, so its later in-dialog
+    /// requests carry it too, which a `To` header override cannot do.
+    pub fn to(mut self, to: impl Into<String>) -> Self {
+        match &mut self {
+            Self::Uri { to: called, .. } | Self::Aor { to: called, .. } => {
+                *called = Some(to.into());
+            }
+        }
+        self
+    }
+
     pub(crate) fn to_json(&self) -> serde_json::Value {
         let mut object = serde_json::Map::new();
-        let (headers, identity) = match self {
+        let (headers, identity, to) = match self {
             Self::Uri {
                 uri,
                 next_hop,
                 headers,
                 identity,
+                to,
             } => {
                 // A bare URI with no overrides is a plain string on the wire —
                 // the shape the server's own examples use. An identity counts
@@ -182,6 +209,7 @@ impl DialTarget {
                 if next_hop.is_none()
                     && headers.is_empty()
                     && identity == &TargetIdentity::default()
+                    && to.is_none()
                 {
                     return json!(uri);
                 }
@@ -189,17 +217,21 @@ impl DialTarget {
                 if let Some(next_hop) = next_hop {
                     object.insert("next_hop".to_string(), json!(next_hop));
                 }
-                (headers, identity)
+                (headers, identity, to)
             }
             Self::Aor {
                 aor,
                 headers,
                 identity,
+                to,
             } => {
                 object.insert("aor".to_string(), json!(aor));
-                (headers, identity)
+                (headers, identity, to)
             }
         };
+        if let Some(to) = to {
+            object.insert("to".to_string(), json!(to));
+        }
         if !headers.is_empty() {
             object.insert("headers".to_string(), headers_to_json(headers));
         }
@@ -790,6 +822,24 @@ mod tests {
         assert_eq!(
             DialTarget::uri("sip:204@pbx.example").to_json(),
             json!("sip:204@pbx.example")
+        );
+    }
+
+    /// A called party defeats the bare-string shortcut too, on either target
+    /// form, or the divert would go out addressed to the original number.
+    #[test]
+    fn a_targets_called_party_goes_out_as_to() {
+        assert_eq!(
+            DialTarget::uri("sip:+15550199@trunk.example")
+                .to("sip:+15550199@trunk.example")
+                .to_json(),
+            json!({"uri": "sip:+15550199@trunk.example", "to": "sip:+15550199@trunk.example"})
+        );
+        assert_eq!(
+            DialTarget::aor("sip:204@pbx.example")
+                .to("sip:+15550199@pbx.example")
+                .to_json(),
+            json!({"aor": "sip:204@pbx.example", "to": "sip:+15550199@pbx.example"})
         );
     }
 

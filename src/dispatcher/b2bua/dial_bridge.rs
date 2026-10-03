@@ -404,6 +404,10 @@ pub fn dial_bridge_spec(
         return Err(DialError::NoTargets);
     }
     resolve_bridge_leg_identities(&caller.template, &plan.shaping, &mut plan.targets)?;
+    // A called party siphon cannot put on the wire refuses the dial before any
+    // phone rings, as it does on a connecting dial; each leg then carries its
+    // target's `to` as its `To` (see `leg_params`).
+    super::dial_target::branch_called_parties(&plan.targets).map_err(DialError::InvalidIdentity)?;
     // An identity named as an argument is carried as one: a copy in the
     // headers as well would put two on the wire.
     if plan.shaping.p_asserted_identity.is_some() {
@@ -460,7 +464,7 @@ pub(crate) fn resolve_bridge_leg_identities(
     for target in targets.iter_mut() {
         let leg = target.shaping_over(shaping);
         let shaped =
-            super::control::shape_from(template, &leg).map_err(DialError::InvalidIdentity)?;
+            super::dial_target::shape_from(template, &leg).map_err(DialError::InvalidIdentity)?;
         let from = match shaped {
             Some(shaped) => shaped.header,
             None => template
