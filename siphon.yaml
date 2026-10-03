@@ -1472,8 +1472,10 @@ auth:
 #                                     # nobody asked it to answer — the same policy
 #                                     # the scripting API uses for scanner traffic.
 #                                     # Every OTHER unhandled method still gets
-#                                     # 405 Method Not Allowed + Allow; the knob does
-#                                     # not silence those.
+#                                     # 405 Method Not Allowed + Allow, or 481 when
+#                                     # it names a dialog siphon does not have (a
+#                                     # To-tag, RFC 3261 §12.2.2); the knob does not
+#                                     # silence those.
 
 # ---------------------------------------------------------------------------
 # Prometheus metrics

@@ -192,6 +192,8 @@ mod session_timer_tests;
 #[cfg(test)]
 mod shutdown_teardown_tests;
 #[cfg(test)]
+mod stale_in_dialog_request_tests;
+#[cfg(test)]
 mod subscribe_reply_order_tests;
 #[cfg(test)]
 mod teardown_race_tests;
