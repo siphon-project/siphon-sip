@@ -123,6 +123,11 @@ pub fn b2bua_send_b_leg_invite(
     // (`call.set_from_host()` / a dial-level `from`): a controller `dial`
     // target that names its own `from`, whose host belongs to that carrier.
     branch_from_host: Option<&str>,
+    // The whole `To` this branch alone is addressed to (`<uri>`, no tag): a
+    // controller `dial` target that names its own called party. Replaces the
+    // caller's `To` outright, so neither the authority rewrite, a pinned To
+    // host nor a retarget number touches it.
+    branch_to: Option<&str>,
     extra_headers: &[(String, String)],
     state: &DispatcherState,
 ) -> bool {
@@ -414,7 +419,15 @@ pub fn b2bua_send_b_leg_invite(
     // Strip any To-tag (B-leg INVITE should not have one) and rewrite the To URI
     // host to match the dial target (topology hiding — A-leg advertised address
     // must not leak to B-leg).
-    if let Some(to) = b_leg_invite
+    //
+    // A branch naming its own called party replaces the To outright. A divert
+    // reaches a different number from the one the caller dialled; keeping the
+    // caller's user would address the B-leg to the original number, and a next
+    // hop routing on To would serve it as such and could send it back.
+    if let Some(to) = branch_to {
+        b_leg_invite.headers.remove("t");
+        b_leg_invite.headers.set("To", to.to_string());
+    } else if let Some(to) = b_leg_invite
         .headers
         .get("To")
         .or_else(|| b_leg_invite.headers.get("t"))

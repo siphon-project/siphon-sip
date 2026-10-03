@@ -188,6 +188,7 @@ async fn a_verified_callers_sec_agree_is_removed_from_the_b_leg() {
         None,
         None,
         None,
+        None,
         &[],
         &dispatcher.state,
     );
