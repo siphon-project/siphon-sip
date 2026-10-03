@@ -445,6 +445,14 @@ export type DialTarget =
       nextHop?: string;
       /** Headers injected on this branch's INVITE, over the command's. */
       headers?: Record<string, string>;
+      /**
+       * Called party: the B-leg's `To` URI. Without it `To` keeps the caller's
+       * user at the target's host, right for a forward and wrong for a divert,
+       * where a next hop routing on `To` would serve the call as one to the
+       * original number. Kept as the leg's dialog `To`, so later in-dialog
+       * requests carry it too, which a `To` header override cannot do.
+       */
+      to?: string;
     }
   | {
       /**
@@ -455,6 +463,8 @@ export type DialTarget =
       aor: string;
       /** Headers injected on every branch the AoR expands to. */
       headers?: Record<string, string>;
+      /** Called party for every branch the AoR expands to (see the URI form). */
+      to?: string;
     };
 
 /**
@@ -601,6 +611,10 @@ function dialTargetToWire(target: DialTarget): unknown {
   const aor = (target as { aor?: unknown }).aor;
   const nextHop = (target as { nextHop?: unknown }).nextHop;
   const headers = (target as { headers?: Record<string, string> }).headers;
+  const to = (target as { to?: unknown }).to;
+  if (to !== undefined && typeof to !== "string") {
+    throw new TypeError('a dial target\'s "to" is a SIP URI string');
+  }
   if (typeof uri === "string" && typeof aor === "string") {
     throw new TypeError(
       'a dial target names "uri" or "aor", never both — siphon reads the aor ' +
@@ -616,16 +630,18 @@ function dialTargetToWire(target: DialTarget): unknown {
     }
     const object: Record<string, unknown> = { aor };
     if (headers !== undefined) object.headers = headers;
+    if (to !== undefined) object.to = to;
     return object;
   }
   if (typeof uri !== "string") {
     throw new TypeError('a dial target requires a string "uri" or "aor"');
   }
   // A bare URI with no overrides is a plain string on the wire.
-  if (nextHop === undefined && headers === undefined) return uri;
+  if (nextHop === undefined && headers === undefined && to === undefined) return uri;
   const object: Record<string, unknown> = { uri };
   if (nextHop !== undefined) object.next_hop = nextHop;
   if (headers !== undefined) object.headers = headers;
+  if (to !== undefined) object.to = to;
   return object;
 }
 
