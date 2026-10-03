@@ -9,7 +9,10 @@ Usage: probe.py [on|off|wait]  (on/off match server.auto_options in the
     off  OPTIONS -> nothing at all, and no synthesized 100 Trying either
 
 Both modes assert an unhandled MESSAGE and INVITE still get 405 + Allow
-(RFC 3261 s8.2.1) -- the knob is scoped to OPTIONS and must not silence those.
+(RFC 3261 s8.2.1) -- the knob is scoped to OPTIONS and must not silence those --
+and that a BYE naming a dialog siphon does not have (it carries a To-tag) gets
+481, not 405 (RFC 3261 s12.2.2): siphon implements BYE, the dialog is what is
+missing. A method siphon does not implement is 405 in a dialog too.
 
 Exits non-zero with a description of every assertion that failed.
 """
@@ -22,13 +25,17 @@ SOURCE_PORT = 15099
 failures = []
 
 
-def send(method, branch, timeout=6):
-    """Send one request; return the response text, or None on timeout."""
+def send(method, branch, timeout=6, to_tag=None):
+    """Send one request; return the response text, or None on timeout.
+
+    A `to_tag` makes it an in-dialog request (RFC 3261 s12).
+    """
+    to_params = f";tag={to_tag}" if to_tag else ""
     raw = (
         f"{method} sip:probe@{HOST} SIP/2.0\r\n"
         f"Via: SIP/2.0/UDP {HOST}:{SOURCE_PORT};branch={branch}\r\n"
         f"From: <sip:probe@peer.invalid>;tag=probe\r\n"
-        f"To: <sip:probe@{HOST}>\r\n"
+        f"To: <sip:probe@{HOST}>{to_params}\r\n"
         f"Call-ID: nohandler-{branch}\r\n"
         f"CSeq: 1 {method}\r\n"
         f"Max-Forwards: 70\r\n"
@@ -117,6 +124,8 @@ else:
 
 expect("MESSAGE", send("MESSAGE", "z9hG4bK-msg"), 405, ("Allow",))
 expect("INVITE", send("INVITE", "z9hG4bK-inv"), 405, ("Allow",))
+expect("in-dialog BYE", send("BYE", "z9hG4bK-bye", to_tag="gone"), 481)
+expect("in-dialog FOO", send("FOO", "z9hG4bK-foo", to_tag="gone"), 405, ("Allow",))
 
 if failures:
     print(f"\nFAIL ({mode}):")
