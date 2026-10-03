@@ -306,6 +306,17 @@ pub(super) fn augment_options_response(
 /// `405 Method Not Allowed` with `Allow` (RFC 3261 §8.2.1), which is both true
 /// and actionable where the previous `500` was neither.
 ///
+/// Except an in-dialog request (it carries a To-tag) for a method siphon
+/// implements, which is answered `481 Call/Transaction Does Not Exist` (RFC 3261
+/// §12.2.2). It got here because no dialog claimed it: a B2BUA call that has
+/// ended and aged out of the torn-down set (a peer's BYE 32 s after its own
+/// CANCEL), or one this process never had. A 405 there denies a method the
+/// response's own `Allow` lists and sends whoever is debugging after a missing
+/// handler instead of a dialog that is gone. Method inspection still comes first
+/// (§8.2.1), so a method siphon does not implement is 405 in a dialog too.
+/// OPTIONS keeps its own answer, so `server.auto_options: false` still means
+/// silence.
+///
 /// `None` means send nothing at all, and only an OPTIONS can produce it: an
 /// operator who sets `server.auto_options: false` is saying siphon must not
 /// answer for a script that did not ask it to, and the honest form of that is
@@ -332,11 +343,29 @@ pub(super) fn build_no_handler_response(
         let mut response = build_response(request, 200, "OK", server_header, &[]);
         augment_options_response(&mut response, via_host, via_port, transport);
         Some(response)
+    } else if super::request::to_has_tag(request) && is_implemented_method(method) {
+        Some(build_response(
+            request,
+            481,
+            "Call/Transaction Does Not Exist",
+            server_header,
+            &[],
+        ))
     } else {
         let mut response = build_response(request, 405, "Method Not Allowed", server_header, &[]);
         advertise_supported_methods(&mut response.headers);
         Some(response)
     }
+}
+
+/// Is `method` one siphon implements, as its `Allow` advertises?
+///
+/// Compared case-sensitively: the method is a case-sensitive token (RFC 3261
+/// §7.1), so `Bye` is a method siphon does not implement.
+fn is_implemented_method(method: &str) -> bool {
+    crate::sip::SUPPORTED_METHODS
+        .split(',')
+        .any(|supported| supported.trim() == method)
 }
 
 /// The port siphon advertises to the A-leg (Contact) and anchors the A-leg

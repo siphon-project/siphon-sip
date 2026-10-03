@@ -719,6 +719,14 @@ pub(super) fn handle_request(
         };
         if method == "OPTIONS" {
             debug!(method = %method, "no script handler — answering OPTIONS locally (RFC 3261 §11.2)");
+        } else if response.status_code() == Some(481) {
+            // A late request on a dialog that is gone is the peer's doing, not a
+            // misconfigured script, so it does not warrant a WARN per request.
+            debug!(
+                method = %method,
+                call_id = %message.headers.call_id().map(String::as_str).unwrap_or(""),
+                "in-dialog request matches no dialog — answering 481 (RFC 3261 §12.2.2)"
+            );
         } else {
             warn!(method = %method, "no script handler registered — answering 405");
         }
