@@ -1014,6 +1014,25 @@ describe("dial args map to the target shapes the server parses", () => {
     });
   });
 
+  it("sends a target's called party as to, on either form", () => {
+    // A divert: without `to` the B-leg keeps the caller's To user and goes out
+    // addressed to the number originally dialled.
+    expect(
+      dialArgs([
+        { uri: "sip:+15550199@trunk.example", to: "sip:+15550199@trunk.example" },
+        { aor: "sip:204@pbx.example", to: "sip:+15550199@pbx.example" },
+      ]),
+    ).toEqual({
+      targets: [
+        { uri: "sip:+15550199@trunk.example", to: "sip:+15550199@trunk.example" },
+        { aor: "sip:204@pbx.example", to: "sip:+15550199@pbx.example" },
+      ],
+    });
+    expect(() =>
+      dialArgs([{ uri: "sip:+15550199@trunk.example", to: 7 } as never]),
+    ).toThrow(/to/);
+  });
+
   it("refuses a target that names both a uri and an aor, and one that names neither", () => {
     // The server reads `aor` first and ignores a `uri` beside it, so this would
     // place a different call than the one written down — silently.

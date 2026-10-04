@@ -515,6 +515,9 @@ fn release_per_source(map: &DashMap<IpAddr, u32>, source: IpAddr) {
 
 /// Take one global slot. A zero ceiling still counts — the total is what the
 /// active-connections gauge reports.
+// `fetch_update` is deprecated from Rust 1.99 for `try_update`, which the
+// MSRV (1.80) does not have. Same operation under either name.
+#[allow(deprecated)]
 fn take_global(counter: &AtomicU32, limit: u32) -> bool {
     if limit == 0 {
         counter.fetch_add(1, Ordering::Relaxed);
@@ -527,6 +530,8 @@ fn take_global(counter: &AtomicU32, limit: u32) -> bool {
         .is_ok()
 }
 
+// See `take_global` for why this is still `fetch_update`.
+#[allow(deprecated)]
 fn release_global(counter: &AtomicU32) {
     let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
         Some(current.saturating_sub(1))

@@ -2290,6 +2290,22 @@ fn dial_target_accepts_uri_with_next_hop_and_headers() {
     );
 }
 
+/// A target's `to` is carried to the dispatcher as the branch's called party;
+/// a target naming none leaves the default `To` in place.
+#[test]
+fn dial_target_carries_its_called_party() {
+    let parsed = parse_dial_target(&serde_json::json!({
+        "uri": "sip:+15550199@trunk.example",
+        "to": "sip:+15550199@trunk.example",
+    }))
+    .expect("the object form is a target");
+    assert_eq!(parsed[0].to.as_deref(), Some("sip:+15550199@trunk.example"));
+
+    let bare = parse_dial_target(&serde_json::json!({"uri": "sip:+15550199@trunk.example"}))
+        .expect("the object form is a target");
+    assert_eq!(bare[0].to, None);
+}
+
 /// An AoR with nobody registered is not a malformed request. It yields no
 /// branch, and `dial` answers `not_found` once every target has been tried
 /// — an app dialling a ring group must not be told its JSON is wrong
