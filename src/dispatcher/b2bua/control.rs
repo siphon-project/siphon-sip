@@ -1091,7 +1091,7 @@ fn dial_parallel(
         // differ costs a clone.
         let branch_template = branch_from.as_ref().map(|shaped| {
             let mut own = template.clone();
-            own.headers.set("From", shaped.header.clone());
+            crate::sip::privacy::present_calling_identity(&mut own, shaped.header.clone());
             own
         });
         // Its number also goes through the tag-preserving substitution a

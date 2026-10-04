@@ -50,6 +50,16 @@ entry, but a working config keeps working.
   does not implement is still `405`, in a dialog or not, and OPTIONS keeps its
   `server.auto_options` behaviour. Logged at debug rather than as a
   no-handler WARN.
+- **`Remote-Party-ID` follows the calling identity siphon presents.** The
+  default header policy copies the caller's `Remote-Party-ID` onto the B-leg,
+  and siphon's identity steps changed `From` and `P-Asserted-Identity` but not
+  it. A dial presenting its own `from` still asserted the caller's identity in
+  `Remote-Party-ID`, and a withheld call (`privacy: "restricted"`, an LCR
+  route's `caller_id_presentation`, `call.restrict_caller_id()`) still carried
+  the number it withheld. Now a number substitution (`caller_id`,
+  `call.set_caller_id()`) rewrites it with the others, a replaced identity
+  (dial or target `from`) drops it, and a restricted call removes it. One a
+  controller or script sets explicitly on the B-leg goes out as written.
 
 ## [1.12.0] — 2026-09-30
 

@@ -1400,6 +1400,12 @@ ACK.
 A `from` that is not a SIP URI, on the dial or on any target, is `bad_request`,
 refused before any phone rings.
 
+The caller's `Remote-Party-ID`, which the default header policy copies, follows
+the identity: a branch presenting a `from` of its own, or withheld with
+`privacy: "restricted"`, carries none, since the caller's would assert the
+identity the branch replaced or withheld. A `Remote-Party-ID` the controller
+names in a branch's `headers` goes out as written.
+
 ### Naming the called party
 
 `uri` is the B-leg's **Request-URI**. Its `To` is a separate header, and by

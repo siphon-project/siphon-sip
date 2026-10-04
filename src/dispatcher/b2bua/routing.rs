@@ -113,7 +113,7 @@ fn control_dial_shaping(
     }
     let mut shaped = original_request.clone();
     if let Some(from_header) = from_header {
-        shaped.headers.set("From", from_header);
+        crate::sip::privacy::present_calling_identity(&mut shaped, from_header);
     }
     if let Some(offer) = offer {
         shaped
@@ -490,7 +490,7 @@ pub fn b2bua_advance_route_with_numbers(
         // on this attempt alone, over the dial's.
         let presented = route.presented_from.as_ref().map(|from| {
             let mut own = original_request.clone();
-            own.headers.set("From", from.clone());
+            crate::sip::privacy::present_calling_identity(&mut own, from.clone());
             own
         });
         let sent = b2bua_send_b_leg_invite(
