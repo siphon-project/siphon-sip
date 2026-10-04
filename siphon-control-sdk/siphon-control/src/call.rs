@@ -769,6 +769,14 @@ impl Call {
     /// meant, and the wrong one places a call that connects to nothing while the
     /// trace looks healthy.
     ///
+    /// Either form may carry ``"to"``, the branch's called party: its ``To``
+    /// URI. The target's URI is the Request-URI, and without ``to`` the B-leg's
+    /// ``To`` keeps the caller's user at the target's host, which is right for a
+    /// forward and wrong for a divert: a next hop that routes on ``To`` serves
+    /// the call as one to the original number and can send it straight back.
+    /// siphon keeps it as the leg's dialog ``To``, so a ``headers`` override is
+    /// no substitute.
+    ///
     /// ``strategy`` is ``"parallel"`` or ``"sequential"`` and ``timeout`` is the
     /// ring timeout in seconds; each left out takes the server's own default
     /// (parallel, 30 s). ``headers`` is applied to every branch's INVITE.

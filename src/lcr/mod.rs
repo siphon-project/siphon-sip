@@ -309,6 +309,12 @@ pub struct Route {
     /// LCR API.
     #[serde(skip)]
     pub from_host: Option<String>,
+    /// The whole `To` this attempt is addressed to, when a controller `dial`
+    /// target named its own called party (`to`). Not part of the LCR API: a
+    /// route re-aims the number with `destination`, which keeps the caller's
+    /// `To` host.
+    #[serde(skip)]
+    pub presented_to: Option<String>,
 }
 
 impl Route {

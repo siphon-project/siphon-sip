@@ -293,7 +293,7 @@ what lets a refused verb be lined up against a capture, a CDR and HEP.
 | `bridge` | sip | `{with, on_peer_hangup?, profile?}` | join this channel to another the app owns; the reply says the media was negotiated, `ChannelBridged` says the audio meets. `profile` names one media profile for the pair — see [`bridge`](#joining-two-legs-bridge) |
 | `unbridge` | sip | `{reason?}` | break a bridge — both legs stay answered, owned and held |
 | `replace_peer` | sip | `{target, next_hop?, replace_a_leg?, profile?, timeout?}` | swap one party of this answered call for a freshly dialed target, no REFER involved; the replaced leg stays up while the target rings, `PeerReplaced` says the swap landed |
-| `dial` | sip | `{targets, strategy?, timeout?, headers?, profile?, from?, from_display?, p_asserted_identity?, privacy?, on_answer?, ringback?}` (identity fields also per target) | ring B-legs while the caller stays **unanswered** and the app keeps the channel; refused (`invalid_state`) on an answered call with `error.details: {verb: "dial", reason: "already_answered", call_state}` — see [`dial`](#dial--ring-while-the-caller-waits). With `on_answer: "bridge"`, ring phones for a caller the app already **answered** and anchored, play `ringback` while they alert, and bridge the one that picks up — see [`on_answer`](#dial-on_answer-bridge--ring-phones-for-an-answered-caller) |
+| `dial` | sip | `{targets, strategy?, timeout?, headers?, profile?, from?, from_display?, p_asserted_identity?, privacy?, on_answer?, ringback?}` (identity fields also per target, as is the called party `to?`) | ring B-legs while the caller stays **unanswered** and the app keeps the channel; refused (`invalid_state`) on an answered call with `error.details: {verb: "dial", reason: "already_answered", call_state}` — see [`dial`](#dial--ring-while-the-caller-waits). With `on_answer: "bridge"`, ring phones for a caller the app already **answered** and anchored, play `ringback` while they alert, and bridge the one that picks up — see [`on_answer`](#dial-on_answer-bridge--ring-phones-for-an-answered-caller) |
 | `route` | sip | `{targets, strategy?, headers?}` | return control to siphon: un-park the call and dial the B-leg via LCR sequential failover |
 | `set_header` / `remove_header` / `get_header` | sip | `{name, value?}` | on the stored A-leg INVITE |
 | `play` | sip | `{file\|db_id\|blob\|tone\|url, repeat?, start_ms?, duration_ms?, gain_decibels?, to_tag?}` | play an announcement on the A-leg media (fire-and-forget); the reply and a `PlayStarted` event carry the `play_id` |
@@ -1223,7 +1223,9 @@ was dialled for.
 
 A target is a URI string, `{uri, next_hop?, headers?}`, or `{aor}`, and either
 object form may also carry `from?`, `from_display?`, `p_asserted_identity?` and
-`privacy?` for that branch alone. An `aor`
+`privacy?` for that branch alone. Either form may also carry `to?`, the called
+party the branch is addressed to, on every contact an `aor` forks to (see
+[naming the called party](#naming-the-called-party)). An `aor`
 resolves against the registrar and forks to **every** registered contact, each
 over that contact's own captured flow and Path route set — which is the only way
 to reach a phone registered over TCP, TLS or WSS behind NAT, since such a
@@ -1397,6 +1399,44 @@ ACK.
 
 A `from` that is not a SIP URI, on the dial or on any target, is `bad_request`,
 refused before any phone rings.
+
+### Naming the called party
+
+`uri` is the B-leg's **Request-URI**. Its `To` is a separate header, and by
+default siphon builds it from the **caller's** `To`: the tag dropped and the
+host and port replaced with the target's, the **user part kept**. That is right
+for a forward, where the B-leg reaches the party the caller asked for, and wrong
+for a divert (call-forward, follow-me, overflow to a mobile), where the call goes
+to a different number. The R-URI then names the new party while `To` still names
+the number the caller dialled, so the two diverge:
+
+```
+INVITE sip:+15550199@trunk.example SIP/2.0     <- the divert target (uri)
+To: <sip:+15550100@trunk.example>              <- the number originally dialled
+```
+
+A next hop that routes on `To` rather than the R-URI serves that as a fresh call
+to the original number and can send it straight back. Each pass looks like a new
+call to it, so a `Diversion` counter never climbs and the loop detection it
+exists for never fires.
+
+A target's `to` sets the B-leg's `To` URI outright, as `<to>` with no tag (RFC
+3261 §8.1.1.2), on that branch alone: neither the host rewrite nor
+`call.set_to_host()` touches it. siphon records it as the leg's dialog `To`, so
+its own later requests on that dialog (BYE, re-INVITE, session refresh) are
+addressed the same way. A `headers: {"To": …}` override reaches only the INVITE
+and is not a substitute. It works on every strategy: each branch of a fork, each
+attempt of a sequential hunt, and each phone of an `on_answer: "bridge"` dial.
+
+```json
+{"verb": "dial", "args": {"targets": [
+  {"uri": "sip:+15550199@trunk.example",
+   "to":  "sip:+15550199@trunk.example",
+   "headers": {"Diversion": "<sip:+15550100@pbx.example>;reason=unavailable;counter=1"}}
+]}}
+```
+
+A `to` that is not a SIP URI is `bad_request`, refused before any phone rings.
 
 ### Anchoring the media
 
