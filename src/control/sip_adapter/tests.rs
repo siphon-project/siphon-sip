@@ -2306,6 +2306,61 @@ fn dial_target_carries_its_called_party() {
     assert_eq!(bare[0].to, None);
 }
 
+/// An `{aor}` target's identity fields reach every contact it forks to, as
+/// its headers and `to` do. They used to be dropped without a word on this
+/// form while the reference documented them on both.
+#[test]
+fn an_aor_targets_identity_reaches_every_contact() {
+    let registrar = crate::script::api::test_registrar();
+    for (instance, host) in [("a", "198.51.100.121"), ("b", "198.51.100.122")] {
+        registrar
+            .save(
+                "sip:3202@siphon.example.com",
+                crate::sip::uri::SipUri::new(host.to_string()),
+                3600,
+                1.0,
+                format!("register-3202-{instance}"),
+                1,
+            )
+            .expect("the binding saves");
+    }
+    let parsed = parse_dial_target(&serde_json::json!({
+        "aor": "sip:3202@siphon.example.com",
+        "from": "sip:+15550100@trunk.example",
+        "from_display": "Example Ltd",
+        "p_asserted_identity": "sip:+15550100@trunk.example",
+        "privacy": "restricted",
+        "headers": {"X-Queue": "sales"},
+    }))
+    .expect("the AoR form is a target");
+    assert_eq!(parsed.len(), 2, "one branch per registered contact");
+    for branch in &parsed {
+        assert_eq!(branch.from.as_deref(), Some("sip:+15550100@trunk.example"));
+        assert_eq!(branch.from_display.as_deref(), Some("Example Ltd"));
+        assert_eq!(
+            branch.p_asserted_identity.as_deref(),
+            Some("sip:+15550100@trunk.example")
+        );
+        assert_eq!(
+            branch.privacy,
+            Some(crate::sip::privacy::CallerIdPresentation::Restricted)
+        );
+        assert_eq!(
+            branch.headers.get("X-Queue").map(String::as_str),
+            Some("sales")
+        );
+        assert!(branch.aor.is_some(), "still named for the AoR it rang");
+    }
+
+    // A privacy siphon cannot honour is refused on this form too, rather
+    // than ignored with the rest of the identity.
+    let refused = parse_dial_target(&serde_json::json!({
+        "aor": "sip:3202@siphon.example.com",
+        "privacy": "maybe",
+    }));
+    assert!(refused.is_err(), "{refused:?}");
+}
+
 /// An AoR with nobody registered is not a malformed request. It yields no
 /// branch, and `dial` answers `not_found` once every target has been tried
 /// — an app dialling a ring group must not be told its JSON is wrong

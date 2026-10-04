@@ -33,6 +33,13 @@ entry, but a working config keeps working.
 
 ### Fixed
 
+- **An `{aor}` dial target's identity is no longer dropped.** `from`,
+  `from_display`, `p_asserted_identity` and `privacy` on an `{aor}` target
+  were ignored, though the reference documented them on both target forms
+  and the Rust control SDK sends them, so every contact the AoR forked to
+  presented the dial's identity (or the caller's) instead. They now reach each
+  contact, as `headers` already did, and an unrecognised `privacy` there is
+  `bad_request` instead of being ignored with the rest.
 - **A request for a dialog siphon does not have is answered `481`, not
   `405`.** An in-dialog request (it carries a To-tag) that no dialog and no
   `@proxy.on_request` handler claims now gets `481 Call/Transaction Does Not

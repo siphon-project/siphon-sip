@@ -284,24 +284,44 @@ pub(super) fn parse_dial_target(
         );
     };
 
-    if let Some(aor) = object.get("aor").and_then(|v| v.as_str()) {
-        let headers: std::collections::HashMap<String, String> = object
+    // What a target says about its own branch, the same on either form: an
+    // `{aor}` applies it to every contact it forks to. Read once, so the two
+    // forms cannot drift apart again: the AoR form used to read only
+    // `headers`, and its identity fields were dropped without a word.
+    let string_field = |name: &str| {
+        object
+            .get(name)
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    };
+    let shaped = crate::dispatcher::DialTarget {
+        headers: object
             .get("headers")
             .map(parse_json_headers)
             .unwrap_or_default()
             .into_iter()
-            .collect();
-        // The called party is the same on every contact the AoR forks to: a
-        // divert names the number the call is going to, not a phone.
-        let to = object
-            .get("to")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
+            .collect(),
+        from: string_field("from"),
+        from_display: string_field("from_display"),
+        p_asserted_identity: string_field("p_asserted_identity"),
+        privacy: super::originate::parse_privacy("dial target", object.get("privacy"))
+            .map_err(|error| error.to_string())?,
+        to: string_field("to"),
+        ..Default::default()
+    };
+
+    if let Some(aor) = object.get("aor").and_then(|v| v.as_str()) {
         return match crate::dispatcher::dial_targets_for_aor(aor) {
             Ok(mut branches) => {
                 for branch in &mut branches {
-                    branch.headers.extend(headers.clone());
-                    branch.to.clone_from(&to);
+                    branch.headers.extend(shaped.headers.clone());
+                    branch.from.clone_from(&shaped.from);
+                    branch.from_display.clone_from(&shaped.from_display);
+                    branch
+                        .p_asserted_identity
+                        .clone_from(&shaped.p_asserted_identity);
+                    branch.privacy = shaped.privacy;
+                    branch.to.clone_from(&shaped.to);
                 }
                 Ok(branches)
             }
@@ -316,40 +336,12 @@ pub(super) fn parse_dial_target(
     };
     Ok(vec![crate::dispatcher::DialTarget {
         uri: uri.to_string(),
-        next_hop: object
-            .get("next_hop")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string()),
-        flow: None,
-        route: Vec::new(),
-        headers: object
-            .get("headers")
-            .map(parse_json_headers)
-            .unwrap_or_default()
-            .into_iter()
-            .collect(),
-        from: object
-            .get("from")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string()),
-        from_display: object
-            .get("from_display")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string()),
-        p_asserted_identity: object
-            .get("p_asserted_identity")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string()),
-        privacy: super::originate::parse_privacy("dial target", object.get("privacy"))
-            .map_err(|error| error.to_string())?,
-        to: object
-            .get("to")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string()),
+        next_hop: string_field("next_hop"),
         // A URI dialled as written names no registered AoR, even one that
         // happens to be a registered contact: only an `{aor}` target says whom
         // the branch was dialled for.
         aor: None,
+        ..shaped
     }])
 }
 
