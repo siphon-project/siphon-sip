@@ -3391,6 +3391,88 @@ fn auto_options_off_does_not_suppress_the_405() {
     }
 }
 
+/// [`request_for`] carrying a To-tag: a request naming a dialog.
+fn in_dialog_request_for(method: &str) -> SipMessage {
+    let mut request = request_for(method);
+    request
+        .headers
+        .set("To", "<sip:probe@siphon.invalid>;tag=gone".to_string());
+    request
+}
+
+#[test]
+fn no_handler_in_dialog_request_for_an_implemented_method_is_481() {
+    // RFC 3261 §12.2.2: a request naming a dialog siphon does not have is
+    // 481. A 405 there denies a method its own Allow lists.
+    for method in [
+        "BYE", "INFO", "UPDATE", "PRACK", "NOTIFY", "REFER", "INVITE",
+    ] {
+        for auto_options in [true, false] {
+            let response = build_no_handler_response(
+                &in_dialog_request_for(method),
+                method,
+                auto_options,
+                None,
+                "sbc.example.org",
+                5060,
+                Transport::Udp,
+            )
+            .unwrap_or_else(|| panic!("{method}: a 481 is never dropped"));
+            assert_eq!(response.status_code(), Some(481), "{method}");
+            assert!(
+                !response.headers.has("Allow"),
+                "{method}: Allow belongs to a 405"
+            );
+        }
+    }
+}
+
+#[test]
+fn no_handler_in_dialog_request_for_an_unimplemented_method_is_405() {
+    // Method inspection comes before dialog matching (RFC 3261 §8.2.1), and
+    // the token is case-sensitive (§7.1): `Bye` is not BYE.
+    for method in ["FOO", "Bye"] {
+        let response = build_no_handler_response(
+            &in_dialog_request_for(method),
+            method,
+            true,
+            None,
+            "sbc.example.org",
+            5060,
+            Transport::Udp,
+        )
+        .expect("a 405 is never dropped");
+        assert_eq!(response.status_code(), Some(405), "{method}");
+    }
+}
+
+#[test]
+fn no_handler_in_dialog_options_keeps_its_own_answer() {
+    // OPTIONS is the auto-answered probe, and `auto_options: false` promises
+    // silence for it; a To-tag does not turn that into a 481.
+    let answered = build_no_handler_response(
+        &in_dialog_request_for("OPTIONS"),
+        "OPTIONS",
+        true,
+        None,
+        "sbc.example.org",
+        5060,
+        Transport::Udp,
+    )
+    .expect("auto_options on answers");
+    assert_eq!(answered.status_code(), Some(200));
+    assert!(build_no_handler_response(
+        &in_dialog_request_for("OPTIONS"),
+        "OPTIONS",
+        false,
+        None,
+        "sbc.example.org",
+        5060,
+        Transport::Udp,
+    )
+    .is_none());
+}
+
 #[test]
 fn b_leg_contact_default_is_userless() {
     // RFC 3261 §8.1.1.8 — no identity in the Contact userpart by default.

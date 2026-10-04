@@ -31,6 +31,19 @@ entry, but a working config keeps working.
   `DialTarget` variants, which breaks code that matches or builds them by
   field.
 
+### Fixed
+
+- **A request for a dialog siphon does not have is answered `481`, not
+  `405`.** An in-dialog request (it carries a To-tag) that no dialog and no
+  `@proxy.on_request` handler claims now gets `481 Call/Transaction Does Not
+  Exist` (RFC 3261 §12.2.2) when siphon implements the method. Before, a BYE
+  arriving 32 s or more after the call ended (for example after the peer's own
+  CANCEL) had aged out of the torn-down set that answers 481, and was told
+  `405 Method Not Allowed`, contradicting the `Allow` on the same response. A method siphon
+  does not implement is still `405`, in a dialog or not, and OPTIONS keeps its
+  `server.auto_options` behaviour. Logged at debug rather than as a
+  no-handler WARN.
+
 ## [1.12.0] — 2026-09-30
 
 ### Changed
