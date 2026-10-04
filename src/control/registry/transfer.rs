@@ -136,7 +136,7 @@ impl TransferStage {
 }
 
 /// The party that sent an inbound REFER, as `TransferRequested` reports it.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct TransferReferrer<'a> {
     /// The referrer's dialog tag.
     pub from_tag: Option<&'a str>,
@@ -144,6 +144,10 @@ pub struct TransferReferrer<'a> {
     pub from_a_leg: bool,
     /// The SIP Call-ID of the dialog the REFER arrived on.
     pub sip_call_id: &'a str,
+    /// The dialog an attended transfer's `Replaces` names, when this node hosts
+    /// it: its call, the channel controlling it, its leg and the channel it is
+    /// bridged with. `None` for a blind transfer or a dialog hosted elsewhere.
+    pub replaces_local: Option<serde_json::Value>,
 }
 
 /// One verdict on a siphon-originated (outbound) REFER, published on the control
@@ -256,6 +260,7 @@ impl ControlBus {
                 "from_tag": replaces.from_tag,
                 "to_tag": replaces.to_tag,
                 "early_only": replaces.early_only,
+                "local": referrer.replaces_local,
             })
         });
         let payload = serde_json::json!({

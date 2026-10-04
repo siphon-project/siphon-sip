@@ -108,7 +108,15 @@ pub fn control_handover(
 
     let sip_call_id = invite.headers.call_id().cloned().unwrap_or_default();
     let channel_id = format!("ch-{call_id}");
-    let stasis_payload = build_stasis_payload(invite, inbound, &vars);
+    let mut stasis_payload = build_stasis_payload(invite, inbound, &vars);
+    // An INVITE whose `Replaces` named a dialog this node hosts: nothing has
+    // acted on it (RFC 3891 §5 leaves that to whoever admits the request), so
+    // the application is told which call and channel it asks to join.
+    if let Some(replaces) = pending_replaces_payload(&bus, call_id, state) {
+        if let Some(payload) = stasis_payload.as_object_mut() {
+            payload.insert("replaces".to_string(), replaces);
+        }
+    }
 
     // Record the control owner + mark awaiting the controller's first action. In
     // deferred mode send NO synthesized provisional — the caller's INVITE txn is
@@ -462,6 +470,31 @@ pub fn answer_first_prepare(
         offer_sdp,
         profile_name: profile_name.to_string(),
     })
+}
+
+/// The `replaces` member of a `StasisStart`: the hosted dialog the call's
+/// INVITE asked to take over, with the `early-only` flag it carried.
+pub fn pending_replaces_payload(
+    bus: &crate::control::ControlBus,
+    call_id: &str,
+    state: &DispatcherState,
+) -> Option<serde_json::Value> {
+    let pending = state
+        .call_actors
+        .get_call(call_id)
+        .and_then(|call| call.pending_replaces.clone())?;
+    let mut hosted = hosted_dialog(
+        bus,
+        state,
+        &crate::b2bua::actor::ReplacesMatch {
+            call_id: pending.replaced_call_id,
+            on_a_leg: pending.replaced_on_a_leg,
+        },
+    );
+    if let Some(fields) = hosted.as_object_mut() {
+        fields.insert("early_only".to_string(), pending.early_only.into());
+    }
+    Some(hosted)
 }
 
 /// Build the `StasisStart` payload: the full SIP context (all headers, source,

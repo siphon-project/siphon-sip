@@ -318,6 +318,30 @@ export interface TransferReplaces {
   from_tag: string;
   to_tag: string;
   early_only: boolean;
+  /**
+   * The dialog named, when the server hosts it — which is what lets an
+   * application act on a `Replaces` at all, since it addresses calls by channel
+   * and never sees a Call-ID or a tag. Absent or `null` for a dialog hosted
+   * elsewhere, and from a server that predates it.
+   */
+  local?: HostedDialog | null;
+}
+
+/** A dialog the server hosts, as a `Replaces` named it. */
+export interface HostedDialog {
+  /** The call the dialog belongs to. */
+  call_actor_id: string;
+  /** The channel controlling that call, when an application owns it. */
+  channel?: string | null;
+  /** Which leg of the call the dialog is. */
+  leg: "a" | "b";
+  /**
+   * The channel that call is bridged with — the party that stays when the
+   * named one is replaced. `null` when it is not a bridge.
+   */
+  bridged_with?: string | null;
+  /** On a `StasisStart` only: the `early-only` flag the INVITE's `Replaces` carried. */
+  early_only?: boolean;
 }
 
 /**

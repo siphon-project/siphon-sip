@@ -360,6 +360,7 @@ async fn forward_transfer_requested_pushes_event_to_owning_connection() {
             from_tag: Some("alice-tag"),
             from_a_leg: true,
             sip_call_id: "sipcid@h",
+            replaces_local: None,
         }
     ));
 
@@ -407,6 +408,7 @@ fn forward_transfer_requested_on_uncontrolled_call_is_clean_noop() {
             from_tag: None,
             from_a_leg: true,
             sip_call_id: "unknown-cid",
+            replaces_local: None,
         }
     ));
     assert_eq!(conn.events.depth(), 0, "no event for an uncontrolled call");

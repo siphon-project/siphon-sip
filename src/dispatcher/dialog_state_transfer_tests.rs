@@ -901,3 +901,143 @@ async fn a_replacement_leg_is_called_as_its_aor_and_presents_the_named_identity(
     );
     assert!(plain.headers.get("X-Account").is_none());
 }
+
+/// An attended transfer names the dialog to replace by Call-ID and tags, which
+/// a controller never sees. When this node hosts that dialog the event says
+/// which call and channel it is and which leg; a dialog hosted elsewhere is
+/// reported as the referrer named it, with nothing local to say.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_attended_refer_names_the_hosted_dialog_it_replaces() {
+    let call = establish(9100, "terminate");
+    let state = &call.dispatcher.state;
+    let internal_call_id = call.call_id();
+    let (bus, connection) = control_plane("transfer-9100");
+    bus.register_channel(
+        "channel-9100",
+        &connection,
+        &internal_call_id,
+        &call.a_call_id,
+        "hangup",
+        std::collections::HashMap::new(),
+    );
+    let referrer = Referrer {
+        call_id: &internal_call_id,
+        from_a_leg: true,
+        from_tag: Some("a-tag"),
+    };
+    let refer = |cseq: u32| {
+        in_dialog(
+            "REFER",
+            call.a.1,
+            &format!("<{}>;tag=a-tag", call.a.0),
+            &header(&call.answer_to_a, "To"),
+            &call.a_call_id,
+            cseq,
+            &format!("Refer-To: <{}>\r\n", call.c_uri()),
+        )
+    };
+
+    // The callee's dialog, as the party on it sees it: siphon's tag is its
+    // remote tag, its own the local one.
+    let hosted = crate::sip::headers::refer::ReferTo {
+        uri: call.c_uri(),
+        replaces: Some(crate::sip::headers::refer::Replaces {
+            call_id: header(&call.to_b, "Call-ID"),
+            from_tag: "b-tag".to_string(),
+            to_tag: tag_of(&header(&call.to_b, "From")),
+            early_only: false,
+        }),
+    };
+    let (raw, message) = refer(2);
+    assert!(hold_controlled_refer(
+        &bus,
+        inbound(call.a.1, &raw),
+        message,
+        &hosted,
+        &referrer,
+        state
+    )
+    .is_none());
+    let events = queued(&connection).await;
+    assert_eq!(events.len(), 1, "{events:?}");
+    let local = &events[0].payload["replaces"]["local"];
+    assert_eq!(local["call_actor_id"], internal_call_id);
+    assert_eq!(local["channel"], "channel-9100");
+    assert_eq!(local["leg"], "b");
+    assert!(local["bridged_with"].is_null(), "this call is not a bridge");
+    assert!(state.pending_inbound_refer.take(&call.a_call_id).is_some());
+
+    // A dialog this node does not host.
+    let foreign = crate::sip::headers::refer::ReferTo {
+        uri: call.c_uri(),
+        replaces: Some(crate::sip::headers::refer::Replaces {
+            call_id: "elsewhere@192.0.2.250".to_string(),
+            from_tag: "x".to_string(),
+            to_tag: "y".to_string(),
+            early_only: true,
+        }),
+    };
+    let (raw, message) = refer(3);
+    assert!(hold_controlled_refer(
+        &bus,
+        inbound(call.a.1, &raw),
+        message,
+        &foreign,
+        &referrer,
+        state
+    )
+    .is_none());
+    let events = queued(&connection).await;
+    assert_eq!(events.len(), 1, "{events:?}");
+    let replaces = &events[0].payload["replaces"];
+    assert_eq!(replaces["call_id"], "elsewhere@192.0.2.250");
+    assert_eq!(replaces["early_only"], true);
+    assert!(replaces["local"].is_null());
+    assert!(state.pending_inbound_refer.take(&call.a_call_id).is_some());
+}
+
+/// A call whose INVITE carried a `Replaces` naming a hosted dialog tells the
+/// application which call, channel and leg it asked to join; a call with no
+/// such header says nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_handed_over_call_names_the_hosted_dialog_its_invite_replaces() {
+    let call = establish(9200, "terminate");
+    let state = &call.dispatcher.state;
+    let internal_call_id = call.call_id();
+    let (bus, connection) = control_plane("transfer-9200");
+    bus.register_channel(
+        "channel-9200",
+        &connection,
+        &internal_call_id,
+        &call.a_call_id,
+        "hangup",
+        std::collections::HashMap::new(),
+    );
+    assert_eq!(
+        pending_replaces_payload(&bus, &internal_call_id, state),
+        None
+    );
+
+    state.call_actors.set_pending_replaces(
+        &internal_call_id,
+        crate::b2bua::actor::PendingReplaces {
+            replaced_call_id: internal_call_id.clone(),
+            replaced_on_a_leg: true,
+            early_only: true,
+        },
+    );
+    let replaces =
+        pending_replaces_payload(&bus, &internal_call_id, state).expect("a pending Replaces");
+    assert_eq!(replaces["call_actor_id"], internal_call_id);
+    assert_eq!(replaces["channel"], "channel-9200");
+    assert_eq!(replaces["leg"], "a");
+    assert_eq!(replaces["early_only"], true);
+    assert_eq!(
+        state
+            .call_actors
+            .take_pending_replaces(&internal_call_id)
+            .map(|pending| pending.early_only),
+        Some(true),
+        "reporting it does not consume it"
+    );
+}

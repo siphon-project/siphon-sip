@@ -395,6 +395,38 @@ pub fn control_channel_follows_a_leg(state: &DispatcherState, call_id: &str, pre
     }
 }
 
+/// What a controller needs to know about a dialog this node hosts, when a
+/// `Replaces` names it: the call it belongs to, the channel controlling that
+/// call, which leg of it the dialog is, and the channel that call is bridged
+/// with — the party that stays when the named one is replaced.
+///
+/// A `Replaces` carries a Call-ID and two tags, none of which a controller
+/// ever sees: it addresses calls by channel. This is the translation.
+pub fn hosted_dialog(
+    bus: &crate::control::ControlBus,
+    state: &DispatcherState,
+    matched: &crate::b2bua::actor::ReplacesMatch,
+) -> serde_json::Value {
+    let (channel, bridged_with) = state
+        .call_actors
+        .get_call(&matched.call_id)
+        .map(|call| {
+            (
+                bus.channel_id_for_sip_call_id(&call.a_leg.dialog.call_id),
+                call.bridge
+                    .as_ref()
+                    .and_then(|bridge| bus.channel_id_for_sip_call_id(&bridge.peer_sip_call_id)),
+            )
+        })
+        .unwrap_or_default();
+    serde_json::json!({
+        "call_actor_id": matched.call_id,
+        "channel": channel,
+        "leg": if matched.on_a_leg { "a" } else { "b" },
+        "bridged_with": bridged_with,
+    })
+}
+
 /// Hold a REFER on a controlled call for its owning app, and tell the app.
 ///
 /// `None` when the REFER was taken: held and reported as `TransferRequested`,
@@ -429,6 +461,17 @@ pub fn hold_controlled_refer(
     );
     match held {
         ReferHold::Held => {
+            // The dialog an attended transfer names, when this node hosts it.
+            let replaces_local = refer_to.replaces.as_ref().and_then(|replaces| {
+                state
+                    .call_actors
+                    .find_call_by_replaces_dialog(
+                        &replaces.call_id,
+                        &replaces.from_tag,
+                        &replaces.to_tag,
+                    )
+                    .map(|matched| hosted_dialog(bus, state, &matched))
+            });
             bus.forward_transfer_requested(
                 &channel_id,
                 &channel_call_id,
@@ -437,6 +480,7 @@ pub fn hold_controlled_refer(
                     from_tag: referrer.from_tag,
                     from_a_leg: referrer.from_a_leg,
                     sip_call_id: &sip_call_id,
+                    replaces_local,
                 },
             );
             info!(

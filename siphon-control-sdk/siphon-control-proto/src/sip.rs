@@ -445,6 +445,28 @@ pub struct TransferReplaces {
     /// Whether the REFER was `early-only`.
     #[serde(default)]
     pub early_only: bool,
+    /// The dialog named, when the server hosts it — which is what lets an
+    /// application act on a `Replaces` at all, since it addresses calls by
+    /// channel and never sees a Call-ID or a tag. `None` for a dialog hosted
+    /// elsewhere, and from a server that predates it.
+    #[serde(default)]
+    pub local: Option<HostedDialog>,
+}
+
+/// A dialog the server hosts, as a `Replaces` named it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostedDialog {
+    /// The call the dialog belongs to.
+    pub call_actor_id: String,
+    /// The channel controlling that call, when an application owns it.
+    #[serde(default)]
+    pub channel: Option<String>,
+    /// Which leg of the call the dialog is: `"a"` or `"b"`.
+    pub leg: String,
+    /// The channel that call is bridged with — the party that stays when the
+    /// named one is replaced. `None` when it is not a bridge.
+    #[serde(default)]
+    pub bridged_with: Option<String>,
 }
 
 /// The `payload` of a [`SipEvent::TransferRequested`] event: an inbound REFER on
@@ -1661,6 +1683,29 @@ mod tests {
         let replaces = parsed.replaces.expect("replaces present");
         assert_eq!(replaces.call_id, "abc");
         assert!(replaces.early_only);
+        assert!(
+            replaces.local.is_none(),
+            "not hosted here, or an older server"
+        );
+
+        // The same, naming a dialog the server hosts.
+        let hosted = serde_json::json!({
+            "refer_to": "sip:dave@example.com",
+            "replaces": {
+                "call_id": "abc", "from_tag": "ft", "to_tag": "tt", "early_only": false,
+                "local": { "call_actor_id": "call-2", "channel": "ch2", "leg": "a",
+                           "bridged_with": "ch3" }
+            }
+        });
+        let hosted: TransferRequestedPayload = serde_json::from_value(hosted).unwrap();
+        let local = hosted
+            .replaces
+            .and_then(|replaces| replaces.local)
+            .expect("the hosted dialog");
+        assert_eq!(local.call_actor_id, "call-2");
+        assert_eq!(local.channel.as_deref(), Some("ch2"));
+        assert_eq!(local.leg, "a");
+        assert_eq!(local.bridged_with.as_deref(), Some("ch3"));
         assert_eq!(parsed.from_tag.as_deref(), Some("referrer-tag"));
     }
 
