@@ -2473,6 +2473,52 @@ fn store_zombie_captures_the_invite_ruri_so_the_487_can_be_acked() {
     );
 }
 
+/// RFC 3261 §17.2.1: a retransmitted INVITE in Proceeding is answered with the
+/// most recent provisional. Before any 18x went out that is the `100 Trying`.
+#[test]
+fn a_retransmitted_invite_gets_the_last_provisional_again() {
+    let store = CallActorStore::new();
+    let call_id = store.create_call(make_a_leg());
+    {
+        let call = store.get_call(&call_id).unwrap();
+        assert_eq!(
+            call.invite_retransmission_reply("z9hG4bK-aleg1"),
+            InviteRetransmissionReply::Trying
+        );
+    }
+
+    let ringing = bytes::Bytes::from_static(b"SIP/2.0 180 Ringing\r\n\r\n");
+    store.get_call_mut(&call_id).unwrap().a_leg_last_provisional = Some(ringing.clone());
+    let call = store.get_call(&call_id).unwrap();
+    assert_eq!(
+        call.invite_retransmission_reply("z9hG4bK-aleg1"),
+        InviteRetransmissionReply::Provisional(ringing)
+    );
+}
+
+/// An INVITE on another Via branch is a different transaction, and one whose
+/// final response is out has that response's own retransmission: neither is
+/// answered with a provisional, and answering drops the stored one.
+#[test]
+fn a_retransmitted_invite_gets_nothing_on_another_branch_or_after_the_final() {
+    let store = CallActorStore::new();
+    let call_id = store.create_call(make_a_leg());
+    let mut call = store.get_call_mut(&call_id).unwrap();
+    call.a_leg_last_provisional = Some(bytes::Bytes::from_static(b"SIP/2.0 180 Ringing\r\n\r\n"));
+
+    assert_eq!(
+        call.invite_retransmission_reply("z9hG4bK-another"),
+        InviteRetransmissionReply::Nothing
+    );
+
+    call.transition_to(CallState::Answered);
+    assert!(call.a_leg_last_provisional.is_none());
+    assert_eq!(
+        call.invite_retransmission_reply("z9hG4bK-aleg1"),
+        InviteRetransmissionReply::Nothing
+    );
+}
+
 #[test]
 fn store_sweep_stale() {
     let store = CallActorStore::new();

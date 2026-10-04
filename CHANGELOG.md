@@ -40,6 +40,14 @@ entry, but a working config keeps working.
 
 ### Fixed
 
+- **A retransmitted INVITE on a B2BUA call is answered.** The retransmission
+  was recognised (it creates no second call) and then dropped without a
+  response. A caller retransmits because it has seen no provisional, so one
+  that lost the `100 Trying` or the `180 Ringing` on the way kept
+  retransmitting its INVITE until a later response happened to arrive. It now
+  gets the most recent provisional again, or a `100 Trying` when none beyond
+  that has been sent (RFC 3261 §17.2.1). Nothing is re-sent once the INVITE
+  has its final response, or for an INVITE on another Via branch.
 - **An `{aor}` dial target's identity is no longer dropped.** `from`,
   `from_display`, `p_asserted_identity` and `privacy` on an `{aor}` target
   were ignored, though the reference documented them on both target forms
