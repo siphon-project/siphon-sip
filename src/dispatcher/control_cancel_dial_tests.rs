@@ -370,3 +370,49 @@ async fn a_route_is_refused_while_a_dial_rings_for_the_call() {
         "{reply}"
     );
 }
+
+/// An endless play reaches the engine as `inf`, a count as the count, and a
+/// play that names neither carries none: what a backend is asked for is what
+/// the engine is sent.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_endless_play_reaches_the_engine_as_inf() {
+    use siphon_rtp_proto::PlayRepeat;
+    let engine = NativeTestEngine::start().await;
+    let dispatcher = bridging_dispatcher(&engine);
+    let caller = answered_caller(&dispatcher, "play-forever@192.0.2.10");
+    let state = &dispatcher.state;
+    let backend = state.rtpengine_set.clone().expect("a media backend");
+    let from_tag = state
+        .rtpengine_sessions
+        .as_ref()
+        .and_then(|sessions| sessions.get(&caller.call_id))
+        .map(|session| session.from_tag.clone())
+        .expect("the caller's media session");
+    let source = crate::rtpengine::client::PlayMediaSource::File("/prompts/hold.wav".to_string());
+    for repeat in [Some(PlayRepeat::Forever), Some(PlayRepeat::Times(3)), None] {
+        backend
+            .play_media(
+                &caller.call_id,
+                &from_tag,
+                &source,
+                repeat,
+                None,
+                None,
+                None,
+                false,
+                None,
+                false,
+            )
+            .await
+            .expect("the play is accepted");
+    }
+    let repeats: Vec<Option<String>> = engine
+        .commands("play_media")
+        .into_iter()
+        .map(|command| command.repeat)
+        .collect();
+    assert_eq!(
+        repeats,
+        [Some("inf".to_string()), Some("3".to_string()), None]
+    );
+}

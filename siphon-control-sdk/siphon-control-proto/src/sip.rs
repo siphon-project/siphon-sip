@@ -105,9 +105,12 @@ pub enum SipVerb {
     Stop,
     /// Inject DTMF digits toward the A-leg.
     Dtmf,
-    /// Hold the A-leg media via silence.
+    /// Silence the call's media in both directions on the media engine. A
+    /// media gate, not a SIP hold: nothing is sent on either dialog, and it is
+    /// refused (`invalid_state`) on a call the engine only relays. Holding one
+    /// party of a bridge is [`SipVerb::Unbridge`].
     Hold,
-    /// Resume the A-leg media after a hold.
+    /// Restore the call's media after a hold.
     Unhold,
     /// Attach a WebSocket audio tee (siphon-rtp backend only).
     StreamStart,
@@ -631,6 +634,34 @@ impl PeerHangupPolicy {
 impl std::fmt::Display for PeerHangupPolicy {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(self.as_str())
+    }
+}
+
+/// How many times a `play` plays its source — the `repeat` argument.
+///
+/// A total play count, or [`PlayRepeat::Forever`] (`"inf"` on the wire) to play
+/// until stopped, which is what music on hold is. The server refuses any other
+/// value with `bad_request` rather than playing once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlayRepeat {
+    /// Play this many times in total; `0` and `1` both mean once.
+    Times(u64),
+    /// Play until stopped.
+    Forever,
+}
+
+impl From<u64> for PlayRepeat {
+    fn from(times: u64) -> Self {
+        PlayRepeat::Times(times)
+    }
+}
+
+impl Serialize for PlayRepeat {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            PlayRepeat::Times(times) => serializer.serialize_u64(*times),
+            PlayRepeat::Forever => serializer.serialize_str("inf"),
+        }
     }
 }
 
@@ -1631,6 +1662,19 @@ mod tests {
         assert_eq!(replaces.call_id, "abc");
         assert!(replaces.early_only);
         assert_eq!(parsed.from_tag.as_deref(), Some("referrer-tag"));
+    }
+
+    #[test]
+    fn a_play_repeat_is_a_count_or_inf_on_the_wire() {
+        assert_eq!(
+            serde_json::json!(PlayRepeat::Times(2)),
+            serde_json::json!(2)
+        );
+        assert_eq!(serde_json::json!(PlayRepeat::from(0)), serde_json::json!(0));
+        assert_eq!(
+            serde_json::json!(PlayRepeat::Forever),
+            serde_json::json!("inf")
+        );
     }
 
     #[test]

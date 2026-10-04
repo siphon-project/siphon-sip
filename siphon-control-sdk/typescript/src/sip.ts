@@ -720,8 +720,11 @@ export type PlaySource =
 
 /** Optional shaping for {@link Call.play}. */
 export interface PlayOptions {
-  /** Repeat the prompt this many times (0/undefined → play once). */
-  repeat?: number;
+  /**
+   * How many times to play in total (undefined → once), or `"inf"` to play
+   * until stopped — music on hold. The server refuses any other value.
+   */
+  repeat?: number | "inf";
   /** Start playback at this offset into the source, in milliseconds. */
   startMs?: number;
   /** Cap playback to this duration, in milliseconds. */
@@ -1379,12 +1382,18 @@ export class Call {
     await this.sip(SipVerb.Dtmf, dtmfArgs(digits, options));
   }
 
-  /** Hold the A-leg media via silence. */
+  /**
+   * Silence the call's media in both directions on the media engine.
+   *
+   * A media gate, not a SIP hold: nothing is sent on either dialog, so no
+   * phone shows a held call. Rejects with `invalid_state` on a call the engine
+   * only relays; to hold one party of a bridge, use {@link Call.unbridge}.
+   */
   async hold(): Promise<void> {
     await this.sip(SipVerb.Hold, {});
   }
 
-  /** Resume the A-leg media after a {@link Call.hold}. */
+  /** Restore the call's media after a {@link Call.hold}. */
   async unhold(): Promise<void> {
     await this.sip(SipVerb.Unhold, {});
   }

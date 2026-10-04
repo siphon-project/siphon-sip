@@ -14,9 +14,9 @@ use siphon_control_client::sip::{
 
 use crate::args::{
     build_play_source, extract_dial_on_answer, extract_dial_strategy, extract_dial_targets,
-    extract_headers, extract_privacy, extract_record_channels, extract_record_direction,
-    extract_route_target, extract_stream_channels, extract_stream_direction, extract_stream_mode,
-    parse_peer_hangup,
+    extract_headers, extract_play_repeat, extract_privacy, extract_record_channels,
+    extract_record_direction, extract_route_target, extract_stream_channels,
+    extract_stream_direction, extract_stream_mode, parse_peer_hangup,
 };
 use crate::{attach_if_running, interpreter_gone, json_to_py, optional_json, to_pyerr};
 
@@ -564,6 +564,9 @@ impl Call {
     /// of `file` (str), `db_id` (int), or `blob` (bytes, base64-encoded on the
     /// wire); the rest shape playback. A call with no anchored media session
     /// raises `ControlError` with `code == "not_found"`.
+    ///
+    /// `repeat` is a total play count, or `"inf"` to play until stopped (music
+    /// on hold; `stop` ends it). Any other value raises `ValueError`.
     #[pyo3(signature = (file=None, db_id=None, blob=None, repeat=None, start_ms=None, duration_ms=None, to_tag=None))]
     #[allow(clippy::too_many_arguments)]
     fn play<'py>(
@@ -572,14 +575,14 @@ impl Call {
         file: Option<String>,
         db_id: Option<u64>,
         blob: Option<Vec<u8>>,
-        repeat: Option<u64>,
+        repeat: Option<Bound<'py, PyAny>>,
         start_ms: Option<u64>,
         duration_ms: Option<u64>,
         to_tag: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let source = build_play_source(file, db_id, blob)?;
         let options = PlayOptions {
-            repeat,
+            repeat: extract_play_repeat(repeat.as_ref())?,
             start_ms,
             duration_ms,
             to_tag,
@@ -630,7 +633,12 @@ impl Call {
         })
     }
 
-    /// Hold the A-leg media via silence.
+    /// Silence the call's media in both directions on the media engine.
+    ///
+    /// A media gate, not a SIP hold: nothing is sent on either dialog, so no
+    /// phone shows a held call. Raises ``ControlError`` (``invalid_state``) on
+    /// a call the engine only relays; to hold one party of a bridge, use
+    /// ``unbridge``.
     fn hold<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let call = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
@@ -638,7 +646,7 @@ impl Call {
         })
     }
 
-    /// Resume the A-leg media after a `hold`.
+    /// Restore the call's media after a `hold`.
     fn unhold<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let call = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {

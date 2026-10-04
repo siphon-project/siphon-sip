@@ -332,7 +332,7 @@ pub(super) fn play_accept(
 /// Everything a `play` names besides its source.
 #[derive(Debug, Clone, Default)]
 pub(super) struct PlayOptions {
-    pub(super) repeat: Option<u64>,
+    pub(super) repeat: Option<siphon_rtp_proto::PlayRepeat>,
     pub(super) start_ms: Option<u64>,
     pub(super) duration_ms: Option<u64>,
     pub(super) to_tag: Option<String>,
@@ -367,6 +367,67 @@ pub(super) async fn start_playback(
         .await
 }
 
+/// Parse everything a `play` names besides its source.
+///
+/// An argument that is present and unusable is refused, never dropped: a
+/// `repeat` read as absent plays the prompt once and answers `ok`, which a
+/// caller on hold hears as music followed by silence.
+pub(super) fn parse_play_options(args: &serde_json::Value) -> Result<PlayOptions, ControlResult> {
+    let refusal = |argument: &str, message: &str| {
+        ControlResult::error_with_details(
+            ControlErrorCode::BadRequest,
+            format!("play args.{argument} {message}"),
+            serde_json::json!({ "verb": "play", "argument": argument, "reason": "invalid_value" }),
+        )
+    };
+    let present = |name: &str| args.get(name).filter(|value| !value.is_null());
+    let count = |name: &str| match present(name) {
+        None => Ok(None),
+        Some(value) => value
+            .as_u64()
+            .map(Some)
+            .ok_or_else(|| refusal(name, "must be a non-negative integer")),
+    };
+    let repeat = match present("repeat") {
+        None => None,
+        Some(value) => Some(
+            serde_json::from_value::<siphon_rtp_proto::PlayRepeat>(value.clone()).map_err(
+                |_| {
+                    refusal(
+                        "repeat",
+                        "must be a total play count (a non-negative integer) or \"inf\" to play until stopped",
+                    )
+                },
+            )?,
+        ),
+    };
+    let gain_decibels = match present("gain_decibels") {
+        None => None,
+        Some(value) => Some(
+            value
+                .as_i64()
+                .and_then(|gain| i32::try_from(gain).ok())
+                .ok_or_else(|| refusal("gain_decibels", "must be a whole number of decibels"))?,
+        ),
+    };
+    let to_tag = match present("to_tag") {
+        None => None,
+        Some(value) => Some(
+            value
+                .as_str()
+                .map(str::to_string)
+                .ok_or_else(|| refusal("to_tag", "must be a string"))?,
+        ),
+    };
+    Ok(PlayOptions {
+        repeat,
+        start_ms: count("start_ms")?,
+        duration_ms: count("duration_ms")?,
+        to_tag,
+        gain_decibels,
+    })
+}
+
 /// `play` — start an announcement on the A-leg's media. Fire-and-forget: `wait`
 /// is false, so this returns on the backend's *accept*, never blocking on
 /// playback completion (the far-end result is not the command reply).
@@ -387,18 +448,9 @@ pub(super) async fn play(channel: &ChannelRef, args: &serde_json::Value) -> Cont
     if let Some(refusal) = play_blob_refusal(&source) {
         return refusal;
     }
-    let options = PlayOptions {
-        repeat: args.get("repeat").and_then(|value| value.as_u64()),
-        start_ms: args.get("start_ms").and_then(|value| value.as_u64()),
-        duration_ms: args.get("duration_ms").and_then(|value| value.as_u64()),
-        to_tag: args
-            .get("to_tag")
-            .and_then(|value| value.as_str())
-            .map(|value| value.to_string()),
-        gain_decibels: args
-            .get("gain_decibels")
-            .and_then(|value| value.as_i64())
-            .and_then(|value| i32::try_from(value).ok()),
+    let options = match parse_play_options(args) {
+        Ok(options) => options,
+        Err(refusal) => return refusal,
     };
 
     let (backend, call_id, from_tag) = match media_target(channel) {
@@ -556,9 +608,15 @@ pub(super) async fn dtmf(channel: &ChannelRef, args: &serde_json::Value) -> Cont
     }
 }
 
-/// `hold` / `unhold` — gentle media hold via silence. `hold` → `silence_media`,
-/// `unhold` → `unsilence_media` (drop/undrop of packets, `block_media`, is a
-/// separate future gate verb — deliberately not exposed here).
+/// `hold` / `unhold` — silence the call's media, and restore it. `hold` →
+/// `silence_media`, `unhold` → `unsilence_media` (drop/undrop of packets,
+/// `block_media`, is a separate future gate verb — deliberately not exposed
+/// here).
+///
+/// A media gate, not a SIP hold: the engine replaces the call's audio with
+/// silence in **both** directions, and nothing is sent on either dialog, so no
+/// party's phone shows a held call. Holding one party of a bridge, with the
+/// RFC 3264 §8.4 `sendonly` re-offer a phone displays, is `unbridge`.
 async fn hold(channel: &ChannelRef, engage: bool) -> ControlResult {
     let (backend, call_id, from_tag) = match media_target(channel) {
         Ok(target) => target,
@@ -569,11 +627,34 @@ async fn hold(channel: &ChannelRef, engage: bool) -> ControlResult {
     } else {
         backend.unsilence_media(&call_id, &from_tag).await
     };
+    hold_result(channel, engage, outcome)
+}
+
+/// The reply to a `hold` / `unhold`, given what the engine said.
+///
+/// A call the engine only relays is refused `invalid_state`, not `unavailable`:
+/// the engine is fine and a retry would fail the same way, because it is the
+/// call that is in no state to be silenced.
+pub(super) fn hold_result(
+    channel: &ChannelRef,
+    engage: bool,
+    outcome: Result<(), crate::rtpengine::RtpEngineError>,
+) -> ControlResult {
+    let verb = if engage { "hold" } else { "unhold" };
     match outcome {
         Ok(()) => {
             let state = if engage { "held" } else { "unheld" };
             ControlResult::Ok(serde_json::json!({ "channel": channel.channel_id, "state": state }))
         }
+        Err(error) if error.is_not_media_processing() => ControlResult::error_with_details(
+            ControlErrorCode::InvalidState,
+            format!(
+                "{verb} silences decoded audio, and this call's media is relayed without being \
+                 decoded — it applies to a call the engine transcodes, records or streams. To \
+                 hold one party of a bridge, unbridge it"
+            ),
+            serde_json::json!({ "verb": verb, "reason": "media_not_processed" }),
+        ),
         Err(error) => media_error(error),
     }
 }

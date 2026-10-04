@@ -236,7 +236,7 @@ impl MediaBackend {
         call_id: &str,
         from_tag: &str,
         source: &PlayMediaSource,
-        repeat_times: Option<u64>,
+        repeat_times: Option<siphon_rtp_proto::PlayRepeat>,
         start_pos_ms: Option<u64>,
         duration_ms: Option<u64>,
         to_tag: Option<&str>,
@@ -320,6 +320,25 @@ impl MediaBackend {
         }
     }
 
+    /// The total play count for a backend whose protocol has no endless form.
+    ///
+    /// An endless play is refused rather than played once: a caller that asked
+    /// for music until stopped and got one pass would hear silence afterwards
+    /// with nothing to say why.
+    fn finite_repeat(
+        repeat_times: Option<siphon_rtp_proto::PlayRepeat>,
+        backend: &'static str,
+    ) -> Result<Option<u64>, RtpEngineError> {
+        match repeat_times {
+            None => Ok(None),
+            Some(siphon_rtp_proto::PlayRepeat::Times(times)) => Ok(Some(times)),
+            Some(siphon_rtp_proto::PlayRepeat::Forever) => Err(RtpEngineError::Unsupported {
+                operation: "play_media(repeat=\"inf\")",
+                backend,
+            }),
+        }
+    }
+
     /// The backend dispatch behind [`Self::play_media`], split out so the
     /// playback bookkeeping wraps every arm rather than being repeated in each.
     #[allow(clippy::too_many_arguments)]
@@ -328,7 +347,7 @@ impl MediaBackend {
         call_id: &str,
         from_tag: &str,
         source: &PlayMediaSource,
-        repeat_times: Option<u64>,
+        repeat_times: Option<siphon_rtp_proto::PlayRepeat>,
         start_pos_ms: Option<u64>,
         duration_ms: Option<u64>,
         to_tag: Option<&str>,
@@ -363,7 +382,7 @@ impl MediaBackend {
                         call_id,
                         from_tag,
                         source,
-                        repeat_times,
+                        Self::finite_repeat(repeat_times, "rtpengine")?,
                         start_pos_ms,
                         duration_ms,
                         to_tag,
@@ -401,7 +420,7 @@ impl MediaBackend {
                         call_id,
                         from_tag,
                         source,
-                        repeat_times,
+                        Self::finite_repeat(repeat_times, "rtpproxy")?,
                         start_pos_ms,
                         duration_ms,
                         to_tag,
@@ -1020,6 +1039,28 @@ mod tests {
     use super::*;
     use crate::rtpengine::events::RtpEngineEvent;
     use tokio::sync::mpsc;
+
+    /// A backend whose protocol carries only a play count refuses an endless
+    /// play, and passes a count or none through as it was.
+    #[test]
+    fn a_finite_only_backend_refuses_an_endless_play() {
+        use siphon_rtp_proto::PlayRepeat;
+        assert_eq!(
+            MediaBackend::finite_repeat(None, "rtpengine").ok(),
+            Some(None)
+        );
+        assert_eq!(
+            MediaBackend::finite_repeat(Some(PlayRepeat::Times(4)), "rtpengine").ok(),
+            Some(Some(4))
+        );
+        match MediaBackend::finite_repeat(Some(PlayRepeat::Forever), "rtpproxy") {
+            Err(RtpEngineError::Unsupported { operation, backend }) => {
+                assert_eq!(backend, "rtpproxy");
+                assert!(operation.contains("inf"), "{operation}");
+            }
+            other => panic!("an endless play was not refused: {other:?}"),
+        }
+    }
 
     /// A valid-but-unused loopback address; nothing listens on it. The native
     /// client dispatches the command and times out; the other backends reject

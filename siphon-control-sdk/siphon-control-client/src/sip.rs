@@ -24,7 +24,7 @@ use siphon_control_proto::sip::{
 };
 // The `bridge` verb's teardown policy is an argument of this facade, so it is
 // re-exported here rather than reached for through the proto crate.
-pub use siphon_control_proto::sip::PeerHangupPolicy;
+pub use siphon_control_proto::sip::{PeerHangupPolicy, PlayRepeat};
 use siphon_control_proto::verbs::MODULE_SIP;
 use siphon_control_proto::{ChannelSnapshot, EventFrame};
 
@@ -206,8 +206,10 @@ impl PlaySource {
 /// Optional shaping for [`Call::play`] (all default to the engine's behaviour).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PlayOptions {
-    /// Repeat the prompt this many times (0/None → play once).
-    pub repeat: Option<u64>,
+    /// How many times to play in total (`None` → once), or
+    /// [`PlayRepeat::Forever`] to play until stopped — music on hold. A count
+    /// converts with `.into()`.
+    pub repeat: Option<PlayRepeat>,
     /// Start playback at this offset into the source, in milliseconds.
     pub start_ms: Option<u64>,
     /// Cap playback to this duration, in milliseconds.
@@ -1057,12 +1059,16 @@ impl Call {
             .map(drop)
     }
 
-    /// Hold the A-leg media via silence.
+    /// Silence the call's media in both directions on the media engine.
+    ///
+    /// A media gate, not a SIP hold: nothing is sent on either dialog, so no
+    /// phone shows a held call. Refused `invalid_state` on a call the engine
+    /// only relays; to hold one party of a bridge, use [`Call::unbridge`].
     pub async fn hold(&self) -> Result<(), ControlError> {
         self.sip(SipVerb::Hold, json!({})).await.map(drop)
     }
 
-    /// Resume the A-leg media after a [`Call::hold`].
+    /// Restore the call's media after a [`Call::hold`].
     pub async fn unhold(&self) -> Result<(), ControlError> {
         self.sip(SipVerb::Unhold, json!({})).await.map(drop)
     }
@@ -1917,7 +1923,7 @@ mod tests {
         call.play(
             PlaySource::blob(b"hi".to_vec()),
             PlayOptions {
-                repeat: Some(2),
+                repeat: Some(2.into()),
                 duration_ms: Some(10_000),
                 ..Default::default()
             },

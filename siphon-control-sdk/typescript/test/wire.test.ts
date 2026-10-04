@@ -581,6 +581,8 @@ describe("Call verbs map to the in-process-mirrored wire verbs", () => {
     // "hi" → base64 "aGk=".
     await call.play({ blob: new Uint8Array([104, 105]) }, { durationMs: 5000 });
     await call.playFile("/prompts/bye.wav");
+    // Until stopped: the one non-numeric repeat.
+    await call.play({ file: "/prompts/hold.wav" }, { repeat: "inf" });
     await call.stop();
     await call.dtmf("123#", { durationMs: 100, volumeDbm0: -8 });
     await call.hold();
@@ -592,6 +594,7 @@ describe("Call verbs map to the in-process-mirrored wire verbs", () => {
       { module: MODULE_SIP, verb: "play", target: { channel: "ch1" }, args: { db_id: 42 } },
       { module: MODULE_SIP, verb: "play", target: { channel: "ch1" }, args: { blob: "aGk=", duration_ms: 5000 } },
       { module: MODULE_SIP, verb: "play", target: { channel: "ch1" }, args: { file: "/prompts/bye.wav" } },
+      { module: MODULE_SIP, verb: "play", target: { channel: "ch1" }, args: { file: "/prompts/hold.wav", repeat: "inf" } },
       { module: MODULE_SIP, verb: "stop", target: { channel: "ch1" }, args: {} },
       { module: MODULE_SIP, verb: "dtmf", target: { channel: "ch1" }, args: { digits: "123#", duration_ms: 100, volume_dbm0: -8 } },
       { module: MODULE_SIP, verb: "hold", target: { channel: "ch1" }, args: {} },

@@ -277,7 +277,7 @@ trust whoever supplies the URL.
 return a handle so you can change or stop that one playback:
 
 ```python
-bed = await rtpengine.play_overlay(call, file="/prompts/hold.wav", repeat=0)
+bed = await rtpengine.play_overlay(call, file="/prompts/hold.wav", repeat="inf")
 await rtpengine.play_media(call, file="/prompts/agent.wav")
 await rtpengine.set_play_gain(call, bed, -18)     # duck the bed under the prompt
 await rtpengine.stop_media(call, play_id=bed)     # stop just the bed

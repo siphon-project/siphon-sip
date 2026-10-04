@@ -446,6 +446,11 @@ def test_media_header_refer_verbs_roundtrip():
             async def handle(call):
                 await call.play(file="/prompts/welcome.wav", repeat=2)
                 await call.play(blob=b"hi", duration_ms=5000)
+                # Until stopped: the one non-integer `repeat` the server takes.
+                # Anything else is refused locally, before the call is touched.
+                await call.play(file="/prompts/hold.wav", repeat="inf")
+                with pytest.raises(ValueError):
+                    await call.play(file="/prompts/hold.wav", repeat="forever")
                 await call.stop()
                 await call.dtmf("123#", duration_ms=100, volume_dbm0=-8)
                 await call.hold()
@@ -504,11 +509,14 @@ def test_media_header_refer_verbs_roundtrip():
             assert by_verb["play"] in (
                 {"file": "/prompts/welcome.wav", "repeat": 2},
                 {"blob": "aGk=", "duration_ms": 5000},
+                {"file": "/prompts/hold.wav", "repeat": "inf"},
             )
             # Both play frames were sent (file first, blob second).
             play_args = [frame["args"] for frame in recorded if frame["verb"] == "play"]
             assert play_args[0] == {"file": "/prompts/welcome.wav", "repeat": 2}
             assert play_args[1] == {"blob": "aGk=", "duration_ms": 5000}
+            assert play_args[2] == {"file": "/prompts/hold.wav", "repeat": "inf"}
+            assert len(play_args) == 3, "the refused repeat never reached the wire"
             assert by_verb["stop"] == {}
             assert by_verb["dtmf"] == {
                 "digits": "123#",

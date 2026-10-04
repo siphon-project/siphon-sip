@@ -62,9 +62,37 @@ impl RtpEngineError {
     }
 }
 
+impl RtpEngineError {
+    /// Whether the engine refused because it only relays this call's media.
+    ///
+    /// A call the engine neither transcodes, records nor streams is forwarded
+    /// without being decoded, so an operation on its audio (silencing it) has
+    /// nothing to act on. That is a fact about the call's state, not an engine
+    /// failure: siphon-rtp says `"call is not a media-processing call …"`.
+    pub fn is_not_media_processing(&self) -> bool {
+        matches!(self, RtpEngineError::EngineError(reason)
+            if reason.to_ascii_lowercase().contains("not a media-processing call"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_relay_only_call_is_told_apart_from_an_engine_failure() {
+        let relayed = RtpEngineError::EngineError(
+            "silence: call is not a media-processing call (transcode/record/stream required)"
+                .to_string(),
+        );
+        assert!(relayed.is_not_media_processing());
+        assert!(!relayed.is_call_not_found());
+        assert!(
+            !RtpEngineError::EngineError("unknown call: 1@host".to_string())
+                .is_not_media_processing()
+        );
+        assert!(!RtpEngineError::Timeout { timeout_ms: 1000 }.is_not_media_processing());
+    }
 
     #[test]
     fn io_error_display() {

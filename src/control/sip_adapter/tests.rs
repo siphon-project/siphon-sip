@@ -1,8 +1,9 @@
 use super::bridge::{bridge_error, bridge_with_bus, unbridge};
 use super::call::{answer, drop_result, provisional_state, remove_header};
 use super::media::{
-    dtmf, media_error, parse_play_source, parse_stream_channels, parse_stream_mode, play,
-    play_accept, play_source_kind, record_start, stream_start, stream_uri, StreamMode,
+    dtmf, hold_result, media_error, parse_play_options, parse_play_source, parse_stream_channels,
+    parse_stream_mode, play, play_accept, play_source_kind, record_start, stream_start, stream_uri,
+    StreamMode,
 };
 use super::originate::{
     default_total_timeout, originate, originate_error, originate_with_bus, parse_originate_media,
@@ -1697,6 +1698,160 @@ async fn play_with_two_sources_is_bad_request() {
             ..
         }
     ));
+}
+
+/// The refusal a `play` argument draws: `bad_request`, naming the argument.
+fn refused_play_argument(args: serde_json::Value, argument: &str) {
+    match parse_play_options(&args) {
+        Err(ControlResult::Error { code, details, .. }) => {
+            assert_eq!(code, ControlErrorCode::BadRequest, "{args}");
+            let details = details.unwrap_or_default();
+            assert_eq!(details["verb"], "play", "{args}");
+            assert_eq!(details["argument"], argument, "{args}");
+            assert_eq!(details["reason"], "invalid_value", "{args}");
+        }
+        other => panic!("{args} was not refused: {other:?}"),
+    }
+}
+
+#[test]
+fn play_repeat_is_a_count_or_inf() {
+    use siphon_rtp_proto::PlayRepeat;
+    let repeat = |args: serde_json::Value| parse_play_options(&args).expect("accepted").repeat;
+    assert_eq!(repeat(serde_json::json!({})), None);
+    assert_eq!(repeat(serde_json::json!({ "repeat": null })), None);
+    assert_eq!(
+        repeat(serde_json::json!({ "repeat": 3 })),
+        Some(PlayRepeat::Times(3))
+    );
+    // Until stopped: the token the tone cadence grammar already uses.
+    assert_eq!(
+        repeat(serde_json::json!({ "repeat": "inf" })),
+        Some(PlayRepeat::Forever)
+    );
+}
+
+#[test]
+fn play_refuses_an_argument_it_cannot_use_rather_than_dropping_it() {
+    // Each of these was read as absent before, so the prompt played once, from
+    // the start, at full level, and the verb answered ok.
+    for repeat in [
+        serde_json::json!("forever"),
+        serde_json::json!(-1),
+        serde_json::json!(1.5),
+        serde_json::json!(true),
+        serde_json::json!([2]),
+    ] {
+        refused_play_argument(serde_json::json!({ "repeat": repeat }), "repeat");
+    }
+    refused_play_argument(serde_json::json!({ "start_ms": "250" }), "start_ms");
+    refused_play_argument(serde_json::json!({ "duration_ms": -5 }), "duration_ms");
+    refused_play_argument(
+        serde_json::json!({ "gain_decibels": "-6" }),
+        "gain_decibels",
+    );
+    refused_play_argument(
+        serde_json::json!({ "gain_decibels": 9_000_000_000_i64 }),
+        "gain_decibels",
+    );
+    refused_play_argument(serde_json::json!({ "to_tag": 7 }), "to_tag");
+
+    // Positive control: the same arguments, well formed, are all carried.
+    let options = parse_play_options(&serde_json::json!({
+        "repeat": 2, "start_ms": 250, "duration_ms": 5000, "gain_decibels": -6, "to_tag": "peer"
+    }))
+    .expect("accepted");
+    assert_eq!(options.start_ms, Some(250));
+    assert_eq!(options.duration_ms, Some(5000));
+    assert_eq!(options.gain_decibels, Some(-6));
+    assert_eq!(options.to_tag.as_deref(), Some("peer"));
+}
+
+#[tokio::test]
+async fn play_with_an_unusable_repeat_is_bad_request_before_the_engine_is_asked() {
+    // Refused on its arguments, so it holds with no dispatcher: a well-formed
+    // one reaches the media-target lookup instead and answers not_found here.
+    let refused = play(
+        &channel(),
+        &serde_json::json!({ "file": "/a.wav", "repeat": "forever" }),
+    )
+    .await;
+    assert!(matches!(
+        refused,
+        ControlResult::Error {
+            code: ControlErrorCode::BadRequest,
+            ..
+        }
+    ));
+    let accepted = play(
+        &channel(),
+        &serde_json::json!({ "file": "/a.wav", "repeat": "inf" }),
+    )
+    .await;
+    assert!(matches!(
+        accepted,
+        ControlResult::Error {
+            code: ControlErrorCode::NotFound,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn hold_on_a_call_the_engine_only_relays_is_an_invalid_state() {
+    use crate::rtpengine::RtpEngineError;
+    let relayed = || {
+        Err(RtpEngineError::EngineError(
+            "silence: call is not a media-processing call (transcode/record/stream required)"
+                .to_string(),
+        ))
+    };
+    for (engage, verb) in [(true, "hold"), (false, "unhold")] {
+        match hold_result(&channel(), engage, relayed()) {
+            ControlResult::Error { code, details, .. } => {
+                assert_eq!(code, ControlErrorCode::InvalidState);
+                let details = details.unwrap_or_default();
+                assert_eq!(details["verb"], verb);
+                assert_eq!(details["reason"], "media_not_processed");
+            }
+            other => panic!("{verb} on a relayed call was not refused: {other:?}"),
+        }
+    }
+    // An engine that is really unreachable is still `unavailable`, and a call
+    // the engine no longer has is still `not_found`.
+    assert!(matches!(
+        hold_result(
+            &channel(),
+            true,
+            Err(RtpEngineError::Timeout { timeout_ms: 1000 })
+        ),
+        ControlResult::Error {
+            code: ControlErrorCode::Unavailable,
+            ..
+        }
+    ));
+    assert!(matches!(
+        hold_result(
+            &channel(),
+            true,
+            Err(RtpEngineError::EngineError(
+                "unknown call: 1@host".to_string()
+            ))
+        ),
+        ControlResult::Error {
+            code: ControlErrorCode::NotFound,
+            ..
+        }
+    ));
+    // Positive control: an accept reports the state.
+    match hold_result(&channel(), true, Ok(())) {
+        ControlResult::Ok(reply) => assert_eq!(reply["state"], "held"),
+        other => panic!("{other:?}"),
+    }
+    match hold_result(&channel(), false, Ok(())) {
+        ControlResult::Ok(reply) => assert_eq!(reply["state"], "unheld"),
+        other => panic!("{other:?}"),
+    }
 }
 
 #[tokio::test]

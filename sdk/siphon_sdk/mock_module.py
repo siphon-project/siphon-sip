@@ -3469,6 +3469,34 @@ def _validate_ws_sample_rate(field: str, rate: int) -> None:
         )
 
 
+def _resolve_play_repeat(
+    repeat: Union[int, str, None], wait: bool = False
+) -> Union[int, str, None]:
+    """Validate ``repeat`` the way the runtime does and return it normalised.
+
+    A total play count (a non-negative integer) or ``"inf"`` to play until
+    stopped. Anything else raises ``ValueError`` rather than playing once, and
+    an endless play cannot be waited for.
+    """
+    if repeat is None:
+        return None
+    if isinstance(repeat, bool):
+        return int(repeat)
+    if isinstance(repeat, int) and repeat >= 0:
+        return repeat
+    if isinstance(repeat, str) and repeat.lower() == "inf":
+        if wait:
+            raise ValueError(
+                'repeat="inf" never finishes, so wait=True would never return '
+                "-- pass wait=False"
+            )
+        return "inf"
+    raise ValueError(
+        "repeat must be a total play count (a non-negative integer) or "
+        '"inf" to play until stopped'
+    )
+
+
 def _resolve_play_source(
     file: Optional[str],
     blob: Optional[bytes],
@@ -3959,7 +3987,7 @@ class MockRtpEngine:
         db_id: Optional[int] = None,
         tone: Optional[str] = None,
         url: Optional[str] = None,
-        repeat: Optional[int] = None,
+        repeat: Union[int, str, None] = None,
         start_ms: Optional[int] = None,
         duration_ms: Optional[int] = None,
         gain_decibels: Optional[int] = None,
@@ -3998,7 +4026,11 @@ class MockRtpEngine:
                 *playback*, never the leg. The accept carries no duration, since
                 the length is unknown until the body arrives. Native
                 **siphon-rtp** backend only.
-            repeat: Number of times to repeat the prompt.
+            repeat: Total number of times to play the prompt (default once),
+                or ``"inf"`` to play until stopped -- music on hold. ``"inf"``
+                needs ``wait=False`` (an endless play never finishes) and the
+                native **siphon-rtp** backend. Anything else raises
+                ``ValueError``.
             start_ms: Offset into the file at which to start (ms).
             duration_ms: Cap on playback length (ms).
             gain_decibels: Playout gain in whole decibels relative to the
@@ -4027,6 +4059,7 @@ class MockRtpEngine:
                 await rtpengine.echo(call)                                     # after prompt
         """
         source = _resolve_play_source(file, blob, db_id, tone, url)
+        repeat = _resolve_play_repeat(repeat, wait)
         call_id, resolved_from_tag = _resolve_media_target(target)
         self.operations.append(("play_media", source))
         self.media_calls.append({
@@ -4056,7 +4089,7 @@ class MockRtpEngine:
         db_id: Optional[int] = None,
         tone: Optional[str] = None,
         url: Optional[str] = None,
-        repeat: Optional[int] = None,
+        repeat: Union[int, str, None] = None,
         start_ms: Optional[int] = None,
         duration_ms: Optional[int] = None,
         gain_decibels: Optional[int] = None,
@@ -4087,7 +4120,8 @@ class MockRtpEngine:
             db_id: Reference to a prompt in the engine's prompt DB.
             tone: A preset name or cadence spec, as for :meth:`play_media`.
             url: An ``http://`` / ``https://`` WAV the engine fetches.
-            repeat: Number of times to repeat.
+            repeat: Total number of times to play, or ``"inf"`` to play
+                until stopped. Anything else raises ``ValueError``.
             start_ms: Offset into the source at which to start (ms).
             duration_ms: Hard playout cap -- the only bound, short of a stop,
                 on an endless (``*inf``) tone.
@@ -4100,12 +4134,14 @@ class MockRtpEngine:
 
         Example::
 
-            bed = await rtpengine.play_overlay(call, file="/prompts/hold.wav")
+            bed = await rtpengine.play_overlay(
+                call, file="/prompts/hold.wav", repeat="inf")
             await rtpengine.play_media(call, file="/prompts/agent.wav")
             await rtpengine.set_play_gain(call, bed, -18)
             await rtpengine.stop_media(call, play_id=bed)
         """
         source = _resolve_play_source(file, blob, db_id, tone, url)
+        repeat = _resolve_play_repeat(repeat)
         call_id, resolved_from_tag = _resolve_media_target(target)
         self.operations.append(("play_overlay", source))
         self.media_calls.append({
