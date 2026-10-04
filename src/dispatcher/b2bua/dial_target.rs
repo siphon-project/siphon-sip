@@ -132,7 +132,7 @@ pub(super) fn apply_dial_identity(
 ) -> Result<Option<ShapedFrom>, String> {
     let shaped = shape_from(template, shaping)?;
     if let Some(shaped) = &shaped {
-        template.headers.set("From", shaped.header.clone());
+        crate::sip::privacy::present_calling_identity(template, shaped.header.clone());
     }
     Ok(shaped)
 }
