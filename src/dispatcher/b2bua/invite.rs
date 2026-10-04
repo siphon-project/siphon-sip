@@ -515,6 +515,10 @@ pub fn handle_b2bua_invite(inbound: InboundMessage, message: SipMessage, state: 
     let engine_state = state.engine.state();
     let handlers = engine_state.handlers_for(&HandlerKind::B2buaInvite);
 
+    // From here until the handler returns, a CANCEL defers `@b2bua.on_cancel`
+    // to this path instead of running it beside the handler.
+    let cancelled_during_handler = state.call_actors.begin_invite_handler(&call_id);
+
     let mut outcome = Python::attach(|python| {
         let call_obj = match Py::new(python, py_call) {
             Ok(obj) => obj,
@@ -555,9 +559,34 @@ pub fn handle_b2bua_invite(inbound: InboundMessage, message: SipMessage, state: 
     // §17.2.1) — most visibly an answer-first `handover`, which sends its
     // `200 OK` off the stored INVITE and would land behind the 487. One guard
     // here rather than per arm, because it covers the `script_error` reject too.
-    // Nothing is left to clean up: the CANCEL path removed the call, its
-    // registry entries and its event receiver.
-    if invite_action_target_gone(&call_id, &state.call_actors) {
+    // The CANCEL path removed the call, its registry entries and its event
+    // receiver. What it could not do is run `@b2bua.on_cancel`: the handler was
+    // still running, and whatever it set up (a media offer it was awaiting) did
+    // not exist yet. That hook runs here, after the handler, so the script can
+    // release it. Closing the handler window and storing the INVITE are one
+    // step, so a CANCEL arriving from now on fires `on_cancel` itself.
+    let call_exists = state
+        .call_actors
+        .finish_invite_handler(&call_id, Arc::clone(&message_arc));
+    let cancelled =
+        cancelled_during_handler.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst));
+    if cancelled {
+        info!(
+            call_id = %call_id,
+            action = action.name(),
+            "B2BUA: call was CANCELled while @b2bua.on_invite ran — action not applied, running on_cancel"
+        );
+        run_b2bua_cancel_handlers(
+            &call_id,
+            Some(Arc::clone(&message_arc)),
+            inbound.remote_addr.ip().to_string(),
+            format!("{}", inbound.transport).to_lowercase(),
+            py_flow_from_inbound(&inbound),
+            state,
+        );
+        return;
+    }
+    if !call_exists || invite_action_target_gone(&call_id, &state.call_actors) {
         info!(
             call_id = %call_id,
             action = action.name(),
@@ -566,11 +595,6 @@ pub fn handle_b2bua_invite(inbound: InboundMessage, message: SipMessage, state: 
         );
         return;
     }
-
-    // Store the A-leg INVITE for later use by on_answer/on_failure/on_bye handlers
-    state
-        .call_actors
-        .set_a_leg_invite(&call_id, Arc::clone(&message_arc));
 
     // Who the caller authenticated as, if the script challenged it: what a
     // registered phone's own call is recognised by (`watch_caller_dialog`).

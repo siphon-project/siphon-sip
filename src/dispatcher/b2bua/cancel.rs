@@ -126,6 +126,7 @@ pub fn handle_b2bua_cancel(inbound: InboundMessage, message: SipMessage, state: 
     // yet get marked pending_cancel; the CANCEL drains automatically
     // once the stash lands.
     let mut bleg_targets: Vec<(SipMessage, Transport, SocketAddr, Option<SocketAddr>)> = Vec::new();
+    let mut cancelled_legs: Vec<Leg> = Vec::new();
     let pending: Vec<bool> = (0..call.b_legs.len())
         .map(|index| call.is_pending_branch(index))
         .collect();
@@ -146,6 +147,7 @@ pub fn handle_b2bua_cancel(inbound: InboundMessage, message: SipMessage, state: 
                 };
                 match build_cancel_from_invite(&invite) {
                     Some(cancel_msg) => {
+                        cancelled_legs.push(b_leg.clone());
                         bleg_targets.push((
                             cancel_msg,
                             b_leg.transport.transport,
@@ -187,6 +189,16 @@ pub fn handle_b2bua_cancel(inbound: InboundMessage, message: SipMessage, state: 
     // @b2bua.on_cancel can run after the lock is released (no DashMap reentry).
     let a_leg = call.a_leg.clone();
     let cancel_a_leg_invite = call.a_leg_invite.clone();
+    // `@b2bua.on_invite` is still running for this call: tell it, and leave
+    // `on_cancel` to the INVITE path, which runs it once the handler is done.
+    // Raised under the call's lock, which is what the handler's end takes too.
+    let invite_handler_running = match &call.invite_handler_cancelled {
+        Some(cancelled) => {
+            cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
+            true
+        }
+        None => false,
+    };
     let cancel_a_leg_source_ip = call.a_leg.transport.remote_addr.ip().to_string();
     let cancel_a_leg_transport = format!("{}", call.a_leg.transport.transport).to_lowercase();
     let cancel_a_leg_flow = py_flow_from_leg(&call.a_leg.transport);
@@ -201,6 +213,21 @@ pub fn handle_b2bua_cancel(inbound: InboundMessage, message: SipMessage, state: 
         crate::b2bua::actor::DialBranchCause::Cancelled,
         state,
     );
+
+    // The legs are recorded as CANCELled before their CANCELs leave. The callee
+    // can answer the CANCEL faster than the rest of this function runs, and its
+    // 487 would otherwise find the call still present and be taken for a B-leg
+    // failure: `@b2bua.on_failure` would then run for a call the caller gave up
+    // on, beside the `on_cancel` that is that call's only teardown hook.
+    if state.call_actors.keep_answerable(cancelled_legs.iter()) {
+        schedule_zombie_cancelled_expiry(
+            state.call_actors.clone(),
+            cancelled_legs
+                .iter()
+                .map(|leg| leg.branch.clone())
+                .collect(),
+        );
+    }
 
     // Emit the prepared CANCELs after dropping the call lock so the
     // outbound path doesn't reenter the DashMap.
@@ -232,14 +259,16 @@ pub fn handle_b2bua_cancel(inbound: InboundMessage, message: SipMessage, state: 
     // B2BUA call (RFC 3261 §9). A 2xx that races this CANCEL is independently
     // ACK+BYE'd by handle_zombie_cancelled_2xx and never delivered on_answer,
     // so this only ever fires for a genuinely abandoned call.
-    run_b2bua_cancel_handlers(
-        &call_id,
-        cancel_a_leg_invite,
-        cancel_a_leg_source_ip,
-        cancel_a_leg_transport,
-        cancel_a_leg_flow,
-        state,
-    );
+    if !invite_handler_running {
+        run_b2bua_cancel_handlers(
+            &call_id,
+            cancel_a_leg_invite,
+            cancel_a_leg_source_ip,
+            cancel_a_leg_transport,
+            cancel_a_leg_flow,
+            state,
+        );
+    }
 
     // Control plane: a handed-over call CANCELled before the controller acted is
     // the same teardown the answered/failed paths hook — emit StasisEnd + drop
