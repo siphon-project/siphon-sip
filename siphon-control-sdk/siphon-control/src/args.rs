@@ -71,8 +71,8 @@ pub(crate) fn extract_dial_targets(items: &[Bound<'_, PyAny>]) -> PyResult<Vec<D
     Ok(targets)
 }
 
-/// Extract one `dial` target: a dict `{uri, next_hop?, headers?}` dialed as
-/// written, or `{aor, headers?}` forked to every registered contact.
+/// Extract one `dial` target: a dict `{uri, next_hop?, headers?, to?}` dialed
+/// as written, or `{aor, headers?, to?}` forked to every registered contact.
 ///
 /// A bare string is refused although the server accepts one as a URI. The two
 /// forms do entirely different things — an AoR forks to every contact over that
@@ -90,6 +90,7 @@ fn extract_dial_target(item: &Bound<'_, PyAny>) -> PyResult<DialTarget> {
     let uri = optional_string(dict, "uri")?;
     let aor = optional_string(dict, "aor")?;
     let next_hop = optional_string(dict, "next_hop")?;
+    let to = optional_string(dict, "to")?;
     let headers = match dict.get_item("headers")? {
         Some(value) if !value.is_none() => extract_headers(&value)?,
         _ => Vec::new(),
@@ -126,6 +127,9 @@ fn extract_dial_target(item: &Bound<'_, PyAny>) -> PyResult<DialTarget> {
     };
     for (name, value) in headers {
         target = target.header(name, value);
+    }
+    if let Some(to) = to {
+        target = target.to(to);
     }
     Ok(target)
 }

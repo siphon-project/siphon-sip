@@ -13,6 +13,24 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
+### Added
+
+- **A `dial` target can name its called party with `to`.** It becomes that
+  branch's `To` URI. Before, a B-leg always kept the caller's `To` user and
+  only swapped in the target's host. That is right for a forward and wrong for
+  a divert: the R-URI named the new number while `To` still named the one the
+  caller dialled, so a next hop that routes on `To` served it as a call to the
+  original number and could send it straight back, in a loop no `Diversion`
+  counter catches. The new `To` is kept as the leg's dialog `To`, so later
+  BYEs, re-INVITEs and session refreshes carry it too. Works per branch, on
+  `{uri}` and `{aor}` targets, for parallel, sequential and
+  `on_answer: "bridge"` dials. A `to` that is not a SIP URI is `bad_request`
+  before anything rings. Targets without `to` behave as before. The Rust,
+  Python and TypeScript control SDKs take it too (`DialTarget::to`,
+  `{"to": ...}`, `to?`). In the Rust SDK this adds a field to both
+  `DialTarget` variants, which breaks code that matches or builds them by
+  field.
+
 ## [1.12.0] — 2026-09-30
 
 ### Changed

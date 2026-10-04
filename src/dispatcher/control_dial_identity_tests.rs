@@ -20,10 +20,10 @@ use super::lcr_ring_timeout_tests::{summaries, Sent};
 use super::test_dispatcher::{test_dispatcher, TestDispatcher};
 use super::*;
 
-const CALLER: &str = "192.0.2.10:5060";
-const FIRST_TARGET: &str = "198.51.100.7:5060";
-const SECOND_TARGET: &str = "198.51.100.8:5060";
-const SIP_CALL_ID: &str = "control-dial-identity@192.0.2.10";
+pub(super) const CALLER: &str = "192.0.2.10:5060";
+pub(super) const FIRST_TARGET: &str = "198.51.100.7:5060";
+pub(super) const SECOND_TARGET: &str = "198.51.100.8:5060";
+pub(super) const SIP_CALL_ID: &str = "control-dial-identity@192.0.2.10";
 
 /// The identity the controller wants the trunk to see, in place of the caller's
 /// own extension.
@@ -66,7 +66,7 @@ fn caller_invite() -> SipMessage {
 }
 
 /// A caller parked under external control with nothing dialed yet.
-fn park(dispatcher: &TestDispatcher) -> String {
+pub(super) fn park(dispatcher: &TestDispatcher) -> String {
     let call_id = dispatcher.state.call_actors.create_call(Leg::new_a_leg(
         SIP_CALL_ID.to_string(),
         "caller-tag".to_string(),
@@ -85,7 +85,7 @@ fn park(dispatcher: &TestDispatcher) -> String {
     call_id
 }
 
-fn wire(dispatcher: &TestDispatcher) -> Vec<Sent> {
+pub(super) fn wire(dispatcher: &TestDispatcher) -> Vec<Sent> {
     let mut sent = Vec::new();
     while let Ok(outbound) = dispatcher.udp.try_recv() {
         sent.push(Sent {
@@ -419,7 +419,7 @@ async fn an_unparseable_presented_identity_is_refused_before_anything_rings() {
 
 /// Drive the sequence forward exactly as the B-leg failure path does: from the
 /// stored A-leg INVITE, not from the dial's template.
-fn advance_from_the_stored_invite(dispatcher: &TestDispatcher, call_id: &str) {
+pub(super) fn advance_from_the_stored_invite(dispatcher: &TestDispatcher, call_id: &str) {
     let invite_arc = dispatcher
         .state
         .call_actors
@@ -443,7 +443,7 @@ fn target_with_identity(address: &str, from: &str) -> DialTarget {
     }
 }
 
-fn dial_targets(
+pub(super) fn dial_targets(
     dispatcher: &TestDispatcher,
     targets: Vec<DialTarget>,
     parallel: bool,
