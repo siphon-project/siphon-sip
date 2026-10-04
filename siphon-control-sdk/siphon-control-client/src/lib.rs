@@ -51,6 +51,7 @@
 
 #![forbid(unsafe_code)]
 
+mod cancel_dial;
 mod client;
 mod dial;
 mod drop_call;

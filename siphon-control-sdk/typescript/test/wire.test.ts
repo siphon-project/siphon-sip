@@ -91,6 +91,7 @@ describe("SipVerb wire tokens + event names", () => {
     expect(SipVerb.RecordStop).toBe("record_stop");
     expect(SipVerb.Reject).toBe("reject");
     expect(SipVerb.Drop).toBe("drop");
+    expect(SipVerb.CancelDial).toBe("cancel_dial");
   });
 
   it("passes unknown + new event names through (forward-compatible)", () => {
@@ -377,6 +378,22 @@ describe("Call verbs map to the in-process-mirrored wire verbs", () => {
         verb: "drop",
         target: { channel: "ch1" },
         args: { reason: "no flow claims this number" },
+      },
+    ]);
+  });
+
+  it("cancelDial names the reason only when one is given", async () => {
+    const transport = new RecordingTransport();
+    const call = makeCall(transport);
+    await call.cancelDial();
+    await call.cancelDial("max_wait");
+    expect(transport.calls).toEqual([
+      { module: MODULE_SIP, verb: "cancel_dial", target: { channel: "ch1" }, args: {} },
+      {
+        module: MODULE_SIP,
+        verb: "cancel_dial",
+        target: { channel: "ch1" },
+        args: { reason: "max_wait" },
       },
     ]);
   });

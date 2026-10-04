@@ -114,6 +114,20 @@ struct RingingDial {
     /// The caller's media session, which a finished prompt is matched on.
     media_call_id: String,
     from_tag: String,
+    /// The controller cancelled the dial before its group existed: the reason
+    /// it gave, for the dial to end on as soon as it has one.
+    cancel: Option<String>,
+}
+
+/// What a cancel of a caller's dial found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum CancelRequest {
+    /// The group to cancel.
+    Group(String),
+    /// No group yet: the cancel is recorded and the dial ends as it starts.
+    Deferred,
+    /// The caller has no dial ringing.
+    Gone,
 }
 
 /// A ringback playing on a caller, until the engine reports its end.
@@ -177,6 +191,31 @@ impl DialBridgeStore {
     /// The group ringing for `caller`, once created.
     pub fn group_of(&self, caller: &str) -> Option<String> {
         self.ringing.get(caller)?.group_id.clone()
+    }
+
+    /// Whether a phone that answered `caller`'s dial has its bridge in motion.
+    pub fn is_bridging(&self, caller: &str) -> bool {
+        self.bridging.iter().any(|pending| pending.caller == caller)
+    }
+
+    /// The controller is cancelling `caller`'s dial: the group to cancel, or
+    /// the cancel recorded for a dial that has none yet.
+    pub(super) fn request_cancel(&self, caller: &str, reason: &str) -> CancelRequest {
+        match self.ringing.get_mut(caller) {
+            None => CancelRequest::Gone,
+            Some(mut dial) => match dial.group_id.clone() {
+                Some(group_id) => CancelRequest::Group(group_id),
+                None => {
+                    dial.cancel = Some(reason.to_string());
+                    CancelRequest::Deferred
+                }
+            },
+        }
+    }
+
+    /// The cancel recorded for `caller`'s dial before its group existed.
+    fn take_cancel(&self, caller: &str) -> Option<String> {
+        self.ringing.get_mut(caller)?.cancel.take()
     }
 
     /// Take `caller` for a new dial. `false` when it already has one.
@@ -274,6 +313,8 @@ pub enum DialBridgeRefusal {
     AlreadyBridged,
     /// The caller already has phones ringing for it.
     AlreadyDialling,
+    /// The controller cancelled the dial while it was being set up.
+    Cancelled,
 }
 
 impl DialBridgeRefusal {
@@ -285,6 +326,7 @@ impl DialBridgeRefusal {
             Self::NotAnchored => "not_anchored",
             Self::AlreadyBridged => "already_bridged",
             Self::AlreadyDialling => "dial_in_progress",
+            Self::Cancelled => "dial_cancelled",
         }
     }
 }
@@ -307,7 +349,11 @@ impl std::fmt::Display for DialBridgeRefusal {
             ),
             Self::AlreadyDialling => write!(
                 formatter,
-                "the caller already has phones ringing for it — hang those up or wait for DialAnswered / DialFailed"
+                "the caller already has phones ringing for it — cancel_dial them or wait for DialAnswered / DialFailed"
+            ),
+            Self::Cancelled => write!(
+                formatter,
+                "the dial was cancelled before any phone was rung"
             ),
         }
     }
@@ -552,6 +598,7 @@ pub fn dial_bridge_start(
             signals,
             media_call_id: caller.media_call_id.clone(),
             from_tag: caller.from_tag.clone(),
+            cancel: None,
         },
     );
     if !claimed {
@@ -576,6 +623,17 @@ pub fn dial_bridge_start(
             },
         );
         return Err(DialBridgeStartError::Refused(DialBridgeRefusal::Gone));
+    }
+    if state
+        .dial_bridges
+        .take_cancel(&caller.sip_call_id)
+        .is_some()
+    {
+        // Cancelled before a phone was rung: nothing is on the wire and the
+        // sink was never told of a group, so it simply never starts.
+        discard_originate_group(state, &group_id);
+        state.dial_bridges.release(&caller.sip_call_id);
+        return Err(DialBridgeStartError::Refused(DialBridgeRefusal::Cancelled));
     }
     match start_originate_group(state, &group_id) {
         Ok(branches) => {
@@ -732,6 +790,7 @@ mod tests {
             signals,
             media_call_id: CALLER.to_string(),
             from_tag: "caller-tag".to_string(),
+            cancel: None,
         }
     }
 
@@ -754,6 +813,29 @@ mod tests {
     }
 
     #[test]
+    fn a_cancel_before_the_group_exists_is_kept_for_it() {
+        let store = DialBridgeStore::new();
+        let (signals, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        assert_eq!(store.request_cancel(CALLER, "gave up"), CancelRequest::Gone);
+        assert!(store.claim(CALLER, ringing(signals)));
+        assert_eq!(
+            store.request_cancel(CALLER, "gave up"),
+            CancelRequest::Deferred
+        );
+        assert!(store.set_group(CALLER, "group-1"));
+        assert_eq!(store.take_cancel(CALLER).as_deref(), Some("gave up"));
+        assert_eq!(store.take_cancel(CALLER), None, "taken once");
+        // Positive control: with its group known, the cancel names it.
+        assert_eq!(
+            store.request_cancel(CALLER, "gave up"),
+            CancelRequest::Group("group-1".to_string())
+        );
+        assert!(!store.is_bridging(CALLER));
+        store.release(CALLER);
+        assert_eq!(store.ringing_count(), 0);
+    }
+
+    #[test]
     fn a_refusal_names_its_reason() {
         let not_answered = DialBridgeRefusal::NotAnswered {
             call_state: "ringing".to_string(),
@@ -769,6 +851,7 @@ mod tests {
             DialBridgeRefusal::AlreadyDialling.reason(),
             "dial_in_progress"
         );
+        assert_eq!(DialBridgeRefusal::Cancelled.reason(), "dial_cancelled");
         let message = not_answered.to_string();
         assert!(message.contains("ringing"), "{message}");
         assert!(message.contains("connect"), "{message}");

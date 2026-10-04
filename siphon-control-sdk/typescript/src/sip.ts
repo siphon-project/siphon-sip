@@ -998,6 +998,33 @@ export class Call {
   }
 
   /**
+   * Give up on the dial ringing for this call and leave the caller alone.
+   *
+   * Every phone still ringing is CANCELled (RFC 3261 §9.1), each reported by
+   * `DialBranchFailed` with cause `cancelled`, and the dial ends in
+   * `DialFailed` with code 487. The caller is exactly as the dial found it —
+   * answered and anchored for an `onAnswer: "bridge"` dial, unanswered and
+   * parked otherwise — still this app's, and free to be dialled for again.
+   * {@link Call.hangup} ends the caller as well.
+   *
+   * `reason` is reported as the `cause` of a bridging dial's `DialFailed`
+   * (default `cancelled`), so the handler that hears it can tell its own cancel
+   * from a dial that failed by itself.
+   *
+   * Rejects with `invalid_state` when nothing is ringing (`details.reason` is
+   * `no_dial_in_progress`), and once a phone has answered and is being bridged
+   * (`dial_answered`), whose outcome arrives as `DialAnswered` or
+   * `BridgeFailed`.
+   */
+  async cancelDial(reason?: string): Promise<void> {
+    const args: Record<string, unknown> = {};
+    if (reason !== undefined) {
+      args.reason = reason;
+    }
+    await this.sip(SipVerb.CancelDial, args);
+  }
+
+  /**
    * Send an in-dialog REFER on the A-leg (blind transfer).
    *
    * Resolves as soon as siphon has sent the REFER — that is *sent*, not

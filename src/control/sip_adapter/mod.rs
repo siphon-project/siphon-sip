@@ -35,7 +35,9 @@ pub(in crate::control) use media::{media_error, play_blob_refusal};
 use originate::originate;
 #[cfg(test)]
 pub(crate) use originate::staged;
-use routing::{dial, route};
+#[cfg(test)]
+use routing::route;
+use routing::{cancel_dial, dial, route_unless_dialling};
 use transfer::{accept_refer, refer, reject_refer, replace_peer};
 
 /// The SIP adapter (`module() == "sip"`).
@@ -102,8 +104,9 @@ impl ControlAdapter for SipControlAdapter {
                 verb("replace_peer", "Replace one leg of this answered call with a freshly dialed target, with no REFER involved: the replaced leg stays up while the target rings and is BYE'd only once it answers. The reply says the INVITE is on the wire, PeerReplaced says the new party is bridged and the old one released (args: target, next_hop, replace_a_leg, profile, number_policy, format, timeout)"),
                 verb("bridge", "Join this channel to another the app owns, so the two parties hear each other; the reply says the media was re-pointed and the first re-INVITE is on the wire, ChannelBridged says the audio meets (args: with, on_peer_hangup)"),
                 verb("unbridge", "Break a bridge — both legs stay answered, owned and held; the reply says the hold offers went out, ChannelUnbridged on each leg says it is parted and safe to bridge again (args: reason)"),
-                verb("route", "Return control to siphon with a routing decision: un-park the call and dial the B-leg via LCR sequential failover (args: targets, strategy, headers)"),
+                verb("route", "Return control to siphon with a routing decision: un-park the call and dial the B-leg via LCR sequential failover (args: targets, strategy, headers). Refused invalid_state with reason dial_in_progress while a dial is still ringing for the call: cancel_dial first"),
                 verb("dial", "Ring one or more targets as B-legs while the caller stays unanswered and this app keeps the channel: each branch is named as it is created by DialBranch (leg_id, leg_sip_call_id, target) and as it ends by DialBranchFailed or DialAnswered, the first 2xx answers the caller and the pair becomes an ordinary two-leg call, and a failure or timeout arrives as DialFailed, listing every branch, with the caller still ringing (args: targets, strategy, timeout, headers, profile, from, from_display, p_asserted_identity, privacy). A target is a URI string, {uri, next_hop, headers} or {aor} — an AoR forks to every registered contact over its own flow, which is the only way to reach a phone registered on TCP, TLS or WSS. The identity arguments present a From of the controller's choosing instead of the caller's own, which on a call out to a trunk is the internal extension. on_answer is connect (the default, just described, refused on an answered call) or bridge, which rings phones for a caller this app already answered and anchored (after its prompts): each phone is its own outbound leg, the caller hears ringback (args: ringback, a tone preset or cadence, default ringback_eu, or false) from the first 180-183 on, and the phone that answers is bridged to the caller while the others ring on; a failed bridge (BridgeFailed, DialBranchFailed cause bridge_failed) hangs that phone up and the next phone to answer is tried, and only the bridged phone gets DialAnswered, with a channel of its own, just before ChannelBridged; DialFailed leaves the caller answered and owned. A phone's early media is not relayed"),
+                verb("cancel_dial", "Give up on the dial ringing for this channel's caller and leave the caller alone: every phone still ringing is CANCELled (RFC 3261 §9.1), each reported by DialBranchFailed with cause cancelled, and the dial ends in DialFailed with code 487 — for a bridging dial with cause set to the reason given here (default cancelled) and the caller still answered and anchored, for a connecting dial with the caller still unanswered and parked. Either way the channel keeps the call and may dial again (args: reason). Refused invalid_state with reason no_dial_in_progress when nothing is ringing, and dial_answered once a phone has answered and is being bridged, whose outcome arrives as DialAnswered or BridgeFailed. hangup ends the caller as well"),
                 verb("set_header", "Set a header on the stored A-leg INVITE (args: name, value)"),
                 verb("remove_header", "Remove a header from the stored A-leg INVITE (args: name)"),
                 verb("get_header", "Read a header from the stored A-leg INVITE (args: name)"),
@@ -273,6 +276,7 @@ fn is_sip_verb(verb: &str) -> bool {
             | "replace_peer"
             | "route"
             | "dial"
+            | "cancel_dial"
             | "set_header"
             | "remove_header"
             | "get_header"
@@ -320,8 +324,9 @@ fn apply_sip(command: AdapterCommand) -> ControlResult {
         "accept_refer" => accept_refer(&channel, &command.args),
         "reject_refer" => reject_refer(&channel, &command.args),
         "replace_peer" => replace_peer(&channel, &command.args),
-        "route" => route(&channel, &command.args),
+        "route" => route_unless_dialling(&channel, &command),
         "dial" => dial(&channel, &command),
+        "cancel_dial" => cancel_dial(&channel, &command),
         "set_header" => set_header(&channel, &command.args),
         "remove_header" => remove_header(&channel, &command.args),
         "get_header" => get_header(&channel, &command.args),

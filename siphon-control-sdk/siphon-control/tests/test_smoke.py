@@ -175,6 +175,7 @@ def test_module_surface():
         "record_start",
         "record_stop",
         "drop",
+        "cancel_dial",
     ):
         assert hasattr(Call, verb), f"Call is missing {verb}"
     assert issubclass(ControlError, Exception)

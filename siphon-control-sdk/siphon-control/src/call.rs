@@ -253,6 +253,30 @@ impl Call {
         })
     }
 
+    /// Give up on the dial ringing for this call and leave the caller alone.
+    ///
+    /// Every phone still ringing is CANCELled, each reported by
+    /// ``DialBranchFailed`` with cause ``cancelled``, and the dial ends in
+    /// ``DialFailed`` with code 487. The caller is exactly as the dial found
+    /// it, still this app's, and free to be dialled for again. ``hangup`` ends
+    /// the caller as well.
+    ///
+    /// ``reason`` is reported as the ``cause`` of a bridging dial's
+    /// ``DialFailed`` (default ``cancelled``). Raises ``ControlError``
+    /// (``invalid_state``) when nothing is ringing, and once a phone has
+    /// answered and is being bridged.
+    #[pyo3(signature = (reason=None))]
+    fn cancel_dial<'py>(
+        &self,
+        py: Python<'py>,
+        reason: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let call = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            call.cancel_dial(reason.as_deref()).await.map_err(to_pyerr)
+        })
+    }
+
     fn refer<'py>(&self, py: Python<'py>, to: String) -> PyResult<Bound<'py, PyAny>> {
         let call = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {

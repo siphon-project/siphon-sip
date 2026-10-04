@@ -64,6 +64,37 @@ pub(super) fn route(channel: &ChannelRef, args: &serde_json::Value) -> ControlRe
     }
 }
 
+/// [`route`], refused while a `dial` is still ringing for the call.
+///
+/// `route` releases the channel, so a dial left ringing behind it would report
+/// into a channel that no longer exists and, for a bridging dial, connect a
+/// phone to a caller that has since been sent somewhere else. The controller
+/// ends the dial first (`cancel_dial`), or waits for its outcome.
+pub(super) fn route_unless_dialling(
+    channel: &ChannelRef,
+    command: &AdapterCommand,
+) -> ControlResult {
+    if dial_under_way(channel, &command.origin.app) {
+        return ControlResult::error_with_details(
+            ControlErrorCode::InvalidState,
+            "route cannot hand this call back while a dial is still ringing for it — cancel_dial \
+             first, or wait for DialAnswered / DialFailed",
+            serde_json::json!({ "verb": "route", "reason": "dial_in_progress" }),
+        );
+    }
+    route(channel, &command.args)
+}
+
+/// Whether a `dial` — bridging or connecting — is still ringing for the
+/// channel's call.
+fn dial_under_way(channel: &ChannelRef, app: &str) -> bool {
+    let dispatcher = super::dial_bridge::dispatcher_for(app);
+    dispatcher.state().is_some_and(|state| {
+        state.dial_bridges.is_ringing(&channel.sip_call_id)
+            || state.call_actors.is_control_dial(&channel.call_actor_id)
+    })
+}
+
 /// `dial` — ring B-legs while the caller stays unanswered and app-owned.
 ///
 /// The difference from [`route`] is who holds the call afterwards. `route`
@@ -190,6 +221,61 @@ pub(super) fn dial(channel: &ChannelRef, command: &AdapterCommand) -> ControlRes
         Ok(false) => ControlResult::error(ControlErrorCode::NotFound, "call is gone"),
         Err(error) => dial_error(error),
     }
+}
+
+/// `cancel_dial` — give up on the dial ringing for this channel's caller.
+///
+/// The one way to stop a dial that leaves the caller alone: the phones are
+/// CANCELled (RFC 3261 §9.1) and the dial fails with `DialFailed {code: 487}`,
+/// the caller exactly as the dial found it and free to be dialled for again.
+/// `hangup` ends the caller too, and letting the ring timeout run keeps the
+/// phones ringing until it does.
+///
+/// `args.reason` is reported as the `cause` of a bridging dial's `DialFailed`
+/// (default `cancelled`). Refused `invalid_state` with a typed `reason` when no
+/// dial is ringing, or when a phone has already answered and is being bridged.
+pub(super) fn cancel_dial(channel: &ChannelRef, command: &AdapterCommand) -> ControlResult {
+    let reason = match command.args.get("reason") {
+        None | Some(serde_json::Value::Null) => crate::dispatcher::DIAL_CANCELLED.to_string(),
+        Some(serde_json::Value::String(reason)) if !reason.trim().is_empty() => reason.clone(),
+        Some(_) => {
+            return ControlResult::error(
+                ControlErrorCode::BadRequest,
+                "cancel_dial reason must be a non-empty string",
+            )
+        }
+    };
+    let dispatcher = super::dial_bridge::dispatcher_for(&command.origin.app);
+    let (Some(state), Some(runtime)) = (dispatcher.state(), dispatcher.runtime()) else {
+        return ControlResult::error(
+            ControlErrorCode::Unavailable,
+            "b2bua is not running — no dial to cancel",
+        );
+    };
+    // The CANCELs may open a connection (TCP/TLS).
+    let _enter = runtime.enter();
+    match crate::dispatcher::b2bua_cancel_dial_with_state(state, &channel.sip_call_id, &reason) {
+        Ok(cancelled) => ControlResult::Ok(serde_json::json!({
+            "channel": channel.channel_id,
+            "state": "cancelled",
+            "on_answer": cancelled.on_answer(),
+        })),
+        Err(refusal) => cancel_dial_refused(refusal),
+    }
+}
+
+/// The reply for a dial that was not cancelled: `not_found` when the call is
+/// gone, otherwise `invalid_state` naming why.
+pub(super) fn cancel_dial_refused(refusal: crate::dispatcher::DialCancelRefusal) -> ControlResult {
+    let code = match refusal {
+        crate::dispatcher::DialCancelRefusal::Gone => ControlErrorCode::NotFound,
+        _ => ControlErrorCode::InvalidState,
+    };
+    ControlResult::error_with_details(
+        code,
+        refusal.to_string(),
+        serde_json::json!({ "verb": "cancel_dial", "reason": refusal.reason() }),
+    )
 }
 
 /// Map a refused `dial` onto its wire code.

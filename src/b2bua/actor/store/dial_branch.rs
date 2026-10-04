@@ -97,6 +97,16 @@ impl CallActorStore {
         publish_dialog_states(ended);
     }
 
+    /// A controller gave up on its dial: drop the targets a sequential hunt had
+    /// left and the dial's ring deadline, so no later attempt is placed and the
+    /// deadline cannot fail a caller that is parked again.
+    pub fn abandon_dial_hunt(&self, call_id: &str) {
+        if let Some(mut call) = self.calls.get_mut(call_id) {
+            call.route_sequence = None;
+            call.answer_deadline = None;
+        }
+    }
+
     /// Whether a controller-issued `dial` is still awaiting its outcome.
     pub fn is_control_dial(&self, call_id: &str) -> bool {
         self.calls

@@ -201,6 +201,13 @@ export const SipVerb = {
    * the channel. Channel-addressed, unlike `originate`, which creates one.
    */
   Dial: "dial",
+  /**
+   * Give up on the dial ringing for this channel's caller and leave the caller
+   * alone: the phones are CANCELled and the dial ends in `DialFailed` with code
+   * 487. Refused (`invalid_state`) when nothing is ringing, and once a phone
+   * has answered and is being bridged.
+   */
+  CancelDial: "cancel_dial",
   SetHeader: "set_header",
   GetHeader: "get_header",
   RemoveHeader: "remove_header",

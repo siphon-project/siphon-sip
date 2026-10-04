@@ -85,6 +85,14 @@ pub enum SipVerb {
     /// Every branch is named as it is created (`DialBranch`) and as it ends
     /// (`DialBranchFailed` / `DialAnswered`), by its leg id and SIP Call-ID.
     Dial,
+    /// Give up on the dial ringing for this channel's caller and leave the
+    /// caller alone: every phone still ringing is CANCELled and the dial ends
+    /// in `DialFailed` with code 487, the caller as the dial found it and free
+    /// to be dialled for again. [`SipVerb::Hangup`] ends the caller as well.
+    ///
+    /// Refused (`invalid_state`) when nothing is ringing, and once a phone has
+    /// answered and is being bridged.
+    CancelDial,
     /// Set a header on the stored A-leg INVITE.
     SetHeader,
     /// Remove a header from the stored A-leg INVITE.
@@ -137,6 +145,7 @@ impl SipVerb {
             SipVerb::ReplacePeer => "replace_peer",
             SipVerb::Route => "route",
             SipVerb::Dial => "dial",
+            SipVerb::CancelDial => "cancel_dial",
             SipVerb::SetHeader => "set_header",
             SipVerb::RemoveHeader => "remove_header",
             SipVerb::GetHeader => "get_header",
@@ -1412,6 +1421,7 @@ mod tests {
         assert_eq!(SipVerb::Reject.as_str(), "reject");
         assert_eq!(SipVerb::Hangup.as_str(), "hangup");
         assert_eq!(SipVerb::Drop.to_string(), "drop");
+        assert_eq!(SipVerb::CancelDial.as_str(), "cancel_dial");
     }
 
     #[test]
