@@ -365,18 +365,7 @@ pub fn b2bua_send_b_leg_invite(
             .map(str::to_string)
             .or(from_host_override)
             .unwrap_or_else(|| state.via_host(&outbound_transport));
-        if let Some(at_pos) = new_from.find('@') {
-            // Find the end of the host: first occurrence of '>', ':', or ';' after '@'
-            let after_at = &new_from[at_pos + 1..];
-            let host_end = after_at.find(['>', ';', ':']).unwrap_or(after_at.len());
-            let end_pos = at_pos + 1 + host_end;
-            new_from = format!(
-                "{}{}{}",
-                &new_from[..at_pos + 1],
-                from_host,
-                &new_from[end_pos..]
-            );
-        }
+        new_from = crate::b2bua::actor::rewrite_uri_host(&new_from, &from_host);
 
         b_leg_invite.headers.set("From", new_from);
     }
