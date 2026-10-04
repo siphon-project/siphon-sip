@@ -513,3 +513,294 @@ async fn a_replaces_takeover_reports_the_new_party_and_ends_the_replaced() {
     assert!(dialog_events(call.c.0).is_empty());
     assert_eq!(call.dispatcher.state.call_actors.count(), 0);
 }
+
+/// A control plane of the test's own, with one connected application.
+fn control_plane(
+    app: &str,
+) -> (
+    Arc<crate::control::ControlBus>,
+    Arc<crate::control::ConnHandle>,
+) {
+    let (command_tx, _command_rx) = flume::unbounded();
+    let bus = crate::control::ControlBus::new(
+        command_tx,
+        vec![crate::config::ControlAppConfig {
+            name: app.to_string(),
+            token: "token".to_string(),
+            per_call_connect: false,
+            connect_url: None,
+            on_lost: None,
+            ca_file: None,
+            events: Vec::new(),
+        }],
+        64,
+        crate::control::SlowConsumerPolicy::DropOldest,
+        10,
+        3000,
+    );
+    let connection = bus.register_connection(app);
+    (bus, connection)
+}
+
+/// The events queued for a connection, once its stream has been quiet for a
+/// moment.
+async fn queued(connection: &crate::control::ConnHandle) -> Vec<crate::control::EventFrame> {
+    let mut events = Vec::new();
+    while let Ok(frames) = tokio::time::timeout(
+        std::time::Duration::from_millis(100),
+        connection.events.recv_many(),
+    )
+    .await
+    {
+        events.extend(frames.into_iter().filter_map(|frame| match frame {
+            crate::control::OutboundFrame::Event(event) => Some(event),
+            crate::control::OutboundFrame::Reply(_) => None,
+        }));
+    }
+    events
+}
+
+fn parsed_refer_to(message: &SipMessage) -> crate::sip::headers::refer::ReferTo {
+    crate::sip::headers::refer::parse_refer_to(&header(message, "Refer-To"))
+        .expect("the Refer-To parses")
+}
+
+/// The callee of a controlled call — a party on a dialog of its own, with a
+/// Call-ID siphon generated — sends a REFER. The channel is bound to the
+/// caller's Call-ID, so the REFER is resolved through the call: it is held
+/// under the channel's Call-ID, where `accept_refer` / `reject_refer` look, and
+/// the application hears `TransferRequested` naming the B-leg as the referrer.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refer_from_the_callee_of_a_controlled_call_reaches_its_application() {
+    let call = establish(8700, "terminate");
+    let state = &call.dispatcher.state;
+    let (bus, connection) = control_plane("transfer-8700");
+    bus.register_channel(
+        "channel-8700",
+        &connection,
+        &call.call_id(),
+        &call.a_call_id,
+        "hangup",
+        std::collections::HashMap::new(),
+    );
+    let b_call_id = header(&call.to_b, "Call-ID");
+    assert_ne!(
+        b_call_id, call.a_call_id,
+        "the callee has a dialog of its own"
+    );
+    let internal_call_id = call.call_id();
+    let referrer = Referrer {
+        call_id: &internal_call_id,
+        from_a_leg: false,
+        from_tag: Some("b-tag"),
+    };
+    let refer = || {
+        in_dialog(
+            "REFER",
+            call.b.1,
+            &format!("{};tag=b-tag", header(&call.to_b, "To")),
+            &header(&call.to_b, "From"),
+            &b_call_id,
+            2,
+            &format!("Refer-To: <{}>\r\n", call.c_uri()),
+        )
+    };
+    let _ = wire(&call.dispatcher);
+
+    let (raw, message) = refer();
+    let refer_to = parsed_refer_to(&message);
+    let taken = hold_controlled_refer(
+        &bus,
+        inbound(call.b.1, &raw),
+        message,
+        &refer_to,
+        &referrer,
+        state,
+    );
+    assert!(taken.is_none(), "a controlled call's REFER is held");
+    assert!(
+        wire(&call.dispatcher).is_empty(),
+        "nothing is answered until the application decides"
+    );
+
+    let events = queued(&connection).await;
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0].event, "TransferRequested");
+    assert_eq!(events[0].channel.as_deref(), Some("channel-8700"));
+    assert_eq!(events[0].payload["refer_to"], call.c_uri());
+    assert_eq!(events[0].payload["referrer_leg"], "b");
+    assert_eq!(events[0].payload["referrer_sip_call_id"], b_call_id);
+    assert_eq!(events[0].payload["from_tag"], "b-tag");
+
+    // A retransmission of that REFER is absorbed: no second event.
+    let (raw, message) = refer();
+    assert!(hold_controlled_refer(
+        &bus,
+        inbound(call.b.1, &raw),
+        message,
+        &refer_to,
+        &referrer,
+        state
+    )
+    .is_none());
+    assert!(
+        queued(&connection).await.is_empty(),
+        "a retransmit is not reported"
+    );
+    assert!(wire(&call.dispatcher).is_empty());
+
+    // The caller sends a REFER of its own while the first is undecided: it is
+    // answered 491, never dropped, and the first is still the one held.
+    let (raw, message) = in_dialog(
+        "REFER",
+        call.a.1,
+        &format!("<{}>;tag=a-tag", call.a.0),
+        &header(&call.answer_to_a, "To"),
+        &call.a_call_id,
+        2,
+        &format!("Refer-To: <{}>\r\n", call.c_uri()),
+    );
+    let from_caller = Referrer {
+        call_id: &internal_call_id,
+        from_a_leg: true,
+        from_tag: Some("a-tag"),
+    };
+    assert!(hold_controlled_refer(
+        &bus,
+        inbound(call.a.1, &raw),
+        message,
+        &refer_to,
+        &from_caller,
+        state
+    )
+    .is_none());
+    let sent = wire(&call.dispatcher);
+    assert_eq!(sent.len(), 1, "exactly the 491");
+    assert_eq!(sent[0].destination, call.a.1);
+    assert_eq!(sent[0].message.status_code(), Some(491));
+    assert_eq!(header(&sent[0].message, "Call-ID"), call.a_call_id);
+    assert!(queued(&connection).await.is_empty());
+
+    // Held under the channel's Call-ID, which is the key the verbs present, and
+    // it is the callee's REFER that is held.
+    assert_eq!(state.pending_inbound_refer.len(), 1);
+    let pending = state
+        .pending_inbound_refer
+        .take(&call.a_call_id)
+        .expect("held under the channel's Call-ID");
+    assert!(!pending.from_a_leg);
+    assert_eq!(header(&pending.message, "Call-ID"), b_call_id);
+    assert_eq!(state.pending_inbound_refer.len(), 0, "drained");
+}
+
+/// A call no application controls is not held: the REFER is handed back for the
+/// script rail, untouched.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refer_on_an_uncontrolled_call_is_handed_back() {
+    let call = establish(8750, "terminate");
+    let (bus, connection) = control_plane("transfer-8750");
+    let internal_call_id = call.call_id();
+    let (raw, message) = in_dialog(
+        "REFER",
+        call.b.1,
+        &format!("{};tag=b-tag", header(&call.to_b, "To")),
+        &header(&call.to_b, "From"),
+        &header(&call.to_b, "Call-ID"),
+        2,
+        &format!("Refer-To: <{}>\r\n", call.c_uri()),
+    );
+    let refer_to = parsed_refer_to(&message);
+    let handed_back = hold_controlled_refer(
+        &bus,
+        inbound(call.b.1, &raw),
+        message,
+        &refer_to,
+        &Referrer {
+            call_id: &internal_call_id,
+            from_a_leg: false,
+            from_tag: Some("b-tag"),
+        },
+        &call.dispatcher.state,
+    );
+    assert!(handed_back.is_some());
+    assert!(queued(&connection).await.is_empty());
+    assert_eq!(call.dispatcher.state.pending_inbound_refer.len(), 0);
+}
+
+/// A `Replaces` takeover puts the new party in the call's A-leg slot, on a
+/// Call-ID of its own, and retires the Call-ID that held it. A control channel
+/// bound to the old one is moved to the new, so its verbs still find the call;
+/// one already on the current A-leg, or naming a Call-ID no channel holds, is
+/// left alone.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_control_channel_follows_its_call_to_a_new_a_leg() {
+    let call = establish(8800, "terminate");
+    let state = &call.dispatcher.state;
+    let internal_call_id = call.call_id();
+    let (bus, connection) = control_plane("transfer-8800");
+    bus.register_channel(
+        "channel-8800",
+        &connection,
+        &internal_call_id,
+        &call.a_call_id,
+        "hangup",
+        std::collections::HashMap::new(),
+    );
+    assert!(
+        !channel_follows_a_leg(&bus, state, &internal_call_id, &call.a_call_id),
+        "nothing to follow while the A-leg is the one the channel is bound to"
+    );
+
+    let (d_aor, d) = ("sip:8804@example.com", "192.0.2.198:5060");
+    register(d_aor, d);
+    let siphon_tag = tag_of(&header(&call.to_b, "From"));
+    let d_call_id = "takeover-8800@192.0.2.198";
+    place(
+        &call.dispatcher,
+        d,
+        &invite(
+            d,
+            d_call_id,
+            &format!("<{d_aor}>;tag=d-tag"),
+            "sip:8800@siphon.example.com",
+            &format!(
+                "Replaces: {};to-tag={siphon_tag};from-tag=b-tag\r\n",
+                header(&call.to_b, "Call-ID")
+            ),
+        ),
+    );
+    let _ = response_to_phone(&wire(&call.dispatcher), d, 200);
+    let a_leg_now = state
+        .call_actors
+        .get_call(&internal_call_id)
+        .map(|joined| joined.a_leg.dialog.call_id.clone());
+    assert_eq!(
+        a_leg_now.as_deref(),
+        Some(d_call_id),
+        "the newcomer holds the A-leg slot"
+    );
+
+    assert!(channel_follows_a_leg(
+        &bus,
+        state,
+        &internal_call_id,
+        &call.a_call_id
+    ));
+    assert_eq!(
+        bus.sip_call_id_for_channel("channel-8800").as_deref(),
+        Some(d_call_id)
+    );
+    assert_eq!(
+        bus.channel_id_for_sip_call_id(d_call_id).as_deref(),
+        Some("channel-8800")
+    );
+    assert_eq!(bus.channel_id_for_sip_call_id(&call.a_call_id), None);
+    assert!(
+        !channel_follows_a_leg(&bus, state, &internal_call_id, &call.a_call_id),
+        "already moved"
+    );
+    assert!(
+        !channel_follows_a_leg(&bus, state, "no-such-call", &call.a_call_id),
+        "a call that is gone has no A-leg to follow"
+    );
+}

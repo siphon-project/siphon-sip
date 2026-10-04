@@ -456,6 +456,15 @@ pub struct TransferRequestedPayload {
     /// The From-tag of the referring party, if known.
     #[serde(default)]
     pub from_tag: Option<String>,
+    /// Which party of the channel's call sent the REFER: `"a"` for the party
+    /// the call came from, `"b"` for the party it was connected to. Absent from
+    /// a server that predates it.
+    #[serde(default)]
+    pub referrer_leg: Option<String>,
+    /// The SIP Call-ID of the dialog the REFER arrived on. For a `"b"` referrer
+    /// this is the `leg_sip_call_id` its `DialBranch` named, not the channel's.
+    #[serde(default)]
+    pub referrer_sip_call_id: Option<String>,
 }
 
 /// The `stage` of a [`TransferOutcomePayload`] — where the verdict on an
@@ -1595,6 +1604,21 @@ mod tests {
         assert_eq!(parsed.refer_to, "sip:carol@example.com");
         assert!(parsed.replaces.is_none());
         assert!(parsed.from_tag.is_none());
+        // A server that predates the referrer fields still parses.
+        assert!(parsed.referrer_leg.is_none());
+        assert!(parsed.referrer_sip_call_id.is_none());
+
+        // The callee of a controlled call refers: the leg and its own dialog.
+        let from_callee = serde_json::json!({
+            "refer_to": "sip:carol@example.com",
+            "replaces": null,
+            "from_tag": "callee-tag",
+            "referrer_leg": "b",
+            "referrer_sip_call_id": "leg-1@siphon"
+        });
+        let parsed: TransferRequestedPayload = serde_json::from_value(from_callee).unwrap();
+        assert_eq!(parsed.referrer_leg.as_deref(), Some("b"));
+        assert_eq!(parsed.referrer_sip_call_id.as_deref(), Some("leg-1@siphon"));
 
         // Attended transfer: an embedded Replaces triple + a referrer from_tag.
         let attended = serde_json::json!({

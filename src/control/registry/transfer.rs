@@ -135,6 +135,17 @@ impl TransferStage {
     }
 }
 
+/// The party that sent an inbound REFER, as `TransferRequested` reports it.
+#[derive(Debug, Clone, Copy)]
+pub struct TransferReferrer<'a> {
+    /// The referrer's dialog tag.
+    pub from_tag: Option<&'a str>,
+    /// Whether the REFER arrived on the A-leg of the channel's call.
+    pub from_a_leg: bool,
+    /// The SIP Call-ID of the dialog the REFER arrived on.
+    pub sip_call_id: &'a str,
+}
+
 /// One verdict on a siphon-originated (outbound) REFER, published on the control
 /// rail as `TransferProgress` / `TransferCompleted` / `TransferFailed`.
 ///
@@ -220,18 +231,20 @@ impl ControlBus {
     /// the dispatcher's store, so this adds and removes **no** per-call state of
     /// its own and needs no leak coverage here.
     ///
-    /// `channel_id` is the caller-resolved owner
-    /// ([`channel_id_for_sip_call_id`](Self::channel_id_for_sip_call_id));
-    /// `from_tag` identifies the referring party. The payload is
-    /// `{refer_to, replaces?, from_tag}` alongside the stable id triple. Returns
-    /// whether the event was pushed (idempotent no-op / `false` when the channel
-    /// is unknown or its connection is gone).
+    /// `channel_id` is the caller-resolved owner and `sip_call_id` the Call-ID
+    /// it is bound to; `referrer` identifies the referring party. The payload
+    /// is `{refer_to, replaces?, from_tag, referrer_leg, referrer_sip_call_id}`
+    /// alongside the stable id triple: `referrer_leg` is `"a"` for the party the
+    /// channel's call came from and `"b"` for the party it was connected to,
+    /// whose dialog (`referrer_sip_call_id`) is the one a `DialBranch` named.
+    /// Returns whether the event was pushed (idempotent no-op / `false` when
+    /// the channel is unknown or its connection is gone).
     pub fn forward_transfer_requested(
         &self,
         channel_id: &str,
         sip_call_id: &str,
         refer_to: &crate::sip::headers::refer::ReferTo,
-        from_tag: Option<&str>,
+        referrer: TransferReferrer<'_>,
     ) -> bool {
         let (app, call_actor_id) = match self.channels.get(channel_id) {
             Some(entry) => (entry.app.clone(), entry.call_actor_id.clone()),
@@ -248,7 +261,9 @@ impl ControlBus {
         let payload = serde_json::json!({
             "refer_to": refer_to.uri,
             "replaces": replaces,
-            "from_tag": from_tag,
+            "from_tag": referrer.from_tag,
+            "referrer_leg": if referrer.from_a_leg { "a" } else { "b" },
+            "referrer_sip_call_id": referrer.sip_call_id,
         });
         let pushed = self.publish_to_channel(
             channel_id,

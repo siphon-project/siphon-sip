@@ -46,7 +46,7 @@ mod transfer;
 
 pub use queue::{OutboundFrame, OutboundQueue, PushOutcome, SlowConsumerPolicy};
 pub use tombstones::CHANNEL_TOMBSTONE_GRACE;
-pub use transfer::{TransferOutcome, TransferStage};
+pub use transfer::{TransferOutcome, TransferReferrer, TransferStage};
 
 /// Length-checked constant-time byte comparison (bearer tokens). Length may leak
 /// — a token's length is not the secret.

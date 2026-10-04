@@ -333,6 +333,17 @@ export interface TransferRequestedPayload {
   replaces?: TransferReplaces | null;
   /** The From-tag of the referring party, if known. */
   from_tag?: string | null;
+  /**
+   * Which party of the channel's call sent the REFER: `"a"` for the party the
+   * call came from, `"b"` for the party it was connected to. Absent from a
+   * server that predates it.
+   */
+  referrer_leg?: "a" | "b" | null;
+  /**
+   * The SIP Call-ID of the dialog the REFER arrived on. For a `"b"` referrer
+   * this is the `leg_sip_call_id` its `DialBranch` named, not the channel's.
+   */
+  referrer_sip_call_id?: string | null;
 }
 
 /**

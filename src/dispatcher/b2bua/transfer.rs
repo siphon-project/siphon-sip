@@ -190,7 +190,7 @@ pub fn b2bua_bridge_inbound_replaces(
     };
     state.call_event_receivers.remove(new_call_id);
 
-    let Some((replaced, _survivor)) = state.call_actors.adopt_replaced_dialog(
+    let Some((replaced, survivor)) = state.call_actors.adopt_replaced_dialog(
         &replaced_call_id,
         pending.replaced_on_a_leg,
         new_leg_owned,
@@ -219,6 +219,16 @@ pub fn b2bua_bridge_inbound_replaces(
         );
         return;
     };
+
+    // The newcomer holds the A-leg slot now, on a Call-ID of its own: a control
+    // channel on the joined call follows it there. The slot's previous holder
+    // is the replaced party, or the survivor when the callee was replaced.
+    let previous_a_leg = if pending.replaced_on_a_leg {
+        &replaced
+    } else {
+        &survivor
+    };
+    control_channel_follows_a_leg(state, &replaced_call_id, &previous_a_leg.dialog.call_id);
 
     // Handlers that rebuild a PyCall (on_bye, CDR finalize) read these off the
     // call, and they now describe the new party.
@@ -1070,10 +1080,20 @@ pub fn b2bua_complete_terminated_transfer(
     // The promotion runs either way — it is what makes the target the surviving
     // party's peer, and is the whole point of the transfer. Only the BYE is
     // conditional on there still being a referrer to receive it.
+    let previous_a_leg = state
+        .call_actors
+        .get_call(call_id)
+        .map(|call| call.a_leg.dialog.call_id.clone());
     let promoted_referrer =
         state
             .call_actors
             .promote_transfer_target(call_id, target_idx, referrer_on_a_leg);
+    if let Some(previous) = previous_a_leg.as_deref() {
+        // Before anything is published for the call: `PeerReplaced` below is
+        // addressed by the A-leg's Call-ID, which the promotion just changed
+        // when the referrer was the A-leg.
+        control_channel_follows_a_leg(state, call_id, previous);
+    }
     if let Some(referrer_leg) = promoted_referrer.filter(|_| !referrer_gone) {
         if let Some(bye) = build_b2bua_bye(&referrer_leg, state) {
             match notify_branch.take() {

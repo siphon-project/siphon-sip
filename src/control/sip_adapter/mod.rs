@@ -35,8 +35,6 @@ pub(in crate::control) use media::{media_error, play_blob_refusal};
 use originate::originate;
 #[cfg(test)]
 pub(crate) use originate::staged;
-#[cfg(test)]
-use routing::route;
 use routing::{cancel_dial, dial, route_unless_dialling};
 use transfer::{accept_refer, refer, reject_refer, replace_peer};
 
