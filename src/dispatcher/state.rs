@@ -201,6 +201,9 @@ pub struct DispatcherState {
     pub nat_fix_contact: bool,
     /// Name used in SDP `o=` and `s=` lines (from media.sdp_name config).
     pub sdp_name: String,
+    /// Leave the `s=` line of relayed SDP as the far side wrote it (from
+    /// media.sdp_keep_session_name config). `o=` is rewritten either way.
+    pub sdp_keep_session_name: bool,
     /// SDP attribute names removed from the SDP relayed across a B2BUA call
     /// (from media.sdp_strip_attributes config). Empty when not configured.
     pub sdp_strip_attributes: Vec<String>,

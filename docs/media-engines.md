@@ -298,8 +298,13 @@ would cut the party's live audio.
 
 On a B2BUA call siphon rewrites the `o=` and `s=` lines of the SDP it relays
 between the legs, so neither party sees the other's user name, host or session
-name (`media.sdp_name`). Every other line crosses as the far side wrote it. When
-an attribute carries something the other leg should not see, list it in
+name (`media.sdp_name`). Every other line crosses as the far side wrote it.
+
+Some peers read the session name as a marker of their own. Set
+`media.sdp_keep_session_name: true` to leave `s=` as it arrived; `o=` is still
+rewritten.
+
+When an attribute carries something the other leg should not see, list it in
 `media.sdp_strip_attributes`:
 
 ```yaml
