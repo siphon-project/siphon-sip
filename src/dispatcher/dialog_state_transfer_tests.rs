@@ -804,3 +804,100 @@ async fn a_control_channel_follows_its_call_to_a_new_a_leg() {
         "a call that is gone has no A-leg to follow"
     );
 }
+
+/// A replacement dialled at a registered contact with an identity of its own:
+/// the new leg's Request-URI is the contact, it is called as the AoR, and it
+/// presents the named `From` (with a dialog tag) and asserted identity instead
+/// of the ones the call's own INVITE carried.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_replacement_leg_is_called_as_its_aor_and_presents_the_named_identity() {
+    let call = establish(8900, "terminate");
+    let state = &call.dispatcher.state;
+    let internal_call_id = call.call_id();
+    let _ = wire(&call.dispatcher);
+    let (target, dial) = ReplacementDial::to_contact(
+        DialTarget {
+            uri: call.c_uri(),
+            aor: Some(call.c.0.to_string()),
+            ..Default::default()
+        },
+        DialShaping {
+            from: Some("sip:+15550100000@trunk.example.com".to_string()),
+            from_display: Some("Front Desk".to_string()),
+            p_asserted_identity: Some("sip:+15550100000@trunk.example.com".to_string()),
+            ..Default::default()
+        },
+        vec![("X-Account".to_string(), "main".to_string())],
+    );
+    let dialled = tokio::task::block_in_place(|| {
+        b2bua_start_leg_replacement(
+            &internal_call_id,
+            false,
+            &target,
+            None,
+            None,
+            None,
+            None,
+            None,
+            0,
+            crate::b2bua::transfer::ReplacementOrigin::SiphonInitiated,
+            30,
+            &dial,
+            state,
+        )
+    });
+    assert!(dialled, "the INVITE reached the transport");
+    let to_c = sent_invite_to(&wire(&call.dispatcher), call.c.1);
+    assert_eq!(header(&to_c, "To"), format!("<{}>", call.c.0));
+    match &to_c.start_line {
+        StartLine::Request(request) => {
+            assert_eq!(request.request_uri.to_string(), call.c_uri(), "the contact")
+        }
+        StartLine::Response(_) => panic!("an INVITE is a request"),
+    }
+    let from = header(&to_c, "From");
+    assert!(
+        from.starts_with("\"Front Desk\" <sip:+15550100000@trunk.example.com>;tag="),
+        "{from}"
+    );
+    assert!(!tag_of(&from).is_empty(), "the dialog tag is kept");
+    assert_eq!(header(&to_c, "X-Account"), "main");
+    let asserted = to_c
+        .headers
+        .get_all("P-Asserted-Identity")
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(asserted.len(), 1, "one asserted identity: {asserted:?}");
+    assert!(asserted[0].contains("+15550100000@trunk.example.com"));
+
+    // Positive control: with nothing named, a replacement is called as its
+    // target URI and presents the call's own caller.
+    let other = establish(8950, "terminate");
+    let _ = wire(&other.dispatcher);
+    let other_call_id = other.call_id();
+    assert!(tokio::task::block_in_place(|| {
+        b2bua_start_leg_replacement(
+            &other_call_id,
+            false,
+            &other.c_uri(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            0,
+            crate::b2bua::transfer::ReplacementOrigin::SiphonInitiated,
+            30,
+            &ReplacementDial::default(),
+            &other.dispatcher.state,
+        )
+    }));
+    let plain = sent_invite_to(&wire(&other.dispatcher), other.c.1);
+    assert_eq!(header(&plain, "To"), format!("<{}>", other.c_uri()));
+    let plain_from = header(&plain, "From");
+    assert!(
+        plain_from.contains(&format!("sip:{}@", Established::user(other.a.0))),
+        "the caller: {plain_from}"
+    );
+    assert!(plain.headers.get("X-Account").is_none());
+}

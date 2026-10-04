@@ -51,6 +51,7 @@ pub mod shutdown;
 mod terminate;
 mod timeouts;
 mod transfer;
+mod transfer_dial;
 mod transfer_media;
 mod update;
 
@@ -93,6 +94,7 @@ pub use session_timer::*;
 pub use terminate::*;
 pub use timeouts::*;
 pub use transfer::*;
+pub use transfer_dial::*;
 pub use transfer_media::*;
 pub use update::*;
 

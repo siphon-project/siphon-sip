@@ -573,6 +573,33 @@ describe("Call verbs map to the in-process-mirrored wire verbs", () => {
     expect(transport.calls[0]?.args).toEqual({ mode: "terminate" });
   });
 
+  it("a transfer names an AoR target and the identity its new leg presents", async () => {
+    const transport = new RecordingTransport();
+    const call = makeCall(transport);
+    await call.acceptRefer({
+      target: { aor: "sip:204@example.com" },
+      from: "sip:+15550100000@trunk.example.com",
+      fromDisplay: "",
+      pAssertedIdentity: "sip:+15550100000@trunk.example.com",
+      privacy: "restricted",
+      headers: { "X-Account": "main" },
+    });
+    await call.replacePeer({ aor: "sip:204@example.com" }, { from: "sip:200@example.com" });
+    await call.replacePeer("sip:204@198.51.100.7");
+    expect(transport.calls.map((recorded) => recorded.args)).toEqual([
+      {
+        target: { aor: "sip:204@example.com" },
+        from: "sip:+15550100000@trunk.example.com",
+        from_display: "",
+        p_asserted_identity: "sip:+15550100000@trunk.example.com",
+        privacy: "restricted",
+        headers: { "X-Account": "main" },
+      },
+      { target: { aor: "sip:204@example.com" }, from: "sip:200@example.com" },
+      { target: "sip:204@198.51.100.7" },
+    ]);
+  });
+
   it("media verbs — play (file/dbId/blob), stop, dtmf, hold, unhold, stream", async () => {
     const transport = new RecordingTransport();
     const call = makeCall(transport);

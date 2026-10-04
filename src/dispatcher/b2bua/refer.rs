@@ -713,6 +713,7 @@ pub fn handle_b2bua_refer(inbound: InboundMessage, message: SipMessage, state: &
                 mode,
                 profile.as_deref(),
                 number_shape.as_ref(),
+                &ReplacementDial::default(),
                 state,
             );
         }

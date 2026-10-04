@@ -62,6 +62,7 @@ mod server;
 mod session;
 pub mod sip;
 mod stream;
+mod transfer;
 
 pub use client::{ClientConfig, ClientEvent, ControlClient, EventStream};
 pub use error::ControlError;

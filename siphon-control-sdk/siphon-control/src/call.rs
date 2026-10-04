@@ -9,7 +9,7 @@ use pyo3::prelude::*;
 
 use siphon_control_client::sip::{
     Call as RustCall, DialOptions, Dialing, DtmfOptions, PlayOptions, RecordOptions, Ringback,
-    StreamOptions,
+    StreamOptions, TransferDial, TransferTarget,
 };
 
 use crate::args::{
@@ -19,6 +19,22 @@ use crate::args::{
     extract_stream_direction, extract_stream_mode, parse_peer_hangup,
 };
 use crate::{attach_if_running, interpreter_gone, json_to_py, optional_json, to_pyerr};
+
+/// The target of a transfer verb: a URI, or a registered AoR — never both.
+fn transfer_target(
+    verb: &str,
+    target: Option<String>,
+    aor: Option<String>,
+) -> PyResult<Option<TransferTarget>> {
+    match (target, aor) {
+        (Some(_), Some(_)) => Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "{verb} takes a target URI or aor=, not both"
+        ))),
+        (Some(uri), None) => Ok(Some(TransferTarget::Uri(uri))),
+        (None, Some(aor)) => Ok(Some(TransferTarget::Aor(aor))),
+        (None, None) => Ok(None),
+    }
+}
 
 /// The dict `dial` resolves to. The bridge fields are added only for a bridge
 /// dial, so a connecting dial's dict keeps the four keys it always had.
@@ -301,7 +317,19 @@ impl Call {
     /// that party's transport to whoever remains and the survivor answers
     /// `m=audio 0` — a connected call with no audio either way. Pass the profile
     /// for the pair that remains, commonly `"rtp_passthrough"`.
-    #[pyo3(signature = (target=None, next_hop=None, mode=None, profile=None))]
+    ///
+    /// `aor` names the target by its registered address-of-record instead of
+    /// a URI: it is dialled over the flow its phone registered on, the only
+    /// way to reach one on TCP, TLS or WebSocket. Nobody registered raises
+    /// `not_found`, several contacts `invalid_state`. `from_uri`,
+    /// `from_display`, `p_asserted_identity`, `privacy` and `headers` are the
+    /// identity arguments `dial` takes, for the leg the transfer dials. They
+    /// and `aor` apply to `mode="terminate"`; `"transparent"` dials no leg.
+    #[pyo3(signature = (
+        target=None, next_hop=None, mode=None, profile=None, *, aor=None, from_uri=None,
+        from_display=None, p_asserted_identity=None, privacy=None, headers=None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
     fn accept_refer<'py>(
         &self,
         py: Python<'py>,
@@ -309,17 +337,30 @@ impl Call {
         next_hop: Option<String>,
         mode: Option<String>,
         profile: Option<String>,
+        aor: Option<String>,
+        from_uri: Option<String>,
+        from_display: Option<String>,
+        p_asserted_identity: Option<String>,
+        privacy: Option<String>,
+        headers: Option<Bound<'py, PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
+        let target = transfer_target("accept_refer", target, aor)?;
+        let dial = TransferDial {
+            next_hop,
+            from: from_uri,
+            from_display,
+            p_asserted_identity,
+            privacy: extract_privacy("accept_refer", privacy)?,
+            headers: headers
+                .map(|headers| extract_headers(&headers))
+                .transpose()?
+                .unwrap_or_default(),
+        };
         let call = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            call.accept_refer(
-                target.as_deref(),
-                next_hop.as_deref(),
-                mode.as_deref(),
-                profile.as_deref(),
-            )
-            .await
-            .map_err(to_pyerr)
+            call.accept_refer_dialling(target.as_ref(), mode.as_deref(), profile.as_deref(), &dial)
+                .await
+                .map_err(to_pyerr)
         })
     }
 
@@ -443,26 +484,52 @@ impl Call {
     /// `"invalid_state"` (not answered, no peer leg, or a replacement already
     /// in flight — all worth retrying later), or `"bad_request"` (the target
     /// will not parse or route).
-    #[pyo3(signature = (target, next_hop=None, replace_a_leg=None, profile=None, timeout=None))]
+    ///
+    /// Pass `aor=` instead of `target` to dial a registered address-of-record
+    /// over the flow its phone registered on (`not_found` when nobody is
+    /// registered, `invalid_state` when several contacts are). `from_uri`,
+    /// `from_display`, `p_asserted_identity`, `privacy` and `headers` are the
+    /// identity arguments `dial` takes, for the new leg.
+    #[pyo3(signature = (
+        target=None, next_hop=None, replace_a_leg=None, profile=None, timeout=None, *, aor=None,
+        from_uri=None, from_display=None, p_asserted_identity=None, privacy=None, headers=None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
     fn replace_peer<'py>(
         &self,
         py: Python<'py>,
-        target: String,
+        target: Option<String>,
         next_hop: Option<String>,
         replace_a_leg: Option<bool>,
         profile: Option<String>,
         timeout: Option<u32>,
+        aor: Option<String>,
+        from_uri: Option<String>,
+        from_display: Option<String>,
+        p_asserted_identity: Option<String>,
+        privacy: Option<String>,
+        headers: Option<Bound<'py, PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
+        let Some(target) = transfer_target("replace_peer", target, aor)? else {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "replace_peer requires a target URI or aor=",
+            ));
+        };
+        let dial = TransferDial {
+            next_hop,
+            from: from_uri,
+            from_display,
+            p_asserted_identity,
+            privacy: extract_privacy("replace_peer", privacy)?,
+            headers: headers
+                .map(|headers| extract_headers(&headers))
+                .transpose()?
+                .unwrap_or_default(),
+        };
         let call = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let value = call
-                .replace_peer(
-                    &target,
-                    next_hop.as_deref(),
-                    replace_a_leg,
-                    profile.as_deref(),
-                    timeout,
-                )
+                .replace_peer_dialling(&target, replace_a_leg, profile.as_deref(), timeout, &dial)
                 .await
                 .map_err(to_pyerr)?;
             attach_if_running(|py| json_to_py(py, &value))

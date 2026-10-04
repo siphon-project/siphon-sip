@@ -11,8 +11,8 @@ use super::originate::{
 };
 use super::routing::{dial_error, parse_dial_target, parse_route_target, route};
 use super::transfer::{
-    accept_refer, parse_refer_mode, parse_replaces_arg, refer, reject_refer, replace_error,
-    replace_peer,
+    accept_refer, parse_refer_mode, parse_replaces_arg, parse_transfer_dial, refer, reject_refer,
+    replace_error, replace_peer,
 };
 use super::*;
 use crate::control::registry::ControlBus;
@@ -2886,6 +2886,186 @@ fn an_aor_originate_with_no_dispatcher_registers_no_channel() {
         ),
         "got {result:?}"
     );
+}
+
+fn register_contact(aor: &str, contact: &str) {
+    crate::script::api::test_registrar()
+        .save(
+            aor,
+            crate::sip::parser::parse_uri_standalone(contact).expect("a contact URI"),
+            3600,
+            1.0,
+            format!("register-{contact}"),
+            1,
+        )
+        .expect("the binding saves");
+}
+
+fn transfer_refusal(verb: &str, args: serde_json::Value) -> (ControlErrorCode, serde_json::Value) {
+    match parse_transfer_dial(verb, &args) {
+        Err(ControlResult::Error { code, details, .. }) => (code, details.unwrap_or_default()),
+        Err(ControlResult::Ok(reply)) => panic!("a refusal that is ok: {reply}"),
+        Ok(_) => panic!("{args} was accepted"),
+    }
+}
+
+#[test]
+fn a_transfer_target_is_a_uri_or_a_registered_aor() {
+    let named = |args: serde_json::Value| {
+        parse_transfer_dial("replace_peer", &args)
+            .ok()
+            .expect("accepted")
+    };
+    // No target at all is the verb's to judge: accept_refer has the Refer-To.
+    assert_eq!(named(serde_json::json!({})).target, None);
+    for args in [
+        serde_json::json!({ "target": "sip:204@198.51.100.7" }),
+        serde_json::json!({ "target": { "uri": "sip:204@198.51.100.7" } }),
+    ] {
+        let transfer = named(args);
+        assert_eq!(transfer.target.as_deref(), Some("sip:204@198.51.100.7"));
+        assert!(transfer.dial.aor.is_none() && transfer.dial.flow.is_none());
+    }
+
+    // An AoR with one phone: the contact is what is dialled, called as the AoR.
+    register_contact(
+        "sip:tx5501@siphon.example.com",
+        "sip:tx5501@198.51.100.61:5060",
+    );
+    let transfer = named(serde_json::json!({
+        "target": { "aor": "sip:tx5501@siphon.example.com" }
+    }));
+    assert_eq!(
+        transfer.target.as_deref(),
+        Some("sip:tx5501@198.51.100.61:5060")
+    );
+    assert_eq!(
+        transfer.dial.aor.as_deref(),
+        Some("sip:tx5501@siphon.example.com")
+    );
+}
+
+#[test]
+fn a_transfer_to_an_aor_nobody_or_several_registered_at_is_refused() {
+    let (code, _) = transfer_refusal(
+        "accept_refer",
+        serde_json::json!({ "target": { "aor": "sip:tx5502@siphon.example.com" } }),
+    );
+    assert_eq!(code, ControlErrorCode::NotFound);
+
+    // Two phones: a replacement rings one target, so neither is picked.
+    register_contact(
+        "sip:tx5503@siphon.example.com",
+        "sip:tx5503@198.51.100.62:5060",
+    );
+    register_contact(
+        "sip:tx5503@siphon.example.com",
+        "sip:tx5503@198.51.100.63:5060",
+    );
+    let (code, details) = transfer_refusal(
+        "accept_refer",
+        serde_json::json!({ "target": { "aor": "sip:tx5503@siphon.example.com" } }),
+    );
+    assert_eq!(code, ControlErrorCode::InvalidState);
+    assert_eq!(details["verb"], "accept_refer");
+    assert_eq!(details["reason"], "several_contacts");
+    assert_eq!(details["contacts"], 2);
+
+    // A registered phone is reached over its own flow, never a next hop.
+    register_contact(
+        "sip:tx5504@siphon.example.com",
+        "sip:tx5504@198.51.100.64:5060",
+    );
+    let (code, _) = transfer_refusal(
+        "replace_peer",
+        serde_json::json!({
+            "target": { "aor": "sip:tx5504@siphon.example.com" },
+            "next_hop": "sip:edge.example.com"
+        }),
+    );
+    assert_eq!(code, ControlErrorCode::BadRequest);
+    for target in [
+        serde_json::json!(7),
+        serde_json::json!({}),
+        serde_json::json!({ "uri": "sip:a@example.com", "aor": "sip:b@example.com" }),
+        serde_json::json!("not a uri"),
+    ] {
+        let (code, _) = transfer_refusal("replace_peer", serde_json::json!({ "target": target }));
+        assert_eq!(code, ControlErrorCode::BadRequest);
+    }
+}
+
+#[test]
+fn a_transfer_carries_the_identity_arguments_a_dial_takes() {
+    let transfer = parse_transfer_dial(
+        "accept_refer",
+        &serde_json::json!({
+            "from": "sip:+15550100000@trunk.example.com",
+            "from_display": "",
+            "p_asserted_identity": "sip:+15550100000@trunk.example.com",
+            "privacy": "restricted",
+            "headers": { "X-Account": "main" }
+        }),
+    )
+    .ok()
+    .expect("accepted");
+    let shaping = &transfer.dial.shaping;
+    assert_eq!(
+        shaping.from.as_deref(),
+        Some("sip:+15550100000@trunk.example.com")
+    );
+    assert_eq!(
+        shaping.from_display.as_deref(),
+        Some(""),
+        "an empty display name is kept: it removes the caller's"
+    );
+    assert_eq!(
+        shaping.privacy,
+        Some(crate::sip::privacy::CallerIdPresentation::Restricted)
+    );
+    assert_eq!(
+        transfer.dial.headers,
+        [("X-Account".to_string(), "main".to_string())]
+    );
+
+    for args in [
+        serde_json::json!({ "from": "not a uri" }),
+        serde_json::json!({ "p_asserted_identity": "not a uri" }),
+        serde_json::json!({ "privacy": "sometimes" }),
+    ] {
+        let (code, _) = transfer_refusal("accept_refer", args);
+        assert_eq!(code, ControlErrorCode::BadRequest);
+    }
+}
+
+#[test]
+fn a_transparent_transfer_refuses_what_it_would_never_use() {
+    // It relays the REFER and dials no leg, so an identity or a flow named on
+    // it would be accepted and silently dropped.
+    for args in [
+        serde_json::json!({ "mode": "transparent", "from": "sip:1@example.com" }),
+        serde_json::json!({ "mode": "transparent", "headers": { "X-A": "b" } }),
+        serde_json::json!({ "mode": "transparent", "privacy": "restricted" }),
+    ] {
+        let result = accept_refer(&channel(), &args);
+        assert!(
+            bad_request_message(&result).contains("transparent"),
+            "{args}"
+        );
+    }
+    // Positive control: with nothing to drop it gets as far as the pending
+    // REFER, of which there is none here.
+    let result = accept_refer(
+        &channel(),
+        &serde_json::json!({ "mode": "transparent", "target": "sip:c@example.com" }),
+    );
+    assert!(matches!(
+        result,
+        ControlResult::Error {
+            code: ControlErrorCode::NotFound,
+            ..
+        }
+    ));
 }
 
 fn bad_request_message(result: &ControlResult) -> String {

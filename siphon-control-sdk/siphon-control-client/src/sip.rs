@@ -42,6 +42,7 @@ pub use crate::recording::{RecordChannels, RecordDirection, RecordOptions, Recor
 use crate::server::{ControlServer, ServerConfig};
 use crate::session::CommandTransport;
 pub use crate::stream::{StreamChannels, StreamDirection, StreamMode, StreamOptions};
+pub use crate::transfer::{TransferDial, TransferTarget};
 
 mod app_event;
 pub use app_event::{AppEvent, AppEventStream};
