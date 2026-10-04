@@ -1178,6 +1178,12 @@ pub fn bridge_adopt_media(
             ],
         );
     }
+    // The calls go on, so a recording on a session retired here did not end
+    // because its call did: noted before the delete, whose finish report says
+    // only that the session went.
+    for (media_call_id, _) in &retired {
+        crate::rtpengine::MediaBackend::session_retired_for_bridge(media_call_id);
+    }
     bridge_delete_sessions(state, retired, "the bridge formed");
 }
 

@@ -56,6 +56,31 @@ static ACTIVE_PLAYBACKS: std::sync::LazyLock<PlaybackRecords> =
 /// `(engine call-id, leg tag)` → the `play_id` of each playback on that leg.
 type PlaybackRecords = dashmap::DashMap<(String, String), Vec<Option<u64>>>;
 
+/// Recordings siphon started and has not seen finish, by `recording_id`.
+///
+/// Kept for one question the engine cannot answer: *why* a recording's session
+/// ended. The engine reports `call_ended` whenever a session goes, and a bridge
+/// retires sessions on calls that are very much alive — so siphon notes, here,
+/// the sessions it retired itself. An entry leaves when the engine reports the
+/// recording finished; one whose session was deleted and whose report never
+/// came (an engine that went away) is dropped by the next `record_start` once
+/// [`RECORDING_REPORT_GRACE`] has passed, so the map cannot outgrow its calls.
+static ACTIVE_RECORDINGS: std::sync::LazyLock<dashmap::DashMap<String, RecordingTrack>> =
+    std::sync::LazyLock::new(dashmap::DashMap::new);
+
+/// How long a recording's finish report is waited for after its session went.
+const RECORDING_REPORT_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// What siphon knows about a recording it started.
+struct RecordingTrack {
+    /// The engine call-id the recording is on.
+    call_id: String,
+    /// siphon retired that session itself, to form a bridge.
+    retired_for_bridge: bool,
+    /// When the session was deleted, from which the finish report is awaited.
+    session_ended: Option<std::time::Instant>,
+}
+
 impl MediaBackend {
     /// Whether siphon started a playback on this leg and has not seen it end.
     ///
@@ -86,6 +111,65 @@ impl MediaBackend {
             plays.retain(|play| *play != Some(play_id));
         }
         ACTIVE_PLAYBACKS.remove_if(&key, |_, plays| plays.is_empty());
+    }
+
+    /// The engine session `call_id` is about to be deleted because a bridge
+    /// replaced it, on a call that goes on: any recording on it ends for that
+    /// reason, not because its call ended.
+    pub fn session_retired_for_bridge(call_id: &str) {
+        for mut recording in ACTIVE_RECORDINGS.iter_mut() {
+            if recording.call_id == call_id {
+                recording.retired_for_bridge = true;
+            }
+        }
+    }
+
+    /// The engine reported recording `recording_id` finished. Returns whether
+    /// it was on a session siphon retired to form a bridge.
+    pub fn recording_finished(recording_id: &str) -> bool {
+        ACTIVE_RECORDINGS
+            .remove(recording_id)
+            .is_some_and(|(_, recording)| recording.retired_for_bridge)
+    }
+
+    /// Recordings siphon started on `call_id` whose finish has not been seen.
+    #[cfg(test)]
+    pub(crate) fn recordings_awaited_on(call_id: &str) -> usize {
+        ACTIVE_RECORDINGS
+            .iter()
+            .filter(|recording| recording.call_id == call_id)
+            .count()
+    }
+
+    /// Note a recording the engine accepted, and drop any whose session went
+    /// longer ago than [`RECORDING_REPORT_GRACE`] with no finish reported.
+    pub(crate) fn recording_started(recording_id: &str, call_id: &str, now: std::time::Instant) {
+        ACTIVE_RECORDINGS.retain(|_, recording| {
+            recording
+                .session_ended
+                .is_none_or(|ended| now.duration_since(ended) < RECORDING_REPORT_GRACE)
+        });
+        ACTIVE_RECORDINGS.insert(
+            recording_id.to_string(),
+            RecordingTrack {
+                call_id: call_id.to_string(),
+                retired_for_bridge: false,
+                session_ended: None,
+            },
+        );
+    }
+
+    /// The session `call_id` is being deleted: its recordings' finish reports
+    /// are awaited from now.
+    fn recordings_session_ended(call_id: &str, now: std::time::Instant) {
+        if ACTIVE_RECORDINGS.is_empty() {
+            return;
+        }
+        for mut recording in ACTIVE_RECORDINGS.iter_mut() {
+            if recording.call_id == call_id && recording.session_ended.is_none() {
+                recording.session_ended = Some(now);
+            }
+        }
     }
 
     /// Which engine this is, as the `media.backend` config spells it.
@@ -181,6 +265,7 @@ impl MediaBackend {
         // away either way, and a playback record that outlived its call would
         // be the one way `ACTIVE_PLAYBACKS` could grow without bound.
         ACTIVE_PLAYBACKS.remove(&(call_id.to_string(), from_tag.to_string()));
+        Self::recordings_session_ended(call_id, std::time::Instant::now());
         match self {
             Self::RtpEngine(set) => set.delete(call_id, from_tag).await,
             Self::SiphonRtp(client) => client.delete(call_id, from_tag).await,
@@ -287,7 +372,11 @@ impl MediaBackend {
         request: &RecordingRequest<'_>,
     ) -> Result<String, RtpEngineError> {
         match self {
-            Self::SiphonRtp(set) => set.start_recording(call_id, from_tag, request).await,
+            Self::SiphonRtp(set) => {
+                let recording_id = set.start_recording(call_id, from_tag, request).await?;
+                Self::recording_started(&recording_id, call_id, std::time::Instant::now());
+                Ok(recording_id)
+            }
             Self::RtpEngine(_) => Err(RtpEngineError::Unsupported {
                 operation: "record_start",
                 backend: "rtpengine",
@@ -1039,6 +1128,76 @@ mod tests {
     use super::*;
     use crate::rtpengine::events::RtpEngineEvent;
     use tokio::sync::mpsc;
+
+    // -----------------------------------------------------------------------
+    // Recording bookkeeping (`ACTIVE_RECORDINGS`)
+    // -----------------------------------------------------------------------
+
+    /// THE leak gate for the recording map: every recording leaves on its
+    /// finish report, and one whose report never comes leaves once its
+    /// session has been gone longer than the grace — so under complete calls
+    /// the map returns to where it started, whichever way each ended.
+    #[test]
+    fn recording_records_drain_to_baseline() {
+        let prefix = "recording-drain-";
+        let awaited = || {
+            ACTIVE_RECORDINGS
+                .iter()
+                .filter(|recording| recording.call_id.starts_with(prefix))
+                .count()
+        };
+        assert_eq!(awaited(), 0);
+        let start = std::time::Instant::now();
+        for cycle in 0..64 {
+            let call_id = format!("{prefix}{cycle}@192.0.2.10");
+            let reported = format!("{prefix}reported-{cycle}");
+            let lost = format!("{prefix}lost-{cycle}");
+            MediaBackend::recording_started(&reported, &call_id, start);
+            MediaBackend::recording_started(&lost, &call_id, start);
+            assert_eq!(MediaBackend::recordings_awaited_on(&call_id), 2);
+
+            // The session goes; one recording's finish is reported, the
+            // other's never is.
+            MediaBackend::recordings_session_ended(&call_id, start);
+            assert!(!MediaBackend::recording_finished(&reported));
+            assert_eq!(MediaBackend::recordings_awaited_on(&call_id), 1);
+        }
+        assert_eq!(awaited(), 64, "the unreported ones are still awaited");
+
+        // A recording started inside the grace drops nothing.
+        let inside = start + RECORDING_REPORT_GRACE - std::time::Duration::from_secs(1);
+        MediaBackend::recording_started(&format!("{prefix}inside"), "other@192.0.2.11", inside);
+        assert_eq!(awaited(), 64);
+        // One started after it drops every recording whose report never came.
+        let after = start + RECORDING_REPORT_GRACE + std::time::Duration::from_secs(1);
+        MediaBackend::recording_started(&format!("{prefix}after"), "other@192.0.2.11", after);
+        assert_eq!(awaited(), 0, "drained");
+        assert!(!MediaBackend::recording_finished(&format!(
+            "{prefix}inside"
+        )));
+        assert!(!MediaBackend::recording_finished(&format!("{prefix}after")));
+    }
+
+    /// A session siphon retired for a bridge marks the recordings on it, and
+    /// only those; the mark is read once, when the finish is reported.
+    #[test]
+    fn a_recording_on_a_session_retired_for_a_bridge_says_so() {
+        let now = std::time::Instant::now();
+        let retired = "recording-bridged-anchor@192.0.2.10";
+        let untouched = "recording-bridged-other@192.0.2.10";
+        MediaBackend::recording_started("recording-bridged-1", retired, now);
+        MediaBackend::recording_started("recording-bridged-2", untouched, now);
+        MediaBackend::session_retired_for_bridge(retired);
+        assert!(MediaBackend::recording_finished("recording-bridged-1"));
+        assert!(
+            !MediaBackend::recording_finished("recording-bridged-1"),
+            "reported once"
+        );
+        assert!(!MediaBackend::recording_finished("recording-bridged-2"));
+        assert!(!MediaBackend::recording_finished("never-started"));
+        assert_eq!(MediaBackend::recordings_awaited_on(retired), 0);
+        assert_eq!(MediaBackend::recordings_awaited_on(untouched), 0);
+    }
 
     /// A backend whose protocol carries only a play count refuses an endless
     /// play, and passes a count or none through as it was.
