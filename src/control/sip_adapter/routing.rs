@@ -291,10 +291,17 @@ pub(super) fn parse_dial_target(
             .unwrap_or_default()
             .into_iter()
             .collect();
+        // The called party is the same on every contact the AoR forks to: a
+        // divert names the number the call is going to, not a phone.
+        let to = object
+            .get("to")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
         return match crate::dispatcher::dial_targets_for_aor(aor) {
             Ok(mut branches) => {
                 for branch in &mut branches {
                     branch.headers.extend(headers.clone());
+                    branch.to.clone_from(&to);
                 }
                 Ok(branches)
             }
@@ -335,6 +342,10 @@ pub(super) fn parse_dial_target(
             .map(|s| s.to_string()),
         privacy: super::originate::parse_privacy("dial target", object.get("privacy"))
             .map_err(|error| error.to_string())?,
+        to: object
+            .get("to")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
         // A URI dialled as written names no registered AoR, even one that
         // happens to be a registered contact: only an `{aor}` target says whom
         // the branch was dialled for.
