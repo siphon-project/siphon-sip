@@ -386,14 +386,14 @@ describe("Call verbs map to the in-process-mirrored wire verbs", () => {
     const transport = new RecordingTransport();
     const call = makeCall(transport);
     await call.cancelDial();
-    await call.cancelDial("max_wait");
+    await call.cancelDial("gave_up");
     expect(transport.calls).toEqual([
       { module: MODULE_SIP, verb: "cancel_dial", target: { channel: "ch1" }, args: {} },
       {
         module: MODULE_SIP,
         verb: "cancel_dial",
         target: { channel: "ch1" },
-        args: { reason: "max_wait" },
+        args: { reason: "gave_up" },
       },
     ]);
   });

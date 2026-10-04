@@ -34,7 +34,7 @@ impl Call {
     /// ```no_run
     /// # use siphon_control_client::sip::Call;
     /// # async fn example(call: &Call) -> Result<(), siphon_control_client::ControlError> {
-    /// call.cancel_dial(Some("max_wait")).await?;
+    /// call.cancel_dial(Some("gave_up")).await?;
     /// # Ok(())
     /// # }
     /// ```
@@ -62,8 +62,8 @@ mod tests {
     fn the_reason_goes_on_the_wire_only_when_given() {
         assert_eq!(cancel_dial_args(None), json!({}));
         assert_eq!(
-            cancel_dial_args(Some("max_wait")),
-            json!({ "reason": "max_wait" })
+            cancel_dial_args(Some("gave_up")),
+            json!({ "reason": "gave_up" })
         );
     }
 }

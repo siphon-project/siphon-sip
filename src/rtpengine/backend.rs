@@ -145,9 +145,9 @@ impl MediaBackend {
     /// longer ago than [`RECORDING_REPORT_GRACE`] with no finish reported.
     pub(crate) fn recording_started(recording_id: &str, call_id: &str, now: std::time::Instant) {
         ACTIVE_RECORDINGS.retain(|_, recording| {
-            recording
+            !recording
                 .session_ended
-                .is_none_or(|ended| now.duration_since(ended) < RECORDING_REPORT_GRACE)
+                .is_some_and(|ended| now.duration_since(ended) >= RECORDING_REPORT_GRACE)
         });
         ACTIVE_RECORDINGS.insert(
             recording_id.to_string(),

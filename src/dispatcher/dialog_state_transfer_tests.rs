@@ -823,7 +823,7 @@ async fn a_replacement_leg_is_called_as_its_aor_and_presents_the_named_identity(
         },
         DialShaping {
             from: Some("sip:+15550100000@trunk.example.com".to_string()),
-            from_display: Some("Front Desk".to_string()),
+            from_display: Some("Main Line".to_string()),
             p_asserted_identity: Some("sip:+15550100000@trunk.example.com".to_string()),
             ..Default::default()
         },
@@ -857,7 +857,7 @@ async fn a_replacement_leg_is_called_as_its_aor_and_presents_the_named_identity(
     }
     let from = header(&to_c, "From");
     assert!(
-        from.starts_with("\"Front Desk\" <sip:+15550100000@trunk.example.com>;tag="),
+        from.starts_with("\"Main Line\" <sip:+15550100000@trunk.example.com>;tag="),
         "{from}"
     );
     assert!(!tag_of(&from).is_empty(), "the dialog tag is kept");

@@ -68,7 +68,7 @@ async fn a_cancelled_bridge_dial_cancels_every_phone_and_keeps_the_caller() {
         &controller,
         "cancel_dial",
         "caller-ring",
-        serde_json::json!({ "reason": "max_wait" }),
+        serde_json::json!({ "reason": "gave_up" }),
     )
     .await;
     assert_eq!(reply["status"], "ok", "{reply}");
@@ -102,7 +102,7 @@ async fn a_cancelled_bridge_dial_cancels_every_phone_and_keeps_the_caller() {
     let failed = &heard[2].payload;
     assert_eq!(failed["code"], 487);
     assert_eq!(failed["reason"], "Request Terminated");
-    assert_eq!(failed["cause"], "max_wait");
+    assert_eq!(failed["cause"], "gave_up");
     assert_eq!(failed["timed_out"], false);
     assert_eq!(failed["branches"].as_array().map(Vec::len), Some(2));
     assert_eq!(

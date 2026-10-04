@@ -288,18 +288,19 @@ what lets a refused verb be lined up against a capture, a CDR and HEP.
 | `hangup` | sip | `{reason?}` | BYE an answered call, or reject an unanswered one |
 | `drop` | sip | `{reason?, ban?}` | abandon an **unanswered** call with no final response and no CANCEL on the wire (the `100 Trying` siphon sent when the INVITE arrived has already gone) and release it; `ban: true` also scores the caller's source toward an auto-ban; refused (`invalid_state`) on an answered call, whose dialog is owed a BYE, and on an `originate {aor}` whose phones are still ringing, whose INVITEs are owed a CANCEL (`hangup`). See [dropping unsolicited traffic](#drop--abandon-a-call-without-answering-it) |
 | `refer` | sip | `{to, replaces?}` | in-dialog REFER on the A-leg |
-| `accept_refer` | sip | `{target?, next_hop?, mode?}` | accept a pending inbound REFER (from a `TransferRequested` event) and run the transfer |
+| `accept_refer` | sip | `{target?, next_hop?, mode?, profile?, number_policy?, format?, from?, from_display?, p_asserted_identity?, privacy?, headers?}` | accept a pending inbound REFER (from a `TransferRequested` event) and run the transfer. `target` is a URI, `{uri}` or `{aor}` — see [inbound REFER](#an-inbound-refer-on-a-controlled-call) |
 | `reject_refer` | sip | `{code?, reason?}` | reject a pending inbound REFER with a final non-2xx (default `603 Decline`) |
 | `bridge` | sip | `{with, on_peer_hangup?, profile?}` | join this channel to another the app owns; the reply says the media was negotiated, `ChannelBridged` says the audio meets. `profile` names one media profile for the pair — see [`bridge`](#joining-two-legs-bridge) |
 | `unbridge` | sip | `{reason?}` | break a bridge — both legs stay answered, owned and held |
-| `replace_peer` | sip | `{target, next_hop?, replace_a_leg?, profile?, timeout?}` | swap one party of this answered call for a freshly dialed target, no REFER involved; the replaced leg stays up while the target rings, `PeerReplaced` says the swap landed |
+| `replace_peer` | sip | `{target, next_hop?, replace_a_leg?, profile?, number_policy?, format?, timeout?, from?, from_display?, p_asserted_identity?, privacy?, headers?}` | swap one party of this answered call for a freshly dialed target, no REFER involved; the replaced leg stays up while the target rings, `PeerReplaced` says the swap landed |
 | `dial` | sip | `{targets, strategy?, timeout?, headers?, profile?, from?, from_display?, p_asserted_identity?, privacy?, on_answer?, ringback?}` (identity fields also per target, as is the called party `to?`) | ring B-legs while the caller stays **unanswered** and the app keeps the channel; refused (`invalid_state`) on an answered call with `error.details: {verb: "dial", reason: "already_answered", call_state}` — see [`dial`](#dial--ring-while-the-caller-waits). With `on_answer: "bridge"`, ring phones for a caller the app already **answered** and anchored, play `ringback` while they alert, and bridge the one that picks up — see [`on_answer`](#dial-on_answer-bridge--ring-phones-for-an-answered-caller) |
-| `route` | sip | `{targets, strategy?, headers?}` | return control to siphon: un-park the call and dial the B-leg via LCR sequential failover |
+| `cancel_dial` | sip | `{reason?}` | give up on the dial ringing for this channel's caller and leave the caller alone: the phones are CANCELled and the dial ends in `DialFailed` with code 487 — see [`cancel_dial`](#cancel_dial--stop-a-dial-and-keep-the-caller) |
+| `route` | sip | `{targets, strategy?, headers?}` | return control to siphon: un-park the call and dial the B-leg via LCR sequential failover. Refused (`invalid_state`, `error.details: {verb: "route", reason: "dial_in_progress"}`) while a `dial` still rings for the call, since `route` releases the channel the dial reports on: `cancel_dial` first |
 | `set_header` / `remove_header` / `get_header` | sip | `{name, value?}` | on the stored A-leg INVITE |
 | `play` | sip | `{file\|db_id\|blob\|tone\|url, repeat?, start_ms?, duration_ms?, gain_decibels?, to_tag?}` | play an announcement on the A-leg media (fire-and-forget); the reply and a `PlayStarted` event carry the `play_id` |
 | `stop` | sip | — | stop the announcement currently playing |
 | `dtmf` | sip | `{digits, duration_ms?, volume_dbm0?, pause_ms?, to_tag?}` | inject DTMF digits toward the A-leg |
-| `hold` / `unhold` | sip | — | media hold via silence |
+| `hold` / `unhold` | sip | — | silence the call's media on the engine, in both directions, and restore it; a media gate, not a SIP hold |
 | `stream_start` | sip | `{ws_uri, mode?, direction?, channels?, sample_rate?, profile?}` | attach a WebSocket audio tee (`mode: tee`, the default) or takeover bridge (`mode: bridge`) (siphon-rtp backend only) |
 | `stream_stop` | sip | `{mode?}` | detach the WebSocket audio tee (`mode: tee`, the default) or bridge |
 | `set_var` / `get_var` | — | `{key, value?}` | per-call variables (drain with the call) |
@@ -375,9 +376,23 @@ same way every other verb does — never a hang:
   arrived, which is why `duration_ms` can be absent. A play the backend refuses
   answers with a typed error and pushes **no** `PlayStarted`, so "no start event
   yet" always reads as "not started".
-- `hold` maps to the engine's *silence* (comfort-noise) mode and `unhold`
-  restores it — a gentle hold that keeps the media path up. Dropping packets
-  outright (`block`/`unblock`) is a separate future gate verb.
+- `play`'s `repeat` is a **total play count**, or the string `"inf"` to play
+  until a `stop` — music on hold. An endless play's accept carries
+  no `duration_ms`. `"inf"` needs the `siphon-rtp` backend: rtpengine and
+  rtpproxy carry only a count and answer `unsupported_verb` rather than playing
+  once. An argument that is present and unusable — a `repeat` that is neither,
+  a `start_ms`, `duration_ms` or `gain_decibels` that is not a number, a
+  `to_tag` that is not a string — is refused `bad_request` with
+  `error.details: {verb: "play", argument, reason: "invalid_value"}`. It is not
+  dropped: a `repeat` read as absent plays the prompt once and answers `ok`.
+- `hold` silences the call's media on the engine and `unhold` restores it. It
+  is a media gate, not a SIP hold: the audio is replaced with silence in **both**
+  directions and nothing is sent on either dialog, so no phone shows a held
+  call. It applies to a call the engine transcodes, records or streams; on one
+  it only relays it is refused `invalid_state` with `error.details: {verb,
+  reason: "media_not_processed"}`. To hold **one party** of a bridge, with the
+  `sendonly` re-offer a phone displays (RFC 3264 §8.4), use `unbridge`.
+  Dropping packets outright (`block`/`unblock`) is a separate future gate verb.
 - `stream_start` / `stream_stop` attach and detach a **WebSocket audio tee** —
   an *additive* copy of the live call's audio for transcription / agent-assist /
   compliance, not a takeover of the media path. This is a `siphon-rtp`-backend
@@ -519,8 +534,15 @@ message is), `egress` or `both`; `channels` is `mono` or `stereo`.
 `RecordingFinished {recording_id, path, reason, duration_ms}` arrives when the
 file is **closed**, which is the event worth waiting for: attaching the audio to
 an email on the `record_stop` reply would race a half-written file. `reason` is
-`stopped`, `max_duration`, `silence`, `call_ended` or `error` — a voicemail box
-reads those differently.
+`stopped`, `max_duration`, `silence`, `call_ended`, `bridged` or `error` — a
+voicemail box reads those differently.
+
+`bridged` is a recording that ended because the leg was **bridged**, on a call
+that is still up. A leg siphon answered itself is anchored on a single-party
+engine session; forming a bridge moves its media onto the pair's own session
+and retires the old one, with the recording on it. The same happens to a
+recording on the leg being bridged in. To record the conversation, issue
+`record_start` again once `ChannelBridged` arrives.
 
 It works on a single-leg, engine-terminated call, which is what a voicemail box
 is. This is **not** `li.record()`: that is SIPREC, where a recording *server*
@@ -803,19 +825,58 @@ its target (about 36 µs at 1,000 bindings, `match_callee_1k_bindings`; an
 record lives on its call and is released with it; the proxy store drains as
 each dialog ends.
 
+### An inbound REFER on a controlled call
+
 An **inbound REFER on a controlled call** (a party asking to be transferred) is
 handed to the owning app rather than the in-process `@b2bua.on_refer` path: siphon
 holds the REFER un-answered and pushes a `TransferRequested` event, payload
-`{refer_to, replaces?, from_tag}` (`replaces` present for an attended transfer;
-`from_tag` identifies the referring party). The app decides with:
+`{refer_to, replaces?, from_tag, referrer_leg, referrer_sip_call_id}`.
 
-- `accept_refer` `{target?, next_hop?, mode?}` — run the transfer through siphon's
-  shipped machinery. `target` overrides the Refer-To URI, `next_hop` steers egress
+Either party of the call can refer, and the event says which. `referrer_leg` is
+`"a"` for the party the channel's call came from and `"b"` for the party it was
+connected to — a phone transferring a call it **answered**. A B-leg has a dialog
+of its own, on a Call-ID siphon generated, so `referrer_sip_call_id` is the
+`leg_sip_call_id` its `DialBranch` named rather than the channel's.
+
+`replaces` is present for an attended transfer: `{call_id, from_tag, to_tag,
+early_only, local}`. `local` is set when this node hosts the dialog named:
+`{call_actor_id, channel, leg, bridged_with}` — the call it belongs to, the
+channel controlling that call, which leg of it the dialog is, and the channel
+that call is bridged with. A `Replaces` carries a Call-ID and two tags, none of
+which an application ever sees; `local` is the same dialog in the terms it
+works in. It is `null` for a dialog hosted elsewhere.
+
+One decision is pending per call. A retransmission of the held REFER is
+absorbed; a second REFER on the same call while the first is undecided is
+answered `491 Request Pending`.
+
+The app decides with:
+
+- `accept_refer` — run the transfer through siphon's shipped machinery.
+  `target` overrides the Refer-To, `next_hop` steers egress
   without reshaping the R-URI, and `mode` is `terminate` (siphon-terminated: 202 +
   sipfrag NOTIFYs + re-dial the target as a new leg — the default, from
   `b2bua.default_refer_mode`) or `transparent` (forward the REFER on the far leg's
   own dialog). On a single-leg call (a voice-AI / IVR call siphon answered itself,
   no B leg) terminate mode re-dials the target off the A dialog.
+
+  `target` is a URI string, `{uri}` or `{aor}`. An AoR is dialled the way
+  `dial {aor}` dials one: over the flow its phone registered on and through the
+  Path of its binding, which is the only way to reach a phone on TCP, TLS or
+  WSS behind NAT. Nobody registered answers `not_found`. An AoR with several
+  registered contacts answers `invalid_state` with `error.details: {verb,
+  reason: "several_contacts", contacts}`: a transfer rings one target, and
+  ringing one phone of a party that has several would not be what was asked.
+  Name the contact with `{uri}`, or ring them all with a `dial`. `next_hop`
+  beside an `{aor}` is `bad_request`.
+
+  `from`, `from_display`, `p_asserted_identity`, `privacy` and `headers` are
+  the arguments [`dial` takes](#presenting-an-identity) and shape the leg the
+  transfer dials the same way. Without them it presents what the call's own
+  INVITE carried, which after a transfer is the wrong party as often as not.
+  They and `{aor}` apply to `terminate`; `transparent` relays the REFER, dials
+  no leg, and refuses them `bad_request` rather than accepting and ignoring
+  them.
 - `reject_refer` `{code?, reason?}` — decline with a final non-2xx (default
   `603 Decline`).
 
@@ -1340,8 +1401,9 @@ being bridged is seen through. `DialFailed` comes only once nothing is left.
 | `DialFailed` | `{code, reason, cause, timed_out, branches}` | nobody answered; the ringback is already stopped, and nothing was sent to the caller. `branches` entries are `{leg_id, leg_sip_call_id, target, aor?, code, reason, cause}` |
 
 `cause` on `DialFailed` says how the dial ended: `rejected`, `ring timeout`,
-`unsent`, `bridge_failed`, or `caller_hangup` when the caller went away while
-the phones rang.
+`unsent`, `bridge_failed`, the `reason` a [`cancel_dial`](#cancel_dial--stop-a-dial-and-keep-the-caller)
+named (`cancelled` when it named none), or `caller_hangup` when the caller went
+away while the phones rang.
 In that last case every phone is CANCELled (RFC 3261 §9.1) and `DialFailed`
 precedes the caller's `StasisEnd`. After `DialFailed` the caller is still
 answered and owned: play the voicemail prompt, or dial again.
@@ -1361,7 +1423,46 @@ Refused, each with `error.details` `{verb: "dial", reason, …}`:
 | `invalid_state` | `not_anchored` | `bridge` on an answered caller with no media session on the engine |
 | `invalid_state` | `already_bridged` | the caller is already bridged |
 | `invalid_state` | `dial_in_progress` | the caller already has phones ringing for it |
+| `invalid_state` | `dial_cancelled` | a `cancel_dial` arrived while the dial was being set up: no phone was rung |
 | `not_found` | `call_gone` | the caller is gone |
+
+### `cancel_dial` — stop a dial and keep the caller
+
+```json
+{ "verb": "cancel_dial", "target": {"channel": "ch1"}, "args": { "reason": "gave_up" } }
+```
+
+A dial ends on its own when a phone answers, when every phone fails, or when
+the ring timeout passes. `cancel_dial` is the fourth way, and the only one the
+application chooses: every phone still ringing is CANCELled (RFC 3261 §9.1) and
+the caller is left exactly as the dial found it, still owned by this channel
+and free to be dialled for again.
+
+That is what tells it from the two verbs that look similar. `hangup` ends the
+caller as well. Letting the timeout run keeps the phones ringing until it does,
+and a phone that answers in that window is connected to a caller the
+application has already sent somewhere else.
+
+- A **bridging** dial (`on_answer: "bridge"`): each phone is reported by
+  `DialBranchFailed` with cause `cancelled`, the ringback is stopped, and the
+  dial ends in `DialFailed {code: 487, reason: "Request Terminated", cause,
+  timed_out: false}`. `cause` is the `reason` given here, `cancelled` when none
+  is, so a handler can tell its own cancel from a dial that failed by itself.
+  The caller stays answered and anchored.
+- A **connecting** dial: each branch is reported by `DialBranchFailed` with
+  cause `cancelled`, a sequential hunt's remaining targets are dropped, and the
+  dial ends in `DialFailed {code: 487, timed_out: false}`. The caller stays
+  unanswered and parked, with no ring deadline left to fail it.
+
+The reply is `{channel, state: "cancelled", on_answer}`. Refused, each with
+`error.details` `{verb: "cancel_dial", reason}`:
+
+| code | `reason` | when |
+|---|---|---|
+| `invalid_state` | `no_dial_in_progress` | nothing is ringing: the dial already ended, or none was issued |
+| `invalid_state` | `dial_answered` | a phone has answered and its bridge to the caller is in motion. The caller's media is being pointed at that phone, so it cannot be released without taking the caller with it; the outcome arrives as `DialAnswered` or `BridgeFailed`, and after a `BridgeFailed` the dial rings on and can be cancelled |
+| `not_found` | `call_gone` | the call is gone |
+| `bad_request` | — | `reason` is not a non-empty string |
 
 ### Presenting an identity
 
@@ -1522,6 +1623,12 @@ This is the whole reason to use the verb rather than a `hangup` followed by a
 re-INVITE: that sequence silences the caller for the length of the ring, and it
 leaves the call's own state behind — no `on_bye`, no CDR, no charging stop, no
 media release.
+
+`target` is a URI string, `{uri}` or `{aor}`, and `from`, `from_display`,
+`p_asserted_identity`, `privacy` and `headers` shape the new leg, all exactly as
+for [`accept_refer`](#an-inbound-refer-on-a-controlled-call): an AoR is dialled
+over the flow its phone registered on, and one with several registered contacts
+is refused `invalid_state` (`several_contacts`).
 
 `replace_a_leg` picks the direction. Omitted or `false` replaces the callee and
 keeps the caller; `true` does the reverse. `profile` names the media profile for

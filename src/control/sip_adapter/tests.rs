@@ -2913,8 +2913,7 @@ fn transfer_refusal(verb: &str, args: serde_json::Value) -> (ControlErrorCode, s
 fn a_transfer_target_is_a_uri_or_a_registered_aor() {
     let named = |args: serde_json::Value| {
         parse_transfer_dial("replace_peer", &args)
-            .ok()
-            .expect("accepted")
+            .unwrap_or_else(|refusal| panic!("{args} was refused: {refusal:?}"))
     };
     // No target at all is the verb's to judge: accept_refer has the Refer-To.
     assert_eq!(named(serde_json::json!({})).target, None);
@@ -3007,8 +3006,7 @@ fn a_transfer_carries_the_identity_arguments_a_dial_takes() {
             "headers": { "X-Account": "main" }
         }),
     )
-    .ok()
-    .expect("accepted");
+    .unwrap_or_else(|refusal| panic!("refused: {refusal:?}"));
     let shaping = &transfer.dial.shaping;
     assert_eq!(
         shaping.from.as_deref(),

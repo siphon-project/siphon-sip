@@ -119,7 +119,7 @@ mod tests {
             "INVITE sip:15550100077@siphon.example.com SIP/2.0\r\n",
             "Via: SIP/2.0/UDP 192.0.2.10:5060;branch=z9hG4bK-replacement\r\n",
             "Max-Forwards: 70\r\n",
-            "From: \"Desk 203\" <sip:203@siphon.example.com>;tag=caller-tag\r\n",
+            "From: \"Caller 203\" <sip:203@siphon.example.com>;tag=caller-tag\r\n",
             "To: <sip:15550100077@siphon.example.com>\r\n",
             "Call-ID: replacement@192.0.2.10\r\n",
             "CSeq: 1 INVITE\r\n",
@@ -144,7 +144,7 @@ mod tests {
         assert_eq!(header(&invite, "To"), "<sip:204@198.51.100.7>");
         assert_eq!(
             header(&invite, "From"),
-            "\"Desk 203\" <sip:203@siphon.example.com>;tag=caller-tag",
+            "\"Caller 203\" <sip:203@siphon.example.com>;tag=caller-tag",
             "untouched"
         );
         assert_eq!(shaped.from_host, None);
@@ -180,7 +180,7 @@ mod tests {
         let dial = ReplacementDial {
             shaping: DialShaping {
                 from: Some("sip:+15550100000@trunk.example.com".to_string()),
-                from_display: Some("Front Desk".to_string()),
+                from_display: Some("Main Line".to_string()),
                 p_asserted_identity: Some("sip:+15550100000@trunk.example.com".to_string()),
                 ..Default::default()
             },
@@ -205,7 +205,7 @@ mod tests {
             .expect("shaped");
         assert_eq!(
             header(&invite, "From"),
-            "\"Front Desk\" <sip:+15550100000@trunk.example.com>;tag=caller-tag"
+            "\"Main Line\" <sip:+15550100000@trunk.example.com>;tag=caller-tag"
         );
         assert_eq!(shaped.from_host.as_deref(), Some("trunk.example.com"));
         assert!(
