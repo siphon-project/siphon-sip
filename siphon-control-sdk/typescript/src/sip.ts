@@ -131,8 +131,52 @@ export interface ReferReplaces {
 }
 
 /** Options for {@link Call.acceptRefer}. */
-export interface AcceptReferOptions {
-  target?: string;
+/**
+ * Who a transfer's new leg is dialled at: a SIP URI, or `{ aor }` — a
+ * registered address-of-record, dialled over the flow its phone registered on
+ * (the only way to reach one on TCP, TLS or WebSocket behind NAT). An AoR nobody
+ * is registered at rejects with `not_found`; one with several registered
+ * contacts with `invalid_state` (`details.reason === "several_contacts"`).
+ */
+export type TransferTarget = string | { aor: string };
+
+/**
+ * The identity a transfer's new leg presents — the arguments {@link Call.dial}
+ * takes. Unset, the leg presents what the call's own INVITE carried.
+ */
+export interface TransferIdentity {
+  /** The calling identity — the From URI (RFC 3261 §8.1.1.3). */
+  from?: string;
+  /** The From display name. An empty one removes the caller's. */
+  fromDisplay?: string;
+  /** `P-Asserted-Identity` for a trusted next hop (RFC 3325 §9.1). */
+  pAssertedIdentity?: string;
+  /** Whether the calling identity may be presented (RFC 3323 §4.1). */
+  privacy?: "allowed" | "restricted";
+  /** Headers for the new leg's INVITE, injected after the header policy. */
+  headers?: Record<string, string>;
+}
+
+function insertTransferIdentity(
+  args: Record<string, unknown>,
+  identity: TransferIdentity | undefined,
+): void {
+  if (identity?.from !== undefined) args.from = identity.from;
+  if (identity?.fromDisplay !== undefined) args.from_display = identity.fromDisplay;
+  if (identity?.pAssertedIdentity !== undefined) {
+    args.p_asserted_identity = identity.pAssertedIdentity;
+  }
+  if (identity?.privacy !== undefined) args.privacy = identity.privacy;
+  if (identity?.headers !== undefined) args.headers = identity.headers;
+}
+
+/**
+ * Options for {@link Call.acceptRefer}. The {@link TransferIdentity} fields and
+ * an `{ aor }` target apply to `mode: "terminate"`, which dials a leg; the
+ * server refuses them with `"transparent"`, which relays the REFER.
+ */
+export interface AcceptReferOptions extends TransferIdentity {
+  target?: TransferTarget;
   nextHop?: string;
   mode?: "terminate" | "transparent";
   /**
@@ -720,8 +764,11 @@ export type PlaySource =
 
 /** Optional shaping for {@link Call.play}. */
 export interface PlayOptions {
-  /** Repeat the prompt this many times (0/undefined → play once). */
-  repeat?: number;
+  /**
+   * How many times to play in total (undefined → once), or `"inf"` to play
+   * until stopped — music on hold. The server refuses any other value.
+   */
+  repeat?: number | "inf";
   /** Start playback at this offset into the source, in milliseconds. */
   startMs?: number;
   /** Cap playback to this duration, in milliseconds. */
@@ -998,6 +1045,33 @@ export class Call {
   }
 
   /**
+   * Give up on the dial ringing for this call and leave the caller alone.
+   *
+   * Every phone still ringing is CANCELled (RFC 3261 §9.1), each reported by
+   * `DialBranchFailed` with cause `cancelled`, and the dial ends in
+   * `DialFailed` with code 487. The caller is exactly as the dial found it —
+   * answered and anchored for an `onAnswer: "bridge"` dial, unanswered and
+   * parked otherwise — still this app's, and free to be dialled for again.
+   * {@link Call.hangup} ends the caller as well.
+   *
+   * `reason` is reported as the `cause` of a bridging dial's `DialFailed`
+   * (default `cancelled`), so the handler that hears it can tell its own cancel
+   * from a dial that failed by itself.
+   *
+   * Rejects with `invalid_state` when nothing is ringing (`details.reason` is
+   * `no_dial_in_progress`), and once a phone has answered and is being bridged
+   * (`dial_answered`), whose outcome arrives as `DialAnswered` or
+   * `BridgeFailed`.
+   */
+  async cancelDial(reason?: string): Promise<void> {
+    const args: Record<string, unknown> = {};
+    if (reason !== undefined) {
+      args.reason = reason;
+    }
+    await this.sip(SipVerb.CancelDial, args);
+  }
+
+  /**
    * Send an in-dialog REFER on the A-leg (blind transfer).
    *
    * Resolves as soon as siphon has sent the REFER — that is *sent*, not
@@ -1170,6 +1244,7 @@ export class Call {
     if (options?.profile !== undefined) {
       args.profile = options.profile;
     }
+    insertTransferIdentity(args, options);
     await this.sip(SipVerb.AcceptRefer, args);
   }
 
@@ -1277,19 +1352,20 @@ export class Call {
    * retrying later) or `"bad_request"` (the target will not parse or route).
    */
   async replacePeer(
-    target: string,
+    target: TransferTarget,
     options: {
       nextHop?: string;
       replaceALeg?: boolean;
       profile?: string;
       timeout?: number;
-    } = {},
+    } & TransferIdentity = {},
   ): Promise<unknown> {
     const args: Record<string, unknown> = { target };
     if (options.nextHop !== undefined) args.next_hop = options.nextHop;
     if (options.replaceALeg !== undefined) args.replace_a_leg = options.replaceALeg;
     if (options.profile !== undefined) args.profile = options.profile;
     if (options.timeout !== undefined) args.timeout = options.timeout;
+    insertTransferIdentity(args, options);
     return this.sip(SipVerb.ReplacePeer, args);
   }
 
@@ -1352,12 +1428,18 @@ export class Call {
     await this.sip(SipVerb.Dtmf, dtmfArgs(digits, options));
   }
 
-  /** Hold the A-leg media via silence. */
+  /**
+   * Silence the call's media in both directions on the media engine.
+   *
+   * A media gate, not a SIP hold: nothing is sent on either dialog, so no
+   * phone shows a held call. Rejects with `invalid_state` on a call the engine
+   * only relays; to hold one party of a bridge, use {@link Call.unbridge}.
+   */
   async hold(): Promise<void> {
     await this.sip(SipVerb.Hold, {});
   }
 
-  /** Resume the A-leg media after a {@link Call.hold}. */
+  /** Restore the call's media after a {@link Call.hold}. */
   async unhold(): Promise<void> {
     await this.sip(SipVerb.Unhold, {});
   }

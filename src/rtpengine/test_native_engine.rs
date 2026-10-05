@@ -90,6 +90,9 @@ pub(crate) struct NativeCommand {
     /// `play_media` plays (`None` for any other source), the `play_id` a
     /// `stop_media` targets (`None` for a stop of everything).
     pub(crate) detail: Option<String>,
+    /// The `repeat_times` a `play_media` carried, as it is on the wire: a
+    /// count, or `inf`. `None` when the command named none.
+    pub(crate) repeat: Option<String>,
     /// The profile's `transport_protocol` on an `answer_local`, `offer`,
     /// `answer` or `reoffer`.
     pub(crate) transport_protocol: Option<String>,
@@ -111,6 +114,7 @@ struct Recorded {
     call_id: String,
     from_tag: String,
     detail: Option<String>,
+    repeat: Option<String>,
     profile: Option<siphon_rtp_proto::ProfileFlags>,
 }
 
@@ -121,6 +125,7 @@ impl Recorded {
             call_id: call_id.to_string(),
             from_tag: from_tag.to_string(),
             detail: None,
+            repeat: None,
             profile: None,
         }
     }
@@ -266,8 +271,18 @@ impl NativeTestEngine {
                                 call_id,
                                 from_tag,
                                 source,
+                                repeat_times,
                                 ..
                             } => {
+                                // As serialised, which is what the engine reads.
+                                let repeat = repeat_times.and_then(|repeat| {
+                                    serde_json::to_value(repeat).ok().map(|value| {
+                                        value
+                                            .as_str()
+                                            .map(str::to_string)
+                                            .unwrap_or_else(|| value.to_string())
+                                    })
+                                });
                                 let tone = match source {
                                     siphon_rtp_proto::PlayMediaSource::Tone { tone } => {
                                         Some(tone.clone())
@@ -277,6 +292,7 @@ impl NativeTestEngine {
                                 (
                                     Some(Recorded {
                                         detail: tone,
+                                        repeat,
                                         ..Recorded::new("play_media", call_id, from_tag)
                                     }),
                                     None,
@@ -324,6 +340,7 @@ impl NativeTestEngine {
                                     call_id: record.call_id,
                                     from_tag: record.from_tag,
                                     detail: record.detail,
+                                    repeat: record.repeat,
                                     transport_protocol: record
                                         .profile
                                         .as_ref()

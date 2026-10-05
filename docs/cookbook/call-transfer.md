@@ -296,8 +296,30 @@ than treating a changed offer as unchanged.
 Attended transfer: Alice consults Carol on a second call first, then transfers
 Bob into the Alice-Carol call with a `REFER` carrying a `Replaces` header
 (RFC 3891) that names the Alice-Carol dialog. siphon reads it off
-`call.refer_replaces`, matches the dialog it is **already tracking**, bridges Bob
-onto it, and BYEs the now-redundant old legs.
+`call.refer_replaces` and dials the transfer target with that `Replaces` on the
+INVITE, rewritten to the identifiers the target knows its own dialog by. The
+**target** performs the takeover: it answers the new INVITE in place of the
+consultation dialog and ends that one itself (RFC 3891 §3).
+
+So the INVITE has to reach the target. siphon does not join two calls it hosts
+on its own: it dials, and the far end replaces.
+
+!!! warning "A `Refer-To` that names siphon needs a `target`"
+    A transferor builds `Refer-To` from the remote target of its consultation
+    call (RFC 5589 §7.3). Behind a B2BUA that remote target is siphon's own
+    Contact, so the URI names this node, not Carol. Dialled as written, siphon
+    INVITEs itself, the rewritten `Replaces` matches nothing on the way back in,
+    and the transfer fails `481`.
+
+    Pass the target's real address: `call.accept_refer(target="sip:carol@…")`
+    from a script, or `accept_refer {target}` from a controller, where `target`
+    may be `{aor}` to reach a registered phone over the connection it holds.
+    A controller finds out who that is from `TransferRequested`: when the
+    `Replaces` names a dialog this node hosts, `replaces.local` carries the
+    call, the channel controlling it and the leg.
+
+    A transferor that puts the target's address-of-record in `Refer-To`
+    instead needs none of this.
 
 ```python
 from siphon import b2bua, log
@@ -310,7 +332,7 @@ def on_refer(call):
                  f"call_id={replaces['call_id']} "
                  f"from_tag={replaces['from_tag']} to_tag={replaces['to_tag']} "
                  f"early_only={replaces['early_only']}")
-    call.accept_refer()          # siphon matches the replaced dialog + re-bridges
+    call.accept_refer()          # dials Refer-To with the Replaces rewritten for it
 ```
 
 !!! warning "One argument, no reply"
@@ -381,20 +403,38 @@ Alice                    siphon 198.51.100.1            Bob            Carol
   |  REFER Refer-To:Carol    |                           |               |
   |  Replaces=call2 dialog   |                           |               |
   |------------------------->|                           |               |
-  |  202 Accepted            |  match Replaces -> call 2 |               |
-  |<-------------------------|                           |               |
-  |                          |  re-bridge Bob <-> Carol  |               |
-  |                          |<==========================|==============>|
+  |  202 Accepted            |  INVITE, Replaces=Carol's own dialog      |
+  |<-------------------------|------------------------------------------>|
+  |                          |  200 OK (Carol replaces her dialog)       |
+  |                          |<------------------------------------------|
+  |                          |  re-INVITE Bob onto Carol |               |
+  |                          |-------------------------->|               |
   |  NOTIFY sipfrag 200 OK   |                           |               |
+  |<-------------------------|        BYE (call 2, Carol's old dialog)   |
+  |  BYE (call 1, Alice)     |<------------------------------------------|
   |<-------------------------|                           |               |
-  |  BYE (call 1, Alice)     |     BYE (call 2, Alice)   |               |
-  |<-------------------------|-------------------------->|               |
   |                          |         Bob <==== bridged ====> Carol     |
 ```
 
 `early_only` is set when the `Replaces` header carried the `early-only`
 parameter — the transfer must only match a dialog still in an early (pre-2xx)
-state (RFC 3891 §3). siphon honours it when matching.
+state (RFC 3891 §3). On this path siphon carries the flag through to the target,
+whose match it is; on an INVITE that names one of siphon's own dialogs siphon
+does the matching, and declines `486` when the dialog is confirmed.
+
+Two cases this does not cover, so they are not read into the above:
+
+- A call a controller **bridged** from two legs (`bridge`, or
+  `dial {on_answer: "bridge"}`) is two calls joined at the media engine, and the
+  party that stays when one is transferred is on the other call. A
+  siphon-terminated transfer re-pairs the legs of one call, so it does not move
+  that party. `TransferRequested` names the hosted dialog and the channel it is
+  bridged with (`replaces.local`), which is what an application needs to
+  re-bridge the two remaining channels itself.
+- A script-free deployment (`control.inbound`) hands an INVITE carrying
+  `Replaces` to its application as a new call. `StasisStart` names the hosted
+  dialog it asked to join (`replaces`); the takeover described under "The other
+  half" runs only after a script's `@b2bua.on_invite` admitted the INVITE.
 
 ## 3. Inbound transparent transfer
 

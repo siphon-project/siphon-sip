@@ -352,7 +352,17 @@ async fn forward_transfer_requested_pushes_event_to_owning_connection() {
             early_only: false,
         }),
     };
-    assert!(bus.forward_transfer_requested("ch1", "sipcid@h", &refer_to, Some("alice-tag")));
+    assert!(bus.forward_transfer_requested(
+        "ch1",
+        "sipcid@h",
+        &refer_to,
+        TransferReferrer {
+            from_tag: Some("alice-tag"),
+            from_a_leg: true,
+            sip_call_id: "sipcid@h",
+            replaces_local: None,
+        }
+    ));
 
     let frames = conn.events.recv_many().await;
     let transfer = frames
@@ -390,7 +400,17 @@ fn forward_transfer_requested_on_uncontrolled_call_is_clean_noop() {
         uri: "sip:carol@example.com".to_string(),
         replaces: None,
     };
-    assert!(!bus.forward_transfer_requested("unknown-ch", "unknown-cid", &refer_to, None));
+    assert!(!bus.forward_transfer_requested(
+        "unknown-ch",
+        "unknown-cid",
+        &refer_to,
+        TransferReferrer {
+            from_tag: None,
+            from_a_leg: true,
+            sip_call_id: "unknown-cid",
+            replaces_local: None,
+        }
+    ));
     assert_eq!(conn.events.depth(), 0, "no event for an uncontrolled call");
     assert_eq!(bus.channel_count(), 0);
 }

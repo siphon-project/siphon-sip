@@ -29,6 +29,7 @@ use super::request::PyRequest;
 
 mod answer;
 mod decorators;
+mod repeat;
 
 use answer::AnswerExchange;
 use decorators::event_decorator;
@@ -1169,7 +1170,9 @@ impl PyRtpEngine {
     ///     gain_decibels: Playout gain in whole decibels relative to the
     ///           source's own level, clamped engine-side to −60..=+12. Native
     ///           **siphon-rtp** backend only.
-    ///     repeat: Number of times to repeat the prompt (default: 1).
+    ///     repeat: Total number of times to play the prompt (default: once), or
+    ///           ``"inf"`` to play until stopped (native **siphon-rtp** backend
+    ///           only, and only with ``wait=False``).
     ///     start_ms: Offset into the file at which to start (milliseconds).
     ///     duration_ms: Cap on playback length (milliseconds).
     ///     to_tag: Optional peer tag for MPTY scoping.
@@ -1197,7 +1200,7 @@ impl PyRtpEngine {
         db_id: Option<u64>,
         tone: Option<String>,
         url: Option<String>,
-        repeat: Option<u64>,
+        repeat: Option<Bound<'py, PyAny>>,
         start_ms: Option<u64>,
         duration_ms: Option<u64>,
         gain_decibels: Option<i32>,
@@ -1205,6 +1208,8 @@ impl PyRtpEngine {
         wait: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
         let source = resolve_play_media_source(file, blob, db_id, tone, url)?;
+        let repeat = repeat::parse_repeat(repeat.as_ref())?;
+        repeat::refuse_endless_wait(repeat, wait)?;
 
         let (call_id, from_tag) = resolve_call_from_tag(target)?;
 
@@ -1259,7 +1264,7 @@ impl PyRtpEngine {
     /// audio; there is no ``wait``). Native **siphon-rtp** backend only.
     ///
     /// ```python,ignore
-    /// bed = await rtpengine.play_overlay(call, file="/prompts/hold.wav", repeat=0)
+    /// bed = await rtpengine.play_overlay(call, file="/prompts/hold.wav", repeat="inf")
     /// await rtpengine.play_media(call, file="/prompts/agent.wav")
     /// await rtpengine.set_play_gain(call, bed, -18)   # duck the bed
     /// await rtpengine.stop_media(call, play_id=bed)
@@ -1269,7 +1274,7 @@ impl PyRtpEngine {
     ///     target: Request, Reply, or Call object.
     ///     file / blob / db_id / tone / url: exactly one, as for
     ///         :meth:`play_media`.
-    ///     repeat: Number of times to repeat.
+    ///     repeat: Total number of times to play, or ``"inf"`` until stopped.
     ///     start_ms: Offset into the source at which to start.
     ///     duration_ms: Hard playout cap — the only bound, short of a stop, on
     ///         an endless (``*inf``) tone.
@@ -1291,13 +1296,14 @@ impl PyRtpEngine {
         db_id: Option<u64>,
         tone: Option<String>,
         url: Option<String>,
-        repeat: Option<u64>,
+        repeat: Option<Bound<'py, PyAny>>,
         start_ms: Option<u64>,
         duration_ms: Option<u64>,
         gain_decibels: Option<i32>,
         to_tag: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let source = resolve_play_media_source(file, blob, db_id, tone, url)?;
+        let repeat = repeat::parse_repeat(repeat.as_ref())?;
 
         let (call_id, from_tag) = resolve_call_from_tag(target)?;
 

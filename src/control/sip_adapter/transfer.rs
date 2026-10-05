@@ -65,6 +65,138 @@ fn validate_number_shape(
     Ok(shape)
 }
 
+/// What a transfer verb dials, and how: the target URI when it names one, with
+/// the flow, called party and identity of the leg it creates.
+pub(super) struct TransferDial {
+    /// The URI to dial: the one named, or the registered contact an `{aor}`
+    /// resolved to. `None` when the verb named no target.
+    pub(super) target: Option<String>,
+    pub(super) dial: crate::dispatcher::ReplacementDial,
+}
+
+impl TransferDial {
+    /// Whether the verb named anything a transfer siphon does not dial itself
+    /// would have to ignore.
+    fn names_a_dial(&self) -> bool {
+        let shaping = &self.dial.shaping;
+        self.dial.aor.is_some()
+            || !self.dial.headers.is_empty()
+            || shaping.from.is_some()
+            || shaping.from_display.is_some()
+            || shaping.p_asserted_identity.is_some()
+            || shaping.privacy.is_some()
+    }
+}
+
+/// Parse a transfer verb's `target` and identity arguments.
+///
+/// `target` is a URI string, `{uri}`, or `{aor}` — a registered AoR, dialled
+/// over the flow its phone registered on and through the Path of its binding,
+/// which is the only way to reach a phone on TCP, TLS or WebSocket. `from`,
+/// `from_display`, `p_asserted_identity`, `privacy` and `headers` are the
+/// arguments `dial` takes, and shape the new leg the same way.
+///
+/// An AoR nobody is registered at is `not_found`. One with several registered
+/// contacts is refused `invalid_state`: a replacement rings one target, and
+/// picking a contact would ring one phone of a party that has several.
+pub(super) fn parse_transfer_dial(
+    verb: &str,
+    args: &serde_json::Value,
+) -> Result<TransferDial, ControlResult> {
+    let bad = |message: String| ControlResult::error(ControlErrorCode::BadRequest, message);
+    let shaping = crate::dispatcher::DialShaping {
+        profile: None,
+        from: super::string_arg(args, "from"),
+        from_display: args
+            .get("from_display")
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
+        p_asserted_identity: super::string_arg(args, "p_asserted_identity"),
+        privacy: super::originate::parse_privacy(verb, args.get("privacy")).map_err(bad)?,
+    };
+    for (name, value) in [
+        ("from", shaping.from.as_deref()),
+        (
+            "p_asserted_identity",
+            shaping.p_asserted_identity.as_deref(),
+        ),
+    ] {
+        if let Some(Err(error)) = value.map(crate::sip::parser::parse_uri_standalone) {
+            return Err(bad(format!("{verb} args.{name} is not a SIP URI: {error}")));
+        }
+    }
+    let headers = super::routing::parse_extra_headers(args.get("headers"));
+    let uri_target = |uri: &str| match crate::sip::parser::parse_uri_standalone(uri) {
+        Ok(_) => Ok(Some(uri.to_string())),
+        Err(error) => Err(bad(format!("invalid {verb} target: {error}"))),
+    };
+    let plain = |target: Option<String>, shaping, headers| TransferDial {
+        target,
+        dial: crate::dispatcher::ReplacementDial {
+            shaping,
+            headers,
+            ..Default::default()
+        },
+    };
+    let object = match args.get("target") {
+        None | Some(serde_json::Value::Null) => return Ok(plain(None, shaping, headers)),
+        Some(serde_json::Value::String(uri)) => {
+            return Ok(plain(uri_target(uri)?, shaping, headers))
+        }
+        Some(serde_json::Value::Object(object)) => object,
+        Some(_) => {
+            return Err(bad(format!(
+                "{verb} args.target must be a URI string, {{uri}} or {{aor}}"
+            )))
+        }
+    };
+    match (
+        object.get("uri").and_then(|value| value.as_str()),
+        object.get("aor").and_then(|value| value.as_str()),
+    ) {
+        (Some(uri), None) => Ok(plain(uri_target(uri)?, shaping, headers)),
+        (None, Some(aor)) => {
+            if args.get("next_hop").is_some_and(|value| !value.is_null()) {
+                return Err(bad(format!(
+                    "{verb} args.next_hop does not apply to an {{aor}} target, which is reached over the flow it registered on"
+                )));
+            }
+            let mut contacts = crate::dispatcher::dial_targets_for_aor(aor).map_err(|error| {
+                ControlResult::error(ControlErrorCode::NotFound, error.to_string())
+            })?;
+            if contacts.len() > 1 {
+                return Err(ControlResult::error_with_details(
+                    ControlErrorCode::InvalidState,
+                    format!(
+                        "{aor} has {} registered contacts, and {verb} rings one target — name the one to ring with {{uri}}",
+                        contacts.len()
+                    ),
+                    serde_json::json!({
+                        "verb": verb,
+                        "reason": "several_contacts",
+                        "contacts": contacts.len(),
+                    }),
+                ));
+            }
+            let Some(contact) = contacts.pop() else {
+                return Err(ControlResult::error(
+                    ControlErrorCode::NotFound,
+                    format!("no registered contact for {aor}"),
+                ));
+            };
+            let (target, dial) =
+                crate::dispatcher::ReplacementDial::to_contact(contact, shaping, headers);
+            Ok(TransferDial {
+                target: Some(target),
+                dial,
+            })
+        }
+        _ => Err(bad(format!(
+            "{verb} args.target must name exactly one of uri or aor"
+        ))),
+    }
+}
+
 /// Map a `replace_peer` refusal onto its wire code.
 ///
 /// Same discipline as [`bridge_error`]: one code per cause, so a controller can
@@ -101,18 +233,16 @@ pub(super) fn replace_error(error: crate::b2bua::transfer::ReplaceError) -> Cont
 /// promotion, the survivor's re-INVITE and the replaced leg's BYE all happen
 /// after the target answers.
 pub(super) fn replace_peer(channel: &ChannelRef, args: &serde_json::Value) -> ControlResult {
-    let Some(target) = args.get("target").and_then(|value| value.as_str()) else {
+    let transfer = match parse_transfer_dial("replace_peer", args) {
+        Ok(transfer) => transfer,
+        Err(refusal) => return refusal,
+    };
+    let Some(target) = transfer.target.as_deref() else {
         return ControlResult::error(
             ControlErrorCode::BadRequest,
-            "replace_peer requires a target URI",
+            "replace_peer requires a target: a URI, {uri} or {aor}",
         );
     };
-    if let Err(error) = crate::sip::parser::parse_uri_standalone(target) {
-        return ControlResult::error(
-            ControlErrorCode::BadRequest,
-            format!("invalid replacement target: {error}"),
-        );
-    }
     let next_hop = args.get("next_hop").and_then(|value| value.as_str());
     if let Some(next_hop) = next_hop {
         if let Err(error) = crate::sip::parser::parse_uri_standalone(next_hop) {
@@ -147,7 +277,7 @@ pub(super) fn replace_peer(channel: &ChannelRef, args: &serde_json::Value) -> Co
         },
     };
 
-    match crate::dispatcher::b2bua_replace_peer(
+    match crate::dispatcher::b2bua_replace_peer_dialling(
         &channel.sip_call_id,
         target,
         next_hop,
@@ -155,6 +285,7 @@ pub(super) fn replace_peer(channel: &ChannelRef, args: &serde_json::Value) -> Co
         media_profile,
         number_shape.as_ref(),
         timeout_secs,
+        &transfer.dial,
     ) {
         Ok(()) => ControlResult::Ok(serde_json::json!({
             "channel": channel.channel_id,
@@ -166,15 +297,10 @@ pub(super) fn replace_peer(channel: &ChannelRef, args: &serde_json::Value) -> Co
 }
 
 pub(super) fn accept_refer(channel: &ChannelRef, args: &serde_json::Value) -> ControlResult {
-    let target = args.get("target").and_then(|v| v.as_str());
-    if let Some(target) = target {
-        if let Err(error) = crate::sip::parser::parse_uri_standalone(target) {
-            return ControlResult::error(
-                ControlErrorCode::BadRequest,
-                format!("invalid refer target: {error}"),
-            );
-        }
-    }
+    let transfer = match parse_transfer_dial("accept_refer", args) {
+        Ok(transfer) => transfer,
+        Err(refusal) => return refusal,
+    };
     let next_hop = args.get("next_hop").and_then(|v| v.as_str());
     if let Some(next_hop) = next_hop {
         if let Err(error) = crate::sip::parser::parse_uri_standalone(next_hop) {
@@ -188,6 +314,14 @@ pub(super) fn accept_refer(channel: &ChannelRef, args: &serde_json::Value) -> Co
         Ok(mode) => mode,
         Err(message) => return ControlResult::error(ControlErrorCode::BadRequest, message),
     };
+    // A transparent transfer relays the REFER and dials nothing, so a flow to
+    // dial over or an identity to present would be accepted and never used.
+    if mode == Some(crate::script::api::call::ReferMode::Transparent) && transfer.names_a_dial() {
+        return ControlResult::error(
+            ControlErrorCode::BadRequest,
+            "accept_refer mode \"transparent\" relays the REFER and dials no leg: an {aor} target, from, from_display, p_asserted_identity, privacy and headers apply to mode \"terminate\"",
+        );
+    }
 
     // Media profile for the pairing the transfer creates. Same requirement as
     // the in-process `accept_refer(profile=…)`: a direction-bound profile
@@ -203,13 +337,14 @@ pub(super) fn accept_refer(channel: &ChannelRef, args: &serde_json::Value) -> Co
         Err(result) => return result,
     };
 
-    if crate::dispatcher::b2bua_accept_refer_call(
+    if crate::dispatcher::b2bua_accept_refer_call_dialling(
         &channel.sip_call_id,
-        target.map(|s| s.to_string()),
+        transfer.target,
         next_hop.map(|s| s.to_string()),
         mode,
         media_profile.map(|s| s.to_string()),
         number_shape,
+        &transfer.dial,
     ) {
         ControlResult::Ok(
             serde_json::json!({ "channel": channel.channel_id, "transfer": "accepted" }),

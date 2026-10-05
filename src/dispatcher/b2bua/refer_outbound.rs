@@ -453,6 +453,30 @@ pub fn b2bua_accept_refer_call(
     media_profile: Option<String>,
     number_shape: Option<crate::script::api::numbers::NumberShape>,
 ) -> bool {
+    b2bua_accept_refer_call_dialling(
+        sip_call_id,
+        target,
+        next_hop,
+        mode,
+        media_profile,
+        number_shape,
+        &ReplacementDial::default(),
+    )
+}
+
+/// [`b2bua_accept_refer_call`], naming how the transfer's new leg reaches its
+/// target and what it presents there (`dial`): over a registered contact's
+/// flow, called as its AoR, with an identity of the controller's choosing. A
+/// siphon-terminated transfer reads it; a transparent one dials nothing.
+pub(crate) fn b2bua_accept_refer_call_dialling(
+    sip_call_id: &str,
+    target: Option<String>,
+    next_hop: Option<String>,
+    mode: Option<crate::script::api::call::ReferMode>,
+    media_profile: Option<String>,
+    number_shape: Option<crate::script::api::numbers::NumberShape>,
+    dial: &ReplacementDial,
+) -> bool {
     let Some(control) = B2BUA_CONTROL.get() else {
         return false;
     };
@@ -485,6 +509,7 @@ pub fn b2bua_accept_refer_call(
         mode,
         media_profile.as_deref(),
         number_shape.as_ref(),
+        dial,
         state,
     );
     true
@@ -519,6 +544,31 @@ pub fn b2bua_replace_peer(
     media_profile: Option<&str>,
     number_shape: Option<&crate::script::api::numbers::NumberShape>,
     timeout_secs: u32,
+) -> Result<(), crate::b2bua::transfer::ReplaceError> {
+    b2bua_replace_peer_dialling(
+        sip_call_id,
+        target,
+        next_hop,
+        replace_a_leg,
+        media_profile,
+        number_shape,
+        timeout_secs,
+        &ReplacementDial::default(),
+    )
+}
+
+/// [`b2bua_replace_peer`], naming how the new leg reaches its target and what
+/// it presents there (`dial`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn b2bua_replace_peer_dialling(
+    sip_call_id: &str,
+    target: &str,
+    next_hop: Option<&str>,
+    replace_a_leg: bool,
+    media_profile: Option<&str>,
+    number_shape: Option<&crate::script::api::numbers::NumberShape>,
+    timeout_secs: u32,
+    dial: &ReplacementDial,
 ) -> Result<(), crate::b2bua::transfer::ReplaceError> {
     use crate::b2bua::transfer::{ReplaceError, ReplacementOrigin};
 
@@ -597,6 +647,7 @@ pub fn b2bua_replace_peer(
         0,
         ReplacementOrigin::SiphonInitiated,
         timeout_secs,
+        dial,
         state,
     );
     if !dialed {

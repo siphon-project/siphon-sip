@@ -6,7 +6,7 @@
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
 
-use siphon_control_client::proto::sip::PeerHangupPolicy;
+use siphon_control_client::proto::sip::{PeerHangupPolicy, PlayRepeat};
 use siphon_control_client::sip::{
     AorRing, DialOnAnswer, DialStrategy, DialTarget, OriginateMedia, OriginatePrivacy, PlaySource,
     RecordChannels, RecordDirection, Ringback, RouteTarget, SessionRefresher, SessionTimer,
@@ -310,6 +310,26 @@ pub(crate) fn build_play_source(
         (None, None, Some(blob)) => Ok(PlaySource::blob(blob)),
         _ => Err(PyValueError::new_err(
             "play requires exactly one of file (str), db_id (int), or blob (bytes)",
+        )),
+    }
+}
+
+/// Read the `repeat` argument of `play`: a total play count, or `"inf"` to play
+/// until stopped. Refused here rather than at the server, so a typo raises
+/// before the call is touched.
+pub(crate) fn extract_play_repeat(
+    repeat: Option<&Bound<'_, PyAny>>,
+) -> PyResult<Option<PlayRepeat>> {
+    let Some(repeat) = repeat.filter(|repeat| !repeat.is_none()) else {
+        return Ok(None);
+    };
+    if let Ok(times) = repeat.extract::<u64>() {
+        return Ok(Some(PlayRepeat::Times(times)));
+    }
+    match repeat.extract::<String>() {
+        Ok(token) if token.eq_ignore_ascii_case("inf") => Ok(Some(PlayRepeat::Forever)),
+        _ => Err(PyValueError::new_err(
+            "repeat must be a total play count (a non-negative integer) or \"inf\" to play until stopped",
         )),
     }
 }

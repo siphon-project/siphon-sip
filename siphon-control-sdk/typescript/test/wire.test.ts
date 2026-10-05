@@ -91,6 +91,7 @@ describe("SipVerb wire tokens + event names", () => {
     expect(SipVerb.RecordStop).toBe("record_stop");
     expect(SipVerb.Reject).toBe("reject");
     expect(SipVerb.Drop).toBe("drop");
+    expect(SipVerb.CancelDial).toBe("cancel_dial");
   });
 
   it("passes unknown + new event names through (forward-compatible)", () => {
@@ -381,6 +382,22 @@ describe("Call verbs map to the in-process-mirrored wire verbs", () => {
     ]);
   });
 
+  it("cancelDial names the reason only when one is given", async () => {
+    const transport = new RecordingTransport();
+    const call = makeCall(transport);
+    await call.cancelDial();
+    await call.cancelDial("gave_up");
+    expect(transport.calls).toEqual([
+      { module: MODULE_SIP, verb: "cancel_dial", target: { channel: "ch1" }, args: {} },
+      {
+        module: MODULE_SIP,
+        verb: "cancel_dial",
+        target: { channel: "ch1" },
+        args: { reason: "gave_up" },
+      },
+    ]);
+  });
+
   it("drop sends ban only when it is true", async () => {
     // Off is the server's default; sending `ban: false` would be noise, and a
     // string would be refused as bad_request.
@@ -556,6 +573,33 @@ describe("Call verbs map to the in-process-mirrored wire verbs", () => {
     expect(transport.calls[0]?.args).toEqual({ mode: "terminate" });
   });
 
+  it("a transfer names an AoR target and the identity its new leg presents", async () => {
+    const transport = new RecordingTransport();
+    const call = makeCall(transport);
+    await call.acceptRefer({
+      target: { aor: "sip:204@example.com" },
+      from: "sip:+15550100000@trunk.example.com",
+      fromDisplay: "",
+      pAssertedIdentity: "sip:+15550100000@trunk.example.com",
+      privacy: "restricted",
+      headers: { "X-Account": "main" },
+    });
+    await call.replacePeer({ aor: "sip:204@example.com" }, { from: "sip:200@example.com" });
+    await call.replacePeer("sip:204@198.51.100.7");
+    expect(transport.calls.map((recorded) => recorded.args)).toEqual([
+      {
+        target: { aor: "sip:204@example.com" },
+        from: "sip:+15550100000@trunk.example.com",
+        from_display: "",
+        p_asserted_identity: "sip:+15550100000@trunk.example.com",
+        privacy: "restricted",
+        headers: { "X-Account": "main" },
+      },
+      { target: { aor: "sip:204@example.com" }, from: "sip:200@example.com" },
+      { target: "sip:204@198.51.100.7" },
+    ]);
+  });
+
   it("media verbs — play (file/dbId/blob), stop, dtmf, hold, unhold, stream", async () => {
     const transport = new RecordingTransport();
     const call = makeCall(transport);
@@ -564,6 +608,8 @@ describe("Call verbs map to the in-process-mirrored wire verbs", () => {
     // "hi" → base64 "aGk=".
     await call.play({ blob: new Uint8Array([104, 105]) }, { durationMs: 5000 });
     await call.playFile("/prompts/bye.wav");
+    // Until stopped: the one non-numeric repeat.
+    await call.play({ file: "/prompts/hold.wav" }, { repeat: "inf" });
     await call.stop();
     await call.dtmf("123#", { durationMs: 100, volumeDbm0: -8 });
     await call.hold();
@@ -575,6 +621,7 @@ describe("Call verbs map to the in-process-mirrored wire verbs", () => {
       { module: MODULE_SIP, verb: "play", target: { channel: "ch1" }, args: { db_id: 42 } },
       { module: MODULE_SIP, verb: "play", target: { channel: "ch1" }, args: { blob: "aGk=", duration_ms: 5000 } },
       { module: MODULE_SIP, verb: "play", target: { channel: "ch1" }, args: { file: "/prompts/bye.wav" } },
+      { module: MODULE_SIP, verb: "play", target: { channel: "ch1" }, args: { file: "/prompts/hold.wav", repeat: "inf" } },
       { module: MODULE_SIP, verb: "stop", target: { channel: "ch1" }, args: {} },
       { module: MODULE_SIP, verb: "dtmf", target: { channel: "ch1" }, args: { digits: "123#", duration_ms: 100, volume_dbm0: -8 } },
       { module: MODULE_SIP, verb: "hold", target: { channel: "ch1" }, args: {} },

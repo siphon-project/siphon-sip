@@ -41,10 +41,22 @@ struct Pair {
 }
 
 async fn formed_pair(name: &str, phone: &str) -> Pair {
+    formed_pair_after(name, phone, |_, _| {}).await
+}
+
+/// [`formed_pair`], with `before` run on the answered caller ahead of the dial
+/// that bridges it.
+async fn formed_pair_after(
+    name: &str,
+    phone: &str,
+    before: impl FnOnce(&DispatcherState, &Caller),
+) -> Pair {
     let contact = format!("sip:{name}@{phone}");
     let engine = NativeTestEngine::start().await;
     let dispatcher = bridging_dispatcher(&engine);
     let caller = answered_caller(&dispatcher, &format!("{name}@192.0.2.10"));
+    crate::control::channel_event_capture::watch(&caller.call_id);
+    before(&dispatcher.state, &caller);
     let controller = controller_owning(name, dispatcher, &caller, "caller", "hangup");
     let (reply, _) = dial(
         &controller,
@@ -381,4 +393,97 @@ fn an_ordinary_calls_media_cdr_is_one_record_on_its_call_id() {
         records[0].extra.get("media_parties").map(String::as_str),
         Some("1")
     );
+}
+
+/// A recording running on an answered caller when it is bridged ends, because
+/// the bridge moves the caller's media onto the pair's engine call and retires
+/// the session the recording was on. The call is still up, so the application
+/// is told `bridged`, not `call_ended`; a recording the bridge did not retire
+/// keeps the engine's own reason.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_recording_ended_by_a_bridge_is_not_reported_as_the_call_ending() {
+    let before_bridge = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let noted = std::sync::Arc::clone(&before_bridge);
+    let pair = formed_pair_after(
+        "pair-recording",
+        "198.51.100.195:5060",
+        move |state, caller| {
+            let session = stored(state, &caller.call_id).expect("the caller is anchored");
+            crate::rtpengine::MediaBackend::recording_started(
+                "rec-before-bridge",
+                session.rtpengine_id(),
+                std::time::Instant::now(),
+            );
+            *noted.lock().expect("unpoisoned") =
+                Some((session.rtpengine_id().to_string(), session.from_tag.clone()));
+        },
+    )
+    .await;
+    let state = pair.state();
+    let (old_engine_call_id, old_tag) = before_bridge
+        .lock()
+        .expect("unpoisoned")
+        .clone()
+        .expect("the caller's session before the bridge");
+    assert_ne!(
+        old_engine_call_id, pair.engine_call_id,
+        "the bridge moved the caller onto another engine call"
+    );
+    let _ = pair.published();
+
+    // The engine reports the recording finished the only way it can.
+    on_recording_finished(
+        state,
+        RecordingFinished {
+            call_id: old_engine_call_id.clone(),
+            from_tag: old_tag.clone(),
+            recording_id: "rec-before-bridge".to_string(),
+            path: Some("/var/spool/recordings/rec-before-bridge.wav".to_string()),
+            reason: "call_ended",
+            duration_ms: 9000,
+        },
+    );
+    let (caller, phone) = pair.published();
+    assert_eq!(names(&caller), ["RecordingFinished"], "{caller:?}");
+    assert_eq!(caller[0].1["reason"], "bridged");
+    assert_eq!(caller[0].1["recording_id"], "rec-before-bridge");
+    assert_eq!(caller[0].1["duration_ms"], 9000);
+    assert!(phone.is_empty(), "{phone:?}");
+    assert_eq!(
+        crate::rtpengine::MediaBackend::recordings_awaited_on(&old_engine_call_id),
+        0,
+        "the record went with the report"
+    );
+
+    // Positive control: a recording on the pair's own engine call, which no
+    // bridge retired, ends with the reason the engine gave.
+    crate::rtpengine::MediaBackend::recording_started(
+        "rec-on-the-pair",
+        &pair.engine_call_id,
+        std::time::Instant::now(),
+    );
+    on_recording_finished(
+        state,
+        RecordingFinished {
+            call_id: pair.engine_call_id.clone(),
+            from_tag: pair.caller_tag.clone(),
+            recording_id: "rec-on-the-pair".to_string(),
+            path: Some("/var/spool/recordings/rec-on-the-pair.wav".to_string()),
+            reason: "call_ended",
+            duration_ms: 3000,
+        },
+    );
+    let (caller, _) = pair.published();
+    assert_eq!(names(&caller), ["RecordingFinished"], "{caller:?}");
+    assert_eq!(caller[0].1["reason"], "call_ended");
+}
+
+#[test]
+fn only_a_call_ended_on_a_retired_session_reads_as_bridged() {
+    assert_eq!(recording_end_reason("call_ended", true), "bridged");
+    assert_eq!(recording_end_reason("call_ended", false), "call_ended");
+    // The controller's own stop, a cap or silence is what it is either way.
+    for reason in ["stopped", "max_duration", "silence", "error"] {
+        assert_eq!(recording_end_reason(reason, true), reason);
+    }
 }

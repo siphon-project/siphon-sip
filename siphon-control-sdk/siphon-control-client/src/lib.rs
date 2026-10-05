@@ -51,6 +51,7 @@
 
 #![forbid(unsafe_code)]
 
+mod cancel_dial;
 mod client;
 mod dial;
 mod drop_call;
@@ -61,6 +62,7 @@ mod server;
 mod session;
 pub mod sip;
 mod stream;
+mod transfer;
 
 pub use client::{ClientConfig, ClientEvent, ControlClient, EventStream};
 pub use error::ControlError;

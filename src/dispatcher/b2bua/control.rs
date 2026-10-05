@@ -761,7 +761,7 @@ pub fn b2bua_progress_call(
 /// preset's `P-*` strip set, the same way a script's `set_header` does. Any
 /// asserted identity already in the command's own headers is replaced, so the
 /// two spellings cannot both reach the wire in an undefined order.
-fn dial_headers_with_asserted_identity(
+pub(super) fn dial_headers_with_asserted_identity(
     extra_headers: &[(String, String)],
     p_asserted_identity: Option<&str>,
 ) -> Vec<(String, String)> {

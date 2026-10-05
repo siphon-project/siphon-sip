@@ -900,6 +900,12 @@ pub fn start_originate_group(
     Ok(placed)
 }
 
+/// Forget a group that was created and never started: nothing is on the wire
+/// and its sink is not told.
+pub fn discard_originate_group(state: &DispatcherState, group_id: &str) {
+    state.originate_groups.remove(group_id);
+}
+
 /// End a group from outside it: CANCEL every leg still ringing (RFC 3261 §9.1),
 /// release every answer awaiting confirmation (BYE, §15) and report the
 /// failure. A group whose deadline passes while an answer awaits confirmation

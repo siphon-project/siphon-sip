@@ -26,9 +26,21 @@ pub struct PendingInboundRefer {
     pub deadline: std::time::Instant,
 }
 
+/// What became of a REFER offered to the pending store.
+pub enum ReferHold {
+    /// Held: the owning app is to be told.
+    Held,
+    /// A retransmission of the REFER already held: absorbed.
+    Retransmit,
+    /// Another REFER is already awaiting a decision on this call. Handed back so
+    /// the caller can answer it.
+    Busy(Box<PendingInboundRefer>),
+}
+
 /// Per-call store of inbound REFERs on *controlled* calls awaiting a control-app
-/// decision, keyed by the REFER's SIP Call-ID (byte-identical to the control
-/// channel's `sip_call_id` for a controlled single-`CallActor` call).
+/// decision, keyed by the SIP Call-ID the call's control channel is bound to —
+/// the A-leg's, whichever leg the REFER arrived on, since that is the key the
+/// `accept_refer` / `reject_refer` verbs present.
 ///
 /// New per-call state: every entry is removed on accept, reject, or the decision
 /// deadline, so the store drains back to baseline under a completed workload (the
@@ -45,13 +57,32 @@ impl PendingInboundReferStore {
     /// pushing a duplicate `TransferRequested` to the app or resetting the
     /// deadline. Race-safe via the map entry API (the junction is not guaranteed
     /// serialized per Call-ID across workers).
+    #[cfg(test)]
     pub fn insert(&self, sip_call_id: &str, pending: PendingInboundRefer) -> bool {
+        matches!(self.hold(sip_call_id, pending), ReferHold::Held)
+    }
+
+    /// Record a pending REFER, telling a retransmission of the one already held
+    /// from a second REFER on the same call.
+    ///
+    /// One decision is pending per call, and a call has two dialogs a REFER can
+    /// arrive on, so an occupied entry is not always a retransmit: the same
+    /// request (Call-ID and CSeq, RFC 3261 §17.2.3) is absorbed, anything else
+    /// is handed back to be answered rather than dropped. Race-safe via the map
+    /// entry API.
+    pub fn hold(&self, sip_call_id: &str, pending: PendingInboundRefer) -> ReferHold {
         use dashmap::mapref::entry::Entry;
         match self.entries.entry(sip_call_id.to_string()) {
-            Entry::Occupied(_) => false,
+            Entry::Occupied(held) => {
+                if same_request(&held.get().message, &pending.message) {
+                    ReferHold::Retransmit
+                } else {
+                    ReferHold::Busy(Box::new(pending))
+                }
+            }
             Entry::Vacant(slot) => {
                 slot.insert(pending);
-                true
+                ReferHold::Held
             }
         }
     }
@@ -82,6 +113,18 @@ impl PendingInboundReferStore {
     pub fn len(&self) -> usize {
         self.entries.len()
     }
+}
+
+/// Whether two requests are the same request, retransmitted: one dialog's
+/// Call-ID and one CSeq.
+fn same_request(held: &SipMessage, arrived: &SipMessage) -> bool {
+    let identity = |message: &SipMessage| {
+        (
+            message.headers.call_id().cloned(),
+            message.headers.cseq().cloned(),
+        )
+    };
+    identity(held) == identity(arrived)
 }
 
 /// A `BYE` for a replaced referrer leg, held back until the terminating
@@ -272,6 +315,207 @@ pub fn refer_decision_deadline(bus: &crate::control::ControlBus) -> std::time::D
     }
 }
 
+/// Who sent a REFER: the call it arrived on and the leg of it.
+pub struct Referrer<'a> {
+    /// The `CallActor` id.
+    pub call_id: &'a str,
+    pub from_a_leg: bool,
+    pub from_tag: Option<&'a str>,
+}
+
+/// The control channel owning the call a REFER arrived on, with the SIP Call-ID
+/// it is bound to.
+///
+/// A channel is bound to one Call-ID, the A-leg's. A REFER from the B-leg
+/// travels on a dialog of its own, with a Call-ID siphon generated, so it is
+/// resolved through the call it belongs to rather than by its own Call-ID —
+/// which is what a party transferring a call it *answered* sends.
+fn controlling_channel(
+    bus: &crate::control::ControlBus,
+    call_id: &str,
+    sip_call_id: &str,
+    state: &DispatcherState,
+) -> Option<(String, String)> {
+    if let Some(channel_id) = bus.channel_id_for_sip_call_id(sip_call_id) {
+        return Some((channel_id, sip_call_id.to_string()));
+    }
+    let a_leg_call_id = state
+        .call_actors
+        .get_call(call_id)
+        .map(|call| call.a_leg.dialog.call_id.clone())?;
+    let channel_id = bus.channel_id_for_sip_call_id(&a_leg_call_id)?;
+    Some((channel_id, a_leg_call_id))
+}
+
+/// A call's A-leg was replaced by another party: bind the call's control
+/// channel to the new A-leg's Call-ID.
+///
+/// A channel is bound to its call's A-leg Call-ID, and every verb finds the
+/// call through it. A transfer that replaces the A-leg, or a `Replaces`
+/// takeover, retires that Call-ID, so a channel left on it addresses nothing:
+/// its verbs answer `not_found` and the call's events have nowhere to go.
+/// `previous` is the Call-ID the channel was bound to. Returns whether a
+/// channel was moved.
+pub fn channel_follows_a_leg(
+    bus: &crate::control::ControlBus,
+    state: &DispatcherState,
+    call_id: &str,
+    previous: &str,
+) -> bool {
+    let Some(current) = state
+        .call_actors
+        .get_call(call_id)
+        .map(|call| call.a_leg.dialog.call_id.clone())
+    else {
+        return false;
+    };
+    if current == previous {
+        return false;
+    }
+    let Some(channel_id) = bus.channel_id_for_sip_call_id(previous) else {
+        return false;
+    };
+    let moved = bus.rebind_channel(&channel_id, call_id, &current);
+    if moved {
+        info!(
+            call_id = %call_id,
+            channel = %channel_id,
+            from = %previous,
+            to = %current,
+            "control plane: channel follows its call to the new A-leg dialog"
+        );
+    }
+    moved
+}
+
+/// [`channel_follows_a_leg`] on the process's control plane, when there is one.
+pub fn control_channel_follows_a_leg(state: &DispatcherState, call_id: &str, previous: &str) {
+    if let Some(bus) = crate::control::ControlBus::global() {
+        channel_follows_a_leg(&bus, state, call_id, previous);
+    }
+}
+
+/// What a controller needs to know about a dialog this node hosts, when a
+/// `Replaces` names it: the call it belongs to, the channel controlling that
+/// call, which leg of it the dialog is, and the channel that call is bridged
+/// with — the party that stays when the named one is replaced.
+///
+/// A `Replaces` carries a Call-ID and two tags, none of which a controller
+/// ever sees: it addresses calls by channel. This is the translation.
+pub fn hosted_dialog(
+    bus: &crate::control::ControlBus,
+    state: &DispatcherState,
+    matched: &crate::b2bua::actor::ReplacesMatch,
+) -> serde_json::Value {
+    let (channel, bridged_with) = state
+        .call_actors
+        .get_call(&matched.call_id)
+        .map(|call| {
+            (
+                bus.channel_id_for_sip_call_id(&call.a_leg.dialog.call_id),
+                call.bridge
+                    .as_ref()
+                    .and_then(|bridge| bus.channel_id_for_sip_call_id(&bridge.peer_sip_call_id)),
+            )
+        })
+        .unwrap_or_default();
+    serde_json::json!({
+        "call_actor_id": matched.call_id,
+        "channel": channel,
+        "leg": if matched.on_a_leg { "a" } else { "b" },
+        "bridged_with": bridged_with,
+    })
+}
+
+/// Hold a REFER on a controlled call for its owning app, and tell the app.
+///
+/// `None` when the REFER was taken: held and reported as `TransferRequested`,
+/// absorbed as a retransmission, or answered `491 Request Pending` because
+/// another REFER on the same call is still awaiting its decision (RFC 3261
+/// §21.4.27 — the request is not dropped, and the referrer may try again). The
+/// request is handed back when no app controls the call.
+pub fn hold_controlled_refer(
+    bus: &crate::control::ControlBus,
+    inbound: InboundMessage,
+    message: SipMessage,
+    refer_to: &crate::sip::headers::refer::ReferTo,
+    referrer: &Referrer<'_>,
+    state: &DispatcherState,
+) -> Option<(InboundMessage, SipMessage)> {
+    let call_id = referrer.call_id;
+    let sip_call_id = message.headers.call_id().cloned().unwrap_or_default();
+    let Some((channel_id, channel_call_id)) =
+        controlling_channel(bus, call_id, &sip_call_id, state)
+    else {
+        return Some((inbound, message));
+    };
+    let held = state.pending_inbound_refer.hold(
+        &channel_call_id,
+        PendingInboundRefer {
+            inbound,
+            message,
+            refer_to: refer_to.clone(),
+            from_a_leg: referrer.from_a_leg,
+            deadline: std::time::Instant::now() + refer_decision_deadline(bus),
+        },
+    );
+    match held {
+        ReferHold::Held => {
+            // The dialog an attended transfer names, when this node hosts it.
+            let replaces_local = refer_to.replaces.as_ref().and_then(|replaces| {
+                state
+                    .call_actors
+                    .find_call_by_replaces_dialog(
+                        &replaces.call_id,
+                        &replaces.from_tag,
+                        &replaces.to_tag,
+                    )
+                    .map(|matched| hosted_dialog(bus, state, &matched))
+            });
+            bus.forward_transfer_requested(
+                &channel_id,
+                &channel_call_id,
+                refer_to,
+                crate::control::TransferReferrer {
+                    from_tag: referrer.from_tag,
+                    from_a_leg: referrer.from_a_leg,
+                    sip_call_id: &sip_call_id,
+                    replaces_local,
+                },
+            );
+            info!(
+                call_id = %call_id,
+                %sip_call_id,
+                channel = %channel_id,
+                from_a_leg = referrer.from_a_leg,
+                target = %refer_to.uri,
+                "B2BUA REFER: controlled call — TransferRequested, awaiting accept/reject"
+            );
+        }
+        // A REFER retransmit (non-INVITE over UDP retransmits to Timer F): a
+        // decision is already pending, so absorb it rather than emit a
+        // duplicate event or reset the deadline.
+        ReferHold::Retransmit => {
+            debug!(call_id = %call_id, %sip_call_id, "B2BUA REFER: retransmit for a pending controlled transfer — absorbed");
+        }
+        ReferHold::Busy(second) => {
+            warn!(
+                call_id = %call_id,
+                %sip_call_id,
+                "B2BUA REFER: another REFER on this call is still awaiting its decision — 491"
+            );
+            b2bua_refer_send_final(
+                &second.inbound,
+                &second.message,
+                491,
+                "Request Pending",
+                state,
+            );
+        }
+    }
+    None
+}
+
 /// Handle an in-dialog REFER (RFC 3515) belonging to a tracked B2BUA call.
 ///
 /// This is the intercept that stops the REFER loop: without it, an in-dialog
@@ -383,41 +627,20 @@ pub fn handle_b2bua_refer(inbound: InboundMessage, message: SipMessage, state: &
     // matching the no-handler default below). An UNCONTROLLED call falls through
     // to the Python path unchanged — the control interception is only for
     // controlled calls.
-    if let Some(bus) = crate::control::ControlBus::global() {
-        if let Some(channel_id) = bus.channel_id_for_sip_call_id(&sip_call_id) {
-            let emitted = state.pending_inbound_refer.insert(
-                &sip_call_id,
-                PendingInboundRefer {
-                    inbound,
-                    message,
-                    refer_to: refer_to.clone(),
-                    from_a_leg,
-                    deadline: std::time::Instant::now() + refer_decision_deadline(&bus),
-                },
-            );
-            if emitted {
-                bus.forward_transfer_requested(
-                    &channel_id,
-                    &sip_call_id,
-                    &refer_to,
-                    from_tag.as_deref(),
-                );
-                info!(
-                    call_id = %call_id,
-                    %sip_call_id,
-                    channel = %channel_id,
-                    target = %refer_to.uri,
-                    "B2BUA REFER: controlled call — TransferRequested, awaiting accept/reject"
-                );
-            } else {
-                // A REFER retransmit (non-INVITE over UDP retransmits to Timer F):
-                // a decision is already pending, so absorb it rather than emit a
-                // duplicate event or reset the deadline.
-                debug!(call_id = %call_id, %sip_call_id, "B2BUA REFER: retransmit for a pending controlled transfer — absorbed");
+    let (inbound, message) = match crate::control::ControlBus::global() {
+        Some(bus) => {
+            let referrer = Referrer {
+                call_id: &call_id,
+                from_a_leg,
+                from_tag: from_tag.as_deref(),
+            };
+            match hold_controlled_refer(&bus, inbound, message, &refer_to, &referrer, state) {
+                None => return,
+                Some(uncontrolled) => uncontrolled,
             }
-            return;
         }
-    }
+        None => (inbound, message),
+    };
 
     // Fire @b2bua.on_refer(call). No handler → local 603 Decline (loop killer for
     // scripts that don't handle REFER at all).
@@ -534,6 +757,7 @@ pub fn handle_b2bua_refer(inbound: InboundMessage, message: SipMessage, state: &
                 mode,
                 profile.as_deref(),
                 number_shape.as_ref(),
+                &ReplacementDial::default(),
                 state,
             );
         }

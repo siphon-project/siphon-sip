@@ -190,7 +190,7 @@ pub fn b2bua_bridge_inbound_replaces(
     };
     state.call_event_receivers.remove(new_call_id);
 
-    let Some((replaced, _survivor)) = state.call_actors.adopt_replaced_dialog(
+    let Some((replaced, survivor)) = state.call_actors.adopt_replaced_dialog(
         &replaced_call_id,
         pending.replaced_on_a_leg,
         new_leg_owned,
@@ -219,6 +219,16 @@ pub fn b2bua_bridge_inbound_replaces(
         );
         return;
     };
+
+    // The newcomer holds the A-leg slot now, on a Call-ID of its own: a control
+    // channel on the joined call follows it there. The slot's previous holder
+    // is the replaced party, or the survivor when the callee was replaced.
+    let previous_a_leg = if pending.replaced_on_a_leg {
+        &replaced
+    } else {
+        &survivor
+    };
+    control_channel_follows_a_leg(state, &replaced_call_id, &previous_a_leg.dialog.call_id);
 
     // Handlers that rebuild a PyCall (on_bye, CDR finalize) read these off the
     // call, and they now describe the new party.
@@ -352,6 +362,7 @@ pub fn b2bua_refer_accept(
     mode: crate::script::api::call::ReferMode,
     media_profile: Option<&str>,
     number_shape: Option<&crate::script::api::numbers::NumberShape>,
+    dial: &ReplacementDial,
     state: &DispatcherState,
 ) {
     use crate::script::api::call::ReferMode;
@@ -544,6 +555,7 @@ pub fn b2bua_refer_accept(
                 refer_cseq,
                 crate::b2bua::transfer::ReplacementOrigin::Refer,
                 0,
+                dial,
                 state,
             );
         }
@@ -593,6 +605,7 @@ pub fn b2bua_start_leg_replacement(
     event_id: u32,
     origin: crate::b2bua::transfer::ReplacementOrigin,
     timeout_secs: u32,
+    dial: &ReplacementDial,
     state: &DispatcherState,
 ) -> bool {
     // Reshape the target to the carrier's number format before anything reads
@@ -629,7 +642,11 @@ pub fn b2bua_start_leg_replacement(
         }
     };
     let reshaped_target;
-    let target_uri = match number_policy.as_deref() {
+    // A registered contact is dialled as it registered: not a number to reshape.
+    let target_uri = match number_policy
+        .as_deref()
+        .filter(|_| !dial.is_registered_contact())
+    {
         Some(policy) => {
             reshaped_target = crate::script::api::numbers::reformat_dial_target(target_uri, policy);
             if reshaped_target != target_uri {
@@ -743,17 +760,16 @@ pub fn b2bua_start_leg_replacement(
         _ => (None, None),
     };
 
-    // Clone the A-leg INVITE as the dial template, but point its To at
-    // the Refer-To target (not the original callee). The generic B-leg
-    // builder rewrites only the To host, so without this the dialed
-    // INVITE would carry the original callee's userpart on the target's
+    // Clone the A-leg INVITE as the dial template; its To is pointed at the
+    // target below (`ReplacementDial::shape`), not left on the original callee.
+    // The generic B-leg builder rewrites only the To host, so without that the
+    // dialed INVITE would carry the original callee's userpart on the target's
     // host (e.g. To: <sip:bob@carol-host>) — wrong for a transfer
     // (RFC 3261 §8.1.1.2). Cloning also lets the lock drop before the send.
-    let dial_template = match a_leg_invite {
+    let mut dial_template = match a_leg_invite {
         Some(invite_arc) => match invite_arc.lock() {
             Ok(invite) => {
                 let mut template = invite.clone();
-                template.headers.set("To", format!("<{target_uri}>"));
                 // A call that itself arrived as a transfer left the
                 // PREVIOUS referrer's `Referred-By` on this
                 // template. When the REFER in hand names someone it is
@@ -804,18 +820,25 @@ pub fn b2bua_start_leg_replacement(
         triggered_extra_headers.push(("Referred-By".to_string(), value));
     }
 
+    // Who the leg is called as and what it presents: the target (its AoR, for
+    // a registered contact) and the identity the transfer was accepted with.
+    let shaped = dial_template
+        .as_mut()
+        .map(|template| dial.shape(template, target_uri, triggered_extra_headers));
+
     // `dialed` decides whether the transfer proceeds, so it has to be
     // what actually happened. It used to be hardcoded `true` next to a
     // send whose result was discarded, so a target that would not
     // resolve was treated as dialled and the replaced leg was BYE'd for
     // a target that never existed.
-    let dialed = if let Some(template) = dial_template {
-        b2bua_send_b_leg_invite(
+    let dialed = match (dial_template, shaped) {
+        (Some(template), Some(Ok(shaped))) => b2bua_send_b_leg_invite(
             call_id,
             target_uri,
             next_hop,
-            None,
-            &[],
+            // Over the flow a registered contact holds, through its Path.
+            dial.flow.as_ref(),
+            &dial.route,
             None,
             forced_cid,
             &template,
@@ -826,14 +849,17 @@ pub fn b2bua_start_leg_replacement(
             number_policy.as_deref(),
             None,
             None,
-            None,
-            None,
-            None,
-            triggered_extra_headers.as_slice(),
+            dial.shaping.privacy,
+            shaped.from_host.as_deref(),
+            shaped.to.as_deref(),
+            shaped.headers.as_slice(),
             state,
-        )
-    } else {
-        false
+        ),
+        (_, Some(Err(error))) => {
+            warn!(call_id = %call_id, %error, "leg replacement: the identity to present could not be put on the INVITE — nothing dialled");
+            false
+        }
+        _ => false,
     };
 
     // The dialed target is the last b_leg; capture its Call-ID so the
@@ -1070,10 +1096,20 @@ pub fn b2bua_complete_terminated_transfer(
     // The promotion runs either way — it is what makes the target the surviving
     // party's peer, and is the whole point of the transfer. Only the BYE is
     // conditional on there still being a referrer to receive it.
+    let previous_a_leg = state
+        .call_actors
+        .get_call(call_id)
+        .map(|call| call.a_leg.dialog.call_id.clone());
     let promoted_referrer =
         state
             .call_actors
             .promote_transfer_target(call_id, target_idx, referrer_on_a_leg);
+    if let Some(previous) = previous_a_leg.as_deref() {
+        // Before anything is published for the call: `PeerReplaced` below is
+        // addressed by the A-leg's Call-ID, which the promotion just changed
+        // when the referrer was the A-leg.
+        control_channel_follows_a_leg(state, call_id, previous);
+    }
     if let Some(referrer_leg) = promoted_referrer.filter(|_| !referrer_gone) {
         if let Some(bye) = build_b2bua_bye(&referrer_leg, state) {
             match notify_branch.take() {

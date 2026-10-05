@@ -22,10 +22,14 @@
 //! the two calls exactly as they were. Doing it the other way round would
 //! re-point a leg at media the second party then refused.
 //!
-//! The *anchor* is the leg the verb is addressed to (`bridge` target), and it
-//! is the leg that keeps its media session — its ports, its recording fork,
-//! anything still riding on it. The peer's own media session is deleted once
-//! the bridge forms; the peer joins the anchor's as the second party.
+//! The *anchor* is the leg the verb is addressed to (`bridge` target). An
+//! anchor that is already relaying keeps its media session — its ports, its
+//! recording fork, anything still riding on it. An anchor siphon answered
+//! itself has only a single-party session, so the pair is negotiated on an
+//! engine call of its own and that session is deleted once the bridge forms,
+//! with whatever rode on it: a recording there ends, reported `bridged`. The
+//! peer's own media session is deleted then too; the peer joins the pair as
+//! the second party.
 //!
 //! ## Re-negotiation, not replacement
 //!
