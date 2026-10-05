@@ -15,6 +15,33 @@ entry, but a working config keeps working.
 
 ### Added
 
+- **A controller can carry a transfer out itself and tell the referrer how
+  it went.** `accept_refer` takes `mode: "controller"`: siphon answers the
+  REFER `202`, sends the first sipfrag NOTIFY (`100 Trying`) and dials
+  nothing. The application moves the parties with its other verbs and then
+  sends the new `complete_refer {code, reason?}`, which siphon turns into
+  the NOTIFY that ends the subscription (a 2xx says the transfer
+  succeeded). Before, `accept_refer` could only have siphon dial the target
+  or relay the REFER, so an attended transfer between two calls a
+  controller had bridged, or one that had to go out through the
+  application's own flow, could be done but never reported: the referrer
+  was either declined or told about a leg siphon dialled on its own.
+  `timeout` (default 60 s, at most 180) bounds the wait; past it siphon
+  reports `503` to the referrer. A further REFER on the call is answered
+  `491` until the report, a retransmission of the accepted one gets its
+  `202` again, and the referrer's BYE ends the subscription without a
+  NOTIFY. `complete_refer` with nothing to report on is `invalid_state`
+  (`reason: no_transfer_pending`). Report before hanging up the referrer's
+  leg: the NOTIFY travels on its dialog, and afterwards the answer is
+  `not_found`. The mode takes `timeout` only, and refuses every argument
+  that describes a leg to dial; `terminate` and `transparent` now refuse
+  `timeout`, which they used to ignore along with any other unknown
+  argument. Control plane only: a script has no `complete_refer`, so the
+  script API and `b2bua.default_refer_mode` are unchanged. The Rust, Python
+  and TypeScript control SDKs have it (`accept_refer_controller` /
+  `complete_refer`, `accept_refer(mode="controller", timeout=…)` /
+  `complete_refer`, `acceptRefer({ mode: "controller" })` /
+  `completeRefer`).
 - **A `dial` target can name its called party with `to`.** It becomes that
   branch's `To` URI. Before, a B-leg always kept the caller's `To` user and
   only swapped in the target's host. That is right for a forward and wrong for
