@@ -14,7 +14,7 @@
 
 use super::control_bridge_ingress_tests::{OPEN_PLAIN, OPEN_SECURE, PINNED_PLAIN, PINNED_SECURE};
 use super::control_bridge_media_tests::{accepts, bridge_offer_to, last, stored};
-use super::control_rebridge_tests::{legs, Legs};
+use super::control_rebridge_tests::{legs, retired_sessions_deleted, Legs};
 use super::dial_bridge_test_harness::{
     answered_caller_from, assert_drained, caller_sends, command, eventually, reinvites_to,
     sent_until, Caller,
@@ -79,6 +79,7 @@ async fn bridge(legs: &Legs, target: &str, with: &str, anchor: &Caller, peer: &C
             .await,
         "the bridge formed"
     );
+    retired_sessions_deleted(legs).await;
     drain(legs.udp());
 }
 

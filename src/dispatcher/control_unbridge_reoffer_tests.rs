@@ -118,6 +118,11 @@ fn hold_from(leg: &Caller) -> String {
 }
 
 /// A pair bridged and parted, both legs held.
+///
+/// The bridge has finished with the engine by the time this returns: forming
+/// it deletes both legs' own sessions on a task of its own, and
+/// [`Legs::bridge`] waits for the last of those to have reached the engine.
+/// A baseline of the engine's commands taken after this is therefore complete.
 async fn parted(app: &str, peer_address: &str) -> Legs {
     let legs = legs(app, peer_address, OPEN_PLAIN, PINNED_SECURE).await;
     legs.bridge("anchor", "peer").await;
@@ -157,8 +162,8 @@ async fn a_changed_offer_from_a_parted_leg_is_refused_and_reaches_neither_the_en
             assert_eq!(
                 engine_commands(&legs),
                 before,
-                "{what}: the engine is sent nothing: {:?}",
-                legs.engine.commands("answer_local")
+                "{what}: the engine is sent nothing; its deletes: {:?}",
+                legs.engine.commands("delete")
             );
             assert!(
                 sent.iter()
