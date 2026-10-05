@@ -574,6 +574,25 @@ impl MediaSessionStore {
         }
     }
 
+    /// Record the caller's answer to a delayed offer (RFC 3264 §4) on the
+    /// session the callee's offer created, and name the two parties in the
+    /// order every other session does: the caller on
+    /// [`MediaSession::from_tag`], the callee on [`MediaSession::to_tag`].
+    ///
+    /// Until the answer the session has only the callee, as its offerer.
+    /// Left that way round once answered, every reader that names a party by
+    /// the leg it is on would name the other one: a hold from the caller
+    /// would reach the engine as the callee's re-offer, and the caller would
+    /// be pinned by the callee's `received_from` policy.
+    pub fn set_delayed_offer_answerer(&self, call_id: &str, caller_tag: String) {
+        if let Some(mut entry) = self.sessions.get_mut(call_id) {
+            if entry.to_tag.is_none() {
+                let callee_tag = std::mem::replace(&mut entry.from_tag, caller_tag);
+                entry.to_tag = Some(callee_tag);
+            }
+        }
+    }
+
     /// Record the WebSocket **tee** attached to a session, or clear it on
     /// detach.
     ///

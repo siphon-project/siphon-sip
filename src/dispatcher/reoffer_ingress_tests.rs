@@ -96,28 +96,23 @@ pub(super) fn request_from(
 
 /// `party` ACKs the 2xx that set its dialog up, which frees the dialog for a
 /// re-INVITE relayed to it (RFC 3261 §14.1).
-pub(super) fn acks(dispatcher: &super::test_dispatcher::TestDispatcher, party: &Party) {
+pub(super) fn acks(state: &DispatcherState, party: &Party) {
     let (_, ack) = request_from(party, "ACK", 1, None);
     assert!(
-        tokio::task::block_in_place(|| absorb_b2bua_ack(&party.call_id, &ack, &dispatcher.state)),
+        tokio::task::block_in_place(|| absorb_b2bua_ack(&party.call_id, &ack, state)),
         "the ACK belongs to a call"
     );
 }
 
 /// `party` re-offers with `method` and an SDP naming [`SIGNALLED`], through
 /// the handler the request path hands it to.
-pub(super) fn reoffers(
-    dispatcher: &super::test_dispatcher::TestDispatcher,
-    party: &Party,
-    method: &str,
-    cseq: u32,
-) {
+pub(super) fn reoffers(state: &DispatcherState, party: &Party, method: &str, cseq: u32) {
     let body = sdp_naming(SIGNALLED);
     let (raw, message) = request_from(party, method, cseq, Some(&body));
     let arrived = inbound(&party.address, &raw);
     tokio::task::block_in_place(|| match method {
-        "INVITE" => handle_b2bua_reinvite(arrived, message, &dispatcher.state),
-        "UPDATE" => handle_b2bua_update(arrived, message, &dispatcher.state),
+        "INVITE" => handle_b2bua_reinvite(arrived, message, state),
+        "UPDATE" => handle_b2bua_update(arrived, message, state),
         other => panic!("no {other} re-offer in these tests"),
     });
 }
@@ -193,7 +188,7 @@ pub(super) fn renegotiates(
     let reoffers_before = engine.commands("reoffer").len();
     let answers_before = engine.commands("answer").len();
     let _ = wire(&call.dispatcher);
-    reoffers(&call.dispatcher, offerer, method, cseq);
+    reoffers(&call.dispatcher.state, offerer, method, cseq);
     let relayed = relayed_to(&wire(&call.dispatcher), &answerer.address, method);
     accepts(call, &call.call_id(), &answerer.address, &relayed);
     assert_eq!(
@@ -240,7 +235,7 @@ async fn a_relayed_reoffer_pins_each_party_by_its_own_half_whoever_reoffers() {
                 let engine = NativeTestEngine::start().await;
                 let call = anchored(prefix, &engine, profile).await;
                 let (caller, callee) = (caller_of(&call), callee_of(&call));
-                acks(&call.dispatcher, &caller);
+                acks(&call.dispatcher.state, &caller);
                 let (offerer, answerer, offerer_pinned, answerer_pinned) = if caller_reoffers {
                     (&caller, &callee, caller_pinned, callee_pinned)
                 } else {
@@ -330,7 +325,7 @@ fn taken_over_by(call: &Established, prefix: u32, newcomer: &str) -> Party {
         to: header(&answered, "To"),
         call_id,
     };
-    acks(&call.dispatcher, &party);
+    acks(&call.dispatcher.state, &party);
     // The surviving caller answers the re-INVITE that pointed it at the
     // newcomer, which frees its dialog for an offer relayed to it.
     let to_survivor = relayed_to(&sent, call.a.1, "INVITE");
@@ -367,7 +362,7 @@ async fn a_reoffer_after_a_takeover_pins_each_party_by_what_the_pair_recorded() 
                 let engine = NativeTestEngine::start().await;
                 let call = anchored(prefix, &engine, profile).await;
                 let survivor = caller_of(&call);
-                acks(&call.dispatcher, &survivor);
+                acks(&call.dispatcher.state, &survivor);
                 let newcomer =
                     taken_over_by(&call, prefix, &format!("192.0.2.{}:5062", 231 + index));
                 let fresh = newcomer.call_id.clone();
@@ -384,7 +379,7 @@ async fn a_reoffer_after_a_takeover_pins_each_party_by_what_the_pair_recorded() 
                     .find_by_sip_call_id(&fresh)
                     .expect("the call");
                 let _ = wire(&call.dispatcher);
-                reoffers(&call.dispatcher, offerer, method, 7);
+                reoffers(&call.dispatcher.state, offerer, method, 7);
                 let relayed = relayed_to(&wire(&call.dispatcher), &answerer.address, method);
                 accepts(&call, &internal, &answerer.address, &relayed);
                 let reoffer = last_on(&engine, "reoffer", &fresh);

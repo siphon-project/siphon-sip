@@ -828,7 +828,7 @@ impl PyRtpEngine {
         } else {
             &entry.answer
         };
-        let flags = side.clone();
+        let flags = exchange.command_flags(entry);
 
         // The bridge belongs to the offerer's leg, so template against the A-leg
         // identifiers resolved above — not the reply's own tags.
