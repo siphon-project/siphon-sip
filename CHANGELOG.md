@@ -108,6 +108,26 @@ entry, but a working config keeps working.
   `call.set_caller_id()`) rewrites it with the others, a replaced identity
   (dial or target `from`) drops it, and a restricted call removes it. One a
   controller or script sets explicitly on the B-leg goes out as written.
+- **`media.backend: rtpproxy` keeps one session per call and releases it.**
+  Four defects in the rtpproxy client, each visible in the engine's own
+  session and command counters:
+  - A BYE from the callee deleted nothing. The delete named the callee's tag,
+    rtpproxy matches on the tag the session was created with, and the session
+    and its relay ports stayed up until the no-media timeout. The delete now
+    names the offer's tag.
+  - A re-INVITE from the callee opened a second session on fresh ports, which
+    was never deleted. The update now carries the session's tag as its to-tag,
+    so rtpproxy updates the callee side of the existing session.
+  - A hold signalled with the null connection address (`c=IN IP4 0.0.0.0`,
+    RFC 3264 §8.4) reached the far end as an ordinary re-offer, because the
+    relay address was written over it. The port is still anchored and the
+    null address is kept.
+  - An IPv6 stream was answered with an IPv4 `c=` when rtpproxy listens on a
+    wildcard and so returns a port without an address. siphon fell back to the
+    control address whatever its family. With a loopback control address the
+    loopback of the stream's family is used. A remote engine reached over the
+    other family keeps the control address and logs a warning: give rtpproxy a
+    concrete `-l` / `-6` listen address there.
 - **`@b2bua.on_cancel` runs once, and after `@b2bua.on_invite`, for a call
   CANCELled early.** Two orderings of a caller's CANCEL left a script's
   teardown wrong:
