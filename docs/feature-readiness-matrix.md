@@ -339,7 +339,8 @@ All four, plus the reliable-provisional scenario that had been driven only by
 | Feature | Readiness | Config | Notes |
 |---------|-----------|--------|-------|
 | Non-INVITE timeout | **Production** | `transaction.timeout_secs` | |
-| INVITE timeout | **Production** | `transaction.invite_timeout_secs` | |
+| INVITE timeout | **Production** | `transaction.invite_timeout_secs` | How long proxy state for an INVITE is kept once no branch of it is still owed a final response. A session with a pending branch is never swept, however long the call rings (`dispatcher::proxy_timer_c_tests::a_call_answered_after_ringing_past_the_transaction_timeout_still_connects`). |
+| Timer C (RFC 3261 §16.6 step 11) | Implemented | `transaction.timer_c_secs` (default 181) | A proxied INVITE that has a provisional and no final response is CANCELled when Timer C runs out (§16.8), counted from the INVITE and again from each 101-199 (§16.7 step 2); its `487` is the branch's final response, and a branch silent for 64*T1 after the CANCEL is given up as a `408`. A provisional resets it by storing its arrival time, so the timer wheel is only touched once the INVITE has outlived Timer B. Unit-tested in `transaction::timer_c_tests` (the default and the configured value reaching the timer, the hand-over from Timer B, reset by 101-199 and not by 100, the CANCEL, the 64*T1 bound, no second CANCEL, a final response stopping it) and through the dispatcher in `dispatcher::proxy_timer_c_tests` (the CANCEL and forwarded `487`, the reset, the `408`, a fork branch counted by the aggregator, and nothing left behind). |
 
 ## DNS Resolution
 

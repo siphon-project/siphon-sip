@@ -16,6 +16,8 @@ pub mod timer;
 
 #[cfg(test)]
 mod cancel_tests;
+#[cfg(test)]
+mod timer_c_tests;
 
 use bytes::Bytes;
 use dashmap::mapref::entry::Entry;
@@ -464,6 +466,17 @@ impl TransactionManager {
                     if matches!(ict.state, IctState::Calling | IctState::Proceeding)
             )
         })
+    }
+
+    /// Move what Timer C counts from, for INVITE client transaction `key`,
+    /// back by `by` (test clock).
+    #[cfg(test)]
+    pub fn age_invite_client(&self, key: &TransactionKey, by: std::time::Duration) {
+        if let Some(mut entry) = self.transactions.get_mut(key) {
+            if let Transaction::Ict(ict) = &mut **entry {
+                ict.age_progress(by);
+            }
+        }
     }
 
     /// Number of INVITE client transactions holding a CANCEL that waits for

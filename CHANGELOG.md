@@ -253,6 +253,31 @@ entry, but a working config keeps working.
   a minute after the request. Each is now released as it ends (the `487` of
   its CANCEL, a failure of its own, its INVITE timing out), and the session
   with the last one.
+- **A proxied INVITE that rings and never answers is ended by Timer C, and
+  one that rings for a long time is no longer lost.** RFC 3261 §16.6 step 11
+  has a proxy set Timer C, larger than 3 minutes, for every INVITE it
+  forwards; §16.7 step 2 resets it on each 101-199 provisional; and §16.8 has
+  it CANCEL a branch that has had a provisional when it fires. siphon had no
+  Timer C. An INVITE client transaction that got a provisional and no final
+  response was never removed, and the proxy session of a call that was still
+  ringing was taken by the periodic sweep once it was older than
+  `transaction.invite_timeout_secs` (32 to 62 s after the INVITE with the
+  defaults): nothing was sent to either side, the callee kept ringing, and
+  when it answered, its 2xx matched no session and was dropped. A session
+  with a branch still owed its final response is now never swept, and the
+  dialog entry the answer's ACK is routed by is kept from the answer. What
+  bounds such a call is `transaction.timer_c_secs` (default 181): counted
+  from the INVITE, and again from each 101-199, and when it runs out the
+  branch is CANCELled. The `487` that follows is the branch's final response
+  like any other (forwarded, or weighed with the other branches of a fork,
+  or the cue for a sequential fork to try the next target), and a branch
+  that does not answer its CANCEL within 64*T1 is given up as a `408`
+  (§9.1, §16.7 step 2). A branch that has drawn no response at all is still
+  ended by Timer B, as before. A lower `timer_c_secs` is a ring timeout for
+  every proxied call, and is never taken as less than Timer B. A provisional
+  resets the timer by storing the time it arrived, so the response path pays
+  one clock read per 101-199 and no timer traffic, and a call that ends
+  within 32 s never has a Timer C at all.
 - **A transfer whose target cannot be dialled ends its subscription and
   leaves the call free.** A siphon-terminated REFER answers `202` and sends
   the `100 Trying` NOTIFY before it dials. When no INVITE could then be sent

@@ -240,6 +240,7 @@ pub(super) fn fire_expired_timers(state: &DispatcherState) {
         let client_event = match entry.name {
             TimerName::A => Some(ClientEvent::Ict(IctEvent::TimerA)),
             TimerName::B => Some(ClientEvent::Ict(IctEvent::TimerB)),
+            TimerName::C => Some(ClientEvent::Ict(IctEvent::TimerC)),
             TimerName::D => Some(ClientEvent::Ict(IctEvent::TimerD)),
             TimerName::E => Some(ClientEvent::Nict(NictEvent::TimerE)),
             TimerName::F => Some(ClientEvent::Nict(NictEvent::TimerF)),

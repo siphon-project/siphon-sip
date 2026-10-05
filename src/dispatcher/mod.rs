@@ -199,6 +199,8 @@ mod proxy_protocol_tests;
 #[cfg(test)]
 mod proxy_reply_filter_tests;
 #[cfg(test)]
+mod proxy_timer_c_tests;
+#[cfg(test)]
 mod public_api_surface;
 #[cfg(test)]
 mod refer_answer_tests;
@@ -455,6 +457,7 @@ pub async fn run(
             config.auto_100_trying = tx.auto_emit_100_trying;
             config.auto_100_delay =
                 std::time::Duration::from_millis(tx.auto_emit_100_trying_delay_ms);
+            config.timer_c_secs = tx.timer_c_secs;
         }
         config
     };

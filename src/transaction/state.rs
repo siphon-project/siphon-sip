@@ -133,6 +133,8 @@ pub enum Action {
 pub enum TimerName {
     A,
     B, // ICT
+    /// The proxy's bound on an INVITE in `Proceeding` (RFC 3261 §16.6 step 11).
+    C, // ICT
     D, // ICT
     E,
     F, // NICT
@@ -704,6 +706,9 @@ pub enum IctEvent {
     TimerA,
     /// Timer B fired (INVITE transaction timeout).
     TimerB,
+    /// Timer C fired (RFC 3261 §16.8): the INVITE has waited too long for its
+    /// final response.
+    TimerC,
     /// Timer D fired (completed → terminated).
     TimerD,
     /// A provisional (1xx) response received.
@@ -776,6 +781,21 @@ enum CancelProgress {
     Sent,
 }
 
+/// Where Timer C stands for an INVITE client transaction (RFC 3261 §16.6
+/// step 11, §16.8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TimerCProgress {
+    /// Not running. The INVITE is younger than Timer B, which every INVITE
+    /// has anyway, so nothing of Timer C exists for a call that is answered or
+    /// fails in that time.
+    Idle,
+    /// Running: the INVITE outlived Timer B in `Proceeding`.
+    Armed,
+    /// It ran out and the INVITE was CANCELled; the final response has
+    /// 64*T1 to arrive (§9.1) before the transaction is given up.
+    Expired,
+}
+
 /// INVITE Client Transaction state machine.
 #[derive(Debug)]
 pub struct Ict {
@@ -802,6 +822,13 @@ pub struct Ict {
     /// what the CANCEL and the ACK of this INVITE are sent by (RFC 3261 §9.1,
     /// §17.1.1.3: the same address, port and transport as the request).
     hop: Option<BranchHop>,
+    /// When the last 101-199 provisional arrived: what Timer C counts from
+    /// (RFC 3261 §16.7 step 2). Kept as a time, so a provisional resets
+    /// Timer C by storing one, and the timer wheel is only touched when the
+    /// timer actually comes due.
+    last_progress: Option<std::time::Instant>,
+    /// Where Timer C stands.
+    timer_c: TimerCProgress,
 }
 
 impl Ict {
@@ -825,6 +852,8 @@ impl Ict {
             cached_ack: None,
             cancel: CancelProgress::NotRequested,
             hop: None,
+            last_progress: None,
+            timer_c: TimerCProgress::Idle,
         };
         // Start Timer B (overall timeout)
         actions.push(Action::StartTimer(TimerName::B, ict.timers.timer_b()));
@@ -998,6 +1027,90 @@ impl Ict {
         matches!(self.cancel, CancelProgress::Waiting(_))
     }
 
+    /// RFC 3261 §16.7 step 2: "If the response is a provisional response with
+    /// status codes 101 to 199 inclusive (i.e., anything but 100), the proxy
+    /// MUST reset timer C for that client transaction." The reset is this
+    /// store; see [`Self::timer_c_due`] for how it is honoured.
+    fn note_progress(&mut self, response: &SipMessage) {
+        if response
+            .status_code()
+            .is_some_and(|status_code| (101..200).contains(&status_code))
+        {
+            self.last_progress = Some(std::time::Instant::now());
+        }
+    }
+
+    /// Timer B found the INVITE in `Proceeding`: it has a provisional, so it
+    /// is no longer Timer B's to end, and Timer C takes over.
+    fn start_timer_c(&mut self, now: std::time::Instant) -> Vec<Action> {
+        if self.last_progress.is_none() {
+            // Nothing but a 100 so far: Timer C runs from when the INVITE was
+            // forwarded, which is Timer B ago.
+            self.last_progress = Some(now.checked_sub(self.timers.timer_b()).unwrap_or(now));
+        }
+        self.timer_c = TimerCProgress::Armed;
+        self.timer_c_due(now)
+    }
+
+    /// Timer C came due, at `now`.
+    ///
+    /// * A 101-199 arrived since it was set: it is set again, for what is left
+    ///   of the time counted from that response.
+    /// * It ran out with the INVITE in `Proceeding` (RFC 3261 §16.8: "If the
+    ///   client transaction has received a provisional response, the proxy
+    ///   MUST generate a CANCEL request matching that transaction"): the
+    ///   CANCEL is sent, unless the TU already sent one, and the final response
+    ///   is given 64*T1 more (§9.1).
+    /// * That ran out too: the transaction ends as a timeout, which the proxy
+    ///   treats as a `408` on the branch (§16.7 step 2).
+    fn timer_c_due(&mut self, now: std::time::Instant) -> Vec<Action> {
+        match self.timer_c {
+            TimerCProgress::Idle => vec![],
+            TimerCProgress::Armed => {
+                let deadline = self.last_progress.unwrap_or(now) + self.timers.timer_c();
+                let remaining = deadline.saturating_duration_since(now);
+                if !remaining.is_zero() {
+                    return vec![Action::StartTimer(TimerName::C, remaining)];
+                }
+                self.timer_c = TimerCProgress::Expired;
+                let mut actions = Vec::new();
+                if matches!(self.cancel, CancelProgress::NotRequested) {
+                    match self.build_cancel(&[]) {
+                        Ok(cancel) => {
+                            self.cancel = CancelProgress::Sent;
+                            actions.push(Action::SendCancel(Box::new(cancel)));
+                        }
+                        Err(error) => actions.push(Action::ProtocolError(format!(
+                            "Timer C fired and the INVITE's CANCEL could not be built: {error}"
+                        ))),
+                    }
+                }
+                actions.push(Action::StartTimer(TimerName::C, self.timers.timer_b()));
+                actions
+            }
+            TimerCProgress::Expired => {
+                self.state = IctState::Terminated;
+                vec![Action::Timeout, Action::Terminated]
+            }
+        }
+    }
+
+    /// The INVITE has its final response: Timer C, if it was running, stops.
+    fn stop_timer_c(&mut self, actions: &mut Vec<Action>) {
+        if self.timer_c != TimerCProgress::Idle {
+            self.timer_c = TimerCProgress::Idle;
+            actions.push(Action::CancelTimer(TimerName::C));
+        }
+    }
+
+    /// Move what Timer C counts from back by `by` (test clock).
+    #[cfg(test)]
+    pub fn age_progress(&mut self, by: Duration) {
+        if let Some(last_progress) = self.last_progress {
+            self.last_progress = Some(last_progress.checked_sub(by).unwrap_or(last_progress));
+        }
+    }
+
     /// The CANCEL that waited for the provisional that has just arrived, if
     /// one did. One discriminant compare when none does.
     fn release_waiting_cancel(&mut self) -> Option<Box<BranchCancel>> {
@@ -1041,6 +1154,7 @@ impl Ict {
             (IctState::Calling, IctEvent::Provisional(response)) => {
                 // RFC 3261 §17.1.1.2: provisional response stops retransmissions
                 self.state = IctState::Proceeding;
+                self.note_progress(&response);
                 let mut actions = vec![
                     Action::CancelTimer(TimerName::A),
                     Action::PassToTu(response),
@@ -1109,16 +1223,26 @@ impl Ict {
                 vec![]
             }
             (IctState::Proceeding, IctEvent::Provisional(response)) => {
+                self.note_progress(&response);
                 vec![Action::PassToTu(response)]
             }
+            (IctState::Proceeding, IctEvent::TimerB) => {
+                // Timer B is for an INVITE with no response (§17.1.1.2). One
+                // with a provisional is bounded by Timer C from here on
+                // (§16.6 step 11).
+                self.start_timer_c(std::time::Instant::now())
+            }
+            (IctState::Proceeding, IctEvent::TimerC) => self.timer_c_due(std::time::Instant::now()),
             (IctState::Proceeding, IctEvent::Response2xx(response)) => {
                 self.state = IctState::Terminated;
-                vec![
+                let mut actions = vec![
                     Action::CancelTimer(TimerName::A),
                     Action::CancelTimer(TimerName::B),
                     Action::PassToTu(response),
                     Action::Terminated,
-                ]
+                ];
+                self.stop_timer_c(&mut actions);
+                actions
             }
             (IctState::Proceeding, IctEvent::ResponseNon2xx(response)) => {
                 self.state = IctState::Completed;
@@ -1149,6 +1273,7 @@ impl Ict {
                     Action::CancelTimer(TimerName::B),
                     Action::PassToTu(response),
                 ]);
+                self.stop_timer_c(&mut actions);
                 if timer_d.is_zero() {
                     self.state = IctState::Terminated;
                     actions.push(Action::Terminated);

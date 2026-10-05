@@ -681,22 +681,66 @@ impl ProxySessionStore {
         ttl: std::time::Duration,
         ack_grace: std::time::Duration,
     ) -> usize {
-        self.sweep_inner(ttl, ack_grace)
+        self.sweep_inner(ttl, ack_grace, &|_| false)
+    }
+
+    /// [`Self::sweep_stale_with_ack_grace`], sparing every session with a
+    /// branch for which `pending` holds: an INVITE still owed its final
+    /// response.
+    ///
+    /// Age alone does not make such a session stale. A call may ring for
+    /// minutes, and its answer has to find the session, and its ACK the dialog
+    /// entry, however long that took. What bounds it is the transaction layer:
+    /// Timer B while the branch has drawn nothing, Timer C once it has
+    /// (RFC 3261 §16.6 step 11), each of which ends the branch and, with the
+    /// last branch, the session.
+    pub fn sweep_stale_sparing(
+        &self,
+        ttl: std::time::Duration,
+        ack_grace: std::time::Duration,
+        pending: &dyn Fn(&TransactionKey) -> bool,
+    ) -> usize {
+        self.sweep_inner(ttl, ack_grace, pending)
     }
 
     /// Sweep sessions older than `ttl`, returning the number removed.
     pub fn sweep_stale(&self, ttl: std::time::Duration) -> usize {
-        self.sweep_inner(ttl, ttl)
+        self.sweep_inner(ttl, ttl, &|_| false)
     }
 
-    fn sweep_inner(&self, ttl: std::time::Duration, ack_grace: std::time::Duration) -> usize {
+    /// A 2xx answered this session's INVITE: the dialog entry its ACK is
+    /// routed by is kept for a transaction's length from now, not from when
+    /// the INVITE arrived, which for a call that rang a while is long past.
+    /// One read lock; the write only for a session older than `stale_after`.
+    pub fn keep_dialog_for_answer(
+        session: &Arc<RwLock<ProxySession>>,
+        stale_after: std::time::Duration,
+    ) {
+        let aged = session
+            .read()
+            .is_ok_and(|guard| guard.created_at.elapsed() > stale_after);
+        if aged {
+            if let Ok(mut guard) = session.write() {
+                guard.created_at = Instant::now();
+            }
+        }
+    }
+
+    fn sweep_inner(
+        &self,
+        ttl: std::time::Duration,
+        ack_grace: std::time::Duration,
+        pending: &dyn Fn(&TransactionKey) -> bool,
+    ) -> usize {
         let now = Instant::now();
         let mut stale_server_keys = Vec::new();
 
         // Find stale sessions by checking any client key's session
         for entry in self.by_client_key.iter() {
             if let Ok(session) = entry.value().read() {
-                if now.duration_since(session.created_at) > ttl {
+                if now.duration_since(session.created_at) > ttl
+                    && !session.client_keys.iter().any(pending)
+                {
                     let server_key = session.server_key.clone();
                     if !stale_server_keys.contains(&server_key) {
                         stale_server_keys.push(server_key);
@@ -734,7 +778,7 @@ impl ProxySessionStore {
                     Some(acked) => (acked, ack_grace),
                     None => (session.created_at, ttl),
                 };
-                if now.duration_since(since) > limit {
+                if now.duration_since(since) > limit && !session.client_keys.iter().any(pending) {
                     stale_dialog_keys.push(entry.key().clone());
                 }
             }

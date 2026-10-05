@@ -17,6 +17,14 @@ pub const DEFAULT_T4: Duration = Duration::from_secs(5);
 /// Mirrors RFC 3261 §17.2.1's 200 ms timer for the INVITE server transaction.
 pub const DEFAULT_AUTO_100_TRYING_DELAY: Duration = Duration::from_millis(200);
 
+/// Default Timer C: how long a proxied INVITE may wait for a final response
+/// after its last 101-199 provisional. RFC 3261 §16.6 step 11: "The timer MUST
+/// be larger than 3 minutes."
+pub const DEFAULT_TIMER_C: Duration = Duration::from_secs(DEFAULT_TIMER_C_SECS as u64);
+
+/// [`DEFAULT_TIMER_C`] in seconds, as it is configured.
+pub const DEFAULT_TIMER_C_SECS: u32 = 181;
+
 /// Timer configuration — all derived from T1, T2, T4.
 #[derive(Debug, Clone, Copy)]
 pub struct TimerConfig {
@@ -31,6 +39,12 @@ pub struct TimerConfig {
     pub auto_100_trying: bool,
     /// Delay before the NIST auto-100 timer fires.
     pub auto_100_delay: Duration,
+    /// Timer C (RFC 3261 §16.6 step 11), in seconds: the proxy's bound on an
+    /// INVITE that has a provisional response and no final one. See
+    /// [`Self::timer_c`]. Whole seconds in four bytes, not a `Duration`: every
+    /// transaction carries this configuration, and the size of the largest
+    /// one is what each of them costs.
+    pub timer_c_secs: u32,
 }
 
 impl TimerConfig {
@@ -41,6 +55,7 @@ impl TimerConfig {
             t4,
             auto_100_trying: true,
             auto_100_delay: DEFAULT_AUTO_100_TRYING_DELAY,
+            timer_c_secs: DEFAULT_TIMER_C_SECS,
         }
     }
 
@@ -56,6 +71,16 @@ impl TimerConfig {
     /// Timer B: INVITE transaction timeout. 64 * T1 = 32s default.
     pub fn timer_b(&self) -> Duration {
         self.t1 * 64
+    }
+
+    /// Timer C: how long an INVITE client transaction that has drawn a
+    /// provisional response waits for its final one, counted from the last
+    /// 101-199 (RFC 3261 §16.6 step 11, §16.7 step 2).
+    ///
+    /// Never less than Timer B: an INVITE with no response at all is Timer B's
+    /// to end, and Timer C is only looked at once Timer B has passed.
+    pub fn timer_c(&self) -> Duration {
+        Duration::from_secs(u64::from(self.timer_c_secs)).max(self.timer_b())
     }
 
     /// Timer D: Wait time in Completed state for retransmits. > 32s for UDP, 0 for TCP.
@@ -181,6 +206,7 @@ impl Default for TimerConfig {
             t4: DEFAULT_T4,
             auto_100_trying: true,
             auto_100_delay: DEFAULT_AUTO_100_TRYING_DELAY,
+            timer_c_secs: DEFAULT_TIMER_C_SECS,
         }
     }
 }

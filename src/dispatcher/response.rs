@@ -1106,6 +1106,12 @@ pub(super) fn handle_response(
             if (200..300).contains(&status_code)
                 && server_key.method == crate::sip::message::Method::Invite
             {
+                // The ACK of this answer is routed by the dialog entry,
+                // which must outlive a call that rang for a while.
+                ProxySessionStore::keep_dialog_for_answer(
+                    &session_arc,
+                    state.transaction_timeout / 2,
+                );
                 spawn_rf_proxy_start_if_invite(state, &server_key, &original_request, &session_arc);
                 // CDR: stamp the answer time on the tracked call (cdr.auto_emit).
                 cdr_mark_proxy_answer(state, &original_request, status_code);
