@@ -181,6 +181,9 @@ pub(super) fn handle_request(
     // ACK for 2xx is end-to-end: no IST exists (it terminated on 2xx),
     // so handle_ack returns None and we fall through to the script.
     if method == "ACK" {
+        // The caller has the B2BUA's final response to its INVITE, if this
+        // acknowledges one: it is then owed again only for Timer I.
+        acknowledge_invite_final(&message, inbound.transport, state);
         match state.transaction_manager.handle_ack(&message) {
             Ok(Some((key, actions))) => {
                 debug!(

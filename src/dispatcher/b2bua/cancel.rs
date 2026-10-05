@@ -197,12 +197,11 @@ pub fn handle_b2bua_cancel(inbound: InboundMessage, message: SipMessage, state: 
 
     // The 487 to the A-leg leaves on the socket the CANCEL (== the INVITE) arrived
     // on, so a multi-homed UDP host answers with a consistent source port.
-    let response_487 = build_response(
+    let response_487 = invite_response_from_cancel(
         &message,
         487,
         "Request Terminated",
         state.server_header.as_deref(),
-        &[],
     );
     send_message_from(
         response_487,
@@ -283,6 +282,32 @@ pub fn handle_b2bua_cancel(inbound: InboundMessage, message: SipMessage, state: 
     state.call_event_receivers.remove(&call_id);
 }
 
+/// The final response to the INVITE a CANCEL cancels, built from the CANCEL.
+///
+/// RFC 3261 §9.2 has the UAS answer the *original request* with the 487. A
+/// CANCEL shares the INVITE's Via, From, To, Call-ID and CSeq number (§9.1), so
+/// a response built from it is the INVITE's response in everything but the
+/// CSeq method. Left as `CANCEL` the caller takes the 487 for a second answer
+/// to its CANCEL, and its INVITE transaction runs on until it times out.
+pub(super) fn invite_response_from_cancel(
+    cancel: &SipMessage,
+    status_code: u16,
+    reason: &str,
+    server_header: Option<&str>,
+) -> SipMessage {
+    let mut response = build_response(cancel, status_code, reason, server_header, &[]);
+    let sequence_number = response
+        .headers
+        .get("CSeq")
+        .and_then(|cseq| cseq.split_whitespace().next().map(str::to_string));
+    if let Some(sequence_number) = sequence_number {
+        response
+            .headers
+            .set("CSeq", format!("{sequence_number} INVITE"));
+    }
+    response
+}
+
 /// Fire `@b2bua.on_cancel` handlers for an unanswered call (Calling/Ringing)
 /// that was CANCELled.
 ///
@@ -346,4 +371,48 @@ pub fn run_b2bua_cancel_handlers(
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sip::parser::parse_sip_message;
+
+    /// The 487 answers the INVITE, so it carries the INVITE's CSeq: the
+    /// CANCEL's sequence number with the method INVITE (RFC 3261 §9.1, §9.2).
+    /// Via, From, To and Call-ID are the ones the two requests share.
+    #[test]
+    fn the_487_for_a_cancelled_invite_carries_the_invite_cseq() {
+        let (_, cancel) = parse_sip_message(concat!(
+            "CANCEL sip:bob@example.com SIP/2.0\r\n",
+            "Via: SIP/2.0/UDP 192.0.2.20:5061;branch=z9hG4bK776asdhds\r\n",
+            "From: <sip:alice@example.com>;tag=1928301774\r\n",
+            "To: <sip:bob@example.com>\r\n",
+            "Call-ID: a84b4c76e66710@192.0.2.20\r\n",
+            "CSeq: 314159 CANCEL\r\n",
+            "Max-Forwards: 70\r\n",
+            "Content-Length: 0\r\n",
+            "\r\n",
+        ))
+        .unwrap();
+
+        let response = invite_response_from_cancel(&cancel, 487, "Request Terminated", None);
+
+        assert_eq!(
+            response.headers.get("CSeq").map(|cseq| cseq.to_string()),
+            Some("314159 INVITE".to_string())
+        );
+        assert_eq!(
+            response.headers.get("Via").map(|via| via.to_string()),
+            cancel.headers.get("Via").map(|via| via.to_string())
+        );
+        assert_eq!(
+            response.headers.get("Call-ID").map(|id| id.to_string()),
+            Some("a84b4c76e66710@192.0.2.20".to_string())
+        );
+        match response.start_line {
+            StartLine::Response(status_line) => assert_eq!(status_line.status_code, 487),
+            StartLine::Request(_) => panic!("expected a response"),
+        }
+    }
 }

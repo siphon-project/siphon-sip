@@ -339,6 +339,19 @@ pub(super) fn relay_request(
         }
         None => None,
     };
+    // No pin of any kind: a destination outside the default listener's address
+    // family still needs the listener that can reach it (see
+    // `family_egress_socket`).  A script force_send_via keeps its own sent-by.
+    let family_egress = if send_socket.is_none()
+        && flow.is_none()
+        && ipsec_source.is_none()
+        && send_via_target.is_none()
+    {
+        state.family_egress_socket(outbound_transport, destination)
+    } else {
+        None
+    };
+    let send_socket = send_socket.or(family_egress.as_ref());
 
     // Add our Via — use the outbound transport for the Via header.
     // If force_send_via set a target, use it as the Via sent-by address.
@@ -978,6 +991,14 @@ pub(super) fn relay_fork_branch(
         }
         None => None,
     };
+    // Unpinned branch to the other address family: leave from the listener
+    // that can reach it (see `family_egress_socket`).
+    let family_egress = if send_socket.is_none() && flow.is_none() {
+        state.family_egress_socket(outbound_transport, destination)
+    } else {
+        None
+    };
+    let send_socket = send_socket.or(family_egress.as_ref());
 
     let transport_str = format!("{}", outbound_transport);
     // Same egress-pin precedence as every other request siphon originates: a
