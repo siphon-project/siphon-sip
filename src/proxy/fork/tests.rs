@@ -94,6 +94,32 @@ fn test_parallel_late_error_after_2xx_won_is_dropped() {
     assert_eq!(action, ForkAction::ContinueWaiting);
 }
 
+/// RFC 3261 §16.7 step 5: after a final response has been forwarded, a
+/// provisional from another branch is not. A branch whose CANCEL waited for
+/// its first provisional (§9.1) sends exactly such a one.
+#[test]
+fn a_provisional_after_the_fork_settled_is_not_forwarded() {
+    for deciding_status in [200, 603] {
+        let mut aggregator = make_aggregator(3, ForkStrategy::Parallel);
+        for index in 0..3 {
+            aggregator.mark_trying(index);
+        }
+        assert!(matches!(
+            aggregator.on_branch_response(1, deciding_status),
+            ForkAction::Forward2xx | ForkAction::Forward6xx
+        ));
+        for late_provisional in [100, 180, 183] {
+            assert_eq!(
+                aggregator.on_branch_response(0, late_provisional),
+                ForkAction::ContinueWaiting,
+                "{late_provisional} after {deciding_status}"
+            );
+        }
+        // The branch is still recorded as having answered with a provisional.
+        assert_eq!(aggregator.branches[0].state, BranchState::Proceeding(183));
+    }
+}
+
 #[test]
 fn test_parallel_6xx_terminates_immediately() {
     let mut aggregator = make_aggregator(3, ForkStrategy::Parallel);

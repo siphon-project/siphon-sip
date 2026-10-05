@@ -237,6 +237,13 @@ impl ForkAggregator {
         // Provisional (1xx)
         if (100..200).contains(&status_code) {
             self.branches[index].state = BranchState::Proceeding(status_code);
+            // RFC 3261 §16.7 step 5: once a final response has gone upstream,
+            // only a 2xx may follow it. A branch whose CANCEL waited for its
+            // first provisional (§9.1) sends that provisional after the fork
+            // settled, as a rule and not as a race.
+            if self.final_forwarded {
+                return ForkAction::ContinueWaiting;
+            }
             if status_code == 100 {
                 if self.sent_100 {
                     return ForkAction::ContinueWaiting;
