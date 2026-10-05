@@ -7988,14 +7988,6 @@ services:
   # replies and events; the runner compares the Call-IDs each party saw with
   # each other and with what the application was told.
   #
-  # The two cancel-late-* cases are run by hand, not by scripts/run-tests.sh or
-  # CI, until a given-up dial holds its CANCEL for a provisional response:
-  #
-  #   bash sipp/control/run_transfer_case.sh cancel-late-ringing \
-  #     control_transfer_cancel_dial_uac.xml sipp-control-transfer-late-ringing-phone
-  #   bash sipp/control/run_transfer_case.sh cancel-late-answer \
-  #     control_transfer_cancel_dial_uac.xml sipp-control-transfer-late-answering-phone
-  #
   # Against the real engine (172.20.0.130): the `media` case's refusal is the
   # engine's own answer about a relayed call.
   #

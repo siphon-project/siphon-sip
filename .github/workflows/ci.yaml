@@ -1987,6 +1987,13 @@ jobs:
       - name: cancel_dial — both phones CANCELled, the caller untouched and dialled for again
         run: bash sipp/control/run_transfer_case.sh cancel-dial control_transfer_cancel_dial_uac.xml sipp-control-transfer-ringing-phone sipp-control-transfer-trying-phone
 
+      # RFC 3261 §9.1: no CANCEL for an INVITE that has drawn no provisional.
+      - name: cancel_dial before the phone has responded — CANCELled on its first provisional, the 487 ACKed
+        run: bash sipp/control/run_transfer_case.sh cancel-late-ringing control_transfer_cancel_dial_uac.xml sipp-control-transfer-late-ringing-phone
+
+      - name: cancel_dial before the phone has responded — its late 200 ACKed and released with a BYE, never CANCELled
+        run: bash sipp/control/run_transfer_case.sh cancel-late-answer control_transfer_cancel_dial_uac.xml sipp-control-transfer-late-answering-phone
+
       - name: A REFER from the callee — declined, then accepted and carried out by siphon
         run: bash sipp/control/run_transfer_case.sh refer-callee control_transfer_survivor_uac.xml sipp-control-transfer-referrer-phone sipp-control-transfer-target
 
