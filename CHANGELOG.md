@@ -206,6 +206,20 @@ entry, but a working config keeps working.
   response of its own to the branch, which had sent nothing. An ACK is now
   only ever the INVITE client transaction's answer to a response it received
   (§17.1.1.3).
+- **A proxy CANCEL is built from the INVITE it cancels.** RFC 3261 §9.1 has
+  the CANCEL repeat the Request-URI, Call-ID, To, From and CSeq number of the
+  request being cancelled, carry its Route header fields, and have a single
+  Via equal to that request's top Via. The proxy built a fork branch's CANCEL
+  from the caller's request with a Via of its own making, and relayed the
+  caller's CANCEL with only the Via replaced, so a branch whose INVITE had
+  gone out with the fork target as Request-URI, with its own Path route set,
+  or with a sent-by other than the default listener's (a captured flow, a
+  `send_socket` pin) was sent a CANCEL that differed from it in exactly those,
+  and a strict next hop answered it `481`. Every proxy CANCEL is now built by
+  the branch's INVITE client transaction from the octets it sent, by the
+  builder the B2BUA already used. A `Reason` in the caller's CANCEL is still
+  relayed with each branch's (RFC 3326); nothing else of the caller's CANCEL
+  is, and `Max-Forwards` is the INVITE's as forwarded.
 - **A transfer whose target cannot be dialled ends its subscription and
   leaves the call free.** A siphon-terminated REFER answers `202` and sends
   the `100 Trying` NOTIFY before it dials. When no INVITE could then be sent

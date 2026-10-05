@@ -33,7 +33,7 @@ use bytes::Bytes;
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
 use siphon::sip::message::SipMessage;
 use siphon::sip::parser::parse_sip_message_bytes;
-use siphon::transaction::state::{BranchCancel, Ict, IctEvent, Transport};
+use siphon::transaction::state::{BranchHop, Ict, IctEvent, Transport};
 use siphon::transaction::timer::TimerConfig;
 use siphon::transaction::TransactionManager;
 use siphon::transport::ConnectionId;
@@ -82,12 +82,12 @@ fn response(branch: &str, status_line: &str) -> SipMessage {
     .expect("the response parses")
 }
 
-fn cancel() -> BranchCancel {
-    BranchCancel {
-        frame: Bytes::from_static(b"CANCEL sip:callee@198.51.100.20 SIP/2.0\r\n\r\n"),
+fn hop() -> BranchHop {
+    BranchHop {
         destination: "198.51.100.20:5060".parse().expect("a literal address"),
         transport: siphon::transport::Transport::Udp,
         connection_id: ConnectionId::default(),
+        source_local_addr: None,
     }
 }
 
@@ -118,7 +118,7 @@ fn bench_response_step(criterion: &mut Criterion) {
             bencher.iter_batched(
                 || {
                     let mut transaction = calling(&frame);
-                    black_box(transaction.request_cancel(cancel()));
+                    black_box(transaction.request_cancel(hop(), &[]));
                     (transaction, ringing.clone())
                 },
                 |(mut transaction, ringing)| {
@@ -163,10 +163,10 @@ fn bench_cancel_request(criterion: &mut Criterion) {
                         Transport::Udp,
                     )
                     .expect("the client transaction starts");
-                (manager, key, cancel())
+                (manager, key)
             },
-            |(manager, key, cancel)| {
-                let outcome = manager.cancel_invite_client(&key, cancel);
+            |(manager, key)| {
+                let outcome = manager.cancel_invite_client(&key, hop(), &[]);
                 black_box((manager, outcome))
             },
             BatchSize::SmallInput,
@@ -192,16 +192,12 @@ fn bench_cancel_request(criterion: &mut Criterion) {
                 ))),
             )
             .expect("the transaction is live");
-        black_box(manager.cancel_invite_client(&key, cancel()));
+        black_box(manager.cancel_invite_client(&key, hop(), &[]));
         keys.push(key);
     }
     let key = keys[500].clone();
     criterion.bench_function("proxy_branch_cancel/request/nothing_to_send", |bencher| {
-        bencher.iter_batched(
-            cancel,
-            |cancel| black_box(manager.cancel_invite_client(black_box(&key), cancel)),
-            BatchSize::SmallInput,
-        );
+        bencher.iter(|| black_box(manager.cancel_invite_client(black_box(&key), hop(), &[])));
     });
 }
 

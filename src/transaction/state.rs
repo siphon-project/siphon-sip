@@ -714,24 +714,36 @@ pub enum IctEvent {
     ResponseNon2xx(SipMessage),
 }
 
+/// Where a client transaction's request went: what RFC 3261 §9.1 and
+/// §17.1.1.3 mean by "the same address, port, and transport" for the CANCEL
+/// and the ACK that follow it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BranchHop {
+    /// Where the request was sent.
+    pub destination: SocketAddr,
+    /// The transport it was sent over.
+    pub transport: crate::transport::Transport,
+    /// The connection it was sent on.
+    pub connection_id: crate::transport::ConnectionId,
+    /// The local socket it left from, when that was pinned.
+    pub source_local_addr: Option<SocketAddr>,
+}
+
 /// The CANCEL for an INVITE this element sent, as it goes on the wire, and the
 /// hop that INVITE went to.
 ///
-/// RFC 3261 §9.1: "The destination address, port, and transport for the CANCEL
-/// MUST be identical to those used to send the original request." The TU that
-/// sent the INVITE knows both, and hands them over with the request to cancel,
-/// because the CANCEL may have to wait for a provisional response and whatever
-/// the TU held for the INVITE may be gone by then.
+/// Built from the INVITE the transaction sent (RFC 3261 §9.1: the same
+/// Request-URI, Call-ID, To, From, CSeq number and Route, and the INVITE's own
+/// top Via as its one Via; see [`crate::transaction::cancel::build_cancel`]),
+/// and sent where that went: "The destination address, port, and transport
+/// for the CANCEL MUST be identical to those used to send the original
+/// request."
 #[derive(Debug, Clone)]
 pub struct BranchCancel {
     /// The serialized CANCEL.
     pub frame: Bytes,
-    /// Where the INVITE was sent.
-    pub destination: SocketAddr,
-    /// The transport the INVITE was sent over.
-    pub transport: crate::transport::Transport,
-    /// The connection the INVITE was sent on.
-    pub connection_id: crate::transport::ConnectionId,
+    /// Where the INVITE went, and so where this goes.
+    pub hop: BranchHop,
 }
 
 /// What [`Ict::request_cancel`] did with a request to cancel the INVITE.
@@ -747,6 +759,9 @@ pub enum CancelOutcome {
     /// Nothing to send: the INVITE has its final response (or its transaction
     /// is over), or its CANCEL has been sent already.
     NothingToSend,
+    /// A CANCEL was owed and could not be built from the INVITE as sent. The
+    /// caller reports it: the branch rings on until it answers or times out.
+    Unbuildable(String),
 }
 
 /// How far a request to cancel an INVITE has come (RFC 3261 §9.1).
@@ -892,7 +907,12 @@ impl Ict {
             .map_err(|error| format!("ACK build failed: {error}"))
     }
 
-    /// The TU wants this INVITE cancelled, and `cancel` is its CANCEL.
+    /// The TU wants this INVITE cancelled. `hop` is where the INVITE went, and
+    /// `reasons` are `Reason` header field values for the CANCEL to carry
+    /// (RFC 3326).
+    ///
+    /// The CANCEL is built here, from the INVITE as this transaction sent it,
+    /// so its Request-URI, Route set and Via are that request's own (§9.1).
     ///
     /// RFC 3261 §9.1: "If no provisional response has been received, the
     /// CANCEL request MUST NOT be sent; rather, the client MUST wait for the
@@ -908,20 +928,42 @@ impl Ict {
     ///   be sent now, to the first caller that asks.
     /// * `Completed` / `Terminated`: the final response has arrived, and there
     ///   is nothing to cancel.
-    pub fn request_cancel(&mut self, cancel: BranchCancel) -> CancelOutcome {
+    pub fn request_cancel(&mut self, hop: BranchHop, reasons: &[String]) -> CancelOutcome {
         match (self.state, &self.cancel) {
             (IctState::Calling, CancelProgress::NotRequested) => {
-                self.cancel = CancelProgress::Waiting(Box::new(cancel));
-                CancelOutcome::Deferred
+                match self.build_cancel(hop, reasons) {
+                    Ok(cancel) => {
+                        self.cancel = CancelProgress::Waiting(Box::new(cancel));
+                        CancelOutcome::Deferred
+                    }
+                    Err(error) => CancelOutcome::Unbuildable(error),
+                }
             }
             // The first request's CANCEL is the one that waits.
             (IctState::Calling, _) => CancelOutcome::Deferred,
             (IctState::Proceeding, CancelProgress::NotRequested) => {
-                self.cancel = CancelProgress::Sent;
-                CancelOutcome::SendNow(cancel)
+                match self.build_cancel(hop, reasons) {
+                    Ok(cancel) => {
+                        self.cancel = CancelProgress::Sent;
+                        CancelOutcome::SendNow(cancel)
+                    }
+                    Err(error) => CancelOutcome::Unbuildable(error),
+                }
             }
             _ => CancelOutcome::NothingToSend,
         }
+    }
+
+    /// The CANCEL of the INVITE this transaction sent, for `hop`.
+    fn build_cancel(&self, hop: BranchHop, reasons: &[String]) -> Result<BranchCancel, String> {
+        let invite = parse_sip_message_bytes(&self.request_bytes)
+            .map_err(|error| format!("sent INVITE does not parse back: {error}"))?;
+        let cancel = crate::transaction::cancel::build_cancel(&invite, reasons)
+            .ok_or_else(|| "sent INVITE has no CSeq to cancel".to_string())?;
+        Ok(BranchCancel {
+            frame: Bytes::from(cancel.to_bytes()),
+            hop,
+        })
     }
 
     /// Whether a CANCEL is waiting for this INVITE's first provisional.

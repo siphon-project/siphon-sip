@@ -9,6 +9,7 @@
 //! The [`TransactionManager`] owns all active transactions in a [`DashMap`]
 //! keyed by [`TransactionKey`].
 
+pub mod cancel;
 pub mod key;
 pub mod state;
 pub mod timer;
@@ -393,9 +394,11 @@ impl TransactionManager {
         Ok(actions)
     }
 
-    /// Ask for the INVITE client transaction `key` to be cancelled with
-    /// `cancel`, and learn whether that CANCEL goes now, waits, or is not sent
-    /// at all (RFC 3261 §9.1, [`Ict::request_cancel`]).
+    /// Ask for the INVITE client transaction `key` to be cancelled, and learn
+    /// whether its CANCEL goes now, waits, or is not sent at all (RFC 3261
+    /// §9.1, [`Ict::request_cancel`]). The CANCEL is built from the INVITE the
+    /// transaction sent; `hop` is where that went and `reasons` the `Reason`
+    /// values to carry.
     ///
     /// Decided under the lock the response path takes for the same
     /// transaction ([`Self::process_client_event`]), so a request to cancel
@@ -409,13 +412,14 @@ impl TransactionManager {
     pub fn cancel_invite_client(
         &self,
         key: &TransactionKey,
-        cancel: BranchCancel,
+        hop: BranchHop,
+        reasons: &[String],
     ) -> CancelOutcome {
         let Some(mut entry) = self.transactions.get_mut(key) else {
             return CancelOutcome::NothingToSend;
         };
         match &mut **entry {
-            Transaction::Ict(ict) => ict.request_cancel(cancel),
+            Transaction::Ict(ict) => ict.request_cancel(hop, reasons),
             _ => CancelOutcome::NothingToSend,
         }
     }

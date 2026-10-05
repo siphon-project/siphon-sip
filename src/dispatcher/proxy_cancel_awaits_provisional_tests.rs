@@ -165,14 +165,42 @@ pub(super) fn branch_of(message: &SipMessage) -> String {
 }
 
 /// The one CANCEL `target` was sent among `sent`, checked against the INVITE
-/// it cancels (RFC 3261 §9.1: the same Via branch and CSeq number).
+/// it cancels. RFC 3261 §9.1: the same Request-URI, Call-ID, To, From, CSeq
+/// number and Route, and a single Via equal to the INVITE's top Via.
 pub(super) fn the_cancel(sent: &[Sent], target: &str, branch_invite: &SipMessage) -> SipMessage {
     let cancels = cancels_to(sent, target);
     assert_eq!(cancels.len(), 1, "exactly one CANCEL to {target}");
     let cancel = cancels[0].clone();
-    assert_eq!(branch_of(&cancel), branch_of(branch_invite));
+    let request_uri = |message: &SipMessage| match &message.start_line {
+        StartLine::Request(request_line) => request_line.request_uri.to_string(),
+        StartLine::Response(_) => panic!("a request"),
+    };
+    assert_eq!(
+        request_uri(&cancel),
+        request_uri(branch_invite),
+        "the Request-URI of the INVITE on this branch"
+    );
+    let invite_vias = branch_invite
+        .headers
+        .get_all("Via")
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        cancel.headers.get_all("Via").cloned().unwrap_or_default(),
+        invite_vias[..1],
+        "one Via, the INVITE's top Via"
+    );
     assert_eq!(header(&cancel, "CSeq"), "5 CANCEL");
-    assert_eq!(header(&cancel, "Call-ID"), header(branch_invite, "Call-ID"));
+    for name in ["Call-ID", "From", "To", "Max-Forwards"] {
+        assert_eq!(header(&cancel, name), header(branch_invite, name), "{name}");
+    }
+    assert_eq!(
+        cancel.headers.get_all("Route"),
+        branch_invite.headers.get_all("Route"),
+        "the INVITE's Route set"
+    );
+    assert!(cancel.headers.get("Contact").is_none());
+    assert!(cancel.body.is_empty());
     cancel
 }
 
@@ -535,7 +563,6 @@ async fn a_callers_cancel_sent_late_is_the_cancel_the_caller_sent() {
         header(&relayed, "Reason"),
         "SIP;cause=200;text=\"Call completed elsewhere\""
     );
-    assert_eq!(header(&relayed, "Via"), header(&to_silent, "Via"));
     assert!(responses_to_caller(&sent).is_empty());
 }
 
