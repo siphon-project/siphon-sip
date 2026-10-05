@@ -1,7 +1,7 @@
 //! E.164 phone-number normalization for SIP identity headers.
 //!
 //! Carriers and IMS elements each expect telephone numbers in a different
-//! shape on the wire: Teams Direct Routing wants `+E.164`, an IMS core wants
+//! shape on the wire: one hosted trunk wants `+E.164`, an IMS core wants
 //! `tel:+E.164`, a national PSTN trunk wants the national `0X` form, some
 //! interconnects want the `00`-international form or a bare-digit E.164. Doing
 //! that rewrite by hand per header (`set_from_user`, `set_ruri_user`, …) is

@@ -3262,7 +3262,7 @@ fn no_handler_options_is_answered_200_with_contact_and_allow() {
         response.headers.get("Allow").unwrap(),
         crate::sip::SUPPORTED_METHODS
     );
-    // Some peers (Teams Direct Routing) reject an OPTIONS answer carrying
+    // Some peers reject an OPTIONS answer carrying
     // neither Contact nor Record-Route.
     assert_eq!(
         response.headers.get("Contact").unwrap(),
@@ -7229,7 +7229,7 @@ fn sanitize_sdp_identity_no_op_on_empty_body() {
 /// (multi-word product / role name) was being written verbatim into the
 /// SDP `o=` line. RFC 4566 §5.2 splits o= on spaces, so a value like
 /// `o=Foo Bar 123 456 IN IP4 ...` has a malformed username token and
-/// downstream parsers (FreeSWITCH, kamailio) reject the whole SDP body.
+/// downstream parsers reject the whole SDP body.
 #[test]
 fn sanitize_sdp_identity_collapses_whitespace_in_o_username() {
     let sdp = "v=0\r\no=- 1 2 IN IP4 10.0.0.1\r\ns=-\r\nt=0 0\r\nm=audio 8000 RTP/AVP 0\r\n";

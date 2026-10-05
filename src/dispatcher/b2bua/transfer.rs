@@ -720,8 +720,8 @@ pub fn b2bua_complete_terminated_transfer(
                 // only thing that tells it), and sits on whatever it was
                 // holding for the transfer — a consultation call, in the
                 // attended case — until its own idle timer fires minutes later.
-                // Observed against Microsoft Teams Direct Routing with the two
-                // 19 µs apart: BYE answered `200`, NOTIFY answered `481`.
+                // A referrer handed the two back to back does exactly that:
+                // BYE answered `200`, NOTIFY answered `481`.
                 Some(branch) => {
                     state.deferred_referrer_bye.insert(
                         &branch,

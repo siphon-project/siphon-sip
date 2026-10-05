@@ -82,8 +82,8 @@ pub fn handle_b2bua_bye(inbound: InboundMessage, message: SipMessage, state: &Di
 
     // The referrer of an in-flight siphon-terminated transfer hanging up is NOT
     // the end of this call (RFC 5589 §7: the transferor is free to end its
-    // dialog as soon as the REFER is accepted — Microsoft Teams BYEs within a
-    // few hundred ms of the 202, long before the target answers). The surviving
+    // dialog as soon as the REFER is accepted, and a transferor may BYE within
+    // a few hundred ms of the 202, long before the target answers). The surviving
     // party is still up and is waiting to be bridged to the transfer target, so
     // everything below — @b2bua.on_bye, the ACR-STOP/CDR close, the BYE
     // generated at the far leg, the rtpengine teardown and `remove_call` —

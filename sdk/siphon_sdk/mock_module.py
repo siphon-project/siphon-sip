@@ -5332,7 +5332,7 @@ class MockGateway:
         Example::
 
             gateway.add_group("teams", [
-                {"uri": "sip:sip.pstnhub.microsoft.com", "address": "203.0.113.10:5061"},
+                {"uri": "sip:sip.trunk.example.com", "address": "203.0.113.10:5061"},
             ])
             gateway.contains_source("teams", "203.0.113.10")  # True
         """

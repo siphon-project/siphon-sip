@@ -66,9 +66,9 @@ pub struct ServerIdentityConfig {
     /// Answer an OPTIONS that **no** script handler claims with `200 OK` plus
     /// `Contact` and `Allow` (RFC 3261 §11.2). Default: true.
     ///
-    /// Every registrar qualifies its bindings — Asterisk's `qualify_frequency`
-    /// and its equivalents probe the registered contact on a timer for the life
-    /// of the registration — so a siphon that registers to a provider answers
+    /// Every registrar qualifies its bindings — it probes the registered
+    /// contact with OPTIONS on a timer for the life of the registration — so a
+    /// siphon that registers to a provider answers
     /// one of these forever, and making each deployment hand-write the same
     /// handler meant nobody did.
     ///

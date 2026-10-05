@@ -708,7 +708,7 @@ pub fn hold_controlled_refer(
 /// Max-Forwards drains. Here siphon owns the transfer instead.
 ///
 /// Flow: resolve the dialog leg the REFER arrived on (by dialog identity, never
-/// source socket — Teams reconnects per transaction over TLS), parse Refer-To,
+/// source socket — a peer may reconnect per transaction over TLS), parse Refer-To,
 /// then split on ownership:
 ///   - **Controlled call** (handed to an external control app): hold the REFER
 ///     un-answered, emit a `TransferRequested` event to the owning connection,
