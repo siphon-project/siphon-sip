@@ -27,30 +27,30 @@ use super::*;
 use crate::rtpengine::test_native_engine::NativeTestEngine;
 
 /// Two answered legs one controller owns, on profiles of their own.
-struct Legs {
-    controller: Controller,
-    engine: NativeTestEngine,
-    anchor: Caller,
-    peer: Caller,
-    peer_address: String,
+pub(super) struct Legs {
+    pub(super) controller: Controller,
+    pub(super) engine: NativeTestEngine,
+    pub(super) anchor: Caller,
+    pub(super) peer: Caller,
+    pub(super) peer_address: String,
 }
 
 impl Legs {
-    fn state(&self) -> &DispatcherState {
+    pub(super) fn state(&self) -> &DispatcherState {
         &self.controller.dispatcher.state
     }
 
-    fn udp(&self) -> &flume::Receiver<OutboundMessage> {
+    pub(super) fn udp(&self) -> &flume::Receiver<OutboundMessage> {
         &self.controller.dispatcher.udp
     }
 
-    fn peer_contact(&self) -> String {
+    pub(super) fn peer_contact(&self) -> String {
         format!("sip:15550100001@{}", self.peer_address)
     }
 
     /// `bridge` addressed to `target` naming `with`, accepted by both legs.
     /// Returns once the bridge has formed.
-    async fn bridge(&self, target: &str, with: &str) {
+    pub(super) async fn bridge(&self, target: &str, with: &str) {
         let (reply, _) = command(
             &self.controller,
             "bridge",
@@ -84,7 +84,7 @@ impl Legs {
 
     /// Part the pair and answer both hold re-INVITEs, so each leg is parted
     /// and held before anything else is asked of it.
-    async fn unbridge(&self) {
+    pub(super) async fn unbridge(&self) {
         tokio::task::block_in_place(|| {
             b2bua_bridge_release(
                 &self.anchor.internal_call_id,
@@ -129,7 +129,12 @@ impl Legs {
 /// An anchor answered with `anchor_profile` and a peer calling from
 /// `peer_address` answered with `peer_profile`, on channels `anchor` and
 /// `peer`.
-async fn legs(app: &str, peer_address: &str, anchor_profile: &str, peer_profile: &str) -> Legs {
+pub(super) async fn legs(
+    app: &str,
+    peer_address: &str,
+    anchor_profile: &str,
+    peer_profile: &str,
+) -> Legs {
     let engine = NativeTestEngine::start().await;
     let mut dispatcher = bridging_dispatcher(&engine);
     dispatcher.state.rtpengine_profiles = Some(profiles());

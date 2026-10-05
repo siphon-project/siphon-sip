@@ -132,6 +132,8 @@ mod control_rebridge_tests;
 #[cfg(test)]
 mod control_refer_controller_tests;
 #[cfg(test)]
+mod control_unbridge_reoffer_tests;
+#[cfg(test)]
 mod delayed_offer_ack_tests;
 #[cfg(test)]
 mod delayed_offer_ingress_tests;

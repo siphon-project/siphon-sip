@@ -125,6 +125,13 @@ pub fn handle_b2bua_update(inbound: InboundMessage, message: SipMessage, state: 
     {
         return;
     }
+    // A leg with no second party and no session the engine answers for it: a
+    // leg parted from its bridge. Before its offer is taken for its media.
+    if from_a_leg
+        && crate::dispatcher::b2bua::answer_unanchored_reoffer(&inbound, &message, &call_id, state)
+    {
+        return;
+    }
 
     // Track the offerer's own new endpoint SDP (its UPDATE offer, raw) so a
     // later siphon-terminated transfer offers this leg's current media if it is

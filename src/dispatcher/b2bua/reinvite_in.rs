@@ -117,6 +117,11 @@ pub fn handle_b2bua_reinvite(
     if from_a_leg && relay_bridged_offer(&inbound, &message, &call_id, state) {
         return;
     }
+    // A leg with no second party and no session the engine answers for it: a
+    // leg parted from its bridge. Before its offer is taken for its media.
+    if from_a_leg && answer_unanchored_reoffer(&inbound, &message, &call_id, state) {
+        return;
+    }
 
     // Track the offerer's own new endpoint SDP (its re-INVITE offer, raw —
     // before any topology/rtpengine rewrite) so a later siphon-terminated
@@ -694,8 +699,12 @@ pub fn handle_b2bua_reinvite(
 ///
 /// An offerless refresh (RFC 4028 §10) is answered with the leg's current media
 /// instead, because RFC 3261 §13.2.1 makes the 2xx to an offerless INVITE carry
-/// the offer. Without a media session there is nothing truthful to answer with,
-/// so it is refused rather than answered with an SDP that describes no path.
+/// the offer.
+///
+/// Only a session the engine is the far side of gets here. A leg with no
+/// session, or with one that relays to a second party (a leg parted from its
+/// bridge), is answered by [`answer_unanchored_reoffer`] before this is
+/// reached: the engine has nothing to answer that leg from on its own.
 pub fn answer_one_legged_reoffer(
     inbound: &InboundMessage,
     message: &SipMessage,
