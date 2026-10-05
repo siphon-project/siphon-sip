@@ -1,6 +1,85 @@
 //! An inbound UPDATE on a bridged call (RFC 3311).
 use crate::dispatcher::*;
 
+/// Answer an UPDATE from the caller of a call whose callee has not answered.
+/// Returns whether the call was one, and the UPDATE is answered.
+///
+/// siphon is the UAS of the caller's dialog and the UAC of the callee's, and
+/// between the INVITE and its answer neither dialog has room for a new offer.
+/// RFC 3311 §5.2 says what the UPDATE gets:
+///
+/// * No offer: it changes nothing about the session and is answered `200`
+///   with no body.
+/// * An offer while the INVITE's offer has no answer yet: "the UAS MUST reject
+///   the UPDATE with a 500 response, and MUST include a Retry-After header
+///   field with a randomly chosen value between 0 and 10 seconds." The answer
+///   is the callee's to give and has not come, or has come only in an
+///   unreliable provisional, which completes nothing (RFC 3262 §5).
+/// * An offer once the caller has its answer in a reliable provisional it
+///   acknowledged: the caller may offer again (§5.1), but taking the offer
+///   needs the callee, whom siphon cannot ask on a dialog it has not
+///   confirmed. That is the case §5.2 gives `504` for, a change the UAS cannot
+///   make by itself.
+///
+/// The media engine is sent nothing in any of them. The call used to fall to
+/// the path for a call with no second party, which had the engine answer the
+/// offer itself (`answer_local`) on a session whose first offer was still out
+/// to the callee: the caller was told `200` with media the callee knew
+/// nothing of, and the callee's own answer then arrived for an offer the
+/// engine no longer held.
+fn answer_early_caller_update(
+    inbound: &InboundMessage,
+    message: &SipMessage,
+    call_id: &str,
+    state: &DispatcherState,
+) -> bool {
+    let Some(caller_has_its_answer) = state.call_actors.get_call(call_id).and_then(|call| {
+        let ringing = call.state != CallState::Answered
+            && call.winner.is_none()
+            && call.b_legs.iter().any(|leg| !leg.is_tracking_leg());
+        ringing.then(|| call.a_leg_reliability.answer_acknowledged())
+    }) else {
+        return false;
+    };
+    let carries_offer = !message.body.is_empty();
+    let (status_code, reason, retry_after) = match (carries_offer, caller_has_its_answer) {
+        (false, _) => (200, "OK", None),
+        (true, false) => (
+            500,
+            "Server Internal Error",
+            Some(crate::dispatcher::b2bua::random_retry_after()),
+        ),
+        (true, true) => (504, "Server Time-out", None),
+    };
+    if carries_offer {
+        info!(
+            call_id = %call_id,
+            status = status_code,
+            caller_has_its_answer,
+            "B2BUA UPDATE: an offer from the caller before the callee answered — refused (RFC 3311 §5.2)"
+        );
+    }
+    let mut response = build_response(
+        message,
+        status_code,
+        reason,
+        state.server_header.as_deref(),
+        &[],
+    );
+    if let Some(retry_after) = retry_after {
+        response.headers.set("Retry-After", retry_after);
+    }
+    send_message_from(
+        response,
+        inbound.transport,
+        inbound.remote_addr,
+        inbound.connection_id,
+        Some(inbound.local_addr),
+        state,
+    );
+    true
+}
+
 /// Bridge an in-dialog UPDATE (RFC 3311) across the B2BUA.
 ///
 /// Mirrors `handle_b2bua_reinvite` minus the INVITE-specific bits:
@@ -116,6 +195,12 @@ pub fn handle_b2bua_update(inbound: InboundMessage, message: SipMessage, state: 
                 leg.dialog.remote_contact = Some(contact.clone());
             }
         }
+    }
+
+    // The caller of a call that still rings: answered here, by what RFC 3311
+    // §5.2 has a UAS do before the INVITE is answered.
+    if from_a_leg && answer_early_caller_update(&inbound, &message, &call_id, state) {
+        return;
     }
 
     // A leg of a formed controller bridge: the other party is another call

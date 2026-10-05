@@ -535,6 +535,24 @@ entry, but a working config keeps working.
   right and is unchanged. The session now never records its offerer's own
   tag as its answerer's; a different answerer's tag, as a forked INVITE's
   final answer can carry, still replaces the one held.
+- **An UPDATE from the caller while its call still rings is answered as RFC
+  3311 §5.2 has it, and never by the media engine on the callee's behalf.**
+  Such an UPDATE found a call with no answered callee and was handled as one
+  with no second party at all. With an offer on a media-anchored call, the
+  engine was told to answer it itself, on a session whose first offer was
+  still out to the callee: the caller got a `200` describing media the callee
+  had never been asked about. With no offer it was refused `488`. Now an
+  UPDATE with no offer is answered `200` with no body. One with an offer
+  while the INVITE's own offer is unanswered is refused `500` with a
+  `Retry-After` of 0 to 10 seconds, the response §5.2 requires of a UAS that
+  has an offer it has not answered. One with an offer after the caller has
+  acknowledged its answer in a reliable provisional is refused `504`: the
+  change needs the callee, and siphon does not relay an UPDATE to a callee
+  whose dialog is not confirmed. In each case the engine and the callee are
+  sent nothing and the call rings on. This applies to a call that is not
+  anchored too, where an offer used to be answered `200` with no body. An
+  UPDATE on an answered call, and on a call siphon answered itself, is
+  handled as before.
 
 ### Changed
 
