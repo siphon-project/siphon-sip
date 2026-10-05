@@ -37,6 +37,7 @@ mod leg;
 mod leg_actor;
 mod prack_bridge;
 mod reliable;
+mod replacement;
 mod store;
 
 #[cfg(test)]
@@ -54,6 +55,7 @@ pub use leg::*;
 pub use leg_actor::*;
 pub use prack_bridge::*;
 pub use reliable::*;
+pub use replacement::*;
 pub use store::*;
 
 // ---------------------------------------------------------------------------

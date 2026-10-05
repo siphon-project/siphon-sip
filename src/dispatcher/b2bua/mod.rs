@@ -53,6 +53,7 @@ mod terminate;
 mod timeouts;
 mod transfer;
 mod transfer_dial;
+mod transfer_fork;
 mod transfer_media;
 mod update;
 
@@ -97,6 +98,7 @@ pub use terminate::*;
 pub use timeouts::*;
 pub use transfer::*;
 pub use transfer_dial::*;
+pub use transfer_fork::*;
 pub use transfer_media::*;
 pub use update::*;
 

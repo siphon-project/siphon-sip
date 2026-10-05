@@ -29,7 +29,7 @@ fn sdp(address: &str) -> String {
     )
 }
 
-fn host_of(address: &str) -> &str {
+pub(super) fn host_of(address: &str) -> &str {
     address.split(':').next().unwrap_or(address)
 }
 
@@ -64,7 +64,7 @@ fn invite(source: &str, call_id: &str, from: &str, to: &str, extra: &str) -> Str
 }
 
 /// The phone at `address` answers `invite` 200 with an answer, tagged `to_tag`.
-fn answer(invite: &SipMessage, address: &str, to_tag: &str) -> SipMessage {
+pub(super) fn answer(invite: &SipMessage, address: &str, to_tag: &str) -> SipMessage {
     let body = sdp(host_of(address));
     let mut raw = String::from("SIP/2.0 200 OK\r\n");
     for via in invite.headers.get_all("Via").cloned().unwrap_or_default() {
@@ -80,7 +80,7 @@ fn answer(invite: &SipMessage, address: &str, to_tag: &str) -> SipMessage {
     parse_sip_message_bytes(raw.as_bytes()).expect("the answer parses")
 }
 
-fn respond(
+pub(super) fn respond(
     dispatcher: &TestDispatcher,
     call_id: &str,
     address: &str,
@@ -116,14 +116,14 @@ fn internal(dispatcher: &TestDispatcher, sip_call_id: &str) -> String {
         .expect("the call exists")
 }
 
-fn sent_invite_to(sent: &[Sent], address: &str) -> SipMessage {
+pub(super) fn sent_invite_to(sent: &[Sent], address: &str) -> SipMessage {
     sent.iter()
         .find(|sent| sent.destination == address && sent.message.method() == Some(&Method::Invite))
         .map(|sent| sent.message.clone())
         .unwrap_or_else(|| panic!("no INVITE to {address}"))
 }
 
-fn sent_to(sent: &[Sent], address: &str, method: Method) -> Option<SipMessage> {
+pub(super) fn sent_to(sent: &[Sent], address: &str, method: Method) -> Option<SipMessage> {
     sent.iter()
         .find(|sent| sent.destination == address && sent.message.method() == Some(&method))
         .map(|sent| sent.message.clone())

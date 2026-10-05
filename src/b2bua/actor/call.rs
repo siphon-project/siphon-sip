@@ -78,12 +78,11 @@ pub struct ReferSubscription {
     pub notify_cseq: u32,
     /// Current transfer progress (drives the sipfrag body and teardown).
     pub state: crate::b2bua::transfer::TransferState,
-    /// For a siphon-terminated inbound transfer: the dialog Call-ID of the leg
-    /// siphon dialed to the transfer target. The response path matches an
-    /// answering b_leg against this exact Call-ID (not just "a non-winner leg")
-    /// so an unrelated leg dialed while a transfer is pending can't be mistaken
-    /// for the transfer target. `None` for the subscriber (outbound) role.
-    pub target_leg_call_id: Option<String>,
+    /// The targets siphon dialled for a replacement, one per INVITE: every
+    /// registered contact of an address-of-record rings. The response path
+    /// matches a leg against these by Via branch, so an unrelated leg dialled
+    /// meanwhile cannot be taken for one. Empty in the subscriber role.
+    pub targets: Vec<ReplacementTarget>,
     /// True once the dialog of the leg being replaced ended while the
     /// replacement was still in flight — for a REFER, the referrer sent a BYE
     /// after siphon accepted it but before the dialed target resolved.
@@ -108,8 +107,8 @@ pub struct ReferSubscription {
     /// sweep ([`take_timed_out_calls`](CallActorStore::take_timed_out_calls))
     /// deliberately looks only at `Calling`/`Ringing` calls — so without a
     /// deadline of its own a target that never sends a final response leaves
-    /// this subscription armed forever, the response path still matching on
-    /// `target_leg_call_id`, and the surviving party bridged to nobody. `None`
+    /// this subscription armed forever, the response path still matching its
+    /// `targets`, and the surviving party bridged to nobody. `None`
     /// keeps the pre-deadline behaviour (wait indefinitely).
     pub deadline: Option<std::time::Instant>,
     /// Media profile chosen for the pairing this transfer creates

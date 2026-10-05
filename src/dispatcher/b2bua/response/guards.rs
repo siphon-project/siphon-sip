@@ -66,9 +66,14 @@ pub fn auto_prack_b_leg(
     if !needs_prack {
         return false;
     }
+    // The leg's position as it is now, not as the snapshot read it: a sibling
+    // replacement target answering in between is taken out of the leg list, and
+    // every leg after it moves down one.
     let (Some(rseq), Some(idx)) = (
         crate::sip::headers::rseq::parse_rseq(&message.headers),
-        snapshot.b_leg_index,
+        snapshot
+            .b_leg_index
+            .and_then(|_| state.call_actors.b_leg_index(call_id, &snapshot.branch)),
     ) else {
         return false;
     };
@@ -563,33 +568,38 @@ pub fn feed_leg_actor_and_learn_dialog(
     // that establishes the dialog (RFC 3261 §12.1.2) — not from an actor event
     // that may describe a different response entirely (see the classification
     // note below).
-    if (200..300).contains(&status_code) {
-        if let Some(idx) = snapshot.b_leg_index {
-            if let Some(mut call) = state.call_actors.get_call_mut(call_id) {
-                if let Some(b_leg) = call.b_legs.get_mut(idx) {
-                    if let Some(to_tag) = crate::b2bua::actor::extract_to_tag(message) {
-                        // Splice the to-tag into remote_to_uri so in-dialog
-                        // requests (UPDATE, re-INVITE, BYE) toward this leg
-                        // can build a proper tagged To: header (RFC 3261
-                        // §12.1.1). remote_to_uri was captured from the
-                        // outbound INVITE which had no tag yet.
-                        if let Some(ref to_uri) = b_leg.dialog.remote_to_uri {
-                            if !to_uri.contains(";tag=") {
-                                b_leg.dialog.remote_to_uri =
-                                    Some(format!("{};tag={}", to_uri.trim_end(), to_tag));
-                            }
+    //
+    // The leg is found again by its branch, under the lock that writes to it. Its
+    // position in the snapshot was read before that lock, and a call ringing
+    // several replacement targets takes the one that answers first out of the
+    // leg list (`promote_replacement_target`): a sibling's 2xx handled at that
+    // moment would otherwise write its dialog onto whichever leg moved into the
+    // position it remembered.
+    if (200..300).contains(&status_code) && snapshot.b_leg_index.is_some() {
+        if let Some(mut call) = state.call_actors.get_call_mut(call_id) {
+            if let Some((_, b_leg)) = call.find_b_leg_by_branch_mut(&snapshot.branch) {
+                if let Some(to_tag) = crate::b2bua::actor::extract_to_tag(message) {
+                    // Splice the to-tag into remote_to_uri so in-dialog
+                    // requests (UPDATE, re-INVITE, BYE) toward this leg
+                    // can build a proper tagged To: header (RFC 3261
+                    // §12.1.1). remote_to_uri was captured from the
+                    // outbound INVITE which had no tag yet.
+                    if let Some(ref to_uri) = b_leg.dialog.remote_to_uri {
+                        if !to_uri.contains(";tag=") {
+                            b_leg.dialog.remote_to_uri =
+                                Some(format!("{};tag={}", to_uri.trim_end(), to_tag));
                         }
-                        b_leg.dialog.remote_tag = Some(to_tag);
                     }
-                    // Capture B-leg's remote Contact (RFC 3261 §12.1.2: remote target from 2xx)
-                    if let Some(contact) = message
-                        .headers
-                        .get("Contact")
-                        .or_else(|| message.headers.get("m"))
-                    {
-                        b_leg.dialog.remote_contact =
-                            Some(crate::b2bua::actor::extract_contact_uri(contact));
-                    }
+                    b_leg.dialog.remote_tag = Some(to_tag);
+                }
+                // Capture B-leg's remote Contact (RFC 3261 §12.1.2: remote target from 2xx)
+                if let Some(contact) = message
+                    .headers
+                    .get("Contact")
+                    .or_else(|| message.headers.get("m"))
+                {
+                    b_leg.dialog.remote_contact =
+                        Some(crate::b2bua::actor::extract_contact_uri(contact));
                 }
             }
         }

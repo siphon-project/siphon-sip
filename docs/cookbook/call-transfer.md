@@ -314,6 +314,8 @@ on its own: it dials, and the far end replaces.
     Pass the target's real address: `call.accept_refer(target="sip:carol@…")`
     from a script, or `accept_refer {target}` from a controller, where `target`
     may be `{aor}` to reach a registered phone over the connection it holds.
+    An AoR with several registered contacts rings them all; the first to answer
+    is kept and the rest are CANCELled.
     A controller finds out who that is from `TransferRequested`: when the
     `Replaces` names a dialog this node hosts, `replaces.local` carries the
     call, the channel controlling it and the leg.

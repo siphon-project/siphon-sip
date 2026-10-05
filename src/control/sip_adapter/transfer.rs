@@ -99,8 +99,9 @@ impl TransferDial {
 /// arguments `dial` takes, and shape the new leg the same way.
 ///
 /// An AoR nobody is registered at is `not_found`. One with several registered
-/// contacts is refused `invalid_state`: a replacement rings one target, and
-/// picking a contact would ring one phone of a party that has several.
+/// contacts rings them all, each on an INVITE of its own: the first to answer
+/// is the party brought into the call and the rest are CANCELled (RFC 3261
+/// §16.7), which is what calling a party with several phones means.
 pub(super) fn parse_transfer_dial(
     verb: &str,
     args: &serde_json::Value,
@@ -163,31 +164,17 @@ pub(super) fn parse_transfer_dial(
                     "{verb} args.next_hop does not apply to an {{aor}} target, which is reached over the flow it registered on"
                 )));
             }
-            let mut contacts = crate::dispatcher::dial_targets_for_aor(aor).map_err(|error| {
+            let contacts = crate::dispatcher::dial_targets_for_aor(aor).map_err(|error| {
                 ControlResult::error(ControlErrorCode::NotFound, error.to_string())
             })?;
-            if contacts.len() > 1 {
-                return Err(ControlResult::error_with_details(
-                    ControlErrorCode::InvalidState,
-                    format!(
-                        "{aor} has {} registered contacts, and {verb} rings one target — name the one to ring with {{uri}}",
-                        contacts.len()
-                    ),
-                    serde_json::json!({
-                        "verb": verb,
-                        "reason": "several_contacts",
-                        "contacts": contacts.len(),
-                    }),
-                ));
-            }
-            let Some(contact) = contacts.pop() else {
+            let Some((target, dial)) =
+                crate::dispatcher::ReplacementDial::to_contacts(contacts, shaping, headers)
+            else {
                 return Err(ControlResult::error(
                     ControlErrorCode::NotFound,
                     format!("no registered contact for {aor}"),
                 ));
             };
-            let (target, dial) =
-                crate::dispatcher::ReplacementDial::to_contact(contact, shaping, headers);
             Ok(TransferDial {
                 target: Some(target),
                 dial,

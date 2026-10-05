@@ -2946,15 +2946,11 @@ fn a_transfer_target_is_a_uri_or_a_registered_aor() {
     );
 }
 
+/// An AoR with two phones rings both: the verb is accepted, and it yields one
+/// target per registered contact, each with the AoR it is called as and all
+/// sharing the identity and headers the verb named.
 #[test]
-fn a_transfer_to_an_aor_nobody_or_several_registered_at_is_refused() {
-    let (code, _) = transfer_refusal(
-        "accept_refer",
-        serde_json::json!({ "target": { "aor": "sip:tx5502@siphon.example.com" } }),
-    );
-    assert_eq!(code, ControlErrorCode::NotFound);
-
-    // Two phones: a replacement rings one target, so neither is picked.
+fn a_transfer_to_an_aor_with_several_contacts_rings_every_one() {
     register_contact(
         "sip:tx5503@siphon.example.com",
         "sip:tx5503@198.51.100.62:5060",
@@ -2963,14 +2959,55 @@ fn a_transfer_to_an_aor_nobody_or_several_registered_at_is_refused() {
         "sip:tx5503@siphon.example.com",
         "sip:tx5503@198.51.100.63:5060",
     );
-    let (code, details) = transfer_refusal(
+    for verb in ["accept_refer", "replace_peer"] {
+        let transfer = parse_transfer_dial(
+            verb,
+            &serde_json::json!({
+                "target": { "aor": "sip:tx5503@siphon.example.com" },
+                "from_display": "Main Line",
+                "headers": { "X-Account": "main" },
+            }),
+        )
+        .unwrap_or_else(|refusal| panic!("{verb} was refused: {refusal:?}"));
+        let mut rung = vec![transfer.target.clone().expect("a first target")];
+        rung.extend(transfer.dial.also.iter().map(|contact| contact.uri.clone()));
+        rung.sort();
+        assert_eq!(
+            rung,
+            [
+                "sip:tx5503@198.51.100.62:5060",
+                "sip:tx5503@198.51.100.63:5060"
+            ],
+            "{verb} rings both contacts"
+        );
+        assert_eq!(
+            transfer.dial.aor.as_deref(),
+            Some("sip:tx5503@siphon.example.com")
+        );
+        assert_eq!(transfer.dial.also.len(), 1);
+        assert_eq!(
+            transfer.dial.also[0].aor.as_deref(),
+            Some("sip:tx5503@siphon.example.com"),
+            "each contact is called as the AoR"
+        );
+        assert_eq!(
+            transfer.dial.shaping.from_display.as_deref(),
+            Some("Main Line")
+        );
+        assert_eq!(
+            transfer.dial.headers,
+            [("X-Account".to_string(), "main".to_string())]
+        );
+    }
+}
+
+#[test]
+fn a_transfer_to_an_aor_nobody_registered_at_is_refused() {
+    let (code, _) = transfer_refusal(
         "accept_refer",
-        serde_json::json!({ "target": { "aor": "sip:tx5503@siphon.example.com" } }),
+        serde_json::json!({ "target": { "aor": "sip:tx5502@siphon.example.com" } }),
     );
-    assert_eq!(code, ControlErrorCode::InvalidState);
-    assert_eq!(details["verb"], "accept_refer");
-    assert_eq!(details["reason"], "several_contacts");
-    assert_eq!(details["contacts"], 2);
+    assert_eq!(code, ControlErrorCode::NotFound);
 
     // A registered phone is reached over its own flow, never a next hop.
     register_contact(

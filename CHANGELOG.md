@@ -15,6 +15,25 @@ entry, but a working config keeps working.
 
 ### Added
 
+- **A transfer to an AoR rings every registered contact.** `accept_refer`
+  (siphon-terminated) and `replace_peer` with an `{aor}` target that has
+  several registered contacts used to be refused `invalid_state`
+  (`several_contacts`). They now ring all of them, each on an INVITE and a
+  Call-ID of its own, the way a forking proxy rings a party with several
+  phones (RFC 3261 §16.7). The first 2xx is the party brought into the call.
+  Every other contact is sent a CANCEL and its `487` is ACKed; one whose 2xx
+  crosses the CANCEL, or arrives at the same moment as the winner's on
+  another worker, is ACKed and released with a BYE rather than promoted over
+  the winner. A contact refusing while another rings reports nothing: the
+  transfer fails once, when none is left, on the best of their responses
+  (§16.7 step 6), a contact that never answered counting as a `408`. On a
+  media-anchored call each contact is offered on a media engine call of its
+  own. A target named by URI, or an AoR with one contact, sends what it sent
+  before. `PeerReplaced` and `ReplaceFailed` are unchanged and still fire
+  once. **BREAKING (Rust library):** `ReferSubscription::target_leg_call_id` is replaced by
+  `targets`, one record per INVITE keyed by Via branch, and
+  `b2bua_complete_terminated_transfer` / `b2bua_fail_terminated_transfer`
+  take that branch instead of a leg index.
 - **A controller can carry a transfer out itself and tell the referrer how
   it went.** `accept_refer` takes `mode: "controller"`: siphon answers the
   REFER `202`, sends the first sipfrag NOTIFY (`100 Trying`) and dials
@@ -67,6 +86,26 @@ entry, but a working config keeps working.
 
 ### Fixed
 
+- **A transfer target given up on at its deadline has its `487` ACKed.** When
+  a siphon-terminated transfer or `replace_peer` ran out of time, siphon sent
+  the target a CANCEL and forgot the leg at once, so the `487 Request
+  Terminated` the CANCEL drew matched nothing and went un-ACKed (RFC 3261
+  §17.1.1.3): the target retransmitted it until Timer H. A 2xx that crossed
+  the CANCEL was worse off, since nothing confirmed or ended the dialog it
+  opened. The cancelled leg is now kept answerable for 32 s, like a cancelled
+  fork branch: the `487` is ACKed, and a crossing 2xx is ACKed and released
+  with a BYE.
+- **A transfer target that never answers no longer leaves a media session
+  behind.** On a media-anchored call the target's INVITE is offered from a
+  fresh media engine call. When the target refused or timed out, that call
+  was never deleted and stayed until the engine's own timeout. It is now
+  deleted when the target fails.
+- **A party hanging up mid-transfer no longer leaves the target ringing.**
+  When the surviving party of a transfer in progress sent a BYE, or the call
+  was ended with `terminate`, the call was removed with the target's INVITE
+  still open and nothing left to CANCEL it. The target is now sent a CANCEL
+  (RFC 3261 §9.1) before the call goes, its `487` is ACKed, and its media
+  engine call is released.
 - **A bridged party's media ingress is pinned by its own profile, not the
   other party's.** In a `bridge` (and a `dial {on_answer: "bridge"}`, which
   ends in one) each media-engine command carries one party's SDP and is shaped
@@ -179,9 +218,8 @@ entry, but a working config keeps working.
   reach a phone on TCP, TLS or WSS behind NAT; before, a transfer could only
   dial a URI. `from`, `from_display`, `p_asserted_identity`, `privacy` and
   `headers` shape the leg the transfer dials, which otherwise presents whatever
-  the call's own INVITE carried. An AoR with several registered contacts is
-  refused `invalid_state` (`several_contacts`), since a transfer rings one
-  target. A transparent `accept_refer` dials no leg and refuses these arguments.
+  the call's own INVITE carried. A transparent `accept_refer` dials no leg and
+  refuses these arguments.
 - **`TransferRequested` says who referred and what an attended transfer
   names.** `referrer_leg` (`"a"` / `"b"`) and `referrer_sip_call_id` identify
   the referring party. When a `Replaces` names a dialog this node hosts,

@@ -864,12 +864,21 @@ The app decides with:
   `target` is a URI string, `{uri}` or `{aor}`. An AoR is dialled the way
   `dial {aor}` dials one: over the flow its phone registered on and through the
   Path of its binding, which is the only way to reach a phone on TCP, TLS or
-  WSS behind NAT. Nobody registered answers `not_found`. An AoR with several
-  registered contacts answers `invalid_state` with `error.details: {verb,
-  reason: "several_contacts", contacts}`: a transfer rings one target, and
-  ringing one phone of a party that has several would not be what was asked.
-  Name the contact with `{uri}`, or ring them all with a `dial`. `next_hop`
-  beside an `{aor}` is `bad_request`.
+  WSS behind NAT. Nobody registered answers `not_found`. `next_hop` beside an
+  `{aor}` is `bad_request`.
+
+  An AoR with several registered contacts rings **every one of them**, each on
+  an INVITE and a Call-ID of its own, as a forking proxy rings a party with
+  several phones (RFC 3261 §16.7). The first to answer is the party brought
+  into the call. Every other one is sent a CANCEL; the `487` that draws is
+  ACKed, and a contact that answers in the instant before its CANCEL arrives is
+  ACKed and released with a BYE, so no phone is left ringing or holding a
+  dialog nobody is on. One contact refusing while another still rings reports
+  nothing: the transfer fails only once none of them is left, and then on the
+  best of their responses (§16.7 step 6), not whichever came last. On a
+  media-anchored call each contact is offered the surviving party's media on an
+  engine call of its own, and the ones that do not answer are released.
+  To ring one phone of the party, name it with `{uri}`.
 
   `from`, `from_display`, `p_asserted_identity`, `privacy` and `headers` are
   the arguments [`dial` takes](#presenting-an-identity) and shape the leg the
@@ -1722,7 +1731,9 @@ media release.
 `p_asserted_identity`, `privacy` and `headers` shape the new leg, all exactly as
 for [`accept_refer`](#an-inbound-refer-on-a-controlled-call): an AoR is dialled
 over the flow its phone registered on, and one with several registered contacts
-is refused `invalid_state` (`several_contacts`).
+rings them all. The first to answer is the party that replaces the leg, and the
+rest are CANCELled. The replaced leg stays up through all of it, and is released
+only when one of them answers.
 
 `replace_a_leg` picks the direction. Omitted or `false` replaces the callee and
 keeps the caller; `true` does the reverse. `profile` names the media profile for
@@ -1739,7 +1750,7 @@ ringing. The verdict arrives as an event:
 | event | payload | when |
 |---|---|---|
 | `PeerReplaced` | `{target_sip_call_id, replaced_leg_released, origin}` | the target answered, was promoted into the pair, and the replaced leg was released |
-| `ReplaceFailed` | `{status, call_kept, origin}` | the target refused, or never answered (`status: 408`) |
+| `ReplaceFailed` | `{status, call_kept, origin}` | the target refused, or never answered (`status: 408`). With several contacts ringing: once, when none of them is left, with the best of their responses |
 
 Branch on `ReplaceFailed.call_kept`: normally the original call is intact and
 still has both parties, so another target can be tried on the same channel. It
