@@ -31,9 +31,25 @@ fn sent_to(proxy: &Proxy, destination: &str) -> Vec<(OutboundMessage, SipMessage
     sent
 }
 
+/// How a branch is pinned to a listener that is not the default one.
+#[derive(Clone, Copy)]
+enum Pinned {
+    /// By the script's `send_socket=`.
+    SendSocket,
+    /// By a captured flow: the listener and connection a registration came in
+    /// on, the only way back to a client behind a NAT or on a protected port.
+    Flow,
+}
+
+/// The connection of the captured flow.
+const FLOW_CONNECTION: u64 = 4242;
+
 /// An INVITE relayed to [`SILENT`] from the pinned listener. Returns the
 /// proxy, the caller's INVITE, and the branch's INVITE as it left.
-fn relayed_from_the_pinned_listener(call_id: &str) -> (Proxy, String, OutboundMessage, SipMessage) {
+fn relayed_from_the_pinned_listener(
+    call_id: &str,
+    pinned: Pinned,
+) -> (Proxy, String, OutboundMessage, SipMessage) {
     let dispatcher = test_dispatcher_with_script("");
     let proxy = Proxy {
         state: Arc::new(dispatcher.state),
@@ -42,14 +58,26 @@ fn relayed_from_the_pinned_listener(call_id: &str) -> (Proxy, String, OutboundMe
     let raw = caller_invite(call_id);
     let original = parse_sip_message_bytes(raw.as_bytes()).expect("the INVITE parses");
     let server_key = TransactionManager::key_from_message(&original).expect("a server key");
+    let pinned_addr: SocketAddr = PINNED.parse().expect("a literal address");
     let pin = crate::transport::SendSocket {
         transport: Transport::Udp,
-        addr: PINNED.parse().expect("a literal address"),
+        addr: pinned_addr,
         advertise: None,
+    };
+    let flow = crate::script::api::registrar::PyFlow {
+        transport: "udp".to_string(),
+        source_addr: SILENT.parse().expect("a literal address"),
+        local_addr: pinned_addr,
+        connection_id: FLOW_CONNECTION,
+    };
+    let target = format!("sip:callee@{SILENT}");
+    let (next_hop, flow, send_socket) = match pinned {
+        Pinned::SendSocket => (Some(target.as_str()), None, Some(&pin)),
+        Pinned::Flow => (None, Some(&flow), None),
     };
     relay_request(
         &original,
-        Some(&format!("sip:callee@{SILENT}")),
+        next_hop,
         false,
         &inbound(CALLER, &raw),
         Some(&server_key),
@@ -58,13 +86,16 @@ fn relayed_from_the_pinned_listener(call_id: &str) -> (Proxy, String, OutboundMe
         None,
         None,
         None,
-        None,
-        Some(&pin),
+        flow,
+        send_socket,
     );
     let mut sent = sent_to(&proxy, SILENT);
     assert_eq!(sent.len(), 1, "the INVITE");
     let (left, invite) = sent.remove(0);
-    assert_eq!(left.source_local_addr, Some(pin.addr));
+    assert_eq!(left.source_local_addr, Some(pinned_addr));
+    if matches!(pinned, Pinned::Flow) {
+        assert_eq!(left.connection_id, ConnectionId(FLOW_CONNECTION));
+    }
     assert!(
         header(&invite, "Via").contains(PINNED),
         "its Via names the listener it left from: {}",
@@ -126,8 +157,16 @@ fn the_one(
 /// both from the listener the INVITE left from.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_cancel_sent_at_once_and_the_ack_leave_from_the_invites_socket() {
-    let (proxy, raw, invite_left, invite) =
-        relayed_from_the_pinned_listener("pinned-now@example.com");
+    for (call_id, pinned) in [
+        ("pinned-now@example.com", Pinned::SendSocket),
+        ("flow-now@example.com", Pinned::Flow),
+    ] {
+        cancel_at_once_and_ack(call_id, pinned);
+    }
+}
+
+fn cancel_at_once_and_ack(call_id: &str, pinned: Pinned) {
+    let (proxy, raw, invite_left, invite) = relayed_from_the_pinned_listener(call_id, pinned);
     answer(&proxy, &invite, 180, "Ringing");
     caller_cancels(&proxy, &raw);
     let cancel = the_one(&sent_to(&proxy, SILENT), Method::Cancel, &invite_left);
@@ -143,8 +182,16 @@ async fn a_cancel_sent_at_once_and_the_ack_leave_from_the_invites_socket() {
 /// any socket and the session is gone by then.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_cancel_that_waited_leaves_from_the_invites_socket() {
-    let (proxy, raw, invite_left, invite) =
-        relayed_from_the_pinned_listener("pinned-later@example.com");
+    for (call_id, pinned) in [
+        ("pinned-later@example.com", Pinned::SendSocket),
+        ("flow-later@example.com", Pinned::Flow),
+    ] {
+        cancel_that_waited(call_id, pinned);
+    }
+}
+
+fn cancel_that_waited(call_id: &str, pinned: Pinned) {
+    let (proxy, raw, invite_left, invite) = relayed_from_the_pinned_listener(call_id, pinned);
     caller_cancels(&proxy, &raw);
     assert!(
         sent_to(&proxy, SILENT).is_empty(),
@@ -159,8 +206,12 @@ async fn a_cancel_that_waited_leaves_from_the_invites_socket() {
 /// The ACK of a failure nobody cancelled leaves from the INVITE's socket too.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_ack_of_a_failure_leaves_from_the_invites_socket() {
-    let (proxy, _, invite_left, invite) =
-        relayed_from_the_pinned_listener("pinned-ack@example.com");
-    answer(&proxy, &invite, 486, "Busy Here");
-    the_one(&sent_to(&proxy, SILENT), Method::Ack, &invite_left);
+    for (call_id, pinned) in [
+        ("pinned-ack@example.com", Pinned::SendSocket),
+        ("flow-ack@example.com", Pinned::Flow),
+    ] {
+        let (proxy, _, invite_left, invite) = relayed_from_the_pinned_listener(call_id, pinned);
+        answer(&proxy, &invite, 486, "Busy Here");
+        the_one(&sent_to(&proxy, SILENT), Method::Ack, &invite_left);
+    }
 }

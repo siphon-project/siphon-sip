@@ -453,16 +453,13 @@ pub async fn run(
     let _non_invite_timeout =
         std::time::Duration::from_secs(tx_config.map(|t| t.timeout_secs as u64).unwrap_or(5));
 
-    let timer_config = {
-        let mut config = TimerConfig::default();
-        if let Some(tx) = tx_config {
-            config.auto_100_trying = tx.auto_emit_100_trying;
-            config.auto_100_delay =
-                std::time::Duration::from_millis(tx.auto_emit_100_trying_delay_ms);
-            config.timer_c_secs = tx.timer_c_secs;
-        }
-        config
-    };
+    let timer_config = transaction_timers(tx_config);
+    if timer_c_is_below_the_rfc_minimum(timer_config.timer_c_secs) {
+        warn!(
+            timer_c_secs = timer_config.timer_c_secs,
+            "transaction.timer_c_secs is 180 or less: RFC 3261 §16.6 step 11 requires Timer C to be larger than 3 minutes; every proxied INVITE still ringing after this long is CANCELled"
+        );
+    }
     let transaction_manager = Arc::new(TransactionManager::new(timer_config));
 
     let dns_resolver = Arc::new(match SipResolver::from_system() {

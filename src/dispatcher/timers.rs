@@ -92,6 +92,28 @@ pub(super) fn client_retransmit_source(
     )
 }
 
+/// The transaction layer's timers as the `transaction:` block of the
+/// configuration sets them, or their defaults without one.
+pub(super) fn transaction_timers(
+    transaction: Option<&crate::config::TransactionConfig>,
+) -> TimerConfig {
+    let mut timers = TimerConfig::default();
+    if let Some(transaction) = transaction {
+        timers.auto_100_trying = transaction.auto_emit_100_trying;
+        timers.auto_100_delay =
+            std::time::Duration::from_millis(transaction.auto_emit_100_trying_delay_ms);
+        timers.timer_c_secs = transaction.timer_c_secs;
+    }
+    timers
+}
+
+/// RFC 3261 §16.6 step 11: "Timer C MUST be set for each client transaction
+/// when an INVITE request is proxied. The timer MUST be larger than 3
+/// minutes." Whether `timer_c_secs` is not.
+pub(super) fn timer_c_is_below_the_rfc_minimum(timer_c_secs: u32) -> bool {
+    timer_c_secs <= 180
+}
+
 /// Re-emit every siphon-originated B2BUA request whose RFC 3261 §17.1
 /// retransmit interval has elapsed, and reap the schedules that reached 64·T1.
 ///

@@ -344,3 +344,56 @@ async fn a_branch_ended_by_the_callers_cancel_does_not_run_the_failure_handler()
         assert_eq!(proxy.state.session_store.session_count(), 0);
     }
 }
+
+/// What `run` builds the transaction layer's timers from: the `transaction:`
+/// block of the configuration, each value where the timers take it, and the
+/// defaults when there is no block.
+#[test]
+fn the_transaction_block_reaches_the_timers() {
+    let defaults = transaction_timers(None);
+    assert_eq!(defaults.timer_c_secs, 181);
+    assert_eq!(
+        defaults.timer_c(),
+        crate::transaction::timer::DEFAULT_TIMER_C
+    );
+    assert!(defaults.auto_100_trying);
+
+    let configured: crate::config::TransactionConfig = serde_yaml_ng::from_str(concat!(
+        "timer_c_secs: 240\n",
+        "auto_emit_100_trying: false\n",
+        "auto_emit_100_trying_delay_ms: 350\n",
+    ))
+    .expect("the transaction block parses");
+    let timers = transaction_timers(Some(&configured));
+    assert_eq!(timers.timer_c_secs, 240);
+    assert_eq!(timers.timer_c(), Duration::from_secs(240));
+    assert!(!timers.auto_100_trying);
+    assert_eq!(timers.auto_100_delay, Duration::from_millis(350));
+
+    // An empty block is the defaults.
+    let empty: crate::config::TransactionConfig =
+        serde_yaml_ng::from_str("{}").expect("an empty transaction block parses");
+    assert_eq!(transaction_timers(Some(&empty)).timer_c_secs, 181);
+}
+
+/// RFC 3261 §16.6 step 11: "The timer MUST be larger than 3 minutes." A
+/// configured Timer C of 180 s or less is what the startup warning is for.
+#[test]
+fn a_timer_c_of_three_minutes_or_less_is_below_the_rfc_minimum() {
+    for (timer_c_secs, below) in [
+        (0, true),
+        (60, true),
+        (180, true),
+        (181, false),
+        (600, false),
+    ] {
+        assert_eq!(
+            timer_c_is_below_the_rfc_minimum(timer_c_secs),
+            below,
+            "{timer_c_secs} s"
+        );
+    }
+    assert!(!timer_c_is_below_the_rfc_minimum(
+        transaction_timers(None).timer_c_secs
+    ));
+}
