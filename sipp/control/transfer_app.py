@@ -12,6 +12,11 @@ wire; this asserts what only the rail shows, the replies and the events:
                         with the cancel's reason as its cause, the second
                         cancel and a `route` mid-ring both refused, and a
                         second dial ringing for the same caller.
+  cancel-late-ringing — `cancel_dial` on a bridging dial whose phone has
+                        answered nothing (RFC 3261 §9.1): the same reply and
+                        events at once, and nothing reaching the caller when
+                        the phone then sends a 180.
+  cancel-late-answer  — the same, with the phone then answering 200.
   refer-callee        — a REFER from the party the call was connected to:
                         `TransferRequested` names leg `b` and the Call-ID of
                         that leg's own dialog; `reject_refer`, then
@@ -45,6 +50,17 @@ from control_app import App, Session, Verdict, heartbeat, is_end, note
 # The parties. Each is a SIPp scenario on the compose network.
 PHONE_URI = os.environ.get("TRANSFER_PHONE", "sip:phone@172.20.0.243:5060")
 SECOND_PHONE_URI = os.environ.get("TRANSFER_SECOND_PHONE", "sip:phone@172.20.0.244:5060")
+# The phones that answer nothing until after their dial has been given up, by
+# case. An address each: a request still being retransmitted to one when its
+# case ends must not be what the other receives first.
+LATE_PHONE_URIS = {
+    "cancel-late-ringing": os.environ.get(
+        "TRANSFER_LATE_RINGING_PHONE", "sip:phone@172.20.0.248:5060"
+    ),
+    "cancel-late-answer": os.environ.get(
+        "TRANSFER_LATE_ANSWERING_PHONE", "sip:phone@172.20.0.249:5060"
+    ),
+}
 # What the referring phone names in its Refer-To.
 REFER_TARGET_HOST = os.environ.get("TRANSFER_REFER_TARGET_HOST", "172.20.0.245")
 # Registered from two addresses before the replace cases run.
@@ -141,6 +157,134 @@ async def connect_phone(
     return branch.get("payload") or {}
 
 
+async def dial_cancelled(
+    session: Session,
+    channel: str,
+    verdict: Verdict,
+    branches: list,
+    reply: dict,
+    cause: str,
+    label: str,
+) -> None:
+    """The reply and the events of one cancelled bridging dial."""
+    result = reply.get("result") or {}
+    verdict.check(
+        f"{label}_reply_is_cancelled_bridge",
+        reply.get("status") == "ok"
+        and result.get("state") == "cancelled"
+        and result.get("on_answer") == "bridge",
+        json.dumps(reply),
+    )
+    seen, predicate = ordered_until(channel, ("DialBranchFailed", "DialFailed"), "DialFailed")
+    failed = (await session.wait_event(predicate, EVENT_TIMEOUT)).get("payload") or {}
+    before = [entry.get("payload") or {} for entry in seen[:-1]]
+    dialled_legs = sorted(branch.get("leg_id") for branch in branches)
+    verdict.check(
+        f"{label}_each_phone_reported_before_the_dial_failed",
+        sorted(entry.get("leg_id") for entry in before) == dialled_legs
+        and all(
+            entry.get("cause") == "cancelled" and entry.get("code") == 487 for entry in before
+        ),
+        json.dumps(before),
+    )
+    verdict.check(
+        f"{label}_dial_failed_487_with_the_cause",
+        failed.get("code") == 487
+        and failed.get("cause") == cause
+        and failed.get("timed_out") is False
+        and sorted(entry.get("leg_id") for entry in failed.get("branches") or [])
+        == dialled_legs,
+        json.dumps(failed),
+    )
+    # The predicate left the branch reports in the backlog. Whatever is there
+    # now is this dial's: one per phone.
+    reported = session.take_events(on_channel(channel, "DialBranchFailed"))
+    verdict.check(
+        f"{label}_each_phone_reported_once",
+        sorted((entry.get("payload") or {}).get("leg_id") for entry in reported)
+        == dialled_legs,
+        json.dumps(reported),
+    )
+
+
+async def case_cancel_before_a_response(
+    app: App, session: Session, event: dict, verdict: Verdict
+) -> None:
+    """Give up on a bridging dial whose phone has answered nothing at all.
+
+    The cases `cancel-late-ringing` and `cancel-late-answer`, which differ only
+    in what the phone finally sends, and that is asserted on the wire by the
+    phone itself. On the rail the two are the same: the dial is over when it is
+    cancelled, whatever the phone does afterwards.
+    """
+    case = ((event.get("payload") or {}).get("vars") or {}).get("case") or ""
+    channel = event.get("channel") or ""
+
+    answered = await session.command(
+        "answer",
+        {"code": 200, "reason": "OK", "anchor": True, "profile": MEDIA_PROFILE},
+        target={"channel": channel},
+    )
+    verdict.check("caller_answered_anchored", answered.get("status") == "ok", json.dumps(answered))
+
+    dialled = await session.command(
+        "dial",
+        {"targets": [{"uri": LATE_PHONE_URIS[case]}], "on_answer": "bridge", "timeout": 30},
+        target={"channel": channel},
+    )
+    result = dialled.get("result") or {}
+    verdict.check(
+        "bridge_dial_accepted",
+        dialled.get("status") == "ok"
+        and result.get("state") == "dialing"
+        and len(result.get("branches") or []) == 1,
+        json.dumps(dialled),
+    )
+    branch = (
+        await session.wait_event(on_channel(channel, "DialBranch"), EVENT_TIMEOUT)
+    ).get("payload") or {}
+    fact(case, "leg_sip_call_id", branch.get("leg_sip_call_id"))
+
+    # The INVITE is on the wire and the phone stays silent for four seconds.
+    # Cancelling one second in leaves three in which it has still drawn no
+    # provisional response.
+    await asyncio.sleep(1.0)
+    alerting = session.take_events(on_channel(channel, "PlayStarted"))
+    verdict.check("no_ringback_for_a_phone_that_has_not_alerted", not alerting, json.dumps(alerting))
+
+    await dial_cancelled(
+        session,
+        channel,
+        verdict,
+        [branch],
+        await session.command(
+            "cancel_dial", {"reason": CANCEL_REASON}, target={"channel": channel}
+        ),
+        CANCEL_REASON,
+        "the",
+    )
+
+    # The caller ends its quiet window with a digit. By then the phone has sent
+    # its late response and been dealt with, and nothing of that may have
+    # reached the caller: no ringback for the 180, no bridge for the 200.
+    await session.wait_event(on_channel(channel, "ChannelDtmfReceived"), EVENT_TIMEOUT)
+    touched = session.take_events(
+        on_channel(
+            channel, "StasisEnd", "PlayStarted", "DialAnswered", "ChannelBridged", "BridgeFailed"
+        )
+    )
+    verdict.check("the_late_response_did_not_reach_the_caller", not touched, json.dumps(touched))
+
+    hangup = await session.command("hangup", {"reason": "done"}, target={"channel": channel})
+    verdict.check("hangup_accepted", hangup.get("status") == "ok", json.dumps(hangup))
+    await session.wait_event(is_end(channel), EVENT_TIMEOUT)
+    # One dial, one outcome, consumed above.
+    stray = session.take_events(
+        on_channel(channel, "DialBranchFailed", "DialFailed", "DialAnswered")
+    )
+    verdict.check("the_dial_was_reported_once", not stray, json.dumps(stray))
+
+
 async def case_cancel_dial(app: App, session: Session, event: dict, verdict: Verdict) -> None:
     """Give up on a ringing bridge dial, and keep the caller."""
     channel = event.get("channel") or ""
@@ -185,45 +329,7 @@ async def case_cancel_dial(app: App, session: Session, event: dict, verdict: Ver
         return branches
 
     async def cancelled(branches: list, reply: dict, cause: str, label: str) -> None:
-        """The reply and the events of one cancelled dial."""
-        result = reply.get("result") or {}
-        verdict.check(
-            f"{label}_reply_is_cancelled_bridge",
-            reply.get("status") == "ok"
-            and result.get("state") == "cancelled"
-            and result.get("on_answer") == "bridge",
-            json.dumps(reply),
-        )
-        seen, predicate = ordered_until(channel, ("DialBranchFailed", "DialFailed"), "DialFailed")
-        failed = (await session.wait_event(predicate, EVENT_TIMEOUT)).get("payload") or {}
-        before = [entry.get("payload") or {} for entry in seen[:-1]]
-        dialled_legs = sorted(branch.get("leg_id") for branch in branches)
-        verdict.check(
-            f"{label}_each_phone_reported_before_the_dial_failed",
-            sorted(entry.get("leg_id") for entry in before) == dialled_legs
-            and all(
-                entry.get("cause") == "cancelled" and entry.get("code") == 487 for entry in before
-            ),
-            json.dumps(before),
-        )
-        verdict.check(
-            f"{label}_dial_failed_487_with_the_cause",
-            failed.get("code") == 487
-            and failed.get("cause") == cause
-            and failed.get("timed_out") is False
-            and sorted(entry.get("leg_id") for entry in failed.get("branches") or [])
-            == dialled_legs,
-            json.dumps(failed),
-        )
-        # The predicate left the branch reports in the backlog. Whatever is
-        # there now is this dial's: two, one per phone.
-        reported = session.take_events(on_channel(channel, "DialBranchFailed"))
-        verdict.check(
-            f"{label}_each_phone_reported_once",
-            sorted((entry.get("payload") or {}).get("leg_id") for entry in reported)
-            == dialled_legs,
-            json.dumps(reported),
-        )
+        await dial_cancelled(session, channel, verdict, branches, reply, cause, label)
 
     first = await ring()
 
@@ -579,6 +685,8 @@ async def case_media(app: App, session: Session, event: dict, verdict: Verdict) 
 
 CASES = {
     "cancel-dial": case_cancel_dial,
+    "cancel-late-ringing": case_cancel_before_a_response,
+    "cancel-late-answer": case_cancel_before_a_response,
     "refer-callee": case_refer_callee,
     "refer-controller": case_refer_controller,
     "replace-aor": case_replace_aor,

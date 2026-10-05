@@ -34,6 +34,7 @@ app="sipp-control-transfer-app"
 # parties are about to be given.
 docker rm -f \
   sipp-control-transfer-ringing-phone sipp-control-transfer-trying-phone \
+  sipp-control-transfer-late-ringing-phone sipp-control-transfer-late-answering-phone \
   sipp-control-transfer-referrer-phone sipp-control-transfer-target \
   sipp-control-transfer-controller-referrer-phone sipp-control-transfer-silent-target \
   sipp-control-transfer-callee-phone sipp-control-transfer-answering-contact \
@@ -128,6 +129,12 @@ case "$case_name" in
       distinct "$phone was rung on a new dialog by the second dial" \
         "$(wire_call_ids "$phone" | sed -n 1p)" "$(wire_call_ids "$phone" | sed -n 2p)"
     done
+    ;;
+  cancel-late-ringing|cancel-late-answer)
+    # One phone, rung once: the dialog its late response was dealt with on is
+    # the one the dial named.
+    same "DialBranch named the dialog the phone was rung on" \
+      "$(wire_call_ids "$1" | sed -n 1p)" "$(fact leg_sip_call_id)"
     ;;
   refer-callee)
     referrer="$(wire_call_ids sipp-control-transfer-referrer-phone | sed -n 1p)"
