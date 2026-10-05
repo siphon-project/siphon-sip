@@ -73,6 +73,22 @@
 //! anchor's for the answer (a caller answered with plain RTP is re-INVITEd with
 //! plain RTP). See [`bridge_offer_profile`].
 //!
+//! ## Which profile pins which party's media ingress
+//!
+//! That is a different question, with the opposite answer. The `offer` that
+//! yields the peer's SDP *carries the anchor's*, and the `answer` that yields
+//! the anchor's carries the peer's. A profile's `received_from` policy pins a
+//! party's media ingress to its signalling source, which is where its media
+//! comes from when the address in its SDP is not (a party behind NAT), and
+//! the hint on a command is about the party whose SDP it carries. So the hint
+//! follows that party's own profile, while everything else on the command
+//! follows the other's: the anchor is pinned when the anchor's profile asks,
+//! the peer when the peer's does. Reading the hint off the shaping profile
+//! pins a party by somebody else's policy, which both leaves a party behind
+//! NAT gated on an address it never sends from and gates one that never asked
+//! to be. A pair profile describes both parties, so its halves decide both.
+//! See [`bridge_anchor_ingress`] and [`bridge_peer_ingress`].
+//!
 //! ## Attachments come off first, and the teardown is confirmed
 //!
 //! An announcement still playing on a leg *replaces that leg's outgoing audio*,
@@ -90,6 +106,8 @@
 
 use std::fmt;
 use std::net::IpAddr;
+
+use crate::rtpengine::session::{ProfileHalf, SideFlags};
 
 /// Which side of a bridge a leg is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -213,6 +231,15 @@ pub struct BridgeContext {
     /// what the pair's session records per side once formed, so a re-offer
     /// relayed to either party later is shaped the way that party was bridged.
     pub media_peer_profile: Option<String>,
+    /// Whose `received_from` policy pins the anchor's media ingress
+    /// ([`bridge_anchor_ingress`]). Kept with the peer's so the pair's session
+    /// records both once formed, for a re-offer relayed to either party later.
+    pub media_anchor_ingress: Option<SideFlags>,
+    /// Whose `received_from` policy pins the peer's media ingress when its
+    /// answer is given to the engine ([`bridge_peer_ingress`]). Not
+    /// [`BridgeContext::media_profile`], which shapes that answer for the
+    /// anchor: the SDP in it is the peer's.
+    pub media_peer_ingress: Option<SideFlags>,
     /// Whether [`BridgeContext::media_call_id`] is a fresh session the anchor's
     /// store entry does not point at yet. It is adopted — the two single-party
     /// sessions deleted, the anchor's entry moved to it — when the bridge
@@ -350,6 +377,12 @@ pub struct LegMedia {
     pub from_tag: String,
     /// The media profile the session was established with.
     pub profile: String,
+    /// The profile half this leg's own `received_from` policy is read from:
+    /// the one its SDP reached the engine under. A session the engine answered
+    /// itself was anchored with its profile's `answer` half; the offerer of a
+    /// relay with the `offer` half; the anchor of a formed bridge with what
+    /// that bridge recorded for it.
+    pub ingress: SideFlags,
     /// Whether the session already relays between **two** parties. A session the
     /// engine answered itself (`answer_local`) has one, and cannot be
     /// renegotiated into a relay — see the module docs.
@@ -436,10 +469,12 @@ pub enum MediaStep {
         profile: String,
         /// The anchor endpoint's current media description.
         sdp: Vec<u8>,
-        /// The anchor's signalling source, pinned as the media ingress when the
-        /// profile's offer half carries `received_from`: the SDP in this offer
-        /// is the anchor's.
+        /// The anchor's signalling source, pinned as the media ingress when
+        /// `ingress` asks for it: the SDP in this offer is the anchor's.
         received_from: Option<IpAddr>,
+        /// Whose `received_from` policy decides that ([`bridge_anchor_ingress`]).
+        /// Not `profile`, which shapes what the peer is offered.
+        ingress: SideFlags,
         /// The anchor's SIP Call-ID: the SDP in this offer is the anchor's, so
         /// the engine files the offerer leg's captures under the anchor's dialog
         /// rather than the pair's engine call-id.
@@ -460,6 +495,8 @@ pub enum MediaStep {
         sdp: Vec<u8>,
         /// The anchor's signalling source, as for [`MediaStep::Offer`].
         received_from: Option<IpAddr>,
+        /// Whose policy pins it, as for [`MediaStep::Offer`].
+        ingress: SideFlags,
         /// The anchor's SIP Call-ID, as for [`MediaStep::Offer`].
         sip_call_id: String,
     },
@@ -488,6 +525,51 @@ pub fn bridge_offer_profile<'a>(
 /// being answered was anchored with it.
 pub fn bridge_answer_profile<'a>(pair_profile: Option<&'a str>, anchor: &'a LegMedia) -> &'a str {
     pair_profile.unwrap_or(anchor.profile.as_str())
+}
+
+/// Whose `received_from` policy pins the **anchor's** media ingress to its
+/// signalling source, on the `offer` / `reoffer` that carries the anchor's SDP.
+///
+/// A pair profile describes both parties the way a dial's profile does: its
+/// `offer` half is the one an offerer's SDP is sent under. Without one it is
+/// the anchor's own ([`LegMedia::ingress`]), never the profile that shapes the
+/// command, which is the peer's ([`bridge_offer_profile`]): the peer's policy
+/// is about the peer's media, and applying it here would pin an anchor that
+/// did not ask to be, or leave one that did open to the address in its SDP.
+pub fn bridge_anchor_ingress(pair_profile: Option<&str>, anchor: &LegMedia) -> SideFlags {
+    match pair_profile {
+        Some(profile) => SideFlags {
+            profile: profile.to_string(),
+            half: ProfileHalf::Offer,
+        },
+        None => anchor.ingress.clone(),
+    }
+}
+
+/// Whose `received_from` policy pins the **peer's** media ingress to its
+/// signalling source, on the `answer` that carries the peer's SDP.
+///
+/// The mirror of [`bridge_anchor_ingress`]: the pair profile's `answer` half
+/// when there is one, the peer's own policy otherwise, never the anchor's
+/// profile that shapes the answer ([`bridge_answer_profile`]). A peer with no
+/// session of its own has no policy of its own to read, so the anchor's
+/// `answer` half decides, as it shapes.
+pub fn bridge_peer_ingress(
+    pair_profile: Option<&str>,
+    anchor: &LegMedia,
+    peer: Option<&LegMedia>,
+) -> SideFlags {
+    match (pair_profile, peer) {
+        (Some(profile), _) => SideFlags {
+            profile: profile.to_string(),
+            half: ProfileHalf::Answer,
+        },
+        (None, Some(peer)) => peer.ingress.clone(),
+        (None, None) => SideFlags {
+            profile: anchor.profile.clone(),
+            half: ProfileHalf::Answer,
+        },
+    }
 }
 
 /// What the anchor side of a bridge brings to the engine's offer.
@@ -555,6 +637,7 @@ pub fn bridge_media_plan(
         let profile = bridge_offer_profile(anchor_offer.pair_profile, anchor, peer).to_string();
         let sdp = anchor_offer.sdp.to_vec();
         let received_from = anchor_offer.source;
+        let ingress = bridge_anchor_ingress(anchor_offer.pair_profile, anchor);
         let sip_call_id = anchor_offer.sip_call_id.to_string();
         steps.push(if anchor.relaying {
             MediaStep::Reoffer {
@@ -563,6 +646,7 @@ pub fn bridge_media_plan(
                 profile,
                 sdp,
                 received_from,
+                ingress,
                 sip_call_id,
             }
         } else {
@@ -572,6 +656,7 @@ pub fn bridge_media_plan(
                 profile,
                 sdp,
                 received_from,
+                ingress,
                 sip_call_id,
             }
         });
@@ -696,6 +781,15 @@ pub fn set_media_direction(body: &[u8], direction: MediaDirection) -> Vec<u8> {
 mod tests {
     use super::*;
 
+    /// The `answer` half of `profile`: what a leg the engine answered itself
+    /// was anchored under.
+    fn own_ingress(profile: &str) -> SideFlags {
+        SideFlags {
+            profile: profile.to_string(),
+            half: ProfileHalf::Answer,
+        }
+    }
+
     /// A single-party session the engine answered itself with no tee — what
     /// every leg a controller owns starts as.
     fn local_leg(call_id: &str, tag: &str) -> LegMedia {
@@ -703,6 +797,7 @@ mod tests {
             media_call_id: call_id.to_string(),
             from_tag: tag.to_string(),
             profile: "rtp_passthrough".to_string(),
+            ingress: own_ingress("rtp_passthrough"),
             relaying: false,
             has_tee: false,
             has_ws_bridge: false,
@@ -844,6 +939,7 @@ mod tests {
                 sdp,
                 received_from,
                 sip_call_id,
+                ..
             } => {
                 assert_eq!(media_call_id, "cid-a");
                 assert_eq!(from_tag, "tag-a");
@@ -1007,6 +1103,98 @@ mod tests {
             });
             assert_eq!(carried, Some(Some(source)));
         }
+    }
+
+    /// The ingress policy named on a step, for either negotiation.
+    fn offered_ingress(steps: &[MediaStep]) -> Option<SideFlags> {
+        steps.iter().find_map(|step| match step {
+            MediaStep::Offer { ingress, .. } | MediaStep::Reoffer { ingress, .. } => {
+                Some(ingress.clone())
+            }
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn each_party_is_pinned_by_its_own_profile_never_the_one_that_shapes_the_command() {
+        // The bug: the offer carries the anchor's SDP and is shaped by the
+        // peer's profile, the answer carries the peer's and is shaped by the
+        // anchor's, and the hint was read off the shaping profile. A peer
+        // behind NAT bridged to a caller whose profile asks for no hint was
+        // then gated on the address in its SDP.
+        let anchor = LegMedia {
+            profile: "open_caller".to_string(),
+            ingress: own_ingress("open_caller"),
+            ..local_leg("cid-a", "tag-a")
+        };
+        let peer = LegMedia {
+            profile: "pinned_phone".to_string(),
+            ingress: own_ingress("pinned_phone"),
+            ..local_leg("cid-b", "tag-b")
+        };
+        assert_eq!(
+            bridge_anchor_ingress(None, &anchor),
+            own_ingress("open_caller")
+        );
+        assert_eq!(
+            bridge_peer_ingress(None, &anchor, Some(&peer)),
+            own_ingress("pinned_phone")
+        );
+        // The plan names the anchor's policy beside the peer's shaping.
+        let steps = bridge_media_plan(
+            Some(&anchor),
+            Some(&peer),
+            offer_of(b"v=0\r\n"),
+            "cid-fresh",
+        );
+        assert_eq!(offered_profile(&steps), Some("pinned_phone"));
+        assert_eq!(offered_ingress(&steps), Some(own_ingress("open_caller")));
+
+        // A relaying anchor keeps what its session recorded for it.
+        let relaying = LegMedia {
+            relaying: true,
+            ingress: SideFlags {
+                profile: "open_caller".to_string(),
+                half: ProfileHalf::Offer,
+            },
+            ..anchor.clone()
+        };
+        let steps = bridge_media_plan(
+            Some(&relaying),
+            Some(&peer),
+            offer_of(b"v=0\r\n"),
+            "cid-fresh",
+        );
+        assert_eq!(offered_ingress(&steps), Some(relaying.ingress.clone()));
+    }
+
+    #[test]
+    fn a_pair_profile_decides_both_parties_ingress_and_a_lone_anchor_decides_its_peers() {
+        let anchor = local_leg("cid-a", "tag-a");
+        let peer = LegMedia {
+            profile: "pinned_phone".to_string(),
+            ingress: own_ingress("pinned_phone"),
+            ..local_leg("cid-b", "tag-b")
+        };
+        // One profile for the pair: its offer half is the offerer's (the
+        // anchor's SDP), its answer half the answerer's, as on a dial.
+        assert_eq!(
+            bridge_anchor_ingress(Some("rtp_to_srtp"), &anchor),
+            SideFlags {
+                profile: "rtp_to_srtp".to_string(),
+                half: ProfileHalf::Offer,
+            }
+        );
+        assert_eq!(
+            bridge_peer_ingress(Some("rtp_to_srtp"), &anchor, Some(&peer)),
+            own_ingress("rtp_to_srtp")
+        );
+        // A peer with no session of its own: the anchor's answer half, the
+        // same profile that shapes the answer.
+        assert_eq!(
+            bridge_peer_ingress(None, &anchor, None),
+            own_ingress(bridge_answer_profile(None, &anchor))
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1180,6 +1368,7 @@ mod tests {
             profile: "rtp_passthrough".to_string(),
             sdp: b"v=0\r\n".to_vec(),
             received_from: None,
+            ingress: own_ingress("rtp_passthrough"),
             sip_call_id: "anchor-dialog@192.0.2.10".to_string(),
         };
         assert_eq!(
@@ -1201,6 +1390,7 @@ mod tests {
             profile: "rtp_passthrough".to_string(),
             sdp: b"v=0\r\n".to_vec(),
             received_from: None,
+            ingress: own_ingress("rtp_passthrough"),
             sip_call_id: "anchor-dialog@192.0.2.10".to_string(),
         };
         assert_eq!(

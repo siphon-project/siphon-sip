@@ -217,6 +217,15 @@ pub fn b2bua_send_b_leg_invite(
         }
         None => None,
     };
+    // Unpinned B-leg to the other address family: it leaves from the listener
+    // bound in that family, so the Via and Contact name that one (see
+    // `family_egress_socket`).
+    let family_egress = if send_socket.is_none() && flow.is_none() {
+        state.family_egress_socket(outbound_transport, destination)
+    } else {
+        None
+    };
+    let send_socket = send_socket.or(family_egress.as_ref());
 
     // The local socket this B-leg is anchored on — `Some` when the script
     // dialled over a captured flow, which is what pins the egress.  The leg
@@ -365,18 +374,7 @@ pub fn b2bua_send_b_leg_invite(
             .map(str::to_string)
             .or(from_host_override)
             .unwrap_or_else(|| state.via_host(&outbound_transport));
-        if let Some(at_pos) = new_from.find('@') {
-            // Find the end of the host: first occurrence of '>', ':', or ';' after '@'
-            let after_at = &new_from[at_pos + 1..];
-            let host_end = after_at.find(['>', ';', ':']).unwrap_or(after_at.len());
-            let end_pos = at_pos + 1 + host_end;
-            new_from = format!(
-                "{}{}{}",
-                &new_from[..at_pos + 1],
-                from_host,
-                &new_from[end_pos..]
-            );
-        }
+        new_from = crate::b2bua::actor::rewrite_uri_host(&new_from, &from_host);
 
         b_leg_invite.headers.set("From", new_from);
     }
@@ -609,7 +607,7 @@ pub fn b2bua_send_b_leg_invite(
     // Sanitize SDP: mask A-leg identity in o= and s= lines, and rewrite
     // the o= address to our advertised address for topology hiding.
     let sdp_addr = state.via_host(&outbound_transport);
-    sanitize_sdp_identity(&mut b_leg_invite.body, &state.sdp_name, Some(&sdp_addr));
+    hide_sdp_identity(&mut b_leg_invite.body, state, Some(&sdp_addr));
 
     // Update Content-Length after SDP rewrite (o=/s= changes may alter body size)
     if !b_leg_invite.body.is_empty() {

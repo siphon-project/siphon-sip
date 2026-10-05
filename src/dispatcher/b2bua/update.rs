@@ -375,7 +375,7 @@ pub fn handle_b2bua_update(inbound: InboundMessage, message: SipMessage, state: 
         if !forwarded.body.is_empty() {
             // Family-matched to the target leg (same arrival socket as the Via).
             let sdp_addr = state.a_leg_advertised_host(target_local_addr, &transport);
-            sanitize_sdp_identity(&mut forwarded.body, &state.sdp_name, Some(&sdp_addr));
+            hide_sdp_identity(&mut forwarded.body, state, Some(&sdp_addr));
 
             if let (Some(ref rtpengine_set), Some(ref media_sessions), Some(ref profiles)) = (
                 &state.rtpengine_set,

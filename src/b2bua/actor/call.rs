@@ -269,6 +269,8 @@ pub struct CallActor {
     pub created_at: std::time::Instant,
     /// Original A-leg INVITE message (for script handler reconstruction).
     pub a_leg_invite: Option<Arc<Mutex<SipMessage>>>,
+    /// Set while `@b2bua.on_invite` runs; a CANCEL raises it (`cancel_deferral`).
+    pub invite_handler_cancelled: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// Local (listener) address the A-leg INVITE arrived on. Captured at INVITE
     /// so an imperative `call.answer()` / `call.progress()` sends the UAS
     /// response back out the same listener (source-socket parity with the
@@ -528,6 +530,8 @@ pub struct CallActor {
     /// retransmitted while the first one's `@b2bua.on_cancel` runs is answered
     /// `200` and nothing more.
     pub cancel_claimed: bool,
+    /// Last 101-199 sent to the caller, as wire bytes (`invite_retransmission`).
+    pub a_leg_last_provisional: Option<bytes::Bytes>,
 }
 /// The media plan of an offerless originate, resolved when the callee's 2xx
 /// arrives. Names a profile in the media registry rather than carrying resolved
@@ -576,6 +580,7 @@ impl CallActor {
             winner: None,
             created_at: std::time::Instant::now(),
             a_leg_invite: None,
+            invite_handler_cancelled: None,
             a_leg_local_addr: None,
             session_timer_override: None,
             transfer: None,
@@ -626,6 +631,7 @@ impl CallActor {
             failure_reroutes: 0,
             failure_concluding: false,
             cancel_claimed: false,
+            a_leg_last_provisional: None,
         }
     }
 
@@ -1025,6 +1031,7 @@ impl CallActor {
         if state == CallState::Answered && self.answered_at.is_none() {
             self.answered_at = Some(std::time::Instant::now());
         }
+        self.forget_provisional_once_final(&state);
         self.state = state;
     }
 

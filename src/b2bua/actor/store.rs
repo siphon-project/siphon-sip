@@ -1304,14 +1304,16 @@ impl CallActorStore {
         let mut kept = false;
         for leg in legs {
             if let Some(invite) = leg.b_leg_invite.as_ref() {
-                self.zombie_cancelled.insert(
-                    leg.branch.clone(),
-                    ZombieCancelledLeg {
+                // A leg may be kept twice: when its CANCEL goes out, and again
+                // when its call is removed. The first entry stands, with what it
+                // has learnt since (a 2xx already BYEd is not BYEd again).
+                self.zombie_cancelled
+                    .entry(leg.branch.clone())
+                    .or_insert_with(|| ZombieCancelledLeg {
                         leg: leg.clone(),
                         invite_ruri: request_uri_of(invite),
                         byed: false,
-                    },
-                );
+                    });
                 kept = true;
             }
         }
