@@ -11,7 +11,7 @@ use super::dial_bridge_test_harness::{
     eventually, invite_to, names, register, reinvites_to, sent_until, CALLER,
 };
 use super::originate_test_harness::{
-    drain, phone_offer, phone_response, phone_sends, requests_to, socket,
+    drain, phone_offer, phone_response, phone_sends, phone_tries, requests_to, socket,
 };
 use super::*;
 use crate::rtpengine::test_native_engine::NativeTestEngine;
@@ -22,7 +22,7 @@ use crate::rtpengine::test_native_engine::NativeTestEngine;
 /// `DialFailed` is published by the dial's coordinator task once it has stopped
 /// the ringback, so it is waited for by name: reading whatever arrived within a
 /// fixed quiet period would make the test depend on how fast that task ran.
-async fn through_dial_failed(
+pub(super) async fn through_dial_failed(
     controller: &super::control_originate_tests::Controller,
     mut heard: Vec<crate::control::EventFrame>,
 ) -> Vec<crate::control::EventFrame> {
@@ -90,6 +90,9 @@ async fn a_cancelled_bridge_dial_cancels_every_phone_and_keeps_the_caller() {
             None,
         ),
     );
+    // The mobile holds its INVITE without alerting yet: a 100 Trying is the
+    // provisional its CANCEL has to wait for (RFC 3261 §9.1).
+    phone_tries(state, MOBILE, &invite_to(&sent, MOBILE));
     assert!(eventually(|| engine.commands("play_media").len() == 1).await);
     let _ = events(&controller).await;
 

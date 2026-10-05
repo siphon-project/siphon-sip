@@ -168,6 +168,8 @@ mod originate_test_harness;
 #[cfg(test)]
 mod originate_tests;
 #[cfg(test)]
+mod originated_cancel_awaits_provisional_tests;
+#[cfg(test)]
 mod prack_offer_answer_tests;
 #[cfg(test)]
 mod proxy_dialog_state_tests;

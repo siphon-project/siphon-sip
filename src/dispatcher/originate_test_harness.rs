@@ -203,6 +203,25 @@ pub(super) fn phone_sends(state: &DispatcherState, from: SocketAddr, response: &
     );
 }
 
+/// The phone at `phone` takes `invite` with a `100 Trying`: it holds the INVITE
+/// and has not alerted anyone yet. Hop by hop, so nobody is told and it is no
+/// progress (RFC 3261 §16.7 step 2), but it is a provisional, and a CANCEL for
+/// that INVITE has to wait for one (§9.1).
+pub(super) fn phone_tries(state: &DispatcherState, phone: &str, invite: &SipMessage) {
+    phone_sends(
+        state,
+        socket(phone),
+        &phone_response(
+            invite,
+            100,
+            "Trying",
+            "trying",
+            &format!("sip:phone@{phone}"),
+            None,
+        ),
+    );
+}
+
 /// A profile that pins media ingress to the signalling source on both halves.
 pub(super) const PINNED_INGRESS: &str = "pinned_ingress";
 
