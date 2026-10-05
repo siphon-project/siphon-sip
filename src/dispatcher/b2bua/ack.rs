@@ -750,7 +750,8 @@ pub fn send_delayed_offer_ack(call_id: &str, caller_ack: &SipMessage, state: &Di
             return;
         };
         let mut body = answer;
-        if let Some(leg) = call.b_legs.get_mut(held.b_leg_index) {
+        // The callee's leg, by the Via branch of the INVITE its 2xx answered.
+        if let Some((_, leg)) = call.find_b_leg_by_branch_mut(&held.branch) {
             stamp_b_leg_origin(&mut body, &content_type, leg, &held.transport, state);
             leg.initial_acked = true;
             // The answer as the callee gets it is the session description in

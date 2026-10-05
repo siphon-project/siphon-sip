@@ -967,38 +967,30 @@ pub fn build_retry_invite(original: &SipMessage, new_via: String, cseq: u32) -> 
 
 /// Spawn a [`LegActor`] for a B-leg and store its handle in the call.
 ///
-/// The actor classifies inbound SIP messages into [`CallEvent`]s.
-/// Call this after `add_b_leg` — uses the last B-leg index.
-pub fn spawn_b_leg_actor(call_id: &str, b_leg: &Leg, state: &DispatcherState) {
-    if let Some(call) = state.call_actors.get_call(call_id) {
-        if let Some(event_tx) = &call.event_tx {
-            let (actor, handle) = LegActor::new(b_leg.clone(), event_tx.clone());
-            let b_leg_index = call.b_legs.len().saturating_sub(1);
-            drop(call);
-            tokio::spawn(actor.run());
-            if let Some(mut call) = state.call_actors.get_call_mut(call_id) {
-                call.set_b_leg_handle(b_leg_index, handle);
-            }
-        }
-    }
-}
-
-/// Spawn a [`LegActor`] for a B-leg whose slot is at an explicit `index`.
+/// The actor classifies inbound SIP messages into [`CallEvent`]s. Call this
+/// after the leg is on the call, appended (`add_b_leg`) or superseding a failed
+/// attempt in place (`replace_b_leg_on`, the 401/407 and 422 retries).
 ///
-/// Like [`spawn_b_leg_actor`] but stores the handle at `index` rather than the
-/// last B-leg. Used by the 401/407 and 422 retry paths, which *supersede* the
-/// failed leg in place (via `CallActorStore::replace_b_leg`) instead of
-/// appending — so the retry's actor handle must land on the same slot the
-/// retry leg occupies.
-pub fn spawn_b_leg_actor_at(call_id: &str, b_leg: &Leg, index: usize, state: &DispatcherState) {
-    if let Some(call) = state.call_actors.get_call(call_id) {
-        if let Some(event_tx) = &call.event_tx {
-            let (actor, handle) = LegActor::new(b_leg.clone(), event_tx.clone());
-            drop(call);
-            tokio::spawn(actor.run());
-            if let Some(mut call) = state.call_actors.get_call_mut(call_id) {
-                call.set_b_leg_handle(index, handle);
-            }
+/// The handle goes to the slot of the leg carrying `b_leg`'s Via branch, found
+/// under the lock that stores it. The call is not held while the actor is
+/// spawned, and a leg added or taken off in between moves the positions: "the
+/// last leg", or a position read before, would then hold another leg's actor.
+pub fn spawn_b_leg_actor(call_id: &str, b_leg: &Leg, state: &DispatcherState) {
+    let Some(event_tx) = state
+        .call_actors
+        .get_call(call_id)
+        .and_then(|call| call.event_tx.clone())
+    else {
+        return;
+    };
+    let (actor, handle) = LegActor::new(b_leg.clone(), event_tx);
+    tokio::spawn(actor.run());
+    if let Some(mut call) = state.call_actors.get_call_mut(call_id) {
+        if let Some(index) = call
+            .find_b_leg_by_branch(&b_leg.branch)
+            .map(|(index, _)| index)
+        {
+            call.set_b_leg_handle(index, handle);
         }
     }
 }

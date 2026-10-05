@@ -66,7 +66,8 @@ impl CallActorStore {
     }
 
     /// Take back an answer the call failed on. See
-    /// [`CallActor::rewind_failed_answer`].
+    /// [`CallActor::rewind_failed_answer`]. By position: a response handler
+    /// uses [`rewind_failed_answer_on`](Self::rewind_failed_answer_on).
     pub fn rewind_failed_answer(
         &self,
         call_id: &str,

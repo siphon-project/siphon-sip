@@ -843,7 +843,6 @@ pub fn settle_owned_leg_response(
     state: &DispatcherState,
 ) {
     let a_leg = &snapshot.a_leg;
-    let b_leg_index = snapshot.b_leg_index;
     let success = (200..300).contains(&status_code);
     let ack_branch = if success {
         TransactionKey::generate_branch()
@@ -868,16 +867,12 @@ pub fn settle_owned_leg_response(
             );
         }
     }
-    if let Some(index) = b_leg_index {
-        if success {
-            // Keep the entry so a retransmitted 200 is re-ACKed rather than
-            // treated as a response to an unknown branch.
-            state
-                .call_actors
-                .set_b_leg_target_uri(call_id, index, request.done_target);
-        } else {
-            state.call_actors.remove_b_leg(call_id, index);
-        }
+    if success {
+        // Keep the entry so a retransmitted 200 is re-ACKed rather than
+        // treated as a response to an unknown branch.
+        mark_tracking_leg_done(call_id, snapshot, request.done_target, state);
+    } else {
+        state.call_actors.remove_b_leg_on(call_id, branch);
     }
     state.call_actors.set_pending_reinvite(call_id, true, false);
     // A final response to a request siphon sent on the leg's dialog, which

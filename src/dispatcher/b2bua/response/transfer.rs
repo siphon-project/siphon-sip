@@ -36,6 +36,7 @@ pub fn forward_transfer_response(
             )
         } else {
             match state.call_actors.get_call(call_id) {
+                // The winner's position is read and used under one hold of the call's lock.
                 Some(call) => match call.winner.and_then(|i| call.b_legs.get(i)) {
                     Some(b) => (
                         b.transport.remote_addr,
@@ -93,6 +94,7 @@ pub fn forward_transfer_response(
                 }
             }
         } else if let Some(call) = state.call_actors.get_call(call_id) {
+            // The winner's position is read and used under one hold of the call's lock.
             if let Some(winner) = call.winner.and_then(|i| call.b_legs.get(i)) {
                 crate::b2bua::actor::Dialog::rewrite_headers(
                     message,
@@ -148,15 +150,9 @@ pub fn forward_transfer_response(
         );
 
         if (200..300).contains(&status_code) {
-            if let Some(idx) = snapshot.b_leg_index {
-                state
-                    .call_actors
-                    .set_b_leg_target_uri(call_id, idx, marker.done_target(direction));
-            }
+            mark_tracking_leg_done(call_id, snapshot, marker.done_target(direction), state);
         } else if status_code >= 300 {
-            if let Some(idx) = snapshot.b_leg_index {
-                state.call_actors.remove_b_leg(call_id, idx);
-            }
+            state.call_actors.remove_b_leg_on(call_id, &snapshot.branch);
         }
 
         // The far end's final response to a relayed REFER is the referrer's

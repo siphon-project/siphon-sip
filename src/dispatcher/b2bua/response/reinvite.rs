@@ -58,6 +58,7 @@ pub fn forward_reinvite_response(
                 // B→A: send response to winning B-leg
                 match state.call_actors.get_call(call_id) {
                     Some(call) => {
+                        // The winner's position is read and used under one hold of the call's lock.
                         let winner = call.winner.and_then(|i| call.b_legs.get(i));
                         if let Some(b) = winner {
                             (
@@ -110,6 +111,7 @@ pub fn forward_reinvite_response(
         } else if is_bridged_reinvite {
             // B→A: response from A-leg → rewrite A-leg identifiers back to B-leg
             if let Some(call) = state.call_actors.get_call(call_id) {
+                // The winner's position is read and used under one hold of the call's lock.
                 if let Some(winner) = call.winner.and_then(|i| call.b_legs.get(i)) {
                     crate::b2bua::actor::Dialog::rewrite_headers(
                         message,
@@ -218,14 +220,12 @@ pub fn forward_reinvite_response(
         // (§12.1.2). Read off the *tracking* leg rather than the winning B-leg
         // because a transfer promotes legs while its re-anchor re-INVITE is in
         // flight, so the winner is not reliably the party this ACK addresses.
-        let responder_route_set: Vec<String> = snapshot
-            .b_leg_index
-            .and_then(|index| {
-                state.call_actors.get_call(call_id).and_then(|call| {
-                    call.b_legs
-                        .get(index)
-                        .map(|leg| leg.dialog.route_set.clone())
-                })
+        // The tracking leg is the one this response's Via branch names, not the
+        // one at the position the snapshot read.
+        let responder_route_set: Vec<String> = state
+            .call_actors
+            .read_b_leg_on(call_id, &snapshot.branch, |leg| {
+                leg.dialog.route_set.clone()
             })
             .unwrap_or_default();
 
@@ -372,13 +372,12 @@ pub fn forward_reinvite_response(
             // Mark the re-INVITE B-leg entry as done (not removed!) so that
             // retransmitted 200 OKs can still be matched and re-ACKed.
             // The entry will be cleaned up when the call terminates.
-            if let Some(idx) = snapshot.b_leg_index {
-                state.call_actors.set_b_leg_target_uri(
-                    call_id,
-                    idx,
-                    format!("reinvite_done:{}", direction),
-                );
-            }
+            mark_tracking_leg_done(
+                call_id,
+                snapshot,
+                format!("reinvite_done:{direction}"),
+                state,
+            );
             // RFC 3261 §14.1: the re-INVITE toward the target leg has
             // completed — clear the pending flag so a subsequent re-INVITE
             // (from either side) is allowed to start. `is_a2b` means the
@@ -403,9 +402,7 @@ pub fn forward_reinvite_response(
 
             // Remove the re-INVITE B-leg entry — no retransmission expected
             // since the IST will transition Completed→Confirmed on our ACK.
-            if let Some(idx) = snapshot.b_leg_index {
-                state.call_actors.remove_b_leg(call_id, idx);
-            }
+            state.call_actors.remove_b_leg_on(call_id, &snapshot.branch);
             // Clear pending-reinvite on the target leg (see comment above).
             state
                 .call_actors

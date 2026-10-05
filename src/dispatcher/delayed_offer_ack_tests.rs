@@ -234,9 +234,18 @@ impl OfferlessCall {
         OfferlessCall::dial_on(dispatcher)
     }
 
-    pub(super) fn dial_on(TestDispatcher { state, udp }: TestDispatcher) -> OfferlessCall {
+    pub(super) fn dial_on(dispatcher: TestDispatcher) -> OfferlessCall {
+        OfferlessCall::dial_behind(dispatcher, None)
+    }
+
+    /// [`OfferlessCall::dial_on`] with `ahead` already on the call, so the
+    /// callee's leg is not the first.
+    fn dial_behind(TestDispatcher { state, udp }: TestDispatcher, ahead: Option<Leg>) -> Self {
         let state = Arc::new(state);
         let call_id = state.call_actors.create_call(caller_leg());
+        if let Some(ahead) = ahead {
+            assert!(state.call_actors.add_b_leg(&call_id, ahead));
+        }
         let a_leg_invite = Arc::new(Mutex::new(caller_invite()));
         state
             .call_actors
@@ -610,6 +619,62 @@ async fn an_offerless_invite_holds_the_callee_ack_until_the_caller_answers() {
         "the caller's retransmitted ACK sends nothing more"
     );
     assert!(call.call_is_up());
+}
+
+/// The held ACK belongs to the callee's leg wherever that leg sits when the
+/// caller answers. A leg tracking a relayed in-dialog request is ahead of it on
+/// the call and is taken off (its request was refused) while the ACK waits: the
+/// answer still goes into the callee's ACK, is recorded on the callee's dialog,
+/// and a later copy of the 2xx draws that same ACK.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_held_ack_follows_its_leg_when_a_leg_ahead_of_it_is_taken_off_the_call() {
+    const AHEAD: &str = "z9hG4bK-tracked-ahead";
+    let ahead = Leg::new_b_leg(
+        CALLER_CALL_ID.to_string(),
+        "tracking-tag".to_string(),
+        "info:b2a".to_string(),
+        AHEAD.to_string(),
+        LegTransport {
+            remote_addr: address(CALLER),
+            connection_id: ConnectionId::default(),
+            transport: Transport::Udp,
+            local_addr: None,
+        },
+    );
+    let call = OfferlessCall::dial_behind(test_dispatcher_with_script(""), Some(ahead));
+    let answer = call.callee_answers_with_an_offer();
+    let relayed = relayed_answer(&call.wire());
+
+    call.state.call_actors.remove_b_leg_on(&call.call_id, AHEAD);
+
+    call.caller_acks(&relayed, Some(CALLER_ANSWER));
+    let sent = call.wire();
+    let ack = acks(&sent)
+        .first()
+        .map(|sent| sent.message.clone())
+        .expect("the callee's ACK");
+    assert!(
+        body_text(&ack).contains("o=siphon "),
+        "the answer carries siphon's origin on the callee's dialog:\n{}",
+        body_text(&ack)
+    );
+    let callee = call
+        .state
+        .call_actors
+        .read_b_leg_on(&call.call_id, &top_via_branch(&call.invite), Leg::clone)
+        .expect("the callee's leg");
+    assert!(callee.initial_acked, "the callee's 2xx is ACKed");
+    assert_eq!(callee.dialog.last_sent_sdp, Some(ack.body.clone()));
+
+    call.callee_sends(&answer);
+    let again = call.wire();
+    let again = acks(&again);
+    assert_eq!(again.len(), 1, "a later copy of the 2xx is ACKed");
+    assert_eq!(
+        again[0].message.to_bytes(),
+        ack.to_bytes(),
+        "with the same ACK, answer included"
+    );
 }
 
 /// The answer siphon puts in the callee's ACK is the session description in force

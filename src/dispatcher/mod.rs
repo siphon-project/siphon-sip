@@ -92,6 +92,8 @@ mod b_leg_asserted_identity_tests;
 #[cfg(test)]
 mod b_leg_capability_tests;
 #[cfg(test)]
+mod b_leg_position_tests;
+#[cfg(test)]
 mod bad_extension_tests;
 #[cfg(test)]
 mod bridged_pair_media_events_tests;

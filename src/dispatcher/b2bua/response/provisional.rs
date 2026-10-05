@@ -29,7 +29,7 @@ pub fn b_leg_provisional(
         // is only dropped. Checked before the call is marked ringing, so a
         // straggler cannot move it to Ringing either. The same check already
         // kept a reliable one from being PRACKed (`auto_prack_b_leg`).
-        if snapshot.b_leg_index.is_some() && state.call_actors.is_ended_branch_on(call_id, branch) {
+        if snapshot.matched_b_leg && state.call_actors.is_ended_branch_on(call_id, branch) {
             debug!(call_id = %call_id, branch = %branch, status = status_code,
                 "B2BUA: dropping a provisional from a leg that already ended");
             return;
@@ -39,8 +39,9 @@ pub fn b_leg_provisional(
         // releases (RFC 3262 §5), found before the response is rewritten for the
         // caller.
         let prack_link = snapshot
-            .b_leg_index
-            .and_then(|_| callee_prack_link(call_id, branch, message, state));
+            .matched_b_leg
+            .then(|| callee_prack_link(call_id, branch, message, state))
+            .flatten();
 
         // Drop a stray provisional that arrives after the call is already
         // answered — e.g. a carrier's 180 reordered behind its 200, or a losing
@@ -209,18 +210,14 @@ pub fn b_leg_provisional(
         // The early media answer as the caller receives it, which is the session
         // description in force on the caller's dialog when this leg's 2xx carries
         // none.
-        // The leg's position is read again here, by its branch: the handler
-        // and the media engine have run since the snapshot was taken, and a
-        // leg ahead of this one may have been taken off the call meanwhile.
-        if let (Some(index), Some(sdp)) = (
-            snapshot
-                .b_leg_index
-                .and_then(|_| state.call_actors.b_leg_index(call_id, branch)),
-            sdp_in_body(message_content_type(message), &message.body),
-        ) {
+        // Recorded on the leg this response's Via branch names, found under
+        // the lock that records it: the handler and the media engine have run
+        // since the snapshot was taken, and a leg ahead of this one may have
+        // been taken off the call meanwhile.
+        if let Some(sdp) = sdp_in_body(message_content_type(message), &message.body) {
             state
                 .call_actors
-                .set_b_leg_early_answer(call_id, index, sdp);
+                .update_b_leg_on(call_id, branch, |leg| leg.early_answer_sent = Some(sdp));
         }
         // To the caller: reliably on siphon's own numbering when it asked for
         // that (RFC 3262 §3), after the PRACK of a reliable one before it.

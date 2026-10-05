@@ -78,9 +78,9 @@ pub fn auto_prack_b_leg(
     // on, never by the position the snapshot read: a leg ahead of it taken off
     // the call in between moves every leg after it down one, and the PRACK
     // built here may wait for the caller's long after this returns.
-    let (Some(rseq), Some(_)) = (
+    let (Some(rseq), true) = (
         crate::sip::headers::rseq::parse_rseq(&message.headers),
-        snapshot.b_leg_index,
+        snapshot.matched_b_leg,
     ) else {
         return false;
     };
@@ -583,7 +583,7 @@ pub fn feed_leg_actor_and_learn_dialog(
     // leg list (`promote_replacement_target`): a sibling's 2xx handled at that
     // moment would otherwise write its dialog onto whichever leg moved into the
     // position it remembered.
-    if (200..300).contains(&status_code) && snapshot.b_leg_index.is_some() {
+    if (200..300).contains(&status_code) && snapshot.matched_b_leg {
         if let Some(mut call) = state.call_actors.get_call_mut(call_id) {
             if let Some((_, b_leg)) = call.find_b_leg_by_branch_mut(&snapshot.branch) {
                 if let Some(to_tag) = crate::b2bua::actor::extract_to_tag(message) {

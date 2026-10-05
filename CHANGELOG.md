@@ -412,6 +412,30 @@ entry, but a working config keeps working.
   `replaces.local` carries its call, the channel controlling it, its leg and
   the channel it is bridged with. `StasisStart` carries the same as `replaces`
   for a handed-over INVITE whose `Replaces` named a hosted dialog.
+- **A B-leg response acts on the leg it answers when the call's legs have
+  moved.** siphon read a B-leg's position among the call's legs when its
+  response arrived and acted on that position later, after its retries, script
+  hooks and media engine calls had run. A leg ahead of it taken off the call in
+  between (the leg tracking a relayed in-dialog request once that request is
+  refused, the targets of a replacement that failed) moves every later leg
+  down one, so the position then named the leg behind it, or none. The
+  PRACK and the recorded branch failure already followed the Via branch of the
+  leg's INVITE (RFC 3261 §8.1.1.7); the rest of the response path now does
+  too, each step finding the leg by that branch under the lock that acts on
+  it. With the legs moved, a 2xx used to answer the call with no winning
+  leg; an answer `@b2bua.on_answer` refused left the callee's dialog up, with
+  no ACK and no BYE; a `401`/`407` was ACKed and taken for a retransmission
+  instead of being answered with credentials; a carrier's failure was taken
+  for a straggler, so an LCR sequence stopped instead of trying the next
+  carrier; a relayed re-INVITE, UPDATE, REFER, NOTIFY or INFO marked a
+  different request as answered, or removed it, and stayed open itself; and
+  the answer in the ACK held for a delayed offer (§13.2.2.4) went out without
+  siphon's own `o=` line. The ACK of a relayed re-INVITE's 2xx now reads its
+  route set (§12.2.1.1) off the re-INVITE's own leg, and a later copy of a
+  delayed offer's 2xx draws the ACK that carried the answer. The actor of a
+  leg that supersedes a challenged one is stored on that leg's own slot,
+  found by its branch. Nothing changes
+  for a call whose legs have not moved.
 
 ### Changed
 
