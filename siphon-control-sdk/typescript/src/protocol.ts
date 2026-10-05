@@ -213,6 +213,7 @@ export const SipVerb = {
   RemoveHeader: "remove_header",
   AcceptRefer: "accept_refer",
   RejectRefer: "reject_refer",
+  CompleteRefer: "complete_refer",
   Bridge: "bridge",
   Unbridge: "unbridge",
   ReplacePeer: "replace_peer",

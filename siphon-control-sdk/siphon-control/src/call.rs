@@ -325,9 +325,17 @@ impl Call {
     /// `from_display`, `p_asserted_identity`, `privacy` and `headers` are the
     /// identity arguments `dial` takes, for the leg the transfer dials. They
     /// and `aor` apply to `mode="terminate"`; `"transparent"` dials no leg.
+    ///
+    /// `mode="controller"` is the transfer this app carries out itself: the
+    /// server answers `202`, sends the first sipfrag NOTIFY and dials nothing.
+    /// Move the parties with `bridge` / `unbridge` / `replace_peer` / `dial`,
+    /// then report with `complete_refer`. `timeout` is how many seconds there
+    /// are to report in (default 60, at most 180); past it the server reports
+    /// `503` to the referrer itself. This mode takes `timeout` only, and
+    /// `timeout` belongs to this mode only: anything else raises `ValueError`.
     #[pyo3(signature = (
         target=None, next_hop=None, mode=None, profile=None, *, aor=None, from_uri=None,
-        from_display=None, p_asserted_identity=None, privacy=None, headers=None,
+        from_display=None, p_asserted_identity=None, privacy=None, headers=None, timeout=None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn accept_refer<'py>(
@@ -343,7 +351,35 @@ impl Call {
         p_asserted_identity: Option<String>,
         privacy: Option<String>,
         headers: Option<Bound<'py, PyAny>>,
+        timeout: Option<u32>,
     ) -> PyResult<Bound<'py, PyAny>> {
+        if mode.as_deref() == Some("controller") {
+            let dials_a_leg = target.is_some()
+                || aor.is_some()
+                || next_hop.is_some()
+                || profile.is_some()
+                || from_uri.is_some()
+                || from_display.is_some()
+                || p_asserted_identity.is_some()
+                || privacy.is_some()
+                || headers.is_some();
+            if dials_a_leg {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "accept_refer mode \"controller\" dials no leg: it takes timeout only",
+                ));
+            }
+            let call = self.inner.clone();
+            return pyo3_async_runtimes::tokio::future_into_py(py, async move {
+                call.accept_refer_controller(timeout)
+                    .await
+                    .map_err(to_pyerr)
+            });
+        }
+        if timeout.is_some() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "accept_refer timeout applies to mode \"controller\"",
+            ));
+        }
         let target = transfer_target("accept_refer", target, aor)?;
         let dial = TransferDial {
             next_hop,
@@ -376,6 +412,29 @@ impl Call {
         let call = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             call.reject_refer(code, reason.as_deref())
+                .await
+                .map_err(to_pyerr)
+        })
+    }
+
+    /// Report how a transfer accepted with `accept_refer(mode="controller")`
+    /// went: the server sends the referrer the sipfrag NOTIFY that ends its
+    /// subscription. `code` is the status in it (200-699), a 2xx for a
+    /// transfer that succeeded; `reason` its reason phrase, used as given.
+    ///
+    /// Report before releasing the referrer's leg: the NOTIFY travels on its
+    /// dialog, and afterwards this raises `code == "not_found"`. With no such
+    /// transfer open on the call it raises `code == "invalid_state"`.
+    #[pyo3(signature = (code, reason=None))]
+    fn complete_refer<'py>(
+        &self,
+        py: Python<'py>,
+        code: u16,
+        reason: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let call = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            call.complete_refer(code, reason.as_deref())
                 .await
                 .map_err(to_pyerr)
         })

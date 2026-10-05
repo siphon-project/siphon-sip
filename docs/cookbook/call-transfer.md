@@ -428,13 +428,76 @@ Two cases this does not cover, so they are not read into the above:
   `dial {on_answer: "bridge"}`) is two calls joined at the media engine, and the
   party that stays when one is transferred is on the other call. A
   siphon-terminated transfer re-pairs the legs of one call, so it does not move
-  that party. `TransferRequested` names the hosted dialog and the channel it is
-  bridged with (`replaces.local`), which is what an application needs to
-  re-bridge the two remaining channels itself.
+  that party. The application does it instead: `TransferRequested` names the
+  hosted dialog and the channel it is bridged with (`replaces.local`), and
+  `accept_refer {mode: "controller"}` lets it re-bridge the two remaining
+  channels and report the result. See
+  [the recipe below](#attended-transfer-between-calls-a-controller-bridged).
 - A script-free deployment (`control.inbound`) hands an INVITE carrying
   `Replaces` to its application as a new call. `StasisStart` names the hosted
   dialog it asked to join (`replaces`); the takeover described under "The other
   half" runs only after a script's `@b2bua.on_invite` admitted the INVITE.
+
+### Attended transfer between calls a controller bridged
+
+Alice called in and the application bridged her to Bob. Bob then called
+Carol through the application too, and now wants Alice and Carol talking.
+That is four calls, each with a channel of its own, in two bridges:
+
+```
+  alice <==== bridge ====> bob-1        (Bob talking to Alice)
+  bob-2 <==== bridge ====> carol        (Bob talking to Carol)
+```
+
+Bob's phone sends a `REFER` on `bob-1` whose `Refer-To` carries a `Replaces`
+naming his dialog on `bob-2`. siphon cannot do this transfer by re-pairing
+the legs of one call, because the two parties who stay are on two other
+calls. The application can, and tells Bob's phone how it went:
+
+1. `TransferRequested` arrives on `bob-1`. `replaces.local` says which
+   hosted dialog Bob named: `channel` is `bob-2`, and `bridged_with` is
+   `carol`, the party to connect. The party on the other side of the
+   REFER's own call is `alice`, which the application knows from the bridge
+   it made.
+2. `accept_refer {mode: "controller"}` on `bob-1`. Bob's phone gets `202`
+   and a `NOTIFY` saying `100 Trying`. Nothing is dialled.
+3. `unbridge` on `alice` and on `carol`, and wait for `ChannelUnbridged` on
+   each. Then `bridge` `alice` with `carol`.
+4. On `ChannelBridged`, `complete_refer {code: 200}` on `bob-1`. Bob's
+   phone gets the `NOTIFY` saying `200 OK` and knows the transfer is done.
+   On `BridgeFailed`, report the failure instead, for example
+   `complete_refer {code: 503}`, and put the bridges back.
+5. `hangup` on `bob-1` and `bob-2`.
+
+As frames on the control connection, with the event that each step waits for:
+
+```text
+<- event   TransferRequested  channel=bob-1
+           replaces.local = {channel: "bob-2", leg: "a", bridged_with: "carol"}
+-> command accept_refer    channel=bob-1  {"mode": "controller", "timeout": 30}
+-> command unbridge        channel=alice
+-> command unbridge        channel=carol
+<- event   ChannelUnbridged  channel=alice
+<- event   ChannelUnbridged  channel=carol
+-> command bridge          channel=alice  {"with": "carol"}
+<- event   ChannelBridged    channel=alice
+-> command complete_refer  channel=bob-1  {"code": 200}
+-> command hangup          channel=bob-1
+-> command hangup          channel=bob-2
+```
+
+The order of the last three commands matters. The `NOTIFY` that
+`complete_refer` sends travels on `bob-1`'s dialog, so it has to go before
+`bob-1` is hung up. Afterwards there is no dialog to send it in and
+`complete_refer` answers `not_found`; Bob's phone never hears the transfer
+worked and may keep the consultation call on hold until its own timer
+runs out.
+
+If the application takes longer than `timeout` (default 60 s, at most 180),
+siphon reports `503` to the referrer itself. If Bob hangs up before the
+report, the subscription ends with his call and there is nothing to
+report. Full rules are in the
+[control plane reference](../reference/control-plane.md#a-transfer-the-application-carries-out).
 
 ## 3. Inbound transparent transfer
 

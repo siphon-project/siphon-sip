@@ -131,6 +131,8 @@ mod control_originate_aor_tests;
 #[cfg(test)]
 mod control_originate_tests;
 #[cfg(test)]
+mod control_refer_controller_tests;
+#[cfg(test)]
 mod delayed_offer_ack_tests;
 #[cfg(test)]
 mod dial_bridge_test_harness;
@@ -240,17 +242,19 @@ pub use b2bua::{
 // `public_api_surface` all the same — the point of the count is that the module
 // does not grow a surface by accident, published or not.
 pub(crate) use b2bua::{
-    b2bua_accept_refer_call_dialling, b2bua_cancel_dial_with_state, b2bua_dial_call,
+    b2bua_accept_refer_call_dialling, b2bua_accept_refer_controller_with_state,
+    b2bua_cancel_dial_with_state, b2bua_complete_refer_with_state, b2bua_dial_call,
     b2bua_drop_call, b2bua_media_profile, b2bua_originate_group_create,
     b2bua_originate_group_start, b2bua_replace_peer_dialling, b2bua_set_session_timer,
     bridge_calls_with_state, dial_answered_payload, dial_branch_identity, dial_branch_summary,
     dial_bridge_caller, dial_bridge_join, dial_bridge_refuse_phone, dial_bridge_spec,
-    dial_bridge_start, dial_targets_for_aor, DialBridgeCaller, DialBridgeListener, DialBridgePlan,
-    DialBridgeRefusal, DialBridgeSender, DialBridgeSignal, DialBridgeStartError, DialCancelRefusal,
-    DialError, DialShaping, DialTarget, DispatcherHandle, DropOutcome, OriginateGroupAnswers,
-    OriginateGroupFailure, OriginateGroupSink, OriginateGroupSpec, OriginateGroupStrategy,
-    OriginateGroupWinner, OriginateLegProgress, ReplacementDial, RunningDispatcher,
-    DIAL_BRIDGE_CALLER_GONE, DIAL_CANCELLED, DIAL_RINGBACK_ORIGIN,
+    dial_bridge_start, dial_targets_for_aor, ControllerReferRefusal, DialBridgeCaller,
+    DialBridgeListener, DialBridgePlan, DialBridgeRefusal, DialBridgeSender, DialBridgeSignal,
+    DialBridgeStartError, DialCancelRefusal, DialError, DialShaping, DialTarget, DispatcherHandle,
+    DropOutcome, OriginateGroupAnswers, OriginateGroupFailure, OriginateGroupSink,
+    OriginateGroupSpec, OriginateGroupStrategy, OriginateGroupWinner, OriginateLegProgress,
+    ReplacementDial, RunningDispatcher, DIAL_BRIDGE_CALLER_GONE, DIAL_CANCELLED,
+    DIAL_RINGBACK_ORIGIN,
 };
 pub use charging::{ro_authorize_b2bua, RoAuthorizeOutcome};
 pub(crate) use liveness::liveness_on_flow_close;
@@ -615,6 +619,7 @@ pub async fn run(
         ro_sessions: Arc::new(DashMap::new()),
         cdr_sessions: Arc::new(DashMap::new()),
         pending_inbound_refer: Arc::new(PendingInboundReferStore::default()),
+        controller_refers: Arc::new(ControllerReferStore::default()),
         deferred_referrer_bye: Arc::new(DeferredReferrerByeStore::default()),
         parse_error_log: Arc::new(ParseErrorLimiter::default()),
         // Interception is enforced here, not in the script. `LI_MANAGER` is

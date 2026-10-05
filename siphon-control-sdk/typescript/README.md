@@ -109,6 +109,7 @@ await client.command("sip", "answer", { channel: "ch1" }, { code: 200 });
 | `removeHeader(name)` | `remove_header` (`sip`) | ‡ |
 | `acceptRefer(options?)` | `accept_refer` (`sip`) | ‡ |
 | `rejectRefer(code, reason?)` | `reject_refer` (`sip`) | ‡ |
+| `completeRefer(code, reason?)` | `complete_refer` (`sip`) | report how a transfer accepted with `acceptRefer({ mode: "controller" })` went: the referrer gets the sipfrag NOTIFY that ends its subscription, a 2xx for success. Report before releasing the referrer's leg |
 | `bridge(withChannel, options?)` | `bridge` (`sip`) | join two answered legs; the verdict arrives as `ChannelBridged` / `BridgeFailed` |
 | `unbridge(reason?)` | `unbridge` (`sip`) | break the bridge — both legs stay answered, owned and held |
 | `dial(targets, options?)` | `dial` (`sip`) | ring B-legs while the caller stays **unanswered** and this app keeps the channel. A target is `{uri}` (dialed as written) or `{aor}` (forked to every registered contact over its own flow); one naming both, or neither, throws. `onAnswer: "bridge"` rings phones for an **answered**, anchored caller and bridges the first to pick up, with `ringback` playing meanwhile; `ringback` without it throws |

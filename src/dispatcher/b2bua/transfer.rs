@@ -368,12 +368,7 @@ pub fn b2bua_refer_accept(
     use crate::script::api::call::ReferMode;
 
     // The subscription `id` token (RFC 3515 §2.4.4) is the REFER's CSeq number.
-    let refer_cseq = message
-        .headers
-        .get("CSeq")
-        .and_then(|value| value.split_whitespace().next())
-        .and_then(|number| number.parse::<u32>().ok())
-        .unwrap_or(1);
+    let refer_cseq = refer_subscription_id(&message);
 
     match mode {
         ReferMode::Transparent => {
@@ -458,83 +453,10 @@ pub fn b2bua_refer_accept(
                 }
             });
 
-            // 202 Accepted to the referrer, on the flow the REFER arrived on,
-            // followed by the first NOTIFY (sipfrag 100 Trying) opening the
-            // implicit subscription.
-            //
-            // RFC 3515 §2.4.4 orders these: the 202 is what tells the referrer
-            // the subscription exists, so a NOTIFY that overtakes it can be
-            // rejected as being for an unknown subscription. They are enqueued
-            // as one ordered unit because two separate sends do NOT order on
-            // UDP — the workers share the outbound channel and each owns its own
-            // SO_REUSEPORT socket, so the NOTIFY could and did win the race.
-            let mut accepted = build_response(
-                &message,
-                202,
-                "Accepted",
-                state.server_header.as_deref(),
-                &[],
-            );
-            let notify_cseq = state.call_actors.reserve_leg_cseq(call_id, from_a_leg);
-            let origin_leg = state.call_actors.clone_leg(call_id, from_a_leg);
-
-            // A REFER creates a subscription, so its 2xx is dialog-forming and
-            // `Contact` is mandatory in it — RFC 3515 §2.2 marks Contact `m` for
-            // both REFER and its 2xx ("REFER creates a dialog, and MAY be
-            // Record-Routed, hence MUST contain a single Contact header field
-            // value"). `build_response` copies only the mandatory *echo*
-            // headers, which is right for a plain response and one header short
-            // for this one. It is the leg's own local contact, the same value
-            // the NOTIFYs below carry, so the referrer sees one target for the
-            // whole subscription.
-            if let Some(contact) = origin_leg
-                .as_ref()
-                .and_then(|leg| leg.dialog.local_contact.clone())
-            {
-                if !accepted.headers.has("Contact") {
-                    accepted.headers.set("Contact", contact);
-                }
-            }
-            advertise_supported_options(&mut accepted.headers);
-
-            let mut ordered = vec![accepted];
-
-            if let (Some(cseq), Some(leg)) = (notify_cseq, origin_leg) {
-                let extra_headers = [
-                    (
-                        "Event",
-                        crate::b2bua::transfer::refer_event_header(refer_cseq),
-                    ),
-                    (
-                        "Subscription-State",
-                        crate::b2bua::transfer::subscription_state_header(
-                            &crate::b2bua::transfer::TransferState::Trying,
-                            60,
-                        ),
-                    ),
-                ];
-                if let Some(notify) = build_b2bua_in_dialog_request(
-                    &leg,
-                    state,
-                    Method::Notify,
-                    cseq,
-                    &extra_headers,
-                    Some((
-                        "message/sipfrag",
-                        crate::b2bua::transfer::build_sipfrag_body(100, "Trying").into_bytes(),
-                    )),
-                ) {
-                    ordered.push(notify);
-                }
-            }
-
-            send_messages_in_order_from(
-                ordered,
-                inbound.transport,
-                inbound.remote_addr,
-                inbound.connection_id,
-                Some(inbound.local_addr),
-                state,
+            // 202 Accepted to the referrer, then the first NOTIFY (sipfrag 100
+            // Trying) opening the implicit subscription, as one ordered unit.
+            send_refer_accepted(
+                &inbound, &message, call_id, from_a_leg, refer_cseq, 60, state,
             );
 
             // RFC 3892 §3: the triggered INVITE carries the REFER's own
@@ -1034,63 +956,16 @@ pub fn b2bua_complete_terminated_transfer(
     // no referrer to tell and the sipfrag would arrive at a peer that never
     // asked for one. The BYE is unconditional on origin — that leg is being
     // replaced either way.
-    let mut referrer_messages: Vec<SipMessage> = Vec::new();
-    let mut referrer_route: Option<(Transport, SocketAddr, ConnectionId, Option<SocketAddr>)> =
-        None;
-    // The terminating NOTIFY's own branch, once one is built — the key the BYE
-    // is parked under until the referrer answers it.
-    let mut notify_branch: Option<String> = None;
-
-    let notify_cseq = if referrer_gone || !origin.notifies_referrer() {
+    let final_notify = if referrer_gone || !origin.notifies_referrer() {
         None
     } else {
-        state
-            .call_actors
-            .reserve_leg_cseq(call_id, referrer_on_a_leg)
+        build_refer_final_notify(call_id, referrer_on_a_leg, event_id, 200, "OK", state)
     };
-    if let Some(cseq) = notify_cseq {
-        if let Some(referrer_leg) = state.call_actors.clone_leg(call_id, referrer_on_a_leg) {
-            let extra_headers = [
-                (
-                    "Event",
-                    crate::b2bua::transfer::refer_event_header(event_id),
-                ),
-                (
-                    "Subscription-State",
-                    crate::b2bua::transfer::subscription_state_header(
-                        &crate::b2bua::transfer::TransferState::Succeeded,
-                        0,
-                    ),
-                ),
-            ];
-            if let Some(notify) = build_b2bua_in_dialog_request(
-                &referrer_leg,
-                state,
-                Method::Notify,
-                cseq,
-                &extra_headers,
-                Some((
-                    "message/sipfrag",
-                    crate::b2bua::transfer::build_sipfrag_body(200, "OK").into_bytes(),
-                )),
-            ) {
-                let (dest, transport) = resolve_in_dialog_destination(
-                    &referrer_leg.dialog.route_set,
-                    state,
-                    referrer_leg.transport.remote_addr,
-                    referrer_leg.transport.transport,
-                );
-                referrer_route = Some((
-                    transport,
-                    dest,
-                    referrer_leg.transport.connection_id,
-                    referrer_leg.transport.local_addr,
-                ));
-                notify_branch = top_via_branch(&notify).map(str::to_string);
-                referrer_messages.push(notify);
-            }
-        }
-    }
+    // The terminating NOTIFY's own branch, once one is built — the key the BYE
+    // is parked under until the referrer answers it.
+    let mut notify_branch = final_notify
+        .as_ref()
+        .and_then(|notify| top_via_branch(&notify.message).map(str::to_string));
 
     // Promote the target into the surviving pair, then BYE the referrer leg.
     // The promotion runs either way — it is what makes the target the surviving
@@ -1146,13 +1021,13 @@ pub fn b2bua_complete_terminated_transfer(
         }
     }
 
-    if let Some((transport, dest, connection_id, local_addr)) = referrer_route {
+    if let Some(notify) = final_notify {
         send_messages_in_order_from(
-            referrer_messages,
-            transport,
-            dest,
-            connection_id,
-            local_addr,
+            vec![notify.message],
+            notify.transport,
+            notify.destination,
+            notify.connection_id,
+            notify.local_addr,
             state,
         );
     }
@@ -1377,52 +1252,18 @@ pub fn b2bua_fail_terminated_transfer(
     // has no subscriber, and the leg it was going to replace is still on the
     // call, so telling it anything would be reporting on a transfer it never
     // asked for.
-    if let Some(cseq) = origin
-        .notifies_referrer()
-        .then(|| {
-            state
-                .call_actors
-                .reserve_leg_cseq(call_id, referrer_on_a_leg)
-        })
-        .flatten()
-    {
-        if let Some(referrer_leg) = state.call_actors.clone_leg(call_id, referrer_on_a_leg) {
-            let extra_headers = [
-                (
-                    "Event",
-                    crate::b2bua::transfer::refer_event_header(event_id),
-                ),
-                (
-                    "Subscription-State",
-                    crate::b2bua::transfer::subscription_state_header(&failure, 0),
-                ),
-            ];
-            if let Some(notify) = build_b2bua_in_dialog_request(
-                &referrer_leg,
+    if origin.notifies_referrer() {
+        if let Some(notify) =
+            build_refer_final_notify(call_id, referrer_on_a_leg, event_id, code, &reason, state)
+        {
+            send_message_from(
+                notify.message,
+                notify.transport,
+                notify.destination,
+                notify.connection_id,
+                notify.local_addr,
                 state,
-                Method::Notify,
-                cseq,
-                &extra_headers,
-                Some((
-                    "message/sipfrag",
-                    crate::b2bua::transfer::build_sipfrag_body(code, &reason).into_bytes(),
-                )),
-            ) {
-                let (dest, transport) = resolve_in_dialog_destination(
-                    &referrer_leg.dialog.route_set,
-                    state,
-                    referrer_leg.transport.remote_addr,
-                    referrer_leg.transport.transport,
-                );
-                send_message_from(
-                    notify,
-                    transport,
-                    dest,
-                    referrer_leg.transport.connection_id,
-                    referrer_leg.transport.local_addr,
-                    state,
-                );
-            }
+            );
         }
     }
 

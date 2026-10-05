@@ -76,6 +76,7 @@ describe("SipVerb wire tokens + event names", () => {
     expect(SipVerb.RemoveHeader).toBe("remove_header");
     expect(SipVerb.AcceptRefer).toBe("accept_refer");
     expect(SipVerb.RejectRefer).toBe("reject_refer");
+    expect(SipVerb.CompleteRefer).toBe("complete_refer");
     expect(SipVerb.Bridge).toBe("bridge");
     expect(SipVerb.Unbridge).toBe("unbridge");
     expect(SipVerb.ReplacePeer).toBe("replace_peer");
@@ -561,6 +562,31 @@ describe("Call verbs map to the in-process-mirrored wire verbs", () => {
         },
       },
       { module: MODULE_SIP, verb: "reject_refer", target: { channel: "ch1" }, args: { code: 603, reason: "Decline" } },
+    ]);
+  });
+
+  it("a transfer the application carries out is accepted, then reported", async () => {
+    const transport = new RecordingTransport();
+    const call = makeCall(transport);
+    await call.acceptRefer({ mode: "controller" });
+    await call.acceptRefer({ mode: "controller", timeout: 90 });
+    await call.completeRefer(200);
+    await call.completeRefer(486, "Busy Here");
+    expect(transport.calls).toEqual([
+      { module: MODULE_SIP, verb: "accept_refer", target: { channel: "ch1" }, args: { mode: "controller" } },
+      {
+        module: MODULE_SIP,
+        verb: "accept_refer",
+        target: { channel: "ch1" },
+        args: { mode: "controller", timeout: 90 },
+      },
+      { module: MODULE_SIP, verb: "complete_refer", target: { channel: "ch1" }, args: { code: 200 } },
+      {
+        module: MODULE_SIP,
+        verb: "complete_refer",
+        target: { channel: "ch1" },
+        args: { code: 486, reason: "Busy Here" },
+      },
     ]);
   });
 

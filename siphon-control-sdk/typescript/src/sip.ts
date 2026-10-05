@@ -173,12 +173,26 @@ function insertTransferIdentity(
 /**
  * Options for {@link Call.acceptRefer}. The {@link TransferIdentity} fields and
  * an `{ aor }` target apply to `mode: "terminate"`, which dials a leg; the
- * server refuses them with `"transparent"`, which relays the REFER.
+ * server refuses them with `"transparent"`, which relays the REFER, and with
+ * `"controller"`, which dials nothing and takes `timeout` only.
  */
 export interface AcceptReferOptions extends TransferIdentity {
   target?: TransferTarget;
   nextHop?: string;
-  mode?: "terminate" | "transparent";
+  /**
+   * Who carries the transfer out. `"terminate"`: the server dials the target.
+   * `"transparent"`: it relays the REFER to the far end. `"controller"`: it
+   * answers `202`, sends the first sipfrag NOTIFY and dials nothing — this
+   * application moves the parties with its other verbs and then reports with
+   * {@link Call.completeRefer}.
+   */
+  mode?: "terminate" | "transparent" | "controller";
+  /**
+   * With `mode: "controller"`, how many seconds there are to report in
+   * (default 60, at most 180). Past it the server reports `503` to the
+   * referrer itself. The server refuses it with any other mode.
+   */
+  timeout?: number;
   /**
    * Media profile for the pairing the transfer creates.
    *
@@ -1227,6 +1241,9 @@ export class Call {
    * `b2bua.default_refer_mode`. No pending REFER (already decided, timed out, or
    * the call is gone) rejects with `code === "not_found"`.
    *
+   * `mode: "controller"` leaves the transfer to this application — see
+   * {@link AcceptReferOptions.mode} and {@link Call.completeRefer}.
+   *
    * `profile` names the media profile for the pairing the transfer creates —
    * see {@link AcceptReferOptions.profile}, which is required at an SRTP edge.
    */
@@ -1244,8 +1261,32 @@ export class Call {
     if (options?.profile !== undefined) {
       args.profile = options.profile;
     }
+    if (options?.timeout !== undefined) {
+      args.timeout = options.timeout;
+    }
     insertTransferIdentity(args, options);
     await this.sip(SipVerb.AcceptRefer, args);
+  }
+
+  /**
+   * Report how a transfer accepted with `acceptRefer({ mode: "controller" })`
+   * went: the server sends the referrer the sipfrag NOTIFY that ends its
+   * subscription. `code` is the status in it (200-699), a 2xx for a transfer
+   * that succeeded, and `reason` its reason phrase, used as given. Nothing
+   * else happens to the call.
+   *
+   * **Report before releasing the referrer's leg.** The NOTIFY travels on its
+   * dialog, so once that leg is hung up or replaced this rejects with
+   * `code === "not_found"`. With no such transfer open on the call — already
+   * reported, past its deadline, or its referrer hung up — it rejects with
+   * `code === "invalid_state"` (`details.reason === "no_transfer_pending"`).
+   */
+  async completeRefer(code: number, reason?: string): Promise<void> {
+    const args: Record<string, unknown> = { code };
+    if (reason !== undefined) {
+      args.reason = reason;
+    }
+    await this.sip(SipVerb.CompleteRefer, args);
   }
 
   /**

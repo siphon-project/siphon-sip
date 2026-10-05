@@ -288,8 +288,9 @@ what lets a refused verb be lined up against a capture, a CDR and HEP.
 | `hangup` | sip | `{reason?}` | BYE an answered call, or reject an unanswered one |
 | `drop` | sip | `{reason?, ban?}` | abandon an **unanswered** call with no final response and no CANCEL on the wire (the `100 Trying` siphon sent when the INVITE arrived has already gone) and release it; `ban: true` also scores the caller's source toward an auto-ban; refused (`invalid_state`) on an answered call, whose dialog is owed a BYE, and on an `originate {aor}` whose phones are still ringing, whose INVITEs are owed a CANCEL (`hangup`). See [dropping unsolicited traffic](#drop--abandon-a-call-without-answering-it) |
 | `refer` | sip | `{to, replaces?}` | in-dialog REFER on the A-leg |
-| `accept_refer` | sip | `{target?, next_hop?, mode?, profile?, number_policy?, format?, from?, from_display?, p_asserted_identity?, privacy?, headers?}` | accept a pending inbound REFER (from a `TransferRequested` event) and run the transfer. `target` is a URI, `{uri}` or `{aor}` — see [inbound REFER](#an-inbound-refer-on-a-controlled-call) |
+| `accept_refer` | sip | `{target?, next_hop?, mode?, timeout?, profile?, number_policy?, format?, from?, from_display?, p_asserted_identity?, privacy?, headers?}` | accept a pending inbound REFER (from a `TransferRequested` event) and run the transfer. `mode` is `terminate`, `transparent` or `controller`; with `controller` siphon answers `202` and dials nothing, the app carries the transfer out and reports with `complete_refer` within `timeout` seconds. `target` is a URI, `{uri}` or `{aor}` — see [inbound REFER](#an-inbound-refer-on-a-controlled-call) |
 | `reject_refer` | sip | `{code?, reason?}` | reject a pending inbound REFER with a final non-2xx (default `603 Decline`) |
+| `complete_refer` | sip | `{code, reason?}` | report how a transfer accepted with `accept_refer {mode: "controller"}` went: siphon sends the referrer the sipfrag NOTIFY that ends its subscription, with this status (200-699, a 2xx for success). Report before releasing the referrer's leg — see [inbound REFER](#a-transfer-the-application-carries-out) |
 | `bridge` | sip | `{with, on_peer_hangup?, profile?}` | join this channel to another the app owns; the reply says the media was negotiated, `ChannelBridged` says the audio meets. `profile` names one media profile for the pair — see [`bridge`](#joining-two-legs-bridge) |
 | `unbridge` | sip | `{reason?}` | break a bridge — both legs stay answered, owned and held |
 | `replace_peer` | sip | `{target, next_hop?, replace_a_leg?, profile?, number_policy?, format?, timeout?, from?, from_display?, p_asserted_identity?, privacy?, headers?}` | swap one party of this answered call for a freshly dialed target, no REFER involved; the replaced leg stays up while the target rings, `PeerReplaced` says the swap landed |
@@ -877,6 +878,10 @@ The app decides with:
   They and `{aor}` apply to `terminate`; `transparent` relays the REFER, dials
   no leg, and refuses them `bad_request` rather than accepting and ignoring
   them.
+
+  `mode: "controller"` is the third mode, and the one where siphon does no
+  transferring at all. See
+  [below](#a-transfer-the-application-carries-out).
 - `reject_refer` `{code?, reason?}` — decline with a final non-2xx (default
   `603 Decline`).
 
@@ -886,6 +891,79 @@ left pending — the referrer is always answered (RFC 3515 §2.4.2). A bad `mode
 answers `bad_request`; a decision for a call with no pending REFER (already
 decided, timed out, or gone) answers `not_found`. A REFER on an **uncontrolled**
 call is unaffected — it still runs the Python `@b2bua.on_refer` path.
+
+#### A transfer the application carries out
+
+`terminate` has siphon dial the target and `transparent` has it relay the
+REFER. Neither fits a transfer the application has to perform with its own
+verbs: joining two calls it bridged, or sending the call out through a flow
+of its own. For those, accept with `mode: "controller"`:
+
+```json
+{"verb": "accept_refer", "target": {"channel": "c1"},
+ "args": {"mode": "controller", "timeout": 30}}
+```
+
+siphon answers the REFER `202 Accepted`, sends the referrer the first NOTIFY
+of its subscription (a `message/sipfrag` body of `SIP/2.0 100 Trying`,
+`Subscription-State: active;expires=<timeout>`, RFC 3515 §2.4.4), and stops.
+It dials nothing, moves no leg and changes no call state. The reply is
+`{transfer: "accepted", mode: "controller", timeout}`, with the timeout
+siphon will apply.
+
+The application then moves the parties with `bridge`, `unbridge`,
+`replace_peer` or `dial`, and says how it went:
+
+```json
+{"verb": "complete_refer", "target": {"channel": "c1"},
+ "args": {"code": 200}}
+```
+
+`code` is required, 200 to 699. siphon sends the NOTIFY that ends the
+subscription: a sipfrag of that status with `Subscription-State:
+terminated`. A 2xx tells the referrer the transfer succeeded, anything else
+that it failed. `reason` is the reason phrase in the sipfrag, used as given;
+without one siphon uses its own phrase for the status (`486` is `Busy Here`,
+a status it has no phrase for is `Error`). The reply is `{transfer:
+"completed", code}`. `complete_refer` touches nothing but the subscription.
+
+Rules:
+
+- **Report before you release the referrer.** The NOTIFY travels on the
+  referrer's dialog. Once the application has hung that leg up, or replaced
+  it, the dialog is gone and there is nothing to send the report in:
+  `complete_refer` answers `not_found`. So `complete_refer` first, then
+  `hangup`.
+- `timeout` is how many seconds the application has to report, default 60,
+  capped at 180. A value that is not a positive whole number is
+  `bad_request`. Past the deadline siphon reports for it: a sipfrag `503
+  Service Unavailable` with `Subscription-State: terminated`, so the
+  referrer is told the transfer did not happen instead of waiting on it. A
+  `complete_refer` after that is refused.
+- With no transfer awaiting a report on the call, `complete_refer` answers
+  `invalid_state` with `error.details: {verb: "complete_refer", reason:
+  "no_transfer_pending"}`. That covers one already reported, one past its
+  deadline, and one whose referrer hung up. A call that is gone answers
+  `not_found`.
+- If the referrer hangs up first, its BYE is answered and the subscription
+  ends with its dialog. No NOTIFY is sent.
+- Until the report, a further REFER on the same call is answered `491
+  Request Pending` and is not shown to the application. A retransmission of
+  the accepted REFER is answered `202` again.
+- `mode: "controller"` takes `timeout` and nothing else. `target`,
+  `next_hop`, `profile`, `number_policy`, `format`, `from`, `from_display`,
+  `p_asserted_identity`, `privacy` and `headers` all describe a leg siphon
+  would dial, and it dials none, so any of them is `bad_request`
+  (`error.details: {verb, argument, reason: "not_dialled"}`). The other
+  modes refuse `timeout` for the same reason.
+- `replace_peer` is not held off by a transfer in this mode. It is refused
+  only while another replacement is in flight.
+- The mode exists on the control plane only. A script has no
+  `complete_refer`, so `call.accept_refer(mode=…)` and
+  `b2bua.default_refer_mode` do not take it.
+
+A worked attended transfer between two bridged calls is in the
+[call transfer cookbook](../cookbook/call-transfer.md#attended-transfer-between-calls-a-controller-bridged).
 
 ## Placing a call: `originate`
 

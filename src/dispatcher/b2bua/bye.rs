@@ -76,6 +76,10 @@ pub fn handle_b2bua_bye(inbound: InboundMessage, message: SipMessage, state: &Di
         }
     };
 
+    // A transfer this party asked for and its controller is still carrying out
+    // has nobody left to be reported to.
+    controller_refer_referrer_left(state, &call_id, from_a_leg);
+
     // The referrer of an in-flight siphon-terminated transfer hanging up is NOT
     // the end of this call (RFC 5589 §7: the transferor is free to end its
     // dialog as soon as the REFER is accepted — Microsoft Teams BYEs within a
