@@ -491,6 +491,29 @@ pub(super) fn handle_cancel(
         return;
     }
 
+    // RFC 3261 §9.2: a CANCEL is matched to the INVITE's server transaction,
+    // and one that matches is answered 200 whatever became of the INVITE. The
+    // session goes with the INVITE's final response; its server transaction
+    // outlives it (`Completed` until the ACK, `Confirmed` until Timer I). A
+    // CANCEL arriving in that time still has its transaction, and "has no
+    // effect on the processing of the original request".
+    if state
+        .transaction_manager
+        .invite_server_has_final(&invite_server_key)
+    {
+        debug!(uac_branch = %uac_branch, "CANCEL for an INVITE that already has its final response — answered 200, no effect (RFC 3261 §9.2)");
+        let response = build_response(&message, 200, "OK", state.server_header.as_deref(), &[]);
+        send_message_from(
+            response,
+            inbound.transport,
+            inbound.remote_addr,
+            inbound.connection_id,
+            Some(inbound.local_addr),
+            state,
+        );
+        return;
+    }
+
     // No matching session or B2BUA call
     debug!(uac_branch = %uac_branch, "CANCEL for unknown transaction");
     let response = build_response(

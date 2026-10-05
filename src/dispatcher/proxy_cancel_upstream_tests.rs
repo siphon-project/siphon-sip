@@ -145,3 +145,58 @@ async fn a_cancel_after_the_final_response_is_answered_and_changes_nothing() {
         "and the call is as it was"
     );
 }
+
+/// The session of an INVITE goes with its final response, and its server
+/// transaction stays a while longer (RFC 3261 §17.2.1: `Completed` until the
+/// ACK, `Confirmed` until Timer I). A CANCEL arriving then still matches the
+/// INVITE's transaction, so §9.2 answers it `200`, and it has no effect.
+/// Once the transaction is gone too, the CANCEL matches nothing and is
+/// answered `481`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cancel_after_the_session_is_gone_is_answered_by_what_the_transaction_still_knows() {
+    let proxy = relaying_proxy(RINGING, "");
+    let (raw, invites) = call(&proxy, "cancel-after-failure@example.com");
+    let to_ringing = find(&invites, RINGING).clone();
+    let caller_invite = parse_sip_message_bytes(raw.as_bytes()).expect("the INVITE parses");
+    answers(&proxy, RINGING, &to_ringing, 486, "Busy Here");
+    let sent = proxy.wire();
+    assert_eq!(responses_to_caller(&sent), [486]);
+    let busy = sent
+        .iter()
+        .find(|sent| sent.message.status_code() == Some(486))
+        .map(|sent| sent.message.clone())
+        .expect("the 486");
+    assert_eq!(proxy.state.session_store.session_count(), 0);
+
+    // Completed: the 486 is out and not yet ACKed.
+    caller_cancels(&proxy, &raw);
+    let sent = proxy.wire();
+    assert_eq!(responses_to_caller(&sent), [200], "the CANCEL's 200, alone");
+    assert!(cancels_to(&sent, RINGING).is_empty());
+
+    // Confirmed: the caller ACKed the 486.
+    proxy.request(CALLER, &caller_acks(&raw, &header(&busy, "To")));
+    let _ = proxy.wire();
+    caller_cancels(&proxy, &raw);
+    assert_eq!(responses_to_caller(&proxy.wire()), [200]);
+
+    // Gone: nothing knows the INVITE any more.
+    fire(&proxy, &caller_invite, TimerName::I);
+    caller_cancels(&proxy, &raw);
+    assert_eq!(responses_to_caller(&proxy.wire()), [481]);
+}
+
+/// An answered INVITE's server transaction ends with its 2xx, so a CANCEL
+/// after the answer matches no transaction: `481` (RFC 3261 §9.2).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cancel_after_the_answer_matches_no_transaction() {
+    let proxy = relaying_proxy(RINGING, "");
+    let (raw, invites) = call(&proxy, "cancel-after-2xx@example.com");
+    let to_ringing = find(&invites, RINGING).clone();
+    answers(&proxy, RINGING, &to_ringing, 200, "OK");
+    assert_eq!(responses_to_caller(&proxy.wire()), [200]);
+    caller_cancels(&proxy, &raw);
+    let sent = proxy.wire();
+    assert_eq!(responses_to_caller(&sent), [481]);
+    assert!(cancels_to(&sent, RINGING).is_empty());
+}

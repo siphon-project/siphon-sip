@@ -311,6 +311,16 @@ entry, but a working config keeps working.
   resets the timer by storing the time it arrived, so the response path pays
   one clock read per 101-199 and no timer traffic, and a call that ends
   within 32 s never has a Timer C at all.
+- **A CANCEL arriving just after a proxied INVITE failed is answered `200`,
+  not `481`.** RFC 3261 §9.2 matches a CANCEL to the INVITE's server
+  transaction and answers `200` when it finds one. The proxy looked for its
+  session instead, which goes with the INVITE's final response, while the
+  server transaction stays until that response is ACKed and a little after.
+  A CANCEL that crossed a `486` on the wire was therefore told the
+  transaction did not exist. It is now answered `200`, with no other effect,
+  for as long as the INVITE's server transaction holds its final response. A
+  CANCEL that matches no transaction at all, after an answered INVITE's has
+  ended with its 2xx for one, is still answered `481`.
 - **A transfer whose target cannot be dialled ends its subscription and
   leaves the call free.** A siphon-terminated REFER answers `202` and sends
   the `100 Trying` NOTIFY before it dials. When no INVITE could then be sent

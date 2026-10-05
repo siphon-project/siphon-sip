@@ -456,6 +456,19 @@ impl TransactionManager {
         }
     }
 
+    /// Whether `key` is an INVITE server transaction that has sent its final
+    /// response and is still there for it (`Completed`, waiting for the ACK,
+    /// or `Confirmed`, absorbing its repeats; RFC 3261 §17.2.1).
+    pub fn invite_server_has_final(&self, key: &TransactionKey) -> bool {
+        self.transactions.get(key).is_some_and(|entry| {
+            matches!(
+                &**entry.value(),
+                Transaction::Ist(ist)
+                    if matches!(ist.state, IstState::Completed | IstState::Confirmed)
+            )
+        })
+    }
+
     /// Whether `key` is an INVITE client transaction still owed its final
     /// response (`Calling` or `Proceeding`).
     pub fn invite_client_is_pending(&self, key: &TransactionKey) -> bool {
