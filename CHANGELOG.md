@@ -57,9 +57,59 @@ entry, but a working config keeps working.
   `{"to": ...}`, `to?`). In the Rust SDK this adds a field to both
   `DialTarget` variants, which breaks code that matches or builds them by
   field.
+- **`media.sdp_keep_session_name` leaves the SDP `s=` line alone on a B2BUA
+  call.** siphon replaces the `o=` identity and the `s=` session name of the
+  SDP it relays between the legs with `media.sdp_name`. Some peers use the
+  session name as a marker of their own and need it to cross unchanged. With
+  `sdp_keep_session_name: true` the session name is relayed as the far side
+  wrote it, and `o=` is still rewritten. Default `false`, so nothing changes
+  for an existing config.
 
 ### Fixed
 
+- **A bridged party's media ingress is pinned by its own profile, not the
+  other party's.** In a `bridge` (and a `dial {on_answer: "bridge"}`, which
+  ends in one) each media-engine command carries one party's SDP and is shaped
+  by the other party's profile, and the `received_from` policy was read from
+  that shaping profile. A party behind NAT, whose SDP names an address its
+  media does not come from, was therefore pinned to its signalling source only
+  if the party it was joined to had a profile asking for that. Joined to a
+  caller answered with a profile that does not, its answer reached the engine
+  with no source hint, the engine expected its media from the address in its
+  SDP, and the call was silent in both directions. The reverse held too: a
+  party whose profile asks for no hint was pinned to its signalling source by
+  the other's, which gates out one whose media comes from a different host
+  than its signalling. The hint now follows the profile of the party whose SDP
+  the command carries, on the bridge's offer and answer and on every re-offer
+  relayed across the formed pair, while the rest of each command is shaped as
+  before. `bridge {profile}` is unchanged: the pair profile describes both
+  parties, its `offer` half the anchor and its `answer` half the `with` leg.
+- **siphon builds with Rust 1.93.** One label list in the call-cost
+  metric mixed a `&String` with a `&str`, which current compilers coerce and
+  1.93 rejects as mismatched types. That is the compiler several
+  distributions ship, so a build from source with distribution packages
+  failed. Nothing changes at run time.
+- **A retransmitted INVITE on a B2BUA call is answered.** The retransmission
+  was recognised (it creates no second call) and then dropped without a
+  response. A caller retransmits because it has seen no provisional, so one
+  that lost the `100 Trying` or the `180 Ringing` on the way kept
+  retransmitting its INVITE until a later response happened to arrive. It now
+  gets the most recent provisional again, or a `100 Trying` when none beyond
+  that has been sent (RFC 3261 §17.2.1). Nothing is re-sent once the INVITE
+  has its final response, or for an INVITE on another Via branch.
+- **A retransmitted INVITE no longer starts a second B2BUA call after the
+  first one failed.** siphon removes a rejected, failed or CANCELled call as
+  soon as it has answered the caller. A caller that did not get that answer
+  retransmits its INVITE, which then found no call and was taken for a new
+  one: `@b2bua.on_invite` ran again, the callee was dialled a second time, and
+  the caller got a different final response. The final non-2xx is now kept for
+  the life of the INVITE transaction (RFC 3261 §17.2.1) and sent again to a
+  retransmission on the same Via branch: 32 s (Timer H) until the caller ACKs
+  it, then 5 s more over UDP (Timer I) and not at all over a reliable
+  transport. An INVITE on a new branch (a retry after a challenge) is a new
+  call as before. At most 10,000 responses are kept; past that the oldest go
+  first. A client that reuses a Call-ID and Via branch for a new call inside
+  that window is answered as the retransmission it looks like.
 - **An `{aor}` dial target's identity is no longer dropped.** `from`,
   `from_display`, `p_asserted_identity` and `privacy` on an `{aor}` target
   were ignored, though the reference documented them on both target forms
@@ -67,6 +117,15 @@ entry, but a working config keeps working.
   presented the dial's identity (or the caller's) instead. They now reach each
   contact, as `headers` already did, and an unrecognised `privacy` there is
   `bad_request` instead of being ignored with the rest.
+- **A dual-stack UDP host can reach peers in both address families.** With an
+  IPv4 and an IPv6 `listen.udp` entry, every send that named no source socket
+  (a relayed request, a CANCEL, a 2xx ACK, a retransmission, a B-leg INVITE)
+  left from the first configured listener. A peer in the other family was
+  never reached: the datagram failed with `EAFNOSUPPORT` and the request ran
+  into its transaction timeout. Such a send now leaves from the listener bound
+  in the destination's family, and the Via, Record-Route and B-leg Contact
+  name that listener. A script `send_socket=` pin, a captured flow and an
+  IPsec source still take precedence. Single-family hosts are unaffected.
 - **A request for a dialog siphon does not have is answered `481`, not
   `405`.** An in-dialog request (it carries a To-tag) that no dialog and no
   `@proxy.on_request` handler claims now gets `481 Call/Transaction Does Not
@@ -77,6 +136,17 @@ entry, but a working config keeps working.
   does not implement is still `405`, in a dialog or not, and OPTIONS keeps its
   `server.auto_options` behaviour. Logged at debug rather than as a
   no-handler WARN.
+- **A B2BUA call CANCELled by the caller ends for the caller.** The
+  `487 Request Terminated` was built from the CANCEL and carried its CSeq
+  (`n CANCEL`). A UAC that matches responses on the CSeq method took it for a
+  second answer to its CANCEL, so its INVITE transaction got no final response
+  and ran until it timed out. The 487 now carries the INVITE's CSeq
+  (RFC 3261 §9.2). Proxy mode already did.
+- **The B-leg From of a call from an IPv6 caller is well-formed.** Topology
+  hiding replaces the From host, and the replacement ended the old host at its
+  first colon, which for a bracketed IPv6 literal is inside the address:
+  `<sip:alice@[2001:db8::1]>` became `<sip:alice@192.0.2.1::1]>`. A bracketed
+  host is now replaced whole. The same helper serves `call.set_to_host()`.
 - **`Remote-Party-ID` follows the calling identity siphon presents.** The
   default header policy copies the caller's `Remote-Party-ID` onto the B-leg,
   and siphon's identity steps changed `From` and `P-Asserted-Identity` but not
@@ -161,6 +231,39 @@ entry, but a working config keeps working.
 - **A caller's dialog that is not watched says why**, at `debug`. The six ways
   out of starting a `DialogStateChanged` watch were all silent, which reads
   the same as the feature being off.
+- **`media.backend: rtpproxy` keeps one session per call and releases it.**
+  Four defects in the rtpproxy client, each visible in the engine's own
+  session and command counters:
+  - A BYE from the callee deleted nothing. The delete named the callee's tag,
+    rtpproxy matches on the tag the session was created with, and the session
+    and its relay ports stayed up until the no-media timeout. The delete now
+    names the offer's tag.
+  - A re-INVITE from the callee opened a second session on fresh ports, which
+    was never deleted. The update now carries the session's tag as its to-tag,
+    so rtpproxy updates the callee side of the existing session.
+  - A hold signalled with the null connection address (`c=IN IP4 0.0.0.0`,
+    RFC 3264 §8.4) reached the far end as an ordinary re-offer, because the
+    relay address was written over it. The port is still anchored and the
+    null address is kept.
+  - An IPv6 stream was answered with an IPv4 `c=` when rtpproxy listens on a
+    wildcard and so returns a port without an address. siphon fell back to the
+    control address whatever its family. With a loopback control address the
+    loopback of the stream's family is used. A remote engine reached over the
+    other family keeps the control address and logs a warning: give rtpproxy a
+    concrete `-l` / `-6` listen address there.
+- **`@b2bua.on_cancel` runs once, and after `@b2bua.on_invite`, for a call
+  CANCELled early.** Two orderings of a caller's CANCEL left a script's
+  teardown wrong:
+  - The CANCEL arrived while an async `on_invite` was still awaiting (a media
+    offer, a lookup). `on_cancel` could not run, because the call's INVITE was
+    not stored until the handler returned, and whatever the handler then
+    finished setting up was never released: a media session held until the
+    engine's own timeout. `on_cancel` now runs when the handler has returned.
+  - The callee answered siphon's CANCEL with its `487` before siphon had
+    finished ending the call. The `487` was taken for a B-leg failure, so
+    `@b2bua.on_failure` ran beside `on_cancel` and a script releasing media in
+    both released it twice. The legs are now recorded as CANCELled before
+    their CANCELs are sent, and the `487` is acknowledged without a handler.
 
 ## [1.12.0] — 2026-09-30
 

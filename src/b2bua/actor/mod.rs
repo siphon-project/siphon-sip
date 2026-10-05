@@ -28,9 +28,11 @@
 //! - Foundation for API-driven calls: create a `Leg` without an inbound INVITE.
 
 mod call;
+mod cancel_deferral;
 mod dial_branch;
 mod dialog_watch;
 mod helpers;
+mod invite_retransmission;
 mod leg;
 mod leg_actor;
 mod prack_bridge;
@@ -47,6 +49,7 @@ pub use call::*;
 pub use dial_branch::*;
 pub use dialog_watch::*;
 pub use helpers::*;
+pub use invite_retransmission::*;
 pub use leg::*;
 pub use leg_actor::*;
 pub use prack_bridge::*;

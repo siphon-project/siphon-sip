@@ -89,6 +89,18 @@ impl SideFlags {
             ProfileHalf::Answer => entry.answer.clone(),
         })
     }
+
+    /// Whether this half asks for a party's media ingress to be pinned to its
+    /// signalling source (`received_from`). `false` for a profile `registry`
+    /// does not carry: a policy that cannot be read pins nothing.
+    pub fn pins_ingress(&self, registry: &super::profile::ProfileRegistry) -> bool {
+        registry
+            .get(&self.profile)
+            .is_some_and(|entry| match self.half {
+                ProfileHalf::Offer => entry.offer.carry_received_from,
+                ProfileHalf::Answer => entry.answer.carry_received_from,
+            })
+    }
 }
 
 /// The two parties of a bridged pair's session and what shapes each.
@@ -99,12 +111,23 @@ impl SideFlags {
 /// a relayed re-offer in either direction, is shaped by the same flags that
 /// party was bridged with, so an SRTP phone keeps getting SRTP and a plain-RTP
 /// caller plain RTP whichever of them re-offers.
+///
+/// Shaping and ingress are two questions with two answers. The flags that
+/// shape the SDP sent to one party ride on the command that carries the
+/// **other** party's SDP, and the `received_from` hint on that command names
+/// where the other party's media comes from. So each party's ingress policy is
+/// kept beside its shaping, and a command takes its shape from the party it is
+/// for and its hint from the party whose SDP it carries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BridgeSides {
     /// The anchor: the party on [`MediaSession::from_tag`].
     pub anchor: SideFlags,
     /// The peer: the party on [`MediaSession::to_tag`].
     pub peer: SideFlags,
+    /// Whose `received_from` policy pins the anchor's media ingress.
+    pub anchor_ingress: SideFlags,
+    /// Whose `received_from` policy pins the peer's.
+    pub peer_ingress: SideFlags,
 }
 
 impl MediaSession {
@@ -547,6 +570,31 @@ mod tests {
             bridge_sides: None,
             created_at: Instant::now(),
         }
+    }
+
+    #[test]
+    fn a_side_pins_ingress_only_where_its_own_half_asks_for_it() {
+        let half = |received_from: bool| crate::config::NgFlagsConfig {
+            received_from,
+            ..Default::default()
+        };
+        let mut custom = std::collections::HashMap::new();
+        custom.insert(
+            "pins_the_offerer".to_string(),
+            crate::config::MediaProfileConfig {
+                offer: half(true),
+                answer: half(false),
+            },
+        );
+        let registry = crate::rtpengine::ProfileRegistry::from_config(&custom);
+        let side = |profile: &str, half| SideFlags {
+            profile: profile.to_string(),
+            half,
+        };
+        assert!(side("pins_the_offerer", ProfileHalf::Offer).pins_ingress(&registry));
+        assert!(!side("pins_the_offerer", ProfileHalf::Answer).pins_ingress(&registry));
+        // A profile the registry does not carry pins nothing.
+        assert!(!side("no_such_profile", ProfileHalf::Offer).pins_ingress(&registry));
     }
 
     #[test]

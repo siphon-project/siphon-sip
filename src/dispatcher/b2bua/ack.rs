@@ -620,7 +620,7 @@ pub fn stamp_b_leg_origin(
     state: &DispatcherState,
 ) {
     let host = state.via_host(transport);
-    sanitize_sdp_identity(body, &state.sdp_name, Some(&host));
+    hide_sdp_identity(body, state, Some(&host));
     stamp_sdp_origin(
         body,
         &state.sdp_name,
