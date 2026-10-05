@@ -141,7 +141,16 @@ entry, but a working config keeps working.
   (the caller the `offer` half, the callee the `answer` half) and the new party
   takes the half of the party it replaces, so a party whose policy asks for no
   hint is still sent none. A replacement that rings several targets pins each
-  target's own answer by its own source.
+  target's own answer by its own source. The pair records both policies, so a
+  second transfer of the same call reads them again.
+- **A transfer that replaces the callee keeps the call's media session.** On a
+  media-anchored call the pair's session is stored under the caller's Call-ID.
+  Replacing the callee leaves that Call-ID unchanged, and the completion wrote
+  the new pair's session there and then removed "the old one" under the same
+  key, so the call was left with no media session at all: a later transfer of
+  it was not anchored, and the call's teardown did not delete the pair's media
+  engine call, which stayed until the engine's own timeout. The session is now
+  kept, and the engine call goes with the call.
 - **A retransmitted INVITE on a B2BUA call is answered.** The retransmission
   was recognised (it creates no second call) and then dropped without a
   response. A caller retransmits because it has seen no provisional, so one

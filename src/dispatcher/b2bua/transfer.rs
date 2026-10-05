@@ -849,6 +849,12 @@ pub fn b2bua_complete_terminated_transfer(
                     let bridge_sides = repaired
                         .as_ref()
                         .map(|repaired| repaired.sides(&profile, false));
+                    // The key moves only when the target took the A-leg slot.
+                    // When the callee was replaced it is the caller's Call-ID
+                    // before and after, and the insert below replaces the old
+                    // entry itself: removing "the old key" after it would
+                    // remove the pair's own session.
+                    let key_moved = new_store_key != *old_key;
                     store.insert(crate::rtpengine::session::MediaSession {
                         call_id: new_store_key,
                         rtpengine_call_id: cid_new.clone(),
@@ -871,7 +877,9 @@ pub fn b2bua_complete_terminated_transfer(
                         bridge_sides,
                         created_at: std::time::Instant::now(),
                     });
-                    store.remove(old_key);
+                    if key_moved {
+                        store.remove(old_key);
+                    }
                 }
                 b2bua_transfer_rtpengine_delete(
                     state,

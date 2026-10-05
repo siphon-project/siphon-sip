@@ -1020,6 +1020,68 @@ async fn each_losing_targets_engine_call_is_deleted_and_the_winners_is_kept() {
     );
 }
 
+/// The callee of a media-anchored call is replaced. The call is keyed on the
+/// caller's Call-ID before and after, and the new pair's media session is the
+/// one stored there, on the engine call of the target that answered: a later
+/// re-offer finds the engine, and the call's own teardown deletes that engine
+/// call. With no session there nothing would, and the pair's media would stay
+/// on the engine until its own timeout.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_replaced_callee_leaves_the_calls_media_session_on_the_new_pair() {
+    let engine = NativeTestEngine::start().await;
+    let (ringing, old_anchor) = ring_two_anchored(47000, &engine).await;
+    let desk = ringing.desk();
+    let desk_media = header(&ringing.to_desk, "Call-ID");
+    let sessions = ringing
+        .state()
+        .rtpengine_sessions
+        .clone()
+        .expect("a session store");
+    assert_eq!(
+        sessions
+            .get(&ringing.call.a_call_id)
+            .map(|session| session.rtpengine_id().to_string()),
+        Some(old_anchor.clone()),
+        "positive control: the call starts on its original anchor"
+    );
+
+    respond(
+        &ringing.call.dispatcher,
+        &ringing.call_id,
+        desk,
+        &ringing.to_desk,
+        answer(&ringing.to_desk, desk, "desk-tag"),
+    );
+    assert!(eventually(|| !engine.holds(&old_anchor)).await);
+    let pair = sessions
+        .get(&ringing.call.a_call_id)
+        .expect("the call keeps a media session under the caller's Call-ID");
+    assert_eq!(
+        pair.rtpengine_id(),
+        desk_media,
+        "on the answering target's engine call"
+    );
+    assert_eq!(pair.to_tag.as_deref(), Some("a-tag"), "with the survivor");
+    assert_eq!(pair.from_tag, "desk-tag", "and the target");
+    assert_eq!(sessions.len(), 1);
+
+    // The call ends: its engine call goes with it.
+    hang_up(
+        &ringing.call.dispatcher,
+        ringing.call.a.1,
+        "<sip:x@example.com>;tag=a-tag",
+        &header(&ringing.call.answer_to_a, "To"),
+        &ringing.call.a_call_id,
+    );
+    assert_eq!(ringing.state().call_actors.count(), 0);
+    assert!(
+        eventually(|| engine.held_count() == 0).await,
+        "the pair's engine call is deleted with the call: {:?}",
+        engine.commands("delete")
+    );
+    assert!(sessions.is_empty(), "and its session with it");
+}
+
 /// Both targets of an anchored call fail: each one's engine call is deleted
 /// as it fails, and the anchor the original pair is on is kept.
 #[tokio::test(flavor = "multi_thread")]

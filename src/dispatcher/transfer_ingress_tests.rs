@@ -26,8 +26,8 @@ use std::net::IpAddr;
 
 use super::dialog_state_events_tests::{header, inbound, register, tag_of, wire};
 use super::dialog_state_transfer_tests::{
-    establish, host_of, in_dialog, invite, place, respond, response_to_phone, sent_invite_to,
-    Established,
+    establish, hang_up, host_of, in_dialog, invite, place, respond, response_to_phone,
+    sent_invite_to, Established,
 };
 use super::replacement_fork_tests::ring_two_on;
 use super::*;
@@ -485,4 +485,55 @@ async fn parties_whose_profile_asks_for_no_hint_are_sent_none_by_any_transfer() 
     let taken = anchored(45020, &engine, OPEN).await;
     let fresh = takeover(&taken, 45020, "192.0.2.233:5060");
     assert_hints(&engine, &fresh, None, None, "a takeover");
+}
+
+/// A call transferred once and then again: the pair the first transfer built
+/// remembers whose policy pins each party, so the second reads the survivor's
+/// own and not the half its engine tag happens to sit on. The session and the
+/// engine calls go with the call.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_second_transfer_still_pins_each_party_by_its_own_policy() {
+    const FIRST: &str = "203.0.113.241:5060";
+    const SECOND: &str = "203.0.113.242:5060";
+    let engine = NativeTestEngine::start().await;
+    let call = anchored(46000, &engine, PINS_OFFERER).await;
+    let caller = ip(call.a.1);
+
+    // The callee is replaced: the caller survives on its `offer` half, the
+    // first target takes the callee's `answer` half.
+    refers(&call, false, FIRST);
+    let first = target_answers(&call, FIRST);
+    assert_hints(&engine, &first, Some(caller), None, "the first transfer");
+    assert!(
+        !engine.holds(&call.a_call_id),
+        "the original anchor is gone"
+    );
+    // The caller's dialog is the one the call is keyed on before and after, so
+    // the pair's session is found where the original anchor was.
+    let sessions = call
+        .dispatcher
+        .state
+        .rtpengine_sessions
+        .clone()
+        .expect("a session store");
+    let pair = sessions
+        .get(&call.a_call_id)
+        .expect("the re-anchored pair keeps the call's media session");
+    assert_eq!(pair.rtpengine_id(), first);
+    let _ = wire(&call.dispatcher);
+
+    // The first target is replaced in turn: the caller is still the one its
+    // own half pins, and the second target takes the first's.
+    replaces_peer(&call, false, SECOND, None);
+    let second = target_answers(&call, SECOND);
+    assert_hints(&engine, &second, Some(caller), None, "the second transfer");
+
+    hang_up(
+        &call.dispatcher,
+        call.a.1,
+        "<sip:x@example.com>;tag=a-tag",
+        &header(&call.answer_to_a, "To"),
+        &call.a_call_id,
+    );
+    assert_eq!(call.dispatcher.state.call_actors.count(), 0);
 }
