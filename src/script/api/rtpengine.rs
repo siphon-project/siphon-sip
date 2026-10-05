@@ -556,6 +556,22 @@ impl PyRtpEngine {
     /// Extracts SDP from the object body, sends it to RTPEngine, and replaces
     /// the body with the rewritten SDP. Returns True on success.
     ///
+    /// The profile's two halves describe the two parties of the call, not the
+    /// two commands: the ``offer`` half is what the callee is sent and the
+    /// ``answer`` half what the caller is sent. On the call's first INVITE the
+    /// rewritten offer goes to the callee, so it is shaped by the ``offer``
+    /// half, and ``received_from`` (the request's source address) is applied
+    /// when that half asks for it, since the SDP is the caller's.
+    ///
+    /// On a call this process has already anchored the command is a re-offer (a
+    /// re-INVITE or an UPDATE) and follows whoever sent it. From the caller it
+    /// is as above. From the callee the rewritten offer goes to the caller, so
+    /// it is shaped by the ``answer`` half, and the callee is pinned to the
+    /// request's source when the ``answer`` half asks for it: the half the
+    /// callee was set up under. Pass the same ``profile=`` as on the first
+    /// offer and each party keeps the transport, direction and
+    /// ``received_from`` policy it started with, whoever re-offers.
+    ///
     /// Args:
     ///     request: A Request or Call object containing the INVITE with SDP.
     ///     profile: RTP profile name (default: "rtp_passthrough").
@@ -773,6 +789,22 @@ impl PyRtpEngine {
     /// from the replying party's side, and siphon completes it with the caller's
     /// answer from the ACK itself, so a script calls ``answer`` the same way for
     /// both.
+    ///
+    /// Whose SDP, and for whom. The SDP in a reply is the replying party's, and
+    /// the rewritten SDP goes to the other party:
+    ///
+    /// * The callee replies (the 2xx or an 18x to the INVITE, or a delayed
+    ///   offer). The result goes to the caller, shaped by the profile's
+    ///   ``answer`` half.
+    /// * The caller replies to a re-INVITE or an UPDATE from the callee. The
+    ///   result goes to the callee, shaped by the ``offer`` half, which is what
+    ///   the callee has been sent since the call was set up. The tags recorded
+    ///   for the two parties are not changed by it.
+    ///
+    /// ``received_from`` is stamped with the address the reply arrived from,
+    /// never the address of the ``call=`` object, which is the other party's.
+    /// Whether it is stamped is the replying party's own policy: the
+    /// ``answer`` half's for the callee, the ``offer`` half's for the caller.
     ///
     /// Args:
     ///     reply: A Reply or Call object containing the 200 OK with SDP.
