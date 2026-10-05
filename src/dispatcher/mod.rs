@@ -180,6 +180,8 @@ mod proxy_reply_filter_tests;
 #[cfg(test)]
 mod public_api_surface;
 #[cfg(test)]
+mod relayed_cancel_awaits_provisional_tests;
+#[cfg(test)]
 mod relayed_identity_tests;
 #[cfg(test)]
 mod replacement_fork_tests;

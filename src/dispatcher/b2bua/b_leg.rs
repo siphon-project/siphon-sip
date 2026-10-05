@@ -872,7 +872,7 @@ pub fn b2bua_dial_b_leg(
     // initial INVITE (CSeq 1 is now used); subsequent requests (re-INVITE,
     // BYE, 401/407 retry) use CSeq >= 2.
     //
-    // Also CANCEL this INVITE right away when it is owed one (RFC 3261 §9.1 —
+    // Also take up the CANCEL this INVITE is owed, if any (RFC 3261 §9.1 —
     // a CANCEL copies the INVITE's Via branch and CSeq, so it can only be built
     // once the INVITE is on the wire and its hygiene-processed form stashed):
     //  * a CANCEL was deferred onto the leg while the INVITE was being built —
@@ -904,37 +904,18 @@ pub fn b2bua_dial_b_leg(
     };
 
     if let Some(leg) = cancel_now {
-        let cancel = stored_invite
-            .lock()
-            .ok()
-            .and_then(|invite| build_cancel_from_invite(&invite));
-        match cancel {
-            Some(cancel_msg) => {
-                debug!(
-                    call_id = %call_id,
-                    branch = %leg.branch,
-                    "B2BUA: CANCELling a B-leg INVITE as soon as it is stashed"
-                );
-                // Kept answerable first, so the 487 this draws is ACKed and a 2xx
-                // crossing it is ACKed and BYEd even though the call may be gone.
-                state.call_actors.keep_answerable(std::iter::once(&leg));
-                // Same egress socket as the INVITE it cancels — RFC 3261 §9.1
-                // puts the CANCEL on the INVITE's own hop, and on a flow-pinned
-                // leg that hop is the flow's socket.
-                send_b2bua_to_bleg(
-                    cancel_msg,
-                    leg.transport.transport,
-                    leg.transport.remote_addr,
-                    flow_local_addr,
-                    state,
-                );
-                schedule_zombie_cancelled_expiry(state.call_actors.clone(), vec![leg.branch]);
-            }
-            None => warn!(
-                call_id = %call_id,
-                "B2BUA: cannot build the CANCEL a B-leg INVITE is owed from its stored copy — it rings until it answers or times out"
-            ),
-        }
+        debug!(
+            call_id = %call_id,
+            branch = %leg.branch,
+            "B2BUA: a B-leg INVITE is owed a CANCEL as soon as it is stashed"
+        );
+        // Kept answerable, so whatever this INVITE draws is handled even though
+        // the call may be gone. The INVITE has only just left and has drawn no
+        // provisional, so the CANCEL itself waits for the first one (RFC 3261
+        // §9.1), and then goes from the socket the INVITE left on: §9.1 puts
+        // it on the INVITE's own hop, the flow's socket on a flow-pinned leg.
+        state.call_actors.keep_answerable(std::iter::once(&leg));
+        cancel_kept_branches(std::slice::from_ref(&leg), state);
     }
 
     Some(branch)

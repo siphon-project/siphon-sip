@@ -116,16 +116,15 @@ pub fn handle_b2bua_cancel(inbound: InboundMessage, message: SipMessage, state: 
         state,
     );
 
-    // Send CANCEL to all pending B-legs.
+    // CANCEL all pending B-legs.
     //
     // RFC 3261 §9.1 — the CANCEL on each B-leg MUST share the *B-leg
     // INVITE*'s topmost Via branch and CSeq sequence number, NOT the
-    // inbound A-leg CANCEL's.  Rebuild from the stashed B-leg INVITE
+    // inbound A-leg CANCEL's, so each is built from the stashed B-leg INVITE
     // ([Leg::b_leg_invite], populated at the end of
-    // [b2bua_send_b_leg_invite]).  Legs whose INVITE hasn't been sent
-    // yet get marked pending_cancel; the CANCEL drains automatically
-    // once the stash lands.
-    let mut bleg_targets: Vec<(SipMessage, Transport, SocketAddr, Option<SocketAddr>)> = Vec::new();
+    // [b2bua_send_b_leg_invite]) once the lock is dropped below.  Legs whose
+    // INVITE hasn't been sent yet get marked pending_cancel here; the send
+    // path takes them up once the stash lands.
     let pending: Vec<bool> = (0..call.b_legs.len())
         .map(|index| call.is_pending_branch(index))
         .collect();
@@ -135,40 +134,16 @@ pub fn handle_b2bua_cancel(inbound: InboundMessage, message: SipMessage, state: 
         if !pending.get(index).copied().unwrap_or(false) {
             continue;
         }
-        match b_leg.b_leg_invite.as_ref() {
-            Some(invite_arc) => {
-                let invite = match invite_arc.lock() {
-                    Ok(guard) => guard.clone(),
-                    Err(_) => {
-                        warn!(call_id = %call_id, "B2BUA CANCEL: b_leg_invite mutex poisoned, skipping leg");
-                        continue;
-                    }
-                };
-                match build_cancel_from_invite(&invite) {
-                    Some(cancel_msg) => {
-                        bleg_targets.push((
-                            cancel_msg,
-                            b_leg.transport.transport,
-                            b_leg.transport.remote_addr,
-                            b_leg.transport.local_addr,
-                        ));
-                    }
-                    None => {
-                        warn!(call_id = %call_id, "B2BUA CANCEL: failed to build CANCEL from stashed INVITE");
-                    }
-                }
-            }
-            None => {
-                // Race: CANCEL arrived before this B-leg's INVITE was
-                // actually sent.  Defer — b2bua_send_b_leg_invite drains
-                // pending_cancel after stashing b_leg_invite.
-                debug!(
-                    call_id = %call_id,
-                    leg_id = %b_leg.id,
-                    "B2BUA CANCEL: deferred (b_leg_invite not yet stashed)"
-                );
-                b_leg.pending_cancel = true;
-            }
+        if b_leg.b_leg_invite.is_none() {
+            // Race: CANCEL arrived before this B-leg's INVITE was
+            // actually sent.  Defer — b2bua_send_b_leg_invite drains
+            // pending_cancel after stashing b_leg_invite.
+            debug!(
+                call_id = %call_id,
+                leg_id = %b_leg.id,
+                "B2BUA CANCEL: deferred (b_leg_invite not yet stashed)"
+            );
+            b_leg.pending_cancel = true;
         }
     }
 
@@ -202,11 +177,13 @@ pub fn handle_b2bua_cancel(inbound: InboundMessage, message: SipMessage, state: 
         state,
     );
 
-    // Emit the prepared CANCELs after dropping the call lock so the
-    // outbound path doesn't reenter the DashMap.
-    for (cancel_msg, b_transport, b_dest, b_local) in bleg_targets {
-        send_b2bua_to_bleg(cancel_msg, b_transport, b_dest, b_local, state);
-    }
+    // After dropping the call lock so the outbound path doesn't reenter the
+    // DashMap: every B-leg still pending is kept answerable apart from the
+    // call, which goes below, and CANCELled as RFC 3261 §9.1 allows — now when
+    // its INVITE has drawn a provisional, on its first provisional when it has
+    // drawn nothing yet.
+    let kept = state.call_actors.keep_pending_answerable(&call_id);
+    cancel_kept_branches(&kept, state);
 
     // The 487 to the A-leg leaves on the socket the CANCEL (== the INVITE) arrived
     // on, so a multi-homed UDP host answers with a consistent source port.
@@ -281,12 +258,13 @@ pub fn handle_b2bua_cancel(inbound: InboundMessage, message: SipMessage, state: 
     );
 
     state.call_actors.set_state(&call_id, CallState::Terminated);
-    // remove_call_after_cancel sends Shutdown to remaining actors, cleans the
-    // registry, and preserves still-pending B-legs as zombie-cancelled entries
-    // so a 2xx that raced this CANCEL (RFC 3261 §9.1) can still be ACKed + BYEd
-    // by handle_response → handle_zombie_cancelled_2xx instead of being dropped
+    // remove_call_after_cancel sends Shutdown to remaining actors and cleans the
+    // registry. The B-legs kept answerable above outlive it, so a 2xx that
+    // raced this CANCEL (RFC 3261 §9.1) can still be ACKed + BYEd by
+    // handle_response → handle_zombie_cancelled_2xx instead of being dropped
     // as an unknown branch (which leaves the callee retransmitting 200 OK then
-    // BYEing the half-open dialog).
+    // BYEing the half-open dialog). It keeps any leg whose INVITE went out in
+    // between as well, hence the expiry armed for everything kept.
     if state.call_actors.remove_call_after_cancel(&call_id) {
         schedule_zombie_cancelled_cleanup(state.call_actors.clone());
     }
