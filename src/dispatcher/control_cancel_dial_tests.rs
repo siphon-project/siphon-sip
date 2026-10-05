@@ -16,6 +16,35 @@ use super::originate_test_harness::{
 use super::*;
 use crate::rtpengine::test_native_engine::NativeTestEngine;
 
+/// The events a cancel produces, from those queued ahead of its reply through
+/// to the dial's `DialFailed`.
+///
+/// `DialFailed` is published by the dial's coordinator task once it has stopped
+/// the ringback, so it is waited for by name: reading whatever arrived within a
+/// fixed quiet period would make the test depend on how fast that task ran.
+async fn through_dial_failed(
+    controller: &super::control_originate_tests::Controller,
+    mut heard: Vec<crate::control::EventFrame>,
+) -> Vec<crate::control::EventFrame> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !heard.iter().any(|event| event.event == "DialFailed") {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no DialFailed after the cancel: {:?}",
+            names(&heard)
+        );
+        heard.extend(events(controller).await);
+    }
+    // The dial's claim on the caller is released right after its DialFailed is
+    // published, by the same task.
+    let state = &controller.dispatcher.state;
+    assert!(
+        eventually(|| state.dial_bridges.ringing_count() == 0).await,
+        "the cancelled dial released its caller"
+    );
+    heard
+}
+
 fn assert_refused(reply: &serde_json::Value, code: &str, reason: &str) {
     assert_eq!(reply["status"], "error", "{reply}");
     assert_eq!(reply["error"]["code"], code, "{reply}");
@@ -89,8 +118,7 @@ async fn a_cancelled_bridge_dial_cancels_every_phone_and_keeps_the_caller() {
         "nothing is sent to the caller"
     );
 
-    let mut heard = queued;
-    heard.extend(events(&controller).await);
+    let heard = through_dial_failed(&controller, queued).await;
     assert_eq!(
         names(&heard),
         ["DialBranchFailed", "DialBranchFailed", "DialFailed"]
@@ -198,8 +226,7 @@ async fn a_cancel_names_cancelled_by_default_and_refuses_a_malformed_reason() {
     )
     .await;
     assert_eq!(reply["status"], "ok", "{reply}");
-    let mut heard = queued;
-    heard.extend(events(&controller).await);
+    let heard = through_dial_failed(&controller, queued).await;
     assert_eq!(names(&heard), ["DialBranchFailed", "DialFailed"]);
     assert_eq!(heard[1].payload["cause"], "cancelled");
     assert_drained(&controller.dispatcher.state);
