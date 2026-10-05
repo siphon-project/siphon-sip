@@ -1,6 +1,7 @@
 //! Outbound REFER verdicts (`TransferProgress` / `TransferCompleted` /
-//! `TransferFailed`), the inbound `TransferRequested` event, and the teardown
-//! flush that keeps a transfer from being left pending.
+//! `TransferFailed`), the inbound `TransferRequested` event and the
+//! `TransferTimedOut` that ends one an app accepted and never reported on, and
+//! the teardown flush that keeps a transfer from being left pending.
 
 use tracing::debug;
 
@@ -283,6 +284,44 @@ impl ControlBus {
         );
         if pushed {
             debug!(%channel_id, %sip_call_id, target = %refer_to.uri, "control plane: TransferRequested forwarded");
+        }
+        pushed
+    }
+
+    /// Tell the owning app that a transfer it accepted to carry out itself
+    /// (`accept_refer` in mode `controller`) ran past its deadline with no
+    /// `complete_refer`, as a `TransferTimedOut` event.
+    ///
+    /// At that deadline siphon ends the referrer's subscription for the app,
+    /// with a sipfrag NOTIFY of its own (RFC 3515 §2.4.5). Without this event
+    /// the app is the one party never told: it goes on moving the parties and
+    /// then reports on a subscription that is no longer there.
+    ///
+    /// `sip_call_id` is the Call-ID the call's channel is bound to and
+    /// `referrer_on_a_leg` which party referred. `code` is the sipfrag status
+    /// the referrer was sent, `None` when its leg had already left the call
+    /// and nothing could be sent. The payload is `{reason: "timeout", code,
+    /// referrer_leg}` alongside the stable id triple, `referrer_leg` as
+    /// `TransferRequested` names it. Adds no state. Returns whether the event
+    /// was pushed (`false` when the call is uncontrolled or its connection is
+    /// gone).
+    pub fn forward_transfer_timed_out(
+        &self,
+        sip_call_id: &str,
+        referrer_on_a_leg: bool,
+        code: Option<u16>,
+    ) -> bool {
+        let pushed = self.forward_channel_event(
+            sip_call_id,
+            "TransferTimedOut",
+            serde_json::json!({
+                "reason": "timeout",
+                "code": code,
+                "referrer_leg": if referrer_on_a_leg { "a" } else { "b" },
+            }),
+        );
+        if pushed {
+            debug!(%sip_call_id, code, "control plane: TransferTimedOut forwarded");
         }
         pushed
     }

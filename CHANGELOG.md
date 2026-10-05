@@ -61,6 +61,20 @@ entry, but a working config keeps working.
   `complete_refer`, `accept_refer(mode="controller", timeout=…)` /
   `complete_refer`, `acceptRefer({ mode: "controller" })` /
   `completeRefer`).
+- **`TransferTimedOut` tells an application its transfer report came too
+  late.** A transfer accepted with `accept_refer {mode: "controller"}` has a
+  deadline for `complete_refer`. When it passed, siphon ended the referrer's
+  subscription with a `503` sipfrag NOTIFY and told the application nothing,
+  so it went on with the transfer and learned of it only from a refused
+  `complete_refer`. The deadline now also raises `TransferTimedOut` on the
+  channel, payload `{reason: "timeout", code, referrer_leg}`: `code` is the
+  status the referrer was sent (`503`, or `null` when its leg had already
+  left the call), `referrer_leg` is `"a"` or `"b"` as in `TransferRequested`.
+  Raised once, and not for a transfer that was reported, whose referrer hung
+  up, or whose call ended. `describe` lists it, and the Rust, Python and
+  TypeScript control SDKs know it (`SipEvent::TransferTimedOut` with
+  `CallEvent::transfer_timed_out()`, the `"TransferTimedOut"` event kind,
+  `TransferTimedOutPayload`).
 - **A `dial` target can name its called party with `to`.** It becomes that
   branch's `To` URI. Before, a B-leg always kept the caller's `To` user and
   only swapped in the target's host. That is right for a forward and wrong for

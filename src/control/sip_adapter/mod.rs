@@ -155,6 +155,11 @@ impl ControlAdapter for SipControlAdapter {
                 // a decode error all make wrong.
                 "PlayFinished".to_string(),
                 "TransferRequested".to_string(),
+                // The end of a transfer accepted with `accept_refer` in mode
+                // `controller` and never reported: at its deadline siphon
+                // tells the referrer 503 for the app, and this is how the app
+                // learns it did.
+                "TransferTimedOut".to_string(),
                 // The verdict on an *outbound* REFER (the `refer` verb). Three
                 // names, because RFC 3515 §2.4.4 splits "accepted for
                 // processing" (the 2xx to the REFER) from the real outcome (the

@@ -324,39 +324,72 @@ pub fn b2bua_complete_refer_with_state(
     Ok(())
 }
 
+/// The status siphon reports to the referrer for an application that did not
+/// report in time.
+const UNREPORTED_TRANSFER_STATUS: (u16, &str) = (503, "Service Unavailable");
+
 /// End every subscription whose application did not report in time: a sipfrag
 /// `503 Service Unavailable` NOTIFY, so the referrer is told the transfer did
-/// not happen rather than left waiting on it. A record whose call, or whose
-/// referrer's leg, is gone is dropped with nothing sent — there is no dialog
-/// left to say it in. Driven from the 500 ms maintenance tick.
+/// not happen rather than left waiting on it, and `TransferTimedOut` to the
+/// application, which would otherwise never learn that siphon reported for
+/// it. A record whose call is gone is dropped with nothing sent — there is
+/// no dialog left to say it in, and no channel to say it on. Driven from the
+/// 500 ms maintenance tick.
 pub fn check_controller_refer_timeouts(state: &DispatcherState) {
+    let bus = crate::control::ControlBus::global();
+    expire_controller_refers(bus.as_deref(), state);
+}
+
+/// [`check_controller_refer_timeouts`] with the control plane named.
+pub fn expire_controller_refers(bus: Option<&crate::control::ControlBus>, state: &DispatcherState) {
+    let (code, reason) = UNREPORTED_TRANSFER_STATUS;
     for (call_id, record) in state
         .controller_refers
         .take_expired(std::time::Instant::now())
     {
-        let Some(notify) = build_refer_final_notify(
-            &call_id,
-            record.referrer_on_a_leg,
-            record.event_id,
-            503,
-            "Service Unavailable",
-            state,
-        ) else {
+        // The Call-ID the call's channel is bound to: the A-leg's.
+        let Some(sip_call_id) = state
+            .call_actors
+            .get_call(&call_id)
+            .map(|call| call.a_leg.dialog.call_id.clone())
+        else {
             debug!(call_id = %call_id, "control plane: a transfer awaiting its report outlived its call — dropped");
             continue;
         };
-        warn!(
-            call_id = %call_id,
-            "control plane: no complete_refer before the deadline — reporting the transfer failed (503)"
-        );
-        send_message_from(
-            notify.message,
-            notify.transport,
-            notify.destination,
-            notify.connection_id,
-            notify.local_addr,
+        let notify = build_refer_final_notify(
+            &call_id,
+            record.referrer_on_a_leg,
+            record.event_id,
+            code,
+            reason,
             state,
         );
+        // What the referrer was told, or `None` when its leg has left a call
+        // that goes on: the application is owed the news either way.
+        let reported = notify.is_some().then_some(code);
+        match notify {
+            Some(notify) => {
+                warn!(
+                    call_id = %call_id,
+                    "control plane: no complete_refer before the deadline — reporting the transfer failed ({code})"
+                );
+                send_message_from(
+                    notify.message,
+                    notify.transport,
+                    notify.destination,
+                    notify.connection_id,
+                    notify.local_addr,
+                    state,
+                );
+            }
+            None => warn!(
+                call_id = %call_id,
+                "control plane: no complete_refer before the deadline, and the referrer's leg is gone — nothing to report it in"
+            ),
+        }
+        if let Some(bus) = bus {
+            bus.forward_transfer_timed_out(&sip_call_id, record.referrer_on_a_leg, reported);
+        }
     }
 }
 

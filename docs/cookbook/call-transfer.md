@@ -526,7 +526,9 @@ worked and may keep the consultation call on hold until its own timer
 runs out.
 
 If the application takes longer than `timeout` (default 60 s, at most 180),
-siphon reports `503` to the referrer itself. If Bob hangs up before the
+siphon reports `503` to the referrer itself and tells the application with a
+`TransferTimedOut` event on `bob-1` (`{reason: "timeout", code: 503,
+referrer_leg}`), after which `complete_refer` is refused. If Bob hangs up before the
 report, the subscription ends with his call and there is nothing to
 report. Full rules are in the
 [control plane reference](../reference/control-plane.md#a-transfer-the-application-carries-out).

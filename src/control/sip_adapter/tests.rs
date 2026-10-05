@@ -1516,6 +1516,17 @@ fn describe_lists_a_lifecycle_for_every_stream_mode() {
     }
 }
 
+/// A transfer an app accepted to carry out and never reported on ends in an
+/// event of its own, so it is discoverable next to the verbs that lead to it.
+#[test]
+fn describe_lists_the_transfer_report_timeout() {
+    let schema = SipControlAdapter::new().describe();
+    assert!(schema
+        .events
+        .iter()
+        .any(|event| event == "TransferTimedOut"));
+}
+
 /// The media engine's summary is published on the rail, so it is discoverable.
 #[test]
 fn describe_lists_the_media_summary() {

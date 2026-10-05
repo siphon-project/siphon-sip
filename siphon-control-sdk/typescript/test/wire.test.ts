@@ -37,6 +37,7 @@ import type {
   DialogStateChangedPayload,
   PlayStartedPayload,
   TransferOutcomePayload,
+  TransferTimedOutPayload,
 } from "../src/index";
 import type { CommandTransport } from "../src/session";
 
@@ -99,6 +100,7 @@ describe("SipVerb wire tokens + event names", () => {
     expect(sipEventKind("StasisStart")).toBe("StasisStart");
     expect(sipEventKind("ChannelDtmfReceived")).toBe("ChannelDtmfReceived");
     expect(sipEventKind("TransferRequested")).toBe("TransferRequested");
+    expect(sipEventKind("TransferTimedOut")).toBe("TransferTimedOut");
     expect(sipEventKind("TransferProgress")).toBe("TransferProgress");
     expect(sipEventKind("TransferCompleted")).toBe("TransferCompleted");
     expect(sipEventKind("TransferFailed")).toBe("TransferFailed");
@@ -137,6 +139,23 @@ describe("SipVerb wire tokens + event names", () => {
     expect(transferOutcome({ kind: "TransferRequested", payload: {} })).toBeNull();
     expect(transferOutcome({ kind: "StasisEnd", payload: {} })).toBeNull();
     expect(transferOutcome({ kind: "TransferFailed", payload: null })).toBeNull();
+  });
+
+  it("reads a missed report deadline as its own event, not an outbound verdict", () => {
+    // Byte-identical to the server's TransferTimedOut payload.
+    const timedOut: TransferTimedOutPayload = JSON.parse(
+      '{"reason":"timeout","code":503,"referrer_leg":"a"}',
+    );
+    expect(timedOut.reason).toBe("timeout");
+    expect(timedOut.code).toBe(503);
+    expect(timedOut.referrer_leg).toBe("a");
+    const unsent: TransferTimedOutPayload = JSON.parse(
+      '{"reason":"timeout","code":null,"referrer_leg":"b"}',
+    );
+    expect(unsent.code).toBeNull();
+    // It ends a transfer this app accepted, not one it asked for with `refer`.
+    expect(isTransferFinal("TransferTimedOut")).toBe(false);
+    expect(transferOutcome({ kind: "TransferTimedOut", payload: timedOut })).toBeNull();
   });
 
   it("marks exactly the terminal bridge verdicts as final", () => {
