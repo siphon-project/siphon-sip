@@ -303,13 +303,18 @@ pub(crate) fn build_play_source(
     file: Option<String>,
     db_id: Option<u64>,
     blob: Option<Vec<u8>>,
+    tone: Option<String>,
+    url: Option<String>,
 ) -> PyResult<PlaySource> {
-    match (file, db_id, blob) {
-        (Some(file), None, None) => Ok(PlaySource::file(file)),
-        (None, Some(db_id), None) => Ok(PlaySource::db_id(db_id)),
-        (None, None, Some(blob)) => Ok(PlaySource::blob(blob)),
+    match (file, db_id, blob, tone, url) {
+        (Some(file), None, None, None, None) => Ok(PlaySource::file(file)),
+        (None, Some(db_id), None, None, None) => Ok(PlaySource::db_id(db_id)),
+        (None, None, Some(blob), None, None) => Ok(PlaySource::blob(blob)),
+        (None, None, None, Some(tone), None) => Ok(PlaySource::tone(tone)),
+        (None, None, None, None, Some(url)) => Ok(PlaySource::url(url)),
         _ => Err(PyValueError::new_err(
-            "play requires exactly one of file (str), db_id (int), or blob (bytes)",
+            "play requires exactly one of file (str), db_id (int), blob (bytes), tone (str), \
+             or url (str)",
         )),
     }
 }

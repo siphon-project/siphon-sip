@@ -62,7 +62,8 @@ Every verb the server's `sip` adapter describes has a typed method:
   `TransferTarget::uri(..)` or `TransferTarget::aor(..)`, a registered
   address-of-record dialled over the flow its phone registered on with every
   registered contact rung, and `TransferDial` carries `next_hop`, `from`,
-  `from_display`, `p_asserted_identity`, `privacy` and `headers`.
+  `from_display`, `p_asserted_identity`, `privacy` and `headers`, and
+  `number_policy` or `format` for how the numbers in that identity are written.
   `accept_refer_controller(timeout)` has the server answer `202` and dial
   nothing, leaving the transfer to the app, which then reports with
   `complete_refer(code, reason)`.
@@ -71,8 +72,10 @@ Every verb the server's `sip` adapter describes has a typed method:
   takes the same `TransferTarget` and `TransferDial`.
 - **Bridging:** `bridge`, `unbridge`.
 - **Media:** `play(PlaySource, PlayOptions)`, `play_file`, `stop`, `dtmf`,
-  `hold`, `unhold`. `PlayOptions::repeat` is a total play count, or
-  `PlayRepeat::Forever` (`"inf"` on the wire) to play until stopped.
+  `hold`, `unhold`. A `PlaySource` is a `file`, a `db_id`, a `blob`, a `tone`
+  (preset or cadence) or a `url` (HTTP or HTTPS). `PlayOptions::repeat` is a
+  total play count, or `PlayRepeat::Forever` (`"inf"` on the wire) to play
+  until stopped, and `PlayOptions::gain_decibels` plays louder or quieter.
 - **Streaming and recording:** `stream_start` / `stream_start_with` /
   `stream_stop` / `stream_stop_with`, `record_start` / `record_stop`.
 - **Headers and variables:** `set_header`, `get_header`, `remove_header`,

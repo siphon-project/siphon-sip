@@ -55,10 +55,12 @@ package's README lists them under its own names.
   `replace_peer` to swap a party with no REFER involved. A transfer target is a
   URI or `{aor}`, a registered address-of-record, and the leg the transfer dials
   takes the identity arguments `dial` takes (`from`, `from_display`,
-  `p_asserted_identity`, `privacy`, `headers`).
+  `p_asserted_identity`, `privacy`, `headers`) and a `number_policy` or a
+  `format` for the numbers in them.
 - **Join calls:** `bridge` and `unbridge`.
-- **Media:** `play` (`repeat` is a total play count, or `"inf"` to play until
-  stopped), `stop`, `dtmf`, `hold` / `unhold`, `stream_start` / `stream_stop`,
+- **Media:** `play` (a file, a media-DB id, inline bytes, a `tone` or a `url`;
+  `repeat` is a total play count, or `"inf"` to play until stopped;
+  `gain_decibels` plays louder or quieter), `stop`, `dtmf`, `hold` / `unhold`, `stream_start` / `stream_stop`,
   `record_start` / `record_stop`.
 - **Headers and variables:** `set_header` / `get_header` / `remove_header`,
   `set_var` / `get_var`.

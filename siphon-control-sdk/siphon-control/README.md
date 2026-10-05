@@ -128,7 +128,8 @@ reported as a failure. That is damage control, not a substitute for closing.
 - `server.local_addr` — the bound address once `bind()` / `serve()` has run, else `None`.
 - `await server.serve()` / `await server.run()` — accept siphon's per-call dials
   forever (stop by cancelling the task).
-- `server.close()` — drop the handler so no further accepted call is dispatched.
+- `server.close()` — drop the handler so no further accepted call is dispatched,
+  one accepted while `serve()` is still running included.
   `async with server:` does this on the way out. See Shutdown above.
 
 ### `Call` (shared by both modes)
@@ -159,7 +160,8 @@ reported as a failure. That is damage control, not a substitute for closing.
   nothing is ringing, and once a phone has answered and is being bridged.
 - `await call.accept_refer(target=None, next_hop=None, mode=None, profile=None, *,
   aor=None, from_uri=None, from_display=None, p_asserted_identity=None, privacy=None,
-  headers=None, timeout=None)` accepts a pending inbound REFER (a `TransferRequested`
+  headers=None, timeout=None, number_policy=None, format=None)` accepts a pending
+  inbound REFER (a `TransferRequested`
   event). `mode` is `"terminate"` (siphon dials the target), `"transparent"` (siphon
   relays the REFER) or `"controller"`: siphon answers `202` and dials nothing, this app
   moves the parties itself and then reports with `await call.complete_refer(code,
@@ -167,12 +169,15 @@ reported as a failure. That is damage control, not a substitute for closing.
   target by its registered address-of-record in place of a URI: it is dialled over the
   flow its phone registered on, every registered contact rings and the first to answer
   is kept. The identity arguments are the ones `dial` takes, for the leg the transfer
-  dials. A target URI together with `aor=`, `mode="controller"` with any argument that
+  dials; `number_policy` names a number policy configured on the server for the
+  numbers in them, or `format` gives one format (`"e164"`, `"plain"`,
+  `"international"`, `"national"`). A target URI together with `aor=`, `mode="controller"` with any argument that
   describes a leg, and `timeout` with another mode each raise `ValueError` before a
   frame goes out. `await call.reject_refer(code, reason=None)` declines the REFER.
 - `await call.replace_peer(target=None, next_hop=None, replace_a_leg=None, profile=None,
   timeout=None, *, aor=None, from_uri=None, from_display=None, p_asserted_identity=None,
-  privacy=None, headers=None)` swaps one party of an answered call for a freshly
+  privacy=None, headers=None, number_policy=None, format=None)` swaps one party of
+  an answered call for a freshly
   dialled target, with no REFER involved; the replaced leg stays up while the target
   rings. Exactly one of `target` and `aor=` (`ValueError` otherwise). The reply says
   the INVITE is on the wire; `PeerReplaced` / `ReplaceFailed` is the outcome.
@@ -180,9 +185,12 @@ reported as a failure. That is damage control, not a substitute for closing.
   leg the app owns, and `await call.unbridge(reason=None)` parts them, both legs
   staying answered and held. The outcome arrives as `ChannelBridged` / `BridgeFailed`.
 - `await call.play(file=None, db_id=None, blob=None, repeat=None, start_ms=None,
-  duration_ms=None, to_tag=None)` plays an announcement on the caller's media (exactly
-  one source). `repeat` is a total play count, or `"inf"` to play until stopped;
-  anything else raises `ValueError`. `play_file(file)`, `stop()`, `dtmf(digits, …)`,
+  duration_ms=None, to_tag=None, *, tone=None, url=None, gain_decibels=None)` plays an
+  announcement on the caller's media. Exactly one source: a `file`, a `db_id`, a
+  `blob`, a `tone` (a preset such as `"ringback_eu"` or a cadence) or a `url` (HTTP
+  or HTTPS). `repeat` is a total play count, or `"inf"` to play until stopped;
+  anything else raises `ValueError`. `gain_decibels` plays louder (positive) or
+  quieter (negative). `play_file(file)`, `stop()`, `dtmf(digits, …)`,
   `hold()` and `unhold()` are the other media verbs. `hold` is a media gate, not a
   SIP hold, and is refused (`invalid_state`) on a call the engine only relays.
 - `await call.stream_start(ws_uri, direction=None, channels=None, *, mode="tee",

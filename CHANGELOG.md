@@ -97,6 +97,22 @@ entry, but a working config keeps working.
   `sdp_keep_session_name: true` the session name is relayed as the far side
   wrote it, and `o=` is still rewritten. Default `false`, so nothing changes
   for an existing config.
+- **The control SDKs type the rest of what `play` and the transfer verbs
+  take.** The server already read a `tone` or a `url` as a `play` source, a
+  `gain_decibels` beside it, and `number_policy` / `format` on
+  `accept_refer` and `replace_peer`; from an SDK they could only be sent
+  through the generic `command`. Rust: `PlaySource::tone` /
+  `PlaySource::url`, `PlayOptions::gain_decibels`, and
+  `TransferDial::number_policy` / `format`. Python: `play(tone=…, url=…,
+  gain_decibels=…)` and `number_policy=` / `format=` on `accept_refer` and
+  `replace_peer` (a second source, and a number argument beside
+  `mode="controller"`, raise `ValueError` before a frame goes out).
+  TypeScript: `{ tone }` and `{ url }` sources, `gainDecibels`, and
+  `numberPolicy` / `format` on the transfer options. Each goes out under the
+  name the server parses, pinned by a wire test per SDK. **BREAKING (Rust
+  SDK source):** `PlaySource` has two more variants and `PlayOptions` and
+  `TransferDial` more public fields, so an exhaustive `match` or a struct
+  literal without `..Default::default()` needs the addition.
 
 ### Fixed
 
@@ -583,6 +599,17 @@ entry, but a working config keeps working.
   (§13.2.2.4, §15). With the branch forgotten at Timer B that `2xx` drew
   neither, and the far end was left in a call nobody would end. A
   provisional after Timer B draws nothing.
+- **`close()` on a Python control client or server stops handlers at
+  once.** A handler is called on a worker thread and its coroutine handed to
+  the event loop, so a `ControlClient.close()` could land between the two
+  and the handler body still ran in an application that had said it was
+  done (about one run in ten of the test that pushes handovers through a
+  close). `ControlServer.close()` did less: a server already in `serve()`
+  kept the handler it had started with and went on dispatching every call
+  dialled in. Both now set a flag the dispatch reads on the event loop
+  itself, as the first thing the handler's task does, so a call whose
+  handler had not started when `close()` ran never starts it. `run()` /
+  `serve()` called again open it again.
 
 ### Changed
 

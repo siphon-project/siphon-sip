@@ -860,6 +860,53 @@ def test_close_stops_dispatching_into_python():
     asyncio.run(scenario())
 
 
+def test_server_close_stops_dispatching_into_python():
+    """After `close()`, a call siphon dials in with is not handed to the
+    handler, although `serve()` is still accepting. One dialled in before the
+    close is, which is what shows the handler was reachable at all."""
+
+    async def scenario():
+        server = ControlServer(app=APP, token=TOKEN, bind="127.0.0.1:0")
+        addr = await server.bind()
+        calls = []
+        first = asyncio.get_event_loop().create_future()
+
+        @server.on_call
+        async def handle(call):
+            calls.append(call.channel_id)
+            if not first.done():
+                first.set_result(None)
+
+        serve_task = asyncio.ensure_future(server.serve())
+        await asyncio.sleep(0.3)
+
+        async def dial_in():
+            return await websockets.connect(
+                f"ws://{addr}/siphon",
+                additional_headers={"Authorization": f"Bearer {TOKEN}"},
+                subprotocols=[SUBPROTOCOL],
+            )
+
+        before = await dial_in()
+        await _push_stasis(before)
+        await asyncio.wait_for(first, timeout=5)
+        assert calls == ["ch-out"]
+
+        server.close()
+        after = await dial_in()
+        await _push_stasis(after)
+        await asyncio.sleep(0.3)
+        assert calls == ["ch-out"], "close() must stop dispatching into Python"
+
+        await before.close()
+        await after.close()
+        serve_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+            await asyncio.wait_for(serve_task, timeout=5)
+
+    asyncio.run(scenario())
+
+
 def test_async_context_manager_closes_on_exit():
     """`async with` closes on the way out, including when the body raises."""
     async def scenario():
@@ -1851,6 +1898,100 @@ def test_cancel_dial_and_transfer_verbs_roundtrip():
             ]
             # Every frame is accounted for above: nothing refused went out.
             assert len(frames) == 3 + 3 + 5 + 3 + 3
+
+            client.shutdown()
+            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+                await asyncio.wait_for(run_task, timeout=5)
+
+    asyncio.run(scenario())
+
+
+def test_play_sources_gain_and_number_shaping_roundtrip():
+    """`play` names a tone or a URL as its source and a gain in decibels, and
+    `accept_refer` / `replace_peer` name how the new leg's numbers are written,
+    each under the name the server parses. A second source beside the first, and
+    a number argument beside a controller transfer, raise `ValueError` before a
+    frame goes out."""
+
+    async def scenario():
+        frames = []
+        verbs = {"play", "accept_refer", "replace_peer"}
+        stub = _verb_stub(verbs, lambda frame: {"channel": "ch1"}, frames)
+        async with websockets.serve(
+            stub, "127.0.0.1", 0, subprotocols=[SUBPROTOCOL]
+        ) as server:
+            port = server.sockets[0].getsockname()[1]
+            url = f"ws://127.0.0.1:{port}/control/ws"
+            client = ControlClient(app=APP, token=TOKEN, url=url)
+            done = asyncio.get_event_loop().create_future()
+
+            async def drive(call):
+                await call.play(tone="ringback_eu")
+                await call.play(
+                    url="https://media.example.com/hold.wav",
+                    repeat="inf",
+                    gain_decibels=-6,
+                )
+                await call.play(file="/prompts/welcome.wav", gain_decibels=3)
+                for kwargs in (
+                    {"tone": "ringback_eu", "url": "https://media.example.com/a.wav"},
+                    {"file": "/prompts/welcome.wav", "tone": "ringback_eu"},
+                    {"db_id": 7, "url": "https://media.example.com/a.wav"},
+                    {},
+                ):
+                    with pytest.raises(ValueError, match="exactly one"):
+                        await call.play(**kwargs)
+
+                await call.accept_refer(mode="terminate", number_policy="carrier_e164")
+                await call.accept_refer("sip:3002@198.51.100.7", format="national")
+                for kwargs in ({"number_policy": "carrier_e164"}, {"format": "e164"}):
+                    with pytest.raises(ValueError, match="controller"):
+                        await call.accept_refer(mode="controller", **kwargs)
+
+                await call.replace_peer(
+                    "sip:3002@198.51.100.7", number_policy="carrier_e164"
+                )
+                await call.replace_peer(aor="sip:3001@example.com", format="plain")
+
+            @client.on_call
+            async def handle(call):
+                try:
+                    await drive(call)
+                except BaseException as error:  # noqa: BLE001
+                    if not done.done():
+                        done.set_exception(error)
+                    return
+                if not done.done():
+                    done.set_result(None)
+
+            await client.connect()
+            run_task = asyncio.ensure_future(client.run())
+            await asyncio.sleep(0.3)
+            await client.command("test_push_stasis")
+            await asyncio.wait_for(done, timeout=10)
+
+            def args_of(verb):
+                return [frame["args"] for frame in frames if frame["verb"] == verb]
+
+            assert args_of("play") == [
+                {"tone": "ringback_eu"},
+                {
+                    "url": "https://media.example.com/hold.wav",
+                    "repeat": "inf",
+                    "gain_decibels": -6,
+                },
+                {"file": "/prompts/welcome.wav", "gain_decibels": 3},
+            ]
+            assert args_of("accept_refer") == [
+                {"mode": "terminate", "number_policy": "carrier_e164"},
+                {"target": "sip:3002@198.51.100.7", "format": "national"},
+            ]
+            assert args_of("replace_peer") == [
+                {"target": "sip:3002@198.51.100.7", "number_policy": "carrier_e164"},
+                {"target": {"aor": "sip:3001@example.com"}, "format": "plain"},
+            ]
+            # Every frame is accounted for above: nothing refused went out.
+            assert len(frames) == 3 + 2 + 2
 
             client.shutdown()
             with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
