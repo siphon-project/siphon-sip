@@ -36,6 +36,16 @@ use crate::transport::{ConnectionId, InboundMessage, OutboundMessage, Transport}
 #[derive(Clone, Debug)]
 pub struct UdpOutbound {
     shards: Arc<[flume::Sender<OutboundMessage>]>,
+    /// The listener that takes this one's traffic for the address family it
+    /// cannot send to. See [`UdpOutbound::with_other_family`].
+    other_family: Option<OtherFamily>,
+}
+
+/// A listener of the other address family and which family that is.
+#[derive(Clone, Debug)]
+struct OtherFamily {
+    ipv6: bool,
+    shards: Arc<[flume::Sender<OutboundMessage>]>,
 }
 
 impl UdpOutbound {
@@ -47,9 +57,27 @@ impl UdpOutbound {
         (
             Self {
                 shards: senders.into(),
+                other_family: None,
             },
             receivers,
         )
+    }
+
+    /// Hand every destination of the other address family to `listener`.
+    ///
+    /// A UDP socket sends within its own family only: a datagram for an IPv6
+    /// peer written to a socket bound to an IPv4 address fails with
+    /// EAFNOSUPPORT. The default egress of a dual-stack host is one listener,
+    /// so without this every send that names no source socket (a relayed
+    /// request, a CANCEL, a 2xx ACK, a retransmission, a keepalive) is lost
+    /// whenever its peer is in the family the first listener is not.
+    /// `ipv6` is the family `listener` serves.
+    pub fn with_other_family(mut self, ipv6: bool, listener: &UdpOutbound) -> Self {
+        self.other_family = Some(OtherFamily {
+            ipv6,
+            shards: Arc::clone(&listener.shards),
+        });
+        self
     }
 
     /// Enqueue `message` on the channel of the worker that owns its destination.
@@ -57,8 +85,12 @@ impl UdpOutbound {
     // `OutboundRouter::send`.
     #[allow(clippy::result_large_err)]
     pub fn send(&self, message: OutboundMessage) -> Result<(), flume::SendError<OutboundMessage>> {
-        let shard = shard_for(message.destination, self.shards.len());
-        match self.shards.get(shard) {
+        let shards = match &self.other_family {
+            Some(other) if message.destination.is_ipv6() == other.ipv6 => &other.shards,
+            _ => &self.shards,
+        };
+        let shard = shard_for(message.destination, shards.len());
+        match shards.get(shard) {
             Some(sender) => sender.send(message),
             // `shard_for` stays below the channel count, and there is always at
             // least one channel, so this is never taken.
@@ -72,6 +104,7 @@ impl From<flume::Sender<OutboundMessage>> for UdpOutbound {
     fn from(sender: flume::Sender<OutboundMessage>) -> Self {
         Self {
             shards: Arc::from([sender]),
+            other_family: None,
         }
     }
 }
@@ -861,6 +894,38 @@ mod tests {
             "64 peers landed on only {} of 8 workers",
             used.len()
         );
+    }
+
+    /// A dual-stack host's default egress is one listener in one family. A
+    /// peer in the other family has to be reached through the listener bound in
+    /// that family, or the datagram dies in `send_to` with EAFNOSUPPORT.
+    #[test]
+    fn a_destination_in_the_other_family_leaves_from_that_familys_listener() {
+        let (ipv4_listener, ipv4_receivers) = UdpOutbound::channels(1);
+        let (ipv6_listener, ipv6_receivers) = UdpOutbound::channels(1);
+        let default_egress = ipv4_listener
+            .clone()
+            .with_other_family(true, &ipv6_listener);
+
+        let ipv6_peer: SocketAddr = "[2001:db8::20]:5062".parse().unwrap();
+        let ipv4_peer: SocketAddr = "198.51.100.7:5060".parse().unwrap();
+        default_egress.send(message_to(ipv6_peer)).unwrap();
+        default_egress.send(message_to(ipv4_peer)).unwrap();
+
+        assert_eq!(ipv6_receivers[0].try_recv().unwrap().destination, ipv6_peer);
+        assert!(ipv6_receivers[0].try_recv().is_err());
+        assert_eq!(ipv4_receivers[0].try_recv().unwrap().destination, ipv4_peer);
+        assert!(ipv4_receivers[0].try_recv().is_err());
+    }
+
+    /// The per-listener sender a pinned send resolves to is the plain one: a
+    /// message pinned to a socket stays on that socket whatever its family.
+    #[test]
+    fn a_listener_without_another_family_keeps_all_its_traffic() {
+        let (listener, receivers) = UdpOutbound::channels(1);
+        let ipv6_peer: SocketAddr = "[2001:db8::20]:5062".parse().unwrap();
+        listener.send(message_to(ipv6_peer)).unwrap();
+        assert_eq!(receivers[0].try_recv().unwrap().destination, ipv6_peer);
     }
 
     /// Sends go to the channel of the worker that owns the destination, and a

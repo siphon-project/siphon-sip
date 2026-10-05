@@ -300,6 +300,8 @@ async fn a_second_bridge_dial_or_a_bridged_caller_is_refused() {
             media_from_tag: None,
             media_profile: None,
             media_peer_profile: None,
+            media_anchor_ingress: None,
+            media_peer_ingress: None,
             media_pending_adoption: false,
             last_local_offer: Vec::new(),
             release_reason: None,

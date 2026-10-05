@@ -1197,8 +1197,24 @@ describes. `profile` names **one profile for the pair** instead, the way one
 profile describes both parties of a connecting dial: its `offer` half shapes
 what the `with` leg gets and its `answer` half what the anchor gets (the
 built-in `rtp_to_srtp`, for example, offers the `with` leg `RTP/SAVP` and
-answers the anchor `RTP/AVP`). A profile that asks for `received_from` pins each
-party's media ingress to that party's own signalling source. An unknown
+answers the anchor `RTP/AVP`).
+
+**Which profile pins which party's media ingress.** `received_from` is the one
+flag that does not follow the shaping. It pins a party's media ingress to the
+address its signalling came from, which is where its media comes from when the
+address in its SDP is not (a party behind NAT), so it is read from the profile
+of the party it is about: the anchor is pinned when the **anchor's** profile
+asks for it and the `with` leg when the **`with` leg's** does, on the bridge's
+own offer and answer and on every re-offer relayed across the pair afterwards.
+A caller answered with a profile that asks for no hint, joined to a phone rung
+with one that does, leaves the caller unpinned and the phone pinned. Each
+party's own policy is the half of its profile it was anchored under: the
+`answer` half for a leg siphon answered and anchored itself (`answer {anchor}`,
+`originate {media: true}`, the phone of a bridge dial). With `profile`, the
+pair profile decides for both, as it does on a connecting dial: its `offer`
+half for the anchor, whose SDP the offer carries, and its `answer` half for the
+`with` leg. A `with` leg with no media session of its own has no policy of its
+own, and the anchor's profile's `answer` half decides for it. An unknown
 profile, or one that is not a non-empty string, is `bad_request` with
 `error.details: {verb: "bridge", argument: "profile", reason:
 "unknown_profile" | "invalid_value"}`, and nothing is touched. The reply echoes

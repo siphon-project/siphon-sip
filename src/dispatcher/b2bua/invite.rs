@@ -122,19 +122,69 @@ pub fn handle_b2bua_invite(inbound: InboundMessage, message: SipMessage, state: 
     let a_leg_supports_100rel = crate::sip::headers::rseq::supports_100rel(&message.headers);
     let a_leg_requires_100rel = crate::sip::headers::rseq::requires_100rel(&message.headers);
 
-    // Guard against INVITE retransmissions: if we already have a call for this
-    // SIP Call-ID, this is a retransmission — absorb it silently.
-    // Without this check, each UDP retransmission would create a new call and
-    // spawn duplicate B-leg INVITEs.
-    if state
-        .call_actors
-        .find_by_sip_call_id(&sip_call_id)
-        .is_some()
-    {
+    // A retransmission of an INVITE that already has its final non-2xx gets
+    // that response again (RFC 3261 §17.2.1, Completed). Checked ahead of the
+    // live-call guard below: the response is recorded as it is sent, which can
+    // be a moment before the call is removed, and after it the call is gone
+    // and the retransmission would be taken for a new one.
+    if let Some(final_response) = state.completed_invites.get(&sip_call_id, &via_branch) {
         debug!(
             call_id = %sip_call_id,
-            "B2BUA: absorbing INVITE retransmission (call already exists)"
+            "B2BUA: INVITE retransmission after the final response, sending it again"
         );
+        send_outbound_from(
+            final_response,
+            inbound.transport,
+            inbound.remote_addr,
+            inbound.connection_id,
+            Some(inbound.local_addr),
+            state,
+        );
+        return;
+    }
+
+    // Guard against INVITE retransmissions: if we already have a call for this
+    // SIP Call-ID, this is a retransmission. It creates no second call (each
+    // UDP retransmission would otherwise spawn duplicate B-leg INVITEs), and
+    // it is answered: a caller retransmits because it has seen no provisional,
+    // so the most recent one goes out again (RFC 3261 §17.2.1). Left unanswered
+    // it keeps retransmitting until a response does get through.
+    if let Some(existing_call_id) = state.call_actors.find_by_sip_call_id(&sip_call_id) {
+        let reply = state
+            .call_actors
+            .get_call(&existing_call_id)
+            .map(|call| call.invite_retransmission_reply(&via_branch))
+            .unwrap_or(crate::b2bua::actor::InviteRetransmissionReply::Nothing);
+        debug!(
+            call_id = %sip_call_id,
+            ?reply,
+            "B2BUA: INVITE retransmission (call already exists)"
+        );
+        match reply {
+            crate::b2bua::actor::InviteRetransmissionReply::Provisional(provisional) => {
+                send_outbound_from(
+                    provisional,
+                    inbound.transport,
+                    inbound.remote_addr,
+                    inbound.connection_id,
+                    Some(inbound.local_addr),
+                    state,
+                );
+            }
+            crate::b2bua::actor::InviteRetransmissionReply::Trying => {
+                let trying =
+                    build_response(&message, 100, "Trying", state.server_header.as_deref(), &[]);
+                send_message_from(
+                    trying,
+                    inbound.transport,
+                    inbound.remote_addr,
+                    inbound.connection_id,
+                    Some(inbound.local_addr),
+                    state,
+                );
+            }
+            crate::b2bua::actor::InviteRetransmissionReply::Nothing => {}
+        }
         return;
     }
 
@@ -515,6 +565,10 @@ pub fn handle_b2bua_invite(inbound: InboundMessage, message: SipMessage, state: 
     let engine_state = state.engine.state();
     let handlers = engine_state.handlers_for(&HandlerKind::B2buaInvite);
 
+    // From here until the handler returns, a CANCEL defers `@b2bua.on_cancel`
+    // to this path instead of running it beside the handler.
+    let cancelled_during_handler = state.call_actors.begin_invite_handler(&call_id);
+
     let mut outcome = Python::attach(|python| {
         let call_obj = match Py::new(python, py_call) {
             Ok(obj) => obj,
@@ -555,9 +609,34 @@ pub fn handle_b2bua_invite(inbound: InboundMessage, message: SipMessage, state: 
     // §17.2.1) — most visibly an answer-first `handover`, which sends its
     // `200 OK` off the stored INVITE and would land behind the 487. One guard
     // here rather than per arm, because it covers the `script_error` reject too.
-    // Nothing is left to clean up: the CANCEL path removed the call, its
-    // registry entries and its event receiver.
-    if invite_action_target_gone(&call_id, &state.call_actors) {
+    // The CANCEL path removed the call, its registry entries and its event
+    // receiver. What it could not do is run `@b2bua.on_cancel`: the handler was
+    // still running, and whatever it set up (a media offer it was awaiting) did
+    // not exist yet. That hook runs here, after the handler, so the script can
+    // release it. Closing the handler window and storing the INVITE are one
+    // step, so a CANCEL arriving from now on fires `on_cancel` itself.
+    let call_exists = state
+        .call_actors
+        .finish_invite_handler(&call_id, Arc::clone(&message_arc));
+    let cancelled =
+        cancelled_during_handler.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst));
+    if cancelled {
+        info!(
+            call_id = %call_id,
+            action = action.name(),
+            "B2BUA: call was CANCELled while @b2bua.on_invite ran — action not applied, running on_cancel"
+        );
+        run_b2bua_cancel_handlers(
+            &call_id,
+            Some(Arc::clone(&message_arc)),
+            inbound.remote_addr.ip().to_string(),
+            format!("{}", inbound.transport).to_lowercase(),
+            py_flow_from_inbound(&inbound),
+            state,
+        );
+        return;
+    }
+    if !call_exists || invite_action_target_gone(&call_id, &state.call_actors) {
         info!(
             call_id = %call_id,
             action = action.name(),
@@ -566,11 +645,6 @@ pub fn handle_b2bua_invite(inbound: InboundMessage, message: SipMessage, state: 
         );
         return;
     }
-
-    // Store the A-leg INVITE for later use by on_answer/on_failure/on_bye handlers
-    state
-        .call_actors
-        .set_a_leg_invite(&call_id, Arc::clone(&message_arc));
 
     // Who the caller authenticated as, if the script challenged it: what a
     // registered phone's own call is recognised by (`watch_caller_dialog`).
