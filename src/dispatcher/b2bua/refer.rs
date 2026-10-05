@@ -19,11 +19,45 @@ pub struct PendingInboundRefer {
     pub message: SipMessage,
     /// Parsed Refer-To — target URI + any embedded Replaces (attended transfer).
     pub refer_to: crate::sip::headers::refer::ReferTo,
-    /// Whether the REFER arrived on the A-leg dialog (drives survivor selection in
-    /// terminate mode — see [`b2bua_refer_accept`]).
-    pub from_a_leg: bool,
     /// When the decision deadline expires and the sweep applies the 603 default.
     pub deadline: std::time::Instant,
+    /// The SIP Call-ID the call's control channel was bound to when the REFER
+    /// was held: how a decision still finds it once the call itself is gone
+    /// ([`PendingInboundReferStore::take_for_channel`]).
+    pub channel_sip_call_id: String,
+}
+
+impl PendingInboundRefer {
+    /// Whether the held REFER was sent in the dialog `sip_call_id` by the party
+    /// tagged `peer_tag` (RFC 3261 §12: a request's Call-ID and From-tag name
+    /// its dialog and its sender).
+    pub fn sent_in_dialog(&self, sip_call_id: &str, peer_tag: Option<&str>) -> bool {
+        self.message
+            .headers
+            .call_id()
+            .is_some_and(|held| held == sip_call_id)
+            && self.referrer_tag().as_deref() == peer_tag
+    }
+
+    /// The referrer's own tag: the REFER's From-tag.
+    fn referrer_tag(&self) -> Option<String> {
+        self.message
+            .typed_from()
+            .ok()
+            .flatten()
+            .and_then(|from| from.tag)
+    }
+
+    /// Which leg of `call` the referrer is on now: `true` for the A-leg. Read
+    /// off the REFER's own dialog, as the direction of any in-dialog request
+    /// is, and not remembered from when the REFER arrived: a `Replaces`
+    /// takeover that replaced the callee has moved the caller to the call's
+    /// other slot since. `None` when that dialog is no longer on the call.
+    pub fn referrer_on_a_leg(&self, call: &crate::b2bua::actor::CallActor) -> Option<bool> {
+        let sip_call_id = self.message.headers.call_id()?;
+        call.request_direction(sip_call_id, self.referrer_tag().as_deref())
+            .map(|side| side == crate::b2bua::actor::LegSide::A)
+    }
 }
 
 /// What became of a REFER offered to the pending store.
@@ -38,9 +72,15 @@ pub enum ReferHold {
 }
 
 /// Per-call store of inbound REFERs on *controlled* calls awaiting a control-app
-/// decision, keyed by the SIP Call-ID the call's control channel is bound to —
-/// the A-leg's, whichever leg the REFER arrived on, since that is the key the
-/// `accept_refer` / `reject_refer` verbs present.
+/// decision, keyed by the call's own id (the `CallActor` id), as
+/// [`ControllerReferStore`] is.
+///
+/// Not by the SIP Call-ID its control channel is bound to, which is the
+/// A-leg's: a `Replaces` takeover or a replacement of the caller puts another
+/// dialog in the A-leg slot, and an entry kept under the Call-ID that left was
+/// found by nothing afterwards but its deadline. The `accept_refer` /
+/// `reject_refer` verbs present the channel's Call-ID, which is resolved to the
+/// call it names now ([`take_held_refer`]).
 ///
 /// New per-call state: every entry is removed on accept, reject, or the decision
 /// deadline, so the store drains back to baseline under a completed workload (the
@@ -58,8 +98,8 @@ impl PendingInboundReferStore {
     /// deadline. Race-safe via the map entry API (the junction is not guaranteed
     /// serialized per Call-ID across workers).
     #[cfg(test)]
-    pub fn insert(&self, sip_call_id: &str, pending: PendingInboundRefer) -> bool {
-        matches!(self.hold(sip_call_id, pending), ReferHold::Held)
+    pub fn insert(&self, call_id: &str, pending: PendingInboundRefer) -> bool {
+        matches!(self.hold(call_id, pending), ReferHold::Held)
     }
 
     /// Record a pending REFER, telling a retransmission of the one already held
@@ -70,9 +110,9 @@ impl PendingInboundReferStore {
     /// request (Call-ID and CSeq, RFC 3261 §17.2.3) is absorbed, anything else
     /// is handed back to be answered rather than dropped. Race-safe via the map
     /// entry API.
-    pub fn hold(&self, sip_call_id: &str, pending: PendingInboundRefer) -> ReferHold {
+    pub fn hold(&self, call_id: &str, pending: PendingInboundRefer) -> ReferHold {
         use dashmap::mapref::entry::Entry;
-        match self.entries.entry(sip_call_id.to_string()) {
+        match self.entries.entry(call_id.to_string()) {
             Entry::Occupied(held) => {
                 if same_request(&held.get().message, &pending.message) {
                     ReferHold::Retransmit
@@ -87,22 +127,46 @@ impl PendingInboundReferStore {
         }
     }
 
-    /// Remove + return the pending REFER for a call (accept / reject path). `None`
-    /// when nothing is pending (already decided, timed out, or never controlled).
-    pub fn take(&self, sip_call_id: &str) -> Option<PendingInboundRefer> {
-        self.entries.remove(sip_call_id).map(|(_, pending)| pending)
+    /// Remove + return the REFER held for the call `call_id`. `None` when
+    /// nothing is pending (already decided, timed out, or never controlled).
+    pub fn take(&self, call_id: &str) -> Option<PendingInboundRefer> {
+        self.entries.remove(call_id).map(|(_, pending)| pending)
     }
 
-    /// Remove + return the call's pending REFER when the party on the given leg
-    /// sent it (that party hanging up). `None` when nothing is pending or the
-    /// other party sent it.
-    pub fn take_from_leg(
+    /// Remove + return the REFER held for the call a control channel's Call-ID
+    /// names (the accept / reject path). `call_id` is the call that Call-ID
+    /// resolves to now. With the call gone there is nothing to resolve, and
+    /// the REFER is found by the Call-ID the channel stood on when it was
+    /// held, so it can still be answered.
+    pub fn take_for_channel(
         &self,
+        channel_sip_call_id: &str,
+        call_id: Option<&str>,
+    ) -> Option<PendingInboundRefer> {
+        if let Some(call_id) = call_id {
+            return self.take(call_id);
+        }
+        let orphaned = self
+            .entries
+            .iter()
+            .find(|entry| entry.value().channel_sip_call_id == channel_sip_call_id)
+            .map(|entry| entry.key().clone())?;
+        self.take(&orphaned)
+    }
+
+    /// Remove + return the call's pending REFER when it was sent in the dialog
+    /// `sip_call_id` by the party tagged `peer_tag` (that party's dialog is
+    /// ending). `None` when nothing is pending or the other party sent it.
+    pub fn take_from_dialog(
+        &self,
+        call_id: &str,
         sip_call_id: &str,
-        from_a_leg: bool,
+        peer_tag: Option<&str>,
     ) -> Option<PendingInboundRefer> {
         self.entries
-            .remove_if(sip_call_id, |_, pending| pending.from_a_leg == from_a_leg)
+            .remove_if(call_id, |_, pending| {
+                pending.sent_in_dialog(sip_call_id, peer_tag)
+            })
             .map(|(_, pending)| pending)
     }
 
@@ -661,14 +725,15 @@ pub fn hold_controlled_refer(
     if answer_refer_during_controller_transfer(&inbound, &message, referrer, state) {
         return None;
     }
+    // Held under the call, not under the Call-ID its channel stands on today.
     let held = state.pending_inbound_refer.hold(
-        &channel_call_id,
+        call_id,
         PendingInboundRefer {
             inbound,
             message,
             refer_to: refer_to.clone(),
-            from_a_leg: referrer.from_a_leg,
             deadline: std::time::Instant::now() + refer_decision_deadline(bus),
+            channel_sip_call_id: channel_call_id.clone(),
         },
     );
     match held {

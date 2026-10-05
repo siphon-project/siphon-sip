@@ -955,6 +955,15 @@ decision is no longer pending (`accept_refer` / `reject_refer` answer
 | the other party's BYE, `hangup`, or any other teardown | `603 Decline`, ahead of the BYE siphon sends the referrer |
 | nothing siphon noticed, and `accept_refer` then finds the call gone | `481 Call/Transaction Does Not Exist` |
 
+The REFER is held for the call, not for the Call-ID the channel was bound to
+when it arrived. An INVITE with `Replaces` that takes the other party's place,
+or a `replace_peer` of it, leaves the REFER pending: the channel follows the
+call to the new dialog, `accept_refer` / `reject_refer` on it still decide the
+REFER, and a transfer accepted then replaces the party the referrer is talking
+to now. When the party taken over or replaced is the referrer itself, its REFER
+is answered `487 Request Terminated` ahead of the BYE that releases it, and the
+decision is no longer pending.
+
 #### A transfer the application carries out
 
 `terminate` has siphon dial the target and `transparent` has it relay the

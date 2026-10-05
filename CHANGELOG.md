@@ -474,6 +474,29 @@ entry, but a working config keeps working.
   before, and a retransmission of the REFER being carried out still gets its
   own `202` again. A second REFER while one is undecided, and one during a
   transfer in `controller` mode, were already refused this way.
+- **A REFER held for a decision stays with its call when the call's A-leg
+  changes.** A REFER on a controlled call waits for `accept_refer` /
+  `reject_refer` under a key, and the key was the SIP Call-ID the call's
+  control channel is bound to, the A-leg's. An INVITE with `Replaces` (RFC
+  3891) that takes one side of the call over, or a replacement of the caller,
+  puts another dialog in the A-leg slot: the channel follows it there, the
+  held REFER stayed under the Call-ID that had left, and from then on neither
+  the application's decision nor the end of the call found it. `accept_refer`
+  and `reject_refer` answered `not_found` for a transfer the application had
+  just been asked about, a party hanging up was not sent the response its
+  REFER was owed, and only the decision deadline's `603` answered it. It is
+  now held under the call itself. A decision that names the call by its
+  channel finds it whatever Call-ID the channel stands on; the call ending
+  answers it (`603`, ahead of the BYE to its sender); and its sender's own
+  BYE answers it `487` (RFC 3261 §15.1.2). The referrer is also recognised by
+  the dialog its REFER arrived in rather than by which side of the call that
+  dialog was on then: a takeover of the callee moves the caller to the call's
+  other slot, and a transfer accepted afterwards replaces the party the
+  referrer is talking to now and reports to the referrer, where it would have
+  taken the newcomer for the referrer. A referrer that is itself taken over
+  or replaced has its held REFER answered `487` ahead of the BYE that
+  releases it, and a decision reaching a REFER whose dialog has left the call
+  answers it `481`.
 
 ### Changed
 

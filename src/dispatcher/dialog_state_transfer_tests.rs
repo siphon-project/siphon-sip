@@ -687,14 +687,15 @@ async fn a_refer_from_the_callee_of_a_controlled_call_reaches_its_application() 
     assert_eq!(header(&sent[0].message, "Call-ID"), call.a_call_id);
     assert!(queued(&connection).await.is_empty());
 
-    // Held under the channel's Call-ID, which is the key the verbs present, and
-    // it is the callee's REFER that is held.
+    // Found by the channel's Call-ID, which is what the verbs present, and it
+    // is the callee's REFER that is held.
     assert_eq!(state.pending_inbound_refer.len(), 1);
-    let pending = state
-        .pending_inbound_refer
-        .take(&call.a_call_id)
-        .expect("held under the channel's Call-ID");
-    assert!(!pending.from_a_leg);
+    let pending = take_held_refer(state, &call.a_call_id).expect("found by the channel's Call-ID");
+    let referrer_on_a_leg = state
+        .call_actors
+        .get_call(&call.call_id())
+        .and_then(|held_for| pending.referrer_on_a_leg(&held_for));
+    assert_eq!(referrer_on_a_leg, Some(false));
     assert_eq!(header(&pending.message, "Call-ID"), b_call_id);
     assert_eq!(state.pending_inbound_refer.len(), 0, "drained");
 }
@@ -971,7 +972,7 @@ async fn an_attended_refer_names_the_hosted_dialog_it_replaces() {
     assert_eq!(local["channel"], "channel-9100");
     assert_eq!(local["leg"], "b");
     assert!(local["bridged_with"].is_null(), "this call is not a bridge");
-    assert!(state.pending_inbound_refer.take(&call.a_call_id).is_some());
+    assert!(take_held_refer(state, &call.a_call_id).is_some());
 
     // A dialog this node does not host.
     let foreign = crate::sip::headers::refer::ReferTo {
@@ -999,7 +1000,7 @@ async fn an_attended_refer_names_the_hosted_dialog_it_replaces() {
     assert_eq!(replaces["call_id"], "elsewhere@192.0.2.250");
     assert_eq!(replaces["early_only"], true);
     assert!(replaces["local"].is_null());
-    assert!(state.pending_inbound_refer.take(&call.a_call_id).is_some());
+    assert!(take_held_refer(state, &call.a_call_id).is_some());
 }
 
 /// A call whose INVITE carried a `Replaces` naming a hosted dialog tells the

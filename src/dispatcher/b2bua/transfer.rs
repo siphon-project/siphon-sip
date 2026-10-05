@@ -289,6 +289,10 @@ pub fn b2bua_bridge_inbound_replaces(
         warn!(call_id = %replaced_call_id, "B2BUA Replaces: failed to answer the taking-over INVITE");
     }
 
+    // A REFER the replaced party sent, still held for its application, is
+    // answered ahead of the BYE that ends its dialog.
+    pending_refer_leg_released(state, &replaced_call_id, &replaced);
+
     // RFC 3891 §3: the replaced dialog is terminated once the new INVITE is
     // accepted. Its leg is already off the call, so this BYE is built from the
     // snapshot taken during the swap. A replaced party that has not ACKed its 2xx
@@ -714,6 +718,9 @@ pub fn b2bua_complete_terminated_transfer(
         control_channel_follows_a_leg(state, call_id, previous);
     }
     if let Some(referrer_leg) = promoted_referrer.filter(|_| !referrer_gone) {
+        // A REFER the replaced party sent before a `replace_peer` took its
+        // place, still held for its application, is answered ahead of its BYE.
+        pending_refer_leg_released(state, call_id, &referrer_leg);
         if let Some(bye) = build_b2bua_bye(&referrer_leg, state) {
             match notify_branch.take() {
                 // A NOTIFY is going out on this dialog, so the BYE waits for it

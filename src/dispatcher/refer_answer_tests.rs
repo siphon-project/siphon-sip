@@ -10,9 +10,10 @@
 //! * a REFER held for an application's decision is answered whatever happens
 //!   to its call in the meantime, and the held entry goes with it.
 
-use super::dialog_state_events_tests::{header, inbound, responds, wire, Sent};
+use super::dialog_state_events_tests::{header, inbound, register, responds, tag_of, wire, Sent};
 use super::dialog_state_transfer_tests::{
-    answer, control_plane, establish, hang_up, in_dialog, respond, sent_to, Established,
+    answer, control_plane, establish, hang_up, in_dialog, invite, place, respond,
+    response_to_phone, sent_to, Established,
 };
 use super::*;
 use crate::script::api::call::ReferMode;
@@ -593,7 +594,7 @@ async fn a_rejected_refer_is_rejected_again_and_a_new_one_is_a_new_request() {
     state
         .pending_inbound_refer
         .entries
-        .get_mut(&controlled.call.a_call_id)
+        .get_mut(&controlled.call_id)
         .expect("the held REFER")
         .deadline = std::time::Instant::now() - std::time::Duration::from_secs(1);
     tokio::task::block_in_place(|| check_pending_inbound_refer_timeouts(state));
@@ -762,8 +763,366 @@ fn controlled_at_deadline(prefix: u32) -> Controlled {
         .state()
         .pending_inbound_refer
         .entries
-        .get_mut(&controlled.call.a_call_id)
+        .get_mut(&controlled.call_id)
         .expect("the held REFER")
         .deadline = std::time::Instant::now() - std::time::Duration::from_secs(1);
     controlled
+}
+
+/// A party that takes one side of a call over with an INVITE carrying
+/// `Replaces` (RFC 3891), from a phone at `address`.
+struct Newcomer {
+    aor: &'static str,
+    address: &'static str,
+    call_id: &'static str,
+    /// The 200 siphon answered its INVITE with.
+    answered: SipMessage,
+}
+
+impl Controlled {
+    /// A new party takes over the caller's side of the call when
+    /// `replace_caller`, the callee's otherwise. The newcomer holds the call's
+    /// A-leg slot afterwards, on a Call-ID of its own, and the call's control
+    /// channel follows it there, as it does on a running control plane.
+    fn taken_over(&self, replace_caller: bool) -> Newcomer {
+        let (aor, address, call_id) = (
+            "sip:takeover@example.com",
+            "192.0.2.199:5060",
+            "takeover@192.0.2.199",
+        );
+        register(aor, address);
+        let replaces = if replace_caller {
+            format!(
+                "Replaces: {};to-tag={};from-tag=a-tag\r\n",
+                self.call.a_call_id,
+                tag_of(&header(&self.call.answer_to_a, "To"))
+            )
+        } else {
+            format!(
+                "Replaces: {};to-tag={};from-tag=b-tag\r\n",
+                header(&self.call.to_b, "Call-ID"),
+                tag_of(&header(&self.call.to_b, "From"))
+            )
+        };
+        let previous = self.call.a_call_id.clone();
+        place(
+            &self.call.dispatcher,
+            address,
+            &invite(
+                address,
+                call_id,
+                &format!("<{aor}>;tag=d-tag"),
+                "sip:takeover@siphon.example.com",
+                &replaces,
+            ),
+        );
+        channel_follows_a_leg(&self.bus, self.state(), &self.call_id, &previous);
+        let sent = wire(&self.call.dispatcher);
+        let answered = response_to_phone(&sent, address, 200);
+        // A replaced callee is released at once. A replaced caller that has
+        // not ACKed its own 2xx gets its BYE behind that ACK (RFC 3261 §15),
+        // so nothing is read for it here.
+        if !replace_caller {
+            assert!(
+                sent_to(&sent, self.call.b.1, Method::Bye).is_some(),
+                "the replaced callee is released: {:?}",
+                summaries(&sent)
+            );
+        }
+        let a_leg = self
+            .state()
+            .call_actors
+            .get_call(&self.call_id)
+            .map(|call| call.a_leg.dialog.call_id.clone());
+        assert_eq!(
+            a_leg.as_deref(),
+            Some(call_id),
+            "the newcomer holds the A-leg"
+        );
+        assert!(
+            self.bus.channel_id_for_sip_call_id(call_id).is_some(),
+            "the channel follows the call to the newcomer's dialog"
+        );
+        Newcomer {
+            aor,
+            address,
+            call_id,
+            answered,
+        }
+    }
+}
+
+impl Newcomer {
+    fn hangs_up(&self, controlled: &Controlled) {
+        hang_up(
+            &controlled.call.dispatcher,
+            self.address,
+            &format!("<{}>;tag=d-tag", self.aor),
+            &header(&self.answered, "To"),
+            self.call_id,
+        );
+    }
+}
+
+/// The callee's REFER is held, and a new party takes the caller's place: the
+/// call's A-leg is now the newcomer's dialog, on another Call-ID. The held
+/// REFER belongs to the call, not to that Call-ID, so the newcomer hanging up
+/// still has it answered ahead of the BYE that ends its sender's dialog, and
+/// nothing stays held.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refer_held_across_a_takeover_of_the_caller_is_answered_when_the_call_ends() {
+    let controlled = controlled(10450);
+    let state = controlled.state();
+    let b = controlled.call.b.1;
+
+    controlled.callee_refers(2);
+    assert_eq!(state.pending_inbound_refer.len(), 1);
+    let newcomer = controlled.taken_over(true);
+    assert_eq!(
+        state.pending_inbound_refer.len(),
+        1,
+        "still awaiting a decision"
+    );
+
+    newcomer.hangs_up(&controlled);
+    let summary = summaries(&wire(&controlled.call.dispatcher));
+    let declined = summary.iter().position(|line| *line == format!("603 {b}"));
+    let released = summary.iter().position(|line| *line == format!("BYE {b}"));
+    assert!(
+        declined.is_some() && declined < released,
+        "the REFER is answered ahead of the BYE that ends its dialog: {summary:?}"
+    );
+    assert_eq!(state.pending_inbound_refer.len(), 0, "nothing stays held");
+    assert_eq!(state.call_actors.count(), 0);
+}
+
+/// After the same takeover the application decides, naming the call by its
+/// channel, which now stands on the newcomer's Call-ID: the held REFER is
+/// found and carried out, on the referrer's own dialog.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refer_held_across_a_takeover_is_still_decided_by_its_channel() {
+    let controlled = controlled(10500);
+    let state = controlled.state();
+    let (b, c) = (controlled.call.b.1, controlled.call.c.1);
+
+    controlled.callee_refers(2);
+    let newcomer = controlled.taken_over(true);
+    let accepted = tokio::task::block_in_place(|| {
+        b2bua_accept_refer_with_state(
+            state,
+            newcomer.call_id,
+            None,
+            None,
+            Some(ReferMode::Terminate),
+            None,
+            None,
+            &ReplacementDial::default(),
+        )
+    });
+    assert!(accepted, "the REFER is found by the channel's Call-ID");
+    let sent = summaries(&wire(&controlled.call.dispatcher));
+    assert!(sent.contains(&format!("202 {b}")), "{sent:?}");
+    assert!(sent.contains(&format!("INVITE {c}")), "{sent:?}");
+    assert_eq!(state.pending_inbound_refer.len(), 0);
+}
+
+/// The caller's REFER is held, and a new party takes the callee's place. The
+/// takeover moves the caller to the call's other slot. Its REFER is still its
+/// own: when the caller hangs up, the REFER is answered `487` ahead of the
+/// BYE's `200` (RFC 3261 §15.1.2), and nothing stays held.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refer_follows_its_sender_when_a_takeover_moves_it_to_the_other_leg() {
+    let controlled = controlled(10550);
+    let state = controlled.state();
+    let a = controlled.call.a.1;
+
+    controlled.caller_refers(2);
+    assert_eq!(state.pending_inbound_refer.len(), 1);
+    let _newcomer = controlled.taken_over(false);
+    assert_eq!(state.pending_inbound_refer.len(), 1);
+
+    controlled.caller_hangs_up();
+    let sent = wire(&controlled.call.dispatcher);
+    let terminated = sent
+        .iter()
+        .position(|sent| sent.destination == a && sent.message.status_code() == Some(487))
+        .unwrap_or_else(|| panic!("the REFER is answered: {:?}", summaries(&sent)));
+    assert_eq!(header(&sent[terminated].message, "CSeq"), "2 REFER");
+    let bye_answered = sent
+        .iter()
+        .position(|sent| sent.destination == a && sent.message.status_code() == Some(200));
+    assert!(Some(terminated) < bye_answered, "{:?}", summaries(&sent));
+    assert_eq!(state.pending_inbound_refer.len(), 0, "nothing stays held");
+}
+
+/// Accepted after such a takeover, the transfer replaces the party the
+/// referrer is talking to now, and the referrer is the one it reports to: the
+/// leg the REFER came from is read off the REFER's own dialog, not off where
+/// that dialog sat when the REFER arrived.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refer_accepted_after_a_takeover_names_its_sender_as_the_referrer() {
+    let controlled = controlled(10600);
+    let state = controlled.state();
+    let (a, c) = (controlled.call.a.1, controlled.call.c.1);
+
+    controlled.caller_refers(2);
+    let newcomer = controlled.taken_over(false);
+    let accepted = tokio::task::block_in_place(|| {
+        b2bua_accept_refer_with_state(
+            state,
+            newcomer.call_id,
+            None,
+            None,
+            Some(ReferMode::Terminate),
+            None,
+            None,
+            &ReplacementDial::default(),
+        )
+    });
+    assert!(accepted);
+    let sent = wire(&controlled.call.dispatcher);
+    let summary = summaries(&sent);
+    assert!(summary.contains(&format!("202 {a}")), "{summary:?}");
+    assert!(summary.contains(&format!("NOTIFY {a}")), "{summary:?}");
+    assert!(summary.contains(&format!("INVITE {c}")), "{summary:?}");
+    let notify = sent_to(&sent, a, Method::Notify).expect("the first NOTIFY");
+    assert_eq!(
+        header(&notify, "Call-ID"),
+        controlled.call.a_call_id,
+        "on the referrer's own dialog"
+    );
+    let referrer_on_a_leg = state
+        .call_actors
+        .get_call(&controlled.call_id)
+        .and_then(|call| {
+            call.refer_subscriptions
+                .first()
+                .map(|subscription| subscription.on_a_leg)
+        });
+    assert_eq!(
+        referrer_on_a_leg,
+        Some(false),
+        "the referrer sits on the callee's side of the call now"
+    );
+}
+
+/// The referrer itself is the party taken over: its dialog is ended by siphon,
+/// so its held REFER is answered `487` ahead of that BYE and released.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_referrer_that_is_taken_over_has_its_held_refer_answered() {
+    let controlled = controlled(10650);
+    let state = controlled.state();
+    let b = controlled.call.b.1;
+
+    controlled.callee_refers(2);
+    assert_eq!(state.pending_inbound_refer.len(), 1);
+    let (aor, address, call_id) = (
+        "sip:takeover@example.com",
+        "192.0.2.199:5060",
+        "takeover-referrer@192.0.2.199",
+    );
+    register(aor, address);
+    place(
+        &controlled.call.dispatcher,
+        address,
+        &invite(
+            address,
+            call_id,
+            &format!("<{aor}>;tag=d-tag"),
+            "sip:takeover@siphon.example.com",
+            &format!(
+                "Replaces: {};to-tag={};from-tag=b-tag\r\n",
+                header(&controlled.call.to_b, "Call-ID"),
+                tag_of(&header(&controlled.call.to_b, "From"))
+            ),
+        ),
+    );
+    let summary = summaries(&wire(&controlled.call.dispatcher));
+    let terminated = summary.iter().position(|line| *line == format!("487 {b}"));
+    let released = summary.iter().position(|line| *line == format!("BYE {b}"));
+    assert!(
+        terminated.is_some() && terminated < released,
+        "the REFER is answered ahead of the BYE that ends its dialog: {summary:?}"
+    );
+    assert_eq!(state.pending_inbound_refer.len(), 0, "nothing stays held");
+}
+
+impl Controlled {
+    /// A `replace_peer` of the caller when `replace_caller`, of the callee
+    /// otherwise, by the call's phone C, which answers.
+    fn peer_replaced(&self, replace_caller: bool) {
+        let started = tokio::task::block_in_place(|| {
+            b2bua_replace_peer_with_state(
+                self.state(),
+                &self.call.a_call_id,
+                &self.call.c_uri(),
+                None,
+                replace_caller,
+                None,
+                None,
+                30,
+                &ReplacementDial::default(),
+            )
+        });
+        assert!(started.is_ok(), "{started:?}");
+        let to_c = sent_to(&wire(&self.call.dispatcher), self.call.c.1, Method::Invite)
+            .expect("the target is dialled");
+        self.target_responds(&to_c, 200);
+    }
+}
+
+/// The callee's REFER is held and the caller is replaced with `replace_peer`:
+/// the target takes the A-leg slot on a Call-ID of its own. The call ending
+/// still answers the REFER ahead of the BYE to its sender, and nothing stays
+/// held.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refer_held_across_a_replacement_of_the_caller_is_answered_when_the_call_ends() {
+    let controlled = controlled(10700);
+    let state = controlled.state();
+    let b = controlled.call.b.1;
+
+    controlled.callee_refers(2);
+    controlled.peer_replaced(true);
+    let _ = wire(&controlled.call.dispatcher);
+    let a_leg = state
+        .call_actors
+        .get_call(&controlled.call_id)
+        .map(|call| call.a_leg.dialog.call_id.clone());
+    assert_ne!(a_leg.as_deref(), Some(controlled.call.a_call_id.as_str()));
+    assert_eq!(
+        state.pending_inbound_refer.len(),
+        1,
+        "still awaiting a decision"
+    );
+
+    assert!(tokio::task::block_in_place(|| {
+        b2bua_terminate_call_inner(&controlled.call_id, None, "b2bua", state)
+    }));
+    let summary = summaries(&wire(&controlled.call.dispatcher));
+    let declined = summary.iter().position(|line| *line == format!("603 {b}"));
+    let released = summary.iter().position(|line| *line == format!("BYE {b}"));
+    assert!(declined.is_some() && declined < released, "{summary:?}");
+    assert_eq!(state.pending_inbound_refer.len(), 0, "nothing stays held");
+}
+
+/// The callee's REFER is held and the callee itself is replaced with
+/// `replace_peer`: its REFER is answered `487` ahead of the BYE that releases
+/// it once the target has answered, and nothing stays held.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_referrer_that_is_replaced_has_its_held_refer_answered() {
+    let controlled = controlled(10750);
+    let state = controlled.state();
+    let b = controlled.call.b.1;
+
+    controlled.callee_refers(2);
+    assert_eq!(state.pending_inbound_refer.len(), 1);
+    controlled.peer_replaced(false);
+    let summary = summaries(&wire(&controlled.call.dispatcher));
+    let terminated = summary.iter().position(|line| *line == format!("487 {b}"));
+    let released = summary.iter().position(|line| *line == format!("BYE {b}"));
+    assert!(
+        terminated.is_some() && terminated < released,
+        "the REFER is answered ahead of the BYE that ends its dialog: {summary:?}"
+    );
+    assert_eq!(state.pending_inbound_refer.len(), 0, "nothing stays held");
 }

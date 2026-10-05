@@ -511,7 +511,7 @@ pub fn b2bua_accept_refer_with_state(
     number_shape: Option<crate::script::api::numbers::NumberShape>,
     dial: &ReplacementDial,
 ) -> bool {
-    let Some(pending) = state.pending_inbound_refer.take(sip_call_id) else {
+    let Some(pending) = take_held_refer(state, sip_call_id) else {
         return false;
     };
     let Some(internal_call_id) = state.call_actors.find_by_sip_call_id(sip_call_id) else {
@@ -528,6 +528,9 @@ pub fn b2bua_accept_refer_with_state(
         );
         return false;
     };
+    let Some(referrer_on_a_leg) = held_referrer_leg(&pending, &internal_call_id, state) else {
+        return false;
+    };
     // Decided: from here to its final response a copy of this REFER arriving
     // on another worker is a retransmission, not a new request to hold.
     state.answered_refers.proceeding(
@@ -542,7 +545,7 @@ pub fn b2bua_accept_refer_with_state(
         pending.inbound,
         pending.message,
         &internal_call_id,
-        pending.from_a_leg,
+        referrer_on_a_leg,
         &target_uri,
         next_hop.as_deref(),
         pending.refer_to.replaces.clone(),
@@ -754,7 +757,7 @@ pub fn b2bua_reject_refer_with_state(
     code: u16,
     reason: &str,
 ) -> bool {
-    let Some(pending) = state.pending_inbound_refer.take(sip_call_id) else {
+    let Some(pending) = take_held_refer(state, sip_call_id) else {
         return false;
     };
     b2bua_refer_send_final(&pending.inbound, &pending.message, code, reason, state);

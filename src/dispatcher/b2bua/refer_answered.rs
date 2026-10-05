@@ -319,44 +319,100 @@ const REFERRER_LEFT_STATUS: (u16, &str) = (487, "Request Terminated");
 /// to transfer, so it is declined, as it is when nobody decides in time.
 const CALL_ENDED_STATUS: (u16, &str) = (603, "Decline");
 
-/// The party on one leg of a call hung up: a REFER of its own still held for
-/// its application's decision is answered now, and released.
+/// A party's dialog on a call is ending, by its own BYE or because siphon is
+/// releasing it (a `Replaces` takeover, a replacement): a REFER it sent in
+/// that dialog, still held for its application's decision, is answered now,
+/// and released.
 ///
-/// Before the BYE's own `200`, while the flow the REFER arrived on is the one
-/// thing known about where to answer it. Asked for every BYE, so it stays
-/// cheap when nothing is held.
-pub fn pending_refer_referrer_left(state: &DispatcherState, call_id: &str, from_a_leg: bool) {
+/// `sip_call_id` and `peer_tag` name the dialog and the party (RFC 3261 §12),
+/// which is how the REFER is recognised as that party's own wherever its leg
+/// sits on the call. Before the BYE's own `200`, or before siphon's BYE, while
+/// the flow the REFER arrived on is the one thing known about where to answer
+/// it. Asked for every BYE, so it stays cheap when nothing is held.
+pub fn pending_refer_referrer_left(
+    state: &DispatcherState,
+    call_id: &str,
+    sip_call_id: &str,
+    peer_tag: Option<&str>,
+) {
     if state.pending_inbound_refer.is_empty() {
         return;
     }
-    let Some(key) = state
-        .call_actors
-        .get_call(call_id)
-        .map(|call| call.a_leg.dialog.call_id.clone())
-    else {
-        return;
-    };
-    if let Some(pending) = state.pending_inbound_refer.take_from_leg(&key, from_a_leg) {
+    if let Some(pending) =
+        state
+            .pending_inbound_refer
+            .take_from_dialog(call_id, sip_call_id, peer_tag)
+    {
         let (code, reason) = REFERRER_LEFT_STATUS;
         info!(
             call_id = %call_id,
-            referrer_on_a_leg = from_a_leg,
-            "B2BUA REFER: the referrer hung up before its transfer was decided — {code}"
+            %sip_call_id,
+            "B2BUA REFER: the referrer's dialog ended before its transfer was decided — {code}"
         );
         b2bua_refer_send_final(&pending.inbound, &pending.message, code, reason, state);
     }
+}
+
+/// [`pending_refer_referrer_left`] for a leg siphon is about to release.
+pub fn pending_refer_leg_released(state: &DispatcherState, call_id: &str, leg: &Leg) {
+    pending_refer_referrer_left(
+        state,
+        call_id,
+        &leg.dialog.call_id,
+        leg.dialog.remote_tag.as_deref(),
+    );
+}
+
+/// Take the REFER held for the call a control channel's Call-ID names: what
+/// `accept_refer` and `reject_refer` decide on.
+pub fn take_held_refer(state: &DispatcherState, sip_call_id: &str) -> Option<PendingInboundRefer> {
+    if state.pending_inbound_refer.is_empty() {
+        return None;
+    }
+    let call_id = state.call_actors.find_by_sip_call_id(sip_call_id);
+    state
+        .pending_inbound_refer
+        .take_for_channel(sip_call_id, call_id.as_deref())
+}
+
+/// The leg of `call_id` the referrer of a held REFER is on now, for a decision
+/// about to be carried out. `None` when the referrer's dialog is no longer on
+/// the call: the REFER is answered `481` here (RFC 3515 §2.4.2 has it answered
+/// whatever became of its dialog) and there is nothing left to carry out.
+pub fn held_referrer_leg(
+    pending: &PendingInboundRefer,
+    call_id: &str,
+    state: &DispatcherState,
+) -> Option<bool> {
+    let leg = state
+        .call_actors
+        .get_call(call_id)
+        .and_then(|call| pending.referrer_on_a_leg(&call));
+    if leg.is_none() {
+        warn!(
+            call_id = %call_id,
+            "B2BUA REFER: the referrer's dialog left the call before its transfer was decided — 481"
+        );
+        b2bua_refer_send_final(
+            &pending.inbound,
+            &pending.message,
+            481,
+            "Call/Transaction Does Not Exist",
+            state,
+        );
+    }
+    leg
 }
 
 /// The call is being torn down: answer the REFER still held for its
 /// application's decision, release it, and forget the REFERs already
 /// answered on it.
 ///
-/// `a_leg_sip_call_id` is the Call-ID the call's control channel is bound to,
-/// which is what a held REFER is kept under. Called before the BYEs go out, so
-/// the referrer has its final response ahead of the BYE that ends its dialog.
-pub fn refers_end_with_call(state: &DispatcherState, call_id: &str, a_leg_sip_call_id: &str) {
+/// Called before the BYEs go out, so the referrer has its final response ahead
+/// of the BYE that ends its dialog.
+pub fn refers_end_with_call(state: &DispatcherState, call_id: &str) {
     let held = (!state.pending_inbound_refer.is_empty())
-        .then(|| state.pending_inbound_refer.take(a_leg_sip_call_id))
+        .then(|| state.pending_inbound_refer.take(call_id))
         .flatten();
     if let Some(pending) = held {
         let (code, reason) = CALL_ENDED_STATUS;
