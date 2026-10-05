@@ -347,6 +347,10 @@ async fn the_answering_branch_is_named_and_the_losers_as_cancelled() {
     let winner_leg = text(branch_named(&events, &call_id_of(&winner)), "leg_id").to_string();
     let loser_leg = text(branch_named(&events, &call_id_of(&loser)), "leg_id").to_string();
 
+    // The loser holds its INVITE: a 100 Trying is the provisional its CANCEL
+    // has to wait for (RFC 3261 §9.1), and is no event of its own.
+    parked.responds(FIRST_TARGET, &loser, 100, "Trying");
+    assert!(parked.events().is_empty());
     parked.responds(SECOND_TARGET, &winner, 200, "OK");
 
     let events = parked.events();

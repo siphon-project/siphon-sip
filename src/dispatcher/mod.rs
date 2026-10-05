@@ -96,6 +96,8 @@ mod bad_extension_tests;
 #[cfg(test)]
 mod bridged_pair_media_events_tests;
 #[cfg(test)]
+mod cancel_awaits_provisional_tests;
+#[cfg(test)]
 mod carrier_attribution_tests;
 #[cfg(test)]
 mod control_bridge_media_tests;

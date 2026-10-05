@@ -105,6 +105,11 @@ pub(super) fn client_retransmit_source(
 /// listener here would put the retry outside the IPsec SA, which is precisely
 /// the failure this whole path exists to survive (3GPP TS 33.203 §7.4).
 pub(super) fn sweep_b2bua_retransmits(state: &DispatcherState) {
+    sweep_b2bua_retransmits_at(state, std::time::Instant::now());
+}
+
+/// [`sweep_b2bua_retransmits`] as of `now`.
+pub(super) fn sweep_b2bua_retransmits_at(state: &DispatcherState, now: std::time::Instant) {
     use crate::b2bua::retransmit::Due;
 
     // `due` walks every shard, so skip it outright on a proxy-only deployment
@@ -113,7 +118,7 @@ pub(super) fn sweep_b2bua_retransmits(state: &DispatcherState) {
         return;
     }
 
-    for event in state.b2bua_retransmits.due(std::time::Instant::now()) {
+    for event in state.b2bua_retransmits.due(now) {
         match event {
             Due::Send {
                 key,
@@ -152,6 +157,13 @@ pub(super) fn sweep_b2bua_retransmits(state: &DispatcherState) {
                     attempts,
                     "B2BUA: no response after 64*T1 — giving up on retransmitting request"
                 );
+                // Timer B (RFC 3261 §17.1.1.2): the INVITE's client transaction
+                // is over. A leg siphon had given up on, whose CANCEL was still
+                // waiting for a provisional (§9.1), ends here with it, and no
+                // CANCEL is ever sent.
+                if key.method == crate::sip::message::Method::Invite {
+                    state.call_actors.invite_transaction_timed_out(&key.branch);
+                }
             }
         }
     }

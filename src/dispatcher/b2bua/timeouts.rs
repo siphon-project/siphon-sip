@@ -218,13 +218,11 @@ pub fn fail_b2bua_call_on_timeout(call_id: &str, state: &DispatcherState) {
             if call.failure_concluding {
                 return;
             }
-            // We are giving up on this ring, so stop retransmitting every B-leg
-            // INVITE that never drew a response. The CANCELs below cover the
-            // legs whose INVITE was stashed; this also catches a leg whose stash
-            // never landed, which would otherwise keep retransmitting until 64*T1.
-            for b_leg in &call.b_legs {
-                state.b2bua_retransmits.disarm_branch(&b_leg.branch);
-            }
+            // We are giving up on this ring. The CANCELs below cover the legs
+            // whose INVITE was stashed, each when RFC 3261 §9.1 allows it; this
+            // catches a leg whose stash never landed, which would otherwise
+            // keep retransmitting until 64*T1.
+            disarm_unstashed_b_leg_invites(&call, state);
             let handle_txs: Vec<_> = call
                 .b_leg_handles
                 .iter()
