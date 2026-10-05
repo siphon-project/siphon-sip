@@ -355,6 +355,11 @@ pub struct DispatcherState {
     /// / reject / the decision-deadline sweep. Empty and cheaply skipped when no
     /// control plane is configured (no call is ever controlled).
     pub pending_inbound_refer: Arc<PendingInboundReferStore>,
+    /// The final response each REFER on a B2BUA call was answered with, kept
+    /// for 64*T1 so a retransmission gets it again instead of being decided on
+    /// a second time — see [`AnsweredReferStore`]. Empty except for that long
+    /// after a REFER.
+    pub answered_refers: Arc<AnsweredReferStore>,
     /// REFER subscriptions on *controlled* B2BUA calls whose transfer the owning
     /// control app carries out itself (`accept_refer` in mode `controller`),
     /// open until it reports with `complete_refer` — see

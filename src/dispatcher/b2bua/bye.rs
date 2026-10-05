@@ -156,6 +156,9 @@ pub fn handle_b2bua_bye(inbound: InboundMessage, message: SipMessage, state: &Di
             None => return,
         };
 
+    // What was kept to answer a REFER's retransmissions goes with the call.
+    state.answered_refers.forget_call(&call_id);
+
     // A bridged partner loses its other half here — before the StasisEnd, so
     // the controller sees the bridge end before the channel does.
     b2bua_bridge_peer_left(&a_leg_call_id, state);

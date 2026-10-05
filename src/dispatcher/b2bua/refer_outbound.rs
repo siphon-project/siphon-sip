@@ -481,7 +481,35 @@ pub(crate) fn b2bua_accept_refer_call_dialling(
     let Some(control) = B2BUA_CONTROL.get() else {
         return false;
     };
-    let state = &control.state;
+    // The send path re-anchors media (block_in_place) and may spawn (TCP/TLS
+    // connect); the caller may be on a non-tokio thread (control apply task) —
+    // establish the runtime, mirroring b2bua_route_call / b2bua_refer_call.
+    let _enter = control.runtime.enter();
+    b2bua_accept_refer_with_state(
+        &control.state,
+        sip_call_id,
+        target,
+        next_hop,
+        mode,
+        media_profile,
+        number_shape,
+        dial,
+    )
+}
+
+/// [`b2bua_accept_refer_call_dialling`] on the dispatcher in hand, from a
+/// thread already inside its runtime.
+#[allow(clippy::too_many_arguments)]
+pub fn b2bua_accept_refer_with_state(
+    state: &DispatcherState,
+    sip_call_id: &str,
+    target: Option<String>,
+    next_hop: Option<String>,
+    mode: Option<crate::script::api::call::ReferMode>,
+    media_profile: Option<String>,
+    number_shape: Option<crate::script::api::numbers::NumberShape>,
+    dial: &ReplacementDial,
+) -> bool {
     let Some(pending) = state.pending_inbound_refer.take(sip_call_id) else {
         return false;
     };
@@ -491,11 +519,13 @@ pub(crate) fn b2bua_accept_refer_call_dialling(
         warn!(%sip_call_id, "b2bua_accept_refer_call: call gone before accept — dropping pending REFER");
         return false;
     };
-
-    // The send path re-anchors media (block_in_place) and may spawn (TCP/TLS
-    // connect); the caller may be on a non-tokio thread (control apply task) —
-    // establish the runtime, mirroring b2bua_route_call / b2bua_refer_call.
-    let _enter = control.runtime.enter();
+    // Decided: from here to its final response a copy of this REFER arriving
+    // on another worker is a retransmission, not a new request to hold.
+    state.answered_refers.proceeding(
+        &internal_call_id,
+        &pending.message,
+        std::time::Instant::now(),
+    );
 
     let mode = mode.unwrap_or(state.default_refer_mode);
     let target_uri = target.unwrap_or_else(|| pending.refer_to.uri.clone());
@@ -706,11 +736,21 @@ pub fn b2bua_reject_refer_call(sip_call_id: &str, code: u16, reason: &str) -> bo
     let Some(control) = B2BUA_CONTROL.get() else {
         return false;
     };
-    let state = &control.state;
+    let _enter = control.runtime.enter();
+    b2bua_reject_refer_with_state(&control.state, sip_call_id, code, reason)
+}
+
+/// [`b2bua_reject_refer_call`] on the dispatcher in hand, from a thread
+/// already inside its runtime.
+pub fn b2bua_reject_refer_with_state(
+    state: &DispatcherState,
+    sip_call_id: &str,
+    code: u16,
+    reason: &str,
+) -> bool {
     let Some(pending) = state.pending_inbound_refer.take(sip_call_id) else {
         return false;
     };
-    let _enter = control.runtime.enter();
     b2bua_refer_send_final(&pending.inbound, &pending.message, code, reason, state);
     true
 }

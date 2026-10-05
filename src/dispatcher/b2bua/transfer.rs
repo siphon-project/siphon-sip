@@ -410,6 +410,12 @@ pub fn b2bua_refer_accept(
                 attended = replaces.is_some(),
                 "B2BUA REFER: accepting (transparent) — forwarding on the far leg"
             );
+            // The far end answers this REFER and siphon relays what it says.
+            // Until then a retransmission has nothing to be answered with, and
+            // must not be relayed as a second REFER on the far leg's dialog.
+            state
+                .answered_refers
+                .proceeding(call_id, &message, std::time::Instant::now());
             b2bua_forward_indialog_request(
                 &inbound,
                 &message,

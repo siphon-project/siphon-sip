@@ -159,6 +159,15 @@ pub fn forward_transfer_response(
             }
         }
 
+        // The far end's final response to a relayed REFER is the referrer's
+        // final response: kept, as relayed, for the REFER's retransmissions
+        // (RFC 3261 §17.2.2).
+        if status_code >= 200 && matches!(marker, crate::b2bua::actor::ForwardedMarker::Refer) {
+            state
+                .answered_refers
+                .answered(call_id, message, std::time::Instant::now());
+        }
+
         if is_a2b {
             send_message_from(
                 message.clone(),

@@ -139,6 +139,15 @@ Two consequences worth knowing when you write handlers:
 * **If the target then fails**, the surviving party has nobody left to talk to,
   so siphon releases it and tears the call down rather than stranding it.
 
+#### When the REFER arrives twice
+
+A `REFER` over UDP is retransmitted until its final response gets through, so
+the same request can arrive after siphon has already acted on it. It is the same
+request (same Call-ID, CSeq and Via branch) and is answered with the same final
+response again, for 32 s: `@b2bua.on_refer` runs once per `REFER`, and the
+target is dialled, or the `REFER` relayed, once. A `REFER` with a new CSeq is a
+new request and runs the handler again.
+
 #### When the target cannot be dialled
 
 The `202` goes out before the target is dialled, so a target siphon can send no

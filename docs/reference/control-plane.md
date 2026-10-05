@@ -851,6 +851,14 @@ One decision is pending per call. A retransmission of the held REFER is
 absorbed; a second REFER on the same call while the first is undecided is
 answered `491 Request Pending`.
 
+A REFER is reported once. After the decision, a retransmission of it (same
+Call-ID, CSeq and Via branch, RFC 3261 §17.2.3) gets the final response the
+decision produced, again, for 64·T1 (32 s): the `202`, the code `reject_refer`
+named, the deadline's `603`, or in `transparent` mode whatever the far end
+answered, and nothing while the far end has not answered yet. It raises no
+second `TransferRequested`, and nothing is dialled or relayed a second time. A
+REFER with a new CSeq is a new request and is reported as one.
+
 The app decides with:
 
 - `accept_refer` — run the transfer through siphon's shipped machinery.

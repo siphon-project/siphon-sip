@@ -101,6 +101,19 @@ entry, but a working config keeps working.
   keeps both its parties with nothing pending. `replace_peer` is still refused
   `bad_request`, with no event, and can be sent again at once. With several
   targets, the ones that were dialled ring on as before.
+- **A retransmitted REFER gets its response again instead of being acted on
+  again.** The B2BUA answers a REFER some time after it arrives, once a
+  script, a controlling application or the far end has decided, and a copy
+  arriving after that (its final response was lost) was taken for a new
+  request. On a controlled call the application got a second
+  `TransferRequested` and a second decision to make. On a call its script
+  accepts, `@b2bua.on_refer` ran again and the target was dialled a second
+  time, or the REFER relayed a second time. A REFER already decided on is now
+  recognised by Call-ID, CSeq and Via branch (RFC 3261 §17.2.3) and answered
+  with the final response it got (§17.2.2), for 64·T1: the `202`, a
+  rejection, the decision deadline's `603`, or what the far end answered in
+  `transparent` mode, where a copy arriving before the far end has answered
+  is absorbed. A REFER with a new CSeq is a new request, as before.
 - **A transfer target given up on at its deadline has its `487` ACKed.** When
   a siphon-terminated transfer or `replace_peer` ran out of time, siphon sent
   the target a CANCEL and forgot the leg at once, so the `487 Request

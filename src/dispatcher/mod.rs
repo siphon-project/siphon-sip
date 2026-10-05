@@ -180,6 +180,8 @@ mod proxy_reply_filter_tests;
 #[cfg(test)]
 mod public_api_surface;
 #[cfg(test)]
+mod refer_answer_tests;
+#[cfg(test)]
 mod relayed_identity_tests;
 #[cfg(test)]
 mod replacement_fork_tests;
@@ -622,6 +624,7 @@ pub async fn run(
         ro_sessions: Arc::new(DashMap::new()),
         cdr_sessions: Arc::new(DashMap::new()),
         pending_inbound_refer: Arc::new(PendingInboundReferStore::default()),
+        answered_refers: Arc::new(AnsweredReferStore::default()),
         controller_refers: Arc::new(ControllerReferStore::default()),
         deferred_referrer_bye: Arc::new(DeferredReferrerByeStore::default()),
         parse_error_log: Arc::new(ParseErrorLimiter::default()),
