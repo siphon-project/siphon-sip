@@ -1930,7 +1930,7 @@ impl PyRequest {
     /// A routing-direction / trust predicate — the siphon equivalent of
     /// Kamailio `ds_is_from_list()` / OpenSIPS `ds_is_in_list()`. Use it to
     /// replace hardcoded source CIDRs when deciding which trunk a request
-    /// arrived from (e.g. an inbound Microsoft Teams call). Matches on IP
+    /// arrived from (e.g. a call inbound from a hosted trunk). Matches on IP
     /// only (the source port is ignored) and against every resolved A/AAAA
     /// candidate of every destination in the group, so a hostname that
     /// round-robins across many IPs matches on any of them.

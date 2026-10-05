@@ -2918,7 +2918,7 @@ def on_invite(call):
     #[test]
     fn b2bua_accept_refer_carries_a_number_policy_for_the_transferred_leg() {
         // A transfer target is named by the referrer, in the referrer's format
-        // (a Teams `Refer-To` names `+E.164`), and dialled at a carrier that
+        // (a `Refer-To` often names `+E.164`), and dialled at a carrier that
         // wants the trunk's. `@b2bua.on_invite` does not run again for the
         // replacement leg, so `accept_refer(number_policy=…)` is where that
         // shaping has to be asked for — this proves the name survives onto the

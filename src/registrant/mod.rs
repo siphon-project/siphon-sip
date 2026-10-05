@@ -964,7 +964,7 @@ impl RegistrantManager {
     /// Handle a failure response (non-401/407, or auth failed twice).
     ///
     /// `retry_after` carries the response's `Retry-After` header (RFC 3261
-    /// §20.33) when present: a carrier / Teams Direct Routing registrar that
+    /// §20.33) when present: a registrar that
     /// answers `503` with `Retry-After` is telling us exactly when to come back,
     /// so we schedule the next attempt at that cooldown instead of the local
     /// exponential backoff. The backoff state is still advanced so that if the

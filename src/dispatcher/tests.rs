@@ -3262,7 +3262,7 @@ fn no_handler_options_is_answered_200_with_contact_and_allow() {
         response.headers.get("Allow").unwrap(),
         crate::sip::SUPPORTED_METHODS
     );
-    // Some peers (Teams Direct Routing) reject an OPTIONS answer carrying
+    // Some peers reject an OPTIONS answer carrying
     // neither Contact nor Record-Route.
     assert_eq!(
         response.headers.get("Contact").unwrap(),
@@ -7229,7 +7229,7 @@ fn sanitize_sdp_identity_no_op_on_empty_body() {
 /// (multi-word product / role name) was being written verbatim into the
 /// SDP `o=` line. RFC 4566 §5.2 splits o= on spaces, so a value like
 /// `o=Foo Bar 123 456 IN IP4 ...` has a malformed username token and
-/// downstream parsers (FreeSWITCH, kamailio) reject the whole SDP body.
+/// downstream parsers reject the whole SDP body.
 #[test]
 fn sanitize_sdp_identity_collapses_whitespace_in_o_username() {
     let sdp = "v=0\r\no=- 1 2 IN IP4 10.0.0.1\r\ns=-\r\nt=0 0\r\nm=audio 8000 RTP/AVP 0\r\n";
@@ -7293,6 +7293,32 @@ fn stamp_sdp_origin_rewrites_address_when_given() {
         "got: {result}",
     );
     assert!(!result.contains("198.51.100.9"));
+}
+
+/// `media.sdp_keep_session_name`: the origin is hidden as always, the session
+/// name crosses as the far side wrote it.
+#[test]
+fn hide_sdp_identity_keeps_the_session_name_when_configured() {
+    let sdp = "v=0\r\no=carol 5 6 IN IP4 198.51.100.9\r\ns=Conference 7\r\nt=0 0\r\n";
+    let mut dispatcher = super::test_dispatcher::test_dispatcher();
+    dispatcher.state.sdp_name = "SIPhon".to_string();
+
+    dispatcher.state.sdp_keep_session_name = true;
+    let mut body = sdp.as_bytes().to_vec();
+    hide_sdp_identity(&mut body, &dispatcher.state, Some("203.0.113.7"));
+    let result = std::str::from_utf8(&body).unwrap();
+    assert!(
+        result.contains("o=SIPhon 5 6 IN IP4 203.0.113.7\r\n"),
+        "got: {result}"
+    );
+    assert!(result.contains("s=Conference 7\r\n"), "got: {result}");
+
+    dispatcher.state.sdp_keep_session_name = false;
+    let mut body = sdp.as_bytes().to_vec();
+    hide_sdp_identity(&mut body, &dispatcher.state, Some("203.0.113.7"));
+    let result = std::str::from_utf8(&body).unwrap();
+    assert!(result.contains("s=SIPhon\r\n"), "got: {result}");
+    assert!(!result.contains("Conference"), "got: {result}");
 }
 
 #[test]

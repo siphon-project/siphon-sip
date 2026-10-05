@@ -84,6 +84,7 @@ export type {
   PlayStartedPayload,
   TransferReplaces,
   TransferRequestedPayload,
+  TransferTimedOutPayload,
   TransferStage,
   TransferOutcomePayload,
   PeerHangupPolicy,

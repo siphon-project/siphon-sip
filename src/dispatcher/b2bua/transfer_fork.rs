@@ -39,6 +39,10 @@ struct ReplacementPlan<'a> {
     survivor_tag: Option<String>,
     survivor_sdp: Option<Vec<u8>>,
     survivor_sip_call_id: String,
+    /// Where the surviving party signals from and whose `received_from`
+    /// policy pins it there: the SDP offered to each target is the
+    /// survivor's. `None` on a call that is not anchored.
+    survivor_ingress: Option<PartyIngress>,
     /// The media profile the surviving pair is anchored with, when the call
     /// is anchored at all.
     anchored_profile: Option<String>,
@@ -70,8 +74,10 @@ struct ReplacementPlan<'a> {
 /// ([`ReplacementDial::also`]): every one gets an INVITE, a Call-ID and an
 /// engine call of its own.
 ///
-/// Returns whether an INVITE reached the transport. A `false` means no
-/// replacement is in flight and the call is untouched.
+/// Returns whether an INVITE reached the transport. A `false` means none did
+/// for any target: the replacement has been ended here
+/// ([`conclude_undialled_replacement`]), a REFER's subscription with a
+/// terminating `503` NOTIFY, and the call is as it was.
 #[allow(clippy::too_many_arguments)]
 pub fn b2bua_start_leg_replacement(
     call_id: &str,
@@ -145,6 +151,30 @@ pub fn b2bua_start_leg_replacement(
         triggered.push(("Referred-By".to_string(), value));
     }
 
+    // The session the call is anchored on, and from it the survivor's own
+    // ingress policy: each target is offered the survivor's SDP on an engine
+    // call that has never been told where the survivor's media comes from.
+    let anchor = state
+        .call_actors
+        .get_call(call_id)
+        .map(|call| call.a_leg.dialog.call_id.clone())
+        .and_then(|key| {
+            state
+                .rtpengine_sessions
+                .as_ref()
+                .and_then(|store| store.get(&key))
+        });
+    let survivor_ingress = anchor
+        .as_ref()
+        .zip(survivor.as_ref())
+        .and_then(|(anchor, leg)| {
+            let tag = leg.dialog.remote_tag.as_deref()?;
+            Some(PartyIngress {
+                source: leg.transport.remote_addr.ip(),
+                policy: RepairedIngress::of(media_profile, anchor, tag, true).survivor,
+            })
+        });
+
     let targets = dial.targets(target_uri);
     let plan = ReplacementPlan {
         call_id,
@@ -158,7 +188,8 @@ pub fn b2bua_start_leg_replacement(
             .as_ref()
             .map(|leg| leg.dialog.call_id.clone())
             .unwrap_or_default(),
-        anchored_profile: anchored_profile(call_id, media_profile, state),
+        survivor_ingress,
+        anchored_profile: anchored_profile(call_id, media_profile, anchor.as_ref(), state),
         template,
         triggered,
         several: targets.len() > 1,
@@ -225,7 +256,48 @@ pub fn b2bua_start_leg_replacement(
             break;
         }
     }
+    if !dialed {
+        conclude_undialled_replacement(call_id, replaced_on_a_leg, state);
+    }
     dialed
+}
+
+/// The status a replacement fails with when no INVITE could be sent for any
+/// of its targets: siphon could not carry the request out (RFC 3261 §21.5.4).
+pub const UNDIALLED_REPLACEMENT_STATUS: u16 = 503;
+
+/// End a replacement that dialled nobody.
+///
+/// Left on the call it would never end: it has no target to answer, refuse or
+/// time out, so it would hold off every later replacement, and a referrer that
+/// was answered `202` would wait on a subscription nothing terminates (RFC
+/// 3515 §2.4.5). It fails as one whose targets all refused does, on a `503`.
+///
+/// A REFER is told by the NOTIFY that ends its subscription and by
+/// `ReplaceFailed`. A siphon-decided replacement has no subscriber, and
+/// whoever asked for it is told by the refusal `b2bua_start_leg_replacement`
+/// returning `false` becomes: only the record is cleared. Unless the leg it
+/// was to replace has hung up meanwhile, which leaves the surviving party
+/// with nobody and is concluded as any failed replacement is.
+fn conclude_undialled_replacement(call_id: &str, replaced_on_a_leg: bool, state: &DispatcherState) {
+    let Some(failed) = state.call_actors.fail_undialled_replacement(
+        call_id,
+        replaced_on_a_leg,
+        UNDIALLED_REPLACEMENT_STATUS,
+    ) else {
+        return;
+    };
+    warn!(
+        call_id = %call_id,
+        "B2BUA: leg replacement could dial none of its targets — failing it and keeping the original call"
+    );
+    if failed.origin.notifies_referrer() || failed.referrer_gone {
+        conclude_failed_replacement(call_id, failed, state);
+    } else {
+        state
+            .call_actors
+            .clear_refer_subscriptions_on_leg(call_id, replaced_on_a_leg);
+    }
 }
 
 /// The media profile the surviving pair of a replacement is anchored with:
@@ -242,19 +314,10 @@ pub fn b2bua_start_leg_replacement(
 fn anchored_profile(
     call_id: &str,
     media_profile: Option<&str>,
+    anchor: Option<&crate::rtpengine::session::MediaSession>,
     state: &DispatcherState,
 ) -> Option<String> {
-    let inherited_profile = state
-        .call_actors
-        .get_call(call_id)
-        .map(|c| c.a_leg.dialog.call_id.clone())
-        .and_then(|key| {
-            state
-                .rtpengine_sessions
-                .as_ref()
-                .and_then(|store| store.get(&key))
-                .map(|session| session.profile.clone())
-        });
+    let inherited_profile = anchor.map(|session| session.profile.clone());
     if media_profile.is_none() {
         if let Some(inherited) = inherited_profile.as_deref() {
             if state
@@ -351,6 +414,7 @@ impl ReplacementPlan<'_> {
                     sdp,
                     &self.survivor_sip_call_id,
                     profile,
+                    self.survivor_ingress.as_ref(),
                 ) {
                     Some(anchored) => (
                         Some(anchored),

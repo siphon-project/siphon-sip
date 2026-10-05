@@ -216,6 +216,11 @@ pub enum SipEvent {
     /// An inbound REFER on a controlled call is asking the app to own the
     /// transfer decision ([`TransferRequestedPayload`]).
     TransferRequested,
+    /// A transfer this app accepted to carry out itself (`accept_refer` in mode
+    /// `controller`) passed its deadline with no `complete_refer`
+    /// ([`TransferTimedOutPayload`]). siphon has ended the referrer's
+    /// subscription for the app, so a `complete_refer` now is refused.
+    TransferTimedOut,
     /// A transfer this app asked for (the `refer` verb) moved forward but is not
     /// finished ([`TransferOutcomePayload`]). Never a success: RFC 3515 §2.4.4
     /// makes a `2xx` to a REFER mean "accepted for processing", with the real
@@ -311,6 +316,7 @@ impl SipEvent {
             SipEvent::ChannelDtmfReceived => "ChannelDtmfReceived",
             SipEvent::PlayStarted => "PlayStarted",
             SipEvent::TransferRequested => "TransferRequested",
+            SipEvent::TransferTimedOut => "TransferTimedOut",
             SipEvent::TransferProgress => "TransferProgress",
             SipEvent::TransferCompleted => "TransferCompleted",
             SipEvent::TransferFailed => "TransferFailed",
@@ -346,6 +352,7 @@ impl From<&str> for SipEvent {
             "ChannelDtmfReceived" => SipEvent::ChannelDtmfReceived,
             "PlayStarted" => SipEvent::PlayStarted,
             "TransferRequested" => SipEvent::TransferRequested,
+            "TransferTimedOut" => SipEvent::TransferTimedOut,
             "TransferProgress" => SipEvent::TransferProgress,
             "TransferCompleted" => SipEvent::TransferCompleted,
             "TransferFailed" => SipEvent::TransferFailed,
@@ -500,6 +507,27 @@ pub struct TransferRequestedPayload {
     /// this is the `leg_sip_call_id` its `DialBranch` named, not the channel's.
     #[serde(default)]
     pub referrer_sip_call_id: Option<String>,
+}
+
+/// The `payload` of a [`SipEvent::TransferTimedOut`] event: a transfer accepted
+/// with `accept_refer` in mode `controller` passed its deadline unreported.
+///
+/// siphon ended the referrer's subscription for the app, with a sipfrag NOTIFY
+/// of its own (RFC 3515 §2.4.5). The parties are wherever the app's verbs left
+/// them; only the report is over, and a `complete_refer` now is refused.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransferTimedOutPayload {
+    /// Why the transfer ended: `"timeout"`.
+    #[serde(default)]
+    pub reason: String,
+    /// The sipfrag status siphon reported to the referrer (`503`). `None` when
+    /// the referrer's leg had already left the call and nothing could be sent.
+    #[serde(default)]
+    pub code: Option<u16>,
+    /// Which party of the channel's call had referred: `"a"` or `"b"`, as on
+    /// [`TransferRequestedPayload`].
+    #[serde(default)]
+    pub referrer_leg: Option<String>,
 }
 
 /// The `stage` of a [`TransferOutcomePayload`] — where the verdict on an
@@ -2122,6 +2150,46 @@ mod tests {
             SipEvent::from("PeerReplacedSomeday"),
             SipEvent::Other("PeerReplacedSomeday".to_string())
         );
+    }
+
+    /// The event a controller-mode transfer ends in when its report is late:
+    /// the name maps both ways, and the payload parses as the server sends it,
+    /// with and without a status reported to the referrer.
+    #[test]
+    fn transfer_timed_out_round_trips_and_parses_from_the_wire_shape() {
+        assert_eq!(SipEvent::TransferTimedOut.as_str(), "TransferTimedOut");
+        assert_eq!(
+            SipEvent::from("TransferTimedOut"),
+            SipEvent::TransferTimedOut
+        );
+        assert_eq!(
+            serde_json::to_string(&SipEvent::TransferTimedOut).unwrap(),
+            "\"TransferTimedOut\""
+        );
+
+        // Byte-identical to the server's payload.
+        let timed_out: TransferTimedOutPayload = serde_json::from_value(serde_json::json!({
+            "reason": "timeout",
+            "code": 503,
+            "referrer_leg": "a",
+        }))
+        .expect("TransferTimedOut payload");
+        assert_eq!(timed_out.reason, "timeout");
+        assert_eq!(timed_out.code, Some(503));
+        assert_eq!(timed_out.referrer_leg.as_deref(), Some("a"));
+
+        let unsent: TransferTimedOutPayload = serde_json::from_value(serde_json::json!({
+            "reason": "timeout",
+            "code": null,
+            "referrer_leg": "b",
+        }))
+        .expect("TransferTimedOut payload with nothing reported");
+        assert_eq!(unsent.code, None);
+
+        let sparse: TransferTimedOutPayload =
+            serde_json::from_value(serde_json::json!({})).expect("sparse payload");
+        assert_eq!(sparse.reason, "");
+        assert_eq!(sparse.referrer_leg, None);
     }
 
     #[test]

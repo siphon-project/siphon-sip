@@ -49,10 +49,12 @@ pub struct MediaSession {
     /// call's whole media path and the engine refuses to detach it, which is
     /// why the two are tracked apart rather than as one "has a bridge" flag.
     pub ws_bridge_attached: bool,
-    /// For the session of a formed controller bridge, which flags shape the SDP
-    /// the engine sends each party. `None` for every other session, which has
-    /// one [`MediaSession::profile`] describing the pair the way a dial's
-    /// profile does.
+    /// For a session whose two parties were paired by something other than
+    /// one dial (a formed controller bridge, a leg replacement, a `Replaces`
+    /// takeover), which flags shape the SDP the engine sends each party and
+    /// whose policy pins each one's media ingress. `None` for every other
+    /// session, which has one [`MediaSession::profile`] describing the pair
+    /// the way a dial's profile does.
     pub bridge_sides: Option<BridgeSides>,
     /// When this session was created.
     pub created_at: Instant,
@@ -89,6 +91,37 @@ impl SideFlags {
             ProfileHalf::Answer => entry.answer.clone(),
         })
     }
+
+    /// Whether this half asks for a party's media ingress to be pinned to its
+    /// signalling source (`received_from`). `false` for a profile `registry`
+    /// does not carry: a policy that cannot be read pins nothing.
+    pub fn pins_ingress(&self, registry: &super::profile::ProfileRegistry) -> bool {
+        registry
+            .get(&self.profile)
+            .is_some_and(|entry| match self.half {
+                ProfileHalf::Offer => entry.offer.carry_received_from,
+                ProfileHalf::Answer => entry.answer.carry_received_from,
+            })
+    }
+
+    /// Put this policy's `received_from` hint on `flags`, a command that
+    /// carries the SDP of the party the policy belongs to: `source`, where
+    /// that party signals from, when the policy asks for the pin, and no hint
+    /// when it does not.
+    ///
+    /// It replaces whatever the flags' own half says. The half a command is
+    /// shaped by is chosen for the party the result is sent to, so its policy
+    /// is the other party's.
+    pub fn stamp_ingress(
+        &self,
+        flags: &mut super::profile::NgFlags,
+        registry: &super::profile::ProfileRegistry,
+        source: std::net::IpAddr,
+    ) {
+        flags.carry_received_from = self.pins_ingress(registry);
+        flags.received_from = None;
+        flags.stamp_received_from(source);
+    }
 }
 
 /// The two parties of a bridged pair's session and what shapes each.
@@ -99,12 +132,23 @@ impl SideFlags {
 /// a relayed re-offer in either direction, is shaped by the same flags that
 /// party was bridged with, so an SRTP phone keeps getting SRTP and a plain-RTP
 /// caller plain RTP whichever of them re-offers.
+///
+/// Shaping and ingress are two questions with two answers. The flags that
+/// shape the SDP sent to one party ride on the command that carries the
+/// **other** party's SDP, and the `received_from` hint on that command names
+/// where the other party's media comes from. So each party's ingress policy is
+/// kept beside its shaping, and a command takes its shape from the party it is
+/// for and its hint from the party whose SDP it carries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BridgeSides {
     /// The anchor: the party on [`MediaSession::from_tag`].
     pub anchor: SideFlags,
     /// The peer: the party on [`MediaSession::to_tag`].
     pub peer: SideFlags,
+    /// Whose `received_from` policy pins the anchor's media ingress.
+    pub anchor_ingress: SideFlags,
+    /// Whose `received_from` policy pins the peer's.
+    pub peer_ingress: SideFlags,
 }
 
 impl MediaSession {
@@ -117,6 +161,39 @@ impl MediaSession {
             &self.call_id
         } else {
             &self.rtpengine_call_id
+        }
+    }
+
+    /// Whose `received_from` policy pins the media ingress of one party of
+    /// this session: the one on [`MediaSession::from_tag`] when `on_from_tag`,
+    /// the one on [`MediaSession::to_tag`] otherwise.
+    ///
+    /// What was recorded for the party when the pair was put together
+    /// ([`MediaSession::bridge_sides`]), and without that the half of the
+    /// session's profile the party was set up under: `offer` for the caller
+    /// of a dial and `answer` for its callee, and `answer` for the one party
+    /// of a session the engine answered itself.
+    ///
+    /// The half is the party's for the life of the call, whichever command
+    /// its SDP rides later: a callee that re-offers is still the `answer`
+    /// half's. A delayed offer (RFC 3264 §4) is no exception. Its callee
+    /// offers and its caller answers, but the profile was chosen for the dial
+    /// before either sent an SDP, and its session names the caller on
+    /// [`MediaSession::from_tag`] once answered
+    /// ([`MediaSessionStore::set_delayed_offer_answerer`]).
+    #[must_use]
+    pub fn party_ingress(&self, on_from_tag: bool) -> SideFlags {
+        match (&self.bridge_sides, on_from_tag) {
+            (Some(sides), true) => sides.anchor_ingress.clone(),
+            (Some(sides), false) => sides.peer_ingress.clone(),
+            (None, _) => SideFlags {
+                profile: self.profile.clone(),
+                half: if on_from_tag && self.to_tag.is_some() {
+                    ProfileHalf::Offer
+                } else {
+                    ProfileHalf::Answer
+                },
+            },
         }
     }
 
@@ -175,6 +252,48 @@ mod media_session_tests {
     }
 
     #[test]
+    fn a_partys_ingress_policy_is_the_half_its_sdp_reached_the_engine_under() {
+        let half = |half| SideFlags {
+            profile: "default".to_string(),
+            half,
+        };
+        // A relay set up by one dial: the caller's `offer` half, the
+        // callee's `answer` half.
+        let relay = session(Some("tag-b"));
+        assert_eq!(relay.party_ingress(true), half(ProfileHalf::Offer));
+        assert_eq!(relay.party_ingress(false), half(ProfileHalf::Answer));
+        // A session the engine answered itself has one party, anchored under
+        // the `answer` half.
+        assert_eq!(session(None).party_ingress(true), half(ProfileHalf::Answer));
+    }
+
+    #[test]
+    fn a_partys_ingress_policy_is_what_was_recorded_when_the_pair_was_put_together() {
+        let side = |profile: &str, half| SideFlags {
+            profile: profile.to_string(),
+            half,
+        };
+        let paired = MediaSession {
+            bridge_sides: Some(BridgeSides {
+                anchor: side("shapes_the_anchor", ProfileHalf::Answer),
+                peer: side("shapes_the_peer", ProfileHalf::Offer),
+                anchor_ingress: side("pins_the_anchor", ProfileHalf::Answer),
+                peer_ingress: side("pins_the_peer", ProfileHalf::Offer),
+            }),
+            ..session(Some("tag-b"))
+        };
+        // Never the profile half its tag would name, nor the shaping.
+        assert_eq!(
+            paired.party_ingress(true),
+            side("pins_the_anchor", ProfileHalf::Answer)
+        );
+        assert_eq!(
+            paired.party_ingress(false),
+            side("pins_the_peer", ProfileHalf::Offer)
+        );
+    }
+
+    #[test]
     fn offer_tag_names_the_offering_party() {
         let answered = session(Some("tag-b"));
         assert_eq!(answered.offer_tag(true), Some("tag-a"));
@@ -213,7 +332,13 @@ pub struct MediaSessionStore {
     /// call not simply named by its own SIP Call-ID. See
     /// [`MediaSessionStore::summary_parties`].
     parties: std::sync::Arc<DashMap<String, EngineParties>>,
+    /// What a bridge shaped and pinned a party with, for each call whose own
+    /// session a bridge retired. See [`own_media`].
+    own_media: DashMap<String, own_media::Recorded>,
 }
+
+mod own_media;
+pub use own_media::OwnMedia;
 
 /// The SIP Call-IDs an engine call carries media for, and until when they are
 /// kept once no stored session is on it.
@@ -239,6 +364,7 @@ impl MediaSessionStore {
         Self {
             sessions: DashMap::new(),
             parties: Default::default(),
+            own_media: DashMap::new(),
         }
     }
 
@@ -340,6 +466,20 @@ impl MediaSessionStore {
         }
     }
 
+    /// Whether the dialog `sip_call_id` is recorded as a party of engine call
+    /// `engine_call_id`: a bridged pair's anchor or peer. A pair parted by an
+    /// `unbridge` stays recorded, since its session stays on the engine call,
+    /// which is how a second bridge of the same two legs recognises the party
+    /// that session already relays to. Spends nothing.
+    pub fn is_party(&self, engine_call_id: &str, sip_call_id: &str) -> bool {
+        self.parties.get(engine_call_id).is_some_and(|recorded| {
+            recorded
+                .parties
+                .iter()
+                .any(|party| party.sip_call_id == sip_call_id)
+        })
+    }
+
     /// The store key of the session on engine call `engine_call_id`: the SIP
     /// Call-ID it is stored under, which for a bridged pair or a re-anchor is
     /// not the engine id. `None` when no stored session is on that call.
@@ -435,7 +575,18 @@ impl MediaSessionStore {
     }
 
     /// Remove a session by Call-ID. Returns the removed session, if any.
+    ///
+    /// This is what a call's teardown does, whether or not the call still has
+    /// a session of its own, so it also drops what a bridge recorded for the
+    /// call when it retired that session ([`own_media`]).
     pub fn remove(&self, call_id: &str) -> Option<MediaSession> {
+        self.forget_own_media(call_id);
+        self.take_session(call_id)
+    }
+
+    /// Take the session stored under `call_id` out of the store and release
+    /// the parties of its engine call.
+    fn take_session(&self, call_id: &str) -> Option<MediaSession> {
         let (_, session) = self.sessions.remove(call_id)?;
         self.release_parties(session.rtpengine_id());
         Some(session)
@@ -445,6 +596,25 @@ impl MediaSessionStore {
     pub fn set_to_tag(&self, call_id: &str, to_tag: String) {
         if let Some(mut entry) = self.sessions.get_mut(call_id) {
             entry.to_tag = Some(to_tag);
+        }
+    }
+
+    /// Record the caller's answer to a delayed offer (RFC 3264 §4) on the
+    /// session the callee's offer created, and name the two parties in the
+    /// order every other session does: the caller on
+    /// [`MediaSession::from_tag`], the callee on [`MediaSession::to_tag`].
+    ///
+    /// Until the answer the session has only the callee, as its offerer.
+    /// Left that way round once answered, every reader that names a party by
+    /// the leg it is on would name the other one: a hold from the caller
+    /// would reach the engine as the callee's re-offer, and the caller would
+    /// be pinned by the callee's `received_from` policy.
+    pub fn set_delayed_offer_answerer(&self, call_id: &str, caller_tag: String) {
+        if let Some(mut entry) = self.sessions.get_mut(call_id) {
+            if entry.to_tag.is_none() {
+                let callee_tag = std::mem::replace(&mut entry.from_tag, caller_tag);
+                entry.to_tag = Some(callee_tag);
+            }
         }
     }
 
@@ -488,6 +658,7 @@ impl MediaSessionStore {
         for engine_call_id in swept {
             self.release_parties(&engine_call_id);
         }
+        self.sweep_own_media(cutoff);
     }
 
     /// The engine-side call-ids of every session siphon currently holds.
@@ -547,6 +718,31 @@ mod tests {
             bridge_sides: None,
             created_at: Instant::now(),
         }
+    }
+
+    #[test]
+    fn a_side_pins_ingress_only_where_its_own_half_asks_for_it() {
+        let half = |received_from: bool| crate::config::NgFlagsConfig {
+            received_from,
+            ..Default::default()
+        };
+        let mut custom = std::collections::HashMap::new();
+        custom.insert(
+            "pins_the_offerer".to_string(),
+            crate::config::MediaProfileConfig {
+                offer: half(true),
+                answer: half(false),
+            },
+        );
+        let registry = crate::rtpengine::ProfileRegistry::from_config(&custom);
+        let side = |profile: &str, half| SideFlags {
+            profile: profile.to_string(),
+            half,
+        };
+        assert!(side("pins_the_offerer", ProfileHalf::Offer).pins_ingress(&registry));
+        assert!(!side("pins_the_offerer", ProfileHalf::Answer).pins_ingress(&registry));
+        // A profile the registry does not carry pins nothing.
+        assert!(!side("no_such_profile", ProfileHalf::Offer).pins_ingress(&registry));
     }
 
     #[test]

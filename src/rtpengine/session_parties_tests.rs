@@ -85,6 +85,36 @@ async fn a_tag_both_parties_carry_names_neither() {
     assert_eq!(store.event_party("same-pair", "shared-tag"), None);
 }
 
+/// A pair's engine call names both its parties for as long as it is recorded,
+/// nobody else, and an engine call with nothing recorded names nobody. Asking
+/// spends nothing.
+#[tokio::test]
+async fn an_engine_call_knows_the_parties_recorded_on_it() {
+    let store = MediaSessionStore::new();
+    store.insert(session("party-anchor@example.test", "party-pair"));
+    record(
+        &store,
+        "party-anchor@example.test",
+        "party-pair",
+        &["party-anchor@example.test", "party-peer@example.test"],
+    );
+    assert!(store.is_party("party-pair", "party-peer@example.test"));
+    assert!(store.is_party("party-pair", "party-anchor@example.test"));
+    assert!(!store.is_party("party-pair", "party-stranger@example.test"));
+    assert!(!store.is_party("no-such-pair", "party-peer@example.test"));
+    assert_eq!(store.engine_parties_count(), 1, "nothing spent");
+
+    // Recorded again with another peer, the first is no longer a party.
+    record(
+        &store,
+        "party-anchor@example.test",
+        "party-pair",
+        &["party-anchor@example.test", "party-other@example.test"],
+    );
+    assert!(!store.is_party("party-pair", "party-peer@example.test"));
+    assert!(store.is_party("party-pair", "party-other@example.test"));
+}
+
 /// The store key of the session on an engine call, whatever id the engine
 /// knows it by; none once it has left the store.
 #[tokio::test]

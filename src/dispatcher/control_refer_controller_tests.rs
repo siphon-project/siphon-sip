@@ -415,6 +415,101 @@ async fn an_unreported_transfer_is_failed_at_its_deadline() {
     assert!(drain(&controller.dispatcher.udp).is_empty());
 }
 
+/// The events queued for the controller since the last look. An event is
+/// pushed before the call that raises it returns, so the queue is read as it
+/// stands.
+async fn queued_events(controller: &Controller) -> Vec<crate::control::EventFrame> {
+    if controller.connection.events.depth() == 0 {
+        return Vec::new();
+    }
+    controller
+        .connection
+        .events
+        .recv_many()
+        .await
+        .into_iter()
+        .filter_map(|frame| match frame {
+            crate::control::OutboundFrame::Event(event) => Some(event),
+            crate::control::OutboundFrame::Reply(_) => None,
+        })
+        .collect()
+}
+
+/// An application that accepted a transfer to carry out and then missed its
+/// deadline is told so: siphon reported `503` to the referrer on its behalf,
+/// and `TransferTimedOut` on the channel says that, once. A transfer reported
+/// in time raises nothing when the sweep next runs.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_application_that_misses_its_deadline_is_told() {
+    let (_engine, caller, controller) = controlled_caller("refer-ctl-told", "ctl-told").await;
+    let state = &controller.dispatcher.state;
+    let sweep =
+        || tokio::task::block_in_place(|| expire_controller_refers(Some(&controller.bus), state));
+
+    assert!(caller_refers(&controller, &caller, 2));
+    let reply = accept(
+        &controller,
+        "ctl-told",
+        serde_json::json!({ "mode": "controller", "timeout": 30 }),
+    )
+    .await;
+    assert_eq!(reply["status"], "ok", "{reply}");
+    let _ = drain(&controller.dispatcher.udp);
+
+    sweep();
+    assert!(
+        queued_events(&controller).await.is_empty(),
+        "the deadline has not passed"
+    );
+
+    state
+        .controller_refers
+        .entries
+        .get_mut(&caller.internal_call_id)
+        .expect("the open subscription")
+        .deadline = std::time::Instant::now() - std::time::Duration::from_secs(1);
+    sweep();
+    terminating_notify(
+        &drain(&controller.dispatcher.udp),
+        &caller,
+        2,
+        "SIP/2.0 503 Service Unavailable",
+    );
+    let events = queued_events(&controller).await;
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event.event.as_str())
+            .collect::<Vec<_>>(),
+        ["TransferTimedOut"]
+    );
+    assert_eq!(events[0].channel.as_deref(), Some("ctl-told"));
+    assert_eq!(events[0].payload["reason"], "timeout");
+    assert_eq!(events[0].payload["code"], 503);
+    assert_eq!(events[0].payload["referrer_leg"], "a");
+
+    // Told once: the record went with the deadline.
+    sweep();
+    assert!(queued_events(&controller).await.is_empty());
+    assert!(drain(&controller.dispatcher.udp).is_empty());
+
+    // A transfer reported in time is not one that timed out.
+    assert!(caller_refers(&controller, &caller, 3));
+    let reply = accept(
+        &controller,
+        "ctl-told",
+        serde_json::json!({ "mode": "controller" }),
+    )
+    .await;
+    assert_eq!(reply["status"], "ok", "{reply}");
+    let reply = complete(&controller, "ctl-told", serde_json::json!({ "code": 200 })).await;
+    assert_eq!(reply["status"], "ok", "{reply}");
+    let _ = drain(&controller.dispatcher.udp);
+    sweep();
+    assert!(queued_events(&controller).await.is_empty());
+    assert!(drain(&controller.dispatcher.udp).is_empty());
+}
+
 /// The referrer hangs up before the report: its BYE is answered, the record
 /// goes with its dialog, and no NOTIFY follows it there.
 #[tokio::test(flavor = "multi_thread")]

@@ -74,17 +74,17 @@ pub fn auto_prack_b_leg(
     if !needs_prack {
         return false;
     }
-    // The leg's position as it is now, not as the snapshot read it: a sibling
-    // replacement target answering in between is taken out of the leg list, and
-    // every leg after it moves down one.
-    let (Some(rseq), Some(idx)) = (
+    // The leg is addressed by the Via branch the response carries from here
+    // on, never by the position the snapshot read: a leg ahead of it taken off
+    // the call in between moves every leg after it down one, and the PRACK
+    // built here may wait for the caller's long after this returns.
+    let (Some(rseq), Some(_)) = (
         crate::sip::headers::rseq::parse_rseq(&message.headers),
-        snapshot
-            .b_leg_index
-            .and_then(|_| state.call_actors.b_leg_index(call_id, &snapshot.branch)),
+        snapshot.b_leg_index,
     ) else {
         return false;
     };
+    let branch = snapshot.branch.as_str();
     // No PRACK for a leg that has ended. It is the check `b_leg_provisional`
     // drops the provisional on, so siphon never PRACKs a provisional it does not
     // relay.
@@ -106,7 +106,7 @@ pub fn auto_prack_b_leg(
     // ends the leg siphon was ending anyway. While the branch is kept answerable,
     // `absorb_cancelled_branch_response` already dropped the provisional before
     // this runs; this covers the leg once it is not.
-    if state.call_actors.is_ended_branch(call_id, idx) {
+    if state.call_actors.is_ended_branch_on(call_id, branch) {
         debug!(
             call_id = %call_id,
             rseq = rseq.response_number,
@@ -139,7 +139,7 @@ pub fn auto_prack_b_leg(
     // the caller a new reliable provisional.
     if !state
         .call_actors
-        .try_mark_prack_acked(call_id, idx, dedup_key, rseq.response_number)
+        .try_mark_prack_acked_on(call_id, branch, dedup_key, rseq.response_number)
     {
         debug!(
             call_id = %call_id,
@@ -154,7 +154,7 @@ pub fn auto_prack_b_leg(
     // 2xx / BYE / re-INVITE have a target before answer. The confirming 2xx
     // refreshes remote_tag / remote_contact to the winning dialog.
     if let Some(mut call) = state.call_actors.get_call_mut(call_id) {
-        if let Some(leg) = call.b_legs.get_mut(idx) {
+        if let Some((_, leg)) = call.find_b_leg_by_branch_mut(branch) {
             if leg.dialog.remote_tag.is_none() {
                 if let Some(ref tag) = early_to_tag {
                     leg.dialog.remote_tag = Some(tag.clone());
@@ -195,7 +195,7 @@ pub fn auto_prack_b_leg(
     hold_or_send_callee_prack(
         call_id,
         crate::b2bua::actor::HeldCalleePrack {
-            b_leg_index: idx,
+            branch: branch.to_string(),
             to_tag: dedup_key.to_string(),
             rseq: rseq.response_number,
             cseq_number,

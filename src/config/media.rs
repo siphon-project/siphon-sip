@@ -196,9 +196,18 @@ pub struct MediaConfig {
     #[serde(default)]
     pub profiles: std::collections::HashMap<String, MediaProfileConfig>,
     /// Name used in SDP `o=` and `s=` lines when sanitizing relayed SDP.
-    /// Hides the remote endpoint's identity (e.g. "FreeSWITCH") from the other leg.
+    /// Hides the remote endpoint's identity (its product name) from the other leg.
     /// Defaults to "SIPhon" if not set.
     pub sdp_name: Option<String>,
+    /// Leave the `s=` session name of relayed SDP as the far side wrote it.
+    ///
+    /// By default `sdp_name` replaces it along with the `o=` username, because
+    /// endpoints commonly put their product name there. Some peers read the
+    /// session name as an application-level marker and need it to cross the
+    /// B2BUA unchanged. `o=` (username and address) is rewritten either way.
+    /// Default: `false`.
+    #[serde(default)]
+    pub sdp_keep_session_name: bool,
     /// SDP attribute names siphon removes from the SDP it relays between the two
     /// legs of a B2BUA call, at session and media level, in both directions
     /// (e.g. `["msid"]`).

@@ -2214,7 +2214,7 @@ services:
       - b2bua-replace-peer
 
   # --- REFER terminate, referrer hangs up mid-transfer (RFC 5589 §7) ---
-  # The Teams blind-transfer ordering: alice REFERs, then BYEs her own dialog
+  # The early-BYE blind-transfer ordering: alice REFERs, then BYEs her own dialog
   # while carol is still ringing. bob must survive and be bridged to carol.
 
   # Same terminate mode, but the transfer target REFUSES (486). Pins two things

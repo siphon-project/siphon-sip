@@ -13,11 +13,11 @@
 
 use serde_json::json;
 
-use siphon_control_proto::sip::SipVerb;
+use siphon_control_proto::sip::{SipEvent, SipVerb, TransferTimedOutPayload};
 
 use crate::error::ControlError;
 use crate::originate::OriginatePrivacy;
-use crate::sip::Call;
+use crate::sip::{Call, CallEvent};
 
 /// Who a transfer's new leg is dialled at.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -139,9 +139,11 @@ impl Call {
     /// [`Call::dial`] — and then report with [`Call::complete_refer`].
     ///
     /// `timeout` is how many seconds there are to report in (default 60, at
-    /// most 180). Past it the server reports `503` to the referrer itself, and
-    /// a later [`Call::complete_refer`] is refused. Until the report, a further
-    /// REFER on the call is answered `491 Request Pending`.
+    /// most 180). Past it the server reports `503` to the referrer itself,
+    /// tells this application with [`SipEvent::TransferTimedOut`]
+    /// ([`CallEvent::transfer_timed_out`]), and refuses a later
+    /// [`Call::complete_refer`]. Until the report, a further REFER on the call
+    /// is answered `491 Request Pending`.
     ///
     /// ```no_run
     /// # use siphon_control_client::sip::Call;
@@ -210,6 +212,21 @@ impl Call {
     }
 }
 
+impl CallEvent {
+    /// The typed [`TransferTimedOutPayload`] when this is a
+    /// [`SipEvent::TransferTimedOut`] event, else `None`.
+    ///
+    /// A transfer accepted with [`Call::accept_refer_controller`] passed its
+    /// deadline with no [`Call::complete_refer`]: the server has told the
+    /// referrer the transfer failed, and there is nothing left to report on.
+    pub fn transfer_timed_out(&self) -> Option<TransferTimedOutPayload> {
+        if self.kind != SipEvent::TransferTimedOut {
+            return None;
+        }
+        serde_json::from_value(self.payload.clone()).ok()
+    }
+}
+
 /// The `accept_refer` arguments of a transfer the application carries out:
 /// the mode, and the timeout only when one is given, so the server's default
 /// applies otherwise.
@@ -243,6 +260,42 @@ mod tests {
             accept_refer_controller_args(Some(90)),
             json!({ "mode": "controller", "timeout": 90 })
         );
+    }
+
+    #[test]
+    fn a_missed_report_deadline_parses_from_its_frame() {
+        let frame = |event: &str, payload: serde_json::Value| {
+            let frame = siphon_control_proto::EventFrame::new(
+                event,
+                "ch1",
+                "ivr-app",
+                "call-uuid",
+                "sip@host",
+                payload,
+            );
+            CallEvent {
+                kind: frame.sip_kind(),
+                payload: frame.payload.clone(),
+                frame,
+            }
+        };
+        let timed_out = frame(
+            "TransferTimedOut",
+            json!({ "reason": "timeout", "code": 503, "referrer_leg": "a" }),
+        );
+        assert_eq!(timed_out.kind, SipEvent::TransferTimedOut);
+        let payload = timed_out.transfer_timed_out().expect("timeout payload");
+        assert_eq!(payload.reason, "timeout");
+        assert_eq!(payload.code, Some(503));
+        assert_eq!(payload.referrer_leg.as_deref(), Some("a"));
+        // An outbound REFER's verdict is another event altogether.
+        assert!(timed_out.transfer_outcome().is_none());
+        assert!(!timed_out.is_transfer_final());
+        let other = frame(
+            "TransferRequested",
+            json!({ "refer_to": "sip:x@example.com" }),
+        );
+        assert!(other.transfer_timed_out().is_none());
     }
 
     #[test]

@@ -627,7 +627,7 @@ pub fn b2bua_dial_b_leg(
     // Per-call override (from call.session_timer()) takes precedence over global config.
     //
     // REPLACE, never append. This INVITE is a clone of the A-leg's, so whatever
-    // the caller asked for is already on it — a Teams INVITE arrives carrying
+    // the caller asked for is already on it — an INVITE may arrive carrying
     // `Session-Expires: 3600` and `Min-SE: 300`. `Session-Expires` and `Min-SE`
     // are single-value headers (RFC 4028 §4, §5), so appending emitted two of
     // each and left the callee to pick: siphon's `Min-SE: 90` next to the
@@ -660,7 +660,7 @@ pub fn b2bua_dial_b_leg(
     // Sanitize SDP: mask A-leg identity in o= and s= lines, and rewrite
     // the o= address to our advertised address for topology hiding.
     let sdp_addr = state.via_host(&outbound_transport);
-    sanitize_sdp_identity(&mut b_leg_invite.body, &state.sdp_name, Some(&sdp_addr));
+    hide_sdp_identity(&mut b_leg_invite.body, state, Some(&sdp_addr));
 
     // Update Content-Length after SDP rewrite (o=/s= changes may alter body size)
     if !b_leg_invite.body.is_empty() {

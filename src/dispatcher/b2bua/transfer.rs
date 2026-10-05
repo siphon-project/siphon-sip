@@ -141,8 +141,15 @@ pub fn b2bua_bridge_inbound_replaces(
         }
     }
 
-    let (sdp_for_new_party, sdp_for_survivor) = match &old_anchor {
-        Some((_, session)) => {
+    // Whose policy pins each party on the fresh engine call: the survivor
+    // keeps its own, the newcomer takes the replaced party's. Here the
+    // newcomer's SDP is the offer and the survivor's the answer.
+    let repaired = old_anchor
+        .as_ref()
+        .map(|(_, session)| RepairedIngress::of(None, session, &survivor_tag, false));
+
+    let (sdp_for_new_party, sdp_for_survivor) = match (&old_anchor, &repaired) {
+        (Some((_, session)), Some(repaired)) => {
             let to_survivor = b2bua_transfer_rtpengine_offer(
                 state,
                 &cid_new,
@@ -150,6 +157,10 @@ pub fn b2bua_bridge_inbound_replaces(
                 &invite.body,
                 &cid_new,
                 &session.profile,
+                Some(&PartyIngress {
+                    source: inbound.remote_addr.ip(),
+                    policy: repaired.joining.clone(),
+                }),
             );
             let to_new_party = b2bua_transfer_rtpengine_answer(
                 state,
@@ -159,6 +170,10 @@ pub fn b2bua_bridge_inbound_replaces(
                 &survivor_sdp,
                 &survivor.dialog.call_id,
                 &session.profile,
+                Some(&PartyIngress {
+                    source: survivor.transport.remote_addr.ip(),
+                    policy: repaired.survivor.clone(),
+                }),
             );
             match (to_survivor, to_new_party) {
                 (Some(survivor_side), Some(new_side)) => (new_side, survivor_side),
@@ -171,7 +186,7 @@ pub fn b2bua_bridge_inbound_replaces(
                 }
             }
         }
-        None => (survivor_sdp.clone(), invite.body.clone()),
+        _ => (survivor_sdp.clone(), invite.body.clone()),
     };
 
     // Move the new party's leg onto the call it is joining. Its own (now empty)
@@ -302,7 +317,11 @@ pub fn b2bua_bridge_inbound_replaces(
                 ws_uri: None,
                 ws_tee: None,
                 ws_bridge_attached: false,
-                bridge_sides: None,
+                // Each party's own ingress policy stays with the pair, for
+                // the next time this call is re-paired.
+                bridge_sides: repaired
+                    .as_ref()
+                    .map(|repaired| repaired.sides(&old_session.profile, true, true)),
                 created_at: std::time::Instant::now(),
             });
             store.remove(old_key);
@@ -335,6 +354,12 @@ pub fn b2bua_transfer_rtpengine_delete(state: &DispatcherState, cid_old: &str, f
     }
 }
 
+/// Carry out an accepted REFER in `mode`.
+///
+/// Transparent: the REFER is re-emitted on the far leg's own dialog and siphon
+/// owns no subscription; the far end's response and its sipfrag NOTIFYs are
+/// relayed back to the referrer.
+///
 /// Siphon-terminated (default): answer `202 Accepted` to the referrer, open the
 /// implicit REFER subscription, and start feeding it `message/sipfrag` NOTIFY
 /// progress (RFC 3515 §2.4.4). Siphon dials the Refer-To (or the script's
@@ -347,9 +372,10 @@ pub fn b2bua_transfer_rtpengine_delete(state: &DispatcherState, cid_old: &str, f
 /// referrer names its target in its own number format and the carrier the leg is
 /// dialled at expects the trunk's.
 ///
-/// The `202 + NOTIFY 100 Trying + subscription` opening is done here; the
-/// new-leg dial and the transfer-aware bridge/BYE completion are driven off the
-/// dialed leg's 2xx in the response path.
+/// The `202 + NOTIFY 100 Trying + subscription` opening and the new-leg dial
+/// are done here; the transfer-aware bridge/BYE completion is driven off the
+/// dialed leg's 2xx in the response path
+/// ([`b2bua_complete_terminated_transfer`]).
 #[allow(clippy::too_many_arguments)]
 pub fn b2bua_refer_accept(
     inbound: InboundMessage,
@@ -384,6 +410,12 @@ pub fn b2bua_refer_accept(
                 attended = replaces.is_some(),
                 "B2BUA REFER: accepting (transparent) — forwarding on the far leg"
             );
+            // The far end answers this REFER and siphon relays what it says.
+            // Until then a retransmission has nothing to be answered with, and
+            // must not be relayed as a second REFER on the far leg's dialog.
+            state
+                .answered_refers
+                .proceeding(call_id, &message, std::time::Instant::now());
             b2bua_forward_indialog_request(
                 &inbound,
                 &message,
@@ -495,15 +527,20 @@ pub fn b2bua_refer_accept(
 /// its CANCEL, established a dialog nobody wants: it is ACKed and released with
 /// a BYE (RFC 3261 §13.2.2.4, §15) and the call is left alone.
 ///
+/// `response_source` is where the 2xx came from: the target's signalling
+/// source, which its answer is pinned to on the media engine where the
+/// target's own policy asks for it (see `transfer_media`).
+///
 /// The signaling here (ACK / NOTIFY / promote / BYE) is what makes the transfer
-/// visible on the wire and is covered by the integration tests. The rtpengine
-/// media re-anchor (re-bridging the surviving party's media to the transfer
-/// target) needs a live rtpengine session to validate and is intentionally left
-/// to the standard re-negotiation path rather than reconstructed blind here.
+/// visible on the wire. The surviving party is then re-INVITEd to the target's
+/// media (RFC 3261 §14): on an anchored call with the media engine's answer on
+/// the target's own engine call, whose session replaces the old anchor;
+/// otherwise with the target's answer SDP as it arrived.
 pub fn b2bua_complete_terminated_transfer(
     call_id: &str,
     branch: &str,
     response: &SipMessage,
+    response_source: SocketAddr,
     state: &DispatcherState,
 ) {
     // Who answered first is decided in the store, under the call's lock: the
@@ -689,8 +726,8 @@ pub fn b2bua_complete_terminated_transfer(
                 // only thing that tells it), and sits on whatever it was
                 // holding for the transfer — a consultation call, in the
                 // attended case — until its own idle timer fires minutes later.
-                // Observed against Microsoft Teams Direct Routing with the two
-                // 19 µs apart: BYE answered `200`, NOTIFY answered `481`.
+                // A referrer handed the two back to back does exactly that:
+                // BYE answered `200`, NOTIFY answered `481`.
                 Some(branch) => {
                     state.deferred_referrer_bye.insert(
                         &branch,
@@ -745,6 +782,21 @@ pub fn b2bua_complete_terminated_transfer(
             target_leg.transport.local_addr,
             state,
         );
+        // That ACK confirms the target's dialog, in whichever slot the
+        // promotion put its leg. A re-INVITE from the surviving party is
+        // relayed only to a confirmed leg (RFC 3261 §14.1), so without this
+        // every hold after the transfer is refused `491` for good.
+        if let Some(mut call) = state.call_actors.get_call_mut(call_id) {
+            if call.a_leg.dialog.call_id == target_sip_call_id {
+                call.a_leg.initial_acked = true;
+            } else if let Some(leg) = call
+                .b_legs
+                .iter_mut()
+                .find(|leg| leg.dialog.call_id == target_sip_call_id)
+            {
+                leg.initial_acked = true;
+            }
+        }
     }
 
     // The targets that did not answer first stop ringing (RFC 3261 §9.1), now
@@ -763,6 +815,17 @@ pub fn b2bua_complete_terminated_transfer(
     //     (post-promotion) A-leg Call-ID, and tear down the old anchor.
     //   Non-anchored: re-INVITE the survivor with the target's raw answer SDP.
     if !response.body.is_empty() {
+        // Whose policy pins each party of the new pair: the same reading the
+        // survivor's offer was sent under when the target was dialled.
+        let repaired = match (&old_anchor, &survivor_tag) {
+            (Some((_, old_session)), Some(surv_tag)) => Some(RepairedIngress::of(
+                transfer_profile.as_deref(),
+                old_session,
+                surv_tag,
+                true,
+            )),
+            _ => None,
+        };
         let reanchored = match (&old_anchor, &survivor_tag, &target_answer_tag) {
             (Some((_, old_session)), Some(surv_tag), Some(tgt_tag)) => {
                 b2bua_transfer_rtpengine_answer(
@@ -775,6 +838,15 @@ pub fn b2bua_complete_terminated_transfer(
                     // The pairing the transfer created, not the one the call
                     // started as — see `accept_refer(profile=…)`.
                     transfer_profile.as_deref().unwrap_or(&old_session.profile),
+                    // The SDP in this answer is the target's, and this 2xx is
+                    // where the target signals from.
+                    repaired
+                        .as_ref()
+                        .map(|repaired| PartyIngress {
+                            source: response_source.ip(),
+                            policy: repaired.joining.clone(),
+                        })
+                        .as_ref(),
                 )
             }
             _ => None,
@@ -795,16 +867,41 @@ pub fn b2bua_complete_terminated_transfer(
                         .get_call(call_id)
                         .map(|call| call.a_leg.dialog.call_id.clone())
                         .unwrap_or_else(|| cid_new.clone());
+                    let profile = transfer_profile
+                        .clone()
+                        .unwrap_or_else(|| old_session.profile.clone());
+                    // The session names the call's two slots in order, the
+                    // A-leg's party on `from_tag` and the B-leg's on `to_tag`,
+                    // which is how every in-dialog re-offer finds the tag of
+                    // the party sending it. The target holds the A-leg slot
+                    // only when it replaced the caller; when it replaced the
+                    // callee the surviving caller still does, and naming the
+                    // target first would send the caller's re-offers to the
+                    // engine as the target's.
+                    let (from_tag, to_tag) = if referrer_on_a_leg {
+                        (tgt_tag.clone(), surv_tag.clone())
+                    } else {
+                        (surv_tag.clone(), tgt_tag.clone())
+                    };
+                    // Each party's own ingress policy stays with the pair: the
+                    // tags do not say whose SDP the engine was offered (the
+                    // survivor's), so a later re-pairing of this call could
+                    // not tell the two policies apart without it.
+                    let bridge_sides = repaired
+                        .as_ref()
+                        .map(|repaired| repaired.sides(&profile, referrer_on_a_leg, false));
+                    // The key moves only when the target took the A-leg slot.
+                    // When the callee was replaced it is the caller's Call-ID
+                    // before and after, and the insert below replaces the old
+                    // entry itself: removing "the old key" after it would
+                    // remove the pair's own session.
+                    let key_moved = new_store_key != *old_key;
                     store.insert(crate::rtpengine::session::MediaSession {
                         call_id: new_store_key,
                         rtpengine_call_id: cid_new.clone(),
-                        // a_leg/b_leg role order after promotion: the target is
-                        // the offerer for future role-based lookups.
-                        from_tag: tgt_tag.clone(),
-                        to_tag: Some(surv_tag.clone()),
-                        profile: transfer_profile
-                            .clone()
-                            .unwrap_or_else(|| old_session.profile.clone()),
+                        from_tag,
+                        to_tag: Some(to_tag),
+                        profile,
                         // Deliberately not carried over from `old_session`: this
                         // is a fresh engine call-id for the survivor↔target
                         // pair, and any WebSocket bridge the pre-transfer anchor
@@ -816,10 +913,12 @@ pub fn b2bua_complete_terminated_transfer(
                         ws_uri: None,
                         ws_tee: None,
                         ws_bridge_attached: false,
-                        bridge_sides: None,
+                        bridge_sides,
                         created_at: std::time::Instant::now(),
                     });
-                    store.remove(old_key);
+                    if key_moved {
+                        store.remove(old_key);
+                    }
                 }
                 b2bua_transfer_rtpengine_delete(
                     state,

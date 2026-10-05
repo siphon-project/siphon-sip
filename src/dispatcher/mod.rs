@@ -100,6 +100,10 @@ mod cancel_awaits_provisional_tests;
 #[cfg(test)]
 mod carrier_attribution_tests;
 #[cfg(test)]
+mod control_bridge_elsewhere_tests;
+#[cfg(test)]
+mod control_bridge_ingress_tests;
+#[cfg(test)]
 mod control_bridge_media_tests;
 #[cfg(test)]
 mod control_bridge_relay_tests;
@@ -128,9 +132,15 @@ mod control_originate_aor_tests;
 #[cfg(test)]
 mod control_originate_tests;
 #[cfg(test)]
+mod control_rebridge_tests;
+#[cfg(test)]
 mod control_refer_controller_tests;
 #[cfg(test)]
+mod control_unbridge_reoffer_tests;
+#[cfg(test)]
 mod delayed_offer_ack_tests;
+#[cfg(test)]
+mod delayed_offer_ingress_tests;
 #[cfg(test)]
 mod dial_bridge_test_harness;
 #[cfg(test)]
@@ -180,11 +190,17 @@ mod proxy_reply_filter_tests;
 #[cfg(test)]
 mod public_api_surface;
 #[cfg(test)]
+mod refer_answer_tests;
+#[cfg(test)]
 mod relayed_cancel_awaits_provisional_tests;
 #[cfg(test)]
 mod relayed_identity_tests;
 #[cfg(test)]
+mod reoffer_ingress_tests;
+#[cfg(test)]
 mod replacement_fork_tests;
+#[cfg(test)]
+mod replacement_prack_tests;
 #[cfg(test)]
 mod reply_script_header_tests;
 #[cfg(test)]
@@ -220,9 +236,13 @@ mod tests;
 #[cfg(test)]
 mod transfer_bye_tests;
 #[cfg(test)]
+mod transfer_ingress_tests;
+#[cfg(test)]
 mod uas_bad_extension_tests;
 #[cfg(test)]
 mod unacked_answer_tests;
+#[cfg(test)]
+mod undialled_replacement_tests;
 #[cfg(test)]
 mod ws_uri_expansion_tests;
 
@@ -594,6 +614,10 @@ pub async fn run(
             .as_ref()
             .and_then(|m| m.sdp_name.clone())
             .unwrap_or_else(|| product_name.to_string()),
+        sdp_keep_session_name: config
+            .media
+            .as_ref()
+            .is_some_and(|m| m.sdp_keep_session_name),
         sdp_strip_attributes: config
             .media
             .as_ref()
@@ -616,6 +640,7 @@ pub async fn run(
         ro_sessions: Arc::new(DashMap::new()),
         cdr_sessions: Arc::new(DashMap::new()),
         pending_inbound_refer: Arc::new(PendingInboundReferStore::default()),
+        answered_refers: Arc::new(AnsweredReferStore::default()),
         controller_refers: Arc::new(ControllerReferStore::default()),
         deferred_referrer_bye: Arc::new(DeferredReferrerByeStore::default()),
         parse_error_log: Arc::new(ParseErrorLimiter::default()),

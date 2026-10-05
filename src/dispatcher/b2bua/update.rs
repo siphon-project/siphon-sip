@@ -125,6 +125,13 @@ pub fn handle_b2bua_update(inbound: InboundMessage, message: SipMessage, state: 
     {
         return;
     }
+    // A leg with no second party and no session the engine answers for it: a
+    // leg parted from its bridge. Before its offer is taken for its media.
+    if from_a_leg
+        && crate::dispatcher::b2bua::answer_unanchored_reoffer(&inbound, &message, &call_id, state)
+    {
+        return;
+    }
 
     // Track the offerer's own new endpoint SDP (its UPDATE offer, raw) so a
     // later siphon-terminated transfer offers this leg's current media if it is
@@ -375,7 +382,7 @@ pub fn handle_b2bua_update(inbound: InboundMessage, message: SipMessage, state: 
         if !forwarded.body.is_empty() {
             // Family-matched to the target leg (same arrival socket as the Via).
             let sdp_addr = state.a_leg_advertised_host(target_local_addr, &transport);
-            sanitize_sdp_identity(&mut forwarded.body, &state.sdp_name, Some(&sdp_addr));
+            hide_sdp_identity(&mut forwarded.body, state, Some(&sdp_addr));
 
             if let (Some(ref rtpengine_set), Some(ref media_sessions), Some(ref profiles)) = (
                 &state.rtpengine_set,
@@ -398,7 +405,14 @@ pub fn handle_b2bua_update(inbound: InboundMessage, message: SipMessage, state: 
                             return;
                         };
                         let mut offer_flags = profile.offer.clone();
-                        offer_flags.stamp_received_from(inbound.remote_addr.ip());
+                        // The offering party's own policy, as on a
+                        // re-INVITE: a callee was set up under the `answer`
+                        // half, not the `offer` half that shapes this command.
+                        session.party_ingress(from_a_leg).stamp_ingress(
+                            &mut offer_flags,
+                            profiles,
+                            inbound.remote_addr.ip(),
+                        );
                         offer_flags.stamp_sip_call_id(&sip_call_id);
                         match tokio::task::block_in_place(|| {
                             tokio::runtime::Handle::current().block_on(rtpengine_set.reoffer(

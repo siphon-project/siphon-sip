@@ -164,6 +164,40 @@ impl CallActorStore {
         Some(late)
     }
 
+    /// The replacement of the leg on this side sent no INVITE at all: every
+    /// target failed before anything reached the transport. End it as failed
+    /// on `status_code`, so it is concluded like one whose targets all refused
+    /// and does not stay on the call holding off the next.
+    ///
+    /// `None` when there is no such replacement: one that entered a target is
+    /// that target's to settle, and one the call's teardown already ended is
+    /// over.
+    pub fn fail_undialled_replacement(
+        &self,
+        call_id: &str,
+        replaced_on_a_leg: bool,
+        status_code: u16,
+    ) -> Option<FailedReplacement> {
+        let mut guard = self.calls.get_mut(call_id)?;
+        let call: &mut CallActor = &mut guard;
+        let subscription = call
+            .refer_subscriptions
+            .iter_mut()
+            .rev()
+            .find(|subscription| {
+                subscription.siphon_notifies
+                    && subscription.on_a_leg == replaced_on_a_leg
+                    && subscription.state == TransferState::Trying
+                    && subscription.targets.is_empty()
+            })?;
+        Some(fail_replacement(
+            subscription,
+            &mut call.b_legs,
+            &mut call.b_leg_status,
+            status_code,
+        ))
+    }
+
     /// Where the leg whose INVITE rode Via `branch` sits among the call's
     /// B-legs right now. A position is only good until the next leg is taken
     /// off the call, so one read earlier is re-read through this before use.
@@ -954,6 +988,43 @@ mod tests {
             .expect("the call is gone");
         assert!(gone.cancelled.is_empty());
         assert_eq!(media_ids(&gone.released_media), ["media-gone"]);
+    }
+
+    /// A replacement that entered no target is failed as a whole, once, and
+    /// one a target was entered for is left to that target.
+    #[test]
+    fn a_replacement_with_no_target_entered_is_failed_and_one_with_a_target_is_not() {
+        let (store, call_id) = ringing(&[], None);
+        assert!(
+            store
+                .fail_undialled_replacement(&call_id, true, 503)
+                .is_none(),
+            "the other side's leg is not being replaced"
+        );
+        let failed = store
+            .fail_undialled_replacement(&call_id, false, 503)
+            .expect("nothing was dialled");
+        assert_eq!(failed.status_code, 503);
+        assert!(!failed.replaced_on_a_leg);
+        assert!(failed.branches.is_empty());
+        assert!(failed.cancelled.is_empty());
+        assert!(failed.released_media.is_empty());
+        assert!(!store.replacement_is_open(&call_id, false));
+        assert!(
+            store
+                .fail_undialled_replacement(&call_id, false, 503)
+                .is_none(),
+            "failed once"
+        );
+
+        let (store, call_id) = ringing(&["desk"], None);
+        assert!(store
+            .fail_undialled_replacement(&call_id, false, 503)
+            .is_none());
+        assert_eq!(outcomes(&store, &call_id), [ReplacementOutcome::Pending]);
+        assert!(store
+            .fail_undialled_replacement("no-such-call", false, 503)
+            .is_none());
     }
 
     /// A target whose INVITE is not on the wire yet cannot be CANCELled (RFC

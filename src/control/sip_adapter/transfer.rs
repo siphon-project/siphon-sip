@@ -41,12 +41,6 @@ pub(super) fn refer(channel: &ChannelRef, args: &serde_json::Value) -> ControlRe
     }
 }
 
-/// `accept_refer` — accept a *controlled* call's pending inbound REFER (surfaced
-/// as a `TransferRequested` event). Drives siphon's shipped transfer machinery in
-/// the resolved mode. Optional `target` overrides the Refer-To URI, `next_hop`
-/// steers egress, and `mode` (`"terminate"` / `"transparent"`) overrides the
-/// configured `b2bua.default_refer_mode`. No pending REFER (already decided,
-/// timed out, or the call is gone) → `not_found`.
 /// Validate the mutually-exclusive `number_policy` / `format` verb arguments.
 ///
 /// Resolved here so an unusable one is a synchronous `bad_request` to the
@@ -285,6 +279,12 @@ pub(super) fn replace_peer(channel: &ChannelRef, args: &serde_json::Value) -> Co
     }
 }
 
+/// `accept_refer` — accept a *controlled* call's pending inbound REFER (surfaced
+/// as a `TransferRequested` event). Drives siphon's shipped transfer machinery in
+/// the resolved mode. Optional `target` overrides the Refer-To URI, `next_hop`
+/// steers egress, and `mode` (`"terminate"` / `"transparent"`) overrides the
+/// configured `b2bua.default_refer_mode`. No pending REFER (already decided,
+/// timed out, or the call is gone) → `not_found`.
 pub(super) fn accept_refer(channel: &ChannelRef, args: &serde_json::Value) -> ControlResult {
     let transfer = match parse_transfer_dial("accept_refer", args) {
         Ok(transfer) => transfer,

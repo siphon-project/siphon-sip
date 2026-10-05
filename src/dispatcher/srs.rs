@@ -436,7 +436,7 @@ pub(super) fn handle_srs_invite(
             response_builder.header("Contact", format!("<sip:srs@{}>", state.local_addr));
 
         // Add SDP body (from RTPEngine or echo back original).
-        // Sanitize o=/s= lines to hide the SRC's identity (e.g. "FreeSWITCH").
+        // Sanitize o=/s= lines to hide the SRC's identity (its product name).
         // Flip SDP direction for the answer: the SRC offered sendonly (it sends
         // forked media), so the SRS answer must be recvonly (we receive it).
         // RTPEngine's offer response preserves the offer direction — we must flip

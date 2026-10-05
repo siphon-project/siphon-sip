@@ -242,6 +242,7 @@ export type SipEventKind =
   | "ChannelDtmfReceived"
   | "PlayStarted"
   | "TransferRequested"
+  | "TransferTimedOut"
   | "TransferProgress"
   | "TransferCompleted"
   | "TransferFailed"
@@ -369,6 +370,26 @@ export interface TransferRequestedPayload {
    * this is the `leg_sip_call_id` its `DialBranch` named, not the channel's.
    */
   referrer_sip_call_id?: string | null;
+}
+
+/**
+ * The `payload` of a `TransferTimedOut` event — a transfer accepted with
+ * `acceptRefer({ mode: "controller" })` passed its deadline with no
+ * `completeRefer`. siphon ended the referrer's subscription for the app, with
+ * a sipfrag NOTIFY of its own (RFC 3515 §2.4.5); a `completeRefer` now is
+ * refused. Cast a {@link import("./sip").CallEvent}'s `payload` to this when
+ * `kind === "TransferTimedOut"`.
+ */
+export interface TransferTimedOutPayload {
+  /** Why the transfer ended: `"timeout"`. */
+  reason: string;
+  /**
+   * The sipfrag status siphon reported to the referrer (`503`), or `null` when
+   * the referrer's leg had already left the call and nothing could be sent.
+   */
+  code?: number | null;
+  /** Which party of the channel's call had referred, as on {@link TransferRequestedPayload}. */
+  referrer_leg?: "a" | "b" | null;
 }
 
 /**

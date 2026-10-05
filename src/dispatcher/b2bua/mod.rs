@@ -39,6 +39,7 @@ mod originate_media;
 mod outbound;
 mod prack_bridge;
 mod refer;
+mod refer_answered;
 mod refer_controller;
 mod refer_outbound;
 mod refresh_offer_relay;
@@ -55,6 +56,7 @@ mod transfer;
 mod transfer_dial;
 mod transfer_fork;
 mod transfer_media;
+mod unanchored_reoffer;
 mod update;
 
 pub use ack::*;
@@ -85,6 +87,7 @@ pub use originate_media::*;
 pub use outbound::*;
 pub use prack_bridge::*;
 pub use refer::*;
+pub use refer_answered::*;
 pub use refer_controller::*;
 pub use refer_outbound::*;
 pub use refresh_offer_relay::*;
@@ -100,6 +103,7 @@ pub use transfer::*;
 pub use transfer_dial::*;
 pub use transfer_fork::*;
 pub use transfer_media::*;
+pub use unanchored_reoffer::*;
 pub use update::*;
 
 /// Whether B2BUA mode handles this call.

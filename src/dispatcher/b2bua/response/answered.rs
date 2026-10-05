@@ -582,7 +582,7 @@ pub fn start_li_recording(
             };
 
             // Sanitize the subscribe SDPs to hide the original call's identity
-            // (o=/s= lines may leak FreeSWITCH, Oracle, etc.).
+            // (o=/s= lines may leak the far end's product name).
             let local_ip = state.local_addr.ip().to_string();
             if let Some(ref mut sdp_bytes) = caller_sdp {
                 sanitize_sdp_identity(sdp_bytes, "siphon", Some(&local_ip));

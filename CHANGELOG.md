@@ -61,6 +61,20 @@ entry, but a working config keeps working.
   `complete_refer`, `accept_refer(mode="controller", timeout=…)` /
   `complete_refer`, `acceptRefer({ mode: "controller" })` /
   `completeRefer`).
+- **`TransferTimedOut` tells an application its transfer report came too
+  late.** A transfer accepted with `accept_refer {mode: "controller"}` has a
+  deadline for `complete_refer`. When it passed, siphon ended the referrer's
+  subscription with a `503` sipfrag NOTIFY and told the application nothing,
+  so it went on with the transfer and learned of it only from a refused
+  `complete_refer`. The deadline now also raises `TransferTimedOut` on the
+  channel, payload `{reason: "timeout", code, referrer_leg}`: `code` is the
+  status the referrer was sent (`503`, or `null` when its leg had already
+  left the call), `referrer_leg` is `"a"` or `"b"` as in `TransferRequested`.
+  Raised once, and not for a transfer that was reported, whose referrer hung
+  up, or whose call ended. `describe` lists it, and the Rust, Python and
+  TypeScript control SDKs know it (`SipEvent::TransferTimedOut` with
+  `CallEvent::transfer_timed_out()`, the `"TransferTimedOut"` event kind,
+  `TransferTimedOutPayload`).
 - **A `dial` target can name its called party with `to`.** It becomes that
   branch's `To` URI. Before, a B-leg always kept the caller's `To` user and
   only swapped in the target's host. That is right for a forward and wrong for
@@ -76,6 +90,13 @@ entry, but a working config keeps working.
   `{"to": ...}`, `to?`). In the Rust SDK this adds a field to both
   `DialTarget` variants, which breaks code that matches or builds them by
   field.
+- **`media.sdp_keep_session_name` leaves the SDP `s=` line alone on a B2BUA
+  call.** siphon replaces the `o=` identity and the `s=` session name of the
+  SDP it relays between the legs with `media.sdp_name`. Some peers use the
+  session name as a marker of their own and need it to cross unchanged. With
+  `sdp_keep_session_name: true` the session name is relayed as the far side
+  wrote it, and `o=` is still rewritten. Default `false`, so nothing changes
+  for an existing config.
 
 ### Fixed
 
@@ -114,6 +135,64 @@ entry, but a working config keeps working.
   proxy path is not changed: a CANCEL relayed or generated for a proxied
   INVITE (`request.relay()`, `request.fork()`, `reply.reject()`) still goes
   out without waiting.
+- **A transfer whose target cannot be dialled ends its subscription and
+  leaves the call free.** A siphon-terminated REFER answers `202` and sends
+  the `100 Trying` NOTIFY before it dials. When no INVITE could then be sent
+  for any target (it does not resolve, or no contact of it can be reached),
+  nothing ever ended the subscription: the referrer waited on it (RFC 3515
+  §2.4.5 has it end with a final NOTIFY), and the replacement stayed recorded
+  on the call, so every later `replace_peer` there was refused as already in
+  flight. `replace_peer` itself was refused `bad_request` for such a target
+  and left the same record behind. The replacement now fails as one whose
+  targets all refused: the referrer gets a NOTIFY with a `503 Service
+  Unavailable` sipfrag and `Subscription-State: terminated;reason=noresource`,
+  a controlling application gets `ReplaceFailed` with status 503, and the call
+  keeps both its parties with nothing pending. `replace_peer` is still refused
+  `bad_request`, with no event, and can be sent again at once. With several
+  targets, the ones that were dialled ring on as before.
+- **A retransmitted REFER gets its response again instead of being acted on
+  again.** The B2BUA answers a REFER some time after it arrives, once a
+  script, a controlling application or the far end has decided, and a copy
+  arriving after that (its final response was lost) was taken for a new
+  request. On a controlled call the application got a second
+  `TransferRequested` and a second decision to make. On a call its script
+  accepts, `@b2bua.on_refer` ran again and the target was dialled a second
+  time, or the REFER relayed a second time. A REFER already decided on is now
+  recognised by Call-ID, CSeq and Via branch (RFC 3261 §17.2.3) and answered
+  with the final response it got (§17.2.2), for 64·T1: the `202`, a
+  rejection, the decision deadline's `603`, or what the far end answered in
+  `transparent` mode, where a copy arriving before the far end has answered
+  is absorbed. A REFER with a new CSeq is a new request, as before.
+- **A REFER waiting for an application's decision is answered when its call
+  ends.** A REFER on a controlled call is held until `accept_refer` or
+  `reject_refer`. When the call ended first the REFER stayed held and
+  unanswered until the decision deadline, and an `accept_refer` arriving
+  before that removed it without answering it at all. It is now answered as
+  the call ends, and nothing stays held: `487 Request Terminated` when its
+  own sender hangs up (RFC 3261 §15.1.2), `603 Decline` when the other party
+  hangs up or the call is torn down, ahead of the BYE siphon sends the
+  referrer, and `481` from an `accept_refer` that finds the call already
+  gone. The deadline's `603` for an application that never decides is
+  unchanged.
+- **A transfer target's reliable provisional is PRACKed.** When the caller
+  of a call supports `100rel`, siphon holds its PRACK for a callee's reliable
+  provisional until the caller PRACKs siphon's copy (RFC 3262 §5). The target
+  of a siphon-terminated transfer or a `replace_peer` was treated the same
+  way, but its provisionals are never relayed to the caller, so the PRACK it
+  was owed waited for one that could not come, and a UAS left without a PRACK
+  rejects the INVITE after 64·T1 (RFC 3262 §3). siphon now PRACKs a
+  replacement target at once, on that target's own early dialog. A call
+  whose caller does not support `100rel` already did.
+- **A PRACK and a branch's failure follow their leg, not its position.**
+  siphon noted a B-leg's position among the call's legs when a response
+  arrived and acted on it later: a PRACK held for the caller's is sent when
+  that arrives, and a branch's failure is recorded after the retries and
+  hooks a failure runs. A leg ahead of it taken off the call in between (the
+  tracking leg of an in-dialog request once it is answered, a failed
+  transfer's targets) moved every later leg down one, so the position no
+  longer named that leg and a PRACK addressed by it was not sent. Both now
+  find the leg by the Via branch of its INVITE (RFC 3261 §8.1.1.7), under
+  the lock that acts on it.
 - **A transfer target given up on at its deadline has its `487` ACKed.** When
   a siphon-terminated transfer or `replace_peer` ran out of time, siphon sent
   the target a CANCEL and forgot the leg at once, so the `487 Request
@@ -134,6 +213,148 @@ entry, but a working config keeps working.
   still open and nothing left to CANCEL it. The target is now sent a CANCEL
   (RFC 3261 §9.1) before the call goes, its `487` is ACKed, and its media
   engine call is released.
+- **A bridged party's media ingress is pinned by its own profile, not the
+  other party's.** In a `bridge` (and a `dial {on_answer: "bridge"}`, which
+  ends in one) each media-engine command carries one party's SDP and is shaped
+  by the other party's profile, and the `received_from` policy was read from
+  that shaping profile. A party behind NAT, whose SDP names an address its
+  media does not come from, was therefore pinned to its signalling source only
+  if the party it was joined to had a profile asking for that. Joined to a
+  caller answered with a profile that does not, its answer reached the engine
+  with no source hint, the engine expected its media from the address in its
+  SDP, and the call was silent in both directions. The reverse held too: a
+  party whose profile asks for no hint was pinned to its signalling source by
+  the other's, which gates out one whose media comes from a different host
+  than its signalling. The hint now follows the profile of the party whose SDP
+  the command carries, on the bridge's offer and answer and on every re-offer
+  relayed across the formed pair, while the rest of each command is shaped as
+  before. `bridge {profile}` is unchanged: the pair profile describes both
+  parties, its `offer` half the anchor and its `answer` half the `with` leg.
+- **A transfer on a media-anchored call pins each party's media ingress to its
+  signalling source.** A siphon-terminated REFER, `replace_peer` and an INVITE
+  with `Replaces` each put the surviving party and a new one on a fresh media
+  engine call, and neither the `offer` nor the `answer` sent there carried the
+  `received_from` hint, whatever the profile asked for. The engine has no
+  earlier hint for a fresh call, so a party behind NAT, whose SDP names an
+  address its media does not come from, was gated on that address and the
+  transferred call was silent. Each command now carries the signalling source
+  of the party whose SDP it holds (the surviving leg's remote address, the
+  source of the target's 2xx, the source of the taking-over INVITE) where that
+  party's own policy asks for it. A profile named for the transfer
+  (`accept_refer(profile=)`, `replace_peer {profile}`) describes the pair it
+  creates as a dial's does: its `offer` half the surviving party, whose SDP is
+  offered, and its `answer` half the target. With none named the call's own
+  profile is inherited, the surviving party keeps the half it was set up under
+  (the caller the `offer` half, the callee the `answer` half) and the new party
+  takes the half of the party it replaces, so a party whose policy asks for no
+  hint is still sent none. A replacement that rings several targets pins each
+  target's own answer by its own source. The pair records both policies, so a
+  second transfer of the same call reads them again.
+- **A transfer that replaces the callee keeps the call's media session.** On a
+  media-anchored call the pair's session is stored under the caller's Call-ID.
+  Replacing the callee leaves that Call-ID unchanged, and the completion wrote
+  the new pair's session there and then removed "the old one" under the same
+  key, so the call was left with no media session at all: a later transfer of
+  it was not anchored, and the call's teardown did not delete the pair's media
+  engine call, which stayed until the engine's own timeout. The session is now
+  kept, and the engine call goes with the call.
+- **A hold from the caller after its callee was transferred away is relayed,
+  not refused `491`.** The leg of a transfer target was never marked confirmed
+  when siphon ACKed its 2xx, so a re-INVITE from the surviving caller, which is
+  relayed only to a confirmed leg (RFC 3261 §14.1), was answered `491 Request
+  Pending` however often it was retried. The target's leg is now confirmed by
+  that ACK. The re-anchored pair's media session also named the target where
+  the caller's slot is read from, so the caller's re-offer would have reached
+  the media engine as the target's; it now names the surviving caller first
+  and the target second, and the caller's hold is re-offered on the pair's
+  engine call under the caller's own tag and relayed to the target.
+- **A pair bridged again after an `unbridge` is shaped and pinned as its first
+  bridge shaped and pinned it.** When a bridge forms, the `with` leg's own
+  media session is retired, and with it the record of the profile that leg was
+  anchored with. A second `bridge` of the same two legs then offered the `with`
+  leg what the anchor's profile describes (a phone anchored with SRTP was
+  offered `RTP/AVP`) and read its `received_from` policy from the anchor's
+  profile, so a `with` leg behind NAT lost its source hint and one that asked
+  for none could be given one. The pair's session records both parties' sides,
+  and the second bridge now reads the `with` leg's from there, in whichever
+  order the two legs are named. A leg bridged to a *different* party afterwards
+  is unaffected by what was recorded for the first.
+- **A re-INVITE or UPDATE relayed between the two legs of a call pins each
+  party's media ingress by that party's own policy.** The relay sent the
+  re-offering party's SDP to the media engine under the profile's `offer` half
+  and the answering party's under its `answer` half, and read `received_from`
+  from the same half. That is right while the caller re-offers. When the
+  callee did (a hold from the called side, a session refresh), the callee was
+  pinned to its signalling source if the *caller's* half asked for it, and the
+  caller's answer by the callee's half. With a profile whose halves differ, a
+  callee behind NAT that re-offered lost its source hint and its media was
+  gated on the address in its SDP, and a callee whose half asks for no hint
+  (one whose media comes from another host than its signalling) was given
+  one. The hint now follows the party whose SDP each command carries: the
+  caller the `offer` half and the callee the `answer` half, whoever re-offers.
+  After a transfer or a `Replaces` takeover it follows what the re-paired
+  session recorded for each party, which matters after a takeover, where the
+  newcomer sits in the caller's slot of the call with the replaced callee's
+  policy. The commands are shaped as before, and a profile with the same
+  policy on both halves sends what it sent.
+- **On a delayed offer the caller's answer carries its source hint, and a
+  later re-offer names the party that sent it.** When the INVITE carried no
+  SDP the callee offers in its 2xx and the caller answers in its ACK. That
+  answer reached the media engine with no `received_from` hint whatever the
+  profile asked for, so a caller behind NAT was gated on the address in its
+  SDP. It is now pinned to the caller's signalling source where the caller's
+  own half asks, which is the `offer` half: a profile is chosen for the dial
+  before anyone knows who will offer. The media session also kept the callee
+  as its first party and the caller as its second once answered, the reverse
+  of every other session, so a hold from the caller reached the engine as a
+  re-offer under the *callee's* tag. The answered session now names the caller
+  first, and a re-offer from either party goes out under its own tag.
+- **`rtpengine.answer(reply)` pins the replying party to where the reply came
+  from.** The source address carried for a reply was the one of the `call=`
+  object, which is the caller's: with a profile whose `answer` half sets
+  `received_from`, the callee's media was gated to the caller's address.
+  Without `call=` no address was carried and the callee was not pinned at
+  all. A reply now carries its own source, also when it holds a delayed
+  offer, where the `answer` half's policy still decides because the SDP is
+  the dialled party's. In a proxy script, `rtpengine.offer()` on a re-INVITE
+  from the callee and `rtpengine.answer()` on the caller's reply to it read
+  the policy of the party whose SDP they carry in the same way. This makes
+  `received_from` on an `answer` half take effect for a script that calls
+  `rtpengine.answer(reply)` without `call=`: a profile that sets it there for
+  callees whose media comes from another host than their signalling has to
+  clear it on that half.
+- **A leg parted by `unbridge` gets a coherent answer to a re-INVITE or
+  UPDATE.** After an `unbridge` the pair's media session stays under the
+  anchor, still joining the two held parties, and the other leg has none. A
+  re-offer or a session refresh from the anchor was answered by sending the
+  engine a local answer on the pair's own engine call, the one that still
+  relays between the two, and a refresh came back `sendrecv` on a leg siphon
+  had on hold. Any request from the other leg, a bodyless session refresh
+  included, was answered `488`. Both are
+  now answered from the leg's own dialog and the engine is sent nothing: a
+  request that changes nothing (no SDP, or the SDP the leg last sent, RFC
+  3264 §8) is answered `200` with the session in force, and an offer that
+  would change the session is refused `488` (RFC 3261 §14.2), leaving the leg
+  held as it was. The refused offer is no longer taken for the leg's media, so
+  a `bridge` afterwards offers what the leg really has.
+- **A leg bridged to a different anchor after an `unbridge` is offered and
+  pinned as its own profile describes.** The `with` leg's own media session is
+  retired when its bridge forms, and what it was bridged with was recorded only
+  on the pair's session, under the first anchor. Bridged to another anchor
+  afterwards, the leg was offered what that anchor's profile describes (a
+  party needing SRTP was offered `RTP/AVP`) and pinned by that anchor's
+  `received_from` policy. What a bridge shaped and pinned its `with` leg with
+  is now kept for that leg's own call until the call ends, and read by the
+  next bridge. A leg that never had a media session of its own is described
+  by its anchor, as before.
+- **A retransmitted INVITE on a B2BUA call is answered.** The retransmission
+  was recognised (it creates no second call) and then dropped without a
+  response. A caller retransmits because it has seen no provisional, so one
+  that lost the `100 Trying` or the `180 Ringing` on the way kept
+  retransmitting its INVITE until a later response happened to arrive. It now
+  gets the most recent provisional again, or a `100 Trying` when none beyond
+  that has been sent (RFC 3261 §17.2.1). Nothing is re-sent once the INVITE
+  has its final response, or for an INVITE on another Via branch.
 - **An `{aor}` dial target's identity is no longer dropped.** `from`,
   `from_display`, `p_asserted_identity` and `privacy` on an `{aor}` target
   were ignored, though the reference documented them on both target forms
@@ -234,6 +455,19 @@ entry, but a working config keeps working.
 - **A caller's dialog that is not watched says why**, at `debug`. The six ways
   out of starting a `DialogStateChanged` watch were all silent, which reads
   the same as the feature being off.
+- **`@b2bua.on_cancel` runs once, and after `@b2bua.on_invite`, for a call
+  CANCELled early.** Two orderings of a caller's CANCEL left a script's
+  teardown wrong:
+  - The CANCEL arrived while an async `on_invite` was still awaiting (a media
+    offer, a lookup). `on_cancel` could not run, because the call's INVITE was
+    not stored until the handler returned, and whatever the handler then
+    finished setting up was never released: a media session held until the
+    engine's own timeout. `on_cancel` now runs when the handler has returned.
+  - The callee answered siphon's CANCEL with its `487` before siphon had
+    finished ending the call. The `487` was taken for a B-leg failure, so
+    `@b2bua.on_failure` ran beside `on_cancel` and a script releasing media in
+    both released it twice. The legs are now recorded as CANCELled before
+    their CANCELs are sent, and the `487` is acknowledged without a handler.
 
 ## [1.12.0] — 2026-09-30
 

@@ -53,10 +53,8 @@ pub fn b_leg_failed(
     // fork of one and settles here at once. An LCR sequence keeps one carrier
     // live at a time under its own failover rules, and a response matching no
     // leg has no fork to settle, so both go straight on.
-    let fork_index = snapshot
-        .b_leg_index
-        .filter(|_| !state.call_actors.is_route_sequence(call_id));
-    let Some(index) = fork_index else {
+    let in_a_fork = snapshot.b_leg_index.is_some() && !state.call_actors.is_route_sequence(call_id);
+    if !in_a_fork {
         fail_call_on_b_leg_failure(
             call_id,
             branch,
@@ -67,13 +65,18 @@ pub fn b_leg_failed(
             false,
         );
         return;
-    };
+    }
+    // Recorded against the leg on this response's Via branch, found under the
+    // lock that records it. The position the snapshot read is not used: the
+    // retries and hooks above ran since, and a leg ahead of this one taken off
+    // the call meanwhile would have the failure land on its neighbour.
     let Some(settlement) =
         state
             .call_actors
-            .record_branch_failure(call_id, index, status_code, message)
+            .record_branch_failure_on(call_id, branch, status_code, message)
     else {
-        // The call went away underneath this response; it is still owed its ACK.
+        // The call, or the leg, went away underneath this response; it is
+        // still owed its ACK.
         ack_b_leg_non2xx(branch, message, state, snapshot);
         return;
     };
