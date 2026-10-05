@@ -878,6 +878,9 @@ auth:
 #     timeout_ms: 1000              # NG protocol response timeout
 #   sdp_name: "SIPhon"             # Name used in SDP o= and s= lines
 #                                   # (masks remote endpoint identity, default: "SIPhon")
+#   sdp_keep_session_name: false   # true leaves the s= session name as the far side
+#                                   # wrote it, for peers that read it as a marker.
+#                                   # o= is rewritten either way. Default: false.
 #   sdp_strip_attributes: ["msid"] # SDP a= attributes removed from the SDP relayed
 #                                   # between B2BUA legs: session and media level, both
 #                                   # directions, with or without a value, names matched

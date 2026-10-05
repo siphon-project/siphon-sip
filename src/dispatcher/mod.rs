@@ -578,6 +578,10 @@ pub async fn run(
             .as_ref()
             .and_then(|m| m.sdp_name.clone())
             .unwrap_or_else(|| product_name.to_string()),
+        sdp_keep_session_name: config
+            .media
+            .as_ref()
+            .is_some_and(|m| m.sdp_keep_session_name),
         sdp_strip_attributes: config
             .media
             .as_ref()

@@ -609,7 +609,7 @@ pub fn b2bua_send_b_leg_invite(
     // Sanitize SDP: mask A-leg identity in o= and s= lines, and rewrite
     // the o= address to our advertised address for topology hiding.
     let sdp_addr = state.via_host(&outbound_transport);
-    sanitize_sdp_identity(&mut b_leg_invite.body, &state.sdp_name, Some(&sdp_addr));
+    hide_sdp_identity(&mut b_leg_invite.body, state, Some(&sdp_addr));
 
     // Update Content-Length after SDP rewrite (o=/s= changes may alter body size)
     if !b_leg_invite.body.is_empty() {

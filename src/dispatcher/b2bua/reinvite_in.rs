@@ -451,7 +451,7 @@ pub fn handle_b2bua_reinvite(
         // target leg (same arrival socket as the Via above), so a v6 A-leg gets
         // a v6 o= address to go with its v6 Via.
         let sdp_addr = state.a_leg_advertised_host(target_local_addr, &transport);
-        sanitize_sdp_identity(&mut forwarded.body, &state.sdp_name, Some(&sdp_addr));
+        hide_sdp_identity(&mut forwarded.body, state, Some(&sdp_addr));
 
         // RTPEngine: rewrite re-INVITE SDP through offer to maintain media anchoring.
         // Without this, re-INVITE SDP passes through unmodified — if the remote side

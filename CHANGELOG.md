@@ -30,6 +30,13 @@ entry, but a working config keeps working.
   `{"to": ...}`, `to?`). In the Rust SDK this adds a field to both
   `DialTarget` variants, which breaks code that matches or builds them by
   field.
+- **`media.sdp_keep_session_name` leaves the SDP `s=` line alone on a B2BUA
+  call.** siphon replaces the `o=` identity and the `s=` session name of the
+  SDP it relays between the legs with `media.sdp_name`. Some peers use the
+  session name as a marker of their own and need it to cross unchanged. With
+  `sdp_keep_session_name: true` the session name is relayed as the far side
+  wrote it, and `o=` is still rewritten. Default `false`, so nothing changes
+  for an existing config.
 
 ### Fixed
 
