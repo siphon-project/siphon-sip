@@ -379,9 +379,18 @@ pub(crate) async fn bridge_calls_with_state(
     // The same pair, parted and bridged again: the peer's own session went
     // when the first bridge formed, and the anchor's still relays to it. What
     // the peer was anchored with is read off that session, or the anchor's
-    // profile would shape and pin a party it was never chosen for.
+    // profile would shape and pin a party it was never chosen for. Bridged to
+    // a different anchor, the peer is on no session of this anchor's, and the
+    // same is read off what was kept for the peer's own call.
     if peer.media.is_none() {
-        peer.media = rejoining_peer_media(state, &anchor.sip_call_id, &peer.sip_call_id);
+        peer.media =
+            rejoining_peer_media(state, &anchor.sip_call_id, &peer.sip_call_id).or_else(|| {
+                state
+                    .rtpengine_sessions
+                    .as_ref()
+                    .and_then(|store| store.own_media(&peer.sip_call_id))
+                    .map(crate::b2bua::bridge::LegMedia::of_retired_peer)
+            });
     }
     bridge_leg_validate(&anchor)?;
     bridge_leg_validate(&peer)?;
@@ -1187,7 +1196,17 @@ pub fn bridge_adopt_media(
         _ => None,
     };
     let mut retired = Vec::new();
-    if let Some(session) = store.remove(&context.peer_sip_call_id) {
+    // The peer's own session goes, and with it the only thing stored under the
+    // peer's own call that says what it was anchored with. What this bridge
+    // shaped and pinned it with is kept for that call, so a bridge to a
+    // different anchor later reads it instead of that anchor's profile.
+    let peer_own = bridge_sides
+        .as_ref()
+        .map(|sides| crate::rtpengine::session::OwnMedia {
+            profile: sides.peer.profile.clone(),
+            ingress: sides.peer_ingress.clone(),
+        });
+    if let Some(session) = store.retire_for_bridge(&context.peer_sip_call_id, peer_own) {
         retired.push((session.rtpengine_id().to_string(), session.from_tag.clone()));
     }
     let previous = store.get(&anchor_key);

@@ -342,6 +342,15 @@ media:
         received_from: true
 ```
 
+Each party is pinned to its **own** signalling source, by its own half of the
+profile: the `offer` half is the caller's and the `answer` half the callee's,
+whichever of them sends the SDP. `rtpengine.offer(request)` carries the
+request's source, `rtpengine.answer(reply)` the source the reply arrived from
+(never the caller's, with or without `call=`), and a re-INVITE or UPDATE from
+the callee is pinned by the `answer` half although it travels as an offer. The
+same holds on a delayed offer, where the callee offers in its 2xx and the caller
+answers in its ACK. Set it on one half only when just one side is behind NAT.
+
 Off by default, because it is wrong for a deployment whose media legitimately
 arrives from a different address than its signalling (a separate media gateway,
 or a carrier that splits the two). Honoured by **rtpengine** (the `received from`

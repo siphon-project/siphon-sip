@@ -20,14 +20,14 @@ use std::sync::{Arc, Mutex};
 use pyo3::prelude::*;
 use tracing::debug;
 
-use crate::rtpengine::profile::NgFlags;
-use crate::rtpengine::session::{MediaSession, MediaSessionStore};
+use crate::rtpengine::profile::{NgFlags, ProfileEntry, ProfileRegistry};
+use crate::rtpengine::session::{MediaSession, MediaSessionStore, ProfileHalf};
 use crate::rtpengine::{MediaBackend, RtpEngineError};
 use crate::sip::message::SipMessage;
 
 use super::{
-    dialog_ids, extract_answer_params, extract_delete_params, extract_message, extract_source_ip,
-    extract_tag, lock_message, PyCall, PyReply, PyRequest,
+    dialog_ids, extract_answer_params, extract_delete_params, extract_message, extract_tag,
+    lock_message, PyCall, PyReply, PyRequest,
 };
 
 /// What `answer` sends to the engine, resolved from either mode.
@@ -141,14 +141,48 @@ impl AnswerExchange {
                     sdp,
                     identity: Some(a_leg_message.unwrap_or_else(|| Arc::clone(&message))),
                     body: Some(message),
-                    // A reply carries no source address of its own; when the script
-                    // passed `call=`, that object does.
-                    source_ip: call.and_then(|object| extract_source_ip(object)),
+                    // The SDP is the replying party's, so the address its media
+                    // ingress may be pinned to is where the reply came from.
+                    // Never the address of the `call=` object: that is the
+                    // caller's, and a callee pinned to it has its media
+                    // refused unless the two share a host.
+                    source_ip: reply
+                        .cast::<PyReply>()
+                        .ok()
+                        .and_then(|reply| reply.borrow().response_source_ip().map(str::to_string)),
                     delayed_offer,
                     answerer_sip_call_id: Some(reply_call_id),
                 })
             }
         }
+    }
+
+    /// The flags of the command the engine is sent, from the profile `entry`:
+    /// its `answer` half, or its `offer` half when the reply carries a delayed
+    /// offer and goes to the engine as one.
+    ///
+    /// Either way the SDP is the replying party's, and that party's own
+    /// `received_from` policy decides whether its media ingress is pinned to
+    /// where it signals from ([`party_pins_ingress`]). The party a dial reaches
+    /// is the one its profile's `answer` half describes, also on a delayed
+    /// offer, whose shape comes from the `offer` half: that half's policy is
+    /// the caller's, who has not sent an SDP yet. `session` is what the store
+    /// holds for the call, which says when the replying party is the caller,
+    /// answering a re-offer of the callee's.
+    pub(super) fn command_flags(
+        &self,
+        entry: &ProfileEntry,
+        registry: &ProfileRegistry,
+        session: Option<&MediaSession>,
+    ) -> NgFlags {
+        let mut flags = if self.delayed_offer {
+            entry.offer.clone()
+        } else {
+            entry.answer.clone()
+        };
+        flags.carry_received_from =
+            party_pins_ingress(session, &self.to_tag, entry, registry, ProfileHalf::Answer);
+        flags
     }
 
     /// Send the SDP to the engine and return the SDP it rewrote.
@@ -211,6 +245,42 @@ impl AnswerExchange {
         sessions.set_to_tag(&self.call_id, self.to_tag.clone());
         Ok(rewritten_sdp)
     }
+}
+
+/// Whether the party on engine tag `party_tag`, whose SDP a command carries, is
+/// pinned to its signalling source: its own `received_from` policy, read from
+/// the profile `entry` the command is sent under.
+///
+/// The half that shapes a command is chosen for the party its result is sent
+/// to, so its policy is the other party's. A party's own is the half it was
+/// set up under, which `session` says once the call is anchored
+/// ([`MediaSession::party_ingress`]): the caller the `offer` half and the
+/// callee the `answer` half, whichever of them offers now, or what a transfer
+/// or a bridge recorded for the pair. With no session, or on one that has only
+/// its first party, `first` is the half of a first exchange: `offer` for the
+/// party offering, `answer` for the one replying.
+pub(super) fn party_pins_ingress(
+    session: Option<&MediaSession>,
+    party_tag: &str,
+    entry: &ProfileEntry,
+    registry: &ProfileRegistry,
+    first: ProfileHalf,
+) -> bool {
+    let of = |half| match half {
+        ProfileHalf::Offer => entry.offer.carry_received_from,
+        ProfileHalf::Answer => entry.answer.carry_received_from,
+    };
+    let Some(session) = session else {
+        return of(first);
+    };
+    let on_from_tag = session.from_tag == party_tag;
+    if session.bridge_sides.is_some() {
+        return session.party_ingress(on_from_tag).pins_ingress(registry);
+    }
+    if on_from_tag && session.to_tag.is_none() {
+        return of(first);
+    }
+    of(session.party_ingress(on_from_tag).half)
 }
 
 /// An engine that refused the command, as the script sees it.
@@ -764,5 +834,127 @@ mod tests {
         );
         assert_eq!(session.from_tag, "tag-b", "the callee is the offerer");
         assert_eq!(session.to_tag, None, "the caller's answer is still to come");
+    }
+
+    /// The SDP in a reply is the replying party's, so the source address its
+    /// media ingress may be pinned to is where the reply arrived from. The
+    /// `call=` object's address is the caller's: carried on the callee's SDP
+    /// it would gate the callee's media to the caller's address.
+    #[test]
+    fn a_reply_carries_its_own_source_and_never_the_callers() {
+        Python::initialize();
+        Python::attach(|python| {
+            let sessions = MediaSessionStore::new();
+            // The caller, at 192.0.2.10.
+            let call = call_on(python, dialog_message("a-leg-call", None));
+            let from_callee = |source: Option<&str>| {
+                let reply = PyReply::new(dialog_message("b-leg-call", Some("tag-b")))
+                    .with_a_leg(dialog_message("a-leg-call", None));
+                let reply = match source {
+                    Some(source) => reply.with_response_source(source.to_string(), 5060),
+                    None => reply,
+                };
+                Bound::new(python, reply).unwrap()
+            };
+
+            for call_argument in [None, Some(call.as_any())] {
+                let exchange = AnswerExchange::resolve(
+                    from_callee(Some("198.51.100.91")).as_any(),
+                    call_argument,
+                    None,
+                    None,
+                    &sessions,
+                )
+                .unwrap();
+                assert_eq!(exchange.source_ip.as_deref(), Some("198.51.100.91"));
+            }
+            // A reply nothing is known about carries no address at all.
+            let exchange = AnswerExchange::resolve(
+                from_callee(None).as_any(),
+                Some(call.as_any()),
+                None,
+                None,
+                &sessions,
+            )
+            .unwrap();
+            assert_eq!(exchange.source_ip, None, "not the caller's");
+        });
+    }
+
+    /// The replying party of a dial is the one its profile's `answer` half
+    /// describes, so that half's `received_from` policy is its own whichever
+    /// command its SDP rides: the `answer`, or the `offer` a delayed offer
+    /// goes to the engine as, which keeps the `offer` half's shape.
+    #[test]
+    fn the_replying_party_is_pinned_by_the_answer_halfs_policy_also_on_a_delayed_offer() {
+        let half = |transport: &str, received_from: bool| NgFlags {
+            transport_protocol: Some(transport.to_string()),
+            carry_received_from: received_from,
+            ..NgFlags::default()
+        };
+        for (offer_pins, answer_pins) in [(true, false), (false, true)] {
+            let entry = crate::rtpengine::profile::ProfileEntry {
+                offer: half("RTP/SAVP", offer_pins),
+                answer: half("RTP/AVP", answer_pins),
+            };
+            let registry = ProfileRegistry::new();
+            let delayed = callee_exchange(true).command_flags(&entry, &registry, None);
+            assert_eq!(delayed.transport_protocol.as_deref(), Some("RTP/SAVP"));
+            assert_eq!(delayed.carry_received_from, answer_pins);
+            let answered = callee_exchange(false).command_flags(&entry, &registry, None);
+            assert_eq!(answered.transport_protocol.as_deref(), Some("RTP/AVP"));
+            assert_eq!(answered.carry_received_from, answer_pins);
+        }
+    }
+
+    /// Whose policy a command's hint follows is the party's whose SDP it
+    /// carries: the caller's is the `offer` half and the callee's the `answer`
+    /// half once the call is anchored, whichever of them offers now.
+    #[test]
+    fn a_party_is_pinned_by_the_half_it_was_set_up_under_whichever_command_carries_its_sdp() {
+        use crate::rtpengine::session::{BridgeSides, SideFlags};
+
+        // The caller is on `tag-a`. Only the `offer` half asks for the pin.
+        let entry = ProfileEntry {
+            offer: NgFlags {
+                carry_received_from: true,
+                ..NgFlags::default()
+            },
+            answer: NgFlags::default(),
+        };
+        let registry = ProfileRegistry::new();
+        let pins = |session: Option<&MediaSession>, tag: &str, first| {
+            party_pins_ingress(session, tag, &entry, &registry, first)
+        };
+
+        // The first exchange of a call the store knows nothing of yet.
+        assert!(pins(None, "tag-a", ProfileHalf::Offer));
+        assert!(!pins(None, "tag-b", ProfileHalf::Answer));
+        // Offered and not answered: the offerer again, or the party replying.
+        let offered = session("call-1", "call-1", None);
+        assert!(pins(Some(&offered), "tag-a", ProfileHalf::Offer));
+        assert!(!pins(Some(&offered), "tag-b", ProfileHalf::Answer));
+        // Answered. The callee re-offers: its own half, not the `offer` half.
+        let answered = session("call-1", "call-1", Some("tag-b"));
+        assert!(!pins(Some(&answered), "tag-b", ProfileHalf::Offer));
+        // And the caller answers that re-offer: its own, not the `answer` half.
+        assert!(pins(Some(&answered), "tag-a", ProfileHalf::Answer));
+
+        // A pair a transfer or a bridge put together reads what was recorded.
+        let side = |profile: &str, half| SideFlags {
+            profile: profile.to_string(),
+            half,
+        };
+        let paired = MediaSession {
+            bridge_sides: Some(BridgeSides {
+                anchor: side("rtp_passthrough", ProfileHalf::Answer),
+                peer: side("rtp_passthrough", ProfileHalf::Offer),
+                anchor_ingress: side("rtp_passthrough", ProfileHalf::Offer),
+                peer_ingress: side("voice_ai", ProfileHalf::Answer),
+            }),
+            ..session("call-1", "call-1", Some("tag-b"))
+        };
+        assert!(!pins(Some(&paired), "tag-a", ProfileHalf::Offer));
+        assert!(pins(Some(&paired), "tag-b", ProfileHalf::Answer));
     }
 }

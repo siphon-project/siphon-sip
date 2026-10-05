@@ -98,6 +98,8 @@ mod bridged_pair_media_events_tests;
 #[cfg(test)]
 mod carrier_attribution_tests;
 #[cfg(test)]
+mod control_bridge_elsewhere_tests;
+#[cfg(test)]
 mod control_bridge_ingress_tests;
 #[cfg(test)]
 mod control_bridge_media_tests;
@@ -132,7 +134,11 @@ mod control_rebridge_tests;
 #[cfg(test)]
 mod control_refer_controller_tests;
 #[cfg(test)]
+mod control_unbridge_reoffer_tests;
+#[cfg(test)]
 mod delayed_offer_ack_tests;
+#[cfg(test)]
+mod delayed_offer_ingress_tests;
 #[cfg(test)]
 mod dial_bridge_test_harness;
 #[cfg(test)]
@@ -183,6 +189,8 @@ mod public_api_surface;
 mod refer_answer_tests;
 #[cfg(test)]
 mod relayed_identity_tests;
+#[cfg(test)]
+mod reoffer_ingress_tests;
 #[cfg(test)]
 mod replacement_fork_tests;
 #[cfg(test)]

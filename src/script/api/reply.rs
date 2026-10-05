@@ -107,6 +107,12 @@ impl PyReply {
         Arc::clone(&self.message)
     }
 
+    /// Where this response arrived from: the signalling source of the party
+    /// that sent it. `None` for a reply built without one.
+    pub fn response_source_ip(&self) -> Option<&str> {
+        self.response_source_ip.as_deref()
+    }
+
     /// Get the A-leg message, if set (B2BUA mode).
     pub fn a_leg_message(&self) -> Option<Arc<Mutex<SipMessage>>> {
         self.a_leg_message.as_ref().map(Arc::clone)

@@ -56,6 +56,7 @@ mod transfer;
 mod transfer_dial;
 mod transfer_fork;
 mod transfer_media;
+mod unanchored_reoffer;
 mod update;
 
 pub use ack::*;
@@ -102,6 +103,7 @@ pub use transfer::*;
 pub use transfer_dial::*;
 pub use transfer_fork::*;
 pub use transfer_media::*;
+pub use unanchored_reoffer::*;
 pub use update::*;
 
 /// Whether B2BUA mode handles this call.

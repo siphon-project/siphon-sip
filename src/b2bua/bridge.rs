@@ -79,6 +79,16 @@
 //! side ([`LegMedia::of_bridged_peer`]): the second bridge shapes and pins
 //! both parties as the first did.
 //!
+//! That session is stored under the first anchor, so it says nothing to a
+//! bridge that joins the same peer to a **different** anchor. What a bridge
+//! shaped and pinned its peer with is therefore also kept for the peer's own
+//! call, for as long as that call lasts
+//! ([`crate::rtpengine::session::OwnMedia`]), and read there
+//! ([`LegMedia::of_retired_peer`]): a party that needs SRTP is offered SRTP
+//! by whichever anchor it is bridged to next, and is pinned by its own policy.
+//! A leg that never had a session of its own has no such record, and the
+//! anchor's profile describes it.
+//!
 //! ## Which profile pins which party's media ingress
 //!
 //! That is a different question, with the opposite answer. The `offer` that
@@ -449,6 +459,27 @@ impl LegMedia {
             has_ws_bridge: false,
             has_playback,
         })
+    }
+
+    /// The media of a leg whose own session an earlier bridge retired, as a
+    /// bridge to an anchor that does **not** relay to it reads it: what that
+    /// earlier bridge shaped and pinned the party with, kept for the leg's own
+    /// call ([`crate::rtpengine::session::OwnMedia`]).
+    ///
+    /// The leg has nothing on the engine the new anchor's session knows of,
+    /// so there is no engine call or tag to name and nothing attached to take
+    /// off: only the profile and the policy are read.
+    pub fn of_retired_peer(own: crate::rtpengine::session::OwnMedia) -> Self {
+        LegMedia {
+            media_call_id: String::new(),
+            from_tag: String::new(),
+            profile: own.profile,
+            ingress: own.ingress,
+            relaying: false,
+            has_tee: false,
+            has_ws_bridge: false,
+            has_playback: false,
+        }
     }
 }
 

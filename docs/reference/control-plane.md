@@ -1259,7 +1259,11 @@ party's own policy is the half of its profile it was anchored under: the
 pair profile decides for both, as it does on a connecting dial: its `offer`
 half for the anchor, whose SDP the offer carries, and its `answer` half for the
 `with` leg. A `with` leg with no media session of its own has no policy of its
-own, and the anchor's profile's `answer` half decides for it. An unknown
+own, and the anchor's profile's `answer` half decides for it. A leg that was the
+`with` side of an earlier bridge is not such a leg: its own session was retired
+when that bridge formed, and what the bridge shaped and pinned it with is kept
+for its call, so bridging it to a different anchor after an `unbridge` still
+offers it its own transport and pins it by its own policy. An unknown
 profile, or one that is not a non-empty string, is `bad_request` with
 `error.details: {verb: "bridge", argument: "profile", reason:
 "unknown_profile" | "invalid_value"}`, and nothing is touched. The reply echoes
@@ -1347,6 +1351,26 @@ against it). Ending both would make `unbridge` indistinguishable from two
 (`state: "unbridging"`); the `ChannelUnbridged` on each leg says that leg is
 parted and held. Wait for it before bridging again, or the new bridge collides
 with the hold's own re-INVITE and is refused `invalid_state` (RFC 3261 §14.1).
+
+The media engine is not told about an `unbridge`. The pair's media session
+stays where the bridge left it, stored under the target and still joining the
+two held parties, so a second `bridge` of the same two legs renegotiates it in
+place; the `with` leg has no session of its own. Neither parted leg therefore
+has anything the engine could answer a request of its own from, and siphon
+answers a parted leg from its dialog alone:
+
+- A re-INVITE or UPDATE that **changes nothing** is a session refresh (RFC
+  4028 §10): one with no SDP, or with the SDP the leg last sent, which RFC
+  3264 §8 marks by an unchanged `o=` line. It is answered `200` with the
+  session in force on that leg, which is the hold siphon put it on (an UPDATE
+  with no SDP gets no body).
+- An offer that **would change the session** (a hold or resume of the leg's
+  own, a new address or codec list) is refused `488 Not Acceptable Here` (RFC
+  3261 §14.2). Under §14.1 the leg keeps the session it had, held. The offer
+  is not kept as the leg's media either.
+
+Neither sends the engine a command or reaches the other leg. A parted leg
+changes its media again when it is bridged: the `bridge` re-offers it.
 
 **When one leg hangs up.** `on_peer_hangup` decides, and it is fixed when the
 bridge is formed:
@@ -1744,6 +1768,21 @@ here, from the engine. A hold arrives as a `sendonly` re-offer and is answered
 current media, because RFC 3261 §13.2.1 makes the `2xx` to an offerless INVITE
 carry the offer. A call with no media backend takes a `200` with no body.
 Nothing is forwarded, because there is nowhere to forward it.
+
+The engine answers only on a session it is the far side of. A leg **parted by
+an `unbridge`** has none (see
+[`unbridge` parts without ending](#joining-two-legs-bridge)), and neither has
+a call siphon answered with a description that is not the engine's. Such a leg
+has a request that changes nothing answered `200` with the session in force on
+its dialog, and an offer that would change the session refused `488`, with
+nothing sent to the engine.
+
+Between the **two legs of one call**, a re-INVITE or an UPDATE with SDP from
+either party is relayed to the other through the call's media session. Each
+party's media ingress is pinned to its own signalling source by its own half of
+the call's profile, the caller's `offer` half and the callee's `answer` half,
+whichever of them re-offers; after a transfer or a `Replaces` takeover, by what
+the re-paired session recorded for each party.
 
 While a pair is **bridged**, a re-INVITE or an UPDATE carrying SDP *from* one of
 the endpoints is relayed across the bridge to the other leg, and the other leg's

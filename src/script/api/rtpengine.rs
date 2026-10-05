@@ -609,10 +609,20 @@ impl PyRtpEngine {
                 self.registry.profile_names().join(", ")
             ))
         })?;
-        let flags = entry.offer.clone();
+        let mut flags = entry.offer.clone();
 
         let message = extract_message(request)?;
         let (call_id, from_tag, sdp) = extract_offer_params(&message)?;
+        // The offer is the sending party's SDP, so that party's own policy
+        // decides whether it is pinned to the request's source: on a re-offer
+        // from the callee, not the `offer` half that shapes this command.
+        flags.carry_received_from = answer::party_pins_ingress(
+            self.sessions.get(&call_id).as_ref(),
+            &from_tag,
+            entry,
+            &self.registry,
+            crate::rtpengine::session::ProfileHalf::Offer,
+        );
 
         // Resolve + template the bridge URI, then finalise the flags. Both run
         // before the async block so a bad template or an unhonourable flag
@@ -828,7 +838,11 @@ impl PyRtpEngine {
         } else {
             &entry.answer
         };
-        let flags = side.clone();
+        let flags = exchange.command_flags(
+            entry,
+            &self.registry,
+            self.sessions.get(&exchange.call_id).as_ref(),
+        );
 
         // The bridge belongs to the offerer's leg, so template against the A-leg
         // identifiers resolved above — not the reply's own tags.
@@ -3349,16 +3363,16 @@ mod tests {
                                 let _ = sender.send(body);
                                 let result = match request.command {
                                     Command::Ping => CmdResult::Pong,
-                                    Command::Offer { .. } | Command::Answer { .. } => {
-                                        CmdResult::Ok {
-                                            sdp: Some(ENGINE_SDP.to_string()),
-                                            duration_ms: None,
-                                            to_tag: None,
-                                            stats: None,
-                                            play_id: None,
-                                            recording_id: None,
-                                        }
-                                    }
+                                    Command::Offer { .. }
+                                    | Command::Reoffer { .. }
+                                    | Command::Answer { .. } => CmdResult::Ok {
+                                        sdp: Some(ENGINE_SDP.to_string()),
+                                        duration_ms: None,
+                                        to_tag: None,
+                                        stats: None,
+                                        play_id: None,
+                                        recording_id: None,
+                                    },
                                     _ => CmdResult::Ok {
                                         sdp: None,
                                         duration_ms: None,
@@ -3783,6 +3797,164 @@ mod tests {
                 sessions.get("call-7").unwrap().to_tag.as_deref(),
                 Some("tag-b")
             );
+        }
+
+        /// Where the caller signals from, and the callee.
+        const CALLER_SOURCE: &str = "192.0.2.10";
+        const CALLEE_SOURCE: &str = "198.51.100.7";
+
+        /// `pins_caller` asks for the source hint on its `offer` half alone,
+        /// `pins_callee` on its `answer` half alone.
+        fn pinning_profiles() -> Arc<ProfileRegistry> {
+            let pair = |offer: bool, answer: bool| crate::config::MediaProfileConfig {
+                offer: crate::config::NgFlagsConfig {
+                    received_from: offer,
+                    ..Default::default()
+                },
+                answer: crate::config::NgFlagsConfig {
+                    received_from: answer,
+                    ..Default::default()
+                },
+            };
+            let mut custom = std::collections::HashMap::new();
+            custom.insert("pins_caller".to_string(), pair(true, false));
+            custom.insert("pins_callee".to_string(), pair(false, true));
+            Arc::new(ProfileRegistry::from_config(&custom))
+        }
+
+        /// The namespace on a stand-in native engine, with `session` stored.
+        async fn pinning_namespace(
+            session: MediaSession,
+        ) -> (PyRtpEngine, mpsc::UnboundedReceiver<serde_json::Value>) {
+            let (address, requests) = spawn_siphon_rtp_engine().await;
+            let (event_sender, _events) = mpsc::channel(16);
+            let set = crate::rtpengine::SiphonRtpClientSet::new(
+                vec![(address, 2_000, 1)],
+                None,
+                5_000,
+                event_sender,
+            )
+            .unwrap();
+            let sessions = Arc::new(MediaSessionStore::new());
+            sessions.insert(session);
+            let engine = PyRtpEngine::new(
+                Arc::new(MediaBackend::SiphonRtp(set)),
+                sessions,
+                pinning_profiles(),
+            );
+            (engine, requests)
+        }
+
+        async fn next_named(
+            requests: &mut mpsc::UnboundedReceiver<serde_json::Value>,
+            name: &str,
+        ) -> serde_json::Value {
+            loop {
+                let body = requests.recv().await.unwrap();
+                if body["command"] == name {
+                    return body;
+                }
+            }
+        }
+
+        /// The hint a command carried, as text.
+        fn hint(command: &serde_json::Value) -> Option<String> {
+            command["profile"]["received_from"]
+                .as_str()
+                .map(str::to_string)
+        }
+
+        /// `rtpengine.answer(reply, call=call)`: the SDP is the callee's, so
+        /// the hint is where the reply came from, when the callee's own half
+        /// asks for it. Never the address of the `call=` object, which is the
+        /// caller's, and not by the caller's half.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_reply_is_pinned_to_its_own_source_by_the_replying_partys_policy() {
+            Python::initialize();
+            for (profile, pinned) in [("pins_callee", true), ("pins_caller", false)] {
+                let (engine, mut requests) = pinning_namespace(MediaSession {
+                    profile: profile.to_string(),
+                    ..offered("call-11", "call-11", None)
+                })
+                .await;
+                with_engine(engine, |python, engine| {
+                    let invite = dialog_message("call-11", None, OFFER_SDP);
+                    let call = PyCall::new(
+                        "id-11".to_string(),
+                        Arc::clone(&invite),
+                        CALLER_SOURCE.to_string(),
+                        "udp".to_string(),
+                    );
+                    let reply = PyReply::new(dialog_message("call-11", Some("tag-b"), FAR_SDP))
+                        .with_a_leg(invite)
+                        .with_response_source(CALLEE_SOURCE.to_string(), 5060);
+                    let reply = Bound::new(python, reply).unwrap();
+                    let kwargs = PyDict::new(python);
+                    kwargs
+                        .set_item("call", Bound::new(python, call).unwrap())
+                        .unwrap();
+                    await_answer(python, engine, reply.as_any(), &kwargs).unwrap();
+                })
+                .await;
+
+                let answer = next_named(&mut requests, "answer").await;
+                assert_eq!(
+                    hint(&answer).as_deref(),
+                    pinned.then_some(CALLEE_SOURCE),
+                    "{profile}: {answer}"
+                );
+            }
+        }
+
+        /// `rtpengine.offer(request)` on a call already anchored is a re-offer.
+        /// From the callee it carries the callee's SDP: pinned to where the
+        /// request came from by the callee's own half, not by the `offer` half
+        /// the command is shaped by.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_reoffer_from_the_callee_is_pinned_by_the_callees_own_policy() {
+            Python::initialize();
+            for (profile, pinned) in [("pins_callee", true), ("pins_caller", false)] {
+                let (engine, mut requests) = pinning_namespace(MediaSession {
+                    profile: profile.to_string(),
+                    ..offered("call-12", "call-12", Some("tag-b"))
+                })
+                .await;
+                with_engine(engine, move |python, engine| {
+                    let reinvite = dialog_message("call-12", None, FAR_SDP);
+                    reinvite
+                        .lock()
+                        .unwrap()
+                        .headers
+                        .set("From", "<sip:bob@example.com>;tag=tag-b".to_string());
+                    let request = PyCall::new(
+                        "id-12".to_string(),
+                        reinvite,
+                        CALLEE_SOURCE.to_string(),
+                        "udp".to_string(),
+                    );
+                    let code = CString::new(format!(
+                        "async def run(engine, request):\n\
+                         \x20\x20\x20\x20return await engine.offer(request, profile='{profile}')\n",
+                    ))
+                    .unwrap();
+                    let globals = PyDict::new(python);
+                    python.run(code.as_c_str(), Some(&globals), None).unwrap();
+                    let run = globals.get_item("run").unwrap().unwrap();
+                    let coroutine = run
+                        .call1((engine, Bound::new(python, request).unwrap()))
+                        .unwrap();
+                    crate::script::engine::run_coroutine_value(python, &coroutine).unwrap();
+                })
+                .await;
+
+                let reoffer = next_named(&mut requests, "reoffer").await;
+                assert_eq!(reoffer["from_tag"], "tag-b", "the callee's own offer");
+                assert_eq!(
+                    hint(&reoffer).as_deref(),
+                    pinned.then_some(CALLEE_SOURCE),
+                    "{profile}: {reoffer}"
+                );
+            }
         }
     }
 }

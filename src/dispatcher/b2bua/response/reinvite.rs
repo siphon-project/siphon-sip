@@ -526,8 +526,14 @@ pub fn rewrite_reinvite_answer_sdp(
                     if let Some((answer_from, answer_to)) = session.answer_tags(is_a2b) {
                         let mut answer_flags = profile.answer.clone();
                         // Pin the answering party's ingress to where its own 2xx arrived from,
-                        // as the offer side now does for the offerer.
-                        answer_flags.stamp_received_from(response_source.ip());
+                        // as the offer side now does for the offerer, and by its own policy:
+                        // a caller answering the callee's re-offer was set up under the
+                        // `offer` half, not the `answer` half that shapes this command.
+                        session.party_ingress(!is_a2b).stamp_ingress(
+                            &mut answer_flags,
+                            profiles,
+                            response_source.ip(),
+                        );
                         if let Some(responder_call_id) = responder_dialog_call_id {
                             answer_flags.stamp_sip_call_id(responder_call_id);
                         }

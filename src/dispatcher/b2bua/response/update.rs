@@ -159,7 +159,13 @@ pub fn forward_update_response(
                         // SDP alone rather than attributing it to the wrong party.
                         if let Some((answer_from, answer_to)) = session.answer_tags(is_a2b) {
                             let mut answer_flags = profile.answer.clone();
-                            answer_flags.stamp_received_from(response_source.ip());
+                            // The answering party's own policy, as on a
+                            // re-INVITE's answer.
+                            session.party_ingress(!is_a2b).stamp_ingress(
+                                &mut answer_flags,
+                                profiles,
+                                response_source.ip(),
+                            );
                             if let Some(responder_call_id) = responder_headers.call_id() {
                                 answer_flags.stamp_sip_call_id(responder_call_id);
                             }
