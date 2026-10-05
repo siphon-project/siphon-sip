@@ -48,6 +48,19 @@ entry, but a working config keeps working.
   gets the most recent provisional again, or a `100 Trying` when none beyond
   that has been sent (RFC 3261 §17.2.1). Nothing is re-sent once the INVITE
   has its final response, or for an INVITE on another Via branch.
+- **A retransmitted INVITE no longer starts a second B2BUA call after the
+  first one failed.** siphon removes a rejected, failed or CANCELled call as
+  soon as it has answered the caller. A caller that did not get that answer
+  retransmits its INVITE, which then found no call and was taken for a new
+  one: `@b2bua.on_invite` ran again, the callee was dialled a second time, and
+  the caller got a different final response. The final non-2xx is now kept for
+  the life of the INVITE transaction (RFC 3261 §17.2.1) and sent again to a
+  retransmission on the same Via branch: 32 s (Timer H) until the caller ACKs
+  it, then 5 s more over UDP (Timer I) and not at all over a reliable
+  transport. An INVITE on a new branch (a retry after a challenge) is a new
+  call as before. At most 10,000 responses are kept; past that the oldest go
+  first. A client that reuses a Call-ID and Via branch for a new call inside
+  that window is answered as the retransmission it looks like.
 - **An `{aor}` dial target's identity is no longer dropped.** `from`,
   `from_display`, `p_asserted_identity` and `privacy` on an `{aor}` target
   were ignored, though the reference documented them on both target forms

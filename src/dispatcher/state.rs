@@ -270,6 +270,10 @@ pub struct DispatcherState {
     /// The B2BUA path needs no entry: it already answers 200 to a CANCEL for a
     /// call that is no longer Calling/Ringing.
     pub cancelled_invites: Arc<DashMap<TransactionKey, ()>>,
+    /// Final non-2xx responses the B2BUA sent for an INVITE, kept for Timer H
+    /// so a retransmitted INVITE is answered with it again and not taken for a
+    /// new call (RFC 3261 §17.2.1). See [`CompletedInvites`].
+    pub completed_invites: crate::dispatcher::completed_invite::CompletedInvites,
     /// Originate groups still ringing: several contacts rung as calls siphon
     /// placed itself, the first to answer kept. Each group and each of its
     /// legs' index entries goes when the group ends, however it ends.
