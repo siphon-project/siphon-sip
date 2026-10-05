@@ -6364,6 +6364,7 @@ services:
       - voice-ai-real
       - bridge
       - dial-bridge
+      - control-transfer
 
   # Readiness gate for the distroless engine: exits 0 once /readyz answers.
   siphon-rtp-engine-ready:
@@ -6395,6 +6396,7 @@ services:
       - voice-ai-real
       - bridge
       - dial-bridge
+      - control-transfer
 
   # ── Native JSON control plane (media.backend: siphon-rtp) ─────────────────
   siphon-rtp-native:
@@ -7957,6 +7959,491 @@ services:
       - -trace_err
     profiles:
       - dial-bridge
+
+  # ── Control plane: giving up a dial, REFER from the callee, replacing a party
+  # One siphon and one persistent control application, driven one case per call
+  # (control/transfer_app.py; control/transfer_routes.py names the cases). Each
+  # case is a caller run with `-s <case>` plus the detached parties that case
+  # needs, started and graded by control/run_transfer_case.sh:
+  #
+  #   cancel-dial         — `cancel_dial` on a bridging dial that rings two
+  #                         phones, twice over for one caller.
+  #   refer-callee        — the connected phone REFERs: `reject_refer`, then
+  #                         `accept_refer` carried out by siphon.
+  #   refer-controller    — `accept_refer {mode: "controller"}` and
+  #                         `complete_refer`, and the deadline for one never
+  #                         reported; the Refer-To target must stay silent.
+  #   replace-aor         — `replace_peer {target: {aor}}` on an AoR with two
+  #                         registered contacts, one of which answers.
+  #   replace-aor-refused — the same with both contacts refusing.
+  #   media               — `hold` on a call the engine only relays, and
+  #                         `play {repeat}`.
+  #
+  # The SIPp scenarios assert the wire; the application's verdict covers the
+  # replies and events; the runner compares the Call-IDs each party saw with
+  # each other and with what the application was told.
+  #
+  # Against the real engine (172.20.0.130): the `media` case's refusal is the
+  # engine's own answer about a relayed call.
+  #
+  # IP map: .240 siphon  .241 app  .242 caller  .243 phone  .244 second phone
+  #         .245 Refer-To target  .246 / .247 the two contacts of the AoR
+  siphon-control-transfer:
+    image: sipp-siphon   # reuse the siphon image (built by the `siphon` service)
+    build:
+      context: ..
+    container_name: sipp-siphon-control-transfer
+    depends_on:
+      siphon-rtp-engine-ready:
+        condition: service_completed_successfully
+    volumes:
+      - ./control/siphon-transfer.yaml:/etc/siphon/siphon.yaml:ro
+      - ./control:/etc/siphon/scripts:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.240
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import socket; t=socket.create_connection(('127.0.0.1',9092),2); t.close(); s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(2); s.sendto(b'OPTIONS sip:transfer.test SIP/2.0\\r\\nVia: SIP/2.0/UDP 127.0.0.1:15060;branch=z9hG4bK-hc\\r\\nFrom: <sip:hc@transfer.test>;tag=hc\\r\\nTo: <sip:transfer.test>\\r\\nCall-ID: hc@check\\r\\nCSeq: 1 OPTIONS\\r\\nMax-Forwards: 1\\r\\nContent-Length: 0\\r\\n\\r\\n', ('127.0.0.1',5060)); s.recv(1024); s.close()\""]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+      start_period: 5s
+    profiles:
+      - control-transfer
+
+  control-transfer-app:
+    image: python:3.12-slim
+    container_name: sipp-control-transfer-app
+    depends_on:
+      siphon-control-transfer:
+        condition: service_healthy
+    working_dir: /app
+    volumes:
+      - ./control:/app:ro
+    environment:
+      CONTROL_MODE: "inbound"
+      CONTROL_APP: "transfer-app"
+      CONTROL_TOKEN: "transfer-app-token"
+      CONTROL_URL: "ws://172.20.0.240:9092/control/ws"
+      CONTROL_READY_FILE: "/tmp/control-app-ready"
+      TRANSFER_PHONE: "sip:phone@172.20.0.243:5060"
+      TRANSFER_SECOND_PHONE: "sip:phone@172.20.0.244:5060"
+      TRANSFER_REFER_TARGET_HOST: "172.20.0.245"
+      TRANSFER_AOR: "sip:3001@transfer.test"
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.241
+    command:
+      - sh
+      - -c
+      - "pip install --quiet --no-cache-dir websockets && exec python3 transfer_app.py"
+    # Freshness, not existence: the application heartbeats this file only while
+    # its socket to siphon is up (see control-app-ivr).
+    healthcheck:
+      test: ["CMD-SHELL", "test -n \"$$(find /tmp/control-app-ready -newermt '-10 seconds' 2>/dev/null)\""]
+      interval: 2s
+      timeout: 3s
+      retries: 6
+      start_period: 25s
+    profiles:
+      - control-transfer
+
+  # The caller. run_transfer_case.sh replaces `command` with the case's
+  # scenario and name.
+  sipp-control-transfer-uac:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-control-transfer:
+        condition: service_healthy
+      control-transfer-app:
+        condition: service_healthy
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.242
+    entrypoint:
+      - sipp
+      - "172.20.0.240:5060"
+      - -mi
+      - "172.20.0.242"
+      - -m
+      - "1"
+      - -l
+      - "1"
+      - -timeout
+      - "60"
+      - -timeout_error
+      - -trace_err
+    command:
+      - -sf
+      - /sipp/scenarios/control_transfer_uac.xml
+      - -s
+      - refer-controller
+    profiles:
+      - control-transfer
+
+  # Every party below runs with -timeout_error: without it a scenario still
+  # waiting for its CANCEL, ACK, NOTIFY or BYE exits 0 on the global timeout,
+  # and the one assertion that case exists for passes vacuously.
+
+  # cancel-dial: the phone that alerts. Rung by both of the case's dials.
+  sipp-control-transfer-ringing-phone:
+    image: ctaloi/sipp:latest
+    container_name: sipp-control-transfer-ringing-phone
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.243
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/control_transfer_cancelled_phone.xml
+      - -p
+      - "5060"
+      - -mi
+      - "172.20.0.243"
+      - -m
+      - "2"
+      - -timeout
+      - "40"
+      - -timeout_error
+      - -trace_err
+    profiles:
+      - control-transfer
+
+  # cancel-dial: the phone that only answers 100 Trying. Rung by both dials.
+  sipp-control-transfer-trying-phone:
+    image: ctaloi/sipp:latest
+    container_name: sipp-control-transfer-trying-phone
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.244
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/control_transfer_trying_phone.xml
+      - -p
+      - "5060"
+      - -mi
+      - "172.20.0.244"
+      - -m
+      - "2"
+      - -timeout
+      - "40"
+      - -timeout_error
+      - -trace_err
+    profiles:
+      - control-transfer
+
+  # refer-callee: the connected phone, which REFERs twice.
+  sipp-control-transfer-referrer-phone:
+    image: ctaloi/sipp:latest
+    container_name: sipp-control-transfer-referrer-phone
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.243
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/control_transfer_referrer_phone.xml
+      - -p
+      - "5060"
+      - -mi
+      - "172.20.0.243"
+      - -m
+      - "1"
+      - -timeout
+      - "60"
+      - -timeout_error
+      - -trace_err
+    profiles:
+      - control-transfer
+
+  # refer-callee: the Refer-To target siphon dials and brings into the call.
+  sipp-control-transfer-target:
+    image: ctaloi/sipp:latest
+    container_name: sipp-control-transfer-target
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.245
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/control_transfer_target.xml
+      - -p
+      - "5060"
+      - -mi
+      - "172.20.0.245"
+      - -m
+      - "1"
+      - -timeout
+      - "60"
+      - -timeout_error
+      - -trace_err
+    profiles:
+      - control-transfer
+
+  # refer-controller: the connected phone, which REFERs three times.
+  sipp-control-transfer-controller-referrer-phone:
+    image: ctaloi/sipp:latest
+    container_name: sipp-control-transfer-controller-referrer-phone
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.243
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/control_transfer_controller_referrer_phone.xml
+      - -p
+      - "5060"
+      - -mi
+      - "172.20.0.243"
+      - -m
+      - "1"
+      - -timeout
+      - "60"
+      - -timeout_error
+      - -trace_err
+    profiles:
+      - control-transfer
+
+  # refer-controller: the Refer-To target, which must never be dialled. Graded
+  # by SIPp's exit code (control_transfer_silent_target.xml): 97, its -timeout
+  # window ending with no call, is the only pass. No -timeout_error, which
+  # turns that same outcome into 255. The 25 s window outlasts the case, whose
+  # three transfers are over within 15 s of the caller's INVITE.
+  sipp-control-transfer-silent-target:
+    image: ctaloi/sipp:latest
+    container_name: sipp-control-transfer-silent-target
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.245
+    entrypoint:
+      - sh
+      - -c
+      - |
+        sipp -sf /sipp/scenarios/control_transfer_silent_target.xml -p 5060 -m 1 -timeout 25 -trace_err
+        code=$$?
+        if [ "$$code" = "97" ]; then
+          echo "Refer-To target: no INVITE within the 25 s window"
+          exit 0
+        fi
+        echo "Refer-To target: SIPp exited $$code, and only 97 (no INVITE in the window) passes"
+        exit 1
+    profiles:
+      - control-transfer
+
+  # replace-aor, replace-aor-refused, media: the phone the caller is connected
+  # to, which does nothing itself.
+  sipp-control-transfer-callee-phone:
+    image: ctaloi/sipp:latest
+    container_name: sipp-control-transfer-callee-phone
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.243
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/control_transfer_callee_phone.xml
+      - -p
+      - "5060"
+      - -mi
+      - "172.20.0.243"
+      - -m
+      - "1"
+      - -timeout
+      - "60"
+      - -timeout_error
+      - -trace_err
+    profiles:
+      - control-transfer
+
+  # The two contacts of the AoR register before any party listens on their
+  # addresses. Each one-shot shares its address with the contacts below, which
+  # wait for it to complete, so the two never run at once.
+  sipp-control-transfer-register-a:
+    image: ctaloi/sipp:latest
+    container_name: sipp-control-transfer-register-a
+    depends_on:
+      siphon-control-transfer:
+        condition: service_healthy
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.246
+    entrypoint:
+      - sipp
+      - "172.20.0.240:5060"
+      - -sf
+      - /sipp/scenarios/control_transfer_register.xml
+      - -p
+      - "5060"
+      - -m
+      - "1"
+      - -timeout
+      - "20"
+      - -timeout_error
+      - -trace_err
+    profiles:
+      - control-transfer
+
+  sipp-control-transfer-register-b:
+    image: ctaloi/sipp:latest
+    container_name: sipp-control-transfer-register-b
+    depends_on:
+      siphon-control-transfer:
+        condition: service_healthy
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.247
+    entrypoint:
+      - sipp
+      - "172.20.0.240:5060"
+      - -sf
+      - /sipp/scenarios/control_transfer_register.xml
+      - -p
+      - "5060"
+      - -m
+      - "1"
+      - -timeout
+      - "20"
+      - -timeout_error
+      - -trace_err
+    profiles:
+      - control-transfer
+
+  # replace-aor: the contact that answers, and so replaces the callee.
+  sipp-control-transfer-answering-contact:
+    image: ctaloi/sipp:latest
+    container_name: sipp-control-transfer-answering-contact
+    depends_on:
+      sipp-control-transfer-register-a:
+        condition: service_completed_successfully
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.246
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/control_transfer_target.xml
+      - -p
+      - "5060"
+      - -mi
+      - "172.20.0.246"
+      - -m
+      - "1"
+      - -timeout
+      - "60"
+      - -timeout_error
+      - -trace_err
+    profiles:
+      - control-transfer
+
+  # replace-aor: the contact still ringing when the other answers. It is
+  # CANCELled, and its 487 has to be ACKed.
+  sipp-control-transfer-cancelled-contact:
+    image: ctaloi/sipp:latest
+    container_name: sipp-control-transfer-cancelled-contact
+    depends_on:
+      sipp-control-transfer-register-b:
+        condition: service_completed_successfully
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.247
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/control_transfer_cancelled_phone.xml
+      - -p
+      - "5060"
+      - -mi
+      - "172.20.0.247"
+      - -m
+      - "1"
+      - -timeout
+      - "60"
+      - -timeout_error
+      - -trace_err
+    profiles:
+      - control-transfer
+
+  # replace-aor-refused: a contact that is busy at once (486), and one that
+  # rings for a second and then gives up (480). The scenarios are the fork
+  # job's; each requires the ACK its refusal is owed.
+  sipp-control-transfer-busy-contact:
+    image: ctaloi/sipp:latest
+    container_name: sipp-control-transfer-busy-contact
+    depends_on:
+      sipp-control-transfer-register-a:
+        condition: service_completed_successfully
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.246
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/b2bua_fork_busy_uas.xml
+      - -p
+      - "5060"
+      - -m
+      - "1"
+      - -timeout
+      - "60"
+      - -timeout_error
+      - -trace_err
+    profiles:
+      - control-transfer
+
+  sipp-control-transfer-unavailable-contact:
+    image: ctaloi/sipp:latest
+    container_name: sipp-control-transfer-unavailable-contact
+    depends_on:
+      sipp-control-transfer-register-b:
+        condition: service_completed_successfully
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.247
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/b2bua_fork_unavailable_uas.xml
+      - -d
+      - "1000"
+      - -p
+      - "5060"
+      - -m
+      - "1"
+      - -timeout
+      - "60"
+      - -timeout_error
+      - -trace_err
+    profiles:
+      - control-transfer
 
   # ── B2BUA parallel fork (RFC 3261 §16.7, §9.1, §13.2.2.4) ────────────────────
   # One siphon, eight callees each scripted for a single branch outcome, and one
