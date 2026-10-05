@@ -68,6 +68,15 @@ entry, but a working config keeps working.
   presented the dial's identity (or the caller's) instead. They now reach each
   contact, as `headers` already did, and an unrecognised `privacy` there is
   `bad_request` instead of being ignored with the rest.
+- **A dual-stack UDP host can reach peers in both address families.** With an
+  IPv4 and an IPv6 `listen.udp` entry, every send that named no source socket
+  (a relayed request, a CANCEL, a 2xx ACK, a retransmission, a B-leg INVITE)
+  left from the first configured listener. A peer in the other family was
+  never reached: the datagram failed with `EAFNOSUPPORT` and the request ran
+  into its transaction timeout. Such a send now leaves from the listener bound
+  in the destination's family, and the Via, Record-Route and B-leg Contact
+  name that listener. A script `send_socket=` pin, a captured flow and an
+  IPsec source still take precedence. Single-family hosts are unaffected.
 - **A request for a dialog siphon does not have is answered `481`, not
   `405`.** An in-dialog request (it carries a To-tag) that no dialog and no
   `@proxy.on_request` handler claims now gets `481 Call/Transaction Does Not

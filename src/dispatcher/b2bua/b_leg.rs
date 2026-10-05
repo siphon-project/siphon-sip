@@ -217,6 +217,15 @@ pub fn b2bua_send_b_leg_invite(
         }
         None => None,
     };
+    // Unpinned B-leg to the other address family: it leaves from the listener
+    // bound in that family, so the Via and Contact name that one (see
+    // `family_egress_socket`).
+    let family_egress = if send_socket.is_none() && flow.is_none() {
+        state.family_egress_socket(outbound_transport, destination)
+    } else {
+        None
+    };
+    let send_socket = send_socket.or(family_egress.as_ref());
 
     // The local socket this B-leg is anchored on — `Some` when the script
     // dialled over a captured flow, which is what pins the egress.  The leg
