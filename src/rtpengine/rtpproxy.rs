@@ -60,8 +60,10 @@ pub struct RtpProxyClient {
     /// Number of retransmits after the first send (same cookie each time).
     retries: u32,
     /// Active call-ids (offer→insert, delete→remove) — mirrors `RtpEngineSet`'s
-    /// affinity count for the `rtpengine.active_sessions` Python getter.
-    sessions: DashMap<String, ()>,
+    /// affinity count for the `rtpengine.active_sessions` Python getter.  The
+    /// value is the tag of the offer that created the session, which is the
+    /// only tag rtpproxy will delete it by (see [`RtpProxyClient::delete`]).
+    sessions: DashMap<String, String>,
 }
 
 impl RtpProxyClient {
@@ -104,10 +106,23 @@ impl RtpProxyClient {
         sdp: &[u8],
         flags: &NgFlags,
     ) -> Result<Vec<u8>, RtpEngineError> {
+        // A re-offer from the callee carries the callee's tag in From. Named on
+        // its own it matches no session and rtpproxy opens a second one on
+        // fresh ports; with the session's tag as the to-tag it is the callee
+        // side of the session that already exists.
+        let session_tag = self
+            .sessions
+            .get(call_id)
+            .map(|session| session.value().clone());
+        let to_tag = session_tag.as_deref().filter(|tag| *tag != from_tag);
         let rewritten = self
-            .negotiate('U', call_id, from_tag, None, sdp, flags)
+            .negotiate('U', call_id, from_tag, to_tag, sdp, flags)
             .await?;
-        self.sessions.insert(call_id.to_string(), ());
+        // First offer wins: a re-offer from the callee carries the callee's tag
+        // and must not displace the one the session was created with.
+        self.sessions
+            .entry(call_id.to_string())
+            .or_insert_with(|| from_tag.to_string());
         Ok(rewritten)
     }
 
@@ -125,11 +140,15 @@ impl RtpProxyClient {
     }
 
     /// Send `D` (delete) to tear down a session and drop its active-session entry.
+    ///
+    /// rtpproxy matches a delete against the tag the session was created with.
+    /// `from_tag` is whatever the tearing-down message carried in From, which is
+    /// the callee's tag when the callee hangs up, so the recorded offer tag is
+    /// sent instead whenever this client saw the offer.
     pub async fn delete(&self, call_id: &str, from_tag: &str) -> Result<(), RtpEngineError> {
-        let command = format!("D {call_id} {from_tag}");
-        let response = self.request(&command).await;
-        self.sessions.remove(call_id);
-        let response = response?;
+        let offer_tag = self.sessions.remove(call_id).map(|(_, tag)| tag);
+        let command = format!("D {call_id} {}", offer_tag.as_deref().unwrap_or(from_tag));
+        let response = self.request(&command).await?;
         let trimmed = response.trim();
         if let Some(code) = trimmed.strip_prefix('E') {
             return Err(RtpEngineError::EngineError(format!(
@@ -208,6 +227,10 @@ impl RtpProxyClient {
         // Clone the session-level c= up front so no borrow of `parsed` is held
         // across the awaits below (we mutate `parsed.media_sections` in the loop).
         let session_connection = parsed.connection().map(str::to_string);
+        let session_held = match session_connection.as_deref() {
+            Some(connection) => is_null_address(&parse_connection(connection)?.1),
+            None => false,
+        };
         let multi_stream = parsed.media_sections.len() > 1;
         let mut relay_address_for_session: Option<String> = None;
 
@@ -251,12 +274,21 @@ impl RtpProxyClient {
             );
 
             let response = self.request(&command).await?;
-            let (relay_address, relay_port) = parse_session_response(&response, self.address.ip())?;
+            let (relay_address, relay_port) = parse_session_response(
+                &response,
+                default_relay_address(self.address.ip(), is_ipv6),
+            )?;
 
             parsed.media_sections[index].port = relay_port;
             // rtpproxy anchors the stream on one relay port, so a `/count` the
             // offer carried would advertise relay ports it never allocated.
             parsed.media_sections[index].port_count = None;
+            if is_null_address(&advertised_address) {
+                // RFC 2543 hold (still to be honoured, RFC 3264 §8.4): the null
+                // address *is* the signal, so the port is anchored and the
+                // `c=` this stream was held with stays as offered.
+                continue;
+            }
             if media_connection.is_some() {
                 set_media_connection(&mut parsed.media_sections[index], &relay_address);
             }
@@ -265,7 +297,9 @@ impl RtpProxyClient {
             }
         }
 
-        if let Some(relay_address) = relay_address_for_session {
+        // A null session-level `c=` holds every stream that inherits it; the
+        // active streams beside it carry their own and were rewritten above.
+        if let Some(relay_address) = relay_address_for_session.filter(|_| !session_held) {
             set_session_connection(&mut parsed, &relay_address);
         }
 
@@ -673,6 +707,36 @@ fn build_command(
     command
 }
 
+/// Where the relay is taken to live when rtpproxy answers with a port and no
+/// address, which is what it does when it listens on a wildcard.
+///
+/// The control endpoint's IP is the only address siphon has for the engine, and
+/// it is right whenever it is in the stream's family.  A loopback control
+/// address means the engine runs on this host, so its wildcard relay sockets
+/// answer on the loopback of the other family too and that one is used.  For a
+/// remote engine of the other family there is nothing better to advertise than
+/// the control IP: the `c=` then names the wrong family, and the warning says
+/// how to make rtpproxy return an address of its own.
+fn default_relay_address(control: IpAddr, stream_is_ipv6: bool) -> IpAddr {
+    if control.is_ipv6() == stream_is_ipv6 {
+        return control;
+    }
+    if control.is_loopback() {
+        return if stream_is_ipv6 {
+            IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+        } else {
+            IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+        };
+    }
+    warn!(
+        %control,
+        stream_family = if stream_is_ipv6 { "IP6" } else { "IP4" },
+        "rtpproxy returned no relay address and its control address is in the other family — \
+         advertising the control address; start rtpproxy with a concrete -l / -6 listen address"
+    );
+    control
+}
+
 /// Parse a `U`/`L` response: `<port> [<address> …]` or `E<code>` on error.
 ///
 /// rtpproxy returns the allocated relay port and, on newer builds, one or more
@@ -721,6 +785,13 @@ fn parse_connection(connection: &str) -> Result<(bool, String), RtpEngineError> 
     // Strip any multicast TTL/count suffix.
     let address = address.split('/').next().unwrap_or(address).to_string();
     Ok((address_type.eq_ignore_ascii_case("IP6"), address))
+}
+
+/// Whether a `c=` address is the unspecified one (`0.0.0.0` / `::`).
+fn is_null_address(address: &str) -> bool {
+    address
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_unspecified())
 }
 
 /// Format a `c=` line for a relay address, picking the family from the address.
@@ -1230,6 +1301,188 @@ mod tests {
         assert_eq!(client.active_sessions(), 1);
         client.delete("call-1", "ft").await.unwrap();
         assert_eq!(client.active_sessions(), 0);
+    }
+
+    /// A wildcard-listening rtpproxy answers with a port only. The control IP
+    /// stands in for the relay, but only in its own family: an IPv6 stream
+    /// anchored through an engine on `127.0.0.1` was handed `c=IN IP4 127.0.0.1`.
+    #[test]
+    fn default_relay_address_follows_the_stream_family_on_a_local_engine() {
+        let control_v4: IpAddr = "127.0.0.1".parse().unwrap();
+        let control_v6: IpAddr = "::1".parse().unwrap();
+        assert_eq!(default_relay_address(control_v4, false), control_v4);
+        assert_eq!(default_relay_address(control_v4, true), control_v6);
+        assert_eq!(default_relay_address(control_v6, true), control_v6);
+        assert_eq!(default_relay_address(control_v6, false), control_v4);
+    }
+
+    /// A remote engine reached over the other family has no better address to
+    /// offer than its control IP, so that is kept (and warned about).
+    #[test]
+    fn default_relay_address_keeps_a_remote_engines_control_address() {
+        let control: IpAddr = "192.0.2.44".parse().unwrap();
+        assert_eq!(default_relay_address(control, false), control);
+        assert_eq!(default_relay_address(control, true), control);
+    }
+
+    /// A mock that answers every command and hands each command line back.
+    async fn spawn_capturing_rtpproxy() -> (SocketAddr, tokio::sync::mpsc::UnboundedReceiver<String>)
+    {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = socket.local_addr().unwrap();
+        let (capture_tx, capture_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        tokio::spawn(async move {
+            let mut buffer = BytesMut::zeroed(4096);
+            while let Ok((size, source)) = socket.recv_from(&mut buffer).await {
+                let data = &buffer[..size];
+                let space = data.iter().position(|&b| b == b' ').unwrap();
+                let cookie = std::str::from_utf8(&data[..space]).unwrap();
+                let command = std::str::from_utf8(&data[space + 1..]).unwrap().to_string();
+                let reply = if command.starts_with('D') {
+                    format!("{cookie} 0")
+                } else {
+                    format!("{cookie} 30000 203.0.113.1")
+                };
+                let _ = socket.send_to(reply.as_bytes(), source).await;
+                let _ = capture_tx.send(command);
+            }
+        });
+        (address, capture_rx)
+    }
+
+    /// rtpproxy finds the session to delete by the tag it was *created* with.
+    /// A BYE from the callee carries the callee's tag in From, and a `D` naming
+    /// only that one matches nothing: the engine answers E50 and the session
+    /// (and its two relay ports) stays up until the no-media timeout.
+    #[tokio::test]
+    async fn delete_names_the_offer_tag_when_the_callee_hangs_up() {
+        let (address, mut commands) = spawn_capturing_rtpproxy().await;
+        let client = RtpProxyClient::new(address, 1000, 1).await.unwrap();
+        let flags = NgFlags::default();
+        client
+            .offer("call-1", "caller-tag", sample_offer_sdp(), &flags)
+            .await
+            .unwrap();
+        assert_eq!(
+            commands.recv().await.unwrap(),
+            "U call-1 10.0.0.1 8000 caller-tag"
+        );
+
+        client.delete("call-1", "callee-tag").await.unwrap();
+        assert_eq!(commands.recv().await.unwrap(), "D call-1 caller-tag");
+        assert_eq!(client.active_sessions(), 0);
+    }
+
+    /// A re-INVITE from the callee re-offers with the callee's tag in From. The
+    /// session is still the one the first offer created: the update names that
+    /// tag as its to-tag so rtpproxy updates the existing session instead of
+    /// opening a second one, and a later delete keeps naming it too.
+    #[tokio::test]
+    async fn a_reoffer_from_the_callee_updates_the_existing_session() {
+        let (address, mut commands) = spawn_capturing_rtpproxy().await;
+        let client = RtpProxyClient::new(address, 1000, 1).await.unwrap();
+        let flags = NgFlags::default();
+        client
+            .offer("call-1", "caller-tag", sample_offer_sdp(), &flags)
+            .await
+            .unwrap();
+        client
+            .offer("call-1", "callee-tag", sample_offer_sdp(), &flags)
+            .await
+            .unwrap();
+        // The caller's own re-offer stays a plain update of its side.
+        client
+            .offer("call-1", "caller-tag", sample_offer_sdp(), &flags)
+            .await
+            .unwrap();
+        assert_eq!(
+            commands.recv().await.unwrap(),
+            "U call-1 10.0.0.1 8000 caller-tag"
+        );
+        assert_eq!(
+            commands.recv().await.unwrap(),
+            "U call-1 10.0.0.1 8000 callee-tag caller-tag"
+        );
+        assert_eq!(
+            commands.recv().await.unwrap(),
+            "U call-1 10.0.0.1 8000 caller-tag"
+        );
+        assert_eq!(client.active_sessions(), 1);
+
+        client.delete("call-1", "callee-tag").await.unwrap();
+        assert_eq!(commands.recv().await.unwrap(), "D call-1 caller-tag");
+    }
+
+    /// No offer was seen for the call (a restart, or the offer went through a
+    /// different node): the tag the caller passed is all there is.
+    #[tokio::test]
+    async fn delete_without_a_recorded_offer_uses_the_given_tag() {
+        let (address, mut commands) = spawn_capturing_rtpproxy().await;
+        let client = RtpProxyClient::new(address, 1000, 1).await.unwrap();
+
+        client.delete("call-9", "some-tag").await.unwrap();
+        assert_eq!(commands.recv().await.unwrap(), "D call-9 some-tag");
+    }
+
+    /// The null connection address is how an RFC 2543 endpoint puts a call on
+    /// hold, and RFC 3264 §8.4 still expects it to be understood. Writing the
+    /// relay address over it turns the hold into an ordinary re-offer, so the
+    /// far end keeps sending. The port is still anchored.
+    #[tokio::test]
+    async fn null_address_hold_survives_the_relay_rewrite() {
+        let (address, mut commands) = spawn_capturing_rtpproxy().await;
+        let client = RtpProxyClient::new(address, 1000, 1).await.unwrap();
+        let flags = NgFlags::default();
+        let hold_sdp = concat!(
+            "v=0\r\n",
+            "o=- 1 2 IN IP4 10.0.0.1\r\n",
+            "s=-\r\n",
+            "c=IN IP4 0.0.0.0\r\n",
+            "t=0 0\r\n",
+            "m=audio 8000 RTP/AVP 0\r\n",
+        )
+        .as_bytes();
+
+        let rewritten = client
+            .offer("call-1", "ftag", hold_sdp, &flags)
+            .await
+            .unwrap();
+        let text = String::from_utf8(rewritten).unwrap();
+        assert!(text.contains("c=IN IP4 0.0.0.0\r\n"), "sdp: {text}");
+        assert!(!text.contains("203.0.113.1"), "sdp: {text}");
+        assert!(text.contains("m=audio 30000 RTP/AVP 0\r\n"), "sdp: {text}");
+        assert_eq!(commands.recv().await.unwrap(), "U call-1 0.0.0.0 8000 ftag");
+    }
+
+    /// Same rule per stream, and for the IPv6 null address: a held stream keeps
+    /// its own `c=` while the active one beside it is pointed at the relay.
+    #[tokio::test]
+    async fn a_held_stream_keeps_its_null_address_beside_an_active_one() {
+        let (address, _commands) = spawn_capturing_rtpproxy().await;
+        let client = RtpProxyClient::new(address, 1000, 1).await.unwrap();
+        let flags = NgFlags::default();
+        let sdp = concat!(
+            "v=0\r\n",
+            "o=- 1 2 IN IP6 2001:db8::1\r\n",
+            "s=-\r\n",
+            "t=0 0\r\n",
+            "m=audio 8000 RTP/AVP 0\r\n",
+            "c=IN IP6 ::\r\n",
+            "m=video 8002 RTP/AVP 31\r\n",
+            "c=IN IP6 2001:db8::1\r\n",
+        )
+        .as_bytes();
+
+        let rewritten = client.offer("call-1", "ftag", sdp, &flags).await.unwrap();
+        let text = String::from_utf8(rewritten).unwrap();
+        assert!(
+            text.contains("m=audio 30000 RTP/AVP 0\r\nc=IN IP6 ::\r\n"),
+            "sdp: {text}"
+        );
+        assert!(
+            text.contains("m=video 30000 RTP/AVP 31\r\nc=IN IP4 203.0.113.1\r\n"),
+            "sdp: {text}"
+        );
     }
 
     #[tokio::test]

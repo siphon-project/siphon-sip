@@ -25,9 +25,16 @@ trap 'rm -rf "$traces"' EXIT
 
 "${compose[@]}" up -d --force-recreate "$@"
 
+# Every case runs SIPp as PID 1 of a fresh container, so its default Call-ID
+# (call number, PID, address) and Via branch come out the same for every case.
+# A Call-ID has to be unique (RFC 3261 §8.1.1.4): repeated within the life of
+# the previous case's INVITE transaction, the INVITE is a retransmission and
+# is answered with that case's final response.
+call_id="%u-%p-$(date +%s%N)@%s"
+
 status=0
 docker rm -f "$caller" > /dev/null 2>&1 || true
-if ! "${compose[@]}" run --name "$caller" "$caller" -sf "/sipp/scenarios/$scenario"; then
+if ! "${compose[@]}" run --name "$caller" "$caller" -sf "/sipp/scenarios/$scenario" -cid_str "$call_id"; then
   echo "$scenario: the caller scenario failed"
   status=1
 fi

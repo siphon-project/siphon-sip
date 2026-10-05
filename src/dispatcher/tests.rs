@@ -1381,6 +1381,106 @@ fn wildcard_pinned_sent_by_uses_the_sockets_advertised_port() {
     );
 }
 
+/// A dual-stack UDP host (`127.0.0.1:5060` + `[::1]:5060`) relaying to a peer
+/// in the family the default listener is *not* in has to leave from the
+/// listener that is.  Unpinned sends take the first configured listener, so an
+/// IPv6 next hop was written to the IPv4 socket: `send_to` failed with
+/// EAFNOSUPPORT, nothing reached the peer and the INVITE ran into Timer B.
+#[test]
+fn family_egress_socket_picks_the_listener_in_the_destination_family() {
+    let mut dispatcher = super::test_dispatcher::test_dispatcher();
+    let ipv4: SocketAddr = "192.0.2.10:5060".parse().unwrap();
+    let ipv6: SocketAddr = "[2001:db8::10]:5060".parse().unwrap();
+    dispatcher.state.listen_addrs = std::collections::HashMap::from([(Transport::Udp, ipv4)]);
+    dispatcher.state.listener_registry = crate::transport::ListenerRegistry::from_entries(vec![
+        (Transport::Udp, ipv4, None),
+        (Transport::Udp, ipv6, None),
+    ]);
+
+    let selected = dispatcher
+        .state
+        .family_egress_socket(Transport::Udp, "[2001:db8::20]:5062".parse().unwrap())
+        .expect("an IPv6 destination needs the IPv6 listener");
+    assert_eq!(selected.addr, ipv6);
+    assert_eq!(selected.via_sent_by(), ("2001:db8::10".to_string(), 5060));
+}
+
+/// The sent-by of an unpinned request follows the same pick, so a 2xx ACK
+/// relayed to an IPv6 UAS names the IPv6 listener it leaves from, bracketed.
+#[test]
+fn unpinned_sent_by_names_the_listener_in_the_destination_family() {
+    let mut dispatcher = super::test_dispatcher::test_dispatcher();
+    let ipv4: SocketAddr = "192.0.2.10:5060".parse().unwrap();
+    let ipv6: SocketAddr = "[2001:db8::10]:5070".parse().unwrap();
+    dispatcher.state.listen_addrs = std::collections::HashMap::from([(Transport::Udp, ipv4)]);
+    dispatcher.state.listener_registry = crate::transport::ListenerRegistry::from_entries(vec![
+        (Transport::Udp, ipv4, None),
+        (Transport::Udp, ipv6, None),
+    ]);
+
+    assert_eq!(
+        dispatcher
+            .state
+            .unpinned_sent_by(Transport::Udp, "[2001:db8::20]:5062".parse().unwrap()),
+        ("[2001:db8::10]".to_string(), 5070)
+    );
+    assert_eq!(
+        dispatcher
+            .state
+            .unpinned_sent_by(Transport::Udp, "192.0.2.20:5062".parse().unwrap()),
+        (
+            dispatcher.state.via_host(&Transport::Udp),
+            dispatcher.state.via_port(&Transport::Udp)
+        )
+    );
+}
+
+/// The default listener already serves its own family, so the common
+/// single-family relay gets no pin and stays on the default egress path.
+#[test]
+fn family_egress_socket_leaves_the_default_family_unpinned() {
+    let mut dispatcher = super::test_dispatcher::test_dispatcher();
+    let ipv4: SocketAddr = "192.0.2.10:5060".parse().unwrap();
+    let ipv6: SocketAddr = "[2001:db8::10]:5060".parse().unwrap();
+    dispatcher.state.listen_addrs = std::collections::HashMap::from([(Transport::Udp, ipv4)]);
+    dispatcher.state.listener_registry = crate::transport::ListenerRegistry::from_entries(vec![
+        (Transport::Udp, ipv4, None),
+        (Transport::Udp, ipv6, None),
+    ]);
+
+    assert!(dispatcher
+        .state
+        .family_egress_socket(Transport::Udp, "192.0.2.20:5062".parse().unwrap())
+        .is_none());
+}
+
+/// No listener in the destination's family: nothing to pin to, the send keeps
+/// the default socket and fails where it did before rather than being dropped
+/// here.  Stream transports connect from an ephemeral socket of the right
+/// family on their own and are never pinned.
+#[test]
+fn family_egress_socket_is_none_without_a_matching_listener() {
+    let mut dispatcher = super::test_dispatcher::test_dispatcher();
+    let ipv4: SocketAddr = "192.0.2.10:5060".parse().unwrap();
+    dispatcher.state.listen_addrs =
+        std::collections::HashMap::from([(Transport::Udp, ipv4), (Transport::Tcp, ipv4)]);
+    dispatcher.state.listener_registry = crate::transport::ListenerRegistry::from_entries(vec![
+        (Transport::Udp, ipv4, None),
+        (Transport::Tcp, ipv4, None),
+        (Transport::Tcp, "[2001:db8::10]:5060".parse().unwrap(), None),
+    ]);
+    let ipv6_peer: SocketAddr = "[2001:db8::20]:5062".parse().unwrap();
+
+    assert!(dispatcher
+        .state
+        .family_egress_socket(Transport::Udp, ipv6_peer)
+        .is_none());
+    assert!(dispatcher
+        .state
+        .family_egress_socket(Transport::Tcp, ipv6_peer)
+        .is_none());
+}
+
 /// The wildcard hook for an `egress_sent_by` case whose flow socket (if any)
 /// is concrete, where the hook must never run.
 fn wildcard_not_consulted(local: SocketAddr) -> (String, u16) {
