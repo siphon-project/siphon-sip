@@ -2314,7 +2314,7 @@ jobs:
         # Pinned to the release siphon pins siphon-rtp-proto to, so this proves
         # a known-good pairing rather than whatever shipped most recently.
         run: |
-          docker create --name rtp-extract ghcr.io/siphon-project/siphon-rtp:0.7.1
+          docker create --name rtp-extract ghcr.io/siphon-project/siphon-rtp:0.12.0
           docker cp rtp-extract:/usr/local/bin/siphon-rtp ./siphon-rtp
           docker rm rtp-extract
           chmod +x ./siphon-rtp
@@ -2636,6 +2636,94 @@ jobs:
           path: |
             siphon-rtpproxy-real.log
             rtpproxy-real.log
+
+  # ── An independent SIP call suite, with siphon as the system under test ──
+  # Everything above is siphon talking to SIPp scenarios written alongside it,
+  # so a misreading of the RFC that both share passes. This drives the same
+  # kinds of call (setup, early media, failures, compact headers, early CANCEL,
+  # re-INVITE, hold) from a second SIP stack, on IPv4 and IPv6, through siphon
+  # as a proxy and as a B2BUA with media on a real rtpproxy. It fails on three
+  # things: either user agent unhappy with what it was sent, an SDP that does
+  # not point at the relay, and the relay's own session and command counters
+  # differing from the expected ones. The last is what catches a media session
+  # created twice or never released.
+  #
+  # siphon is not built here: the image is siphon's own from build-image, laid
+  # over the published rtpproxy image (interop/voiptests/Dockerfile).
+  #
+  # Every input is pinned. The suite is third-party code that runs in this
+  # pipeline, so it is checked out at a commit, never a branch, and the job has
+  # no secrets and only read access. For now that commit is on a fork carrying
+  # the siphon scenarios; it moves to the upstream repository once they are
+  # merged there.
+  interop-call-suite:
+    runs-on: ubuntu-latest
+    needs: build-image
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [simple, b2bua]
+        control: [udp, udp6]
+    env:
+      SUITE_REPOSITORY: siphon-project/voiptests
+      SUITE_COMMIT: 811c5470953977045e4accc92df2302974fb6a59
+      RTPPROXY_TOOLS_COMMIT: 630f75e22ab30c9856e6200f4bab29e938b990c2
+      RTPPROXY_IMAGE: ghcr.io/sippy/rtpproxy@sha256:7cf39743917d836af56f9c4293d4c79d1e528938f2a9e7fa60a6039d8358f4a8
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Load the siphon image
+        uses: ./.github/actions/load-siphon-image
+
+      - name: Check out the suite
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ env.SUITE_REPOSITORY }}
+          ref: ${{ env.SUITE_COMMIT }}
+          path: interop/voiptests/dist/voiptests
+          persist-credentials: false
+
+      - name: Check out rtpproxy's control tools
+        uses: actions/checkout@v7
+        with:
+          repository: sippy/rtpproxy
+          ref: ${{ env.RTPPROXY_TOOLS_COMMIT }}
+          path: interop/voiptests/dist/rtpproxy
+          persist-credentials: false
+
+      - name: Build the suite image around the siphon image
+        run: |
+          docker build \
+            --build-arg SIPHON_IMAGE=sipp-siphon:latest \
+            --build-arg BASE_IMAGE="$RTPPROXY_IMAGE" \
+            -t siphon-call-suite interop/voiptests
+
+      # The suite's own scenario selector is MM_AUTH: `simple` is siphon as a
+      # proxy, `b2bua` as a B2BUA. RTPPC_TYPE is how siphon reaches rtpproxy.
+      - name: Run the suite (${{ matrix.mode }}, rtpproxy control over ${{ matrix.control }})
+        timeout-minutes: 5
+        run: |
+          docker run --name suite --privileged \
+            --sysctl net.ipv6.conf.all.disable_ipv6=0 \
+            -e MM_AUTH=${{ matrix.mode }} -e RTPPC_TYPE=${{ matrix.control }} \
+            siphon-call-suite
+
+      - name: Collect logs
+        if: always()
+        run: |
+          mkdir -p suite-logs
+          for log in siphon.log siphon.yaml alice.log bob.log rtpproxy.log rtpproxy.rout; do
+            docker cp "suite:/opt/voiptests/$log" suite-logs/ 2> /dev/null || true
+          done
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: interop-call-suite-${{ matrix.mode }}-${{ matrix.control }}-logs
+          path: suite-logs
 
   # ── A media failure at answer must fail the call, not connect and bill it ──
   # @b2bua.on_answer is where the media backend is driven, so an answer the
