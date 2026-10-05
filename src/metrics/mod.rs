@@ -1582,7 +1582,7 @@ pub fn record_call_cost(route: Option<&crate::lcr::Route>, talk_seconds: Option<
     let currency = route.currency.as_deref().unwrap_or("unknown");
     metrics
         .call_cost_total
-        .with_label_values(&[&route.carrier_id, currency])
+        .with_label_values(&[route.carrier_id.as_str(), currency])
         .inc_by(cost);
 }
 

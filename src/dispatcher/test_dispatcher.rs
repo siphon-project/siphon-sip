@@ -135,6 +135,7 @@ pub(super) fn test_dispatcher_with_script(source: &str) -> TestDispatcher {
         held_byes: Arc::new(DashMap::new()),
         pending_reinvite_acks: Arc::new(DashMap::new()),
         cancelled_invites: Arc::new(DashMap::new()),
+        completed_invites: crate::dispatcher::completed_invite::CompletedInvites::default(),
         originate_groups: Arc::new(crate::dispatcher::b2bua::OriginateGroupStore::new()),
         dial_bridges: Arc::new(crate::dispatcher::b2bua::DialBridgeStore::new()),
         bridge_relays: Arc::new(crate::dispatcher::b2bua::BridgeRelayStore::new()),

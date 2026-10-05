@@ -3300,6 +3300,26 @@ fn rewrite_uri_host_pai_with_display() {
     assert_eq!(result, "\"Outbound Call\" <sip:alice@203.0.113.5>");
 }
 
+/// An IPv6 host is a bracketed literal (RFC 3261 §25.1 `IPv6reference`) and its
+/// colons are not the port separator. Ending the host at the first `:` left
+/// `<sip:alice@192.0.2.1::1]>` on the B-leg From.
+#[test]
+fn rewrite_uri_host_replaces_a_bracketed_ipv6_host_whole() {
+    let from = "\"Alice\" <sip:alice@[2001:db8::1]>;tag=abc123";
+    let result = rewrite_uri_host(from, "192.0.2.1");
+    assert_eq!(result, "\"Alice\" <sip:alice@192.0.2.1>;tag=abc123");
+}
+
+#[test]
+fn rewrite_uri_host_keeps_the_port_after_a_bracketed_ipv6_host() {
+    let from = "<sip:alice@[2001:db8::1]:5070;transport=udp>;tag=abc123";
+    let result = rewrite_uri_host(from, "[2001:db8::10]");
+    assert_eq!(
+        result,
+        "<sip:alice@[2001:db8::10]:5070;transport=udp>;tag=abc123"
+    );
+}
+
 // --- rewrite_uri_authority tests ---
 
 #[test]

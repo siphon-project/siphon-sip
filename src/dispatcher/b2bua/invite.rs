@@ -122,6 +122,27 @@ pub fn handle_b2bua_invite(inbound: InboundMessage, message: SipMessage, state: 
     let a_leg_supports_100rel = crate::sip::headers::rseq::supports_100rel(&message.headers);
     let a_leg_requires_100rel = crate::sip::headers::rseq::requires_100rel(&message.headers);
 
+    // A retransmission of an INVITE that already has its final non-2xx gets
+    // that response again (RFC 3261 §17.2.1, Completed). Checked ahead of the
+    // live-call guard below: the response is recorded as it is sent, which can
+    // be a moment before the call is removed, and after it the call is gone
+    // and the retransmission would be taken for a new one.
+    if let Some(final_response) = state.completed_invites.get(&sip_call_id, &via_branch) {
+        debug!(
+            call_id = %sip_call_id,
+            "B2BUA: INVITE retransmission after the final response, sending it again"
+        );
+        send_outbound_from(
+            final_response,
+            inbound.transport,
+            inbound.remote_addr,
+            inbound.connection_id,
+            Some(inbound.local_addr),
+            state,
+        );
+        return;
+    }
+
     // Guard against INVITE retransmissions: if we already have a call for this
     // SIP Call-ID, this is a retransmission. It creates no second call (each
     // UDP retransmission would otherwise spawn duplicate B-leg INVITEs), and
