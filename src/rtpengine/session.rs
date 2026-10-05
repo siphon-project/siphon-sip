@@ -170,10 +170,17 @@ impl MediaSession {
     ///
     /// What was recorded for the party when the pair was put together
     /// ([`MediaSession::bridge_sides`]), and without that the half of the
-    /// session's profile the party's SDP reached the engine under: `offer`
-    /// for the offerer of a relay and `answer` for its answerer, as on a
-    /// dial, and `answer` for the one party of a session the engine answered
-    /// itself.
+    /// session's profile the party was set up under: `offer` for the caller
+    /// of a dial and `answer` for its callee, and `answer` for the one party
+    /// of a session the engine answered itself.
+    ///
+    /// The half is the party's for the life of the call, whichever command
+    /// its SDP rides later: a callee that re-offers is still the `answer`
+    /// half's. A delayed offer (RFC 3264 §4) is no exception. Its callee
+    /// offers and its caller answers, but the profile was chosen for the dial
+    /// before either sent an SDP, and its session names the caller on
+    /// [`MediaSession::from_tag`] once answered
+    /// ([`MediaSessionStore::set_delayed_offer_answerer`]).
     #[must_use]
     pub fn party_ingress(&self, on_from_tag: bool) -> SideFlags {
         match (&self.bridge_sides, on_from_tag) {
@@ -250,8 +257,8 @@ mod media_session_tests {
             profile: "default".to_string(),
             half,
         };
-        // A relay set up by one dial: the offerer's `offer` half, the
-        // answerer's `answer` half.
+        // A relay set up by one dial: the caller's `offer` half, the
+        // callee's `answer` half.
         let relay = session(Some("tag-b"));
         assert_eq!(relay.party_ingress(true), half(ProfileHalf::Offer));
         assert_eq!(relay.party_ingress(false), half(ProfileHalf::Answer));
