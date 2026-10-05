@@ -338,52 +338,55 @@ pub fn handle_b2bua_response(
     // here must NOT be forwarded to the referrer (it would look like a fresh
     // call-setup 18x and confuse them) and (b) the 2xx must drive the transfer
     // completion rather than being swallowed by the "200 OK retransmission"
-    // absorber below. A transfer target is a b_leg that is not the winner while
-    // a siphon-owned REFER subscription is pending.
-    if let Some(target_idx) = snapshot.b_leg_index {
-        let is_transfer_target = state
-            .call_actors
-            .get_call(call_id)
-            .and_then(|call| {
-                let leg_call_id = &call.b_legs.get(target_idx)?.dialog.call_id;
-                Some(call.refer_subscriptions.iter().any(|subscription| {
-                    subscription.siphon_notifies
-                        && subscription.target_leg_call_id.as_deref() == Some(leg_call_id.as_str())
-                }))
-            })
-            .unwrap_or(false);
-        if is_transfer_target {
-            if (200..300).contains(&status_code) {
-                b2bua_complete_terminated_transfer(call_id, target_idx, message, state);
-            } else if status_code >= 300 {
-                // RFC 3261 §17.1.1.3 — the INVITE client transaction MUST ACK a
-                // non-2xx final, on the SAME branch. Nothing else on this path
-                // does it: the interception returns before the ordinary B-leg
-                // failure handling below, which is where every other B-leg
-                // non-2xx is ACKed. Without this the target retransmits its
-                // final response for the full 32 s of Timer H — observed on a
-                // transfer whose target answered `486 Busy Here` (11 copies at
-                // T1-doubling to T2) while siphon had already reported the
-                // failure to the referrer and moved on.
-                if !ack_b_leg_non2xx(branch, message, state, &snapshot) {
-                    warn!(
-                        call_id = %call_id,
-                        status = status_code,
-                        "B2BUA REFER (terminate): transfer target failed but its flow is \
-                         unknown — cannot ACK, the target will retransmit until Timer H"
-                    );
-                }
-                callee_dialog_ended(call_id, branch, state);
-                b2bua_fail_terminated_transfer(call_id, target_idx, status_code, state);
-            } else {
-                debug!(
+    // absorber below.
+    //
+    // A target is recognised by the Via branch of its INVITE, which the
+    // response carries: a replacement may ring several at once, and a leg's
+    // position on the call moves as soon as a sibling is taken off it. What the
+    // response then means (the first answer, a loser's, the last failure) is
+    // decided in the store under the call's lock, not here.
+    let replacement_branch = state.call_actors.replacement_branch(call_id, branch);
+    // A target whose replacement ended without it between this response
+    // arriving and here: a sibling that answered first, or the deadline, on
+    // another worker, has cancelled it and cleared the replacement. It is a
+    // cancelled branch now, and is answered as one (its 2xx ACKed and released
+    // with a BYE) instead of being taken for an answer to the call below.
+    if replacement_branch == crate::b2bua::actor::ReplacementBranch::Settled
+        && absorb_cancelled_branch_response(call_id, branch, message, status_code, state)
+    {
+        return true;
+    }
+    if replacement_branch == crate::b2bua::actor::ReplacementBranch::Target {
+        if (200..300).contains(&status_code) {
+            b2bua_complete_terminated_transfer(call_id, branch, message, state);
+        } else if status_code >= 300 {
+            // RFC 3261 §17.1.1.3 — the INVITE client transaction MUST ACK a
+            // non-2xx final, on the SAME branch. Nothing else on this path
+            // does it: the interception returns before the ordinary B-leg
+            // failure handling below, which is where every other B-leg
+            // non-2xx is ACKed. Without this the target retransmits its
+            // final response for the full 32 s of Timer H — observed on a
+            // transfer whose target answered `486 Busy Here` (11 copies at
+            // T1-doubling to T2) while siphon had already reported the
+            // failure to the referrer and moved on.
+            if !ack_b_leg_non2xx(branch, message, state, &snapshot) {
+                warn!(
                     call_id = %call_id,
                     status = status_code,
-                    "B2BUA REFER (terminate): absorbing transfer-target provisional (not forwarded to the referrer)"
+                    "B2BUA REFER (terminate): transfer target failed but its flow is \
+                     unknown — cannot ACK, the target will retransmit until Timer H"
                 );
             }
-            return true;
+            callee_dialog_ended(call_id, branch, state);
+            b2bua_fail_terminated_transfer(call_id, branch, status_code, state);
+        } else {
+            debug!(
+                call_id = %call_id,
+                status = status_code,
+                "B2BUA REFER (terminate): absorbing transfer-target provisional (not forwarded to the referrer)"
+            );
         }
+        return true;
     }
 
     match class {

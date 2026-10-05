@@ -32,6 +32,36 @@ pub struct ReplacementDial {
     pub shaping: DialShaping,
     /// Headers for the leg, injected after the header policy.
     pub headers: Vec<(String, String)>,
+    /// The further contacts of the same AoR, each rung alongside the target on
+    /// an INVITE of its own. The first to answer is kept and the rest are
+    /// CANCELled (RFC 3261 §16.7), and they share the identity and headers
+    /// above. Empty for a target named by URI, or an AoR with one contact.
+    pub also: Vec<ReplacementContact>,
+}
+
+/// One registered contact a replacement rings: where its INVITE goes, and the
+/// AoR it is called as.
+#[derive(Debug, Clone, Default)]
+pub struct ReplacementContact {
+    /// The contact's URI, which is the INVITE's Request-URI.
+    pub uri: String,
+    /// The contact's captured inbound flow.
+    pub flow: Option<crate::script::api::registrar::PyFlow>,
+    /// The binding's Path, as a route set.
+    pub route: Vec<String>,
+    /// The registered AoR the contact belongs to.
+    pub aor: Option<String>,
+}
+
+impl From<DialTarget> for ReplacementContact {
+    fn from(contact: DialTarget) -> Self {
+        Self {
+            uri: contact.uri,
+            flow: contact.flow,
+            route: contact.route,
+            aor: contact.aor,
+        }
+    }
 }
 
 /// What shaping a replacement's template settled for the send.
@@ -62,8 +92,50 @@ impl ReplacementDial {
                 aor: contact.aor,
                 shaping,
                 headers,
+                also: Vec::new(),
             },
         )
+    }
+
+    /// Dial every registered contact of an AoR at once: the first is the
+    /// target, the rest ring alongside it. `None` for no contacts at all.
+    pub fn to_contacts(
+        contacts: Vec<DialTarget>,
+        shaping: DialShaping,
+        headers: Vec<(String, String)>,
+    ) -> Option<(String, Self)> {
+        let mut contacts = contacts.into_iter();
+        let (target, mut dial) = Self::to_contact(contacts.next()?, shaping, headers);
+        dial.also = contacts.map(ReplacementContact::from).collect();
+        Some((target, dial))
+    }
+
+    /// Every target this replacement rings, each with the dial that reaches
+    /// it: `target_uri` as this names it, then the contacts rung alongside,
+    /// which share its identity and headers and bring their own flow, Path and
+    /// AoR.
+    pub(super) fn targets(&self, target_uri: &str) -> Vec<(String, Self)> {
+        let mut targets = vec![(
+            target_uri.to_string(),
+            Self {
+                also: Vec::new(),
+                ..self.clone()
+            },
+        )];
+        targets.extend(self.also.iter().cloned().map(|contact| {
+            (
+                contact.uri,
+                Self {
+                    flow: contact.flow,
+                    route: contact.route,
+                    aor: contact.aor,
+                    shaping: self.shaping.clone(),
+                    headers: self.headers.clone(),
+                    also: Vec::new(),
+                },
+            )
+        }));
+        targets
     }
 
     /// Whether the target is a registered contact, dialled exactly as it

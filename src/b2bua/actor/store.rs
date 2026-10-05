@@ -21,6 +21,7 @@ mod dialog_watch;
 mod failure;
 pub use failure::FailureConclusion;
 mod fork;
+mod replacement;
 mod route_progress;
 mod session_timer;
 
@@ -243,23 +244,31 @@ impl CallActorStore {
     pub fn remove_b_leg(&self, call_id: &str, index: usize) {
         let mut ended = Vec::new();
         if let Some(mut call) = self.calls.get_mut(call_id) {
-            if let Some(removed) = call.remove_b_leg(index) {
-                // A leg that leaves the call ends its dialog here, whatever
-                // state it was reported in.
-                ended = call.end_orphaned_dialogs();
-                self.registry.remove_branch(&removed.branch);
-                // Only remove Call-ID mapping if no other leg uses it.
-                // Re-INVITE tracking legs share the A-leg or winning B-leg
-                // Call-ID; removing it here would break BYE/in-dialog routing.
-                let cid = &removed.dialog.call_id;
-                let still_used = call.a_leg.dialog.call_id == *cid
-                    || call.b_legs.iter().any(|b| b.dialog.call_id == *cid);
-                if !still_used {
-                    self.registry.remove_call_id(cid);
-                }
-            }
+            ended = self.remove_b_leg_of(&mut call, index);
         }
         publish_dialog_states(ended);
+    }
+
+    /// [`remove_b_leg`](Self::remove_b_leg) on a call already held, handing
+    /// back the dialogs that ended for the caller to publish once it lets go.
+    fn remove_b_leg_of(&self, call: &mut CallActor, index: usize) -> Vec<DialogWatch> {
+        let Some(removed) = call.remove_b_leg(index) else {
+            return Vec::new();
+        };
+        // A leg that leaves the call ends its dialog here, whatever state it
+        // was reported in.
+        let ended = call.end_orphaned_dialogs();
+        self.registry.remove_branch(&removed.branch);
+        // Only remove Call-ID mapping if no other leg uses it. Re-INVITE
+        // tracking legs share the A-leg or winning B-leg Call-ID; removing it
+        // here would break BYE/in-dialog routing.
+        let cid = &removed.dialog.call_id;
+        let still_used = call.a_leg.dialog.call_id == *cid
+            || call.b_legs.iter().any(|b| b.dialog.call_id == *cid);
+        if !still_used {
+            self.registry.remove_call_id(cid);
+        }
+        ended
     }
 
     /// Update the target_uri of a B-leg (used to mark re-INVITE entries as done).
@@ -985,7 +994,7 @@ impl CallActorStore {
         for subscription in call.refer_subscriptions.iter_mut() {
             if subscription.siphon_notifies
                 && subscription.on_a_leg == on_a_leg
-                && subscription.target_leg_call_id.is_some()
+                && !subscription.targets.is_empty()
             {
                 subscription.referrer_gone = true;
                 matched = true;
@@ -1117,66 +1126,6 @@ impl CallActorStore {
         } else {
             call.winner
                 .and_then(|index| call.b_legs.get(index).cloned())
-        }
-    }
-
-    /// Complete a siphon-terminated transfer: promote the just-answered transfer
-    /// target (`target_idx` in `b_legs`) to be the surviving party's new peer,
-    /// and return the referrer leg (the party being transferred away) so the
-    /// caller can BYE it.
-    ///
-    /// - `referrer_on_a_leg == true` — the referrer is the A-leg and the
-    ///   surviving party is the winning B-leg: the target replaces the A-leg (it
-    ///   becomes the new `a_leg`, the winner is preserved, the old A-leg is
-    ///   returned). This is the Microsoft Teams blind-transfer shape.
-    /// - `referrer_on_a_leg == false` — the referrer is the winning B-leg and the
-    ///   surviving party is the A-leg: the target becomes the new winner and the
-    ///   old winning B-leg is returned.
-    ///
-    /// The parallel per-B-leg vectors are kept aligned when a slot is removed.
-    pub fn promote_transfer_target(
-        &self,
-        call_id: &str,
-        target_idx: usize,
-        referrer_on_a_leg: bool,
-    ) -> Option<Leg> {
-        let mut call = self.calls.get_mut(call_id)?;
-        if target_idx >= call.b_legs.len() {
-            return None;
-        }
-        if referrer_on_a_leg {
-            let target = call.b_legs.remove(target_idx);
-            if target_idx < call.b_leg_status.len() {
-                call.b_leg_status.remove(target_idx);
-            }
-            if target_idx < call.b_leg_handles.len() {
-                call.b_leg_handles.remove(target_idx);
-            }
-            // Removing the slot shifts higher indices down by one — fix the
-            // winner pointer (the surviving B-leg) accordingly.
-            match call.winner {
-                Some(winner) if winner == target_idx => call.winner = None,
-                Some(winner) if winner > target_idx => call.winner = Some(winner - 1),
-                _ => {}
-            }
-            let old_referrer = std::mem::replace(&mut call.a_leg, target);
-            // The referrer is transferred away and BYEd next: its dialog ends.
-            let ended = call.end_orphaned_dialogs();
-            drop(call);
-            publish_dialog_states(ended);
-            self.retire_promoted_referrer(&old_referrer);
-            Some(old_referrer)
-        } else {
-            let old_winner_idx = call.winner?;
-            let old_referrer = call.b_legs.get(old_winner_idx).cloned()?;
-            call.winner = Some(target_idx);
-            // The referrer stays in its slot until the call ends, but it is
-            // transferred away and BYEd next: its dialog ends now.
-            let ended = call.advance_dialog(&old_referrer.id.0, DialogState::Terminated, None);
-            drop(call);
-            publish_dialog_states(ended.into_iter().collect());
-            self.retire_promoted_referrer(&old_referrer);
-            Some(old_referrer)
         }
     }
 
@@ -1521,43 +1470,6 @@ impl CallActorStore {
                 })
             })
             .map(|entry| entry.id.clone())
-            .collect()
-    }
-
-    /// Leg replacements whose dialed target has blown its deadline, as
-    /// `(internal call id, target leg Call-ID)`.
-    ///
-    /// The counterpart of [`take_timed_out_calls`](Self::take_timed_out_calls)
-    /// for the *answered* calls that one skips. A replacement dials a new leg
-    /// on a call that is already `Answered`, so nothing in the answer-timeout
-    /// path can see it: a target that never sends a final response would leave
-    /// the subscription armed for the life of the call.
-    ///
-    /// Does NOT remove anything — the dispatcher runs the teardown (CANCEL the
-    /// target leg, drop it, clear the subscription), which needs to build and
-    /// send messages. Only notifier-role subscriptions that actually dialed a
-    /// target and carry a deadline are eligible.
-    pub fn take_timed_out_replacements(&self, now: std::time::Instant) -> Vec<(String, String)> {
-        self.calls
-            .iter()
-            .flat_map(|entry| {
-                entry
-                    .refer_subscriptions
-                    .iter()
-                    .filter(|subscription| {
-                        subscription.siphon_notifies
-                            && subscription
-                                .deadline
-                                .is_some_and(|deadline| now >= deadline)
-                    })
-                    .filter_map(|subscription| {
-                        subscription
-                            .target_leg_call_id
-                            .clone()
-                            .map(|target| (entry.id.clone(), target))
-                    })
-                    .collect::<Vec<_>>()
-            })
             .collect()
     }
 }

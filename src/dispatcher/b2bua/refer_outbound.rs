@@ -377,7 +377,7 @@ pub fn b2bua_send_outbound_refer(
             event_id: cseq,
             notify_cseq: cseq,
             state: crate::b2bua::transfer::TransferState::Trying,
-            target_leg_call_id: None,
+            targets: Vec::new(),
             // Subscriber role: siphon is the referrer here, so there is no
             // remote referrer whose departure this could track.
             referrer_gone: false,

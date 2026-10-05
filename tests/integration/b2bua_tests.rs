@@ -6,8 +6,18 @@
 use siphon::b2bua::actor::{
     generate_call_id, generate_tag, CallActor, CallActorStore, CallEvent, CallState,
     EarlyMediaAnchor, ForwardedMarker, Leg, LegActor, LegSide, ReferSubscription,
-    SessionTimerState, TransportInfo,
+    ReplacementTarget, SessionTimerState, TransportInfo,
 };
+
+/// The one target a replacement dialled, named by its leg's Call-ID, as the
+/// subscription records it.
+fn one_target(leg_call_id: String) -> Vec<ReplacementTarget> {
+    vec![ReplacementTarget::ringing(
+        format!("z9hG4bK-{leg_call_id}"),
+        leg_call_id,
+        None,
+    )]
+}
 use siphon::b2bua::header_policy::{
     apply_to_request, apply_to_response, build_registry, builtin_presets, validate_preset,
     DirectionPolicy, HeaderPattern, PolicyContext, Preset, PresetError, ResolvedPolicy, RewriteOp,
@@ -2417,7 +2427,7 @@ fn refer_subscription_push_query_clear() {
             event_id: 4,
             notify_cseq: 4,
             state: TransferState::Trying,
-            target_leg_call_id: None,
+            targets: Vec::new(),
             referrer_gone: false,
             deadline: None,
             media_profile: None,
@@ -2537,7 +2547,7 @@ fn transfer_referrer_bye_is_recognised_and_flags_the_subscription() {
             event_id: 2,
             notify_cseq: 2,
             state: TransferState::Trying,
-            target_leg_call_id: Some(target_call_id),
+            targets: one_target(target_call_id),
             referrer_gone: false,
             deadline: None,
             media_profile: None,
@@ -2573,7 +2583,7 @@ fn transfer_referrer_bye_is_idempotent_for_retransmissions() {
             event_id: 2,
             notify_cseq: 2,
             state: TransferState::Trying,
-            target_leg_call_id: Some(target_call_id),
+            targets: one_target(target_call_id),
             referrer_gone: false,
             deadline: None,
             media_profile: None,
@@ -2618,7 +2628,7 @@ fn surviving_party_bye_during_transfer_still_tears_the_call_down() {
             event_id: 2,
             notify_cseq: 2,
             state: TransferState::Trying,
-            target_leg_call_id: Some(target_call_id),
+            targets: one_target(target_call_id),
             referrer_gone: false,
             deadline: None,
             media_profile: None,
@@ -2659,7 +2669,7 @@ fn originated_refer_subscription_never_flags_referrer_gone() {
             event_id: 3,
             notify_cseq: 3,
             state: TransferState::Trying,
-            target_leg_call_id: None,
+            targets: Vec::new(),
             referrer_gone: false,
             deadline: None,
             media_profile: None,
@@ -2760,7 +2770,7 @@ fn refer_notifier_subscription_is_not_a_subscriber_one() {
             event_id: 2,
             notify_cseq: 2,
             state: TransferState::Trying,
-            target_leg_call_id: None,
+            targets: Vec::new(),
             referrer_gone: false,
             deadline: None,
             media_profile: None,
@@ -2791,7 +2801,7 @@ fn a_notify_after_the_terminating_one_finds_no_subscription_and_no_far_leg() {
             event_id: 7,
             notify_cseq: 7,
             state: TransferState::Trying,
-            target_leg_call_id: None,
+            targets: Vec::new(),
             referrer_gone: false,
             deadline: None,
             media_profile: None,
@@ -2818,7 +2828,7 @@ fn siphon_initiated(target: &str, deadline: Option<std::time::Instant>) -> Refer
         event_id: 0,
         notify_cseq: 0,
         state: TransferState::Trying,
-        target_leg_call_id: Some(target.to_string()),
+        targets: one_target(target.to_string()),
         referrer_gone: false,
         deadline,
         media_profile: None,
@@ -2846,7 +2856,10 @@ fn a_siphon_initiated_replacement_owes_no_notify_but_still_owes_the_bye() {
     // promotion, which is what the response path matches on.
     assert!(subscription.siphon_notifies);
     assert_eq!(
-        subscription.target_leg_call_id.as_deref(),
+        subscription
+            .targets
+            .first()
+            .map(|target| target.leg_call_id.as_str()),
         Some("target@test")
     );
     // And it is not a subscriber subscription, so an inbound NOTIFY on this

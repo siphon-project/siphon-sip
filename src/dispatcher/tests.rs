@@ -3759,7 +3759,7 @@ fn transfer_target_leg_captures_its_route_set_and_the_ack_carries_it() {
     let response = record_routed_2xx();
 
     assert!(
-        store_b_leg_route_set_from_2xx(&store, &call_id, 0, &response),
+        store_b_leg_route_set_from_2xx(&store, &call_id, "z9hG4bK-target-1", &response),
         "a 2xx carrying Record-Route establishes a route set"
     );
     let target = store
@@ -3806,7 +3806,10 @@ fn a_2xx_without_record_route_stores_nothing_and_routes_nothing() {
     .1;
 
     assert!(!store_b_leg_route_set_from_2xx(
-        &store, &call_id, 0, &response
+        &store,
+        &call_id,
+        "z9hG4bK-target-1",
+        &response
     ));
     let target = store
         .get_call(&call_id)

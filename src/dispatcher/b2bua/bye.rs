@@ -136,6 +136,13 @@ pub fn handle_b2bua_bye(inbound: InboundMessage, message: SipMessage, state: &Di
     #[cfg(test)]
     teardown_race::claimed();
 
+    // A party of a call with a leg replacement still ringing its targets is
+    // hanging up: the surviving one, since the replaced one was handled above.
+    // The targets are CANCELled now (RFC 3261 §9.1), while the call that knows
+    // them is still here; left to the teardown below they would ring on with
+    // nothing to end them.
+    b2bua_abandon_leg_replacements(&call_id, state);
+
     // Extract the rest from the DashMap ref and drop it before entering Python
     let (a_leg_invite, a_leg_source_ip, a_leg_transport, a_leg_call_id, a_leg_flow) =
         match state.call_actors.get_call(&call_id) {

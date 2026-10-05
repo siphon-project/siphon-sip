@@ -88,9 +88,60 @@ pub(crate) fn gateway_credentials_for(
 /// about instantly (and, on the LCR path, blames the carrier for a `408` it
 /// never saw a packet for). The proxy's own relay answers `502` the moment a
 /// target will not resolve; this is the B2BUA half of that.
+///
+/// The parameters are [`b2bua_dial_b_leg`]'s, which does the work and is
+/// where each is described.
 #[must_use = "an unsent B-leg INVITE must fail the call now, not at the ring timeout"]
-#[allow(clippy::too_many_lines)] // TODO(1.9.0 split): decomposed by the dispatcher module split. b2bua_send_b_leg_invite
 pub fn b2bua_send_b_leg_invite(
+    call_id: &str,
+    target_uri: &str,
+    next_hop: Option<&str>,
+    flow: Option<&crate::script::api::registrar::PyFlow>,
+    b_leg_route: &[String],
+    send_socket: Option<&crate::transport::SendSocket>,
+    forced_call_id: Option<&str>,
+    original_request: &SipMessage,
+    number_policy: Option<&crate::numbers::policy::NumberPolicy>,
+    retarget_number: Option<&str>,
+    caller_id: Option<&str>,
+    caller_id_presentation: Option<crate::sip::privacy::CallerIdPresentation>,
+    branch_from_host: Option<&str>,
+    branch_to: Option<&str>,
+    extra_headers: &[(String, String)],
+    state: &DispatcherState,
+) -> bool {
+    b2bua_dial_b_leg(
+        call_id,
+        target_uri,
+        next_hop,
+        flow,
+        b_leg_route,
+        send_socket,
+        forced_call_id,
+        original_request,
+        number_policy,
+        retarget_number,
+        caller_id,
+        caller_id_presentation,
+        branch_from_host,
+        branch_to,
+        extra_headers,
+        state,
+    )
+    .is_some()
+}
+
+/// [`b2bua_send_b_leg_invite`], handing back the Via branch of the INVITE it
+/// sent, or `None` when nothing reached the transport.
+///
+/// The branch is the one identity a leg has that no other leg can share (RFC
+/// 3261 §8.1.1.7), and every response to the INVITE carries it. A caller that
+/// rings several targets for one call tells them apart by it, where the leg's
+/// position on the call moves and its Call-ID may be the caller's own.
+#[must_use = "an unsent B-leg INVITE must fail the call now, not at the ring timeout"]
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)] // TODO(1.9.0 split): decomposed by the dispatcher module split. b2bua_send_b_leg_invite
+pub fn b2bua_dial_b_leg(
     call_id: &str,
     target_uri: &str,
     next_hop: Option<&str>,
@@ -130,7 +181,7 @@ pub fn b2bua_send_b_leg_invite(
     branch_to: Option<&str>,
     extra_headers: &[(String, String)],
     state: &DispatcherState,
-) -> bool {
+) -> Option<String> {
     // Where the INVITE goes: over the captured flow, or to the topmost Route of
     // a Path route set, an explicit next hop or the target. The same decision
     // an originate to a registered phone makes (`resolve_leg_destination`).
@@ -159,7 +210,7 @@ pub fn b2bua_send_b_leg_invite(
                 route = ?b_leg_route,
                 "B2BUA: cannot dial the B-leg: {error}",
             );
-            return false;
+            return None;
         }
     };
     let routing_uri = routing_uri.as_str();
@@ -696,7 +747,7 @@ pub fn b2bua_send_b_leg_invite(
             call_id = %call_id,
             "B2BUA: the call ended before its B-leg INVITE went out — not sending it"
         );
-        return false;
+        return None;
     }
     spawn_b_leg_actor(call_id, &b_leg, state);
     // A branch of a controller-issued `dial` is named to the controller now,
@@ -783,7 +834,7 @@ pub fn b2bua_send_b_leg_invite(
                 state,
             );
             callee_dialog_ended(call_id, &branch, state);
-            return false;
+            return None;
         }
     } else {
         let relay_target = RelayTarget {
@@ -886,7 +937,7 @@ pub fn b2bua_send_b_leg_invite(
         }
     }
 
-    true
+    Some(branch)
 }
 
 /// Apply 401/407 digest-retry edits to a previously sent B-leg INVITE.

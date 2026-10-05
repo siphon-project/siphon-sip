@@ -2663,7 +2663,16 @@ fn replacement(
         event_id: 0,
         notify_cseq: 0,
         state: TransferState::Trying,
-        target_leg_call_id: target_leg_call_id.map(str::to_string),
+        targets: target_leg_call_id
+            .map(|leg_call_id| {
+                ReplacementTarget::ringing(
+                    format!("z9hG4bK-{leg_call_id}"),
+                    leg_call_id.to_string(),
+                    None,
+                )
+            })
+            .into_iter()
+            .collect(),
         referrer_gone: false,
         deadline,
         media_profile: None,
