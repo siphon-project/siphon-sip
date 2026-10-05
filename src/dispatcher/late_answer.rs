@@ -320,3 +320,27 @@ pub(super) fn forward_2xx_statelessly(
     }
     true
 }
+
+/// Rewrite the Contact URI in a response with the observed source address.
+///
+/// This is the automatic equivalent of OpenSIPS's `fix_nated_contact()` in
+/// onreply_route.  When `nat.fix_contact` is enabled, every response gets
+/// its Contact rewritten before forwarding upstream, so in-dialog requests
+/// from the upstream UAC will reach the NATed endpoint's public address.
+pub(super) fn fix_response_contact(mut message: SipMessage, source: SocketAddr) -> SipMessage {
+    use crate::sip::headers::nameaddr::NameAddr;
+
+    if let Some(raw) = message.headers.get("Contact").cloned() {
+        if let Ok(mut nameaddr) = NameAddr::parse(&raw) {
+            let host = source.ip().to_string();
+            nameaddr.uri.host = if host.contains(':') && !host.starts_with('[') {
+                format!("[{host}]")
+            } else {
+                host
+            };
+            nameaddr.uri.port = Some(source.port());
+            message.headers.set("Contact", nameaddr.to_string());
+        }
+    }
+    message
+}
