@@ -514,14 +514,16 @@ pub fn rewrite_reinvite_answer_sdp(
         ) {
             let a_sip_call_id = &snapshot.a_leg.dialog.call_id;
             if let Some(session) = media_sessions.get(a_sip_call_id) {
-                if let Some(profile) = profiles.get(&session.profile) {
+                // Shaped for the party the answer is relayed to, the one that
+                // offered, by its own side of the profile.
+                if let Some(shape) = session.party_shape(is_a2b).resolve(profiles) {
                     // The answer comes from the opposite side of the offer, and the engine keys
                     // the exchange on the offerer. A B→A answer must therefore name the callee
                     // as offerer: the caller's tag would claim the exchange ran the other way
                     // round and re-point the wrong leg's media. A 2xx cannot be refused, so when
                     // the pair cannot be named the SDP is left alone and the gap is logged.
                     if let Some((answer_from, answer_to)) = session.answer_tags(is_a2b) {
-                        let mut answer_flags = profile.answer.clone();
+                        let mut answer_flags = shape;
                         // Pin the answering party's ingress to where its own 2xx arrived from,
                         // as the offer side now does for the offerer, and by its own policy:
                         // a caller answering the callee's re-offer was set up under the

@@ -851,7 +851,14 @@ pub fn anchored_answer(
         &caller_tag,
         &caller_ack.body,
         caller_ack.headers.call_id().map_or("", String::as_str),
-        &session.profile,
+        // The result goes to the callee, in the ACK: shaped as everything the
+        // callee of this dial is sent, by the profile's `offer` half. The
+        // session still names the callee alone, on its `from_tag`, so the
+        // half is named here, not read off the session.
+        &crate::rtpengine::session::SideFlags {
+            profile: session.profile.clone(),
+            half: crate::rtpengine::session::ProfileHalf::Offer,
+        },
         Some(&caller),
     ) {
         Some(answer) => {

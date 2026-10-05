@@ -384,62 +384,41 @@ pub fn handle_b2bua_update(inbound: InboundMessage, message: SipMessage, state: 
             let sdp_addr = state.a_leg_advertised_host(target_local_addr, &transport);
             hide_sdp_identity(&mut forwarded.body, state, Some(&sdp_addr));
 
-            if let (Some(ref rtpengine_set), Some(ref media_sessions), Some(ref profiles)) = (
-                &state.rtpengine_set,
-                &state.rtpengine_sessions,
-                &state.rtpengine_profiles,
+            // Through the media engine, as a re-INVITE's offer goes: named by
+            // the offering party's own tag, pinned by its own policy, and
+            // shaped for the party it is relayed to.
+            match reoffer_through_media_engine(
+                state,
+                &a_leg.dialog.call_id,
+                from_a_leg,
+                inbound.remote_addr.ip(),
+                &sip_call_id,
+                &forwarded.body,
             ) {
-                let a_sip_call_id = &a_leg.dialog.call_id;
-                if let Some(session) = media_sessions.get(a_sip_call_id) {
-                    if let Some(profile) = profiles.get(&session.profile) {
-                        // Same tag rule as the re-INVITE path: an UPDATE from the callee needs the
-                        // callee's own tag, and there is no substitute for it.
-                        let Some(offer_tag) = session.offer_tag(from_a_leg) else {
-                            warn!(
-                                call_id = %call_id,
-                                "B2BUA UPDATE from the callee on a media session with no recorded \
-                                 answerer tag — rejecting with 488 rather than naming the caller to \
-                                 the media engine"
-                            );
-                            reject_unanchorable_offer(&message, &inbound, state, &call_id, None);
-                            return;
-                        };
-                        let mut offer_flags = profile.offer.clone();
-                        // The offering party's own policy, as on a
-                        // re-INVITE: a callee was set up under the `answer`
-                        // half, not the `offer` half that shapes this command.
-                        session.party_ingress(from_a_leg).stamp_ingress(
-                            &mut offer_flags,
-                            profiles,
-                            inbound.remote_addr.ip(),
-                        );
-                        offer_flags.stamp_sip_call_id(&sip_call_id);
-                        match tokio::task::block_in_place(|| {
-                            tokio::runtime::Handle::current().block_on(rtpengine_set.reoffer(
-                                session.rtpengine_id(),
-                                offer_tag,
-                                &forwarded.body,
-                                &offer_flags,
-                            ))
-                        }) {
-                            Ok(rewritten_sdp) => {
-                                forwarded.body = rewritten_sdp;
-                                debug!(call_id = %call_id, "RTPEngine: rewrote UPDATE SDP (offer)");
-                            }
-                            Err(error) => {
-                                error!(
-                                    call_id = %call_id,
-                                    "RTPEngine offer for UPDATE failed: {error} — rejecting the \
-                                     UPDATE with 488 rather than forwarding SDP that routes both \
-                                     parties around the anchor"
-                                );
-                                reject_unanchorable_offer(
-                                    &message, &inbound, state, &call_id, None,
-                                );
-                                return;
-                            }
-                        }
-                    }
+                ReofferOutcome::NotAnchored => {}
+                ReofferOutcome::Rewritten(rewritten_sdp) => {
+                    forwarded.body = rewritten_sdp;
+                    debug!(call_id = %call_id, "RTPEngine: rewrote UPDATE SDP (offer)");
+                }
+                ReofferOutcome::NoOfferTag => {
+                    warn!(
+                        call_id = %call_id,
+                        "B2BUA UPDATE from the callee on a media session with no recorded \
+                         answerer tag — rejecting with 488 rather than naming the caller to \
+                         the media engine"
+                    );
+                    reject_unanchorable_offer(&message, &inbound, state, &call_id, None);
+                    return;
+                }
+                ReofferOutcome::Failed(error) => {
+                    error!(
+                        call_id = %call_id,
+                        "RTPEngine offer for UPDATE failed: {error} — rejecting the \
+                         UPDATE with 488 rather than forwarding SDP that routes both \
+                         parties around the anchor"
+                    );
+                    reject_unanchorable_offer(&message, &inbound, state, &call_id, None);
+                    return;
                 }
             }
             // Own the o= identity toward the leg this UPDATE is sent to (RFC 3264

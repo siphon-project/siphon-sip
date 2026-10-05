@@ -871,6 +871,10 @@ pub enum ReofferOutcome {
 /// The offering party is named by its own tag: the engine resolves the
 /// re-offering party by tag and answers with the leg facing the other one, so the
 /// other party's tag would come back wired to the wrong leg.
+///
+/// The command is shaped by the side of the profile that describes the party
+/// the rewritten offer is relayed to. A re-INVITE and an UPDATE both come
+/// through here.
 pub fn reoffer_through_media_engine(
     state: &DispatcherState,
     a_leg_call_id: &str,
@@ -889,13 +893,15 @@ pub fn reoffer_through_media_engine(
     let Some(session) = media_sessions.get(a_leg_call_id) else {
         return ReofferOutcome::NotAnchored;
     };
-    let Some(profile) = profiles.get(&session.profile) else {
+    // Shaped for the party the engine's result is relayed to, the other one:
+    // by its own side of the profile, whoever offers
+    // ([`crate::rtpengine::MediaSession::party_shape`]).
+    let Some(mut offer_flags) = session.party_shape(!from_a_leg).resolve(profiles) else {
         return ReofferOutcome::NotAnchored;
     };
     let Some(offer_tag) = session.offer_tag(from_a_leg) else {
         return ReofferOutcome::NoOfferTag;
     };
-    let mut offer_flags = profile.offer.clone();
     // Pin media ingress to where the offer actually came from, the way the initial
     // offer does: a client that changed network re-offers from a new public
     // address, and the engine gates the leg on the last hint it was given. The

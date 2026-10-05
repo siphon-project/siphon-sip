@@ -497,6 +497,32 @@ entry, but a working config keeps working.
   or replaced has its held REFER answered `487` ahead of the BYE that
   releases it, and a decision reaching a REFER whose dialog has left the call
   answers it `481`.
+- **A re-offer from the callee is relayed to each party in that party's own
+  transport.** A media profile's `offer` half shapes what the callee of a
+  dial is sent (the caller's offer, rewritten) and its `answer` half what
+  the caller is sent, and both media backends apply the flags on a command
+  to the SDP they return, so to the party that SDP is sent to. On a
+  re-INVITE or an UPDATE the half was chosen by the command instead: `offer`
+  flags on the re-offer and `answer` flags on its answer, whoever sent it.
+  That is right while the caller re-offers. When the callee does, a hold
+  and its resume for instance, its offer was relayed to the caller under the
+  `offer` half and the caller's answer returned to the callee under the
+  `answer` half: each got the other's side of the profile. With a profile
+  whose halves differ, the built-in `srtp_to_rtp` / `rtp_to_srtp` or any
+  that sets `transport_protocol`, `direction`, DTLS or codec handling per
+  half, the SRTP party was offered plain RTP and the plain one SRTP, with
+  the `direction` pair reversed. A delayed offer (RFC 3264 §4) had the same
+  fault from the start of the call, since there the callee offers: its offer
+  in the 2xx reached the caller under the `offer` half and the caller's
+  answer in the ACK reached the callee under the `answer` half. Every such
+  command is now shaped for the party its result is sent to, which the
+  call's media session says for the life of the call: the callee by the
+  `offer` half and the caller by the `answer` half, or what a transfer, a
+  takeover or a bridge recorded for the pair. This covers a B2BUA call's
+  relayed re-INVITE and UPDATE and their answers, the delayed offer and its
+  answer, and a script's own `rtpengine.offer()` / `rtpengine.answer()` on a
+  call already anchored. A profile whose two halves are the same, and every
+  re-offer from the caller, is sent exactly what it was.
 
 ### Changed
 

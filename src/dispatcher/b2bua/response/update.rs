@@ -154,12 +154,14 @@ pub fn forward_update_response(
             ) {
                 let a_sip_call_id = &snapshot.a_leg.dialog.call_id;
                 if let Some(session) = media_sessions.get(a_sip_call_id) {
-                    if let Some(profile) = profiles.get(&session.profile) {
+                    // Shaped for the party the answer is relayed to, the one that
+                    // offered, by its own side of the profile.
+                    if let Some(shape) = session.party_shape(is_a2b).resolve(profiles) {
                         // Same rule as the re-INVITE answer above: a B→A answer must name the callee
                         // as offerer, and a 2xx cannot be refused, so an unnameable pair leaves the
                         // SDP alone rather than attributing it to the wrong party.
                         if let Some((answer_from, answer_to)) = session.answer_tags(is_a2b) {
-                            let mut answer_flags = profile.answer.clone();
+                            let mut answer_flags = shape;
                             // The answering party's own policy, as on a
                             // re-INVITE's answer.
                             session.party_ingress(!is_a2b).stamp_ingress(

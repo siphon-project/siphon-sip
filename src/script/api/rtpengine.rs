@@ -609,15 +609,26 @@ impl PyRtpEngine {
                 self.registry.profile_names().join(", ")
             ))
         })?;
-        let mut flags = entry.offer.clone();
-
         let message = extract_message(request)?;
         let (call_id, from_tag, sdp) = extract_offer_params(&message)?;
+        let anchored = self.sessions.get(&call_id);
+        // Shaped for the party the rewritten offer is sent to: the callee of
+        // the call under the `offer` half, and on a re-offer from the callee
+        // the caller, under the `answer` half that has described it since the
+        // call was set up.
+        let mut flags = match answer::shaping_half(
+            anchored.as_ref(),
+            &from_tag,
+            crate::rtpengine::session::ProfileHalf::Offer,
+        ) {
+            crate::rtpengine::session::ProfileHalf::Offer => entry.offer.clone(),
+            crate::rtpengine::session::ProfileHalf::Answer => entry.answer.clone(),
+        };
         // The offer is the sending party's SDP, so that party's own policy
-        // decides whether it is pinned to the request's source: on a re-offer
-        // from the callee, not the `offer` half that shapes this command.
+        // decides whether it is pinned to the request's source, whichever
+        // half shapes this command.
         flags.carry_received_from = answer::party_pins_ingress(
-            self.sessions.get(&call_id).as_ref(),
+            anchored.as_ref(),
             &from_tag,
             entry,
             &self.registry,

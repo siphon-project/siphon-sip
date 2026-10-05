@@ -197,6 +197,41 @@ impl MediaSession {
         }
     }
 
+    /// What shapes the SDP the engine sends one party of this session: the
+    /// one on [`MediaSession::from_tag`] when `on_from_tag`, the one on
+    /// [`MediaSession::to_tag`] otherwise.
+    ///
+    /// The flags on an engine command describe the party its result is sent
+    /// to, not the party whose SDP it carries and not the command. A dial's
+    /// profile says so once for the call: its `offer` half is what the callee
+    /// is sent (the caller's offer, rewritten) and its `answer` half what the
+    /// caller is sent. That holds for the life of the call whoever offers
+    /// next, so a callee's re-offer is relayed to the caller under the
+    /// `answer` half and answered to the callee under the `offer` half.
+    /// Choosing the half by the command instead sends each party the other's
+    /// side of a profile whose halves differ: the transport, the `direction`
+    /// pair, the codec policy.
+    ///
+    /// A pair put together by something other than one dial reads what was
+    /// recorded for each party ([`MediaSession::bridge_sides`]). The one party
+    /// of a session the engine answered itself is on `from_tag` and was
+    /// answered under the `answer` half.
+    #[must_use]
+    pub fn party_shape(&self, on_from_tag: bool) -> SideFlags {
+        match (&self.bridge_sides, on_from_tag) {
+            (Some(sides), true) => sides.anchor.clone(),
+            (Some(sides), false) => sides.peer.clone(),
+            (None, _) => SideFlags {
+                profile: self.profile.clone(),
+                half: if on_from_tag {
+                    ProfileHalf::Answer
+                } else {
+                    ProfileHalf::Offer
+                },
+            },
+        }
+    }
+
     /// The tag naming the party that is **sending** an in-dialog offer, for the media engine's
     /// re-offer: the A-leg's `from_tag` when the offer came from A, the B-leg's `to_tag` when it came
     /// from B.
