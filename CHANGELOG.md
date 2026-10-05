@@ -151,6 +151,17 @@ entry, but a working config keeps working.
   it was not anchored, and the call's teardown did not delete the pair's media
   engine call, which stayed until the engine's own timeout. The session is now
   kept, and the engine call goes with the call.
+- **A pair bridged again after an `unbridge` is shaped and pinned as its first
+  bridge shaped and pinned it.** When a bridge forms, the `with` leg's own
+  media session is retired, and with it the record of the profile that leg was
+  anchored with. A second `bridge` of the same two legs then offered the `with`
+  leg what the anchor's profile describes (a phone anchored with SRTP was
+  offered `RTP/AVP`) and read its `received_from` policy from the anchor's
+  profile, so a `with` leg behind NAT lost its source hint and one that asked
+  for none could be given one. The pair's session records both parties' sides,
+  and the second bridge now reads the `with` leg's from there, in whichever
+  order the two legs are named. A leg bridged to a *different* party afterwards
+  is unaffected by what was recorded for the first.
 - **A retransmitted INVITE on a B2BUA call is answered.** The retransmission
   was recognised (it creates no second call) and then dropped without a
   response. A caller retransmits because it has seen no provisional, so one

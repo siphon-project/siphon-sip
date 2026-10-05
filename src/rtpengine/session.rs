@@ -433,6 +433,20 @@ impl MediaSessionStore {
         }
     }
 
+    /// Whether the dialog `sip_call_id` is recorded as a party of engine call
+    /// `engine_call_id`: a bridged pair's anchor or peer. A pair parted by an
+    /// `unbridge` stays recorded, since its session stays on the engine call,
+    /// which is how a second bridge of the same two legs recognises the party
+    /// that session already relays to. Spends nothing.
+    pub fn is_party(&self, engine_call_id: &str, sip_call_id: &str) -> bool {
+        self.parties.get(engine_call_id).is_some_and(|recorded| {
+            recorded
+                .parties
+                .iter()
+                .any(|party| party.sip_call_id == sip_call_id)
+        })
+    }
+
     /// The store key of the session on engine call `engine_call_id`: the SIP
     /// Call-ID it is stored under, which for a bridged pair or a re-anchor is
     /// not the engine id. `None` when no stored session is on that call.

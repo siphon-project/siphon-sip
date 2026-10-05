@@ -73,6 +73,12 @@
 //! anchor's for the answer (a caller answered with plain RTP is re-INVITEd with
 //! plain RTP). See [`bridge_offer_profile`].
 //!
+//! A peer's own session is retired when its bridge forms, so a pair that is
+//! parted and bridged again finds the peer with none. What that party was
+//! anchored with is then read off the pair's session, which recorded it per
+//! side ([`LegMedia::of_bridged_peer`]): the second bridge shapes and pins
+//! both parties as the first did.
+//!
 //! ## Which profile pins which party's media ingress
 //!
 //! That is a different question, with the opposite answer. The `offer` that
@@ -107,7 +113,7 @@
 use std::fmt;
 use std::net::IpAddr;
 
-use crate::rtpengine::session::{ProfileHalf, SideFlags};
+use crate::rtpengine::session::{MediaSession, ProfileHalf, SideFlags};
 
 /// Which side of a bridge a leg is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -409,6 +415,41 @@ pub struct LegMedia {
     /// "this call has no active media playback", and it counts that answer as a
     /// rejected command in the counter operators alert on.
     pub has_playback: bool,
+}
+
+impl LegMedia {
+    /// The media of the **peer** a formed bridge left on `pair`, the session
+    /// stored under its anchor: what a second bridge of the same two legs
+    /// reads for a peer that has no session of its own any more.
+    ///
+    /// The peer's own session is retired when a bridge forms, and with it the
+    /// only other record of which profile that party was anchored with. The
+    /// pair's session keeps both, per side: the profile whose `offer` half
+    /// shaped what the peer was offered, and whose policy pins the peer's
+    /// media ingress. Without them a bridge of the same pair after an
+    /// `unbridge` offers the peer the anchor's transport and pins it by the
+    /// anchor's policy.
+    ///
+    /// `None` for a session no bridge recorded sides on, or with no second
+    /// party. Whether the leg in hand *is* that party is the caller's to
+    /// establish: a session's sides describe the party it relays to, not
+    /// whoever is bridged to its anchor next.
+    pub fn of_bridged_peer(pair: &MediaSession, has_playback: bool) -> Option<Self> {
+        let sides = pair.bridge_sides.as_ref()?;
+        let tag = pair.to_tag.clone()?;
+        Some(LegMedia {
+            media_call_id: pair.rtpengine_id().to_string(),
+            from_tag: tag,
+            profile: sides.peer.profile.clone(),
+            ingress: sides.peer_ingress.clone(),
+            relaying: true,
+            // A tee or a takeover bridge is recorded on a leg's own session,
+            // and this party has none.
+            has_tee: false,
+            has_ws_bridge: false,
+            has_playback,
+        })
+    }
 }
 
 /// One step of the media work a bridge performs, in the order
@@ -1195,6 +1236,92 @@ mod tests {
             bridge_peer_ingress(None, &anchor, None),
             own_ingress(bridge_answer_profile(None, &anchor))
         );
+    }
+
+    /// The session a formed bridge leaves under its anchor: a plain-RTP caller
+    /// on `tag-a` joined to an SRTP phone on `tag-b`, each with a policy of
+    /// its own.
+    fn formed_pair() -> MediaSession {
+        let side = |profile: &str, half| SideFlags {
+            profile: profile.to_string(),
+            half,
+        };
+        MediaSession {
+            call_id: "anchor-dialog@192.0.2.10".to_string(),
+            rtpengine_call_id: "cid-pair".to_string(),
+            from_tag: "tag-a".to_string(),
+            to_tag: Some("tag-b".to_string()),
+            profile: "open_caller".to_string(),
+            ws_uri: None,
+            ws_tee: None,
+            ws_bridge_attached: false,
+            bridge_sides: Some(crate::rtpengine::session::BridgeSides {
+                anchor: side("open_caller", ProfileHalf::Answer),
+                peer: side("pinned_phone", ProfileHalf::Offer),
+                anchor_ingress: own_ingress("open_caller"),
+                peer_ingress: own_ingress("pinned_phone"),
+            }),
+            created_at: std::time::Instant::now(),
+        }
+    }
+
+    #[test]
+    fn a_pair_bridged_again_reads_the_peers_own_profile_off_the_pairs_session() {
+        // The bug: after an unbridge the peer has no session of its own, so
+        // the second bridge shaped and pinned it with the anchor's profile.
+        let pair = formed_pair();
+        let peer = LegMedia::of_bridged_peer(&pair, false).expect("the pair recorded its peer");
+        assert_eq!(peer.media_call_id, "cid-pair");
+        assert_eq!(peer.from_tag, "tag-b");
+        assert_eq!(peer.profile, "pinned_phone");
+        assert_eq!(peer.ingress, own_ingress("pinned_phone"));
+        assert!(!peer.has_tee && !peer.has_ws_bridge && !peer.has_playback);
+
+        // The anchor as its snapshot reads it after the unbridge: relaying,
+        // on its own profile and policy.
+        let anchor = LegMedia {
+            profile: "open_caller".to_string(),
+            ingress: own_ingress("open_caller"),
+            ..relaying_leg("cid-pair", "tag-a")
+        };
+        let steps = bridge_media_plan(
+            Some(&anchor),
+            Some(&peer),
+            offer_of(b"v=0\r\n"),
+            "cid-fresh",
+        );
+        assert_eq!(
+            kinds(&steps),
+            vec!["reoffer"],
+            "nothing to tear down on a party with no session of its own"
+        );
+        assert_eq!(offered_profile(&steps), Some("pinned_phone"));
+        assert_eq!(offered_ingress(&steps), Some(own_ingress("open_caller")));
+        assert_eq!(
+            bridge_peer_ingress(None, &anchor, Some(&peer)),
+            own_ingress("pinned_phone")
+        );
+        // Positive control: without it the anchor's profile decides both.
+        let steps = bridge_media_plan(Some(&anchor), None, offer_of(b"v=0\r\n"), "cid-fresh");
+        assert_eq!(offered_profile(&steps), Some("open_caller"));
+        assert_eq!(
+            bridge_peer_ingress(None, &anchor, None),
+            own_ingress("open_caller")
+        );
+    }
+
+    #[test]
+    fn a_session_no_bridge_recorded_sides_on_names_no_bridged_peer() {
+        let plain = MediaSession {
+            bridge_sides: None,
+            ..formed_pair()
+        };
+        assert_eq!(LegMedia::of_bridged_peer(&plain, false), None);
+        let single = MediaSession {
+            to_tag: None,
+            ..formed_pair()
+        };
+        assert_eq!(LegMedia::of_bridged_peer(&single, false), None);
     }
 
     // -----------------------------------------------------------------------
