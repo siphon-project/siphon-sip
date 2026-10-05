@@ -28,6 +28,7 @@
 //! - Foundation for API-driven calls: create a `Leg` without an inbound INVITE.
 
 mod call;
+mod cancel_deferral;
 mod dial_branch;
 mod dialog_watch;
 mod helpers;

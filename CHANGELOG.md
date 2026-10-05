@@ -67,6 +67,19 @@ entry, but a working config keeps working.
   `call.set_caller_id()`) rewrites it with the others, a replaced identity
   (dial or target `from`) drops it, and a restricted call removes it. One a
   controller or script sets explicitly on the B-leg goes out as written.
+- **`@b2bua.on_cancel` runs once, and after `@b2bua.on_invite`, for a call
+  CANCELled early.** Two orderings of a caller's CANCEL left a script's
+  teardown wrong:
+  - The CANCEL arrived while an async `on_invite` was still awaiting (a media
+    offer, a lookup). `on_cancel` could not run, because the call's INVITE was
+    not stored until the handler returned, and whatever the handler then
+    finished setting up was never released: a media session held until the
+    engine's own timeout. `on_cancel` now runs when the handler has returned.
+  - The callee answered siphon's CANCEL with its `487` before siphon had
+    finished ending the call. The `487` was taken for a B-leg failure, so
+    `@b2bua.on_failure` ran beside `on_cancel` and a script releasing media in
+    both released it twice. The legs are now recorded as CANCELled before
+    their CANCELs are sent, and the `487` is acknowledged without a handler.
 
 ## [1.12.0] — 2026-09-30
 

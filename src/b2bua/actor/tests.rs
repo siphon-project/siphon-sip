@@ -1488,6 +1488,72 @@ fn store_create_and_lookup() {
     );
 }
 
+fn stored_invite() -> Arc<Mutex<crate::sip::SipMessage>> {
+    let invite = crate::sip::builder::SipMessageBuilder::new()
+        .request(
+            crate::sip::message::Method::Invite,
+            crate::sip::uri::SipUri::new("example.com".to_string()).with_user("bob".to_string()),
+        )
+        .via("SIP/2.0/UDP 192.0.2.20:5061;branch=z9hG4bK-invite1".to_string())
+        .from("<sip:alice@example.com>;tag=from-tag".to_string())
+        .to("<sip:bob@example.com>".to_string())
+        .call_id("call-1@10.0.0.1".to_string())
+        .cseq("1 INVITE".to_string())
+        .content_length(0)
+        .build()
+        .unwrap();
+    Arc::new(Mutex::new(invite))
+}
+
+/// While `on_invite` runs the call carries a flag a CANCEL can raise, and the
+/// handler's end clears it and stores the INVITE in the same step, so a later
+/// CANCEL finds a call it can run `on_cancel` for itself.
+#[test]
+fn invite_handler_window_opens_and_closes_with_the_handler() {
+    use std::sync::atomic::Ordering;
+    let store = CallActorStore::new();
+    let call_id = store.create_call(make_a_leg());
+
+    let cancelled = store.begin_invite_handler(&call_id).unwrap();
+    assert!(!cancelled.load(Ordering::SeqCst));
+    {
+        let call = store.get_call(&call_id).unwrap();
+        assert!(call.invite_handler_cancelled.is_some());
+        assert!(call.a_leg_invite.is_none());
+    }
+
+    assert!(store.finish_invite_handler(&call_id, stored_invite()));
+    let call = store.get_call(&call_id).unwrap();
+    assert!(call.invite_handler_cancelled.is_none());
+    assert!(call.a_leg_invite.is_some());
+}
+
+/// A CANCEL that lands mid-handler raises the flag and removes the call. The
+/// INVITE path still holds the flag, which is how it learns `on_cancel` is
+/// owed, and finishing the handler reports the call gone.
+#[test]
+fn a_cancel_during_the_invite_handler_is_seen_after_the_call_is_gone() {
+    use std::sync::atomic::Ordering;
+    let store = CallActorStore::new();
+    let call_id = store.create_call(make_a_leg());
+    let cancelled = store.begin_invite_handler(&call_id).unwrap();
+
+    if let Some(flag) = &store.get_call(&call_id).unwrap().invite_handler_cancelled {
+        flag.store(true, Ordering::SeqCst);
+    }
+    store.remove_call(&call_id);
+
+    assert!(cancelled.load(Ordering::SeqCst));
+    assert!(!store.finish_invite_handler(&call_id, stored_invite()));
+}
+
+#[test]
+fn invite_handler_window_needs_a_call() {
+    let store = CallActorStore::new();
+    assert!(store.begin_invite_handler("never-existed").is_none());
+    assert!(!store.finish_invite_handler("never-existed", stored_invite()));
+}
+
 #[test]
 fn store_add_b_leg_and_route() {
     let store = CallActorStore::new();
@@ -2258,6 +2324,32 @@ fn store_replace_b_leg_repoints_registry() {
     // Superseding an unknown call or out-of-range index is a no-op.
     assert!(!store.replace_b_leg("nope", 0, make_b_leg(9)));
     assert!(!store.replace_b_leg(&call_id, 99, make_b_leg(9)));
+}
+
+/// A caller's CANCEL records its B-legs as CANCELled before their CANCELs go
+/// out, so a 487 that beats the call's removal is absorbed instead of being
+/// taken for a B-leg failure. The removal keeps the same legs again, and that
+/// must not undo what the first entry learnt: a 2xx already BYEd stays BYEd.
+#[test]
+fn a_leg_kept_answerable_twice_keeps_its_first_entry() {
+    let store = CallActorStore::new();
+    let call_id = store.create_call(make_a_leg());
+    let mut leg = make_b_leg(0);
+    let branch = leg.branch.clone();
+    leg.b_leg_invite = Some(stored_invite());
+    store.add_b_leg(&call_id, leg.clone());
+
+    assert!(store.keep_answerable([&leg]));
+    assert!(store.is_cancelled_branch(&branch));
+    // The call is still there: this is the window before its removal.
+    assert!(store.get_call(&call_id).is_some());
+
+    let (_, first_2xx) = store.zombie_cancelled_for_2xx(&branch).unwrap();
+    assert!(first_2xx);
+
+    assert!(store.remove_call_after_cancel(&call_id));
+    let (_, first_2xx) = store.zombie_cancelled_for_2xx(&branch).unwrap();
+    assert!(!first_2xx, "the removal must not reset the entry");
 }
 
 #[test]

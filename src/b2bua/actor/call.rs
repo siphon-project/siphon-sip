@@ -269,6 +269,8 @@ pub struct CallActor {
     pub created_at: std::time::Instant,
     /// Original A-leg INVITE message (for script handler reconstruction).
     pub a_leg_invite: Option<Arc<Mutex<SipMessage>>>,
+    /// Set while `@b2bua.on_invite` runs; a CANCEL raises it (`cancel_deferral`).
+    pub invite_handler_cancelled: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// Local (listener) address the A-leg INVITE arrived on. Captured at INVITE
     /// so an imperative `call.answer()` / `call.progress()` sends the UAS
     /// response back out the same listener (source-socket parity with the
@@ -576,6 +578,7 @@ impl CallActor {
             winner: None,
             created_at: std::time::Instant::now(),
             a_leg_invite: None,
+            invite_handler_cancelled: None,
             a_leg_local_addr: None,
             session_timer_override: None,
             transfer: None,
