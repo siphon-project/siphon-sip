@@ -444,7 +444,8 @@ pub fn b2bua_refer_call(sip_call_id: &str, refer_to: crate::sip::headers::refer:
 /// pairing the transfer creates (see `accept_refer(profile=…)` — required when
 /// the call is anchored with a direction-bound profile). Returns `false` (never panics) when no REFER is
 /// pending for this call (already decided, timed out, or the call is gone),
-/// which the adapter maps to `not_found`. Safe from any thread (enters the
+/// which the adapter maps to `not_found`. A REFER still held for a call that
+/// is gone is answered `481` first. Safe from any thread (enters the
 /// dispatcher runtime), mirroring [`b2bua_refer_call`].
 pub fn b2bua_accept_refer_call(
     sip_call_id: &str,
@@ -514,9 +515,17 @@ pub fn b2bua_accept_refer_with_state(
         return false;
     };
     let Some(internal_call_id) = state.call_actors.find_by_sip_call_id(sip_call_id) else {
-        // The call vanished between the REFER and the decision — the referrer's
-        // transaction is gone too. The pending entry is already removed (no leak).
-        warn!(%sip_call_id, "b2bua_accept_refer_call: call gone before accept — dropping pending REFER");
+        // The call ended between the REFER and the decision, by a path that
+        // did not answer what it held. The REFER is still owed an answer (RFC
+        // 3515 §2.4.2), and with the entry taken nothing else would give it.
+        warn!(%sip_call_id, "b2bua_accept_refer_call: call gone before accept — 481");
+        b2bua_refer_send_final(
+            &pending.inbound,
+            &pending.message,
+            481,
+            "Call/Transaction Does Not Exist",
+            state,
+        );
         return false;
     };
     // Decided: from here to its final response a copy of this REFER arriving

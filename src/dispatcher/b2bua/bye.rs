@@ -76,6 +76,9 @@ pub fn handle_b2bua_bye(inbound: InboundMessage, message: SipMessage, state: &Di
         }
     };
 
+    // A REFER of this party's still waiting for its application's decision is
+    // answered before its dialog is over (RFC 3261 §15.1.2).
+    pending_refer_referrer_left(state, &call_id, from_a_leg);
     // A transfer this party asked for and its controller is still carrying out
     // has nobody left to be reported to.
     controller_refer_referrer_left(state, &call_id, from_a_leg);
@@ -156,8 +159,9 @@ pub fn handle_b2bua_bye(inbound: InboundMessage, message: SipMessage, state: &Di
             None => return,
         };
 
-    // What was kept to answer a REFER's retransmissions goes with the call.
-    state.answered_refers.forget_call(&call_id);
+    // A REFER the other party sent, still waiting for a decision, is answered
+    // now: the BYE below ends the dialog it would have been answered in.
+    refers_end_with_call(state, &call_id, &a_leg_call_id);
 
     // A bridged partner loses its other half here — before the StasisEnd, so
     // the controller sees the bridge end before the channel does.

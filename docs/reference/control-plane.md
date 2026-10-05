@@ -913,10 +913,21 @@ The app decides with:
 
 If the app never decides, a decision deadline answers `603 Decline` (the same
 default as when no `@b2bua.on_refer` handler is registered), so a REFER is never
-left pending — the referrer is always answered (RFC 3515 §2.4.2). A bad `mode`
+left pending — the referrer is always answered (RFC 3515 §2.4.2). The deadline
+is `control.limits.handoff_deadline_ms`, or 30 s when that is `0`. A bad `mode`
 answers `bad_request`; a decision for a call with no pending REFER (already
 decided, timed out, or gone) answers `not_found`. A REFER on an **uncontrolled**
 call is unaffected — it still runs the Python `@b2bua.on_refer` path.
+
+A call that ends while its REFER is undecided answers it then, and the
+decision is no longer pending (`accept_refer` / `reject_refer` answer
+`not_found`):
+
+| what ended the call | the REFER is answered |
+|---|---|
+| the referrer's own BYE | `487 Request Terminated`, ahead of the `200` to its BYE (RFC 3261 §15.1.2) |
+| the other party's BYE, `hangup`, or any other teardown | `603 Decline`, ahead of the BYE siphon sends the referrer |
+| nothing siphon noticed, and `accept_refer` then finds the call gone | `481 Call/Transaction Does Not Exist` |
 
 #### A transfer the application carries out
 

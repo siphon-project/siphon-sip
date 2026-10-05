@@ -1,14 +1,19 @@
-//! REFER as a server transaction: answered once.
+//! REFER as a server transaction: answered once, and always answered.
 //!
 //! The B2BUA answers a REFER itself, some time after it arrived: when a script
 //! or a controlling application has decided, or when the far end it was
-//! relayed to has.
+//! relayed to has. Two things follow from that gap.
 //!
 //! A retransmission can arrive after the decision. It is the same request (RFC
 //! 3261 §17.2.3), so it is owed the same final response again (§17.2.2) and
 //! must not be decided on a second time: that would report a second transfer
 //! request, or dial the target twice. What was sent is remembered per call for
 //! the transaction's lifetime, [`AnsweredReferStore`].
+//!
+//! And the call can end before the decision. A REFER held for an application
+//! ([`PendingInboundReferStore`]) is still owed a final response then, and its
+//! entry has to go with the call rather than wait for an accept that may never
+//! come.
 
 use crate::dispatcher::*;
 
@@ -76,7 +81,7 @@ pub enum ReferReplay {
 ///
 /// New per-call state: an entry is forgotten 64*T1 after it was recorded
 /// ([`check_answered_refer_expiry`], on the maintenance tick) and with its
-/// call ([`AnsweredReferStore::forget_call`]), and a call never holds more than
+/// call ([`refers_end_with_call`]), and a call never holds more than
 /// [`ANSWERED_REFERS_PER_CALL`], so the store drains back to baseline under a
 /// completed workload (the classic never-evicted-per-call-entry leak). Covered
 /// by the co-located steady-state leak test
@@ -237,6 +242,66 @@ pub fn remember_refer_response(response: &SipMessage, state: &DispatcherState) {
             .answered_refers
             .answered(&call_id, response, std::time::Instant::now());
     }
+}
+
+/// The status a REFER held for a decision is answered with when its own
+/// sender ends the dialog first: RFC 3261 §15.1.2 has a UAS that receives a
+/// BYE still answer the requests pending in that dialog, and recommends 487.
+const REFERRER_LEFT_STATUS: (u16, &str) = (487, "Request Terminated");
+
+/// The status a REFER held for a decision is answered with when its call ends
+/// under it while the referrer's own dialog is still up: there is no call left
+/// to transfer, so it is declined, as it is when nobody decides in time.
+const CALL_ENDED_STATUS: (u16, &str) = (603, "Decline");
+
+/// The party on one leg of a call hung up: a REFER of its own still held for
+/// its application's decision is answered now, and released.
+///
+/// Before the BYE's own `200`, while the flow the REFER arrived on is the one
+/// thing known about where to answer it. Asked for every BYE, so it stays
+/// cheap when nothing is held.
+pub fn pending_refer_referrer_left(state: &DispatcherState, call_id: &str, from_a_leg: bool) {
+    if state.pending_inbound_refer.is_empty() {
+        return;
+    }
+    let Some(key) = state
+        .call_actors
+        .get_call(call_id)
+        .map(|call| call.a_leg.dialog.call_id.clone())
+    else {
+        return;
+    };
+    if let Some(pending) = state.pending_inbound_refer.take_from_leg(&key, from_a_leg) {
+        let (code, reason) = REFERRER_LEFT_STATUS;
+        info!(
+            call_id = %call_id,
+            referrer_on_a_leg = from_a_leg,
+            "B2BUA REFER: the referrer hung up before its transfer was decided — {code}"
+        );
+        b2bua_refer_send_final(&pending.inbound, &pending.message, code, reason, state);
+    }
+}
+
+/// The call is being torn down: answer the REFER still held for its
+/// application's decision, release it, and forget the REFERs already
+/// answered on it.
+///
+/// `a_leg_sip_call_id` is the Call-ID the call's control channel is bound to,
+/// which is what a held REFER is kept under. Called before the BYEs go out, so
+/// the referrer has its final response ahead of the BYE that ends its dialog.
+pub fn refers_end_with_call(state: &DispatcherState, call_id: &str, a_leg_sip_call_id: &str) {
+    let held = (!state.pending_inbound_refer.is_empty())
+        .then(|| state.pending_inbound_refer.take(a_leg_sip_call_id))
+        .flatten();
+    if let Some(pending) = held {
+        let (code, reason) = CALL_ENDED_STATUS;
+        info!(
+            call_id = %call_id,
+            "B2BUA REFER: the call ended before its transfer was decided — {code}"
+        );
+        b2bua_refer_send_final(&pending.inbound, &pending.message, code, reason, state);
+    }
+    state.answered_refers.forget_call(call_id);
 }
 
 #[cfg(test)]

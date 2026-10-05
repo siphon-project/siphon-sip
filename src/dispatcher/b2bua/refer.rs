@@ -93,6 +93,25 @@ impl PendingInboundReferStore {
         self.entries.remove(sip_call_id).map(|(_, pending)| pending)
     }
 
+    /// Remove + return the call's pending REFER when the party on the given leg
+    /// sent it (that party hanging up). `None` when nothing is pending or the
+    /// other party sent it.
+    pub fn take_from_leg(
+        &self,
+        sip_call_id: &str,
+        from_a_leg: bool,
+    ) -> Option<PendingInboundRefer> {
+        self.entries
+            .remove_if(sip_call_id, |_, pending| pending.from_a_leg == from_a_leg)
+            .map(|(_, pending)| pending)
+    }
+
+    /// Whether nothing is pending on any call: the steady state, which the
+    /// per-BYE and per-teardown lookups check before anything else.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
     /// Drain every entry whose decision deadline has passed; the sweep applies the
     /// 603 default to each drained REFER.
     pub fn take_expired(&self, now: std::time::Instant) -> Vec<PendingInboundRefer> {

@@ -114,6 +114,17 @@ entry, but a working config keeps working.
   rejection, the decision deadline's `603`, or what the far end answered in
   `transparent` mode, where a copy arriving before the far end has answered
   is absorbed. A REFER with a new CSeq is a new request, as before.
+- **A REFER waiting for an application's decision is answered when its call
+  ends.** A REFER on a controlled call is held until `accept_refer` or
+  `reject_refer`. When the call ended first the REFER stayed held and
+  unanswered until the decision deadline, and an `accept_refer` arriving
+  before that removed it without answering it at all. It is now answered as
+  the call ends, and nothing stays held: `487 Request Terminated` when its
+  own sender hangs up (RFC 3261 §15.1.2), `603 Decline` when the other party
+  hangs up or the call is torn down, ahead of the BYE siphon sends the
+  referrer, and `481` from an `accept_refer` that finds the call already
+  gone. The deadline's `603` for an application that never decides is
+  unchanged.
 - **A transfer target given up on at its deadline has its `487` ACKed.** When
   a siphon-terminated transfer or `replace_peer` ran out of time, siphon sent
   the target a CANCEL and forgot the leg at once, so the `487 Request

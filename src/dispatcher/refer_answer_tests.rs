@@ -7,7 +7,8 @@
 //! * a retransmission of a REFER siphon has already decided on gets the final
 //!   response that decision produced, again, and is not shown to anybody as a
 //!   new request (RFC 3261 §17.2.2);
-//! * a REFER with a new CSeq is still a new request.
+//! * a REFER held for an application's decision is answered whatever happens
+//!   to its call in the meantime, and the held entry goes with it.
 
 use super::dialog_state_events_tests::{header, inbound, responds, wire, Sent};
 use super::dialog_state_transfer_tests::{
@@ -98,6 +99,16 @@ impl Controlled {
                 &ReplacementDial::default(),
             )
         })
+    }
+
+    fn callee_hangs_up(&self) {
+        hang_up(
+            &self.call.dispatcher,
+            self.call.b.1,
+            &format!("{};tag=b-tag", header(&self.call.to_b, "To")),
+            &header(&self.call.to_b, "From"),
+            &header(&self.call.to_b, "Call-ID"),
+        );
     }
 
     fn caller_hangs_up(&self) {
@@ -210,8 +221,12 @@ async fn a_refer_retransmitted_after_it_was_accepted_gets_its_202_again() {
     assert_eq!(header(&busy[0].message, "CSeq"), "4 REFER");
     assert!(controlled.events().await.is_empty());
 
-    // The call ends: nothing is left that remembers the REFERs answered.
+    // The call ends: the held REFER is answered, and nothing is left that
+    // remembers any of them.
     controlled.caller_hangs_up();
+    let ended = summaries(&wire(&controlled.call.dispatcher));
+    assert!(ended.contains(&format!("603 {b}")), "{ended:?}");
+    assert_eq!(controlled.state().pending_inbound_refer.len(), 0);
     assert_eq!(controlled.state().call_actors.count(), 0);
     assert_eq!(controlled.state().answered_refers.len(), 0);
 }
@@ -346,4 +361,126 @@ async fn a_scripts_accepted_refer_is_not_carried_out_twice() {
         [format!("202 {}", call.b.1)],
         "answered again, and nobody dialled again"
     );
+}
+
+/// The referrer hangs up while its REFER awaits a decision: the REFER is
+/// answered `487` (RFC 3261 §15.1.2), its BYE `200`, and nothing stays held.
+/// An accept that arrives afterwards finds nothing and sends nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_referrer_that_hangs_up_has_its_pending_refer_answered() {
+    let controlled = controlled(9900);
+    let state = controlled.state();
+    let b = controlled.call.b.1;
+
+    controlled.callee_refers(2);
+    assert_eq!(state.pending_inbound_refer.len(), 1);
+    controlled.callee_hangs_up();
+    let sent = wire(&controlled.call.dispatcher);
+    let terminated = sent
+        .iter()
+        .find(|sent| sent.destination == b && sent.message.status_code() == Some(487))
+        .unwrap_or_else(|| panic!("the REFER is answered: {:?}", summaries(&sent)));
+    assert_eq!(header(&terminated.message, "CSeq"), "2 REFER");
+    assert!(summaries(&sent).contains(&format!("200 {b}")), "the BYE");
+    assert_eq!(state.pending_inbound_refer.len(), 0, "nothing stays held");
+    assert_eq!(state.call_actors.count(), 0);
+
+    assert!(!controlled.accept(ReferMode::Terminate));
+    assert!(wire(&controlled.call.dispatcher).is_empty());
+    assert_eq!(state.answered_refers.len(), 0);
+}
+
+/// The other party hangs up while the REFER awaits a decision. The referrer's
+/// dialog is still up when that happens, so its REFER gets a final response
+/// before its BYE, nobody is dialled, and nothing stays held.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pending_refer_is_declined_when_the_other_party_hangs_up() {
+    let controlled = controlled(9950);
+    let state = controlled.state();
+    let b = controlled.call.b.1;
+
+    controlled.callee_refers(2);
+    controlled.caller_hangs_up();
+    let summary = summaries(&wire(&controlled.call.dispatcher));
+    let declined = summary.iter().position(|line| *line == format!("603 {b}"));
+    let released = summary.iter().position(|line| *line == format!("BYE {b}"));
+    assert!(
+        declined.is_some() && declined < released,
+        "the REFER is answered ahead of the BYE that ends its dialog: {summary:?}"
+    );
+    assert!(
+        !summary.iter().any(|line| line.starts_with("INVITE")),
+        "{summary:?}"
+    );
+    assert_eq!(state.pending_inbound_refer.len(), 0, "nothing stays held");
+
+    assert!(!controlled.accept(ReferMode::Terminate));
+    assert!(wire(&controlled.call.dispatcher).is_empty());
+}
+
+/// A framework teardown (a script's `terminate`, a session timer) ends a call
+/// with a REFER held the same way: answered, and released.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pending_refer_is_declined_when_the_call_is_torn_down() {
+    let controlled = controlled(10000);
+    let state = controlled.state();
+    let b = controlled.call.b.1;
+
+    controlled.callee_refers(2);
+    assert!(tokio::task::block_in_place(|| {
+        b2bua_terminate_call_inner(&controlled.call_id, None, "b2bua", state)
+    }));
+    let summary = summaries(&wire(&controlled.call.dispatcher));
+    let declined = summary.iter().position(|line| *line == format!("603 {b}"));
+    let released = summary.iter().position(|line| *line == format!("BYE {b}"));
+    assert!(declined.is_some() && declined < released, "{summary:?}");
+    assert_eq!(state.pending_inbound_refer.len(), 0);
+}
+
+/// A call that went without passing a teardown that answers its held REFER
+/// still has it answered: by the accept that finds the call gone (`481`), and
+/// otherwise by the decision deadline (`603`). Either way the entry goes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refer_whose_call_is_gone_is_answered_by_the_accept_or_the_deadline() {
+    let controlled = controlled(10050);
+    let state = controlled.state();
+    let b = controlled.call.b.1;
+
+    controlled.callee_refers(2);
+    state.call_actors.remove_call(&controlled.call_id);
+    assert!(!controlled.accept(ReferMode::Terminate));
+    let sent = wire(&controlled.call.dispatcher);
+    assert_eq!(summaries(&sent), [format!("481 {b}")]);
+    assert_eq!(header(&sent[0].message, "CSeq"), "2 REFER");
+    assert_eq!(state.pending_inbound_refer.len(), 0);
+
+    // The application never answers at all.
+    let other = controlled_at_deadline(10100);
+    tokio::task::block_in_place(|| check_pending_inbound_refer_timeouts(other.state()));
+    assert_eq!(
+        summaries(&wire(&other.call.dispatcher)),
+        [format!("603 {}", other.call.b.1)]
+    );
+    assert_eq!(other.state().pending_inbound_refer.len(), 0);
+    assert!(!other.accept(ReferMode::Terminate));
+    assert!(wire(&other.call.dispatcher).is_empty());
+}
+
+/// A controlled call with a REFER held past its decision deadline, the sweep
+/// not yet run.
+fn controlled_at_deadline(prefix: u32) -> Controlled {
+    let controlled = controlled(prefix);
+    controlled.callee_refers(2);
+    // Not due yet: the sweep leaves it alone.
+    tokio::task::block_in_place(|| check_pending_inbound_refer_timeouts(controlled.state()));
+    assert!(wire(&controlled.call.dispatcher).is_empty());
+    assert_eq!(controlled.state().pending_inbound_refer.len(), 1);
+    controlled
+        .state()
+        .pending_inbound_refer
+        .entries
+        .get_mut(&controlled.call.a_call_id)
+        .expect("the held REFER")
+        .deadline = std::time::Instant::now() - std::time::Duration::from_secs(1);
+    controlled
 }

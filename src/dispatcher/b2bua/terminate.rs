@@ -122,8 +122,9 @@ pub fn b2bua_terminate_call_inner(
     // A leg replacement still ringing its targets ends with the call: they are
     // CANCELled (RFC 3261 §9.1) before the call that knows them is removed.
     b2bua_abandon_leg_replacements(internal_call_id, state);
-    // What was kept to answer a REFER's retransmissions goes with the call.
-    state.answered_refers.forget_call(internal_call_id);
+    // And a REFER still waiting for its application's decision is answered,
+    // ahead of the BYE that ends the dialog it arrived in.
+    refers_end_with_call(state, internal_call_id, &sip_call_id);
 
     // Rf ACR-STOP (TS 32.299 §6.2.2). A framework-initiated teardown maps to the
     // Diameter "normal" cause (None → 0); the RFC 3326 Reason on the BYE is
@@ -260,7 +261,7 @@ pub fn b2bua_release_transferred_call(internal_call_id: &str, state: &Dispatcher
 
     b2bua_stop_siprec(internal_call_id, state);
     dial_bridge_call_ended(&sip_call_id, state);
-    state.answered_refers.forget_call(internal_call_id);
+    refers_end_with_call(state, internal_call_id, &sip_call_id);
     control_notify_terminated(&sip_call_id, "transfer_failed");
 
     state
