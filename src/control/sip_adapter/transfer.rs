@@ -1,7 +1,9 @@
-//! Transfer verbs: `refer`, `accept_refer`, `reject_refer` and `replace_peer`.
+//! Transfer verbs: `refer`, `accept_refer`, `reject_refer`, `complete_refer`
+//! and `replace_peer`.
 
 use crate::control::protocol::{ControlErrorCode, ControlResult};
 use crate::control::registry::ChannelRef;
+use crate::control::AdapterCommand;
 
 use super::call::response_args;
 
@@ -357,6 +359,224 @@ pub(super) fn accept_refer(channel: &ChannelRef, args: &serde_json::Value) -> Co
     }
 }
 
+/// The arguments of `accept_refer` that describe the leg a transfer dials.
+const DIAL_ARGUMENTS: [&str; 10] = [
+    "target",
+    "next_hop",
+    "profile",
+    "number_policy",
+    "format",
+    "from",
+    "from_display",
+    "p_asserted_identity",
+    "privacy",
+    "headers",
+];
+
+/// Who carries an accepted transfer out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum AcceptReferMode {
+    /// siphon: it dials the target (`terminate`) or relays the REFER
+    /// (`transparent`), or whichever `b2bua.default_refer_mode` names.
+    Siphon(Option<crate::script::api::call::ReferMode>),
+    /// The application, which reports with `complete_refer`.
+    Controller,
+}
+
+/// Parse `accept_refer`'s `mode`.
+///
+/// `controller` exists on this rail only. A script has no `complete_refer` to
+/// follow it with, so it is not a [`crate::script::api::call::ReferMode`] and
+/// cannot be a configured default.
+pub(super) fn parse_accept_refer_mode(
+    value: Option<&serde_json::Value>,
+) -> Result<AcceptReferMode, String> {
+    match value.and_then(|value| value.as_str()) {
+        Some("controller") => Ok(AcceptReferMode::Controller),
+        _ => parse_refer_mode(value).map(AcceptReferMode::Siphon),
+    }
+}
+
+/// `accept_refer`, as a controller's command reaches it.
+///
+/// `mode: "controller"` is the transfer the application carries out itself —
+/// see [`accept_refer_controller`]. Every other mode is [`accept_refer`], which
+/// has no `timeout` to honour: its transfers end when the target answers or the
+/// far end reports, so a `timeout` named with them is refused rather than
+/// accepted and ignored.
+pub(super) fn accept_refer_command(
+    channel: &ChannelRef,
+    command: &AdapterCommand,
+) -> ControlResult {
+    let args = &command.args;
+    match parse_accept_refer_mode(args.get("mode")) {
+        Ok(AcceptReferMode::Controller) => accept_refer_controller(channel, command),
+        Ok(AcceptReferMode::Siphon(_)) if arg_present(args, "timeout") => ControlResult::error(
+            ControlErrorCode::BadRequest,
+            "accept_refer args.timeout applies to mode \"controller\": it is how long the application has to report with complete_refer",
+        ),
+        // The mode is parsed again there, with everything else the verb takes.
+        _ => accept_refer(channel, args),
+    }
+}
+
+/// Whether an argument is present and not JSON `null`.
+fn arg_present(args: &serde_json::Value, name: &str) -> bool {
+    args.get(name).is_some_and(|value| !value.is_null())
+}
+
+/// `accept_refer {mode: "controller", timeout?}` — accept the pending REFER for
+/// the application to carry out.
+///
+/// siphon answers `202 Accepted`, sends the first sipfrag NOTIFY (`100 Trying`)
+/// and dials nothing. The application moves the parties with its other verbs —
+/// `bridge`, `unbridge`, `replace_peer`, `dial` — and then reports with
+/// `complete_refer`. `timeout` is how many seconds it has (default 60, at most
+/// 180); past it siphon reports a `503` to the referrer itself.
+///
+/// Every argument describing a leg to dial is refused: none is dialled, so one
+/// accepted here would be dropped without a word.
+pub(super) fn accept_refer_controller(
+    channel: &ChannelRef,
+    command: &AdapterCommand,
+) -> ControlResult {
+    let args = &command.args;
+    if let Some(name) = DIAL_ARGUMENTS.iter().find(|name| arg_present(args, name)) {
+        return ControlResult::error_with_details(
+            ControlErrorCode::BadRequest,
+            format!(
+                "accept_refer mode \"controller\" dials no leg, so args.{name} has nothing to apply to: target, next_hop, profile, number_policy, format, from, from_display, p_asserted_identity, privacy and headers belong to mode \"terminate\""
+            ),
+            serde_json::json!({
+                "verb": "accept_refer",
+                "argument": name,
+                "reason": "not_dialled",
+            }),
+        );
+    }
+    let timeout = match args.get("timeout") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(value) => match value.as_u64().map(u32::try_from) {
+            Some(Ok(seconds)) if seconds > 0 => Some(seconds),
+            _ => {
+                return ControlResult::error(
+                    ControlErrorCode::BadRequest,
+                    "accept_refer timeout must be a positive whole number of seconds",
+                )
+            }
+        },
+    };
+
+    let dispatcher = super::dial_bridge::dispatcher_for(&command.origin.app);
+    let (Some(state), Some(runtime)) = (dispatcher.state(), dispatcher.runtime()) else {
+        // As the other modes answer with no B2BUA running: nothing is pending.
+        return controller_refer_refused(
+            "accept_refer",
+            crate::dispatcher::ControllerReferRefusal::NoPendingRefer,
+        );
+    };
+    // The 202 and the NOTIFY may open a connection (TCP/TLS).
+    let _enter = runtime.enter();
+    match crate::dispatcher::b2bua_accept_refer_controller_with_state(
+        state,
+        &channel.sip_call_id,
+        timeout,
+    ) {
+        Ok(timeout) => ControlResult::Ok(serde_json::json!({
+            "channel": channel.channel_id,
+            "transfer": "accepted",
+            "mode": "controller",
+            "timeout": timeout,
+        })),
+        Err(refusal) => controller_refer_refused("accept_refer", refusal),
+    }
+}
+
+/// `complete_refer {code, reason?}` — report how a transfer accepted in mode
+/// `controller` went.
+///
+/// siphon sends the referrer the sipfrag NOTIFY that ends its subscription
+/// (RFC 3515 §2.4.4): `code` is the status in it, a 2xx for a transfer that
+/// succeeded, and `reason` its reason phrase, used as given. Nothing else
+/// happens — the parties are wherever the application's other verbs put them.
+///
+/// Refused `invalid_state` with reason `no_transfer_pending` when the call has
+/// no such transfer open, and `not_found` when the call or the referrer's leg
+/// of it is gone: report before releasing the referrer.
+pub(super) fn complete_refer(channel: &ChannelRef, command: &AdapterCommand) -> ControlResult {
+    let args = &command.args;
+    let code = match args.get("code").and_then(|value| value.as_u64()) {
+        Some(code) if (200..=699).contains(&code) => code as u16,
+        _ => {
+            return ControlResult::error(
+                ControlErrorCode::BadRequest,
+                "complete_refer requires args.code, the final status of the transfer (200-699): a 2xx reports it succeeded",
+            )
+        }
+    };
+    let reason = match args.get("reason") {
+        None | Some(serde_json::Value::Null) => None,
+        // It becomes the Status-Line of a sipfrag, so it stays on one line.
+        Some(serde_json::Value::String(reason))
+            if !reason.trim().is_empty() && !reason.chars().any(char::is_control) =>
+        {
+            Some(reason.trim())
+        }
+        Some(_) => {
+            return ControlResult::error(
+                ControlErrorCode::BadRequest,
+                "complete_refer reason must be a non-empty reason phrase on one line",
+            )
+        }
+    };
+
+    let dispatcher = super::dial_bridge::dispatcher_for(&command.origin.app);
+    let (Some(state), Some(runtime)) = (dispatcher.state(), dispatcher.runtime()) else {
+        return ControlResult::error(
+            ControlErrorCode::Unavailable,
+            "b2bua is not running — no transfer to report on",
+        );
+    };
+    // The NOTIFY may open a connection (TCP/TLS).
+    let _enter = runtime.enter();
+    match crate::dispatcher::b2bua_complete_refer_with_state(
+        state,
+        &channel.sip_call_id,
+        code,
+        reason,
+    ) {
+        Ok(()) => ControlResult::Ok(serde_json::json!({
+            "channel": channel.channel_id,
+            "transfer": "completed",
+            "code": code,
+        })),
+        Err(refusal) => controller_refer_refused("complete_refer", refusal),
+    }
+}
+
+/// The reply for a controller-carried transfer that was not accepted or not
+/// reported: `not_found` when there is nothing to act on any more, otherwise
+/// `invalid_state`, and always naming why.
+pub(super) fn controller_refer_refused(
+    verb: &str,
+    refusal: crate::dispatcher::ControllerReferRefusal,
+) -> ControlResult {
+    use crate::dispatcher::ControllerReferRefusal;
+    let code = match refusal {
+        ControllerReferRefusal::NoPendingRefer
+        | ControllerReferRefusal::Gone
+        | ControllerReferRefusal::ReferrerGone => ControlErrorCode::NotFound,
+        ControllerReferRefusal::TransferOpen | ControllerReferRefusal::NoTransferPending => {
+            ControlErrorCode::InvalidState
+        }
+    };
+    ControlResult::error_with_details(
+        code,
+        refusal.to_string(),
+        serde_json::json!({ "verb": verb, "reason": refusal.reason() }),
+    )
+}
+
 /// `reject_refer` — decline a *controlled* call's pending inbound REFER with a
 /// final non-2xx (default `603 Decline`). No pending REFER → `not_found`.
 pub(super) fn reject_refer(channel: &ChannelRef, args: &serde_json::Value) -> ControlResult {
@@ -393,7 +613,10 @@ pub(super) fn parse_refer_mode(
         Some(value) => match value.as_str() {
             Some("terminate") => Ok(Some(ReferMode::Terminate)),
             Some("transparent") => Ok(Some(ReferMode::Transparent)),
-            _ => Err("accept_refer args.mode must be \"terminate\" or \"transparent\"".to_string()),
+            _ => Err(
+                "accept_refer args.mode must be \"terminate\", \"transparent\" or \"controller\""
+                    .to_string(),
+            ),
         },
     }
 }

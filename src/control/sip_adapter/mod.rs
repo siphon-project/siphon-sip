@@ -36,7 +36,7 @@ use originate::originate;
 #[cfg(test)]
 pub(crate) use originate::staged;
 use routing::{cancel_dial, dial, route_unless_dialling};
-use transfer::{accept_refer, refer, reject_refer, replace_peer};
+use transfer::{accept_refer_command, complete_refer, refer, reject_refer, replace_peer};
 
 /// The SIP adapter (`module() == "sip"`).
 #[derive(Debug, Default)]
@@ -97,8 +97,9 @@ impl ControlAdapter for SipControlAdapter {
                 verb("hangup", "BYE an answered call, or reject an unanswered one (args: reason)"),
                 verb("drop", "Abandon an unanswered call with NOTHING on the wire — no final response, no CANCEL (the 100 Trying siphon sent when the INVITE arrived has already gone) — and release it, so an unsolicited INVITE costs a scanner silence instead of a 404 that confirms the number it probed (args: reason, ban). Refused on an answered call, whose dialog is owed a BYE (RFC 3261 §15) — that is hangup. The reason reaches the log and the CDR, which records disconnect_initiator=control with no response code. With ban=true the caller's source is also scored in the auto-ban store (needs security.failed_auth_ban; strong weight over a stream transport, weight 1 over UDP where the source can be forged; trusted_cidrs never), so a source that keeps sending unwanted calls is banned"),
                 verb("refer", "Send an in-dialog REFER on the A-leg; the reply reports only that it was sent, the far end's verdict arrives as TransferProgress then TransferCompleted / TransferFailed (args: to, replaces)"),
-                verb("accept_refer", "Accept a pending inbound REFER (from a TransferRequested event) and run the transfer (args: target, next_hop, mode, profile, number_policy, format, from, from_display, p_asserted_identity, privacy, headers). target is a URI string, {uri} or {aor}: an AoR is dialled over the flow its phone registered on and through the Path of its binding, the only way to reach one on TCP, TLS or WSS; nobody registered is not_found, several registered contacts are invalid_state with reason several_contacts, since a transfer rings one target. The identity arguments are the ones dial takes and shape the leg the transfer dials. They and {aor} apply to mode terminate; transparent relays the REFER, dials nothing and refuses them"),
+                verb("accept_refer", "Accept a pending inbound REFER (from a TransferRequested event) and run the transfer (args: target, next_hop, mode, timeout, profile, number_policy, format, from, from_display, p_asserted_identity, privacy, headers). mode is terminate (siphon dials the target), transparent (siphon relays the REFER) or controller: siphon answers 202, sends the first sipfrag NOTIFY (100 Trying) and dials nothing, and this app carries the transfer out with its other verbs, then reports with complete_refer within timeout seconds (default 60, at most 180), past which siphon reports 503 to the referrer itself; a further REFER on the call is answered 491 until then. controller takes timeout only and refuses every argument that describes a leg to dial; the other modes refuse timeout. target is a URI string, {uri} or {aor}: an AoR is dialled over the flow its phone registered on and through the Path of its binding, the only way to reach one on TCP, TLS or WSS; nobody registered is not_found, several registered contacts are invalid_state with reason several_contacts, since a transfer rings one target. The identity arguments are the ones dial takes and shape the leg the transfer dials. They and {aor} apply to mode terminate; transparent relays the REFER, dials nothing and refuses them"),
                 verb("reject_refer", "Reject a pending inbound REFER with a final non-2xx (args: code, reason)"),
+                verb("complete_refer", "Report how a transfer accepted with accept_refer mode controller went: siphon sends the referrer the sipfrag NOTIFY that ends its subscription, with this status (a 2xx says the transfer succeeded) and reason phrase, and touches nothing else (args: code 200-699, reason). Report before releasing the referrer's leg, since the NOTIFY travels on its dialog: afterwards the answer is not_found. Refused invalid_state with reason no_transfer_pending when no such transfer is open on the call — already reported, past its deadline, or its referrer hung up"),
                 verb("replace_peer", "Replace one leg of this answered call with a freshly dialed target, with no REFER involved: the replaced leg stays up while the target rings and is BYE'd only once it answers. The reply says the INVITE is on the wire, PeerReplaced says the new party is bridged and the old one released (args: target, next_hop, replace_a_leg, profile, number_policy, format, timeout, from, from_display, p_asserted_identity, privacy, headers). target is a URI string, {uri} or {aor}, and the identity arguments shape the new leg, both as for accept_refer"),
                 verb("bridge", "Join this channel to another the app owns, so the two parties hear each other; the reply says the media was re-pointed and the first re-INVITE is on the wire, ChannelBridged says the audio meets (args: with, on_peer_hangup)"),
                 verb("unbridge", "Break a bridge — both legs stay answered, owned and held; the reply says the hold offers went out, ChannelUnbridged on each leg says it is parted and safe to bridge again (args: reason)"),
@@ -271,6 +272,7 @@ fn is_sip_verb(verb: &str) -> bool {
             | "refer"
             | "accept_refer"
             | "reject_refer"
+            | "complete_refer"
             | "replace_peer"
             | "route"
             | "dial"
@@ -319,8 +321,9 @@ fn apply_sip(command: AdapterCommand) -> ControlResult {
         "hangup" => hangup(&channel, &command.args),
         "drop" => drop_call(&channel, &command.args),
         "refer" => refer(&channel, &command.args),
-        "accept_refer" => accept_refer(&channel, &command.args),
+        "accept_refer" => accept_refer_command(&channel, &command),
         "reject_refer" => reject_refer(&channel, &command.args),
+        "complete_refer" => complete_refer(&channel, &command),
         "replace_peer" => replace_peer(&channel, &command.args),
         "route" => route_unless_dialling(&channel, &command),
         "dial" => dial(&channel, &command),

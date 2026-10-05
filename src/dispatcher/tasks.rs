@@ -128,6 +128,7 @@ pub fn spawn_timer_sweep(state: &Arc<DispatcherState>) {
                         check_b2bua_max_call_durations(&state);
                         check_b2bua_replacement_timeouts(&state);
                         check_pending_inbound_refer_timeouts(&state);
+                        check_controller_refer_timeouts(&state);
                         check_orphaned_ro_sessions(&state);
                         check_deferred_referrer_byes(&state);
                     }

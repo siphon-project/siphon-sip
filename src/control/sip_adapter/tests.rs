@@ -11,8 +11,9 @@ use super::originate::{
 };
 use super::routing::{dial_error, parse_dial_target, parse_route_target, route};
 use super::transfer::{
-    accept_refer, parse_refer_mode, parse_replaces_arg, parse_transfer_dial, refer, reject_refer,
-    replace_error, replace_peer,
+    accept_refer, controller_refer_refused, parse_accept_refer_mode, parse_refer_mode,
+    parse_replaces_arg, parse_transfer_dial, refer, reject_refer, replace_error, replace_peer,
+    AcceptReferMode,
 };
 use super::*;
 use crate::control::registry::ControlBus;
@@ -1570,6 +1571,7 @@ fn every_dispatchable_verb_is_advertised() {
         "refer",
         "accept_refer",
         "reject_refer",
+        "complete_refer",
         "replace_peer",
         "route",
         "dial",
@@ -3138,4 +3140,102 @@ async fn stream_start_bridge_with_a_null_profile_is_no_profile() {
             ..
         }
     ));
+}
+
+#[test]
+fn accept_refer_mode_controller_is_this_rails_own() {
+    use crate::script::api::call::ReferMode;
+    assert_eq!(
+        parse_accept_refer_mode(Some(&serde_json::json!("controller"))),
+        Ok(AcceptReferMode::Controller)
+    );
+    // The modes siphon carries out are the script rail's, parsed as before.
+    assert_eq!(
+        parse_accept_refer_mode(None),
+        Ok(AcceptReferMode::Siphon(None))
+    );
+    assert_eq!(
+        parse_accept_refer_mode(Some(&serde_json::json!("terminate"))),
+        Ok(AcceptReferMode::Siphon(Some(ReferMode::Terminate)))
+    );
+    assert!(parse_accept_refer_mode(Some(&serde_json::json!("sideways"))).is_err());
+    // It is not a mode a script or the configured default can name.
+    assert!(parse_refer_mode(Some(&serde_json::json!("controller"))).is_err());
+}
+
+#[test]
+fn a_controller_transfer_with_no_b2bua_running_is_answered_not_left_hanging() {
+    // No dispatcher in a unit context. Accepting finds nothing pending, as the
+    // other modes do; reporting says the B2BUA is not there to report through.
+    let result = sip_command("accept_refer", serde_json::json!({ "mode": "controller" }));
+    assert!(matches!(
+        result,
+        ControlResult::Error {
+            code: ControlErrorCode::NotFound,
+            ..
+        }
+    ));
+    let result = sip_command("complete_refer", serde_json::json!({ "code": 200 }));
+    assert!(matches!(
+        result,
+        ControlResult::Error {
+            code: ControlErrorCode::Unavailable,
+            ..
+        }
+    ));
+    // Arguments are judged before the rail is reached.
+    let result = sip_command("complete_refer", serde_json::json!({}));
+    assert!(bad_request_message(&result).contains("code"));
+    let result = sip_command(
+        "accept_refer",
+        serde_json::json!({ "mode": "controller", "target": "sip:c@example.com" }),
+    );
+    assert!(bad_request_message(&result).contains("dials no leg"));
+    let result = sip_command("accept_refer", serde_json::json!({ "timeout": 30 }));
+    assert!(bad_request_message(&result).contains("controller"));
+}
+
+#[test]
+fn a_refused_controller_transfer_names_its_verb_and_reason() {
+    use crate::dispatcher::ControllerReferRefusal;
+    for (refusal, code, reason) in [
+        (
+            ControllerReferRefusal::NoPendingRefer,
+            ControlErrorCode::NotFound,
+            "no_pending_refer",
+        ),
+        (
+            ControllerReferRefusal::Gone,
+            ControlErrorCode::NotFound,
+            "call_gone",
+        ),
+        (
+            ControllerReferRefusal::ReferrerGone,
+            ControlErrorCode::NotFound,
+            "referrer_gone",
+        ),
+        (
+            ControllerReferRefusal::TransferOpen,
+            ControlErrorCode::InvalidState,
+            "transfer_in_progress",
+        ),
+        (
+            ControllerReferRefusal::NoTransferPending,
+            ControlErrorCode::InvalidState,
+            "no_transfer_pending",
+        ),
+    ] {
+        let ControlResult::Error {
+            code: answered,
+            details,
+            ..
+        } = controller_refer_refused("complete_refer", refusal)
+        else {
+            panic!("a refusal is an error");
+        };
+        assert_eq!(answered, code, "{refusal:?}");
+        let details = details.expect("a refusal carries details");
+        assert_eq!(details["verb"], "complete_refer");
+        assert_eq!(details["reason"], reason);
+    }
 }

@@ -301,6 +301,186 @@ pub fn b2bua_refer_send_final(
     );
 }
 
+/// The `id` of the subscription a REFER creates: its CSeq number (RFC 3515
+/// §2.4.6).
+pub fn refer_subscription_id(message: &SipMessage) -> u32 {
+    message
+        .headers
+        .get("CSeq")
+        .and_then(|value| value.split_whitespace().next())
+        .and_then(|number| number.parse::<u32>().ok())
+        .unwrap_or(1)
+}
+
+/// The `202 Accepted` to a REFER from the leg `origin_leg`.
+///
+/// A REFER creates a subscription, so its 2xx is dialog-forming and `Contact`
+/// is mandatory in it — RFC 3515 §2.2 marks Contact `m` for both REFER and its
+/// 2xx ("REFER creates a dialog, and MAY be Record-Routed, hence MUST contain a
+/// single Contact header field value"). `build_response` copies only the
+/// mandatory *echo* headers, which is right for a plain response and one header
+/// short for this one. It is the leg's own local contact, the same value the
+/// NOTIFYs carry, so the referrer sees one target for the whole subscription.
+pub fn build_refer_accepted(
+    message: &SipMessage,
+    origin_leg: Option<&Leg>,
+    state: &DispatcherState,
+) -> SipMessage {
+    let mut accepted = build_response(
+        message,
+        202,
+        "Accepted",
+        state.server_header.as_deref(),
+        &[],
+    );
+    if let Some(contact) = origin_leg.and_then(|leg| leg.dialog.local_contact.clone()) {
+        if !accepted.headers.has("Contact") {
+            accepted.headers.set("Contact", contact);
+        }
+    }
+    advertise_supported_options(&mut accepted.headers);
+    accepted
+}
+
+/// Answer a REFER `202 Accepted` on the flow it arrived on and follow it with
+/// the first NOTIFY (sipfrag `100 Trying`), which opens the implicit
+/// subscription for `expires` seconds. Returns whether the NOTIFY was built —
+/// it is not when the referrer's leg is no longer on the call.
+///
+/// RFC 3515 §2.4.4 orders these: the 202 is what tells the referrer the
+/// subscription exists, so a NOTIFY that overtakes it can be rejected as being
+/// for an unknown subscription. They are enqueued as one ordered unit because
+/// two separate sends do NOT order on UDP — the workers share the outbound
+/// channel and each owns its own SO_REUSEPORT socket, so the NOTIFY could and
+/// did win the race.
+pub fn send_refer_accepted(
+    inbound: &InboundMessage,
+    message: &SipMessage,
+    call_id: &str,
+    from_a_leg: bool,
+    refer_cseq: u32,
+    expires: u32,
+    state: &DispatcherState,
+) -> bool {
+    let notify_cseq = state.call_actors.reserve_leg_cseq(call_id, from_a_leg);
+    let origin_leg = state.call_actors.clone_leg(call_id, from_a_leg);
+    let mut ordered = vec![build_refer_accepted(message, origin_leg.as_ref(), state)];
+
+    if let (Some(cseq), Some(leg)) = (notify_cseq, origin_leg) {
+        let extra_headers = [
+            (
+                "Event",
+                crate::b2bua::transfer::refer_event_header(refer_cseq),
+            ),
+            (
+                "Subscription-State",
+                crate::b2bua::transfer::subscription_state_header(
+                    &crate::b2bua::transfer::TransferState::Trying,
+                    expires,
+                ),
+            ),
+        ];
+        if let Some(notify) = build_b2bua_in_dialog_request(
+            &leg,
+            state,
+            Method::Notify,
+            cseq,
+            &extra_headers,
+            Some((
+                "message/sipfrag",
+                crate::b2bua::transfer::build_sipfrag_body(100, "Trying").into_bytes(),
+            )),
+        ) {
+            ordered.push(notify);
+        }
+    }
+    let notified = ordered.len() > 1;
+
+    send_messages_in_order_from(
+        ordered,
+        inbound.transport,
+        inbound.remote_addr,
+        inbound.connection_id,
+        Some(inbound.local_addr),
+        state,
+    );
+    notified
+}
+
+/// A NOTIFY for a REFER subscription, with the flow it goes out on: the
+/// referrer's dialog route, not the flow the REFER arrived on, which a later
+/// NOTIFY has no claim to.
+pub struct ReferNotify {
+    pub message: SipMessage,
+    pub transport: Transport,
+    pub destination: SocketAddr,
+    pub connection_id: ConnectionId,
+    pub local_addr: Option<SocketAddr>,
+}
+
+/// Build the NOTIFY that ends a REFER subscription: a sipfrag of `code` and
+/// `reason` with `Subscription-State: terminated` (RFC 3515 §2.4.4), on the
+/// referrer's leg of the call.
+///
+/// `None` when the call or that leg is gone: there is no dialog left to send it
+/// in. Only builds — what else ending the subscription takes (releasing the
+/// referrer, clearing the record of it) is the caller's.
+pub fn build_refer_final_notify(
+    call_id: &str,
+    referrer_on_a_leg: bool,
+    event_id: u32,
+    code: u16,
+    reason: &str,
+    state: &DispatcherState,
+) -> Option<ReferNotify> {
+    let cseq = state
+        .call_actors
+        .reserve_leg_cseq(call_id, referrer_on_a_leg)?;
+    let referrer_leg = state.call_actors.clone_leg(call_id, referrer_on_a_leg)?;
+    let outcome = if (200..300).contains(&code) {
+        crate::b2bua::transfer::TransferState::Succeeded
+    } else {
+        crate::b2bua::transfer::TransferState::Failed {
+            code,
+            reason: reason.to_string(),
+        }
+    };
+    let extra_headers = [
+        (
+            "Event",
+            crate::b2bua::transfer::refer_event_header(event_id),
+        ),
+        (
+            "Subscription-State",
+            crate::b2bua::transfer::subscription_state_header(&outcome, 0),
+        ),
+    ];
+    let message = build_b2bua_in_dialog_request(
+        &referrer_leg,
+        state,
+        Method::Notify,
+        cseq,
+        &extra_headers,
+        Some((
+            "message/sipfrag",
+            crate::b2bua::transfer::build_sipfrag_body(code, reason).into_bytes(),
+        )),
+    )?;
+    let (destination, transport) = resolve_in_dialog_destination(
+        &referrer_leg.dialog.route_set,
+        state,
+        referrer_leg.transport.remote_addr,
+        referrer_leg.transport.transport,
+    );
+    Some(ReferNotify {
+        message,
+        transport,
+        destination,
+        connection_id: referrer_leg.transport.connection_id,
+        local_addr: referrer_leg.transport.local_addr,
+    })
+}
+
 /// The window a controlled call's inbound REFER waits for an `accept_refer` /
 /// `reject_refer` decision before the sweep applies the 603 default.
 ///
@@ -431,9 +611,10 @@ pub fn hosted_dialog(
 ///
 /// `None` when the REFER was taken: held and reported as `TransferRequested`,
 /// absorbed as a retransmission, or answered `491 Request Pending` because
-/// another REFER on the same call is still awaiting its decision (RFC 3261
-/// §21.4.27 — the request is not dropped, and the referrer may try again). The
-/// request is handed back when no app controls the call.
+/// another REFER on the same call is still awaiting its decision or its
+/// application's report (RFC 3261 §21.4.27 — the request is not dropped, and
+/// the referrer may try again). The request is handed back when no app controls
+/// the call.
 pub fn hold_controlled_refer(
     bus: &crate::control::ControlBus,
     inbound: InboundMessage,
@@ -449,6 +630,9 @@ pub fn hold_controlled_refer(
     else {
         return Some((inbound, message));
     };
+    if answer_refer_during_controller_transfer(&inbound, &message, referrer, state) {
+        return None;
+    }
     let held = state.pending_inbound_refer.hold(
         &channel_call_id,
         PendingInboundRefer {

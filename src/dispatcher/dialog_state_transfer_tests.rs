@@ -138,7 +138,7 @@ fn response_to_phone(sent: &[Sent], address: &str, status_code: u16) -> SipMessa
 
 /// A request from `source` in a dialog, handed to [`handle_b2bua_bye`] or
 /// [`handle_b2bua_refer`] the way the dispatcher's B2BUA gate hands it over.
-fn in_dialog(
+pub(super) fn in_dialog(
     method: &str,
     source: &str,
     from: &str,
@@ -174,7 +174,13 @@ fn in_dialog(
     (raw, message)
 }
 
-fn hang_up(dispatcher: &TestDispatcher, source: &str, from: &str, to: &str, call_id: &str) {
+pub(super) fn hang_up(
+    dispatcher: &TestDispatcher,
+    source: &str,
+    from: &str,
+    to: &str,
+    call_id: &str,
+) {
     let (raw, message) = in_dialog("BYE", source, from, to, call_id, 9, "");
     tokio::task::block_in_place(|| {
         handle_b2bua_bye(inbound(source, &raw), message, &dispatcher.state)
@@ -183,20 +189,20 @@ fn hang_up(dispatcher: &TestDispatcher, source: &str, from: &str, to: &str, call
 
 /// Registered phones A, B and C, and a call A → B through the B2BUA,
 /// answered.
-struct Established {
-    dispatcher: TestDispatcher,
-    a: (&'static str, &'static str),
-    b: (&'static str, &'static str),
-    c: (&'static str, &'static str),
+pub(super) struct Established {
+    pub(super) dispatcher: TestDispatcher,
+    pub(super) a: (&'static str, &'static str),
+    pub(super) b: (&'static str, &'static str),
+    pub(super) c: (&'static str, &'static str),
     /// The caller's Call-ID.
-    a_call_id: String,
+    pub(super) a_call_id: String,
     /// The INVITE siphon sent B.
-    to_b: SipMessage,
+    pub(super) to_b: SipMessage,
     /// The 200 siphon relayed to A.
-    answer_to_a: SipMessage,
+    pub(super) answer_to_a: SipMessage,
 }
 
-fn establish(prefix: u32, refer_mode: &str) -> Established {
+pub(super) fn establish(prefix: u32, refer_mode: &str) -> Established {
     let aor =
         |n: u32| -> &'static str { Box::leak(format!("sip:{n}@example.com").into_boxed_str()) };
     let a = (
@@ -281,7 +287,7 @@ fn establish(prefix: u32, refer_mode: &str) -> Established {
 }
 
 impl Established {
-    fn call_id(&self) -> String {
+    pub(super) fn call_id(&self) -> String {
         internal(&self.dispatcher, &self.a_call_id)
     }
 
@@ -293,7 +299,7 @@ impl Established {
             .to_string()
     }
 
-    fn c_uri(&self) -> String {
+    pub(super) fn c_uri(&self) -> String {
         format!("sip:{}@{}", Self::user(self.c.0), self.c.1)
     }
 
@@ -515,7 +521,7 @@ async fn a_replaces_takeover_reports_the_new_party_and_ends_the_replaced() {
 }
 
 /// A control plane of the test's own, with one connected application.
-fn control_plane(
+pub(super) fn control_plane(
     app: &str,
 ) -> (
     Arc<crate::control::ControlBus>,
@@ -560,7 +566,7 @@ async fn queued(connection: &crate::control::ConnHandle) -> Vec<crate::control::
     events
 }
 
-fn parsed_refer_to(message: &SipMessage) -> crate::sip::headers::refer::ReferTo {
+pub(super) fn parsed_refer_to(message: &SipMessage) -> crate::sip::headers::refer::ReferTo {
     crate::sip::headers::refer::parse_refer_to(&header(message, "Refer-To"))
         .expect("the Refer-To parses")
 }
