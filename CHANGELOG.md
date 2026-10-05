@@ -169,8 +169,20 @@ entry, but a working config keeps working.
   other branches of a forked request that is not an INVITE are no longer sent
   a CANCEL when one answers (§9.1: a CANCEL is for an INVITE). A 2xx from a
   branch the proxy has given up on is the next entry's. **BREAKING (Rust
-  library):** `transaction::state::Action` gains a
-  `SendCancel` variant, which an exhaustive `match` on it has to handle.
+  library):** `transaction::state::Action` gains a `SendCancel` variant.
+  Migration: an exhaustive `match` on `Action` needs an arm for it, which
+  sends `cancel.frame` to `cancel.hop` (its destination, transport and
+  connection, from its `source_local_addr`), as the arm for
+  `Action::SendFrame` sends a retransmission. An embedder that creates INVITE
+  client transactions itself records where each INVITE went with
+  `TransactionManager::set_client_hop`; without it a CANCEL has nowhere to go
+  and `cancel_invite_client` reports `CancelOutcome::Unbuildable`. The
+  entries below add, to the same enums' exhaustive matches,
+  `proxy::fork::ForkAction::ForwardAnother2xx` (forward the response, cancel
+  nothing), `TimerName::C` and `IctEvent::TimerC` (feed the event to the
+  transaction when the timer fires, like Timer B), and to `TimerConfig` the
+  field `timer_c_secs` (a struct literal takes it, or
+  `..TimerConfig::default()`).
 - **The proxy forwards every 2xx to an INVITE, also after the request's
   final response.** RFC 3261 §16.7 step 5: "After a final response has been
   sent on the server transaction, the following responses MUST be forwarded
