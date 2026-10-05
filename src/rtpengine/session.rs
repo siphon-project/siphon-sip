@@ -325,7 +325,13 @@ pub struct MediaSessionStore {
     /// call not simply named by its own SIP Call-ID. See
     /// [`MediaSessionStore::summary_parties`].
     parties: std::sync::Arc<DashMap<String, EngineParties>>,
+    /// What a bridge shaped and pinned a party with, for each call whose own
+    /// session a bridge retired. See [`own_media`].
+    own_media: DashMap<String, own_media::Recorded>,
 }
+
+mod own_media;
+pub use own_media::OwnMedia;
 
 /// The SIP Call-IDs an engine call carries media for, and until when they are
 /// kept once no stored session is on it.
@@ -351,6 +357,7 @@ impl MediaSessionStore {
         Self {
             sessions: DashMap::new(),
             parties: Default::default(),
+            own_media: DashMap::new(),
         }
     }
 
@@ -561,7 +568,18 @@ impl MediaSessionStore {
     }
 
     /// Remove a session by Call-ID. Returns the removed session, if any.
+    ///
+    /// This is what a call's teardown does, whether or not the call still has
+    /// a session of its own, so it also drops what a bridge recorded for the
+    /// call when it retired that session ([`own_media`]).
     pub fn remove(&self, call_id: &str) -> Option<MediaSession> {
+        self.forget_own_media(call_id);
+        self.take_session(call_id)
+    }
+
+    /// Take the session stored under `call_id` out of the store and release
+    /// the parties of its engine call.
+    fn take_session(&self, call_id: &str) -> Option<MediaSession> {
         let (_, session) = self.sessions.remove(call_id)?;
         self.release_parties(session.rtpengine_id());
         Some(session)
@@ -633,6 +651,7 @@ impl MediaSessionStore {
         for engine_call_id in swept {
             self.release_parties(&engine_call_id);
         }
+        self.sweep_own_media(cutoff);
     }
 
     /// The engine-side call-ids of every session siphon currently holds.

@@ -98,6 +98,8 @@ mod bridged_pair_media_events_tests;
 #[cfg(test)]
 mod carrier_attribution_tests;
 #[cfg(test)]
+mod control_bridge_elsewhere_tests;
+#[cfg(test)]
 mod control_bridge_ingress_tests;
 #[cfg(test)]
 mod control_bridge_media_tests;
