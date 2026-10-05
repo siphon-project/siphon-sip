@@ -771,6 +771,28 @@ pub(super) fn handle_cancel_via_session(
         state,
     );
 
+    // RFC 3261 §9.2: "the CANCEL request has no effect on the processing of
+    // the original request" once that has its final response, and an INVITE
+    // server transaction sends one final response (§17.2.1). The INVITE was
+    // already rejected from the reply path, or already answered by a fork
+    // branch, while this session lingers for the branches still to end: the
+    // CANCEL has its 200, and nothing follows it, least of all a 487.
+    let already_answered = session.final_response_sent
+        || session
+            .fork_aggregator
+            .as_ref()
+            .is_some_and(|aggregator| match aggregator.lock() {
+                Ok(aggregator) => aggregator.has_settled(),
+                Err(_) => false,
+            });
+    if already_answered {
+        debug!(
+            server_key = %invite_server_key,
+            "CANCEL for an INVITE that already has its final response — answered 200, no effect (RFC 3261 §9.2)"
+        );
+        return;
+    }
+
     // Forward CANCEL to each client branch still pending
     let reasons = message
         .headers

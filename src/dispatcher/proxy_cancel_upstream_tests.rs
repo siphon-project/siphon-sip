@@ -11,8 +11,8 @@
 //! read off the UDP egress.
 
 use super::proxy_cancel_awaits_provisional_tests::{
-    answers, call, caller_cancels, fire, relaying_proxy, requests_to, responses_to_caller, CALLER,
-    RINGING,
+    answers, call, caller_cancels, cancels_to, fire, forking_proxy, relaying_proxy, requests_to,
+    responses_to_caller, the_cancel, CALLER, DECIDING, REJECT_ON_183, RINGING, SILENT,
 };
 use super::proxy_dialog_state_tests::{find, header};
 use super::*;
@@ -88,5 +88,60 @@ async fn the_487_of_a_cancelled_invite_is_the_server_transactions_final_response
     assert!(
         !proxy.state.transaction_manager.contains(&server_key),
         "the INVITE's server transaction is over"
+    );
+}
+
+/// RFC 3261 §9.2: a CANCEL for an INVITE that already has its final response
+/// "has no effect on the processing of the original request". It is answered
+/// `200`, and the INVITE, which has had its one final response, gets no `487`
+/// after it. Whether that final response was the script's own
+/// (`reply.reject()`) or a fork branch's answer.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cancel_after_the_final_response_is_answered_and_changes_nothing() {
+    // Rejected from the reply path.
+    let proxy = forking_proxy(&[RINGING, SILENT], "parallel", REJECT_ON_183);
+    let (raw, invites) = call(&proxy, "cancel-after-reject@example.com");
+    let to_ringing = find(&invites, RINGING).clone();
+    answers(&proxy, RINGING, &to_ringing, 183, "Session Progress");
+    let sent = proxy.wire();
+    assert_eq!(responses_to_caller(&sent), [503]);
+    the_cancel(&sent, RINGING, &to_ringing);
+
+    caller_cancels(&proxy, &raw);
+    let sent = proxy.wire();
+    assert_eq!(
+        responses_to_caller(&sent),
+        [200],
+        "the CANCEL's 200, and no 487 behind the 503"
+    );
+    assert!(cancels_to(&sent, RINGING).is_empty());
+    assert!(cancels_to(&sent, SILENT).is_empty());
+
+    // Answered by a fork branch, with another branch still to end.
+    let proxy = forking_proxy(&[DECIDING, RINGING], "parallel", "");
+    let (raw, invites) = call(&proxy, "cancel-after-answer@example.com");
+    let (to_deciding, to_ringing) = (
+        find(&invites, DECIDING).clone(),
+        find(&invites, RINGING).clone(),
+    );
+    answers(&proxy, RINGING, &to_ringing, 180, "Ringing");
+    answers(&proxy, DECIDING, &to_deciding, 200, "OK");
+    let sent = proxy.wire();
+    assert!(responses_to_caller(&sent).contains(&200));
+    the_cancel(&sent, RINGING, &to_ringing);
+    let sessions = proxy.state.session_store.client_key_count();
+
+    caller_cancels(&proxy, &raw);
+    let sent = proxy.wire();
+    assert_eq!(
+        responses_to_caller(&sent),
+        [200],
+        "the CANCEL's 200, and no 487 behind the answer"
+    );
+    assert!(cancels_to(&sent, RINGING).is_empty());
+    assert_eq!(
+        proxy.state.session_store.client_key_count(),
+        sessions,
+        "and the call is as it was"
     );
 }

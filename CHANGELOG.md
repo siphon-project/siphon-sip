@@ -239,6 +239,14 @@ entry, but a working config keeps working.
   `Proceeding`, waiting for a final response that had already gone. It now
   goes through the transaction, as the response of `reply.reject()` already
   did: retransmitted until the caller's ACK, which is absorbed.
+- **A CANCEL for a proxied INVITE that already has its final response is
+  answered and changes nothing.** RFC 3261 §9.2: such a CANCEL "has no effect
+  on the processing of the original request". When the INVITE had been
+  rejected with `reply.reject()`, or answered by one fork branch while
+  another was still ending, a CANCEL from the caller was answered `200` and
+  then the INVITE was sent a `487` on top of the final response it already
+  had, and `@proxy.on_cancel` ran for a call that had not been cancelled. The
+  CANCEL now gets its `200` and nothing else happens.
 - **A transfer whose target cannot be dialled ends its subscription and
   leaves the call free.** A siphon-terminated REFER answers `202` and sends
   the `100 Trying` NOTIFY before it dials. When no INVITE could then be sent
