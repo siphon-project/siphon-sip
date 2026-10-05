@@ -299,7 +299,7 @@ class Call:
             @b2bua.on_invite
             def on_invite(call):
                 if call.from_gateway("teams"):
-                    # Inbound from Microsoft Teams — bridge to the PBX.
+                    # Inbound from that trunk — bridge to the internal side.
                     call.dial("sip:pbx.internal:5060")
                 else:
                     call.reject(403, "Forbidden")
@@ -1153,8 +1153,8 @@ class Call:
 
                 **Required whenever the call is anchored with a
                 direction-bound profile** — one whose offer and answer halves
-                describe different sides, such as ``srtp_to_rtp`` at a
-                Teams/SRTP edge.  A transfer moves the party that half was
+                describe different sides, such as ``srtp_to_rtp`` at an
+                SRTP edge.  A transfer moves the party that half was
                 written for out of the call, so inheriting the profile
                 re-offers *that party's* transport to whoever remains: SRTP to
                 a plain-RTP carrier, which answers ``m=audio 0``.  The call
@@ -1174,7 +1174,7 @@ class Call:
                 headers.
 
                 Without it the target goes out in whatever shape the
-                *referrer* named it in.  A Teams ``Refer-To`` names
+                *referrer* named it in.  A ``Refer-To`` often names
                 ``+E.164``, so a trunk that takes bare digits sees every
                 ordinary call arrive as ``32...`` and every transferred one as
                 ``+32...``.

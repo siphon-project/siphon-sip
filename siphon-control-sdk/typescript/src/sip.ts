@@ -191,7 +191,9 @@ export interface AcceptReferOptions extends TransferIdentity {
   /**
    * With `mode: "controller"`, how many seconds there are to report in
    * (default 60, at most 180). Past it the server reports `503` to the
-   * referrer itself. The server refuses it with any other mode.
+   * referrer itself and tells this application with a `TransferTimedOut`
+   * event ({@link import("./protocol").TransferTimedOutPayload}). The server
+   * refuses it with any other mode.
    */
   timeout?: number;
   /**

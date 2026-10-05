@@ -964,6 +964,16 @@ def test_transfer_outcome_helpers():
     assert transfer_outcome({"kind": "StasisEnd", "payload": {}}) is None
     assert transfer_outcome({"kind": "TransferFailed"}) is None
 
+    # TransferTimedOut ends a transfer this app *accepted* in mode "controller"
+    # and did not report on in time. It is not a verdict on a `refer()`, so
+    # neither helper claims it: an app reads its payload off the event itself.
+    timed_out = {
+        "kind": "TransferTimedOut",
+        "payload": {"reason": "timeout", "code": 503, "referrer_leg": "a"},
+    }
+    assert is_transfer_final(timed_out["kind"]) is False
+    assert transfer_outcome(timed_out) is None
+
 
 def test_originate_verb_roundtrip():
     """`client.originate(...)` emits the module-level `originate` command with the

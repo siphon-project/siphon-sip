@@ -102,8 +102,8 @@ pub struct Destination {
     failures: AtomicU32,
     /// Cooldown deadline. When set and not yet elapsed, the health prober must
     /// not flip this destination back to healthy — used to honor a `503`
-    /// `Retry-After` (RFC 3261 §20.33 / Teams Direct Routing datacenter
-    /// failover): a peer that answered "come back in N seconds" stays out of
+    /// `Retry-After` (RFC 3261 §20.33, a peer steering traffic to another
+    /// site): a peer that answered "come back in N seconds" stays out of
     /// selection for at least that long even if a later probe succeeds.
     down_until: std::sync::Mutex<Option<Instant>>,
 }
@@ -566,8 +566,8 @@ impl DispatcherGroup {
     /// Rebuild the cached set of member source IPs.
     ///
     /// For every destination: if `address_str` is set, resolve it and insert
-    /// each resolved candidate IP (so a round-robin hostname, and Teams'
-    /// `sip`/`sip2`/`sip3.pstnhub.microsoft.com`, all match, not just the
+    /// each resolved candidate IP (so every address of a round-robin
+    /// hostname matches, not just the
     /// currently-selected address). The currently-resolved `address().ip()`
     /// is ALWAYS also inserted as a floor — this covers static-IP
     /// destinations and survives a transient resolver hiccup. The new set is
@@ -865,8 +865,8 @@ impl DispatcherManager {
     /// belongs to a configured gateway **hostname** destination.
     ///
     /// The request datapath calls this before a blocking DNS resolve (see
-    /// `crate::dispatcher::resolve_candidates`): a gateway FQDN — an SBC trunk,
-    /// Teams Direct Routing `*.pstnhub.microsoft.com` — is re-resolved and
+    /// `crate::dispatcher::resolve_candidates`): a gateway FQDN — a trunk
+    /// named by hostname — is re-resolved and
     /// `set_address`'d by the health prober every cycle, so routing a call to it
     /// can reuse that address with zero DNS on the hot path. That closes a
     /// per-call ~1s stall on a low-traffic node where the resolver's own cache
@@ -1159,8 +1159,8 @@ async fn probe_destination(
 /// Health verdict on a response:
 /// - **`503 Service Unavailable`** (RFC 3261 §21.5.4) is NOT healthy. A `503`
 ///   is an explicit "I am temporarily unable to serve this request", which is
-///   exactly what an overloaded Microsoft Teams Direct Routing datacenter
-///   returns (with `Retry-After`) to steer the SBC to the next datacenter. So a
+///   exactly what an overloaded site of a multi-site peer
+///   returns (with `Retry-After`) to steer the caller to its next site. So a
 ///   `503` counts as a probe failure, and a `Retry-After` on it pins the
 ///   destination down for at least that cooldown.
 /// - **`500` / `502` / `504`** (and any other non-`503` response) still count

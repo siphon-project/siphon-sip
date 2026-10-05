@@ -274,8 +274,8 @@ pub(super) fn advertise_b_leg_capabilities(
 /// `Contact` at the advertised sent-by and advertise the supported methods via
 /// `Allow`. Both are added only when absent, so a script-set `Contact`/`Allow`
 /// wins. `via_host`/`via_port` are the advertised sent-by for the transport the
-/// OPTIONS arrived on; some peers (Microsoft Teams Direct Routing) reject an
-/// OPTIONS answer that carries neither `Contact` nor `Record-Route`.
+/// OPTIONS arrived on; some peers reject an OPTIONS answer that carries
+/// neither `Contact` nor `Record-Route`.
 pub(super) fn augment_options_response(
     response: &mut SipMessage,
     via_host: &str,

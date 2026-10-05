@@ -93,6 +93,25 @@ impl PendingInboundReferStore {
         self.entries.remove(sip_call_id).map(|(_, pending)| pending)
     }
 
+    /// Remove + return the call's pending REFER when the party on the given leg
+    /// sent it (that party hanging up). `None` when nothing is pending or the
+    /// other party sent it.
+    pub fn take_from_leg(
+        &self,
+        sip_call_id: &str,
+        from_a_leg: bool,
+    ) -> Option<PendingInboundRefer> {
+        self.entries
+            .remove_if(sip_call_id, |_, pending| pending.from_a_leg == from_a_leg)
+            .map(|(_, pending)| pending)
+    }
+
+    /// Whether nothing is pending on any call: the steady state, which the
+    /// per-BYE and per-teardown lookups check before anything else.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
     /// Drain every entry whose decision deadline has passed; the sweep applies the
     /// 603 default to each drained REFER.
     pub fn take_expired(&self, now: std::time::Instant) -> Vec<PendingInboundRefer> {
@@ -291,6 +310,9 @@ pub fn b2bua_refer_send_final(
     state: &DispatcherState,
 ) {
     let response = build_response(message, code, reason, state.server_header.as_deref(), &[]);
+    // Kept for the REFER's retransmissions, which get this response again
+    // rather than a second decision (RFC 3261 §17.2.2).
+    remember_refer_response(&response, state);
     send_message_from(
         response,
         inbound.transport,
@@ -364,7 +386,13 @@ pub fn send_refer_accepted(
 ) -> bool {
     let notify_cseq = state.call_actors.reserve_leg_cseq(call_id, from_a_leg);
     let origin_leg = state.call_actors.clone_leg(call_id, from_a_leg);
-    let mut ordered = vec![build_refer_accepted(message, origin_leg.as_ref(), state)];
+    let accepted = build_refer_accepted(message, origin_leg.as_ref(), state);
+    // Kept for the REFER's retransmissions: its 202 was lost, and it is owed
+    // that 202 again, not a second transfer (RFC 3261 §17.2.2).
+    state
+        .answered_refers
+        .answered(call_id, &accepted, std::time::Instant::now());
+    let mut ordered = vec![accepted];
 
     if let (Some(cseq), Some(leg)) = (notify_cseq, origin_leg) {
         let extra_headers = [
@@ -708,7 +736,7 @@ pub fn hold_controlled_refer(
 /// Max-Forwards drains. Here siphon owns the transfer instead.
 ///
 /// Flow: resolve the dialog leg the REFER arrived on (by dialog identity, never
-/// source socket — Teams reconnects per transaction over TLS), parse Refer-To,
+/// source socket — a peer may reconnect per transaction over TLS), parse Refer-To,
 /// then split on ownership:
 ///   - **Controlled call** (handed to an external control app): hold the REFER
 ///     un-answered, emit a `TransferRequested` event to the owning connection,
@@ -725,6 +753,18 @@ pub fn hold_controlled_refer(
 ///
 /// Every path answers the REFER — never a silent drop, never a proxy relay.
 pub fn handle_b2bua_refer(inbound: InboundMessage, message: SipMessage, state: &DispatcherState) {
+    let bus = crate::control::ControlBus::global();
+    handle_b2bua_refer_on(bus.as_deref(), inbound, message, state);
+}
+
+/// [`handle_b2bua_refer`] with the control plane named: `None` when there is
+/// none, and every call is then uncontrolled.
+pub fn handle_b2bua_refer_on(
+    bus: Option<&crate::control::ControlBus>,
+    inbound: InboundMessage,
+    message: SipMessage,
+    state: &DispatcherState,
+) {
     let sip_call_id = message
         .headers
         .get("Call-ID")
@@ -787,6 +827,13 @@ pub fn handle_b2bua_refer(inbound: InboundMessage, message: SipMessage, state: &
         }
     };
 
+    // A REFER already decided on, arriving again because its final response
+    // was lost or is still on its way: answered as it was, and shown to neither
+    // the application nor the script as a new request (RFC 3261 §17.2.2).
+    if answer_refer_retransmission(&inbound, &message, &call_id, state) {
+        return;
+    }
+
     // Parse Refer-To (+ any embedded Replaces). A missing/malformed Refer-To is
     // a client error (RFC 3515 §2.4.1) — 400, don't relay.
     let refer_to = match message
@@ -811,14 +858,14 @@ pub fn handle_b2bua_refer(inbound: InboundMessage, message: SipMessage, state: &
     // matching the no-handler default below). An UNCONTROLLED call falls through
     // to the Python path unchanged — the control interception is only for
     // controlled calls.
-    let (inbound, message) = match crate::control::ControlBus::global() {
+    let (inbound, message) = match bus {
         Some(bus) => {
             let referrer = Referrer {
                 call_id: &call_id,
                 from_a_leg,
                 from_tag: from_tag.as_deref(),
             };
-            match hold_controlled_refer(&bus, inbound, message, &refer_to, &referrer, state) {
+            match hold_controlled_refer(bus, inbound, message, &refer_to, &referrer, state) {
                 None => return,
                 Some(uncontrolled) => uncontrolled,
             }
@@ -835,6 +882,13 @@ pub fn handle_b2bua_refer(inbound: InboundMessage, message: SipMessage, state: &
         b2bua_refer_send_final(&inbound, &message, 603, "Decline", state);
         return;
     }
+
+    // The handler decides from here, and every path out of it answers. A copy
+    // of this REFER arriving on another worker meanwhile is absorbed instead
+    // of running the handler, and the transfer, a second time.
+    state
+        .answered_refers
+        .proceeding(&call_id, &message, std::time::Instant::now());
 
     let mut py_call = PyCall::new(
         call_id.clone(),

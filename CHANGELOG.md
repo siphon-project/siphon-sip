@@ -61,6 +61,20 @@ entry, but a working config keeps working.
   `complete_refer`, `accept_refer(mode="controller", timeout=…)` /
   `complete_refer`, `acceptRefer({ mode: "controller" })` /
   `completeRefer`).
+- **`TransferTimedOut` tells an application its transfer report came too
+  late.** A transfer accepted with `accept_refer {mode: "controller"}` has a
+  deadline for `complete_refer`. When it passed, siphon ended the referrer's
+  subscription with a `503` sipfrag NOTIFY and told the application nothing,
+  so it went on with the transfer and learned of it only from a refused
+  `complete_refer`. The deadline now also raises `TransferTimedOut` on the
+  channel, payload `{reason: "timeout", code, referrer_leg}`: `code` is the
+  status the referrer was sent (`503`, or `null` when its leg had already
+  left the call), `referrer_leg` is `"a"` or `"b"` as in `TransferRequested`.
+  Raised once, and not for a transfer that was reported, whose referrer hung
+  up, or whose call ended. `describe` lists it, and the Rust, Python and
+  TypeScript control SDKs know it (`SipEvent::TransferTimedOut` with
+  `CallEvent::transfer_timed_out()`, the `"TransferTimedOut"` event kind,
+  `TransferTimedOutPayload`).
 - **A `dial` target can name its called party with `to`.** It becomes that
   branch's `To` URI. Before, a B-leg always kept the caller's `To` user and
   only swapped in the target's host. That is right for a forward and wrong for
@@ -86,6 +100,64 @@ entry, but a working config keeps working.
 
 ### Fixed
 
+- **A transfer whose target cannot be dialled ends its subscription and
+  leaves the call free.** A siphon-terminated REFER answers `202` and sends
+  the `100 Trying` NOTIFY before it dials. When no INVITE could then be sent
+  for any target (it does not resolve, or no contact of it can be reached),
+  nothing ever ended the subscription: the referrer waited on it (RFC 3515
+  §2.4.5 has it end with a final NOTIFY), and the replacement stayed recorded
+  on the call, so every later `replace_peer` there was refused as already in
+  flight. `replace_peer` itself was refused `bad_request` for such a target
+  and left the same record behind. The replacement now fails as one whose
+  targets all refused: the referrer gets a NOTIFY with a `503 Service
+  Unavailable` sipfrag and `Subscription-State: terminated;reason=noresource`,
+  a controlling application gets `ReplaceFailed` with status 503, and the call
+  keeps both its parties with nothing pending. `replace_peer` is still refused
+  `bad_request`, with no event, and can be sent again at once. With several
+  targets, the ones that were dialled ring on as before.
+- **A retransmitted REFER gets its response again instead of being acted on
+  again.** The B2BUA answers a REFER some time after it arrives, once a
+  script, a controlling application or the far end has decided, and a copy
+  arriving after that (its final response was lost) was taken for a new
+  request. On a controlled call the application got a second
+  `TransferRequested` and a second decision to make. On a call its script
+  accepts, `@b2bua.on_refer` ran again and the target was dialled a second
+  time, or the REFER relayed a second time. A REFER already decided on is now
+  recognised by Call-ID, CSeq and Via branch (RFC 3261 §17.2.3) and answered
+  with the final response it got (§17.2.2), for 64·T1: the `202`, a
+  rejection, the decision deadline's `603`, or what the far end answered in
+  `transparent` mode, where a copy arriving before the far end has answered
+  is absorbed. A REFER with a new CSeq is a new request, as before.
+- **A REFER waiting for an application's decision is answered when its call
+  ends.** A REFER on a controlled call is held until `accept_refer` or
+  `reject_refer`. When the call ended first the REFER stayed held and
+  unanswered until the decision deadline, and an `accept_refer` arriving
+  before that removed it without answering it at all. It is now answered as
+  the call ends, and nothing stays held: `487 Request Terminated` when its
+  own sender hangs up (RFC 3261 §15.1.2), `603 Decline` when the other party
+  hangs up or the call is torn down, ahead of the BYE siphon sends the
+  referrer, and `481` from an `accept_refer` that finds the call already
+  gone. The deadline's `603` for an application that never decides is
+  unchanged.
+- **A transfer target's reliable provisional is PRACKed.** When the caller
+  of a call supports `100rel`, siphon holds its PRACK for a callee's reliable
+  provisional until the caller PRACKs siphon's copy (RFC 3262 §5). The target
+  of a siphon-terminated transfer or a `replace_peer` was treated the same
+  way, but its provisionals are never relayed to the caller, so the PRACK it
+  was owed waited for one that could not come, and a UAS left without a PRACK
+  rejects the INVITE after 64·T1 (RFC 3262 §3). siphon now PRACKs a
+  replacement target at once, on that target's own early dialog. A call
+  whose caller does not support `100rel` already did.
+- **A PRACK and a branch's failure follow their leg, not its position.**
+  siphon noted a B-leg's position among the call's legs when a response
+  arrived and acted on it later: a PRACK held for the caller's is sent when
+  that arrives, and a branch's failure is recorded after the retries and
+  hooks a failure runs. A leg ahead of it taken off the call in between (the
+  tracking leg of an in-dialog request once it is answered, a failed
+  transfer's targets) moved every later leg down one, so the position no
+  longer named that leg and a PRACK addressed by it was not sent. Both now
+  find the leg by the Via branch of its INVITE (RFC 3261 §8.1.1.7), under
+  the lock that acts on it.
 - **A transfer target given up on at its deadline has its `487` ACKed.** When
   a siphon-terminated transfer or `replace_peer` ran out of time, siphon sent
   the target a CANCEL and forgot the leg at once, so the `487 Request

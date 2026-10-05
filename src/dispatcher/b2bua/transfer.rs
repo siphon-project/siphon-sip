@@ -354,6 +354,12 @@ pub fn b2bua_transfer_rtpengine_delete(state: &DispatcherState, cid_old: &str, f
     }
 }
 
+/// Carry out an accepted REFER in `mode`.
+///
+/// Transparent: the REFER is re-emitted on the far leg's own dialog and siphon
+/// owns no subscription; the far end's response and its sipfrag NOTIFYs are
+/// relayed back to the referrer.
+///
 /// Siphon-terminated (default): answer `202 Accepted` to the referrer, open the
 /// implicit REFER subscription, and start feeding it `message/sipfrag` NOTIFY
 /// progress (RFC 3515 §2.4.4). Siphon dials the Refer-To (or the script's
@@ -366,9 +372,10 @@ pub fn b2bua_transfer_rtpengine_delete(state: &DispatcherState, cid_old: &str, f
 /// referrer names its target in its own number format and the carrier the leg is
 /// dialled at expects the trunk's.
 ///
-/// The `202 + NOTIFY 100 Trying + subscription` opening is done here; the
-/// new-leg dial and the transfer-aware bridge/BYE completion are driven off the
-/// dialed leg's 2xx in the response path.
+/// The `202 + NOTIFY 100 Trying + subscription` opening and the new-leg dial
+/// are done here; the transfer-aware bridge/BYE completion is driven off the
+/// dialed leg's 2xx in the response path
+/// ([`b2bua_complete_terminated_transfer`]).
 #[allow(clippy::too_many_arguments)]
 pub fn b2bua_refer_accept(
     inbound: InboundMessage,
@@ -403,6 +410,12 @@ pub fn b2bua_refer_accept(
                 attended = replaces.is_some(),
                 "B2BUA REFER: accepting (transparent) — forwarding on the far leg"
             );
+            // The far end answers this REFER and siphon relays what it says.
+            // Until then a retransmission has nothing to be answered with, and
+            // must not be relayed as a second REFER on the far leg's dialog.
+            state
+                .answered_refers
+                .proceeding(call_id, &message, std::time::Instant::now());
             b2bua_forward_indialog_request(
                 &inbound,
                 &message,
@@ -519,10 +532,10 @@ pub fn b2bua_refer_accept(
 /// target's own policy asks for it (see `transfer_media`).
 ///
 /// The signaling here (ACK / NOTIFY / promote / BYE) is what makes the transfer
-/// visible on the wire and is covered by the integration tests. The rtpengine
-/// media re-anchor (re-bridging the surviving party's media to the transfer
-/// target) needs a live rtpengine session to validate and is intentionally left
-/// to the standard re-negotiation path rather than reconstructed blind here.
+/// visible on the wire. The surviving party is then re-INVITEd to the target's
+/// media (RFC 3261 §14): on an anchored call with the media engine's answer on
+/// the target's own engine call, whose session replaces the old anchor;
+/// otherwise with the target's answer SDP as it arrived.
 pub fn b2bua_complete_terminated_transfer(
     call_id: &str,
     branch: &str,
@@ -713,8 +726,8 @@ pub fn b2bua_complete_terminated_transfer(
                 // only thing that tells it), and sits on whatever it was
                 // holding for the transfer — a consultation call, in the
                 // attended case — until its own idle timer fires minutes later.
-                // Observed against Microsoft Teams Direct Routing with the two
-                // 19 µs apart: BYE answered `200`, NOTIFY answered `481`.
+                // A referrer handed the two back to back does exactly that:
+                // BYE answered `200`, NOTIFY answered `481`.
                 Some(branch) => {
                     state.deferred_referrer_bye.insert(
                         &branch,

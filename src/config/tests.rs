@@ -299,7 +299,7 @@ fn codec_flags_are_rtpengine_only() {
 }
 
 /// The codec block is a DICT of named lists. The shape that shipped in the
-/// Teams example (`codec: ["offer", "PCMA,PCMU"]`) is not it, and now fails
+/// SBC example (`codec: ["offer", "PCMA,PCMU"]`) is not it, and now fails
 /// the config load instead of being silently dropped — which is how it went
 /// unnoticed while implying siphon was restricting codecs.
 #[test]

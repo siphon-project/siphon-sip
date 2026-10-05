@@ -625,7 +625,7 @@ pub fn b2bua_dial_b_leg(
     // Per-call override (from call.session_timer()) takes precedence over global config.
     //
     // REPLACE, never append. This INVITE is a clone of the A-leg's, so whatever
-    // the caller asked for is already on it — a Teams INVITE arrives carrying
+    // the caller asked for is already on it — an INVITE may arrive carrying
     // `Session-Expires: 3600` and `Min-SE: 300`. `Session-Expires` and `Min-SE`
     // are single-value headers (RFC 4028 §4, §5), so appending emitted two of
     // each and left the callee to pick: siphon's `Min-SE: 90` next to the

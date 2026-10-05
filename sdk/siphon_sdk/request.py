@@ -1460,9 +1460,8 @@ class Request:
 
         The match is on IP only (the source port is ignored — gateways answer
         from varied ports) and against **every** resolved address in the
-        group, so a hostname that round-robins across many IPs (e.g. Teams'
-        ``sip``/``sip2``/``sip3.pstnhub.microsoft.com``) matches on any of
-        them.
+        group, so a hostname that round-robins across many IPs matches on any
+        of them.
 
         Infallible: returns ``False`` (never raises) when the group does not
         exist, no gateway is configured, or the source IP does not parse.
@@ -1483,7 +1482,7 @@ class Request:
             @proxy.on_request("INVITE")
             def route(request):
                 if request.from_gateway("teams"):
-                    # Inbound from Microsoft Teams — trust and forward to the PBX.
+                    # Inbound from that trunk — trust and forward to the internal side.
                     request.relay("sip:pbx.internal:5060")
                 else:
                     request.reply(403, "Forbidden")

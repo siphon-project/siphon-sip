@@ -1392,7 +1392,7 @@ mod tests {
 
     #[test]
     fn store_dialog_key_disambiguates_same_call_id() {
-        // Simulates a B2BUA (e.g. FreeSWITCH) that reuses the same Call-ID
+        // Simulates a downstream B2BUA that reuses the same Call-ID
         // for both call legs through the proxy.
         let store = ProxySessionStore::new();
 
@@ -1430,7 +1430,7 @@ mod tests {
         session1.set_client_branch(
             leg1_client.clone(),
             ClientBranch {
-                destination: "10.0.0.2:5060".parse().unwrap(), // FreeSWITCH
+                destination: "10.0.0.2:5060".parse().unwrap(), // the B2BUA
                 transport: Transport::Tcp,
                 connection_id: ConnectionId::default(),
             },

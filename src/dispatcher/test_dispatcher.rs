@@ -147,6 +147,7 @@ pub(super) fn test_dispatcher_with_script(source: &str) -> TestDispatcher {
         ro_sessions: Arc::new(DashMap::new()),
         cdr_sessions: Arc::new(DashMap::new()),
         pending_inbound_refer: Arc::new(PendingInboundReferStore::default()),
+        answered_refers: Arc::new(AnsweredReferStore::default()),
         controller_refers: Arc::new(ControllerReferStore::default()),
         deferred_referrer_bye: Arc::new(DeferredReferrerByeStore::default()),
         parse_error_log: Arc::new(ParseErrorLimiter::default()),

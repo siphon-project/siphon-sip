@@ -10,7 +10,7 @@
   → nothing further
 
   RFC 5589 §7 lets the transferor end its dialog as soon as the REFER is
-  accepted, and real transferors do: a Teams blind transfer BYEs within a few
+  accepted, and real transferors do: a blind transfer may BYE within a few
   hundred ms of the 202, roughly a second before the target answers. The
   transfer must still complete — bob stays up and is bridged to carol.
 
@@ -112,7 +112,7 @@ Content-Length: 0
 
   <!--
     Hang up NOW — carol has not answered yet (she holds 180 for 1.5 s). This is
-    the exact ordering a Teams transfer produces and the one that used to take
+    the ordering such a blind transfer produces and the one that used to take
     the surviving leg down with it.
   -->
   <send retrans="500">

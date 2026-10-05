@@ -1673,8 +1673,8 @@ impl SiphonServer {
 
         // Hot-reload the outbound client certificate alongside the inbound
         // acceptor: when `tls.client_certificate` + `tls.client_private_key` are
-        // configured (outbound mutual TLS — Teams Direct Routing, carrier
-        // interconnects), watch them on disk and swap the renewed identity into
+        // configured (outbound mutual TLS, as carrier interconnects
+        // require), watch them on disk and swap the renewed identity into
         // the pool so outbound handshakes present the new cert without a restart.
         if let Some((Some(certificate_path), Some(private_key_path))) = config
             .tls

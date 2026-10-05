@@ -204,7 +204,7 @@ pub(super) fn handle_request(
             Ok(None) => {
                 // No IST found — ACK for 2xx (end-to-end) or stale.
                 // Route via ProxySession using Call-ID + From-tag dialog key.
-                // Using both fields avoids ambiguity when a B2BUA (e.g. FreeSWITCH)
+                // Using both fields avoids ambiguity when a downstream B2BUA
                 // reuses the same Call-ID for both call legs through this proxy.
                 let call_id = message.headers.get("Call-ID");
                 let from_tag = message.typed_from().ok().flatten().and_then(|na| na.tag);
@@ -662,9 +662,9 @@ pub(super) fn handle_request(
         // things depending on the method, so it gets two different answers.
         //
         // OPTIONS is a liveness probe, and answering it is the stack's job
-        // rather than every script's. A registrar qualifies its bindings —
-        // Asterisk's `qualify_frequency` and its equivalents send OPTIONS to the
-        // registered contact on a timer for the life of the registration — so a
+        // rather than every script's. A registrar qualifies its bindings — it
+        // sends OPTIONS to the registered contact on a timer for the life of
+        // the registration — so a
         // siphon that registers to a provider answers one of these forever. RFC
         // 3261 §11.2 has a UAS respond 200 with its capabilities. Requiring each
         // deployment to hand-write that handler got it wrong twice over: the
@@ -685,8 +685,9 @@ pub(super) fn handle_request(
         // registered handlers would under-advertise every method the framework
         // dispatches somewhere other than `@proxy.on_request` — REFER to
         // `@b2bua.on_refer`, CANCEL and ACK to the transaction layer — and
-        // under-advertising `Allow` is exactly how Teams Direct Routing stopped
-        // offering REFER once already (see `crate::sip::SUPPORTED_METHODS`).
+        // under-advertising `Allow` is exactly how a peer that reads its
+        // transfer method from it stopped offering REFER once already (see
+        // `crate::sip::SUPPORTED_METHODS`).
         let Some(response) = build_no_handler_response(
             &message,
             &method,
@@ -1018,8 +1019,8 @@ pub(super) fn handle_request(
             }
 
             // RFC 3261 §11.2 — make a 2xx OPTIONS a proper capability response: a
-            // Contact (Microsoft Teams Direct Routing rejects an OPTIONS answer
-            // carrying neither Contact nor Record-Route) plus an Allow advertising
+            // Contact (some peers reject an OPTIONS answer carrying neither
+            // Contact nor Record-Route) plus an Allow advertising
             // siphon's supported methods (peers read transfer capability from it).
             // Both are added only when absent, so a script-set header still wins.
             if method == "OPTIONS" && (200..300).contains(code) {

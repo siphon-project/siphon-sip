@@ -332,7 +332,9 @@ impl Call {
     /// Move the parties with `bridge` / `unbridge` / `replace_peer` / `dial`,
     /// then report with `complete_refer`. `timeout` is how many seconds there
     /// are to report in (default 60, at most 180); past it the server reports
-    /// `503` to the referrer itself. This mode takes `timeout` only, and
+    /// `503` to the referrer itself and tells this app with a
+    /// `TransferTimedOut` event, payload `{"reason": "timeout", "code": 503,
+    /// "referrer_leg": "a" | "b"}`. This mode takes `timeout` only, and
     /// `timeout` belongs to this mode only: anything else raises `ValueError`.
     #[pyo3(signature = (
         target=None, next_hop=None, mode=None, profile=None, *, aor=None, from_uri=None,

@@ -76,14 +76,17 @@ pub fn handle_b2bua_bye(inbound: InboundMessage, message: SipMessage, state: &Di
         }
     };
 
+    // A REFER of this party's still waiting for its application's decision is
+    // answered before its dialog is over (RFC 3261 §15.1.2).
+    pending_refer_referrer_left(state, &call_id, from_a_leg);
     // A transfer this party asked for and its controller is still carrying out
     // has nobody left to be reported to.
     controller_refer_referrer_left(state, &call_id, from_a_leg);
 
     // The referrer of an in-flight siphon-terminated transfer hanging up is NOT
     // the end of this call (RFC 5589 §7: the transferor is free to end its
-    // dialog as soon as the REFER is accepted — Microsoft Teams BYEs within a
-    // few hundred ms of the 202, long before the target answers). The surviving
+    // dialog as soon as the REFER is accepted, and a transferor may BYE within
+    // a few hundred ms of the 202, long before the target answers). The surviving
     // party is still up and is waiting to be bridged to the transfer target, so
     // everything below — @b2bua.on_bye, the ACR-STOP/CDR close, the BYE
     // generated at the far leg, the rtpengine teardown and `remove_call` —
@@ -155,6 +158,10 @@ pub fn handle_b2bua_bye(inbound: InboundMessage, message: SipMessage, state: &Di
             ),
             None => return,
         };
+
+    // A REFER the other party sent, still waiting for a decision, is answered
+    // now: the BYE below ends the dialog it would have been answered in.
+    refers_end_with_call(state, &call_id, &a_leg_call_id);
 
     // A bridged partner loses its other half here — before the StasisEnd, so
     // the controller sees the bridge end before the channel does.

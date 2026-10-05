@@ -139,6 +139,36 @@ Two consequences worth knowing when you write handlers:
 * **If the target then fails**, the surviving party has nobody left to talk to,
   so siphon releases it and tears the call down rather than stranding it.
 
+#### When the REFER arrives twice
+
+A `REFER` over UDP is retransmitted until its final response gets through, so
+the same request can arrive after siphon has already acted on it. It is the same
+request (same Call-ID, CSeq and Via branch) and is answered with the same final
+response again, for 32 s: `@b2bua.on_refer` runs once per `REFER`, and the
+target is dialled, or the `REFER` relayed, once. A `REFER` with a new CSeq is a
+new request and runs the handler again.
+
+#### When the target cannot be dialled
+
+The `202` goes out before the target is dialled, so a target siphon can send no
+INVITE to (it does not resolve, or none of its contacts can be reached) is found
+out after the referrer was told the transfer is under way. The referrer is not
+left waiting: its subscription is ended with a `NOTIFY` whose sipfrag says
+`503 Service Unavailable` (`Subscription-State: terminated;reason=noresource`,
+RFC 3515 §2.4.5), and the call keeps both its parties.
+
+```
+   Alice (referrer)              siphon
+     |  REFER Refer-To: <target> |
+     |------------------------->|
+     |  202 Accepted            |
+     |<-------------------------|
+     |  NOTIFY sipfrag 100      |
+     |<-------------------------|   (no INVITE can be sent)
+     |  NOTIFY sipfrag 503      |
+     |<-------------------------|   Alice <== still bridged ==> Bob
+```
+
 Rewrite the destination or steer egress without touching what the endpoints see:
 
 ```python
@@ -496,7 +526,9 @@ worked and may keep the consultation call on hold until its own timer
 runs out.
 
 If the application takes longer than `timeout` (default 60 s, at most 180),
-siphon reports `503` to the referrer itself. If Bob hangs up before the
+siphon reports `503` to the referrer itself and tells the application with a
+`TransferTimedOut` event on `bob-1` (`{reason: "timeout", code: 503,
+referrer_leg}`), after which `complete_refer` is refused. If Bob hangs up before the
 report, the subscription ends with his call and there is nothing to
 report. Full rules are in the
 [control plane reference](../reference/control-plane.md#a-transfer-the-application-carries-out).
@@ -694,6 +726,10 @@ A target that rejects, or never answers before `timeout`, leaves the call
 **exactly as it was** — the IVR is still there and the caller never knew. That is
 also why `timeout` matters: the target here is a human, and "nobody picked up" is
 an ordinary outcome, not an error case.
+
+A target no INVITE can be sent to is refused on the spot (`bad_request`, a
+`ValueError` in a script), with nothing dialled and nothing left pending on the
+call, so another `replace_peer` can be tried right away.
 
 `replace_a_leg=True` reverses the direction (replace the caller, keep the
 callee). Pass `profile=` when the call is anchored with a direction-bound media

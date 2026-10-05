@@ -2,14 +2,6 @@
 //! and the sipfrag NOTIFYs it subscribes to (RFC 3515).
 use crate::dispatcher::*;
 
-/// Send a siphon-originated in-dialog REFER on one leg of a B2BUA call
-/// (`call.refer()` / `b2bua.refer()`).
-///
-/// Siphon is the referrer: it builds the REFER on the chosen leg's own dialog
-/// identity, sends it, and records a *subscriber* REFER subscription so the
-/// referee's `message/sipfrag` NOTIFYs are absorbed (200 OK'd + read) by
-/// [`handle_b2bua_notify`] rather than bridged. Returns `false` if the call or
-/// leg is gone.
 /// Handle the response to a REFER siphon originated on one of its own legs.
 ///
 /// A cold transfer off a call siphon answered itself (`call.refer()` /
@@ -298,6 +290,14 @@ pub fn retry_originated_refer_with_credentials(
     true
 }
 
+/// Send a siphon-originated in-dialog REFER on one leg of a B2BUA call
+/// (`call.refer()` / `b2bua.refer()`).
+///
+/// Siphon is the referrer: it builds the REFER on the chosen leg's own dialog
+/// identity, sends it, and records a *subscriber* REFER subscription so the
+/// referee's `message/sipfrag` NOTIFYs are absorbed (200 OK'd + read) by
+/// [`handle_b2bua_notify`] rather than bridged. Returns `false` if the call or
+/// leg is gone.
 pub fn b2bua_send_outbound_refer(
     state: &DispatcherState,
     internal_call_id: &str,
@@ -433,9 +433,10 @@ pub fn b2bua_refer_call(sip_call_id: &str, refer_to: crate::sip::headers::refer:
 /// controlled call and drives the shipped [`b2bua_refer_accept`] transfer in the
 /// resolved mode (terminate = siphon-terminated 202 + NOTIFY + re-dial;
 /// transparent = forward on the far leg), reusing the exact same machinery the
-/// `@b2bua.on_refer` accept path uses — including #181's single-leg behaviour
-/// (a voice-ai / IVR call with no B leg re-dials the target off the A dialog,
-/// falling back to the referrer's SDP when there is no surviving leg to bridge).
+/// `@b2bua.on_refer` accept path uses — including its single-leg behaviour (a
+/// call siphon answered itself, with no B-leg, re-dials the target off the A
+/// dialog, falling back to the referrer's SDP when there is no surviving leg
+/// to bridge).
 ///
 /// `target` overrides the Refer-To URI, `next_hop` steers egress without
 /// reshaping the R-URI, `mode` overrides the configured
@@ -443,7 +444,8 @@ pub fn b2bua_refer_call(sip_call_id: &str, refer_to: crate::sip::headers::refer:
 /// pairing the transfer creates (see `accept_refer(profile=…)` — required when
 /// the call is anchored with a direction-bound profile). Returns `false` (never panics) when no REFER is
 /// pending for this call (already decided, timed out, or the call is gone),
-/// which the adapter maps to `not_found`. Safe from any thread (enters the
+/// which the adapter maps to `not_found`. A REFER still held for a call that
+/// is gone is answered `481` first. Safe from any thread (enters the
 /// dispatcher runtime), mirroring [`b2bua_refer_call`].
 pub fn b2bua_accept_refer_call(
     sip_call_id: &str,
@@ -480,21 +482,59 @@ pub(crate) fn b2bua_accept_refer_call_dialling(
     let Some(control) = B2BUA_CONTROL.get() else {
         return false;
     };
-    let state = &control.state;
-    let Some(pending) = state.pending_inbound_refer.take(sip_call_id) else {
-        return false;
-    };
-    let Some(internal_call_id) = state.call_actors.find_by_sip_call_id(sip_call_id) else {
-        // The call vanished between the REFER and the decision — the referrer's
-        // transaction is gone too. The pending entry is already removed (no leak).
-        warn!(%sip_call_id, "b2bua_accept_refer_call: call gone before accept — dropping pending REFER");
-        return false;
-    };
-
     // The send path re-anchors media (block_in_place) and may spawn (TCP/TLS
     // connect); the caller may be on a non-tokio thread (control apply task) —
     // establish the runtime, mirroring b2bua_route_call / b2bua_refer_call.
     let _enter = control.runtime.enter();
+    b2bua_accept_refer_with_state(
+        &control.state,
+        sip_call_id,
+        target,
+        next_hop,
+        mode,
+        media_profile,
+        number_shape,
+        dial,
+    )
+}
+
+/// [`b2bua_accept_refer_call_dialling`] on the dispatcher in hand, from a
+/// thread already inside its runtime.
+#[allow(clippy::too_many_arguments)]
+pub fn b2bua_accept_refer_with_state(
+    state: &DispatcherState,
+    sip_call_id: &str,
+    target: Option<String>,
+    next_hop: Option<String>,
+    mode: Option<crate::script::api::call::ReferMode>,
+    media_profile: Option<String>,
+    number_shape: Option<crate::script::api::numbers::NumberShape>,
+    dial: &ReplacementDial,
+) -> bool {
+    let Some(pending) = state.pending_inbound_refer.take(sip_call_id) else {
+        return false;
+    };
+    let Some(internal_call_id) = state.call_actors.find_by_sip_call_id(sip_call_id) else {
+        // The call ended between the REFER and the decision, by a path that
+        // did not answer what it held. The REFER is still owed an answer (RFC
+        // 3515 §2.4.2), and with the entry taken nothing else would give it.
+        warn!(%sip_call_id, "b2bua_accept_refer_call: call gone before accept — 481");
+        b2bua_refer_send_final(
+            &pending.inbound,
+            &pending.message,
+            481,
+            "Call/Transaction Does Not Exist",
+            state,
+        );
+        return false;
+    };
+    // Decided: from here to its final response a copy of this REFER arriving
+    // on another worker is a retransmission, not a new request to hold.
+    state.answered_refers.proceeding(
+        &internal_call_id,
+        &pending.message,
+        std::time::Instant::now(),
+    );
 
     let mode = mode.unwrap_or(state.default_refer_mode);
     let target_uri = target.unwrap_or_else(|| pending.refer_to.uri.clone());
@@ -570,14 +610,49 @@ pub(crate) fn b2bua_replace_peer_dialling(
     timeout_secs: u32,
     dial: &ReplacementDial,
 ) -> Result<(), crate::b2bua::transfer::ReplaceError> {
-    use crate::b2bua::transfer::{ReplaceError, ReplacementOrigin};
-
     let Some(control) = B2BUA_CONTROL.get() else {
-        return Err(ReplaceError::Unavailable(
+        return Err(crate::b2bua::transfer::ReplaceError::Unavailable(
             "B2BUA is not running".to_string(),
         ));
     };
-    let state = &control.state;
+    // The send path re-anchors media (block_in_place) and may spawn (TCP/TLS
+    // connect); the caller may be on a non-tokio thread (a script handler, a
+    // timer, the control apply task).
+    let _enter = control.runtime.enter();
+    b2bua_replace_peer_with_state(
+        &control.state,
+        sip_call_id,
+        target,
+        next_hop,
+        replace_a_leg,
+        media_profile,
+        number_shape,
+        timeout_secs,
+        dial,
+    )
+}
+
+/// [`b2bua_replace_peer_dialling`] on the dispatcher in hand, from a thread
+/// already inside its runtime.
+///
+/// A target no INVITE could be sent to is refused
+/// [`Unroutable`](crate::b2bua::transfer::ReplaceError::Unroutable) with the
+/// call as it was: the replacement that was opened for it is ended before this
+/// returns, so it does not hold off the next one.
+#[allow(clippy::too_many_arguments)]
+pub fn b2bua_replace_peer_with_state(
+    state: &DispatcherState,
+    sip_call_id: &str,
+    target: &str,
+    next_hop: Option<&str>,
+    replace_a_leg: bool,
+    media_profile: Option<&str>,
+    number_shape: Option<&crate::script::api::numbers::NumberShape>,
+    timeout_secs: u32,
+    dial: &ReplacementDial,
+) -> Result<(), crate::b2bua::transfer::ReplaceError> {
+    use crate::b2bua::transfer::{ReplaceError, ReplacementOrigin};
+
     let Some(internal_call_id) = state.call_actors.find_by_sip_call_id(sip_call_id) else {
         return Err(ReplaceError::UnknownCall {
             id: sip_call_id.to_string(),
@@ -627,11 +702,6 @@ pub(crate) fn b2bua_replace_peer_dialling(
         });
     }
 
-    // The send path re-anchors media (block_in_place) and may spawn (TCP/TLS
-    // connect); the caller may be on a non-tokio thread (a script handler, a
-    // timer, the control apply task).
-    let _enter = control.runtime.enter();
-
     let dialed = b2bua_start_leg_replacement(
         &internal_call_id,
         replace_a_leg,
@@ -675,11 +745,21 @@ pub fn b2bua_reject_refer_call(sip_call_id: &str, code: u16, reason: &str) -> bo
     let Some(control) = B2BUA_CONTROL.get() else {
         return false;
     };
-    let state = &control.state;
+    let _enter = control.runtime.enter();
+    b2bua_reject_refer_with_state(&control.state, sip_call_id, code, reason)
+}
+
+/// [`b2bua_reject_refer_call`] on the dispatcher in hand, from a thread
+/// already inside its runtime.
+pub fn b2bua_reject_refer_with_state(
+    state: &DispatcherState,
+    sip_call_id: &str,
+    code: u16,
+    reason: &str,
+) -> bool {
     let Some(pending) = state.pending_inbound_refer.take(sip_call_id) else {
         return false;
     };
-    let _enter = control.runtime.enter();
     b2bua_refer_send_final(&pending.inbound, &pending.message, code, reason, state);
     true
 }

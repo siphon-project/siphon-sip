@@ -1516,6 +1516,17 @@ fn describe_lists_a_lifecycle_for_every_stream_mode() {
     }
 }
 
+/// A transfer an app accepted to carry out and never reported on ends in an
+/// event of its own, so it is discoverable next to the verbs that lead to it.
+#[test]
+fn describe_lists_the_transfer_report_timeout() {
+    let schema = SipControlAdapter::new().describe();
+    assert!(schema
+        .events
+        .iter()
+        .any(|event| event == "TransferTimedOut"));
+}
+
 /// The media engine's summary is published on the rail, so it is discoverable.
 #[test]
 fn describe_lists_the_media_summary() {
@@ -1532,7 +1543,7 @@ fn every_advertised_verb_is_claimed_by_a_dispatch_table() {
     for advertised in SipControlAdapter::new().describe().verbs {
         let verb = advertised.verb.as_str();
         assert!(
-            verb == "originate" || is_bridge_verb(verb) || is_media_verb(verb) || is_sip_verb(verb),
+            verb == MODULE_VERB || is_bridge_verb(verb) || is_media_verb(verb) || is_sip_verb(verb),
             "describe() advertises '{verb}' but no dispatch table claims it — \
                  apply() would answer unsupported_verb"
         );
@@ -1549,41 +1560,92 @@ fn every_dispatchable_verb_is_advertised() {
         .into_iter()
         .map(|verb| verb.verb)
         .collect();
-    for verb in [
-        "originate",
-        "bridge",
-        "unbridge",
-        "play",
-        "stop",
-        "dtmf",
-        "hold",
-        "unhold",
-        "stream_start",
-        "stream_stop",
-        "record_start",
-        "record_stop",
-        "answer",
-        "ring",
-        "progress",
-        "reject",
-        "hangup",
-        "drop",
-        "refer",
-        "accept_refer",
-        "reject_refer",
-        "complete_refer",
-        "replace_peer",
-        "route",
-        "dial",
-        "set_header",
-        "remove_header",
-        "get_header",
-    ] {
+    // Read off the dispatch tables themselves. A list kept here by hand went
+    // stale the first time a verb was added without it, and a stale list
+    // cannot notice that verb being dropped from describe().
+    for verb in dispatch_tables() {
         assert!(
             advertised.iter().any(|name| name == verb),
             "'{verb}' dispatches but describe() never mentions it"
         );
     }
+    assert_eq!(
+        advertised.len(),
+        dispatch_tables().len(),
+        "describe() and the dispatch tables name the same verbs, each once"
+    );
+}
+
+/// Every verb some dispatch table claims.
+fn dispatch_tables() -> Vec<&'static str> {
+    std::iter::once(MODULE_VERB)
+        .chain(BRIDGE_VERBS)
+        .chain(MEDIA_VERBS)
+        .chain(SIP_VERBS)
+        .collect()
+}
+
+/// No verb is claimed by two tables: `apply` takes the first classifier that
+/// matches, so the second table's handler would never run.
+#[test]
+fn no_verb_is_claimed_by_two_dispatch_tables() {
+    let mut claimed = dispatch_tables();
+    claimed.sort_unstable();
+    let total = claimed.len();
+    claimed.dedup();
+    assert_eq!(claimed.len(), total, "a verb sits in two dispatch tables");
+    for verb in SIP_VERBS.iter().chain(&BRIDGE_VERBS).chain([&MODULE_VERB]) {
+        assert!(!is_media_verb(verb), "{verb} is not a media verb");
+    }
+}
+
+/// Every advertised verb, and every verb a table claims, sent through `apply`
+/// the way a command reaches the adapter, is answered by a handler.
+///
+/// The classifier tests above compare names with names. This one runs the
+/// dispatch: a verb in `describe()` and in a table but with no arm in the
+/// table's `match`, or advertised and in no table at all, is answered
+/// `unsupported_verb` here, exactly as it would be on the wire. No dispatcher
+/// is running, so a real handler refuses for a reason of its own (nothing to
+/// act on, a missing argument, no B2BUA), never with that code.
+#[tokio::test]
+async fn every_advertised_verb_reaches_a_handler_through_apply() {
+    let adapter = SipControlAdapter::new();
+    let mut verbs: Vec<String> = adapter
+        .describe()
+        .verbs
+        .into_iter()
+        .map(|verb| verb.verb)
+        .collect();
+    verbs.extend(dispatch_tables().into_iter().map(str::to_string));
+    verbs.sort_unstable();
+    verbs.dedup();
+    assert!(verbs.iter().any(|verb| verb == "cancel_dial"));
+    for verb in verbs {
+        let result = adapter
+            .apply(AdapterCommand {
+                verb: verb.clone(),
+                args: serde_json::json!({}),
+                target: ResolvedTarget::Channel(channel()),
+                origin: test_origin(),
+            })
+            .await;
+        assert_ne!(
+            error_code(&result),
+            Some(ControlErrorCode::UnsupportedVerb),
+            "'{verb}' is advertised or claimed by a dispatch table, and apply() answers unsupported_verb"
+        );
+    }
+    // Positive control: a verb nobody claims is refused with exactly that code.
+    let result = adapter
+        .apply(AdapterCommand {
+            verb: "teleport".to_string(),
+            args: serde_json::json!({}),
+            target: ResolvedTarget::Channel(channel()),
+            origin: test_origin(),
+        })
+        .await;
+    assert_eq!(error_code(&result), Some(ControlErrorCode::UnsupportedVerb));
 }
 
 #[test]

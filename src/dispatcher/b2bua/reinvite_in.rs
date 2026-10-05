@@ -40,7 +40,7 @@ pub fn handle_b2bua_reinvite(
     };
 
     // In-dialog direction by dialog identity (RFC 3261 §12 — Call-ID + From-tag),
-    // never by source socket: a Teams-style peer opens a NEW TLS connection (new
+    // never by source socket: a peer may open a NEW TLS connection (new
     // source port) for its re-INVITE, so a socket comparison misclassifies the
     // direction and reflects the re-INVITE back at the leg it came from.
     let from_tag = message.typed_from().ok().flatten().and_then(|na| na.tag);
