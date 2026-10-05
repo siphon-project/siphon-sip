@@ -58,7 +58,7 @@ impl ControlAdapter for SipControlAdapter {
         // Media verbs bind to the async MediaBackend, so they run on the async
         // path; every other verb is a synchronous decision over the B2BUA rail.
         Box::pin(async move {
-            if command.verb == "originate" {
+            if command.verb == MODULE_VERB {
                 // Module-level: it creates the channel rather than addressing one.
                 originate(command)
             } else if is_bridge_verb(&command.verb) {
@@ -229,27 +229,34 @@ fn verb(name: &str, summary: &str) -> VerbSchema {
 /// The media-control verbs the SIP adapter dispatches asynchronously against the
 /// configured [`crate::rtpengine::MediaBackend`] (rather than the synchronous
 /// B2BUA rail). Kept in one place so `apply` and the tests agree on the split.
+const MEDIA_VERBS: [&str; 9] = [
+    "play",
+    "stop",
+    "dtmf",
+    "hold",
+    "unhold",
+    "stream_start",
+    "stream_stop",
+    "record_start",
+    "record_stop",
+];
+
 fn is_media_verb(verb: &str) -> bool {
-    matches!(
-        verb,
-        "play"
-            | "stop"
-            | "dtmf"
-            | "hold"
-            | "unhold"
-            | "stream_start"
-            | "stream_stop"
-            | "record_start"
-            | "record_stop"
-    )
+    MEDIA_VERBS.contains(&verb)
 }
 
 /// The verbs that join or part two channels. Split out so `apply` and the tests
 /// agree on which verbs take the async path (they confirm the media teardown
 /// with the backend before answering).
+const BRIDGE_VERBS: [&str; 2] = ["bridge", "unbridge"];
+
 fn is_bridge_verb(verb: &str) -> bool {
-    matches!(verb, "bridge" | "unbridge")
+    BRIDGE_VERBS.contains(&verb)
 }
+
+/// The one verb that addresses the module rather than a channel: it creates
+/// the channel it answers for.
+const MODULE_VERB: &str = "originate";
 
 /// The verbs [`apply_sip`] dispatches synchronously over the B2BUA rail — the
 /// arms of its own `match`, restated so the schema guard in the tests can prove
@@ -260,27 +267,32 @@ fn is_bridge_verb(verb: &str) -> bool {
 /// classifier in [`ControlAdapter::apply`] that routes to it, falls through to
 /// the wrong table and answers `unsupported_verb` on the wire — while every unit
 /// test that calls the handler function directly still passes.
+///
+/// The guard reads these tables rather than a list of its own, and sends every
+/// verb in them through `apply`: a name here with no arm in [`apply_sip`], or an
+/// arm there with no name here, is answered `unsupported_verb` and fails it.
+const SIP_VERBS: [&str; 17] = [
+    "answer",
+    "ring",
+    "progress",
+    "reject",
+    "hangup",
+    "drop",
+    "refer",
+    "accept_refer",
+    "reject_refer",
+    "complete_refer",
+    "replace_peer",
+    "route",
+    "dial",
+    "cancel_dial",
+    "set_header",
+    "remove_header",
+    "get_header",
+];
+
 fn is_sip_verb(verb: &str) -> bool {
-    matches!(
-        verb,
-        "answer"
-            | "ring"
-            | "progress"
-            | "reject"
-            | "hangup"
-            | "drop"
-            | "refer"
-            | "accept_refer"
-            | "reject_refer"
-            | "complete_refer"
-            | "replace_peer"
-            | "route"
-            | "dial"
-            | "cancel_dial"
-            | "set_header"
-            | "remove_header"
-            | "get_header"
-    )
+    SIP_VERBS.contains(&verb)
 }
 
 /// Resolve the command's channel target and mark the controller as having acted
