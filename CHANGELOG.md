@@ -40,6 +40,11 @@ entry, but a working config keeps working.
 
 ### Fixed
 
+- **siphon builds with Rust 1.93.** One label list in the call-cost
+  metric mixed a `&String` with a `&str`, which current compilers coerce and
+  1.93 rejects as mismatched types. That is the compiler several
+  distributions ship, so a build from source with distribution packages
+  failed. Nothing changes at run time.
 - **A retransmitted INVITE on a B2BUA call is answered.** The retransmission
   was recognised (it creates no second call) and then dropped without a
   response. A caller retransmits because it has seen no provisional, so one
