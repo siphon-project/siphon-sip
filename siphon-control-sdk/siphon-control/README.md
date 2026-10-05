@@ -133,11 +133,14 @@ reported as a failure. That is damage control, not a substitute for closing.
 
 ### `Call` (shared by both modes)
 
-- `Call` verbs: `answer()`, `answer_with(code, …)`, `progress()`, `reject(code, reason)`,
-  `hangup(reason=None)`, `refer(to)` / `transfer(to)`, `set_header(name, value)`,
-  `get_header(name)`, `set_var(key, value)`, `get_var(key)`, `command(verb, args=None)`,
-  `next_event()`.
-- `await call.dial(targets, strategy=None, timeout=None, headers=None)` rings B-legs
+- `Call` verbs: `answer()`, `answer_with(code, …)`, `answer_anchored(profile=None,
+  ws_uri=None)`, `ring(reason=None)`, `progress()`, `reject(code, reason)`,
+  `hangup(reason=None)`, `refer(to)` / `transfer(to)`, `route(targets, strategy="sequential",
+  headers=None)`, `set_header(name, value)`, `get_header(name)`, `remove_header(name)`,
+  `set_var(key, value)`, `get_var(key)`, `command(verb, args=None)`, `next_event()`.
+- `await call.dial(targets, strategy=None, timeout=None, headers=None, profile=None,
+  from_uri=None, from_display=None, p_asserted_identity=None, privacy=None,
+  on_answer=None, ringback=None)` rings B-legs
   while the caller stays **unanswered** and this app keeps the channel. Each target
   is a dict: `{"uri": ...}` is dialed as written, `{"aor": ...}` is forked to every
   registered contact over that contact's own captured flow, which is the only way to
@@ -148,6 +151,44 @@ reported as a failure. That is damage control, not a substitute for closing.
   preset or cadence, `True` for the default, `False` for none) while they alert, and
   bridges the first to pick up; the result adds `group_id`, `total_timeout` and the
   `branches` rung.
+- `await call.cancel_dial(reason=None)` gives up on the dial that is ringing and
+  leaves the caller as the dial found it. Every phone still ringing is CANCELled,
+  each reported by `DialBranchFailed` with cause `cancelled`, and the dial ends in
+  `DialFailed` with code 487; `reason` is the `cause` of a bridging dial's
+  `DialFailed` (default `cancelled`). Raises `ControlError` (`invalid_state`) when
+  nothing is ringing, and once a phone has answered and is being bridged.
+- `await call.accept_refer(target=None, next_hop=None, mode=None, profile=None, *,
+  aor=None, from_uri=None, from_display=None, p_asserted_identity=None, privacy=None,
+  headers=None, timeout=None)` accepts a pending inbound REFER (a `TransferRequested`
+  event). `mode` is `"terminate"` (siphon dials the target), `"transparent"` (siphon
+  relays the REFER) or `"controller"`: siphon answers `202` and dials nothing, this app
+  moves the parties itself and then reports with `await call.complete_refer(code,
+  reason=None)`, within `timeout` seconds (default 60, at most 180). `aor=` names the
+  target by its registered address-of-record in place of a URI: it is dialled over the
+  flow its phone registered on, every registered contact rings and the first to answer
+  is kept. The identity arguments are the ones `dial` takes, for the leg the transfer
+  dials. A target URI together with `aor=`, `mode="controller"` with any argument that
+  describes a leg, and `timeout` with another mode each raise `ValueError` before a
+  frame goes out. `await call.reject_refer(code, reason=None)` declines the REFER.
+- `await call.replace_peer(target=None, next_hop=None, replace_a_leg=None, profile=None,
+  timeout=None, *, aor=None, from_uri=None, from_display=None, p_asserted_identity=None,
+  privacy=None, headers=None)` swaps one party of an answered call for a freshly
+  dialled target, with no REFER involved; the replaced leg stays up while the target
+  rings. Exactly one of `target` and `aor=` (`ValueError` otherwise). The reply says
+  the INVITE is on the wire; `PeerReplaced` / `ReplaceFailed` is the outcome.
+- `await call.bridge(with_channel, on_peer_hangup=None)` joins this call to another
+  leg the app owns, and `await call.unbridge(reason=None)` parts them, both legs
+  staying answered and held. The outcome arrives as `ChannelBridged` / `BridgeFailed`.
+- `await call.play(file=None, db_id=None, blob=None, repeat=None, start_ms=None,
+  duration_ms=None, to_tag=None)` plays an announcement on the caller's media (exactly
+  one source). `repeat` is a total play count, or `"inf"` to play until stopped;
+  anything else raises `ValueError`. `play_file(file)`, `stop()`, `dtmf(digits, …)`,
+  `hold()` and `unhold()` are the other media verbs. `hold` is a media gate, not a
+  SIP hold, and is refused (`invalid_state`) on a call the engine only relays.
+- `await call.stream_start(ws_uri, direction=None, channels=None, *, mode="tee",
+  sample_rate=None, profile=None)` streams the call's audio to a WebSocket server, as
+  a copy (`"tee"`) or a takeover (`"bridge"`), and `await call.stream_stop(*,
+  mode="tee")` detaches it. siphon-rtp backend only.
 - `await client.originate(channel, aor=..., strategy=None, total_timeout=None, …)`
   rings every phone registered at the AoR, each over its own flow and Path; the first
   to answer becomes the channel's call. Exactly one of `to` and `aor`, and
@@ -166,8 +207,9 @@ reported as a failure. That is damage control, not a substitute for closing.
   reason reaches siphon's log and the CDR, not the peer. `ban=True` also scores the
   caller's source toward an auto-ban (`security.failed_auth_ban`), so a source the
   controller keeps dropping is refused at the transport.
-- Media verbs `play_file(file)` / `dtmf(digits)` raise `ControlError` with
-  `code == "unsupported_verb"` until the server implements media.
+- `unsupported_verb` is what a verb raises when the configured media backend cannot
+  carry it out: the stream and record verbs on rtpengine or rtpproxy, and
+  `play(repeat="inf")` there.
 
 ## Errors
 

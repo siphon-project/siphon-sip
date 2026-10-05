@@ -67,8 +67,9 @@ impl ControlError {
         }
     }
 
-    /// True when this is a server-side `unsupported_verb` rejection — the state a
-    /// media verb (`play`/`dtmf`/…) lands in until the server implements it.
+    /// True when this is a server-side `unsupported_verb` rejection — what a
+    /// verb answers when the configured media backend cannot carry it out
+    /// (streaming and recording on anything but siphon-rtp).
     pub fn is_unsupported_verb(&self) -> bool {
         matches!(
             self,

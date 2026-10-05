@@ -64,7 +64,14 @@ rather than crashing on them, but closing means there is nothing to drop.
 `Call` verbs: `answer()` / `answer_with(code, …)` /
 `answer_anchored(profile=None, ws_uri=None)`, `ring(reason=None)`, `progress()`,
 `reject(code, reason)`, `hangup(reason=None)`, `drop(reason=None)`,
-`refer(to)` / `transfer(to)`, `set_header(name, value)` / `get_header(name)`,
+`refer(to)` / `transfer(to)`, `dial(targets, …)` / `cancel_dial(reason=None)`,
+`route(targets, …)`, `accept_refer(…)` / `reject_refer(code, reason=None)` /
+`complete_refer(code, reason=None)`, `replace_peer(…)`,
+`bridge(with_channel, …)` / `unbridge(reason=None)`,
+`play(…)` / `play_file(file)` / `stop()` / `dtmf(digits, …)` / `hold()` /
+`unhold()`, `stream_start(ws_uri, …)` / `stream_stop()`,
+`record_start(…)` / `record_stop(recording_id=None)`,
+`set_header(name, value)` / `get_header(name)` / `remove_header(name)`,
 `set_var(key, value)` / `get_var(key)`, plus the generic
 `command(verb, args=None)` escape hatch and
 `next_event()`. A rejected command raises `ControlError` carrying a stable
@@ -75,8 +82,9 @@ rather than crashing on them, but closing means there is nothing to drop.
 the event stream with the module-level `is_transfer_final(kind)` and
 `transfer_outcome(event)` rather than matching the wire strings by hand
 (`isTransferFinal` / `transferOutcome` in TypeScript, `CallEvent::is_transfer_final`
-/ `CallEvent::transfer_outcome` in Rust). Media verbs (`play_file` / `dtmf`) raise with `code ==
-"unsupported_verb"` until the server implements them.
+/ `CallEvent::transfer_outcome` in Rust). A verb the configured media backend
+cannot carry out raises with `code == "unsupported_verb"`: the stream and
+record verbs on rtpengine or rtpproxy, and `play(repeat="inf")` there.
 
 ## Rust — `siphon-control-client`
 
