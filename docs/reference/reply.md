@@ -29,4 +29,12 @@ BYE, and siphon forwards it as it is: no `@proxy.on_reply` handler and no
 per-relay `on_reply=` callback runs for it, and it is not the call's answer in
 a CDR or on Rf.
 
+The same holds for a retransmission of a 2xx to an INVITE. A handler sees the
+first copy; the callee repeats it until the caller's ACK arrives, and siphon
+forwards each repeat by its Via stack with the framework's own changes only
+(its Via removed, the Contact fixed under `nat.fix_contact`). What a handler
+changed on the first copy, a header or the SDP, is not on the repeats: they
+exist to get an answer through that was lost, and the caller takes its dialog
+from whichever copy arrives first.
+
 ::: siphon_sdk.reply.Reply

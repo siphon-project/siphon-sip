@@ -119,9 +119,19 @@ fn assert_late_answer_is_forwarded_and_released(
         "the late 2xx is not the call's answer: nothing is stamped on its record"
     );
 
-    // The same 2xx again is this branch's retransmission, not another answer.
+    // The same 2xx again is this branch's retransmission: it reaches the
+    // caller as the first did (RFC 3261 §16.7 step 9), and is not another
+    // answer to anything.
     answers(proxy, callee, branch_invite, 200, "OK");
-    assert!(answers_to_caller(&proxy.wire()).is_empty());
+    let again = answers_to_caller(&proxy.wire());
+    assert_eq!(again.len(), 1);
+    assert_eq!(headers(&again[0], "Via"), headers(answer, "Via"));
+    assert_eq!(header(&again[0], "To"), header(answer, "To"));
+    assert_eq!(
+        call_record(proxy, call_id),
+        record_before,
+        "a retransmission stamps nothing either"
+    );
 
     // The caller ACKs the dialog (a request of its own, on the route set)...
     let route_set: Vec<String> = record_route.into_iter().rev().collect();

@@ -65,11 +65,9 @@ pub(super) fn forward_if_late_2xx(
             }
         };
         if action != crate::proxy::fork::ForkAction::ForwardAnother2xx {
-            // This branch's own 2xx again: forwarded once already.
-            debug!(
-                client_key = %client_key,
-                "retransmitted 2xx on a branch that already answered — not forwarded twice"
-            );
+            // This branch's own 2xx again: its retransmission, which goes to
+            // the caller like any other and is nobody's answer a second time.
+            forward_2xx_statelessly(inbound, message, status_code, state);
             return true;
         }
     }
@@ -153,4 +151,172 @@ pub(super) fn send_late_2xx_upstream(
 
     // The branch has its final response.
     state.session_store.remove_client_key(client_key);
+}
+
+/// The Via values of `message`, in order, whether they came one per header
+/// line or several to a line.
+fn via_stack(message: &SipMessage) -> Option<Vec<Via>> {
+    let mut stack = Vec::new();
+    for line in message.headers.get_all("Via")? {
+        stack.extend(Via::parse_multi(line).ok()?);
+    }
+    Some(stack)
+}
+
+/// Whether `via` is one this instance puts on a request it forwards: its
+/// branch has the form siphon generates (the RFC 3261 cookie, a hyphen and 32
+/// hexadecimal digits), and its sent-by is an address this instance answers
+/// on. What a stateless forward goes by, since no transaction vouches for the
+/// response: a response whose top Via fails this was not sent in answer to
+/// anything this instance forwarded.
+pub(super) fn is_own_forwarding_via(via: &Via, state: &DispatcherState) -> bool {
+    let own_branch = via
+        .branch
+        .as_deref()
+        .and_then(|branch| branch.strip_prefix("z9hG4bK-"))
+        .is_some_and(|unique| {
+            unique.len() == 32 && unique.bytes().all(|byte| byte.is_ascii_hexdigit())
+        });
+    if !own_branch {
+        return false;
+    }
+    let Some(port) = via.port else {
+        // siphon always stamps a port.
+        return false;
+    };
+    if state.self_identity.matches(&via.host, Some(port)) {
+        return true;
+    }
+    strip_ipv6_brackets(&via.host)
+        .parse::<IpAddr>()
+        .is_ok_and(|ip| state.is_own_address(&SocketAddr::new(ip, port)))
+}
+
+/// Where a response goes by the Via `via` under the proxy's own (RFC 3261
+/// §18.2.2): the `received` address when there is one, else the sent-by host;
+/// the `rport` port when it has a value (RFC 3581), else the sent-by port,
+/// else the transport's default.
+fn response_hop(via: &Via, state: &DispatcherState) -> Option<(SocketAddr, Transport)> {
+    let transport = Transport::from_scheme(&via.transport)?;
+    let default_port = match transport {
+        Transport::Tls | Transport::WebSocketSecure => 5061,
+        _ => 5060,
+    };
+    let port = via.rport.flatten().or(via.port).unwrap_or(default_port);
+    let host = via.received.as_deref().unwrap_or(&via.host);
+    if let Ok(ip) = strip_ipv6_brackets(host).parse::<IpAddr>() {
+        return Some((SocketAddr::new(ip, port), transport));
+    }
+    let uri = format!(
+        "sip:{}:{port};transport={}",
+        format_sip_host(host),
+        transport.as_scheme()
+    );
+    resolve_target(&uri, &state.dns_resolver).map(|target| (target.address, transport))
+}
+
+/// Forward a 2xx to an INVITE that matched no client transaction and no
+/// session, by its Via stack (RFC 3261 §16.7 step 9: "the element MUST forward
+/// the response statelessly by sending it to the server transport"). Returns
+/// whether the response was taken.
+///
+/// That is the retransmission of an answer the proxy already forwarded (its
+/// state went with the first copy; the callee repeats the 2xx until the
+/// caller's ACK reaches it, §13.3.1.4, so a copy lost toward the caller is
+/// only ever made good by forwarding the next one), and the answer of a
+/// branch whose state is gone for another reason, such as one the proxy timed
+/// out.
+///
+/// Guarded, because nothing else vouches for such a response: the top Via must
+/// be one this instance generates ([`is_own_forwarding_via`]) and a second Via
+/// must say where the request came from.
+///
+/// It is forwarded with what the framework itself does to a 2xx on its way
+/// upstream and nothing else: the proxy's Via removed, and the Contact fixed
+/// when `nat.fix_contact` is on. No `@proxy.on_reply` runs (the script saw the
+/// request end with the first 2xx, and what it changed on that one cannot be
+/// repeated here), and nothing is counted: no CDR, no Rf.
+///
+/// Reached only where a response would otherwise be logged as for an unknown
+/// branch, so a response anything still claims never pays for it.
+pub(super) fn forward_2xx_statelessly(
+    inbound: &InboundMessage,
+    response: &SipMessage,
+    status_code: u16,
+    state: &DispatcherState,
+) -> bool {
+    if !(200..300).contains(&status_code) {
+        return false;
+    }
+    let to_invite = response
+        .headers
+        .get("CSeq")
+        .and_then(|cseq| crate::sip::headers::cseq::CSeq::parse(cseq).ok())
+        .is_some_and(|cseq| cseq.method == Method::Invite);
+    if !to_invite {
+        return false;
+    }
+    let Some(stack) = via_stack(response) else {
+        return false;
+    };
+    let [own, upstream, ..] = stack.as_slice() else {
+        return false;
+    };
+    if !is_own_forwarding_via(own, state) {
+        return false;
+    }
+    let Some((destination, transport)) = response_hop(upstream, state) else {
+        warn!(
+            via = %upstream,
+            "cannot forward a 2xx statelessly: its second Via names no address this proxy can reach"
+        );
+        return false;
+    };
+
+    let mut forwarded = response.clone();
+    core::strip_top_via(&mut forwarded.headers);
+    let forwarded = if state.nat_fix_contact {
+        fix_response_contact(forwarded, inbound.remote_addr)
+    } else {
+        forwarded
+    };
+    info!(
+        %destination,
+        %transport,
+        "forwarding a 2xx to an INVITE statelessly, by its Via (RFC 3261 §16.7 step 9)"
+    );
+    let data = Bytes::from(forwarded.to_bytes());
+    if transport.is_stream() {
+        // RFC 3261 §18.2.2: over the connection the request came in on, if it
+        // is still open; else a new one to the address the Via gives.
+        match state.stream_connections.reuse(destination, transport) {
+            Some(connection_id) => {
+                send_outbound_from(data, transport, destination, connection_id, None, state);
+            }
+            None => {
+                send_to_target(
+                    data,
+                    &RelayTarget {
+                        address: destination,
+                        transport: Some(transport),
+                        server_name: None,
+                    },
+                    transport,
+                    ConnectionId::default(),
+                    None,
+                    state,
+                );
+            }
+        }
+    } else {
+        send_outbound_from(
+            data,
+            transport,
+            destination,
+            ConnectionId::default(),
+            None,
+            state,
+        );
+    }
+    true
 }

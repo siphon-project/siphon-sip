@@ -1251,6 +1251,12 @@ pub(super) fn handle_response(
     if ack_late_2xx_after_teardown(&inbound, &message, status_code, state) {
         return;
     }
+    // A 2xx to an INVITE this proxy forwarded and holds nothing for any more
+    // (the retransmission of an answer, an answer after a timeout) still goes
+    // to the caller, by its Via (RFC 3261 §16.7 step 9).
+    if forward_2xx_statelessly(&inbound, &message, status_code, state) {
+        return;
+    }
     match torn_down_call {
         Some(call_id) => warn!(call_id = %call_id, "B2BUA: response for unknown call"),
         None => debug!(branch = %branch, "response for unknown branch (not ours)"),

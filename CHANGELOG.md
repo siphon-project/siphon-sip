@@ -205,7 +205,28 @@ entry, but a working config keeps working.
   session is opened; and the BYE that ends its dialog does not close the
   call's record or its Rf session, which belong to the dialog that was
   answered first and may still be up. A branch's own 2xx arriving again is
-  its retransmission and is not forwarded a second time.
+  its retransmission, and the next entry's.
+- **A retransmitted 2xx to a proxied INVITE reaches the caller.** A callee
+  repeats its 2xx until the caller's ACK reaches it (RFC 3261 §13.3.1.4),
+  and a proxy forwards every copy: the proxy's state for the INVITE goes with
+  the first one, so the rest match nothing and go by their Via stack (§16.7
+  step 9). siphon dropped them, so a `200` lost between siphon and the
+  caller, over UDP, was lost for good: the caller never heard the answer and
+  the call failed after 32 s. The same went for a 2xx on a branch whose state
+  was gone for another reason, such as one the proxy had timed out with a
+  `408`. Such a 2xx is now forwarded by its Via stack, when its top Via is
+  one this instance generates (its own sent-by, and a branch of the form it
+  makes) and a second Via says where the request came from: to that Via's
+  `received` and `rport` when it has them, else its sent-by, over the
+  connection the request came in on when the transport is a stream one.
+  Anything else is dropped as before. It carries what the framework does to
+  a 2xx (the proxy's Via removed, and the Contact fixed under
+  `nat.fix_contact`), and only that: no `@proxy.on_reply` runs for it, so a
+  header or body a script changed on the first copy is not changed on this
+  one, and nothing is counted in a CDR or on Rf. Kept state would be needed
+  for more, and an answered call keeps none. siphon does not add `received`
+  or `rport` to the Via of a request it forwards, so toward a caller behind a
+  NAT the copy goes to the address the caller wrote in its Via.
 - **The proxy ACKs a failed branch once.** A 300-699 final response to a
   proxied INVITE drew two ACKs: the INVITE client transaction's (RFC 3261
   §17.1.1.3) and a second one built by the proxy itself. Only the

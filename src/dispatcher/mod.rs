@@ -199,6 +199,8 @@ mod proxy_protocol_tests;
 #[cfg(test)]
 mod proxy_reply_filter_tests;
 #[cfg(test)]
+mod proxy_stateless_2xx_tests;
+#[cfg(test)]
 mod proxy_timer_c_tests;
 #[cfg(test)]
 mod public_api_surface;
