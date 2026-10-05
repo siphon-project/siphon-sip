@@ -691,6 +691,15 @@ if [[ "$RUN_B2BUA" == true ]]; then
   run_sipp docker compose -f "$COMPOSE_FILE" --profile b2bua-rtpengine-refer up --abort-on-container-exit --exit-code-from sipp-anchored-refer-uac sipp-anchored-refer-uac sipp-anchored-refer-bob-uas sipp-anchored-refer-carol-uas
   docker compose -f "$COMPOSE_FILE" --profile b2bua-rtpengine-refer down 2>/dev/null || true
 
+  # The caller speaks SRTP and the callee plain RTP, anchored with a profile
+  # whose halves say so. The callee holds and resumes: each re-INVITE must reach
+  # the caller as SRTP and be answered to the callee as plain RTP. Both parties
+  # assert the SDP they are sent, so both are graded.
+  echo "=== B2BUA callee re-offer at an SRTP edge + REAL rtpengine (each party keeps its transport) ==="
+  docker compose -f "$COMPOSE_FILE" --profile b2bua-rtpengine-reoffer up -d --wait rtpengine-real siphon-b2bua-rtpengine-reoffer
+  run_sipp env COMPOSE_PROFILES=b2bua-rtpengine-reoffer bash sipp/run_call.sh sipp-srtp-edge-reoffer-uac sipp-srtp-edge-reoffer-uas
+  docker compose -f "$COMPOSE_FILE" --profile b2bua-rtpengine-reoffer down 2>/dev/null || true
+
   echo "=== B2BUA CANCEL test (INVITE → CANCEL → 487) ==="
   run_sipp docker compose -f "$COMPOSE_FILE" --profile b2bua --profile b2bua-cancel up --abort-on-container-exit --exit-code-from sipp-b2bua-cancel-uac sipp-b2bua-cancel-uac sipp-b2bua-cancel-uas
   docker compose -f "$COMPOSE_FILE" --profile b2bua --profile b2bua-cancel rm -sf sipp-b2bua-cancel-uac sipp-b2bua-cancel-uas 2>/dev/null || true
