@@ -16,6 +16,7 @@ use crate::sip::message::SipMessage;
 
 use super::*;
 
+mod by_branch;
 mod dial_branch;
 mod dialog_watch;
 mod failure;
@@ -527,11 +528,7 @@ impl CallActorStore {
         let Some(leg) = call.b_legs.get_mut(b_leg_index) else {
             return false;
         };
-        if leg.prack_acked_rseq.get(to_tag).is_some_and(|&v| v >= rseq) {
-            return false;
-        }
-        leg.prack_acked_rseq.insert(to_tag.to_string(), rseq);
-        true
+        by_branch::mark_prack_acked(leg, to_tag, rseq)
     }
 
     /// 401/407 auth-retry dedup: returns `true` exactly once for the first

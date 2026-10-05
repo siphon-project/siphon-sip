@@ -91,8 +91,10 @@ fn random_retry_after() -> String {
 
 /// Where the late offer goes, decided under the call's lock.
 enum LateOfferRoute {
-    /// In an UPDATE on the dialog of the answered callee at this index.
-    Update(usize),
+    /// In an UPDATE on the dialog of the answered callee, named by the Via
+    /// branch of its INVITE: the media engine is asked before the UPDATE is
+    /// built, and a position among the call's legs may have moved by then.
+    Update(String),
     Refuse {
         status: u16,
         retry_after: Option<String>,
@@ -145,14 +147,11 @@ pub fn carry_late_prack_offer(
                     why: "another offer of the caller's is still with the callee (RFC 3311 §5.2)",
                 };
             }
-            let callee = call
-                .winner
-                .and_then(|index| call.b_legs.get(index).map(|leg| (index, leg)));
-            match callee {
+            match call.winning_b_leg() {
                 // The Allow of the callee's 2xx, as the session timer negotiation
                 // recorded it on the dialog.
-                Some((index, leg)) if leg.dialog.peer_allows_update => {
-                    LateOfferRoute::Update(index)
+                Some(leg) if leg.dialog.peer_allows_update => {
+                    LateOfferRoute::Update(leg.branch.clone())
                 }
                 Some(_) => LateOfferRoute::Refuse {
                     status: 488,
@@ -171,8 +170,8 @@ pub fn carry_late_prack_offer(
             retry_after: None,
             why: "the call is gone",
         });
-    let index = match route {
-        LateOfferRoute::Update(index) => index,
+    let branch = match route {
+        LateOfferRoute::Update(branch) => branch,
         LateOfferRoute::Refuse {
             status,
             retry_after,
@@ -193,9 +192,6 @@ pub fn carry_late_prack_offer(
             return refuse(488, None, "the media engine refused the offer");
         }
     };
-    let Some(cseq) = state.call_actors.next_b_leg_local_cseq(call_id, index) else {
-        return refuse(500, None, "the callee's leg is gone");
-    };
     let source = RequestSource {
         transport: inbound.transport,
         remote_addr: inbound.remote_addr,
@@ -207,7 +203,10 @@ pub fn carry_late_prack_offer(
         .get_call_mut(call_id)
         .and_then(|mut guard| {
             let call = &mut *guard;
-            let leg = call.b_legs.get_mut(index)?;
+            // Found, numbered and built under one lock, by branch.
+            let leg = call.b_legs.iter_mut().find(|leg| leg.branch == branch)?;
+            leg.dialog.local_cseq = leg.dialog.local_cseq.saturating_add(1);
+            let cseq = leg.dialog.local_cseq;
             let mut sdp = offer;
             let transport = leg.transport.transport;
             stamp_b_leg_origin(&mut sdp, &content_type, leg, &transport, state);
@@ -229,14 +228,14 @@ pub fn carry_late_prack_offer(
                 a_leg_rseq,
                 b_leg_call_id: leg.dialog.call_id.clone(),
                 b_leg_cseq: cseq,
-                b_leg_index: index,
+                branch: branch.clone(),
                 sent_offer,
                 offer: caller_prack.body.clone(),
                 sent_at: Instant::now(),
             });
-            Some((update, leg))
+            Some((update, leg, cseq))
         });
-    let Some((update, leg)) = built else {
+    let Some((update, leg, cseq)) = built else {
         return refuse(500, None, "the UPDATE to the callee could not be built");
     };
     let (destination, transport) = resolve_in_dialog_destination(

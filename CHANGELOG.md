@@ -139,6 +139,25 @@ entry, but a working config keeps working.
   referrer, and `481` from an `accept_refer` that finds the call already
   gone. The deadline's `603` for an application that never decides is
   unchanged.
+- **A transfer target's reliable provisional is PRACKed.** When the caller
+  of a call supports `100rel`, siphon holds its PRACK for a callee's reliable
+  provisional until the caller PRACKs siphon's copy (RFC 3262 §5). The target
+  of a siphon-terminated transfer or a `replace_peer` was treated the same
+  way, but its provisionals are never relayed to the caller, so the PRACK it
+  was owed waited for one that could not come, and a UAS left without a PRACK
+  rejects the INVITE after 64·T1 (RFC 3262 §3). siphon now PRACKs a
+  replacement target at once, on that target's own early dialog. A call
+  whose caller does not support `100rel` already did.
+- **A PRACK and a branch's failure follow their leg, not its position.**
+  siphon noted a B-leg's position among the call's legs when a response
+  arrived and acted on it later: a PRACK held for the caller's is sent when
+  that arrives, and a branch's failure is recorded after the retries and
+  hooks a failure runs. A leg ahead of it taken off the call in between (the
+  tracking leg of an in-dialog request once it is answered, a failed
+  transfer's targets) moved every later leg down one, so the position no
+  longer named that leg and a PRACK addressed by it was not sent. Both now
+  find the leg by the Via branch of its INVITE (RFC 3261 §8.1.1.7), under
+  the lock that acts on it.
 - **A transfer target given up on at its deadline has its `487` ACKed.** When
   a siphon-terminated transfer or `replace_peer` ran out of time, siphon sent
   the target a CANCEL and forgot the leg at once, so the `487 Request

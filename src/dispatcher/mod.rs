@@ -186,6 +186,8 @@ mod relayed_identity_tests;
 #[cfg(test)]
 mod replacement_fork_tests;
 #[cfg(test)]
+mod replacement_prack_tests;
+#[cfg(test)]
 mod reply_script_header_tests;
 #[cfg(test)]
 mod retransmit_capture_tests;
