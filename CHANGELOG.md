@@ -177,6 +177,12 @@ entry, but a working config keeps working.
   transaction's is sent now, and it goes to the address, port and transport
   the INVITE went to, as §17.1.1.3 has it, also when the response arrived
   from another port.
+- **A proxied branch that never answered is no longer sent an ACK.** When a
+  branch timed out, or its request could not be sent, the proxy answers for
+  it (a `408`, RFC 3261 §16.7 step 2; a `503`, §16.9) and then ACKed that
+  response of its own to the branch, which had sent nothing. An ACK is now
+  only ever the INVITE client transaction's answer to a response it received
+  (§17.1.1.3).
 - **A transfer whose target cannot be dialled ends its subscription and
   leaves the call free.** A siphon-terminated REFER answers `202` and sends
   the `100 Trying` NOTIFY before it dials. When no INVITE could then be sent

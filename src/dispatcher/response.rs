@@ -381,7 +381,6 @@ pub(super) fn handle_response(
 
     // Feed response to client transaction (if one exists).
     // The state machine handles retransmit absorption and timer cancellation.
-    let mut acked_by_transaction = false;
     if let Some(ref key) = client_txn_key {
         let event = if status_code < 200 {
             if key.method == crate::sip::message::Method::Invite {
@@ -428,7 +427,6 @@ pub(super) fn handle_response(
                                     size = frame.len(),
                                     "sending cached ACK frame"
                                 );
-                                acked_by_transaction = true;
                                 send_outbound_from(
                                     frame.clone(),
                                     ack_transport,
@@ -498,7 +496,6 @@ pub(super) fn handle_response(
                 original_request,
                 relay_on_reply,
                 relay_on_failure,
-                client_branch,
                 final_response_sent,
                 record_routed,
                 failure_retargets,
@@ -527,66 +524,24 @@ pub(super) fn handle_response(
                     session.original_request.clone(),
                     relay_on_reply,
                     relay_on_failure,
-                    session.client_branches.get(client_key).cloned(),
                     session.final_response_sent,
                     session.record_routed,
                     session.failure_retargets,
                 )
             };
 
-            // RFC 3261 §17.1.1.3: the client transaction MUST generate an ACK
-            // for non-2xx final responses to INVITE, sent hop-by-hop to the
-            // same downstream destination. It has, above, when there is one;
-            // a second ACK from here would be a second request on the wire for
-            // one response.
-            if status_code >= 300
-                && client_key.method == crate::sip::message::Method::Invite
-                && !acked_by_transaction
-            {
-                match client_branch {
-                    Some(ref cb) => {
-                        let ack = build_ack_for_non2xx(
-                            &original_request,
-                            &message,
-                            &branch,
-                            cb.transport,
-                            &client_key.sent_by,
-                        );
-                        send_to_target(
-                            ack.to_bytes().into(),
-                            &RelayTarget {
-                                address: cb.destination,
-                                transport: Some(cb.transport),
-                                server_name: None,
-                            },
-                            cb.transport,
-                            cb.connection_id,
-                            None,
-                            state,
-                        );
-                        info!(
-                            branch = %branch,
-                            destination = %cb.destination,
-                            transport = %cb.transport,
-                            "ACK for {status_code} sent downstream"
-                        );
-                    }
-                    None => {
-                        warn!(
-                            branch = %branch,
-                            status = status_code,
-                            "cannot send ACK for non-2xx: no client branch in session"
-                        );
-                    }
-                }
-            }
+            // RFC 3261 §17.1.1.3: the ACK of a 300-699 final response is the
+            // INVITE client transaction's, and it sent it above. A response no
+            // client transaction took is not ACKed from here: that is one the
+            // proxy answered the branch with itself (a timeout's 408, a
+            // transport error's 503), which the peer never sent.
 
             // A reply-time `reply.reject()` already committed a final response
             // upstream for this server transaction and CANCELled the pending
             // branch(es).  This response is the straggler that CANCEL drew back
             // (typically the `487` answering it, or a late provisional).  Any
-            // non-2xx final was ACKed downstream just above (and by the client
-            // transaction), so absorb it here — forwarding it would put a second
+            // non-2xx final was ACKed downstream by the client transaction, so
+            // absorb it here — forwarding it would put a second
             // final response on the wire to the UAC.  The single-target relay
             // path has no fork aggregator to dedup, so this flag is the guard.
             if final_response_sent {

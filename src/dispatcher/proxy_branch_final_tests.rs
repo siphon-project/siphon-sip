@@ -7,7 +7,8 @@
 //! [`super::proxy_cancel_awaits_provisional_tests`], read off the UDP egress.
 
 use super::proxy_cancel_awaits_provisional_tests::{
-    answers, branch_of, call, relaying_proxy, requests_to, responses_to_caller, FAILED,
+    answers, branch_of, call, fire, relaying_proxy, requests_to, responses_to_caller, FAILED,
+    SILENT,
 };
 use super::proxy_dialog_state_tests::{find, header, response_to};
 use super::*;
@@ -64,4 +65,21 @@ async fn the_ack_of_a_failure_goes_where_the_invite_went() {
     let sent = proxy.wire();
     assert_eq!(requests_to(&sent, FAILED, Method::Ack).len(), 1);
     assert!(requests_to(&sent, elsewhere, Method::Ack).is_empty());
+}
+
+/// A branch that never responds is answered for by the proxy (a 408 to the
+/// caller, RFC 3261 §16.7 step 2), and is sent no ACK: it sent no response to
+/// acknowledge.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_branch_that_timed_out_is_sent_no_ack() {
+    let proxy = relaying_proxy(SILENT, "");
+    let (_, invites) = call(&proxy, "no-ack-for-a-timeout@example.com");
+    let to_silent = find(&invites, SILENT).clone();
+    fire(&proxy, &to_silent, TimerName::B);
+    let sent = proxy.wire();
+    assert_eq!(responses_to_caller(&sent), [408]);
+    assert!(
+        requests_to(&sent, SILENT, Method::Ack).is_empty(),
+        "no ACK for a response the branch never sent"
+    );
 }

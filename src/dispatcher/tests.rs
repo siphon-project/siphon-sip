@@ -5021,54 +5021,6 @@ fn build_response_replace_then_add_for_same_header_keeps_replace_then_appends() 
     assert!(warns[1].contains("second"));
 }
 
-#[test]
-fn build_ack_for_non2xx_has_correct_headers() {
-    let request = sample_invite();
-    let response = build_response(&request, 480, "Temporarily Unavailable", None, &[]);
-    let ack = build_ack_for_non2xx(
-        &request,
-        &response,
-        "z9hG4bK-proxy-branch",
-        Transport::Tcp,
-        "10.0.0.1:5060",
-    );
-
-    // Must be an ACK request
-    assert!(ack.is_request());
-    let bytes = String::from_utf8(ack.to_bytes()).unwrap();
-    assert!(bytes.starts_with("ACK sip:bob@biloxi.com SIP/2.0\r\n"));
-
-    // Via: our own hop only (not the UAC's)
-    let via = ack.headers.via().unwrap();
-    assert!(via.contains("z9hG4bK-proxy-branch"));
-    assert!(via.contains("TCP"));
-    assert!(via.contains("10.0.0.1:5060"));
-
-    // From: same as original request
-    assert_eq!(ack.headers.from().unwrap(), request.headers.from().unwrap());
-
-    // To: from the response (may have To-tag)
-    assert_eq!(ack.headers.to().unwrap(), response.headers.to().unwrap());
-
-    // Call-ID: same as original
-    assert_eq!(
-        ack.headers.call_id().unwrap(),
-        request.headers.call_id().unwrap()
-    );
-
-    // CSeq: same number, ACK method
-    let cseq = ack.headers.cseq().unwrap();
-    assert!(cseq.contains("314159"));
-    assert!(cseq.contains("ACK"));
-    assert!(!cseq.contains("INVITE"));
-
-    // Max-Forwards present
-    assert_eq!(ack.headers.get("Max-Forwards").unwrap(), "70");
-
-    // Content-Length: 0
-    assert_eq!(ack.headers.content_length(), Some(0));
-}
-
 /// Build a representative B-leg INVITE — i.e. one that has already been
 /// through the hygiene chain in `b2bua_send_b_leg_invite`: stripped
 /// Record-Route/Route/Authorization, our own Via and Contact, rewritten
