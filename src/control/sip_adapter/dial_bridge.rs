@@ -690,10 +690,13 @@ impl Coordinator {
         self.release();
     }
 
-    /// The dial is over: the caller may dial again.
+    /// The dial is over: the caller may dial again. Only this dial's own
+    /// claim is let go of, never one a later dial has taken since.
     fn release(&self) {
         if let Some(state) = self.dispatcher.state() {
-            state.dial_bridges.release(&self.caller.sip_call_id);
+            state
+                .dial_bridges
+                .release_dial(&self.caller.sip_call_id, &self.signals);
         }
     }
 }

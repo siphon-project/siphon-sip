@@ -72,7 +72,7 @@ async fn cancelled_bridge_dial_to_a_silent_phone(
     assert_eq!(reply["status"], "ok", "{reply}");
     assert_eq!(reply["result"]["state"], "cancelled");
     // What the controller is told does not wait for the phone.
-    let heard = through_dial_failed(&controller, queued).await;
+    let heard = through_dial_failed(&controller, queued);
     assert_eq!(names(&heard), ["DialBranchFailed", "DialFailed"]);
     assert_eq!(heard[0].payload["code"], 487);
     assert_eq!(heard[0].payload["cause"], "cancelled");

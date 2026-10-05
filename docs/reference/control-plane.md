@@ -1668,6 +1668,15 @@ to the caller. The same holds wherever siphon gives up on an INVITE it sent: a
 ring timeout, the phones that lose to the one that answered, `hangup` of an
 unanswered `originate`, `drop`, `terminate`, and the caller's own CANCEL.
 
+**The reply means the dial is over.** Each phone's `DialBranchFailed` and the
+dial's `DialFailed` are queued ahead of it, the ringback has been stopped, and
+nothing of the dial holds the caller any more: a `dial` or a `route` sent on
+reading the reply is not refused `dial_in_progress`. For a bridging dial that
+takes one exchange with the media engine, to stop the ringback, and the reply
+waits for it. It waits for no phone. Should that exchange not finish within
+5 s the reply is sent anyway, with the caller released, and `DialFailed`
+follows it.
+
 The reply is `{channel, state: "cancelled", on_answer}`. Refused, each with
 `error.details` `{verb: "cancel_dial", reason}`:
 

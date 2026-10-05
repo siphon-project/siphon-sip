@@ -436,6 +436,22 @@ entry, but a working config keeps working.
   leg that supersedes a challenged one is stored on that leg's own slot,
   found by its branch. Nothing changes
   for a call whose legs have not moved.
+- **The reply to `cancel_dial` means the dial is over.** Cancelling a
+  bridging dial (`dial {on_answer: "bridge"}`) CANCELled the phones and
+  replied at once, while the dial's own task was still stopping the ringback
+  on the media engine; only after that did it report `DialFailed` and let go
+  of the caller. An application that acted on the reply, as the `route`
+  refusal tells it to (`cancel_dial` first), could have its `route` or its
+  next `dial` refused `invalid_state` / `dial_in_progress` for a dial it had
+  just been told was cancelled. The reply is now held until the dial has let
+  go: each phone's `DialBranchFailed` and the dial's `DialFailed` are queued
+  ahead of it, the ringback is stopped, and a `dial` or `route` sent on
+  reading it is taken. The wait is for that one exchange with the media
+  engine and never for a phone; after 5 s the reply is sent anyway with the
+  caller released, and `DialFailed` follows it. A connecting dial's cancel
+  already reported `DialFailed` ahead of its reply and is unchanged. A dial's
+  task also lets go only of its own claim on the caller, so one that ends
+  late cannot release a dial placed after it.
 
 ### Changed
 
