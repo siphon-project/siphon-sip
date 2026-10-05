@@ -40,6 +40,23 @@ entry, but a working config keeps working.
 
 ### Fixed
 
+- **A bridged party's media ingress is pinned by its own profile, not the
+  other party's.** In a `bridge` (and a `dial {on_answer: "bridge"}`, which
+  ends in one) each media-engine command carries one party's SDP and is shaped
+  by the other party's profile, and the `received_from` policy was read from
+  that shaping profile. A party behind NAT, whose SDP names an address its
+  media does not come from, was therefore pinned to its signalling source only
+  if the party it was joined to had a profile asking for that. Joined to a
+  caller answered with a profile that does not, its answer reached the engine
+  with no source hint, the engine expected its media from the address in its
+  SDP, and the call was silent in both directions. The reverse held too: a
+  party whose profile asks for no hint was pinned to its signalling source by
+  the other's, which gates out one whose media comes from a different host
+  than its signalling. The hint now follows the profile of the party whose SDP
+  the command carries, on the bridge's offer and answer and on every re-offer
+  relayed across the formed pair, while the rest of each command is shaped as
+  before. `bridge {profile}` is unchanged: the pair profile describes both
+  parties, its `offer` half the anchor and its `answer` half the `with` leg.
 - **A retransmitted INVITE on a B2BUA call is answered.** The retransmission
   was recognised (it creates no second call) and then dropped without a
   response. A caller retransmits because it has seen no provisional, so one

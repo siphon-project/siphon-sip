@@ -16,7 +16,9 @@
 //! re-INVITE (or UPDATE) of siphon's own with the result; and the answer that
 //! comes back goes to the engine as the `answer`, shaped by the sender's side,
 //! whose result is the 200 the sender gets. `received_from` is stamped with the
-//! signalling source of the party whose SDP each command carries.
+//! signalling source of the party whose SDP each command carries, where that
+//! party's own profile asks for it — not the profile that shapes the command,
+//! which is the other party's.
 //!
 //! * **Refused** — the other leg's final status goes back to the sender, and
 //!   the engine is put back: the sender's previous media re-offered and closed
@@ -56,6 +58,11 @@ struct RelayMedia {
     sender_side: crate::rtpengine::session::SideFlags,
     /// What shapes SDP the engine sends the receiver.
     receiver_side: crate::rtpengine::session::SideFlags,
+    /// Whose `received_from` policy pins the sender's media ingress, on the
+    /// re-offer that carries the sender's SDP.
+    sender_ingress: crate::rtpengine::session::SideFlags,
+    /// Whose policy pins the receiver's, on the answer that carries its SDP.
+    receiver_ingress: crate::rtpengine::session::SideFlags,
     /// The sender's SIP Call-ID: the dialog the re-offered SDP belongs to.
     sender_sip_call_id: String,
     /// The receiver's SIP Call-ID: the dialog the answer belongs to.
@@ -332,15 +339,18 @@ fn relay_media(
         .as_ref()
         .and_then(|store| store.get(&anchor_key))
         .ok_or("the pair has no media session")?;
+    // A session with no sides recorded has one profile describing the pair the
+    // way a dial's does: its `offer` half is the one the offerer's (the
+    // anchor's) SDP was sent under, its `answer` half the answerer's.
+    let half = |half| SideFlags {
+        profile: session.profile.clone(),
+        half,
+    };
     let sides = session.bridge_sides.clone().unwrap_or_else(|| BridgeSides {
-        anchor: SideFlags {
-            profile: session.profile.clone(),
-            half: ProfileHalf::Answer,
-        },
-        peer: SideFlags {
-            profile: session.profile.clone(),
-            half: ProfileHalf::Offer,
-        },
+        anchor: half(ProfileHalf::Answer),
+        peer: half(ProfileHalf::Offer),
+        anchor_ingress: half(ProfileHalf::Offer),
+        peer_ingress: half(ProfileHalf::Answer),
     });
     let peer_tag = session
         .to_tag
@@ -354,6 +364,8 @@ fn relay_media(
             receiver_tag: peer_tag,
             sender_side: sides.anchor,
             receiver_side: sides.peer,
+            sender_ingress: sides.anchor_ingress,
+            receiver_ingress: sides.peer_ingress,
             sender_sip_call_id,
             receiver_sip_call_id,
         }
@@ -364,25 +376,37 @@ fn relay_media(
             receiver_tag: anchor_tag,
             sender_side: sides.peer,
             receiver_side: sides.anchor,
+            sender_ingress: sides.peer_ingress,
+            receiver_ingress: sides.anchor_ingress,
             sender_sip_call_id,
             receiver_sip_call_id,
         }
     }))
 }
 
-/// `flags` resolved, with `received_from` stamped where they ask for it and
-/// the Call-ID of the dialog whose SDP the command carries.
+/// `side`'s flags resolved, with `received_from` stamped where `ingress` asks
+/// for it and the Call-ID of the dialog whose SDP the command carries.
+///
+/// Two parties are in play on every command: `side` shapes the SDP the engine
+/// sends one of them, and the SDP the command carries — with the `source` it
+/// came from — is the other's. `ingress` is that other party's own policy, so
+/// neither party is pinned, or left unpinned, by the profile of the one it is
+/// talking to.
 fn side_flags(
     state: &DispatcherState,
     side: &crate::rtpengine::session::SideFlags,
+    ingress: &crate::rtpengine::session::SideFlags,
     source: std::net::IpAddr,
     sip_call_id: &str,
 ) -> Result<crate::rtpengine::profile::NgFlags, String> {
-    let mut flags = state
+    let registry = state
         .rtpengine_profiles
         .as_ref()
-        .and_then(|registry| side.resolve(registry))
+        .ok_or("no media profiles are configured")?;
+    let mut flags = side
+        .resolve(registry)
         .ok_or_else(|| format!("unknown media profile '{}'", side.profile))?;
+    flags.carry_received_from = ingress.pins_ingress(registry);
     flags.stamp_received_from(source);
     flags.stamp_sip_call_id(sip_call_id);
     Ok(flags)
@@ -400,7 +424,13 @@ fn reoffer(
         .rtpengine_set
         .as_ref()
         .ok_or("no media backend is configured")?;
-    let flags = side_flags(state, toward, sender_source, &media.sender_sip_call_id)?;
+    let flags = side_flags(
+        state,
+        toward,
+        &media.sender_ingress,
+        sender_source,
+        &media.sender_sip_call_id,
+    )?;
     tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current().block_on(backend.reoffer(
             &media.media_call_id,
@@ -426,6 +456,7 @@ fn answer(
     let flags = side_flags(
         state,
         &media.sender_side,
+        &media.receiver_ingress,
         receiver_source,
         &media.receiver_sip_call_id,
     )?;
