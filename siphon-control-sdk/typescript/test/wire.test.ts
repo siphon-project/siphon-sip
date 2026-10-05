@@ -645,6 +645,37 @@ describe("Call verbs map to the in-process-mirrored wire verbs", () => {
     ]);
   });
 
+  it("a play names a tone or a URL as its source, and its gain", async () => {
+    const transport = new RecordingTransport();
+    const call = makeCall(transport);
+    await call.play({ tone: "ringback_eu" });
+    await call.play(
+      { url: "https://media.example.com/hold.wav" },
+      { repeat: "inf", gainDecibels: -6 },
+    );
+    await call.play({ file: "/prompts/welcome.wav" }, { gainDecibels: 3 });
+    expect(transport.calls.map((recorded) => [recorded.verb, recorded.args])).toEqual([
+      ["play", { tone: "ringback_eu" }],
+      ["play", { url: "https://media.example.com/hold.wav", repeat: "inf", gain_decibels: -6 }],
+      ["play", { file: "/prompts/welcome.wav", gain_decibels: 3 }],
+    ]);
+  });
+
+  it("a transfer names how its new leg's numbers are written", async () => {
+    const transport = new RecordingTransport();
+    const call = makeCall(transport);
+    await call.acceptRefer({ mode: "terminate", numberPolicy: "carrier_e164" });
+    await call.acceptRefer({ target: "sip:204@198.51.100.7", format: "national" });
+    await call.replacePeer("sip:204@198.51.100.7", { numberPolicy: "carrier_e164" });
+    await call.replacePeer({ aor: "sip:204@example.com" }, { format: "plain" });
+    expect(transport.calls.map((recorded) => [recorded.verb, recorded.args])).toEqual([
+      ["accept_refer", { mode: "terminate", number_policy: "carrier_e164" }],
+      ["accept_refer", { target: "sip:204@198.51.100.7", format: "national" }],
+      ["replace_peer", { target: "sip:204@198.51.100.7", number_policy: "carrier_e164" }],
+      ["replace_peer", { target: { aor: "sip:204@example.com" }, format: "plain" }],
+    ]);
+  });
+
   it("media verbs — play (file/dbId/blob), stop, dtmf, hold, unhold, stream", async () => {
     const transport = new RecordingTransport();
     const call = makeCall(transport);

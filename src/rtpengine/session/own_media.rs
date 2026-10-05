@@ -1,32 +1,50 @@
-//! What a bridge shaped and pinned a party with, kept for the party's own
-//! call once that call has no media session of its own left to say it.
+//! The media profile a call was first anchored with, kept for the call once a
+//! bridge has put its party on a session that no longer says it.
 //!
-//! When a bridge forms, the `with` leg's own session is retired: its party
-//! relays through the pair's session, which is stored under the anchor. From
-//! then on nothing stored under the leg's own SIP Call-ID says which profile
-//! it was anchored with or whose `received_from` policy pins its media
-//! ingress. The pair's session records both, but only for that pair: bridged
-//! to a different anchor afterwards, the leg would be shaped and pinned by
-//! that anchor's profile.
+//! A bridge changes what is stored under each of its legs. The `with` leg's
+//! own session is retired: its party relays through the pair's session, which
+//! is stored under the anchor. The anchor's session becomes the pair's, and
+//! takes the profile the pair was shaped with, which a pair `profile` named
+//! for that bridge makes somebody else's. From then on nothing stored under
+//! either leg's SIP Call-ID says which profile that call was anchored with or
+//! whose `received_from` policy pins its party's media ingress. The pair's
+//! session records what the pair used, but only for that pair: parted and
+//! bridged to another leg, a party would be shaped and pinned by a profile
+//! chosen for a pairing it is no longer in.
 //!
 //! So the store keeps a small record per such call, by its SIP Call-ID, beside
-//! the sessions. It is written when a bridge retires the call's own session
-//! and rewritten by each bridge the call forms after that. It goes when the
-//! call does: every teardown removes the call's session entry by SIP Call-ID
-//! whether or not it finds one ([`MediaSessionStore::remove`]), and that
-//! removal takes the record with it.
+//! the sessions: the profile and the policy the call had on the session of its
+//! own, read off that session the first time a bridge retires or takes it
+//! over. It is written once and never rewritten. What a later bridge shaped
+//! the party with is that pair's business, and a pair profile least of all
+//! says what the call is. It goes when the call does: every teardown removes
+//! the call's session entry by SIP Call-ID whether or not it finds one
+//! ([`MediaSessionStore::remove`]), and that removal takes the record with it.
 
 use std::time::Instant;
 
 use super::{MediaSession, MediaSessionStore, SideFlags};
 
-/// What a bridge shaped and pinned a party with.
+/// The profile a call was first anchored with, and its party's own policy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OwnMedia {
-    /// The profile whose `offer` half shapes the SDP the party is offered.
+    /// The profile the call's own session was anchored with: its `offer` half
+    /// shapes the SDP the party is offered as a bridge's `with` leg, its
+    /// `answer` half what it is re-INVITEd with as a bridge's anchor.
     pub profile: String,
     /// Whose `received_from` policy pins the party's media ingress.
     pub ingress: SideFlags,
+}
+
+impl OwnMedia {
+    /// What `session`, a call's own, says of its party: the one on its
+    /// `from_tag`.
+    fn of(session: &MediaSession) -> Self {
+        OwnMedia {
+            profile: session.profile.clone(),
+            ingress: session.party_ingress(true),
+        }
+    }
 }
 
 /// A record and when it was written, for the stale sweep.
@@ -38,37 +56,39 @@ pub(super) struct Recorded {
 
 impl MediaSessionStore {
     /// Retire the media session stored under `sip_call_id`, a leg whose party
-    /// relays through a bridged pair's session from here on, and keep `own`,
-    /// what the bridge shaped and pinned that party with, for the leg's call.
-    /// Returns the retired session.
+    /// relays through a bridged pair's session from here on, and keep what
+    /// that session said of the party for the leg's call. Returns the retired
+    /// session.
     ///
-    /// A leg whose session an earlier bridge retired has its record replaced.
-    /// A leg that never had a session and has no record gets none: it has no
-    /// profile of its own, and whichever anchor it is bridged to next decides
-    /// for it.
-    pub fn retire_for_bridge(
-        &self,
-        sip_call_id: &str,
-        own: Option<OwnMedia>,
-    ) -> Option<MediaSession> {
+    /// A leg an earlier bridge retired the session of has nothing to retire
+    /// and keeps the record it has. A leg that never had a session gets none:
+    /// it has no profile of its own, and whichever anchor it is bridged to
+    /// decides for it.
+    pub fn retire_for_bridge(&self, sip_call_id: &str) -> Option<MediaSession> {
         let retired = self.take_session(sip_call_id);
-        if let Some(own) = own {
-            if retired.is_some() || self.own_media.contains_key(sip_call_id) {
-                self.own_media.insert(
-                    sip_call_id.to_string(),
-                    Recorded {
-                        own,
-                        recorded_at: Instant::now(),
-                    },
-                );
-            }
+        if let Some(session) = &retired {
+            self.keep_own_media(sip_call_id, session);
         }
         retired
     }
 
-    /// What a bridge shaped and pinned the party of call `sip_call_id` with,
-    /// when a bridge retired that call's own session. `None` for a call that
-    /// still has its session, or never had one.
+    /// Keep what `session`, the one stored under `sip_call_id` until now, says
+    /// of its party, before a bridge makes that session a pair's. Only the
+    /// first time: what is kept is what the call was anchored with, and a
+    /// session a bridge has already shaped no longer says that.
+    pub fn keep_own_media(&self, sip_call_id: &str, session: &MediaSession) {
+        self.own_media
+            .entry(sip_call_id.to_string())
+            .or_insert_with(|| Recorded {
+                own: OwnMedia::of(session),
+                recorded_at: Instant::now(),
+            });
+    }
+
+    /// The profile and policy call `sip_call_id` was first anchored with, once
+    /// a bridge has retired or taken over its own session. `None` for a call
+    /// no bridge has formed on, whose session still says it, and for one that
+    /// never had a session.
     pub fn own_media(&self, sip_call_id: &str) -> Option<OwnMedia> {
         self.own_media
             .get(sip_call_id)
@@ -127,17 +147,20 @@ mod tests {
     fn a_retired_session_leaves_a_record_that_goes_with_the_call() {
         let store = MediaSessionStore::new();
         store.insert(session("leg@192.0.2.10"));
-        let retired = store.retire_for_bridge("leg@192.0.2.10", Some(own("own_profile")));
+        let retired = store.retire_for_bridge("leg@192.0.2.10");
         assert!(retired.is_some());
         assert!(store.is_empty(), "the session is gone");
         assert_eq!(store.own_media("leg@192.0.2.10"), Some(own("own_profile")));
         assert_eq!(store.own_media_len(), 1);
 
-        // A later bridge retires nothing, and rewrites what it used.
-        assert!(store
-            .retire_for_bridge("leg@192.0.2.10", Some(own("pair_profile")))
-            .is_none());
-        assert_eq!(store.own_media("leg@192.0.2.10"), Some(own("pair_profile")));
+        // A later bridge retires nothing, and the record stays the call's own:
+        // neither a session that bridge shaped under a pair profile nor a
+        // second retirement rewrites it.
+        assert!(store.retire_for_bridge("leg@192.0.2.10").is_none());
+        let mut under_a_pair = session("leg@192.0.2.10");
+        under_a_pair.profile = "pair_profile".to_string();
+        store.keep_own_media("leg@192.0.2.10", &under_a_pair);
+        assert_eq!(store.own_media("leg@192.0.2.10"), Some(own("own_profile")));
         assert_eq!(store.own_media_len(), 1);
 
         // The call ends: its teardown removes a session it no longer has.
@@ -149,21 +172,40 @@ mod tests {
     #[test]
     fn a_leg_that_never_had_a_session_gets_no_record() {
         let store = MediaSessionStore::new();
-        assert!(store
-            .retire_for_bridge("bare@192.0.2.11", Some(own("anchor_profile")))
-            .is_none());
+        assert!(store.retire_for_bridge("bare@192.0.2.11").is_none());
         assert_eq!(store.own_media("bare@192.0.2.11"), None);
-        // Nor does a retirement that names nothing to keep.
-        store.insert(session("raw@192.0.2.12"));
-        assert!(store.retire_for_bridge("raw@192.0.2.12", None).is_some());
         assert_eq!(store.own_media_len(), 0);
+    }
+
+    /// An anchor keeps its session through a bridge, so its record is taken
+    /// from the session as it stood before the bridge made it the pair's: the
+    /// party of a relay is pinned by the half its SDP was offered under.
+    #[test]
+    fn an_anchors_record_is_what_its_session_said_before_the_bridge() {
+        let store = MediaSessionStore::new();
+        let mut relaying = session("anchor@192.0.2.14");
+        relaying.to_tag = Some("tag-b".to_string());
+        store.keep_own_media("anchor@192.0.2.14", &relaying);
+        assert_eq!(
+            store.own_media("anchor@192.0.2.14"),
+            Some(OwnMedia {
+                profile: "own_profile".to_string(),
+                ingress: SideFlags {
+                    profile: "own_profile".to_string(),
+                    half: ProfileHalf::Offer,
+                },
+            })
+        );
+        store.insert(relaying);
+        assert!(store.remove("anchor@192.0.2.14").is_some());
+        assert_eq!(store.own_media_len(), 0, "it goes with the call");
     }
 
     #[test]
     fn the_stale_sweep_takes_old_records_with_old_sessions() {
         let store = MediaSessionStore::new();
         store.insert(session("old@192.0.2.13"));
-        store.retire_for_bridge("old@192.0.2.13", Some(own("own_profile")));
+        store.retire_for_bridge("old@192.0.2.13");
         store.sweep_stale(std::time::Duration::from_secs(60));
         assert_eq!(store.own_media_len(), 1, "a fresh record is kept");
         std::thread::sleep(std::time::Duration::from_millis(5));

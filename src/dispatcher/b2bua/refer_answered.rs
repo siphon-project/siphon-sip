@@ -157,6 +157,29 @@ impl AnsweredReferStore {
         })
     }
 
+    /// Whether a REFER other than `request` is still being carried out on
+    /// `call_id`: handed to a script that has not decided yet, or relayed to
+    /// the far end, whose response has not come back. Asked for every new
+    /// REFER on a tracked call, so it stays cheap when nothing is remembered.
+    pub fn another_proceeding(
+        &self,
+        call_id: &str,
+        request: &SipMessage,
+        now: std::time::Instant,
+    ) -> bool {
+        if self.entries.is_empty() {
+            return false;
+        }
+        let identity = RequestIdentity::of(request);
+        self.entries.get(call_id).is_some_and(|answered| {
+            answered.iter().any(|known| {
+                known.response.is_none()
+                    && known.expires > now
+                    && Some(&known.identity) != identity.as_ref()
+            })
+        })
+    }
+
     /// Forget everything remembered for a call that is ending.
     pub fn forget_call(&self, call_id: &str) {
         if self.entries.is_empty() {
@@ -228,6 +251,48 @@ pub fn answer_refer_retransmission(
     }
 }
 
+/// Refuse a new REFER that arrives while its call is still carrying out a
+/// transfer. Returns whether it was refused.
+///
+/// A call is re-paired once at a time. While a leg replacement is in flight (a
+/// REFER accepted for siphon to carry out, or a `replace_peer`, whose target
+/// has neither answered nor failed nor run out of time), and while a REFER
+/// relayed to the far end or handed to a script has not been answered, another
+/// REFER on the call is refused `491 Request Pending` (RFC 3261 §21.4.27):
+/// neither held for an application nor shown to `@b2bua.on_refer`, since
+/// accepting it would start a second replacement on the same pair. RFC 3515
+/// lets a referrer send several REFERs in a dialog; it does not oblige the
+/// recipient to carry them out together, and a `491` asks for it again later.
+/// Once the first transfer has concluded a REFER is taken as usual.
+///
+/// A retransmission of the REFER being carried out is not this: it was
+/// answered from [`AnsweredReferStore`] before this is asked.
+pub fn refuse_refer_during_transfer(
+    inbound: &InboundMessage,
+    message: &SipMessage,
+    call_id: &str,
+    state: &DispatcherState,
+) -> bool {
+    let replacing = state
+        .call_actors
+        .get_call(call_id)
+        .is_some_and(|call| call.replacement_in_flight());
+    let in_flight = replacing
+        || state
+            .answered_refers
+            .another_proceeding(call_id, message, std::time::Instant::now());
+    if !in_flight {
+        return false;
+    }
+    warn!(
+        call_id = %call_id,
+        replacing,
+        "B2BUA REFER: another transfer is still being carried out on this call — 491"
+    );
+    b2bua_refer_send_final(inbound, message, 491, "Request Pending", state);
+    true
+}
+
 /// Remember the final response `response` to a REFER, for its
 /// retransmissions. The call is found by the response's own Call-ID; one that
 /// matches no call (a REFER answered `481`) has nothing to be remembered
@@ -254,44 +319,100 @@ const REFERRER_LEFT_STATUS: (u16, &str) = (487, "Request Terminated");
 /// to transfer, so it is declined, as it is when nobody decides in time.
 const CALL_ENDED_STATUS: (u16, &str) = (603, "Decline");
 
-/// The party on one leg of a call hung up: a REFER of its own still held for
-/// its application's decision is answered now, and released.
+/// A party's dialog on a call is ending, by its own BYE or because siphon is
+/// releasing it (a `Replaces` takeover, a replacement): a REFER it sent in
+/// that dialog, still held for its application's decision, is answered now,
+/// and released.
 ///
-/// Before the BYE's own `200`, while the flow the REFER arrived on is the one
-/// thing known about where to answer it. Asked for every BYE, so it stays
-/// cheap when nothing is held.
-pub fn pending_refer_referrer_left(state: &DispatcherState, call_id: &str, from_a_leg: bool) {
+/// `sip_call_id` and `peer_tag` name the dialog and the party (RFC 3261 §12),
+/// which is how the REFER is recognised as that party's own wherever its leg
+/// sits on the call. Before the BYE's own `200`, or before siphon's BYE, while
+/// the flow the REFER arrived on is the one thing known about where to answer
+/// it. Asked for every BYE, so it stays cheap when nothing is held.
+pub fn pending_refer_referrer_left(
+    state: &DispatcherState,
+    call_id: &str,
+    sip_call_id: &str,
+    peer_tag: Option<&str>,
+) {
     if state.pending_inbound_refer.is_empty() {
         return;
     }
-    let Some(key) = state
-        .call_actors
-        .get_call(call_id)
-        .map(|call| call.a_leg.dialog.call_id.clone())
-    else {
-        return;
-    };
-    if let Some(pending) = state.pending_inbound_refer.take_from_leg(&key, from_a_leg) {
+    if let Some(pending) =
+        state
+            .pending_inbound_refer
+            .take_from_dialog(call_id, sip_call_id, peer_tag)
+    {
         let (code, reason) = REFERRER_LEFT_STATUS;
         info!(
             call_id = %call_id,
-            referrer_on_a_leg = from_a_leg,
-            "B2BUA REFER: the referrer hung up before its transfer was decided — {code}"
+            %sip_call_id,
+            "B2BUA REFER: the referrer's dialog ended before its transfer was decided — {code}"
         );
         b2bua_refer_send_final(&pending.inbound, &pending.message, code, reason, state);
     }
+}
+
+/// [`pending_refer_referrer_left`] for a leg siphon is about to release.
+pub fn pending_refer_leg_released(state: &DispatcherState, call_id: &str, leg: &Leg) {
+    pending_refer_referrer_left(
+        state,
+        call_id,
+        &leg.dialog.call_id,
+        leg.dialog.remote_tag.as_deref(),
+    );
+}
+
+/// Take the REFER held for the call a control channel's Call-ID names: what
+/// `accept_refer` and `reject_refer` decide on.
+pub fn take_held_refer(state: &DispatcherState, sip_call_id: &str) -> Option<PendingInboundRefer> {
+    if state.pending_inbound_refer.is_empty() {
+        return None;
+    }
+    let call_id = state.call_actors.find_by_sip_call_id(sip_call_id);
+    state
+        .pending_inbound_refer
+        .take_for_channel(sip_call_id, call_id.as_deref())
+}
+
+/// The leg of `call_id` the referrer of a held REFER is on now, for a decision
+/// about to be carried out. `None` when the referrer's dialog is no longer on
+/// the call: the REFER is answered `481` here (RFC 3515 §2.4.2 has it answered
+/// whatever became of its dialog) and there is nothing left to carry out.
+pub fn held_referrer_leg(
+    pending: &PendingInboundRefer,
+    call_id: &str,
+    state: &DispatcherState,
+) -> Option<bool> {
+    let leg = state
+        .call_actors
+        .get_call(call_id)
+        .and_then(|call| pending.referrer_on_a_leg(&call));
+    if leg.is_none() {
+        warn!(
+            call_id = %call_id,
+            "B2BUA REFER: the referrer's dialog left the call before its transfer was decided — 481"
+        );
+        b2bua_refer_send_final(
+            &pending.inbound,
+            &pending.message,
+            481,
+            "Call/Transaction Does Not Exist",
+            state,
+        );
+    }
+    leg
 }
 
 /// The call is being torn down: answer the REFER still held for its
 /// application's decision, release it, and forget the REFERs already
 /// answered on it.
 ///
-/// `a_leg_sip_call_id` is the Call-ID the call's control channel is bound to,
-/// which is what a held REFER is kept under. Called before the BYEs go out, so
-/// the referrer has its final response ahead of the BYE that ends its dialog.
-pub fn refers_end_with_call(state: &DispatcherState, call_id: &str, a_leg_sip_call_id: &str) {
+/// Called before the BYEs go out, so the referrer has its final response ahead
+/// of the BYE that ends its dialog.
+pub fn refers_end_with_call(state: &DispatcherState, call_id: &str) {
     let held = (!state.pending_inbound_refer.is_empty())
-        .then(|| state.pending_inbound_refer.take(a_leg_sip_call_id))
+        .then(|| state.pending_inbound_refer.take(call_id))
         .flatten();
     if let Some(pending) = held {
         let (code, reason) = CALL_ENDED_STATUS;
@@ -425,6 +546,36 @@ mod tests {
             status(store.replay("call", &request, now + REFER_TRANSACTION_LIFETIME)),
             Some(Some(202)),
             "kept for 64*T1 from the response, not from the request"
+        );
+    }
+
+    /// A REFER still being carried out is another request's reason to wait,
+    /// never its own retransmission's, and only until it is answered or its
+    /// transaction runs out.
+    #[test]
+    fn a_refer_being_carried_out_is_seen_by_another_request_until_it_is_answered() {
+        let store = AnsweredReferStore::default();
+        let now = std::time::Instant::now();
+        let first = refer("call@192.0.2.10", 2, "z9hG4bK-two");
+        let second = refer("call@192.0.2.10", 3, "z9hG4bK-three");
+        assert!(!store.another_proceeding("call", &second, now), "nothing");
+
+        store.proceeding("call", &first, now);
+        assert!(store.another_proceeding("call", &second, now));
+        assert!(
+            !store.another_proceeding("call", &first, now),
+            "its own retransmission is not another request"
+        );
+        assert!(!store.another_proceeding("another-call", &second, now));
+        assert!(
+            !store.another_proceeding("call", &second, now + REFER_TRANSACTION_LIFETIME),
+            "a REFER nobody answered stops holding the call when its transaction ends"
+        );
+
+        store.answered("call", &response(&first, 202, "Accepted"), now);
+        assert!(
+            !store.another_proceeding("call", &second, now),
+            "answered: nothing is being carried out"
         );
     }
 

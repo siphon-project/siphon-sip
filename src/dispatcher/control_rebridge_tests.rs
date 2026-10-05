@@ -51,13 +51,16 @@ impl Legs {
     /// `bridge` addressed to `target` naming `with`, accepted by both legs.
     /// Returns once the bridge has formed.
     pub(super) async fn bridge(&self, target: &str, with: &str) {
-        let (reply, _) = command(
-            &self.controller,
-            "bridge",
-            target,
-            serde_json::json!({ "with": with }),
-        )
-        .await;
+        self.bridge_under(target, with, None).await;
+    }
+
+    /// [`Legs::bridge`], naming `profile` for the pair when there is one.
+    pub(super) async fn bridge_under(&self, target: &str, with: &str, profile: Option<&str>) {
+        let mut args = serde_json::json!({ "with": with });
+        if let Some(profile) = profile {
+            args["profile"] = profile.into();
+        }
+        let (reply, _) = command(&self.controller, "bridge", target, args).await;
         assert_eq!(reply["status"], "ok", "{reply}");
         let offer = bridge_offer_to(self.udp(), &self.peer_address).await;
         accepts(
@@ -79,6 +82,7 @@ impl Legs {
             .await,
             "the bridge formed"
         );
+        retired_sessions_deleted(self).await;
         drain(self.udp());
     }
 
@@ -124,6 +128,32 @@ impl Legs {
         );
         drain(self.udp());
     }
+}
+
+/// Wait for the engine to have been sent the `delete` of every session a
+/// bridge that just formed retired.
+///
+/// A formed bridge deletes the sessions its legs had before it on a task of
+/// its own, one after the other, after the signalling has moved on
+/// (`bridge_delete_sessions`). Until the last has landed the engine holds a
+/// call no stored session names, and a count of the engine's commands read
+/// then is short of a `delete` that arrives a moment later. The engine
+/// holding exactly the calls the session store names is that last `delete`
+/// having been received.
+pub(super) async fn retired_sessions_deleted(legs: &Legs) {
+    let stored = || {
+        legs.state()
+            .rtpengine_sessions
+            .as_ref()
+            .map_or(0, |store| store.len())
+    };
+    assert!(
+        eventually(|| legs.engine.held_count() == stored()).await,
+        "the sessions the bridge retired are deleted on the engine: it holds {} calls for {} stored sessions, after deletes {:?}",
+        legs.engine.held_count(),
+        stored(),
+        legs.engine.commands("delete")
+    );
 }
 
 /// An anchor answered with `anchor_profile` and a peer calling from

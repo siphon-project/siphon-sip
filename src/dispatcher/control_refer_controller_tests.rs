@@ -598,7 +598,7 @@ async fn a_second_refer_waits_for_the_first_to_be_reported() {
     assert!(caller_refers(&controller, &caller, 4));
     assert!(drain(&controller.dispatcher.udp).is_empty());
     assert_eq!(state.pending_inbound_refer.len(), 1);
-    assert!(state.pending_inbound_refer.take(&caller.call_id).is_some());
+    assert!(take_held_refer(state, &caller.call_id).is_some());
 }
 
 /// Mode `controller` dials nothing, so it refuses every argument describing a

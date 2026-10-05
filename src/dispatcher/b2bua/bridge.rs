@@ -95,6 +95,10 @@ pub fn bridge_leg_snapshot(
     let source_ip = call.a_leg.transport.remote_addr.ip();
     drop(call);
 
+    let own = state
+        .rtpengine_sessions
+        .as_ref()
+        .and_then(|store| store.own_media(sip_call_id));
     let media = state
         .rtpengine_sessions
         .as_ref()
@@ -102,12 +106,19 @@ pub fn bridge_leg_snapshot(
         .map(|session| crate::b2bua::bridge::LegMedia {
             media_call_id: session.rtpengine_id().to_string(),
             from_tag: session.from_tag.clone(),
-            profile: session.profile.clone(),
-            // Whose policy pins this leg's own media ingress: what a bridge it
-            // anchored recorded for it, otherwise the half of its profile its
-            // SDP reached the engine under — `offer` for the offerer of a
-            // relay, `answer` for a leg the engine answered itself.
-            ingress: session.party_ingress(true),
+            // The profile the leg was anchored with and whose policy pins its
+            // own media ingress: what was kept for its call when a bridge took
+            // its session over, since the session is a pair's from then on and
+            // may carry a pair profile. Until then the session says it: its
+            // profile, and the half its SDP reached the engine under (`offer`
+            // for the offerer of a relay, `answer` for a leg the engine
+            // answered itself).
+            profile: own
+                .as_ref()
+                .map_or_else(|| session.profile.clone(), |own| own.profile.clone()),
+            ingress: own
+                .as_ref()
+                .map_or_else(|| session.party_ingress(true), |own| own.ingress.clone()),
             // A session with a second party is a relay and can be renegotiated
             // in place; one the engine answered itself has only the caller.
             relaying: session.to_tag.is_some(),
@@ -157,7 +168,11 @@ fn rejoining_peer_media(
     let has_playback = pair.to_tag.as_deref().is_some_and(|tag| {
         crate::rtpengine::MediaBackend::playback_started(pair.rtpengine_id(), tag)
     });
-    crate::b2bua::bridge::LegMedia::of_bridged_peer(&pair, has_playback)
+    crate::b2bua::bridge::LegMedia::of_bridged_peer(
+        &pair,
+        store.own_media(peer_sip_call_id),
+        has_playback,
+    )
 }
 
 /// Refuse everything about one leg that would make the bridge a half-formed
@@ -843,7 +858,6 @@ pub fn settle_owned_leg_response(
     state: &DispatcherState,
 ) {
     let a_leg = &snapshot.a_leg;
-    let b_leg_index = snapshot.b_leg_index;
     let success = (200..300).contains(&status_code);
     let ack_branch = if success {
         TransactionKey::generate_branch()
@@ -868,16 +882,12 @@ pub fn settle_owned_leg_response(
             );
         }
     }
-    if let Some(index) = b_leg_index {
-        if success {
-            // Keep the entry so a retransmitted 200 is re-ACKed rather than
-            // treated as a response to an unknown branch.
-            state
-                .call_actors
-                .set_b_leg_target_uri(call_id, index, request.done_target);
-        } else {
-            state.call_actors.remove_b_leg(call_id, index);
-        }
+    if success {
+        // Keep the entry so a retransmitted 200 is re-ACKed rather than
+        // treated as a response to an unknown branch.
+        mark_tracking_leg_done(call_id, snapshot, request.done_target, state);
+    } else {
+        state.call_actors.remove_b_leg_on(call_id, branch);
     }
     state.call_actors.set_pending_reinvite(call_id, true, false);
     // A final response to a request siphon sent on the leg's dialog, which
@@ -1197,19 +1207,19 @@ pub fn bridge_adopt_media(
     };
     let mut retired = Vec::new();
     // The peer's own session goes, and with it the only thing stored under the
-    // peer's own call that says what it was anchored with. What this bridge
-    // shaped and pinned it with is kept for that call, so a bridge to a
-    // different anchor later reads it instead of that anchor's profile.
-    let peer_own = bridge_sides
-        .as_ref()
-        .map(|sides| crate::rtpengine::session::OwnMedia {
-            profile: sides.peer.profile.clone(),
-            ingress: sides.peer_ingress.clone(),
-        });
-    if let Some(session) = store.retire_for_bridge(&context.peer_sip_call_id, peer_own) {
+    // peer's own call that says what it was anchored with. That is kept for
+    // the call, so a later bridge reads the peer's own profile and policy
+    // rather than its anchor's, or a pair profile's.
+    if let Some(session) = store.retire_for_bridge(&context.peer_sip_call_id) {
         retired.push((session.rtpengine_id().to_string(), session.from_tag.clone()));
     }
     let previous = store.get(&anchor_key);
+    // The anchor keeps a session, but from here on it is the pair's, under
+    // the profile the pair was shaped with. What it said of the anchor alone
+    // is kept the same way, the first time.
+    if let Some(previous) = previous.as_ref() {
+        store.keep_own_media(&anchor_key, previous);
+    }
     if context.media_pending_adoption {
         if let Some(previous) = previous.as_ref() {
             if previous.rtpengine_id() != media_call_id {

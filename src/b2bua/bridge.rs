@@ -73,21 +73,21 @@
 //! anchor's for the answer (a caller answered with plain RTP is re-INVITEd with
 //! plain RTP). See [`bridge_offer_profile`].
 //!
-//! A peer's own session is retired when its bridge forms, so a pair that is
-//! parted and bridged again finds the peer with none. What that party was
-//! anchored with is then read off the pair's session, which recorded it per
-//! side ([`LegMedia::of_bridged_peer`]): the second bridge shapes and pins
-//! both parties as the first did.
+//! A bridge changes what is stored under both legs: the peer's own session is
+//! retired, and the anchor's becomes the pair's, under the profile the pair
+//! was shaped with. What each call was first anchored with is therefore kept
+//! for the call the first time that happens
+//! ([`crate::rtpengine::session::OwnMedia`]) and never rewritten. A leg
+//! bridged again after an `unbridge`, to the same leg or another, as anchor or
+//! as peer, is read from there: a party that needs SRTP is offered SRTP by
+//! whichever anchor it is bridged to next and is pinned by its own policy, and
+//! a pair profile named for one bridge says nothing about the next.
 //!
-//! That session is stored under the first anchor, so it says nothing to a
-//! bridge that joins the same peer to a **different** anchor. What a bridge
-//! shaped and pinned its peer with is therefore also kept for the peer's own
-//! call, for as long as that call lasts
-//! ([`crate::rtpengine::session::OwnMedia`]), and read there
-//! ([`LegMedia::of_retired_peer`]): a party that needs SRTP is offered SRTP
-//! by whichever anchor it is bridged to next, and is pinned by its own policy.
-//! A leg that never had a session of its own has no such record, and the
-//! anchor's profile describes it.
+//! Where a parted peer sits on the engine is read off the pair's session,
+//! which its first anchor still holds ([`LegMedia::of_bridged_peer`]); bridged
+//! to a different anchor it is on no session of that anchor's
+//! ([`LegMedia::of_retired_peer`]). A leg that never had a session of its own
+//! has no record, and the anchor's profile describes it.
 //!
 //! ## Which profile pins which party's media ingress
 //!
@@ -432,11 +432,13 @@ impl LegMedia {
     /// stored under its anchor: what a second bridge of the same two legs
     /// reads for a peer that has no session of its own any more.
     ///
-    /// The peer's own session is retired when a bridge forms, and with it the
-    /// only other record of which profile that party was anchored with. The
-    /// pair's session keeps both, per side: the profile whose `offer` half
-    /// shaped what the peer was offered, and whose policy pins the peer's
-    /// media ingress. Without them a bridge of the same pair after an
+    /// The peer's own session is retired when a bridge forms. Where its party
+    /// sits on the engine is read off the pair's session. What it was
+    /// anchored with is `own`, the record kept for the peer's own call
+    /// ([`crate::rtpengine::session::OwnMedia`]), which a pair profile named
+    /// for the first bridge does not change. A peer with no such record never
+    /// had a session of its own, and what the pair's session recorded for its
+    /// side is all there is. Without either a bridge of the same pair after an
     /// `unbridge` offers the peer the anchor's transport and pins it by the
     /// anchor's policy.
     ///
@@ -444,14 +446,25 @@ impl LegMedia {
     /// party. Whether the leg in hand *is* that party is the caller's to
     /// establish: a session's sides describe the party it relays to, not
     /// whoever is bridged to its anchor next.
-    pub fn of_bridged_peer(pair: &MediaSession, has_playback: bool) -> Option<Self> {
+    pub fn of_bridged_peer(
+        pair: &MediaSession,
+        own: Option<crate::rtpengine::session::OwnMedia>,
+        has_playback: bool,
+    ) -> Option<Self> {
         let sides = pair.bridge_sides.as_ref()?;
         let tag = pair.to_tag.clone()?;
+        // What the peer's own call was anchored with, when it had a session of
+        // its own to say so. A peer that never had one was shaped and pinned
+        // by its anchor, and the pair's session is the only record of how.
+        let (profile, ingress) = match own {
+            Some(own) => (own.profile, own.ingress),
+            None => (sides.peer.profile.clone(), sides.peer_ingress.clone()),
+        };
         Some(LegMedia {
             media_call_id: pair.rtpengine_id().to_string(),
             from_tag: tag,
-            profile: sides.peer.profile.clone(),
-            ingress: sides.peer_ingress.clone(),
+            profile,
+            ingress,
             relaying: true,
             // A tee or a takeover bridge is recorded on a leg's own session,
             // and this party has none.
@@ -1301,7 +1314,8 @@ mod tests {
         // The bug: after an unbridge the peer has no session of its own, so
         // the second bridge shaped and pinned it with the anchor's profile.
         let pair = formed_pair();
-        let peer = LegMedia::of_bridged_peer(&pair, false).expect("the pair recorded its peer");
+        let peer =
+            LegMedia::of_bridged_peer(&pair, None, false).expect("the pair recorded its peer");
         assert_eq!(peer.media_call_id, "cid-pair");
         assert_eq!(peer.from_tag, "tag-b");
         assert_eq!(peer.profile, "pinned_phone");
@@ -1347,12 +1361,12 @@ mod tests {
             bridge_sides: None,
             ..formed_pair()
         };
-        assert_eq!(LegMedia::of_bridged_peer(&plain, false), None);
+        assert_eq!(LegMedia::of_bridged_peer(&plain, None, false), None);
         let single = MediaSession {
             to_tag: None,
             ..formed_pair()
         };
-        assert_eq!(LegMedia::of_bridged_peer(&single, false), None);
+        assert_eq!(LegMedia::of_bridged_peer(&single, None, false), None);
     }
 
     // -----------------------------------------------------------------------

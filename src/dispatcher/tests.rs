@@ -8465,8 +8465,8 @@ fn sample_pending_refer(deadline: std::time::Instant) -> PendingInboundRefer {
             uri: "sip:carol@example.com".to_string(),
             replaces: None,
         },
-        from_a_leg: true,
         deadline,
+        channel_sip_call_id: "caller-dialog@192.0.2.1".to_string(),
     }
 }
 
@@ -8663,6 +8663,57 @@ fn deferred_referrer_bye_take_is_cheap_when_idle() {
     assert!(store.take_expired(std::time::Instant::now()).is_empty());
 }
 
+/// Every way a held REFER leaves by something other than a decision on its
+/// own call id: its sender's dialog ending, and a decision that names the call
+/// by its channel, with the call still up or already gone. Each takes it once,
+/// and the store returns to its baseline.
+#[test]
+fn pending_inbound_refer_is_taken_by_its_dialog_or_its_channel_and_drains() {
+    let store = PendingInboundReferStore::default();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let baseline = store.len();
+
+    // By the dialog it was sent in: the Call-ID and the sender's own tag.
+    assert!(store.insert("call-1", sample_pending_refer(deadline)));
+    for (sip_call_id, tag) in [
+        ("other-call@example.com", Some("alicetag")),
+        ("refer-call@example.com", Some("proxytag")),
+        ("refer-call@example.com", None),
+    ] {
+        assert!(
+            store.take_from_dialog("call-1", sip_call_id, tag).is_none(),
+            "{sip_call_id} {tag:?} is not the referrer's dialog"
+        );
+    }
+    assert!(store
+        .take_from_dialog("another-call", "refer-call@example.com", Some("alicetag"))
+        .is_none());
+    assert!(store
+        .take_from_dialog("call-1", "refer-call@example.com", Some("alicetag"))
+        .is_some());
+    assert_eq!(store.len(), baseline);
+
+    // By its channel, with the call up: whatever Call-ID the channel stands on
+    // now, the call it resolves to is what the REFER is held under.
+    assert!(store.insert("call-2", sample_pending_refer(deadline)));
+    assert!(store
+        .take_for_channel("newcomer@192.0.2.9", Some("call-3"))
+        .is_none());
+    assert!(store
+        .take_for_channel("newcomer@192.0.2.9", Some("call-2"))
+        .is_some());
+    assert_eq!(store.len(), baseline);
+
+    // By its channel, with the call gone: the Call-ID the channel stood on
+    // when the REFER was held.
+    assert!(store.insert("call-4", sample_pending_refer(deadline)));
+    assert!(store.take_for_channel("newcomer@192.0.2.9", None).is_none());
+    assert!(store
+        .take_for_channel("caller-dialog@192.0.2.1", None)
+        .is_some());
+    assert_eq!(store.len(), baseline, "the store drains to its baseline");
+}
+
 #[test]
 fn pending_inbound_refer_absorbs_retransmit() {
     // A second insert for the same call (a REFER retransmit) is absorbed —
@@ -8718,7 +8769,10 @@ fn pending_inbound_refer_preserves_accept_inputs() {
 
     let pending = store.take("cid@host").expect("entry present");
     assert_eq!(pending.refer_to.uri, "sip:carol@example.com");
-    assert!(pending.from_a_leg);
+    assert!(
+        pending.sent_in_dialog("refer-call@example.com", Some("alicetag")),
+        "the dialog its sender is recognised by"
+    );
 }
 
 #[test]

@@ -74,8 +74,10 @@ const POLICIES: [(&str, bool, bool); 4] = [
 
 /// The caller's answer in its ACK completes the callee's offer on the engine.
 /// It is the caller's SDP: pinned to where the caller signals from when the
-/// caller's own half asks, not when the `answer` half that shapes the command
-/// does, and not left without a hint.
+/// caller's own half asks, not when the half that shapes the command does,
+/// and not left without a hint. The command is shaped for the callee, which
+/// the result is sent to in its ACK: by the `offer` half, as everything the
+/// callee of a dial is sent.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_callers_answer_to_a_delayed_offer_is_pinned_by_the_callers_own_policy() {
     for (profile, caller_pinned, _) in POLICIES {
@@ -97,8 +99,8 @@ async fn the_callers_answer_to_a_delayed_offer_is_pinned_by_the_callers_own_poli
         assert_eq!(answer.sip_call_id.as_deref(), Some(CALLER_CALL_ID));
         assert_eq!(
             answer.transport_protocol.as_deref(),
-            Some("RTP/AVP"),
-            "{profile}: shaped by the `answer` half"
+            Some("RTP/SAVP"),
+            "{profile}: the result goes to the callee, shaped by the half that describes it"
         );
         let session = call
             .state

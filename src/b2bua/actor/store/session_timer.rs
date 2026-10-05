@@ -94,7 +94,8 @@ impl CallActorStore {
     }
 
     /// Record the SDP siphon relayed to the caller in the early media of the
-    /// B-leg at `index`, as it went on the wire.
+    /// B-leg at `index`, as it went on the wire. A response handler records it
+    /// by Via branch instead (`update_b_leg_on`).
     pub fn set_b_leg_early_answer(&self, call_id: &str, index: usize, sdp: Vec<u8>) {
         if let Some(mut call) = self.calls.get_mut(call_id) {
             if let Some(leg) = call.b_legs.get_mut(index) {

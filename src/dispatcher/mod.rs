@@ -95,6 +95,8 @@ mod b_leg_asserted_identity_tests;
 #[cfg(test)]
 mod b_leg_capability_tests;
 #[cfg(test)]
+mod b_leg_position_tests;
+#[cfg(test)]
 mod bad_extension_tests;
 #[cfg(test)]
 mod bridged_pair_media_events_tests;
@@ -150,6 +152,8 @@ mod dial_bridge_test_harness;
 mod dialog_state_events_tests;
 #[cfg(test)]
 mod dialog_state_transfer_tests;
+#[cfg(test)]
+mod early_update_tests;
 #[cfg(test)]
 mod held_bye_tests;
 #[cfg(test)]

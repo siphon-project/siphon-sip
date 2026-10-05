@@ -30,6 +30,12 @@ pub(super) fn mark_prack_acked(leg: &mut Leg, to_tag: &str, rseq: u32) -> bool {
     true
 }
 
+/// 401/407 dedup on one leg: `true` exactly once, for the first challenge the
+/// leg's INVITE draws, `false` for every retransmission of it.
+pub(super) fn mark_auth_challenged(leg: &mut Leg) -> bool {
+    !std::mem::replace(&mut leg.auth_challenged, true)
+}
+
 impl CallActorStore {
     /// [`record_branch_failure`](Self::record_branch_failure) for the leg
     /// whose INVITE rode Via `branch`. `None` when the call, or that leg, is
@@ -71,6 +77,120 @@ impl CallActorStore {
         self.calls.get_mut(call_id).is_some_and(|mut call| {
             call.find_b_leg_by_branch_mut(branch)
                 .is_some_and(|(_, leg)| mark_prack_acked(leg, to_tag, rseq))
+        })
+    }
+
+    /// [`try_win`](Self::try_win) for the leg whose INVITE rode Via `branch`,
+    /// found under the lock that claims the answer for it. `None` when the
+    /// call, or that leg, is gone.
+    pub fn try_win_on(&self, call_id: &str, branch: &str) -> Option<WinOutcome> {
+        let mut call = self.calls.get_mut(call_id)?;
+        let (index, _) = call.find_b_leg_by_branch(branch)?;
+        Some(self.claim_answer(&mut call, index))
+    }
+
+    /// Claim the answer of a call already held for the leg at `index`.
+    pub(super) fn claim_answer(&self, call: &mut CallActor, index: usize) -> WinOutcome {
+        if call.state == CallState::Answered {
+            return WinOutcome::AlreadyAnswered;
+        }
+        call.set_winner(index);
+        let cancelled = call.cancel_pending_branches(Some(index));
+        self.keep_answerable(&cancelled);
+        WinOutcome::FirstWin { cancelled }
+    }
+
+    /// [`rewind_failed_answer`](Self::rewind_failed_answer) for the leg whose
+    /// INVITE rode Via `branch`. The call is rewound whether or not that leg
+    /// is still on it.
+    pub fn rewind_failed_answer_on(&self, call_id: &str, branch: &str, status_code: u16) {
+        if let Some(mut call) = self.calls.get_mut(call_id) {
+            let index = call.find_b_leg_by_branch(branch).map(|(index, _)| index);
+            call.rewind_failed_answer(index, status_code);
+        }
+    }
+
+    /// [`try_mark_auth_challenged`](Self::try_mark_auth_challenged) for the
+    /// leg whose INVITE rode Via `branch`. `false` when the call or that leg is
+    /// gone: a challenge on a branch already superseded is a retransmission.
+    pub fn try_mark_auth_challenged_on(&self, call_id: &str, branch: &str) -> bool {
+        self.update_b_leg_on(call_id, branch, mark_auth_challenged)
+            .unwrap_or(false)
+    }
+
+    /// [`replace_b_leg`](Self::replace_b_leg) for the leg whose INVITE rode
+    /// Via `branch`. `false` when the call or that leg is gone and nothing was
+    /// replaced.
+    pub fn replace_b_leg_on(&self, call_id: &str, branch: &str, leg: Leg) -> bool {
+        let new_branch = leg.branch.clone();
+        let replaced = self.calls.get_mut(call_id).and_then(|mut call| {
+            let (index, _) = call.find_b_leg_by_branch(branch)?;
+            call.replace_b_leg(index, leg)
+        });
+        match replaced {
+            Some(old_branch) => {
+                self.repoint_branch(call_id, &old_branch, &new_branch);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Move the registry's entry for a superseded leg to its new Via branch.
+    pub(super) fn repoint_branch(&self, call_id: &str, old_branch: &str, new_branch: &str) {
+        if old_branch != new_branch {
+            self.registry.remove_branch(old_branch);
+        }
+        self.registry.register_branch(new_branch, call_id);
+    }
+
+    /// [`settle_route_branch`](Self::settle_route_branch) for the carrier leg
+    /// whose INVITE rode Via `branch`. `false` when the call or that leg is
+    /// gone, which makes the response a straggler.
+    pub fn settle_route_branch_on(&self, call_id: &str, branch: &str, status_code: u16) -> bool {
+        self.calls.get_mut(call_id).is_some_and(|mut call| {
+            call.find_b_leg_by_branch(branch)
+                .map(|(index, _)| index)
+                .is_some_and(|index| call.settle_route_branch(index, status_code))
+        })
+    }
+
+    /// [`remove_b_leg`](Self::remove_b_leg) for the leg whose request rode Via
+    /// `branch`. Nothing is removed when no leg carries that branch.
+    pub fn remove_b_leg_on(&self, call_id: &str, branch: &str) {
+        let mut ended = Vec::new();
+        if let Some(mut call) = self.calls.get_mut(call_id) {
+            if let Some(index) = call.find_b_leg_by_branch(branch).map(|(index, _)| index) {
+                ended = self.remove_b_leg_of(&mut call, index);
+            }
+        }
+        publish_dialog_states(ended);
+    }
+
+    /// Read off the leg whose request rode Via `branch`, as it stands now.
+    /// `None` when the call or that leg is gone.
+    pub fn read_b_leg_on<T>(
+        &self,
+        call_id: &str,
+        branch: &str,
+        read: impl FnOnce(&Leg) -> T,
+    ) -> Option<T> {
+        self.calls
+            .get(call_id)
+            .and_then(|call| call.find_b_leg_by_branch(branch).map(|(_, leg)| read(leg)))
+    }
+
+    /// Change the leg whose request rode Via `branch`, under the call's lock.
+    /// `None`, with nothing changed, when the call or that leg is gone.
+    pub fn update_b_leg_on<T>(
+        &self,
+        call_id: &str,
+        branch: &str,
+        update: impl FnOnce(&mut Leg) -> T,
+    ) -> Option<T> {
+        self.calls.get_mut(call_id).and_then(|mut call| {
+            call.find_b_leg_by_branch_mut(branch)
+                .map(|(_, leg)| update(leg))
         })
     }
 }

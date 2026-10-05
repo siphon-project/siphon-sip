@@ -523,7 +523,7 @@ pub fn classify_answer_action(action: Option<CallAction>) -> AnswerAction {
 pub fn b2bua_fail_after_answer(
     call_id: &str,
     cause: &str,
-    b_leg_index: Option<usize>,
+    branch: &str,
     response: &SipMessage,
     state: &DispatcherState,
 ) {
@@ -538,12 +538,10 @@ pub fn b2bua_fail_after_answer(
     // Release the answered B-leg dialog. The leg is re-read here rather than
     // carried in: `handle_b2bua_response` drops its actor reference before running
     // Python, and the handler that just failed may itself have touched the call.
-    let b_leg = b_leg_index.and_then(|index| {
-        state
-            .call_actors
-            .get_call(call_id)
-            .and_then(|call| call.b_legs.get(index).cloned())
-    });
+    // Read by the Via branch of its INVITE, since its position may have moved.
+    let b_leg = state
+        .call_actors
+        .read_b_leg_on(call_id, branch, crate::b2bua::actor::Leg::clone);
     match b_leg {
         Some(leg) => {
             b2bua_ack_and_bye_answered_leg(leg, response, true, state);
@@ -561,7 +559,7 @@ pub fn b2bua_fail_after_answer(
     // brought the call here, so neither has anything to take back.
     state
         .call_actors
-        .rewind_failed_answer(call_id, b_leg_index, STATUS);
+        .rewind_failed_answer_on(call_id, branch, STATUS);
     cdr_clear_b2bua_answer(state, call_id);
 
     conclude_failed_call(

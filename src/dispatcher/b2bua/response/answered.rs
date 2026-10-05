@@ -50,7 +50,7 @@ pub fn b_leg_answered(
         if let Err(error) = control_dial_media_answer(call_id, message, response_source.ip(), state)
         {
             error!(%call_id, %error, "control dial media failed before answering caller");
-            b2bua_fail_after_answer(call_id, &error, snapshot.b_leg_index, message, state);
+            b2bua_fail_after_answer(call_id, &error, &snapshot.branch, message, state);
             return;
         }
 
@@ -217,7 +217,7 @@ pub fn b_leg_answered(
             } else {
                 "@b2bua.on_answer called call.terminate()"
             };
-            b2bua_fail_after_answer(call_id, cause, snapshot.b_leg_index, message, state);
+            b2bua_fail_after_answer(call_id, cause, &snapshot.branch, message, state);
             return;
         }
 
@@ -282,10 +282,27 @@ pub fn absorb_answered_retransmit(
     state: &DispatcherState,
     snapshot: &BLegResponseSnapshot,
 ) -> bool {
-    let already_answered = match snapshot
-        .b_leg_index
-        .map(|idx| state.call_actors.try_win(call_id, idx))
-    {
+    // Claimed for the leg on this response's Via branch, found under the lock
+    // that claims it. The position the snapshot read is not used: a leg ahead
+    // of this one taken off the call since would make another leg, or none, the
+    // winner.
+    let claim = if snapshot.matched_b_leg {
+        let Some(outcome) = state.call_actors.try_win_on(call_id, &snapshot.branch) else {
+            // The call, or this leg, went away underneath its 2xx. It answers
+            // nothing now, and is still owed its ACK (RFC 3261 §13.2.2.4).
+            warn!(
+                call_id = %call_id,
+                branch = %snapshot.branch,
+                "B2BUA: a 2xx on a leg taken off its call is ACKed and not relayed"
+            );
+            ack_b_leg_2xx(call_id, message, state, snapshot);
+            return true;
+        };
+        Some(outcome)
+    } else {
+        None
+    };
+    let already_answered = match claim {
         Some(crate::b2bua::actor::WinOutcome::FirstWin { cancelled }) => {
             // The winner of a controller-issued `dial` is named before the
             // branches it beat are reported cancelled.
@@ -375,7 +392,7 @@ pub fn ack_b_leg_2xx(
         .call_actors
         .get_call(call_id)
         .and_then(|call| call.delayed_offer_ack.clone())
-        .filter(|held| Some(held.b_leg_index) == snapshot.b_leg_index)
+        .filter(|held| snapshot.matched_b_leg && held.branch == snapshot.branch)
     {
         if held.sent {
             debug!(call_id = %call_id, "B2BUA: ACKing a retransmitted B-leg 2xx with the ACK that carried the answer");
@@ -435,7 +452,7 @@ pub fn ack_b_leg_2xx(
         .and_then(|invite| invite.lock().ok())
         .is_some_and(|invite| invite.body.is_empty());
     if invite_carried_no_offer && !message.body.is_empty() {
-        if let Some(index) = snapshot.b_leg_index {
+        if snapshot.matched_b_leg {
             if let Some(mut call) = state.call_actors.get_call_mut(call_id) {
                 // The first copy to get here holds it; a copy racing it adds
                 // nothing.
@@ -446,7 +463,7 @@ pub fn ack_b_leg_2xx(
                         transport,
                         destination,
                         local_addr: snapshot.b_leg_local_addr,
-                        b_leg_index: index,
+                        branch: snapshot.branch.clone(),
                         sent: false,
                     });
                 }
@@ -462,13 +479,9 @@ pub fn ack_b_leg_2xx(
         snapshot.b_leg_local_addr,
         state,
     );
-    if let Some(index) = snapshot.b_leg_index {
-        if let Some(mut call) = state.call_actors.get_call_mut(call_id) {
-            if let Some(leg) = call.b_legs.get_mut(index) {
-                leg.initial_acked = true;
-            }
-        }
-    }
+    state
+        .call_actors
+        .update_b_leg_on(call_id, &snapshot.branch, |leg| leg.initial_acked = true);
     debug!(call_id = %call_id, %destination, "B2BUA: ACKed B-leg 2xx");
 }
 
@@ -722,9 +735,12 @@ pub fn prepare_a_leg_answer(
     match sdp_in_body(message_content_type(response), &response.body) {
         Some(answer) => state.call_actors.set_leg_sent_sdp(call_id, true, answer),
         None => {
-            if let Some(early) = snapshot
-                .b_leg_index
-                .and_then(|index| state.call_actors.b_leg_early_answer(call_id, index))
+            if let Some(early) = state
+                .call_actors
+                .read_b_leg_on(call_id, &snapshot.branch, |leg| {
+                    leg.early_answer_sent.clone()
+                })
+                .flatten()
             {
                 state.call_actors.set_leg_sent_sdp(call_id, true, early);
             }
@@ -758,6 +774,7 @@ pub fn prepare_a_leg_answer(
             .unwrap_or_default();
 
         if let Some(mut call) = state.call_actors.get_call_mut(call_id) {
+            // The winner's position is read and used under one hold of the call's lock.
             if let Some(winner) = call.winner {
                 if let Some(b_leg) = call.b_legs.get_mut(winner) {
                     debug!(

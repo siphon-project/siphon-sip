@@ -154,6 +154,18 @@ export interface TransferIdentity {
   pAssertedIdentity?: string;
   /** Whether the calling identity may be presented (RFC 3323 §4.1). */
   privacy?: "allowed" | "restricted";
+  /**
+   * The name of a number policy configured on the server, which decides how
+   * the numbers in the new leg's identity headers are written. Unset, the
+   * server's default for the calls it dials applies. Not together with
+   * `format`: the server refuses the two.
+   */
+  numberPolicy?: string;
+  /**
+   * One number format for the new leg's identity headers, in place of a named
+   * policy.
+   */
+  format?: "e164" | "plain" | "international" | "national";
   /** Headers for the new leg's INVITE, injected after the header policy. */
   headers?: Record<string, string>;
 }
@@ -168,6 +180,8 @@ function insertTransferIdentity(
     args.p_asserted_identity = identity.pAssertedIdentity;
   }
   if (identity?.privacy !== undefined) args.privacy = identity.privacy;
+  if (identity?.numberPolicy !== undefined) args.number_policy = identity.numberPolicy;
+  if (identity?.format !== undefined) args.format = identity.format;
   if (identity?.headers !== undefined) args.headers = identity.headers;
 }
 
@@ -774,10 +788,18 @@ export function recordStopArgs(recordingId?: string): Record<string, unknown> {
   return recordingId === undefined ? {} : { recording_id: recordingId };
 }
 
+/**
+ * The audio source for {@link Call.play}: a server-side file, a media-DB id,
+ * inline bytes, a tone the media engine generates (a preset name such as
+ * `"ringback_eu"` or a cadence such as `"425/1000,0/4000*inf"`), or an
+ * `http://` / `https://` URL it fetches.
+ */
 export type PlaySource =
   | { file: string }
   | { dbId: number }
-  | { blob: Uint8Array };
+  | { blob: Uint8Array }
+  | { tone: string }
+  | { url: string };
 
 /** Optional shaping for {@link Call.play}. */
 export interface PlayOptions {
@@ -790,6 +812,8 @@ export interface PlayOptions {
   startMs?: number;
   /** Cap playback to this duration, in milliseconds. */
   durationMs?: number;
+  /** Play louder (positive) or quieter (negative) by this many decibels. */
+  gainDecibels?: number;
   /** Scope the prompt to one peer of an MPTY bridge (its To-tag). */
   toTag?: string;
 }
@@ -859,6 +883,10 @@ function playArgs(source: PlaySource, options?: PlayOptions): Record<string, unk
     args.file = source.file;
   } else if ("dbId" in source) {
     args.db_id = source.dbId;
+  } else if ("tone" in source) {
+    args.tone = source.tone;
+  } else if ("url" in source) {
+    args.url = source.url;
   } else {
     args.blob = Buffer.from(source.blob).toString("base64");
   }
@@ -870,6 +898,9 @@ function playArgs(source: PlaySource, options?: PlayOptions): Record<string, unk
   }
   if (options?.durationMs !== undefined) {
     args.duration_ms = options.durationMs;
+  }
+  if (options?.gainDecibels !== undefined) {
+    args.gain_decibels = options.gainDecibels;
   }
   if (options?.toTag !== undefined) {
     args.to_tag = options.toTag;

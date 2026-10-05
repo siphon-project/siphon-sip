@@ -184,10 +184,8 @@ pub fn b2bua_accept_refer_controller_with_state(
     sip_call_id: &str,
     timeout_secs: Option<u32>,
 ) -> Result<u32, ControllerReferRefusal> {
-    let pending = state
-        .pending_inbound_refer
-        .take(sip_call_id)
-        .ok_or(ControllerReferRefusal::NoPendingRefer)?;
+    let pending =
+        take_held_refer(state, sip_call_id).ok_or(ControllerReferRefusal::NoPendingRefer)?;
     let Some(call_id) = state.call_actors.find_by_sip_call_id(sip_call_id) else {
         // The call ended between the REFER and the decision. The REFER is
         // still owed an answer (RFC 3515 §2.4.2).
@@ -202,6 +200,10 @@ pub fn b2bua_accept_refer_controller_with_state(
         return Err(ControllerReferRefusal::Gone);
     };
 
+    let Some(referrer_on_a_leg) = held_referrer_leg(&pending, &call_id, state) else {
+        return Err(ControllerReferRefusal::ReferrerGone);
+    };
+
     let expires = timeout_secs
         .unwrap_or(CONTROLLER_REFER_DEFAULT_SECS)
         .clamp(1, CONTROLLER_REFER_MAX_SECS);
@@ -211,7 +213,7 @@ pub fn b2bua_accept_refer_controller_with_state(
     let opened = state.controller_refers.insert(
         &call_id,
         ControllerRefer {
-            referrer_on_a_leg: pending.from_a_leg,
+            referrer_on_a_leg,
             event_id,
             deadline: std::time::Instant::now() + std::time::Duration::from_secs(expires.into()),
         },
@@ -232,7 +234,7 @@ pub fn b2bua_accept_refer_controller_with_state(
         &pending.inbound,
         &pending.message,
         &call_id,
-        pending.from_a_leg,
+        referrer_on_a_leg,
         event_id,
         expires,
         state,
@@ -240,7 +242,7 @@ pub fn b2bua_accept_refer_controller_with_state(
     if notified {
         info!(
             call_id = %call_id,
-            referrer_on_a_leg = pending.from_a_leg,
+            referrer_on_a_leg,
             target = %pending.refer_to.uri,
             expires,
             "B2BUA REFER: accepted for its controller to carry out — 202 + NOTIFY 100 Trying, nothing dialled"

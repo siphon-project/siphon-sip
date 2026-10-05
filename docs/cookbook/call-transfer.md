@@ -146,7 +146,17 @@ the same request can arrive after siphon has already acted on it. It is the same
 request (same Call-ID, CSeq and Via branch) and is answered with the same final
 response again, for 32 s: `@b2bua.on_refer` runs once per `REFER`, and the
 target is dialled, or the `REFER` relayed, once. A `REFER` with a new CSeq is a
-new request and runs the handler again.
+new request.
+
+#### When a second REFER arrives during a transfer
+
+A call carries out one transfer at a time. While the target of an accepted
+transfer is still ringing, and while a relayed `REFER` has not been answered by
+the far end, a new `REFER` on the call (from either party) is answered
+`491 Request Pending` and `@b2bua.on_refer` does not run for it: accepting it
+would dial a second target for the same pair. The referrer may send it again
+(RFC 3261 §21.4.27), and once the first transfer has succeeded, failed or timed
+out the handler runs for a new `REFER` as usual.
 
 #### When the target cannot be dialled
 

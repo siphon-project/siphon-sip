@@ -72,7 +72,7 @@ async fn cancelled_bridge_dial_to_a_silent_phone(
     assert_eq!(reply["status"], "ok", "{reply}");
     assert_eq!(reply["result"]["state"], "cancelled");
     // What the controller is told does not wait for the phone.
-    let heard = through_dial_failed(&controller, queued).await;
+    let heard = through_dial_failed(&controller, queued);
     assert_eq!(names(&heard), ["DialBranchFailed", "DialFailed"]);
     assert_eq!(heard[0].payload["code"], 487);
     assert_eq!(heard[0].payload["cause"], "cancelled");
@@ -187,8 +187,10 @@ async fn a_late_failure_to_a_cancelled_dial_is_acked_and_nothing_else() {
     assert_released_at_expiry(state, &branch);
 }
 
-/// The phone never says anything: the INVITE retransmits to Timer B, no CANCEL
-/// is ever sent, and the branch is released when the transaction times out.
+/// The phone never says anything: the INVITE retransmits to Timer B and no
+/// CANCEL is ever sent, not for a provisional that turns up after it either.
+/// A 2xx that turns up after it is ACKed and released with a BYE, and the
+/// branch is released at its expiry.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_cancelled_dial_to_a_phone_that_never_responds_ends_at_timer_b_without_a_cancel() {
     const PHONE: &str = "198.51.100.195:5060";
@@ -209,12 +211,33 @@ async fn a_cancelled_dial_to_a_phone_that_never_responds_ends_at_timer_b_without
     assert_eq!(state.call_actors.deferred_cancel_count(), 0);
     assert_eq!(
         state.call_actors.cancelled_branch_count(),
-        0,
-        "Timer B releases the branch"
+        1,
+        "still answerable, for a final response that turns up late"
     );
     assert!(state.b2bua_retransmits.is_empty());
 
     // The transaction is over: a provisional after it draws no CANCEL.
     phone_answers(state, PHONE, &invite, 180, "Ringing", None);
     assert_no_cancel(&drain(&dispatcher.udp), PHONE);
+
+    // A 2xx after it created a dialog all the same: ACKed, and released.
+    phone_answers(
+        state,
+        PHONE,
+        &invite,
+        200,
+        "OK",
+        Some(&phone_offer("198.51.100.195")),
+    );
+    let sent = wire_until(dispatcher, |sent| {
+        !requests_to(sent, socket(PHONE), Method::Bye).is_empty()
+    })
+    .await;
+    assert_no_cancel(&sent, PHONE);
+    assert_eq!(requests_to(&sent, socket(PHONE), Method::Ack).len(), 1);
+    let byes = requests_to(&sent, socket(PHONE), Method::Bye);
+    assert_eq!(byes.len(), 1);
+    // The BYE is the phone's to answer; its schedule goes with that answer.
+    phone_answers(state, PHONE, &byes[0].message.clone(), 200, "OK", None);
+    assert_released_at_expiry(state, &branch);
 }

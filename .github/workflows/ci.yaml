@@ -1524,17 +1524,27 @@ jobs:
       - name: B2BUA REFER terminate + REAL rtpengine (media re-anchor offer/answer/delete)
         run: COMPOSE_PROFILES=b2bua-rtpengine-refer bash sipp/run_call.sh sipp-anchored-refer-uac sipp-anchored-refer-bob-uas sipp-anchored-refer-carol-uas
 
+      # The caller speaks SRTP and the callee plain RTP, anchored with a profile
+      # whose halves say so. The callee holds and resumes: each re-INVITE must
+      # reach the caller as SRTP and be answered to the callee as plain RTP.
+      # Both parties assert the SDP they are sent, and run_call.sh grades both.
+      - name: B2BUA callee re-offer at an SRTP edge + REAL rtpengine (each party keeps its transport)
+        run: |
+          docker compose -f sipp/docker-compose.yaml --profile b2bua-rtpengine-reoffer up -d --wait rtpengine-real siphon-b2bua-rtpengine-reoffer
+          COMPOSE_PROFILES=b2bua-rtpengine-reoffer bash sipp/run_call.sh sipp-srtp-edge-reoffer-uac sipp-srtp-edge-reoffer-uas
+
       - name: Collect logs
         if: always()
         run: |
           docker compose -f sipp/docker-compose.yaml logs siphon-b2bua > siphon-b2bua-refer.log 2>&1 || true
           docker compose -f sipp/docker-compose.yaml logs siphon-b2bua-refer-modes >> siphon-b2bua-refer.log 2>&1 || true
           docker compose -f sipp/docker-compose.yaml logs siphon-b2bua-rtpengine-refer >> siphon-b2bua-refer.log 2>&1 || true
+          docker compose -f sipp/docker-compose.yaml logs siphon-b2bua-rtpengine-reoffer >> siphon-b2bua-refer.log 2>&1 || true
           docker compose -f sipp/docker-compose.yaml logs rtpengine-real > rtpengine-real.log 2>&1 || true
 
       - name: Teardown
         if: always()
-        run: docker compose -f sipp/docker-compose.yaml --profile b2bua --profile b2bua-refer --profile b2bua-refer-reject --profile b2bua-refer-terminate --profile b2bua-refer-referrer-bye --profile b2bua-refer-attended --profile b2bua-replaces --profile b2bua-bleg-ack --profile b2bua-rtpengine-refer down --remove-orphans
+        run: docker compose -f sipp/docker-compose.yaml --profile b2bua --profile b2bua-refer --profile b2bua-refer-reject --profile b2bua-refer-terminate --profile b2bua-refer-referrer-bye --profile b2bua-refer-attended --profile b2bua-replaces --profile b2bua-bleg-ack --profile b2bua-rtpengine-refer --profile b2bua-rtpengine-reoffer down --remove-orphans
 
       - name: Upload logs
         if: always()

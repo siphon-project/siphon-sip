@@ -236,17 +236,16 @@ impl CallActorStore {
         };
         match old_branch {
             Some(old) => {
-                if old != new_branch {
-                    self.registry.remove_branch(&old);
-                }
-                self.registry.register_branch(&new_branch, call_id);
+                self.repoint_branch(call_id, &old, &new_branch);
                 true
             }
             None => false,
         }
     }
 
-    /// Remove a B-leg by index.
+    /// Remove a B-leg by index. Only for a caller whose index cannot have gone
+    /// stale; a response handler uses
+    /// [`remove_b_leg_on`](Self::remove_b_leg_on).
     pub fn remove_b_leg(&self, call_id: &str, index: usize) {
         let mut ended = Vec::new();
         if let Some(mut call) = self.calls.get_mut(call_id) {
@@ -277,7 +276,8 @@ impl CallActorStore {
         ended
     }
 
-    /// Update the target_uri of a B-leg (used to mark re-INVITE entries as done).
+    /// Update the target_uri of the B-leg at `index`. A response handler marks
+    /// its tracking leg done by Via branch instead (`update_b_leg_on`).
     pub fn set_b_leg_target_uri(&self, call_id: &str, index: usize, target_uri: String) {
         if let Some(mut call) = self.calls.get_mut(call_id) {
             if let Some(b_leg) = call.b_legs.get_mut(index) {
@@ -549,14 +549,9 @@ impl CallActorStore {
         let Some(mut call) = self.calls.get_mut(call_id) else {
             return false;
         };
-        let Some(leg) = call.b_legs.get_mut(b_leg_index) else {
-            return false;
-        };
-        if leg.auth_challenged {
-            return false;
-        }
-        leg.auth_challenged = true;
-        true
+        call.b_legs
+            .get_mut(b_leg_index)
+            .is_some_and(by_branch::mark_auth_challenged)
     }
 
     /// Current count of credentialed outbound INVITEs sent on the 401/407
@@ -811,14 +806,7 @@ impl CallActorStore {
         let Some(mut call) = self.calls.get_mut(call_id) else {
             return WinOutcome::AlreadyAnswered;
         };
-        if call.state == CallState::Answered {
-            WinOutcome::AlreadyAnswered
-        } else {
-            call.set_winner(index);
-            let cancelled = call.cancel_pending_branches(Some(index));
-            self.keep_answerable(&cancelled);
-            WinOutcome::FirstWin { cancelled }
-        }
+        self.claim_answer(&mut call, index)
     }
 
     /// Atomically decide whether a 1xx provisional should be forwarded to the

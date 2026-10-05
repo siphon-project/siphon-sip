@@ -35,7 +35,11 @@ pub struct BLegResponseSnapshot {
     pub b_leg_dest: Option<(SocketAddr, Transport)>,
     pub b_leg_local_addr: Option<SocketAddr>,
     pub b_leg_connection_id: ConnectionId,
-    pub b_leg_index: Option<usize>,
+    /// Whether a B-leg carried the response's Via branch when the call was
+    /// read. Its position is deliberately not kept: by the time a handler acts
+    /// a leg ahead of it may be off the call, so the leg is found again by
+    /// [`branch`](Self::branch) under the lock that acts on it.
+    pub matched_b_leg: bool,
     pub b_leg_stored_vias: Vec<String>,
     pub b_leg_stored_cseq: Option<String>,
     pub b_leg_stored_from: Option<String>,
@@ -106,7 +110,7 @@ pub fn b_leg_response_snapshot(
         b_leg_dest: dest,
         b_leg_local_addr: b_local_addr,
         b_leg_connection_id: connection_id,
-        b_leg_index: matching_b_idx,
+        matched_b_leg: matching_b_idx.is_some(),
         b_leg_stored_vias: stored_vias,
         b_leg_stored_cseq: stored_cseq,
         b_leg_stored_from: stored_from,
@@ -122,6 +126,23 @@ pub fn b_leg_response_snapshot(
         branch: branch.to_string(),
         a_leg_local_addr: call.a_leg_local_addr,
     })
+}
+
+/// Keep the tracking leg whose request a 2xx just answered, under
+/// `done_target`, so a retransmission of that 2xx is recognised and not
+/// handled a second time. The leg is the one the response's Via branch names,
+/// wherever it sits on the call by now.
+pub fn mark_tracking_leg_done(
+    call_id: &str,
+    snapshot: &BLegResponseSnapshot,
+    done_target: String,
+    state: &DispatcherState,
+) {
+    state
+        .call_actors
+        .update_b_leg_on(call_id, &snapshot.branch, |leg| {
+            leg.dialog.target_uri = Some(done_target)
+        });
 }
 
 /// The To-tag a B-leg response carries once it is relayed to the caller.

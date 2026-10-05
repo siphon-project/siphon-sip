@@ -1327,7 +1327,10 @@ async fn ring_two_anchored(prefix: u32, engine: &NativeTestEngine) -> (Ringing, 
             "b-tag",
             caller_sdp.as_bytes(),
             &header(&call.to_b, "Call-ID"),
-            "rtp_passthrough",
+            &crate::rtpengine::session::SideFlags {
+                profile: "rtp_passthrough".to_string(),
+                half: crate::rtpengine::session::ProfileHalf::Answer,
+            },
             None,
         )
         .is_some());
