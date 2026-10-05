@@ -398,7 +398,14 @@ pub fn handle_b2bua_update(inbound: InboundMessage, message: SipMessage, state: 
                             return;
                         };
                         let mut offer_flags = profile.offer.clone();
-                        offer_flags.stamp_received_from(inbound.remote_addr.ip());
+                        // The offering party's own policy, as on a
+                        // re-INVITE: a callee was set up under the `answer`
+                        // half, not the `offer` half that shapes this command.
+                        session.party_ingress(from_a_leg).stamp_ingress(
+                            &mut offer_flags,
+                            profiles,
+                            inbound.remote_addr.ip(),
+                        );
                         offer_flags.stamp_sip_call_id(&sip_call_id);
                         match tokio::task::block_in_place(|| {
                             tokio::runtime::Handle::current().block_on(rtpengine_set.reoffer(

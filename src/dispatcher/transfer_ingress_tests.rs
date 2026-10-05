@@ -35,22 +35,22 @@ use crate::b2bua::transfer::ReplacementOrigin;
 use crate::rtpengine::test_native_engine::{NativeCommand, NativeTestEngine};
 
 /// No source hint on either half.
-const OPEN: &str = "open_pair";
+pub(super) const OPEN: &str = "open_pair";
 /// The source hint on both halves.
-const PINNED: &str = "pinned_pair";
+pub(super) const PINNED: &str = "pinned_pair";
 /// The hint on the `offer` half alone: the party whose SDP is offered.
-const PINS_OFFERER: &str = "pins_offerer";
+pub(super) const PINS_OFFERER: &str = "pins_offerer";
 /// The hint on the `answer` half alone: the party that answers.
-const PINS_ANSWERER: &str = "pins_answerer";
+pub(super) const PINS_ANSWERER: &str = "pins_answerer";
 
 /// The address a new party's SDP names. It stands for the private address a
 /// party behind NAT signals: not where its signalling, or its media, comes
 /// from.
-const SIGNALLED: &str = "203.0.113.77";
+pub(super) const SIGNALLED: &str = "203.0.113.77";
 
 /// The built-in profiles plus the four above. Each half names a transport of
 /// its own, so a recorded command says which half shaped it.
-fn profiles() -> Arc<crate::rtpengine::ProfileRegistry> {
+pub(super) fn profiles() -> Arc<crate::rtpengine::ProfileRegistry> {
     let pair = |offer: bool, answer: bool| crate::config::MediaProfileConfig {
         offer: crate::config::NgFlagsConfig {
             transport_protocol: Some("RTP/SAVP".to_string()),
@@ -71,11 +71,11 @@ fn profiles() -> Arc<crate::rtpengine::ProfileRegistry> {
     Arc::new(crate::rtpengine::ProfileRegistry::from_config(&custom))
 }
 
-fn ip(address: &str) -> IpAddr {
+pub(super) fn ip(address: &str) -> IpAddr {
     host_of(address).parse().expect("a literal address")
 }
 
-fn sdp_naming(address: &str) -> String {
+pub(super) fn sdp_naming(address: &str) -> String {
     format!(
         concat!(
             "v=0\r\n",
@@ -93,7 +93,7 @@ fn sdp_naming(address: &str) -> String {
 /// An answered call between A and B anchored on `engine` under `profile`: the
 /// caller offered and the callee answered on an engine call keyed by the
 /// caller's Call-ID, as a script's `rtpengine.offer` / `answer` leave it.
-async fn anchored(prefix: u32, engine: &NativeTestEngine, profile: &str) -> Established {
+pub(super) async fn anchored(prefix: u32, engine: &NativeTestEngine, profile: &str) -> Established {
     let mut call = establish(prefix, "terminate");
     let registry = profiles();
     let backend = engine.backend();
@@ -167,7 +167,7 @@ fn answer_naming_another_address(invite: &SipMessage, address: &str, to_tag: &st
 }
 
 /// One party of `call` sends a REFER naming `target` in its own dialog.
-fn refers(call: &Established, from_a_leg: bool, target: &str) {
+pub(super) fn refers(call: &Established, from_a_leg: bool, target: &str) {
     let refer_to = format!("Refer-To: <sip:target@{target}>\r\n");
     let (source, (raw, message)) = if from_a_leg {
         (
@@ -203,7 +203,12 @@ fn refers(call: &Established, from_a_leg: bool, target: &str) {
 
 /// Replace one party of `call` with `target` the way `replace_peer` does,
 /// naming `profile` for the pair when one is given.
-fn replaces_peer(call: &Established, replace_a_leg: bool, target: &str, profile: Option<&str>) {
+pub(super) fn replaces_peer(
+    call: &Established,
+    replace_a_leg: bool,
+    target: &str,
+    profile: Option<&str>,
+) {
     let call_id = call.call_id();
     let dialled = tokio::task::block_in_place(|| {
         b2bua_start_leg_replacement(
@@ -228,7 +233,7 @@ fn replaces_peer(call: &Established, replace_a_leg: bool, target: &str, profile:
 /// The target at `target` answers the INVITE the replacement sent it, from
 /// `target` and naming [`SIGNALLED`]. Returns the fresh engine call-id the
 /// pair was put on.
-fn target_answers(call: &Established, target: &str) -> String {
+pub(super) fn target_answers(call: &Established, target: &str) -> String {
     let to_target = sent_invite_to(&wire(&call.dispatcher), target);
     let fresh = header(&to_target, "Call-ID");
     assert_ne!(fresh, call.a_call_id, "a fresh engine call");
@@ -442,7 +447,7 @@ async fn a_replaces_takeover_pins_the_newcomer_and_the_survivor_by_their_own_pol
 /// A newcomer at `newcomer` takes the callee's place in `call` with an INVITE
 /// carrying `Replaces`. Returns the fresh engine call-id, the newcomer's own
 /// Call-ID.
-fn takeover(call: &Established, prefix: u32, newcomer: &str) -> String {
+pub(super) fn takeover(call: &Established, prefix: u32, newcomer: &str) -> String {
     let aor = format!("sip:{}@example.com", prefix + 4);
     register(&aor, newcomer);
     let siphon_tag = tag_of(&header(&call.to_b, "From"));

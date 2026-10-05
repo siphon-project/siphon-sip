@@ -103,6 +103,25 @@ impl SideFlags {
                 ProfileHalf::Answer => entry.answer.carry_received_from,
             })
     }
+
+    /// Put this policy's `received_from` hint on `flags`, a command that
+    /// carries the SDP of the party the policy belongs to: `source`, where
+    /// that party signals from, when the policy asks for the pin, and no hint
+    /// when it does not.
+    ///
+    /// It replaces whatever the flags' own half says. The half a command is
+    /// shaped by is chosen for the party the result is sent to, so its policy
+    /// is the other party's.
+    pub fn stamp_ingress(
+        &self,
+        flags: &mut super::profile::NgFlags,
+        registry: &super::profile::ProfileRegistry,
+        source: std::net::IpAddr,
+    ) {
+        flags.carry_received_from = self.pins_ingress(registry);
+        flags.received_from = None;
+        flags.stamp_received_from(source);
+    }
 }
 
 /// The two parties of a bridged pair's session and what shapes each.
