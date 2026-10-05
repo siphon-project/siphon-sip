@@ -381,6 +381,7 @@ pub(super) fn process_timer_actions_with_followups(
                     }
                 }
             }
+            Action::SendCancel(cancel) => send_proxy_branch_cancel(cancel, state),
             Action::StartTimer(name, duration) => {
                 let timer_id = format!("{}:{:?}", key, name);
                 state.timer_wheel.insert(

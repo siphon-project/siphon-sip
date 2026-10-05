@@ -203,8 +203,14 @@ pub(super) fn handle_response(
                     ClientEvent::Ict(IctEvent::Provisional(message.clone())),
                 ) {
                     for action in &actions {
-                        if let Action::CancelTimer(name) = action {
-                            state.timer_wheel.remove(&format!("{}:{:?}", key, name));
+                        match action {
+                            Action::CancelTimer(name) => {
+                                state.timer_wheel.remove(&format!("{}:{:?}", key, name));
+                            }
+                            // A proxied branch given up on while it had drawn
+                            // nothing: this 100 is what its CANCEL waited for.
+                            Action::SendCancel(cancel) => send_proxy_branch_cancel(cancel, state),
+                            _ => {}
                         }
                     }
                 }
@@ -439,6 +445,9 @@ pub(super) fn handle_response(
                             Action::ProtocolError(message) => {
                                 warn!(key = %key, "client transaction protocol error: {message}");
                             }
+                            // RFC 3261 §9.1: the first provisional on a branch
+                            // the proxy gave up on while it had drawn nothing.
+                            Action::SendCancel(cancel) => send_proxy_branch_cancel(cancel, state),
                             _ => {}
                         }
                     }

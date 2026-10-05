@@ -2,7 +2,9 @@
 //!
 //! A 2xx ACK is a new transaction (RFC 3261 §13.2.2.4), not part of the INVITE
 //! one, so it is routed by dialog rather than by branch. CANCEL fans out to
-//! every fork branch still in flight.
+//! every fork branch still pending: one that has drawn a provisional is sent
+//! it at once, and one that has drawn nothing when it does (RFC 3261 §9.1,
+//! [`cancel_proxy_branch`]).
 
 use super::*;
 
@@ -26,6 +28,11 @@ pub(super) fn cancel_other_fork_branches(
 /// every branch, which is what a reply-time `reply.reject(code, reason)` needs:
 /// it aborts the whole in-progress INVITE, including the branch whose
 /// provisional triggered the reject.
+///
+/// "Pending" is RFC 3261 §9.1's: each branch is offered to
+/// [`cancel_proxy_branch`], which sends the CANCEL to a branch that has drawn a
+/// provisional, keeps it for one that has drawn nothing, and sends none to one
+/// that has its final response.
 ///
 /// RFC 3261 §9.1: each branch's CANCEL MUST carry the same topmost Via branch
 /// (and CSeq number) siphon used for that branch's INVITE, so we rebuild the
@@ -85,23 +92,89 @@ pub(super) fn cancel_fork_branches(
                 }
             };
 
-            let data = Bytes::from(cancel.to_bytes());
-
-            debug!(
-                client_key = %client_key,
-                destination = %client_branch.destination,
-                "fork: cancelling branch"
-            );
-
-            send_outbound(
-                data,
-                client_branch.transport,
-                client_branch.destination,
-                client_branch.connection_id,
-                state,
-            );
+            cancel_proxy_branch(client_key, client_branch, &cancel, state);
         }
     }
+}
+
+/// CANCEL one branch of a proxied INVITE with `cancel`, when RFC 3261 §9.1
+/// allows it. The one place the proxy decides to send a branch its CANCEL,
+/// whatever gave up on the branch: another branch's 2xx or 6xx, a
+/// `reply.reject()`, the caller's own CANCEL.
+///
+/// §9.1: "If no provisional response has been received, the CANCEL request
+/// MUST NOT be sent; rather, the client MUST wait for the arrival of a
+/// provisional response before sending the request", and a CANCEL "SHOULD NOT
+/// be sent" for a request with its final response. §16.10 and §16.7 step 10
+/// have a proxy CANCEL its *pending* client transactions, which are those.
+///
+/// What the branch has drawn is the state of its INVITE client transaction,
+/// and the decision is taken there, under the lock the response path holds
+/// for the same transaction:
+///
+/// * a provisional and no final: the CANCEL is sent now;
+/// * nothing yet: the CANCEL is left with the transaction. The INVITE stays an
+///   unanswered request, retransmitted on Timer A, and its first provisional
+///   (a `100 Trying` counts) sends the CANCEL from the response path. A final
+///   response instead drops it unsent, and so does Timer B;
+/// * a final response, or a transaction that is over: nothing is sent.
+///
+/// The waiting CANCEL does not depend on the proxy session, which the caller's
+/// CANCEL removes at once.
+fn cancel_proxy_branch(
+    client_key: &TransactionKey,
+    client_branch: &ClientBranch,
+    cancel: &SipMessage,
+    state: &DispatcherState,
+) {
+    use crate::transaction::state::{BranchCancel, CancelOutcome};
+
+    let cancel = BranchCancel {
+        frame: Bytes::from(cancel.to_bytes()),
+        destination: client_branch.destination,
+        transport: client_branch.transport,
+        connection_id: client_branch.connection_id,
+    };
+    match state
+        .transaction_manager
+        .cancel_invite_client(client_key, cancel)
+    {
+        CancelOutcome::SendNow(cancel) => send_proxy_branch_cancel(&cancel, state),
+        CancelOutcome::Deferred => debug!(
+            client_key = %client_key,
+            destination = %client_branch.destination,
+            "proxy: no provisional on this branch yet — its INVITE keeps retransmitting and the CANCEL follows its first provisional (RFC 3261 §9.1)"
+        ),
+        CancelOutcome::NothingToSend => debug!(
+            client_key = %client_key,
+            destination = %client_branch.destination,
+            "proxy: branch has its final response or its CANCEL already — nothing to send (RFC 3261 §9.1)"
+        ),
+    }
+}
+
+/// Put the CANCEL of a proxied INVITE on the wire, to the hop that INVITE went
+/// to (RFC 3261 §9.1: the same destination address, port and transport).
+///
+/// Reached from the two places a branch's CANCEL is released: at once, when
+/// the branch already had a provisional, and from the response path, on the
+/// first provisional of a branch that had none ([`Action::SendCancel`]).
+pub(super) fn send_proxy_branch_cancel(
+    cancel: &crate::transaction::state::BranchCancel,
+    state: &DispatcherState,
+) {
+    debug!(
+        destination = %cancel.destination,
+        transport = %cancel.transport,
+        "proxy: sending a branch its CANCEL"
+    );
+    send_outbound(
+        cancel.frame.clone(),
+        cancel.transport,
+        cancel.destination,
+        cancel.connection_id,
+        state,
+    );
 }
 
 /// Fail an in-progress proxied INVITE from the reply context.
@@ -114,8 +187,9 @@ pub(super) fn cancel_fork_branches(
 /// 1. Mark the session finalized *first* so any branch response that races in
 ///    (the `487` the CANCEL draws back, or a late provisional) is absorbed by
 ///    the straggler guard in `handle_response` rather than forwarded upstream.
-/// 2. CANCEL every pending downstream branch (RFC 3261 §9 — we have received a
-///    provisional, so CANCEL is well-formed), then send `code reason` upstream
+/// 2. CANCEL every pending downstream branch (RFC 3261 §9.1 — the branch whose
+///    provisional drew the reject at once, any other when it has drawn a
+///    provisional of its own), then send `code reason` upstream
 ///    to the UAC through the server transaction so retransmission and ACK
 ///    absorption are handled by the transaction layer.
 ///
@@ -686,8 +760,14 @@ pub(super) fn cancel_via_for_client_branch(
     )
 }
 
-/// Handle CANCEL using ProxySession — forwards CANCEL to all client branches
-/// and sends 487 Request Terminated upstream.
+/// Handle CANCEL using ProxySession — forwards CANCEL to the pending client
+/// branches and sends 487 Request Terminated upstream.
+///
+/// The caller is answered, and the session removed, at once. A branch that
+/// has drawn no response yet is not sent the CANCEL then (RFC 3261 §9.1): it
+/// stays with the branch's INVITE client transaction, which outlives the
+/// session, and goes on that INVITE's first provisional
+/// ([`cancel_proxy_branch`]).
 pub(super) fn handle_cancel_via_session(
     inbound: InboundMessage,
     message: SipMessage,
@@ -731,7 +811,7 @@ pub(super) fn handle_cancel_via_session(
         state,
     );
 
-    // Forward CANCEL to each client branch
+    // Forward CANCEL to each client branch still pending
     for client_key in &session.client_keys {
         if let Some(client_branch) = session.get_client_branch(client_key) {
             let mut cancel_downstream = message.clone();
@@ -747,21 +827,10 @@ pub(super) fn handle_cancel_via_session(
             let via_value = cancel_via_for_client_branch(client_key, client_branch.transport);
             cancel_downstream.headers.set("Via", via_value);
 
-            let data = Bytes::from(cancel_downstream.to_bytes());
-
-            debug!(
-                client_key = %client_key,
-                destination = %client_branch.destination,
-                "forwarding CANCEL downstream via session"
-            );
-
-            send_outbound(
-                data,
-                client_branch.transport,
-                client_branch.destination,
-                client_branch.connection_id,
-                state,
-            );
+            // Sent now to a branch that has answered with a provisional, kept
+            // for one that has answered nothing, dropped for one that already
+            // has its final response (RFC 3261 §9.1).
+            cancel_proxy_branch(client_key, client_branch, &cancel_downstream, state);
         }
     }
 

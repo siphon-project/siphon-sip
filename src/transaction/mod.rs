@@ -13,6 +13,9 @@ pub mod key;
 pub mod state;
 pub mod timer;
 
+#[cfg(test)]
+mod cancel_tests;
+
 use bytes::Bytes;
 use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
@@ -388,6 +391,46 @@ impl TransactionManager {
         }
 
         Ok(actions)
+    }
+
+    /// Ask for the INVITE client transaction `key` to be cancelled with
+    /// `cancel`, and learn whether that CANCEL goes now, waits, or is not sent
+    /// at all (RFC 3261 §9.1, [`Ict::request_cancel`]).
+    ///
+    /// Decided under the lock the response path takes for the same
+    /// transaction ([`Self::process_client_event`]), so a request to cancel
+    /// and a provisional response racing it on another worker send the CANCEL
+    /// exactly once between them: whichever comes second finds what the first
+    /// left.
+    ///
+    /// [`CancelOutcome::NothingToSend`] for a key with no transaction (it has
+    /// ended: a 2xx, Timer B or Timer D) and for one that is not an INVITE
+    /// client transaction (§9.1: a CANCEL is for an INVITE).
+    pub fn cancel_invite_client(
+        &self,
+        key: &TransactionKey,
+        cancel: BranchCancel,
+    ) -> CancelOutcome {
+        let Some(mut entry) = self.transactions.get_mut(key) else {
+            return CancelOutcome::NothingToSend;
+        };
+        match &mut **entry {
+            Transaction::Ict(ict) => ict.request_cancel(cancel),
+            _ => CancelOutcome::NothingToSend,
+        }
+    }
+
+    /// Number of INVITE client transactions holding a CANCEL that waits for
+    /// their first provisional (leak-test accessor): back to its baseline once
+    /// each has had a response or timed out.
+    #[cfg(test)]
+    pub fn waiting_cancel_count(&self) -> usize {
+        self.transactions
+            .iter()
+            .filter(|entry| {
+                matches!(&**entry.value(), Transaction::Ict(ict) if ict.cancel_is_waiting())
+            })
+            .count()
     }
 
     /// Remove a transaction (e.g. on cleanup).

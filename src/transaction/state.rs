@@ -3,6 +3,7 @@
 //! Each state machine is a pure function: `(State, Event) → (State, Vec<Action>)`.
 //! No I/O, no async — the caller (TransactionManager) drives timers and sends messages.
 
+use std::net::SocketAddr;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -101,6 +102,14 @@ pub enum Action {
     /// (`tests/transaction_footprint_tests.rs` pins it). Cloning a frame for a
     /// retransmit is a refcount bump; the serialize it replaces is not.
     SendFrame(Bytes),
+    /// Send the CANCEL that was waiting for this INVITE's first provisional
+    /// response (RFC 3261 §9.1), to the hop the INVITE went to.
+    ///
+    /// Emitted once, by an INVITE client transaction leaving `Calling` on a
+    /// provisional, and only when the TU had asked for the INVITE to be
+    /// cancelled while it had drawn no response
+    /// ([`Ict::request_cancel`]).
+    SendCancel(Box<BranchCancel>),
     /// Pass a received message to the Transaction User (TU).
     PassToTu(SipMessage),
     /// Start or restart a timer that fires after `duration`.
@@ -705,6 +714,53 @@ pub enum IctEvent {
     ResponseNon2xx(SipMessage),
 }
 
+/// The CANCEL for an INVITE this element sent, as it goes on the wire, and the
+/// hop that INVITE went to.
+///
+/// RFC 3261 §9.1: "The destination address, port, and transport for the CANCEL
+/// MUST be identical to those used to send the original request." The TU that
+/// sent the INVITE knows both, and hands them over with the request to cancel,
+/// because the CANCEL may have to wait for a provisional response and whatever
+/// the TU held for the INVITE may be gone by then.
+#[derive(Debug, Clone)]
+pub struct BranchCancel {
+    /// The serialized CANCEL.
+    pub frame: Bytes,
+    /// Where the INVITE was sent.
+    pub destination: SocketAddr,
+    /// The transport the INVITE was sent over.
+    pub transport: crate::transport::Transport,
+    /// The connection the INVITE was sent on.
+    pub connection_id: crate::transport::ConnectionId,
+}
+
+/// What [`Ict::request_cancel`] did with a request to cancel the INVITE.
+#[derive(Debug)]
+pub enum CancelOutcome {
+    /// A provisional response has arrived and no final one: the CANCEL is
+    /// handed back for the caller to send now. Returned once per INVITE.
+    SendNow(BranchCancel),
+    /// No response has arrived yet. The CANCEL is kept, the INVITE goes on
+    /// retransmitting, and the first provisional response sends it
+    /// ([`Action::SendCancel`]).
+    Deferred,
+    /// Nothing to send: the INVITE has its final response (or its transaction
+    /// is over), or its CANCEL has been sent already.
+    NothingToSend,
+}
+
+/// How far a request to cancel an INVITE has come (RFC 3261 §9.1).
+#[derive(Debug)]
+enum CancelProgress {
+    /// Nobody asked for this INVITE to be cancelled.
+    NotRequested,
+    /// Asked for while the INVITE had drawn no response: the CANCEL waits here
+    /// for the first provisional. A final response, or Timer B, drops it.
+    Waiting(Box<BranchCancel>),
+    /// The CANCEL was handed out to be sent.
+    Sent,
+}
+
 /// INVITE Client Transaction state machine.
 #[derive(Debug)]
 pub struct Ict {
@@ -720,6 +776,12 @@ pub struct Ict {
     /// Cached ACK for non-2xx retransmission (RFC 3261 §17.1.1.3), serialized
     /// once when it is built for the same reason as `request_bytes`.
     cached_ack: Option<Bytes>,
+    /// Whether the TU asked for this INVITE to be cancelled, and what became
+    /// of it. The record of a CANCEL that waits for a provisional lives here
+    /// rather than with the TU, so it is found by the response that releases
+    /// it without a lookup of its own, and ends with the transaction whatever
+    /// ends that.
+    cancel: CancelProgress,
 }
 
 impl Ict {
@@ -741,6 +803,7 @@ impl Ict {
             request_bytes,
             timer_a_interval,
             cached_ack: None,
+            cancel: CancelProgress::NotRequested,
         };
         // Start Timer B (overall timeout)
         actions.push(Action::StartTimer(TimerName::B, ict.timers.timer_b()));
@@ -821,6 +884,63 @@ impl Ict {
             .map_err(|error| format!("ACK build failed: {error}"))
     }
 
+    /// The TU wants this INVITE cancelled, and `cancel` is its CANCEL.
+    ///
+    /// RFC 3261 §9.1: "If no provisional response has been received, the
+    /// CANCEL request MUST NOT be sent; rather, the client MUST wait for the
+    /// arrival of a provisional response before sending the request", and a
+    /// CANCEL "SHOULD NOT be sent" for a request that has its final response.
+    /// The transaction's own state is the record of both:
+    ///
+    /// * `Calling`: nothing has arrived. The CANCEL is kept and the INVITE is
+    ///   left as it is, retransmitting on Timer A over an unreliable
+    ///   transport. The first provisional sends it; a final response or
+    ///   Timer B drops it unsent.
+    /// * `Proceeding`: a provisional has arrived. The CANCEL is handed back to
+    ///   be sent now, to the first caller that asks.
+    /// * `Completed` / `Terminated`: the final response has arrived, and there
+    ///   is nothing to cancel.
+    pub fn request_cancel(&mut self, cancel: BranchCancel) -> CancelOutcome {
+        match (self.state, &self.cancel) {
+            (IctState::Calling, CancelProgress::NotRequested) => {
+                self.cancel = CancelProgress::Waiting(Box::new(cancel));
+                CancelOutcome::Deferred
+            }
+            // The first request's CANCEL is the one that waits.
+            (IctState::Calling, _) => CancelOutcome::Deferred,
+            (IctState::Proceeding, CancelProgress::NotRequested) => {
+                self.cancel = CancelProgress::Sent;
+                CancelOutcome::SendNow(cancel)
+            }
+            _ => CancelOutcome::NothingToSend,
+        }
+    }
+
+    /// Whether a CANCEL is waiting for this INVITE's first provisional.
+    pub fn cancel_is_waiting(&self) -> bool {
+        matches!(self.cancel, CancelProgress::Waiting(_))
+    }
+
+    /// The CANCEL that waited for the provisional that has just arrived, if
+    /// one did. One discriminant compare when none does.
+    fn release_waiting_cancel(&mut self) -> Option<Box<BranchCancel>> {
+        if !self.cancel_is_waiting() {
+            return None;
+        }
+        match std::mem::replace(&mut self.cancel, CancelProgress::Sent) {
+            CancelProgress::Waiting(cancel) => Some(cancel),
+            CancelProgress::NotRequested | CancelProgress::Sent => None,
+        }
+    }
+
+    /// The INVITE got its final response, or timed out, with a CANCEL still
+    /// waiting: that CANCEL is never sent (RFC 3261 §9.1).
+    fn drop_waiting_cancel(&mut self) {
+        if self.cancel_is_waiting() {
+            self.cancel = CancelProgress::NotRequested;
+        }
+    }
+
     pub fn process(&mut self, event: IctEvent) -> Vec<Action> {
         match (&self.state, event) {
             // -- Calling --
@@ -834,6 +954,7 @@ impl Ict {
             }
             (IctState::Calling, IctEvent::TimerB) => {
                 self.state = IctState::Terminated;
+                self.drop_waiting_cancel();
                 vec![
                     Action::CancelTimer(TimerName::A),
                     Action::Timeout,
@@ -843,14 +964,21 @@ impl Ict {
             (IctState::Calling, IctEvent::Provisional(response)) => {
                 // RFC 3261 §17.1.1.2: provisional response stops retransmissions
                 self.state = IctState::Proceeding;
-                vec![
+                let mut actions = vec![
                     Action::CancelTimer(TimerName::A),
                     Action::PassToTu(response),
-                ]
+                ];
+                // RFC 3261 §9.1: this is the response a CANCEL asked for
+                // earlier was waiting on.
+                if let Some(cancel) = self.release_waiting_cancel() {
+                    actions.push(Action::SendCancel(cancel));
+                }
+                actions
             }
             (IctState::Calling, IctEvent::Response2xx(response)) => {
                 // 2xx to INVITE: transaction layer steps aside
                 self.state = IctState::Terminated;
+                self.drop_waiting_cancel();
                 vec![
                     Action::CancelTimer(TimerName::A),
                     Action::CancelTimer(TimerName::B),
@@ -860,6 +988,7 @@ impl Ict {
             }
             (IctState::Calling, IctEvent::ResponseNon2xx(response)) => {
                 self.state = IctState::Completed;
+                self.drop_waiting_cancel();
                 let timer_d = match self.transport {
                     Transport::Udp => self.timers.timer_d_udp(),
                     Transport::Reliable => self.timers.timer_d_tcp(),

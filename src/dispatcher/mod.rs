@@ -182,6 +182,8 @@ mod originated_cancel_awaits_provisional_tests;
 #[cfg(test)]
 mod prack_offer_answer_tests;
 #[cfg(test)]
+mod proxy_cancel_awaits_provisional_tests;
+#[cfg(test)]
 mod proxy_dialog_state_tests;
 #[cfg(test)]
 mod proxy_protocol_tests;
