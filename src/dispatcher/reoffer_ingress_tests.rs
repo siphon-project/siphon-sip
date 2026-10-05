@@ -168,8 +168,7 @@ pub(super) fn last_on(
     engine
         .commands(name)
         .into_iter()
-        .filter(|command| command.call_id == engine_call_id)
-        .next_back()
+        .rfind(|command| command.call_id == engine_call_id)
         .unwrap_or_else(|| panic!("no {name} on {engine_call_id}"))
 }
 
