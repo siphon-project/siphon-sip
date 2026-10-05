@@ -54,6 +54,7 @@ pub(crate) mod b2bua;
 mod cancel_ack;
 mod cdr;
 mod charging;
+mod completed_invite;
 mod engine_channel_events;
 mod failure;
 mod identity;
@@ -86,6 +87,8 @@ mod advertised_port_tests;
 #[cfg(test)]
 mod b2bua_conclude_once_tests;
 #[cfg(test)]
+mod b2bua_invite_retransmission_tests;
+#[cfg(test)]
 mod b_leg_2xx_ack_tests;
 #[cfg(test)]
 mod b_leg_asserted_identity_tests;
@@ -97,6 +100,8 @@ mod bad_extension_tests;
 mod bridged_pair_media_events_tests;
 #[cfg(test)]
 mod carrier_attribution_tests;
+#[cfg(test)]
+mod control_bridge_ingress_tests;
 #[cfg(test)]
 mod control_bridge_media_tests;
 #[cfg(test)]
@@ -263,6 +268,7 @@ use b2bua::*;
 use cancel_ack::*;
 use cdr::*;
 use charging::*;
+use completed_invite::*;
 use engine_channel_events::*;
 use failure::*;
 use identity::*;
@@ -588,6 +594,10 @@ pub async fn run(
             .as_ref()
             .and_then(|m| m.sdp_name.clone())
             .unwrap_or_else(|| product_name.to_string()),
+        sdp_keep_session_name: config
+            .media
+            .as_ref()
+            .is_some_and(|m| m.sdp_keep_session_name),
         sdp_strip_attributes: config
             .media
             .as_ref()
@@ -599,6 +609,7 @@ pub async fn run(
         held_byes: Arc::new(DashMap::new()),
         pending_reinvite_acks: Arc::new(DashMap::new()),
         cancelled_invites: Arc::new(DashMap::new()),
+        completed_invites: CompletedInvites::default(),
         originate_groups: Arc::new(crate::dispatcher::b2bua::OriginateGroupStore::new()),
         dial_bridges: Arc::new(crate::dispatcher::b2bua::DialBridgeStore::new()),
         bridge_relays: Arc::new(crate::dispatcher::b2bua::BridgeRelayStore::new()),

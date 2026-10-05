@@ -605,11 +605,12 @@ pub(super) fn handle_ack_via_session(
             // Add our Via on top (preserving existing Vias), reflecting the
             // transport we will actually send over.
             let transport_str = format!("{out_transport}");
+            let (via_host, via_port) = state.unpinned_sent_by(out_transport, destination);
             core::add_via(
                 &mut ack_downstream.headers,
                 &transport_str,
-                &state.via_host(&out_transport),
-                Some(state.via_port(&out_transport)),
+                &via_host,
+                Some(via_port),
             );
 
             let hop = (destination, out_transport);

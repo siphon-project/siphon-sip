@@ -103,6 +103,21 @@ pub fn bridge_leg_snapshot(
             media_call_id: session.rtpengine_id().to_string(),
             from_tag: session.from_tag.clone(),
             profile: session.profile.clone(),
+            // Whose policy pins this leg's own media ingress: what a bridge it
+            // anchored recorded for it, otherwise the half of its profile its
+            // SDP reached the engine under — `offer` for the offerer of a
+            // relay, `answer` for a leg the engine answered itself.
+            ingress: session.bridge_sides.as_ref().map_or_else(
+                || crate::rtpengine::session::SideFlags {
+                    profile: session.profile.clone(),
+                    half: if session.to_tag.is_some() {
+                        crate::rtpengine::session::ProfileHalf::Offer
+                    } else {
+                        crate::rtpengine::session::ProfileHalf::Answer
+                    },
+                },
+                |sides| sides.anchor_ingress.clone(),
+            ),
             // A session with a second party is a relay and can be renegotiated
             // in place; one the engine answered itself has only the caller.
             relaying: session.to_tag.is_some(),
@@ -211,6 +226,7 @@ pub async fn bridge_run_media_step(
             profile,
             sdp,
             received_from,
+            ingress,
             sip_call_id,
         }
         | MediaStep::Reoffer {
@@ -219,6 +235,7 @@ pub async fn bridge_run_media_step(
             profile,
             sdp,
             received_from,
+            ingress,
             sip_call_id,
         } => {
             // A profile the registry no longer carries is a deployment this
@@ -232,7 +249,11 @@ pub async fn bridge_run_media_step(
                 )));
             };
             // The SDP in this offer is the anchor's, so its source is the
-            // ingress the profile asks to pin.
+            // ingress to pin, and the policy that asks for it is the anchor's
+            // (`ingress`), not that of the flags above, which shape what the
+            // peer is offered.
+            flags.carry_received_from =
+                profiles.is_some_and(|registry| ingress.pins_ingress(registry));
             if let Some(source) = received_from {
                 flags.stamp_received_from(*source);
             }
@@ -316,8 +337,9 @@ pub(crate) async fn bridge_calls_with_state(
     pair_profile: Option<&str>,
 ) -> Result<BridgeAccepted, crate::b2bua::bridge::BridgeError> {
     use crate::b2bua::bridge::{
-        bridge_answer_profile, bridge_media_plan, bridge_offer_profile, set_media_direction,
-        AnchorOffer, BridgeContext, BridgeError, BridgeRole, BridgeStage, MediaDirection,
+        bridge_anchor_ingress, bridge_answer_profile, bridge_media_plan, bridge_offer_profile,
+        bridge_peer_ingress, set_media_direction, AnchorOffer, BridgeContext, BridgeError,
+        BridgeRole, BridgeStage, MediaDirection,
     };
 
     if params.anchor_sip_call_id == params.peer_sip_call_id {
@@ -454,6 +476,14 @@ pub(crate) async fn bridge_calls_with_state(
         .media
         .as_ref()
         .map(|media| bridge_offer_profile(pair_profile, media, peer.media.as_ref()).to_string());
+    let media_anchor_ingress = anchor
+        .media
+        .as_ref()
+        .map(|media| bridge_anchor_ingress(pair_profile, media));
+    let media_peer_ingress = anchor
+        .media
+        .as_ref()
+        .map(|media| bridge_peer_ingress(pair_profile, media, peer.media.as_ref()));
     let media_pending_adoption = anchor.media.as_ref().is_some_and(|media| !media.relaying);
     let half = |peer_call_id: &str, peer_sip_call_id: &str, role, last_local_offer| BridgeContext {
         peer_call_id: peer_call_id.to_string(),
@@ -465,6 +495,8 @@ pub(crate) async fn bridge_calls_with_state(
         media_from_tag: media_from_tag.clone(),
         media_profile: media_profile.clone(),
         media_peer_profile: media_peer_profile.clone(),
+        media_anchor_ingress: media_anchor_ingress.clone(),
+        media_peer_ingress: media_peer_ingress.clone(),
         media_pending_adoption,
         last_local_offer,
         release_reason: None,
@@ -954,7 +986,17 @@ pub fn bridge_advance_to_anchor(
                 return;
             };
             // The SDP in this answer is the peer's, so its signalling source is
-            // the ingress the profile asks to pin.
+            // the ingress to pin, and the policy that asks for it is the peer's
+            // own. The flags above are the anchor's and shape what the anchor
+            // is re-INVITEd with; read off them, a peer behind NAT joined to an
+            // anchor whose profile asks for no hint is gated on the address in
+            // its SDP, which its media never comes from.
+            if let (Some(ingress), Some(registry)) = (
+                context.media_peer_ingress.as_ref(),
+                state.rtpengine_profiles.as_ref(),
+            ) {
+                flags.carry_received_from = ingress.pins_ingress(registry);
+            }
             if let Some(source) = state
                 .call_actors
                 .get_call(peer_call_id)
@@ -1099,18 +1141,28 @@ pub fn bridge_adopt_media(
         .get_call(&context.peer_call_id)
         .and_then(|call| call.a_leg.dialog.remote_tag.clone());
 
-    // What shapes each party from here on: the flags each was bridged with.
-    let bridge_sides = match (&context.media_profile, &context.media_peer_profile) {
-        (Some(anchor), Some(peer)) => Some(crate::rtpengine::session::BridgeSides {
-            anchor: crate::rtpengine::session::SideFlags {
-                profile: anchor.clone(),
-                half: crate::rtpengine::session::ProfileHalf::Answer,
-            },
-            peer: crate::rtpengine::session::SideFlags {
-                profile: peer.clone(),
-                half: crate::rtpengine::session::ProfileHalf::Offer,
-            },
-        }),
+    // What shapes each party from here on, and whose policy pins each one's
+    // ingress: the flags each was bridged with.
+    let bridge_sides = match (
+        &context.media_profile,
+        &context.media_peer_profile,
+        &context.media_anchor_ingress,
+        &context.media_peer_ingress,
+    ) {
+        (Some(anchor), Some(peer), Some(anchor_ingress), Some(peer_ingress)) => {
+            Some(crate::rtpengine::session::BridgeSides {
+                anchor: crate::rtpengine::session::SideFlags {
+                    profile: anchor.clone(),
+                    half: crate::rtpengine::session::ProfileHalf::Answer,
+                },
+                peer: crate::rtpengine::session::SideFlags {
+                    profile: peer.clone(),
+                    half: crate::rtpengine::session::ProfileHalf::Offer,
+                },
+                anchor_ingress: anchor_ingress.clone(),
+                peer_ingress: peer_ingress.clone(),
+            })
+        }
         _ => None,
     };
     let mut retired = Vec::new();
