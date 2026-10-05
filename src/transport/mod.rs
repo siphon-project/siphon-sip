@@ -145,7 +145,11 @@ pub(crate) mod testutil {
     }
 
     pub(crate) fn temp_dir(name: &str) -> std::path::PathBuf {
-        let directory = std::env::temp_dir().join(format!("siphon-tls-fixture-{name}"));
+        // Named for this process too: two test runs at once (another checkout
+        // of the same tree) would otherwise write one key over the other's
+        // certificate, and each fail on a pair that does not match.
+        let directory =
+            std::env::temp_dir().join(format!("siphon-tls-fixture-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&directory);
         std::fs::create_dir_all(&directory).expect("temp dir");
         directory

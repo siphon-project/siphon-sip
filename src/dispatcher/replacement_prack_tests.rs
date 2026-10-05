@@ -245,8 +245,16 @@ async fn a_target_is_pracked_and_failed_by_branch_when_the_leg_list_shifts() {
         top_via_branch(&ringing.to_mobile),
     );
     let position = |branch: &str| state.call_actors.b_leg_index(&ringing.call_id, branch);
-    assert_eq!(position(&desk_branch), Some(2));
-    assert_eq!(position(&mobile_branch), Some(3));
+    // Which target was dialled first follows the registrar's order of the two
+    // contacts, most recently registered first to the second, so only where
+    // each sits now is read, not which of them is ahead.
+    let (desk_at, mobile_at) = (
+        position(&desk_branch).expect("the desk's leg"),
+        position(&mobile_branch).expect("the mobile's leg"),
+    );
+    let mut targets_at = [desk_at, mobile_at];
+    targets_at.sort_unstable();
+    assert_eq!(targets_at, [2, 3], "behind the callee and the tracking leg");
 
     // A PRACK built for the mobile, as its provisional arrived.
     let provisional = reliable_183(&ringing.to_mobile, mobile, "mobile-tag", 1);
@@ -266,8 +274,8 @@ async fn a_target_is_pracked_and_failed_by_branch_when_the_leg_list_shifts() {
     // the desk is now where the tracking leg was, the mobile where the desk was.
     let tracking = position(tracking_branch).expect("the tracking leg");
     state.call_actors.remove_b_leg(&ringing.call_id, tracking);
-    assert_eq!(position(&desk_branch), Some(1));
-    assert_eq!(position(&mobile_branch), Some(2));
+    assert_eq!(position(&desk_branch), Some(desk_at - 1));
+    assert_eq!(position(&mobile_branch), Some(mobile_at - 1));
 
     let sent =
         tokio::task::block_in_place(|| send_callee_prack(&ringing.call_id, &held, None, state));
@@ -308,12 +316,23 @@ async fn a_target_is_pracked_and_failed_by_branch_when_the_leg_list_shifts() {
     let sent = wire(dispatcher);
     assert_eq!(summaries(&sent), [format!("ACK {desk}")]);
     assert_eq!(top_via_branch(&sent[0].message), desk_branch);
+    // In the order the targets were dialled, which is the registrar's.
+    let mut expected = [
+        (
+            desk_at,
+            desk_branch.clone(),
+            ReplacementOutcome::Failed(486),
+        ),
+        (
+            mobile_at,
+            mobile_branch.clone(),
+            ReplacementOutcome::Pending,
+        ),
+    ];
+    expected.sort_unstable_by_key(|(dialled_at, _, _)| *dialled_at);
     assert_eq!(
         outcomes(&ringing),
-        [
-            (desk_branch.clone(), ReplacementOutcome::Failed(486)),
-            (mobile_branch.clone(), ReplacementOutcome::Pending),
-        ]
+        expected.map(|(_, branch, outcome)| (branch, outcome))
     );
 
     // And the mobile answers: it is the one brought in.

@@ -85,7 +85,7 @@ pub fn prack_refusal_reason(status_code: u16) -> &'static str {
 
 /// A `Retry-After` value between 0 and 10 seconds, as RFC 3311 §5.2 has a UAS
 /// choose for a 500 to an offer that crosses one it has not answered.
-fn random_retry_after() -> String {
+pub fn random_retry_after() -> String {
     (uuid::Uuid::new_v4().as_bytes()[0] % 11).to_string()
 }
 

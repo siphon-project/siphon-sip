@@ -71,6 +71,14 @@ pub struct TransferDial {
     pub p_asserted_identity: Option<String>,
     /// Whether the calling identity may be presented (RFC 3323 §4.1).
     pub privacy: Option<OriginatePrivacy>,
+    /// The name of a number policy configured on the server, which decides how
+    /// the numbers in the new leg's identity headers are written. Unset, the
+    /// server's default for the calls it dials applies. Not together with
+    /// [`format`](Self::format): the server refuses the two.
+    pub number_policy: Option<String>,
+    /// One number format for the new leg's identity headers, in place of a
+    /// named policy: `"e164"`, `"plain"`, `"international"` or `"national"`.
+    pub format: Option<String>,
     /// Headers for the new leg's INVITE, injected after the header policy.
     pub headers: Vec<(String, String)>,
 }
@@ -82,6 +90,8 @@ impl TransferDial {
             ("from", &self.from),
             ("from_display", &self.from_display),
             ("p_asserted_identity", &self.p_asserted_identity),
+            ("number_policy", &self.number_policy),
+            ("format", &self.format),
         ] {
             if let Some(value) = value {
                 args.insert(name.to_string(), json!(value));
@@ -334,6 +344,8 @@ mod tests {
             from_display: Some(String::new()),
             p_asserted_identity: Some("sip:+15550100000@trunk.example.com".to_string()),
             privacy: Some(OriginatePrivacy::Restricted),
+            number_policy: None,
+            format: None,
             headers: vec![("X-Account".to_string(), "main".to_string())],
         };
         assert_eq!(
@@ -347,5 +359,21 @@ mod tests {
                 "headers": { "X-Account": "main" }
             })
         );
+    }
+
+    /// How the new leg's numbers are written goes out under the names the
+    /// server reads: a named policy, or one format.
+    #[test]
+    fn a_transfer_names_a_number_policy_or_a_format() {
+        let named = TransferDial {
+            number_policy: Some("carrier_e164".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(args_of(&named), json!({ "number_policy": "carrier_e164" }));
+        let inline = TransferDial {
+            format: Some("national".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(args_of(&inline), json!({ "format": "national" }));
     }
 }

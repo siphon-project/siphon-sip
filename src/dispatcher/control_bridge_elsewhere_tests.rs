@@ -14,7 +14,7 @@
 
 use super::control_bridge_ingress_tests::{OPEN_PLAIN, OPEN_SECURE, PINNED_PLAIN, PINNED_SECURE};
 use super::control_bridge_media_tests::{accepts, bridge_offer_to, last, stored};
-use super::control_rebridge_tests::{legs, Legs};
+use super::control_rebridge_tests::{legs, retired_sessions_deleted, Legs};
 use super::dial_bridge_test_harness::{
     answered_caller_from, assert_drained, caller_sends, command, eventually, reinvites_to,
     sent_until, Caller,
@@ -79,6 +79,7 @@ async fn bridge(legs: &Legs, target: &str, with: &str, anchor: &Caller, peer: &C
             .await,
         "the bridge formed"
     );
+    retired_sessions_deleted(legs).await;
     drain(legs.udp());
 }
 
@@ -112,7 +113,7 @@ async fn unbridge(legs: &Legs, anchor: &Caller, peer: &Caller) {
     drain(legs.udp());
 }
 
-/// How many calls have a record of what a bridge shaped and pinned them with.
+/// How many calls have a record of what they were first anchored with.
 fn records(legs: &Legs) -> usize {
     legs.state()
         .rtpengine_sessions
@@ -219,12 +220,75 @@ async fn a_leg_bridged_to_another_anchor_is_shaped_and_pinned_as_its_own_profile
     }
 }
 
+/// An anchor bridged under a pair profile, parted, and bridged to another leg
+/// with no pair profile is shaped and pinned as the profile it was first
+/// anchored with describes. The pair profile was for that pair: it said SRTP
+/// and a source hint for both, where the anchor's own says plain RTP and none.
+/// The second bridge re-INVITEs the anchor with plain RTP and sends its SDP to
+/// the engine with no hint.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_anchor_bridged_under_a_pair_profile_is_its_own_again_for_the_next_bridge() {
+    const SECOND: &str = "192.0.2.32:5060";
+    let legs = legs("anchor-own", "198.51.100.251:5060", OPEN_PLAIN, OPEN_PLAIN).await;
+    legs.bridge_under("anchor", "peer", Some(PINNED_SECURE))
+        .await;
+    let under_the_pair = last(&legs.engine, "answer");
+    assert_eq!(
+        under_the_pair.transport_protocol.as_deref(),
+        Some("RTP/SAVP"),
+        "positive control: the pair profile shaped the anchor for that pair"
+    );
+    legs.unbridge().await;
+
+    let second = another_leg(&legs, "second", SECOND, OPEN_PLAIN);
+    let carrying_the_anchor = |legs: &Legs| {
+        let mut commands = legs.engine.commands("offer");
+        commands.extend(legs.engine.commands("reoffer"));
+        commands
+            .into_iter()
+            .filter(|command| command.sip_call_id.as_deref() == Some(legs.anchor.call_id.as_str()))
+            .collect::<Vec<_>>()
+    };
+    let before = carrying_the_anchor(&legs).len();
+    bridge(&legs, "anchor", "second", &legs.anchor, &second).await;
+
+    let answer = last(&legs.engine, "answer");
+    assert_eq!(
+        answer.sip_call_id.as_deref(),
+        Some(second.call_id.as_str()),
+        "the answer of this bridge"
+    );
+    assert_eq!(
+        answer.transport_protocol.as_deref(),
+        Some("RTP/AVP"),
+        "the anchor is re-INVITEd with what its own profile describes"
+    );
+    let offered = carrying_the_anchor(&legs);
+    assert_eq!(
+        offered.len(),
+        before + 1,
+        "one offer carries the anchor's SDP"
+    );
+    assert_eq!(
+        offered[before].received_from, None,
+        "the anchor is pinned by its own policy, which asks for no hint"
+    );
+
+    caller_sends(legs.state(), &legs.anchor, "BYE", "9 BYE");
+    assert!(eventually(|| legs.state().call_actors.count() == 1).await);
+    caller_sends(legs.state(), &legs.peer, "BYE", "9 BYE");
+    assert_all_gone(&legs, "an anchor under a pair profile").await;
+}
+
 /// The leak gate for the per-call record. Whole calls, each through the
 /// bridge, unbridge, bridge-elsewhere cycle and then out by a different door:
 /// a BYE from the leg, a BYE from the anchor it is bridged to (which ends it
 /// by the bridge's hang-up policy), a teardown of siphon's own, and a BYE
-/// while it is parted and bridged to nobody. After each the count is back at
-/// zero, and it never exceeds the calls a bridge has retired a session of.
+/// while it is parted and bridged to nobody. Both anchors have a record too,
+/// from the bridge that made each one's session a pair's, and each goes with
+/// its own call: after the leg and its second anchor are gone the first
+/// anchor's is the one left, and its BYE brings the count back to zero. It
+/// never exceeds the calls a bridge has formed on.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_per_call_media_record_drains_on_every_way_a_call_ends() {
     const SECOND: &str = "192.0.2.31:5060";
@@ -249,14 +313,18 @@ async fn the_per_call_media_record_drains_on_every_way_a_call_ends() {
             legs.bridge("anchor", "peer").await;
             assert_eq!(
                 records(&legs),
-                1,
-                "{what}: the leg's own session was retired"
+                2,
+                "{what}: the leg's own session was retired, and the anchor's became the pair's"
             );
             legs.unbridge().await;
-            assert_eq!(records(&legs), 1, "{what}: kept while the call lasts");
+            assert_eq!(records(&legs), 2, "{what}: kept while the calls last");
             let second = another_leg(&legs, "second", SECOND, OPEN_PLAIN);
             bridge(&legs, "second", "peer", &second, &legs.peer).await;
-            assert_eq!(records(&legs), 1, "{what}: one per call, not per bridge");
+            assert_eq!(
+                records(&legs),
+                3,
+                "{what}: one per call a bridge formed on, not per bridge"
+            );
 
             match exit {
                 "the leg hangs up" => caller_sends(legs.state(), &legs.peer, "BYE", "9 BYE"),
@@ -271,7 +339,7 @@ async fn the_per_call_media_record_drains_on_every_way_a_call_ends() {
                 }
                 _ => {
                     unbridge(&legs, &second, &legs.peer).await;
-                    assert_eq!(records(&legs), 1, "{what}: still its call's");
+                    assert_eq!(records(&legs), 3, "{what}: still each call's");
                     caller_sends(legs.state(), &legs.peer, "BYE", "9 BYE");
                     assert!(eventually(|| legs.state().call_actors.count() == 2).await);
                     caller_sends(legs.state(), &second, "BYE", "9 BYE");
@@ -283,7 +351,11 @@ async fn the_per_call_media_record_drains_on_every_way_a_call_ends() {
                 eventually(|| legs.state().call_actors.count() == 1).await,
                 "{what}"
             );
-            assert_eq!(records(&legs), 0, "{what}: the record went with the call");
+            assert_eq!(
+                records(&legs),
+                1,
+                "{what}: each record went with its call, and the first anchor's is left"
+            );
             caller_sends(legs.state(), &legs.anchor, "BYE", "9 BYE");
             assert_all_gone(&legs, &what).await;
         }

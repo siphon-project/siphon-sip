@@ -197,6 +197,41 @@ impl MediaSession {
         }
     }
 
+    /// What shapes the SDP the engine sends one party of this session: the
+    /// one on [`MediaSession::from_tag`] when `on_from_tag`, the one on
+    /// [`MediaSession::to_tag`] otherwise.
+    ///
+    /// The flags on an engine command describe the party its result is sent
+    /// to, not the party whose SDP it carries and not the command. A dial's
+    /// profile says so once for the call: its `offer` half is what the callee
+    /// is sent (the caller's offer, rewritten) and its `answer` half what the
+    /// caller is sent. That holds for the life of the call whoever offers
+    /// next, so a callee's re-offer is relayed to the caller under the
+    /// `answer` half and answered to the callee under the `offer` half.
+    /// Choosing the half by the command instead sends each party the other's
+    /// side of a profile whose halves differ: the transport, the `direction`
+    /// pair, the codec policy.
+    ///
+    /// A pair put together by something other than one dial reads what was
+    /// recorded for each party ([`MediaSession::bridge_sides`]). The one party
+    /// of a session the engine answered itself is on `from_tag` and was
+    /// answered under the `answer` half.
+    #[must_use]
+    pub fn party_shape(&self, on_from_tag: bool) -> SideFlags {
+        match (&self.bridge_sides, on_from_tag) {
+            (Some(sides), true) => sides.anchor.clone(),
+            (Some(sides), false) => sides.peer.clone(),
+            (None, _) => SideFlags {
+                profile: self.profile.clone(),
+                half: if on_from_tag {
+                    ProfileHalf::Answer
+                } else {
+                    ProfileHalf::Offer
+                },
+            },
+        }
+    }
+
     /// The tag naming the party that is **sending** an in-dialog offer, for the media engine's
     /// re-offer: the A-leg's `from_tag` when the offer came from A, the B-leg's `to_tag` when it came
     /// from B.
@@ -332,8 +367,8 @@ pub struct MediaSessionStore {
     /// call not simply named by its own SIP Call-ID. See
     /// [`MediaSessionStore::summary_parties`].
     parties: std::sync::Arc<DashMap<String, EngineParties>>,
-    /// What a bridge shaped and pinned a party with, for each call whose own
-    /// session a bridge retired. See [`own_media`].
+    /// What each call was first anchored with, once a bridge has retired its
+    /// own session or made it a pair's. See [`own_media`].
     own_media: DashMap<String, own_media::Recorded>,
 }
 
@@ -592,10 +627,24 @@ impl MediaSessionStore {
         Some(session)
     }
 
-    /// Update the to_tag for an existing session.
+    /// Record the tag of the party that answered the session's offer, the one
+    /// on [`MediaSession::to_tag`].
+    ///
+    /// A tag names one party for the life of the session. The answerer of a
+    /// later exchange can be the party already on
+    /// [`MediaSession::from_tag`]: the caller answering a re-offer of the
+    /// callee's, whose 2xx carries the caller's tag as its To-tag. Recording
+    /// that as the `to_tag` would name the caller twice and the callee not
+    /// at all, and every reader that finds a party by its leg (a re-offer's
+    /// offerer, an answer's pair, whose policy pins whom) would take the
+    /// caller for the callee from then on. So the offerer's own tag is never
+    /// recorded here. Another tag replaces the one held: a forked INVITE's
+    /// final answer may come from another branch than its early media did.
     pub fn set_to_tag(&self, call_id: &str, to_tag: String) {
         if let Some(mut entry) = self.sessions.get_mut(call_id) {
-            entry.to_tag = Some(to_tag);
+            if entry.from_tag != to_tag {
+                entry.to_tag = Some(to_tag);
+            }
         }
     }
 
@@ -775,6 +824,31 @@ mod tests {
     fn remove_missing_returns_none() {
         let store = MediaSessionStore::new();
         assert!(store.remove("nonexistent").is_none());
+    }
+
+    /// The answerer's tag is the other party's. A later answer that comes
+    /// from the offerer (it answers a re-offer of the answerer's) leaves both
+    /// tags as they are, and a different answerer, as a fork's final answer
+    /// can be, replaces the one held.
+    #[test]
+    fn set_to_tag_never_records_the_offerers_own_tag() {
+        let store = MediaSessionStore::new();
+        let offerer = make_session("call-1").from_tag;
+        store.insert(make_session("call-1"));
+        store.set_to_tag("call-1", offerer.clone());
+        assert_eq!(store.get("call-1").unwrap().to_tag, None);
+
+        store.set_to_tag("call-1", "tag-early".to_string());
+        store.set_to_tag("call-1", offerer.clone());
+        let session = store.get("call-1").unwrap();
+        assert_eq!(session.from_tag, offerer);
+        assert_eq!(session.to_tag.as_deref(), Some("tag-early"));
+
+        store.set_to_tag("call-1", "tag-final".to_string());
+        assert_eq!(
+            store.get("call-1").unwrap().to_tag.as_deref(),
+            Some("tag-final")
+        );
     }
 
     #[test]

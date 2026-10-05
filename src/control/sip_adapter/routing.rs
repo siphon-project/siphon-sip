@@ -264,6 +264,80 @@ pub(super) fn cancel_dial(channel: &ChannelRef, command: &AdapterCommand) -> Con
     }
 }
 
+/// How long `cancel_dial` waits for the dial it ended to let go of the caller
+/// before answering anyway. What it waits on is local: the dial's own task
+/// stopping the ringback on the media engine and reporting `DialFailed`.
+const DIAL_CONCLUSION_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The bridging dial a `cancel_dial` is about to end, watched from before the
+/// cancel so its conclusion cannot be missed.
+pub(super) struct WatchedDial {
+    dispatcher: std::sync::Arc<dyn crate::dispatcher::DispatcherHandle>,
+    sip_call_id: String,
+    conclusion: tokio::sync::watch::Receiver<()>,
+}
+
+/// The dial ringing for the caller a `cancel_dial` names, if one is. `None`
+/// for any other verb, and for a connecting dial: its cancel is carried out in
+/// full before it returns.
+pub(super) fn watch_dial_to_cancel(command: &AdapterCommand) -> Option<WatchedDial> {
+    if command.verb != "cancel_dial" {
+        return None;
+    }
+    let crate::control::ResolvedTarget::Channel(channel) = &command.target else {
+        return None;
+    };
+    let dispatcher = super::dial_bridge::dispatcher_for(&command.origin.app);
+    let conclusion = dispatcher
+        .state()?
+        .dial_bridges
+        .conclusion(&channel.sip_call_id)?;
+    Some(WatchedDial {
+        dispatcher,
+        sip_call_id: channel.sip_call_id.clone(),
+        conclusion,
+    })
+}
+
+/// Hold the reply to an accepted `cancel_dial` until the dial it ended has let
+/// go of the caller.
+///
+/// The cancel itself is synchronous: the phones are CANCELled and each is
+/// reported before it returns. What is left runs on the dial's own task, which
+/// stops the ringback on the media engine, reports `DialFailed`, and only then
+/// lets go of the caller. A reply sent ahead of that told the controller the
+/// dial was over while a `route` or a second `dial` was still refused
+/// `dial_in_progress`. Waiting here puts `DialFailed` ahead of the reply and
+/// makes the reply mean what it says.
+///
+/// Bounded: a dial that has not concluded by then is let go of here, so the
+/// caller is free once the reply is in whatever became of that task.
+pub(super) async fn dial_concluded(watched: Option<WatchedDial>, result: &ControlResult) {
+    let (Some(mut watched), ControlResult::Ok(_)) = (watched, result) else {
+        return;
+    };
+    let concluded = tokio::time::timeout(DIAL_CONCLUSION_BOUND, async {
+        // The watch carries no value: it only closes, with the dial's entry.
+        while watched.conclusion.changed().await.is_ok() {}
+    })
+    .await;
+    if concluded.is_ok() {
+        return;
+    }
+    let released = watched.dispatcher.state().is_some_and(|state| {
+        state
+            .dial_bridges
+            .release_watched(&watched.sip_call_id, &watched.conclusion)
+    });
+    tracing::error!(
+        caller = %watched.sip_call_id,
+        released,
+        "control plane: cancel_dial — the cancelled dial had not reported its end within {} s; \
+         the caller is released and DialFailed follows when it does",
+        DIAL_CONCLUSION_BOUND.as_secs()
+    );
+}
+
 /// The reply for a dial that was not cancelled: `not_found` when the call is
 /// gone, otherwise `invalid_state` naming why.
 pub(super) fn cancel_dial_refused(refusal: crate::dispatcher::DialCancelRefusal) -> ControlResult {

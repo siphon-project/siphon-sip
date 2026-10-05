@@ -127,10 +127,13 @@ async fn a_silent_callee_failing_or_timing_out_after_the_caller_gave_up_draws_no
         std::time::Instant::now() + state.b2bua_retransmits.transaction_timeout(),
     );
     assert_no_cancel(&drain(&sequence.dispatcher.udp), FIRST_CARRIER);
-    assert_eq!(state.call_actors.cancelled_branch_count(), 0);
     assert_eq!(state.call_actors.deferred_cancel_count(), 0);
     assert!(state.b2bua_retransmits.is_empty());
-    let _ = silent;
+    // Timer B ends the wait for a provisional, not the branch: it is kept for
+    // a final response that turns up late, and goes at its own expiry.
+    assert_eq!(state.call_actors.cancelled_branch_count(), 1);
+    assert_branch_released(state, &branch_of(&silent));
+    assert_eq!(state.call_actors.cancelled_branch_count(), 0);
 }
 
 /// The other half of RFC 3261 §9.1: a callee that has already sent its final

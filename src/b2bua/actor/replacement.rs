@@ -176,6 +176,21 @@ impl AbandonedReplacements {
     }
 }
 
+impl CallActor {
+    /// Whether a leg replacement is being carried out on this call: a
+    /// siphon-terminated transfer or a `replace_peer`, from the moment it is
+    /// accepted until it succeeds, fails or runs out of time.
+    ///
+    /// A call is re-paired once at a time. A second replacement would race the
+    /// first for the same promotion: its target's 2xx would promote against a
+    /// pair the first had already changed.
+    pub fn replacement_in_flight(&self) -> bool {
+        self.refer_subscriptions
+            .iter()
+            .any(|subscription| subscription.siphon_notifies)
+    }
+}
+
 impl ReferSubscription {
     /// Whether this is a replacement still waiting on its targets: siphon
     /// dialled them, and neither an answer nor a failure has settled it.

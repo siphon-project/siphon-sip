@@ -3,11 +3,11 @@
 //!
 //! The relay sends the engine two commands: a `reoffer` carrying the SDP of
 //! the party that re-offers, and an `answer` carrying the other party's. Each
-//! takes its shape from the profile half of the command, and its
-//! `received_from` hint from the party whose SDP it carries: that party's own
-//! policy, and where that party signals from. The caller of a dial is the
-//! party its profile's `offer` half was written for and the callee the
-//! `answer` half's, whichever of them re-offers.
+//! takes its shape from the side of the profile that describes the party the
+//! engine's result is sent to (a dial's `offer` half shapes what its callee is
+//! sent and its `answer` half what its caller is), and its `received_from`
+//! hint from the party whose SDP it carries: that party's own policy, and
+//! where that party signals from. Neither depends on which of them re-offers.
 //!
 //! The parties here signal from one address and name another in their SDP,
 //! as a party behind NAT does. The proof is the command the in-process engine
@@ -207,6 +207,11 @@ pub(super) fn renegotiates(
     )
 }
 
+/// What the test profiles send the callee of a dial (their `offer` half) and
+/// its caller (their `answer` half).
+const TO_CALLEE: &str = "RTP/SAVP";
+const TO_CALLER: &str = "RTP/AVP";
+
 fn pinned_at(pinned: bool, party: &Party) -> Option<IpAddr> {
     pinned.then(|| ip(&party.address))
 }
@@ -214,8 +219,7 @@ fn pinned_at(pinned: bool, party: &Party) -> Option<IpAddr> {
 /// A re-INVITE and an UPDATE from either party of an ordinary call: the
 /// caller is pinned where the profile's `offer` half asks and the callee where
 /// its `answer` half does, whichever of them re-offers and whichever command
-/// carries its SDP. The commands keep their shape, the `offer` half on the
-/// re-offer and the `answer` half on the answer.
+/// carries its SDP. Each command is shaped for the party its result goes to.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_relayed_reoffer_pins_each_party_by_its_own_half_whoever_reoffers() {
     // (profile, the caller is pinned, the callee is pinned)
@@ -269,15 +273,23 @@ async fn a_relayed_reoffer_pins_each_party_by_its_own_half_whoever_reoffers() {
                 }
                 assert_eq!(reoffer.sip_call_id.as_deref(), Some(&*offerer.call_id));
                 assert_eq!(answer.sip_call_id.as_deref(), Some(&*answerer.call_id));
+                // Each command is shaped for the party its result is sent to:
+                // the callee by the `offer` half, the caller by the `answer`
+                // half, whoever re-offers.
+                let (to_answerer, to_offerer) = if caller_reoffers {
+                    (TO_CALLEE, TO_CALLER)
+                } else {
+                    (TO_CALLER, TO_CALLEE)
+                };
                 assert_eq!(
                     reoffer.transport_protocol.as_deref(),
-                    Some("RTP/SAVP"),
-                    "{what}: shaped by the `offer` half"
+                    Some(to_answerer),
+                    "{what}: the re-offer is shaped for the party it is relayed to"
                 );
                 assert_eq!(
                     answer.transport_protocol.as_deref(),
-                    Some("RTP/AVP"),
-                    "{what}: shaped by the `answer` half"
+                    Some(to_offerer),
+                    "{what}: the answer is shaped for the party that re-offered"
                 );
 
                 hang_up(
@@ -393,17 +405,73 @@ async fn a_reoffer_after_a_takeover_pins_each_party_by_what_the_pair_recorded() 
                     pinned_at(answerer_pinned, answerer),
                     "{what}: the answer carries the answering party's SDP"
                 );
+                // The takeover offered the newcomer's SDP to the surviving
+                // caller under the `offer` half and answered the newcomer
+                // under the `answer` half, and each keeps that shape.
+                let (to_answerer, to_offerer) = if newcomer_reoffers {
+                    (TO_CALLEE, TO_CALLER)
+                } else {
+                    (TO_CALLER, TO_CALLEE)
+                };
                 assert_eq!(
                     reoffer.transport_protocol.as_deref(),
-                    Some("RTP/SAVP"),
-                    "{what}: shaped by the `offer` half"
+                    Some(to_answerer),
+                    "{what}: the re-offer is shaped for the party it is relayed to"
                 );
                 assert_eq!(
                     answer.transport_protocol.as_deref(),
-                    Some("RTP/AVP"),
-                    "{what}: shaped by the `answer` half"
+                    Some(to_offerer),
+                    "{what}: the answer is shaped for the party that re-offered"
                 );
             }
+        }
+    }
+}
+
+/// The case this is for: on a profile whose two sides differ in transport,
+/// the callee puts the call on hold and resumes it, with a re-INVITE and with
+/// an UPDATE. The caller is relayed the callee's offer in the caller's own
+/// transport and the callee is answered in its own, as on the call's first
+/// exchange, where it was the caller that offered.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_callee_hold_is_relayed_to_each_party_in_its_own_transport() {
+    let mut cseq = 2;
+    for (index, method) in ["INVITE", "UPDATE"].into_iter().enumerate() {
+        let engine = NativeTestEngine::start().await;
+        let call = anchored(53000 + 10 * index as u32, &engine, OPEN).await;
+        let (caller, callee) = (caller_of(&call), callee_of(&call));
+        acks(&call.dispatcher.state, &caller);
+        // What the first exchange sent each party.
+        let first = |name: &str| {
+            last_on(&engine, name, &call.a_call_id)
+                .transport_protocol
+                .expect("a shaped command")
+        };
+        assert_eq!(first("offer"), TO_CALLEE, "positive control");
+        assert_eq!(first("answer"), TO_CALLER, "positive control");
+
+        for step in ["hold", "resume"] {
+            cseq += 1;
+            let what = format!("{method}, the callee's {step}");
+            let (reoffer, answer) = renegotiates(
+                &call,
+                &engine,
+                &call.a_call_id,
+                &callee,
+                &caller,
+                method,
+                cseq,
+            );
+            assert_eq!(
+                reoffer.transport_protocol.as_deref(),
+                Some(TO_CALLER),
+                "{what}: the caller is relayed the offer in its own transport"
+            );
+            assert_eq!(
+                answer.transport_protocol.as_deref(),
+                Some(TO_CALLEE),
+                "{what}: the callee is answered in its own transport"
+            );
         }
     }
 }

@@ -155,7 +155,8 @@ pub(crate) fn headers_to_json(headers: &[(String, String)]) -> serde_json::Value
 // ---------------------------------------------------------------------------
 
 /// The audio source for [`Call::play`]: exactly one of a server-side file path,
-/// an rtpengine media-DB id, or an inline blob.
+/// an rtpengine media-DB id, an inline blob, a generated tone, or an HTTP(S)
+/// URL the media engine fetches.
 ///
 /// A `Blob` is base64-encoded on the wire (the control rail is JSON text), so the
 /// caller passes raw bytes and this handle does the encoding — mirroring the
@@ -168,6 +169,11 @@ pub enum PlaySource {
     DbId(u64),
     /// Raw audio bytes played inline (base64-encoded on the wire).
     Blob(Vec<u8>),
+    /// A tone the media engine generates: a preset name (`"ringback_eu"`) or a
+    /// cadence (`"425/1000,0/4000*inf"`).
+    Tone(String),
+    /// An `http://` or `https://` URL the media engine fetches and plays.
+    Url(String),
 }
 
 impl PlaySource {
@@ -186,7 +192,17 @@ impl PlaySource {
         Self::Blob(bytes.into())
     }
 
-    /// Insert the one source arg (`file` / `db_id` / `blob`) into a play args map.
+    /// Play a tone the media engine generates, by preset name or cadence.
+    pub fn tone(tone: impl Into<String>) -> Self {
+        Self::Tone(tone.into())
+    }
+
+    /// Play what an `http://` or `https://` URL serves.
+    pub fn url(url: impl Into<String>) -> Self {
+        Self::Url(url.into())
+    }
+
+    /// Insert the one source arg into a play args map.
     fn insert_into(&self, args: &mut serde_json::Map<String, serde_json::Value>) {
         match self {
             PlaySource::File(path) => {
@@ -199,6 +215,12 @@ impl PlaySource {
                 use base64::Engine as _;
                 let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
                 args.insert("blob".to_string(), json!(encoded));
+            }
+            PlaySource::Tone(tone) => {
+                args.insert("tone".to_string(), json!(tone));
+            }
+            PlaySource::Url(url) => {
+                args.insert("url".to_string(), json!(url));
             }
         }
     }
@@ -215,6 +237,8 @@ pub struct PlayOptions {
     pub start_ms: Option<u64>,
     /// Cap playback to this duration, in milliseconds.
     pub duration_ms: Option<u64>,
+    /// Play louder (positive) or quieter (negative) by this many decibels.
+    pub gain_decibels: Option<i32>,
     /// Scope the prompt to one peer of an MPTY bridge (its To-tag).
     pub to_tag: Option<String>,
 }
@@ -229,6 +253,9 @@ impl PlayOptions {
         }
         if let Some(duration_ms) = self.duration_ms {
             args.insert("duration_ms".to_string(), json!(duration_ms));
+        }
+        if let Some(gain_decibels) = self.gain_decibels {
+            args.insert("gain_decibels".to_string(), json!(gain_decibels));
         }
         if let Some(to_tag) = &self.to_tag {
             args.insert("to_tag".to_string(), json!(to_tag));
@@ -1024,7 +1051,8 @@ impl Call {
     /// Play an announcement on the A-leg media (fire-and-forget).
     ///
     /// `source` is one of [`PlaySource::file`] / [`PlaySource::db_id`] /
-    /// [`PlaySource::blob`] (a blob is base64-encoded on the wire); `options`
+    /// [`PlaySource::blob`] (a blob is base64-encoded on the wire) /
+    /// [`PlaySource::tone`] / [`PlaySource::url`]; `options`
     /// carries the optional `repeat` / `start_ms` / `duration_ms` / `to_tag`
     /// shaping. Resolves once the media backend *accepts* the command; the far-end
     /// playback outcome is not the reply. A call with no anchored media session →
@@ -1905,6 +1933,56 @@ mod tests {
 
         let recorded = lock(&recorder.calls).clone();
         assert_eq!(recorded[0].args, json!({ "targets": ["sip:only@gw"] }));
+    }
+
+    /// A tone and a URL go out under the names the server reads them by, and a
+    /// gain in decibels only when one is given, negative included.
+    #[tokio::test]
+    async fn a_play_names_a_tone_or_a_url_and_its_gain() {
+        let recorder = Arc::new(RecordingTransport {
+            calls: Mutex::new(Vec::new()),
+            result: json!({ "channel": "ch1", "state": "playing" }),
+        });
+        let call = make_call(recorder.clone());
+        call.play(PlaySource::tone("ringback_eu"), PlayOptions::default())
+            .await
+            .expect("play tone ok");
+        call.play(
+            PlaySource::url("https://media.example.com/hold.wav"),
+            PlayOptions {
+                repeat: Some(PlayRepeat::Forever),
+                gain_decibels: Some(-6),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("play url ok");
+        call.play(
+            PlaySource::tone("425/1000,0/4000*inf"),
+            PlayOptions {
+                gain_decibels: Some(3),
+                to_tag: Some("peer-tag".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("play cadence ok");
+
+        let recorded = lock(&recorder.calls).clone();
+        let args: Vec<&serde_json::Value> = recorded.iter().map(|call| &call.args).collect();
+        assert!(recorded.iter().all(|call| call.verb == "play"));
+        assert_eq!(
+            args,
+            [
+                &json!({ "tone": "ringback_eu" }),
+                &json!({
+                    "url": "https://media.example.com/hold.wav",
+                    "repeat": "inf",
+                    "gain_decibels": -6
+                }),
+                &json!({ "tone": "425/1000,0/4000*inf", "gain_decibels": 3, "to_tag": "peer-tag" }),
+            ]
+        );
     }
 
     #[tokio::test]

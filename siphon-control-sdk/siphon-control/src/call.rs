@@ -324,7 +324,11 @@ impl Call {
     /// `not_found`; several registered contacts all ring, the first to answer
     /// is kept and the rest are CANCELled. `from_uri`,
     /// `from_display`, `p_asserted_identity`, `privacy` and `headers` are the
-    /// identity arguments `dial` takes, for the leg the transfer dials. They
+    /// identity arguments `dial` takes, for the leg the transfer dials.
+    /// `number_policy` names a number policy configured on the server for the
+    /// numbers in that leg's identity headers, and `format` gives one format
+    /// instead (`"e164"`, `"plain"`, `"international"`, `"national"`); the
+    /// server refuses the two together. All of these
     /// and `aor` apply to `mode="terminate"`; `"transparent"` dials no leg.
     ///
     /// `mode="controller"` is the transfer this app carries out itself: the
@@ -339,6 +343,7 @@ impl Call {
     #[pyo3(signature = (
         target=None, next_hop=None, mode=None, profile=None, *, aor=None, from_uri=None,
         from_display=None, p_asserted_identity=None, privacy=None, headers=None, timeout=None,
+        number_policy=None, format=None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn accept_refer<'py>(
@@ -355,6 +360,8 @@ impl Call {
         privacy: Option<String>,
         headers: Option<Bound<'py, PyAny>>,
         timeout: Option<u32>,
+        number_policy: Option<String>,
+        format: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
         if mode.as_deref() == Some("controller") {
             let dials_a_leg = target.is_some()
@@ -365,7 +372,9 @@ impl Call {
                 || from_display.is_some()
                 || p_asserted_identity.is_some()
                 || privacy.is_some()
-                || headers.is_some();
+                || headers.is_some()
+                || number_policy.is_some()
+                || format.is_some();
             if dials_a_leg {
                 return Err(pyo3::exceptions::PyValueError::new_err(
                     "accept_refer mode \"controller\" dials no leg: it takes timeout only",
@@ -390,6 +399,8 @@ impl Call {
             from_display,
             p_asserted_identity,
             privacy: extract_privacy("accept_refer", privacy)?,
+            number_policy,
+            format,
             headers: headers
                 .map(|headers| extract_headers(&headers))
                 .transpose()?
@@ -552,10 +563,15 @@ impl Call {
     /// registered; several registered contacts all ring, the first to answer
     /// is kept and the rest are CANCELled). `from_uri`,
     /// `from_display`, `p_asserted_identity`, `privacy` and `headers` are the
-    /// identity arguments `dial` takes, for the new leg.
+    /// identity arguments `dial` takes, for the new leg. `number_policy` names
+    /// a number policy configured on the server for the numbers in its
+    /// identity headers, and `format` gives one format instead (`"e164"`,
+    /// `"plain"`, `"international"`, `"national"`); the server refuses the two
+    /// together.
     #[pyo3(signature = (
         target=None, next_hop=None, replace_a_leg=None, profile=None, timeout=None, *, aor=None,
         from_uri=None, from_display=None, p_asserted_identity=None, privacy=None, headers=None,
+        number_policy=None, format=None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn replace_peer<'py>(
@@ -572,6 +588,8 @@ impl Call {
         p_asserted_identity: Option<String>,
         privacy: Option<String>,
         headers: Option<Bound<'py, PyAny>>,
+        number_policy: Option<String>,
+        format: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let Some(target) = transfer_target("replace_peer", target, aor)? else {
             return Err(pyo3::exceptions::PyValueError::new_err(
@@ -584,6 +602,8 @@ impl Call {
             from_display,
             p_asserted_identity,
             privacy: extract_privacy("replace_peer", privacy)?,
+            number_policy,
+            format,
             headers: headers
                 .map(|headers| extract_headers(&headers))
                 .transpose()?
@@ -691,13 +711,20 @@ impl Call {
     }
 
     /// Play an announcement on the A-leg media (fire-and-forget). Pass exactly one
-    /// of `file` (str), `db_id` (int), or `blob` (bytes, base64-encoded on the
-    /// wire); the rest shape playback. A call with no anchored media session
-    /// raises `ControlError` with `code == "not_found"`.
+    /// of `file` (str), `db_id` (int), `blob` (bytes, base64-encoded on the
+    /// wire), `tone` (a preset name such as `"ringback_eu"`, or a cadence such
+    /// as `"425/1000,0/4000*inf"`) or `url` (an `http://` or `https://` URL the
+    /// media engine fetches); the rest shape playback. A call with no anchored
+    /// media session raises `ControlError` with `code == "not_found"`.
     ///
     /// `repeat` is a total play count, or `"inf"` to play until stopped (music
     /// on hold; `stop` ends it). Any other value raises `ValueError`.
-    #[pyo3(signature = (file=None, db_id=None, blob=None, repeat=None, start_ms=None, duration_ms=None, to_tag=None))]
+    /// `gain_decibels` plays louder (positive) or quieter (negative) by that
+    /// many decibels.
+    #[pyo3(signature = (
+        file=None, db_id=None, blob=None, repeat=None, start_ms=None, duration_ms=None,
+        to_tag=None, *, tone=None, url=None, gain_decibels=None,
+    ))]
     #[allow(clippy::too_many_arguments)]
     fn play<'py>(
         &self,
@@ -709,12 +736,16 @@ impl Call {
         start_ms: Option<u64>,
         duration_ms: Option<u64>,
         to_tag: Option<String>,
+        tone: Option<String>,
+        url: Option<String>,
+        gain_decibels: Option<i32>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let source = build_play_source(file, db_id, blob)?;
+        let source = build_play_source(file, db_id, blob, tone, url)?;
         let options = PlayOptions {
             repeat: extract_play_repeat(repeat.as_ref())?,
             start_ms,
             duration_ms,
+            gain_decibels,
             to_tag,
         };
         let call = self.inner.clone();

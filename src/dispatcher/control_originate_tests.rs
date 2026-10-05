@@ -24,6 +24,10 @@ pub(super) struct Controller {
     pub(super) bus: Arc<ControlBus>,
     pub(super) connection: Arc<ConnHandle>,
     pub(super) dispatcher: Arc<TestDispatcher>,
+    /// Events read off the connection with a reply and queued behind it: one
+    /// read drains everything queued, so what follows the reply is kept here
+    /// for the next read instead of being dropped with the rest of the batch.
+    pub(super) overheard: Mutex<std::collections::VecDeque<crate::control::EventFrame>>,
 }
 
 /// Connect a controller as `app`, a name no other test uses, to a control plane
@@ -89,6 +93,7 @@ pub(super) fn controller_on(app: &str, dispatcher: TestDispatcher) -> Controller
         bus,
         connection,
         dispatcher,
+        overheard: Mutex::default(),
     }
 }
 

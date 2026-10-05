@@ -351,6 +351,18 @@ the callee is pinned by the `answer` half although it travels as an offer. The
 same holds on a delayed offer, where the callee offers in its 2xx and the caller
 answers in its ACK. Set it on one half only when just one side is behind NAT.
 
+The rest of a half works the other way round, and it helps to keep the two
+apart. `received_from` is about the party whose SDP a command **carries**.
+Everything that shapes SDP (`transport_protocol`, `direction`, ICE, DTLS, codec
+handling) is about the party the rewritten SDP is **sent to**: the `offer` half
+is what the callee is sent and the `answer` half what the caller is sent. That
+too holds for the life of the call. When the callee re-offers (a hold, say),
+its offer is relayed to the caller under the `answer` half and the caller's
+answer goes back to the callee under the `offer` half, so with `srtp_to_rtp`
+the SRTP side is offered SRTP and the plain side plain RTP whoever sends the
+re-INVITE. A script keeps passing the same `profile=` to `rtpengine.offer()` and
+`rtpengine.answer()` on every request and reply, as in the examples above.
+
 Off by default, because it is wrong for a deployment whose media legitimately
 arrives from a different address than its signalling (a separate media gateway,
 or a carrier that splits the two). Honoured by **rtpengine** (the `received from`

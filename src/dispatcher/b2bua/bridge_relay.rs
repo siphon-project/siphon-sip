@@ -316,7 +316,7 @@ fn relay_media(
     state: &DispatcherState,
 ) -> Result<Option<RelayMedia>, String> {
     use crate::b2bua::bridge::BridgeRole;
-    use crate::rtpengine::session::{BridgeSides, ProfileHalf, SideFlags};
+    use crate::rtpengine::session::BridgeSides;
 
     let Some(media_call_id) = context.media_call_id.clone() else {
         return Ok(None);
@@ -339,23 +339,19 @@ fn relay_media(
         .as_ref()
         .and_then(|store| store.get(&anchor_key))
         .ok_or("the pair has no media session")?;
-    // A session with no sides recorded has one profile describing the pair the
-    // way a dial's does: its `offer` half is the one the offerer's (the
-    // anchor's) SDP was sent under, its `answer` half the answerer's.
-    let half = |half| SideFlags {
-        profile: session.profile.clone(),
-        half,
-    };
-    let sides = session.bridge_sides.clone().unwrap_or_else(|| BridgeSides {
-        anchor: half(ProfileHalf::Answer),
-        peer: half(ProfileHalf::Offer),
-        anchor_ingress: half(ProfileHalf::Offer),
-        peer_ingress: half(ProfileHalf::Answer),
-    });
     let peer_tag = session
         .to_tag
         .clone()
         .ok_or("the pair's session has no tag for the peer")?;
+    // A session with no sides recorded has one profile describing the pair the
+    // way a dial's does, which the session reads the same way for a re-offer
+    // relayed between the two legs of an ordinary call.
+    let sides = session.bridge_sides.clone().unwrap_or_else(|| BridgeSides {
+        anchor: session.party_shape(true),
+        peer: session.party_shape(false),
+        anchor_ingress: session.party_ingress(true),
+        peer_ingress: session.party_ingress(false),
+    });
     let anchor_tag = session.from_tag.clone();
     Ok(Some(if from_anchor {
         RelayMedia {

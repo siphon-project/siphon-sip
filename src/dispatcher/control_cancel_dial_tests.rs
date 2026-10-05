@@ -7,8 +7,8 @@
 //! off its event stream.
 
 use super::dial_bridge_test_harness::{
-    answered_caller, assert_drained, bridging_dispatcher, command, controller_owning, dial, events,
-    eventually, invite_to, names, register, reinvites_to, sent_until, CALLER,
+    answered_caller, assert_drained, bridging_dispatcher, command, controller_owning, dial,
+    events_through, invite_to, names, register, reinvites_to, sent_until, CALLER,
 };
 use super::originate_test_harness::{
     drain, phone_offer, phone_response, phone_sends, phone_tries, requests_to, socket,
@@ -16,33 +16,28 @@ use super::originate_test_harness::{
 use super::*;
 use crate::rtpengine::test_native_engine::NativeTestEngine;
 
-/// The events a cancel produces, from those queued ahead of its reply through
-/// to the dial's `DialFailed`.
+/// The events an accepted cancel produced, which are all queued ahead of its
+/// reply: `queued`, as [`command`] returned it.
 ///
-/// `DialFailed` is published by the dial's coordinator task once it has stopped
-/// the ringback, so it is waited for by name: reading whatever arrived within a
-/// fixed quiet period would make the test depend on how fast that task ran.
-pub(super) async fn through_dial_failed(
+/// The reply to a `cancel_dial` is held until the dial is over, so by the time
+/// it is read the dial's `DialFailed` has been published and the caller is let
+/// go of. Nothing is waited for here.
+pub(super) fn through_dial_failed(
     controller: &super::control_originate_tests::Controller,
-    mut heard: Vec<crate::control::EventFrame>,
+    queued: Vec<crate::control::EventFrame>,
 ) -> Vec<crate::control::EventFrame> {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while !heard.iter().any(|event| event.event == "DialFailed") {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "no DialFailed after the cancel: {:?}",
-            names(&heard)
-        );
-        heard.extend(events(controller).await);
-    }
-    // The dial's claim on the caller is released right after its DialFailed is
-    // published, by the same task.
-    let state = &controller.dispatcher.state;
-    assert!(
-        eventually(|| state.dial_bridges.ringing_count() == 0).await,
-        "the cancelled dial released its caller"
+    assert_eq!(
+        queued.last().map(|event| event.event.as_str()),
+        Some("DialFailed"),
+        "the dial's DialFailed precedes the reply to its cancel: {:?}",
+        names(&queued)
     );
-    heard
+    assert_eq!(
+        controller.dispatcher.state.dial_bridges.ringing_count(),
+        0,
+        "the cancelled dial has let go of its caller"
+    );
+    queued
 }
 
 fn assert_refused(reply: &serde_json::Value, code: &str, reason: &str) {
@@ -93,8 +88,13 @@ async fn a_cancelled_bridge_dial_cancels_every_phone_and_keeps_the_caller() {
     // The mobile holds its INVITE without alerting yet: a 100 Trying is the
     // provisional its CANCEL has to wait for (RFC 3261 §9.1).
     phone_tries(state, MOBILE, &invite_to(&sent, MOBILE));
-    assert!(eventually(|| engine.commands("play_media").len() == 1).await);
-    let _ = events(&controller).await;
+    // The ringback is started by the dial's own task: waited for by its event.
+    let started = events_through(&controller, "PlayStarted").await;
+    assert_eq!(
+        started.last().map(|event| &event.payload["origin"]),
+        Some(&serde_json::json!("ringback"))
+    );
+    assert_eq!(engine.commands("play_media").len(), 1);
 
     let (reply, queued) = command(
         &controller,
@@ -121,7 +121,7 @@ async fn a_cancelled_bridge_dial_cancels_every_phone_and_keeps_the_caller() {
         "nothing is sent to the caller"
     );
 
-    let heard = through_dial_failed(&controller, queued).await;
+    let heard = through_dial_failed(&controller, queued);
     assert_eq!(
         names(&heard),
         ["DialBranchFailed", "DialBranchFailed", "DialFailed"]
@@ -201,7 +201,6 @@ async fn a_cancel_names_cancelled_by_default_and_refuses_a_malformed_reason() {
     .await;
     assert_eq!(reply["status"], "ok", "{reply}");
     let _ = drain(&controller.dispatcher.udp);
-    let _ = events(&controller).await;
 
     let (bad, _) = command(
         &controller,
@@ -229,10 +228,91 @@ async fn a_cancel_names_cancelled_by_default_and_refuses_a_malformed_reason() {
     )
     .await;
     assert_eq!(reply["status"], "ok", "{reply}");
-    let heard = through_dial_failed(&controller, queued).await;
+    let heard = through_dial_failed(&controller, queued);
     assert_eq!(names(&heard), ["DialBranchFailed", "DialFailed"]);
     assert_eq!(heard[1].payload["cause"], "cancelled");
     assert_drained(&controller.dispatcher.state);
+}
+
+/// The reply to a cancel means the dial is over. With the ringback playing,
+/// ending the dial takes a round trip to the media engine on the dial's own
+/// task, and the reply waits for it: `DialFailed` is queued ahead of the reply,
+/// the ringback is stopped, the caller is let go of, and a `dial` and a `route`
+/// sent on reading the reply are both taken.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cancel_replies_once_the_dial_has_let_go_of_the_caller() {
+    const DESK: &str = "198.51.100.187:5060";
+    let aor = "sip:cd4406@siphon.example.com";
+    register(aor, &format!("sip:cd4406@{DESK}"), 1.0);
+    let engine = NativeTestEngine::start().await;
+    let dispatcher = bridging_dispatcher(&engine);
+    let caller = answered_caller(&dispatcher, "cancel-reply@192.0.2.10");
+    let controller = controller_owning(
+        "cancel-reply",
+        dispatcher,
+        &caller,
+        "caller-reply",
+        "hangup",
+    );
+    let state = &controller.dispatcher.state;
+    let dial_args =
+        || serde_json::json!({ "targets": [{ "aor": aor }], "on_answer": "bridge", "timeout": 60 });
+
+    // Twice over: a dial placed on reading the first cancel's reply is itself
+    // cancelled the same way.
+    for round in 1..=2 {
+        let (reply, _) = dial(&controller, "caller-reply", dial_args()).await;
+        assert_eq!(reply["status"], "ok", "round {round}: {reply}");
+        let desk = invite_to(&drain(&controller.dispatcher.udp), DESK);
+        phone_sends(
+            state,
+            socket(DESK),
+            &phone_response(
+                &desk,
+                180,
+                "Ringing",
+                "desk-tag",
+                &format!("sip:cd4406@{DESK}"),
+                None,
+            ),
+        );
+        let _ = events_through(&controller, "PlayStarted").await;
+
+        let (reply, queued) = command(
+            &controller,
+            "cancel_dial",
+            "caller-reply",
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(reply["status"], "ok", "round {round}: {reply}");
+        assert_eq!(
+            names(&queued),
+            ["DialBranchFailed", "DialFailed"],
+            "round {round}: the dial's end is reported ahead of the reply"
+        );
+        assert!(
+            !state.dial_bridges.is_ringing(&caller.call_id),
+            "round {round}: the caller is let go of"
+        );
+        assert_eq!(
+            engine.commands("stop_media").len(),
+            round,
+            "round {round}: the ringback is stopped"
+        );
+    }
+
+    let (reply, _) = command(
+        &controller,
+        "route",
+        "caller-reply",
+        serde_json::json!({ "targets": ["sip:15550100099@198.51.100.9"] }),
+    )
+    .await;
+    assert_ne!(
+        reply["error"]["details"]["reason"], "dial_in_progress",
+        "{reply}"
+    );
 }
 
 /// A phone has answered and its bridge to the caller is in motion: the cancel

@@ -140,6 +140,9 @@ pub struct ALegReliableProvisionals {
     offer_to_caller: Option<(u32, Vec<u8>)>,
     /// siphon has sent that caller its offer.
     offered_to_caller: bool,
+    /// The caller has acknowledged a reliable provisional that carried a
+    /// session description.
+    answer_acknowledged: bool,
 }
 
 impl ALegReliableProvisionals {
@@ -286,7 +289,11 @@ impl ALegReliableProvisionals {
                 PrackOutcome::Unmatched
             };
         }
-        let link = self.unacknowledged.take().and_then(|pending| pending.link);
+        let acknowledged = self.unacknowledged.take();
+        self.answer_acknowledged |= acknowledged
+            .as_ref()
+            .is_some_and(|pending| pending.carries_sdp);
+        let link = acknowledged.and_then(|pending| pending.link);
         self.highest_acknowledged = Some(rseq);
         let mut release = Vec::new();
         while let Some(next) = self.queued.pop_front() {
@@ -334,6 +341,14 @@ impl ALegReliableProvisionals {
                 .unacknowledged
                 .as_ref()
                 .is_some_and(|pending| now.saturating_duration_since(pending.sent_at) >= PRACK_WAIT)
+    }
+
+    /// Whether the caller has its answer: it has acknowledged a reliable
+    /// provisional that carried a session description, which completes the
+    /// INVITE's offer/answer on its dialog before the 2xx (RFC 3262 §5). From
+    /// then on the caller may send a new offer in an UPDATE (RFC 3311 §5.1).
+    pub fn answer_acknowledged(&self) -> bool {
+        self.answer_acknowledged
     }
 
     /// The `RSeq` of the provisional awaiting its PRACK.

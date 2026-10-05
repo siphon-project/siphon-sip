@@ -194,6 +194,11 @@ pub fn b2bua_transfer_rtpengine_offer(
 /// caller's. `answerer_sip_call_id` is the Call-ID of the dialog the
 /// answer SDP belongs to, and `ingress` the party it belongs to: the answer is
 /// pinned to that party's signalling source where its own policy asks for it.
+///
+/// `shape` is what shapes the result, which goes to the offerer: the `answer`
+/// half of the pair's profile when the offerer is the party a dial's `answer`
+/// half describes, and for a delayed offer, whose offerer is the callee, the
+/// `offer` half.
 #[allow(clippy::too_many_arguments)]
 pub fn b2bua_transfer_rtpengine_answer(
     state: &DispatcherState,
@@ -202,13 +207,12 @@ pub fn b2bua_transfer_rtpengine_answer(
     target_tag: &str,
     target_sdp: &[u8],
     answerer_sip_call_id: &str,
-    profile_name: &str,
+    shape: &SideFlags,
     ingress: Option<&PartyIngress>,
 ) -> Option<Vec<u8>> {
     let backend = state.rtpengine_set.as_ref()?;
     let profiles = state.rtpengine_profiles.as_ref()?;
-    let profile = profiles.get(profile_name)?;
-    let mut answer_flags = profile.answer.clone();
+    let mut answer_flags = shape.resolve(profiles)?;
     stamp_party_ingress(&mut answer_flags, profiles, ingress);
     answer_flags.stamp_sip_call_id(answerer_sip_call_id);
     match tokio::task::block_in_place(|| {

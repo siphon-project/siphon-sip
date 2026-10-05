@@ -666,9 +666,7 @@ mod tests {
     #[allow(clippy::result_large_err)]
     #[tokio::test]
     async fn a_wss_connect_url_dials_over_tls_and_owns_the_call() {
-        let directory = std::env::temp_dir().join("siphon-control-wss-dial");
-        let _ = std::fs::remove_dir_all(&directory);
-        std::fs::create_dir_all(&directory).expect("temp dir");
+        let directory = crate::transport::testutil::temp_dir("control-wss-dial");
         let (ca_path, certificate_path, key_path) = write_test_chain(&directory);
 
         use tokio_rustls::rustls::pki_types::pem::PemObject;
@@ -767,9 +765,7 @@ mod tests {
     /// above passing while every certificate on earth was acceptable.
     #[tokio::test]
     async fn a_wss_dial_without_the_ca_is_refused_rather_than_trusted() {
-        let directory = std::env::temp_dir().join("siphon-control-wss-noca");
-        let _ = std::fs::remove_dir_all(&directory);
-        std::fs::create_dir_all(&directory).expect("temp dir");
+        let directory = crate::transport::testutil::temp_dir("control-wss-noca");
         let (_ca_path, certificate_path, key_path) = write_test_chain(&directory);
 
         use tokio_rustls::rustls::pki_types::pem::PemObject;

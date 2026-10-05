@@ -169,7 +169,10 @@ pub fn b2bua_bridge_inbound_replaces(
                 &survivor_tag,
                 &survivor_sdp,
                 &survivor.dialog.call_id,
-                &session.profile,
+                &crate::rtpengine::session::SideFlags {
+                    profile: session.profile.clone(),
+                    half: crate::rtpengine::session::ProfileHalf::Answer,
+                },
                 Some(&PartyIngress {
                     source: survivor.transport.remote_addr.ip(),
                     policy: repaired.survivor.clone(),
@@ -288,6 +291,10 @@ pub fn b2bua_bridge_inbound_replaces(
     ) {
         warn!(call_id = %replaced_call_id, "B2BUA Replaces: failed to answer the taking-over INVITE");
     }
+
+    // A REFER the replaced party sent, still held for its application, is
+    // answered ahead of the BYE that ends its dialog.
+    pending_refer_leg_released(state, &replaced_call_id, &replaced);
 
     // RFC 3891 §3: the replaced dialog is terminated once the new INVITE is
     // accepted. Its leg is already off the call, so this BYE is built from the
@@ -714,6 +721,9 @@ pub fn b2bua_complete_terminated_transfer(
         control_channel_follows_a_leg(state, call_id, previous);
     }
     if let Some(referrer_leg) = promoted_referrer.filter(|_| !referrer_gone) {
+        // A REFER the replaced party sent before a `replace_peer` took its
+        // place, still held for its application, is answered ahead of its BYE.
+        pending_refer_leg_released(state, call_id, &referrer_leg);
         if let Some(bye) = build_b2bua_bye(&referrer_leg, state) {
             match notify_branch.take() {
                 // A NOTIFY is going out on this dialog, so the BYE waits for it
@@ -837,7 +847,12 @@ pub fn b2bua_complete_terminated_transfer(
                     response.headers.call_id().map_or("", String::as_str),
                     // The pairing the transfer created, not the one the call
                     // started as — see `accept_refer(profile=…)`.
-                    transfer_profile.as_deref().unwrap_or(&old_session.profile),
+                    &crate::rtpengine::session::SideFlags {
+                        profile: transfer_profile
+                            .clone()
+                            .unwrap_or_else(|| old_session.profile.clone()),
+                        half: crate::rtpengine::session::ProfileHalf::Answer,
+                    },
                     // The SDP in this answer is the target's, and this 2xx is
                     // where the target signals from.
                     repaired

@@ -272,7 +272,8 @@ async fn a_losing_fork_branch_that_fails_without_a_provisional_is_acked_and_noth
 }
 
 /// The silent branch never responds: Timer B ends its INVITE, and no CANCEL
-/// was ever sent.
+/// was ever sent. The branch is kept answerable until its expiry, which
+/// releases it.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_losing_fork_branch_that_never_responds_ends_at_timer_b_without_a_cancel() {
     let (sequence, silent) = fork_won_beside_a_silent_branch();
@@ -287,8 +288,151 @@ async fn a_losing_fork_branch_that_never_responds_ends_at_timer_b_without_a_canc
     assert_no_cancel(&drain(&dispatcher.udp), SECOND_CARRIER);
     assert_eq!(state.call_actors.deferred_cancel_count(), 0);
     assert!(
-        !state.call_actors.is_cancelled_branch(&branch),
-        "Timer B releases the branch"
+        state.call_actors.is_cancelled_branch(&branch),
+        "still answerable, for a final response that turns up late"
     );
     assert!(!sequence.call_is_gone(), "the answered call stands");
+    assert_branch_released(state, &branch);
+}
+
+/// A stream of the frames siphon hands a reliable transport, in place of the
+/// test dispatcher's own, which reads none of them.
+fn capture_streams(sequence: &mut Sequence) -> flume::Receiver<OutboundMessage> {
+    let (sender, streams) = flume::unbounded();
+    let router = &sequence.dispatcher.state.outbound;
+    sequence.dispatcher.state.outbound = Arc::new(OutboundRouter {
+        udp: router.udp.clone(),
+        udp_by_local: router.udp_by_local.clone(),
+        tcp: sender.clone(),
+        tls: sender.clone(),
+        ws: sender.clone(),
+        wss: sender.clone(),
+        sctp: Some(sender),
+    });
+    streams
+}
+
+/// Every message handed to a reliable transport since the last look.
+fn stream_frames(streams: &flume::Receiver<OutboundMessage>) -> Vec<SipMessage> {
+    let mut sent = Vec::new();
+    while let Ok(outbound) = streams.try_recv() {
+        for frame in outbound.frames() {
+            sent.push(parse_sip_message_bytes(frame).expect("siphon sent a message that parses"));
+        }
+    }
+    sent
+}
+
+fn methods(sent: &[SipMessage]) -> Vec<String> {
+    sent.iter()
+        .map(|message| match (message.method(), message.status_code()) {
+            (Some(method), _) => method.as_str().to_string(),
+            (None, status_code) => status_code.unwrap_or_default().to_string(),
+        })
+        .collect()
+}
+
+/// The same on a reliable transport, where nothing retransmits the INVITE and
+/// nothing else would ever notice the far end stayed silent. Timer B runs
+/// there too (RFC 3261 §17.1.1.2: 64·T1 "for any transport"): when it fires
+/// the INVITE's transaction is over, the CANCEL that waited for a provisional
+/// is owed no longer and is never sent, and a provisional that turns up after
+/// it draws none. The branch is still answerable until its own expiry, for a
+/// final response that turns up late, and then nothing of it is left.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_silent_branch_on_a_reliable_transport_ends_at_timer_b_without_a_cancel() {
+    const STREAM_CARRIER: &str = "198.51.100.8:42000";
+    let mut sequence = Sequence::new_call("");
+    let streams = capture_streams(&mut sequence);
+    let state = &sequence.dispatcher.state;
+    // One branch over UDP, which answers, and one over a TCP flow, which
+    // never says anything.
+    let flow = crate::script::api::registrar::PyFlow {
+        transport: "tcp".to_string(),
+        source_addr: socket(STREAM_CARRIER),
+        local_addr: socket("192.0.2.1:5060"),
+        connection_id: 73,
+    };
+    for (target, next_hop, flow) in [
+        (
+            format!("sip:15550100042@{FIRST_CARRIER}"),
+            Some(format!("sip:{FIRST_CARRIER}")),
+            None,
+        ),
+        (
+            format!("sip:15550100042@{STREAM_CARRIER}"),
+            None,
+            Some(&flow),
+        ),
+    ] {
+        let guard = sequence.invite.lock().expect("the A-leg INVITE lock");
+        assert!(b2bua_send_b_leg_invite(
+            &sequence.call_id,
+            &target,
+            next_hop.as_deref(),
+            flow,
+            &[],
+            None,
+            None,
+            &guard,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            state,
+        ));
+    }
+    let winner = invite_among(&drain(&sequence.dispatcher.udp), FIRST_CARRIER);
+    let on_stream = stream_frames(&streams);
+    assert_eq!(methods(&on_stream), ["INVITE"]);
+    let silent = on_stream[0].clone();
+    let branch = branch_of(&silent);
+    let timeout = state.b2bua_retransmits.transaction_timeout();
+
+    phone_answers(state, FIRST_CARRIER, &winner, 200, "OK", None);
+    let _ = drain(&sequence.dispatcher.udp);
+    assert!(stream_frames(&streams).is_empty(), "no CANCEL yet (§9.1)");
+    assert_eq!(state.call_actors.deferred_cancel_count(), 1);
+
+    // Short of Timer B nothing happens, and nothing is retransmitted on a
+    // reliable transport at any point.
+    super::timers::sweep_b2bua_retransmits_at(
+        state,
+        std::time::Instant::now() + timeout - std::time::Duration::from_secs(1),
+    );
+    assert!(stream_frames(&streams).is_empty());
+    assert_eq!(state.call_actors.deferred_cancel_count(), 1);
+
+    super::timers::sweep_b2bua_retransmits_at(state, std::time::Instant::now() + timeout);
+    assert!(
+        stream_frames(&streams).is_empty(),
+        "Timer B sends nothing: no CANCEL for an INVITE nothing answered"
+    );
+    assert_eq!(
+        state.call_actors.deferred_cancel_count(),
+        0,
+        "the CANCEL that waited is owed no longer"
+    );
+    assert_eq!(state.b2bua_retransmits.disarm_branch(&branch), 0);
+
+    // The transaction is over: a provisional after it draws no CANCEL.
+    phone_answers(state, STREAM_CARRIER, &silent, 180, "Ringing", None);
+    assert!(stream_frames(&streams).is_empty());
+    assert!(
+        drain(&sequence.dispatcher.udp)
+            .iter()
+            .all(|frame| frame.destination != socket(CALLER)),
+        "the caller hears nothing of it"
+    );
+    // The branch is still answerable, as on UDP, where a 2xx after Timer B is
+    // read off the wire being ACKed and released with a BYE
+    // (`originated_cancel_awaits_provisional_tests`); then its expiry releases
+    // it and nothing of it is left.
+    assert!(state.call_actors.is_cancelled_branch(&branch));
+    assert!(!sequence.call_is_gone(), "the answered call stands");
+    assert_branch_released(state, &branch);
+    assert_eq!(state.call_actors.cancelled_branch_count(), 0);
 }

@@ -53,7 +53,7 @@ pub fn b_leg_failed(
     // fork of one and settles here at once. An LCR sequence keeps one carrier
     // live at a time under its own failover rules, and a response matching no
     // leg has no fork to settle, so both go straight on.
-    let in_a_fork = snapshot.b_leg_index.is_some() && !state.call_actors.is_route_sequence(call_id);
+    let in_a_fork = snapshot.matched_b_leg && !state.call_actors.is_route_sequence(call_id);
     if !in_a_fork {
         fail_call_on_b_leg_failure(
             call_id,
@@ -507,10 +507,10 @@ pub fn retry_with_credentials(
                 );
                 send_b2bua_to_bleg(ack, b_transport, b_dest, snapshot.b_leg_local_addr, state);
             }
-            let first = snapshot
-                .b_leg_index
-                .map(|idx| state.call_actors.try_mark_auth_challenged(call_id, idx))
-                .unwrap_or(true);
+            let first = !snapshot.matched_b_leg
+                || state
+                    .call_actors
+                    .try_mark_auth_challenged_on(call_id, branch);
             if !first {
                 // Retransmit of an already-surfaced challenge — absorb.
                 return true;
@@ -579,10 +579,12 @@ pub fn retry_with_credentials(
                         // trunk BYEs the call. A chained re-challenge (stale
                         // nonce) lands on the *retry* leg's branch, a distinct
                         // B-leg, so legitimate re-auth still proceeds.
-                        let first_challenge = snapshot
-                            .b_leg_index
-                            .map(|idx| state.call_actors.try_mark_auth_challenged(call_id, idx))
-                            .unwrap_or(true);
+                        // Marked on the leg this challenge's Via branch
+                        // names, not at the position the snapshot read.
+                        let first_challenge = !snapshot.matched_b_leg
+                            || state
+                                .call_actors
+                                .try_mark_auth_challenged_on(call_id, branch);
                         if !first_challenge {
                             debug!(
                                 call_id = %call_id,
@@ -791,19 +793,28 @@ fn supersede_b_leg_with_retry(
     // from it (RFC 3261 §9.1: the same Via branch and CSeq).
     b_leg.b_leg_invite = Some(Arc::new(Mutex::new(retry.clone())));
 
-    // `snapshot.b_leg_index` is the slot the failed response matched. It is
-    // always Some here, since a B-leg response only reaches a retry with a matched
-    // leg, but fall back to appending defensively.
-    match snapshot.b_leg_index {
-        Some(idx) => {
-            state.call_actors.replace_b_leg(call_id, idx, b_leg.clone());
-            spawn_b_leg_actor_at(call_id, &b_leg, idx, state);
+    // The retry takes the place of the leg the failed response's Via branch
+    // names, found under the lock that replaces it. A B-leg response only
+    // reaches a retry with a matched leg; one that matched none appends,
+    // defensively.
+    if snapshot.matched_b_leg {
+        if !state
+            .call_actors
+            .replace_b_leg_on(call_id, &snapshot.branch, b_leg.clone())
+        {
+            // The leg was taken off the call since its response arrived, so
+            // the call has given up on it: no retry is owed.
+            warn!(
+                call_id = %call_id,
+                branch = %snapshot.branch,
+                "B2BUA: not retrying an INVITE whose leg has left the call"
+            );
+            return;
         }
-        None => {
-            state.call_actors.add_b_leg(call_id, b_leg.clone());
-            spawn_b_leg_actor(call_id, &b_leg, state);
-        }
+    } else {
+        state.call_actors.add_b_leg(call_id, b_leg.clone());
     }
+    spawn_b_leg_actor(call_id, &b_leg, state);
 
     let data = Bytes::from(retry.to_bytes());
     // Egress from the leg's anchored socket (UDP only; a stream leg is reached
@@ -864,11 +875,12 @@ pub fn advance_route_sequence(
         // — no forward, no teardown, no advance.
         //
         // `map_or(true, …)` not `is_none_or`: MSRV 1.80, and that is 1.82.
-        let newly_settled = snapshot.b_leg_index.map_or(true, |index| {
-            state
+        // Settled on the leg this response's Via branch names, found under
+        // the lock that settles it.
+        let newly_settled = !snapshot.matched_b_leg
+            || state
                 .call_actors
-                .settle_route_branch(call_id, index, status_code)
-        });
+                .settle_route_branch_on(call_id, branch, status_code);
         if !newly_settled || status_code == 487 || snapshot.call_state == CallState::Answered {
             ack_b_leg_non2xx(branch, message, state, snapshot);
             info!(call_id = %call_id, status = status_code,

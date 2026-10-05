@@ -117,6 +117,10 @@ struct RingingDial {
     /// The controller cancelled the dial before its group existed: the reason
     /// it gave, for the dial to end on as soon as it has one.
     cancel: Option<String>,
+    /// Dropped with this entry, which is how a `cancel_dial` waiting to answer
+    /// learns the dial has let go of the caller
+    /// ([`DialBridgeStore::conclusion`]).
+    concluded: tokio::sync::watch::Sender<()>,
 }
 
 /// What a cancel of a caller's dial found.
@@ -244,6 +248,43 @@ impl DialBridgeStore {
     /// `caller`'s dial is over.
     pub fn release(&self, caller: &str) {
         self.ringing.remove(caller);
+    }
+
+    /// The dial reporting on `signals` is over: `caller` is let go of, unless
+    /// another dial has claimed it since.
+    pub fn release_dial(
+        &self,
+        caller: &str,
+        signals: &tokio::sync::mpsc::WeakUnboundedSender<DialBridgeSignal>,
+    ) {
+        // A dial whose senders are all gone has no entry left: it holds one.
+        if let Some(signals) = signals.upgrade() {
+            self.ringing
+                .remove_if(caller, |_, dial| dial.signals.same_channel(&signals));
+        }
+    }
+
+    /// A watch on the dial ringing for `caller` that closes when that dial
+    /// lets go of the caller: its outcome reported, its ringback stopped, the
+    /// caller free to be dialled for or routed. `None` when no dial holds it.
+    pub fn conclusion(&self, caller: &str) -> Option<tokio::sync::watch::Receiver<()>> {
+        self.ringing
+            .get(caller)
+            .map(|dial| dial.concluded.subscribe())
+    }
+
+    /// Let go of `caller` for the dial `conclusion` watches, when it still
+    /// holds it. `true` when it did.
+    pub fn release_watched(
+        &self,
+        caller: &str,
+        conclusion: &tokio::sync::watch::Receiver<()>,
+    ) -> bool {
+        self.ringing
+            .remove_if(caller, |_, dial| {
+                dial.concluded.subscribe().same_channel(conclusion)
+            })
+            .is_some()
     }
 
     /// A ringback started on `caller`. Only an engine that names its playbacks
@@ -599,6 +640,7 @@ pub fn dial_bridge_start(
             media_call_id: caller.media_call_id.clone(),
             from_tag: caller.from_tag.clone(),
             cancel: None,
+            concluded: tokio::sync::watch::channel(()).0,
         },
     );
     if !claimed {
@@ -791,6 +833,7 @@ mod tests {
             media_call_id: CALLER.to_string(),
             from_tag: "caller-tag".to_string(),
             cancel: None,
+            concluded: tokio::sync::watch::channel(()).0,
         }
     }
 
@@ -809,6 +852,42 @@ mod tests {
         // Positive control: released, it can be claimed again.
         assert!(store.claim(CALLER, ringing(signals)));
         store.release(CALLER);
+        assert_eq!(store.ringing_count(), 0);
+    }
+
+    /// A dial's conclusion is watched from outside it: the watch closes when
+    /// the dial lets go of the caller, and only that dial's own handles let go
+    /// of it, so a dial that claimed the caller afterwards keeps it.
+    #[tokio::test]
+    async fn a_dials_conclusion_closes_when_it_lets_go_and_never_takes_another_dials_claim() {
+        let store = DialBridgeStore::new();
+        assert!(store.conclusion(CALLER).is_none(), "nothing rings");
+        let (first, _first_receiver) = tokio::sync::mpsc::unbounded_channel();
+        assert!(store.claim(CALLER, ringing(first.clone())));
+        let mut watched = store.conclusion(CALLER).expect("the dial is watched");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), watched.changed())
+                .await
+                .is_err(),
+            "open while the dial holds the caller"
+        );
+
+        // Another dial's handle does not let go of this one.
+        let (second, _second_receiver) = tokio::sync::mpsc::unbounded_channel();
+        store.release_dial(CALLER, &second.downgrade());
+        assert!(store.is_ringing(CALLER));
+        store.release_dial(CALLER, &first.downgrade());
+        assert!(!store.is_ringing(CALLER));
+        assert!(watched.changed().await.is_err(), "closed with the dial");
+
+        // The caller is claimed again: neither the first dial's handle nor the
+        // watch on it takes the new claim.
+        assert!(store.claim(CALLER, ringing(second.clone())));
+        store.release_dial(CALLER, &first.downgrade());
+        assert!(!store.release_watched(CALLER, &watched));
+        assert!(store.is_ringing(CALLER));
+        let current = store.conclusion(CALLER).expect("the second dial");
+        assert!(store.release_watched(CALLER, &current));
         assert_eq!(store.ringing_count(), 0);
     }
 

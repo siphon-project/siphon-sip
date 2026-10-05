@@ -97,6 +97,22 @@ entry, but a working config keeps working.
   `sdp_keep_session_name: true` the session name is relayed as the far side
   wrote it, and `o=` is still rewritten. Default `false`, so nothing changes
   for an existing config.
+- **The control SDKs type the rest of what `play` and the transfer verbs
+  take.** The server already read a `tone` or a `url` as a `play` source, a
+  `gain_decibels` beside it, and `number_policy` / `format` on
+  `accept_refer` and `replace_peer`; from an SDK they could only be sent
+  through the generic `command`. Rust: `PlaySource::tone` /
+  `PlaySource::url`, `PlayOptions::gain_decibels`, and
+  `TransferDial::number_policy` / `format`. Python: `play(tone=…, url=…,
+  gain_decibels=…)` and `number_policy=` / `format=` on `accept_refer` and
+  `replace_peer` (a second source, and a number argument beside
+  `mode="controller"`, raise `ValueError` before a frame goes out).
+  TypeScript: `{ tone }` and `{ url }` sources, `gainDecibels`, and
+  `numberPolicy` / `format` on the transfer options. Each goes out under the
+  name the server parses, pinned by a wire test per SDK. **BREAKING (Rust
+  SDK source):** `PlaySource` has two more variants and `PlayOptions` and
+  `TransferDial` more public fields, so an exhaustive `match` or a struct
+  literal without `..Default::default()` needs the addition.
 
 ### Fixed
 
@@ -343,6 +359,11 @@ entry, but a working config keeps working.
   backstop dropped it unwritten. The record is now written when the call
   ends, with `487` and the caller as the one who ended it for a CANCEL, and
   with the script's code for a reject.
+  party finally answers. On a reliable transport nothing is retransmitted
+  and Timer B ends the wait the same way. The
+  proxy path is not changed: a CANCEL relayed or generated for a proxied
+  INVITE (`request.relay()`, `request.fork()`, `reply.reject()`) still goes
+  out without waiting.
 - **A transfer whose target cannot be dialled ends its subscription and
   leaves the call free.** A siphon-terminated REFER answers `202` and sends
   the `100 Trying` NOTIFY before it dials. When no INVITE could then be sent
@@ -620,6 +641,188 @@ entry, but a working config keeps working.
   `replaces.local` carries its call, the channel controlling it, its leg and
   the channel it is bridged with. `StasisStart` carries the same as `replaces`
   for a handed-over INVITE whose `Replaces` named a hosted dialog.
+- **A B-leg response acts on the leg it answers when the call's legs have
+  moved.** siphon read a B-leg's position among the call's legs when its
+  response arrived and acted on that position later, after its retries, script
+  hooks and media engine calls had run. A leg ahead of it taken off the call in
+  between (the leg tracking a relayed in-dialog request once that request is
+  refused, the targets of a replacement that failed) moves every later leg
+  down one, so the position then named the leg behind it, or none. The
+  PRACK and the recorded branch failure already followed the Via branch of the
+  leg's INVITE (RFC 3261 §8.1.1.7); the rest of the response path now does
+  too, each step finding the leg by that branch under the lock that acts on
+  it. With the legs moved, a 2xx used to answer the call with no winning
+  leg; an answer `@b2bua.on_answer` refused left the callee's dialog up, with
+  no ACK and no BYE; a `401`/`407` was ACKed and taken for a retransmission
+  instead of being answered with credentials; a carrier's failure was taken
+  for a straggler, so an LCR sequence stopped instead of trying the next
+  carrier; a relayed re-INVITE, UPDATE, REFER, NOTIFY or INFO marked a
+  different request as answered, or removed it, and stayed open itself; and
+  the answer in the ACK held for a delayed offer (§13.2.2.4) went out without
+  siphon's own `o=` line. The ACK of a relayed re-INVITE's 2xx now reads its
+  route set (§12.2.1.1) off the re-INVITE's own leg, and a later copy of a
+  delayed offer's 2xx draws the ACK that carried the answer. The actor of a
+  leg that supersedes a challenged one is stored on that leg's own slot,
+  found by its branch. Nothing changes
+  for a call whose legs have not moved.
+- **The reply to `cancel_dial` means the dial is over.** Cancelling a
+  bridging dial (`dial {on_answer: "bridge"}`) CANCELled the phones and
+  replied at once, while the dial's own task was still stopping the ringback
+  on the media engine; only after that did it report `DialFailed` and let go
+  of the caller. An application that acted on the reply, as the `route`
+  refusal tells it to (`cancel_dial` first), could have its `route` or its
+  next `dial` refused `invalid_state` / `dial_in_progress` for a dial it had
+  just been told was cancelled. The reply is now held until the dial has let
+  go: each phone's `DialBranchFailed` and the dial's `DialFailed` are queued
+  ahead of it, the ringback is stopped, and a `dial` or `route` sent on
+  reading it is taken. The wait is for that one exchange with the media
+  engine and never for a phone; after 5 s the reply is sent anyway with the
+  caller released, and `DialFailed` follows it. A connecting dial's cancel
+  already reported `DialFailed` ahead of its reply and is unchanged. A dial's
+  task also lets go only of its own claim on the caller, so one that ends
+  late cannot release a dial placed after it.
+- **A call carries out one transfer at a time: a REFER that arrives while
+  another is in flight is refused `491 Request Pending`.** A REFER with a new
+  CSeq was taken as a request of its own whatever its call was doing. While
+  the target of a transfer siphon carries out was still ringing, a second
+  REFER was held for the controlling application and reported as another
+  `TransferRequested`, or run through `@b2bua.on_refer` on a call its script
+  decides for, where an `accept_refer()` answered a second `202` and dialled
+  a second target for the same pair; with a REFER relayed in `transparent`
+  mode still waiting for the far end, the second was relayed on top of it.
+  The two targets' answers would then each re-pair the call against a pair
+  the other had changed. RFC 3515 lets a referrer send several REFERs in a
+  dialog but does not oblige the recipient to carry them out together, and a
+  `491` (RFC 3261 §21.4.27) asks for the request again later. A REFER from
+  either party is now refused `491`, with no event and no script hook, while
+  a leg replacement is in flight on its call (an accepted `terminate`
+  transfer or a `replace_peer` whose target has not answered, failed or run
+  out of time) and while a REFER relayed to the far end has not been
+  answered. Once that
+  transfer has succeeded, failed or reached its deadline a REFER is taken as
+  before, and a retransmission of the REFER being carried out still gets its
+  own `202` again. A second REFER while one is undecided, and one during a
+  transfer in `controller` mode, were already refused this way.
+- **A REFER held for a decision stays with its call when the call's A-leg
+  changes.** A REFER on a controlled call waits for `accept_refer` /
+  `reject_refer` under a key, and the key was the SIP Call-ID the call's
+  control channel is bound to, the A-leg's. An INVITE with `Replaces` (RFC
+  3891) that takes one side of the call over, or a replacement of the caller,
+  puts another dialog in the A-leg slot: the channel follows it there, the
+  held REFER stayed under the Call-ID that had left, and from then on neither
+  the application's decision nor the end of the call found it. `accept_refer`
+  and `reject_refer` answered `not_found` for a transfer the application had
+  just been asked about, a party hanging up was not sent the response its
+  REFER was owed, and only the decision deadline's `603` answered it. It is
+  now held under the call itself. A decision that names the call by its
+  channel finds it whatever Call-ID the channel stands on; the call ending
+  answers it (`603`, ahead of the BYE to its sender); and its sender's own
+  BYE answers it `487` (RFC 3261 §15.1.2). The referrer is also recognised by
+  the dialog its REFER arrived in rather than by which side of the call that
+  dialog was on then: a takeover of the callee moves the caller to the call's
+  other slot, and a transfer accepted afterwards replaces the party the
+  referrer is talking to now and reports to the referrer, where it would have
+  taken the newcomer for the referrer. A referrer that is itself taken over
+  or replaced has its held REFER answered `487` ahead of the BYE that
+  releases it, and a decision reaching a REFER whose dialog has left the call
+  answers it `481`.
+- **A re-offer from the callee is relayed to each party in that party's own
+  transport.** A media profile's `offer` half shapes what the callee of a
+  dial is sent (the caller's offer, rewritten) and its `answer` half what
+  the caller is sent, and both media backends apply the flags on a command
+  to the SDP they return, so to the party that SDP is sent to. On a
+  re-INVITE or an UPDATE the half was chosen by the command instead: `offer`
+  flags on the re-offer and `answer` flags on its answer, whoever sent it.
+  That is right while the caller re-offers. When the callee does, a hold
+  and its resume for instance, its offer was relayed to the caller under the
+  `offer` half and the caller's answer returned to the callee under the
+  `answer` half: each got the other's side of the profile. With a profile
+  whose halves differ, the built-in `srtp_to_rtp` / `rtp_to_srtp` or any
+  that sets `transport_protocol`, `direction`, DTLS or codec handling per
+  half, the SRTP party was offered plain RTP and the plain one SRTP, with
+  the `direction` pair reversed. A delayed offer (RFC 3264 §4) had the same
+  fault from the start of the call, since there the callee offers: its offer
+  in the 2xx reached the caller under the `offer` half and the caller's
+  answer in the ACK reached the callee under the `answer` half. Every such
+  command is now shaped for the party its result is sent to, which the
+  call's media session says for the life of the call: the callee by the
+  `offer` half and the caller by the `answer` half, or what a transfer, a
+  takeover or a bridge recorded for the pair. This covers a B2BUA call's
+  relayed re-INVITE and UPDATE and their answers, the delayed offer and its
+  answer, and a script's own `rtpengine.offer()` / `rtpengine.answer()` on a
+  call already anchored. A profile whose two halves are the same, and every
+  re-offer from the caller, is sent exactly what it was.
+- **`rtpengine.answer()` on the caller's 2xx to a re-INVITE from the callee
+  no longer renames the callee.** A proxy script that anchors media calls
+  `rtpengine.answer(reply)` for every 2xx with SDP. The 2xx the caller sends
+  to a re-INVITE of the callee's carries the callee's tag in From and the
+  caller's in To, and the To-tag of whatever reply was answered was recorded
+  as the tag of the call's answering party. The media session then named the
+  caller under both of its tags and the callee under neither, so the next
+  re-offer from the callee, its answer, and each party's `received_from`
+  policy were worked out for the wrong party. The engine command itself was
+  right and is unchanged. The session now never records its offerer's own
+  tag as its answerer's; a different answerer's tag, as a forked INVITE's
+  final answer can carry, still replaces the one held.
+- **An UPDATE from the caller while its call still rings is answered as RFC
+  3311 §5.2 has it, and never by the media engine on the callee's behalf.**
+  Such an UPDATE found a call with no answered callee and was handled as one
+  with no second party at all. With an offer on a media-anchored call, the
+  engine was told to answer it itself, on a session whose first offer was
+  still out to the callee: the caller got a `200` describing media the callee
+  had never been asked about. With no offer it was refused `488`. Now an
+  UPDATE with no offer is answered `200` with no body. One with an offer
+  while the INVITE's own offer is unanswered is refused `500` with a
+  `Retry-After` of 0 to 10 seconds, the response §5.2 requires of a UAS that
+  has an offer it has not answered. One with an offer after the caller has
+  acknowledged its answer in a reliable provisional is refused `504`: the
+  change needs the callee, and siphon does not relay an UPDATE to a callee
+  whose dialog is not confirmed. In each case the engine and the callee are
+  sent nothing and the call rings on. This applies to a call that is not
+  anchored too, where an offer used to be answered `200` with no body. An
+  UPDATE on an answered call, and on a call siphon answered itself, is
+  handled as before.
+- **A leg bridged under a pair `profile` is its own again for the next
+  bridge.** `bridge {profile}` shapes and pins both legs by one profile for
+  that pair. The anchor's media session became the pair's and took that
+  profile, and what was kept for the `with` leg's call was what its last
+  bridge had used, so after an `unbridge` a bridge of either leg to another
+  one with no `profile` still shaped and pinned it by the earlier pair's:
+  an anchor answered with plain RTP and no source hint was re-INVITEd with
+  the pair profile's transport and pinned by its `received_from` policy.
+  What a call was first anchored with is now kept for the call the first
+  time a bridge retires its session (the `with` leg) or makes it the pair's
+  (the anchor), and is never rewritten. A later bridge with no `profile`
+  reads it for both legs, in either role; one that names a `profile` still
+  decides for both legs of that pair. A pair that never used a pair profile
+  is shaped and pinned exactly as before. The record goes with its call on
+  every way the call ends.
+- **An INVITE siphon sends on a reliable transport times out at Timer B.**
+  RFC 3261 §17.1.1.2 starts Timer B at 64·T1 "for any transport". The B2BUA
+  timed only the INVITEs it retransmits, so over TCP, TLS or WebSocket
+  nothing ever said that a far end which took the INVITE and answered
+  nothing had had its time. A CANCEL held back for that far end's first
+  provisional (§9.1) then stayed owed until the branch was forgotten, and a
+  `100 Trying` arriving before that still drew it, after the INVITE's own
+  64·T1 had passed. Timer B now runs for those INVITEs
+  too: nothing is retransmitted, and at 64·T1 the CANCEL is owed no longer
+  and is never sent, as on UDP. On every transport the branch then stays
+  answerable until its own expiry instead of being forgotten at Timer B, so
+  a `2xx` that turns up after it is ACKed and its dialog released with a BYE
+  (§13.2.2.4, §15). With the branch forgotten at Timer B that `2xx` drew
+  neither, and the far end was left in a call nobody would end. A
+  provisional after Timer B draws nothing.
+- **`close()` on a Python control client or server stops handlers at
+  once.** A handler is called on a worker thread and its coroutine handed to
+  the event loop, so a `ControlClient.close()` could land between the two
+  and the handler body still ran in an application that had said it was
+  done (about one run in ten of the test that pushes handovers through a
+  close). `ControlServer.close()` did less: a server already in `serve()`
+  kept the handler it had started with and went on dispatching every call
+  dialled in. Both now set a flag the dispatch reads on the event loop
+  itself, as the first thing the handler's task does, so a call whose
+  handler had not started when `close()` ran never starts it. `run()` /
+  `serve()` called again open it again.
 
 ### Changed
 

@@ -859,6 +859,16 @@ One decision is pending per call. A retransmission of the held REFER is
 absorbed; a second REFER on the same call while the first is undecided is
 answered `491 Request Pending`.
 
+A call also carries out one transfer at a time. While a transfer siphon is
+carrying out is in flight (an `accept_refer` in `terminate` mode or a
+`replace_peer` whose target has not answered, failed or run out of time), and
+while a REFER relayed in `transparent` mode has not been answered by the far
+end, a REFER from either party is answered `491 Request Pending` and is not
+reported: accepting it would start a second replacement of the same pair. Once
+the first has concluded, with `PeerReplaced`, `ReplaceFailed` or the far end's
+response, a REFER is reported as usual. RFC 3261 §21.4.27 has the referrer try
+again later.
+
 A REFER is reported once. After the decision, a retransmission of it (same
 Call-ID, CSeq and Via branch, RFC 3261 §17.2.3) gets the final response the
 decision produced, again, for 64·T1 (32 s): the `202`, the code `reject_refer`
@@ -944,6 +954,15 @@ decision is no longer pending (`accept_refer` / `reject_refer` answer
 | the referrer's own BYE | `487 Request Terminated`, ahead of the `200` to its BYE (RFC 3261 §15.1.2) |
 | the other party's BYE, `hangup`, or any other teardown | `603 Decline`, ahead of the BYE siphon sends the referrer |
 | nothing siphon noticed, and `accept_refer` then finds the call gone | `481 Call/Transaction Does Not Exist` |
+
+The REFER is held for the call, not for the Call-ID the channel was bound to
+when it arrived. An INVITE with `Replaces` that takes the other party's place,
+or a `replace_peer` of it, leaves the REFER pending: the channel follows the
+call to the new dialog, `accept_refer` / `reject_refer` on it still decide the
+REFER, and a transfer accepted then replaces the party the referrer is talking
+to now. When the party taken over or replaced is the referrer itself, its REFER
+is answered `487 Request Terminated` ahead of the BYE that releases it, and the
+decision is no longer pending.
 
 #### A transfer the application carries out
 
@@ -1269,9 +1288,12 @@ half for the anchor, whose SDP the offer carries, and its `answer` half for the
 `with` leg. A `with` leg with no media session of its own has no policy of its
 own, and the anchor's profile's `answer` half decides for it. A leg that was the
 `with` side of an earlier bridge is not such a leg: its own session was retired
-when that bridge formed, and what the bridge shaped and pinned it with is kept
-for its call, so bridging it to a different anchor after an `unbridge` still
-offers it its own transport and pins it by its own policy. An unknown
+when that bridge formed, and what it was anchored with is kept for its call,
+so bridging it to a different anchor after an `unbridge` still offers it its
+own transport and pins it by its own policy. The same is kept for the target,
+whose session became the pair's. A `profile` named for one bridge is therefore
+that pair's alone: after an `unbridge`, a bridge of either leg with no
+`profile` goes back to what each leg was first anchored with. An unknown
 profile, or one that is not a non-empty string, is `bad_request` with
 `error.details: {verb: "bridge", argument: "profile", reason:
 "unknown_profile" | "invalid_value"}`, and nothing is touched. The reply echoes
@@ -1379,6 +1401,21 @@ answers a parted leg from its dialog alone:
 
 Neither sends the engine a command or reaches the other leg. A parted leg
 changes its media again when it is bridged: the `bridge` re-offers it.
+
+!!! warning "Limitation: a parted leg cannot change its own media"
+    Between an `unbridge` and the next `bridge`, a leg that sends a re-INVITE
+    or an UPDATE with a changed offer (its own hold or resume, a move to
+    another network address, a different codec list) gets `488 Not Acceptable
+    Here` every time. Its media stays as the `unbridge` left it, on hold, and
+    siphon does not follow a change of address. There is nothing to configure:
+    the leg has no media session of its own to renegotiate.
+
+    What an application can do is not leave a leg parted for long. Bridge it
+    again (to the same leg or another) before it has reason to re-offer: once
+    the bridge has formed, a re-offer on either leg is relayed to the other and
+    answered normally. An endpoint that got the `488` keeps the session it had
+    (RFC 3261 §14.1) and is free to send the offer again later, and one sent
+    after `ChannelBridged` is taken.
 
 **When one leg hangs up.** `on_peer_hangup` decides, and it is fixed when the
 bridge is formed:
@@ -1657,7 +1694,7 @@ phone is sent depends on what it has said so far:
 | the phone has sent | what siphon sends it |
 |---|---|
 | a provisional (`100 Trying` counts) | the CANCEL, at once; the `487` it draws is ACKed |
-| nothing | nothing new: its INVITE goes on being retransmitted (UDP). Its first provisional then draws the CANCEL; a `2xx` instead is ACKed and released with a BYE, never CANCELled; any other final response is ACKed and that is all; and if it stays silent the INVITE times out at Timer B (64·T1, 32 s by default) with no CANCEL sent |
+| nothing | nothing new: its INVITE goes on being retransmitted (UDP). Its first provisional then draws the CANCEL; a `2xx` instead is ACKed and released with a BYE, never CANCELled; any other final response is ACKed and that is all; and if it stays silent the INVITE times out at Timer B (64·T1, 32 s by default, on a reliable transport too, where nothing is retransmitted) with no CANCEL sent. A `2xx` that turns up after Timer B is still ACKed and released with a BYE |
 | its final response | nothing: there is no INVITE left to cancel |
 
 None of that delays the application. The reply, `DialBranchFailed`,
@@ -1667,6 +1704,15 @@ on the wire alone: nothing more is reported for it, and it is never connected
 to the caller. The same holds wherever siphon gives up on an INVITE it sent: a
 ring timeout, the phones that lose to the one that answered, `hangup` of an
 unanswered `originate`, `drop`, `terminate`, and the caller's own CANCEL.
+
+**The reply means the dial is over.** Each phone's `DialBranchFailed` and the
+dial's `DialFailed` are queued ahead of it, the ringback has been stopped, and
+nothing of the dial holds the caller any more: a `dial` or a `route` sent on
+reading the reply is not refused `dial_in_progress`. For a bridging dial that
+takes one exchange with the media engine, to stop the ringback, and the reply
+waits for it. It waits for no phone. Should that exchange not finish within
+5 s the reply is sent anyway, with the caller released, and `DialFailed`
+follows it.
 
 The reply is `{channel, state: "cancelled", on_answer}`. Refused, each with
 `error.details` `{verb: "cancel_dial", reason}`:

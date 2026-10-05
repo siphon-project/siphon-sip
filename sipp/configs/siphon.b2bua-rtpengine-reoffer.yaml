@@ -1,0 +1,47 @@
+# siphon.b2bua-rtpengine-reoffer.yaml — a callee's re-offer at an SRTP edge
+#
+# Used with: sipp/docker-compose.yaml (b2bua-rtpengine-reoffer profile)
+# Script:    sipp/rtpengine/b2bua_srtp_edge.py
+# Media:     REAL rtpengine (drachtio/rtpengine) at 172.20.0.44:22222
+# Proves:    on a call anchored with a profile whose halves describe different
+#            sides, a re-INVITE from the callee reaches the caller in the
+#            caller's transport and its answer reaches the callee in the
+#            callee's, against a real media engine.
+
+listen:
+  udp:
+    - "0.0.0.0:5060"
+
+domain:
+  local:
+    - "siphon.test"
+    - "172.20.0.222"
+    - "127.0.0.1"
+
+script:
+  path: "scripts/b2bua_srtp_edge.py"
+  reload: auto
+
+advertised_address: "172.20.0.222"
+
+media:
+  rtpengine:
+    address: "172.20.0.44:22222"
+    timeout_ms: 2000
+  profiles:
+    # The built-in srtp_to_rtp without its interface names, which this engine
+    # (one unnamed interface) does not have. The offer half is what the callee
+    # is offered, the answer half what the caller is answered.
+    srtp_edge:
+      offer:
+        transport_protocol: "RTP/AVP"
+        replace: ["origin"]
+        flags: ["trust-address"]
+      answer:
+        transport_protocol: "RTP/SAVP"
+        replace: ["origin"]
+        flags: ["trust-address"]
+
+log:
+  level: debug
+  format: pretty

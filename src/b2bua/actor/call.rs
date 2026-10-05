@@ -1429,8 +1429,8 @@ pub struct DelayedOfferAck {
     pub destination: std::net::SocketAddr,
     /// The socket the INVITE left from, for a flow-pinned leg.
     pub local_addr: Option<std::net::SocketAddr>,
-    /// The B-leg that sent the 2xx.
-    pub b_leg_index: usize,
+    /// Via branch of the INVITE the 2xx answers, which names its B-leg.
+    pub branch: String,
     /// Whether the ACK has gone out. Until it has, copies of the 2xx are absorbed.
     pub sent: bool,
 }
