@@ -123,18 +123,47 @@ pub fn handle_b2bua_invite(inbound: InboundMessage, message: SipMessage, state: 
     let a_leg_requires_100rel = crate::sip::headers::rseq::requires_100rel(&message.headers);
 
     // Guard against INVITE retransmissions: if we already have a call for this
-    // SIP Call-ID, this is a retransmission — absorb it silently.
-    // Without this check, each UDP retransmission would create a new call and
-    // spawn duplicate B-leg INVITEs.
-    if state
-        .call_actors
-        .find_by_sip_call_id(&sip_call_id)
-        .is_some()
-    {
+    // SIP Call-ID, this is a retransmission. It creates no second call (each
+    // UDP retransmission would otherwise spawn duplicate B-leg INVITEs), and
+    // it is answered: a caller retransmits because it has seen no provisional,
+    // so the most recent one goes out again (RFC 3261 §17.2.1). Left unanswered
+    // it keeps retransmitting until a response does get through.
+    if let Some(existing_call_id) = state.call_actors.find_by_sip_call_id(&sip_call_id) {
+        let reply = state
+            .call_actors
+            .get_call(&existing_call_id)
+            .map(|call| call.invite_retransmission_reply(&via_branch))
+            .unwrap_or(crate::b2bua::actor::InviteRetransmissionReply::Nothing);
         debug!(
             call_id = %sip_call_id,
-            "B2BUA: absorbing INVITE retransmission (call already exists)"
+            ?reply,
+            "B2BUA: INVITE retransmission (call already exists)"
         );
+        match reply {
+            crate::b2bua::actor::InviteRetransmissionReply::Provisional(provisional) => {
+                send_outbound_from(
+                    provisional,
+                    inbound.transport,
+                    inbound.remote_addr,
+                    inbound.connection_id,
+                    Some(inbound.local_addr),
+                    state,
+                );
+            }
+            crate::b2bua::actor::InviteRetransmissionReply::Trying => {
+                let trying =
+                    build_response(&message, 100, "Trying", state.server_header.as_deref(), &[]);
+                send_message_from(
+                    trying,
+                    inbound.transport,
+                    inbound.remote_addr,
+                    inbound.connection_id,
+                    Some(inbound.local_addr),
+                    state,
+                );
+            }
+            crate::b2bua::actor::InviteRetransmissionReply::Nothing => {}
+        }
         return;
     }
 

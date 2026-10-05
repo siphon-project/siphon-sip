@@ -190,6 +190,9 @@ fn prepare_provisionals(
                         state,
                     );
                 }
+                // Kept for a retransmission of the caller's INVITE, which is
+                // owed the most recent provisional again (RFC 3261 §17.2.1).
+                call.a_leg_last_provisional = Some(bytes::Bytes::from(response.to_bytes()));
                 response
             },
         )
