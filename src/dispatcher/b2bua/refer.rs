@@ -850,6 +850,12 @@ pub fn handle_b2bua_refer_on(
         }
     };
 
+    // One transfer at a time: while another is being carried out on this call
+    // the REFER is refused, before an application or a script is shown it.
+    if refuse_refer_during_transfer(&inbound, &message, &call_id, state) {
+        return;
+    }
+
     // Control-plane interception (RFC 3515 on a *controlled* call): when the call
     // has been handed to an external control app, that app owns the transfer
     // decision — NOT the in-process `@b2bua.on_refer` path. Hold the REFER

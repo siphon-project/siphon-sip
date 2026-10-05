@@ -12,7 +12,7 @@
 
 use super::dialog_state_events_tests::{header, inbound, responds, wire, Sent};
 use super::dialog_state_transfer_tests::{
-    control_plane, establish, hang_up, in_dialog, sent_to, Established,
+    answer, control_plane, establish, hang_up, in_dialog, respond, sent_to, Established,
 };
 use super::*;
 use crate::script::api::call::ReferMode;
@@ -208,27 +208,310 @@ async fn a_refer_retransmitted_after_it_was_accepted_gets_its_202_again() {
         assert_eq!(replacements(&controlled), 1, "still the one replacement");
     }
 
-    // A REFER with a new CSeq is not a retransmission, whatever the first is
-    // doing: it is a request of its own, held for a decision of its own.
+    // A REFER with a new CSeq is not a retransmission. The transfer the first
+    // one started is still in flight (its target rings), and a call is
+    // re-paired once at a time, so this one is refused `491`: not held, and
+    // not reported.
     controlled.callee_refers(3);
-    assert!(wire(&controlled.call.dispatcher).is_empty());
-    assert_eq!(controlled.events().await, ["TransferRequested"]);
-    assert_eq!(controlled.state().pending_inbound_refer.len(), 1);
-    // And while that one is undecided, a third is refused `491`, as before.
-    controlled.callee_refers(4);
     let busy = wire(&controlled.call.dispatcher);
     assert_eq!(summaries(&busy), [format!("491 {b}")]);
-    assert_eq!(header(&busy[0].message, "CSeq"), "4 REFER");
+    assert_eq!(header(&busy[0].message, "CSeq"), "3 REFER");
     assert!(controlled.events().await.is_empty());
+    assert_eq!(controlled.state().pending_inbound_refer.len(), 0);
+    assert_eq!(replacements(&controlled), 1, "still the one replacement");
 
-    // The call ends: the held REFER is answered, and nothing is left that
+    // The call ends: nothing is held to answer, and nothing is left that
     // remembers any of them.
     controlled.caller_hangs_up();
     let ended = summaries(&wire(&controlled.call.dispatcher));
-    assert!(ended.contains(&format!("603 {b}")), "{ended:?}");
+    assert!(!ended.contains(&format!("603 {b}")), "{ended:?}");
     assert_eq!(controlled.state().pending_inbound_refer.len(), 0);
     assert_eq!(controlled.state().call_actors.count(), 0);
     assert_eq!(controlled.state().answered_refers.len(), 0);
+}
+
+impl Controlled {
+    /// The caller sends the REFER numbered `cseq` in its dialog.
+    fn caller_refers(&self, cseq: u32) {
+        refer(
+            Some(self.bus.as_ref()),
+            &self.call,
+            self.call.a.1,
+            "<sip:x@example.com>;tag=a-tag",
+            &header(&self.call.answer_to_a, "To"),
+            &self.call.a_call_id,
+            cseq,
+        );
+    }
+
+    /// The transfer target, which siphon dialled with `invite`, answers it
+    /// with `status_code`.
+    fn target_responds(&self, invite: &SipMessage, status_code: u16) {
+        if status_code == 200 {
+            respond(
+                &self.call.dispatcher,
+                &self.call_id,
+                self.call.c.1,
+                invite,
+                answer(invite, self.call.c.1, "c-tag"),
+            );
+        } else {
+            responds(
+                &self.call.dispatcher,
+                &self.call_id,
+                self.call.c.1,
+                invite,
+                status_code,
+                "Busy Here",
+                "c-tag",
+            );
+        }
+    }
+
+    /// The callee's REFER numbered `cseq` is refused `491` and nothing else
+    /// happens: no event, nothing held, nobody dialled.
+    async fn assert_callee_refer_refused(&self, cseq: u32) {
+        self.callee_refers(cseq);
+        let refused = wire(&self.call.dispatcher);
+        assert_eq!(summaries(&refused), [format!("491 {}", self.call.b.1)]);
+        assert_eq!(header(&refused[0].message, "CSeq"), format!("{cseq} REFER"));
+        assert!(self.events().await.is_empty(), "nothing is reported");
+        assert_eq!(self.state().pending_inbound_refer.len(), 0, "nothing held");
+    }
+
+    /// The callee's REFER numbered `cseq` is taken as any REFER is: held for
+    /// its application and reported.
+    async fn assert_callee_refer_taken(&self, cseq: u32) {
+        self.callee_refers(cseq);
+        assert!(wire(&self.call.dispatcher).is_empty(), "held, not answered");
+        assert_eq!(self.events().await, ["TransferRequested"]);
+        assert_eq!(self.state().pending_inbound_refer.len(), 1);
+    }
+}
+
+/// While a transfer siphon carries out is in flight, a new REFER on the call
+/// is refused `491` from either party, without being held or reported. Once
+/// the target refuses and the transfer has failed, a new REFER is taken.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refer_is_refused_while_a_transfer_is_in_flight_and_taken_once_it_fails() {
+    let controlled = controlled(10150);
+    let (a, c) = (controlled.call.a.1, controlled.call.c.1);
+
+    controlled.callee_refers(2);
+    assert_eq!(controlled.events().await, ["TransferRequested"]);
+    assert!(controlled.accept(ReferMode::Terminate));
+    let to_c = sent_to(&wire(&controlled.call.dispatcher), c, Method::Invite)
+        .expect("the target is dialled");
+
+    controlled.assert_callee_refer_refused(3).await;
+    // The other party's REFER is one for the same call.
+    controlled.caller_refers(7);
+    let refused = wire(&controlled.call.dispatcher);
+    assert_eq!(summaries(&refused), [format!("491 {a}")]);
+    assert_eq!(header(&refused[0].message, "CSeq"), "7 REFER");
+    assert!(controlled.events().await.is_empty());
+    assert_eq!(controlled.state().pending_inbound_refer.len(), 0);
+    assert_eq!(replacements(&controlled), 1, "still the one replacement");
+
+    controlled.target_responds(&to_c, 486);
+    let _ = wire(&controlled.call.dispatcher);
+    assert_eq!(replacements(&controlled), 0, "the transfer failed");
+    let _ = controlled.events().await;
+
+    controlled.assert_callee_refer_taken(4).await;
+}
+
+/// The transfer's deadline ends it as a failure does: a new REFER is taken.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refer_is_taken_once_the_transfer_in_flight_runs_out_of_time() {
+    let controlled = controlled(10200);
+    let state = controlled.state();
+
+    controlled.callee_refers(2);
+    assert_eq!(controlled.events().await, ["TransferRequested"]);
+    assert!(controlled.accept(ReferMode::Terminate));
+    let _ = wire(&controlled.call.dispatcher);
+    controlled.assert_callee_refer_refused(3).await;
+
+    if let Some(mut call) = state.call_actors.get_call_mut(&controlled.call_id) {
+        for subscription in call.refer_subscriptions.iter_mut() {
+            subscription.deadline =
+                Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+        }
+    }
+    tokio::task::block_in_place(|| check_b2bua_replacement_timeouts(state));
+    let _ = wire(&controlled.call.dispatcher);
+    assert_eq!(replacements(&controlled), 0, "the transfer ran out of time");
+    let _ = controlled.events().await;
+
+    controlled.assert_callee_refer_taken(4).await;
+}
+
+/// The transfer succeeds: the referrer is released and the caller is with the
+/// target. A REFER from the caller, a new transfer of the new pair, is taken.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refer_is_taken_once_the_transfer_in_flight_has_succeeded() {
+    let controlled = controlled(10250);
+    let c = controlled.call.c.1;
+
+    controlled.callee_refers(2);
+    assert_eq!(controlled.events().await, ["TransferRequested"]);
+    assert!(controlled.accept(ReferMode::Terminate));
+    let to_c = sent_to(&wire(&controlled.call.dispatcher), c, Method::Invite)
+        .expect("the target is dialled");
+    controlled.caller_refers(7);
+    assert_eq!(
+        summaries(&wire(&controlled.call.dispatcher)),
+        [format!("491 {}", controlled.call.a.1)]
+    );
+
+    controlled.target_responds(&to_c, 200);
+    let _ = wire(&controlled.call.dispatcher);
+    assert_eq!(replacements(&controlled), 0, "the transfer completed");
+    let _ = controlled.events().await;
+
+    controlled.caller_refers(8);
+    assert!(wire(&controlled.call.dispatcher).is_empty(), "held");
+    assert_eq!(controlled.events().await, ["TransferRequested"]);
+    assert_eq!(controlled.state().pending_inbound_refer.len(), 1);
+}
+
+/// On a call its script decides for, a REFER arriving while the transfer the
+/// script accepted is in flight is refused before `@b2bua.on_refer` runs: the
+/// handler here accepts every REFER, and nobody is dialled a second time.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_script_is_not_shown_a_refer_while_its_transfer_is_in_flight() {
+    let call = establish(10300, "terminate");
+    let _ = wire(&call.dispatcher);
+    let callee_refers = |cseq: u32| {
+        refer(
+            None,
+            &call,
+            call.b.1,
+            &format!("{};tag=b-tag", header(&call.to_b, "To")),
+            &header(&call.to_b, "From"),
+            &header(&call.to_b, "Call-ID"),
+            cseq,
+        )
+    };
+    let accepted = [
+        format!("202 {}", call.b.1),
+        format!("NOTIFY {}", call.b.1),
+        format!("INVITE {}", call.c.1),
+    ];
+    callee_refers(2);
+    let sent = wire(&call.dispatcher);
+    assert_eq!(summaries(&sent), accepted);
+    let to_c = sent_to(&sent, call.c.1, Method::Invite).expect("the target is dialled");
+
+    callee_refers(3);
+    let refused = wire(&call.dispatcher);
+    assert_eq!(summaries(&refused), [format!("491 {}", call.b.1)]);
+    assert_eq!(header(&refused[0].message, "CSeq"), "3 REFER");
+
+    // The target refuses: the transfer is over, and the next REFER is the
+    // script's to decide again.
+    responds(
+        &call.dispatcher,
+        &call.call_id(),
+        call.c.1,
+        &to_c,
+        486,
+        "Busy Here",
+        "c-tag",
+    );
+    let _ = wire(&call.dispatcher);
+    callee_refers(4);
+    assert_eq!(summaries(&wire(&call.dispatcher)), accepted);
+}
+
+/// A REFER relayed to the far end is a transfer in flight until the far end
+/// answers it: another REFER meanwhile is refused `491` and not relayed. Once
+/// the far end has answered, a new REFER is relayed as the first was.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refer_is_refused_while_a_relayed_refer_awaits_the_far_end() {
+    let call = establish(10350, "transparent");
+    let _ = wire(&call.dispatcher);
+    let (a, b) = (call.a.1, call.b.1);
+    let callee_refers = |cseq: u32| {
+        refer(
+            None,
+            &call,
+            b,
+            &format!("{};tag=b-tag", header(&call.to_b, "To")),
+            &header(&call.to_b, "From"),
+            &header(&call.to_b, "Call-ID"),
+            cseq,
+        )
+    };
+    callee_refers(2);
+    let sent = wire(&call.dispatcher);
+    assert_eq!(summaries(&sent), [format!("REFER {a}")]);
+    let relayed = sent_to(&sent, a, Method::Refer).expect("the relayed REFER");
+
+    callee_refers(3);
+    let refused = wire(&call.dispatcher);
+    assert_eq!(
+        summaries(&refused),
+        [format!("491 {b}")],
+        "refused, and not relayed"
+    );
+    assert_eq!(header(&refused[0].message, "CSeq"), "3 REFER");
+
+    responds(
+        &call.dispatcher,
+        &call.call_id(),
+        a,
+        &relayed,
+        202,
+        "Accepted",
+        "a-tag",
+    );
+    assert_eq!(summaries(&wire(&call.dispatcher)), [format!("202 {b}")]);
+
+    callee_refers(4);
+    assert_eq!(
+        summaries(&wire(&call.dispatcher)),
+        [format!("REFER {a}")],
+        "the far end has answered: a new REFER is relayed"
+    );
+}
+
+/// A `replace_peer` in flight is a transfer in flight: a REFER on the call is
+/// refused `491` until its target has refused, and is then taken.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refer_is_refused_while_a_replace_peer_is_in_flight() {
+    let controlled = controlled(10400);
+    let state = controlled.state();
+    let c = controlled.call.c.1;
+
+    let started = tokio::task::block_in_place(|| {
+        b2bua_replace_peer_with_state(
+            state,
+            &controlled.call.a_call_id,
+            &controlled.call.c_uri(),
+            None,
+            false,
+            None,
+            None,
+            30,
+            &ReplacementDial::default(),
+        )
+    });
+    assert!(started.is_ok(), "{started:?}");
+    let to_c = sent_to(&wire(&controlled.call.dispatcher), c, Method::Invite)
+        .expect("the target is dialled");
+    let _ = controlled.events().await;
+
+    controlled.assert_callee_refer_refused(2).await;
+    assert_eq!(replacements(&controlled), 1, "the replacement rings on");
+
+    controlled.target_responds(&to_c, 486);
+    let _ = wire(&controlled.call.dispatcher);
+    assert_eq!(replacements(&controlled), 0, "the replacement failed");
+    let _ = controlled.events().await;
+
+    controlled.assert_callee_refer_taken(3).await;
 }
 
 /// A REFER relayed to the far end is not relayed a second time when it is

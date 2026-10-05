@@ -859,6 +859,16 @@ One decision is pending per call. A retransmission of the held REFER is
 absorbed; a second REFER on the same call while the first is undecided is
 answered `491 Request Pending`.
 
+A call also carries out one transfer at a time. While a transfer siphon is
+carrying out is in flight (an `accept_refer` in `terminate` mode or a
+`replace_peer` whose target has not answered, failed or run out of time), and
+while a REFER relayed in `transparent` mode has not been answered by the far
+end, a REFER from either party is answered `491 Request Pending` and is not
+reported: accepting it would start a second replacement of the same pair. Once
+the first has concluded, with `PeerReplaced`, `ReplaceFailed` or the far end's
+response, a REFER is reported as usual. RFC 3261 §21.4.27 has the referrer try
+again later.
+
 A REFER is reported once. After the decision, a retransmission of it (same
 Call-ID, CSeq and Via branch, RFC 3261 §17.2.3) gets the final response the
 decision produced, again, for 64·T1 (32 s): the `202`, the code `reject_refer`

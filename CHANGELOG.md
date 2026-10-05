@@ -452,6 +452,28 @@ entry, but a working config keeps working.
   already reported `DialFailed` ahead of its reply and is unchanged. A dial's
   task also lets go only of its own claim on the caller, so one that ends
   late cannot release a dial placed after it.
+- **A call carries out one transfer at a time: a REFER that arrives while
+  another is in flight is refused `491 Request Pending`.** A REFER with a new
+  CSeq was taken as a request of its own whatever its call was doing. While
+  the target of a transfer siphon carries out was still ringing, a second
+  REFER was held for the controlling application and reported as another
+  `TransferRequested`, or run through `@b2bua.on_refer` on a call its script
+  decides for, where an `accept_refer()` answered a second `202` and dialled
+  a second target for the same pair; with a REFER relayed in `transparent`
+  mode still waiting for the far end, the second was relayed on top of it.
+  The two targets' answers would then each re-pair the call against a pair
+  the other had changed. RFC 3515 lets a referrer send several REFERs in a
+  dialog but does not oblige the recipient to carry them out together, and a
+  `491` (RFC 3261 §21.4.27) asks for the request again later. A REFER from
+  either party is now refused `491`, with no event and no script hook, while
+  a leg replacement is in flight on its call (an accepted `terminate`
+  transfer or a `replace_peer` whose target has not answered, failed or run
+  out of time) and while a REFER relayed to the far end has not been
+  answered. Once that
+  transfer has succeeded, failed or reached its deadline a REFER is taken as
+  before, and a retransmission of the REFER being carried out still gets its
+  own `202` again. A second REFER while one is undecided, and one during a
+  transfer in `controller` mode, were already refused this way.
 
 ### Changed
 

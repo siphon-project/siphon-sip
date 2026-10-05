@@ -677,12 +677,9 @@ pub fn b2bua_replace_peer_with_state(
         // Two replacements at once would race for the same promotion slot: the
         // second target's 2xx would promote against a pair the first already
         // changed. `push_refer_subscription` is a bare push with no dedup, so
-        // this is the only thing standing between a caller and that race.
-        if call
-            .refer_subscriptions
-            .iter()
-            .any(|subscription| subscription.siphon_notifies)
-        {
+        // this is what stands between a controller and that race; a REFER is
+        // held off by the same test (`refuse_refer_during_transfer`).
+        if call.replacement_in_flight() {
             return Err(ReplaceError::ReplacementInFlight {
                 id: sip_call_id.to_string(),
             });

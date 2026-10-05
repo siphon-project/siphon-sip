@@ -157,6 +157,29 @@ impl AnsweredReferStore {
         })
     }
 
+    /// Whether a REFER other than `request` is still being carried out on
+    /// `call_id`: handed to a script that has not decided yet, or relayed to
+    /// the far end, whose response has not come back. Asked for every new
+    /// REFER on a tracked call, so it stays cheap when nothing is remembered.
+    pub fn another_proceeding(
+        &self,
+        call_id: &str,
+        request: &SipMessage,
+        now: std::time::Instant,
+    ) -> bool {
+        if self.entries.is_empty() {
+            return false;
+        }
+        let identity = RequestIdentity::of(request);
+        self.entries.get(call_id).is_some_and(|answered| {
+            answered.iter().any(|known| {
+                known.response.is_none()
+                    && known.expires > now
+                    && Some(&known.identity) != identity.as_ref()
+            })
+        })
+    }
+
     /// Forget everything remembered for a call that is ending.
     pub fn forget_call(&self, call_id: &str) {
         if self.entries.is_empty() {
@@ -226,6 +249,48 @@ pub fn answer_refer_retransmission(
         }
         None => false,
     }
+}
+
+/// Refuse a new REFER that arrives while its call is still carrying out a
+/// transfer. Returns whether it was refused.
+///
+/// A call is re-paired once at a time. While a leg replacement is in flight (a
+/// REFER accepted for siphon to carry out, or a `replace_peer`, whose target
+/// has neither answered nor failed nor run out of time), and while a REFER
+/// relayed to the far end or handed to a script has not been answered, another
+/// REFER on the call is refused `491 Request Pending` (RFC 3261 §21.4.27):
+/// neither held for an application nor shown to `@b2bua.on_refer`, since
+/// accepting it would start a second replacement on the same pair. RFC 3515
+/// lets a referrer send several REFERs in a dialog; it does not oblige the
+/// recipient to carry them out together, and a `491` asks for it again later.
+/// Once the first transfer has concluded a REFER is taken as usual.
+///
+/// A retransmission of the REFER being carried out is not this: it was
+/// answered from [`AnsweredReferStore`] before this is asked.
+pub fn refuse_refer_during_transfer(
+    inbound: &InboundMessage,
+    message: &SipMessage,
+    call_id: &str,
+    state: &DispatcherState,
+) -> bool {
+    let replacing = state
+        .call_actors
+        .get_call(call_id)
+        .is_some_and(|call| call.replacement_in_flight());
+    let in_flight = replacing
+        || state
+            .answered_refers
+            .another_proceeding(call_id, message, std::time::Instant::now());
+    if !in_flight {
+        return false;
+    }
+    warn!(
+        call_id = %call_id,
+        replacing,
+        "B2BUA REFER: another transfer is still being carried out on this call — 491"
+    );
+    b2bua_refer_send_final(inbound, message, 491, "Request Pending", state);
+    true
 }
 
 /// Remember the final response `response` to a REFER, for its
@@ -425,6 +490,36 @@ mod tests {
             status(store.replay("call", &request, now + REFER_TRANSACTION_LIFETIME)),
             Some(Some(202)),
             "kept for 64*T1 from the response, not from the request"
+        );
+    }
+
+    /// A REFER still being carried out is another request's reason to wait,
+    /// never its own retransmission's, and only until it is answered or its
+    /// transaction runs out.
+    #[test]
+    fn a_refer_being_carried_out_is_seen_by_another_request_until_it_is_answered() {
+        let store = AnsweredReferStore::default();
+        let now = std::time::Instant::now();
+        let first = refer("call@192.0.2.10", 2, "z9hG4bK-two");
+        let second = refer("call@192.0.2.10", 3, "z9hG4bK-three");
+        assert!(!store.another_proceeding("call", &second, now), "nothing");
+
+        store.proceeding("call", &first, now);
+        assert!(store.another_proceeding("call", &second, now));
+        assert!(
+            !store.another_proceeding("call", &first, now),
+            "its own retransmission is not another request"
+        );
+        assert!(!store.another_proceeding("another-call", &second, now));
+        assert!(
+            !store.another_proceeding("call", &second, now + REFER_TRANSACTION_LIFETIME),
+            "a REFER nobody answered stops holding the call when its transaction ends"
+        );
+
+        store.answered("call", &response(&first, 202, "Accepted"), now);
+        assert!(
+            !store.another_proceeding("call", &second, now),
+            "answered: nothing is being carried out"
         );
     }
 
