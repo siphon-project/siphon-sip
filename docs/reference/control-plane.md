@@ -888,6 +888,15 @@ The app decides with:
   no leg, and refuses them `bad_request` rather than accepting and ignoring
   them.
 
+  A target siphon can send no INVITE to (it does not resolve, or no contact
+  of it can be reached) still gets the REFER answered: the `202` and the
+  `100 Trying` NOTIFY go out, and the subscription is then ended with a
+  sipfrag `503 Service Unavailable`, `Subscription-State:
+  terminated;reason=noresource` (RFC 3515 §2.4.5). The app hears
+  `ReplaceFailed {status: 503, call_kept: true, origin: "refer"}` and the call
+  keeps both its parties. With several targets, the ones that could be
+  dialled ring on and decide the transfer between them.
+
   `mode: "controller"` is the third mode, and the one where siphon does no
   transferring at all. See
   [below](#a-transfer-the-application-carries-out).
@@ -1779,7 +1788,7 @@ ringing. The verdict arrives as an event:
 | event | payload | when |
 |---|---|---|
 | `PeerReplaced` | `{target_sip_call_id, replaced_leg_released, origin}` | the target answered, was promoted into the pair, and the replaced leg was released |
-| `ReplaceFailed` | `{status, call_kept, origin}` | the target refused, or never answered (`status: 408`). With several contacts ringing: once, when none of them is left, with the best of their responses |
+| `ReplaceFailed` | `{status, call_kept, origin}` | the target refused, or never answered (`status: 408`). With several contacts ringing: once, when none of them is left, with the best of their responses. For an accepted REFER also when no INVITE could be sent to any target (`status: 503`) |
 
 Branch on `ReplaceFailed.call_kept`: normally the original call is intact and
 still has both parties, so another target can be tried on the same channel. It
@@ -1792,7 +1801,7 @@ Refusals are typed the same way as `bridge`'s:
 
 | code | when |
 |---|---|
-| `bad_request` | no `args.target`, a target or `next_hop` that will not parse, a nonsense `timeout`, or a target siphon cannot route to |
+| `bad_request` | no `args.target`, a target or `next_hop` that will not parse, a nonsense `timeout`, or a target siphon cannot route to. Nothing was dialled and no event follows: the reply is the outcome, the call is as it was, and another `replace_peer` can follow at once |
 | `not_found` | no such channel, or the call is already gone |
 | `invalid_state` | the call has not answered, has no peer leg to replace, or already has a replacement in flight — all worth retrying later |
 | `unavailable` | the B2BUA is not running |

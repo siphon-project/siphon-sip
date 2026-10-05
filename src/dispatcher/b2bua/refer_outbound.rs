@@ -571,14 +571,49 @@ pub(crate) fn b2bua_replace_peer_dialling(
     timeout_secs: u32,
     dial: &ReplacementDial,
 ) -> Result<(), crate::b2bua::transfer::ReplaceError> {
-    use crate::b2bua::transfer::{ReplaceError, ReplacementOrigin};
-
     let Some(control) = B2BUA_CONTROL.get() else {
-        return Err(ReplaceError::Unavailable(
+        return Err(crate::b2bua::transfer::ReplaceError::Unavailable(
             "B2BUA is not running".to_string(),
         ));
     };
-    let state = &control.state;
+    // The send path re-anchors media (block_in_place) and may spawn (TCP/TLS
+    // connect); the caller may be on a non-tokio thread (a script handler, a
+    // timer, the control apply task).
+    let _enter = control.runtime.enter();
+    b2bua_replace_peer_with_state(
+        &control.state,
+        sip_call_id,
+        target,
+        next_hop,
+        replace_a_leg,
+        media_profile,
+        number_shape,
+        timeout_secs,
+        dial,
+    )
+}
+
+/// [`b2bua_replace_peer_dialling`] on the dispatcher in hand, from a thread
+/// already inside its runtime.
+///
+/// A target no INVITE could be sent to is refused
+/// [`Unroutable`](crate::b2bua::transfer::ReplaceError::Unroutable) with the
+/// call as it was: the replacement that was opened for it is ended before this
+/// returns, so it does not hold off the next one.
+#[allow(clippy::too_many_arguments)]
+pub fn b2bua_replace_peer_with_state(
+    state: &DispatcherState,
+    sip_call_id: &str,
+    target: &str,
+    next_hop: Option<&str>,
+    replace_a_leg: bool,
+    media_profile: Option<&str>,
+    number_shape: Option<&crate::script::api::numbers::NumberShape>,
+    timeout_secs: u32,
+    dial: &ReplacementDial,
+) -> Result<(), crate::b2bua::transfer::ReplaceError> {
+    use crate::b2bua::transfer::{ReplaceError, ReplacementOrigin};
+
     let Some(internal_call_id) = state.call_actors.find_by_sip_call_id(sip_call_id) else {
         return Err(ReplaceError::UnknownCall {
             id: sip_call_id.to_string(),
@@ -627,11 +662,6 @@ pub(crate) fn b2bua_replace_peer_dialling(
             id: sip_call_id.to_string(),
         });
     }
-
-    // The send path re-anchors media (block_in_place) and may spawn (TCP/TLS
-    // connect); the caller may be on a non-tokio thread (a script handler, a
-    // timer, the control apply task).
-    let _enter = control.runtime.enter();
 
     let dialed = b2bua_start_leg_replacement(
         &internal_call_id,

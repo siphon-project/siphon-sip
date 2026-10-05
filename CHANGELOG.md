@@ -86,6 +86,21 @@ entry, but a working config keeps working.
 
 ### Fixed
 
+- **A transfer whose target cannot be dialled ends its subscription and
+  leaves the call free.** A siphon-terminated REFER answers `202` and sends
+  the `100 Trying` NOTIFY before it dials. When no INVITE could then be sent
+  for any target (it does not resolve, or no contact of it can be reached),
+  nothing ever ended the subscription: the referrer waited on it (RFC 3515
+  §2.4.5 has it end with a final NOTIFY), and the replacement stayed recorded
+  on the call, so every later `replace_peer` there was refused as already in
+  flight. `replace_peer` itself was refused `bad_request` for such a target
+  and left the same record behind. The replacement now fails as one whose
+  targets all refused: the referrer gets a NOTIFY with a `503 Service
+  Unavailable` sipfrag and `Subscription-State: terminated;reason=noresource`,
+  a controlling application gets `ReplaceFailed` with status 503, and the call
+  keeps both its parties with nothing pending. `replace_peer` is still refused
+  `bad_request`, with no event, and can be sent again at once. With several
+  targets, the ones that were dialled ring on as before.
 - **A transfer target given up on at its deadline has its `487` ACKed.** When
   a siphon-terminated transfer or `replace_peer` ran out of time, siphon sent
   the target a CANCEL and forgot the leg at once, so the `487 Request

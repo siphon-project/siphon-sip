@@ -139,6 +139,27 @@ Two consequences worth knowing when you write handlers:
 * **If the target then fails**, the surviving party has nobody left to talk to,
   so siphon releases it and tears the call down rather than stranding it.
 
+#### When the target cannot be dialled
+
+The `202` goes out before the target is dialled, so a target siphon can send no
+INVITE to (it does not resolve, or none of its contacts can be reached) is found
+out after the referrer was told the transfer is under way. The referrer is not
+left waiting: its subscription is ended with a `NOTIFY` whose sipfrag says
+`503 Service Unavailable` (`Subscription-State: terminated;reason=noresource`,
+RFC 3515 §2.4.5), and the call keeps both its parties.
+
+```
+   Alice (referrer)              siphon
+     |  REFER Refer-To: <target> |
+     |------------------------->|
+     |  202 Accepted            |
+     |<-------------------------|
+     |  NOTIFY sipfrag 100      |
+     |<-------------------------|   (no INVITE can be sent)
+     |  NOTIFY sipfrag 503      |
+     |<-------------------------|   Alice <== still bridged ==> Bob
+```
+
 Rewrite the destination or steer egress without touching what the endpoints see:
 
 ```python
@@ -694,6 +715,10 @@ A target that rejects, or never answers before `timeout`, leaves the call
 **exactly as it was** — the IVR is still there and the caller never knew. That is
 also why `timeout` matters: the target here is a human, and "nobody picked up" is
 an ordinary outcome, not an error case.
+
+A target no INVITE can be sent to is refused on the spot (`bad_request`, a
+`ValueError` in a script), with nothing dialled and nothing left pending on the
+call, so another `replace_peer` can be tried right away.
 
 `replace_a_leg=True` reverses the direction (replace the caller, keep the
 callee). Pass `profile=` when the call is anchored with a direction-bound media

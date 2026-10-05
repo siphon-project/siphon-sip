@@ -224,6 +224,8 @@ mod uas_bad_extension_tests;
 #[cfg(test)]
 mod unacked_answer_tests;
 #[cfg(test)]
+mod undialled_replacement_tests;
+#[cfg(test)]
 mod ws_uri_expansion_tests;
 
 // The imperative call-control surface the scripting, admin and control-plane
