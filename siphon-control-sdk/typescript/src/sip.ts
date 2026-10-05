@@ -135,8 +135,9 @@ export interface ReferReplaces {
  * Who a transfer's new leg is dialled at: a SIP URI, or `{ aor }` — a
  * registered address-of-record, dialled over the flow its phone registered on
  * (the only way to reach one on TCP, TLS or WebSocket behind NAT). An AoR nobody
- * is registered at rejects with `not_found`; one with several registered
- * contacts with `invalid_state` (`details.reason === "several_contacts"`).
+ * is registered at rejects with `not_found`. One with several registered
+ * contacts rings them all: the first to answer is the party brought into the
+ * call, and the server CANCELs the rest.
  */
 export type TransferTarget = string | { aor: string };
 

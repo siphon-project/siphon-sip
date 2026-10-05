@@ -28,9 +28,9 @@ pub enum TransferTarget {
     /// over the flow it registered on and through the Path of its binding —
     /// the only way to reach a phone on TCP, TLS or WebSocket behind NAT.
     ///
-    /// Refused `not_found` when nobody is registered at it, and `invalid_state`
-    /// (`details.reason == "several_contacts"`) when several contacts are: a
-    /// transfer rings one target.
+    /// Refused `not_found` when nobody is registered at it. One with several
+    /// registered contacts rings them all: the first to answer is the party
+    /// brought into the call, and the server CANCELs the rest.
     Aor(String),
 }
 

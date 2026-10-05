@@ -321,7 +321,8 @@ impl Call {
     /// `aor` names the target by its registered address-of-record instead of
     /// a URI: it is dialled over the flow its phone registered on, the only
     /// way to reach one on TCP, TLS or WebSocket. Nobody registered raises
-    /// `not_found`, several contacts `invalid_state`. `from_uri`,
+    /// `not_found`; several registered contacts all ring, the first to answer
+    /// is kept and the rest are CANCELled. `from_uri`,
     /// `from_display`, `p_asserted_identity`, `privacy` and `headers` are the
     /// identity arguments `dial` takes, for the leg the transfer dials. They
     /// and `aor` apply to `mode="terminate"`; `"transparent"` dials no leg.
@@ -546,7 +547,8 @@ impl Call {
     ///
     /// Pass `aor=` instead of `target` to dial a registered address-of-record
     /// over the flow its phone registered on (`not_found` when nobody is
-    /// registered, `invalid_state` when several contacts are). `from_uri`,
+    /// registered; several registered contacts all ring, the first to answer
+    /// is kept and the rest are CANCELled). `from_uri`,
     /// `from_display`, `p_asserted_identity`, `privacy` and `headers` are the
     /// identity arguments `dial` takes, for the new leg.
     #[pyo3(signature = (
