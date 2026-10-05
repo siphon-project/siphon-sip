@@ -1278,11 +1278,18 @@ its bridge offer was, the target's as its bridge re-INVITE was, whichever of
 them re-offers, so a held SRTP phone is still offered SRTP and a held
 plain-RTP caller is still answered plain RTP. A refusal from the other leg goes
 back to the sender with the same status, and the pair's session is put back
-where it was. An offer that crosses one still being relayed, on either leg, is
-refused `491` (RFC 3261 §14.1). A re-INVITE or UPDATE without SDP is a session
-refresh and is answered at once with the session in force, without disturbing
-the other leg. A leg that hangs up mid-relay has the other's pending request
-answered `487`, and one the other leg never answers is answered `408`. The
+where it was. An offer the pair's media session cannot take, or the engine
+refuses, is answered `488`. One relay runs per pair at a time: an offer on
+either leg while either leg still has an offer/answer exchange outstanding is
+refused `491` (RFC 3261 §14.1, RFC 3311 §5.2), and so is any re-INVITE or
+UPDATE that arrives while the bridge is still forming or being parted, when the
+bridge's own re-INVITE is the exchange outstanding on that dialog. On a formed
+bridge a re-INVITE or UPDATE without SDP is a session refresh (RFC 4028 §10)
+and is answered at once without touching the engine or the other leg: a
+re-INVITE with the session in force on that leg as the offer its 2xx has to
+carry (RFC 3261 §14.2), an UPDATE with no body. A leg that hangs up mid-relay
+has the other's pending request answered `487`, and one the other leg never
+answers is answered `408` after 64·T1, with the pair's session put back. The
 `with` leg still has no media session of its own once bridged: media verbs
 address the pair through the target.
 
@@ -1684,18 +1691,24 @@ cannot reach each other.
 siphon does not retry a `491 Request Pending`. It reports the glare and leaves
 the pairing to the controller, which by then may want a different one.
 
-On a call with **no second leg** — one siphon answered itself and anchored on
-the media engine, which is what an IVR, a queue or a voicemail box is — a
-re-INVITE or an UPDATE from the endpoint is answered here, from the engine. A
-hold arrives as a `sendonly` re-offer and is answered `recvonly` (RFC 3264
-§6.1); an offerless refresh is answered with the leg's current media, because
-RFC 3261 §13.2.1 makes the `2xx` to an offerless INVITE carry the offer. A call
-with no media backend takes a `200` with no body. Nothing is forwarded, because
-there is nowhere to forward it.
+On a call with **no second leg** that is not bridged to another — one siphon
+answered itself and anchored on the media engine, which is what an IVR, a queue
+or a voicemail box is — a re-INVITE or an UPDATE from the endpoint is answered
+here, from the engine. A hold arrives as a `sendonly` re-offer and is answered
+`recvonly` (RFC 3264 §6.1); an offerless refresh is answered with the leg's
+current media, because RFC 3261 §13.2.1 makes the `2xx` to an offerless INVITE
+carry the offer. A call with no media backend takes a `200` with no body.
+Nothing is forwarded, because there is nowhere to forward it.
 
-**Known limitation.** While a pair is **bridged**, a re-INVITE *from* one of the
-endpoints is still answered `491 Request Pending` rather than relayed across the
-bridge.
+While a pair is **bridged**, a re-INVITE or an UPDATE carrying SDP *from* one of
+the endpoints is relayed across the bridge to the other leg, and the other leg's
+answer comes back as its 200 (see
+[A re-offer on a formed bridge](#joining-two-legs-bridge)). It is answered `491
+Request Pending` only for glare (RFC 3261 §14.1, RFC 3311 §5.2): while an offer
+on either leg of the pair is still being relayed, and while the bridge is still
+forming or being parted, when siphon's own re-INVITE is the offer outstanding on
+that dialog. siphon does not hold or retry the refused request; the endpoint
+retries it, as RFC 3261 §14.1 has it.
 
 In-process, the same primitives are
 [`b2bua.bridge(...)` / `b2bua.unbridge(...)`](call.md#joining-two-calls-b2buabridge).
