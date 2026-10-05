@@ -1629,3 +1629,221 @@ def test_stream_verbs_roundtrip():
                 await asyncio.wait_for(run_task, timeout=5)
 
     asyncio.run(scenario())
+
+
+# The identity a transfer's new leg presents, as the keyword arguments name it
+# and as the wire names it: `from` is a Python keyword, so it is `from_uri` here.
+_IDENTITY_KWARGS = {
+    "from_uri": "sip:+15550100000@trunk.example.com",
+    "from_display": "",
+    "p_asserted_identity": "sip:+15550100000@trunk.example.com",
+    "privacy": "restricted",
+    "headers": {"X-Account": "main"},
+}
+_IDENTITY_ARGS = {
+    "from": "sip:+15550100000@trunk.example.com",
+    # An empty display name removes the caller's, so it is sent, not dropped.
+    "from_display": "",
+    "p_asserted_identity": "sip:+15550100000@trunk.example.com",
+    "privacy": "restricted",
+    "headers": {"X-Account": "main"},
+}
+
+
+def test_cancel_dial_and_transfer_verbs_roundtrip():
+    """`cancel_dial`, `play(repeat=...)`, `accept_refer`, `replace_peer` and
+    `complete_refer` emit the exact args the server parses: an AoR target as an
+    object, the identity arguments under their wire names, the controller mode
+    with its timeout only. What the server would refuse raises `ValueError`
+    before a frame goes out."""
+
+    async def scenario():
+        frames = []
+        verbs = {"cancel_dial", "play", "accept_refer", "replace_peer", "complete_refer"}
+
+        def reply(frame):
+            if frame["verb"] == "replace_peer":
+                return {"channel": "ch1", "replacement": "dialing"}
+            return {"channel": "ch1"}
+
+        stub = _verb_stub(verbs, reply, frames)
+        async with websockets.serve(
+            stub, "127.0.0.1", 0, subprotocols=[SUBPROTOCOL]
+        ) as server:
+            port = server.sockets[0].getsockname()[1]
+            url = f"ws://127.0.0.1:{port}/control/ws"
+            client = ControlClient(app=APP, token=TOKEN, url=url)
+            done = asyncio.get_event_loop().create_future()
+
+            async def drive(call):
+                # cancel_dial: the reason only when one is given, so the
+                # server's `cancelled` applies otherwise.
+                await call.cancel_dial()
+                await call.cancel_dial("operator_gave_up")
+                await call.cancel_dial(reason="timer_ran_out")
+
+                # play: a count goes out as a number, and the one string the
+                # server takes goes out as `inf` however it was capitalised.
+                await call.play(file="/prompts/hold.wav", repeat=3)
+                await call.play(file="/prompts/hold.wav", repeat="inf")
+                await call.play(file="/prompts/hold.wav", repeat="INF")
+                for repeat in ("forever", "3", "", -1, 1.5, ["inf"]):
+                    with pytest.raises(ValueError, match="repeat"):
+                        await call.play(file="/prompts/hold.wav", repeat=repeat)
+
+                # accept_refer: nothing named, nothing sent, so the transfer
+                # dials what the referrer asked for in the server's own mode.
+                await call.accept_refer()
+                # An AoR is an object on the wire, where a URI is a string.
+                await call.accept_refer(
+                    mode="terminate",
+                    profile="rtp_passthrough",
+                    aor="sip:3001@example.com",
+                    **_IDENTITY_KWARGS,
+                )
+                await call.accept_refer(
+                    "sip:3002@198.51.100.7", "sip:edge.example.com", "terminate"
+                )
+                # The controller mode: the mode, and the timeout only when given.
+                await call.accept_refer(mode="controller")
+                await call.accept_refer(mode="controller", timeout=30)
+
+                with pytest.raises(ValueError, match="not both"):
+                    await call.accept_refer(
+                        "sip:3002@198.51.100.7", aor="sip:3001@example.com"
+                    )
+                # A controller transfer dials no leg, so every argument that
+                # shapes one is refused beside it.
+                for kwargs in (
+                    {"target": "sip:3002@198.51.100.7"},
+                    {"aor": "sip:3001@example.com"},
+                    {"next_hop": "sip:edge.example.com"},
+                    {"profile": "rtp_passthrough"},
+                    {"from_uri": "sip:+15550100000@trunk.example.com"},
+                    {"from_display": "Main Line"},
+                    {"p_asserted_identity": "sip:+15550100000@trunk.example.com"},
+                    {"privacy": "restricted"},
+                    {"headers": {"X-Account": "main"}},
+                ):
+                    with pytest.raises(ValueError, match="controller"):
+                        await call.accept_refer(mode="controller", timeout=30, **kwargs)
+                # ... and the deadline belongs to that mode alone.
+                for mode in (None, "terminate", "transparent"):
+                    with pytest.raises(ValueError, match="timeout"):
+                        await call.accept_refer(mode=mode, timeout=30)
+                with pytest.raises(ValueError, match="privacy"):
+                    await call.accept_refer(privacy="hidden")
+
+                # replace_peer: the same target and identity arguments.
+                replaced = await call.replace_peer(
+                    aor="sip:3001@example.com",
+                    replace_a_leg=True,
+                    profile="rtp_passthrough",
+                    timeout=20,
+                    **_IDENTITY_KWARGS,
+                )
+                await call.replace_peer(aor="sip:3001@example.com")
+                await call.replace_peer(
+                    "sip:3002@198.51.100.7",
+                    next_hop="sip:edge.example.com",
+                    from_uri="sip:+15550100000@trunk.example.com",
+                )
+                with pytest.raises(ValueError, match="not both"):
+                    await call.replace_peer(
+                        "sip:3002@198.51.100.7", aor="sip:3001@example.com"
+                    )
+                with pytest.raises(ValueError, match="requires a target"):
+                    await call.replace_peer()
+                with pytest.raises(ValueError, match="privacy"):
+                    await call.replace_peer(aor="sip:3001@example.com", privacy="hidden")
+
+                # complete_refer: the reason only when one is given.
+                await call.complete_refer(200)
+                await call.complete_refer(486, "Busy Here")
+                await call.complete_refer(code=503, reason="Service Unavailable")
+                return replaced
+
+            @client.on_call
+            async def handle(call):
+                # A failed expectation above has to fail the test by name, not
+                # as a timeout waiting for a handler that already raised.
+                try:
+                    result = await drive(call)
+                except BaseException as error:  # noqa: BLE001
+                    if not done.done():
+                        done.set_exception(error)
+                    return
+                if not done.done():
+                    done.set_result(result)
+
+            await client.connect()
+            run_task = asyncio.ensure_future(client.run())
+            await asyncio.sleep(0.3)
+            await client.command("test_push_stasis")
+
+            replaced = await asyncio.wait_for(done, timeout=10)
+            assert replaced == {"channel": "ch1", "replacement": "dialing"}
+
+            for frame in frames:
+                assert frame["module"] == "sip"
+                assert frame["target"]["channel"] == "ch1"
+
+            def args_of(verb):
+                return [frame["args"] for frame in frames if frame["verb"] == verb]
+
+            assert args_of("cancel_dial") == [
+                {},
+                {"reason": "operator_gave_up"},
+                {"reason": "timer_ran_out"},
+            ]
+            # Three plays, and none of the six refused ones.
+            assert args_of("play") == [
+                {"file": "/prompts/hold.wav", "repeat": 3},
+                {"file": "/prompts/hold.wav", "repeat": "inf"},
+                {"file": "/prompts/hold.wav", "repeat": "inf"},
+            ]
+            # Five accepts, and none of the fourteen refused ones.
+            assert args_of("accept_refer") == [
+                {},
+                {
+                    "target": {"aor": "sip:3001@example.com"},
+                    "mode": "terminate",
+                    "profile": "rtp_passthrough",
+                    **_IDENTITY_ARGS,
+                },
+                {
+                    "target": "sip:3002@198.51.100.7",
+                    "next_hop": "sip:edge.example.com",
+                    "mode": "terminate",
+                },
+                {"mode": "controller"},
+                {"mode": "controller", "timeout": 30},
+            ]
+            assert args_of("replace_peer") == [
+                {
+                    "target": {"aor": "sip:3001@example.com"},
+                    "replace_a_leg": True,
+                    "profile": "rtp_passthrough",
+                    "timeout": 20,
+                    **_IDENTITY_ARGS,
+                },
+                {"target": {"aor": "sip:3001@example.com"}},
+                {
+                    "target": "sip:3002@198.51.100.7",
+                    "next_hop": "sip:edge.example.com",
+                    "from": "sip:+15550100000@trunk.example.com",
+                },
+            ]
+            assert args_of("complete_refer") == [
+                {"code": 200},
+                {"code": 486, "reason": "Busy Here"},
+                {"code": 503, "reason": "Service Unavailable"},
+            ]
+            # Every frame is accounted for above: nothing refused went out.
+            assert len(frames) == 3 + 3 + 5 + 3 + 3
+
+            client.shutdown()
+            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+                await asyncio.wait_for(run_task, timeout=5)
+
+    asyncio.run(scenario())
