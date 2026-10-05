@@ -54,6 +54,7 @@ pub(crate) mod b2bua;
 mod cancel_ack;
 mod cdr;
 mod charging;
+mod completed_invite;
 mod engine_channel_events;
 mod failure;
 mod identity;
@@ -85,6 +86,8 @@ mod a_leg_reliable_provisional_tests;
 mod advertised_port_tests;
 #[cfg(test)]
 mod b2bua_conclude_once_tests;
+#[cfg(test)]
+mod b2bua_invite_retransmission_tests;
 #[cfg(test)]
 mod b_leg_2xx_ack_tests;
 #[cfg(test)]
@@ -255,6 +258,7 @@ use b2bua::*;
 use cancel_ack::*;
 use cdr::*;
 use charging::*;
+use completed_invite::*;
 use engine_channel_events::*;
 use failure::*;
 use identity::*;
@@ -595,6 +599,7 @@ pub async fn run(
         held_byes: Arc::new(DashMap::new()),
         pending_reinvite_acks: Arc::new(DashMap::new()),
         cancelled_invites: Arc::new(DashMap::new()),
+        completed_invites: CompletedInvites::default(),
         originate_groups: Arc::new(crate::dispatcher::b2bua::OriginateGroupStore::new()),
         dial_bridges: Arc::new(crate::dispatcher::b2bua::DialBridgeStore::new()),
         bridge_relays: Arc::new(crate::dispatcher::b2bua::BridgeRelayStore::new()),
