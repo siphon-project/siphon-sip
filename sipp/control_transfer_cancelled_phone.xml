@@ -1,0 +1,84 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  A phone of the `control-transfer` cases that rings and is then CANCELled
+  (RFC 3261 §9.1): the phone that alerts in the `cancel-dial` case, once for
+  each of its two dials, and the contact that is still ringing when the other
+  answers in the `replace-aor` case.
+
+  recv INVITE -> 180 -> recv CANCEL -> 200 (CANCEL) -> 487 (INVITE) -> recv ACK
+
+  The CANCEL and the ACK are both mandatory rows, and the container runs with
+  -timeout_error, so a phone left ringing or a 487 left unacknowledged
+  (§17.1.1.3) fails the run. The ACK's To-tag is the one this phone put on the
+  487: the INVITE and the CANCEL carried a tagless To, so it can only have been
+  copied from the response being acknowledged.
+
+  The INVITE's Call-ID is echoed to the container's output, where the runner
+  compares it with the other parties' and with what the application was told
+  (sipp/control/run_transfer_case.sh).
+-->
+<scenario name="control-transfer phone that is CANCELled">
+
+  <recv request="INVITE" crlf="true">
+    <action>
+      <ereg regexp="[^[:space:]]+" search_in="hdr" header="Call-ID:" assign_to="wire_call_id" />
+      <ereg regexp="[0-9]+" search_in="hdr" header="CSeq:" assign_to="invite_cseq" />
+      <exec command="echo WIRE-CALL-ID [$wire_call_id]" />
+    </action>
+  </recv>
+
+  <send>
+    <![CDATA[
+SIP/2.0 180 Ringing
+[last_Via:]
+[last_From:]
+[last_To:];tag=[pid]SIPpTag01[call_number]
+[last_Call-ID:]
+[last_CSeq:]
+Contact: <sip:phone@[local_ip]:[local_port];transport=[transport]>
+Content-Length: 0
+
+]]>
+  </send>
+
+  <recv request="CANCEL" timeout="30000" />
+
+  <send>
+    <![CDATA[
+SIP/2.0 200 OK
+[last_Via:]
+[last_From:]
+[last_To:]
+[last_Call-ID:]
+[last_CSeq:]
+Content-Length: 0
+
+]]>
+  </send>
+
+  <!-- The INVITE's final response, on the INVITE's CSeq rather than the
+       CANCEL's that [last_CSeq:] would give. -->
+  <send>
+    <![CDATA[
+SIP/2.0 487 Request Terminated
+[last_Via:]
+[last_From:]
+[last_To:];tag=[pid]SIPpTag01[call_number]
+[last_Call-ID:]
+CSeq: [$invite_cseq] INVITE
+Content-Length: 0
+
+]]>
+  </send>
+
+  <recv request="ACK" timeout="10000">
+    <action>
+      <ereg regexp="tag=.*SIPpTag01"
+            search_in="hdr" header="To:" check_it="true" assign_to="ack_to_tag" />
+      <log message="the 487 was ACKed with its own To-tag: [$ack_to_tag]" />
+    </action>
+  </recv>
+
+</scenario>

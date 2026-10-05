@@ -37,6 +37,7 @@ RUN_VOICE_AI=false
 RUN_CONTROL=false
 RUN_BRIDGE=false
 RUN_DIAL_BRIDGE=false
+RUN_CONTROL_TRANSFER=false
 RUN_REFER_SINGLE_LEG=false
 RUN_REINVITE=false
 RUN_REOFFER=false
@@ -73,6 +74,7 @@ for arg in "$@"; do
     --control)    RUN_CONTROL=true;    SELECTED_MODES+=("$arg") ;;
     --bridge)     RUN_BRIDGE=true;     SELECTED_MODES+=("$arg") ;;
     --dial-bridge) RUN_DIAL_BRIDGE=true; SELECTED_MODES+=("$arg") ;;
+    --control-transfer) RUN_CONTROL_TRANSFER=true; SELECTED_MODES+=("$arg") ;;
     --refer-single-leg) RUN_REFER_SINGLE_LEG=true; SELECTED_MODES+=("$arg") ;;
     --reinvite)   RUN_REINVITE=true;   SELECTED_MODES+=("$arg") ;;
     --reoffer)    RUN_REOFFER=true;    SELECTED_MODES+=("$arg") ;;
@@ -98,6 +100,7 @@ for arg in "$@"; do
       echo "Scenario modes (pick at most ONE per run):"
       echo "  --ipsec --charging --call --presence --rtpengine --rtpproxy --reinvite"
       echo "  --voice-ai --refer-single-leg --reoffer --control --bridge --dial-bridge"
+      echo "  --control-transfer"
       echo "  --b2bua --b2bua-auth --b2bua-invite-auth --gateway --auto100 --http-auth"
       echo "  --wedge --nohandler --banscan --reload --shutdown"
       echo "  --security --rfc4475 --webrtc"
@@ -437,6 +440,42 @@ if [[ "$RUN_DIAL_BRIDGE" == true ]]; then
   docker compose -f "$COMPOSE_FILE" --profile dial-bridge rm -sf \
     sipp-dial-bridge-uac sipp-dial-bridge-phone sipp-dial-bridge-register dial-bridge-app 2>/dev/null || true
   echo "Dial-bridge logs: $DIAL_BRIDGE_LOG_DIR"
+fi
+
+# ── Step 7a4: giving up a dial, a REFER from the callee, replacing a party ──
+# Six cases against one siphon and one persistent control application. Each is
+# a caller plus the detached parties that case needs; run_transfer_case.sh
+# fails a case unless the caller, every party, the application's verdict and
+# the Call-IDs the parties and the application saw all agree.
+if [[ "$RUN_CONTROL_TRANSFER" == true ]]; then
+  echo "=== SIPp control-transfer tests (cancel_dial, inbound REFER, replace_peer, media verbs) ==="
+  docker compose -f "$COMPOSE_FILE" --profile control-transfer up -d --force-recreate --wait \
+    siphon-rtp-engine siphon-control-transfer control-transfer-app
+
+  control_transfer_case() {
+    echo "--- $1 ---"
+    run_sipp bash sipp/control/run_transfer_case.sh "$@"
+  }
+
+  control_transfer_case cancel-dial control_transfer_cancel_dial_uac.xml \
+    sipp-control-transfer-ringing-phone sipp-control-transfer-trying-phone
+  control_transfer_case refer-callee control_transfer_survivor_uac.xml \
+    sipp-control-transfer-referrer-phone sipp-control-transfer-target
+  control_transfer_case refer-controller control_transfer_uac.xml \
+    sipp-control-transfer-controller-referrer-phone sipp-control-transfer-silent-target
+  control_transfer_case replace-aor control_transfer_survivor_uac.xml \
+    sipp-control-transfer-callee-phone sipp-control-transfer-answering-contact \
+    sipp-control-transfer-cancelled-contact
+  control_transfer_case replace-aor-refused control_transfer_probe_uac.xml \
+    sipp-control-transfer-callee-phone sipp-control-transfer-busy-contact \
+    sipp-control-transfer-unavailable-contact
+  control_transfer_case media control_transfer_media_uac.xml \
+    sipp-control-transfer-callee-phone
+
+  CONTROL_TRANSFER_LOG_DIR="$(mktemp -d)"
+  docker compose -f "$COMPOSE_FILE" logs control-transfer-app > "$CONTROL_TRANSFER_LOG_DIR/control-transfer-app.log" 2>&1 || true
+  docker compose -f "$COMPOSE_FILE" logs siphon-control-transfer > "$CONTROL_TRANSFER_LOG_DIR/siphon-control-transfer.log" 2>&1 || true
+  echo "Control-transfer logs: $CONTROL_TRANSFER_LOG_DIR"
 fi
 
 # ── Step 7a2: Single-leg cold transfer (optional) ─────────────────────────
