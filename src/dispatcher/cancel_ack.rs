@@ -63,6 +63,12 @@ pub(super) fn cancel_fork_branches(
         }
         cancel_proxy_branch(client_key, &[], state);
     }
+    // The branches that had already ended when the request got its final
+    // response (they failed while the fork was still open) go now; `exclude`,
+    // the branch whose response is going upstream, is its caller's to release.
+    let client_keys = session.client_keys.clone();
+    drop(session);
+    release_ended_branches(&client_keys, exclude, state);
 }
 
 /// CANCEL one branch of a proxied INVITE, when RFC 3261 §9.1 allows it;
@@ -897,10 +903,24 @@ fn release_cancelled_session(session_arc: &Arc<RwLock<ProxySession>>, state: &Di
         }
     };
     state.session_store.remove_dialog_key(&original_request);
-    for client_key in &client_keys {
-        if !state
-            .transaction_manager
-            .invite_client_is_pending(client_key)
+    release_ended_branches(&client_keys, None, state);
+}
+
+/// Release the branches of a request that has its final response upstream and
+/// that have nothing more to send: every one of `client_keys`, bar `keep`,
+/// whose INVITE is no longer owed a final response. A branch still pending is
+/// released by that response when it comes (or by its timeout); once none is
+/// left the session is gone, without waiting for the sweep.
+pub(super) fn release_ended_branches(
+    client_keys: &[TransactionKey],
+    keep: Option<&TransactionKey>,
+    state: &DispatcherState,
+) {
+    for client_key in client_keys {
+        if Some(client_key) != keep
+            && !state
+                .transaction_manager
+                .invite_client_is_pending(client_key)
         {
             state.session_store.remove_client_key(client_key);
         }

@@ -247,6 +247,12 @@ entry, but a working config keeps working.
   then the INVITE was sent a `487` on top of the final response it already
   had, and `@proxy.on_cancel` ran for a call that had not been cancelled. The
   CANCEL now gets its `200` and nothing else happens.
+- **A settled fork's session is released by its last branch, not by the
+  sweep.** After a 2xx or a 6xx settled a proxy fork, the branches that lost
+  stayed indexed, and the session with them, until the periodic sweep, up to
+  a minute after the request. Each is now released as it ends (the `487` of
+  its CANCEL, a failure of its own, its INVITE timing out), and the session
+  with the last one.
 - **A transfer whose target cannot be dialled ends its subscription and
   leaves the call free.** A siphon-terminated REFER answers `202` and sends
   the `100 Trying` NOTIFY before it dials. When no INVITE could then be sent

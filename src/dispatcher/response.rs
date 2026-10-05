@@ -878,14 +878,14 @@ pub(super) fn handle_response(
             if let (Some(ref aggregator), Some(index)) = (&fork_agg, branch_index) {
                 // Decided and taken under one lock, so a straggler cannot slip
                 // between the fork settling and its chosen response being read.
-                let (fork_action, chosen_response) = match aggregator.lock() {
+                let (fork_action, chosen_response, settled) = match aggregator.lock() {
                     Ok(mut agg) => {
                         let action = agg.on_response(index, status_code, &message);
-                        (action, agg.take_best_response())
+                        (action, agg.take_best_response(), agg.has_settled())
                     }
                     Err(_) => {
                         error!("fork aggregator lock poisoned");
-                        (crate::proxy::fork::ForkAction::ContinueWaiting, None)
+                        (crate::proxy::fork::ForkAction::ContinueWaiting, None, false)
                     }
                 };
 
@@ -896,6 +896,14 @@ pub(super) fn handle_response(
                             branch_index = index,
                             "fork: waiting for more branches"
                         );
+                        // A branch of a fork that has already settled has
+                        // ended with this final response (the 487 of its
+                        // CANCEL, a failure of its own, its timeout): nothing
+                        // more is owed it, and with the last such branch the
+                        // session goes, without waiting for the sweep.
+                        if settled && status_code >= 200 {
+                            state.session_store.remove_client_key(client_key);
+                        }
                         return;
                     }
                     crate::proxy::fork::ForkAction::Forward2xx => {

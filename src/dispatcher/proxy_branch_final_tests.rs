@@ -7,8 +7,8 @@
 //! [`super::proxy_cancel_awaits_provisional_tests`], read off the UDP egress.
 
 use super::proxy_cancel_awaits_provisional_tests::{
-    answers, branch_of, call, fire, relaying_proxy, requests_to, responses_to_caller, FAILED,
-    SILENT,
+    answers, branch_of, call, fire, forking_proxy, relaying_proxy, requests_to,
+    responses_to_caller, the_cancel, DECIDING, FAILED, RINGING, SILENT,
 };
 use super::proxy_dialog_state_tests::{find, header, response_to};
 use super::*;
@@ -82,4 +82,82 @@ async fn a_branch_that_timed_out_is_sent_no_ack() {
         requests_to(&sent, SILENT, Method::Ack).is_empty(),
         "no ACK for a response the branch never sent"
     );
+}
+
+/// Once a fork has settled, each branch that lost is released from the session
+/// store as it ends: by the `487` of its CANCEL, by a failure of its own, by
+/// its INVITE timing out. With the last one the session is gone, and nothing
+/// is left for the periodic sweep to find.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_settled_forks_losing_branches_are_released_as_they_end() {
+    for deciding in [(200, "OK"), (603, "Decline")] {
+        let proxy = forking_proxy(&[DECIDING, RINGING, FAILED, SILENT], "parallel", "");
+        let call_id = format!("losers-released-{}@example.com", deciding.0);
+        let (_, invites) = call(&proxy, &call_id);
+        let (to_deciding, to_ringing, to_failed, to_silent) = (
+            find(&invites, DECIDING).clone(),
+            find(&invites, RINGING).clone(),
+            find(&invites, FAILED).clone(),
+            find(&invites, SILENT).clone(),
+        );
+        let store = &proxy.state.session_store;
+        answers(&proxy, RINGING, &to_ringing, 180, "Ringing");
+        answers(&proxy, FAILED, &to_failed, 486, "Busy Here");
+        assert_eq!(
+            store.client_key_count(),
+            4,
+            "an unsettled fork keeps a branch that failed: its response may be the best"
+        );
+        let _ = proxy.wire();
+
+        answers(&proxy, DECIDING, &to_deciding, deciding.0, deciding.1);
+        let sent = proxy.wire();
+        the_cancel(&sent, RINGING, &to_ringing);
+        assert_eq!(
+            store.client_key_count(),
+            2,
+            "the branches still to end; the one that had failed went with the settling"
+        );
+
+        // A failure of its own, crossing the CANCEL.
+        answers(&proxy, RINGING, &to_ringing, 486, "Busy Here");
+        assert_eq!(store.client_key_count(), 1, "released by its failure");
+        // A provisional is not an end.
+        answers(&proxy, SILENT, &to_silent, 100, "Trying");
+        assert_eq!(store.client_key_count(), 1);
+        fire(&proxy, &to_silent, TimerName::B);
+        assert_eq!(
+            store.client_key_count(),
+            1,
+            "Timer B is over once it has a 1xx"
+        );
+        answers(&proxy, SILENT, &to_silent, 487, "Request Terminated");
+        assert_eq!(store.client_key_count(), 0, "released by its 487");
+        assert_eq!(store.session_count(), 0, "and the session with the last");
+
+        let sent = proxy.wire();
+        assert!(
+            responses_to_caller(&sent).is_empty(),
+            "none of it reaches the caller: {:?}",
+            responses_to_caller(&sent)
+        );
+    }
+}
+
+/// A branch of a settled fork that never responds is released when its INVITE
+/// times out.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_settled_forks_silent_branch_is_released_by_its_timeout() {
+    let proxy = forking_proxy(&[DECIDING, SILENT], "parallel", "");
+    let (_, invites) = call(&proxy, "loser-timeout@example.com");
+    let (to_deciding, to_silent) = (
+        find(&invites, DECIDING).clone(),
+        find(&invites, SILENT).clone(),
+    );
+    answers(&proxy, DECIDING, &to_deciding, 200, "OK");
+    let store = &proxy.state.session_store;
+    assert_eq!(store.client_key_count(), 1);
+    fire(&proxy, &to_silent, TimerName::B);
+    assert_eq!(store.client_key_count(), 0);
+    assert_eq!(store.session_count(), 0);
 }
