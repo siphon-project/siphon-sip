@@ -1,0 +1,2 @@
+# The suite and rtpproxy's tools are checked out here for the image build.
+dist/
