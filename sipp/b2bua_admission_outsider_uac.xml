@@ -1,0 +1,75 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!-- A caller that belongs to no gateway group, placed while the group
+     `carrier-a` is at its inbound limit
+     (sipp/b2bua-admission/siphon-b2bua-admission-gateway.yaml).
+
+     A group's limit is on that group's sources only, so this call is answered:
+     the 200 is the assertion. A 486 here would mean the carrier's ceiling had
+     been applied to somebody else. -->
+
+<scenario name="B2BUA gateway inbound limit: a caller outside the group is not limited">
+
+  <!-- Let the holder's call be answered first. -->
+  <pause milliseconds="2000" />
+
+  <send retrans="500">
+    <![CDATA[
+INVITE sip:outsider@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:outsider@[local_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:outsider@[remote_ip]>
+Call-ID: [call_id]
+CSeq: 1 INVITE
+Contact: <sip:outsider@[local_ip]:[local_port];transport=[transport]>
+Max-Forwards: 70
+Content-Type: application/sdp
+Content-Length: [len]
+
+v=0
+o=outsider 1 1 IN IP[local_ip_type] [local_ip]
+s=-
+c=IN IP[media_ip_type] [media_ip]
+t=0 0
+m=audio [media_port] RTP/AVP 0
+a=rtpmap:0 PCMU/8000
+]]>
+  </send>
+
+  <recv response="100" optional="true" />
+  <recv response="200" rtd="true" crlf="true" />
+
+  <send>
+    <![CDATA[
+ACK sip:outsider@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:outsider@[local_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:outsider@[remote_ip]>[peer_tag_param]
+Call-ID: [call_id]
+CSeq: 1 ACK
+Max-Forwards: 70
+Content-Length: 0
+
+]]>
+  </send>
+
+  <pause milliseconds="1000" />
+
+  <send retrans="500">
+    <![CDATA[
+BYE sip:outsider@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:outsider@[local_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:outsider@[remote_ip]>[peer_tag_param]
+Call-ID: [call_id]
+CSeq: 2 BYE
+Max-Forwards: 70
+Content-Length: 0
+
+]]>
+  </send>
+
+  <recv response="200" crlf="true" />
+
+</scenario>

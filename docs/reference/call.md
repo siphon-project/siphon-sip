@@ -302,6 +302,51 @@ What to size the ceilings by:
 The limits are published as gauges (`0` = unlimited), so utilisation is one
 division: `siphon_b2bua_calls_active / siphon_b2bua_max_concurrent_calls`.
 
+### Limiting one carrier: `gateway.groups[].inbound_limit`
+
+The same block on a gateway group caps the calls arriving **from** that group:
+
+```yaml
+gateway:
+  groups:
+    - name: "carrier-a"
+      source_networks: ["203.0.113.0/24"]
+      inbound_limit:
+        max_concurrent_calls: 300
+        max_calls_per_second: 30
+        reject_code: 486
+      destinations:
+        - uri: "sip:gw1.carrier.example:5060"
+```
+
+A caller belongs to a group when its source address is one the group admits:
+an address its destinations resolve to, or one inside `source_networks`. That
+is the membership `call.from_gateway()` answers from. Calls siphon sends *to*
+the group are not counted.
+
+Everything above holds for a group's limit too, with these differences:
+
+- **The group is judged first.** A carrier over its own limit is answered with
+  its group's `reject_code` and `retry_after_secs`, and takes nothing from the
+  instance. A carrier inside its own limit is still held to
+  `b2bua.inbound_limit`, and that refusal is the instance's.
+- **A source two limited groups admit is counted against both**, and refused by
+  whichever is full.
+- **The CDR names the group**: `refusal_scope` is `gateway` and `gateway_group`
+  is the group's name. The counter is
+  `siphon_gateway_inbound_calls_refused_total{group,reason}`, and
+  `siphon_gateway_inbound_calls_active{group}` over
+  `siphon_gateway_inbound_max_concurrent_calls{group}` is the carrier's
+  utilisation. `GET /admin/gateways` reports the same under `inbound_limit`.
+- **On UDP the source address can be forged**, so a third party can spend a
+  carrier's budget by sending from its address. Over TCP and TLS it cannot.
+- **A changed limit applies to the calls already up.** The count belongs to the
+  group's name, so reloading a provisioned group does not restart it.
+
+Groups a script adds with `gateway.add_group()` cannot carry a limit. A group
+provisioned through `gateway.backend` can: see
+[the provisioning contract](gateway-api.md#inbound-limit).
+
 A retransmission of a refused INVITE is answered with the same response and is
 not counted again (RFC 3261 §17.2.1). A new attempt, which carries a new Via
 branch, is admitted or refused on its own.

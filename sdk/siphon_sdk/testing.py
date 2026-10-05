@@ -199,6 +199,13 @@ class CallResult:
     """On a refused call, the ``Retry-After`` siphon sent, in seconds. ``None``
     when the call was not refused or the header was turned off."""
 
+    refusal_scope: Optional[str] = None
+    """On a refused call, which limit refused it: ``"global"`` for
+    ``b2bua.inbound_limit``, ``"gateway"`` for a gateway group's own."""
+
+    refusal_gateway_group: Optional[str] = None
+    """On a call a gateway group's limit refused, that group's name."""
+
 
 #: Reason phrases for the codes an inbound limit is configured to refuse with.
 _REFUSAL_REASONS = {
@@ -258,10 +265,9 @@ class SipTestHarness:
         self._loop = asyncio.new_event_loop()
         self._hss: Optional[MockHss] = None
         self._pcrf: Optional[MockPcrf] = None
-        self._inbound_limit: Optional[dict[str, int]] = None
+        self._inbound_limit: Optional[mock_module.InboundLimit] = None
         self._inbound_calls: set[str] = set()
         self._inbound_clock: float = 0.0
-        self._inbound_arrival: float = 0.0
 
     # -- inbound limit (b2bua.inbound_limit) ---------------------------------
 
@@ -319,23 +325,21 @@ class SipTestHarness:
         Raises:
             ValueError: ``reject_code`` is not a failure response.
         """
-        if not 400 <= reject_code <= 699:
-            raise ValueError(
-                f"reject_code is {reject_code} — it must be a failure response, 400 to 699."
-            )
-        self._inbound_limit = {
-            "max_concurrent_calls": max_concurrent_calls or 0,
-            "max_calls_per_second": max_calls_per_second or 0,
-            "reject_code": reject_code,
-            "retry_after_secs": retry_after_secs,
-        }
+        limit = mock_module.InboundLimit(
+            max_concurrent_calls, max_calls_per_second, reject_code, retry_after_secs
+        )
+        # The instance's count is every call up, limited or not, so the limit
+        # shares the harness's own set rather than starting one at zero.
+        limit.calls = self._inbound_calls
+        self._inbound_limit = limit
 
     def clear_inbound_limit(self) -> None:
         """Stop enforcing an inbound limit. Calls in progress stay counted."""
         self._inbound_limit = None
 
     def advance_time(self, seconds: float) -> None:
-        """Move the clock ``max_calls_per_second`` is measured against."""
+        """Move the clock every ``max_calls_per_second`` is measured against,
+        this limit's and each gateway group's."""
         self._inbound_clock += seconds
 
     @property
@@ -345,45 +349,56 @@ class SipTestHarness:
         return len(self._inbound_calls)
 
     def _admit_inbound(self, call: Call) -> Optional[CallResult]:
-        """Take a slot for ``call``, or return the refusal it is answered with."""
-        limit = self._inbound_limit
-        if limit is None or _is_emergency_ruri(call.ruri):
-            self._inbound_calls.add(call.id)
-            return None
+        """Take a slot for ``call``, or return the refusal it is answered with.
 
-        ceiling = limit["max_concurrent_calls"]
-        if ceiling and len(self._inbound_calls) >= ceiling:
-            return self._refuse_inbound(call, limit)
+        In siphon's order: a slot in every gateway group that admits the
+        caller's address and has a limit, then one in the instance; only then
+        the rates, groups first. A call refused for a slot has spent no rate.
+        """
+        groups = mock_module.get_gateway().inbound_limits_admitting(call.source_ip)
 
-        rate = limit["max_calls_per_second"]
-        if rate:
-            interval = 1.0 / rate
-            tolerance = interval * (rate - 1)
-            # The generic cell rate algorithm siphon uses: a call conforms
-            # while the next due time is no further ahead than the burst.
-            if self._inbound_arrival > self._inbound_clock + tolerance + 1e-9:
-                return self._refuse_inbound(call, limit)
-            self._inbound_arrival = max(self._inbound_arrival, self._inbound_clock) + interval
+        if not _is_emergency_ruri(call.ruri):
+            for name, limit in groups:
+                if not limit.has_slot():
+                    return self._refuse_inbound(call, limit, "gateway", name)
+            instance = self._inbound_limit
+            if instance is not None and not instance.has_slot():
+                return self._refuse_inbound(call, instance, "global", None)
+            for name, limit in groups:
+                if not limit.take_rate(self._inbound_clock):
+                    return self._refuse_inbound(call, limit, "gateway", name)
+            if instance is not None and not instance.take_rate(self._inbound_clock):
+                return self._refuse_inbound(call, instance, "global", None)
 
         self._inbound_calls.add(call.id)
+        for _, limit in groups:
+            limit.calls.add(call.id)
         return None
 
     @staticmethod
-    def _refuse_inbound(call: Call, limit: dict[str, int]) -> CallResult:
-        code = limit["reject_code"]
+    def _refuse_inbound(
+        call: Call,
+        limit: mock_module.InboundLimit,
+        scope: str,
+        gateway_group: Optional[str],
+    ) -> CallResult:
         refusal = Action(
             kind="refused",
-            status_code=code,
-            reason=_REFUSAL_REASONS.get(code, "Error"),
+            status_code=limit.reject_code,
+            reason=_REFUSAL_REASONS.get(limit.reject_code, "Error"),
         )
         return CallResult(
             call=call,
             actions=[refusal],
-            retry_after_secs=limit["retry_after_secs"] or None,
+            retry_after_secs=limit.retry_after_secs or None,
+            refusal_scope=scope,
+            refusal_gateway_group=gateway_group,
         )
 
     def _release_inbound(self, call: Call) -> None:
         self._inbound_calls.discard(call.id)
+        for limit in mock_module.get_gateway()._inbound_limits.values():
+            limit.calls.discard(call.id)
 
     @property
     def registrar(self) -> mock_module.MockRegistrar:
@@ -435,7 +450,6 @@ class SipTestHarness:
         self._inbound_limit = None
         self._inbound_calls.clear()
         self._inbound_clock = 0.0
-        self._inbound_arrival = 0.0
 
     def load_script(self, path: str) -> None:
         """Load and execute a SIPhon script, registering its handlers.

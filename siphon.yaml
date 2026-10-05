@@ -1627,6 +1627,28 @@ auth:
 #         failure_threshold: 3    # mark down after 3 consecutive failures
 #         from_user: "siphon"     # user part in From URI of OPTIONS probes
 #         from_domain: "sip.example.com"  # host part in From URI (default: local IP)
+#       # Ceiling on the calls arriving FROM this group: from the addresses its
+#       # destinations resolve to plus source_networks, the same membership
+#       # call.from_gateway() answers from. B2BUA mode only. UNSET by default.
+#       #
+#       # Checked on the inbound INVITE before @b2bua.on_invite runs, and
+#       # before b2bua.inbound_limit, so a carrier over its own limit is
+#       # answered with THIS block's reject_code and costs the instance
+#       # nothing. No handler fires for the refused call. A source two limited
+#       # groups admit is counted against both. Calls TO the group are not
+#       # counted. Emergency calls (urn:service:sos) are counted, never refused.
+#       #
+#       # Per instance: N nodes accept N times this from the carrier. On UDP
+#       # the source address is forgeable, so a third party can spend the
+#       # carrier's budget; over TCP/TLS it cannot.
+#       #
+#       # A changed limit applies to the calls already up; it does not restart
+#       # the count. Same keys and defaults as b2bua.inbound_limit.
+#       #   inbound_limit:
+#       #     max_concurrent_calls: 300
+#       #     max_calls_per_second: 30
+#       #     reject_code: 486        # default 503
+#       #     retry_after_secs: 0     # default 1; 0 omits Retry-After
 #       destinations:
 #         # A destination may carry the digest credentials it challenges with,
 #         # so any B-leg sent to it answers a 401/407 (RFC 3261 §22).  Supply a
@@ -2313,6 +2335,9 @@ auth:
 # siphon_b2bua_max_concurrent_calls and siphon_b2bua_max_calls_per_second
 # publish the limits (0 = unlimited), so utilisation is one division:
 #   siphon_b2bua_calls_active / siphon_b2bua_max_concurrent_calls
+#
+# To cap one carrier rather than the instance, see inbound_limit under
+# gateway.groups[] above. Both apply to a call from a limited carrier.
 # b2bua:
 #   inbound_limit:
 #     max_concurrent_calls: 20000

@@ -703,3 +703,186 @@ async fn calls_drain_to_baseline_through_every_ending() {
         .prune(Instant::now() + crate::admission::refused::REFUSAL_TTL);
     assert_eq!(dispatcher.state.refused_invites.len(), 0);
 }
+
+// ── gateway.groups[].inbound_limit ──────────────────────────────────────────
+
+const CARRIER: &str = "203.0.113.10:5060";
+
+/// A manager holding one group, `carrier-a`, whose destination is at
+/// [`CARRIER`] and whose inbound limit is `limits`.
+fn gateway_with_limit(limits: InboundLimits) -> Arc<crate::gateway::DispatcherManager> {
+    use crate::gateway::{Algorithm, Destination, DispatcherGroup, DispatcherManager};
+    let manager = DispatcherManager::new();
+    manager.add_group(
+        DispatcherGroup::new(
+            "carrier-a".to_string(),
+            Algorithm::Weighted,
+            vec![Destination::new(
+                format!("sip:{CARRIER}"),
+                CARRIER.parse().expect("a literal address"),
+                Transport::Udp,
+                1,
+                1,
+            )],
+        )
+        .with_inbound_limits(Some(limits)),
+    );
+    Arc::new(manager)
+}
+
+/// The carrier's `index`th INVITE; everything siphon sent in return.
+fn place_from_carrier(dispatcher: &TestDispatcher, index: usize) -> Vec<Sent> {
+    let raw = caller_invite(index, RURI, "");
+    let invite = parse_sip_message_bytes(raw.as_bytes()).expect("the carrier INVITE parses");
+    let mut inbound = from_caller(dispatcher, &raw);
+    inbound.remote_addr = CARRIER.parse().expect("a literal address");
+    handle_b2bua_invite(inbound, invite, &dispatcher.state);
+    wire(dispatcher)
+}
+
+fn admitted_from_carrier() -> [String; 2] {
+    [format!("100 to {CARRIER}"), format!("INVITE to {CALLEE}")]
+}
+
+/// A carrier over its own limit is refused with its group's response, and a
+/// caller that is not that carrier is not held to it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_carrier_past_its_groups_limit_is_refused_and_other_callers_are_not() {
+    let records = crate::cdr::capture_auto_emitted_cdrs();
+    let mut dispatcher = test_dispatcher_with_script(DIAL);
+    let gateway = gateway_with_limit(InboundLimits {
+        max_concurrent_calls: 1,
+        max_calls_per_second: 0,
+        reject_code: 486,
+        retry_after_secs: 0,
+    });
+    dispatcher.state.gateway = Some(Arc::clone(&gateway));
+
+    assert_eq!(
+        summaries(&place_from_carrier(&dispatcher, 1)),
+        admitted_from_carrier()
+    );
+    let refused_call_id = "admission-gateway-cdr@192.0.2.10";
+    let raw = caller_invite(2, RURI, "").replace(&sip_call_id(2), refused_call_id);
+    let invite = parse_sip_message_bytes(raw.as_bytes()).expect("the carrier INVITE parses");
+    let mut inbound = from_caller(&dispatcher, &raw);
+    inbound.remote_addr = CARRIER.parse().expect("a literal address");
+    handle_b2bua_invite(inbound, invite, &dispatcher.state);
+    let sent = wire(&dispatcher);
+    assert_eq!(summaries(&sent), [format!("486 to {CARRIER}")]);
+    assert_eq!(reason_phrase(&sent[0]), "Busy Here");
+    assert_eq!(retry_after(&sent[0]), None);
+
+    // Another source is admitted while the carrier is at its ceiling.
+    assert_eq!(summaries(&place(&dispatcher, 3)), admitted());
+    assert_eq!(dispatcher.state.admission.active(), 2);
+    assert_eq!(gateway.inbound_usage()[0].active, 1);
+
+    let cdr = records
+        .lock()
+        .expect("the captured CDRs")
+        .iter()
+        .find(|cdr| cdr.call_id == refused_call_id)
+        .cloned()
+        .expect("the refused call wrote a CDR");
+    assert_eq!(cdr.response_code, 486);
+    assert_eq!(cdr.source_ip, "203.0.113.10");
+    for (key, value) in [
+        ("refusal_scope", "gateway"),
+        ("refusal_reason", "concurrent"),
+        ("gateway_group", "carrier-a"),
+    ] {
+        assert_eq!(cdr.extra.get(key).map(String::as_str), Some(value), "{key}");
+    }
+}
+
+/// The group's slot is the call's, like the instance's: it comes back however
+/// the call ends.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_groups_slot_comes_back_on_every_way_a_call_ends() {
+    for ending in ENDINGS {
+        let mut dispatcher = test_dispatcher_with_script(DIAL);
+        let gateway = gateway_with_limit(limits(1, 0));
+        dispatcher.state.gateway = Some(Arc::clone(&gateway));
+
+        let sent = place_from_carrier(&dispatcher, 1);
+        assert_eq!(summaries(&sent), admitted_from_carrier(), "{ending:?}");
+        assert_eq!(
+            summaries(&place_from_carrier(&dispatcher, 2)),
+            [format!("503 to {CARRIER}")],
+            "{ending:?}"
+        );
+
+        end_call(&dispatcher, 1, sent, ending);
+        assert_eq!(gateway.inbound_usage()[0].active, 0, "{ending:?}");
+        assert_eq!(dispatcher.state.admission.active(), 0, "{ending:?}");
+        assert_eq!(
+            summaries(&place_from_carrier(&dispatcher, 3)),
+            admitted_from_carrier(),
+            "{ending:?}"
+        );
+    }
+}
+
+/// A carrier inside its own limit is still held to the instance's, and that
+/// refusal is the instance's: its code, and no slot left taken in the group.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_instance_limit_still_applies_to_a_carrier_inside_its_own() {
+    let mut dispatcher = limited(DIAL, limits(1, 0));
+    let gateway = gateway_with_limit(InboundLimits {
+        max_concurrent_calls: 10,
+        max_calls_per_second: 0,
+        reject_code: 486,
+        retry_after_secs: 0,
+    });
+    dispatcher.state.gateway = Some(Arc::clone(&gateway));
+
+    assert_eq!(summaries(&place(&dispatcher, 1)), admitted());
+    let sent = place_from_carrier(&dispatcher, 2);
+    assert_eq!(summaries(&sent), [format!("503 to {CARRIER}")]);
+    assert_eq!(retry_after(&sent[0]), Some("1"));
+    assert_eq!(gateway.inbound_usage()[0].active, 0);
+}
+
+/// An emergency call from a carrier at its ceiling is admitted, and counted in
+/// the group so the group's figure stays the calls it has up.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_emergency_call_from_a_carrier_at_its_limit_is_admitted_and_counted() {
+    let mut dispatcher = test_dispatcher_with_script(DIAL);
+    let gateway = gateway_with_limit(limits(1, 0));
+    dispatcher.state.gateway = Some(Arc::clone(&gateway));
+    assert_eq!(
+        summaries(&place_from_carrier(&dispatcher, 1)),
+        admitted_from_carrier()
+    );
+
+    let raw = caller_invite(2, "urn:service:sos", "");
+    let invite = parse_sip_message_bytes(raw.as_bytes()).expect("the carrier INVITE parses");
+    let mut inbound = from_caller(&dispatcher, &raw);
+    inbound.remote_addr = CARRIER.parse().expect("a literal address");
+    handle_b2bua_invite(inbound, invite, &dispatcher.state);
+    assert_eq!(summaries(&wire(&dispatcher)), admitted_from_carrier());
+    assert_eq!(gateway.inbound_usage()[0].active, 2);
+}
+
+/// The per-module leak gate for the group half, through the dispatcher.
+#[tokio::test(flavor = "multi_thread")]
+async fn carrier_calls_drain_to_baseline_through_every_ending() {
+    let mut dispatcher = test_dispatcher_with_script(DIAL);
+    let gateway = gateway_with_limit(limits(1, 0));
+    dispatcher.state.gateway = Some(Arc::clone(&gateway));
+    for round in 0..120usize {
+        let index = round * 2;
+        let sent = place_from_carrier(&dispatcher, index);
+        assert_eq!(summaries(&sent), admitted_from_carrier(), "round {round}");
+        assert_eq!(
+            summaries(&place_from_carrier(&dispatcher, index + 1)),
+            [format!("503 to {CARRIER}")],
+            "round {round}"
+        );
+        end_call(&dispatcher, index, sent, ENDINGS[round % ENDINGS.len()]);
+        assert_eq!(gateway.inbound_usage()[0].active, 0, "round {round}");
+        assert_eq!(dispatcher.state.admission.active(), 0, "round {round}");
+        assert_eq!(dispatcher.state.call_actors.count(), 0, "round {round}");
+    }
+}

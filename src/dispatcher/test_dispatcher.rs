@@ -115,6 +115,7 @@ pub(super) fn test_dispatcher_with_script(source: &str) -> TestDispatcher {
         assert_identity: true,
         admission: Arc::new(crate::admission::AdmissionController::unlimited()),
         refused_invites: Arc::new(crate::admission::refused::RefusedInvites::default()),
+        gateway: None,
         registrant_manager: None,
         recording_manager: Arc::new(crate::siprec::RecordingManager::new("siphon", "test")),
         li_siprec_srs_uri: None,

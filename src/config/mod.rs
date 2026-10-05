@@ -509,6 +509,13 @@ impl Config {
                 .validate("b2bua.inbound_limit")
                 .map_err(SiphonError::Config)?;
         }
+        for group in self.gateway.iter().flat_map(|gateway| &gateway.groups) {
+            if let Some(limit) = &group.inbound_limit {
+                limit
+                    .validate(&format!("gateway.groups[{}].inbound_limit", group.name))
+                    .map_err(SiphonError::Config)?;
+            }
+        }
         Ok(())
     }
 

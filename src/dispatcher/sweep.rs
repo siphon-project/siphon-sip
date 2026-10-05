@@ -226,6 +226,9 @@ pub(super) async fn sweep_stale_entries(state: &DispatcherState) {
             dialog_sessions,
         );
         crate::metrics::admission::publish_limits(state.admission.limits());
+        if let Some(gateway) = &state.gateway {
+            crate::metrics::admission::publish_gateway_usage(&gateway.inbound_usage());
+        }
 
         // Carrier burn rate. Iterates the answered calls, so it sits on this
         // 30 s sweep rather than in `publish_store_gauges`, whose contract is
