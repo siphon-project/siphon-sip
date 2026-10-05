@@ -1402,6 +1402,21 @@ answers a parted leg from its dialog alone:
 Neither sends the engine a command or reaches the other leg. A parted leg
 changes its media again when it is bridged: the `bridge` re-offers it.
 
+!!! warning "Limitation: a parted leg cannot change its own media"
+    Between an `unbridge` and the next `bridge`, a leg that sends a re-INVITE
+    or an UPDATE with a changed offer (its own hold or resume, a move to
+    another network address, a different codec list) gets `488 Not Acceptable
+    Here` every time. Its media stays as the `unbridge` left it, on hold, and
+    siphon does not follow a change of address. There is nothing to configure:
+    the leg has no media session of its own to renegotiate.
+
+    What an application can do is not leave a leg parted for long. Bridge it
+    again (to the same leg or another) before it has reason to re-offer: once
+    the bridge has formed, a re-offer on either leg is relayed to the other and
+    answered normally. An endpoint that got the `488` keeps the session it had
+    (RFC 3261 §14.1) and is free to send the offer again later, and one sent
+    after `ChannelBridged` is taken.
+
 **When one leg hangs up.** `on_peer_hangup` decides, and it is fixed when the
 bridge is formed:
 
