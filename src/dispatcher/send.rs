@@ -203,6 +203,7 @@ pub(super) fn send_message_from(
     state: &DispatcherState,
 ) {
     let data = Bytes::from(message.to_bytes());
+    remember_invite_final(&message, &data, state);
 
     debug!(
         destination = %destination,

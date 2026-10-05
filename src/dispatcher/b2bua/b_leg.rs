@@ -268,6 +268,15 @@ pub fn b2bua_dial_b_leg(
         }
         None => None,
     };
+    // Unpinned B-leg to the other address family: it leaves from the listener
+    // bound in that family, so the Via and Contact name that one (see
+    // `family_egress_socket`).
+    let family_egress = if send_socket.is_none() && flow.is_none() {
+        state.family_egress_socket(outbound_transport, destination)
+    } else {
+        None
+    };
+    let send_socket = send_socket.or(family_egress.as_ref());
 
     // The local socket this B-leg is anchored on — `Some` when the script
     // dialled over a captured flow, which is what pins the egress.  The leg
@@ -416,18 +425,7 @@ pub fn b2bua_dial_b_leg(
             .map(str::to_string)
             .or(from_host_override)
             .unwrap_or_else(|| state.via_host(&outbound_transport));
-        if let Some(at_pos) = new_from.find('@') {
-            // Find the end of the host: first occurrence of '>', ':', or ';' after '@'
-            let after_at = &new_from[at_pos + 1..];
-            let host_end = after_at.find(['>', ';', ':']).unwrap_or(after_at.len());
-            let end_pos = at_pos + 1 + host_end;
-            new_from = format!(
-                "{}{}{}",
-                &new_from[..at_pos + 1],
-                from_host,
-                &new_from[end_pos..]
-            );
-        }
+        new_from = crate::b2bua::actor::rewrite_uri_host(&new_from, &from_host);
 
         b_leg_invite.headers.set("From", new_from);
     }
