@@ -553,6 +553,21 @@ entry, but a working config keeps working.
   anchored too, where an offer used to be answered `200` with no body. An
   UPDATE on an answered call, and on a call siphon answered itself, is
   handled as before.
+- **A leg bridged under a pair `profile` is its own again for the next
+  bridge.** `bridge {profile}` shapes and pins both legs by one profile for
+  that pair. The anchor's media session became the pair's and took that
+  profile, and what was kept for the `with` leg's call was what its last
+  bridge had used, so after an `unbridge` a bridge of either leg to another
+  one with no `profile` still shaped and pinned it by the earlier pair's:
+  an anchor answered with plain RTP and no source hint was re-INVITEd with
+  the pair profile's transport and pinned by its `received_from` policy.
+  What a call was first anchored with is now kept for the call the first
+  time a bridge retires its session (the `with` leg) or makes it the pair's
+  (the anchor), and is never rewritten. A later bridge with no `profile`
+  reads it for both legs, in either role; one that names a `profile` still
+  decides for both legs of that pair. A pair that never used a pair profile
+  is shaped and pinned exactly as before. The record goes with its call on
+  every way the call ends.
 
 ### Changed
 

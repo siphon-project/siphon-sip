@@ -1288,9 +1288,12 @@ half for the anchor, whose SDP the offer carries, and its `answer` half for the
 `with` leg. A `with` leg with no media session of its own has no policy of its
 own, and the anchor's profile's `answer` half decides for it. A leg that was the
 `with` side of an earlier bridge is not such a leg: its own session was retired
-when that bridge formed, and what the bridge shaped and pinned it with is kept
-for its call, so bridging it to a different anchor after an `unbridge` still
-offers it its own transport and pins it by its own policy. An unknown
+when that bridge formed, and what it was anchored with is kept for its call,
+so bridging it to a different anchor after an `unbridge` still offers it its
+own transport and pins it by its own policy. The same is kept for the target,
+whose session became the pair's. A `profile` named for one bridge is therefore
+that pair's alone: after an `unbridge`, a bridge of either leg with no
+`profile` goes back to what each leg was first anchored with. An unknown
 profile, or one that is not a non-empty string, is `bad_request` with
 `error.details: {verb: "bridge", argument: "profile", reason:
 "unknown_profile" | "invalid_value"}`, and nothing is touched. The reply echoes

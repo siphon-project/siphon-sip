@@ -367,8 +367,8 @@ pub struct MediaSessionStore {
     /// call not simply named by its own SIP Call-ID. See
     /// [`MediaSessionStore::summary_parties`].
     parties: std::sync::Arc<DashMap<String, EngineParties>>,
-    /// What a bridge shaped and pinned a party with, for each call whose own
-    /// session a bridge retired. See [`own_media`].
+    /// What each call was first anchored with, once a bridge has retired its
+    /// own session or made it a pair's. See [`own_media`].
     own_media: DashMap<String, own_media::Recorded>,
 }
 

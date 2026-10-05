@@ -51,13 +51,16 @@ impl Legs {
     /// `bridge` addressed to `target` naming `with`, accepted by both legs.
     /// Returns once the bridge has formed.
     pub(super) async fn bridge(&self, target: &str, with: &str) {
-        let (reply, _) = command(
-            &self.controller,
-            "bridge",
-            target,
-            serde_json::json!({ "with": with }),
-        )
-        .await;
+        self.bridge_under(target, with, None).await;
+    }
+
+    /// [`Legs::bridge`], naming `profile` for the pair when there is one.
+    pub(super) async fn bridge_under(&self, target: &str, with: &str, profile: Option<&str>) {
+        let mut args = serde_json::json!({ "with": with });
+        if let Some(profile) = profile {
+            args["profile"] = profile.into();
+        }
+        let (reply, _) = command(&self.controller, "bridge", target, args).await;
         assert_eq!(reply["status"], "ok", "{reply}");
         let offer = bridge_offer_to(self.udp(), &self.peer_address).await;
         accepts(
