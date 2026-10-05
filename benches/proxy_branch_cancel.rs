@@ -1,28 +1,34 @@
-//! Criterion bench for what RFC 3261 §9.1 costs the proxy response path.
+//! Criterion bench for what RFC 3261 §9.1 and Timer C cost the proxy response
+//! path.
 //!
 //! Run with `PYO3_PYTHON=python3 cargo bench --bench proxy_branch_cancel`.
 //!
 //! A CANCEL for a proxied INVITE that has drawn no response waits, in that
-//! INVITE's client transaction, for its first provisional. The response path
-//! already holds the transaction when it feeds it a response, so finding out
-//! whether a CANCEL waits is a compare on a field of it: no map read, no lock
-//! and no allocation of its own. These rows are the transaction's step for a
-//! response, which is where that compare sits:
+//! INVITE's client transaction, for its first provisional, and Timer C
+//! (§16.6 step 11) is reset by each 101-199 by storing when it arrived. The
+//! response path already holds the transaction when it feeds it a response,
+//! so both are a step inside it: a compare on a field for the CANCEL, a clock
+//! read and a store for the timer; no map read, no lock, no allocation and no
+//! timer wheel traffic of their own. These rows are the transaction's step
+//! for a response, which is where they sit:
 //!
-//! - `first_provisional` is the datapath: the first 1xx of an INVITE nobody
-//!   asked to cancel, `Calling` to `Proceeding`, with the compare.
+//! - `first_provisional` is the datapath: the first 1xx (a `180`) of an INVITE
+//!   nobody asked to cancel, `Calling` to `Proceeding`, with the compare and
+//!   the stored time.
 //! - `first_provisional_releases_a_cancel` is the same response when a CANCEL
 //!   waited for it and is handed out to be sent.
-//! - `later_provisional` is a 1xx in `Proceeding`, which the change does not
-//!   touch, for scale.
+//! - `later_provisional` is a `180` in `Proceeding`: the stored time alone.
 //! - `final_response_2xx` is a 2xx to an INVITE in `Calling`, the other place
 //!   the compare sits.
+//! - `control/non_invite_provisional` is a 1xx to a non-INVITE client
+//!   transaction, which none of this touches: the row to read the others
+//!   against when comparing two builds, since it moves only with the machine.
 //!
 //! and the request to cancel itself, through the transaction manager as the
 //! dispatcher makes it:
 //!
 //! - `request/deferred` for an INVITE with no response yet (the CANCEL is
-//!   kept);
+//!   built from the INVITE and kept);
 //! - `request/nothing_to_send` for one whose CANCEL already went.
 //!
 //! Fixtures use RFC 5737 addresses and example.com AoRs.
@@ -33,7 +39,7 @@ use bytes::Bytes;
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
 use siphon::sip::message::SipMessage;
 use siphon::sip::parser::parse_sip_message_bytes;
-use siphon::transaction::state::{BranchHop, Ict, IctEvent, Transport};
+use siphon::transaction::state::{BranchHop, Ict, IctEvent, Nict, NictEvent, Transport};
 use siphon::transaction::timer::TimerConfig;
 use siphon::transaction::TransactionManager;
 use siphon::transport::ConnectionId;
@@ -149,6 +155,19 @@ fn bench_response_step(criterion: &mut Criterion) {
             BatchSize::SmallInput,
         );
     });
+
+    // Untouched by the change: the same kind of step on another state machine.
+    let (mut non_invite, _) = Nict::new(frame.clone(), Transport::Udp, TimerConfig::default());
+    criterion.bench_function(
+        "proxy_branch_cancel/control/non_invite_provisional",
+        |bencher| {
+            bencher.iter_batched(
+                || ringing.clone(),
+                |ringing| black_box(non_invite.process(NictEvent::Provisional(ringing))),
+                BatchSize::SmallInput,
+            );
+        },
+    );
 }
 
 fn bench_cancel_request(criterion: &mut Criterion) {
