@@ -1,0 +1,24 @@
+# siphon for the b2bua.inbound_limit cases: one call at a time. The script next
+# to this file answers every call it is handed, so a call that is refused never
+# reached it.
+listen:
+  udp:
+    - "0.0.0.0:5060"
+
+domain:
+  local:
+    - "siphon.test"
+    - "172.20.0.222"
+
+advertised_address: "172.20.0.222"
+
+script:
+  path: "/etc/siphon/scripts/b2bua_admission.py"
+  reload: auto
+
+b2bua:
+  inbound_limit:
+    max_concurrent_calls: 1
+
+log:
+  level: debug

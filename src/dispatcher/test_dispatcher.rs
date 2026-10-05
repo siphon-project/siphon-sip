@@ -113,6 +113,8 @@ pub(super) fn test_dispatcher_with_script(source: &str) -> TestDispatcher {
         // The production default, so a test that does not care about identity
         // still exercises the shape a deployment runs.
         assert_identity: true,
+        admission: Arc::new(crate::admission::AdmissionController::unlimited()),
+        refused_invites: Arc::new(crate::admission::refused::RefusedInvites::default()),
         registrant_manager: None,
         recording_manager: Arc::new(crate::siprec::RecordingManager::new("siphon", "test")),
         li_siprec_srs_uri: None,

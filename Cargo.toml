@@ -243,6 +243,10 @@ harness = false
 name = "dialog_state"      # DialogStateChanged: per-message gate, per-branch match, per-call tracking
 harness = false
 
+[[bench]]
+name = "admission"         # b2bua.inbound_limit: the per-INVITE admission check and the refused-retransmission lookup
+harness = false
+
 [features]
 default = ["redis-backend", "postgres-backend"]
 redis-backend = ["dep:redis"]

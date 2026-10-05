@@ -528,6 +528,11 @@ pub struct CallActor {
     /// retransmitted while the first one's `@b2bua.on_cancel` runs is answered
     /// `200` and nothing more.
     pub cancel_claimed: bool,
+    /// This call's hold on the capacity it was admitted against
+    /// ([`crate::admission`]). Never read: it exists to be dropped with the
+    /// call, which is what releases the slot on every teardown path. `None`
+    /// only for a call built without going through admission, in tests.
+    pub admission: Option<crate::admission::AdmissionPermit>,
 }
 /// The media plan of an offerless originate, resolved when the callee's 2xx
 /// arrives. Names a profile in the media registry rather than carrying resolved
@@ -626,6 +631,7 @@ impl CallActor {
             failure_reroutes: 0,
             failure_concluding: false,
             cancel_claimed: false,
+            admission: None,
         }
     }
 

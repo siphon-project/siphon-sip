@@ -321,6 +321,12 @@ pub fn prepare_originate_routed(
     state
         .call_actors
         .mark_originated(&internal_call_id, &branch);
+    // A call siphon places counts toward the instance's total and is never
+    // refused by it: the ceiling is on what the instance accepts. The call owns
+    // the slot from here, so whichever path removes the call releases it.
+    if let Some(mut call) = state.call_actors.get_call_mut(&internal_call_id) {
+        call.admission = Some(state.admission.admit_unrefused());
+    }
     if let OriginateMedia::Anchor { profile, ws_uri } = &params.media {
         state.call_actors.set_originate_anchor(
             &internal_call_id,

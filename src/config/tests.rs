@@ -5287,3 +5287,86 @@ fn admin_log_tail_unknown_retain_level_is_refused() {
     let error = Config::from_str(&yaml).expect_err("an unknown level must be refused");
     assert!(error.to_string().contains("retain_level"), "{error}");
 }
+
+#[test]
+fn b2bua_inbound_limit_is_unlimited_when_absent() {
+    let config = base_yaml("").expect("a config with no b2bua block");
+    assert_eq!(config.b2bua.inbound_limit, None);
+    let limits = config.b2bua.resolved_inbound_limits();
+    assert!(!limits.is_limited());
+    assert_eq!(limits, crate::admission::InboundLimits::UNLIMITED);
+}
+
+#[test]
+fn b2bua_inbound_limit_parses_and_defaults_the_refusal() {
+    let config = base_yaml(concat!(
+        "b2bua:\n",
+        "  inbound_limit:\n",
+        "    max_concurrent_calls: 20000\n",
+        "    max_calls_per_second: 500\n",
+    ))
+    .expect("a valid inbound limit");
+    assert_eq!(
+        config.b2bua.resolved_inbound_limits(),
+        crate::admission::InboundLimits {
+            max_concurrent_calls: 20000,
+            max_calls_per_second: 500,
+            reject_code: 503,
+            retry_after_secs: 1,
+        }
+    );
+}
+
+#[test]
+fn b2bua_inbound_limit_takes_its_own_reject_code_and_retry_after() {
+    let config = base_yaml(concat!(
+        "b2bua:\n",
+        "  inbound_limit:\n",
+        "    max_concurrent_calls: 10\n",
+        "    reject_code: 486\n",
+        "    retry_after_secs: 0\n",
+    ))
+    .expect("a valid inbound limit");
+    let limits = config.b2bua.resolved_inbound_limits();
+    assert_eq!(limits.reject_code, 486);
+    assert_eq!(limits.retry_after_secs, 0, "0 omits the header");
+    assert_eq!(
+        limits.max_calls_per_second, 0,
+        "an unset ceiling is unlimited"
+    );
+}
+
+#[test]
+fn b2bua_inbound_limit_zero_ceilings_are_unlimited() {
+    // Written down as "no limit", the same reading `max_call_duration_secs: 0`
+    // has. A zero that refused every call would turn a typo into an outage.
+    let config = base_yaml(concat!(
+        "b2bua:\n",
+        "  inbound_limit:\n",
+        "    max_concurrent_calls: 0\n",
+        "    max_calls_per_second: 0\n",
+    ))
+    .expect("zero ceilings load");
+    assert!(!config.b2bua.resolved_inbound_limits().is_limited());
+}
+
+#[test]
+fn b2bua_inbound_limit_reject_code_outside_4xx_to_6xx_is_refused_at_load() {
+    for code in ["200", "302", "399", "700"] {
+        let error = base_yaml(&format!(
+            "b2bua:\n  inbound_limit:\n    max_concurrent_calls: 10\n    reject_code: {code}\n"
+        ))
+        .expect_err("a refusal must be a failure response");
+        let message = error.to_string();
+        assert!(
+            message.contains("b2bua.inbound_limit.reject_code"),
+            "{code}: {message}"
+        );
+    }
+    for code in ["400", "480", "486", "503", "600", "699"] {
+        base_yaml(&format!(
+            "b2bua:\n  inbound_limit:\n    max_concurrent_calls: 10\n    reject_code: {code}\n"
+        ))
+        .unwrap_or_else(|error| panic!("{code} is a failure response: {error}"));
+    }
+}

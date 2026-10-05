@@ -362,6 +362,20 @@ pub fn handle_b2bua_invite(inbound: InboundMessage, message: SipMessage, state: 
         }
     }
 
+    // `b2bua.inbound_limit`: the last gate before this INVITE becomes a call.
+    // After the checks above so that a request they answer spends no capacity,
+    // and before the 100 so that a refused INVITE gets one response, not two.
+    let Some(admission_permit) = super::inbound_admission::admit_inbound_invite(
+        &inbound,
+        &message,
+        &sip_call_id,
+        &via_branch,
+        pending_replaces.is_some(),
+        state,
+    ) else {
+        return;
+    };
+
     // Send 100 Trying immediately to suppress A-leg retransmissions
     // (RFC 3261 §8.2.6.1: SHOULD send 100 within 200ms for INVITE)
     let trying = build_response(&message, 100, "Trying", state.server_header.as_deref(), &[]);
@@ -482,6 +496,9 @@ pub fn handle_b2bua_invite(inbound: InboundMessage, message: SipMessage, state: 
         // call.progress() (which has no `inbound` in scope) sends the UAS
         // response back out the same socket.
         call.a_leg_local_addr = Some(inbound.local_addr);
+        // The call owns its slot from here: whichever path removes the call
+        // drops it, and the drop is the release.
+        call.admission = Some(admission_permit);
     }
     state.call_event_receivers.insert(call_id.clone(), event_rx);
 

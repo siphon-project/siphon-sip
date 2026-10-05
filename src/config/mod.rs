@@ -40,7 +40,7 @@ pub use admin::{
     AdminAuthConfig, AdminCaptureConfig, AdminConfig, AdminLogTailConfig, AdminUiConfig, CorsConfig,
 };
 pub use auth::{AkaCredential, AuthBackendType, AuthConfig, DatabaseAuthConfig, HttpAuthConfig};
-pub use b2bua::{B2buaConfig, SessionRefresher, SessionTimerConfig};
+pub use b2bua::{B2buaConfig, InboundLimitConfig, SessionRefresher, SessionTimerConfig};
 pub use cdr::{CdrFileConfig, CdrHttpConfig, CdrSinkConfig, CdrSyslogConfig, CdrYamlConfig};
 pub use charging::{RfConfig, RoConfig};
 pub use control::{
@@ -498,7 +498,18 @@ impl Config {
         config.validate_listen()?;
         config.validate_timer_intervals()?;
         config.validate_advertised_address()?;
+        config.validate_inbound_limits()?;
         Ok(config)
+    }
+
+    /// Refuse an `inbound_limit` whose refusal is not a failure response.
+    fn validate_inbound_limits(&self) -> Result<()> {
+        if let Some(limit) = &self.b2bua.inbound_limit {
+            limit
+                .validate("b2bua.inbound_limit")
+                .map_err(SiphonError::Config)?;
+        }
+        Ok(())
     }
 
     /// Reject a zero period on a timer siphon runs for the life of the process.

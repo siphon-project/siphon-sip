@@ -13,6 +13,24 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
+### Added
+
+- **`b2bua.inbound_limit` caps the inbound calls a B2BUA instance accepts.**
+  `max_concurrent_calls` and `max_calls_per_second` are both unset by default,
+  so nothing changes until one is set. A call past either is answered `503`
+  with `Retry-After: 1` before `@b2bua.on_invite` runs (`reject_code` and
+  `retry_after_secs` change the answer), so no handler sees it. Calls siphon
+  places, emergency calls (`urn:service:sos`, RFC 5031) and `Replaces`
+  takeovers count toward the total and are never refused. A refused call
+  writes a CDR with `disconnect_initiator: "local"` and `refusal_scope` /
+  `refusal_reason`, and counts in
+  `siphon_b2bua_inbound_calls_refused_total{reason}`. The limits are published
+  as `siphon_b2bua_max_concurrent_calls` and
+  `siphon_b2bua_max_calls_per_second`. The ceilings are per instance, and the
+  rate counts INVITEs, so a digest-challenged call spends two. SDK:
+  `SipTestHarness.set_inbound_limit()`, `CallResult.was_refused`,
+  `CallDetailRecord.is_refused`.
+
 ## [1.12.0] — 2026-09-30
 
 ### Changed

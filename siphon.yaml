@@ -2279,6 +2279,47 @@ auth:
 # b2bua:
 #   assert_identity: false
 
+# Ceiling on the inbound calls this instance accepts, for capacity planning:
+# how many it holds at once and how fast new ones may arrive. UNSET by default,
+# and unset means nothing is refused.
+#
+# Checked on the inbound initial INVITE BEFORE @b2bua.on_invite runs. A call
+# past either ceiling is answered by siphon itself (503 Service Unavailable with
+# Retry-After, RFC 3261 section 21.5.4) and no handler fires for it: the script
+# cannot see, log or re-route a refused call. What records it is a CDR
+# (disconnect_initiator="local", refusal_scope / refusal_reason) and
+# siphon_b2bua_inbound_calls_refused_total{reason}.
+#
+# Only inbound calls are refused. These take a slot, so max_concurrent_calls
+# stays the number of calls the instance is carrying, but are never turned away:
+#   - a call siphon places itself (b2bua.originate, the control plane)
+#   - an emergency call, request URI urn:service:sos[.x] (RFC 5031). An
+#     emergency number dialled as a sip: URI is not recognised
+#   - an INVITE taking over a dialog with Replaces (RFC 3891)
+#
+# max_calls_per_second counts INVITEs, with a burst of one second's worth. A
+# call the script challenges for digest credentials arrives twice (the 407, then
+# the retry), so it spends two: size the rate for that.
+#
+# The ceilings are PER INSTANCE. Behind a load balancer with N nodes, the fleet
+# accepts N times what is written here.
+#
+# reject_code: some peers read a 503 as "this server is down" and move all
+# their traffic elsewhere. That is what an overloaded instance wants; 486 or 480
+# is gentler. Must be 400-699.
+# retry_after_secs: a compliant peer holds its traffic for this long after a
+# 503 (RFC 3261 section 21.5.4). 0 omits the header.
+#
+# siphon_b2bua_max_concurrent_calls and siphon_b2bua_max_calls_per_second
+# publish the limits (0 = unlimited), so utilisation is one division:
+#   siphon_b2bua_calls_active / siphon_b2bua_max_concurrent_calls
+# b2bua:
+#   inbound_limit:
+#     max_concurrent_calls: 20000
+#     max_calls_per_second: 500
+#     reject_code: 503          # default
+#     retry_after_secs: 1       # default; 0 omits Retry-After
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------

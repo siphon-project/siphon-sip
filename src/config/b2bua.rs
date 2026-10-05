@@ -159,9 +159,87 @@ pub struct B2buaConfig {
     ///   assert_identity: false
     /// ```
     pub assert_identity: Option<bool>,
+
+    /// Ceiling on the inbound calls this instance accepts, for capacity
+    /// planning. **Unset by default** — nothing is refused.
+    ///
+    /// Checked on the inbound initial INVITE before `@b2bua.on_invite` runs, so
+    /// a refused call reaches no handler. Calls siphon places itself count
+    /// toward `max_concurrent_calls` but are never refused; neither is an
+    /// emergency call (`urn:service:sos`, RFC 5031) nor an INVITE taking over a
+    /// dialog with `Replaces`.
+    ///
+    /// The ceilings are per instance. `max_calls_per_second` counts INVITEs,
+    /// so a call that is challenged for digest credentials spends two.
+    ///
+    /// ```yaml
+    /// b2bua:
+    ///   inbound_limit:
+    ///     max_concurrent_calls: 20000
+    ///     max_calls_per_second: 500
+    /// ```
+    pub inbound_limit: Option<InboundLimitConfig>,
+}
+
+/// `inbound_limit:` — a ceiling on inbound calls and how a call past it is
+/// answered.
+#[derive(Debug, Deserialize, Clone, Default, PartialEq, Eq)]
+pub struct InboundLimitConfig {
+    /// Calls held at once. Unset or `0` is unlimited.
+    pub max_concurrent_calls: Option<u32>,
+    /// New calls per second, with a burst of one second's worth. Unset or `0`
+    /// is unlimited.
+    pub max_calls_per_second: Option<u32>,
+    /// Status code a refused INVITE is answered with. Default `503`. A peer
+    /// that takes a 503 as "this server is down" and fails all its traffic
+    /// over may be better served by `486` or `480`.
+    pub reject_code: Option<u16>,
+    /// `Retry-After` on the refusal, in seconds. Default `1`; `0` omits the
+    /// header.
+    pub retry_after_secs: Option<u32>,
+}
+
+impl InboundLimitConfig {
+    /// The limits to enforce, with the defaults filled in.
+    pub fn resolved(&self) -> crate::admission::InboundLimits {
+        use crate::admission::InboundLimits;
+        InboundLimits {
+            max_concurrent_calls: self.max_concurrent_calls.unwrap_or(0),
+            max_calls_per_second: self.max_calls_per_second.unwrap_or(0),
+            reject_code: self
+                .reject_code
+                .unwrap_or(InboundLimits::DEFAULT_REJECT_CODE),
+            retry_after_secs: self
+                .retry_after_secs
+                .unwrap_or(InboundLimits::DEFAULT_RETRY_AFTER_SECS),
+        }
+    }
+
+    /// Check the block, naming `field` (its dotted path) in the error.
+    ///
+    /// A refusal is a final failure response: RFC 3261 §21 puts those in
+    /// 4xx-6xx, and a 2xx or 3xx here would answer or redirect the very call
+    /// the limit exists to turn away.
+    pub fn validate(&self, field: &str) -> Result<(), String> {
+        match self.reject_code {
+            Some(code) if !(400..=699).contains(&code) => Err(format!(
+                "{field}.reject_code is {code} — it must be a failure response, 400 to 699."
+            )),
+            _ => Ok(()),
+        }
+    }
 }
 
 impl B2buaConfig {
+    /// The instance-wide inbound limits, unlimited when the block is absent —
+    /// see [`inbound_limit`](Self::inbound_limit).
+    pub fn resolved_inbound_limits(&self) -> crate::admission::InboundLimits {
+        self.inbound_limit
+            .as_ref()
+            .map(InboundLimitConfig::resolved)
+            .unwrap_or(crate::admission::InboundLimits::UNLIMITED)
+    }
+
     /// Whether to assert a `P-Asserted-Identity` on a B-leg that has none.
     /// Defaults to `true` — see [`assert_identity`](Self::assert_identity).
     pub fn assert_identity_enabled(&self) -> bool {

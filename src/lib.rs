@@ -1,6 +1,7 @@
 //! SIPhon — high-performance SIP proxy, B2BUA and IMS platform.
 
 pub mod admin;
+pub mod admission;
 pub mod apiban;
 pub mod auth;
 pub mod b2bua;

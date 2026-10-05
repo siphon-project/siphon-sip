@@ -386,7 +386,10 @@ class CallDetailRecord:
 
     disconnect_initiator: Optional[str] = None
     """Who ended the call: ``"caller"`` | ``"callee"`` | ``"timeout"`` |
-    ``"error"``."""
+    ``"error"`` | ``"local"``.
+
+    ``"local"`` is a call siphon turned away itself before any handler ran —
+    an inbound call past ``b2bua.inbound_limit``. See :attr:`is_refused`."""
 
     sip_reason: Optional[str] = None
     """Reason header value from the BYE (RFC 3326), when present."""
@@ -536,6 +539,35 @@ class CallDetailRecord:
         return [
             LcrAttempt.from_dict(entry) for entry in decoded if isinstance(entry, dict)
         ]
+
+    # -- admission -------------------------------------------------------
+
+    @property
+    def is_refused(self) -> bool:
+        """True for an inbound call siphon refused at admission, before
+        ``@b2bua.on_invite`` ran (``b2bua.inbound_limit``).
+
+        Such a record has :attr:`disconnect_initiator` ``"local"``, the refusal's
+        status in :attr:`response_code` (``503`` unless ``reject_code`` says
+        otherwise), no answer, and no far end: nothing was dialled::
+
+            refused = [r for r in records if r.is_refused]
+            by_reason = Counter(r.refusal_reason for r in refused)
+        """
+        return self.refusal_reason is not None
+
+    @property
+    def refusal_scope(self) -> Optional[str]:
+        """On a refused call, which limit refused it: ``"global"`` for the
+        instance-wide ``b2bua.inbound_limit``. ``None`` on every other record."""
+        return self.extra.get("refusal_scope")
+
+    @property
+    def refusal_reason(self) -> Optional[str]:
+        """On a refused call, which ceiling it hit: ``"concurrent"``
+        (``max_concurrent_calls``) or ``"rate"`` (``max_calls_per_second``).
+        ``None`` on every other record."""
+        return self.extra.get("refusal_reason")
 
     # -- teardown --------------------------------------------------------
 

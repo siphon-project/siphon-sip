@@ -180,6 +180,46 @@ class CallResult:
     def was_terminated(self) -> bool:
         return any(a.kind == "terminate" for a in self.actions)
 
+    @property
+    def was_refused(self) -> bool:
+        """True when siphon refused the call at admission
+        (``b2bua.inbound_limit``), before ``@b2bua.on_invite`` ran.
+
+        The refusal's status is :attr:`status_code`. No handler saw the call,
+        so there is nothing else on the result::
+
+            harness.set_inbound_limit(max_concurrent_calls=1)
+            harness.send_invite()
+            result = harness.send_invite()
+            assert result.was_refused and result.status_code == 503
+        """
+        return any(a.kind == "refused" for a in self.actions)
+
+    retry_after_secs: Optional[int] = None
+    """On a refused call, the ``Retry-After`` siphon sent, in seconds. ``None``
+    when the call was not refused or the header was turned off."""
+
+
+#: Reason phrases for the codes an inbound limit is configured to refuse with.
+_REFUSAL_REASONS = {
+    480: "Temporarily Unavailable",
+    486: "Busy Here",
+    500: "Server Internal Error",
+    503: "Service Unavailable",
+    600: "Busy Everywhere",
+    603: "Decline",
+}
+
+#: Actions that leave a call up after a handler returns.
+_CALL_CONTINUES = {"dial", "fork", "route", "handover", "answer", "progress"}
+
+
+def _is_emergency_ruri(ruri: Any) -> bool:
+    """``urn:service:sos`` or a sub-service of it (RFC 5031)."""
+    text = str(ruri).strip().lower() if ruri is not None else ""
+    prefix = "urn:service:sos"
+    return text == prefix or text.startswith(prefix + ".")
+
 
 class SipTestHarness:
     """High-level test harness for SIPhon scripts.
@@ -218,6 +258,132 @@ class SipTestHarness:
         self._loop = asyncio.new_event_loop()
         self._hss: Optional[MockHss] = None
         self._pcrf: Optional[MockPcrf] = None
+        self._inbound_limit: Optional[dict[str, int]] = None
+        self._inbound_calls: set[str] = set()
+        self._inbound_clock: float = 0.0
+        self._inbound_arrival: float = 0.0
+
+    # -- inbound limit (b2bua.inbound_limit) ---------------------------------
+
+    def set_inbound_limit(
+        self,
+        max_concurrent_calls: Optional[int] = None,
+        max_calls_per_second: Optional[int] = None,
+        reject_code: int = 503,
+        retry_after_secs: int = 1,
+    ) -> None:
+        """Enforce ``b2bua.inbound_limit`` on :meth:`send_invite`.
+
+        Mirrors what siphon does with::
+
+            b2bua:
+              inbound_limit:
+                max_concurrent_calls: 2
+                max_calls_per_second: 10
+
+        A call past either ceiling is refused **before** ``@b2bua.on_invite``
+        runs: no handler fires for it, so a script cannot observe, log or
+        re-route a refused call. The result has :attr:`CallResult.was_refused`
+        set and the refusal's status in :attr:`CallResult.status_code`.
+
+        Two things to size the ceilings by:
+
+        * ``max_calls_per_second`` counts INVITEs. A call the script challenges
+          for digest credentials arrives twice (the 407, then the retry), so it
+          spends two.
+        * The ceilings are per siphon instance.
+
+        A slot is released when the call ends: :meth:`send_bye`,
+        :meth:`send_call_cancel`, a :meth:`send_failure` the handler does not
+        route again, or an ``on_invite`` that rejects, terminates or does
+        nothing. An emergency call (request URI ``urn:service:sos``, RFC 5031)
+        is counted and never refused.
+
+        The rate runs on the harness's own clock, which only
+        :meth:`advance_time` moves, so a test is deterministic::
+
+            harness.set_inbound_limit(max_calls_per_second=1)
+            assert not harness.send_invite().was_refused
+            assert harness.send_invite().was_refused
+            harness.advance_time(1.0)
+            assert not harness.send_invite().was_refused
+
+        Args:
+            max_concurrent_calls: Calls held at once. ``None`` or ``0`` is
+                unlimited.
+            max_calls_per_second: New calls per second, with a burst of one
+                second's worth. ``None`` or ``0`` is unlimited.
+            reject_code: Status a refused call is answered with (400-699).
+            retry_after_secs: ``Retry-After`` on the refusal; ``0`` omits it.
+
+        Raises:
+            ValueError: ``reject_code`` is not a failure response.
+        """
+        if not 400 <= reject_code <= 699:
+            raise ValueError(
+                f"reject_code is {reject_code} — it must be a failure response, 400 to 699."
+            )
+        self._inbound_limit = {
+            "max_concurrent_calls": max_concurrent_calls or 0,
+            "max_calls_per_second": max_calls_per_second or 0,
+            "reject_code": reject_code,
+            "retry_after_secs": retry_after_secs,
+        }
+
+    def clear_inbound_limit(self) -> None:
+        """Stop enforcing an inbound limit. Calls in progress stay counted."""
+        self._inbound_limit = None
+
+    def advance_time(self, seconds: float) -> None:
+        """Move the clock ``max_calls_per_second`` is measured against."""
+        self._inbound_clock += seconds
+
+    @property
+    def inbound_calls_active(self) -> int:
+        """Calls currently holding a slot — what siphon reports as
+        ``siphon_b2bua_calls_active``."""
+        return len(self._inbound_calls)
+
+    def _admit_inbound(self, call: Call) -> Optional[CallResult]:
+        """Take a slot for ``call``, or return the refusal it is answered with."""
+        limit = self._inbound_limit
+        if limit is None or _is_emergency_ruri(call.ruri):
+            self._inbound_calls.add(call.id)
+            return None
+
+        ceiling = limit["max_concurrent_calls"]
+        if ceiling and len(self._inbound_calls) >= ceiling:
+            return self._refuse_inbound(call, limit)
+
+        rate = limit["max_calls_per_second"]
+        if rate:
+            interval = 1.0 / rate
+            tolerance = interval * (rate - 1)
+            # The generic cell rate algorithm siphon uses: a call conforms
+            # while the next due time is no further ahead than the burst.
+            if self._inbound_arrival > self._inbound_clock + tolerance + 1e-9:
+                return self._refuse_inbound(call, limit)
+            self._inbound_arrival = max(self._inbound_arrival, self._inbound_clock) + interval
+
+        self._inbound_calls.add(call.id)
+        return None
+
+    @staticmethod
+    def _refuse_inbound(call: Call, limit: dict[str, int]) -> CallResult:
+        code = limit["reject_code"]
+        refusal = Action(
+            kind="refused",
+            status_code=code,
+            reason=_REFUSAL_REASONS.get(code, "Error"),
+        )
+        return CallResult(
+            call=call,
+            actions=[refusal],
+            retry_after_secs=limit["retry_after_secs"] or None,
+        )
+
+    def _release_inbound(self, call: Call) -> None:
+        self._inbound_calls.discard(call.id)
 
     @property
     def registrar(self) -> mock_module.MockRegistrar:
@@ -262,9 +428,14 @@ class SipTestHarness:
     def reset(self) -> None:
         """Reset all mock state between tests.
 
-        Clears: handlers, registrar, auth, cache, log, rtpengine.
+        Clears: handlers, registrar, auth, cache, log, rtpengine, and the
+        inbound limit with every slot held against it.
         """
         mock_module.reset()
+        self._inbound_limit = None
+        self._inbound_calls.clear()
+        self._inbound_clock = 0.0
+        self._inbound_arrival = 0.0
 
     def load_script(self, path: str) -> None:
         """Load and execute a SIPhon script, registering its handlers.
@@ -494,10 +665,16 @@ class SipTestHarness:
             **kwargs: Passed to :class:`Call` constructor.
 
         Returns:
-            :class:`CallResult` with action details.
+            :class:`CallResult` with action details. With an inbound limit set
+            (:meth:`set_inbound_limit`) and reached, the call is refused and no
+            handler runs — see :attr:`CallResult.was_refused`.
         """
         if call is None:
             call = Call(**kwargs)
+
+        refusal = self._admit_inbound(call)
+        if refusal is not None:
+            return refusal
 
         registry = mock_module.get_registry()
         handlers = registry.get("b2bua.on_invite")
@@ -507,6 +684,11 @@ class SipTestHarness:
                 self._loop.run_until_complete(fn(call))
             else:
                 fn(call)
+
+        # A handler that rejects, terminates or does nothing ends the call
+        # there and then, and siphon drops it with its slot.
+        if not call.actions or call.actions[-1].kind not in _CALL_CONTINUES:
+            self._release_inbound(call)
 
         return CallResult(call=call, actions=list(call.actions))
 
@@ -558,11 +740,17 @@ class SipTestHarness:
         registry = mock_module.get_registry()
         handlers = registry.get("b2bua.on_failure")
 
+        before = len(call.actions)
         for fn, is_async in handlers:
             if is_async:
                 self._loop.run_until_complete(fn(call, code, reason))
             else:
                 fn(call, code, reason)
+
+        # The call ends with its failure unless the handler routed it again.
+        decided = call.actions[before:]
+        if not decided or decided[-1].kind not in _CALL_CONTINUES:
+            self._release_inbound(call)
 
         return CallResult(call=call, actions=list(call.actions))
 
@@ -591,6 +779,7 @@ class SipTestHarness:
             else:
                 fn(call, initiator)
 
+        self._release_inbound(call)
         return CallResult(call=call, actions=list(call.actions))
 
     def send_call_cancel(self, call: Optional[Call] = None, **kwargs: Any) -> CallResult:
@@ -617,6 +806,7 @@ class SipTestHarness:
             else:
                 fn(call)
 
+        self._release_inbound(call)
         return CallResult(call=call, actions=list(call.actions))
 
     def send_refer(

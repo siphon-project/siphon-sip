@@ -226,6 +226,9 @@ pub(super) fn handle_request(
                         return;
                     }
                 }
+                // The ACK for an INVITE `b2bua.inbound_limit` refused is one of
+                // these: the refusal was stateless and created no call.
+                b2bua::forget_refused_invite(&message, state);
                 debug!("ACK matched no IST/session/dialog — dropping (RFC 3261: never respond to or route an ACK)");
             }
             Err(error) => {

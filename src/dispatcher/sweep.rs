@@ -189,6 +189,10 @@ pub(super) async fn sweep_stale_entries(state: &DispatcherState) {
     // source that was ever noisy for the life of the process.
     state.parse_error_log.prune(now);
 
+    // Forget refused INVITEs whose client transaction has stopped
+    // retransmitting. Keyed on values the peer chooses, like the table above.
+    state.refused_invites.prune(now);
+
     // Registrar-liveness Part B: UDP+IPsec idle detection (kernel SA use-time
     // poll → one OPTIONS probe → deregister on no answer).  No-op unless
     // enabled and a P-CSCF IPsec role is configured.
@@ -221,6 +225,7 @@ pub(super) async fn sweep_stale_entries(state: &DispatcherState) {
             state.call_actors.count(),
             dialog_sessions,
         );
+        crate::metrics::admission::publish_limits(state.admission.limits());
 
         // Carrier burn rate. Iterates the answered calls, so it sits on this
         // 30 s sweep rather than in `publish_store_gauges`, whose contract is
