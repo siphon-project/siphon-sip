@@ -107,17 +107,7 @@ pub fn bridge_leg_snapshot(
             // anchored recorded for it, otherwise the half of its profile its
             // SDP reached the engine under — `offer` for the offerer of a
             // relay, `answer` for a leg the engine answered itself.
-            ingress: session.bridge_sides.as_ref().map_or_else(
-                || crate::rtpengine::session::SideFlags {
-                    profile: session.profile.clone(),
-                    half: if session.to_tag.is_some() {
-                        crate::rtpengine::session::ProfileHalf::Offer
-                    } else {
-                        crate::rtpengine::session::ProfileHalf::Answer
-                    },
-                },
-                |sides| sides.anchor_ingress.clone(),
-            ),
+            ingress: session.party_ingress(true),
             // A session with a second party is a relay and can be renegotiated
             // in place; one the engine answered itself has only the caller.
             relaying: session.to_tag.is_some(),
@@ -144,6 +134,30 @@ pub fn bridge_leg_snapshot(
         source_ip,
         media,
     })
+}
+
+/// The media of the leg `peer_sip_call_id` when the session stored under
+/// `anchor_sip_call_id` is a pair's and already relays to it: the two were
+/// bridged before and parted since (an `unbridge` leaves the pair's session
+/// and its engine call in place). `None` for any other leg, which a session's
+/// recorded sides do not describe.
+///
+/// The peer is recognised by its SIP Call-ID among the parties recorded for
+/// the pair's engine call, not by its tag: two dialogs may carry the same tag.
+fn rejoining_peer_media(
+    state: &DispatcherState,
+    anchor_sip_call_id: &str,
+    peer_sip_call_id: &str,
+) -> Option<crate::b2bua::bridge::LegMedia> {
+    let store = state.rtpengine_sessions.as_ref()?;
+    let pair = store.get(anchor_sip_call_id)?;
+    if !store.is_party(pair.rtpengine_id(), peer_sip_call_id) {
+        return None;
+    }
+    let has_playback = pair.to_tag.as_deref().is_some_and(|tag| {
+        crate::rtpengine::MediaBackend::playback_started(pair.rtpengine_id(), tag)
+    });
+    crate::b2bua::bridge::LegMedia::of_bridged_peer(&pair, has_playback)
 }
 
 /// Refuse everything about one leg that would make the bridge a half-formed
@@ -357,11 +371,18 @@ pub(crate) async fn bridge_calls_with_state(
     // deployment that anchors media (NAT, SRTP, recording, lawful intercept) is
     // a topology change nobody asked for. Swapping is deterministic and the
     // reply names which leg ended up the anchor.
-    let (anchor, peer) = if anchor.media.is_none() && peer.media.is_some() {
+    let (anchor, mut peer) = if anchor.media.is_none() && peer.media.is_some() {
         (peer, anchor)
     } else {
         (anchor, peer)
     };
+    // The same pair, parted and bridged again: the peer's own session went
+    // when the first bridge formed, and the anchor's still relays to it. What
+    // the peer was anchored with is read off that session, or the anchor's
+    // profile would shape and pin a party it was never chosen for.
+    if peer.media.is_none() {
+        peer.media = rejoining_peer_media(state, &anchor.sip_call_id, &peer.sip_call_id);
+    }
     bridge_leg_validate(&anchor)?;
     bridge_leg_validate(&peer)?;
     // A pair profile this deployment does not carry is refused before either

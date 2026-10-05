@@ -49,10 +49,12 @@ pub struct MediaSession {
     /// call's whole media path and the engine refuses to detach it, which is
     /// why the two are tracked apart rather than as one "has a bridge" flag.
     pub ws_bridge_attached: bool,
-    /// For the session of a formed controller bridge, which flags shape the SDP
-    /// the engine sends each party. `None` for every other session, which has
-    /// one [`MediaSession::profile`] describing the pair the way a dial's
-    /// profile does.
+    /// For a session whose two parties were paired by something other than
+    /// one dial (a formed controller bridge, a leg replacement, a `Replaces`
+    /// takeover), which flags shape the SDP the engine sends each party and
+    /// whose policy pins each one's media ingress. `None` for every other
+    /// session, which has one [`MediaSession::profile`] describing the pair
+    /// the way a dial's profile does.
     pub bridge_sides: Option<BridgeSides>,
     /// When this session was created.
     pub created_at: Instant,
@@ -143,6 +145,32 @@ impl MediaSession {
         }
     }
 
+    /// Whose `received_from` policy pins the media ingress of one party of
+    /// this session: the one on [`MediaSession::from_tag`] when `on_from_tag`,
+    /// the one on [`MediaSession::to_tag`] otherwise.
+    ///
+    /// What was recorded for the party when the pair was put together
+    /// ([`MediaSession::bridge_sides`]), and without that the half of the
+    /// session's profile the party's SDP reached the engine under: `offer`
+    /// for the offerer of a relay and `answer` for its answerer, as on a
+    /// dial, and `answer` for the one party of a session the engine answered
+    /// itself.
+    #[must_use]
+    pub fn party_ingress(&self, on_from_tag: bool) -> SideFlags {
+        match (&self.bridge_sides, on_from_tag) {
+            (Some(sides), true) => sides.anchor_ingress.clone(),
+            (Some(sides), false) => sides.peer_ingress.clone(),
+            (None, _) => SideFlags {
+                profile: self.profile.clone(),
+                half: if on_from_tag && self.to_tag.is_some() {
+                    ProfileHalf::Offer
+                } else {
+                    ProfileHalf::Answer
+                },
+            },
+        }
+    }
+
     /// The tag naming the party that is **sending** an in-dialog offer, for the media engine's
     /// re-offer: the A-leg's `from_tag` when the offer came from A, the B-leg's `to_tag` when it came
     /// from B.
@@ -195,6 +223,48 @@ mod media_session_tests {
             bridge_sides: None,
             created_at: Instant::now(),
         }
+    }
+
+    #[test]
+    fn a_partys_ingress_policy_is_the_half_its_sdp_reached_the_engine_under() {
+        let half = |half| SideFlags {
+            profile: "default".to_string(),
+            half,
+        };
+        // A relay set up by one dial: the offerer's `offer` half, the
+        // answerer's `answer` half.
+        let relay = session(Some("tag-b"));
+        assert_eq!(relay.party_ingress(true), half(ProfileHalf::Offer));
+        assert_eq!(relay.party_ingress(false), half(ProfileHalf::Answer));
+        // A session the engine answered itself has one party, anchored under
+        // the `answer` half.
+        assert_eq!(session(None).party_ingress(true), half(ProfileHalf::Answer));
+    }
+
+    #[test]
+    fn a_partys_ingress_policy_is_what_was_recorded_when_the_pair_was_put_together() {
+        let side = |profile: &str, half| SideFlags {
+            profile: profile.to_string(),
+            half,
+        };
+        let paired = MediaSession {
+            bridge_sides: Some(BridgeSides {
+                anchor: side("shapes_the_anchor", ProfileHalf::Answer),
+                peer: side("shapes_the_peer", ProfileHalf::Offer),
+                anchor_ingress: side("pins_the_anchor", ProfileHalf::Answer),
+                peer_ingress: side("pins_the_peer", ProfileHalf::Offer),
+            }),
+            ..session(Some("tag-b"))
+        };
+        // Never the profile half its tag would name, nor the shaping.
+        assert_eq!(
+            paired.party_ingress(true),
+            side("pins_the_anchor", ProfileHalf::Answer)
+        );
+        assert_eq!(
+            paired.party_ingress(false),
+            side("pins_the_peer", ProfileHalf::Offer)
+        );
     }
 
     #[test]
@@ -361,6 +431,20 @@ impl MediaSessionStore {
             (Some(party), None) => Some(party.sip_call_id.clone()),
             _ => None,
         }
+    }
+
+    /// Whether the dialog `sip_call_id` is recorded as a party of engine call
+    /// `engine_call_id`: a bridged pair's anchor or peer. A pair parted by an
+    /// `unbridge` stays recorded, since its session stays on the engine call,
+    /// which is how a second bridge of the same two legs recognises the party
+    /// that session already relays to. Spends nothing.
+    pub fn is_party(&self, engine_call_id: &str, sip_call_id: &str) -> bool {
+        self.parties.get(engine_call_id).is_some_and(|recorded| {
+            recorded
+                .parties
+                .iter()
+                .any(|party| party.sip_call_id == sip_call_id)
+        })
     }
 
     /// The store key of the session on engine call `engine_call_id`: the SIP

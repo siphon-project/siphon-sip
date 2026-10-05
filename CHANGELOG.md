@@ -123,6 +123,55 @@ entry, but a working config keeps working.
   relayed across the formed pair, while the rest of each command is shaped as
   before. `bridge {profile}` is unchanged: the pair profile describes both
   parties, its `offer` half the anchor and its `answer` half the `with` leg.
+- **A transfer on a media-anchored call pins each party's media ingress to its
+  signalling source.** A siphon-terminated REFER, `replace_peer` and an INVITE
+  with `Replaces` each put the surviving party and a new one on a fresh media
+  engine call, and neither the `offer` nor the `answer` sent there carried the
+  `received_from` hint, whatever the profile asked for. The engine has no
+  earlier hint for a fresh call, so a party behind NAT, whose SDP names an
+  address its media does not come from, was gated on that address and the
+  transferred call was silent. Each command now carries the signalling source
+  of the party whose SDP it holds (the surviving leg's remote address, the
+  source of the target's 2xx, the source of the taking-over INVITE) where that
+  party's own policy asks for it. A profile named for the transfer
+  (`accept_refer(profile=)`, `replace_peer {profile}`) describes the pair it
+  creates as a dial's does: its `offer` half the surviving party, whose SDP is
+  offered, and its `answer` half the target. With none named the call's own
+  profile is inherited, the surviving party keeps the half it was set up under
+  (the caller the `offer` half, the callee the `answer` half) and the new party
+  takes the half of the party it replaces, so a party whose policy asks for no
+  hint is still sent none. A replacement that rings several targets pins each
+  target's own answer by its own source. The pair records both policies, so a
+  second transfer of the same call reads them again.
+- **A transfer that replaces the callee keeps the call's media session.** On a
+  media-anchored call the pair's session is stored under the caller's Call-ID.
+  Replacing the callee leaves that Call-ID unchanged, and the completion wrote
+  the new pair's session there and then removed "the old one" under the same
+  key, so the call was left with no media session at all: a later transfer of
+  it was not anchored, and the call's teardown did not delete the pair's media
+  engine call, which stayed until the engine's own timeout. The session is now
+  kept, and the engine call goes with the call.
+- **A hold from the caller after its callee was transferred away is relayed,
+  not refused `491`.** The leg of a transfer target was never marked confirmed
+  when siphon ACKed its 2xx, so a re-INVITE from the surviving caller, which is
+  relayed only to a confirmed leg (RFC 3261 §14.1), was answered `491 Request
+  Pending` however often it was retried. The target's leg is now confirmed by
+  that ACK. The re-anchored pair's media session also named the target where
+  the caller's slot is read from, so the caller's re-offer would have reached
+  the media engine as the target's; it now names the surviving caller first
+  and the target second, and the caller's hold is re-offered on the pair's
+  engine call under the caller's own tag and relayed to the target.
+- **A pair bridged again after an `unbridge` is shaped and pinned as its first
+  bridge shaped and pinned it.** When a bridge forms, the `with` leg's own
+  media session is retired, and with it the record of the profile that leg was
+  anchored with. A second `bridge` of the same two legs then offered the `with`
+  leg what the anchor's profile describes (a phone anchored with SRTP was
+  offered `RTP/AVP`) and read its `received_from` policy from the anchor's
+  profile, so a `with` leg behind NAT lost its source hint and one that asked
+  for none could be given one. The pair's session records both parties' sides,
+  and the second bridge now reads the `with` leg's from there, in whichever
+  order the two legs are named. A leg bridged to a *different* party afterwards
+  is unaffected by what was recorded for the first.
 - **siphon builds with Rust 1.93.** One label list in the call-cost
   metric mixed a `&String` with a `&str`, which current compilers coerce and
   1.93 rejects as mismatched types. That is the compiler several

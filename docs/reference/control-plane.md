@@ -1278,11 +1278,18 @@ its bridge offer was, the target's as its bridge re-INVITE was, whichever of
 them re-offers, so a held SRTP phone is still offered SRTP and a held
 plain-RTP caller is still answered plain RTP. A refusal from the other leg goes
 back to the sender with the same status, and the pair's session is put back
-where it was. An offer that crosses one still being relayed, on either leg, is
-refused `491` (RFC 3261 §14.1). A re-INVITE or UPDATE without SDP is a session
-refresh and is answered at once with the session in force, without disturbing
-the other leg. A leg that hangs up mid-relay has the other's pending request
-answered `487`, and one the other leg never answers is answered `408`. The
+where it was. An offer the pair's media session cannot take, or the engine
+refuses, is answered `488`. One relay runs per pair at a time: an offer on
+either leg while either leg still has an offer/answer exchange outstanding is
+refused `491` (RFC 3261 §14.1, RFC 3311 §5.2), and so is any re-INVITE or
+UPDATE that arrives while the bridge is still forming or being parted, when the
+bridge's own re-INVITE is the exchange outstanding on that dialog. On a formed
+bridge a re-INVITE or UPDATE without SDP is a session refresh (RFC 4028 §10)
+and is answered at once without touching the engine or the other leg: a
+re-INVITE with the session in force on that leg as the offer its 2xx has to
+carry (RFC 3261 §14.2), an UPDATE with no body. A leg that hangs up mid-relay
+has the other's pending request answered `487`, and one the other leg never
+answers is answered `408` after 64·T1, with the pair's session put back. The
 `with` leg still has no media session of its own once bridged: media verbs
 address the pair through the target.
 
@@ -1684,18 +1691,24 @@ cannot reach each other.
 siphon does not retry a `491 Request Pending`. It reports the glare and leaves
 the pairing to the controller, which by then may want a different one.
 
-On a call with **no second leg** — one siphon answered itself and anchored on
-the media engine, which is what an IVR, a queue or a voicemail box is — a
-re-INVITE or an UPDATE from the endpoint is answered here, from the engine. A
-hold arrives as a `sendonly` re-offer and is answered `recvonly` (RFC 3264
-§6.1); an offerless refresh is answered with the leg's current media, because
-RFC 3261 §13.2.1 makes the `2xx` to an offerless INVITE carry the offer. A call
-with no media backend takes a `200` with no body. Nothing is forwarded, because
-there is nowhere to forward it.
+On a call with **no second leg** that is not bridged to another — one siphon
+answered itself and anchored on the media engine, which is what an IVR, a queue
+or a voicemail box is — a re-INVITE or an UPDATE from the endpoint is answered
+here, from the engine. A hold arrives as a `sendonly` re-offer and is answered
+`recvonly` (RFC 3264 §6.1); an offerless refresh is answered with the leg's
+current media, because RFC 3261 §13.2.1 makes the `2xx` to an offerless INVITE
+carry the offer. A call with no media backend takes a `200` with no body.
+Nothing is forwarded, because there is nowhere to forward it.
 
-**Known limitation.** While a pair is **bridged**, a re-INVITE *from* one of the
-endpoints is still answered `491 Request Pending` rather than relayed across the
-bridge.
+While a pair is **bridged**, a re-INVITE or an UPDATE carrying SDP *from* one of
+the endpoints is relayed across the bridge to the other leg, and the other leg's
+answer comes back as its 200 (see
+[A re-offer on a formed bridge](#joining-two-legs-bridge)). It is answered `491
+Request Pending` only for glare (RFC 3261 §14.1, RFC 3311 §5.2): while an offer
+on either leg of the pair is still being relayed, and while the bridge is still
+forming or being parted, when siphon's own re-INVITE is the offer outstanding on
+that dialog. siphon does not hold or retry the refused request; the endpoint
+retries it, as RFC 3261 §14.1 has it.
 
 In-process, the same primitives are
 [`b2bua.bridge(...)` / `b2bua.unbridge(...)`](call.md#joining-two-calls-b2buabridge).
@@ -1741,6 +1754,22 @@ the pair this creates, and is required when the call is anchored with a
 direction-bound one, whose answer half was written for the party that is
 leaving. `timeout` bounds the ring in seconds; `0` means no ring policy, leaving
 only siphon's own guard against a target that answers nothing at all.
+
+**Which party's media ingress is pinned.** On a media-anchored call the
+surviving party and the target meet on a fresh media engine call, which has
+never been told where either party's media comes from. Each is pinned to its
+signalling source (`received_from`) there by its own policy, as in a
+[`bridge`](#joining-two-legs-bridge). With `profile`, that profile describes the
+pair the way a dial's does: its `offer` half decides for the surviving party,
+whose SDP is offered to the target, and its `answer` half for the target.
+Without it the call's own profile is inherited: the surviving party keeps the
+half it was set up under (the caller the `offer` half, the callee the `answer`
+half), and the target takes the half of the party it replaces. With several
+contacts ringing, each is offered on an engine call of its own and the one that
+answers is pinned to where its own answer came from. A REFER accepted with
+[`accept_refer`](#an-inbound-refer-on-a-controlled-call) follows the same rule,
+and so does an INVITE with `Replaces`: the party taking over gets the half of
+the party it replaces, and the one that stays keeps its own.
 
 **The reply is the local action, not the outcome** — `{channel, replacement:
 "dialing", target}`, which means the INVITE is on the wire and nothing more. An

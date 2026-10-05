@@ -131,6 +131,8 @@ mod control_originate_aor_tests;
 #[cfg(test)]
 mod control_originate_tests;
 #[cfg(test)]
+mod control_rebridge_tests;
+#[cfg(test)]
 mod control_refer_controller_tests;
 #[cfg(test)]
 mod delayed_offer_ack_tests;
@@ -218,6 +220,8 @@ mod test_dispatcher;
 mod tests;
 #[cfg(test)]
 mod transfer_bye_tests;
+#[cfg(test)]
+mod transfer_ingress_tests;
 #[cfg(test)]
 mod uas_bad_extension_tests;
 #[cfg(test)]

@@ -358,7 +358,7 @@ pub fn handle_b2bua_response(
     }
     if replacement_branch == crate::b2bua::actor::ReplacementBranch::Target {
         if (200..300).contains(&status_code) {
-            b2bua_complete_terminated_transfer(call_id, branch, message, state);
+            b2bua_complete_terminated_transfer(call_id, branch, message, response_source, state);
         } else if status_code >= 300 {
             // RFC 3261 §17.1.1.3 — the INVITE client transaction MUST ACK a
             // non-2xx final, on the SAME branch. Nothing else on this path

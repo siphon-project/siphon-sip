@@ -151,7 +151,13 @@ async fn a_replaced_party_that_has_not_acked_is_sent_its_bye_after_its_ack() {
     let target_branch = add_transfer_target(&call);
     subscribe(&call, true, ReplacementOrigin::SiphonInitiated, false);
 
-    b2bua_complete_terminated_transfer(&call.call_id, target_branch, &target_answer(), &call.state);
+    b2bua_complete_terminated_transfer(
+        &call.call_id,
+        target_branch,
+        &target_answer(),
+        target(),
+        &call.state,
+    );
     let sent = call.wire();
     assert!(
         sent.iter()
@@ -177,7 +183,13 @@ async fn a_referrer_bye_released_by_its_notify_still_waits_for_the_ack() {
     let target_branch = add_transfer_target(&call);
     subscribe(&call, true, ReplacementOrigin::Refer, false);
 
-    b2bua_complete_terminated_transfer(&call.call_id, target_branch, &target_answer(), &call.state);
+    b2bua_complete_terminated_transfer(
+        &call.call_id,
+        target_branch,
+        &target_answer(),
+        target(),
+        &call.state,
+    );
     let sent = call.wire();
     let notify = sent
         .iter()

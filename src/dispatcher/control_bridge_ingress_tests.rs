@@ -30,13 +30,13 @@ use super::originate_test_harness::{drain, phone_offer, phone_response, phone_se
 use crate::rtpengine::test_native_engine::NativeTestEngine;
 
 /// Plain RTP, no source hint on either half.
-const OPEN_PLAIN: &str = "open_plain";
+pub(super) const OPEN_PLAIN: &str = "open_plain";
 /// Plain RTP, the source hint on both halves.
-const PINNED_PLAIN: &str = "pinned_plain";
+pub(super) const PINNED_PLAIN: &str = "pinned_plain";
 /// SRTP, no source hint on either half.
-const OPEN_SECURE: &str = "open_secure";
+pub(super) const OPEN_SECURE: &str = "open_secure";
 /// SRTP, the source hint on both halves.
-const PINNED_SECURE: &str = "pinned_secure";
+pub(super) const PINNED_SECURE: &str = "pinned_secure";
 /// A pair profile whose `offer` half alone asks for the hint: the party whose
 /// SDP the offer carries (the anchor) is pinned, the answering one is not.
 const PAIR_PINS_OFFERER: &str = "pair_pins_offerer";
@@ -49,7 +49,7 @@ const PAIR_PINS_ANSWERER: &str = "pair_pins_answerer";
 const SIGNALLED: &str = "203.0.113.77";
 
 /// The built-in profiles plus the six above.
-fn profiles() -> Arc<crate::rtpengine::ProfileRegistry> {
+pub(super) fn profiles() -> Arc<crate::rtpengine::ProfileRegistry> {
     let half = |transport: &str, received_from: bool| crate::config::NgFlagsConfig {
         transport_protocol: Some(transport.to_string()),
         received_from,
