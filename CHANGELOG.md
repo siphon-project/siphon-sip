@@ -231,6 +231,14 @@ entry, but a working config keeps working.
   transport, and the connection once a stream transport has established it),
   and its CANCEL and ACK are sent by that record, also when the session is
   gone by the time a waiting CANCEL is released.
+- **The `487` to a cancelled proxied INVITE is its server transaction's
+  final response.** The proxy sent it around the INVITE server transaction,
+  once: over UDP a lost `487` was never repeated (RFC 3261 §17.2.1 has it
+  retransmitted on Timer G until the ACK), a retransmitted INVITE was
+  answered with the last provisional instead, and the transaction stayed in
+  `Proceeding`, waiting for a final response that had already gone. It now
+  goes through the transaction, as the response of `reply.reject()` already
+  did: retransmitted until the caller's ACK, which is absorbed.
 - **A transfer whose target cannot be dialled ends its subscription and
   leaves the call free.** A siphon-terminated REFER answers `202` and sends
   the `100 Trying` NOTIFY before it dials. When no INVITE could then be sent

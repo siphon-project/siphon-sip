@@ -209,6 +209,38 @@ pub(super) fn reject_pending_invite(
         &[],
     );
 
+    send_final_through_server_transaction(
+        server_key,
+        response,
+        transport,
+        source_addr,
+        connection_id,
+        inbound_local_addr,
+        state,
+    );
+}
+
+/// Send `response`, a final response the proxy itself gives an INVITE, through
+/// that INVITE's server transaction: RFC 3261 §17.2.1 has it retransmitted on
+/// Timer G over an unreliable transport until the caller's ACK, which the
+/// transaction then absorbs, and sent again for a retransmission of the
+/// INVITE. Sent around the transaction it is sent once, a lost copy is never
+/// repeated, and the transaction is left waiting for a final response that
+/// already went.
+///
+/// With no live server transaction (or one that would not send it) the
+/// response goes straight to the transport, from the listener the INVITE
+/// arrived on, so an IPsec-protected response egresses on the right SA
+/// (TS 33.203 §7.4).
+fn send_final_through_server_transaction(
+    server_key: &TransactionKey,
+    response: SipMessage,
+    transport: Transport,
+    source_addr: SocketAddr,
+    connection_id: ConnectionId,
+    inbound_local_addr: SocketAddr,
+    state: &DispatcherState,
+) {
     let event = ServerEvent::Ist(IstEvent::TuNon2xxFinal(response.clone()));
     let mut sent_by_transaction = false;
     if let Ok(actions) = state
@@ -228,9 +260,6 @@ pub(super) fn reject_pending_invite(
     }
 
     if !sent_by_transaction {
-        // No live server transaction (or it emitted no SendMessage) — send the
-        // error directly, pinning the inbound listener's local address so an
-        // IPsec-protected response egresses on the right SA (TS 33.203 §7.4).
         send_message_from(
             response,
             transport,
@@ -762,7 +791,9 @@ pub(super) fn handle_cancel_via_session(
         cancel_proxy_branch(client_key, &reasons, state);
     }
 
-    // Send 487 Request Terminated upstream using the original INVITE from the session
+    // Send 487 Request Terminated upstream using the original INVITE from the
+    // session, as the final response of that INVITE's server transaction
+    // (RFC 3261 §9.2, §17.2.1).
     let response_487 = build_response(
         &session.original_request,
         487,
@@ -770,12 +801,13 @@ pub(super) fn handle_cancel_via_session(
         state.server_header.as_deref(),
         &[],
     );
-    send_message_from(
+    send_final_through_server_transaction(
+        invite_server_key,
         response_487,
         session.transport,
         session.source_addr,
         session.connection_id,
-        Some(session.inbound_local_addr),
+        session.inbound_local_addr,
         state,
     );
     // The caller abandoned the INVITE: its dialog, and every branch's, is over.
