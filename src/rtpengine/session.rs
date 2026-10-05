@@ -103,6 +103,25 @@ impl SideFlags {
                 ProfileHalf::Answer => entry.answer.carry_received_from,
             })
     }
+
+    /// Put this policy's `received_from` hint on `flags`, a command that
+    /// carries the SDP of the party the policy belongs to: `source`, where
+    /// that party signals from, when the policy asks for the pin, and no hint
+    /// when it does not.
+    ///
+    /// It replaces whatever the flags' own half says. The half a command is
+    /// shaped by is chosen for the party the result is sent to, so its policy
+    /// is the other party's.
+    pub fn stamp_ingress(
+        &self,
+        flags: &mut super::profile::NgFlags,
+        registry: &super::profile::ProfileRegistry,
+        source: std::net::IpAddr,
+    ) {
+        flags.carry_received_from = self.pins_ingress(registry);
+        flags.received_from = None;
+        flags.stamp_received_from(source);
+    }
 }
 
 /// The two parties of a bridged pair's session and what shapes each.
@@ -151,10 +170,17 @@ impl MediaSession {
     ///
     /// What was recorded for the party when the pair was put together
     /// ([`MediaSession::bridge_sides`]), and without that the half of the
-    /// session's profile the party's SDP reached the engine under: `offer`
-    /// for the offerer of a relay and `answer` for its answerer, as on a
-    /// dial, and `answer` for the one party of a session the engine answered
-    /// itself.
+    /// session's profile the party was set up under: `offer` for the caller
+    /// of a dial and `answer` for its callee, and `answer` for the one party
+    /// of a session the engine answered itself.
+    ///
+    /// The half is the party's for the life of the call, whichever command
+    /// its SDP rides later: a callee that re-offers is still the `answer`
+    /// half's. A delayed offer (RFC 3264 §4) is no exception. Its callee
+    /// offers and its caller answers, but the profile was chosen for the dial
+    /// before either sent an SDP, and its session names the caller on
+    /// [`MediaSession::from_tag`] once answered
+    /// ([`MediaSessionStore::set_delayed_offer_answerer`]).
     #[must_use]
     pub fn party_ingress(&self, on_from_tag: bool) -> SideFlags {
         match (&self.bridge_sides, on_from_tag) {
@@ -231,8 +257,8 @@ mod media_session_tests {
             profile: "default".to_string(),
             half,
         };
-        // A relay set up by one dial: the offerer's `offer` half, the
-        // answerer's `answer` half.
+        // A relay set up by one dial: the caller's `offer` half, the
+        // callee's `answer` half.
         let relay = session(Some("tag-b"));
         assert_eq!(relay.party_ingress(true), half(ProfileHalf::Offer));
         assert_eq!(relay.party_ingress(false), half(ProfileHalf::Answer));
@@ -306,7 +332,13 @@ pub struct MediaSessionStore {
     /// call not simply named by its own SIP Call-ID. See
     /// [`MediaSessionStore::summary_parties`].
     parties: std::sync::Arc<DashMap<String, EngineParties>>,
+    /// What a bridge shaped and pinned a party with, for each call whose own
+    /// session a bridge retired. See [`own_media`].
+    own_media: DashMap<String, own_media::Recorded>,
 }
+
+mod own_media;
+pub use own_media::OwnMedia;
 
 /// The SIP Call-IDs an engine call carries media for, and until when they are
 /// kept once no stored session is on it.
@@ -332,6 +364,7 @@ impl MediaSessionStore {
         Self {
             sessions: DashMap::new(),
             parties: Default::default(),
+            own_media: DashMap::new(),
         }
     }
 
@@ -542,7 +575,18 @@ impl MediaSessionStore {
     }
 
     /// Remove a session by Call-ID. Returns the removed session, if any.
+    ///
+    /// This is what a call's teardown does, whether or not the call still has
+    /// a session of its own, so it also drops what a bridge recorded for the
+    /// call when it retired that session ([`own_media`]).
     pub fn remove(&self, call_id: &str) -> Option<MediaSession> {
+        self.forget_own_media(call_id);
+        self.take_session(call_id)
+    }
+
+    /// Take the session stored under `call_id` out of the store and release
+    /// the parties of its engine call.
+    fn take_session(&self, call_id: &str) -> Option<MediaSession> {
         let (_, session) = self.sessions.remove(call_id)?;
         self.release_parties(session.rtpengine_id());
         Some(session)
@@ -552,6 +596,25 @@ impl MediaSessionStore {
     pub fn set_to_tag(&self, call_id: &str, to_tag: String) {
         if let Some(mut entry) = self.sessions.get_mut(call_id) {
             entry.to_tag = Some(to_tag);
+        }
+    }
+
+    /// Record the caller's answer to a delayed offer (RFC 3264 §4) on the
+    /// session the callee's offer created, and name the two parties in the
+    /// order every other session does: the caller on
+    /// [`MediaSession::from_tag`], the callee on [`MediaSession::to_tag`].
+    ///
+    /// Until the answer the session has only the callee, as its offerer.
+    /// Left that way round once answered, every reader that names a party by
+    /// the leg it is on would name the other one: a hold from the caller
+    /// would reach the engine as the callee's re-offer, and the caller would
+    /// be pinned by the callee's `received_from` policy.
+    pub fn set_delayed_offer_answerer(&self, call_id: &str, caller_tag: String) {
+        if let Some(mut entry) = self.sessions.get_mut(call_id) {
+            if entry.to_tag.is_none() {
+                let callee_tag = std::mem::replace(&mut entry.from_tag, caller_tag);
+                entry.to_tag = Some(callee_tag);
+            }
         }
     }
 
@@ -595,6 +658,7 @@ impl MediaSessionStore {
         for engine_call_id in swept {
             self.release_parties(&engine_call_id);
         }
+        self.sweep_own_media(cutoff);
     }
 
     /// The engine-side call-ids of every session siphon currently holds.

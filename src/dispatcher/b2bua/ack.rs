@@ -797,11 +797,12 @@ pub fn anchored_answer(
     caller_ack: &SipMessage,
     state: &DispatcherState,
 ) -> AnchoredAnswer {
-    let Some(a_leg_call_id) = state
-        .call_actors
-        .get_call(call_id)
-        .map(|call| call.a_leg.dialog.call_id.clone())
-    else {
+    let Some((a_leg_call_id, caller_source)) = state.call_actors.get_call(call_id).map(|call| {
+        (
+            call.a_leg.dialog.call_id.clone(),
+            call.a_leg.transport.remote_addr.ip(),
+        )
+    }) else {
         return AnchoredAnswer::NotAnchored;
     };
     let Some(sessions) = state.rtpengine_sessions.as_ref() else {
@@ -828,6 +829,20 @@ pub fn anchored_answer(
     else {
         return AnchoredAnswer::Refused;
     };
+    // The answer is the caller's SDP, so the caller's own policy decides
+    // whether its media ingress is pinned to where it signals from: the half
+    // of the profile the caller of a dial is set up under, which is not the
+    // `answer` half this command is shaped by. Read off the session as it is
+    // recorded below, the caller first.
+    let caller = PartyIngress {
+        source: caller_source,
+        policy: crate::rtpengine::MediaSession {
+            from_tag: caller_tag.clone(),
+            to_tag: Some(session.from_tag.clone()),
+            ..session.clone()
+        }
+        .party_ingress(true),
+    };
     match b2bua_transfer_rtpengine_answer(
         state,
         session.rtpengine_id(),
@@ -836,10 +851,10 @@ pub fn anchored_answer(
         &caller_ack.body,
         caller_ack.headers.call_id().map_or("", String::as_str),
         &session.profile,
-        None,
+        Some(&caller),
     ) {
         Some(answer) => {
-            sessions.set_to_tag(&a_leg_call_id, caller_tag);
+            sessions.set_delayed_offer_answerer(&a_leg_call_id, caller_tag);
             AnchoredAnswer::Rewritten(answer)
         }
         None => AnchoredAnswer::Refused,
