@@ -76,6 +76,13 @@ entry, but a working config keeps working.
   `{"to": ...}`, `to?`). In the Rust SDK this adds a field to both
   `DialTarget` variants, which breaks code that matches or builds them by
   field.
+- **`media.sdp_keep_session_name` leaves the SDP `s=` line alone on a B2BUA
+  call.** siphon replaces the `o=` identity and the `s=` session name of the
+  SDP it relays between the legs with `media.sdp_name`. Some peers use the
+  session name as a marker of their own and need it to cross unchanged. With
+  `sdp_keep_session_name: true` the session name is relayed as the far side
+  wrote it, and `o=` is still rewritten. Default `false`, so nothing changes
+  for an existing config.
 
 ### Fixed
 
@@ -99,6 +106,31 @@ entry, but a working config keeps working.
   still open and nothing left to CANCEL it. The target is now sent a CANCEL
   (RFC 3261 §9.1) before the call goes, its `487` is ACKed, and its media
   engine call is released.
+- **A bridged party's media ingress is pinned by its own profile, not the
+  other party's.** In a `bridge` (and a `dial {on_answer: "bridge"}`, which
+  ends in one) each media-engine command carries one party's SDP and is shaped
+  by the other party's profile, and the `received_from` policy was read from
+  that shaping profile. A party behind NAT, whose SDP names an address its
+  media does not come from, was therefore pinned to its signalling source only
+  if the party it was joined to had a profile asking for that. Joined to a
+  caller answered with a profile that does not, its answer reached the engine
+  with no source hint, the engine expected its media from the address in its
+  SDP, and the call was silent in both directions. The reverse held too: a
+  party whose profile asks for no hint was pinned to its signalling source by
+  the other's, which gates out one whose media comes from a different host
+  than its signalling. The hint now follows the profile of the party whose SDP
+  the command carries, on the bridge's offer and answer and on every re-offer
+  relayed across the formed pair, while the rest of each command is shaped as
+  before. `bridge {profile}` is unchanged: the pair profile describes both
+  parties, its `offer` half the anchor and its `answer` half the `with` leg.
+- **A retransmitted INVITE on a B2BUA call is answered.** The retransmission
+  was recognised (it creates no second call) and then dropped without a
+  response. A caller retransmits because it has seen no provisional, so one
+  that lost the `100 Trying` or the `180 Ringing` on the way kept
+  retransmitting its INVITE until a later response happened to arrive. It now
+  gets the most recent provisional again, or a `100 Trying` when none beyond
+  that has been sent (RFC 3261 §17.2.1). Nothing is re-sent once the INVITE
+  has its final response, or for an INVITE on another Via branch.
 - **An `{aor}` dial target's identity is no longer dropped.** `from`,
   `from_display`, `p_asserted_identity` and `privacy` on an `{aor}` target
   were ignored, though the reference documented them on both target forms
@@ -199,6 +231,19 @@ entry, but a working config keeps working.
 - **A caller's dialog that is not watched says why**, at `debug`. The six ways
   out of starting a `DialogStateChanged` watch were all silent, which reads
   the same as the feature being off.
+- **`@b2bua.on_cancel` runs once, and after `@b2bua.on_invite`, for a call
+  CANCELled early.** Two orderings of a caller's CANCEL left a script's
+  teardown wrong:
+  - The CANCEL arrived while an async `on_invite` was still awaiting (a media
+    offer, a lookup). `on_cancel` could not run, because the call's INVITE was
+    not stored until the handler returned, and whatever the handler then
+    finished setting up was never released: a media session held until the
+    engine's own timeout. `on_cancel` now runs when the handler has returned.
+  - The callee answered siphon's CANCEL with its `487` before siphon had
+    finished ending the call. The `487` was taken for a B-leg failure, so
+    `@b2bua.on_failure` ran beside `on_cancel` and a script releasing media in
+    both released it twice. The legs are now recorded as CANCELled before
+    their CANCELs are sent, and the `487` is acknowledged without a handler.
 
 ## [1.12.0] — 2026-09-30
 

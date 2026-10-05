@@ -7295,6 +7295,32 @@ fn stamp_sdp_origin_rewrites_address_when_given() {
     assert!(!result.contains("198.51.100.9"));
 }
 
+/// `media.sdp_keep_session_name`: the origin is hidden as always, the session
+/// name crosses as the far side wrote it.
+#[test]
+fn hide_sdp_identity_keeps_the_session_name_when_configured() {
+    let sdp = "v=0\r\no=carol 5 6 IN IP4 198.51.100.9\r\ns=Conference 7\r\nt=0 0\r\n";
+    let mut dispatcher = super::test_dispatcher::test_dispatcher();
+    dispatcher.state.sdp_name = "SIPhon".to_string();
+
+    dispatcher.state.sdp_keep_session_name = true;
+    let mut body = sdp.as_bytes().to_vec();
+    hide_sdp_identity(&mut body, &dispatcher.state, Some("203.0.113.7"));
+    let result = std::str::from_utf8(&body).unwrap();
+    assert!(
+        result.contains("o=SIPhon 5 6 IN IP4 203.0.113.7\r\n"),
+        "got: {result}"
+    );
+    assert!(result.contains("s=Conference 7\r\n"), "got: {result}");
+
+    dispatcher.state.sdp_keep_session_name = false;
+    let mut body = sdp.as_bytes().to_vec();
+    hide_sdp_identity(&mut body, &dispatcher.state, Some("203.0.113.7"));
+    let result = std::str::from_utf8(&body).unwrap();
+    assert!(result.contains("s=SIPhon\r\n"), "got: {result}");
+    assert!(!result.contains("Conference"), "got: {result}");
+}
+
 #[test]
 fn stamp_sdp_origin_rewrites_ipv6_address_and_addrtype() {
     // v6 substitute (bracketed via_host()) -> unbracketed address + IP6.

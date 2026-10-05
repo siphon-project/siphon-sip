@@ -98,6 +98,8 @@ mod bridged_pair_media_events_tests;
 #[cfg(test)]
 mod carrier_attribution_tests;
 #[cfg(test)]
+mod control_bridge_ingress_tests;
+#[cfg(test)]
 mod control_bridge_media_tests;
 #[cfg(test)]
 mod control_bridge_relay_tests;
@@ -588,6 +590,10 @@ pub async fn run(
             .as_ref()
             .and_then(|m| m.sdp_name.clone())
             .unwrap_or_else(|| product_name.to_string()),
+        sdp_keep_session_name: config
+            .media
+            .as_ref()
+            .is_some_and(|m| m.sdp_keep_session_name),
         sdp_strip_attributes: config
             .media
             .as_ref()
