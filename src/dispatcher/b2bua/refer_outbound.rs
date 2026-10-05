@@ -2,14 +2,6 @@
 //! and the sipfrag NOTIFYs it subscribes to (RFC 3515).
 use crate::dispatcher::*;
 
-/// Send a siphon-originated in-dialog REFER on one leg of a B2BUA call
-/// (`call.refer()` / `b2bua.refer()`).
-///
-/// Siphon is the referrer: it builds the REFER on the chosen leg's own dialog
-/// identity, sends it, and records a *subscriber* REFER subscription so the
-/// referee's `message/sipfrag` NOTIFYs are absorbed (200 OK'd + read) by
-/// [`handle_b2bua_notify`] rather than bridged. Returns `false` if the call or
-/// leg is gone.
 /// Handle the response to a REFER siphon originated on one of its own legs.
 ///
 /// A cold transfer off a call siphon answered itself (`call.refer()` /
@@ -298,6 +290,14 @@ pub fn retry_originated_refer_with_credentials(
     true
 }
 
+/// Send a siphon-originated in-dialog REFER on one leg of a B2BUA call
+/// (`call.refer()` / `b2bua.refer()`).
+///
+/// Siphon is the referrer: it builds the REFER on the chosen leg's own dialog
+/// identity, sends it, and records a *subscriber* REFER subscription so the
+/// referee's `message/sipfrag` NOTIFYs are absorbed (200 OK'd + read) by
+/// [`handle_b2bua_notify`] rather than bridged. Returns `false` if the call or
+/// leg is gone.
 pub fn b2bua_send_outbound_refer(
     state: &DispatcherState,
     internal_call_id: &str,
@@ -433,9 +433,10 @@ pub fn b2bua_refer_call(sip_call_id: &str, refer_to: crate::sip::headers::refer:
 /// controlled call and drives the shipped [`b2bua_refer_accept`] transfer in the
 /// resolved mode (terminate = siphon-terminated 202 + NOTIFY + re-dial;
 /// transparent = forward on the far leg), reusing the exact same machinery the
-/// `@b2bua.on_refer` accept path uses — including #181's single-leg behaviour
-/// (a voice-ai / IVR call with no B leg re-dials the target off the A dialog,
-/// falling back to the referrer's SDP when there is no surviving leg to bridge).
+/// `@b2bua.on_refer` accept path uses — including its single-leg behaviour (a
+/// call siphon answered itself, with no B-leg, re-dials the target off the A
+/// dialog, falling back to the referrer's SDP when there is no surviving leg
+/// to bridge).
 ///
 /// `target` overrides the Refer-To URI, `next_hop` steers egress without
 /// reshaping the R-URI, `mode` overrides the configured
