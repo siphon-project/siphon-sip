@@ -523,6 +523,18 @@ entry, but a working config keeps working.
   answer, and a script's own `rtpengine.offer()` / `rtpengine.answer()` on a
   call already anchored. A profile whose two halves are the same, and every
   re-offer from the caller, is sent exactly what it was.
+- **`rtpengine.answer()` on the caller's 2xx to a re-INVITE from the callee
+  no longer renames the callee.** A proxy script that anchors media calls
+  `rtpengine.answer(reply)` for every 2xx with SDP. The 2xx the caller sends
+  to a re-INVITE of the callee's carries the callee's tag in From and the
+  caller's in To, and the To-tag of whatever reply was answered was recorded
+  as the tag of the call's answering party. The media session then named the
+  caller under both of its tags and the callee under neither, so the next
+  re-offer from the callee, its answer, and each party's `received_from`
+  policy were worked out for the wrong party. The engine command itself was
+  right and is unchanged. The session now never records its offerer's own
+  tag as its answerer's; a different answerer's tag, as a forked INVITE's
+  final answer can carry, still replaces the one held.
 
 ### Changed
 

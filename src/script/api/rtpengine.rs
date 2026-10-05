@@ -3917,6 +3917,61 @@ mod tests {
             }
         }
 
+        /// A proxy script answers through the engine whatever 2xx carries SDP.
+        /// The caller's 2xx to a re-INVITE of the callee's names the callee
+        /// in its From and the caller in its To, so the replying party's tag
+        /// is the caller's. The session keeps naming each party as the first
+        /// exchange did: the caller's tag does not become the callee's, and a
+        /// later re-offer from either side still names its own sender.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn the_callers_answer_to_a_callee_reoffer_leaves_the_sessions_tags_alone() {
+            Python::initialize();
+            let (address, mut requests) = spawn_siphon_rtp_engine().await;
+            let (event_sender, _events) = mpsc::channel(16);
+            let set = crate::rtpengine::SiphonRtpClientSet::new(
+                vec![(address, 2_000, 1)],
+                None,
+                5_000,
+                event_sender,
+            )
+            .unwrap();
+            let sessions = Arc::new(MediaSessionStore::new());
+            sessions.insert(offered("call-13", "call-13", Some("tag-b")));
+            let engine = PyRtpEngine::new(
+                Arc::new(MediaBackend::SiphonRtp(set)),
+                Arc::clone(&sessions),
+                Arc::new(ProfileRegistry::new()),
+            );
+
+            with_engine(engine, |python, engine| {
+                let reply = dialog_message("call-13", Some("tag-a"), OFFER_SDP);
+                reply
+                    .lock()
+                    .unwrap()
+                    .headers
+                    .set("From", "<sip:bob@example.com>;tag=tag-b".to_string());
+                let reply =
+                    PyReply::new(reply).with_response_source(CALLER_SOURCE.to_string(), 5060);
+                let reply = Bound::new(python, reply).unwrap();
+                await_answer(python, engine, reply.as_any(), &PyDict::new(python)).unwrap();
+            })
+            .await;
+
+            let answer = next_named(&mut requests, "answer").await;
+            assert_eq!(answer["from_tag"], "tag-b", "the callee offered");
+            assert_eq!(answer["to_tag"], "tag-a", "the caller answers");
+            let session = sessions.get("call-13").expect("the session");
+            assert_eq!(session.from_tag, "tag-a", "the caller");
+            assert_eq!(session.to_tag.as_deref(), Some("tag-b"), "the callee");
+            assert_eq!(session.offer_tag(true), Some("tag-a"));
+            assert_eq!(
+                session.offer_tag(false),
+                Some("tag-b"),
+                "a re-offer from the callee is still the callee's"
+            );
+            assert_eq!(session.answer_tags(false), Some(("tag-b", "tag-a")));
+        }
+
         /// `rtpengine.offer(request)` on a call already anchored is a re-offer.
         /// From the callee it carries the callee's SDP: pinned to where the
         /// request came from by the callee's own half, not by the `offer` half
