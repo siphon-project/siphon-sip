@@ -61,6 +61,7 @@ mod in_dialog;
 mod inbound;
 mod inbound_filter;
 mod intercept;
+mod late_answer;
 mod liveness;
 mod media_init;
 mod proxy_dialog_state;
@@ -188,6 +189,8 @@ mod proxy_cancel_awaits_provisional_tests;
 #[cfg(test)]
 mod proxy_dialog_state_tests;
 #[cfg(test)]
+mod proxy_late_answer_tests;
+#[cfg(test)]
 mod proxy_protocol_tests;
 #[cfg(test)]
 mod proxy_reply_filter_tests;
@@ -300,6 +303,7 @@ use in_dialog::*;
 use inbound::*;
 use inbound_filter::*;
 use intercept::*;
+use late_answer::*;
 use liveness::*;
 use media_init::*;
 use proxy_dialog_state::*;

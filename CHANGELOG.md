@@ -168,9 +168,32 @@ entry, but a working config keeps working.
   provisional of a silent branch would otherwise be every time. And the
   other branches of a forked request that is not an INVITE are no longer sent
   a CANCEL when one answers (§9.1: a CANCEL is for an INVITE). A 2xx from a
-  branch the proxy has given up on is still not relayed to the caller, as
-  before. **BREAKING (Rust library):** `transaction::state::Action` gains a
+  branch the proxy has given up on is the next entry's. **BREAKING (Rust
+  library):** `transaction::state::Action` gains a
   `SendCancel` variant, which an exhaustive `match` on it has to handle.
+- **The proxy forwards every 2xx to an INVITE, also after the request's
+  final response.** RFC 3261 §16.7 step 5: "After a final response has been
+  sent on the server transaction, the following responses MUST be forwarded
+  immediately: Any 2xx response to an INVITE request", through the server
+  transaction while it can take it and straight to the transport when it
+  cannot (step 9). The proxy dropped such a 2xx: the answer of a second fork
+  branch after another had won or a 6xx had ended the fork, of a branch
+  after `reply.reject()`, and of a branch after the caller's CANCEL. Whether
+  it had crossed the branch's CANCEL or came from a branch whose CANCEL was
+  still waiting for a provisional, the callee was left holding a dialog and
+  retransmitting its 2xx for 64*T1, with nobody to ACK it. It is now handed
+  to the caller, whose user agent ACKs it and ends the dialog with a BYE
+  (§13.2.2.4), and both are routed like any other dialog's: the entry the
+  ACK is routed by is put back for it, a cancelled INVITE's session is kept
+  for as long as a branch is still owed a final response (it used to go with
+  the CANCEL), and each branch's final response releases its part. Such a
+  2xx is not the call's answer. `@proxy.on_reply` and a per-relay `on_reply`
+  do not run for it, because the script has already seen this request end;
+  no answer time or destination is stamped on the call's record and no Rf
+  session is opened; and the BYE that ends its dialog does not close the
+  call's record or its Rf session, which belong to the dialog that was
+  answered first and may still be up. A branch's own 2xx arriving again is
+  its retransmission and is not forwarded a second time.
 - **The proxy ACKs a failed branch once.** A 300-699 final response to a
   proxied INVITE drew two ACKs: the INVITE client transaction's (RFC 3261
   §17.1.1.3) and a second one built by the proxy itself. Only the

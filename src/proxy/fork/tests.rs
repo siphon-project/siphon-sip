@@ -47,14 +47,16 @@ fn test_parallel_first_2xx_wins() {
     assert!(!aggregator.is_complete());
 }
 
-/// Regression: parallel fork where two branches both return 200 OK
-/// (CANCEL races with branch B's already-in-flight 200 on TCP).  The
-/// aggregator must Forward2xx for the first 200 and `ContinueWaiting`
-/// for the second, otherwise the proxy emits two copies of the 200 to
-/// the UAC and sipp's UAC scenario classifies the late ACK as
-/// `FailedUnexpectedMessage` (the documented Proxy/TCP ~0.025 % rate).
+/// RFC 3261 §16.7 step 5 requires the forward: "After a final response has
+/// been sent on the server transaction, the following responses MUST be
+/// forwarded immediately: Any 2xx response to an INVITE request."  A second
+/// branch answering 2xx, because its 200 crossed its CANCEL or because it
+/// answered without ever sending the provisional its CANCEL waited for (§9.1),
+/// has opened a dialog that only the caller can ACK and release (§13.2.2.4).
+/// Dropping it leaves that callee retransmitting its 200 into a call nobody
+/// ends.  It is forwarded as another 2xx, not as the fork's answer.
 #[test]
-fn test_parallel_late_2xx_from_cancelled_branch_is_dropped() {
+fn test_parallel_late_2xx_from_cancelled_branch_is_forwarded() {
     let mut aggregator = make_aggregator(3, ForkStrategy::Parallel);
     for index in 0..3 {
         aggregator.mark_trying(index);
@@ -65,13 +67,58 @@ fn test_parallel_late_2xx_from_cancelled_branch_is_dropped() {
     assert_eq!(action, ForkAction::Forward2xx);
 
     // Second 200 — branch 2's in-flight 200 racing with the CANCEL.
-    // Must NOT be Forward2xx; must be silently absorbed.
     let action = aggregator.on_branch_response(2, 200);
-    assert_eq!(action, ForkAction::ContinueWaiting);
+    assert_eq!(action, ForkAction::ForwardAnother2xx);
 
-    // And a third — defensive, e.g. branch 0 also raced.
+    // And a third, e.g. branch 0 also raced.
     let action = aggregator.on_branch_response(0, 200);
-    assert_eq!(action, ForkAction::ContinueWaiting);
+    assert_eq!(action, ForkAction::ForwardAnother2xx);
+}
+
+/// A 2xx coming again on a branch that already answered is that branch's
+/// retransmission: it is neither the fork's answer a second time nor another
+/// dialog.
+#[test]
+fn a_retransmitted_2xx_is_not_another_answer() {
+    let mut aggregator = make_aggregator(3, ForkStrategy::Parallel);
+    for index in 0..3 {
+        aggregator.mark_trying(index);
+    }
+    assert_eq!(
+        aggregator.on_branch_response(1, 200),
+        ForkAction::Forward2xx
+    );
+    assert_eq!(
+        aggregator.on_branch_response(1, 200),
+        ForkAction::ContinueWaiting,
+        "the winner's 2xx again"
+    );
+    assert_eq!(
+        aggregator.on_branch_response(2, 200),
+        ForkAction::ForwardAnother2xx
+    );
+    assert_eq!(
+        aggregator.on_branch_response(2, 200),
+        ForkAction::ContinueWaiting,
+        "the other branch's 2xx again"
+    );
+}
+
+/// A 2xx after a 6xx ended the fork is forwarded all the same.
+#[test]
+fn a_2xx_after_a_6xx_is_forwarded() {
+    let mut aggregator = make_aggregator(2, ForkStrategy::Parallel);
+    aggregator.mark_trying(0);
+    aggregator.mark_trying(1);
+    assert_eq!(
+        aggregator.on_branch_response(0, 603),
+        ForkAction::Forward6xx
+    );
+    assert!(aggregator.has_settled());
+    assert_eq!(
+        aggregator.on_branch_response(1, 200),
+        ForkAction::ForwardAnother2xx
+    );
 }
 
 /// Regression: a late error after a 2xx already won must not be

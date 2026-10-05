@@ -112,7 +112,7 @@ pub(super) struct Proxy {
 
 /// siphon knows its own address, so `loose_route()` consumes the Route entry
 /// it Record-Routed.
-fn knows_itself(state: &mut DispatcherState) {
+pub(super) fn knows_itself(state: &mut DispatcherState) {
     let mut identity = crate::proxy::core::SelfIdentity::new();
     identity.add_host("192.0.2.1", &[5060]);
     state.self_identity = Arc::new(identity);
@@ -255,7 +255,7 @@ pub(super) fn response_to(
 }
 
 /// An in-dialog request along the route set the dialog's 2xx established.
-fn in_dialog(
+pub(super) fn in_dialog(
     method: &str,
     target: &str,
     source: &str,

@@ -9,7 +9,8 @@
 //! All branches are started simultaneously.  The aggregator follows RFC 3261
 //! §16.7 step 3:
 //!
-//! - **First 2xx** → forward to UAC, CANCEL all other pending branches.
+//! - **First 2xx** → forward to UAC, CANCEL all other pending branches.  A 2xx
+//!   from another branch after that is forwarded too (§16.7 step 5).
 //! - **6xx received** → forward immediately, CANCEL all other branches.
 //! - **All branches failed** → forward the best failure (§16.7 step 6, see
 //!   [`crate::sip::best_response`]): the lowest class present, preferring
@@ -96,6 +97,12 @@ pub struct ForkBranch {
 pub enum ForkAction {
     /// A 2xx was received — forward it upstream and CANCEL all other branches.
     Forward2xx,
+    /// A 2xx was received from another branch after a final response had
+    /// already gone upstream: forward it too (RFC 3261 §16.7 step 5).  It is a
+    /// second dialog, or the answer of a branch the proxy gave up on, which
+    /// only the caller can ACK and release (§13.2.2.4); it is not the fork's
+    /// answer, and nothing more is CANCELled for it.
+    ForwardAnother2xx,
     /// A 6xx was received — forward it upstream and CANCEL all other branches.
     Forward6xx,
     /// Waiting for more branches to complete (parallel mode).
@@ -123,13 +130,11 @@ pub struct ForkAggregator {
     pub strategy: ForkStrategy,
     /// Whether we already forwarded a 100 Trying upstream.
     sent_100: bool,
-    /// Whether a 2xx (or 6xx) has already been forwarded — guards
-    /// against the parallel-fork race where a CANCELled branch's
-    /// already-in-flight 200 OK arrives after another branch's 200
-    /// already won.  Without this flag the aggregator would happily
-    /// say `Forward2xx` for every 2xx received, the proxy would
-    /// forward both copies, and the UAC would see two 200s for one
-    /// INVITE (the documented Proxy/TCP ~0.025 % FailedCall rate).
+    /// Whether a final response has already been forwarded.  Nothing but a
+    /// 2xx goes upstream after it (RFC 3261 §16.7 step 5), and a 2xx that does
+    /// is told apart from the one that settled the fork
+    /// ([`ForkAction::ForwardAnother2xx`]): it is forwarded, and cancels and
+    /// accounts for nothing.
     final_forwarded: bool,
     /// The response chosen when the fork settled on
     /// [`ForwardBestError`](ForkAction::ForwardBestError), until the proxy
@@ -157,6 +162,11 @@ impl ForkAggregator {
             final_forwarded: false,
             best_response: None,
         }
+    }
+
+    /// Whether a final response has already gone upstream for this fork.
+    pub fn has_settled(&self) -> bool {
+        self.final_forwarded
     }
 
     /// Number of branches.
@@ -255,15 +265,26 @@ impl ForkAggregator {
         }
 
         // Final response
+        let answered_before = matches!(
+            self.branches[index].state,
+            BranchState::Completed(200..=299)
+        );
         self.branches[index].state = BranchState::Completed(status_code);
 
-        // 2xx — immediate win.  If a final has already been forwarded
-        // upstream, drop this duplicate (race: branch B's 200 was in
-        // flight when branch A's 200 won and CANCELs were sent; on TCP
-        // both 200s reach the proxy intact).
+        // 2xx.  The first one settles the fork.  RFC 3261 §16.7 step 5: "After
+        // a final response has been sent on the server transaction, the
+        // following responses MUST be forwarded immediately: Any 2xx response
+        // to an INVITE request" — so the 2xx of another branch, whether it
+        // crossed that branch's CANCEL or came from a branch whose CANCEL was
+        // still waiting for a provisional (§9.1), goes upstream as well, for
+        // the caller to ACK and release.  A branch's own 2xx coming again is
+        // its retransmission, not another answer, and is not counted twice.
         if (200..300).contains(&status_code) {
-            if self.final_forwarded {
+            if answered_before {
                 return ForkAction::ContinueWaiting;
+            }
+            if self.final_forwarded {
+                return ForkAction::ForwardAnother2xx;
             }
             self.settle();
             return ForkAction::Forward2xx;

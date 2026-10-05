@@ -420,6 +420,18 @@ impl TransactionManager {
         }
     }
 
+    /// Whether `key` is an INVITE client transaction still owed its final
+    /// response (`Calling` or `Proceeding`).
+    pub fn invite_client_is_pending(&self, key: &TransactionKey) -> bool {
+        self.transactions.get(key).is_some_and(|entry| {
+            matches!(
+                &**entry.value(),
+                Transaction::Ict(ict)
+                    if matches!(ict.state, IctState::Calling | IctState::Proceeding)
+            )
+        })
+    }
+
     /// Number of INVITE client transactions holding a CANCEL that waits for
     /// their first provisional (leak-test accessor): back to its baseline once
     /// each has had a response or timed out.

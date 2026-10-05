@@ -896,10 +896,46 @@ pub(super) fn handle_cancel_via_session(
         drop(session);
     }
 
-    state.session_store.remove_by_server_key(&server_key);
-    // Removing the session is what makes a retransmitted CANCEL unmatchable, so
-    // record the acceptance in the same breath (RFC 3261 §9.2).
+    release_cancelled_session(&session_arc, state);
+    // A retransmitted CANCEL is answered 200 and does none of this again
+    // (RFC 3261 §9.2).
     remember_cancelled_invite(&state.cancelled_invites, server_key);
+}
+
+/// Leave a cancelled INVITE's session to its branches still owed a final
+/// response, and to nothing else.
+///
+/// The caller has its `487`, so the session is marked as finally answered:
+/// whatever a branch still sends is absorbed, except a 2xx, which RFC 3261
+/// §16.7 step 5 has forwarded even now and which needs the session to reach
+/// the caller. The dialog index goes at once (no dialog was established; a
+/// late 2xx puts it back for its own ACK), and so does every branch that has
+/// nothing more to send. A branch still pending is released by its final
+/// response or by its transaction timing out; with none left the session is
+/// gone here.
+fn release_cancelled_session(session_arc: &Arc<RwLock<ProxySession>>, state: &DispatcherState) {
+    let (original_request, client_keys) = match session_arc.write() {
+        Ok(mut session) => {
+            session.final_response_sent = true;
+            (
+                session.original_request.clone(),
+                session.client_keys.clone(),
+            )
+        }
+        Err(error) => {
+            error!("proxy session lock poisoned while releasing a cancelled INVITE: {error}");
+            return;
+        }
+    };
+    state.session_store.remove_dialog_key(&original_request);
+    for client_key in &client_keys {
+        if !state
+            .transaction_manager
+            .invite_client_is_pending(client_key)
+        {
+            state.session_store.remove_client_key(client_key);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

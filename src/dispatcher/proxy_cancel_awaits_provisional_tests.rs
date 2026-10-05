@@ -302,7 +302,8 @@ async fn a_fork_ended_by_a_6xx_cancels_a_silent_branch_on_its_first_provisional(
 
 /// The silent branch of a settled fork answers 2xx without ever sending a
 /// provisional: its INVITE has a final response, so no CANCEL is sent, and the
-/// fork, which forwards one 2xx, sends the caller nothing more.
+/// 2xx goes to the caller, who alone can release that dialog (RFC 3261 §16.7
+/// step 5; followed through in [`super::proxy_late_answer_tests`]).
 #[tokio::test(flavor = "multi_thread")]
 async fn a_silent_branch_of_a_settled_fork_that_answers_is_not_cancelled() {
     for (call_id, deciding_status, reason) in [
@@ -313,7 +314,7 @@ async fn a_silent_branch_of_a_settled_fork_that_answers_is_not_cancelled() {
         answers(&proxy, SILENT, &to_silent, 200, "OK");
         let sent = proxy.wire();
         assert!(cancels_to(&sent, SILENT).is_empty());
-        assert!(responses_to_caller(&sent).is_empty());
+        assert_eq!(responses_to_caller(&sent), [200]);
         assert_eq!(waiting_cancels(&proxy), 0);
     }
 }
@@ -401,11 +402,13 @@ async fn a_silent_branch_of_a_rejected_invite_is_not_cancelled_once_it_has_its_f
         }
         let sent = proxy.wire();
         assert!(cancels_to(&sent, SILENT).is_empty(), "{call_id}");
-        assert!(
-            responses_to_caller(&sent).is_empty(),
-            "{call_id}: {:?}",
-            responses_to_caller(&sent)
-        );
+        // A 2xx is the caller's to release (RFC 3261 §16.7 step 5); nothing
+        // else reaches a caller that already has its final response.
+        let forwarded: &[u16] = match ending {
+            Some((200, _)) => &[200],
+            _ => &[],
+        };
+        assert_eq!(responses_to_caller(&sent), forwarded, "{call_id}");
         if ending.is_some_and(|(status_code, _)| status_code >= 300) {
             assert!(!requests_to(&sent, SILENT, Method::Ack).is_empty());
         }
@@ -537,7 +540,8 @@ async fn a_callers_cancel_sent_late_is_the_cancel_the_caller_sent() {
 }
 
 /// The branch the caller's CANCEL left waiting answers 2xx, fails, or never
-/// responds: no CANCEL, and the caller, already answered 487, hears nothing.
+/// responds: no CANCEL, and the caller, already answered 487, hears nothing
+/// but a 2xx.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_silent_branch_the_caller_gave_up_on_is_not_cancelled_once_it_has_its_final_response() {
     for (call_id, ending) in [
@@ -555,11 +559,13 @@ async fn a_silent_branch_the_caller_gave_up_on_is_not_cancelled_once_it_has_its_
         }
         let sent = proxy.wire();
         assert!(cancels_to(&sent, SILENT).is_empty(), "{call_id}");
-        assert!(
-            responses_to_caller(&sent).is_empty(),
-            "{call_id}: {:?}",
-            responses_to_caller(&sent)
-        );
+        // A 2xx is the caller's to release (RFC 3261 §16.7 step 5); nothing
+        // else reaches a caller that already has its final response.
+        let forwarded: &[u16] = match ending {
+            Some((200, _)) => &[200],
+            _ => &[],
+        };
+        assert_eq!(responses_to_caller(&sent), forwarded, "{call_id}");
         if ending.is_some_and(|(status_code, _)| status_code >= 300) {
             assert_eq!(
                 requests_to(&sent, SILENT, Method::Ack).len(),
@@ -954,7 +960,11 @@ async fn waiting_cancels_drain_to_baseline_over_every_exit() {
     let sent = proxy.wire();
     assert!(cancels_to(&sent, SILENT).is_empty());
     assert_eq!(waiting_cancels(&proxy), 40);
-    assert_eq!(state.session_store.session_count(), 0);
+    assert_eq!(
+        state.session_store.session_count(),
+        40,
+        "each held for its one branch still owed a final response"
+    );
 
     let mut cancels_sent = 0;
     for (index, to_silent) in abandoned.iter().enumerate() {

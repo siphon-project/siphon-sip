@@ -426,7 +426,12 @@ pub(super) fn handle_request(
     // before the script handler so accounting is closed even if the
     // script chooses to drop or reject the BYE; the SIP path itself
     // is unaffected (spawn is fire-and-forget).
-    if method == "BYE" {
+    //
+    // Not for a BYE that ends a dialog a late 2xx opened (RFC 3261 §16.7
+    // step 5): that dialog was never the call, and the call's accounting,
+    // keyed by Call-ID and the caller's tag alone, may be another dialog's.
+    let ends_the_call = method == "BYE" && !state.session_store.take_late_dialog(&message);
+    if ends_the_call {
         spawn_rf_proxy_stop_if_tracked(state, &message);
     }
     // CDR: the call record is written when this scope ends — i.e. *after* the
@@ -436,7 +441,7 @@ pub(super) fn handle_request(
     // every exit path, including the one a dropped or rejected BYE takes —
     // same "accounting closes regardless of what the script decides" rule as
     // the ACR-STOP above.
-    let _cdr_stop_guard = if method == "BYE" && crate::cdr::auto_emit_enabled() {
+    let _cdr_stop_guard = if ends_the_call && crate::cdr::auto_emit_enabled() {
         CdrProxyStop::from_bye(&message).map(|parts| CdrProxyStopGuard {
             sessions: Arc::clone(&state.cdr_sessions),
             parts: Some(parts),

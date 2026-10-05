@@ -530,15 +530,33 @@ pub(super) fn handle_response(
                 )
             };
 
+            // RFC 3261 §16.7 step 5: a 2xx to an INVITE whose final response
+            // has already gone upstream is forwarded all the same, and is not
+            // the call's answer: no reply handler and no accounting below.
+            if forward_if_late_2xx(
+                &message,
+                status_code,
+                client_key,
+                &session_arc,
+                final_response_sent,
+                fork_agg.as_ref(),
+                branch_index,
+                &inbound,
+                state,
+            ) {
+                return;
+            }
+
             // RFC 3261 §17.1.1.3: the ACK of a 300-699 final response is the
             // INVITE client transaction's, and it sent it above. A response no
             // client transaction took is not ACKed from here: that is one the
             // proxy answered the branch with itself (a timeout's 408, a
             // transport error's 503), which the peer never sent.
 
-            // A reply-time `reply.reject()` already committed a final response
-            // upstream for this server transaction and CANCELled the pending
-            // branch(es).  This response is the straggler that CANCEL drew back
+            // A reply-time `reply.reject()`, or the caller's own CANCEL, already
+            // committed a final response upstream for this server transaction
+            // and CANCELled the pending branch(es).  A 2xx was forwarded above
+            // all the same.  This response is the straggler that CANCEL drew back
             // (typically the `487` answering it, or a late provisional).  Any
             // non-2xx final was ACKed downstream by the client transaction, so
             // absorb it here — forwarding it would put a second
@@ -548,7 +566,7 @@ pub(super) fn handle_response(
                 debug!(
                     status = status_code,
                     branch = %branch,
-                    "absorbing straggler after reply-time reject (final already sent)"
+                    "absorbing straggler: a final response was already sent upstream"
                 );
                 if status_code >= 200 {
                     state.session_store.remove_client_key(client_key);
@@ -882,6 +900,12 @@ pub(super) fn handle_response(
                             "fork: forwarding 2xx, cancelling others"
                         );
                         cancel_other_fork_branches(client_key, &server_key, state);
+                    }
+                    crate::proxy::fork::ForkAction::ForwardAnother2xx => {
+                        // Two branches answered at the same moment on two
+                        // workers, and this one came second.
+                        send_late_2xx_upstream(message, client_key, &session_arc, &inbound, state);
+                        return;
                     }
                     crate::proxy::fork::ForkAction::Forward6xx => {
                         debug!(
