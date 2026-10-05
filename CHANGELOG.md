@@ -123,6 +123,25 @@ entry, but a working config keeps working.
   relayed across the formed pair, while the rest of each command is shaped as
   before. `bridge {profile}` is unchanged: the pair profile describes both
   parties, its `offer` half the anchor and its `answer` half the `with` leg.
+- **A transfer on a media-anchored call pins each party's media ingress to its
+  signalling source.** A siphon-terminated REFER, `replace_peer` and an INVITE
+  with `Replaces` each put the surviving party and a new one on a fresh media
+  engine call, and neither the `offer` nor the `answer` sent there carried the
+  `received_from` hint, whatever the profile asked for. The engine has no
+  earlier hint for a fresh call, so a party behind NAT, whose SDP names an
+  address its media does not come from, was gated on that address and the
+  transferred call was silent. Each command now carries the signalling source
+  of the party whose SDP it holds (the surviving leg's remote address, the
+  source of the target's 2xx, the source of the taking-over INVITE) where that
+  party's own policy asks for it. A profile named for the transfer
+  (`accept_refer(profile=)`, `replace_peer {profile}`) describes the pair it
+  creates as a dial's does: its `offer` half the surviving party, whose SDP is
+  offered, and its `answer` half the target. With none named the call's own
+  profile is inherited, the surviving party keeps the half it was set up under
+  (the caller the `offer` half, the callee the `answer` half) and the new party
+  takes the half of the party it replaces, so a party whose policy asks for no
+  hint is still sent none. A replacement that rings several targets pins each
+  target's own answer by its own source.
 - **A retransmitted INVITE on a B2BUA call is answered.** The retransmission
   was recognised (it creates no second call) and then dropped without a
   response. A caller retransmits because it has seen no provisional, so one

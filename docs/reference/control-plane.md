@@ -1742,6 +1742,22 @@ direction-bound one, whose answer half was written for the party that is
 leaving. `timeout` bounds the ring in seconds; `0` means no ring policy, leaving
 only siphon's own guard against a target that answers nothing at all.
 
+**Which party's media ingress is pinned.** On a media-anchored call the
+surviving party and the target meet on a fresh media engine call, which has
+never been told where either party's media comes from. Each is pinned to its
+signalling source (`received_from`) there by its own policy, as in a
+[`bridge`](#joining-two-legs-bridge). With `profile`, that profile describes the
+pair the way a dial's does: its `offer` half decides for the surviving party,
+whose SDP is offered to the target, and its `answer` half for the target.
+Without it the call's own profile is inherited: the surviving party keeps the
+half it was set up under (the caller the `offer` half, the callee the `answer`
+half), and the target takes the half of the party it replaces. With several
+contacts ringing, each is offered on an engine call of its own and the one that
+answers is pinned to where its own answer came from. A REFER accepted with
+[`accept_refer`](#an-inbound-refer-on-a-controlled-call) follows the same rule,
+and so does an INVITE with `Replaces`: the party taking over gets the half of
+the party it replaces, and the one that stays keeps its own.
+
 **The reply is the local action, not the outcome** — `{channel, replacement:
 "dialing", target}`, which means the INVITE is on the wire and nothing more. An
 app that acts on it alone will tear down a call whose replacement is still

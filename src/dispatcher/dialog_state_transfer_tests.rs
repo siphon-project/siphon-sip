@@ -35,7 +35,7 @@ pub(super) fn host_of(address: &str) -> &str {
 
 /// A phone at `source` sends an INVITE for `to`, with an offer and `extra`
 /// headers.
-fn invite(source: &str, call_id: &str, from: &str, to: &str, extra: &str) -> String {
+pub(super) fn invite(source: &str, call_id: &str, from: &str, to: &str, extra: &str) -> String {
     let body = sdp(host_of(source));
     format!(
         concat!(
@@ -101,7 +101,7 @@ pub(super) fn respond(
     assert!(handled, "the call was gone when the {status_code} arrived");
 }
 
-fn place(dispatcher: &TestDispatcher, source: &str, raw: &str) {
+pub(super) fn place(dispatcher: &TestDispatcher, source: &str, raw: &str) {
     let message = parse_sip_message_bytes(raw.as_bytes()).expect("the INVITE parses");
     tokio::task::block_in_place(|| {
         handle_b2bua_invite(inbound(source, raw), message, &dispatcher.state)
@@ -129,7 +129,7 @@ pub(super) fn sent_to(sent: &[Sent], address: &str, method: Method) -> Option<Si
         .map(|sent| sent.message.clone())
 }
 
-fn response_to_phone(sent: &[Sent], address: &str, status_code: u16) -> SipMessage {
+pub(super) fn response_to_phone(sent: &[Sent], address: &str, status_code: u16) -> SipMessage {
     sent.iter()
         .find(|sent| sent.destination == address && sent.message.status_code() == Some(status_code))
         .map(|sent| sent.message.clone())

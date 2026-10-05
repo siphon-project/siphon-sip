@@ -836,6 +836,7 @@ pub fn anchored_answer(
         &caller_ack.body,
         caller_ack.headers.call_id().map_or("", String::as_str),
         &session.profile,
+        None,
     ) {
         Some(answer) => {
             sessions.set_to_tag(&a_leg_call_id, caller_tag);

@@ -25,15 +25,15 @@ use crate::rtpengine::test_native_engine::NativeTestEngine;
 
 /// An answered call whose callee is being replaced by an AoR with two
 /// contacts, both ringing.
-struct Ringing {
-    call: Established,
+pub(super) struct Ringing {
+    pub(super) call: Established,
     /// The call's internal id.
-    call_id: String,
+    pub(super) call_id: String,
     /// Where the second contact is; the first is the call's phone C.
-    mobile: &'static str,
+    pub(super) mobile: &'static str,
     /// The INVITE each contact was sent.
-    to_desk: SipMessage,
-    to_mobile: SipMessage,
+    pub(super) to_desk: SipMessage,
+    pub(super) to_mobile: SipMessage,
 }
 
 impl Ringing {
@@ -41,7 +41,7 @@ impl Ringing {
         &self.call.dispatcher.state
     }
 
-    fn desk(&self) -> &'static str {
+    pub(super) fn desk(&self) -> &'static str {
         self.call.c.1
     }
 
@@ -133,7 +133,7 @@ fn ring_two(prefix: u32, origin: ReplacementOrigin) -> Ringing {
 
 /// [`ring_two`] on a call already established, replacing its caller when
 /// `replace_a_leg` and its callee otherwise.
-fn ring_two_on(
+pub(super) fn ring_two_on(
     call: Established,
     prefix: u32,
     origin: ReplacementOrigin,
@@ -1105,6 +1105,7 @@ async fn ring_two_anchored(prefix: u32, engine: &NativeTestEngine) -> (Ringing, 
             caller_sdp.as_bytes(),
             &old_anchor,
             "rtp_passthrough",
+            None,
         )
         .is_some());
         assert!(b2bua_transfer_rtpengine_answer(
@@ -1115,6 +1116,7 @@ async fn ring_two_anchored(prefix: u32, engine: &NativeTestEngine) -> (Ringing, 
             caller_sdp.as_bytes(),
             &header(&call.to_b, "Call-ID"),
             "rtp_passthrough",
+            None,
         )
         .is_some());
     });

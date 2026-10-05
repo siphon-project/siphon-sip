@@ -216,6 +216,8 @@ mod tests;
 #[cfg(test)]
 mod transfer_bye_tests;
 #[cfg(test)]
+mod transfer_ingress_tests;
+#[cfg(test)]
 mod uas_bad_extension_tests;
 #[cfg(test)]
 mod unacked_answer_tests;

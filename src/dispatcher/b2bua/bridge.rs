@@ -107,17 +107,7 @@ pub fn bridge_leg_snapshot(
             // anchored recorded for it, otherwise the half of its profile its
             // SDP reached the engine under — `offer` for the offerer of a
             // relay, `answer` for a leg the engine answered itself.
-            ingress: session.bridge_sides.as_ref().map_or_else(
-                || crate::rtpengine::session::SideFlags {
-                    profile: session.profile.clone(),
-                    half: if session.to_tag.is_some() {
-                        crate::rtpengine::session::ProfileHalf::Offer
-                    } else {
-                        crate::rtpengine::session::ProfileHalf::Answer
-                    },
-                },
-                |sides| sides.anchor_ingress.clone(),
-            ),
+            ingress: session.party_ingress(true),
             // A session with a second party is a relay and can be renegotiated
             // in place; one the engine answered itself has only the caller.
             relaying: session.to_tag.is_some(),
