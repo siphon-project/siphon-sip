@@ -18,7 +18,10 @@
 //! * a 2xx arrives: it is ACKed and its dialog released with a BYE, and no
 //!   CANCEL is sent (§9.1 has none for a request with a final response);
 //! * any other final arrives: it is ACKed and nothing more is sent;
-//! * nothing arrives: Timer B ends the INVITE's transaction and the branch.
+//! * nothing arrives: Timer B ends the INVITE's transaction, on a reliable
+//!   transport as on UDP, and the CANCEL is never sent. The branch stays
+//!   answerable until its expiry all the same: a final response that turns up
+//!   late is still ACKed, and a 2xx released with a BYE.
 //!
 //! The record of all this is the [`ZombieCancelledLeg`], keyed by the INVITE's
 //! Via branch, because by then the call it belonged to may be gone and the
@@ -302,19 +305,22 @@ impl CallActorStore {
     }
 
     /// Timer B fired for the INVITE on `branch` (RFC 3261 §17.1.1.2): no
-    /// response came in 64·T1 and its client transaction is over. A kept leg
-    /// still waiting for a provisional to send its CANCEL on is released with
-    /// it, and no CANCEL is ever sent.
+    /// response came in 64·T1 and its client transaction is over. A CANCEL a
+    /// kept leg was still owed, waiting for a provisional to be sent on, is
+    /// owed no longer and is never sent: there is no transaction left for it
+    /// to cancel, and a provisional that turns up now draws nothing.
+    ///
+    /// The leg itself stays kept until its own expiry. A far end that answers
+    /// after all has still sent a final response that is owed its ACK, and a
+    /// 2xx among them has created a dialog only a BYE releases (§13.2.2.4,
+    /// §15). With the leg forgotten here that 2xx could only be ACKed, from
+    /// the response alone, and the far end left in a call nobody would end.
     pub fn invite_transaction_timed_out(&self, branch: &str) {
         if self.deferred_cancels.load(Ordering::SeqCst) == 0 {
             return;
         }
-        if self
-            .zombie_cancelled
-            .remove_if(branch, |_, entry| entry.awaiting_provisional)
-            .is_some()
-        {
-            self.deferred_cancels.fetch_sub(1, Ordering::SeqCst);
+        if let Some(mut entry) = self.zombie_cancelled.get_mut(branch) {
+            self.settle_owed_cancel(&mut entry);
         }
     }
 
@@ -468,13 +474,26 @@ mod tests {
     }
 
     #[test]
-    fn timer_b_releases_a_branch_still_waiting_and_only_such_a_branch() {
+    fn timer_b_ends_the_wait_for_a_cancel_and_leaves_the_branch_answerable() {
         let (store, _, leg) = store_with_leg();
         store.keep_answerable(std::iter::once(&leg));
         store.invite_transaction_timed_out(BRANCH);
-        assert_eq!(store.cancelled_branch_count(), 0);
         assert_eq!(store.deferred_cancel_count(), 0);
-        assert!(store.provisional_received(BRANCH).is_none());
+        assert!(
+            store.provisional_received(BRANCH).is_none(),
+            "a provisional after Timer B draws no CANCEL"
+        );
+        assert!(!store.claim_cancel(BRANCH));
+        // Still answerable: a 2xx that turns up late is ACKed and released.
+        assert_eq!(store.cancelled_branch_count(), 1);
+        assert!(matches!(
+            store.zombie_cancelled_for_2xx(BRANCH),
+            Some((_, true))
+        ));
+        assert_eq!(store.deferred_cancel_count(), 0, "settled once");
+        // And it drains at its own expiry.
+        store.expire_cancelled_branch(BRANCH, after_lifetime());
+        assert_eq!(store.cancelled_branch_count(), 0);
 
         // A branch whose CANCEL went out is still owed the ACK of its 487.
         let (store, _, leg) = store_with_leg();

@@ -1694,7 +1694,7 @@ phone is sent depends on what it has said so far:
 | the phone has sent | what siphon sends it |
 |---|---|
 | a provisional (`100 Trying` counts) | the CANCEL, at once; the `487` it draws is ACKed |
-| nothing | nothing new: its INVITE goes on being retransmitted (UDP). Its first provisional then draws the CANCEL; a `2xx` instead is ACKed and released with a BYE, never CANCELled; any other final response is ACKed and that is all; and if it stays silent the INVITE times out at Timer B (64·T1, 32 s by default) with no CANCEL sent |
+| nothing | nothing new: its INVITE goes on being retransmitted (UDP). Its first provisional then draws the CANCEL; a `2xx` instead is ACKed and released with a BYE, never CANCELled; any other final response is ACKed and that is all; and if it stays silent the INVITE times out at Timer B (64·T1, 32 s by default, on a reliable transport too, where nothing is retransmitted) with no CANCEL sent. A `2xx` that turns up after Timer B is still ACKed and released with a BYE |
 | its final response | nothing: there is no INVITE left to cancel |
 
 None of that delays the application. The reply, `DialBranchFailed`,

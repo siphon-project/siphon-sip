@@ -199,20 +199,24 @@ pub fn arm_b2bua_retransmit(
             ));
     }
 
-    state.b2bua_retransmits.arm(
-        key,
-        data.clone(),
-        crate::b2bua::retransmit::RetransmitTarget {
-            destination,
-            transport,
-            // Schedules exist for UDP only (`B2buaRetransmits::arm` refuses
-            // reliable transports), and UDP egress selects its socket from
-            // `source_local_addr`, never from the connection id.
-            connection_id: ConnectionId::default(),
-            source_local_addr,
-        },
-        std::time::Instant::now(),
-    );
+    let target = crate::b2bua::retransmit::RetransmitTarget {
+        destination,
+        transport,
+        // Retransmission is for UDP only (`B2buaRetransmits::arm` refuses
+        // reliable transports), and UDP egress selects its socket from
+        // `source_local_addr`, never from the connection id.
+        connection_id: ConnectionId::default(),
+        source_local_addr,
+    };
+    let now = std::time::Instant::now();
+    if !state
+        .b2bua_retransmits
+        .arm(key.clone(), data.clone(), target.clone(), now)
+    {
+        // A reliable transport: nothing to retransmit, but an INVITE's Timer B
+        // runs there too (RFC 3261 §17.1.1.2).
+        state.b2bua_retransmits.arm_timeout(key, target, now);
+    }
 }
 
 /// Stop retransmitting for every B-leg of `call` that cannot be CANCELled: one

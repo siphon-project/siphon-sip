@@ -130,8 +130,8 @@ entry, but a working config keeps working.
   the caller, a script and a controller are told (`487`, `DialBranchFailed`,
   `DialFailed`, the `cancel_dial` reply, `@b2bua.on_cancel`, the CDR) and
   the release of media still happen when siphon gives up, not when that
-  party finally answers. On a reliable transport, where nothing is
-  retransmitted, a waiting CANCEL is dropped 32 s after siphon gave up. The
+  party finally answers. On a reliable transport nothing is retransmitted
+  and Timer B ends the wait the same way. The
   proxy path is not changed: a CANCEL relayed or generated for a proxied
   INVITE (`request.relay()`, `request.fork()`, `reply.reject()`) still goes
   out without waiting.
@@ -568,6 +568,21 @@ entry, but a working config keeps working.
   decides for both legs of that pair. A pair that never used a pair profile
   is shaped and pinned exactly as before. The record goes with its call on
   every way the call ends.
+- **An INVITE siphon sends on a reliable transport times out at Timer B.**
+  RFC 3261 §17.1.1.2 starts Timer B at 64·T1 "for any transport". The B2BUA
+  timed only the INVITEs it retransmits, so over TCP, TLS or WebSocket
+  nothing ever said that a far end which took the INVITE and answered
+  nothing had had its time. A CANCEL held back for that far end's first
+  provisional (§9.1) then stayed owed until the branch was forgotten, and a
+  `100 Trying` arriving before that still drew it, after the INVITE's own
+  64·T1 had passed. Timer B now runs for those INVITEs
+  too: nothing is retransmitted, and at 64·T1 the CANCEL is owed no longer
+  and is never sent, as on UDP. On every transport the branch then stays
+  answerable until its own expiry instead of being forgotten at Timer B, so
+  a `2xx` that turns up after it is ACKed and its dialog released with a BYE
+  (§13.2.2.4, §15). With the branch forgotten at Timer B that `2xx` drew
+  neither, and the far end was left in a call nobody would end. A
+  provisional after Timer B draws nothing.
 
 ### Changed
 
