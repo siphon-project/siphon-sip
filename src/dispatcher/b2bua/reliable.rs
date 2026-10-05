@@ -962,9 +962,7 @@ pub fn claim_refusal(
         .a_leg_reliability
         .finish()
         .or_else(|| call.prack_bridge.take_deferred_answer());
-    for b_leg in &call.b_legs {
-        state.b2bua_retransmits.disarm_branch(&b_leg.branch);
-    }
+    disarm_unstashed_b_leg_invites(&call, state);
     if held.is_none() {
         for handle in call.b_leg_handles.iter().flatten() {
             let _ = handle.tx.try_send(crate::b2bua::actor::LegMessage::Cancel);

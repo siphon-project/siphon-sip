@@ -4,11 +4,12 @@
 
 use crate::dispatcher::*;
 
-/// A response on a fork branch siphon has CANCELled because another branch
+/// A response on a fork branch siphon has given up on because another branch
 /// answered, or one declined with a 6xx.
 ///
 /// None of it may reach the call, which is answered or about to be torn down: a
-/// 1xx is dropped, the ordinary 487 is ACKed (RFC 3261 §17.1.1.3), and a 2xx
+/// 1xx is dropped, once it has let out the CANCEL that waited for it (RFC 3261
+/// §9.1), the ordinary 487 is ACKed (RFC 3261 §17.1.1.3), and a 2xx
 /// that crossed the CANCEL is ACKed and its dialog released with a BYE
 /// (§13.2.2.4, §15). That is the handling the branch gets once the call is
 /// gone, so it is the same code. Returns `true` when the response was this.
@@ -19,6 +20,13 @@ pub fn absorb_cancelled_branch_response(
     status_code: u16,
     state: &DispatcherState,
 ) -> bool {
+    // Every response to a B-leg INVITE passes here first, which makes it the
+    // place a provisional is recorded on its branch: what a CANCEL for that
+    // INVITE waits on (RFC 3261 §9.1), sent now if siphon gave up on the branch
+    // while it had drawn nothing.
+    if status_code < 200 {
+        cancel_on_first_provisional(branch, state);
+    }
     if !state.call_actors.is_cancelled_branch(branch) {
         return false;
     }

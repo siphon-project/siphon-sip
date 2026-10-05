@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use dashmap::DashMap;
@@ -606,7 +607,7 @@ pub struct LegRegistry {
     /// SIP Call-ID → internal call ID (for matching inbound requests).
     by_call_id: DashMap<String, String>,
     /// Via branch → internal call ID (for matching responses).
-    by_branch: DashMap<String, String>,
+    by_branch: DashMap<String, BranchEntry>,
     /// Via branch → the siphon-originated REFER that branch belongs to.
     ///
     /// Kept apart from [`Self::by_branch`], which maps a branch to a *leg* whose
@@ -627,7 +628,31 @@ pub struct LegRegistry {
     /// and has no B-leg, so relaying its own 180 back at the peer we are calling
     /// is exactly wrong. This index gives the response path a first, explicit
     /// hook (checked before the leg-branch lookup) into the UAC-side handler.
-    originated_calls: DashMap<String, String>,
+    originated_calls: DashMap<String, BranchEntry>,
+}
+/// What the registry keeps for a Via branch siphon is matching responses on.
+#[derive(Debug)]
+struct BranchEntry {
+    /// The internal id of the call the branch belongs to.
+    call_id: String,
+    /// Whether a provisional response has arrived on the branch, a
+    /// `100 Trying` included.
+    ///
+    /// RFC 3261 §9.1 allows a CANCEL for an INVITE only once one has, so this
+    /// is what a CANCEL waits on. It is kept here, beside the branch, because
+    /// the response path has the branch in hand and nothing else: a
+    /// `100 Trying` is absorbed before any call is looked up, and recording it
+    /// on the leg would cost every provisional a call lookup and its lock.
+    provisional: AtomicBool,
+}
+
+impl BranchEntry {
+    fn new(internal_id: &str) -> Self {
+        Self {
+            call_id: internal_id.to_string(),
+            provisional: AtomicBool::new(false),
+        }
+    }
 }
 /// A REFER siphon sent on one of its own legs, awaiting a response.
 ///
@@ -663,18 +688,44 @@ impl LegRegistry {
     /// UAC-side handler instead of the B-leg relay machinery.
     pub fn register_originated_call(&self, branch: &str, internal_id: &str) {
         self.originated_calls
-            .insert(branch.to_string(), internal_id.to_string());
+            .insert(branch.to_string(), BranchEntry::new(internal_id));
     }
 
     /// The internal call id of the originate this branch belongs to, if any.
     pub fn lookup_originated_call(&self, branch: &str) -> Option<String> {
-        self.originated_calls.get(branch).map(|entry| entry.clone())
+        self.originated_calls
+            .get(branch)
+            .map(|entry| entry.call_id.clone())
+    }
+
+    /// Record that a provisional response arrived on `branch`, for an INVITE
+    /// siphon sent on a leg or placed itself. A branch that is neither misses.
+    ///
+    /// Runs for every provisional on the response path: two map reads and one
+    /// atomic store at most, and no allocation.
+    pub fn note_provisional(&self, branch: &str) {
+        if let Some(entry) = self.by_branch.get(branch) {
+            entry.provisional.store(true, Ordering::SeqCst);
+        } else if let Some(entry) = self.originated_calls.get(branch) {
+            entry.provisional.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Whether a provisional response has arrived on `branch`. `false` for a
+    /// branch that is not registered: nothing was ever recorded for it.
+    pub fn provisional_received(&self, branch: &str) -> bool {
+        let seen = |entry: &BranchEntry| entry.provisional.load(Ordering::SeqCst);
+        self.by_branch
+            .get(branch)
+            .map(|entry| seen(&entry))
+            .or_else(|| self.originated_calls.get(branch).map(|entry| seen(&entry)))
+            .unwrap_or(false)
     }
 
     /// Drop the originate branch index entry of a call that is gone.
     pub fn clear_originated_calls(&self, internal_id: &str) {
         self.originated_calls
-            .retain(|_, id| id.as_str() != internal_id);
+            .retain(|_, entry| entry.call_id != internal_id);
     }
 
     /// Number of tracked originate branches (leak-test accessor).
@@ -718,7 +769,7 @@ impl LegRegistry {
     /// Register a Via branch → internal call ID mapping.
     pub fn register_branch(&self, branch: &str, internal_id: &str) {
         self.by_branch
-            .insert(branch.to_string(), internal_id.to_string());
+            .insert(branch.to_string(), BranchEntry::new(internal_id));
     }
 
     /// Look up internal call ID by SIP Call-ID.
@@ -728,7 +779,9 @@ impl LegRegistry {
 
     /// Look up internal call ID by Via branch.
     pub fn lookup_branch(&self, branch: &str) -> Option<String> {
-        self.by_branch.get(branch).map(|v| v.clone())
+        self.by_branch
+            .get(branch)
+            .map(|entry| entry.call_id.clone())
     }
 
     /// Remove a SIP Call-ID mapping.
@@ -746,7 +799,8 @@ impl LegRegistry {
         // Remove all Call-ID mappings for this call
         self.by_call_id.retain(|_, v| v.as_str() != internal_id);
         // Remove all branch mappings for this call
-        self.by_branch.retain(|_, v| v.as_str() != internal_id);
+        self.by_branch
+            .retain(|_, entry| entry.call_id != internal_id);
         // ...including any REFER siphon originated on it and is still awaiting a
         // response. A call that is gone cannot be transferred, and leaving the
         // entry would leak one per abandoned transfer.
@@ -755,7 +809,7 @@ impl LegRegistry {
         // ...and the originate branch, for the same reason: one entry per placed
         // call would otherwise never drain.
         self.originated_calls
-            .retain(|_, id| id.as_str() != internal_id);
+            .retain(|_, entry| entry.call_id != internal_id);
     }
 
     /// Number of registered calls (unique internal IDs in Call-ID map).

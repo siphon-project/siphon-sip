@@ -14,7 +14,7 @@ use super::dial_bridge_test_harness::{
     Caller, CALLER,
 };
 use super::originate_test_harness::{
-    drain, phone_offer, phone_response, phone_sends, requests_to, socket,
+    drain, phone_offer, phone_response, phone_sends, phone_tries, requests_to, socket,
 };
 use super::*;
 use crate::rtpengine::test_native_engine::{NativeTestEngine, NATIVE_ENGINE_OFFER};
@@ -98,6 +98,9 @@ async fn the_first_phone_to_answer_is_bridged_to_the_answered_caller() {
             && sent.iter().all(|frame| frame.destination != socket(CALLER)),
         "nothing goes to the caller while the phones ring"
     );
+    // The desk takes its INVITE with a 100 Trying: no alerting yet, so no
+    // ringback, and the provisional its CANCEL waits for (RFC 3261 §9.1).
+    phone_tries(state, DESK, &desk_invite);
     assert!(
         engine.commands("play_media").is_empty(),
         "no ringback before a phone alerts"
@@ -297,6 +300,7 @@ async fn a_sequential_bridge_dial_moves_on_when_a_phone_is_busy_or_rings_out() {
     let sent = drain(&controller.dispatcher.udp);
     let second = invite_to(&sent, SECOND);
     assert!(requests_to(&sent, socket(THIRD), Method::Invite).is_empty());
+    phone_tries(state, SECOND, &second);
 
     // It rings out: CANCELled, and the third is tried.
     check_b2bua_answer_timeouts_at(
@@ -333,7 +337,6 @@ async fn a_sequential_bridge_dial_moves_on_when_a_phone_is_busy_or_rings_out() {
         })
         .collect();
     assert_eq!(causes, ["rejected", "timeout", "rejected"]);
-    let _ = second;
     assert_caller_untouched(&controller, &caller, "caller-hunt");
     assert_drained(state);
 }
@@ -469,6 +472,7 @@ async fn a_caller_that_hangs_up_while_the_phones_ring_cancels_every_phone() {
             None,
         ),
     );
+    phone_tries(state, MOBILE, &invite_to(&sent, MOBILE));
     assert!(eventually(|| engine.commands("play_media").len() == 1).await);
     let _ = events(&controller).await;
     assert_eq!(state.dial_bridges.ringing_count(), 1);
@@ -535,7 +539,8 @@ async fn a_caller_siphon_hangs_up_while_the_phones_ring_cancels_every_phone() {
     )
     .await;
     assert_eq!(reply["status"], "ok", "{reply}");
-    drain(&controller.dispatcher.udp);
+    let sent = drain(&controller.dispatcher.udp);
+    phone_tries(state, DESK, &invite_to(&sent, DESK));
 
     assert!(b2bua_terminate_call_inner(
         &caller.internal_call_id,

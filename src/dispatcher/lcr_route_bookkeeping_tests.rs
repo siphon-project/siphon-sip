@@ -106,7 +106,9 @@ pub(super) fn caller_cancels(sequence: &Sequence) {
 }
 
 /// Start `routes` and fail the first carrier with a 503, which dials the
-/// second.
+/// second. That one takes the INVITE with a `100 Trying`, as a carrier does:
+/// no progress, and the provisional a CANCEL for it has to wait for (RFC 3261
+/// §9.1).
 fn first_carrier_fails(routes: Vec<crate::lcr::Route>, script: &str) -> (Sequence, SipMessage) {
     let mut sequence = Sequence::start_with_script(routes, 5, script);
     let first = invite_to(sequence.wire(), FIRST_CARRIER);
@@ -121,6 +123,7 @@ fn first_carrier_fails(routes: Vec<crate::lcr::Route>, script: &str) -> (Sequenc
     );
     sequence.redialled();
     let second = invite_to(sent, SECOND_CARRIER);
+    sequence.carrier_tries(SECOND_CARRIER, &second);
     (sequence, second)
 }
 
@@ -234,14 +237,16 @@ async fn a_carrier_that_failed_is_not_cancelled_when_on_failure_routes_the_call_
     );
     let first = invite_to(sequence.wire(), FIRST_CARRIER);
     sequence.carrier_answers(FIRST_CARRIER, &first, 503, "Service Unavailable");
+    let sent = sequence.wire();
     assert_eq!(
-        summaries(&sequence.wire()),
+        summaries(&sent),
         [
             format!("ACK to {FIRST_CARRIER}"),
             format!("INVITE to {BACKUP_TARGET}")
         ]
     );
     sequence.redialled();
+    sequence.carrier_tries(BACKUP_TARGET, &invite_to(sent, BACKUP_TARGET));
 
     sequence.ring_for(Duration::from_secs(4));
     assert_eq!(
@@ -270,14 +275,16 @@ async fn a_retransmitted_failure_from_a_carrier_that_failed_is_absorbed() {
     );
     let first = invite_to(sequence.wire(), FIRST_CARRIER);
     sequence.carrier_answers(FIRST_CARRIER, &first, 503, "Service Unavailable");
+    let sent = sequence.wire();
     assert_eq!(
-        summaries(&sequence.wire()),
+        summaries(&sent),
         [
             format!("ACK to {FIRST_CARRIER}"),
             format!("INVITE to {SECOND_CARRIER}")
         ]
     );
     sequence.redialled();
+    sequence.carrier_tries(SECOND_CARRIER, &invite_to(sent, SECOND_CARRIER));
 
     sequence.carrier_answers(FIRST_CARRIER, &first, 503, "Service Unavailable");
     assert_eq!(
@@ -381,7 +388,8 @@ async fn a_carrier_that_rings_out_without_rerouting_is_recorded_as_a_failed_atte
         5,
         RECORD_EVENTS,
     );
-    invite_to(sequence.wire(), FIRST_CARRIER);
+    let first = invite_to(sequence.wire(), FIRST_CARRIER);
+    sequence.carrier_tries(FIRST_CARRIER, &first);
 
     sequence.ring_for(Duration::from_secs(2));
     assert_eq!(
@@ -409,7 +417,8 @@ async fn a_carrier_that_rings_out_and_is_failed_over_is_recorded_once() {
         5,
         RECORD_EVENTS,
     );
-    invite_to(sequence.wire(), FIRST_CARRIER);
+    let first = invite_to(sequence.wire(), FIRST_CARRIER);
+    sequence.carrier_tries(FIRST_CARRIER, &first);
 
     sequence.ring_for(Duration::from_secs(2));
     assert_eq!(
@@ -439,7 +448,8 @@ async fn a_carrier_that_rings_out_onto_unroutable_carriers_is_recorded_once() {
         5,
         RECORD_EVENTS,
     );
-    invite_to(sequence.wire(), FIRST_CARRIER);
+    let first = invite_to(sequence.wire(), FIRST_CARRIER);
+    sequence.carrier_tries(FIRST_CARRIER, &first);
 
     sequence.ring_for(Duration::from_secs(2));
     assert_eq!(
@@ -509,14 +519,10 @@ async fn a_carrier_that_rang_before_failing_is_not_progress_for_the_last_carrier
     );
     sequence.redialled();
 
+    // The last carrier has sent nothing at all, so it is not CANCELled either
+    // (RFC 3261 §9.1): its INVITE runs to Timer B, or to its first provisional.
     sequence.ring_for(Duration::from_secs(2));
-    assert_eq!(
-        summaries(&sequence.wire()),
-        [
-            format!("CANCEL to {SECOND_CARRIER}"),
-            format!("503 to {CALLER}")
-        ]
-    );
+    assert_eq!(summaries(&sequence.wire()), [format!("503 to {CALLER}")]);
     assert_eq!(
         events(&sequence),
         "route:carrier-a:503;route:carrier-b:408;failure:503:carrier-a=503,carrier-b=408;"
@@ -600,14 +606,9 @@ async fn a_silent_carrier_ringing_out_onto_an_undialable_carrier_fails_503() {
     );
     invite_to(sequence.wire(), FIRST_CARRIER);
 
+    // Silent to the end: no provisional, so no CANCEL (RFC 3261 §9.1).
     sequence.ring_for(Duration::from_secs(2));
-    assert_eq!(
-        summaries(&sequence.wire()),
-        [
-            format!("CANCEL to {FIRST_CARRIER}"),
-            format!("503 to {CALLER}")
-        ]
-    );
+    assert_eq!(summaries(&sequence.wire()), [format!("503 to {CALLER}")]);
     assert_eq!(
         events(&sequence),
         "route:carrier-a:408;route:carrier-b:503;failure:503:carrier-a=408,carrier-b=503;"

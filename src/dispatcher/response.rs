@@ -194,6 +194,10 @@ pub(super) fn handle_response(
         // destination.
         if let Ok(key) = TransactionManager::key_from_message(&message) {
             if key.method == crate::sip::message::Method::Invite {
+                // A 100 is a provisional for RFC 3261 §9.1 too: it is recorded
+                // on the branch, and draws the CANCEL of an INVITE siphon gave
+                // up on while it had no response.
+                cancel_on_first_provisional(&key.branch, state);
                 if let Ok(actions) = state.transaction_manager.process_client_event(
                     &key,
                     ClientEvent::Ict(IctEvent::Provisional(message.clone())),
@@ -249,6 +253,11 @@ pub(super) fn handle_response(
     // *is* the A-leg, so relaying its own 180 would put it back on the wire at
     // the party we are calling.
     if let Some(internal_call_id) = state.call_actors.lookup_originated_call(&branch) {
+        if status_code < 200 {
+            // Recorded on the branch: what a CANCEL for this INVITE waits on
+            // (RFC 3261 §9.1).
+            cancel_on_first_provisional(&branch, state);
+        }
         handle_originated_call_response(
             &internal_call_id,
             &message,
@@ -286,6 +295,19 @@ pub(super) fn handle_response(
         // right after. Handled below like any response for a call that already
         // ended, so a 2xx to our own INVITE still gets its ACK.
         torn_down_call = Some(call_id);
+    }
+
+    // RFC 3261 §9.1: a provisional on the branch of an INVITE siphon gave up
+    // on while it had drawn no response is what its CANCEL was waiting for. The
+    // call is gone, so the two handlers above, which do this for a call that
+    // lives, never saw it.
+    if status_code < 200
+        && message
+            .headers
+            .get("CSeq")
+            .is_some_and(|cseq| cseq.contains("INVITE"))
+    {
+        cancel_on_first_provisional(&branch, state);
     }
 
     // Post-CANCEL glare (RFC 3261 §9.1): a 2xx that raced an outbound CANCEL.

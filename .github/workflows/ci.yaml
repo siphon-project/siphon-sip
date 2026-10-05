@@ -1699,6 +1699,92 @@ jobs:
             siphon-rtp-engine.log
             *.log
 
+  # ── `dial {on_answer: "bridge"}`: ringing a phone for an answered caller ──
+  # A phone registers. A controller answers a caller anchored on the media
+  # engine, rings the phone's AoR with `dial {on_answer: "bridge"}`, and siphon
+  # bridges the two when the phone picks up. Two oracles:
+  #
+  #   * the SIPp scenarios decide the run and assert the SIP wire — the phone
+  #     rung offerless and shown the caller's identity, its answer carried on
+  #     the ACK (RFC 3261 §13.2.2.4), both legs re-INVITEd onto the engine by
+  #     the bridge, the caller's hold and resume relayed to the phone, and the
+  #     BYE the phone gets when the caller leaves (the peer-hangup policy);
+  #   * the application's verdict covers the verb contract — a connecting dial
+  #     and a second bridge dial both refused `invalid_state`, the reply naming
+  #     one branch, ringback once the phone alerts, `DialAnswered` naming a
+  #     channel for the phone, and `ChannelBridged` on both channels.
+  #
+  # Against the real siphon-rtp engine: the bridge re-points live media
+  # sessions, which a mock would only record.
+  sipp-dial-bridge:
+    runs-on: ubuntu-latest
+    needs: build-image
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Load the siphon image
+        uses: ./.github/actions/load-siphon-image
+
+      # --wait on the application as well: siphon parks a handed-over call only
+      # while a controller is connected.
+      - name: Start the media engine, siphon and the control application
+        run: docker compose -f sipp/docker-compose.yaml --profile dial-bridge up -d --force-recreate --wait siphon-rtp-engine siphon-dial-bridge dial-bridge-app
+
+      # The phone's dependency registers its AoR and runs to completion; the
+      # phone then listens on the same address.
+      - name: Register the phone, then start it
+        run: docker compose -f sipp/docker-compose.yaml --profile dial-bridge up -d --force-recreate sipp-dial-bridge-phone
+
+      # The caller finishes last (its trailing pause), so it decides the step.
+      # --no-deps: the register one-shot shares the phone's address and must not
+      # be started again while the phone holds it.
+      - name: Answer the caller, ring the phone, bridge the two on answer
+        run: docker compose -f sipp/docker-compose.yaml --profile dial-bridge up --no-deps --abort-on-container-exit --exit-code-from sipp-dial-bridge-uac sipp-dial-bridge-uac
+
+      # The phone ran detached, so without this its scenario could fail and the
+      # job would still be green.
+      - name: Assert the phone scenario passed
+        run: |
+          code="$(timeout 90 docker wait sipp-dial-bridge-phone || echo "no exit within 90 s")"
+          if [ "$code" != "0" ]; then
+            echo "the phone scenario exited $code"
+            docker compose -f sipp/docker-compose.yaml logs sipp-dial-bridge-phone | tail -60
+            exit 1
+          fi
+
+      - name: Assert the control application's verdict
+        if: always()
+        run: |
+          docker compose -f sipp/docker-compose.yaml logs dial-bridge-app > dial-bridge-app.log 2>&1 || true
+          grep -q 'DIAL-BRIDGE-VERDICT' dial-bridge-app.log || { echo "no verdict — the control application never completed"; exit 1; }
+          if grep -q '"pass": false' dial-bridge-app.log; then
+            echo "dial-bridge acceptance checks failed:"; grep 'DIAL-BRIDGE-VERDICT' dial-bridge-app.log; exit 1
+          fi
+          grep 'DIAL-BRIDGE-VERDICT' dial-bridge-app.log
+
+      - name: Collect logs
+        if: always()
+        run: |
+          docker compose -f sipp/docker-compose.yaml logs siphon-dial-bridge > siphon-dial-bridge.log 2>&1 || true
+          docker compose -f sipp/docker-compose.yaml logs sipp-dial-bridge-phone > sipp-dial-bridge-phone.log 2>&1 || true
+          docker compose -f sipp/docker-compose.yaml logs siphon-rtp-engine > siphon-rtp-engine.log 2>&1 || true
+
+      - name: Teardown
+        if: always()
+        run: docker compose -f sipp/docker-compose.yaml --profile dial-bridge down --remove-orphans
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: sipp-dial-bridge-logs
+          path: |
+            siphon-dial-bridge.log
+            dial-bridge-app.log
+            sipp-dial-bridge-phone.log
+            siphon-rtp-engine.log
+            *.log
+
   # ── Control plane: the external application rail ────────────────────────
   # An out-of-process application drives real calls over a real WebSocket. Five
   # cases against one siphon, both connection modes at once (per-call-connect,
@@ -1900,6 +1986,13 @@ jobs:
 
       - name: cancel_dial — both phones CANCELled, the caller untouched and dialled for again
         run: bash sipp/control/run_transfer_case.sh cancel-dial control_transfer_cancel_dial_uac.xml sipp-control-transfer-ringing-phone sipp-control-transfer-trying-phone
+
+      # RFC 3261 §9.1: no CANCEL for an INVITE that has drawn no provisional.
+      - name: cancel_dial before the phone has responded — CANCELled on its first provisional, the 487 ACKed
+        run: bash sipp/control/run_transfer_case.sh cancel-late-ringing control_transfer_cancel_dial_uac.xml sipp-control-transfer-late-ringing-phone
+
+      - name: cancel_dial before the phone has responded — its late 200 ACKed and released with a BYE, never CANCELled
+        run: bash sipp/control/run_transfer_case.sh cancel-late-answer control_transfer_cancel_dial_uac.xml sipp-control-transfer-late-answering-phone
 
       - name: A REFER from the callee — declined, then accepted and carried out by siphon
         run: bash sipp/control/run_transfer_case.sh refer-callee control_transfer_survivor_uac.xml sipp-control-transfer-referrer-phone sipp-control-transfer-target

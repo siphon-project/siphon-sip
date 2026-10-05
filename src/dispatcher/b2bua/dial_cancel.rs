@@ -140,9 +140,7 @@ pub fn b2bua_cancel_dial_with_state(
 /// neither can move the call afterwards.
 fn cancel_connecting_dial(call_id: &str, state: &DispatcherState) {
     if let Some(call) = state.call_actors.get_call(call_id) {
-        for b_leg in &call.b_legs {
-            state.b2bua_retransmits.disarm_branch(&b_leg.branch);
-        }
+        disarm_unstashed_b_leg_invites(&call, state);
     }
     // Named as cancelled ahead of the CANCELs, and before the hunt could place
     // another attempt.

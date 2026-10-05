@@ -16,6 +16,8 @@ use crate::sip::message::SipMessage;
 
 use super::*;
 
+mod cancelled;
+pub use cancelled::{ZombieCancelledLeg, CANCELLED_BRANCH_LIFETIME};
 mod by_branch;
 mod dial_branch;
 mod dialog_watch;
@@ -64,6 +66,8 @@ pub struct CallActorStore {
     /// Post-CANCEL glare absorber (RFC 3261 §9.1): a 2xx that raced our CANCEL
     /// is ACKed + BYEd here, keyed by B-leg SIP Call-ID.
     pub zombie_cancelled: DashMap<String, ZombieCancelledLeg>,
+    /// How many of those are still owed their CANCEL. See [`cancelled`].
+    pub(super) deferred_cancels: std::sync::atomic::AtomicUsize,
     /// SIP Call-IDs of calls this node has torn down → when they were torn down,
     /// so a late in-dialog request naming one can be answered 481 instead of
     /// dropped ([`Self::is_recently_terminated`]). Read on the request path, so
@@ -84,6 +88,7 @@ impl CallActorStore {
             calls: DashMap::new(),
             registry: LegRegistry::new(),
             zombie_cancelled: DashMap::new(),
+            deferred_cancels: std::sync::atomic::AtomicUsize::new(0),
             terminated: DashMap::new(),
             terminated_order: Mutex::new(VecDeque::new()),
         }
@@ -1191,118 +1196,16 @@ impl CallActorStore {
         }
     }
 
-    /// Tear down a CANCELled call, but first preserve every still-pending
-    /// leg (INVITE sent, no final response yet — status `Trying`/`Ringing`) as
-    /// a [`ZombieCancelledLeg`], so the final response the CANCEL provokes is
-    /// still answerable after the call is gone: the ordinary `487` gets its ACK
-    /// (RFC 3261 §17.1.1.3) and a 2xx that raced the CANCEL (§9.1) gets ACK
-    /// (§13.2.2.4) + BYE (§15). Used by the CANCEL paths in place of
-    /// `remove_call`.
+    /// Tear down a call siphon gave up on before it was answered, first keeping
+    /// every leg still pending answerable. See
+    /// [`Self::keep_pending_answerable`], whose legs the caller has by then been
+    /// handed to CANCEL. Used by the CANCEL paths in place of `remove_call`.
     ///
-    /// Returns true if any zombie-cancelled entries were captured (so the
-    /// caller can schedule their expiry).
+    /// Returns true if any leg is kept (so the caller can schedule its expiry).
     pub fn remove_call_after_cancel(&self, call_id: &str) -> bool {
-        let mut captured = false;
-        if let Some(call) = self.calls.get(call_id) {
-            // A call siphon placed (`originate`) carries its pending INVITE on
-            // the A-leg, not a B-leg, so the loop below would capture nothing
-            // and the final response to our CANCEL would be dropped — leaving
-            // the callee retransmitting a 487 nobody ACKs (RFC 3261 §17.1.1.3),
-            // or a 200 for a dialog nobody ACKs or BYEs (§9.1 glare, §13.2.2.4,
-            // §15).
-            if call.originated && matches!(call.state, CallState::Calling | CallState::Ringing) {
-                if let Some(invite) = call.a_leg_invite.as_ref() {
-                    // The leg keeps the INVITE it sent, as a B-leg does: a 2xx
-                    // that raced the CANCEL carries the offer when the INVITE
-                    // went out offerless, and its ACK is then owed an answer
-                    // (RFC 3261 §13.2.2.4), which is decided from this.
-                    let mut leg = call.a_leg.clone();
-                    leg.b_leg_invite = Some(Arc::clone(invite));
-                    self.zombie_cancelled.insert(
-                        call.a_leg.branch.clone(),
-                        ZombieCancelledLeg {
-                            leg,
-                            invite_ruri: request_uri_of(invite),
-                            byed: false,
-                        },
-                    );
-                    captured = true;
-                }
-            }
-            let pending = call.b_legs.iter().enumerate().filter(|(index, _)| {
-                matches!(
-                    call.b_leg_status.get(*index),
-                    Some(BLegStatus::Trying) | Some(BLegStatus::Ringing)
-                )
-            });
-            captured |= self.keep_answerable(pending.map(|(_, leg)| leg));
-        }
+        let captured = !self.keep_pending_answerable(call_id).is_empty();
         self.remove_call(call_id);
         captured
-    }
-
-    /// Keep legs whose INVITE siphon is CANCELling answerable after the CANCEL,
-    /// as [`ZombieCancelledLeg`]s. Only a leg whose INVITE is stashed went on the
-    /// wire, so only such a leg can answer and only it is kept.
-    ///
-    /// Returns whether any leg was kept, so the caller can schedule the expiry.
-    pub fn keep_answerable<'a>(&self, legs: impl IntoIterator<Item = &'a Leg>) -> bool {
-        let mut kept = false;
-        for leg in legs {
-            if let Some(invite) = leg.b_leg_invite.as_ref() {
-                // A leg may be kept twice: when its CANCEL goes out, and again
-                // when its call is removed. The first entry stands, with what it
-                // has learnt since (a 2xx already BYEd is not BYEd again).
-                self.zombie_cancelled
-                    .entry(leg.branch.clone())
-                    .or_insert_with(|| ZombieCancelledLeg {
-                        leg: leg.clone(),
-                        invite_ruri: request_uri_of(invite),
-                        byed: false,
-                    });
-                kept = true;
-            }
-        }
-        kept
-    }
-
-    /// Whether `branch` is a leg siphon CANCELled and is keeping answerable.
-    pub fn is_cancelled_branch(&self, branch: &str) -> bool {
-        self.zombie_cancelled.contains_key(branch)
-    }
-
-    /// Resolve a racing 2xx to a CANCELled leg by the Via branch it answers.
-    ///
-    /// Returns the captured leg plus a `first_2xx` flag: the first racing 2xx
-    /// on a branch returns `(leg, true)` so the caller sends ACK + BYE; later
-    /// 200 OK retransmits return `(leg, false)` so the caller re-ACKs only (a
-    /// lost ACK still gets retried) without a second BYE. The entry stays until
-    /// the 32 s cleanup so retransmits keep matching.
-    pub fn zombie_cancelled_for_2xx(&self, branch: &str) -> Option<(Leg, bool)> {
-        self.zombie_cancelled.get_mut(branch).map(|mut entry| {
-            let first_2xx = !entry.byed;
-            entry.byed = true;
-            (entry.leg.clone(), first_2xx)
-        })
-    }
-
-    /// Resolve a final non-2xx — in practice the `487 Request Terminated` that
-    /// RFC 3261 §9.1 makes the ordinary outcome of a CANCEL — to a CANCELled
-    /// leg by the Via branch it answers.
-    ///
-    /// Returns the captured leg and the CANCELled INVITE's Request-URI, so the
-    /// caller can build the ACK §17.1.1.3 requires on the INVITE's own branch.
-    ///
-    /// Unlike [`Self::zombie_cancelled_for_2xx`] there is no first-response
-    /// flag: the ACK for a final non-2xx belongs to the INVITE's client
-    /// transaction, which §17.1.1.3 has re-pass it to the transport on *every*
-    /// retransmission of the response while it sits in `Completed`. Answering
-    /// only the first would leave a peer whose ACK was lost retransmitting to
-    /// Timer H regardless — the exact stall this entry exists to end.
-    pub fn zombie_cancelled_for_non2xx(&self, branch: &str) -> Option<(Leg, Option<String>)> {
-        self.zombie_cancelled
-            .get(branch)
-            .map(|entry| (entry.leg.clone(), entry.invite_ruri.clone()))
     }
 
     /// Iterate over all active calls (for session timer sweep).

@@ -215,6 +215,26 @@ pub fn arm_b2bua_retransmit(
     );
 }
 
+/// Stop retransmitting for every B-leg of `call` that cannot be CANCELled: one
+/// whose INVITE was handed to the transport but never stashed on the leg, so
+/// no CANCEL can be built for it and nothing else would ever stop it.
+///
+/// For a call whose ring is being given up on. A leg whose INVITE *is* stashed
+/// is left alone on purpose: when it has drawn a provisional its schedule is
+/// already gone, and when it has drawn nothing RFC 3261 §9.1 has the INVITE
+/// retransmit until a provisional lets its CANCEL out
+/// ([`cancel_kept_branches`]) or Timer B ends it.
+pub fn disarm_unstashed_b_leg_invites(
+    call: &crate::b2bua::actor::CallActor,
+    state: &DispatcherState,
+) {
+    for b_leg in &call.b_legs {
+        if b_leg.b_leg_invite.is_none() {
+            state.b2bua_retransmits.disarm_branch(&b_leg.branch);
+        }
+    }
+}
+
 /// The key a retransmit schedule for `message` is armed under: its method and its
 /// topmost Via branch. `None` for a response, an ACK, and a request without a
 /// parseable branch, none of which [`arm_b2bua_retransmit`] arms.

@@ -1373,47 +1373,6 @@ impl CallActor {
 // CallActorStore — manages all active calls
 // ---------------------------------------------------------------------------
 
-/// Post-teardown state for a leg whose INVITE was CANCELled but is still owed a
-/// final response.
-///
-/// Two outcomes reach this entry, and both would otherwise be dropped as
-/// "unknown branch" — the CANCEL paths remove the call, unregistering the leg's
-/// branch, at the moment they put the CANCEL on the wire:
-///
-///  * the **ordinary** one, a `487 Request Terminated` (RFC 3261 §9.1): every
-///    CANCELled INVITE draws a final non-2xx, and §17.1.1.3 makes ACKing it the
-///    client transaction's job. Unacknowledged, the peer's INVITE server
-///    transaction retransmits on Timer G until Timer H (64*T1 = 32 s, §17.2.1),
-///    holding transaction state on both sides for the whole window.
-///  * the **glare** one, a 2xx the callee put on the wire before our CANCEL
-///    arrived (§9.1). That 2xx still establishes a dialog, which the B2BUA MUST
-///    ACK (§13.2.2.4) and then BYE (§15) to release.
-///
-/// Keyed by the Via branch of the CANCELled INVITE, which every final response
-/// to it carries (RFC 3261 §17.1.3). Not by the Call-ID: under
-/// `call.preserve_call_id()` every branch of a fork shares one, and a key per
-/// Call-ID kept only the last cancelled branch answerable. Auto-expires after 32
-/// seconds (Timer H).
-#[derive(Debug, Clone)]
-pub struct ZombieCancelledLeg {
-    /// The cancelled leg's dialog + transport, used to build the ACK and BYE.
-    /// `remote_tag` / `remote_contact` are filled from the racing 2xx at
-    /// handling time (they were unknown when the INVITE was CANCELled).
-    pub leg: Leg,
-    /// Request-URI of the INVITE that was CANCELled, captured at teardown.
-    ///
-    /// RFC 3261 §17.1.1.3 requires the ACK for a final non-2xx to carry the
-    /// same Request-URI as the INVITE it acknowledges, and by the time the
-    /// `487` lands the call — and with it the stashed INVITE — is gone. `None`
-    /// only when the INVITE could not be read back (poisoned mutex); no ACK is
-    /// built in that case, because a `sip:invalid` R-URI on the wire is worse
-    /// than none.
-    pub invite_ruri: Option<String>,
-    /// Whether the BYE has already been sent. The first racing 2xx triggers
-    /// ACK + BYE; later 200 OK retransmits re-ACK only (so a lost ACK still
-    /// gets retried) without emitting a second BYE.
-    pub byed: bool,
-}
 /// A fork branch's final failure, held until the fork settles.
 #[derive(Debug, Clone)]
 pub struct BranchFailure {

@@ -135,10 +135,10 @@ pub fn b2bua_dispatch_route_failure(
     });
 }
 
-/// Expire post-CANCEL glare entries after 32 s (Timer H / 64·T1).
+/// Arm the expiry of every leg kept answerable.
 ///
-/// Removes from the *shared* store via the `Arc`, so entries that never see a
-/// racing 2xx (the CANCEL won the race) are still reaped.
+/// Through the *shared* store via the `Arc`, so entries that never see a
+/// response at all are still reaped.
 pub fn schedule_zombie_cancelled_cleanup(call_actors: Arc<crate::b2bua::actor::CallActorStore>) {
     let keys: Vec<String> = call_actors
         .zombie_cancelled
@@ -148,7 +148,9 @@ pub fn schedule_zombie_cancelled_cleanup(call_actors: Arc<crate::b2bua::actor::C
     schedule_zombie_cancelled_expiry(call_actors, keys);
 }
 
-/// Expire the named post-CANCEL entries after 32 s (Timer H / 64·T1).
+/// Expire the named kept legs once their time is up
+/// ([`CANCELLED_BRANCH_LIFETIME`](crate::b2bua::actor::CANCELLED_BRANCH_LIFETIME),
+/// Timer H / 64·T1).
 ///
 /// For a caller that knows which entries it just created. A fork cancels its
 /// losing branches on every answered call, and re-arming the expiry of every
@@ -162,9 +164,10 @@ pub fn schedule_zombie_cancelled_expiry(
         return;
     }
     tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_secs(32)).await;
+        tokio::time::sleep(crate::b2bua::actor::CANCELLED_BRANCH_LIFETIME).await;
+        let now = tokio::time::Instant::now();
         for key in keys {
-            call_actors.zombie_cancelled.remove(&key);
+            call_actors.expire_cancelled_branch(&key, now);
         }
     });
 }
@@ -174,7 +177,8 @@ pub fn schedule_zombie_cancelled_expiry(
 ///
 /// The store has already kept each one answerable, so the 487 its CANCEL draws
 /// gets an ACK and a 2xx that crosses the CANCEL an ACK and a BYE. This puts the
-/// CANCELs on the wire and arms the expiry of what was kept.
+/// CANCELs on the wire, for the branches §9.1 allows one yet, and arms the
+/// expiry of what was kept.
 pub fn cancel_settled_branches(
     call_id: &str,
     legs: &[crate::b2bua::actor::Leg],
@@ -189,36 +193,97 @@ pub fn cancel_settled_branches(
     control_dial_legs_cancelled(call_id, legs, state);
     // A registered callee among them stops ringing.
     callee_dialogs_ended(call_id, legs, state);
+    cancel_kept_branches(legs, state);
+}
+
+/// Send each of `legs`, already kept answerable by the store, the CANCEL it is
+/// owed, and arm the expiry of what was kept. The one place siphon CANCELs an
+/// INVITE it sent, whatever gave up on it.
+///
+/// RFC 3261 §9.1: "If no provisional response has been received, the CANCEL
+/// request MUST NOT be sent; rather, the client MUST wait for the arrival of a
+/// provisional response before sending the request." A leg whose INVITE has
+/// drawn a provisional is CANCELled here. One that has drawn nothing is left
+/// as it is, its INVITE still retransmitting on Timer A, and its first
+/// provisional sends the CANCEL ([`cancel_on_first_provisional`]); a final
+/// response instead is ACKed, a 2xx released with a BYE as well, and Timer B
+/// ends it if nothing ever comes.
+pub fn cancel_kept_branches(legs: &[crate::b2bua::actor::Leg], state: &DispatcherState) {
     let mut kept = Vec::with_capacity(legs.len());
     for leg in legs {
-        // Stop retransmitting the INVITE, as the ring-timeout CANCEL does: an
-        // INVITE delivered after its own CANCEL would start the branch ringing
-        // again, with nothing left to cancel it.
-        state.b2bua_retransmits.disarm_branch(&leg.branch);
-        let Some(invite_arc) = leg.b_leg_invite.as_ref() else {
+        if leg.b_leg_invite.is_none() {
+            // Never stashed, so never kept: there is nothing to CANCEL and
+            // nothing that should go on retransmitting.
+            state.b2bua_retransmits.disarm_branch(&leg.branch);
             continue;
-        };
+        }
         // The store kept exactly the legs with a stashed INVITE, under this key.
         kept.push(leg.branch.clone());
-        let cancel = match invite_arc.lock() {
-            Ok(invite) => build_cancel_from_invite(&invite),
-            Err(_) => None,
-        };
-        match cancel {
-            Some(cancel) => send_b2bua_to_bleg(
-                cancel,
-                leg.transport.transport,
-                leg.transport.remote_addr,
-                leg.transport.local_addr,
-                state,
-            ),
-            None => warn!(
+        if state.call_actors.claim_cancel(&leg.branch) {
+            send_branch_cancel(leg, state);
+        } else {
+            debug!(
                 branch = %leg.branch,
-                "B2BUA: cannot build the CANCEL for a fork branch from its stored INVITE — it rings on until it answers or times out"
-            ),
+                "B2BUA: no provisional on this branch yet — its INVITE keeps retransmitting and the CANCEL follows its first provisional (RFC 3261 §9.1)"
+            );
         }
     }
     schedule_zombie_cancelled_expiry(state.call_actors.clone(), kept);
+}
+
+/// A provisional response arrived for the INVITE on `branch`: record it, and
+/// send the CANCEL that was waiting for it, if siphon gave up on that INVITE
+/// while it had drawn no response (RFC 3261 §9.1).
+///
+/// Called for every provisional to an INVITE, a `100 Trying` included, before
+/// anything is looked up for it. See
+/// [`CallActorStore::provisional_received`](crate::b2bua::actor::CallActorStore::provisional_received)
+/// for what that costs a branch nothing is waiting on.
+pub fn cancel_on_first_provisional(branch: &str, state: &DispatcherState) {
+    let Some(leg) = state.call_actors.provisional_received(branch) else {
+        return;
+    };
+    debug!(
+        branch = %leg.branch,
+        "B2BUA: first provisional on a branch siphon gave up on — sending its CANCEL (RFC 3261 §9.1)"
+    );
+    send_branch_cancel(&leg, state);
+    // The 487 this draws is ACKed for as long as the far end may retransmit it.
+    schedule_zombie_cancelled_expiry(state.call_actors.clone(), vec![leg.branch]);
+}
+
+/// Build the CANCEL for `leg` from its stashed INVITE (RFC 3261 §9.1: the same
+/// Via branch and CSeq number) and put it on the wire, from the socket the
+/// INVITE left on. Sending it ends the INVITE's own retransmissions.
+fn send_branch_cancel(leg: &crate::b2bua::actor::Leg, state: &DispatcherState) {
+    // An INVITE delivered after its own CANCEL would start the branch ringing
+    // again, with nothing left to cancel it. Arming the CANCEL stops it; this
+    // covers a CANCEL that cannot be built.
+    state.b2bua_retransmits.disarm_branch(&leg.branch);
+    let cancel = match leg.b_leg_invite.as_ref().map(|invite| invite.lock()) {
+        Some(Ok(invite)) => build_cancel_from_invite(&invite),
+        Some(Err(_)) => {
+            error!(
+                branch = %leg.branch,
+                "B2BUA: stored INVITE mutex poisoned while building its CANCEL"
+            );
+            None
+        }
+        None => None,
+    };
+    match cancel {
+        Some(cancel) => send_b2bua_to_bleg(
+            cancel,
+            leg.transport.transport,
+            leg.transport.remote_addr,
+            leg.transport.local_addr,
+            state,
+        ),
+        None => warn!(
+            branch = %leg.branch,
+            "B2BUA: cannot build the CANCEL for a branch from its stored INVITE — it rings on until it answers or times out"
+        ),
+    }
 }
 
 /// Build an ACK for a 2xx INVITE response on a B2BUA B-leg (RFC 3261 §13.2.2.4).

@@ -45,9 +45,10 @@
 //! # Errors
 //!
 //! A `status:"error"` reply becomes [`ControlError::Command`], carrying the
-//! stable [`siphon_control_proto::ControlErrorCode`]. Media verbs
-//! ([`sip::Call::play_file`] / [`sip::Call::dtmf`]) resolve to
-//! [`ControlError::is_unsupported_verb`] until the server implements them.
+//! stable [`siphon_control_proto::ControlErrorCode`]. A verb the configured
+//! media backend cannot carry out ([`sip::Call::stream_start`] and
+//! [`sip::Call::record_start`] on anything but siphon-rtp) resolves to
+//! [`ControlError::is_unsupported_verb`].
 
 #![forbid(unsafe_code)]
 

@@ -443,7 +443,7 @@ if [[ "$RUN_DIAL_BRIDGE" == true ]]; then
 fi
 
 # ── Step 7a4: giving up a dial, a REFER from the callee, replacing a party ──
-# Six cases against one siphon and one persistent control application. Each is
+# Eight cases against one siphon and one persistent control application. Each is
 # a caller plus the detached parties that case needs; run_transfer_case.sh
 # fails a case unless the caller, every party, the application's verdict and
 # the Call-IDs the parties and the application saw all agree.
@@ -459,6 +459,13 @@ if [[ "$RUN_CONTROL_TRANSFER" == true ]]; then
 
   control_transfer_case cancel-dial control_transfer_cancel_dial_uac.xml \
     sipp-control-transfer-ringing-phone sipp-control-transfer-trying-phone
+  # RFC 3261 §9.1: a dial given up before its phone has sent any response is
+  # not CANCELled until that phone's first provisional, and not at all when it
+  # answers with a final response instead.
+  control_transfer_case cancel-late-ringing control_transfer_cancel_dial_uac.xml \
+    sipp-control-transfer-late-ringing-phone
+  control_transfer_case cancel-late-answer control_transfer_cancel_dial_uac.xml \
+    sipp-control-transfer-late-answering-phone
   control_transfer_case refer-callee control_transfer_survivor_uac.xml \
     sipp-control-transfer-referrer-phone sipp-control-transfer-target
   control_transfer_case refer-controller control_transfer_uac.xml \

@@ -99,6 +99,8 @@ mod bad_extension_tests;
 #[cfg(test)]
 mod bridged_pair_media_events_tests;
 #[cfg(test)]
+mod cancel_awaits_provisional_tests;
+#[cfg(test)]
 mod carrier_attribution_tests;
 #[cfg(test)]
 mod control_bridge_elsewhere_tests;
@@ -179,6 +181,8 @@ mod originate_test_harness;
 #[cfg(test)]
 mod originate_tests;
 #[cfg(test)]
+mod originated_cancel_awaits_provisional_tests;
+#[cfg(test)]
 mod prack_offer_answer_tests;
 #[cfg(test)]
 mod proxy_dialog_state_tests;
@@ -190,6 +194,8 @@ mod proxy_reply_filter_tests;
 mod public_api_surface;
 #[cfg(test)]
 mod refer_answer_tests;
+#[cfg(test)]
+mod relayed_cancel_awaits_provisional_tests;
 #[cfg(test)]
 mod relayed_identity_tests;
 #[cfg(test)]

@@ -18,6 +18,11 @@
   rung and CANCELled is a failure. The INFO then shows the dialog is still
   there to answer it, and tells the application the quiet window is over; only
   after that does the application hang up.
+
+  Also the caller of `cancel-late-ringing` and `cancel-late-answer`, where one
+  dial rings a phone that answers nothing until after the dial is given up. The
+  same six seconds cover that phone's late 180 or 200 and what it is owed, none
+  of which may reach this leg.
 -->
 <scenario name="control-transfer caller of a cancelled dial">
 

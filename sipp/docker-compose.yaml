@@ -7968,6 +7968,11 @@ services:
   #
   #   cancel-dial         — `cancel_dial` on a bridging dial that rings two
   #                         phones, twice over for one caller.
+  #   cancel-late-ringing — `cancel_dial` while the one phone rung has answered
+  #                         nothing: no CANCEL until its late 180 (RFC 3261
+  #                         §9.1), then the CANCEL, the 487 and its ACK.
+  #   cancel-late-answer  — the same, with the phone answering 200 instead:
+  #                         no CANCEL at all, the 200 ACKed and BYEd.
   #   refer-callee        — the connected phone REFERs: `reject_refer`, then
   #                         `accept_refer` carried out by siphon.
   #   refer-controller    — `accept_refer {mode: "controller"}` and
@@ -7988,6 +7993,7 @@ services:
   #
   # IP map: .240 siphon  .241 app  .242 caller  .243 phone  .244 second phone
   #         .245 Refer-To target  .246 / .247 the two contacts of the AoR
+  #         .248 / .249 the phones that answer late, with a 180 and with a 200
   siphon-control-transfer:
     image: sipp-siphon   # reuse the siphon image (built by the `siphon` service)
     build:
@@ -8028,6 +8034,8 @@ services:
       CONTROL_READY_FILE: "/tmp/control-app-ready"
       TRANSFER_PHONE: "sip:phone@172.20.0.243:5060"
       TRANSFER_SECOND_PHONE: "sip:phone@172.20.0.244:5060"
+      TRANSFER_LATE_RINGING_PHONE: "sip:phone@172.20.0.248:5060"
+      TRANSFER_LATE_ANSWERING_PHONE: "sip:phone@172.20.0.249:5060"
       TRANSFER_REFER_TARGET_HOST: "172.20.0.245"
       TRANSFER_AOR: "sip:3001@transfer.test"
     networks:
@@ -8132,6 +8140,60 @@ services:
       - "172.20.0.244"
       - -m
       - "2"
+      - -timeout
+      - "40"
+      - -timeout_error
+      - -trace_err
+    profiles:
+      - control-transfer
+
+  # cancel-late-ringing: the phone that answers nothing while its dial is given
+  # up, then sends a 180 and must only then be CANCELled (RFC 3261 §9.1).
+  sipp-control-transfer-late-ringing-phone:
+    image: ctaloi/sipp:latest
+    container_name: sipp-control-transfer-late-ringing-phone
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.248
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/control_transfer_late_ringing_phone.xml
+      - -p
+      - "5060"
+      - -mi
+      - "172.20.0.248"
+      - -m
+      - "1"
+      - -timeout
+      - "40"
+      - -timeout_error
+      - -trace_err
+    profiles:
+      - control-transfer
+
+  # cancel-late-answer: the phone that answers nothing while its dial is given
+  # up, then answers 200: never CANCELled, ACKed and released with a BYE.
+  sipp-control-transfer-late-answering-phone:
+    image: ctaloi/sipp:latest
+    container_name: sipp-control-transfer-late-answering-phone
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.249
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/control_transfer_late_answering_phone.xml
+      - -p
+      - "5060"
+      - -mi
+      - "172.20.0.249"
+      - -m
+      - "1"
       - -timeout
       - "40"
       - -timeout_error

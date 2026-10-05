@@ -5,6 +5,9 @@ bound to it. An INVITE is handed to the control application un-answered, with
 the dialled user as the case to run (sipp/control/transfer_app.py):
 
   cancel-dial         — answer anchored, ring two phones, give the dial up.
+  cancel-late-ringing — answer anchored, ring a phone that answers nothing, give
+                        the dial up; the phone then sends a 180.
+  cancel-late-answer  — the same, with the phone then answering 200.
   refer-callee        — connect a phone, which then REFERs: once rejected, once
                         accepted and carried out by siphon.
   refer-controller    — connect a phone, which REFERs three times; the
@@ -22,6 +25,8 @@ APP = "transfer-app"
 
 CASES = (
     "cancel-dial",
+    "cancel-late-ringing",
+    "cancel-late-answer",
     "refer-callee",
     "refer-controller",
     "replace-aor",

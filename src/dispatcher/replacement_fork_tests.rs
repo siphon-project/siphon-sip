@@ -139,6 +139,34 @@ pub(super) fn ring_two_on(
     origin: ReplacementOrigin,
     replace_a_leg: bool,
 ) -> Ringing {
+    let ringing = dial_two_on(call, prefix, origin, replace_a_leg);
+    // Each contact takes its INVITE with a 100 Trying, as a phone that rings
+    // does. Hop by hop, so nothing is reported for it, and the provisional a
+    // CANCEL for that INVITE has to wait for (RFC 3261 §9.1).
+    for (address, invite) in [
+        (ringing.desk(), &ringing.to_desk),
+        (ringing.mobile, &ringing.to_mobile),
+    ] {
+        let trying = response_for(invite, 100, "Trying", "trying");
+        tokio::task::block_in_place(|| {
+            handle_response(inbound(address, ""), trying, 100, ringing.state())
+        });
+    }
+    assert!(
+        wire(&ringing.call.dispatcher).is_empty(),
+        "a 100 is absorbed"
+    );
+    ringing
+}
+
+/// [`ring_two_on`] with both contacts sent their INVITE and neither having
+/// answered anything yet.
+fn dial_two_on(
+    call: Established,
+    prefix: u32,
+    origin: ReplacementOrigin,
+    replace_a_leg: bool,
+) -> Ringing {
     let mobile: &'static str =
         Box::leak(format!("203.0.113.{}:5060", 120 + prefix % 50).into_boxed_str());
     let user = call
@@ -222,6 +250,50 @@ pub(super) fn ring_two_on(
 
 fn names(events: &[(String, serde_json::Value)]) -> Vec<&str> {
     events.iter().map(|(name, _)| name.as_str()).collect()
+}
+
+/// A target that has answered nothing when the other one wins is not
+/// CANCELled: RFC 3261 §9.1 has the CANCEL wait for a provisional. Its first
+/// one, long after the replacement is over, draws the CANCEL, and the `487`
+/// that follows is ACKed.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_losing_target_that_has_not_responded_is_cancelled_on_its_first_provisional() {
+    let ringing = dial_two_on(
+        establish(6390, "terminate"),
+        6390,
+        ReplacementOrigin::SiphonInitiated,
+        false,
+    );
+    let (desk, mobile) = (ringing.desk(), ringing.mobile);
+
+    respond(
+        &ringing.call.dispatcher,
+        &ringing.call_id,
+        desk,
+        &ringing.to_desk,
+        answer(&ringing.to_desk, desk, "desk-tag"),
+    );
+    let summary = ringing.sent();
+    assert!(summary.contains(&format!("ACK {desk}")), "{summary:?}");
+    assert!(
+        !summary.contains(&format!("CANCEL {mobile}")),
+        "no CANCEL for an INVITE that has drawn no provisional: {summary:?}"
+    );
+    assert_eq!(names(&ringing.events()), ["PeerReplaced"]);
+    assert_eq!(ringing.state().call_actors.deferred_cancel_count(), 1);
+
+    ringing.responds_from_the_top(mobile, &ringing.to_mobile, 180);
+    let sent = wire(&ringing.call.dispatcher);
+    assert_eq!(summaries(&sent), [format!("CANCEL {mobile}")]);
+    assert_eq!(
+        top_via_branch(&sent[0].message),
+        top_via_branch(&ringing.to_mobile)
+    );
+    assert_eq!(ringing.state().call_actors.deferred_cancel_count(), 0);
+
+    ringing.responds_from_the_top(mobile, &ringing.to_mobile, 487);
+    assert_eq!(ringing.sent(), [format!("ACK {mobile}")]);
+    assert!(ringing.events().is_empty(), "nothing more is reported");
 }
 
 /// One target answers: it is ACKed and brought into the call, the surviving
