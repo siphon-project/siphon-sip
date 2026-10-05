@@ -172,6 +172,74 @@ entry, but a working config keeps working.
   and the second bridge now reads the `with` leg's from there, in whichever
   order the two legs are named. A leg bridged to a *different* party afterwards
   is unaffected by what was recorded for the first.
+- **A re-INVITE or UPDATE relayed between the two legs of a call pins each
+  party's media ingress by that party's own policy.** The relay sent the
+  re-offering party's SDP to the media engine under the profile's `offer` half
+  and the answering party's under its `answer` half, and read `received_from`
+  from the same half. That is right while the caller re-offers. When the
+  callee did (a hold from the called side, a session refresh), the callee was
+  pinned to its signalling source if the *caller's* half asked for it, and the
+  caller's answer by the callee's half. With a profile whose halves differ, a
+  callee behind NAT that re-offered lost its source hint and its media was
+  gated on the address in its SDP, and a callee whose half asks for no hint
+  (one whose media comes from another host than its signalling) was given
+  one. The hint now follows the party whose SDP each command carries: the
+  caller the `offer` half and the callee the `answer` half, whoever re-offers.
+  After a transfer or a `Replaces` takeover it follows what the re-paired
+  session recorded for each party, which matters after a takeover, where the
+  newcomer sits in the caller's slot of the call with the replaced callee's
+  policy. The commands are shaped as before, and a profile with the same
+  policy on both halves sends what it sent.
+- **On a delayed offer the caller's answer carries its source hint, and a
+  later re-offer names the party that sent it.** When the INVITE carried no
+  SDP the callee offers in its 2xx and the caller answers in its ACK. That
+  answer reached the media engine with no `received_from` hint whatever the
+  profile asked for, so a caller behind NAT was gated on the address in its
+  SDP. It is now pinned to the caller's signalling source where the caller's
+  own half asks, which is the `offer` half: a profile is chosen for the dial
+  before anyone knows who will offer. The media session also kept the callee
+  as its first party and the caller as its second once answered, the reverse
+  of every other session, so a hold from the caller reached the engine as a
+  re-offer under the *callee's* tag. The answered session now names the caller
+  first, and a re-offer from either party goes out under its own tag.
+- **`rtpengine.answer(reply)` pins the replying party to where the reply came
+  from.** The source address carried for a reply was the one of the `call=`
+  object, which is the caller's: with a profile whose `answer` half sets
+  `received_from`, the callee's media was gated to the caller's address.
+  Without `call=` no address was carried and the callee was not pinned at
+  all. A reply now carries its own source, also when it holds a delayed
+  offer, where the `answer` half's policy still decides because the SDP is
+  the dialled party's. In a proxy script, `rtpengine.offer()` on a re-INVITE
+  from the callee and `rtpengine.answer()` on the caller's reply to it read
+  the policy of the party whose SDP they carry in the same way. This makes
+  `received_from` on an `answer` half take effect for a script that calls
+  `rtpengine.answer(reply)` without `call=`: a profile that sets it there for
+  callees whose media comes from another host than their signalling has to
+  clear it on that half.
+- **A leg parted by `unbridge` gets a coherent answer to a re-INVITE or
+  UPDATE.** After an `unbridge` the pair's media session stays under the
+  anchor, still joining the two held parties, and the other leg has none. A
+  re-offer or a session refresh from the anchor was answered by sending the
+  engine a local answer on the pair's own engine call, the one that still
+  relays between the two, and a refresh came back `sendrecv` on a leg siphon
+  had on hold. Any request from the other leg, a bodyless session refresh
+  included, was answered `488`. Both are
+  now answered from the leg's own dialog and the engine is sent nothing: a
+  request that changes nothing (no SDP, or the SDP the leg last sent, RFC
+  3264 §8) is answered `200` with the session in force, and an offer that
+  would change the session is refused `488` (RFC 3261 §14.2), leaving the leg
+  held as it was. The refused offer is no longer taken for the leg's media, so
+  a `bridge` afterwards offers what the leg really has.
+- **A leg bridged to a different anchor after an `unbridge` is offered and
+  pinned as its own profile describes.** The `with` leg's own media session is
+  retired when its bridge forms, and what it was bridged with was recorded only
+  on the pair's session, under the first anchor. Bridged to another anchor
+  afterwards, the leg was offered what that anchor's profile describes (a
+  party needing SRTP was offered `RTP/AVP`) and pinned by that anchor's
+  `received_from` policy. What a bridge shaped and pinned its `with` leg with
+  is now kept for that leg's own call until the call ends, and read by the
+  next bridge. A leg that never had a media session of its own is described
+  by its anchor, as before.
 - **A retransmitted INVITE on a B2BUA call is answered.** The retransmission
   was recognised (it creates no second call) and then dropped without a
   response. A caller retransmits because it has seen no provisional, so one
