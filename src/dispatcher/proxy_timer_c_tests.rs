@@ -15,8 +15,8 @@
 use std::time::Duration;
 
 use super::proxy_cancel_awaits_provisional_tests::{
-    answers, call, cancels_to, fire, forking_proxy, relaying_proxy, requests_to,
-    responses_to_caller, the_cancel, waiting_cancels, CALLER, FAILED, RINGING,
+    answers, call, caller_cancels, cancels_to, fire, forking_proxy, relaying_proxy, requests_to,
+    responses_to_caller, the_cancel, waiting_cancels, CALLER, DECIDING, FAILED, RINGING,
 };
 use super::proxy_dialog_state_tests::{find, header, headers, in_dialog, Proxy};
 use super::*;
@@ -237,5 +237,110 @@ async fn a_fork_branch_ended_by_timer_c_counts_as_that_branchs_final_response() 
             "{call_id}: the best of the two branches': {finals:?}"
         );
         assert_ended(&proxy, &to_ringing);
+    }
+}
+
+/// `@proxy.on_failure` re-targeting whatever failed to [`DECIDING`].
+fn retarget_on_failure() -> String {
+    format!(
+        concat!(
+            "@proxy.on_failure\n",
+            "def failed(request, reply):\n",
+            "    request.relay(\"sip:callee@{next}\")\n",
+        ),
+        next = DECIDING
+    )
+}
+
+/// A branch the proxy itself ended, through Timer C, has failed like any
+/// other, and `@proxy.on_failure` runs for it: for the `487` that answers the
+/// proxy's CANCEL, and for the `408` a branch that stays silent is given. Here
+/// the handler re-targets the call, on a single relay and on a fork.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_branch_ended_by_timer_c_runs_the_failure_handler() {
+    for (forked, answers_its_cancel) in [(false, true), (false, false), (true, true), (true, false)]
+    {
+        let what = format!("forked={forked} answers_its_cancel={answers_its_cancel}");
+        let proxy = if forked {
+            forking_proxy(&[RINGING, FAILED], "parallel", &retarget_on_failure())
+        } else {
+            relaying_proxy(RINGING, &retarget_on_failure())
+        };
+        let call_id = format!("timer-c-on-failure-{forked}-{answers_its_cancel}@example.com");
+        let (_, invites) = call(&proxy, &call_id);
+        let to_ringing = find(&invites, RINGING).clone();
+        answers(&proxy, RINGING, &to_ringing, 180, "Ringing");
+        if forked {
+            answers(&proxy, FAILED, find(&invites, FAILED), 404, "Not Found");
+        }
+        let _ = proxy.wire();
+
+        ring_past_timer_c(&proxy, &to_ringing);
+        fire(&proxy, &to_ringing, TimerName::C);
+        the_cancel(&proxy.wire(), RINGING, &to_ringing);
+        if answers_its_cancel {
+            answers(&proxy, RINGING, &to_ringing, 487, "Request Terminated");
+        } else {
+            fire(&proxy, &to_ringing, TimerName::C);
+        }
+        let sent = proxy.wire();
+        assert_eq!(
+            requests_to(&sent, DECIDING, Method::Invite).len(),
+            1,
+            "{what}: the failure handler ran and re-targeted the call"
+        );
+        assert!(
+            responses_to_caller(&sent)
+                .iter()
+                .all(|status_code| *status_code < 200),
+            "{what}: the caller is still waiting: {:?}",
+            responses_to_caller(&sent)
+        );
+    }
+}
+
+/// The caller's own CANCEL is not a failure of the branch: the `487` it draws
+/// is absorbed, `@proxy.on_failure` does not run, and nothing is re-targeted
+/// for a call the caller has given up (`@proxy.on_cancel` is the hook for
+/// that). The same status code as above, told apart by what caused it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_branch_ended_by_the_callers_cancel_does_not_run_the_failure_handler() {
+    for forked in [false, true] {
+        let proxy = if forked {
+            forking_proxy(&[RINGING, FAILED], "parallel", &retarget_on_failure())
+        } else {
+            relaying_proxy(RINGING, &retarget_on_failure())
+        };
+        let (raw, invites) = call(
+            &proxy,
+            &format!("cancel-no-on-failure-{forked}@example.com"),
+        );
+        let to_ringing = find(&invites, RINGING).clone();
+        answers(&proxy, RINGING, &to_ringing, 180, "Ringing");
+        if forked {
+            answers(&proxy, FAILED, find(&invites, FAILED), 180, "Ringing");
+        }
+        let _ = proxy.wire();
+
+        caller_cancels(&proxy, &raw);
+        let sent = proxy.wire();
+        assert_eq!(responses_to_caller(&sent), [200, 487], "forked={forked}");
+        answers(&proxy, RINGING, &to_ringing, 487, "Request Terminated");
+        if forked {
+            answers(
+                &proxy,
+                FAILED,
+                find(&invites, FAILED),
+                487,
+                "Request Terminated",
+            );
+        }
+        let sent = proxy.wire();
+        assert!(
+            requests_to(&sent, DECIDING, Method::Invite).is_empty(),
+            "forked={forked}: nothing is re-targeted for a call the caller gave up"
+        );
+        assert!(responses_to_caller(&sent).is_empty(), "forked={forked}");
+        assert_eq!(proxy.state.session_store.session_count(), 0);
     }
 }

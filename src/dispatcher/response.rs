@@ -828,14 +828,15 @@ pub(super) fn handle_response(
             // nothing to aggregate: every non-2xx final response *is* "all
             // branches failed".
             //
-            // 487 is excluded: the transaction was cancelled by the UAC, so a
-            // retarget would resurrect a call the caller has already abandoned.
-            // `@proxy.on_cancel` is the hook for that teardown.
-            if fork_agg.is_none()
-                && (300..700).contains(&status_code)
-                && status_code != 487
-                && !final_response_sent
-            {
+            // A 487 is a failure like any other here, whatever sent it: the
+            // one the proxy drew itself by CANCELling a branch on Timer C
+            // (RFC 3261 §16.8), or one a downstream element produced. The 487
+            // a *caller's* CANCEL draws never gets this far: that CANCEL
+            // marked the request as finally answered before it was relayed,
+            // and what the branch answers is absorbed above. A cancelled call
+            // is `@proxy.on_cancel`'s, and is told from a failed one by what
+            // caused it, not by the status code it ends on.
+            if fork_agg.is_none() && (300..700).contains(&status_code) && !final_response_sent {
                 let outcome = run_proxy_failure_handlers(
                     message,
                     original_request.clone(),

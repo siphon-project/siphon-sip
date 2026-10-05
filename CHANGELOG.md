@@ -321,6 +321,16 @@ entry, but a working config keeps working.
   for as long as the INVITE's server transaction holds its final response. A
   CANCEL that matches no transaction at all, after an answered INVITE's has
   ended with its 2xx for one, is still answered `481`.
+- **`@proxy.on_failure` runs for a `487` the caller did not ask for.** On a
+  single relay the handler was never run for a `487`, on the assumption that
+  only the caller's CANCEL produces one. A branch the proxy CANCELs itself
+  when Timer C runs out answers `487` too, and so can a downstream element
+  for reasons of its own; neither could be re-targeted or answered by a
+  script. The handler now runs for every failed branch, `487` included, and
+  a cancelled call is told from a failed one by its cause: the caller's
+  CANCEL marks the request as answered before it is relayed, so what the
+  branches reply is absorbed and only `@proxy.on_cancel` runs, as before. A
+  fork already behaved this way.
 - **A transfer whose target cannot be dialled ends its subscription and
   leaves the call free.** A siphon-terminated REFER answers `202` and sends
   the `100 Trying` NOTIFY before it dials. When no INVITE could then be sent

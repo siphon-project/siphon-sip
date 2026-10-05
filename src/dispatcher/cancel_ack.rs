@@ -764,8 +764,32 @@ pub(super) fn handle_cancel_via_session(
     session_arc: Arc<RwLock<ProxySession>>,
     state: &DispatcherState,
 ) {
-    let session = match session_arc.read() {
-        Ok(s) => s,
+    // Whether the INVITE already has its final response, and if it has not,
+    // the mark that from here on it has: the 487 below. Latched before
+    // anything goes on the wire, as a reply-time reject does, so that what a
+    // branch answers its CANCEL with, on whichever worker and however soon,
+    // finds the INVITE finally answered and is absorbed: neither forwarded as
+    // a second final response nor taken for a branch failure by
+    // `@proxy.on_failure`.
+    //
+    // RFC 3261 §9.2: "the CANCEL request has no effect on the processing of
+    // the original request" once that has its final response, and an INVITE
+    // server transaction sends one final response (§17.2.1). An INVITE already
+    // rejected from the reply path, or already answered by a fork branch while
+    // this session lingers for the branches still to end, gets the CANCEL's
+    // 200 and nothing after it, least of all a 487.
+    let already_answered = match session_arc.write() {
+        Ok(mut session) => {
+            let answered = session.final_response_sent
+                || session.fork_aggregator.as_ref().is_some_and(|aggregator| {
+                    match aggregator.lock() {
+                        Ok(aggregator) => aggregator.has_settled(),
+                        Err(_) => false,
+                    }
+                });
+            session.final_response_sent = true;
+            answered
+        }
         Err(_) => {
             error!("ProxySession lock poisoned during CANCEL handling");
             let response = build_response(
@@ -799,21 +823,6 @@ pub(super) fn handle_cancel_via_session(
         Some(inbound.local_addr),
         state,
     );
-
-    // RFC 3261 §9.2: "the CANCEL request has no effect on the processing of
-    // the original request" once that has its final response, and an INVITE
-    // server transaction sends one final response (§17.2.1). The INVITE was
-    // already rejected from the reply path, or already answered by a fork
-    // branch, while this session lingers for the branches still to end: the
-    // CANCEL has its 200, and nothing follows it, least of all a 487.
-    let already_answered = session.final_response_sent
-        || session
-            .fork_aggregator
-            .as_ref()
-            .is_some_and(|aggregator| match aggregator.lock() {
-                Ok(aggregator) => aggregator.has_settled(),
-                Err(_) => false,
-            });
     if already_answered {
         debug!(
             server_key = %invite_server_key,
@@ -821,6 +830,13 @@ pub(super) fn handle_cancel_via_session(
         );
         return;
     }
+    let session = match session_arc.read() {
+        Ok(session) => session,
+        Err(_) => {
+            error!("ProxySession lock poisoned during CANCEL handling");
+            return;
+        }
+    };
 
     // Forward CANCEL to each client branch still pending
     let reasons = message
