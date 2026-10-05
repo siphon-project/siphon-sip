@@ -70,7 +70,14 @@ pub fn ensure_tag(header_value: &str, tag: Option<&str>) -> String {
 pub fn rewrite_uri_host(header_value: &str, new_host: &str) -> String {
     if let Some(at_pos) = header_value.find('@') {
         let after_at = &header_value[at_pos + 1..];
-        let host_end = after_at.find(['>', ';', ':']).unwrap_or(after_at.len());
+        // A bracketed IPv6 literal (RFC 3261 §25.1) ends at its `]`; the colons
+        // inside it are not the port separator.
+        let bracketed_end = after_at
+            .starts_with('[')
+            .then(|| after_at.find(']').map(|close| close + 1))
+            .flatten();
+        let host_end = bracketed_end
+            .unwrap_or_else(|| after_at.find(['>', ';', ':']).unwrap_or(after_at.len()));
         let end_pos = at_pos + 1 + host_end;
         format!(
             "{}{}{}",

@@ -87,6 +87,17 @@ entry, but a working config keeps working.
   does not implement is still `405`, in a dialog or not, and OPTIONS keeps its
   `server.auto_options` behaviour. Logged at debug rather than as a
   no-handler WARN.
+- **A B2BUA call CANCELled by the caller ends for the caller.** The
+  `487 Request Terminated` was built from the CANCEL and carried its CSeq
+  (`n CANCEL`). A UAC that matches responses on the CSeq method took it for a
+  second answer to its CANCEL, so its INVITE transaction got no final response
+  and ran until it timed out. The 487 now carries the INVITE's CSeq
+  (RFC 3261 §9.2). Proxy mode already did.
+- **The B-leg From of a call from an IPv6 caller is well-formed.** Topology
+  hiding replaces the From host, and the replacement ended the old host at its
+  first colon, which for a bracketed IPv6 literal is inside the address:
+  `<sip:alice@[2001:db8::1]>` became `<sip:alice@192.0.2.1::1]>`. A bracketed
+  host is now replaced whole. The same helper serves `call.set_to_host()`.
 - **`Remote-Party-ID` follows the calling identity siphon presents.** The
   default header policy copies the caller's `Remote-Party-ID` onto the B-leg,
   and siphon's identity steps changed `From` and `P-Asserted-Identity` but not
