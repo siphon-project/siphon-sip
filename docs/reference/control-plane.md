@@ -1358,6 +1358,13 @@ the caller's own.
 Each branch is reported once. A second `dial` on the same channel starts a
 fresh list, so its `DialFailed` carries only its own branches.
 
+A branch reported `cancelled` or `timeout` is over for the application at that
+moment. On the wire its CANCEL goes out then only if the branch has sent a
+provisional response; one that has sent nothing keeps receiving its INVITE's
+retransmissions and is CANCELled on its first provisional (RFC 3261 §9.1). See
+[`cancel_dial`](#cancel_dial--stop-a-dial-and-keep-the-caller) for what a
+party that has answered nothing is sent.
+
 **A caller that requires what no branch can honour.** When the caller's INVITE
 lists an option tag in `Require` that this call cannot honour under its header
 policy, no B-leg could ever connect it (RFC 3261 §8.2.2.3), and a controller
@@ -1548,6 +1555,26 @@ application has already sent somewhere else.
   cause `cancelled`, a sequential hunt's remaining targets are dropped, and the
   dial ends in `DialFailed {code: 487, timed_out: false}`. The caller stays
   unanswered and parked, with no ring deadline left to fail it.
+
+**On the wire, a phone that has answered nothing is not CANCELled yet.** RFC
+3261 §9.1 has a CANCEL wait for the INVITE's first provisional response: a far
+end that has shown no sign of the INVITE may not hold it yet, and a CANCEL that
+got there first would be refused and leave the INVITE to ring. So what each
+phone is sent depends on what it has said so far:
+
+| the phone has sent | what siphon sends it |
+|---|---|
+| a provisional (`100 Trying` counts) | the CANCEL, at once; the `487` it draws is ACKed |
+| nothing | nothing new: its INVITE goes on being retransmitted (UDP). Its first provisional then draws the CANCEL; a `2xx` instead is ACKed and released with a BYE, never CANCELled; any other final response is ACKed and that is all; and if it stays silent the INVITE times out at Timer B (64·T1, 32 s by default) with no CANCEL sent |
+| its final response | nothing: there is no INVITE left to cancel |
+
+None of that delays the application. The reply, `DialBranchFailed`,
+`DialFailed` and the release of the ringback and of each phone's media come
+when the dial is given up, and a phone that speaks up afterwards is dealt with
+on the wire alone: nothing more is reported for it, and it is never connected
+to the caller. The same holds wherever siphon gives up on an INVITE it sent: a
+ring timeout, the phones that lose to the one that answered, `hangup` of an
+unanswered `originate`, `drop`, `terminate`, and the caller's own CANCEL.
 
 The reply is `{channel, state: "cancelled", on_answer}`. Refused, each with
 `error.details` `{verb: "cancel_dial", reason}`:

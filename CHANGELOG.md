@@ -79,6 +79,41 @@ entry, but a working config keeps working.
 
 ### Fixed
 
+- **A CANCEL waits for the INVITE's first provisional response.** RFC 3261
+  §9.1: "If no provisional response has been received, the CANCEL request
+  MUST NOT be sent; rather, the client MUST wait for the arrival of a
+  provisional response before sending the request." siphon sent the CANCEL
+  the moment it gave up on an INVITE, stopped retransmitting that INVITE, and
+  retransmitted the CANCEL instead, whether or not the far end had answered
+  anything. A far end that does not hold the INVITE yet can only refuse such
+  a CANCEL, and an INVITE that reaches it afterwards rings with nothing left
+  to stop it, which is what the rule is there to prevent. Giving up on an
+  INVITE that has drawn no response now leaves it as it is, retransmitting on
+  Timer A, and what the far end says first decides the rest: a provisional
+  (a `100 Trying` counts) draws the CANCEL, and the `487` that follows is
+  ACKed; a 2xx is ACKed and its dialog released with a BYE, and no CANCEL is
+  sent; any other final response is ACKed and nothing more is sent; and if
+  nothing arrives, Timer B ends the transaction with no CANCEL at all. An
+  INVITE that already had a provisional is CANCELled at once, as before, and
+  one that already has its final response is still never CANCELled. This
+  changes every CANCEL siphon sends for an INVITE of its own: `originate`
+  and an originate group (`hangup` of an unanswered one, its ring timeout,
+  the legs that lost to another), a bridging `dial` (`cancel_dial`, the
+  caller hanging up, the phones that lost), a connecting `dial` and a
+  parallel or sequential fork (the branches that lost to a 2xx or a 6xx, the
+  ring timeout, `cancel_dial`, `drop`, `terminate`, shutdown), an LCR
+  carrier failed over at its ring timeout, the caller's own CANCEL relayed
+  to the callees, the targets of a transfer or `replace_peer` that lost or
+  ran out of time, and a B-leg whose CANCEL was owed before its INVITE had
+  left. Only the wire toward the party that has not answered changes. What
+  the caller, a script and a controller are told (`487`, `DialBranchFailed`,
+  `DialFailed`, the `cancel_dial` reply, `@b2bua.on_cancel`, the CDR) and
+  the release of media still happen when siphon gives up, not when that
+  party finally answers. On a reliable transport, where nothing is
+  retransmitted, a waiting CANCEL is dropped 32 s after siphon gave up. The
+  proxy path is not changed: a CANCEL relayed or generated for a proxied
+  INVITE (`request.relay()`, `request.fork()`, `reply.reject()`) still goes
+  out without waiting.
 - **A transfer target given up on at its deadline has its `487` ACKed.** When
   a siphon-terminated transfer or `replace_peer` ran out of time, siphon sent
   the target a CANCEL and forgot the leg at once, so the `487 Request
