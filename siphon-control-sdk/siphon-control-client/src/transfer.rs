@@ -6,6 +6,10 @@
 //! over the flow its phone registered on, and the identity arguments
 //! [`Call::dial`] takes. Split from [`sip`](crate::sip), which is at its size
 //! budget.
+//!
+//! Also the transfer the application carries out itself:
+//! [`Call::accept_refer_controller`] has the server answer the REFER and dial
+//! nothing, and [`Call::complete_refer`] reports how it went.
 
 use serde_json::json;
 
@@ -127,6 +131,59 @@ impl Call {
             .map(drop)
     }
 
+    /// Accept a pending inbound REFER for this application to carry out.
+    ///
+    /// The server answers `202 Accepted`, sends the referrer the first sipfrag
+    /// NOTIFY (`100 Trying`) and dials nothing. Move the parties with the other
+    /// verbs — [`Call::bridge`], [`Call::unbridge`], [`Call::replace_peer`],
+    /// [`Call::dial`] — and then report with [`Call::complete_refer`].
+    ///
+    /// `timeout` is how many seconds there are to report in (default 60, at
+    /// most 180). Past it the server reports `503` to the referrer itself, and
+    /// a later [`Call::complete_refer`] is refused. Until the report, a further
+    /// REFER on the call is answered `491 Request Pending`.
+    ///
+    /// ```no_run
+    /// # use siphon_control_client::sip::Call;
+    /// # async fn example(call: &Call) -> Result<(), siphon_control_client::ControlError> {
+    /// call.accept_refer_controller(Some(30)).await?;
+    /// // ... bridge the parties that remain ...
+    /// call.complete_refer(200, None).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn accept_refer_controller(&self, timeout: Option<u32>) -> Result<(), ControlError> {
+        self.sip(SipVerb::AcceptRefer, accept_refer_controller_args(timeout))
+            .await
+            .map(drop)
+    }
+
+    /// Report how a transfer accepted with [`Call::accept_refer_controller`]
+    /// went.
+    ///
+    /// The server sends the referrer the sipfrag NOTIFY that ends its
+    /// subscription: `code` is the status in it (200-699), a 2xx for a transfer
+    /// that succeeded, and `reason` its reason phrase, used as given. Nothing
+    /// else happens to the call.
+    ///
+    /// **Report before releasing the referrer's leg.** The NOTIFY travels on
+    /// its dialog, so once that leg is hung up or replaced there is nothing to
+    /// send it in, and this resolves to `ControlErrorCode::NotFound`.
+    ///
+    /// Resolves to [`ControlError::Command`] with
+    /// `ControlErrorCode::InvalidState` (`details.reason` is
+    /// `no_transfer_pending`) when the call has no such transfer open: already
+    /// reported, past its deadline, or its referrer hung up.
+    pub async fn complete_refer(
+        &self,
+        code: u16,
+        reason: Option<&str>,
+    ) -> Result<(), ControlError> {
+        self.sip(SipVerb::CompleteRefer, complete_refer_args(code, reason))
+            .await
+            .map(drop)
+    }
+
     /// [`Call::replace_peer`], naming who the replacement dials and how.
     pub async fn replace_peer_dialling(
         &self,
@@ -153,9 +210,49 @@ impl Call {
     }
 }
 
+/// The `accept_refer` arguments of a transfer the application carries out:
+/// the mode, and the timeout only when one is given, so the server's default
+/// applies otherwise.
+fn accept_refer_controller_args(timeout: Option<u32>) -> serde_json::Value {
+    match timeout {
+        Some(timeout) => json!({ "mode": "controller", "timeout": timeout }),
+        None => json!({ "mode": "controller" }),
+    }
+}
+
+/// The `complete_refer` arguments: the reason only when one is given, so the
+/// server's phrase for the status applies otherwise.
+fn complete_refer_args(code: u16, reason: Option<&str>) -> serde_json::Value {
+    match reason {
+        Some(reason) => json!({ "code": code, "reason": reason }),
+        None => json!({ "code": code }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_controller_accept_names_its_mode_and_only_a_given_timeout() {
+        assert_eq!(
+            accept_refer_controller_args(None),
+            json!({ "mode": "controller" })
+        );
+        assert_eq!(
+            accept_refer_controller_args(Some(90)),
+            json!({ "mode": "controller", "timeout": 90 })
+        );
+    }
+
+    #[test]
+    fn a_report_names_its_status_and_only_a_given_reason() {
+        assert_eq!(complete_refer_args(200, None), json!({ "code": 200 }));
+        assert_eq!(
+            complete_refer_args(486, Some("Busy Here")),
+            json!({ "code": 486, "reason": "Busy Here" })
+        );
+    }
 
     fn args_of(dial: &TransferDial) -> serde_json::Value {
         let mut args = serde_json::Map::new();

@@ -168,6 +168,7 @@ def test_module_surface():
         "remove_header",
         "accept_refer",
         "reject_refer",
+        "complete_refer",
         "bridge",
         "unbridge",
         "answer_anchored",

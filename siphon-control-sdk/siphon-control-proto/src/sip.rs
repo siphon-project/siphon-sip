@@ -59,6 +59,15 @@ pub enum SipVerb {
     AcceptRefer,
     /// Reject a pending inbound REFER with a final non-2xx.
     RejectRefer,
+    /// Report how a transfer accepted with [`SipVerb::AcceptRefer`] in mode
+    /// `controller` went. The server answered that REFER `202`, dialled
+    /// nothing and left the transfer to the application; this sends the
+    /// referrer the sipfrag NOTIFY that ends its subscription, a 2xx for a
+    /// transfer that succeeded.
+    ///
+    /// Refused (`invalid_state`, `details.reason == "no_transfer_pending"`)
+    /// when the call has no such transfer open.
+    CompleteRefer,
     /// Join this channel to another the app owns, so the two parties hear each
     /// other. The reply reports the local action only (the media is re-pointed
     /// and the first re-INVITE is on the wire); the outcome arrives as
@@ -143,6 +152,7 @@ impl SipVerb {
             SipVerb::Refer => "refer",
             SipVerb::AcceptRefer => "accept_refer",
             SipVerb::RejectRefer => "reject_refer",
+            SipVerb::CompleteRefer => "complete_refer",
             SipVerb::Bridge => "bridge",
             SipVerb::Unbridge => "unbridge",
             SipVerb::ReplacePeer => "replace_peer",
@@ -1461,6 +1471,7 @@ mod tests {
         assert_eq!(SipVerb::RemoveHeader.as_str(), "remove_header");
         assert_eq!(SipVerb::AcceptRefer.as_str(), "accept_refer");
         assert_eq!(SipVerb::RejectRefer.as_str(), "reject_refer");
+        assert_eq!(SipVerb::CompleteRefer.as_str(), "complete_refer");
         assert_eq!(SipVerb::Ring.as_str(), "ring");
         assert_eq!(SipVerb::Progress.as_str(), "progress");
         assert_eq!(SipVerb::Bridge.as_str(), "bridge");
