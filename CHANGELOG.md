@@ -131,10 +131,46 @@ entry, but a working config keeps working.
   `DialFailed`, the `cancel_dial` reply, `@b2bua.on_cancel`, the CDR) and
   the release of media still happen when siphon gives up, not when that
   party finally answers. On a reliable transport, where nothing is
-  retransmitted, a waiting CANCEL is dropped 32 s after siphon gave up. The
-  proxy path is not changed: a CANCEL relayed or generated for a proxied
-  INVITE (`request.relay()`, `request.fork()`, `reply.reject()`) still goes
-  out without waiting.
+  retransmitted, a waiting CANCEL is dropped 32 s after siphon gave up. A
+  CANCEL relayed or generated for a proxied INVITE (`request.relay()`,
+  `request.fork()`, `reply.reject()`) waits the same way, by the proxy's own
+  means: see the next entry.
+- **The proxy CANCELs a branch only once its INVITE has drawn a provisional
+  response, and never after its final one.** RFC 3261 §9.1 forbids a CANCEL
+  for a request with no provisional response ("the CANCEL request MUST NOT
+  be sent; rather, the client MUST wait for the arrival of a provisional
+  response") and advises against one for a request with its final response,
+  and §16.10 and §16.7 step 10 have a proxy CANCEL its *pending* client
+  transactions, which are the ones in between. The proxy sent a CANCEL on
+  every branch of the request, whatever the branch had answered: on every
+  other branch when a fork branch answered 2xx or 6xx, on every branch for
+  `reply.reject()`, and on every branch for the caller's own CANCEL. A branch
+  that had sent nothing got one for an INVITE it might not hold yet, which it
+  can only refuse, and the INVITE retransmitted behind it then rang with
+  nothing left to stop it; a branch that had already failed got one for a
+  transaction that was over. Each branch is now asked through its INVITE
+  client transaction, whose state is the record of what the branch has
+  drawn. One that has a provisional is CANCELled at once, as before. One that
+  has nothing keeps its CANCEL with the transaction and stays an unanswered
+  request, retransmitted on Timer A over UDP: its first provisional (a `100
+  Trying` counts) sends the CANCEL and the `487` that follows is ACKed, a
+  final response instead is taken as it is with no CANCEL, and Timer B ends
+  the wait with no CANCEL at all, over a reliable transport too. One that has
+  its final response is sent nothing. The waiting CANCEL does not depend on
+  the proxy session, which the caller's CANCEL removes at once, and a
+  provisional and a request to cancel arriving together on two workers send
+  exactly one CANCEL. What the caller sees does not change: the `200` and
+  `487` to its CANCEL, the winning 2xx, the reject's own response, and
+  `@proxy.on_cancel`, `@proxy.on_reply` and `@proxy.on_failure` when they
+  ran before. Two things follow from the same rule. A provisional from a
+  branch of a fork that has already settled is no longer forwarded to the
+  caller behind the final response (§16.7 step 5), which the late first
+  provisional of a silent branch would otherwise be every time. And the
+  other branches of a forked request that is not an INVITE are no longer sent
+  a CANCEL when one answers (§9.1: a CANCEL is for an INVITE). A 2xx from a
+  branch the proxy has given up on is still not relayed to the caller, as
+  before. **BREAKING (Rust library):** `transaction::state::Action` gains a
+  `SendCancel` variant, which an exhaustive `match` on it has to handle.
 - **A transfer whose target cannot be dialled ends its subscription and
   leaves the call free.** A siphon-terminated REFER answers `202` and sends
   the `100 Trying` NOTIFY before it dials. When no INVITE could then be sent
