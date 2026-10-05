@@ -412,12 +412,15 @@ pub(super) fn handle_response(
                                 //
                                 // It goes "to the same address, port, and
                                 // transport to which the original request was
-                                // sent" (§17.1.1.3), which the branch records;
-                                // a response can arrive from another port. With
-                                // no session left for the branch, where the
-                                // response came from is all there is.
-                                let (ack_transport, ack_destination, ack_connection) =
-                                    proxy_branch_hop(key, state).unwrap_or((
+                                // sent" (§17.1.1.3), which the transaction
+                                // records; a response can arrive from another
+                                // port. Where none is recorded, or the
+                                // transaction ended with this response, where
+                                // the response came from is all there is.
+                                let hop = state.transaction_manager.client_hop(key);
+                                let (ack_transport, ack_destination, ack_connection) = hop
+                                    .map(|hop| (hop.transport, hop.destination, hop.connection_id))
+                                    .unwrap_or((
                                         inbound.transport,
                                         inbound.remote_addr,
                                         inbound.connection_id,
@@ -432,7 +435,8 @@ pub(super) fn handle_response(
                                     ack_transport,
                                     ack_destination,
                                     ack_connection,
-                                    Some(inbound.local_addr),
+                                    hop.and_then(|hop| hop.source_local_addr)
+                                        .or(Some(inbound.local_addr)),
                                     state,
                                 );
                             }

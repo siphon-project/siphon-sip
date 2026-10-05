@@ -118,7 +118,8 @@ fn bench_response_step(criterion: &mut Criterion) {
             bencher.iter_batched(
                 || {
                     let mut transaction = calling(&frame);
-                    black_box(transaction.request_cancel(hop(), &[]));
+                    transaction.set_hop(hop());
+                    black_box(transaction.request_cancel(&[]));
                     (transaction, ringing.clone())
                 },
                 |(mut transaction, ringing)| {
@@ -163,10 +164,11 @@ fn bench_cancel_request(criterion: &mut Criterion) {
                         Transport::Udp,
                     )
                     .expect("the client transaction starts");
+                manager.set_client_hop(&key, hop());
                 (manager, key)
             },
             |(manager, key)| {
-                let outcome = manager.cancel_invite_client(&key, hop(), &[]);
+                let outcome = manager.cancel_invite_client(&key, &[]);
                 black_box((manager, outcome))
             },
             BatchSize::SmallInput,
@@ -183,6 +185,7 @@ fn bench_cancel_request(criterion: &mut Criterion) {
         let (key, _) = manager
             .new_client_transaction(&request, Bytes::from(request.to_bytes()), Transport::Udp)
             .expect("the client transaction starts");
+        manager.set_client_hop(&key, hop());
         manager
             .process_client_event(
                 &key,
@@ -192,12 +195,12 @@ fn bench_cancel_request(criterion: &mut Criterion) {
                 ))),
             )
             .expect("the transaction is live");
-        black_box(manager.cancel_invite_client(&key, hop(), &[]));
+        black_box(manager.cancel_invite_client(&key, &[]));
         keys.push(key);
     }
     let key = keys[500].clone();
     criterion.bench_function("proxy_branch_cancel/request/nothing_to_send", |bencher| {
-        bencher.iter(|| black_box(manager.cancel_invite_client(black_box(&key), hop(), &[])));
+        bencher.iter(|| black_box(manager.cancel_invite_client(black_box(&key), &[])));
     });
 }
 

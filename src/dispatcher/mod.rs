@@ -187,6 +187,8 @@ mod proxy_branch_final_tests;
 #[cfg(test)]
 mod proxy_cancel_awaits_provisional_tests;
 #[cfg(test)]
+mod proxy_cancel_wire_tests;
+#[cfg(test)]
 mod proxy_dialog_state_tests;
 #[cfg(test)]
 mod proxy_late_answer_tests;

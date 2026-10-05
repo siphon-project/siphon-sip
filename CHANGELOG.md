@@ -220,6 +220,17 @@ entry, but a working config keeps working.
   builder the B2BUA already used. A `Reason` in the caller's CANCEL is still
   relayed with each branch's (RFC 3326); nothing else of the caller's CANCEL
   is, and `Max-Forwards` is the INVITE's as forwarded.
+- **A proxy CANCEL, and the ACK of a failed branch, leave the way the INVITE
+  did.** RFC 3261 §9.1: "The destination address, port, and transport for the
+  CANCEL MUST be identical to those used to send the original request", and
+  §17.1.1.3 says the same of the ACK. Both left from the default listener,
+  whatever socket the INVITE had gone out from, so a branch pinned to another
+  one (a captured flow, a `send_socket`, a protected port) got them from a
+  socket its peer had never heard from. The INVITE client transaction now
+  records the hop its INVITE took (the local socket, the address, the
+  transport, and the connection once a stream transport has established it),
+  and its CANCEL and ACK are sent by that record, also when the session is
+  gone by the time a waiting CANCEL is released.
 - **A transfer whose target cannot be dialled ends its subscription and
   leaves the call free.** A siphon-terminated REFER answers `202` and sends
   the `100 Trying` NOTIFY before it dials. When no INVITE could then be sent

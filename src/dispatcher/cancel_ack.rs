@@ -61,9 +61,7 @@ pub(super) fn cancel_fork_branches(
         if Some(client_key) == exclude {
             continue;
         }
-        if let Some(client_branch) = session.get_client_branch(client_key) {
-            cancel_proxy_branch(client_key, client_branch, &[], state);
-        }
+        cancel_proxy_branch(client_key, &[], state);
     }
 }
 
@@ -91,58 +89,33 @@ pub(super) fn cancel_fork_branches(
 ///
 /// The waiting CANCEL does not depend on the proxy session, which the caller's
 /// CANCEL removes at once.
-fn cancel_proxy_branch(
-    client_key: &TransactionKey,
-    client_branch: &ClientBranch,
-    reasons: &[String],
-    state: &DispatcherState,
-) {
-    use crate::transaction::state::{BranchHop, CancelOutcome};
+fn cancel_proxy_branch(client_key: &TransactionKey, reasons: &[String], state: &DispatcherState) {
+    use crate::transaction::state::CancelOutcome;
 
-    let hop = BranchHop {
-        destination: client_branch.destination,
-        transport: client_branch.transport,
-        connection_id: client_branch.connection_id,
-        source_local_addr: None,
-    };
     match state
         .transaction_manager
-        .cancel_invite_client(client_key, hop, reasons)
+        .cancel_invite_client(client_key, reasons)
     {
         CancelOutcome::SendNow(cancel) => send_proxy_branch_cancel(&cancel, state),
         CancelOutcome::Deferred => debug!(
             client_key = %client_key,
-            destination = %client_branch.destination,
             "proxy: no provisional on this branch yet — its INVITE keeps retransmitting and the CANCEL follows its first provisional (RFC 3261 §9.1)"
         ),
         CancelOutcome::NothingToSend => debug!(
             client_key = %client_key,
-            destination = %client_branch.destination,
             "proxy: branch has its final response or its CANCEL already — nothing to send (RFC 3261 §9.1)"
         ),
         CancelOutcome::Unbuildable(error) => warn!(
             client_key = %client_key,
-            destination = %client_branch.destination,
             "proxy: cannot build the CANCEL of a branch from its INVITE as sent ({error}) — it rings on until it answers or times out"
         ),
     }
 }
 
-/// Where the proxy sent the request of client transaction `client_key`:
-/// transport, address and connection, as its session's branch records them.
-/// `None` once the session no longer holds the branch.
-pub(super) fn proxy_branch_hop(
-    client_key: &TransactionKey,
-    state: &DispatcherState,
-) -> Option<(Transport, SocketAddr, ConnectionId)> {
-    let session_arc = state.session_store.get_by_client_key(client_key)?;
-    let session = session_arc.read().ok()?;
-    let branch = session.get_client_branch(client_key)?;
-    Some((branch.transport, branch.destination, branch.connection_id))
-}
-
 /// Put the CANCEL of a proxied INVITE on the wire, to the hop that INVITE went
-/// to (RFC 3261 §9.1: the same destination address, port and transport).
+/// to and from the socket it left from (RFC 3261 §9.1: the same destination
+/// address, port and transport; on a multi-homed host, or a flow pinned to
+/// one listener, a CANCEL from another socket is another sender to the peer).
 ///
 /// Reached from the two places a branch's CANCEL is released: at once, when
 /// the branch already had a provisional, and from the response path, on the
@@ -776,19 +749,17 @@ pub(super) fn handle_cancel_via_session(
         .cloned()
         .unwrap_or_default();
     for client_key in &session.client_keys {
-        if let Some(client_branch) = session.get_client_branch(client_key) {
-            // RFC 3261 §9.1 / §16.10: the CANCEL of a branch is that
-            // branch's INVITE over again (Request-URI, Route, From, To,
-            // Call-ID, CSeq number, and its top Via as the one Via), so it is
-            // built from the INVITE as sent, not from the caller's CANCEL,
-            // whose Request-URI and route set are the caller's. What the
-            // caller's CANCEL adds is why (RFC 3326), and that is relayed.
-            //
-            // Sent now to a branch that has answered with a provisional, kept
-            // for one that has answered nothing, dropped for one that already
-            // has its final response (RFC 3261 §9.1).
-            cancel_proxy_branch(client_key, client_branch, &reasons, state);
-        }
+        // RFC 3261 §9.1 / §16.10: the CANCEL of a branch is that branch's
+        // INVITE over again (Request-URI, Route, From, To, Call-ID, CSeq
+        // number, and its top Via as the one Via), so it is built from the
+        // INVITE as sent, not from the caller's CANCEL, whose Request-URI and
+        // route set are the caller's. What the caller's CANCEL adds is why
+        // (RFC 3326), and that is relayed.
+        //
+        // Sent now to a branch that has answered with a provisional, kept for
+        // one that has answered nothing, dropped for one that already has its
+        // final response (RFC 3261 §9.1).
+        cancel_proxy_branch(client_key, &reasons, state);
     }
 
     // Send 487 Request Terminated upstream using the original INVITE from the session

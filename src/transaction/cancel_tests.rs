@@ -67,6 +67,7 @@ fn started(transport: Transport) -> (TransactionManager, TransactionKey, Vec<Act
     let (key, actions) = manager
         .new_client_transaction(&request, Bytes::from(request.to_bytes()), transport)
         .expect("the client transaction starts");
+    manager.set_client_hop(&key, hop());
     (manager, key, actions)
 }
 
@@ -94,7 +95,7 @@ fn retransmits_in(actions: &[Action]) -> usize {
 fn a_cancel_for_an_invite_with_no_response_waits_for_its_first_provisional() {
     let (manager, key, _) = started(Transport::Udp);
     assert!(matches!(
-        manager.cancel_invite_client(&key, hop(), &[]),
+        manager.cancel_invite_client(&key, &[]),
         CancelOutcome::Deferred
     ));
     assert_eq!(manager.waiting_cancel_count(), 1);
@@ -130,7 +131,7 @@ fn a_cancel_for_an_invite_with_no_response_waits_for_its_first_provisional() {
     );
     assert_eq!(cancels_in(&actions), 0);
     assert!(matches!(
-        manager.cancel_invite_client(&key, hop(), &[]),
+        manager.cancel_invite_client(&key, &[]),
         CancelOutcome::NothingToSend
     ));
 
@@ -153,7 +154,7 @@ fn a_cancel_for_an_invite_with_a_provisional_is_sent_at_once_and_only_once() {
         &key,
         IctEvent::Provisional(response(180, "Ringing")),
     );
-    match manager.cancel_invite_client(&key, hop(), &[]) {
+    match manager.cancel_invite_client(&key, &[]) {
         CancelOutcome::SendNow(now) => {
             assert_eq!(parsed(&now).method(), Some(&Method::Cancel));
             assert_eq!(now.hop, hop());
@@ -162,7 +163,7 @@ fn a_cancel_for_an_invite_with_a_provisional_is_sent_at_once_and_only_once() {
     }
     assert_eq!(manager.waiting_cancel_count(), 0);
     assert!(matches!(
-        manager.cancel_invite_client(&key, hop(), &[]),
+        manager.cancel_invite_client(&key, &[]),
         CancelOutcome::NothingToSend
     ));
 }
@@ -172,7 +173,7 @@ fn a_second_request_while_the_first_cancel_waits_does_not_send_two() {
     let (manager, key, _) = started(Transport::Udp);
     for _ in 0..2 {
         assert!(matches!(
-            manager.cancel_invite_client(&key, hop(), &[]),
+            manager.cancel_invite_client(&key, &[]),
             CancelOutcome::Deferred
         ));
     }
@@ -195,7 +196,7 @@ fn an_invite_with_its_final_response_is_not_cancelled() {
         IctEvent::ResponseNon2xx(response(486, "Busy Here")),
     );
     assert!(matches!(
-        manager.cancel_invite_client(&key, hop(), &[]),
+        manager.cancel_invite_client(&key, &[]),
         CancelOutcome::NothingToSend
     ));
     assert_eq!(manager.waiting_cancel_count(), 0);
@@ -205,7 +206,7 @@ fn an_invite_with_its_final_response_is_not_cancelled() {
     feed(&manager, &key, IctEvent::Response2xx(response(200, "OK")));
     assert_eq!(manager.count(), 0);
     assert!(matches!(
-        manager.cancel_invite_client(&key, hop(), &[]),
+        manager.cancel_invite_client(&key, &[]),
         CancelOutcome::NothingToSend
     ));
 }
@@ -215,7 +216,7 @@ fn a_waiting_cancel_is_dropped_unsent_by_a_final_response() {
     for success in [true, false] {
         let (manager, key, _) = started(Transport::Udp);
         assert!(matches!(
-            manager.cancel_invite_client(&key, hop(), &[]),
+            manager.cancel_invite_client(&key, &[]),
             CancelOutcome::Deferred
         ));
         let actions = if success {
@@ -239,7 +240,7 @@ fn a_waiting_cancel_is_dropped_unsent_by_a_final_response() {
             );
             assert_eq!(cancels_in(&actions), 0);
             assert!(matches!(
-                manager.cancel_invite_client(&key, hop(), &[]),
+                manager.cancel_invite_client(&key, &[]),
                 CancelOutcome::NothingToSend
             ));
         }
@@ -250,7 +251,7 @@ fn a_waiting_cancel_is_dropped_unsent_by_a_final_response() {
 fn timer_b_ends_a_waiting_cancel_without_sending_it() {
     let (manager, key, _) = started(Transport::Udp);
     assert!(matches!(
-        manager.cancel_invite_client(&key, hop(), &[]),
+        manager.cancel_invite_client(&key, &[]),
         CancelOutcome::Deferred
     ));
     let actions = feed(&manager, &key, IctEvent::TimerB);
@@ -261,7 +262,7 @@ fn timer_b_ends_a_waiting_cancel_without_sending_it() {
     assert_eq!(manager.waiting_cancel_count(), 0);
     assert_eq!(manager.count(), 0);
     assert!(matches!(
-        manager.cancel_invite_client(&key, hop(), &[]),
+        manager.cancel_invite_client(&key, &[]),
         CancelOutcome::NothingToSend
     ));
 }
@@ -281,7 +282,7 @@ fn over_a_reliable_transport_a_waiting_cancel_ends_at_the_transaction_timeout() 
         .collect();
     assert_eq!(timers, [TimerName::B], "no Timer A to retransmit on");
     assert!(matches!(
-        manager.cancel_invite_client(&key, hop(), &[]),
+        manager.cancel_invite_client(&key, &[]),
         CancelOutcome::Deferred
     ));
     assert_eq!(manager.waiting_cancel_count(), 1);
@@ -306,8 +307,9 @@ fn waiting_cancels_drain_to_baseline_over_every_exit() {
         let (key, _) = manager
             .new_client_transaction(&request, Bytes::from(request.to_bytes()), Transport::Udp)
             .expect("the client transaction starts");
+        manager.set_client_hop(&key, hop());
         assert!(matches!(
-            manager.cancel_invite_client(&key, hop(), &[]),
+            manager.cancel_invite_client(&key, &[]),
             CancelOutcome::Deferred
         ));
         keys.push(key);
@@ -450,13 +452,14 @@ fn the_cancel_is_built_from_the_invite_as_it_was_sent() {
         let (key, _) = manager
             .new_client_transaction(&request, Bytes::from(request.to_bytes()), Transport::Udp)
             .expect("the client transaction starts");
+        manager.set_client_hop(&key, hop());
         feed(
             &manager,
             &key,
             IctEvent::Provisional(response(180, "Ringing")),
         );
         let reasons = ["SIP;cause=200;text=\"Call completed elsewhere\"".to_string()];
-        let cancel = match manager.cancel_invite_client(&key, hop(), &reasons) {
+        let cancel = match manager.cancel_invite_client(&key, &reasons) {
             CancelOutcome::SendNow(cancel) => parsed(&cancel),
             other => panic!("expected the CANCEL back to send, got {other:?}"),
         };
@@ -503,7 +506,7 @@ fn a_waiting_cancel_is_the_invites_own_cancel_too() {
     let (manager, key, _) = started(Transport::Udp);
     let reasons = ["Q.850;cause=16".to_string()];
     assert!(matches!(
-        manager.cancel_invite_client(&key, hop(), &reasons),
+        manager.cancel_invite_client(&key, &reasons),
         CancelOutcome::Deferred
     ));
     let actions = feed(
@@ -528,6 +531,50 @@ fn a_waiting_cancel_is_the_invites_own_cancel_too() {
     );
 }
 
+/// The CANCEL goes to the hop recorded for the INVITE: from the socket it left
+/// from, on the connection the send ended up on. With no hop recorded there
+/// is nowhere to send one, and that is reported, not swallowed.
+#[test]
+fn the_cancel_goes_the_way_the_invite_went() {
+    let pinned = BranchHop {
+        source_local_addr: Some("192.0.2.1:5070".parse().expect("a literal address")),
+        transport: crate::transport::Transport::Tcp,
+        ..hop()
+    };
+    let (manager, key, _) = started(Transport::Reliable);
+    manager.set_client_hop(&key, pinned);
+    assert_eq!(manager.client_hop(&key), Some(pinned));
+    // The connection is known only once the send has established it.
+    manager.set_client_connection(&key, ConnectionId(41));
+    let established = BranchHop {
+        connection_id: ConnectionId(41),
+        ..pinned
+    };
+    assert_eq!(manager.client_hop(&key), Some(established));
+
+    feed(
+        &manager,
+        &key,
+        IctEvent::Provisional(response(180, "Ringing")),
+    );
+    match manager.cancel_invite_client(&key, &[]) {
+        CancelOutcome::SendNow(cancel) => assert_eq!(cancel.hop, established),
+        other => panic!("expected the CANCEL back to send, got {other:?}"),
+    }
+
+    let manager = TransactionManager::default();
+    let request = invite();
+    let (key, _) = manager
+        .new_client_transaction(&request, Bytes::from(request.to_bytes()), Transport::Udp)
+        .expect("the client transaction starts");
+    assert_eq!(manager.client_hop(&key), None);
+    assert!(matches!(
+        manager.cancel_invite_client(&key, &[]),
+        CancelOutcome::Unbuildable(_)
+    ));
+    assert_eq!(manager.waiting_cancel_count(), 0);
+}
+
 #[test]
 fn a_request_other_than_invite_is_never_cancelled() {
     let manager = TransactionManager::default();
@@ -545,7 +592,7 @@ fn a_request_other_than_invite_is_never_cancelled() {
         .new_client_transaction(&options, Bytes::from(options.to_bytes()), Transport::Udp)
         .expect("the client transaction starts");
     assert!(matches!(
-        manager.cancel_invite_client(&key, hop(), &[]),
+        manager.cancel_invite_client(&key, &[]),
         CancelOutcome::NothingToSend
     ));
 }
@@ -576,7 +623,7 @@ fn a_provisional_and_a_cancel_racing_send_exactly_one_cancel() {
             let (manager, key, barrier) = (Arc::clone(&manager), key.clone(), Arc::clone(&barrier));
             std::thread::spawn(move || {
                 barrier.wait();
-                match manager.cancel_invite_client(&key, hop(), &[]) {
+                match manager.cancel_invite_client(&key, &[]) {
                     CancelOutcome::SendNow(_) => 1,
                     CancelOutcome::Deferred
                     | CancelOutcome::NothingToSend
@@ -626,7 +673,7 @@ fn a_final_response_and_a_cancel_racing_never_send_two_cancels() {
                     (Arc::clone(&manager), key.clone(), Arc::clone(&barrier));
                 std::thread::spawn(move || {
                     barrier.wait();
-                    match manager.cancel_invite_client(&key, hop(), &[]) {
+                    match manager.cancel_invite_client(&key, &[]) {
                         CancelOutcome::SendNow(_) => 1,
                         CancelOutcome::Deferred
                         | CancelOutcome::NothingToSend

@@ -797,6 +797,11 @@ pub struct Ict {
     /// it without a lookup of its own, and ends with the transaction whatever
     /// ends that.
     cancel: CancelProgress,
+    /// Where the INVITE went: the socket it left from, the address, transport
+    /// and connection it was sent to. Recorded by the TU when it sends, and
+    /// what the CANCEL and the ACK of this INVITE are sent by (RFC 3261 §9.1,
+    /// §17.1.1.3: the same address, port and transport as the request).
+    hop: Option<BranchHop>,
 }
 
 impl Ict {
@@ -819,6 +824,7 @@ impl Ict {
             timer_a_interval,
             cached_ack: None,
             cancel: CancelProgress::NotRequested,
+            hop: None,
         };
         // Start Timer B (overall timeout)
         actions.push(Action::StartTimer(TimerName::B, ict.timers.timer_b()));
@@ -907,12 +913,32 @@ impl Ict {
             .map_err(|error| format!("ACK build failed: {error}"))
     }
 
-    /// The TU wants this INVITE cancelled. `hop` is where the INVITE went, and
-    /// `reasons` are `Reason` header field values for the CANCEL to carry
-    /// (RFC 3326).
+    /// Record where the INVITE went.
+    pub fn set_hop(&mut self, hop: BranchHop) {
+        self.hop = Some(hop);
+    }
+
+    /// Where the INVITE went, once recorded.
+    pub fn hop(&self) -> Option<BranchHop> {
+        self.hop
+    }
+
+    /// The connection the INVITE went on turned out to be `connection_id`: a
+    /// stream transport's connection is only known once the send has
+    /// established it.
+    pub fn set_connection(&mut self, connection_id: crate::transport::ConnectionId) {
+        if let Some(hop) = self.hop.as_mut() {
+            hop.connection_id = connection_id;
+        }
+    }
+
+    /// The TU wants this INVITE cancelled. `reasons` are `Reason` header field
+    /// values for the CANCEL to carry (RFC 3326).
     ///
     /// The CANCEL is built here, from the INVITE as this transaction sent it,
-    /// so its Request-URI, Route set and Via are that request's own (§9.1).
+    /// so its Request-URI, Route set and Via are that request's own (§9.1),
+    /// and it is addressed to the hop recorded for that INVITE
+    /// ([`Self::set_hop`]): the same socket, address, transport and connection.
     ///
     /// RFC 3261 §9.1: "If no provisional response has been received, the
     /// CANCEL request MUST NOT be sent; rather, the client MUST wait for the
@@ -928,21 +954,19 @@ impl Ict {
     ///   be sent now, to the first caller that asks.
     /// * `Completed` / `Terminated`: the final response has arrived, and there
     ///   is nothing to cancel.
-    pub fn request_cancel(&mut self, hop: BranchHop, reasons: &[String]) -> CancelOutcome {
+    pub fn request_cancel(&mut self, reasons: &[String]) -> CancelOutcome {
         match (self.state, &self.cancel) {
-            (IctState::Calling, CancelProgress::NotRequested) => {
-                match self.build_cancel(hop, reasons) {
-                    Ok(cancel) => {
-                        self.cancel = CancelProgress::Waiting(Box::new(cancel));
-                        CancelOutcome::Deferred
-                    }
-                    Err(error) => CancelOutcome::Unbuildable(error),
+            (IctState::Calling, CancelProgress::NotRequested) => match self.build_cancel(reasons) {
+                Ok(cancel) => {
+                    self.cancel = CancelProgress::Waiting(Box::new(cancel));
+                    CancelOutcome::Deferred
                 }
-            }
+                Err(error) => CancelOutcome::Unbuildable(error),
+            },
             // The first request's CANCEL is the one that waits.
             (IctState::Calling, _) => CancelOutcome::Deferred,
             (IctState::Proceeding, CancelProgress::NotRequested) => {
-                match self.build_cancel(hop, reasons) {
+                match self.build_cancel(reasons) {
                     Ok(cancel) => {
                         self.cancel = CancelProgress::Sent;
                         CancelOutcome::SendNow(cancel)
@@ -954,8 +978,11 @@ impl Ict {
         }
     }
 
-    /// The CANCEL of the INVITE this transaction sent, for `hop`.
-    fn build_cancel(&self, hop: BranchHop, reasons: &[String]) -> Result<BranchCancel, String> {
+    /// The CANCEL of the INVITE this transaction sent, for the hop it went to.
+    fn build_cancel(&self, reasons: &[String]) -> Result<BranchCancel, String> {
+        let hop = self
+            .hop
+            .ok_or_else(|| "no hop was recorded for the INVITE".to_string())?;
         let invite = parse_sip_message_bytes(&self.request_bytes)
             .map_err(|error| format!("sent INVITE does not parse back: {error}"))?;
         let cancel = crate::transaction::cancel::build_cancel(&invite, reasons)

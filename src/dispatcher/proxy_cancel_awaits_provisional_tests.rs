@@ -872,6 +872,20 @@ fn caller_gave_up_on_a_silent_stream_branch(
         )
         .expect("the client transaction starts");
     assert_eq!(client_key.branch, branch);
+    // As the relay path does: the hop before the send, and the connection the
+    // send established once it is known.
+    state.transaction_manager.set_client_hop(
+        &client_key,
+        crate::transaction::state::BranchHop {
+            destination,
+            transport: Transport::Tcp,
+            connection_id: ConnectionId::default(),
+            source_local_addr: None,
+        },
+    );
+    state
+        .transaction_manager
+        .set_client_connection(&client_key, STREAM_CONNECTION);
     process_timer_actions(
         &actions,
         &client_key,
