@@ -30,7 +30,7 @@ entry, but a working config keeps working.
   media-anchored call each contact is offered on a media engine call of its
   own. A target named by URI, or an AoR with one contact, sends what it sent
   before. `PeerReplaced` and `ReplaceFailed` are unchanged and still fire
-  once. Rust library: `ReferSubscription::target_leg_call_id` is replaced by
+  once. **BREAKING (Rust library):** `ReferSubscription::target_leg_call_id` is replaced by
   `targets`, one record per INVITE keyed by Via branch, and
   `b2bua_complete_terminated_transfer` / `b2bua_fail_terminated_transfer`
   take that branch instead of a leg index.
