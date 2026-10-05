@@ -1061,9 +1061,87 @@ async fn a_replaced_callee_leaves_the_calls_media_session_on_the_new_pair() {
         desk_media,
         "on the answering target's engine call"
     );
-    assert_eq!(pair.to_tag.as_deref(), Some("a-tag"), "with the survivor");
-    assert_eq!(pair.from_tag, "desk-tag", "and the target");
+    // The session names the party in the caller's slot first, as every
+    // in-dialog re-offer reads it: the surviving caller, then the target.
+    assert_eq!(pair.from_tag, "a-tag", "the surviving caller");
+    assert_eq!(pair.to_tag.as_deref(), Some("desk-tag"), "and the target");
     assert_eq!(sessions.len(), 1);
+
+    // The caller answers the re-INVITE that pointed it at the target, which
+    // frees its dialog for an offer of its own (RFC 3261 §14.1).
+    let to_caller = sent_invite_to(&wire(&ringing.call.dispatcher), ringing.call.a.1);
+    let accepted = super::dial_bridge_test_harness::in_dialog_response(
+        &to_caller,
+        200,
+        "OK",
+        &format!("sip:phone@{}", ringing.call.a.1),
+        Some(concat!(
+            "v=0\r\n",
+            "o=- 1 1 IN IP4 192.0.2.120\r\n",
+            "s=-\r\n",
+            "c=IN IP4 192.0.2.120\r\n",
+            "t=0 0\r\n",
+            "m=audio 40000 RTP/AVP 0\r\n",
+        )),
+    );
+    respond(
+        &ringing.call.dispatcher,
+        &ringing.call_id,
+        ringing.call.a.1,
+        &to_caller,
+        accepted,
+    );
+
+    // The caller holds: its re-offer goes through the pair's engine call under
+    // the caller's own tag. Under the target's it would claim the target is
+    // the party re-offering, and the engine would re-point the wrong side.
+    let _ = wire(&ringing.call.dispatcher);
+    let hold = concat!(
+        "v=0\r\n",
+        "o=- 1 2 IN IP4 192.0.2.120\r\n",
+        "s=-\r\n",
+        "c=IN IP4 192.0.2.120\r\n",
+        "t=0 0\r\n",
+        "m=audio 40000 RTP/AVP 0\r\n",
+        "a=sendonly\r\n",
+    );
+    let raw = format!(
+        concat!(
+            "INVITE sip:192.0.2.1:5060 SIP/2.0\r\n",
+            "Via: SIP/2.0/UDP {source};branch=z9hG4bK-hold-after-replacement\r\n",
+            "Max-Forwards: 70\r\n",
+            "From: <sip:x@example.com>;tag=a-tag\r\n",
+            "To: {to}\r\n",
+            "Call-ID: {call_id}\r\n",
+            "CSeq: 5 INVITE\r\n",
+            "Contact: <sip:phone@{source}>\r\n",
+            "Content-Type: application/sdp\r\n",
+            "Content-Length: {length}\r\n",
+            "\r\n",
+            "{hold}",
+        ),
+        source = ringing.call.a.1,
+        to = header(&ringing.call.answer_to_a, "To"),
+        call_id = ringing.call.a_call_id,
+        length = hold.len(),
+        hold = hold,
+    );
+    let reinvite = parse_sip_message_bytes(raw.as_bytes()).expect("the re-INVITE parses");
+    tokio::task::block_in_place(|| {
+        handle_b2bua_reinvite(inbound(ringing.call.a.1, &raw), reinvite, ringing.state())
+    });
+    let reoffers = engine.commands("reoffer");
+    assert_eq!(
+        reoffers.len(),
+        1,
+        "the hold reaches the engine: {reoffers:?}"
+    );
+    assert_eq!(reoffers[0].call_id, desk_media, "on the pair's engine call");
+    assert_eq!(reoffers[0].from_tag, "a-tag", "as the caller's own offer");
+    assert!(
+        summaries(&wire(&ringing.call.dispatcher)).contains(&format!("INVITE {desk}")),
+        "and is relayed to the target"
+    );
 
     // The call ends: its engine call goes with it.
     hang_up(

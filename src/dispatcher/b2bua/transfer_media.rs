@@ -90,13 +90,19 @@ impl RepairedIngress {
     /// What the re-anchored pair's session records per party, so a later
     /// re-pairing of the same call still reads each party's own policy.
     ///
-    /// That session names the joining party on its `from_tag` and the survivor
-    /// on its `to_tag`, after a replacement and a takeover alike. `profile` is
-    /// the one the pair was shaped with, and `joiner_offered` says whether the
-    /// joining party's SDP was the fresh call's `offer`: the party whose SDP
-    /// is offered is sent the `answer` half's result, the other one the
-    /// `offer` half's.
-    pub fn sides(&self, profile: &str, joiner_offered: bool) -> BridgeSides {
+    /// That session names the party in the call's A-leg slot on its
+    /// `from_tag` and the other on its `to_tag`: `joiner_on_from_tag` says the
+    /// joining party is the one in the A-leg slot (it replaced the caller, or
+    /// took over), otherwise the survivor is. `profile` is the one the pair
+    /// was shaped with, and `joiner_offered` says whether the joining party's
+    /// SDP was the fresh call's `offer`: the party whose SDP is offered is
+    /// sent the `answer` half's result, the other one the `offer` half's.
+    pub fn sides(
+        &self,
+        profile: &str,
+        joiner_on_from_tag: bool,
+        joiner_offered: bool,
+    ) -> BridgeSides {
         let half = |half| SideFlags {
             profile: profile.to_string(),
             half,
@@ -106,11 +112,20 @@ impl RepairedIngress {
         } else {
             (ProfileHalf::Offer, ProfileHalf::Answer)
         };
-        BridgeSides {
-            anchor: half(joining),
-            peer: half(survivor),
-            anchor_ingress: self.joining.clone(),
-            peer_ingress: self.survivor.clone(),
+        if joiner_on_from_tag {
+            BridgeSides {
+                anchor: half(joining),
+                peer: half(survivor),
+                anchor_ingress: self.joining.clone(),
+                peer_ingress: self.survivor.clone(),
+            }
+        } else {
+            BridgeSides {
+                anchor: half(survivor),
+                peer: half(joining),
+                anchor_ingress: self.survivor.clone(),
+                peer_ingress: self.joining.clone(),
+            }
         }
     }
 }
@@ -275,16 +290,23 @@ mod tests {
             survivor: side("dialled", ProfileHalf::Offer),
             joining: side("dialled", ProfileHalf::Answer),
         };
-        // A leg replacement stores the target on `from_tag`, and the target
-        // answered: it was sent the `offer` half's result.
-        let replaced = ingress.sides("shaped", false);
+        // A replacement of the caller stores the target on `from_tag`, and
+        // the target answered: it was sent the `offer` half's result.
+        let replaced = ingress.sides("shaped", true, false);
         assert_eq!(replaced.anchor, side("shaped", ProfileHalf::Offer));
         assert_eq!(replaced.peer, side("shaped", ProfileHalf::Answer));
         assert_eq!(replaced.anchor_ingress, ingress.joining);
         assert_eq!(replaced.peer_ingress, ingress.survivor);
+        // A replacement of the callee leaves the surviving caller on
+        // `from_tag`: the same two parties, the other way round.
+        let callee_replaced = ingress.sides("shaped", false, false);
+        assert_eq!(callee_replaced.anchor, side("shaped", ProfileHalf::Answer));
+        assert_eq!(callee_replaced.peer, side("shaped", ProfileHalf::Offer));
+        assert_eq!(callee_replaced.anchor_ingress, ingress.survivor);
+        assert_eq!(callee_replaced.peer_ingress, ingress.joining);
         // A takeover stores the newcomer on `from_tag`, and the newcomer
         // offered: it was sent the `answer` half's result.
-        let taken_over = ingress.sides("shaped", true);
+        let taken_over = ingress.sides("shaped", true, true);
         assert_eq!(taken_over.anchor, side("shaped", ProfileHalf::Answer));
         assert_eq!(taken_over.peer, side("shaped", ProfileHalf::Offer));
         assert_eq!(taken_over.anchor_ingress, ingress.joining);

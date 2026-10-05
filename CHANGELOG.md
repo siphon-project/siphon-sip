@@ -151,6 +151,16 @@ entry, but a working config keeps working.
   it was not anchored, and the call's teardown did not delete the pair's media
   engine call, which stayed until the engine's own timeout. The session is now
   kept, and the engine call goes with the call.
+- **A hold from the caller after its callee was transferred away is relayed,
+  not refused `491`.** The leg of a transfer target was never marked confirmed
+  when siphon ACKed its 2xx, so a re-INVITE from the surviving caller, which is
+  relayed only to a confirmed leg (RFC 3261 §14.1), was answered `491 Request
+  Pending` however often it was retried. The target's leg is now confirmed by
+  that ACK. The re-anchored pair's media session also named the target where
+  the caller's slot is read from, so the caller's re-offer would have reached
+  the media engine as the target's; it now names the surviving caller first
+  and the target second, and the caller's hold is re-offered on the pair's
+  engine call under the caller's own tag and relayed to the target.
 - **A pair bridged again after an `unbridge` is shaped and pinned as its first
   bridge shaped and pinned it.** When a bridge forms, the `with` leg's own
   media session is retired, and with it the record of the profile that leg was

@@ -321,7 +321,7 @@ pub fn b2bua_bridge_inbound_replaces(
                 // the next time this call is re-paired.
                 bridge_sides: repaired
                     .as_ref()
-                    .map(|repaired| repaired.sides(&old_session.profile, true)),
+                    .map(|repaired| repaired.sides(&old_session.profile, true, true)),
                 created_at: std::time::Instant::now(),
             });
             store.remove(old_key);
@@ -769,6 +769,21 @@ pub fn b2bua_complete_terminated_transfer(
             target_leg.transport.local_addr,
             state,
         );
+        // That ACK confirms the target's dialog, in whichever slot the
+        // promotion put its leg. A re-INVITE from the surviving party is
+        // relayed only to a confirmed leg (RFC 3261 §14.1), so without this
+        // every hold after the transfer is refused `491` for good.
+        if let Some(mut call) = state.call_actors.get_call_mut(call_id) {
+            if call.a_leg.dialog.call_id == target_sip_call_id {
+                call.a_leg.initial_acked = true;
+            } else if let Some(leg) = call
+                .b_legs
+                .iter_mut()
+                .find(|leg| leg.dialog.call_id == target_sip_call_id)
+            {
+                leg.initial_acked = true;
+            }
+        }
     }
 
     // The targets that did not answer first stop ringing (RFC 3261 §9.1), now
@@ -842,13 +857,26 @@ pub fn b2bua_complete_terminated_transfer(
                     let profile = transfer_profile
                         .clone()
                         .unwrap_or_else(|| old_session.profile.clone());
+                    // The session names the call's two slots in order, the
+                    // A-leg's party on `from_tag` and the B-leg's on `to_tag`,
+                    // which is how every in-dialog re-offer finds the tag of
+                    // the party sending it. The target holds the A-leg slot
+                    // only when it replaced the caller; when it replaced the
+                    // callee the surviving caller still does, and naming the
+                    // target first would send the caller's re-offers to the
+                    // engine as the target's.
+                    let (from_tag, to_tag) = if referrer_on_a_leg {
+                        (tgt_tag.clone(), surv_tag.clone())
+                    } else {
+                        (surv_tag.clone(), tgt_tag.clone())
+                    };
                     // Each party's own ingress policy stays with the pair: the
-                    // tags below do not say whose SDP the engine was offered
-                    // (the survivor's), so a later re-pairing of this call
-                    // could not tell the two policies apart without it.
+                    // tags do not say whose SDP the engine was offered (the
+                    // survivor's), so a later re-pairing of this call could
+                    // not tell the two policies apart without it.
                     let bridge_sides = repaired
                         .as_ref()
-                        .map(|repaired| repaired.sides(&profile, false));
+                        .map(|repaired| repaired.sides(&profile, referrer_on_a_leg, false));
                     // The key moves only when the target took the A-leg slot.
                     // When the callee was replaced it is the caller's Call-ID
                     // before and after, and the insert below replaces the old
@@ -858,10 +886,8 @@ pub fn b2bua_complete_terminated_transfer(
                     store.insert(crate::rtpengine::session::MediaSession {
                         call_id: new_store_key,
                         rtpengine_call_id: cid_new.clone(),
-                        // a_leg/b_leg role order after promotion: the target is
-                        // the offerer for future role-based lookups.
-                        from_tag: tgt_tag.clone(),
-                        to_tag: Some(surv_tag.clone()),
+                        from_tag,
+                        to_tag: Some(to_tag),
                         profile,
                         // Deliberately not carried over from `old_session`: this
                         // is a fresh engine call-id for the survivor↔target
