@@ -24,14 +24,14 @@ use super::proxy_dialog_state_tests::{
 use super::test_dispatcher::test_dispatcher_with_script;
 use super::*;
 
-const CALLER: &str = "192.0.2.50:5060";
-const RINGING: &str = "198.51.100.11:5060";
-const SILENT: &str = "198.51.100.12:5060";
-const FAILED: &str = "198.51.100.13:5060";
-const DECIDING: &str = "198.51.100.14:5060";
+pub(super) const CALLER: &str = "192.0.2.50:5060";
+pub(super) const RINGING: &str = "198.51.100.11:5060";
+pub(super) const SILENT: &str = "198.51.100.12:5060";
+pub(super) const FAILED: &str = "198.51.100.13:5060";
+pub(super) const DECIDING: &str = "198.51.100.14:5060";
 
 /// A proxy that forks every INVITE to `targets` and runs `handlers` beside it.
-fn forking_proxy(targets: &[&str], strategy: &str, handlers: &str) -> Proxy {
+pub(super) fn forking_proxy(targets: &[&str], strategy: &str, handlers: &str) -> Proxy {
     let uris: Vec<String> = targets
         .iter()
         .map(|target| format!("\"sip:callee@{target}\""))
@@ -58,7 +58,7 @@ fn forking_proxy(targets: &[&str], strategy: &str, handlers: &str) -> Proxy {
 }
 
 /// A proxy that relays every INVITE to `target` and runs `handlers` beside it.
-fn relaying_proxy(target: &str, handlers: &str) -> Proxy {
+pub(super) fn relaying_proxy(target: &str, handlers: &str) -> Proxy {
     let script = format!(
         concat!(
             "from siphon import proxy\n",
@@ -81,7 +81,7 @@ fn relaying_proxy(target: &str, handlers: &str) -> Proxy {
 
 /// `@proxy.on_reply` failing the INVITE on a `183`, as a media-authorization
 /// failure at answer time does.
-const REJECT_ON_183: &str = concat!(
+pub(super) const REJECT_ON_183: &str = concat!(
     "@proxy.on_reply\n",
     "def answered(request, reply):\n",
     "    if reply.status_code == 183:\n",
@@ -90,7 +90,7 @@ const REJECT_ON_183: &str = concat!(
     "    reply.relay()\n",
 );
 
-fn caller_invite(call_id: &str) -> String {
+pub(super) fn caller_invite(call_id: &str) -> String {
     invite(
         CALLER,
         call_id,
@@ -100,14 +100,14 @@ fn caller_invite(call_id: &str) -> String {
 }
 
 /// The caller sends its INVITE; returns it and what the proxy sent each target.
-fn call(proxy: &Proxy, call_id: &str) -> (String, Vec<(String, SipMessage)>) {
+pub(super) fn call(proxy: &Proxy, call_id: &str) -> (String, Vec<(String, SipMessage)>) {
     let raw = caller_invite(call_id);
     proxy.request(CALLER, &raw);
     (raw, invites_by_destination(&proxy.wire()))
 }
 
 /// The caller's CANCEL for the INVITE it sent as `raw`.
-fn caller_cancels(proxy: &Proxy, raw: &str) {
+pub(super) fn caller_cancels(proxy: &Proxy, raw: &str) {
     let cancel = raw
         .replacen("INVITE", "CANCEL", 1)
         .replace("CSeq: 5 INVITE", "CSeq: 5 CANCEL")
@@ -116,7 +116,13 @@ fn caller_cancels(proxy: &Proxy, raw: &str) {
 }
 
 /// `target` answers `request`, the INVITE or the CANCEL it was sent.
-fn answers(proxy: &Proxy, target: &str, request: &SipMessage, status_code: u16, reason: &str) {
+pub(super) fn answers(
+    proxy: &Proxy,
+    target: &str,
+    request: &SipMessage,
+    status_code: u16,
+    reason: &str,
+) {
     let tag = format!("tag-{}", target.replace(['.', ':'], "-"));
     proxy.response(
         target,
@@ -131,20 +137,20 @@ fn answers(proxy: &Proxy, target: &str, request: &SipMessage, status_code: u16, 
     );
 }
 
-fn requests_to(sent: &[Sent], destination: &str, method: Method) -> Vec<SipMessage> {
+pub(super) fn requests_to(sent: &[Sent], destination: &str, method: Method) -> Vec<SipMessage> {
     sent.iter()
         .filter(|sent| sent.destination == destination && sent.message.method() == Some(&method))
         .map(|sent| sent.message.clone())
         .collect()
 }
 
-fn cancels_to(sent: &[Sent], destination: &str) -> Vec<SipMessage> {
+pub(super) fn cancels_to(sent: &[Sent], destination: &str) -> Vec<SipMessage> {
     requests_to(sent, destination, Method::Cancel)
 }
 
 /// The final and ringing responses the caller was sent (a `100` is the
 /// proxy's own and is not what these tests are about).
-fn responses_to_caller(sent: &[Sent]) -> Vec<u16> {
+pub(super) fn responses_to_caller(sent: &[Sent]) -> Vec<u16> {
     sent.iter()
         .filter(|sent| sent.destination == CALLER)
         .filter_map(|sent| sent.message.status_code())
@@ -152,7 +158,7 @@ fn responses_to_caller(sent: &[Sent]) -> Vec<u16> {
         .collect()
 }
 
-fn branch_of(message: &SipMessage) -> String {
+pub(super) fn branch_of(message: &SipMessage) -> String {
     TransactionManager::key_from_message(message)
         .expect("a Via branch")
         .branch
@@ -160,7 +166,7 @@ fn branch_of(message: &SipMessage) -> String {
 
 /// The one CANCEL `target` was sent among `sent`, checked against the INVITE
 /// it cancels (RFC 3261 §9.1: the same Via branch and CSeq number).
-fn the_cancel(sent: &[Sent], target: &str, branch_invite: &SipMessage) -> SipMessage {
+pub(super) fn the_cancel(sent: &[Sent], target: &str, branch_invite: &SipMessage) -> SipMessage {
     let cancels = cancels_to(sent, target);
     assert_eq!(cancels.len(), 1, "exactly one CANCEL to {target}");
     let cancel = cancels[0].clone();
@@ -172,7 +178,7 @@ fn the_cancel(sent: &[Sent], target: &str, branch_invite: &SipMessage) -> SipMes
 
 /// Make timer `name` of the INVITE client transaction that sent `branch_invite`
 /// due, and fire what is due.
-fn fire(proxy: &Proxy, branch_invite: &SipMessage, name: TimerName) {
+pub(super) fn fire(proxy: &Proxy, branch_invite: &SipMessage, name: TimerName) {
     let key = TransactionManager::key_from_message(branch_invite).expect("a transaction key");
     let timer_id = format!("{}:{:?}", key, name);
     proxy
@@ -184,7 +190,7 @@ fn fire(proxy: &Proxy, branch_invite: &SipMessage, name: TimerName) {
     tokio::task::block_in_place(|| fire_expired_timers(&proxy.state));
 }
 
-fn waiting_cancels(proxy: &Proxy) -> usize {
+pub(super) fn waiting_cancels(proxy: &Proxy) -> usize {
     proxy.state.transaction_manager.waiting_cancel_count()
 }
 
@@ -668,7 +674,10 @@ async fn a_forked_request_other_than_invite_is_not_cancelled() {
 // ---------------------------------------------------------------------------
 
 /// Run `first` and `second` on two threads released together.
-async fn race(first: impl FnOnce() + Send + 'static, second: impl FnOnce() + Send + 'static) {
+pub(super) async fn race(
+    first: impl FnOnce() + Send + 'static,
+    second: impl FnOnce() + Send + 'static,
+) {
     let barrier = Arc::new(Barrier::new(2));
     let (first_barrier, second_barrier) = (Arc::clone(&barrier), Arc::clone(&barrier));
     let first = tokio::task::spawn_blocking(move || {
@@ -683,7 +692,7 @@ async fn race(first: impl FnOnce() + Send + 'static, second: impl FnOnce() + Sen
     second.await.expect("the second side ran");
 }
 
-fn deliver(state: &Arc<DispatcherState>, source: &str, message: SipMessage) {
+pub(super) fn deliver(state: &Arc<DispatcherState>, source: &str, message: SipMessage) {
     let raw = String::from_utf8(message.to_bytes()).expect("UTF-8");
     match message.status_code() {
         Some(status_code) => handle_response(inbound(source, &raw), message, status_code, state),

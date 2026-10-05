@@ -381,6 +381,7 @@ pub(super) fn handle_response(
 
     // Feed response to client transaction (if one exists).
     // The state machine handles retransmit absorption and timer cancellation.
+    let mut acked_by_transaction = false;
     if let Some(ref key) = client_txn_key {
         let event = if status_code < 200 {
             if key.method == crate::sip::message::Method::Invite {
@@ -409,16 +410,30 @@ pub(super) fn handle_response(
                                 // is built once and its octets cached, so a
                                 // retransmission is the same ACK rather than a rebuild
                                 // of it.
+                                //
+                                // It goes "to the same address, port, and
+                                // transport to which the original request was
+                                // sent" (§17.1.1.3), which the branch records;
+                                // a response can arrive from another port. With
+                                // no session left for the branch, where the
+                                // response came from is all there is.
+                                let (ack_transport, ack_destination, ack_connection) =
+                                    proxy_branch_hop(key, state).unwrap_or((
+                                        inbound.transport,
+                                        inbound.remote_addr,
+                                        inbound.connection_id,
+                                    ));
                                 debug!(
-                                    destination = %inbound.remote_addr,
+                                    destination = %ack_destination,
                                     size = frame.len(),
                                     "sending cached ACK frame"
                                 );
+                                acked_by_transaction = true;
                                 send_outbound_from(
                                     frame.clone(),
-                                    inbound.transport,
-                                    inbound.remote_addr,
-                                    inbound.connection_id,
+                                    ack_transport,
+                                    ack_destination,
+                                    ack_connection,
                                     Some(inbound.local_addr),
                                     state,
                                 );
@@ -521,8 +536,13 @@ pub(super) fn handle_response(
 
             // RFC 3261 §17.1.1.3: the client transaction MUST generate an ACK
             // for non-2xx final responses to INVITE, sent hop-by-hop to the
-            // same downstream destination.
-            if status_code >= 300 && client_key.method == crate::sip::message::Method::Invite {
+            // same downstream destination. It has, above, when there is one;
+            // a second ACK from here would be a second request on the wire for
+            // one response.
+            if status_code >= 300
+                && client_key.method == crate::sip::message::Method::Invite
+                && !acked_by_transaction
+            {
                 match client_branch {
                     Some(ref cb) => {
                         let ack = build_ack_for_non2xx(

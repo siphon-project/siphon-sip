@@ -153,6 +153,19 @@ fn cancel_proxy_branch(
     }
 }
 
+/// Where the proxy sent the request of client transaction `client_key`:
+/// transport, address and connection, as its session's branch records them.
+/// `None` once the session no longer holds the branch.
+pub(super) fn proxy_branch_hop(
+    client_key: &TransactionKey,
+    state: &DispatcherState,
+) -> Option<(Transport, SocketAddr, ConnectionId)> {
+    let session_arc = state.session_store.get_by_client_key(client_key)?;
+    let session = session_arc.read().ok()?;
+    let branch = session.get_client_branch(client_key)?;
+    Some((branch.transport, branch.destination, branch.connection_id))
+}
+
 /// Put the CANCEL of a proxied INVITE on the wire, to the hop that INVITE went
 /// to (RFC 3261 §9.1: the same destination address, port and transport).
 ///

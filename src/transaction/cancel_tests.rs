@@ -355,6 +355,52 @@ fn waiting_cancels_drain_to_baseline_over_every_exit() {
     assert_eq!(manager.count(), 0);
 }
 
+/// RFC 3261 §17.1.1.3: the ACK of a failure carries the INVITE's Route header
+/// fields, its Request-URI and its one Via.
+#[test]
+fn the_ack_of_a_failure_carries_the_invites_route_set() {
+    let manager = TransactionManager::default();
+    let mut request = invite();
+    request
+        .headers
+        .add("Route", "<sip:edge.example.com;lr>".to_string());
+    request
+        .headers
+        .add("Route", "<sip:core.example.com;lr>".to_string());
+    let (key, _) = manager
+        .new_client_transaction(&request, Bytes::from(request.to_bytes()), Transport::Udp)
+        .expect("the client transaction starts");
+    let actions = feed(
+        &manager,
+        &key,
+        IctEvent::ResponseNon2xx(response(486, "Busy Here")),
+    );
+    let ack = actions
+        .iter()
+        .find_map(|action| match action {
+            Action::SendFrame(frame) => crate::sip::parser::parse_sip_message_bytes(frame).ok(),
+            _ => None,
+        })
+        .expect("an ACK");
+    assert_eq!(ack.method(), Some(&Method::Ack));
+    assert_eq!(
+        ack.headers.get_all("Route").cloned(),
+        Some(vec![
+            "<sip:edge.example.com;lr>".to_string(),
+            "<sip:core.example.com;lr>".to_string(),
+        ])
+    );
+    assert_eq!(
+        ack.headers.get_all("Via").map(Vec::len),
+        Some(1),
+        "a single Via"
+    );
+    assert_eq!(
+        ack.headers.get("Max-Forwards").map(String::as_str),
+        Some("70")
+    );
+}
+
 #[test]
 fn a_request_other_than_invite_is_never_cancelled() {
     let manager = TransactionManager::default();

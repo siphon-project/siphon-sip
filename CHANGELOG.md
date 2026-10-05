@@ -171,6 +171,12 @@ entry, but a working config keeps working.
   branch the proxy has given up on is still not relayed to the caller, as
   before. **BREAKING (Rust library):** `transaction::state::Action` gains a
   `SendCancel` variant, which an exhaustive `match` on it has to handle.
+- **The proxy ACKs a failed branch once.** A 300-699 final response to a
+  proxied INVITE drew two ACKs: the INVITE client transaction's (RFC 3261
+  §17.1.1.3) and a second one built by the proxy itself. Only the
+  transaction's is sent now, and it goes to the address, port and transport
+  the INVITE went to, as §17.1.1.3 has it, also when the response arrived
+  from another port.
 - **A transfer whose target cannot be dialled ends its subscription and
   leaves the call free.** A siphon-terminated REFER answers `202` and sends
   the `100 Trying` NOTIFY before it dials. When no INVITE could then be sent

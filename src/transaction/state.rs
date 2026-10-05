@@ -872,13 +872,21 @@ impl Ict {
             .and_then(|c| c.split_whitespace().next().map(|s| s.to_string()))
             .unwrap_or_else(|| "1".to_string());
 
-        SipMessageBuilder::new()
+        let mut builder = SipMessageBuilder::new()
             .request(Method::Ack, request_uri)
             .via(via)
             .from(from)
             .to(to)
             .call_id(call_id)
-            .cseq(format!("{} ACK", cseq_num))
+            .cseq(format!("{} ACK", cseq_num));
+        // RFC 3261 §17.1.1.3: "If the INVITE request whose response is being
+        // acknowledged had Route header fields, those header fields MUST
+        // appear in the ACK."
+        for route in request.headers.get_all("Route").into_iter().flatten() {
+            builder = builder.header("Route", route.clone());
+        }
+        builder
+            .header("Max-Forwards", "70".to_string())
             .content_length(0)
             .build()
             .map_err(|error| format!("ACK build failed: {error}"))
