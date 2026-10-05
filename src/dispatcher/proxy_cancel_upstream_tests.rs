@@ -200,3 +200,61 @@ async fn a_cancel_after_the_answer_matches_no_transaction() {
     assert_eq!(responses_to_caller(&sent), [481]);
     assert!(cancels_to(&sent, RINGING).is_empty());
 }
+
+/// The record of a proxied call that ends before it is answered, by the
+/// caller's CANCEL or by `reply.reject()`, is written then and its session
+/// dropped, as for a call that fails on its branch's own response. Nothing is
+/// left for the 24-hour backstop to find, and a 2xx arriving afterwards finds
+/// no record to touch.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cancelled_or_rejected_call_closes_its_record() {
+    let records = crate::cdr::capture_auto_emitted_cdrs();
+    let written = |call_id: &str| -> Vec<(u16, Option<String>)> {
+        records
+            .lock()
+            .expect("the captured records")
+            .iter()
+            .filter(|record| record.call_id == call_id)
+            .map(|record| (record.response_code, record.disconnect_initiator.clone()))
+            .collect()
+    };
+
+    // Cancelled by the caller.
+    let call_id = "record-cancelled@example.com";
+    let proxy = relaying_proxy(RINGING, "");
+    let (raw, invites) = call(&proxy, call_id);
+    let to_ringing = find(&invites, RINGING).clone();
+    let record_key = cdr_dialog_key(call_id, "caller-tag");
+    answers(&proxy, RINGING, &to_ringing, 180, "Ringing");
+    assert!(proxy.state.cdr_sessions.contains_key(&record_key));
+    caller_cancels(&proxy, &raw);
+    assert!(
+        !proxy.state.cdr_sessions.contains_key(&record_key),
+        "the cancelled call's record is closed with the CANCEL"
+    );
+    assert_eq!(written(call_id), [(487, Some("caller".to_string()))]);
+    // The branch's 487, and an answer that crossed the CANCEL, change nothing.
+    answers(&proxy, RINGING, &to_ringing, 200, "OK");
+    assert!(!proxy.state.cdr_sessions.contains_key(&record_key));
+    assert_eq!(written(call_id).len(), 1, "written once");
+    assert!(proxy.state.cdr_sessions.is_empty());
+
+    // Rejected from the reply path.
+    let call_id = "record-rejected@example.com";
+    let proxy = relaying_proxy(RINGING, REJECT_ON_183);
+    let (_, invites) = call(&proxy, call_id);
+    let to_ringing = find(&invites, RINGING).clone();
+    let record_key = cdr_dialog_key(call_id, "caller-tag");
+    assert!(proxy.state.cdr_sessions.contains_key(&record_key));
+    answers(&proxy, RINGING, &to_ringing, 183, "Session Progress");
+    assert!(
+        !proxy.state.cdr_sessions.contains_key(&record_key),
+        "the rejected call's record is closed with the reject"
+    );
+    let rejected = written(call_id);
+    assert_eq!(rejected.len(), 1);
+    assert_eq!(rejected[0].0, 503);
+    answers(&proxy, RINGING, &to_ringing, 487, "Request Terminated");
+    assert_eq!(written(call_id).len(), 1, "written once");
+    assert!(proxy.state.cdr_sessions.is_empty());
+}

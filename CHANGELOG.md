@@ -205,7 +205,11 @@ entry, but a working config keeps working.
   session is opened; and the BYE that ends its dialog does not close the
   call's record or its Rf session, which belong to the dialog that was
   answered first and may still be up. A branch's own 2xx arriving again is
-  its retransmission, and the next entry's.
+  its retransmission, and the next entry's. Limitation: a proxied call's CDR
+  and Rf session are kept per call (Call-ID and the caller's tag), not per
+  dialog. A late dialog is therefore never recorded on its own; and if a
+  caller keeps the late dialog and ends the one that was answered first, the
+  call's record closes with the first dialog's BYE.
 - **A retransmitted 2xx to a proxied INVITE reaches the caller.** A callee
   repeats its 2xx until the caller's ACK reaches it (RFC 3261 §13.3.1.4),
   and a proxy forwards every copy: the proxy's state for the INVITE goes with
@@ -331,6 +335,14 @@ entry, but a working config keeps working.
   CANCEL marks the request as answered before it is relayed, so what the
   branches reply is absorbed and only `@proxy.on_cancel` runs, as before. A
   fork already behaved this way.
+- **A proxied call the caller cancels, or a script rejects, gets its CDR.**
+  Under `cdr.auto_emit` the record of a proxied call is opened at the INVITE
+  and closed by the BYE or by the branch's failure. A call ended by the
+  caller's CANCEL, or by `reply.reject()`, was closed by neither: no record
+  was written for it, and its session stayed in memory until the 24-hour
+  backstop dropped it unwritten. The record is now written when the call
+  ends, with `487` and the caller as the one who ended it for a CANCEL, and
+  with the script's code for a reject.
 - **A transfer whose target cannot be dialled ends its subscription and
   leaves the call free.** A siphon-terminated REFER answers `202` and sends
   the `100 Trying` NOTIFY before it dials. When no INVITE could then be sent

@@ -205,6 +205,11 @@ pub(super) fn reject_pending_invite(
     // 2a. CANCEL all pending downstream branches (no winner to exclude).
     cancel_fork_branches(server_key, None, state);
 
+    // The call has failed with the script's response: its record is written
+    // now. Nothing later closes it, since what the branches answer is
+    // absorbed.
+    cdr_finalize_proxy_fail(state, original_request, code);
+
     // 2b. Build and send the error response upstream via the server
     // transaction (handles retransmission + UAC-ACK absorption for INVITE).
     let response = build_response(
@@ -910,6 +915,14 @@ pub(super) fn handle_cancel_via_session(
         drop(session);
     }
 
+    // The call's record is written, as cancelled by the caller: after the
+    // `@proxy.on_cancel` handlers, so what one of them adds to it with
+    // `cdr.write` is on it. Nothing later closes it (what the branches answer
+    // is absorbed), and an open one would sit until the day-long backstop with
+    // no record written.
+    if let Ok(session) = session_arc.read() {
+        cdr_finalize_proxy_fail(state, &session.original_request, 487);
+    }
     release_cancelled_session(&session_arc, state);
     // A retransmitted CANCEL is answered 200 and does none of this again
     // (RFC 3261 §9.2).
