@@ -42,29 +42,8 @@ pub fn try_metrics() -> Option<&'static SiphonMetrics> {
     METRICS.get()
 }
 
-/// Initialize the global metrics. Call once at startup.
-/// Returns an error if metric creation fails (should never happen with
-/// valid hardcoded metric names — indicates a bug if it does).
-pub fn init() -> Result<(), prometheus::Error> {
-    // One caller builds the metrics; a second one arriving meanwhile waits and
-    // then finds them built. Without this two callers each built a registry,
-    // and the admission gauges of the one could be kept beside the registry of
-    // the other, where nothing that reads the exposition would ever see them.
-    static BUILDING: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _building = BUILDING
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if METRICS.get().is_some() {
-        return Ok(());
-    }
-    let _ = STARTED_AT.set(std::time::Instant::now());
-    let metrics = SiphonMetrics::new()?;
-    admission::init(&metrics.registry)?;
-    let custom = Arc::new(CustomMetrics::new(&metrics.registry));
-    let _ = CUSTOM_METRICS.set(custom);
-    let _ = METRICS.set(metrics);
-    Ok(())
-}
+mod startup;
+pub use startup::init;
 
 /// Access the custom metrics store (for script-defined metrics).
 /// Returns `None` before `init()` is called.
