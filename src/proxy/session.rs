@@ -10,6 +10,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
@@ -232,7 +233,18 @@ pub struct ProxySessionStore {
     /// Using Call-ID alone is ambiguous when both legs of a B2BUA call
     /// (e.g. caller→proxy→FS and FS→proxy→callee) share the same Call-ID.
     by_dialog_key: DashMap<String, Arc<RwLock<ProxySession>>>,
+    /// The dialogs opened by a 2xx forwarded after its INVITE already had a
+    /// final response upstream (RFC 3261 §16.7 step 5), by Call-ID and both
+    /// tags, with when each was opened. See [`Self::note_late_dialog`].
+    late_dialogs: DashMap<String, Instant>,
+    /// How many `late_dialogs` there are, so that the BYE path, which asks on
+    /// every BYE, pays one atomic load while there are none.
+    late_dialog_total: AtomicUsize,
 }
+
+/// How long a late dialog nobody ended stays recorded: the backstop of a
+/// call-lifetime store. Its BYE removes it long before, whenever that comes.
+pub const LATE_DIALOG_BACKSTOP: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
 
 impl ProxySessionStore {
     pub fn new() -> Self {
@@ -240,6 +252,8 @@ impl ProxySessionStore {
             by_client_key: DashMap::new(),
             server_to_clients: DashMap::new(),
             by_dialog_key: DashMap::new(),
+            late_dialogs: DashMap::new(),
+            late_dialog_total: AtomicUsize::new(0),
         }
     }
 
@@ -502,6 +516,103 @@ impl ProxySessionStore {
         }
     }
 
+    /// Make `session`'s dialog routable again for the 2xx ACK of a late answer.
+    ///
+    /// A 2xx forwarded after the request already had a final response upstream
+    /// (RFC 3261 §16.7 step 5) opens a dialog the caller ACKs end to end, and
+    /// that ACK is routed through `by_dialog_key` like any other. The entry
+    /// may be gone by then: dropped when the request was rejected or
+    /// cancelled, or retired after the first dialog's ACK. It is put back for
+    /// this one ACK, and the window it is kept for starts now.
+    ///
+    /// `or_insert_with`, as everywhere else: an entry already there for the
+    /// same `(Call-ID, From-tag)` is left as it is.
+    ///
+    /// Released like any dialog entry: on the short grace once the ACK has
+    /// been routed, or by the sweep after `ttl` if no ACK ever comes.
+    pub fn keep_dialog_for_late_answer(&self, session: &Arc<RwLock<ProxySession>>) {
+        let dialog_key = match session.write() {
+            Ok(mut guard) => {
+                guard.acked_at = None;
+                guard.created_at = Instant::now();
+                Self::invite_dialog_key(&guard.original_request)
+            }
+            Err(_) => return,
+        };
+        if let Some(dialog_key) = dialog_key {
+            self.by_dialog_key
+                .entry(dialog_key)
+                .or_insert_with(|| Arc::clone(session));
+        }
+    }
+
+    /// Record the dialog a late 2xx opened: `response` is that 2xx.
+    ///
+    /// The call's accounting is keyed by Call-ID and the caller's tag, which
+    /// every dialog of one INVITE shares. The dialog a late 2xx opens is not
+    /// the call (the request already had its final response when it came), so
+    /// the BYE that ends it must not close the call's record, which may be
+    /// another dialog's, still up. The BYE path asks [`Self::take_late_dialog`].
+    pub fn note_late_dialog(&self, response: &SipMessage) {
+        let Some(key) = Self::full_dialog_key(response, false) else {
+            return;
+        };
+        if self.late_dialogs.insert(key, Instant::now()).is_none() {
+            self.late_dialog_total.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// Whether `bye` ends a dialog recorded by [`Self::note_late_dialog`], from
+    /// either side, forgetting it if so. One atomic load when none is recorded.
+    pub fn take_late_dialog(&self, bye: &SipMessage) -> bool {
+        if self.late_dialog_total.load(Ordering::SeqCst) == 0 {
+            return false;
+        }
+        for reversed in [false, true] {
+            let Some(key) = Self::full_dialog_key(bye, reversed) else {
+                return false;
+            };
+            if self.late_dialogs.remove(&key).is_some() {
+                self.late_dialog_total.fetch_sub(1, Ordering::SeqCst);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Forget the late dialogs opened more than `backstop` before `now`: the
+    /// ones nobody ever ended.
+    pub fn sweep_late_dialogs(&self, now: Instant, backstop: std::time::Duration) {
+        if self.late_dialog_total.load(Ordering::SeqCst) == 0 {
+            return;
+        }
+        self.late_dialogs.retain(|_, opened| {
+            let keep = now.saturating_duration_since(*opened) <= backstop;
+            if !keep {
+                self.late_dialog_total.fetch_sub(1, Ordering::SeqCst);
+            }
+            keep
+        });
+    }
+
+    /// Number of late dialogs recorded (leak-test accessor).
+    pub fn late_dialog_count(&self) -> usize {
+        self.late_dialogs.len()
+    }
+
+    /// Call-ID, From-tag and To-tag of `message`, the tags swapped when
+    /// `reversed` (a request the callee sends carries them the other way).
+    fn full_dialog_key(message: &SipMessage, reversed: bool) -> Option<String> {
+        let call_id = message.headers.get("Call-ID")?;
+        let from_tag = message.typed_from().ok().flatten().and_then(|na| na.tag)?;
+        let to_tag = message.typed_to().ok().flatten().and_then(|na| na.tag)?;
+        Some(if reversed {
+            format!("{call_id}\0{to_tag}\0{from_tag}")
+        } else {
+            format!("{call_id}\0{from_tag}\0{to_tag}")
+        })
+    }
+
     /// Remove a single client key from the store.
     ///
     /// If the session has no remaining client keys, removes the session entirely.
@@ -570,22 +681,66 @@ impl ProxySessionStore {
         ttl: std::time::Duration,
         ack_grace: std::time::Duration,
     ) -> usize {
-        self.sweep_inner(ttl, ack_grace)
+        self.sweep_inner(ttl, ack_grace, &|_| false)
+    }
+
+    /// [`Self::sweep_stale_with_ack_grace`], sparing every session with a
+    /// branch for which `pending` holds: an INVITE still owed its final
+    /// response.
+    ///
+    /// Age alone does not make such a session stale. A call may ring for
+    /// minutes, and its answer has to find the session, and its ACK the dialog
+    /// entry, however long that took. What bounds it is the transaction layer:
+    /// Timer B while the branch has drawn nothing, Timer C once it has
+    /// (RFC 3261 §16.6 step 11), each of which ends the branch and, with the
+    /// last branch, the session.
+    pub fn sweep_stale_sparing(
+        &self,
+        ttl: std::time::Duration,
+        ack_grace: std::time::Duration,
+        pending: &dyn Fn(&TransactionKey) -> bool,
+    ) -> usize {
+        self.sweep_inner(ttl, ack_grace, pending)
     }
 
     /// Sweep sessions older than `ttl`, returning the number removed.
     pub fn sweep_stale(&self, ttl: std::time::Duration) -> usize {
-        self.sweep_inner(ttl, ttl)
+        self.sweep_inner(ttl, ttl, &|_| false)
     }
 
-    fn sweep_inner(&self, ttl: std::time::Duration, ack_grace: std::time::Duration) -> usize {
+    /// A 2xx answered this session's INVITE: the dialog entry its ACK is
+    /// routed by is kept for a transaction's length from now, not from when
+    /// the INVITE arrived, which for a call that rang a while is long past.
+    /// One read lock; the write only for a session older than `stale_after`.
+    pub fn keep_dialog_for_answer(
+        session: &Arc<RwLock<ProxySession>>,
+        stale_after: std::time::Duration,
+    ) {
+        let aged = session
+            .read()
+            .is_ok_and(|guard| guard.created_at.elapsed() > stale_after);
+        if aged {
+            if let Ok(mut guard) = session.write() {
+                guard.created_at = Instant::now();
+            }
+        }
+    }
+
+    fn sweep_inner(
+        &self,
+        ttl: std::time::Duration,
+        ack_grace: std::time::Duration,
+        pending: &dyn Fn(&TransactionKey) -> bool,
+    ) -> usize {
         let now = Instant::now();
         let mut stale_server_keys = Vec::new();
 
         // Find stale sessions by checking any client key's session
         for entry in self.by_client_key.iter() {
             if let Ok(session) = entry.value().read() {
-                if now.duration_since(session.created_at) > ttl {
+                if now.duration_since(session.created_at) > ttl
+                    && !session.client_keys.iter().any(pending)
+                {
                     let server_key = session.server_key.clone();
                     if !stale_server_keys.contains(&server_key) {
                         stale_server_keys.push(server_key);
@@ -623,7 +778,7 @@ impl ProxySessionStore {
                     Some(acked) => (acked, ack_grace),
                     None => (session.created_at, ttl),
                 };
-                if now.duration_since(since) > limit {
+                if now.duration_since(since) > limit && !session.client_keys.iter().any(pending) {
                     stale_dialog_keys.push(entry.key().clone());
                 }
             }
@@ -631,6 +786,8 @@ impl ProxySessionStore {
         for dialog_key in &stale_dialog_keys {
             self.by_dialog_key.remove(dialog_key);
         }
+
+        self.sweep_late_dialogs(now, LATE_DIALOG_BACKSTOP);
 
         count + stale_dialog_keys.len()
     }
@@ -1507,6 +1664,94 @@ mod tests {
         assert!(store.get_by_dialog_key("session-test", "abc").is_some());
         store.remove_by_server_key(&server_key());
         assert!(store.get_by_dialog_key("session-test", "abc").is_none());
+    }
+
+    /// A dialog opened by a late 2xx is found by the BYE that ends it, from
+    /// either side, once; and one nobody ends goes at the backstop.
+    #[test]
+    fn a_late_dialog_is_taken_by_its_bye_from_either_side() {
+        let response = |to_tag: &str| {
+            SipMessageBuilder::new()
+                .response(200, "OK".to_string())
+                .via("SIP/2.0/UDP 192.0.2.50:5060;branch=z9hG4bK-caller".to_string())
+                .to(format!("<sip:callee@example.com>;tag={to_tag}"))
+                .from("<sip:caller@example.com>;tag=caller-tag".to_string())
+                .call_id("late-dialog@example.com".to_string())
+                .cseq("1 INVITE".to_string())
+                .content_length(0)
+                .build()
+                .unwrap()
+        };
+        let bye = |from: &str, to: &str| {
+            SipMessageBuilder::new()
+                .request(Method::Bye, SipUri::new("example.com".to_string()))
+                .via("SIP/2.0/UDP 192.0.2.50:5060;branch=z9hG4bK-bye".to_string())
+                .to(format!("<sip:b@example.com>;tag={to}"))
+                .from(format!("<sip:a@example.com>;tag={from}"))
+                .call_id("late-dialog@example.com".to_string())
+                .cseq("2 BYE".to_string())
+                .content_length(0)
+                .build()
+                .unwrap()
+        };
+        let store = ProxySessionStore::new();
+        assert!(!store.take_late_dialog(&bye("caller-tag", "late-tag")));
+
+        store.note_late_dialog(&response("late-tag"));
+        store.note_late_dialog(&response("late-tag"));
+        store.note_late_dialog(&response("other-late-tag"));
+        assert_eq!(store.late_dialog_count(), 2);
+        // The call's own dialog is not one of them.
+        assert!(!store.take_late_dialog(&bye("caller-tag", "winner-tag")));
+        // The caller ends one, the callee the other.
+        assert!(store.take_late_dialog(&bye("caller-tag", "late-tag")));
+        assert!(!store.take_late_dialog(&bye("caller-tag", "late-tag")));
+        assert!(store.take_late_dialog(&bye("other-late-tag", "caller-tag")));
+        assert_eq!(store.late_dialog_count(), 0);
+
+        store.note_late_dialog(&response("never-ended"));
+        store.sweep_late_dialogs(Instant::now(), LATE_DIALOG_BACKSTOP);
+        assert_eq!(store.late_dialog_count(), 1, "kept inside the backstop");
+        store.sweep_late_dialogs(
+            Instant::now() + LATE_DIALOG_BACKSTOP * 2,
+            LATE_DIALOG_BACKSTOP,
+        );
+        assert_eq!(store.late_dialog_count(), 0);
+        assert!(!store.take_late_dialog(&bye("caller-tag", "never-ended")));
+    }
+
+    /// A late answer puts its session's dialog entry back for its own ACK,
+    /// without displacing an entry already there, and the sweep retires it.
+    #[test]
+    fn a_late_answer_makes_its_dialog_routable_again() {
+        let store = ProxySessionStore::new();
+        let session = store.insert(make_session());
+        store.remove_dialog_key(&dummy_request());
+        assert_eq!(store.dialog_key_count(), 0);
+
+        store.keep_dialog_for_late_answer(&session);
+        let found = store
+            .get_by_dialog_key("session-test", "abc")
+            .expect("routable again");
+        assert!(Arc::ptr_eq(&found, &session));
+
+        // Another session of the same dialog (a re-INVITE's) does not take it.
+        let mut other = make_session();
+        other.client_keys.clear();
+        other.add_client_key(client_key("other"));
+        let other = Arc::new(RwLock::new(other));
+        store.keep_dialog_for_late_answer(&other);
+        let found = store.get_by_dialog_key("session-test", "abc").unwrap();
+        assert!(Arc::ptr_eq(&found, &session), "the first entry stays");
+
+        // Its ACK routed, it goes on the short grace like any other.
+        ProxySessionStore::mark_dialog_acked(&found);
+        store.remove_client_key(&client_key("1"));
+        store.sweep_stale_with_ack_grace(
+            std::time::Duration::from_secs(3600),
+            std::time::Duration::ZERO,
+        );
+        assert_eq!(store.dialog_key_count(), 0);
     }
 
     #[test]

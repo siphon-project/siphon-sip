@@ -203,8 +203,14 @@ pub(super) fn handle_response(
                     ClientEvent::Ict(IctEvent::Provisional(message.clone())),
                 ) {
                     for action in &actions {
-                        if let Action::CancelTimer(name) = action {
-                            state.timer_wheel.remove(&format!("{}:{:?}", key, name));
+                        match action {
+                            Action::CancelTimer(name) => {
+                                state.timer_wheel.remove(&format!("{}:{:?}", key, name));
+                            }
+                            // A proxied branch given up on while it had drawn
+                            // nothing: this 100 is what its CANCEL waited for.
+                            Action::SendCancel(cancel) => send_proxy_branch_cancel(cancel, state),
+                            _ => {}
                         }
                     }
                 }
@@ -403,17 +409,34 @@ pub(super) fn handle_response(
                                 // is built once and its octets cached, so a
                                 // retransmission is the same ACK rather than a rebuild
                                 // of it.
+                                //
+                                // It goes "to the same address, port, and
+                                // transport to which the original request was
+                                // sent" (§17.1.1.3), which the transaction
+                                // records; a response can arrive from another
+                                // port. Where none is recorded, or the
+                                // transaction ended with this response, where
+                                // the response came from is all there is.
+                                let hop = state.transaction_manager.client_hop(key);
+                                let (ack_transport, ack_destination, ack_connection) = hop
+                                    .map(|hop| (hop.transport, hop.destination, hop.connection_id))
+                                    .unwrap_or((
+                                        inbound.transport,
+                                        inbound.remote_addr,
+                                        inbound.connection_id,
+                                    ));
                                 debug!(
-                                    destination = %inbound.remote_addr,
+                                    destination = %ack_destination,
                                     size = frame.len(),
                                     "sending cached ACK frame"
                                 );
                                 send_outbound_from(
                                     frame.clone(),
-                                    inbound.transport,
-                                    inbound.remote_addr,
-                                    inbound.connection_id,
-                                    Some(inbound.local_addr),
+                                    ack_transport,
+                                    ack_destination,
+                                    ack_connection,
+                                    hop.and_then(|hop| hop.source_local_addr)
+                                        .or(Some(inbound.local_addr)),
                                     state,
                                 );
                             }
@@ -439,6 +462,9 @@ pub(super) fn handle_response(
                             Action::ProtocolError(message) => {
                                 warn!(key = %key, "client transaction protocol error: {message}");
                             }
+                            // RFC 3261 §9.1: the first provisional on a branch
+                            // the proxy gave up on while it had drawn nothing.
+                            Action::SendCancel(cancel) => send_proxy_branch_cancel(cancel, state),
                             _ => {}
                         }
                     }
@@ -474,7 +500,6 @@ pub(super) fn handle_response(
                 original_request,
                 relay_on_reply,
                 relay_on_failure,
-                client_branch,
                 final_response_sent,
                 record_routed,
                 failure_retargets,
@@ -503,68 +528,49 @@ pub(super) fn handle_response(
                     session.original_request.clone(),
                     relay_on_reply,
                     relay_on_failure,
-                    session.client_branches.get(client_key).cloned(),
                     session.final_response_sent,
                     session.record_routed,
                     session.failure_retargets,
                 )
             };
 
-            // RFC 3261 §17.1.1.3: the client transaction MUST generate an ACK
-            // for non-2xx final responses to INVITE, sent hop-by-hop to the
-            // same downstream destination.
-            if status_code >= 300 && client_key.method == crate::sip::message::Method::Invite {
-                match client_branch {
-                    Some(ref cb) => {
-                        let ack = build_ack_for_non2xx(
-                            &original_request,
-                            &message,
-                            &branch,
-                            cb.transport,
-                            &client_key.sent_by,
-                        );
-                        send_to_target(
-                            ack.to_bytes().into(),
-                            &RelayTarget {
-                                address: cb.destination,
-                                transport: Some(cb.transport),
-                                server_name: None,
-                            },
-                            cb.transport,
-                            cb.connection_id,
-                            None,
-                            state,
-                        );
-                        info!(
-                            branch = %branch,
-                            destination = %cb.destination,
-                            transport = %cb.transport,
-                            "ACK for {status_code} sent downstream"
-                        );
-                    }
-                    None => {
-                        warn!(
-                            branch = %branch,
-                            status = status_code,
-                            "cannot send ACK for non-2xx: no client branch in session"
-                        );
-                    }
-                }
+            // RFC 3261 §16.7 step 5: a 2xx to an INVITE whose final response
+            // has already gone upstream is forwarded all the same, and is not
+            // the call's answer: no reply handler and no accounting below.
+            if forward_if_late_2xx(
+                &message,
+                status_code,
+                client_key,
+                &session_arc,
+                final_response_sent,
+                fork_agg.as_ref(),
+                branch_index,
+                &inbound,
+                state,
+            ) {
+                return;
             }
 
-            // A reply-time `reply.reject()` already committed a final response
-            // upstream for this server transaction and CANCELled the pending
-            // branch(es).  This response is the straggler that CANCEL drew back
+            // RFC 3261 §17.1.1.3: the ACK of a 300-699 final response is the
+            // INVITE client transaction's, and it sent it above. A response no
+            // client transaction took is not ACKed from here: that is one the
+            // proxy answered the branch with itself (a timeout's 408, a
+            // transport error's 503), which the peer never sent.
+
+            // A reply-time `reply.reject()`, or the caller's own CANCEL, already
+            // committed a final response upstream for this server transaction
+            // and CANCELled the pending branch(es).  A 2xx was forwarded above
+            // all the same.  This response is the straggler that CANCEL drew back
             // (typically the `487` answering it, or a late provisional).  Any
-            // non-2xx final was ACKed downstream just above (and by the client
-            // transaction), so absorb it here — forwarding it would put a second
+            // non-2xx final was ACKed downstream by the client transaction, so
+            // absorb it here — forwarding it would put a second
             // final response on the wire to the UAC.  The single-target relay
             // path has no fork aggregator to dedup, so this flag is the guard.
             if final_response_sent {
                 debug!(
                     status = status_code,
                     branch = %branch,
-                    "absorbing straggler after reply-time reject (final already sent)"
+                    "absorbing straggler: a final response was already sent upstream"
                 );
                 if status_code >= 200 {
                     state.session_store.remove_client_key(client_key);
@@ -822,14 +828,15 @@ pub(super) fn handle_response(
             // nothing to aggregate: every non-2xx final response *is* "all
             // branches failed".
             //
-            // 487 is excluded: the transaction was cancelled by the UAC, so a
-            // retarget would resurrect a call the caller has already abandoned.
-            // `@proxy.on_cancel` is the hook for that teardown.
-            if fork_agg.is_none()
-                && (300..700).contains(&status_code)
-                && status_code != 487
-                && !final_response_sent
-            {
+            // A 487 is a failure like any other here, whatever sent it: the
+            // one the proxy drew itself by CANCELling a branch on Timer C
+            // (RFC 3261 §16.8), or one a downstream element produced. The 487
+            // a *caller's* CANCEL draws never gets this far: that CANCEL
+            // marked the request as finally answered before it was relayed,
+            // and what the branch answers is absorbed above. A cancelled call
+            // is `@proxy.on_cancel`'s, and is told from a failed one by what
+            // caused it, not by the status code it ends on.
+            if fork_agg.is_none() && (300..700).contains(&status_code) && !final_response_sent {
                 let outcome = run_proxy_failure_handlers(
                     message,
                     original_request.clone(),
@@ -872,14 +879,14 @@ pub(super) fn handle_response(
             if let (Some(ref aggregator), Some(index)) = (&fork_agg, branch_index) {
                 // Decided and taken under one lock, so a straggler cannot slip
                 // between the fork settling and its chosen response being read.
-                let (fork_action, chosen_response) = match aggregator.lock() {
+                let (fork_action, chosen_response, settled) = match aggregator.lock() {
                     Ok(mut agg) => {
                         let action = agg.on_response(index, status_code, &message);
-                        (action, agg.take_best_response())
+                        (action, agg.take_best_response(), agg.has_settled())
                     }
                     Err(_) => {
                         error!("fork aggregator lock poisoned");
-                        (crate::proxy::fork::ForkAction::ContinueWaiting, None)
+                        (crate::proxy::fork::ForkAction::ContinueWaiting, None, false)
                     }
                 };
 
@@ -890,6 +897,14 @@ pub(super) fn handle_response(
                             branch_index = index,
                             "fork: waiting for more branches"
                         );
+                        // A branch of a fork that has already settled has
+                        // ended with this final response (the 487 of its
+                        // CANCEL, a failure of its own, its timeout): nothing
+                        // more is owed it, and with the last such branch the
+                        // session goes, without waiting for the sweep.
+                        if settled && status_code >= 200 {
+                            state.session_store.remove_client_key(client_key);
+                        }
                         return;
                     }
                     crate::proxy::fork::ForkAction::Forward2xx => {
@@ -898,6 +913,12 @@ pub(super) fn handle_response(
                             "fork: forwarding 2xx, cancelling others"
                         );
                         cancel_other_fork_branches(client_key, &server_key, state);
+                    }
+                    crate::proxy::fork::ForkAction::ForwardAnother2xx => {
+                        // Two branches answered at the same moment on two
+                        // workers, and this one came second.
+                        send_late_2xx_upstream(message, client_key, &session_arc, &inbound, state);
+                        return;
                     }
                     crate::proxy::fork::ForkAction::Forward6xx => {
                         debug!(
@@ -1086,6 +1107,12 @@ pub(super) fn handle_response(
             if (200..300).contains(&status_code)
                 && server_key.method == crate::sip::message::Method::Invite
             {
+                // The ACK of this answer is routed by the dialog entry,
+                // which must outlive a call that rang for a while.
+                ProxySessionStore::keep_dialog_for_answer(
+                    &session_arc,
+                    state.transaction_timeout / 2,
+                );
                 spawn_rf_proxy_start_if_invite(state, &server_key, &original_request, &session_arc);
                 // CDR: stamp the answer time on the tracked call (cdr.auto_emit).
                 cdr_mark_proxy_answer(state, &original_request, status_code);
@@ -1223,6 +1250,12 @@ pub(super) fn handle_response(
     // the same (RFC 3261 §13.2.2.4, RFC 5407 §3.1.3). Checked last, so a
     // response a live transaction or session claims never pays for the check.
     if ack_late_2xx_after_teardown(&inbound, &message, status_code, state) {
+        return;
+    }
+    // A 2xx to an INVITE this proxy forwarded and holds nothing for any more
+    // (the retransmission of an answer, an answer after a timeout) still goes
+    // to the caller, by its Via (RFC 3261 §16.7 step 9).
+    if forward_2xx_statelessly(&inbound, &message, status_code, state) {
         return;
     }
     match torn_down_call {
@@ -1442,28 +1475,4 @@ pub(super) fn run_proxy_cancel_handlers(
             }
         }
     });
-}
-
-/// Rewrite the Contact URI in a response with the observed source address.
-///
-/// This is the automatic equivalent of OpenSIPS's `fix_nated_contact()` in
-/// onreply_route.  When `nat.fix_contact` is enabled, every response gets
-/// its Contact rewritten before forwarding upstream, so in-dialog requests
-/// from the upstream UAC will reach the NATed endpoint's public address.
-pub(super) fn fix_response_contact(mut message: SipMessage, source: SocketAddr) -> SipMessage {
-    use crate::sip::headers::nameaddr::NameAddr;
-
-    if let Some(raw) = message.headers.get("Contact").cloned() {
-        if let Ok(mut nameaddr) = NameAddr::parse(&raw) {
-            let host = source.ip().to_string();
-            nameaddr.uri.host = if host.contains(':') && !host.starts_with('[') {
-                format!("[{host}]")
-            } else {
-                host
-            };
-            nameaddr.uri.port = Some(source.port());
-            message.headers.set("Contact", nameaddr.to_string());
-        }
-    }
-    message
 }

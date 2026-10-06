@@ -123,6 +123,18 @@ pub struct TransactionConfig {
     /// is why an in-dialog BYE answered in milliseconds never draws a 100.
     #[serde(default = "default_auto_emit_100_trying_delay_ms")]
     pub auto_emit_100_trying_delay_ms: u64,
+    /// Timer C (RFC 3261 §16.6 step 11): how long a proxied INVITE that has
+    /// drawn a provisional response may go without a final one, counted from
+    /// its last 101-199. When it runs out the branch is CANCELled (§16.8).
+    /// Default: 181s; the RFC requires more than 3 minutes. A lower value is a
+    /// ring timeout for every proxied call, and is never taken as less than
+    /// the INVITE transaction's own 32s.
+    #[serde(default = "default_timer_c_secs")]
+    pub timer_c_secs: u32,
+}
+
+fn default_timer_c_secs() -> u32 {
+    181
 }
 
 fn default_tx_timeout() -> u32 {

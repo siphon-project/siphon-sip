@@ -146,6 +146,219 @@ entry, but a working config keeps working.
   the caller, a script and a controller are told (`487`, `DialBranchFailed`,
   `DialFailed`, the `cancel_dial` reply, `@b2bua.on_cancel`, the CDR) and
   the release of media still happen when siphon gives up, not when that
+  party finally answers. On a reliable transport, where nothing is
+  retransmitted, a waiting CANCEL is dropped 32 s after siphon gave up. A
+  CANCEL relayed or generated for a proxied INVITE (`request.relay()`,
+  `request.fork()`, `reply.reject()`) waits the same way, by the proxy's own
+  means: see the next entry.
+- **The proxy CANCELs a branch only once its INVITE has drawn a provisional
+  response, and never after its final one.** RFC 3261 §9.1 forbids a CANCEL
+  for a request with no provisional response ("the CANCEL request MUST NOT
+  be sent; rather, the client MUST wait for the arrival of a provisional
+  response") and advises against one for a request with its final response,
+  and §16.10 and §16.7 step 10 have a proxy CANCEL its *pending* client
+  transactions, which are the ones in between. The proxy sent a CANCEL on
+  every branch of the request, whatever the branch had answered: on every
+  other branch when a fork branch answered 2xx or 6xx, on every branch for
+  `reply.reject()`, and on every branch for the caller's own CANCEL. A branch
+  that had sent nothing got one for an INVITE it might not hold yet, which it
+  can only refuse, and the INVITE retransmitted behind it then rang with
+  nothing left to stop it; a branch that had already failed got one for a
+  transaction that was over. Each branch is now asked through its INVITE
+  client transaction, whose state is the record of what the branch has
+  drawn. One that has a provisional is CANCELled at once, as before. One that
+  has nothing keeps its CANCEL with the transaction and stays an unanswered
+  request, retransmitted on Timer A over UDP: its first provisional (a `100
+  Trying` counts) sends the CANCEL and the `487` that follows is ACKed, a
+  final response instead is taken as it is with no CANCEL, and Timer B ends
+  the wait with no CANCEL at all, over a reliable transport too. One that has
+  its final response is sent nothing. The waiting CANCEL does not depend on
+  the proxy session, which the caller's CANCEL removes at once, and a
+  provisional and a request to cancel arriving together on two workers send
+  exactly one CANCEL. What the caller sees does not change: the `200` and
+  `487` to its CANCEL, the winning 2xx, the reject's own response, and
+  `@proxy.on_cancel`, `@proxy.on_reply` and `@proxy.on_failure` when they
+  ran before. Two things follow from the same rule. A provisional from a
+  branch of a fork that has already settled is no longer forwarded to the
+  caller behind the final response (§16.7 step 5), which the late first
+  provisional of a silent branch would otherwise be every time. And the
+  other branches of a forked request that is not an INVITE are no longer sent
+  a CANCEL when one answers (§9.1: a CANCEL is for an INVITE). A 2xx from a
+  branch the proxy has given up on is the next entry's. **BREAKING (Rust
+  library):** `transaction::state::Action` gains a `SendCancel` variant.
+  Migration: an exhaustive `match` on `Action` needs an arm for it, which
+  sends `cancel.frame` to `cancel.hop` (its destination, transport and
+  connection, from its `source_local_addr`), as the arm for
+  `Action::SendFrame` sends a retransmission. An embedder that creates INVITE
+  client transactions itself records where each INVITE went with
+  `TransactionManager::set_client_hop`; without it a CANCEL has nowhere to go
+  and `cancel_invite_client` reports `CancelOutcome::Unbuildable`. The
+  entries below add, to the same enums' exhaustive matches,
+  `proxy::fork::ForkAction::ForwardAnother2xx` (forward the response, cancel
+  nothing), `TimerName::C` and `IctEvent::TimerC` (feed the event to the
+  transaction when the timer fires, like Timer B), and to `TimerConfig` the
+  field `timer_c_secs` (a struct literal takes it, or
+  `..TimerConfig::default()`).
+- **The proxy forwards every 2xx to an INVITE, also after the request's
+  final response.** RFC 3261 §16.7 step 5: "After a final response has been
+  sent on the server transaction, the following responses MUST be forwarded
+  immediately: Any 2xx response to an INVITE request", through the server
+  transaction while it can take it and straight to the transport when it
+  cannot (step 9). The proxy dropped such a 2xx: the answer of a second fork
+  branch after another had won or a 6xx had ended the fork, of a branch
+  after `reply.reject()`, and of a branch after the caller's CANCEL. Whether
+  it had crossed the branch's CANCEL or came from a branch whose CANCEL was
+  still waiting for a provisional, the callee was left holding a dialog and
+  retransmitting its 2xx for 64*T1, with nobody to ACK it. It is now handed
+  to the caller, whose user agent ACKs it and ends the dialog with a BYE
+  (§13.2.2.4), and both are routed like any other dialog's: the entry the
+  ACK is routed by is put back for it, a cancelled INVITE's session is kept
+  for as long as a branch is still owed a final response (it used to go with
+  the CANCEL), and each branch's final response releases its part. Such a
+  2xx is not the call's answer. `@proxy.on_reply` and a per-relay `on_reply`
+  do not run for it, because the script has already seen this request end;
+  no answer time or destination is stamped on the call's record and no Rf
+  session is opened; and the BYE that ends its dialog does not close the
+  call's record or its Rf session, which belong to the dialog that was
+  answered first and may still be up. A branch's own 2xx arriving again is
+  its retransmission, and the next entry's. Limitation: a proxied call's CDR
+  and Rf session are kept per call (Call-ID and the caller's tag), not per
+  dialog. A late dialog is therefore never recorded on its own; and if a
+  caller keeps the late dialog and ends the one that was answered first, the
+  call's record closes with the first dialog's BYE.
+- **A retransmitted 2xx to a proxied INVITE reaches the caller.** A callee
+  repeats its 2xx until the caller's ACK reaches it (RFC 3261 §13.3.1.4),
+  and a proxy forwards every copy: the proxy's state for the INVITE goes with
+  the first one, so the rest match nothing and go by their Via stack (§16.7
+  step 9). siphon dropped them, so a `200` lost between siphon and the
+  caller, over UDP, was lost for good: the caller never heard the answer and
+  the call failed after 32 s. The same went for a 2xx on a branch whose state
+  was gone for another reason, such as one the proxy had timed out with a
+  `408`. Such a 2xx is now forwarded by its Via stack, when its top Via is
+  one this instance generates (its own sent-by, and a branch of the form it
+  makes) and a second Via says where the request came from: to that Via's
+  `received` and `rport` when it has them, else its sent-by, over the
+  connection the request came in on when the transport is a stream one.
+  Anything else is dropped as before. It carries what the framework does to
+  a 2xx (the proxy's Via removed, and the Contact fixed under
+  `nat.fix_contact`), and only that: no `@proxy.on_reply` runs for it, so a
+  header or body a script changed on the first copy is not changed on this
+  one, and nothing is counted in a CDR or on Rf. Kept state would be needed
+  for more, and an answered call keeps none. siphon does not add `received`
+  or `rport` to the Via of a request it forwards, so toward a caller behind a
+  NAT the copy goes to the address the caller wrote in its Via.
+- **The proxy ACKs a failed branch once.** A 300-699 final response to a
+  proxied INVITE drew two ACKs: the INVITE client transaction's (RFC 3261
+  §17.1.1.3) and a second one built by the proxy itself. Only the
+  transaction's is sent now, and it goes to the address, port and transport
+  the INVITE went to, as §17.1.1.3 has it, also when the response arrived
+  from another port.
+- **A proxied branch that never answered is no longer sent an ACK.** When a
+  branch timed out, or its request could not be sent, the proxy answers for
+  it (a `408`, RFC 3261 §16.7 step 2; a `503`, §16.9) and then ACKed that
+  response of its own to the branch, which had sent nothing. An ACK is now
+  only ever the INVITE client transaction's answer to a response it received
+  (§17.1.1.3).
+- **A proxy CANCEL is built from the INVITE it cancels.** RFC 3261 §9.1 has
+  the CANCEL repeat the Request-URI, Call-ID, To, From and CSeq number of the
+  request being cancelled, carry its Route header fields, and have a single
+  Via equal to that request's top Via. The proxy built a fork branch's CANCEL
+  from the caller's request with a Via of its own making, and relayed the
+  caller's CANCEL with only the Via replaced, so a branch whose INVITE had
+  gone out with the fork target as Request-URI, with its own Path route set,
+  or with a sent-by other than the default listener's (a captured flow, a
+  `send_socket` pin) was sent a CANCEL that differed from it in exactly those,
+  and a strict next hop answered it `481`. Every proxy CANCEL is now built by
+  the branch's INVITE client transaction from the octets it sent, by the
+  builder the B2BUA already used. A `Reason` in the caller's CANCEL is still
+  relayed with each branch's (RFC 3326); nothing else of the caller's CANCEL
+  is, and `Max-Forwards` is the INVITE's as forwarded.
+- **A proxy CANCEL, and the ACK of a failed branch, leave the way the INVITE
+  did.** RFC 3261 §9.1: "The destination address, port, and transport for the
+  CANCEL MUST be identical to those used to send the original request", and
+  §17.1.1.3 says the same of the ACK. Both left from the default listener,
+  whatever socket the INVITE had gone out from, so a branch pinned to another
+  one (a captured flow, a `send_socket`, a protected port) got them from a
+  socket its peer had never heard from. The INVITE client transaction now
+  records the hop its INVITE took (the local socket, the address, the
+  transport, and the connection once a stream transport has established it),
+  and its CANCEL and ACK are sent by that record, also when the session is
+  gone by the time a waiting CANCEL is released.
+- **The `487` to a cancelled proxied INVITE is its server transaction's
+  final response.** The proxy sent it around the INVITE server transaction,
+  once: over UDP a lost `487` was never repeated (RFC 3261 §17.2.1 has it
+  retransmitted on Timer G until the ACK), a retransmitted INVITE was
+  answered with the last provisional instead, and the transaction stayed in
+  `Proceeding`, waiting for a final response that had already gone. It now
+  goes through the transaction, as the response of `reply.reject()` already
+  did: retransmitted until the caller's ACK, which is absorbed.
+- **A CANCEL for a proxied INVITE that already has its final response is
+  answered and changes nothing.** RFC 3261 §9.2: such a CANCEL "has no effect
+  on the processing of the original request". When the INVITE had been
+  rejected with `reply.reject()`, or answered by one fork branch while
+  another was still ending, a CANCEL from the caller was answered `200` and
+  then the INVITE was sent a `487` on top of the final response it already
+  had, and `@proxy.on_cancel` ran for a call that had not been cancelled. The
+  CANCEL now gets its `200` and nothing else happens.
+- **A settled fork's session is released by its last branch, not by the
+  sweep.** After a 2xx or a 6xx settled a proxy fork, the branches that lost
+  stayed indexed, and the session with them, until the periodic sweep, up to
+  a minute after the request. Each is now released as it ends (the `487` of
+  its CANCEL, a failure of its own, its INVITE timing out), and the session
+  with the last one.
+- **A proxied INVITE that rings and never answers is ended by Timer C, and
+  one that rings for a long time is no longer lost.** RFC 3261 §16.6 step 11
+  has a proxy set Timer C, larger than 3 minutes, for every INVITE it
+  forwards; §16.7 step 2 resets it on each 101-199 provisional; and §16.8 has
+  it CANCEL a branch that has had a provisional when it fires. siphon had no
+  Timer C. An INVITE client transaction that got a provisional and no final
+  response was never removed, and the proxy session of a call that was still
+  ringing was taken by the periodic sweep once it was older than
+  `transaction.invite_timeout_secs` (32 to 62 s after the INVITE with the
+  defaults): nothing was sent to either side, the callee kept ringing, and
+  when it answered, its 2xx matched no session and was dropped. A session
+  with a branch still owed its final response is now never swept, and the
+  dialog entry the answer's ACK is routed by is kept from the answer. What
+  bounds such a call is `transaction.timer_c_secs` (default 181): counted
+  from the INVITE, and again from each 101-199, and when it runs out the
+  branch is CANCELled. The `487` that follows is the branch's final response
+  like any other (forwarded, or weighed with the other branches of a fork,
+  or the cue for a sequential fork to try the next target), and a branch
+  that does not answer its CANCEL within 64*T1 is given up as a `408`
+  (§9.1, §16.7 step 2). A branch that has drawn no response at all is still
+  ended by Timer B, as before. A lower `timer_c_secs` is a ring timeout for
+  every proxied call, and is never taken as less than Timer B. A provisional
+  resets the timer by storing the time it arrived, so the response path pays
+  one clock read per 101-199 and no timer traffic, and a call that ends
+  within 32 s never has a Timer C at all.
+- **A CANCEL arriving just after a proxied INVITE failed is answered `200`,
+  not `481`.** RFC 3261 §9.2 matches a CANCEL to the INVITE's server
+  transaction and answers `200` when it finds one. The proxy looked for its
+  session instead, which goes with the INVITE's final response, while the
+  server transaction stays until that response is ACKed and a little after.
+  A CANCEL that crossed a `486` on the wire was therefore told the
+  transaction did not exist. It is now answered `200`, with no other effect,
+  for as long as the INVITE's server transaction holds its final response. A
+  CANCEL that matches no transaction at all, after an answered INVITE's has
+  ended with its 2xx for one, is still answered `481`.
+- **`@proxy.on_failure` runs for a `487` the caller did not ask for.** On a
+  single relay the handler was never run for a `487`, on the assumption that
+  only the caller's CANCEL produces one. A branch the proxy CANCELs itself
+  when Timer C runs out answers `487` too, and so can a downstream element
+  for reasons of its own; neither could be re-targeted or answered by a
+  script. The handler now runs for every failed branch, `487` included, and
+  a cancelled call is told from a failed one by its cause: the caller's
+  CANCEL marks the request as answered before it is relayed, so what the
+  branches reply is absorbed and only `@proxy.on_cancel` runs, as before. A
+  fork already behaved this way.
+- **A proxied call the caller cancels, or a script rejects, gets its CDR.**
+  Under `cdr.auto_emit` the record of a proxied call is opened at the INVITE
+  and closed by the BYE or by the branch's failure. A call ended by the
+  caller's CANCEL, or by `reply.reject()`, was closed by neither: no record
+  was written for it, and its session stayed in memory until the 24-hour
+  backstop dropped it unwritten. The record is now written when the call
+  ends, with `487` and the caller as the one who ended it for a CANCEL, and
+  with the script's code for a reject.
   party finally answers. On a reliable transport nothing is retransmitted
   and Timer B ends the wait the same way. The
   proxy path is not changed: a CANCEL relayed or generated for a proxied

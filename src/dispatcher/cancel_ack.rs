@@ -2,7 +2,9 @@
 //!
 //! A 2xx ACK is a new transaction (RFC 3261 §13.2.2.4), not part of the INVITE
 //! one, so it is routed by dialog rather than by branch. CANCEL fans out to
-//! every fork branch still in flight.
+//! every fork branch still pending: one that has drawn a provisional is sent
+//! it at once, and one that has drawn nothing when it does (RFC 3261 §9.1,
+//! [`cancel_proxy_branch`]).
 
 use super::*;
 
@@ -27,9 +29,14 @@ pub(super) fn cancel_other_fork_branches(
 /// it aborts the whole in-progress INVITE, including the branch whose
 /// provisional triggered the reject.
 ///
-/// RFC 3261 §9.1: each branch's CANCEL MUST carry the same topmost Via branch
-/// (and CSeq number) siphon used for that branch's INVITE, so we rebuild the
-/// per-branch outbound-INVITE view and run it through `build_cancel_from_invite`.
+/// "Pending" is RFC 3261 §9.1's: each branch is offered to
+/// [`cancel_proxy_branch`], which sends the CANCEL to a branch that has drawn a
+/// provisional, keeps it for one that has drawn nothing, and sends none to one
+/// that has its final response.
+///
+/// RFC 3261 §9.1: each branch's CANCEL is built from that branch's own INVITE
+/// as its client transaction sent it, so its Request-URI is the branch target,
+/// its Route set the branch's, and its one Via the INVITE's top Via.
 pub(super) fn cancel_fork_branches(
     server_key: &TransactionKey,
     exclude: Option<&TransactionKey>,
@@ -54,54 +61,88 @@ pub(super) fn cancel_fork_branches(
         if Some(client_key) == exclude {
             continue;
         }
-        if let Some(client_branch) = session.get_client_branch(client_key) {
-            // RFC 3261 §9.1 — the CANCEL on each branch MUST share the
-            // topmost Via branch siphon used when sending the INVITE
-            // downstream on that branch (which IS client_key.branch),
-            // and the same CSeq sequence number as the INVITE.  Build
-            // a synthetic outbound-INVITE view (clone of the inbound
-            // request with topmost Via swapped for siphon's per-branch
-            // Via), then run it through build_cancel_from_invite which
-            // enforces every other RFC-§9.1 invariant (single Via, CSeq
-            // method=CANCEL, no body, no body-bearing headers).
-            let transport_str = format!("{}", client_branch.transport);
-            let siphon_via = format!(
-                "SIP/2.0/{} {}:{};branch={}",
-                transport_str.to_uppercase(),
-                state.via_host(&client_branch.transport),
-                state.via_port(&client_branch.transport),
-                client_key.branch,
-            );
-            let mut as_outbound_invite = session.original_request.clone();
-            as_outbound_invite.headers.set("Via", siphon_via);
-            let cancel = match build_cancel_from_invite(&as_outbound_invite) {
-                Some(c) => c,
-                None => {
-                    warn!(
-                        client_key = %client_key,
-                        "fork: failed to build CANCEL from outbound INVITE view"
-                    );
-                    continue;
-                }
-            };
-
-            let data = Bytes::from(cancel.to_bytes());
-
-            debug!(
-                client_key = %client_key,
-                destination = %client_branch.destination,
-                "fork: cancelling branch"
-            );
-
-            send_outbound(
-                data,
-                client_branch.transport,
-                client_branch.destination,
-                client_branch.connection_id,
-                state,
-            );
-        }
+        cancel_proxy_branch(client_key, &[], state);
     }
+    // The branches that had already ended when the request got its final
+    // response (they failed while the fork was still open) go now; `exclude`,
+    // the branch whose response is going upstream, is its caller's to release.
+    let client_keys = session.client_keys.clone();
+    drop(session);
+    release_ended_branches(&client_keys, exclude, state);
+}
+
+/// CANCEL one branch of a proxied INVITE, when RFC 3261 §9.1 allows it;
+/// `reasons` are the `Reason` values the CANCEL carries (RFC 3326). The one place the proxy decides to send a branch its CANCEL,
+/// whatever gave up on the branch: another branch's 2xx or 6xx, a
+/// `reply.reject()`, the caller's own CANCEL.
+///
+/// §9.1: "If no provisional response has been received, the CANCEL request
+/// MUST NOT be sent; rather, the client MUST wait for the arrival of a
+/// provisional response before sending the request", and a CANCEL "SHOULD NOT
+/// be sent" for a request with its final response. §16.10 and §16.7 step 10
+/// have a proxy CANCEL its *pending* client transactions, which are those.
+///
+/// What the branch has drawn is the state of its INVITE client transaction,
+/// and the decision is taken there, under the lock the response path holds
+/// for the same transaction:
+///
+/// * a provisional and no final: the CANCEL is sent now;
+/// * nothing yet: the CANCEL is left with the transaction. The INVITE stays an
+///   unanswered request, retransmitted on Timer A, and its first provisional
+///   (a `100 Trying` counts) sends the CANCEL from the response path. A final
+///   response instead drops it unsent, and so does Timer B;
+/// * a final response, or a transaction that is over: nothing is sent.
+///
+/// The waiting CANCEL does not depend on the proxy session, which the caller's
+/// CANCEL removes at once.
+fn cancel_proxy_branch(client_key: &TransactionKey, reasons: &[String], state: &DispatcherState) {
+    use crate::transaction::state::CancelOutcome;
+
+    match state
+        .transaction_manager
+        .cancel_invite_client(client_key, reasons)
+    {
+        CancelOutcome::SendNow(cancel) => send_proxy_branch_cancel(&cancel, state),
+        CancelOutcome::Deferred => debug!(
+            client_key = %client_key,
+            "proxy: no provisional on this branch yet — its INVITE keeps retransmitting and the CANCEL follows its first provisional (RFC 3261 §9.1)"
+        ),
+        CancelOutcome::NothingToSend => debug!(
+            client_key = %client_key,
+            "proxy: branch has its final response or its CANCEL already — nothing to send (RFC 3261 §9.1)"
+        ),
+        CancelOutcome::Unbuildable(error) => warn!(
+            client_key = %client_key,
+            "proxy: cannot build the CANCEL of a branch from its INVITE as sent ({error}) — it rings on until it answers or times out"
+        ),
+    }
+}
+
+/// Put the CANCEL of a proxied INVITE on the wire, to the hop that INVITE went
+/// to and from the socket it left from (RFC 3261 §9.1: the same destination
+/// address, port and transport; on a multi-homed host, or a flow pinned to
+/// one listener, a CANCEL from another socket is another sender to the peer).
+///
+/// Reached from the two places a branch's CANCEL is released: at once, when
+/// the branch already had a provisional, and from the response path, on the
+/// first provisional of a branch that had none ([`Action::SendCancel`]).
+pub(super) fn send_proxy_branch_cancel(
+    cancel: &crate::transaction::state::BranchCancel,
+    state: &DispatcherState,
+) {
+    debug!(
+        destination = %cancel.hop.destination,
+        transport = %cancel.hop.transport,
+        "proxy: sending a branch its CANCEL"
+    );
+    send_outbound_from(
+        cancel.frame.clone(),
+        cancel.hop.transport,
+        cancel.hop.destination,
+        cancel.hop.connection_id,
+        cancel.hop.source_local_addr,
+        state,
+    );
 }
 
 /// Fail an in-progress proxied INVITE from the reply context.
@@ -114,8 +155,9 @@ pub(super) fn cancel_fork_branches(
 /// 1. Mark the session finalized *first* so any branch response that races in
 ///    (the `487` the CANCEL draws back, or a late provisional) is absorbed by
 ///    the straggler guard in `handle_response` rather than forwarded upstream.
-/// 2. CANCEL every pending downstream branch (RFC 3261 §9 — we have received a
-///    provisional, so CANCEL is well-formed), then send `code reason` upstream
+/// 2. CANCEL every pending downstream branch (RFC 3261 §9.1 — the branch whose
+///    provisional drew the reject at once, any other when it has drawn a
+///    provisional of its own), then send `code reason` upstream
 ///    to the UAC through the server transaction so retransmission and ACK
 ///    absorption are handled by the transaction layer.
 ///
@@ -163,6 +205,11 @@ pub(super) fn reject_pending_invite(
     // 2a. CANCEL all pending downstream branches (no winner to exclude).
     cancel_fork_branches(server_key, None, state);
 
+    // The call has failed with the script's response: its record is written
+    // now. Nothing later closes it, since what the branches answer is
+    // absorbed.
+    cdr_finalize_proxy_fail(state, original_request, code);
+
     // 2b. Build and send the error response upstream via the server
     // transaction (handles retransmission + UAC-ACK absorption for INVITE).
     let response = build_response(
@@ -173,6 +220,38 @@ pub(super) fn reject_pending_invite(
         &[],
     );
 
+    send_final_through_server_transaction(
+        server_key,
+        response,
+        transport,
+        source_addr,
+        connection_id,
+        inbound_local_addr,
+        state,
+    );
+}
+
+/// Send `response`, a final response the proxy itself gives an INVITE, through
+/// that INVITE's server transaction: RFC 3261 §17.2.1 has it retransmitted on
+/// Timer G over an unreliable transport until the caller's ACK, which the
+/// transaction then absorbs, and sent again for a retransmission of the
+/// INVITE. Sent around the transaction it is sent once, a lost copy is never
+/// repeated, and the transaction is left waiting for a final response that
+/// already went.
+///
+/// With no live server transaction (or one that would not send it) the
+/// response goes straight to the transport, from the listener the INVITE
+/// arrived on, so an IPsec-protected response egresses on the right SA
+/// (TS 33.203 §7.4).
+fn send_final_through_server_transaction(
+    server_key: &TransactionKey,
+    response: SipMessage,
+    transport: Transport,
+    source_addr: SocketAddr,
+    connection_id: ConnectionId,
+    inbound_local_addr: SocketAddr,
+    state: &DispatcherState,
+) {
     let event = ServerEvent::Ist(IstEvent::TuNon2xxFinal(response.clone()));
     let mut sent_by_transaction = false;
     if let Ok(actions) = state
@@ -192,9 +271,6 @@ pub(super) fn reject_pending_invite(
     }
 
     if !sent_by_transaction {
-        // No live server transaction (or it emitted no SendMessage) — send the
-        // error directly, pinning the inbound listener's local address so an
-        // IPsec-protected response egresses on the right SA (TS 33.203 §7.4).
         send_message_from(
             response,
             transport,
@@ -417,6 +493,29 @@ pub(super) fn handle_cancel(
 
     if let Some(session_arc) = state.session_store.get_by_server_key(&invite_server_key) {
         handle_cancel_via_session(inbound, message, &invite_server_key, session_arc, state);
+        return;
+    }
+
+    // RFC 3261 §9.2: a CANCEL is matched to the INVITE's server transaction,
+    // and one that matches is answered 200 whatever became of the INVITE. The
+    // session goes with the INVITE's final response; its server transaction
+    // outlives it (`Completed` until the ACK, `Confirmed` until Timer I). A
+    // CANCEL arriving in that time still has its transaction, and "has no
+    // effect on the processing of the original request".
+    if state
+        .transaction_manager
+        .invite_server_has_final(&invite_server_key)
+    {
+        debug!(uac_branch = %uac_branch, "CANCEL for an INVITE that already has its final response — answered 200, no effect (RFC 3261 §9.2)");
+        let response = build_response(&message, 200, "OK", state.server_header.as_deref(), &[]);
+        send_message_from(
+            response,
+            inbound.transport,
+            inbound.remote_addr,
+            inbound.connection_id,
+            Some(inbound.local_addr),
+            state,
+        );
         return;
     }
 
@@ -656,39 +755,14 @@ pub(super) fn handle_ack_via_session(
 // ProxySession-based CANCEL handling
 // ---------------------------------------------------------------------------
 
-/// Build the topmost `Via` value for a CANCEL forwarded on a proxy client
-/// branch.
+/// Handle CANCEL using ProxySession — forwards CANCEL to the pending client
+/// branches and sends 487 Request Terminated upstream.
 ///
-/// RFC 3261 §9.1 makes CANCEL the one request that MUST share the topmost
-/// `Via` branch of the request it cancels; §16.10 has a stateful proxy
-/// generate, for each pending branch, a CANCEL whose single `Via` equals the
-/// top `Via` of the INVITE it forwarded on that branch.  The downstream
-/// UAS/proxy matches CANCEL→INVITE on that branch + sent-by (RFC 3261 §9.2 /
-/// §17.2.3) to find the in-progress INVITE server transaction.
-///
-/// The proxy's client transaction key already holds exactly the branch and
-/// sent-by siphon stamped on that INVITE's topmost `Via` (see
-/// [`TransactionManager::key_from_message`]), so we reuse them verbatim —
-/// reusing `sent_by` also keeps the CANCEL aligned with the INVITE in the
-/// IPsec / flow / `force_send_via` cases where the advertised sent-by differs
-/// from the default per-transport `via_host`.  Minting a fresh branch here
-/// (as siphon did before) makes the forwarded CANCEL unmatchable downstream:
-/// it is dropped, the INVITE leg below is never torn down, and the callee
-/// keeps ringing after the caller abandons during alerting.
-pub(super) fn cancel_via_for_client_branch(
-    client_key: &TransactionKey,
-    transport: Transport,
-) -> String {
-    format!(
-        "SIP/2.0/{} {};branch={}",
-        format!("{transport}").to_uppercase(),
-        client_key.sent_by,
-        client_key.branch,
-    )
-}
-
-/// Handle CANCEL using ProxySession — forwards CANCEL to all client branches
-/// and sends 487 Request Terminated upstream.
+/// The caller is answered, and the session removed, at once. A branch that
+/// has drawn no response yet is not sent the CANCEL then (RFC 3261 §9.1): it
+/// stays with the branch's INVITE client transaction, which outlives the
+/// session, and goes on that INVITE's first provisional
+/// ([`cancel_proxy_branch`]).
 pub(super) fn handle_cancel_via_session(
     inbound: InboundMessage,
     message: SipMessage,
@@ -696,8 +770,32 @@ pub(super) fn handle_cancel_via_session(
     session_arc: Arc<RwLock<ProxySession>>,
     state: &DispatcherState,
 ) {
-    let session = match session_arc.read() {
-        Ok(s) => s,
+    // Whether the INVITE already has its final response, and if it has not,
+    // the mark that from here on it has: the 487 below. Latched before
+    // anything goes on the wire, as a reply-time reject does, so that what a
+    // branch answers its CANCEL with, on whichever worker and however soon,
+    // finds the INVITE finally answered and is absorbed: neither forwarded as
+    // a second final response nor taken for a branch failure by
+    // `@proxy.on_failure`.
+    //
+    // RFC 3261 §9.2: "the CANCEL request has no effect on the processing of
+    // the original request" once that has its final response, and an INVITE
+    // server transaction sends one final response (§17.2.1). An INVITE already
+    // rejected from the reply path, or already answered by a fork branch while
+    // this session lingers for the branches still to end, gets the CANCEL's
+    // 200 and nothing after it, least of all a 487.
+    let already_answered = match session_arc.write() {
+        Ok(mut session) => {
+            let answered = session.final_response_sent
+                || session.fork_aggregator.as_ref().is_some_and(|aggregator| {
+                    match aggregator.lock() {
+                        Ok(aggregator) => aggregator.has_settled(),
+                        Err(_) => false,
+                    }
+                });
+            session.final_response_sent = true;
+            answered
+        }
         Err(_) => {
             error!("ProxySession lock poisoned during CANCEL handling");
             let response = build_response(
@@ -731,42 +829,44 @@ pub(super) fn handle_cancel_via_session(
         Some(inbound.local_addr),
         state,
     );
-
-    // Forward CANCEL to each client branch
-    for client_key in &session.client_keys {
-        if let Some(client_branch) = session.get_client_branch(client_key) {
-            let mut cancel_downstream = message.clone();
-            // RFC 3261 §9.1 / §16.10: the forwarded CANCEL MUST carry the SAME
-            // topmost Via branch (and sent-by) as the INVITE siphon sent on
-            // this branch, so the downstream matches CANCEL→INVITE (RFC 3261
-            // §9.2 / §17.2.3) and tears the alerting branch down.  Minting a
-            // fresh branch makes the CANCEL unmatchable: it's dropped, the
-            // INVITE leg below is never cancelled, and the callee keeps
-            // ringing after the caller abandons.  `headers.set` collapses the
-            // inbound CANCEL's Via stack to this single Via (§9.1 — a proxy
-            // CANCEL carries exactly one Via).
-            let via_value = cancel_via_for_client_branch(client_key, client_branch.transport);
-            cancel_downstream.headers.set("Via", via_value);
-
-            let data = Bytes::from(cancel_downstream.to_bytes());
-
-            debug!(
-                client_key = %client_key,
-                destination = %client_branch.destination,
-                "forwarding CANCEL downstream via session"
-            );
-
-            send_outbound(
-                data,
-                client_branch.transport,
-                client_branch.destination,
-                client_branch.connection_id,
-                state,
-            );
+    if already_answered {
+        debug!(
+            server_key = %invite_server_key,
+            "CANCEL for an INVITE that already has its final response — answered 200, no effect (RFC 3261 §9.2)"
+        );
+        return;
+    }
+    let session = match session_arc.read() {
+        Ok(session) => session,
+        Err(_) => {
+            error!("ProxySession lock poisoned during CANCEL handling");
+            return;
         }
+    };
+
+    // Forward CANCEL to each client branch still pending
+    let reasons = message
+        .headers
+        .get_all("Reason")
+        .cloned()
+        .unwrap_or_default();
+    for client_key in &session.client_keys {
+        // RFC 3261 §9.1 / §16.10: the CANCEL of a branch is that branch's
+        // INVITE over again (Request-URI, Route, From, To, Call-ID, CSeq
+        // number, and its top Via as the one Via), so it is built from the
+        // INVITE as sent, not from the caller's CANCEL, whose Request-URI and
+        // route set are the caller's. What the caller's CANCEL adds is why
+        // (RFC 3326), and that is relayed.
+        //
+        // Sent now to a branch that has answered with a provisional, kept for
+        // one that has answered nothing, dropped for one that already has its
+        // final response (RFC 3261 §9.1).
+        cancel_proxy_branch(client_key, &reasons, state);
     }
 
-    // Send 487 Request Terminated upstream using the original INVITE from the session
+    // Send 487 Request Terminated upstream using the original INVITE from the
+    // session, as the final response of that INVITE's server transaction
+    // (RFC 3261 §9.2, §17.2.1).
     let response_487 = build_response(
         &session.original_request,
         487,
@@ -774,12 +874,13 @@ pub(super) fn handle_cancel_via_session(
         state.server_header.as_deref(),
         &[],
     );
-    send_message_from(
+    send_final_through_server_transaction(
+        invite_server_key,
         response_487,
         session.transport,
         session.source_addr,
         session.connection_id,
-        Some(session.inbound_local_addr),
+        session.inbound_local_addr,
         state,
     );
     // The caller abandoned the INVITE: its dialog, and every branch's, is over.
@@ -815,98 +916,79 @@ pub(super) fn handle_cancel_via_session(
         drop(session);
     }
 
-    state.session_store.remove_by_server_key(&server_key);
-    // Removing the session is what makes a retransmitted CANCEL unmatchable, so
-    // record the acceptance in the same breath (RFC 3261 §9.2).
+    // The call's record is written, as cancelled by the caller: after the
+    // `@proxy.on_cancel` handlers, so what one of them adds to it with
+    // `cdr.write` is on it. Nothing later closes it (what the branches answer
+    // is absorbed), and an open one would sit until the day-long backstop with
+    // no record written.
+    if let Ok(session) = session_arc.read() {
+        cdr_finalize_proxy_fail(state, &session.original_request, 487);
+    }
+    release_cancelled_session(&session_arc, state);
+    // A retransmitted CANCEL is answered 200 and does none of this again
+    // (RFC 3261 §9.2).
     remember_cancelled_invite(&state.cancelled_invites, server_key);
+}
+
+/// Leave a cancelled INVITE's session to its branches still owed a final
+/// response, and to nothing else.
+///
+/// The caller has its `487`, so the session is marked as finally answered:
+/// whatever a branch still sends is absorbed, except a 2xx, which RFC 3261
+/// §16.7 step 5 has forwarded even now and which needs the session to reach
+/// the caller. The dialog index goes at once (no dialog was established; a
+/// late 2xx puts it back for its own ACK), and so does every branch that has
+/// nothing more to send. A branch still pending is released by its final
+/// response or by its transaction timing out; with none left the session is
+/// gone here.
+fn release_cancelled_session(session_arc: &Arc<RwLock<ProxySession>>, state: &DispatcherState) {
+    let (original_request, client_keys) = match session_arc.write() {
+        Ok(mut session) => {
+            session.final_response_sent = true;
+            (
+                session.original_request.clone(),
+                session.client_keys.clone(),
+            )
+        }
+        Err(error) => {
+            error!("proxy session lock poisoned while releasing a cancelled INVITE: {error}");
+            return;
+        }
+    };
+    state.session_store.remove_dialog_key(&original_request);
+    release_ended_branches(&client_keys, None, state);
+}
+
+/// Release the branches of a request that has its final response upstream and
+/// that have nothing more to send: every one of `client_keys`, bar `keep`,
+/// whose INVITE is no longer owed a final response. A branch still pending is
+/// released by that response when it comes (or by its timeout); once none is
+/// left the session is gone, without waiting for the sweep.
+pub(super) fn release_ended_branches(
+    client_keys: &[TransactionKey],
+    keep: Option<&TransactionKey>,
+    state: &DispatcherState,
+) {
+    for client_key in client_keys {
+        if Some(client_key) != keep
+            && !state
+                .transaction_manager
+                .invite_client_is_pending(client_key)
+        {
+            state.session_store.remove_client_key(client_key);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
 // B2BUA CANCEL handling
 // ---------------------------------------------------------------------------
 
-/// Build a CANCEL for an outbound INVITE per RFC 3261 §9.1.
+/// Build a CANCEL for an outbound INVITE per RFC 3261 §9.1, from that INVITE
+/// as siphon put it on the wire: for the B2BUA the leg's stashed INVITE, for
+/// the proxy the octets the branch's client transaction sent.
 ///
-/// The CANCEL MUST share the topmost Via branch and CSeq sequence number
-/// of the request being cancelled — that is the contract that lets the
-/// downstream UAS (and every proxy on the path) match the CANCEL to the
-/// in-progress server transaction of the INVITE.  Building a CANCEL with
-/// a fresh branch, or with the wrong CSeq number, makes every proxy hop
-/// return 481 Call/Transaction Does Not Exist and the UAS keeps ringing.
-///
-/// The caller passes the outbound INVITE as siphon put it on the wire —
-/// for B2BUA that's [Leg::b_leg_invite]; for proxy fork it's a clone of
-/// the inbound request with the topmost Via swapped for siphon's
-/// per-branch Via.
-///
-/// Other headers (From, To, Call-ID, R-URI, Max-Forwards, Route) are
-/// preserved verbatim from the INVITE.  Content-Length is forced to 0;
-/// the body is dropped.  Everything else (Contact, Allow, Supported,
-/// PAI, Session-Expires, SDP, …) is stripped — CANCEL is hop-by-hop and
-/// carries no payload.
+/// See [`crate::transaction::cancel::build_cancel`], which this is.
 pub(super) fn build_cancel_from_invite(invite: &SipMessage) -> Option<SipMessage> {
-    // Method swap: INVITE → CANCEL on the request line.
-    let mut cancel = invite.clone();
-    let request_uri = match &mut cancel.start_line {
-        StartLine::Request(rl) => {
-            rl.method = crate::sip::message::Method::Cancel;
-            rl.request_uri.clone()
-        }
-        StartLine::Response(_) => return None,
-    };
-    let _ = request_uri; // touched only to enforce the variant guard above
-
-    // CSeq: keep the INVITE's sequence number, swap the method to CANCEL
-    // (RFC 3261 §9.1 — "MUST contain the same value for the sequence
-    //  number as was present in the request being cancelled, but the
-    //  method parameter MUST be equal to CANCEL").
-    let cseq_seq = invite
-        .headers
-        .cseq()?
-        .split_whitespace()
-        .next()?
-        .to_string();
-    cancel.headers.set("CSeq", format!("{} CANCEL", cseq_seq));
-
-    // Topmost Via only.  The stashed B-leg INVITE has exactly one Via
-    // (siphon overwrites Via on B-leg INVITE build), so set_all with a
-    // single value is fine — but be defensive in case the assumption
-    // ever drifts.
-    if let Some(vias) = invite.headers.get_all("Via") {
-        if let Some(top) = vias.first() {
-            cancel.headers.set("Via", top.clone());
-        }
-    }
-
-    // Drop the payload — CANCEL never carries a body.
-    cancel.body.clear();
-    cancel.headers.set("Content-Length", "0".to_string());
-
-    // Strip headers that have no place on a CANCEL.  We keep:
-    //   Via (topmost only — set above)
-    //   From, To, Call-ID, CSeq, Max-Forwards, Route
-    //   Content-Length
-    // Everything else is dropped per RFC 3261 §9.1 + §20 (CANCEL is
-    // hop-by-hop, carries no offer/answer, no dialog-establishing data).
-    const KEEP: &[&str] = &[
-        "via",
-        "from",
-        "to",
-        "call-id",
-        "cseq",
-        "max-forwards",
-        "route",
-        "content-length",
-    ];
-    let to_remove: Vec<String> = cancel
-        .headers
-        .iter()
-        .map(|(name, _)| name.clone())
-        .filter(|n| !KEEP.contains(&n.as_str()))
-        .collect();
-    for name in to_remove {
-        cancel.headers.remove(&name);
-    }
-
-    Some(cancel)
+    crate::transaction::cancel::build_cancel(invite, &[])
 }

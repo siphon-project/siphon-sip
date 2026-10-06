@@ -9,9 +9,15 @@
 //! The [`TransactionManager`] owns all active transactions in a [`DashMap`]
 //! keyed by [`TransactionKey`].
 
+pub mod cancel;
 pub mod key;
 pub mod state;
 pub mod timer;
+
+#[cfg(test)]
+mod cancel_tests;
+#[cfg(test)]
+mod timer_c_tests;
 
 use bytes::Bytes;
 use dashmap::mapref::entry::Entry;
@@ -388,6 +394,115 @@ impl TransactionManager {
         }
 
         Ok(actions)
+    }
+
+    /// Ask for the INVITE client transaction `key` to be cancelled, and learn
+    /// whether its CANCEL goes now, waits, or is not sent at all (RFC 3261
+    /// §9.1, [`Ict::request_cancel`]). The CANCEL is built from the INVITE the
+    /// transaction sent and goes where that went ([`Self::set_client_hop`]);
+    /// `reasons` are the `Reason` values to carry.
+    ///
+    /// Decided under the lock the response path takes for the same
+    /// transaction ([`Self::process_client_event`]), so a request to cancel
+    /// and a provisional response racing it on another worker send the CANCEL
+    /// exactly once between them: whichever comes second finds what the first
+    /// left.
+    ///
+    /// [`CancelOutcome::NothingToSend`] for a key with no transaction (it has
+    /// ended: a 2xx, Timer B or Timer D) and for one that is not an INVITE
+    /// client transaction (§9.1: a CANCEL is for an INVITE).
+    pub fn cancel_invite_client(&self, key: &TransactionKey, reasons: &[String]) -> CancelOutcome {
+        let Some(mut entry) = self.transactions.get_mut(key) else {
+            return CancelOutcome::NothingToSend;
+        };
+        match &mut **entry {
+            Transaction::Ict(ict) => ict.request_cancel(reasons),
+            _ => CancelOutcome::NothingToSend,
+        }
+    }
+
+    /// Record where the INVITE of client transaction `key` went: the local
+    /// socket it left from and the address, transport and connection it was
+    /// sent to. Its CANCEL and the ACK of its failure go the same way
+    /// (RFC 3261 §9.1, §17.1.1.3). A no-op for any other transaction.
+    pub fn set_client_hop(&self, key: &TransactionKey, hop: BranchHop) {
+        if let Some(mut entry) = self.transactions.get_mut(key) {
+            if let Transaction::Ict(ict) = &mut **entry {
+                ict.set_hop(hop);
+            }
+        }
+    }
+
+    /// The connection the INVITE of client transaction `key` went on, once the
+    /// send has established it.
+    pub fn set_client_connection(
+        &self,
+        key: &TransactionKey,
+        connection_id: crate::transport::ConnectionId,
+    ) {
+        if let Some(mut entry) = self.transactions.get_mut(key) {
+            if let Transaction::Ict(ict) = &mut **entry {
+                ict.set_connection(connection_id);
+            }
+        }
+    }
+
+    /// Where the INVITE of client transaction `key` went, while the
+    /// transaction lives.
+    pub fn client_hop(&self, key: &TransactionKey) -> Option<BranchHop> {
+        match &**self.transactions.get(key)?.value() {
+            Transaction::Ict(ict) => ict.hop(),
+            _ => None,
+        }
+    }
+
+    /// Whether `key` is an INVITE server transaction that has sent its final
+    /// response and is still there for it (`Completed`, waiting for the ACK,
+    /// or `Confirmed`, absorbing its repeats; RFC 3261 §17.2.1).
+    pub fn invite_server_has_final(&self, key: &TransactionKey) -> bool {
+        self.transactions.get(key).is_some_and(|entry| {
+            matches!(
+                &**entry.value(),
+                Transaction::Ist(ist)
+                    if matches!(ist.state, IstState::Completed | IstState::Confirmed)
+            )
+        })
+    }
+
+    /// Whether `key` is an INVITE client transaction still owed its final
+    /// response (`Calling` or `Proceeding`).
+    pub fn invite_client_is_pending(&self, key: &TransactionKey) -> bool {
+        self.transactions.get(key).is_some_and(|entry| {
+            matches!(
+                &**entry.value(),
+                Transaction::Ict(ict)
+                    if matches!(ict.state, IctState::Calling | IctState::Proceeding)
+            )
+        })
+    }
+
+    /// Move what Timer C counts from, for INVITE client transaction `key`,
+    /// back by `by` (test clock).
+    #[cfg(test)]
+    pub fn age_invite_client(&self, key: &TransactionKey, by: std::time::Duration) {
+        if let Some(mut entry) = self.transactions.get_mut(key) {
+            if let Transaction::Ict(ict) = &mut **entry {
+                ict.age_progress(by);
+            }
+        }
+    }
+
+    /// Number of INVITE client transactions holding a CANCEL that waits for
+    /// their first provisional (leak-test accessor): back to its baseline once
+    /// each has had a response or timed out.
+    #[cfg(test)]
+    pub fn waiting_cancel_count(&self) -> usize {
+        self.transactions
+            .iter()
+            .filter(|entry| {
+                matches!(&**entry.value(), Transaction::Ict(ict) if ict.cancel_is_waiting())
+            })
+            .count()
     }
 
     /// Remove a transaction (e.g. on cleanup).

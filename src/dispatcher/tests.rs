@@ -5121,54 +5121,6 @@ fn build_response_replace_then_add_for_same_header_keeps_replace_then_appends() 
     assert!(warns[1].contains("second"));
 }
 
-#[test]
-fn build_ack_for_non2xx_has_correct_headers() {
-    let request = sample_invite();
-    let response = build_response(&request, 480, "Temporarily Unavailable", None, &[]);
-    let ack = build_ack_for_non2xx(
-        &request,
-        &response,
-        "z9hG4bK-proxy-branch",
-        Transport::Tcp,
-        "10.0.0.1:5060",
-    );
-
-    // Must be an ACK request
-    assert!(ack.is_request());
-    let bytes = String::from_utf8(ack.to_bytes()).unwrap();
-    assert!(bytes.starts_with("ACK sip:bob@biloxi.com SIP/2.0\r\n"));
-
-    // Via: our own hop only (not the UAC's)
-    let via = ack.headers.via().unwrap();
-    assert!(via.contains("z9hG4bK-proxy-branch"));
-    assert!(via.contains("TCP"));
-    assert!(via.contains("10.0.0.1:5060"));
-
-    // From: same as original request
-    assert_eq!(ack.headers.from().unwrap(), request.headers.from().unwrap());
-
-    // To: from the response (may have To-tag)
-    assert_eq!(ack.headers.to().unwrap(), response.headers.to().unwrap());
-
-    // Call-ID: same as original
-    assert_eq!(
-        ack.headers.call_id().unwrap(),
-        request.headers.call_id().unwrap()
-    );
-
-    // CSeq: same number, ACK method
-    let cseq = ack.headers.cseq().unwrap();
-    assert!(cseq.contains("314159"));
-    assert!(cseq.contains("ACK"));
-    assert!(!cseq.contains("INVITE"));
-
-    // Max-Forwards present
-    assert_eq!(ack.headers.get("Max-Forwards").unwrap(), "70");
-
-    // Content-Length: 0
-    assert_eq!(ack.headers.content_length(), Some(0));
-}
-
 /// Build a representative B-leg INVITE — i.e. one that has already been
 /// through the hygiene chain in `b2bua_send_b_leg_invite`: stripped
 /// Record-Route/Route/Authorization, our own Via and Contact, rewritten
@@ -6755,71 +6707,6 @@ fn build_ack_for_2xx_falls_back_when_contact_absent() {
     let wire = String::from_utf8(ack.to_bytes()).unwrap();
     assert!(wire.starts_with("ACK "), "must still be an ACK:\n{wire}");
     assert!(wire.contains("CSeq: 9 ACK\r\n"), "CSeq preserved:\n{wire}");
-}
-
-// --- Proxy-forwarded CANCEL Via (RFC 3261 §9.1 / §16.10) ---
-//
-// Regression: handle_cancel_via_session used to mint a fresh branch
-// (TransactionKey::generate_branch()) for the forwarded CANCEL, so the
-// downstream proxy/UAS could not match CANCEL→INVITE and dropped it — the
-// INVITE leg below was never torn down and the callee kept ringing after
-// the caller abandoned during alerting.
-
-#[test]
-fn proxy_cancel_via_reuses_invite_branch_and_sent_by() {
-    // The proxy forwarded an INVITE on this client branch; its transaction
-    // key holds exactly the branch + sent-by siphon stamped on that
-    // INVITE's topmost Via.
-    let client_key = TransactionKey::new(
-        "z9hG4bK-invite-branch-B".to_string(),
-        Method::Invite,
-        "192.0.2.178:4060".to_string(),
-    );
-    let via = cancel_via_for_client_branch(&client_key, Transport::Udp);
-    assert_eq!(
-        via, "SIP/2.0/UDP 192.0.2.178:4060;branch=z9hG4bK-invite-branch-B",
-        "forwarded CANCEL must reuse the INVITE's top Via branch + sent-by (RFC 3261 §9.1)",
-    );
-}
-
-#[test]
-fn proxy_cancel_via_branch_is_deterministic_not_fresh() {
-    // Guards the exact regression: TransactionKey::generate_branch() would
-    // yield a different (and non-matching) branch on every call.
-    let client_key = TransactionKey::new(
-        "z9hG4bK-stored-branch".to_string(),
-        Method::Invite,
-        "10.0.0.1:5060".to_string(),
-    );
-    let via_first = cancel_via_for_client_branch(&client_key, Transport::Tcp);
-    let via_second = cancel_via_for_client_branch(&client_key, Transport::Tcp);
-    assert_eq!(
-        via_first, via_second,
-        "forwarded CANCEL Via must derive from the stored client branch, \
-         never a freshly generated one",
-    );
-    assert!(
-        via_first.ends_with(";branch=z9hG4bK-stored-branch"),
-        "CANCEL branch must equal the stored INVITE branch: {via_first}",
-    );
-}
-
-#[test]
-fn proxy_cancel_via_preserves_transport_and_ipv6_sent_by() {
-    // sent_by is reused verbatim from the client key — this covers the
-    // IPsec / flow / force_send_via cases where the advertised sent-by
-    // (here an IPv6 literal with a non-default protected port) differs
-    // from the default per-transport via_host.
-    let client_key = TransactionKey::new(
-        "z9hG4bK-tls-branch".to_string(),
-        Method::Invite,
-        "[2001:db8::1]:5061".to_string(),
-    );
-    let via = cancel_via_for_client_branch(&client_key, Transport::Tls);
-    assert_eq!(
-        via,
-        "SIP/2.0/TLS [2001:db8::1]:5061;branch=z9hG4bK-tls-branch",
-    );
 }
 
 // --- Transaction integration tests ---

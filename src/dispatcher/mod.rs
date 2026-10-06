@@ -62,6 +62,7 @@ mod in_dialog;
 mod inbound;
 mod inbound_filter;
 mod intercept;
+mod late_answer;
 mod liveness;
 mod media_init;
 mod proxy_dialog_state;
@@ -189,11 +190,25 @@ mod originated_cancel_awaits_provisional_tests;
 #[cfg(test)]
 mod prack_offer_answer_tests;
 #[cfg(test)]
+mod proxy_branch_final_tests;
+#[cfg(test)]
+mod proxy_cancel_awaits_provisional_tests;
+#[cfg(test)]
+mod proxy_cancel_upstream_tests;
+#[cfg(test)]
+mod proxy_cancel_wire_tests;
+#[cfg(test)]
 mod proxy_dialog_state_tests;
+#[cfg(test)]
+mod proxy_late_answer_tests;
 #[cfg(test)]
 mod proxy_protocol_tests;
 #[cfg(test)]
 mod proxy_reply_filter_tests;
+#[cfg(test)]
+mod proxy_stateless_2xx_tests;
+#[cfg(test)]
+mod proxy_timer_c_tests;
 #[cfg(test)]
 mod public_api_surface;
 #[cfg(test)]
@@ -304,6 +319,7 @@ use in_dialog::*;
 use inbound::*;
 use inbound_filter::*;
 use intercept::*;
+use late_answer::*;
 use liveness::*;
 use media_init::*;
 use proxy_dialog_state::*;
@@ -445,15 +461,13 @@ pub async fn run(
     let _non_invite_timeout =
         std::time::Duration::from_secs(tx_config.map(|t| t.timeout_secs as u64).unwrap_or(5));
 
-    let timer_config = {
-        let mut config = TimerConfig::default();
-        if let Some(tx) = tx_config {
-            config.auto_100_trying = tx.auto_emit_100_trying;
-            config.auto_100_delay =
-                std::time::Duration::from_millis(tx.auto_emit_100_trying_delay_ms);
-        }
-        config
-    };
+    let timer_config = transaction_timers(tx_config);
+    if timer_c_is_below_the_rfc_minimum(timer_config.timer_c_secs) {
+        warn!(
+            timer_c_secs = timer_config.timer_c_secs,
+            "transaction.timer_c_secs is 180 or less: RFC 3261 §16.6 step 11 requires Timer C to be larger than 3 minutes; every proxied INVITE still ringing after this long is CANCELled"
+        );
+    }
     let transaction_manager = Arc::new(TransactionManager::new(timer_config));
 
     let dns_resolver = Arc::new(match SipResolver::from_system() {
