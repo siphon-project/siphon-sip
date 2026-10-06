@@ -13,6 +13,15 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
+### Changed
+
+- **The minimum Rust version is 1.89, and CI now builds with it.**
+  `rust-version` said 1.80, which no job checked and which was not true: the
+  locked dependencies need 1.89. Building from source with an older compiler
+  already failed, in a dependency, so this corrects the declared number rather
+  than raising the real one. A new CI job builds the library and the binary
+  with exactly the declared version.
+
 ## [1.13.0] — 2026-10-06
 
 ### Added

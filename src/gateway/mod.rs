@@ -455,7 +455,7 @@ impl DispatcherGroup {
                 .filter(|d| {
                     d.priority == priority
                         && d.is_selectable()
-                        && attr_filter.map_or(true, |f| d.matches_attrs(f))
+                        && attr_filter.is_none_or(|f| d.matches_attrs(f))
                 })
                 .collect();
 

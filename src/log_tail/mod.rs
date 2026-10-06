@@ -458,7 +458,7 @@ impl LogTail {
     pub fn retained(&self, query: &RetainedQuery) -> RetainedPage {
         let admit = |record: &&Arc<LogRecord>| {
             // `map_or(true, …)` not `is_none_or`: MSRV 1.80.
-            query.before.map_or(true, |before| record.seq < before) && record.matches(&query.filter)
+            query.before.is_none_or(|before| record.seq < before) && record.matches(&query.filter)
         };
         let mut records: Vec<Arc<LogRecord>> = lock_ring(&self.warn_ring)
             .iter()

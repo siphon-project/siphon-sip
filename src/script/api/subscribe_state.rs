@@ -893,7 +893,7 @@ async fn send_notify(
             .filter(|connection_id| {
                 dialog
                     .received_connection_id
-                    .map_or(true, |expected| connection_id.0 == expected)
+                    .is_none_or(|expected| connection_id.0 == expected)
             })
             .ok_or_else(|| {
                 pyo3::exceptions::PyRuntimeError::new_err(

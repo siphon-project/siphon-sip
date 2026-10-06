@@ -551,7 +551,7 @@ impl MediaSessionStore {
             Some((_, parties))
                 if parties
                     .expires_at
-                    .map_or(true, |expires_at| expires_at > tokio::time::Instant::now()) =>
+                    .is_none_or(|expires_at| expires_at > tokio::time::Instant::now()) =>
             {
                 parties
                     .parties
@@ -599,7 +599,7 @@ impl MediaSessionStore {
             Err(_) => {
                 let now = tokio::time::Instant::now();
                 self.parties
-                    .retain(|_, parties| parties.expires_at.map_or(true, |expiry| expiry > now));
+                    .retain(|_, parties| parties.expires_at.is_none_or(|expiry| expiry > now));
             }
         }
     }

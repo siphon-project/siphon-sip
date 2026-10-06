@@ -1251,7 +1251,7 @@ impl PrackCall {
         self.state
             .call_actors
             .get_call(&self.call_id)
-            .map_or(true, |actor| actor.teardown_claimed)
+            .is_none_or(|actor| actor.teardown_claimed)
     }
 }
 

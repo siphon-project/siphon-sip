@@ -156,7 +156,7 @@ pub fn decode_hex(hex: &str) -> Result<Vec<u8>, IpsecError> {
     if hex.is_empty() {
         return Ok(Vec::new());
     }
-    if hex.len() % 2 != 0 {
+    if !hex.len().is_multiple_of(2) {
         return Err(IpsecError::InvalidKey(format!(
             "hex key has odd length: {}",
             hex.len()

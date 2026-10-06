@@ -811,7 +811,7 @@ fn record_shed() {
     }
     static SHED_WARN_COUNT: AtomicU64 = AtomicU64::new(0);
     let n = SHED_WARN_COUNT.fetch_add(1, Ordering::Relaxed);
-    if n == 0 || n % 5000 == 0 {
+    if n == 0 || n.is_multiple_of(5000) {
         warn!(
             shed_total_since_start = n + 1,
             "Python executor queue full — shedding handler job (pool saturated; \
