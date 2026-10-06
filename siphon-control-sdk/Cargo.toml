@@ -16,7 +16,7 @@ members = [
 [workspace.package]
 version = "0.8.0"
 edition = "2021"
-rust-version = "1.80"
+rust-version = "1.89"
 license = "MIT"
 repository = "https://github.com/siphon-project/siphon-sip"
 authors = ["The SIPhon authors"]

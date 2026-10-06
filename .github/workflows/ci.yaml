@@ -356,6 +356,24 @@ jobs:
       - name: Clippy (--features full)
         run: PYO3_PYTHON=python3.14 cargo clippy -p siphon-bin --features full -- -D warnings
 
+      # The floor siphon-bin declares, checked the way the `minimum rust` job
+      # checks the library's: built with exactly that version, read from
+      # Cargo.toml so the two cannot drift, and `--locked` because the floor is
+      # a property of the committed lockfile. `full` so every extension crate's
+      # own floor is covered. Before the pin below, which rewrites the graph.
+      - name: Read rust-version from Cargo.toml
+        id: declared
+        run: |
+          version="$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' Cargo.toml)"
+          test -n "$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Install the declared minimum rust
+        run: rustup toolchain install ${{ steps.declared.outputs.version }} --profile minimal
+
+      - name: Check with the declared minimum rust (--features full)
+        run: PYO3_PYTHON=python3.14 cargo +${{ steps.declared.outputs.version }} check --locked --features full
+
       # The release composition, and the one leg that is NOT a bit-rot guard.
       # Everything above resolves siphon-sip from git, so it can be green against
       # a lib many commits behind this branch. This leg patches siphon-sip to the
@@ -444,6 +462,23 @@ jobs:
       # them.
       - name: Tests (proto + client)
         run: cargo test
+
+      # The floor the three crates declare, built with exactly that version
+      # (read from the workspace Cargo.toml so the two cannot drift). Library
+      # targets only and `--locked`, as the `minimum rust` job does for the
+      # core: a dev-dependency should not raise the floor for people who build.
+      - name: Read rust-version from Cargo.toml
+        id: declared
+        run: |
+          version="$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' Cargo.toml)"
+          test -n "$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Install the declared minimum rust
+        run: rustup toolchain install ${{ steps.declared.outputs.version }} --profile minimal
+
+      - name: Check with the declared minimum rust
+        run: cargo +${{ steps.declared.outputs.version }} check --locked
 
       # `pip install -e .` and not `maturin develop`: the pyproject already
       # declares the maturin backend, so pip builds the extension through it,

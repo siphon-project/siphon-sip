@@ -186,7 +186,8 @@ entry, but a working config keeps working.
   locked dependencies need 1.89. Building from source with an older compiler
   already failed, in a dependency, so this corrects the declared number rather
   than raising the real one. A new CI job builds the library and the binary
-  with exactly the declared version.
+  with exactly the declared version. `siphon-bin` and the three control SDK
+  crates declare 1.89 too, and their CI jobs build with it.
 - **`play` refuses an argument it cannot use.** A `repeat`, `start_ms`,
   `duration_ms`, `gain_decibels` or `to_tag` of the wrong type used to be read
   as absent, so the prompt played once from the start at full level and the
