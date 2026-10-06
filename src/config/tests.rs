@@ -190,7 +190,7 @@ fn auto_options_defaults_on() {
         with_block
             .server
             .as_ref()
-            .map_or(true, |server| server.auto_options),
+            .is_none_or(|server| server.auto_options),
         "a server: block that omits auto_options must still answer OPTIONS"
     );
 
@@ -207,7 +207,7 @@ fn auto_options_defaults_on() {
         without_block
             .server
             .as_ref()
-            .map_or(true, |server| server.auto_options),
+            .is_none_or(|server| server.auto_options),
         "no server: block at all must still answer OPTIONS"
     );
 }
@@ -228,7 +228,7 @@ fn auto_options_can_be_turned_off() {
     assert!(!config
         .server
         .as_ref()
-        .map_or(true, |server| server.auto_options));
+        .is_none_or(|server| server.auto_options));
 }
 
 /// Codec manipulation is an rtpengine NG capability. The native engine's

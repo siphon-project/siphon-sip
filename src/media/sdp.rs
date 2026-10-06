@@ -92,7 +92,7 @@ impl MediaLine {
         // Remove all matches
         self.other_attrs.retain(|line| {
             line.strip_prefix("a=")
-                .map_or(true, |attr| !attr_matches_name(attr, name))
+                .is_none_or(|attr| !attr_matches_name(attr, name))
         });
 
         // Build new lines
@@ -156,7 +156,7 @@ impl MediaLine {
     pub fn remove_attr(&mut self, name: &str) {
         self.other_attrs.retain(|line| {
             line.strip_prefix("a=")
-                .map_or(true, |attr| !attr_matches_name(attr, name))
+                .is_none_or(|attr| !attr_matches_name(attr, name))
         });
     }
 
@@ -397,7 +397,7 @@ impl SdpBody {
         });
         self.session_lines.retain(|line| {
             line.strip_prefix("a=")
-                .map_or(true, |attr| !attr_matches_name(attr, name))
+                .is_none_or(|attr| !attr_matches_name(attr, name))
         });
         let insert_pos = first_pos
             .unwrap_or(self.session_lines.len())
@@ -433,7 +433,7 @@ impl SdpBody {
     pub fn session_remove_attr(&mut self, name: &str) {
         self.session_lines.retain(|line| {
             line.strip_prefix("a=")
-                .map_or(true, |attr| !attr_matches_name(attr, name))
+                .is_none_or(|attr| !attr_matches_name(attr, name))
         });
     }
 

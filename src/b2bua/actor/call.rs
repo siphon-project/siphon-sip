@@ -1219,9 +1219,10 @@ impl CallActor {
             return BranchSettlement::default();
         }
         // `map_or(true, …)` not `is_none_or`: MSRV 1.80, and that is 1.82.
-        let improves = self.fork_best_failure.as_ref().map_or(true, |best| {
-            ResponseRank::of(status_code) > ResponseRank::of(best.status_code)
-        });
+        let improves = self
+            .fork_best_failure
+            .as_ref()
+            .is_none_or(|best| ResponseRank::of(status_code) > ResponseRank::of(best.status_code));
         if improves {
             if let Some(leg) = self.b_legs.get(index) {
                 self.fork_best_failure = Some(BranchFailure {

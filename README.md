@@ -139,7 +139,7 @@ SIPhon requires **Python 3.12+** at runtime for scripting support. For optimal p
 ### Option 1: cargo install (from crates.io)
 
 ```bash
-# Requires Rust 1.80+ and Python 3.12+ development headers
+# Requires Rust 1.89+ and Python 3.12+ development headers
 cargo install siphon-sip
 
 # Or with optional backends

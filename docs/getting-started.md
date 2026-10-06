@@ -77,9 +77,10 @@ binary; only the Compose quickstart needs no build toolchain.
 
 - **Linux** is the primary target (that's where the transports, `nf_tables`
   firewall, and IPsec paths are exercised). macOS works fine for development.
-- **Rust 1.80 or newer**, installed with [rustup](https://rustup.rs). Do **not**
-  use the `rustc` from `apt`/`dnf` — the distro package is usually too old to
-  build the crate, and that is the single most common install failure.
+- **Rust 1.89 or newer**, installed with [rustup](https://rustup.rs). Do **not**
+  use the `rustc` from `apt`/`dnf` unless `rustc --version` reports 1.89 or
+  newer — the distro package is usually too old to build the crate, and that is
+  the single most common install failure.
 - **Python 3.12+ with dev headers** (`python3-dev` / `python3-devel`). The
   scripting layer embeds CPython, so the headers and a shared `libpython` must
   be present at build time. Python 3.12 is enough to run SIPhon; the
@@ -105,7 +106,7 @@ PYO3_PYTHON=python3 cargo install siphon-sip
     Almost every failed build is one of these:
 
     1. **`rustc` is too old.** `apt`'s Rust predates what the crate needs. Install
-       [rustup](https://rustup.rs) and make sure `rustc --version` reports 1.80+
+       [rustup](https://rustup.rs) and make sure `rustc --version` reports 1.89+
        (`which rustc` should point into `~/.cargo`, not `/usr/bin`).
     2. **`python3-dev` is missing.** Without the Python headers and shared
        library, the build can't link CPython and fails with a PyO3/`libpython`

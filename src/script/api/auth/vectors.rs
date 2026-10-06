@@ -68,7 +68,7 @@ impl AuthVectorStore {
         let count = self
             .inserts
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if count % AUTH_VECTOR_PRUNE_EVERY == 0 {
+        if count.is_multiple_of(AUTH_VECTOR_PRUNE_EVERY) {
             self.vectors
                 .retain(|_, vector| vector.stored_at.elapsed() < AUTH_VECTOR_TTL);
         }

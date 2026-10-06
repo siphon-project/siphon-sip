@@ -41,7 +41,7 @@ impl CallActorStore {
         // `map_or(true, …)` not `is_none_or`: MSRV 1.80, and that is 1.82.
         self.calls
             .get(call_id)
-            .map_or(true, |call| call.is_ended_branch(index))
+            .is_none_or(|call| call.is_ended_branch(index))
     }
 
     /// Open a fork's dispatch window. See [`CallActor::fork_dispatching`].

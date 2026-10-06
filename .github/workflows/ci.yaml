@@ -150,6 +150,50 @@ jobs:
       - name: Run clippy (no default features)
         run: PYO3_PYTHON=python3.14 cargo clippy --no-default-features --all-targets -- -D warnings
 
+  # ── Minimum supported Rust version ──────────────────────────────────────
+  # Every other job builds with the current stable compiler, so nothing said
+  # whether `rust-version` in Cargo.toml was true. It was not: it read 1.80
+  # while the locked dependency graph needed 1.89, and `main` at one point did
+  # not compile on a compiler four releases old. This job builds with exactly
+  # the declared version, read from Cargo.toml so the two cannot drift.
+  #
+  # It checks the library and the binary, which is what someone building from
+  # source compiles. Tests and benches are left out on purpose: a dev-dependency
+  # that needs a newer compiler should not raise the floor for people who only
+  # build. `--locked` because the floor is a property of the committed lockfile.
+  minimum-rust:
+    name: minimum rust
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Python 3.14 (free-threaded)
+        uses: deadsnakes/action@v3.2.0
+        with:
+          python-version: "3.14-dev"
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libsctp-dev
+
+      - name: Read rust-version from Cargo.toml
+        id: declared
+        run: |
+          version="$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' Cargo.toml)"
+          test -n "$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.declared.outputs.version }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check (default features)
+        run: PYO3_PYTHON=python3.14 cargo check --locked
+
+      - name: Check (all features)
+        run: PYO3_PYTHON=python3.14 cargo check --locked --all-features
+
   # ── Criterion bench compile gate ─────────────────────────────────────────
   # Keep the per-message hot-path criterion benches (benches/sip_hot_path.rs)
   # compiling so they never bit-rot. The hard ">10% regression fails" gate is

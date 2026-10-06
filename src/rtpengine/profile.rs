@@ -557,7 +557,8 @@ pub const WS_SAMPLE_RATE_STEP: u32 = 1_000;
 ///
 /// Returns a ready-to-print reason on rejection.
 pub fn validate_ws_sample_rate(rate: u32) -> Result<(), String> {
-    if !(WS_SAMPLE_RATE_MIN..=WS_SAMPLE_RATE_MAX).contains(&rate) || rate % WS_SAMPLE_RATE_STEP != 0
+    if !(WS_SAMPLE_RATE_MIN..=WS_SAMPLE_RATE_MAX).contains(&rate)
+        || !rate.is_multiple_of(WS_SAMPLE_RATE_STEP)
     {
         return Err(format!(
             "must be a multiple of {WS_SAMPLE_RATE_STEP} within \

@@ -157,7 +157,7 @@ impl SourceHealth {
         let due = self.consecutive == 2
             || self
                 .last_logged
-                .map_or(true, |at| at.elapsed() >= ERROR_LOG_INTERVAL);
+                .is_none_or(|at| at.elapsed() >= ERROR_LOG_INTERVAL);
         if due {
             error!(
                 %source,

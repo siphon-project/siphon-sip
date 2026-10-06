@@ -321,11 +321,9 @@ pub fn release_held_callee_pracks(call_id: &str, state: &DispatcherState) {
 /// siphon received that provisional while the branch was still pending.
 fn send_unanswered_callee_prack(call_id: &str, held: &HeldCalleePrack, state: &DispatcherState) {
     // The leg as it sits on the call now. One that is gone has ended.
-    let ended = state.call_actors.get_call(call_id).map_or(true, |call| {
+    let ended = state.call_actors.get_call(call_id).is_none_or(|call| {
         call.find_b_leg_by_branch(&held.branch)
-            .map_or(true, |(index, _)| {
-                call.winner != Some(index) && call.is_ended_branch(index)
-            })
+            .is_none_or(|(index, _)| call.winner != Some(index) && call.is_ended_branch(index))
     });
     if ended {
         debug!(

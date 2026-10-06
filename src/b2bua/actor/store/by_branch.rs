@@ -59,9 +59,9 @@ impl CallActorStore {
     /// ended it.
     pub fn is_ended_branch_on(&self, call_id: &str, branch: &str) -> bool {
         // `map_or(true, …)` not `is_none_or`: MSRV 1.80, and that is 1.82.
-        self.calls.get(call_id).map_or(true, |call| {
+        self.calls.get(call_id).is_none_or(|call| {
             call.find_b_leg_by_branch(branch)
-                .map_or(true, |(index, _)| call.is_ended_branch(index))
+                .is_none_or(|(index, _)| call.is_ended_branch(index))
         })
     }
 

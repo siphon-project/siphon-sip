@@ -980,7 +980,7 @@ pub mod hex {
     }
 
     pub fn decode(hex_str: &str) -> Option<Vec<u8>> {
-        if hex_str.len() % 2 != 0 {
+        if !hex_str.len().is_multiple_of(2) {
             return None;
         }
         let mut bytes = Vec::with_capacity(hex_str.len() / 2);

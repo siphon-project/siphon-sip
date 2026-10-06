@@ -949,7 +949,7 @@ fn select_request_handler(
     for (filter, handler) in state.diameter_request_handlers() {
         if let Some(score) = request_filter_score(filter, application_id, command_code) {
             // Strict `>` keeps the earliest-registered handler on ties.
-            if best.map_or(true, |(best_score, _)| score > best_score) {
+            if best.is_none_or(|(best_score, _)| score > best_score) {
                 best = Some((score, handler));
             }
         }

@@ -80,8 +80,8 @@ impl ScriptState {
                     call_id: filter_cid,
                     from_tag: filter_ftag,
                 } => {
-                    filter_cid.as_deref().map_or(true, |v| v == call_id)
-                        && filter_ftag.as_deref().map_or(true, |v| v == from_tag)
+                    filter_cid.as_deref().is_none_or(|v| v == call_id)
+                        && filter_ftag.as_deref().is_none_or(|v| v == from_tag)
                 }
                 _ => false,
             })
@@ -99,8 +99,8 @@ impl ScriptState {
                     call_id: filter_cid,
                     from_tag: filter_ftag,
                 } => {
-                    filter_cid.as_deref().map_or(true, |v| v == call_id)
-                        && filter_ftag.as_deref().map_or(true, |v| v == from_tag)
+                    filter_cid.as_deref().is_none_or(|v| v == call_id)
+                        && filter_ftag.as_deref().is_none_or(|v| v == from_tag)
                 }
                 _ => false,
             })
@@ -117,8 +117,8 @@ impl ScriptState {
                     call_id: filter_cid,
                     from_tag: filter_ftag,
                 } => {
-                    filter_cid.as_deref().map_or(true, |v| v == call_id)
-                        && filter_ftag.as_deref().map_or(true, |v| v == from_tag)
+                    filter_cid.as_deref().is_none_or(|v| v == call_id)
+                        && filter_ftag.as_deref().is_none_or(|v| v == from_tag)
                 }
                 _ => false,
             })
@@ -136,8 +136,8 @@ impl ScriptState {
                     call_id: filter_cid,
                     from_tag: filter_ftag,
                 } => {
-                    filter_cid.as_deref().map_or(true, |v| v == call_id)
-                        && filter_ftag.as_deref().map_or(true, |v| v == from_tag)
+                    filter_cid.as_deref().is_none_or(|v| v == call_id)
+                        && filter_ftag.as_deref().is_none_or(|v| v == from_tag)
                 }
                 _ => false,
             })
@@ -155,8 +155,8 @@ impl ScriptState {
                     call_id: filter_cid,
                     from_tag: filter_ftag,
                 } => {
-                    filter_cid.as_deref().map_or(true, |v| v == call_id)
-                        && filter_ftag.as_deref().map_or(true, |v| v == from_tag)
+                    filter_cid.as_deref().is_none_or(|v| v == call_id)
+                        && filter_ftag.as_deref().is_none_or(|v| v == from_tag)
                 }
                 _ => false,
             })
@@ -174,8 +174,8 @@ impl ScriptState {
                     call_id: filter_cid,
                     from_tag: filter_ftag,
                 } => {
-                    filter_cid.as_deref().map_or(true, |v| v == call_id)
-                        && filter_ftag.as_deref().map_or(true, |v| v == from_tag)
+                    filter_cid.as_deref().is_none_or(|v| v == call_id)
+                        && filter_ftag.as_deref().is_none_or(|v| v == from_tag)
                 }
                 _ => false,
             })
@@ -193,8 +193,8 @@ impl ScriptState {
                     call_id: filter_cid,
                     from_tag: filter_ftag,
                 } => {
-                    filter_cid.as_deref().map_or(true, |v| v == call_id)
-                        && filter_ftag.as_deref().map_or(true, |v| v == from_tag)
+                    filter_cid.as_deref().is_none_or(|v| v == call_id)
+                        && filter_ftag.as_deref().is_none_or(|v| v == from_tag)
                 }
                 _ => false,
             })
@@ -212,8 +212,8 @@ impl ScriptState {
                     call_id: filter_cid,
                     from_tag: filter_ftag,
                 } => {
-                    filter_cid.as_deref().map_or(true, |v| v == call_id)
-                        && filter_ftag.as_deref().map_or(true, |v| v == from_tag)
+                    filter_cid.as_deref().is_none_or(|v| v == call_id)
+                        && filter_ftag.as_deref().is_none_or(|v| v == from_tag)
                 }
                 _ => false,
             })
@@ -231,8 +231,8 @@ impl ScriptState {
                     call_id: filter_cid,
                     from_tag: filter_ftag,
                 } => {
-                    filter_cid.as_deref().map_or(true, |v| v == call_id)
-                        && filter_ftag.as_deref().map_or(true, |v| v == from_tag)
+                    filter_cid.as_deref().is_none_or(|v| v == call_id)
+                        && filter_ftag.as_deref().is_none_or(|v| v == from_tag)
                 }
                 _ => false,
             })
@@ -249,8 +249,8 @@ impl ScriptState {
                     call_id: filter_cid,
                     from_tag: filter_ftag,
                 } => {
-                    filter_cid.as_deref().map_or(true, |v| v == call_id)
-                        && filter_ftag.as_deref().map_or(true, |v| v == from_tag)
+                    filter_cid.as_deref().is_none_or(|v| v == call_id)
+                        && filter_ftag.as_deref().is_none_or(|v| v == from_tag)
                 }
                 _ => false,
             })
