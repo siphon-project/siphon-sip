@@ -23,8 +23,13 @@ use dashmap::DashMap;
 use ipnet::IpNet;
 use tracing::{debug, error, info, warn};
 
+mod inbound_limit;
+#[cfg(test)]
+mod inbound_limit_tests;
 pub mod source;
 pub mod view;
+
+pub use inbound_limit::InboundUsage;
 
 use crate::sip::uri::SipUri;
 use crate::transport::Transport;
@@ -303,6 +308,19 @@ impl Default for ProbeConfig {
     }
 }
 
+impl From<&crate::config::GatewayProbeConfig> for ProbeConfig {
+    /// A `gateway.groups[].probe` block as the prober takes it.
+    fn from(config: &crate::config::GatewayProbeConfig) -> Self {
+        Self {
+            enabled: config.enabled,
+            interval: Duration::from_secs(u64::from(config.interval_secs)),
+            failure_threshold: config.failure_threshold,
+            from_user: config.from_user.clone(),
+            from_domain: config.from_domain.clone(),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // DispatcherGroup
 // ---------------------------------------------------------------------------
@@ -341,6 +359,12 @@ pub struct DispatcherGroup {
     /// pass would delete every group from `gateway.groups` and every one a
     /// script added with `gateway.add_group()`.
     pub origin: GroupOrigin,
+    /// `gateway.groups[].inbound_limit`, as configured. `None` = no limit.
+    inbound_limits: Option<crate::admission::InboundLimits>,
+    /// The counters that limit is enforced against, bound when the group is
+    /// registered — see [`inbound_limit`]. They belong to the group's name, not
+    /// to this object, so a refresh that rebuilds the group keeps the count.
+    inbound_state: Option<Arc<crate::admission::LimitState>>,
 }
 
 /// Who created a [`DispatcherGroup`].
@@ -367,6 +391,8 @@ impl DispatcherGroup {
             source_networks: Vec::new(),
             reroute_causes: Vec::new(),
             origin: GroupOrigin::Script,
+            inbound_limits: None,
+            inbound_state: None,
         };
         // Startup resolution — sync context, `to_socket_addrs` is fine here.
         group.refresh_member_ips();
@@ -394,6 +420,8 @@ impl DispatcherGroup {
             source_networks: Vec::new(),
             reroute_causes: Vec::new(),
             origin: GroupOrigin::Script,
+            inbound_limits: None,
+            inbound_state: None,
         };
         group.refresh_member_ips();
         group
@@ -420,6 +448,25 @@ impl DispatcherGroup {
     pub fn with_reroute_causes(mut self, causes: Vec<u16>) -> Self {
         self.reroute_causes = causes;
         self
+    }
+
+    /// Limit the calls arriving from the sources this group admits
+    /// (`gateway.groups[].inbound_limit`). Takes effect when the group is
+    /// registered with a [`DispatcherManager`].
+    pub fn with_inbound_limits(mut self, limits: Option<crate::admission::InboundLimits>) -> Self {
+        self.inbound_limits = limits.filter(crate::admission::InboundLimits::is_limited);
+        self
+    }
+
+    /// The inbound limit this group was configured with, if any.
+    pub fn inbound_limits(&self) -> Option<crate::admission::InboundLimits> {
+        self.inbound_limits
+    }
+
+    /// Calls currently up from this group's sources. `None` when the group has
+    /// no inbound limit, and so keeps no count.
+    pub fn inbound_calls_active(&self) -> Option<u32> {
+        self.inbound_state.as_ref().map(|state| state.active())
     }
 
     /// The per-group LCR reroute-cause overrides (empty = use the global set).
@@ -678,6 +725,8 @@ pub struct DispatcherManager {
     /// spawned from a thread that is not itself on the runtime — the Python
     /// executor calling `gateway.add_group()`, for one.
     prober_runtime: std::sync::OnceLock<ProberRuntime>,
+    /// Inbound call limits of the groups that have one.
+    inbound: inbound_limit::InboundLimitRegistry,
 }
 
 /// What [`spawn_health_probers`] installs so later groups can start probing.
@@ -693,15 +742,20 @@ impl DispatcherManager {
             view: Arc::new(view::GatewayView::new()),
             probers: DashMap::new(),
             prober_runtime: std::sync::OnceLock::new(),
+            inbound: inbound_limit::InboundLimitRegistry::new(),
         }
     }
 
     /// Add a group, or replace the one already registered under its name, and
     /// (re)start its health prober.
-    pub fn add_group(&self, group: DispatcherGroup) {
+    pub fn add_group(&self, mut group: DispatcherGroup) {
         let name = group.name.clone();
+        // A group replacing one of the same name takes over its counters, so
+        // the calls already up still count against the new limit.
+        group.inbound_state = self.inbound.bind(&name, group.inbound_limits);
         let group = Arc::new(group);
         self.groups.insert(name.clone(), Arc::clone(&group));
+        self.inbound.rebuild(&self.groups);
         self.republish_view();
         self.start_prober(name, &group);
     }
@@ -715,9 +769,25 @@ impl DispatcherManager {
         self.stop_prober(name);
         let removed = self.groups.remove(name).is_some();
         if removed {
+            self.inbound.forget(name);
+            self.inbound.rebuild(&self.groups);
             self.republish_view();
         }
         removed
+    }
+
+    /// The inbound limit of every group that admits `source` and has one.
+    ///
+    /// Read for every inbound INVITE: lock-free, and one atomic load when no
+    /// group has a limit. A source two limited groups admit is returned for
+    /// both, and counted against both.
+    pub fn inbound_limits_admitting(&self, source: IpAddr) -> Vec<crate::admission::GroupLimit> {
+        self.inbound.admitting(source)
+    }
+
+    /// Limits and calls up, per limited group, ordered by name.
+    pub fn inbound_usage(&self) -> Vec<InboundUsage> {
+        self.inbound.usage()
     }
 
     /// The published gateway view: every source any group admits, whichever

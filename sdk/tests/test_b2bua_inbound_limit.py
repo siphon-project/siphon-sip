@@ -232,3 +232,194 @@ def test_ending_a_call_that_never_held_a_slot_is_harmless(harness):
     harness.send_bye()
     harness.send_call_cancel()
     assert harness.inbound_calls_active == 0
+
+
+# -- gateway.groups[].inbound_limit -------------------------------------------
+
+CARRIER = "203.0.113.10"
+OTHER_CARRIER = "203.0.113.20"
+
+
+def carrier_group(harness, name="carrier-a", address=CARRIER):
+    harness.gateway.add_group(name, [
+        {"uri": f"sip:{address}:5060", "address": f"{address}:5060"},
+    ])
+
+
+def test_a_carrier_past_its_groups_limit_is_refused_in_the_groups_name(harness):
+    harness.load_source(DIAL)
+    carrier_group(harness)
+    harness.gateway.set_inbound_limit(
+        "carrier-a", max_concurrent_calls=1, reject_code=486, retry_after_secs=0
+    )
+
+    assert harness.send_invite(source_ip=CARRIER).action == "dial"
+    refused = harness.send_invite(source_ip=CARRIER)
+    assert refused.was_refused
+    assert refused.status_code == 486
+    assert refused.retry_after_secs is None
+    assert refused.refusal_scope == "gateway"
+    assert refused.refusal_gateway_group == "carrier-a"
+    assert refused.call.actions == [], "the handler never touched the call"
+    assert harness.gateway.inbound_calls_active("carrier-a") == 1
+
+
+def test_a_caller_outside_the_group_is_not_held_to_its_limit(harness):
+    harness.load_source(DIAL)
+    carrier_group(harness)
+    harness.gateway.set_inbound_limit("carrier-a", max_concurrent_calls=1)
+    harness.send_invite(source_ip=CARRIER)
+
+    for _ in range(3):
+        assert not harness.send_invite(source_ip="192.0.2.99").was_refused
+    assert harness.gateway.inbound_calls_active("carrier-a") == 1
+    assert harness.inbound_calls_active == 4
+
+
+def test_a_group_with_no_limit_keeps_no_count(harness):
+    harness.load_source(DIAL)
+    carrier_group(harness)
+    assert harness.gateway.inbound_calls_active("carrier-a") is None
+    assert not harness.send_invite(source_ip=CARRIER).was_refused
+    assert harness.gateway.inbound_calls_active("carrier-a") is None
+
+
+@pytest.mark.parametrize("ending", ["bye", "cancel", "failure"])
+def test_a_groups_slot_comes_back_when_the_call_ends(harness, ending):
+    harness.load_source(DIAL)
+    carrier_group(harness)
+    harness.gateway.set_inbound_limit("carrier-a", max_concurrent_calls=1)
+
+    call = Call(call_id="held@example.com", source_ip=CARRIER)
+    harness.send_invite(call)
+    assert harness.send_invite(source_ip=CARRIER).was_refused
+
+    if ending == "bye":
+        harness.send_bye(call)
+    elif ending == "cancel":
+        harness.send_call_cancel(call)
+    else:
+        harness.send_failure(call, 486, "Busy Here")
+
+    assert harness.gateway.inbound_calls_active("carrier-a") == 0
+    assert not harness.send_invite(source_ip=CARRIER).was_refused
+
+
+def test_the_instance_limit_still_applies_to_a_carrier_inside_its_own(harness):
+    harness.load_source(DIAL)
+    carrier_group(harness)
+    harness.gateway.set_inbound_limit("carrier-a", max_concurrent_calls=10, reject_code=486)
+    harness.set_inbound_limit(max_concurrent_calls=1)
+    harness.send_invite(source_ip="192.0.2.99")
+
+    refused = harness.send_invite(source_ip=CARRIER)
+    assert refused.was_refused
+    assert refused.refusal_scope == "global"
+    assert refused.refusal_gateway_group is None
+    assert refused.status_code == 503
+    assert harness.gateway.inbound_calls_active("carrier-a") == 0
+
+
+def test_the_groups_limit_is_judged_before_the_instances(harness):
+    harness.load_source(DIAL)
+    carrier_group(harness)
+    harness.gateway.set_inbound_limit("carrier-a", max_concurrent_calls=1, reject_code=486)
+    harness.set_inbound_limit(max_concurrent_calls=1)
+    harness.send_invite(source_ip=CARRIER)
+
+    # Both are full; the carrier is answered in its own name, with its own code.
+    refused = harness.send_invite(source_ip=CARRIER)
+    assert refused.refusal_scope == "gateway"
+    assert refused.status_code == 486
+
+
+def test_a_source_two_limited_groups_admit_is_counted_against_both(harness):
+    harness.load_source(DIAL)
+    carrier_group(harness, "wide")
+    carrier_group(harness, "narrow")
+    harness.gateway.set_inbound_limit("wide", max_concurrent_calls=2)
+    harness.gateway.set_inbound_limit("narrow", max_concurrent_calls=1)
+
+    harness.send_invite(source_ip=CARRIER)
+    assert harness.gateway.inbound_calls_active("wide") == 1
+    assert harness.gateway.inbound_calls_active("narrow") == 1
+
+    refused = harness.send_invite(source_ip=CARRIER)
+    assert refused.refusal_gateway_group == "narrow"
+    assert harness.gateway.inbound_calls_active("wide") == 1, "nothing left taken in wide"
+
+
+def test_a_groups_rate_is_its_own_and_runs_on_the_harness_clock(harness):
+    harness.load_source(DIAL)
+    carrier_group(harness)
+    carrier_group(harness, "carrier-b", OTHER_CARRIER)
+    harness.gateway.set_inbound_limit("carrier-a", max_calls_per_second=1)
+
+    assert not harness.send_invite(source_ip=CARRIER).was_refused
+    refused = harness.send_invite(source_ip=CARRIER)
+    assert refused.was_refused and refused.refusal_gateway_group == "carrier-a"
+    assert not harness.send_invite(source_ip=OTHER_CARRIER).was_refused
+
+    harness.advance_time(1.0)
+    assert not harness.send_invite(source_ip=CARRIER).was_refused
+
+
+def test_an_emergency_call_from_a_carrier_at_its_limit_is_admitted_and_counted(harness):
+    harness.load_source(DIAL)
+    carrier_group(harness)
+    harness.gateway.set_inbound_limit("carrier-a", max_concurrent_calls=1)
+    harness.send_invite(source_ip=CARRIER)
+
+    emergency = harness.send_invite(source_ip=CARRIER, ruri="urn:service:sos")
+    assert not emergency.was_refused
+    assert harness.gateway.inbound_calls_active("carrier-a") == 2
+
+
+def test_a_changed_group_limit_applies_to_the_calls_already_up(harness):
+    harness.load_source(DIAL)
+    carrier_group(harness)
+    harness.gateway.set_inbound_limit("carrier-a", max_concurrent_calls=3)
+    for _ in range(3):
+        harness.send_invite(source_ip=CARRIER)
+
+    harness.gateway.set_inbound_limit("carrier-a", max_concurrent_calls=1)
+    assert harness.gateway.inbound_calls_active("carrier-a") == 3
+    assert harness.send_invite(source_ip=CARRIER).was_refused
+
+
+def test_removing_the_group_or_its_limit_stops_the_refusals(harness):
+    harness.load_source(DIAL)
+    carrier_group(harness)
+    harness.gateway.set_inbound_limit("carrier-a", max_concurrent_calls=1)
+    harness.send_invite(source_ip=CARRIER)
+    assert harness.send_invite(source_ip=CARRIER).was_refused
+
+    harness.gateway.clear_inbound_limit("carrier-a")
+    assert not harness.send_invite(source_ip=CARRIER).was_refused
+
+    harness.gateway.set_inbound_limit("carrier-a", max_concurrent_calls=1)
+    harness.gateway.remove_group("carrier-a")
+    assert not harness.send_invite(source_ip=CARRIER).was_refused
+    assert harness.gateway.inbound_calls_active("carrier-a") is None
+
+
+def test_a_limit_on_an_unknown_group_or_with_a_bad_code_is_an_error(harness):
+    with pytest.raises(KeyError):
+        harness.gateway.set_inbound_limit("nobody", max_concurrent_calls=1)
+    carrier_group(harness)
+    with pytest.raises(ValueError, match="reject_code"):
+        harness.gateway.set_inbound_limit("carrier-a", max_concurrent_calls=1, reject_code=302)
+
+
+def test_reset_clears_group_limits_too(harness):
+    harness.load_source(DIAL)
+    carrier_group(harness)
+    harness.gateway.set_inbound_limit("carrier-a", max_concurrent_calls=1)
+    harness.send_invite(source_ip=CARRIER)
+
+    harness.reset()
+    harness.load_source(DIAL)
+    carrier_group(harness)
+    assert harness.gateway.inbound_calls_active("carrier-a") is None
+    assert not harness.send_invite(source_ip=CARRIER).was_refused
+    assert not harness.send_invite(source_ip=CARRIER).was_refused

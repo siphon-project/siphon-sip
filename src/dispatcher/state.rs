@@ -159,6 +159,10 @@ pub struct DispatcherState {
     /// INVITEs admission refused, remembered so a retransmission is answered
     /// again rather than counted again. The periodic sweep prunes it.
     pub refused_invites: Arc<crate::admission::refused::RefusedInvites>,
+    /// The gateway groups, for the inbound limit of the group an INVITE's
+    /// source belongs to (`gateway.groups[].inbound_limit`). `None` when no
+    /// `gateway:` block is configured.
+    pub gateway: Option<Arc<crate::gateway::DispatcherManager>>,
     /// Outbound registration manager (None when registrant is not configured).
     pub registrant_manager: Option<Arc<crate::registrant::RegistrantManager>>,
     /// SIPREC recording manager (SRC role — sends recordings to external SRS).

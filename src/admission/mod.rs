@@ -209,10 +209,13 @@ fn update_u64(atomic: &AtomicU64, mut next: impl FnMut(u64) -> Option<u64>) -> b
 }
 
 /// Which ceiling refused a call.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RefusalScope {
     /// The instance-wide `b2bua.inbound_limit`.
     Global,
+    /// The `inbound_limit` of the named gateway group, which admits the
+    /// caller's source address.
+    Gateway(Arc<str>),
 }
 
 impl RefusalScope {
@@ -220,6 +223,35 @@ impl RefusalScope {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Global => "global",
+            Self::Gateway(_) => "gateway",
+        }
+    }
+
+    /// The gateway group whose limit refused the call, when one did.
+    pub fn gateway_group(&self) -> Option<&str> {
+        match self {
+            Self::Global => None,
+            Self::Gateway(name) => Some(name),
+        }
+    }
+}
+
+/// One gateway group's inbound limit, as the admission check takes it: the
+/// group's name and the counters calls from it are held against.
+#[derive(Debug, Clone)]
+pub struct GroupLimit {
+    pub name: Arc<str>,
+    pub state: Arc<LimitState>,
+}
+
+impl GroupLimit {
+    fn refusal(&self, reason: RefusalReason) -> Refusal {
+        let limits = self.state.limits();
+        Refusal {
+            scope: RefusalScope::Gateway(Arc::clone(&self.name)),
+            reason,
+            reject_code: limits.reject_code,
+            retry_after_secs: limits.retry_after_secs,
         }
     }
 }
@@ -244,7 +276,7 @@ impl RefusalReason {
 }
 
 /// Why an inbound call was not admitted, and how to answer it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Refusal {
     pub scope: RefusalScope,
     pub reason: RefusalReason,
@@ -258,12 +290,23 @@ pub struct Refusal {
 /// leak one by returning early.
 #[derive(Debug)]
 pub struct AdmissionPermit {
-    global: Arc<LimitState>,
+    /// The instance-wide slot, once taken. `None` only while the permit is
+    /// being put together, so that dropping a half-built one gives back
+    /// exactly what it holds.
+    global: Option<Arc<LimitState>>,
+    /// A slot in each gateway group that admits the caller and has a limit.
+    /// Empty for most calls, and an empty `Vec` allocates nothing.
+    groups: Vec<Arc<LimitState>>,
 }
 
 impl Drop for AdmissionPermit {
     fn drop(&mut self) {
-        self.global.release_slot();
+        if let Some(global) = &self.global {
+            global.release_slot();
+        }
+        for group in &self.groups {
+            group.release_slot();
+        }
     }
 }
 
@@ -287,25 +330,74 @@ impl AdmissionController {
 
     /// Admit an inbound call arriving now, or say why not.
     pub fn admit(&self) -> Result<AdmissionPermit, Refusal> {
-        self.admit_with(Instant::now)
+        self.admit_with(&[], Instant::now)
     }
 
     /// [`admit`](Self::admit) at a stated time.
     pub fn admit_at(&self, now: Instant) -> Result<AdmissionPermit, Refusal> {
-        self.admit_with(|| now)
+        self.admit_with(&[], || now)
     }
 
-    /// The slot is taken before the rate is consulted: a slot is given back by
-    /// dropping the permit, while a place in the rate schedule cannot be
+    /// Admit an inbound call from a source the gateway groups in `groups`
+    /// admit, against each of their limits and then the instance's own.
+    pub fn admit_from(&self, groups: &[GroupLimit]) -> Result<AdmissionPermit, Refusal> {
+        self.admit_with(groups, Instant::now)
+    }
+
+    /// [`admit_from`](Self::admit_from) at a stated time.
+    pub fn admit_from_at(
+        &self,
+        groups: &[GroupLimit],
+        now: Instant,
+    ) -> Result<AdmissionPermit, Refusal> {
+        self.admit_with(groups, || now)
+    }
+
+    /// Every slot is taken before any rate is consulted: a slot is given back
+    /// by dropping the permit, while a place in a rate schedule cannot be
     /// returned, so a call refused for want of a slot must not have spent one.
-    fn admit_with(&self, now: impl FnOnce() -> Instant) -> Result<AdmissionPermit, Refusal> {
+    ///
+    /// Groups come before the instance in both passes. A carrier over its own
+    /// limit is then refused in its own name and with its own response code,
+    /// and has cost the instance nothing. The one thing that is not undone is
+    /// a group's rate, spent on a call the instance's rate then refuses.
+    fn admit_with(
+        &self,
+        groups: &[GroupLimit],
+        now: impl FnOnce() -> Instant,
+    ) -> Result<AdmissionPermit, Refusal> {
+        let mut permit = AdmissionPermit {
+            global: None,
+            groups: Vec::with_capacity(groups.len()),
+        };
+        for group in groups {
+            if !group.state.try_take_slot() {
+                return Err(group.refusal(RefusalReason::Concurrent));
+            }
+            permit.groups.push(Arc::clone(&group.state));
+        }
         if !self.global.try_take_slot() {
             return Err(self.refusal(RefusalReason::Concurrent));
         }
-        let permit = AdmissionPermit {
-            global: Arc::clone(&self.global),
+        permit.global = Some(Arc::clone(&self.global));
+
+        // One reading of the clock for every rate, taken only if one is set.
+        let mut now = Some(now);
+        let mut read: Option<Instant> = None;
+        let mut clock = || match read {
+            Some(instant) => instant,
+            None => {
+                let instant = now.take().map_or_else(Instant::now, |now| now());
+                read = Some(instant);
+                instant
+            }
         };
-        if !self.global.try_take_rate(now) {
+        for group in groups {
+            if !group.state.try_take_rate(&mut clock) {
+                return Err(group.refusal(RefusalReason::Rate));
+            }
+        }
+        if !self.global.try_take_rate(&mut clock) {
             return Err(self.refusal(RefusalReason::Rate));
         }
         Ok(permit)
@@ -314,9 +406,23 @@ impl AdmissionController {
     /// Count a call that is never refused: one siphon originated, a dialog
     /// takeover, an emergency call. It holds a slot and spends no rate.
     pub fn admit_unrefused(&self) -> AdmissionPermit {
+        self.admit_unrefused_from(&[])
+    }
+
+    /// [`admit_unrefused`](Self::admit_unrefused) for a call from a source the
+    /// gateway groups in `groups` admit. It holds a slot in each, so a group's
+    /// count stays the number of calls it has up.
+    pub fn admit_unrefused_from(&self, groups: &[GroupLimit]) -> AdmissionPermit {
         self.global.take_slot_unrefused();
         AdmissionPermit {
-            global: Arc::clone(&self.global),
+            global: Some(Arc::clone(&self.global)),
+            groups: groups
+                .iter()
+                .map(|group| {
+                    group.state.take_slot_unrefused();
+                    Arc::clone(&group.state)
+                })
+                .collect(),
         }
     }
 
@@ -557,6 +663,155 @@ mod tests {
         }
     }
 
+    fn group(name: &str, limits: InboundLimits) -> GroupLimit {
+        GroupLimit {
+            name: Arc::from(name),
+            state: Arc::new(LimitState::new(limits)),
+        }
+    }
+
+    #[test]
+    fn a_call_past_its_groups_ceiling_is_refused_in_the_groups_name() {
+        let controller = AdmissionController::unlimited();
+        let carrier = group(
+            "carrier-a",
+            InboundLimits {
+                max_concurrent_calls: 1,
+                max_calls_per_second: 0,
+                reject_code: 486,
+                retry_after_secs: 0,
+            },
+        );
+        let groups = [carrier.clone()];
+        let held = controller
+            .admit_from(&groups)
+            .expect("the group's one slot");
+        assert_eq!(carrier.state.active(), 1);
+        assert_eq!(controller.active(), 1);
+
+        let refusal = controller.admit_from(&groups).expect_err("no second slot");
+        assert_eq!(
+            refusal,
+            Refusal {
+                scope: RefusalScope::Gateway(Arc::from("carrier-a")),
+                reason: RefusalReason::Concurrent,
+                reject_code: 486,
+                retry_after_secs: 0,
+            }
+        );
+        assert_eq!(refusal.scope.gateway_group(), Some("carrier-a"));
+        assert_eq!(
+            controller.active(),
+            1,
+            "the refusal cost the instance nothing"
+        );
+
+        // A caller from no limited group is not held to that group's ceiling.
+        controller.admit().expect("another source");
+        drop(held);
+        assert_eq!(carrier.state.active(), 0);
+        controller.admit_from(&groups).expect("the freed slot");
+    }
+
+    #[test]
+    fn a_source_in_two_limited_groups_is_counted_against_both() {
+        let controller = AdmissionController::unlimited();
+        let wide = group("wide", limits(2, 0));
+        let narrow = group("narrow", limits(1, 0));
+        let both = [wide.clone(), narrow.clone()];
+
+        let held = controller.admit_from(&both).expect("a slot in each");
+        assert_eq!((wide.state.active(), narrow.state.active()), (1, 1));
+
+        let refusal = controller.admit_from(&both).expect_err("narrow is full");
+        assert_eq!(refusal.scope.gateway_group(), Some("narrow"));
+        assert_eq!(
+            wide.state.active(),
+            1,
+            "the slot taken in the first group was given back"
+        );
+        assert_eq!(controller.active(), 1);
+
+        drop(held);
+        assert_eq!((wide.state.active(), narrow.state.active()), (0, 0));
+        assert_eq!(controller.active(), 0);
+    }
+
+    #[test]
+    fn the_instance_ceiling_refuses_a_group_caller_and_returns_the_groups_slot() {
+        let controller = AdmissionController::new(limits(1, 0));
+        let carrier = group("carrier-a", limits(10, 0));
+        let groups = [carrier.clone()];
+        let _held = controller.admit().expect("the instance's one slot");
+
+        let refusal = controller
+            .admit_from(&groups)
+            .expect_err("the instance is full");
+        assert_eq!(refusal.scope, RefusalScope::Global);
+        assert_eq!(carrier.state.active(), 0);
+    }
+
+    #[test]
+    fn a_groups_rate_refuses_in_its_name_and_holds_no_slot() {
+        let controller = AdmissionController::unlimited();
+        let carrier = group("carrier-a", limits(0, 1));
+        let groups = [carrier.clone()];
+        let now = Instant::now();
+        let _held = controller
+            .admit_from_at(&groups, now)
+            .expect("the first call");
+        let refusal = controller
+            .admit_from_at(&groups, now)
+            .expect_err("over the group's rate");
+        assert_eq!(refusal.scope.gateway_group(), Some("carrier-a"));
+        assert_eq!(refusal.reason, RefusalReason::Rate);
+        assert_eq!(carrier.state.active(), 1);
+        assert_eq!(controller.active(), 1);
+        controller
+            .admit_at(now)
+            .expect("the instance has no rate and another source is not held to the group's");
+    }
+
+    #[test]
+    fn an_unrefused_call_from_a_group_is_counted_in_it() {
+        let controller = AdmissionController::new(limits(1, 0));
+        let carrier = group("carrier-a", limits(1, 0));
+        let groups = [carrier.clone()];
+        let permits: Vec<_> = (0..3)
+            .map(|_| controller.admit_unrefused_from(&groups))
+            .collect();
+        assert_eq!(carrier.state.active(), 3);
+        assert_eq!(controller.active(), 3);
+        drop(permits);
+        assert_eq!(carrier.state.active(), 0);
+        assert_eq!(controller.active(), 0);
+    }
+
+    /// The per-module leak gate for the group half: admitted, refused by the
+    /// group, refused by the instance and unrefused calls all leave both
+    /// counts where they started.
+    #[test]
+    fn group_slots_drain_to_baseline_after_complete_cycles() {
+        let controller = AdmissionController::new(limits(6, 0));
+        let first = group("first", limits(4, 0));
+        let second = group("second", limits(3, 0));
+        let both = [first.clone(), second.clone()];
+        let only_first = [first.clone()];
+        for round in 0..5_000u32 {
+            let mut held = Vec::new();
+            for _ in 0..5 {
+                held.extend(controller.admit_from(&both).ok());
+                held.extend(controller.admit_from(&only_first).ok());
+                held.extend(controller.admit().ok());
+            }
+            held.push(controller.admit_unrefused_from(&both));
+            drop(held);
+            assert_eq!(controller.active(), 0, "round {round}");
+            assert_eq!(first.state.active(), 0, "round {round}");
+            assert_eq!(second.state.active(), 0, "round {round}");
+        }
+    }
+
     #[test]
     fn a_release_never_wraps_below_zero() {
         let state = LimitState::new(InboundLimits::UNLIMITED);
@@ -596,6 +851,8 @@ mod tests {
     #[test]
     fn refusal_labels_are_stable() {
         assert_eq!(RefusalScope::Global.as_str(), "global");
+        assert_eq!(RefusalScope::Gateway(Arc::from("x")).as_str(), "gateway");
+        assert_eq!(RefusalScope::Global.gateway_group(), None);
         assert_eq!(RefusalReason::Concurrent.as_str(), "concurrent");
         assert_eq!(RefusalReason::Rate.as_str(), "rate");
     }

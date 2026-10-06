@@ -1,0 +1,38 @@
+# siphon for the gateway.groups[].inbound_limit cases: the group `carrier-a`
+# may have one call up at a time and is refused with 486, while a caller that is
+# not part of the group is not limited at all. The script is the one the
+# b2bua.inbound_limit cases use: it answers every call it is handed.
+listen:
+  udp:
+    - "0.0.0.0:5060"
+
+domain:
+  local:
+    - "siphon.test"
+    - "172.20.0.225"
+
+advertised_address: "172.20.0.225"
+
+script:
+  path: "/etc/siphon/scripts/b2bua_admission.py"
+  reload: auto
+
+gateway:
+  groups:
+    - name: "carrier-a"
+      # The carrier's two source addresses: the holder is its destination, the
+      # caller is admitted by source_networks. Neither answers OPTIONS.
+      probe:
+        enabled: false
+      source_networks:
+        - "172.20.0.227"
+      inbound_limit:
+        max_concurrent_calls: 1
+        reject_code: 486
+        retry_after_secs: 0
+      destinations:
+        - uri: "sip:172.20.0.226:5060"
+          address: "172.20.0.226:5060"
+
+log:
+  level: debug

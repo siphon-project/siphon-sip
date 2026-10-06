@@ -1,4 +1,5 @@
-//! Admission of an inbound B2BUA INVITE against `b2bua.inbound_limit`.
+//! Admission of an inbound B2BUA INVITE against `b2bua.inbound_limit` and the
+//! `inbound_limit` of every gateway group its source belongs to.
 //!
 //! Runs before a call or a script exists. A refused INVITE is answered here,
 //! statelessly like every other pre-script rejection on this path, and gets a
@@ -38,11 +39,18 @@ pub(in crate::dispatcher) fn admit_inbound_invite(
         return None;
     }
 
+    // The limits of the gateway groups the caller's address belongs to. Empty,
+    // without allocating, unless a group that admits it has one.
+    let groups = match &state.gateway {
+        Some(gateway) => gateway.inbound_limits_admitting(inbound.remote_addr.ip()),
+        None => Vec::new(),
+    };
+
     if takes_over_dialog || is_emergency_call(message) {
-        return Some(state.admission.admit_unrefused());
+        return Some(state.admission.admit_unrefused_from(&groups));
     }
 
-    match state.admission.admit() {
+    match state.admission.admit_from(&groups) {
         Ok(permit) => Some(permit),
         Err(refusal) => {
             let answer = RefusedAnswer {
@@ -52,6 +60,7 @@ pub(in crate::dispatcher) fn admit_inbound_invite(
             debug!(
                 call_id = %call_id,
                 scope = refusal.scope.as_str(),
+                gateway_group = refusal.scope.gateway_group().unwrap_or_default(),
                 reason = refusal.reason.as_str(),
                 code = refusal.reject_code,
                 "B2BUA: refusing INVITE — inbound limit reached"
@@ -59,7 +68,7 @@ pub(in crate::dispatcher) fn admit_inbound_invite(
             state
                 .refused_invites
                 .remember(call_id, via_branch, answer, std::time::Instant::now());
-            crate::metrics::admission::record_refusal(refusal.reason);
+            crate::metrics::admission::record_refusal(&refusal);
             write_refusal_cdr(inbound, message, &refusal);
             send_refusal(inbound, message, answer, state);
             None
@@ -141,7 +150,7 @@ fn write_refusal_cdr(inbound: &InboundMessage, message: &SipMessage, refusal: &R
     ) else {
         return;
     };
-    session.merge_extra(&std::collections::HashMap::from([
+    let mut extra = std::collections::HashMap::from([
         (
             "refusal_scope".to_string(),
             refusal.scope.as_str().to_string(),
@@ -150,6 +159,10 @@ fn write_refusal_cdr(inbound: &InboundMessage, message: &SipMessage, refusal: &R
             "refusal_reason".to_string(),
             refusal.reason.as_str().to_string(),
         ),
-    ]));
+    ]);
+    if let Some(group) = refusal.scope.gateway_group() {
+        extra.insert("gateway_group".to_string(), group.to_string());
+    }
+    session.merge_extra(&extra);
     crate::cdr::write(session.finalize(DISCONNECT_LOCAL, Some(refusal.reject_code), None));
 }

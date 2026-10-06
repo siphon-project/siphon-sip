@@ -1296,6 +1296,72 @@ jobs:
         if: always()
         run: docker compose -f sipp/docker-compose.yaml --profile b2bua-admission down --remove-orphans 2>/dev/null || true
 
+  # ── Gateway group inbound limit ──────────────────────────────────────────
+  # gateway.groups[].inbound_limit caps the calls arriving from one group's
+  # sources. The group here may have one call up and answers a second with 486.
+  # The carrier's second call is refused and then admitted once its first has
+  # ended; a caller in no group is answered while the carrier is at its ceiling.
+  # The script logs one line per call it saw, and the last step counts them.
+  sipp-b2bua-admission-gateway:
+    runs-on: ubuntu-latest
+    needs: build-image
+    env:
+      SIPP_PROFILE: b2bua-admission-gateway
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Load the siphon image
+        uses: ./.github/actions/load-siphon-image
+
+      - name: Start siphon-b2bua-admission-gateway
+        run: docker compose -f sipp/docker-compose.yaml --profile b2bua-admission-gateway up -d --wait siphon-b2bua-admission-gateway
+
+      - name: A carrier past its group's limit is refused 486, and admitted once the slot is free
+        env:
+          SIPP_CALLER: sipp-b2bua-admission-gateway-carrier-uac
+        run: bash sipp/b2bua-fork/run_case.sh refused b2bua_admission_gateway_refused_uac.xml sipp-b2bua-admission-gateway-holder-uac
+
+      - name: A caller outside the group is answered while the carrier is at its limit
+        env:
+          SIPP_CALLER: sipp-b2bua-admission-gateway-outsider-uac
+        run: bash sipp/b2bua-fork/run_case.sh outsider b2bua_admission_outsider_uac.xml sipp-b2bua-admission-gateway-holder-uac
+
+      - name: The refused call never reached the script
+        run: |
+          logs="$(docker logs siphon-b2bua-admission-gateway 2>&1)"
+          refused="$(grep -c 'ADMITTED sip:refused@' <<<"$logs" || true)"
+          if [ "$refused" != "0" ]; then
+            echo "@b2bua.on_invite ran for the refused call"
+            grep 'ADMITTED ' <<<"$logs" || true
+            exit 1
+          fi
+          for expected in "sip:holder@ 2" "sip:admitted@ 1" "sip:outsider@ 1"; do
+            ruri="${expected% *}"
+            want="${expected#* }"
+            count="$(grep -c "ADMITTED $ruri" <<<"$logs" || true)"
+            if [ "$count" != "$want" ]; then
+              echo "expected $want 'ADMITTED $ruri' lines, got $count"
+              grep 'ADMITTED ' <<<"$logs" || true
+              exit 1
+            fi
+          done
+
+      - name: Collect siphon logs
+        if: always()
+        run: docker logs siphon-b2bua-admission-gateway > siphon-b2bua-admission-gateway.log 2>&1 || true
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: sipp-b2bua-admission-gateway-logs
+          path: siphon-b2bua-admission-gateway.log
+          if-no-files-found: ignore
+
+      - name: Teardown
+        if: always()
+        run: docker compose -f sipp/docker-compose.yaml --profile b2bua-admission-gateway down --remove-orphans 2>/dev/null || true
+
   # ── B2BUA LCR route sequence ────────────────────────────────────────────
   # call.route() over the carriers a mock LCR API returns (sipp/b2bua-lcr/),
   # each sent the caller's numbers reshaped by the route's number policy.

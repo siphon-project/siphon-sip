@@ -470,11 +470,42 @@ def test_a_refused_call_record_names_the_refusal():
 
     assert record.is_refused is True
     assert record.refusal_scope == "global"
+    assert record.refusal_gateway_group is None
     assert record.refusal_reason == "concurrent"
     assert record.disconnect_initiator == "local"
     assert record.answered is False
     assert record.extra == {"refusal_scope": "global", "refusal_reason": "concurrent"}
     assert CallDetailRecord.from_dict(record.to_dict()) == record
+
+
+def test_a_call_a_gateway_groups_limit_refused_names_the_group():
+    payload = call_record()
+    payload.update(
+        {
+            "response_code": 486,
+            "timestamp_answer": None,
+            "duration_secs": 0.0,
+            "disconnect_initiator": "local",
+            "refusal_scope": "gateway",
+            "refusal_reason": "rate",
+            "gateway_group": "carrier-a",
+        }
+    )
+    record = CallDetailRecord.from_dict(payload)
+
+    assert record.is_refused is True
+    assert record.refusal_scope == "gateway"
+    assert record.refusal_gateway_group == "carrier-a"
+    assert record.refusal_reason == "rate"
+
+
+def test_a_gateway_group_field_on_a_call_that_was_not_refused_is_not_a_refusal():
+    # `gateway_group` is also what an LCR route stamps on an ordinary call.
+    payload = call_record()
+    payload["gateway_group"] = "carrier-a"
+    record = CallDetailRecord.from_dict(payload)
+    assert record.is_refused is False
+    assert record.refusal_gateway_group is None
 
 
 def test_an_ordinary_call_record_is_not_a_refusal():

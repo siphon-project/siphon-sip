@@ -34,6 +34,8 @@ SIPhon exports built-in gauges/counters; the ones worth alerting on:
 | `siphon_gateway_source_failures_total` | sustained `rate() > 0` | Reads are failing now; the timestamp above says for how long |
 | `siphon_b2bua_inbound_calls_refused_total{reason}` | sustained `rate() > 0` | Inbound calls are being turned away at `b2bua.inbound_limit`. `reason="concurrent"` is the instance full, `reason="rate"` is a burst arriving faster than `max_calls_per_second` |
 | `siphon_b2bua_calls_active` / `siphon_b2bua_max_concurrent_calls` | ratio above your headroom, e.g. `> 0.8` | Capacity is running out before calls are refused. The limit gauge reads `0` when no ceiling is set, so guard the division |
+| `siphon_gateway_inbound_calls_refused_total{group,reason}` | sustained `rate() > 0` | A carrier is being turned away at its group's `inbound_limit`. Either it is sending more than was agreed, or the limit is set below what was |
+| `siphon_gateway_inbound_calls_active{group}` / `siphon_gateway_inbound_max_concurrent_calls{group}` | ratio above your headroom | A carrier is close to its ceiling. Only groups with an `inbound_limit` have these series, and they are refreshed every 30 s |
 | `siphon_registrant_source_last_success_timestamp_seconds` / `_failures_total` | same pair | Outbound trunk registrations, tracked separately — a node can route over stale carriers with current registrations, or the reverse |
 
 See [Handler execution model](../handler-execution-model.md) for the pool internals.

@@ -487,13 +487,7 @@ pub(super) async fn init_gateway(config: &Config) -> Option<Arc<DispatcherManage
             destinations.push(dest);
         }
 
-        let probe = ProbeConfig {
-            enabled: group_config.probe.enabled,
-            interval: std::time::Duration::from_secs(group_config.probe.interval_secs as u64),
-            failure_threshold: group_config.probe.failure_threshold,
-            from_user: group_config.probe.from_user.clone(),
-            from_domain: group_config.probe.from_domain.clone(),
-        };
+        let probe = ProbeConfig::from(&group_config.probe);
 
         // Static source CIDR membership (for from_gateway) — peers that source
         // SIP from a whole published subnet, not only their FQDN-resolved IPs.
@@ -518,6 +512,7 @@ pub(super) async fn init_gateway(config: &Config) -> Option<Arc<DispatcherManage
                 .with_probe_config(probe)
                 .with_source_networks(source_networks)
                 .with_reroute_causes(group_config.reroute_causes.clone())
+                .with_inbound_limits(group_config.resolved_inbound_limits())
                 .from_yaml(),
         );
     }

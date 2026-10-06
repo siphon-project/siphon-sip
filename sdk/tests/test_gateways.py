@@ -37,6 +37,10 @@ def test_absent_optionals_are_omitted_not_null():
         "probe_failure_threshold",
         "probe_from_user",
         "probe_from_domain",
+        "inbound_max_concurrent_calls",
+        "inbound_max_calls_per_second",
+        "inbound_reject_code",
+        "inbound_retry_after_secs",
     ):
         assert absent not in encoded
     # Empty collections are omitted too, matching skip_serializing_if.
@@ -64,8 +68,47 @@ def test_round_trip_preserves_every_field():
         probe_failure_threshold=5,
         probe_from_user="edge",
         probe_from_domain="sbc.example.com",
+        inbound_max_concurrent_calls=300,
+        inbound_max_calls_per_second=30,
+        inbound_reject_code=486,
+        inbound_retry_after_secs=5,
     )
     assert GatewayRow.from_dict(original.to_dict()) == original
+
+
+def test_the_inbound_limit_fields_use_the_names_siphon_reads():
+    encoded = row(
+        inbound_max_concurrent_calls=300,
+        inbound_max_calls_per_second=30,
+        inbound_reject_code=486,
+    ).to_dict()
+    assert encoded["inbound_max_concurrent_calls"] == 300
+    assert encoded["inbound_max_calls_per_second"] == 30
+    assert encoded["inbound_reject_code"] == 486
+    assert "inbound_retry_after_secs" not in encoded
+
+
+def test_a_zero_retry_after_is_sent_not_omitted():
+    # 0 is the value that turns the header off; dropping it as "falsy" would
+    # leave the default of one second in force.
+    encoded = row(inbound_max_concurrent_calls=10, inbound_retry_after_secs=0).to_dict()
+    assert encoded["inbound_retry_after_secs"] == 0
+
+
+def test_the_row_fields_mirror_the_rust_struct():
+    """Every `inbound_*` field of the Rust `GatewayRow` exists here, and no
+    more: a drift is a wire-contract break."""
+    import dataclasses
+    import re
+    from pathlib import Path
+
+    source = (Path(__file__).resolve().parents[2] / "src/gateway/source.rs").read_text()
+    struct = source[source.index("pub struct GatewayRow {"):]
+    struct = struct[: struct.index("\n}\n")]
+    rust = set(re.findall(r"pub (inbound_\w+):", struct))
+    python = {f.name for f in dataclasses.fields(GatewayRow) if f.name.startswith("inbound_")}
+    assert rust == python
+    assert len(rust) == 4
 
 
 def test_probe_false_is_sent_not_omitted():
