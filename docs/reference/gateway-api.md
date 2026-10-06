@@ -83,6 +83,10 @@ destination; rows are gathered into groups by `group`.
 | `probe_failure_threshold` | int | `3` | Group-wide: failed probes before a destination is marked down |
 | `probe_from_user` | string | `"siphon"` | Group-wide: user part of the probe's `From` |
 | `probe_from_domain` | string | local address | Group-wide: host part of the probe's `From` |
+| `inbound_max_concurrent_calls` | int | unlimited | Group-wide: calls up at once from this group's sources ([inbound limit](#inbound-limit)) |
+| `inbound_max_calls_per_second` | int | unlimited | Group-wide: new calls per second from this group's sources |
+| `inbound_reject_code` | int | `503` | Group-wide: status a call past either ceiling gets; outside 400-699 is refused |
+| `inbound_retry_after_secs` | int | `1` | Group-wide: `Retry-After` on that answer; `0` omits it |
 | `username` | string | — | Digest username this destination challenges with |
 | `password` | string | — | Plaintext password. Supply this **or** `ha1` |
 | `ha1` | string | — | `H(username:realm:password)` hex |
@@ -123,6 +127,40 @@ exactly like a carrier that is down.
   exactly as for a `gateway.groups` entry with `probe.enabled: false`. Its
   membership for `from_gateway()` is re-resolved on the kernel allow set's floor
   tick when [that set](../kernel-firewall.md#gateway-allow-set) is on.
+
+## Inbound limit
+
+The `inbound_*` fields are the row form of a `gateway.groups` entry's
+`inbound_limit:` block. They cap the calls arriving **from** the group, in
+B2BUA mode: from the addresses its destinations resolve to plus
+`source_networks`, which is the membership `from_gateway()` answers from.
+Like the `probe_*` fields they are group-wide, each taken from the first row of
+the group that carries it.
+
+```json
+{"group": "carrier-a", "uri": "sip:gw1.carrier.example:5060",
+ "inbound_max_concurrent_calls": 300, "inbound_max_calls_per_second": 30,
+ "inbound_reject_code": 486}
+```
+
+A group whose rows set neither ceiling has no limit. A call past one is
+answered before `@b2bua.on_invite` runs, so no handler sees it; see
+[Limiting inbound calls](call.md#limiting-inbound-calls-b2buainbound_limit)
+for what is refused, what is exempt and what records it.
+
+- **A change keeps the count.** Changing an `inbound_*` field replaces the
+  group, but the calls already up from it stay counted against the new limit.
+  Lowering a ceiling below what is up ends no call; it refuses new ones until
+  enough have ended.
+- **Removing the fields removes the limit**, and removing the group forgets its
+  count. Calls still up at that moment finish normally.
+- **A bad `inbound_reject_code` refuses the row**, like a zero probe interval,
+  and counts in the reconcile's `rejected`.
+- **The count is per siphon instance.** N nodes reading the same source each
+  allow the full figure.
+
+With `security.trust_gateways` on, a provisioned carrier is exempt from the
+rate limiter, so this is the only throttle on it.
 
 ## Exempting provisioned carriers from abuse controls
 

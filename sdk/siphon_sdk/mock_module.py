@@ -5292,6 +5292,63 @@ class MockDestination:
         return self.healthy
 
 
+class InboundLimit:
+    """One inbound call limit and the calls held against it — the harness's
+    model of ``b2bua.inbound_limit`` and of a gateway group's
+    ``inbound_limit``.
+
+    Test-side state, not part of the ``siphon`` script API: a script cannot
+    read or change a limit. Tests set one with
+    :meth:`siphon_sdk.testing.SipTestHarness.set_inbound_limit` or
+    :meth:`MockGateway.set_inbound_limit`.
+    """
+
+    def __init__(
+        self,
+        max_concurrent_calls: Optional[int] = None,
+        max_calls_per_second: Optional[int] = None,
+        reject_code: int = 503,
+        retry_after_secs: int = 1,
+    ) -> None:
+        if not 400 <= reject_code <= 699:
+            raise ValueError(
+                f"reject_code is {reject_code} — it must be a failure response, 400 to 699."
+            )
+        self.max_concurrent_calls: int = max_concurrent_calls or 0
+        self.max_calls_per_second: int = max_calls_per_second or 0
+        self.reject_code: int = reject_code
+        self.retry_after_secs: int = retry_after_secs
+        self.calls: set[str] = set()
+        self._arrival: float = 0.0
+
+    @property
+    def active(self) -> int:
+        """Calls currently holding a slot."""
+        return len(self.calls)
+
+    def has_slot(self) -> bool:
+        """Whether one more call fits under ``max_concurrent_calls``."""
+        return not self.max_concurrent_calls or len(self.calls) < self.max_concurrent_calls
+
+    def take_rate(self, clock: float) -> bool:
+        """Whether a call arriving at ``clock`` conforms to the rate, spending
+        its place in the schedule if it does.
+
+        The generic cell rate algorithm siphon uses: a call conforms while the
+        next due time is no further ahead than the burst, which is one second's
+        worth of calls.
+        """
+        rate = self.max_calls_per_second
+        if not rate:
+            return True
+        interval = 1.0 / rate
+        tolerance = interval * (rate - 1)
+        if self._arrival > clock + tolerance + 1e-9:
+            return False
+        self._arrival = max(self._arrival, clock) + interval
+        return True
+
+
 class MockGateway:
     """Mock gateway namespace — manages named groups of SIP destinations.
 
@@ -5314,6 +5371,95 @@ class MockGateway:
         self._groups: dict[str, list[MockDestination]] = {}
         self._algorithms: dict[str, str] = {}
         self._counters: dict[str, int] = {}
+        self._inbound_limits: dict[str, InboundLimit] = {}
+
+    # -- inbound limit (gateway.groups[].inbound_limit) — test-side ----------
+
+    def set_inbound_limit(
+        self,
+        group_name: str,
+        max_concurrent_calls: Optional[int] = None,
+        max_calls_per_second: Optional[int] = None,
+        reject_code: int = 503,
+        retry_after_secs: int = 1,
+    ) -> None:
+        """Give a group the inbound limit siphon enforces for::
+
+            gateway:
+              groups:
+                - name: "carrier-a"
+                  inbound_limit:
+                    max_concurrent_calls: 300
+                    max_calls_per_second: 30
+                    reject_code: 486
+
+        **Test-side, not a script API.** The limit is configuration
+        (``siphon.yaml``, or the ``inbound_*`` fields of a provisioned
+        :class:`siphon_sdk.gateways.GatewayRow`); ``gateway.add_group()`` in a
+        script cannot set one.
+
+        It caps the calls arriving *from* the group — from a source address
+        :meth:`contains_source` calls a member — in B2BUA mode. With it set,
+        :meth:`siphon_sdk.testing.SipTestHarness.send_invite` refuses a call
+        from such a source once the group is at its ceiling, **before**
+        ``@b2bua.on_invite`` runs, and before the instance-wide limit is
+        consulted. A source two limited groups admit is counted against both.
+        Calls *to* the group are not counted.
+
+        Example::
+
+            harness.gateway.add_group("carrier-a", [
+                {"uri": "sip:gw1.carrier.example", "address": "203.0.113.10:5060"},
+            ])
+            harness.gateway.set_inbound_limit("carrier-a", max_concurrent_calls=1)
+            harness.send_invite(source_ip="203.0.113.10")
+            refused = harness.send_invite(source_ip="203.0.113.10")
+            assert refused.was_refused
+            assert refused.refusal_gateway_group == "carrier-a"
+
+        Args:
+            group_name: A group added with :meth:`add_group`.
+            max_concurrent_calls: Calls up at once. ``None`` or ``0`` is
+                unlimited.
+            max_calls_per_second: New calls per second, with a burst of one
+                second's worth. ``None`` or ``0`` is unlimited.
+            reject_code: Status a refused call is answered with (400-699).
+            retry_after_secs: ``Retry-After`` on the refusal; ``0`` omits it.
+
+        Raises:
+            KeyError: No group of that name.
+            ValueError: ``reject_code`` is not a failure response.
+        """
+        if group_name not in self._groups:
+            raise KeyError(f"no gateway group named {group_name!r}")
+        limit = InboundLimit(
+            max_concurrent_calls, max_calls_per_second, reject_code, retry_after_secs
+        )
+        # A changed limit applies to the calls already up, as it does in siphon.
+        existing = self._inbound_limits.get(group_name)
+        if existing is not None:
+            limit.calls = existing.calls
+        self._inbound_limits[group_name] = limit
+
+    def clear_inbound_limit(self, group_name: str) -> None:
+        """Remove a group's inbound limit (test helper)."""
+        self._inbound_limits.pop(group_name, None)
+
+    def inbound_calls_active(self, group_name: str) -> Optional[int]:
+        """Calls up from the group's sources — what siphon reports as
+        ``siphon_gateway_inbound_calls_active{group}``. ``None`` for a group
+        with no inbound limit, which keeps no count."""
+        limit = self._inbound_limits.get(group_name)
+        return limit.active if limit is not None else None
+
+    def inbound_limits_admitting(self, source_ip: str) -> "list[tuple[str, InboundLimit]]":
+        """The limit of every limited group that admits ``source_ip``, by group
+        name. What the harness holds an inbound call to (test helper)."""
+        return [
+            (name, self._inbound_limits[name])
+            for name in sorted(self._inbound_limits)
+            if self.contains_source(name, source_ip)
+        ]
 
     def select(
         self,
@@ -5488,6 +5634,7 @@ class MockGateway:
             del self._groups[name]
             self._algorithms.pop(name, None)
             self._counters.pop(name, None)
+            self._inbound_limits.pop(name, None)
             return True
         return False
 
@@ -5520,6 +5667,7 @@ class MockGateway:
         self._groups.clear()
         self._algorithms.clear()
         self._counters.clear()
+        self._inbound_limits.clear()
 
 
 # ---------------------------------------------------------------------------

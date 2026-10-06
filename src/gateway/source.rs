@@ -101,6 +101,23 @@ pub struct GatewayRow {
     /// is otherwise indistinguishable from a carrier that is down.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub probe_from_domain: Option<String>,
+    /// Ceiling on the calls up at once from the sources this group admits.
+    /// Group-wide, like every `inbound_*` field: each is taken from the first
+    /// row that carries it. Absent or `0` is unlimited. Enforced in B2BUA mode,
+    /// on the inbound INVITE, before the script runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inbound_max_concurrent_calls: Option<u32>,
+    /// Ceiling on new calls per second from this group's sources, with a burst
+    /// of one second's worth. Absent or `0` is unlimited.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inbound_max_calls_per_second: Option<u32>,
+    /// Status code a call past either ceiling is answered with. Default `503`;
+    /// anything outside 400-699 is refused as a row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inbound_reject_code: Option<u16>,
+    /// `Retry-After` on that answer, in seconds. Default `1`; `0` omits it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inbound_retry_after_secs: Option<u32>,
     /// Digest username this destination challenges with.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub username: Option<String>,
@@ -229,7 +246,57 @@ pub struct DesiredGroup {
     pub algorithm: Algorithm,
     pub source_networks: Vec<String>,
     pub probe: DesiredProbe,
+    pub inbound_limit: DesiredInboundLimit,
     pub destinations: Vec<DesiredDestination>,
+}
+
+/// The group's `inbound_*` fields as the rows gave them, each from the first
+/// row that carries it. A group whose rows set neither ceiling has no limit.
+#[derive(Debug, Clone, Default)]
+pub struct DesiredInboundLimit {
+    max_concurrent_calls: Option<u32>,
+    max_calls_per_second: Option<u32>,
+    reject_code: Option<u16>,
+    retry_after_secs: Option<u32>,
+}
+
+impl DesiredInboundLimit {
+    fn of(row: &GatewayRow) -> Self {
+        Self {
+            max_concurrent_calls: row.inbound_max_concurrent_calls,
+            max_calls_per_second: row.inbound_max_calls_per_second,
+            reject_code: row.inbound_reject_code,
+            retry_after_secs: row.inbound_retry_after_secs,
+        }
+    }
+
+    /// Fill whatever this group has not set yet from a later row.
+    fn fill_from(&mut self, row: &GatewayRow) {
+        self.max_concurrent_calls = self
+            .max_concurrent_calls
+            .or(row.inbound_max_concurrent_calls);
+        self.max_calls_per_second = self
+            .max_calls_per_second
+            .or(row.inbound_max_calls_per_second);
+        self.reject_code = self.reject_code.or(row.inbound_reject_code);
+        self.retry_after_secs = self.retry_after_secs.or(row.inbound_retry_after_secs);
+    }
+
+    /// The limit to enforce, or `None` when no ceiling is set.
+    pub fn limits(&self) -> Option<crate::admission::InboundLimits> {
+        use crate::admission::InboundLimits;
+        Some(InboundLimits {
+            max_concurrent_calls: self.max_concurrent_calls.unwrap_or(0),
+            max_calls_per_second: self.max_calls_per_second.unwrap_or(0),
+            reject_code: self
+                .reject_code
+                .unwrap_or(InboundLimits::DEFAULT_REJECT_CODE),
+            retry_after_secs: self
+                .retry_after_secs
+                .unwrap_or(InboundLimits::DEFAULT_RETRY_AFTER_SECS),
+        })
+        .filter(InboundLimits::is_limited)
+    }
 }
 
 /// The group's `probe_*` fields as the rows gave them, each from the first row
@@ -316,6 +383,7 @@ pub fn group_rows(rows: &[GatewayRow]) -> (Vec<DesiredGroup>, usize) {
                     group.source_networks = row.source_networks.clone();
                 }
                 group.probe.fill_from(row);
+                group.inbound_limit.fill_from(row);
                 group.destinations.push(destination);
             }
             None => groups.push(DesiredGroup {
@@ -327,6 +395,7 @@ pub fn group_rows(rows: &[GatewayRow]) -> (Vec<DesiredGroup>, usize) {
                     .unwrap_or(Algorithm::Weighted),
                 source_networks: row.source_networks.clone(),
                 probe: DesiredProbe::of(row),
+                inbound_limit: DesiredInboundLimit::of(row),
                 destinations: vec![destination],
             }),
         }
@@ -380,6 +449,16 @@ fn desired_destination(row: &GatewayRow) -> Result<DesiredDestination, String> {
     // group's prober task and leave the group looking probed.
     if row.probe_interval_secs == Some(0) {
         return Err("`probe_interval_secs` must be at least 1".to_string());
+    }
+
+    // A refusal is a final failure response (RFC 3261 §21): a 2xx or 3xx here
+    // would answer or redirect the call the limit exists to turn away.
+    if let Some(code) = row.inbound_reject_code {
+        if !(400..=699).contains(&code) {
+            return Err(format!(
+                "`inbound_reject_code` is {code}; it must be a failure response, 400 to 699"
+            ));
+        }
     }
 
     if row.require_registration && row.registers.is_none() {
@@ -524,10 +603,12 @@ fn apply_rows(manager: &Arc<DispatcherManager>, rows: &[GatewayRow]) -> Reconcil
             .filter_map(|spec| super::parse_source_network(spec))
             .collect();
         let probe = group.probe.config();
+        let inbound_limits = group.inbound_limit.limits();
         let group_changed = live_group.as_ref().is_some_and(|existing| {
             existing.algorithm != group.algorithm
                 || existing.source_networks != source_networks
                 || existing.probe_config != probe
+                || existing.inbound_limits() != inbound_limits
         });
 
         if existed && !changed && !group_changed {
@@ -563,6 +644,9 @@ fn apply_rows(manager: &Arc<DispatcherManager>, rows: &[GatewayRow]) -> Reconcil
             DispatcherGroup::from_existing(group.name.clone(), group.algorithm, destinations)
                 .with_probe_config(probe)
                 .with_source_networks(source_networks)
+                // The manager keeps the group's call count by name, so a limit
+                // changed here applies to the calls already up.
+                .with_inbound_limits(inbound_limits)
                 .from_source(),
         );
 
@@ -927,6 +1011,16 @@ mod postgres {
                 .map(|value| value.clamp(0, i64::from(u32::MAX)) as u32),
             probe_from_user: text(row, "probe_from_user"),
             probe_from_domain: text(row, "probe_from_domain"),
+            inbound_max_concurrent_calls: integer(row, "inbound_max_concurrent_calls")
+                .map(|value| value.clamp(0, i64::from(u32::MAX)) as u32),
+            inbound_max_calls_per_second: integer(row, "inbound_max_calls_per_second")
+                .map(|value| value.clamp(0, i64::from(u32::MAX)) as u32),
+            // Clamped into range of the type, not of the rule: an out-of-range
+            // code reaches the row check and is refused there, not defaulted.
+            inbound_reject_code: integer(row, "inbound_reject_code")
+                .map(|value| value.clamp(0, i64::from(u16::MAX)) as u16),
+            inbound_retry_after_secs: integer(row, "inbound_retry_after_secs")
+                .map(|value| value.clamp(0, i64::from(u32::MAX)) as u32),
         }
     }
 
@@ -1012,6 +1106,10 @@ mod tests {
             probe_failure_threshold: None,
             probe_from_user: None,
             probe_from_domain: None,
+            inbound_max_concurrent_calls: None,
+            inbound_max_calls_per_second: None,
+            inbound_reject_code: None,
+            inbound_retry_after_secs: None,
         }
     }
 
@@ -1494,7 +1592,176 @@ mod tests {
         assert_eq!(manager.prober_count(), 1);
     }
 
+    // --- Inbound limit ---
+
+    fn limited_row(max_concurrent_calls: u32) -> GatewayRow {
+        let mut limited = row("carriers", "sip:gw1.carrier.example:5060");
+        limited.inbound_max_concurrent_calls = Some(max_concurrent_calls);
+        limited
+    }
+
+    /// The address `row()` gives its destination, which is what makes a caller
+    /// a member of the group.
+    fn carrier_source() -> std::net::IpAddr {
+        "203.0.113.10".parse().expect("a literal address")
+    }
+
+    #[test]
+    fn a_source_that_sets_no_inbound_field_provisions_no_limit() {
+        let manager = manager();
+        apply_rows(&manager, &[row("carriers", "sip:gw1.carrier.example:5060")]);
+        let group = manager.get_group("carriers").expect("group");
+        assert_eq!(group.inbound_limits(), None);
+        assert!(manager
+            .inbound_limits_admitting(carrier_source())
+            .is_empty());
+    }
+
+    #[test]
+    fn the_inbound_fields_provision_the_groups_limit_with_the_defaults_filled_in() {
+        let manager = manager();
+        apply_rows(&manager, &[limited_row(300)]);
+        assert_eq!(
+            manager
+                .get_group("carriers")
+                .expect("group")
+                .inbound_limits(),
+            Some(crate::admission::InboundLimits {
+                max_concurrent_calls: 300,
+                max_calls_per_second: 0,
+                reject_code: 503,
+                retry_after_secs: 1,
+            })
+        );
+        assert_eq!(manager.inbound_limits_admitting(carrier_source()).len(), 1);
+    }
+
+    #[test]
+    fn each_inbound_field_comes_from_the_first_row_that_carries_it() {
+        let mut first = row("carriers", "sip:gw1.carrier.example:5060");
+        first.inbound_max_concurrent_calls = Some(300);
+        let mut second = row("carriers", "sip:gw2.carrier.example:5060");
+        second.inbound_max_concurrent_calls = Some(999);
+        second.inbound_max_calls_per_second = Some(30);
+        second.inbound_reject_code = Some(486);
+        second.inbound_retry_after_secs = Some(0);
+
+        let (groups, rejected) = group_rows(&[first, second]);
+        assert_eq!(rejected, 0);
+        assert_eq!(
+            groups[0].inbound_limit.limits(),
+            Some(crate::admission::InboundLimits {
+                max_concurrent_calls: 300,
+                max_calls_per_second: 30,
+                reject_code: 486,
+                retry_after_secs: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn a_reject_code_with_no_ceiling_is_no_limit() {
+        let mut only_code = row("carriers", "sip:gw1.carrier.example:5060");
+        only_code.inbound_reject_code = Some(486);
+        let (groups, _) = group_rows(&[only_code]);
+        assert_eq!(groups[0].inbound_limit.limits(), None);
+    }
+
+    #[test]
+    fn a_row_whose_reject_code_is_not_a_failure_response_is_refused() {
+        for code in [200, 302, 399, 700] {
+            let mut bad = limited_row(10);
+            bad.inbound_reject_code = Some(code);
+            let (groups, rejected) = group_rows(&[bad]);
+            assert_eq!(rejected, 1, "{code}");
+            assert!(groups.is_empty(), "{code}");
+        }
+    }
+
+    #[test]
+    fn an_unchanged_inbound_limit_leaves_the_group_alone() {
+        let manager = manager();
+        let rows = [limited_row(300)];
+        apply_rows(&manager, &rows);
+        let first = manager.get_group("carriers").expect("group");
+        assert_eq!(apply_rows(&manager, &rows), ReconcileReport::default());
+        assert!(Arc::ptr_eq(
+            &first,
+            &manager.get_group("carriers").expect("group")
+        ));
+    }
+
+    /// A limit changed at the source replaces the group, and the calls that
+    /// were up before the reconcile are still counted after it.
+    #[test]
+    fn a_changed_inbound_limit_replaces_the_group_and_keeps_the_calls_that_are_up() {
+        let manager = manager();
+        let controller = crate::admission::AdmissionController::unlimited();
+        apply_rows(&manager, &[limited_row(2)]);
+        let before = manager.get_group("carriers").expect("group");
+        let _held: Vec<_> = (0..2)
+            .map(|_| {
+                controller
+                    .admit_from(&manager.inbound_limits_admitting(carrier_source()))
+                    .expect("a slot")
+            })
+            .collect();
+
+        assert_eq!(apply_rows(&manager, &[limited_row(3)]).updated, 1);
+        let after = manager.get_group("carriers").expect("group");
+        assert!(!Arc::ptr_eq(&before, &after));
+        assert_eq!(after.inbound_calls_active(), Some(2));
+
+        let limits = manager.inbound_limits_admitting(carrier_source());
+        let _third = controller.admit_from(&limits).expect("the raised ceiling");
+        controller
+            .admit_from(&limits)
+            .expect_err("three are up and the ceiling is three");
+    }
+
+    #[test]
+    fn a_limit_removed_at_the_source_stops_being_enforced() {
+        let manager = manager();
+        apply_rows(&manager, &[limited_row(1)]);
+        assert_eq!(
+            apply_rows(&manager, &[row("carriers", "sip:gw1.carrier.example:5060")]).updated,
+            1
+        );
+        assert!(manager
+            .inbound_limits_admitting(carrier_source())
+            .is_empty());
+        assert!(manager.inbound_usage().is_empty());
+    }
+
+    #[test]
+    fn a_group_removed_at_the_source_takes_its_limit_with_it() {
+        let manager = manager();
+        apply_rows(&manager, &[limited_row(1)]);
+        assert_eq!(apply_rows(&manager, &[]).removed, 1);
+        assert!(manager.inbound_usage().is_empty());
+    }
+
     // --- Wire contract ---
+
+    #[test]
+    fn the_http_contract_carries_the_inbound_limit_fields() {
+        let json = r#"{"gateways":[{"group":"carriers","uri":"sip:gw1.carrier.example:5060",
+            "inbound_max_concurrent_calls":300,"inbound_max_calls_per_second":30,
+            "inbound_reject_code":486,"inbound_retry_after_secs":0}]}"#;
+        let response: GatewayListResponse =
+            serde_json::from_str(json).expect("the contract parses");
+        let parsed = &response.gateways[0];
+        assert_eq!(parsed.inbound_max_concurrent_calls, Some(300));
+        assert_eq!(parsed.inbound_max_calls_per_second, Some(30));
+        assert_eq!(parsed.inbound_reject_code, Some(486));
+        assert_eq!(parsed.inbound_retry_after_secs, Some(0));
+
+        // A row that sets none of them serialises without them, so a
+        // controller on the older contract sees the shape it always did.
+        let plain = serde_json::to_string(&row("carriers", "sip:gw1.carrier.example:5060"))
+            .expect("a row serialises");
+        assert!(!plain.contains("inbound_"), "{plain}");
+    }
 
     #[test]
     fn the_http_contract_parses_a_minimal_row() {

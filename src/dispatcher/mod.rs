@@ -609,6 +609,8 @@ pub async fn run(
             config.b2bua.resolved_inbound_limits(),
         )),
         refused_invites: Arc::new(crate::admission::refused::RefusedInvites::default()),
+        // `init_gateway` runs before the dispatcher is built.
+        gateway: crate::script::api::gateway_manager().cloned(),
         registrant_manager,
         recording_manager: Arc::new(crate::siprec::RecordingManager::new(
             product_name,

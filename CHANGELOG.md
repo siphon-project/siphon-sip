@@ -41,6 +41,24 @@ entry, but a working config keeps working.
   rate counts INVITEs, so a digest-challenged call spends two. SDK:
   `SipTestHarness.set_inbound_limit()`, `CallResult.was_refused`,
   `CallDetailRecord.is_refused`.
+- **`gateway.groups[].inbound_limit` caps the calls arriving from one gateway
+  group.** The same block as `b2bua.inbound_limit`, applied to callers whose
+  source address the group admits (its destinations' addresses plus
+  `source_networks`). B2BUA mode only. It is judged before the instance limit,
+  so a carrier over its own is answered with its group's `reject_code`. A
+  provisioned group carries it as `inbound_max_concurrent_calls`,
+  `inbound_max_calls_per_second`, `inbound_reject_code` and
+  `inbound_retry_after_secs`; a reconcile that changes them keeps the count of
+  calls already up. A refusal's CDR has `refusal_scope: "gateway"` and
+  `gateway_group`. New metrics:
+  `siphon_gateway_inbound_calls_refused_total{group,reason}`,
+  `siphon_gateway_inbound_calls_active{group}`,
+  `siphon_gateway_inbound_max_concurrent_calls{group}` and
+  `siphon_gateway_inbound_max_calls_per_second{group}`. `GET /admin/gateways`
+  gains `inbound_limit` per group (`null` when there is none). The count is
+  per instance. SDK: `GatewayRow.inbound_*`,
+  `MockGateway.set_inbound_limit()`, `CallResult.refusal_gateway_group`,
+  `CallDetailRecord.refusal_gateway_group`.
 - **A transfer to an AoR rings every registered contact.** `accept_refer`
   (siphon-terminated) and `replace_peer` with an `{aor}` target that has
   several registered contacts used to be refused `invalid_state`

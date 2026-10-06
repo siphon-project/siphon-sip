@@ -1318,6 +1318,7 @@ fn gateways_json(manager: &crate::gateway::DispatcherManager) -> serde_json::Val
             // Consecutive probe failures that mark a destination down — lets the
             // dashboard render "n/threshold missed" against each destination.
             "failure_threshold": group.probe_config.failure_threshold,
+            "inbound_limit": group.inbound_limit_json(),
             "destinations": destinations,
         }));
     }
@@ -2538,6 +2539,60 @@ mod tests {
     fn gateways_json_empty_manager_is_empty_array() {
         let manager = crate::gateway::DispatcherManager::new();
         assert_eq!(gateways_json(&manager), serde_json::json!([]));
+    }
+
+    #[test]
+    fn gateways_json_reports_a_groups_inbound_limit_and_the_calls_it_has_up() {
+        use crate::admission::{AdmissionController, InboundLimits};
+        use crate::gateway::{Algorithm, Destination, DispatcherGroup, DispatcherManager};
+        use crate::transport::Transport;
+
+        let destination = |address: &str| {
+            Destination::new(
+                format!("sip:{address}"),
+                address.parse().unwrap(),
+                Transport::Udp,
+                1,
+                1,
+            )
+        };
+        let manager = DispatcherManager::new();
+        manager.add_group(
+            DispatcherGroup::new(
+                "limited".to_string(),
+                Algorithm::Weighted,
+                vec![destination("203.0.113.10:5060")],
+            )
+            .with_inbound_limits(Some(InboundLimits {
+                max_concurrent_calls: 300,
+                max_calls_per_second: 30,
+                reject_code: 486,
+                retry_after_secs: 0,
+            })),
+        );
+        manager.add_group(DispatcherGroup::new(
+            "open".to_string(),
+            Algorithm::Weighted,
+            vec![destination("203.0.113.20:5060")],
+        ));
+        let controller = AdmissionController::unlimited();
+        let _held = controller
+            .admit_from(&manager.inbound_limits_admitting("203.0.113.10".parse().unwrap()))
+            .unwrap();
+
+        let json = gateways_json(&manager);
+        assert_eq!(
+            json[0]["inbound_limit"],
+            serde_json::json!({
+                "max_concurrent_calls": 300,
+                "max_calls_per_second": 30,
+                "reject_code": 486,
+                "retry_after_secs": 0,
+                "calls_active": 1,
+            })
+        );
+        assert_eq!(json[1]["name"], "open");
+        assert!(json[1]["inbound_limit"].is_null());
     }
 
     #[test]

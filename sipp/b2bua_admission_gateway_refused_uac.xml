@@ -1,0 +1,127 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!-- A carrier's second call while its gateway group is at its inbound limit
+     (sipp/b2bua-admission/siphon-b2bua-admission-gateway.yaml). The holder, the
+     same carrier's other address, has the group's one call up.
+
+     1. The INVITE is refused with the group's own answer: 486, and no 100
+        before it. Any other response here fails the call. The group turns
+        Retry-After off, so there is none to check.
+     2. Once the holder has hung up it tries again and is answered. The retry
+        keeps the Call-ID and raises the CSeq (RFC 3261 §8.1.3.5).
+
+     Each attempt carries its own From-tag; the To-tag is taken from the 200. -->
+
+<scenario name="B2BUA gateway inbound limit: refused 486, then admitted once the slot is free">
+
+  <!-- Let the holder's call be answered first. -->
+  <pause milliseconds="2000" />
+
+  <!-- ── 1. Refused ──────────────────────────────────────────────────────── -->
+  <send retrans="500">
+    <![CDATA[
+INVITE sip:refused@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:caller@[local_ip]>;tag=[pid]Refused[call_number]
+To: <sip:refused@[remote_ip]>
+Call-ID: [call_id]
+CSeq: 1 INVITE
+Contact: <sip:caller@[local_ip]:[local_port];transport=[transport]>
+Max-Forwards: 70
+Content-Type: application/sdp
+Content-Length: [len]
+
+v=0
+o=caller 1 1 IN IP[local_ip_type] [local_ip]
+s=-
+c=IN IP[media_ip_type] [media_ip]
+t=0 0
+m=audio [media_port] RTP/AVP 0
+a=rtpmap:0 PCMU/8000
+]]>
+  </send>
+
+  <recv response="486" rtd="true" />
+
+  <send>
+    <![CDATA[
+ACK sip:refused@[remote_ip]:[remote_port] SIP/2.0
+[last_Via:]
+From: <sip:caller@[local_ip]>;tag=[pid]Refused[call_number]
+[last_To:]
+Call-ID: [call_id]
+CSeq: 1 ACK
+Max-Forwards: 70
+Content-Length: 0
+
+]]>
+  </send>
+
+  <!-- The holder hangs up 8 s after it was answered; wait it out. -->
+  <pause milliseconds="8000" />
+
+  <!-- ── 2. Admitted once the slot is free ───────────────────────────────── -->
+  <send retrans="500">
+    <![CDATA[
+INVITE sip:admitted@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:caller@[local_ip]>;tag=[pid]Admitted[call_number]
+To: <sip:admitted@[remote_ip]>
+Call-ID: [call_id]
+CSeq: 2 INVITE
+Contact: <sip:caller@[local_ip]:[local_port];transport=[transport]>
+Max-Forwards: 70
+Content-Type: application/sdp
+Content-Length: [len]
+
+v=0
+o=caller 2 2 IN IP[local_ip_type] [local_ip]
+s=-
+c=IN IP[media_ip_type] [media_ip]
+t=0 0
+m=audio [media_port] RTP/AVP 0
+a=rtpmap:0 PCMU/8000
+]]>
+  </send>
+
+  <recv response="100" optional="true" />
+  <recv response="200" rtd="true" crlf="true">
+    <action>
+      <ereg regexp=".*" search_in="hdr" header="To:" assign_to="admitted_to" />
+    </action>
+  </recv>
+
+  <send>
+    <![CDATA[
+ACK sip:[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:caller@[local_ip]>;tag=[pid]Admitted[call_number]
+To:[$admitted_to]
+Call-ID: [call_id]
+CSeq: 2 ACK
+Max-Forwards: 70
+Content-Length: 0
+
+]]>
+  </send>
+
+  <pause milliseconds="1000" />
+
+  <send retrans="500">
+    <![CDATA[
+BYE sip:[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:caller@[local_ip]>;tag=[pid]Admitted[call_number]
+To:[$admitted_to]
+Call-ID: [call_id]
+CSeq: 3 BYE
+Max-Forwards: 70
+Content-Length: 0
+
+]]>
+  </send>
+
+  <recv response="200" crlf="true" />
+
+</scenario>

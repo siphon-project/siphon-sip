@@ -158,6 +158,40 @@ pub struct GatewayGroupConfig {
     /// global set. A per-route `reroute_causes` from the API wins over this.
     #[serde(default)]
     pub reroute_causes: Vec<u16>,
+    /// Ceiling on the calls arriving **from** this group: from the addresses
+    /// its destinations resolve to and from `source_networks`, the same
+    /// membership `call.from_gateway()` answers from. **Unset by default.**
+    ///
+    /// B2BUA mode only. Checked on the inbound initial INVITE before
+    /// `@b2bua.on_invite` runs, ahead of `b2bua.inbound_limit`, so a carrier
+    /// over its own limit is refused with this block's `reject_code` and costs
+    /// the instance nothing. A source two limited groups admit is counted
+    /// against both. Calls *to* the group are not counted.
+    ///
+    /// The count is per instance, and on UDP the source address it is matched
+    /// on can be forged.
+    ///
+    /// ```yaml
+    /// gateway:
+    ///   groups:
+    ///     - name: "carrier-a"
+    ///       inbound_limit:
+    ///         max_concurrent_calls: 300
+    ///         max_calls_per_second: 30
+    ///         reject_code: 486
+    /// ```
+    #[serde(default)]
+    pub inbound_limit: Option<super::InboundLimitConfig>,
+}
+
+impl GatewayGroupConfig {
+    /// The group's inbound limit with the defaults filled in, or `None` when
+    /// the block is absent — see [`inbound_limit`](Self::inbound_limit).
+    pub fn resolved_inbound_limits(&self) -> Option<crate::admission::InboundLimits> {
+        self.inbound_limit
+            .as_ref()
+            .map(super::InboundLimitConfig::resolved)
+    }
 }
 
 /// Per-group health probe settings.

@@ -389,7 +389,8 @@ class CallDetailRecord:
     ``"error"`` | ``"local"``.
 
     ``"local"`` is a call siphon turned away itself before any handler ran —
-    an inbound call past ``b2bua.inbound_limit``. See :attr:`is_refused`."""
+    an inbound call past ``b2bua.inbound_limit`` or a gateway group's
+    ``inbound_limit``. See :attr:`is_refused`."""
 
     sip_reason: Optional[str] = None
     """Reason header value from the BYE (RFC 3326), when present."""
@@ -545,7 +546,8 @@ class CallDetailRecord:
     @property
     def is_refused(self) -> bool:
         """True for an inbound call siphon refused at admission, before
-        ``@b2bua.on_invite`` ran (``b2bua.inbound_limit``).
+        ``@b2bua.on_invite`` ran: one past ``b2bua.inbound_limit`` or past a
+        gateway group's ``inbound_limit``.
 
         Such a record has :attr:`disconnect_initiator` ``"local"``, the refusal's
         status in :attr:`response_code` (``503`` unless ``reject_code`` says
@@ -559,8 +561,24 @@ class CallDetailRecord:
     @property
     def refusal_scope(self) -> Optional[str]:
         """On a refused call, which limit refused it: ``"global"`` for the
-        instance-wide ``b2bua.inbound_limit``. ``None`` on every other record."""
+        instance-wide ``b2bua.inbound_limit``, ``"gateway"`` for the
+        ``inbound_limit`` of a gateway group (named by
+        :attr:`refusal_gateway_group`). ``None`` on every other record."""
         return self.extra.get("refusal_scope")
+
+    @property
+    def refusal_gateway_group(self) -> Optional[str]:
+        """On a call a gateway group's ``inbound_limit`` refused, the group:
+        the one whose sources include :attr:`source_ip`. ``None`` when the
+        instance-wide limit refused it, and on every other record::
+
+            per_carrier = Counter(
+                r.refusal_gateway_group for r in records if r.is_refused
+            )
+        """
+        if self.refusal_scope != "gateway":
+            return None
+        return self.extra.get("gateway_group")
 
     @property
     def refusal_reason(self) -> Optional[str]:

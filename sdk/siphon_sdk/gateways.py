@@ -115,6 +115,33 @@ class GatewayRow:
     carrier that rejects an ``OPTIONS`` from a domain it does not recognise,
     which otherwise looks exactly like a carrier that is down."""
 
+    inbound_max_concurrent_calls: Optional[int] = None
+    """Ceiling on the calls up at once **from** this group's sources: the
+    addresses its destinations resolve to plus :attr:`source_networks`. Absent
+    or ``0`` is unlimited.
+
+    Enforced in B2BUA mode on the inbound INVITE, before ``@b2bua.on_invite``
+    runs, so a refused call reaches no handler. The count is per siphon
+    instance, and calls *to* the group are not counted.
+
+    Group-wide, like every ``inbound_*`` field: each is taken from the first
+    row of the group that carries it. Changing one applies to the calls already
+    up; it does not restart the count."""
+
+    inbound_max_calls_per_second: Optional[int] = None
+    """Ceiling on new calls per second from this group's sources, with a burst
+    of one second's worth. Absent or ``0`` is unlimited. Counts INVITEs, so a
+    call that is challenged for digest credentials spends two."""
+
+    inbound_reject_code: Optional[int] = None
+    """Status a call past either ceiling is answered with. Default ``503``;
+    anything outside 400-699 gets the row refused. ``486`` or ``480`` suits a
+    carrier that reads a 503 as "this server is down"."""
+
+    inbound_retry_after_secs: Optional[int] = None
+    """``Retry-After`` on that answer, in seconds. Default ``1``; ``0`` omits
+    the header."""
+
     username: Optional[str] = None
     """Digest username this destination challenges with."""
 
@@ -162,6 +189,10 @@ class GatewayRow:
             "probe_failure_threshold",
             "probe_from_user",
             "probe_from_domain",
+            "inbound_max_concurrent_calls",
+            "inbound_max_calls_per_second",
+            "inbound_reject_code",
+            "inbound_retry_after_secs",
         ):
             value = getattr(self, name)
             if value is not None:
@@ -196,6 +227,10 @@ class GatewayRow:
             probe_failure_threshold=data.get("probe_failure_threshold"),
             probe_from_user=data.get("probe_from_user"),
             probe_from_domain=data.get("probe_from_domain"),
+            inbound_max_concurrent_calls=data.get("inbound_max_concurrent_calls"),
+            inbound_max_calls_per_second=data.get("inbound_max_calls_per_second"),
+            inbound_reject_code=data.get("inbound_reject_code"),
+            inbound_retry_after_secs=data.get("inbound_retry_after_secs"),
         )
 
 

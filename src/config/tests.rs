@@ -5383,3 +5383,51 @@ fn b2bua_inbound_limit_reject_code_outside_4xx_to_6xx_is_refused_at_load() {
         .unwrap_or_else(|error| panic!("{code} is a failure response: {error}"));
     }
 }
+
+const GATEWAY_GROUP_WITH_LIMIT: &str = concat!(
+    "gateway:\n",
+    "  groups:\n",
+    "    - name: \"carrier-a\"\n",
+    "      inbound_limit:\n",
+    "        max_concurrent_calls: 300\n",
+    "        max_calls_per_second: 30\n",
+    "        reject_code: 486\n",
+    "      destinations:\n",
+    "        - uri: \"sip:gw1.carrier.example:5060\"\n",
+    "          address: \"203.0.113.10:5060\"\n",
+    "    - name: \"carrier-b\"\n",
+    "      destinations:\n",
+    "        - uri: \"sip:gw2.carrier.example:5060\"\n",
+    "          address: \"203.0.113.20:5060\"\n",
+);
+
+#[test]
+fn a_gateway_group_inbound_limit_parses_and_is_absent_by_default() {
+    let config = base_yaml(GATEWAY_GROUP_WITH_LIMIT).expect("a valid group limit");
+    let groups = &config.gateway.expect("a gateway block").groups;
+    assert_eq!(
+        groups[0]
+            .inbound_limit
+            .as_ref()
+            .map(InboundLimitConfig::resolved),
+        Some(crate::admission::InboundLimits {
+            max_concurrent_calls: 300,
+            max_calls_per_second: 30,
+            reject_code: 486,
+            retry_after_secs: 1,
+        })
+    );
+    assert_eq!(groups[1].inbound_limit, None);
+}
+
+#[test]
+fn a_gateway_group_reject_code_outside_4xx_to_6xx_is_refused_at_load() {
+    let error =
+        base_yaml(&GATEWAY_GROUP_WITH_LIMIT.replace("reject_code: 486", "reject_code: 302"))
+            .expect_err("a refusal must be a failure response");
+    let message = error.to_string();
+    assert!(
+        message.contains("gateway.groups[carrier-a].inbound_limit.reject_code"),
+        "{message}"
+    );
+}
