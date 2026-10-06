@@ -13,6 +13,8 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
+## [1.13.0] — 2026-10-06
+
 ### Added
 
 - **`b2bua.inbound_limit` caps the inbound calls a B2BUA instance accepts.**
@@ -128,6 +130,64 @@ entry, but a working config keeps working.
   SDK source):** `PlaySource` has two more variants and `PlayOptions` and
   `TransferDial` more public fields, so an exhaustive `match` or a struct
   literal without `..Default::default()` needs the addition.
+- **`cancel_dial` on the control plane: stop a dial and keep the caller.**
+  Until now a dial ended when a phone answered, when every phone failed, or
+  when its timeout ran out. `hangup` ended the caller with it, and a dial left
+  to time out kept the phones ringing, so a phone answering in that window was
+  connected to a caller the application had already sent elsewhere. The verb
+  CANCELs every phone still ringing (RFC 3261 §9.1) and ends the dial in
+  `DialFailed {code: 487}`, with the caller as the dial found it and free to
+  be dialled again. For a bridging dial `cause` carries the `reason` given
+  (default `cancelled`). Refused `invalid_state` when nothing rings
+  (`no_dial_in_progress`) and once a phone has answered and is being bridged
+  (`dial_answered`). In the Rust, Python and TypeScript control SDKs.
+- **`play` can play until stopped: `repeat: "inf"`.** For music on hold. The
+  same on the scripting side, `rtpengine.play_media(...,
+  repeat="inf", wait=False)` and `play_overlay(..., repeat="inf")`. Native
+  `siphon-rtp` backend; rtpengine and rtpproxy carry only a count and refuse it
+  rather than play once.
+- **`accept_refer` and `replace_peer` take an `{aor}` target and the identity
+  arguments `dial` takes.** An AoR is dialled over the flow its phone
+  registered on and through the Path of its binding, which is the only way to
+  reach a phone on TCP, TLS or WSS behind NAT; before, a transfer could only
+  dial a URI. `from`, `from_display`, `p_asserted_identity`, `privacy` and
+  `headers` shape the leg the transfer dials, which otherwise presents whatever
+  the call's own INVITE carried. A transparent `accept_refer` dials no leg and
+  refuses these arguments.
+- **`TransferRequested` says who referred and what an attended transfer
+  names.** `referrer_leg` (`"a"` / `"b"`) and `referrer_sip_call_id` identify
+  the referring party. When a `Replaces` names a dialog this node hosts,
+  `replaces.local` carries its call, the channel controlling it, its leg and
+  the channel it is bridged with. `StasisStart` carries the same as `replaces`
+  for a handed-over INVITE whose `Replaces` named a hosted dialog.
+
+### Changed
+
+- **`play` refuses an argument it cannot use.** A `repeat`, `start_ms`,
+  `duration_ms`, `gain_decibels` or `to_tag` of the wrong type used to be read
+  as absent, so the prompt played once from the start at full level and the
+  verb answered `ok`. It is now `bad_request`, naming the argument. A
+  controller sending a number as a string must send a number.
+  `rtpengine.play_media` / `play_overlay` raise `ValueError` for a `repeat`
+  that is neither a count nor `"inf"`. The Rust control SDK's
+  `PlayOptions::repeat` is now `Option<PlayRepeat>` (a count converts with
+  `.into()`).
+- **`hold` on a call the media engine only relays answers `invalid_state`**
+  (`media_not_processed`), where it answered `unavailable`. Nothing is wrong
+  with the engine and a retry fails the same way. The verb's description now
+  says what it does: it silences the call's media in both directions and sends
+  no SIP. Holding one party of a bridge is `unbridge`.
+- **`route` is refused while a `dial` still rings for the call**
+  (`invalid_state`, `dial_in_progress`). It releases the channel, which left
+  the dial ringing into a channel that no longer existed. `cancel_dial` first.
+- **A recording ended by a bridge forming reports `bridged`**, where
+  `RecordingFinished` said `call_ended` on a call that was still up. A leg
+  siphon answered itself moves onto the pair's engine session when it is
+  bridged, and the recording on the old one stops. Start one on the bridge if
+  the conversation is to be recorded.
+- **A second REFER on a call whose first is still undecided is answered
+  `491 Request Pending`.** It was absorbed as a retransmission and never
+  answered.
 
 ### Fixed
 
@@ -664,36 +724,6 @@ entry, but a working config keeps working.
   `call.set_caller_id()`) rewrites it with the others, a replaced identity
   (dial or target `from`) drops it, and a restricted call removes it. One a
   controller or script sets explicitly on the B-leg goes out as written.
-- **`cancel_dial` on the control plane: stop a dial and keep the caller.**
-  Until now a dial ended when a phone answered, when every phone failed, or
-  when its timeout ran out. `hangup` ended the caller with it, and a dial left
-  to time out kept the phones ringing, so a phone answering in that window was
-  connected to a caller the application had already sent elsewhere. The verb
-  CANCELs every phone still ringing (RFC 3261 §9.1) and ends the dial in
-  `DialFailed {code: 487}`, with the caller as the dial found it and free to
-  be dialled again. For a bridging dial `cause` carries the `reason` given
-  (default `cancelled`). Refused `invalid_state` when nothing rings
-  (`no_dial_in_progress`) and once a phone has answered and is being bridged
-  (`dial_answered`). In the Rust, Python and TypeScript control SDKs.
-- **`play` can play until stopped: `repeat: "inf"`.** For music on hold. The
-  same on the scripting side, `rtpengine.play_media(...,
-  repeat="inf", wait=False)` and `play_overlay(..., repeat="inf")`. Native
-  `siphon-rtp` backend; rtpengine and rtpproxy carry only a count and refuse it
-  rather than play once.
-- **`accept_refer` and `replace_peer` take an `{aor}` target and the identity
-  arguments `dial` takes.** An AoR is dialled over the flow its phone
-  registered on and through the Path of its binding, which is the only way to
-  reach a phone on TCP, TLS or WSS behind NAT; before, a transfer could only
-  dial a URI. `from`, `from_display`, `p_asserted_identity`, `privacy` and
-  `headers` shape the leg the transfer dials, which otherwise presents whatever
-  the call's own INVITE carried. A transparent `accept_refer` dials no leg and
-  refuses these arguments.
-- **`TransferRequested` says who referred and what an attended transfer
-  names.** `referrer_leg` (`"a"` / `"b"`) and `referrer_sip_call_id` identify
-  the referring party. When a `Replaces` names a dialog this node hosts,
-  `replaces.local` carries its call, the channel controlling it, its leg and
-  the channel it is bridged with. `StasisStart` carries the same as `replaces`
-  for a handed-over INVITE whose `Replaces` named a hosted dialog.
 - **A B-leg response acts on the leg it answers when the call's legs have
   moved.** siphon read a B-leg's position among the call's legs when its
   response arrived and acted on that position later, after its retries, script
@@ -876,37 +906,6 @@ entry, but a working config keeps working.
   itself, as the first thing the handler's task does, so a call whose
   handler had not started when `close()` ran never starts it. `run()` /
   `serve()` called again open it again.
-
-### Changed
-
-- **`play` refuses an argument it cannot use.** A `repeat`, `start_ms`,
-  `duration_ms`, `gain_decibels` or `to_tag` of the wrong type used to be read
-  as absent, so the prompt played once from the start at full level and the
-  verb answered `ok`. It is now `bad_request`, naming the argument. A
-  controller sending a number as a string must send a number.
-  `rtpengine.play_media` / `play_overlay` raise `ValueError` for a `repeat`
-  that is neither a count nor `"inf"`. The Rust control SDK's
-  `PlayOptions::repeat` is now `Option<PlayRepeat>` (a count converts with
-  `.into()`).
-- **`hold` on a call the media engine only relays answers `invalid_state`**
-  (`media_not_processed`), where it answered `unavailable`. Nothing is wrong
-  with the engine and a retry fails the same way. The verb's description now
-  says what it does: it silences the call's media in both directions and sends
-  no SIP. Holding one party of a bridge is `unbridge`.
-- **`route` is refused while a `dial` still rings for the call**
-  (`invalid_state`, `dial_in_progress`). It releases the channel, which left
-  the dial ringing into a channel that no longer existed. `cancel_dial` first.
-- **A recording ended by a bridge forming reports `bridged`**, where
-  `RecordingFinished` said `call_ended` on a call that was still up. A leg
-  siphon answered itself moves onto the pair's engine session when it is
-  bridged, and the recording on the old one stops. Start one on the bridge if
-  the conversation is to be recorded.
-- **A second REFER on a call whose first is still undecided is answered
-  `491 Request Pending`.** It was absorbed as a retransmission and never
-  answered.
-
-### Fixed
-
 - **A REFER from the callee of a controlled call reaches the application.** The
   owning channel was looked up by the REFER's own Call-ID, and a B-leg has a
   dialog of its own, so a party transferring a call it had answered was
