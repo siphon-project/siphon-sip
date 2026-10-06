@@ -92,6 +92,28 @@ pub(super) fn client_retransmit_source(
     )
 }
 
+/// The transaction layer's timers as the `transaction:` block of the
+/// configuration sets them, or their defaults without one.
+pub(super) fn transaction_timers(
+    transaction: Option<&crate::config::TransactionConfig>,
+) -> TimerConfig {
+    let mut timers = TimerConfig::default();
+    if let Some(transaction) = transaction {
+        timers.auto_100_trying = transaction.auto_emit_100_trying;
+        timers.auto_100_delay =
+            std::time::Duration::from_millis(transaction.auto_emit_100_trying_delay_ms);
+        timers.timer_c_secs = transaction.timer_c_secs;
+    }
+    timers
+}
+
+/// RFC 3261 §16.6 step 11: "Timer C MUST be set for each client transaction
+/// when an INVITE request is proxied. The timer MUST be larger than 3
+/// minutes." Whether `timer_c_secs` is not.
+pub(super) fn timer_c_is_below_the_rfc_minimum(timer_c_secs: u32) -> bool {
+    timer_c_secs <= 180
+}
+
 /// Re-emit every siphon-originated B2BUA request whose RFC 3261 §17.1
 /// retransmit interval has elapsed, and reap the schedules that reached 64·T1.
 ///
@@ -105,6 +127,11 @@ pub(super) fn client_retransmit_source(
 /// listener here would put the retry outside the IPsec SA, which is precisely
 /// the failure this whole path exists to survive (3GPP TS 33.203 §7.4).
 pub(super) fn sweep_b2bua_retransmits(state: &DispatcherState) {
+    sweep_b2bua_retransmits_at(state, std::time::Instant::now());
+}
+
+/// [`sweep_b2bua_retransmits`] as of `now`.
+pub(super) fn sweep_b2bua_retransmits_at(state: &DispatcherState, now: std::time::Instant) {
     use crate::b2bua::retransmit::Due;
 
     // `due` walks every shard, so skip it outright on a proxy-only deployment
@@ -113,7 +140,7 @@ pub(super) fn sweep_b2bua_retransmits(state: &DispatcherState) {
         return;
     }
 
-    for event in state.b2bua_retransmits.due(std::time::Instant::now()) {
+    for event in state.b2bua_retransmits.due(now) {
         match event {
             Due::Send {
                 key,
@@ -152,6 +179,13 @@ pub(super) fn sweep_b2bua_retransmits(state: &DispatcherState) {
                     attempts,
                     "B2BUA: no response after 64*T1 — giving up on retransmitting request"
                 );
+                // Timer B (RFC 3261 §17.1.1.2): the INVITE's client transaction
+                // is over. A leg siphon had given up on, whose CANCEL was still
+                // waiting for a provisional (§9.1), ends here with it, and no
+                // CANCEL is ever sent.
+                if key.method == crate::sip::message::Method::Invite {
+                    state.call_actors.invite_transaction_timed_out(&key.branch);
+                }
             }
         }
     }
@@ -228,6 +262,7 @@ pub(super) fn fire_expired_timers(state: &DispatcherState) {
         let client_event = match entry.name {
             TimerName::A => Some(ClientEvent::Ict(IctEvent::TimerA)),
             TimerName::B => Some(ClientEvent::Ict(IctEvent::TimerB)),
+            TimerName::C => Some(ClientEvent::Ict(IctEvent::TimerC)),
             TimerName::D => Some(ClientEvent::Ict(IctEvent::TimerD)),
             TimerName::E => Some(ClientEvent::Nict(NictEvent::TimerE)),
             TimerName::F => Some(ClientEvent::Nict(NictEvent::TimerF)),
@@ -369,6 +404,7 @@ pub(super) fn process_timer_actions_with_followups(
                     }
                 }
             }
+            Action::SendCancel(cancel) => send_proxy_branch_cancel(cancel, state),
             Action::StartTimer(name, duration) => {
                 let timer_id = format!("{}:{:?}", key, name);
                 state.timer_wheel.insert(

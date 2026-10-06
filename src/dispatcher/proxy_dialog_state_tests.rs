@@ -34,7 +34,7 @@ fn proxy_script(routing: &str, in_dialog: &str) -> String {
     )
 }
 
-const FOLLOW_ROUTE: &str = "request.loose_route()\n        request.relay()";
+pub(super) const FOLLOW_ROUTE: &str = "request.loose_route()\n        request.relay()";
 
 fn register(aor: &str, address: &str) {
     let user = aor
@@ -100,25 +100,25 @@ fn text<'a>(payload: &'a serde_json::Value, field: &str) -> &'a str {
         .unwrap_or_else(|| panic!("no string `{field}` in {payload}"))
 }
 
-struct Sent {
-    destination: String,
-    message: SipMessage,
+pub(super) struct Sent {
+    pub(super) destination: String,
+    pub(super) message: SipMessage,
 }
 
-struct Proxy {
-    state: Arc<DispatcherState>,
-    udp: flume::Receiver<OutboundMessage>,
+pub(super) struct Proxy {
+    pub(super) state: Arc<DispatcherState>,
+    pub(super) udp: flume::Receiver<OutboundMessage>,
 }
 
 /// siphon knows its own address, so `loose_route()` consumes the Route entry
 /// it Record-Routed.
-fn knows_itself(state: &mut DispatcherState) {
+pub(super) fn knows_itself(state: &mut DispatcherState) {
     let mut identity = crate::proxy::core::SelfIdentity::new();
     identity.add_host("192.0.2.1", &[5060]);
     state.self_identity = Arc::new(identity);
 }
 
-fn proxy(routing: &str, in_dialog: &str) -> Proxy {
+pub(super) fn proxy(routing: &str, in_dialog: &str) -> Proxy {
     let mut dispatcher = test_dispatcher_with_script(&proxy_script(routing, in_dialog));
     knows_itself(&mut dispatcher.state);
     Proxy {
@@ -137,7 +137,7 @@ fn proxy_with(routing: &str, configure: impl FnOnce(&mut DispatcherState)) -> Pr
     }
 }
 
-fn header(message: &SipMessage, name: &str) -> String {
+pub(super) fn header(message: &SipMessage, name: &str) -> String {
     message
         .headers
         .get(name)
@@ -145,7 +145,7 @@ fn header(message: &SipMessage, name: &str) -> String {
         .unwrap_or_else(|| panic!("no {name} header"))
 }
 
-fn headers(message: &SipMessage, name: &str) -> Vec<String> {
+pub(super) fn headers(message: &SipMessage, name: &str) -> Vec<String> {
     message.headers.get_all(name).cloned().unwrap_or_default()
 }
 
@@ -157,7 +157,7 @@ fn tag_of(value: &str) -> String {
         .unwrap_or_else(|| panic!("no tag in {value}"))
 }
 
-fn inbound(source: &str, raw: &str) -> InboundMessage {
+pub(super) fn inbound(source: &str, raw: &str) -> InboundMessage {
     InboundMessage {
         client_transport: None,
         connection_id: ConnectionId::default(),
@@ -169,7 +169,7 @@ fn inbound(source: &str, raw: &str) -> InboundMessage {
 }
 
 impl Proxy {
-    fn wire(&self) -> Vec<Sent> {
+    pub(super) fn wire(&self) -> Vec<Sent> {
         let mut sent = Vec::new();
         while let Ok(outbound) = self.udp.try_recv() {
             for frame in outbound.frames() {
@@ -183,7 +183,7 @@ impl Proxy {
         sent
     }
 
-    fn request(&self, source: &str, raw: &str) {
+    pub(super) fn request(&self, source: &str, raw: &str) {
         let message = parse_sip_message_bytes(raw.as_bytes()).expect("the request parses");
         let method = message.method().expect("a request").as_str().to_string();
         tokio::task::block_in_place(|| {
@@ -191,7 +191,7 @@ impl Proxy {
         });
     }
 
-    fn response(&self, source: &str, message: SipMessage) {
+    pub(super) fn response(&self, source: &str, message: SipMessage) {
         let status_code = message.status_code().expect("a response");
         let raw = String::from_utf8(message.to_bytes()).expect("UTF-8");
         tokio::task::block_in_place(|| {
@@ -205,7 +205,7 @@ impl Proxy {
 }
 
 /// The phone at `source` sends an INVITE for `to` (a URI).
-fn invite(source: &str, call_id: &str, from: &str, to: &str) -> String {
+pub(super) fn invite(source: &str, call_id: &str, from: &str, to: &str) -> String {
     format!(
         concat!(
             "INVITE {to} SIP/2.0\r\n",
@@ -229,7 +229,7 @@ fn invite(source: &str, call_id: &str, from: &str, to: &str) -> String {
 /// A UAS's response to the INVITE it received: the INVITE's Via stack and
 /// Record-Route (RFC 3261 §8.2.6.2, §12.1.1), a tagged To, its Contact and
 /// `extra` headers.
-fn response_to(
+pub(super) fn response_to(
     invite: &SipMessage,
     status_code: u16,
     reason: &str,
@@ -255,7 +255,7 @@ fn response_to(
 }
 
 /// An in-dialog request along the route set the dialog's 2xx established.
-fn in_dialog(
+pub(super) fn in_dialog(
     method: &str,
     target: &str,
     source: &str,
@@ -280,14 +280,14 @@ fn in_dialog(
 }
 
 /// The INVITEs among `sent` by destination.
-fn invites_by_destination(sent: &[Sent]) -> Vec<(String, SipMessage)> {
+pub(super) fn invites_by_destination(sent: &[Sent]) -> Vec<(String, SipMessage)> {
     sent.iter()
         .filter(|sent| sent.message.method() == Some(&Method::Invite))
         .map(|sent| (sent.destination.clone(), sent.message.clone()))
         .collect()
 }
 
-fn find<'a>(sent: &'a [(String, SipMessage)], address: &str) -> &'a SipMessage {
+pub(super) fn find<'a>(sent: &'a [(String, SipMessage)], address: &str) -> &'a SipMessage {
     sent.iter()
         .find(|(destination, _)| destination == address)
         .map(|(_, message)| message)

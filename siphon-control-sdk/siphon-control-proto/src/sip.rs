@@ -59,6 +59,15 @@ pub enum SipVerb {
     AcceptRefer,
     /// Reject a pending inbound REFER with a final non-2xx.
     RejectRefer,
+    /// Report how a transfer accepted with [`SipVerb::AcceptRefer`] in mode
+    /// `controller` went. The server answered that REFER `202`, dialled
+    /// nothing and left the transfer to the application; this sends the
+    /// referrer the sipfrag NOTIFY that ends its subscription, a 2xx for a
+    /// transfer that succeeded.
+    ///
+    /// Refused (`invalid_state`, `details.reason == "no_transfer_pending"`)
+    /// when the call has no such transfer open.
+    CompleteRefer,
     /// Join this channel to another the app owns, so the two parties hear each
     /// other. The reply reports the local action only (the media is re-pointed
     /// and the first re-INVITE is on the wire); the outcome arrives as
@@ -85,6 +94,14 @@ pub enum SipVerb {
     /// Every branch is named as it is created (`DialBranch`) and as it ends
     /// (`DialBranchFailed` / `DialAnswered`), by its leg id and SIP Call-ID.
     Dial,
+    /// Give up on the dial ringing for this channel's caller and leave the
+    /// caller alone: every phone still ringing is CANCELled and the dial ends
+    /// in `DialFailed` with code 487, the caller as the dial found it and free
+    /// to be dialled for again. [`SipVerb::Hangup`] ends the caller as well.
+    ///
+    /// Refused (`invalid_state`) when nothing is ringing, and once a phone has
+    /// answered and is being bridged.
+    CancelDial,
     /// Set a header on the stored A-leg INVITE.
     SetHeader,
     /// Remove a header from the stored A-leg INVITE.
@@ -97,9 +114,12 @@ pub enum SipVerb {
     Stop,
     /// Inject DTMF digits toward the A-leg.
     Dtmf,
-    /// Hold the A-leg media via silence.
+    /// Silence the call's media in both directions on the media engine. A
+    /// media gate, not a SIP hold: nothing is sent on either dialog, and it is
+    /// refused (`invalid_state`) on a call the engine only relays. Holding one
+    /// party of a bridge is [`SipVerb::Unbridge`].
     Hold,
-    /// Resume the A-leg media after a hold.
+    /// Restore the call's media after a hold.
     Unhold,
     /// Attach a WebSocket audio tee (siphon-rtp backend only).
     StreamStart,
@@ -132,11 +152,13 @@ impl SipVerb {
             SipVerb::Refer => "refer",
             SipVerb::AcceptRefer => "accept_refer",
             SipVerb::RejectRefer => "reject_refer",
+            SipVerb::CompleteRefer => "complete_refer",
             SipVerb::Bridge => "bridge",
             SipVerb::Unbridge => "unbridge",
             SipVerb::ReplacePeer => "replace_peer",
             SipVerb::Route => "route",
             SipVerb::Dial => "dial",
+            SipVerb::CancelDial => "cancel_dial",
             SipVerb::SetHeader => "set_header",
             SipVerb::RemoveHeader => "remove_header",
             SipVerb::GetHeader => "get_header",
@@ -194,6 +216,11 @@ pub enum SipEvent {
     /// An inbound REFER on a controlled call is asking the app to own the
     /// transfer decision ([`TransferRequestedPayload`]).
     TransferRequested,
+    /// A transfer this app accepted to carry out itself (`accept_refer` in mode
+    /// `controller`) passed its deadline with no `complete_refer`
+    /// ([`TransferTimedOutPayload`]). siphon has ended the referrer's
+    /// subscription for the app, so a `complete_refer` now is refused.
+    TransferTimedOut,
     /// A transfer this app asked for (the `refer` verb) moved forward but is not
     /// finished ([`TransferOutcomePayload`]). Never a success: RFC 3515 §2.4.4
     /// makes a `2xx` to a REFER mean "accepted for processing", with the real
@@ -289,6 +316,7 @@ impl SipEvent {
             SipEvent::ChannelDtmfReceived => "ChannelDtmfReceived",
             SipEvent::PlayStarted => "PlayStarted",
             SipEvent::TransferRequested => "TransferRequested",
+            SipEvent::TransferTimedOut => "TransferTimedOut",
             SipEvent::TransferProgress => "TransferProgress",
             SipEvent::TransferCompleted => "TransferCompleted",
             SipEvent::TransferFailed => "TransferFailed",
@@ -324,6 +352,7 @@ impl From<&str> for SipEvent {
             "ChannelDtmfReceived" => SipEvent::ChannelDtmfReceived,
             "PlayStarted" => SipEvent::PlayStarted,
             "TransferRequested" => SipEvent::TransferRequested,
+            "TransferTimedOut" => SipEvent::TransferTimedOut,
             "TransferProgress" => SipEvent::TransferProgress,
             "TransferCompleted" => SipEvent::TransferCompleted,
             "TransferFailed" => SipEvent::TransferFailed,
@@ -433,6 +462,28 @@ pub struct TransferReplaces {
     /// Whether the REFER was `early-only`.
     #[serde(default)]
     pub early_only: bool,
+    /// The dialog named, when the server hosts it — which is what lets an
+    /// application act on a `Replaces` at all, since it addresses calls by
+    /// channel and never sees a Call-ID or a tag. `None` for a dialog hosted
+    /// elsewhere, and from a server that predates it.
+    #[serde(default)]
+    pub local: Option<HostedDialog>,
+}
+
+/// A dialog the server hosts, as a `Replaces` named it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostedDialog {
+    /// The call the dialog belongs to.
+    pub call_actor_id: String,
+    /// The channel controlling that call, when an application owns it.
+    #[serde(default)]
+    pub channel: Option<String>,
+    /// Which leg of the call the dialog is: `"a"` or `"b"`.
+    pub leg: String,
+    /// The channel that call is bridged with — the party that stays when the
+    /// named one is replaced. `None` when it is not a bridge.
+    #[serde(default)]
+    pub bridged_with: Option<String>,
 }
 
 /// The `payload` of a [`SipEvent::TransferRequested`] event: an inbound REFER on
@@ -447,6 +498,36 @@ pub struct TransferRequestedPayload {
     /// The From-tag of the referring party, if known.
     #[serde(default)]
     pub from_tag: Option<String>,
+    /// Which party of the channel's call sent the REFER: `"a"` for the party
+    /// the call came from, `"b"` for the party it was connected to. Absent from
+    /// a server that predates it.
+    #[serde(default)]
+    pub referrer_leg: Option<String>,
+    /// The SIP Call-ID of the dialog the REFER arrived on. For a `"b"` referrer
+    /// this is the `leg_sip_call_id` its `DialBranch` named, not the channel's.
+    #[serde(default)]
+    pub referrer_sip_call_id: Option<String>,
+}
+
+/// The `payload` of a [`SipEvent::TransferTimedOut`] event: a transfer accepted
+/// with `accept_refer` in mode `controller` passed its deadline unreported.
+///
+/// siphon ended the referrer's subscription for the app, with a sipfrag NOTIFY
+/// of its own (RFC 3515 §2.4.5). The parties are wherever the app's verbs left
+/// them; only the report is over, and a `complete_refer` now is refused.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransferTimedOutPayload {
+    /// Why the transfer ended: `"timeout"`.
+    #[serde(default)]
+    pub reason: String,
+    /// The sipfrag status siphon reported to the referrer (`503`). `None` when
+    /// the referrer's leg had already left the call and nothing could be sent.
+    #[serde(default)]
+    pub code: Option<u16>,
+    /// Which party of the channel's call had referred: `"a"` or `"b"`, as on
+    /// [`TransferRequestedPayload`].
+    #[serde(default)]
+    pub referrer_leg: Option<String>,
 }
 
 /// The `stage` of a [`TransferOutcomePayload`] — where the verdict on an
@@ -613,6 +694,34 @@ impl PeerHangupPolicy {
 impl std::fmt::Display for PeerHangupPolicy {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(self.as_str())
+    }
+}
+
+/// How many times a `play` plays its source — the `repeat` argument.
+///
+/// A total play count, or [`PlayRepeat::Forever`] (`"inf"` on the wire) to play
+/// until stopped, which is what music on hold is. The server refuses any other
+/// value with `bad_request` rather than playing once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlayRepeat {
+    /// Play this many times in total; `0` and `1` both mean once.
+    Times(u64),
+    /// Play until stopped.
+    Forever,
+}
+
+impl From<u64> for PlayRepeat {
+    fn from(times: u64) -> Self {
+        PlayRepeat::Times(times)
+    }
+}
+
+impl Serialize for PlayRepeat {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            PlayRepeat::Times(times) => serializer.serialize_u64(*times),
+            PlayRepeat::Forever => serializer.serialize_str("inf"),
+        }
     }
 }
 
@@ -1390,6 +1499,7 @@ mod tests {
         assert_eq!(SipVerb::RemoveHeader.as_str(), "remove_header");
         assert_eq!(SipVerb::AcceptRefer.as_str(), "accept_refer");
         assert_eq!(SipVerb::RejectRefer.as_str(), "reject_refer");
+        assert_eq!(SipVerb::CompleteRefer.as_str(), "complete_refer");
         assert_eq!(SipVerb::Ring.as_str(), "ring");
         assert_eq!(SipVerb::Progress.as_str(), "progress");
         assert_eq!(SipVerb::Bridge.as_str(), "bridge");
@@ -1412,6 +1522,7 @@ mod tests {
         assert_eq!(SipVerb::Reject.as_str(), "reject");
         assert_eq!(SipVerb::Hangup.as_str(), "hangup");
         assert_eq!(SipVerb::Drop.to_string(), "drop");
+        assert_eq!(SipVerb::CancelDial.as_str(), "cancel_dial");
     }
 
     #[test]
@@ -1585,6 +1696,21 @@ mod tests {
         assert_eq!(parsed.refer_to, "sip:carol@example.com");
         assert!(parsed.replaces.is_none());
         assert!(parsed.from_tag.is_none());
+        // A server that predates the referrer fields still parses.
+        assert!(parsed.referrer_leg.is_none());
+        assert!(parsed.referrer_sip_call_id.is_none());
+
+        // The callee of a controlled call refers: the leg and its own dialog.
+        let from_callee = serde_json::json!({
+            "refer_to": "sip:carol@example.com",
+            "replaces": null,
+            "from_tag": "callee-tag",
+            "referrer_leg": "b",
+            "referrer_sip_call_id": "leg-1@siphon"
+        });
+        let parsed: TransferRequestedPayload = serde_json::from_value(from_callee).unwrap();
+        assert_eq!(parsed.referrer_leg.as_deref(), Some("b"));
+        assert_eq!(parsed.referrer_sip_call_id.as_deref(), Some("leg-1@siphon"));
 
         // Attended transfer: an embedded Replaces triple + a referrer from_tag.
         let attended = serde_json::json!({
@@ -1596,7 +1722,43 @@ mod tests {
         let replaces = parsed.replaces.expect("replaces present");
         assert_eq!(replaces.call_id, "abc");
         assert!(replaces.early_only);
+        assert!(
+            replaces.local.is_none(),
+            "not hosted here, or an older server"
+        );
+
+        // The same, naming a dialog the server hosts.
+        let hosted = serde_json::json!({
+            "refer_to": "sip:dave@example.com",
+            "replaces": {
+                "call_id": "abc", "from_tag": "ft", "to_tag": "tt", "early_only": false,
+                "local": { "call_actor_id": "call-2", "channel": "ch2", "leg": "a",
+                           "bridged_with": "ch3" }
+            }
+        });
+        let hosted: TransferRequestedPayload = serde_json::from_value(hosted).unwrap();
+        let local = hosted
+            .replaces
+            .and_then(|replaces| replaces.local)
+            .expect("the hosted dialog");
+        assert_eq!(local.call_actor_id, "call-2");
+        assert_eq!(local.channel.as_deref(), Some("ch2"));
+        assert_eq!(local.leg, "a");
+        assert_eq!(local.bridged_with.as_deref(), Some("ch3"));
         assert_eq!(parsed.from_tag.as_deref(), Some("referrer-tag"));
+    }
+
+    #[test]
+    fn a_play_repeat_is_a_count_or_inf_on_the_wire() {
+        assert_eq!(
+            serde_json::json!(PlayRepeat::Times(2)),
+            serde_json::json!(2)
+        );
+        assert_eq!(serde_json::json!(PlayRepeat::from(0)), serde_json::json!(0));
+        assert_eq!(
+            serde_json::json!(PlayRepeat::Forever),
+            serde_json::json!("inf")
+        );
     }
 
     #[test]
@@ -1988,6 +2150,46 @@ mod tests {
             SipEvent::from("PeerReplacedSomeday"),
             SipEvent::Other("PeerReplacedSomeday".to_string())
         );
+    }
+
+    /// The event a controller-mode transfer ends in when its report is late:
+    /// the name maps both ways, and the payload parses as the server sends it,
+    /// with and without a status reported to the referrer.
+    #[test]
+    fn transfer_timed_out_round_trips_and_parses_from_the_wire_shape() {
+        assert_eq!(SipEvent::TransferTimedOut.as_str(), "TransferTimedOut");
+        assert_eq!(
+            SipEvent::from("TransferTimedOut"),
+            SipEvent::TransferTimedOut
+        );
+        assert_eq!(
+            serde_json::to_string(&SipEvent::TransferTimedOut).unwrap(),
+            "\"TransferTimedOut\""
+        );
+
+        // Byte-identical to the server's payload.
+        let timed_out: TransferTimedOutPayload = serde_json::from_value(serde_json::json!({
+            "reason": "timeout",
+            "code": 503,
+            "referrer_leg": "a",
+        }))
+        .expect("TransferTimedOut payload");
+        assert_eq!(timed_out.reason, "timeout");
+        assert_eq!(timed_out.code, Some(503));
+        assert_eq!(timed_out.referrer_leg.as_deref(), Some("a"));
+
+        let unsent: TransferTimedOutPayload = serde_json::from_value(serde_json::json!({
+            "reason": "timeout",
+            "code": null,
+            "referrer_leg": "b",
+        }))
+        .expect("TransferTimedOut payload with nothing reported");
+        assert_eq!(unsent.code, None);
+
+        let sparse: TransferTimedOutPayload =
+            serde_json::from_value(serde_json::json!({})).expect("sparse payload");
+        assert_eq!(sparse.reason, "");
+        assert_eq!(sparse.referrer_leg, None);
     }
 
     #[test]

@@ -815,7 +815,14 @@ auth:
 # ---------------------------------------------------------------------------
 # transaction:
 #   timeout_secs: 5        # non-INVITE transaction timeout (fr_timeout)
-#   invite_timeout_secs: 30  # INVITE transaction timeout (fr_inv_timeout)
+#   invite_timeout_secs: 30  # how long proxy state for an INVITE no branch of which
+#                            # is still waiting for a final response is kept; a
+#                            # call that is still ringing is bounded by timer_c_secs
+#   timer_c_secs: 181        # RFC 3261 §16.6 Timer C: how long a proxied INVITE may
+#                            # ring without a final response, counted from its last
+#                            # 101-199. Then the branch is CANCELled (§16.8). The RFC
+#                            # requires more than 180; a lower value is a ring timeout
+#                            # for every proxied call, never less than 32 (Timer B)
 #   auto_emit_100_trying: true             # NIST auto-emits 100 Trying on slow relays
 #                                          # (suppresses UAC retransmits, RFC 3261 §17.1.2)
 #   auto_emit_100_trying_delay_ms: 200     # mirrors RFC 3261 §17.2.1 IST timer
@@ -878,6 +885,9 @@ auth:
 #     timeout_ms: 1000              # NG protocol response timeout
 #   sdp_name: "SIPhon"             # Name used in SDP o= and s= lines
 #                                   # (masks remote endpoint identity, default: "SIPhon")
+#   sdp_keep_session_name: false   # true leaves the s= session name as the far side
+#                                   # wrote it, for peers that read it as a marker.
+#                                   # o= is rewritten either way. Default: false.
 #   sdp_strip_attributes: ["msid"] # SDP a= attributes removed from the SDP relayed
 #                                   # between B2BUA legs: session and media level, both
 #                                   # directions, with or without a value, names matched
@@ -1472,8 +1482,10 @@ auth:
 #                                     # nobody asked it to answer — the same policy
 #                                     # the scripting API uses for scanner traffic.
 #                                     # Every OTHER unhandled method still gets
-#                                     # 405 Method Not Allowed + Allow; the knob does
-#                                     # not silence those.
+#                                     # 405 Method Not Allowed + Allow, or 481 when
+#                                     # it names a dialog siphon does not have (a
+#                                     # To-tag, RFC 3261 §12.2.2); the knob does not
+#                                     # silence those.
 
 # ---------------------------------------------------------------------------
 # Prometheus metrics

@@ -370,9 +370,8 @@ impl UacSender {
         let from_uri = format!("<sip:{from_name}@{from_host_str}>;tag=uac-{cseq}");
 
         // RFC 3261 §11.1 permits a Contact on an OPTIONS, and some peers require
-        // it: Microsoft Teams Direct Routing rejects an OPTIONS that carries
-        // neither Contact nor Record-Route ("Record-Route and Contact headers are
-        // missing") because it uses one of them to compute the next hop. Advertise
+        // it: such a peer rejects an OPTIONS that carries neither Contact nor
+        // Record-Route because it uses one of them to compute the next hop. Advertise
         // our own reachable address, the same host:port as the Via (so it follows
         // the advertised address, FQDN included, rather than a loopback fallback),
         // so the peer can reach us for return traffic.
@@ -393,8 +392,8 @@ impl UacSender {
             .cseq(format!("{cseq} OPTIONS"))
             .max_forwards(70)
             // Advertise our supported methods so a peer probing us via this
-            // OPTIONS keepalive can discover the method set — e.g. Teams Direct
-            // Routing selects its transfer method from the SBC's Allow.
+            // OPTIONS keepalive can discover the method set — a peer may select
+            // its transfer method from the Allow it is shown.
             .header("Allow", crate::sip::SUPPORTED_METHODS.to_string())
             .content_length(0);
 
@@ -770,8 +769,8 @@ mod tests {
 
     #[test]
     fn send_options_includes_contact_header() {
-        // RFC 3261 §11.1 permits Contact on an OPTIONS; peers like Microsoft
-        // Teams Direct Routing require it and reject an OPTIONS carrying neither
+        // RFC 3261 §11.1 permits Contact on an OPTIONS; some peers
+        // require it and reject an OPTIONS carrying neither
         // Contact nor Record-Route. The keepalive OPTIONS must advertise our own
         // reachable address (same host:port as the Via, transport lowercased).
         let (sender, receivers) = make_uac_sender();

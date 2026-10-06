@@ -385,7 +385,7 @@ impl SipClient {
     /// Place an outbound call under a caller-supplied channel id.
     ///
     /// The one verb that *creates* a channel rather than addressing one, which
-    /// is why it lives here and not on [`Call`]. It returns as soon as the
+    /// is why it lives here and not on [`Call`](crate::sip::Call). It returns as soon as the
     /// INVITE is on the wire — the call is `calling`, and the answer, failure or
     /// timeout arrives later as an event on the channel, exactly as a handed-over
     /// call's does.

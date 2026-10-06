@@ -88,9 +88,60 @@ pub(crate) fn gateway_credentials_for(
 /// about instantly (and, on the LCR path, blames the carrier for a `408` it
 /// never saw a packet for). The proxy's own relay answers `502` the moment a
 /// target will not resolve; this is the B2BUA half of that.
+///
+/// The parameters are [`b2bua_dial_b_leg`]'s, which does the work and is
+/// where each is described.
 #[must_use = "an unsent B-leg INVITE must fail the call now, not at the ring timeout"]
-#[allow(clippy::too_many_lines)] // TODO(1.9.0 split): decomposed by the dispatcher module split. b2bua_send_b_leg_invite
 pub fn b2bua_send_b_leg_invite(
+    call_id: &str,
+    target_uri: &str,
+    next_hop: Option<&str>,
+    flow: Option<&crate::script::api::registrar::PyFlow>,
+    b_leg_route: &[String],
+    send_socket: Option<&crate::transport::SendSocket>,
+    forced_call_id: Option<&str>,
+    original_request: &SipMessage,
+    number_policy: Option<&crate::numbers::policy::NumberPolicy>,
+    retarget_number: Option<&str>,
+    caller_id: Option<&str>,
+    caller_id_presentation: Option<crate::sip::privacy::CallerIdPresentation>,
+    branch_from_host: Option<&str>,
+    branch_to: Option<&str>,
+    extra_headers: &[(String, String)],
+    state: &DispatcherState,
+) -> bool {
+    b2bua_dial_b_leg(
+        call_id,
+        target_uri,
+        next_hop,
+        flow,
+        b_leg_route,
+        send_socket,
+        forced_call_id,
+        original_request,
+        number_policy,
+        retarget_number,
+        caller_id,
+        caller_id_presentation,
+        branch_from_host,
+        branch_to,
+        extra_headers,
+        state,
+    )
+    .is_some()
+}
+
+/// [`b2bua_send_b_leg_invite`], handing back the Via branch of the INVITE it
+/// sent, or `None` when nothing reached the transport.
+///
+/// The branch is the one identity a leg has that no other leg can share (RFC
+/// 3261 §8.1.1.7), and every response to the INVITE carries it. A caller that
+/// rings several targets for one call tells them apart by it, where the leg's
+/// position on the call moves and its Call-ID may be the caller's own.
+#[must_use = "an unsent B-leg INVITE must fail the call now, not at the ring timeout"]
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)] // TODO(1.9.0 split): decomposed by the dispatcher module split. b2bua_send_b_leg_invite
+pub fn b2bua_dial_b_leg(
     call_id: &str,
     target_uri: &str,
     next_hop: Option<&str>,
@@ -123,9 +174,14 @@ pub fn b2bua_send_b_leg_invite(
     // (`call.set_from_host()` / a dial-level `from`): a controller `dial`
     // target that names its own `from`, whose host belongs to that carrier.
     branch_from_host: Option<&str>,
+    // The whole `To` this branch alone is addressed to (`<uri>`, no tag): a
+    // controller `dial` target that names its own called party. Replaces the
+    // caller's `To` outright, so neither the authority rewrite, a pinned To
+    // host nor a retarget number touches it.
+    branch_to: Option<&str>,
     extra_headers: &[(String, String)],
     state: &DispatcherState,
-) -> bool {
+) -> Option<String> {
     // Where the INVITE goes: over the captured flow, or to the topmost Route of
     // a Path route set, an explicit next hop or the target. The same decision
     // an originate to a registered phone makes (`resolve_leg_destination`).
@@ -154,7 +210,7 @@ pub fn b2bua_send_b_leg_invite(
                 route = ?b_leg_route,
                 "B2BUA: cannot dial the B-leg: {error}",
             );
-            return false;
+            return None;
         }
     };
     let routing_uri = routing_uri.as_str();
@@ -212,6 +268,15 @@ pub fn b2bua_send_b_leg_invite(
         }
         None => None,
     };
+    // Unpinned B-leg to the other address family: it leaves from the listener
+    // bound in that family, so the Via and Contact name that one (see
+    // `family_egress_socket`).
+    let family_egress = if send_socket.is_none() && flow.is_none() {
+        state.family_egress_socket(outbound_transport, destination)
+    } else {
+        None
+    };
+    let send_socket = send_socket.or(family_egress.as_ref());
 
     // The local socket this B-leg is anchored on — `Some` when the script
     // dialled over a captured flow, which is what pins the egress.  The leg
@@ -360,18 +425,7 @@ pub fn b2bua_send_b_leg_invite(
             .map(str::to_string)
             .or(from_host_override)
             .unwrap_or_else(|| state.via_host(&outbound_transport));
-        if let Some(at_pos) = new_from.find('@') {
-            // Find the end of the host: first occurrence of '>', ':', or ';' after '@'
-            let after_at = &new_from[at_pos + 1..];
-            let host_end = after_at.find(['>', ';', ':']).unwrap_or(after_at.len());
-            let end_pos = at_pos + 1 + host_end;
-            new_from = format!(
-                "{}{}{}",
-                &new_from[..at_pos + 1],
-                from_host,
-                &new_from[end_pos..]
-            );
-        }
+        new_from = crate::b2bua::actor::rewrite_uri_host(&new_from, &from_host);
 
         b_leg_invite.headers.set("From", new_from);
     }
@@ -414,7 +468,15 @@ pub fn b2bua_send_b_leg_invite(
     // Strip any To-tag (B-leg INVITE should not have one) and rewrite the To URI
     // host to match the dial target (topology hiding — A-leg advertised address
     // must not leak to B-leg).
-    if let Some(to) = b_leg_invite
+    //
+    // A branch naming its own called party replaces the To outright. A divert
+    // reaches a different number from the one the caller dialled; keeping the
+    // caller's user would address the B-leg to the original number, and a next
+    // hop routing on To would serve it as such and could send it back.
+    if let Some(to) = branch_to {
+        b_leg_invite.headers.remove("t");
+        b_leg_invite.headers.set("To", to.to_string());
+    } else if let Some(to) = b_leg_invite
         .headers
         .get("To")
         .or_else(|| b_leg_invite.headers.get("t"))
@@ -563,7 +625,7 @@ pub fn b2bua_send_b_leg_invite(
     // Per-call override (from call.session_timer()) takes precedence over global config.
     //
     // REPLACE, never append. This INVITE is a clone of the A-leg's, so whatever
-    // the caller asked for is already on it — a Teams INVITE arrives carrying
+    // the caller asked for is already on it — an INVITE may arrive carrying
     // `Session-Expires: 3600` and `Min-SE: 300`. `Session-Expires` and `Min-SE`
     // are single-value headers (RFC 4028 §4, §5), so appending emitted two of
     // each and left the callee to pick: siphon's `Min-SE: 90` next to the
@@ -596,7 +658,7 @@ pub fn b2bua_send_b_leg_invite(
     // Sanitize SDP: mask A-leg identity in o= and s= lines, and rewrite
     // the o= address to our advertised address for topology hiding.
     let sdp_addr = state.via_host(&outbound_transport);
-    sanitize_sdp_identity(&mut b_leg_invite.body, &state.sdp_name, Some(&sdp_addr));
+    hide_sdp_identity(&mut b_leg_invite.body, state, Some(&sdp_addr));
 
     // Update Content-Length after SDP rewrite (o=/s= changes may alter body size)
     if !b_leg_invite.body.is_empty() {
@@ -683,7 +745,7 @@ pub fn b2bua_send_b_leg_invite(
             call_id = %call_id,
             "B2BUA: the call ended before its B-leg INVITE went out — not sending it"
         );
-        return false;
+        return None;
     }
     spawn_b_leg_actor(call_id, &b_leg, state);
     // A branch of a controller-issued `dial` is named to the controller now,
@@ -770,7 +832,7 @@ pub fn b2bua_send_b_leg_invite(
                 state,
             );
             callee_dialog_ended(call_id, &branch, state);
-            return false;
+            return None;
         }
     } else {
         let relay_target = RelayTarget {
@@ -808,7 +870,7 @@ pub fn b2bua_send_b_leg_invite(
     // initial INVITE (CSeq 1 is now used); subsequent requests (re-INVITE,
     // BYE, 401/407 retry) use CSeq >= 2.
     //
-    // Also CANCEL this INVITE right away when it is owed one (RFC 3261 §9.1 —
+    // Also take up the CANCEL this INVITE is owed, if any (RFC 3261 §9.1 —
     // a CANCEL copies the INVITE's Via branch and CSeq, so it can only be built
     // once the INVITE is on the wire and its hygiene-processed form stashed):
     //  * a CANCEL was deferred onto the leg while the INVITE was being built —
@@ -840,40 +902,21 @@ pub fn b2bua_send_b_leg_invite(
     };
 
     if let Some(leg) = cancel_now {
-        let cancel = stored_invite
-            .lock()
-            .ok()
-            .and_then(|invite| build_cancel_from_invite(&invite));
-        match cancel {
-            Some(cancel_msg) => {
-                debug!(
-                    call_id = %call_id,
-                    branch = %leg.branch,
-                    "B2BUA: CANCELling a B-leg INVITE as soon as it is stashed"
-                );
-                // Kept answerable first, so the 487 this draws is ACKed and a 2xx
-                // crossing it is ACKed and BYEd even though the call may be gone.
-                state.call_actors.keep_answerable(std::iter::once(&leg));
-                // Same egress socket as the INVITE it cancels — RFC 3261 §9.1
-                // puts the CANCEL on the INVITE's own hop, and on a flow-pinned
-                // leg that hop is the flow's socket.
-                send_b2bua_to_bleg(
-                    cancel_msg,
-                    leg.transport.transport,
-                    leg.transport.remote_addr,
-                    flow_local_addr,
-                    state,
-                );
-                schedule_zombie_cancelled_expiry(state.call_actors.clone(), vec![leg.branch]);
-            }
-            None => warn!(
-                call_id = %call_id,
-                "B2BUA: cannot build the CANCEL a B-leg INVITE is owed from its stored copy — it rings until it answers or times out"
-            ),
-        }
+        debug!(
+            call_id = %call_id,
+            branch = %leg.branch,
+            "B2BUA: a B-leg INVITE is owed a CANCEL as soon as it is stashed"
+        );
+        // Kept answerable, so whatever this INVITE draws is handled even though
+        // the call may be gone. The INVITE has only just left and has drawn no
+        // provisional, so the CANCEL itself waits for the first one (RFC 3261
+        // §9.1), and then goes from the socket the INVITE left on: §9.1 puts
+        // it on the INVITE's own hop, the flow's socket on a flow-pinned leg.
+        state.call_actors.keep_answerable(std::iter::once(&leg));
+        cancel_kept_branches(std::slice::from_ref(&leg), state);
     }
 
-    true
+    Some(branch)
 }
 
 /// Apply 401/407 digest-retry edits to a previously sent B-leg INVITE.
@@ -922,38 +965,30 @@ pub fn build_retry_invite(original: &SipMessage, new_via: String, cseq: u32) -> 
 
 /// Spawn a [`LegActor`] for a B-leg and store its handle in the call.
 ///
-/// The actor classifies inbound SIP messages into [`CallEvent`]s.
-/// Call this after `add_b_leg` — uses the last B-leg index.
-pub fn spawn_b_leg_actor(call_id: &str, b_leg: &Leg, state: &DispatcherState) {
-    if let Some(call) = state.call_actors.get_call(call_id) {
-        if let Some(event_tx) = &call.event_tx {
-            let (actor, handle) = LegActor::new(b_leg.clone(), event_tx.clone());
-            let b_leg_index = call.b_legs.len().saturating_sub(1);
-            drop(call);
-            tokio::spawn(actor.run());
-            if let Some(mut call) = state.call_actors.get_call_mut(call_id) {
-                call.set_b_leg_handle(b_leg_index, handle);
-            }
-        }
-    }
-}
-
-/// Spawn a [`LegActor`] for a B-leg whose slot is at an explicit `index`.
+/// The actor classifies inbound SIP messages into [`CallEvent`]s. Call this
+/// after the leg is on the call, appended (`add_b_leg`) or superseding a failed
+/// attempt in place (`replace_b_leg_on`, the 401/407 and 422 retries).
 ///
-/// Like [`spawn_b_leg_actor`] but stores the handle at `index` rather than the
-/// last B-leg. Used by the 401/407 and 422 retry paths, which *supersede* the
-/// failed leg in place (via `CallActorStore::replace_b_leg`) instead of
-/// appending — so the retry's actor handle must land on the same slot the
-/// retry leg occupies.
-pub fn spawn_b_leg_actor_at(call_id: &str, b_leg: &Leg, index: usize, state: &DispatcherState) {
-    if let Some(call) = state.call_actors.get_call(call_id) {
-        if let Some(event_tx) = &call.event_tx {
-            let (actor, handle) = LegActor::new(b_leg.clone(), event_tx.clone());
-            drop(call);
-            tokio::spawn(actor.run());
-            if let Some(mut call) = state.call_actors.get_call_mut(call_id) {
-                call.set_b_leg_handle(index, handle);
-            }
+/// The handle goes to the slot of the leg carrying `b_leg`'s Via branch, found
+/// under the lock that stores it. The call is not held while the actor is
+/// spawned, and a leg added or taken off in between moves the positions: "the
+/// last leg", or a position read before, would then hold another leg's actor.
+pub fn spawn_b_leg_actor(call_id: &str, b_leg: &Leg, state: &DispatcherState) {
+    let Some(event_tx) = state
+        .call_actors
+        .get_call(call_id)
+        .and_then(|call| call.event_tx.clone())
+    else {
+        return;
+    };
+    let (actor, handle) = LegActor::new(b_leg.clone(), event_tx);
+    tokio::spawn(actor.run());
+    if let Some(mut call) = state.call_actors.get_call_mut(call_id) {
+        if let Some(index) = call
+            .find_b_leg_by_branch(&b_leg.branch)
+            .map(|(index, _)| index)
+        {
+            call.set_b_leg_handle(index, handle);
         }
     }
 }

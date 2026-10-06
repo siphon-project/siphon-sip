@@ -1,0 +1,58 @@
+# siphon config for the `control-transfer` acceptance harness
+# (sipp/control/transfer_app.py + sipp/control/transfer_routes.py +
+# sipp/control/run_transfer_case.sh + sipp/control_transfer_*.xml).
+#
+# One siphon, one persistent control application, one case per call: giving up
+# on a ringing dial, a REFER from the callee of a controlled call in each of
+# its three outcomes, a party replaced by an AoR with two registered contacts,
+# and the media verbs that need a real engine to answer them. Against the REAL
+# siphon-rtp engine for that last reason: what `hold` is refused with on a
+# relayed call is the engine's own answer, which a mock would only repeat back.
+
+listen:
+  udp:
+    - "0.0.0.0:5060"
+
+domain:
+  local:
+    - "transfer.test"
+    - "172.20.0.240"
+
+advertised_address: "172.20.0.240"
+
+script:
+  path: "/etc/siphon/scripts/transfer_routes.py"
+
+media:
+  backend: siphon-rtp
+  siphon_rtp:
+    address: "172.20.0.130:8080"
+    timeout_ms: 2000
+
+  profiles:
+    # Plain RTP, no ICE and no DTLS, so SIPp answers the engine's SDP without
+    # help. The cancel-dial caller is answered with it, and the media case's
+    # two parties are relayed through the engine with it.
+    transfer_relay:
+      offer: &transfer_flags
+        transport_protocol: "RTP/AVP"
+        ice: "remove"
+        dtls: "off"
+        replace: ["origin"]
+      answer: *transfer_flags
+
+control:
+  listen: "0.0.0.0:9092"
+  apps:
+    - name: "transfer-app"
+      token: "transfer-app-token"
+      per_call_connect: false
+      on_lost: "hangup"
+  limits:
+    event_queue_depth: 256
+    slow_consumer: drop_oldest
+    reattach_grace_secs: 10
+    handoff_deadline_ms: 20000
+
+log:
+  level: info

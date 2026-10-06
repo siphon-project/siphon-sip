@@ -1657,17 +1657,27 @@ jobs:
       - name: B2BUA REFER terminate + REAL rtpengine (media re-anchor offer/answer/delete)
         run: COMPOSE_PROFILES=b2bua-rtpengine-refer bash sipp/run_call.sh sipp-anchored-refer-uac sipp-anchored-refer-bob-uas sipp-anchored-refer-carol-uas
 
+      # The caller speaks SRTP and the callee plain RTP, anchored with a profile
+      # whose halves say so. The callee holds and resumes: each re-INVITE must
+      # reach the caller as SRTP and be answered to the callee as plain RTP.
+      # Both parties assert the SDP they are sent, and run_call.sh grades both.
+      - name: B2BUA callee re-offer at an SRTP edge + REAL rtpengine (each party keeps its transport)
+        run: |
+          docker compose -f sipp/docker-compose.yaml --profile b2bua-rtpengine-reoffer up -d --wait rtpengine-real siphon-b2bua-rtpengine-reoffer
+          COMPOSE_PROFILES=b2bua-rtpengine-reoffer bash sipp/run_call.sh sipp-srtp-edge-reoffer-uac sipp-srtp-edge-reoffer-uas
+
       - name: Collect logs
         if: always()
         run: |
           docker compose -f sipp/docker-compose.yaml logs siphon-b2bua > siphon-b2bua-refer.log 2>&1 || true
           docker compose -f sipp/docker-compose.yaml logs siphon-b2bua-refer-modes >> siphon-b2bua-refer.log 2>&1 || true
           docker compose -f sipp/docker-compose.yaml logs siphon-b2bua-rtpengine-refer >> siphon-b2bua-refer.log 2>&1 || true
+          docker compose -f sipp/docker-compose.yaml logs siphon-b2bua-rtpengine-reoffer >> siphon-b2bua-refer.log 2>&1 || true
           docker compose -f sipp/docker-compose.yaml logs rtpengine-real > rtpengine-real.log 2>&1 || true
 
       - name: Teardown
         if: always()
-        run: docker compose -f sipp/docker-compose.yaml --profile b2bua --profile b2bua-refer --profile b2bua-refer-reject --profile b2bua-refer-terminate --profile b2bua-refer-referrer-bye --profile b2bua-refer-attended --profile b2bua-replaces --profile b2bua-bleg-ack --profile b2bua-rtpengine-refer down --remove-orphans
+        run: docker compose -f sipp/docker-compose.yaml --profile b2bua --profile b2bua-refer --profile b2bua-refer-reject --profile b2bua-refer-terminate --profile b2bua-refer-referrer-bye --profile b2bua-refer-attended --profile b2bua-replaces --profile b2bua-bleg-ack --profile b2bua-rtpengine-refer --profile b2bua-rtpengine-reoffer down --remove-orphans
 
       - name: Upload logs
         if: always()
@@ -1829,6 +1839,92 @@ jobs:
             siphon-bridge.log
             bridge-app.log
             sipp-bridge-uas.log
+            siphon-rtp-engine.log
+            *.log
+
+  # ── `dial {on_answer: "bridge"}`: ringing a phone for an answered caller ──
+  # A phone registers. A controller answers a caller anchored on the media
+  # engine, rings the phone's AoR with `dial {on_answer: "bridge"}`, and siphon
+  # bridges the two when the phone picks up. Two oracles:
+  #
+  #   * the SIPp scenarios decide the run and assert the SIP wire — the phone
+  #     rung offerless and shown the caller's identity, its answer carried on
+  #     the ACK (RFC 3261 §13.2.2.4), both legs re-INVITEd onto the engine by
+  #     the bridge, the caller's hold and resume relayed to the phone, and the
+  #     BYE the phone gets when the caller leaves (the peer-hangup policy);
+  #   * the application's verdict covers the verb contract — a connecting dial
+  #     and a second bridge dial both refused `invalid_state`, the reply naming
+  #     one branch, ringback once the phone alerts, `DialAnswered` naming a
+  #     channel for the phone, and `ChannelBridged` on both channels.
+  #
+  # Against the real siphon-rtp engine: the bridge re-points live media
+  # sessions, which a mock would only record.
+  sipp-dial-bridge:
+    runs-on: ubuntu-latest
+    needs: build-image
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Load the siphon image
+        uses: ./.github/actions/load-siphon-image
+
+      # --wait on the application as well: siphon parks a handed-over call only
+      # while a controller is connected.
+      - name: Start the media engine, siphon and the control application
+        run: docker compose -f sipp/docker-compose.yaml --profile dial-bridge up -d --force-recreate --wait siphon-rtp-engine siphon-dial-bridge dial-bridge-app
+
+      # The phone's dependency registers its AoR and runs to completion; the
+      # phone then listens on the same address.
+      - name: Register the phone, then start it
+        run: docker compose -f sipp/docker-compose.yaml --profile dial-bridge up -d --force-recreate sipp-dial-bridge-phone
+
+      # The caller finishes last (its trailing pause), so it decides the step.
+      # --no-deps: the register one-shot shares the phone's address and must not
+      # be started again while the phone holds it.
+      - name: Answer the caller, ring the phone, bridge the two on answer
+        run: docker compose -f sipp/docker-compose.yaml --profile dial-bridge up --no-deps --abort-on-container-exit --exit-code-from sipp-dial-bridge-uac sipp-dial-bridge-uac
+
+      # The phone ran detached, so without this its scenario could fail and the
+      # job would still be green.
+      - name: Assert the phone scenario passed
+        run: |
+          code="$(timeout 90 docker wait sipp-dial-bridge-phone || echo "no exit within 90 s")"
+          if [ "$code" != "0" ]; then
+            echo "the phone scenario exited $code"
+            docker compose -f sipp/docker-compose.yaml logs sipp-dial-bridge-phone | tail -60
+            exit 1
+          fi
+
+      - name: Assert the control application's verdict
+        if: always()
+        run: |
+          docker compose -f sipp/docker-compose.yaml logs dial-bridge-app > dial-bridge-app.log 2>&1 || true
+          grep -q 'DIAL-BRIDGE-VERDICT' dial-bridge-app.log || { echo "no verdict — the control application never completed"; exit 1; }
+          if grep -q '"pass": false' dial-bridge-app.log; then
+            echo "dial-bridge acceptance checks failed:"; grep 'DIAL-BRIDGE-VERDICT' dial-bridge-app.log; exit 1
+          fi
+          grep 'DIAL-BRIDGE-VERDICT' dial-bridge-app.log
+
+      - name: Collect logs
+        if: always()
+        run: |
+          docker compose -f sipp/docker-compose.yaml logs siphon-dial-bridge > siphon-dial-bridge.log 2>&1 || true
+          docker compose -f sipp/docker-compose.yaml logs sipp-dial-bridge-phone > sipp-dial-bridge-phone.log 2>&1 || true
+          docker compose -f sipp/docker-compose.yaml logs siphon-rtp-engine > siphon-rtp-engine.log 2>&1 || true
+
+      - name: Teardown
+        if: always()
+        run: docker compose -f sipp/docker-compose.yaml --profile dial-bridge down --remove-orphans
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: sipp-dial-bridge-logs
+          path: |
+            siphon-dial-bridge.log
+            dial-bridge-app.log
+            sipp-dial-bridge-phone.log
             siphon-rtp-engine.log
             *.log
 
@@ -1994,6 +2090,88 @@ jobs:
             control-app-ivr.log
             control-app-inbound.log
             mock-control-rtp.log
+            *.log
+
+  # ── Control plane: giving up a dial, a REFER from the callee, replacing a party
+  # Six cases against one siphon and one persistent control application, each a
+  # caller plus the detached parties that case needs (sipp/control/
+  # run_transfer_case.sh). Three oracles per case, because none sees the whole
+  # of it:
+  #
+  #   * the SIPp scenarios assert the wire: the CANCEL each rung phone gets and
+  #     the ACK its 487 is owed (RFC 3261 §9.1, §17.1.1.3), the 202 and the
+  #     sipfrag NOTIFYs a referrer gets (RFC 3515 §2.4.4), the re-INVITE the
+  #     surviving party gets, the BYE the replaced one gets, and a caller left
+  #     untouched while a dial is given up or a replacement fails;
+  #   * the application's verdict covers the replies and events: `cancel_dial`
+  #     and its `DialFailed` 487, `TransferRequested` naming the callee's leg,
+  #     `accept_refer` in each mode, `complete_refer`, one `PeerReplaced` or
+  #     one `ReplaceFailed`, and what `hold` and `play` are refused with;
+  #   * the runner compares Call-IDs, which only the wire and the rail both
+  #     see: the dialog an event names is the one the party was called on, and
+  #     the two contacts of an AoR were rung on dialogs of their own.
+  #
+  # Against the real siphon-rtp engine: what `hold` is refused with on a
+  # relayed call is the engine's own answer.
+  sipp-control-transfer:
+    runs-on: ubuntu-latest
+    needs: build-image
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Load the siphon image
+        uses: ./.github/actions/load-siphon-image
+
+      # --wait on the application as well: siphon parks a handed-over call only
+      # while a controller is connected.
+      - name: Start the media engine, siphon and the control application
+        run: docker compose -f sipp/docker-compose.yaml --profile control-transfer up -d --force-recreate --wait siphon-rtp-engine siphon-control-transfer control-transfer-app
+
+      - name: cancel_dial — both phones CANCELled, the caller untouched and dialled for again
+        run: bash sipp/control/run_transfer_case.sh cancel-dial control_transfer_cancel_dial_uac.xml sipp-control-transfer-ringing-phone sipp-control-transfer-trying-phone
+
+      # RFC 3261 §9.1: no CANCEL for an INVITE that has drawn no provisional.
+      - name: cancel_dial before the phone has responded — CANCELled on its first provisional, the 487 ACKed
+        run: bash sipp/control/run_transfer_case.sh cancel-late-ringing control_transfer_cancel_dial_uac.xml sipp-control-transfer-late-ringing-phone
+
+      - name: cancel_dial before the phone has responded — its late 200 ACKed and released with a BYE, never CANCELled
+        run: bash sipp/control/run_transfer_case.sh cancel-late-answer control_transfer_cancel_dial_uac.xml sipp-control-transfer-late-answering-phone
+
+      - name: A REFER from the callee — declined, then accepted and carried out by siphon
+        run: bash sipp/control/run_transfer_case.sh refer-callee control_transfer_survivor_uac.xml sipp-control-transfer-referrer-phone sipp-control-transfer-target
+
+      - name: A transfer the application carries out — reported 200, reported 486, left to its deadline
+        run: bash sipp/control/run_transfer_case.sh refer-controller control_transfer_uac.xml sipp-control-transfer-controller-referrer-phone sipp-control-transfer-silent-target
+
+      - name: replace_peer to an AoR with two contacts — one answers, the other is CANCELled
+        run: bash sipp/control/run_transfer_case.sh replace-aor control_transfer_survivor_uac.xml sipp-control-transfer-callee-phone sipp-control-transfer-answering-contact sipp-control-transfer-cancelled-contact
+
+      - name: replace_peer to an AoR whose contacts both refuse — one failure, the call kept
+        run: bash sipp/control/run_transfer_case.sh replace-aor-refused control_transfer_probe_uac.xml sipp-control-transfer-callee-phone sipp-control-transfer-busy-contact sipp-control-transfer-unavailable-contact
+
+      - name: hold on a relayed call, and play's repeat argument
+        run: bash sipp/control/run_transfer_case.sh media control_transfer_media_uac.xml sipp-control-transfer-callee-phone
+
+      - name: Collect logs
+        if: always()
+        run: |
+          docker compose -f sipp/docker-compose.yaml logs siphon-control-transfer > siphon-control-transfer.log 2>&1 || true
+          docker compose -f sipp/docker-compose.yaml logs control-transfer-app > control-transfer-app.log 2>&1 || true
+          docker compose -f sipp/docker-compose.yaml logs siphon-rtp-engine > siphon-rtp-engine.log 2>&1 || true
+
+      - name: Teardown
+        if: always()
+        run: docker compose -f sipp/docker-compose.yaml --profile control-transfer down --remove-orphans
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: sipp-control-transfer-logs
+          path: |
+            siphon-control-transfer.log
+            control-transfer-app.log
+            siphon-rtp-engine.log
             *.log
 
   # ── B2BUA A-leg INVITE authentication ──────────────────────────────────
@@ -2372,7 +2550,7 @@ jobs:
         # Pinned to the release siphon pins siphon-rtp-proto to, so this proves
         # a known-good pairing rather than whatever shipped most recently.
         run: |
-          docker create --name rtp-extract ghcr.io/siphon-project/siphon-rtp:0.7.1
+          docker create --name rtp-extract ghcr.io/siphon-project/siphon-rtp:0.12.0
           docker cp rtp-extract:/usr/local/bin/siphon-rtp ./siphon-rtp
           docker rm rtp-extract
           chmod +x ./siphon-rtp
@@ -2694,6 +2872,94 @@ jobs:
           path: |
             siphon-rtpproxy-real.log
             rtpproxy-real.log
+
+  # ── An independent SIP call suite, with siphon as the system under test ──
+  # Everything above is siphon talking to SIPp scenarios written alongside it,
+  # so a misreading of the RFC that both share passes. This drives the same
+  # kinds of call (setup, early media, failures, compact headers, early CANCEL,
+  # re-INVITE, hold) from a second SIP stack, on IPv4 and IPv6, through siphon
+  # as a proxy and as a B2BUA with media on a real rtpproxy. It fails on three
+  # things: either user agent unhappy with what it was sent, an SDP that does
+  # not point at the relay, and the relay's own session and command counters
+  # differing from the expected ones. The last is what catches a media session
+  # created twice or never released.
+  #
+  # siphon is not built here: the image is siphon's own from build-image, laid
+  # over the published rtpproxy image (interop/voiptests/Dockerfile).
+  #
+  # Every input is pinned. The suite is third-party code that runs in this
+  # pipeline, so it is checked out at a commit, never a branch, and the job has
+  # no secrets and only read access. For now that commit is on a fork carrying
+  # the siphon scenarios; it moves to the upstream repository once they are
+  # merged there.
+  interop-call-suite:
+    runs-on: ubuntu-latest
+    needs: build-image
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [simple, b2bua]
+        control: [udp, udp6]
+    env:
+      SUITE_REPOSITORY: siphon-project/voiptests
+      SUITE_COMMIT: 811c5470953977045e4accc92df2302974fb6a59
+      RTPPROXY_TOOLS_COMMIT: 630f75e22ab30c9856e6200f4bab29e938b990c2
+      RTPPROXY_IMAGE: ghcr.io/sippy/rtpproxy@sha256:7cf39743917d836af56f9c4293d4c79d1e528938f2a9e7fa60a6039d8358f4a8
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Load the siphon image
+        uses: ./.github/actions/load-siphon-image
+
+      - name: Check out the suite
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ env.SUITE_REPOSITORY }}
+          ref: ${{ env.SUITE_COMMIT }}
+          path: interop/voiptests/dist/voiptests
+          persist-credentials: false
+
+      - name: Check out rtpproxy's control tools
+        uses: actions/checkout@v7
+        with:
+          repository: sippy/rtpproxy
+          ref: ${{ env.RTPPROXY_TOOLS_COMMIT }}
+          path: interop/voiptests/dist/rtpproxy
+          persist-credentials: false
+
+      - name: Build the suite image around the siphon image
+        run: |
+          docker build \
+            --build-arg SIPHON_IMAGE=sipp-siphon:latest \
+            --build-arg BASE_IMAGE="$RTPPROXY_IMAGE" \
+            -t siphon-call-suite interop/voiptests
+
+      # The suite's own scenario selector is MM_AUTH: `simple` is siphon as a
+      # proxy, `b2bua` as a B2BUA. RTPPC_TYPE is how siphon reaches rtpproxy.
+      - name: Run the suite (${{ matrix.mode }}, rtpproxy control over ${{ matrix.control }})
+        timeout-minutes: 5
+        run: |
+          docker run --name suite --privileged \
+            --sysctl net.ipv6.conf.all.disable_ipv6=0 \
+            -e MM_AUTH=${{ matrix.mode }} -e RTPPC_TYPE=${{ matrix.control }} \
+            siphon-call-suite
+
+      - name: Collect logs
+        if: always()
+        run: |
+          mkdir -p suite-logs
+          for log in siphon.log siphon.yaml alice.log bob.log rtpproxy.log rtpproxy.rout; do
+            docker cp "suite:/opt/voiptests/$log" suite-logs/ 2> /dev/null || true
+          done
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: interop-call-suite-${{ matrix.mode }}-${{ matrix.control }}-logs
+          path: suite-logs
 
   # ── A media failure at answer must fail the call, not connect and bill it ──
   # @b2bua.on_answer is where the media backend is driven, so an answer the

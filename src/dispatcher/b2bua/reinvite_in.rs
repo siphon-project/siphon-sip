@@ -40,7 +40,7 @@ pub fn handle_b2bua_reinvite(
     };
 
     // In-dialog direction by dialog identity (RFC 3261 §12 — Call-ID + From-tag),
-    // never by source socket: a Teams-style peer opens a NEW TLS connection (new
+    // never by source socket: a peer may open a NEW TLS connection (new
     // source port) for its re-INVITE, so a socket comparison misclassifies the
     // direction and reflects the re-INVITE back at the leg it came from.
     let from_tag = message.typed_from().ok().flatten().and_then(|na| na.tag);
@@ -115,6 +115,11 @@ pub fn handle_b2bua_reinvite(
     // A leg of a formed controller bridge: the other party is another call
     // actor, and the offer is relayed to it there.
     if from_a_leg && relay_bridged_offer(&inbound, &message, &call_id, state) {
+        return;
+    }
+    // A leg with no second party and no session the engine answers for it: a
+    // leg parted from its bridge. Before its offer is taken for its media.
+    if from_a_leg && answer_unanchored_reoffer(&inbound, &message, &call_id, state) {
         return;
     }
 
@@ -451,7 +456,7 @@ pub fn handle_b2bua_reinvite(
         // target leg (same arrival socket as the Via above), so a v6 A-leg gets
         // a v6 o= address to go with its v6 Via.
         let sdp_addr = state.a_leg_advertised_host(target_local_addr, &transport);
-        sanitize_sdp_identity(&mut forwarded.body, &state.sdp_name, Some(&sdp_addr));
+        hide_sdp_identity(&mut forwarded.body, state, Some(&sdp_addr));
 
         // RTPEngine: rewrite re-INVITE SDP through offer to maintain media anchoring.
         // Without this, re-INVITE SDP passes through unmodified — if the remote side
@@ -694,8 +699,12 @@ pub fn handle_b2bua_reinvite(
 ///
 /// An offerless refresh (RFC 4028 §10) is answered with the leg's current media
 /// instead, because RFC 3261 §13.2.1 makes the 2xx to an offerless INVITE carry
-/// the offer. Without a media session there is nothing truthful to answer with,
-/// so it is refused rather than answered with an SDP that describes no path.
+/// the offer.
+///
+/// Only a session the engine is the far side of gets here. A leg with no
+/// session, or with one that relays to a second party (a leg parted from its
+/// bridge), is answered by [`answer_unanchored_reoffer`] before this is
+/// reached: the engine has nothing to answer that leg from on its own.
 pub fn answer_one_legged_reoffer(
     inbound: &InboundMessage,
     message: &SipMessage,
@@ -762,7 +771,13 @@ pub fn answer_one_legged_reoffer(
     let mut answer_flags = profile.answer.clone();
     // Pin media ingress where this request actually came from, as the offer path
     // does: a handset that changed network re-offers from a new public address.
-    answer_flags.stamp_received_from(inbound.remote_addr.ip());
+    // By the offering party's own policy, which for the one party of a session
+    // the engine answered itself is this same `answer` half.
+    session.party_ingress(true).stamp_ingress(
+        &mut answer_flags,
+        profiles,
+        inbound.remote_addr.ip(),
+    );
     answer_flags.stamp_sip_call_id_of(message);
 
     let answer_sdp = tokio::task::block_in_place(|| {
@@ -848,13 +863,18 @@ pub enum ReofferOutcome {
 
 /// Re-offer `offer`, from the caller when `from_a_leg` and else from the callee,
 /// through the media engine anchoring the call keyed by `a_leg_call_id`, with
-/// media ingress pinned to `received_from` where the profile asks for it and the
-/// offer filed under `offerer_sip_call_id`, the Call-ID of the offering party's
-/// own dialog.
+/// media ingress pinned to `received_from` where the offering party's own policy
+/// asks for it ([`crate::rtpengine::MediaSession::party_ingress`]) and the offer
+/// filed under `offerer_sip_call_id`, the Call-ID of the offering party's own
+/// dialog.
 ///
 /// The offering party is named by its own tag: the engine resolves the
 /// re-offering party by tag and answers with the leg facing the other one, so the
 /// other party's tag would come back wired to the wrong leg.
+///
+/// The command is shaped by the side of the profile that describes the party
+/// the rewritten offer is relayed to. A re-INVITE and an UPDATE both come
+/// through here.
 pub fn reoffer_through_media_engine(
     state: &DispatcherState,
     a_leg_call_id: &str,
@@ -873,17 +893,24 @@ pub fn reoffer_through_media_engine(
     let Some(session) = media_sessions.get(a_leg_call_id) else {
         return ReofferOutcome::NotAnchored;
     };
-    let Some(profile) = profiles.get(&session.profile) else {
+    // Shaped for the party the engine's result is relayed to, the other one:
+    // by its own side of the profile, whoever offers
+    // ([`crate::rtpengine::MediaSession::party_shape`]).
+    let Some(mut offer_flags) = session.party_shape(!from_a_leg).resolve(profiles) else {
         return ReofferOutcome::NotAnchored;
     };
     let Some(offer_tag) = session.offer_tag(from_a_leg) else {
         return ReofferOutcome::NoOfferTag;
     };
-    let mut offer_flags = profile.offer.clone();
     // Pin media ingress to where the offer actually came from, the way the initial
     // offer does: a client that changed network re-offers from a new public
-    // address, and the engine gates the leg on the last hint it was given.
-    offer_flags.stamp_received_from(received_from);
+    // address, and the engine gates the leg on the last hint it was given. The
+    // SDP is the offering party's, so the policy that asks for the pin is that
+    // party's own, not the `offer` half's: a callee that re-offers was set up
+    // under the `answer` half.
+    session
+        .party_ingress(from_a_leg)
+        .stamp_ingress(&mut offer_flags, profiles, received_from);
     offer_flags.stamp_sip_call_id(offerer_sip_call_id);
     match tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current().block_on(rtpengine_set.reoffer(

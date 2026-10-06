@@ -1,0 +1,327 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  The phone of the `refer-controller` case (sipp/control/transfer_app.py): the
+  callee of a controlled call sends three REFERs, and the application accepts
+  each with `accept_refer {mode: "controller"}`, the mode in which siphon
+  answers the REFER and transfers nothing.
+
+  recv INVITE -> 180 -> 200 -> recv ACK
+       -> REFER (CSeq 1) -> 202
+          -> recv NOTIFY (100 Trying, active;expires=30)           -> 200
+          -> recv NOTIFY (200 OK, terminated)                       -> 200
+       -> REFER (CSeq 2) -> 202
+          -> recv NOTIFY (100 Trying, active;expires=30)           -> 200
+          -> recv NOTIFY (486 Busy Here, terminated)                -> 200
+       -> REFER (CSeq 3) -> 202
+          -> recv NOTIFY (100 Trying, active;expires=2)            -> 200
+          -> recv NOTIFY (503 Service Unavailable, terminated)      -> 200
+       -> BYE -> 200
+
+  The first NOTIFY of each subscription advertises the time the application
+  asked for as its `expires`. The last one carries what the application
+  reported with `complete_refer`: a 200, then a 486 with the reason phrase it
+  named. The third is never reported, and siphon ends it itself at its two
+  second deadline with a 503 (RFC 3515 §2.4.4: a subscription ends by
+  something). Each subscription's `id` is its REFER's CSeq number (§2.4.6).
+
+  Nothing else happens to this phone: it is not BYEd, because the application
+  moved no party, and it ends the call itself. The Refer-To target runs
+  sipp/control_transfer_silent_target.xml, which fails if it is ever dialled.
+-->
+<scenario name="control-transfer callee whose transfers the application carries out">
+
+  <recv request="INVITE" crlf="true">
+    <action>
+      <ereg regexp="[^[:space:]]+" search_in="hdr" header="Call-ID:" assign_to="wire_call_id" />
+      <ereg regexp="tag=([^;>[:space:]]+)" search_in="hdr" header="From:" assign_to="junk_tag,remote_tag" />
+      <ereg regexp="&lt;([^>]+)>" search_in="hdr" header="From:" assign_to="junk_from,remote_uri" />
+      <ereg regexp="&lt;([^>]+)>" search_in="hdr" header="To:" assign_to="junk_to,local_uri" />
+      <ereg regexp="&lt;([^>]+)>" search_in="hdr" header="Contact:" assign_to="junk_contact,remote_contact" />
+      <exec command="echo WIRE-CALL-ID [$wire_call_id]" />
+      <log message="called on [$wire_call_id] ([$junk_tag][$junk_from][$junk_to][$junk_contact])" />
+    </action>
+  </recv>
+
+  <send>
+    <![CDATA[
+SIP/2.0 180 Ringing
+[last_Via:]
+[last_From:]
+[last_To:];tag=[pid]SIPpTag01[call_number]
+[last_Call-ID:]
+[last_CSeq:]
+Contact: <sip:phone@[local_ip]:[local_port];transport=[transport]>
+Content-Length: 0
+
+]]>
+  </send>
+
+  <pause milliseconds="200" />
+
+  <send retrans="500">
+    <![CDATA[
+SIP/2.0 200 OK
+[last_Via:]
+[last_From:]
+[last_To:];tag=[pid]SIPpTag01[call_number]
+[last_Call-ID:]
+[last_CSeq:]
+Contact: <sip:phone@[local_ip]:[local_port];transport=[transport]>
+Content-Type: application/sdp
+Content-Length: [len]
+
+v=0
+o=phone 53655765 2353687637 IN IP[local_ip_type] [local_ip]
+s=-
+c=IN IP[media_ip_type] [media_ip]
+t=0 0
+m=audio [media_port] RTP/AVP 8
+a=rtpmap:8 PCMA/8000
+a=ptime:20
+]]>
+  </send>
+
+  <recv request="ACK" timeout="5000" />
+
+  <pause milliseconds="500" />
+
+  <!-- ===== first transfer: reported 200 ===== -->
+  <send retrans="500">
+    <![CDATA[
+REFER [$remote_contact] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <[$local_uri]>;tag=[pid]SIPpTag01[call_number]
+To: <[$remote_uri]>;tag=[$remote_tag]
+Call-ID: [$wire_call_id]
+CSeq: 1 REFER
+Contact: <sip:phone@[local_ip]:[local_port];transport=[transport]>
+Max-Forwards: 70
+Refer-To: <sip:target@172.20.0.245:5060>
+User-Agent: SIPp/control-transfer-controller-referrer
+Content-Length: 0
+
+]]>
+  </send>
+
+  <recv response="202" crlf="true" />
+
+  <recv request="NOTIFY" crlf="true">
+    <action>
+      <ereg regexp="refer;id=1"
+            search_in="hdr" header="Event:" check_it="true" assign_to="first_trying_event" />
+      <ereg regexp="active;expires=30[[:space:]]*$"
+            search_in="hdr" header="Subscription-State:" check_it="true" assign_to="first_trying_state" />
+      <ereg regexp="message/sipfrag"
+            search_in="hdr" header="Content-Type:" check_it="true" assign_to="first_trying_type" />
+      <ereg regexp="SIP/2.0 100 Trying"
+            search_in="body" check_it="true" assign_to="first_trying_frag" />
+      <log message="transfer 1 opened: [$first_trying_event] [$first_trying_state] [$first_trying_type] [$first_trying_frag]" />
+    </action>
+  </recv>
+
+  <send>
+    <![CDATA[
+SIP/2.0 200 OK
+[last_Via:]
+[last_From:]
+[last_To:]
+[last_Call-ID:]
+[last_CSeq:]
+Content-Length: 0
+
+]]>
+  </send>
+
+  <recv request="NOTIFY" crlf="true" timeout="20000">
+    <action>
+      <ereg regexp="refer;id=1"
+            search_in="hdr" header="Event:" check_it="true" assign_to="first_final_event" />
+      <ereg regexp="terminated"
+            search_in="hdr" header="Subscription-State:" check_it="true" assign_to="first_final_state" />
+      <ereg regexp="SIP/2.0 200 OK"
+            search_in="body" check_it="true" assign_to="first_final_frag" />
+      <log message="transfer 1 reported: [$first_final_event] [$first_final_state] [$first_final_frag]" />
+    </action>
+  </recv>
+
+  <send>
+    <![CDATA[
+SIP/2.0 200 OK
+[last_Via:]
+[last_From:]
+[last_To:]
+[last_Call-ID:]
+[last_CSeq:]
+Content-Length: 0
+
+]]>
+  </send>
+
+  <pause milliseconds="500" />
+
+  <!-- ===== second transfer: reported 486 Busy Here ===== -->
+  <send retrans="500">
+    <![CDATA[
+REFER [$remote_contact] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <[$local_uri]>;tag=[pid]SIPpTag01[call_number]
+To: <[$remote_uri]>;tag=[$remote_tag]
+Call-ID: [$wire_call_id]
+CSeq: 2 REFER
+Contact: <sip:phone@[local_ip]:[local_port];transport=[transport]>
+Max-Forwards: 70
+Refer-To: <sip:target@172.20.0.245:5060>
+User-Agent: SIPp/control-transfer-controller-referrer
+Content-Length: 0
+
+]]>
+  </send>
+
+  <recv response="202" crlf="true" />
+
+  <recv request="NOTIFY" crlf="true">
+    <action>
+      <ereg regexp="refer;id=2"
+            search_in="hdr" header="Event:" check_it="true" assign_to="second_trying_event" />
+      <ereg regexp="active;expires=30[[:space:]]*$"
+            search_in="hdr" header="Subscription-State:" check_it="true" assign_to="second_trying_state" />
+      <ereg regexp="SIP/2.0 100 Trying"
+            search_in="body" check_it="true" assign_to="second_trying_frag" />
+      <log message="transfer 2 opened: [$second_trying_event] [$second_trying_state] [$second_trying_frag]" />
+    </action>
+  </recv>
+
+  <send>
+    <![CDATA[
+SIP/2.0 200 OK
+[last_Via:]
+[last_From:]
+[last_To:]
+[last_Call-ID:]
+[last_CSeq:]
+Content-Length: 0
+
+]]>
+  </send>
+
+  <recv request="NOTIFY" crlf="true" timeout="20000">
+    <action>
+      <ereg regexp="refer;id=2"
+            search_in="hdr" header="Event:" check_it="true" assign_to="second_final_event" />
+      <ereg regexp="terminated"
+            search_in="hdr" header="Subscription-State:" check_it="true" assign_to="second_final_state" />
+      <ereg regexp="SIP/2.0 486 Busy Here"
+            search_in="body" check_it="true" assign_to="second_final_frag" />
+      <log message="transfer 2 reported: [$second_final_event] [$second_final_state] [$second_final_frag]" />
+    </action>
+  </recv>
+
+  <send>
+    <![CDATA[
+SIP/2.0 200 OK
+[last_Via:]
+[last_From:]
+[last_To:]
+[last_Call-ID:]
+[last_CSeq:]
+Content-Length: 0
+
+]]>
+  </send>
+
+  <pause milliseconds="500" />
+
+  <!-- ===== third transfer: never reported, ended at its deadline ===== -->
+  <send retrans="500">
+    <![CDATA[
+REFER [$remote_contact] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <[$local_uri]>;tag=[pid]SIPpTag01[call_number]
+To: <[$remote_uri]>;tag=[$remote_tag]
+Call-ID: [$wire_call_id]
+CSeq: 3 REFER
+Contact: <sip:phone@[local_ip]:[local_port];transport=[transport]>
+Max-Forwards: 70
+Refer-To: <sip:target@172.20.0.245:5060>
+User-Agent: SIPp/control-transfer-controller-referrer
+Content-Length: 0
+
+]]>
+  </send>
+
+  <recv response="202" crlf="true" />
+
+  <recv request="NOTIFY" crlf="true">
+    <action>
+      <ereg regexp="refer;id=3"
+            search_in="hdr" header="Event:" check_it="true" assign_to="third_trying_event" />
+      <ereg regexp="active;expires=2[[:space:]]*$"
+            search_in="hdr" header="Subscription-State:" check_it="true" assign_to="third_trying_state" />
+      <ereg regexp="SIP/2.0 100 Trying"
+            search_in="body" check_it="true" assign_to="third_trying_frag" />
+      <log message="transfer 3 opened: [$third_trying_event] [$third_trying_state] [$third_trying_frag]" />
+    </action>
+  </recv>
+
+  <send>
+    <![CDATA[
+SIP/2.0 200 OK
+[last_Via:]
+[last_From:]
+[last_To:]
+[last_Call-ID:]
+[last_CSeq:]
+Content-Length: 0
+
+]]>
+  </send>
+
+  <recv request="NOTIFY" crlf="true" timeout="20000">
+    <action>
+      <ereg regexp="refer;id=3"
+            search_in="hdr" header="Event:" check_it="true" assign_to="third_final_event" />
+      <ereg regexp="terminated"
+            search_in="hdr" header="Subscription-State:" check_it="true" assign_to="third_final_state" />
+      <ereg regexp="SIP/2.0 503 Service Unavailable"
+            search_in="body" check_it="true" assign_to="third_final_frag" />
+      <log message="transfer 3 ended at its deadline: [$third_final_event] [$third_final_state] [$third_final_frag]" />
+    </action>
+  </recv>
+
+  <send>
+    <![CDATA[
+SIP/2.0 200 OK
+[last_Via:]
+[last_From:]
+[last_To:]
+[last_Call-ID:]
+[last_CSeq:]
+Content-Length: 0
+
+]]>
+  </send>
+
+  <!-- Long enough for the application to find its late report refused. -->
+  <pause milliseconds="5000" />
+
+  <send retrans="500">
+    <![CDATA[
+BYE [$remote_contact] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <[$local_uri]>;tag=[pid]SIPpTag01[call_number]
+To: <[$remote_uri]>;tag=[$remote_tag]
+Call-ID: [$wire_call_id]
+CSeq: 4 BYE
+Contact: <sip:phone@[local_ip]:[local_port];transport=[transport]>
+Max-Forwards: 70
+User-Agent: SIPp/control-transfer-controller-referrer
+Content-Length: 0
+
+]]>
+  </send>
+
+  <recv response="200" crlf="true" />
+
+</scenario>

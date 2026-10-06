@@ -5,7 +5,8 @@ use crate::dispatcher::*;
 
 /// Abandon an originated call that has not been answered: CANCEL the INVITE
 /// (RFC 3261 §9.1 — same Via branch and CSeq sequence as the request it
-/// cancels), stop retransmitting it, emit `StasisEnd`, and tear the call down.
+/// cancels, and only once it has drawn a provisional), emit `StasisEnd`, and
+/// tear the call down.
 ///
 /// This is what `hangup` means on an un-answered leg siphon placed. The
 /// inbound-call path answers its A-leg with a final non-2xx there, which is
@@ -66,36 +67,23 @@ pub(crate) fn abandon_originated_call(
     outcome: crate::b2bua::actor::DialBranchOutcome,
 ) -> bool {
     let internal_call_id = internal_call_id.to_string();
-    let staged = match state.call_actors.get_call(&internal_call_id) {
-        Some(call) => call.a_leg_invite.clone().map(|invite| {
-            (
-                invite,
-                call.a_leg.transport.transport,
-                call.a_leg.transport.remote_addr,
-                call.a_leg.transport.local_addr,
-                call.a_leg.branch.clone(),
-            )
-        }),
-        None => return false,
-    };
-    let Some((invite_arc, transport, destination, local_addr, branch)) = staged else {
-        return false;
+    let branch = match state.call_actors.get_call(&internal_call_id) {
+        Some(call) if call.a_leg_invite.is_some() => call.a_leg.branch.clone(),
+        _ => return false,
     };
 
-    // Stop the INVITE's own retransmit schedule first: we are giving up on it,
-    // and `arm_b2bua_retransmit` disarms it again when the CANCEL is armed —
-    // this also covers a leg whose CANCEL cannot be built.
-    state.b2bua_retransmits.disarm_branch(&branch);
-    let cancel = match invite_arc.lock() {
-        Ok(invite) => build_cancel_from_invite(&invite),
-        Err(_) => {
-            error!(call_id = %internal_call_id, "originate cancel: stored INVITE mutex poisoned");
-            None
-        }
-    };
-    if let Some(cancel) = cancel {
-        send_b2bua_to_bleg(cancel, transport, destination, local_addr, state);
+    // The leg is kept answerable apart from the call, which goes below, and
+    // CANCELled as RFC 3261 §9.1 allows: now when its INVITE has drawn a
+    // provisional, and on its first provisional when it has drawn nothing, its
+    // INVITE retransmitting until then. Everything else here happens now either
+    // way: the call is given up on at this moment, whenever its CANCEL goes.
+    let kept = state.call_actors.keep_pending_answerable(&internal_call_id);
+    if kept.is_empty() {
+        // Not waiting for a final response any more, so nothing to CANCEL, and
+        // nothing that should go on retransmitting.
+        state.b2bua_retransmits.disarm_branch(&branch);
     }
+    cancel_kept_branches(&kept, state);
 
     if crate::cdr::auto_emit_enabled() {
         cdr_finalize_b2bua_fail(state, &internal_call_id, 487);
@@ -110,8 +98,9 @@ pub(crate) fn abandon_originated_call(
         Some(487),
         Some("Request Terminated"),
     );
-    // Keep the leg alive as a zombie so a 2xx that raced our CANCEL is still
-    // ACKed + BYEd (RFC 3261 §9.1 glare) rather than left ringing on the callee.
+    // The leg kept above outlives the call, so the 487 its CANCEL draws is
+    // ACKed and a 2xx instead is ACKed + BYEd (RFC 3261 §9.1) rather than left
+    // ringing on the callee.
     if state
         .call_actors
         .remove_call_after_cancel(&internal_call_id)

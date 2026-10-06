@@ -18,9 +18,9 @@ use super::test_dispatcher::{test_dispatcher_with_script, TestDispatcher};
 use super::*;
 use crate::rtpengine::test_engine::TestEngine;
 
-const CALLER: &str = "192.0.2.20:5060";
-const CALLEE: &str = "198.51.100.90:5060";
-const CALLER_CALL_ID: &str = "offerless-call@192.0.2.20";
+pub(super) const CALLER: &str = "192.0.2.20:5060";
+pub(super) const CALLEE: &str = "198.51.100.90:5060";
+pub(super) const CALLER_CALL_ID: &str = "offerless-call@192.0.2.20";
 const NO_ANSWER_REASON: &str = "Q.850;cause=111;text=\"No SDP answer in ACK\"";
 const MEDIA_ANCHOR_FAILED_REASON: &str = "Q.850;cause=47;text=\"Media anchor failed\"";
 
@@ -68,7 +68,11 @@ async fn an_anchored_delayed_offer_is_answered_through_the_media_engine() {
         .as_ref()
         .and_then(|sessions| sessions.get(CALLER_CALL_ID))
         .expect("the media session");
-    assert_eq!(session.to_tag.as_deref(), Some("caller-tag"));
+    // Answered, and naming the caller first as every session does: on
+    // `to_tag` the caller would be taken for the callee by every later
+    // re-offer (`delayed_offer_ingress_tests`).
+    assert_eq!(session.from_tag, "caller-tag");
+    assert_eq!(session.to_tag.as_deref(), Some("callee-tag"));
     assert!(call.call_is_up());
 }
 
@@ -94,7 +98,7 @@ async fn an_anchored_delayed_offer_the_engine_cannot_answer_ends_the_call() {
 }
 
 /// The offer the callee puts in its 2xx: an audio and a video stream.
-const CALLEE_OFFER: &str = concat!(
+pub(super) const CALLEE_OFFER: &str = concat!(
     "v=0\r\n",
     "o=callee 7 7 IN IP4 198.51.100.91\r\n",
     "s=-\r\n",
@@ -108,7 +112,7 @@ const CALLEE_OFFER: &str = concat!(
 );
 
 /// The caller's answer, in its ACK: audio accepted, video declined.
-const CALLER_ANSWER: &str = concat!(
+pub(super) const CALLER_ANSWER: &str = concat!(
     "v=0\r\n",
     "o=caller 3 3 IN IP4 192.0.2.20\r\n",
     "s=-\r\n",
@@ -173,23 +177,23 @@ fn caller_leg() -> Leg {
 }
 
 /// One frame siphon put on the wire.
-struct Sent {
-    destination: SocketAddr,
-    message: SipMessage,
+pub(super) struct Sent {
+    pub(super) destination: SocketAddr,
+    pub(super) message: SipMessage,
 }
 
 impl Sent {
-    fn is(&self, method: Method) -> bool {
+    pub(super) fn is(&self, method: Method) -> bool {
         self.message.method() == Some(&method)
     }
 }
 
 /// A caller's offerless call bridged to one callee through a real dispatcher.
-struct OfferlessCall {
-    state: Arc<DispatcherState>,
+pub(super) struct OfferlessCall {
+    pub(super) state: Arc<DispatcherState>,
     udp: flume::Receiver<OutboundMessage>,
-    call_id: String,
-    invite: SipMessage,
+    pub(super) call_id: String,
+    pub(super) invite: SipMessage,
 }
 
 impl OfferlessCall {
@@ -230,9 +234,18 @@ impl OfferlessCall {
         OfferlessCall::dial_on(dispatcher)
     }
 
-    fn dial_on(TestDispatcher { state, udp }: TestDispatcher) -> OfferlessCall {
+    pub(super) fn dial_on(dispatcher: TestDispatcher) -> OfferlessCall {
+        OfferlessCall::dial_behind(dispatcher, None)
+    }
+
+    /// [`OfferlessCall::dial_on`] with `ahead` already on the call, so the
+    /// callee's leg is not the first.
+    fn dial_behind(TestDispatcher { state, udp }: TestDispatcher, ahead: Option<Leg>) -> Self {
         let state = Arc::new(state);
         let call_id = state.call_actors.create_call(caller_leg());
+        if let Some(ahead) = ahead {
+            assert!(state.call_actors.add_b_leg(&call_id, ahead));
+        }
         let a_leg_invite = Arc::new(Mutex::new(caller_invite()));
         state
             .call_actors
@@ -248,6 +261,7 @@ impl OfferlessCall {
                 None,
                 None,
                 &guard,
+                None,
                 None,
                 None,
                 None,
@@ -271,7 +285,7 @@ impl OfferlessCall {
         }
     }
 
-    fn wire(&self) -> Vec<Sent> {
+    pub(super) fn wire(&self) -> Vec<Sent> {
         drain(&self.udp)
     }
 
@@ -318,7 +332,7 @@ impl OfferlessCall {
     }
 
     /// The callee rings, then answers with an offer. Returns the 2xx as sent.
-    fn callee_answers_with_an_offer(&self) -> String {
+    pub(super) fn callee_answers_with_an_offer(&self) -> String {
         self.callee_sends(&self.callee_response("180 Ringing", ""));
         let answer = self.callee_response("200 OK", CALLEE_OFFER);
         self.callee_sends(&answer);
@@ -326,7 +340,7 @@ impl OfferlessCall {
     }
 
     /// A request from the caller in the dialog `relayed_200` created.
-    fn caller_request(
+    pub(super) fn caller_request(
         &self,
         method: &str,
         cseq: &str,
@@ -372,12 +386,12 @@ impl OfferlessCall {
         (inbound, message)
     }
 
-    fn caller_acks(&self, relayed_200: &SipMessage, answer: Option<&str>) {
+    pub(super) fn caller_acks(&self, relayed_200: &SipMessage, answer: Option<&str>) {
         let (inbound, message) = self.caller_request("ACK", "1 ACK", relayed_200, answer);
         handle_request(inbound, message, "ACK".to_string(), &self.state);
     }
 
-    fn caller_hangs_up(&self, relayed_200: &SipMessage) {
+    pub(super) fn caller_hangs_up(&self, relayed_200: &SipMessage) {
         let (inbound, message) = self.caller_request("BYE", "2 BYE", relayed_200, None);
         handle_b2bua_bye(inbound, message, &self.state);
     }
@@ -417,7 +431,7 @@ fn acks(sent: &[Sent]) -> Vec<&Sent> {
     sent.iter().filter(|sent| sent.is(Method::Ack)).collect()
 }
 
-fn relayed_answer(sent: &[Sent]) -> SipMessage {
+pub(super) fn relayed_answer(sent: &[Sent]) -> SipMessage {
     to_caller(sent)
         .into_iter()
         .find(|sent| sent.message.status_code() == Some(200))
@@ -605,6 +619,62 @@ async fn an_offerless_invite_holds_the_callee_ack_until_the_caller_answers() {
         "the caller's retransmitted ACK sends nothing more"
     );
     assert!(call.call_is_up());
+}
+
+/// The held ACK belongs to the callee's leg wherever that leg sits when the
+/// caller answers. A leg tracking a relayed in-dialog request is ahead of it on
+/// the call and is taken off (its request was refused) while the ACK waits: the
+/// answer still goes into the callee's ACK, is recorded on the callee's dialog,
+/// and a later copy of the 2xx draws that same ACK.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_held_ack_follows_its_leg_when_a_leg_ahead_of_it_is_taken_off_the_call() {
+    const AHEAD: &str = "z9hG4bK-tracked-ahead";
+    let ahead = Leg::new_b_leg(
+        CALLER_CALL_ID.to_string(),
+        "tracking-tag".to_string(),
+        "info:b2a".to_string(),
+        AHEAD.to_string(),
+        LegTransport {
+            remote_addr: address(CALLER),
+            connection_id: ConnectionId::default(),
+            transport: Transport::Udp,
+            local_addr: None,
+        },
+    );
+    let call = OfferlessCall::dial_behind(test_dispatcher_with_script(""), Some(ahead));
+    let answer = call.callee_answers_with_an_offer();
+    let relayed = relayed_answer(&call.wire());
+
+    call.state.call_actors.remove_b_leg_on(&call.call_id, AHEAD);
+
+    call.caller_acks(&relayed, Some(CALLER_ANSWER));
+    let sent = call.wire();
+    let ack = acks(&sent)
+        .first()
+        .map(|sent| sent.message.clone())
+        .expect("the callee's ACK");
+    assert!(
+        body_text(&ack).contains("o=siphon "),
+        "the answer carries siphon's origin on the callee's dialog:\n{}",
+        body_text(&ack)
+    );
+    let callee = call
+        .state
+        .call_actors
+        .read_b_leg_on(&call.call_id, &top_via_branch(&call.invite), Leg::clone)
+        .expect("the callee's leg");
+    assert!(callee.initial_acked, "the callee's 2xx is ACKed");
+    assert_eq!(callee.dialog.last_sent_sdp, Some(ack.body.clone()));
+
+    call.callee_sends(&answer);
+    let again = call.wire();
+    let again = acks(&again);
+    assert_eq!(again.len(), 1, "a later copy of the 2xx is ACKed");
+    assert_eq!(
+        again[0].message.to_bytes(),
+        ack.to_bytes(),
+        "with the same ACK, answer included"
+    );
 }
 
 /// The answer siphon puts in the callee's ACK is the session description in force

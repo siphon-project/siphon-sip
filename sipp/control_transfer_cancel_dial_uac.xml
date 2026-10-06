@@ -1,0 +1,118 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  The caller of the `cancel-dial` case (sipp/control/transfer_app.py): answered
+  and anchored by the application, which then rings two phones for it with
+  `dial {on_answer: "bridge"}`, gives that dial up with `cancel_dial`, rings
+  them again and gives that up too.
+
+  INVITE -> 200 (the engine's answer) -> ACK
+         -> (6 s: two dials, two cancels)
+         -> INFO (a digit) -> 200
+         -> BYE (the application's hangup) -> 200
+
+  `cancel_dial` leaves the caller exactly as the dial found it, and the pause is
+  where that is asserted: SIPp fails the call on any request that arrives
+  during a pause, so a re-INVITE or a BYE sent to this leg while the phones are
+  rung and CANCELled is a failure. The INFO then shows the dialog is still
+  there to answer it, and tells the application the quiet window is over; only
+  after that does the application hang up.
+
+  Also the caller of `cancel-late-ringing` and `cancel-late-answer`, where one
+  dial rings a phone that answers nothing until after the dial is given up. The
+  same six seconds cover that phone's late 180 or 200 and what it is owed, none
+  of which may reach this leg.
+-->
+<scenario name="control-transfer caller of a cancelled dial">
+
+  <send retrans="500">
+    <![CDATA[
+INVITE sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: "Caller" <sip:12025550101@transfer.test>;tag=[pid]SIPpTag00[call_number]
+To: <sip:[service]@[remote_ip]>
+Call-ID: [call_id]
+CSeq: 1 INVITE
+Contact: <sip:caller@[local_ip]:[local_port];transport=[transport]>
+Max-Forwards: 70
+User-Agent: SIPp/control-transfer-cancel-dial-uac
+Content-Type: application/sdp
+Content-Length: [len]
+
+v=0
+o=caller 53655765 2353687637 IN IP[local_ip_type] [local_ip]
+s=-
+c=IN IP[media_ip_type] [media_ip]
+t=0 0
+m=audio [media_port] RTP/AVP 8 101
+a=rtpmap:8 PCMA/8000
+a=rtpmap:101 telephone-event/8000
+a=fmtp:101 0-15
+a=ptime:20
+]]>
+  </send>
+
+  <recv response="100" optional="true" />
+
+  <recv response="200" rtd="true" crlf="true" rrs="true">
+    <action>
+      <ereg regexp="c=IN IP4 172\.20\.0\.130"
+            search_in="body" check_it="true" assign_to="anchored_answer" />
+      <log message="the application answered anchored on the engine: [$anchored_answer]" />
+    </action>
+  </recv>
+
+  <send>
+    <![CDATA[
+ACK [next_url] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: "Caller" <sip:12025550101@transfer.test>;tag=[pid]SIPpTag00[call_number]
+To: <sip:[service]@[remote_ip]>[peer_tag_param]
+Call-ID: [call_id]
+CSeq: 1 ACK
+[routes]
+Max-Forwards: 70
+Content-Length: 0
+
+]]>
+  </send>
+
+  <pause milliseconds="6000" />
+
+  <send retrans="500">
+    <![CDATA[
+INFO [next_url] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: "Caller" <sip:12025550101@transfer.test>;tag=[pid]SIPpTag00[call_number]
+To: <sip:[service]@[remote_ip]>[peer_tag_param]
+Call-ID: [call_id]
+CSeq: 2 INFO
+[routes]
+Max-Forwards: 70
+Content-Type: application/dtmf-relay
+Content-Length: [len]
+
+Signal=7
+Duration=160
+]]>
+  </send>
+
+  <recv response="200" rtd="true" />
+
+  <recv request="BYE" crlf="true" timeout="30000" />
+
+  <send>
+    <![CDATA[
+SIP/2.0 200 OK
+[last_Via:]
+[last_From:]
+[last_To:]
+[last_Call-ID:]
+[last_CSeq:]
+Content-Length: 0
+
+]]>
+  </send>
+
+</scenario>

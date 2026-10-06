@@ -37,6 +37,7 @@ import type {
   DialogStateChangedPayload,
   PlayStartedPayload,
   TransferOutcomePayload,
+  TransferTimedOutPayload,
 } from "../src/index";
 import type { CommandTransport } from "../src/session";
 
@@ -76,6 +77,7 @@ describe("SipVerb wire tokens + event names", () => {
     expect(SipVerb.RemoveHeader).toBe("remove_header");
     expect(SipVerb.AcceptRefer).toBe("accept_refer");
     expect(SipVerb.RejectRefer).toBe("reject_refer");
+    expect(SipVerb.CompleteRefer).toBe("complete_refer");
     expect(SipVerb.Bridge).toBe("bridge");
     expect(SipVerb.Unbridge).toBe("unbridge");
     expect(SipVerb.ReplacePeer).toBe("replace_peer");
@@ -91,12 +93,14 @@ describe("SipVerb wire tokens + event names", () => {
     expect(SipVerb.RecordStop).toBe("record_stop");
     expect(SipVerb.Reject).toBe("reject");
     expect(SipVerb.Drop).toBe("drop");
+    expect(SipVerb.CancelDial).toBe("cancel_dial");
   });
 
   it("passes unknown + new event names through (forward-compatible)", () => {
     expect(sipEventKind("StasisStart")).toBe("StasisStart");
     expect(sipEventKind("ChannelDtmfReceived")).toBe("ChannelDtmfReceived");
     expect(sipEventKind("TransferRequested")).toBe("TransferRequested");
+    expect(sipEventKind("TransferTimedOut")).toBe("TransferTimedOut");
     expect(sipEventKind("TransferProgress")).toBe("TransferProgress");
     expect(sipEventKind("TransferCompleted")).toBe("TransferCompleted");
     expect(sipEventKind("TransferFailed")).toBe("TransferFailed");
@@ -135,6 +139,23 @@ describe("SipVerb wire tokens + event names", () => {
     expect(transferOutcome({ kind: "TransferRequested", payload: {} })).toBeNull();
     expect(transferOutcome({ kind: "StasisEnd", payload: {} })).toBeNull();
     expect(transferOutcome({ kind: "TransferFailed", payload: null })).toBeNull();
+  });
+
+  it("reads a missed report deadline as its own event, not an outbound verdict", () => {
+    // Byte-identical to the server's TransferTimedOut payload.
+    const timedOut: TransferTimedOutPayload = JSON.parse(
+      '{"reason":"timeout","code":503,"referrer_leg":"a"}',
+    );
+    expect(timedOut.reason).toBe("timeout");
+    expect(timedOut.code).toBe(503);
+    expect(timedOut.referrer_leg).toBe("a");
+    const unsent: TransferTimedOutPayload = JSON.parse(
+      '{"reason":"timeout","code":null,"referrer_leg":"b"}',
+    );
+    expect(unsent.code).toBeNull();
+    // It ends a transfer this app accepted, not one it asked for with `refer`.
+    expect(isTransferFinal("TransferTimedOut")).toBe(false);
+    expect(transferOutcome({ kind: "TransferTimedOut", payload: timedOut })).toBeNull();
   });
 
   it("marks exactly the terminal bridge verdicts as final", () => {
@@ -381,6 +402,22 @@ describe("Call verbs map to the in-process-mirrored wire verbs", () => {
     ]);
   });
 
+  it("cancelDial names the reason only when one is given", async () => {
+    const transport = new RecordingTransport();
+    const call = makeCall(transport);
+    await call.cancelDial();
+    await call.cancelDial("gave_up");
+    expect(transport.calls).toEqual([
+      { module: MODULE_SIP, verb: "cancel_dial", target: { channel: "ch1" }, args: {} },
+      {
+        module: MODULE_SIP,
+        verb: "cancel_dial",
+        target: { channel: "ch1" },
+        args: { reason: "gave_up" },
+      },
+    ]);
+  });
+
   it("drop sends ban only when it is true", async () => {
     // Off is the server's default; sending `ban: false` would be noise, and a
     // string would be refused as bad_request.
@@ -547,6 +584,31 @@ describe("Call verbs map to the in-process-mirrored wire verbs", () => {
     ]);
   });
 
+  it("a transfer the application carries out is accepted, then reported", async () => {
+    const transport = new RecordingTransport();
+    const call = makeCall(transport);
+    await call.acceptRefer({ mode: "controller" });
+    await call.acceptRefer({ mode: "controller", timeout: 90 });
+    await call.completeRefer(200);
+    await call.completeRefer(486, "Busy Here");
+    expect(transport.calls).toEqual([
+      { module: MODULE_SIP, verb: "accept_refer", target: { channel: "ch1" }, args: { mode: "controller" } },
+      {
+        module: MODULE_SIP,
+        verb: "accept_refer",
+        target: { channel: "ch1" },
+        args: { mode: "controller", timeout: 90 },
+      },
+      { module: MODULE_SIP, verb: "complete_refer", target: { channel: "ch1" }, args: { code: 200 } },
+      {
+        module: MODULE_SIP,
+        verb: "complete_refer",
+        target: { channel: "ch1" },
+        args: { code: 486, reason: "Busy Here" },
+      },
+    ]);
+  });
+
   it("acceptRefer omits an unset profile", async () => {
     // Absent, not null — so the server's "inherit the call's profile" default
     // is what applies.
@@ -554,6 +616,64 @@ describe("Call verbs map to the in-process-mirrored wire verbs", () => {
     const call = makeCall(transport);
     await call.acceptRefer({ mode: "terminate" });
     expect(transport.calls[0]?.args).toEqual({ mode: "terminate" });
+  });
+
+  it("a transfer names an AoR target and the identity its new leg presents", async () => {
+    const transport = new RecordingTransport();
+    const call = makeCall(transport);
+    await call.acceptRefer({
+      target: { aor: "sip:204@example.com" },
+      from: "sip:+15550100000@trunk.example.com",
+      fromDisplay: "",
+      pAssertedIdentity: "sip:+15550100000@trunk.example.com",
+      privacy: "restricted",
+      headers: { "X-Account": "main" },
+    });
+    await call.replacePeer({ aor: "sip:204@example.com" }, { from: "sip:200@example.com" });
+    await call.replacePeer("sip:204@198.51.100.7");
+    expect(transport.calls.map((recorded) => recorded.args)).toEqual([
+      {
+        target: { aor: "sip:204@example.com" },
+        from: "sip:+15550100000@trunk.example.com",
+        from_display: "",
+        p_asserted_identity: "sip:+15550100000@trunk.example.com",
+        privacy: "restricted",
+        headers: { "X-Account": "main" },
+      },
+      { target: { aor: "sip:204@example.com" }, from: "sip:200@example.com" },
+      { target: "sip:204@198.51.100.7" },
+    ]);
+  });
+
+  it("a play names a tone or a URL as its source, and its gain", async () => {
+    const transport = new RecordingTransport();
+    const call = makeCall(transport);
+    await call.play({ tone: "ringback_eu" });
+    await call.play(
+      { url: "https://media.example.com/hold.wav" },
+      { repeat: "inf", gainDecibels: -6 },
+    );
+    await call.play({ file: "/prompts/welcome.wav" }, { gainDecibels: 3 });
+    expect(transport.calls.map((recorded) => [recorded.verb, recorded.args])).toEqual([
+      ["play", { tone: "ringback_eu" }],
+      ["play", { url: "https://media.example.com/hold.wav", repeat: "inf", gain_decibels: -6 }],
+      ["play", { file: "/prompts/welcome.wav", gain_decibels: 3 }],
+    ]);
+  });
+
+  it("a transfer names how its new leg's numbers are written", async () => {
+    const transport = new RecordingTransport();
+    const call = makeCall(transport);
+    await call.acceptRefer({ mode: "terminate", numberPolicy: "carrier_e164" });
+    await call.acceptRefer({ target: "sip:204@198.51.100.7", format: "national" });
+    await call.replacePeer("sip:204@198.51.100.7", { numberPolicy: "carrier_e164" });
+    await call.replacePeer({ aor: "sip:204@example.com" }, { format: "plain" });
+    expect(transport.calls.map((recorded) => [recorded.verb, recorded.args])).toEqual([
+      ["accept_refer", { mode: "terminate", number_policy: "carrier_e164" }],
+      ["accept_refer", { target: "sip:204@198.51.100.7", format: "national" }],
+      ["replace_peer", { target: "sip:204@198.51.100.7", number_policy: "carrier_e164" }],
+      ["replace_peer", { target: { aor: "sip:204@example.com" }, format: "plain" }],
+    ]);
   });
 
   it("media verbs — play (file/dbId/blob), stop, dtmf, hold, unhold, stream", async () => {
@@ -564,6 +684,8 @@ describe("Call verbs map to the in-process-mirrored wire verbs", () => {
     // "hi" → base64 "aGk=".
     await call.play({ blob: new Uint8Array([104, 105]) }, { durationMs: 5000 });
     await call.playFile("/prompts/bye.wav");
+    // Until stopped: the one non-numeric repeat.
+    await call.play({ file: "/prompts/hold.wav" }, { repeat: "inf" });
     await call.stop();
     await call.dtmf("123#", { durationMs: 100, volumeDbm0: -8 });
     await call.hold();
@@ -575,6 +697,7 @@ describe("Call verbs map to the in-process-mirrored wire verbs", () => {
       { module: MODULE_SIP, verb: "play", target: { channel: "ch1" }, args: { db_id: 42 } },
       { module: MODULE_SIP, verb: "play", target: { channel: "ch1" }, args: { blob: "aGk=", duration_ms: 5000 } },
       { module: MODULE_SIP, verb: "play", target: { channel: "ch1" }, args: { file: "/prompts/bye.wav" } },
+      { module: MODULE_SIP, verb: "play", target: { channel: "ch1" }, args: { file: "/prompts/hold.wav", repeat: "inf" } },
       { module: MODULE_SIP, verb: "stop", target: { channel: "ch1" }, args: {} },
       { module: MODULE_SIP, verb: "dtmf", target: { channel: "ch1" }, args: { digits: "123#", duration_ms: 100, volume_dbm0: -8 } },
       { module: MODULE_SIP, verb: "hold", target: { channel: "ch1" }, args: {} },
@@ -1012,6 +1135,25 @@ describe("dial args map to the target shapes the server parses", () => {
         },
       ],
     });
+  });
+
+  it("sends a target's called party as to, on either form", () => {
+    // A divert: without `to` the B-leg keeps the caller's To user and goes out
+    // addressed to the number originally dialled.
+    expect(
+      dialArgs([
+        { uri: "sip:+15550199@trunk.example", to: "sip:+15550199@trunk.example" },
+        { aor: "sip:204@pbx.example", to: "sip:+15550199@pbx.example" },
+      ]),
+    ).toEqual({
+      targets: [
+        { uri: "sip:+15550199@trunk.example", to: "sip:+15550199@trunk.example" },
+        { aor: "sip:204@pbx.example", to: "sip:+15550199@pbx.example" },
+      ],
+    });
+    expect(() =>
+      dialArgs([{ uri: "sip:+15550199@trunk.example", to: 7 } as never]),
+    ).toThrow(/to/);
   });
 
   it("refuses a target that names both a uri and an aor, and one that names neither", () => {

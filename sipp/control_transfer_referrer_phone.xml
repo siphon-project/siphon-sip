@@ -1,0 +1,240 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  The phone of the `refer-callee` case (sipp/control/transfer_app.py): the
+  callee of a controlled call, on a dialog of its own, asking twice to have the
+  call transferred (RFC 3515).
+
+  recv INVITE -> 180 -> 200 -> recv ACK
+       -> REFER -> 480 Transfer Refused         (the application's reject_refer)
+       -> REFER -> 202
+          -> recv NOTIFY (sipfrag 100 Trying, active) -> 200
+          -> recv NOTIFY (sipfrag 200 OK, terminated) -> 200
+          -> recv BYE -> 200                     (accept_refer, carried out)
+
+  Both REFERs go out in the dialog siphon created for this leg, whose Call-ID
+  is siphon's own and not the caller's. That Call-ID is echoed to the
+  container's output, and the runner requires `TransferRequested` to have named
+  the same one (sipp/control/run_transfer_case.sh).
+
+  The first REFER's final response is the code and reason phrase the
+  application gave `reject_refer`, and the dialog survives it: the second REFER
+  is sent in it. For the second, siphon dials the Refer-To target, and once
+  that answers this phone is told so and released. The terminating NOTIFY and
+  the BYE are separate transactions sent back to back, so either may arrive
+  first over UDP (RFC 3261 §18) and both orders are accepted.
+-->
+<scenario name="control-transfer callee that refers">
+
+  <recv request="INVITE" crlf="true">
+    <action>
+      <ereg regexp="[^[:space:]]+" search_in="hdr" header="Call-ID:" assign_to="wire_call_id" />
+      <ereg regexp="tag=([^;>[:space:]]+)" search_in="hdr" header="From:" assign_to="junk_tag,remote_tag" />
+      <ereg regexp="&lt;([^>]+)>" search_in="hdr" header="From:" assign_to="junk_from,remote_uri" />
+      <ereg regexp="&lt;([^>]+)>" search_in="hdr" header="To:" assign_to="junk_to,local_uri" />
+      <ereg regexp="&lt;([^>]+)>" search_in="hdr" header="Contact:" assign_to="junk_contact,remote_contact" />
+      <exec command="echo WIRE-CALL-ID [$wire_call_id]" />
+      <log message="called on [$wire_call_id] ([$junk_tag][$junk_from][$junk_to][$junk_contact])" />
+    </action>
+  </recv>
+
+  <send>
+    <![CDATA[
+SIP/2.0 180 Ringing
+[last_Via:]
+[last_From:]
+[last_To:];tag=[pid]SIPpTag01[call_number]
+[last_Call-ID:]
+[last_CSeq:]
+Contact: <sip:phone@[local_ip]:[local_port];transport=[transport]>
+Content-Length: 0
+
+]]>
+  </send>
+
+  <pause milliseconds="200" />
+
+  <send retrans="500">
+    <![CDATA[
+SIP/2.0 200 OK
+[last_Via:]
+[last_From:]
+[last_To:];tag=[pid]SIPpTag01[call_number]
+[last_Call-ID:]
+[last_CSeq:]
+Contact: <sip:phone@[local_ip]:[local_port];transport=[transport]>
+Content-Type: application/sdp
+Content-Length: [len]
+
+v=0
+o=phone 53655765 2353687637 IN IP[local_ip_type] [local_ip]
+s=-
+c=IN IP[media_ip_type] [media_ip]
+t=0 0
+m=audio [media_port] RTP/AVP 8
+a=rtpmap:8 PCMA/8000
+a=ptime:20
+]]>
+  </send>
+
+  <recv request="ACK" timeout="5000" />
+
+  <pause milliseconds="500" />
+
+  <!-- The REFER the application declines. -->
+  <send retrans="500">
+    <![CDATA[
+REFER [$remote_contact] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <[$local_uri]>;tag=[pid]SIPpTag01[call_number]
+To: <[$remote_uri]>;tag=[$remote_tag]
+Call-ID: [$wire_call_id]
+CSeq: 1 REFER
+Contact: <sip:phone@[local_ip]:[local_port];transport=[transport]>
+Max-Forwards: 70
+Refer-To: <sip:target@172.20.0.245:5060>
+User-Agent: SIPp/control-transfer-referrer
+Content-Length: 0
+
+]]>
+  </send>
+
+  <recv response="480" crlf="true">
+    <action>
+      <ereg regexp="SIP/2.0 480 Transfer Refused"
+            search_in="msg" check_it="true" assign_to="refused_as_told" />
+      <log message="the REFER was declined as the application said: [$refused_as_told]" />
+    </action>
+  </recv>
+
+  <pause milliseconds="500" />
+
+  <!-- The REFER the application accepts, in the same dialog. -->
+  <send retrans="500">
+    <![CDATA[
+REFER [$remote_contact] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <[$local_uri]>;tag=[pid]SIPpTag01[call_number]
+To: <[$remote_uri]>;tag=[$remote_tag]
+Call-ID: [$wire_call_id]
+CSeq: 2 REFER
+Contact: <sip:phone@[local_ip]:[local_port];transport=[transport]>
+Max-Forwards: 70
+Refer-To: <sip:target@172.20.0.245:5060>
+User-Agent: SIPp/control-transfer-referrer
+Content-Length: 0
+
+]]>
+  </send>
+
+  <recv response="202" crlf="true">
+    <action>
+      <!-- RFC 3515 §2.2: the 2xx to a REFER is dialog-forming for the
+           subscription and carries a Contact. -->
+      <ereg regexp="sip:"
+            search_in="hdr" header="Contact:" check_it="true"
+            assign_to="accepted_contact" />
+      <log message="202 Contact: [$accepted_contact]" />
+    </action>
+  </recv>
+
+  <recv request="NOTIFY" crlf="true">
+    <action>
+      <!-- RFC 3515 §2.4.6: the id is the CSeq number of the REFER that opened
+           the subscription, 2 here. -->
+      <ereg regexp="refer;id=2"
+            search_in="hdr" header="Event:" check_it="true" assign_to="trying_event" />
+      <ereg regexp="active"
+            search_in="hdr" header="Subscription-State:" check_it="true" assign_to="trying_state" />
+      <ereg regexp="SIP/2.0 100 Trying"
+            search_in="body" check_it="true" assign_to="trying_frag" />
+      <log message="first NOTIFY: [$trying_event] [$trying_state] [$trying_frag]" />
+    </action>
+  </recv>
+
+  <send>
+    <![CDATA[
+SIP/2.0 200 OK
+[last_Via:]
+[last_From:]
+[last_To:]
+[last_Call-ID:]
+[last_CSeq:]
+Content-Length: 0
+
+]]>
+  </send>
+
+  <!-- If the terminating NOTIFY arrives first, go to label 10; otherwise the
+       BYE came first. -->
+  <recv request="NOTIFY" optional="true" next="10" crlf="true" timeout="30000">
+    <action>
+      <ereg regexp="refer;id=2"
+            search_in="hdr" header="Event:" check_it="true" assign_to="final_event_a" />
+      <ereg regexp="terminated"
+            search_in="hdr" header="Subscription-State:" check_it="true" assign_to="final_state_a" />
+      <ereg regexp="SIP/2.0 200 OK"
+            search_in="body" check_it="true" assign_to="final_frag_a" />
+      <log message="last NOTIFY (before the BYE): [$final_event_a] [$final_state_a] [$final_frag_a]" />
+    </action>
+  </recv>
+
+  <!-- The BYE arrived before the terminating NOTIFY. -->
+  <recv request="BYE" crlf="true" timeout="30000" />
+  <send>
+    <![CDATA[
+SIP/2.0 200 OK
+[last_Via:]
+[last_From:]
+[last_To:]
+[last_Call-ID:]
+[last_CSeq:]
+Content-Length: 0
+
+]]>
+  </send>
+  <recv request="NOTIFY" crlf="true" next="20">
+    <action>
+      <ereg regexp="refer;id=2"
+            search_in="hdr" header="Event:" check_it="true" assign_to="final_event_b" />
+      <ereg regexp="terminated"
+            search_in="hdr" header="Subscription-State:" check_it="true" assign_to="final_state_b" />
+      <ereg regexp="SIP/2.0 200 OK"
+            search_in="body" check_it="true" assign_to="final_frag_b" />
+      <log message="last NOTIFY (after the BYE): [$final_event_b] [$final_state_b] [$final_frag_b]" />
+    </action>
+  </recv>
+
+  <!-- The NOTIFY arrived first. -->
+  <label id="10" />
+  <send>
+    <![CDATA[
+SIP/2.0 200 OK
+[last_Via:]
+[last_From:]
+[last_To:]
+[last_Call-ID:]
+[last_CSeq:]
+Content-Length: 0
+
+]]>
+  </send>
+  <recv request="BYE" crlf="true" timeout="30000" />
+
+  <!-- Answer whichever of the two came last. -->
+  <label id="20" />
+  <send>
+    <![CDATA[
+SIP/2.0 200 OK
+[last_Via:]
+[last_From:]
+[last_To:]
+[last_Call-ID:]
+[last_CSeq:]
+Content-Length: 0
+
+]]>
+  </send>
+
+</scenario>

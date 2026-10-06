@@ -33,16 +33,15 @@ pub fn forward_update_response(
         // relay the response to, which its tracking leg says by carrying no stored
         // Via. Its response only moves the session timer on.
         if snapshot.b_leg_stored_vias.is_empty() {
-            if let Some(index) = snapshot.b_leg_index {
-                if (200..300).contains(&status_code) {
-                    state.call_actors.set_b_leg_target_uri(
-                        call_id,
-                        index,
-                        format!("update_done:{direction}"),
-                    );
-                } else if status_code >= 300 {
-                    state.call_actors.remove_b_leg(call_id, index);
-                }
+            if (200..300).contains(&status_code) {
+                mark_tracking_leg_done(
+                    call_id,
+                    snapshot,
+                    format!("update_done:{direction}"),
+                    state,
+                );
+            } else if status_code >= 300 {
+                state.call_actors.remove_b_leg_on(call_id, &snapshot.branch);
             }
             session_timer_on_response(
                 call_id,
@@ -74,6 +73,7 @@ pub fn forward_update_response(
         } else {
             match state.call_actors.get_call(call_id) {
                 Some(call) => {
+                    // The winner's position is read and used under one hold of the call's lock.
                     let winner = call.winner.and_then(|i| call.b_legs.get(i));
                     if let Some(b) = winner {
                         (
@@ -102,6 +102,7 @@ pub fn forward_update_response(
                 );
             }
         } else if let Some(call) = state.call_actors.get_call(call_id) {
+            // The winner's position is read and used under one hold of the call's lock.
             if let Some(winner) = call.winner.and_then(|i| call.b_legs.get(i)) {
                 crate::b2bua::actor::Dialog::rewrite_headers(
                     message,
@@ -153,13 +154,21 @@ pub fn forward_update_response(
             ) {
                 let a_sip_call_id = &snapshot.a_leg.dialog.call_id;
                 if let Some(session) = media_sessions.get(a_sip_call_id) {
-                    if let Some(profile) = profiles.get(&session.profile) {
+                    // Shaped for the party the answer is relayed to, the one that
+                    // offered, by its own side of the profile.
+                    if let Some(shape) = session.party_shape(is_a2b).resolve(profiles) {
                         // Same rule as the re-INVITE answer above: a B→A answer must name the callee
                         // as offerer, and a 2xx cannot be refused, so an unnameable pair leaves the
                         // SDP alone rather than attributing it to the wrong party.
                         if let Some((answer_from, answer_to)) = session.answer_tags(is_a2b) {
-                            let mut answer_flags = profile.answer.clone();
-                            answer_flags.stamp_received_from(response_source.ip());
+                            let mut answer_flags = shape;
+                            // The answering party's own policy, as on a
+                            // re-INVITE's answer.
+                            session.party_ingress(!is_a2b).stamp_ingress(
+                                &mut answer_flags,
+                                profiles,
+                                response_source.ip(),
+                            );
                             if let Some(responder_call_id) = responder_headers.call_id() {
                                 answer_flags.stamp_sip_call_id(responder_call_id);
                             }
@@ -251,20 +260,12 @@ pub fn forward_update_response(
             );
 
             // Mark the UPDATE entry done so retransmitted 2xx can be absorbed.
-            if let Some(idx) = snapshot.b_leg_index {
-                state.call_actors.set_b_leg_target_uri(
-                    call_id,
-                    idx,
-                    format!("update_done:{}", direction),
-                );
-            }
+            mark_tracking_leg_done(call_id, snapshot, format!("update_done:{direction}"), state);
         } else if status_code >= 300 {
             // Non-2xx UPDATE — no ACK (UPDATE is non-INVITE), just remove the
             // tracking entry. The responder's non-INVITE server transaction
             // self-terminates (RFC 3261 §17.2.2).
-            if let Some(idx) = snapshot.b_leg_index {
-                state.call_actors.remove_b_leg(call_id, idx);
-            }
+            state.call_actors.remove_b_leg_on(call_id, &snapshot.branch);
             // A 422 still teaches the responder's dialog its Min-SE (RFC 4028 §7.4).
             session_timer_on_response(
                 call_id,

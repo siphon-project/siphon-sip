@@ -116,16 +116,15 @@ pub fn handle_b2bua_cancel(inbound: InboundMessage, message: SipMessage, state: 
         state,
     );
 
-    // Send CANCEL to all pending B-legs.
+    // CANCEL all pending B-legs.
     //
     // RFC 3261 §9.1 — the CANCEL on each B-leg MUST share the *B-leg
     // INVITE*'s topmost Via branch and CSeq sequence number, NOT the
-    // inbound A-leg CANCEL's.  Rebuild from the stashed B-leg INVITE
+    // inbound A-leg CANCEL's, so each is built from the stashed B-leg INVITE
     // ([Leg::b_leg_invite], populated at the end of
-    // [b2bua_send_b_leg_invite]).  Legs whose INVITE hasn't been sent
-    // yet get marked pending_cancel; the CANCEL drains automatically
-    // once the stash lands.
-    let mut bleg_targets: Vec<(SipMessage, Transport, SocketAddr, Option<SocketAddr>)> = Vec::new();
+    // [b2bua_send_b_leg_invite]) once the lock is dropped below.  Legs whose
+    // INVITE hasn't been sent yet get marked pending_cancel here; the send
+    // path takes them up once the stash lands.
     let pending: Vec<bool> = (0..call.b_legs.len())
         .map(|index| call.is_pending_branch(index))
         .collect();
@@ -135,40 +134,16 @@ pub fn handle_b2bua_cancel(inbound: InboundMessage, message: SipMessage, state: 
         if !pending.get(index).copied().unwrap_or(false) {
             continue;
         }
-        match b_leg.b_leg_invite.as_ref() {
-            Some(invite_arc) => {
-                let invite = match invite_arc.lock() {
-                    Ok(guard) => guard.clone(),
-                    Err(_) => {
-                        warn!(call_id = %call_id, "B2BUA CANCEL: b_leg_invite mutex poisoned, skipping leg");
-                        continue;
-                    }
-                };
-                match build_cancel_from_invite(&invite) {
-                    Some(cancel_msg) => {
-                        bleg_targets.push((
-                            cancel_msg,
-                            b_leg.transport.transport,
-                            b_leg.transport.remote_addr,
-                            b_leg.transport.local_addr,
-                        ));
-                    }
-                    None => {
-                        warn!(call_id = %call_id, "B2BUA CANCEL: failed to build CANCEL from stashed INVITE");
-                    }
-                }
-            }
-            None => {
-                // Race: CANCEL arrived before this B-leg's INVITE was
-                // actually sent.  Defer — b2bua_send_b_leg_invite drains
-                // pending_cancel after stashing b_leg_invite.
-                debug!(
-                    call_id = %call_id,
-                    leg_id = %b_leg.id,
-                    "B2BUA CANCEL: deferred (b_leg_invite not yet stashed)"
-                );
-                b_leg.pending_cancel = true;
-            }
+        if b_leg.b_leg_invite.is_none() {
+            // Race: CANCEL arrived before this B-leg's INVITE was
+            // actually sent.  Defer — b2bua_send_b_leg_invite drains
+            // pending_cancel after stashing b_leg_invite.
+            debug!(
+                call_id = %call_id,
+                leg_id = %b_leg.id,
+                "B2BUA CANCEL: deferred (b_leg_invite not yet stashed)"
+            );
+            b_leg.pending_cancel = true;
         }
     }
 
@@ -187,6 +162,16 @@ pub fn handle_b2bua_cancel(inbound: InboundMessage, message: SipMessage, state: 
     // @b2bua.on_cancel can run after the lock is released (no DashMap reentry).
     let a_leg = call.a_leg.clone();
     let cancel_a_leg_invite = call.a_leg_invite.clone();
+    // `@b2bua.on_invite` is still running for this call: tell it, and leave
+    // `on_cancel` to the INVITE path, which runs it once the handler is done.
+    // Raised under the call's lock, which is what the handler's end takes too.
+    let invite_handler_running = match &call.invite_handler_cancelled {
+        Some(cancelled) => {
+            cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
+            true
+        }
+        None => false,
+    };
     let cancel_a_leg_source_ip = call.a_leg.transport.remote_addr.ip().to_string();
     let cancel_a_leg_transport = format!("{}", call.a_leg.transport.transport).to_lowercase();
     let cancel_a_leg_flow = py_flow_from_leg(&call.a_leg.transport);
@@ -202,20 +187,21 @@ pub fn handle_b2bua_cancel(inbound: InboundMessage, message: SipMessage, state: 
         state,
     );
 
-    // Emit the prepared CANCELs after dropping the call lock so the
-    // outbound path doesn't reenter the DashMap.
-    for (cancel_msg, b_transport, b_dest, b_local) in bleg_targets {
-        send_b2bua_to_bleg(cancel_msg, b_transport, b_dest, b_local, state);
-    }
+    // After dropping the call lock so the outbound path doesn't reenter the
+    // DashMap: every B-leg still pending is kept answerable apart from the
+    // call, which goes below, and CANCELled as RFC 3261 §9.1 allows — now when
+    // its INVITE has drawn a provisional, on its first provisional when it has
+    // drawn nothing yet.
+    let kept = state.call_actors.keep_pending_answerable(&call_id);
+    cancel_kept_branches(&kept, state);
 
     // The 487 to the A-leg leaves on the socket the CANCEL (== the INVITE) arrived
     // on, so a multi-homed UDP host answers with a consistent source port.
-    let response_487 = build_response(
+    let response_487 = invite_response_from_cancel(
         &message,
         487,
         "Request Terminated",
         state.server_header.as_deref(),
-        &[],
     );
     send_message_from(
         response_487,
@@ -232,14 +218,16 @@ pub fn handle_b2bua_cancel(inbound: InboundMessage, message: SipMessage, state: 
     // B2BUA call (RFC 3261 §9). A 2xx that races this CANCEL is independently
     // ACK+BYE'd by handle_zombie_cancelled_2xx and never delivered on_answer,
     // so this only ever fires for a genuinely abandoned call.
-    run_b2bua_cancel_handlers(
-        &call_id,
-        cancel_a_leg_invite,
-        cancel_a_leg_source_ip,
-        cancel_a_leg_transport,
-        cancel_a_leg_flow,
-        state,
-    );
+    if !invite_handler_running {
+        run_b2bua_cancel_handlers(
+            &call_id,
+            cancel_a_leg_invite,
+            cancel_a_leg_source_ip,
+            cancel_a_leg_transport,
+            cancel_a_leg_flow,
+            state,
+        );
+    }
 
     // Control plane: a handed-over call CANCELled before the controller acted is
     // the same teardown the answered/failed paths hook — emit StasisEnd + drop
@@ -281,16 +269,43 @@ pub fn handle_b2bua_cancel(inbound: InboundMessage, message: SipMessage, state: 
     );
 
     state.call_actors.set_state(&call_id, CallState::Terminated);
-    // remove_call_after_cancel sends Shutdown to remaining actors, cleans the
-    // registry, and preserves still-pending B-legs as zombie-cancelled entries
-    // so a 2xx that raced this CANCEL (RFC 3261 §9.1) can still be ACKed + BYEd
-    // by handle_response → handle_zombie_cancelled_2xx instead of being dropped
+    // remove_call_after_cancel sends Shutdown to remaining actors and cleans the
+    // registry. The B-legs kept answerable above outlive it, so a 2xx that
+    // raced this CANCEL (RFC 3261 §9.1) can still be ACKed + BYEd by
+    // handle_response → handle_zombie_cancelled_2xx instead of being dropped
     // as an unknown branch (which leaves the callee retransmitting 200 OK then
-    // BYEing the half-open dialog).
+    // BYEing the half-open dialog). It keeps any leg whose INVITE went out in
+    // between as well, hence the expiry armed for everything kept.
     if state.call_actors.remove_call_after_cancel(&call_id) {
         schedule_zombie_cancelled_cleanup(state.call_actors.clone());
     }
     state.call_event_receivers.remove(&call_id);
+}
+
+/// The final response to the INVITE a CANCEL cancels, built from the CANCEL.
+///
+/// RFC 3261 §9.2 has the UAS answer the *original request* with the 487. A
+/// CANCEL shares the INVITE's Via, From, To, Call-ID and CSeq number (§9.1), so
+/// a response built from it is the INVITE's response in everything but the
+/// CSeq method. Left as `CANCEL` the caller takes the 487 for a second answer
+/// to its CANCEL, and its INVITE transaction runs on until it times out.
+pub(super) fn invite_response_from_cancel(
+    cancel: &SipMessage,
+    status_code: u16,
+    reason: &str,
+    server_header: Option<&str>,
+) -> SipMessage {
+    let mut response = build_response(cancel, status_code, reason, server_header, &[]);
+    let sequence_number = response
+        .headers
+        .get("CSeq")
+        .and_then(|cseq| cseq.split_whitespace().next().map(str::to_string));
+    if let Some(sequence_number) = sequence_number {
+        response
+            .headers
+            .set("CSeq", format!("{sequence_number} INVITE"));
+    }
+    response
 }
 
 /// Fire `@b2bua.on_cancel` handlers for an unanswered call (Calling/Ringing)
@@ -356,4 +371,48 @@ pub fn run_b2bua_cancel_handlers(
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sip::parser::parse_sip_message;
+
+    /// The 487 answers the INVITE, so it carries the INVITE's CSeq: the
+    /// CANCEL's sequence number with the method INVITE (RFC 3261 §9.1, §9.2).
+    /// Via, From, To and Call-ID are the ones the two requests share.
+    #[test]
+    fn the_487_for_a_cancelled_invite_carries_the_invite_cseq() {
+        let (_, cancel) = parse_sip_message(concat!(
+            "CANCEL sip:bob@example.com SIP/2.0\r\n",
+            "Via: SIP/2.0/UDP 192.0.2.20:5061;branch=z9hG4bK776asdhds\r\n",
+            "From: <sip:alice@example.com>;tag=1928301774\r\n",
+            "To: <sip:bob@example.com>\r\n",
+            "Call-ID: a84b4c76e66710@192.0.2.20\r\n",
+            "CSeq: 314159 CANCEL\r\n",
+            "Max-Forwards: 70\r\n",
+            "Content-Length: 0\r\n",
+            "\r\n",
+        ))
+        .unwrap();
+
+        let response = invite_response_from_cancel(&cancel, 487, "Request Terminated", None);
+
+        assert_eq!(
+            response.headers.get("CSeq").map(|cseq| cseq.to_string()),
+            Some("314159 INVITE".to_string())
+        );
+        assert_eq!(
+            response.headers.get("Via").map(|via| via.to_string()),
+            cancel.headers.get("Via").map(|via| via.to_string())
+        );
+        assert_eq!(
+            response.headers.get("Call-ID").map(|id| id.to_string()),
+            Some("a84b4c76e66710@192.0.2.20".to_string())
+        );
+        match response.start_line {
+            StartLine::Response(status_line) => assert_eq!(status_line.status_code, 487),
+            StartLine::Request(_) => panic!("expected a response"),
+        }
+    }
 }

@@ -579,7 +579,7 @@ impl SiphonRtpClient {
         call_id: &str,
         from_tag: &str,
         source: &PlayMediaSource,
-        repeat_times: Option<u64>,
+        repeat_times: Option<siphon_rtp_proto::PlayRepeat>,
         start_pos_ms: Option<u64>,
         duration_ms: Option<u64>,
         to_tag: Option<&str>,
@@ -592,9 +592,8 @@ impl SiphonRtpClient {
                 call_id: call_id.to_string(),
                 from_tag: from_tag.to_string(),
                 source: proto_play_source(source),
-                // A count from siphon-sip's own API; the endless form
-                // (`PlayRepeat::Forever`) is reached through the play verb.
-                repeat_times: repeat_times.map(siphon_rtp_proto::PlayRepeat::Times),
+                // A total play count, or `Forever` (`"inf"` on the wire).
+                repeat_times,
                 start_pos_ms,
                 duration_ms,
                 overlay,
@@ -1371,7 +1370,7 @@ impl SiphonRtpClientSet {
         call_id: &str,
         from_tag: &str,
         source: &PlayMediaSource,
-        repeat_times: Option<u64>,
+        repeat_times: Option<siphon_rtp_proto::PlayRepeat>,
         start_pos_ms: Option<u64>,
         duration_ms: Option<u64>,
         to_tag: Option<&str>,

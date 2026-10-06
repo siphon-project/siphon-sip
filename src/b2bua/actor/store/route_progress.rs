@@ -6,7 +6,9 @@ use super::*;
 
 impl CallActorStore {
     /// Settle a sequential failover call's B-leg on its final failure. See
-    /// [`CallActor::settle_route_branch`]. `false` when the call is gone.
+    /// [`CallActor::settle_route_branch`]. `false` when the call is gone. By
+    /// position: a response handler uses
+    /// [`settle_route_branch_on`](Self::settle_route_branch_on).
     pub fn settle_route_branch(&self, call_id: &str, index: usize, status_code: u16) -> bool {
         self.calls
             .get_mut(call_id)

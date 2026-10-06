@@ -201,11 +201,19 @@ export const SipVerb = {
    * the channel. Channel-addressed, unlike `originate`, which creates one.
    */
   Dial: "dial",
+  /**
+   * Give up on the dial ringing for this channel's caller and leave the caller
+   * alone: the phones are CANCELled and the dial ends in `DialFailed` with code
+   * 487. Refused (`invalid_state`) when nothing is ringing, and once a phone
+   * has answered and is being bridged.
+   */
+  CancelDial: "cancel_dial",
   SetHeader: "set_header",
   GetHeader: "get_header",
   RemoveHeader: "remove_header",
   AcceptRefer: "accept_refer",
   RejectRefer: "reject_refer",
+  CompleteRefer: "complete_refer",
   Bridge: "bridge",
   Unbridge: "unbridge",
   ReplacePeer: "replace_peer",
@@ -234,6 +242,7 @@ export type SipEventKind =
   | "ChannelDtmfReceived"
   | "PlayStarted"
   | "TransferRequested"
+  | "TransferTimedOut"
   | "TransferProgress"
   | "TransferCompleted"
   | "TransferFailed"
@@ -311,6 +320,30 @@ export interface TransferReplaces {
   from_tag: string;
   to_tag: string;
   early_only: boolean;
+  /**
+   * The dialog named, when the server hosts it — which is what lets an
+   * application act on a `Replaces` at all, since it addresses calls by channel
+   * and never sees a Call-ID or a tag. Absent or `null` for a dialog hosted
+   * elsewhere, and from a server that predates it.
+   */
+  local?: HostedDialog | null;
+}
+
+/** A dialog the server hosts, as a `Replaces` named it. */
+export interface HostedDialog {
+  /** The call the dialog belongs to. */
+  call_actor_id: string;
+  /** The channel controlling that call, when an application owns it. */
+  channel?: string | null;
+  /** Which leg of the call the dialog is. */
+  leg: "a" | "b";
+  /**
+   * The channel that call is bridged with — the party that stays when the
+   * named one is replaced. `null` when it is not a bridge.
+   */
+  bridged_with?: string | null;
+  /** On a `StasisStart` only: the `early-only` flag the INVITE's `Replaces` carried. */
+  early_only?: boolean;
 }
 
 /**
@@ -326,6 +359,37 @@ export interface TransferRequestedPayload {
   replaces?: TransferReplaces | null;
   /** The From-tag of the referring party, if known. */
   from_tag?: string | null;
+  /**
+   * Which party of the channel's call sent the REFER: `"a"` for the party the
+   * call came from, `"b"` for the party it was connected to. Absent from a
+   * server that predates it.
+   */
+  referrer_leg?: "a" | "b" | null;
+  /**
+   * The SIP Call-ID of the dialog the REFER arrived on. For a `"b"` referrer
+   * this is the `leg_sip_call_id` its `DialBranch` named, not the channel's.
+   */
+  referrer_sip_call_id?: string | null;
+}
+
+/**
+ * The `payload` of a `TransferTimedOut` event — a transfer accepted with
+ * `acceptRefer({ mode: "controller" })` passed its deadline with no
+ * `completeRefer`. siphon ended the referrer's subscription for the app, with
+ * a sipfrag NOTIFY of its own (RFC 3515 §2.4.5); a `completeRefer` now is
+ * refused. Cast a {@link import("./sip").CallEvent}'s `payload` to this when
+ * `kind === "TransferTimedOut"`.
+ */
+export interface TransferTimedOutPayload {
+  /** Why the transfer ended: `"timeout"`. */
+  reason: string;
+  /**
+   * The sipfrag status siphon reported to the referrer (`503`), or `null` when
+   * the referrer's leg had already left the call and nothing could be sent.
+   */
+  code?: number | null;
+  /** Which party of the channel's call had referred, as on {@link TransferRequestedPayload}. */
+  referrer_leg?: "a" | "b" | null;
 }
 
 /**

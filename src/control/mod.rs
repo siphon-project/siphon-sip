@@ -62,7 +62,7 @@ pub use protocol::{
 };
 pub use registry::{
     ChannelRef, ConnHandle, ControlBus, ControlCommand, OfferOutcome, OutboundFrame, OutboundQueue,
-    Ownership, PushOutcome, SlowConsumerPolicy, TransferOutcome, TransferStage,
+    Ownership, PushOutcome, SlowConsumerPolicy, TransferOutcome, TransferReferrer, TransferStage,
     CHANNEL_TOMBSTONE_GRACE,
 };
 

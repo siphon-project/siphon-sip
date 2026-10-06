@@ -1,0 +1,102 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  The phone a `control-transfer` case connects its caller to, in the cases
+  where that phone does nothing itself: `replace-aor` (it is the party
+  replaced), `replace-aor-refused` (it is the party kept) and `media`.
+
+  recv INVITE -> 180 -> 200 -> recv ACK
+       -> (recv INFO -> 200, any number of times)
+       -> recv BYE -> 200
+
+  The INFO is the caller's, relayed by siphon: the `replace-aor-refused` caller
+  sends one after both replacement contacts have refused, and this phone
+  answering it is the proof that its dialog outlived the failed replacement.
+  The BYE is mandatory under -timeout_error, so a phone siphon forgot to
+  release when it was replaced fails the run.
+-->
+<scenario name="control-transfer phone that is called">
+
+  <recv request="INVITE" crlf="true">
+    <action>
+      <ereg regexp="[^[:space:]]+" search_in="hdr" header="Call-ID:" assign_to="wire_call_id" />
+      <exec command="echo WIRE-CALL-ID [$wire_call_id]" />
+    </action>
+  </recv>
+
+  <send>
+    <![CDATA[
+SIP/2.0 180 Ringing
+[last_Via:]
+[last_From:]
+[last_To:];tag=[pid]SIPpTag01[call_number]
+[last_Call-ID:]
+[last_CSeq:]
+Contact: <sip:phone@[local_ip]:[local_port];transport=[transport]>
+Content-Length: 0
+
+]]>
+  </send>
+
+  <pause milliseconds="200" />
+
+  <send retrans="500">
+    <![CDATA[
+SIP/2.0 200 OK
+[last_Via:]
+[last_From:]
+[last_To:];tag=[pid]SIPpTag01[call_number]
+[last_Call-ID:]
+[last_CSeq:]
+Contact: <sip:phone@[local_ip]:[local_port];transport=[transport]>
+Content-Type: application/sdp
+Content-Length: [len]
+
+v=0
+o=phone 53655765 2353687637 IN IP[local_ip_type] [local_ip]
+s=-
+c=IN IP[media_ip_type] [media_ip]
+t=0 0
+m=audio [media_port] RTP/AVP 8
+a=rtpmap:8 PCMA/8000
+a=ptime:20
+]]>
+  </send>
+
+  <recv request="ACK" timeout="5000" />
+
+  <label id="1" />
+  <recv request="INFO" optional="true" next="2" />
+  <recv request="BYE" timeout="40000" next="3" />
+
+  <label id="2" />
+  <send>
+    <![CDATA[
+SIP/2.0 200 OK
+[last_Via:]
+[last_From:]
+[last_To:]
+[last_Call-ID:]
+[last_CSeq:]
+Content-Length: 0
+
+]]>
+  </send>
+  <nop next="1" />
+
+  <label id="3" />
+  <send>
+    <![CDATA[
+SIP/2.0 200 OK
+[last_Via:]
+[last_From:]
+[last_To:]
+[last_Call-ID:]
+[last_CSeq:]
+Content-Length: 0
+
+]]>
+  </send>
+
+</scenario>

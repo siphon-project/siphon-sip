@@ -88,9 +88,17 @@ fn rewrite_userpart(message: &mut SipMessage, header: &str, user: &str) -> usize
     rewritten
 }
 
+/// The legacy calling-identity header (draft-ietf-sip-privacy), which predates
+/// `P-Asserted-Identity` and states the same thing. siphon never generates it,
+/// and the default header policy copies the caller's like any header it has no
+/// rule for, so every step here that changes the calling identity has to carry
+/// it along or drop it: left alone it asserts the caller's identity beside the
+/// one the call presents.
+const REMOTE_PARTY_ID: &str = "Remote-Party-ID";
+
 /// Present `number` as the calling party on `From`, and on
-/// `P-Asserted-Identity` / `P-Preferred-Identity` when the message carries
-/// them.
+/// `P-Asserted-Identity` / `P-Preferred-Identity` / `Remote-Party-ID` when the
+/// message carries them.
 ///
 /// The dialog tag on `From` is preserved, which is why this exists rather than
 /// a `set_header("From", …)`: the B-leg's From tag is siphon's, and a header
@@ -104,7 +112,21 @@ pub fn set_calling_number(message: &mut SipMessage, number: &str) -> bool {
     let mut rewritten = rewrite_userpart(message, "From", number);
     rewritten += rewrite_userpart(message, "P-Asserted-Identity", number);
     rewritten += rewrite_userpart(message, "P-Preferred-Identity", number);
+    rewritten += rewrite_userpart(message, REMOTE_PARTY_ID, number);
     rewritten > 0
+}
+
+/// Present `from` (a whole `From` value, dialog tag included) as the calling
+/// identity, in place of the caller's.
+///
+/// A replaced identity is a different party, not a different number for the
+/// same one, so the caller's `Remote-Party-ID` cannot be carried over by
+/// substitution the way [`set_calling_number`] carries it: it is dropped. One a
+/// controller or script names explicitly is injected after this runs and goes
+/// out as written.
+pub fn present_calling_identity(message: &mut SipMessage, from: String) {
+    message.headers.set("From", from);
+    message.headers.remove(REMOTE_PARTY_ID);
 }
 
 /// Assert the calling party's identity in `P-Asserted-Identity`, built from
@@ -235,6 +257,8 @@ fn split_identity_list(value: &str) -> Vec<&str> {
 /// - `P-Preferred-Identity` is removed. It is the UA's *request* for what to
 ///   assert (RFC 3325 §9.1) and has no meaning once the network has decided;
 ///   forwarding it past a privacy boundary re-leaks the number.
+/// - `Remote-Party-ID` is removed. It states the calling identity in the clear
+///   to whoever renders it, and the trusted next hop has PAI.
 ///
 /// Do not call this and then reformat identity headers — anonymisation is the
 /// last step, or a number policy will try to reshape `anonymous` as a number.
@@ -242,6 +266,7 @@ pub fn restrict_calling_identity(message: &mut SipMessage) {
     anonymize_from(message);
 
     message.headers.remove("P-Preferred-Identity");
+    message.headers.remove(REMOTE_PARTY_ID);
 
     // RFC 3323 §4.2: Privacy is a list. Preserve anything already asserted.
     let existing = message.headers.get("Privacy").cloned().unwrap_or_default();
@@ -319,6 +344,56 @@ mod tests {
 
     fn header(message: &SipMessage, name: &str) -> Option<String> {
         message.headers.get(name).cloned()
+    }
+
+    /// The caller's legacy identity header (draft-ietf-sip-privacy), as an
+    /// access leg or an inbound carrier sends it.
+    const CALLER_RPID: &str = "Remote-Party-ID: \"Alice\" <sip:+12025550100@siphon.example.com>;party=calling;screen=yes;privacy=off\r\n";
+
+    #[test]
+    fn set_calling_number_rewrites_remote_party_id_with_the_asserted_identity() {
+        // Remote-Party-ID states the calling identity as PAI does. Leaving it
+        // alone presented the route's number in From and PAI and the caller's
+        // own in RPID, two identities on one INVITE.
+        let mut message = invite_with(CALLER_RPID);
+        assert!(set_calling_number(&mut message, "+12025550142"));
+        let rpid = header(&message, "Remote-Party-ID").expect("RPID kept");
+        assert!(
+            rpid.contains("sip:+12025550142@"),
+            "number substituted: {rpid}"
+        );
+        assert!(
+            !rpid.contains("+12025550100"),
+            "caller's number gone: {rpid}"
+        );
+        assert!(
+            rpid.contains("party=calling"),
+            "its parameters survive: {rpid}"
+        );
+    }
+
+    #[test]
+    fn restrict_calling_identity_removes_remote_party_id() {
+        // A withheld call that still carries the caller's RPID withholds
+        // nothing: a carrier rendering RPID shows the number. PAI is what keeps
+        // the identity for the trusted hop, so RPID goes.
+        let mut message = invite_with(CALLER_RPID);
+        restrict_calling_identity(&mut message);
+        assert!(header(&message, "Remote-Party-ID").is_none());
+    }
+
+    #[test]
+    fn present_calling_identity_replaces_from_and_drops_the_callers_rpid() {
+        let mut message = invite_with(CALLER_RPID);
+        present_calling_identity(
+            &mut message,
+            "\"Example Ltd\" <sip:+12025550142@trunk.example.com>;tag=a-tag".to_string(),
+        );
+        assert_eq!(
+            header(&message, "From").as_deref(),
+            Some("\"Example Ltd\" <sip:+12025550142@trunk.example.com>;tag=a-tag")
+        );
+        assert!(header(&message, "Remote-Party-ID").is_none());
     }
 
     #[test]

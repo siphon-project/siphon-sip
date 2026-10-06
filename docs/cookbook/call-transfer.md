@@ -139,6 +139,46 @@ Two consequences worth knowing when you write handlers:
 * **If the target then fails**, the surviving party has nobody left to talk to,
   so siphon releases it and tears the call down rather than stranding it.
 
+#### When the REFER arrives twice
+
+A `REFER` over UDP is retransmitted until its final response gets through, so
+the same request can arrive after siphon has already acted on it. It is the same
+request (same Call-ID, CSeq and Via branch) and is answered with the same final
+response again, for 32 s: `@b2bua.on_refer` runs once per `REFER`, and the
+target is dialled, or the `REFER` relayed, once. A `REFER` with a new CSeq is a
+new request.
+
+#### When a second REFER arrives during a transfer
+
+A call carries out one transfer at a time. While the target of an accepted
+transfer is still ringing, and while a relayed `REFER` has not been answered by
+the far end, a new `REFER` on the call (from either party) is answered
+`491 Request Pending` and `@b2bua.on_refer` does not run for it: accepting it
+would dial a second target for the same pair. The referrer may send it again
+(RFC 3261 §21.4.27), and once the first transfer has succeeded, failed or timed
+out the handler runs for a new `REFER` as usual.
+
+#### When the target cannot be dialled
+
+The `202` goes out before the target is dialled, so a target siphon can send no
+INVITE to (it does not resolve, or none of its contacts can be reached) is found
+out after the referrer was told the transfer is under way. The referrer is not
+left waiting: its subscription is ended with a `NOTIFY` whose sipfrag says
+`503 Service Unavailable` (`Subscription-State: terminated;reason=noresource`,
+RFC 3515 §2.4.5), and the call keeps both its parties.
+
+```
+   Alice (referrer)              siphon
+     |  REFER Refer-To: <target> |
+     |------------------------->|
+     |  202 Accepted            |
+     |<-------------------------|
+     |  NOTIFY sipfrag 100      |
+     |<-------------------------|   (no INVITE can be sent)
+     |  NOTIFY sipfrag 503      |
+     |<-------------------------|   Alice <== still bridged ==> Bob
+```
+
 Rewrite the destination or steer egress without touching what the endpoints see:
 
 ```python
@@ -296,8 +336,32 @@ than treating a changed offer as unchanged.
 Attended transfer: Alice consults Carol on a second call first, then transfers
 Bob into the Alice-Carol call with a `REFER` carrying a `Replaces` header
 (RFC 3891) that names the Alice-Carol dialog. siphon reads it off
-`call.refer_replaces`, matches the dialog it is **already tracking**, bridges Bob
-onto it, and BYEs the now-redundant old legs.
+`call.refer_replaces` and dials the transfer target with that `Replaces` on the
+INVITE, rewritten to the identifiers the target knows its own dialog by. The
+**target** performs the takeover: it answers the new INVITE in place of the
+consultation dialog and ends that one itself (RFC 3891 §3).
+
+So the INVITE has to reach the target. siphon does not join two calls it hosts
+on its own: it dials, and the far end replaces.
+
+!!! warning "A `Refer-To` that names siphon needs a `target`"
+    A transferor builds `Refer-To` from the remote target of its consultation
+    call (RFC 5589 §7.3). Behind a B2BUA that remote target is siphon's own
+    Contact, so the URI names this node, not Carol. Dialled as written, siphon
+    INVITEs itself, the rewritten `Replaces` matches nothing on the way back in,
+    and the transfer fails `481`.
+
+    Pass the target's real address: `call.accept_refer(target="sip:carol@…")`
+    from a script, or `accept_refer {target}` from a controller, where `target`
+    may be `{aor}` to reach a registered phone over the connection it holds.
+    An AoR with several registered contacts rings them all; the first to answer
+    is kept and the rest are CANCELled.
+    A controller finds out who that is from `TransferRequested`: when the
+    `Replaces` names a dialog this node hosts, `replaces.local` carries the
+    call, the channel controlling it and the leg.
+
+    A transferor that puts the target's address-of-record in `Refer-To`
+    instead needs none of this.
 
 ```python
 from siphon import b2bua, log
@@ -310,7 +374,7 @@ def on_refer(call):
                  f"call_id={replaces['call_id']} "
                  f"from_tag={replaces['from_tag']} to_tag={replaces['to_tag']} "
                  f"early_only={replaces['early_only']}")
-    call.accept_refer()          # siphon matches the replaced dialog + re-bridges
+    call.accept_refer()          # dials Refer-To with the Replaces rewritten for it
 ```
 
 !!! warning "One argument, no reply"
@@ -381,20 +445,103 @@ Alice                    siphon 198.51.100.1            Bob            Carol
   |  REFER Refer-To:Carol    |                           |               |
   |  Replaces=call2 dialog   |                           |               |
   |------------------------->|                           |               |
-  |  202 Accepted            |  match Replaces -> call 2 |               |
-  |<-------------------------|                           |               |
-  |                          |  re-bridge Bob <-> Carol  |               |
-  |                          |<==========================|==============>|
+  |  202 Accepted            |  INVITE, Replaces=Carol's own dialog      |
+  |<-------------------------|------------------------------------------>|
+  |                          |  200 OK (Carol replaces her dialog)       |
+  |                          |<------------------------------------------|
+  |                          |  re-INVITE Bob onto Carol |               |
+  |                          |-------------------------->|               |
   |  NOTIFY sipfrag 200 OK   |                           |               |
+  |<-------------------------|        BYE (call 2, Carol's old dialog)   |
+  |  BYE (call 1, Alice)     |<------------------------------------------|
   |<-------------------------|                           |               |
-  |  BYE (call 1, Alice)     |     BYE (call 2, Alice)   |               |
-  |<-------------------------|-------------------------->|               |
   |                          |         Bob <==== bridged ====> Carol     |
 ```
 
 `early_only` is set when the `Replaces` header carried the `early-only`
 parameter — the transfer must only match a dialog still in an early (pre-2xx)
-state (RFC 3891 §3). siphon honours it when matching.
+state (RFC 3891 §3). On this path siphon carries the flag through to the target,
+whose match it is; on an INVITE that names one of siphon's own dialogs siphon
+does the matching, and declines `486` when the dialog is confirmed.
+
+Two cases this does not cover, so they are not read into the above:
+
+- A call a controller **bridged** from two legs (`bridge`, or
+  `dial {on_answer: "bridge"}`) is two calls joined at the media engine, and the
+  party that stays when one is transferred is on the other call. A
+  siphon-terminated transfer re-pairs the legs of one call, so it does not move
+  that party. The application does it instead: `TransferRequested` names the
+  hosted dialog and the channel it is bridged with (`replaces.local`), and
+  `accept_refer {mode: "controller"}` lets it re-bridge the two remaining
+  channels and report the result. See
+  [the recipe below](#attended-transfer-between-calls-a-controller-bridged).
+- A script-free deployment (`control.inbound`) hands an INVITE carrying
+  `Replaces` to its application as a new call. `StasisStart` names the hosted
+  dialog it asked to join (`replaces`); the takeover described under "The other
+  half" runs only after a script's `@b2bua.on_invite` admitted the INVITE.
+
+### Attended transfer between calls a controller bridged
+
+Alice called in and the application bridged her to Bob. Bob then called
+Carol through the application too, and now wants Alice and Carol talking.
+That is four calls, each with a channel of its own, in two bridges:
+
+```
+  alice <==== bridge ====> bob-1        (Bob talking to Alice)
+  bob-2 <==== bridge ====> carol        (Bob talking to Carol)
+```
+
+Bob's phone sends a `REFER` on `bob-1` whose `Refer-To` carries a `Replaces`
+naming his dialog on `bob-2`. siphon cannot do this transfer by re-pairing
+the legs of one call, because the two parties who stay are on two other
+calls. The application can, and tells Bob's phone how it went:
+
+1. `TransferRequested` arrives on `bob-1`. `replaces.local` says which
+   hosted dialog Bob named: `channel` is `bob-2`, and `bridged_with` is
+   `carol`, the party to connect. The party on the other side of the
+   REFER's own call is `alice`, which the application knows from the bridge
+   it made.
+2. `accept_refer {mode: "controller"}` on `bob-1`. Bob's phone gets `202`
+   and a `NOTIFY` saying `100 Trying`. Nothing is dialled.
+3. `unbridge` on `alice` and on `carol`, and wait for `ChannelUnbridged` on
+   each. Then `bridge` `alice` with `carol`.
+4. On `ChannelBridged`, `complete_refer {code: 200}` on `bob-1`. Bob's
+   phone gets the `NOTIFY` saying `200 OK` and knows the transfer is done.
+   On `BridgeFailed`, report the failure instead, for example
+   `complete_refer {code: 503}`, and put the bridges back.
+5. `hangup` on `bob-1` and `bob-2`.
+
+As frames on the control connection, with the event that each step waits for:
+
+```text
+<- event   TransferRequested  channel=bob-1
+           replaces.local = {channel: "bob-2", leg: "a", bridged_with: "carol"}
+-> command accept_refer    channel=bob-1  {"mode": "controller", "timeout": 30}
+-> command unbridge        channel=alice
+-> command unbridge        channel=carol
+<- event   ChannelUnbridged  channel=alice
+<- event   ChannelUnbridged  channel=carol
+-> command bridge          channel=alice  {"with": "carol"}
+<- event   ChannelBridged    channel=alice
+-> command complete_refer  channel=bob-1  {"code": 200}
+-> command hangup          channel=bob-1
+-> command hangup          channel=bob-2
+```
+
+The order of the last three commands matters. The `NOTIFY` that
+`complete_refer` sends travels on `bob-1`'s dialog, so it has to go before
+`bob-1` is hung up. Afterwards there is no dialog to send it in and
+`complete_refer` answers `not_found`; Bob's phone never hears the transfer
+worked and may keep the consultation call on hold until its own timer
+runs out.
+
+If the application takes longer than `timeout` (default 60 s, at most 180),
+siphon reports `503` to the referrer itself and tells the application with a
+`TransferTimedOut` event on `bob-1` (`{reason: "timeout", code: 503,
+referrer_leg}`), after which `complete_refer` is refused. If Bob hangs up before the
+report, the subscription ends with his call and there is nothing to
+report. Full rules are in the
+[control plane reference](../reference/control-plane.md#a-transfer-the-application-carries-out).
 
 ## 3. Inbound transparent transfer
 
@@ -589,6 +736,10 @@ A target that rejects, or never answers before `timeout`, leaves the call
 **exactly as it was** — the IVR is still there and the caller never knew. That is
 also why `timeout` matters: the target here is a human, and "nobody picked up" is
 an ordinary outcome, not an error case.
+
+A target no INVITE can be sent to is refused on the spot (`bad_request`, a
+`ValueError` in a script), with nothing dialled and nothing left pending on the
+call, so another `replace_peer` can be tried right away.
 
 `replace_a_leg=True` reverses the direction (replace the caller, keep the
 callee). Pass `profile=` when the call is anchored with a direction-bound media

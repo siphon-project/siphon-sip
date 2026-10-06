@@ -1349,9 +1349,24 @@ impl SiphonServer {
         // `udp_listener_channels` HashMap-iteration pick (per-process randomized
         // seed).  Without this a multi-homed UDP host could egress from a
         // different socket than its Via advertised and flip between restarts.
-        let udp_default = default_udp_egress_addr(&config.listen.udp)
+        let udp_default_addr = default_udp_egress_addr(&config.listen.udp);
+        let udp_default = udp_default_addr
             .and_then(|addr| udp_listener_channels.get(&addr).map(|(tx, _)| tx.clone()))
             .unwrap_or_else(|| transport::udp::UdpOutbound::channels(1).0);
+        // Dual-stack: the default listener reaches one address family only, so
+        // unpinned sends to the other one go to a listener bound in it (the
+        // lowest-bound, the same pick `ListenerRegistry::resolve_family` makes
+        // for the Via of a relayed request).
+        let udp_default = match udp_default_addr.and_then(|default| {
+            udp_listener_channels
+                .iter()
+                .filter(|(addr, _)| addr.is_ipv6() != default.is_ipv6())
+                .min_by_key(|(addr, _)| **addr)
+                .map(|(addr, (tx, _))| (addr.is_ipv6(), tx))
+        }) {
+            Some((ipv6, listener)) => udp_default.with_other_family(ipv6, listener),
+            None => udp_default,
+        };
 
         let outbound_senders = Arc::new(transport::OutboundRouter {
             udp: udp_default,
@@ -1658,8 +1673,8 @@ impl SiphonServer {
 
         // Hot-reload the outbound client certificate alongside the inbound
         // acceptor: when `tls.client_certificate` + `tls.client_private_key` are
-        // configured (outbound mutual TLS — Teams Direct Routing, carrier
-        // interconnects), watch them on disk and swap the renewed identity into
+        // configured (outbound mutual TLS, as carrier interconnects
+        // require), watch them on disk and swap the renewed identity into
         // the pool so outbound handshakes present the new cert without a restart.
         if let Some((Some(certificate_path), Some(private_key_path))) = config
             .tls

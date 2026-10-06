@@ -131,7 +131,7 @@ pub(super) fn sanitize_b2bua_response_keeping(
 
     // Sanitize SDP: mask B-leg identity in o= and s= lines, and rewrite
     // the o= address to our advertised address for topology hiding.
-    sanitize_sdp_identity(&mut response.body, &state.sdp_name, Some(&a_leg_host));
+    hide_sdp_identity(&mut response.body, state, Some(&a_leg_host));
 
     // Update Content-Length after SDP rewrite (o=/s= changes may alter body size)
     if !response.body.is_empty() {
@@ -199,7 +199,29 @@ pub(super) fn sdp_origin_address(addr: &str) -> (String, Option<&'static str>) {
     }
 }
 
+/// Replace both the `o=` identity and the `s=` session name with `name`: for
+/// SDP siphon presents as its own, where there is no far side to preserve.
 pub(super) fn sanitize_sdp_identity(body: &mut Vec<u8>, name: &str, addr: Option<&str>) {
+    rewrite_sdp_identity(body, name, Some(name), addr);
+}
+
+/// Hide the far side's SDP identity the way this node is configured to:
+/// `o=` always, `s=` unless `media.sdp_keep_session_name` leaves it alone.
+pub(super) fn hide_sdp_identity(body: &mut Vec<u8>, state: &DispatcherState, addr: Option<&str>) {
+    let session_name = (!state.sdp_keep_session_name).then_some(state.sdp_name.as_str());
+    rewrite_sdp_identity(body, &state.sdp_name, session_name, addr);
+}
+
+/// Replace the `o=` username (and address, when `addr` is given) with siphon's
+/// own, and the `s=` session name with `session_name` unless that is `None`,
+/// which leaves the session name as the far side wrote it
+/// (`media.sdp_keep_session_name`).
+pub(super) fn rewrite_sdp_identity(
+    body: &mut Vec<u8>,
+    name: &str,
+    session_name: Option<&str>,
+    addr: Option<&str>,
+) {
     if body.is_empty() {
         return;
     }
@@ -279,7 +301,7 @@ pub(super) fn sanitize_sdp_identity(body: &mut Vec<u8>, name: &str, addr: Option
                 }
             }
             result.push_str(line);
-        } else if line.starts_with("s=") {
+        } else if let (true, Some(name)) = (line.starts_with("s="), session_name) {
             // s=<session name> — replace entirely
             if line.ends_with("\r\n") {
                 result.push_str("s=");
@@ -426,7 +448,7 @@ pub(super) fn own_sdp_toward_leg(
     if body.is_empty() {
         return;
     }
-    sanitize_sdp_identity(body, &state.sdp_name, address);
+    hide_sdp_identity(body, state, address);
     if let Some((session_id, version)) =
         state.call_actors.reserve_leg_sdp_version(call_id, on_a_leg)
     {

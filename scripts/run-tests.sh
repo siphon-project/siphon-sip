@@ -10,6 +10,10 @@
 #   ./scripts/run-tests.sh --rtpproxy   # Also run classic rtpproxy media test
 #   ./scripts/run-tests.sh --control    # Also run the external control-plane (app rail) tests
 #   ./scripts/run-tests.sh --b2bua     # Also run B2BUA call/session-timer/cancel/failure tests
+#   ./scripts/run-tests.sh --b2bua-fork        # Also run the parallel-fork cases
+#   ./scripts/run-tests.sh --b2bua-on-failure  # Also run the @b2bua.on_failure decision cases
+#   ./scripts/run-tests.sh --b2bua-lcr         # Also run the LCR route-sequence cases
+#   ./scripts/run-tests.sh --originate         # Also run the control-plane originate test
 set -euo pipefail
 
 # SIPp exit code 255 means "dead call messages" (late retransmissions received
@@ -37,12 +41,17 @@ RUN_VOICE_AI=false
 RUN_CONTROL=false
 RUN_BRIDGE=false
 RUN_DIAL_BRIDGE=false
+RUN_CONTROL_TRANSFER=false
 RUN_REFER_SINGLE_LEG=false
 RUN_REINVITE=false
 RUN_REOFFER=false
 RUN_B2BUA=false
 RUN_B2BUA_AUTH=false
 RUN_B2BUA_INVITE_AUTH=false
+RUN_B2BUA_FORK=false
+RUN_B2BUA_ON_FAILURE=false
+RUN_B2BUA_LCR=false
+RUN_ORIGINATE=false
 RUN_GATEWAY=false
 RUN_AUTO100=false
 RUN_HTTP_AUTH=false
@@ -73,12 +82,17 @@ for arg in "$@"; do
     --control)    RUN_CONTROL=true;    SELECTED_MODES+=("$arg") ;;
     --bridge)     RUN_BRIDGE=true;     SELECTED_MODES+=("$arg") ;;
     --dial-bridge) RUN_DIAL_BRIDGE=true; SELECTED_MODES+=("$arg") ;;
+    --control-transfer) RUN_CONTROL_TRANSFER=true; SELECTED_MODES+=("$arg") ;;
     --refer-single-leg) RUN_REFER_SINGLE_LEG=true; SELECTED_MODES+=("$arg") ;;
     --reinvite)   RUN_REINVITE=true;   SELECTED_MODES+=("$arg") ;;
     --reoffer)    RUN_REOFFER=true;    SELECTED_MODES+=("$arg") ;;
     --b2bua)      RUN_B2BUA=true;      SELECTED_MODES+=("$arg") ;;
     --b2bua-auth) RUN_B2BUA_AUTH=true; SELECTED_MODES+=("$arg") ;;
     --b2bua-invite-auth) RUN_B2BUA_INVITE_AUTH=true; SELECTED_MODES+=("$arg") ;;
+    --b2bua-fork) RUN_B2BUA_FORK=true; SELECTED_MODES+=("$arg") ;;
+    --b2bua-on-failure) RUN_B2BUA_ON_FAILURE=true; SELECTED_MODES+=("$arg") ;;
+    --b2bua-lcr)  RUN_B2BUA_LCR=true;  SELECTED_MODES+=("$arg") ;;
+    --originate)  RUN_ORIGINATE=true;  SELECTED_MODES+=("$arg") ;;
     --gateway)    RUN_GATEWAY=true;    SELECTED_MODES+=("$arg") ;;
     --auto100)    RUN_AUTO100=true;    SELECTED_MODES+=("$arg") ;;
     --http-auth)  RUN_HTTP_AUTH=true;  SELECTED_MODES+=("$arg") ;;
@@ -98,7 +112,9 @@ for arg in "$@"; do
       echo "Scenario modes (pick at most ONE per run):"
       echo "  --ipsec --charging --call --presence --rtpengine --rtpproxy --reinvite"
       echo "  --voice-ai --refer-single-leg --reoffer --control --bridge --dial-bridge"
+      echo "  --control-transfer"
       echo "  --b2bua --b2bua-auth --b2bua-invite-auth --gateway --auto100 --http-auth"
+      echo "  --b2bua-fork --b2bua-on-failure --b2bua-lcr --originate"
       echo "  --wedge --nohandler --banscan --reload --shutdown"
       echo "  --security --rfc4475 --webrtc"
       echo
@@ -138,13 +154,38 @@ if (( ${#SELECTED_MODES[@]} > 1 )); then
   exit 2
 fi
 
+# Every compose profile this run names, kept so the exit trap can take down
+# what the run started. Recorded here, on the way to docker, so that no step
+# has to remember to: a mode names its profiles on the commands that start its
+# containers, and the helper scripts it calls use the same ones.
+declare -A STARTED_PROFILES=()
+docker() {
+  local argument previous=""
+  for argument in "$@"; do
+    if [[ "$previous" == "--profile" ]]; then
+      STARTED_PROFILES["$argument"]=1
+    fi
+    previous="$argument"
+  done
+  command docker "$@"
+}
+
 cleanup() {
   echo "--- Cleaning up ---"
+  # `down` takes down the services of the profiles it is given and those that
+  # belong to none. Without the profiles a mode's own containers (its siphon,
+  # its media engine, its control application) were left running on their
+  # fixed addresses and host ports, and the network with them, for the next
+  # run to collide with.
+  local profile profiles=()
+  for profile in "${!STARTED_PROFILES[@]}"; do
+    profiles+=(--profile "$profile")
+  done
   # -v drops the named volumes too. The bridge mode shares siphon's CDR file
   # with its assertion container through one, and a record left over from an
   # earlier run would be exactly what makes that assertion pass without the
   # current run having carried any audio.
-  docker compose -f "$COMPOSE_FILE" down --remove-orphans -v 2>/dev/null || true
+  command docker compose -f "$COMPOSE_FILE" "${profiles[@]}" down --remove-orphans -v 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -439,6 +480,49 @@ if [[ "$RUN_DIAL_BRIDGE" == true ]]; then
   echo "Dial-bridge logs: $DIAL_BRIDGE_LOG_DIR"
 fi
 
+# ── Step 7a4: giving up a dial, a REFER from the callee, replacing a party ──
+# Eight cases against one siphon and one persistent control application. Each is
+# a caller plus the detached parties that case needs; run_transfer_case.sh
+# fails a case unless the caller, every party, the application's verdict and
+# the Call-IDs the parties and the application saw all agree.
+if [[ "$RUN_CONTROL_TRANSFER" == true ]]; then
+  echo "=== SIPp control-transfer tests (cancel_dial, inbound REFER, replace_peer, media verbs) ==="
+  docker compose -f "$COMPOSE_FILE" --profile control-transfer up -d --force-recreate --wait \
+    siphon-rtp-engine siphon-control-transfer control-transfer-app
+
+  control_transfer_case() {
+    echo "--- $1 ---"
+    run_sipp bash sipp/control/run_transfer_case.sh "$@"
+  }
+
+  control_transfer_case cancel-dial control_transfer_cancel_dial_uac.xml \
+    sipp-control-transfer-ringing-phone sipp-control-transfer-trying-phone
+  # RFC 3261 §9.1: a dial given up before its phone has sent any response is
+  # not CANCELled until that phone's first provisional, and not at all when it
+  # answers with a final response instead.
+  control_transfer_case cancel-late-ringing control_transfer_cancel_dial_uac.xml \
+    sipp-control-transfer-late-ringing-phone
+  control_transfer_case cancel-late-answer control_transfer_cancel_dial_uac.xml \
+    sipp-control-transfer-late-answering-phone
+  control_transfer_case refer-callee control_transfer_survivor_uac.xml \
+    sipp-control-transfer-referrer-phone sipp-control-transfer-target
+  control_transfer_case refer-controller control_transfer_uac.xml \
+    sipp-control-transfer-controller-referrer-phone sipp-control-transfer-silent-target
+  control_transfer_case replace-aor control_transfer_survivor_uac.xml \
+    sipp-control-transfer-callee-phone sipp-control-transfer-answering-contact \
+    sipp-control-transfer-cancelled-contact
+  control_transfer_case replace-aor-refused control_transfer_probe_uac.xml \
+    sipp-control-transfer-callee-phone sipp-control-transfer-busy-contact \
+    sipp-control-transfer-unavailable-contact
+  control_transfer_case media control_transfer_media_uac.xml \
+    sipp-control-transfer-callee-phone
+
+  CONTROL_TRANSFER_LOG_DIR="$(mktemp -d)"
+  docker compose -f "$COMPOSE_FILE" logs control-transfer-app > "$CONTROL_TRANSFER_LOG_DIR/control-transfer-app.log" 2>&1 || true
+  docker compose -f "$COMPOSE_FILE" logs siphon-control-transfer > "$CONTROL_TRANSFER_LOG_DIR/siphon-control-transfer.log" 2>&1 || true
+  echo "Control-transfer logs: $CONTROL_TRANSFER_LOG_DIR"
+fi
+
 # ── Step 7a2: Single-leg cold transfer (optional) ─────────────────────────
 if [[ "$RUN_REFER_SINGLE_LEG" == true ]]; then
   echo "=== SIPp cold-transfer test (single-leg answer -> in-dialog REFER) ==="
@@ -607,6 +691,15 @@ if [[ "$RUN_B2BUA" == true ]]; then
   run_sipp docker compose -f "$COMPOSE_FILE" --profile b2bua-rtpengine-refer up --abort-on-container-exit --exit-code-from sipp-anchored-refer-uac sipp-anchored-refer-uac sipp-anchored-refer-bob-uas sipp-anchored-refer-carol-uas
   docker compose -f "$COMPOSE_FILE" --profile b2bua-rtpengine-refer down 2>/dev/null || true
 
+  # The caller speaks SRTP and the callee plain RTP, anchored with a profile
+  # whose halves say so. The callee holds and resumes: each re-INVITE must reach
+  # the caller as SRTP and be answered to the callee as plain RTP. Both parties
+  # assert the SDP they are sent, so both are graded.
+  echo "=== B2BUA callee re-offer at an SRTP edge + REAL rtpengine (each party keeps its transport) ==="
+  docker compose -f "$COMPOSE_FILE" --profile b2bua-rtpengine-reoffer up -d --wait rtpengine-real siphon-b2bua-rtpengine-reoffer
+  run_sipp env COMPOSE_PROFILES=b2bua-rtpengine-reoffer bash sipp/run_call.sh sipp-srtp-edge-reoffer-uac sipp-srtp-edge-reoffer-uas
+  docker compose -f "$COMPOSE_FILE" --profile b2bua-rtpengine-reoffer down 2>/dev/null || true
+
   echo "=== B2BUA CANCEL test (INVITE → CANCEL → 487) ==="
   run_sipp docker compose -f "$COMPOSE_FILE" --profile b2bua --profile b2bua-cancel up --abort-on-container-exit --exit-code-from sipp-b2bua-cancel-uac sipp-b2bua-cancel-uac sipp-b2bua-cancel-uas
   docker compose -f "$COMPOSE_FILE" --profile b2bua --profile b2bua-cancel rm -sf sipp-b2bua-cancel-uac sipp-b2bua-cancel-uas 2>/dev/null || true
@@ -661,6 +754,169 @@ if [[ "$RUN_B2BUA_INVITE_AUTH" == true ]]; then
   echo "=== B2BUA A-leg INVITE auth test (siphon 407s the caller, then bridges the authenticated re-INVITE) ==="
   run_sipp docker compose -f "$COMPOSE_FILE" --profile b2bua-invite-auth up --abort-on-container-exit --exit-code-from sipp-b2bua-invite-auth-uac sipp-b2bua-invite-auth-uac sipp-b2bua-invite-auth-uas
   docker compose -f "$COMPOSE_FILE" --profile b2bua-invite-auth rm -sf sipp-b2bua-invite-auth-uac sipp-b2bua-invite-auth-uas 2>/dev/null || true
+fi
+
+# ── Step 9d: B2BUA parallel fork (optional) ─────────────────────────────────
+# The steps of CI's sipp-b2bua-fork job. Each case is a caller plus detached
+# callees (sipp/b2bua-fork/run_case.sh), and the callees carry most of the
+# assertions.
+if [[ "$RUN_B2BUA_FORK" == true ]]; then
+  echo "=== Starting siphon-b2bua-fork ==="
+  docker compose -f "$COMPOSE_FILE" --profile b2bua-fork up -d --wait siphon-b2bua-fork
+
+  fork_case() {
+    echo "--- $1 ---"
+    run_sipp bash sipp/b2bua-fork/run_case.sh "$@"
+  }
+
+  fork_case fork-busy b2bua_fork_uac.xml sipp-b2bua-fork-busy-uas sipp-b2bua-fork-late-uas
+  fork_case fork-cancel b2bua_fork_uac.xml sipp-b2bua-fork-early-uas sipp-b2bua-fork-cancelled-uas
+  fork_case fork-glare b2bua_fork_uac.xml sipp-b2bua-fork-early-uas sipp-b2bua-fork-glare-uas
+  fork_case fork-allfail b2bua_fork_fail_uac.xml sipp-b2bua-fork-busy-uas sipp-b2bua-fork-unavailable-uas
+  fork_case fork-timeout b2bua_fork_fail_uac.xml sipp-b2bua-fork-busy-uas sipp-b2bua-fork-cancelled-uas
+  fork_case fork-class b2bua_fork_fail_uac.xml sipp-b2bua-fork-busy-uas sipp-b2bua-fork-service-unavailable-uas
+  fork_case fork-503 b2bua_fork_500_uac.xml sipp-b2bua-fork-service-unavailable-uas
+  fork_case fork-redirect b2bua_fork_redirect_uac.xml sipp-b2bua-fork-busy-uas sipp-b2bua-fork-redirect-uas
+  fork_case fork-seqbest b2bua_fork_408_uac.xml sipp-b2bua-fork-cancelled-uas sipp-b2bua-fork-service-unavailable-uas
+
+  # Every case but fork-busy, fork-cancel and fork-glare fails, and
+  # @b2bua.on_failure must run once for each.
+  echo "--- on_failure ran once for each case that failed ---"
+  count="$(docker logs siphon-b2bua-fork 2>&1 | grep -c 'FORK-FAILURE' || true)"
+  if [ "$count" != "6" ]; then
+    echo "@b2bua.on_failure ran $count times, expected 6 (once per failing case)"
+    docker logs siphon-b2bua-fork 2>&1 | grep 'FORK-FAILURE' || true
+    exit 1
+  fi
+fi
+
+# ── Step 9e: B2BUA @b2bua.on_failure decisions (optional) ───────────────────
+# The steps of CI's sipp-b2bua-on-failure job: the fork job's runner and
+# callees against their own siphon.
+if [[ "$RUN_B2BUA_ON_FAILURE" == true ]]; then
+  echo "=== Starting siphon-b2bua-on-failure ==="
+  docker compose -f "$COMPOSE_FILE" --profile b2bua-on-failure up -d --wait siphon-b2bua-on-failure
+
+  on_failure_case() {
+    echo "--- $1 ---"
+    run_sipp env SIPP_PROFILE=b2bua-on-failure SIPP_CALLER=sipp-b2bua-on-failure-uac \
+      bash sipp/b2bua-fork/run_case.sh "$@"
+  }
+
+  on_failure_case fail-redial b2bua_fork_uac.xml sipp-b2bua-fork-busy-uas sipp-b2bua-fork-early-uas
+  on_failure_case fail-reject b2bua_on_failure_reject_uac.xml sipp-b2bua-fork-busy-uas
+  on_failure_case timeout-redial b2bua_fork_uac.xml sipp-b2bua-fork-cancelled-uas sipp-b2bua-fork-early-uas
+  on_failure_case undialed-redial b2bua_fork_uac.xml sipp-b2bua-fork-early-uas
+  on_failure_case answer-fail-redial b2bua_fork_uac.xml sipp-b2bua-fork-early-uas sipp-b2bua-fork-late-uas
+  on_failure_case fail-answer b2bua_fork_uac.xml sipp-b2bua-fork-busy-uas
+
+  # Each case fails once, on the status its first attempt ended with.
+  echo "--- on_failure ran once per case, with the status each case failed on ---"
+  logs="$(docker logs siphon-b2bua-on-failure 2>&1)"
+  for expected in "fail-redial 486" "fail-reject 486" "timeout-redial 408" "undialed-redial 503" "answer-fail-redial 500" "fail-answer 486"; do
+    count="$(grep -c "ON-FAILURE $expected " <<<"$logs" || true)"
+    if [ "$count" != "1" ]; then
+      echo "expected one 'ON-FAILURE $expected' line, got $count"
+      grep 'ON-FAILURE ' <<<"$logs" || true
+      exit 1
+    fi
+  done
+  total="$(grep -c 'ON-FAILURE ' <<<"$logs" || true)"
+  if [ "$total" != "6" ]; then
+    echo "@b2bua.on_failure ran $total times, expected 6 (once per case)"
+    grep 'ON-FAILURE ' <<<"$logs" || true
+    exit 1
+  fi
+fi
+
+# ── Step 9f: B2BUA LCR route sequence (optional) ────────────────────────────
+# The steps of CI's sipp-b2bua-lcr job, against the mock LCR API.
+if [[ "$RUN_B2BUA_LCR" == true ]]; then
+  echo "=== Starting siphon-b2bua-lcr and the mock LCR API ==="
+  docker compose -f "$COMPOSE_FILE" --profile b2bua-lcr up -d --wait siphon-b2bua-lcr b2bua-lcr-api
+
+  echo "--- the last carrier's failure reaches the caller with the caller's own From and To ---"
+  run_sipp bash sipp/b2bua-lcr/run_case.sh b2bua_lcr_relay_identity_uac.xml sipp-b2bua-lcr-carrier-a-uas sipp-b2bua-lcr-carrier-b-uas
+
+  echo "--- carrier A failed over, carrier B's 404 ended the call ---"
+  logs="$(docker logs siphon-b2bua-lcr 2>&1)"
+  for expected in "LCR-CARRIER-FAILED carrier-a 503" "LCR-CARRIER-FAILED carrier-b 404" "LCR-FAILURE 404 Not Found"; do
+    count="$(grep -c "$expected" <<<"$logs" || true)"
+    if [ "$count" != "1" ]; then
+      echo "expected one '$expected' line, got $count"
+      grep 'LCR-' <<<"$logs" || true
+      exit 1
+    fi
+  done
+
+  echo "--- a carrier that shows progress keeps the call past its ring timeout ---"
+  run_sipp bash sipp/b2bua-lcr/run_case.sh b2bua_lcr_progress_ring_bound_uac.xml sipp-b2bua-lcr-ringing-carrier-uas sipp-b2bua-lcr-untried-carrier-uas
+
+  echo "--- the ring bound's 408 ended the call once ---"
+  logs="$(docker logs siphon-b2bua-lcr 2>&1)"
+  expected="LCR-FAILURE 408 Request Timeout"
+  count="$(grep -c "$expected" <<<"$logs" || true)"
+  if [ "$count" != "1" ]; then
+    echo "expected one '$expected' line, got $count"
+    grep 'LCR-' <<<"$logs" || true
+    exit 1
+  fi
+
+  # The start time is kept so the next check reads this call's siphon lines
+  # only: the progress case above logged a failure too.
+  echo "--- a carrier that already failed is not CANCELled when the last carrier rings out ---"
+  LCR_SETTLED_CASE_SINCE="$(date -u +%Y-%m-%dT%H:%M:%S.%NZ)"
+  run_sipp bash sipp/b2bua-lcr/run_case.sh b2bua_lcr_last_carrier_rings_out_uac.xml sipp-b2bua-lcr-rejecting-carrier-uas sipp-b2bua-lcr-trying-carrier-uas
+
+  echo "--- both carriers' failures were recorded once, the ring timeout before on_failure ---"
+  call_failure="LCR-FAILURE 503 Service Unavailable"
+  events="$(docker logs --since "$LCR_SETTLED_CASE_SINCE" siphon-b2bua-lcr 2>&1 | grep -E 'LCR-(CARRIER-FAILED|FAILURE|NO-ROUTE)' || true)"
+  position=1
+  for expected in "LCR-CARRIER-FAILED carrier-rejecting 503" "LCR-CARRIER-FAILED carrier-trying 408" "$call_failure"; do
+    at="$(grep -n "$expected" <<<"$events" | cut -d: -f1 | paste -sd, - || true)"
+    if [ "$at" != "$position" ]; then
+      echo "expected one '$expected' line, line $position of this call's LCR lines, got line(s): ${at:-none}"
+      echo "$events"
+      exit 1
+    fi
+    position=$((position + 1))
+  done
+  total="$(grep -c . <<<"$events" || true)"
+  if [ "$total" != "3" ]; then
+    echo "expected three LCR lines for this call, got $total"
+    echo "$events"
+    exit 1
+  fi
+
+  echo "--- a carrier is told who the call is from, and CLIR still withholds it from the From ---"
+  run_sipp bash sipp/b2bua-lcr/run_case.sh b2bua_lcr_asserted_identity_uac.xml sipp-b2bua-lcr-asserted-identity-uas
+fi
+
+# ── Step 9g: Control-plane originate (optional) ─────────────────────────────
+# The steps of CI's sipp-originate job: a control application places a call
+# under a channel id it chose. The callee asserts what reached the wire, the
+# application prints one ORIGINATE-VERDICT line.
+if [[ "$RUN_ORIGINATE" == true ]]; then
+  echo "=== Starting siphon-originate ==="
+  docker compose -f "$COMPOSE_FILE" --profile originate up -d --wait siphon-originate
+
+  echo "=== Originate under a caller-supplied id, ring, answer, hangup ==="
+  run_sipp docker compose -f "$COMPOSE_FILE" --profile originate up --abort-on-container-exit --exit-code-from originate-app sipp-originate-uas originate-app
+
+  ORIGINATE_LOG_DIR="$(mktemp -d)"
+  docker compose -f "$COMPOSE_FILE" logs originate-app > "$ORIGINATE_LOG_DIR/originate-app.log" 2>&1 || true
+  docker compose -f "$COMPOSE_FILE" logs siphon-originate > "$ORIGINATE_LOG_DIR/siphon-originate.log" 2>&1 || true
+  if ! grep -q 'ORIGINATE-VERDICT' "$ORIGINATE_LOG_DIR/originate-app.log"; then
+    echo "FAILED: no ORIGINATE-VERDICT — the control application never completed"
+    exit 1
+  fi
+  if grep -q '"pass": false' "$ORIGINATE_LOG_DIR/originate-app.log"; then
+    echo "FAILED: originate acceptance checks:"
+    grep 'ORIGINATE-VERDICT' "$ORIGINATE_LOG_DIR/originate-app.log"
+    exit 1
+  fi
+  grep 'ORIGINATE-VERDICT' "$ORIGINATE_LOG_DIR/originate-app.log"
+  echo "Originate logs: $ORIGINATE_LOG_DIR"
 fi
 
 # ── Step 10: Gateway routing tests (optional) ──────────────────────────────────
@@ -725,8 +981,7 @@ if [[ "$RUN_HTTP_AUTH" == true ]]; then
     up --abort-on-container-exit --exit-code-from sipp-onchange-load \
     mock-http-auth siphon-onchange sipp-onchange-load
   docker compose -f "$COMPOSE_FILE" --profile http-auth rm -sf \
-    mock-http-auth siphon-onchange sipp-onchange-load 2>/dev/nu
-    ll || true
+    mock-http-auth siphon-onchange sipp-onchange-load 2>/dev/null || true
 fi
 
 # ── Outbound-drain wedge regression (optional) ───────────────────────────────

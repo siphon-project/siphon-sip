@@ -54,6 +54,7 @@ pub(crate) mod b2bua;
 mod cancel_ack;
 mod cdr;
 mod charging;
+mod completed_invite;
 mod engine_channel_events;
 mod failure;
 mod identity;
@@ -61,6 +62,7 @@ mod in_dialog;
 mod inbound;
 mod inbound_filter;
 mod intercept;
+mod late_answer;
 mod liveness;
 mod media_init;
 mod proxy_dialog_state;
@@ -88,21 +90,33 @@ mod advertised_port_tests;
 #[cfg(test)]
 mod b2bua_conclude_once_tests;
 #[cfg(test)]
+mod b2bua_invite_retransmission_tests;
+#[cfg(test)]
 mod b_leg_2xx_ack_tests;
 #[cfg(test)]
 mod b_leg_asserted_identity_tests;
 #[cfg(test)]
 mod b_leg_capability_tests;
 #[cfg(test)]
+mod b_leg_position_tests;
+#[cfg(test)]
 mod bad_extension_tests;
 #[cfg(test)]
 mod bridged_pair_media_events_tests;
 #[cfg(test)]
+mod cancel_awaits_provisional_tests;
+#[cfg(test)]
 mod carrier_attribution_tests;
+#[cfg(test)]
+mod control_bridge_elsewhere_tests;
+#[cfg(test)]
+mod control_bridge_ingress_tests;
 #[cfg(test)]
 mod control_bridge_media_tests;
 #[cfg(test)]
 mod control_bridge_relay_tests;
+#[cfg(test)]
+mod control_cancel_dial_tests;
 #[cfg(test)]
 mod control_dial_branch_events_tests;
 #[cfg(test)]
@@ -114,6 +128,10 @@ mod control_dial_bridge_tests;
 #[cfg(test)]
 mod control_dial_identity_tests;
 #[cfg(test)]
+mod control_dial_rpid_tests;
+#[cfg(test)]
+mod control_dial_to_tests;
+#[cfg(test)]
 mod control_drop_tests;
 #[cfg(test)]
 mod control_inbound_cancel_tests;
@@ -122,13 +140,23 @@ mod control_originate_aor_tests;
 #[cfg(test)]
 mod control_originate_tests;
 #[cfg(test)]
+mod control_rebridge_tests;
+#[cfg(test)]
+mod control_refer_controller_tests;
+#[cfg(test)]
+mod control_unbridge_reoffer_tests;
+#[cfg(test)]
 mod delayed_offer_ack_tests;
+#[cfg(test)]
+mod delayed_offer_ingress_tests;
 #[cfg(test)]
 mod dial_bridge_test_harness;
 #[cfg(test)]
 mod dialog_state_events_tests;
 #[cfg(test)]
 mod dialog_state_transfer_tests;
+#[cfg(test)]
+mod early_update_tests;
 #[cfg(test)]
 mod held_bye_tests;
 #[cfg(test)]
@@ -160,17 +188,43 @@ mod originate_test_harness;
 #[cfg(test)]
 mod originate_tests;
 #[cfg(test)]
+mod originated_cancel_awaits_provisional_tests;
+#[cfg(test)]
 mod prack_offer_answer_tests;
 #[cfg(test)]
+mod proxy_branch_final_tests;
+#[cfg(test)]
+mod proxy_cancel_awaits_provisional_tests;
+#[cfg(test)]
+mod proxy_cancel_upstream_tests;
+#[cfg(test)]
+mod proxy_cancel_wire_tests;
+#[cfg(test)]
 mod proxy_dialog_state_tests;
+#[cfg(test)]
+mod proxy_late_answer_tests;
 #[cfg(test)]
 mod proxy_protocol_tests;
 #[cfg(test)]
 mod proxy_reply_filter_tests;
 #[cfg(test)]
+mod proxy_stateless_2xx_tests;
+#[cfg(test)]
+mod proxy_timer_c_tests;
+#[cfg(test)]
 mod public_api_surface;
 #[cfg(test)]
+mod refer_answer_tests;
+#[cfg(test)]
+mod relayed_cancel_awaits_provisional_tests;
+#[cfg(test)]
 mod relayed_identity_tests;
+#[cfg(test)]
+mod reoffer_ingress_tests;
+#[cfg(test)]
+mod replacement_fork_tests;
+#[cfg(test)]
+mod replacement_prack_tests;
 #[cfg(test)]
 mod reply_script_header_tests;
 #[cfg(test)]
@@ -194,6 +248,8 @@ mod session_timer_tests;
 #[cfg(test)]
 mod shutdown_teardown_tests;
 #[cfg(test)]
+mod stale_in_dialog_request_tests;
+#[cfg(test)]
 mod subscribe_reply_order_tests;
 #[cfg(test)]
 mod teardown_race_tests;
@@ -204,9 +260,13 @@ mod tests;
 #[cfg(test)]
 mod transfer_bye_tests;
 #[cfg(test)]
+mod transfer_ingress_tests;
+#[cfg(test)]
 mod uas_bad_extension_tests;
 #[cfg(test)]
 mod unacked_answer_tests;
+#[cfg(test)]
+mod undialled_replacement_tests;
 #[cfg(test)]
 mod ws_uri_expansion_tests;
 
@@ -229,15 +289,19 @@ pub use b2bua::{
 // `public_api_surface` all the same — the point of the count is that the module
 // does not grow a surface by accident, published or not.
 pub(crate) use b2bua::{
-    b2bua_dial_call, b2bua_drop_call, b2bua_media_profile, b2bua_originate_group_create,
-    b2bua_originate_group_start, b2bua_set_session_timer, bridge_calls_with_state,
-    dial_answered_payload, dial_branch_identity, dial_branch_summary, dial_bridge_caller,
-    dial_bridge_join, dial_bridge_refuse_phone, dial_bridge_spec, dial_bridge_start,
-    dial_targets_for_aor, DialBridgeCaller, DialBridgeListener, DialBridgePlan, DialBridgeRefusal,
-    DialBridgeSender, DialBridgeSignal, DialBridgeStartError, DialError, DialShaping, DialTarget,
-    DispatcherHandle, DropOutcome, OriginateGroupAnswers, OriginateGroupFailure,
-    OriginateGroupSink, OriginateGroupSpec, OriginateGroupStrategy, OriginateGroupWinner,
-    OriginateLegProgress, RunningDispatcher, DIAL_BRIDGE_CALLER_GONE, DIAL_RINGBACK_ORIGIN,
+    b2bua_accept_refer_call_dialling, b2bua_accept_refer_controller_with_state,
+    b2bua_cancel_dial_with_state, b2bua_complete_refer_with_state, b2bua_dial_call,
+    b2bua_drop_call, b2bua_media_profile, b2bua_originate_group_create,
+    b2bua_originate_group_start, b2bua_replace_peer_dialling, b2bua_set_session_timer,
+    bridge_calls_with_state, dial_answered_payload, dial_branch_identity, dial_branch_summary,
+    dial_bridge_caller, dial_bridge_join, dial_bridge_refuse_phone, dial_bridge_spec,
+    dial_bridge_start, dial_targets_for_aor, ControllerReferRefusal, DialBridgeCaller,
+    DialBridgeListener, DialBridgePlan, DialBridgeRefusal, DialBridgeSender, DialBridgeSignal,
+    DialBridgeStartError, DialCancelRefusal, DialError, DialShaping, DialTarget, DispatcherHandle,
+    DropOutcome, OriginateGroupAnswers, OriginateGroupFailure, OriginateGroupSink,
+    OriginateGroupSpec, OriginateGroupStrategy, OriginateGroupWinner, OriginateLegProgress,
+    ReplacementDial, RunningDispatcher, DIAL_BRIDGE_CALLER_GONE, DIAL_CANCELLED,
+    DIAL_RINGBACK_ORIGIN,
 };
 pub use charging::{ro_authorize_b2bua, RoAuthorizeOutcome};
 pub(crate) use liveness::liveness_on_flow_close;
@@ -249,6 +313,7 @@ use b2bua::*;
 use cancel_ack::*;
 use cdr::*;
 use charging::*;
+use completed_invite::*;
 use engine_channel_events::*;
 use failure::*;
 use identity::*;
@@ -256,6 +321,7 @@ use in_dialog::*;
 use inbound::*;
 use inbound_filter::*;
 use intercept::*;
+use late_answer::*;
 use liveness::*;
 use media_init::*;
 use proxy_dialog_state::*;
@@ -397,15 +463,13 @@ pub async fn run(
     let _non_invite_timeout =
         std::time::Duration::from_secs(tx_config.map(|t| t.timeout_secs as u64).unwrap_or(5));
 
-    let timer_config = {
-        let mut config = TimerConfig::default();
-        if let Some(tx) = tx_config {
-            config.auto_100_trying = tx.auto_emit_100_trying;
-            config.auto_100_delay =
-                std::time::Duration::from_millis(tx.auto_emit_100_trying_delay_ms);
-        }
-        config
-    };
+    let timer_config = transaction_timers(tx_config);
+    if timer_c_is_below_the_rfc_minimum(timer_config.timer_c_secs) {
+        warn!(
+            timer_c_secs = timer_config.timer_c_secs,
+            "transaction.timer_c_secs is 180 or less: RFC 3261 §16.6 step 11 requires Timer C to be larger than 3 minutes; every proxied INVITE still ringing after this long is CANCELled"
+        );
+    }
     let transaction_manager = Arc::new(TransactionManager::new(timer_config));
 
     let dns_resolver = Arc::new(match SipResolver::from_system() {
@@ -580,6 +644,10 @@ pub async fn run(
             .as_ref()
             .and_then(|m| m.sdp_name.clone())
             .unwrap_or_else(|| product_name.to_string()),
+        sdp_keep_session_name: config
+            .media
+            .as_ref()
+            .is_some_and(|m| m.sdp_keep_session_name),
         sdp_strip_attributes: config
             .media
             .as_ref()
@@ -591,6 +659,7 @@ pub async fn run(
         held_byes: Arc::new(DashMap::new()),
         pending_reinvite_acks: Arc::new(DashMap::new()),
         cancelled_invites: Arc::new(DashMap::new()),
+        completed_invites: CompletedInvites::default(),
         originate_groups: Arc::new(crate::dispatcher::b2bua::OriginateGroupStore::new()),
         dial_bridges: Arc::new(crate::dispatcher::b2bua::DialBridgeStore::new()),
         bridge_relays: Arc::new(crate::dispatcher::b2bua::BridgeRelayStore::new()),
@@ -602,6 +671,8 @@ pub async fn run(
         ro_sessions: Arc::new(DashMap::new()),
         cdr_sessions: Arc::new(DashMap::new()),
         pending_inbound_refer: Arc::new(PendingInboundReferStore::default()),
+        answered_refers: Arc::new(AnsweredReferStore::default()),
+        controller_refers: Arc::new(ControllerReferStore::default()),
         deferred_referrer_bye: Arc::new(DeferredReferrerByeStore::default()),
         parse_error_log: Arc::new(ParseErrorLimiter::default()),
         // Interception is enforced here, not in the script. `LI_MANAGER` is

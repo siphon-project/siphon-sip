@@ -63,8 +63,8 @@ pub(super) fn transport_from_token(token: &str) -> Option<Transport> {
 /// hop is a configured gateway hostname destination whose address the health
 /// prober has already resolved (and `set_address`'d every probe cycle). A hit
 /// returns that cached, health-checked address with **zero** DNS on the hot
-/// path — the fix for a per-call ~1s stall routing to an FQDN trunk / Teams
-/// Direct Routing SBC on a low-traffic node where the resolver's own cache has
+/// path — the fix for a per-call ~1s stall routing to a trunk named by FQDN
+/// on a low-traffic node where the resolver's own cache has
 /// gone cold between calls. The hostname is preserved as `server_name` so TLS
 /// SNI is unchanged, and the R-URI (built elsewhere from the same URI) is
 /// untouched.
@@ -468,8 +468,8 @@ pub(super) fn mtu_tcp_upgrade(
 /// For a B→A in-dialog forward over **TLS**, decide whether to dial the remote
 /// target Contact instead of the target leg's cached socket.
 ///
-/// A peer that opens a fresh TLS connection per transaction (e.g. a Teams
-/// Direct Routing SBC) closes its old connection; the leg's cached
+/// A peer that opens a fresh TLS connection per transaction closes its old
+/// connection; the leg's cached
 /// `remote_addr` is then the peer's dead *source* port and its cached
 /// `connection_id` is gone from the connection map, so both the reuse path and
 /// the cached-socket fallback would time out. In that case dial the remote

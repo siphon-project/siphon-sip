@@ -119,6 +119,13 @@ pub fn b2bua_terminate_call_inner(
     #[cfg(test)]
     teardown_race::claimed();
 
+    // A leg replacement still ringing its targets ends with the call: they are
+    // CANCELled (RFC 3261 §9.1) before the call that knows them is removed.
+    b2bua_abandon_leg_replacements(internal_call_id, state);
+    // And a REFER still waiting for its application's decision is answered,
+    // ahead of the BYE that ends the dialog it arrived in.
+    refers_end_with_call(state, internal_call_id);
+
     // Rf ACR-STOP (TS 32.299 §6.2.2). A framework-initiated teardown maps to the
     // Diameter "normal" cause (None → 0); the RFC 3326 Reason on the BYE is
     // informational only here (its Q.850 cause is not a SIP status).
@@ -232,9 +239,9 @@ pub fn b2bua_release_transferred_call(internal_call_id: &str, state: &Dispatcher
     }
 
     // Safety-net RTPEngine cleanup. Keyed on the A-leg Call-ID (the store key);
-    // a transfer that never completed leaves the pre-transfer anchor in place,
-    // and the fresh survivor↔target anchor offered in phase 1 is dropped by the
-    // engine's own timeout since the target never answered.
+    // a transfer that never completed leaves the pre-transfer anchor in place.
+    // The fresh survivor↔target anchors offered in phase 1 were released when
+    // their targets failed (`conclude_failed_replacement`).
     if let (Some(rtpengine_set), Some(media_sessions)) =
         (&state.rtpengine_set, &state.rtpengine_sessions)
     {
@@ -254,6 +261,7 @@ pub fn b2bua_release_transferred_call(internal_call_id: &str, state: &Dispatcher
 
     b2bua_stop_siprec(internal_call_id, state);
     dial_bridge_call_ended(&sip_call_id, state);
+    refers_end_with_call(state, internal_call_id);
     control_notify_terminated(&sip_call_id, "transfer_failed");
 
     state

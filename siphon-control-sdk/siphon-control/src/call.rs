@@ -9,16 +9,32 @@ use pyo3::prelude::*;
 
 use siphon_control_client::sip::{
     Call as RustCall, DialOptions, Dialing, DtmfOptions, PlayOptions, RecordOptions, Ringback,
-    StreamOptions,
+    StreamOptions, TransferDial, TransferTarget,
 };
 
 use crate::args::{
     build_play_source, extract_dial_on_answer, extract_dial_strategy, extract_dial_targets,
-    extract_headers, extract_privacy, extract_record_channels, extract_record_direction,
-    extract_route_target, extract_stream_channels, extract_stream_direction, extract_stream_mode,
-    parse_peer_hangup,
+    extract_headers, extract_play_repeat, extract_privacy, extract_record_channels,
+    extract_record_direction, extract_route_target, extract_stream_channels,
+    extract_stream_direction, extract_stream_mode, parse_peer_hangup,
 };
 use crate::{attach_if_running, interpreter_gone, json_to_py, optional_json, to_pyerr};
+
+/// The target of a transfer verb: a URI, or a registered AoR — never both.
+fn transfer_target(
+    verb: &str,
+    target: Option<String>,
+    aor: Option<String>,
+) -> PyResult<Option<TransferTarget>> {
+    match (target, aor) {
+        (Some(_), Some(_)) => Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "{verb} takes a target URI or aor=, not both"
+        ))),
+        (Some(uri), None) => Ok(Some(TransferTarget::Uri(uri))),
+        (None, Some(aor)) => Ok(Some(TransferTarget::Aor(aor))),
+        (None, None) => Ok(None),
+    }
+}
 
 /// The dict `dial` resolves to. The bridge fields are added only for a bridge
 /// dial, so a connecting dial's dict keeps the four keys it always had.
@@ -253,6 +269,30 @@ impl Call {
         })
     }
 
+    /// Give up on the dial ringing for this call and leave the caller alone.
+    ///
+    /// Every phone still ringing is CANCELled, each reported by
+    /// ``DialBranchFailed`` with cause ``cancelled``, and the dial ends in
+    /// ``DialFailed`` with code 487. The caller is exactly as the dial found
+    /// it, still this app's, and free to be dialled for again. ``hangup`` ends
+    /// the caller as well.
+    ///
+    /// ``reason`` is reported as the ``cause`` of a bridging dial's
+    /// ``DialFailed`` (default ``cancelled``). Raises ``ControlError``
+    /// (``invalid_state``) when nothing is ringing, and once a phone has
+    /// answered and is being bridged.
+    #[pyo3(signature = (reason=None))]
+    fn cancel_dial<'py>(
+        &self,
+        py: Python<'py>,
+        reason: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let call = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            call.cancel_dial(reason.as_deref()).await.map_err(to_pyerr)
+        })
+    }
+
     fn refer<'py>(&self, py: Python<'py>, to: String) -> PyResult<Bound<'py, PyAny>> {
         let call = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
@@ -277,7 +317,35 @@ impl Call {
     /// that party's transport to whoever remains and the survivor answers
     /// `m=audio 0` — a connected call with no audio either way. Pass the profile
     /// for the pair that remains, commonly `"rtp_passthrough"`.
-    #[pyo3(signature = (target=None, next_hop=None, mode=None, profile=None))]
+    ///
+    /// `aor` names the target by its registered address-of-record instead of
+    /// a URI: it is dialled over the flow its phone registered on, the only
+    /// way to reach one on TCP, TLS or WebSocket. Nobody registered raises
+    /// `not_found`; several registered contacts all ring, the first to answer
+    /// is kept and the rest are CANCELled. `from_uri`,
+    /// `from_display`, `p_asserted_identity`, `privacy` and `headers` are the
+    /// identity arguments `dial` takes, for the leg the transfer dials.
+    /// `number_policy` names a number policy configured on the server for the
+    /// numbers in that leg's identity headers, and `format` gives one format
+    /// instead (`"e164"`, `"plain"`, `"international"`, `"national"`); the
+    /// server refuses the two together. All of these
+    /// and `aor` apply to `mode="terminate"`; `"transparent"` dials no leg.
+    ///
+    /// `mode="controller"` is the transfer this app carries out itself: the
+    /// server answers `202`, sends the first sipfrag NOTIFY and dials nothing.
+    /// Move the parties with `bridge` / `unbridge` / `replace_peer` / `dial`,
+    /// then report with `complete_refer`. `timeout` is how many seconds there
+    /// are to report in (default 60, at most 180); past it the server reports
+    /// `503` to the referrer itself and tells this app with a
+    /// `TransferTimedOut` event, payload `{"reason": "timeout", "code": 503,
+    /// "referrer_leg": "a" | "b"}`. This mode takes `timeout` only, and
+    /// `timeout` belongs to this mode only: anything else raises `ValueError`.
+    #[pyo3(signature = (
+        target=None, next_hop=None, mode=None, profile=None, *, aor=None, from_uri=None,
+        from_display=None, p_asserted_identity=None, privacy=None, headers=None, timeout=None,
+        number_policy=None, format=None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
     fn accept_refer<'py>(
         &self,
         py: Python<'py>,
@@ -285,17 +353,64 @@ impl Call {
         next_hop: Option<String>,
         mode: Option<String>,
         profile: Option<String>,
+        aor: Option<String>,
+        from_uri: Option<String>,
+        from_display: Option<String>,
+        p_asserted_identity: Option<String>,
+        privacy: Option<String>,
+        headers: Option<Bound<'py, PyAny>>,
+        timeout: Option<u32>,
+        number_policy: Option<String>,
+        format: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
+        if mode.as_deref() == Some("controller") {
+            let dials_a_leg = target.is_some()
+                || aor.is_some()
+                || next_hop.is_some()
+                || profile.is_some()
+                || from_uri.is_some()
+                || from_display.is_some()
+                || p_asserted_identity.is_some()
+                || privacy.is_some()
+                || headers.is_some()
+                || number_policy.is_some()
+                || format.is_some();
+            if dials_a_leg {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "accept_refer mode \"controller\" dials no leg: it takes timeout only",
+                ));
+            }
+            let call = self.inner.clone();
+            return pyo3_async_runtimes::tokio::future_into_py(py, async move {
+                call.accept_refer_controller(timeout)
+                    .await
+                    .map_err(to_pyerr)
+            });
+        }
+        if timeout.is_some() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "accept_refer timeout applies to mode \"controller\"",
+            ));
+        }
+        let target = transfer_target("accept_refer", target, aor)?;
+        let dial = TransferDial {
+            next_hop,
+            from: from_uri,
+            from_display,
+            p_asserted_identity,
+            privacy: extract_privacy("accept_refer", privacy)?,
+            number_policy,
+            format,
+            headers: headers
+                .map(|headers| extract_headers(&headers))
+                .transpose()?
+                .unwrap_or_default(),
+        };
         let call = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            call.accept_refer(
-                target.as_deref(),
-                next_hop.as_deref(),
-                mode.as_deref(),
-                profile.as_deref(),
-            )
-            .await
-            .map_err(to_pyerr)
+            call.accept_refer_dialling(target.as_ref(), mode.as_deref(), profile.as_deref(), &dial)
+                .await
+                .map_err(to_pyerr)
         })
     }
 
@@ -311,6 +426,29 @@ impl Call {
         let call = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             call.reject_refer(code, reason.as_deref())
+                .await
+                .map_err(to_pyerr)
+        })
+    }
+
+    /// Report how a transfer accepted with `accept_refer(mode="controller")`
+    /// went: the server sends the referrer the sipfrag NOTIFY that ends its
+    /// subscription. `code` is the status in it (200-699), a 2xx for a
+    /// transfer that succeeded; `reason` its reason phrase, used as given.
+    ///
+    /// Report before releasing the referrer's leg: the NOTIFY travels on its
+    /// dialog, and afterwards this raises `code == "not_found"`. With no such
+    /// transfer open on the call it raises `code == "invalid_state"`.
+    #[pyo3(signature = (code, reason=None))]
+    fn complete_refer<'py>(
+        &self,
+        py: Python<'py>,
+        code: u16,
+        reason: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let call = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            call.complete_refer(code, reason.as_deref())
                 .await
                 .map_err(to_pyerr)
         })
@@ -419,26 +557,62 @@ impl Call {
     /// `"invalid_state"` (not answered, no peer leg, or a replacement already
     /// in flight — all worth retrying later), or `"bad_request"` (the target
     /// will not parse or route).
-    #[pyo3(signature = (target, next_hop=None, replace_a_leg=None, profile=None, timeout=None))]
+    ///
+    /// Pass `aor=` instead of `target` to dial a registered address-of-record
+    /// over the flow its phone registered on (`not_found` when nobody is
+    /// registered; several registered contacts all ring, the first to answer
+    /// is kept and the rest are CANCELled). `from_uri`,
+    /// `from_display`, `p_asserted_identity`, `privacy` and `headers` are the
+    /// identity arguments `dial` takes, for the new leg. `number_policy` names
+    /// a number policy configured on the server for the numbers in its
+    /// identity headers, and `format` gives one format instead (`"e164"`,
+    /// `"plain"`, `"international"`, `"national"`); the server refuses the two
+    /// together.
+    #[pyo3(signature = (
+        target=None, next_hop=None, replace_a_leg=None, profile=None, timeout=None, *, aor=None,
+        from_uri=None, from_display=None, p_asserted_identity=None, privacy=None, headers=None,
+        number_policy=None, format=None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
     fn replace_peer<'py>(
         &self,
         py: Python<'py>,
-        target: String,
+        target: Option<String>,
         next_hop: Option<String>,
         replace_a_leg: Option<bool>,
         profile: Option<String>,
         timeout: Option<u32>,
+        aor: Option<String>,
+        from_uri: Option<String>,
+        from_display: Option<String>,
+        p_asserted_identity: Option<String>,
+        privacy: Option<String>,
+        headers: Option<Bound<'py, PyAny>>,
+        number_policy: Option<String>,
+        format: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
+        let Some(target) = transfer_target("replace_peer", target, aor)? else {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "replace_peer requires a target URI or aor=",
+            ));
+        };
+        let dial = TransferDial {
+            next_hop,
+            from: from_uri,
+            from_display,
+            p_asserted_identity,
+            privacy: extract_privacy("replace_peer", privacy)?,
+            number_policy,
+            format,
+            headers: headers
+                .map(|headers| extract_headers(&headers))
+                .transpose()?
+                .unwrap_or_default(),
+        };
         let call = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let value = call
-                .replace_peer(
-                    &target,
-                    next_hop.as_deref(),
-                    replace_a_leg,
-                    profile.as_deref(),
-                    timeout,
-                )
+                .replace_peer_dialling(&target, replace_a_leg, profile.as_deref(), timeout, &dial)
                 .await
                 .map_err(to_pyerr)?;
             attach_if_running(|py| json_to_py(py, &value))
@@ -537,10 +711,20 @@ impl Call {
     }
 
     /// Play an announcement on the A-leg media (fire-and-forget). Pass exactly one
-    /// of `file` (str), `db_id` (int), or `blob` (bytes, base64-encoded on the
-    /// wire); the rest shape playback. A call with no anchored media session
-    /// raises `ControlError` with `code == "not_found"`.
-    #[pyo3(signature = (file=None, db_id=None, blob=None, repeat=None, start_ms=None, duration_ms=None, to_tag=None))]
+    /// of `file` (str), `db_id` (int), `blob` (bytes, base64-encoded on the
+    /// wire), `tone` (a preset name such as `"ringback_eu"`, or a cadence such
+    /// as `"425/1000,0/4000*inf"`) or `url` (an `http://` or `https://` URL the
+    /// media engine fetches); the rest shape playback. A call with no anchored
+    /// media session raises `ControlError` with `code == "not_found"`.
+    ///
+    /// `repeat` is a total play count, or `"inf"` to play until stopped (music
+    /// on hold; `stop` ends it). Any other value raises `ValueError`.
+    /// `gain_decibels` plays louder (positive) or quieter (negative) by that
+    /// many decibels.
+    #[pyo3(signature = (
+        file=None, db_id=None, blob=None, repeat=None, start_ms=None, duration_ms=None,
+        to_tag=None, *, tone=None, url=None, gain_decibels=None,
+    ))]
     #[allow(clippy::too_many_arguments)]
     fn play<'py>(
         &self,
@@ -548,16 +732,20 @@ impl Call {
         file: Option<String>,
         db_id: Option<u64>,
         blob: Option<Vec<u8>>,
-        repeat: Option<u64>,
+        repeat: Option<Bound<'py, PyAny>>,
         start_ms: Option<u64>,
         duration_ms: Option<u64>,
         to_tag: Option<String>,
+        tone: Option<String>,
+        url: Option<String>,
+        gain_decibels: Option<i32>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let source = build_play_source(file, db_id, blob)?;
+        let source = build_play_source(file, db_id, blob, tone, url)?;
         let options = PlayOptions {
-            repeat,
+            repeat: extract_play_repeat(repeat.as_ref())?,
             start_ms,
             duration_ms,
+            gain_decibels,
             to_tag,
         };
         let call = self.inner.clone();
@@ -606,7 +794,12 @@ impl Call {
         })
     }
 
-    /// Hold the A-leg media via silence.
+    /// Silence the call's media in both directions on the media engine.
+    ///
+    /// A media gate, not a SIP hold: nothing is sent on either dialog, so no
+    /// phone shows a held call. Raises ``ControlError`` (``invalid_state``) on
+    /// a call the engine only relays; to hold one party of a bridge, use
+    /// ``unbridge``.
     fn hold<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let call = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
@@ -614,7 +807,7 @@ impl Call {
         })
     }
 
-    /// Resume the A-leg media after a `hold`.
+    /// Restore the call's media after a `hold`.
     fn unhold<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let call = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
@@ -768,6 +961,14 @@ impl Call {
     /// NAT. A bare string raises ``ValueError``: it does not say which was
     /// meant, and the wrong one places a call that connects to nothing while the
     /// trace looks healthy.
+    ///
+    /// Either form may carry ``"to"``, the branch's called party: its ``To``
+    /// URI. The target's URI is the Request-URI, and without ``to`` the B-leg's
+    /// ``To`` keeps the caller's user at the target's host, which is right for a
+    /// forward and wrong for a divert: a next hop that routes on ``To`` serves
+    /// the call as one to the original number and can send it straight back.
+    /// siphon keeps it as the leg's dialog ``To``, so a ``headers`` override is
+    /// no substitute.
     ///
     /// ``strategy`` is ``"parallel"`` or ``"sequential"`` and ``timeout`` is the
     /// ring timeout in seconds; each left out takes the server's own default

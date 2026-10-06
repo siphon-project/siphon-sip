@@ -1,0 +1,97 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  The phone of the `cancel-late-ringing` case: rung by a bridging dial, it
+  answers nothing at all for four seconds, during which the dial is given up
+  with `cancel_dial`, and only then sends its first response, a 180.
+
+  recv INVITE -> (4 s, nothing sent) -> 180
+              -> recv CANCEL -> 200 (CANCEL) -> 487 (INVITE) -> recv ACK
+
+  RFC 3261 §9.1: "If no provisional response has been received, the CANCEL
+  request MUST NOT be sent; rather, the client MUST wait for the arrival of a
+  provisional response before sending the request." So:
+
+    * nothing but the INVITE and its retransmissions may arrive during the
+      four seconds. SIPp discards a retransmission of the request it last
+      received, and fails the call on any other request that arrives while it
+      pauses, so a CANCEL sent before this phone has answered anything fails
+      the run here;
+    * once the 180 is out the CANCEL is owed, and it and the ACK of the 487
+      (§17.1.1.3) are mandatory rows under -timeout_error.
+
+  The ACK's To-tag is the one this phone put on the 487: the INVITE and the
+  CANCEL carried a tagless To, so it can only have been copied from the
+  response being acknowledged.
+
+  The INVITE's Call-ID is echoed to the container's output, where the runner
+  compares it with what the application was told
+  (sipp/control/run_transfer_case.sh).
+-->
+<scenario name="control-transfer phone that is silent, then rings">
+
+  <recv request="INVITE" crlf="true">
+    <action>
+      <ereg regexp="[^[:space:]]+" search_in="hdr" header="Call-ID:" assign_to="wire_call_id" />
+      <ereg regexp="[0-9]+" search_in="hdr" header="CSeq:" assign_to="invite_cseq" />
+      <exec command="echo WIRE-CALL-ID [$wire_call_id]" />
+    </action>
+  </recv>
+
+  <!-- No response of any kind: the INVITE has drawn no provisional. -->
+  <pause milliseconds="4000" />
+
+  <send>
+    <![CDATA[
+SIP/2.0 180 Ringing
+[last_Via:]
+[last_From:]
+[last_To:];tag=[pid]SIPpTag01[call_number]
+[last_Call-ID:]
+[last_CSeq:]
+Contact: <sip:phone@[local_ip]:[local_port];transport=[transport]>
+Content-Length: 0
+
+]]>
+  </send>
+
+  <recv request="CANCEL" timeout="10000" />
+
+  <send>
+    <![CDATA[
+SIP/2.0 200 OK
+[last_Via:]
+[last_From:]
+[last_To:]
+[last_Call-ID:]
+[last_CSeq:]
+Content-Length: 0
+
+]]>
+  </send>
+
+  <!-- The INVITE's final response, on the INVITE's CSeq rather than the
+       CANCEL's that [last_CSeq:] would give. -->
+  <send>
+    <![CDATA[
+SIP/2.0 487 Request Terminated
+[last_Via:]
+[last_From:]
+[last_To:];tag=[pid]SIPpTag01[call_number]
+[last_Call-ID:]
+CSeq: [$invite_cseq] INVITE
+Content-Length: 0
+
+]]>
+  </send>
+
+  <recv request="ACK" timeout="10000">
+    <action>
+      <ereg regexp="tag=.*SIPpTag01"
+            search_in="hdr" header="To:" check_it="true" assign_to="ack_to_tag" />
+      <log message="the 487 was ACKed with its own To-tag: [$ack_to_tag]" />
+    </action>
+  </recv>
+
+</scenario>

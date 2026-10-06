@@ -940,16 +940,37 @@ async fn on_x3_ended(state: &Arc<DispatcherState>, ended: crate::rtpengine::even
     }
 }
 
+/// The reason a recording is reported finished with, given the engine's and
+/// whether siphon retired the recording's session itself to form a bridge.
+///
+/// The engine says `call_ended` whenever a session goes. A bridge retires
+/// sessions on calls that stay up, and reporting that as the call ending tells
+/// an application its caller hung up when the caller is in fact being
+/// connected. `bridged` says what happened: the recording stopped because the
+/// leg's media moved onto the bridge, and one is to be started there if the
+/// conversation is to be recorded.
+pub(super) fn recording_end_reason(engine: &'static str, retired_for_bridge: bool) -> &'static str {
+    if retired_for_bridge && engine == "call_ended" {
+        "bridged"
+    } else {
+        engine
+    }
+}
+
 /// A recording's file is closed. Tell the controller that owns the call.
 ///
 /// The event exists because the *closed* file is what a controller can act on:
 /// attaching the audio to an email on the `record_stop` reply would race a
 /// half-written one. Forwarded to the channel owner, which is the only thing
 /// that knows what the recording was for.
-fn on_recording_finished(
+pub(super) fn on_recording_finished(
     state: &DispatcherState,
-    recording: crate::rtpengine::events::RecordingFinished,
+    mut recording: crate::rtpengine::events::RecordingFinished,
 ) {
+    recording.reason = recording_end_reason(
+        recording.reason,
+        crate::rtpengine::MediaBackend::recording_finished(&recording.recording_id),
+    );
     tracing::info!(
         call_id = %recording.call_id,
         recording_id = %recording.recording_id,

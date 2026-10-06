@@ -277,7 +277,7 @@ trust whoever supplies the URL.
 return a handle so you can change or stop that one playback:
 
 ```python
-bed = await rtpengine.play_overlay(call, file="/prompts/hold.wav", repeat=0)
+bed = await rtpengine.play_overlay(call, file="/prompts/hold.wav", repeat="inf")
 await rtpengine.play_media(call, file="/prompts/agent.wav")
 await rtpengine.set_play_gain(call, bed, -18)     # duck the bed under the prompt
 await rtpengine.stop_media(call, play_id=bed)     # stop just the bed
@@ -298,8 +298,13 @@ would cut the party's live audio.
 
 On a B2BUA call siphon rewrites the `o=` and `s=` lines of the SDP it relays
 between the legs, so neither party sees the other's user name, host or session
-name (`media.sdp_name`). Every other line crosses as the far side wrote it. When
-an attribute carries something the other leg should not see, list it in
+name (`media.sdp_name`). Every other line crosses as the far side wrote it.
+
+Some peers read the session name as a marker of their own. Set
+`media.sdp_keep_session_name: true` to leave `s=` as it arrived; `o=` is still
+rewritten.
+
+When an attribute carries something the other leg should not see, list it in
 `media.sdp_strip_attributes`:
 
 ```yaml

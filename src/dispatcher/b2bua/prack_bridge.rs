@@ -51,6 +51,13 @@ pub enum CallerPrackBridged {
 /// PRACK goes out at once, and an offer the callee made in the provisional, which
 /// that caller cannot answer, is answered with every stream rejected (RFC 3264
 /// §6). `offer` is the provisional's SDP when the INVITE siphon sent carried none.
+///
+/// Nor does the caller PRACK a provisional it is never shown. The target of a
+/// leg replacement rings for a party of a call that is already up, and its
+/// provisionals are absorbed rather than relayed: siphon is the only UAC that
+/// INVITE has, so its PRACK goes out at once too. Held, it would wait for a
+/// PRACK that cannot come, and the target would retransmit the provisional and
+/// then give the INVITE up (RFC 3262 §3).
 pub fn hold_or_send_callee_prack(
     call_id: &str,
     prack: HeldCalleePrack,
@@ -60,7 +67,10 @@ pub fn hold_or_send_callee_prack(
     let Some(mut call) = state.call_actors.get_call_mut(call_id) else {
         return;
     };
-    if call.a_leg_supports_100rel || call.a_leg_requires_100rel {
+    let replacement_target = call.refer_subscriptions.iter().any(|subscription| {
+        subscription.siphon_notifies && subscription.target(&prack.branch).is_some()
+    });
+    if (call.a_leg_supports_100rel || call.a_leg_requires_100rel) && !replacement_target {
         call.prack_bridge.hold(prack, offer);
         debug!(
             call_id = %call_id,
@@ -176,17 +186,19 @@ pub fn build_callee_prack(
     body: Option<PrackBody>,
     state: &DispatcherState,
 ) -> Option<BuiltPrack> {
-    let cseq = state
-        .call_actors
-        .next_b_leg_local_cseq(call_id, held.b_leg_index)?;
     let target = EarlyDialogTarget {
         remote_contact: held.remote_contact.clone(),
         to_header: held.to_header.clone(),
         route_set: held.route_set.clone(),
     };
-    let (prack, leg, offer) = {
+    let (prack, leg, offer, cseq) = {
         let mut call = state.call_actors.get_call_mut(call_id)?;
-        let leg = call.b_legs.get_mut(held.b_leg_index)?;
+        // By the branch of the INVITE the provisional answered, under the one
+        // lock that also numbers the PRACK: this may run long after the
+        // provisional arrived, and the leg's position may have moved since.
+        let (_, leg) = call.find_b_leg_by_branch_mut(&held.branch)?;
+        leg.dialog.local_cseq = leg.dialog.local_cseq.saturating_add(1);
+        let cseq = leg.dialog.local_cseq;
         let mut prack = build_b2bua_prack(
             leg,
             state,
@@ -211,7 +223,7 @@ pub fn build_callee_prack(
             }
             set_sdp_body(&mut prack, sdp, &content_type);
         }
-        (prack, leg.clone(), offer)
+        (prack, leg.clone(), offer, cseq)
     };
     // PRACK follows this early dialog's route set (RFC 3262 §4, RFC 3261
     // §12.2.1.1), from the reliable provisional's Record-Route; without one it goes
@@ -236,16 +248,17 @@ pub fn build_callee_prack(
     })
 }
 
-/// Run `update` on the callee's leg `b_leg_index`. By index, where the store's
-/// per-leg setters reach only the winning leg: in the early dialog none has won.
+/// Run `update` on the callee's leg whose INVITE rode Via `branch`. By branch,
+/// where the store's per-leg setters reach only the winning leg (in the early
+/// dialog none has won) and a position may have moved since it was read.
 fn update_callee_leg(
     call_id: &str,
-    b_leg_index: usize,
+    branch: &str,
     state: &DispatcherState,
     update: impl FnOnce(&mut Leg),
 ) {
     if let Some(mut call) = state.call_actors.get_call_mut(call_id) {
-        if let Some(leg) = call.b_legs.get_mut(b_leg_index) {
+        if let Some((_, leg)) = call.find_b_leg_by_branch_mut(branch) {
             update(leg);
         }
     }
@@ -253,21 +266,20 @@ fn update_callee_leg(
 
 /// The link siphon's copy of a callee's reliable provisional carries to the PRACK
 /// held for it, read off the callee's response before it is rewritten for the
-/// caller.
+/// caller. `branch` is the Via branch that response carries.
 pub fn callee_prack_link(
     call_id: &str,
-    b_leg_index: Option<usize>,
+    branch: &str,
     response: &SipMessage,
     state: &DispatcherState,
 ) -> Option<u64> {
-    let index = b_leg_index?;
     let rseq = crate::sip::headers::rseq::parse_rseq(&response.headers)?.response_number;
     let to_tag = crate::b2bua::actor::extract_to_tag(response).unwrap_or_default();
     state
         .call_actors
         .get_call(call_id)?
         .prack_bridge
-        .link_for(index, &to_tag, rseq)
+        .link_for(branch, &to_tag, rseq)
 }
 
 /// A held PRACK whose provisional the caller will never PRACK: sent now, with
@@ -308,8 +320,12 @@ pub fn release_held_callee_pracks(call_id: &str, state: &DispatcherState) {
 /// stays unacknowledged at its UAS core until a PRACK names it (RFC 3262 §3), and
 /// siphon received that provisional while the branch was still pending.
 fn send_unanswered_callee_prack(call_id: &str, held: &HeldCalleePrack, state: &DispatcherState) {
+    // The leg as it sits on the call now. One that is gone has ended.
     let ended = state.call_actors.get_call(call_id).map_or(true, |call| {
-        call.winner != Some(held.b_leg_index) && call.is_ended_branch(held.b_leg_index)
+        call.find_b_leg_by_branch(&held.branch)
+            .map_or(true, |(index, _)| {
+                call.winner != Some(index) && call.is_ended_branch(index)
+            })
     });
     if ended {
         debug!(
@@ -384,7 +400,7 @@ pub fn bridge_caller_prack(
                     };
                 }
             };
-            update_callee_leg(call_id, held.b_leg_index, state, |leg| {
+            update_callee_leg(call_id, &held.branch, state, |leg| {
                 leg.last_sdp = Some(offer.to_vec());
             });
             state
@@ -452,7 +468,7 @@ pub fn bridge_caller_prack(
                         a_leg_rseq,
                         b_leg_call_id: b_leg_call_id.clone(),
                         b_leg_cseq,
-                        b_leg_index: held.b_leg_index,
+                        branch: held.branch.clone(),
                         sent_offer: built.sent.offer.clone(),
                         offer: caller_prack.body.clone(),
                         sent_at: Instant::now(),
@@ -548,7 +564,7 @@ pub fn handle_callee_prack_response(
             // session description in force on the callee's dialog now, and the
             // callee's answer is its own last SDP.
             let sent_offer = pending.sent_offer.clone();
-            update_callee_leg(&call_id, pending.b_leg_index, state, |leg| {
+            update_callee_leg(&call_id, &pending.branch, state, |leg| {
                 leg.last_sdp = Some(message.body.clone());
                 if let Some(offer) = sent_offer {
                     leg.dialog.last_sent_sdp = Some(offer);

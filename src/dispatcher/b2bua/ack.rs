@@ -620,7 +620,7 @@ pub fn stamp_b_leg_origin(
     state: &DispatcherState,
 ) {
     let host = state.via_host(transport);
-    sanitize_sdp_identity(body, &state.sdp_name, Some(&host));
+    hide_sdp_identity(body, state, Some(&host));
     stamp_sdp_origin(
         body,
         &state.sdp_name,
@@ -750,7 +750,8 @@ pub fn send_delayed_offer_ack(call_id: &str, caller_ack: &SipMessage, state: &Di
             return;
         };
         let mut body = answer;
-        if let Some(leg) = call.b_legs.get_mut(held.b_leg_index) {
+        // The callee's leg, by the Via branch of the INVITE its 2xx answered.
+        if let Some((_, leg)) = call.find_b_leg_by_branch_mut(&held.branch) {
             stamp_b_leg_origin(&mut body, &content_type, leg, &held.transport, state);
             leg.initial_acked = true;
             // The answer as the callee gets it is the session description in
@@ -797,11 +798,12 @@ pub fn anchored_answer(
     caller_ack: &SipMessage,
     state: &DispatcherState,
 ) -> AnchoredAnswer {
-    let Some(a_leg_call_id) = state
-        .call_actors
-        .get_call(call_id)
-        .map(|call| call.a_leg.dialog.call_id.clone())
-    else {
+    let Some((a_leg_call_id, caller_source)) = state.call_actors.get_call(call_id).map(|call| {
+        (
+            call.a_leg.dialog.call_id.clone(),
+            call.a_leg.transport.remote_addr.ip(),
+        )
+    }) else {
         return AnchoredAnswer::NotAnchored;
     };
     let Some(sessions) = state.rtpengine_sessions.as_ref() else {
@@ -828,6 +830,20 @@ pub fn anchored_answer(
     else {
         return AnchoredAnswer::Refused;
     };
+    // The answer is the caller's SDP, so the caller's own policy decides
+    // whether its media ingress is pinned to where it signals from: the half
+    // of the profile the caller of a dial is set up under, which is not the
+    // `answer` half this command is shaped by. Read off the session as it is
+    // recorded below, the caller first.
+    let caller = PartyIngress {
+        source: caller_source,
+        policy: crate::rtpengine::MediaSession {
+            from_tag: caller_tag.clone(),
+            to_tag: Some(session.from_tag.clone()),
+            ..session.clone()
+        }
+        .party_ingress(true),
+    };
     match b2bua_transfer_rtpengine_answer(
         state,
         session.rtpengine_id(),
@@ -835,10 +851,18 @@ pub fn anchored_answer(
         &caller_tag,
         &caller_ack.body,
         caller_ack.headers.call_id().map_or("", String::as_str),
-        &session.profile,
+        // The result goes to the callee, in the ACK: shaped as everything the
+        // callee of this dial is sent, by the profile's `offer` half. The
+        // session still names the callee alone, on its `from_tag`, so the
+        // half is named here, not read off the session.
+        &crate::rtpengine::session::SideFlags {
+            profile: session.profile.clone(),
+            half: crate::rtpengine::session::ProfileHalf::Offer,
+        },
+        Some(&caller),
     ) {
         Some(answer) => {
-            sessions.set_to_tag(&a_leg_call_id, caller_tag);
+            sessions.set_delayed_offer_answerer(&a_leg_call_id, caller_tag);
             AnchoredAnswer::Rewritten(answer)
         }
         None => AnchoredAnswer::Refused,

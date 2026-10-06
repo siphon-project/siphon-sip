@@ -163,7 +163,7 @@ impl PySecurityOffer {
 ///
 /// All transforms install identical xfrm policies; only the algorithm
 /// IDs and key material change.
-#[pyclass(name = "Transform", eq, eq_int, from_py_object)]
+#[pyclass(name = "Transform", eq, eq_int, skip_from_py_object)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PyTransform {
     /// HMAC-SHA-1-96 integrity, NULL encryption.
@@ -976,10 +976,11 @@ impl PyIpsec {
         python: Python<'py>,
         av: Bound<'py, PyAuthVectorHandle>,
         offer: PySecurityOffer,
-        transform: PyTransform,
+        transform: PyRef<'py, PyTransform>,
         expires_secs: Option<u64>,
         protocol: Option<&str>,
     ) -> PyResult<Bound<'py, PyAny>> {
+        let transform = *transform; // no FromPyObject: its generated clone of a Copy type fails clippy
         if !transform.compatible_with(&offer) {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
                 "transform {:?} not compatible with offer alg={:?} ealg={:?}",

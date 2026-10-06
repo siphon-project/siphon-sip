@@ -116,8 +116,8 @@ pub struct ConnectionPool {
     /// Pre-computed TOS byte (DSCP << 2) for DSCP/DiffServ marking.
     tos: Option<u32>,
     /// TLS connector for outbound TLS connections. Live-swappable so a renewed
-    /// outbound client certificate (mutual TLS — Teams Direct Routing, carrier
-    /// interconnects) is picked up without a restart: the inbound acceptor
+    /// outbound client certificate (mutual TLS, as carrier interconnects
+    /// require) is picked up without a restart: the inbound acceptor
     /// hot-reloads via its own `ArcSwap` (see [`crate::transport::tls`]), and
     /// this is the outbound counterpart. Read once per new connection in
     /// `send_tls_inner`; replaced atomically by the client-cert watcher spawned
@@ -156,8 +156,7 @@ pub struct ConnectionPool {
 
 /// A client identity siphon presents on OUTBOUND TLS connections when the
 /// upstream peer requests one (mutual TLS — SIP trunks that require
-/// client-certificate auth, e.g. carrier interconnects or Microsoft Teams
-/// Direct Routing).
+/// client-certificate auth, e.g. carrier interconnects).
 ///
 /// Owned (`'static`) so it can be moved into the long-lived `ClientConfig`.
 pub struct OutboundClientIdentity {
@@ -272,8 +271,8 @@ pub fn build_outbound_tls_config(
 /// handshake.
 ///
 /// When `sni` is `Some(host)`, the hostname is used verbatim — RFC 6066 SNI is
-/// emitted so a hostname-vhost front-end (upstream SIP trunk / Teams Direct
-/// Routing) can route the handshake. When `None`, the destination IP literal
+/// emitted so a hostname-vhost front-end (an upstream SIP trunk) can route
+/// the handshake. When `None`, the destination IP literal
 /// is used; rustls sends no SNI for an IP literal (RFC 6066).
 fn resolve_server_name(
     destination: SocketAddr,
@@ -1312,7 +1311,7 @@ impl ConnectionPool {
     /// [`crate::transport::tls::build_hot_reload_acceptor`] (which hot-reloads
     /// the inbound *server* acceptor): after a cert renewal, siphon presents the
     /// renewed identity both when it *accepts* TLS (inbound) and when it *dials*
-    /// TLS (outbound mutual-TLS — Teams Direct Routing, carrier interconnects)
+    /// TLS (outbound mutual-TLS, as carrier interconnects require)
     /// without a restart. Same notify pattern as the acceptor watcher:
     /// parent-directory watch (so atomic rename by cert-manager/certbot is
     /// observed), 150 ms debounce for the key-then-cert write pair, and a `Weak`
@@ -2210,7 +2209,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn reload_swaps_outbound_identity_for_new_connections() {
-        // The Teams-cert-renewal path: an outbound handshake with the OLD
+        // The client-cert-renewal path: an outbound handshake with the OLD
         // (untrusted) client identity must fail, and after
         // `reload_tls_client_config` swaps in the renewed identity, a fresh
         // outbound handshake must succeed — proving the live swap reaches new

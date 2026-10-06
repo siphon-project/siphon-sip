@@ -181,6 +181,9 @@ pub(super) fn handle_request(
     // ACK for 2xx is end-to-end: no IST exists (it terminated on 2xx),
     // so handle_ack returns None and we fall through to the script.
     if method == "ACK" {
+        // The caller has the B2BUA's final response to its INVITE, if this
+        // acknowledges one: it is then owed again only for Timer I.
+        acknowledge_invite_final(&message, inbound.transport, state);
         match state.transaction_manager.handle_ack(&message) {
             Ok(Some((key, actions))) => {
                 debug!(
@@ -201,7 +204,7 @@ pub(super) fn handle_request(
             Ok(None) => {
                 // No IST found — ACK for 2xx (end-to-end) or stale.
                 // Route via ProxySession using Call-ID + From-tag dialog key.
-                // Using both fields avoids ambiguity when a B2BUA (e.g. FreeSWITCH)
+                // Using both fields avoids ambiguity when a downstream B2BUA
                 // reuses the same Call-ID for both call legs through this proxy.
                 let call_id = message.headers.get("Call-ID");
                 let from_tag = message.typed_from().ok().flatten().and_then(|na| na.tag);
@@ -429,7 +432,12 @@ pub(super) fn handle_request(
     // before the script handler so accounting is closed even if the
     // script chooses to drop or reject the BYE; the SIP path itself
     // is unaffected (spawn is fire-and-forget).
-    if method == "BYE" {
+    //
+    // Not for a BYE that ends a dialog a late 2xx opened (RFC 3261 §16.7
+    // step 5): that dialog was never the call, and the call's accounting,
+    // keyed by Call-ID and the caller's tag alone, may be another dialog's.
+    let ends_the_call = method == "BYE" && !state.session_store.take_late_dialog(&message);
+    if ends_the_call {
         spawn_rf_proxy_stop_if_tracked(state, &message);
     }
     // CDR: the call record is written when this scope ends — i.e. *after* the
@@ -439,7 +447,7 @@ pub(super) fn handle_request(
     // every exit path, including the one a dropped or rejected BYE takes —
     // same "accounting closes regardless of what the script decides" rule as
     // the ACR-STOP above.
-    let _cdr_stop_guard = if method == "BYE" && crate::cdr::auto_emit_enabled() {
+    let _cdr_stop_guard = if ends_the_call && crate::cdr::auto_emit_enabled() {
         CdrProxyStop::from_bye(&message).map(|parts| CdrProxyStopGuard {
             sessions: Arc::clone(&state.cdr_sessions),
             parts: Some(parts),
@@ -662,9 +670,9 @@ pub(super) fn handle_request(
         // things depending on the method, so it gets two different answers.
         //
         // OPTIONS is a liveness probe, and answering it is the stack's job
-        // rather than every script's. A registrar qualifies its bindings —
-        // Asterisk's `qualify_frequency` and its equivalents send OPTIONS to the
-        // registered contact on a timer for the life of the registration — so a
+        // rather than every script's. A registrar qualifies its bindings — it
+        // sends OPTIONS to the registered contact on a timer for the life of
+        // the registration — so a
         // siphon that registers to a provider answers one of these forever. RFC
         // 3261 §11.2 has a UAS respond 200 with its capabilities. Requiring each
         // deployment to hand-write that handler got it wrong twice over: the
@@ -685,8 +693,9 @@ pub(super) fn handle_request(
         // registered handlers would under-advertise every method the framework
         // dispatches somewhere other than `@proxy.on_request` — REFER to
         // `@b2bua.on_refer`, CANCEL and ACK to the transaction layer — and
-        // under-advertising `Allow` is exactly how Teams Direct Routing stopped
-        // offering REFER once already (see `crate::sip::SUPPORTED_METHODS`).
+        // under-advertising `Allow` is exactly how a peer that reads its
+        // transfer method from it stopped offering REFER once already (see
+        // `crate::sip::SUPPORTED_METHODS`).
         let Some(response) = build_no_handler_response(
             &message,
             &method,
@@ -722,6 +731,14 @@ pub(super) fn handle_request(
         };
         if method == "OPTIONS" {
             debug!(method = %method, "no script handler — answering OPTIONS locally (RFC 3261 §11.2)");
+        } else if response.status_code() == Some(481) {
+            // A late request on a dialog that is gone is the peer's doing, not a
+            // misconfigured script, so it does not warrant a WARN per request.
+            debug!(
+                method = %method,
+                call_id = %message.headers.call_id().map(String::as_str).unwrap_or(""),
+                "in-dialog request matches no dialog — answering 481 (RFC 3261 §12.2.2)"
+            );
         } else {
             warn!(method = %method, "no script handler registered — answering 405");
         }
@@ -1010,8 +1027,8 @@ pub(super) fn handle_request(
             }
 
             // RFC 3261 §11.2 — make a 2xx OPTIONS a proper capability response: a
-            // Contact (Microsoft Teams Direct Routing rejects an OPTIONS answer
-            // carrying neither Contact nor Record-Route) plus an Allow advertising
+            // Contact (some peers reject an OPTIONS answer carrying neither
+            // Contact nor Record-Route) plus an Allow advertising
             // siphon's supported methods (peers read transfer capability from it).
             // Both are added only when absent, so a script-set header still wins.
             if method == "OPTIONS" && (200..300).contains(code) {

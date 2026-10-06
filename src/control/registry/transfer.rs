@@ -1,6 +1,7 @@
 //! Outbound REFER verdicts (`TransferProgress` / `TransferCompleted` /
-//! `TransferFailed`), the inbound `TransferRequested` event, and the teardown
-//! flush that keeps a transfer from being left pending.
+//! `TransferFailed`), the inbound `TransferRequested` event and the
+//! `TransferTimedOut` that ends one an app accepted and never reported on, and
+//! the teardown flush that keeps a transfer from being left pending.
 
 use tracing::debug;
 
@@ -135,6 +136,21 @@ impl TransferStage {
     }
 }
 
+/// The party that sent an inbound REFER, as `TransferRequested` reports it.
+#[derive(Debug, Clone)]
+pub struct TransferReferrer<'a> {
+    /// The referrer's dialog tag.
+    pub from_tag: Option<&'a str>,
+    /// Whether the REFER arrived on the A-leg of the channel's call.
+    pub from_a_leg: bool,
+    /// The SIP Call-ID of the dialog the REFER arrived on.
+    pub sip_call_id: &'a str,
+    /// The dialog an attended transfer's `Replaces` names, when this node hosts
+    /// it: its call, the channel controlling it, its leg and the channel it is
+    /// bridged with. `None` for a blind transfer or a dialog hosted elsewhere.
+    pub replaces_local: Option<serde_json::Value>,
+}
+
 /// One verdict on a siphon-originated (outbound) REFER, published on the control
 /// rail as `TransferProgress` / `TransferCompleted` / `TransferFailed`.
 ///
@@ -220,18 +236,20 @@ impl ControlBus {
     /// the dispatcher's store, so this adds and removes **no** per-call state of
     /// its own and needs no leak coverage here.
     ///
-    /// `channel_id` is the caller-resolved owner
-    /// ([`channel_id_for_sip_call_id`](Self::channel_id_for_sip_call_id));
-    /// `from_tag` identifies the referring party. The payload is
-    /// `{refer_to, replaces?, from_tag}` alongside the stable id triple. Returns
-    /// whether the event was pushed (idempotent no-op / `false` when the channel
-    /// is unknown or its connection is gone).
+    /// `channel_id` is the caller-resolved owner and `sip_call_id` the Call-ID
+    /// it is bound to; `referrer` identifies the referring party. The payload
+    /// is `{refer_to, replaces?, from_tag, referrer_leg, referrer_sip_call_id}`
+    /// alongside the stable id triple: `referrer_leg` is `"a"` for the party the
+    /// channel's call came from and `"b"` for the party it was connected to,
+    /// whose dialog (`referrer_sip_call_id`) is the one a `DialBranch` named.
+    /// Returns whether the event was pushed (idempotent no-op / `false` when
+    /// the channel is unknown or its connection is gone).
     pub fn forward_transfer_requested(
         &self,
         channel_id: &str,
         sip_call_id: &str,
         refer_to: &crate::sip::headers::refer::ReferTo,
-        from_tag: Option<&str>,
+        referrer: TransferReferrer<'_>,
     ) -> bool {
         let (app, call_actor_id) = match self.channels.get(channel_id) {
             Some(entry) => (entry.app.clone(), entry.call_actor_id.clone()),
@@ -243,12 +261,15 @@ impl ControlBus {
                 "from_tag": replaces.from_tag,
                 "to_tag": replaces.to_tag,
                 "early_only": replaces.early_only,
+                "local": referrer.replaces_local,
             })
         });
         let payload = serde_json::json!({
             "refer_to": refer_to.uri,
             "replaces": replaces,
-            "from_tag": from_tag,
+            "from_tag": referrer.from_tag,
+            "referrer_leg": if referrer.from_a_leg { "a" } else { "b" },
+            "referrer_sip_call_id": referrer.sip_call_id,
         });
         let pushed = self.publish_to_channel(
             channel_id,
@@ -263,6 +284,44 @@ impl ControlBus {
         );
         if pushed {
             debug!(%channel_id, %sip_call_id, target = %refer_to.uri, "control plane: TransferRequested forwarded");
+        }
+        pushed
+    }
+
+    /// Tell the owning app that a transfer it accepted to carry out itself
+    /// (`accept_refer` in mode `controller`) ran past its deadline with no
+    /// `complete_refer`, as a `TransferTimedOut` event.
+    ///
+    /// At that deadline siphon ends the referrer's subscription for the app,
+    /// with a sipfrag NOTIFY of its own (RFC 3515 §2.4.5). Without this event
+    /// the app is the one party never told: it goes on moving the parties and
+    /// then reports on a subscription that is no longer there.
+    ///
+    /// `sip_call_id` is the Call-ID the call's channel is bound to and
+    /// `referrer_on_a_leg` which party referred. `code` is the sipfrag status
+    /// the referrer was sent, `None` when its leg had already left the call
+    /// and nothing could be sent. The payload is `{reason: "timeout", code,
+    /// referrer_leg}` alongside the stable id triple, `referrer_leg` as
+    /// `TransferRequested` names it. Adds no state. Returns whether the event
+    /// was pushed (`false` when the call is uncontrolled or its connection is
+    /// gone).
+    pub fn forward_transfer_timed_out(
+        &self,
+        sip_call_id: &str,
+        referrer_on_a_leg: bool,
+        code: Option<u16>,
+    ) -> bool {
+        let pushed = self.forward_channel_event(
+            sip_call_id,
+            "TransferTimedOut",
+            serde_json::json!({
+                "reason": "timeout",
+                "code": code,
+                "referrer_leg": if referrer_on_a_leg { "a" } else { "b" },
+            }),
+        );
+        if pushed {
+            debug!(%sip_call_id, code, "control plane: TransferTimedOut forwarded");
         }
         pushed
     }

@@ -212,6 +212,9 @@ pub struct DispatcherState {
     pub nat_fix_contact: bool,
     /// Name used in SDP `o=` and `s=` lines (from media.sdp_name config).
     pub sdp_name: String,
+    /// Leave the `s=` line of relayed SDP as the far side wrote it (from
+    /// media.sdp_keep_session_name config). `o=` is rewritten either way.
+    pub sdp_keep_session_name: bool,
     /// SDP attribute names removed from the SDP relayed across a B2BUA call
     /// (from media.sdp_strip_attributes config). Empty when not configured.
     pub sdp_strip_attributes: Vec<String>,
@@ -278,6 +281,10 @@ pub struct DispatcherState {
     /// The B2BUA path needs no entry: it already answers 200 to a CANCEL for a
     /// call that is no longer Calling/Ringing.
     pub cancelled_invites: Arc<DashMap<TransactionKey, ()>>,
+    /// Final non-2xx responses the B2BUA sent for an INVITE, kept for Timer H
+    /// so a retransmitted INVITE is answered with it again and not taken for a
+    /// new call (RFC 3261 §17.2.1). See [`CompletedInvites`].
+    pub completed_invites: crate::dispatcher::completed_invite::CompletedInvites,
     /// Originate groups still ringing: several contacts rung as calls siphon
     /// placed itself, the first to answer kept. Each group and each of its
     /// legs' index entries goes when the group ends, however it ends.
@@ -363,6 +370,16 @@ pub struct DispatcherState {
     /// / reject / the decision-deadline sweep. Empty and cheaply skipped when no
     /// control plane is configured (no call is ever controlled).
     pub pending_inbound_refer: Arc<PendingInboundReferStore>,
+    /// The final response each REFER on a B2BUA call was answered with, kept
+    /// for 64*T1 so a retransmission gets it again instead of being decided on
+    /// a second time — see [`AnsweredReferStore`]. Empty except for that long
+    /// after a REFER.
+    pub answered_refers: Arc<AnsweredReferStore>,
+    /// REFER subscriptions on *controlled* B2BUA calls whose transfer the owning
+    /// control app carries out itself (`accept_refer` in mode `controller`),
+    /// open until it reports with `complete_refer` — see
+    /// [`ControllerReferStore`]. Empty except between those two verbs.
+    pub controller_refers: Arc<ControllerReferStore>,
     /// `BYE`s owed to a transfer referrer, held until the terminating `NOTIFY`
     /// sharing their dialog has been answered — see [`DeferredReferrerByeStore`].
     /// Empty except while a siphon-terminated transfer is completing.
@@ -710,6 +727,50 @@ impl DispatcherState {
                 warn!(send_socket = %spec, "ignoring malformed send_socket: {error}");
                 None
             }
+        }
+    }
+
+    /// The listener an unpinned UDP send to `destination` has to leave from when
+    /// the default egress listener is in the other address family.
+    ///
+    /// Unpinned sends take the first configured `listen.udp` socket.  On a
+    /// dual-stack host that socket serves one family only, and writing a
+    /// datagram for the other one to it fails with EAFNOSUPPORT, so the
+    /// request never reaches the next hop.  `Some` names the lowest-bound
+    /// listener of the destination's family; the caller treats it exactly like
+    /// a script `send_socket=` pin, so the Via sent-by and Record-Route name the
+    /// socket the request really left from.
+    ///
+    /// `None` when the default listener already matches (the common case, kept
+    /// off the pinned path), when no listener of that family exists, and for
+    /// stream transports, which connect from a socket of the right family.
+    pub fn family_egress_socket(
+        &self,
+        transport: Transport,
+        destination: SocketAddr,
+    ) -> Option<crate::transport::SendSocket> {
+        if transport != Transport::Udp {
+            return None;
+        }
+        let default_listener = self.listen_addrs.get(&transport)?;
+        if default_listener.is_ipv6() == destination.is_ipv6() {
+            return None;
+        }
+        self.listener_registry
+            .resolve_family(transport, destination.is_ipv6())
+    }
+
+    /// Via sent-by for a request with no egress pin: the listener it will leave
+    /// from when its destination is outside the default listener's address
+    /// family (see [`family_egress_socket`](Self::family_egress_socket)), else
+    /// the transport's usual `via_host` / `via_port`.
+    pub fn unpinned_sent_by(&self, transport: Transport, destination: SocketAddr) -> (String, u16) {
+        match self.family_egress_socket(transport, destination) {
+            Some(socket) => {
+                let (host, port) = socket.via_sent_by();
+                (format_sip_host(&host), port)
+            }
+            None => (self.via_host(&transport), self.via_port(&transport)),
         }
     }
 

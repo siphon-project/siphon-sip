@@ -9,7 +9,8 @@ use std::sync::{Arc, Mutex};
 
 use super::originate_test_harness::{
     anchored_dispatcher, anchored_params, drain, phone_offer, phone_response, phone_sends,
-    pinned_ingress_profiles, requests_to, socket, with_stream_egress, Sent, PINNED_INGRESS,
+    phone_tries, pinned_ingress_profiles, requests_to, socket, with_stream_egress, Sent,
+    PINNED_INGRESS,
 };
 use super::test_dispatcher::TestDispatcher;
 use super::*;
@@ -396,7 +397,9 @@ async fn a_sequential_group_moves_on_after_a_decline_and_a_ring_timeout() {
         other => panic!("expected the first leg's end and the second's start, got {other:?}"),
     }
 
-    // The second rings out its own 5 s: CANCELled, and the third rings.
+    // The second holds the INVITE and rings out its own 5 s: CANCELled, and the
+    // third rings.
+    phone_tries(&dispatcher.state, SECOND, &second_invite);
     check_b2bua_answer_timeouts_at(
         &dispatcher.state,
         std::time::Instant::now() + std::time::Duration::from_secs(6),
@@ -536,6 +539,10 @@ async fn cancelling_a_ringing_group_cancels_every_leg() {
     let desk_invite = invite_to(&sent, DESK);
     let mobile_invite = invite_to(&sent, MOBILE);
     recorder.take();
+    // Both phones hold their INVITE: the provisional a CANCEL waits for (RFC
+    // 3261 §9.1).
+    phone_tries(&dispatcher.state, DESK, &desk_invite);
+    phone_tries(&dispatcher.state, MOBILE, &mobile_invite);
 
     // `drop` is refused while the phones ring: there is no response to
     // withhold, and the INVITEs would be left standing. Nothing is sent.
@@ -621,6 +628,7 @@ async fn a_group_that_outlives_its_deadline_is_cancelled() {
     );
     let desk_invite = invite_to(&drain(&dispatcher.udp), DESK);
     recorder.take();
+    phone_tries(&dispatcher.state, DESK, &desk_invite);
 
     // Positive control: before the deadline nothing moves.
     check_b2bua_answer_timeouts_at(
@@ -865,7 +873,9 @@ async fn a_phone_registered_through_an_edge_proxy_is_rung_through_its_path() {
         "the Path outranks the flow"
     );
 
-    // Its CANCEL carries the same route set to the same hop (RFC 3261 §9.1).
+    // Its CANCEL carries the same route set to the same hop (RFC 3261 §9.1),
+    // once the edge has taken the INVITE with a 100 Trying.
+    phone_tries(&dispatcher.state, EDGE, &invite);
     assert!(cancel_originated_call(&dispatcher.state, &group_id, None));
     let cancels = requests_to(&drain(&dispatcher.udp), socket(EDGE), Method::Cancel);
     assert_eq!(cancels.len(), 1);

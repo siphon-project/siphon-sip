@@ -20,10 +20,19 @@ pub(super) async fn sweep_stale_entries(state: &DispatcherState) {
     let ttl = state.transaction_timeout;
     // Timer I (T4) is the ACK-absorption window (RFC 3261 §17.2.1), which is
     // all a dialog owes once its 2xx ACK has been routed.
-    let expired_sessions = state
-        .session_store
-        .sweep_stale_with_ack_grace(ttl, crate::transaction::timer::DEFAULT_T4)
-        as u64;
+    //
+    // A session with an INVITE still owed its final response is not stale
+    // however old it is: a call may ring for minutes. Timer B and Timer C end
+    // such a branch (RFC 3261 §16.6 step 11), and the session with it.
+    let expired_sessions = state.session_store.sweep_stale_sparing(
+        ttl,
+        crate::transaction::timer::DEFAULT_T4,
+        &|client_key| {
+            state
+                .transaction_manager
+                .invite_client_is_pending(client_key)
+        },
+    ) as u64;
 
     // Expire UAC pending requests whose response never arrived. Callers
     // (NAT keepalive, gateway health probe, proxy.send_request) apply a short

@@ -347,6 +347,10 @@ async fn the_answering_branch_is_named_and_the_losers_as_cancelled() {
     let winner_leg = text(branch_named(&events, &call_id_of(&winner)), "leg_id").to_string();
     let loser_leg = text(branch_named(&events, &call_id_of(&loser)), "leg_id").to_string();
 
+    // The loser holds its INVITE: a 100 Trying is the provisional its CANCEL
+    // has to wait for (RFC 3261 §9.1), and is no event of its own.
+    parked.responds(FIRST_TARGET, &loser, 100, "Trying");
+    assert!(parked.events().is_empty());
     parked.responds(SECOND_TARGET, &winner, 200, "OK");
 
     let events = parked.events();
@@ -479,4 +483,127 @@ async fn a_redial_reports_only_its_own_branches() {
         text(&branches[0], "leg_sip_call_id"),
         call_id_of(&second[0].1)
     );
+}
+
+/// A controller cancels a connecting dial while both branches ring: each is
+/// CANCELled and named as cancelled, the dial fails 487, and the caller is left
+/// parked and unanswered — no deadline left to fail it, free to be dialled again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cancelled_connecting_dial_cancels_every_branch_and_parks_the_caller() {
+    let parked = park("dial-branches-cancelled@192.0.2.10");
+    parked.dial(&[FIRST_TARGET, SECOND_TARGET], true);
+    let invites = parked.invites();
+    for (address, invite) in &invites {
+        parked.responds(address, invite, 180, "Ringing");
+    }
+    let _ = parked.events();
+    let _ = parked.wire();
+
+    let cancelled =
+        b2bua_cancel_dial_with_state(&parked.dispatcher.state, &parked.sip_call_id, "gave up");
+    assert_eq!(cancelled, Ok(DialCancelled::Connect));
+
+    let sent = summaries(&parked.wire());
+    for target in [FIRST_TARGET, SECOND_TARGET] {
+        assert!(
+            sent.iter()
+                .any(|line| line == &format!("CANCEL to {target}")),
+            "{target} was CANCELled: {sent:?}"
+        );
+    }
+    assert!(
+        sent.iter()
+            .all(|line| !line.ends_with(&format!("to {CALLER}"))),
+        "nothing is sent to the caller: {sent:?}"
+    );
+
+    let events = parked.events();
+    let order: Vec<&str> = events.iter().map(|(event, _)| event.as_str()).collect();
+    assert_eq!(
+        order,
+        ["DialBranchFailed", "DialBranchFailed", "DialFailed"],
+        "{events:?}"
+    );
+    for payload in named(&events, "DialBranchFailed") {
+        assert_eq!(text(payload, "cause"), "cancelled");
+        assert_eq!(payload["code"], 487);
+    }
+    let failed = named(&events, "DialFailed")[0];
+    assert_eq!(failed["code"], 487);
+    assert_eq!(failed["timed_out"], false);
+    assert_eq!(failed["branches"].as_array().map(Vec::len), Some(2));
+
+    let state = &parked.dispatcher.state;
+    assert!(!state.call_actors.is_control_dial(&parked.call_id));
+    let call_state = state
+        .call_actors
+        .get_call(&parked.call_id)
+        .map(|call| (call.state.clone(), call.answer_deadline));
+    assert!(
+        matches!(
+            call_state,
+            Some((CallState::Calling | CallState::Ringing, None))
+        ),
+        "the caller is still unanswered, with no ring deadline: {call_state:?}"
+    );
+    // The dial's deadline went with it: the sweep finds nothing to fail.
+    check_b2bua_answer_timeouts_at(state, Instant::now() + Duration::from_secs(120));
+    assert!(
+        state.call_actors.get_call(&parked.call_id).is_some(),
+        "the parked caller outlives the cancelled dial's timeout"
+    );
+    assert!(summaries(&parked.wire()).is_empty(), "and hears nothing");
+
+    // Nothing rings now, so a second cancel has nothing to act on.
+    assert_eq!(
+        b2bua_cancel_dial_with_state(state, &parked.sip_call_id, "gave up"),
+        Err(DialCancelRefusal::NoDial)
+    );
+    // Positive control: the caller can be dialled for again.
+    parked.dial(&[SECOND_TARGET], true);
+    assert_eq!(parked.invites().len(), 1, "a fresh dial rings");
+}
+
+/// Cancelling a sequential hunt ends it: the targets it had not reached are
+/// never dialled, not even when the cancelled attempt's own failure arrives.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cancelled_hunt_does_not_move_on_to_its_next_target() {
+    let parked = park("dial-branches-hunt-cancelled@192.0.2.10");
+    parked.dial(&[FIRST_TARGET, SECOND_TARGET], false);
+    let first = parked.invites();
+    assert_eq!(first.len(), 1);
+    parked.responds(FIRST_TARGET, &first[0].1, 180, "Ringing");
+    let _ = parked.events();
+
+    assert_eq!(
+        b2bua_cancel_dial_with_state(&parked.dispatcher.state, &parked.sip_call_id, "gave up"),
+        Ok(DialCancelled::Connect)
+    );
+    let events = parked.events();
+    let order: Vec<&str> = events.iter().map(|(event, _)| event.as_str()).collect();
+    assert_eq!(order, ["DialBranchFailed", "DialFailed"], "{events:?}");
+    assert!(
+        parked.invites().is_empty(),
+        "the second target is not dialled"
+    );
+    assert!(!parked
+        .dispatcher
+        .state
+        .call_actors
+        .is_route_sequence(&parked.call_id));
+}
+
+/// A call with no dial under way, and a Call-ID that names no call.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cancel_with_no_dial_under_way_is_refused() {
+    let parked = park("dial-branches-nothing@192.0.2.10");
+    assert_eq!(
+        b2bua_cancel_dial_with_state(&parked.dispatcher.state, &parked.sip_call_id, "gave up"),
+        Err(DialCancelRefusal::NoDial)
+    );
+    assert_eq!(
+        b2bua_cancel_dial_with_state(&parked.dispatcher.state, "nobody@192.0.2.10", "gave up"),
+        Err(DialCancelRefusal::Gone)
+    );
+    assert!(parked.wire().is_empty());
 }

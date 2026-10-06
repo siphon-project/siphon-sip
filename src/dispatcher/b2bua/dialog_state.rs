@@ -79,36 +79,55 @@ fn aor_of(header: &str) -> String {
 /// never shown as a call. `auth_user` is who the INVITE authenticated as, when
 /// the script challenged it. The watch starts in whatever state siphon's own
 /// responses already put the caller's dialog in.
+///
+/// Every way out without a watch says which one it was, at `debug`: a caller
+/// that is not watched looks, from outside, exactly like the feature being off.
 pub fn watch_caller_dialog(call_id: &str, auth_user: Option<&str>, state: &DispatcherState) {
+    let unwatched = |why: &str| {
+        debug!(call_id = %call_id, why, "dialog state: the caller's dialog is not watched");
+    };
     if !dialog_state_wanted() {
+        unwatched("no control application subscribed to the dialog event class");
         return;
     }
     let Some(registrar) = registrar() else {
+        unwatched("no registrar is configured");
         return;
     };
-    let Some((from, to, source, leg_id, sip_call_id, phone_tag, siphon_tag, reached)) =
-        state.call_actors.get_call(call_id).and_then(|call| {
-            // A call siphon placed has no caller to watch; its callee is
-            // watched as a recipient instead.
-            if call.originated {
-                return None;
-            }
-            Some((
-                call.a_leg.stored_from.clone()?,
-                call.a_leg.stored_to.clone().unwrap_or_default(),
-                call.a_leg.transport.remote_addr,
-                call.a_leg.id.0.clone(),
-                call.a_leg.dialog.call_id.clone(),
-                call.a_leg.dialog.remote_tag.clone(),
-                call.a_leg.dialog.local_tag.clone(),
-                call.caller_dialog_state,
-            ))
-        })
-    else {
+    let Some(call) = state.call_actors.get_call(call_id) else {
+        unwatched("the call is gone");
         return;
     };
-    let Some((aor, contact)) = registrar.binding_placing_request(&aor_of(&from), auth_user, source)
+    // A call siphon placed has no caller to watch; its callee is watched as a
+    // recipient instead.
+    if call.originated {
+        unwatched("siphon placed this call, so it has no caller");
+        return;
+    }
+    let Some(from) = call.a_leg.stored_from.clone() else {
+        unwatched("the caller's leg kept no From header");
+        return;
+    };
+    let (to, source, leg_id, sip_call_id, phone_tag, siphon_tag, reached) = (
+        call.a_leg.stored_to.clone().unwrap_or_default(),
+        call.a_leg.transport.remote_addr,
+        call.a_leg.id.0.clone(),
+        call.a_leg.dialog.call_id.clone(),
+        call.a_leg.dialog.remote_tag.clone(),
+        call.a_leg.dialog.local_tag.clone(),
+        call.caller_dialog_state,
+    );
+    drop(call);
+    let from_aor = aor_of(&from);
+    let Some((aor, contact)) = registrar.binding_placing_request(&from_aor, auth_user, source)
     else {
+        debug!(
+            call_id = %call_id,
+            aor = %from_aor,
+            %source,
+            authenticated = auth_user.is_some(),
+            "dialog state: the caller's dialog is not watched — no live binding of the From AoR placed this request (matched on the authenticated user when there is one, otherwise on the source address)"
+        );
         return;
     };
     let (remote_uri, remote_display_name) = identity_of(&to);

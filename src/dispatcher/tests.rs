@@ -1381,6 +1381,106 @@ fn wildcard_pinned_sent_by_uses_the_sockets_advertised_port() {
     );
 }
 
+/// A dual-stack UDP host (`127.0.0.1:5060` + `[::1]:5060`) relaying to a peer
+/// in the family the default listener is *not* in has to leave from the
+/// listener that is.  Unpinned sends take the first configured listener, so an
+/// IPv6 next hop was written to the IPv4 socket: `send_to` failed with
+/// EAFNOSUPPORT, nothing reached the peer and the INVITE ran into Timer B.
+#[test]
+fn family_egress_socket_picks_the_listener_in_the_destination_family() {
+    let mut dispatcher = super::test_dispatcher::test_dispatcher();
+    let ipv4: SocketAddr = "192.0.2.10:5060".parse().unwrap();
+    let ipv6: SocketAddr = "[2001:db8::10]:5060".parse().unwrap();
+    dispatcher.state.listen_addrs = std::collections::HashMap::from([(Transport::Udp, ipv4)]);
+    dispatcher.state.listener_registry = crate::transport::ListenerRegistry::from_entries(vec![
+        (Transport::Udp, ipv4, None),
+        (Transport::Udp, ipv6, None),
+    ]);
+
+    let selected = dispatcher
+        .state
+        .family_egress_socket(Transport::Udp, "[2001:db8::20]:5062".parse().unwrap())
+        .expect("an IPv6 destination needs the IPv6 listener");
+    assert_eq!(selected.addr, ipv6);
+    assert_eq!(selected.via_sent_by(), ("2001:db8::10".to_string(), 5060));
+}
+
+/// The sent-by of an unpinned request follows the same pick, so a 2xx ACK
+/// relayed to an IPv6 UAS names the IPv6 listener it leaves from, bracketed.
+#[test]
+fn unpinned_sent_by_names_the_listener_in_the_destination_family() {
+    let mut dispatcher = super::test_dispatcher::test_dispatcher();
+    let ipv4: SocketAddr = "192.0.2.10:5060".parse().unwrap();
+    let ipv6: SocketAddr = "[2001:db8::10]:5070".parse().unwrap();
+    dispatcher.state.listen_addrs = std::collections::HashMap::from([(Transport::Udp, ipv4)]);
+    dispatcher.state.listener_registry = crate::transport::ListenerRegistry::from_entries(vec![
+        (Transport::Udp, ipv4, None),
+        (Transport::Udp, ipv6, None),
+    ]);
+
+    assert_eq!(
+        dispatcher
+            .state
+            .unpinned_sent_by(Transport::Udp, "[2001:db8::20]:5062".parse().unwrap()),
+        ("[2001:db8::10]".to_string(), 5070)
+    );
+    assert_eq!(
+        dispatcher
+            .state
+            .unpinned_sent_by(Transport::Udp, "192.0.2.20:5062".parse().unwrap()),
+        (
+            dispatcher.state.via_host(&Transport::Udp),
+            dispatcher.state.via_port(&Transport::Udp)
+        )
+    );
+}
+
+/// The default listener already serves its own family, so the common
+/// single-family relay gets no pin and stays on the default egress path.
+#[test]
+fn family_egress_socket_leaves_the_default_family_unpinned() {
+    let mut dispatcher = super::test_dispatcher::test_dispatcher();
+    let ipv4: SocketAddr = "192.0.2.10:5060".parse().unwrap();
+    let ipv6: SocketAddr = "[2001:db8::10]:5060".parse().unwrap();
+    dispatcher.state.listen_addrs = std::collections::HashMap::from([(Transport::Udp, ipv4)]);
+    dispatcher.state.listener_registry = crate::transport::ListenerRegistry::from_entries(vec![
+        (Transport::Udp, ipv4, None),
+        (Transport::Udp, ipv6, None),
+    ]);
+
+    assert!(dispatcher
+        .state
+        .family_egress_socket(Transport::Udp, "192.0.2.20:5062".parse().unwrap())
+        .is_none());
+}
+
+/// No listener in the destination's family: nothing to pin to, the send keeps
+/// the default socket and fails where it did before rather than being dropped
+/// here.  Stream transports connect from an ephemeral socket of the right
+/// family on their own and are never pinned.
+#[test]
+fn family_egress_socket_is_none_without_a_matching_listener() {
+    let mut dispatcher = super::test_dispatcher::test_dispatcher();
+    let ipv4: SocketAddr = "192.0.2.10:5060".parse().unwrap();
+    dispatcher.state.listen_addrs =
+        std::collections::HashMap::from([(Transport::Udp, ipv4), (Transport::Tcp, ipv4)]);
+    dispatcher.state.listener_registry = crate::transport::ListenerRegistry::from_entries(vec![
+        (Transport::Udp, ipv4, None),
+        (Transport::Tcp, ipv4, None),
+        (Transport::Tcp, "[2001:db8::10]:5060".parse().unwrap(), None),
+    ]);
+    let ipv6_peer: SocketAddr = "[2001:db8::20]:5062".parse().unwrap();
+
+    assert!(dispatcher
+        .state
+        .family_egress_socket(Transport::Udp, ipv6_peer)
+        .is_none());
+    assert!(dispatcher
+        .state
+        .family_egress_socket(Transport::Tcp, ipv6_peer)
+        .is_none());
+}
+
 /// The wildcard hook for an `egress_sent_by` case whose flow socket (if any)
 /// is concrete, where the hook must never run.
 fn wildcard_not_consulted(local: SocketAddr) -> (String, u16) {
@@ -3262,7 +3362,7 @@ fn no_handler_options_is_answered_200_with_contact_and_allow() {
         response.headers.get("Allow").unwrap(),
         crate::sip::SUPPORTED_METHODS
     );
-    // Some peers (Teams Direct Routing) reject an OPTIONS answer carrying
+    // Some peers reject an OPTIONS answer carrying
     // neither Contact nor Record-Route.
     assert_eq!(
         response.headers.get("Contact").unwrap(),
@@ -3389,6 +3489,88 @@ fn auto_options_off_does_not_suppress_the_405() {
             "{method}",
         );
     }
+}
+
+/// [`request_for`] carrying a To-tag: a request naming a dialog.
+fn in_dialog_request_for(method: &str) -> SipMessage {
+    let mut request = request_for(method);
+    request
+        .headers
+        .set("To", "<sip:probe@siphon.invalid>;tag=gone".to_string());
+    request
+}
+
+#[test]
+fn no_handler_in_dialog_request_for_an_implemented_method_is_481() {
+    // RFC 3261 §12.2.2: a request naming a dialog siphon does not have is
+    // 481. A 405 there denies a method its own Allow lists.
+    for method in [
+        "BYE", "INFO", "UPDATE", "PRACK", "NOTIFY", "REFER", "INVITE",
+    ] {
+        for auto_options in [true, false] {
+            let response = build_no_handler_response(
+                &in_dialog_request_for(method),
+                method,
+                auto_options,
+                None,
+                "sbc.example.org",
+                5060,
+                Transport::Udp,
+            )
+            .unwrap_or_else(|| panic!("{method}: a 481 is never dropped"));
+            assert_eq!(response.status_code(), Some(481), "{method}");
+            assert!(
+                !response.headers.has("Allow"),
+                "{method}: Allow belongs to a 405"
+            );
+        }
+    }
+}
+
+#[test]
+fn no_handler_in_dialog_request_for_an_unimplemented_method_is_405() {
+    // Method inspection comes before dialog matching (RFC 3261 §8.2.1), and
+    // the token is case-sensitive (§7.1): `Bye` is not BYE.
+    for method in ["FOO", "Bye"] {
+        let response = build_no_handler_response(
+            &in_dialog_request_for(method),
+            method,
+            true,
+            None,
+            "sbc.example.org",
+            5060,
+            Transport::Udp,
+        )
+        .expect("a 405 is never dropped");
+        assert_eq!(response.status_code(), Some(405), "{method}");
+    }
+}
+
+#[test]
+fn no_handler_in_dialog_options_keeps_its_own_answer() {
+    // OPTIONS is the auto-answered probe, and `auto_options: false` promises
+    // silence for it; a To-tag does not turn that into a 481.
+    let answered = build_no_handler_response(
+        &in_dialog_request_for("OPTIONS"),
+        "OPTIONS",
+        true,
+        None,
+        "sbc.example.org",
+        5060,
+        Transport::Udp,
+    )
+    .expect("auto_options on answers");
+    assert_eq!(answered.status_code(), Some(200));
+    assert!(build_no_handler_response(
+        &in_dialog_request_for("OPTIONS"),
+        "OPTIONS",
+        false,
+        None,
+        "sbc.example.org",
+        5060,
+        Transport::Udp,
+    )
+    .is_none());
 }
 
 #[test]
@@ -3677,7 +3859,7 @@ fn transfer_target_leg_captures_its_route_set_and_the_ack_carries_it() {
     let response = record_routed_2xx();
 
     assert!(
-        store_b_leg_route_set_from_2xx(&store, &call_id, 0, &response),
+        store_b_leg_route_set_from_2xx(&store, &call_id, "z9hG4bK-target-1", &response),
         "a 2xx carrying Record-Route establishes a route set"
     );
     let target = store
@@ -3724,7 +3906,10 @@ fn a_2xx_without_record_route_stores_nothing_and_routes_nothing() {
     .1;
 
     assert!(!store_b_leg_route_set_from_2xx(
-        &store, &call_id, 0, &response
+        &store,
+        &call_id,
+        "z9hG4bK-target-1",
+        &response
     ));
     let target = store
         .get_call(&call_id)
@@ -4934,54 +5119,6 @@ fn build_response_replace_then_add_for_same_header_keeps_replace_then_appends() 
     assert_eq!(warns.len(), 2);
     assert!(warns[0].contains("first"));
     assert!(warns[1].contains("second"));
-}
-
-#[test]
-fn build_ack_for_non2xx_has_correct_headers() {
-    let request = sample_invite();
-    let response = build_response(&request, 480, "Temporarily Unavailable", None, &[]);
-    let ack = build_ack_for_non2xx(
-        &request,
-        &response,
-        "z9hG4bK-proxy-branch",
-        Transport::Tcp,
-        "10.0.0.1:5060",
-    );
-
-    // Must be an ACK request
-    assert!(ack.is_request());
-    let bytes = String::from_utf8(ack.to_bytes()).unwrap();
-    assert!(bytes.starts_with("ACK sip:bob@biloxi.com SIP/2.0\r\n"));
-
-    // Via: our own hop only (not the UAC's)
-    let via = ack.headers.via().unwrap();
-    assert!(via.contains("z9hG4bK-proxy-branch"));
-    assert!(via.contains("TCP"));
-    assert!(via.contains("10.0.0.1:5060"));
-
-    // From: same as original request
-    assert_eq!(ack.headers.from().unwrap(), request.headers.from().unwrap());
-
-    // To: from the response (may have To-tag)
-    assert_eq!(ack.headers.to().unwrap(), response.headers.to().unwrap());
-
-    // Call-ID: same as original
-    assert_eq!(
-        ack.headers.call_id().unwrap(),
-        request.headers.call_id().unwrap()
-    );
-
-    // CSeq: same number, ACK method
-    let cseq = ack.headers.cseq().unwrap();
-    assert!(cseq.contains("314159"));
-    assert!(cseq.contains("ACK"));
-    assert!(!cseq.contains("INVITE"));
-
-    // Max-Forwards present
-    assert_eq!(ack.headers.get("Max-Forwards").unwrap(), "70");
-
-    // Content-Length: 0
-    assert_eq!(ack.headers.content_length(), Some(0));
 }
 
 /// Build a representative B-leg INVITE — i.e. one that has already been
@@ -6572,71 +6709,6 @@ fn build_ack_for_2xx_falls_back_when_contact_absent() {
     assert!(wire.contains("CSeq: 9 ACK\r\n"), "CSeq preserved:\n{wire}");
 }
 
-// --- Proxy-forwarded CANCEL Via (RFC 3261 §9.1 / §16.10) ---
-//
-// Regression: handle_cancel_via_session used to mint a fresh branch
-// (TransactionKey::generate_branch()) for the forwarded CANCEL, so the
-// downstream proxy/UAS could not match CANCEL→INVITE and dropped it — the
-// INVITE leg below was never torn down and the callee kept ringing after
-// the caller abandoned during alerting.
-
-#[test]
-fn proxy_cancel_via_reuses_invite_branch_and_sent_by() {
-    // The proxy forwarded an INVITE on this client branch; its transaction
-    // key holds exactly the branch + sent-by siphon stamped on that
-    // INVITE's topmost Via.
-    let client_key = TransactionKey::new(
-        "z9hG4bK-invite-branch-B".to_string(),
-        Method::Invite,
-        "192.0.2.178:4060".to_string(),
-    );
-    let via = cancel_via_for_client_branch(&client_key, Transport::Udp);
-    assert_eq!(
-        via, "SIP/2.0/UDP 192.0.2.178:4060;branch=z9hG4bK-invite-branch-B",
-        "forwarded CANCEL must reuse the INVITE's top Via branch + sent-by (RFC 3261 §9.1)",
-    );
-}
-
-#[test]
-fn proxy_cancel_via_branch_is_deterministic_not_fresh() {
-    // Guards the exact regression: TransactionKey::generate_branch() would
-    // yield a different (and non-matching) branch on every call.
-    let client_key = TransactionKey::new(
-        "z9hG4bK-stored-branch".to_string(),
-        Method::Invite,
-        "10.0.0.1:5060".to_string(),
-    );
-    let via_first = cancel_via_for_client_branch(&client_key, Transport::Tcp);
-    let via_second = cancel_via_for_client_branch(&client_key, Transport::Tcp);
-    assert_eq!(
-        via_first, via_second,
-        "forwarded CANCEL Via must derive from the stored client branch, \
-         never a freshly generated one",
-    );
-    assert!(
-        via_first.ends_with(";branch=z9hG4bK-stored-branch"),
-        "CANCEL branch must equal the stored INVITE branch: {via_first}",
-    );
-}
-
-#[test]
-fn proxy_cancel_via_preserves_transport_and_ipv6_sent_by() {
-    // sent_by is reused verbatim from the client key — this covers the
-    // IPsec / flow / force_send_via cases where the advertised sent-by
-    // (here an IPv6 literal with a non-default protected port) differs
-    // from the default per-transport via_host.
-    let client_key = TransactionKey::new(
-        "z9hG4bK-tls-branch".to_string(),
-        Method::Invite,
-        "[2001:db8::1]:5061".to_string(),
-    );
-    let via = cancel_via_for_client_branch(&client_key, Transport::Tls);
-    assert_eq!(
-        via,
-        "SIP/2.0/TLS [2001:db8::1]:5061;branch=z9hG4bK-tls-branch",
-    );
-}
-
 // --- Transaction integration tests ---
 
 #[test]
@@ -7144,7 +7216,7 @@ fn sanitize_sdp_identity_no_op_on_empty_body() {
 /// (multi-word product / role name) was being written verbatim into the
 /// SDP `o=` line. RFC 4566 §5.2 splits o= on spaces, so a value like
 /// `o=Foo Bar 123 456 IN IP4 ...` has a malformed username token and
-/// downstream parsers (FreeSWITCH, kamailio) reject the whole SDP body.
+/// downstream parsers reject the whole SDP body.
 #[test]
 fn sanitize_sdp_identity_collapses_whitespace_in_o_username() {
     let sdp = "v=0\r\no=- 1 2 IN IP4 10.0.0.1\r\ns=-\r\nt=0 0\r\nm=audio 8000 RTP/AVP 0\r\n";
@@ -7208,6 +7280,32 @@ fn stamp_sdp_origin_rewrites_address_when_given() {
         "got: {result}",
     );
     assert!(!result.contains("198.51.100.9"));
+}
+
+/// `media.sdp_keep_session_name`: the origin is hidden as always, the session
+/// name crosses as the far side wrote it.
+#[test]
+fn hide_sdp_identity_keeps_the_session_name_when_configured() {
+    let sdp = "v=0\r\no=carol 5 6 IN IP4 198.51.100.9\r\ns=Conference 7\r\nt=0 0\r\n";
+    let mut dispatcher = super::test_dispatcher::test_dispatcher();
+    dispatcher.state.sdp_name = "SIPhon".to_string();
+
+    dispatcher.state.sdp_keep_session_name = true;
+    let mut body = sdp.as_bytes().to_vec();
+    hide_sdp_identity(&mut body, &dispatcher.state, Some("203.0.113.7"));
+    let result = std::str::from_utf8(&body).unwrap();
+    assert!(
+        result.contains("o=SIPhon 5 6 IN IP4 203.0.113.7\r\n"),
+        "got: {result}"
+    );
+    assert!(result.contains("s=Conference 7\r\n"), "got: {result}");
+
+    dispatcher.state.sdp_keep_session_name = false;
+    let mut body = sdp.as_bytes().to_vec();
+    hide_sdp_identity(&mut body, &dispatcher.state, Some("203.0.113.7"));
+    let result = std::str::from_utf8(&body).unwrap();
+    assert!(result.contains("s=SIPhon\r\n"), "got: {result}");
+    assert!(!result.contains("Conference"), "got: {result}");
 }
 
 #[test]
@@ -8254,8 +8352,8 @@ fn sample_pending_refer(deadline: std::time::Instant) -> PendingInboundRefer {
             uri: "sip:carol@example.com".to_string(),
             replaces: None,
         },
-        from_a_leg: true,
         deadline,
+        channel_sip_call_id: "caller-dialog@192.0.2.1".to_string(),
     }
 }
 
@@ -8452,6 +8550,57 @@ fn deferred_referrer_bye_take_is_cheap_when_idle() {
     assert!(store.take_expired(std::time::Instant::now()).is_empty());
 }
 
+/// Every way a held REFER leaves by something other than a decision on its
+/// own call id: its sender's dialog ending, and a decision that names the call
+/// by its channel, with the call still up or already gone. Each takes it once,
+/// and the store returns to its baseline.
+#[test]
+fn pending_inbound_refer_is_taken_by_its_dialog_or_its_channel_and_drains() {
+    let store = PendingInboundReferStore::default();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let baseline = store.len();
+
+    // By the dialog it was sent in: the Call-ID and the sender's own tag.
+    assert!(store.insert("call-1", sample_pending_refer(deadline)));
+    for (sip_call_id, tag) in [
+        ("other-call@example.com", Some("alicetag")),
+        ("refer-call@example.com", Some("proxytag")),
+        ("refer-call@example.com", None),
+    ] {
+        assert!(
+            store.take_from_dialog("call-1", sip_call_id, tag).is_none(),
+            "{sip_call_id} {tag:?} is not the referrer's dialog"
+        );
+    }
+    assert!(store
+        .take_from_dialog("another-call", "refer-call@example.com", Some("alicetag"))
+        .is_none());
+    assert!(store
+        .take_from_dialog("call-1", "refer-call@example.com", Some("alicetag"))
+        .is_some());
+    assert_eq!(store.len(), baseline);
+
+    // By its channel, with the call up: whatever Call-ID the channel stands on
+    // now, the call it resolves to is what the REFER is held under.
+    assert!(store.insert("call-2", sample_pending_refer(deadline)));
+    assert!(store
+        .take_for_channel("newcomer@192.0.2.9", Some("call-3"))
+        .is_none());
+    assert!(store
+        .take_for_channel("newcomer@192.0.2.9", Some("call-2"))
+        .is_some());
+    assert_eq!(store.len(), baseline);
+
+    // By its channel, with the call gone: the Call-ID the channel stood on
+    // when the REFER was held.
+    assert!(store.insert("call-4", sample_pending_refer(deadline)));
+    assert!(store.take_for_channel("newcomer@192.0.2.9", None).is_none());
+    assert!(store
+        .take_for_channel("caller-dialog@192.0.2.1", None)
+        .is_some());
+    assert_eq!(store.len(), baseline, "the store drains to its baseline");
+}
+
 #[test]
 fn pending_inbound_refer_absorbs_retransmit() {
     // A second insert for the same call (a REFER retransmit) is absorbed —
@@ -8507,7 +8656,10 @@ fn pending_inbound_refer_preserves_accept_inputs() {
 
     let pending = store.take("cid@host").expect("entry present");
     assert_eq!(pending.refer_to.uri, "sip:carol@example.com");
-    assert!(pending.from_a_leg);
+    assert!(
+        pending.sent_in_dialog("refer-call@example.com", Some("alicetag")),
+        "the dialog its sender is recognised by"
+    );
 }
 
 #[test]

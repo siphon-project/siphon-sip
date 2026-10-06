@@ -187,6 +187,48 @@ impl B2buaRetransmits {
         true
     }
 
+    /// Start Timer B alone for an INVITE just handed to a **reliable**
+    /// transport.
+    ///
+    /// Nothing is retransmitted there, but the transaction still times out:
+    /// RFC 3261 §17.1.1.2 starts Timer B at 64·T1 "for any transport". Without
+    /// it nothing ever says a far end that accepted the connection and then
+    /// answered nothing has had its time, and whatever waits on the INVITE's
+    /// first response (a CANCEL held back for a provisional, §9.1) waits on.
+    /// The entry is found, disarmed and reported like any other, and produces
+    /// no [`Due::Send`]: its first retransmission is due when it gives up.
+    ///
+    /// Returns `false` without storing anything for an unreliable transport,
+    /// whose INVITE [`arm`](Self::arm) already times, and for anything but an
+    /// INVITE.
+    pub fn arm_timeout(&self, key: RetransmitKey, target: RetransmitTarget, now: Instant) -> bool {
+        let reliable = !matches!(
+            crate::transaction::state::Transport::from(target.transport),
+            crate::transaction::state::Transport::Udp
+        );
+        if !reliable || key.method != Method::Invite {
+            return false;
+        }
+        let give_up_at = now + self.timers.timer_b();
+        let replaced = self.entries.insert(
+            key,
+            RetransmitEntry {
+                data: Bytes::new(),
+                target,
+                next_at: give_up_at,
+                interval: self.timers.timer_b(),
+                give_up_at,
+                invite: true,
+                attempts: 0,
+            },
+        );
+        if replaced.is_none() {
+            self.armed
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        true
+    }
+
     /// Stop retransmitting one request. Returns `true` if a schedule was armed.
     pub fn disarm(&self, key: &RetransmitKey) -> bool {
         if self.entries.remove(key).is_some() {
@@ -429,6 +471,54 @@ mod tests {
             "an expired schedule must not also emit a retransmit"
         );
         assert_eq!(store.len(), 0, "the expired entry must be removed");
+    }
+
+    /// An INVITE on a reliable transport is timed and never retransmitted:
+    /// nothing is due before 64·T1, and at 64·T1 it gives up like any other.
+    /// Only an INVITE, and only on a reliable transport.
+    #[test]
+    fn a_reliable_invite_times_out_at_timer_b_and_never_retransmits() {
+        let store = store();
+        let start = Instant::now();
+        for (index, transport) in [Transport::Tcp, Transport::Tls, Transport::WebSocket]
+            .into_iter()
+            .enumerate()
+        {
+            let key = RetransmitKey::new(format!("z9hG4bK-stream-{index}"), Method::Invite);
+            assert!(store.arm_timeout(key.clone(), target(transport), start));
+            assert!(store.is_armed());
+            let timer_b = store.timers.timer_b();
+            let mut now = start;
+            while now + store.timers.t1 < start + timer_b {
+                now += store.timers.t1;
+                assert!(
+                    store.due(now).is_empty(),
+                    "{transport}: nothing is sent or given up on before 64·T1"
+                );
+            }
+            let events = store.due(start + timer_b);
+            assert!(
+                matches!(events.as_slice(), [Due::GaveUp { key: gone, attempts: 0, .. }] if *gone == key),
+                "{transport}: {events:?}"
+            );
+            assert_eq!(store.len(), 0, "{transport}: the entry is gone");
+            assert!(!store.is_armed());
+        }
+
+        // A response disarms it like any schedule.
+        let key = RetransmitKey::new("z9hG4bK-stream-answered", Method::Invite);
+        assert!(store.arm_timeout(key.clone(), target(Transport::Tcp), start));
+        assert!(store.disarm(&key));
+        assert!(store.due(start + store.timers.timer_b()).is_empty());
+
+        // Not for UDP, which `arm` times, and not for a non-INVITE.
+        assert!(!store.arm_timeout(invite_key(), target(Transport::Udp), start));
+        assert!(!store.arm_timeout(
+            RetransmitKey::new("z9hG4bK-stream-bye", Method::Bye),
+            target(Transport::Tcp),
+            start
+        ));
+        assert_eq!(store.len(), 0);
     }
 
     #[test]
