@@ -11,7 +11,7 @@ use super::dial_bridge_test_harness::{
     in_dialog_response, invite_to, names, register, reinvites_to, sent_until, CALLER,
 };
 use super::originate_test_harness::{
-    drain, phone_offer, phone_response, phone_sends, requests_to, socket, Sent,
+    drain, phone_offer, phone_response, phone_sends, phone_tries, requests_to, socket, Sent,
 };
 use super::*;
 use crate::rtpengine::test_native_engine::NativeTestEngine;
@@ -235,7 +235,9 @@ async fn a_standby_is_hung_up_when_the_first_bridge_forms() {
     assert_eq!(reply["status"], "ok", "{reply}");
     let sent = drain(udp);
     let (desk, mobile) = (invite_to(&sent, DESK), invite_to(&sent, MOBILE));
-    let _tablet = invite_to(&sent, TABLET);
+    // The tablet holds its INVITE and rings on: the provisional its CANCEL
+    // waits for (RFC 3261 §9.1).
+    phone_tries(state, TABLET, &invite_to(&sent, TABLET));
 
     answers(state, MOBILE, &mobile, &contact(MOBILE));
     let (offer, _) = bridge_offer_to(udp, MOBILE).await;

@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  The Refer-To target of the `refer-controller` case, which siphon must never
+  dial: with `accept_refer {mode: "controller"}` it answers the REFER and the
+  application carries the transfer out.
+
+  SIPp creates a call only when a message arrives, so a UAS cannot count an
+  INVITE that never comes. The service's entrypoint grades this scenario by
+  SIPp's exit code instead (the idiom of b2bua_lcr_untried_carrier_uas.xml):
+    - no INVITE: SIPp exits 97 when its -timeout window ends with no call, and
+      97 is the only code that passes;
+    - an INVITE: the receive below matches it, the next one times out and
+      aborts the call, and SIPp exits at once with a failure code;
+    - SIPp that never ran, crashed or could not bind: any other code, which
+      fails too.
+-->
+<scenario name="control-transfer Refer-To target that must never be dialled">
+
+  <recv request="INVITE" />
+
+  <!-- Nothing sends this; the timeout fails the call. -->
+  <recv request="DIALLED_BUT_MUST_NOT_BE" timeout="100" />
+
+</scenario>

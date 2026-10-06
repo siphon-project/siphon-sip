@@ -1,8 +1,9 @@
 use super::bridge::{bridge_error, bridge_with_bus, unbridge};
 use super::call::{answer, drop_result, provisional_state, remove_header};
 use super::media::{
-    dtmf, media_error, parse_play_source, parse_stream_channels, parse_stream_mode, play,
-    play_accept, play_source_kind, record_start, stream_start, stream_uri, StreamMode,
+    dtmf, hold_result, media_error, parse_play_options, parse_play_source, parse_stream_channels,
+    parse_stream_mode, play, play_accept, play_source_kind, record_start, stream_start, stream_uri,
+    StreamMode,
 };
 use super::originate::{
     default_total_timeout, originate, originate_error, originate_with_bus, parse_originate_media,
@@ -10,8 +11,9 @@ use super::originate::{
 };
 use super::routing::{dial_error, parse_dial_target, parse_route_target, route};
 use super::transfer::{
-    accept_refer, parse_refer_mode, parse_replaces_arg, refer, reject_refer, replace_error,
-    replace_peer,
+    accept_refer, controller_refer_refused, parse_accept_refer_mode, parse_refer_mode,
+    parse_replaces_arg, parse_transfer_dial, refer, reject_refer, replace_error, replace_peer,
+    AcceptReferMode,
 };
 use super::*;
 use crate::control::registry::ControlBus;
@@ -1514,6 +1516,17 @@ fn describe_lists_a_lifecycle_for_every_stream_mode() {
     }
 }
 
+/// A transfer an app accepted to carry out and never reported on ends in an
+/// event of its own, so it is discoverable next to the verbs that lead to it.
+#[test]
+fn describe_lists_the_transfer_report_timeout() {
+    let schema = SipControlAdapter::new().describe();
+    assert!(schema
+        .events
+        .iter()
+        .any(|event| event == "TransferTimedOut"));
+}
+
 /// The media engine's summary is published on the rail, so it is discoverable.
 #[test]
 fn describe_lists_the_media_summary() {
@@ -1530,7 +1543,7 @@ fn every_advertised_verb_is_claimed_by_a_dispatch_table() {
     for advertised in SipControlAdapter::new().describe().verbs {
         let verb = advertised.verb.as_str();
         assert!(
-            verb == "originate" || is_bridge_verb(verb) || is_media_verb(verb) || is_sip_verb(verb),
+            verb == MODULE_VERB || is_bridge_verb(verb) || is_media_verb(verb) || is_sip_verb(verb),
             "describe() advertises '{verb}' but no dispatch table claims it — \
                  apply() would answer unsupported_verb"
         );
@@ -1547,40 +1560,92 @@ fn every_dispatchable_verb_is_advertised() {
         .into_iter()
         .map(|verb| verb.verb)
         .collect();
-    for verb in [
-        "originate",
-        "bridge",
-        "unbridge",
-        "play",
-        "stop",
-        "dtmf",
-        "hold",
-        "unhold",
-        "stream_start",
-        "stream_stop",
-        "record_start",
-        "record_stop",
-        "answer",
-        "ring",
-        "progress",
-        "reject",
-        "hangup",
-        "drop",
-        "refer",
-        "accept_refer",
-        "reject_refer",
-        "replace_peer",
-        "route",
-        "dial",
-        "set_header",
-        "remove_header",
-        "get_header",
-    ] {
+    // Read off the dispatch tables themselves. A list kept here by hand went
+    // stale the first time a verb was added without it, and a stale list
+    // cannot notice that verb being dropped from describe().
+    for verb in dispatch_tables() {
         assert!(
             advertised.iter().any(|name| name == verb),
             "'{verb}' dispatches but describe() never mentions it"
         );
     }
+    assert_eq!(
+        advertised.len(),
+        dispatch_tables().len(),
+        "describe() and the dispatch tables name the same verbs, each once"
+    );
+}
+
+/// Every verb some dispatch table claims.
+fn dispatch_tables() -> Vec<&'static str> {
+    std::iter::once(MODULE_VERB)
+        .chain(BRIDGE_VERBS)
+        .chain(MEDIA_VERBS)
+        .chain(SIP_VERBS)
+        .collect()
+}
+
+/// No verb is claimed by two tables: `apply` takes the first classifier that
+/// matches, so the second table's handler would never run.
+#[test]
+fn no_verb_is_claimed_by_two_dispatch_tables() {
+    let mut claimed = dispatch_tables();
+    claimed.sort_unstable();
+    let total = claimed.len();
+    claimed.dedup();
+    assert_eq!(claimed.len(), total, "a verb sits in two dispatch tables");
+    for verb in SIP_VERBS.iter().chain(&BRIDGE_VERBS).chain([&MODULE_VERB]) {
+        assert!(!is_media_verb(verb), "{verb} is not a media verb");
+    }
+}
+
+/// Every advertised verb, and every verb a table claims, sent through `apply`
+/// the way a command reaches the adapter, is answered by a handler.
+///
+/// The classifier tests above compare names with names. This one runs the
+/// dispatch: a verb in `describe()` and in a table but with no arm in the
+/// table's `match`, or advertised and in no table at all, is answered
+/// `unsupported_verb` here, exactly as it would be on the wire. No dispatcher
+/// is running, so a real handler refuses for a reason of its own (nothing to
+/// act on, a missing argument, no B2BUA), never with that code.
+#[tokio::test]
+async fn every_advertised_verb_reaches_a_handler_through_apply() {
+    let adapter = SipControlAdapter::new();
+    let mut verbs: Vec<String> = adapter
+        .describe()
+        .verbs
+        .into_iter()
+        .map(|verb| verb.verb)
+        .collect();
+    verbs.extend(dispatch_tables().into_iter().map(str::to_string));
+    verbs.sort_unstable();
+    verbs.dedup();
+    assert!(verbs.iter().any(|verb| verb == "cancel_dial"));
+    for verb in verbs {
+        let result = adapter
+            .apply(AdapterCommand {
+                verb: verb.clone(),
+                args: serde_json::json!({}),
+                target: ResolvedTarget::Channel(channel()),
+                origin: test_origin(),
+            })
+            .await;
+        assert_ne!(
+            error_code(&result),
+            Some(ControlErrorCode::UnsupportedVerb),
+            "'{verb}' is advertised or claimed by a dispatch table, and apply() answers unsupported_verb"
+        );
+    }
+    // Positive control: a verb nobody claims is refused with exactly that code.
+    let result = adapter
+        .apply(AdapterCommand {
+            verb: "teleport".to_string(),
+            args: serde_json::json!({}),
+            target: ResolvedTarget::Channel(channel()),
+            origin: test_origin(),
+        })
+        .await;
+    assert_eq!(error_code(&result), Some(ControlErrorCode::UnsupportedVerb));
 }
 
 #[test]
@@ -1697,6 +1762,160 @@ async fn play_with_two_sources_is_bad_request() {
             ..
         }
     ));
+}
+
+/// The refusal a `play` argument draws: `bad_request`, naming the argument.
+fn refused_play_argument(args: serde_json::Value, argument: &str) {
+    match parse_play_options(&args) {
+        Err(ControlResult::Error { code, details, .. }) => {
+            assert_eq!(code, ControlErrorCode::BadRequest, "{args}");
+            let details = details.unwrap_or_default();
+            assert_eq!(details["verb"], "play", "{args}");
+            assert_eq!(details["argument"], argument, "{args}");
+            assert_eq!(details["reason"], "invalid_value", "{args}");
+        }
+        other => panic!("{args} was not refused: {other:?}"),
+    }
+}
+
+#[test]
+fn play_repeat_is_a_count_or_inf() {
+    use siphon_rtp_proto::PlayRepeat;
+    let repeat = |args: serde_json::Value| parse_play_options(&args).expect("accepted").repeat;
+    assert_eq!(repeat(serde_json::json!({})), None);
+    assert_eq!(repeat(serde_json::json!({ "repeat": null })), None);
+    assert_eq!(
+        repeat(serde_json::json!({ "repeat": 3 })),
+        Some(PlayRepeat::Times(3))
+    );
+    // Until stopped: the token the tone cadence grammar already uses.
+    assert_eq!(
+        repeat(serde_json::json!({ "repeat": "inf" })),
+        Some(PlayRepeat::Forever)
+    );
+}
+
+#[test]
+fn play_refuses_an_argument_it_cannot_use_rather_than_dropping_it() {
+    // Each of these was read as absent before, so the prompt played once, from
+    // the start, at full level, and the verb answered ok.
+    for repeat in [
+        serde_json::json!("forever"),
+        serde_json::json!(-1),
+        serde_json::json!(1.5),
+        serde_json::json!(true),
+        serde_json::json!([2]),
+    ] {
+        refused_play_argument(serde_json::json!({ "repeat": repeat }), "repeat");
+    }
+    refused_play_argument(serde_json::json!({ "start_ms": "250" }), "start_ms");
+    refused_play_argument(serde_json::json!({ "duration_ms": -5 }), "duration_ms");
+    refused_play_argument(
+        serde_json::json!({ "gain_decibels": "-6" }),
+        "gain_decibels",
+    );
+    refused_play_argument(
+        serde_json::json!({ "gain_decibels": 9_000_000_000_i64 }),
+        "gain_decibels",
+    );
+    refused_play_argument(serde_json::json!({ "to_tag": 7 }), "to_tag");
+
+    // Positive control: the same arguments, well formed, are all carried.
+    let options = parse_play_options(&serde_json::json!({
+        "repeat": 2, "start_ms": 250, "duration_ms": 5000, "gain_decibels": -6, "to_tag": "peer"
+    }))
+    .expect("accepted");
+    assert_eq!(options.start_ms, Some(250));
+    assert_eq!(options.duration_ms, Some(5000));
+    assert_eq!(options.gain_decibels, Some(-6));
+    assert_eq!(options.to_tag.as_deref(), Some("peer"));
+}
+
+#[tokio::test]
+async fn play_with_an_unusable_repeat_is_bad_request_before_the_engine_is_asked() {
+    // Refused on its arguments, so it holds with no dispatcher: a well-formed
+    // one reaches the media-target lookup instead and answers not_found here.
+    let refused = play(
+        &channel(),
+        &serde_json::json!({ "file": "/a.wav", "repeat": "forever" }),
+    )
+    .await;
+    assert!(matches!(
+        refused,
+        ControlResult::Error {
+            code: ControlErrorCode::BadRequest,
+            ..
+        }
+    ));
+    let accepted = play(
+        &channel(),
+        &serde_json::json!({ "file": "/a.wav", "repeat": "inf" }),
+    )
+    .await;
+    assert!(matches!(
+        accepted,
+        ControlResult::Error {
+            code: ControlErrorCode::NotFound,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn hold_on_a_call_the_engine_only_relays_is_an_invalid_state() {
+    use crate::rtpengine::RtpEngineError;
+    let relayed = || {
+        Err(RtpEngineError::EngineError(
+            "silence: call is not a media-processing call (transcode/record/stream required)"
+                .to_string(),
+        ))
+    };
+    for (engage, verb) in [(true, "hold"), (false, "unhold")] {
+        match hold_result(&channel(), engage, relayed()) {
+            ControlResult::Error { code, details, .. } => {
+                assert_eq!(code, ControlErrorCode::InvalidState);
+                let details = details.unwrap_or_default();
+                assert_eq!(details["verb"], verb);
+                assert_eq!(details["reason"], "media_not_processed");
+            }
+            other => panic!("{verb} on a relayed call was not refused: {other:?}"),
+        }
+    }
+    // An engine that is really unreachable is still `unavailable`, and a call
+    // the engine no longer has is still `not_found`.
+    assert!(matches!(
+        hold_result(
+            &channel(),
+            true,
+            Err(RtpEngineError::Timeout { timeout_ms: 1000 })
+        ),
+        ControlResult::Error {
+            code: ControlErrorCode::Unavailable,
+            ..
+        }
+    ));
+    assert!(matches!(
+        hold_result(
+            &channel(),
+            true,
+            Err(RtpEngineError::EngineError(
+                "unknown call: 1@host".to_string()
+            ))
+        ),
+        ControlResult::Error {
+            code: ControlErrorCode::NotFound,
+            ..
+        }
+    ));
+    // Positive control: an accept reports the state.
+    match hold_result(&channel(), true, Ok(())) {
+        ControlResult::Ok(reply) => assert_eq!(reply["state"], "held"),
+        other => panic!("{other:?}"),
+    }
+    match hold_result(&channel(), false, Ok(())) {
+        ControlResult::Ok(reply) => assert_eq!(reply["state"], "unheld"),
+        other => panic!("{other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -2290,6 +2509,77 @@ fn dial_target_accepts_uri_with_next_hop_and_headers() {
     );
 }
 
+/// A target's `to` is carried to the dispatcher as the branch's called party;
+/// a target naming none leaves the default `To` in place.
+#[test]
+fn dial_target_carries_its_called_party() {
+    let parsed = parse_dial_target(&serde_json::json!({
+        "uri": "sip:+15550199@trunk.example",
+        "to": "sip:+15550199@trunk.example",
+    }))
+    .expect("the object form is a target");
+    assert_eq!(parsed[0].to.as_deref(), Some("sip:+15550199@trunk.example"));
+
+    let bare = parse_dial_target(&serde_json::json!({"uri": "sip:+15550199@trunk.example"}))
+        .expect("the object form is a target");
+    assert_eq!(bare[0].to, None);
+}
+
+/// An `{aor}` target's identity fields reach every contact it forks to, as
+/// its headers and `to` do. They used to be dropped without a word on this
+/// form while the reference documented them on both.
+#[test]
+fn an_aor_targets_identity_reaches_every_contact() {
+    let registrar = crate::script::api::test_registrar();
+    for (instance, host) in [("a", "198.51.100.121"), ("b", "198.51.100.122")] {
+        registrar
+            .save(
+                "sip:3202@siphon.example.com",
+                crate::sip::uri::SipUri::new(host.to_string()),
+                3600,
+                1.0,
+                format!("register-3202-{instance}"),
+                1,
+            )
+            .expect("the binding saves");
+    }
+    let parsed = parse_dial_target(&serde_json::json!({
+        "aor": "sip:3202@siphon.example.com",
+        "from": "sip:+15550100@trunk.example",
+        "from_display": "Example Ltd",
+        "p_asserted_identity": "sip:+15550100@trunk.example",
+        "privacy": "restricted",
+        "headers": {"X-Queue": "sales"},
+    }))
+    .expect("the AoR form is a target");
+    assert_eq!(parsed.len(), 2, "one branch per registered contact");
+    for branch in &parsed {
+        assert_eq!(branch.from.as_deref(), Some("sip:+15550100@trunk.example"));
+        assert_eq!(branch.from_display.as_deref(), Some("Example Ltd"));
+        assert_eq!(
+            branch.p_asserted_identity.as_deref(),
+            Some("sip:+15550100@trunk.example")
+        );
+        assert_eq!(
+            branch.privacy,
+            Some(crate::sip::privacy::CallerIdPresentation::Restricted)
+        );
+        assert_eq!(
+            branch.headers.get("X-Queue").map(String::as_str),
+            Some("sales")
+        );
+        assert!(branch.aor.is_some(), "still named for the AoR it rang");
+    }
+
+    // A privacy siphon cannot honour is refused on this form too, rather
+    // than ignored with the rest of the identity.
+    let refused = parse_dial_target(&serde_json::json!({
+        "aor": "sip:3202@siphon.example.com",
+        "privacy": "maybe",
+    }));
+    assert!(refused.is_err(), "{refused:?}");
+}
+
 /// An AoR with nobody registered is not a malformed request. It yields no
 /// branch, and `dial` answers `not_found` once every target has been tried
 /// — an app dialling a ring group must not be told its JSON is wrong
@@ -2662,6 +2952,221 @@ fn an_aor_originate_with_no_dispatcher_registers_no_channel() {
     );
 }
 
+fn register_contact(aor: &str, contact: &str) {
+    crate::script::api::test_registrar()
+        .save(
+            aor,
+            crate::sip::parser::parse_uri_standalone(contact).expect("a contact URI"),
+            3600,
+            1.0,
+            format!("register-{contact}"),
+            1,
+        )
+        .expect("the binding saves");
+}
+
+fn transfer_refusal(verb: &str, args: serde_json::Value) -> (ControlErrorCode, serde_json::Value) {
+    match parse_transfer_dial(verb, &args) {
+        Err(ControlResult::Error { code, details, .. }) => (code, details.unwrap_or_default()),
+        Err(ControlResult::Ok(reply)) => panic!("a refusal that is ok: {reply}"),
+        Ok(_) => panic!("{args} was accepted"),
+    }
+}
+
+#[test]
+fn a_transfer_target_is_a_uri_or_a_registered_aor() {
+    let named = |args: serde_json::Value| {
+        parse_transfer_dial("replace_peer", &args)
+            .unwrap_or_else(|refusal| panic!("{args} was refused: {refusal:?}"))
+    };
+    // No target at all is the verb's to judge: accept_refer has the Refer-To.
+    assert_eq!(named(serde_json::json!({})).target, None);
+    for args in [
+        serde_json::json!({ "target": "sip:204@198.51.100.7" }),
+        serde_json::json!({ "target": { "uri": "sip:204@198.51.100.7" } }),
+    ] {
+        let transfer = named(args);
+        assert_eq!(transfer.target.as_deref(), Some("sip:204@198.51.100.7"));
+        assert!(transfer.dial.aor.is_none() && transfer.dial.flow.is_none());
+    }
+
+    // An AoR with one phone: the contact is what is dialled, called as the AoR.
+    register_contact(
+        "sip:tx5501@siphon.example.com",
+        "sip:tx5501@198.51.100.61:5060",
+    );
+    let transfer = named(serde_json::json!({
+        "target": { "aor": "sip:tx5501@siphon.example.com" }
+    }));
+    assert_eq!(
+        transfer.target.as_deref(),
+        Some("sip:tx5501@198.51.100.61:5060")
+    );
+    assert_eq!(
+        transfer.dial.aor.as_deref(),
+        Some("sip:tx5501@siphon.example.com")
+    );
+}
+
+/// An AoR with two phones rings both: the verb is accepted, and it yields one
+/// target per registered contact, each with the AoR it is called as and all
+/// sharing the identity and headers the verb named.
+#[test]
+fn a_transfer_to_an_aor_with_several_contacts_rings_every_one() {
+    register_contact(
+        "sip:tx5503@siphon.example.com",
+        "sip:tx5503@198.51.100.62:5060",
+    );
+    register_contact(
+        "sip:tx5503@siphon.example.com",
+        "sip:tx5503@198.51.100.63:5060",
+    );
+    for verb in ["accept_refer", "replace_peer"] {
+        let transfer = parse_transfer_dial(
+            verb,
+            &serde_json::json!({
+                "target": { "aor": "sip:tx5503@siphon.example.com" },
+                "from_display": "Main Line",
+                "headers": { "X-Account": "main" },
+            }),
+        )
+        .unwrap_or_else(|refusal| panic!("{verb} was refused: {refusal:?}"));
+        let mut rung = vec![transfer.target.clone().expect("a first target")];
+        rung.extend(transfer.dial.also.iter().map(|contact| contact.uri.clone()));
+        rung.sort();
+        assert_eq!(
+            rung,
+            [
+                "sip:tx5503@198.51.100.62:5060",
+                "sip:tx5503@198.51.100.63:5060"
+            ],
+            "{verb} rings both contacts"
+        );
+        assert_eq!(
+            transfer.dial.aor.as_deref(),
+            Some("sip:tx5503@siphon.example.com")
+        );
+        assert_eq!(transfer.dial.also.len(), 1);
+        assert_eq!(
+            transfer.dial.also[0].aor.as_deref(),
+            Some("sip:tx5503@siphon.example.com"),
+            "each contact is called as the AoR"
+        );
+        assert_eq!(
+            transfer.dial.shaping.from_display.as_deref(),
+            Some("Main Line")
+        );
+        assert_eq!(
+            transfer.dial.headers,
+            [("X-Account".to_string(), "main".to_string())]
+        );
+    }
+}
+
+#[test]
+fn a_transfer_to_an_aor_nobody_registered_at_is_refused() {
+    let (code, _) = transfer_refusal(
+        "accept_refer",
+        serde_json::json!({ "target": { "aor": "sip:tx5502@siphon.example.com" } }),
+    );
+    assert_eq!(code, ControlErrorCode::NotFound);
+
+    // A registered phone is reached over its own flow, never a next hop.
+    register_contact(
+        "sip:tx5504@siphon.example.com",
+        "sip:tx5504@198.51.100.64:5060",
+    );
+    let (code, _) = transfer_refusal(
+        "replace_peer",
+        serde_json::json!({
+            "target": { "aor": "sip:tx5504@siphon.example.com" },
+            "next_hop": "sip:edge.example.com"
+        }),
+    );
+    assert_eq!(code, ControlErrorCode::BadRequest);
+    for target in [
+        serde_json::json!(7),
+        serde_json::json!({}),
+        serde_json::json!({ "uri": "sip:a@example.com", "aor": "sip:b@example.com" }),
+        serde_json::json!("not a uri"),
+    ] {
+        let (code, _) = transfer_refusal("replace_peer", serde_json::json!({ "target": target }));
+        assert_eq!(code, ControlErrorCode::BadRequest);
+    }
+}
+
+#[test]
+fn a_transfer_carries_the_identity_arguments_a_dial_takes() {
+    let transfer = parse_transfer_dial(
+        "accept_refer",
+        &serde_json::json!({
+            "from": "sip:+15550100000@trunk.example.com",
+            "from_display": "",
+            "p_asserted_identity": "sip:+15550100000@trunk.example.com",
+            "privacy": "restricted",
+            "headers": { "X-Account": "main" }
+        }),
+    )
+    .unwrap_or_else(|refusal| panic!("refused: {refusal:?}"));
+    let shaping = &transfer.dial.shaping;
+    assert_eq!(
+        shaping.from.as_deref(),
+        Some("sip:+15550100000@trunk.example.com")
+    );
+    assert_eq!(
+        shaping.from_display.as_deref(),
+        Some(""),
+        "an empty display name is kept: it removes the caller's"
+    );
+    assert_eq!(
+        shaping.privacy,
+        Some(crate::sip::privacy::CallerIdPresentation::Restricted)
+    );
+    assert_eq!(
+        transfer.dial.headers,
+        [("X-Account".to_string(), "main".to_string())]
+    );
+
+    for args in [
+        serde_json::json!({ "from": "not a uri" }),
+        serde_json::json!({ "p_asserted_identity": "not a uri" }),
+        serde_json::json!({ "privacy": "sometimes" }),
+    ] {
+        let (code, _) = transfer_refusal("accept_refer", args);
+        assert_eq!(code, ControlErrorCode::BadRequest);
+    }
+}
+
+#[test]
+fn a_transparent_transfer_refuses_what_it_would_never_use() {
+    // It relays the REFER and dials no leg, so an identity or a flow named on
+    // it would be accepted and silently dropped.
+    for args in [
+        serde_json::json!({ "mode": "transparent", "from": "sip:1@example.com" }),
+        serde_json::json!({ "mode": "transparent", "headers": { "X-A": "b" } }),
+        serde_json::json!({ "mode": "transparent", "privacy": "restricted" }),
+    ] {
+        let result = accept_refer(&channel(), &args);
+        assert!(
+            bad_request_message(&result).contains("transparent"),
+            "{args}"
+        );
+    }
+    // Positive control: with nothing to drop it gets as far as the pending
+    // REFER, of which there is none here.
+    let result = accept_refer(
+        &channel(),
+        &serde_json::json!({ "mode": "transparent", "target": "sip:c@example.com" }),
+    );
+    assert!(matches!(
+        result,
+        ControlResult::Error {
+            code: ControlErrorCode::NotFound,
+            ..
+        }
+    ));
+}
+
 fn bad_request_message(result: &ControlResult) -> String {
     match result {
         ControlResult::Error {
@@ -2734,4 +3239,102 @@ async fn stream_start_bridge_with_a_null_profile_is_no_profile() {
             ..
         }
     ));
+}
+
+#[test]
+fn accept_refer_mode_controller_is_this_rails_own() {
+    use crate::script::api::call::ReferMode;
+    assert_eq!(
+        parse_accept_refer_mode(Some(&serde_json::json!("controller"))),
+        Ok(AcceptReferMode::Controller)
+    );
+    // The modes siphon carries out are the script rail's, parsed as before.
+    assert_eq!(
+        parse_accept_refer_mode(None),
+        Ok(AcceptReferMode::Siphon(None))
+    );
+    assert_eq!(
+        parse_accept_refer_mode(Some(&serde_json::json!("terminate"))),
+        Ok(AcceptReferMode::Siphon(Some(ReferMode::Terminate)))
+    );
+    assert!(parse_accept_refer_mode(Some(&serde_json::json!("sideways"))).is_err());
+    // It is not a mode a script or the configured default can name.
+    assert!(parse_refer_mode(Some(&serde_json::json!("controller"))).is_err());
+}
+
+#[test]
+fn a_controller_transfer_with_no_b2bua_running_is_answered_not_left_hanging() {
+    // No dispatcher in a unit context. Accepting finds nothing pending, as the
+    // other modes do; reporting says the B2BUA is not there to report through.
+    let result = sip_command("accept_refer", serde_json::json!({ "mode": "controller" }));
+    assert!(matches!(
+        result,
+        ControlResult::Error {
+            code: ControlErrorCode::NotFound,
+            ..
+        }
+    ));
+    let result = sip_command("complete_refer", serde_json::json!({ "code": 200 }));
+    assert!(matches!(
+        result,
+        ControlResult::Error {
+            code: ControlErrorCode::Unavailable,
+            ..
+        }
+    ));
+    // Arguments are judged before the rail is reached.
+    let result = sip_command("complete_refer", serde_json::json!({}));
+    assert!(bad_request_message(&result).contains("code"));
+    let result = sip_command(
+        "accept_refer",
+        serde_json::json!({ "mode": "controller", "target": "sip:c@example.com" }),
+    );
+    assert!(bad_request_message(&result).contains("dials no leg"));
+    let result = sip_command("accept_refer", serde_json::json!({ "timeout": 30 }));
+    assert!(bad_request_message(&result).contains("controller"));
+}
+
+#[test]
+fn a_refused_controller_transfer_names_its_verb_and_reason() {
+    use crate::dispatcher::ControllerReferRefusal;
+    for (refusal, code, reason) in [
+        (
+            ControllerReferRefusal::NoPendingRefer,
+            ControlErrorCode::NotFound,
+            "no_pending_refer",
+        ),
+        (
+            ControllerReferRefusal::Gone,
+            ControlErrorCode::NotFound,
+            "call_gone",
+        ),
+        (
+            ControllerReferRefusal::ReferrerGone,
+            ControlErrorCode::NotFound,
+            "referrer_gone",
+        ),
+        (
+            ControllerReferRefusal::TransferOpen,
+            ControlErrorCode::InvalidState,
+            "transfer_in_progress",
+        ),
+        (
+            ControllerReferRefusal::NoTransferPending,
+            ControlErrorCode::InvalidState,
+            "no_transfer_pending",
+        ),
+    ] {
+        let ControlResult::Error {
+            code: answered,
+            details,
+            ..
+        } = controller_refer_refused("complete_refer", refusal)
+        else {
+            panic!("a refusal is an error");
+        };
+        assert_eq!(answered, code, "{refusal:?}");
+        let details = details.expect("a refusal carries details");
+        assert_eq!(details["verb"], "complete_refer");
+        assert_eq!(details["reason"], reason);
+    }
 }

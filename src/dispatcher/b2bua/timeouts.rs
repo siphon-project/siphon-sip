@@ -65,8 +65,9 @@ pub fn check_b2bua_max_call_durations(state: &DispatcherState) {
     }
 }
 
-/// Give up on every leg replacement whose dialed target has blown its deadline:
-/// CANCEL that leg and run the ordinary replacement-failure path (`408`).
+/// Give up on every leg replacement whose dialed targets have blown its
+/// deadline: CANCEL each one still ringing and run the ordinary
+/// replacement-failure path (`408`, or a better response a target already gave).
 ///
 /// The sibling of [`check_b2bua_answer_timeouts`] for the calls that one cannot
 /// see. A replacement — a siphon-terminated REFER transfer, or
@@ -77,60 +78,20 @@ pub fn check_b2bua_max_call_durations(state: &DispatcherState) {
 /// armed, the response path kept matching its Call-ID, and the surviving party
 /// stayed bridged to a leg that was never going to answer.
 ///
-/// The original call survives — [`b2bua_fail_terminated_transfer`] drops the
-/// target leg and clears the replacement, exactly as it does for a target that
+/// The original call survives — [`conclude_failed_replacement`] drops the
+/// target legs and clears the replacement, exactly as it does for a target that
 /// answers `486`. The one exception is its own: a call whose replaced leg
 /// already left has nobody for the survivor to talk to, and is released.
+///
+/// The sweep only finds the calls. Whether a replacement is still there to
+/// give up on is decided again under the call's lock
+/// ([`b2bua_expire_leg_replacement`]): a target may have answered or failed
+/// between the sweep and here, and a call with several targets ringing is
+/// listed once for each.
 pub fn check_b2bua_replacement_timeouts(state: &DispatcherState) {
     let now = std::time::Instant::now();
-    for (call_id, target_call_id) in state.call_actors.take_timed_out_replacements(now) {
-        // Re-resolve the leg under the lock: it may have answered, failed or
-        // been removed between the sweep and here, and the index is only
-        // meaningful for as long as `b_legs` has not shifted.
-        let Some((target_idx, cancel)) = state.call_actors.get_call(&call_id).and_then(|call| {
-            let index = call
-                .b_legs
-                .iter()
-                .position(|leg| leg.dialog.call_id == target_call_id)?;
-            let leg = call.b_legs.get(index)?;
-            state.b2bua_retransmits.disarm_branch(&leg.branch);
-            let cancel = leg.b_leg_invite.as_ref().and_then(|invite| {
-                invite.lock().ok().and_then(|invite| {
-                    build_cancel_from_invite(&invite).map(|message| {
-                        (
-                            message,
-                            leg.transport.transport,
-                            leg.transport.remote_addr,
-                            leg.transport.connection_id,
-                            leg.transport.local_addr,
-                        )
-                    })
-                })
-            });
-            Some((index, cancel))
-        }) else {
-            continue;
-        };
-
-        // RFC 3261 §9.1: the target still has an INVITE server transaction open,
-        // so abandon it rather than walking away and leaving it ringing.
-        if let Some((cancel, transport, destination, connection_id, local_addr)) = cancel {
-            send_message_from(
-                cancel,
-                transport,
-                destination,
-                connection_id,
-                local_addr,
-                state,
-            );
-        }
-
-        warn!(
-            call_id = %call_id,
-            target_leg = %target_call_id,
-            "B2BUA: leg replacement target never answered — cancelling it and keeping the original call"
-        );
-        b2bua_fail_terminated_transfer(&call_id, target_idx, 408, state);
+    for (call_id, _target_call_id) in state.call_actors.take_timed_out_replacements(now) {
+        b2bua_expire_leg_replacement(&call_id, state);
     }
 }
 
@@ -257,13 +218,11 @@ pub fn fail_b2bua_call_on_timeout(call_id: &str, state: &DispatcherState) {
             if call.failure_concluding {
                 return;
             }
-            // We are giving up on this ring, so stop retransmitting every B-leg
-            // INVITE that never drew a response. The CANCELs below cover the
-            // legs whose INVITE was stashed; this also catches a leg whose stash
-            // never landed, which would otherwise keep retransmitting until 64*T1.
-            for b_leg in &call.b_legs {
-                state.b2bua_retransmits.disarm_branch(&b_leg.branch);
-            }
+            // We are giving up on this ring. The CANCELs below cover the legs
+            // whose INVITE was stashed, each when RFC 3261 §9.1 allows it; this
+            // catches a leg whose stash never landed, which would otherwise
+            // keep retransmitting until 64*T1.
+            disarm_unstashed_b_leg_invites(&call, state);
             let handle_txs: Vec<_> = call
                 .b_leg_handles
                 .iter()

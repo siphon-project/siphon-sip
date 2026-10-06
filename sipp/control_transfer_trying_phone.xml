@@ -1,0 +1,75 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  The second phone of the `cancel-dial` case: rung alongside one that alerts,
+  it answers `100 Trying` and nothing more before the dial is given up.
+
+  recv INVITE -> 100 -> recv CANCEL -> 200 (CANCEL) -> 487 (INVITE) -> recv ACK
+
+  It never sends a 180, so it is not what starts the caller's ringback, and the
+  dial is cancelled with this phone in a different state from its sibling. It
+  must be CANCELled all the same: RFC 3261 §9.1 lets a CANCEL go once any
+  provisional response has arrived, and the 100 is one. The CANCEL and the ACK
+  are mandatory rows under -timeout_error.
+-->
+<scenario name="control-transfer phone that only says Trying">
+
+  <recv request="INVITE" crlf="true">
+    <action>
+      <ereg regexp="[^[:space:]]+" search_in="hdr" header="Call-ID:" assign_to="wire_call_id" />
+      <ereg regexp="[0-9]+" search_in="hdr" header="CSeq:" assign_to="invite_cseq" />
+      <exec command="echo WIRE-CALL-ID [$wire_call_id]" />
+    </action>
+  </recv>
+
+  <send>
+    <![CDATA[
+SIP/2.0 100 Trying
+[last_Via:]
+[last_From:]
+[last_To:]
+[last_Call-ID:]
+[last_CSeq:]
+Content-Length: 0
+
+]]>
+  </send>
+
+  <recv request="CANCEL" timeout="30000" />
+
+  <send>
+    <![CDATA[
+SIP/2.0 200 OK
+[last_Via:]
+[last_From:]
+[last_To:]
+[last_Call-ID:]
+[last_CSeq:]
+Content-Length: 0
+
+]]>
+  </send>
+
+  <send>
+    <![CDATA[
+SIP/2.0 487 Request Terminated
+[last_Via:]
+[last_From:]
+[last_To:];tag=[pid]SIPpTag01[call_number]
+[last_Call-ID:]
+CSeq: [$invite_cseq] INVITE
+Content-Length: 0
+
+]]>
+  </send>
+
+  <recv request="ACK" timeout="10000">
+    <action>
+      <ereg regexp="tag=.*SIPpTag01"
+            search_in="hdr" header="To:" check_it="true" assign_to="ack_to_tag" />
+      <log message="the 487 was ACKed with its own To-tag: [$ack_to_tag]" />
+    </action>
+  </recv>
+
+</scenario>

@@ -2479,7 +2479,7 @@ impl PyCall {
     /// `profile` names the media profile for the pairing the transfer creates.
     /// **Required whenever the call is anchored with a direction-bound profile**
     /// — one whose offer and answer describe different sides, such as
-    /// `srtp_to_rtp` at a Teams/SRTP edge. Left unset, the transfer inherits the
+    /// `srtp_to_rtp` at an SRTP edge. Left unset, the transfer inherits the
     /// original call's profile, whose answer half was written for the party that
     /// is being transferred away; the surviving leg is then re-INVITEd with that
     /// party's transport (SRTP toward a plain-RTP carrier) and answers `m=audio

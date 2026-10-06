@@ -900,6 +900,12 @@ pub fn start_originate_group(
     Ok(placed)
 }
 
+/// Forget a group that was created and never started: nothing is on the wire
+/// and its sink is not told.
+pub fn discard_originate_group(state: &DispatcherState, group_id: &str) {
+    state.originate_groups.remove(group_id);
+}
+
 /// End a group from outside it: CANCEL every leg still ringing (RFC 3261 §9.1),
 /// release every answer awaiting confirmation (BYE, §15) and report the
 /// failure. A group whose deadline passes while an answer awaits confirmation
@@ -1089,6 +1095,11 @@ fn leg_params(template: &OriginateParams, target: &DialTarget) -> OriginateParam
         params.to = aor.clone();
     } else if params.to.is_empty() {
         params.to = target.uri.clone();
+    }
+    // A called party the target names outranks both: a divert reaches a
+    // different number from the one the AoR or the group names.
+    if let Some(to) = &target.to {
+        params.to = to.clone();
     }
     if target.next_hop.is_some() {
         params.next_hop = target.next_hop.clone();
@@ -1846,6 +1857,21 @@ mod tests {
             params.headers,
             vec![("x-queue".to_string(), "support".to_string())],
             "the target's header replaces the group's of the same name"
+        );
+    }
+
+    #[test]
+    fn a_targets_to_is_its_legs_called_party_over_the_aor_and_the_group() {
+        let template = group(OriginateGroupStrategy::Parallel, 0).params;
+        let target = DialTarget {
+            uri: "sip:201@198.51.100.7:5070".to_string(),
+            aor: Some("sip:201@siphon.example.com".to_string()),
+            to: Some("sip:15550100199@trunk.example.com".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            leg_params(&template, &target).to,
+            "sip:15550100199@trunk.example.com"
         );
     }
 }

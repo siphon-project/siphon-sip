@@ -78,12 +78,11 @@ pub struct ReferSubscription {
     pub notify_cseq: u32,
     /// Current transfer progress (drives the sipfrag body and teardown).
     pub state: crate::b2bua::transfer::TransferState,
-    /// For a siphon-terminated inbound transfer: the dialog Call-ID of the leg
-    /// siphon dialed to the transfer target. The response path matches an
-    /// answering b_leg against this exact Call-ID (not just "a non-winner leg")
-    /// so an unrelated leg dialed while a transfer is pending can't be mistaken
-    /// for the transfer target. `None` for the subscriber (outbound) role.
-    pub target_leg_call_id: Option<String>,
+    /// The targets siphon dialled for a replacement, one per INVITE: every
+    /// registered contact of an address-of-record rings. The response path
+    /// matches a leg against these by Via branch, so an unrelated leg dialled
+    /// meanwhile cannot be taken for one. Empty in the subscriber role.
+    pub targets: Vec<ReplacementTarget>,
     /// True once the dialog of the leg being replaced ended while the
     /// replacement was still in flight — for a REFER, the referrer sent a BYE
     /// after siphon accepted it but before the dialed target resolved.
@@ -108,8 +107,8 @@ pub struct ReferSubscription {
     /// sweep ([`take_timed_out_calls`](CallActorStore::take_timed_out_calls))
     /// deliberately looks only at `Calling`/`Ringing` calls — so without a
     /// deadline of its own a target that never sends a final response leaves
-    /// this subscription armed forever, the response path still matching on
-    /// `target_leg_call_id`, and the surviving party bridged to nobody. `None`
+    /// this subscription armed forever, the response path still matching its
+    /// `targets`, and the surviving party bridged to nobody. `None`
     /// keeps the pre-deadline behaviour (wait indefinitely).
     pub deadline: Option<std::time::Instant>,
     /// Media profile chosen for the pairing this transfer creates
@@ -269,6 +268,8 @@ pub struct CallActor {
     pub created_at: std::time::Instant,
     /// Original A-leg INVITE message (for script handler reconstruction).
     pub a_leg_invite: Option<Arc<Mutex<SipMessage>>>,
+    /// Set while `@b2bua.on_invite` runs; a CANCEL raises it (`cancel_deferral`).
+    pub invite_handler_cancelled: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// Local (listener) address the A-leg INVITE arrived on. Captured at INVITE
     /// so an imperative `call.answer()` / `call.progress()` sends the UAS
     /// response back out the same listener (source-socket parity with the
@@ -533,6 +534,8 @@ pub struct CallActor {
     /// call, which is what releases the slot on every teardown path. `None`
     /// only for a call built without going through admission, in tests.
     pub admission: Option<crate::admission::AdmissionPermit>,
+    /// Last 101-199 sent to the caller, as wire bytes (`invite_retransmission`).
+    pub a_leg_last_provisional: Option<bytes::Bytes>,
 }
 /// The media plan of an offerless originate, resolved when the callee's 2xx
 /// arrives. Names a profile in the media registry rather than carrying resolved
@@ -581,6 +584,7 @@ impl CallActor {
             winner: None,
             created_at: std::time::Instant::now(),
             a_leg_invite: None,
+            invite_handler_cancelled: None,
             a_leg_local_addr: None,
             session_timer_override: None,
             transfer: None,
@@ -632,6 +636,7 @@ impl CallActor {
             failure_concluding: false,
             cancel_claimed: false,
             admission: None,
+            a_leg_last_provisional: None,
         }
     }
 
@@ -1031,6 +1036,7 @@ impl CallActor {
         if state == CallState::Answered && self.answered_at.is_none() {
             self.answered_at = Some(std::time::Instant::now());
         }
+        self.forget_provisional_once_final(&state);
         self.state = state;
     }
 
@@ -1373,47 +1379,6 @@ impl CallActor {
 // CallActorStore — manages all active calls
 // ---------------------------------------------------------------------------
 
-/// Post-teardown state for a leg whose INVITE was CANCELled but is still owed a
-/// final response.
-///
-/// Two outcomes reach this entry, and both would otherwise be dropped as
-/// "unknown branch" — the CANCEL paths remove the call, unregistering the leg's
-/// branch, at the moment they put the CANCEL on the wire:
-///
-///  * the **ordinary** one, a `487 Request Terminated` (RFC 3261 §9.1): every
-///    CANCELled INVITE draws a final non-2xx, and §17.1.1.3 makes ACKing it the
-///    client transaction's job. Unacknowledged, the peer's INVITE server
-///    transaction retransmits on Timer G until Timer H (64*T1 = 32 s, §17.2.1),
-///    holding transaction state on both sides for the whole window.
-///  * the **glare** one, a 2xx the callee put on the wire before our CANCEL
-///    arrived (§9.1). That 2xx still establishes a dialog, which the B2BUA MUST
-///    ACK (§13.2.2.4) and then BYE (§15) to release.
-///
-/// Keyed by the Via branch of the CANCELled INVITE, which every final response
-/// to it carries (RFC 3261 §17.1.3). Not by the Call-ID: under
-/// `call.preserve_call_id()` every branch of a fork shares one, and a key per
-/// Call-ID kept only the last cancelled branch answerable. Auto-expires after 32
-/// seconds (Timer H).
-#[derive(Debug, Clone)]
-pub struct ZombieCancelledLeg {
-    /// The cancelled leg's dialog + transport, used to build the ACK and BYE.
-    /// `remote_tag` / `remote_contact` are filled from the racing 2xx at
-    /// handling time (they were unknown when the INVITE was CANCELled).
-    pub leg: Leg,
-    /// Request-URI of the INVITE that was CANCELled, captured at teardown.
-    ///
-    /// RFC 3261 §17.1.1.3 requires the ACK for a final non-2xx to carry the
-    /// same Request-URI as the INVITE it acknowledges, and by the time the
-    /// `487` lands the call — and with it the stashed INVITE — is gone. `None`
-    /// only when the INVITE could not be read back (poisoned mutex); no ACK is
-    /// built in that case, because a `sip:invalid` R-URI on the wire is worse
-    /// than none.
-    pub invite_ruri: Option<String>,
-    /// Whether the BYE has already been sent. The first racing 2xx triggers
-    /// ACK + BYE; later 200 OK retransmits re-ACK only (so a lost ACK still
-    /// gets retried) without emitting a second BYE.
-    pub byed: bool,
-}
 /// A fork branch's final failure, held until the fork settles.
 #[derive(Debug, Clone)]
 pub struct BranchFailure {
@@ -1470,8 +1435,8 @@ pub struct DelayedOfferAck {
     pub destination: std::net::SocketAddr,
     /// The socket the INVITE left from, for a flow-pinned leg.
     pub local_addr: Option<std::net::SocketAddr>,
-    /// The B-leg that sent the 2xx.
-    pub b_leg_index: usize,
+    /// Via branch of the INVITE the 2xx answers, which names its B-leg.
+    pub branch: String,
     /// Whether the ACK has gone out. Until it has, copies of the 2xx are absorbed.
     pub sent: bool,
 }

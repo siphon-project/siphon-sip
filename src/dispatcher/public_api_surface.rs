@@ -142,13 +142,22 @@ fn the_public_surface_is_pinned() {
     // `bridge` verb names a pair media profile through (`BridgeParams` is
     // published and built literally, so it gains no field), plus the
     // crate-internal `b2bua_media_profile` a runtime `stream_start` bridge
-    // resolves its profile through. All additive, so a minor-compatible
-    // change — recorded here because that is the tripwire.
+    // resolves its profile through, plus the 3 crate-internal items the
+    // `cancel_dial` verb ends a ringing dial through: its entry point, its
+    // refusal and the default cause a cancelled dial fails with, plus the 3
+    // crate-internal items `accept_refer` / `replace_peer` name how a transfer's
+    // new leg is dialled through: the two entry points taking it and the type
+    // itself (the published `b2bua_accept_refer_call` / `b2bua_replace_peer`
+    // keep their signatures), plus the 3 crate-internal items a transfer its
+    // controller carries out goes through: the `accept_refer` entry point for
+    // mode `controller`, the `complete_refer` one, and the refusal they share.
+    // All additive, so a minor-compatible change — recorded here because that
+    // is the tripwire.
     assert_eq!(
         declared + re_exported,
-        79,
+        88,
         "the dispatcher's public surface is {} items ({declared} declared here, \
-         {re_exported} re-exported), not 79. Adding one is a semver commitment on a \
+         {re_exported} re-exported), not 88. Adding one is a semver commitment on a \
          published crate; removing one breaks embedders. An extraction should move the \
          declaration and add a `pub use`, leaving this total unchanged.",
         declared + re_exported,

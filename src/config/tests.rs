@@ -299,7 +299,7 @@ fn codec_flags_are_rtpengine_only() {
 }
 
 /// The codec block is a DICT of named lists. The shape that shipped in the
-/// Teams example (`codec: ["offer", "PCMA,PCMU"]`) is not it, and now fails
+/// SBC example (`codec: ["offer", "PCMA,PCMU"]`) is not it, and now fails
 /// the config load instead of being silently dropped — which is how it went
 /// unnoticed while implying siphon was restricting codecs.
 #[test]
@@ -1882,6 +1882,19 @@ fn a_media_block_that_names_or_configures_an_engine_expects_one() {
 fn an_unset_media_backend_still_resolves_to_rtpengine() {
     let config = config_with("media:\n  sdp_name: \"SIPhon\"\n").unwrap();
     assert_eq!(config.media.unwrap().backend(), MediaBackendKind::Rtpengine);
+}
+
+/// `media.sdp_keep_session_name` is off unless written, and a block that only
+/// shapes relayed SDP still expects no engine.
+#[test]
+fn sdp_keep_session_name_defaults_off_and_parses() {
+    let config = config_with("media:\n  sdp_name: \"SIPhon\"\n").unwrap();
+    assert!(!config.media.unwrap().sdp_keep_session_name);
+
+    let config = config_with("media:\n  sdp_keep_session_name: true\n").unwrap();
+    let media = config.media.unwrap();
+    assert!(media.sdp_keep_session_name);
+    assert!(!media.expects_engine());
 }
 
 /// Minimum config the loader accepts, plus whatever the test is about.

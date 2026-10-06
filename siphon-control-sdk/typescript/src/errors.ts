@@ -61,8 +61,9 @@ export class ControlError extends Error {
   }
 
   /**
-   * True when this is a server-side `unsupported_verb` rejection — the state a
-   * media verb (`playFile`/`dtmf`/…) lands in until the server implements it.
+   * True when this is a server-side `unsupported_verb` rejection — what a verb
+   * answers when the configured media backend cannot carry it out (streaming
+   * and recording on anything but siphon-rtp).
    */
   isUnsupportedVerb(): boolean {
     return this.kind === "command" && this.code === "unsupported_verb";

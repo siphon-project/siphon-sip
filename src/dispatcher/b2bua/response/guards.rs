@@ -4,11 +4,12 @@
 
 use crate::dispatcher::*;
 
-/// A response on a fork branch siphon has CANCELled because another branch
+/// A response on a fork branch siphon has given up on because another branch
 /// answered, or one declined with a 6xx.
 ///
 /// None of it may reach the call, which is answered or about to be torn down: a
-/// 1xx is dropped, the ordinary 487 is ACKed (RFC 3261 §17.1.1.3), and a 2xx
+/// 1xx is dropped, once it has let out the CANCEL that waited for it (RFC 3261
+/// §9.1), the ordinary 487 is ACKed (RFC 3261 §17.1.1.3), and a 2xx
 /// that crossed the CANCEL is ACKed and its dialog released with a BYE
 /// (§13.2.2.4, §15). That is the handling the branch gets once the call is
 /// gone, so it is the same code. Returns `true` when the response was this.
@@ -19,6 +20,13 @@ pub fn absorb_cancelled_branch_response(
     status_code: u16,
     state: &DispatcherState,
 ) -> bool {
+    // Every response to a B-leg INVITE passes here first, which makes it the
+    // place a provisional is recorded on its branch: what a CANCEL for that
+    // INVITE waits on (RFC 3261 §9.1), sent now if siphon gave up on the branch
+    // while it had drawn nothing.
+    if status_code < 200 {
+        cancel_on_first_provisional(branch, state);
+    }
     if !state.call_actors.is_cancelled_branch(branch) {
         return false;
     }
@@ -66,12 +74,17 @@ pub fn auto_prack_b_leg(
     if !needs_prack {
         return false;
     }
-    let (Some(rseq), Some(idx)) = (
+    // The leg is addressed by the Via branch the response carries from here
+    // on, never by the position the snapshot read: a leg ahead of it taken off
+    // the call in between moves every leg after it down one, and the PRACK
+    // built here may wait for the caller's long after this returns.
+    let (Some(rseq), true) = (
         crate::sip::headers::rseq::parse_rseq(&message.headers),
-        snapshot.b_leg_index,
+        snapshot.matched_b_leg,
     ) else {
         return false;
     };
+    let branch = snapshot.branch.as_str();
     // No PRACK for a leg that has ended. It is the check `b_leg_provisional`
     // drops the provisional on, so siphon never PRACKs a provisional it does not
     // relay.
@@ -93,7 +106,7 @@ pub fn auto_prack_b_leg(
     // ends the leg siphon was ending anyway. While the branch is kept answerable,
     // `absorb_cancelled_branch_response` already dropped the provisional before
     // this runs; this covers the leg once it is not.
-    if state.call_actors.is_ended_branch(call_id, idx) {
+    if state.call_actors.is_ended_branch_on(call_id, branch) {
         debug!(
             call_id = %call_id,
             rseq = rseq.response_number,
@@ -126,7 +139,7 @@ pub fn auto_prack_b_leg(
     // the caller a new reliable provisional.
     if !state
         .call_actors
-        .try_mark_prack_acked(call_id, idx, dedup_key, rseq.response_number)
+        .try_mark_prack_acked_on(call_id, branch, dedup_key, rseq.response_number)
     {
         debug!(
             call_id = %call_id,
@@ -141,7 +154,7 @@ pub fn auto_prack_b_leg(
     // 2xx / BYE / re-INVITE have a target before answer. The confirming 2xx
     // refreshes remote_tag / remote_contact to the winning dialog.
     if let Some(mut call) = state.call_actors.get_call_mut(call_id) {
-        if let Some(leg) = call.b_legs.get_mut(idx) {
+        if let Some((_, leg)) = call.find_b_leg_by_branch_mut(branch) {
             if leg.dialog.remote_tag.is_none() {
                 if let Some(ref tag) = early_to_tag {
                     leg.dialog.remote_tag = Some(tag.clone());
@@ -182,7 +195,7 @@ pub fn auto_prack_b_leg(
     hold_or_send_callee_prack(
         call_id,
         crate::b2bua::actor::HeldCalleePrack {
-            b_leg_index: idx,
+            branch: branch.to_string(),
             to_tag: dedup_key.to_string(),
             rseq: rseq.response_number,
             cseq_number,
@@ -563,33 +576,38 @@ pub fn feed_leg_actor_and_learn_dialog(
     // that establishes the dialog (RFC 3261 §12.1.2) — not from an actor event
     // that may describe a different response entirely (see the classification
     // note below).
-    if (200..300).contains(&status_code) {
-        if let Some(idx) = snapshot.b_leg_index {
-            if let Some(mut call) = state.call_actors.get_call_mut(call_id) {
-                if let Some(b_leg) = call.b_legs.get_mut(idx) {
-                    if let Some(to_tag) = crate::b2bua::actor::extract_to_tag(message) {
-                        // Splice the to-tag into remote_to_uri so in-dialog
-                        // requests (UPDATE, re-INVITE, BYE) toward this leg
-                        // can build a proper tagged To: header (RFC 3261
-                        // §12.1.1). remote_to_uri was captured from the
-                        // outbound INVITE which had no tag yet.
-                        if let Some(ref to_uri) = b_leg.dialog.remote_to_uri {
-                            if !to_uri.contains(";tag=") {
-                                b_leg.dialog.remote_to_uri =
-                                    Some(format!("{};tag={}", to_uri.trim_end(), to_tag));
-                            }
+    //
+    // The leg is found again by its branch, under the lock that writes to it. Its
+    // position in the snapshot was read before that lock, and a call ringing
+    // several replacement targets takes the one that answers first out of the
+    // leg list (`promote_replacement_target`): a sibling's 2xx handled at that
+    // moment would otherwise write its dialog onto whichever leg moved into the
+    // position it remembered.
+    if (200..300).contains(&status_code) && snapshot.matched_b_leg {
+        if let Some(mut call) = state.call_actors.get_call_mut(call_id) {
+            if let Some((_, b_leg)) = call.find_b_leg_by_branch_mut(&snapshot.branch) {
+                if let Some(to_tag) = crate::b2bua::actor::extract_to_tag(message) {
+                    // Splice the to-tag into remote_to_uri so in-dialog
+                    // requests (UPDATE, re-INVITE, BYE) toward this leg
+                    // can build a proper tagged To: header (RFC 3261
+                    // §12.1.1). remote_to_uri was captured from the
+                    // outbound INVITE which had no tag yet.
+                    if let Some(ref to_uri) = b_leg.dialog.remote_to_uri {
+                        if !to_uri.contains(";tag=") {
+                            b_leg.dialog.remote_to_uri =
+                                Some(format!("{};tag={}", to_uri.trim_end(), to_tag));
                         }
-                        b_leg.dialog.remote_tag = Some(to_tag);
                     }
-                    // Capture B-leg's remote Contact (RFC 3261 §12.1.2: remote target from 2xx)
-                    if let Some(contact) = message
-                        .headers
-                        .get("Contact")
-                        .or_else(|| message.headers.get("m"))
-                    {
-                        b_leg.dialog.remote_contact =
-                            Some(crate::b2bua::actor::extract_contact_uri(contact));
-                    }
+                    b_leg.dialog.remote_tag = Some(to_tag);
+                }
+                // Capture B-leg's remote Contact (RFC 3261 §12.1.2: remote target from 2xx)
+                if let Some(contact) = message
+                    .headers
+                    .get("Contact")
+                    .or_else(|| message.headers.get("m"))
+                {
+                    b_leg.dialog.remote_contact =
+                        Some(crate::b2bua::actor::extract_contact_uri(contact));
                 }
             }
         }

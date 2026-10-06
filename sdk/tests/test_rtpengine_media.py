@@ -76,6 +76,43 @@ async def route(request):
         assert call["db_id"] == 42
         assert call["repeat"] == 3
 
+    def test_repeat_inf_plays_until_stopped(self, harness):
+        import asyncio
+
+        asyncio.run(
+            harness.rtpengine.play_media(
+                None, file="/hold.wav", repeat="inf", wait=False
+            )
+        )
+        assert harness.rtpengine.media_calls[-1]["repeat"] == "inf"
+        asyncio.run(
+            harness.rtpengine.play_overlay(None, file="/hold.wav", repeat="INF")
+        )
+        assert harness.rtpengine.media_calls[-1]["repeat"] == "inf"
+
+    def test_repeat_inf_cannot_be_waited_for(self, harness):
+        import asyncio
+
+        with pytest.raises(ValueError, match="wait=False"):
+            asyncio.run(
+                harness.rtpengine.play_media(None, file="/hold.wav", repeat="inf")
+            )
+
+    @pytest.mark.parametrize("repeat", ["forever", -1, 1.5, [2]])
+    def test_an_unusable_repeat_is_refused(self, harness, repeat):
+        import asyncio
+
+        with pytest.raises(ValueError, match="repeat must be"):
+            asyncio.run(
+                harness.rtpengine.play_media(
+                    None, file="/a.wav", repeat=repeat, wait=False
+                )
+            )
+        with pytest.raises(ValueError, match="repeat must be"):
+            asyncio.run(
+                harness.rtpengine.play_overlay(None, file="/a.wav", repeat=repeat)
+            )
+
     def test_exactly_one_source_required(self, harness):
         with pytest.raises(ValueError, match="exactly one"):
             import asyncio

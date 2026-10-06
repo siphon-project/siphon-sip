@@ -1,0 +1,84 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  The caller of a `control-transfer` case in which nothing may reach it between
+  its ACK and the end of the call. `-s` names the case (sipp/control/
+  transfer_routes.py), which becomes the dialled user.
+
+  INVITE -> 180 -> 200 -> ACK -> BYE (siphon's, when the far party leaves) -> 200
+
+  The application connects this caller to a phone with `dial`, and then the
+  phone and the application do things to each other: REFERs are declined, or
+  accepted for the application to carry out. None of that concerns the caller,
+  so the only request this scenario accepts after its ACK is the BYE. A
+  re-INVITE, or a BYE that came early, lands on a row that does not expect it
+  and fails the call.
+-->
+<scenario name="control-transfer caller left alone">
+
+  <send retrans="500">
+    <![CDATA[
+INVITE sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: "Caller" <sip:12025550101@transfer.test>;tag=[pid]SIPpTag00[call_number]
+To: <sip:[service]@[remote_ip]>
+Call-ID: [call_id]
+CSeq: 1 INVITE
+Contact: <sip:caller@[local_ip]:[local_port];transport=[transport]>
+Max-Forwards: 70
+User-Agent: SIPp/control-transfer-uac
+Content-Type: application/sdp
+Content-Length: [len]
+
+v=0
+o=caller 53655765 2353687637 IN IP[local_ip_type] [local_ip]
+s=-
+c=IN IP[media_ip_type] [media_ip]
+t=0 0
+m=audio [media_port] RTP/AVP 8 101
+a=rtpmap:8 PCMA/8000
+a=rtpmap:101 telephone-event/8000
+a=fmtp:101 0-15
+a=ptime:20
+]]>
+  </send>
+
+  <recv response="100" optional="true" />
+
+  <label id="1" />
+  <recv response="180" optional="true" next="1" />
+
+  <recv response="200" rtd="true" crlf="true" rrs="true" />
+
+  <send>
+    <![CDATA[
+ACK [next_url] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: "Caller" <sip:12025550101@transfer.test>;tag=[pid]SIPpTag00[call_number]
+To: <sip:[service]@[remote_ip]>[peer_tag_param]
+Call-ID: [call_id]
+CSeq: 1 ACK
+[routes]
+Max-Forwards: 70
+Content-Length: 0
+
+]]>
+  </send>
+
+  <recv request="BYE" crlf="true" timeout="40000" />
+
+  <send>
+    <![CDATA[
+SIP/2.0 200 OK
+[last_Via:]
+[last_From:]
+[last_To:]
+[last_Call-ID:]
+[last_CSeq:]
+Content-Length: 0
+
+]]>
+  </send>
+
+</scenario>

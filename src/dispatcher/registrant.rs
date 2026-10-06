@@ -49,7 +49,7 @@ pub(super) fn handle_registrant_response(
 
     let is_aka = registrant.auth_mode(&aor) == Some(crate::registrant::AuthMode::Aka);
 
-    // A carrier / Teams Direct Routing registrar that rejects with a Retry-After
+    // A registrar that rejects with a Retry-After
     // (RFC 3261 §20.33) is telling us exactly when to re-REGISTER — thread it
     // into the failure handler so it schedules the next attempt at that cooldown
     // instead of the local exponential backoff.

@@ -19,6 +19,7 @@ use super::*;
 use crate::b2bua::transfer::ReplacementOrigin;
 
 const TARGET_CALL_ID: &str = "b2b-target@192.0.2.1";
+const TARGET_BRANCH: &str = "z9hG4bK-target-invite";
 const NEW_PARTY_CALL_ID: &str = "new-party@192.0.2.30";
 const NORMAL_CLEARING: &str = "Q.850;cause=16;text=\"Normal Clearing\"";
 
@@ -64,12 +65,13 @@ fn assert_the_ack_releases_one_bye(call: &Call, relayed: &SipMessage) {
 }
 
 /// A transfer target dialled on the call, the way the REFER path dials it.
-fn add_transfer_target(call: &Call) -> usize {
+/// Returns the Via branch of its INVITE, which is what names it from then on.
+fn add_transfer_target(call: &Call) -> &'static str {
     let mut leg = Leg::new_b_leg(
         TARGET_CALL_ID.to_string(),
         "sb-target-leg".to_string(),
         "sip:15550100077@198.51.100.88:5060".to_string(),
-        "z9hG4bK-target-invite".to_string(),
+        TARGET_BRANCH.to_string(),
         LegTransport {
             remote_addr: target(),
             connection_id: ConnectionId::default(),
@@ -81,11 +83,7 @@ fn add_transfer_target(call: &Call) -> usize {
     leg.dialog.local_from_uri = Some("<sip:15550100001@192.0.2.1>;tag=sb-target-leg".to_string());
     leg.dialog.remote_to_uri = Some("<sip:15550100077@198.51.100.88>".to_string());
     assert!(call.state.call_actors.add_b_leg(&call.call_id, leg));
-    call.state
-        .call_actors
-        .get_call(&call.call_id)
-        .map(|call| call.b_legs.len() - 1)
-        .expect("the call exists")
+    TARGET_BRANCH
 }
 
 /// The notifier subscription a siphon-terminated transfer records.
@@ -99,7 +97,11 @@ fn subscribe(call: &Call, referrer_on_a_leg: bool, origin: ReplacementOrigin, re
             event_id: 2,
             notify_cseq: 2,
             state: crate::b2bua::transfer::TransferState::Trying,
-            target_leg_call_id: Some(TARGET_CALL_ID.to_string()),
+            targets: vec![crate::b2bua::actor::ReplacementTarget::ringing(
+                TARGET_BRANCH.to_string(),
+                TARGET_CALL_ID.to_string(),
+                None,
+            )],
             referrer_gone,
             deadline: None,
             media_profile: None,
@@ -120,7 +122,7 @@ fn target_answer() -> SipMessage {
     let raw = format!(
         concat!(
             "SIP/2.0 200 OK\r\n",
-            "Via: SIP/2.0/UDP 192.0.2.1:5060;branch=z9hG4bK-target-invite\r\n",
+            "Via: SIP/2.0/UDP 192.0.2.1:5060;branch={branch}\r\n",
             "From: <sip:15550100001@192.0.2.1>;tag=sb-target-leg\r\n",
             "To: <sip:15550100077@198.51.100.88>;tag=target-tag\r\n",
             "Call-ID: {call_id}\r\n",
@@ -131,6 +133,7 @@ fn target_answer() -> SipMessage {
             "\r\n",
             "{sdp}",
         ),
+        branch = TARGET_BRANCH,
         call_id = TARGET_CALL_ID,
         length = sdp.len(),
         sdp = sdp,
@@ -145,10 +148,16 @@ async fn a_replaced_party_that_has_not_acked_is_sent_its_bye_after_its_ack() {
     let call = Call::bridged();
     call.callee_answers("");
     let relayed = relayed_answer(&call);
-    let target_index = add_transfer_target(&call);
+    let target_branch = add_transfer_target(&call);
     subscribe(&call, true, ReplacementOrigin::SiphonInitiated, false);
 
-    b2bua_complete_terminated_transfer(&call.call_id, target_index, &target_answer(), &call.state);
+    b2bua_complete_terminated_transfer(
+        &call.call_id,
+        target_branch,
+        &target_answer(),
+        target(),
+        &call.state,
+    );
     let sent = call.wire();
     assert!(
         sent.iter()
@@ -171,10 +180,16 @@ async fn a_referrer_bye_released_by_its_notify_still_waits_for_the_ack() {
     let call = Call::bridged();
     call.callee_answers("");
     let relayed = relayed_answer(&call);
-    let target_index = add_transfer_target(&call);
+    let target_branch = add_transfer_target(&call);
     subscribe(&call, true, ReplacementOrigin::Refer, false);
 
-    b2bua_complete_terminated_transfer(&call.call_id, target_index, &target_answer(), &call.state);
+    b2bua_complete_terminated_transfer(
+        &call.call_id,
+        target_branch,
+        &target_answer(),
+        target(),
+        &call.state,
+    );
     let sent = call.wire();
     let notify = sent
         .iter()
@@ -203,10 +218,10 @@ async fn the_survivor_of_a_failed_transfer_is_sent_its_bye_after_its_ack() {
     let call = Call::bridged();
     call.callee_answers("");
     let relayed = relayed_answer(&call);
-    let target_index = add_transfer_target(&call);
+    let target_branch = add_transfer_target(&call);
     subscribe(&call, false, ReplacementOrigin::Refer, true);
 
-    b2bua_fail_terminated_transfer(&call.call_id, target_index, 486, &call.state);
+    b2bua_fail_terminated_transfer(&call.call_id, target_branch, 486, &call.state);
     let sent = call.wire();
     assert!(
         byes_to(&sent, caller()).is_empty(),

@@ -300,6 +300,8 @@ async fn a_second_bridge_dial_or_a_bridged_caller_is_refused() {
             media_from_tag: None,
             media_profile: None,
             media_peer_profile: None,
+            media_anchor_ingress: None,
+            media_peer_ingress: None,
             media_pending_adoption: false,
             last_local_offer: Vec::new(),
             release_reason: None,
@@ -339,6 +341,7 @@ async fn a_bridge_dial_presents_the_dials_identity_to_each_phone() {
                 format!("sip:bd3308@{DESK}"),
                 {
                     "uri": format!("sip:bd3309@{TRUNK}"),
+                    "to": "sip:15550100199@trunk.example.com",
                     "from": "sip:5550199@siphon.example.com",
                     "privacy": "restricted",
                     "headers": { "X-Queue": "overflow" },
@@ -391,9 +394,94 @@ async fn a_bridge_dial_presents_the_dials_identity_to_each_phone() {
         Some("overflow"),
         "the target's header over the dial's"
     );
+    assert_eq!(
+        trunk.headers.to().map(String::as_str),
+        Some("<sip:15550100199@trunk.example.com>"),
+        "a target's own called party is its leg's To"
+    );
     assert!(
         !desk_from.contains("Caller One"),
         "the caller's display name is not carried beside another identity"
+    );
+}
+
+/// A `to` on an `{aor}` target is the called party of every contact the AoR
+/// forks to, over the AoR the leg would otherwise be addressed to.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_aor_targets_to_is_each_contacts_called_party() {
+    const DESK: &str = "198.51.100.210:5060";
+    let aor = "sip:bd3310@siphon.example.com";
+    register(aor, &format!("sip:bd3310@{DESK}"), 1.0);
+    let engine = NativeTestEngine::start().await;
+    let dispatcher = bridging_dispatcher(&engine);
+    let caller = answered_caller(&dispatcher, "aor-to@192.0.2.10");
+    let controller = controller_owning("aor-to", dispatcher, &caller, "aor-to", "hangup");
+    let (reply, _) = dial(
+        &controller,
+        "aor-to",
+        serde_json::json!({
+            "on_answer": "bridge",
+            "targets": [{ "aor": aor, "to": "sip:15550100199@siphon.example.com" }],
+        }),
+    )
+    .await;
+    assert_eq!(reply["status"], "ok", "{reply}");
+    let desk = requests_to(
+        &drain(&controller.dispatcher.udp),
+        socket(DESK),
+        Method::Invite,
+    )
+    .remove(0)
+    .message;
+    assert_eq!(
+        desk.headers.to().map(String::as_str),
+        Some("<sip:15550100199@siphon.example.com>")
+    );
+}
+
+/// An `{aor}` target presents its own identity to each contact it forks to,
+/// over the dial's: the AoR form used to drop it and show the dial's.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_aor_targets_own_identity_is_what_its_contacts_are_shown() {
+    const DESK: &str = "198.51.100.211:5060";
+    let aor = "sip:bd3311@siphon.example.com";
+    register(aor, &format!("sip:bd3311@{DESK}"), 1.0);
+    let engine = NativeTestEngine::start().await;
+    let dispatcher = bridging_dispatcher(&engine);
+    let caller = answered_caller(&dispatcher, "aor-identity@192.0.2.10");
+    let controller = controller_owning(
+        "aor-identity",
+        dispatcher,
+        &caller,
+        "aor-identity",
+        "hangup",
+    );
+    let (reply, _) = dial(
+        &controller,
+        "aor-identity",
+        serde_json::json!({
+            "on_answer": "bridge",
+            "from": "sip:5550100@siphon.example.com",
+            "targets": [{
+                "aor": aor,
+                "from": "sip:5550199@siphon.example.com",
+                "from_display": "Overflow",
+            }],
+        }),
+    )
+    .await;
+    assert_eq!(reply["status"], "ok", "{reply}");
+    let desk = requests_to(
+        &drain(&controller.dispatcher.udp),
+        socket(DESK),
+        Method::Invite,
+    )
+    .remove(0)
+    .message;
+    let from = desk.headers.from().expect("a From");
+    assert!(
+        from.starts_with("\"Overflow\" <sip:5550199@siphon.example.com>"),
+        "the target's identity, not the dial's: {from}"
     );
 }
 

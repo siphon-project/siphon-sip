@@ -111,6 +111,10 @@ pub fn b2bua_forward_indialog_request(
             );
             let response =
                 build_response(message, code, reason, state.server_header.as_deref(), &[]);
+            // A REFER's final response is kept for its retransmissions.
+            if method == Method::Refer {
+                remember_refer_response(&response, state);
+            }
             send_message_from(
                 response,
                 inbound.transport,

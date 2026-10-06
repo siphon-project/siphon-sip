@@ -29,9 +29,16 @@ use super::request::PyRequest;
 
 mod answer;
 mod decorators;
+mod message;
+mod repeat;
 
 use answer::AnswerExchange;
 use decorators::event_decorator;
+use message::{
+    dialog_ids, extract_answer_params, extract_delete_params, extract_offer_params, extract_tag,
+    lock_message,
+};
+pub(super) use message::{extract_sdp_body, replace_body};
 
 /// Python-visible RTPEngine namespace.
 ///
@@ -555,6 +562,22 @@ impl PyRtpEngine {
     /// Extracts SDP from the object body, sends it to RTPEngine, and replaces
     /// the body with the rewritten SDP. Returns True on success.
     ///
+    /// The profile's two halves describe the two parties of the call, not the
+    /// two commands: the ``offer`` half is what the callee is sent and the
+    /// ``answer`` half what the caller is sent. On the call's first INVITE the
+    /// rewritten offer goes to the callee, so it is shaped by the ``offer``
+    /// half, and ``received_from`` (the request's source address) is applied
+    /// when that half asks for it, since the SDP is the caller's.
+    ///
+    /// On a call this process has already anchored the command is a re-offer (a
+    /// re-INVITE or an UPDATE) and follows whoever sent it. From the caller it
+    /// is as above. From the callee the rewritten offer goes to the caller, so
+    /// it is shaped by the ``answer`` half, and the callee is pinned to the
+    /// request's source when the ``answer`` half asks for it: the half the
+    /// callee was set up under. Pass the same ``profile=`` as on the first
+    /// offer and each party keeps the transport, direction and
+    /// ``received_from`` policy it started with, whoever re-offers.
+    ///
     /// Args:
     ///     request: A Request or Call object containing the INVITE with SDP.
     ///     profile: RTP profile name (default: "rtp_passthrough").
@@ -608,10 +631,31 @@ impl PyRtpEngine {
                 self.registry.profile_names().join(", ")
             ))
         })?;
-        let flags = entry.offer.clone();
-
         let message = extract_message(request)?;
         let (call_id, from_tag, sdp) = extract_offer_params(&message)?;
+        let anchored = self.sessions.get(&call_id);
+        // Shaped for the party the rewritten offer is sent to: the callee of
+        // the call under the `offer` half, and on a re-offer from the callee
+        // the caller, under the `answer` half that has described it since the
+        // call was set up.
+        let mut flags = match answer::shaping_half(
+            anchored.as_ref(),
+            &from_tag,
+            crate::rtpengine::session::ProfileHalf::Offer,
+        ) {
+            crate::rtpengine::session::ProfileHalf::Offer => entry.offer.clone(),
+            crate::rtpengine::session::ProfileHalf::Answer => entry.answer.clone(),
+        };
+        // The offer is the sending party's SDP, so that party's own policy
+        // decides whether it is pinned to the request's source, whichever
+        // half shapes this command.
+        flags.carry_received_from = answer::party_pins_ingress(
+            anchored.as_ref(),
+            &from_tag,
+            entry,
+            &self.registry,
+            crate::rtpengine::session::ProfileHalf::Offer,
+        );
 
         // Resolve + template the bridge URI, then finalise the flags. Both run
         // before the async block so a bad template or an unhonourable flag
@@ -752,6 +796,22 @@ impl PyRtpEngine {
     /// answer from the ACK itself, so a script calls ``answer`` the same way for
     /// both.
     ///
+    /// Whose SDP, and for whom. The SDP in a reply is the replying party's, and
+    /// the rewritten SDP goes to the other party:
+    ///
+    /// * The callee replies (the 2xx or an 18x to the INVITE, or a delayed
+    ///   offer). The result goes to the caller, shaped by the profile's
+    ///   ``answer`` half.
+    /// * The caller replies to a re-INVITE or an UPDATE from the callee. The
+    ///   result goes to the callee, shaped by the ``offer`` half, which is what
+    ///   the callee has been sent since the call was set up. The tags recorded
+    ///   for the two parties are not changed by it.
+    ///
+    /// ``received_from`` is stamped with the address the reply arrived from,
+    /// never the address of the ``call=`` object, which is the other party's.
+    /// Whether it is stamped is the replying party's own policy: the
+    /// ``answer`` half's for the callee, the ``offer`` half's for the caller.
+    ///
     /// Args:
     ///     reply: A Reply or Call object containing the 200 OK with SDP.
     ///     profile: RTP profile name. When omitted, the profile recorded by
@@ -827,7 +887,11 @@ impl PyRtpEngine {
         } else {
             &entry.answer
         };
-        let flags = side.clone();
+        let flags = exchange.command_flags(
+            entry,
+            &self.registry,
+            self.sessions.get(&exchange.call_id).as_ref(),
+        );
 
         // The bridge belongs to the offerer's leg, so template against the A-leg
         // identifiers resolved above — not the reply's own tags.
@@ -1169,7 +1233,9 @@ impl PyRtpEngine {
     ///     gain_decibels: Playout gain in whole decibels relative to the
     ///           source's own level, clamped engine-side to −60..=+12. Native
     ///           **siphon-rtp** backend only.
-    ///     repeat: Number of times to repeat the prompt (default: 1).
+    ///     repeat: Total number of times to play the prompt (default: once), or
+    ///           ``"inf"`` to play until stopped (native **siphon-rtp** backend
+    ///           only, and only with ``wait=False``).
     ///     start_ms: Offset into the file at which to start (milliseconds).
     ///     duration_ms: Cap on playback length (milliseconds).
     ///     to_tag: Optional peer tag for MPTY scoping.
@@ -1197,7 +1263,7 @@ impl PyRtpEngine {
         db_id: Option<u64>,
         tone: Option<String>,
         url: Option<String>,
-        repeat: Option<u64>,
+        repeat: Option<Bound<'py, PyAny>>,
         start_ms: Option<u64>,
         duration_ms: Option<u64>,
         gain_decibels: Option<i32>,
@@ -1205,6 +1271,8 @@ impl PyRtpEngine {
         wait: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
         let source = resolve_play_media_source(file, blob, db_id, tone, url)?;
+        let repeat = repeat::parse_repeat(repeat.as_ref())?;
+        repeat::refuse_endless_wait(repeat, wait)?;
 
         let (call_id, from_tag) = resolve_call_from_tag(target)?;
 
@@ -1259,7 +1327,7 @@ impl PyRtpEngine {
     /// audio; there is no ``wait``). Native **siphon-rtp** backend only.
     ///
     /// ```python,ignore
-    /// bed = await rtpengine.play_overlay(call, file="/prompts/hold.wav", repeat=0)
+    /// bed = await rtpengine.play_overlay(call, file="/prompts/hold.wav", repeat="inf")
     /// await rtpengine.play_media(call, file="/prompts/agent.wav")
     /// await rtpengine.set_play_gain(call, bed, -18)   # duck the bed
     /// await rtpengine.stop_media(call, play_id=bed)
@@ -1269,7 +1337,7 @@ impl PyRtpEngine {
     ///     target: Request, Reply, or Call object.
     ///     file / blob / db_id / tone / url: exactly one, as for
     ///         :meth:`play_media`.
-    ///     repeat: Number of times to repeat.
+    ///     repeat: Total number of times to play, or ``"inf"`` until stopped.
     ///     start_ms: Offset into the source at which to start.
     ///     duration_ms: Hard playout cap — the only bound, short of a stop, on
     ///         an endless (``*inf``) tone.
@@ -1291,13 +1359,14 @@ impl PyRtpEngine {
         db_id: Option<u64>,
         tone: Option<String>,
         url: Option<String>,
-        repeat: Option<u64>,
+        repeat: Option<Bound<'py, PyAny>>,
         start_ms: Option<u64>,
         duration_ms: Option<u64>,
         gain_decibels: Option<i32>,
         to_tag: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let source = resolve_play_media_source(file, blob, db_id, tone, url)?;
+        let repeat = repeat::parse_repeat(repeat.as_ref())?;
 
         let (call_id, from_tag) = resolve_call_from_tag(target)?;
 
@@ -2448,167 +2517,6 @@ impl PyRtpEngine {
 }
 
 // ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-fn lock_message(
-    message: &Arc<Mutex<SipMessage>>,
-) -> PyResult<std::sync::MutexGuard<'_, SipMessage>> {
-    message.lock().map_err(|error| {
-        pyo3::exceptions::PyRuntimeError::new_err(format!("lock poisoned: {error}"))
-    })
-}
-
-/// Extract the SDP body from a SIP message, handling multipart bodies.
-///
-/// If the Content-Type is a `multipart/*`, extracts the `application/sdp` part
-/// from it (RFC 5621 §3). Otherwise returns the raw body as-is.
-pub(super) fn extract_sdp_body(message: &SipMessage) -> PyResult<Vec<u8>> {
-    let body = &message.body;
-    if body.is_empty() {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "message has no SDP body",
-        ));
-    }
-
-    let empty_string = String::new();
-    let content_type = message
-        .headers
-        .get("Content-Type")
-        .or_else(|| message.headers.get("c"))
-        .unwrap_or(&empty_string);
-
-    if crate::media::body::is_multipart(content_type) {
-        crate::media::body::sdp_from_body(content_type, body)
-            .map_err(pyo3::exceptions::PyValueError::new_err)
-    } else {
-        // Unchanged for every other body: handed over as-is, including one that
-        // arrived with no Content-Type at all.
-        Ok(body.clone())
-    }
-}
-
-/// Extract call-id, from-tag, and SDP body from a SIP message (offer direction).
-fn extract_offer_params(message: &Arc<Mutex<SipMessage>>) -> PyResult<(String, String, Vec<u8>)> {
-    let message = lock_message(message)?;
-    let (call_id, from_tag) = dialog_ids(&message)?;
-    let sdp = extract_sdp_body(&message)?;
-    Ok((call_id, from_tag, sdp))
-}
-
-/// The Call-ID and From-tag of a SIP message: what the engine keys a call and
-/// its offerer on.
-fn dialog_ids(message: &SipMessage) -> PyResult<(String, String)> {
-    let call_id = message
-        .headers
-        .get("Call-ID")
-        .or_else(|| message.headers.get("i"))
-        .map(|v| v.to_string())
-        .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("message missing Call-ID header"))?;
-
-    let from_raw = message
-        .headers
-        .get("From")
-        .or_else(|| message.headers.get("f"))
-        .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("message missing From header"))?;
-
-    let from_tag = extract_tag(from_raw).ok_or_else(|| {
-        pyo3::exceptions::PyValueError::new_err("From header missing tag parameter")
-    })?;
-
-    Ok((call_id, from_tag))
-}
-
-/// Extract call-id, from-tag, to-tag, and SDP body from a SIP message (answer direction).
-fn extract_answer_params(
-    message: &Arc<Mutex<SipMessage>>,
-) -> PyResult<(String, String, String, Vec<u8>)> {
-    let message = lock_message(message)?;
-
-    let call_id = message
-        .headers
-        .get("Call-ID")
-        .or_else(|| message.headers.get("i"))
-        .map(|v| v.to_string())
-        .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("message missing Call-ID header"))?;
-
-    let from_raw = message
-        .headers
-        .get("From")
-        .or_else(|| message.headers.get("f"))
-        .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("message missing From header"))?;
-
-    let from_tag = extract_tag(from_raw).ok_or_else(|| {
-        pyo3::exceptions::PyValueError::new_err("From header missing tag parameter")
-    })?;
-
-    let to_raw = message
-        .headers
-        .get("To")
-        .or_else(|| message.headers.get("t"))
-        .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("message missing To header"))?;
-
-    let to_tag = extract_tag(to_raw).ok_or_else(|| {
-        pyo3::exceptions::PyValueError::new_err("To header missing tag parameter")
-    })?;
-
-    let sdp = extract_sdp_body(&message)?;
-
-    Ok((call_id, from_tag, to_tag, sdp))
-}
-
-/// Extract call-id and from-tag from a SIP message (delete direction — no SDP required).
-fn extract_delete_params(message: &Arc<Mutex<SipMessage>>) -> PyResult<(String, String)> {
-    let message = lock_message(message)?;
-
-    let call_id = message
-        .headers
-        .get("Call-ID")
-        .or_else(|| message.headers.get("i"))
-        .map(|v| v.to_string())
-        .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("message missing Call-ID header"))?;
-
-    let from_raw = message
-        .headers
-        .get("From")
-        .or_else(|| message.headers.get("f"))
-        .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("message missing From header"))?;
-
-    let from_tag = extract_tag(from_raw).ok_or_else(|| {
-        pyo3::exceptions::PyValueError::new_err("From header missing tag parameter")
-    })?;
-
-    Ok((call_id, from_tag))
-}
-
-/// Extract the `tag=` parameter from a From/To header value.
-fn extract_tag(header_value: &str) -> Option<String> {
-    // Look for ";tag=" (case-insensitive).
-    let lower = header_value.to_lowercase();
-    let tag_start = lower.find(";tag=")?;
-    let value_start = tag_start + 5; // skip ";tag="
-    let rest = &header_value[value_start..];
-    // Tag ends at next ';', '>', or end of string.
-    let end = rest.find([';', '>']).unwrap_or(rest.len());
-    Some(rest[..end].to_string())
-}
-
-/// Replace the SIP message body with new SDP and update Content-Length.
-pub(super) fn replace_body(message: &Arc<Mutex<SipMessage>>, new_body: &[u8]) -> PyResult<()> {
-    let mut message = message.lock().map_err(|error| {
-        pyo3::exceptions::PyRuntimeError::new_err(format!("lock poisoned: {error}"))
-    })?;
-    message.body = new_body.to_vec();
-    message
-        .headers
-        .set("Content-Length", new_body.len().to_string());
-    message
-        .headers
-        .set("Content-Type", "application/sdp".to_string());
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -3343,16 +3251,16 @@ mod tests {
                                 let _ = sender.send(body);
                                 let result = match request.command {
                                     Command::Ping => CmdResult::Pong,
-                                    Command::Offer { .. } | Command::Answer { .. } => {
-                                        CmdResult::Ok {
-                                            sdp: Some(ENGINE_SDP.to_string()),
-                                            duration_ms: None,
-                                            to_tag: None,
-                                            stats: None,
-                                            play_id: None,
-                                            recording_id: None,
-                                        }
-                                    }
+                                    Command::Offer { .. }
+                                    | Command::Reoffer { .. }
+                                    | Command::Answer { .. } => CmdResult::Ok {
+                                        sdp: Some(ENGINE_SDP.to_string()),
+                                        duration_ms: None,
+                                        to_tag: None,
+                                        stats: None,
+                                        play_id: None,
+                                        recording_id: None,
+                                    },
                                     _ => CmdResult::Ok {
                                         sdp: None,
                                         duration_ms: None,
@@ -3777,6 +3685,219 @@ mod tests {
                 sessions.get("call-7").unwrap().to_tag.as_deref(),
                 Some("tag-b")
             );
+        }
+
+        /// Where the caller signals from, and the callee.
+        const CALLER_SOURCE: &str = "192.0.2.10";
+        const CALLEE_SOURCE: &str = "198.51.100.7";
+
+        /// `pins_caller` asks for the source hint on its `offer` half alone,
+        /// `pins_callee` on its `answer` half alone.
+        fn pinning_profiles() -> Arc<ProfileRegistry> {
+            let pair = |offer: bool, answer: bool| crate::config::MediaProfileConfig {
+                offer: crate::config::NgFlagsConfig {
+                    received_from: offer,
+                    ..Default::default()
+                },
+                answer: crate::config::NgFlagsConfig {
+                    received_from: answer,
+                    ..Default::default()
+                },
+            };
+            let mut custom = std::collections::HashMap::new();
+            custom.insert("pins_caller".to_string(), pair(true, false));
+            custom.insert("pins_callee".to_string(), pair(false, true));
+            Arc::new(ProfileRegistry::from_config(&custom))
+        }
+
+        /// The namespace on a stand-in native engine, with `session` stored.
+        async fn pinning_namespace(
+            session: MediaSession,
+        ) -> (PyRtpEngine, mpsc::UnboundedReceiver<serde_json::Value>) {
+            let (address, requests) = spawn_siphon_rtp_engine().await;
+            let (event_sender, _events) = mpsc::channel(16);
+            let set = crate::rtpengine::SiphonRtpClientSet::new(
+                vec![(address, 2_000, 1)],
+                None,
+                5_000,
+                event_sender,
+            )
+            .unwrap();
+            let sessions = Arc::new(MediaSessionStore::new());
+            sessions.insert(session);
+            let engine = PyRtpEngine::new(
+                Arc::new(MediaBackend::SiphonRtp(set)),
+                sessions,
+                pinning_profiles(),
+            );
+            (engine, requests)
+        }
+
+        async fn next_named(
+            requests: &mut mpsc::UnboundedReceiver<serde_json::Value>,
+            name: &str,
+        ) -> serde_json::Value {
+            loop {
+                let body = requests.recv().await.unwrap();
+                if body["command"] == name {
+                    return body;
+                }
+            }
+        }
+
+        /// The hint a command carried, as text.
+        fn hint(command: &serde_json::Value) -> Option<String> {
+            command["profile"]["received_from"]
+                .as_str()
+                .map(str::to_string)
+        }
+
+        /// `rtpengine.answer(reply, call=call)`: the SDP is the callee's, so
+        /// the hint is where the reply came from, when the callee's own half
+        /// asks for it. Never the address of the `call=` object, which is the
+        /// caller's, and not by the caller's half.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_reply_is_pinned_to_its_own_source_by_the_replying_partys_policy() {
+            Python::initialize();
+            for (profile, pinned) in [("pins_callee", true), ("pins_caller", false)] {
+                let (engine, mut requests) = pinning_namespace(MediaSession {
+                    profile: profile.to_string(),
+                    ..offered("call-11", "call-11", None)
+                })
+                .await;
+                with_engine(engine, |python, engine| {
+                    let invite = dialog_message("call-11", None, OFFER_SDP);
+                    let call = PyCall::new(
+                        "id-11".to_string(),
+                        Arc::clone(&invite),
+                        CALLER_SOURCE.to_string(),
+                        "udp".to_string(),
+                    );
+                    let reply = PyReply::new(dialog_message("call-11", Some("tag-b"), FAR_SDP))
+                        .with_a_leg(invite)
+                        .with_response_source(CALLEE_SOURCE.to_string(), 5060);
+                    let reply = Bound::new(python, reply).unwrap();
+                    let kwargs = PyDict::new(python);
+                    kwargs
+                        .set_item("call", Bound::new(python, call).unwrap())
+                        .unwrap();
+                    await_answer(python, engine, reply.as_any(), &kwargs).unwrap();
+                })
+                .await;
+
+                let answer = next_named(&mut requests, "answer").await;
+                assert_eq!(
+                    hint(&answer).as_deref(),
+                    pinned.then_some(CALLEE_SOURCE),
+                    "{profile}: {answer}"
+                );
+            }
+        }
+
+        /// A proxy script answers through the engine whatever 2xx carries SDP.
+        /// The caller's 2xx to a re-INVITE of the callee's names the callee
+        /// in its From and the caller in its To, so the replying party's tag
+        /// is the caller's. The session keeps naming each party as the first
+        /// exchange did: the caller's tag does not become the callee's, and a
+        /// later re-offer from either side still names its own sender.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn the_callers_answer_to_a_callee_reoffer_leaves_the_sessions_tags_alone() {
+            Python::initialize();
+            let (address, mut requests) = spawn_siphon_rtp_engine().await;
+            let (event_sender, _events) = mpsc::channel(16);
+            let set = crate::rtpengine::SiphonRtpClientSet::new(
+                vec![(address, 2_000, 1)],
+                None,
+                5_000,
+                event_sender,
+            )
+            .unwrap();
+            let sessions = Arc::new(MediaSessionStore::new());
+            sessions.insert(offered("call-13", "call-13", Some("tag-b")));
+            let engine = PyRtpEngine::new(
+                Arc::new(MediaBackend::SiphonRtp(set)),
+                Arc::clone(&sessions),
+                Arc::new(ProfileRegistry::new()),
+            );
+
+            with_engine(engine, |python, engine| {
+                let reply = dialog_message("call-13", Some("tag-a"), OFFER_SDP);
+                reply
+                    .lock()
+                    .unwrap()
+                    .headers
+                    .set("From", "<sip:bob@example.com>;tag=tag-b".to_string());
+                let reply =
+                    PyReply::new(reply).with_response_source(CALLER_SOURCE.to_string(), 5060);
+                let reply = Bound::new(python, reply).unwrap();
+                await_answer(python, engine, reply.as_any(), &PyDict::new(python)).unwrap();
+            })
+            .await;
+
+            let answer = next_named(&mut requests, "answer").await;
+            assert_eq!(answer["from_tag"], "tag-b", "the callee offered");
+            assert_eq!(answer["to_tag"], "tag-a", "the caller answers");
+            let session = sessions.get("call-13").expect("the session");
+            assert_eq!(session.from_tag, "tag-a", "the caller");
+            assert_eq!(session.to_tag.as_deref(), Some("tag-b"), "the callee");
+            assert_eq!(session.offer_tag(true), Some("tag-a"));
+            assert_eq!(
+                session.offer_tag(false),
+                Some("tag-b"),
+                "a re-offer from the callee is still the callee's"
+            );
+            assert_eq!(session.answer_tags(false), Some(("tag-b", "tag-a")));
+        }
+
+        /// `rtpengine.offer(request)` on a call already anchored is a re-offer.
+        /// From the callee it carries the callee's SDP: pinned to where the
+        /// request came from by the callee's own half, not by the `offer` half
+        /// the command is shaped by.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_reoffer_from_the_callee_is_pinned_by_the_callees_own_policy() {
+            Python::initialize();
+            for (profile, pinned) in [("pins_callee", true), ("pins_caller", false)] {
+                let (engine, mut requests) = pinning_namespace(MediaSession {
+                    profile: profile.to_string(),
+                    ..offered("call-12", "call-12", Some("tag-b"))
+                })
+                .await;
+                with_engine(engine, move |python, engine| {
+                    let reinvite = dialog_message("call-12", None, FAR_SDP);
+                    reinvite
+                        .lock()
+                        .unwrap()
+                        .headers
+                        .set("From", "<sip:bob@example.com>;tag=tag-b".to_string());
+                    let request = PyCall::new(
+                        "id-12".to_string(),
+                        reinvite,
+                        CALLEE_SOURCE.to_string(),
+                        "udp".to_string(),
+                    );
+                    let code = CString::new(format!(
+                        "async def run(engine, request):\n\
+                         \x20\x20\x20\x20return await engine.offer(request, profile='{profile}')\n",
+                    ))
+                    .unwrap();
+                    let globals = PyDict::new(python);
+                    python.run(code.as_c_str(), Some(&globals), None).unwrap();
+                    let run = globals.get_item("run").unwrap().unwrap();
+                    let coroutine = run
+                        .call1((engine, Bound::new(python, request).unwrap()))
+                        .unwrap();
+                    crate::script::engine::run_coroutine_value(python, &coroutine).unwrap();
+                })
+                .await;
+
+                let reoffer = next_named(&mut requests, "reoffer").await;
+                assert_eq!(reoffer["from_tag"], "tag-b", "the callee's own offer");
+                assert_eq!(
+                    hint(&reoffer).as_deref(),
+                    pinned.then_some(CALLEE_SOURCE),
+                    "{profile}: {reoffer}"
+                );
+            }
         }
     }
 }

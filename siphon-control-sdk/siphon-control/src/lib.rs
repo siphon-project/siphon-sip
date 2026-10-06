@@ -5,7 +5,7 @@
 //!
 //! # Two connection modes (both exposed here)
 //!
-//! - **Inbound-persistent** — [`ControlClient`]. The app dials siphon's
+//! - **Inbound-persistent** — `ControlClient`. The app dials siphon's
 //!   `/control/ws` and keeps one long-lived socket (does the `hello`
 //!   handshake). Simplest to reason about; ideal for development and
 //!   single-process controllers.
@@ -25,7 +25,7 @@
 //!       await client.run()
 //!   ```
 //!
-//! - **Per-call-connect** — [`ControlServer`]. *siphon dials the app* at
+//! - **Per-call-connect** — `ControlServer`. *siphon dials the app* at
 //!   handover, so the app is a WebSocket server; each accepted connection owns
 //!   exactly one call and the first frame is a pushed `StasisStart` (no `hello`
 //!   from the app side). This is the documented production default for
@@ -46,7 +46,7 @@
 //!       await server.serve()
 //!   ```
 //!
-//! Both modes reuse the SAME `@on_call` decorator and the SAME [`Call`] handle;
+//! Both modes reuse the SAME `@on_call` decorator and the SAME `Call` handle;
 //! only the transport differs (dial-out vs. be-dialed). The layering mirrors the
 //! Rust crate: `ControlClient.command(...)` is the generic `{module, verb,
 //! target, args}` primitive for any adapter, and the `on_call` decorator +
@@ -61,7 +61,7 @@
 //! interpreter, so an app that finishes without closing leaves them delivering
 //! results into an asyncio loop — and then a Python — that is no longer there.
 //!
-//! Not closing is handled rather than fatal: [`attach_if_running`] declines a
+//! Not closing is handled rather than fatal: `attach_if_running` declines a
 //! re-entry into a departed interpreter instead of panicking, a handover onto a
 //! closed loop is dropped rather than dispatched, and a handler cancelled during
 //! teardown is not reported as a failure. That is damage control; closing is the
@@ -233,6 +233,9 @@ struct ClientInner {
     handler: Mutex<Option<Py<PyAny>>>,
     /// The `@client.on_app_event` handler, for application-level events.
     app_handler: Mutex<Option<Py<PyAny>>>,
+    /// Set by `close()`: nothing more is handed to a handler. See
+    /// [`UnlessClosed`].
+    closed: Arc<AtomicBool>,
 }
 
 /// The control client. Construct it, register a handler with `@client.on_call`,
@@ -265,6 +268,7 @@ impl ControlClient {
                 client: tokio::sync::Mutex::new(None),
                 handler: Mutex::new(None),
                 app_handler: Mutex::new(None),
+                closed: Arc::new(AtomicBool::new(false)),
             }),
         }
     }
@@ -505,13 +509,17 @@ impl ControlClient {
         let app_handler = lock(&self.inner.app_handler)
             .as_ref()
             .map(|h| h.clone_ref(py));
+        // Running is what opens a client: one run again after a `close()`
+        // dispatches again.
+        let closed = Arc::clone(&self.inner.closed);
+        closed.store(false, Ordering::SeqCst);
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let client = ensure_client(&inner).await?;
             if let Some(app_handler) = app_handler {
-                install_app_event_bridge(&client, app_handler, locals.clone());
+                install_app_event_bridge(&client, app_handler, locals.clone(), closed.clone());
             }
             if let Some(handler) = handler {
-                install_handler_bridge(&client, handler, locals);
+                install_handler_bridge(&client, handler, locals, closed);
             }
             client.run().await.map_err(to_pyerr)?;
             Ok(())
@@ -539,10 +547,12 @@ impl ControlClient {
     /// them is damage control — closing first means there is nothing in flight
     /// to decline.
     fn close(&self) {
+        // First, and on the thread the handlers run on: from here on nothing is
+        // handed to one, not a call handed over between the shutdown and the
+        // socket actually closing, and not one already on its way to the event
+        // loop when this was called (see `UnlessClosed`).
+        self.inner.closed.store(true, Ordering::SeqCst);
         self.shutdown();
-        // Drop the handler reference as well: a call handed over between the
-        // shutdown and the socket actually closing would otherwise still be
-        // dispatched into an app that has said it is done.
         *lock(&self.inner.handler) = None;
         *lock(&self.inner.app_handler) = None;
     }
@@ -589,13 +599,19 @@ async fn ensure_client(inner: &Arc<ClientInner>) -> PyResult<Arc<SipClient>> {
 /// Bridge the Rust call handler to the stored Python coroutine function: for each
 /// handed-over call, build a `Call` pyobject, invoke the handler, and drive the
 /// returned coroutine on the asyncio loop captured in `locals`.
-fn install_handler_bridge(client: &SipClient, handler: Py<PyAny>, locals: TaskLocals) {
+fn install_handler_bridge(
+    client: &SipClient,
+    handler: Py<PyAny>,
+    locals: TaskLocals,
+    closed: Arc<AtomicBool>,
+) {
     client.set_call_handler(move |call: RustCall| {
         // Runs on a detached `tokio::spawn` from `SipFacade::dispatch`, so it
         // can wake after the interpreter has gone — clone the handler through
         // the lifecycle guard rather than `Python::attach` directly.
         let handler = attach_if_running(|py| handler.clone_ref(py));
         let locals = locals.clone();
+        let closed = closed.clone();
         async move {
             // `None` = Python is on its way out. Drop the call: there is nobody
             // left to hand it to and the process is not going to place it
@@ -603,7 +619,7 @@ fn install_handler_bridge(client: &SipClient, handler: Py<PyAny>, locals: TaskLo
             // path is that a finished app exits quietly, and this crate has no
             // logger of its own to say it through.
             if let Some(handler) = handler {
-                dispatch_to_python(handler, locals, call).await;
+                dispatch_to_python(handler, locals, call, closed).await;
             }
             Ok(())
         }
@@ -613,17 +629,89 @@ fn install_handler_bridge(client: &SipClient, handler: Py<PyAny>, locals: TaskLo
 /// Bridge application-level events to the stored Python handler: each one is
 /// handed over as `handler(event, payload)` on the asyncio loop captured in
 /// `locals`, off the client's receive path.
-fn install_app_event_bridge(client: &SipClient, handler: Py<PyAny>, locals: TaskLocals) {
+fn install_app_event_bridge(
+    client: &SipClient,
+    handler: Py<PyAny>,
+    locals: TaskLocals,
+    closed: Arc<AtomicBool>,
+) {
     client.set_app_event_handler(move |event: AppEvent| {
         let Some(handler) = attach_if_running(|py| handler.clone_ref(py)) else {
             return;
         };
         let locals = locals.clone();
-        tokio::spawn(dispatch_app_event(handler, locals, event));
+        tokio::spawn(dispatch_app_event(handler, locals, event, closed.clone()));
     });
 }
 
-async fn dispatch_app_event(handler: Py<PyAny>, locals: TaskLocals, event: AppEvent) {
+/// What a handler returned, awaited on the event loop unless its client or
+/// server was closed first.
+///
+/// A handler is called on a worker thread and what it returns is handed to the
+/// event loop to run, so a `close()` on the loop's own thread can land between
+/// the two: the coroutine is already on its way, and without this its body
+/// would still run in an application that has said it is done. `__await__` runs
+/// on the loop, as the first thing the task does, so reading the flag there
+/// cannot race a `close()` on the same thread.
+#[pyclass(frozen)]
+struct UnlessClosed {
+    awaitable: Py<PyAny>,
+    closed: Arc<AtomicBool>,
+}
+
+#[pymethods]
+impl UnlessClosed {
+    fn __await__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let awaitable = self.awaitable.bind(py);
+        if !self.closed.load(Ordering::SeqCst) {
+            return awaitable.call_method0("__await__");
+        }
+        // Never started. Closing a coroutine says so, where dropping it would
+        // have Python warn that it was never awaited.
+        if awaitable.hasattr("close")? {
+            awaitable.call_method0("close")?;
+        }
+        // An iterator with nothing in it: awaiting this completes at once.
+        Ok(pyo3::types::PyTuple::empty(py).try_iter()?.into_any())
+    }
+}
+
+/// Call `handler` and turn what it returns into a future, unless `closed` is
+/// set. `Ok(None)` when there is nothing to await: the handler was not called,
+/// or it was not a coroutine function.
+fn call_handler<'py>(
+    py: Python<'py>,
+    handler: &Py<PyAny>,
+    arguments: Bound<'py, pyo3::types::PyTuple>,
+    closed: &Arc<AtomicBool>,
+) -> PyResult<Option<impl std::future::Future<Output = PyResult<Py<PyAny>>> + Send>> {
+    // Read with the interpreter attached, as `close()` writes it: a handler
+    // that is not a coroutine function runs right here.
+    if closed.load(Ordering::SeqCst) {
+        return Ok(None);
+    }
+    let result = handler.bind(py).call1(arguments)?;
+    if !result.hasattr("__await__")? {
+        return Ok(None);
+    }
+    let guarded = Bound::new(
+        py,
+        UnlessClosed {
+            awaitable: result.unbind(),
+            closed: Arc::clone(closed),
+        },
+    )?;
+    Ok(Some(pyo3_async_runtimes::tokio::into_future(
+        guarded.into_any(),
+    )?))
+}
+
+async fn dispatch_app_event(
+    handler: Py<PyAny>,
+    locals: TaskLocals,
+    event: AppEvent,
+    closed: Arc<AtomicBool>,
+) {
     // A closed loop cannot run the handler; see `dispatch_to_python`.
     let loop_usable = attach_if_running(|py| {
         locals
@@ -641,12 +729,7 @@ async fn dispatch_app_event(handler: Py<PyAny>, locals: TaskLocals, event: AppEv
     let scoped = pyo3_async_runtimes::tokio::scope(locals, async move {
         let awaitable = attach_if_running(|py| -> PyResult<Option<_>> {
             let py_payload = json_to_py(py, &payload)?;
-            let result = handler.bind(py).call1((name, py_payload))?;
-            if result.hasattr("__await__")? {
-                Ok(Some(pyo3_async_runtimes::tokio::into_future(result)?))
-            } else {
-                Ok(None)
-            }
+            call_handler(py, &handler, (name, py_payload).into_pyobject(py)?, &closed)
         })?;
         Some(match awaitable {
             Ok(Some(future)) => future.await.map(|_| ()),
@@ -664,7 +747,12 @@ async fn dispatch_app_event(handler: Py<PyAny>, locals: TaskLocals, event: AppEv
     }
 }
 
-async fn dispatch_to_python(handler: Py<PyAny>, locals: TaskLocals, call: RustCall) {
+async fn dispatch_to_python(
+    handler: Py<PyAny>,
+    locals: TaskLocals,
+    call: RustCall,
+    closed: Arc<AtomicBool>,
+) {
     // The asyncio loop captured when `run()` was called can be closed while the
     // client is still live — an app that finished without closing, which is the
     // shape that produced this bug report. Dispatching onto a closed loop does
@@ -691,12 +779,7 @@ async fn dispatch_to_python(handler: Py<PyAny>, locals: TaskLocals, call: RustCa
     let scoped = pyo3_async_runtimes::tokio::scope(locals, async move {
         let awaitable = attach_if_running(|py| -> PyResult<Option<_>> {
             let py_call = Bound::new(py, Call { inner: call })?;
-            let result = handler.bind(py).call1((py_call,))?;
-            if result.hasattr("__await__")? {
-                Ok(Some(pyo3_async_runtimes::tokio::into_future(result)?))
-            } else {
-                Ok(None)
-            }
+            call_handler(py, &handler, (py_call,).into_pyobject(py)?, &closed)
         })?;
         Some(match awaitable {
             Ok(Some(future)) => future.await.map(|_| ()),
@@ -736,6 +819,8 @@ struct ServerInner {
     server: tokio::sync::Mutex<Option<Arc<SipServer>>>,
     handler: Mutex<Option<Py<PyAny>>>,
     local_addr: Mutex<Option<String>>,
+    /// Set by `close()`: no further call is handed to the handler.
+    closed: Arc<AtomicBool>,
 }
 
 /// The per-call-connect control server: **siphon dials the app**, so this is a
@@ -769,6 +854,7 @@ impl ControlServer {
                 server: tokio::sync::Mutex::new(None),
                 handler: Mutex::new(None),
                 local_addr: Mutex::new(None),
+                closed: Arc::new(AtomicBool::new(false)),
             }),
         })
     }
@@ -811,10 +897,12 @@ impl ControlServer {
     }
 
     /// Drop the registered handler, so no further accepted call is dispatched
-    /// into Python. Same reasoning as [`ControlClient::close`]: close before
-    /// the interpreter goes away rather than leaving dispatches in flight for
-    /// the lifecycle guard to decline.
+    /// into Python, one accepted while `serve()` is still running included.
+    /// Same reasoning as [`ControlClient::close`]: close before the
+    /// interpreter goes away rather than leaving dispatches in flight for the
+    /// lifecycle guard to decline.
     fn close(&self) {
+        self.inner.closed.store(true, Ordering::SeqCst);
         *lock(&self.inner.handler) = None;
     }
 
@@ -843,10 +931,14 @@ impl ControlServer {
         // the handler bridge can drive Python coroutines from Rust.
         let locals = pyo3_async_runtimes::tokio::get_current_locals(py)?;
         let handler = lock(&self.inner.handler).as_ref().map(|h| h.clone_ref(py));
+        // Serving is what opens a server: one served again after a `close()`
+        // dispatches again.
+        let closed = Arc::clone(&self.inner.closed);
+        closed.store(false, Ordering::SeqCst);
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let server = ensure_server(&inner).await?;
             if let Some(handler) = handler {
-                install_server_handler_bridge(&server, handler, locals);
+                install_server_handler_bridge(&server, handler, locals, closed);
             }
             server.run().await.map_err(to_pyerr)?;
             Ok(())
@@ -873,15 +965,21 @@ async fn ensure_server(inner: &Arc<ServerInner>) -> PyResult<Arc<SipServer>> {
 
 /// Bridge the stored Python handler to the SIP server, reusing the same
 /// per-call dispatch as the inbound client (identical `Call` + coroutine drive).
-fn install_server_handler_bridge(server: &SipServer, handler: Py<PyAny>, locals: TaskLocals) {
+fn install_server_handler_bridge(
+    server: &SipServer,
+    handler: Py<PyAny>,
+    locals: TaskLocals,
+    closed: Arc<AtomicBool>,
+) {
     server.set_call_handler(move |call: RustCall| {
         // Same detached-task lifetime as the client bridge above — guard the
         // attach for the same reason.
         let handler = attach_if_running(|py| handler.clone_ref(py));
         let locals = locals.clone();
+        let closed = closed.clone();
         async move {
             if let Some(handler) = handler {
-                dispatch_to_python(handler, locals, call).await;
+                dispatch_to_python(handler, locals, call, closed).await;
             }
             Ok(())
         }

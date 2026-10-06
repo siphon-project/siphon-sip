@@ -16,11 +16,15 @@ use crate::sip::message::SipMessage;
 
 use super::*;
 
+mod cancelled;
+pub use cancelled::{ZombieCancelledLeg, CANCELLED_BRANCH_LIFETIME};
+mod by_branch;
 mod dial_branch;
 mod dialog_watch;
 mod failure;
 pub use failure::FailureConclusion;
 mod fork;
+mod replacement;
 mod route_progress;
 mod session_timer;
 
@@ -62,6 +66,8 @@ pub struct CallActorStore {
     /// Post-CANCEL glare absorber (RFC 3261 §9.1): a 2xx that raced our CANCEL
     /// is ACKed + BYEd here, keyed by B-leg SIP Call-ID.
     pub zombie_cancelled: DashMap<String, ZombieCancelledLeg>,
+    /// How many of those are still owed their CANCEL. See [`cancelled`].
+    pub(super) deferred_cancels: std::sync::atomic::AtomicUsize,
     /// SIP Call-IDs of calls this node has torn down → when they were torn down,
     /// so a late in-dialog request naming one can be answered 481 instead of
     /// dropped ([`Self::is_recently_terminated`]). Read on the request path, so
@@ -82,6 +88,7 @@ impl CallActorStore {
             calls: DashMap::new(),
             registry: LegRegistry::new(),
             zombie_cancelled: DashMap::new(),
+            deferred_cancels: std::sync::atomic::AtomicUsize::new(0),
             terminated: DashMap::new(),
             terminated_order: Mutex::new(VecDeque::new()),
         }
@@ -229,40 +236,48 @@ impl CallActorStore {
         };
         match old_branch {
             Some(old) => {
-                if old != new_branch {
-                    self.registry.remove_branch(&old);
-                }
-                self.registry.register_branch(&new_branch, call_id);
+                self.repoint_branch(call_id, &old, &new_branch);
                 true
             }
             None => false,
         }
     }
 
-    /// Remove a B-leg by index.
+    /// Remove a B-leg by index. Only for a caller whose index cannot have gone
+    /// stale; a response handler uses
+    /// [`remove_b_leg_on`](Self::remove_b_leg_on).
     pub fn remove_b_leg(&self, call_id: &str, index: usize) {
         let mut ended = Vec::new();
         if let Some(mut call) = self.calls.get_mut(call_id) {
-            if let Some(removed) = call.remove_b_leg(index) {
-                // A leg that leaves the call ends its dialog here, whatever
-                // state it was reported in.
-                ended = call.end_orphaned_dialogs();
-                self.registry.remove_branch(&removed.branch);
-                // Only remove Call-ID mapping if no other leg uses it.
-                // Re-INVITE tracking legs share the A-leg or winning B-leg
-                // Call-ID; removing it here would break BYE/in-dialog routing.
-                let cid = &removed.dialog.call_id;
-                let still_used = call.a_leg.dialog.call_id == *cid
-                    || call.b_legs.iter().any(|b| b.dialog.call_id == *cid);
-                if !still_used {
-                    self.registry.remove_call_id(cid);
-                }
-            }
+            ended = self.remove_b_leg_of(&mut call, index);
         }
         publish_dialog_states(ended);
     }
 
-    /// Update the target_uri of a B-leg (used to mark re-INVITE entries as done).
+    /// [`remove_b_leg`](Self::remove_b_leg) on a call already held, handing
+    /// back the dialogs that ended for the caller to publish once it lets go.
+    fn remove_b_leg_of(&self, call: &mut CallActor, index: usize) -> Vec<DialogWatch> {
+        let Some(removed) = call.remove_b_leg(index) else {
+            return Vec::new();
+        };
+        // A leg that leaves the call ends its dialog here, whatever state it
+        // was reported in.
+        let ended = call.end_orphaned_dialogs();
+        self.registry.remove_branch(&removed.branch);
+        // Only remove Call-ID mapping if no other leg uses it. Re-INVITE
+        // tracking legs share the A-leg or winning B-leg Call-ID; removing it
+        // here would break BYE/in-dialog routing.
+        let cid = &removed.dialog.call_id;
+        let still_used = call.a_leg.dialog.call_id == *cid
+            || call.b_legs.iter().any(|b| b.dialog.call_id == *cid);
+        if !still_used {
+            self.registry.remove_call_id(cid);
+        }
+        ended
+    }
+
+    /// Update the target_uri of the B-leg at `index`. A response handler marks
+    /// its tracking leg done by Via branch instead (`update_b_leg_on`).
     pub fn set_b_leg_target_uri(&self, call_id: &str, index: usize, target_uri: String) {
         if let Some(mut call) = self.calls.get_mut(call_id) {
             if let Some(b_leg) = call.b_legs.get_mut(index) {
@@ -518,11 +533,7 @@ impl CallActorStore {
         let Some(leg) = call.b_legs.get_mut(b_leg_index) else {
             return false;
         };
-        if leg.prack_acked_rseq.get(to_tag).is_some_and(|&v| v >= rseq) {
-            return false;
-        }
-        leg.prack_acked_rseq.insert(to_tag.to_string(), rseq);
-        true
+        by_branch::mark_prack_acked(leg, to_tag, rseq)
     }
 
     /// 401/407 auth-retry dedup: returns `true` exactly once for the first
@@ -538,14 +549,9 @@ impl CallActorStore {
         let Some(mut call) = self.calls.get_mut(call_id) else {
             return false;
         };
-        let Some(leg) = call.b_legs.get_mut(b_leg_index) else {
-            return false;
-        };
-        if leg.auth_challenged {
-            return false;
-        }
-        leg.auth_challenged = true;
-        true
+        call.b_legs
+            .get_mut(b_leg_index)
+            .is_some_and(by_branch::mark_auth_challenged)
     }
 
     /// Current count of credentialed outbound INVITEs sent on the 401/407
@@ -800,14 +806,7 @@ impl CallActorStore {
         let Some(mut call) = self.calls.get_mut(call_id) else {
             return WinOutcome::AlreadyAnswered;
         };
-        if call.state == CallState::Answered {
-            WinOutcome::AlreadyAnswered
-        } else {
-            call.set_winner(index);
-            let cancelled = call.cancel_pending_branches(Some(index));
-            self.keep_answerable(&cancelled);
-            WinOutcome::FirstWin { cancelled }
-        }
+        self.claim_answer(&mut call, index)
     }
 
     /// Atomically decide whether a 1xx provisional should be forwarded to the
@@ -985,7 +984,7 @@ impl CallActorStore {
         for subscription in call.refer_subscriptions.iter_mut() {
             if subscription.siphon_notifies
                 && subscription.on_a_leg == on_a_leg
-                && subscription.target_leg_call_id.is_some()
+                && !subscription.targets.is_empty()
             {
                 subscription.referrer_gone = true;
                 matched = true;
@@ -1120,66 +1119,6 @@ impl CallActorStore {
         }
     }
 
-    /// Complete a siphon-terminated transfer: promote the just-answered transfer
-    /// target (`target_idx` in `b_legs`) to be the surviving party's new peer,
-    /// and return the referrer leg (the party being transferred away) so the
-    /// caller can BYE it.
-    ///
-    /// - `referrer_on_a_leg == true` — the referrer is the A-leg and the
-    ///   surviving party is the winning B-leg: the target replaces the A-leg (it
-    ///   becomes the new `a_leg`, the winner is preserved, the old A-leg is
-    ///   returned). This is the Microsoft Teams blind-transfer shape.
-    /// - `referrer_on_a_leg == false` — the referrer is the winning B-leg and the
-    ///   surviving party is the A-leg: the target becomes the new winner and the
-    ///   old winning B-leg is returned.
-    ///
-    /// The parallel per-B-leg vectors are kept aligned when a slot is removed.
-    pub fn promote_transfer_target(
-        &self,
-        call_id: &str,
-        target_idx: usize,
-        referrer_on_a_leg: bool,
-    ) -> Option<Leg> {
-        let mut call = self.calls.get_mut(call_id)?;
-        if target_idx >= call.b_legs.len() {
-            return None;
-        }
-        if referrer_on_a_leg {
-            let target = call.b_legs.remove(target_idx);
-            if target_idx < call.b_leg_status.len() {
-                call.b_leg_status.remove(target_idx);
-            }
-            if target_idx < call.b_leg_handles.len() {
-                call.b_leg_handles.remove(target_idx);
-            }
-            // Removing the slot shifts higher indices down by one — fix the
-            // winner pointer (the surviving B-leg) accordingly.
-            match call.winner {
-                Some(winner) if winner == target_idx => call.winner = None,
-                Some(winner) if winner > target_idx => call.winner = Some(winner - 1),
-                _ => {}
-            }
-            let old_referrer = std::mem::replace(&mut call.a_leg, target);
-            // The referrer is transferred away and BYEd next: its dialog ends.
-            let ended = call.end_orphaned_dialogs();
-            drop(call);
-            publish_dialog_states(ended);
-            self.retire_promoted_referrer(&old_referrer);
-            Some(old_referrer)
-        } else {
-            let old_winner_idx = call.winner?;
-            let old_referrer = call.b_legs.get(old_winner_idx).cloned()?;
-            call.winner = Some(target_idx);
-            // The referrer stays in its slot until the call ends, but it is
-            // transferred away and BYEd next: its dialog ends now.
-            let ended = call.advance_dialog(&old_referrer.id.0, DialogState::Terminated, None);
-            drop(call);
-            publish_dialog_states(ended.into_iter().collect());
-            self.retire_promoted_referrer(&old_referrer);
-            Some(old_referrer)
-        }
-    }
-
     /// Retire the dialog the transfer promoted away from.
     ///
     /// The referrer's leg leaves the call at promotion, so `remove_call` will
@@ -1245,116 +1184,16 @@ impl CallActorStore {
         }
     }
 
-    /// Tear down a CANCELled call, but first preserve every still-pending
-    /// leg (INVITE sent, no final response yet — status `Trying`/`Ringing`) as
-    /// a [`ZombieCancelledLeg`], so the final response the CANCEL provokes is
-    /// still answerable after the call is gone: the ordinary `487` gets its ACK
-    /// (RFC 3261 §17.1.1.3) and a 2xx that raced the CANCEL (§9.1) gets ACK
-    /// (§13.2.2.4) + BYE (§15). Used by the CANCEL paths in place of
-    /// `remove_call`.
+    /// Tear down a call siphon gave up on before it was answered, first keeping
+    /// every leg still pending answerable. See
+    /// [`Self::keep_pending_answerable`], whose legs the caller has by then been
+    /// handed to CANCEL. Used by the CANCEL paths in place of `remove_call`.
     ///
-    /// Returns true if any zombie-cancelled entries were captured (so the
-    /// caller can schedule their expiry).
+    /// Returns true if any leg is kept (so the caller can schedule its expiry).
     pub fn remove_call_after_cancel(&self, call_id: &str) -> bool {
-        let mut captured = false;
-        if let Some(call) = self.calls.get(call_id) {
-            // A call siphon placed (`originate`) carries its pending INVITE on
-            // the A-leg, not a B-leg, so the loop below would capture nothing
-            // and the final response to our CANCEL would be dropped — leaving
-            // the callee retransmitting a 487 nobody ACKs (RFC 3261 §17.1.1.3),
-            // or a 200 for a dialog nobody ACKs or BYEs (§9.1 glare, §13.2.2.4,
-            // §15).
-            if call.originated && matches!(call.state, CallState::Calling | CallState::Ringing) {
-                if let Some(invite) = call.a_leg_invite.as_ref() {
-                    // The leg keeps the INVITE it sent, as a B-leg does: a 2xx
-                    // that raced the CANCEL carries the offer when the INVITE
-                    // went out offerless, and its ACK is then owed an answer
-                    // (RFC 3261 §13.2.2.4), which is decided from this.
-                    let mut leg = call.a_leg.clone();
-                    leg.b_leg_invite = Some(Arc::clone(invite));
-                    self.zombie_cancelled.insert(
-                        call.a_leg.branch.clone(),
-                        ZombieCancelledLeg {
-                            leg,
-                            invite_ruri: request_uri_of(invite),
-                            byed: false,
-                        },
-                    );
-                    captured = true;
-                }
-            }
-            let pending = call.b_legs.iter().enumerate().filter(|(index, _)| {
-                matches!(
-                    call.b_leg_status.get(*index),
-                    Some(BLegStatus::Trying) | Some(BLegStatus::Ringing)
-                )
-            });
-            captured |= self.keep_answerable(pending.map(|(_, leg)| leg));
-        }
+        let captured = !self.keep_pending_answerable(call_id).is_empty();
         self.remove_call(call_id);
         captured
-    }
-
-    /// Keep legs whose INVITE siphon is CANCELling answerable after the CANCEL,
-    /// as [`ZombieCancelledLeg`]s. Only a leg whose INVITE is stashed went on the
-    /// wire, so only such a leg can answer and only it is kept.
-    ///
-    /// Returns whether any leg was kept, so the caller can schedule the expiry.
-    pub fn keep_answerable<'a>(&self, legs: impl IntoIterator<Item = &'a Leg>) -> bool {
-        let mut kept = false;
-        for leg in legs {
-            if let Some(invite) = leg.b_leg_invite.as_ref() {
-                self.zombie_cancelled.insert(
-                    leg.branch.clone(),
-                    ZombieCancelledLeg {
-                        leg: leg.clone(),
-                        invite_ruri: request_uri_of(invite),
-                        byed: false,
-                    },
-                );
-                kept = true;
-            }
-        }
-        kept
-    }
-
-    /// Whether `branch` is a leg siphon CANCELled and is keeping answerable.
-    pub fn is_cancelled_branch(&self, branch: &str) -> bool {
-        self.zombie_cancelled.contains_key(branch)
-    }
-
-    /// Resolve a racing 2xx to a CANCELled leg by the Via branch it answers.
-    ///
-    /// Returns the captured leg plus a `first_2xx` flag: the first racing 2xx
-    /// on a branch returns `(leg, true)` so the caller sends ACK + BYE; later
-    /// 200 OK retransmits return `(leg, false)` so the caller re-ACKs only (a
-    /// lost ACK still gets retried) without a second BYE. The entry stays until
-    /// the 32 s cleanup so retransmits keep matching.
-    pub fn zombie_cancelled_for_2xx(&self, branch: &str) -> Option<(Leg, bool)> {
-        self.zombie_cancelled.get_mut(branch).map(|mut entry| {
-            let first_2xx = !entry.byed;
-            entry.byed = true;
-            (entry.leg.clone(), first_2xx)
-        })
-    }
-
-    /// Resolve a final non-2xx — in practice the `487 Request Terminated` that
-    /// RFC 3261 §9.1 makes the ordinary outcome of a CANCEL — to a CANCELled
-    /// leg by the Via branch it answers.
-    ///
-    /// Returns the captured leg and the CANCELled INVITE's Request-URI, so the
-    /// caller can build the ACK §17.1.1.3 requires on the INVITE's own branch.
-    ///
-    /// Unlike [`Self::zombie_cancelled_for_2xx`] there is no first-response
-    /// flag: the ACK for a final non-2xx belongs to the INVITE's client
-    /// transaction, which §17.1.1.3 has re-pass it to the transport on *every*
-    /// retransmission of the response while it sits in `Completed`. Answering
-    /// only the first would leave a peer whose ACK was lost retransmitting to
-    /// Timer H regardless — the exact stall this entry exists to end.
-    pub fn zombie_cancelled_for_non2xx(&self, branch: &str) -> Option<(Leg, Option<String>)> {
-        self.zombie_cancelled
-            .get(branch)
-            .map(|entry| (entry.leg.clone(), entry.invite_ruri.clone()))
     }
 
     /// Iterate over all active calls (for session timer sweep).
@@ -1521,43 +1360,6 @@ impl CallActorStore {
                 })
             })
             .map(|entry| entry.id.clone())
-            .collect()
-    }
-
-    /// Leg replacements whose dialed target has blown its deadline, as
-    /// `(internal call id, target leg Call-ID)`.
-    ///
-    /// The counterpart of [`take_timed_out_calls`](Self::take_timed_out_calls)
-    /// for the *answered* calls that one skips. A replacement dials a new leg
-    /// on a call that is already `Answered`, so nothing in the answer-timeout
-    /// path can see it: a target that never sends a final response would leave
-    /// the subscription armed for the life of the call.
-    ///
-    /// Does NOT remove anything — the dispatcher runs the teardown (CANCEL the
-    /// target leg, drop it, clear the subscription), which needs to build and
-    /// send messages. Only notifier-role subscriptions that actually dialed a
-    /// target and carry a deadline are eligible.
-    pub fn take_timed_out_replacements(&self, now: std::time::Instant) -> Vec<(String, String)> {
-        self.calls
-            .iter()
-            .flat_map(|entry| {
-                entry
-                    .refer_subscriptions
-                    .iter()
-                    .filter(|subscription| {
-                        subscription.siphon_notifies
-                            && subscription
-                                .deadline
-                                .is_some_and(|deadline| now >= deadline)
-                    })
-                    .filter_map(|subscription| {
-                        subscription
-                            .target_leg_call_id
-                            .clone()
-                            .map(|target| (entry.id.clone(), target))
-                    })
-                    .collect::<Vec<_>>()
-            })
             .collect()
     }
 }

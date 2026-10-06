@@ -64,6 +64,37 @@ pub(super) fn route(channel: &ChannelRef, args: &serde_json::Value) -> ControlRe
     }
 }
 
+/// [`route`], refused while a `dial` is still ringing for the call.
+///
+/// `route` releases the channel, so a dial left ringing behind it would report
+/// into a channel that no longer exists and, for a bridging dial, connect a
+/// phone to a caller that has since been sent somewhere else. The controller
+/// ends the dial first (`cancel_dial`), or waits for its outcome.
+pub(super) fn route_unless_dialling(
+    channel: &ChannelRef,
+    command: &AdapterCommand,
+) -> ControlResult {
+    if dial_under_way(channel, &command.origin.app) {
+        return ControlResult::error_with_details(
+            ControlErrorCode::InvalidState,
+            "route cannot hand this call back while a dial is still ringing for it — cancel_dial \
+             first, or wait for DialAnswered / DialFailed",
+            serde_json::json!({ "verb": "route", "reason": "dial_in_progress" }),
+        );
+    }
+    route(channel, &command.args)
+}
+
+/// Whether a `dial` — bridging or connecting — is still ringing for the
+/// channel's call.
+fn dial_under_way(channel: &ChannelRef, app: &str) -> bool {
+    let dispatcher = super::dial_bridge::dispatcher_for(app);
+    dispatcher.state().is_some_and(|state| {
+        state.dial_bridges.is_ringing(&channel.sip_call_id)
+            || state.call_actors.is_control_dial(&channel.call_actor_id)
+    })
+}
+
 /// `dial` — ring B-legs while the caller stays unanswered and app-owned.
 ///
 /// The difference from [`route`] is who holds the call afterwards. `route`
@@ -192,6 +223,135 @@ pub(super) fn dial(channel: &ChannelRef, command: &AdapterCommand) -> ControlRes
     }
 }
 
+/// `cancel_dial` — give up on the dial ringing for this channel's caller.
+///
+/// The one way to stop a dial that leaves the caller alone: the phones are
+/// CANCELled (RFC 3261 §9.1) and the dial fails with `DialFailed {code: 487}`,
+/// the caller exactly as the dial found it and free to be dialled for again.
+/// `hangup` ends the caller too, and letting the ring timeout run keeps the
+/// phones ringing until it does.
+///
+/// `args.reason` is reported as the `cause` of a bridging dial's `DialFailed`
+/// (default `cancelled`). Refused `invalid_state` with a typed `reason` when no
+/// dial is ringing, or when a phone has already answered and is being bridged.
+pub(super) fn cancel_dial(channel: &ChannelRef, command: &AdapterCommand) -> ControlResult {
+    let reason = match command.args.get("reason") {
+        None | Some(serde_json::Value::Null) => crate::dispatcher::DIAL_CANCELLED.to_string(),
+        Some(serde_json::Value::String(reason)) if !reason.trim().is_empty() => reason.clone(),
+        Some(_) => {
+            return ControlResult::error(
+                ControlErrorCode::BadRequest,
+                "cancel_dial reason must be a non-empty string",
+            )
+        }
+    };
+    let dispatcher = super::dial_bridge::dispatcher_for(&command.origin.app);
+    let (Some(state), Some(runtime)) = (dispatcher.state(), dispatcher.runtime()) else {
+        return ControlResult::error(
+            ControlErrorCode::Unavailable,
+            "b2bua is not running — no dial to cancel",
+        );
+    };
+    // The CANCELs may open a connection (TCP/TLS).
+    let _enter = runtime.enter();
+    match crate::dispatcher::b2bua_cancel_dial_with_state(state, &channel.sip_call_id, &reason) {
+        Ok(cancelled) => ControlResult::Ok(serde_json::json!({
+            "channel": channel.channel_id,
+            "state": "cancelled",
+            "on_answer": cancelled.on_answer(),
+        })),
+        Err(refusal) => cancel_dial_refused(refusal),
+    }
+}
+
+/// How long `cancel_dial` waits for the dial it ended to let go of the caller
+/// before answering anyway. What it waits on is local: the dial's own task
+/// stopping the ringback on the media engine and reporting `DialFailed`.
+const DIAL_CONCLUSION_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The bridging dial a `cancel_dial` is about to end, watched from before the
+/// cancel so its conclusion cannot be missed.
+pub(super) struct WatchedDial {
+    dispatcher: std::sync::Arc<dyn crate::dispatcher::DispatcherHandle>,
+    sip_call_id: String,
+    conclusion: tokio::sync::watch::Receiver<()>,
+}
+
+/// The dial ringing for the caller a `cancel_dial` names, if one is. `None`
+/// for any other verb, and for a connecting dial: its cancel is carried out in
+/// full before it returns.
+pub(super) fn watch_dial_to_cancel(command: &AdapterCommand) -> Option<WatchedDial> {
+    if command.verb != "cancel_dial" {
+        return None;
+    }
+    let crate::control::ResolvedTarget::Channel(channel) = &command.target else {
+        return None;
+    };
+    let dispatcher = super::dial_bridge::dispatcher_for(&command.origin.app);
+    let conclusion = dispatcher
+        .state()?
+        .dial_bridges
+        .conclusion(&channel.sip_call_id)?;
+    Some(WatchedDial {
+        dispatcher,
+        sip_call_id: channel.sip_call_id.clone(),
+        conclusion,
+    })
+}
+
+/// Hold the reply to an accepted `cancel_dial` until the dial it ended has let
+/// go of the caller.
+///
+/// The cancel itself is synchronous: the phones are CANCELled and each is
+/// reported before it returns. What is left runs on the dial's own task, which
+/// stops the ringback on the media engine, reports `DialFailed`, and only then
+/// lets go of the caller. A reply sent ahead of that told the controller the
+/// dial was over while a `route` or a second `dial` was still refused
+/// `dial_in_progress`. Waiting here puts `DialFailed` ahead of the reply and
+/// makes the reply mean what it says.
+///
+/// Bounded: a dial that has not concluded by then is let go of here, so the
+/// caller is free once the reply is in whatever became of that task.
+pub(super) async fn dial_concluded(watched: Option<WatchedDial>, result: &ControlResult) {
+    let (Some(mut watched), ControlResult::Ok(_)) = (watched, result) else {
+        return;
+    };
+    let concluded = tokio::time::timeout(DIAL_CONCLUSION_BOUND, async {
+        // The watch carries no value: it only closes, with the dial's entry.
+        while watched.conclusion.changed().await.is_ok() {}
+    })
+    .await;
+    if concluded.is_ok() {
+        return;
+    }
+    let released = watched.dispatcher.state().is_some_and(|state| {
+        state
+            .dial_bridges
+            .release_watched(&watched.sip_call_id, &watched.conclusion)
+    });
+    tracing::error!(
+        caller = %watched.sip_call_id,
+        released,
+        "control plane: cancel_dial — the cancelled dial had not reported its end within {} s; \
+         the caller is released and DialFailed follows when it does",
+        DIAL_CONCLUSION_BOUND.as_secs()
+    );
+}
+
+/// The reply for a dial that was not cancelled: `not_found` when the call is
+/// gone, otherwise `invalid_state` naming why.
+pub(super) fn cancel_dial_refused(refusal: crate::dispatcher::DialCancelRefusal) -> ControlResult {
+    let code = match refusal {
+        crate::dispatcher::DialCancelRefusal::Gone => ControlErrorCode::NotFound,
+        _ => ControlErrorCode::InvalidState,
+    };
+    ControlResult::error_with_details(
+        code,
+        refusal.to_string(),
+        serde_json::json!({ "verb": "cancel_dial", "reason": refusal.reason() }),
+    )
+}
+
 /// Map a refused `dial` onto its wire code.
 ///
 /// The already-answered refusal also carries `details` (`verb`, `reason`,
@@ -284,17 +444,44 @@ pub(super) fn parse_dial_target(
         );
     };
 
-    if let Some(aor) = object.get("aor").and_then(|v| v.as_str()) {
-        let headers: std::collections::HashMap<String, String> = object
+    // What a target says about its own branch, the same on either form: an
+    // `{aor}` applies it to every contact it forks to. Read once, so the two
+    // forms cannot drift apart again: the AoR form used to read only
+    // `headers`, and its identity fields were dropped without a word.
+    let string_field = |name: &str| {
+        object
+            .get(name)
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    };
+    let shaped = crate::dispatcher::DialTarget {
+        headers: object
             .get("headers")
             .map(parse_json_headers)
             .unwrap_or_default()
             .into_iter()
-            .collect();
+            .collect(),
+        from: string_field("from"),
+        from_display: string_field("from_display"),
+        p_asserted_identity: string_field("p_asserted_identity"),
+        privacy: super::originate::parse_privacy("dial target", object.get("privacy"))
+            .map_err(|error| error.to_string())?,
+        to: string_field("to"),
+        ..Default::default()
+    };
+
+    if let Some(aor) = object.get("aor").and_then(|v| v.as_str()) {
         return match crate::dispatcher::dial_targets_for_aor(aor) {
             Ok(mut branches) => {
                 for branch in &mut branches {
-                    branch.headers.extend(headers.clone());
+                    branch.headers.extend(shaped.headers.clone());
+                    branch.from.clone_from(&shaped.from);
+                    branch.from_display.clone_from(&shaped.from_display);
+                    branch
+                        .p_asserted_identity
+                        .clone_from(&shaped.p_asserted_identity);
+                    branch.privacy = shaped.privacy;
+                    branch.to.clone_from(&shaped.to);
                 }
                 Ok(branches)
             }
@@ -309,36 +496,12 @@ pub(super) fn parse_dial_target(
     };
     Ok(vec![crate::dispatcher::DialTarget {
         uri: uri.to_string(),
-        next_hop: object
-            .get("next_hop")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string()),
-        flow: None,
-        route: Vec::new(),
-        headers: object
-            .get("headers")
-            .map(parse_json_headers)
-            .unwrap_or_default()
-            .into_iter()
-            .collect(),
-        from: object
-            .get("from")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string()),
-        from_display: object
-            .get("from_display")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string()),
-        p_asserted_identity: object
-            .get("p_asserted_identity")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string()),
-        privacy: super::originate::parse_privacy("dial target", object.get("privacy"))
-            .map_err(|error| error.to_string())?,
+        next_hop: string_field("next_hop"),
         // A URI dialled as written names no registered AoR, even one that
         // happens to be a registered contact: only an `{aor}` target says whom
         // the branch was dialled for.
         aor: None,
+        ..shaped
     }])
 }
 

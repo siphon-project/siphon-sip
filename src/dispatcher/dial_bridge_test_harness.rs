@@ -326,7 +326,7 @@ pub(super) async fn command(
         )
         .await
     );
-    let mut events = Vec::new();
+    let mut events = overheard(controller);
     loop {
         let frames = tokio::time::timeout(
             std::time::Duration::from_secs(5),
@@ -334,13 +334,17 @@ pub(super) async fn command(
         )
         .await
         .expect("a reply to the command");
-        for frame in frames {
+        let mut frames = frames.into_iter();
+        while let Some(frame) = frames.next() {
             match frame {
                 OutboundFrame::Reply(reply) => {
+                    // One read drains everything queued, so events queued
+                    // behind the reply came with it: kept for the next read.
+                    overhear(controller, frames.filter_map(event_of));
                     return (
                         serde_json::to_value(reply).expect("the reply serialises"),
                         events,
-                    )
+                    );
                 }
                 OutboundFrame::Event(event) => events.push(event),
             }
@@ -348,20 +352,73 @@ pub(super) async fn command(
     }
 }
 
+fn event_of(frame: OutboundFrame) -> Option<EventFrame> {
+    match frame {
+        OutboundFrame::Event(event) => Some(event),
+        OutboundFrame::Reply(_) => None,
+    }
+}
+
+/// Take the events an earlier read found queued behind a reply.
+fn overheard(controller: &Controller) -> Vec<EventFrame> {
+    controller
+        .overheard
+        .lock()
+        .expect("the overheard events")
+        .drain(..)
+        .collect()
+}
+
+/// Keep `events` for the next read, behind what is already kept.
+fn overhear(controller: &Controller, events: impl Iterator<Item = EventFrame>) {
+    controller
+        .overheard
+        .lock()
+        .expect("the overheard events")
+        .extend(events);
+}
+
+/// The events queued for the controller up to and including the first one
+/// named `name`, waited for until it arrives. Whatever is queued behind it
+/// stays for the next read.
+///
+/// An event published by a task of its own (a dial's coordinator, a bridge
+/// settling) arrives when that task has run, so it is waited for by name: what
+/// happened to arrive within a fixed quiet period depends on how fast the task
+/// was scheduled.
+pub(super) async fn events_through(controller: &Controller, name: &str) -> Vec<EventFrame> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut pending: std::collections::VecDeque<EventFrame> = overheard(controller).into();
+    let mut heard = Vec::new();
+    loop {
+        while let Some(event) = pending.pop_front() {
+            let found = event.event == name;
+            heard.push(event);
+            if found {
+                overhear(controller, pending.into_iter());
+                return heard;
+            }
+        }
+        let frames =
+            tokio::time::timeout_at(deadline, controller.connection.events.recv_many()).await;
+        match frames {
+            Ok(frames) => pending.extend(frames.into_iter().filter_map(event_of)),
+            Err(_) => panic!("no {name} within 10 s; heard {:?}", names(&heard)),
+        }
+    }
+}
+
 /// The events queued for the controller since the last look, once the stream
 /// has been quiet for a moment.
 pub(super) async fn events(controller: &Controller) -> Vec<EventFrame> {
-    let mut events = Vec::new();
+    let mut events = overheard(controller);
     while let Ok(frames) = tokio::time::timeout(
         std::time::Duration::from_millis(150),
         controller.connection.events.recv_many(),
     )
     .await
     {
-        events.extend(frames.into_iter().filter_map(|frame| match frame {
-            OutboundFrame::Event(event) => Some(event),
-            OutboundFrame::Reply(_) => None,
-        }));
+        events.extend(frames.into_iter().filter_map(event_of));
     }
     events
 }

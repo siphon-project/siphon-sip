@@ -168,6 +168,7 @@ def test_module_surface():
         "remove_header",
         "accept_refer",
         "reject_refer",
+        "complete_refer",
         "bridge",
         "unbridge",
         "answer_anchored",
@@ -175,6 +176,7 @@ def test_module_surface():
         "record_start",
         "record_stop",
         "drop",
+        "cancel_dial",
     ):
         assert hasattr(Call, verb), f"Call is missing {verb}"
     assert issubclass(ControlError, Exception)
@@ -445,6 +447,11 @@ def test_media_header_refer_verbs_roundtrip():
             async def handle(call):
                 await call.play(file="/prompts/welcome.wav", repeat=2)
                 await call.play(blob=b"hi", duration_ms=5000)
+                # Until stopped: the one non-integer `repeat` the server takes.
+                # Anything else is refused locally, before the call is touched.
+                await call.play(file="/prompts/hold.wav", repeat="inf")
+                with pytest.raises(ValueError):
+                    await call.play(file="/prompts/hold.wav", repeat="forever")
                 await call.stop()
                 await call.dtmf("123#", duration_ms=100, volume_dbm0=-8)
                 await call.hold()
@@ -503,11 +510,14 @@ def test_media_header_refer_verbs_roundtrip():
             assert by_verb["play"] in (
                 {"file": "/prompts/welcome.wav", "repeat": 2},
                 {"blob": "aGk=", "duration_ms": 5000},
+                {"file": "/prompts/hold.wav", "repeat": "inf"},
             )
             # Both play frames were sent (file first, blob second).
             play_args = [frame["args"] for frame in recorded if frame["verb"] == "play"]
             assert play_args[0] == {"file": "/prompts/welcome.wav", "repeat": 2}
             assert play_args[1] == {"blob": "aGk=", "duration_ms": 5000}
+            assert play_args[2] == {"file": "/prompts/hold.wav", "repeat": "inf"}
+            assert len(play_args) == 3, "the refused repeat never reached the wire"
             assert by_verb["stop"] == {}
             assert by_verb["dtmf"] == {
                 "digits": "123#",
@@ -850,6 +860,53 @@ def test_close_stops_dispatching_into_python():
     asyncio.run(scenario())
 
 
+def test_server_close_stops_dispatching_into_python():
+    """After `close()`, a call siphon dials in with is not handed to the
+    handler, although `serve()` is still accepting. One dialled in before the
+    close is, which is what shows the handler was reachable at all."""
+
+    async def scenario():
+        server = ControlServer(app=APP, token=TOKEN, bind="127.0.0.1:0")
+        addr = await server.bind()
+        calls = []
+        first = asyncio.get_event_loop().create_future()
+
+        @server.on_call
+        async def handle(call):
+            calls.append(call.channel_id)
+            if not first.done():
+                first.set_result(None)
+
+        serve_task = asyncio.ensure_future(server.serve())
+        await asyncio.sleep(0.3)
+
+        async def dial_in():
+            return await websockets.connect(
+                f"ws://{addr}/siphon",
+                additional_headers={"Authorization": f"Bearer {TOKEN}"},
+                subprotocols=[SUBPROTOCOL],
+            )
+
+        before = await dial_in()
+        await _push_stasis(before)
+        await asyncio.wait_for(first, timeout=5)
+        assert calls == ["ch-out"]
+
+        server.close()
+        after = await dial_in()
+        await _push_stasis(after)
+        await asyncio.sleep(0.3)
+        assert calls == ["ch-out"], "close() must stop dispatching into Python"
+
+        await before.close()
+        await after.close()
+        serve_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+            await asyncio.wait_for(serve_task, timeout=5)
+
+    asyncio.run(scenario())
+
+
 def test_async_context_manager_closes_on_exit():
     """`async with` closes on the way out, including when the body raises."""
     async def scenario():
@@ -953,6 +1010,16 @@ def test_transfer_outcome_helpers():
     assert transfer_outcome({"kind": "TransferRequested", "payload": {}}) is None
     assert transfer_outcome({"kind": "StasisEnd", "payload": {}}) is None
     assert transfer_outcome({"kind": "TransferFailed"}) is None
+
+    # TransferTimedOut ends a transfer this app *accepted* in mode "controller"
+    # and did not report on in time. It is not a verdict on a `refer()`, so
+    # neither helper claims it: an app reads its payload off the event itself.
+    timed_out = {
+        "kind": "TransferTimedOut",
+        "payload": {"reason": "timeout", "code": 503, "referrer_leg": "a"},
+    }
+    assert is_transfer_final(timed_out["kind"]) is False
+    assert transfer_outcome(timed_out) is None
 
 
 def test_originate_verb_roundtrip():
@@ -1145,6 +1212,7 @@ def test_dial_verb_roundtrip():
                             "uri": "sip:+15550177@trunk.example",
                             "next_hop": "sip:192.0.2.9:5060",
                             "headers": {"X-Carrier": "a"},
+                            "to": "sip:+15550177@trunk.example",
                         },
                     ],
                     strategy="sequential",
@@ -1202,6 +1270,7 @@ def test_dial_verb_roundtrip():
                         "uri": "sip:+15550177@trunk.example",
                         "next_hop": "sip:192.0.2.9:5060",
                         "headers": {"X-Carrier": "a"},
+                        "to": "sip:+15550177@trunk.example",
                     },
                 ],
                 "strategy": "sequential",
@@ -1611,6 +1680,318 @@ def test_stream_verbs_roundtrip():
             assert frames[5]["args"] == {"mode": "bridge"}
             # Refused before a frame goes out: nothing past the five above.
             assert len(refused) == 4, refused
+
+            client.shutdown()
+            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+                await asyncio.wait_for(run_task, timeout=5)
+
+    asyncio.run(scenario())
+
+
+# The identity a transfer's new leg presents, as the keyword arguments name it
+# and as the wire names it: `from` is a Python keyword, so it is `from_uri` here.
+_IDENTITY_KWARGS = {
+    "from_uri": "sip:+15550100000@trunk.example.com",
+    "from_display": "",
+    "p_asserted_identity": "sip:+15550100000@trunk.example.com",
+    "privacy": "restricted",
+    "headers": {"X-Account": "main"},
+}
+_IDENTITY_ARGS = {
+    "from": "sip:+15550100000@trunk.example.com",
+    # An empty display name removes the caller's, so it is sent, not dropped.
+    "from_display": "",
+    "p_asserted_identity": "sip:+15550100000@trunk.example.com",
+    "privacy": "restricted",
+    "headers": {"X-Account": "main"},
+}
+
+
+def test_cancel_dial_and_transfer_verbs_roundtrip():
+    """`cancel_dial`, `play(repeat=...)`, `accept_refer`, `replace_peer` and
+    `complete_refer` emit the exact args the server parses: an AoR target as an
+    object, the identity arguments under their wire names, the controller mode
+    with its timeout only. What the server would refuse raises `ValueError`
+    before a frame goes out."""
+
+    async def scenario():
+        frames = []
+        verbs = {"cancel_dial", "play", "accept_refer", "replace_peer", "complete_refer"}
+
+        def reply(frame):
+            if frame["verb"] == "replace_peer":
+                return {"channel": "ch1", "replacement": "dialing"}
+            return {"channel": "ch1"}
+
+        stub = _verb_stub(verbs, reply, frames)
+        async with websockets.serve(
+            stub, "127.0.0.1", 0, subprotocols=[SUBPROTOCOL]
+        ) as server:
+            port = server.sockets[0].getsockname()[1]
+            url = f"ws://127.0.0.1:{port}/control/ws"
+            client = ControlClient(app=APP, token=TOKEN, url=url)
+            done = asyncio.get_event_loop().create_future()
+
+            async def drive(call):
+                # cancel_dial: the reason only when one is given, so the
+                # server's `cancelled` applies otherwise.
+                await call.cancel_dial()
+                await call.cancel_dial("operator_gave_up")
+                await call.cancel_dial(reason="timer_ran_out")
+
+                # play: a count goes out as a number, and the one string the
+                # server takes goes out as `inf` however it was capitalised.
+                await call.play(file="/prompts/hold.wav", repeat=3)
+                await call.play(file="/prompts/hold.wav", repeat="inf")
+                await call.play(file="/prompts/hold.wav", repeat="INF")
+                for repeat in ("forever", "3", "", -1, 1.5, ["inf"]):
+                    with pytest.raises(ValueError, match="repeat"):
+                        await call.play(file="/prompts/hold.wav", repeat=repeat)
+
+                # accept_refer: nothing named, nothing sent, so the transfer
+                # dials what the referrer asked for in the server's own mode.
+                await call.accept_refer()
+                # An AoR is an object on the wire, where a URI is a string.
+                await call.accept_refer(
+                    mode="terminate",
+                    profile="rtp_passthrough",
+                    aor="sip:3001@example.com",
+                    **_IDENTITY_KWARGS,
+                )
+                await call.accept_refer(
+                    "sip:3002@198.51.100.7", "sip:edge.example.com", "terminate"
+                )
+                # The controller mode: the mode, and the timeout only when given.
+                await call.accept_refer(mode="controller")
+                await call.accept_refer(mode="controller", timeout=30)
+
+                with pytest.raises(ValueError, match="not both"):
+                    await call.accept_refer(
+                        "sip:3002@198.51.100.7", aor="sip:3001@example.com"
+                    )
+                # A controller transfer dials no leg, so every argument that
+                # shapes one is refused beside it.
+                for kwargs in (
+                    {"target": "sip:3002@198.51.100.7"},
+                    {"aor": "sip:3001@example.com"},
+                    {"next_hop": "sip:edge.example.com"},
+                    {"profile": "rtp_passthrough"},
+                    {"from_uri": "sip:+15550100000@trunk.example.com"},
+                    {"from_display": "Main Line"},
+                    {"p_asserted_identity": "sip:+15550100000@trunk.example.com"},
+                    {"privacy": "restricted"},
+                    {"headers": {"X-Account": "main"}},
+                ):
+                    with pytest.raises(ValueError, match="controller"):
+                        await call.accept_refer(mode="controller", timeout=30, **kwargs)
+                # ... and the deadline belongs to that mode alone.
+                for mode in (None, "terminate", "transparent"):
+                    with pytest.raises(ValueError, match="timeout"):
+                        await call.accept_refer(mode=mode, timeout=30)
+                with pytest.raises(ValueError, match="privacy"):
+                    await call.accept_refer(privacy="hidden")
+
+                # replace_peer: the same target and identity arguments.
+                replaced = await call.replace_peer(
+                    aor="sip:3001@example.com",
+                    replace_a_leg=True,
+                    profile="rtp_passthrough",
+                    timeout=20,
+                    **_IDENTITY_KWARGS,
+                )
+                await call.replace_peer(aor="sip:3001@example.com")
+                await call.replace_peer(
+                    "sip:3002@198.51.100.7",
+                    next_hop="sip:edge.example.com",
+                    from_uri="sip:+15550100000@trunk.example.com",
+                )
+                with pytest.raises(ValueError, match="not both"):
+                    await call.replace_peer(
+                        "sip:3002@198.51.100.7", aor="sip:3001@example.com"
+                    )
+                with pytest.raises(ValueError, match="requires a target"):
+                    await call.replace_peer()
+                with pytest.raises(ValueError, match="privacy"):
+                    await call.replace_peer(aor="sip:3001@example.com", privacy="hidden")
+
+                # complete_refer: the reason only when one is given.
+                await call.complete_refer(200)
+                await call.complete_refer(486, "Busy Here")
+                await call.complete_refer(code=503, reason="Service Unavailable")
+                return replaced
+
+            @client.on_call
+            async def handle(call):
+                # A failed expectation above has to fail the test by name, not
+                # as a timeout waiting for a handler that already raised.
+                try:
+                    result = await drive(call)
+                except BaseException as error:  # noqa: BLE001
+                    if not done.done():
+                        done.set_exception(error)
+                    return
+                if not done.done():
+                    done.set_result(result)
+
+            await client.connect()
+            run_task = asyncio.ensure_future(client.run())
+            await asyncio.sleep(0.3)
+            await client.command("test_push_stasis")
+
+            replaced = await asyncio.wait_for(done, timeout=10)
+            assert replaced == {"channel": "ch1", "replacement": "dialing"}
+
+            for frame in frames:
+                assert frame["module"] == "sip"
+                assert frame["target"]["channel"] == "ch1"
+
+            def args_of(verb):
+                return [frame["args"] for frame in frames if frame["verb"] == verb]
+
+            assert args_of("cancel_dial") == [
+                {},
+                {"reason": "operator_gave_up"},
+                {"reason": "timer_ran_out"},
+            ]
+            # Three plays, and none of the six refused ones.
+            assert args_of("play") == [
+                {"file": "/prompts/hold.wav", "repeat": 3},
+                {"file": "/prompts/hold.wav", "repeat": "inf"},
+                {"file": "/prompts/hold.wav", "repeat": "inf"},
+            ]
+            # Five accepts, and none of the fourteen refused ones.
+            assert args_of("accept_refer") == [
+                {},
+                {
+                    "target": {"aor": "sip:3001@example.com"},
+                    "mode": "terminate",
+                    "profile": "rtp_passthrough",
+                    **_IDENTITY_ARGS,
+                },
+                {
+                    "target": "sip:3002@198.51.100.7",
+                    "next_hop": "sip:edge.example.com",
+                    "mode": "terminate",
+                },
+                {"mode": "controller"},
+                {"mode": "controller", "timeout": 30},
+            ]
+            assert args_of("replace_peer") == [
+                {
+                    "target": {"aor": "sip:3001@example.com"},
+                    "replace_a_leg": True,
+                    "profile": "rtp_passthrough",
+                    "timeout": 20,
+                    **_IDENTITY_ARGS,
+                },
+                {"target": {"aor": "sip:3001@example.com"}},
+                {
+                    "target": "sip:3002@198.51.100.7",
+                    "next_hop": "sip:edge.example.com",
+                    "from": "sip:+15550100000@trunk.example.com",
+                },
+            ]
+            assert args_of("complete_refer") == [
+                {"code": 200},
+                {"code": 486, "reason": "Busy Here"},
+                {"code": 503, "reason": "Service Unavailable"},
+            ]
+            # Every frame is accounted for above: nothing refused went out.
+            assert len(frames) == 3 + 3 + 5 + 3 + 3
+
+            client.shutdown()
+            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+                await asyncio.wait_for(run_task, timeout=5)
+
+    asyncio.run(scenario())
+
+
+def test_play_sources_gain_and_number_shaping_roundtrip():
+    """`play` names a tone or a URL as its source and a gain in decibels, and
+    `accept_refer` / `replace_peer` name how the new leg's numbers are written,
+    each under the name the server parses. A second source beside the first, and
+    a number argument beside a controller transfer, raise `ValueError` before a
+    frame goes out."""
+
+    async def scenario():
+        frames = []
+        verbs = {"play", "accept_refer", "replace_peer"}
+        stub = _verb_stub(verbs, lambda frame: {"channel": "ch1"}, frames)
+        async with websockets.serve(
+            stub, "127.0.0.1", 0, subprotocols=[SUBPROTOCOL]
+        ) as server:
+            port = server.sockets[0].getsockname()[1]
+            url = f"ws://127.0.0.1:{port}/control/ws"
+            client = ControlClient(app=APP, token=TOKEN, url=url)
+            done = asyncio.get_event_loop().create_future()
+
+            async def drive(call):
+                await call.play(tone="ringback_eu")
+                await call.play(
+                    url="https://media.example.com/hold.wav",
+                    repeat="inf",
+                    gain_decibels=-6,
+                )
+                await call.play(file="/prompts/welcome.wav", gain_decibels=3)
+                for kwargs in (
+                    {"tone": "ringback_eu", "url": "https://media.example.com/a.wav"},
+                    {"file": "/prompts/welcome.wav", "tone": "ringback_eu"},
+                    {"db_id": 7, "url": "https://media.example.com/a.wav"},
+                    {},
+                ):
+                    with pytest.raises(ValueError, match="exactly one"):
+                        await call.play(**kwargs)
+
+                await call.accept_refer(mode="terminate", number_policy="carrier_e164")
+                await call.accept_refer("sip:3002@198.51.100.7", format="national")
+                for kwargs in ({"number_policy": "carrier_e164"}, {"format": "e164"}):
+                    with pytest.raises(ValueError, match="controller"):
+                        await call.accept_refer(mode="controller", **kwargs)
+
+                await call.replace_peer(
+                    "sip:3002@198.51.100.7", number_policy="carrier_e164"
+                )
+                await call.replace_peer(aor="sip:3001@example.com", format="plain")
+
+            @client.on_call
+            async def handle(call):
+                try:
+                    await drive(call)
+                except BaseException as error:  # noqa: BLE001
+                    if not done.done():
+                        done.set_exception(error)
+                    return
+                if not done.done():
+                    done.set_result(None)
+
+            await client.connect()
+            run_task = asyncio.ensure_future(client.run())
+            await asyncio.sleep(0.3)
+            await client.command("test_push_stasis")
+            await asyncio.wait_for(done, timeout=10)
+
+            def args_of(verb):
+                return [frame["args"] for frame in frames if frame["verb"] == verb]
+
+            assert args_of("play") == [
+                {"tone": "ringback_eu"},
+                {
+                    "url": "https://media.example.com/hold.wav",
+                    "repeat": "inf",
+                    "gain_decibels": -6,
+                },
+                {"file": "/prompts/welcome.wav", "gain_decibels": 3},
+            ]
+            assert args_of("accept_refer") == [
+                {"mode": "terminate", "number_policy": "carrier_e164"},
+                {"target": "sip:3002@198.51.100.7", "format": "national"},
+            ]
+            assert args_of("replace_peer") == [
+                {"target": "sip:3002@198.51.100.7", "number_policy": "carrier_e164"},
+                {"target": {"aor": "sip:3001@example.com"}, "format": "plain"},
+            ]
+            # Every frame is accounted for above: nothing refused went out.
+            assert len(frames) == 3 + 2 + 2
 
             client.shutdown()
             with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):

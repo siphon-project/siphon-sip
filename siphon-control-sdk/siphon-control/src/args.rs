@@ -6,7 +6,7 @@
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
 
-use siphon_control_client::proto::sip::PeerHangupPolicy;
+use siphon_control_client::proto::sip::{PeerHangupPolicy, PlayRepeat};
 use siphon_control_client::sip::{
     AorRing, DialOnAnswer, DialStrategy, DialTarget, OriginateMedia, OriginatePrivacy, PlaySource,
     RecordChannels, RecordDirection, Ringback, RouteTarget, SessionRefresher, SessionTimer,
@@ -71,8 +71,8 @@ pub(crate) fn extract_dial_targets(items: &[Bound<'_, PyAny>]) -> PyResult<Vec<D
     Ok(targets)
 }
 
-/// Extract one `dial` target: a dict `{uri, next_hop?, headers?}` dialed as
-/// written, or `{aor, headers?}` forked to every registered contact.
+/// Extract one `dial` target: a dict `{uri, next_hop?, headers?, to?}` dialed
+/// as written, or `{aor, headers?, to?}` forked to every registered contact.
 ///
 /// A bare string is refused although the server accepts one as a URI. The two
 /// forms do entirely different things — an AoR forks to every contact over that
@@ -90,6 +90,7 @@ fn extract_dial_target(item: &Bound<'_, PyAny>) -> PyResult<DialTarget> {
     let uri = optional_string(dict, "uri")?;
     let aor = optional_string(dict, "aor")?;
     let next_hop = optional_string(dict, "next_hop")?;
+    let to = optional_string(dict, "to")?;
     let headers = match dict.get_item("headers")? {
         Some(value) if !value.is_none() => extract_headers(&value)?,
         _ => Vec::new(),
@@ -126,6 +127,9 @@ fn extract_dial_target(item: &Bound<'_, PyAny>) -> PyResult<DialTarget> {
     };
     for (name, value) in headers {
         target = target.header(name, value);
+    }
+    if let Some(to) = to {
+        target = target.to(to);
     }
     Ok(target)
 }
@@ -299,13 +303,38 @@ pub(crate) fn build_play_source(
     file: Option<String>,
     db_id: Option<u64>,
     blob: Option<Vec<u8>>,
+    tone: Option<String>,
+    url: Option<String>,
 ) -> PyResult<PlaySource> {
-    match (file, db_id, blob) {
-        (Some(file), None, None) => Ok(PlaySource::file(file)),
-        (None, Some(db_id), None) => Ok(PlaySource::db_id(db_id)),
-        (None, None, Some(blob)) => Ok(PlaySource::blob(blob)),
+    match (file, db_id, blob, tone, url) {
+        (Some(file), None, None, None, None) => Ok(PlaySource::file(file)),
+        (None, Some(db_id), None, None, None) => Ok(PlaySource::db_id(db_id)),
+        (None, None, Some(blob), None, None) => Ok(PlaySource::blob(blob)),
+        (None, None, None, Some(tone), None) => Ok(PlaySource::tone(tone)),
+        (None, None, None, None, Some(url)) => Ok(PlaySource::url(url)),
         _ => Err(PyValueError::new_err(
-            "play requires exactly one of file (str), db_id (int), or blob (bytes)",
+            "play requires exactly one of file (str), db_id (int), blob (bytes), tone (str), \
+             or url (str)",
+        )),
+    }
+}
+
+/// Read the `repeat` argument of `play`: a total play count, or `"inf"` to play
+/// until stopped. Refused here rather than at the server, so a typo raises
+/// before the call is touched.
+pub(crate) fn extract_play_repeat(
+    repeat: Option<&Bound<'_, PyAny>>,
+) -> PyResult<Option<PlayRepeat>> {
+    let Some(repeat) = repeat.filter(|repeat| !repeat.is_none()) else {
+        return Ok(None);
+    };
+    if let Ok(times) = repeat.extract::<u64>() {
+        return Ok(Some(PlayRepeat::Times(times)));
+    }
+    match repeat.extract::<String>() {
+        Ok(token) if token.eq_ignore_ascii_case("inf") => Ok(Some(PlayRepeat::Forever)),
+        _ => Err(PyValueError::new_err(
+            "repeat must be a total play count (a non-negative integer) or \"inf\" to play until stopped",
         )),
     }
 }

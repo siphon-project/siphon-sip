@@ -24,7 +24,11 @@ pub const PRACK_OFFER_WAIT: Duration = Duration::from_secs(32);
 /// PRACK of siphon's copy.
 #[derive(Debug, Clone)]
 pub struct HeldCalleePrack {
-    pub b_leg_index: usize,
+    /// The callee's leg, by the Via branch of the INVITE the provisional
+    /// answers. Not its position among the call's legs: that moves whenever a
+    /// leg ahead of it is taken off the call, and this is held until the
+    /// caller's PRACK arrives.
+    pub branch: String,
     /// The callee's early dialog, by its To-tag.
     pub to_tag: String,
     /// The callee's `RSeq`, which the PRACK's `RAck` names.
@@ -78,9 +82,10 @@ pub struct PendingPrackOffer {
     /// PRACK's CSeq number, which the callee's response echoes.
     pub b_leg_call_id: String,
     pub b_leg_cseq: u32,
-    /// The callee's leg, and the offer as siphon's PRACK carried it there: the
-    /// session description in force on that dialog once the callee answers it.
-    pub b_leg_index: usize,
+    /// The callee's leg, by the Via branch of its INVITE, and the offer as
+    /// siphon's PRACK carried it there: the session description in force on
+    /// that dialog once the callee answers it.
+    pub branch: String,
     pub sent_offer: Option<Vec<u8>>,
     /// The caller's offer as it wrote it, for an answer rejecting every stream
     /// should the callee not answer.
@@ -128,12 +133,12 @@ impl PrackBridge {
     }
 
     /// The link of the PRACK held for the callee's provisional `rseq` on its early
-    /// dialog `to_tag` of B-leg `b_leg_index`.
-    pub fn link_for(&self, b_leg_index: usize, to_tag: &str, rseq: u32) -> Option<u64> {
+    /// dialog `to_tag` of the B-leg whose INVITE rode Via `branch`.
+    pub fn link_for(&self, branch: &str, to_tag: &str, rseq: u32) -> Option<u64> {
         self.held
             .iter()
             .find(|(_, prack)| {
-                prack.b_leg_index == b_leg_index && prack.to_tag == to_tag && prack.rseq == rseq
+                prack.branch == branch && prack.to_tag == to_tag && prack.rseq == rseq
             })
             .map(|(link, _)| *link)
     }
@@ -271,9 +276,14 @@ impl PrackBridge {
 mod tests {
     use super::*;
 
-    fn held(b_leg_index: usize, to_tag: &str, rseq: u32) -> HeldCalleePrack {
+    /// The Via branch of the test's B-leg number `leg`.
+    fn branch(leg: usize) -> String {
+        format!("z9hG4bK-leg-{leg}")
+    }
+
+    fn held(leg: usize, to_tag: &str, rseq: u32) -> HeldCalleePrack {
         HeldCalleePrack {
-            b_leg_index,
+            branch: branch(leg),
             to_tag: to_tag.to_string(),
             rseq,
             cseq_number: 1,
@@ -315,7 +325,7 @@ mod tests {
             a_leg_rseq: 7,
             b_leg_call_id: "b-leg@198.51.100.70".to_string(),
             b_leg_cseq: 3,
-            b_leg_index: 0,
+            branch: branch(0),
             sent_offer: None,
             offer: b"v=0\r\n".to_vec(),
             sent_at,
@@ -328,15 +338,15 @@ mod tests {
         let first = bridge.hold(held(0, "callee-a", 42), None);
         let second = bridge.hold(held(0, "callee-b", 42), None);
         assert_ne!(first, second);
-        assert_eq!(bridge.link_for(0, "callee-a", 42), Some(first));
-        assert_eq!(bridge.link_for(0, "callee-b", 42), Some(second));
-        assert_eq!(bridge.link_for(1, "callee-a", 42), None);
+        assert_eq!(bridge.link_for(&branch(0), "callee-a", 42), Some(first));
+        assert_eq!(bridge.link_for(&branch(0), "callee-b", 42), Some(second));
+        assert_eq!(bridge.link_for(&branch(1), "callee-a", 42), None);
         assert_eq!(
             bridge.take(first).map(|prack| prack.to_tag),
             Some("callee-a".to_string())
         );
         assert!(bridge.take(first).is_none());
-        assert_eq!(bridge.link_for(0, "callee-a", 42), None);
+        assert_eq!(bridge.link_for(&branch(0), "callee-a", 42), None);
     }
 
     #[test]
@@ -409,14 +419,14 @@ mod tests {
         let mut bridge = PrackBridge::default();
         let first = bridge.hold(held(0, "callee-a", 42), None);
         bridge.hold(held(1, "callee-b", 7), None);
-        let taken: Vec<(usize, u32)> = bridge
+        let taken: Vec<(String, u32)> = bridge
             .take_all()
             .into_iter()
-            .map(|prack| (prack.b_leg_index, prack.rseq))
+            .map(|prack| (prack.branch, prack.rseq))
             .collect();
-        assert_eq!(taken, [(0, 42), (1, 7)]);
+        assert_eq!(taken, [(branch(0), 42), (branch(1), 7)]);
         assert!(bridge.take_all().is_empty());
         assert!(bridge.take(first).is_none());
-        assert_eq!(bridge.link_for(0, "callee-a", 42), None);
+        assert_eq!(bridge.link_for(&branch(0), "callee-a", 42), None);
     }
 }

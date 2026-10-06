@@ -17,6 +17,7 @@ in a language the SDKs don't cover.
 | --- | --- | --- |
 | Python | `pip install siphon-control` | `siphon-control` (PyPI) |
 | Rust | `cargo add siphon-control-client` | `siphon-control-client` (crates.io) |
+| TypeScript | `npm install @siphon-project/control ws` | `@siphon-project/control` (npm) |
 
 ```python
 import asyncio
@@ -36,6 +37,37 @@ async def handle(call):
 asyncio.run(client.run())
 ```
 
+## What a controller can do
+
+All three SDKs wrap every verb the server's `sip` adapter describes; each
+package's README lists them under its own names.
+
+- **Answer, or not:** `answer`, an anchored answer on the media engine, `ring`,
+  `progress`, `reject`, `hangup`, and `drop` for an unanswered call that is owed
+  no response.
+- **Place and ring calls:** `originate` to a URI or to a registered AoR; `dial`
+  to ring B-legs while keeping the channel, or with `on_answer: "bridge"` to ring
+  phones for an answered caller; `cancel_dial` to give a ringing dial up and
+  keep the caller; `route` to hand the call back to siphon.
+- **Transfer:** `refer`; `accept_refer` / `reject_refer` for an inbound REFER,
+  carried out by siphon (`terminate`), relayed (`transparent`) or left to the
+  application (`controller`, then `complete_refer` to report how it went);
+  `replace_peer` to swap a party with no REFER involved. A transfer target is a
+  URI or `{aor}`, a registered address-of-record, and the leg the transfer dials
+  takes the identity arguments `dial` takes (`from`, `from_display`,
+  `p_asserted_identity`, `privacy`, `headers`) and a `number_policy` or a
+  `format` for the numbers in them.
+- **Join calls:** `bridge` and `unbridge`.
+- **Media:** `play` (a file, a media-DB id, inline bytes, a `tone` or a `url`;
+  `repeat` is a total play count, or `"inf"` to play until stopped;
+  `gain_decibels` plays louder or quieter), `stop`, `dtmf`, `hold` / `unhold`, `stream_start` / `stream_stop`,
+  `record_start` / `record_stop`.
+- **Headers and variables:** `set_header` / `get_header` / `remove_header`,
+  `set_var` / `get_var`.
+
+A verb the configured media backend cannot carry out answers `unsupported_verb`:
+streaming, recording and an endless `play` need the siphon-rtp backend.
+
 ## The crates
 
 | Crate | Publishes to | Role |
@@ -43,6 +75,7 @@ asyncio.run(client.run())
 | [`siphon-control-proto`](siphon-control-proto/) | crates.io | Dependency-light wire DTOs (`CommandFrame` / `ReplyFrame` / `EventFrame`, error codes, handshake) — the single source of truth for the frames, shared by the server and every SDK. |
 | [`siphon-control-client`](siphon-control-client/) | crates.io | Async Rust client: protocol-agnostic core (`command(module, verb, target, args)`, request-id correlation, reconnect + `resync`) plus a typed `sip::Call` facade. |
 | [`siphon-control`](siphon-control/) | PyPI (wheel) | PyO3 bindings over the Rust client — `ControlClient` + `Call` as asyncio awaitables, `@client.on_call` dispatch. |
+| [`@siphon-project/control`](typescript/) | npm | TypeScript / Node client over the same wire: `SipClient` / `SipServer` and a typed `Call`. Not a crate, and not built on the Rust client. |
 
 `siphon-control` is a **native** extension, not pure Python. There is no abi3
 for free-threaded CPython, so wheels are built per interpreter: **cp314 (GIL)
@@ -51,12 +84,13 @@ is free-threaded.
 
 ## Versioning & release
 
-The three crates share one version (`0.1.0`), independent of the siphon server
-and tied to the `siphon-control.v1` protocol. They release on their own tag
-train — `control-sdk-vX.Y.Z` — driving
+The three crates and the TypeScript package share one version, independent of
+the siphon server and tied to the `siphon-control.v1` protocol. They release on
+their own tag train — `control-sdk-vX.Y.Z` — driving
 [`.github/workflows/release-control-sdk.yaml`](../.github/workflows/release-control-sdk.yaml),
-which builds the wheels (maturin) and publishes to PyPI and crates.io via OIDC
-Trusted Publishing (no stored tokens). This is a **standalone excluded
+which builds the wheels (maturin) and publishes to PyPI and crates.io, and
+[`.github/workflows/release-control-sdk-ts.yaml`](../.github/workflows/release-control-sdk-ts.yaml),
+which publishes to npm, all via OIDC Trusted Publishing (no stored tokens). This is a **standalone excluded
 workspace** with its own `Cargo.lock`: a root `cargo build` of siphon-sip never
 sweeps it, and nothing here publishes on its own — only a `control-sdk-v*` tag
 does.

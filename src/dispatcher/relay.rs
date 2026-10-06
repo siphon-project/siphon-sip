@@ -339,6 +339,19 @@ pub(super) fn relay_request(
         }
         None => None,
     };
+    // No pin of any kind: a destination outside the default listener's address
+    // family still needs the listener that can reach it (see
+    // `family_egress_socket`).  A script force_send_via keeps its own sent-by.
+    let family_egress = if send_socket.is_none()
+        && flow.is_none()
+        && ipsec_source.is_none()
+        && send_via_target.is_none()
+    {
+        state.family_egress_socket(outbound_transport, destination)
+    } else {
+        None
+    };
+    let send_socket = send_socket.or(family_egress.as_ref());
 
     // Add our Via — use the outbound transport for the Via header.
     // If force_send_via set a target, use it as the Via sent-by address.
@@ -499,6 +512,16 @@ pub(super) fn relay_request(
                 }
             }
 
+            record_client_hop(
+                &client_key,
+                destination,
+                outbound_transport,
+                flow.map(|flow| ConnectionId(flow.connection_id))
+                    .unwrap_or(placeholder_connection_id),
+                retransmit_source,
+                state,
+            );
+
             if let Some(srv_key) = server_key {
                 let mut session = ProxySession::new(
                     srv_key.clone(),
@@ -630,6 +653,11 @@ pub(super) fn relay_request(
     // the UAC instead of the UAS.  The `Arc` keeps the session alive
     // across the index removal, so the write always lands.
     if connection_id != placeholder_connection_id {
+        if let Some(client_key) = client_key_opt.as_ref() {
+            state
+                .transaction_manager
+                .set_client_connection(client_key, connection_id);
+        }
         if let (Some(client_key), Some(arc)) =
             (client_key_opt.as_ref(), inserted_session_arc.as_ref())
         {
@@ -963,6 +991,14 @@ pub(super) fn relay_fork_branch(
         }
         None => None,
     };
+    // Unpinned branch to the other address family: leave from the listener
+    // that can reach it (see `family_egress_socket`).
+    let family_egress = if send_socket.is_none() && flow.is_none() {
+        state.family_egress_socket(outbound_transport, destination)
+    } else {
+        None
+    };
+    let send_socket = send_socket.or(family_egress.as_ref());
 
     let transport_str = format!("{}", outbound_transport);
     // Same egress-pin precedence as every other request siphon originates: a
@@ -1085,6 +1121,15 @@ pub(super) fn relay_fork_branch(
                     );
                 }
             }
+            record_client_hop(
+                &client_key,
+                destination,
+                outbound_transport,
+                flow.map(|flow| ConnectionId(flow.connection_id))
+                    .unwrap_or(placeholder_connection_id),
+                retransmit_source,
+                state,
+            );
             state.session_store.register_fork_branch(
                 session_arc,
                 server_key,
@@ -1205,6 +1250,9 @@ pub(super) fn relay_fork_branch(
     // `remove_client_key`, so this write always lands.
     if connection_id != placeholder_connection_id {
         if let Some(client_key) = client_key_opt.as_ref() {
+            state
+                .transaction_manager
+                .set_client_connection(client_key, connection_id);
             if let Ok(mut session) = session_arc.write() {
                 if let Some(branch) = session.client_branches.get_mut(client_key) {
                     branch.connection_id = connection_id;
@@ -1212,6 +1260,29 @@ pub(super) fn relay_fork_branch(
             }
         }
     }
+}
+
+/// Record on client transaction `client_key` where its request is about to
+/// go: the hop its CANCEL and the ACK of its failure follow it to
+/// (RFC 3261 §9.1, §17.1.1.3), from the socket a retransmission would leave
+/// from. Before the send, like the session's own record of the branch.
+fn record_client_hop(
+    client_key: &TransactionKey,
+    destination: SocketAddr,
+    transport: Transport,
+    connection_id: ConnectionId,
+    source_local_addr: Option<SocketAddr>,
+    state: &DispatcherState,
+) {
+    state.transaction_manager.set_client_hop(
+        client_key,
+        crate::transaction::state::BranchHop {
+            destination,
+            transport,
+            connection_id,
+            source_local_addr,
+        },
+    );
 }
 
 /// Record-Route entries on `message`, flattened.

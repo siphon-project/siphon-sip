@@ -50,14 +50,17 @@ async fn a_late_provisional_from_a_carrier_that_failed_is_dropped() {
     );
     let first = invite_to(sequence.wire(), FIRST_CARRIER);
     sequence.carrier_answers(FIRST_CARRIER, &first, 503, "Service Unavailable");
+    let sent = sequence.wire();
     assert_eq!(
-        summaries(&sequence.wire()),
+        summaries(&sent),
         [
             format!("ACK to {FIRST_CARRIER}"),
             format!("INVITE to {SECOND_CARRIER}")
         ]
     );
     sequence.redialled();
+    // The carrier in flight holds the INVITE, which is not progress.
+    sequence.carrier_tries(SECOND_CARRIER, &invite_to(sent, SECOND_CARRIER));
 
     sequence.carrier_answers(FIRST_CARRIER, &first, 183, "Session Progress");
     assert_eq!(
@@ -98,6 +101,7 @@ async fn a_late_provisional_from_a_cancelled_carrier_is_dropped() {
         "",
     );
     let first = invite_to(sequence.wire(), FIRST_CARRIER);
+    sequence.carrier_tries(FIRST_CARRIER, &first);
     sequence.ring_for(Duration::from_secs(2));
     let sent = sequence.wire();
     assert_eq!(
@@ -286,6 +290,7 @@ async fn a_reliable_provisional_from_a_carrier_awaiting_its_487_draws_no_prack()
         "",
     );
     let first = invite_to(sequence.wire(), FIRST_CARRIER);
+    sequence.carrier_tries(FIRST_CARRIER, &first);
     sequence.ring_for(Duration::from_secs(2));
     assert_eq!(
         summaries(&sequence.wire()),
@@ -316,6 +321,7 @@ async fn a_reliable_provisional_from_a_cancelled_carrier_past_timer_h_draws_no_p
         "",
     );
     let first = invite_to(sequence.wire(), FIRST_CARRIER);
+    sequence.carrier_tries(FIRST_CARRIER, &first);
     sequence.ring_for(Duration::from_secs(2));
     assert_eq!(
         summaries(&sequence.wire()),

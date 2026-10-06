@@ -211,6 +211,7 @@ impl Sequence {
                     None,
                     None,
                     None,
+                    None,
                     &[],
                     &sequence.dispatcher.state,
                 );
@@ -271,6 +272,14 @@ impl Sequence {
         reason: &str,
     ) {
         self.carrier_answers_with(address, invite, status_code, reason, &[]);
+    }
+
+    /// The carrier at `address` answers its INVITE `100 Trying`: it holds the
+    /// INVITE and is working on it. Hop by hop, so nothing is relayed and it is
+    /// no progress (RFC 3261 §16.7 step 2), but it is a provisional, which a
+    /// CANCEL for that INVITE has to wait for (§9.1).
+    pub(super) fn carrier_tries(&self, address: &str, invite: &SipMessage) {
+        self.carrier_answers(address, invite, 100, "Trying");
     }
 
     /// [`Sequence::carrier_answers`] with `headers` set on the response, such as
@@ -376,7 +385,9 @@ async fn a_carrier_that_showed_progress_keeps_the_call_past_its_ring_timeout() {
 }
 
 /// Before progress nothing changes: a carrier that never answered is failed
-/// over at its own `timeout_secs`.
+/// over at its own `timeout_secs`. It has sent no provisional, so it is not
+/// CANCELled then (RFC 3261 §9.1): the CANCEL goes when it shows it holds the
+/// INVITE.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_carrier_that_never_responded_is_failed_over_at_its_ring_timeout() {
     let sequence = Sequence::start(
@@ -386,18 +397,22 @@ async fn a_carrier_that_never_responded_is_failed_over_at_its_ring_timeout() {
         ],
         5,
     );
-    invite_to(sequence.wire(), FIRST_CARRIER);
+    let first = invite_to(sequence.wire(), FIRST_CARRIER);
 
     sequence.ring_for(Duration::from_secs(2));
     assert_eq!(
         summaries(&sequence.wire()),
-        [
-            format!("CANCEL to {FIRST_CARRIER}"),
-            format!("INVITE to {SECOND_CARRIER}")
-        ]
+        [format!("INVITE to {SECOND_CARRIER}")]
     );
     assert!(sequence.failures_seen().is_none());
     assert!(!sequence.call_is_gone());
+
+    sequence.carrier_tries(FIRST_CARRIER, &first);
+    assert_eq!(
+        summaries(&sequence.wire()),
+        [format!("CANCEL to {FIRST_CARRIER}")],
+        "its first provisional draws the CANCEL"
+    );
 }
 
 /// A 100 is hop-by-hop (RFC 3261 §16.7 step 2): it says the next hop has the
@@ -453,6 +468,8 @@ async fn one_carriers_progress_does_not_keep_the_carrier_after_it() {
         ]
     );
     sequence.redialled();
+    // The second carrier holds the INVITE, which is not progress.
+    sequence.carrier_tries(SECOND_CARRIER, &invite_to(sent, SECOND_CARRIER));
 
     sequence.ring_for(Duration::from_secs(2));
     let sent = summaries(&sequence.wire());
@@ -484,16 +501,19 @@ async fn a_late_provisional_from_a_cancelled_carrier_does_not_mark_the_next_one(
         5,
     );
     let first = invite_to(sequence.wire(), FIRST_CARRIER);
+    sequence.carrier_tries(FIRST_CARRIER, &first);
 
     sequence.ring_for(Duration::from_secs(2));
+    let sent = sequence.wire();
     assert_eq!(
-        summaries(&sequence.wire()),
+        summaries(&sent),
         [
             format!("CANCEL to {FIRST_CARRIER}"),
             format!("INVITE to {SECOND_CARRIER}")
         ]
     );
     sequence.redialled();
+    sequence.carrier_tries(SECOND_CARRIER, &invite_to(sent, SECOND_CARRIER));
 
     sequence.carrier_answers(FIRST_CARRIER, &first, 183, "Session Progress");
     assert_eq!(

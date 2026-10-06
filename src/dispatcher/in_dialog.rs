@@ -357,13 +357,17 @@ pub(super) fn uac_route_set_from_record_routes(record_routes: &[String]) -> Vec<
 /// their `Record-Route` — a lenient proxy forwards it anyway, one that keys media
 /// on that token never opens the media path, and the call answers silent.
 ///
+/// The leg is the one whose INVITE rode Via `branch`, found under the lock that
+/// writes to it: a call ringing several transfer targets has several such legs,
+/// and a position read beforehand may be another's by the time it is used.
+///
 /// Returns whether a route set was stored. `false` covers the ordinary
 /// direct-peer case where the 2xx carries no `Record-Route`, and leaves whatever
 /// the leg already had alone.
 pub(super) fn store_b_leg_route_set_from_2xx(
     call_actors: &CallActorStore,
     call_id: &str,
-    leg_index: usize,
+    branch: &str,
     response: &SipMessage,
 ) -> bool {
     let route_set = uac_route_set_from_record_routes(
@@ -379,7 +383,7 @@ pub(super) fn store_b_leg_route_set_from_2xx(
     let Some(mut call) = call_actors.get_call_mut(call_id) else {
         return false;
     };
-    let Some(leg) = call.b_legs.get_mut(leg_index) else {
+    let Some((_, leg)) = call.find_b_leg_by_branch_mut(branch) else {
         return false;
     };
     leg.dialog.route_set = route_set;

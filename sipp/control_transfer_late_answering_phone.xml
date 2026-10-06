@@ -1,0 +1,92 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  The phone of the `cancel-late-answer` case: rung by a bridging dial, it
+  answers nothing at all for four seconds, during which the dial is given up
+  with `cancel_dial`, and then answers 200 without ever having sent a
+  provisional response.
+
+  recv INVITE (offerless) -> (4 s, nothing sent) -> 200 (our offer)
+              -> recv ACK (an answer) -> recv BYE -> 200
+
+  RFC 3261 §9.1: a CANCEL "MUST NOT be sent" for an INVITE that has drawn no
+  provisional response, and "SHOULD NOT be sent" once it has drawn a final
+  one. This INVITE goes from the first state straight to the second, so no
+  CANCEL belongs on this dialog at any point: SIPp fails the call on a request
+  that arrives while it pauses, and on one that arrives where the ACK or the
+  BYE is expected.
+
+  The 2xx creates a dialog for a dial nobody wants any more, so it is ACKed
+  (§13.2.2.4) and then released with a BYE (§15). The INVITE carried no offer,
+  so the 200 carries one and the ACK has to carry the answer (§13.2.1). Both
+  are mandatory rows under -timeout_error.
+
+  The INVITE's Call-ID is echoed to the container's output, where the runner
+  compares it with what the application was told
+  (sipp/control/run_transfer_case.sh).
+-->
+<scenario name="control-transfer phone that is silent, then answers">
+
+  <recv request="INVITE" crlf="true">
+    <action>
+      <ereg regexp="[^[:space:]]+" search_in="hdr" header="Call-ID:" assign_to="wire_call_id" />
+      <ereg regexp="m=audio"
+            search_in="msg" check_it_inverse="true" assign_to="offerless" />
+      <exec command="echo WIRE-CALL-ID [$wire_call_id]" />
+      <log message="rung offerless: [$offerless]" />
+    </action>
+  </recv>
+
+  <!-- No response of any kind: the INVITE has drawn no provisional. -->
+  <pause milliseconds="4000" />
+
+  <send retrans="500">
+    <![CDATA[
+SIP/2.0 200 OK
+[last_Via:]
+[last_From:]
+[last_To:];tag=[pid]SIPpTag01[call_number]
+[last_Call-ID:]
+[last_CSeq:]
+Contact: <sip:phone@[local_ip]:[local_port];transport=[transport]>
+Content-Type: application/sdp
+Content-Length: [len]
+
+v=0
+o=phone 53655765 2353687637 IN IP[local_ip_type] [local_ip]
+s=-
+c=IN IP[media_ip_type] [media_ip]
+t=0 0
+m=audio [media_port] RTP/AVP 8 101
+a=rtpmap:8 PCMA/8000
+a=rtpmap:101 telephone-event/8000
+a=fmtp:101 0-15
+a=ptime:20
+]]>
+  </send>
+
+  <recv request="ACK" timeout="10000">
+    <action>
+      <ereg regexp="m=audio"
+            search_in="body" check_it="true" assign_to="answer_on_ack" />
+      <log message="the late 200 was ACKed with an answer: [$answer_on_ack]" />
+    </action>
+  </recv>
+
+  <recv request="BYE" timeout="10000" />
+
+  <send>
+    <![CDATA[
+SIP/2.0 200 OK
+[last_Via:]
+[last_From:]
+[last_To:]
+[last_Call-ID:]
+[last_CSeq:]
+Content-Length: 0
+
+]]>
+  </send>
+
+</scenario>
