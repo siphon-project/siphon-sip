@@ -2,7 +2,7 @@
 name = "siphon-bin"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.80"
+rust-version = "1.89"
 license = "MIT"
 description = "SIPhon binary with opt-in, feature-gated extension modules (SMPP, HTTP, SIGTRAN, …)"
 # Built from source by operators who want extensions. The plain `siphon` binary
