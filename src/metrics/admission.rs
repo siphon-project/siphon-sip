@@ -107,7 +107,7 @@ pub fn record_refusal(refusal: &Refusal) {
         RefusalScope::Global => metrics.refused_total.with_label_values(&[reason]).inc(),
         RefusalScope::Gateway(group) => metrics
             .gateway_refused_total
-            .with_label_values(&[group, reason])
+            .with_label_values(&[group.as_ref(), reason])
             .inc(),
     }
 }
@@ -117,6 +117,24 @@ pub fn record_refusal(refusal: &Refusal) {
 /// The gauges are cleared first, which is what drops the series of a group
 /// that has been removed or has lost its limit since the last publish.
 pub fn publish_gateway_usage(usage: &[InboundUsage]) {
+    // The gauges are process-wide, and in a test binary every dispatcher that
+    // sweeps publishes to them. A test reading back what it published holds
+    // this for the whole exchange.
+    #[cfg(test)]
+    let _serial = publish_serial();
+    publish_gateway_usage_unserialised(usage);
+}
+
+/// One publish at a time in a test binary, see [`publish_gateway_usage`].
+#[cfg(test)]
+fn publish_serial() -> std::sync::MutexGuard<'static, ()> {
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn publish_gateway_usage_unserialised(usage: &[InboundUsage]) {
     let Some(metrics) = ADMISSION_METRICS.get() else {
         return;
     };
@@ -227,6 +245,10 @@ mod tests {
             },
         };
         let present = |exposition: &str, needle: &str| exposition.contains(needle);
+        // Held from the first publish to the last read: another test's sweep
+        // publishing in between would clear what this one is about to read.
+        let _serial = publish_serial();
+        let publish_gateway_usage = publish_gateway_usage_unserialised;
 
         publish_gateway_usage(&[usage("usage-test-a", 7), usage("usage-test-b", 2)]);
         let exposition = crate::metrics::encode_metrics();
