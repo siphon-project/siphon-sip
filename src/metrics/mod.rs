@@ -46,6 +46,14 @@ pub fn try_metrics() -> Option<&'static SiphonMetrics> {
 /// Returns an error if metric creation fails (should never happen with
 /// valid hardcoded metric names — indicates a bug if it does).
 pub fn init() -> Result<(), prometheus::Error> {
+    // One caller builds the metrics; a second one arriving meanwhile waits and
+    // then finds them built. Without this two callers each built a registry,
+    // and the admission gauges of the one could be kept beside the registry of
+    // the other, where nothing that reads the exposition would ever see them.
+    static BUILDING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _building = BUILDING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if METRICS.get().is_some() {
         return Ok(());
     }
