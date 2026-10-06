@@ -13,15 +13,6 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
-### Changed
-
-- **The minimum Rust version is 1.89, and CI now builds with it.**
-  `rust-version` said 1.80, which no job checked and which was not true: the
-  locked dependencies need 1.89. Building from source with an older compiler
-  already failed, in a dependency, so this corrects the declared number rather
-  than raising the real one. A new CI job builds the library and the binary
-  with exactly the declared version.
-
 ## [1.13.0] — 2026-10-06
 
 ### Added
@@ -190,6 +181,12 @@ entry, but a working config keeps working.
 
 ### Changed
 
+- **The minimum Rust version is 1.89, and CI now builds with it.**
+  `rust-version` said 1.80, which no job checked and which was not true: the
+  locked dependencies need 1.89. Building from source with an older compiler
+  already failed, in a dependency, so this corrects the declared number rather
+  than raising the real one. A new CI job builds the library and the binary
+  with exactly the declared version.
 - **`play` refuses an argument it cannot use.** A `repeat`, `start_ms`,
   `duration_ms`, `gain_decibels` or `to_tag` of the wrong type used to be read
   as absent, so the prompt played once from the start at full level and the
