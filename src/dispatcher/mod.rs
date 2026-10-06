@@ -84,6 +84,8 @@ mod timers;
 #[cfg(test)]
 mod a_leg_reliable_provisional_tests;
 #[cfg(test)]
+mod admission_tests;
+#[cfg(test)]
 mod advertised_port_tests;
 #[cfg(test)]
 mod b2bua_conclude_once_tests;
@@ -603,6 +605,10 @@ pub async fn run(
         log_dial: config.b2bua.log_dial_enabled(),
         default_max_call_duration_secs: config.b2bua.resolved_max_call_duration_secs(),
         assert_identity: config.b2bua.assert_identity_enabled(),
+        admission: Arc::new(crate::admission::AdmissionController::new(
+            config.b2bua.resolved_inbound_limits(),
+        )),
+        refused_invites: Arc::new(crate::admission::refused::RefusedInvites::default()),
         registrant_manager,
         recording_manager: Arc::new(crate::siprec::RecordingManager::new(
             product_name,
@@ -681,6 +687,10 @@ pub async fn run(
     let _ = drain.call_actors.set(Arc::clone(&state.call_actors));
 
     install_charging_hooks(&state);
+
+    // Published now as well as on the sweep, so the limit gauges are right
+    // from the first scrape rather than thirty seconds in.
+    crate::metrics::admission::publish_limits(state.admission.limits());
 
     spawn_timer_sweep(&state);
 

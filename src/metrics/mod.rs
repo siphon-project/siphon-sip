@@ -4,6 +4,7 @@
 //! registrations, dialogs, and transport connections. Metrics are collected
 //! inline (at the call site) and scraped via the HTTP admin API `/metrics`.
 
+pub mod admission;
 pub mod custom;
 pub mod glibc;
 
@@ -50,6 +51,7 @@ pub fn init() -> Result<(), prometheus::Error> {
     }
     let _ = STARTED_AT.set(std::time::Instant::now());
     let metrics = SiphonMetrics::new()?;
+    admission::init(&metrics.registry)?;
     let custom = Arc::new(CustomMetrics::new(&metrics.registry));
     let _ = CUSTOM_METRICS.set(custom);
     let _ = METRICS.set(metrics);

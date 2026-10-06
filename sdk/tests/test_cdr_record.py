@@ -451,6 +451,39 @@ def test_unanswered_call_record():
     assert record.ended_at is not None
 
 
+def test_a_refused_call_record_names_the_refusal():
+    # An inbound call siphon turned away at b2bua.inbound_limit: no answer, no
+    # far end, and the two refusal fields flattened in beside the fixed ones.
+    payload = call_record()
+    payload.update(
+        {
+            "response_code": 503,
+            "timestamp_answer": None,
+            "duration_secs": 0.0,
+            "destination_ip": "",
+            "disconnect_initiator": "local",
+            "refusal_scope": "global",
+            "refusal_reason": "concurrent",
+        }
+    )
+    record = CallDetailRecord.from_dict(payload)
+
+    assert record.is_refused is True
+    assert record.refusal_scope == "global"
+    assert record.refusal_reason == "concurrent"
+    assert record.disconnect_initiator == "local"
+    assert record.answered is False
+    assert record.extra == {"refusal_scope": "global", "refusal_reason": "concurrent"}
+    assert CallDetailRecord.from_dict(record.to_dict()) == record
+
+
+def test_an_ordinary_call_record_is_not_a_refusal():
+    record = CallDetailRecord.from_dict(call_record())
+    assert record.is_refused is False
+    assert record.refusal_scope is None
+    assert record.refusal_reason is None
+
+
 def test_unparseable_media_value_reads_as_none_not_a_crash():
     payload = media_record()
     payload["far_mos_average"] = "n/a"

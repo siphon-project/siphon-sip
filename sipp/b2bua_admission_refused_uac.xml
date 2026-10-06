@@ -1,0 +1,156 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!-- The caller that meets `b2bua.inbound_limit` (sipp/b2bua-admission/). The
+     holder's call is up when it starts.
+
+     1. Its INVITE is refused: 503 with Retry-After: 1 (RFC 3261 §21.5.4), and
+        no 100 before it, because the refusal is the only thing siphon does with
+        the request. Any other response here fails the call.
+     2. Once the holder has hung up it tries again and is answered. The retry
+        keeps the Call-ID and raises the CSeq (RFC 3261 §8.1.3.5), so it is a
+        new transaction with a new branch: the refusal siphon remembers for the
+        first INVITE's retransmissions must not answer it.
+
+     Each attempt carries its own From-tag; the To-tag is taken from the 200. -->
+
+<scenario name="B2BUA inbound limit: refused, then admitted once the slot is free">
+
+  <!-- Let the holder's call be answered first. -->
+  <pause milliseconds="2000" />
+
+  <!-- ── 1. Refused ──────────────────────────────────────────────────────── -->
+  <send retrans="500">
+    <![CDATA[
+INVITE sip:refused@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:caller@[local_ip]>;tag=[pid]Refused[call_number]
+To: <sip:refused@[remote_ip]>
+Call-ID: [call_id]
+CSeq: 1 INVITE
+Contact: <sip:caller@[local_ip]:[local_port];transport=[transport]>
+Max-Forwards: 70
+Content-Type: application/sdp
+Content-Length: [len]
+
+v=0
+o=caller 1 1 IN IP[local_ip_type] [local_ip]
+s=-
+c=IN IP[media_ip_type] [media_ip]
+t=0 0
+m=audio [media_port] RTP/AVP 0
+a=rtpmap:0 PCMU/8000
+]]>
+  </send>
+
+  <recv response="503" rtd="true">
+    <action>
+      <ereg regexp=".*" search_in="hdr" header="Retry-After:"
+            assign_to="retry_after" />
+      <ereg regexp="[[:space:]]*1[[:space:]]*$"
+            search_in="hdr" header="Retry-After:" check_it="true"
+            assign_to="retry_after_own" />
+      <strcmp assign_to="retry_after_compared"
+              variable="retry_after" variable2="retry_after_own" />
+      <test assign_to="retry_after_differs"
+            variable="retry_after_compared" compare="not_equal" value="0" />
+      <log message="503 carries Retry-After [$retry_after]" />
+    </action>
+  </recv>
+
+  <send>
+    <![CDATA[
+ACK sip:refused@[remote_ip]:[remote_port] SIP/2.0
+[last_Via:]
+From: <sip:caller@[local_ip]>;tag=[pid]Refused[call_number]
+[last_To:]
+Call-ID: [call_id]
+CSeq: 1 ACK
+Max-Forwards: 70
+Content-Length: 0
+
+]]>
+  </send>
+
+  <nop next="wrong_retry_after" test="retry_after_differs" />
+
+  <!-- The holder hangs up 8 s after it was answered; wait it out. -->
+  <pause milliseconds="8000" />
+
+  <!-- ── 2. Admitted once the slot is free ───────────────────────────────── -->
+  <send retrans="500">
+    <![CDATA[
+INVITE sip:admitted@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:caller@[local_ip]>;tag=[pid]Admitted[call_number]
+To: <sip:admitted@[remote_ip]>
+Call-ID: [call_id]
+CSeq: 2 INVITE
+Contact: <sip:caller@[local_ip]:[local_port];transport=[transport]>
+Max-Forwards: 70
+Content-Type: application/sdp
+Content-Length: [len]
+
+v=0
+o=caller 2 2 IN IP[local_ip_type] [local_ip]
+s=-
+c=IN IP[media_ip_type] [media_ip]
+t=0 0
+m=audio [media_port] RTP/AVP 0
+a=rtpmap:0 PCMU/8000
+]]>
+  </send>
+
+  <recv response="100" optional="true" />
+  <recv response="200" rtd="true" crlf="true">
+    <action>
+      <ereg regexp=".*" search_in="hdr" header="To:" assign_to="admitted_to" />
+    </action>
+  </recv>
+
+  <send>
+    <![CDATA[
+ACK sip:[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:caller@[local_ip]>;tag=[pid]Admitted[call_number]
+To:[$admitted_to]
+Call-ID: [call_id]
+CSeq: 2 ACK
+Max-Forwards: 70
+Content-Length: 0
+
+]]>
+  </send>
+
+  <pause milliseconds="1000" />
+
+  <send retrans="500">
+    <![CDATA[
+BYE sip:[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:caller@[local_ip]>;tag=[pid]Admitted[call_number]
+To:[$admitted_to]
+Call-ID: [call_id]
+CSeq: 3 BYE
+Max-Forwards: 70
+Content-Length: 0
+
+]]>
+  </send>
+
+  <recv response="200" crlf="true" />
+
+  <nop next="done" />
+
+  <label id="wrong_retry_after" />
+  <nop>
+    <action>
+      <log message="WRONG RETRY-AFTER: siphon's 503 carried Retry-After [$retry_after], expected 1" />
+    </action>
+  </nop>
+  <!-- Nothing sends this; the timeout fails the call. -->
+  <recv request="WRONG_RETRY_AFTER" timeout="100" />
+
+  <label id="done" />
+
+</scenario>

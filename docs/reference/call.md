@@ -248,6 +248,69 @@ closed when the call ends, not when that BYE goes out.
 
 ::: siphon_sdk.call.Call.set_max_duration
 
+## Limiting inbound calls: `b2bua.inbound_limit`
+
+A B2BUA instance accepts every call it is sent unless told otherwise.
+`b2bua.inbound_limit` puts a ceiling on that, so there is a number to plan
+capacity against:
+
+```yaml
+b2bua:
+  inbound_limit:
+    max_concurrent_calls: 20000   # calls held at once
+    max_calls_per_second: 500     # new calls, with a burst of one second's worth
+    reject_code: 503              # default
+    retry_after_secs: 1           # default; 0 omits Retry-After
+```
+
+Both ceilings are unset by default, and `0` means unlimited.
+
+The check runs on the inbound initial INVITE **before `@b2bua.on_invite`**. A
+call past either ceiling is answered by siphon: `503 Service Unavailable` with
+`Retry-After` (RFC 3261 §21.5.4), or whatever `reject_code` names. **No handler
+fires for a refused call.** There is no `Call`, so nothing for a script to log
+or re-route. Two things record it:
+
+- a CDR with `disconnect_initiator="local"`, the refusal's status in
+  `response_code`, and `refusal_scope` / `refusal_reason` (`concurrent` or
+  `rate`) flattened in beside the fixed fields;
+- `siphon_b2bua_inbound_calls_refused_total{reason}`.
+
+Only inbound calls are refused. These still take a slot, so
+`max_concurrent_calls` stays the number of calls the instance is carrying, but
+are never turned away:
+
+- a call siphon places itself (`b2bua.originate`, the control plane);
+- an emergency call, whose request URI is `urn:service:sos` or a sub-service
+  of it (RFC 5031). An emergency number dialled as a `sip:` URI is not
+  recognised;
+- an INVITE taking over a dialog with `Replaces` (RFC 3891).
+
+What to size the ceilings by:
+
+- **`max_calls_per_second` counts INVITEs.** A call the script challenges with
+  `auth.require_proxy_digest()` arrives twice, the challenged INVITE and the
+  retry carrying credentials, so it spends two.
+- **The ceilings are per instance.** N nodes behind a load balancer accept N
+  times what is configured.
+- **A 503 moves traffic.** Many peers read it as "this server is down" and send
+  everything elsewhere, for `Retry-After` seconds if the header is there. That is
+  what an overloaded instance wants. `reject_code: 486` or `480` is gentler.
+- **The source address is not checked.** Any caller can claim the emergency
+  exemption by addressing `urn:service:sos`.
+
+The limits are published as gauges (`0` = unlimited), so utilisation is one
+division: `siphon_b2bua_calls_active / siphon_b2bua_max_concurrent_calls`.
+
+A retransmission of a refused INVITE is answered with the same response and is
+not counted again (RFC 3261 §17.2.1). A new attempt, which carries a new Via
+branch, is admitted or refused on its own.
+
+Test a script against a limit with
+`SipTestHarness.set_inbound_limit()`:
+
+::: siphon_sdk.testing.SipTestHarness.set_inbound_limit
+
 ## `MediaHandle`
 
 Returned by `call.media` — controls RTP anchoring for the call.

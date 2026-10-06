@@ -1,0 +1,77 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!-- An emergency call placed while the holder's call has the one slot
+     `b2bua.inbound_limit` allows (sipp/b2bua-admission/).
+
+     The request URI is urn:service:sos (RFC 5031), so siphon counts the call and
+     does not refuse it: the 200 here is the assertion. A 503 fails the call. -->
+
+<scenario name="B2BUA inbound limit: an emergency call is admitted at the ceiling">
+
+  <!-- Let the holder's call be answered first. -->
+  <pause milliseconds="2000" />
+
+  <send retrans="500">
+    <![CDATA[
+INVITE urn:service:sos SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:caller@[local_ip]>;tag=[pid]Emergency[call_number]
+To: <urn:service:sos>
+Call-ID: [call_id]
+CSeq: 1 INVITE
+Contact: <sip:caller@[local_ip]:[local_port];transport=[transport]>
+Max-Forwards: 70
+Content-Type: application/sdp
+Content-Length: [len]
+
+v=0
+o=caller 1 1 IN IP[local_ip_type] [local_ip]
+s=-
+c=IN IP[media_ip_type] [media_ip]
+t=0 0
+m=audio [media_port] RTP/AVP 0
+a=rtpmap:0 PCMU/8000
+]]>
+  </send>
+
+  <recv response="100" optional="true" />
+  <recv response="200" rtd="true" crlf="true">
+    <action>
+      <ereg regexp=".*" search_in="hdr" header="To:" assign_to="emergency_to" />
+    </action>
+  </recv>
+
+  <send>
+    <![CDATA[
+ACK sip:[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:caller@[local_ip]>;tag=[pid]Emergency[call_number]
+To:[$emergency_to]
+Call-ID: [call_id]
+CSeq: 1 ACK
+Max-Forwards: 70
+Content-Length: 0
+
+]]>
+  </send>
+
+  <pause milliseconds="1000" />
+
+  <send retrans="500">
+    <![CDATA[
+BYE sip:[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:caller@[local_ip]>;tag=[pid]Emergency[call_number]
+To:[$emergency_to]
+Call-ID: [call_id]
+CSeq: 2 BYE
+Max-Forwards: 70
+Content-Length: 0
+
+]]>
+  </send>
+
+  <recv response="200" crlf="true" />
+
+</scenario>

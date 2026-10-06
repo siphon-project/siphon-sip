@@ -152,6 +152,13 @@ pub struct DispatcherState {
     /// not want a PAI ignores it, while one that wants it and does not get it
     /// rejects or mis-bills the call.
     pub assert_identity: bool,
+    /// Admission control for inbound B2BUA calls. Built from
+    /// `config.b2bua.inbound_limit`; with that unset it counts calls and
+    /// refuses none.
+    pub admission: Arc<crate::admission::AdmissionController>,
+    /// INVITEs admission refused, remembered so a retransmission is answered
+    /// again rather than counted again. The periodic sweep prunes it.
+    pub refused_invites: Arc<crate::admission::refused::RefusedInvites>,
     /// Outbound registration manager (None when registrant is not configured).
     pub registrant_manager: Option<Arc<crate::registrant::RegistrantManager>>,
     /// SIPREC recording manager (SRC role — sends recordings to external SRS).

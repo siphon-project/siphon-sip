@@ -1239,6 +1239,22 @@ class MockB2bua:
         """Register handler for new INVITE (new call).
 
         Handler signature: ``(call) -> None``
+
+        Not every inbound INVITE reaches this handler. With
+        ``b2bua.inbound_limit`` configured, a call past
+        ``max_concurrent_calls`` or ``max_calls_per_second`` is refused by
+        siphon first (``503`` and ``Retry-After`` unless configured otherwise)
+        and no handler runs for it: there is no ``Call``, and nothing for a
+        script to log or re-route. The refusal is visible as a CDR
+        (:attr:`siphon_sdk.cdr.CallDetailRecord.is_refused`) and in
+        ``siphon_b2bua_inbound_calls_refused_total``.
+
+        ``max_calls_per_second`` counts INVITEs, so a call this handler
+        challenges with ``auth.require_proxy_digest()`` spends two: the
+        challenged INVITE and the retry that carries credentials.
+
+        Test it with
+        :meth:`siphon_sdk.testing.SipTestHarness.set_inbound_limit`.
         """
         is_async = asyncio.iscoroutinefunction(fn)
         _registry.register("b2bua.on_invite", None, fn, is_async)

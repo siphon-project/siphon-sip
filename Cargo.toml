@@ -244,6 +244,10 @@ name = "dialog_state"      # DialogStateChanged: per-message gate, per-branch ma
 harness = false
 
 [[bench]]
+name = "admission"         # b2bua.inbound_limit: the per-INVITE admission check and the refused-retransmission lookup
+harness = false
+
+[[bench]]
 name = "b2bua_provisional" # RFC 3261 §9.1: recording a provisional on its branch, per 1xx to an INVITE
 harness = false
 
