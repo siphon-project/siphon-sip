@@ -152,7 +152,7 @@ pub fn b_leg_answered(
                                 Ok(ret) => {
                                     if handler.is_async {
                                         if let Err(error) = run_coroutine(python, &ret) {
-                                            error!("async B2BUA on_answer handler error: {error}");
+                                            record_script_error("async B2BUA on_answer", &error);
                                             raised = true;
                                         }
                                     }

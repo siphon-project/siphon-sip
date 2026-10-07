@@ -167,7 +167,7 @@ fn run_handlers(
                 Err(error) => Err(error),
             };
             if let Err(error) = outcome {
-                error!(decorator, %error, "PCF callback handler failed");
+                error!(decorator, error = %crate::script::error_report::describe(python, &error), "PCF callback handler failed");
             }
         }
     });

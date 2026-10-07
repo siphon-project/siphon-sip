@@ -509,8 +509,13 @@ pub struct ReliableProvisional {
 /// declared but never incremented — which is what happens when thirty-odd call
 /// sites each have to remember to bump it. `context` names the handler, e.g.
 /// `"B2BUA on_invite"`.
-pub fn record_script_error(context: &str, error: &dyn std::fmt::Display) {
-    error!("{context} handler error: {error}");
+///
+/// The line carries the script file, line number and Python traceback (see
+/// `script::error_report`), not just the exception text.
+pub fn record_script_error(context: &str, error: &pyo3::PyErr) {
+    let detail =
+        pyo3::Python::attach(|python| crate::script::error_report::describe(python, error));
+    error!("{context} handler error: {detail}");
     if let Some(metrics) = crate::metrics::try_metrics() {
         metrics.script_errors_total.inc();
     }

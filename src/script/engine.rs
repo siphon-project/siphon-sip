@@ -700,8 +700,9 @@ impl ScriptEngine {
             .call1((&code_object, &globals))
             .map_err(|error| {
                 SiphonError::Script(format!(
-                    "script execution failed for {}: {error}",
-                    path.display()
+                    "script execution failed for {}: {}",
+                    path.display(),
+                    crate::script::error_report::describe(python, &error)
                 ))
             })?;
 
@@ -1222,14 +1223,14 @@ async fn timer_loop(
                             if let Err(error) = run_coroutine(python, &ret) {
                                 warn!(
                                     timer = %timer_name,
-                                    %error,
+                                    error = %crate::script::error_report::describe(python, &error),
                                     "async timer callback error"
                                 );
                             }
                         }
                     }
                     Err(error) => {
-                        warn!(timer = %timer_name, %error, "timer callback error");
+                        warn!(timer = %timer_name, error = %crate::script::error_report::describe(python, &error), "timer callback error");
                     }
                 }
             });

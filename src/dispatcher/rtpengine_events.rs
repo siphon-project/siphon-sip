@@ -134,7 +134,7 @@ async fn run_dtmf_handlers(
                         if handler.is_async {
                             if let Err(error) = run_coroutine(python, &ret) {
                                 tracing::error!(
-                                    %error,
+                                    error = %crate::script::error_report::describe(python, &error),
                                     "async rtpengine.on_dtmf handler error"
                                 );
                             }
@@ -142,7 +142,7 @@ async fn run_dtmf_handlers(
                     }
                     Err(error) => {
                         tracing::error!(
-                            %error,
+                            error = %crate::script::error_report::describe(python, &error),
                             "rtpengine.on_dtmf handler failed"
                         );
                     }
@@ -202,7 +202,7 @@ async fn on_media_timeout(
                         if handler.is_async {
                             if let Err(error) = run_coroutine(python, &ret) {
                                 tracing::error!(
-                                    %error,
+                                    error = %crate::script::error_report::describe(python, &error),
                                     "async rtpengine.on_media_timeout handler error"
                                 );
                             }
@@ -210,7 +210,7 @@ async fn on_media_timeout(
                     }
                     Err(error) => {
                         tracing::error!(
-                            %error,
+                            error = %crate::script::error_report::describe(python, &error),
                             "rtpengine.on_media_timeout handler failed"
                         );
                     }
@@ -340,7 +340,7 @@ async fn on_text(state: &Arc<DispatcherState>, text_event: crate::rtpengine::eve
                         if handler.is_async {
                             if let Err(error) = run_coroutine(python, &ret) {
                                 tracing::error!(
-                                    %error,
+                                    error = %crate::script::error_report::describe(python, &error),
                                     "async rtpengine.on_text handler error"
                                 );
                             }
@@ -348,7 +348,7 @@ async fn on_text(state: &Arc<DispatcherState>, text_event: crate::rtpengine::eve
                     }
                     Err(error) => {
                         tracing::error!(
-                            %error,
+                            error = %crate::script::error_report::describe(python, &error),
                             "rtpengine.on_text handler failed"
                         );
                     }
@@ -402,7 +402,7 @@ async fn on_ws_tee_started(
                         if handler.is_async {
                             if let Err(error) = run_coroutine(python, &ret) {
                                 tracing::error!(
-                                    %error,
+                                    error = %crate::script::error_report::describe(python, &error),
                                     "async rtpengine.on_ws_tee_started handler error"
                                 );
                             }
@@ -410,7 +410,7 @@ async fn on_ws_tee_started(
                     }
                     Err(error) => {
                         tracing::error!(
-                            %error,
+                            error = %crate::script::error_report::describe(python, &error),
                             "rtpengine.on_ws_tee_started handler failed"
                         );
                     }
@@ -500,7 +500,7 @@ async fn on_play_finished(
                         if handler.is_async {
                             if let Err(error) = run_coroutine(python, &ret) {
                                 tracing::error!(
-                                    %error,
+                                    error = %crate::script::error_report::describe(python, &error),
                                     "async rtpengine.on_play_finished handler error"
                                 );
                             }
@@ -508,7 +508,7 @@ async fn on_play_finished(
                     }
                     Err(error) => {
                         tracing::error!(
-                            %error,
+                            error = %crate::script::error_report::describe(python, &error),
                             "rtpengine.on_play_finished handler failed"
                         );
                     }
@@ -558,7 +558,7 @@ async fn on_ws_bridge_started(
                         if handler.is_async {
                             if let Err(error) = run_coroutine(python, &ret) {
                                 tracing::error!(
-                                    %error,
+                                    error = %crate::script::error_report::describe(python, &error),
                                     "async rtpengine.on_ws_bridge_started handler error"
                                 );
                             }
@@ -566,7 +566,7 @@ async fn on_ws_bridge_started(
                     }
                     Err(error) => {
                         tracing::error!(
-                            %error,
+                            error = %crate::script::error_report::describe(python, &error),
                             "rtpengine.on_ws_bridge_started handler failed"
                         );
                     }
@@ -630,7 +630,7 @@ async fn on_ws_bridge_ended(
                         if handler.is_async {
                             if let Err(error) = run_coroutine(python, &ret) {
                                 tracing::error!(
-                                    %error,
+                                    error = %crate::script::error_report::describe(python, &error),
                                     "async rtpengine.on_ws_bridge_ended handler error"
                                 );
                             }
@@ -638,7 +638,7 @@ async fn on_ws_bridge_ended(
                     }
                     Err(error) => {
                         tracing::error!(
-                            %error,
+                            error = %crate::script::error_report::describe(python, &error),
                             "rtpengine.on_ws_bridge_ended handler failed"
                         );
                     }
@@ -704,7 +704,7 @@ async fn on_ws_tee_ended(state: &Arc<DispatcherState>, tee: crate::rtpengine::ev
                         if handler.is_async {
                             if let Err(error) = run_coroutine(python, &ret) {
                                 tracing::error!(
-                                    %error,
+                                    error = %crate::script::error_report::describe(python, &error),
                                     "async rtpengine.on_ws_tee_ended handler error"
                                 );
                             }
@@ -712,7 +712,7 @@ async fn on_ws_tee_ended(state: &Arc<DispatcherState>, tee: crate::rtpengine::ev
                     }
                     Err(error) => {
                         tracing::error!(
-                            %error,
+                            error = %crate::script::error_report::describe(python, &error),
                             "rtpengine.on_ws_tee_ended handler failed"
                         );
                     }
@@ -761,7 +761,7 @@ async fn on_beep_detected(
                         if handler.is_async {
                             if let Err(error) = run_coroutine(python, &ret) {
                                 tracing::error!(
-                                    %error,
+                                    error = %crate::script::error_report::describe(python, &error),
                                     "async rtpengine.on_beep handler error"
                                 );
                             }
@@ -769,7 +769,7 @@ async fn on_beep_detected(
                     }
                     Err(error) => {
                         tracing::error!(
-                            %error,
+                            error = %crate::script::error_report::describe(python, &error),
                             "rtpengine.on_beep handler failed"
                         );
                     }
@@ -822,7 +822,7 @@ async fn on_media_started(
                         if handler.is_async {
                             if let Err(error) = run_coroutine(python, &ret) {
                                 tracing::error!(
-                                    %error,
+                                    error = %crate::script::error_report::describe(python, &error),
                                     "async rtpengine.on_media_started handler error"
                                 );
                             }
@@ -830,7 +830,7 @@ async fn on_media_started(
                     }
                     Err(error) => {
                         tracing::error!(
-                            %error,
+                            error = %crate::script::error_report::describe(python, &error),
                             "rtpengine.on_media_started handler failed"
                         );
                     }

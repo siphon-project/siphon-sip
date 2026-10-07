@@ -647,8 +647,8 @@ pub(super) fn handle_response(
                         Option<String>,
                     )>,
                 );
-                let (cb_forward, cb_reject, cb_retarget): RelayCallbackOutcome = Python::attach(
-                    |python| {
+                let (cb_forward, cb_reject, cb_retarget): RelayCallbackOutcome =
+                    Python::attach(|python| {
                         let py_reply_obj = PyReply::new(Arc::clone(&msg_arc)).with_response_source(
                             inbound.remote_addr.ip().to_string(),
                             inbound.remote_addr.port(),
@@ -697,12 +697,20 @@ pub(super) fn handle_response(
                                 Ok(ret) => {
                                     if let Ok(true) = is_coroutine(python, &ret) {
                                         if let Err(error) = run_coroutine(python, &ret) {
-                                            error!("async relay on_reply callback error: {error}");
+                                            error!(
+                                                "async relay on_reply callback error: {}",
+                                                crate::script::error_report::describe(
+                                                    python, &error
+                                                )
+                                            );
                                         }
                                     }
                                 }
                                 Err(error) => {
-                                    error!("relay on_reply callback error: {error}");
+                                    error!(
+                                        "relay on_reply callback error: {}",
+                                        crate::script::error_report::describe(python, &error)
+                                    );
                                 }
                             }
                         }
@@ -716,12 +724,20 @@ pub(super) fn handle_response(
                                     Ok(ret) => {
                                         if let Ok(true) = is_coroutine(python, &ret) {
                                             if let Err(error) = run_coroutine(python, &ret) {
-                                                error!("async relay on_failure callback error: {error}");
+                                                error!(
+                                                    "async relay on_failure callback error: {}",
+                                                    crate::script::error_report::describe(
+                                                        python, &error
+                                                    )
+                                                );
                                             }
                                         }
                                     }
                                     Err(error) => {
-                                        error!("relay on_failure callback error: {error}");
+                                        error!(
+                                            "relay on_failure callback error: {}",
+                                            crate::script::error_report::describe(python, &error)
+                                        );
                                     }
                                 }
                                 // A per-relay on_failure callback may re-target the
@@ -752,8 +768,7 @@ pub(super) fn handle_response(
                             reply_ref.reject_action(),
                             retarget,
                         )
-                    },
-                );
+                    });
                 // A per-relay on_reply callback can reject too (same contract as
                 // the global `@proxy.on_reply` handler) — fail the in-progress
                 // INVITE upstream + CANCEL downstream.  Reached only when the
