@@ -579,6 +579,26 @@ class MockSubscribeState:
 
         Tests can assert on the recorded ``self.sends`` list to verify a
         script originated a SUBSCRIBE with the expected parameters.
+
+        In siphon the subscription exists from the moment the SUBSCRIBE is
+        sent. The notifier's first NOTIFY may arrive before the 2xx (RFC 6665
+        section 4.1.2.4); it then establishes the dialog (section 4.4.1), and
+        :meth:`find` in the NOTIFY handler returns the handle this call
+        returns once the 2xx is in::
+
+            @proxy.on_request("NOTIFY")
+            def notify(request):
+                handle = proxy.subscribe_state.find(
+                    request.call_id, request.to_tag, request.from_tag
+                )
+                if handle is None:
+                    request.reply(481, "Subscription Does Not Exist")
+                    return
+                request.reply(200, "OK")
+
+        Raises ``RuntimeError`` on a non-2xx response or a timeout. The
+        subscription is then gone, including one an early NOTIFY had
+        established, and a later NOTIFY for it finds nothing.
         """
         async def _run():
             import uuid
@@ -618,7 +638,13 @@ class MockSubscribeState:
         remote_tag: str,
     ) -> Optional[MockSubscribeHandle]:
         """Mock dialog lookup by tags. Returns the first live dialog
-        matching all three identity fields, or ``None``."""
+        matching all three identity fields, or ``None``.
+
+        On a NOTIFY, ``local_tag`` is the To tag and ``remote_tag`` the From
+        tag. In siphon the first NOTIFY of a :meth:`send` that is still
+        awaiting its 2xx is found too, so ``None`` means the NOTIFY belongs
+        to no subscription and 481 is the answer (RFC 6665 section 4.1.3).
+        """
         for dialog_id, dialog in self._dialogs.items():
             if dialog.get("terminated"):
                 continue

@@ -58,6 +58,27 @@ entry, but a working config keeps working.
 
 ### Fixed
 
+- **A NOTIFY that arrives before the 2xx to the SUBSCRIBE of
+  `proxy.subscribe_state.send()` is matched to that subscription (RFC 6665
+  §4.1.2.4, §4.4.1).** The dialog was stored only once the awaited 2xx had
+  been processed, so a first NOTIFY that overtook it, which a notifier sending
+  both back to back produces routinely, was looked up against an empty store:
+  `proxy.subscribe_state.find()` returned `None` and the script had no way to
+  tell it from a stray. The subscription is now registered before the
+  SUBSCRIBE is sent, and a NOTIFY with its Call-ID, a To tag equal to the
+  SUBSCRIBE's From tag and a matching Event header (§8.2.1) establishes the
+  dialog before the NOTIFY handler runs, with the remote target and route set
+  taken from the NOTIFY. `find()` returns the handle that `send()` returns
+  afterwards, and a `None` from it now reliably means the NOTIFY belongs to no
+  subscription (§4.1.3, 481). With the 2xx first nothing changes. When
+  `send()` raises, on a non-2xx or a timeout, the subscription is withdrawn,
+  including one an early NOTIFY had established, so a failed attempt leaves
+  no state. A NOTIFY with `Subscription-State: terminated` is matched like any
+  other and acting on it stays with the script, as it does after the 2xx. One
+  `send()` still tracks one dialog: if a forked SUBSCRIBE is answered 2xx by
+  another notifier than the one whose NOTIFY came first, the dialog is the
+  2xx's, as before.
+
 - **`diameter.s6c_rsr` sends a Report-SM-Delivery-Status request an HSS can
   read (3GPP TS 29.338 clause 5.3.2.7).** The outcome was written into
   SM-Delivery-Outcome as an SM-RP-MTI AVP, which is not a member of that

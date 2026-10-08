@@ -23,6 +23,11 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 use crate::cache::CacheManager;
+use crate::sip::message::SipMessage;
+
+mod pending;
+
+pub use pending::{PendingSubscription, RemoteParty};
 
 /// Seconds since the Unix epoch, capped at `u64::MAX` on clock weirdness.
 fn unix_now() -> u64 {
@@ -128,6 +133,9 @@ impl SubscribeDialog {
 /// Store holding the L1 DashMap and (optionally) an L2 cache handle.
 pub struct SubscribeStore {
     dialogs: DashMap<String, SubscribeDialog>,
+    /// Outbound subscriptions whose SUBSCRIBE is sent and whose dialog no
+    /// NOTIFY or 2xx has established yet, by Call-ID.  See [`pending`].
+    pending: DashMap<String, SubscribeDialog>,
     /// ``(cache_manager, cache_name)`` when configured.
     cache: Option<(Arc<CacheManager>, String)>,
 }
@@ -147,10 +155,21 @@ pub fn global_store() -> Option<Arc<SubscribeStore>> {
     GLOBAL_STORE.get().cloned()
 }
 
+/// Let an inbound NOTIFY establish the outbound subscription it answers when
+/// it arrives ahead of the 2xx to the SUBSCRIBE (RFC 6665 §4.1.2.4, §4.4.1).
+/// The dispatcher calls this for every NOTIFY before the script sees it, so
+/// the script's lookup finds the dialog whichever of the two came first.
+pub fn establish_from_notify(notify: &SipMessage) {
+    if let Some(store) = GLOBAL_STORE.get() {
+        store.establish_from_notify(notify);
+    }
+}
+
 impl SubscribeStore {
     pub fn new() -> Self {
         Self {
             dialogs: DashMap::new(),
+            pending: DashMap::new(),
             cache: None,
         }
     }
@@ -169,6 +188,12 @@ impl SubscribeStore {
 
     /// Write a dialog to L1 and (if configured) L2.
     pub fn put(&self, dialog: SubscribeDialog) {
+        self.persist(&dialog);
+        self.dialogs.insert(dialog.id.clone(), dialog);
+    }
+
+    /// Write a dialog through to L2, when one is configured.
+    fn persist(&self, dialog: &SubscribeDialog) {
         if let Some((manager, name)) = &self.cache {
             let manager = Arc::clone(manager);
             let cache_name = name.clone();
@@ -186,7 +211,6 @@ impl SubscribeStore {
                 }
             });
         }
-        self.dialogs.insert(dialog.id.clone(), dialog);
     }
 
     /// Fetch a dialog from L1 only — synchronous, no network, never blocks.
@@ -345,6 +369,34 @@ impl SubscribeStore {
         }
         None
     }
+}
+
+/// Pull ``tag=...`` from a From/To header value.
+pub(crate) fn extract_tag(value: &str) -> Option<String> {
+    let lower = value.to_ascii_lowercase();
+    let tag_start = lower.find(";tag=")?;
+    let rest = &value[tag_start + 5..];
+    let end = rest.find([';', '>']).unwrap_or(rest.len());
+    Some(rest[..end].to_string())
+}
+
+/// Strip display-name and angle-brackets from a name-addr header value,
+/// returning only the URI portion.  Falls back to the whole trimmed
+/// value on parse failure.
+pub(crate) fn strip_nameaddr(value: &str) -> String {
+    let trimmed = value.trim();
+    if let (Some(l), Some(r)) = (trimmed.find('<'), trimmed.rfind('>')) {
+        if l < r {
+            return trimmed[l + 1..r].to_string();
+        }
+    }
+    // No angle brackets — strip any trailing ;tag=… or other params.
+    trimmed
+        .split(';')
+        .next()
+        .unwrap_or(trimmed)
+        .trim()
+        .to_string()
 }
 
 impl Default for SubscribeStore {

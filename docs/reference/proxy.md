@@ -55,6 +55,19 @@ uses that exact live stream, never another phone sharing the same proxy address;
 a closed stream fails visibly. The Contact remains the NOTIFY Request-URI.
 Subscriptions with Record-Route follow their established route set.
 
+As a subscriber, `handle = await proxy.subscribe_state.send(ruri, event=..., expires=...)`
+sends the SUBSCRIBE and returns once the 2xx is in. The subscription exists from
+the moment the SUBSCRIBE leaves, because the notifier's first NOTIFY may arrive
+before that 2xx (RFC 6665 §4.1.2.4). siphon matches such a NOTIFY on Call-ID, the
+To tag and the Event header and establishes the dialog from it (§4.4.1), route
+set included, before the NOTIFY handler runs. So
+`proxy.subscribe_state.find(request.call_id, request.to_tag, request.from_tag)`
+returns the same handle in either order, and `None` means the NOTIFY belongs to
+no subscription: answer it 481. When `send()` raises (a non-2xx, a timeout) the
+subscription is gone again, including one an early NOTIFY had established. A
+NOTIFY with `Subscription-State: terminated` is matched like any other; ending
+the subscription on it stays with the script.
+
 ::: siphon_sdk.mock_module.MockSubscribeState
 
 ## `SubscribeHandle`

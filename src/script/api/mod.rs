@@ -500,6 +500,18 @@ pub fn set_subscribe_state_singleton(
     Ok(())
 }
 
+/// The store behind the installed ``proxy.subscribe_state`` namespace. The
+/// singleton is set once per process, so a test that needs the store a script
+/// writes to has to ask which one that turned out to be.
+#[cfg(test)]
+pub(crate) fn subscribe_state_singleton_store(
+    python: Python<'_>,
+) -> Option<std::sync::Arc<crate::subscribe_state::SubscribeStore>> {
+    let namespace = SUBSCRIBE_STATE_SINGLETON.get()?.bind(python);
+    let namespace = namespace.cast::<subscribe_state::PySubscribeState>().ok()?;
+    Some(namespace.borrow().store())
+}
+
 /// Store the IPsec singleton for injection into the siphon module.
 ///
 /// Called at startup only when `ipsec` is configured (i.e. siphon is

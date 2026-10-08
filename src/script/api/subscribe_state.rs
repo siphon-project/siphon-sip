@@ -14,7 +14,8 @@ use crate::dns::SipResolver;
 use crate::sip::builder::SipMessageBuilder;
 use crate::sip::message::Method;
 use crate::sip::parser::parse_uri_standalone;
-use crate::subscribe_state::{SubscribeDialog, SubscribeStore};
+pub(crate) use crate::subscribe_state::strip_nameaddr;
+use crate::subscribe_state::{extract_tag, RemoteParty, SubscribeDialog, SubscribeStore};
 use crate::transport::Transport;
 use crate::uac::UacSender;
 
@@ -43,6 +44,11 @@ pub struct PySubscribeState {
 impl PySubscribeState {
     pub fn new(store: Arc<SubscribeStore>) -> Self {
         Self { store }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn store(&self) -> Arc<SubscribeStore> {
+        Arc::clone(&self.store)
     }
 }
 
@@ -202,11 +208,14 @@ impl PySubscribeState {
     ///
     /// Sends a SUBSCRIBE to ``ruri`` (or to ``target_uri`` if given as a
     /// pre-loaded Route — see RFC 3261 §16.4) and blocks until the
-    /// notifier responds. On a 2xx response the dialog state is captured
-    /// from the From/To/Contact/Record-Route headers and a
-    /// :class:`SubscribeHandle` is returned for later
-    /// :meth:`SubscribeHandle.refresh` / :meth:`SubscribeHandle.terminate`
-    /// or in-dialog NOTIFY correlation via :meth:`find`.
+    /// notifier responds. On a 2xx response a :class:`SubscribeHandle` is
+    /// returned for later :meth:`SubscribeHandle.refresh` /
+    /// :meth:`SubscribeHandle.terminate` or in-dialog NOTIFY correlation via
+    /// :meth:`find`.
+    ///
+    /// The notifier's first NOTIFY may arrive before the 2xx (RFC 6665
+    /// §4.1.2.4). It then establishes the dialog (§4.4.1), so :meth:`find`
+    /// in the NOTIFY handler returns the handle this call returns afterwards.
     ///
     /// Args:
     ///     ruri: SUBSCRIBE Request-URI (the watched resource).
@@ -224,7 +233,8 @@ impl PySubscribeState {
     ///     timeout_ms: Response timeout in milliseconds (default 2000).
     ///
     /// Raises ``RuntimeError`` on non-2xx response, timeout, malformed
-    /// 200 OK (missing tag/Contact), or transport failure.
+    /// 200 OK (missing tag), or transport failure. The subscription is then
+    /// gone, including one an early NOTIFY had established.
     #[pyo3(signature = (
         ruri,
         event,
@@ -282,6 +292,11 @@ impl PySubscribeState {
     /// On NOTIFY, the From-tag is the notifier's tag (our remote_tag)
     /// and the To-tag is ours (our local_tag). Returns ``None`` if the
     /// dialog is unknown or terminated.
+    ///
+    /// The first NOTIFY of a :meth:`send` still awaiting its 2xx is found
+    /// too: that NOTIFY establishes the dialog before the handler runs
+    /// (RFC 6665 §4.4.1). ``None`` therefore means the NOTIFY belongs to no
+    /// subscription, and 481 is the answer (§4.1.3).
     #[pyo3(signature = (call_id, local_tag, remote_tag))]
     fn find(&self, call_id: &str, local_tag: &str, remote_tag: &str) -> Option<PySubscribeHandle> {
         self.store
@@ -1254,34 +1269,6 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
-/// Pull ``tag=...`` from a From/To header value.
-fn extract_tag(value: &str) -> Option<String> {
-    let lower = value.to_ascii_lowercase();
-    let tag_start = lower.find(";tag=")?;
-    let rest = &value[tag_start + 5..];
-    let end = rest.find([';', '>']).unwrap_or(rest.len());
-    Some(rest[..end].to_string())
-}
-
-/// Strip display-name and angle-brackets from a name-addr header value,
-/// returning only the URI portion.  Falls back to the whole trimmed
-/// value on parse failure.
-pub(crate) fn strip_nameaddr(value: &str) -> String {
-    let trimmed = value.trim();
-    if let (Some(l), Some(r)) = (trimmed.find('<'), trimmed.rfind('>')) {
-        if l < r {
-            return trimmed[l + 1..r].to_string();
-        }
-    }
-    // No angle brackets — strip any trailing ;tag=… or other params.
-    trimmed
-        .split(';')
-        .next()
-        .unwrap_or(trimmed)
-        .trim()
-        .to_string()
-}
-
 impl PySubscribeState {
     /// The outbound SUBSCRIBE itself: resolve, send, await the 2xx, record the
     /// dialog. Awaitable because both the DNS lookup and the response wait are
@@ -1387,6 +1374,36 @@ impl PySubscribeState {
             &extra_headers,
         )?;
 
+        // The subscription exists from here, before the SUBSCRIBE leaves: the
+        // notifier's first NOTIFY may overtake its 2xx (RFC 6665 §4.1.2.4), and
+        // the dispatcher establishes the dialog from whichever arrives first.
+        // Every return below that is not the 2xx drops `pending`, which takes
+        // the subscription out of the store again.
+        let pending = store.register_pending(SubscribeDialog {
+            id: short_uuid(),
+            call_id,
+            local_tag,
+            remote_tag: String::new(),
+            local_uri: match from_override.as_ref() {
+                Some(val) => strip_nameaddr(val),
+                None => local_uri_default.clone(),
+            },
+            remote_uri: local_uri_default.clone(),
+            // Until a Contact names the notifier; some peers omit it in the 2xx.
+            remote_target: local_uri_default,
+            received_address: None,
+            received_transport: None,
+            received_connection_id: None,
+            route_set: Vec::new(),
+            event: event.to_string(),
+            expires_secs: expires,
+            created_at_unix: now_unix(),
+            cseq: cseq_value,
+            event_version: 0,
+            terminated: false,
+            is_outbound: true,
+        });
+
         let receiver = uac_sender.send_request_with_response(message, target.address, transport);
 
         let timeout = std::time::Duration::from_millis(timeout_ms);
@@ -1408,68 +1425,9 @@ impl PySubscribeState {
             )));
         }
 
-        // Extract dialog state from the 2xx.
-        let to_raw = response
-            .headers
-            .get("To")
-            .or_else(|| response.headers.get("t"))
-            .cloned()
-            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("2xx missing To header"))?;
-        let remote_tag = extract_tag(&to_raw).ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err(
-                "2xx response To header missing tag — peer did not establish dialog",
-            )
-        })?;
-        let remote_uri = strip_nameaddr(&to_raw);
-
-        // Contact in 2xx is the notifier's remote target. Per RFC 3265,
-        // it's mandatory for SUBSCRIBE 2xx; tolerate absence by falling
-        // back to the original R-URI (some buggy peers omit it for
-        // already-established dialogs).
-        let remote_target = response
-            .headers
-            .get("Contact")
-            .or_else(|| response.headers.get("m"))
-            .map(|c| strip_nameaddr(c))
-            .unwrap_or_else(|| local_uri_default.clone());
-
-        // Reverse Record-Route per RFC 3261 §12.1.2 — we reverse here
-        // because the same field on inbound dialogs is reversed at
-        // create() time, so all storage holds Route in the order needed
-        // for outgoing in-dialog traffic.
-        let route_set: Vec<String> = response
-            .headers
-            .get_all("Record-Route")
-            .map(|entries| entries.iter().rev().cloned().collect())
-            .unwrap_or_default();
-
-        let local_uri = match from_override.as_ref() {
-            Some(val) => strip_nameaddr(val),
-            None => local_uri_default,
-        };
-
-        let id = short_uuid();
-        let dialog = SubscribeDialog {
-            id: id.clone(),
-            call_id,
-            local_tag,
-            remote_tag,
-            local_uri,
-            remote_uri,
-            remote_target,
-            received_address: None,
-            received_transport: None,
-            received_connection_id: None,
-            route_set,
-            event: event.to_string(),
-            expires_secs: expires,
-            created_at_unix: now_unix(),
-            cseq: cseq_value,
-            event_version: 0,
-            terminated: false,
-            is_outbound: true,
-        };
-        store.put(dialog);
+        let notifier = RemoteParty::from_subscribe_response(&response)
+            .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+        let id = pending.confirm(&notifier);
         debug!(id, "subscribe_state: outbound dialog established");
 
         Ok(PySubscribeHandle {

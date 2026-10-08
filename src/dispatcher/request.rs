@@ -662,6 +662,13 @@ pub(super) fn handle_request(
         return;
     }
 
+    // A NOTIFY ahead of the 2xx to the SUBSCRIBE it answers creates that
+    // subscription's dialog (RFC 6665 §4.4.1), here and before the script, so
+    // the handler's lookup finds it in either order.
+    if method == "NOTIFY" {
+        crate::subscribe_state::establish_from_notify(&message);
+    }
+
     // Look up matching Python handlers
     let handlers = engine_state.proxy_request_handlers(&method);
 
