@@ -15,6 +15,22 @@ entry, but a working config keeps working.
 
 ### Added
 
+- **Rf accounting records can carry Access-Network-Information.** The
+  `P-Access-Network-Info` header of the request (RFC 7315) goes to the CDF as
+  `Access-Network-Information` (TS 32.299, AVP 1263, vendor 10415) inside
+  `IMS-Information`, one AVP per access-net-spec when the header lists several.
+  `diameter.rf_acr_start` / `rf_acr_interim` / `rf_acr_stop` / `rf_acr_event`
+  take it as `access_network_information=`, the header value as received. The
+  automatic ACRs of an `rf:` session read it off the request when
+  `rf.access_network_information: true`, and the automatic Ro credit-control
+  requests of a call when `ro.access_network_information: true`; the
+  `diameter.ro_ccr_*` calls have no such argument. Both settings default to
+  `false`, so nothing changes on the wire until one is set: the AVP is sent
+  with the M bit, like the other 3GPP charging AVPs, and a CDF or OCS that
+  does not know it answers `DIAMETER_AVP_UNSUPPORTED` (5001), which for Ro
+  under `on_ocs_failure: terminate` refuses the call. The header also holds
+  the subscriber's cell.
+
 - **`script_config:` and the `config` script namespace.** A YAML document for
   the tables a script walks (routes, rule lists, policy), either inline in
   `siphon.yaml` or in a file of its own that the key names. A script reads it
