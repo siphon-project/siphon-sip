@@ -197,6 +197,16 @@ impl RfChargingService {
         self.node_functionality
     }
 
+    /// Drop the access network information a request carried unless
+    /// `rf.access_network_information` asks for it. Every ACR this service
+    /// sends passes through here, so the setting holds for START, INTERIM,
+    /// STOP and EVENT alike.
+    fn apply_access_network_setting(&self, ims_data: &mut ImsChargingData) {
+        if !self.config.access_network_information {
+            ims_data.access_network_information.clear();
+        }
+    }
+
     pub fn auto_emit_proxy(&self) -> bool {
         self.config.enabled && self.config.auto_emit_proxy
     }
@@ -234,13 +244,14 @@ impl RfChargingService {
     /// the START — auto-emit is best-effort per TS 32.299 §6.5.
     pub async fn acr_start(
         self: &Arc<Self>,
-        ims_data: ImsChargingData,
+        mut ims_data: ImsChargingData,
         user_name: Option<String>,
     ) -> Option<RfChargingSession> {
         if !self.config.enabled {
             return None;
         }
         let peer = self.pick_peer()?;
+        self.apply_access_network_setting(&mut ims_data);
         let subscription_ids = subscription_ids_for(&ims_data);
         let mut params = AccountingParams::new(AccountingRecordType::StartRecord);
         params.user_name = user_name.as_deref();
@@ -304,13 +315,14 @@ impl RfChargingService {
     /// Result is the parsed answer so callers can record it on a CDR.
     pub async fn acr_event(
         &self,
-        ims_data: ImsChargingData,
+        mut ims_data: ImsChargingData,
         user_name: Option<String>,
     ) -> Option<AccountingAnswer> {
         if !self.config.enabled {
             return None;
         }
         let peer = self.pick_peer()?;
+        self.apply_access_network_setting(&mut ims_data);
         let subscription_ids = subscription_ids_for(&ims_data);
         let mut params = AccountingParams::new(AccountingRecordType::EventRecord);
         params.user_name = user_name.as_deref();
@@ -353,6 +365,7 @@ impl RfChargingService {
         if ims_data.node_functionality.is_none() {
             ims_data.node_functionality = self.node_functionality;
         }
+        self.apply_access_network_setting(&mut ims_data);
         let record_number = session.next_record_number();
         let subscription_ids = subscription_ids_for(&ims_data);
         let mut params = AccountingParams::new(AccountingRecordType::InterimRecord);
@@ -414,6 +427,7 @@ impl RfChargingService {
         if ims_data.node_functionality.is_none() {
             ims_data.node_functionality = self.node_functionality;
         }
+        self.apply_access_network_setting(&mut ims_data);
         let record_number = session.next_record_number();
         let subscription_ids = subscription_ids_for(&ims_data);
         let mut params = AccountingParams::new(AccountingRecordType::StopRecord);
@@ -1663,6 +1677,20 @@ mod tests {
         Arc<DiameterManager>,
         tokio::sync::mpsc::Receiver<crate::diameter::peer::IncomingRequest>,
     ) {
+        mock_cdf_manager_recording(None).await
+    }
+
+    /// The decoded AVPs of every ACR a mock CDF was sent, in arrival order.
+    type ReceivedAcrs = Arc<std::sync::Mutex<Vec<serde_json::Value>>>;
+
+    /// [`mock_cdf_manager`], with every ACR the far end reads pushed onto
+    /// `received` before it is answered.
+    async fn mock_cdf_manager_recording(
+        received: Option<ReceivedAcrs>,
+    ) -> (
+        Arc<DiameterManager>,
+        tokio::sync::mpsc::Receiver<crate::diameter::peer::IncomingRequest>,
+    ) {
         use crate::diameter::codec::{
             self, encode_avp_u32, encode_avp_utf8, encode_diameter_message,
         };
@@ -1689,6 +1717,9 @@ mod tests {
                     continue;
                 }
                 if msg.command_code == dictionary::CMD_ACCOUNTING {
+                    if let Some(received) = &received {
+                        received.lock().unwrap().push(msg.avps.clone());
+                    }
                     let mut avps = Vec::new();
                     if let Some(sid) = msg.avps.get("Session-Id").and_then(|v| v.as_str()) {
                         avps.extend_from_slice(&encode_avp_utf8(avp::SESSION_ID, sid));
@@ -1789,6 +1820,82 @@ mod tests {
             service.active_session_count(),
             baseline,
             "rf accounting sessions must drain to baseline after completed calls"
+        );
+    }
+
+    /// The Access-Network-Information of the START, INTERIM, STOP and EVENT
+    /// records of one call as the mock CDF read them, for a call whose INVITE
+    /// carried `P-Access-Network-Info`.
+    async fn access_network_information_on_the_wire(
+        enabled: bool,
+    ) -> Vec<Option<serde_json::Value>> {
+        let received = ReceivedAcrs::default();
+        let (manager, _incoming_rx) = mock_cdf_manager_recording(Some(received.clone())).await;
+        let service = RfChargingService::new(
+            manager,
+            RfConfig {
+                enabled: true,
+                interim_interval_secs: 0,
+                access_network_information: enabled,
+                ..Default::default()
+            },
+        );
+        let ims = ImsChargingData {
+            sip_method: Some("INVITE".into()),
+            node_functionality: Some(NodeFunctionality::SCscf),
+            access_network_information: vec![
+                "3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=0010100010000101".into(),
+            ],
+            ..Default::default()
+        };
+
+        let session = service
+            .acr_start(ims.clone(), None)
+            .await
+            .expect("ACR-START opens a session");
+        service.acr_interim(&session, ims.clone(), None).await;
+        service
+            .acr_stop(
+                &session,
+                ims.clone(),
+                None,
+                termination_cause::DIAMETER_LOGOUT,
+            )
+            .await;
+        service.acr_event(ims, None).await;
+
+        let received = received.lock().unwrap();
+        assert_eq!(received.len(), 4, "START, INTERIM, STOP and EVENT");
+        received
+            .iter()
+            .map(|acr| {
+                acr["Service-Information"]["IMS-Information"]
+                    .get("Access-Network-Information")
+                    .cloned()
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn access_network_information_is_withheld_from_the_cdf_by_default() {
+        assert!(!RfConfig::default().access_network_information);
+        assert_eq!(
+            access_network_information_on_the_wire(false).await,
+            vec![None, None, None, None]
+        );
+    }
+
+    #[tokio::test]
+    async fn access_network_information_reaches_the_cdf_when_asked_for() {
+        // Our dictionary types the AVP OctetString, so it reads back as the
+        // hex of the header text.
+        let expected: String = "3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=0010100010000101"
+            .bytes()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        assert_eq!(
+            access_network_information_on_the_wire(true).await,
+            vec![Some(serde_json::Value::String(expected)); 4]
         );
     }
 

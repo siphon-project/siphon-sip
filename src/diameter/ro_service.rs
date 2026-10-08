@@ -469,6 +469,11 @@ impl RoChargingService {
         if ims_data.node_functionality.is_none() {
             ims_data.node_functionality = self.node_functionality;
         }
+        // The session keeps this copy for its re-authorizations and its
+        // termination, so the setting holds for every CCR of the call.
+        if !self.config.access_network_information {
+            ims_data.access_network_information.clear();
+        }
 
         let requested = self.requested_units();
         let params = CreditControlParams {
@@ -1442,6 +1447,73 @@ mod tests {
         assert_eq!(
             ims.get("Called-Party-Address").and_then(|v| v.as_str()),
             Some("sip:+10000000002@ims.example.com"),
+        );
+    }
+
+    /// The Access-Network-Information of a call's CCR-INITIAL and
+    /// CCR-TERMINATION as the mock OCS read them, for a call whose INVITE
+    /// carried `P-Access-Network-Info`.
+    async fn access_network_information_on_the_wire(
+        enabled: bool,
+    ) -> Vec<Option<serde_json::Value>> {
+        let (manager, _rx, captured) = mock_ocs_manager(2001, Some(30), 2001, None).await;
+        let service = RoChargingService::new(
+            manager,
+            RoConfig {
+                access_network_information: enabled,
+                ..enabled_config()
+            },
+        );
+        let mut charging_data = call_charging_data();
+        charging_data.access_network_information =
+            vec!["3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=0010100010000101".into()];
+        let ChargeDecision::Granted(Some(session)) = service
+            .authorize_call(
+                SubscriberId::msisdn("+310000000001"),
+                charging_data,
+                "c1".to_string(),
+            )
+            .await
+        else {
+            panic!("not granted");
+        };
+        service.terminate_call(&session, Some(0)).await;
+
+        let ccrs = captured.lock().unwrap().clone();
+        [1, 3]
+            .into_iter()
+            .map(|request_type| {
+                ims_information(&ccr_of_type(&ccrs, request_type))
+                    .expect("the CCR carries IMS-Information")
+                    .get("Access-Network-Information")
+                    .cloned()
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn access_network_information_is_withheld_from_the_ocs_by_default() {
+        assert!(!RoConfig::default().access_network_information);
+        assert_eq!(
+            access_network_information_on_the_wire(false).await,
+            vec![None, None]
+        );
+    }
+
+    #[tokio::test]
+    async fn access_network_information_reaches_the_ocs_when_asked_for() {
+        // Our dictionary types the AVP OctetString, so it reads back as the
+        // hex of the header text.
+        let expected: String = "3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=0010100010000101"
+            .bytes()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        assert_eq!(
+            access_network_information_on_the_wire(true).await,
+            vec![
+                Some(serde_json::Value::String(expected.clone())),
+                Some(serde_json::Value::String(expected)),
+            ]
         );
     }
 

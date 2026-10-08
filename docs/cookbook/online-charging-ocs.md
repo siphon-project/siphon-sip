@@ -59,6 +59,10 @@ ro:
   on_ocs_failure: terminate    # fail-closed; `continue` = fail-open (allow, uncharged)
   credit_denied_status: 402    # SIP status a script returns when denied at setup
   rating_group: 100            # optional; its presence selects the MSCC (multi-service) shape
+  access_network_information: false   # true: CCRs carry the INVITE's P-Access-Network-Info as
+                                      # Access-Network-Information (AVP 1263, M bit). Leave off
+                                      # unless the OCS knows the AVP: one that does not answers
+                                      # 5001, which under `terminate` refuses the call
   peer: ocs1                   # optional explicit OCS peer
 ```
 

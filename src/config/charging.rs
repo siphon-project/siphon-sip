@@ -18,6 +18,7 @@ use serde::Deserialize;
 ///   interim_interval_secs: 300   # 0 = disabled; CDF ACA-START Acct-Interim-Interval overrides
 ///   node_functionality: scscf    # scscf | pcscf | icscf | mrfc | mgcf | bgcf | as | ibcf
 ///   service_context_id: "32260@3gpp.org"   # TS 32.260 IMS = 32260, SMS = 32274, MMTel = 32275
+///   access_network_information: false   # send P-Access-Network-Info as AVP 1263
 ///   peer: cdf1                   # optional explicit peer; default = first 'rf' route, else any peer
 /// ```
 #[derive(Debug, Deserialize, Clone)]
@@ -52,6 +53,17 @@ pub struct RfConfig {
     /// ``"32260@3gpp.org"`` (TS 32.260 IMS).
     #[serde(default = "default_rf_service_context_id")]
     pub service_context_id: String,
+    /// Send the request's `P-Access-Network-Info` to the CDF as
+    /// Access-Network-Information (TS 32.299, AVP 1263) in the automatic
+    /// ACRs.  Default: false.
+    ///
+    /// Off unless asked for, for two reasons.  The AVP carries the M bit, so
+    /// a CDF that does not know it answers DIAMETER_AVP_UNSUPPORTED (5001)
+    /// and the record is lost, and the header holds the subscriber's
+    /// cell-level location.  `diameter.rf_acr_*` sends what the script
+    /// passes as `access_network_information=` whatever this says.
+    #[serde(default)]
+    pub access_network_information: bool,
     /// Explicit Diameter peer name to send ACRs to.  When unset, the
     /// first peer registered with the manager is used (`any_client`).
     pub peer: Option<String>,
@@ -67,6 +79,7 @@ impl Default for RfConfig {
             interim_interval_secs: 0,
             node_functionality: default_rf_node_functionality(),
             service_context_id: default_rf_service_context_id(),
+            access_network_information: false,
             peer: None,
         }
     }
@@ -112,6 +125,7 @@ fn default_rf_service_context_id() -> String {
 ///   on_ocs_failure: terminate     # terminate (fail-closed) | continue (fail-open)
 ///   credit_denied_status: 402     # SIP status when the OCS denies at setup
 ///   rating_group: 100             # optional; presence selects the MSCC (multi-service) shape
+///   access_network_information: false   # send P-Access-Network-Info as AVP 1263
 ///   peer: ocs1                    # optional explicit OCS peer
 /// ```
 #[derive(Debug, Deserialize, Clone)]
@@ -171,6 +185,15 @@ pub struct RoConfig {
     pub rating_group: Option<u32>,
     /// Optional Service-Identifier.
     pub service_identifier: Option<u32>,
+    /// Send the request's `P-Access-Network-Info` to the OCS as
+    /// Access-Network-Information (TS 32.299, AVP 1263) in the credit-control
+    /// requests of a call. Default: false.
+    ///
+    /// Off unless asked for: the AVP carries the M bit, so an OCS that does
+    /// not know it answers DIAMETER_AVP_UNSUPPORTED (5001), which under
+    /// `on_ocs_failure: terminate` refuses the call.
+    #[serde(default)]
+    pub access_network_information: bool,
     /// Explicit OCS peer name. When unset, the first registered peer is used.
     pub peer: Option<String>,
 }
@@ -191,6 +214,7 @@ impl Default for RoConfig {
             credit_denied_status: default_ro_denied_status(),
             rating_group: None,
             service_identifier: None,
+            access_network_information: false,
             peer: None,
         }
     }
@@ -219,4 +243,27 @@ fn default_ro_ocs_failure() -> String {
 }
 fn default_ro_denied_status() -> u16 {
     402
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn access_network_information_is_off_unless_asked_for() {
+        let rf: RfConfig = serde_yaml_ng::from_str("enabled: true\n").unwrap();
+        let ro: RoConfig = serde_yaml_ng::from_str("enabled: true\n").unwrap();
+        assert!(!rf.access_network_information);
+        assert!(!ro.access_network_information);
+    }
+
+    #[test]
+    fn access_network_information_is_read_from_both_sections() {
+        let rf: RfConfig =
+            serde_yaml_ng::from_str("enabled: true\naccess_network_information: true\n").unwrap();
+        let ro: RoConfig =
+            serde_yaml_ng::from_str("enabled: true\naccess_network_information: true\n").unwrap();
+        assert!(rf.access_network_information);
+        assert!(ro.access_network_information);
+    }
 }

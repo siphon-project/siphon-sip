@@ -2046,6 +2046,11 @@ auth:
 #   interim_interval_secs: 0              # 0 = disabled; CDF Acct-Interim-Interval overrides
 #   node_functionality: scscf             # scscf|pcscf|icscf|mrfc|mgcf|bgcf|as|ibcf|ecscf|atcf|mmtel|tpf|atgw
 #   service_context_id: "32260@3gpp.org"  # TS 32.260 IMS = 32260, MMTel SC = 32274
+#   access_network_information: false     # true: the automatic ACRs carry the request's
+#                                         # P-Access-Network-Info as Access-Network-Information
+#                                         # (AVP 1263, M bit). Off by default: a CDF that does
+#                                         # not know the AVP rejects the record (5001), and the
+#                                         # header is cell-level location. `ro:` has the same key.
 #   peer: cdf1                            # explicit peer; default = first registered
 
 # ---------------------------------------------------------------------------

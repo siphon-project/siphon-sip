@@ -7159,7 +7159,9 @@ class MockDiameter:
             )
 
         The automatic session ACRs (``rf:`` config) fill it from the header
-        themselves.
+        themselves when ``rf.access_network_information: true``. It is off by
+        default: the AVP carries the M bit, so a CDF that does not know it
+        rejects the record.
         """
         return self._record_acr(
             "EVENT",
