@@ -27,8 +27,15 @@ entry, but a working config keeps working.
   is translated to the SM-Delivery-Cause enumeration (which numbers them 2, 1
   and 0). `3` and `4`, documented until now as "successful transfer, not last"
   and "temporary error", name no cause the interface defines and raise
-  `ValueError` instead of being sent. The delivery is always reported as one
-  made through an MME, and no Absent-User-Diagnostic-SM is sent.
+  `ValueError` instead of being sent.
+
+  Two new arguments say what else the HSS acts on. `node=` names the node the
+  delivery was attempted through, `"mme"` (the default), `"sgsn"`, `"msc"` or
+  `"ip_sm_gw"`, and selects the group inside SM-Delivery-Outcome: the HSS
+  keeps its message waiting flags per node, so a forward that went to the
+  `sgsn_name` of the preceding `s6c_srr` is reported with `node="sgsn"`.
+  `absent_user_diagnostic=` adds an Absent-User-Diagnostic-SM, the reason the
+  node found the user absent, and is accepted with `delivery_outcome=1` only.
 
 ## [1.13.1] — 2026-10-08
 

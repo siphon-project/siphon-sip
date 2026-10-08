@@ -332,20 +332,145 @@ impl std::fmt::Display for SmDeliveryCause {
     }
 }
 
+/// The node a delivery was attempted through (TS 29.338 clause 5.3.3.14).
+///
+/// The HSS keeps its message waiting data per node type, so an outcome
+/// reported under the wrong one sets or clears the wrong flag: an absent
+/// subscriber reported under the MME when the message went to an SGSN is
+/// marked unreachable through a node that never saw it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SmDeliveryNode {
+    Mme,
+    Msc,
+    Sgsn,
+    IpSmGw,
+}
+
+impl SmDeliveryNode {
+    /// The grouped AVP of SM-Delivery-Outcome this node reports in
+    /// (clauses 5.3.3.15 to 5.3.3.18).
+    pub fn outcome_avp(self) -> u32 {
+        match self {
+            Self::Mme => avp::MME_SM_DELIVERY_OUTCOME,
+            Self::Msc => avp::MSC_SM_DELIVERY_OUTCOME,
+            Self::Sgsn => avp::SGSN_SM_DELIVERY_OUTCOME,
+            Self::IpSmGw => avp::IP_SM_GW_SM_DELIVERY_OUTCOME,
+        }
+    }
+
+    /// The node for the `node` name a script passes to `diameter.s6c_rsr`:
+    /// `mme`, `msc`, `sgsn` or `ip_sm_gw`, compared without case.
+    pub fn from_script_name(name: &str) -> Option<Self> {
+        match name.to_ascii_lowercase().as_str() {
+            "mme" => Some(Self::Mme),
+            "msc" => Some(Self::Msc),
+            "sgsn" => Some(Self::Sgsn),
+            "ip_sm_gw" => Some(Self::IpSmGw),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for SmDeliveryNode {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Mme => "mme",
+            Self::Msc => "msc",
+            Self::Sgsn => "sgsn",
+            Self::IpSmGw => "ip_sm_gw",
+        })
+    }
+}
+
+/// An Absent-User-Diagnostic-SM was given for a delivery that did not end in
+/// ABSENT_USER, the only cause it accompanies (TS 29.338 clause 5.3.2.7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("an absent user diagnostic accompanies ABSENT_USER only, not {0}")]
+pub struct DiagnosticWithoutAbsentUser(pub SmDeliveryCause);
+
+/// What an RSR reports: through which node the delivery was attempted, how it
+/// ended and, for an absent user, why the node found the user absent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SmDeliveryOutcome {
+    node: SmDeliveryNode,
+    cause: SmDeliveryCause,
+    absent_user_diagnostic: Option<u32>,
+}
+
+impl SmDeliveryOutcome {
+    /// `absent_user_diagnostic` is the Absent-User-Diagnostic-SM value
+    /// (clause 5.3.3.20, numbered by TS 23.040 clause 3.3.2) and is refused
+    /// with any cause other than [`SmDeliveryCause::AbsentUser`].
+    pub fn new(
+        node: SmDeliveryNode,
+        cause: SmDeliveryCause,
+        absent_user_diagnostic: Option<u32>,
+    ) -> Result<Self, DiagnosticWithoutAbsentUser> {
+        if absent_user_diagnostic.is_some() && cause != SmDeliveryCause::AbsentUser {
+            return Err(DiagnosticWithoutAbsentUser(cause));
+        }
+        Ok(Self {
+            node,
+            cause,
+            absent_user_diagnostic,
+        })
+    }
+
+    /// The outcome for the arguments a script passes to `diameter.s6c_rsr`,
+    /// or the message of the `ValueError` it gets for ones that name nothing
+    /// the interface defines.
+    pub fn from_script(
+        delivery_outcome: u32,
+        node: &str,
+        absent_user_diagnostic: Option<u32>,
+    ) -> Result<Self, String> {
+        let cause = SmDeliveryCause::from_script_outcome(delivery_outcome).ok_or_else(|| {
+            format!(
+                "invalid delivery_outcome: {delivery_outcome} — expected 0 (successful \
+                 transfer), 1 (absent user) or 2 (UE memory capacity exceeded)"
+            )
+        })?;
+        let node = SmDeliveryNode::from_script_name(node).ok_or_else(|| {
+            format!("invalid node: {node:?} — expected \"mme\", \"sgsn\", \"msc\" or \"ip_sm_gw\"")
+        })?;
+        Self::new(node, cause, absent_user_diagnostic).map_err(|_| {
+            format!(
+                "absent_user_diagnostic is only sent with delivery_outcome 1 (absent user), \
+                 not {delivery_outcome}"
+            )
+        })
+    }
+
+    /// The SM-Delivery-Outcome AVP: the node's group holding the cause and,
+    /// when there is one, the diagnostic (clause 5.3.3.14).
+    fn encode(&self) -> Vec<u8> {
+        let mut members = encode_avp_u32_3gpp(avp::SM_DELIVERY_CAUSE, self.cause.code());
+        if let Some(diagnostic) = self.absent_user_diagnostic {
+            members.extend_from_slice(&encode_avp_u32_3gpp(
+                avp::ABSENT_USER_DIAGNOSTIC_SM,
+                diagnostic,
+            ));
+        }
+        encode_avp_grouped_3gpp(
+            avp::SM_DELIVERY_OUTCOME,
+            &encode_avp_grouped_3gpp(self.node.outcome_avp(), &members),
+        )
+    }
+}
+
 /// Build the wire-format RSR (TS 29.338 clause 5.3.2.7, where the command is
 /// abbreviated RDR).
 ///
 /// The subscriber goes in the mandatory User-Identifier group, as a
-/// User-Name. The outcome goes in
-/// `SM-Delivery-Outcome { MME-SM-Delivery-Outcome { SM-Delivery-Cause } }`
-/// (clauses 5.3.3.14, 5.3.3.15 and 5.3.3.19): the delivery is reported as one
-/// made through an MME, and no Absent-User-Diagnostic-SM is sent.
+/// User-Name. The outcome goes in SM-Delivery-Outcome, inside the group of
+/// the node the delivery was attempted through (clauses 5.3.3.14 to
+/// 5.3.3.20).
 pub fn build_report_sm_delivery_status_request(
     config: &crate::diameter::peer::PeerConfig,
     session_id: &str,
     user_name: &str,
     sc_address: &str,
-    delivery_cause: SmDeliveryCause,
+    delivery_outcome: &SmDeliveryOutcome,
     hop_by_hop: u32,
     end_to_end: u32,
 ) -> Vec<u8> {
@@ -373,13 +498,7 @@ pub fn build_report_sm_delivery_status_request(
         avp::SC_ADDRESS,
         &codec::encode_isdn_address_string(sc_address, codec::TON_NPI_INTERNATIONAL_E164),
     ));
-    avp_bytes.extend_from_slice(&encode_avp_grouped_3gpp(
-        avp::SM_DELIVERY_OUTCOME,
-        &encode_avp_grouped_3gpp(
-            avp::MME_SM_DELIVERY_OUTCOME,
-            &encode_avp_u32_3gpp(avp::SM_DELIVERY_CAUSE, delivery_cause.code()),
-        ),
-    ));
+    avp_bytes.extend_from_slice(&delivery_outcome.encode());
 
     encode_diameter_message(
         FLAG_REQUEST | FLAG_PROXIABLE,
@@ -803,6 +922,23 @@ mod tests {
         ]
     }
 
+    /// A delivery through the MME that ended in `cause`, with no diagnostic.
+    fn through_the_mme(cause: SmDeliveryCause) -> SmDeliveryOutcome {
+        SmDeliveryOutcome::new(SmDeliveryNode::Mme, cause, None).unwrap()
+    }
+
+    fn rsr(outcome: &SmDeliveryOutcome) -> Vec<u8> {
+        build_report_sm_delivery_status_request(
+            &config(),
+            "smsc.example.com;1;1",
+            "001010000000001",
+            "441632960000",
+            outcome,
+            1,
+            1,
+        )
+    }
+
     #[test]
     fn rsr_known_answer_bytes() {
         let wire = build_report_sm_delivery_status_request(
@@ -810,7 +946,7 @@ mod tests {
             "test;1;1",
             "001010000000001",
             "441632960000",
-            SmDeliveryCause::SuccessfulTransfer,
+            &through_the_mme(SmDeliveryCause::SuccessfulTransfer),
             1,
             1,
         );
@@ -848,7 +984,7 @@ mod tests {
             "test;1;1",
             "001010000000001",
             "441632960000",
-            SmDeliveryCause::AbsentUser,
+            &through_the_mme(SmDeliveryCause::AbsentUser),
             1,
             1,
         );
@@ -892,7 +1028,7 @@ mod tests {
                 "test;1;1",
                 "001010000000001",
                 "441632960000",
-                cause,
+                &through_the_mme(cause),
                 1,
                 1,
             );
@@ -935,8 +1071,194 @@ mod tests {
         );
     }
 
-    /// Emit one RSR per SM-Delivery-Cause as hex for
-    /// [`scripts/validate_s6c_rsr.sh`] to feed to tshark.
+    /// Each node reports in its own group (TS 29.338 clauses 5.3.3.15 to
+    /// 5.3.3.18): 3317 MME, 3318 MSC, 3319 SGSN, 3320 IP-SM-GW. The group
+    /// header is written out by hand, V and M bits, vendor 10415, and holds
+    /// the 16-octet SM-Delivery-Cause.
+    #[test]
+    fn rsr_reports_in_the_group_of_the_node_it_was_delivered_through() {
+        for (node, code_low_octet) in [
+            (SmDeliveryNode::Mme, 0xf5),
+            (SmDeliveryNode::Msc, 0xf6),
+            (SmDeliveryNode::Sgsn, 0xf7),
+            (SmDeliveryNode::IpSmGw, 0xf8),
+        ] {
+            let outcome =
+                SmDeliveryOutcome::new(node, SmDeliveryCause::SuccessfulTransfer, None).unwrap();
+            let expected = [
+                0x00,
+                0x00,
+                0x0c,
+                0xf4,
+                0xc0,
+                0x00,
+                0x00,
+                0x28,
+                0x00,
+                0x00,
+                0x28,
+                0xaf, // 3316, 40
+                0x00,
+                0x00,
+                0x0c,
+                code_low_octet,
+                0xc0,
+                0x00,
+                0x00,
+                0x1c,
+                0x00,
+                0x00,
+                0x28,
+                0xaf, // the node's group, 28
+                0x00,
+                0x00,
+                0x0c,
+                0xf9,
+                0xc0,
+                0x00,
+                0x00,
+                0x10,
+                0x00,
+                0x00,
+                0x28,
+                0xaf, // 3321, 16
+                0x00,
+                0x00,
+                0x00,
+                0x02,
+            ];
+            assert!(contains(&rsr(&outcome), &expected), "{node}");
+        }
+    }
+
+    /// Absent-User-Diagnostic-SM (3322, clause 5.3.3.20) follows the cause
+    /// inside the node's group, which grows by its 16 octets.
+    #[test]
+    fn rsr_carries_the_absent_user_diagnostic_beside_the_cause() {
+        let outcome =
+            SmDeliveryOutcome::new(SmDeliveryNode::Sgsn, SmDeliveryCause::AbsentUser, Some(6))
+                .unwrap();
+        let expected = [
+            0x00, 0x00, 0x0c, 0xf4, 0xc0, 0x00, 0x00, 0x38, 0x00, 0x00, 0x28,
+            0xaf, // 3316, 56
+            0x00, 0x00, 0x0c, 0xf7, 0xc0, 0x00, 0x00, 0x2c, 0x00, 0x00, 0x28,
+            0xaf, // 3319, 44
+            0x00, 0x00, 0x0c, 0xf9, 0xc0, 0x00, 0x00, 0x10, 0x00, 0x00, 0x28,
+            0xaf, // 3321, 16
+            0x00, 0x00, 0x00, 0x01, // ABSENT_USER
+            0x00, 0x00, 0x0c, 0xfa, 0xc0, 0x00, 0x00, 0x10, 0x00, 0x00, 0x28,
+            0xaf, // 3322, 16
+            0x00, 0x00, 0x00, 0x06, // GPRS detached
+        ];
+        assert!(contains(&rsr(&outcome), &expected));
+
+        let decoded = codec::decode_diameter(&rsr(&outcome)).unwrap();
+        let group = &decoded.avps["SM-Delivery-Outcome"]["SGSN-SM-Delivery-Outcome"];
+        assert_eq!(group["SM-Delivery-Cause"].as_u64(), Some(1));
+        assert_eq!(group["Absent-User-Diagnostic-SM"].as_u64(), Some(6));
+        assert!(decoded.avps["SM-Delivery-Outcome"]
+            .get("MME-SM-Delivery-Outcome")
+            .is_none());
+    }
+
+    #[test]
+    fn a_diagnostic_is_refused_unless_the_user_was_absent() {
+        for cause in [
+            SmDeliveryCause::SuccessfulTransfer,
+            SmDeliveryCause::UeMemoryCapacityExceeded,
+        ] {
+            assert_eq!(
+                SmDeliveryOutcome::new(SmDeliveryNode::Mme, cause, Some(1)),
+                Err(DiagnosticWithoutAbsentUser(cause))
+            );
+        }
+        assert_eq!(
+            DiagnosticWithoutAbsentUser(SmDeliveryCause::SuccessfulTransfer).to_string(),
+            "an absent user diagnostic accompanies ABSENT_USER only, not SUCCESSFUL_TRANSFER"
+        );
+        assert!(
+            SmDeliveryOutcome::new(SmDeliveryNode::Mme, SmDeliveryCause::AbsentUser, Some(1))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn node_names_map_to_nodes_and_their_groups() {
+        for (name, node, code) in [
+            ("mme", SmDeliveryNode::Mme, 3317),
+            ("msc", SmDeliveryNode::Msc, 3318),
+            ("sgsn", SmDeliveryNode::Sgsn, 3319),
+            ("ip_sm_gw", SmDeliveryNode::IpSmGw, 3320),
+        ] {
+            assert_eq!(SmDeliveryNode::from_script_name(name), Some(node));
+            assert_eq!(
+                SmDeliveryNode::from_script_name(&name.to_ascii_uppercase()),
+                Some(node)
+            );
+            assert_eq!(node.outcome_avp(), code);
+            assert_eq!(node.to_string(), name);
+        }
+        for unknown in ["", "smsf", "ip-sm-gw", "mme "] {
+            assert_eq!(
+                SmDeliveryNode::from_script_name(unknown),
+                None,
+                "{unknown:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn script_arguments_become_an_outcome_or_name_what_is_wrong() {
+        assert_eq!(
+            SmDeliveryOutcome::from_script(0, "mme", None),
+            Ok(through_the_mme(SmDeliveryCause::SuccessfulTransfer))
+        );
+        assert_eq!(
+            SmDeliveryOutcome::from_script(1, "ip_sm_gw", Some(12)),
+            Ok(SmDeliveryOutcome::new(
+                SmDeliveryNode::IpSmGw,
+                SmDeliveryCause::AbsentUser,
+                Some(12)
+            )
+            .unwrap())
+        );
+        assert!(SmDeliveryOutcome::from_script(3, "mme", None)
+            .unwrap_err()
+            .starts_with("invalid delivery_outcome: 3"));
+        assert!(SmDeliveryOutcome::from_script(0, "smsf", None)
+            .unwrap_err()
+            .starts_with("invalid node: \"smsf\""));
+        assert!(SmDeliveryOutcome::from_script(0, "mme", Some(1))
+            .unwrap_err()
+            .starts_with("absent_user_diagnostic is only sent with delivery_outcome 1"));
+    }
+
+    /// The outcomes [`emit_rsr_for_external_dissection`] writes, in order;
+    /// `scripts/validate_s6c_rsr.sh` expects exactly these.
+    fn outcomes_for_external_dissection() -> Vec<SmDeliveryOutcome> {
+        let outcome =
+            |node, cause, diagnostic| SmDeliveryOutcome::new(node, cause, diagnostic).unwrap();
+        vec![
+            through_the_mme(SmDeliveryCause::UeMemoryCapacityExceeded),
+            through_the_mme(SmDeliveryCause::AbsentUser),
+            through_the_mme(SmDeliveryCause::SuccessfulTransfer),
+            outcome(SmDeliveryNode::Msc, SmDeliveryCause::AbsentUser, Some(1)),
+            outcome(SmDeliveryNode::Sgsn, SmDeliveryCause::AbsentUser, Some(6)),
+            outcome(
+                SmDeliveryNode::IpSmGw,
+                SmDeliveryCause::AbsentUser,
+                Some(12),
+            ),
+            outcome(
+                SmDeliveryNode::Sgsn,
+                SmDeliveryCause::SuccessfulTransfer,
+                None,
+            ),
+        ]
+    }
+
+    /// Emit one RSR per outcome as hex for [`scripts/validate_s6c_rsr.sh`] to
+    /// feed to tshark.
     ///
     /// The known-answer tests pin bytes we chose, so they share whatever we
     /// misread of TS 29.338. tshark decodes the same bytes with its own
@@ -951,21 +1273,8 @@ mod tests {
         // `text2pcap`'s hex-dump form: an offset, then the octets. An offset
         // of zero starts the next packet.
         let mut dump = String::new();
-        for cause in [
-            SmDeliveryCause::UeMemoryCapacityExceeded,
-            SmDeliveryCause::AbsentUser,
-            SmDeliveryCause::SuccessfulTransfer,
-        ] {
-            let wire = build_report_sm_delivery_status_request(
-                &config(),
-                "smsc.example.com;1;1",
-                "001010000000001",
-                "441632960000",
-                cause,
-                1,
-                1,
-            );
-            for (offset, chunk) in wire.chunks(16).enumerate() {
+        for outcome in outcomes_for_external_dissection() {
+            for (offset, chunk) in rsr(&outcome).chunks(16).enumerate() {
                 dump.push_str(&format!("{:06x}", offset * 16));
                 for byte in chunk {
                     dump.push_str(&format!(" {byte:02x}"));

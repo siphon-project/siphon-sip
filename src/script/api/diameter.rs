@@ -2043,30 +2043,43 @@ impl PyDiameter {
     ///         1 = absent user,
     ///         2 = UE memory capacity exceeded.
     ///         Sent as the SM-Delivery-Cause of TS 29.338 clause 5.3.3.19
-    ///         (which numbers them 2, 1 and 0) inside
-    ///         SM-Delivery-Outcome / MME-SM-Delivery-Outcome. Any other
-    ///         number raises ``ValueError``: the interface defines no
-    ///         further cause.
+    ///         (which numbers them 2, 1 and 0). Any other number raises
+    ///         ``ValueError``: the interface defines no further cause.
+    ///     node: the node the delivery was attempted through, ``"mme"``
+    ///         (default), ``"sgsn"``, ``"msc"`` or ``"ip_sm_gw"``. The HSS
+    ///         keeps its message waiting flags per node, so name the one the
+    ///         message went to: ``"sgsn"`` when the preceding
+    ///         :meth:`s6c_srr` located no MME and the forward went to
+    ///         ``sgsn_name``. Selects the group inside SM-Delivery-Outcome.
+    ///     absent_user_diagnostic: optional Absent-User-Diagnostic-SM, why
+    ///         the node found the user absent (TS 23.040 clause 3.3.2, e.g.
+    ///         ``1`` IMSI detached, ``6`` GPRS detached). With
+    ///         ``delivery_outcome=1`` only; ``ValueError`` otherwise.
+    ///
+    /// ```python
+    /// await diameter.s6c_rsr(imsi, sc_address, 1, node="sgsn",
+    ///                        absent_user_diagnostic=6)
+    /// ```
     ///
     /// **Awaitable** — returns a coroutine, so `await` it. The request runs on
     /// tokio rather than on the calling thread, which for an `async def` handler
     /// is the asyncio driver its whole loop shares.
-    #[pyo3(signature = (user_name, sc_address, delivery_outcome))]
+    #[pyo3(signature = (user_name, sc_address, delivery_outcome, node="mme", absent_user_diagnostic=None))]
     fn s6c_rsr<'py>(
         &self,
         python: Python<'py>,
         user_name: &str,
         sc_address: &str,
         delivery_outcome: u32,
+        node: &str,
+        absent_user_diagnostic: Option<u32>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let delivery_cause =
-            crate::diameter::s6c::SmDeliveryCause::from_script_outcome(delivery_outcome)
-                .ok_or_else(|| {
-                    pyo3::exceptions::PyValueError::new_err(format!(
-                        "invalid delivery_outcome: {delivery_outcome} — expected 0 (successful \
-                         transfer), 1 (absent user) or 2 (UE memory capacity exceeded)"
-                    ))
-                })?;
+        let delivery_outcome = crate::diameter::s6c::SmDeliveryOutcome::from_script(
+            delivery_outcome,
+            node,
+            absent_user_diagnostic,
+        )
+        .map_err(pyo3::exceptions::PyValueError::new_err)?;
         let client = match self
             .manager
             .route_client(&crate::config::DiameterApplication::S6c, None)
@@ -2082,7 +2095,7 @@ impl PyDiameter {
 
         crate::script::awaitable(python, async move {
             match client
-                .send_rsr(&user_name, &sc_address, delivery_cause)
+                .send_rsr(&user_name, &sc_address, &delivery_outcome)
                 .await
             {
                 Ok(message) => match crate::diameter::s6c::parse_rsa(&message) {
@@ -3649,6 +3662,61 @@ mod tests {
                 .cx_uar(python, "sip:alice@example.com", None, Some(0))
                 .unwrap();
             assert!(resolve(python, result).is_none());
+        });
+    }
+
+    /// `s6c_rsr` from Python: the two keywords are optional, and arguments
+    /// that name nothing the interface defines raise before a peer is looked
+    /// for, so a script learns of them with no HSS connected.
+    #[test]
+    fn s6c_rsr_takes_a_node_and_a_diagnostic_and_refuses_what_it_cannot_send() {
+        pyo3::Python::initialize();
+        let manager = Arc::new(DiameterManager::new());
+        pyo3::Python::attach(|python| {
+            let diameter = Py::new(python, PyDiameter::new(manager)).unwrap();
+            let diameter = diameter.bind(python);
+            let call = |outcome: u32, keywords: &[(&str, Py<PyAny>)]| {
+                let dict = PyDict::new(python);
+                for (name, value) in keywords {
+                    dict.set_item(name, value).unwrap();
+                }
+                diameter.call_method(
+                    "s6c_rsr",
+                    ("001010000000001", "441632960000", outcome),
+                    Some(&dict),
+                )
+            };
+            let text = |value: &str| value.into_pyobject(python).unwrap().into_any().unbind();
+            let number = |value: u32| value.into_pyobject(python).unwrap().into_any().unbind();
+
+            // No HSS connected: accepted arguments resolve to None.
+            assert!(resolve(python, call(0, &[]).unwrap()).is_none());
+            assert!(resolve(
+                python,
+                call(
+                    1,
+                    &[
+                        ("node", text("sgsn")),
+                        ("absent_user_diagnostic", number(6))
+                    ]
+                )
+                .unwrap()
+            )
+            .is_none());
+
+            for (outcome, keywords, expected) in [
+                (3, vec![], "invalid delivery_outcome: 3"),
+                (0, vec![("node", text("smsf"))], "invalid node: \"smsf\""),
+                (
+                    0,
+                    vec![("absent_user_diagnostic", number(1))],
+                    "absent_user_diagnostic is only sent with delivery_outcome 1",
+                ),
+            ] {
+                let error = call(outcome, &keywords).expect_err(expected);
+                assert!(error.is_instance_of::<pyo3::exceptions::PyValueError>(python));
+                assert!(error.to_string().contains(expected), "{error}");
+            }
         });
     }
 
