@@ -2038,12 +2038,15 @@ impl PyDiameter {
     /// Args:
     ///     user_name: IMSI of the served subscriber.
     ///     sc_address: GT of the originating SMSC.
-    ///     delivery_outcome: TS 29.336 outcome enum —
-    ///         0 = SUCCESSFUL_TRANSFER,
-    ///         1 = ABSENT_USER,
-    ///         2 = UE_MEMORY_CAPACITY_EXCEEDED,
-    ///         3 = SUCCESSFUL_TRANSFER_NOT_LAST,
-    ///         4 = TEMPORARY_ERROR.
+    ///     delivery_outcome: outcome of the delivery —
+    ///         0 = successful transfer,
+    ///         1 = absent user,
+    ///         2 = UE memory capacity exceeded.
+    ///         Sent as the SM-Delivery-Cause of TS 29.338 clause 5.3.3.19
+    ///         (which numbers them 2, 1 and 0) inside
+    ///         SM-Delivery-Outcome / MME-SM-Delivery-Outcome. Any other
+    ///         number raises ``ValueError``: the interface defines no
+    ///         further cause.
     ///
     /// **Awaitable** — returns a coroutine, so `await` it. The request runs on
     /// tokio rather than on the calling thread, which for an `async def` handler
@@ -2056,6 +2059,14 @@ impl PyDiameter {
         sc_address: &str,
         delivery_outcome: u32,
     ) -> PyResult<Bound<'py, PyAny>> {
+        let delivery_cause =
+            crate::diameter::s6c::SmDeliveryCause::from_script_outcome(delivery_outcome)
+                .ok_or_else(|| {
+                    pyo3::exceptions::PyValueError::new_err(format!(
+                        "invalid delivery_outcome: {delivery_outcome} — expected 0 (successful \
+                         transfer), 1 (absent user) or 2 (UE memory capacity exceeded)"
+                    ))
+                })?;
         let client = match self
             .manager
             .route_client(&crate::config::DiameterApplication::S6c, None)
@@ -2071,7 +2082,7 @@ impl PyDiameter {
 
         crate::script::awaitable(python, async move {
             match client
-                .send_rsr(&user_name, &sc_address, delivery_outcome)
+                .send_rsr(&user_name, &sc_address, delivery_cause)
                 .await
             {
                 Ok(message) => match crate::diameter::s6c::parse_rsa(&message) {

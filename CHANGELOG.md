@@ -13,6 +13,23 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`diameter.s6c_rsr` sends a Report-SM-Delivery-Status request an HSS can
+  read (3GPP TS 29.338 clause 5.3.2.7).** The outcome was written into
+  SM-Delivery-Outcome as an SM-RP-MTI AVP, which is not a member of that
+  group, and the subscriber as a User-Name at command level, where the
+  command requires a User-Identifier. Now the request carries
+  `User-Identifier { User-Name }` and
+  `SM-Delivery-Outcome { MME-SM-Delivery-Outcome { SM-Delivery-Cause } }`.
+  `delivery_outcome` keeps its meaning for the values that have one, `0`
+  successful transfer, `1` absent user, `2` UE memory capacity exceeded, and
+  is translated to the SM-Delivery-Cause enumeration (which numbers them 2, 1
+  and 0). `3` and `4`, documented until now as "successful transfer, not last"
+  and "temporary error", name no cause the interface defines and raise
+  `ValueError` instead of being sent. The delivery is always reported as one
+  made through an MME, and no Absent-User-Diagnostic-SM is sent.
+
 ## [1.13.1] — 2026-10-08
 
 ### Added

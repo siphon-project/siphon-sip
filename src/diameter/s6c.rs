@@ -293,19 +293,59 @@ pub fn build_ala_error(
 // RSR — Report-SM-Delivery-Status (SMSC → HSS)
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Build the wire-format RSR.
+/// SM-Delivery-Cause (TS 29.338 clause 5.3.3.19): why the HSS is to set, or
+/// clear, its message waiting data. The discriminants are the wire values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SmDeliveryCause {
+    UeMemoryCapacityExceeded = 0,
+    AbsentUser = 1,
+    SuccessfulTransfer = 2,
+}
+
+impl SmDeliveryCause {
+    /// The Enumerated value carried in the SM-Delivery-Cause AVP.
+    pub fn code(self) -> u32 {
+        self as u32
+    }
+
+    /// The cause for the `delivery_outcome` number a script passes to
+    /// `diameter.s6c_rsr`: 0 successful transfer, 1 absent user, 2 UE memory
+    /// capacity exceeded. That numbering is the script API's own and is not
+    /// the wire enumeration; any other number has no SM-Delivery-Cause.
+    pub fn from_script_outcome(delivery_outcome: u32) -> Option<Self> {
+        match delivery_outcome {
+            0 => Some(Self::SuccessfulTransfer),
+            1 => Some(Self::AbsentUser),
+            2 => Some(Self::UeMemoryCapacityExceeded),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for SmDeliveryCause {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::UeMemoryCapacityExceeded => "UE_MEMORY_CAPACITY_EXCEEDED",
+            Self::AbsentUser => "ABSENT_USER",
+            Self::SuccessfulTransfer => "SUCCESSFUL_TRANSFER",
+        })
+    }
+}
+
+/// Build the wire-format RSR (TS 29.338 clause 5.3.2.7, where the command is
+/// abbreviated RDR).
 ///
-/// `delivery_outcome` is encoded into a SM-Delivery-Outcome grouped AVP
-/// holding only the per-domain outcome enum. Convention follows
-/// TS 29.336 Annex A: 0 = SUCCESSFUL_TRANSFER, 1 = ABSENT_USER,
-/// 2 = UE_MEMORY_CAPACITY_EXCEEDED, 3 = SUCCESSFUL_TRANSFER_NOT_LAST,
-/// 4 = TEMPORARY_ERROR.
+/// The subscriber goes in the mandatory User-Identifier group, as a
+/// User-Name. The outcome goes in
+/// `SM-Delivery-Outcome { MME-SM-Delivery-Outcome { SM-Delivery-Cause } }`
+/// (clauses 5.3.3.14, 5.3.3.15 and 5.3.3.19): the delivery is reported as one
+/// made through an MME, and no Absent-User-Diagnostic-SM is sent.
 pub fn build_report_sm_delivery_status_request(
     config: &crate::diameter::peer::PeerConfig,
     session_id: &str,
     user_name: &str,
     sc_address: &str,
-    delivery_outcome: u32,
+    delivery_cause: SmDeliveryCause,
     hop_by_hop: u32,
     end_to_end: u32,
 ) -> Vec<u8> {
@@ -325,23 +365,20 @@ pub fn build_report_sm_delivery_status_request(
         dictionary::VENDOR_3GPP,
         dictionary::S6C_APP_ID,
     ));
-    avp_bytes.extend_from_slice(&encode_avp_utf8(avp::USER_NAME, user_name));
+    avp_bytes.extend_from_slice(&encode_avp_grouped_3gpp(
+        avp::USER_IDENTIFIER,
+        &encode_avp_utf8(avp::USER_NAME, user_name),
+    ));
     avp_bytes.extend_from_slice(&encode_avp_octet_3gpp(
         avp::SC_ADDRESS,
         &codec::encode_isdn_address_string(sc_address, codec::TON_NPI_INTERNATIONAL_E164),
     ));
-
-    // SM-Delivery-Outcome is a grouped AVP that wraps a per-domain
-    // outcome leaf. We emit only the MME-side leaf (most common in MT
-    // delivery completion); HSS implementations accept either MME or
-    // SGSN outcomes here as the dispositive value.
-    let outcome_children = encode_avp_u32_3gpp(
-        avp::SM_RP_MTI, /* placeholder leaf code */
-        delivery_outcome,
-    );
     avp_bytes.extend_from_slice(&encode_avp_grouped_3gpp(
         avp::SM_DELIVERY_OUTCOME,
-        &outcome_children,
+        &encode_avp_grouped_3gpp(
+            avp::MME_SM_DELIVERY_OUTCOME,
+            &encode_avp_u32_3gpp(avp::SM_DELIVERY_CAUSE, delivery_cause.code()),
+        ),
     ));
 
     encode_diameter_message(
@@ -730,14 +767,88 @@ mod tests {
         );
     }
 
+    /// Top-level AVP codes of an encoded message, read straight off the
+    /// AVP headers (RFC 6733 section 4.1) without the decoder under test.
+    fn top_level_avp_codes(wire: &[u8]) -> Vec<u32> {
+        let mut codes = Vec::new();
+        let mut offset = 20;
+        while offset + 8 <= wire.len() {
+            codes.push(u32::from_be_bytes(
+                wire[offset..offset + 4].try_into().unwrap(),
+            ));
+            let length =
+                u32::from_be_bytes(wire[offset + 4..offset + 8].try_into().unwrap()) & 0x00ff_ffff;
+            offset += (length as usize).div_ceil(4) * 4;
+        }
+        codes
+    }
+
+    fn contains(wire: &[u8], expected: &[u8]) -> bool {
+        wire.windows(expected.len())
+            .any(|window| window == expected)
+    }
+
+    /// SM-Delivery-Outcome { MME-SM-Delivery-Outcome { SM-Delivery-Cause } }
+    /// as TS 29.338 clauses 5.3.3.14, 5.3.3.15 and 5.3.3.19 lay it out, all
+    /// three with the V and M bits and vendor 10415 (table 5.3.3.1/1).
+    fn sm_delivery_outcome_bytes(cause: u8) -> Vec<u8> {
+        vec![
+            0x00, 0x00, 0x0c, 0xf4, 0xc0, 0x00, 0x00, 0x28, 0x00, 0x00, 0x28,
+            0xaf, // 3316, 40
+            0x00, 0x00, 0x0c, 0xf5, 0xc0, 0x00, 0x00, 0x1c, 0x00, 0x00, 0x28,
+            0xaf, // 3317, 28
+            0x00, 0x00, 0x0c, 0xf9, 0xc0, 0x00, 0x00, 0x10, 0x00, 0x00, 0x28,
+            0xaf, // 3321, 16
+            0x00, 0x00, 0x00, cause,
+        ]
+    }
+
     #[test]
-    fn rsr_encodes_with_outcome_grouped_avp() {
+    fn rsr_known_answer_bytes() {
         let wire = build_report_sm_delivery_status_request(
             &config(),
             "test;1;1",
             "001010000000001",
-            "31611111111",
-            0, // SUCCESSFUL_TRANSFER
+            "441632960000",
+            SmDeliveryCause::SuccessfulTransfer,
+            1,
+            1,
+        );
+
+        // TS 29.338 clause 5.3.2.7: command 8388649, request and proxiable,
+        // application 16777312.
+        assert_eq!(wire[0], 1);
+        assert_eq!(wire[4], 0xc0);
+        assert_eq!(&wire[5..8], &[0x80, 0x00, 0x29]);
+        assert_eq!(&wire[8..12], &[0x01, 0x00, 0x00, 0x60]);
+
+        // User-Identifier (3102, TS 29.336) holding User-Name (1): the
+        // subscriber is named inside the group, as the command requires,
+        // and not by a User-Name at command level.
+        let user_identifier: &[u8] = &[
+            0x00, 0x00, 0x0c, 0x1e, 0xc0, 0x00, 0x00, 0x24, 0x00, 0x00, 0x28,
+            0xaf, // 3102, 36
+            0x00, 0x00, 0x00, 0x01, 0x40, 0x00, 0x00, 0x17, // User-Name, 23
+            b'0', b'0', b'1', b'0', b'1', b'0', b'0', b'0', b'0', b'0', b'0', b'0', b'0', b'0',
+            b'1', 0x00,
+        ];
+        assert!(contains(&wire, user_identifier));
+        assert!(contains(&wire, &sm_delivery_outcome_bytes(2)));
+
+        assert_eq!(
+            top_level_avp_codes(&wire),
+            vec![263, 264, 296, 283, 293, 277, 260, 3102, 3300, 3316]
+        );
+    }
+
+    #[test]
+    fn rsr_decodes_to_the_nested_delivery_outcome() {
+        let wire = build_report_sm_delivery_status_request(
+            &config(),
+            "test;1;1",
+            "001010000000001",
+            "441632960000",
+            SmDeliveryCause::AbsentUser,
             1,
             1,
         );
@@ -747,6 +858,80 @@ mod tests {
             decoded.command_code,
             dictionary::CMD_REPORT_SM_DELIVERY_STATUS
         );
-        assert!(decoded.avps.get("SM-Delivery-Outcome").is_some());
+        assert_eq!(
+            decoded
+                .avps
+                .get("SM-Delivery-Outcome")
+                .and_then(|outcome| outcome.get("MME-SM-Delivery-Outcome"))
+                .and_then(|outcome| outcome.get("SM-Delivery-Cause"))
+                .and_then(|cause| cause.as_u64()),
+            Some(1)
+        );
+        assert_eq!(
+            decoded
+                .avps
+                .get("User-Identifier")
+                .and_then(|identifier| identifier.get("User-Name"))
+                .and_then(|name| name.as_str()),
+            Some("001010000000001")
+        );
+        assert!(decoded.avps.get("User-Name").is_none());
+    }
+
+    #[test]
+    fn rsr_carries_each_cause_with_its_wire_value() {
+        // TS 29.338 clause 5.3.3.19.
+        for (cause, value) in [
+            (SmDeliveryCause::UeMemoryCapacityExceeded, 0),
+            (SmDeliveryCause::AbsentUser, 1),
+            (SmDeliveryCause::SuccessfulTransfer, 2),
+        ] {
+            assert_eq!(cause.code(), u32::from(value));
+            let wire = build_report_sm_delivery_status_request(
+                &config(),
+                "test;1;1",
+                "001010000000001",
+                "441632960000",
+                cause,
+                1,
+                1,
+            );
+            assert!(
+                contains(&wire, &sm_delivery_outcome_bytes(value)),
+                "{cause}"
+            );
+        }
+    }
+
+    #[test]
+    fn script_outcome_numbers_map_to_causes() {
+        assert_eq!(
+            SmDeliveryCause::from_script_outcome(0),
+            Some(SmDeliveryCause::SuccessfulTransfer)
+        );
+        assert_eq!(
+            SmDeliveryCause::from_script_outcome(1),
+            Some(SmDeliveryCause::AbsentUser)
+        );
+        assert_eq!(
+            SmDeliveryCause::from_script_outcome(2),
+            Some(SmDeliveryCause::UeMemoryCapacityExceeded)
+        );
+        for undefined in [3, 4, 5, u32::MAX] {
+            assert_eq!(SmDeliveryCause::from_script_outcome(undefined), None);
+        }
+    }
+
+    #[test]
+    fn sm_delivery_cause_display() {
+        assert_eq!(
+            SmDeliveryCause::UeMemoryCapacityExceeded.to_string(),
+            "UE_MEMORY_CAPACITY_EXCEEDED"
+        );
+        assert_eq!(SmDeliveryCause::AbsentUser.to_string(), "ABSENT_USER");
+        assert_eq!(
+            SmDeliveryCause::SuccessfulTransfer.to_string(),
+            "SUCCESSFUL_TRANSFER"
+        );
     }
 }

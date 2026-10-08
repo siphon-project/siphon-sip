@@ -7652,7 +7652,25 @@ class MockDiameter:
     async def s6c_rsr(self, user_name: str, sc_address: str,
                 delivery_outcome: int) -> Optional[dict]:
         """Mock Report-SM-Delivery-Status. Records the call on
-        ``self.rsrs`` for assertions and returns a 2001."""
+        ``self.rsrs`` for assertions and returns a 2001.
+
+        Args:
+            user_name: IMSI of the served subscriber.
+            sc_address: Address of the service centre.
+            delivery_outcome: ``0`` successful transfer, ``1`` absent user,
+                ``2`` UE memory capacity exceeded. siphon sends it as the
+                SM-Delivery-Cause of TS 29.338 inside SM-Delivery-Outcome /
+                MME-SM-Delivery-Outcome.
+
+        Raises:
+            ValueError: ``delivery_outcome`` is not 0, 1 or 2.
+        """
+        if delivery_outcome not in (0, 1, 2):
+            raise ValueError(
+                f"invalid delivery_outcome: {delivery_outcome} — expected 0 "
+                "(successful transfer), 1 (absent user) or 2 (UE memory "
+                "capacity exceeded)"
+            )
         if not hasattr(self, "rsrs"):
             self.rsrs = []
         self.rsrs.append({

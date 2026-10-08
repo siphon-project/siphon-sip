@@ -1694,6 +1694,20 @@ static AVP_TABLE: &[AvpDef] = &[
         name: "SM-Delivery-Outcome",
         data_type: AvpType::Grouped,
     },
+    // TS 29.338 clauses 5.3.3.15 and 5.3.3.19: the per-node outcome inside
+    // SM-Delivery-Outcome and the cause it carries.
+    AvpDef {
+        code: 3317,
+        vendor_id: TGPP,
+        name: "MME-SM-Delivery-Outcome",
+        data_type: AvpType::Grouped,
+    },
+    AvpDef {
+        code: 3321,
+        vendor_id: TGPP,
+        name: "SM-Delivery-Cause",
+        data_type: AvpType::Enumerated,
+    },
     AvpDef {
         code: 3324,
         vendor_id: TGPP,
@@ -2394,6 +2408,8 @@ pub mod avp {
     pub const SM_RP_UI: u32 = 3301;
     pub const SM_RP_MTI: u32 = 3308;
     pub const SM_DELIVERY_OUTCOME: u32 = 3316;
+    pub const MME_SM_DELIVERY_OUTCOME: u32 = 3317;
+    pub const SM_DELIVERY_CAUSE: u32 = 3321;
     pub const SMSMI_CORRELATION_ID: u32 = 3324;
     pub const SMS_GMSC_ADDRESS: u32 = 3332;
 
