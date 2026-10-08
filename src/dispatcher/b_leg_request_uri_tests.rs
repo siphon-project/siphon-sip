@@ -125,8 +125,8 @@ async fn a_dialled_uri_without_user_parameters_removes_the_callers() {
     assert_eq!(request_uri, "sip:+15550100@example.com;user=phone");
 }
 
-/// A script that reads the Request-URI, edits its parameters and dials the
-/// result: the round trip through `call.ruri` loses nothing.
+/// A script that reads the Request-URI and dials it back as read: the round
+/// trip through `call.ruri` loses nothing.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_dipped_request_uri_dialled_back_as_read_is_unchanged() {
     let request_uri = dialled_request_uri(
