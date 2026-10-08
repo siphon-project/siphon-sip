@@ -216,6 +216,14 @@ impl PySubscribeState {
     /// The notifier's first NOTIFY may arrive before the 2xx (RFC 6665
     /// §4.1.2.4). It then establishes the dialog (§4.4.1), so :meth:`find`
     /// in the NOTIFY handler returns the handle this call returns afterwards.
+    /// A subscription a NOTIFY established stands when the SUBSCRIBE gets no
+    /// final response within ``timeout_ms``, and its handle is returned then
+    /// too (§4.1.2).
+    ///
+    /// One call tracks one dialog: the first NOTIFY's, or the 2xx's when no
+    /// NOTIFY came before it. siphon answers a NOTIFY for the same SUBSCRIBE
+    /// from another notifier tag with 481 itself, and a 2xx from another
+    /// fork does not change the dialog (§5.4.9).
     ///
     /// Args:
     ///     ruri: SUBSCRIBE Request-URI (the watched resource).
@@ -232,9 +240,13 @@ impl PySubscribeState {
     ///              (e.g. ``P-Asserted-Identity``).
     ///     timeout_ms: Response timeout in milliseconds (default 2000).
     ///
-    /// Raises ``RuntimeError`` on non-2xx response, timeout, malformed
-    /// 200 OK (missing tag), or transport failure. The subscription is then
-    /// gone, including one an early NOTIFY had established.
+    /// Raises ``RuntimeError`` on a non-2xx response (§4.1.2.1: no
+    /// subscription was created, even if a NOTIFY came first), on a timeout
+    /// with no NOTIFY received, on a 200 OK with no To tag when it had to
+    /// establish the dialog, on transport failure, and when a NOTIFY with
+    /// ``Subscription-State: terminated`` ended the subscription before the
+    /// SUBSCRIBE completed (the message carries that header value). Nothing
+    /// of the attempt is left in any of these cases.
     #[pyo3(signature = (
         ruri,
         event,
@@ -297,6 +309,11 @@ impl PySubscribeState {
     /// too: that NOTIFY establishes the dialog before the handler runs
     /// (RFC 6665 §4.4.1). ``None`` therefore means the NOTIFY belongs to no
     /// subscription, and 481 is the answer (§4.1.3).
+    ///
+    /// A NOTIFY with ``Subscription-State: terminated`` still finds its
+    /// subscription here. siphon removes the subscription when the NOTIFY
+    /// handlers have returned (§4.4.1), so the handle is good for reading
+    /// inside the handler and raises ``LookupError`` afterwards.
     #[pyo3(signature = (call_id, local_tag, remote_tag))]
     fn find(&self, call_id: &str, local_tag: &str, remote_tag: &str) -> Option<PySubscribeHandle> {
         self.store
@@ -1377,8 +1394,8 @@ impl PySubscribeState {
         // The subscription exists from here, before the SUBSCRIBE leaves: the
         // notifier's first NOTIFY may overtake its 2xx (RFC 6665 §4.1.2.4), and
         // the dispatcher establishes the dialog from whichever arrives first.
-        // Every return below that is not the 2xx drops `pending`, which takes
-        // the subscription out of the store again.
+        // Every return below that keeps no subscription drops `pending`, which
+        // takes whatever the attempt put in the store out again.
         let pending = store.register_pending(SubscribeDialog {
             id: short_uuid(),
             call_id,
@@ -1409,25 +1426,23 @@ impl PySubscribeState {
         let timeout = std::time::Duration::from_millis(timeout_ms);
         let result = tokio::time::timeout(timeout, receiver).await;
 
-        let response = match result {
-            Ok(Ok(crate::uac::UacResult::Response(message))) => *message,
-            Ok(Ok(crate::uac::UacResult::Timeout)) | Ok(Err(_)) | Err(_) => {
-                return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                    "subscribe_state.send() timed out waiting for 2xx",
-                ));
+        let outcome = match result {
+            Ok(Ok(crate::uac::UacResult::Response(response))) => {
+                let status = response.status_code().unwrap_or(0);
+                if !(200..300).contains(&status) {
+                    // RFC 6665 §4.1.2.1: no subscription has been created.
+                    return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "subscribe_state.send() got non-2xx response: {status}"
+                    )));
+                }
+                pending.accepted(RemoteParty::from_subscribe_response(&response))
             }
+            // No final response. A subscription a NOTIFY established stands
+            // all the same (§4.1.2), and its handle is what the script gets.
+            Ok(Ok(crate::uac::UacResult::Timeout)) | Ok(Err(_)) | Err(_) => pending.unanswered(),
         };
-
-        let status = response.status_code().unwrap_or(0);
-        if !(200..300).contains(&status) {
-            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "subscribe_state.send() got non-2xx response: {status}"
-            )));
-        }
-
-        let notifier = RemoteParty::from_subscribe_response(&response)
-            .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
-        let id = pending.confirm(&notifier);
+        let id = outcome
+            .map_err(|failure| pyo3::exceptions::PyRuntimeError::new_err(failure.to_string()))?;
         debug!(id, "subscribe_state: outbound dialog established");
 
         Ok(PySubscribeHandle {

@@ -63,10 +63,27 @@ To tag and the Event header and establishes the dialog from it (§4.4.1), route
 set included, before the NOTIFY handler runs. So
 `proxy.subscribe_state.find(request.call_id, request.to_tag, request.from_tag)`
 returns the same handle in either order, and `None` means the NOTIFY belongs to
-no subscription: answer it 481. When `send()` raises (a non-2xx, a timeout) the
-subscription is gone again, including one an early NOTIFY had established. A
-NOTIFY with `Subscription-State: terminated` is matched like any other; ending
-the subscription on it stays with the script.
+no subscription: answer it 481.
+
+What the SUBSCRIBE transaction then decides, per the subscriber state machine of
+§4.1.2:
+
+| The SUBSCRIBE gets | after a NOTIFY established the subscription | with no NOTIFY yet |
+|---|---|---|
+| a 2xx | `send()` returns the handle; the dialog stays the NOTIFY's | `send()` returns the handle; the 2xx establishes the dialog |
+| no final response within `timeout_ms` | `send()` returns the handle: the subscription stands | `send()` raises; nothing is left |
+| a non-2xx | `send()` raises; the subscription is withdrawn (§4.1.2.1) | `send()` raises; nothing is left |
+
+A NOTIFY with `Subscription-State: terminated` ends the subscription in any
+order. The NOTIFY handler still finds it with `find()` and answers 200; siphon
+removes it when the handlers have returned (§4.4.1), after which the handle
+raises `LookupError`. If that happens before `send()` has returned, `send()`
+raises with the Subscription-State value in the message.
+
+One `send()` tracks one dialog: the first NOTIFY's, or the 2xx's when no NOTIFY
+came before it. A NOTIFY for the same SUBSCRIBE from another notifier tag, which
+a forked SUBSCRIBE produces, is answered 481 by siphon without running the
+handler, and a 2xx from another fork does not change the dialog (§5.4.9).
 
 ::: siphon_sdk.mock_module.MockSubscribeState
 

@@ -48,7 +48,7 @@ const SCRIPT: &str = concat!(
     "        request.call_id, request.to_tag, request.from_tag\n",
     "    )\n",
     "    if handle is None:\n",
-    "        request.reply(481, \"Subscription Does Not Exist\")\n",
+    "        request.reply(481, \"Unknown To The Script\")\n",
     "        return\n",
     "    request.set_reply_header(\"X-Subscription\", handle.id)\n",
     "    request.set_reply_header(\"X-Event\", handle.event)\n",

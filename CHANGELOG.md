@@ -70,14 +70,29 @@ entry, but a working config keeps working.
   dialog before the NOTIFY handler runs, with the remote target and route set
   taken from the NOTIFY. `find()` returns the handle that `send()` returns
   afterwards, and a `None` from it now reliably means the NOTIFY belongs to no
-  subscription (§4.1.3, 481). With the 2xx first nothing changes. When
-  `send()` raises, on a non-2xx or a timeout, the subscription is withdrawn,
-  including one an early NOTIFY had established, so a failed attempt leaves
-  no state. A NOTIFY with `Subscription-State: terminated` is matched like any
-  other and acting on it stays with the script, as it does after the 2xx. One
-  `send()` still tracks one dialog: if a forked SUBSCRIBE is answered 2xx by
-  another notifier than the one whose NOTIFY came first, the dialog is the
-  2xx's, as before.
+  subscription (§4.1.3, 481). With the 2xx first nothing changes.
+
+  The rest follows the subscriber state machine of §4.1.2, and changes what a
+  script sees in three places:
+
+  - **`send()` returns the handle instead of raising when the SUBSCRIBE gets
+    no final response but a NOTIFY has established the subscription.** Timer N
+    bounds the wait for a NOTIFY, not for a response, so that subscription
+    stands. A timeout with no NOTIFY still raises and leaves no state, and so
+    does a non-2xx, which says no subscription was created (§4.1.2.1) and
+    withdraws one an early NOTIFY had established.
+  - **A NOTIFY with `Subscription-State: terminated` destroys the outbound
+    subscription (§4.4.1).** The NOTIFY handler still finds it with `find()`;
+    siphon removes it when the handlers have returned, where it used to stay
+    in the store until the script terminated it or it expired. A handle kept
+    past that point raises `LookupError`. When this happens before `send()`
+    has returned, `send()` raises with the Subscription-State value in its
+    message, whatever the SUBSCRIBE is answered with.
+  - **A NOTIFY for the same SUBSCRIBE from another notifier tag than the
+    dialog's is answered 481 by siphon, without running the NOTIFY handler
+    (§5.4.9).** One `send()` tracks one dialog, the one the first NOTIFY
+    established, or the 2xx when it came first. A 2xx from another fork than
+    that NOTIFY does not change the dialog.
 
 - **`diameter.s6c_rsr` sends a Report-SM-Delivery-Status request an HSS can
   read (3GPP TS 29.338 clause 5.3.2.7).** The outcome was written into

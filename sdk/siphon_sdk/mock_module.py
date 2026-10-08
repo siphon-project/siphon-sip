@@ -596,9 +596,22 @@ class MockSubscribeState:
                     return
                 request.reply(200, "OK")
 
-        Raises ``RuntimeError`` on a non-2xx response or a timeout. The
-        subscription is then gone, including one an early NOTIFY had
-        established, and a later NOTIFY for it finds nothing.
+        A subscription a NOTIFY established stands when the SUBSCRIBE gets
+        no final response within ``timeout_ms``: its handle is returned then
+        too (section 4.1.2).
+
+        One call tracks one dialog: the first NOTIFY's, or the 2xx's when no
+        NOTIFY came before it. siphon itself answers 481 to a NOTIFY for the
+        same SUBSCRIBE from another notifier tag, without running the
+        handler, and a 2xx from another fork does not change the dialog
+        (section 5.4.9).
+
+        Raises ``RuntimeError`` on a non-2xx response (no subscription was
+        created, even if a NOTIFY came first, section 4.1.2.1), on a timeout
+        with no NOTIFY received, and when a NOTIFY with
+        ``Subscription-State: terminated`` ended the subscription before the
+        SUBSCRIBE completed; the message then carries that header value.
+        Nothing of the attempt is left in any of these cases.
         """
         async def _run():
             import uuid
@@ -644,6 +657,11 @@ class MockSubscribeState:
         tag. In siphon the first NOTIFY of a :meth:`send` that is still
         awaiting its 2xx is found too, so ``None`` means the NOTIFY belongs
         to no subscription and 481 is the answer (RFC 6665 section 4.1.3).
+
+        A NOTIFY with ``Subscription-State: terminated`` still finds its
+        subscription. siphon removes the subscription once the NOTIFY
+        handlers have returned (section 4.4.1): read what you need from the
+        handle inside the handler, afterwards it raises ``LookupError``.
         """
         for dialog_id, dialog in self._dialogs.items():
             if dialog.get("terminated"):

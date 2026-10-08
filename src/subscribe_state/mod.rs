@@ -25,9 +25,11 @@ use tracing::{debug, warn};
 use crate::cache::CacheManager;
 use crate::sip::message::SipMessage;
 
-mod pending;
+mod outbound;
 
-pub use pending::{PendingSubscription, RemoteParty};
+pub use outbound::{
+    AttemptFailure, EndedSubscription, NotifyDisposition, PendingSubscription, RemoteParty,
+};
 
 /// Seconds since the Unix epoch, capped at `u64::MAX` on clock weirdness.
 fn unix_now() -> u64 {
@@ -133,9 +135,9 @@ impl SubscribeDialog {
 /// Store holding the L1 DashMap and (optionally) an L2 cache handle.
 pub struct SubscribeStore {
     dialogs: DashMap<String, SubscribeDialog>,
-    /// Outbound subscriptions whose SUBSCRIBE is sent and whose dialog no
-    /// NOTIFY or 2xx has established yet, by Call-ID.  See [`pending`].
-    pending: DashMap<String, SubscribeDialog>,
+    /// The subscriptions this node originated, by Call-ID, from the SUBSCRIBE
+    /// leaving until the dialog is gone.  See [`outbound`].
+    outbound: DashMap<String, outbound::OutboundSubscription>,
     /// ``(cache_manager, cache_name)`` when configured.
     cache: Option<(Arc<CacheManager>, String)>,
 }
@@ -155,13 +157,15 @@ pub fn global_store() -> Option<Arc<SubscribeStore>> {
     GLOBAL_STORE.get().cloned()
 }
 
-/// Let an inbound NOTIFY establish the outbound subscription it answers when
-/// it arrives ahead of the 2xx to the SUBSCRIBE (RFC 6665 §4.1.2.4, §4.4.1).
-/// The dispatcher calls this for every NOTIFY before the script sees it, so
-/// the script's lookup finds the dialog whichever of the two came first.
-pub fn establish_from_notify(notify: &SipMessage) {
-    if let Some(store) = GLOBAL_STORE.get() {
-        store.establish_from_notify(notify);
+/// Place an inbound NOTIFY against the subscriptions this node originated
+/// (RFC 6665 §4.1.2.4, §4.4.1, §5.4.9).  The dispatcher calls this for every
+/// NOTIFY before the script sees it: one that arrives ahead of the 2xx to its
+/// SUBSCRIBE establishes the dialog, so the script's lookup finds it
+/// whichever of the two came first.
+pub fn notify_received(notify: &SipMessage) -> NotifyDisposition {
+    match GLOBAL_STORE.get() {
+        Some(store) => store.notify_received(notify),
+        None => NotifyDisposition::Deliver,
     }
 }
 
@@ -169,7 +173,7 @@ impl SubscribeStore {
     pub fn new() -> Self {
         Self {
             dialogs: DashMap::new(),
-            pending: DashMap::new(),
+            outbound: DashMap::new(),
             cache: None,
         }
     }
@@ -288,7 +292,9 @@ impl SubscribeStore {
 
     /// Remove a dialog from both L1 and L2.
     pub fn remove(&self, id: &str) {
-        self.dialogs.remove(id);
+        if let Some((_, dialog)) = self.dialogs.remove(id) {
+            self.forget_outbound(&dialog);
+        }
         if let Some((manager, name)) = &self.cache {
             let manager = Arc::clone(manager);
             let cache_name = name.clone();
@@ -333,6 +339,7 @@ impl SubscribeStore {
             if let Some((_, dialog)) = self.dialogs.remove_if(id, |_, dialog| {
                 dialog.terminated || dialog.remaining_secs() == 0
             }) {
+                self.forget_outbound(&dialog);
                 removed.push(dialog);
             }
         }

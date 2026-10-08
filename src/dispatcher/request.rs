@@ -107,6 +107,57 @@ pub(super) fn invite_action_target_gone(
         .map_or(true, |call| call.state == CallState::Terminated)
 }
 
+/// Answer a request the dispatcher decides itself, with no script involved.
+///
+/// The response is fed to the server transaction the way a script's own reply
+/// is fed (RFC 3261 §17.2.1/§17.2.2), so a retransmitted request is answered
+/// from the cached response instead of falling into silence — over UDP that
+/// lost-request case is the whole reason this path matters. Falls back to a
+/// direct send when no transaction was created (a topmost Via carrying no
+/// branch).
+fn answer_locally(
+    response: SipMessage,
+    server_key: Option<&TransactionKey>,
+    inbound: &InboundMessage,
+    state: &Arc<DispatcherState>,
+) {
+    let mut sent_by_transaction = false;
+    if let Some(key) = server_key {
+        let event = if key.method == crate::sip::message::Method::Invite {
+            ServerEvent::Ist(IstEvent::TuNon2xxFinal(response.clone()))
+        } else {
+            ServerEvent::Nist(NistEvent::TuFinal(response.clone()))
+        };
+        match state.transaction_manager.process_server_event(key, event) {
+            Ok(actions) => {
+                sent_by_transaction = actions.iter().any(|a| matches!(a, Action::SendMessage(_)));
+                process_timer_actions(
+                    &actions,
+                    key,
+                    Some(inbound.remote_addr),
+                    Some(inbound.transport),
+                    Some(inbound.connection_id),
+                    Some(inbound.local_addr),
+                    state,
+                );
+            }
+            Err(error) => {
+                debug!(key = %key, "failed to feed a local reply to the server transaction: {error}");
+            }
+        }
+    }
+    if !sent_by_transaction {
+        send_message_from(
+            response,
+            inbound.transport,
+            inbound.remote_addr,
+            inbound.connection_id,
+            Some(inbound.local_addr),
+            state,
+        );
+    }
+}
+
 /// Handle an inbound SIP request — run through Python handlers.
 #[allow(clippy::too_many_lines)] // TODO(1.9.0 split): decomposed by the dispatcher module split. handle_request: security, method intercepts, script dispatch, action arms
 pub(super) fn handle_request(
@@ -662,12 +713,32 @@ pub(super) fn handle_request(
         return;
     }
 
-    // A NOTIFY ahead of the 2xx to the SUBSCRIBE it answers creates that
-    // subscription's dialog (RFC 6665 §4.4.1), here and before the script, so
-    // the handler's lookup finds it in either order.
-    if method == "NOTIFY" {
-        crate::subscribe_state::establish_from_notify(&message);
-    }
+    // A NOTIFY for a SUBSCRIBE this node sent is placed against that
+    // subscription here, before the script: one ahead of the 2xx creates the
+    // dialog (RFC 6665 §4.4.1), so the handler's lookup finds it in either
+    // order; one from another notifier than the dialog's is refused (§5.4.9);
+    // and one that terminates the subscription destroys it once the handlers
+    // below have returned, which is when this guard goes.
+    let _ended_subscription =
+        match (method == "NOTIFY").then(|| crate::subscribe_state::notify_received(&message)) {
+            Some(crate::subscribe_state::NotifyDisposition::Reject) => {
+                debug!(
+                    call_id = %message.headers.call_id().map(String::as_str).unwrap_or(""),
+                    "NOTIFY from another notifier than the subscription's dialog — answering 481"
+                );
+                let response = build_response(
+                    &message,
+                    481,
+                    "Subscription Does Not Exist",
+                    state.server_header.as_deref(),
+                    &[],
+                );
+                answer_locally(response, server_key.as_ref(), &inbound, state);
+                return;
+            }
+            Some(crate::subscribe_state::NotifyDisposition::DeliverThenEnd(ended)) => Some(ended),
+            Some(crate::subscribe_state::NotifyDisposition::Deliver) | None => None,
+        };
 
     // Look up matching Python handlers
     let handlers = engine_state.proxy_request_handlers(&method);
@@ -750,49 +821,7 @@ pub(super) fn handle_request(
             warn!(method = %method, "no script handler registered — answering 405");
         }
 
-        // Feed it to the server transaction the way a script's own reply is fed
-        // (RFC 3261 §17.2.1/§17.2.2), so a retransmitted request is answered
-        // from the cached response instead of falling into silence — over UDP
-        // that lost-probe case is the whole reason this path matters. Falls back
-        // to a direct send when no transaction was created (a topmost Via
-        // carrying no branch).
-        let mut sent_by_transaction = false;
-        if let Some(ref key) = server_key {
-            let event = if key.method == crate::sip::message::Method::Invite {
-                // Only reachable as the 405 — an OPTIONS never keys an IST.
-                ServerEvent::Ist(IstEvent::TuNon2xxFinal(response.clone()))
-            } else {
-                ServerEvent::Nist(NistEvent::TuFinal(response.clone()))
-            };
-            match state.transaction_manager.process_server_event(key, event) {
-                Ok(actions) => {
-                    sent_by_transaction =
-                        actions.iter().any(|a| matches!(a, Action::SendMessage(_)));
-                    process_timer_actions(
-                        &actions,
-                        key,
-                        Some(inbound.remote_addr),
-                        Some(inbound.transport),
-                        Some(inbound.connection_id),
-                        Some(inbound.local_addr),
-                        state,
-                    );
-                }
-                Err(error) => {
-                    debug!(key = %key, "failed to feed no-handler reply to server transaction: {error}");
-                }
-            }
-        }
-        if !sent_by_transaction {
-            send_message_from(
-                response,
-                inbound.transport,
-                inbound.remote_addr,
-                inbound.connection_id,
-                Some(inbound.local_addr),
-                state,
-            );
-        }
+        answer_locally(response, server_key.as_ref(), &inbound, state);
         return;
     }
 

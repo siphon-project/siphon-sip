@@ -134,6 +134,10 @@ impl Attempt {
     }
 }
 
+fn first_line(message: &str) -> &str {
+    message.lines().next().unwrap_or_default()
+}
+
 #[test]
 fn a_notify_ahead_of_the_2xx_reaches_the_subscription_send_returns() {
     let (_turn, harness) = subscribe_harness();
@@ -233,22 +237,48 @@ fn a_subscribe_that_times_out_leaves_nothing_behind() {
     );
     assert_eq!(harness.store.pending_count(), 0);
     assert_eq!(harness.store.local_count(), dialogs_before);
-
-    // Notified, but the 2xx never comes.
-    let mut notified = Attempt::start(harness, 5, 400);
-    let early = notified.notify(NOTIFIER_TAG, "reg", "active;expires=600");
-    assert!(early.starts_with("SIP/2.0 200"), "got {early:?}");
-    let reply = notified.outcome();
-    assert!(reply.starts_with("SIP/2.0 500"), "send() raises: {reply:?}");
-    assert_eq!(harness.store.pending_count(), 0);
-    assert_eq!(harness.store.local_count(), dialogs_before);
-    let late = notified.notify(NOTIFIER_TAG, "reg", "active;expires=600");
-    assert!(late.starts_with("SIP/2.0 481"), "got {late:?}");
 }
 
+/// RFC 6665 §4.1.2: the NOTIFY takes the subscription out of `notify_wait`,
+/// and nothing about the SUBSCRIBE transaction is an event in the state it
+/// enters. Timer N (§4.1.2.4) only bounds the wait for that NOTIFY.
 #[test]
-fn a_terminated_notify_ahead_of_the_2xx_is_the_subscriptions_too() {
+fn a_notified_subscription_stands_when_the_subscribe_is_never_answered() {
     let (_turn, harness) = subscribe_harness();
+    let dialogs_before = harness.store.local_count();
+    let mut attempt = Attempt::start(harness, 5, 400);
+
+    let early = attempt.notify(NOTIFIER_TAG, "reg", "active;expires=600");
+    assert!(early.starts_with("SIP/2.0 200"), "got {early:?}");
+    let id = header_value(&early, "X-Subscription").expect("the handle the script found");
+
+    let reply = attempt.outcome();
+    assert!(
+        reply.starts_with("SIP/2.0 200"),
+        "send() returns the subscription the NOTIFY established: {reply:?}"
+    );
+    assert_eq!(
+        header_value(&reply, "X-Subscription").as_deref(),
+        Some(id.as_str())
+    );
+    assert_eq!(harness.store.pending_count(), 0);
+    assert_eq!(harness.store.local_count(), dialogs_before + 1);
+
+    let later = attempt.notify(NOTIFIER_TAG, "reg", "active;expires=600");
+    assert_eq!(
+        header_value(&later, "X-Subscription").as_deref(),
+        Some(id.as_str())
+    );
+}
+
+/// RFC 6665 §4.1.2: `notify_wait` goes to `terminated` on "NOTIFY,
+/// state=terminated", and §4.4.1 creates no dialog usage for that NOTIFY. The
+/// script still answers it as its subscription's; nothing is left afterwards,
+/// and the 2xx that follows has no subscription to hand back.
+#[test]
+fn a_terminated_notify_ahead_of_the_2xx_ends_the_attempt() {
+    let (_turn, harness) = subscribe_harness();
+    let dialogs_before = harness.store.local_count();
     let mut attempt = Attempt::start(harness, 6, 5000);
 
     let early = attempt.notify(NOTIFIER_TAG, "reg", "terminated;reason=rejected");
@@ -256,16 +286,112 @@ fn a_terminated_notify_ahead_of_the_2xx_is_the_subscriptions_too() {
         early.starts_with("SIP/2.0 200"),
         "the script learns its subscription ended, got {early:?}"
     );
-    let id = header_value(&early, "X-Subscription").expect("the handle the script found");
+    assert!(header_value(&early, "X-Subscription").is_some());
+    assert_eq!(
+        harness.store.local_count(),
+        dialogs_before,
+        "no dialog outlives the NOTIFY that terminated it"
+    );
 
     attempt.answer("200 OK", Some(NOTIFIER_TAG));
+    let reply = attempt.outcome();
+    assert!(reply.starts_with("SIP/2.0 500"), "send() raises: {reply:?}");
+    assert!(
+        header_value(&reply, "X-Failure")
+            .is_some_and(|failure| failure.contains("terminated;reason=rejected")),
+        "the script is told how it ended, got {reply:?}"
+    );
+    assert_eq!(harness.store.pending_count(), 0);
+    assert_eq!(harness.store.local_count(), dialogs_before);
+
+    let late = attempt.notify(NOTIFIER_TAG, "reg", "active;expires=600");
+    assert!(late.starts_with("SIP/2.0 481"), "got {late:?}");
+}
+
+/// RFC 6665 §4.4.1: "A subscription is destroyed after a notifier sends a
+/// NOTIFY request with a Subscription-State of terminated."
+#[test]
+fn a_terminated_notify_destroys_an_established_subscription() {
+    let (_turn, harness) = subscribe_harness();
+    let dialogs_before = harness.store.local_count();
+    let mut attempt = Attempt::start(harness, 8, 5000);
+    attempt.answer("200 OK", Some(NOTIFIER_TAG));
+    let reply = attempt.outcome();
+    let id = header_value(&reply, "X-Subscription").expect("the handle send() returned");
+    assert_eq!(harness.store.local_count(), dialogs_before + 1);
+
+    let last = attempt.notify(NOTIFIER_TAG, "reg", "terminated;reason=timeout");
+    assert!(last.starts_with("SIP/2.0 200"), "got {last:?}");
+    assert_eq!(
+        header_value(&last, "X-Subscription").as_deref(),
+        Some(id.as_str()),
+        "the handler still finds the subscription the NOTIFY ends"
+    );
+    assert_eq!(harness.store.local_count(), dialogs_before);
+
+    let stray = attempt.notify(NOTIFIER_TAG, "reg", "active;expires=600");
+    assert_eq!(first_line(&stray), "SIP/2.0 481 Unknown To The Script");
+}
+
+/// RFC 6665 §5.4.9: "the first potential dialog-establishing message will
+/// create a dialog", later NOTIFYs for the SUBSCRIBE that do not match it
+/// "would be rejected with a 481 response", and a 2xx that does not correlate
+/// to it is ignored.
+#[test]
+fn one_send_keeps_the_first_dialog_and_refuses_other_forks() {
+    let (_turn, harness) = subscribe_harness();
+    let mut attempt = Attempt::start(harness, 9, 5000);
+
+    let first = attempt.notify("fork-one", "reg", "active;expires=600");
+    assert!(first.starts_with("SIP/2.0 200"), "got {first:?}");
+    let id = header_value(&first, "X-Subscription").expect("the handle the script found");
+
+    // Answered by the framework: the script is not asked.
+    let second = attempt.notify("fork-two", "reg", "active;expires=600");
+    assert_eq!(
+        first_line(&second),
+        "SIP/2.0 481 Subscription Does Not Exist"
+    );
+
+    attempt.answer("200 OK", Some("fork-two"));
     let reply = attempt.outcome();
     assert_eq!(
         header_value(&reply, "X-Subscription").as_deref(),
         Some(id.as_str()),
-        "the same subscription as with the 2xx first"
+        "send() returns the subscription the first NOTIFY established"
     );
-    assert_eq!(harness.store.pending_count(), 0);
+
+    let from_first = attempt.notify("fork-one", "reg", "active;expires=600");
+    assert_eq!(
+        header_value(&from_first, "X-Subscription").as_deref(),
+        Some(id.as_str()),
+        "the 2xx of another fork did not replace the dialog"
+    );
+    let from_second = attempt.notify("fork-two", "reg", "active;expires=600");
+    assert_eq!(
+        first_line(&from_second),
+        "SIP/2.0 481 Subscription Does Not Exist"
+    );
+}
+
+#[test]
+fn a_notify_from_another_fork_after_the_2xx_is_refused() {
+    let (_turn, harness) = subscribe_harness();
+    let mut attempt = Attempt::start(harness, 10, 5000);
+    attempt.answer("200 OK", Some("fork-one"));
+    let reply = attempt.outcome();
+    let id = header_value(&reply, "X-Subscription").expect("the handle send() returned");
+
+    let other = attempt.notify("fork-two", "reg", "active;expires=600");
+    assert_eq!(
+        first_line(&other),
+        "SIP/2.0 481 Subscription Does Not Exist"
+    );
+    let same = attempt.notify("fork-one", "reg", "active;expires=600");
+    assert_eq!(
+        header_value(&same, "X-Subscription").as_deref(),
+        Some(id.as_str())
+    );
 }
 
 #[test]
