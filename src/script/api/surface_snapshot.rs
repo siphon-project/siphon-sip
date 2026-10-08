@@ -62,6 +62,7 @@ mod tests {
             super::super::call::PyCall,
             super::super::call::PyMediaHandle,
             super::super::cdr::PyCdrNamespace,
+            super::super::config::PyScriptConfig,
             super::super::diameter::PyDiameter,
             super::super::diameter::PyEventSink,
             super::super::diameter_server::PyDiameterAnswer,

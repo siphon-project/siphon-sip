@@ -68,26 +68,30 @@ impl std::error::Error for IfcError {}
 // ---------------------------------------------------------------------------
 
 /// Session case for iFC evaluation (originating vs terminating).
+///
+/// The integer codes are those of `tDirectionOfRequest` in 3GPP TS 29.228
+/// Annex E.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionCase {
-    /// Originating (request from registered user).
+    /// Originating, request from a registered user (code 0).
     Originating,
-    /// Terminating (request to registered user).
+    /// Terminating, request to a registered user (code 1).
     Terminating,
-    /// Originating on behalf of unregistered user.
+    /// Originating on behalf of an unregistered user (code 3).
     OriginatingUnregistered,
-    /// Terminating for unregistered user.
+    /// Terminating for an unregistered user (code 2).
     TerminatingUnregistered,
 }
 
 impl SessionCase {
-    /// Parse from the 3GPP integer encoding (TS 29.228).
+    /// Parse from the 3GPP integer encoding (TS 29.228 Annex E,
+    /// `tDirectionOfRequest`).
     fn from_code(code: u32) -> Option<SessionCase> {
         match code {
             0 => Some(SessionCase::Originating),
             1 => Some(SessionCase::Terminating),
-            2 => Some(SessionCase::OriginatingUnregistered),
-            3 => Some(SessionCase::TerminatingUnregistered),
+            2 => Some(SessionCase::TerminatingUnregistered),
+            3 => Some(SessionCase::OriginatingUnregistered),
             _ => None,
         }
     }
@@ -1805,6 +1809,87 @@ mod tests {
             &ifcs,
         );
         assert!(results.is_empty());
+    }
+
+    /// Service profile with one iFC whose only SPT is the given
+    /// `SessionCase` code.
+    fn session_case_profile(code: u32) -> String {
+        format!(
+            concat!(
+                "<ServiceProfile>\n",
+                "  <InitialFilterCriteria>\n",
+                "    <Priority>0</Priority>\n",
+                "    <TriggerPoint>\n",
+                "      <ConditionTypeCNF>1</ConditionTypeCNF>\n",
+                "      <SPT>\n",
+                "        <ConditionNegated>0</ConditionNegated>\n",
+                "        <Group>0</Group>\n",
+                "        <SessionCase>{}</SessionCase>\n",
+                "      </SPT>\n",
+                "    </TriggerPoint>\n",
+                "    <ApplicationServer>\n",
+                "      <ServerName>sip:as@example.com</ServerName>\n",
+                "      <DefaultHandling>0</DefaultHandling>\n",
+                "    </ApplicationServer>\n",
+                "  </InitialFilterCriteria>\n",
+                "</ServiceProfile>\n",
+            ),
+            code
+        )
+    }
+
+    /// The session cases a profile carrying `code` matches, out of the four
+    /// the engine evaluates.
+    fn session_cases_matched_by(code: u32) -> Vec<SessionCase> {
+        let ifcs = parse_service_profile(&session_case_profile(code)).unwrap();
+        [
+            SessionCase::Originating,
+            SessionCase::Terminating,
+            SessionCase::TerminatingUnregistered,
+            SessionCase::OriginatingUnregistered,
+        ]
+        .into_iter()
+        .filter(|case| !evaluate("INVITE", "sip:bob@example.com", &[], *case, &ifcs).is_empty())
+        .collect()
+    }
+
+    // 3GPP TS 29.228 Annex E, tDirectionOfRequest: 0 originating
+    // (registered), 1 TERMINATING_REGISTERED, 2 TERMINATING_UNREGISTERED,
+    // 3 ORIGINATING_UNREGISTERED.
+    #[test]
+    fn session_case_code_2_is_terminating_unregistered() {
+        let ifcs = parse_service_profile(&session_case_profile(2)).unwrap();
+        let spt = &ifcs[0]
+            .trigger_point
+            .as_ref()
+            .unwrap()
+            .service_point_triggers[0];
+        assert_eq!(spt.session_case, Some(SessionCase::TerminatingUnregistered));
+        assert_eq!(
+            session_cases_matched_by(2),
+            vec![SessionCase::TerminatingUnregistered]
+        );
+    }
+
+    #[test]
+    fn session_case_code_3_is_originating_unregistered() {
+        let ifcs = parse_service_profile(&session_case_profile(3)).unwrap();
+        let spt = &ifcs[0]
+            .trigger_point
+            .as_ref()
+            .unwrap()
+            .service_point_triggers[0];
+        assert_eq!(spt.session_case, Some(SessionCase::OriginatingUnregistered));
+        assert_eq!(
+            session_cases_matched_by(3),
+            vec![SessionCase::OriginatingUnregistered]
+        );
+    }
+
+    #[test]
+    fn session_case_codes_0_and_1_are_the_registered_cases() {
+        assert_eq!(session_cases_matched_by(0), vec![SessionCase::Originating]);
+        assert_eq!(session_cases_matched_by(1), vec![SessionCase::Terminating]);
     }
 
     #[test]

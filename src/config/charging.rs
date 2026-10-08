@@ -121,7 +121,6 @@ fn default_rf_service_context_id() -> String {
 ///   service_context_id: "32260@3gpp.org"       # voice (SCUR); 32275 for MMTel-AS
 ///   sms_service_context_id: "32274@3gpp.org"   # SMS/RCS (IEC)
 ///   charge: orig                  # orig | term | both
-///   charge_message: true          # one-shot IEC on SIP MESSAGE (SMS/RCS)
 ///   on_ocs_failure: terminate     # terminate (fail-closed) | continue (fail-open)
 ///   credit_denied_status: 402     # SIP status when the OCS denies at setup
 ///   rating_group: 100             # optional; presence selects the MSCC (multi-service) shape
@@ -169,9 +168,6 @@ pub struct RoConfig {
     /// reserve-before-connect is the entire point of the prepaid gate.
     #[serde(default = "default_ro_charge_from")]
     pub charge_from: String,
-    /// One-shot IEC charging on SIP MESSAGE (SMS/RCS). Default: true.
-    #[serde(default = "default_true")]
-    pub charge_message: bool,
     /// Behavior when the OCS is unreachable / times out (Credit-Control-Failure-
     /// Handling): ``"terminate"`` (fail-closed) | ``"continue"`` (fail-open).
     /// Default ``"terminate"``.
@@ -209,7 +205,6 @@ impl Default for RoConfig {
             sms_service_context_id: default_ro_sms_service_context_id(),
             charge: default_ro_charge(),
             charge_from: default_ro_charge_from(),
-            charge_message: true,
             on_ocs_failure: default_ro_ocs_failure(),
             credit_denied_status: default_ro_denied_status(),
             rating_group: None,
@@ -265,5 +260,46 @@ mod tests {
             serde_yaml_ng::from_str("enabled: true\naccess_network_information: true\n").unwrap();
         assert!(rf.access_network_information);
         assert!(ro.access_network_information);
+    }
+
+    #[test]
+    fn ro_defaults_from_a_minimal_section() {
+        let config: RoConfig = serde_yaml_ng::from_str("enabled: true\n").unwrap();
+        assert!(config.enabled);
+        assert_eq!(config.reauth_interval_secs, 30);
+        assert_eq!(config.requested_seconds, 30);
+        assert_eq!(config.node_functionality, "pcscf");
+        assert_eq!(config.service_context_id, "32260@3gpp.org");
+        assert_eq!(config.sms_service_context_id, "32274@3gpp.org");
+        assert_eq!(config.charge, "orig");
+        assert_eq!(config.charge_from, "answer");
+        assert_eq!(config.on_ocs_failure, "terminate");
+        assert_eq!(config.credit_denied_status, 402);
+        assert_eq!(config.rating_group, None);
+        assert_eq!(config.service_identifier, None);
+        assert_eq!(config.peer, None);
+    }
+
+    /// `ro.charge_message` never switched anything: a MESSAGE is charged only
+    /// when the script sends the CCR-EVENT. The setting is gone, so the
+    /// configuration no longer offers a switch that does nothing.
+    #[test]
+    fn ro_has_no_charge_message_setting() {
+        let rendered = format!("{:?}", RoConfig::default());
+        assert!(!rendered.contains("charge_message"), "{rendered}");
+    }
+
+    /// A configuration written while the key existed still loads, with
+    /// either value, and reads the same as one without it.
+    #[test]
+    fn ro_section_carrying_the_removed_charge_message_key_still_loads() {
+        let without: RoConfig = serde_yaml_ng::from_str("enabled: true\ncharge: both\n").unwrap();
+        for value in ["true", "false"] {
+            let with: RoConfig = serde_yaml_ng::from_str(&format!(
+                "enabled: true\ncharge: both\ncharge_message: {value}\n"
+            ))
+            .unwrap();
+            assert_eq!(format!("{with:?}"), format!("{without:?}"));
+        }
     }
 }

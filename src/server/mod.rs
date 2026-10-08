@@ -666,6 +666,34 @@ impl SiphonServer {
             }
         });
 
+        // --- Initialize config namespace for Python scripts ---
+        // Always available; an empty document without `script_config:`. A file
+        // that is missing or does not parse stops the node here: a script
+        // running against an empty table routes nothing while reporting healthy.
+        let script_config_store =
+            match crate::script::script_config::ScriptConfigStore::from_setting(
+                config.script_config.as_ref(),
+            ) {
+                Ok(store) => Arc::new(store),
+                Err(error) => {
+                    eprintln!("Failed to load script_config: {error}");
+                    std::process::exit(1);
+                }
+            };
+        pyo3::Python::attach(|python| {
+            let py_config =
+                crate::script::api::config::PyScriptConfig::new(Arc::clone(&script_config_store));
+            if let Err(error) = crate::script::api::set_config_singleton(python, py_config) {
+                error!("failed to store config singleton: {error}");
+            }
+        });
+        // The file form follows `script.reload`: watched under `auto`, and
+        // reloaded on SIGHUP in either mode, like the script itself.
+        if config.script.reload == crate::config::ReloadMode::Auto {
+            crate::script::script_config::spawn_file_watcher(&script_config_store);
+        }
+        crate::script::script_config::spawn_sighup_reloader(Arc::clone(&script_config_store));
+
         // --- Initialize numbers namespace + number-policy runtime ---
         // E.164 identity normalization. The parser namespace is always
         // available; the home locale and named policies come from the config.
@@ -2452,7 +2480,7 @@ impl SiphonServer {
         let drain = Arc::new(dispatcher::DrainState::new());
 
         // --- HTTP admin API (health/readiness probes + registration inspection) ---
-        admin_start::start_admin_api(&config, &drain, &engine);
+        admin_start::start_admin_api(&config, &drain, &engine, &script_config_store);
 
         // --- External remote-control plane (ARI/ESL-class) ---
         // Installs the ControlBus, spawns the command consumer + inbound WS

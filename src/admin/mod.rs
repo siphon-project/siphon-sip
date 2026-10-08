@@ -18,11 +18,13 @@ use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{delete, get, post};
 use axum::Router;
 use serde::Serialize;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 mod refresh;
+mod script_reload;
 mod serve;
 use refresh::{gateways_refresh_handler, registrants_refresh_handler};
+use script_reload::script_reload_handler;
 pub use serve::serve;
 
 use crate::config::CorsConfig;
@@ -57,6 +59,9 @@ pub struct AdminState {
     /// a recompile and report the error. `None` in tests and on a node with no
     /// script.
     pub script_engine: Option<Arc<crate::script::engine::ScriptEngine>>,
+    /// The `script_config:` document, so `POST /admin/script/reload` reads its
+    /// file again as `SIGHUP` does. `None` in tests that do not exercise it.
+    pub script_config: Option<Arc<crate::script::script_config::ScriptConfigStore>>,
     /// Whether the embedded dashboard is served from this listener. Set by
     /// [`router`] from its own argument rather than by each caller, so the
     /// auth layer and the route table can never disagree about it. Read only to
@@ -432,44 +437,6 @@ async fn drain_handler(State(state): State<AdminState>, method: Method) -> Respo
         "active_calls": calls,
     }))
     .into_response()
-}
-
-/// `POST /admin/script/reload` — recompile the Python script now.
-///
-/// The inotify watcher already reloads on write; this is for the case where an
-/// operator cannot rely on it (a config-map mount whose events do not fire, an
-/// editor writing through a rename) and, more usefully, gives them the compile
-/// error rather than leaving them to find it in the log. A failed reload keeps
-/// the previous script live, which is the behaviour the watcher has, so this
-/// reports the failure without changing what is running.
-async fn script_reload_handler(State(state): State<AdminState>) -> Response {
-    let Some(ref engine) = state.script_engine else {
-        return (
-            StatusCode::NOT_IMPLEMENTED,
-            Json(serde_json::json!({ "error": "no script engine on this node" })),
-        )
-            .into_response();
-    };
-
-    match engine.reload() {
-        Ok(()) => {
-            info!("admin: script reloaded");
-            Json(serde_json::json!({ "reloaded": true })).into_response()
-        }
-        Err(error) => {
-            let detail = error.to_string();
-            error!(%detail, "admin: script reload failed; previous script stays live");
-            (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                Json(serde_json::json!({
-                    "reloaded": false,
-                    "error": detail,
-                    "detail": "the previously loaded script is still running",
-                })),
-            )
-                .into_response()
-        }
-    }
 }
 
 /// `GET /admin/capture/{call_id}` — the captured messages for one call.
@@ -1512,6 +1479,7 @@ mod tests {
             instance_id: None,
             features: AdminFeatures::default(),
             script_engine: None,
+            script_config: None,
             ui_enabled: false,
         }
     }
@@ -1811,6 +1779,7 @@ mod tests {
             instance_id: None,
             features: AdminFeatures::default(),
             script_engine: None,
+            script_config: None,
             ui_enabled: false,
         };
         let app = router(state, None, false);
