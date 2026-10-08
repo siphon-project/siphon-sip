@@ -43,6 +43,10 @@ entry, but a working config keeps working.
     distribution's updates. The interpreter is pinned by version and checksum in
     `scripts/bundle-python.sh`.
   - The `.deb` now depends on `adduser`, which its install script always used.
+  - The systemd unit sets `PYTHON_GIL=0` and `PYTHONFAULTHANDLER=1`, as the
+    container image does. An extension module without free-threading support
+    no longer turns the GIL back on when a script imports it. If such a module
+    misbehaves without the GIL, drop the variable with `systemctl edit siphon`.
 
 - **The profile for a `Replaces` takeover is the one the script anchors the
   taking-over INVITE with.** `rtpengine.offer(call, profile=…)` in

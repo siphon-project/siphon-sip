@@ -47,6 +47,12 @@ script:
   path: "/etc/siphon/scripts/proxy_default.py"
 YAML
 
+# Start it with the environment the packaged unit gives it, so the settings
+# there are part of what is verified.
+unit_environment="$(sed -n "s/^Environment=//p" /usr/lib/systemd/system/siphon.service)"
+echo "unit environment: $(echo $unit_environment)"
+export $unit_environment
+
 # siphon runs until stopped, so let it start and then end it.
 timeout 5 /usr/bin/siphon --config /tmp/siphon.yaml > /tmp/siphon.log 2>&1 || status=$?
 if [ "${status:-0}" -ne 124 ]; then

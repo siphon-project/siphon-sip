@@ -24,6 +24,17 @@ Type=simple
 WorkingDirectory=/etc/siphon
 ExecStart=/usr/bin/siphon --config /etc/siphon/siphon.yaml
 ExecReload=/bin/kill -HUP $MAINPID
+
+# Same interpreter settings as the container image.
+# PYTHON_GIL=0 keeps the GIL off for good. Without it, importing an extension
+# module that does not declare free-threading support turns the GIL back on for
+# the whole process, and every script handler runs serialised from then on.
+# Remove it if a script needs such a module and it misbehaves without the GIL,
+# and when running a siphon built against a regular (GIL) Python, which refuses
+# to start with it set.
+Environment=PYTHON_GIL=0
+# Print the C stack on a fatal signal, so a crash is never silent.
+Environment=PYTHONFAULTHANDLER=1
 Restart=on-failure
 RestartSec=5s
 
