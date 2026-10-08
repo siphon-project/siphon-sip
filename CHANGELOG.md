@@ -69,8 +69,10 @@ entry, but a working config keeps working.
   SUBSCRIBE's From tag and a matching Event header (§8.2.1) establishes the
   dialog before the NOTIFY handler runs, with the remote target and route set
   taken from the NOTIFY. `find()` returns the handle that `send()` returns
-  afterwards, and a `None` from it now reliably means the NOTIFY belongs to no
-  subscription (§4.1.3, 481). With the 2xx first nothing changes.
+  afterwards, and a `None` from it no longer depends on whether the 2xx was
+  processed yet. With the 2xx first nothing changes. One case still returns
+  `None` for a NOTIFY that is the subscription's: the final NOTIFY after
+  `handle.terminate()`, which removes the subscription at once.
 
   The rest follows the subscriber state machine of §4.1.2, and changes what a
   script sees in three places:
@@ -85,9 +87,10 @@ entry, but a working config keeps working.
     subscription (§4.4.1).** The NOTIFY handler still finds it with `find()`;
     siphon removes it when the handlers have returned, where it used to stay
     in the store until the script terminated it or it expired. A handle kept
-    past that point raises `LookupError`. When this happens before `send()`
-    has returned, `send()` raises with the Subscription-State value in its
-    message, whatever the SUBSCRIBE is answered with.
+    past that point raises `LookupError`. `send()` does not report it: the
+    2xx and the NOTIFY race, so `send()` returns the handle whether the
+    terminating NOTIFY came before the 2xx or after, and a one-shot fetch
+    (`expires=0`) reads its result in the NOTIFY handler either way.
   - **A NOTIFY for the same SUBSCRIBE from another notifier tag than the
     dialog's is answered 481 by siphon, without running the NOTIFY handler
     (§5.4.9).** One `send()` tracks one dialog, the one the first NOTIFY

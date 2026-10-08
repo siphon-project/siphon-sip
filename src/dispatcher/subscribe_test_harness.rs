@@ -16,6 +16,8 @@ use crate::subscribe_state::SubscribeStore;
 /// Both roles in one script: the notifier that accepts a SUBSCRIBE, and the
 /// subscriber that a MESSAGE tells to send one and that looks a NOTIFY up.
 const SCRIPT: &str = concat!(
+    "import asyncio\n",
+    "\n",
     "from siphon import proxy\n",
     "\n",
     "@proxy.on_request(\"SUBSCRIBE\")\n",
@@ -43,7 +45,11 @@ const SCRIPT: &str = concat!(
     "    request.reply(200, \"OK\")\n",
     "\n",
     "@proxy.on_request(\"NOTIFY\")\n",
-    "def notify(request):\n",
+    "async def notify(request):\n",
+    "    # Suspended once before the lookup: a subscription its NOTIFY\n",
+    "    # terminates has to last until the coroutine has finished, not until\n",
+    "    # it first yields.\n",
+    "    await asyncio.sleep(0)\n",
     "    handle = proxy.subscribe_state.find(\n",
     "        request.call_id, request.to_tag, request.from_tag\n",
     "    )\n",

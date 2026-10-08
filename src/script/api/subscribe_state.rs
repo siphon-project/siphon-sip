@@ -225,6 +225,15 @@ impl PySubscribeState {
     /// from another notifier tag with 481 itself, and a 2xx from another
     /// fork does not change the dialog (§5.4.9).
     ///
+    /// What this call returns depends on which messages arrived, never on
+    /// their order: the 2xx and the NOTIFYs race. A NOTIFY with
+    /// ``Subscription-State: terminated`` is reported to the NOTIFY handler
+    /// and nowhere else, so a one-shot fetch (``expires=0``) or a
+    /// subscription the notifier ends at once returns its handle whether
+    /// that NOTIFY came before the 2xx or after. The subscription is gone by
+    /// then or soon after, and the handle raises ``LookupError`` once it is;
+    /// take what you need from the NOTIFY in its handler.
+    ///
     /// Args:
     ///     ruri: SUBSCRIBE Request-URI (the watched resource).
     ///     event: Event package name written to the ``Event`` header
@@ -243,10 +252,8 @@ impl PySubscribeState {
     /// Raises ``RuntimeError`` on a non-2xx response (§4.1.2.1: no
     /// subscription was created, even if a NOTIFY came first), on a timeout
     /// with no NOTIFY received, on a 200 OK with no To tag when it had to
-    /// establish the dialog, on transport failure, and when a NOTIFY with
-    /// ``Subscription-State: terminated`` ended the subscription before the
-    /// SUBSCRIBE completed (the message carries that header value). Nothing
-    /// of the attempt is left in any of these cases.
+    /// establish the dialog, and on transport failure. Nothing of the
+    /// attempt is left in any of these cases.
     #[pyo3(signature = (
         ruri,
         event,

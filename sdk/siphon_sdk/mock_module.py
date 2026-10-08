@@ -606,12 +606,18 @@ class MockSubscribeState:
         handler, and a 2xx from another fork does not change the dialog
         (section 5.4.9).
 
+        What this call returns depends on which messages arrived, never on
+        their order. A NOTIFY with ``Subscription-State: terminated`` is
+        reported to the NOTIFY handler and nowhere else, so a one-shot fetch
+        (``expires=0``) returns its handle whether that NOTIFY came before
+        the 2xx or after. The subscription is gone by then or soon after, and
+        the handle raises ``LookupError`` once it is: take what you need from
+        the NOTIFY in its handler.
+
         Raises ``RuntimeError`` on a non-2xx response (no subscription was
-        created, even if a NOTIFY came first, section 4.1.2.1), on a timeout
-        with no NOTIFY received, and when a NOTIFY with
-        ``Subscription-State: terminated`` ended the subscription before the
-        SUBSCRIBE completed; the message then carries that header value.
-        Nothing of the attempt is left in any of these cases.
+        created, even if a NOTIFY came first, section 4.1.2.1) and on a
+        timeout with no NOTIFY received. Nothing of the attempt is left in
+        either case.
         """
         async def _run():
             import uuid

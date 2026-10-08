@@ -77,8 +77,15 @@ What the SUBSCRIBE transaction then decides, per the subscriber state machine of
 A NOTIFY with `Subscription-State: terminated` ends the subscription in any
 order. The NOTIFY handler still finds it with `find()` and answers 200; siphon
 removes it when the handlers have returned (§4.4.1), after which the handle
-raises `LookupError`. If that happens before `send()` has returned, `send()`
-raises with the Subscription-State value in the message.
+raises `LookupError`.
+
+The 2xx and the NOTIFYs travel separately and race, so what `send()` returns
+depends on which of them arrived and never on their order. A terminating NOTIFY
+is reported to the NOTIFY handler and nowhere else: `send()` returns the handle
+on the 2xx whether that NOTIFY came first or second, and in both cases the
+subscription no longer exists once the handler has returned. A one-shot fetch
+(`expires=0`) therefore reads its result in the NOTIFY handler and gets back a
+handle that is already spent.
 
 One `send()` tracks one dialog: the first NOTIFY's, or the 2xx's when no NOTIFY
 came before it. A NOTIFY for the same SUBSCRIBE from another notifier tag, which

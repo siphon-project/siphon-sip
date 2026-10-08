@@ -271,41 +271,57 @@ fn a_notified_subscription_stands_when_the_subscribe_is_never_answered() {
     );
 }
 
-/// RFC 6665 §4.1.2: `notify_wait` goes to `terminated` on "NOTIFY,
-/// state=terminated", and §4.4.1 creates no dialog usage for that NOTIFY. The
-/// script still answers it as its subscription's; nothing is left afterwards,
-/// and the 2xx that follows has no subscription to hand back.
-#[test]
-fn a_terminated_notify_ahead_of_the_2xx_ends_the_attempt() {
+/// What a script sees of a subscription its notifier terminates at once, as
+/// a one-shot fetch is: the NOTIFY handler's answer and what `send()` came
+/// back with, for the terminating NOTIFY placed before the 2xx or after it.
+fn terminated_exchange(sequence: u32, notify_first: bool) -> (String, String, usize, usize) {
     let (_turn, harness) = subscribe_harness();
     let dialogs_before = harness.store.local_count();
-    let mut attempt = Attempt::start(harness, 6, 5000);
+    let mut attempt = Attempt::start(harness, sequence, 5000);
 
-    let early = attempt.notify(NOTIFIER_TAG, "reg", "terminated;reason=rejected");
-    assert!(
-        early.starts_with("SIP/2.0 200"),
-        "the script learns its subscription ended, got {early:?}"
-    );
-    assert!(header_value(&early, "X-Subscription").is_some());
-    assert_eq!(
-        harness.store.local_count(),
-        dialogs_before,
-        "no dialog outlives the NOTIFY that terminated it"
-    );
+    let (notified, reply) = if notify_first {
+        let notified = attempt.notify(NOTIFIER_TAG, "reg", "terminated;reason=timeout");
+        attempt.answer("200 OK", Some(NOTIFIER_TAG));
+        (notified, attempt.outcome())
+    } else {
+        attempt.answer("200 OK", Some(NOTIFIER_TAG));
+        let reply = attempt.outcome();
+        (
+            attempt.notify(NOTIFIER_TAG, "reg", "terminated;reason=timeout"),
+            reply,
+        )
+    };
 
-    attempt.answer("200 OK", Some(NOTIFIER_TAG));
-    let reply = attempt.outcome();
-    assert!(reply.starts_with("SIP/2.0 500"), "send() raises: {reply:?}");
-    assert!(
-        header_value(&reply, "X-Failure")
-            .is_some_and(|failure| failure.contains("terminated;reason=rejected")),
-        "the script is told how it ended, got {reply:?}"
-    );
-    assert_eq!(harness.store.pending_count(), 0);
-    assert_eq!(harness.store.local_count(), dialogs_before);
-
+    // RFC 6665 §4.4.1: nothing outlives the NOTIFY that terminated it, so a
+    // NOTIFY after it matches no subscription.
     let late = attempt.notify(NOTIFIER_TAG, "reg", "active;expires=600");
     assert!(late.starts_with("SIP/2.0 481"), "got {late:?}");
+    (
+        first_line(&notified).to_string(),
+        first_line(&reply).to_string(),
+        harness.store.local_count() - dialogs_before,
+        harness.store.pending_count(),
+    )
+}
+
+/// The 2xx and the NOTIFY race, so both orders are one exchange and the script
+/// has to be handed the same thing: the NOTIFY handler finds the subscription
+/// and learns it ended, `send()` returns its handle, and nothing is left.
+#[test]
+fn a_terminating_notify_gives_the_same_outcome_on_either_side_of_the_2xx() {
+    let notify_first = terminated_exchange(6, true);
+    let response_first = terminated_exchange(11, false);
+
+    assert_eq!(notify_first, response_first);
+    assert_eq!(
+        notify_first,
+        (
+            "SIP/2.0 200 OK".to_string(),
+            "SIP/2.0 200 OK".to_string(),
+            0,
+            0
+        )
+    );
 }
 
 /// RFC 6665 §4.4.1: "A subscription is destroyed after a notifier sends a

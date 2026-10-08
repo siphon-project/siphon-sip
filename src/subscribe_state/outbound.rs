@@ -23,6 +23,17 @@
 //! response "indicate that no subscription or new dialog usage has been
 //! created, and no subsequent NOTIFY request will be sent".
 //!
+//! What `send()` gives its caller follows from which of these happened, never
+//! from the order they happened in.  The 2xx and the NOTIFYs travel
+//! separately and race, so an outcome that depended on the winner would hand
+//! the same exchange to a script two different ways.  Concretely: a NOTIFY
+//! that terminates the subscription is reported to the NOTIFY handler and
+//! nowhere else.  `send()` returns the subscription's id whether that NOTIFY
+//! came before its 2xx or after, and in both cases nothing is left in the
+//! store once the handler has returned.  Repeating an event changes nothing
+//! either: a second 2xx, or a NOTIFY for a subscription already terminated,
+//! finds no state to alter.
+//!
 //! The caller of `send()` holds a [`PendingSubscription`].  Dropping it
 //! without an outcome that keeps the subscription withdraws whatever the
 //! attempt put in the store, so a failed attempt leaves nothing behind.
@@ -123,10 +134,14 @@ fn event_matches(subscribed: &str, notified: &str) -> bool {
 }
 
 /// `Subscription-State: terminated`, with whatever parameters follow.
-fn terminated_state(notify: &SipMessage) -> Option<&String> {
-    let value = notify.headers.get("Subscription-State")?;
-    let state = value.split(';').next().unwrap_or_default().trim();
-    state.eq_ignore_ascii_case("terminated").then_some(value)
+fn is_terminated(notify: &SipMessage) -> bool {
+    notify
+        .headers
+        .get("Subscription-State")
+        .is_some_and(|value| {
+            let state = value.split(';').next().unwrap_or_default().trim();
+            state.eq_ignore_ascii_case("terminated")
+        })
 }
 
 /// One outbound subscription, as the store tracks it by Call-ID.
@@ -144,8 +159,10 @@ enum OutboundState {
     Pending(Box<SubscribeDialog>),
     /// The dialog is among the store's live dialogs, with this notifier tag.
     Established { remote_tag: String },
-    /// Over before its `send()` returned.  Kept until that `send()` reads it.
-    Ended { cause: String },
+    /// Established and then over, by a terminating NOTIFY or by the script,
+    /// before its `send()` returned.  Kept until that `send()` settles, so
+    /// that nothing arriving meanwhile revives it.
+    Ended,
 }
 
 /// What the dispatcher does with an inbound NOTIFY.
@@ -184,12 +201,6 @@ pub enum AttemptFailure {
     /// The 2xx would have had to establish the dialog and cannot.
     #[error("{0}")]
     Malformed(&'static str),
-    /// The subscription ended while the SUBSCRIBE was in flight: `cause` is
-    /// the Subscription-State of the NOTIFY that terminated it.
-    #[error(
-        "subscribe_state.send(): the subscription ended before the SUBSCRIBE completed ({cause})"
-    )]
-    Ended { cause: String },
 }
 
 /// The registration of one outbound SUBSCRIBE, held while its response is
@@ -208,6 +219,12 @@ impl PendingSubscription {
     /// `notifier` must be a dialog-forming 2xx.  After a NOTIFY the dialog is
     /// the NOTIFY's, route set included (RFC 6665 §4.4.1), and the 2xx only
     /// completes the transaction, whatever tag it carries (§5.4.9).
+    ///
+    /// The id is returned as well when a NOTIFY has already terminated the
+    /// subscription.  That is the same exchange as a 2xx followed by the
+    /// terminating NOTIFY, where the id was handed out before anything could
+    /// say it would end, so it has the same result: the id of a subscription
+    /// that no longer exists.
     pub fn accepted(
         self,
         notifier: Result<RemoteParty, &'static str>,
@@ -216,7 +233,8 @@ impl PendingSubscription {
     }
 
     /// No final response arrived.  The subscription stands if a NOTIFY
-    /// established it (RFC 6665 §4.1.2), and its id is returned.
+    /// established it (RFC 6665 §4.1.2), and its id is returned, also when a
+    /// later NOTIFY has terminated it since.
     pub fn unanswered(self) -> Result<String, AttemptFailure> {
         self.settle(None)
     }
@@ -229,13 +247,16 @@ impl PendingSubscription {
         let Entry::Occupied(mut entry) = store.outbound.entry(self.call_id.clone()) else {
             return Err(AttemptFailure::Unanswered);
         };
+        if matches!(entry.get().state, OutboundState::Ended) {
+            // Nothing is left to track, and nothing is brought back.
+            entry.remove();
+            self.kept = true;
+            return Ok(self.id.clone());
+        }
         let subscription = entry.get_mut();
         let dialog = match &subscription.state {
-            OutboundState::Ended { cause } => {
-                return Err(AttemptFailure::Ended {
-                    cause: cause.clone(),
-                });
-            }
+            // Settled just above.
+            OutboundState::Ended => None,
             OutboundState::Established { .. } => store.get_local(&self.id),
             OutboundState::Pending(pending) => {
                 let notifier = response
@@ -315,7 +336,7 @@ impl SubscribeStore {
     }
 
     /// Number of outbound subscriptions whose `send()` has yet to settle
-    /// them: nothing established, or terminated and not yet read.
+    /// them: nothing established, or ended while it waits.
     pub fn pending_count(&self) -> usize {
         self.outbound
             .iter()
@@ -362,7 +383,7 @@ impl SubscribeStore {
             return NotifyDisposition::Deliver;
         };
         let subscription = entry.get_mut();
-        let terminated = terminated_state(notify);
+        let terminated = is_terminated(notify);
         match &subscription.state {
             OutboundState::Pending(pending) => {
                 // Also for a terminating NOTIFY, for as long as its handlers
@@ -375,18 +396,16 @@ impl SubscribeStore {
                 };
             }
             OutboundState::Established { remote_tag } if *remote_tag == notifier.tag => {}
-            OutboundState::Established { .. } | OutboundState::Ended { .. } => {
+            OutboundState::Established { .. } | OutboundState::Ended => {
                 return NotifyDisposition::Reject;
             }
         }
-        let Some(subscription_state) = terminated else {
+        if !terminated {
             return NotifyDisposition::Deliver;
-        };
+        }
         let id = subscription.id.clone();
         if subscription.awaiting_response {
-            subscription.state = OutboundState::Ended {
-                cause: subscription_state.clone(),
-            };
+            subscription.state = OutboundState::Ended;
         }
         drop(entry);
         NotifyDisposition::DeliverThenEnd(EndedSubscription {
@@ -397,7 +416,7 @@ impl SubscribeStore {
 
     /// A dialog left the live dialogs: stop tracking it as an outbound
     /// subscription.  While its `send()` is still waiting, the entry stays as
-    /// ended for that `send()` to read.
+    /// ended until that `send()` settles.
     pub(super) fn forget_outbound(&self, dialog: &SubscribeDialog) {
         if !dialog.is_outbound {
             return;
@@ -412,9 +431,7 @@ impl SubscribeStore {
             return;
         }
         if subscription.awaiting_response {
-            subscription.state = OutboundState::Ended {
-                cause: "ended by the script".to_string(),
-            };
+            subscription.state = OutboundState::Ended;
         } else {
             entry.remove();
         }
@@ -812,19 +829,98 @@ mod tests {
         drop(disposition);
         assert_eq!(store.local_count(), 0, "and gone once it has been");
 
-        // Nothing revives it: not a later NOTIFY, not the 2xx.
+        // Nothing revives it: not a later NOTIFY, not the 2xx.  The 2xx
+        // still completes the attempt with the subscription's id, as it would
+        // have had it come first.
         assert!(matches!(
             store.notify_received(&active("a")),
             NotifyDisposition::Reject
         ));
         assert_eq!(
-            registration.accepted(two_hundred("a", NOTIFIER_TAG)),
-            Err(AttemptFailure::Ended {
-                cause: "Terminated;reason=rejected".to_string()
-            })
+            registration
+                .accepted(two_hundred("a", NOTIFIER_TAG))
+                .as_deref(),
+            Ok("a")
         );
         assert_eq!(store.outbound_count(), 0);
         assert_eq!(store.local_count(), 0);
+        assert!(store.get_local("a").is_none());
+    }
+
+    /// What one exchange leaves behind and hands its `send()`, for the events
+    /// applied in the order given: `2` the 2xx, `a` an active NOTIFY, `t` a
+    /// terminating NOTIFY, `x` a non-2xx, `u` no final response.
+    fn outcome_of(order: &str) -> (Result<String, AttemptFailure>, usize, usize) {
+        let store = Arc::new(SubscribeStore::new());
+        let mut registration = Some(store.register_pending(subscription("a")));
+        let mut result = Err(AttemptFailure::Unanswered);
+        for event in order.chars() {
+            match event {
+                'a' => drop(store.notify_received(&active("a"))),
+                't' => drop(store.notify_received(&notify(
+                    "a",
+                    NOTIFIER_TAG,
+                    "reg",
+                    "terminated;reason=timeout",
+                ))),
+                '2' => {
+                    if let Some(registration) = registration.take() {
+                        result = registration.accepted(two_hundred("a", NOTIFIER_TAG));
+                    }
+                }
+                'u' => {
+                    if let Some(registration) = registration.take() {
+                        result = registration.unanswered();
+                    }
+                }
+                'x' => drop(registration.take()),
+                other => panic!("unknown event {other:?}"),
+            }
+        }
+        (result, store.local_count(), store.outbound_count())
+    }
+
+    /// The 2xx and the NOTIFYs race, so the same events in another order are
+    /// the same exchange and must leave the same state and the same answer.
+    #[test]
+    fn the_outcome_does_not_depend_on_which_message_arrived_first() {
+        let kept = (Ok("a".to_string()), 1, 1);
+        let ended = (Ok("a".to_string()), 0, 0);
+        let refused = (Err(AttemptFailure::Unanswered), 0, 0);
+        for (orders, expected) in [
+            // Accepted and notified: the subscription stands.
+            (&["2a", "a2"][..], &kept),
+            // Accepted and terminated: send() has its id, nothing is left.
+            (&["2t", "t2", "2at", "a2t", "at2"][..], &ended),
+            // Rejected: nothing, whatever the notifier sent besides.
+            (&["x", "ax", "tx", "atx"][..], &refused),
+        ] {
+            for order in orders {
+                assert_eq!(
+                    &outcome_of(order),
+                    expected,
+                    "events in the order {order:?}"
+                );
+            }
+        }
+        // Never answered: only a NOTIFY can have established it, and one that
+        // then terminated it leaves the id of a subscription that is gone.
+        assert_eq!(outcome_of("u"), refused);
+        assert_eq!(outcome_of("au"), kept);
+        assert_eq!(outcome_of("tu"), ended);
+        assert_eq!(outcome_of("atu"), ended);
+    }
+
+    /// An event that arrives twice changes nothing the second time.
+    #[test]
+    fn a_repeated_event_changes_nothing() {
+        assert_eq!(outcome_of("2aa"), outcome_of("2a"));
+        assert_eq!(outcome_of("aa2"), outcome_of("a2"));
+        assert_eq!(outcome_of("2tt"), outcome_of("2t"));
+        assert_eq!(outcome_of("tt2"), outcome_of("t2"));
+        assert_eq!(outcome_of("t2t"), outcome_of("t2"));
+        assert_eq!(outcome_of("2ta"), outcome_of("2t"));
+        assert_eq!(outcome_of("ta2"), outcome_of("t2"));
     }
 
     #[test]
@@ -834,10 +930,7 @@ mod tests {
         let _ = store.notify_received(&active("a"));
         drop(store.notify_received(&notify("a", NOTIFIER_TAG, "reg", "terminated")));
 
-        assert!(matches!(
-            registration.unanswered(),
-            Err(AttemptFailure::Ended { .. })
-        ));
+        assert_eq!(registration.unanswered().as_deref(), Ok("a"));
         assert_eq!(store.outbound_count(), 0);
         assert_eq!(store.local_count(), 0);
     }
@@ -902,10 +995,12 @@ mod tests {
         let _ = store.notify_received(&active("a"));
         store.remove("a");
 
-        assert!(matches!(
-            registration.accepted(two_hundred("a", NOTIFIER_TAG)),
-            Err(AttemptFailure::Ended { .. })
-        ));
+        assert_eq!(
+            registration
+                .accepted(two_hundred("a", NOTIFIER_TAG))
+                .as_deref(),
+            Ok("a")
+        );
         assert_eq!(store.local_count(), 0);
         assert_eq!(store.outbound_count(), 0);
     }
