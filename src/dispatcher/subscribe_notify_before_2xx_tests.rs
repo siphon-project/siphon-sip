@@ -15,8 +15,9 @@ const NOTIFIER: &str = "192.0.2.30:5060";
 const NOTIFIER_TAG: &str = "notifier-tag";
 
 /// The MESSAGE that makes the script subscribe, waiting `timeout_ms` for the
-/// 2xx. Each call is a transaction of its own.
-fn trigger(sequence: u32, timeout_ms: u64) -> String {
+/// 2xx, and unsubscribe again at once when `unsubscribe` is set. Each call is
+/// a transaction of its own.
+fn trigger(sequence: u32, timeout_ms: u64, unsubscribe: bool) -> String {
     format!(
         concat!(
             "MESSAGE sip:watch@siphon.example.com SIP/2.0\r\n",
@@ -26,12 +27,18 @@ fn trigger(sequence: u32, timeout_ms: u64) -> String {
             "Call-ID: trigger-{sequence}@example.com\r\n",
             "CSeq: 1 MESSAGE\r\n",
             "X-Timeout-Ms: {timeout_ms}\r\n",
+            "{unsubscribe}",
             "Max-Forwards: 70\r\n",
             "Content-Length: 0\r\n",
             "\r\n",
         ),
         sequence = sequence,
         timeout_ms = timeout_ms,
+        unsubscribe = if unsubscribe {
+            "X-Unsubscribe: yes\r\n"
+        } else {
+            ""
+        },
     )
 }
 
@@ -46,7 +53,18 @@ struct Attempt {
 
 impl Attempt {
     fn start(harness: &'static SubscribeHarness, sequence: u32, timeout_ms: u64) -> Self {
-        let raw = trigger(sequence, timeout_ms);
+        Self::start_then(harness, sequence, timeout_ms, false)
+    }
+
+    /// As [`Self::start`]; with `unsubscribe` the script unsubscribes as soon
+    /// as `send()` has returned.
+    fn start_then(
+        harness: &'static SubscribeHarness,
+        sequence: u32,
+        timeout_ms: u64,
+        unsubscribe: bool,
+    ) -> Self {
+        let raw = trigger(sequence, timeout_ms, unsubscribe);
         let handler = std::thread::spawn(move || harness.receive_request(&raw, TRIGGER_SOURCE));
         let subscribe = harness.next_sent("SUBSCRIBE ");
         Self {
@@ -426,4 +444,75 @@ fn a_notify_for_another_event_package_does_not_take_the_pending_subscription() {
         "send() returns: {reply:?}"
     );
     assert_eq!(harness.store.pending_count(), 0);
+}
+
+/// RFC 6665 §4.1.2.3: the notifier answers an unsubscribe with a terminating
+/// NOTIFY. The subscription has to be there for the script to find, or the
+/// script answers 481 to the one NOTIFY it asked for.
+#[test]
+fn the_notify_that_answers_an_unsubscribe_finds_the_subscription() {
+    let (_turn, harness) = subscribe_harness();
+    let dialogs_before = harness.store.local_count();
+    // The store is every test's: other subscriptions stand in it.
+    let tracked_before = harness.store.outbound_count();
+    let mut attempt = Attempt::start_then(harness, 12, 5000, true);
+    attempt.answer("200 OK", Some(NOTIFIER_TAG));
+
+    let unsubscribe = harness.next_sent("SUBSCRIBE ");
+    assert_eq!(header_value(&unsubscribe, "Expires").as_deref(), Some("0"));
+    assert_eq!(
+        header_value(&unsubscribe, "Call-ID"),
+        header_value(&attempt.subscribe, "Call-ID"),
+        "sent in the subscription's dialog"
+    );
+    let reply = attempt.outcome();
+    let id = header_value(&reply, "X-Subscription").expect("the handle send() returned");
+    assert_eq!(
+        harness.store.local_count(),
+        dialogs_before + 1,
+        "not over until the notifier says so"
+    );
+
+    let last = attempt.notify(NOTIFIER_TAG, "reg", "terminated;reason=timeout");
+    assert!(last.starts_with("SIP/2.0 200"), "got {last:?}");
+    assert_eq!(
+        header_value(&last, "X-Subscription").as_deref(),
+        Some(id.as_str())
+    );
+    assert_eq!(harness.store.local_count(), dialogs_before);
+    assert_eq!(harness.store.outbound_count(), tracked_before);
+}
+
+/// RFC 6665 §4.1.2.1: a non-2xx says no subscription was created. It says so
+/// as well when it arrives after `send()` stopped waiting and returned the
+/// subscription a NOTIFY had established.
+#[test]
+fn a_rejection_after_send_returned_withdraws_the_subscription() {
+    let (_turn, harness) = subscribe_harness();
+    let dialogs_before = harness.store.local_count();
+    let tracked_before = harness.store.outbound_count();
+    let mut attempt = Attempt::start(harness, 13, 300);
+
+    let early = attempt.notify(NOTIFIER_TAG, "reg", "active;expires=600");
+    assert!(early.starts_with("SIP/2.0 200"), "got {early:?}");
+    let reply = attempt.outcome();
+    assert!(
+        reply.starts_with("SIP/2.0 200"),
+        "send() returns: {reply:?}"
+    );
+    assert_eq!(harness.store.local_count(), dialogs_before + 1);
+
+    attempt.answer("403 Forbidden", None);
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while harness.store.local_count() != dialogs_before {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the rejected subscription was never withdrawn"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(harness.store.outbound_count(), tracked_before);
+    let late = attempt.notify(NOTIFIER_TAG, "reg", "active;expires=600");
+    assert!(late.starts_with("SIP/2.0 481"), "got {late:?}");
 }

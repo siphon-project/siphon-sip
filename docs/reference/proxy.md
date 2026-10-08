@@ -92,6 +92,31 @@ came before it. A NOTIFY for the same SUBSCRIBE from another notifier tag, which
 a forked SUBSCRIBE produces, is answered 481 by siphon without running the
 handler, and a 2xx from another fork does not change the dialog (§5.4.9).
 
+What the dialog holds is the notifier's to say, and is likewise the same in
+either order:
+
+- **Duration.** `handle.expires` is the shortest the notifier has stated, in the
+  `Expires` of the 2xx (§4.1.2.1) or the `expires` of a NOTIFY's
+  Subscription-State (§4.1.2.2). Only `handle.refresh()` lengthens it. Schedule
+  the refresh from `handle.expires`, not from the value you asked for.
+- **Target.** A NOTIFY is a target refresh request, so its Contact is where the
+  next `handle.refresh()` or `handle.terminate()` goes (§4.4.1). The 2xx
+  supplies the target only until a NOTIFY has.
+- **Route set.** Fixed by whichever message established the dialog (RFC 3261
+  §12.1). A 2xx that would have given another one is logged at `warn`.
+
+Four things end a subscription before it expires:
+
+| What happened | What siphon does |
+|---|---|
+| A NOTIFY with `Subscription-State: terminated` | Removes it once the NOTIFY handlers have returned |
+| `handle.terminate()` | Sends SUBSCRIBE `Expires: 0`; the subscription stays until the notifier's terminating NOTIFY (§4.1.2.3), which the handler finds and answers 200, or 32 s (Timer N) |
+| A 2xx with no NOTIFY inside 32 s (Timer N, §4.1.2.4) | Removes it: the attempt failed |
+| A non-2xx after `send()` had returned on its timeout | Removes it: no subscription was created (§4.1.2.1) |
+
+A subscription read back with `proxy.subscribe_state.get(id)`, after a restart or
+on another replica, is tracked the same way from the moment it is loaded.
+
 ::: siphon_sdk.mock_module.MockSubscribeState
 
 ## `SubscribeHandle`

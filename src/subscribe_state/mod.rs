@@ -254,6 +254,10 @@ impl SubscribeStore {
                     None
                 } else {
                     self.dialogs.insert(dialog.id.clone(), dialog.clone());
+                    // A subscription this process did not make, or made
+                    // before a restart: its NOTIFYs are placed against it
+                    // from here on, as for one made here.
+                    self.track_restored(&dialog);
                     Some(dialog)
                 }
             }
@@ -322,7 +326,12 @@ impl SubscribeStore {
 
     /// Remove stale dialogs atomically, returning their final snapshots so the
     /// notifier can send the mandatory terminating NOTIFY after releasing locks.
+    ///
+    /// Stale is expired or terminated, and for a subscription this node
+    /// originated also accepted with no NOTIFY inside Timer N (RFC 6665
+    /// §4.1.2.4), which is a failed attempt.
     pub fn take_stale(&self) -> Vec<SubscribeDialog> {
+        let mut removed = self.take_unnotified(outbound::TIMER_N);
         // Collect ids first, then remove: holding a DashMap iterator (shard
         // read lock) while removing (shard write lock) on the same map can
         // deadlock.
@@ -332,7 +341,7 @@ impl SubscribeStore {
             .filter(|entry| entry.terminated || entry.remaining_secs() == 0)
             .map(|entry| entry.key().clone())
             .collect();
-        let mut removed = Vec::with_capacity(stale.len());
+        removed.reserve(stale.len());
         for id in &stale {
             // L1-only: an expired L2 entry ages out via its own TTL, and a
             // terminated dialog already had its L2 key deleted by `remove`.

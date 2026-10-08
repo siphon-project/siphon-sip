@@ -41,6 +41,8 @@ const SCRIPT: &str = concat!(
     "        request.set_reply_header(\"X-Failure\", str(error))\n",
     "        request.reply(500, \"Subscribe Failed\")\n",
     "        return\n",
+    "    if request.get_header(\"X-Unsubscribe\"):\n",
+    "        await handle.terminate()\n",
     "    request.set_reply_header(\"X-Subscription\", handle.id)\n",
     "    request.reply(200, \"OK\")\n",
     "\n",

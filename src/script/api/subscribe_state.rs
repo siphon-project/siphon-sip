@@ -234,6 +234,18 @@ impl PySubscribeState {
     /// then or soon after, and the handle raises ``LookupError`` once it is;
     /// take what you need from the NOTIFY in its handler.
     ///
+    /// What the subscription holds is the notifier's to say. Its duration is
+    /// the shortest the notifier states, in the ``Expires`` of the 2xx
+    /// (§4.1.2.1) or the ``expires`` of a NOTIFY's ``Subscription-State``
+    /// (§4.1.2.2), so schedule a refresh from ``handle.expires`` and not
+    /// from the value you asked for. Its target follows the Contact of the
+    /// latest NOTIFY (§4.4.1).
+    ///
+    /// siphon ends the subscription on its own in two cases, each logged at
+    /// ``warn``: a 2xx that no NOTIFY follows within 32 seconds (Timer N,
+    /// §4.1.2.4), and a non-2xx that arrives after this call stopped waiting
+    /// and returned a subscription a NOTIFY had established (§4.1.2.1).
+    ///
     /// Args:
     ///     ruri: SUBSCRIBE Request-URI (the watched resource).
     ///     event: Event package name written to the ``Event`` header
@@ -494,14 +506,19 @@ impl PySubscribeHandle {
     /// For dialogs we received as the notifier (the original
     /// ``create()`` flow), this sends a final NOTIFY with
     /// ``Subscription-State: terminated;reason=<reason>`` (RFC 6665
-    /// §4.2.2). For dialogs we originated as the watcher (the
-    /// :meth:`SubscribeStateNamespace.send` flow), this sends a
-    /// SUBSCRIBE Expires:0 instead — the notifier owes us the final
-    /// terminating NOTIFY, which arrives via ``@proxy.on_request("NOTIFY")``.
+    /// §4.2.2), and the dialog is marked terminated and removed from the
+    /// store. ``reason`` defaults to ``"noresource"`` and is only used on
+    /// this path.
     ///
-    /// In both cases the dialog is marked terminated and removed from
-    /// the store. ``reason`` defaults to ``"noresource"`` and is only
-    /// used for the notifier path.
+    /// For dialogs we originated as the watcher (the
+    /// :meth:`SubscribeStateNamespace.send` flow), this sends a
+    /// SUBSCRIBE Expires:0 instead. That asks the notifier to end the
+    /// subscription; it is over when the notifier's terminating NOTIFY
+    /// arrives (§4.1.2.3). So the subscription stays in the store until
+    /// then: the ``@proxy.on_request("NOTIFY")`` handler finds it with
+    /// :meth:`SubscribeStateNamespace.find` and answers 200, and siphon
+    /// removes it when the handler has returned. If no such NOTIFY comes
+    /// within Timer N (32 s), siphon removes it anyway.
     #[pyo3(signature = (reason=None, body=None, content_type=None))]
     fn terminate<'py>(
         &self,
@@ -526,8 +543,12 @@ impl PySubscribeHandle {
 
         crate::script::awaitable(python, async move {
             if dialog.is_outbound {
-                // Watcher role — terminate by sending SUBSCRIBE Expires:0.
+                // Watcher role — unsubscribe by sending SUBSCRIBE Expires:0.
+                // The notifier's terminating NOTIFY is what ends it, and that
+                // NOTIFY has to find the subscription.
                 send_in_dialog_subscribe(&dialog, 0).await?;
+                store.unsubscribed(&id);
+                return Ok(true);
             } else {
                 // Notifier role — send the final NOTIFY.
                 send_notify(
@@ -1428,10 +1449,11 @@ impl PySubscribeState {
             is_outbound: true,
         });
 
-        let receiver = uac_sender.send_request_with_response(message, target.address, transport);
+        let mut receiver =
+            uac_sender.send_request_with_response(message, target.address, transport);
 
         let timeout = std::time::Duration::from_millis(timeout_ms);
-        let result = tokio::time::timeout(timeout, receiver).await;
+        let result = tokio::time::timeout(timeout, &mut receiver).await;
 
         let outcome = match result {
             Ok(Ok(crate::uac::UacResult::Response(response))) => {
@@ -1444,9 +1466,21 @@ impl PySubscribeState {
                 }
                 pending.accepted(RemoteParty::from_subscribe_response(&response))
             }
-            // No final response. A subscription a NOTIFY established stands
-            // all the same (§4.1.2), and its handle is what the script gets.
-            Ok(Ok(crate::uac::UacResult::Timeout)) | Ok(Err(_)) | Err(_) => pending.unanswered(),
+            // The transaction ended with no final response. A subscription a
+            // NOTIFY established stands all the same (§4.1.2), and its handle
+            // is what the script gets.
+            Ok(Ok(crate::uac::UacResult::Timeout)) | Ok(Err(_)) => pending.unanswered(),
+            // The script stopped waiting, the transaction has not ended. The
+            // same holds, and the response still decides when it comes: a
+            // non-2xx withdraws the subscription (§4.1.2.1).
+            Err(_) => {
+                let call_id = pending.call_id().to_string();
+                let outcome = pending.unanswered();
+                if let Ok(id) = &outcome {
+                    store.await_late_response(call_id, id.clone(), receiver);
+                }
+                outcome
+            }
         };
         let id = outcome
             .map_err(|failure| pyo3::exceptions::PyRuntimeError::new_err(failure.to_string()))?;

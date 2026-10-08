@@ -37,19 +37,48 @@
 //! The caller of `send()` holds a [`PendingSubscription`].  Dropping it
 //! without an outcome that keeps the subscription withdraws whatever the
 //! attempt put in the store, so a failed attempt leaves nothing behind.
+//!
+//! The same holds for what the dialog ends up holding.  Its remote target is
+//! the Contact of the latest NOTIFY, since a NOTIFY is a target refresh
+//! request (RFC 6665 §4.4.1, RFC 3261 §12.2.2); the 2xx supplies it only
+//! until a NOTIFY has.  Its duration is the shortest the notifier has stated,
+//! in the Expires of the 2xx (§4.1.2.1) or the `expires` of a
+//! Subscription-State (§4.1.2.2), and only a refresh the script sends makes
+//! it longer.  Neither depends on the order the two arrived in.  The route
+//! set is the one thing fixed by whichever established the dialog (RFC 3261
+//! §12.1); a 2xx that would have given another is logged.
+//!
+//! Three things end a subscription without the script asking:
+//!
+//! - Timer N (§4.1.2.4): a 2xx that no NOTIFY follows within 64*T1 is a
+//!   failed attempt, and its state is removed.
+//! - A non-2xx that arrives after `send()` gave up waiting and returned the
+//!   subscription a NOTIFY had established (§4.1.2.1).
+//! - The notifier's terminating NOTIFY, including the one that answers the
+//!   script's own unsubscribe: `handle.terminate()` sends SUBSCRIBE with
+//!   Expires 0 and the subscription stays until that NOTIFY, or Timer N.
+//!
+//! A subscription read back from the L2 cache, after a restart or on another
+//! replica, is tracked again from the moment it is loaded, and a terminating
+//! NOTIFY for one this map does not know removes it all the same.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use dashmap::mapref::entry::Entry;
 use thiserror::Error;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use super::{extract_tag, strip_nameaddr, unix_now, SubscribeDialog, SubscribeStore};
 use crate::sip::headers::SipHeaders;
 use crate::sip::message::SipMessage;
 
+/// Timer N of RFC 6665 §4.1.2.4, 64*T1 with T1 at its 500 ms default: how long
+/// a subscriber waits for the NOTIFY a SUBSCRIBE must be followed by.
+pub const TIMER_N: Duration = Duration::from_secs(32);
+
 /// What the notifier contributes to a subscription dialog: its tag, its URI,
-/// where in-dialog requests go and the route they take.
+/// where in-dialog requests go, the route they take and how long it grants.
 #[derive(Debug)]
 pub struct RemoteParty {
     tag: String,
@@ -57,6 +86,9 @@ pub struct RemoteParty {
     /// The Contact, when the message carried one.
     target: Option<String>,
     route_set: Vec<String>,
+    /// The duration the message states: the Expires of a 2xx, or the
+    /// `expires` of a NOTIFY's Subscription-State.
+    expires: Option<u64>,
 }
 
 impl RemoteParty {
@@ -70,6 +102,10 @@ impl RemoteParty {
             uri: strip_nameaddr(from),
             target: contact(&notify.headers),
             route_set: record_route(&notify.headers).cloned().unwrap_or_default(),
+            expires: notify
+                .headers
+                .get("Subscription-State")
+                .and_then(|value| subscription_state_expires(value)),
         })
     }
 
@@ -87,18 +123,31 @@ impl RemoteParty {
             route_set: record_route(&response.headers)
                 .map(|entries| entries.iter().rev().cloned().collect())
                 .unwrap_or_default(),
+            expires: response
+                .headers
+                .get("Expires")
+                .and_then(|value| value.trim().parse().ok()),
         })
     }
 
-    /// Write this peer into `dialog`.  A missing Contact leaves the target the
-    /// dialog was registered with, which is the SUBSCRIBE's Request-URI.
-    fn apply_to(&self, dialog: &mut SubscribeDialog) {
+    /// The dialog `pending` becomes with this notifier.  A missing Contact
+    /// leaves the target the dialog was registered with, which is the
+    /// SUBSCRIBE's Request-URI.  The duration is the notifier's when it
+    /// states a shorter one than was asked for; it cannot grant a longer one
+    /// (RFC 6665 §4.1.2.1).
+    fn establish(&self, pending: &SubscribeDialog) -> SubscribeDialog {
+        let mut dialog = pending.clone();
         dialog.remote_tag.clone_from(&self.tag);
         dialog.remote_uri.clone_from(&self.uri);
         if let Some(target) = &self.target {
             dialog.remote_target.clone_from(target);
         }
         dialog.route_set.clone_from(&self.route_set);
+        if let Some(granted) = self.expires {
+            dialog.expires_secs = dialog.expires_secs.min(granted);
+        }
+        dialog.created_at_unix = unix_now();
+        dialog
     }
 }
 
@@ -144,6 +193,16 @@ fn is_terminated(notify: &SipMessage) -> bool {
         })
 }
 
+/// The `expires` parameter of a Subscription-State value (RFC 6665 §4.1.2.2).
+fn subscription_state_expires(value: &str) -> Option<u64> {
+    value.split(';').skip(1).find_map(|parameter| {
+        let (name, seconds) = parameter.split_once('=')?;
+        name.trim()
+            .eq_ignore_ascii_case("expires")
+            .then(|| seconds.trim().parse().ok())?
+    })
+}
+
 /// One outbound subscription, as the store tracks it by Call-ID.
 pub(super) struct OutboundSubscription {
     id: String,
@@ -152,6 +211,12 @@ pub(super) struct OutboundSubscription {
     /// The `send()` that made it has not learned its outcome yet.
     awaiting_response: bool,
     state: OutboundState,
+    /// When its SUBSCRIBE left, which is when Timer N started.
+    subscribed_at: Instant,
+    /// A NOTIFY has arrived for it, which stops Timer N.
+    notified: bool,
+    /// A NOTIFY supplied the remote target.  Until one has, the 2xx may.
+    target_from_notify: bool,
 }
 
 enum OutboundState {
@@ -182,13 +247,44 @@ pub enum NotifyDisposition {
 /// A subscription its notifier terminated.  Dropping this destroys it.
 pub struct EndedSubscription {
     store: Arc<SubscribeStore>,
-    id: String,
+    subscription: Ended,
+}
+
+/// Which subscription a terminating NOTIFY ends.
+enum Ended {
+    /// One this store tracks.
+    Tracked { id: String },
+    /// One this store does not track: a NOTIFY for a subscription made by
+    /// another process, which a handler may load from the L2 cache while it
+    /// runs.  Looked up by its dialog once the handlers have returned.
+    ByDialog {
+        call_id: String,
+        local_tag: String,
+        remote_tag: String,
+    },
 }
 
 impl Drop for EndedSubscription {
     fn drop(&mut self) {
-        self.store.discard(&self.id);
-        debug!(id = %self.id, "subscribe_state: outbound dialog terminated by NOTIFY");
+        let id = match &self.subscription {
+            Ended::Tracked { id } => id.clone(),
+            Ended::ByDialog {
+                call_id,
+                local_tag,
+                remote_tag,
+            } => {
+                match self
+                    .store
+                    .find_by_tags(call_id, local_tag, remote_tag)
+                    .filter(|dialog| dialog.is_outbound)
+                {
+                    Some(dialog) => dialog.id,
+                    None => return,
+                }
+            }
+        };
+        self.store.discard(&id);
+        debug!(%id, "subscribe_state: outbound dialog terminated by NOTIFY");
     }
 }
 
@@ -213,6 +309,12 @@ pub struct PendingSubscription {
 }
 
 impl PendingSubscription {
+    /// The Call-ID of the SUBSCRIBE, which is what a response that arrives
+    /// after this registration settled is placed by.
+    pub fn call_id(&self) -> &str {
+        &self.call_id
+    }
+
     /// The 2xx to the SUBSCRIBE arrived.  Returns the subscription's id.
     ///
     /// With no NOTIFY ahead of it the 2xx establishes the dialog, and
@@ -254,29 +356,32 @@ impl PendingSubscription {
             return Ok(self.id.clone());
         }
         let subscription = entry.get_mut();
-        let dialog = match &subscription.state {
+        match &subscription.state {
             // Settled just above.
-            OutboundState::Ended => None,
-            OutboundState::Established { .. } => store.get_local(&self.id),
+            OutboundState::Ended => {}
+            OutboundState::Established { .. } => {
+                if let Some(Ok(notifier)) = &response {
+                    store.reconcile_with_response(subscription, notifier);
+                }
+            }
             OutboundState::Pending(pending) => {
                 let notifier = response
                     .ok_or(AttemptFailure::Unanswered)?
                     .map_err(AttemptFailure::Malformed)?;
                 let dialog = notifier.establish(pending);
-                store.dialogs.insert(dialog.id.clone(), dialog.clone());
+                store.dialogs.insert(dialog.id.clone(), dialog);
                 subscription.state = OutboundState::Established {
                     remote_tag: notifier.tag,
                 };
-                Some(dialog)
             }
-        };
+        }
         subscription.awaiting_response = false;
         drop(entry);
         self.kept = true;
         // L2 learns of the subscription here and not from an early NOTIFY, so
         // that an attempt which fails afterwards has nothing to take back out.
-        if let Some(dialog) = &dialog {
-            store.persist(dialog);
+        if let Some(dialog) = store.get_local(&self.id) {
+            store.persist(&dialog);
         }
         Ok(self.id.clone())
     }
@@ -300,16 +405,6 @@ impl Drop for PendingSubscription {
     }
 }
 
-impl RemoteParty {
-    /// The dialog `pending` becomes with this notifier.
-    fn establish(&self, pending: &SubscribeDialog) -> SubscribeDialog {
-        let mut dialog = pending.clone();
-        self.apply_to(&mut dialog);
-        dialog.created_at_unix = unix_now();
-        dialog
-    }
-}
-
 impl SubscribeStore {
     /// Register an outbound subscription before its SUBSCRIBE is sent, so a
     /// NOTIFY that overtakes the 2xx has something to match.  `dialog` is the
@@ -329,10 +424,36 @@ impl SubscribeStore {
                 local_tag: dialog.local_tag.clone(),
                 event: dialog.event.clone(),
                 awaiting_response: true,
+                subscribed_at: Instant::now(),
+                notified: false,
+                target_from_notify: false,
                 state: OutboundState::Pending(Box::new(dialog)),
             },
         );
         registration
+    }
+
+    /// Track an outbound subscription that was read back from the L2 cache:
+    /// one made before a restart, or by another replica.  It is past the
+    /// stage Timer N guards, and its target is whatever was stored.
+    pub(super) fn track_restored(&self, dialog: &SubscribeDialog) {
+        if !dialog.is_outbound || dialog.terminated {
+            return;
+        }
+        self.outbound
+            .entry(dialog.call_id.clone())
+            .or_insert_with(|| OutboundSubscription {
+                id: dialog.id.clone(),
+                local_tag: dialog.local_tag.clone(),
+                event: dialog.event.clone(),
+                awaiting_response: false,
+                subscribed_at: Instant::now(),
+                notified: true,
+                target_from_notify: true,
+                state: OutboundState::Established {
+                    remote_tag: dialog.remote_tag.clone(),
+                },
+            });
     }
 
     /// Number of outbound subscriptions whose `send()` has yet to settle
@@ -355,18 +476,19 @@ impl SubscribeStore {
     /// tag equal to the tag the SUBSCRIBE carried in From, and a matching
     /// Event (RFC 6665 §4.4.1, §8.2.1).  The first such NOTIFY establishes
     /// the dialog unless the 2xx already has.  One from the dialog's notifier
-    /// is the subscription's.  One from any other tag is refused (§5.4.9).
-    /// One that says `terminated` ends the subscription once delivered.
+    /// is the subscription's, and refreshes its target and its duration.  One
+    /// from any other tag is refused (§5.4.9).  One that says `terminated`
+    /// ends the subscription once delivered.
     pub fn notify_received(self: &Arc<Self>, notify: &SipMessage) -> NotifyDisposition {
         let Some(call_id) = notify.headers.call_id() else {
             return NotifyDisposition::Deliver;
         };
+        let to_tag = header(&notify.headers, "To", "t").and_then(|to| extract_tag(to));
         {
             // A read that costs one lookup for the NOTIFY that is not ours.
             let Some(subscription) = self.outbound.get(call_id.as_str()) else {
-                return NotifyDisposition::Deliver;
+                return self.untracked_notify(notify, call_id, to_tag);
             };
-            let to_tag = header(&notify.headers, "To", "t").and_then(|to| extract_tag(to));
             let event = header(&notify.headers, "Event", "o");
             if to_tag.as_deref() != Some(subscription.local_tag.as_str())
                 || !event.is_some_and(|event| event_matches(&subscription.event, event))
@@ -392,14 +514,20 @@ impl SubscribeStore {
                 self.dialogs.insert(dialog.id.clone(), dialog);
                 debug!(id = %subscription.id, "subscribe_state: outbound dialog established by NOTIFY");
                 subscription.state = OutboundState::Established {
-                    remote_tag: notifier.tag,
+                    remote_tag: notifier.tag.clone(),
                 };
             }
-            OutboundState::Established { remote_tag } if *remote_tag == notifier.tag => {}
+            OutboundState::Established { remote_tag } if *remote_tag == notifier.tag => {
+                if !terminated {
+                    self.refresh_from_notify(&subscription.id, &notifier);
+                }
+            }
             OutboundState::Established { .. } | OutboundState::Ended => {
                 return NotifyDisposition::Reject;
             }
         }
+        subscription.notified = true;
+        subscription.target_from_notify |= notifier.target.is_some();
         if !terminated {
             return NotifyDisposition::Deliver;
         }
@@ -410,8 +538,223 @@ impl SubscribeStore {
         drop(entry);
         NotifyDisposition::DeliverThenEnd(EndedSubscription {
             store: Arc::clone(self),
-            id,
+            subscription: Ended::Tracked { id },
         })
+    }
+
+    /// A NOTIFY whose Call-ID this map does not know.  It is not a
+    /// subscription this process is tracking, and the script decides what it
+    /// is.  One that terminates a subscription may still be ending one the
+    /// script reads from the L2 cache while it handles it, so that is looked
+    /// for once the handlers have returned.
+    fn untracked_notify(
+        self: &Arc<Self>,
+        notify: &SipMessage,
+        call_id: &str,
+        to_tag: Option<String>,
+    ) -> NotifyDisposition {
+        if !is_terminated(notify) {
+            return NotifyDisposition::Deliver;
+        }
+        let from_tag = header(&notify.headers, "From", "f").and_then(|from| extract_tag(from));
+        match (to_tag, from_tag) {
+            (Some(local_tag), Some(remote_tag)) => {
+                NotifyDisposition::DeliverThenEnd(EndedSubscription {
+                    store: Arc::clone(self),
+                    subscription: Ended::ByDialog {
+                        call_id: call_id.to_string(),
+                        local_tag,
+                        remote_tag,
+                    },
+                })
+            }
+            _ => NotifyDisposition::Deliver,
+        }
+    }
+
+    /// Apply what a NOTIFY from the dialog's notifier says about the dialog.
+    ///
+    /// A NOTIFY is a target refresh request, so its Contact replaces the
+    /// remote target (RFC 6665 §4.4.1, RFC 3261 §12.2.2).  The `expires` of
+    /// its Subscription-State is how long the notifier will keep the
+    /// subscription, and shortens ours when it is less than we assumed
+    /// (§4.1.2.2); it never lengthens it, which only a refresh does.
+    fn refresh_from_notify(&self, id: &str, notifier: &RemoteParty) {
+        let Some(dialog) = self.get_local(id) else {
+            return;
+        };
+        let target = notifier
+            .target
+            .as_ref()
+            .filter(|target| **target != dialog.remote_target);
+        let duration = notifier
+            .expires
+            .filter(|granted| shortens(&dialog, *granted));
+        if target.is_none() && duration.is_none() {
+            return;
+        }
+        self.update(id, |dialog| {
+            if let Some(target) = target {
+                dialog.remote_target.clone_from(target);
+            }
+            if let Some(granted) = duration {
+                dialog.refresh(granted);
+            }
+        });
+    }
+
+    /// Apply what the 2xx to the SUBSCRIBE says to a dialog a NOTIFY already
+    /// established.  A 2xx from another fork says nothing about it (RFC 6665
+    /// §5.4.9).  From the dialog's notifier it supplies the remote target
+    /// only when no NOTIFY has, and a shorter duration when it grants one
+    /// (§4.1.2.1), so that the dialog holds the same whichever came first.
+    fn reconcile_with_response(&self, subscription: &OutboundSubscription, notifier: &RemoteParty) {
+        let OutboundState::Established { remote_tag } = &subscription.state else {
+            return;
+        };
+        if *remote_tag != notifier.tag {
+            return;
+        }
+        let Some(dialog) = self.get_local(&subscription.id) else {
+            return;
+        };
+        if dialog.route_set != notifier.route_set {
+            // RFC 3261 §12.1: fixed by whichever established the dialog.
+            warn!(
+                id = %subscription.id,
+                from_notify = ?dialog.route_set,
+                from_response = ?notifier.route_set,
+                "subscribe_state: the 2xx and the NOTIFY that preceded it give different route \
+                 sets; keeping the NOTIFY's"
+            );
+        }
+        let target = notifier
+            .target
+            .as_ref()
+            .filter(|target| !subscription.target_from_notify && **target != dialog.remote_target);
+        let duration = notifier
+            .expires
+            .filter(|granted| shortens(&dialog, *granted));
+        if target.is_none() && duration.is_none() {
+            return;
+        }
+        // Not written through to L2 here: the caller does that once.
+        if let Some(mut entry) = self.dialogs.get_mut(&subscription.id) {
+            if let Some(target) = target {
+                entry.remote_target.clone_from(target);
+            }
+            if let Some(granted) = duration {
+                entry.refresh(granted);
+            }
+        }
+    }
+
+    /// The final response to a SUBSCRIBE whose `send()` had stopped waiting
+    /// and returned the subscription a NOTIFY established.  `None` is a
+    /// non-2xx: no subscription was created after all (RFC 6665 §4.1.2.1),
+    /// and it is withdrawn.  A 2xx is reconciled with the dialog as it would
+    /// have been in time.
+    pub fn late_response(
+        &self,
+        call_id: &str,
+        id: &str,
+        response: Option<Result<RemoteParty, &'static str>>,
+    ) {
+        match response {
+            Some(Ok(notifier)) => {
+                let Some(subscription) = self.outbound.get(call_id) else {
+                    return;
+                };
+                if subscription.id != id {
+                    return;
+                }
+                self.reconcile_with_response(&subscription, &notifier);
+                drop(subscription);
+                if let Some(dialog) = self.get_local(id) {
+                    self.persist(&dialog);
+                }
+            }
+            // Established by a NOTIFY, so a 2xx that could not have
+            // established it changes nothing.
+            Some(Err(_)) => {}
+            None => {
+                let rejected = self
+                    .outbound
+                    .get(call_id)
+                    .is_some_and(|subscription| subscription.id == id);
+                if rejected {
+                    self.discard(id);
+                    warn!(
+                        id,
+                        "subscribe_state: the SUBSCRIBE was rejected after a NOTIFY had established \
+                         the subscription; withdrawn"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Keep waiting for the final response to a SUBSCRIBE whose `send()` has
+    /// returned, and apply it with [`Self::late_response`] when it comes.
+    /// Ends with the transaction: the receiver closes when the UAC gives the
+    /// request up.
+    pub fn await_late_response(
+        self: &Arc<Self>,
+        call_id: String,
+        id: String,
+        receiver: tokio::sync::oneshot::Receiver<crate::uac::UacResult>,
+    ) {
+        let store = Arc::clone(self);
+        tokio::spawn(async move {
+            if let Ok(crate::uac::UacResult::Response(response)) = receiver.await {
+                let status = response.status_code().unwrap_or(0);
+                let accepted = (200..300)
+                    .contains(&status)
+                    .then(|| RemoteParty::from_subscribe_response(&response));
+                store.late_response(&call_id, &id, accepted);
+            }
+        });
+    }
+
+    /// The script unsubscribed: a SUBSCRIBE with Expires 0 has been sent.
+    /// The subscription is not over until the notifier's terminating NOTIFY
+    /// (RFC 6665 §4.1.2.3), which the script's handler has to be able to find
+    /// it for.  It is given Timer N to arrive, and reaped with the expired
+    /// dialogs when it does not.
+    pub fn unsubscribed(&self, id: &str) {
+        self.update(id, |dialog| dialog.refresh(TIMER_N.as_secs()));
+    }
+
+    /// Remove the outbound subscriptions whose SUBSCRIBE was accepted
+    /// `older_than` ago with no NOTIFY since, and return them.  Timer N of
+    /// RFC 6665 §4.1.2.4: the subscriber "considers the subscription failed,
+    /// and cleans up any state associated with the subscription attempt".
+    pub(super) fn take_unnotified(&self, older_than: Duration) -> Vec<SubscribeDialog> {
+        let overdue: Vec<String> = self
+            .outbound
+            .iter()
+            .filter(|subscription| {
+                !subscription.notified
+                    && !subscription.awaiting_response
+                    && matches!(subscription.state, OutboundState::Established { .. })
+                    && subscription.subscribed_at.elapsed() >= older_than
+            })
+            .map(|subscription| subscription.id.clone())
+            .collect();
+        let mut failed = Vec::with_capacity(overdue.len());
+        for id in overdue {
+            if let Some(dialog) = self.get_local(&id) {
+                self.discard(&id);
+                warn!(
+                    %id,
+                    call_id = %dialog.call_id,
+                    "subscribe_state: no NOTIFY followed the 2xx within Timer N; the subscription \
+                     attempt failed and its state is removed"
+                );
+                failed.push(dialog);
+            }
+        }
+        failed
     }
 
     /// A dialog left the live dialogs: stop tracking it as an outbound
@@ -449,6 +792,13 @@ impl SubscribeStore {
             self.remove(id);
         }
     }
+}
+
+/// Whether the notifier keeping the subscription for `granted` seconds from
+/// now ends it sooner than `dialog` assumes.  A second of slack, so that the
+/// same duration read a moment apart is not a change.
+fn shortens(dialog: &SubscribeDialog, granted: u64) -> bool {
+    granted.saturating_add(1) < dialog.remaining_secs()
 }
 
 #[cfg(test)]
@@ -608,13 +958,14 @@ mod tests {
         assert_eq!(dialog.remote_target, "sip:accepted@192.0.2.30:5060");
         // A UAC reverses the Record-Route of the response.
         assert_eq!(dialog.route_set, ROUTE_OF_THE_NOTIFY);
-        // The NOTIFY that follows is the subscription's and changes nothing.
+        // The NOTIFY that follows is the subscription's.  It is a target
+        // refresh request, so its Contact is the remote target from here on
+        // (RFC 6665 §4.4.1); the route set stays the dialog's.
         assert!(delivered(&store.notify_received(&active("a"))));
         assert_eq!(store.local_count(), 1);
-        assert_eq!(
-            store.get_local("a").map(|dialog| dialog.remote_target),
-            Some("sip:accepted@192.0.2.30:5060".to_string())
-        );
+        let dialog = store.get_local("a").expect("still there");
+        assert_eq!(dialog.remote_target, "sip:notifier@192.0.2.30:5060");
+        assert_eq!(dialog.route_set, ROUTE_OF_THE_NOTIFY);
     }
 
     #[test]
@@ -1127,5 +1478,375 @@ mod tests {
         assert_eq!(store.pending_count(), 0);
         assert_eq!(store.local_count(), standing);
         assert_eq!(store.outbound_count(), standing);
+    }
+
+    /// The 2xx of `accepted`, with its Contact and Expires replaced or, for
+    /// `None`, taken out.
+    fn two_hundred_with(
+        id: &str,
+        contact: Option<&str>,
+        expires: Option<u64>,
+    ) -> Result<RemoteParty, &'static str> {
+        let mut raw = format!(
+            concat!(
+                "SIP/2.0 200 OK\r\n",
+                "Via: SIP/2.0/UDP 192.0.2.1:5060;branch=z9hG4bK-uac-py-1\r\n",
+                "From: <sip:watcher@example.com>;tag=local-{id}\r\n",
+                "To: <sip:001010123456789@example.com>;tag={tag}\r\n",
+                "Call-ID: call-{id}\r\n",
+                "CSeq: 1 SUBSCRIBE\r\n",
+                "Record-Route: <sip:far.example.com;lr>\r\n",
+                "Record-Route: <sip:near.example.com;lr>\r\n",
+            ),
+            id = id,
+            tag = NOTIFIER_TAG,
+        );
+        if let Some(contact) = contact {
+            raw.push_str(&format!("Contact: <{contact}>\r\n"));
+        }
+        if let Some(expires) = expires {
+            raw.push_str(&format!("Expires: {expires}\r\n"));
+        }
+        raw.push_str("Content-Length: 0\r\n\r\n");
+        let response = parse_sip_message_bytes(raw.as_bytes()).expect("the 2xx parses");
+        RemoteParty::from_subscribe_response(&response)
+    }
+
+    /// The NOTIFY of `notify`, with its Contact replaced or taken out.
+    fn notify_with(id: &str, contact: Option<&str>, subscription_state: &str) -> SipMessage {
+        let mut message = notify(id, NOTIFIER_TAG, "reg", subscription_state);
+        match contact {
+            Some(contact) => message.headers.set("Contact", format!("<{contact}>")),
+            None => message.headers.remove("Contact"),
+        }
+        message
+    }
+
+    /// What the dialog of one exchange holds: its remote target, its route
+    /// set, and its duration to the nearest ten seconds.
+    fn dialog_after(
+        order: &str,
+        response: (Option<&str>, Option<u64>),
+        notification: (Option<&str>, &str),
+    ) -> (String, Vec<String>, u64) {
+        let store = Arc::new(SubscribeStore::new());
+        let mut registration = Some(store.register_pending(subscription("a")));
+        for event in order.chars() {
+            match event {
+                '2' => {
+                    let registration = registration.take().expect("one 2xx");
+                    let accepted =
+                        registration.accepted(two_hundred_with("a", response.0, response.1));
+                    assert_eq!(accepted.as_deref(), Ok("a"));
+                }
+                'n' => {
+                    drop(store.notify_received(&notify_with("a", notification.0, notification.1)))
+                }
+                other => panic!("unknown event {other:?}"),
+            }
+        }
+        let dialog = store.get_local("a").expect("the subscription stands");
+        (
+            dialog.remote_target.clone(),
+            dialog.route_set.clone(),
+            (dialog.remaining_secs() + 5) / 10 * 10,
+        )
+    }
+
+    /// The 2xx and the NOTIFY race, so the dialog must hold the same target
+    /// and the same duration whichever arrived first.
+    #[test]
+    fn the_dialog_holds_the_same_whichever_message_came_first() {
+        let accepted = "sip:accepted@192.0.2.30:5060";
+        let notifier = "sip:notifier@192.0.2.30:5060";
+        let route: Vec<String> = ROUTE_OF_THE_NOTIFY
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        for (response, notification, expected) in [
+            // Both state a target and a duration: the NOTIFY's target, and
+            // the shorter duration.
+            (
+                (Some(accepted), Some(300)),
+                (Some(notifier), "active;expires=120"),
+                (notifier, 120),
+            ),
+            (
+                (Some(accepted), Some(120)),
+                (Some(notifier), "active;expires=300"),
+                (notifier, 120),
+            ),
+            // A NOTIFY without a Contact leaves the 2xx's.
+            (
+                (Some(accepted), Some(300)),
+                (None, "active;expires=300"),
+                (accepted, 300),
+            ),
+            // Neither states a duration: the one that was asked for.
+            (
+                (Some(accepted), None),
+                (Some(notifier), "active"),
+                (notifier, 600),
+            ),
+            // A notifier cannot grant more than was asked for.
+            (
+                (Some(accepted), Some(3600)),
+                (Some(notifier), "active;expires=7200"),
+                (notifier, 600),
+            ),
+        ] {
+            let expected = (expected.0.to_string(), route.clone(), expected.1);
+            for order in ["2n", "n2", "2nn", "n2n", "nn2"] {
+                assert_eq!(
+                    dialog_after(order, response, notification),
+                    expected,
+                    "events in the order {order:?}, 2xx {response:?}, NOTIFY {notification:?}"
+                );
+            }
+        }
+    }
+
+    /// RFC 6665 §4.1.2.2: the notifier may shorten the subscription in any
+    /// NOTIFY.  Only a refresh the subscriber sends lengthens it.
+    #[test]
+    fn a_notify_shortens_the_subscription_and_never_lengthens_it() {
+        let store = Arc::new(SubscribeStore::new());
+        assert!(store
+            .register_pending(subscription("a"))
+            .accepted(two_hundred("a", NOTIFIER_TAG))
+            .is_ok());
+        assert_eq!(store.get_local("a").map(|d| d.expires_secs), Some(600));
+
+        let _ = store.notify_received(&notify("a", NOTIFIER_TAG, "reg", "active;expires=90"));
+        assert_eq!(store.get_local("a").map(|d| d.expires_secs), Some(90));
+
+        let _ = store.notify_received(&notify("a", NOTIFIER_TAG, "reg", "active;expires=900"));
+        assert_eq!(store.get_local("a").map(|d| d.expires_secs), Some(90));
+        // Read again a moment later it is the same duration, not a change.
+        let _ = store.notify_received(&notify("a", NOTIFIER_TAG, "reg", "active;expires=89"));
+        assert_eq!(store.get_local("a").map(|d| d.expires_secs), Some(90));
+    }
+
+    #[test]
+    fn subscription_state_expires_is_read_from_any_position() {
+        assert_eq!(subscription_state_expires("active;expires=600"), Some(600));
+        assert_eq!(
+            subscription_state_expires("pending ; reason=x ; Expires = 30"),
+            Some(30)
+        );
+        assert_eq!(subscription_state_expires("active"), None);
+        assert_eq!(subscription_state_expires("active;expires=soon"), None);
+        assert_eq!(
+            subscription_state_expires("terminated;reason=timeout"),
+            None
+        );
+    }
+
+    /// RFC 6665 §4.1.2.4, Timer N: a 2xx that no NOTIFY follows is a failed
+    /// attempt, and its state is cleaned up.
+    #[test]
+    fn a_2xx_that_no_notify_follows_is_reaped_at_timer_n() {
+        let store = Arc::new(SubscribeStore::new());
+        assert!(store
+            .register_pending(subscription("silent"))
+            .accepted(two_hundred("silent", NOTIFIER_TAG))
+            .is_ok());
+        assert!(store
+            .register_pending(subscription("notified"))
+            .accepted(two_hundred("notified", NOTIFIER_TAG))
+            .is_ok());
+        let _ = store.notify_received(&active("notified"));
+        // Still in its transaction: Timer N has not been reached by a
+        // `send()` that is still waiting, whatever its age.
+        let _waiting = store.register_pending(subscription("waiting"));
+        let _ = store.notify_received(&active("waiting"));
+        let _unanswered = store.register_pending(subscription("unanswered"));
+
+        // Inside Timer N nothing is touched.
+        assert!(store.take_stale().is_empty());
+        assert_eq!(store.local_count(), 3);
+
+        let failed = store.take_unnotified(Duration::ZERO);
+        assert_eq!(
+            failed
+                .iter()
+                .map(|dialog| dialog.id.as_str())
+                .collect::<Vec<_>>(),
+            ["silent"]
+        );
+        assert!(store.get_local("silent").is_none());
+        assert!(store.get_local("notified").is_some());
+        assert!(store.get_local("waiting").is_some());
+        assert_eq!(store.outbound_count(), 3);
+        // Reaping it twice finds nothing more.
+        assert!(store.take_unnotified(Duration::ZERO).is_empty());
+        // A NOTIFY for it now matches no subscription.
+        assert!(delivered(&store.notify_received(&active("silent"))));
+        assert_eq!(store.local_count(), 2);
+    }
+
+    /// RFC 6665 §4.1.2.3: an unsubscribe is answered by a terminating NOTIFY,
+    /// and the subscription exists until it arrives.
+    #[test]
+    fn an_unsubscribed_subscription_lasts_until_its_terminating_notify() {
+        let store = Arc::new(SubscribeStore::new());
+        assert!(store
+            .register_pending(subscription("a"))
+            .accepted(two_hundred("a", NOTIFIER_TAG))
+            .is_ok());
+        let _ = store.notify_received(&active("a"));
+
+        store.unsubscribed("a");
+
+        let dialog = store
+            .find_by_tags("call-a", "local-a", NOTIFIER_TAG)
+            .expect("the final NOTIFY has a subscription to find");
+        assert!(dialog.remaining_secs() <= TIMER_N.as_secs());
+        // A NOTIFY that crossed the unsubscribe does not give it its old
+        // duration back.
+        let _ = store.notify_received(&active("a"));
+        assert!(store.get_local("a").expect("still there").remaining_secs() <= TIMER_N.as_secs());
+
+        let last = store.notify_received(&notify(
+            "a",
+            NOTIFIER_TAG,
+            "reg",
+            "terminated;reason=timeout",
+        ));
+        assert!(matches!(last, NotifyDisposition::DeliverThenEnd(_)));
+        assert!(store.get_local("a").is_some(), "found while it is handled");
+        drop(last);
+        assert_eq!(store.local_count(), 0);
+        assert_eq!(store.outbound_count(), 0);
+    }
+
+    /// And when that NOTIFY never comes, Timer N ends it.
+    #[test]
+    fn an_unsubscribed_subscription_is_reaped_when_no_notify_answers() {
+        let store = Arc::new(SubscribeStore::new());
+        assert!(store
+            .register_pending(subscription("a"))
+            .accepted(two_hundred("a", NOTIFIER_TAG))
+            .is_ok());
+        let _ = store.notify_received(&active("a"));
+        store.unsubscribed("a");
+        assert!(store.take_stale().is_empty(), "not before Timer N");
+
+        // Timer N later.
+        store.update("a", |dialog| dialog.created_at_unix -= TIMER_N.as_secs());
+        assert_eq!(store.take_stale().len(), 1);
+        assert_eq!(store.local_count(), 0);
+        assert_eq!(store.outbound_count(), 0);
+    }
+
+    /// RFC 6665 §4.1.2.1: a non-2xx says no subscription was created, also
+    /// when it arrives after `send()` stopped waiting for it.
+    #[test]
+    fn a_late_rejection_withdraws_the_subscription_a_notify_established() {
+        let store = Arc::new(SubscribeStore::new());
+        let registration = store.register_pending(subscription("a"));
+        let _ = store.notify_received(&active("a"));
+        assert_eq!(registration.unanswered().as_deref(), Ok("a"));
+        assert_eq!(store.local_count(), 1);
+
+        // Another subscription's response does not touch this one.
+        store.late_response("call-a", "someone-else", None);
+        store.late_response("call-b", "a", None);
+        assert_eq!(store.local_count(), 1);
+
+        store.late_response("call-a", "a", None);
+        assert_eq!(store.local_count(), 0);
+        assert_eq!(store.outbound_count(), 0);
+        // And again: nothing is left to withdraw.
+        store.late_response("call-a", "a", None);
+        assert_eq!(store.local_count(), 0);
+    }
+
+    #[test]
+    fn a_late_2xx_is_reconciled_as_one_in_time_would_have_been() {
+        let store = Arc::new(SubscribeStore::new());
+        let registration = store.register_pending(subscription("a"));
+        let _ = store.notify_received(&notify_with("a", None, "active"));
+        assert_eq!(registration.unanswered().as_deref(), Ok("a"));
+
+        store.late_response(
+            "call-a",
+            "a",
+            Some(two_hundred_with(
+                "a",
+                Some("sip:accepted@192.0.2.30:5060"),
+                Some(120),
+            )),
+        );
+
+        let dialog = store.get_local("a").expect("still there");
+        assert_eq!(dialog.remote_target, "sip:accepted@192.0.2.30:5060");
+        assert_eq!(dialog.expires_secs, 120);
+        // A 2xx that could not have established a dialog changes nothing.
+        store.late_response("call-a", "a", Some(untagged_2xx()));
+        assert_eq!(store.local_count(), 1);
+    }
+
+    /// A subscription read back from the L2 cache, after a restart or on
+    /// another replica, is placed against its NOTIFYs like one made here.
+    #[test]
+    fn a_restored_subscription_is_tracked_again() {
+        let store = Arc::new(SubscribeStore::new());
+        let mut restored = subscription("a");
+        restored.remote_tag = NOTIFIER_TAG.to_string();
+        store.dialogs.insert("a".to_string(), restored.clone());
+        store.track_restored(&restored);
+        // Loading it twice tracks it once.
+        store.track_restored(&restored);
+        assert_eq!(store.outbound_count(), 1);
+        // It is past Timer N by definition.
+        assert!(store.take_unnotified(Duration::ZERO).is_empty());
+
+        assert!(matches!(
+            store.notify_received(&notify("a", "another-fork", "reg", "active")),
+            NotifyDisposition::Reject
+        ));
+        assert!(delivered(&store.notify_received(&active("a"))));
+        drop(store.notify_received(&notify("a", NOTIFIER_TAG, "reg", "terminated")));
+        assert_eq!(store.local_count(), 0);
+        assert_eq!(store.outbound_count(), 0);
+
+        // A notifier-side dialog is never tracked as a subscription of ours.
+        let mut inbound = subscription("b");
+        inbound.is_outbound = false;
+        store.track_restored(&inbound);
+        assert_eq!(store.outbound_count(), 0);
+    }
+
+    /// A terminating NOTIFY for a subscription this map does not track ends
+    /// the one its handler loaded, once the handler has returned.
+    #[test]
+    fn a_terminating_notify_ends_a_subscription_loaded_while_it_is_handled() {
+        let store = Arc::new(SubscribeStore::new());
+        let terminating = notify("a", NOTIFIER_TAG, "reg", "terminated;reason=timeout");
+
+        let disposition = store.notify_received(&terminating);
+        assert!(matches!(disposition, NotifyDisposition::DeliverThenEnd(_)));
+        // The handler reads the subscription from the cache.
+        let mut loaded = subscription("a");
+        loaded.remote_tag = NOTIFIER_TAG.to_string();
+        store.dialogs.insert("a".to_string(), loaded.clone());
+        store.track_restored(&loaded);
+        drop(disposition);
+        assert_eq!(store.local_count(), 0);
+        assert_eq!(store.outbound_count(), 0);
+
+        // Nothing was loaded: nothing is removed, and nothing breaks.
+        drop(store.notify_received(&terminating));
+        // A notifier-side dialog with those tags is not a subscription of
+        // ours, and a NOTIFY does not remove it.
+        let mut inbound = subscription("b");
+        inbound.is_outbound = false;
+        inbound.remote_tag = NOTIFIER_TAG.to_string();
+        store.put(inbound);
+        drop(store.notify_received(&notify("b", NOTIFIER_TAG, "reg", "terminated")));
+        assert_eq!(store.local_count(), 1);
+        // An active NOTIFY it does not track costs it nothing.
+        assert!(delivered(&store.notify_received(&active("c"))));
     }
 }

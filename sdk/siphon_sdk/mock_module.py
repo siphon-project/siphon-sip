@@ -450,8 +450,28 @@ class MockSubscribeHandle:
 
     def terminate(self, reason: Optional[str] = None,
                   body=None, content_type: Optional[str] = None) -> bool:
+        """Terminate the subscription. Recorded on the parent's ``terminates``.
+
+        A dialog accepted from a SUBSCRIBE (notifier role) gets its final
+        NOTIFY and is removed at once.
+
+        A subscription made with ``send()`` (watcher role) is unsubscribed:
+        siphon sends SUBSCRIBE with ``Expires: 0``, and the subscription is
+        over when the notifier's terminating NOTIFY arrives (RFC 6665 section
+        4.1.2.3). It therefore stays until then, so the NOTIFY handler finds
+        it and answers 200::
+
+            await handle.terminate()
+            # later, in @proxy.on_request("NOTIFY"):
+            #   proxy.subscribe_state.find(...) still returns the handle, and
+            #   siphon removes it once the handler has returned.
+
+        siphon removes it after 32 seconds (Timer N) when no such NOTIFY
+        comes; in a test, deliver the NOTIFY or call
+        ``proxy.subscribe_state.expire_unanswered()``.
+        """
         async def _run():
-            self._live()
+            dialog = self._live()
             reason_str = reason or "noresource"
             self._parent.terminates.append({
                 "id": self._id,
@@ -459,7 +479,13 @@ class MockSubscribeHandle:
                 "body": body,
                 "content_type": content_type,
             })
-            self._parent._dialogs.pop(self._id, None)
+            if dialog.get("is_outbound"):
+                dialog["unsubscribed"] = True
+                dialog["expires_secs"] = min(
+                    int(dialog.get("expires_secs", 0)), MockSubscribeState.TIMER_N_SECS
+                )
+            else:
+                self._parent._dialogs.pop(self._id, None)
             return True
 
         return _run()
@@ -502,10 +528,78 @@ class MockSubscribeState:
     ``terminates`` lists for test assertions.
     """
 
+    #: Timer N of RFC 6665 section 4.1.2.4, 64*T1, in seconds.
+    TIMER_N_SECS = 32
+
     def __init__(self) -> None:
         self._dialogs: dict[str, dict] = {}
         self.notifies: list[dict] = []
         self.terminates: list[dict] = []
+
+    @staticmethod
+    def _event_identity(value: str) -> tuple[str, Optional[str]]:
+        """The event-type and the ``id`` parameter of an Event header value,
+        which is all that is compared (RFC 6665 section 8.2.1)."""
+        parts = value.split(";")
+        event_id = None
+        for parameter in parts[1:]:
+            name, _, parameter_value = parameter.partition("=")
+            if name.strip().lower() == "id":
+                event_id = parameter_value.strip()
+                break
+        return parts[0].strip(), event_id
+
+    def _place_notify(self, request: Any) -> tuple[str, Optional[str]]:
+        """What siphon does with a NOTIFY before the script sees it.
+
+        Mirrors the dispatcher. Returns ``("reject", None)`` for a NOTIFY for
+        one of our SUBSCRIBEs from another notifier than its dialog's (481
+        without running the handler, RFC 6665 section 5.4.9),
+        ``("end", dialog_id)`` for one that terminates a subscription (it is
+        removed once the handlers have returned, section 4.4.1) and
+        ``("deliver", None)`` otherwise. A NOTIFY from the dialog's notifier
+        that states a shorter ``expires`` shortens the subscription (section
+        4.1.2.2); it never lengthens it.
+        """
+        event = request.get_header("Event") or getattr(request, "event", None) or ""
+        state = request.get_header("Subscription-State") or ""
+        for dialog_id, dialog in self._dialogs.items():
+            if (
+                not dialog.get("is_outbound")
+                or dialog.get("call_id") != request.call_id
+                or dialog.get("local_tag") != request.to_tag
+                or self._event_identity(dialog.get("event", "")) != self._event_identity(event)
+            ):
+                continue
+            if dialog.get("remote_tag") != request.from_tag:
+                return "reject", None
+            parts = [part.strip() for part in state.split(";")]
+            if parts[0].lower() == "terminated":
+                return "end", dialog_id
+            for parameter in parts[1:]:
+                name, _, seconds = parameter.partition("=")
+                if name.strip().lower() == "expires" and seconds.strip().isdigit():
+                    dialog["expires_secs"] = min(
+                        int(dialog.get("expires_secs", 0)), int(seconds.strip())
+                    )
+            return "deliver", None
+        return "deliver", None
+
+    def expire_unanswered(self) -> list[str]:
+        """Test helper: let Timer N run out.
+
+        Removes every subscription a script unsubscribed with
+        ``handle.terminate()`` whose terminating NOTIFY never came, as siphon
+        does 32 seconds after the SUBSCRIBE, and returns their ids.
+        """
+        gone = [
+            dialog_id
+            for dialog_id, dialog in self._dialogs.items()
+            if dialog.get("is_outbound") and dialog.get("unsubscribed")
+        ]
+        for dialog_id in gone:
+            del self._dialogs[dialog_id]
+        return gone
 
     def create(self, request: Any, expires: Optional[int] = None) -> MockSubscribeHandle:
         import uuid
@@ -618,6 +712,19 @@ class MockSubscribeState:
         created, even if a NOTIFY came first, section 4.1.2.1) and on a
         timeout with no NOTIFY received. Nothing of the attempt is left in
         either case.
+
+        What the subscription then holds is the notifier's to say. Its
+        duration is the shortest the notifier states, in the ``Expires`` of
+        the 2xx or the ``expires`` of a NOTIFY's ``Subscription-State``, so
+        schedule a refresh from ``handle.expires`` and not from the value you
+        asked for. siphon also ends a subscription on its own in two cases:
+        a 2xx that no NOTIFY follows within 32 seconds (Timer N, section
+        4.1.2.4), and a non-2xx that arrives after this call stopped waiting
+        and returned a subscription a NOTIFY had established.
+
+        In the mock the SUBSCRIBE is accepted at once. Deliver the NOTIFYs
+        with ``harness.send_request("NOTIFY", ...)``: the harness places them
+        against the subscription the way siphon does.
         """
         async def _run():
             import uuid
@@ -10508,6 +10615,9 @@ def reset() -> None:
     """
     _registry.clear()
     _registrar.clear()
+    # Subscriptions a script made outlive the request that made them, so a
+    # test that does not start from none sees the previous test's.
+    _proxy.subscribe_state.clear()
     _log.clear()
     _cache.clear()
     _rtpengine.clear()
