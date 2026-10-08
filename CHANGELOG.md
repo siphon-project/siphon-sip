@@ -30,6 +30,17 @@ entry, but a working config keeps working.
   that registered a namespace of its own called `config` has to rename it. See
   `docs/reference/script-config.md`.
 
+### Fixed
+
+- **iFC `SessionCase` 2 and 3 are decoded the way 3GPP TS 29.228 Annex E
+  defines them.** `2` is terminating for an unregistered user and `3` is
+  originating for an unregistered user; the two were swapped. A user profile
+  whose trigger point carries `<SessionCase>2</SessionCase>` now matches
+  `isc.evaluate(..., session_case="terminating_unregistered")`, and `3` matches
+  `"originating_unregistered"`. Codes `0` and `1` are unchanged. A script that
+  compensated by passing the opposite unregistered name has to pass the right
+  one now.
+
 ## [1.13.1] — 2026-10-08
 
 ### Added
