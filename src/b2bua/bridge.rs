@@ -862,9 +862,85 @@ pub fn set_media_direction(body: &[u8], direction: MediaDirection) -> Vec<u8> {
     sdp.to_string().into_bytes()
 }
 
+/// Whether every stream `body` describes runs both ways.
+///
+/// `sendrecv` is the default (RFC 3264 §6.1), so a stream says so by naming no
+/// direction, and a media-level attribute overrides the session-level one
+/// (RFC 4566 §6). A body that is not SDP describes no stream and offers
+/// nothing.
+pub fn offers_both_ways(body: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(body) else {
+        return false;
+    };
+    let sdp = crate::media::sdp::SdpBody::parse(text);
+    if sdp.media_sections.is_empty() {
+        return false;
+    }
+    let session_direction = DIRECTION_ATTRS
+        .into_iter()
+        .find(|attribute| sdp.session_has_attr(attribute));
+    sdp.media_sections.iter().all(|media| {
+        DIRECTION_ATTRS
+            .into_iter()
+            .find(|attribute| media.has_attr(attribute))
+            .or(session_direction)
+            .is_none_or(|direction| direction == "sendrecv")
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const ONE_STREAM: &str = concat!(
+        "v=0\r\n",
+        "o=- 1 1 IN IP4 192.0.2.10\r\n",
+        "s=-\r\n",
+        "c=IN IP4 192.0.2.10\r\n",
+        "t=0 0\r\n",
+    );
+
+    #[test]
+    fn a_stream_naming_no_direction_or_sendrecv_is_offered_both_ways() {
+        let unnamed = format!("{ONE_STREAM}m=audio 40000 RTP/AVP 0\r\n");
+        assert!(offers_both_ways(unnamed.as_bytes()));
+        let named = format!("{ONE_STREAM}m=audio 40000 RTP/AVP 0\r\na=sendrecv\r\n");
+        assert!(offers_both_ways(named.as_bytes()));
+    }
+
+    #[test]
+    fn a_held_stream_is_not_offered_both_ways() {
+        for direction in ["sendonly", "recvonly", "inactive"] {
+            let media = format!("{ONE_STREAM}m=audio 40000 RTP/AVP 0\r\na={direction}\r\n");
+            assert!(
+                !offers_both_ways(media.as_bytes()),
+                "media-level {direction}"
+            );
+            let session = format!("{ONE_STREAM}a={direction}\r\nm=audio 40000 RTP/AVP 0\r\n");
+            assert!(
+                !offers_both_ways(session.as_bytes()),
+                "session-level {direction}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_media_level_direction_overrides_the_session_level_one() {
+        let resumed =
+            format!("{ONE_STREAM}a=inactive\r\nm=audio 40000 RTP/AVP 0\r\na=sendrecv\r\n");
+        assert!(offers_both_ways(resumed.as_bytes()));
+        let one_held = format!(
+            "{ONE_STREAM}m=audio 40000 RTP/AVP 0\r\nm=video 40002 RTP/AVP 96\r\na=sendonly\r\n"
+        );
+        assert!(!offers_both_ways(one_held.as_bytes()));
+    }
+
+    #[test]
+    fn a_body_that_is_not_sdp_offers_nothing() {
+        assert!(!offers_both_ways(b"not sdp at all"));
+        assert!(!offers_both_ways(&[0xff, 0xfe]));
+        assert!(!offers_both_ways(b""));
+    }
 
     /// The `answer` half of `profile`: what a leg the engine answered itself
     /// was anchored under.

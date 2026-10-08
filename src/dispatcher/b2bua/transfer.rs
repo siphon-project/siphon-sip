@@ -103,10 +103,51 @@ pub fn b2bua_bridge_inbound_replaces(
         );
         return;
     };
-    let new_tag = new_leg.dialog.local_tag.clone();
     // The fresh engine call-id is the new party's SIP Call-ID, which is what the
     // media store is keyed on once this leg occupies the A-leg slot.
     let cid_new = new_leg.dialog.call_id.clone();
+
+    // A script that anchors its calls has already offered this INVITE to the
+    // engine: the takeover runs after `@b2bua.on_invite`, and the INVITE here
+    // carries the engine's rewrite of the offer, not the new party's own SDP.
+    // That session is the one to complete, under the profile the script named
+    // for the pair it was about to create.
+    let own_anchor = state
+        .rtpengine_sessions
+        .as_ref()
+        .and_then(|store| store.get(&cid_new));
+    // The engine names the new party by its own From-tag, as the script's
+    // `rtpengine.offer` did and its `answer` and `delete` will.
+    let Some(new_tag) = own_anchor
+        .as_ref()
+        .map(|session| session.from_tag.clone())
+        .or_else(|| new_leg.dialog.remote_tag.clone())
+    else {
+        refuse(
+            488,
+            "Not Acceptable Here",
+            "the new party's INVITE carried no From tag",
+        );
+        return;
+    };
+    let engine_call = own_anchor
+        .as_ref()
+        .map(|session| session.rtpengine_id().to_string())
+        .unwrap_or_else(|| cid_new.clone());
+
+    // The answer is to the offer in hand (RFC 3264 §6.1). The survivor's last
+    // SDP belongs to the dialog being replaced, and a transferor puts that
+    // call on hold before it hands it over: replayed as it is, a new party
+    // that offered a stream both ways is answered `inactive`. The survivor is
+    // re-INVITEd with the new party's offer below, which takes it off hold.
+    let survivor_sdp = if crate::b2bua::bridge::offers_both_ways(&invite.body) {
+        crate::b2bua::bridge::set_media_direction(
+            &survivor_sdp,
+            crate::b2bua::bridge::MediaDirection::SendRecv,
+        )
+    } else {
+        survivor_sdp
+    };
 
     // The pre-takeover anchor, keyed on the replaced call's A-leg Call-ID.
     let old_anchor = state
@@ -121,11 +162,23 @@ pub fn b2bua_bridge_inbound_replaces(
                 .map(|session| (key, session))
         });
 
-    // Media. Anchored: re-offer the new party onto a fresh engine call-id and
-    // answer it with the survivor's already-negotiated SDP, so the 200 can go out
-    // now instead of waiting for the survivor's re-INVITE to come back.
-    // Unanchored: the two SDPs cross directly.
-    if let Some((_, session)) = &old_anchor {
+    // Media. Anchored: put the new party and the survivor on the new party's
+    // engine call and answer the new party with the survivor's SDP, so the 200
+    // can go out now instead of waiting for the survivor's re-INVITE to come
+    // back. Unanchored: the two SDPs cross directly.
+    //
+    // The pair's profile is the one the script anchored the taking-over INVITE
+    // with. A script that did not anchor it leaves the replaced call's own to
+    // inherit, which was written for the pair that call started as.
+    let pair_profile = own_anchor
+        .as_ref()
+        .map(|session| session.profile.clone())
+        .or_else(|| {
+            old_anchor
+                .as_ref()
+                .map(|(_, session)| session.profile.clone())
+        });
+    if let (None, Some((_, session))) = (&own_anchor, &old_anchor) {
         if state
             .rtpengine_profiles
             .as_ref()
@@ -136,41 +189,55 @@ pub fn b2bua_bridge_inbound_replaces(
             warn!(
                 call_id = %replaced_call_id,
                 profile = %session.profile,
-                "B2BUA Replaces: the call is anchored with a direction-bound media profile and the takeover re-pairs it — the surviving leg may be re-offered the replaced party's transport. A symmetric profile is required for takeovers across an SRTP or transcoding boundary."
+                "B2BUA Replaces: the taking-over INVITE was not anchored, so the takeover inherits the replaced call's direction-bound media profile — the new party is answered under the half written for the replaced one. Anchor the INVITE in @b2bua.on_invite (rtpengine.offer(call, profile=…)) to name the profile for the new pair."
             );
         }
     }
 
-    // Whose policy pins each party on the fresh engine call: the survivor
-    // keeps its own, the newcomer takes the replaced party's. Here the
-    // newcomer's SDP is the offer and the survivor's the answer.
-    let repaired = old_anchor
-        .as_ref()
-        .map(|(_, session)| RepairedIngress::of(None, session, &survivor_tag, false));
+    // Whose policy pins each party on the engine call. Under a profile the
+    // script named, as a dial's would: the newcomer's SDP is the offer and the
+    // survivor's the answer. Under an inherited one the survivor keeps its
+    // own and the newcomer takes the replaced party's.
+    let repaired = match (&own_anchor, &old_anchor) {
+        (Some(own), _) => Some(RepairedIngress::of(
+            Some(&own.profile),
+            own,
+            &survivor_tag,
+            false,
+        )),
+        (None, Some((_, session))) => {
+            Some(RepairedIngress::of(None, session, &survivor_tag, false))
+        }
+        (None, None) => None,
+    };
 
-    let (sdp_for_new_party, sdp_for_survivor) = match (&old_anchor, &repaired) {
-        (Some((_, session)), Some(repaired)) => {
-            let to_survivor = b2bua_transfer_rtpengine_offer(
-                state,
-                &cid_new,
-                &new_tag,
-                &invite.body,
-                &cid_new,
-                &session.profile,
-                Some(&PartyIngress {
-                    source: inbound.remote_addr.ip(),
-                    policy: repaired.joining.clone(),
-                }),
-            );
+    let (sdp_for_new_party, sdp_for_survivor) = match (&pair_profile, &repaired) {
+        (Some(profile), Some(repaired)) => {
+            let to_survivor = match &own_anchor {
+                // Offered already, by the script: the INVITE carries the result.
+                Some(_) => Some(invite.body.clone()),
+                None => b2bua_transfer_rtpengine_offer(
+                    state,
+                    &engine_call,
+                    &new_tag,
+                    &invite.body,
+                    &cid_new,
+                    profile,
+                    Some(&PartyIngress {
+                        source: inbound.remote_addr.ip(),
+                        policy: repaired.joining.clone(),
+                    }),
+                ),
+            };
             let to_new_party = b2bua_transfer_rtpengine_answer(
                 state,
-                &cid_new,
+                &engine_call,
                 &new_tag,
                 &survivor_tag,
                 &survivor_sdp,
                 &survivor.dialog.call_id,
                 &crate::rtpengine::session::SideFlags {
-                    profile: session.profile.clone(),
+                    profile: profile.clone(),
                     half: crate::rtpengine::session::ProfileHalf::Answer,
                 },
                 Some(&PartyIngress {
@@ -309,28 +376,25 @@ pub fn b2bua_bridge_inbound_replaces(
     // winning B-leg after the swap, always.
     b2bua_send_media_reinvite(&replaced_call_id, false, sdp_for_survivor, state);
 
-    // Re-key the media session onto the new A-leg Call-ID and drop the old
-    // anchor, mirroring the terminate-transfer re-anchor.
+    // The pair's media session, keyed on the new A-leg Call-ID, and the old
+    // anchor dropped, mirroring the terminate-transfer re-anchor.
+    if let (Some(profile), Some(store)) = (&pair_profile, state.rtpengine_sessions.as_ref()) {
+        // Each party's own ingress policy stays with the pair, for the next
+        // time this call is re-paired.
+        let bridge_sides = repaired
+            .as_ref()
+            .map(|repaired| repaired.sides(profile, true, true));
+        store.insert(takeover_session(
+            own_anchor,
+            &cid_new,
+            &new_tag,
+            &survivor_tag,
+            profile,
+            bridge_sides,
+        ));
+    }
     if let Some((old_key, old_session)) = &old_anchor {
         if let Some(store) = state.rtpengine_sessions.as_ref() {
-            store.insert(crate::rtpengine::session::MediaSession {
-                call_id: cid_new.clone(),
-                rtpengine_call_id: cid_new.clone(),
-                from_tag: new_tag.clone(),
-                to_tag: Some(survivor_tag.clone()),
-                profile: old_session.profile.clone(),
-                // A fresh engine call-id: any WebSocket bridge the old anchor
-                // held belonged to the call-id that just went away.
-                ws_uri: None,
-                ws_tee: None,
-                ws_bridge_attached: false,
-                // Each party's own ingress policy stays with the pair, for
-                // the next time this call is re-paired.
-                bridge_sides: repaired
-                    .as_ref()
-                    .map(|repaired| repaired.sides(&old_session.profile, true, true)),
-                created_at: std::time::Instant::now(),
-            });
             store.remove(old_key);
         }
         b2bua_transfer_rtpengine_delete(state, old_session.rtpengine_id(), &old_session.from_tag);

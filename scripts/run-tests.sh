@@ -700,6 +700,19 @@ if [[ "$RUN_B2BUA" == true ]]; then
   run_sipp env COMPOSE_PROFILES=b2bua-rtpengine-reoffer bash sipp/run_call.sh sipp-srtp-edge-reoffer-uac sipp-srtp-edge-reoffer-uas
   docker compose -f "$COMPOSE_FILE" --profile b2bua-rtpengine-reoffer down 2>/dev/null || true
 
+  # A held call at an SRTP edge is taken over with Replaces. The new caller must
+  # be answered RTP/SAVP with a key and off hold, the survivor re-INVITEd as
+  # plain RTP. Once per engine, with the same script, peer and checks.
+  echo "=== B2BUA Replaces takeover of a held call at an SRTP edge + REAL rtpengine ==="
+  docker compose -f "$COMPOSE_FILE" --profile b2bua-replaces-srtp-rtpengine up -d --wait rtpengine-real siphon-b2bua-replaces-srtp-rtpengine
+  run_sipp docker compose -f "$COMPOSE_FILE" --profile b2bua-replaces-srtp-rtpengine up --abort-on-container-exit --exit-code-from replaces-srtp-rtpengine-peer replaces-srtp-rtpengine-peer
+  docker compose -f "$COMPOSE_FILE" --profile b2bua-replaces-srtp-rtpengine down 2>/dev/null || true
+
+  echo "=== B2BUA Replaces takeover of a held call at an SRTP edge + REAL siphon-rtp ==="
+  docker compose -f "$COMPOSE_FILE" --profile b2bua-replaces-srtp-siphon-rtp up -d --wait siphon-rtp-engine siphon-b2bua-replaces-srtp-siphon-rtp
+  run_sipp docker compose -f "$COMPOSE_FILE" --profile b2bua-replaces-srtp-siphon-rtp up --abort-on-container-exit --exit-code-from replaces-srtp-siphon-rtp-peer replaces-srtp-siphon-rtp-peer
+  docker compose -f "$COMPOSE_FILE" --profile b2bua-replaces-srtp-siphon-rtp down 2>/dev/null || true
+
   echo "=== B2BUA CANCEL test (INVITE → CANCEL → 487) ==="
   run_sipp docker compose -f "$COMPOSE_FILE" --profile b2bua --profile b2bua-cancel up --abort-on-container-exit --exit-code-from sipp-b2bua-cancel-uac sipp-b2bua-cancel-uac sipp-b2bua-cancel-uas
   docker compose -f "$COMPOSE_FILE" --profile b2bua --profile b2bua-cancel rm -sf sipp-b2bua-cancel-uac sipp-b2bua-cancel-uas 2>/dev/null || true

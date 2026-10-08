@@ -234,11 +234,11 @@ def ack_for(party, response, call_id, from_tag, cseq):
     return "\r\n".join(lines) + "\r\n\r\n"
 
 
-def establish(alice, bob, label):
+def establish(alice, bob, label, caller_sdp=None):
     """Alice calls through siphon; Bob answers. Returns both dialogs' identifiers."""
     call_id = f"{label}-alice-{uuid.uuid4().hex[:8]}@{SELF_IP}"
     alice_tag = f"alice-{uuid.uuid4().hex[:8]}"
-    alice.send(invite(alice, call_id, alice_tag, "bob", sdp(1000, 40000)))
+    alice.send(invite(alice, call_id, alice_tag, "bob", caller_sdp or sdp(1000, 40000)))
 
     # An INITIAL INVITE only. A re-INVITE (or a retransmission of one) left over
     # from an earlier case carries a To-tag, and picking that up here would quote
@@ -279,6 +279,8 @@ def establish(alice, bob, label):
         "bob_tag": bob_tag,
         "siphon_b_tag": siphon_b_tag,
         "alice_contact": header(a_200, "Contact"),
+        "alice_answer": body_of(a_200),
+        "bob_offer": body_of(b_invite),
     }
 
 

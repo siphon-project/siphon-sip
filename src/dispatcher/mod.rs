@@ -254,6 +254,8 @@ mod stale_in_dialog_request_tests;
 #[cfg(test)]
 mod subscribe_reply_order_tests;
 #[cfg(test)]
+mod takeover_media_tests;
+#[cfg(test)]
 mod teardown_race_tests;
 #[cfg(test)]
 mod test_dispatcher;

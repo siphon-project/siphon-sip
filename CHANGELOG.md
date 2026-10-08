@@ -15,6 +15,13 @@ entry, but a working config keeps working.
 
 ### Changed
 
+- **The profile for a `Replaces` takeover is the one the script anchors the
+  taking-over INVITE with.** `rtpengine.offer(call, profile=…)` in
+  `@b2bua.on_invite` describes the new pair, the newcomer as offerer and the
+  survivor as answerer, exactly as it does for a dialled call. It used to be
+  ignored in favour of the replaced call's profile. The direction-bound warning
+  is now logged only when the INVITE was not anchored and the replaced call's
+  profile is inherited.
 - **A script handler that raises is logged with its script file, line number
   and Python traceback.** The log line used to carry the exception text alone
   (`TypeError: 'str' object cannot be interpreted as an integer`), which named
@@ -49,6 +56,24 @@ entry, but a working config keeps working.
   `srtp_to_srtp` profile the Teams-to-Teams case needs. The call-transfer
   cookbook carries the same table. No change to siphon itself: copy the handler
   if you based a script on the old example.
+- **A `Replaces` takeover of a call the script anchors no longer answers the
+  new caller without an SRTP key, or on hold.** The takeover runs after
+  `@b2bua.on_invite`, so a script that anchors its calls had already offered
+  the taking-over INVITE to the media engine, and the INVITE carried the
+  engine's rewrite of that offer. The takeover offered the rewritten SDP a
+  second time, under siphon's own dialog tag, so the engine saw an offerer with
+  none of the caller's transport or keys. At an SRTP edge the 200 came back
+  `RTP/SAVP` with no `a=crypto` (rtpengine) or as plain `RTP/AVP` (siphon-rtp),
+  and a peer that requires SRTP dropped the call and failed the transfer. The
+  takeover now completes the session the script opened, under the profile the
+  script named, and names the caller by its own From-tag. A script that leaves
+  the INVITE unanchored still has it offered once, now under that same tag.
+- **The new caller of a `Replaces` takeover is answered the direction it
+  offered.** The 200 was built from the surviving party's last SDP, and a
+  transferor puts the call on hold before handing it over, so a caller that
+  offered `sendrecv` was answered `inactive`. The answer is now to the offer in
+  hand (RFC 3264 §6.1); a caller that itself offers a held stream is answered
+  as before.
 
 ## [1.13.0] — 2026-10-06
 

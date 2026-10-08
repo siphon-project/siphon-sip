@@ -1745,6 +1745,27 @@ jobs:
           docker compose -f sipp/docker-compose.yaml --profile b2bua-rtpengine-reoffer up -d --wait rtpengine-real siphon-b2bua-rtpengine-reoffer
           COMPOSE_PROFILES=b2bua-rtpengine-reoffer bash sipp/run_call.sh sipp-srtp-edge-reoffer-uac sipp-srtp-edge-reoffer-uas
 
+      # A held call at an SRTP edge is taken over with Replaces. The script
+      # anchors the taking-over INVITE like any other, so the takeover has to
+      # finish that media session: the new caller must be answered RTP/SAVP
+      # with a key and off hold, and the survivor re-INVITEd as plain RTP.
+      # Once per engine, with the same script, peer and checks.
+      - name: B2BUA Replaces takeover of a held call at an SRTP edge + REAL rtpengine
+        run: |
+          docker compose -f sipp/docker-compose.yaml --profile b2bua-replaces-srtp-rtpengine up -d --wait rtpengine-real siphon-b2bua-replaces-srtp-rtpengine
+          docker compose -f sipp/docker-compose.yaml --profile b2bua-replaces-srtp-rtpengine up \
+            --abort-on-container-exit --exit-code-from replaces-srtp-rtpengine-peer \
+            replaces-srtp-rtpengine-peer | tee replaces-srtp-rtpengine.log
+          grep -q 'REPLACES-SRTP-VERDICT .*"ok": true' replaces-srtp-rtpengine.log
+
+      - name: B2BUA Replaces takeover of a held call at an SRTP edge + REAL siphon-rtp
+        run: |
+          docker compose -f sipp/docker-compose.yaml --profile b2bua-replaces-srtp-siphon-rtp up -d --wait siphon-rtp-engine siphon-b2bua-replaces-srtp-siphon-rtp
+          docker compose -f sipp/docker-compose.yaml --profile b2bua-replaces-srtp-siphon-rtp up \
+            --abort-on-container-exit --exit-code-from replaces-srtp-siphon-rtp-peer \
+            replaces-srtp-siphon-rtp-peer | tee replaces-srtp-siphon-rtp.log
+          grep -q 'REPLACES-SRTP-VERDICT .*"ok": true' replaces-srtp-siphon-rtp.log
+
       - name: Collect logs
         if: always()
         run: |
@@ -1752,11 +1773,14 @@ jobs:
           docker compose -f sipp/docker-compose.yaml logs siphon-b2bua-refer-modes >> siphon-b2bua-refer.log 2>&1 || true
           docker compose -f sipp/docker-compose.yaml logs siphon-b2bua-rtpengine-refer >> siphon-b2bua-refer.log 2>&1 || true
           docker compose -f sipp/docker-compose.yaml logs siphon-b2bua-rtpengine-reoffer >> siphon-b2bua-refer.log 2>&1 || true
+          docker compose -f sipp/docker-compose.yaml logs siphon-b2bua-replaces-srtp-rtpengine >> siphon-b2bua-refer.log 2>&1 || true
+          docker compose -f sipp/docker-compose.yaml logs siphon-b2bua-replaces-srtp-siphon-rtp >> siphon-b2bua-refer.log 2>&1 || true
           docker compose -f sipp/docker-compose.yaml logs rtpengine-real > rtpengine-real.log 2>&1 || true
+          docker compose -f sipp/docker-compose.yaml logs siphon-rtp-engine > siphon-rtp-engine.log 2>&1 || true
 
       - name: Teardown
         if: always()
-        run: docker compose -f sipp/docker-compose.yaml --profile b2bua --profile b2bua-refer --profile b2bua-refer-reject --profile b2bua-refer-terminate --profile b2bua-refer-referrer-bye --profile b2bua-refer-attended --profile b2bua-replaces --profile b2bua-bleg-ack --profile b2bua-rtpengine-refer --profile b2bua-rtpengine-reoffer down --remove-orphans
+        run: docker compose -f sipp/docker-compose.yaml --profile b2bua --profile b2bua-refer --profile b2bua-refer-reject --profile b2bua-refer-terminate --profile b2bua-refer-referrer-bye --profile b2bua-refer-attended --profile b2bua-replaces --profile b2bua-bleg-ack --profile b2bua-rtpengine-refer --profile b2bua-rtpengine-reoffer --profile b2bua-replaces-srtp-rtpengine --profile b2bua-replaces-srtp-siphon-rtp down --remove-orphans
 
       - name: Upload logs
         if: always()

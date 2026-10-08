@@ -341,8 +341,14 @@ automatically suit the party that replaces it. If the two halves of your profile
 are not interchangeable, name the profile explicitly on transfer.
 
 This is not specific to `REFER`: an inbound `INVITE` with `Replaces` re-pairs the
-call the same way, and warns the same way. Transfers across an SRTP or
-transcoding boundary want a symmetric profile on the surviving pair.
+call the same way. There the profile is named the way it is for any other call,
+by anchoring the INVITE in `@b2bua.on_invite`: the takeover runs after that
+handler and completes the media session it opened, so the profile passed to
+`rtpengine.offer(call, profile=…)` describes the new pair, the newcomer as the
+offerer and the survivor as the answerer. A script that anchors every INVITE
+needs nothing extra. One that leaves the taking-over INVITE unanchored makes the
+takeover inherit the replaced call's profile, and siphon warns when that one is
+direction-bound.
 
 ### Media anchoring (terminate mode)
 
