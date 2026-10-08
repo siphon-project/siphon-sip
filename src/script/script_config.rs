@@ -292,6 +292,12 @@ impl ScriptConfigStore {
     /// an empty table routes nothing while the node reports healthy.
     pub fn from_file(path: impl Into<PathBuf>) -> Result<Self> {
         let path = path.into();
+        // Held absolute: a relative path that was not found beside
+        // `siphon.yaml` is read from the working directory, and an error or a
+        // log line naming only `tables/routes.yaml` leaves the operator to
+        // work out which directory that was. It also keeps every later reload
+        // on the same file whatever the working directory becomes.
+        let path = std::path::absolute(&path).unwrap_or(path);
         let text = std::fs::read_to_string(&path).map_err(|error| {
             SiphonError::Config(format!(
                 "script_config: cannot read {}: {error}",
@@ -744,6 +750,20 @@ mod tests {
             .to_string();
         assert!(
             error.contains("script_config: cannot read") && error.contains("absent.yaml"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// A relative path is reported as the absolute path it was read from.
+    #[test]
+    fn a_relative_path_is_named_in_full() {
+        let relative = "script-config-test-absent/routes.yaml";
+        let expected = std::env::current_dir().unwrap().join(relative);
+        let error = ScriptConfigStore::from_file(relative)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(&format!("cannot read {}", expected.display())),
             "unexpected error: {error}"
         );
     }
