@@ -13,6 +13,8 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
+## [1.13.1] — 2026-10-08
+
 ### Added
 
 - **siphon logs the Python interpreter it embeds at startup.** One `python
@@ -47,7 +49,6 @@ entry, but a working config keeps working.
     container image does. An extension module without free-threading support
     no longer turns the GIL back on when a script imports it. If such a module
     misbehaves without the GIL, drop the variable with `systemctl edit siphon`.
-
 - **The profile for a `Replaces` takeover is the one the script anchors the
   taking-over INVITE with.** `rtpengine.offer(call, profile=…)` in
   `@b2bua.on_invite` describes the new pair, the newcomer as offerer and the
