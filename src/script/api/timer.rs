@@ -155,12 +155,12 @@ def make_decorator(seconds, name, jitter):
                         Ok(returned) => {
                             if is_async {
                                 if let Err(error) = run_coroutine(python, &returned) {
-                                    error!(%error, key = %key_clone, "async timer handler error");
+                                    error!(error = %crate::script::error_report::describe(python, &error), key = %key_clone, "async timer handler error");
                                 }
                             }
                         }
                         Err(error) => {
-                            error!(%error, key = %key_clone, "timer handler failed");
+                            error!(error = %crate::script::error_report::describe(python, &error), key = %key_clone, "timer handler failed");
                         }
                     }
                 });

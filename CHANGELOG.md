@@ -13,6 +13,21 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
+### Changed
+
+- **A script handler that raises is logged with its script file, line number
+  and Python traceback.** The log line used to carry the exception text alone
+  (`TypeError: 'str' object cannot be interpreted as an integer`), which named
+  neither the script nor the line. The first line now ends with
+  `(at /etc/siphon/script.py:142 in route_call)` and the standard
+  `Traceback (most recent call last):` block follows, chained exceptions
+  included. Applies to every handler and callback (`proxy`, `b2bua`,
+  `registrar`, `registration`, `timer`, `rtpengine`, `diameter`, `sbi`, `srs`)
+  and to a script that fails while loading. These log entries are now
+  multi-line; a line-oriented parser should key on the first line. The async
+  `@b2bua.on_answer` failure now counts in `siphon_script_errors_total` like
+  its sync twin.
+
 ## [1.13.0] — 2026-10-06
 
 ### Added

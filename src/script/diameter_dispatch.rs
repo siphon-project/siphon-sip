@@ -818,7 +818,7 @@ fn build_answer_via_handler(
                     Err(error) => {
                         error!(
                             handler = %handler_name(handler_callable),
-                            %error,
+                            error = %crate::script::error_report::describe(python, &error),
                             "Diameter server: async on_request handler raised; answering 5012"
                         );
                         let answer = cannot_comply("on_request handler raised");
@@ -836,7 +836,7 @@ fn build_answer_via_handler(
         Err(error) => {
             error!(
                 handler = %handler_name(handler_callable),
-                %error,
+                error = %crate::script::error_report::describe(python, &error),
                 "Diameter server: on_request handler raised; answering 5012"
             );
             let answer = cannot_comply("on_request handler raised");
@@ -926,11 +926,13 @@ fn run_on_reply(
         {
             Ok(value) if handler.is_async => {
                 if let Err(error) = run_coroutine_value(python, &value) {
-                    warn!(%error, "Diameter server: async on_reply failed");
+                    warn!(error = %crate::script::error_report::describe(python, &error), "Diameter server: async on_reply failed");
                 }
             }
             Ok(_) => {}
-            Err(error) => warn!(%error, "Diameter server: on_reply handler raised"),
+            Err(error) => {
+                warn!(error = %crate::script::error_report::describe(python, &error), "Diameter server: on_reply handler raised")
+            }
         }
     }
     ran

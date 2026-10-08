@@ -215,7 +215,7 @@ pub(super) fn handle_srs_invite(
                                 }
                             }
                             Err(error) => {
-                                warn!(call_id = %call_id, error = %error, "SRS: on_invite handler error");
+                                warn!(call_id = %call_id, error = %crate::script::error_report::describe(python, &error), "SRS: on_invite handler error");
                             }
                         }
                     }
@@ -547,7 +547,7 @@ pub(super) fn handle_srs_bye(
                                 if let Err(error) =
                                     handler.callable.call1(python, (py_sess.clone_ref(python),))
                                 {
-                                    warn!(call_id = %call_id, error = %error, "SRS: on_session_end handler error");
+                                    warn!(call_id = %call_id, error = %crate::script::error_report::describe(python, &error), "SRS: on_session_end handler error");
                                 }
                             }
                         }

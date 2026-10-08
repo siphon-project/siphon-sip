@@ -309,7 +309,7 @@ pub fn spawn_registrar_events(
                                     if handler.is_async {
                                         if let Err(error) = run_coroutine(python, &ret) {
                                             tracing::error!(
-                                                %error,
+                                                error = %crate::script::error_report::describe(python, &error),
                                                 "async registrar.on_change handler error"
                                             );
                                         }
@@ -317,7 +317,7 @@ pub fn spawn_registrar_events(
                                 }
                                 Err(error) => {
                                     tracing::error!(
-                                        %error,
+                                        error = %crate::script::error_report::describe(python, &error),
                                         "registrar.on_change handler failed"
                                     );
                                 }
@@ -402,7 +402,7 @@ pub fn spawn_registrant_events(state: &Arc<DispatcherState>) {
                                     if handler.is_async {
                                         if let Err(error) = run_coroutine(python, &ret) {
                                             tracing::error!(
-                                                %error,
+                                                error = %crate::script::error_report::describe(python, &error),
                                                 "async registration.on_change handler error"
                                             );
                                         }
@@ -410,7 +410,7 @@ pub fn spawn_registrant_events(state: &Arc<DispatcherState>) {
                                 }
                                 Err(error) => {
                                     tracing::error!(
-                                        %error,
+                                        error = %crate::script::error_report::describe(python, &error),
                                         "registration.on_change handler failed"
                                     );
                                 }
