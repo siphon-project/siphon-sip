@@ -980,4 +980,145 @@ mod tests {
             );
         }
     }
+
+    /// Publish `text` the way a Kubernetes ConfigMap volume is updated: the
+    /// content goes into a new directory and `..data` is swapped onto it by a
+    /// rename, so `routes.yaml -> ..data/routes.yaml` changes without the file
+    /// the store was given ever being written.
+    #[cfg(unix)]
+    fn publish_to_mount(mount: &Path, version: &str, text: &str) {
+        use std::os::unix::fs::symlink;
+
+        let directory = mount.join(format!("..{version}"));
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("routes.yaml"), text).unwrap();
+        let staged = mount.join("..data_tmp");
+        let _ = std::fs::remove_file(&staged);
+        symlink(format!("..{version}"), &staged).unwrap();
+        std::fs::rename(&staged, mount.join("..data")).unwrap();
+        let file = mount.join("routes.yaml");
+        if std::fs::symlink_metadata(&file).is_err() {
+            symlink("..data/routes.yaml", &file).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reload_follows_a_swapped_symlinked_mount() {
+        let mount = tempfile::tempdir().unwrap();
+        publish_to_mount(mount.path(), "v1", "gateway: carrier-a\n");
+        let store = ScriptConfigStore::from_file(mount.path().join("routes.yaml")).unwrap();
+        assert_eq!(
+            lookup(&store.snapshot(), "gateway").unwrap().as_str(),
+            Some("carrier-a")
+        );
+
+        publish_to_mount(mount.path(), "v2", "gateway: carrier-b\n");
+        assert_eq!(store.reload(), ReloadOutcome::Reloaded);
+        assert_eq!(
+            lookup(&store.snapshot(), "gateway").unwrap().as_str(),
+            Some("carrier-b")
+        );
+
+        // A swap onto a table that does not parse keeps the last good one.
+        publish_to_mount(mount.path(), "v3", "gateway: [unterminated\n");
+        assert!(matches!(store.reload(), ReloadOutcome::Failed(_)));
+        assert_eq!(
+            lookup(&store.snapshot(), "gateway").unwrap().as_str(),
+            Some("carrier-b")
+        );
+    }
+
+    /// The watcher end to end on such a mount: nothing writes the file the
+    /// store names, only `..data` moves, and the snapshot still follows.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_watcher_reloads_when_a_symlinked_mount_is_swapped() {
+        let mount = tempfile::tempdir().unwrap();
+        publish_to_mount(mount.path(), "v0", "gateway: carrier-a\n");
+        let store =
+            Arc::new(ScriptConfigStore::from_file(mount.path().join("routes.yaml")).unwrap());
+        spawn_file_watcher(&store);
+
+        // Swap until the watcher has picked one up: the watch is installed on
+        // a blocking thread, so the first swap can precede it.
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
+            publish_to_mount(
+                mount.path(),
+                &format!("v{attempt}"),
+                &format!("gateway: carrier-b\nattempt: {attempt}\n"),
+            );
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let snapshot = store.snapshot();
+            if lookup(&snapshot, "gateway").unwrap().as_str() == Some("carrier-b") {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the watcher never reloaded the swapped mount"
+            );
+        }
+    }
+
+    /// SIGHUP reaches the store. Runs in a process of its own, since the
+    /// signal goes to the whole process.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sighup_rereads_the_file() {
+        crate::own_process::run(
+            concat!(module_path!(), "::sighup_rereads_the_file"),
+            sighup_rereads_the_file_in_this_process,
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn sighup_rereads_the_file_in_this_process() {
+        use tokio::signal::unix::{signal, SignalKind};
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("routes.yaml");
+            std::fs::write(&path, "gateway: carrier-a\n").unwrap();
+            let store = Arc::new(ScriptConfigStore::from_file(&path).unwrap());
+
+            // The reloader installs its handler from a spawned task. Until a
+            // handler exists SIGHUP ends the process, so one is installed
+            // here first; the reloader's own then shares the signal.
+            let _held = signal(SignalKind::hangup()).unwrap();
+            spawn_sighup_reloader(Arc::clone(&store));
+
+            std::fs::write(&path, "gateway: carrier-b\n").unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                // SAFETY: `kill` with our own pid and a valid signal number.
+                let sent = unsafe { libc::kill(libc::getpid(), libc::SIGHUP) };
+                assert_eq!(sent, 0, "SIGHUP could not be sent");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                if lookup(&store.snapshot(), "gateway").unwrap().as_str() == Some("carrier-b") {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "SIGHUP never reloaded the file"
+                );
+            }
+        });
+    }
+
+    /// A store that is not file-backed installs no SIGHUP handler at all.
+    #[tokio::test]
+    async fn the_sighup_reloader_is_a_no_op_for_an_inline_store() {
+        let store = Arc::new(ScriptConfigStore::inline(document("gateway: carrier-a\n")).unwrap());
+        spawn_sighup_reloader(Arc::clone(&store));
+        tokio::task::yield_now().await;
+        // Nothing was spawned that holds the store.
+        assert_eq!(Arc::strong_count(&store), 1);
+    }
 }
