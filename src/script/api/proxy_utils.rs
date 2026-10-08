@@ -308,9 +308,17 @@ impl PyProxyUtils {
 
     /// Look up a phone number via ENUM (DNS NAPTR) query.
     ///
-    /// Converts a number like "+12125551234" to a DNS query against
-    /// `4.3.2.1.5.5.5.2.1.2.1.e164.arpa` and returns the SIP URI
-    /// from the first matching NAPTR record, or `None`.
+    /// Converts a number like "+441632960083" to a DNS query against
+    /// `3.8.0.0.6.9.2.3.6.1.4.4.e164.arpa.` and returns the URI the NAPTR
+    /// records there yield for it (RFC 6116), or `None`.
+    ///
+    /// The records are taken by order, then preference. The first terminal
+    /// (`u` flag) record that offers one of the Enumservices named in
+    /// `service` and whose regular expression matches the number (written
+    /// with its leading `+`) gives the result: its replacement, with
+    /// back-references filled in. `service` is an
+    /// `E2U+enumservice[+enumservice...]` field, compared without case.
+    /// Non-terminal records are not followed.
     #[pyo3(signature = (number, suffix="e164.arpa.", service="E2U+sip"))]
     fn enum_lookup<'py>(
         &self,
@@ -324,8 +332,7 @@ impl PyProxyUtils {
         let service = service.to_string();
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let enum_result = enum_naptr_lookup(&resolver, &number, &suffix, &service).await;
-            Ok(enum_result)
+            Ok(resolver.enum_lookup(&number, &suffix, &service).await)
         })
     }
 
@@ -871,39 +878,6 @@ fn build_send_request_message(
     SendRequestInputs::extract(method, headers, body)?
         .build(uri, transport, local_sent_by)
         .map_err(pyo3::exceptions::PyRuntimeError::new_err)
-}
-
-/// Perform ENUM NAPTR lookup for a phone number.
-async fn enum_naptr_lookup(
-    resolver: &SipResolver,
-    number: &str,
-    suffix: &str,
-    _service: &str,
-) -> Option<String> {
-    // Strip leading '+' and non-digit characters
-    let digits: String = number.chars().filter(|c| c.is_ascii_digit()).collect();
-    if digits.is_empty() {
-        return None;
-    }
-
-    // Reverse digits and join with dots: +12125551234 → 4.3.2.1.5.5.5.2.1.2.1
-    let reversed: String = digits
-        .chars()
-        .rev()
-        .map(|c| c.to_string())
-        .collect::<Vec<_>>()
-        .join(".");
-
-    let query_name = format!("{reversed}.{suffix}");
-
-    // Use the resolver's inner hickory resolver for NAPTR
-    match resolver.naptr_lookup(&query_name).await {
-        Some(uri) => Some(uri),
-        None => {
-            tracing::debug!(query = %query_name, "ENUM NAPTR lookup returned no results");
-            None
-        }
-    }
 }
 
 /// Read RSS and total memory from /proc on Linux.

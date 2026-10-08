@@ -13,6 +13,33 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`proxy.enum_lookup` selects and rewrites NAPTR records the way RFC 6116
+  and RFC 3402 / 3403 specify.** It used to return the first `E2U+sip` record
+  in the order the resolver answered, ignore its `service` argument, and
+  return the replacement text as written, so a record such as
+  `!^(.*)$!sip:\1@example.com!` came back with a literal `\1`. Now:
+  - Records are taken by order, then preference.
+  - `service` is honoured. It is an `E2U+enumservice[+enumservice...]` field,
+    compared without case and by whole Enumservice (`E2U+sip` no longer
+    matches a record that offers only `sips`); a compound record matches when
+    it offers any of the requested ones. The obsolete `sip+E2U` form is still
+    read.
+  - The regular expression is matched against the number written with its
+    leading `+`, a record whose expression does not match is skipped, and
+    back-references `\1` to `\9` and the `i` flag are applied. Any delimiter
+    is accepted, not only `!`.
+  - Only a terminal `u` record yields a result. A record without a usable
+    expression, or whose output is not an absolute URI, is skipped and the
+    next one is considered. The domain name in a record's Replacement field
+    is no longer returned as if it were a URI. Non-terminal records are not
+    followed.
+
+  The signature and the return type are unchanged. A zone that relied on the
+  answer order, or on the expression not being matched, can now resolve to a
+  different record or to `None`.
+
 ## [1.13.1] — 2026-10-08
 
 ### Added

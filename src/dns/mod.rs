@@ -6,6 +6,7 @@
 //! 3. If no port, do SRV lookup (`_sip._udp.host`, `_sip._tcp.host`, etc.)
 //!    and fall back to A/AAAA on port 5060 if no SRV records exist.
 
+pub mod enum_naptr;
 mod resolver;
 
 pub use resolver::SipResolver;
