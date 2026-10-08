@@ -349,7 +349,7 @@ impl DiameterClient {
         &self,
         user_name: &str,
         sc_address: &str,
-        delivery_outcome: u32,
+        delivery_outcome: &s6c::SmDeliveryOutcome,
     ) -> Result<codec::DiameterMessage, String> {
         let session_id = self.peer.new_session_id();
         let wire = s6c::build_report_sm_delivery_status_request(

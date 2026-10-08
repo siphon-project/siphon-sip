@@ -2488,6 +2488,31 @@ log:
 #   @b2bua.* handler does.
 
 # ---------------------------------------------------------------------------
+# Script configuration: tables the script reads through `config`
+# ---------------------------------------------------------------------------
+# Routes, rule lists and policy the script walks, kept out of the script so
+# they can change without touching it. Read with config.get("routes.default")
+# / config.require("routes.prefixes"). ${VAR} / ${VAR:-default} are expanded.
+#
+# Either the path of a YAML file, watched and reloaded under script.reload:
+# auto and read again on SIGHUP and POST /admin/script/reload in both modes (a
+# file that stops parsing keeps the last good one serving, a file missing at
+# startup stops siphon):
+#
+# script_config: /etc/siphon/routes.yaml
+#
+# or the document itself, fixed for the life of the process:
+#
+# script_config:
+#   routes:
+#     default: gateway-a.example.com
+#     prefixes:
+#       - prefix: "+1555"
+#         gateway: gateway-b.example.com
+#
+# See docs/reference/script-config.md.
+
+# ---------------------------------------------------------------------------
 # Extensions — protocols beyond SIP
 # ---------------------------------------------------------------------------
 # Each entry names a module and points at that module's own config file. A

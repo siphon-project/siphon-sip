@@ -391,6 +391,25 @@ pub struct Config {
     /// (when they consume the value directly).
     #[serde(default)]
     pub extensions: Option<IndexMap<String, serde_yaml_ng::Value>>,
+
+    /// Structured configuration for the script, read through the `config`
+    /// script namespace. Opaque to siphon-core: the script gives it meaning.
+    ///
+    /// Either the document itself, or the path of a YAML file holding it. The
+    /// file form is watched and reloaded while siphon runs; a relative path is
+    /// resolved like `script.path`.
+    ///
+    /// ```yaml
+    /// script_config: /etc/siphon/routes.yaml    # path form
+    ///
+    /// script_config:                            # inline form
+    ///   routes:
+    ///     default: { gateway: carrier-a }
+    /// ```
+    ///
+    /// See [`crate::script::script_config`].
+    #[serde(default)]
+    pub script_config: Option<serde_yaml_ng::Value>,
 }
 
 // ---------------------------------------------------------------------------
@@ -420,8 +439,8 @@ impl Config {
         Ok(config)
     }
 
-    /// Re-anchor a relative `script.path` / `script.include_paths` on the
-    /// directory holding the config file.
+    /// Re-anchor a relative `script.path` / `script.include_paths` / path-form
+    /// `script_config` on the directory holding the config file.
     ///
     /// Both are resolved against the process working directory
     /// (`ScriptEngine::new` does `PathBuf::from(&config.path)`), which is fine
@@ -463,6 +482,9 @@ impl Config {
         anchor(&mut self.script.path);
         for include_path in &mut self.script.include_paths {
             anchor(include_path);
+        }
+        if let Some(serde_yaml_ng::Value::String(script_config_path)) = &mut self.script_config {
+            anchor(script_config_path);
         }
     }
 

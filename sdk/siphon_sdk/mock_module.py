@@ -7665,15 +7665,64 @@ class MockDiameter:
         }
 
     async def s6c_rsr(self, user_name: str, sc_address: str,
-                delivery_outcome: int) -> Optional[dict]:
+                delivery_outcome: int, node: str = "mme",
+                absent_user_diagnostic: Optional[int] = None) -> Optional[dict]:
         """Mock Report-SM-Delivery-Status. Records the call on
-        ``self.rsrs`` for assertions and returns a 2001."""
+        ``self.rsrs`` for assertions and returns a 2001.
+
+        Args:
+            user_name: IMSI of the served subscriber.
+            sc_address: Address of the service centre.
+            delivery_outcome: ``0`` successful transfer, ``1`` absent user,
+                ``2`` UE memory capacity exceeded. siphon sends it as the
+                SM-Delivery-Cause of TS 29.338.
+            node: The node the delivery was attempted through: ``"mme"``
+                (default), ``"sgsn"``, ``"msc"`` or ``"ip_sm_gw"``, compared
+                without case. The HSS keeps its message waiting flags per
+                node, so name the one the message went to: ``"sgsn"`` when
+                ``s6c_srr`` located no MME and the forward went to
+                ``sgsn_name``. Selects the group inside SM-Delivery-Outcome.
+            absent_user_diagnostic: Optional Absent-User-Diagnostic-SM, why
+                the node found the user absent (TS 23.040 clause 3.3.2, e.g.
+                ``1`` IMSI detached, ``6`` GPRS detached). Only with
+                ``delivery_outcome=1``.
+
+        Raises:
+            ValueError: ``delivery_outcome`` is not 0, 1 or 2, ``node`` is
+                not one of the four, or ``absent_user_diagnostic`` is given
+                for a delivery that did not end in an absent user.
+
+        Example::
+
+            located = await diameter.s6c_srr(msisdn, sc_address)
+            node = "mme" if located["mme_name"] else "sgsn"
+            ...
+            await diameter.s6c_rsr(located["user_name"], sc_address, 1,
+                                   node=node, absent_user_diagnostic=6)
+        """
+        if delivery_outcome not in (0, 1, 2):
+            raise ValueError(
+                f"invalid delivery_outcome: {delivery_outcome} — expected 0 "
+                "(successful transfer), 1 (absent user) or 2 (UE memory "
+                "capacity exceeded)"
+            )
+        if not isinstance(node, str) or node.lower() not in ("mme", "sgsn", "msc", "ip_sm_gw"):
+            raise ValueError(
+                f'invalid node: "{node}" — expected "mme", "sgsn", "msc" or "ip_sm_gw"'
+            )
+        if absent_user_diagnostic is not None and delivery_outcome != 1:
+            raise ValueError(
+                "absent_user_diagnostic is only sent with delivery_outcome 1 "
+                f"(absent user), not {delivery_outcome}"
+            )
         if not hasattr(self, "rsrs"):
             self.rsrs = []
         self.rsrs.append({
             "user_name": user_name,
             "sc_address": sc_address,
             "delivery_outcome": delivery_outcome,
+            "node": node.lower(),
+            "absent_user_diagnostic": absent_user_diagnostic,
         })
         return {
             "result_code": 2001,
@@ -9917,6 +9966,164 @@ _numbers = MockNumbersNamespace()
 
 
 # ---------------------------------------------------------------------------
+# config namespace: operator-supplied script configuration (script_config:)
+# ---------------------------------------------------------------------------
+
+class MockScriptConfig:
+    """Mock ``config`` namespace: read access to the ``script_config:`` document.
+
+    ``script_config:`` in ``siphon.yaml`` holds the tables a script walks
+    (routes, rule lists, policy), either inline or as the path of a YAML file
+    that siphon watches and reloads. The script reads it at the moment it needs
+    a value, so a reload is seen by the next call::
+
+        from siphon import b2bua, config
+
+        @b2bua.on_invite
+        def route(call):
+            number = call.ruri.user
+            gateway = config.require("routes.default")
+            # Longest prefix first, one narrow lookup per length.
+            for length in range(len(number), 0, -1):
+                found = config.get("routes.by_prefix." + number[:length])
+                if found is not None:
+                    gateway = found
+                    break
+            call.dial(f"sip:{number}@{gateway}")
+
+    Every call returns a new copy: changing what you were handed changes
+    nothing for the next caller. The copy costs as much as the value is large,
+    so on a per-message path ask for the narrowest key rather than the whole
+    document, and key a table that grows (``by_prefix: {"+1555": ...}``)
+    instead of walking a list of its rows.
+
+    In a test, hand the mock the document the script should see::
+
+        mock_module.get_script_config().set({
+            "routes": {"default": "gateway-a.example.com", "by_prefix": {}},
+        })
+    """
+
+    def __init__(self) -> None:
+        self._document: dict = {}
+
+    def set(self, document: dict) -> None:
+        """Test helper: replace the document, as a reload of the file would.
+
+        Args:
+            document: The new top-level mapping, as plain data.
+
+        Raises:
+            TypeError: ``document`` is not a ``dict``.
+        """
+        if not isinstance(document, dict):
+            raise TypeError("script_config: the top level must be a mapping")
+        self._document = self._copy(document)
+
+    def clear(self) -> None:
+        """Test helper: back to an empty document."""
+        self._document = {}
+
+    def get(self, key: str, default: Any = None) -> Any:
+        """Return the value at ``key``, or ``default`` when it is not set.
+
+        Args:
+            key: A dotted path into the document, e.g. ``"routes.default"``.
+                Each segment is a mapping key or a zero-based sequence index;
+                a mapping key written as an integer in YAML (``31: nl``) is
+                matched by the segment ``31``. ``""`` is the whole document.
+                A key that itself contains a dot cannot be named this way:
+                fetch its parent and index that.
+            default: Returned when the path does not resolve.
+
+        Returns:
+            Plain data (``dict``, ``list``, ``str``, ``int``, ``float``,
+            ``bool`` or ``None``) as a new copy on every call. A key that is
+            set to ``null`` returns ``None``, not ``default``.
+
+        Example::
+
+            gateway = config.get("routes.default.gateway", "carrier-a")
+        """
+        try:
+            return self._copy(self._lookup(key))
+        except LookupError:
+            return default
+
+    def require(self, key: str) -> Any:
+        """Return the value at ``key``, or raise when it is not set.
+
+        Args:
+            key: A dotted path into the document, as for :meth:`get`.
+
+        Returns:
+            The value, as a new copy on every call.
+
+        Raises:
+            LookupError: The path does not resolve, or resolves to ``null``.
+                The message names the key and the segment it stopped at.
+
+        Example::
+
+            prefixes = config.require("routes.prefixes")
+        """
+        value = self._lookup(key)
+        if value is None:
+            raise LookupError(f'script_config key "{key}" is set to null')
+        return self._copy(value)
+
+    def _lookup(self, key: str) -> Any:
+        current: Any = self._document
+        if key == "":
+            return current
+        consumed: list[str] = []
+        for segment in key.split("."):
+            parent = ".".join(consumed)
+            found = False
+            if isinstance(current, dict):
+                if segment in current:
+                    current, found = current[segment], True
+                elif re.fullmatch(r"-?[0-9]+", segment) and int(segment) in current:
+                    current, found = current[int(segment)], True
+            elif isinstance(current, list):
+                if segment.isascii() and segment.isdigit() and int(segment) < len(current):
+                    current, found = current[int(segment)], True
+            else:
+                raise LookupError(
+                    f'script_config key "{key}" is not set '
+                    f'("{parent}" is {self._describe(current)}, not a mapping or a sequence)'
+                )
+            if not found:
+                where = f'under "{parent}"' if parent else "at the top level"
+                raise LookupError(
+                    f'script_config key "{key}" is not set (no "{segment}" {where})'
+                )
+            consumed.append(segment)
+        return current
+
+    @staticmethod
+    def _describe(value: Any) -> str:
+        if value is None:
+            return "null"
+        if isinstance(value, bool):
+            return "a boolean"
+        if isinstance(value, (int, float)):
+            return "a number"
+        return "a string"
+
+    @classmethod
+    def _copy(cls, value: Any) -> Any:
+        if isinstance(value, dict):
+            return {key: cls._copy(child) for key, child in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [cls._copy(child) for child in value]
+        return value
+
+
+_script_config = MockScriptConfig()
+
+
+# ---------------------------------------------------------------------------
 # QoS namespace — SDP → IPFilterRule helper
 # ---------------------------------------------------------------------------
 
@@ -10184,6 +10391,7 @@ def install() -> ModuleType:
     mod.sdp = _sdp  # type: ignore[attr-defined]
     mod.numbers = _numbers  # type: ignore[attr-defined]
     mod.qos = _qos  # type: ignore[attr-defined]
+    mod.config = _script_config  # type: ignore[attr-defined]
     # LCR namespace (B2BUA-only) + the Route / LcrDecision types (mirrors the
     # Rust module.add_class::<Route>() / <LcrDecision>() top-level registration).
     mod.lcr = _lcr  # type: ignore[attr-defined]
@@ -10239,6 +10447,7 @@ def reset() -> None:
     _ipsec.clear()
     _stir.clear()
     _numbers.clear()
+    _script_config.clear()
     _smpp.clear()
     _http.clear()
     _lcr.clear()
@@ -10266,6 +10475,16 @@ def get_numbers() -> MockNumbersNamespace:
         mock_module.get_numbers().register_policy("teams-outbound@2026", default="e164")
     """
     return _numbers
+
+
+def get_script_config() -> MockScriptConfig:
+    """Access the mock config namespace singleton (test helper).
+
+    Give the script under test the ``script_config:`` document it should see::
+
+        mock_module.get_script_config().set({"routes": {"default": "gateway-a.example.com"}})
+    """
+    return _script_config
 
 
 def get_smpp() -> MockSmpp:
