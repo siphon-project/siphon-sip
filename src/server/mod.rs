@@ -1090,6 +1090,9 @@ impl SiphonServer {
             }))
         };
 
+        // After the script load, so a GIL its imports re-enabled is reported.
+        crate::script::runtime_info::log_python_runtime();
+
         // Start file watcher for hot-reload (no-op for embedded scripts, and
         // under `reload: sighup`, where the signal below is the only trigger).
         spawn_file_watcher(Arc::clone(&engine));

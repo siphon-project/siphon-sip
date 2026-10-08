@@ -191,6 +191,21 @@ native build, install a free-threaded interpreter (for example with
 `uv python install 3.14+freethreaded`) and point `PYO3_PYTHON` at it when you're
 tuning for throughput.
 
+The interpreter is chosen when SIPhon is **compiled**, not when it starts: the
+binary links the `libpython` that `PYO3_PYTHON` pointed at. Installing another
+Python afterwards does not change an existing binary, so switching means
+rebuilding. To see which one a binary uses, read the `python runtime` line it
+logs at startup:
+
+```text
+INFO siphon::script::runtime_info: python runtime version=3.14.0 free_threaded=true gil_enabled=false prefix=/usr/local
+```
+
+It is logged at `WARN` when the GIL is on. `ldd $(which siphon) | grep python`
+answers the same question without starting it: `libpython3.14t.so` (note the
+`t`) is free-threaded. A Python you compiled yourself needs `--enable-shared`
+as well as `--disable-gil`, and a `sudo ldconfig` if it went into `/usr/local`.
+
 ## Next steps
 
 - **[Cookbook](cookbook/index.md)** — a complete, working starting point for each

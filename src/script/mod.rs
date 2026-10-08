@@ -11,6 +11,7 @@ pub mod handle;
 pub mod handler_select;
 pub mod inline_dispatch;
 pub mod py_executor;
+pub mod runtime_info;
 pub mod watcher;
 
 pub(crate) use blocking::{awaitable, detach_block_on, ready};

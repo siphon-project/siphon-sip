@@ -13,6 +13,17 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
+### Added
+
+- **siphon logs the Python interpreter it embeds at startup.** One `python
+  runtime` line after the script loads, with the version, whether the build is
+  free-threaded, whether the GIL is enabled, and the installation prefix. The
+  interpreter is fixed when siphon is compiled, so this is the way to tell
+  which one a binary uses. It is logged at `warn` when the GIL is on, since
+  handlers then do not run in parallel: either siphon was built against a GIL
+  interpreter, or a free-threaded one has the GIL re-enabled (`PYTHON_GIL=1`,
+  or an extension module the script imports).
+
 ### Changed
 
 - **The profile for a `Replaces` takeover is the one the script anchors the
