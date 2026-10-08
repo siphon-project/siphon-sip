@@ -203,6 +203,12 @@ pub(super) struct Established {
 }
 
 pub(super) fn establish(prefix: u32, refer_mode: &str) -> Established {
+    establish_deciding(prefix, &format!("call.accept_refer(mode=\"{refer_mode}\")"))
+}
+
+/// [`establish`] with `on_refer` as the one statement of the script's
+/// `@b2bua.on_refer` handler.
+pub(super) fn establish_deciding(prefix: u32, on_refer: &str) -> Established {
     let aor =
         |n: u32| -> &'static str { Box::leak(format!("sip:{n}@example.com").into_boxed_str()) };
     let a = (
@@ -226,9 +232,9 @@ pub(super) fn establish(prefix: u32, refer_mode: &str) -> Established {
             "\n",
             "@b2bua.on_refer\n",
             "def on_refer(call):\n",
-            "    call.accept_refer(mode=\"{mode}\")",
+            "    {on_refer}",
         ),
-        mode = refer_mode,
+        on_refer = on_refer,
     );
     let mut dispatcher = test_dispatcher_with_script(&script(&routing));
     dispatcher.state.accept_replaces = true;

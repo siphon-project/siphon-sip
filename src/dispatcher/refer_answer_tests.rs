@@ -12,9 +12,10 @@
 
 use super::dialog_state_events_tests::{header, inbound, register, responds, tag_of, wire, Sent};
 use super::dialog_state_transfer_tests::{
-    answer, control_plane, establish, hang_up, in_dialog, invite, place, respond,
-    response_to_phone, sent_to, Established,
+    answer, control_plane, establish, establish_deciding, hang_up, host_of, in_dialog, invite,
+    place, respond, response_to_phone, sent_to, Established,
 };
+use super::transfer_ingress_tests::refers;
 use super::*;
 use crate::script::api::call::ReferMode;
 
@@ -1125,4 +1126,36 @@ async fn a_referrer_that_is_replaced_has_its_held_refer_answered() {
         "the REFER is answered ahead of the BYE that ends its dialog: {summary:?}"
     );
     assert_eq!(state.pending_inbound_refer.len(), 0, "nothing stays held");
+}
+
+/// The call a script is handed in `@b2bua.on_refer` is the same call it was
+/// handed in every other handler: `call.source_ip`, and so `from_gateway()`
+/// and `source_ip_in()`, name where the caller came from. Which party sent
+/// the REFER is `call.refer_side`. A REFER from the callee used to put the
+/// callee's address there, so a script that told the two trunks of an SBC
+/// apart by the caller's source read a transfer by the callee the wrong way
+/// round.
+#[tokio::test(flavor = "multi_thread")]
+async fn on_refer_sees_the_callers_source_whichever_party_refers() {
+    for (index, from_a_leg) in [true, false].into_iter().enumerate() {
+        let call = establish_deciding(
+            48000 + 10 * index as u32,
+            "call.reject_refer(486, call.source_ip + ' ' + call.refer_side)",
+        );
+        let _ = wire(&call.dispatcher);
+
+        refers(&call, from_a_leg, "203.0.113.250:5060");
+
+        let referrer = if from_a_leg { call.a.1 } else { call.b.1 };
+        let refused = response_to_phone(&wire(&call.dispatcher), referrer, 486);
+        let StartLine::Response(status) = &refused.start_line else {
+            panic!("a response");
+        };
+        let side = if from_a_leg { "a" } else { "b" };
+        assert_eq!(
+            status.reason_phrase,
+            format!("{} {side}", host_of(call.a.1)),
+            "a REFER from the {side} leg"
+        );
+    }
 }
