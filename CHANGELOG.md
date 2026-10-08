@@ -74,6 +74,16 @@ entry, but a working config keeps working.
   offered `sendrecv` was answered `inactive`. The answer is now to the offer in
   hand (RFC 3264 §6.1); a caller that itself offers a held stream is answered
   as before.
+- **`call.source_ip` in `@b2bua.on_refer` is the caller's, whichever party
+  sent the REFER.** The call handed to that handler took its source address and
+  transport from the REFER itself, so on a transfer by the callee
+  `call.source_ip`, `call.from_gateway()` and `call.source_ip_in()` answered for
+  the callee, where every other `@b2bua.*` handler, the SDK mock and the
+  documentation give the caller. A script that tells the two sides of an SBC
+  apart by the caller's source and reads the referrer off `call.refer_side`
+  picked the survivor, and so the media profile, the wrong way round for those
+  transfers. A script that had worked around it by reading "who sent this
+  REFER" from `call.from_gateway()` in `on_refer` should use `call.refer_side`.
 
 ## [1.13.0] — 2026-10-06
 

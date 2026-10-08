@@ -961,11 +961,26 @@ pub fn handle_b2bua_refer_on(
         .answered_refers
         .proceeding(&call_id, &message, std::time::Instant::now());
 
+    // `call.source_ip` and `call.transport` are the caller's, as they are in
+    // every other handler: a script tells its two sides apart by them
+    // (`from_gateway()`, `source_ip_in()`), and which party sent this REFER is
+    // `call.refer_side`. Taken from the REFER, a transfer by the callee showed
+    // the script the callee's address under the caller's name.
+    let (caller_source, caller_transport) = match state.call_actors.clone_leg(&call_id, true) {
+        Some(a_leg) => (
+            a_leg.transport.remote_addr.ip().to_string(),
+            format!("{}", a_leg.transport.transport).to_lowercase(),
+        ),
+        None => (
+            inbound.remote_addr.ip().to_string(),
+            format!("{}", inbound.transport).to_lowercase(),
+        ),
+    };
     let mut py_call = PyCall::new(
         call_id.clone(),
         Arc::new(std::sync::Mutex::new(message.clone())),
-        inbound.remote_addr.ip().to_string(),
-        format!("{}", inbound.transport).to_lowercase(),
+        caller_source,
+        caller_transport,
     )
     .with_flow(py_flow_from_inbound(&inbound));
     py_call.set_refer_to(refer_to.uri.clone(), refer_to.replaces.clone());
