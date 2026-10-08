@@ -1,0 +1,52 @@
+# siphon.b2bua-replaces-srtp-siphon-rtp.yaml — Replaces takeover at an SRTP edge
+#
+# Used with: sipp/docker-compose.yaml (b2bua-replaces-srtp-siphon-rtp profile)
+# Script:    sipp/replaces/b2bua_srtp_edge_replaces.py
+# Test:      sipp/replaces/replaces_srtp_edge_test.py
+# Media:     REAL siphon-rtp engine over the native control plane
+# Proves:    a caller that takes over a held call across an SRTP edge is
+#            answered in its own transport, with a key, and off hold.
+#
+# Twin of siphon.b2bua-replaces-srtp-rtpengine.yaml: same script, same test,
+# only the media engine differs.
+
+listen:
+  udp:
+    - "0.0.0.0:5060"
+
+domain:
+  local:
+    - "siphon.test"
+    - "172.20.0.155"
+    - "127.0.0.1"
+
+b2bua:
+  accept_replaces: true
+
+script:
+  path: "scripts/b2bua_srtp_edge_replaces.py"
+  reload: auto
+
+advertised_address: "172.20.0.155"
+
+media:
+  backend: siphon-rtp
+  siphon_rtp:
+    address: "172.20.0.130:8080"
+    timeout_ms: 2000
+  profiles:
+    # The offer half is what the callee is offered, the answer half what the
+    # caller is answered.
+    srtp_edge:
+      offer:
+        transport_protocol: "RTP/AVP"
+        replace: ["origin"]
+        flags: ["trust-address"]
+      answer:
+        transport_protocol: "RTP/SAVP"
+        replace: ["origin"]
+        flags: ["trust-address"]
+
+log:
+  level: debug
+  format: pretty

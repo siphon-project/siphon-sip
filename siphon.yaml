@@ -1029,6 +1029,12 @@ auth:
 #
 # siphon logs a WARN naming the inherited profile when it is direction-bound,
 # but cannot choose the replacement — only the script knows the surviving pair.
+#
+# An INVITE with Replaces names its profile the way any call does: the takeover
+# runs after @b2bua.on_invite and completes the media session that handler
+# opened, so `rtpengine.offer(call, profile=...)` there describes the new pair
+# (the newcomer offers, the survivor answers). Left unanchored, the takeover
+# inherits the replaced call's profile.
 # Direction-bound built-ins: srtp_to_rtp, rtp_to_srtp, ws_to_rtp, wss_to_rtp.
 # Symmetric (safe to inherit): rtp_passthrough.
 #

@@ -130,6 +130,44 @@ impl RepairedIngress {
     }
 }
 
+/// The media session a `Replaces` takeover leaves the pair on, keyed on the
+/// newcomer's Call-ID `cid_new`.
+///
+/// `own` is the session the script opened when it anchored the taking-over
+/// INVITE, which now gains its other party and keeps everything else it was
+/// opened with. With none, the takeover anchored the newcomer itself on a
+/// fresh engine call named by `cid_new`, under `new_tag` and `profile`.
+pub fn takeover_session(
+    own: Option<MediaSession>,
+    cid_new: &str,
+    new_tag: &str,
+    survivor_tag: &str,
+    profile: &str,
+    bridge_sides: Option<BridgeSides>,
+) -> MediaSession {
+    match own {
+        Some(own) => MediaSession {
+            to_tag: Some(survivor_tag.to_string()),
+            bridge_sides,
+            ..own
+        },
+        None => MediaSession {
+            call_id: cid_new.to_string(),
+            rtpengine_call_id: cid_new.to_string(),
+            from_tag: new_tag.to_string(),
+            to_tag: Some(survivor_tag.to_string()),
+            profile: profile.to_string(),
+            // A fresh engine call-id: any WebSocket bridge the old anchor
+            // held belonged to the call-id that just went away.
+            ws_uri: None,
+            ws_tee: None,
+            ws_bridge_attached: false,
+            bridge_sides,
+            created_at: std::time::Instant::now(),
+        },
+    }
+}
+
 /// Pin the party `flags` carry the SDP of to its signalling source, where its
 /// own policy asks for it. With no `ingress` the flags are left as they are.
 fn stamp_party_ingress(

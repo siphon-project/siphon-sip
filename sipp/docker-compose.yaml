@@ -2427,6 +2427,98 @@ services:
     profiles:
       - b2bua-replaces
 
+  # --- Replaces takeover of a HELD call at an SRTP edge, on a real engine ---
+  # The caller speaks RTP/SAVP, the callee RTP/AVP. The caller holds, then a
+  # second SRTP caller takes its dialog over. The peer asserts the answer it is
+  # given is SAVP with a key and off hold, and that the survivor's re-INVITE is
+  # plain RTP. Run once per media engine: same script, same peer, same checks.
+  #   172.20.0.153 / .154  siphon + peer, REAL rtpengine (172.20.0.44)
+  #   172.20.0.155 / .156  siphon + peer, REAL siphon-rtp (172.20.0.130)
+
+  siphon-b2bua-replaces-srtp-rtpengine:
+    image: sipp-siphon   # reuse the siphon image (built by the `siphon` service)
+    build:
+      context: ..
+    container_name: siphon-b2bua-replaces-srtp-rtpengine-test
+    depends_on:
+      rtpengine-real:
+        condition: service_healthy
+    environment:
+      REPLACES_CALLEE: "sip:bob@172.20.0.154:6002"
+    volumes:
+      - ./configs/siphon.b2bua-replaces-srtp-rtpengine.yaml:/etc/siphon/siphon.yaml:ro
+      - ./replaces/b2bua_srtp_edge_replaces.py:/etc/siphon/scripts/b2bua_srtp_edge_replaces.py:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.153
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import socket; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(2); s.sendto(b'OPTIONS sip:siphon.test SIP/2.0\\r\\nVia: SIP/2.0/UDP 127.0.0.1:15060;branch=z9hG4bK-hc\\r\\nFrom: <sip:hc@siphon.test>;tag=hc\\r\\nTo: <sip:siphon.test>\\r\\nCall-ID: hc@check\\r\\nCSeq: 1 OPTIONS\\r\\nMax-Forwards: 1\\r\\nContent-Length: 0\\r\\n\\r\\n', ('127.0.0.1',5060)); s.recv(1024); s.close()\""]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+      start_period: 10s
+    profiles:
+      - b2bua-replaces-srtp-rtpengine
+
+  replaces-srtp-rtpengine-peer:
+    image: python:3.12-slim
+    depends_on:
+      siphon-b2bua-replaces-srtp-rtpengine:
+        condition: service_healthy
+    volumes:
+      - ./replaces:/peer:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.154
+    environment:
+      SIPHON_ADDR: "172.20.0.153:5060"
+      SELF_IP: "172.20.0.154"
+    command: ["python3", "/peer/replaces_srtp_edge_test.py"]
+    profiles:
+      - b2bua-replaces-srtp-rtpengine
+
+  siphon-b2bua-replaces-srtp-siphon-rtp:
+    image: sipp-siphon   # reuse the siphon image (built by the `siphon` service)
+    build:
+      context: ..
+    container_name: siphon-b2bua-replaces-srtp-siphon-rtp-test
+    depends_on:
+      siphon-rtp-engine-ready:
+        condition: service_completed_successfully
+    environment:
+      REPLACES_CALLEE: "sip:bob@172.20.0.156:6002"
+    volumes:
+      - ./configs/siphon.b2bua-replaces-srtp-siphon-rtp.yaml:/etc/siphon/siphon.yaml:ro
+      - ./replaces/b2bua_srtp_edge_replaces.py:/etc/siphon/scripts/b2bua_srtp_edge_replaces.py:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.155
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import socket; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(2); s.sendto(b'OPTIONS sip:siphon.test SIP/2.0\\r\\nVia: SIP/2.0/UDP 127.0.0.1:15060;branch=z9hG4bK-hc\\r\\nFrom: <sip:hc@siphon.test>;tag=hc\\r\\nTo: <sip:siphon.test>\\r\\nCall-ID: hc@check\\r\\nCSeq: 1 OPTIONS\\r\\nMax-Forwards: 1\\r\\nContent-Length: 0\\r\\n\\r\\n', ('127.0.0.1',5060)); s.recv(1024); s.close()\""]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+      start_period: 10s
+    profiles:
+      - b2bua-replaces-srtp-siphon-rtp
+
+  replaces-srtp-siphon-rtp-peer:
+    image: python:3.12-slim
+    depends_on:
+      siphon-b2bua-replaces-srtp-siphon-rtp:
+        condition: service_healthy
+    volumes:
+      - ./replaces:/peer:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.156
+    environment:
+      SIPHON_ADDR: "172.20.0.155:5060"
+      SELF_IP: "172.20.0.156"
+    command: ["python3", "/peer/replaces_srtp_edge_test.py"]
+    profiles:
+      - b2bua-replaces-srtp-siphon-rtp
+
   # --- The callee is ACKed on every answered call (RFC 3261 §13.2.2.4) ---
   # Reuses the replaces siphon (a plain bridge to one fixed callee) and drives
   # calls in a tight loop, which is what makes a 18x and its 200 land on
@@ -4639,6 +4731,7 @@ services:
     profiles:
       - b2bua-rtpengine-refer
       - b2bua-rtpengine-reoffer
+      - b2bua-replaces-srtp-rtpengine
       - rtpengine-real
 
   siphon-b2bua-rtpengine-refer:
@@ -6450,6 +6543,7 @@ services:
       - bridge
       - dial-bridge
       - control-transfer
+      - b2bua-replaces-srtp-siphon-rtp
 
   # Readiness gate for the distroless engine: exits 0 once /readyz answers.
   siphon-rtp-engine-ready:
@@ -6482,6 +6576,7 @@ services:
       - bridge
       - dial-bridge
       - control-transfer
+      - b2bua-replaces-srtp-siphon-rtp
 
   # ── Native JSON control plane (media.backend: siphon-rtp) ─────────────────
   siphon-rtp-native:
