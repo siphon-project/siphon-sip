@@ -23,6 +23,13 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 use crate::cache::CacheManager;
+use crate::sip::message::SipMessage;
+
+mod outbound;
+
+pub use outbound::{
+    AttemptFailure, EndedSubscription, NotifyDisposition, PendingSubscription, RemoteParty,
+};
 
 /// Seconds since the Unix epoch, capped at `u64::MAX` on clock weirdness.
 fn unix_now() -> u64 {
@@ -128,6 +135,9 @@ impl SubscribeDialog {
 /// Store holding the L1 DashMap and (optionally) an L2 cache handle.
 pub struct SubscribeStore {
     dialogs: DashMap<String, SubscribeDialog>,
+    /// The subscriptions this node originated, by Call-ID, from the SUBSCRIBE
+    /// leaving until the dialog is gone.  See [`outbound`].
+    outbound: DashMap<String, outbound::OutboundSubscription>,
     /// ``(cache_manager, cache_name)`` when configured.
     cache: Option<(Arc<CacheManager>, String)>,
 }
@@ -147,10 +157,23 @@ pub fn global_store() -> Option<Arc<SubscribeStore>> {
     GLOBAL_STORE.get().cloned()
 }
 
+/// Place an inbound NOTIFY against the subscriptions this node originated
+/// (RFC 6665 §4.1.2.4, §4.4.1, §5.4.9).  The dispatcher calls this for every
+/// NOTIFY before the script sees it: one that arrives ahead of the 2xx to its
+/// SUBSCRIBE establishes the dialog, so the script's lookup finds it
+/// whichever of the two came first.
+pub fn notify_received(notify: &SipMessage) -> NotifyDisposition {
+    match GLOBAL_STORE.get() {
+        Some(store) => store.notify_received(notify),
+        None => NotifyDisposition::Deliver,
+    }
+}
+
 impl SubscribeStore {
     pub fn new() -> Self {
         Self {
             dialogs: DashMap::new(),
+            outbound: DashMap::new(),
             cache: None,
         }
     }
@@ -169,6 +192,12 @@ impl SubscribeStore {
 
     /// Write a dialog to L1 and (if configured) L2.
     pub fn put(&self, dialog: SubscribeDialog) {
+        self.persist(&dialog);
+        self.dialogs.insert(dialog.id.clone(), dialog);
+    }
+
+    /// Write a dialog through to L2, when one is configured.
+    fn persist(&self, dialog: &SubscribeDialog) {
         if let Some((manager, name)) = &self.cache {
             let manager = Arc::clone(manager);
             let cache_name = name.clone();
@@ -186,7 +215,6 @@ impl SubscribeStore {
                 }
             });
         }
-        self.dialogs.insert(dialog.id.clone(), dialog);
     }
 
     /// Fetch a dialog from L1 only — synchronous, no network, never blocks.
@@ -226,6 +254,10 @@ impl SubscribeStore {
                     None
                 } else {
                     self.dialogs.insert(dialog.id.clone(), dialog.clone());
+                    // A subscription this process did not make, or made
+                    // before a restart: its NOTIFYs are placed against it
+                    // from here on, as for one made here.
+                    self.track_restored(&dialog);
                     Some(dialog)
                 }
             }
@@ -264,7 +296,9 @@ impl SubscribeStore {
 
     /// Remove a dialog from both L1 and L2.
     pub fn remove(&self, id: &str) {
-        self.dialogs.remove(id);
+        if let Some((_, dialog)) = self.dialogs.remove(id) {
+            self.forget_outbound(&dialog);
+        }
         if let Some((manager, name)) = &self.cache {
             let manager = Arc::clone(manager);
             let cache_name = name.clone();
@@ -292,7 +326,12 @@ impl SubscribeStore {
 
     /// Remove stale dialogs atomically, returning their final snapshots so the
     /// notifier can send the mandatory terminating NOTIFY after releasing locks.
+    ///
+    /// Stale is expired or terminated, and for a subscription this node
+    /// originated also accepted with no NOTIFY inside Timer N (RFC 6665
+    /// §4.1.2.4), which is a failed attempt.
     pub fn take_stale(&self) -> Vec<SubscribeDialog> {
+        let mut removed = self.take_unnotified(outbound::TIMER_N);
         // Collect ids first, then remove: holding a DashMap iterator (shard
         // read lock) while removing (shard write lock) on the same map can
         // deadlock.
@@ -302,13 +341,14 @@ impl SubscribeStore {
             .filter(|entry| entry.terminated || entry.remaining_secs() == 0)
             .map(|entry| entry.key().clone())
             .collect();
-        let mut removed = Vec::with_capacity(stale.len());
+        removed.reserve(stale.len());
         for id in &stale {
             // L1-only: an expired L2 entry ages out via its own TTL, and a
             // terminated dialog already had its L2 key deleted by `remove`.
             if let Some((_, dialog)) = self.dialogs.remove_if(id, |_, dialog| {
                 dialog.terminated || dialog.remaining_secs() == 0
             }) {
+                self.forget_outbound(&dialog);
                 removed.push(dialog);
             }
         }
@@ -345,6 +385,34 @@ impl SubscribeStore {
         }
         None
     }
+}
+
+/// Pull ``tag=...`` from a From/To header value.
+pub(crate) fn extract_tag(value: &str) -> Option<String> {
+    let lower = value.to_ascii_lowercase();
+    let tag_start = lower.find(";tag=")?;
+    let rest = &value[tag_start + 5..];
+    let end = rest.find([';', '>']).unwrap_or(rest.len());
+    Some(rest[..end].to_string())
+}
+
+/// Strip display-name and angle-brackets from a name-addr header value,
+/// returning only the URI portion.  Falls back to the whole trimmed
+/// value on parse failure.
+pub(crate) fn strip_nameaddr(value: &str) -> String {
+    let trimmed = value.trim();
+    if let (Some(l), Some(r)) = (trimmed.find('<'), trimmed.rfind('>')) {
+        if l < r {
+            return trimmed[l + 1..r].to_string();
+        }
+    }
+    // No angle brackets — strip any trailing ;tag=… or other params.
+    trimmed
+        .split(';')
+        .next()
+        .unwrap_or(trimmed)
+        .trim()
+        .to_string()
 }
 
 impl Default for SubscribeStore {

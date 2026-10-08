@@ -254,7 +254,11 @@ mod shutdown_teardown_tests;
 #[cfg(test)]
 mod stale_in_dialog_request_tests;
 #[cfg(test)]
+mod subscribe_notify_before_2xx_tests;
+#[cfg(test)]
 mod subscribe_reply_order_tests;
+#[cfg(test)]
+mod subscribe_test_harness;
 #[cfg(test)]
 mod takeover_media_tests;
 #[cfg(test)]

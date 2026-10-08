@@ -575,14 +575,31 @@ class SipTestHarness:
             request.relay()
             return RequestResult(request=request, actions=list(request.actions))
 
+        # A NOTIFY for a SUBSCRIBE the script sent is placed against that
+        # subscription before the script sees it (RFC 6665 sections 4.4.1 and
+        # 5.4.9): one from another notifier than the dialog's is answered 481
+        # without running a handler, and one that terminates the subscription
+        # removes it once the handlers have returned.
+        ended_subscription = None
+        if method == "NOTIFY":
+            subscribe_state = mock_module.get_proxy().subscribe_state
+            verdict, ended_subscription = subscribe_state._place_notify(request)
+            if verdict == "reject":
+                request.reply(481, "Subscription Does Not Exist")
+                return RequestResult(request=request, actions=list(request.actions))
+
         registry = mock_module.get_registry()
         handlers = registry.get("proxy.on_request", method)
 
-        for fn, is_async in handlers:
-            if is_async:
-                self._loop.run_until_complete(fn(request))
-            else:
-                fn(request)
+        try:
+            for fn, is_async in handlers:
+                if is_async:
+                    self._loop.run_until_complete(fn(request))
+                else:
+                    fn(request)
+        finally:
+            if ended_subscription is not None:
+                mock_module.get_proxy().subscribe_state._dialogs.pop(ended_subscription, None)
 
         return RequestResult(request=request, actions=list(request.actions))
 

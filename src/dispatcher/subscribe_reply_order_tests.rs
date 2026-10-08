@@ -9,20 +9,7 @@
 //! a real async script through `handle_request` sees that; a unit test on the
 //! queue or on `accept()` alone stays green while the wire order is reversed.
 
-use super::test_dispatcher::{test_dispatcher_with_script, TestDispatcher};
-use super::*;
-
-const NOTIFIER: &str = concat!(
-    "from siphon import proxy\n",
-    "\n",
-    "@proxy.on_request(\"SUBSCRIBE\")\n",
-    "async def subscribe(request):\n",
-    "    handle = proxy.subscribe_state.accept(request, expires=60)\n",
-    "    await handle.notify(\n",
-    "        body=\"Messages-Waiting: no\\r\\n\",\n",
-    "        content_type=\"application/simple-message-summary\",\n",
-    "    )\n",
-);
+use super::subscribe_test_harness::subscribe_harness;
 
 const SUBSCRIBER: &str = "192.0.2.20:5070";
 
@@ -44,52 +31,15 @@ fn subscribe() -> String {
     .to_string()
 }
 
-/// The frames a peer receives, in egress order: each outbound message's own
-/// data, then the followups the transport writes behind it.
-fn frames(udp: &flume::Receiver<OutboundMessage>) -> Vec<(SocketAddr, Bytes)> {
-    let mut frames = Vec::new();
-    while let Ok(message) = udp.try_recv() {
-        let destination = message.destination;
-        for frame in message.frames() {
-            frames.push((destination, frame.clone()));
-        }
-    }
-    frames
-}
-
 #[test]
 fn the_initial_notify_leaves_after_the_200_that_accepted_the_subscription() {
-    Python::initialize();
-    // The singleton goes in before the script engine is built, so the script's
-    // `proxy.subscribe_state` is the Rust namespace rather than the stub.
-    Python::attach(|python| {
-        let namespace = crate::script::api::subscribe_state::PySubscribeState::new(Arc::new(
-            crate::subscribe_state::SubscribeStore::new(),
-        ));
-        let _ = crate::script::api::set_subscribe_state_singleton(python, namespace);
-    });
-    let TestDispatcher { state, udp } = test_dispatcher_with_script(NOTIFIER);
-    crate::script::api::subscribe_state::set_uac_sender(Arc::clone(&state.uac_sender));
-    crate::script::api::subscribe_state::set_resolver(Arc::clone(&state.dns_resolver));
-    let state = Arc::new(state);
-    let raw = subscribe();
-    let message = parse_sip_message_bytes(raw.as_bytes()).expect("the SUBSCRIBE parses");
+    // The script is the harness's: its SUBSCRIBE handler accepts the
+    // subscription and awaits the initial NOTIFY.
+    let (_turn, harness) = subscribe_harness();
 
-    handle_request(
-        InboundMessage {
-            client_transport: None,
-            connection_id: ConnectionId::default(),
-            transport: Transport::Udp,
-            local_addr: "192.0.2.1:5060".parse().expect("a literal address"),
-            remote_addr: SUBSCRIBER.parse().expect("a literal address"),
-            data: Bytes::from(raw),
-        },
-        message,
-        "SUBSCRIBE".to_string(),
-        &state,
-    );
+    harness.receive_request(&subscribe(), SUBSCRIBER);
 
-    let sent = frames(&udp);
+    let sent = harness.frames();
     let starts: Vec<String> = sent
         .iter()
         .map(|(_, frame)| {

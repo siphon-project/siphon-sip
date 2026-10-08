@@ -58,6 +58,71 @@ entry, but a working config keeps working.
 
 ### Fixed
 
+- **A NOTIFY that arrives before the 2xx to the SUBSCRIBE of
+  `proxy.subscribe_state.send()` is matched to that subscription (RFC 6665
+  §4.1.2.4, §4.4.1).** The dialog was stored only once the awaited 2xx had
+  been processed, so a first NOTIFY that overtook it, which a notifier sending
+  both back to back produces routinely, was looked up against an empty store:
+  `proxy.subscribe_state.find()` returned `None` and the script had no way to
+  tell it from a stray. The subscription is now registered before the
+  SUBSCRIBE is sent, and a NOTIFY with its Call-ID, a To tag equal to the
+  SUBSCRIBE's From tag and a matching Event header (§8.2.1) establishes the
+  dialog before the NOTIFY handler runs, with the remote target and route set
+  taken from the NOTIFY. `find()` returns the handle that `send()` returns
+  afterwards, and a `None` from it now means the NOTIFY belongs to no
+  subscription (§4.1.3, 481).
+
+  The rest follows the subscriber state machine of §4.1.2, and changes what a
+  script sees in three places:
+
+  - **`send()` returns the handle instead of raising when the SUBSCRIBE gets
+    no final response but a NOTIFY has established the subscription.** Timer N
+    bounds the wait for a NOTIFY, not for a response, so that subscription
+    stands. A timeout with no NOTIFY still raises and leaves no state, and so
+    does a non-2xx, which says no subscription was created (§4.1.2.1) and
+    withdraws one an early NOTIFY had established.
+  - **A NOTIFY with `Subscription-State: terminated` destroys the outbound
+    subscription (§4.4.1).** The NOTIFY handler still finds it with `find()`;
+    siphon removes it when the handlers have returned, where it used to stay
+    in the store until the script terminated it or it expired. A handle kept
+    past that point raises `LookupError`. `send()` does not report it: the
+    2xx and the NOTIFY race, so `send()` returns the handle whether the
+    terminating NOTIFY came before the 2xx or after, and a one-shot fetch
+    (`expires=0`) reads its result in the NOTIFY handler either way.
+  - **A NOTIFY for the same SUBSCRIBE from another notifier tag than the
+    dialog's is answered 481 by siphon, without running the NOTIFY handler
+    (§5.4.9).** One `send()` tracks one dialog, the one the first NOTIFY
+    established, or the 2xx when it came first. A 2xx from another fork than
+    that NOTIFY does not change the dialog.
+  - **`handle.terminate()` on a subscription made with `send()` no longer
+    removes it at once.** It sends SUBSCRIBE with `Expires: 0`, and the
+    subscription is over when the notifier's terminating NOTIFY arrives
+    (§4.1.2.3). It used to be gone before that NOTIFY came, so the handler's
+    `find()` returned `None` and a script answered 481 to the one NOTIFY it
+    had asked for. Now the handler finds it, and siphon removes it when the
+    handler has returned, or after 32 seconds (Timer N) when no such NOTIFY
+    comes. Until then the handle keeps working.
+  - **The subscription lasts as long as the notifier says, not as long as the
+    script asked.** The `Expires` of the 2xx (§4.1.2.1) and the `expires` of a
+    NOTIFY's Subscription-State (§4.1.2.2) shorten `handle.expires` when they
+    state less; nothing but `handle.refresh()` lengthens it. `handle.expires`
+    used to stay at the requested value, so a refresh scheduled from it came
+    after the notifier had already dropped the subscription.
+  - **A NOTIFY's Contact becomes the target of the next in-dialog request**
+    (a NOTIFY is a target refresh request, §4.4.1), so a refresh or an
+    unsubscribe follows a notifier that moved. The 2xx supplies the target
+    only until a NOTIFY has, which makes it the same whichever came first.
+  - **siphon ends a subscription on its own in two more cases.** A 2xx that
+    no NOTIFY follows within 32 seconds is a failed attempt (Timer N,
+    §4.1.2.4), and a non-2xx that arrives after `send()` stopped waiting and
+    returned a subscription a NOTIFY had established says none was created
+    (§4.1.2.1). Both are logged at `warn`, and the handle raises
+    `LookupError` afterwards.
+
+  A subscription read back from the cache with `proxy.subscribe_state.get()`,
+  after a restart or on another replica, is tracked the same way from then
+  on, and a terminating NOTIFY removes it too.
+
 - **`diameter.s6c_rsr` sends a Report-SM-Delivery-Status request an HSS can
   read (3GPP TS 29.338 clause 5.3.2.7).** The outcome was written into
   SM-Delivery-Outcome as an SM-RP-MTI AVP, which is not a member of that
