@@ -1598,3 +1598,32 @@ class _NumbersNamespace:
 
 
 numbers = _NumbersNamespace()
+
+
+# ---------------------------------------------------------------------------
+# config namespace (stub, replaced by Rust at startup)
+# ---------------------------------------------------------------------------
+
+class _ConfigNamespace:
+    """Operator-supplied configuration for the script (stub: an empty document).
+
+    Usage:
+        from siphon import config
+
+        gateway = config.get("routes.default.gateway", "carrier-a")
+        prefixes = config.require("routes.prefixes")
+    """
+
+    def get(self, key, default=None):
+        return {} if key == "" else default
+
+    def require(self, key):
+        if key == "":
+            return {}
+        raise LookupError(
+            'script_config key "%s" is not set (no "%s" at the top level)'
+            % (key, key.split(".")[0])
+        )
+
+
+config = _ConfigNamespace()

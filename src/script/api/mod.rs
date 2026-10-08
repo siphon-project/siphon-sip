@@ -11,6 +11,7 @@ pub mod b2bua;
 pub mod cache;
 pub mod call;
 pub mod cdr;
+pub mod config;
 pub mod diameter;
 pub mod diameter_server;
 pub mod gateway;
@@ -77,6 +78,7 @@ pub const BUILT_IN_NAMESPACE_NAMES: &[&str] = &[
     "qos",
     "stir",
     "lcr",
+    "config",
 ];
 
 /// Host-registered Python namespaces. Populated by `SiphonServer` at
@@ -147,6 +149,10 @@ static SDP_SINGLETON: OnceLock<Py<PyAny>> = OnceLock::new();
 /// numbers namespace singleton — always available (stateless E.164 parser; the
 /// home locale / policies come from the process-wide number runtime).
 static NUMBERS_SINGLETON: OnceLock<Py<PyAny>> = OnceLock::new();
+
+/// `config` namespace singleton, always available (an empty document when
+/// `script_config:` is absent).
+static CONFIG_SINGLETON: OnceLock<Py<PyAny>> = OnceLock::new();
 
 /// QoS namespace singleton — always available (stateless SDP→IPFilterRule helper).
 static QOS_SINGLETON: OnceLock<Py<PyAny>> = OnceLock::new();
@@ -432,6 +438,17 @@ pub fn set_numbers_singleton(python: Python<'_>) -> Result<()> {
         .map_err(|error| SiphonError::Script(format!("Py::new(numbers): {error}")))?
         .into_any();
     let _ = NUMBERS_SINGLETON.set(numbers_py);
+    Ok(())
+}
+
+/// Store the `config` namespace singleton for injection into the siphon module.
+///
+/// Always called at startup, with the store built from `script_config:`.
+pub fn set_config_singleton(python: Python<'_>, py_config: config::PyScriptConfig) -> Result<()> {
+    let config_py: Py<PyAny> = Py::new(python, py_config)
+        .map_err(|error| SiphonError::Script(format!("Py::new(config): {error}")))?
+        .into_any();
+    let _ = CONFIG_SINGLETON.set(config_py);
     Ok(())
 }
 
@@ -860,6 +877,13 @@ pub fn install_siphon_module(python: Python<'_>) -> Result<()> {
         module
             .setattr("numbers", numbers_py.bind(python))
             .map_err(|error| SiphonError::Script(format!("setattr numbers: {error}")))?;
+    }
+
+    // Inject config namespace singleton (always available, `script_config:`).
+    if let Some(config_py) = CONFIG_SINGLETON.get() {
+        module
+            .setattr("config", config_py.bind(python))
+            .map_err(|error| SiphonError::Script(format!("setattr config: {error}")))?;
     }
 
     // Inject QoS namespace singleton (always available — stateless helper).

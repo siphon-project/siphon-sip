@@ -557,6 +557,53 @@ fn relative_include_paths_anchor_on_config_dir() {
     );
 }
 
+/// A relative path-form `script_config` resolves like `script.path`.
+#[test]
+fn relative_script_config_path_anchors_on_config_dir() {
+    let (dir, config_path) = config_dir_with_script("# script\n");
+    std::fs::write(dir.path().join("routes.yaml"), "routes: {}\n").unwrap();
+    let mut yaml = std::fs::read_to_string(&config_path).unwrap();
+    yaml.push_str("script_config: \"routes.yaml\"\n");
+    std::fs::write(&config_path, yaml).unwrap();
+
+    let config = Config::from_file(&config_path).unwrap();
+
+    assert_eq!(
+        config
+            .script_config
+            .as_ref()
+            .and_then(|value| value.as_str()),
+        Some(dir.path().join("routes.yaml").to_string_lossy().as_ref())
+    );
+}
+
+/// The inline form is a document, not a path: anchoring leaves it alone.
+#[test]
+fn inline_script_config_is_not_anchored() {
+    let (_dir, config_path) = config_dir_with_script("# script\n");
+    let mut yaml = std::fs::read_to_string(&config_path).unwrap();
+    yaml.push_str(
+        "script_config:\n  routes:\n    default: \"${SIPHON_TEST_UNSET_ROUTE:-carrier-a}\"\n",
+    );
+    std::fs::write(&config_path, yaml).unwrap();
+
+    let config = Config::from_file(&config_path).unwrap();
+
+    let document = config.script_config.expect("script_config present");
+    assert_eq!(
+        document["routes"]["default"].as_str(),
+        Some("carrier-a"),
+        "the inline form is expanded with the rest of siphon.yaml"
+    );
+}
+
+#[test]
+fn script_config_is_absent_by_default() {
+    let (_dir, config_path) = config_dir_with_script("# script\n");
+    let config = Config::from_file(&config_path).unwrap();
+    assert!(config.script_config.is_none());
+}
+
 /// Anchoring must not change a config that already worked: when there is no
 /// config-relative candidate, the value is left alone so the process
 /// working directory still resolves it (and the same "script not found"

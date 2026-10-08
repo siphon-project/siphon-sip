@@ -30,7 +30,7 @@ your handlers. Import the namespaces you need:
 ```python
 from siphon import proxy, registrar, b2bua, auth, log, cache
 from siphon import gateway, cdr, diameter, presence, li, registration
-from siphon import timer, metrics, sdp, sbi, ipsec, rtpengine, isc
+from siphon import timer, metrics, sdp, sbi, ipsec, rtpengine, isc, config
 ```
 
 ## How this reference is organised
@@ -41,6 +41,7 @@ from siphon import timer, metrics, sdp, sbi, ipsec, rtpengine, isc
 | [Reply](reply.md) | The response object passed to `@proxy.on_reply` / `@proxy.on_failure` |
 | [Call](call.md) | The B2BUA call object and its media handle |
 | [SDP](sdp.md) | The `sdp` namespace, parsed SDP bodies, and media sections |
+| [Script configuration](script-config.md) | The `script_config:` document and the `config` namespace that reads it |
 | [SIP types](types.md) | `SipUri`, `Contact`, `Flow`, and the captured `Action` record |
 | [Proxy & B2BUA](proxy.md) | Routing handlers, forking, and subscription-dialog state |
 | [Registrar](registrar.md) | Location service plus outbound trunk registration |

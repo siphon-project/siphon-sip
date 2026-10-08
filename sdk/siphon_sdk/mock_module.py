@@ -9902,6 +9902,162 @@ _numbers = MockNumbersNamespace()
 
 
 # ---------------------------------------------------------------------------
+# config namespace: operator-supplied script configuration (script_config:)
+# ---------------------------------------------------------------------------
+
+class MockScriptConfig:
+    """Mock ``config`` namespace: read access to the ``script_config:`` document.
+
+    ``script_config:`` in ``siphon.yaml`` holds the tables a script walks
+    (routes, rule lists, policy), either inline or as the path of a YAML file
+    that siphon watches and reloads. The script reads it at the moment it needs
+    a value, so a reload is seen by the next call::
+
+        from siphon import b2bua, config
+
+        @b2bua.on_invite
+        def route(call):
+            number = call.ruri.user
+            gateway = config.require("routes.default")
+            longest = -1
+            for route in config.get("routes.prefixes", []):
+                prefix = route["prefix"]
+                if number.startswith(prefix) and len(prefix) > longest:
+                    gateway, longest = route["gateway"], len(prefix)
+            call.dial(f"sip:{number}@{gateway}")
+
+    Every call returns a new copy: changing what you were handed changes
+    nothing for the next caller. The copy costs as much as the value is large,
+    so on a per-message path ask for the narrowest key rather than the whole
+    document.
+
+    In a test, hand the mock the document the script should see::
+
+        mock_module.get_script_config().set({
+            "routes": {"default": "gateway-a.example.com", "prefixes": []},
+        })
+    """
+
+    def __init__(self) -> None:
+        self._document: dict = {}
+
+    def set(self, document: dict) -> None:
+        """Test helper: replace the document, as a reload of the file would.
+
+        Args:
+            document: The new top-level mapping, as plain data.
+
+        Raises:
+            TypeError: ``document`` is not a ``dict``.
+        """
+        if not isinstance(document, dict):
+            raise TypeError("script_config: the top level must be a mapping")
+        self._document = self._copy(document)
+
+    def clear(self) -> None:
+        """Test helper: back to an empty document."""
+        self._document = {}
+
+    def get(self, key: str, default: Any = None) -> Any:
+        """Return the value at ``key``, or ``default`` when it is not set.
+
+        Args:
+            key: A dotted path into the document, e.g. ``"routes.default"``.
+                Each segment is a mapping key or a zero-based sequence index;
+                a mapping key written as an integer in YAML (``31: nl``) is
+                matched by the segment ``31``. ``""`` is the whole document.
+                A key that itself contains a dot cannot be named this way:
+                fetch its parent and index that.
+            default: Returned when the path does not resolve.
+
+        Returns:
+            Plain data (``dict``, ``list``, ``str``, ``int``, ``float``,
+            ``bool`` or ``None``) as a new copy on every call. A key that is
+            set to ``null`` returns ``None``, not ``default``.
+
+        Example::
+
+            gateway = config.get("routes.default.gateway", "carrier-a")
+        """
+        try:
+            return self._copy(self._lookup(key))
+        except LookupError:
+            return default
+
+    def require(self, key: str) -> Any:
+        """Return the value at ``key``, or raise when it is not set.
+
+        Args:
+            key: A dotted path into the document, as for :meth:`get`.
+
+        Returns:
+            The value, as a new copy on every call.
+
+        Raises:
+            LookupError: The path does not resolve, or resolves to ``null``.
+                The message names the key and the segment it stopped at.
+
+        Example::
+
+            prefixes = config.require("routes.prefixes")
+        """
+        value = self._lookup(key)
+        if value is None:
+            raise LookupError(f'script_config key "{key}" is set to null')
+        return self._copy(value)
+
+    def _lookup(self, key: str) -> Any:
+        current: Any = self._document
+        if key == "":
+            return current
+        consumed: list[str] = []
+        for segment in key.split("."):
+            parent = ".".join(consumed)
+            found = False
+            if isinstance(current, dict):
+                if segment in current:
+                    current, found = current[segment], True
+                elif re.fullmatch(r"-?[0-9]+", segment) and int(segment) in current:
+                    current, found = current[int(segment)], True
+            elif isinstance(current, list):
+                if segment.isascii() and segment.isdigit() and int(segment) < len(current):
+                    current, found = current[int(segment)], True
+            else:
+                raise LookupError(
+                    f'script_config key "{key}" is not set '
+                    f'("{parent}" is {self._describe(current)}, not a mapping or a sequence)'
+                )
+            if not found:
+                where = f'under "{parent}"' if parent else "at the top level"
+                raise LookupError(
+                    f'script_config key "{key}" is not set (no "{segment}" {where})'
+                )
+            consumed.append(segment)
+        return current
+
+    @staticmethod
+    def _describe(value: Any) -> str:
+        if value is None:
+            return "null"
+        if isinstance(value, bool):
+            return "a boolean"
+        if isinstance(value, (int, float)):
+            return "a number"
+        return "a string"
+
+    @classmethod
+    def _copy(cls, value: Any) -> Any:
+        if isinstance(value, dict):
+            return {key: cls._copy(child) for key, child in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [cls._copy(child) for child in value]
+        return value
+
+
+_script_config = MockScriptConfig()
+
+
+# ---------------------------------------------------------------------------
 # QoS namespace — SDP → IPFilterRule helper
 # ---------------------------------------------------------------------------
 
@@ -10169,6 +10325,7 @@ def install() -> ModuleType:
     mod.sdp = _sdp  # type: ignore[attr-defined]
     mod.numbers = _numbers  # type: ignore[attr-defined]
     mod.qos = _qos  # type: ignore[attr-defined]
+    mod.config = _script_config  # type: ignore[attr-defined]
     # LCR namespace (B2BUA-only) + the Route / LcrDecision types (mirrors the
     # Rust module.add_class::<Route>() / <LcrDecision>() top-level registration).
     mod.lcr = _lcr  # type: ignore[attr-defined]
@@ -10224,6 +10381,7 @@ def reset() -> None:
     _ipsec.clear()
     _stir.clear()
     _numbers.clear()
+    _script_config.clear()
     _smpp.clear()
     _http.clear()
     _lcr.clear()
@@ -10251,6 +10409,16 @@ def get_numbers() -> MockNumbersNamespace:
         mock_module.get_numbers().register_policy("teams-outbound@2026", default="e164")
     """
     return _numbers
+
+
+def get_script_config() -> MockScriptConfig:
+    """Access the mock config namespace singleton (test helper).
+
+    Give the script under test the ``script_config:`` document it should see::
+
+        mock_module.get_script_config().set({"routes": {"default": "gateway-a.example.com"}})
+    """
+    return _script_config
 
 
 def get_smpp() -> MockSmpp:

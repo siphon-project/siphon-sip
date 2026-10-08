@@ -13,6 +13,22 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
+### Added
+
+- **`script_config:` and the `config` script namespace.** A YAML document for
+  the tables a script walks (routes, rule lists, policy), either inline in
+  `siphon.yaml` or in a file of its own that the key names. A script reads it
+  with `config.get("routes.default", default)` and
+  `config.require("routes.prefixes")`, which raises a `LookupError` naming the
+  key; both return plain data as a new copy. The file form is watched under
+  `script.reload: auto` and read again on `SIGHUP`. A reload replaces the whole
+  document at once, and a file that does not parse is logged and leaves the
+  last good document serving. A file that is missing or does not parse at
+  startup stops siphon. `${VAR}` / `${VAR:-default}` are expanded as in
+  `siphon.yaml`. `config` becomes a reserved namespace name: an embedding host
+  that registered a namespace of its own called `config` has to rename it. See
+  `docs/reference/script-config.md`.
+
 ## [1.13.1] — 2026-10-08
 
 ### Added
