@@ -1328,6 +1328,128 @@ mod tests {
         )
     }
 
+    /// Known answer for Access-Network-Information (TS 32.299, AVP 1263,
+    /// vendor 10415, OctetString holding one P-Access-Network-Info
+    /// access-net-spec). The header bytes are written out by hand from RFC 6733
+    /// section 4.1 rather than produced by the encoder under test:
+    ///
+    /// ```text
+    /// 00 00 04 EF   AVP code 1263
+    /// C0            flags: V (vendor-specific) + M (mandatory)
+    /// 00 00 40      AVP length 64 = 12 header + 52 data
+    /// 00 00 28 AF   Vendor-Id 10415 (3GPP)
+    /// ```
+    #[test]
+    fn access_network_information_avp_known_answer() {
+        const VALUE: &str = "3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=0010100010000101";
+        let ims = ImsChargingData {
+            access_network_information: vec![VALUE.to_string()],
+            ..Default::default()
+        };
+
+        let mut expected = vec![
+            0x00, 0x00, 0x04, 0xEF, 0xC0, 0x00, 0x00, 0x40, 0x00, 0x00, 0x28, 0xAF,
+        ];
+        expected.extend_from_slice(VALUE.as_bytes());
+        assert_eq!(expected.len(), 64);
+
+        // The IMS-Information grouped AVP holds exactly this one member.
+        let ims_information_avp = ims.encode_ims_information_avp();
+        assert_eq!(&ims_information_avp[12..], expected.as_slice());
+        // And its own header: code 876, V+M, length 12 + 64, vendor 10415.
+        assert_eq!(
+            &ims_information_avp[..12],
+            &[0x00, 0x00, 0x03, 0x6C, 0xC0, 0x00, 0x00, 0x4C, 0x00, 0x00, 0x28, 0xAF]
+        );
+    }
+
+    /// A value whose length is not a multiple of four is padded with zero
+    /// octets that the AVP length does not count (RFC 6733 section 4.1).
+    #[test]
+    fn access_network_information_avp_is_padded_to_a_word_boundary() {
+        let ims = ImsChargingData {
+            access_network_information: vec!["IEEE-802.11".to_string()],
+            ..Default::default()
+        };
+        let ims_information_avp = ims.encode_ims_information_avp();
+        assert_eq!(
+            &ims_information_avp[12..],
+            &[
+                0x00, 0x00, 0x04, 0xEF, 0xC0, 0x00, 0x00, 0x17, 0x00, 0x00, 0x28,
+                0xAF, // header
+                b'I', b'E', b'E', b'E', b'-', b'8', b'0', b'2', b'.', b'1', b'1', // 11 octets
+                0x00, // 1 octet of padding
+            ]
+        );
+    }
+
+    /// One AVP per access-net-spec, in order, inside IMS-Information and after
+    /// Cause-Code, in an ACR built the way the service builds one.
+    #[test]
+    fn acr_carries_one_access_network_information_per_spec() {
+        let ims = ImsChargingData {
+            sip_method: Some("INVITE".into()),
+            cause_code: Some(0),
+            access_network_information: vec![
+                "3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=0010100010000101".into(),
+                "3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=0010100010000101;network-provided".into(),
+            ],
+            ..Default::default()
+        };
+        let mut params = AccountingParams::new(AccountingRecordType::EventRecord);
+        params.ims_data = Some(&ims);
+        let payload = encode_for_test(&params);
+
+        let ims_info = ims_information(&payload);
+        let values: Vec<String> = avps_with_code(ims_info, avp::ACCESS_NETWORK_INFORMATION)
+            .into_iter()
+            .map(utf8)
+            .collect();
+        assert_eq!(
+            values,
+            vec![
+                "3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=0010100010000101",
+                "3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=0010100010000101;network-provided",
+            ]
+        );
+
+        let codes: Vec<u32> = split_avps(ims_info).iter().map(|avp| avp.code).collect();
+        let cause_code_at = codes.iter().position(|code| *code == avp::CAUSE_CODE);
+        let first_access_network_at = codes
+            .iter()
+            .position(|code| *code == avp::ACCESS_NETWORK_INFORMATION);
+        assert!(cause_code_at.is_some() && cause_code_at < first_access_network_at);
+
+        // Not at the top level of the ACR, and not directly under
+        // Service-Information: only inside IMS-Information.
+        assert!(avps_with_code(&payload, avp::ACCESS_NETWORK_INFORMATION).is_empty());
+        let service_info = first_avp(&payload, avp::SERVICE_INFORMATION).unwrap();
+        assert!(avps_with_code(service_info, avp::ACCESS_NETWORK_INFORMATION).is_empty());
+    }
+
+    #[test]
+    fn acr_without_access_network_information_emits_none() {
+        let ims = ImsChargingData {
+            sip_method: Some("INVITE".into()),
+            ..Default::default()
+        };
+        let mut params = AccountingParams::new(AccountingRecordType::EventRecord);
+        params.ims_data = Some(&ims);
+        let payload = encode_for_test(&params);
+        assert!(
+            avps_with_code(ims_information(&payload), avp::ACCESS_NETWORK_INFORMATION).is_empty()
+        );
+    }
+
+    #[test]
+    fn access_network_information_is_in_the_dictionary_as_a_3gpp_octet_string() {
+        let definition = dictionary::lookup_avp(1263, dictionary::VENDOR_3GPP)
+            .expect("Access-Network-Information is in the dictionary");
+        assert_eq!(definition.name, "Access-Network-Information");
+        assert_eq!(definition.data_type, dictionary::AvpType::OctetString);
+        assert_eq!(avp::ACCESS_NETWORK_INFORMATION, 1263);
+    }
+
     /// A P-Asserted-Identity asserting an IMPU, its tel alias and the
     /// IMSI-derived IMPU must produce three Calling-Party-Address AVPs — not
     /// one AVP holding the raw header line.

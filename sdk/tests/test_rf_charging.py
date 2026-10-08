@@ -73,6 +73,37 @@ class TestRfMock:
         assert captured[0]["record_type"] == "EVENT"
         assert captured[0]["sip_method"] == "REGISTER"
 
+    def test_acr_event_carries_access_network_information(self):
+        from siphon import diameter
+        header = (
+            "3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=0010100010000101, "
+            "3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=0010100010000101;network-provided"
+        )
+        run(diameter.rf_acr_event(
+            sip_method="REGISTER",
+            access_network_information=header,
+        ))
+        captured = self.diameter.captured_acrs()
+        assert captured[0]["access_network_information"] == header
+
+    def test_session_acrs_accept_access_network_information(self):
+        from siphon import diameter
+        value = "3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=0010100010000101"
+        start = run(diameter.rf_acr_start(
+            sip_method="INVITE", access_network_information=value))
+        sid = start["session_id"]
+        run(diameter.rf_acr_interim(sid, 1, access_network_information=value))
+        run(diameter.rf_acr_stop(sid, 2, access_network_information=value))
+        assert [
+            entry["access_network_information"]
+            for entry in self.diameter.captured_acrs()
+        ] == [value, value, value]
+
+    def test_access_network_information_defaults_to_none(self):
+        from siphon import diameter
+        run(diameter.rf_acr_event(sip_method="REGISTER"))
+        assert self.diameter.captured_acrs()[0]["access_network_information"] is None
+
     def test_set_rf_result_code_propagates(self):
         from siphon import diameter
         self.diameter.set_rf_result_code(4002)  # DIAMETER_OUT_OF_SPACE

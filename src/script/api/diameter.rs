@@ -625,6 +625,7 @@ fn build_ims_data(
     outgoing_trunk_group_id: Option<&str>,
     visited_network_id: Option<&str>,
     cause_code: Option<i32>,
+    access_network_information: Option<&str>,
 ) -> PyResult<Option<ImsChargingData>> {
     let nothing_set = calling_party.is_none()
         && called_party.is_none()
@@ -640,7 +641,8 @@ fn build_ims_data(
         && incoming_trunk_group_id.is_none()
         && outgoing_trunk_group_id.is_none()
         && visited_network_id.is_none()
-        && cause_code.is_none();
+        && cause_code.is_none()
+        && access_network_information.is_none();
     if nothing_set {
         return Ok(None);
     }
@@ -690,6 +692,11 @@ fn build_ims_data(
         incoming_trunk_group_id: incoming_trunk_group_id.map(str::to_owned),
         outgoing_trunk_group_id: outgoing_trunk_group_id.map(str::to_owned),
         visited_network_id: visited_network_id.map(str::to_owned),
+        // Access-Network-Information is 0..n: a P-Access-Network-Info value
+        // listing several access-net-specs gets one AVP per spec.
+        access_network_information: access_network_information
+            .map(crate::sip::headers::charging::access_network_specs)
+            .unwrap_or_default(),
     }))
 }
 
@@ -2361,6 +2368,12 @@ impl PyDiameter {
     /// ``"mrfc"``, ``"mgcf"``, ``"bgcf"``, ``"as"``, ``"ibcf"``, ``"ecscf"``,
     /// ``"atcf"``, ``"mmtel"``, ``"tpf"``, ``"atgw"`` (TS 32.299 §7.2.111).
     ///
+    /// ``access_network_information`` takes the value of the request's
+    /// ``P-Access-Network-Info`` header as received. It is sent inside
+    /// IMS-Information as Access-Network-Information (TS 32.299, AVP 1263),
+    /// one AVP per comma-separated access-net-spec. Accepted by every
+    /// ``rf_acr_*`` call.
+    ///
     /// **Awaitable** — returns a coroutine, so `await` it. The request runs on
     /// tokio rather than on the calling thread, which for an `async def` handler
     /// is the asyncio driver its whole loop shares.
@@ -2372,7 +2385,7 @@ impl PyDiameter {
         originating_ioi=None, terminating_ioi=None,
         application_server=None, application_provided_called_party_address=None,
         incoming_trunk_group_id=None, outgoing_trunk_group_id=None,
-        visited_network_id=None,
+        visited_network_id=None, access_network_information=None,
         originator_address=None, recipient_address=None,
         originator_sccp_address=None, recipient_sccp_address=None,
         sm_message_type=None, reply_path_requested=None,
@@ -2404,6 +2417,7 @@ impl PyDiameter {
         incoming_trunk_group_id: Option<&str>,
         outgoing_trunk_group_id: Option<&str>,
         visited_network_id: Option<&str>,
+        access_network_information: Option<&str>,
         originator_address: Option<&str>,
         recipient_address: Option<&str>,
         originator_sccp_address: Option<&str>,
@@ -2454,6 +2468,7 @@ impl PyDiameter {
             outgoing_trunk_group_id,
             visited_network_id,
             cause_code,
+            access_network_information,
         )?;
         let sms_data = build_sms_data(
             originator_address,
@@ -2525,7 +2540,7 @@ impl PyDiameter {
         originating_ioi=None, terminating_ioi=None,
         application_server=None, application_provided_called_party_address=None,
         incoming_trunk_group_id=None, outgoing_trunk_group_id=None,
-        visited_network_id=None,
+        visited_network_id=None, access_network_information=None,
         originator_address=None, recipient_address=None,
         originator_sccp_address=None, recipient_sccp_address=None,
         sm_message_type=None, reply_path_requested=None,
@@ -2559,6 +2574,7 @@ impl PyDiameter {
         incoming_trunk_group_id: Option<&str>,
         outgoing_trunk_group_id: Option<&str>,
         visited_network_id: Option<&str>,
+        access_network_information: Option<&str>,
         originator_address: Option<&str>,
         recipient_address: Option<&str>,
         originator_sccp_address: Option<&str>,
@@ -2609,6 +2625,7 @@ impl PyDiameter {
             outgoing_trunk_group_id,
             visited_network_id,
             cause_code,
+            access_network_information,
         )?;
         let sms_data = build_sms_data(
             originator_address,
@@ -2686,7 +2703,7 @@ impl PyDiameter {
         originating_ioi=None, terminating_ioi=None,
         application_server=None, application_provided_called_party_address=None,
         incoming_trunk_group_id=None, outgoing_trunk_group_id=None,
-        visited_network_id=None,
+        visited_network_id=None, access_network_information=None,
         originator_address=None, recipient_address=None,
         originator_sccp_address=None, recipient_sccp_address=None,
         sm_message_type=None, reply_path_requested=None,
@@ -2721,6 +2738,7 @@ impl PyDiameter {
         incoming_trunk_group_id: Option<&str>,
         outgoing_trunk_group_id: Option<&str>,
         visited_network_id: Option<&str>,
+        access_network_information: Option<&str>,
         originator_address: Option<&str>,
         recipient_address: Option<&str>,
         originator_sccp_address: Option<&str>,
@@ -2771,6 +2789,7 @@ impl PyDiameter {
             outgoing_trunk_group_id,
             visited_network_id,
             cause_code,
+            access_network_information,
         )?;
         let sms_data = build_sms_data(
             originator_address,
@@ -2844,7 +2863,7 @@ impl PyDiameter {
         originating_ioi=None, terminating_ioi=None,
         application_server=None, application_provided_called_party_address=None,
         incoming_trunk_group_id=None, outgoing_trunk_group_id=None,
-        visited_network_id=None,
+        visited_network_id=None, access_network_information=None,
         originator_address=None, recipient_address=None,
         originator_sccp_address=None, recipient_sccp_address=None,
         sm_message_type=None, reply_path_requested=None,
@@ -2876,6 +2895,7 @@ impl PyDiameter {
         incoming_trunk_group_id: Option<&str>,
         outgoing_trunk_group_id: Option<&str>,
         visited_network_id: Option<&str>,
+        access_network_information: Option<&str>,
         originator_address: Option<&str>,
         recipient_address: Option<&str>,
         originator_sccp_address: Option<&str>,
@@ -2926,6 +2946,7 @@ impl PyDiameter {
             outgoing_trunk_group_id,
             visited_network_id,
             cause_code,
+            access_network_information,
         )?;
         let sms_data = build_sms_data(
             originator_address,
@@ -3042,6 +3063,7 @@ impl PyDiameter {
             outgoing_trunk_group_id,
             visited_network_id,
             cause_code,
+            None,
         )?;
         let requested = time_service_unit(requested_seconds);
         let service_context_id = service_context_id
@@ -3199,6 +3221,7 @@ impl PyDiameter {
             node_functionality,
             None,
             user_session_id,
+            None,
             None,
             None,
             None,
@@ -4018,6 +4041,209 @@ mod tests {
             let request = full_rx_aar_request(python, &[6, 7, 9]);
             rx_aar_wire(&request, Some("pcrf1.ims.mnc001.mcc001.3gppnetwork.org"))
         });
+
+        // `text2pcap`'s hex-dump form: an offset, then the octets.
+        let mut dump = String::new();
+        for (offset, chunk) in wire.chunks(16).enumerate() {
+            dump.push_str(&format!("{:06x}", offset * 16));
+            for byte in chunk {
+                dump.push_str(&format!(" {byte:02x}"));
+            }
+            dump.push('\n');
+        }
+        std::fs::write(&path, dump).expect("hex dump must be writable");
+    }
+
+    // ── Rf ACR: Access-Network-Information (TS 32.299, AVP 1263) ────────
+
+    const ACCESS_NETWORK_FROM_TERMINAL: &str =
+        "3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=0010100010000101";
+    const ACCESS_NETWORK_FROM_NETWORK: &str =
+        "3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=0010100010000101;network-provided";
+
+    /// The IMS-Information `rf_acr_event` builds from its kwargs when only
+    /// `sip_method` and `access_network_information` are set.
+    fn ims_data_with_access_network(access_network_information: Option<&str>) -> ImsChargingData {
+        build_ims_data(
+            None,
+            None,
+            Some("REGISTER"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            access_network_information,
+        )
+        .expect("the kwargs are valid")
+        .expect("IMS-Information is built")
+    }
+
+    /// An ACR-EVENT on the wire, framed the way `rf::send_acr` frames one.
+    fn rf_acr_event_wire(ims_data: &ImsChargingData) -> Vec<u8> {
+        let mut params = AccountingParams::new(AccountingRecordType::EventRecord);
+        params.ims_data = Some(ims_data);
+        params.user_name = Some("sip:001010000000001@ims.mnc001.mcc001.3gppnetwork.org");
+        let payload = rf::encode_acr_payload(
+            "pcscf.ims.mnc001.mcc001.3gppnetwork.org",
+            "ims.mnc001.mcc001.3gppnetwork.org",
+            "ims.mnc001.mcc001.3gppnetwork.org",
+            Some("cdf1.ims.mnc001.mcc001.3gppnetwork.org"),
+            "pcscf.ims.mnc001.mcc001.3gppnetwork.org;1;1",
+            &params,
+        );
+        crate::diameter::codec::encode_diameter_message(
+            crate::diameter::codec::FLAG_REQUEST | crate::diameter::codec::FLAG_PROXIABLE,
+            dictionary::CMD_ACCOUNTING,
+            dictionary::RF_APP_ID,
+            1,
+            1,
+            &payload,
+        )
+    }
+
+    #[test]
+    fn rf_access_network_information_kwarg_becomes_one_spec() {
+        let ims = ims_data_with_access_network(Some(ACCESS_NETWORK_FROM_TERMINAL));
+        assert_eq!(
+            ims.access_network_information,
+            vec![ACCESS_NETWORK_FROM_TERMINAL]
+        );
+    }
+
+    #[test]
+    fn rf_access_network_information_kwarg_splits_a_header_listing_several() {
+        let header = format!("{ACCESS_NETWORK_FROM_TERMINAL}, {ACCESS_NETWORK_FROM_NETWORK}");
+        let ims = ims_data_with_access_network(Some(&header));
+        assert_eq!(
+            ims.access_network_information,
+            vec![ACCESS_NETWORK_FROM_TERMINAL, ACCESS_NETWORK_FROM_NETWORK]
+        );
+    }
+
+    #[test]
+    fn rf_access_network_information_alone_is_enough_to_build_ims_information() {
+        let ims = build_ims_data(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(ACCESS_NETWORK_FROM_TERMINAL),
+        )
+        .unwrap()
+        .expect("the kwarg alone must not be dropped");
+        assert_eq!(
+            ims.access_network_information,
+            vec![ACCESS_NETWORK_FROM_TERMINAL]
+        );
+    }
+
+    #[test]
+    fn rf_ims_information_without_the_kwarg_has_no_access_network_information() {
+        assert!(ims_data_with_access_network(None)
+            .access_network_information
+            .is_empty());
+    }
+
+    fn lower_hex(text: &str) -> String {
+        text.bytes().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    /// The whole ACR-EVENT decodes, with our own decoder, to the value the
+    /// script passed. Our dictionary types the AVP OctetString, so it reads
+    /// back as the hex of the header text.
+    #[test]
+    fn rf_acr_event_wire_carries_access_network_information() {
+        let header = format!("{ACCESS_NETWORK_FROM_TERMINAL}, {ACCESS_NETWORK_FROM_NETWORK}");
+        let wire = rf_acr_event_wire(&ims_data_with_access_network(Some(&header)));
+
+        let message = crate::diameter::codec::decode_diameter(&wire).expect("the ACR decodes");
+        assert!(message.is_request);
+        assert_eq!(message.command_code, dictionary::CMD_ACCOUNTING);
+        let ims_information = &message.avps["Service-Information"]["IMS-Information"];
+        let decoded = &ims_information["Access-Network-Information"];
+        let values: Vec<String> = match decoded {
+            serde_json::Value::Array(items) => items
+                .iter()
+                .filter_map(|item| item.as_str().map(str::to_owned))
+                .collect(),
+            other => panic!("expected one entry per AVP, got {other}"),
+        };
+        assert_eq!(
+            values,
+            vec![
+                lower_hex(ACCESS_NETWORK_FROM_TERMINAL),
+                lower_hex(ACCESS_NETWORK_FROM_NETWORK),
+            ]
+        );
+    }
+
+    /// `access_network_information` is a keyword every `rf_acr_*` accepts from
+    /// Python. With no CDF connected each resolves to `None`, as before.
+    #[test]
+    fn rf_acr_calls_accept_access_network_information_from_python() {
+        pyo3::Python::initialize();
+        let manager = Arc::new(DiameterManager::new());
+        pyo3::Python::attach(|python| {
+            let diameter = Py::new(python, PyDiameter::new(manager)).unwrap();
+            let diameter = diameter.bind(python);
+            let keywords = || {
+                let keywords = PyDict::new(python);
+                keywords
+                    .set_item("access_network_information", ACCESS_NETWORK_FROM_TERMINAL)
+                    .unwrap();
+                keywords
+            };
+
+            for method in ["rf_acr_start", "rf_acr_event"] {
+                let coroutine = diameter
+                    .call_method(method, (), Some(&keywords()))
+                    .unwrap_or_else(|error| panic!("{method}: {error}"));
+                assert!(resolve(python, coroutine).is_none(), "{method}");
+            }
+            let coroutine = diameter
+                .call_method("rf_acr_interim", ("session;1", 1u32), Some(&keywords()))
+                .unwrap_or_else(|error| panic!("rf_acr_interim: {error}"));
+            assert!(resolve(python, coroutine).is_none());
+            let coroutine = diameter
+                .call_method("rf_acr_stop", ("session;1", 2u32), Some(&keywords()))
+                .unwrap_or_else(|error| panic!("rf_acr_stop: {error}"));
+            assert!(resolve(python, coroutine).is_none());
+        });
+    }
+
+    /// Emit a full Rf ACR-EVENT as hex for [`scripts/validate_rf_acr.sh`] to
+    /// feed to tshark.
+    ///
+    /// The known-answer tests pin bytes we chose, so they share whatever we
+    /// misread of TS 32.299. tshark decodes the same bytes with its own
+    /// dictionary.
+    #[test]
+    fn emit_rf_acr_for_external_dissection() {
+        let Ok(path) = std::env::var("SIPHON_RF_ACR_HEX_OUT") else {
+            // Nothing to do in an ordinary test run.
+            return;
+        };
+        let header = format!("{ACCESS_NETWORK_FROM_TERMINAL}, {ACCESS_NETWORK_FROM_NETWORK}");
+        let wire = rf_acr_event_wire(&ims_data_with_access_network(Some(&header)));
 
         // `text2pcap`'s hex-dump form: an offset, then the octets.
         let mut dump = String::new();

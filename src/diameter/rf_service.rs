@@ -927,6 +927,19 @@ where
         .get("P-Visited-Network-ID")
         .and_then(|v| crate::sip::headers::charging::parse_visited_network_id(v));
 
+    // P-Access-Network-Info can repeat, and one line can list several
+    // access-net-specs (RFC 7315 §5.4); each is one Access-Network-Information.
+    let access_network_information = message
+        .headers
+        .get_all("P-Access-Network-Info")
+        .map(|values| {
+            values
+                .iter()
+                .flat_map(|value| crate::sip::headers::charging::access_network_specs(value))
+                .collect()
+        })
+        .unwrap_or_default();
+
     // Role determination: P-Served-User wins, else compare From-URI to
     // local-domain predicate, else default ORIGINATING_ROLE.
     let role_of_node = message
@@ -974,6 +987,7 @@ where
         terminating_ioi: charging_vector.term_ioi,
         application_server: None,
         visited_network_id,
+        access_network_information,
     }
 }
 
@@ -1220,6 +1234,61 @@ mod tests {
         assert_eq!(ims.user_session_id.as_deref(), Some("a84b4c76e66710"));
         assert_eq!(ims.sip_method.as_deref(), Some("INVITE"));
         assert_eq!(ims.node_functionality, Some(NodeFunctionality::SCscf));
+    }
+
+    #[test]
+    fn ims_data_carries_every_access_network_spec() {
+        let raw = concat!(
+            "INVITE sip:bob@example.com SIP/2.0\r\n",
+            "Via: SIP/2.0/UDP host;branch=z9hG4bK1\r\n",
+            "From: <sip:alice@example.com>;tag=a\r\n",
+            "To: <sip:bob@example.com>\r\n",
+            "Call-ID: c\r\n",
+            "CSeq: 1 INVITE\r\n",
+            "P-Access-Network-Info: 3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=0010100010000101\r\n",
+            "P-Access-Network-Info: 3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=0010100010000101;network-provided, IEEE-802.11;network-provided\r\n",
+            "Max-Forwards: 70\r\n",
+            "Content-Length: 0\r\n",
+            "\r\n",
+        );
+        let msg = parse_test_sip(raw);
+        let ims = ims_data_from_request(
+            &msg,
+            Some(NodeFunctionality::PCscf),
+            |_| false,
+            SipTimestamps::now(),
+        );
+        assert_eq!(
+            ims.access_network_information,
+            vec![
+                "3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=0010100010000101",
+                "3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=0010100010000101;network-provided",
+                "IEEE-802.11;network-provided",
+            ]
+        );
+    }
+
+    #[test]
+    fn ims_data_without_access_network_info_has_none() {
+        let raw = concat!(
+            "INVITE sip:bob@example.com SIP/2.0\r\n",
+            "Via: SIP/2.0/UDP host;branch=z9hG4bK1\r\n",
+            "From: <sip:alice@example.com>;tag=a\r\n",
+            "To: <sip:bob@example.com>\r\n",
+            "Call-ID: c\r\n",
+            "CSeq: 1 INVITE\r\n",
+            "Max-Forwards: 70\r\n",
+            "Content-Length: 0\r\n",
+            "\r\n",
+        );
+        let msg = parse_test_sip(raw);
+        let ims = ims_data_from_request(
+            &msg,
+            Some(NodeFunctionality::PCscf),
+            |_| false,
+            SipTimestamps::now(),
+        );
+        assert!(ims.access_network_information.is_empty());
     }
 
     #[test]

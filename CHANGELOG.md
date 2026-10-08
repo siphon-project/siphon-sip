@@ -13,6 +13,19 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
+### Added
+
+- **Rf accounting records carry Access-Network-Information.** The
+  `P-Access-Network-Info` header of the request (RFC 7315) now goes to the CDF
+  as `Access-Network-Information` (TS 32.299, AVP 1263, vendor 10415) inside
+  `IMS-Information`, one AVP per access-net-spec when the header lists several.
+  The automatic ACRs of an `rf:` session read it off the request, and
+  `diameter.rf_acr_start` / `rf_acr_interim` / `rf_acr_stop` / `rf_acr_event`
+  take it as `access_network_information=`, the header value as received. The
+  AVP is sent with the M bit, like the other 3GPP charging AVPs. The automatic
+  Ro credit-control requests build `IMS-Information` from the same request and
+  carry it too; the `diameter.ro_ccr_*` calls have no such argument.
+
 ## [1.13.1] — 2026-10-08
 
 ### Added

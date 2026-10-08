@@ -1347,6 +1347,14 @@ static AVP_TABLE: &[AvpDef] = &[
         name: "Recipient-Address",
         data_type: AvpType::Grouped,
     },
+    // Charging: Access-Network-Information (TS 32.299), one access-net-spec
+    // of the SIP P-Access-Network-Info header, a member of IMS-Information
+    AvpDef {
+        code: 1263,
+        vendor_id: TGPP,
+        name: "Access-Network-Information",
+        data_type: AvpType::OctetString,
+    },
     // S6a / S6d (TS 29.272) — MME/SGSN ↔ HSS for LTE attach + auth vectors
     AvpDef {
         code: 1400,
@@ -2374,6 +2382,7 @@ pub mod avp {
     pub const NODE_FUNCTIONALITY: u32 = 862;
     pub const SERVICE_INFORMATION: u32 = 873;
     pub const IMS_INFORMATION: u32 = 876;
+    pub const ACCESS_NETWORK_INFORMATION: u32 = 1263;
     pub const IMS_VISITED_NETWORK_IDENTIFIER: u32 = 2713;
 
     // 3GPP S6c served-node identifiers

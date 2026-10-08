@@ -134,6 +134,44 @@ pub fn parse_visited_network_id(value: &str) -> Option<String> {
 
 // ── Internal helpers ────────────────────────────────────────────────────
 
+/// Split a `P-Access-Network-Info` header value into its `access-net-spec`s
+/// (RFC 7315 §5.4), each returned whole: access type or class, then its
+/// `;`-separated parameters, exactly as written.
+///
+/// One header line can carry several, comma-separated, typically the one the
+/// terminal supplied and a `network-provided` one. A comma inside a quoted
+/// parameter value does not separate.
+pub fn access_network_specs(value: &str) -> Vec<String> {
+    let mut specs = Vec::new();
+    let mut start = 0usize;
+    let mut in_quotes = false;
+    let mut escaped = false;
+
+    let mut push = |raw: &str| {
+        let spec = raw.trim();
+        if !spec.is_empty() {
+            specs.push(spec.to_string());
+        }
+    };
+    for (index, byte) in value.bytes().enumerate() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match byte {
+            b'\\' if in_quotes => escaped = true,
+            b'"' => in_quotes = !in_quotes,
+            b',' if !in_quotes => {
+                push(&value[start..index]);
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    push(&value[start..]);
+    specs
+}
+
 fn strip_quotes(s: &str) -> &str {
     let bytes = s.as_bytes();
     if bytes.len() >= 2 && bytes[0] == b'"' && bytes[bytes.len() - 1] == b'"' {
@@ -290,6 +328,49 @@ mod tests {
         let su = ServedUser::parse("<tel:+15551234>;sescase=orig").unwrap();
         assert_eq!(su.uri, "tel:+15551234");
         assert_eq!(su.sescase.as_deref(), Some("orig"));
+    }
+
+    // ── P-Access-Network-Info ───────────────────────────────────────────
+
+    #[test]
+    fn access_network_single_spec_is_kept_whole() {
+        assert_eq!(
+            access_network_specs("3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=0010100010000101"),
+            vec!["3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=0010100010000101"]
+        );
+    }
+
+    #[test]
+    fn access_network_specs_split_on_commas() {
+        assert_eq!(
+            access_network_specs(
+                "3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=0010100010000101 , \
+                 3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=0010100010000101;network-provided"
+            ),
+            vec![
+                "3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=0010100010000101",
+                "3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=0010100010000101;network-provided",
+            ]
+        );
+    }
+
+    #[test]
+    fn access_network_comma_inside_a_quoted_string_does_not_split() {
+        assert_eq!(
+            access_network_specs(
+                "IEEE-802.11;i-wlan-node-id=\"a, \\\"b\\\", c\", IEEE-802.11;network-provided"
+            ),
+            vec![
+                "IEEE-802.11;i-wlan-node-id=\"a, \\\"b\\\", c\"",
+                "IEEE-802.11;network-provided",
+            ]
+        );
+    }
+
+    #[test]
+    fn access_network_empty_value_yields_nothing() {
+        assert!(access_network_specs("").is_empty());
+        assert!(access_network_specs(" , ,").is_empty());
     }
 
     // ── P-Visited-Network-ID ────────────────────────────────────────────

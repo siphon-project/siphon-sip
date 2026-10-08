@@ -6968,6 +6968,7 @@ class MockDiameter:
         incoming_trunk_group_id: Optional[str] = None,
         outgoing_trunk_group_id: Optional[str] = None,
         visited_network_id: Optional[str] = None,
+        access_network_information: Optional[str] = None,
         user_name: Optional[str] = None,
         subscription_id: Optional[Union[str, list[str]]] = None,
         subscription_id_type: Optional[Union[str, list[str]]] = None,
@@ -6995,6 +6996,7 @@ class MockDiameter:
             incoming_trunk_group_id=incoming_trunk_group_id,
             outgoing_trunk_group_id=outgoing_trunk_group_id,
             visited_network_id=visited_network_id,
+            access_network_information=access_network_information,
             user_name=user_name,
             subscription_id=subscription_id,
             subscription_id_type=subscription_id_type,
@@ -7022,6 +7024,7 @@ class MockDiameter:
         incoming_trunk_group_id: Optional[str] = None,
         outgoing_trunk_group_id: Optional[str] = None,
         visited_network_id: Optional[str] = None,
+        access_network_information: Optional[str] = None,
         user_name: Optional[str] = None,
         subscription_id: Optional[Union[str, list[str]]] = None,
         subscription_id_type: Optional[Union[str, list[str]]] = None,
@@ -7049,6 +7052,7 @@ class MockDiameter:
             incoming_trunk_group_id=incoming_trunk_group_id,
             outgoing_trunk_group_id=outgoing_trunk_group_id,
             visited_network_id=visited_network_id,
+            access_network_information=access_network_information,
             user_name=user_name,
             subscription_id=subscription_id,
             subscription_id_type=subscription_id_type,
@@ -7077,6 +7081,7 @@ class MockDiameter:
         incoming_trunk_group_id: Optional[str] = None,
         outgoing_trunk_group_id: Optional[str] = None,
         visited_network_id: Optional[str] = None,
+        access_network_information: Optional[str] = None,
         user_name: Optional[str] = None,
         subscription_id: Optional[Union[str, list[str]]] = None,
         subscription_id_type: Optional[Union[str, list[str]]] = None,
@@ -7105,6 +7110,7 @@ class MockDiameter:
             incoming_trunk_group_id=incoming_trunk_group_id,
             outgoing_trunk_group_id=outgoing_trunk_group_id,
             visited_network_id=visited_network_id,
+            access_network_information=access_network_information,
             user_name=user_name,
             subscription_id=subscription_id,
             subscription_id_type=subscription_id_type,
@@ -7130,6 +7136,7 @@ class MockDiameter:
         incoming_trunk_group_id: Optional[str] = None,
         outgoing_trunk_group_id: Optional[str] = None,
         visited_network_id: Optional[str] = None,
+        access_network_information: Optional[str] = None,
         user_name: Optional[str] = None,
         subscription_id: Optional[Union[str, list[str]]] = None,
         subscription_id_type: Optional[Union[str, list[str]]] = None,
@@ -7137,7 +7144,23 @@ class MockDiameter:
         service_context_id: Optional[str] = None,
         peer: Optional[str] = None,
     ) -> Optional[dict]:
-        """Send Rf ACR-EVENT (one-shot accounting — REGISTER/MESSAGE)."""
+        """Send Rf ACR-EVENT (one-shot accounting — REGISTER/MESSAGE).
+
+        ``access_network_information`` (also on ``rf_acr_start`` /
+        ``rf_acr_interim`` / ``rf_acr_stop``) is the value of the request's
+        ``P-Access-Network-Info`` header. It is sent inside IMS-Information as
+        Access-Network-Information (TS 32.299, AVP 1263), one AVP per
+        comma-separated access-net-spec::
+
+            await diameter.rf_acr_event(
+                sip_method="REGISTER",
+                calling_party=str(request.from_uri),
+                access_network_information=request.get_header("P-Access-Network-Info"),
+            )
+
+        The automatic session ACRs (``rf:`` config) fill it from the header
+        themselves.
+        """
         return self._record_acr(
             "EVENT",
             session_id=None,
@@ -7157,6 +7180,7 @@ class MockDiameter:
             incoming_trunk_group_id=incoming_trunk_group_id,
             outgoing_trunk_group_id=outgoing_trunk_group_id,
             visited_network_id=visited_network_id,
+            access_network_information=access_network_information,
             user_name=user_name,
             subscription_id=subscription_id,
             subscription_id_type=subscription_id_type,

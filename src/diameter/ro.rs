@@ -302,6 +302,12 @@ pub struct ImsChargingData {
     /// `Outgoing-Trunk-Group-Id` AVP — same on the terminating side
     /// (typically the chosen `gateway.select(...)` group).
     pub outgoing_trunk_group_id: Option<String>,
+    /// `Access-Network-Information` (TS 32.299, AVP 1263), **0..n**: the
+    /// content of the SIP `P-Access-Network-Info` header (RFC 7315 §5.4), one
+    /// entry per `access-net-spec`. A request can carry several, typically the
+    /// one the terminal supplied and a `network-provided` one, and each is an
+    /// AVP of its own. Sent as received: the value is an OctetString.
+    pub access_network_information: Vec<String>,
 }
 
 impl ImsChargingData {
@@ -416,6 +422,13 @@ impl ImsChargingData {
         }
         if let Some(cause) = self.cause_code {
             ims_inner.extend_from_slice(&encode_avp_i32_3gpp(avp::CAUSE_CODE, cause));
+        }
+        // Access-Network-Information is 0..n: one AVP per access-net-spec.
+        for access_network in &self.access_network_information {
+            ims_inner.extend_from_slice(&encode_avp_octet_3gpp(
+                avp::ACCESS_NETWORK_INFORMATION,
+                access_network.as_bytes(),
+            ));
         }
 
         ims_inner
