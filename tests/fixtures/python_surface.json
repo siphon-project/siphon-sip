@@ -13,6 +13,7 @@
     "auth",
     "b2bua",
     "cache",
+    "config",
     "diameter",
     "gateway",
     "isc",
@@ -2358,6 +2359,18 @@
         "doc": "Update an N5 app session \u2014 media renegotiation (re-INVITE / UPDATE).",
         "kind": "method_descriptor",
         "sig": "($self, session_id, media_components=None, events=None, notif_uri=None)"
+      }
+    },
+    "ScriptConfig": {
+      "get": {
+        "doc": "Return the value at ``key``, or ``default`` when it is not set.",
+        "kind": "method_descriptor",
+        "sig": "($self, key, default=None)"
+      },
+      "require": {
+        "doc": "Return the value at ``key``, or raise when it is not set.",
+        "kind": "method_descriptor",
+        "sig": "($self, key)"
       }
     },
     "Sdp": {

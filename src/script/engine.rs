@@ -2916,6 +2916,170 @@ def on_invite(call):
         assert!(message.headers.from().unwrap().contains("+31612345678"));
     }
 
+    /// A script reads a routing table from `script_config` at call time, the
+    /// table is replaced on disk, and the next call routes by the new one.
+    ///
+    /// Also covers the stub: before the namespace is wired, `config` is an
+    /// empty document rather than something that raises.
+    ///
+    /// Runs in a process of its own: the `config` singleton is set once per
+    /// process, and this test needs it to be the store it reloads.
+    #[test]
+    fn a_script_routes_from_a_script_config_table_and_sees_a_reload() {
+        crate::own_process::run(
+            concat!(
+                module_path!(),
+                "::a_script_routes_from_a_script_config_table_and_sees_a_reload"
+            ),
+            script_routes_from_script_config,
+        );
+    }
+
+    fn script_routes_from_script_config() {
+        use crate::script::api::call::{CallAction, PyCall};
+        use crate::script::api::config::PyScriptConfig;
+        use crate::script::script_config::{ReloadOutcome, ScriptConfigStore};
+        use crate::sip::builder::SipMessageBuilder;
+        use crate::sip::message::Method;
+        use crate::sip::uri::SipUri;
+        use std::sync::{Arc, Mutex};
+
+        Python::initialize();
+
+        // Not wired yet: the stub is an empty document.
+        compile_temp_script(
+            r#"
+from siphon import config
+
+assert config.get("routes") is None
+assert config.get("routes", []) == []
+try:
+    config.require("routes.default")
+except LookupError as error:
+    assert "routes.default" in str(error)
+else:
+    raise AssertionError("require() returned on an empty document")
+"#,
+        )
+        .unwrap();
+
+        let directory = tempfile::tempdir().unwrap();
+        let table = directory.path().join("routes.yaml");
+        std::fs::write(
+            &table,
+            concat!(
+                "routes:\n",
+                "  default: gateway-a.example.com\n",
+                "  prefixes:\n",
+                "    - prefix: \"+1555\"\n",
+                "      gateway: gateway-b.example.com\n",
+                "    - prefix: \"+15550100\"\n",
+                "      gateway: gateway-c.example.com\n",
+            ),
+        )
+        .unwrap();
+        let store = Arc::new(ScriptConfigStore::from_file(&table).unwrap());
+        Python::attach(|python| {
+            crate::script::api::set_config_singleton(
+                python,
+                PyScriptConfig::new(Arc::clone(&store)),
+            )
+            .unwrap();
+        });
+
+        let state = compile_temp_script(
+            r#"
+from siphon import b2bua, config
+
+@b2bua.on_invite
+def on_invite(call):
+    number = call.ruri.user
+    gateway = config.require("routes.default")
+    longest = -1
+    for route in config.get("routes.prefixes", []):
+        prefix = route["prefix"]
+        if number.startswith(prefix) and len(prefix) > longest:
+            gateway, longest = route["gateway"], len(prefix)
+    call.dial(f"sip:{number}@{gateway}")
+"#,
+        )
+        .unwrap();
+
+        let dial_target = |number: &str| -> String {
+            let invite = SipMessageBuilder::new()
+                .request(
+                    Method::Invite,
+                    SipUri::new("example.com".to_string()).with_user(number.to_string()),
+                )
+                .via("SIP/2.0/UDP 192.0.2.1:5060;branch=z9hG4bK-script-config".to_string())
+                .from("<sip:+15550123@example.com>;tag=script-config".to_string())
+                .to(format!("<sip:{number}@example.com>"))
+                .call_id("script-config@example.com".to_string())
+                .cseq("1 INVITE".to_string())
+                .content_length(0)
+                .build()
+                .unwrap();
+            let py_call = PyCall::new(
+                "script-config-001".to_string(),
+                Arc::new(Mutex::new(invite)),
+                "192.0.2.1".to_string(),
+                "udp".to_string(),
+            );
+            Python::attach(|python| {
+                let call_obj = Py::new(python, py_call).expect("failed to create PyCall");
+                state.handlers[0]
+                    .callable
+                    .bind(python)
+                    .call1((call_obj.bind(python),))
+                    .expect("handler invocation failed");
+                let borrowed = call_obj.borrow(python);
+                match borrowed.action() {
+                    CallAction::Dial { target, .. } => target.clone(),
+                    other => panic!("expected Dial, got {other:?}"),
+                }
+            })
+        };
+
+        assert_eq!(
+            dial_target("+15550100"),
+            "sip:+15550100@gateway-c.example.com",
+            "the longest matching prefix wins"
+        );
+        assert_eq!(
+            dial_target("+15550199"),
+            "sip:+15550199@gateway-b.example.com"
+        );
+        assert_eq!(
+            dial_target("+44700900123"),
+            "sip:+44700900123@gateway-a.example.com",
+            "no prefix matches: the default route"
+        );
+
+        // The table changes on disk; the script is not reloaded.
+        std::fs::write(
+            &table,
+            concat!(
+                "routes:\n",
+                "  default: gateway-d.example.com\n",
+                "  prefixes: []\n",
+            ),
+        )
+        .unwrap();
+        assert_eq!(store.reload(), ReloadOutcome::Reloaded);
+        assert_eq!(
+            dial_target("+15550100"),
+            "sip:+15550100@gateway-d.example.com"
+        );
+
+        // A table that does not parse leaves the last good one routing.
+        std::fs::write(&table, "routes: [unterminated\n").unwrap();
+        assert!(matches!(store.reload(), ReloadOutcome::Failed(_)));
+        assert_eq!(
+            dial_target("+15550100"),
+            "sip:+15550100@gateway-d.example.com"
+        );
+    }
+
     #[test]
     fn b2bua_accept_refer_carries_a_number_policy_for_the_transferred_leg() {
         // A transfer target is named by the referrer, in the referrer's format

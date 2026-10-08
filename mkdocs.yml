@@ -67,6 +67,7 @@ nav:
       - Call: reference/call.md
       - SDP: reference/sdp.md
       - Numbers (E.164): reference/numbers.md
+      - Script configuration: reference/script-config.md
       - SIP types: reference/types.md
       - Proxy & B2BUA: reference/proxy.md
       - Registrar: reference/registrar.md
