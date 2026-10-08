@@ -66,23 +66,21 @@ jobs:
     strategy:
       matrix:
         include:
+          # Pinned, not ubuntu-latest: the runner's glibc is the floor the
+          # packages declare (libc6 / glibc >= 2.39 in Cargo.toml), so the two
+          # move together in one reviewed change.
           - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-24.04
           # Native ARM runner. siphon embeds CPython via PyO3, so cross-compiling
           # aarch64 from an x86 host needs a full cross-Python (PYO3_CROSS_LIB_DIR
-          # → an aarch64 libpython); building on a native aarch64 runner makes
-          # PyO3 resolve the host python3.14 and sidesteps cross-compilation.
+          # → an aarch64 libpython); building on a native aarch64 runner lets
+          # the bundled interpreter be the host's own architecture.
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-24.04-arm
 
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
-
-      - name: Install Python 3.14 (free-threaded)
-        uses: deadsnakes/action@v3.2.0
-        with:
-          python-version: "3.14-dev"
 
       # Default release build excludes SCTP (the `sctp` Cargo feature is off by
       # default), so no libsctp system dependency is needed here.
@@ -112,9 +110,25 @@ jobs:
       - name: Pin siphon-sip to this checkout
         run: scripts/pin-siphon-sip-to-tree.sh
 
+      # The interpreter the artifacts ship AND the one the binary is linked
+      # against: a pinned, checksum-verified free-threaded CPython, staged under
+      # target/python-bundle. The packages install it as /usr/lib/siphon/python
+      # and the tarball carries it as python/, so no artifact depends on a
+      # Python from the host. See the script header for why. After the cache
+      # restore, so a cached target/ cannot overlay it.
+      - name: Stage the bundled free-threaded CPython
+        run: scripts/bundle-python.sh target/python-bundle
+
+      # RUSTFLAGS carries the rpath to the bundled libpython and the directory
+      # the linker finds it in. With --target they apply to the binary only,
+      # not to build scripts.
       - name: Build release binary (siphon-bin — http + ui)
         working-directory: siphon-bin
-        run: PYO3_PYTHON=python3.14 cargo build --release --target ${{ matrix.target }} --features ui
+        run: |
+          export PYO3_PYTHON="$GITHUB_WORKSPACE/target/python-bundle/bin/python3.14t"
+          RUSTFLAGS="$(../scripts/bundle-python.sh --print-rustflags ../target/python-bundle)"
+          export RUSTFLAGS
+          cargo build --release --target ${{ matrix.target }} --features ui
 
       # Stage it where the packaging steps below already look. Everything in
       # Cargo.toml's [package.metadata.deb] / [package.metadata.generate-rpm]
@@ -131,7 +145,7 @@ jobs:
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         run: |
           cargo install cargo-deb
-          PYO3_PYTHON=python3.14 cargo deb --target ${{ matrix.target }} --no-build
+          cargo deb --target ${{ matrix.target }} --no-build
 
       - name: Build .rpm package
         if: matrix.target == 'x86_64-unknown-linux-gnu'
@@ -139,12 +153,25 @@ jobs:
           cargo install cargo-generate-rpm
           cargo generate-rpm --target ${{ matrix.target }}
 
+      # Install each package on the oldest base it claims to support, with no
+      # Python there, and start siphon from it. Both images have glibc 2.39,
+      # the floor the packages declare, so this is also what catches a build
+      # that has come to need a newer one.
+      - name: Verify the packages install and run free-threaded
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: |
+          scripts/verify-package.sh "$(find target -name '*.deb' -print -quit)" ubuntu:24.04
+          scripts/verify-package.sh "$(find target -name '*.rpm' -print -quit)" almalinux:10-minimal
+
+      # python/ sits next to the binary, where the rpath's $ORIGIN entry looks.
       - name: Package tarball
         run: |
           ARCHIVE="siphon-${{ github.ref_name }}-${{ matrix.target }}.tar.gz"
           tar czf "$ARCHIVE" \
-            -C target/${{ matrix.target }}/release siphon \
+            --transform='s,^python-bundle,python,' \
             --transform='s,^,siphon-${{ github.ref_name }}/,' \
+            -C target/${{ matrix.target }}/release siphon \
+            -C "${{ github.workspace }}/target" python-bundle \
             -C "${{ github.workspace }}" siphon.yaml scripts/proxy_default.py scripts/b2bua_default.py \
             dist/siphon.service etc/logrotate.d/siphon LICENSE README.md
           echo "ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
@@ -185,7 +212,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Install Python 3.14 (free-threaded)
+      # Only so `cargo publish` can compile the crate to verify it; nothing
+      # built here ships, so the GIL build is fine.
+      - name: Install Python 3.14
         uses: deadsnakes/action@v3.2.0
         with:
           python-version: "3.14-dev"

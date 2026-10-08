@@ -312,9 +312,22 @@ It features a RFC 3261 compliant SIP parser, stateful proxy with \
 parallel/sequential forking, digest authentication, in-memory \
 registrar with Redis/PostgreSQL backends, and hot-reloaded Python \
 routing scripts."""
-depends = "$auto, python3 (>= 3.12)"
+# No python3 dependency: the package carries its own free-threaded CPython
+# under /usr/lib/siphon/python (staged by scripts/bundle-python.sh), which the
+# binary reaches through its rpath.
+#
+# The libc6 floor is spelled out because $auto cannot supply it for the siphon
+# binary: dpkg-shlibdeps gives up on a binary whose libpython belongs to no
+# installed package. It is the glibc of the release runner (ubuntu-24.04). The
+# release installs and starts the package on a base with exactly that glibc
+# (scripts/verify-package.sh), so a binary that needs a newer one fails there.
+# adduser is what preinst creates the service account with.
+depends = "$auto, libc6 (>= 2.39), adduser"
 assets = [
     ["target/release/siphon", "usr/bin/", "755"],
+    ["target/python-bundle/bin/python3.14t", "usr/lib/siphon/python/bin/", "755"],
+    ["target/python-bundle/lib/**/*", "usr/lib/siphon/python/lib/", "644"],
+    ["target/python-bundle/LICENSE.txt", "usr/lib/siphon/python/", "644"],
     ["siphon.yaml", "etc/siphon/siphon.yaml", "644"],
     ["scripts/proxy_default.py", "etc/siphon/scripts/proxy_default.py", "644"],
     ["scripts/b2bua_default.py", "etc/siphon/scripts/b2bua_default.py", "644"],
@@ -329,8 +342,17 @@ systemd-units = { unit-name = "siphon", enable = false, start = false }
 
 # --- RPM packaging (cargo-generate-rpm) ---
 [package.metadata.generate-rpm]
+# Requirements are listed by hand. Automatic detection adds a requirement on
+# libpython3.14t.so.1.0, which the package itself carries (no Provides is
+# generated for it), so the rpm would not install where the distribution has
+# no free-threaded Python of its own. The glibc floor mirrors the deb.
+auto-req = "disabled"
 assets = [
     { source = "target/release/siphon", dest = "/usr/bin/siphon", mode = "755" },
+    # The bundled free-threaded CPython, see the note in the deb section.
+    { source = "target/python-bundle/bin/python3.14t", dest = "/usr/lib/siphon/python/bin/python3.14t", mode = "755" },
+    { source = "target/python-bundle/lib/**/*", dest = "/usr/lib/siphon/python/lib/", mode = "644" },
+    { source = "target/python-bundle/LICENSE.txt", dest = "/usr/lib/siphon/python/LICENSE.txt", mode = "644" },
     { source = "siphon.yaml", dest = "/etc/siphon/siphon.yaml", mode = "644", config = true },
     { source = "scripts/proxy_default.py", dest = "/etc/siphon/scripts/proxy_default.py", mode = "644" },
     { source = "scripts/b2bua_default.py", dest = "/etc/siphon/scripts/b2bua_default.py", mode = "644" },
@@ -341,7 +363,7 @@ assets = [
 ]
 
 [package.metadata.generate-rpm.requires]
-python3 = ">= 3.12"
+glibc = ">= 2.39"
 
 # RPM scriptlets: create user, reload systemd, enable on install
 [package.metadata.generate-rpm.scriptlets]
