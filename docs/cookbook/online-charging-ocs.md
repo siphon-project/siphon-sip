@@ -143,7 +143,10 @@ runs the re-auth + teardown for you.
 ## Script control (SMS / RCS — one-shot IEC)
 
 Charge a page-mode `MESSAGE` before relaying it, and reject with `402` when the
-balance is empty:
+balance is empty. siphon does not charge a `MESSAGE` on its own: nothing in the
+`ro:` section turns that on, and a message is debited only when the script sends
+the CCR-EVENT as below. Pass `service_context_id` on the call; without it the
+event carries the voice context, `32260@3gpp.org`.
 
 ```python
 from siphon import proxy, diameter

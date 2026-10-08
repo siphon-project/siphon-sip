@@ -13,6 +13,16 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
+### Removed
+
+- **`ro.charge_message` is gone.** It was documented as one-shot charging of
+  SIP `MESSAGE`, defaulted to `true`, and was read by nothing: a `MESSAGE` has
+  only ever been charged when the script calls `diameter.ro_ccr_event`. That
+  is unchanged, and the Ro cookbook now says so. A configuration that still
+  carries the key loads as before and the key is ignored, so no edit is
+  needed; anyone who set it expecting automatic charging has to add the
+  `ro_ccr_event` call to their `MESSAGE` handler.
+
 ## [1.13.1] — 2026-10-08
 
 ### Added
