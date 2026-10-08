@@ -66,52 +66,101 @@ async def route(call):
         call.dial(destination.uri)
 
 
+# The profile for the pair that remains after a transfer, keyed on
+# (survivor is Teams, target is Teams). The survivor offers, the target answers,
+# so each entry reads "survivor's media -> target's media".
+TRANSFER_PROFILES = {
+    (False, False): "rtp_passthrough",  # carrier -> carrier: plain RTP both ends
+    (False, True): "rtp_to_srtp",       # carrier -> Teams
+    (True, False): "srtp_to_rtp",       # Teams   -> carrier
+    (True, True): "srtp_to_srtp",       # Teams   -> Teams: SRTP both ends
+}
+
+
+def uri_host(uri):
+    """Host of a SIP URI string, lowercased — ``sip:user@host:port;params`` -> ``host``."""
+    rest = uri.split(":", 1)[-1].split("?", 1)[0]
+    rest = rest.rsplit("@", 1)[-1].split(";", 1)[0]
+    if rest.startswith("["):
+        return rest.split("]", 1)[0].lstrip("[").lower()
+    return rest.split(":", 1)[0].lower()
+
+
+def targets_teams(uri):
+    """True when a transfer target is on the Teams side of the SBC.
+
+    Here that means the Refer-To names one of the ``teams`` gateway group's own
+    hosts. If your deployment names Teams users another way (a number range the
+    carrier refers to, say), this is the function to replace.
+    """
+    host = uri_host(uri)
+    return any(uri_host(destination.uri) == host for destination in gateway.list("teams"))
+
+
 @b2bua.on_refer
 async def on_refer(call):
-    """A party transfers the call away — pick the profile for the pair that REMAINS.
+    """A party transfers the call away — route and anchor the pair that REMAINS.
 
-    Every call here is anchored with a DIRECTION-BOUND profile: ``srtp_to_rtp``
-    means "the offerer speaks SRTP, the answerer speaks plain RTP". A transfer
-    takes one of those two parties out of the call, so the profile that suited
-    the original pairing is usually wrong for the new one — and the failure is
-    silent, a connected call with no audio in either direction.
+    A siphon-terminated transfer dials the target directly: ``@b2bua.on_invite``
+    does not run again, so this handler makes both decisions that one made for
+    the original call, and neither can be inherited from it.
+
+    **Where the new leg goes.** ``next_hop=`` picks the trunk. The target can be
+    on either side: a transfer to a PSTN number leaves via the carrier, a
+    transfer to a Teams user goes back to Teams.
+
+    **Which media profile it gets.** Every call here is anchored with a
+    DIRECTION-BOUND profile: ``srtp_to_rtp`` means "the offerer speaks SRTP, the
+    answerer speaks plain RTP". A transfer takes one of those two parties out of
+    the call, so the profile that suited the original pairing is usually wrong
+    for the new one — and the failure is silent, a connected call with no audio
+    in either direction.
 
     The rule: **the survivor is the peer of the referrer**, and the profile
-    describes survivor -> target.
+    describes survivor -> target. With two sides that is four pairings:
 
-      Teams refers   -> Teams leaves, a carrier leg survives and the target is
-                        carrier-side too: plain RTP both ends, ``rtp_passthrough``.
-      Carrier refers -> the TEAMS leg survives, so the new pair is still
-                        SRTP -> plain RTP: keep ``srtp_to_rtp``.
+      survivor   target    next_hop   profile
+      carrier    carrier   carrier    ``rtp_passthrough``
+      carrier    Teams     teams      ``rtp_to_srtp``
+      Teams      carrier   carrier    ``srtp_to_rtp``
+      Teams      Teams     teams      ``srtp_to_srtp``
 
     ``call.refer_side`` ("a"/"b") says which leg referred. In practice Teams is
-    almost always the transferor, but the SBC should not fall over otherwise.
+    almost always the transferor, so the first two rows are the ones that carry
+    traffic, but the SBC should not fall over on the others.
     """
     if not call.refer_to:
         call.reject_refer(400, "Bad Request")
         return
 
     # from_gateway() answers for the A-leg; refer_side says which leg referred.
-    # They agree exactly when the Teams party is the one transferring.
+    # They agree exactly when the Teams party is the one transferring — and the
+    # survivor is whoever did not.
     a_leg_is_teams = call.from_gateway("teams")
     referrer_is_teams = a_leg_is_teams == (call.refer_side == "a")
+    survivor_is_teams = not referrer_is_teams
+    target_is_teams = targets_teams(call.refer_to)
 
-    # Teams leaving leaves two plain-RTP ends behind; Teams surviving keeps the
-    # asymmetric pairing.
-    profile = "rtp_passthrough" if referrer_is_teams else "srtp_to_rtp"
-
-    destination = gateway.select("carrier")
+    group = "teams" if target_is_teams else "carrier"
+    destination = gateway.select(group)
     if not destination:
-        log.error(f"[{call.id}] no healthy carrier gateway for transfer")
+        log.error(f"[{call.id}] no healthy {group} gateway for transfer")
         call.reject_refer(503, "Service Unavailable")
         return
 
+    profile = TRANSFER_PROFILES[(survivor_is_teams, target_is_teams)]
     log.info(
         f"[{call.id}] transfer -> {call.refer_to} via {destination.uri} "
-        f"(referrer={'teams' if referrer_is_teams else 'carrier'}, profile={profile})"
+        f"(survivor={'teams' if survivor_is_teams else 'carrier'}, "
+        f"target={group}, profile={profile})"
     )
     call.accept_refer(
+        # Verbatim: whatever URI parameters a Refer-To aimed at Teams carries
+        # are Teams' own, so do not rebuild it. Reshape the number only on the
+        # carrier rows (number_policy= / format=), never on a Teams target.
         target=call.refer_to,
+        # The Teams gateway URI carries transport=tls, which the Refer-To itself
+        # need not, so the new leg is routed by this and not by the target.
         next_hop=destination.uri,
         mode="terminate",
         # The pair that REMAINS after the referrer leaves — never simply the

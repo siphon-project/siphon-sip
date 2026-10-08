@@ -146,9 +146,10 @@ media:
         replace: ["origin", "session-connection"]
         direction: ["teams", "carrier"]
     # Symmetric: both halves say the same thing, so it survives a re-pairing.
-    # This is what a transfer away from Teams uses — see teams_sbc.py's
-    # @b2bua.on_refer. Named explicitly here even though siphon ships a built-in
-    # of the same name, so the example is readable on its own.
+    # This is what a transfer from Teams to a PSTN number uses (two carrier legs
+    # remain) — see TRANSFER_PROFILES in teams_sbc.py for all four pairings.
+    # Named explicitly here even though siphon ships a built-in of the same
+    # name, so the example is readable on its own.
     rtp_passthrough:
       offer:
         replace: ["origin", "session-connection"]
@@ -160,9 +161,9 @@ media:
     # DIRECTION-BOUND. The two halves describe specific sides: the offerer
     # speaks SRTP, the answerer speaks plain RTP, and `direction` names which
     # rtpengine interface each is on. That is correct for the pairing it was
-    # chosen for and wrong for any other — so a call transferred away from Teams
-    # must NOT inherit it. See the @b2bua.on_refer handler in teams_sbc.py:
-    # accept_refer(profile="rtp_passthrough") for the pair that remains.
+    # chosen for and wrong for any other — so a transferred call must NOT
+    # inherit it. See the @b2bua.on_refer handler in teams_sbc.py, which names
+    # the profile for the pair that remains.
     srtp_to_rtp:
       offer:
         transport_protocol: "RTP/AVP"
@@ -180,6 +181,20 @@ media:
         ice: "remove"
         replace: ["origin", "session-connection"]
         direction: ["carrier", "teams"]
+    # Teams on both ends: SRTP in, SRTP out, both on the Teams interface. Only a
+    # transfer produces this pair (a carrier leg refers its Teams peer to
+    # another Teams user); no call starts this way.
+    srtp_to_srtp:
+      offer:
+        transport_protocol: "RTP/SAVP"
+        ice: "remove"
+        replace: ["origin", "session-connection"]
+        direction: ["teams", "teams"]
+      answer:
+        transport_protocol: "RTP/SAVP"
+        ice: "remove"
+        replace: ["origin", "session-connection"]
+        direction: ["teams", "teams"]
 
 log:
   level: info
