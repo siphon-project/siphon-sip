@@ -21,9 +21,10 @@ entry, but a working config keeps working.
   with `config.get("routes.default", default)` and
   `config.require("routes.prefixes")`, which raises a `LookupError` naming the
   key; both return plain data as a new copy. The file form is watched under
-  `script.reload: auto` and read again on `SIGHUP`. A reload replaces the whole
-  document at once, and a file that does not parse is logged and leaves the
-  last good document serving. A file that is missing or does not parse at
+  `script.reload: auto` and read again on `SIGHUP` and on
+  `POST /admin/script/reload`, whose reply says what became of it. A reload
+  replaces the whole document at once, and a file that does not parse is
+  logged and leaves the last good document serving. A file that is missing or does not parse at
   startup stops siphon. `${VAR}` / `${VAR:-default}` are expanded as in
   `siphon.yaml`. `config` becomes a reserved namespace name: an embedding host
   that registered a namespace of its own called `config` has to rename it. See

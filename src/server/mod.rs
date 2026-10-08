@@ -692,7 +692,7 @@ impl SiphonServer {
         if config.script.reload == crate::config::ReloadMode::Auto {
             crate::script::script_config::spawn_file_watcher(&script_config_store);
         }
-        crate::script::script_config::spawn_sighup_reloader(script_config_store);
+        crate::script::script_config::spawn_sighup_reloader(Arc::clone(&script_config_store));
 
         // --- Initialize numbers namespace + number-policy runtime ---
         // E.164 identity normalization. The parser namespace is always
@@ -2480,7 +2480,7 @@ impl SiphonServer {
         let drain = Arc::new(dispatcher::DrainState::new());
 
         // --- HTTP admin API (health/readiness probes + registration inspection) ---
-        admin_start::start_admin_api(&config, &drain, &engine);
+        admin_start::start_admin_api(&config, &drain, &engine, &script_config_store);
 
         // --- External remote-control plane (ARI/ESL-class) ---
         // Installs the ControlBus, spawns the command consumer + inbound WS

@@ -110,9 +110,9 @@ pub fn lookup<'a>(
         let parent = dotted_key[..consumed].trim_end_matches('.');
         let next = match current {
             Value::Mapping(mapping) => mapping_child(mapping, segment),
-            Value::Sequence(items) => segment
-                .parse::<usize>()
-                .ok()
+            Value::Sequence(items) => Some(segment)
+                .filter(|segment| is_decimal(segment))
+                .and_then(|segment| segment.parse::<usize>().ok())
                 .and_then(|index| items.get(index)),
             other => {
                 return Err(LookupError::NotAContainer {
@@ -138,6 +138,9 @@ fn mapping_child<'a>(mapping: &'a Mapping, segment: &str) -> Option<&'a Value> {
     if let Some(value) = mapping.get(segment) {
         return Some(value);
     }
+    if !is_decimal(segment.strip_prefix('-').unwrap_or(segment)) {
+        return None;
+    }
     if let Ok(number) = segment.parse::<u64>() {
         return mapping.get(Value::Number(number.into()));
     }
@@ -145,6 +148,13 @@ fn mapping_child<'a>(mapping: &'a Mapping, segment: &str) -> Option<&'a Value> {
         return mapping.get(Value::Number(number.into()));
     }
     None
+}
+
+/// Whether `text` is one or more ASCII digits and nothing else. `str::parse`
+/// alone also takes a leading `+`, and the segment `+31` names the string key
+/// `"+31"`, a dialling prefix, not the integer key `31`.
+fn is_decimal(text: &str) -> bool {
+    !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 /// Check a parsed document is one a script can be handed as plain data, and
@@ -554,6 +564,36 @@ mod tests {
             lookup(&root, "country_codes.31").unwrap().as_str(),
             Some("nl")
         );
+    }
+
+    /// A dialling prefix is a string key. Spelled with its `+` it must not
+    /// fall through to the integer key the digits alone would name, or to a
+    /// sequence index.
+    #[test]
+    fn lookup_does_not_read_a_signed_segment_as_an_integer() {
+        let root = document(concat!(
+            "by_prefix:\n",
+            "  \"+31\": gateway-nl.example.com\n",
+            "  44: gateway-uk.example.com\n",
+            "  -1: negative\n",
+            "list: [first, second]\n",
+        ));
+        assert_eq!(
+            lookup(&root, "by_prefix.+31").unwrap().as_str(),
+            Some("gateway-nl.example.com")
+        );
+        assert_eq!(
+            lookup(&root, "by_prefix.44").unwrap().as_str(),
+            Some("gateway-uk.example.com")
+        );
+        assert_eq!(
+            lookup(&root, "by_prefix.-1").unwrap().as_str(),
+            Some("negative")
+        );
+        assert!(lookup(&root, "by_prefix.+44").is_err());
+        assert!(lookup(&root, "by_prefix.+-1").is_err());
+        assert!(lookup(&root, "list.+1").is_err());
+        assert_eq!(lookup(&root, "list.1").unwrap().as_str(), Some("second"));
     }
 
     #[test]

@@ -9919,22 +9919,24 @@ class MockScriptConfig:
         def route(call):
             number = call.ruri.user
             gateway = config.require("routes.default")
-            longest = -1
-            for route in config.get("routes.prefixes", []):
-                prefix = route["prefix"]
-                if number.startswith(prefix) and len(prefix) > longest:
-                    gateway, longest = route["gateway"], len(prefix)
+            # Longest prefix first, one narrow lookup per length.
+            for length in range(len(number), 0, -1):
+                found = config.get("routes.by_prefix." + number[:length])
+                if found is not None:
+                    gateway = found
+                    break
             call.dial(f"sip:{number}@{gateway}")
 
     Every call returns a new copy: changing what you were handed changes
     nothing for the next caller. The copy costs as much as the value is large,
     so on a per-message path ask for the narrowest key rather than the whole
-    document.
+    document, and key a table that grows (``by_prefix: {"+1555": ...}``)
+    instead of walking a list of its rows.
 
     In a test, hand the mock the document the script should see::
 
         mock_module.get_script_config().set({
-            "routes": {"default": "gateway-a.example.com", "prefixes": []},
+            "routes": {"default": "gateway-a.example.com", "by_prefix": {}},
         })
     """
 

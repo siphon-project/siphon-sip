@@ -40,6 +40,21 @@ def test_get_indexes_a_sequence_and_an_integer_key():
     assert config.get("country_codes.31") == "nl"
 
 
+def test_a_prefix_key_is_not_read_as_the_integer_its_digits_spell():
+    from siphon import config
+
+    get_script_config().set({
+        "by_prefix": {"+31": "gateway-nl.example.com", 44: "gateway-uk.example.com"},
+        "rows": ["first", "second"],
+    })
+
+    assert config.get("by_prefix.+31") == "gateway-nl.example.com"
+    assert config.get("by_prefix.44") == "gateway-uk.example.com"
+    assert config.get("by_prefix.+44", "unset") == "unset"
+    assert config.get("rows.+1", "unset") == "unset"
+    assert config.get("rows.1") == "second"
+
+
 def test_get_of_the_empty_key_is_the_whole_document():
     from siphon import config
 

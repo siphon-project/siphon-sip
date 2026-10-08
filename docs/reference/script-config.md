@@ -33,12 +33,18 @@ script_config:
   `siphon.yaml` when the file is there, else against the working directory.
 - A file that is missing or does not parse at startup stops siphon, naming the
   file. Without the key the document is empty.
+- Quote anything that is a string but looks like a number. YAML reads an
+  unquoted `+1555` as the integer 1555 and `0031` as 31, so a dialling prefix
+  or a number with a leading zero written bare is not the text you typed, as a
+  value and as a mapping key alike.
 
 ## Reloading
 
 The path form follows `script.reload`. Under `auto` (the default) the file is
 watched and read again when it changes; under `sighup` it is not watched. In
-both modes `SIGHUP` reads it again.
+both modes `SIGHUP` reads it again, and so does `POST /admin/script/reload`,
+whose reply carries `"script_config": "reloaded"`, `"unchanged"` or `"failed"`
+(with the reason in `script_config_error` and a `422`).
 
 A reload replaces the whole document at once: a handler sees the old document
 or the new one, never a mix. A file that cannot be read or does not parse is
@@ -55,11 +61,9 @@ when the script loads: those copies are taken once and never see a reload.
 # /etc/siphon/routes.yaml
 routes:
   default: gateway-a.example.com
-  prefixes:
-    - prefix: "+1555"
-      gateway: gateway-b.example.com
-    - prefix: "+15550100"
-      gateway: gateway-c.example.com
+  by_prefix:
+    "+1555": gateway-b.example.com
+    "+15550100": gateway-c.example.com
 ```
 
 ```python
@@ -69,17 +73,24 @@ from siphon import b2bua, config
 def route(call):
     number = call.ruri.user
     gateway = config.require("routes.default")
-    longest = -1
-    for route in config.get("routes.prefixes", []):
-        prefix = route["prefix"]
-        if number.startswith(prefix) and len(prefix) > longest:
-            gateway, longest = route["gateway"], len(prefix)
+    # Longest prefix first, one narrow lookup per length.
+    for length in range(len(number), 0, -1):
+        found = config.get("routes.by_prefix." + number[:length])
+        if found is not None:
+            gateway = found
+            break
     call.dial(f"sip:{number}@{gateway}")
 ```
 
 `+15550100` goes to `gateway-c.example.com`, `+15550199` to
 `gateway-b.example.com`, anything else to `gateway-a.example.com`. Edit the
 file and the next call routes by the new table.
+
+The table is a mapping keyed by prefix, not a list to walk, for a reason: each
+`config.get` copies what it returns, so asking for the whole list on every call
+costs as much as the list is long, while a lookup by key costs the same for ten
+routes or a hundred thousand. Keep a list for what really is one (an ordered
+rule set of a handful of entries) and key anything that grows.
 
 Keys are dotted paths. Each segment is a mapping key or a zero-based sequence
 index (`routes.prefixes.0.gateway`); a mapping key written as an integer in

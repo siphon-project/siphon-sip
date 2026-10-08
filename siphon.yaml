@@ -2495,8 +2495,9 @@ log:
 # / config.require("routes.prefixes"). ${VAR} / ${VAR:-default} are expanded.
 #
 # Either the path of a YAML file, watched and reloaded under script.reload:
-# auto and read again on SIGHUP in both modes (a file that stops parsing keeps
-# the last good one serving, a file missing at startup stops siphon):
+# auto and read again on SIGHUP and POST /admin/script/reload in both modes (a
+# file that stops parsing keeps the last good one serving, a file missing at
+# startup stops siphon):
 #
 # script_config: /etc/siphon/routes.yaml
 #
