@@ -37,6 +37,15 @@ entry, but a working config keeps working.
   `absent_user_diagnostic=` adds an Absent-User-Diagnostic-SM, the reason the
   node found the user absent, and is accepted with `delivery_outcome=1` only.
 
+- **iFC `SessionCase` 2 and 3 are decoded the way 3GPP TS 29.228 Annex E
+  defines them.** `2` is terminating for an unregistered user and `3` is
+  originating for an unregistered user; the two were swapped. A user profile
+  whose trigger point carries `<SessionCase>2</SessionCase>` now matches
+  `isc.evaluate(..., session_case="terminating_unregistered")`, and `3` matches
+  `"originating_unregistered"`. Codes `0` and `1` are unchanged. A script that
+  compensated by passing the opposite unregistered name has to pass the right
+  one now.
+
 ## [1.13.1] — 2026-10-08
 
 ### Added

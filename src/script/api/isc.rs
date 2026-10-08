@@ -151,3 +151,40 @@ fn parse_session_case(value: &str) -> Option<SessionCase> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_case_names_map_to_the_matching_case() {
+        for (name, expected) in [
+            ("originating", SessionCase::Originating),
+            ("orig", SessionCase::Originating),
+            ("terminating", SessionCase::Terminating),
+            ("term", SessionCase::Terminating),
+            (
+                "originating_unregistered",
+                SessionCase::OriginatingUnregistered,
+            ),
+            ("orig_unreg", SessionCase::OriginatingUnregistered),
+            (
+                "terminating_unregistered",
+                SessionCase::TerminatingUnregistered,
+            ),
+            ("term_unreg", SessionCase::TerminatingUnregistered),
+            (
+                "Terminating_Unregistered",
+                SessionCase::TerminatingUnregistered,
+            ),
+        ] {
+            assert_eq!(parse_session_case(name), Some(expected), "{name}");
+        }
+    }
+
+    #[test]
+    fn unknown_session_case_name_is_rejected() {
+        assert_eq!(parse_session_case("originating_cdiv"), None);
+        assert_eq!(parse_session_case(""), None);
+    }
+}
