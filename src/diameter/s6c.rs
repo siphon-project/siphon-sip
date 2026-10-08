@@ -934,4 +934,46 @@ mod tests {
             "SUCCESSFUL_TRANSFER"
         );
     }
+
+    /// Emit one RSR per SM-Delivery-Cause as hex for
+    /// [`scripts/validate_s6c_rsr.sh`] to feed to tshark.
+    ///
+    /// The known-answer tests pin bytes we chose, so they share whatever we
+    /// misread of TS 29.338. tshark decodes the same bytes with its own
+    /// dictionary.
+    #[test]
+    fn emit_rsr_for_external_dissection() {
+        let Ok(path) = std::env::var("SIPHON_S6C_RSR_HEX_OUT") else {
+            // Nothing to do in an ordinary test run.
+            return;
+        };
+
+        // `text2pcap`'s hex-dump form: an offset, then the octets. An offset
+        // of zero starts the next packet.
+        let mut dump = String::new();
+        for cause in [
+            SmDeliveryCause::UeMemoryCapacityExceeded,
+            SmDeliveryCause::AbsentUser,
+            SmDeliveryCause::SuccessfulTransfer,
+        ] {
+            let wire = build_report_sm_delivery_status_request(
+                &config(),
+                "smsc.example.com;1;1",
+                "001010000000001",
+                "441632960000",
+                cause,
+                1,
+                1,
+            );
+            for (offset, chunk) in wire.chunks(16).enumerate() {
+                dump.push_str(&format!("{:06x}", offset * 16));
+                for byte in chunk {
+                    dump.push_str(&format!(" {byte:02x}"));
+                }
+                dump.push('\n');
+            }
+            dump.push('\n');
+        }
+        std::fs::write(&path, dump).expect("hex dump must be writable");
+    }
 }
