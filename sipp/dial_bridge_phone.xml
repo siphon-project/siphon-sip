@@ -14,7 +14,7 @@
 
   Asserted here, where nothing on the controller's rail can see it: the phone is
   rung as a call of its own (offerless, answered on the ACK), it is shown the
-  caller's identity, and the bridge re-offers it onto the engine. The pause
+  caller's identity behind siphon's own From host, and the bridge re-offers it onto the engine. The pause
   after 180 is the window in which the caller hears ringback.
 -->
 <scenario name="dial-bridge phone">
@@ -23,9 +23,13 @@
     <action>
       <ereg regexp="15550000009"
             search_in="hdr" header="From:" check_it="true" assign_to="caller_shown" />
+      <!-- The caller sent `@dialbridge.test`; the phone sees siphon's
+           advertised address in its place, as on a connecting dial. -->
+      <ereg regexp="sip:15550000009@172\.20\.0\.230&gt;"
+            search_in="hdr" header="From:" check_it="true" assign_to="from_host_hidden" />
       <ereg regexp="m=audio"
             search_in="msg" check_it_inverse="true" assign_to="offerless" />
-      <log message="phone INVITE: caller shown=[$caller_shown] offerless=[$offerless]" />
+      <log message="phone INVITE: caller shown=[$caller_shown] from host hidden=[$from_host_hidden] offerless=[$offerless]" />
     </action>
   </recv>
 

@@ -333,6 +333,10 @@ pub struct DialBridgeCaller {
     pub sip_call_id: String,
     /// The caller's INVITE, whose `From` the phones are shown.
     pub template: SipMessage,
+    /// The `From` host pinned on the caller's call (`call.set_from_host()`),
+    /// which a leg presenting the caller's own `From` carries in place of
+    /// siphon's advertised address, as a connecting dial's B-leg does.
+    pub from_host: Option<String>,
     /// The media profile the caller is anchored with.
     pub profile: String,
     /// The caller's media session.
@@ -419,7 +423,7 @@ pub fn dial_bridge_caller(
         .call_actors
         .find_by_sip_call_id(sip_call_id)
         .ok_or(DialBridgeRefusal::Gone)?;
-    let (call_state, bridged, invite) = state
+    let (call_state, bridged, invite, from_host) = state
         .call_actors
         .get_call(&internal_call_id)
         .map(|call| {
@@ -427,6 +431,7 @@ pub fn dial_bridge_caller(
                 call.state.clone(),
                 call.bridge.is_some(),
                 call.a_leg_invite.clone(),
+                call.from_host_override.clone(),
             )
         })
         .ok_or(DialBridgeRefusal::Gone)?;
@@ -454,6 +459,7 @@ pub fn dial_bridge_caller(
     Ok(DialBridgeCaller {
         sip_call_id: sip_call_id.to_string(),
         template,
+        from_host,
         profile: session.profile.clone(),
         media_call_id: session.rtpengine_id().to_string(),
         from_tag: session.from_tag.clone(),
@@ -491,6 +497,21 @@ pub fn dial_bridge_spec(
         return Err(DialError::NoTargets);
     }
     resolve_bridge_leg_identities(&caller.template, &plan.shaping, &mut plan.targets)?;
+    // A host pinned on the caller's call outranks the advertised address on a
+    // leg that would otherwise be hidden behind it, as on a connecting dial.
+    if let Some(host) = caller.from_host.as_deref() {
+        for target in plan
+            .targets
+            .iter_mut()
+            .filter(|target| target.hide_from_host)
+        {
+            target.from = target
+                .from
+                .take()
+                .map(|from| crate::b2bua::actor::rewrite_uri_host(&from, host));
+            target.hide_from_host = false;
+        }
+    }
     // A called party siphon cannot put on the wire refuses the dial before any
     // phone rings, as it does on a connecting dial; each leg then carries its
     // target's `to` as its `To` (see `leg_params`).
@@ -543,6 +564,12 @@ pub fn dial_bridge_spec(
 /// drops the caller's display name unless one is named too, and an empty
 /// display name presents none). Every field is written, the display name as
 /// `""` when there is none, so the leg carries exactly this.
+///
+/// The caller's own `From` is presented with its host hidden
+/// ([`DialTarget::hide_from_host`]), as a connecting dial's B-leg presents it:
+/// the same ring must not show a phone siphon's address when it is placed
+/// directly and the caller's side's address when it follows a prompt. Only a
+/// `from` the dial or the target names pins its host.
 pub(crate) fn resolve_bridge_leg_identities(
     template: &SipMessage,
     shaping: &DialShaping,
@@ -552,6 +579,9 @@ pub(crate) fn resolve_bridge_leg_identities(
         let leg = target.shaping_over(shaping);
         let shaped =
             super::dial_target::shape_from(template, &leg).map_err(DialError::InvalidIdentity)?;
+        // The host is pinned only where a `from` named one, as on a connecting
+        // dial; a display name alone leaves the caller's URI, host and all.
+        target.hide_from_host = shaped.as_ref().is_none_or(|shaped| shaped.host.is_none());
         let from = match shaped {
             Some(shaped) => shaped.header,
             None => template

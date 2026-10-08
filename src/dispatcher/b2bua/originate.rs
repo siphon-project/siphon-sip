@@ -101,6 +101,11 @@ pub struct OriginateRoute {
     /// INVITE's Route headers; its topmost entry is the next hop. Outranks the
     /// flow, as for a dialled B-leg.
     pub route: Vec<String>,
+    /// Rewrite the host of [`OriginateParams::from`] to the address siphon
+    /// advertises on the leg's transport (see [`DialTarget::hide_from_host`]).
+    /// Settled here rather than by the caller because that address is only
+    /// known once the leg's destination has resolved to a transport.
+    pub hide_from_host: bool,
 }
 
 /// Why an originate was refused. Each variant maps to its own control-plane
@@ -198,7 +203,7 @@ pub fn prepare_originate(
 /// ([`resolve_leg_destination`]).
 pub fn prepare_originate_routed(
     state: &DispatcherState,
-    params: OriginateParams,
+    mut params: OriginateParams,
     route: &OriginateRoute,
 ) -> Result<PreparedOriginate, OriginateError> {
     let (request_uri, request_uri_field) = match route.request_uri.as_deref() {
@@ -250,6 +255,14 @@ pub fn prepare_originate_routed(
     )
     .map_err(|error| OriginateError::Unroutable(error.to_string()))?;
     let flow_local_addr = flow.map(|flow| flow.local_addr);
+
+    // Topology hiding, with the host a dialled B-leg masks its From with: the
+    // transport's advertised address, not the flow's socket.
+    if route.hide_from_host {
+        if let Some(from) = params.from.as_mut() {
+            *from = crate::b2bua::actor::rewrite_uri_host(from, &state.via_host(&transport));
+        }
+    }
 
     let sip_call_id = crate::b2bua::actor::generate_call_id();
     let from_tag = crate::b2bua::actor::generate_tag();

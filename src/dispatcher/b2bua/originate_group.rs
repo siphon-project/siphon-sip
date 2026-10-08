@@ -1142,6 +1142,7 @@ fn place_leg(
         request_uri: Some(target.uri.clone()),
         flow: target.flow.clone(),
         route: target.route.clone(),
+        hide_from_host: target.hide_from_host,
     };
     let prepared = match prepare_originate_routed(state, params, &route) {
         Ok(prepared) => prepared,
