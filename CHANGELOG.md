@@ -36,7 +36,8 @@ entry, but a working config keeps working.
   there (a carrier's, on a call in from a trunk), while the same ring placed as
   a connecting dial showed siphon's advertised address. The bridge dial now
   rewrites that host to the advertised address of the leg's transport, the same
-  host a connecting dial's B-leg uses. A `from` named on the dial or on a
+  host a connecting dial's B-leg uses, or to the host a script pinned on the
+  caller's call with `call.set_from_host()`. A `from` named on the dial or on a
   target keeps its host, as before; `from_display` alone names no host, so the
   host is hidden there too. A phone or downstream that matched on the caller's
   original `From` host behind a bridge dial needs a named `from` to keep it.

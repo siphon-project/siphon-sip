@@ -44,9 +44,28 @@ fn from_shown_to(dispatcher: &TestDispatcher, phone: &str) -> String {
 
 /// The From a bridge dial with `identity` arguments shows `phone`.
 async fn bridge_dial_shows(call_id: &str, phone: &str, identity: serde_json::Value) -> String {
+    bridge_dial_shows_pinned(call_id, phone, identity, None).await
+}
+
+/// [`bridge_dial_shows`] for a caller whose call has the From host `pinned`,
+/// as `call.set_from_host()` leaves it.
+async fn bridge_dial_shows_pinned(
+    call_id: &str,
+    phone: &str,
+    identity: serde_json::Value,
+    pinned: Option<&str>,
+) -> String {
     let engine = NativeTestEngine::start().await;
     let dispatcher = advertising_dispatcher(&engine);
     let caller = answered_caller(&dispatcher, call_id);
+    if let Some(host) = pinned {
+        dispatcher
+            .state
+            .call_actors
+            .get_call_mut(&caller.internal_call_id)
+            .expect("the caller's call")
+            .from_host_override = Some(host.to_string());
+    }
     let controller = controller_owning(call_id, dispatcher, &caller, call_id, "hangup");
     let mut args = serde_json::json!({
         "on_answer": "bridge",
@@ -102,6 +121,29 @@ async fn a_bridge_dial_naming_a_from_keeps_its_host() {
     )
     .await;
     assert_eq!(from, "<sip:5550100@tenant.example.org>");
+}
+
+/// A host pinned on the caller's call outranks the advertised address, as it
+/// does on a connecting dial's B-leg; a `from` the dial names outranks both.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bridge_dial_presents_the_from_host_pinned_on_the_call() {
+    let from = bridge_dial_shows_pinned(
+        "from-host-pinned@192.0.2.10",
+        "198.51.100.225:5060",
+        serde_json::json!({}),
+        Some("tenant.example.org"),
+    )
+    .await;
+    assert_eq!(from, "\"Caller One\" <sip:15550100001@tenant.example.org>");
+
+    let from = bridge_dial_shows_pinned(
+        "from-host-pinned-named@192.0.2.10",
+        "198.51.100.226:5060",
+        serde_json::json!({ "from": "sip:5550100@other.example.org" }),
+        Some("tenant.example.org"),
+    )
+    .await;
+    assert_eq!(from, "<sip:5550100@other.example.org>");
 }
 
 /// The two paths agree: a phone rung for a caller sees the same From whether
