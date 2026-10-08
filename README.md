@@ -134,7 +134,7 @@ This isn't a replacement for Kamailio or OpenSIPS. It's what happens when someon
 
 ### Prerequisites
 
-SIPhon requires **Python 3.12+** at runtime for scripting support. For optimal performance, use **Python 3.14t** (free-threaded) which eliminates the GIL entirely. (The pure-Python test SDK, `siphon-sip`, runs on Python 3.10+ — script unit tests don't need the proxy's runtime.)
+The container image, the `.deb`, the `.rpm` and the release tarball **carry their own free-threaded Python 3.14t**, so they need no Python from the host. A build from source links whichever interpreter `PYO3_PYTHON` points at: **Python 3.12+** works, and **Python 3.14t** (free-threaded) eliminates the GIL entirely, which is what the performance numbers below are measured on. The interpreter is fixed at build time; `siphon` logs the one it uses at startup. (The pure-Python test SDK, `siphon-sip`, runs on Python 3.10+ — script unit tests don't need the proxy's runtime.)
 
 ### Option 1: cargo install (from crates.io)
 
@@ -216,29 +216,41 @@ docker build -t siphon .
 ### Option 3: Debian/Ubuntu (.deb)
 
 ```bash
+# Stage the free-threaded Python the package carries (pinned, checksum-verified)
+scripts/bundle-python.sh target/python-bundle
+export PYO3_PYTHON="$PWD/target/python-bundle/bin/python3.14t"
+export RUSTFLAGS="$(scripts/bundle-python.sh --print-rustflags target/python-bundle)"
+
 # Build the .deb package (requires cargo-deb)
 cargo install cargo-deb
-PYO3_PYTHON=python3 cargo deb
+cargo deb
 
 # Install the package
-sudo dpkg -i target/debian/siphon_*.deb
+sudo dpkg -i target/debian/siphon-sip_*.deb
 ```
 
-This installs the binary to `/usr/bin/siphon`, the default config to `/etc/siphon/siphon.yaml`, example scripts to `/etc/siphon/scripts/`, and a systemd unit file.
+This installs the binary to `/usr/bin/siphon`, the default config to `/etc/siphon/siphon.yaml`, example scripts to `/etc/siphon/scripts/`, a systemd unit file, and the bundled interpreter to `/usr/lib/siphon/python`. Install Python packages for your scripts with `sudo /usr/lib/siphon/python/bin/python3.14t -m pip install <package>`.
 
 Pre-built `.deb` packages are also available from [GitHub Releases](https://github.com/siphon-project/siphon-sip/releases).
 
 ### Option 4: Fedora/RHEL/Rocky (.rpm)
 
 ```bash
+# Stage the free-threaded Python the package carries (pinned, checksum-verified)
+scripts/bundle-python.sh target/python-bundle
+export PYO3_PYTHON="$PWD/target/python-bundle/bin/python3.14t"
+export RUSTFLAGS="$(scripts/bundle-python.sh --print-rustflags target/python-bundle)"
+
 # Build the .rpm package (requires cargo-generate-rpm)
 cargo install cargo-generate-rpm
-PYO3_PYTHON=python3 cargo build --release
+cargo build --release
 cargo generate-rpm
 
 # Install the package
-sudo rpm -i target/generate-rpm/siphon-*.rpm
+sudo rpm -i target/generate-rpm/siphon-sip-*.rpm
 ```
+
+The interpreter and `pip` are at `/usr/lib/siphon/python`, as in the `.deb`.
 
 Pre-built `.rpm` packages are also available from [GitHub Releases](https://github.com/siphon-project/siphon-sip/releases).
 

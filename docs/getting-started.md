@@ -130,11 +130,14 @@ Prebuilt packages are attached to each
 [GitHub Release](https://github.com/siphon-project/siphon-sip/releases). They
 install the binary to `/usr/bin/siphon`, a default config to
 `/etc/siphon/siphon.yaml`, example scripts to `/etc/siphon/scripts/`, and a
-systemd unit.
+systemd unit. They also carry their own free-threaded Python 3.14t, installed
+to `/usr/lib/siphon/python`, so nothing has to be installed first and the
+host's Python version does not matter. They need glibc 2.39 or newer (Ubuntu
+24.04, Debian 13, RHEL 10).
 
 ```bash
-sudo dpkg -i siphon_*.deb        # Debian / Ubuntu
-sudo rpm -i siphon-*.rpm         # Fedora / RHEL / Rocky
+sudo dpkg -i siphon-sip_*.deb    # Debian / Ubuntu
+sudo rpm -i siphon-sip-*.rpm     # Fedora / RHEL / Rocky
 
 sudo vim /etc/siphon/siphon.yaml # edit to match your network
 sudo systemctl enable --now siphon
@@ -145,6 +148,16 @@ The service runs as an unprivileged `siphon` user and is not auto-enabled on
 install — you enable it explicitly. Building the packages yourself, and the
 from-source path, are covered in the
 [README](https://github.com/siphon-project/siphon-sip#installation).
+
+Scripts run on the bundled interpreter, not on the system `python3`, so a
+package your script imports has to be installed into it:
+
+```bash
+sudo /usr/lib/siphon/python/bin/python3.14t -m pip install httpx
+```
+
+What you install there survives a package upgrade as long as the bundled Python
+stays on the same minor version.
 
 If the unit does not come up, `journalctl -u siphon -n 50` has the reason: siphon
 exits non-zero on a config or script error rather than running broken, and the
@@ -180,8 +193,9 @@ PYO3_PYTHON=python3 cargo run --release -- --config siphon.yaml
 
 SIPhon runs on any Python **3.12 or newer**. Scripts run under a real CPython
 interpreter, so you get the whole standard library (`re`, `json`, `asyncio`, …)
-and any pip package you install. (The prebuilt Docker image already bundles a
-free-threaded 3.14t interpreter, so the Compose quickstart is fast by default.)
+and any pip package you install. (The Docker image, the `.deb` / `.rpm` and the
+release tarball already bundle a free-threaded 3.14t interpreter, so they are
+fast by default. The rest of this section is about building from source.)
 
 The performance numbers in the README are measured on **free-threaded Python
 3.14t**, which removes the GIL so handler threads run in genuine parallel.

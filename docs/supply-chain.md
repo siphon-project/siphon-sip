@@ -121,6 +121,31 @@ cargo deny check              # advisories + licenses + sources + bans
 
 ---
 
+## The bundled Python interpreter
+
+The `.deb`, the `.rpm` and the release tarballs carry their own free-threaded
+CPython, installed under `/usr/lib/siphon/python` (`python/` next to the binary
+in the tarball). It is a
+[python-build-standalone](https://github.com/astral-sh/python-build-standalone)
+build, which is relocatable where a distribution's Python is not.
+
+- **Pinned by version and SHA-256** in
+  [`scripts/bundle-python.sh`](https://github.com/siphon-project/siphon-sip/blob/main/scripts/bundle-python.sh).
+  The release fetches exactly that archive and refuses anything whose checksum
+  differs, so moving to another build is a reviewed change to that file.
+- **It is patched by a SIPhon release, not by your distribution.** A CPython
+  security fix reaches an installed package only when a SIPhon release picks up
+  the new interpreter. `siphon` logs the exact version at startup (the `python
+  runtime` line).
+- **Its licences ship with it**, as `LICENSE.txt` in the bundle root: CPython's
+  own and those of the libraries built into it (OpenSSL, SQLite, and so on).
+- **It is not in the SBOM**, which describes the Rust crate graph only (see
+  [Known gaps](#known-gaps)).
+
+Packages you add with the bundled `pip` are yours to track.
+
+---
+
 ## Reporting a vulnerability
 
 Please report security issues **privately** — do not open a public GitHub issue
@@ -144,6 +169,10 @@ Stated honestly, because a supply-chain page that overclaims is worse than none:
   wired. Until they are, scan the published image with your registry scanner and
   treat the crate SBOM as the authoritative component list for the SIPhon binary
   itself.
+- **The bundled Python interpreter is not in the SBOM.** The packages and
+  tarballs ship a CPython and the C libraries built into it; neither appears in
+  the published SBOM. Its version and checksum are in `scripts/bundle-python.sh`
+  at the release tag.
 - **No cryptographic signing of release artifacts yet.** Artifacts are published
   through GitHub Releases and OIDC Trusted Publishing to crates.io / PyPI (no
   long-lived tokens), but the tarballs/SBOMs are not yet Sigstore-signed. Verify

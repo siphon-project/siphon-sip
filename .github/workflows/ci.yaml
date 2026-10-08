@@ -401,6 +401,71 @@ jobs:
       - name: Clippy (patched to this tree — the released composition)
         run: PYO3_PYTHON=python3.14 cargo clippy -p siphon-bin --features ui -- -D warnings
 
+  # ── Release packaging: the bundled Python ──────────────────────────────
+  # The .deb / .rpm / tarball carry their own free-threaded CPython and the
+  # binary is linked to find it. All of that lives in release.yaml, which runs
+  # only on a tag, so without this job a break in it (a packaging-metadata
+  # typo, a moved interpreter download, a link flag) would first show up
+  # halfway through a release cut. This runs the same scripts and the same
+  # package metadata on every PR and installs the result in clean containers.
+  #
+  # Two deliberate shortcuts against the release: it builds the plain
+  # siphon-sip binary instead of the siphon-bin composition (the siphon-bin job
+  # above owns that), and in the debug profile, staged where the packaging
+  # expects the release binary. Neither changes what is being proven here.
+  #
+  # The arm leg only stages the interpreter. The release ships an aarch64
+  # tarball with it, and that download has its own pinned checksum, so it is
+  # worth the few seconds to know it still verifies and runs.
+  packages:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            package: true
+          - os: ubuntu-24.04-arm
+            package: false
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: matrix.package
+
+      - uses: Swatinem/rust-cache@v2
+        if: matrix.package
+        with:
+          key: packages
+
+      # After the cache restore, so a cached target/ cannot overlay it.
+      - name: Stage the bundled free-threaded CPython
+        run: scripts/bundle-python.sh target/python-bundle
+
+      - name: Build against the bundled interpreter
+        if: matrix.package
+        run: |
+          export PYO3_PYTHON="$GITHUB_WORKSPACE/target/python-bundle/bin/python3.14t"
+          RUSTFLAGS="$(scripts/bundle-python.sh --print-rustflags target/python-bundle)"
+          export RUSTFLAGS
+          cargo build --bin siphon --target x86_64-unknown-linux-gnu
+          install -D target/x86_64-unknown-linux-gnu/debug/siphon \
+                     target/x86_64-unknown-linux-gnu/release/siphon
+
+      - name: Build the .deb and .rpm
+        if: matrix.package
+        run: |
+          cargo install cargo-deb cargo-generate-rpm
+          cargo deb --target x86_64-unknown-linux-gnu --no-build
+          cargo generate-rpm --target x86_64-unknown-linux-gnu
+
+      # Same images as release.yaml: glibc 2.39, the floor the packages declare.
+      - name: Verify the packages install and run free-threaded
+        if: matrix.package
+        run: |
+          scripts/verify-package.sh "$(find target -name '*.deb' -print -quit)" ubuntu:24.04
+          scripts/verify-package.sh "$(find target -name '*.rpm' -print -quit)" almalinux:10-minimal
+
   # ── External control-plane SDKs (siphon-control-sdk/) ──────────────────
   # `siphon-control-sdk/` is a SEPARATE, excluded standalone workspace with its
   # own Cargo.lock (the same arrangement as `siphon-bin/`), so every job above

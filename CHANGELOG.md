@@ -26,6 +26,28 @@ entry, but a working config keeps working.
 
 ### Changed
 
+- **The `.deb`, the `.rpm` and the release tarballs carry their own
+  free-threaded Python 3.14t.** It installs to `/usr/lib/siphon/python`
+  (`python/` next to the binary in the tarball) and the binary finds it through
+  its rpath, so the packages no longer depend on a Python from the host. Until
+  now they were built against a GIL interpreter, so handlers never ran in
+  parallel, and the binary needed the host's `libpython3.14` while the package
+  only asked for `python3 >= 3.12`: it installed on a 3.12 or 3.13 system and
+  then failed to start. What changes for an existing install:
+  - Scripts run on the bundled interpreter. A package they import has to be
+    installed into it: `sudo /usr/lib/siphon/python/bin/python3.14t -m pip
+    install <package>`. Packages in the system Python are no longer seen.
+  - The packages are about 25 MB larger and need glibc 2.39 or newer (Ubuntu
+    24.04, Debian 13, RHEL 10), now declared as a dependency.
+  - CPython security fixes arrive with a siphon release, not with the
+    distribution's updates. The interpreter is pinned by version and checksum in
+    `scripts/bundle-python.sh`.
+  - The `.deb` now depends on `adduser`, which its install script always used.
+  - The systemd unit sets `PYTHON_GIL=0` and `PYTHONFAULTHANDLER=1`, as the
+    container image does. An extension module without free-threading support
+    no longer turns the GIL back on when a script imports it. If such a module
+    misbehaves without the GIL, drop the variable with `systemctl edit siphon`.
+
 - **The profile for a `Replaces` takeover is the one the script anchors the
   taking-over INVITE with.** `rtpengine.offer(call, profile=…)` in
   `@b2bua.on_invite` describes the new pair, the newcomer as offerer and the
