@@ -286,6 +286,46 @@ numbering — so `number_policy` has no effect there.
     In practice the secure side is nearly always the transferor — a carrier
     rarely sends `REFER` — but an SBC should not fall over the day one does.
 
+    That snippet assumes the target is on the plain-RTP side. It need not be:
+    the SRTP party can transfer its caller to **another user on its own side**,
+    and then the new leg has to go back out the secure trunk with the mirror
+    profile. Neither follows from the original call, so decide both from the
+    pair that remains — who survives, and which side the target is on:
+
+    | Survivor | Target | `next_hop` | `profile` |
+    |---|---|---|---|
+    | plain RTP | plain RTP | carrier | `rtp_passthrough` |
+    | plain RTP | SRTP | secure trunk | `rtp_to_srtp` |
+    | SRTP | plain RTP | carrier | `srtp_to_rtp` |
+    | SRTP | SRTP | secure trunk | a symmetric SRTP profile of your own |
+
+    ```python
+    PROFILES = {   # (survivor is secure, target is secure)
+        (False, False): "rtp_passthrough",
+        (False, True):  "rtp_to_srtp",
+        (True,  False): "srtp_to_rtp",
+        (True,  True):  "srtp_to_srtp",   # custom, see the media cookbook
+    }
+
+    @b2bua.on_refer
+    def on_refer(call):
+        a_leg_is_secure = call.from_gateway("teams")
+        survivor_is_secure = a_leg_is_secure != (call.refer_side == "a")
+        target_is_secure = targets_teams(call.refer_to)   # your own test
+
+        gw = gateway.select("teams" if target_is_secure else "carrier")
+        call.accept_refer(target=call.refer_to, next_hop=gw.uri, mode="terminate",
+                          profile=PROFILES[(survivor_is_secure, target_is_secure)])
+    ```
+
+    How a target is recognised as secure-side is deployment-specific: the
+    `Refer-To` naming one of the trunk's own hosts, or a number range. There is
+    no `from_gateway()` for a URI, so compare the host against
+    `gateway.list(group)` yourself. Pass such a target **verbatim** — its URI
+    parameters belong to the far end — and keep `number_policy=` / `format=` for
+    the carrier rows. [`examples/teams_sbc.py`](https://github.com/siphon-project/siphon-sip/blob/main/examples/teams_sbc.py)
+    is the complete handler.
+
     siphon logs a `WARN` naming the profile when a transfer inherits a
     direction-bound one, but it cannot pick the replacement for you — only the
     script knows what the surviving pair looks like.

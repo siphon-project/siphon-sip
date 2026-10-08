@@ -41,6 +41,14 @@ entry, but a working config keeps working.
   target keeps its host, as before; `from_display` alone names no host, so the
   host is hidden there too. A phone or downstream that matched on the caller's
   original `From` host behind a bridge dial needs a named `from` to keep it.
+- **`examples/teams_sbc.py` routes a transfer to whichever side its target is
+  on.** The `@b2bua.on_refer` handler sent every transferred leg to the carrier
+  trunk, so a transfer to another Teams user was dialled at the PSTN, with a
+  plain-RTP profile. It now picks `next_hop` and `profile` from the pair that
+  remains (survivor x target, four cases), and `teams_sbc.yaml` gains the
+  `srtp_to_srtp` profile the Teams-to-Teams case needs. The call-transfer
+  cookbook carries the same table. No change to siphon itself: copy the handler
+  if you based a script on the old example.
 
 ## [1.13.0] — 2026-10-06
 
