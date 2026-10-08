@@ -5,7 +5,20 @@ use hickory_resolver::TokioResolver;
 use std::net::{IpAddr, SocketAddr};
 use tracing::{debug, warn};
 
+use super::enum_naptr::{application_unique_string, query_name, select_enum_uri, NaptrRule};
 use crate::sip::uri::strip_ipv6_brackets;
+
+/// The text form of a NAPTR record's fields.
+fn naptr_rule(naptr: &hickory_resolver::proto::rr::rdata::NAPTR) -> NaptrRule {
+    NaptrRule {
+        order: naptr.order,
+        preference: naptr.preference,
+        flags: String::from_utf8_lossy(&naptr.flags).into_owned(),
+        services: String::from_utf8_lossy(&naptr.services).into_owned(),
+        regexp: String::from_utf8_lossy(&naptr.regexp).into_owned(),
+        replacement: naptr.replacement.to_string(),
+    }
+}
 
 /// A resolved SIP target: address + transport hint from SRV.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -275,45 +288,46 @@ impl SipResolver {
         results
     }
 
-    /// Perform a NAPTR lookup and return the first matching SIP URI replacement.
+    /// Query the NAPTR records at `query_name`, in answer order.
     ///
-    /// Used for ENUM (e164.arpa) lookups. Returns the URI from the first
-    /// NAPTR record whose service field contains "E2U+sip".
-    pub async fn naptr_lookup(&self, query_name: &str) -> Option<String> {
+    /// Empty when the name has none or the query fails.
+    pub async fn naptr_records(&self, query_name: &str) -> Vec<NaptrRule> {
         use hickory_resolver::proto::rr::RecordType;
 
         match self.resolver.lookup(query_name, RecordType::NAPTR).await {
-            Ok(lookup) => {
-                // hickory 0.26: iterate the answer section's `Record`s and
-                // pull the typed `RData` via `Record::data()`. NAPTR fields
-                // (`services`, `regexp`, `replacement`) are now public.
-                for record in lookup.answers() {
-                    if let RData::NAPTR(naptr) = &record.data {
-                        let services = String::from_utf8_lossy(&naptr.services);
-                        if services.contains("E2U+sip") || services.contains("e2u+sip") {
-                            let replacement = naptr.replacement.to_string();
-                            if !replacement.is_empty() && replacement != "." {
-                                return Some(replacement.trim_end_matches('.').to_string());
-                            }
-                            // Check regexp field for URI extraction
-                            let regexp = String::from_utf8_lossy(&naptr.regexp);
-                            if !regexp.is_empty() {
-                                // NAPTR regexp format: "!pattern!replacement!"
-                                let parts: Vec<&str> = regexp.split('!').collect();
-                                if parts.len() >= 3 && !parts[2].is_empty() {
-                                    return Some(parts[2].to_string());
-                                }
-                            }
-                        }
-                    }
-                }
-                None
-            }
+            Ok(lookup) => lookup
+                .answers()
+                .iter()
+                .filter_map(|record| match &record.data {
+                    RData::NAPTR(naptr) => Some(naptr_rule(naptr)),
+                    _ => None,
+                })
+                .collect(),
             Err(error) => {
                 debug!(query = %query_name, %error, "NAPTR lookup failed");
-                None
+                Vec::new()
             }
         }
+    }
+
+    /// Resolve an E.164 number to a URI through ENUM (RFC 6116).
+    ///
+    /// Queries the NAPTR records of the number under `suffix` and returns the
+    /// URI of the rule [`select_enum_uri`] picks for `service`, or `None`.
+    pub async fn enum_lookup(&self, number: &str, suffix: &str, service: &str) -> Option<String> {
+        let application_unique_string = application_unique_string(number)?;
+        let query_name = query_name(&application_unique_string, suffix);
+        let rules = self.naptr_records(&query_name).await;
+        let uri = select_enum_uri(&rules, &application_unique_string, service);
+        if uri.is_none() {
+            debug!(
+                query = %query_name,
+                records = rules.len(),
+                service,
+                "ENUM lookup selected no URI"
+            );
+        }
+        uri
     }
 
     /// Resolve a hostname to IP addresses via A/AAAA lookup.
@@ -459,6 +473,102 @@ fn random_u32_inclusive(max: u32) -> u32 {
 mod tests {
     use super::*;
     use std::cell::RefCell;
+
+    fn naptr_record(
+        order: u16,
+        preference: u16,
+        flags: &str,
+        services: &str,
+        regexp: &str,
+        replacement: &str,
+    ) -> hickory_resolver::proto::rr::rdata::NAPTR {
+        hickory_resolver::proto::rr::rdata::NAPTR::new(
+            order,
+            preference,
+            flags.as_bytes().into(),
+            services.as_bytes().into(),
+            regexp.as_bytes().into(),
+            replacement.parse().expect("a literal domain name"),
+        )
+    }
+
+    #[test]
+    fn a_naptr_record_converts_field_by_field() {
+        let record = naptr_record(
+            100,
+            50,
+            "u",
+            "E2U+sip",
+            r"!^(\+441632960083)$!sip:\1@example.com!",
+            ".",
+        );
+        assert_eq!(
+            naptr_rule(&record),
+            NaptrRule {
+                order: 100,
+                preference: 50,
+                flags: "u".to_string(),
+                services: "E2U+sip".to_string(),
+                regexp: r"!^(\+441632960083)$!sip:\1@example.com!".to_string(),
+                replacement: ".".to_string(),
+            }
+        );
+
+        let non_terminal = naptr_record(100, 10, "", "", "", "enum.example.com.");
+        assert_eq!(naptr_rule(&non_terminal).replacement, "enum.example.com.");
+    }
+
+    /// The RFC 6116 section 4 records, out of order, through the conversion
+    /// the resolver applies to an answer.
+    #[test]
+    fn converted_records_select_the_rfc6116_example_uri() {
+        let rules: Vec<NaptrRule> = [
+            naptr_record(
+                100,
+                52,
+                "u",
+                "E2U+email:mailto",
+                "!^.*$!mailto:info@example.com!",
+                ".",
+            ),
+            naptr_record(
+                100,
+                50,
+                "u",
+                "E2U+sip",
+                r"!^(\+441632960083)$!sip:\1@example.com!",
+                ".",
+            ),
+        ]
+        .iter()
+        .map(naptr_rule)
+        .collect();
+
+        let application_unique_string =
+            application_unique_string("+44 1632 960083").expect("a number with digits");
+        assert_eq!(
+            query_name(&application_unique_string, "e164.arpa."),
+            "3.8.0.0.6.9.2.3.6.1.4.4.e164.arpa."
+        );
+        assert_eq!(
+            select_enum_uri(&rules, &application_unique_string, "E2U+sip").as_deref(),
+            Some("sip:+441632960083@example.com")
+        );
+    }
+
+    /// A number without a digit has no Application Unique String, so nothing
+    /// is queried: against a nameserver that never answers this returns at
+    /// once instead of at the query timeout.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn enum_lookup_without_digits_does_not_query() {
+        let resolver = SipResolver::unreachable_nameserver(std::time::Duration::from_secs(30));
+        let started = std::time::Instant::now();
+        assert_eq!(
+            resolver.enum_lookup("+", "e164.arpa.", "E2U+sip").await,
+            None
+        );
+        assert!(started.elapsed() < std::time::Duration::from_millis(500));
+    }
 
     /// A nameserver that never answers must not hold the caller past the
     /// budget.

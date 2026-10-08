@@ -689,13 +689,28 @@ class MockProxyUtils:
                           service: str = "E2U+sip") -> Optional[str]:
         """DNS NAPTR lookup for phone number to SIP URI.
 
+        Resolves the number through ENUM (RFC 6116): the NAPTR records of
+        the number under ``suffix`` are taken by order, then preference, and
+        the first terminal (``u`` flag) record that offers one of the
+        Enumservices in ``service`` and whose regular expression matches the
+        number gives the result. The expression is matched against the
+        number written with its leading ``+`` and digits only, and the
+        record's replacement is returned with its back-references
+        (``\\1`` to ``\\9``) filled in. Non-terminal records are not
+        followed.
+
         Args:
-            number: E.164 number (e.g. ``"+14155552671"``).
+            number: E.164 number (e.g. ``"+441632960083"``). Characters
+                other than digits are ignored.
             suffix: DNS suffix (default ``"e164.arpa."``).
-            service: Service type (default ``"E2U+sip"``).
+            service: Services field naming the wanted Enumservices,
+                ``"E2U+enumservice[+enumservice...]"`` (default
+                ``"E2U+sip"``). Compared without case; a record matches
+                when it offers any one of them.
 
         Returns:
-            SIP URI string or ``None``.
+            The URI string (e.g. ``"sip:+441632960083@example.com"``) or
+            ``None`` when no record yields one.
 
         In the mock, looks up ``_enum_results`` dict.
         """
