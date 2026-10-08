@@ -89,8 +89,8 @@ async fn the_first_phone_to_answer_is_bridged_to_the_answered_caller() {
         );
         let from = invite.headers.from().expect("a From");
         assert!(
-            from.contains("\"Caller One\" <sip:15550100001@siphon.example.com>"),
-            "the phones are shown the caller: {from}"
+            from.contains("\"Caller One\" <sip:15550100001@192.0.2.1>"),
+            "the phones are shown the caller, behind siphon's own host: {from}"
         );
     }
     assert!(

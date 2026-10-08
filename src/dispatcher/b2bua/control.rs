@@ -1742,6 +1742,18 @@ mod tests {
         );
         assert_eq!(targets[0].from_display.as_deref(), Some("Caller One"));
         assert_eq!(targets[0].privacy, None);
+        assert!(targets[0].hide_from_host, "the caller's own host is hidden");
+
+        let mut targets = vec![DialTarget {
+            from_display: Some("Reception".to_string()),
+            ..target("sip:201@192.0.2.30")
+        }];
+        resolve_bridge_leg_identities(&template, &DialShaping::default(), &mut targets)
+            .expect("the caller's From resolves");
+        assert!(
+            targets[0].hide_from_host,
+            "a display name alone names no host"
+        );
 
         let shaping = DialShaping {
             from: Some("sip:5550100@pbx.example.com".to_string()),
@@ -1776,6 +1788,10 @@ mod tests {
             Some("sip:5550100@pbx.example.com")
         );
         assert_eq!(targets[1].from_display.as_deref(), Some("Overflow"));
+        assert!(
+            targets.iter().all(|target| !target.hide_from_host),
+            "a named From keeps the host it names"
+        );
         assert_eq!(
             targets[1].privacy,
             Some(crate::sip::privacy::CallerIdPresentation::Allowed)

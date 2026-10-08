@@ -543,6 +543,12 @@ pub fn dial_bridge_spec(
 /// drops the caller's display name unless one is named too, and an empty
 /// display name presents none). Every field is written, the display name as
 /// `""` when there is none, so the leg carries exactly this.
+///
+/// The caller's own `From` is presented with its host hidden
+/// ([`DialTarget::hide_from_host`]), as a connecting dial's B-leg presents it:
+/// the same ring must not show a phone siphon's address when it is placed
+/// directly and the caller's side's address when it follows a prompt. Only a
+/// `from` the dial or the target names pins its host.
 pub(crate) fn resolve_bridge_leg_identities(
     template: &SipMessage,
     shaping: &DialShaping,
@@ -552,6 +558,9 @@ pub(crate) fn resolve_bridge_leg_identities(
         let leg = target.shaping_over(shaping);
         let shaped =
             super::dial_target::shape_from(template, &leg).map_err(DialError::InvalidIdentity)?;
+        // The host is pinned only where a `from` named one, as on a connecting
+        // dial; a display name alone leaves the caller's URI, host and all.
+        target.hide_from_host = shaped.as_ref().is_none_or(|shaped| shaped.host.is_none());
         let from = match shaped {
             Some(shaped) => shaped.header,
             None => template

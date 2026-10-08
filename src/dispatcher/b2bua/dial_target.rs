@@ -33,6 +33,16 @@ pub struct DialTarget {
     /// From display name for this branch alone. An empty string removes the
     /// caller's rather than presenting an empty one, as at dial level.
     pub from_display: Option<String>,
+    /// Present `from` with siphon's own advertised address as its host
+    /// (topology hiding), the way a connecting dial's B-leg presents the
+    /// caller's `From`.
+    ///
+    /// Set by a bridge dial on a leg that presents the caller's own `From`:
+    /// that host is whatever the caller's side put there, a carrier's address
+    /// on a call in from a trunk, and is not the phone's to see. A `from` the
+    /// dial or the target names keeps its host, which is pinned exactly as on
+    /// a connecting dial.
+    pub hide_from_host: bool,
     /// `P-Asserted-Identity` for this branch alone (RFC 3325 §9.1).
     pub p_asserted_identity: Option<String>,
     /// Calling-identity presentation for this branch alone (RFC 3323 §4.1).

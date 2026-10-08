@@ -1570,8 +1570,9 @@ The targets, `strategy` (`parallel`, `sequential`), per-target `next_hop` and
 `headers`, the dial's `headers`, and every identity argument — `from`,
 `from_display`, `p_asserted_identity`, `privacy`, on the dial and per target —
 apply as they do for a connecting dial. A leg that names no identity shows the
-phone the **caller's** `From`, display name included; a named one is shaped by
-the same rules as above. Unlike a connecting dial, none of the caller's other
+phone the **caller's** `From`, display name included, with the host rewritten to
+siphon's advertised address as on a connecting dial; a named one is shaped by
+the same rules as above and keeps the host it names. Unlike a connecting dial, none of the caller's other
 INVITE headers reach the phones: each leg is a fresh call. `timeout` is how long
 each phone rings; the dial as a whole rings for `timeout` (parallel) or
 `timeout` × the number of phones (sequential). `profile` names the media profile
