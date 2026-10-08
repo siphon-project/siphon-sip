@@ -90,7 +90,10 @@ pub enum ExpressionError {
     /// There are not exactly three unescaped delimiters.
     #[error("expected exactly three unescaped delimiters")]
     DelimiterCount,
-    /// A backslash is followed by something the grammar does not define.
+    /// A backslash in the replacement that starts neither an escaped
+    /// delimiter nor a back-reference. The RFC 3402 grammar reads it as a
+    /// literal backslash, which no URI can hold, so the rule is refused here
+    /// rather than at the URI check.
     #[error("undefined escape in the replacement")]
     UndefinedEscape,
     /// A flag other than `i` follows the last delimiter.
@@ -710,7 +713,8 @@ mod tests {
             r"!^(.*)$!sip:\2@example.com!",
             // An expression that does not compile.
             "!^(.*$!sip:broken@example.com!",
-            // An escape the grammar does not define.
+            // A backslash that is neither an escaped delimiter nor a
+            // back-reference.
             r"!^.*$!sip:bro\ken@example.com!",
             // No expression at all.
             "",

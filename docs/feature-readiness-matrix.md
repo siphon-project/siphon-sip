@@ -352,7 +352,7 @@ All four, plus the reliable-provisional scenario that had been driven only by
 | SRV lookup (RFC 3263) | Implemented | Core | With A/AAAA fallback; weighted-random RFC 2782 selection per call |
 | A/AAAA load distribution (RFC 3263 §4.2) | Implemented | Core | Fisher-Yates shuffle on every A-only resolution so callers picking `.next()` distribute uniformly across equal-cost records |
 | NAPTR support | Implemented | Core | |
-| ENUM (RFC 6116) | Implemented | Core | |
+| ENUM (RFC 6116) | Implemented | `proxy.enum_lookup` | NAPTR records taken by order then preference; `service` honoured as an `E2U+enumservice[+enumservice...]` field (whole Enumservice, case-insensitive, obsolete `sip+E2U` still read); the RFC 3402 substitution expression applied to the number written with its leading `+` (any delimiter, back-references `\1` to `\9`, `i` flag). Only a terminal `u` record whose output is an absolute URI yields a result; non-terminal records are skipped, not followed. The expression runs on the `regex` crate, so an alternation takes the first matching alternative, not the POSIX longest. Unit-tested on the RFC 6116 / 3403 / 3402 examples without DNS; not yet validated against a live ENUM zone. |
 
 ---
 
