@@ -753,7 +753,7 @@
       "s6c_rsr": {
         "doc": "Send an S6c Report-SM-Delivery-Status request to the HSS.",
         "kind": "method_descriptor",
-        "sig": "($self, user_name, sc_address, delivery_outcome)"
+        "sig": "($self, user_name, sc_address, delivery_outcome, node=\"mme\", absent_user_diagnostic=None)"
       },
       "s6c_srr": {
         "doc": "Send an S6c Send-Routing-Info-for-SM request to the HSS.",

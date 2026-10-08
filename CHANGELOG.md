@@ -32,6 +32,28 @@ entry, but a working config keeps working.
 
 ### Fixed
 
+- **`diameter.s6c_rsr` sends a Report-SM-Delivery-Status request an HSS can
+  read (3GPP TS 29.338 clause 5.3.2.7).** The outcome was written into
+  SM-Delivery-Outcome as an SM-RP-MTI AVP, which is not a member of that
+  group, and the subscriber as a User-Name at command level, where the
+  command requires a User-Identifier. Now the request carries
+  `User-Identifier { User-Name }` and
+  `SM-Delivery-Outcome { MME-SM-Delivery-Outcome { SM-Delivery-Cause } }`.
+  `delivery_outcome` keeps its meaning for the values that have one, `0`
+  successful transfer, `1` absent user, `2` UE memory capacity exceeded, and
+  is translated to the SM-Delivery-Cause enumeration (which numbers them 2, 1
+  and 0). `3` and `4`, documented until now as "successful transfer, not last"
+  and "temporary error", name no cause the interface defines and raise
+  `ValueError` instead of being sent.
+
+  Two new arguments say what else the HSS acts on. `node=` names the node the
+  delivery was attempted through, `"mme"` (the default), `"sgsn"`, `"msc"` or
+  `"ip_sm_gw"`, and selects the group inside SM-Delivery-Outcome: the HSS
+  keeps its message waiting flags per node, so a forward that went to the
+  `sgsn_name` of the preceding `s6c_srr` is reported with `node="sgsn"`.
+  `absent_user_diagnostic=` adds an Absent-User-Diagnostic-SM, the reason the
+  node found the user absent, and is accepted with `delivery_outcome=1` only.
+
 - **iFC `SessionCase` 2 and 3 are decoded the way 3GPP TS 29.228 Annex E
   defines them.** `2` is terminating for an unregistered user and `3` is
   originating for an unregistered user; the two were swapped. A user profile

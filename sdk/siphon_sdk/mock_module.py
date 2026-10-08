@@ -7650,15 +7650,64 @@ class MockDiameter:
         }
 
     async def s6c_rsr(self, user_name: str, sc_address: str,
-                delivery_outcome: int) -> Optional[dict]:
+                delivery_outcome: int, node: str = "mme",
+                absent_user_diagnostic: Optional[int] = None) -> Optional[dict]:
         """Mock Report-SM-Delivery-Status. Records the call on
-        ``self.rsrs`` for assertions and returns a 2001."""
+        ``self.rsrs`` for assertions and returns a 2001.
+
+        Args:
+            user_name: IMSI of the served subscriber.
+            sc_address: Address of the service centre.
+            delivery_outcome: ``0`` successful transfer, ``1`` absent user,
+                ``2`` UE memory capacity exceeded. siphon sends it as the
+                SM-Delivery-Cause of TS 29.338.
+            node: The node the delivery was attempted through: ``"mme"``
+                (default), ``"sgsn"``, ``"msc"`` or ``"ip_sm_gw"``, compared
+                without case. The HSS keeps its message waiting flags per
+                node, so name the one the message went to: ``"sgsn"`` when
+                ``s6c_srr`` located no MME and the forward went to
+                ``sgsn_name``. Selects the group inside SM-Delivery-Outcome.
+            absent_user_diagnostic: Optional Absent-User-Diagnostic-SM, why
+                the node found the user absent (TS 23.040 clause 3.3.2, e.g.
+                ``1`` IMSI detached, ``6`` GPRS detached). Only with
+                ``delivery_outcome=1``.
+
+        Raises:
+            ValueError: ``delivery_outcome`` is not 0, 1 or 2, ``node`` is
+                not one of the four, or ``absent_user_diagnostic`` is given
+                for a delivery that did not end in an absent user.
+
+        Example::
+
+            located = await diameter.s6c_srr(msisdn, sc_address)
+            node = "mme" if located["mme_name"] else "sgsn"
+            ...
+            await diameter.s6c_rsr(located["user_name"], sc_address, 1,
+                                   node=node, absent_user_diagnostic=6)
+        """
+        if delivery_outcome not in (0, 1, 2):
+            raise ValueError(
+                f"invalid delivery_outcome: {delivery_outcome} — expected 0 "
+                "(successful transfer), 1 (absent user) or 2 (UE memory "
+                "capacity exceeded)"
+            )
+        if not isinstance(node, str) or node.lower() not in ("mme", "sgsn", "msc", "ip_sm_gw"):
+            raise ValueError(
+                f'invalid node: "{node}" — expected "mme", "sgsn", "msc" or "ip_sm_gw"'
+            )
+        if absent_user_diagnostic is not None and delivery_outcome != 1:
+            raise ValueError(
+                "absent_user_diagnostic is only sent with delivery_outcome 1 "
+                f"(absent user), not {delivery_outcome}"
+            )
         if not hasattr(self, "rsrs"):
             self.rsrs = []
         self.rsrs.append({
             "user_name": user_name,
             "sc_address": sc_address,
             "delivery_outcome": delivery_outcome,
+            "node": node.lower(),
+            "absent_user_diagnostic": absent_user_diagnostic,
         })
         return {
             "result_code": 2001,

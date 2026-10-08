@@ -1694,6 +1694,44 @@ static AVP_TABLE: &[AvpDef] = &[
         name: "SM-Delivery-Outcome",
         data_type: AvpType::Grouped,
     },
+    // TS 29.338 clauses 5.3.3.15 to 5.3.3.20: the per-node outcomes inside
+    // SM-Delivery-Outcome, and the cause and absence diagnostic each carries.
+    AvpDef {
+        code: 3317,
+        vendor_id: TGPP,
+        name: "MME-SM-Delivery-Outcome",
+        data_type: AvpType::Grouped,
+    },
+    AvpDef {
+        code: 3318,
+        vendor_id: TGPP,
+        name: "MSC-SM-Delivery-Outcome",
+        data_type: AvpType::Grouped,
+    },
+    AvpDef {
+        code: 3319,
+        vendor_id: TGPP,
+        name: "SGSN-SM-Delivery-Outcome",
+        data_type: AvpType::Grouped,
+    },
+    AvpDef {
+        code: 3320,
+        vendor_id: TGPP,
+        name: "IP-SM-GW-SM-Delivery-Outcome",
+        data_type: AvpType::Grouped,
+    },
+    AvpDef {
+        code: 3321,
+        vendor_id: TGPP,
+        name: "SM-Delivery-Cause",
+        data_type: AvpType::Enumerated,
+    },
+    AvpDef {
+        code: 3322,
+        vendor_id: TGPP,
+        name: "Absent-User-Diagnostic-SM",
+        data_type: AvpType::Unsigned32,
+    },
     AvpDef {
         code: 3324,
         vendor_id: TGPP,
@@ -2394,6 +2432,12 @@ pub mod avp {
     pub const SM_RP_UI: u32 = 3301;
     pub const SM_RP_MTI: u32 = 3308;
     pub const SM_DELIVERY_OUTCOME: u32 = 3316;
+    pub const MME_SM_DELIVERY_OUTCOME: u32 = 3317;
+    pub const MSC_SM_DELIVERY_OUTCOME: u32 = 3318;
+    pub const SGSN_SM_DELIVERY_OUTCOME: u32 = 3319;
+    pub const IP_SM_GW_SM_DELIVERY_OUTCOME: u32 = 3320;
+    pub const SM_DELIVERY_CAUSE: u32 = 3321;
+    pub const ABSENT_USER_DIAGNOSTIC_SM: u32 = 3322;
     pub const SMSMI_CORRELATION_ID: u32 = 3324;
     pub const SMS_GMSC_ADDRESS: u32 = 3332;
 
