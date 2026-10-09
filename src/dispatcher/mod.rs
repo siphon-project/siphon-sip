@@ -98,6 +98,8 @@ mod b_leg_asserted_identity_tests;
 #[cfg(test)]
 mod b_leg_capability_tests;
 #[cfg(test)]
+mod b_leg_non_sip_target_tests;
+#[cfg(test)]
 mod b_leg_position_tests;
 #[cfg(test)]
 mod b_leg_request_uri_tests;

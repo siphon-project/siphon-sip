@@ -753,7 +753,12 @@ class Call:
         """Dial a single B-leg target.
 
         Args:
-            uri: Destination SIP URI — drives the B-leg R-URI.
+            uri: Destination URI — drives the B-leg R-URI.  A SIP URI also
+                gives the B-leg To its ``host[:port]``.  A ``tel:`` URI
+                (RFC 3966), or one in any other scheme, has no host: it goes
+                out as the R-URI as written, needs ``next_hop=``, ``route=``
+                or ``flow=`` to be sent anywhere, and leaves the To as the
+                caller wrote it (pin its host with :meth:`set_to_host`).
             timeout: How long the B-leg may **ring** before siphon gives up,
                 in seconds.  On expiry siphon CANCELs, fires
                 ``@b2bua.on_failure`` and answers the caller ``408``.
@@ -1642,10 +1647,12 @@ class Call:
     def set_to_host(self, value: str) -> None:
         """Pin the host part of the B-leg To header URI.
 
-        By default the B2BUA rewrites the To URI host to the dial-target host.
-        ``set_to_host()`` pins it to ``value`` instead, so the To domain does
-        what the script says regardless of the routing next-hop (declarative
-        replacement for the raw ``set_header("To", "<sip:user@host>")`` idiom).
+        By default the B2BUA rewrites the To URI host to the dial-target host,
+        and leaves it as the caller wrote it when the target has none (a
+        ``tel:`` URI).  ``set_to_host()`` pins it to ``value`` instead, so the
+        To domain does what the script says regardless of the routing next-hop
+        (declarative replacement for the raw
+        ``set_header("To", "<sip:user@host>")`` idiom).
 
         Only the host changes; scheme/user/port/params and any To-tag are
         preserved.  ``value`` is a bare host (no port).  Must be called before
