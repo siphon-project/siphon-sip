@@ -2315,9 +2315,10 @@ impl PyCall {
 
     /// Pin the host part of the B-leg To header URI.
     ///
-    /// By default the B2BUA rewrites the To URI host to the dial-target host.
-    /// `set_to_host()` pins it to `value` instead, so the To domain does what
-    /// the script says regardless of the routing next-hop (declarative
+    /// By default the B2BUA rewrites the To URI host to the dial-target host,
+    /// and leaves it as the caller wrote it when the target has none (a `tel:`
+    /// URI). `set_to_host()` pins it to `value` instead, so the To domain does
+    /// what the script says regardless of the routing next-hop (declarative
     /// replacement for the raw `set_header("To", "<sip:user@host>")` idiom).
     ///
     /// Only the host changes; scheme/user/port/params and any To-tag are

@@ -337,8 +337,11 @@ pub fn b2bua_dial_b_leg(
     // preserve the called party's user part from the A-leg RURI.
     // The dial target is a routing destination, not the called party.
     // If the script dials `sip:specific-user@host`, that user is respected.
+    // Only a SIP URI has a user part to fill in (RFC 3261 §19.1.1): a `tel:` URI
+    // is its number (RFC 3966 §3), and any other scheme is opaque here and goes
+    // out as written.
     if let Ok(mut target_parsed) = parse_uri_standalone(target_uri) {
-        if target_parsed.user.is_none() {
+        if target_parsed.user.is_none() && target_parsed.scheme.is_sip_family() {
             if let StartLine::Request(ref orig_rl) = original_request.start_line {
                 target_parsed.user = orig_rl.request_uri.user.clone();
             }
@@ -491,7 +494,10 @@ pub fn b2bua_dial_b_leg(
             // original To port and URI params are preserved (documented
             // `set_to_host` contract: `value` is a bare host, no port).
             new_to = crate::b2bua::actor::rewrite_uri_host(&new_to, pinned);
-        } else if let Ok(target_parsed) = parse_uri_standalone(target_uri) {
+        } else if let Some(target_parsed) = parse_uri_standalone(target_uri)
+            .ok()
+            .filter(|target| target.scheme.is_sip_family())
+        {
             // Default: topology-hide the To to the dial-target authority.  The
             // original To host+port is siphon's own inbound address (leaked
             // from the A-leg) and is meaningless on the B-leg, so replace host
@@ -506,7 +512,14 @@ pub fn b2bua_dial_b_leg(
             };
             new_to = crate::b2bua::actor::rewrite_uri_authority(&new_to, &target_authority);
         }
-        // Unparseable target and no override — leave the To host untouched.
+        // A target with no authority to give and no override — leave the To
+        // host untouched. That is an unparseable target, and one that is not a
+        // SIP URI: a `tel:` URI has no host (RFC 3966 §3) and another scheme's
+        // URI is opaque, so splicing one in left the To with an empty host or
+        // with whatever followed the scheme. The To names the logical
+        // recipient and need not track the Request-URI (RFC 3261 §8.1.1.2), so
+        // the caller's crosses as written; `call.set_to_host()` pins a host
+        // where the caller-facing one must not.
 
         // A retargeted call must not carry the number it was originally
         // addressed to. RFC 3261 §8.1.1.2 does not require To to track the
@@ -701,7 +714,11 @@ pub fn b2bua_dial_b_leg(
     );
     // Store the B-leg's remote AoR host (from dial target) for in-dialog To headers.
     // In-dialog To uses the original AoR, NOT the remote Contact (which is for RURI).
-    if let Ok(target_parsed) = parse_uri_standalone(target_uri) {
+    // Only a SIP target has one: a `tel:` URI or an opaque one names no host.
+    if let Some(target_parsed) = parse_uri_standalone(target_uri)
+        .ok()
+        .filter(|target| target.scheme.is_sip_family())
+    {
         b_leg.dialog.remote_aor_host = Some(if let Some(port) = target_parsed.port {
             format!("{}:{}", target_parsed.host, port)
         } else {

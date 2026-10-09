@@ -58,6 +58,19 @@ entry, but a working config keeps working.
 
 ### Fixed
 
+- **`call.dial()` and `call.fork()` to a `tel:` target build a well-formed
+  B-leg `To`.** The B-leg `To` takes the dial target's `host[:port]`, and a
+  `tel:` URI has none (RFC 3966 §3), so `call.dial("tel:+15550100", ...)` sent
+  `To: <sip:user@>` with an empty host, or with the target's `phone-context` in
+  its place, and every later request siphon sent on that leg, the BYE included,
+  carried the same malformed `To`. The caller's `To` now crosses as the caller wrote it when
+  the target is not a SIP URI (RFC 3261 §8.1.1.2: it names the logical
+  recipient and need not track the Request-URI), and `call.set_to_host()` pins
+  a host as before. A target in any other scheme sent by way of `next_hop=` or
+  `route=`, such as `urn:service:sos`, is the Request-URI as written: the
+  caller's user was spliced into it (`urn:user@service:sos`). SIP targets are
+  unchanged.
+
 - **An UPDATE with an offer on the early dialog of a B2BUA call crosses to the
   other party (RFC 3311 §5.1, RFC 3312 §5).** A caller that negotiates
   preconditions gets its answer in a reliable 183, PRACKs it, and sends an

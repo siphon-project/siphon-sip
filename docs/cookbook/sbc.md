@@ -65,6 +65,12 @@ host the same way (a declarative replacement for hand-building
 `set_header("To", "<sip:user@host>")`). Only the host changes — scheme, user, port,
 params, and tags are preserved — and both apply to `call.dial()` and `call.fork()`.
 
+A target that is not a SIP URI has no host to give the To. `call.dial("tel:+15550100",
+next_hop=...)` sends `tel:+15550100` as the Request-URI (RFC 3966) and leaves the To as
+the caller wrote it, its host included, which is what a B2BUA that routes a request on
+unchanged wants. Where the caller-facing host must not cross, pin one with
+`set_to_host`.
+
 ## Header policies — control what crosses the boundary
 
 The whole point of an SBC is deciding which headers leak between two networks. SIPhon
