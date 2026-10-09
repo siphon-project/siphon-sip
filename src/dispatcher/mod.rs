@@ -104,6 +104,8 @@ mod b_leg_position_tests;
 #[cfg(test)]
 mod b_leg_request_uri_tests;
 #[cfg(test)]
+mod b_leg_route_entry_tests;
+#[cfg(test)]
 mod bad_extension_tests;
 #[cfg(test)]
 mod bridged_pair_media_events_tests;

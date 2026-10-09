@@ -29,6 +29,7 @@ pub mod registrant;
 pub mod registrar;
 pub mod reply;
 pub mod request;
+mod route_entries;
 pub mod rtpengine;
 pub mod sbi;
 pub mod sdp;
