@@ -11,7 +11,7 @@ import ipaddress
 import uuid
 from typing import Any, Optional, Union
 
-from siphon_sdk.types import Action, Contact, Flow, MediaHandle, SipUri
+from siphon_sdk.types import Action, Contact, Flow, MediaHandle, SipUri, route_name_addrs
 from siphon_sdk.request import _parse_uri, _validate_send_socket
 from siphon_sdk.lcr import Route
 
@@ -819,9 +819,15 @@ class Call:
             route: Route header set prepended to the B-leg INVITE *after* the
                 A-leg Route/Record-Route are stripped.  Carries the captured
                 IMS Service-Route on MO calls so the request traverses the
-                originating S-CSCF (RFC 3608).  Each entry is a full route
-                value, e.g. ``"<sip:scscf.ims.example.com:6060;lr>"`` — pass
-                the list returned by ``registration.service_route(impu)``.
+                originating S-CSCF (RFC 3608) — pass the list returned by
+                ``registration.service_route(impu)``.  Each entry goes out as
+                one ``name-addr`` (RFC 3261 §20.34) whatever form it is
+                written in: a bare URI (``"sip:scscf.example.com:6060;lr"``,
+                every parameter the URI's), a bracketed one, a full
+                ``'"Name" <sip:...;lr>;param'``, or a received ``Route`` value
+                with several bracketed entries, which is taken apart at its
+                commas.  An entry that is not a SIP or SIPS URI raises
+                ``ValueError`` naming it.
             send_socket: Optional egress socket pin
                 (``"<transport>:<ip>:<port>"``, e.g. ``"udp:10.0.0.1:5060"``)
                 — the operator equivalent of Kamailio's ``force_send_socket()``.
@@ -887,6 +893,7 @@ class Call:
         if max_duration is not None:
             self._max_duration_secs = max_duration
         uri = self._normalize_dial_targets([uri], number_policy, format)[0]
+        route_set = route_name_addrs(route)
         self._actions.append(Action(
             kind="dial",
             targets=[uri],
@@ -899,7 +906,7 @@ class Call:
                 "copy": copy or [],
                 "strip": strip or [],
                 "translate": translate or [],
-                "route": route or [],
+                "route": route_set,
                 "send_socket": send_socket,
                 "auth_passthrough": auth_passthrough,
             },

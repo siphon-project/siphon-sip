@@ -498,6 +498,149 @@ class Contact:
     way the engine does; the engine does not expose it to scripts."""
 
 
+def _split_route_entries(value: str) -> list:
+    """Split a ``Route`` value at the commas between its entries: those
+    outside angle brackets and outside a quoted display name."""
+    entries, start = [], 0
+    quoted = escaped = bracketed = False
+    for offset, character in enumerate(value):
+        if escaped:
+            escaped = False
+        elif quoted and character == "\\":
+            escaped = True
+        elif character == '"' and not bracketed:
+            quoted = not quoted
+        elif quoted:
+            continue
+        elif character == "<":
+            bracketed = True
+        elif character == ">":
+            bracketed = False
+        elif character == "," and not bracketed:
+            entries.append(value[start:offset].strip())
+            start = offset + 1
+    entries.append(value[start:].strip())
+    return [entry for entry in entries if entry]
+
+
+def _route_uri(uri: str, entry: str) -> str:
+    """``uri`` when it is a complete SIP or SIPS URI, as the URI of ``entry``."""
+    try:
+        parsed = parse_uri(uri, strict=True)
+    except ValueError as error:
+        raise ValueError(f"route entry {entry!r} is not a URI: {error}") from None
+    if parsed.scheme not in ("sip", "sips") or not parsed.host:
+        raise ValueError(
+            f"route entry {entry!r} is not a SIP or SIPS URI with a host, "
+            "which is all a request can be routed to"
+        )
+    return uri
+
+
+def route_parts(value: str) -> list:
+    """Take apart the route entries a script supplied as one string.
+
+    Mirrors the runtime: a bare URI, a URI in angle brackets, a full
+    ``name-addr`` with or without a display name and header parameters, or
+    several bracketed entries separated by commas (a received ``Route`` or
+    ``Service-Route`` value).  A value with no angle brackets is one URI, its
+    semicolons and commas included.
+
+    Returns:
+        ``(display_name, uri, parameters)`` per entry, each as written.
+
+    Raises:
+        ValueError: An entry is not a complete SIP or SIPS URI.
+    """
+    text = str(value).strip()
+    if not text:
+        raise ValueError("a route entry is empty")
+    if "<" not in text:
+        return [("", _route_uri(text, text), "")]
+    parts = []
+    for entry in _split_route_entries(text):
+        open_at, quoted, escaped = -1, False, False
+        for offset, character in enumerate(entry):
+            if escaped:
+                escaped = False
+            elif quoted and character == "\\":
+                escaped = True
+            elif character == '"':
+                quoted = not quoted
+            elif not quoted and character == "<":
+                open_at = offset
+                break
+        if open_at < 0:
+            raise ValueError(
+                f"route entry {entry!r} has no '<' outside its display name")
+        close_at = entry.find(">", open_at)
+        if close_at < 0:
+            raise ValueError(f"route entry {entry!r} has no '>' closing its URI")
+        parameters = entry[close_at + 1:].strip()
+        if parameters and not parameters.startswith(";"):
+            raise ValueError(
+                f"route entry {entry!r} has text after '>' that is not a "
+                "';'-separated parameter")
+        uri = _route_uri(entry[open_at + 1:close_at].strip(), entry)
+        parts.append((entry[:open_at].strip(), uri, parameters))
+    return parts
+
+
+def _name_addr(display_name: str, uri: str, parameters: str) -> str:
+    if display_name:
+        return f"{display_name} <{uri}>{parameters}"
+    return f"<{uri}>{parameters}"
+
+
+def route_name_addrs(entries) -> list:
+    """The route set ``entries`` name, one ``name-addr`` per entry.
+
+    What the runtime puts in a ``Route`` header for
+    ``call.dial(route=[...])`` and ``presence.subscribe_dialog(route_set=[...])``
+    (RFC 3261 §20.34): a URI written there without angle brackets has its
+    parameters, ``lr`` among them, read as the header's.
+
+    Example::
+
+        route_name_addrs(["sip:scscf.example.com;lr"])
+        # ['<sip:scscf.example.com;lr>']
+
+    Raises:
+        ValueError: An entry is not a complete SIP or SIPS URI.
+    """
+    route_set = []
+    for entry in entries or []:
+        route_set.extend(_name_addr(*parts) for parts in route_parts(entry))
+    return route_set
+
+
+def _has_lr(uri: str) -> bool:
+    parameters = uri.split("?", 1)[0].split(";")[1:]
+    return any(p.split("=", 1)[0].strip().lower() == "lr" for p in parameters)
+
+
+def loose_route_entry(value: str) -> str:
+    """``value`` as one loose-route entry, ``<uri;lr>``, exactly once.
+
+    What the runtime's ``request.prepend_route()`` / ``request.add_path()``
+    write: a bare URI or a bracketed one gains ``;lr`` when it has none, and a
+    full ``name-addr`` keeps its display name and header parameters.
+    """
+    text = str(value).strip()
+    if "<" in text:
+        try:
+            parts = route_parts(text)
+        except ValueError:
+            parts = []
+        if len(parts) == 1:
+            display_name, uri, parameters = parts[0]
+            if not _has_lr(uri):
+                uri = f"{uri};lr"
+            return _name_addr(display_name, uri, parameters)
+    inner = text[1:-1].strip() if text.startswith("<") and text.endswith(">") else text
+    return f"<{inner}>" if _has_lr(inner) else f"<{inner};lr>"
+
+
 @dataclass
 class Action:
     """Records a single action taken by a handler (reply, relay, fork, etc.).

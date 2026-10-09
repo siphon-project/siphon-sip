@@ -21,44 +21,6 @@ use crate::sip::uri::format_sip_host;
 /// Shared list of local domains from config.
 pub type LocalDomains = Arc<Vec<String>>;
 
-/// Build a loose-route header value (`<uri;lr>`) idempotently.
-///
-/// Accepts URIs with or without surrounding angle brackets and with or
-/// without an existing `;lr` URI parameter, returning the canonical
-/// `<uri;lr>` form exactly once.  Required so scripts can pass back
-/// values they previously received from siphon (stored Path entries,
-/// Service-Route bindings) without producing wire forms like
-/// `<<sip:host;lr>;lr>` or `<sip:host;lr;lr>` — both of which break
-/// downstream loose-route detection (RFC 3261 §16.4 / §16.12).
-fn format_loose_route_entry(uri: &str) -> String {
-    let trimmed = uri.trim();
-    let inner = if trimmed.starts_with('<') && trimmed.ends_with('>') {
-        trimmed[1..trimmed.len() - 1].trim()
-    } else {
-        trimmed
-    };
-    if has_lr_uri_param(inner) {
-        format!("<{inner}>")
-    } else {
-        format!("<{inner};lr>")
-    }
-}
-
-/// True when `uri` (the contents inside `<...>`) already carries `;lr`
-/// as a URI parameter.  RFC 3261 §25.1 allows URI parameters in any
-/// order, so this checks every `;`-delimited parameter (not just the
-/// last).  The `?headers` portion of a URI is excluded — `lr` after
-/// `?` is a URI header named `lr`, not the loose-route parameter.
-fn has_lr_uri_param(uri: &str) -> bool {
-    let params_section = uri.split('?').next().unwrap_or(uri);
-    let mut parts = params_section.split(';');
-    parts.next();
-    parts.any(|param| {
-        let name = param.split('=').next().unwrap_or("").trim();
-        name.eq_ignore_ascii_case("lr")
-    })
-}
-
 /// Whether a script-supplied reply header should replace any existing
 /// header of the same name (single-value: To, From, Contact, Expires, …)
 /// or append (multi-value: Via, Route, Service-Route, P-Associated-URI, …).
@@ -1642,7 +1604,7 @@ impl PyRequest {
 
     /// Prepend a `Path: <uri;lr>` header.
     fn add_path(&self, uri: &str) -> PyResult<()> {
-        let path_value = format_loose_route_entry(uri);
+        let path_value = super::route_entries::format_loose_route_entry(uri);
         let mut message = self.lock_mut()?;
         let existing = message.headers.get("Path").cloned();
         match existing {
@@ -1654,7 +1616,7 @@ impl PyRequest {
 
     /// Prepend a `Route: <uri;lr>` header.
     fn prepend_route(&self, uri: &str) -> PyResult<()> {
-        let route_value = format_loose_route_entry(uri);
+        let route_value = super::route_entries::format_loose_route_entry(uri);
         let mut message = self.lock_mut()?;
         let existing = message.headers.get("Route").cloned();
         match existing {
@@ -3390,6 +3352,24 @@ mod tests {
         request.prepend_route("<sip:proxy.example.com>").unwrap();
         let route = request.get_header("Route").unwrap().unwrap();
         assert_eq!(route, "<sip:proxy.example.com;lr>");
+    }
+
+    /// A full name-addr keeps its display name and the header parameters after
+    /// its closing bracket, with `lr` added to the URI inside (RFC 3261 §20).
+    #[test]
+    fn prepend_route_keeps_a_display_name_and_header_parameters() {
+        let request = make_request();
+        request.remove_header("Route").unwrap();
+        request
+            .prepend_route("\"Edge, one\" <sip:proxy.example.com:5060>;hop=1")
+            .unwrap();
+        let route = request.get_header("Route").unwrap().unwrap();
+        assert_eq!(route, "\"Edge, one\" <sip:proxy.example.com:5060;lr>;hop=1");
+
+        request.remove_header("Path").unwrap();
+        request.add_path("Edge <sip:proxy.example.com;lr>").unwrap();
+        let path = request.get_header("Path").unwrap().unwrap();
+        assert_eq!(path, "Edge <sip:proxy.example.com;lr>");
     }
 
     #[test]

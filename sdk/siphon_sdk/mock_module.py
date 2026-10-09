@@ -21,7 +21,7 @@ import uuid
 from types import ModuleType
 from typing import Any, Awaitable, Callable, Optional, Union
 
-from siphon_sdk.types import Contact, SipUri
+from siphon_sdk.types import Contact, SipUri, route_name_addrs
 from siphon_sdk.request import _parse_uri
 from siphon_sdk.cdr import CallDetailRecord
 from siphon_sdk.lcr import Route
@@ -8162,7 +8162,10 @@ class MockPresence:
             call_id: Call-ID from the SUBSCRIBE dialog.
             from_tag: From-tag from the SUBSCRIBE.
             to_tag: To-tag from the SUBSCRIBE.
-            route_set: Route headers from Record-Route.
+            route_set: Route headers from Record-Route.  Each entry is kept
+                as one ``name-addr`` whatever form it is written in (a bare
+                URI, a bracketed one, a full ``name-addr``); one that is not
+                a SIP or SIPS URI raises ``ValueError``.
             local_uri: The SUBSCRIBE's **To URI** — the dialog's local URI,
                 which RFC 3261 §12.2.1.1 requires in the ``From`` of every
                 in-dialog NOTIFY.  Pass ``str(request.to_uri)``.
@@ -8177,6 +8180,7 @@ class MockPresence:
         Returns:
             Subscription ID string.
         """
+        route_set = route_name_addrs(route_set)
         sub_id = f"sub-{self._next_sub_id}"
         self._next_sub_id += 1
         self._subscriptions[sub_id] = {
@@ -8186,7 +8190,7 @@ class MockPresence:
             "call_id": call_id,
             "from_tag": from_tag,
             "to_tag": to_tag,
-            "route_set": route_set or [],
+            "route_set": route_set,
             "local_uri": _strip_nameaddr(local_uri) if local_uri else resource,
             "remote_uri": _strip_nameaddr(remote_uri) if remote_uri else resource,
         }

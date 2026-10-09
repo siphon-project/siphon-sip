@@ -159,3 +159,90 @@ class TestCallMaxDuration:
         assert call.max_duration == 600
         call.set_max_duration(0)
         assert call.max_duration == 0
+
+
+class TestCallDialRoute:
+    """``route=`` entries reach the wire as one name-addr each (RFC 3261
+    §20.34), whatever form the script writes them in."""
+
+    def _route(self, entries):
+        call = Call()
+        call.dial("sip:1000@ims.example.org", route=entries)
+        return call._actions[0].extras["route"]
+
+    def test_a_bare_uri_keeps_its_parameters_inside_the_brackets(self):
+        assert self._route(["sip:orig@198.51.100.7:6060;lr;odi=abc"]) == [
+            "<sip:orig@198.51.100.7:6060;lr;odi=abc>",
+        ]
+
+    def test_a_bracketed_uri_is_kept_as_written(self):
+        assert self._route(["<sip:198.51.100.7;lr>"]) == ["<sip:198.51.100.7;lr>"]
+
+    def test_a_name_addr_keeps_its_display_name_and_parameters(self):
+        assert self._route(['"First, hop" <sip:198.51.100.7;lr>;hop=1']) == [
+            '"First, hop" <sip:198.51.100.7;lr>;hop=1',
+        ]
+
+    def test_a_received_route_value_is_taken_apart_at_its_commas(self):
+        assert self._route([
+            "sip:[2001:db8::7]:5060;lr",
+            "<sip:edge.example.com;lr>, Core <sip:1,2@core.example.com;lr>",
+        ]) == [
+            "<sip:[2001:db8::7]:5060;lr>",
+            "<sip:edge.example.com;lr>",
+            "Core <sip:1,2@core.example.com;lr>",
+        ]
+
+    def test_no_route_is_an_empty_route_set(self):
+        assert self._route(None) == []
+        assert self._route([]) == []
+
+    @pytest.mark.parametrize("entry", [
+        "",
+        "198.51.100.7:5060;lr",
+        "tel:+15550100",
+        "<urn:service:sos>",
+        "<sip:edge.example.com;lr",
+        "<sip:edge.example.com;lr> trailing",
+        "sip:edge.example.com garbage",
+    ])
+    def test_an_entry_that_is_no_sip_uri_raises_and_dials_nothing(self, entry):
+        call = Call()
+        with pytest.raises(ValueError, match="route entry|is empty"):
+            call.dial("sip:1000@ims.example.org", route=["<sip:ok.example.com;lr>", entry])
+        assert call._actions == []
+
+
+class TestLooseRouteEntry:
+    """``request.prepend_route()`` / ``add_path()`` write ``<uri;lr>`` once."""
+
+    @pytest.mark.parametrize("given, written", [
+        ("sip:proxy.example.com", "<sip:proxy.example.com;lr>"),
+        ("sip:proxy.example.com;lr", "<sip:proxy.example.com;lr>"),
+        ("<sip:proxy.example.com;lr>", "<sip:proxy.example.com;lr>"),
+        ("<sip:proxy.example.com>", "<sip:proxy.example.com;lr>"),
+        ("sip:proxy.example.com;LR;transport=tcp", "<sip:proxy.example.com;LR;transport=tcp>"),
+        ("sip:proxy.example.com;lrid=1", "<sip:proxy.example.com;lrid=1;lr>"),
+        ('"Edge, one" <sip:proxy.example.com:5060>;hop=1',
+         '"Edge, one" <sip:proxy.example.com:5060;lr>;hop=1'),
+    ])
+    def test_prepend_route_and_add_path(self, given, written):
+        from siphon_sdk.request import Request
+
+        request = Request()
+        request.remove_header("Route")
+        request.prepend_route(given)
+        assert request.get_header("Route") == written
+        request.remove_header("Path")
+        request.add_path(given)
+        assert request.get_header("Path") == written
+
+    def test_prepend_route_goes_in_front_of_what_is_there(self):
+        from siphon_sdk.request import Request
+
+        request = Request()
+        request.set_header("Route", "<sip:second.example.com;lr>")
+        request.prepend_route("sip:first.example.com")
+        assert request.get_header("Route") == (
+            "<sip:first.example.com;lr>, <sip:second.example.com;lr>"
+        )

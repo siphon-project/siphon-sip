@@ -11,7 +11,9 @@ import ipaddress
 import uuid
 from typing import Callable, Optional, Union
 
-from siphon_sdk.types import Action, Contact, Flow, SipUri, _check_param, parse_uri
+from siphon_sdk.types import (
+    Action, Contact, Flow, SipUri, _check_param, loose_route_entry, parse_uri,
+)
 
 _SEND_SOCKET_TRANSPORTS = {"udp", "tcp", "tls", "ws", "wss", "sctp"}
 
@@ -1290,14 +1292,19 @@ class Request:
     def add_path(self, uri: str) -> None:
         """Prepend a ``Path`` header (P-CSCF registration path).
 
+        The entry goes out as ``<uri;lr>`` exactly once: angle brackets and
+        ``;lr`` are added only where ``uri`` has none, and a full
+        ``name-addr`` keeps its display name and header parameters.
+
         Args:
             uri: URI to prepend (e.g. ``"sip:pcscf.ims.example.com;lr"``).
         """
+        entry = loose_route_entry(uri)
         existing = self.get_header("Path")
         if existing:
-            self.set_header("Path", f"<{uri};lr>, {existing}")
+            self.set_header("Path", f"{entry}, {existing}")
         else:
-            self.set_header("Path", f"<{uri};lr>")
+            self.set_header("Path", entry)
 
     def add_pcscf_path(self, token: str) -> None:
         """Insert a Path header (RFC 3327) of the form
@@ -1323,14 +1330,19 @@ class Request:
     def prepend_route(self, uri: str) -> None:
         """Prepend a ``Route`` header.
 
+        The entry goes out as ``<uri;lr>`` exactly once: angle brackets and
+        ``;lr`` are added only where ``uri`` has none, and a full
+        ``name-addr`` keeps its display name and header parameters.
+
         Args:
             uri: URI to prepend (e.g. ``"sip:scscf.ims.example.com;lr"``).
         """
+        entry = loose_route_entry(uri)
         existing = self.get_header("Route")
         if existing:
-            self.set_header("Route", f"<{uri};lr>, {existing}")
+            self.set_header("Route", f"{entry}, {existing}")
         else:
-            self.set_header("Route", f"<{uri};lr>")
+            self.set_header("Route", entry)
 
     def add_contact_alias(self) -> None:
         """Append ``;alias`` to the Contact URI (NAT traversal)."""

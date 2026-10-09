@@ -175,7 +175,10 @@ impl PyPresence {
         route_set: Option<Vec<String>>,
         local_uri: Option<String>,
         remote_uri: Option<String>,
-    ) -> String {
+    ) -> PyResult<String> {
+        // Each NOTIFY carries these as its `Route`, which takes `name-addr`
+        // values (RFC 3261 §20.34): one per entry, whatever form it came in.
+        let route_set = super::route_entries::route_set_from(&route_set.unwrap_or_default())?;
         let subscription_id = format!("sub-{}", uuid::Uuid::new_v4());
         let subscription = Subscription::with_dialog(
             subscription_id.clone(),
@@ -187,12 +190,12 @@ impl PyPresence {
             call_id.to_string(),
             from_tag.to_string(),
             to_tag.to_string(),
-            route_set.unwrap_or_default(),
+            route_set,
             local_uri.map(|uri| strip_nameaddr(&uri)),
             remote_uri.map(|uri| strip_nameaddr(&uri)),
         );
         self.store.add_subscription(subscription);
-        subscription_id
+        Ok(subscription_id)
     }
 
     /// Unsubscribe by subscription ID.
@@ -711,18 +714,20 @@ mod tests {
         // UUID@ip:port, both dialog URIs are the AoR.
         let contact = "sip:f81d4fae-7dec-11d0-a765-00a0c91e6bf6@198.51.100.7:43080";
         let aor = "sip:001010000000001@ims.mnc001.mcc001.3gppnetwork.org";
-        let sub_id = presence.subscribe_dialog(
-            contact,
-            aor,
-            "reg",
-            7200,
-            "call-1",
-            "ftag-ue",
-            "scscf-notifier",
-            None,
-            Some(format!("<{aor}>")),
-            Some(format!("<{aor}>;tag=ftag-ue")),
-        );
+        let sub_id = presence
+            .subscribe_dialog(
+                contact,
+                aor,
+                "reg",
+                7200,
+                "call-1",
+                "ftag-ue",
+                "scscf-notifier",
+                None,
+                Some(format!("<{aor}>")),
+                Some(format!("<{aor}>;tag=ftag-ue")),
+            )
+            .expect("a subscription");
 
         let dialog = store.prepare_notify(&sub_id).expect("dialog state");
         assert_eq!(
@@ -747,9 +752,11 @@ mod tests {
 
         let contact = "sip:uuid@198.51.100.7:43080";
         let aor = "sip:001010000000001@ims.example.com";
-        let sub_id = presence.subscribe_dialog(
-            contact, aor, "reg", 7200, "call-2", "ftag", "notif", None, None, None,
-        );
+        let sub_id = presence
+            .subscribe_dialog(
+                contact, aor, "reg", 7200, "call-2", "ftag", "notif", None, None, None,
+            )
+            .expect("a subscription");
 
         let dialog = store.prepare_notify(&sub_id).expect("dialog state");
         assert_eq!(dialog.local_uri, aor);
@@ -766,23 +773,71 @@ mod tests {
         let store = make_store();
         let presence = PyPresence::new(Arc::clone(&store));
 
-        let sub_id = presence.subscribe_dialog(
-            "sip:bob@10.0.0.9:5060",
-            "sip:alice@example.com",
-            "presence",
-            3600,
-            "call-3",
-            "ftag-bob",
-            "notif",
-            None,
-            Some("<sip:alice@example.com>".to_string()),
-            Some("<sip:bob@example.com>".to_string()),
-        );
+        let sub_id = presence
+            .subscribe_dialog(
+                "sip:bob@10.0.0.9:5060",
+                "sip:alice@example.com",
+                "presence",
+                3600,
+                "call-3",
+                "ftag-bob",
+                "notif",
+                None,
+                Some("<sip:alice@example.com>".to_string()),
+                Some("<sip:bob@example.com>".to_string()),
+            )
+            .expect("a subscription");
 
         let dialog = store.prepare_notify(&sub_id).expect("dialog state");
         assert_eq!(dialog.local_uri, "sip:alice@example.com");
         assert_eq!(dialog.remote_uri, "sip:bob@example.com");
         assert_eq!(dialog.subscriber, "sip:bob@10.0.0.9:5060");
+    }
+
+    /// The route set a NOTIFY carries is one name-addr per entry (RFC 3261
+    /// §20.34), whatever form the script handed it over in, and an entry that
+    /// is not a SIP URI is refused where the script made the call.
+    #[test]
+    fn a_dialog_route_set_is_kept_as_name_addrs() {
+        let store = make_store();
+        let presence = PyPresence::new(Arc::clone(&store));
+        let subscribe = |route_set: Vec<&str>| {
+            presence.subscribe_dialog(
+                "sip:watcher@198.51.100.7:5060",
+                "sip:001010000000001@ims.mnc001.mcc001.3gppnetwork.org",
+                "reg",
+                3600,
+                "call-route-set",
+                "ftag-watcher",
+                "notifier-tag",
+                Some(route_set.into_iter().map(str::to_string).collect()),
+                None,
+                None,
+            )
+        };
+
+        let sub_id = subscribe(vec![
+            "sip:edge.example.com:5060;lr",
+            "<sip:core.example.com;lr>, Core <sip:core2.example.com;lr>;x=1",
+        ])
+        .expect("a subscription");
+        let dialog = store.prepare_notify(&sub_id).expect("dialog state");
+        assert_eq!(
+            dialog.route_set,
+            vec![
+                "<sip:edge.example.com:5060;lr>".to_string(),
+                "<sip:core.example.com;lr>".to_string(),
+                "Core <sip:core2.example.com;lr>;x=1".to_string(),
+            ]
+        );
+
+        pyo3::Python::initialize();
+        let error = subscribe(vec!["edge.example.com;lr"]).expect_err("no URI");
+        Python::attach(|python| {
+            assert!(error.is_instance_of::<pyo3::exceptions::PyValueError>(python));
+            let text = error.value(python).to_string();
+            assert!(text.contains("\"edge.example.com;lr\""), "{text}");
+        });
     }
 
     #[test]
@@ -793,18 +848,20 @@ mod tests {
         let store = make_store();
         let presence = PyPresence::new(store);
 
-        let sub_id = presence.subscribe_dialog(
-            "sip:alice@ims.example.com",
-            "sip:alice@ims.example.com",
-            "reg",
-            3600,
-            "call-abc",
-            "ftag-alice",
-            "scscf-notif",
-            None,
-            None,
-            None,
-        );
+        let sub_id = presence
+            .subscribe_dialog(
+                "sip:alice@ims.example.com",
+                "sip:alice@ims.example.com",
+                "reg",
+                3600,
+                "call-abc",
+                "ftag-alice",
+                "scscf-notif",
+                None,
+                None,
+                None,
+            )
+            .expect("a subscription");
 
         // In-dialog refresh path: resolve by dialog, then refresh.
         assert_eq!(

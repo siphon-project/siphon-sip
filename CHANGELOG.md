@@ -58,6 +58,26 @@ entry, but a working config keeps working.
 
 ### Fixed
 
+- **`call.dial(route=[...])` writes every entry as a `name-addr` (RFC 3261
+  §20.34).** An entry given as a bare URI, `"sip:host;lr;x=y"`, went on the
+  wire as `Route: sip:host;lr;x=y`. Without angle brackets its parameters are
+  the header's, not the URI's (§20), so the next hop saw no `lr` on the URI
+  and took the request as strictly routed; siphon itself did not read the bare
+  entry as the route set either and sent the INVITE to the dial target rather
+  than to the first `Route` (§8.1.2). Each entry now goes out as one
+  `name-addr` whatever form it is written in: a bare URI, with every parameter
+  the URI's, a bracketed one, a full `"Name" <sip:...;lr>;param` with its
+  display name and header parameters kept, or a received `Route` /
+  `Service-Route` value holding several bracketed entries, which is taken apart
+  at its commas. Nothing is added: an entry without `lr` stays without. An
+  entry that is not a complete SIP or SIPS URI raises `ValueError` naming it
+  when the script calls `dial`, where it used to be sent as written.
+  `presence.subscribe_dialog(route_set=[...])`, whose entries become the
+  `Route` of each NOTIFY, takes the same forms and raises the same way.
+  `request.prepend_route()` and `request.add_path()` already bracketed a bare
+  URI; they now keep the display name and header parameters of a full
+  `name-addr`, which they wrapped in a second pair of brackets.
+
 - **A NOTIFY that arrives before the 2xx to the SUBSCRIBE of
   `proxy.subscribe_state.send()` is matched to that subscription (RFC 6665
   §4.1.2.4, §4.4.1).** The dialog was stored only once the awaited 2xx had

@@ -39,7 +39,8 @@ pub enum CallAction {
         /// Route header set prepended to the B-leg INVITE (after the A-leg
         /// Route/Record-Route are stripped). Used to carry the captured IMS
         /// Service-Route on MO calls so they traverse the originating S-CSCF
-        /// (RFC 3608). Each entry is a full route value, e.g. `<sip:scscf;lr>`.
+        /// (RFC 3608). Each entry is one `name-addr`, e.g. `<sip:scscf;lr>`, as
+        /// `route_set_from` made of whatever form the script wrote.
         route: Vec<String>,
         /// Force-send-socket egress pin (`send_socket="udp:10.0.0.1:5060"`).
         /// Selects which configured listener the B-leg INVITE leaves from on a
@@ -1719,6 +1720,7 @@ impl PyCall {
         format: Option<&str>,
     ) -> PyResult<()> {
         super::request::validate_send_socket(send_socket.as_deref())?;
+        let route = super::route_entries::route_set_from(&route)?;
         self.max_duration_secs = max_duration.or(self.max_duration_secs);
         // Number normalization (a named `number_policy=`, an inline `format=`,
         // else the configured `b2bua.default_number_policy`): reformat the A-leg
@@ -3096,6 +3098,77 @@ mod tests {
             }
             other => panic!("expected Dial, got {other:?}"),
         }
+    }
+
+    /// `route=` entries become one name-addr each (RFC 3261 §20.34), whatever
+    /// form the script wrote them in, and an entry that is not a SIP URI raises
+    /// `ValueError` naming it, with no dial recorded.
+    #[test]
+    fn call_dial_route_entries_become_name_addrs() {
+        let dial = |call: &mut PyCall, route: Vec<&str>| {
+            call.dial(
+                "sip:1000@ims.mnc001.mcc001.3gppnetwork.org",
+                30,
+                None,
+                None,
+                None,
+                None,
+                vec![],
+                vec![],
+                vec![],
+                route.into_iter().map(str::to_string).collect(),
+                None,
+                false,
+                None,
+                None,
+            )
+        };
+        let new_call = || {
+            PyCall::new(
+                "test-id".to_string(),
+                Arc::new(Mutex::new(make_invite())),
+                "192.0.2.10".to_string(),
+                "udp".to_string(),
+            )
+        };
+
+        let mut call = new_call();
+        dial(
+            &mut call,
+            vec![
+                "sip:orig@198.51.100.7:6060;lr;odi=abc",
+                "<sip:198.51.100.8;lr>",
+                "\"Core\" <sip:198.51.100.9;lr>;hop=3, <sip:198.51.100.10>",
+            ],
+        )
+        .expect("the dial is recorded");
+        match call.action() {
+            CallAction::Dial { route, .. } => assert_eq!(
+                route,
+                &vec![
+                    "<sip:orig@198.51.100.7:6060;lr;odi=abc>".to_string(),
+                    "<sip:198.51.100.8;lr>".to_string(),
+                    "\"Core\" <sip:198.51.100.9;lr>;hop=3".to_string(),
+                    "<sip:198.51.100.10>".to_string(),
+                ]
+            ),
+            other => panic!("expected Dial, got {other:?}"),
+        }
+
+        pyo3::Python::initialize();
+        let mut call = new_call();
+        let error =
+            dial(&mut call, vec!["<sip:198.51.100.8;lr>", "198.51.100.7;lr"]).expect_err("no URI");
+        Python::attach(|python| {
+            assert!(error.is_instance_of::<pyo3::exceptions::PyValueError>(python));
+            let text = error.value(python).to_string();
+            assert!(text.contains("\"198.51.100.7;lr\""), "{text}");
+            assert!(text.contains("is not a URI"), "{text}");
+        });
+        assert!(
+            !matches!(call.action(), CallAction::Dial { .. }),
+            "nothing is dialled"
+        );
     }
 
     #[test]
