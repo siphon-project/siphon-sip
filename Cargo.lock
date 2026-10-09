@@ -2525,21 +2525,10 @@ dependencies = [
  "num-integer",
  "num-traits",
  "once_cell",
- "rasn-derive 0.29.0",
+ "rasn-derive",
  "serde_json",
  "snafu",
  "xml-no-std",
-]
-
-[[package]]
-name = "rasn-derive"
-version = "0.28.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6fe71aa61cfb0191e50b95ebd72d454e9eeabff8a35b6252b99f2e90b7ef4c6d"
-dependencies = [
- "proc-macro2",
- "rasn-derive-impl 0.28.15",
- "syn 2.0.117",
 ]
 
 [[package]]
@@ -2549,22 +2538,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "261556388c573dde262717e06ad2c9a9ed78405418f16f2789a0dd8004793fba"
 dependencies = [
  "proc-macro2",
- "rasn-derive-impl 0.29.0",
+ "rasn-derive-impl",
  "syn 2.0.117",
-]
-
-[[package]]
-name = "rasn-derive-impl"
-version = "0.28.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ac6b7d207ad810df71b46ef90916dbb71fe366e0ad58a62e737fe6098525684c"
-dependencies = [
- "either",
- "itertools",
- "proc-macro2",
- "quote",
- "syn 2.0.117",
- "uuid",
 ]
 
 [[package]]
@@ -3154,7 +3129,7 @@ dependencies = [
  "pyo3-async-runtimes",
  "quick-xml",
  "rasn",
- "rasn-derive 0.28.15",
+ "rasn-derive",
  "rcgen",
  "redis",
  "regex",
@@ -3403,7 +3378,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.4",
  "windows-sys 0.61.2",

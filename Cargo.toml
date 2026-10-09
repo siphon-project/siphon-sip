@@ -154,7 +154,7 @@ mime_guess = { version = "2", optional = true }
 
 # Lawful Intercept — ETSI ASN.1/BER + XML
 rasn = "0.29"
-rasn-derive = "0.28"
+rasn-derive = "0.29"
 chrono = { version = "0.4", default-features = false }
 quick-xml = { version = "0.42", features = ["serialize"] }
 # ETSI X1 (TS 103 221-1) schema validation. Pure Rust, zero transitive
