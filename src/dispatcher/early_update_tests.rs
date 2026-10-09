@@ -10,8 +10,10 @@
 //!   Retry-After header field with a randomly chosen value between 0 and 10
 //!   seconds";
 //! * with an offer once the caller has its answer in a reliable provisional,
-//!   the change would need the callee, which siphon cannot ask on a dialog it
-//!   has not confirmed: 504.
+//!   it crosses to the callee when the callee's own early dialog can carry it
+//!   (`early_update_bridge_tests`); while that dialog cannot, because the
+//!   callee has not answered siphon's offer reliably, the caller is asked to
+//!   try again the same way, 500 with a `Retry-After`.
 //!
 //! None of them asks the engine to answer for the callee. Read off the UDP
 //! egress and the commands an in-process native engine records.
@@ -223,11 +225,13 @@ async fn an_early_update_without_an_offer_is_answered_and_touches_no_media() {
 }
 
 /// Once the caller has its answer in a reliable provisional it acknowledged,
-/// the offer in its UPDATE is one siphon could only take by asking the callee,
-/// on a dialog it has not confirmed. It is refused `504` (RFC 3311 §5.2), again
-/// with nothing sent to the engine or the callee.
+/// it may offer again (RFC 3311 §5.1), and siphon could only take the offer by
+/// asking the callee. This callee has only rung, so siphon's own offer to it is
+/// unanswered and its early dialog cannot carry another one yet. The caller is
+/// asked to try again, `500` with a `Retry-After`, again with nothing sent to
+/// the engine or the callee.
 #[tokio::test(flavor = "multi_thread")]
-async fn an_early_update_with_an_offer_after_a_reliable_answer_is_refused_504() {
+async fn an_early_update_with_an_offer_the_callee_cannot_be_asked_yet_is_refused_500() {
     let engine = NativeTestEngine::start().await;
     let sequence = ringing_and_anchored(&engine).await;
     let state = &sequence.dispatcher.state;
@@ -260,8 +264,13 @@ async fn an_early_update_with_an_offer_after_a_reliable_answer_is_refused_504() 
 
     let sent = caller_updates(&sequence, 2, Some(OFFER));
     assert_eq!(sent.len(), 1, "one final response");
-    assert_eq!(sent[0].status_code(), Some(504));
-    assert!(sent[0].headers.get("Retry-After").is_none());
+    assert_eq!(sent[0].status_code(), Some(500));
+    let retry_after = sent[0]
+        .headers
+        .get("Retry-After")
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .expect("a Retry-After in seconds");
+    assert!(retry_after <= 10, "{retry_after}");
     assert_eq!(engine_commands(&engine), before);
     assert_eq!(session_after(&sequence), ("caller-tag".to_string(), None));
     assert!(!sequence.call_is_gone());

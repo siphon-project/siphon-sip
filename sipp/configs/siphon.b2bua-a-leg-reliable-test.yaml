@@ -13,7 +13,9 @@
 #            and a new offer in the caller's PRACK answered by the callee
 #            (dave), each crossing on siphon's own PRACK; and an offer in a
 #            PRACK sent after the caller's 2xx, carried to the callee in an
-#            UPDATE (erin).
+#            UPDATE (erin). And preconditions (RFC 3312): the caller's UPDATE
+#            on the early dialog, relayed to the callee before it alerts
+#            (frank).
 #
 # Pins `ims-intra-trust-domain@2026`, whose response policy copies `Require`
 # and `RSeq`: the callee's RSeq 42 would pass straight through if the caller's
@@ -49,6 +51,7 @@ auth:
     carol: "secret"
     dave: "secret"
     erin: "secret"
+    frank: "secret"
 
 b2bua:
   default_header_policy: "ims-intra-trust-domain@2026"

@@ -197,8 +197,11 @@ pub fn build_callee_prack(
         // lock that also numbers the PRACK: this may run long after the
         // provisional arrived, and the leg's position may have moved since.
         let (_, leg) = call.find_b_leg_by_branch_mut(&held.branch)?;
-        leg.dialog.local_cseq = leg.dialog.local_cseq.saturating_add(1);
+        // The dialog's counter holds the number of its next request (RFC 3261
+        // §12.2.1.1): the PRACK takes it and leaves the one after for whatever
+        // siphon sends the callee next.
         let cseq = leg.dialog.local_cseq;
+        leg.dialog.local_cseq = cseq.saturating_add(1);
         let mut prack = build_b2bua_prack(
             leg,
             state,
@@ -222,6 +225,13 @@ pub fn build_callee_prack(
                 (false, session) => offer = session,
             }
             set_sdp_body(&mut prack, sdp, &content_type);
+        }
+        // The PRACK of the provisional that carried the callee's session
+        // description on the leg's own early dialog completes the INVITE's
+        // offer/answer exchange there (RFC 3262 §5): from here on a new offer
+        // may cross that dialog in an UPDATE (RFC 3311 §5.1).
+        if held.session && leg.dialog.remote_tag.as_deref() == Some(held.to_tag.as_str()) {
+            leg.early_exchange_complete = true;
         }
         (prack, leg.clone(), offer, cseq)
     };

@@ -884,6 +884,19 @@ impl CallActor {
         let b_match = winner_b.is_some_and(|leg| leg.dialog.call_id == sip_call_id);
 
         match (a_match, b_match) {
+            // Before anybody has answered, a callee's leg that carries the
+            // caller's Call-ID (`preserve_call_id`) is told from the caller's
+            // by the tag alone: a request whose From-tag is that callee's and
+            // not the caller's arrived on the callee's early dialog.
+            (true, false)
+                if from_tag.is_some()
+                    && self.a_leg.dialog.remote_tag.as_deref() != from_tag
+                    && self
+                        .early_request_leg(sip_call_id, from_tag)
+                        .is_some_and(|index| self.b_legs[index].dialog.remote_tag.is_some()) =>
+            {
+                Some(LegSide::B)
+            }
             (true, false) => Some(LegSide::A),
             (false, true) => Some(LegSide::B),
             (true, true) => {

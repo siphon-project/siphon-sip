@@ -46,6 +46,14 @@ pub fn b_leg_failed(
     );
     // And a registered callee's dialog is over.
     callee_dialog_ended(call_id, branch, state);
+    // So is its early dialog: an UPDATE of the caller's still with it is
+    // answered now, before anything dials again.
+    if let Some(ended) = state
+        .call_actors
+        .read_b_leg_on(call_id, branch, |leg| leg.clone())
+    {
+        refuse_caller_updates_in_flight(call_id, &[&ended], state);
+    }
 
     // A parallel fork: one branch failing is not the call failing while another
     // can still answer (RFC 3261 §16.7). The failure is recorded, the best one

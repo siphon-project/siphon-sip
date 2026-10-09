@@ -235,8 +235,8 @@ pub fn early_dialog_target_from_response(response: &SipMessage) -> EarlyDialogTa
 /// `leg` still supplies OUR side (From/local-tag/Contact) and the CSeq counter,
 /// which are identical across every early dialog of the leg.
 ///
-/// `local_cseq` MUST already have been incremented for the dialog before
-/// calling this — the value passed in is used as-is.
+/// `local_cseq` is this PRACK's CSeq number, used as-is: the caller takes it
+/// off the dialog's counter and moves the counter on before calling this.
 /// The branch prefix of every PRACK siphon sends a callee. siphon registers no
 /// branch for those, and the response to one is told by it
 /// ([`handle_callee_prack_response`]), since the 2xx answering an offer a PRACK
