@@ -1718,6 +1718,85 @@ services:
     profiles:
       - b2bua-a-leg-reliable-prov
 
+  sipp-b2bua-early-update-register:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-b2bua-a-leg-reliable:
+        condition: service_healthy
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.234
+    entrypoint:
+      - sipp
+      - "172.20.0.120:5060"
+      - -sf
+      - /sipp/scenarios/register_alice_contact.xml
+      - -inf
+      - /sipp/scenarios/b2bua_early_update_frank_contact.csv
+      - -s
+      - frank
+      - -ap
+      - secret
+      - -m
+      - "1"
+      - -timeout
+      - "10"
+    profiles:
+      - b2bua-a-leg-reliable-prov
+
+  sipp-b2bua-early-update-uas:
+    image: ctaloi/sipp:latest
+    depends_on:
+      sipp-b2bua-early-update-register:
+        condition: service_completed_successfully
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.235
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/b2bua_early_update_uas.xml
+      - -p
+      - "5060"
+      - -m
+      - "1"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - b2bua-a-leg-reliable-prov
+
+  sipp-b2bua-early-update-uac:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-b2bua-a-leg-reliable:
+        condition: service_healthy
+      sipp-b2bua-early-update-uas:
+        condition: service_started
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.236
+    entrypoint:
+      - sipp
+      - "172.20.0.120:5060"
+      - -sf
+      - /sipp/scenarios/b2bua_early_update_uac.xml
+      - -m
+      - "1"
+      - -l
+      - "1"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - b2bua-a-leg-reliable-prov
+
   # --- B2BUA session timer test ---
 
   sipp-b2bua-st-uas:

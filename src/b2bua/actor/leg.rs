@@ -392,6 +392,12 @@ pub struct Leg {
     /// force on the caller's dialog when this leg answers with a 2xx that carries
     /// none.
     pub early_answer_sent: Option<Vec<u8>>,
+    /// On a B-leg before its final response: siphon has PRACKed the reliable
+    /// provisional that carried the callee's session description on this leg's
+    /// early dialog, which completes the INVITE's offer/answer exchange there
+    /// (RFC 3262 §5). From then on a new offer may cross that dialog in an
+    /// UPDATE, either way (RFC 3311 §5.1).
+    pub early_exchange_complete: bool,
     /// On a re-INVITE or UPDATE tracking leg: the session interval the request's
     /// `Session-Expires` asked for, which a 2xx without one leaves siphon
     /// refreshing at (RFC 4028 §7.2).
@@ -428,6 +434,7 @@ impl Leg {
             auth_challenged: false,
             offered_sdp: None,
             early_answer_sent: None,
+            early_exchange_complete: false,
             request_session_expires: None,
             session_refresh_request: None,
         }
@@ -482,6 +489,7 @@ impl Leg {
             auth_challenged: false,
             offered_sdp: None,
             early_answer_sent: None,
+            early_exchange_complete: false,
             request_session_expires: None,
             session_refresh_request: None,
         }

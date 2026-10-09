@@ -203,6 +203,7 @@ pub fn auto_prack_b_leg(
             remote_contact: target.remote_contact,
             to_header: target.to_header,
             route_set: target.route_set,
+            session: !message.body.is_empty(),
             offer: None,
         },
         offer,

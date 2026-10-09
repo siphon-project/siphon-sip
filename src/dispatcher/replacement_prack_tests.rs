@@ -268,6 +268,7 @@ async fn a_target_is_pracked_and_failed_by_branch_when_the_leg_list_shifts() {
         remote_contact: target.remote_contact,
         to_header: target.to_header,
         route_set: target.route_set,
+        session: false,
         offer: None,
     };
     // Before it is sent, the tracked request is answered and its leg removed:

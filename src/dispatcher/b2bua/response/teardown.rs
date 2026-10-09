@@ -193,6 +193,9 @@ pub fn cancel_settled_branches(
     control_dial_legs_cancelled(call_id, legs, state);
     // A registered callee among them stops ringing.
     callee_dialogs_ended(call_id, legs, state);
+    // An UPDATE of the caller's still with one of them is answered: a CANCELled
+    // callee owes it no answer the caller could use.
+    refuse_caller_updates_in_flight(call_id, &legs.iter().collect::<Vec<_>>(), state);
     cancel_kept_branches(legs, state);
 }
 

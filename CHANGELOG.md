@@ -58,25 +58,45 @@ entry, but a working config keeps working.
 
 ### Fixed
 
-- **`call.dial(route=[...])` writes every entry as a `name-addr` (RFC 3261
-  §20.34).** An entry given as a bare URI, `"sip:host;lr;x=y"`, went on the
-  wire as `Route: sip:host;lr;x=y`. Without angle brackets its parameters are
-  the header's, not the URI's (§20), so the next hop saw no `lr` on the URI
-  and took the request as strictly routed; siphon itself did not read the bare
-  entry as the route set either and sent the INVITE to the dial target rather
-  than to the first `Route` (§8.1.2). Each entry now goes out as one
-  `name-addr` whatever form it is written in: a bare URI, with every parameter
-  the URI's, a bracketed one, a full `"Name" <sip:...;lr>;param` with its
-  display name and header parameters kept, or a received `Route` /
-  `Service-Route` value holding several bracketed entries, which is taken apart
-  at its commas. Nothing is added: an entry without `lr` stays without. An
-  entry that is not a complete SIP or SIPS URI raises `ValueError` naming it
-  when the script calls `dial`, where it used to be sent as written.
-  `presence.subscribe_dialog(route_set=[...])`, whose entries become the
-  `Route` of each NOTIFY, takes the same forms and raises the same way.
-  `request.prepend_route()` and `request.add_path()` already bracketed a bare
-  URI; they now keep the display name and header parameters of a full
-  `name-addr`, which they wrapped in a second pair of brackets.
+- **An UPDATE with an offer on the early dialog of a B2BUA call crosses to the
+  other party (RFC 3311 §5.1, RFC 3312 §5).** A caller that negotiates
+  preconditions gets its answer in a reliable 183, PRACKs it, and sends an
+  UPDATE with a new offer carrying the updated current status before the callee
+  alerts. siphon refused that UPDATE `504`, so a call with preconditions could
+  not be set up through a B2BUA; and an UPDATE from the callee on its early
+  dialog was relayed to the caller under the callee's Call-ID, which names no
+  dialog of the caller's. The UPDATE is now relayed on the other party's early dialog
+  with the header and SDP treatment of an UPDATE after the answer, through the
+  media engine on an anchored call, and the 2xx with the answer is returned,
+  each party seeing siphon's `o=` at a version above the last one it was sent
+  (RFC 3264 §8). Under a policy that passes preconditions end to end the
+  relayed UPDATE keeps `precondition` in `Require` / `Supported` (RFC 3312
+  §11); that applies to an UPDATE after the answer as well.
+
+  It crosses when the INVITE's own offer/answer exchange is complete on both
+  dialogs, the answer having gone in a reliable provisional that was PRACKed
+  (RFC 3262 §5), and no other offer is in flight. Otherwise it is refused as
+  RFC 3311 §5.2 has a UAS do, and the session stays as it was:
+
+  | The UPDATE carries an offer and | It gets |
+  |---|---|
+  | the party's first offer has no acknowledged answer yet, or an earlier UPDATE or PRACK offer of its own has none | `500` with `Retry-After` 0 to 10 s |
+  | an offer of the other party's, or siphon's own on that dialog, has no answer yet | `491` |
+  | the other party's dialog cannot carry an offer yet: the callee answered only in an unreliable provisional, has not answered, or several fork branches answered | `500` with `Retry-After` (was `504` from the caller) |
+
+  An UPDATE without an offer is answered `200` on the dialog it arrived on, now
+  from the callee too. A callee's `481` or `408` to the relayed UPDATE, and an
+  UPDATE still with a callee whose INVITE fails or is CANCELled, reach the
+  caller as `500` with `Retry-After`: the caller's dialog outlives a callee's,
+  and relayed as they are, or left unanswered, they have the caller end its own
+  (§5.3). Every other response of the callee's is relayed as it is. A session
+  timer is not negotiated on an UPDATE before the answer.
+
+  The PRACK siphon sends a callee, and the UPDATE that carries a PRACK's late
+  offer, now take the next CSeq of the callee's dialog (RFC 3261 §12.2.1.1).
+  They took the one after it, and left the counter there, so the next request
+  siphon sent the callee (a relayed UPDATE or re-INVITE, a BYE) repeated that
+  number.
 
 - **A NOTIFY that arrives before the 2xx to the SUBSCRIBE of
   `proxy.subscribe_state.send()` is matched to that subscription (RFC 6665
@@ -198,6 +218,26 @@ entry, but a working config keeps working.
   The signature and the return type are unchanged. A zone that relied on the
   answer order, or on the expression not being matched, can now resolve to a
   different record or to `None`.
+
+- **`call.dial(route=[...])` writes every entry as a `name-addr` (RFC 3261
+  §20.34).** An entry given as a bare URI, `"sip:host;lr;x=y"`, went on the
+  wire as `Route: sip:host;lr;x=y`. Without angle brackets its parameters are
+  the header's, not the URI's (§20), so the next hop saw no `lr` on the URI
+  and took the request as strictly routed; siphon itself did not read the bare
+  entry as the route set either and sent the INVITE to the dial target rather
+  than to the first `Route` (§8.1.2). Each entry now goes out as one
+  `name-addr` whatever form it is written in: a bare URI, with every parameter
+  the URI's, a bracketed one, a full `"Name" <sip:...;lr>;param` with its
+  display name and header parameters kept, or a received `Route` /
+  `Service-Route` value holding several bracketed entries, which is taken apart
+  at its commas. Nothing is added: an entry without `lr` stays without. An
+  entry that is not a complete SIP or SIPS URI raises `ValueError` naming it
+  when the script calls `dial`, where it used to be sent as written.
+  `presence.subscribe_dialog(route_set=[...])`, whose entries become the
+  `Route` of each NOTIFY, takes the same forms and raises the same way.
+  `request.prepend_route()` and `request.add_path()` already bracketed a bare
+  URI; they now keep the display name and header parameters of a full
+  `name-addr`, which they wrapped in a second pair of brackets.
 
 ## [1.13.1] — 2026-10-08
 
