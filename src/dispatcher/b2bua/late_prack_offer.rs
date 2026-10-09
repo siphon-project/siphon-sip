@@ -205,8 +205,8 @@ pub fn carry_late_prack_offer(
             let call = &mut *guard;
             // Found, numbered and built under one lock, by branch.
             let leg = call.b_legs.iter_mut().find(|leg| leg.branch == branch)?;
-            leg.dialog.local_cseq = leg.dialog.local_cseq.saturating_add(1);
             let cseq = leg.dialog.local_cseq;
+            leg.dialog.local_cseq = cseq.saturating_add(1);
             let mut sdp = offer;
             let transport = leg.transport.transport;
             stamp_b_leg_origin(&mut sdp, &content_type, leg, &transport, state);

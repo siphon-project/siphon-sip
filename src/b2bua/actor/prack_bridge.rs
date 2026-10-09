@@ -41,6 +41,11 @@ pub struct HeldCalleePrack {
     pub remote_contact: Option<String>,
     pub to_header: Option<String>,
     pub route_set: Vec<String>,
+    /// Whether the provisional carried a session description: the callee's
+    /// answer to the offer in siphon's INVITE, or its offer to an INVITE that
+    /// carried none. Its PRACK then completes the INVITE's offer/answer
+    /// exchange on the callee's dialog (RFC 3262 §5).
+    pub session: bool,
     /// The callee's offer, when the INVITE siphon sent it carried none: the
     /// caller's PRACK has to answer it (RFC 3262 §5).
     pub offer: Option<Vec<u8>>,
@@ -291,6 +296,7 @@ mod tests {
             remote_contact: None,
             to_header: None,
             route_set: Vec::new(),
+            session: false,
             offer: None,
         }
     }

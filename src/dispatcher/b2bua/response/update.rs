@@ -7,7 +7,7 @@ use crate::dispatcher::*;
 pub fn forward_update_response(
     call_id: &str,
     message: &mut SipMessage,
-    status_code: u16,
+    mut status_code: u16,
     response_source: SocketAddr,
     state: &DispatcherState,
     snapshot: &BLegResponseSnapshot,
@@ -61,6 +61,41 @@ pub fn forward_update_response(
             return true;
         }
 
+        // Nobody has answered the call: the UPDATE crossed between the two
+        // early dialogs, which run no session timer yet (RFC 4028 §7.1 starts it
+        // with the 2xx of the INVITE).
+        let on_early_dialog = state
+            .call_actors
+            .get_call(call_id)
+            .is_some_and(|call| call.winner.is_none());
+
+        // The callee's early dialog is gone, not the caller's: the caller is
+        // asked to offer again rather than told its own dialog ended
+        // (`early_update_refusal_for_caller`).
+        if let Some((status, retry_after)) = (is_a2b && on_early_dialog)
+            .then(|| early_update_refusal_for_caller(status_code))
+            .flatten()
+        {
+            debug!(
+                call_id = %call_id,
+                callee_status = status_code,
+                status,
+                "B2BUA: the callee's early dialog is gone for the caller's UPDATE; the caller's own stays"
+            );
+            message.start_line = StartLine::Response(StatusLine {
+                version: Version::sip_2_0(),
+                status_code: status,
+                reason_phrase: "Server Internal Error".to_string(),
+            });
+            message.headers.remove("Content-Type");
+            message.body.clear();
+            message.headers.set("Content-Length", "0".to_string());
+            if retry_after {
+                message.headers.set("Retry-After", random_retry_after());
+            }
+            status_code = status;
+        }
+
         // 4th element: the responder leg's anchored egress socket (see the
         // re-INVITE response path above).
         let (resp_dest, resp_transport, resp_conn_id, resp_local_addr) = if is_a2b {
@@ -73,9 +108,11 @@ pub fn forward_update_response(
         } else {
             match state.call_actors.get_call(call_id) {
                 Some(call) => {
-                    // The winner's position is read and used under one hold of the call's lock.
-                    let winner = call.winner.and_then(|i| call.b_legs.get(i));
-                    if let Some(b) = winner {
+                    // The callee's position is read and used under one hold of the
+                    // call's lock: the winner, or on the early dialog the leg the
+                    // caller's session is shared with.
+                    let callee = call.bridged_b_leg_index().and_then(|i| call.b_legs.get(i));
+                    if let Some(b) = callee {
                         (
                             b.transport.remote_addr,
                             b.transport.transport,
@@ -83,7 +120,11 @@ pub fn forward_update_response(
                             b.transport.local_addr,
                         )
                     } else {
-                        warn!(call_id = %call_id, "B2BUA UPDATE response: no winning B-leg");
+                        // The callee that sent the UPDATE is off the call: there
+                        // is nobody to relay the response to.
+                        warn!(call_id = %call_id, "B2BUA UPDATE response: no B-leg to relay it to");
+                        drop(call);
+                        state.call_actors.remove_b_leg_on(call_id, &snapshot.branch);
                         return true;
                     }
                 }
@@ -102,8 +143,8 @@ pub fn forward_update_response(
                 );
             }
         } else if let Some(call) = state.call_actors.get_call(call_id) {
-            // The winner's position is read and used under one hold of the call's lock.
-            if let Some(winner) = call.winner.and_then(|i| call.b_legs.get(i)) {
+            // The callee's position is read and used under one hold of the call's lock.
+            if let Some(winner) = call.bridged_b_leg_index().and_then(|i| call.b_legs.get(i)) {
                 crate::b2bua::actor::Dialog::rewrite_headers(
                     message,
                     &winner.dialog.call_id,
@@ -208,9 +249,16 @@ pub fn forward_update_response(
         // Own the o= identity toward the UPDATE originator on the relayed answer
         // (RFC 3264 §8), after any rtpengine rewrite. Offerer = A-leg when is_a2b.
         if (200..300).contains(&status_code) && !message.body.is_empty() {
-            if let Some((sess_id, version)) =
-                state.call_actors.reserve_leg_sdp_version(call_id, is_a2b)
-            {
+            let identity = if is_a2b {
+                state.call_actors.reserve_leg_sdp_version(call_id, true)
+            } else {
+                update_bridged_callee(state, call_id, |leg| {
+                    let identity = (leg.dialog.sdp_session_id, leg.dialog.sdp_version);
+                    leg.dialog.sdp_version += 1;
+                    identity
+                })
+            };
+            if let Some((sess_id, version)) = identity {
                 stamp_sdp_origin(&mut message.body, &state.sdp_name, sess_id, version, None);
                 message
                     .headers
@@ -226,38 +274,48 @@ pub fn forward_update_response(
             // The responder took the offer (when the UPDATE carried one), so it is
             // the session description in force on the responder's dialog, and the
             // answer relayed back is in force on the originator's.
-            if let Some(offer) = &snapshot.b_leg_offered_sdp {
-                state
-                    .call_actors
-                    .set_leg_sent_sdp(call_id, !is_a2b, offer.clone());
+            let answer = sdp_in_body(message_content_type(message), &message.body);
+            if is_a2b {
+                if let Some(offer) = snapshot.b_leg_offered_sdp.clone() {
+                    update_bridged_callee(state, call_id, |leg| {
+                        leg.dialog.last_sent_sdp = Some(offer)
+                    });
+                }
+                if let Some(answer) = answer {
+                    state.call_actors.set_leg_sent_sdp(call_id, true, answer);
+                }
+            } else {
+                if let Some(offer) = snapshot.b_leg_offered_sdp.clone() {
+                    state.call_actors.set_leg_sent_sdp(call_id, true, offer);
+                }
+                if let Some(answer) = answer {
+                    update_bridged_callee(state, call_id, |leg| {
+                        leg.dialog.last_sent_sdp = Some(answer)
+                    });
+                }
             }
-            record_sdp_sent_to_leg(
-                state,
-                call_id,
-                is_a2b,
-                message_content_type(message),
-                &message.body,
-            );
 
             // The 2xx refreshes both dialogs the UPDATE crossed: the responder's
             // from its own 2xx (RFC 4028 §7.2), and the originator's with siphon's
             // answer on the copy relayed there (§9).
-            session_timer_on_response(
-                call_id,
-                !is_a2b,
-                &snapshot.branch,
-                status_code,
-                &responder_headers,
-                snapshot.b_leg_request_session_expires,
-                state,
-            );
-            negotiate_relayed_session_timer(
-                call_id,
-                is_a2b,
-                snapshot.b_leg_session_refresh_request.as_ref(),
-                &mut message.headers,
-                state,
-            );
+            if !on_early_dialog {
+                session_timer_on_response(
+                    call_id,
+                    !is_a2b,
+                    &snapshot.branch,
+                    status_code,
+                    &responder_headers,
+                    snapshot.b_leg_request_session_expires,
+                    state,
+                );
+                negotiate_relayed_session_timer(
+                    call_id,
+                    is_a2b,
+                    snapshot.b_leg_session_refresh_request.as_ref(),
+                    &mut message.headers,
+                    state,
+                );
+            }
 
             // Mark the UPDATE entry done so retransmitted 2xx can be absorbed.
             mark_tracking_leg_done(call_id, snapshot, format!("update_done:{direction}"), state);
@@ -267,15 +325,17 @@ pub fn forward_update_response(
             // self-terminates (RFC 3261 §17.2.2).
             state.call_actors.remove_b_leg_on(call_id, &snapshot.branch);
             // A 422 still teaches the responder's dialog its Min-SE (RFC 4028 §7.4).
-            session_timer_on_response(
-                call_id,
-                !is_a2b,
-                &snapshot.branch,
-                status_code,
-                &responder_headers,
-                snapshot.b_leg_request_session_expires,
-                state,
-            );
+            if !on_early_dialog {
+                session_timer_on_response(
+                    call_id,
+                    !is_a2b,
+                    &snapshot.branch,
+                    status_code,
+                    &responder_headers,
+                    snapshot.b_leg_request_session_expires,
+                    state,
+                );
+            }
         }
 
         // Forward response to the originator.
@@ -309,4 +369,17 @@ pub fn forward_update_response(
     }
 
     false
+}
+
+/// Change the callee's leg an UPDATE crossed to or from, under the call's lock:
+/// the winner, or on the early dialog the leg the caller's session is shared
+/// with. `None`, with nothing changed, when the call or that leg is gone.
+fn update_bridged_callee<T>(
+    state: &DispatcherState,
+    call_id: &str,
+    update: impl FnOnce(&mut Leg) -> T,
+) -> Option<T> {
+    let mut call = state.call_actors.get_call_mut(call_id)?;
+    let index = call.bridged_b_leg_index()?;
+    call.b_legs.get_mut(index).map(update)
 }

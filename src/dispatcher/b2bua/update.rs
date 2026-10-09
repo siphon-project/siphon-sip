@@ -1,91 +1,14 @@
 //! An inbound UPDATE on a bridged call (RFC 3311).
 use crate::dispatcher::*;
 
-/// Answer an UPDATE from the caller of a call whose callee has not answered.
-/// Returns whether the call was one, and the UPDATE is answered.
-///
-/// siphon is the UAS of the caller's dialog and the UAC of the callee's, and
-/// between the INVITE and its answer neither dialog has room for a new offer.
-/// RFC 3311 §5.2 says what the UPDATE gets:
-///
-/// * No offer: it changes nothing about the session and is answered `200`
-///   with no body.
-/// * An offer while the INVITE's offer has no answer yet: "the UAS MUST reject
-///   the UPDATE with a 500 response, and MUST include a Retry-After header
-///   field with a randomly chosen value between 0 and 10 seconds." The answer
-///   is the callee's to give and has not come, or has come only in an
-///   unreliable provisional, which completes nothing (RFC 3262 §5).
-/// * An offer once the caller has its answer in a reliable provisional it
-///   acknowledged: the caller may offer again (§5.1), but taking the offer
-///   needs the callee, whom siphon cannot ask on a dialog it has not
-///   confirmed. That is the case §5.2 gives `504` for, a change the UAS cannot
-///   make by itself.
-///
-/// The media engine is sent nothing in any of them. The call used to fall to
-/// the path for a call with no second party, which had the engine answer the
-/// offer itself (`answer_local`) on a session whose first offer was still out
-/// to the callee: the caller was told `200` with media the callee knew
-/// nothing of, and the callee's own answer then arrived for an offer the
-/// engine no longer held.
-fn answer_early_caller_update(
-    inbound: &InboundMessage,
-    message: &SipMessage,
-    call_id: &str,
-    state: &DispatcherState,
-) -> bool {
-    let Some(caller_has_its_answer) = state.call_actors.get_call(call_id).and_then(|call| {
-        let ringing = call.state != CallState::Answered
-            && call.winner.is_none()
-            && call.b_legs.iter().any(|leg| !leg.is_tracking_leg());
-        ringing.then(|| call.a_leg_reliability.answer_acknowledged())
-    }) else {
-        return false;
-    };
-    let carries_offer = !message.body.is_empty();
-    let (status_code, reason, retry_after) = match (carries_offer, caller_has_its_answer) {
-        (false, _) => (200, "OK", None),
-        (true, false) => (
-            500,
-            "Server Internal Error",
-            Some(crate::dispatcher::b2bua::random_retry_after()),
-        ),
-        (true, true) => (504, "Server Time-out", None),
-    };
-    if carries_offer {
-        info!(
-            call_id = %call_id,
-            status = status_code,
-            caller_has_its_answer,
-            "B2BUA UPDATE: an offer from the caller before the callee answered — refused (RFC 3311 §5.2)"
-        );
-    }
-    let mut response = build_response(
-        message,
-        status_code,
-        reason,
-        state.server_header.as_deref(),
-        &[],
-    );
-    if let Some(retry_after) = retry_after {
-        response.headers.set("Retry-After", retry_after);
-    }
-    send_message_from(
-        response,
-        inbound.transport,
-        inbound.remote_addr,
-        inbound.connection_id,
-        Some(inbound.local_addr),
-        state,
-    );
-    true
-}
-
 /// Bridge an in-dialog UPDATE (RFC 3311) across the B2BUA.
 ///
 /// Mirrors `handle_b2bua_reinvite` minus the INVITE-specific bits:
-///   * no 491 glare gate — RFC 3311 §5.2 explicitly permits UPDATE before
-///     the initial INVITE is ACKed, and §5.1 places no analogue of RFC 3261
-///     §14.1's pending-offer rule on UPDATE
+///   * no 491 glare gate once the call is answered: both parties get the
+///     other's UPDATE and each refuses the one that crosses its own
+///     (RFC 3311 §5.2). Before the answer siphon decides it, since the offer
+///     may only cross when both early dialogs can carry it
+///     ([`early_dialog_update`])
 ///   * no ACK on 2xx — RFC 3311 §5.4: UPDATE is a normal non-INVITE
 ///     transaction; the 2xx ACK rule applies to INVITE only
 ///   * SDP / RTPEngine path is conditional on a non-empty body — empty-body
@@ -174,14 +97,24 @@ pub fn handle_b2bua_update(inbound: InboundMessage, message: SipMessage, state: 
         .get("Contact")
         .or_else(|| message.headers.get("m"))
         .map(|value| crate::b2bua::actor::extract_contact_uri(value));
+    // The callee's leg the UPDATE arrived on, by the Via branch of its INVITE:
+    // the winner, or before anybody has answered the pending leg whose early
+    // dialog the request names (RFC 3311 §5.1 has either party send one there).
+    let origin_branch = if from_a_leg {
+        None
+    } else {
+        state.call_actors.get_call(&call_id).and_then(|call| {
+            call.winner
+                .or_else(|| call.early_request_leg(&sip_call_id, from_tag.as_deref()))
+                .and_then(|index| call.b_legs.get(index))
+                .map(|leg| leg.branch.clone())
+        })
+    };
     if let Some(mut call) = state.call_actors.get_call_mut(&call_id) {
-        let winner_index = call.winner;
-        let origin_leg: Option<&mut Leg> = if from_a_leg {
-            Some(&mut call.a_leg)
-        } else if let Some(index) = winner_index {
-            call.b_legs.get_mut(index)
-        } else {
-            None
+        let origin_leg: Option<&mut Leg> = match origin_branch.as_deref() {
+            None if from_a_leg => Some(&mut call.a_leg),
+            None => None,
+            Some(branch) => call.find_b_leg_by_branch_mut(branch).map(|(_, leg)| leg),
         };
         if let Some(leg) = origin_leg {
             if leg.transport.remote_addr != inbound.remote_addr
@@ -197,15 +130,26 @@ pub fn handle_b2bua_update(inbound: InboundMessage, message: SipMessage, state: 
         }
     }
 
-    // The caller of a call that still rings: answered here, by what RFC 3311
-    // §5.2 has a UAS do before the INVITE is answered.
-    if from_a_leg && answer_early_caller_update(&inbound, &message, &call_id, state) {
+    // A call nobody has answered: an UPDATE without an offer is answered here,
+    // and one with an offer crosses only when both early dialogs can carry it,
+    // refused otherwise by what RFC 3311 §5.2 has a UAS do.
+    let early = early_dialog_update(
+        &inbound,
+        &message,
+        &call_id,
+        from_a_leg,
+        origin_branch.as_deref(),
+        state,
+    );
+    if early == EarlyUpdate::Answered {
         return;
     }
+    let on_early_dialog = early == EarlyUpdate::Relay;
 
     // A leg of a formed controller bridge: the other party is another call
     // actor, and the offer is relayed to it there.
     if from_a_leg
+        && !on_early_dialog
         && crate::dispatcher::b2bua::relay_bridged_offer(&inbound, &message, &call_id, state)
     {
         return;
@@ -213,6 +157,7 @@ pub fn handle_b2bua_update(inbound: InboundMessage, message: SipMessage, state: 
     // A leg with no second party and no session the engine answers for it: a
     // leg parted from its bridge. Before its offer is taken for its media.
     if from_a_leg
+        && !on_early_dialog
         && crate::dispatcher::b2bua::answer_unanchored_reoffer(&inbound, &message, &call_id, state)
     {
         return;
@@ -222,19 +167,58 @@ pub fn handle_b2bua_update(inbound: InboundMessage, message: SipMessage, state: 
     // later siphon-terminated transfer offers this leg's current media if it is
     // the survivor.
     if !message.body.is_empty() {
-        state
-            .call_actors
-            .set_leg_last_sdp(&call_id, from_a_leg, &message.body);
+        if from_a_leg {
+            state
+                .call_actors
+                .set_leg_last_sdp(&call_id, true, &message.body);
+        } else if let Some(branch) = origin_branch.as_deref() {
+            state.call_actors.update_b_leg_on(&call_id, branch, |leg| {
+                leg.last_sdp = Some(message.body.clone())
+            });
+        }
     }
 
-    // Snapshot routing info + per-leg contacts AFTER the flow refresh.
+    // Snapshot routing info + per-leg contacts AFTER the flow refresh. The
+    // callee's leg is the winner, or on the early dialog the one the caller's
+    // session is shared with.
     let (a_leg, winner_b_leg) = match state.call_actors.get_call(&call_id) {
         Some(call) => {
-            let b_leg = call.winner.and_then(|i| call.b_legs.get(i).cloned());
+            let index = if on_early_dialog {
+                call.bridged_b_leg_index()
+            } else {
+                call.winner
+            };
+            let b_leg = index.and_then(|i| call.b_legs.get(i).cloned());
             (call.a_leg.clone(), b_leg)
         }
         None => return,
     };
+    // The callee's leg by the Via branch of its INVITE from here on: a leg's
+    // position on the call moves when one ahead of it is taken off.
+    let callee_branch = winner_b_leg.as_ref().map(|leg| leg.branch.clone());
+
+    // An UPDATE from a callee that is not the call's other party: a pending
+    // branch on a call siphon answered itself, or one that ended meanwhile. It
+    // is on no dialog an UPDATE could cross from (RFC 3261 §12.2.2).
+    if !from_a_leg && winner_b_leg.is_none() {
+        warn!(sip_call_id = %sip_call_id, "B2BUA UPDATE: from a callee that is not the call's other party — 481");
+        let response = build_response(
+            &message,
+            481,
+            "Call/Transaction Does Not Exist",
+            state.server_header.as_deref(),
+            &[],
+        );
+        send_message_from(
+            response,
+            inbound.transport,
+            inbound.remote_addr,
+            inbound.connection_id,
+            Some(inbound.local_addr),
+            state,
+        );
+        return;
+    }
 
     let (target_remote_contact, target_local_contact) = if from_a_leg {
         winner_b_leg
@@ -389,6 +373,14 @@ pub fn handle_b2bua_update(inbound: InboundMessage, message: SipMessage, state: 
         forwarded.headers.remove("Supported");
         forwarded.headers.remove("Require");
         forwarded.headers.remove("Proxy-Require");
+        // The preconditions in the offer are the other party's to meet, so
+        // their option tag crosses where the call's policy passes them end to
+        // end (RFC 3312 §11).
+        relay_precondition_tag(
+            &message.headers,
+            &mut forwarded.headers,
+            &state.resolve_header_policy(&call_id),
+        );
         forwarded.headers.remove("P-Asserted-Identity");
         forwarded.headers.remove("P-Access-Network-Info");
         forwarded.headers.remove("Security-Verify");
@@ -508,10 +500,18 @@ pub fn handle_b2bua_update(inbound: InboundMessage, message: SipMessage, state: 
             }
             // Own the o= identity toward the leg this UPDATE is sent to (RFC 3264
             // §8), after any rtpengine rewrite.
-            if let Some((sess_id, version)) = state
-                .call_actors
-                .reserve_leg_sdp_version(&call_id, !from_a_leg)
-            {
+            let identity = if from_a_leg {
+                callee_branch.as_deref().and_then(|branch| {
+                    state.call_actors.update_b_leg_on(&call_id, branch, |leg| {
+                        let identity = (leg.dialog.sdp_session_id, leg.dialog.sdp_version);
+                        leg.dialog.sdp_version += 1;
+                        identity
+                    })
+                })
+            } else {
+                state.call_actors.reserve_leg_sdp_version(&call_id, true)
+            };
+            if let Some((sess_id, version)) = identity {
                 stamp_sdp_origin(&mut forwarded.body, &state.sdp_name, sess_id, version, None);
             }
             // `media.sdp_strip_attributes`, last: after the media engine re-offer
@@ -649,10 +649,11 @@ pub fn handle_b2bua_update(inbound: InboundMessage, message: SipMessage, state: 
         // Bump local CSeq on the target leg after sending.
         if let Some(mut call) = state.call_actors.get_call_mut(&call_id) {
             if from_a_leg {
-                if let Some(winner_idx) = call.winner {
-                    if let Some(b_leg) = call.b_legs.get_mut(winner_idx) {
-                        b_leg.dialog.local_cseq += 1;
-                    }
+                if let Some((_, b_leg)) = callee_branch
+                    .as_deref()
+                    .and_then(|branch| call.find_b_leg_by_branch_mut(branch))
+                {
+                    b_leg.dialog.local_cseq += 1;
                 }
             } else {
                 call.a_leg.dialog.local_cseq += 1;

@@ -292,6 +292,24 @@ call.set_header("Supported", call.get_header("Supported"))
 `replaces`, and `timer` when SIPhon runs the session timer, are still merged into a
 `Supported` the script set. `call.remove_header("Allow")` sends no `Allow` at all.
 
+### Preconditions before the answer
+
+With `precondition` crossing, the exchange itself runs on the early dialog
+(RFC 3312 §5): the callee answers the INVITE's offer in a reliable 183, the caller
+PRACKs it, and whichever side has reserved its resources says so in an UPDATE with
+a new offer, before the callee alerts. SIPhon relays that UPDATE to the other
+party's early dialog and returns the 2xx with its answer, through the media engine
+on an anchored call, and keeps `precondition` in the relayed UPDATE's `Require` /
+`Supported`. Nothing in the script takes part.
+
+An UPDATE with an offer crosses only once both early dialogs can carry one: the
+answer to the INVITE's offer went in a reliable provisional that was PRACKed on
+each, and no other offer is in flight. Until then it is refused as RFC 3311 §5.2
+has it, `500` with a `Retry-After` of 0 to 10 seconds to try again, or `491` when it
+crosses an offer of the other party's, and the session stays as it was. A callee
+that sends its 183 unreliably has not answered yet (RFC 3262 §5), so a caller's
+UPDATE waits for that callee's 2xx.
+
 ### A caller's `Require`
 
 The same rule decides whether SIPhon can take a call whose INVITE *requires* an

@@ -1,0 +1,170 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  B2BUA preconditions: the caller's UPDATE on the early dialog reaches the
+  callee, and the callee's answer comes back in the 200 to it (RFC 3312 §13.1,
+  RFC 3311 §5.1).
+
+  INVITE (offer, a=curr:qos e2e none, Require: precondition) -> 100 ->
+  reliable 183 with the answer (a=conf:qos e2e recv) -> PRACK -> 200 PRACK ->
+  UPDATE with a new offer (a=curr:qos e2e send) -> 200 UPDATE with the answer
+  (a=curr:qos e2e sendrecv) -> 180 -> 200 INVITE -> ACK -> BYE -> 200
+
+  The callee (b2bua_early_update_uas.xml) answers the INVITE's offer in a
+  reliable 183. Once this caller has PRACKed siphon's copy of it, the offer/
+  answer exchange is complete on both dialogs and the caller may offer again in
+  an UPDATE before the callee alerts. siphon relays that UPDATE on the callee's
+  early dialog and returns the callee's answer with siphon's origin.
+-->
+<scenario name="B2BUA preconditions: caller updates on the early dialog">
+
+  <send retrans="500">
+    <![CDATA[
+INVITE sip:frank@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:alice@[local_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:frank@[remote_ip]>
+Call-ID: [call_id]
+CSeq: 1 INVITE
+Contact: <sip:alice@[local_ip]:[local_port];transport=[transport]>
+Max-Forwards: 70
+Supported: 100rel
+Require: precondition
+Allow: INVITE, ACK, CANCEL, BYE, PRACK, UPDATE
+User-Agent: SIPp/b2bua-early-update
+Content-Type: application/sdp
+Content-Length: [len]
+
+v=0
+o=alice 53655765 2353687637 IN IP[local_ip_type] [local_ip]
+s=-
+c=IN IP[media_ip_type] [media_ip]
+t=0 0
+m=audio 49170 RTP/AVP 0
+a=rtpmap:0 PCMU/8000
+a=curr:qos e2e none
+a=des:qos mandatory e2e sendrecv
+]]>
+  </send>
+
+  <recv response="100" optional="true" />
+
+  <recv response="183" crlf="true">
+    <action>
+      <ereg regexp="100rel" search_in="hdr" header="Require:"
+            check_it="true" assign_to="junk" />
+      <ereg regexp="([0-9]+)" search_in="hdr" header="RSeq:"
+            check_it="true" assign_to="junk,rseq_progress" />
+      <ereg regexp="a=conf:qos e2e recv" search_in="body"
+            check_it="true" assign_to="junk" />
+    </action>
+  </recv>
+
+  <send retrans="500">
+    <![CDATA[
+PRACK sip:frank@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:alice@[local_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:frank@[remote_ip]>[peer_tag_param]
+Call-ID: [call_id]
+CSeq: 2 PRACK
+RAck: [$rseq_progress] 1 INVITE
+Max-Forwards: 70
+Content-Length: 0
+
+]]>
+  </send>
+
+  <recv response="200" crlf="true">
+    <action>
+      <ereg regexp="PRACK" search_in="hdr" header="CSeq:"
+            check_it="true" assign_to="junk" />
+    </action>
+  </recv>
+
+  <!-- The caller's resources are reserved: the updated current status goes to
+       the callee in a new offer (RFC 3312 §5.1). -->
+  <send retrans="500">
+    <![CDATA[
+UPDATE sip:frank@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:alice@[local_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:frank@[remote_ip]>[peer_tag_param]
+Call-ID: [call_id]
+CSeq: 3 UPDATE
+Contact: <sip:alice@[local_ip]:[local_port];transport=[transport]>
+Max-Forwards: 70
+Require: precondition
+Content-Type: application/sdp
+Content-Length: [len]
+
+v=0
+o=alice 53655765 2353687638 IN IP[local_ip_type] [local_ip]
+s=-
+c=IN IP[media_ip_type] [media_ip]
+t=0 0
+m=audio 49170 RTP/AVP 0
+a=rtpmap:0 PCMU/8000
+a=curr:qos e2e send
+a=des:qos mandatory e2e sendrecv
+]]>
+  </send>
+
+  <recv response="100" optional="true" />
+
+  <recv response="200" crlf="true">
+    <action>
+      <ereg regexp="UPDATE" search_in="hdr" header="CSeq:"
+            check_it="true" assign_to="junk" />
+      <ereg regexp="a=curr:qos e2e sendrecv" search_in="body"
+            check_it="true" assign_to="junk" />
+      <ereg regexp="m=audio 49172 RTP/AVP" search_in="body"
+            check_it="true" assign_to="junk" />
+      <ereg regexp="o=frank" search_in="body"
+            check_it_inverse="true" assign_to="junk" />
+    </action>
+  </recv>
+
+  <recv response="180" optional="true" />
+
+  <recv response="200" rtd="true" crlf="true">
+    <action>
+      <ereg regexp="INVITE" search_in="hdr" header="CSeq:"
+            check_it="true" assign_to="junk" />
+    </action>
+  </recv>
+
+  <send>
+    <![CDATA[
+ACK sip:frank@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:alice@[local_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:frank@[remote_ip]>[peer_tag_param]
+Call-ID: [call_id]
+CSeq: 1 ACK
+Max-Forwards: 70
+Content-Length: 0
+
+]]>
+  </send>
+
+  <pause milliseconds="500" />
+
+  <send retrans="500">
+    <![CDATA[
+BYE sip:frank@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:alice@[local_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:frank@[remote_ip]>[peer_tag_param]
+Call-ID: [call_id]
+CSeq: 4 BYE
+Max-Forwards: 70
+Content-Length: 0
+
+]]>
+  </send>
+
+  <recv response="200" rtd="true" />
+
+</scenario>

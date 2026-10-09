@@ -1203,6 +1203,12 @@ jobs:
       - name: An offer in a PRACK after the caller's 2xx reaches the callee in an UPDATE
         run: docker compose -f sipp/docker-compose.yaml --profile b2bua-a-leg-reliable-prov up --abort-on-container-exit --exit-code-from sipp-b2bua-prack-late-offer-uac sipp-b2bua-prack-late-offer-uac sipp-b2bua-prack-late-offer-uas
 
+      - name: Register frank against the instance
+        run: docker compose -f sipp/docker-compose.yaml --profile b2bua-a-leg-reliable-prov run --rm sipp-b2bua-early-update-register
+
+      - name: The caller's UPDATE on the early dialog carries its preconditions to the callee
+        run: docker compose -f sipp/docker-compose.yaml --profile b2bua-a-leg-reliable-prov up --abort-on-container-exit --exit-code-from sipp-b2bua-early-update-uac sipp-b2bua-early-update-uac sipp-b2bua-early-update-uas
+
       - name: Collect siphon logs
         if: always()
         run: docker compose -f sipp/docker-compose.yaml logs siphon-b2bua-a-leg-reliable > siphon-a-leg-reliable-prov.log 2>&1 || true

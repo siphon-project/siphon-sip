@@ -351,6 +351,13 @@ impl ALegReliableProvisionals {
         self.answer_acknowledged
     }
 
+    /// Whether siphon's offer to a caller whose INVITE carried none is out in a
+    /// reliable provisional and the PRACK that answers it has not come: an offer
+    /// from the caller meanwhile crosses it (RFC 3311 §5.2).
+    pub fn awaits_answer(&self) -> bool {
+        self.offer_to_caller.is_some()
+    }
+
     /// The `RSeq` of the provisional awaiting its PRACK.
     pub fn unacknowledged_rseq(&self) -> Option<u32> {
         self.unacknowledged.as_ref().map(|pending| pending.rseq)
