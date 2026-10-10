@@ -17,6 +17,10 @@ def on_invite(call):
     gw = gateway.select("carriers")            # pick a trunk
     call.dial(gw.uri, timeout=30)              # dial the B-leg
 
+@b2bua.on_provisional
+def on_provisional(call, reply):
+    log.info(f"[{call.id}] {reply.status_code} from the callee")
+
 @b2bua.on_early_media
 def on_early_media(call, reply):
     log.info(f"[{call.id}] early media {reply.status_code}")
@@ -193,7 +197,7 @@ headers, SIPhon's `Session-Expires` / `Min-SE` when it runs the session timer, a
 `replaces` merged into `Supported`.
 
 Responses work the same way. What a script does to a B-leg response in
-`@b2bua.on_answer` or `@b2bua.on_early_media` with `reply.set_header()` /
+`@b2bua.on_answer`, `@b2bua.on_provisional` or `@b2bua.on_early_media` with `reply.set_header()` /
 `reply.remove_header()` / `reply.remove_headers_matching()` reaches the caller as the
 script left it, over the response policy and SIPhon's own `Supported` / `Allow`.
 SIPhon still sets the caller's `Contact`, drops the callee's `Record-Route`, decides a
@@ -235,8 +239,29 @@ caller's UAS on the A-leg, so RFC 3262 on each leg is SIPhon's, under every pres
   A call already being torn down some other way is left to that teardown.
 
 `call.progress()` and `call.answer()` follow the same rules. `RSeq` and the `100rel`
-tag are SIPhon's alone: a `reply.set_header()` of either in `@b2bua.on_early_media`
-does not reach the caller.
+tag are SIPhon's alone: a `reply.set_header()` of either in `@b2bua.on_provisional`
+or `@b2bua.on_early_media` does not reach the caller.
+
+### Provisional responses
+
+`@b2bua.on_provisional(call, reply)` runs for every provisional response of the
+callee that SIPhon relays to the caller, 101 to 199, whether it carries SDP or not.
+A phone that rings normally answers `180` without a body, so this is the hook that
+tells a script the callee is being alerted, and the place to mark what the caller
+sees of it:
+
+```python
+@b2bua.on_provisional
+def on_provisional(call, reply):
+    if reply.status_code == 180:
+        reply.set_header("Privacy", "id")
+```
+
+`@b2bua.on_early_media(call, reply)` runs only for a provisional with SDP, and is
+where the session description goes through the media engine. A response with SDP
+runs both, `on_provisional` first, on the same `reply`. Neither runs for a
+`100 Trying`, which is hop by hop, nor for a provisional SIPhon does not relay:
+one that arrives after the answer, or from a leg that has already ended.
 
 ### `Supported` and `Allow` on both legs
 

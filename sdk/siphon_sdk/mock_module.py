@@ -890,6 +890,7 @@ class MockB2bua:
 
     Decorators:
         - ``@b2bua.on_invite`` — new call
+        - ``@b2bua.on_provisional``: every provisional response relayed (101-199)
         - ``@b2bua.on_early_media`` — provisional response with SDP (183/180)
         - ``@b2bua.on_answer`` — call answered
         - ``@b2bua.on_failure`` — all B-legs failed
@@ -1433,12 +1434,43 @@ class MockB2bua:
         return fn
 
     @staticmethod
+    def on_provisional(fn: Callable) -> Callable:
+        """Register handler for every provisional response relayed to the caller.
+
+        Called for each 101-199 the callee sends that siphon relays to the
+        caller, with or without SDP: a plain ``180 Ringing`` as much as a
+        ``183`` with early media. Not for a ``100 Trying``, which is hop by
+        hop, nor for a provisional siphon drops (one that arrives after the
+        answer, or on a leg that has already ended). Use it to mark the
+        response the caller sees, or to note that the callee is being
+        alerted.
+
+        Handler signature: ``(call, reply) -> None``
+
+        ``reply`` is the callee's response. A header set or removed on it
+        reaches the caller as the handler left it, as in ``on_answer``; the
+        dialog headers stay siphon's. A provisional with SDP goes on to
+        ``on_early_media`` afterwards, with the same ``reply``.
+
+        Example::
+
+            @b2bua.on_provisional
+            def provisional(call, reply):
+                if reply.status_code == 180:
+                    reply.set_header("Privacy", "id")
+        """
+        is_async = asyncio.iscoroutinefunction(fn)
+        _registry.register("b2bua.on_provisional", None, fn, is_async)
+        return fn
+
+    @staticmethod
     def on_early_media(fn: Callable) -> Callable:
         """Register handler for provisional response with SDP (183/180).
 
         Called when the B-leg sends a provisional response containing SDP
         (early media).  Use this to process the SDP through RTPEngine so
-        early media is anchored correctly.
+        early media is anchored correctly.  A provisional without SDP runs
+        ``on_provisional`` only.
 
         Handler signature: ``(call, reply) -> None``
 

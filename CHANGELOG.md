@@ -15,6 +15,18 @@ entry, but a working config keeps working.
 
 ### Added
 
+- **`@b2bua.on_provisional`: a hook for every provisional response the B2BUA
+  relays.** `@b2bua.on_early_media` runs only for a provisional with SDP, so a
+  `180 Ringing` without a body, which is what a ringing phone normally sends,
+  reached the caller without any script handler seeing it. `on_provisional(call,
+  reply)` runs for each 101-199 relayed to the caller, with or without SDP. A
+  header set or removed on `reply` reaches the caller as the handler left it,
+  as in `on_answer`. A provisional with SDP runs `on_provisional` first and
+  then `on_early_media`, on the same `reply`; `on_early_media` itself is
+  unchanged. Neither runs for a `100 Trying` or for a provisional that is not
+  relayed (after the answer, or from a leg that has ended). In the SDK,
+  `SipTestHarness.send_provisional()` runs the handlers against a reply.
+
 - **Rf accounting records can carry Access-Network-Information.** The
   `P-Access-Network-Info` header of the request (RFC 7315) goes to the CDF as
   `Access-Network-Information` (TS 32.299, AVP 1263, vendor 10415) inside
