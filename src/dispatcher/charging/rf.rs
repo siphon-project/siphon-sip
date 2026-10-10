@@ -27,6 +27,16 @@ pub fn rf_extract_dialog_parts(message: &SipMessage) -> Option<(String, String)>
     Some((call_id, from_tag))
 }
 
+/// Whether `message` is a request inside an existing dialog: its To header
+/// carries a tag (RFC 3261 section 12.2).
+pub fn rf_request_is_in_dialog(message: &SipMessage) -> bool {
+    message
+        .typed_to()
+        .ok()
+        .flatten()
+        .is_some_and(|to| to.tag.is_some())
+}
+
 /// Predicate factory: returns `true` when a SIP URI / name-addr value
 /// belongs to one of the locally-served domains.  Used by the
 /// `ims_data_from_request` builder to decide ORIGINATING vs
@@ -216,6 +226,16 @@ pub fn spawn_rf_proxy_start_if_invite(
             method = server_key.method.as_str(),
             "rf: proxy ACR-START skipped — non-INVITE method"
         );
+        return;
+    }
+    // A re-INVITE: the To tag says the dialog exists, so its accounting
+    // session was opened by the initial INVITE. TS 32.260 Table 5.2.1.1-1
+    // gives the Start to a "SIP 2xx acknowledging an initial SIP INVITE".
+    // Left to the keys below, a re-INVITE without the dialog's
+    // P-Charging-Vector, or one from the called party (whose From tag is the
+    // dialog's other tag), matches nothing and opens a second session.
+    if rf_request_is_in_dialog(original_request) {
+        debug!("rf: proxy ACR-START skipped: re-INVITE, the session is already open");
         return;
     }
     let (call_id, from_tag) = match rf_extract_dialog_parts(original_request) {
