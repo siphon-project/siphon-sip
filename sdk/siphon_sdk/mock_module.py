@@ -6916,7 +6916,8 @@ class MockDiameter:
                media_components: Optional[list] = None,
                af_application_id: str = "IMS Services",
                subscription_id: Optional[tuple] = None,
-               specific_actions: Optional[list[int]] = None) -> Awaitable[Optional[dict]]:
+               specific_actions: Optional[list[int]] = None,
+               service_urn: Optional[str] = None) -> Awaitable[Optional[dict]]:
         """Send an Rx AA-Request for QoS resource reservation.
 
         Without ``session_id`` the AAR is sent as Rx-Request-Type
@@ -6969,13 +6970,19 @@ class MockDiameter:
                 each event in an RAR carrying the matching Specific-Action,
                 which reaches ``@diameter.on_request``
                 (``request.command_name == "RAR"``).
+            service_urn: The service URN of an emergency session, e.g.
+                ``"urn:service:sos"`` or ``"urn:service:sos.police"``, sent
+                as Service-URN so the PCRF applies its emergency policy
+                (TS 29.214 §4.4.1). The AVP holds the URN without its
+                ``urn:service:`` (§5.3.23), so ``"sos"`` is accepted too.
 
         Returns:
             Dict with ``result_code`` and ``session_id``, or ``None``.
 
         Raises:
             ValueError: A ``specific_actions`` entry is not a defined value;
-                the message names it.
+                the message names it. Or ``service_urn`` has nothing after
+                ``urn:service:``.
             TypeError: ``specific_actions`` is not a list of int.
 
         Example::
@@ -6995,6 +7002,11 @@ class MockDiameter:
         # production rejects earlier.
         if specific_actions is not None:
             self._check_specific_actions(specific_actions)
+        if service_urn is not None:
+            prefix = "urn:service:"
+            rest = service_urn[len(prefix):] if service_urn.lower().startswith(prefix) else service_urn
+            if not rest:
+                raise ValueError(f"service_urn names no service: {service_urn!r}")
         sid = session_id or f"mock-rx-{len(self._aar_responses) + 1}"
 
         async def _send() -> Optional[dict]:

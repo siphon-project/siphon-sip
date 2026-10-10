@@ -658,6 +658,12 @@ static AVP_TABLE: &[AvpDef] = &[
         data_type: AvpType::OctetString,
     },
     AvpDef {
+        code: 525,
+        vendor_id: TGPP,
+        name: "Service-URN",
+        data_type: AvpType::OctetString,
+    },
+    AvpDef {
         code: 527,
         vendor_id: TGPP,
         name: "Service-Info-Status",
@@ -2392,6 +2398,7 @@ pub mod avp {
     pub const FLOW_STATUS: u32 = 511;
     pub const FLOW_USAGE: u32 = 512;
     pub const SPECIFIC_ACTION: u32 = 513;
+    pub const SERVICE_URN: u32 = 525;
     pub const MAX_REQUESTED_BANDWIDTH_DL: u32 = 515;
     pub const MAX_REQUESTED_BANDWIDTH_UL: u32 = 516;
     pub const MEDIA_COMPONENT_DESCRIPTION: u32 = 517;
