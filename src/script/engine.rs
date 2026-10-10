@@ -65,6 +65,9 @@ pub enum HandlerKind {
     ProxyCancel,
     /// `@b2bua.on_invite`
     B2buaInvite,
+    /// `@b2bua.on_provisional`: every provisional response relayed to the
+    /// caller (101-199), with or without SDP.
+    B2buaProvisional,
     /// `@b2bua.on_early_media` — provisional response with SDP (183/180).
     B2buaEarlyMedia,
     /// `@b2bua.on_answer`
@@ -991,6 +994,7 @@ fn extract_handlers(_python: Python<'_>, registry: &Bound<'_, PyAny>) -> Result<
             "proxy.on_failure" => HandlerKind::ProxyFailure,
             "proxy.on_cancel" => HandlerKind::ProxyCancel,
             "b2bua.on_invite" => HandlerKind::B2buaInvite,
+            "b2bua.on_provisional" => HandlerKind::B2buaProvisional,
             "b2bua.on_early_media" => HandlerKind::B2buaEarlyMedia,
             "b2bua.on_answer" => HandlerKind::B2buaAnswer,
             "b2bua.on_failure" => HandlerKind::B2buaFailure,
@@ -1856,6 +1860,23 @@ def on_cancel(call):
         assert_eq!(state.handlers[0].kind, HandlerKind::B2buaCancel);
         assert!(!state.handlers[0].is_async);
         assert_eq!(state.handlers_for(&HandlerKind::B2buaCancel).len(), 1);
+    }
+
+    #[test]
+    fn b2bua_on_provisional_decorator_registers_handler() {
+        let source = r#"
+from siphon import b2bua
+
+@b2bua.on_provisional
+async def on_provisional(call, reply):
+    pass
+"#;
+        let state = compile_temp_script(source).unwrap();
+        assert_eq!(state.handlers.len(), 1);
+        assert_eq!(state.handlers[0].kind, HandlerKind::B2buaProvisional);
+        assert!(state.handlers[0].is_async);
+        assert_eq!(state.handlers_for(&HandlerKind::B2buaProvisional).len(), 1);
+        assert!(state.handlers_for(&HandlerKind::B2buaEarlyMedia).is_empty());
     }
 
     #[test]
