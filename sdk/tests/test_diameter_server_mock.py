@@ -245,6 +245,34 @@ def test_get_avp_decodes_isdn_address_avps():
     assert req2.get_avp(3300, 10415) == "31611111111"  # SC-Address
 
 
+def test_answer_copies_the_application_avps_of_the_request():
+    """``request.answer()`` starts with the request's
+    Vendor-Specific-Application-Id and Auth-Session-State, as siphon does,
+    and a script that sets one itself does not end up with two."""
+    application = [(266, 10415), (258, 16777216)]
+    req = mock_module.MockDiameterRequest(
+        application_name="Cx",
+        command_name="RTR",
+        avps={(260, 0): application, (277, 0): 1, (1, 0): "001010000000001"},
+    )
+    answer = req.answer(5012)
+    assert answer.iter_avps() == [(260, 0, application), (277, 0, 1)]
+    assert req.reject(5012).iter_avps() == [(260, 0, application), (277, 0, 1)]
+
+    # A protocol error is the generic answer-message, which lists neither.
+    assert req.reject(3002).iter_avps() == []
+    # Nothing to copy, nothing copied.
+    assert mock_module.MockDiameterRequest().answer(2001).iter_avps() == []
+
+    answer.set_avp(277, 0)
+    assert answer.iter_avps() == [(260, 0, application), (277, 0, 0)]
+    # The first insert_avp of a copied AVP replaces the copy, the next adds.
+    answer.insert_avp(260, application)
+    assert answer.iter_avps() == [(277, 0, 0), (260, 0, application)]
+    answer.insert_avp(260, application)
+    assert [code for code, _, _ in answer.iter_avps()] == [277, 260, 260]
+
+
 def test_ip_in_cidr_and_fnmatch_helpers():
     from siphon import diameter as d
 

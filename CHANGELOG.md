@@ -70,6 +70,29 @@ entry, but a working config keeps working.
   AVPs in order and allows repeats, and its `remove_avp` returns how many AVPs
   it removed, as siphon does, where it returned at most 1.
 
+### Changed
+
+- **`DiameterRequest.answer()` and `.reject()` copy the application AVPs of the
+  request into the answer. This changes the answers scripts send.** An answer
+  built in a `@diameter.on_request` handler started with Session-Id,
+  Result-Code, Origin-Host and Origin-Realm, and every handler had to add
+  Vendor-Specific-Application-Id and Auth-Session-State by hand, which the
+  answers of the 3GPP applications list: both as required on Cx and Sh (TS
+  29.229 clause 6.1, TS 29.329 clause 6.1), Auth-Session-State as required on
+  S6a, S6c and SGd (TS 29.272 clause 7.2, TS 29.338 clauses 5.3.2 and 6.3.2).
+  A handler that forgot sent an answer its peer could refuse. The answer now
+  starts with both, copied as the request has them, when the request has
+  them: Vendor-Specific-Application-Id after Session-Id and
+  Auth-Session-State before Origin-Host. A protocol error (3xxx) gets
+  neither. **Nothing has to change in a script that already sets them:**
+  `set_avp` replaces the copy as it replaces any AVP, and the first
+  `insert_avp` of a copied AVP replaces the copy instead of adding a second,
+  so neither is sent twice. Its own AVP then sits where the script put it,
+  after the seeded ones. A script that wants the answer without one of them
+  calls `answer.remove_avp(...)`. The SDK mock does the same. Checked against
+  Wireshark's Diameter dissector with
+  `scripts/validate_diameter_answer_avps.sh`.
+
 ### Removed
 
 - **`ro.charge_message` is gone.** It was documented as one-shot charging of

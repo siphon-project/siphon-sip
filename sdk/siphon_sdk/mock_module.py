@@ -6526,6 +6526,10 @@ class MockDiameterAnswer:
         # An ordered list rather than a dict: an answer can carry the same AVP
         # more than once, and the order is the order on the wire.
         self._avps = [(key, value) for key, value in (avps or {}).items()]
+        # The AVPs ``DiameterRequest.answer`` copied from the request and the
+        # script has not touched since: the first ``insert_avp`` of one
+        # replaces the copy.
+        self._copied_from_request: set = set()
 
     @property
     def is_error(self) -> bool:
@@ -6557,11 +6561,19 @@ class MockDiameterAnswer:
             answer.set_avp("SIP-Number-Auth-Items", len(vectors))
             for vector in vectors:
                 answer.insert_avp("SIP-Auth-Data-Item", vector)
+
+        One exception: the first ``insert_avp`` of an AVP that
+        ``request.answer()`` copied from the request
+        (Vendor-Specific-Application-Id, Auth-Session-State) replaces that
+        copy, so adding it yourself does not send it twice.
         """
+        if (code_or_name, vendor) in self._copied_from_request:
+            self.remove_avp(code_or_name, vendor)
         self._avps.append(((code_or_name, vendor), value))
 
     def remove_avp(self, code: int, vendor: int = 0) -> int:
         """Remove every AVP with this code and vendor; returns how many."""
+        self._copied_from_request.discard((code, vendor))
         kept = [(key, value) for key, value in self._avps if key != (code, vendor)]
         removed = len(self._avps) - len(kept)
         self._avps = kept
@@ -6682,11 +6694,22 @@ class MockDiameterRequest:
         with :meth:`MockDiameterAnswer.set_avp`, including grouped AVPs (pass a
         list of ``(code, value[, vendor])`` child tuples as the value), and
         with :meth:`MockDiameterAnswer.insert_avp` for an AVP the answer
-        carries more than once."""
-        return MockDiameterAnswer(result_code=result_code, command_code=self.command_code)
+        carries more than once.
+
+        The answer starts with the request's Vendor-Specific-Application-Id
+        (260) and Auth-Session-State (277) when the request has them, which
+        the answers of the 3GPP applications list, unless ``result_code`` is a
+        protocol error (3xxx). Setting either yourself replaces the copy."""
+        answer = MockDiameterAnswer(result_code=result_code, command_code=self.command_code)
+        if not 3000 <= result_code < 4000:
+            for key in ((260, 0), (277, 0)):
+                if key in self._avps:
+                    answer._avps.append((key, self._avps[key]))
+                    answer._copied_from_request.add(key)
+        return answer
 
     def reject(self, result_code: int, error_message: Optional[str] = None) -> MockDiameterAnswer:
-        return MockDiameterAnswer(result_code=result_code, command_code=self.command_code)
+        return self.answer(result_code, error_message)
 
     async def forward_to(self, peer: MockPeer, identity=None,
                          timeout_secs: float = 10.0) -> MockDiameterAnswer:

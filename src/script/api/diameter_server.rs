@@ -338,13 +338,74 @@ fn build_child_spec(spec: &Bound<'_, PyAny>) -> PyResult<Avp> {
 #[pyclass(name = "DiameterAnswer")]
 pub struct PyDiameterAnswer {
     pub(crate) msg: Arc<Mutex<DiameterMsg>>,
+    /// The (code, vendor) of the AVPs `DiameterRequest.answer` copied from
+    /// the request and the script has not touched since. The first
+    /// `insert_avp` of one replaces the copy, so a script that adds the AVP
+    /// itself does not end up with two.
+    copied_from_request: Mutex<Vec<(u32, u32)>>,
 }
+
+/// The AVPs an answer takes from its request. Every answer of the 3GPP
+/// applications lists Vendor-Specific-Application-Id and Auth-Session-State,
+/// with the values of the request: both as required on Cx and Sh (TS 29.229
+/// clause 6.1, TS 29.329 clause 6.1), Auth-Session-State as required and the
+/// other as optional on S6a, S6c and SGd (TS 29.272 clause 7.2, TS 29.338
+/// clauses 5.3.2 and 6.3.2).
+const APPLICATION_AVPS: [u32; 2] = [
+    dictionary::avp::VENDOR_SPECIFIC_APPLICATION_ID,
+    dictionary::avp::AUTH_SESSION_STATE,
+];
 
 impl PyDiameterAnswer {
     pub(crate) fn from_msg(msg: DiameterMsg) -> Self {
         Self {
             msg: Arc::new(Mutex::new(msg)),
+            copied_from_request: Mutex::new(Vec::new()),
         }
+    }
+
+    /// An answer a handler is about to fill in, with the application AVPs of
+    /// `request` copied into the places the commands list them in:
+    /// Vendor-Specific-Application-Id after Session-Id, Auth-Session-State
+    /// before Origin-Host. A protocol error (3xxx) gets neither: it is the
+    /// generic answer-message of RFC 6733 section 7.2.
+    fn for_handler(request: &DiameterMsg, mut answer: DiameterMsg, result_code: u32) -> Self {
+        let mut copied = Vec::new();
+        if !(3000..4000).contains(&result_code) {
+            for code in APPLICATION_AVPS {
+                let Some(avp) = request.find(code, 0) else {
+                    continue;
+                };
+                let before = if code == dictionary::avp::AUTH_SESSION_STATE {
+                    dictionary::avp::ORIGIN_HOST
+                } else {
+                    dictionary::avp::RESULT_CODE
+                };
+                let position = answer
+                    .avps
+                    .iter()
+                    .position(|existing| existing.code == before && existing.vendor == 0)
+                    .unwrap_or(answer.avps.len());
+                answer.avps.insert(position, avp.clone());
+                copied.push((code, 0));
+            }
+        }
+        Self {
+            msg: Arc::new(Mutex::new(answer)),
+            copied_from_request: Mutex::new(copied),
+        }
+    }
+
+    /// Forget that `(code, vendor)` was copied from the request, because the
+    /// script is now setting it. Returns whether it was.
+    fn take_copied(&self, code: u32, vendor: u32) -> PyResult<bool> {
+        let mut copied = self
+            .copied_from_request
+            .lock()
+            .map_err(|error| pyo3::exceptions::PyRuntimeError::new_err(format!("lock: {error}")))?;
+        let before = copied.len();
+        copied.retain(|entry| *entry != (code, vendor));
+        Ok(copied.len() != before)
     }
 
     /// Serialize the answer to wire bytes (used by the dispatch layer to ship
@@ -409,6 +470,7 @@ impl PyDiameterAnswer {
         let (code, name_vendor) = resolve_code(code_or_name)?;
         let vendor = if vendor != 0 { vendor } else { name_vendor };
         let avp = build_avp(code, vendor, value)?;
+        self.take_copied(code, vendor)?;
         let mut msg = self.lock_mut()?;
         msg.remove(code, vendor);
         msg.avps.push(avp);
@@ -429,6 +491,11 @@ impl PyDiameterAnswer {
     /// for vector in vectors:
     ///     answer.insert_avp("SIP-Auth-Data-Item", vector)
     /// ```
+    ///
+    /// One exception: the first ``insert_avp`` of an AVP that
+    /// ``request.answer()`` copied from the request
+    /// (Vendor-Specific-Application-Id, Auth-Session-State) replaces that
+    /// copy, so adding it yourself does not send it twice.
     #[pyo3(signature = (code_or_name, value, vendor=0))]
     fn insert_avp(
         &self,
@@ -439,7 +506,12 @@ impl PyDiameterAnswer {
         let (code, name_vendor) = resolve_code(code_or_name)?;
         let vendor = if vendor != 0 { vendor } else { name_vendor };
         let avp = build_avp(code, vendor, value)?;
-        self.lock_mut()?.avps.push(avp);
+        let replaces_copy = self.take_copied(code, vendor)?;
+        let mut msg = self.lock_mut()?;
+        if replaces_copy {
+            msg.remove(code, vendor);
+        }
+        msg.avps.push(avp);
         Ok(())
     }
 
@@ -447,6 +519,7 @@ impl PyDiameterAnswer {
     fn remove_avp(&self, code_or_name: &Bound<'_, PyAny>, vendor: u32) -> PyResult<usize> {
         let (code, name_vendor) = resolve_code(code_or_name)?;
         let vendor = if vendor != 0 { vendor } else { name_vendor };
+        self.take_copied(code, vendor)?;
         Ok(self.lock_mut()?.remove(code, vendor))
     }
 }
@@ -634,7 +707,11 @@ impl PyDiameterRequest {
     /// AIR/ULR): siphon transports the message; the script builds the answer.
     ///
     /// The envelope is seeded with Session-Id (echoed), Result-Code,
-    /// Origin-Host/Realm, and the request's hop-by-hop / end-to-end. Add the
+    /// Origin-Host/Realm, and the request's hop-by-hop / end-to-end. It also
+    /// carries the request's Vendor-Specific-Application-Id and
+    /// Auth-Session-State when the request has them, which the answers of
+    /// the 3GPP applications list, unless `result_code` is a protocol error
+    /// (3xxx). Setting either yourself replaces the copy. Add the other
     /// application AVPs (including grouped ones) with `set_avp`, or with
     /// `insert_avp` for an AVP the answer carries more than once.
     #[pyo3(signature = (result_code=2001, error_message=None))]
@@ -651,7 +728,7 @@ impl PyDiameterRequest {
             result_code,
             error_message.as_deref(),
         );
-        Ok(PyDiameterAnswer::from_msg(answer))
+        Ok(PyDiameterAnswer::for_handler(&request, answer, result_code))
     }
 
     /// Build an error answer for this request (alias of `answer` kept for
@@ -1038,6 +1115,20 @@ mod tests {
                         0,
                         "scscf.ims.mnc001.mcc001.3gppnetwork.org",
                     ),
+                    Avp {
+                        code: dictionary::avp::VENDOR_SPECIFIC_APPLICATION_ID,
+                        vendor: 0,
+                        flags: crate::diameter::codec::AVP_FLAG_MANDATORY,
+                        value: AvpData::Grouped(vec![
+                            Avp::u32(dictionary::avp::VENDOR_ID, 0, dictionary::VENDOR_3GPP),
+                            Avp::u32(
+                                dictionary::avp::AUTH_APPLICATION_ID,
+                                0,
+                                dictionary::CX_APP_ID,
+                            ),
+                        ]),
+                    },
+                    Avp::u32(dictionary::avp::AUTH_SESSION_STATE, 0, 1),
                 ],
             },
             PyInboundPeer {
@@ -1190,6 +1281,208 @@ mod tests {
             // remove_avp takes all of them and says how many.
             assert_eq!(answer.remove_avp(&name, 0).unwrap(), 2);
             assert!(item_numbers_on_the_wire(&answer).is_empty());
+        });
+    }
+
+    // ── answer(): the application AVPs of the request ───────────────────
+
+    /// Vendor-Specific-Application-Id for Cx, octet by octet (RFC 6733
+    /// section 6.11): code 260 with M, length 32, holding Vendor-Id (266)
+    /// 10415 and Auth-Application-Id (258) 16777216.
+    const CX_VENDOR_SPECIFIC_APPLICATION_ID: [u8; 32] = [
+        0x00, 0x00, 0x01, 0x04, 0x40, 0x00, 0x00, 0x20, // 260, M, length 32
+        0x00, 0x00, 0x01, 0x0a, 0x40, 0x00, 0x00, 0x0c, 0x00, 0x00, 0x28, 0xaf, // Vendor-Id
+        0x00, 0x00, 0x01, 0x02, 0x40, 0x00, 0x00, 0x0c, 0x01, 0x00, 0x00, 0x00, // Auth-App-Id
+    ];
+
+    /// Auth-Session-State NO_STATE_MAINTAINED (RFC 6733 section 8.11): code
+    /// 277 with M, length 12, value 1.
+    const AUTH_SESSION_STATE_NO_STATE: [u8; 12] = [
+        0x00, 0x00, 0x01, 0x15, 0x40, 0x00, 0x00, 0x0c, 0x00, 0x00, 0x00, 0x01,
+    ];
+
+    /// A Cx Registration-Termination-Request as a peer sends it, written out
+    /// by hand: the header, Session-Id, and `application_avps` in between
+    /// that and Origin-Host.
+    fn registration_termination_request(application_avps: &[&[u8]]) -> PyDiameterRequest {
+        let mut avps = Vec::new();
+        // Session-Id (263, M), "hss;7;7": length 15, one octet of padding.
+        avps.extend_from_slice(&[0x00, 0x00, 0x01, 0x07, 0x40, 0x00, 0x00, 0x0f]);
+        avps.extend_from_slice(b"hss;7;7\0");
+        for avp in application_avps {
+            avps.extend_from_slice(avp);
+        }
+        // Origin-Host (264, M), "hss.example.com": length 23, one of padding.
+        avps.extend_from_slice(&[0x00, 0x00, 0x01, 0x08, 0x40, 0x00, 0x00, 0x17]);
+        avps.extend_from_slice(b"hss.example.com\0");
+
+        let length = (20 + avps.len()) as u32;
+        let mut wire = vec![0x01];
+        wire.extend_from_slice(&length.to_be_bytes()[1..]);
+        // Request and proxiable, command 304, application 16777216.
+        wire.extend_from_slice(&[0xc0, 0x00, 0x01, 0x30, 0x01, 0x00, 0x00, 0x00]);
+        wire.extend_from_slice(&[0x00, 0x00, 0x0b, 0x3a, 0x00, 0x00, 0x10, 0xea]);
+        wire.extend_from_slice(&avps);
+
+        PyDiameterRequest::new(
+            DiameterMsg::from_wire(&wire).unwrap(),
+            PyInboundPeer {
+                name: "hss".into(),
+                tenant: "default".into(),
+                addr: "192.0.2.7:3868".into(),
+                transport: "tcp".into(),
+            },
+            "scscf.ims.mnc001.mcc001.3gppnetwork.org".into(),
+            "ims.mnc001.mcc001.3gppnetwork.org".into(),
+        )
+    }
+
+    fn cx_request() -> PyDiameterRequest {
+        registration_termination_request(&[
+            &CX_VENDOR_SPECIFIC_APPLICATION_ID,
+            &AUTH_SESSION_STATE_NO_STATE,
+        ])
+    }
+
+    fn top_level_codes(answer: &PyDiameterAnswer) -> Vec<u32> {
+        let wire = answer.to_wire().unwrap();
+        let msg = DiameterMsg::from_wire(&wire).unwrap();
+        msg.avps.iter().map(|avp| avp.code).collect()
+    }
+
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+    }
+
+    /// Every answer of the 3GPP applications lists these two (TS 29.229
+    /// clause 6.1.10 for this command: `{ Vendor-Specific-Application-Id }`
+    /// and `{ Auth-Session-State }`), with the values the request has.
+    #[test]
+    fn answer_carries_the_application_avps_of_the_request() {
+        pyo3::Python::initialize();
+        Python::attach(|_py| {
+            for result_code in [2001, 5012] {
+                let answer = cx_request().answer(result_code, None).unwrap();
+                let wire = answer.to_wire().unwrap();
+                assert!(contains(&wire, &CX_VENDOR_SPECIFIC_APPLICATION_ID));
+                assert!(contains(&wire, &AUTH_SESSION_STATE_NO_STATE));
+                // In the order the command lists them.
+                assert_eq!(
+                    top_level_codes(&answer),
+                    [263, 260, 268, 277, 264, 296],
+                    "{result_code}"
+                );
+            }
+            let refusal = cx_request().reject(5012, None).unwrap();
+            assert_eq!(top_level_codes(&refusal), [263, 260, 268, 277, 264, 296]);
+        });
+    }
+
+    #[test]
+    fn answer_copies_only_what_the_request_has() {
+        pyo3::Python::initialize();
+        Python::attach(|_py| {
+            let bare = registration_termination_request(&[]);
+            assert_eq!(
+                top_level_codes(&bare.answer(2001, None).unwrap()),
+                [263, 268, 264, 296]
+            );
+            let stateless = registration_termination_request(&[&AUTH_SESSION_STATE_NO_STATE]);
+            assert_eq!(
+                top_level_codes(&stateless.answer(2001, None).unwrap()),
+                [263, 268, 277, 264, 296]
+            );
+        });
+    }
+
+    /// A protocol error goes out as the generic answer-message of RFC 6733
+    /// section 7.2, which lists neither.
+    #[test]
+    fn a_protocol_error_answer_carries_no_application_avps() {
+        pyo3::Python::initialize();
+        Python::attach(|_py| {
+            let answer = cx_request().reject(3002, None).unwrap();
+            assert_eq!(top_level_codes(&answer), [263, 268, 264, 296]);
+        });
+    }
+
+    /// A script that sets one of them itself, with `set_avp` or with
+    /// `insert_avp`, ends up with its own and not with two.
+    #[test]
+    fn a_script_setting_an_application_avp_does_not_duplicate_it() {
+        pyo3::Python::initialize();
+        Python::attach(|py| {
+            let name = |name: &str| name.into_pyobject(py).unwrap().into_any();
+            let state = 0u32.into_pyobject(py).unwrap().into_any();
+            let application = PyList::empty(py);
+            application.append(("Vendor-Id", 10415u32)).unwrap();
+            application
+                .append(("Auth-Application-Id", 16_777_216u32))
+                .unwrap();
+
+            let count = |answer: &PyDiameterAnswer, code: u32| {
+                let wire = answer.to_wire().unwrap();
+                DiameterMsg::from_wire(&wire)
+                    .unwrap()
+                    .find_all(code, 0)
+                    .count()
+            };
+
+            let answer = cx_request().answer(2001, None).unwrap();
+            answer
+                .set_avp(&name("Auth-Session-State"), &state, 0)
+                .unwrap();
+            answer
+                .set_avp(
+                    &name("Vendor-Specific-Application-Id"),
+                    application.as_any(),
+                    0,
+                )
+                .unwrap();
+            assert_eq!(count(&answer, 277), 1);
+            assert_eq!(count(&answer, 260), 1);
+            let state_read: u32 = answer
+                .get_avp(py, &name("Auth-Session-State"), 0)
+                .unwrap()
+                .unwrap()
+                .extract()
+                .unwrap();
+            assert_eq!(state_read, 0, "the script's value, not the request's");
+
+            let answer = cx_request().answer(2001, None).unwrap();
+            answer
+                .insert_avp(&name("Auth-Session-State"), &state, 0)
+                .unwrap();
+            answer
+                .insert_avp(
+                    &name("Vendor-Specific-Application-Id"),
+                    application.as_any(),
+                    0,
+                )
+                .unwrap();
+            assert_eq!(count(&answer, 277), 1);
+            assert_eq!(count(&answer, 260), 1);
+
+            // Only the copy `answer()` made gives way. What the script
+            // inserted stays, so it can still repeat an AVP on purpose.
+            answer
+                .insert_avp(
+                    &name("Vendor-Specific-Application-Id"),
+                    application.as_any(),
+                    0,
+                )
+                .unwrap();
+            assert_eq!(count(&answer, 260), 2);
+
+            // Removing the copy and inserting again is not a replacement.
+            let answer = cx_request().answer(2001, None).unwrap();
+            assert_eq!(
+                answer.remove_avp(&name("Auth-Session-State"), 0).unwrap(),
+                1
+            );
+            assert_eq!(count(&answer, 277), 0);
         });
     }
 
