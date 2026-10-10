@@ -96,15 +96,28 @@ pub fn forward_update_response(
             status_code = status;
         }
 
+        // The response goes back where the UPDATE came from (RFC 3261 §18.2.2):
+        // before the answer that need not be the hop the originator's INVITE
+        // arrived from, or was sent to, and the INVITE's own responses and
+        // CANCEL stay with the INVITE.
         // 4th element: the responder leg's anchored egress socket (see the
         // re-INVITE response path above).
+        let source = snapshot.b_leg_request_source.as_ref();
         let (resp_dest, resp_transport, resp_conn_id, resp_local_addr) = if is_a2b {
-            (
-                snapshot.a_leg.transport.remote_addr,
-                snapshot.a_leg.transport.transport,
-                snapshot.a_leg.transport.connection_id,
-                snapshot.a_leg_local_addr,
-            )
+            match source {
+                Some(source) => (
+                    source.remote_addr,
+                    source.transport,
+                    source.connection_id,
+                    source.local_addr,
+                ),
+                None => (
+                    snapshot.a_leg.transport.remote_addr,
+                    snapshot.a_leg.transport.transport,
+                    snapshot.a_leg.transport.connection_id,
+                    snapshot.a_leg_local_addr,
+                ),
+            }
         } else {
             match state.call_actors.get_call(call_id) {
                 Some(call) => {
@@ -113,9 +126,12 @@ pub fn forward_update_response(
                     // caller's session is shared with.
                     let callee = call.bridged_b_leg_index().and_then(|i| call.b_legs.get(i));
                     if let Some(b) = callee {
+                        let (remote_addr, transport) = source
+                            .map(|source| (source.remote_addr, source.transport))
+                            .unwrap_or((b.transport.remote_addr, b.transport.transport));
                         (
-                            b.transport.remote_addr,
-                            b.transport.transport,
+                            remote_addr,
+                            transport,
                             ConnectionId::default(),
                             b.transport.local_addr,
                         )

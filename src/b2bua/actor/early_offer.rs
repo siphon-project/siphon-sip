@@ -137,6 +137,27 @@ impl CallActor {
             && self.b_legs.iter().any(|leg| !leg.is_tracking_leg())
     }
 
+    /// Whether the leg an in-dialog request arrived on moves to the flow the
+    /// request arrived on (RFC 5626 §5.3): only once the INVITE that opened the
+    /// leg's dialog has had its final response.
+    ///
+    /// Until then the leg's transport is that INVITE's own. The caller's is
+    /// where every response to its INVITE goes, the source the INVITE came from
+    /// (RFC 3261 §18.2.2), and a request on the early dialog is another
+    /// transaction that may arrive from another hop. The caller has no final
+    /// response while nobody has answered or its 2xx is held for a PRACK
+    /// (RFC 3262 §3). A callee's is where siphon sent its INVITE, which the
+    /// CANCEL of that INVITE follows (RFC 3261 §9.1), until the callee wins.
+    pub fn in_dialog_request_moves_flow(&self, from_a_leg: bool) -> bool {
+        if !from_a_leg {
+            return self.winner.is_some();
+        }
+        if self.originated {
+            return self.state == CallState::Answered;
+        }
+        self.a_leg_reliability.finished() && !self.prack_bridge.holds_answer()
+    }
+
     /// The one callee leg whose early dialog shares the caller's session before
     /// anybody has answered: the only pending branch that completed the
     /// INVITE's offer/answer exchange and whose session description the caller

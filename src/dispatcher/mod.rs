@@ -174,6 +174,8 @@ mod held_bye_tests;
 #[cfg(test)]
 mod inbound_drop_tests;
 #[cfg(test)]
+mod invite_response_path_tests;
+#[cfg(test)]
 mod late_provisional_tests;
 #[cfg(test)]
 mod lcr_number_policy_tests;

@@ -58,6 +58,9 @@ pub struct BLegResponseSnapshot {
     /// On a tracking leg for a relayed re-INVITE or UPDATE, the originator's
     /// session timer headers (`Leg::session_refresh_request`).
     pub b_leg_session_refresh_request: Option<crate::sip::headers::SipHeaders>,
+    /// On a tracking leg for a relayed UPDATE: the flow the UPDATE arrived on,
+    /// where its response goes.
+    pub b_leg_request_source: Option<LegTransport>,
     /// The Via branch the response carries.
     pub branch: String,
     pub a_leg_local_addr: Option<SocketAddr>,
@@ -123,6 +126,7 @@ pub fn b_leg_response_snapshot(
         b_leg_offered_sdp: matching_b.and_then(|b| b.offered_sdp.clone()),
         b_leg_request_session_expires: matching_b.and_then(|b| b.request_session_expires),
         b_leg_session_refresh_request: matching_b.and_then(|b| b.session_refresh_request.clone()),
+        b_leg_request_source: matching_b.and_then(|b| b.request_source.clone()),
         branch: branch.to_string(),
         a_leg_local_addr: call.a_leg_local_addr,
     })
