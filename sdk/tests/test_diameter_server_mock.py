@@ -90,6 +90,11 @@ def test_on_request_forward_and_reject():
     assert answer.result_code == 3002
     assert answer.is_error
 
+    # A permanent failure a handler answers is an answer of the command: the
+    # E bit stays clear (RFC 6733 section 7.1.5).
+    assert not req.answer(5012).is_error
+    assert not req.reject(5012).is_error
+
 
 def test_event_sink_and_completed_hook():
     diameter = _fresh_diameter()

@@ -305,11 +305,7 @@ fn build_avp(code: u32, vendor: u32, value: &Bound<'_, PyAny>) -> PyResult<Avp> 
         });
     }
     let raw = py_to_avp_raw(code, vendor, value)?;
-    let mut avp = Avp::raw(code, vendor, raw);
-    if !dictionary::avp_is_mandatory(code, vendor) {
-        avp.flags &= !crate::diameter::codec::AVP_FLAG_MANDATORY;
-    }
-    Ok(avp)
+    Ok(Avp::raw(code, vendor, raw))
 }
 
 /// Parse one grouped child spec — a `(code_or_name, value)` or
@@ -663,8 +659,10 @@ impl PyDiameterRequest {
         Ok(PyDiameterAnswer::from_msg(answer))
     }
 
-    /// Build an error answer for this request (alias of `answer` kept for
-    /// readability when refusing). Sets the E-bit for 3xxx/5xxx codes.
+    /// Build an answer that refuses this request (alias of `answer` kept for
+    /// readability when refusing). The E-bit is set for a protocol error
+    /// (3xxx) and for nothing else: a permanent failure (5xxx) a handler
+    /// answers is an answer of the command (RFC 6733 section 7.1.5).
     #[pyo3(signature = (result_code, error_message=None))]
     fn reject(
         &self,
@@ -703,12 +701,12 @@ impl PyDiameterRequest {
 
             // Loop detection + Route-Record append.
             if let Err(error) = forward::prepare_forward(&mut tree, &local_origin_host) {
-                let answer = forward::build_answer(
+                let answer = forward::build_error_answer(
                     &tree,
                     &local_origin_host,
                     &local_origin_realm,
                     error.result_code(),
-                    Some(&error.to_string()),
+                    &error.to_string(),
                 );
                 return Ok(PyDiameterAnswer::from_msg(answer));
             }
@@ -728,12 +726,12 @@ impl PyDiameterRequest {
                             Ok(PyDiameterAnswer::from_msg(answer_tree))
                         }
                         Err(_) => {
-                            let answer = forward::build_answer(
+                            let answer = forward::build_error_answer(
                                 &tree,
                                 &local_origin_host,
                                 &local_origin_realm,
                                 dictionary::DIAMETER_UNABLE_TO_DELIVER,
-                                Some("malformed answer from backend"),
+                                "malformed answer from backend",
                             );
                             Ok(PyDiameterAnswer::from_msg(answer))
                         }
@@ -745,12 +743,12 @@ impl PyDiameterRequest {
                     } else {
                         dictionary::DIAMETER_UNABLE_TO_DELIVER
                     };
-                    let answer = forward::build_answer(
+                    let answer = forward::build_error_answer(
                         &tree,
                         &local_origin_host,
                         &local_origin_realm,
                         result_code,
-                        Some(&reason),
+                        &reason,
                     );
                     Ok(PyDiameterAnswer::from_msg(answer))
                 }
@@ -855,6 +853,40 @@ mod tests {
                 1
             );
             assert!(request.dest_host().unwrap().is_none());
+        });
+    }
+
+    /// RFC 6733 section 4.5 lists four base AVPs with M under "MUST NOT".
+    /// A script that sets one gets it without the bit, at the top level and
+    /// inside a group.
+    #[test]
+    fn a_script_set_avp_that_must_not_be_mandatory_carries_no_m_bit() {
+        pyo3::Python::initialize();
+        Python::attach(|py| {
+            let answer = py_request().answer(5012, None).unwrap();
+            let text = "why".into_pyobject(py).unwrap().into_any();
+            for name in ["Error-Message", "Product-Name"] {
+                answer
+                    .set_avp(&name.into_pyobject(py).unwrap().into_any(), &text, 0)
+                    .unwrap();
+            }
+            // Error-Reporting-Host, by its code.
+            answer
+                .set_avp(&294u32.into_pyobject(py).unwrap().into_any(), &text, 0)
+                .unwrap();
+            let revision = 1u32.into_pyobject(py).unwrap().into_any();
+            answer
+                .set_avp(&267u32.into_pyobject(py).unwrap().into_any(), &revision, 0)
+                .unwrap();
+            // Result-Code keeps its M bit.
+            let msg = DiameterMsg::from_wire(&answer.to_wire().unwrap()).unwrap();
+            for code in [281, 294, 269, 267] {
+                assert_eq!(msg.find(code, 0).unwrap().flags, 0, "{code}");
+            }
+            assert_eq!(
+                msg.find(dictionary::avp::RESULT_CODE, 0).unwrap().flags,
+                crate::diameter::codec::AVP_FLAG_MANDATORY
+            );
         });
     }
 
@@ -1061,6 +1093,36 @@ mod tests {
             answer.set_avp(&name, &value, 0).unwrap();
             let message = answer.msg.lock().unwrap();
             assert_eq!(message.find(410, 10415).expect("GBA-Type").flags, 0xc0);
+        });
+    }
+
+    /// The AVPs of the base protocol and of an application that go out
+    /// without the M bit follow one rule (`dictionary::avp_is_mandatory`): an
+    /// answer a script gives one of each carries neither with it on the wire,
+    /// and the vendor AVP keeps its V bit.
+    #[test]
+    fn base_and_application_avps_without_the_m_bit_share_an_answer() {
+        pyo3::Python::initialize();
+        Python::attach(|py| {
+            let answer = py_request().answer(5012, None).unwrap();
+            let text = "why".into_pyobject(py).unwrap().into_any();
+            let name = "Error-Message".into_pyobject(py).unwrap().into_any();
+            answer.set_avp(&name, &text, 0).unwrap();
+            let name = "GUSS-Timestamp".into_pyobject(py).unwrap().into_any();
+            let seconds = 1_767_225_600u64.into_pyobject(py).unwrap().into_any();
+            answer.set_avp(&name, &seconds, 0).unwrap();
+
+            let msg = DiameterMsg::from_wire(&answer.to_wire().unwrap()).unwrap();
+            assert!(
+                !msg.is_error(),
+                "5012 from a handler is an answer of the command"
+            );
+            assert_eq!(msg.find(281, 0).expect("Error-Message").flags, 0);
+            assert_eq!(msg.find(409, 10415).expect("GUSS-Timestamp").flags, 0x80);
+            assert_eq!(
+                msg.find(dictionary::avp::RESULT_CODE, 0).unwrap().flags,
+                crate::diameter::codec::AVP_FLAG_MANDATORY
+            );
         });
     }
 

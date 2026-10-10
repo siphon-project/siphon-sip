@@ -1901,9 +1901,20 @@ pub fn lookup_avp_by_python_name(name: &str) -> Option<&'static AvpDef> {
 
 /// Whether an AVP goes out with the M bit. Every AVP this node builds does,
 /// except the few whose specification forbids it: GUSS-Timestamp, which
-/// TS 29.109 Table 6.1 lists with "V" under Must and "M" under Must not.
+/// TS 29.109 Table 6.1 lists with "V" under Must and "M" under Must not, and
+/// the four base AVPs RFC 6733 section 4.5 lists with M under "MUST NOT":
+/// Firmware-Revision (267), Product-Name (269), Error-Message (281) and
+/// Error-Reporting-Host (294).
 pub fn avp_is_mandatory(code: u32, vendor_id: u32) -> bool {
-    !(vendor_id == VENDOR_3GPP && code == avp::GUSS_TIMESTAMP)
+    const ERROR_REPORTING_HOST: u32 = 294;
+    match vendor_id {
+        VENDOR_3GPP => code != avp::GUSS_TIMESTAMP,
+        0 => !matches!(
+            code,
+            avp::FIRMWARE_REVISION | avp::PRODUCT_NAME | avp::ERROR_MESSAGE | ERROR_REPORTING_HOST
+        ),
+        _ => true,
+    }
 }
 
 /// Look up an AVP name by code (tries vendor=0, then vendor=10415).

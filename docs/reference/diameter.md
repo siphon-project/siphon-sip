@@ -25,6 +25,15 @@ are meant to be distinguishable at the peer:
 | `5012` DIAMETER_UNABLE_TO_COMPLY | siphon has a handler and could not carry it out: it raised, returned something that is not a `DiameterAnswer`, or produced an answer that would not serialize. Logged at `error` with the handler's name and the exception. |
 | `5014` DIAMETER_INVALID_AVP_LENGTH | The inbound message did not parse. |
 
+These three are the generic `answer-message` of RFC 6733 section 7.2, with the
+header E bit set and an `Error-Message` saying which case it was, because
+siphon cannot compose the answer of a command it has no handler's answer for.
+An answer the handler builds is different: `request.answer(code)` and
+`request.reject(code)` set the E bit for a protocol error (3xxx) only. A
+permanent failure (5xxx) a handler answers, such as `request.answer(5012)` to
+a Registration-Termination-Request for a user it does not serve, is an answer
+of the command and goes out with the bit clear (section 7.1.5).
+
 The 3002/5012 split matters most on Ro, where a `3002` to a CCR-UPDATE is read
 as a credit denial and the call is torn down. A handler that raises is a fault
 on siphon's side of the interface, not a decision about the subscriber's
