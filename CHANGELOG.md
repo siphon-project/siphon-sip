@@ -58,6 +58,17 @@ entry, but a working config keeps working.
   application-qualified filter matches on the Application-Id of the request,
   so a `"Gx:CCR"` handler and a `"Ro:CCR"` handler each see only their own. See
   `docs/reference/diameter.md`.
+- **`DiameterAnswer.insert_avp` appends an AVP to a script-built answer.**
+  `set_avp` removes every AVP with the same code and vendor before it adds
+  one, so an answer built with it could not carry the same AVP twice at the
+  top level, which several answers need: a Cx Multimedia-Auth-Answer has one
+  `SIP-Auth-Data-Item` per authentication vector (TS 29.229). `insert_avp`
+  takes the arguments `set_avp` takes (`code_or_name, value, vendor=0`), keeps
+  what is there and adds the AVP after it, so calling it once per occurrence
+  puts them on the wire in that order. `DiameterRequest` already had it, and
+  `set_avp` is unchanged. The SDK mock of `DiameterAnswer` follows: it keeps
+  AVPs in order and allows repeats, and its `remove_avp` returns how many AVPs
+  it removed, as siphon does, where it returned at most 1.
 
 ### Removed
 

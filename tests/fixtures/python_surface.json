@@ -562,6 +562,11 @@
         "kind": "method_descriptor",
         "sig": "($self, code_or_name, vendor=0)"
       },
+      "insert_avp": {
+        "doc": "Append an AVP, keeping the ones already there with its code and vendor.",
+        "kind": "method_descriptor",
+        "sig": "($self, code_or_name, value, vendor=0)"
+      },
       "is_error": {
         "kind": "getset_descriptor"
       },

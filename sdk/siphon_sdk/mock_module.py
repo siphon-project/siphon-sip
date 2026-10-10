@@ -6523,7 +6523,9 @@ class MockDiameterAnswer:
                  avps: Optional[dict] = None) -> None:
         self.result_code = result_code
         self.command_code = command_code
-        self._avps = dict(avps or {})
+        # An ordered list rather than a dict: an answer can carry the same AVP
+        # more than once, and the order is the order on the wire.
+        self._avps = [(key, value) for key, value in (avps or {}).items()]
 
     @property
     def is_error(self) -> bool:
@@ -6531,16 +6533,42 @@ class MockDiameterAnswer:
         return (3000 <= rc < 4000) or (5000 <= rc < 6000)
 
     def get_avp(self, code: int, vendor: int = 0):
-        return self._avps.get((code, vendor))
+        """The value of the first AVP with this code and vendor, or ``None``."""
+        for key, value in self._avps:
+            if key == (code, vendor):
+                return value
+        return None
 
     def set_avp(self, code_or_name, value, vendor: int = 0) -> None:
-        self._avps[(code_or_name, vendor)] = value
+        """Set an AVP, replacing every AVP with the same code and vendor."""
+        self.remove_avp(code_or_name, vendor)
+        self._avps.append(((code_or_name, vendor), value))
+
+    def insert_avp(self, code_or_name, value, vendor: int = 0) -> None:
+        """Append an AVP, keeping the ones already there with its code and vendor.
+
+        ``set_avp`` replaces: it removes every AVP of that code and vendor
+        first, so it cannot build an answer that carries the same AVP more
+        than once at the top level. Call ``insert_avp`` once per occurrence
+        for those, in the order they should go on the wire. The arguments are
+        the ones ``set_avp`` takes::
+
+            answer = req.answer(2001)
+            answer.set_avp("SIP-Number-Auth-Items", len(vectors))
+            for vector in vectors:
+                answer.insert_avp("SIP-Auth-Data-Item", vector)
+        """
+        self._avps.append(((code_or_name, vendor), value))
 
     def remove_avp(self, code: int, vendor: int = 0) -> int:
-        return 1 if self._avps.pop((code, vendor), None) is not None else 0
+        """Remove every AVP with this code and vendor; returns how many."""
+        kept = [(key, value) for key, value in self._avps if key != (code, vendor)]
+        removed = len(self._avps) - len(kept)
+        self._avps = kept
+        return removed
 
     def iter_avps(self) -> list:
-        return [(code, vendor, value) for (code, vendor), value in self._avps.items()]
+        return [(code, vendor, value) for (code, vendor), value in self._avps]
 
 
 # ── ISDN-AddressString / TBCD (3GPP TS 29.002 §17.7.8) ──────────────────────
@@ -6652,7 +6680,9 @@ class MockDiameterRequest:
     def answer(self, result_code: int = 2001, error_message: Optional[str] = None) -> MockDiameterAnswer:
         """Build a local answer to serve this request (HSS-style). Populate it
         with :meth:`MockDiameterAnswer.set_avp`, including grouped AVPs (pass a
-        list of ``(code, value[, vendor])`` child tuples as the value)."""
+        list of ``(code, value[, vendor])`` child tuples as the value), and
+        with :meth:`MockDiameterAnswer.insert_avp` for an AVP the answer
+        carries more than once."""
         return MockDiameterAnswer(result_code=result_code, command_code=self.command_code)
 
     def reject(self, result_code: int, error_message: Optional[str] = None) -> MockDiameterAnswer:
