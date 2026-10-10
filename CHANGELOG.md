@@ -82,6 +82,32 @@ entry, but a working config keeps working.
 
 ### Fixed
 
+- **An INVITE that returns to the B2BUA that dialled it is a new call (RFC 3261
+  §17.2.3, §16.3).** When siphon dialled a proxy and the proxy's routing
+  brought that INVITE back to the same instance, for the next party's services
+  for instance, siphon took it for a retransmission, because it knew the
+  Call-ID as a dialog it had dialled itself, and answered nothing: no `100`,
+  and the proxy gave up after 32 s. A request matches a server transaction by
+  its top Via branch, not by its Call-ID, and this one arrives on a branch of
+  the proxy's own. It is now served as a new call with its own caller dialog.
+  Only an INVITE whose Call-ID and From tag are those of a caller's dialog
+  siphon already serves is not a new call: on the same branch it is a
+  retransmission, absorbed and answered with the last provisional as before.
+  Two calls can then share a Call-ID, one as the dialog it dialled and one as
+  the dialog it answers, and every request on it (ACK, PRACK, UPDATE, INFO,
+  re-INVITE, REFER, NOTIFY, BYE, CANCEL) reaches the call it is for by its
+  tags: the To tag is siphon's own tag on exactly one of the two dialogs. A
+  call ending takes only its own Call-ID mapping with it. A script, a control
+  application or the admin API that names a call by a shared Call-ID gets the
+  call whose caller dialog it is. Routing that keeps returning a request to
+  the instance that dialled it stays bounded: each B-leg INVITE goes out with
+  the caller's `Max-Forwards` less one, and one that comes back at 0 is
+  refused `483 Too Many Hops`.
+- **A merged INVITE is answered `482 Loop Detected` (RFC 3261 §8.2.2.2).** A
+  caller's INVITE that arrives a second time on another Via branch, with the
+  same Call-ID, From tag and CSeq, was absorbed without a response. It is the
+  same request over a second path, and is now refused with 482 so that the
+  sender does not wait out its timer.
 - **The Diameter listener advertises its applications in the CEA, and refuses
   a peer that shares none (RFC 6733 §5.3).** The Capabilities-Exchange-Answer
   of a node with `diameter.listen` listed no application at all, so a strict

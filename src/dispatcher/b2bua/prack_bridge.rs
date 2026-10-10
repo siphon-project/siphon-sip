@@ -531,7 +531,7 @@ pub fn handle_callee_prack_response(
     let Some(b_leg_call_id) = message.headers.call_id().cloned() else {
         return;
     };
-    let Some(call_id) = state.call_actors.find_by_sip_call_id(&b_leg_call_id) else {
+    let Some(call_id) = state.call_actors.find_by_own_request(message) else {
         debug!(%b_leg_call_id, status = status_code, "B2BUA: response to a PRACK for a call that has ended");
         return;
     };

@@ -618,8 +618,15 @@ pub enum BLegStatus {
 /// call actor.
 #[derive(Debug)]
 pub struct LegRegistry {
-    /// SIP Call-ID → internal call ID (for matching inbound requests).
-    by_call_id: DashMap<String, String>,
+    /// SIP Call-ID → the calls a dialog with that Call-ID belongs to (for
+    /// matching inbound requests).
+    ///
+    /// Nearly always one. Two when an INVITE this node dialled is routed back
+    /// to it as a new call (RFC 3261 §16.3, a spiral): the Call-ID is then the
+    /// callee dialog of the call that dialled it and the caller dialog of the
+    /// call that received it, and a request on it belongs to one or the other
+    /// by its tags.
+    by_call_id: DashMap<String, Vec<CallIdOwner>>,
     /// Via branch → internal call ID (for matching responses).
     by_branch: DashMap<String, BranchEntry>,
     /// Via branch → the siphon-originated REFER that branch belongs to.
@@ -643,6 +650,16 @@ pub struct LegRegistry {
     /// is exactly wrong. This index gives the response path a first, explicit
     /// hook (checked before the leg-branch lookup) into the UAC-side handler.
     originated_calls: DashMap<String, BranchEntry>,
+}
+/// One call that has a dialog with a given SIP Call-ID.
+#[derive(Debug, Clone)]
+struct CallIdOwner {
+    /// The internal id of the call.
+    call_id: String,
+    /// Whether the Call-ID is that call's caller dialog (its A-leg), which is
+    /// the one a script, a control application and the admin API name the call
+    /// by.
+    caller_dialog: bool,
 }
 /// What the registry keeps for a Via branch siphon is matching responses on.
 #[derive(Debug)]
@@ -774,10 +791,23 @@ impl LegRegistry {
             .retain(|_, refer| refer.call_id.as_str() != internal_id);
     }
 
-    /// Register a SIP Call-ID → internal call ID mapping.
-    pub fn register_call_id(&self, sip_call_id: &str, internal_id: &str) {
-        self.by_call_id
-            .insert(sip_call_id.to_string(), internal_id.to_string());
+    /// Register a SIP Call-ID → internal call ID mapping, for the dialog on
+    /// `side` of that call.
+    ///
+    /// Adds to whatever the Call-ID already maps to: another call that has a
+    /// dialog with the same Call-ID keeps its own entry. Registering a call a
+    /// second time changes nothing, except that a Call-ID first seen on a
+    /// callee dialog becomes the caller dialog's once that registers it.
+    pub fn register_call_id(&self, sip_call_id: &str, internal_id: &str, side: LegSide) {
+        let caller_dialog = side == LegSide::A;
+        let mut owners = self.by_call_id.entry(sip_call_id.to_string()).or_default();
+        match owners.iter_mut().find(|owner| owner.call_id == internal_id) {
+            Some(owner) => owner.caller_dialog |= caller_dialog,
+            None => owners.push(CallIdOwner {
+                call_id: internal_id.to_string(),
+                caller_dialog,
+            }),
+        }
     }
 
     /// Register a Via branch → internal call ID mapping.
@@ -787,8 +817,36 @@ impl LegRegistry {
     }
 
     /// Look up internal call ID by SIP Call-ID.
+    ///
+    /// When two calls have a dialog with this Call-ID, the one whose caller
+    /// dialog it is: that is the call the Call-ID names everywhere outside a
+    /// SIP message. A request or response is matched with its tags instead,
+    /// see [`Self::lookup_call_ids`].
     pub fn lookup_call_id(&self, sip_call_id: &str) -> Option<String> {
-        self.by_call_id.get(sip_call_id).map(|v| v.clone())
+        let owners = self.by_call_id.get(sip_call_id)?;
+        owners
+            .iter()
+            .find(|owner| owner.caller_dialog)
+            .or_else(|| owners.first())
+            .map(|owner| owner.call_id.clone())
+    }
+
+    /// Every call that has a dialog with this SIP Call-ID, the one whose caller
+    /// dialog it is first.
+    pub fn lookup_call_ids(&self, sip_call_id: &str) -> Vec<String> {
+        let Some(owners) = self.by_call_id.get(sip_call_id) else {
+            return Vec::new();
+        };
+        let mut ids: Vec<String> = Vec::with_capacity(owners.len());
+        for caller_dialog in [true, false] {
+            ids.extend(
+                owners
+                    .iter()
+                    .filter(|owner| owner.caller_dialog == caller_dialog)
+                    .map(|owner| owner.call_id.clone()),
+            );
+        }
+        ids
     }
 
     /// Look up internal call ID by Via branch.
@@ -798,9 +856,14 @@ impl LegRegistry {
             .map(|entry| entry.call_id.clone())
     }
 
-    /// Remove a SIP Call-ID mapping.
-    pub fn remove_call_id(&self, sip_call_id: &str) {
-        self.by_call_id.remove(sip_call_id);
+    /// Remove one call's mapping for a SIP Call-ID. Another call that has a
+    /// dialog with the same Call-ID keeps its own.
+    pub fn remove_call_id(&self, sip_call_id: &str, internal_id: &str) {
+        if let Some(mut owners) = self.by_call_id.get_mut(sip_call_id) {
+            owners.retain(|owner| owner.call_id != internal_id);
+        }
+        self.by_call_id
+            .remove_if(sip_call_id, |_, owners| owners.is_empty());
     }
 
     /// Remove a branch mapping.
@@ -811,7 +874,10 @@ impl LegRegistry {
     /// Remove all mappings for a call (Call-IDs + branches).
     pub fn remove_all_for_call(&self, internal_id: &str) {
         // Remove all Call-ID mappings for this call
-        self.by_call_id.retain(|_, v| v.as_str() != internal_id);
+        self.by_call_id.retain(|_, owners| {
+            owners.retain(|owner| owner.call_id != internal_id);
+            !owners.is_empty()
+        });
         // Remove all branch mappings for this call
         self.by_branch
             .retain(|_, entry| entry.call_id != internal_id);
@@ -828,7 +894,17 @@ impl LegRegistry {
 
     /// Number of registered calls (unique internal IDs in Call-ID map).
     pub fn call_count(&self) -> usize {
-        let mut ids: Vec<String> = self.by_call_id.iter().map(|e| e.value().clone()).collect();
+        let mut ids: Vec<String> = self
+            .by_call_id
+            .iter()
+            .flat_map(|entry| {
+                entry
+                    .value()
+                    .iter()
+                    .map(|owner| owner.call_id.clone())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
         ids.sort();
         ids.dedup();
         ids.len()
