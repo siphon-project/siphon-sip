@@ -265,6 +265,70 @@ fn msg_get_avp<'py>(
     }
 }
 
+/// One AVP of a message with its fields by name, as `avps()` lists them.
+///
+/// `iter_avps` yields `(code, vendor, value)` tuples and the members of a
+/// grouped AVP are `(code, value, vendor)` tuples, so a handler that unpacks
+/// one in the order of the other compares a value with a vendor id. Here the
+/// fields are attributes, the same at every level: the `value` of a grouped
+/// AVP is a list of `DiameterAvp`.
+#[pyclass(name = "DiameterAvp", frozen, skip_from_py_object)]
+pub struct PyDiameterAvp {
+    /// The AVP code.
+    #[pyo3(get)]
+    code: u32,
+    /// The Vendor-Id, 0 for a base AVP.
+    #[pyo3(get)]
+    vendor: u32,
+    /// The dictionary name, or None for an AVP the dictionary does not know.
+    #[pyo3(get)]
+    name: Option<String>,
+    /// The value as `get_avp` returns it, or for a grouped AVP a list of
+    /// `DiameterAvp`.
+    #[pyo3(get)]
+    value: Py<PyAny>,
+}
+
+#[pymethods]
+impl PyDiameterAvp {
+    fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
+        let name = match &self.name {
+            Some(name) => format!("'{name}'"),
+            None => "None".to_string(),
+        };
+        Ok(format!(
+            "DiameterAvp(name={name}, code={}, vendor={}, value={})",
+            self.code,
+            self.vendor,
+            self.value.bind(py).repr()?
+        ))
+    }
+}
+
+fn named_avp(py: Python<'_>, avp: &Avp) -> PyResult<Py<PyDiameterAvp>> {
+    let value = match &avp.value {
+        AvpData::Grouped(children) => named_avps(py, children)?.into_any().unbind(),
+        AvpData::Raw(_) => avp_to_py(py, avp.code, avp.vendor, avp)?.unbind(),
+    };
+    Py::new(
+        py,
+        PyDiameterAvp {
+            code: avp.code,
+            vendor: avp.vendor,
+            name: dictionary::lookup_avp(avp.code, avp.vendor).map(|def| def.name.to_string()),
+            value,
+        },
+    )
+}
+
+fn named_avps<'py>(py: Python<'py>, avps: &[Avp]) -> PyResult<Bound<'py, PyList>> {
+    let list = PyList::empty(py);
+    for avp in avps {
+        list.append(named_avp(py, avp)?)?;
+    }
+    Ok(list)
+}
+
 fn msg_iter_avps<'py>(py: Python<'py>, msg: &DiameterMsg) -> PyResult<Bound<'py, PyList>> {
     let mut rows: Vec<(u32, u32, Bound<'py, PyAny>)> = Vec::with_capacity(msg.avps.len());
     for avp in &msg.avps {
@@ -394,9 +458,30 @@ impl PyDiameterAnswer {
         msg_get_avp(py, &guard, code, vendor)
     }
 
+    /// The top-level AVPs as `(code, vendor, value)` tuples, in wire order.
+    ///
+    /// **The members of a grouped AVP are in another order**: its `value` is
+    /// a list of `(code, value, vendor)` tuples, the shape `set_avp` takes
+    /// for a child. Unpacking one in the order of the other compares a value
+    /// with a vendor id and matches nothing. `avps()` lists the same AVPs
+    /// with the fields by name.
     fn iter_avps<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
         let guard = self.lock()?;
         msg_iter_avps(py, &guard)
+    }
+
+    /// The top-level AVPs as `DiameterAvp` objects, in wire order: `.code`,
+    /// `.vendor`, `.name` (None when the dictionary does not know the AVP)
+    /// and `.value`, which for a grouped AVP is a list of `DiameterAvp`.
+    ///
+    /// ```python,ignore
+    /// for avp in request.avps():
+    ///     if avp.name == "Deregistration-Reason":
+    ///         reason = {member.name: member.value for member in avp.value}
+    /// ```
+    fn avps<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        let guard = self.lock()?;
+        named_avps(py, &guard.avps)
     }
 
     #[pyo3(signature = (code_or_name, value, vendor=0))]
@@ -581,9 +666,30 @@ impl PyDiameterRequest {
         msg_get_avp(py, &guard, code, vendor)
     }
 
+    /// The top-level AVPs as `(code, vendor, value)` tuples, in wire order.
+    ///
+    /// **The members of a grouped AVP are in another order**: its `value` is
+    /// a list of `(code, value, vendor)` tuples, the shape `set_avp` takes
+    /// for a child. Unpacking one in the order of the other compares a value
+    /// with a vendor id and matches nothing. `avps()` lists the same AVPs
+    /// with the fields by name.
     fn iter_avps<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
         let guard = self.lock()?;
         msg_iter_avps(py, &guard)
+    }
+
+    /// The top-level AVPs as `DiameterAvp` objects, in wire order: `.code`,
+    /// `.vendor`, `.name` (None when the dictionary does not know the AVP)
+    /// and `.value`, which for a grouped AVP is a list of `DiameterAvp`.
+    ///
+    /// ```python,ignore
+    /// for avp in request.avps():
+    ///     if avp.name == "Deregistration-Reason":
+    ///         reason = {member.name: member.value for member in avp.value}
+    /// ```
+    fn avps<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        let guard = self.lock()?;
+        named_avps(py, &guard.avps)
     }
 
     #[pyo3(signature = (code_or_name, value, vendor=0))]
@@ -919,6 +1025,161 @@ mod tests {
             let request = py_request();
             let rows = request.iter_avps(py).unwrap();
             assert_eq!(rows.len(), 4);
+        });
+    }
+
+    // ── avps(): every field by name ──────────────────────────────────────
+
+    /// A Cx Registration-Termination-Request with a top-level 3GPP AVP and a
+    /// grouped one, the way a handler receives it.
+    fn registration_termination_request() -> PyDiameterRequest {
+        let reason = Avp {
+            code: 615,
+            vendor: dictionary::VENDOR_3GPP,
+            flags: crate::diameter::codec::AVP_FLAG_MANDATORY
+                | crate::diameter::codec::AVP_FLAG_VENDOR,
+            value: AvpData::Grouped(vec![
+                Avp::u32(616, dictionary::VENDOR_3GPP, 0),
+                Avp::utf8(617, dictionary::VENDOR_3GPP, "subscription ended"),
+            ]),
+        };
+        PyDiameterRequest::new(
+            DiameterMsg {
+                flags: FLAG_REQUEST | FLAG_PROXIABLE,
+                command_code: dictionary::CMD_REGISTRATION_TERMINATION,
+                application_id: dictionary::CX_APP_ID,
+                hop_by_hop: 1,
+                end_to_end: 2,
+                avps: vec![
+                    Avp::utf8(dictionary::avp::SESSION_ID, 0, "hss;1;1"),
+                    Avp::utf8(
+                        dictionary::avp::PUBLIC_IDENTITY,
+                        dictionary::VENDOR_3GPP,
+                        "sip:001010000000001@ims.mnc001.mcc001.3gppnetwork.org",
+                    ),
+                    reason,
+                    // An AVP the dictionary does not know.
+                    Avp::raw(59_999, 99_999, vec![0xde, 0xad]),
+                ],
+            },
+            PyInboundPeer {
+                name: "hss".into(),
+                tenant: "default".into(),
+                addr: "192.0.2.7:3868".into(),
+                transport: "tcp".into(),
+            },
+            "scscf.ims.mnc001.mcc001.3gppnetwork.org".into(),
+            "ims.mnc001.mcc001.3gppnetwork.org".into(),
+        )
+    }
+
+    /// The two documented tuple shapes, pinned side by side because they
+    /// differ: `iter_avps` yields `(code, vendor, value)` at the top level,
+    /// and the members of a grouped AVP are `(code, value, vendor)`, which is
+    /// the shape `set_avp` takes for a child. Neither can change without
+    /// breaking scripts, which is why `avps` exists.
+    #[test]
+    fn iter_avps_and_group_members_keep_their_documented_tuple_orders() {
+        pyo3::Python::initialize();
+        Python::attach(|py| {
+            let request = registration_termination_request();
+            let rows = request.iter_avps(py).unwrap();
+
+            let (code, vendor, value): (u32, u32, String) =
+                rows.get_item(1).unwrap().extract().unwrap();
+            assert_eq!((code, vendor), (601, 10415));
+            assert!(value.starts_with("sip:"));
+
+            let (code, vendor, members): (u32, u32, Bound<'_, PyList>) =
+                rows.get_item(2).unwrap().extract().unwrap();
+            assert_eq!((code, vendor), (615, 10415));
+            let (member_code, member_value, member_vendor): (u32, u32, u32) =
+                members.get_item(0).unwrap().extract().unwrap();
+            assert_eq!((member_code, member_value, member_vendor), (616, 0, 10415));
+        });
+    }
+
+    /// `avps()` names the fields, the same way at every level, so no handler
+    /// has to remember which position holds the vendor.
+    #[test]
+    fn avps_names_every_field_at_every_level() {
+        pyo3::Python::initialize();
+        Python::attach(|py| {
+            let request = Py::new(py, registration_termination_request()).unwrap();
+            let avps = request.bind(py).call_method0("avps").unwrap();
+            assert_eq!(avps.len().unwrap(), 4);
+            let number = |avp: &Bound<'_, PyAny>, field: &str| -> u32 {
+                avp.getattr(field).unwrap().extract().unwrap()
+            };
+            let text = |avp: &Bound<'_, PyAny>, field: &str| -> String {
+                avp.getattr(field).unwrap().extract().unwrap()
+            };
+
+            let session = avps.get_item(0).unwrap();
+            assert_eq!(number(&session, "code"), 263);
+            assert_eq!(number(&session, "vendor"), 0);
+            assert_eq!(text(&session, "name"), "Session-Id");
+            assert_eq!(text(&session, "value"), "hss;1;1");
+
+            let identity = avps.get_item(1).unwrap();
+            assert_eq!(number(&identity, "code"), 601);
+            assert_eq!(number(&identity, "vendor"), 10415);
+            assert_eq!(text(&identity, "name"), "Public-Identity");
+            assert_eq!(
+                text(&identity, "value"),
+                "sip:001010000000001@ims.mnc001.mcc001.3gppnetwork.org"
+            );
+
+            // A grouped AVP: its value is a list of the same objects.
+            let reason = avps.get_item(2).unwrap();
+            assert_eq!(text(&reason, "name"), "Deregistration-Reason");
+            let members = reason.getattr("value").unwrap();
+            assert_eq!(members.len().unwrap(), 2);
+            let code = members.get_item(0).unwrap();
+            assert_eq!(number(&code, "code"), 616);
+            assert_eq!(number(&code, "vendor"), 10415);
+            assert_eq!(text(&code, "name"), "Reason-Code");
+            assert_eq!(number(&code, "value"), 0);
+            let info = members.get_item(1).unwrap();
+            assert_eq!(number(&info, "code"), 617);
+            assert_eq!(number(&info, "vendor"), 10415);
+            assert_eq!(text(&info, "value"), "subscription ended");
+
+            // An AVP the dictionary does not know has no name and raw bytes.
+            let unknown = avps.get_item(3).unwrap();
+            assert_eq!(number(&unknown, "code"), 59_999);
+            assert_eq!(number(&unknown, "vendor"), 99_999);
+            assert!(unknown.getattr("name").unwrap().is_none());
+            let bytes: Vec<u8> = unknown.getattr("value").unwrap().extract().unwrap();
+            assert_eq!(bytes, [0xde, 0xad]);
+
+            assert_eq!(
+                identity.repr().unwrap().to_string(),
+                "DiameterAvp(name='Public-Identity', code=601, vendor=10415, \
+                 value='sip:001010000000001@ims.mnc001.mcc001.3gppnetwork.org')"
+            );
+        });
+    }
+
+    #[test]
+    fn an_answer_lists_its_avps_the_same_way() {
+        pyo3::Python::initialize();
+        Python::attach(|py| {
+            let answer = registration_termination_request()
+                .answer(2001, None)
+                .unwrap();
+            let answer = Py::new(py, answer).unwrap();
+            let avps = answer.bind(py).call_method0("avps").unwrap();
+            let names: Vec<Option<String>> = avps
+                .try_iter()
+                .unwrap()
+                .map(|avp| avp.unwrap().getattr("name").unwrap().extract().unwrap())
+                .collect();
+            assert_eq!(
+                names,
+                ["Session-Id", "Result-Code", "Origin-Host", "Origin-Realm"]
+                    .map(|name| Some(name.to_string()))
+            );
         });
     }
 

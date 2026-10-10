@@ -6516,6 +6516,42 @@ class MockPeerPool:
         return len(self._live())
 
 
+class MockDiameterAvp:
+    """Mock ``DiameterAvp``: one AVP with its fields by name, as
+    ``request.avps()`` / ``answer.avps()`` list them.
+
+    ``iter_avps`` yields ``(code, vendor, value)`` tuples and the members of a
+    grouped AVP are ``(code, value, vendor)`` tuples, so a handler that
+    unpacks one in the order of the other compares a value with a vendor id.
+    Here the fields are attributes, the same at every level.
+
+    Attributes:
+        code: The AVP code.
+        vendor: The Vendor-Id, ``0`` for a base AVP.
+        name: The dictionary name, or ``None`` for an AVP the dictionary does
+            not know. The mock has no dictionary: an AVP stored under a name
+            has that name and the name as its ``code``, one stored under a
+            number has no name.
+        value: The value as ``get_avp`` returns it, or for a grouped AVP a
+            list of ``DiameterAvp``.
+    """
+
+    def __init__(self, code, vendor: int, value) -> None:
+        self.code = code
+        self.vendor = vendor
+        self.name = code if isinstance(code, str) else None
+        if isinstance(value, list):
+            value = [
+                MockDiameterAvp(child[0], child[2] if len(child) > 2 else 0, child[1])
+                for child in value
+            ]
+        self.value = value
+
+    def __repr__(self) -> str:
+        return (f"DiameterAvp(name={self.name!r}, code={self.code!r}, "
+                f"vendor={self.vendor!r}, value={self.value!r})")
+
+
 class MockDiameterAnswer:
     """Mock ``DiameterAnswer`` — the value a handler returns / forwards."""
 
@@ -6568,7 +6604,21 @@ class MockDiameterAnswer:
         return removed
 
     def iter_avps(self) -> list:
+        """The top-level AVPs as ``(code, vendor, value)`` tuples, in wire order.
+
+        **The members of a grouped AVP are in another order**: its ``value``
+        is a list of ``(code, value, vendor)`` tuples, the shape ``set_avp``
+        takes for a child. Unpacking one in the order of the other compares a
+        value with a vendor id and matches nothing. :meth:`avps` lists the
+        same AVPs with the fields by name.
+        """
         return [(code, vendor, value) for (code, vendor), value in self._avps]
+
+    def avps(self) -> list:
+        """The top-level AVPs as :class:`MockDiameterAvp` objects, in wire
+        order: ``.code``, ``.vendor``, ``.name`` and ``.value``, which for a
+        grouped AVP is a list of the same objects."""
+        return [MockDiameterAvp(code, vendor, value) for (code, vendor), value in self._avps]
 
 
 # ── ISDN-AddressString / TBCD (3GPP TS 29.002 §17.7.8) ──────────────────────
@@ -6672,7 +6722,25 @@ class MockDiameterRequest:
         return 1 if self._avps.pop((code, vendor), None) is not None else 0
 
     def iter_avps(self) -> list:
+        """The top-level AVPs as ``(code, vendor, value)`` tuples, in wire order.
+
+        **The members of a grouped AVP are in another order**: its ``value``
+        is a list of ``(code, value, vendor)`` tuples, the shape ``set_avp``
+        takes for a child. Unpacking one in the order of the other compares a
+        value with a vendor id and matches nothing. :meth:`avps` lists the
+        same AVPs with the fields by name::
+
+            for avp in request.avps():
+                if avp.name == "Deregistration-Reason":
+                    reason = {member.name: member.value for member in avp.value}
+        """
         return [(code, vendor, value) for (code, vendor), value in self._avps.items()]
+
+    def avps(self) -> list:
+        """The top-level AVPs as :class:`MockDiameterAvp` objects, in wire
+        order: ``.code``, ``.vendor``, ``.name`` and ``.value``, which for a
+        grouped AVP is a list of the same objects."""
+        return [MockDiameterAvp(code, vendor, value) for (code, vendor), value in self._avps.items()]
 
     def extract_imsi(self) -> Optional[str]:
         return self._avps.get((1, 0))

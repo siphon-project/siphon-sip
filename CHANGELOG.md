@@ -70,6 +70,19 @@ entry, but a working config keeps working.
   AVPs in order and allows repeats, and its `remove_avp` returns how many AVPs
   it removed, as siphon does, where it returned at most 1.
 
+- **`DiameterRequest.avps()` and `DiameterAnswer.avps()` list AVPs with their
+  fields by name.** Each entry is a `DiameterAvp` with `.code`, `.vendor`,
+  `.name` (`None` when the dictionary does not know the AVP) and `.value`,
+  which for a grouped AVP is a list of `DiameterAvp`. It is there because the
+  two tuple shapes of the existing calls differ and are easy to mix up:
+  `iter_avps()` yields `(code, vendor, value)` for a top-level AVP, and the
+  members of a grouped AVP are `(code, value, vendor)`, the shape `set_avp`
+  takes for a child. A handler that unpacks a member in the top-level order
+  compares a value with a vendor id and matches nothing. Both orders are
+  documented behaviour that scripts depend on, so neither changed; the
+  docstrings of `iter_avps` and `docs/reference/diameter.md` now say so. The
+  SDK mock has `avps()` and `MockDiameterAvp`.
+
 ### Removed
 
 - **`ro.charge_message` is gone.** It was documented as one-shot charging of

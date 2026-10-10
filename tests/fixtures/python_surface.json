@@ -555,6 +555,11 @@
       }
     },
     "DiameterAnswer": {
+      "avps": {
+        "doc": "The top-level AVPs as `DiameterAvp` objects, in wire order: `.code`,",
+        "kind": "method_descriptor",
+        "sig": "($self)"
+      },
       "command_code": {
         "kind": "getset_descriptor"
       },
@@ -571,6 +576,7 @@
         "kind": "getset_descriptor"
       },
       "iter_avps": {
+        "doc": "The top-level AVPs as `(code, vendor, value)` tuples, in wire order.",
         "kind": "method_descriptor",
         "sig": "($self)"
       },
@@ -584,6 +590,24 @@
       "set_avp": {
         "kind": "method_descriptor",
         "sig": "($self, code_or_name, value, vendor=0)"
+      }
+    },
+    "DiameterAvp": {
+      "code": {
+        "doc": "The AVP code.",
+        "kind": "getset_descriptor"
+      },
+      "name": {
+        "doc": "The dictionary name, or None for an AVP the dictionary does not know.",
+        "kind": "getset_descriptor"
+      },
+      "value": {
+        "doc": "The value as `get_avp` returns it, or for a grouped AVP a list of",
+        "kind": "member_descriptor"
+      },
+      "vendor": {
+        "doc": "The Vendor-Id, 0 for a base AVP.",
+        "kind": "getset_descriptor"
       }
     },
     "DiameterEventSink": {
@@ -831,6 +855,11 @@
       "application_name": {
         "kind": "getset_descriptor"
       },
+      "avps": {
+        "doc": "The top-level AVPs as `DiameterAvp` objects, in wire order: `.code`,",
+        "kind": "method_descriptor",
+        "sig": "($self)"
+      },
       "command_code": {
         "kind": "getset_descriptor"
       },
@@ -868,6 +897,7 @@
         "kind": "getset_descriptor"
       },
       "iter_avps": {
+        "doc": "The top-level AVPs as `(code, vendor, value)` tuples, in wire order.",
         "kind": "method_descriptor",
         "sig": "($self)"
       },
