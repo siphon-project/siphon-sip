@@ -4565,6 +4565,54 @@ mod tests {
     // -----------------------------------------------------------------
 
     #[test]
+    fn on_request_accepts_a_gx_qualified_filter() {
+        pyo3::Python::initialize();
+        pyo3::Python::attach(|python| {
+            // Validation alone: nothing is registered until the returned
+            // decorator is applied to a function.
+            for filter in ["Gx:CCR", "gx:ccr", "GX:CCR|RAR", " Gx : Credit-Control "] {
+                validate_request_filter(filter)
+                    .unwrap_or_else(|error| panic!("{filter:?} must validate: {error}"));
+                let argument = pyo3::types::PyString::new(python, filter).into_any();
+                let decorator = PyDiameter::on_request(python, Some(argument))
+                    .unwrap_or_else(|error| panic!("{filter:?} must be accepted: {error}"));
+                assert!(decorator.is_callable(), "{filter}");
+            }
+        });
+    }
+
+    #[test]
+    fn on_request_still_rejects_an_unknown_application() {
+        pyo3::Python::initialize();
+        pyo3::Python::attach(|python| {
+            let argument = pyo3::types::PyString::new(python, "Gz:CCR").into_any();
+            let error = PyDiameter::on_request(python, Some(argument))
+                .expect_err("an unknown application must not register");
+            assert!(error.is_instance_of::<pyo3::exceptions::PyValueError>(python));
+            let message = format!("{error}");
+            assert!(
+                message.contains("unknown Diameter application in on_request filter: \"Gz\""),
+                "message: {message}"
+            );
+        });
+    }
+
+    #[test]
+    fn send_request_accepts_the_gx_application_name() {
+        // With no peer connected the call resolves to None, which it only
+        // reaches once the command and application names have both resolved.
+        pyo3::Python::initialize();
+        let manager = Arc::new(DiameterManager::new());
+        let py_diameter = PyDiameter::new(manager);
+        pyo3::Python::attach(|python| {
+            let result = py_diameter
+                .send_request(python, "Re-Auth-Request", "Gx", None, 10_000, None)
+                .unwrap();
+            assert!(resolve(python, result).is_none());
+        });
+    }
+
+    #[test]
     fn send_request_rejects_unknown_command() {
         pyo3::Python::initialize();
         let manager = Arc::new(DiameterManager::new());

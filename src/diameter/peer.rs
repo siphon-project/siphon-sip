@@ -1063,6 +1063,79 @@ mod tests {
         assert_eq!(vsai_count, 1, "exactly one VSAI (the vendor-10415 Cx app)");
     }
 
+    /// The exact octets of a Vendor-Specific-Application-Id advertising Gx,
+    /// written out from RFC 6733 §4.1 / §6.11 and TS 29.212 §5.1 rather than
+    /// produced by the encoder under test: Vendor-Id 10415 (0x28AF) and
+    /// Auth-Application-Id 16777238 (0x01000016).
+    const GX_VENDOR_SPECIFIC_APPLICATION_ID: [u8; 32] = [
+        0x00, 0x00, 0x01, 0x04, 0x40, 0x00, 0x00, 0x20, // 260, M, length 32
+        0x00, 0x00, 0x01, 0x0a, 0x40, 0x00, 0x00, 0x0c, // 266 Vendor-Id, M, 12
+        0x00, 0x00, 0x28, 0xaf, // 10415
+        0x00, 0x00, 0x01, 0x02, 0x40, 0x00, 0x00, 0x0c, // 258 Auth-Application-Id
+        0x01, 0x00, 0x00, 0x16, // 16777238
+    ];
+
+    fn gx_and_ro_config() -> PeerConfig {
+        PeerConfig {
+            host: "pcrf.example.org".to_string(),
+            port: 3868,
+            origin_host: "siphon.example.org".to_string(),
+            origin_realm: "example.org".to_string(),
+            destination_host: None,
+            destination_realm: "example.org".to_string(),
+            local_ip: "192.0.2.1".parse().unwrap(),
+            application_ids: vec![
+                (dictionary::VENDOR_3GPP, dictionary::GX_APP_ID),
+                (0, dictionary::RO_APP_ID),
+            ],
+            watchdog_interval: 30,
+            reconnect_delay: 5,
+            product_name: "SIPhon".to_string(),
+            firmware_revision: 1,
+        }
+    }
+
+    /// Gx is advertised the way every 3GPP auth application is: once inside a
+    /// Vendor-Specific-Application-Id with Vendor-Id 10415, never as an
+    /// Acct-Application-Id.
+    fn assert_advertises_gx(wire: &[u8]) {
+        assert!(
+            wire.windows(GX_VENDOR_SPECIFIC_APPLICATION_ID.len())
+                .any(|window| window == GX_VENDOR_SPECIFIC_APPLICATION_ID),
+            "no Vendor-Specific-Application-Id for Gx in {}",
+            hex::encode(wire)
+        );
+
+        let tree = codec::DiameterMsg::from_wire(wire).expect("decode capabilities exchange");
+        let groups: Vec<_> = tree
+            .find_all(avp::VENDOR_SPECIFIC_APPLICATION_ID, 0)
+            .collect();
+        assert_eq!(groups.len(), 1, "Ro is a base application, so one VSAI");
+
+        let auth: Vec<u32> = tree
+            .find_all(avp::AUTH_APPLICATION_ID, 0)
+            .filter_map(|a| a.as_u32())
+            .collect();
+        assert!(auth.contains(&dictionary::GX_APP_ID), "got {auth:?}");
+        assert!(auth.contains(&dictionary::RO_APP_ID), "got {auth:?}");
+        assert_eq!(
+            tree.find_all(avp::ACCT_APPLICATION_ID, 0).count(),
+            0,
+            "neither Gx nor Ro is an accounting application"
+        );
+    }
+
+    #[test]
+    fn cer_advertises_gx_as_a_3gpp_auth_application() {
+        assert_advertises_gx(&build_cer(&gx_and_ro_config(), 1, 1));
+    }
+
+    #[test]
+    fn cea_advertises_gx_as_a_3gpp_auth_application() {
+        let cea = build_cea(&gx_and_ro_config(), dictionary::DIAMETER_SUCCESS, 1, 1);
+        assert_advertises_gx(&cea);
+    }
+
     /// Build a throwaway `PeerConfig` for the loopback leak tests. The watchdog
     /// interval is set far longer than any test runs so no DWR is injected into
     /// the `pending` map to perturb the assertions.

@@ -1853,12 +1853,13 @@ pub const VENDOR_3GPP: u32 = 10415;
 
 /// Resolve an application name (case-insensitive) to its
 /// `(vendor_id, app_id)` tuple. Accepts the canonical short form
-/// (`"Cx"`, `"Sh"`, `"Rx"`, `"Ro"`, `"Rf"`, `"S6c"`, `"SGd"`).
+/// (`"Cx"`, `"Sh"`, `"Gx"`, `"Rx"`, `"Ro"`, `"Rf"`, `"S6c"`, `"SGd"`, `"S6a"`).
 pub fn app_id_by_name(name: &str) -> Option<(u32, u32)> {
     let lower = name.to_ascii_lowercase();
     match lower.as_str() {
         "cx" => Some((VENDOR_3GPP, CX_APP_ID)),
         "sh" => Some((VENDOR_3GPP, SH_APP_ID)),
+        "gx" => Some((VENDOR_3GPP, GX_APP_ID)),
         "rx" => Some((VENDOR_3GPP, RX_APP_ID)),
         "ro" => Some((0, RO_APP_ID)),
         "rf" => Some((0, RF_APP_ID)),
@@ -1873,7 +1874,7 @@ pub fn app_id_by_name(name: &str) -> Option<(u32, u32)> {
 /// advertised in the CER/CEA via `Acct-Application-Id (259)` rather than
 /// `Auth-Application-Id (258)` (RFC 6733 §2.4 / §6.9). Today only base
 /// accounting — Rf (id 3) — is an accounting application; every other app
-/// SIPhon speaks (Cx/Sh/Rx/Ro/S6a/S6c/SGd) is an auth application. Advertising
+/// SIPhon speaks (Cx/Sh/Gx/Rx/Ro/S6a/S6c/SGd) is an auth application. Advertising
 /// an accounting app as an auth app makes strict peers (freeDiameter,
 /// go-diameter/CGRateS) answer `DIAMETER_NO_COMMON_APPLICATION`.
 pub fn is_accounting_application(app_id: u32) -> bool {
@@ -1887,6 +1888,7 @@ pub fn app_name_by_id(app_id: u32) -> Option<&'static str> {
     match app_id {
         CX_APP_ID => Some("Cx"),
         SH_APP_ID => Some("Sh"),
+        GX_APP_ID => Some("Gx"),
         RX_APP_ID => Some("Rx"),
         RO_APP_ID => Some("Ro"),
         RF_APP_ID => Some("Rf"),
@@ -2770,7 +2772,7 @@ mod tests {
 
     #[test]
     fn app_id_by_name_round_trips() {
-        for app in &["Cx", "Sh", "Rx", "Ro", "Rf", "S6c", "SGd"] {
+        for app in &["Cx", "Sh", "Gx", "Rx", "Ro", "Rf", "S6c", "SGd"] {
             let (vendor, app_id) = app_id_by_name(app).expect("app must resolve");
             let _ = vendor;
             let resolved = app_name_by_id(app_id).expect("app id must resolve");
@@ -2784,6 +2786,28 @@ mod tests {
         assert_eq!(app_id_by_name("s6c"), app_id_by_name("S6c"));
         assert_eq!(app_id_by_name("SGD"), app_id_by_name("sgd"));
         assert!(app_id_by_name("not-an-app").is_none());
+    }
+
+    #[test]
+    fn gx_resolves_to_the_3gpp_application_id() {
+        // TS 29.212 §5.1: Gx is vendor-specific to 3GPP (10415) with
+        // application id 16777238.
+        for name in ["Gx", "gx", "GX", "gX"] {
+            assert_eq!(app_id_by_name(name), Some((10415, 16_777_238)), "{name}");
+        }
+        assert_eq!(app_name_by_id(16_777_238), Some("Gx"));
+        // The neighbouring ids belong to other applications and must not be
+        // mistaken for Gx (Rx is 16777236).
+        assert_eq!(app_name_by_id(16_777_236), Some("Rx"));
+        assert_eq!(app_name_by_id(16_777_237), None);
+    }
+
+    #[test]
+    fn gx_is_an_auth_application() {
+        // Gx credit control runs over the RFC 4006 command set, but the
+        // application itself is advertised as Auth-Application-Id.
+        assert!(!is_accounting_application(GX_APP_ID));
+        assert!(is_accounting_application(RF_APP_ID));
     }
 
     #[test]

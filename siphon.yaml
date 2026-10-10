@@ -1971,7 +1971,8 @@ auth:
 # the routing table to select which peer(s) handle each application interface.
 #
 # Supported applications: cx (HSS auth/reg), sh (HSS user data),
-#   ro (online charging), rf (offline charging), rx (QoS policy).
+#   ro (online charging), rf (offline charging), rx (QoS policy),
+#   gx (policy and charging control).
 #
 # diameter:
 #   origin_host: "siphon.ims.example.com"

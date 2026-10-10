@@ -4035,6 +4035,61 @@ fn diameter_peers_for_application() {
 }
 
 #[test]
+fn diameter_route_accepts_the_gx_application() {
+    let yaml = concat!(
+        "listen:\n",
+        "  udp:\n",
+        "    - \"0.0.0.0:5060\"\n",
+        "domain:\n",
+        "  local:\n",
+        "    - \"example.org\"\n",
+        "script:\n",
+        "  path: \"scripts/proxy_default.py\"\n",
+        "diameter:\n",
+        "  origin_host: \"siphon.example.org\"\n",
+        "  origin_realm: \"example.org\"\n",
+        "  peers:\n",
+        "    - name: \"pcrf1\"\n",
+        "      host: \"pcrf1.example.org\"\n",
+        "      destination_realm: \"example.org\"\n",
+        "    - name: \"ocs1\"\n",
+        "      host: \"ocs1.example.org\"\n",
+        "      destination_realm: \"example.org\"\n",
+        "  routes:\n",
+        "    - application: gx\n",
+        "      peers: [\"pcrf1\"]\n",
+        "    - application: rx\n",
+        "      peers: [\"pcrf1\"]\n",
+        "    - application: ro\n",
+        "      peers: [\"ocs1\"]\n",
+    );
+    let config = Config::from_str(yaml).unwrap();
+    let diameter = config.diameter.as_ref().unwrap();
+    assert_eq!(diameter.routes[0].application, DiameterApplication::Gx);
+
+    // TS 29.212 §5.1: 3GPP vendor 10415, application 16777238.
+    assert_eq!(DiameterApplication::Gx.to_app_id(), (10415, 16_777_238));
+
+    // The peer's CER advertises every application routed to it, Gx included.
+    let pcrf = diameter.to_peer_config(&diameter.peers[0], "SIPhon", "1.2.3");
+    assert_eq!(
+        pcrf.application_ids,
+        vec![
+            DiameterApplication::Gx.to_app_id(),
+            DiameterApplication::Rx.to_app_id(),
+        ]
+    );
+
+    // Gx and Ro both carry Credit-Control, and route to different peers.
+    let gx_peers = diameter.peers_for_application(&DiameterApplication::Gx, None);
+    assert_eq!(gx_peers.len(), 1);
+    assert_eq!(gx_peers[0].name, "pcrf1");
+    let ro_peers = diameter.peers_for_application(&DiameterApplication::Ro, None);
+    assert_eq!(ro_peers.len(), 1);
+    assert_eq!(ro_peers[0].name, "ocs1");
+}
+
+#[test]
 fn diameter_absent_when_not_configured() {
     let config = Config::from_str(minimal_yaml()).unwrap();
     assert!(config.diameter.is_none());
