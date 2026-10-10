@@ -56,6 +56,15 @@ impl PyQosNamespace {
     ///     and ``sbi.create_session(media_components=…)``.  Each list entry
     ///     corresponds to one ``m=`` section in the SDPs (sections with port
     ///     ``0`` are skipped — RFC 4566 §5.14 "disabled stream").
+    ///     Each sub-component carries two descriptions, uplink first
+    ///     (TS 29.214 clause 5.3.8: ``in`` is the uplink flow, ``out`` the
+    ///     downlink flow; the UE is the source of ``in`` and the destination
+    ///     of ``out``):
+    ///
+    /// ```text
+    /// permit in  <proto> from <UE> <port> to <remote> <port>
+    /// permit out <proto> from <remote> <port> to <UE> <port>
+    /// ```
     ///
     /// Raises:
     ///     ``ValueError`` if ``direction`` is not ``"orig"`` / ``"term"``,
@@ -159,24 +168,11 @@ impl PyQosNamespace {
             rtp_flow.set_item("number", 1u32)?;
             rtp_flow.set_item(
                 "descriptions",
-                vec![
-                    ipfilter_rule(
-                        "out",
-                        proto_num,
-                        &ue_ip,
-                        ue_rtp_port,
-                        &remote_ip,
-                        remote_rtp_port,
-                    ),
-                    ipfilter_rule(
-                        "in",
-                        proto_num,
-                        &remote_ip,
-                        remote_rtp_port,
-                        &ue_ip,
-                        ue_rtp_port,
-                    ),
-                ],
+                flow_descriptions(
+                    proto_num,
+                    (&ue_ip, ue_rtp_port),
+                    (&remote_ip, remote_rtp_port),
+                ),
             )?;
             flows.append(rtp_flow)?;
 
@@ -194,24 +190,11 @@ impl PyQosNamespace {
                 rtcp_flow.set_item("usage", "rtcp")?;
                 rtcp_flow.set_item(
                     "descriptions",
-                    vec![
-                        ipfilter_rule(
-                            "out",
-                            proto_num,
-                            &ue_ip,
-                            ue_rtcp_port,
-                            &remote_ip,
-                            remote_rtcp_port,
-                        ),
-                        ipfilter_rule(
-                            "in",
-                            proto_num,
-                            &remote_ip,
-                            remote_rtcp_port,
-                            &ue_ip,
-                            ue_rtcp_port,
-                        ),
-                    ],
+                    flow_descriptions(
+                        proto_num,
+                        (&ue_ip, ue_rtcp_port),
+                        (&remote_ip, remote_rtcp_port),
+                    ),
                 )?;
                 flows.append(rtcp_flow)?;
             }
@@ -309,13 +292,29 @@ fn explicit_rtcp_port(media: &MediaLine) -> Option<u16> {
     token.parse().ok()
 }
 
+/// The two Flow-Descriptions of one IP flow pair, uplink first.
+///
+/// TS 29.214 clause 5.3.8: the direction "in" refers to uplink IP flows and
+/// "out" to downlink IP flows. RFC 6733 clause 4.3.1 defines "in" as from the
+/// terminal and "out" as to the terminal, and TS 29.212 clause 5.4.2 spells
+/// out the addresses: for "out" the source is the remote end and the
+/// destination is the UE. TS 29.514 defines the N5 `FlowDescription` by the
+/// same clause, so one form serves Rx and N5.
+///
+/// Neither specification orders the two descriptions; the Media-Sub-Component
+/// grammar lists them as "UL and/or DL" and the uplink one goes first here.
+fn flow_descriptions(proto: u8, ue: (&str, u16), remote: (&str, u16)) -> Vec<String> {
+    vec![
+        ipfilter_rule("in", proto, ue, remote),
+        ipfilter_rule("out", proto, remote, ue),
+    ]
+}
+
 fn ipfilter_rule(
     direction: &str,
     proto: u8,
-    src_ip: &str,
-    src_port: u16,
-    dst_ip: &str,
-    dst_port: u16,
+    (src_ip, src_port): (&str, u16),
+    (dst_ip, dst_port): (&str, u16),
 ) -> String {
     format!("permit {direction} {proto} from {src_ip} {src_port} to {dst_ip} {dst_port}")
 }
@@ -351,9 +350,9 @@ mod tests {
 
     const OFFER: &str = concat!(
         "v=0\r\n",
-        "o=- 1 1 IN IP4 100.65.0.2\r\n",
+        "o=- 1 1 IN IP4 192.0.2.2\r\n",
         "s=-\r\n",
-        "c=IN IP4 100.65.0.2\r\n",
+        "c=IN IP4 192.0.2.2\r\n",
         "t=0 0\r\n",
         "m=audio 50000 RTP/AVP 0 8\r\n",
         "a=rtpmap:0 PCMU/8000\r\n",
@@ -362,9 +361,9 @@ mod tests {
 
     const ANSWER_REWRITTEN: &str = concat!(
         "v=0\r\n",
-        "o=- 1 1 IN IP4 100.64.0.10\r\n",
+        "o=- 1 1 IN IP4 198.51.100.10\r\n",
         "s=-\r\n",
-        "c=IN IP4 100.64.0.10\r\n",
+        "c=IN IP4 198.51.100.10\r\n",
         "t=0 0\r\n",
         "m=audio 30000 RTP/AVP 0\r\n",
         "a=rtpmap:0 PCMU/8000\r\n",
@@ -410,11 +409,11 @@ mod tests {
             assert_eq!(rtp_descs.len(), 2);
             assert_eq!(
                 rtp_descs[0],
-                "permit out 17 from 100.65.0.2 50000 to 100.64.0.10 30000"
+                "permit in 17 from 192.0.2.2 50000 to 198.51.100.10 30000"
             );
             assert_eq!(
                 rtp_descs[1],
-                "permit in 17 from 100.64.0.10 30000 to 100.65.0.2 50000"
+                "permit out 17 from 198.51.100.10 30000 to 192.0.2.2 50000"
             );
 
             let rtcp: Bound<'_, PyDict> = flows.get_item(1).unwrap().cast_into().unwrap();
@@ -434,7 +433,11 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 rtcp_descs[0],
-                "permit out 17 from 100.65.0.2 50001 to 100.64.0.10 30001"
+                "permit in 17 from 192.0.2.2 50001 to 198.51.100.10 30001"
+            );
+            assert_eq!(
+                rtcp_descs[1],
+                "permit out 17 from 198.51.100.10 30001 to 192.0.2.2 50001"
             );
         });
     }
@@ -463,17 +466,122 @@ mod tests {
                 .unwrap()
                 .extract()
                 .unwrap();
-            // For term, the UE is the answerer (100.64.0.10:30000) and the
-            // remote is the offerer (100.65.0.2:50000).
+            // For term, the UE is the answerer (198.51.100.10:30000) and the
+            // remote is the offerer (192.0.2.2:50000).
             assert_eq!(
                 rtp_descs[0],
-                "permit out 17 from 100.64.0.10 30000 to 100.65.0.2 50000"
+                "permit in 17 from 198.51.100.10 30000 to 192.0.2.2 50000"
             );
             assert_eq!(
                 rtp_descs[1],
-                "permit in 17 from 100.65.0.2 50000 to 100.64.0.10 30000"
+                "permit out 17 from 192.0.2.2 50000 to 198.51.100.10 30000"
             );
         });
+    }
+
+    /// One parsed IPFilterRule: `permit <dir> <proto> from <ip> <port> to <ip> <port>`.
+    struct Rule {
+        direction: String,
+        source: (String, String),
+        destination: (String, String),
+    }
+
+    fn parse_rule(rule: &str) -> Rule {
+        let tokens: Vec<&str> = rule.split_whitespace().collect();
+        assert_eq!(tokens.len(), 9, "unexpected IPFilterRule shape: {rule}");
+        assert_eq!(tokens[0], "permit", "{rule}");
+        assert_eq!(tokens[3], "from", "{rule}");
+        assert_eq!(tokens[6], "to", "{rule}");
+        Rule {
+            direction: tokens[1].to_string(),
+            source: (tokens[4].to_string(), tokens[5].to_string()),
+            destination: (tokens[7].to_string(), tokens[8].to_string()),
+        }
+    }
+
+    /// The descriptions of every sub-component of the first media component.
+    fn sub_component_descriptions(offer: &str, answer: &str, direction: &str) -> Vec<Vec<String>> {
+        pyo3::Python::initialize();
+        let ns = PyQosNamespace::new();
+        pyo3::Python::attach(|python| {
+            let offer = offer.into_pyobject(python).unwrap();
+            let answer = answer.into_pyobject(python).unwrap();
+            let result = ns
+                .media_flows_from_sdp(python, offer.as_any(), answer.as_any(), direction)
+                .unwrap();
+            let component: Bound<'_, PyDict> = result.get_item(0).unwrap().cast_into().unwrap();
+            let flows: Bound<'_, PyList> = component
+                .get_item("flows")
+                .unwrap()
+                .unwrap()
+                .cast_into()
+                .unwrap();
+            flows
+                .iter()
+                .map(|flow| {
+                    let flow: Bound<'_, PyDict> = flow.cast_into().unwrap();
+                    flow.get_item("descriptions")
+                        .unwrap()
+                        .unwrap()
+                        .extract()
+                        .unwrap()
+                })
+                .collect()
+        })
+    }
+
+    fn audio_sdp(address_type: &str, address: &str, port: u16) -> String {
+        format!(
+            "v=0\r\no=- 1 1 IN {address_type} {address}\r\ns=-\r\n\
+             c=IN {address_type} {address}\r\nt=0 0\r\n\
+             m=audio {port} RTP/AVP 0\r\n"
+        )
+    }
+
+    /// TS 29.214 clause 5.3.8: "in" is the uplink flow and "out" the downlink
+    /// flow. RFC 6733 clause 4.3.1 and TS 29.212 clause 5.4.2 fix the
+    /// addresses that follow from it: the UE is the source of the "in" rule
+    /// and the destination of the "out" rule. Holds for RTP and RTCP, on the
+    /// originating and the terminating leg, for IPv4 and IPv6.
+    #[test]
+    fn ue_is_source_of_in_and_destination_of_out() {
+        let cases = [
+            ("IP4", "192.0.2.2", "198.51.100.10"),
+            ("IP6", "2001:db8:1::2", "2001:db8:2::10"),
+        ];
+        for (address_type, offerer, answerer) in cases {
+            let offer = audio_sdp(address_type, offerer, 50000);
+            let answer = audio_sdp(address_type, answerer, 30000);
+            // (direction, UE address, UE RTP port, remote address, remote RTP port)
+            let legs = [
+                ("orig", offerer, 50000u16, answerer, 30000u16),
+                ("term", answerer, 30000, offerer, 50000),
+            ];
+            for (leg, ue_ip, ue_port, remote_ip, remote_port) in legs {
+                let flows = sub_component_descriptions(&offer, &answer, leg);
+                assert_eq!(flows.len(), 2, "RTP and RTCP sub-components ({leg})");
+                // RTCP rides one port above RTP on both ends.
+                for (port_offset, descriptions) in flows.iter().enumerate() {
+                    let port_offset = port_offset as u16;
+                    let ue = (ue_ip.to_string(), (ue_port + port_offset).to_string());
+                    let remote = (
+                        remote_ip.to_string(),
+                        (remote_port + port_offset).to_string(),
+                    );
+                    assert_eq!(descriptions.len(), 2, "{leg}: {descriptions:?}");
+
+                    let uplink = parse_rule(&descriptions[0]);
+                    assert_eq!(uplink.direction, "in", "{leg}: {descriptions:?}");
+                    assert_eq!(uplink.source, ue, "{leg}: {descriptions:?}");
+                    assert_eq!(uplink.destination, remote, "{leg}: {descriptions:?}");
+
+                    let downlink = parse_rule(&descriptions[1]);
+                    assert_eq!(downlink.direction, "out", "{leg}: {descriptions:?}");
+                    assert_eq!(downlink.source, remote, "{leg}: {descriptions:?}");
+                    assert_eq!(downlink.destination, ue, "{leg}: {descriptions:?}");
+                }
+            }
+        }
     }
 
     #[test]

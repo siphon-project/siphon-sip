@@ -1561,6 +1561,9 @@ class _QosNamespace:
             offer=request.body, answer=reply.body, direction="orig",
         )
         diameter.rx_aar(framed_ip=request.source_ip, media_components=components)
+
+    Each sub-component carries the uplink flow as ``permit in`` from the UE
+    and the downlink flow as ``permit out`` to the UE (TS 29.214 clause 5.3.8).
     """
 
     def media_flows_from_sdp(self, *, offer, answer, direction="orig"):

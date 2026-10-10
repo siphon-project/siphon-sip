@@ -382,8 +382,8 @@ fn build_aar_wire_structured() -> Vec<u8> {
             MediaFlow {
                 flow_number: 1,
                 descriptions: vec![
-                    "permit out 17 from 100.65.0.2 50000 to 100.64.0.10 30000".into(),
-                    "permit in 17 from 100.64.0.10 30000 to 100.65.0.2 50000".into(),
+                    "permit in 17 from 192.0.2.2 50000 to 198.51.100.10 30000".into(),
+                    "permit out 17 from 198.51.100.10 30000 to 192.0.2.2 50000".into(),
                 ],
                 status: None,
                 usage: None,
@@ -391,8 +391,8 @@ fn build_aar_wire_structured() -> Vec<u8> {
             MediaFlow {
                 flow_number: 2,
                 descriptions: vec![
-                    "permit out 17 from 100.65.0.2 50001 to 100.64.0.10 30001".into(),
-                    "permit in 17 from 100.64.0.10 30001 to 100.65.0.2 50001".into(),
+                    "permit in 17 from 192.0.2.2 50001 to 198.51.100.10 30001".into(),
+                    "permit out 17 from 198.51.100.10 30001 to 192.0.2.2 50001".into(),
                 ],
                 status: None,
                 usage: Some(FlowUsage::Rtcp),
@@ -454,13 +454,13 @@ fn rx_aar_structured_components_roundtrip() {
     );
 
     // And the wire must carry the full 5-tuple, not a wildcard.
-    let rtp_rule = b"permit out 17 from 100.65.0.2 50000 to 100.64.0.10 30000";
+    let rtp_rule = b"permit in 17 from 192.0.2.2 50000 to 198.51.100.10 30000";
     assert!(
         wire.windows(rtp_rule.len()).any(|w| w == rtp_rule),
         "AAR wire must include the 5-tuple RTP Flow-Description"
     );
 
-    let rtcp_rule = b"permit out 17 from 100.65.0.2 50001 to 100.64.0.10 30001";
+    let rtcp_rule = b"permit out 17 from 198.51.100.10 30001 to 192.0.2.2 50001";
     assert!(
         wire.windows(rtcp_rule.len()).any(|w| w == rtcp_rule),
         "AAR wire must include the 5-tuple RTCP Flow-Description"
