@@ -2482,7 +2482,7 @@ fn a_retransmitted_invite_gets_the_last_provisional_again() {
     {
         let call = store.get_call(&call_id).unwrap();
         assert_eq!(
-            call.invite_retransmission_reply("z9hG4bK-aleg1"),
+            call.invite_retransmission_reply("z9hG4bK-aleg1", Some(1)),
             InviteRetransmissionReply::Trying
         );
     }
@@ -2491,7 +2491,7 @@ fn a_retransmitted_invite_gets_the_last_provisional_again() {
     store.get_call_mut(&call_id).unwrap().a_leg_last_provisional = Some(ringing.clone());
     let call = store.get_call(&call_id).unwrap();
     assert_eq!(
-        call.invite_retransmission_reply("z9hG4bK-aleg1"),
+        call.invite_retransmission_reply("z9hG4bK-aleg1", Some(1)),
         InviteRetransmissionReply::Provisional(ringing)
     );
 }
@@ -2507,14 +2507,14 @@ fn a_retransmitted_invite_gets_nothing_on_another_branch_or_after_the_final() {
     call.a_leg_last_provisional = Some(bytes::Bytes::from_static(b"SIP/2.0 180 Ringing\r\n\r\n"));
 
     assert_eq!(
-        call.invite_retransmission_reply("z9hG4bK-another"),
+        call.invite_retransmission_reply("z9hG4bK-another", Some(2)),
         InviteRetransmissionReply::Nothing
     );
 
     call.transition_to(CallState::Answered);
     assert!(call.a_leg_last_provisional.is_none());
     assert_eq!(
-        call.invite_retransmission_reply("z9hG4bK-aleg1"),
+        call.invite_retransmission_reply("z9hG4bK-aleg1", Some(1)),
         InviteRetransmissionReply::Nothing
     );
 }
@@ -2925,7 +2925,7 @@ fn originated_refer_is_dropped_when_its_call_goes_away() {
 #[test]
 fn registry_basic() {
     let reg = LegRegistry::new();
-    reg.register_call_id("call-1@host", "internal-1");
+    reg.register_call_id("call-1@host", "internal-1", LegSide::A);
     reg.register_branch("z9hG4bK-test", "internal-1");
 
     assert_eq!(
@@ -2938,7 +2938,7 @@ fn registry_basic() {
     );
     assert!(reg.lookup_call_id("nonexistent").is_none());
 
-    reg.remove_call_id("call-1@host");
+    reg.remove_call_id("call-1@host", "internal-1");
     assert!(reg.lookup_call_id("call-1@host").is_none());
 }
 

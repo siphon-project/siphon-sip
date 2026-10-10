@@ -461,13 +461,12 @@ pub fn handle_b2bua_prack(inbound: InboundMessage, message: SipMessage, state: &
         to_inbound(reply(400, "Bad Request"));
         return;
     };
-    let sip_call_id = message.headers.call_id().cloned().unwrap_or_default();
     let to_tag = crate::b2bua::actor::extract_to_tag(&message);
     let now = Instant::now();
 
     let decided = state
         .call_actors
-        .find_by_sip_call_id(&sip_call_id)
+        .find_by_message(&message)
         .and_then(|call_id| {
             let mut call = state.call_actors.get_call_mut(&call_id)?;
             let route = CallerRoute::of(&call);

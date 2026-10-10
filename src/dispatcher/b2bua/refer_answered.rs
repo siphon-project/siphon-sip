@@ -298,10 +298,7 @@ pub fn refuse_refer_during_transfer(
 /// matches no call (a REFER answered `481`) has nothing to be remembered
 /// under, and is answered the same way again from scratch.
 pub fn remember_refer_response(response: &SipMessage, state: &DispatcherState) {
-    let call_id = response
-        .headers
-        .call_id()
-        .and_then(|sip_call_id| state.call_actors.find_by_sip_call_id(sip_call_id));
+    let call_id = state.call_actors.find_by_message(response);
     if let Some(call_id) = call_id {
         state
             .answered_refers

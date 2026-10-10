@@ -13,7 +13,7 @@ pub fn handle_b2bua_cancel(inbound: InboundMessage, message: SipMessage, state: 
         .map(|s| s.to_string())
         .unwrap_or_default();
 
-    let call_id = match state.call_actors.find_by_sip_call_id(&sip_call_id) {
+    let call_id = match state.call_actors.find_by_message(&message) {
         Some(id) => id,
         None => {
             warn!(sip_call_id = %sip_call_id, "B2BUA CANCEL: no matching call");

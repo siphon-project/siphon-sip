@@ -19,6 +19,7 @@ use super::*;
 mod cancelled;
 pub use cancelled::{ZombieCancelledLeg, CANCELLED_BRANCH_LIFETIME};
 mod by_branch;
+mod by_dialog;
 mod dial_branch;
 mod dialog_watch;
 mod failure;
@@ -193,9 +194,13 @@ impl CallActorStore {
         let a_branch = a_leg.branch.clone();
         let call = CallActor::new(a_leg);
         let id = call.id.clone();
-        self.registry.register_call_id(&sip_call_id, &id);
-        self.registry.register_branch(&a_branch, &id);
+        // In the store before it is registered: a mapping to a call that is
+        // not in the store is taken for one a finished call left behind.
         self.calls.insert(id.clone(), Box::new(call));
+        self.forget_ended_owners(&sip_call_id);
+        self.registry
+            .register_call_id(&sip_call_id, &id, LegSide::A);
+        self.registry.register_branch(&a_branch, &id);
         id
     }
 
@@ -206,13 +211,14 @@ impl CallActorStore {
         if let Some(mut call) = self.calls.get_mut(call_id) {
             call.add_b_leg(leg);
             self.registry.register_branch(&branch, call_id);
-            // Only register Call-ID if not already mapped to this call.
-            // Re-INVITE tracking legs reuse the A-leg or B-leg Call-ID;
-            // re-registering would overwrite the original mapping, and
-            // remove_b_leg would then delete it, breaking BYE routing.
-            if self.registry.lookup_call_id(&sip_call_id).as_deref() != Some(call_id) {
-                self.registry.register_call_id(&sip_call_id, call_id);
-            }
+            // A no-op when the Call-ID is already mapped to this call:
+            // re-INVITE tracking legs reuse the A-leg or B-leg Call-ID, and the
+            // mapping they share is removed with the last leg that uses it
+            // (`remove_b_leg_of`). A Call-ID another call answers as its caller
+            // dialog, because this INVITE was routed back to this node, keeps
+            // that call's mapping beside this one.
+            self.registry
+                .register_call_id(&sip_call_id, call_id, LegSide::B);
             true
         } else {
             false
@@ -271,7 +277,7 @@ impl CallActorStore {
         let still_used = call.a_leg.dialog.call_id == *cid
             || call.b_legs.iter().any(|b| b.dialog.call_id == *cid);
         if !still_used {
-            self.registry.remove_call_id(cid);
+            self.registry.remove_call_id(cid, &call.id);
         }
         ended
     }
@@ -420,11 +426,16 @@ impl CallActorStore {
 
         // The new party's dialog now belongs to this call, so its Call-ID has to
         // resolve here — its ACK, re-INVITEs and BYE all arrive on it.
+        // Re-pointed, not added to: the call the INVITE first opened was taken
+        // apart for this adoption (`detach_a_leg_for_adoption`) and left its
+        // mapping behind for exactly this.
+        self.forget_ended_owners(&new_sip_call_id);
         self.registry
-            .register_call_id(&new_sip_call_id, replaced_call_id);
+            .register_call_id(&new_sip_call_id, replaced_call_id, LegSide::A);
         self.registry.register_branch(&new_branch, replaced_call_id);
 
-        self.registry.remove_call_id(&replaced.dialog.call_id);
+        self.registry
+            .remove_call_id(&replaced.dialog.call_id, replaced_call_id);
         self.registry.remove_branch(&replaced.branch);
         self.remember_terminated(&replaced.dialog.call_id);
 
@@ -602,6 +613,13 @@ impl CallActorStore {
     }
 
     /// Look up internal call ID by SIP Call-ID.
+    ///
+    /// For a caller that has a Call-ID and nothing else: a script, a control
+    /// application, the admin API, an event from the media engine. They name a
+    /// call by its caller dialog, so when two calls have a dialog with this
+    /// Call-ID (see [`Self::find_by_dialog`]) the answer is the one whose
+    /// A-leg carries it. A SIP request or response is matched with
+    /// [`Self::find_by_message`], which reads its tags too.
     pub fn find_by_sip_call_id(&self, sip_call_id: &str) -> Option<String> {
         self.registry.lookup_call_id(sip_call_id)
     }
@@ -1130,8 +1148,9 @@ impl CallActorStore {
     /// makes a late in-dialog request on the retired dialog answer 481 rather
     /// than resolving to a call that has moved on (RFC 3261 §12.2.2), which is
     /// the same treatment every other torn-down leg gets.
-    fn retire_promoted_referrer(&self, referrer: &Leg) {
-        self.registry.remove_call_id(&referrer.dialog.call_id);
+    fn retire_promoted_referrer(&self, call_id: &str, referrer: &Leg) {
+        self.registry
+            .remove_call_id(&referrer.dialog.call_id, call_id);
         self.registry.remove_branch(&referrer.branch);
         self.remember_terminated(&referrer.dialog.call_id);
     }
@@ -1172,12 +1191,13 @@ impl CallActorStore {
             // dropped with the call so it can never outlive it.
             self.registry.clear_originated_calls(call_id);
             // Clean up A-leg registry entries
-            self.registry.remove_call_id(&call.a_leg.dialog.call_id);
+            self.registry
+                .remove_call_id(&call.a_leg.dialog.call_id, call_id);
             self.registry.remove_branch(&call.a_leg.branch);
             self.remember_terminated(&call.a_leg.dialog.call_id);
             // Clean up B-leg registry entries
             for b_leg in &call.b_legs {
-                self.registry.remove_call_id(&b_leg.dialog.call_id);
+                self.registry.remove_call_id(&b_leg.dialog.call_id, call_id);
                 self.registry.remove_branch(&b_leg.branch);
                 self.remember_terminated(&b_leg.dialog.call_id);
             }

@@ -143,17 +143,34 @@ pub fn handle_b2bua_invite(inbound: InboundMessage, message: SipMessage, state: 
         return;
     }
 
-    // Guard against INVITE retransmissions: if we already have a call for this
-    // SIP Call-ID, this is a retransmission. It creates no second call (each
-    // UDP retransmission would otherwise spawn duplicate B-leg INVITEs), and
-    // it is answered: a caller retransmits because it has seen no provisional,
-    // so the most recent one goes out again (RFC 3261 §17.2.1). Left unanswered
-    // it keeps retransmitting until a response does get through.
-    if let Some(existing_call_id) = state.call_actors.find_by_sip_call_id(&sip_call_id) {
+    // Guard against INVITE retransmissions: an INVITE without a To tag whose
+    // Call-ID and From tag are those of a caller's dialog this node already
+    // serves is not a new call. On that INVITE's branch it is a retransmission
+    // (RFC 3261 §17.2.3 matches a transaction by the top Via branch). It
+    // creates no second call (each UDP retransmission would otherwise spawn
+    // duplicate B-leg INVITEs), and it is answered: a caller retransmits
+    // because it has seen no provisional, so the most recent one goes out again
+    // (RFC 3261 §17.2.1). Left unanswered it keeps retransmitting until a
+    // response does get through.
+    //
+    // The Call-ID alone does not decide it. An INVITE this node dialled and a
+    // proxy routed back here carries a Call-ID the store knows, as the dialog
+    // a call dialled, with siphon's own From tag: no caller's dialog, so it is
+    // a new request, and the element it spirals through serves it as a new
+    // call (RFC 3261 §16.3).
+    if let Some(existing_call_id) = state
+        .call_actors
+        .find_by_caller_dialog(&sip_call_id, &from_tag)
+    {
+        let cseq_number = message
+            .headers
+            .cseq()
+            .and_then(|cseq| cseq.split_whitespace().next())
+            .and_then(|number| number.parse::<u32>().ok());
         let reply = state
             .call_actors
             .get_call(&existing_call_id)
-            .map(|call| call.invite_retransmission_reply(&via_branch))
+            .map(|call| call.invite_retransmission_reply(&via_branch, cseq_number))
             .unwrap_or(crate::b2bua::actor::InviteRetransmissionReply::Nothing);
         debug!(
             call_id = %sip_call_id,
@@ -183,8 +200,63 @@ pub fn handle_b2bua_invite(inbound: InboundMessage, message: SipMessage, state: 
                     state,
                 );
             }
+            crate::b2bua::actor::InviteRetransmissionReply::Merged => {
+                // RFC 3261 §8.2.2.2: the caller's INVITE again, with the same
+                // From tag, Call-ID and CSeq, on a branch that is not the
+                // transaction's. It reached this node over a second path, and
+                // is refused rather than served twice or left to time out.
+                let loop_detected = build_response(
+                    &message,
+                    482,
+                    "Loop Detected",
+                    state.server_header.as_deref(),
+                    &[],
+                );
+                send_message_from(
+                    loop_detected,
+                    inbound.transport,
+                    inbound.remote_addr,
+                    inbound.connection_id,
+                    Some(inbound.local_addr),
+                    state,
+                );
+            }
             crate::b2bua::actor::InviteRetransmissionReply::Nothing => {}
         }
+        return;
+    }
+
+    // An INVITE this node dialled, back here with no hops left. Each B-leg
+    // INVITE goes out with the caller's Max-Forwards less one (RFC 7332), so a
+    // request that keeps being routed back to the node that dialled it runs the
+    // count down, and at 0 it has looped: it ends here with 483 (RFC 3261
+    // §8.1.1.6), where serving it would dial it again.
+    if message.headers.max_forwards() == Some(0)
+        && state
+            .call_actors
+            .find_by_sip_call_id(&sip_call_id)
+            .is_some()
+    {
+        info!(
+            call_id = %sip_call_id,
+            source = %inbound.remote_addr,
+            "B2BUA: an INVITE this node dialled returned with Max-Forwards 0, answering 483"
+        );
+        let too_many_hops = build_response(
+            &message,
+            483,
+            "Too Many Hops",
+            state.server_header.as_deref(),
+            &[],
+        );
+        send_message_from(
+            too_many_hops,
+            inbound.transport,
+            inbound.remote_addr,
+            inbound.connection_id,
+            Some(inbound.local_addr),
+            state,
+        );
         return;
     }
 
@@ -455,6 +527,14 @@ pub fn handle_b2bua_invite(inbound: InboundMessage, message: SipMessage, state: 
             local_addr: Some(inbound.local_addr),
         },
     );
+    // The INVITE's CSeq number, which with its From tag and Call-ID is what a
+    // copy of it arriving over another path is recognised by (RFC 3261
+    // §8.2.2.2).
+    a_leg.dialog.remote_cseq = message
+        .headers
+        .cseq()
+        .and_then(|cseq| cseq.split_whitespace().next())
+        .and_then(|number| number.parse::<u32>().ok());
 
     // Store our Contact for the A-leg direction (what we advertise to the caller).
     // via_host() applies the advertised_address fallback and substitutes the

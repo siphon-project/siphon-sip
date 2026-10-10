@@ -24,7 +24,7 @@ pub fn handle_b2bua_info(inbound: InboundMessage, message: SipMessage, state: &D
         .map(|s| s.to_string())
         .unwrap_or_default();
 
-    let Some(call_id) = state.call_actors.find_by_sip_call_id(&sip_call_id) else {
+    let Some(call_id) = state.call_actors.find_by_message(&message) else {
         // Raced a teardown after the dispatch gate matched.
         warn!(sip_call_id = %sip_call_id, "B2BUA INFO: no matching call — 481");
         respond(
