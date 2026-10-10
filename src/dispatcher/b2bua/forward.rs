@@ -31,6 +31,9 @@ pub fn b2bua_forward_indialog_request(
         .map(|value| crate::b2bua::actor::extract_contact_uri(value));
     if let Some(mut call) = state.call_actors.get_call_mut(call_id) {
         let winner_index = call.winner;
+        // Not while the leg's INVITE is pending, whose responses follow the
+        // INVITE (RFC 3261 §18.2.2).
+        let moves_flow = call.in_dialog_request_moves_flow(from_a_leg);
         let origin_leg: Option<&mut Leg> = if from_a_leg {
             Some(&mut call.a_leg)
         } else if let Some(index) = winner_index {
@@ -39,8 +42,9 @@ pub fn b2bua_forward_indialog_request(
             None
         };
         if let Some(leg) = origin_leg {
-            if leg.transport.remote_addr != inbound.remote_addr
-                || leg.transport.connection_id != inbound.connection_id
+            if moves_flow
+                && (leg.transport.remote_addr != inbound.remote_addr
+                    || leg.transport.connection_id != inbound.connection_id)
             {
                 leg.transport.remote_addr = inbound.remote_addr;
                 leg.transport.connection_id = inbound.connection_id;

@@ -90,8 +90,10 @@ pub fn handle_b2bua_update(inbound: InboundMessage, message: SipMessage, state: 
     }
 
     // Flow refresh (RFC 5626 / RFC 3261 §12.2.2): re-anchor the originating leg
-    // on the arrival flow so the UPDATE 200 OK and later in-dialog requests reach
-    // the live connection. Done before the snapshot so the clones carry it.
+    // on the arrival flow so later in-dialog requests reach the live connection.
+    // Done before the snapshot so the clones carry it. Not while the leg's
+    // INVITE is pending: its responses and its CANCEL follow the INVITE
+    // (`in_dialog_request_moves_flow`).
     let refreshed_contact = message
         .headers
         .get("Contact")
@@ -111,14 +113,16 @@ pub fn handle_b2bua_update(inbound: InboundMessage, message: SipMessage, state: 
         })
     };
     if let Some(mut call) = state.call_actors.get_call_mut(&call_id) {
+        let moves_flow = call.in_dialog_request_moves_flow(from_a_leg);
         let origin_leg: Option<&mut Leg> = match origin_branch.as_deref() {
             None if from_a_leg => Some(&mut call.a_leg),
             None => None,
             Some(branch) => call.find_b_leg_by_branch_mut(branch).map(|(_, leg)| leg),
         };
         if let Some(leg) = origin_leg {
-            if leg.transport.remote_addr != inbound.remote_addr
-                || leg.transport.connection_id != inbound.connection_id
+            if moves_flow
+                && (leg.transport.remote_addr != inbound.remote_addr
+                    || leg.transport.connection_id != inbound.connection_id)
             {
                 leg.transport.remote_addr = inbound.remote_addr;
                 leg.transport.connection_id = inbound.connection_id;
@@ -578,6 +582,15 @@ pub fn handle_b2bua_update(inbound: InboundMessage, message: SipMessage, state: 
             },
         );
         update_leg.stored_vias = originator_vias;
+        // The response goes back where this request came from (RFC 3261
+        // §18.2.2), which before the answer need not be where the leg's INVITE
+        // did.
+        update_leg.request_source = Some(LegTransport {
+            remote_addr: inbound.remote_addr,
+            connection_id: inbound.connection_id,
+            transport: inbound.transport,
+            local_addr: Some(inbound.local_addr),
+        });
         update_leg.stored_cseq = message.headers.cseq().map(|c| c.to_string());
         // See the re-INVITE tracking leg: the response forwarded to this
         // originator must echo this request's From/To (RFC 3261 §8.2.6.2), not

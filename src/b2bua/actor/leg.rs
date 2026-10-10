@@ -406,6 +406,10 @@ pub struct Leg {
     /// `Session-Expires`, `Min-SE`, `Supported` and `Require`, from which siphon
     /// answers the refresh on the originator's dialog (RFC 4028 §9).
     pub session_refresh_request: Option<crate::sip::headers::SipHeaders>,
+    /// On a tracking leg for a relayed UPDATE: the flow the UPDATE arrived on,
+    /// which is where its response goes (RFC 3261 §18.2.2), wherever the other
+    /// requests of the dialog arrived from.
+    pub request_source: Option<TransportInfo>,
 }
 impl Leg {
     /// Create a new A-leg from an inbound INVITE.
@@ -437,6 +441,7 @@ impl Leg {
             early_exchange_complete: false,
             request_session_expires: None,
             session_refresh_request: None,
+            request_source: None,
         }
     }
 
@@ -492,6 +497,7 @@ impl Leg {
             early_exchange_complete: false,
             request_session_expires: None,
             session_refresh_request: None,
+            request_source: None,
         }
     }
 

@@ -363,6 +363,11 @@ impl ALegReliableProvisionals {
         self.unacknowledged.as_ref().map(|pending| pending.rseq)
     }
 
+    /// Whether a final response has gone to the caller.
+    pub fn finished(&self) -> bool {
+        self.finished
+    }
+
     /// Whether the caller's 2xx is ready but held for a PRACK, so the caller has
     /// had no final response yet.
     pub fn holds_answer(&self) -> bool {

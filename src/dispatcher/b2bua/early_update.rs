@@ -191,7 +191,7 @@ pub fn refuse_caller_updates_in_flight(call_id: &str, ended: &[&Leg], state: &Di
         return;
     }
     let orphaned = state.call_actors.get_call(call_id).map(|call| {
-        let refusals: Vec<(String, SipMessage)> = call
+        let refusals: Vec<(String, SipMessage, Option<LegTransport>)> = call
             .b_legs
             .iter()
             .filter(|tracking| {
@@ -204,7 +204,11 @@ pub fn refuse_caller_updates_in_flight(call_id: &str, ended: &[&Leg], state: &Di
             })
             .filter_map(|tracking| {
                 let refusal = caller_update_refusal(tracking, &call.a_leg, state)?;
-                Some((tracking.branch.clone(), refusal))
+                Some((
+                    tracking.branch.clone(),
+                    refusal,
+                    tracking.request_source.clone(),
+                ))
             })
             .collect();
         (
@@ -216,18 +220,34 @@ pub fn refuse_caller_updates_in_flight(call_id: &str, ended: &[&Leg], state: &Di
     let Some((refusals, caller, caller_local_addr)) = orphaned else {
         return;
     };
-    for (branch, refusal) in refusals {
+    for (branch, refusal, source) in refusals {
         debug!(
             call_id = %call_id,
             "B2BUA: the callee's INVITE ended with the caller's UPDATE unanswered; refusing it 500 with a Retry-After"
         );
         state.call_actors.remove_b_leg_on(call_id, &branch);
+        // To the hop the UPDATE came from (RFC 3261 §18.2.2), which need not be
+        // the one the caller's INVITE did.
+        let (transport, remote_addr, connection_id, local_addr) = match source {
+            Some(source) => (
+                source.transport,
+                source.remote_addr,
+                source.connection_id,
+                source.local_addr,
+            ),
+            None => (
+                caller.transport,
+                caller.remote_addr,
+                caller.connection_id,
+                caller_local_addr,
+            ),
+        };
         send_message_from(
             refusal,
-            caller.transport,
-            caller.remote_addr,
-            caller.connection_id,
-            caller_local_addr,
+            transport,
+            remote_addr,
+            connection_id,
+            local_addr,
             state,
         );
     }

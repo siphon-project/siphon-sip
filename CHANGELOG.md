@@ -176,6 +176,24 @@ entry, but a working config keeps working.
   siphon sent the callee (a relayed UPDATE or re-INVITE, a BYE) repeated that
   number.
 
+- **The responses to a B2BUA call's INVITE go where the INVITE came from,
+  whichever hop a later request on the early dialog arrives from (RFC 3261
+  §18.2.2).** An UPDATE from the caller, and any other request siphon relays
+  between the legs, moved the caller's leg to the flow it arrived on. That is
+  right on a confirmed dialog, where the peer may have reconnected (RFC 5626
+  §5.3), but before the answer the leg's flow is where every response to the
+  INVITE is sent. When the UPDATE reached siphon from another proxy than the
+  one that delivered the INVITE, the 18x after it, the 2xx and any failure went
+  to that other proxy with the INVITE's Via set, which it matched to no
+  transaction and dropped: the caller never saw the answer, and siphon ended
+  the call unACKed after 64*T1. A PRACK from the same hop did no harm, which is
+  why the call set up without the UPDATE. The same held on the callee's side
+  since UPDATEs cross on the early dialog: after a callee's UPDATE from another
+  hop, the CANCEL of its INVITE went to that hop and not where the INVITE had
+  gone (§9.1). A leg now moves to a request's flow only once its INVITE has had
+  its final response, and the response to a relayed UPDATE goes to the source
+  of that UPDATE on either side, before the answer and after.
+
 - **A NOTIFY that arrives before the 2xx to the SUBSCRIBE of
   `proxy.subscribe_state.send()` is matched to that subscription (RFC 6665
   §4.1.2.4, §4.4.1).** The dialog was stored only once the awaited 2xx had
