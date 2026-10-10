@@ -333,6 +333,7 @@ struct RxAarRequest {
     framed_ip: Option<[u8; 4]>,
     framed_ipv6: Option<Vec<u8>>,
     subscription_id: Option<(String, u32)>,
+    service_urn: Option<String>,
 }
 
 impl RxAarRequest {
@@ -349,6 +350,7 @@ impl RxAarRequest {
         af_application_id: &str,
         subscription_id: Option<&Bound<'_, PyAny>>,
         specific_actions: Option<&Bound<'_, PyAny>>,
+        service_urn: Option<&str>,
     ) -> PyResult<Self> {
         let media_components = media_components.map(parse_media_components).transpose()?;
         let framed_ipv6 = framed_ipv6.map(extract_ipv6_prefix).transpose()?;
@@ -365,6 +367,17 @@ impl RxAarRequest {
             })
             .transpose()?;
         let specific_actions = specific_actions.map(parse_specific_actions).transpose()?;
+        let service_urn = service_urn
+            .map(|urn| {
+                crate::diameter::rx::service_urn_value(urn)
+                    .map(str::to_string)
+                    .ok_or_else(|| {
+                        pyo3::exceptions::PyValueError::new_err(format!(
+                            "service_urn names no service: {urn:?}"
+                        ))
+                    })
+            })
+            .transpose()?;
         Ok(Self {
             session_id: session_id.map(String::from),
             af_application_id: af_application_id.to_string(),
@@ -373,6 +386,7 @@ impl RxAarRequest {
             framed_ip,
             framed_ipv6,
             subscription_id,
+            service_urn,
         })
     }
 
@@ -394,6 +408,7 @@ impl RxAarRequest {
                 .subscription_id
                 .as_ref()
                 .map(|(data, kind)| (data.as_str(), *kind)),
+            service_urn: self.service_urn.as_deref(),
         }
     }
 }
@@ -1681,6 +1696,12 @@ impl PyDiameter {
     ///         INDICATION_OF_FAILED_RESOURCES_ALLOCATION. One AVP per entry;
     ///         ``None`` sends none. A value TS 29.214 does not define (0 and
     ///         5 are void) raises ``ValueError`` naming it.
+    ///     service_urn: The service URN of an emergency session, e.g.
+    ///         ``"urn:service:sos"`` or ``"urn:service:sos.police"``, sent as
+    ///         Service-URN so the PCRF applies its emergency policy (TS
+    ///         29.214 §4.4.1). The AVP holds the URN without its
+    ///         ``urn:service:`` (§5.3.23), so ``"sos"`` is accepted too. A URN
+    ///         with nothing after the prefix raises ``ValueError``.
     ///
     /// Returns:
     ///     Dict with ``result_code`` (int) and ``session_id`` (str),
@@ -1697,6 +1718,7 @@ impl PyDiameter {
         af_application_id="IMS Services",
         subscription_id=None,
         specific_actions=None,
+        service_urn=None,
     ))]
     fn rx_aar<'py>(
         &self,
@@ -1708,6 +1730,7 @@ impl PyDiameter {
         af_application_id: &str,
         subscription_id: Option<&Bound<'py, PyAny>>,
         specific_actions: Option<&Bound<'py, PyAny>>,
+        service_urn: Option<&str>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let client = match self
             .manager
@@ -1731,6 +1754,7 @@ impl PyDiameter {
             af_application_id,
             subscription_id,
             specific_actions,
+            service_urn,
         )?;
 
         crate::script::awaitable(python, async move {
@@ -4013,7 +4037,17 @@ mod tests {
         let py_diameter = PyDiameter::new(manager);
         pyo3::Python::attach(|python| {
             let result = py_diameter
-                .rx_aar(python, None, None, None, None, "IMS Services", None, None)
+                .rx_aar(
+                    python,
+                    None,
+                    None,
+                    None,
+                    None,
+                    "IMS Services",
+                    None,
+                    None,
+                    None,
+                )
                 .unwrap();
             assert!(resolve(python, result).is_none());
         });
@@ -4085,6 +4119,7 @@ mod tests {
                         "IMS Services",
                         None,
                         Some(actions.as_any()),
+                        None,
                     )
                     .unwrap_err();
                 assert!(
@@ -4109,6 +4144,7 @@ mod tests {
                         "IMS Services",
                         None,
                         Some(bad),
+                        None,
                     )
                     .unwrap_err();
                 assert!(
@@ -4127,6 +4163,7 @@ mod tests {
                     "IMS Services",
                     None,
                     Some(huge.as_any()),
+                    None,
                 )
                 .unwrap_err();
             assert!(
@@ -4153,6 +4190,7 @@ mod tests {
                 "IMS Services",
                 None,
                 Some(actions.as_any()),
+                None,
             )
             .unwrap();
             let wire = rx_aar_wire(&request, None);
@@ -4169,12 +4207,52 @@ mod tests {
         });
     }
 
+    /// The whole AVP by hand: 525 with V and M, vendor 10415, "sos".
+    #[test]
+    fn rx_aar_service_urn_marks_an_emergency_session() {
+        pyo3::Python::initialize();
+        pyo3::Python::attach(|_python| {
+            let parse = |service_urn: Option<&str>| {
+                RxAarRequest::parse(
+                    None,
+                    None,
+                    None,
+                    None,
+                    "IMS Services",
+                    None,
+                    None,
+                    service_urn,
+                )
+            };
+            let sos = vec![
+                0x00, 0x00, 0x02, 0x0d, 0xc0, 0x00, 0x00, 0x0f, 0x00, 0x00, 0x28, 0xaf, b's', b'o',
+                b's', 0x00,
+            ];
+            for urn in ["urn:service:sos", "sos"] {
+                let wire = rx_aar_wire(&parse(Some(urn)).unwrap(), None);
+                assert_eq!(
+                    avps_with_code(&wire, avp::SERVICE_URN),
+                    std::slice::from_ref(&sos),
+                    "{urn}"
+                );
+            }
+            let wire = rx_aar_wire(&parse(None).unwrap(), None);
+            assert!(avps_with_code(&wire, avp::SERVICE_URN).is_empty());
+
+            for empty in ["", "urn:service:"] {
+                let error = parse(Some(empty)).err().expect("names no service");
+                assert!(error.to_string().contains("service_urn"), "{error}");
+            }
+        });
+    }
+
     #[test]
     fn rx_aar_without_specific_actions_emits_no_avp_513() {
         pyo3::Python::initialize();
         pyo3::Python::attach(|_python| {
             let request =
-                RxAarRequest::parse(None, None, None, None, "IMS Services", None, None).unwrap();
+                RxAarRequest::parse(None, None, None, None, "IMS Services", None, None, None)
+                    .unwrap();
             let wire = rx_aar_wire(&request, None);
             assert!(avps_with_code(&wire, avp::SPECIFIC_ACTION).is_empty());
         });
@@ -4251,6 +4329,7 @@ mod tests {
             "IMS Services",
             Some(subscription.as_any()),
             Some(actions.as_any()),
+            Some("urn:service:sos"),
         )
         .unwrap()
     }
@@ -4542,6 +4621,7 @@ mod tests {
                     avp::SUBSCRIPTION_ID,
                     avp::FRAMED_IP_ADDRESS,
                     avp::FRAMED_IPV6_PREFIX,
+                    avp::SERVICE_URN,
                     avp::RX_REQUEST_TYPE,
                 ]
             );
@@ -4648,7 +4728,8 @@ mod tests {
         pyo3::Python::initialize();
         pyo3::Python::attach(|_python| {
             let initial =
-                RxAarRequest::parse(None, None, None, None, "IMS Services", None, None).unwrap();
+                RxAarRequest::parse(None, None, None, None, "IMS Services", None, None, None)
+                    .unwrap();
             assert_eq!(
                 initial.params().rx_request_type,
                 crate::diameter::rx::RxRequestType::InitialRequest
@@ -4659,6 +4740,7 @@ mod tests {
                 None,
                 None,
                 "IMS Services",
+                None,
                 None,
                 None,
             )

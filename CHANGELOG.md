@@ -147,6 +147,33 @@ entry, but a working config keeps working.
   when no Cx peer is connected. The other Cx requests already had a script
   call; `auth.require_ims_digest` still sends its own MAR. The SDK mock has
   `cx_mar` and `set_mar_response`.
+- **`DiameterRequest.avps()` and `DiameterAnswer.avps()` list AVPs with their
+  fields by name.** Each entry is a `DiameterAvp` with `.code`, `.vendor`,
+  `.name` (`None` when the dictionary does not know the AVP) and `.value`,
+  which for a grouped AVP is a list of `DiameterAvp`. It is there because the
+  two tuple shapes of the existing calls differ and are easy to mix up:
+  `iter_avps()` yields `(code, vendor, value)` for a top-level AVP, and the
+  members of a grouped AVP are `(code, value, vendor)`, the shape `set_avp`
+  takes for a child. A handler that unpacks a member in the top-level order
+  compares a value with a vendor id and matches nothing. Both orders are
+  documented behaviour that scripts depend on, so neither changed; the
+  docstrings of `iter_avps` and `docs/reference/diameter.md` now say so. The
+  SDK mock has `avps()` and `MockDiameterAvp`.
+- **`diameter.rx_aar` can mark an emergency session.** `service_urn=` takes the
+  service URN of the request, e.g. `"urn:service:sos"` or
+  `"urn:service:sos.police"`, and sends it as Service-URN (TS 29.214 clause
+  5.3.23, AVP 525, vendor 10415, V and M), which tells the PCRF the AF session
+  is an emergency one (clause 4.4.1). An AAR for an emergency call was
+  indistinguishable from any other. The AVP holds the URN without its
+  `urn:service:`, as clause 5.3.23 has it ("The string "urn:service:" in the
+  beginning of the URN shall be omitted in the AVP"), so the PCRF receives
+  `sos`; `"sos"` is accepted as given, and a URN with nothing after the
+  prefix raises `ValueError`. Without the argument nothing changes on the
+  wire. `Service-URN` is also a dictionary name now, for `get_avp` and
+  `set_avp`. The Rust `rx::RxSessionRequest` has a new `service_urn` field.
+  Checked against Wireshark's Diameter dissector with
+  `scripts/validate_rx_aar.sh`.
+
 ### Changed
 
 - **`DiameterRequest.answer()` and `.reject()` copy the application AVPs of the
@@ -169,18 +196,6 @@ entry, but a working config keeps working.
   calls `answer.remove_avp(...)`. The SDK mock does the same. Checked against
   Wireshark's Diameter dissector with
   `scripts/validate_diameter_answer_avps.sh`.
-- **`DiameterRequest.avps()` and `DiameterAnswer.avps()` list AVPs with their
-  fields by name.** Each entry is a `DiameterAvp` with `.code`, `.vendor`,
-  `.name` (`None` when the dictionary does not know the AVP) and `.value`,
-  which for a grouped AVP is a list of `DiameterAvp`. It is there because the
-  two tuple shapes of the existing calls differ and are easy to mix up:
-  `iter_avps()` yields `(code, vendor, value)` for a top-level AVP, and the
-  members of a grouped AVP are `(code, value, vendor)`, the shape `set_avp`
-  takes for a child. A handler that unpacks a member in the top-level order
-  compares a value with a vendor id and matches nothing. Both orders are
-  documented behaviour that scripts depend on, so neither changed; the
-  docstrings of `iter_avps` and `docs/reference/diameter.md` now say so. The
-  SDK mock has `avps()` and `MockDiameterAvp`.
 
 ### Removed
 
