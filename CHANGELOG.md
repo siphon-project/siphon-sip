@@ -71,6 +71,32 @@ entry, but a working config keeps working.
 
 ### Fixed
 
+- **The Diameter listener advertises its applications in the CEA, and refuses
+  a peer that shares none (RFC 6733 §5.3).** The Capabilities-Exchange-Answer
+  of a node with `diameter.listen` listed no application at all, so a strict
+  peer found nothing in common and dropped the connection with
+  `DIAMETER_NO_COMMON_APPLICATION`. The CEA now lists every application named
+  in a registered `@diameter.on_request("<App>:<CMD>")` filter, plus the new
+  optional `diameter.applications` list (`diameter.tenants.<name>.applications`
+  with tenants) for what the filters do not say: a bare-command or catch-all
+  handler names no application, and siphon does not advertise everything its
+  dictionary knows in their place. The list takes `cx`, `sh`, `rx`, `gx`, `ro`, `rf`,
+  `s6a`, `s6c`, `sgd`, and `relay` for an agent (Relay application id
+  0xffffffff). The CER siphon sends on `servers` and `connect_to` connections
+  carries the same list, where it also carried none. **Behaviour change:** when
+  that list is not empty, a connecting peer whose CER has no application in
+  common with it is answered `5010` and disconnected, unless either side
+  advertises the Relay application. That includes a peer whose CER names no
+  application. A node whose list is empty, which is a script with only
+  bare-command or catch-all handlers and no `applications`, accepts every peer
+  and sends a CEA without applications, exactly as before, and now logs a
+  `warn` at startup saying so. Two cases need a configuration line after
+  upgrading: a script that mixes an `"<App>:<CMD>"` filter with a catch-all
+  serving other applications lists those applications (or `relay`) under
+  `applications`, and a relay that connects to a siphon node serving named
+  applications sets `applications: [relay]` so that its CER is no longer
+  empty. See `docs/reference/diameter.md`.
+
 - **`call.dial()` and `call.fork()` to a `tel:` target build a well-formed
   B-leg `To`.** The B-leg `To` takes the dial target's `host[:port]`, and a
   `tel:` URI has none (RFC 3966 §3), so `call.dial("tel:+15550100", ...)` sent

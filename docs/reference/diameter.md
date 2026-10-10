@@ -75,6 +75,79 @@ the CER: the 3GPP ones as a `Vendor-Specific-Application-Id` holding
 `Vendor-Id` 10415 and the `Auth-Application-Id`, Ro as a bare
 `Auth-Application-Id`, Rf as a bare `Acct-Application-Id`.
 
+## Capabilities exchange: the applications siphon advertises
+
+A node that accepts Diameter connections (`diameter.listen` with `clients`)
+lists the applications it serves in the Capabilities-Exchange-Answer, as
+RFC 6733 §5.3 requires. The list has two sources:
+
+1. Every application named in a registered `@diameter.on_request` filter:
+   `@diameter.on_request("S6a:AIR")` makes the node an S6a server.
+2. The `applications` list in the configuration, for what the filters do not
+   say.
+
+A bare-command filter (`"RAR"`) or a catch-all handler names no application,
+so it adds nothing to the list. siphon does not fall back to every application
+its dictionary knows, because that would claim interfaces the script may not
+implement. A script that serves through such handlers lists its applications
+in the configuration, and a relay lists `relay`:
+
+```yaml
+diameter:
+  listen:
+    tcp: "0.0.0.0:3868"
+  origin_host: "hss.epc.mnc001.mcc001.3gppnetwork.org"
+  origin_realm: "epc.mnc001.mcc001.3gppnetwork.org"
+  applications: [s6a, cx]      # cx, sh, rx, gx, ro, rf, s6a, s6c, sgd, or relay
+  clients:
+    - name: mme
+      allowed_ips: ["192.0.2.0/24"]
+```
+
+With `tenants:`, each tenant has its own `applications` next to its
+`identity`. The handlers belong to the one script, so the applications their
+filters name are advertised to every tenant.
+
+On the wire a 3GPP application goes out as a `Vendor-Specific-Application-Id`
+(Vendor-Id 10415 with the Auth-Application-Id) and as an `Auth-Application-Id`,
+base accounting (Rf) as an `Acct-Application-Id`, and `relay` as
+`Auth-Application-Id` 0xffffffff. The list is read from the running script at
+each handshake, so a reload that adds or removes a handler changes what the
+next connection is told.
+
+The same list goes into the Capabilities-Exchange-Request siphon sends on the
+connections it opens for that tenant, `servers` and `connect_to`.
+
+### When a connecting peer is refused
+
+siphon compares the application ids in the peer's CER with its own list. It
+looks at every `Auth-Application-Id` and `Acct-Application-Id`, including the
+ones inside a `Vendor-Specific-Application-Id`, and ignores the Vendor-Id.
+
+| siphon's list | The peer's CER | Outcome |
+|---|---|---|
+| empty | anything | Accepted. The CEA lists no application. |
+| contains `relay` | anything | Accepted. |
+| not empty | contains the Relay application (0xffffffff) | Accepted. |
+| not empty | shares at least one application | Accepted. |
+| not empty | shares none, or lists none at all | CEA with `5010` DIAMETER_NO_COMMON_APPLICATION, then the connection is closed. The CEA still lists what siphon serves. |
+
+The refusal is logged at `warn` with the peer's name, what it offered and what
+this node serves.
+
+The first row is what siphon did for every peer before it advertised
+applications at all, and it is kept so that a relay or agent written as a
+catch-all handler keeps accepting its peers without a configuration change.
+Such a node answers with a CEA that names no application, which a strict peer
+refuses on its side, and siphon says so with a `warn` at startup. Setting
+`applications` (to `[relay]` for an agent) fixes it.
+
+Two things follow for a script that mixes filter styles. A script with
+`@diameter.on_request("S6a:AIR")` and a catch-all for everything else
+advertises S6a alone, and refuses a peer that offers only Cx. List the other
+applications, or `relay`, under `applications`. And a peer that sends a CER
+with no application in it is refused by any node whose list is not empty.
+
 ## Rx: QoS and bearer events
 
 `diameter.rx_aar` asks the PCRF to authorize the media of a call. With

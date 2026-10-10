@@ -30,7 +30,7 @@ use crate::diameter::auth::{AclMatch, OriginHostPolicy, SourceIpAcl};
 use crate::diameter::codec::{Avp, DiameterMsg};
 use crate::diameter::dictionary;
 use crate::diameter::peer::{self, DiameterPeer, IncomingRequest, PeerConfig};
-use crate::diameter::server::{CerDecision, ServerHandshake, ServerIdentity};
+use crate::diameter::server::{CerDecision, ServerHandshake, ServerIdentity, TenantApplications};
 use crate::diameter::transport::DiameterListener;
 use crate::diameter::{forward, DiameterClient, DiameterManager};
 use crate::script::api::diameter_server::{PyDiameterAnswer, PyDiameterRequest, PyInboundPeer};
@@ -43,6 +43,49 @@ const MAX_INFLIGHT: usize = 512;
 
 /// Per-tenant advertised identity, indexed by tenant name.
 type TenantIdentities = Arc<HashMap<String, (String, String)>>;
+
+/// The applications a tenant serves, as `(vendor_id, application_id)` pairs in
+/// the order they are advertised (RFC 6733 §5.3): the tenant's configured
+/// `applications`, then every application a registered
+/// `@diameter.on_request("<App>:<CMD>")` filter names, each once.
+///
+/// A bare-command or catch-all filter names no application and so adds
+/// nothing. That is deliberate: such a handler takes whatever arrives, and
+/// advertising everything the dictionary knows would claim applications the
+/// script may not implement.
+fn served_applications(configured: &[(u32, u32)], state: &ScriptState) -> Vec<(u32, u32)> {
+    let named = state
+        .diameter_request_handlers()
+        .filter_map(|(filter, _)| split_request_filter(filter?).0)
+        .filter_map(dictionary::app_id_by_name);
+    let mut applications: Vec<(u32, u32)> = Vec::new();
+    for application in configured.iter().copied().chain(named) {
+        if !applications.iter().any(|known| known.1 == application.1) {
+            applications.push(application);
+        }
+    }
+    applications
+}
+
+/// [`served_applications`] per tenant, read off the running script each time
+/// it is asked so that a reload which adds or drops a handler changes what the
+/// next capabilities exchange advertises.
+fn tenant_applications(
+    tenants: &HashMap<String, crate::config::DiameterTenant>,
+    engine: &Arc<ScriptEngine>,
+) -> TenantApplications {
+    let configured: HashMap<String, Vec<(u32, u32)>> = tenants
+        .iter()
+        .map(|(name, tenant)| (name.clone(), tenant.application_ids()))
+        .collect();
+    let engine = Arc::clone(engine);
+    Arc::new(move |tenant: &str| {
+        served_applications(
+            configured.get(tenant).map_or(&[][..], Vec::as_slice),
+            &engine.state(),
+        )
+    })
+}
 
 /// Bootstrap the Diameter server / server NF: connect backends, dial any outbound serving
 /// connections (`connect_to`), and bind the inbound listeners. Runs whenever
@@ -68,6 +111,7 @@ pub fn spawn(
     }
 
     let semaphore = Arc::new(Semaphore::new(MAX_INFLIGHT));
+    let applications = tenant_applications(&tenants, &engine);
 
     // Tenant identities + connect backend servers (relay targets) + outbound
     // serving connections (e.g. a node dialling an upstream).
@@ -78,12 +122,22 @@ pub fn spawn(
             tenant.identity.origin_realm.clone(),
         );
         identities.insert(tenant_name.clone(), identity.clone());
+        if applications(tenant_name).is_empty() {
+            warn!(
+                tenant = %tenant_name,
+                "Diameter server: no application to advertise in the capabilities exchange: no \
+                 @diameter.on_request filter names one and `applications` is not set, so the \
+                 CER/CEA lists none and a strict peer answers DIAMETER_NO_COMMON_APPLICATION \
+                 (list them under `applications`, or `relay` for an agent)"
+            );
+        }
         for server in &tenant.servers {
             spawn_backend_connection(
                 tenant_name,
                 tenant,
                 server,
                 Arc::clone(&manager),
+                Arc::clone(&applications),
                 product_name,
                 product_version,
             );
@@ -95,6 +149,7 @@ pub fn spawn(
                 upstream.clone(),
                 Arc::clone(&engine),
                 Arc::clone(&semaphore),
+                Arc::clone(&applications),
                 product_name,
                 product_version,
             );
@@ -148,8 +203,8 @@ pub fn spawn(
                 .unwrap_or_else(|| product_name.to_string()),
             firmware_revision: peer::version_to_firmware_revision(product_version),
             watchdog_interval: config.watchdog_interval,
-            application_ids: vec![],
         },
+        applications,
     });
 
     if let Some(tcp_addr) = listen.tcp {
@@ -251,11 +306,12 @@ fn spawn_backend_connection(
     tenant: &crate::config::DiameterTenant,
     server: &crate::config::DiameterServerEntry,
     manager: Arc<DiameterManager>,
+    applications: TenantApplications,
     product_name: &str,
     product_version: &str,
 ) {
     let transport = server.transport.clone();
-    let config = PeerConfig {
+    let mut config = PeerConfig {
         host: server.host.clone(),
         port: server.port,
         origin_host: tenant.identity.origin_host.clone(),
@@ -273,6 +329,8 @@ fn spawn_backend_connection(
     let tenant_name = tenant_name.to_string();
     tokio::spawn(async move {
         loop {
+            // Asked per attempt: the CER advertises what the script serves now.
+            config.application_ids = applications(&tenant_name);
             match peer::connect_with_transport(config.clone(), &transport).await {
                 Ok((connected, mut incoming_rx)) => {
                     let client = Arc::new(DiameterClient::new(Arc::clone(&connected)));
@@ -303,11 +361,12 @@ fn spawn_serving_connection(
     entry: crate::config::DiameterServerEntry,
     engine: Arc<ScriptEngine>,
     semaphore: Arc<Semaphore>,
+    applications: TenantApplications,
     product_name: &str,
     product_version: &str,
 ) {
     let (origin_host, origin_realm) = identity;
-    let config = PeerConfig {
+    let mut config = PeerConfig {
         host: entry.host.clone(),
         port: entry.port,
         origin_host: origin_host.clone(),
@@ -331,6 +390,8 @@ fn spawn_serving_connection(
 
     tokio::spawn(async move {
         loop {
+            // Asked per attempt: the CER advertises what the script serves now.
+            config.application_ids = applications(&tenant_name);
             match peer::connect_with_transport(config.clone(), &transport).await {
                 Ok((connected, mut incoming_rx)) => {
                     info!(
@@ -993,10 +1054,7 @@ fn request_filter_score(
     let Some(filter) = filter else {
         return Some(0); // catch-all
     };
-    let (app_token, commands) = match filter.split_once(':') {
-        Some((app, commands)) => (Some(app.trim()), commands),
-        None => (None, filter),
-    };
+    let (app_token, commands) = split_request_filter(filter);
     let command_matches = commands
         .split('|')
         .any(|token| dictionary::command_code_by_name(token.trim()) == Some(command_code));
@@ -1012,6 +1070,15 @@ fn request_filter_score(
     }
 }
 
+/// Split a `@diameter.on_request` filter into the application it names, if
+/// any, and its command list: `"App:CMD|CMD"` or `"CMD|CMD"`.
+fn split_request_filter(filter: &str) -> (Option<&str>, &str) {
+    match filter.split_once(':') {
+        Some((app, commands)) => (Some(app.trim()), commands),
+        None => (None, filter),
+    }
+}
+
 /// Minimal tree carrying just the header fields of a malformed inbound request,
 /// so an error answer can echo its command/app/hbh/e2e.
 fn stub_message(incoming: &IncomingRequest) -> DiameterMsg {
@@ -1022,6 +1089,96 @@ fn stub_message(incoming: &IncomingRequest) -> DiameterMsg {
         hop_by_hop: incoming.hop_by_hop,
         end_to_end: incoming.end_to_end,
         avps: vec![Avp::utf8(dictionary::avp::SESSION_ID, 0, "")],
+    }
+}
+
+#[cfg(test)]
+mod served_applications_tests {
+    use super::*;
+
+    const S6A: (u32, u32) = (dictionary::VENDOR_3GPP, dictionary::S6A_APP_ID);
+    const CX: (u32, u32) = (dictionary::VENDOR_3GPP, dictionary::CX_APP_ID);
+    const RF: (u32, u32) = (0, dictionary::RF_APP_ID);
+    const RELAY: (u32, u32) = (0, dictionary::RELAY_APP_ID);
+
+    fn engine(handlers: &str) -> Arc<ScriptEngine> {
+        let source = format!("{ON_REQUEST}{handlers}");
+        Arc::new(ScriptEngine::new_embedded(&source).expect("the test script should compile"))
+    }
+
+    fn served(configured: &[(u32, u32)], source: &str) -> Vec<(u32, u32)> {
+        served_applications(configured, &engine(source).state())
+    }
+
+    /// What `@diameter.on_request("<filter>")` does. The decorator that takes
+    /// a filter belongs to the namespace installed once `diameter:` is
+    /// configured, which an embedded test script does not have, so the scripts
+    /// below make the same registry call themselves.
+    const ON_REQUEST: &str = concat!(
+        "import _siphon_registry\n",
+        "def on_request(filter=None):\n",
+        "    def decorator(handler):\n",
+        "        _siphon_registry.register('diameter.on_request', filter, handler, False)\n",
+        "        return handler\n",
+        "    return decorator\n",
+    );
+
+    const HSS_HANDLERS: &str = concat!(
+        "@on_request('s6a:AIR')\n",
+        "def on_air(request):\n",
+        "    return request.answer(2001)\n",
+        "@on_request('S6a:ULR|purge-ue')\n",
+        "def on_ulr(request):\n",
+        "    return request.answer(2001)\n",
+        "@on_request('Rf:ACR')\n",
+        "def on_acr(request):\n",
+        "    return request.answer(2001)\n",
+    );
+
+    const CATCH_ALL_HANDLERS: &str = concat!(
+        "@on_request()\n",
+        "def relay(request):\n",
+        "    return None\n",
+        "@on_request('RAR')\n",
+        "def on_rar(request):\n",
+        "    return request.answer(2001)\n",
+    );
+
+    #[test]
+    fn filters_naming_an_application_are_served_once_each() {
+        assert_eq!(served(&[], HSS_HANDLERS), vec![S6A, RF]);
+    }
+
+    #[test]
+    fn bare_and_catch_all_filters_name_no_application() {
+        // Not "every application the dictionary knows": nothing at all.
+        assert!(served(&[], CATCH_ALL_HANDLERS).is_empty());
+    }
+
+    #[test]
+    fn configured_applications_come_first_and_are_not_repeated() {
+        assert_eq!(served(&[CX, S6A], HSS_HANDLERS), vec![CX, S6A, RF]);
+        assert_eq!(served(&[RELAY], CATCH_ALL_HANDLERS), vec![RELAY]);
+    }
+
+    #[test]
+    fn each_tenant_gets_its_own_configured_list_and_the_shared_script() {
+        let mut tenants = HashMap::new();
+        tenants.insert(
+            "alpha".to_string(),
+            crate::config::DiameterTenant {
+                applications: vec![crate::config::DiameterAdvertisedApplication::Application(
+                    crate::config::DiameterApplication::Cx,
+                )],
+                ..Default::default()
+            },
+        );
+        tenants.insert("beta".to_string(), crate::config::DiameterTenant::default());
+        let applications = tenant_applications(&tenants, &engine(HSS_HANDLERS));
+        assert_eq!(applications("alpha"), vec![CX, S6A, RF]);
+        assert_eq!(applications("beta"), vec![S6A, RF]);
+        // A tenant the config does not know still serves what the script names.
+        assert_eq!(applications("gamma"), vec![S6A, RF]);
     }
 }
 

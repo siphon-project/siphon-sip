@@ -4454,6 +4454,78 @@ fn example_diameter_server_yaml_loads() {
     assert_eq!(default.servers[0].name, "backend");
 }
 
+fn diameter_server_yaml(diameter_block: &str) -> Result<Config> {
+    Config::from_str(&format!(
+        "listen:\n  udp: [\"127.0.0.1:5099\"]\ndomain:\n  local: [\"example.org\"]\nscript:\n  path: \"examples/diameter_server.py\"\ndiameter:\n{diameter_block}"
+    ))
+}
+
+#[test]
+fn flat_applications_fold_into_the_default_tenant() {
+    let diameter = diameter_server_yaml(concat!(
+        "  origin_host: \"hss.example.org\"\n",
+        "  origin_realm: \"example.org\"\n",
+        "  applications: [s6a, rf, relay]\n",
+        "  clients:\n",
+        "    - { name: mme, allowed_ips: [\"192.0.2.0/24\"] }\n",
+    ))
+    .expect("applications should parse")
+    .diameter
+    .expect("diameter section");
+    let effective = diameter.effective_tenants();
+    let tenant = effective.get("default").expect("default tenant");
+    assert_eq!(
+        tenant.application_ids(),
+        vec![
+            (
+                crate::diameter::dictionary::VENDOR_3GPP,
+                crate::diameter::dictionary::S6A_APP_ID
+            ),
+            (0, crate::diameter::dictionary::RF_APP_ID),
+            (0, 0xffff_ffff),
+        ]
+    );
+}
+
+#[test]
+fn tenant_applications_parse_and_default_to_none() {
+    let diameter = diameter_server_yaml(concat!(
+        "  tenants:\n",
+        "    alpha:\n",
+        "      identity: { origin_host: \"alpha.example.org\", origin_realm: \"example.org\" }\n",
+        "      applications: [cx, sh]\n",
+        "    beta:\n",
+        "      identity: { origin_host: \"beta.example.org\", origin_realm: \"example.org\" }\n",
+    ))
+    .expect("tenant applications should parse")
+    .diameter
+    .expect("diameter section");
+    assert_eq!(
+        diameter.tenants["alpha"].applications,
+        vec![
+            DiameterAdvertisedApplication::Application(DiameterApplication::Cx),
+            DiameterAdvertisedApplication::Application(DiameterApplication::Sh),
+        ]
+    );
+    assert!(diameter.tenants["beta"].application_ids().is_empty());
+}
+
+#[test]
+fn an_unknown_application_name_is_refused_at_load() {
+    // A typo must not load as "advertise nothing": that would silently turn
+    // the no-common-application check off.
+    let result = diameter_server_yaml(concat!(
+        "  applications: [s6z]\n",
+        "  clients:\n",
+        "    - { name: mme, allowed_ips: [\"192.0.2.0/24\"] }\n",
+    ));
+    let message = result
+        .expect_err("an unknown application must not parse")
+        .to_string();
+    assert!(message.contains("diameter.applications"), "{message}");
+    assert!(message.contains("s6z"), "{message}");
+}
+
 #[test]
 fn effective_tenants_prefers_explicit_over_flat() {
     // When `tenants:` is declared, the flat fields are ignored.
