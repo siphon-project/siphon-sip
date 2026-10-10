@@ -148,7 +148,7 @@ pub fn build_mt_forward_short_message_request(
     avp_bytes.extend_from_slice(&encode_avp_utf8(avp::USER_NAME, user_name));
     avp_bytes.extend_from_slice(&encode_avp_octet_3gpp(
         avp::SC_ADDRESS,
-        &codec::encode_isdn_address_string(sc_address, codec::TON_NPI_INTERNATIONAL_E164),
+        &codec::encode_tbcd_digits(sc_address),
     ));
     avp_bytes.extend_from_slice(&encode_avp_octet_3gpp(avp::SM_RP_UI, sm_rp_ui));
     if let Some(mti) = sm_rp_mti {
@@ -411,11 +411,13 @@ mod tests {
         assert_eq!(codec::hex::decode(sm_rp_ui_hex).unwrap(), pdu);
     }
 
-    /// SC-Address on the TFR wire must be ISDN-AddressString — same fix
-    /// class as the S6c SRR. Asserts the exact bytes so a regression
-    /// reintroducing the raw-ASCII encoder fails loudly.
+    /// SC-Address in the MT-Forward-Short-Message request, the whole AVP
+    /// written out by hand: code 3300 with V and M, vendor 10415, then the
+    /// digits. TS 29.338 clause 6.3.3.2: "This AVP shall not include leading
+    /// indicators for the nature of address and the numbering plan; it shall
+    /// contain only the TBCD-encoded digits of the address."
     #[test]
-    fn tfr_encodes_sc_address_as_isdn_address_string() {
+    fn tfr_encodes_sc_address_as_bare_tbcd() {
         let wire = build_mt_forward_short_message_request(
             &config(),
             "test;1;1",
@@ -429,17 +431,16 @@ mod tests {
             1,
         );
         let decoded = codec::decode_diameter(&wire).unwrap();
-        // "31611111111": (31)(61)(11)(11)(11)(1F) → nibble-swapped
-        // 0x13 0x16 0x11 0x11 0x11 0xF1, with 0x91 ToN/NPI prefix. Pin the
-        // exact octets on the wire (decode-path-independent), then the
-        // round-trip and the decoded serde value (ISDNAddressString type).
-        let sc_isdn = vec![0x91, 0x13, 0x16, 0x11, 0x11, 0x11, 0xF1];
+        let sc_address_avp = [
+            0x00, 0x00, 0x0c, 0xe4, 0xc0, 0x00, 0x00, 0x12, 0x00, 0x00, 0x28, 0xaf, // header
+            0x13, 0x16, 0x11, 0x11, 0x11, 0xf1, // 31 61 11 11 11 1F, nibbles swapped
+            0x00, 0x00, // padding
+        ];
         assert!(
-            wire.windows(sc_isdn.len()).any(|w| w == sc_isdn.as_slice()),
-            "SC-Address must be 0x91 ToN/NPI + TBCD(31611111111) on the wire, \
-             not raw ASCII"
+            wire.windows(sc_address_avp.len())
+                .any(|window| window == sc_address_avp),
+            "SC-Address must be the 6 TBCD octets of 31611111111 and nothing else"
         );
-        assert_eq!(codec::decode_isdn_address_string(&sc_isdn), "31611111111");
         assert_eq!(
             decoded.avps.get("SC-Address").and_then(|v| v.as_str()),
             Some("31611111111"),
@@ -498,10 +499,14 @@ mod tests {
         avp_bytes.extend_from_slice(&encode_avp_utf8(avp::ORIGIN_HOST, "mme1.example.com"));
         avp_bytes.extend_from_slice(&encode_avp_utf8(avp::ORIGIN_REALM, "example.com"));
         avp_bytes.extend_from_slice(&encode_avp_utf8(avp::USER_NAME, "001010000000001"));
-        avp_bytes.extend_from_slice(&encode_avp_octet_3gpp(
-            avp::SC_ADDRESS,
-            &codec::encode_isdn_address_string("31611111111", codec::TON_NPI_INTERNATIONAL_E164),
-        ));
+        // SC-Address 48000000001 as a peer sends it (TS 29.338 clause
+        // 6.3.3.2), written out by hand. Its first octet, 0x84, is the digits
+        // 4 and 8 and has its top bit set.
+        avp_bytes.extend_from_slice(&[
+            0x00, 0x00, 0x0c, 0xe4, 0xc0, 0x00, 0x00, 0x12, 0x00, 0x00, 0x28, 0xaf, // header
+            0x84, 0x00, 0x00, 0x00, 0x00, 0xf1, // 48 00 00 00 00 1F, nibbles swapped
+            0x00, 0x00, // padding
+        ]);
         avp_bytes.extend_from_slice(&encode_avp_octet_3gpp(avp::SM_RP_UI, &pdu));
 
         let wire = encode_diameter_message(
@@ -524,7 +529,7 @@ mod tests {
         };
         let parsed = parse_ofr(&incoming).expect("OFR must parse");
         assert_eq!(parsed.user_name.as_deref(), Some("001010000000001"));
-        assert_eq!(parsed.sc_address.as_deref(), Some("31611111111"));
+        assert_eq!(parsed.sc_address.as_deref(), Some("48000000001"));
         assert_eq!(parsed.sm_rp_ui.as_deref(), Some(pdu.as_slice()));
     }
 
@@ -537,13 +542,13 @@ mod tests {
     fn parse_ofr_names_the_originator_in_user_identifier() {
         let mut identifier = Vec::new();
         identifier.extend_from_slice(&encode_avp_utf8(avp::USER_NAME, "001010000000001"));
-        identifier.extend_from_slice(&encode_avp_octet_3gpp(
-            avp::MSISDN,
-            &codec::encode_isdn_address_string(
-                "001010000000001",
-                codec::TON_NPI_INTERNATIONAL_E164,
-            ),
-        ));
+        // MSISDN 19995550100 as a peer sends it (TS 29.329 clause 6.3.2),
+        // written out by hand. Its first octet, 0x91, is the digits 1 and 9.
+        identifier.extend_from_slice(&[
+            0x00, 0x00, 0x02, 0xbd, 0xc0, 0x00, 0x00, 0x12, 0x00, 0x00, 0x28, 0xaf, // header
+            0x91, 0x99, 0x55, 0x05, 0x01, 0xf0, // 19 99 55 50 10 0F, nibbles swapped
+            0x00, 0x00, // padding
+        ]);
 
         let mut avp_bytes = Vec::new();
         avp_bytes.extend_from_slice(&encode_avp_utf8(avp::SESSION_ID, "test;1;1"));
@@ -567,8 +572,8 @@ mod tests {
             .expect("the grouped AVP must resolve by name, or no script can read the originator");
         assert_eq!(
             identifier.get("MSISDN").and_then(|v| v.as_str()),
-            Some("001010000000001"),
-            "MSISDN is an ISDN-AddressString, so the dictionary TBCD-decodes it to digits"
+            Some("19995550100"),
+            "MSISDN is a TBCD-string, so the dictionary decodes it to digits, all of them"
         );
         assert_eq!(
             identifier.get("User-Name").and_then(|v| v.as_str()),

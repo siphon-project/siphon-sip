@@ -215,7 +215,7 @@ fn decode_avp_value(avp_type: AvpType, data: &[u8]) -> Value {
             }
         }
         AvpType::OctetString => Value::String(hex::encode(data)),
-        AvpType::ISDNAddressString => Value::String(decode_isdn_address_string(data)),
+        AvpType::TbcdString => Value::String(decode_tbcd_digits(data)),
         AvpType::Address => decode_address(data),
         AvpType::Time => {
             if data.len() >= 4 {
@@ -1013,6 +1013,16 @@ pub const TON_NPI_INTERNATIONAL_E164: u8 = 0x91;
 /// TS 23.003 §3.1 — each octet holds two digits packed low-nibble first,
 /// odd-length strings padded with 0xF in the final high nibble.
 ///
+/// This is the whole value of the Diameter AVPs that carry an E.164 number.
+/// MSISDN (TS 29.329 clause 6.3.2), SC-Address (TS 29.338 clause 6.3.3.2),
+/// SGSN-Number and MME-Number-for-MT-SMS (TS 29.272 clauses 7.3.102 and
+/// 7.3.159) and MSC-Number (TS 29.173 clause 6.4.5) are each defined as "a
+/// TBCD-string", and for SC-Address and the two from TS 29.272 the text goes
+/// on: "This AVP shall not include leading indicators for the nature of
+/// address and the numbering plan; it shall contain only the TBCD-encoded
+/// digits of the address." The ISDN-AddressString of MAP, which does start
+/// with such an octet, is a different type ([`encode_isdn_address_string`]).
+///
 /// E.g. `"31"` → `[0x13]`, `"3197010267609"` →
 /// `[0x13, 0x79, 0x10, 0x20, 0x76, 0x06, 0xF9]`.
 pub fn encode_tbcd_digits(digits: &str) -> Vec<u8> {
@@ -1057,11 +1067,12 @@ pub fn decode_tbcd_digits(data: &[u8]) -> String {
 /// Encode an E.164 number as an ISDN-AddressString per 3GPP TS 29.002
 /// §17.7.8 — one ToN/NPI octet followed by the TBCD digit string.
 ///
-/// Used for MSISDN (701, TS 29.336 §6.4.5), SC-Address (3300, TS 29.336
-/// §6.4.6 / TS 29.338 §6.3.2.3), SGSN-Number (1489, TS 29.272 §7.3.102),
-/// and MME-Number-for-MT-SMS (1645, TS 29.272 §7.3.146). A leading `+`
-/// on the input is stripped — international form is signalled via the
-/// ToN/NPI byte, not the literal character.
+/// This is the MAP type. The Diameter AVPs that carry an E.164 number
+/// (MSISDN, SC-Address, SGSN-Number, MME-Number-for-MT-SMS, MSC-Number) are
+/// defined without that octet and use [`encode_tbcd_digits`]; see
+/// `dictionary::AvpType::TbcdString`. A leading `+` on the input is
+/// stripped: international form is signalled via the ToN/NPI byte, not the
+/// literal character.
 pub fn encode_isdn_address_string(digits: &str, ton_npi: u8) -> Vec<u8> {
     let tbcd = encode_tbcd_digits(digits);
     let mut result = Vec::with_capacity(1 + tbcd.len());
@@ -1074,11 +1085,13 @@ pub fn encode_isdn_address_string(digits: &str, ton_npi: u8) -> Vec<u8> {
 /// ToN/NPI octet is consumed but not surfaced (callers route on the digit
 /// part — siphon does not distinguish international vs national today).
 ///
-/// Be lenient on the receive side: some non-conformant peers omit the
-/// ToN/NPI byte and ship raw TBCD. Detection rule — the first byte of an
-/// ISDN-AddressString always has bit 7 set (RFC: extension bit), while a
-/// TBCD digit-pair byte never does (digits are 0x0-0x9). If bit 7 is
-/// clear, treat the whole buffer as TBCD-only.
+/// The first octet of an ISDN-AddressString always has bit 8 set (the
+/// extension bit), so a buffer whose first octet has it clear cannot be one
+/// and is read as bare TBCD. The reverse does not hold: bare TBCD starts with
+/// such an octet whenever the second digit of the number is 8 or 9, and this
+/// function then drops those two digits. So it is only for values known to be
+/// an ISDN-AddressString. The Diameter AVPs defined as a TBCD-string are
+/// decoded with [`decode_tbcd_digits`], never with this.
 pub fn decode_isdn_address_string(data: &[u8]) -> String {
     match data.first() {
         Some(&first) if first & 0x80 != 0 => decode_tbcd_digits(&data[1..]),
@@ -1200,6 +1213,45 @@ mod tests {
     /// 0x76, 0x06, 0xF9]` (7 octets); ISDN-AddressString `[0x91, …]`
     /// (8 octets). Compare against pre-fix behaviour where siphon shipped
     /// 13 raw ASCII bytes (`0x33 0x31 0x39 …`).
+    /// The five AVPs the 3GPP specifications define as a TBCD-string with no
+    /// leading indicator, each written out by hand as a peer sends it, with
+    /// a number whose first octet has its top bit set (the second digit is 8
+    /// or 9). MSISDN: TS 29.329 clause 6.3.2. SC-Address: TS 29.338 clause
+    /// 6.3.3.2. SGSN-Number and MME-Number-for-MT-SMS: TS 29.272 clauses
+    /// 7.3.102 and 7.3.159. MSC-Number: TS 29.173 clause 6.4.5.
+    #[test]
+    fn tbcd_avps_decode_every_digit() {
+        for (name, code) in [
+            ("MSISDN", [0x00u8, 0x00, 0x02, 0xbd]),
+            ("SC-Address", [0x00, 0x00, 0x0c, 0xe4]),
+            ("SGSN-Number", [0x00, 0x00, 0x05, 0xd1]),
+            ("MME-Number-for-MT-SMS", [0x00, 0x00, 0x06, 0x6d]),
+            ("MSC-Number", [0x00, 0x00, 0x09, 0x63]),
+        ] {
+            for (digits, tbcd) in [
+                // 19 99 55 50 10 0F, 49 00 00 00 00 1F, 48 ..., 39 ...
+                ("19995550100", [0x91u8, 0x99, 0x55, 0x05, 0x01, 0xf0]),
+                ("49000000001", [0x94, 0x00, 0x00, 0x00, 0x00, 0xf1]),
+                ("48000000001", [0x84, 0x00, 0x00, 0x00, 0x00, 0xf1]),
+                ("39000000001", [0x93, 0x00, 0x00, 0x00, 0x00, 0xf1]),
+                // and one whose first octet has it clear: 31 61 23 45 67 8F
+                ("31612345678", [0x13, 0x16, 0x32, 0x54, 0x76, 0xf8]),
+            ] {
+                let mut avp = Vec::new();
+                avp.extend_from_slice(&code);
+                avp.extend_from_slice(&[0xc0, 0x00, 0x00, 0x12, 0x00, 0x00, 0x28, 0xaf]);
+                avp.extend_from_slice(&tbcd);
+                avp.extend_from_slice(&[0x00, 0x00]);
+                let decoded = decode_avps(&avp);
+                assert_eq!(
+                    decoded.get(name).and_then(|value| value.as_str()),
+                    Some(digits),
+                    "{name}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn isdn_address_string_matches_ts_29002_wire_format() {
         let tbcd = encode_tbcd_digits("3197010267609");

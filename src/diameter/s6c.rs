@@ -124,11 +124,11 @@ pub fn build_send_routing_info_request(
     ));
     avp_bytes.extend_from_slice(&encode_avp_octet_3gpp(
         avp::MSISDN,
-        &codec::encode_isdn_address_string(msisdn, codec::TON_NPI_INTERNATIONAL_E164),
+        &codec::encode_tbcd_digits(msisdn),
     ));
     avp_bytes.extend_from_slice(&encode_avp_octet_3gpp(
         avp::SC_ADDRESS,
-        &codec::encode_isdn_address_string(sc_address, codec::TON_NPI_INTERNATIONAL_E164),
+        &codec::encode_tbcd_digits(sc_address),
     ));
     if let Some(mti) = sm_rp_mti {
         avp_bytes.extend_from_slice(&encode_avp_u32_3gpp(avp::SM_RP_MTI, mti));
@@ -496,7 +496,7 @@ pub fn build_report_sm_delivery_status_request(
     ));
     avp_bytes.extend_from_slice(&encode_avp_octet_3gpp(
         avp::SC_ADDRESS,
-        &codec::encode_isdn_address_string(sc_address, codec::TON_NPI_INTERNATIONAL_E164),
+        &codec::encode_tbcd_digits(sc_address),
     ));
     avp_bytes.extend_from_slice(&delivery_outcome.encode());
 
@@ -567,6 +567,28 @@ mod tests {
         }
     }
 
+    /// MSISDN (701, V and M, vendor 10415) for 31612345678, written out by
+    /// hand: a 12-octet header, then per TS 29.329 clause 6.3.2 "digits from
+    /// 0 through 9 are encoded 0000 to 1001; 1111 is used as a filler when
+    /// there is an odd number of digits; bits 8 to 5 of octet n encode digit
+    /// 2n; bits 4 to 1 of octet n encode digit 2(n-1)+1". Length 18 (0x12),
+    /// two octets of padding.
+    const MSISDN_31612345678: [u8; 20] = [
+        0x00, 0x00, 0x02, 0xbd, 0xc0, 0x00, 0x00, 0x12, 0x00, 0x00, 0x28, 0xaf, // header
+        0x13, 0x16, 0x32, 0x54, 0x76, 0xf8, // 31 61 23 45 67 8F, nibbles swapped
+        0x00, 0x00, // padding
+    ];
+
+    /// SC-Address (3300, V and M, vendor 10415) for 31611111111. TS 29.338
+    /// clause 6.3.3.2: "This AVP shall not include leading indicators for the
+    /// nature of address and the numbering plan; it shall contain only the
+    /// TBCD-encoded digits of the address."
+    const SC_ADDRESS_31611111111: [u8; 20] = [
+        0x00, 0x00, 0x0c, 0xe4, 0xc0, 0x00, 0x00, 0x12, 0x00, 0x00, 0x28, 0xaf, // header
+        0x13, 0x16, 0x11, 0x11, 0x11, 0xf1, // 31 61 11 11 11 1F, nibbles swapped
+        0x00, 0x00, // padding
+    ];
+
     #[test]
     fn srr_encodes_with_msisdn_and_sc_address() {
         let wire = build_send_routing_info_request(
@@ -586,35 +608,18 @@ mod tests {
         );
         assert_eq!(decoded.application_id, dictionary::S6C_APP_ID);
 
-        // MSISDN and SC-Address are ISDN-AddressString — ToN/NPI 0x91 +
-        // TBCD digit pairs. Pre-fix siphon shipped raw ASCII, which any
-        // conformant HSS rejected as DIAMETER_USER_UNKNOWN. Pin the exact
-        // octets on the wire (decode-path-independent, so a symmetric
-        // encode/decode bug can't hide them), then assert they round-trip
-        // back to the E.164 number and that the serde tree surfaces the
-        // decoded digits (ISDNAddressString type, not hex).
-        // "31612345678": nibble-swap each pair (31)(61)(23)(45)(67)(8F)
-        // → 0x13 0x16 0x32 0x54 0x76 0xF8, with 0x91 ToN/NPI prefix.
-        let msisdn_isdn = vec![0x91, 0x13, 0x16, 0x32, 0x54, 0x76, 0xF8];
+        // TS 29.329 clause 6.3.2 (MSISDN) and TS 29.338 clause 6.3.3.2
+        // (SC-Address): the digits as a TBCD-string and nothing else. The
+        // whole AVP is pinned, header included, so an extra leading octet
+        // shows as a wrong length.
         assert!(
-            wire.windows(msisdn_isdn.len())
-                .any(|w| w == msisdn_isdn.as_slice()),
-            "MSISDN must be 0x91 ToN/NPI + TBCD(31612345678) — 7 octets on \
-             the wire, not 11 ASCII octets"
+            contains(&wire, &MSISDN_31612345678),
+            "MSISDN must be the 6 TBCD octets of 31612345678 and nothing else"
         );
-        assert_eq!(
-            codec::decode_isdn_address_string(&msisdn_isdn),
-            "31612345678"
-        );
-
-        // "31611111111": (31)(61)(11)(11)(11)(1F) → 0x13 0x16 0x11
-        // 0x11 0x11 0xF1, with 0x91 prefix.
-        let sc_isdn = vec![0x91, 0x13, 0x16, 0x11, 0x11, 0x11, 0xF1];
         assert!(
-            wire.windows(sc_isdn.len()).any(|w| w == sc_isdn.as_slice()),
-            "SC-Address must be 0x91 ToN/NPI + TBCD(31611111111) on the wire"
+            contains(&wire, &SC_ADDRESS_31611111111),
+            "SC-Address must be the 6 TBCD octets of 31611111111 and nothing else"
         );
-        assert_eq!(codec::decode_isdn_address_string(&sc_isdn), "31611111111");
 
         let avps = &decoded.avps;
         assert_eq!(
@@ -627,36 +632,51 @@ mod tests {
         );
     }
 
-    /// Regression test for the bug trace's MSISDN "3197010267609" — siphon
-    /// must emit the exact 8-byte ISDN-AddressString the HSS expects, not
-    /// the 13-byte ASCII the pre-fix encoder shipped.
+    /// A number whose second digit is 8 or 9 starts with an octet that has
+    /// its top bit set: 19995550100 is `91 99 55 05 01 f0`. That first octet
+    /// is two digits, not an indicator.
     #[test]
-    fn srr_encodes_bug_report_msisdn_per_ts_29002() {
+    fn srr_encodes_an_msisdn_whose_first_octet_reads_like_an_indicator() {
         let wire = build_send_routing_info_request(
             &config(),
             "test;1;1",
-            "3197010267609",
+            "19995550100",
             "31611111111",
             Some(0),
             1,
             1,
         );
+        let msisdn_avp = [
+            0x00, 0x00, 0x02, 0xbd, 0xc0, 0x00, 0x00, 0x12, 0x00, 0x00, 0x28, 0xaf, // header
+            0x91, 0x99, 0x55, 0x05, 0x01, 0xf0, // 19 99 55 50 10 0F, nibbles swapped
+            0x00, 0x00, // padding
+        ];
+        assert!(contains(&wire, &msisdn_avp));
         let decoded = codec::decode_diameter(&wire).unwrap();
-        let msisdn_isdn = vec![0x91, 0x13, 0x79, 0x10, 0x20, 0x76, 0x06, 0xF9];
-        assert!(
-            wire.windows(msisdn_isdn.len())
-                .any(|w| w == msisdn_isdn.as_slice()),
-            "MSISDN 3197010267609 must be the exact 8-byte ISDN-AddressString \
-             on the wire, not the 13-byte ASCII the pre-fix encoder shipped"
-        );
-        assert_eq!(
-            codec::decode_isdn_address_string(&msisdn_isdn),
-            "3197010267609"
-        );
         assert_eq!(
             decoded.avps.get("MSISDN").and_then(|v| v.as_str()),
-            Some("3197010267609"),
+            Some("19995550100"),
         );
+    }
+
+    /// The Report-SM-Delivery-Status request carries SC-Address the same way.
+    #[test]
+    fn rsr_encodes_sc_address_as_bare_tbcd() {
+        let wire = build_report_sm_delivery_status_request(
+            &config(),
+            "test;1;1",
+            "001010000000001",
+            "31611111111",
+            &SmDeliveryOutcome::new(
+                SmDeliveryNode::Mme,
+                SmDeliveryCause::SuccessfulTransfer,
+                None,
+            )
+            .unwrap(),
+            1,
+            1,
+        );
+        assert!(contains(&wire, &SC_ADDRESS_31611111111));
     }
 
     #[test]
@@ -676,18 +696,20 @@ mod tests {
 
     #[test]
     fn parse_sra_with_mme_and_user_name() {
-        // Build an SRA-shaped answer the way a TS 29.272 §7.3.146-conformant
-        // HSS would — MME-Number-for-MT-SMS encoded as ISDN-AddressString.
+        // An SRA the way TS 29.272 clause 7.3.159 has it: MME-Number-for-MT-SMS
+        // is a TBCD-string with no leading indicator. Written out by hand for
+        // 49000000001, whose first octet (0x94) has its top bit set.
         let mut avp_bytes = Vec::new();
         avp_bytes.extend_from_slice(&encode_avp_utf8(avp::SESSION_ID, "test;1;1"));
         avp_bytes.extend_from_slice(&encode_avp_utf8(avp::ORIGIN_HOST, "hss1.example.com"));
         avp_bytes.extend_from_slice(&encode_avp_utf8(avp::ORIGIN_REALM, "example.com"));
         avp_bytes.extend_from_slice(&encode_avp_u32(avp::RESULT_CODE, 2001));
         avp_bytes.extend_from_slice(&encode_avp_utf8(avp::USER_NAME, "001010000000001"));
-        avp_bytes.extend_from_slice(&encode_avp_octet_3gpp(
-            avp::MME_NUMBER_FOR_MT_SMS,
-            &codec::encode_isdn_address_string("31698765432", codec::TON_NPI_INTERNATIONAL_E164),
-        ));
+        avp_bytes.extend_from_slice(&[
+            0x00, 0x00, 0x06, 0x6d, 0xc0, 0x00, 0x00, 0x12, 0x00, 0x00, 0x28, 0xaf, // 1645
+            0x94, 0x00, 0x00, 0x00, 0x00, 0xf1, // 49 00 00 00 00 1F, nibbles swapped
+            0x00, 0x00, // padding
+        ]);
 
         let wire = encode_diameter_message(
             FLAG_PROXIABLE,
@@ -701,7 +723,7 @@ mod tests {
         let parsed = parse_sra(&decoded).expect("SRA must parse");
         assert_eq!(parsed.result_code, 2001);
         assert_eq!(parsed.user_name.as_deref(), Some("001010000000001"));
-        assert_eq!(parsed.mme_number_for_mt_sms.as_deref(), Some("31698765432"));
+        assert_eq!(parsed.mme_number_for_mt_sms.as_deref(), Some("49000000001"));
         assert!(parsed.sgsn_number.is_none());
     }
 
@@ -721,7 +743,7 @@ mod tests {
         ));
         serving.extend_from_slice(&encode_avp_octet_3gpp(
             avp::MME_NUMBER_FOR_MT_SMS,
-            &codec::encode_isdn_address_string("999000000001", codec::TON_NPI_INTERNATIONAL_E164),
+            &codec::encode_tbcd_digits("999000000001"),
         ));
 
         let mut avp_bytes = Vec::new();
@@ -820,21 +842,21 @@ mod tests {
         assert_eq!(parsed.sgd_destination(), None);
     }
 
-    /// Parser must tolerate peers that omit the ToN/NPI prefix and ship
-    /// raw TBCD digits — some non-conformant HSSes do this.
+    /// SGSN-Number is a TBCD-string with no leading indicator (TS 29.272
+    /// clause 7.3.102). Written out by hand for 39000000001, whose first
+    /// octet (0x93) has its top bit set: the country code must survive.
     #[test]
-    fn parse_sra_tolerates_raw_tbcd_sgsn_number() {
+    fn parse_sra_reads_an_sgsn_number_as_bare_tbcd() {
         let mut avp_bytes = Vec::new();
         avp_bytes.extend_from_slice(&encode_avp_utf8(avp::SESSION_ID, "test;1;1"));
         avp_bytes.extend_from_slice(&encode_avp_utf8(avp::ORIGIN_HOST, "hss1.example.com"));
         avp_bytes.extend_from_slice(&encode_avp_utf8(avp::ORIGIN_REALM, "example.com"));
         avp_bytes.extend_from_slice(&encode_avp_u32(avp::RESULT_CODE, 2001));
-        // 7 TBCD octets, no ToN/NPI byte — first nibble is 0x3 (bit 7
-        // clear), so the parser falls back to TBCD-only decoding.
-        avp_bytes.extend_from_slice(&encode_avp_octet_3gpp(
-            avp::SGSN_NUMBER,
-            &codec::encode_tbcd_digits("31698765432"),
-        ));
+        avp_bytes.extend_from_slice(&[
+            0x00, 0x00, 0x05, 0xd1, 0xc0, 0x00, 0x00, 0x12, 0x00, 0x00, 0x28, 0xaf, // 1489
+            0x93, 0x00, 0x00, 0x00, 0x00, 0xf1, // 39 00 00 00 00 1F, nibbles swapped
+            0x00, 0x00, // padding
+        ]);
 
         let wire = encode_diameter_message(
             FLAG_PROXIABLE,
@@ -846,7 +868,7 @@ mod tests {
         );
         let decoded = codec::decode_diameter(&wire).unwrap();
         let parsed = parse_sra(&decoded).expect("SRA must parse");
-        assert_eq!(parsed.sgsn_number.as_deref(), Some("31698765432"));
+        assert_eq!(parsed.sgsn_number.as_deref(), Some("39000000001"));
     }
 
     #[test]
@@ -1275,6 +1297,61 @@ mod tests {
         let mut dump = String::new();
         for outcome in outcomes_for_external_dissection() {
             for (offset, chunk) in rsr(&outcome).chunks(16).enumerate() {
+                dump.push_str(&format!("{:06x}", offset * 16));
+                for byte in chunk {
+                    dump.push_str(&format!(" {byte:02x}"));
+                }
+                dump.push('\n');
+            }
+            dump.push('\n');
+        }
+        std::fs::write(&path, dump).expect("hex dump must be writable");
+    }
+
+    /// Emit an SRR, an RSR and an SGd MT-Forward-Short-Message request as hex
+    /// for [`scripts/validate_diameter_sms_addresses.sh`] to feed to tshark,
+    /// which reads the MSISDN and the SC-Address with its own dissector. The
+    /// MSISDN is one whose first octet has its top bit set.
+    #[test]
+    fn emit_sms_addresses_for_external_dissection() {
+        let Ok(path) = std::env::var("SIPHON_SMS_ADDRESSES_HEX_OUT") else {
+            // Nothing to do in an ordinary test run.
+            return;
+        };
+        let packets = [
+            build_send_routing_info_request(
+                &config(),
+                "smsc.example.com;1;1",
+                "19995550100",
+                "31611111111",
+                Some(0),
+                1,
+                1,
+            ),
+            rsr(&through_the_mme(SmDeliveryCause::SuccessfulTransfer)),
+            crate::diameter::sgd::build_mt_forward_short_message_request(
+                &config(),
+                "smsc.example.com;1;2",
+                "001010000000001",
+                "31611111111",
+                // An SMS-DELIVER from 31612345678 saying "hi" (TS 23.040).
+                &[
+                    0x04, 0x0b, 0x91, 0x13, 0x16, 0x32, 0x54, 0x76, 0xf8, 0x00, 0x00, 0x62, 0x01,
+                    0x01, 0x21, 0x00, 0x00, 0x00, 0x02, 0xe8, 0x34,
+                ],
+                None,
+                Some(0),
+                None,
+                2,
+                2,
+            ),
+        ];
+
+        // `text2pcap`'s hex-dump form: an offset, then the octets. An offset
+        // of zero starts the next packet.
+        let mut dump = String::new();
+        for packet in packets {
+            for (offset, chunk) in packet.chunks(16).enumerate() {
                 dump.push_str(&format!("{:06x}", offset * 16));
                 for byte in chunk {
                     dump.push_str(&format!(" {byte:02x}"));
