@@ -70,6 +70,21 @@ entry, but a working config keeps working.
   AVPs in order and allows repeats, and its `remove_avp` returns how many AVPs
   it removed, as siphon does, where it returned at most 1.
 
+- **`diameter.rx_aar` can mark an emergency session.** `service_urn=` takes the
+  service URN of the request, e.g. `"urn:service:sos"` or
+  `"urn:service:sos.police"`, and sends it as Service-URN (TS 29.214 clause
+  5.3.23, AVP 525, vendor 10415, V and M), which tells the PCRF the AF session
+  is an emergency one (clause 4.4.1). An AAR for an emergency call was
+  indistinguishable from any other. The AVP holds the URN without its
+  `urn:service:`, as clause 5.3.23 has it ("The string "urn:service:" in the
+  beginning of the URN shall be omitted in the AVP"), so the PCRF receives
+  `sos`; `"sos"` is accepted as given, and a URN with nothing after the
+  prefix raises `ValueError`. Without the argument nothing changes on the
+  wire. `Service-URN` is also a dictionary name now, for `get_avp` and
+  `set_avp`. The Rust `rx::RxSessionRequest` has a new `service_urn` field.
+  Checked against Wireshark's Diameter dissector with
+  `scripts/validate_rx_aar.sh`.
+
 ### Removed
 
 - **`ro.charge_message` is gone.** It was documented as one-shot charging of

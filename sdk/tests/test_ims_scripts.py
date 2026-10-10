@@ -554,6 +554,14 @@ class TestMockDiameterCx:
         assert result["result_code"] == 2001
         assert "session_id" in result
 
+    def test_rx_aar_takes_a_service_urn(self):
+        for urn in ("urn:service:sos", "urn:service:sos.police", "sos"):
+            result = run(self.diameter.rx_aar(service_urn=urn))
+            assert result["result_code"] == 2001
+        for empty in ("", "urn:service:"):
+            with pytest.raises(ValueError, match="service_urn"):
+                self.diameter.rx_aar(service_urn=empty)
+
     def test_clear_resets_all(self):
         self.diameter.add_peer("hss1")
         self.diameter.set_default_server_name("sip:scscf:6060")

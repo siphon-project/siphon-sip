@@ -284,6 +284,23 @@ pub struct RxSessionRequest<'a> {
     pub framed_ip: Option<&'a [u8]>,
     pub framed_ipv6: Option<&'a [u8]>,
     pub subscription_id: Option<(&'a str, u32)>,
+    /// The service URN that marks an emergency (or other well-known
+    /// service) session, sent as Service-URN. See [`service_urn_value`].
+    pub service_urn: Option<&'a str>,
+}
+
+/// The value of the Service-URN AVP for a service URN (TS 29.214 clause
+/// 5.3.23): "The string "urn:service:" in the beginning of the URN shall be
+/// omitted in the AVP and all subsequent text shall be included. Examples of
+/// valid values of the AVP are "sos", "sos.fire", "sos.police" and
+/// "sos.ambulance"." `None` when nothing is left to send.
+pub fn service_urn_value(urn: &str) -> Option<&str> {
+    const PREFIX: &str = "urn:service:";
+    let value = match urn.get(..PREFIX.len()) {
+        Some(start) if start.eq_ignore_ascii_case(PREFIX) => &urn[PREFIX.len()..],
+        _ => urn,
+    };
+    Some(value).filter(|value| !value.is_empty())
 }
 
 /// Parsed AA-Answer from the PCRF.
@@ -404,6 +421,11 @@ pub fn encode_aar(
     }
     if let Some(ipv6) = params.framed_ipv6 {
         payload.extend_from_slice(&encode_avp_octet(avp::FRAMED_IPV6_PREFIX, ipv6));
+    }
+
+    // Service-URN (§5.3.23): this AF session is an emergency one (§4.4.1).
+    if let Some(value) = params.service_urn.and_then(service_urn_value) {
+        payload.extend_from_slice(&encode_avp_octet_3gpp(avp::SERVICE_URN, value.as_bytes()));
     }
 
     // Rx-Request-Type (§5.3.31). Table 5.3.1 forbids the M-bit on it, so a
@@ -776,8 +798,85 @@ mod tests {
             framed_ip: None,
             framed_ipv6: None,
             subscription_id: None,
+            service_urn: None,
         };
         encode_aar(&test_peer_config(None), 7, 9, "pcscf;1;1", &params)
+    }
+
+    fn aar_with_service_urn(service_urn: Option<&str>) -> Vec<u8> {
+        let params = RxSessionRequest {
+            session_id: None,
+            af_application_id: b"IMS Services",
+            media_components: &[],
+            specific_actions: &[],
+            rx_request_type: RxRequestType::InitialRequest,
+            framed_ip: None,
+            framed_ipv6: None,
+            subscription_id: None,
+            service_urn,
+        };
+        encode_aar(&test_peer_config(None), 7, 9, "pcscf;1;1", &params)
+    }
+
+    fn service_urn_avps(wire: &[u8]) -> Vec<Vec<u8>> {
+        raw_top_level_avps(wire)
+            .into_iter()
+            .filter(|(code, _)| *code == 525)
+            .map(|(_, bytes)| bytes.to_vec())
+            .collect()
+    }
+
+    /// Service-URN by hand from TS 29.214 Table 5.3.0.1 and clause 5.3.23:
+    /// code 525 (0x20d), V and M, vendor 10415, an OctetString holding the
+    /// URN without its "urn:service:". "sos" is 3 octets, so the length is
+    /// 15 and one octet pads.
+    #[test]
+    fn aar_carries_the_service_urn_without_its_urn_service_prefix() {
+        let sos = vec![
+            0x00, 0x00, 0x02, 0x0d, 0xc0, 0x00, 0x00, 0x0f, 0x00, 0x00, 0x28, 0xaf, // header
+            b's', b'o', b's', 0x00,
+        ];
+        assert_eq!(
+            service_urn_avps(&aar_with_service_urn(Some("urn:service:sos"))),
+            std::slice::from_ref(&sos)
+        );
+        // The value the AVP holds may be given as it is.
+        assert_eq!(service_urn_avps(&aar_with_service_urn(Some("sos"))), [sos]);
+
+        // "sos.police" is 10 octets: length 22 (0x16), two octets pad.
+        let mut police = vec![
+            0x00, 0x00, 0x02, 0x0d, 0xc0, 0x00, 0x00, 0x16, 0x00, 0x00, 0x28, 0xaf,
+        ];
+        police.extend_from_slice(b"sos.police\0\0");
+        assert_eq!(
+            service_urn_avps(&aar_with_service_urn(Some("URN:SERVICE:sos.police"))),
+            [police]
+        );
+    }
+
+    #[test]
+    fn aar_without_a_service_urn_carries_no_avp_525() {
+        assert!(service_urn_avps(&aar_with_service_urn(None)).is_empty());
+    }
+
+    #[test]
+    fn service_urn_value_drops_the_prefix_and_refuses_an_empty_rest() {
+        assert_eq!(service_urn_value("urn:service:sos"), Some("sos"));
+        assert_eq!(service_urn_value("urn:service:sos.fire"), Some("sos.fire"));
+        assert_eq!(service_urn_value("Urn:Service:sos"), Some("sos"));
+        assert_eq!(service_urn_value("sos.ambulance"), Some("sos.ambulance"));
+        assert_eq!(service_urn_value("urn:service:"), None);
+        assert_eq!(service_urn_value(""), None);
+    }
+
+    /// An inbound AAR names the AVP, so a script reads it by name.
+    #[test]
+    fn service_urn_decodes_by_name() {
+        let decoded = decode_diameter(&aar_with_service_urn(Some("sos"))).unwrap();
+        assert_eq!(
+            decoded.avps["Service-URN"].as_str(),
+            Some(crate::diameter::codec::hex::encode(b"sos").as_str())
+        );
     }
 
     #[test]
@@ -792,6 +891,7 @@ mod tests {
             framed_ip: None,
             framed_ipv6: None,
             subscription_id: None,
+            service_urn: None,
         };
         let wire = encode_aar(&config, 7, 9, "pcscf;1;1", &params);
 

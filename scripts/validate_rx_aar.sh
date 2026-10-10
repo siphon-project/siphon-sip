@@ -93,6 +93,9 @@ expect diameter.Session-Id "pcscf.ims.mnc001.mcc001.3gppnetwork.org;1;1"
 expect diameter.Destination-Host pcrf1.ims.mnc001.mcc001.3gppnetwork.org
 expect diameter.Specific-Action 6,7,9
 expect diameter.Rx-Request-Type 0
+# TS 29.214 §5.3.23: the URN without its "urn:service:", so "sos" for
+# urn:service:sos. An OctetString, which tshark prints as octets.
+expect diameter.Service-URN 736f73
 
 # TS 29.214 §5.3.13 names, read from Wireshark's dictionary rather than ours.
 check_tree "6 is IP-CAN_CHANGE" 'Specific-Action: IP-CAN_CHANGE \(6\)'
@@ -105,6 +108,8 @@ check_tree "Rx-Request-Type is INITIAL_REQUEST" 'Rx-Request-Type: INITIAL_REQUES
 # carry M.
 check_flags "Specific-Action flags M+V" "AVP Code: 513 Specific-Action" \
   "AVP Flags: 0xc0, Vendor-Specific: Set, Mandatory: Set" 3
+check_flags "Service-URN flags M+V" "AVP Code: 525 Service-URN" \
+  "AVP Flags: 0xc0, Vendor-Specific: Set, Mandatory: Set" 1
 check_flags "Rx-Request-Type flags V only" "AVP Code: 533 Rx-Request-Type" \
   "AVP Flags: 0x80, Vendor-Specific: Set" 1
 

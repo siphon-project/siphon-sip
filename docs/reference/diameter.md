@@ -174,6 +174,12 @@ Subscribe in the first AAR for a session. Apart from one-time actions such as
 ACCESS_NETWORK_INFO_REPORT, a Specific-Action only counts there and then holds
 for the life of the Rx session.
 
+For an emergency session pass the service URN of the request as
+`service_urn`, for example `"urn:service:sos"`. It goes out as Service-URN,
+which tells the PCRF the AF session is an emergency one so it can apply its
+emergency policy (TS 29.214 §4.4.1). The AVP holds the URN without its
+`urn:service:` (§5.3.23), so the PCRF receives `sos`.
+
 Every AAR carries Rx-Request-Type: INITIAL_REQUEST, or UPDATE_REQUEST when
 `session_id` reuses an existing session (TS 29.214 §4.4.1, §4.4.2). It is sent
 without the M-bit, so a PCRF that does not know the AVP skips it. When the Rx
