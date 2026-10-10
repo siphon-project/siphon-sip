@@ -35,6 +35,46 @@ re-authorisation with nothing pointing at the script.
 Returning `None` stays `3002` on purpose: declining is a routing answer, and it
 is the documented way for a handler to say "not mine".
 
+### Application names
+
+A filter on `@diameter.on_request` can name the application as well as the
+command (`"S6a:ULR"`, `"Gx:CCR"`), and `diameter.send_request(...,
+application=...)` and `diameter.routes[].application` take the same names.
+They are case-insensitive in a script and lowercase in `siphon.yaml`.
+
+| Name | Application-Id | Vendor-Id | Specification |
+|---|---|---|---|
+| `Cx` | 16777216 | 10415 | TS 29.229 |
+| `Sh` | 16777217 | 10415 | TS 29.329 |
+| `Rx` | 16777236 | 10415 | TS 29.214 |
+| `Gx` | 16777238 | 10415 | TS 29.212 |
+| `S6a` | 16777251 | 10415 | TS 29.272 |
+| `S6c` | 16777312 | 10415 | TS 29.338 |
+| `SGd` | 16777313 | 10415 | TS 29.338 |
+| `Ro` | 4 | none | RFC 8506, TS 32.299 |
+| `Rf` | 3 | none | RFC 6733, TS 32.299 |
+
+Some command codes belong to more than one application: Credit-Control (272)
+is both Ro and Gx, Re-Auth (258) both Rx and Gx. A bare `"CCR"` filter matches
+the command on any application; `"Gx:CCR"` and `"Ro:CCR"` match only their own
+Application-Id, so one script can serve both without either handler seeing the
+other's requests.
+
+```python
+@diameter.on_request("Gx:CCR")
+def gx_credit_control(request):
+    return request.answer(2001)
+
+@diameter.on_request("Ro:CCR")
+def ro_credit_control(request):
+    return request.answer(2001)
+```
+
+An application listed under `diameter.routes` is advertised to that peer in
+the CER: the 3GPP ones as a `Vendor-Specific-Application-Id` holding
+`Vendor-Id` 10415 and the `Auth-Application-Id`, Ro as a bare
+`Auth-Application-Id`, Rf as a bare `Acct-Application-Id`.
+
 ## Rx: QoS and bearer events
 
 `diameter.rx_aar` asks the PCRF to authorize the media of a call. With

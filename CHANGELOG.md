@@ -46,6 +46,19 @@ entry, but a working config keeps working.
   that registered a namespace of its own called `config` has to rename it. See
   `docs/reference/script-config.md`.
 
+- **Gx is a named Diameter application.** `"Gx"` (TS 29.212, Vendor-Id 10415,
+  Application-Id 16777238) resolves wherever an application is given by name:
+  the `@diameter.on_request("Gx:CCR")` filter, which raised `ValueError:
+  unknown Diameter application` when the script loaded,
+  `diameter.send_request(..., application="Gx")`, and `application: gx` under
+  `diameter.routes`, which advertises it to that peer in the CER as a
+  `Vendor-Specific-Application-Id` with an `Auth-Application-Id`.
+  `request.application_name` reads `"Gx"` for such a request, where it was
+  `None`. Credit-Control (272) is shared with Ro and Re-Auth (258) with Rx: an
+  application-qualified filter matches on the Application-Id of the request,
+  so a `"Gx:CCR"` handler and a `"Ro:CCR"` handler each see only their own. See
+  `docs/reference/diameter.md`.
+
 ### Removed
 
 - **`ro.charge_message` is gone.** It was documented as one-shot charging of

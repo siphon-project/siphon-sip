@@ -467,7 +467,7 @@ pub fn encode_generic_answer(
         origin_realm,
     ));
     avp_buf.extend_from_slice(&encode_avp_u32(dictionary::avp::AUTH_SESSION_STATE, 1));
-    // Apps with a 3GPP-vendor application-id (Cx, Sh, Rx, S6c, SGd) need
+    // Apps with a 3GPP-vendor application-id (Cx, Sh, Gx, Rx, S6c, SGd) need
     // Vendor-Specific-Application-Id; base apps (Ro, Rf) don't. Match
     // dictionary::app_name_by_id to detect the vendor side.
     if let Some(name) = dictionary::app_name_by_id(application_id) {
@@ -1276,6 +1276,51 @@ mod tests {
         );
         // 3GPP-vendor app must carry Vendor-Specific-Application-Id.
         assert!(decoded.avps.get("Vendor-Specific-Application-Id").is_some());
+    }
+
+    #[test]
+    fn generic_answer_on_gx_carries_the_gx_vendor_specific_app_id() {
+        // Credit-Control is answered on two applications. On Gx (TS 29.212)
+        // the answer names the 3GPP application; on Ro (base, application 4)
+        // it carries no Vendor-Specific-Application-Id at all.
+        let answer = |application_id| {
+            let wire = encode_generic_answer(
+                "siphon.example.org",
+                "example.org",
+                "test;1;1",
+                dictionary::CMD_CREDIT_CONTROL,
+                application_id,
+                dictionary::DIAMETER_SUCCESS,
+                10,
+                20,
+            );
+            DiameterMsg::from_wire(&wire).expect("decode generic answer")
+        };
+
+        let gx = answer(dictionary::GX_APP_ID);
+        assert_eq!(gx.application_id, 16_777_238);
+        let group = gx
+            .find(dictionary::avp::VENDOR_SPECIFIC_APPLICATION_ID, 0)
+            .expect("a Gx answer carries Vendor-Specific-Application-Id");
+        let AvpData::Grouped(children) = &group.value else {
+            panic!("Vendor-Specific-Application-Id must decode as a grouped AVP");
+        };
+        let child = |code| {
+            children
+                .iter()
+                .find(|avp| avp.code == code)
+                .and_then(|avp| avp.as_u32())
+        };
+        assert_eq!(child(dictionary::avp::VENDOR_ID), Some(10415));
+        assert_eq!(
+            child(dictionary::avp::AUTH_APPLICATION_ID),
+            Some(16_777_238)
+        );
+
+        let ro = answer(dictionary::RO_APP_ID);
+        assert!(ro
+            .find(dictionary::avp::VENDOR_SPECIFIC_APPLICATION_ID, 0)
+            .is_none());
     }
 
     #[test]

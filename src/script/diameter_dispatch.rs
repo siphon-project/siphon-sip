@@ -1098,6 +1098,36 @@ mod filter_tests {
     use crate::diameter::dictionary;
 
     #[test]
+    fn request_filter_score_keeps_gx_and_ro_credit_control_apart() {
+        // Credit-Control (272) is one command code on two applications: Ro
+        // (RFC 4006, application 4) and Gx (TS 29.212, application 16777238).
+        // The application id in the header is the only thing that tells them
+        // apart, so an app-qualified filter must match on it.
+        let gx = dictionary::GX_APP_ID;
+        let ro = dictionary::RO_APP_ID;
+        let ccr = dictionary::CMD_CREDIT_CONTROL;
+        let rar = dictionary::CMD_RE_AUTH;
+
+        assert_eq!(request_filter_score(Some("Gx:CCR"), gx, ccr), Some(2));
+        assert_eq!(request_filter_score(Some("Gx:CCR"), ro, ccr), None);
+        assert_eq!(request_filter_score(Some("Ro:CCR"), ro, ccr), Some(2));
+        assert_eq!(request_filter_score(Some("Ro:CCR"), gx, ccr), None);
+        // Case and whitespace tolerance, as for every other application.
+        assert_eq!(request_filter_score(Some(" gx : ccr "), gx, ccr), Some(2));
+        // Re-Auth (258) is shared with Rx in the same way.
+        assert_eq!(request_filter_score(Some("Gx:RAR"), gx, rar), Some(2));
+        assert_eq!(
+            request_filter_score(Some("Gx:RAR"), dictionary::RX_APP_ID, rar),
+            None
+        );
+        assert_eq!(request_filter_score(Some("Rx:RAR"), gx, rar), None);
+        // A bare command still matches either application, at lower
+        // specificity than the app-qualified form.
+        assert_eq!(request_filter_score(Some("CCR"), gx, ccr), Some(1));
+        assert_eq!(request_filter_score(Some("CCR"), ro, ccr), Some(1));
+    }
+
+    #[test]
     fn request_filter_score_specificity() {
         let s6a = dictionary::S6A_APP_ID;
         let ulr = dictionary::CMD_UPDATE_LOCATION;
@@ -1185,8 +1215,12 @@ mod handler_failure_tests {
     }
 
     fn incoming() -> crate::diameter::peer::IncomingRequest {
+        incoming_credit_control(dictionary::RO_APP_ID)
+    }
+
+    /// An inbound Credit-Control-Request on the given application.
+    fn incoming_credit_control(application_id: u32) -> crate::diameter::peer::IncomingRequest {
         let command_code = dictionary::CMD_CREDIT_CONTROL;
-        let application_id = dictionary::RO_APP_ID;
         crate::diameter::peer::IncomingRequest {
             command_code,
             application_id,
@@ -1209,15 +1243,22 @@ mod handler_failure_tests {
     /// Compile `source` as the running script and return the Result-Code of the
     /// answer siphon produces for one inbound CCR.
     fn answer_result_code(source: &str) -> u32 {
+        answer_result_code_for(source, &incoming())
+    }
+
+    /// As [`answer_result_code`], for a caller-supplied inbound request.
+    fn answer_result_code_for(
+        source: &str,
+        request: &crate::diameter::peer::IncomingRequest,
+    ) -> u32 {
         let engine =
             Arc::new(ScriptEngine::new_embedded(source).expect("the test script should compile"));
-        let request = incoming();
         let peer_info = peer();
         let wire = Python::attach(|python| {
             build_answer_via_handler(
                 python,
                 &engine,
-                &request,
+                request,
                 &peer_info,
                 "siphon.example.net",
                 "example.net",
@@ -1316,6 +1357,81 @@ mod handler_failure_tests {
                 "    return request.answer(2001)\n",
             )),
             dictionary::DIAMETER_SUCCESS,
+        );
+    }
+
+    /// One script serving Credit-Control on both applications that use it.
+    /// Each handler answers a Result-Code the other does not, so the answer
+    /// says which one ran.
+    ///
+    /// The handlers go into the registry the way the filtered decorator puts
+    /// them there (`"diameter.on_request"`, the filter string, the function):
+    /// the embedded test engine carries the placeholder `diameter` namespace,
+    /// which has only the bare decorator. The decorator's own acceptance of
+    /// `"Gx:CCR"` is covered next to it in `script::api::diameter`.
+    const GX_AND_RO_HANDLERS: &str = concat!(
+        "import _siphon_registry\n",
+        "\n",
+        "def gx_credit_control(request):\n",
+        "    return request.answer(2001)\n",
+        "\n",
+        "def ro_credit_control(request):\n",
+        "    return request.answer(4012)\n",
+        "\n",
+        "_siphon_registry.register('diameter.on_request', 'Gx:CCR', gx_credit_control, False)\n",
+        "_siphon_registry.register('diameter.on_request', 'Ro:CCR', ro_credit_control, False)\n",
+    );
+
+    #[test]
+    fn a_gx_ccr_reaches_only_the_gx_handler() {
+        assert_eq!(
+            answer_result_code_for(
+                GX_AND_RO_HANDLERS,
+                &incoming_credit_control(dictionary::GX_APP_ID),
+            ),
+            2001,
+        );
+    }
+
+    #[test]
+    fn an_ro_ccr_reaches_only_the_ro_handler() {
+        assert_eq!(
+            answer_result_code_for(
+                GX_AND_RO_HANDLERS,
+                &incoming_credit_control(dictionary::RO_APP_ID),
+            ),
+            4012,
+        );
+    }
+
+    #[test]
+    fn a_ccr_on_one_application_is_not_served_by_the_others_handler() {
+        // With no handler for its application the request is unserved (3002);
+        // it must not fall through to the other application's handler because
+        // the command code happens to match.
+        let ro_only = concat!(
+            "import _siphon_registry\n",
+            "\n",
+            "def ro_credit_control(request):\n",
+            "    return request.answer(2001)\n",
+            "\n",
+            "_siphon_registry.register('diameter.on_request', 'Ro:CCR', ro_credit_control, False)\n",
+        );
+        assert_eq!(
+            answer_result_code_for(ro_only, &incoming_credit_control(dictionary::GX_APP_ID)),
+            dictionary::DIAMETER_UNABLE_TO_DELIVER,
+        );
+        let gx_only = concat!(
+            "import _siphon_registry\n",
+            "\n",
+            "def gx_credit_control(request):\n",
+            "    return request.answer(2001)\n",
+            "\n",
+            "_siphon_registry.register('diameter.on_request', 'gx:ccr', gx_credit_control, False)\n",
+        );
+        assert_eq!(
+            answer_result_code_for(gx_only, &incoming_credit_control(dictionary::RO_APP_ID)),
+            dictionary::DIAMETER_UNABLE_TO_DELIVER,
         );
     }
 
