@@ -107,6 +107,21 @@ entry, but a working config keeps working.
   `applications`, and a relay that connects to a siphon node serving named
   applications sets `applications: [relay]` so that its CER is no longer
   empty. See `docs/reference/diameter.md`.
+- **A B2BUA call's provisional responses carry the caller's `Record-Route`
+  (RFC 3261 §12.1.1).** A UAS copies every `Record-Route` value of the request,
+  in order, into each response that establishes a dialog, and a 101-199 with a
+  To tag establishes one early. siphon did so on the 2xx and on a provisional
+  of its own (`call.progress()`), but an 18x relayed from the callee went to the
+  caller with none: the callee's values are removed, as they belong to the
+  other dialog, and the caller's were not put back. A caller that took its
+  route set from that 18x had an empty one, so its PRACK and UPDATE (RFC 3262
+  §3, RFC 3311) skipped every proxy the INVITE had crossed and went to siphon's
+  Contact through whichever hop could reach it, and its route set changed when
+  the 2xx arrived. A relayed 18x now carries the same values the 2xx does. The
+  caller's dialog also has its route set from the INVITE on, not from the
+  answer: an UPDATE siphon relays to the caller on the early dialog went out
+  with no `Route` and straight to the INVITE's source, and now follows the
+  route set as one after the answer does (§12.2.1.1).
 
 - **`call.dial()` and `call.fork()` to a `tel:` target build a well-formed
   B-leg `To`.** The B-leg `To` takes the dial target's `host[:port]`, and a

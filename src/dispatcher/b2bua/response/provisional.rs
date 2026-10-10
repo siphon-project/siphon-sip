@@ -204,6 +204,17 @@ pub fn b_leg_provisional(
             call_id,
             &reply_shaped_headers,
         );
+        // The caller's own Record-Route, after the callee's was removed above:
+        // a provisional above 100 with a To tag establishes the caller's early
+        // dialog, and the caller's route set for its PRACK and UPDATE comes from
+        // it (RFC 3261 §12.1.1, RFC 3262 §3).
+        if status_code > 100 {
+            if let Some(invite_arc) = &snapshot.a_leg_invite {
+                if let Ok(invite) = invite_arc.lock() {
+                    restore_caller_record_route(message, &invite);
+                }
+            }
+        }
         // `media.sdp_strip_attributes`, after `@b2bua.on_early_media` had the
         // media engine rewrite the early media SDP.
         strip_relayed_sdp_attributes(message, state);

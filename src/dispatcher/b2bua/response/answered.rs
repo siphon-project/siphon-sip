@@ -752,9 +752,7 @@ pub fn prepare_a_leg_answer(
     // 200 OK must contain the A-leg Record-Route so the UAC can build its route set.
     if let Some(ref invite_arc) = snapshot.a_leg_invite {
         if let Ok(invite) = invite_arc.lock() {
-            if let Some(rrs) = invite.headers.get_all("Record-Route") {
-                response.headers.set_all("Record-Route", rrs.clone());
-            }
+            restore_caller_record_route(response, &invite);
         }
     }
 
