@@ -170,6 +170,23 @@ result = await diameter.rx_aar(
 )
 ```
 
+`qos.media_flows_from_sdp` writes two Flow-Descriptions per sub-component,
+the uplink flow first. In TS 29.214 §5.3.8 `in` is the uplink flow and `out`
+the downlink flow, so the UE is the source of the `in` rule and the
+destination of the `out` rule (RFC 6733 §4.3.1, TS 29.212 §5.4.2):
+
+```text
+permit in 17 from 192.0.2.2 50000 to 198.51.100.10 30000
+permit out 17 from 198.51.100.10 30000 to 192.0.2.2 50000
+```
+
+Here `192.0.2.2` is the UE, on the originating and on the terminating leg
+alike; `direction=` only says which of the two SDP bodies is the UE's. The
+RTCP sub-component follows the same rule one port up. The same list goes to
+`sbi.create_session` unchanged, where TS 29.514 defines `fDescs` by the same
+clause. A script that writes its own descriptions has to follow the same
+convention: siphon sends them as given.
+
 Subscribe in the first AAR for a session. Apart from one-time actions such as
 ACCESS_NETWORK_INFO_REPORT, a Specific-Action only counts there and then holds
 for the life of the Rx session.
