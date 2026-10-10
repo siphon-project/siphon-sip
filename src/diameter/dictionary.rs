@@ -20,11 +20,11 @@ pub enum AvpType {
     Address,
     Time,
     DiameterIdentity,
-    /// ISDN-AddressString (3GPP TS 29.002 §17.7.8): one ToN/NPI octet
-    /// followed by the TBCD-packed E.164 digit string. Surfaces to scripts
-    /// as a plain digit string, not raw bytes — see
-    /// [`crate::diameter::codec::decode_isdn_address_string`].
-    ISDNAddressString,
+    /// An E.164 number as a bare TBCD-string, with no nature-of-address
+    /// octet before the digits, which is how the 3GPP specifications define
+    /// MSISDN, SC-Address, SGSN-Number, MME-Number-for-MT-SMS and MSC-Number.
+    /// Surfaces to scripts as a digit string. See `codec::decode_tbcd_digits`.
+    TbcdString,
 }
 
 impl AvpType {
@@ -879,7 +879,7 @@ static AVP_TABLE: &[AvpDef] = &[
         code: 701,
         vendor_id: TGPP,
         name: "MSISDN",
-        data_type: AvpType::ISDNAddressString,
+        data_type: AvpType::TbcdString,
     },
     AvpDef {
         code: 702,
@@ -1469,7 +1469,7 @@ static AVP_TABLE: &[AvpDef] = &[
         code: 1489,
         vendor_id: TGPP,
         name: "SGSN-Number",
-        data_type: AvpType::ISDNAddressString,
+        data_type: AvpType::TbcdString,
     },
     AvpDef {
         code: 1635,
@@ -1481,7 +1481,7 @@ static AVP_TABLE: &[AvpDef] = &[
         code: 1645,
         vendor_id: TGPP,
         name: "MME-Number-for-MT-SMS",
-        data_type: AvpType::ISDNAddressString,
+        data_type: AvpType::TbcdString,
     },
     // SMS-Information block (TS 32.299 §7.2.79 / §7.2.158 / §7.2.171)
     AvpDef {
@@ -1625,7 +1625,7 @@ static AVP_TABLE: &[AvpDef] = &[
         code: 2403,
         vendor_id: TGPP,
         name: "MSC-Number",
-        data_type: AvpType::ISDNAddressString,
+        data_type: AvpType::TbcdString,
     },
     AvpDef {
         code: 2408,
@@ -1682,7 +1682,7 @@ static AVP_TABLE: &[AvpDef] = &[
         code: 3300,
         vendor_id: TGPP,
         name: "SC-Address",
-        data_type: AvpType::ISDNAddressString,
+        data_type: AvpType::TbcdString,
     },
     AvpDef {
         code: 3301,

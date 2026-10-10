@@ -82,6 +82,42 @@ entry, but a working config keeps working.
 
 ### Fixed
 
+- **BREAKING on the wire: MSISDN, SC-Address, SGSN-Number,
+  MME-Number-for-MT-SMS and MSC-Number are sent and read as bare TBCD.** siphon
+  put a nature-of-address octet (`0x91`) before the digits of these AVPs, as
+  if they were the ISDN-AddressString of MAP. The Diameter specifications
+  define them as a TBCD-string of the digits alone: MSISDN in TS 29.329 clause
+  6.3.2, SC-Address in TS 29.338 clause 6.3.3.2 ("This AVP shall not include
+  leading indicators for the nature of address and the numbering plan; it
+  shall contain only the TBCD-encoded digits of the address"), SGSN-Number and
+  MME-Number-for-MT-SMS in TS 29.272 clauses 7.3.102 and 7.3.159, MSC-Number in
+  TS 29.173 clause 6.4.5. An HSS that follows them read the `0x91` as the
+  digits `19`, looked up the wrong subscriber and answered
+  `DIAMETER_ERROR_USER_UNKNOWN`. What changes:
+  - `diameter.s6c_srr`, `s6c_rsr` and `sgd_tfr` send MSISDN and SC-Address
+    without the octet: 31612345678 is `13 16 32 54 76 f8`, where it was
+    `91 13 16 32 54 76 f8`. So does a digit string given for any of the five
+    AVPs to `diameter.send_request(...)`, `DiameterRequest.set_avp` /
+    `insert_avp` and `DiameterAnswer.set_avp` / `insert_avp`.
+  - Reading one of them (`get_avp`, `iter_avps`, the dicts of `s6c_srr`)
+    decodes every octet as digits. The decoder used to drop the first octet
+    whenever its top bit was set, taking it for the indicator, which in bare
+    TBCD is any number whose second digit is 8 or 9: a number in +39, +48 or
+    +49 arrived without its country code.
+  - **A peer that expects or sends the `0x91` no longer interoperates on these
+    AVPs, and both ends have to change together.** There is no setting for
+    it: the octets of a number starting `19` and of an indicator followed by a
+    number cannot be told apart. A script that has to keep feeding such a
+    peer passes `bytes`, which are sent as given:
+    `set_avp("MSISDN", diameter.encode_isdn_address(digits))`. Nothing reads
+    the octet back out of an inbound value.
+  - `diameter.encode_isdn_address` and `diameter.decode_isdn_address` are
+    unchanged and still produce and read the MAP form, with the octet.
+  - Rust: `AvpType::ISDNAddressString` is now `AvpType::TbcdString`.
+
+  Checked against Wireshark's Diameter dissector with
+  `scripts/validate_diameter_sms_addresses.sh`.
+
 - **The Diameter listener advertises its applications in the CEA, and refuses
   a peer that shares none (RFC 6733 §5.3).** The Capabilities-Exchange-Answer
   of a node with `diameter.listen` listed no application at all, so a strict

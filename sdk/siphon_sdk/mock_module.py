@@ -6571,15 +6571,19 @@ class MockDiameterAnswer:
         return [(code, vendor, value) for (code, vendor), value in self._avps]
 
 
-# ── ISDN-AddressString / TBCD (3GPP TS 29.002 §17.7.8) ──────────────────────
+# ── TBCD and ISDN-AddressString ─────────────────────────────────────────────
 # Mirrors siphon's Rust codec so the mock decodes MSISDN / SC-Address /
-# SGSN-Number / MME-Number-for-MT-SMS exactly like the real server path.
+# SGSN-Number / MME-Number-for-MT-SMS / MSC-Number exactly like the real
+# server path.
 
-# (code, vendor) of the AVPs dictionary-typed ISDNAddressString — vendor 3GPP.
-_ISDN_ADDRESS_AVPS = {
+# (code, vendor) of the AVPs the 3GPP specifications define as a TBCD-string
+# with no leading nature-of-address octet (TS 29.329 6.3.2, TS 29.338 6.3.3.2,
+# TS 29.272 7.3.102 and 7.3.159, TS 29.173 6.4.5), vendor 3GPP.
+_TBCD_AVPS = {
     (701, 10415),   # MSISDN
     (1489, 10415),  # SGSN-Number
     (1645, 10415),  # MME-Number-for-MT-SMS
+    (2403, 10415),  # MSC-Number
     (3300, 10415),  # SC-Address
 }
 
@@ -6620,8 +6624,10 @@ def encode_isdn_address_string(digits: str, ton_npi: int = TON_NPI_INTERNATIONAL
 
 
 def decode_isdn_address_string(data: bytes) -> str:
-    """Decode ISDN-AddressString bytes to an E.164 digit string. Tolerates a
-    missing ToN/NPI byte (bit 7 clear → treat the whole buffer as TBCD)."""
+    """Decode ISDN-AddressString bytes to an E.164 digit string. A first
+    octet with bit 8 clear cannot be a ToN/NPI octet, so the buffer is then
+    read as bare TBCD. Bare TBCD whose second digit is 8 or 9 is not
+    recognised: its first octet has bit 8 set."""
     if data and (data[0] & 0x80):
         return _decode_tbcd_digits(data[1:])
     return _decode_tbcd_digits(data)
@@ -6655,11 +6661,12 @@ class MockDiameterRequest:
 
     def get_avp(self, code: int, vendor: int = 0):
         value = self._avps.get((code, vendor))
-        # ISDNAddressString AVPs surface as a decoded E.164 digit string, like
-        # the real server path. Tolerate a test storing either raw bytes or an
+        # TBCD-string AVPs surface as a decoded E.164 digit string, like the
+        # real server path: every octet is a pair of digits, the first one
+        # included. Tolerate a test storing either raw bytes or an
         # already-decoded str.
-        if value is not None and (code, vendor) in _ISDN_ADDRESS_AVPS and isinstance(value, (bytes, bytearray)):
-            return decode_isdn_address_string(bytes(value))
+        if value is not None and (code, vendor) in _TBCD_AVPS and isinstance(value, (bytes, bytearray)):
+            return _decode_tbcd_digits(bytes(value))
         return value
 
     def set_avp(self, code_or_name, value, vendor: int = 0) -> None:
@@ -6767,10 +6774,12 @@ class MockDiameter:
     def decode_isdn_address(self, value: Union[bytes, str]) -> str:
         """Decode an ISDN-AddressString to its E.164 digit string.
 
-        Accepts the raw AVP bytes (``0x91`` ToN/NPI + TBCD digits) **or** an
-        already-decoded ``str`` — the latter is returned unchanged, so it is
-        safe to call on the result of ``req.get_avp("MSISDN")`` regardless of
-        the AVP's dictionary type. A missing ToN/NPI byte is tolerated.
+        Accepts the raw bytes (``0x91`` ToN/NPI + TBCD digits) **or** an
+        already-decoded ``str``, which is returned unchanged. This is the MAP
+        type. The Diameter AVPs MSISDN, SC-Address, SGSN-Number,
+        MME-Number-for-MT-SMS and MSC-Number are bare TBCD with no ToN/NPI
+        octet and ``get_avp`` already returns them as digits. Bare TBCD is
+        only recognised here when its second digit is 0 to 7.
 
         Args:
             value: ``bytes`` (raw ISDN-AddressString) or ``str`` (digits).
@@ -6792,10 +6801,11 @@ class MockDiameter:
         """Encode an E.164 digit string as an ISDN-AddressString — one ToN/NPI
         octet followed by the TBCD digit string.
 
-        Use when building a raw OctetString AVP by hand for an unknown code;
-        dictionary-typed AVPs (MSISDN / SC-Address / SGSN-Number /
-        MME-Number-for-MT-SMS) encode digit strings automatically. A leading
-        ``+`` is stripped.
+        Use when building a raw OctetString AVP by hand for an unknown code.
+        The Diameter AVPs MSISDN, SC-Address, SGSN-Number,
+        MME-Number-for-MT-SMS and MSC-Number take a digit string and send it
+        as bare TBCD, without the ToN/NPI octet this adds. A leading ``+`` is
+        stripped.
 
         Args:
             digits: The E.164 number as a digit string.

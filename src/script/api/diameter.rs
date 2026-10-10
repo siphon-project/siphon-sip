@@ -967,12 +967,12 @@ impl PyDiameter {
     /// Decode an ISDN-AddressString (3GPP TS 29.002 §17.7.8) to its E.164
     /// digit string.
     ///
-    /// Accepts the raw AVP bytes (``0x91`` ToN/NPI + TBCD digits) **or** an
-    /// already-decoded ``str`` — the latter is returned unchanged, so it is
-    /// safe to call on the result of ``req.get_avp("MSISDN")`` whether that
-    /// AVP is dictionary-typed (already a ``str``) or an unknown/raw AVP
-    /// (``bytes``). The ToN/NPI byte is optional: peers that ship bare TBCD
-    /// are tolerated.
+    /// Accepts the raw bytes (``0x91`` ToN/NPI + TBCD digits) **or** an
+    /// already-decoded ``str``, which is returned unchanged. This is the MAP
+    /// type. The Diameter AVPs MSISDN, SC-Address, SGSN-Number,
+    /// MME-Number-for-MT-SMS and MSC-Number are bare TBCD with no ToN/NPI
+    /// octet and ``get_avp`` already returns them as digits. Bare TBCD is
+    /// only recognised here when its second digit is 0 to 7.
     ///
     /// Args:
     ///     value: ``bytes`` (raw ISDN-AddressString) or ``str`` (digits).
@@ -999,10 +999,10 @@ impl PyDiameter {
     /// §17.7.8) — one ToN/NPI octet followed by the TBCD digit string.
     ///
     /// Use when building a raw OctetString AVP by hand (``set_avp`` /
-    /// ``send_request`` for an unknown code). Dictionary-typed AVPs
-    /// (MSISDN / SC-Address / SGSN-Number / MME-Number-for-MT-SMS) already
-    /// encode digit strings automatically — you do not need this for those.
-    /// A leading ``+`` is stripped.
+    /// ``send_request`` for an unknown code). The Diameter AVPs MSISDN,
+    /// SC-Address, SGSN-Number, MME-Number-for-MT-SMS and MSC-Number take a
+    /// digit string and send it as bare TBCD, without the ToN/NPI octet
+    /// this adds. A leading ``+`` is stripped.
     ///
     /// Args:
     ///     digits: The E.164 number as a digit string.
@@ -3426,17 +3426,12 @@ fn encode_kwarg_avp(def: &AvpDef, value: &Bound<'_, PyAny>) -> PyResult<Vec<u8>>
                 encode_avp_octet(def.code, &bytes)
             })
         }
-        AvpType::ISDNAddressString => {
-            // A str is an E.164 digit string → TBCD-encode with the
-            // international ToN/NPI byte (TS 29.002 §17.7.8). This is the fix
-            // for the MSISDN/SC-Address/SGSN-Number/MME-Number-for-MT-SMS
-            // encoding bug — the OctetString path used to ship raw ASCII.
-            // Bytes are taken as already-encoded ISDN-AddressString octets.
+        AvpType::TbcdString => {
+            // A str is an E.164 digit string, sent as the TBCD digits and
+            // nothing else (see `AvpType::TbcdString`). Bytes are taken as
+            // the octets to send.
             let bytes = if let Ok(digits) = value.extract::<String>() {
-                crate::diameter::codec::encode_isdn_address_string(
-                    &digits,
-                    crate::diameter::codec::TON_NPI_INTERNATIONAL_E164,
-                )
+                crate::diameter::codec::encode_tbcd_digits(&digits)
             } else if let Ok(raw) = value.extract::<Vec<u8>>() {
                 raw
             } else {
@@ -4723,29 +4718,32 @@ mod tests {
         );
     }
 
+    /// `send_request(msisdn="...")` sends the digits as a TBCD-string and
+    /// nothing else (TS 29.329 clause 6.3.2): no ASCII, no leading indicator.
     #[test]
-    fn encode_kwarg_avp_isdn_address_produces_tbcd_not_ascii() {
-        // The send_request(msisdn="…") path must TBCD-encode the digits, not
-        // ship raw ASCII (the pre-fix OctetString bug). MSISDN is now typed
-        // ISDNAddressString, so the kwarg encoder produces 0x91 + TBCD.
+    fn encode_kwarg_avp_msisdn_is_bare_tbcd() {
         pyo3::Python::initialize();
         let avp_def = crate::diameter::dictionary::lookup_avp_by_python_name("msisdn")
             .expect("msisdn must resolve");
         pyo3::Python::attach(|python| {
             let value = "31612345678".into_pyobject(python).unwrap();
             let encoded = encode_kwarg_avp(avp_def, value.as_any()).unwrap();
-            // The exact ISDN-AddressString octets must appear in the AVP.
-            let isdn = [0x91u8, 0x13, 0x16, 0x32, 0x54, 0x76, 0xF8];
-            assert!(
-                encoded.windows(isdn.len()).any(|w| w == isdn),
-                "MSISDN kwarg must encode as 0x91 ToN/NPI + TBCD, not 11 ASCII \
-                 octets; got {encoded:02x?}"
+            // The whole AVP, by hand: 701 with V and M, length 18, vendor
+            // 10415, 31 61 23 45 67 8F with the nibbles swapped, padding.
+            assert_eq!(
+                encoded,
+                [
+                    0x00, 0x00, 0x02, 0xbd, 0xc0, 0x00, 0x00, 0x12, 0x00, 0x00, 0x28, 0xaf, 0x13,
+                    0x16, 0x32, 0x54, 0x76, 0xf8, 0x00, 0x00,
+                ],
+                "got {encoded:02x?}"
             );
-            // And it must NOT contain the ASCII byte string "31612345678".
-            assert!(
-                !encoded.windows(11).any(|w| w == b"31612345678"),
-                "MSISDN must not be raw ASCII on the wire"
-            );
+
+            // Bytes are sent as given, which is how a script addresses a peer
+            // that wants something else in the AVP.
+            let raw = pyo3::types::PyBytes::new(python, &[0x91, 0x13, 0x16]);
+            let encoded = encode_kwarg_avp(avp_def, raw.as_any()).unwrap();
+            assert_eq!(&encoded[12..15], &[0x91, 0x13, 0x16]);
         });
     }
 
@@ -4776,7 +4774,8 @@ mod tests {
                 "31612345678",
             );
 
-            // Bare TBCD (no ToN/NPI byte, bit 7 clear) is tolerated.
+            // Bare TBCD whose first octet has bit 8 clear cannot be an
+            // ISDN-AddressString and is read as digits.
             let bare = pyo3::types::PyBytes::new(python, &[0x13, 0x16, 0x32, 0x54, 0x76, 0xF8]);
             assert_eq!(
                 py_diameter.decode_isdn_address(bare.as_any()).unwrap(),
