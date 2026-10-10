@@ -879,6 +879,14 @@ impl CallActor {
     /// Returns `None` when the Call-ID matches no live dialog on this call —
     /// the caller answers 481 Call/Transaction Does Not Exist.
     pub fn request_direction(&self, sip_call_id: &str, from_tag: Option<&str>) -> Option<LegSide> {
+        // A request whose From tag is the tag siphon itself put on that dialog
+        // was sent by this call, not to it. It can only come back when the
+        // dialog's other end is a call on this node too (an INVITE that
+        // returned to its dialler, RFC 3261 §16.3) and that call has ended
+        // since: the dialog it was for is gone.
+        if from_tag.is_some_and(|tag| self.sent_with_tag(sip_call_id, tag)) {
+            return None;
+        }
         let a_match = self.a_leg.dialog.call_id == sip_call_id;
         let winner_b = self.winner.and_then(|index| self.b_legs.get(index));
         let b_match = winner_b.is_some_and(|leg| leg.dialog.call_id == sip_call_id);
@@ -931,6 +939,15 @@ impl CallActor {
                 }
             }
         }
+    }
+
+    /// Whether `tag` is siphon's own tag on a dialog of this call with this
+    /// Call-ID: the From tag of every request the call sends on it.
+    fn sent_with_tag(&self, sip_call_id: &str, tag: &str) -> bool {
+        std::iter::once(&self.a_leg)
+            .chain(self.b_legs.iter())
+            .filter(|leg| !leg.is_tracking_leg())
+            .any(|leg| leg.dialog.call_id == sip_call_id && leg.dialog.local_tag == tag)
     }
 
     /// Add a B-leg to this call.

@@ -651,7 +651,7 @@ pub fn absorb_b2bua_ack(dialog_call_id: &str, ack: &SipMessage, state: &Dispatch
         }
         None => false,
     };
-    if let Some(internal_id) = state.call_actors.find_by_sip_call_id(dialog_call_id) {
+    if let Some(internal_id) = state.call_actors.find_by_message(ack) {
         // The leg carrying this dialog is confirmed, whichever slot a takeover
         // has moved it to.
         if let Some(mut call) = state.call_actors.get_call_mut(&internal_id) {
