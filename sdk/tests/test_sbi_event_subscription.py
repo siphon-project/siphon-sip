@@ -20,6 +20,8 @@ NOTIF_URI = "http://pcscf.example.com:8080/sbi/events"
 
 def setup_function(_):
     sbi.clear()
+    # A node with ``sbi.notif_uri`` configured, as a create needs one.
+    sbi.set_notif_uri(NOTIF_URI)
 
 
 def test_create_session_with_events_and_notif_uri():
@@ -37,8 +39,22 @@ def test_create_session_without_events_is_unchanged():
 
 
 def test_create_session_events_without_notif_uri_raises():
+    sbi.set_notif_uri(None)
     with pytest.raises(ValueError, match="notif_uri"):
         run(sbi.create_session(ue_ipv4="192.0.2.7", events=["FAILED_RESOURCES_ALLOCATION"]))
+
+
+def test_create_session_requires_a_callback_uri_even_without_events():
+    # notifUri is required on every create (TS 29.514), events or not.
+    sbi.set_notif_uri(None)
+    with pytest.raises(ValueError, match="sbi.notif_uri"):
+        run(sbi.create_session(ue_ipv4="192.0.2.7"))
+
+
+def test_create_session_falls_back_to_the_configured_callback_uri():
+    assert run(sbi.create_session(ue_ipv4="192.0.2.7")) is not None
+    assert run(sbi.create_session(
+        ue_ipv4="192.0.2.7", events=["FAILED_RESOURCES_ALLOCATION"])) is not None
 
 
 def test_create_session_empty_events_raises():

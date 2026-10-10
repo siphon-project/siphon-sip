@@ -28,6 +28,8 @@ BINDING = {
 
 def setup_function(_):
     sbi.clear()
+    # A node with ``sbi.notif_uri`` configured, as a create needs one.
+    sbi.set_notif_uri("http://pcscf.example.org:8080/sbi/events")
 
 
 def test_discover_404_returns_none_by_default():
@@ -118,5 +120,8 @@ def test_delete_failure_returns_false_and_keeps_the_session():
 def test_clear_resets_delete_failure():
     sbi.set_delete_failure(True)
     sbi.clear()
-    uri = run(sbi.create_session(ue_ipv4="192.0.2.7"))["app_session_uri"]
+    # clear() also forgets the configured callback URI, so pass one.
+    uri = run(sbi.create_session(
+        ue_ipv4="192.0.2.7", notif_uri="http://pcscf.example.org:8080/sbi/events"
+    ))["app_session_uri"]
     assert run(sbi.delete_session(uri)) is True

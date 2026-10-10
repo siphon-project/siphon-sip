@@ -9039,8 +9039,9 @@ class BsfError(RuntimeError):
     """Raised by ``sbi.discover_pcf_binding()`` when the BSF is unhealthy
     (5xx / timeout / transport / malformed body).
 
-    A 404 (no binding for the UE IP) is **not** a ``BsfError`` — it returns
-    ``None`` (the 4G UE case). Mirrors the Rust ``sbi.BsfError`` exception.
+    No binding for the UE IP is **not** a ``BsfError``: the BSF answers 204
+    (TS 29.521), or 404 on some servers, and the lookup returns ``None`` (the
+    4G UE case). Mirrors the Rust ``sbi.BsfError`` exception.
     """
 
 
@@ -9070,12 +9071,20 @@ class MockSbi:
         self._sessions: dict[str, dict] = {}
         self._next_session_id: int = 1
         self._authorized: bool = True
-        #: discover_pcf_binding result: a binding dict (5G) or None (404 / 4G).
+        #: discover_pcf_binding result: a binding dict (5G) or None (no binding, 4G).
         self._binding: Optional[dict] = None
         #: when True, discover_pcf_binding raises BsfError (BSF unhealthy).
         self._bsf_error: bool = False
         #: when True, delete_session fails (returns False, keeps the session).
         self._delete_failure: bool = False
+        #: stands in for ``sbi.notif_uri`` in siphon.yaml: the callback base a
+        #: create sends when the script passes no ``notif_uri``.
+        self._notif_uri: Optional[str] = None
+
+    def set_notif_uri(self, notif_uri: Optional[str]) -> None:
+        """Test helper: act as a node with ``sbi.notif_uri`` configured (or,
+        with ``None``, without it)."""
+        self._notif_uri = notif_uri
 
     @staticmethod
     def _session_id(session_ref: str) -> str:
@@ -9130,13 +9139,17 @@ class MockSbi:
 
         Args:
             af_app_id: AF-Application identifier (default ``"IMS Services"``).
-            sip_call_id: SIP Call-ID for correlation.
+            sip_call_id: SIP Call-ID of the call, for correlation in siphon's
+                own log. It is not sent to the PCF: TS 29.514 has no such
+                attribute.
             supi: Subscription Permanent Identifier.
             ue_ipv4: UE IPv4 address.
             ue_ipv6: UE IPv6 address.
             dnn: Data Network Name.
             notif_uri: base URI of siphon's PCF callback listener,
-                ``http://<sbi.notif_listen>/sbi/events``. Sent as ``notifUri``,
+                ``http://<sbi.notif_listen>/sbi/events``. Defaults to
+                ``sbi.notif_uri`` from the configuration; one of the two must
+                be set, since TS 29.514 requires it. Sent as ``notifUri``,
                 where the PCF posts a termination (``/terminate``, to
                 ``@sbi.on_terminate``), and with ``events`` also as the
                 subscription's ``notifUri``, where it posts events
@@ -9161,7 +9174,8 @@ class MockSbi:
             teardown), or ``None``.
 
         Raises:
-            ValueError: ``events`` is empty, or given without ``notif_uri``.
+            ValueError: neither ``notif_uri`` nor ``sbi.notif_uri`` is set
+                (``notifUri`` is required on a create), or ``events`` is empty.
             TypeError: ``events`` is not a list of strings.
 
         Example::
@@ -9176,6 +9190,12 @@ class MockSbi:
         # Validated at the call, as siphon does: the request body is built
         # from the Python arguments before the future exists, so a bad
         # `events` raises here rather than on ``await``.
+        notif_uri = notif_uri if notif_uri is not None else self._notif_uri
+        if notif_uri is None:
+            raise ValueError(
+                "sbi.create_session: notif_uri is required: pass notif_uri= or "
+                "set sbi.notif_uri (TS 29.514 requires notifUri on a create)"
+            )
         subscription = self._event_subscription(events, notif_uri, creating=True)
         session_id = f"mock-n5-{self._next_session_id}"
         self._next_session_id += 1
@@ -9283,14 +9303,18 @@ class MockSbi:
         """Nbsf_Management discovery — look up the PCF binding for a UE IP.
 
         Returns a binding dict (5G; configure via ``set_binding``), ``None``
-        when the BSF has no binding (404 / 4G), or raises ``sbi.BsfError`` when
-        configured unhealthy via ``set_bsf_error``.
+        when the BSF has no binding (it answers 204, or 404 on some servers;
+        4G), or raises ``sbi.BsfError`` when configured unhealthy via
+        ``set_bsf_error``.
 
         Exactly one of ``ue_ipv4`` / ``ue_ipv6`` must be supplied.
 
         Args:
             ue_ipv4: UE IPv4 address (the IPsec SA peer).
-            ue_ipv6: UE IPv6 address/prefix.
+            ue_ipv6: UE IPv6 address. siphon sends it as the ``ipv6Prefix``
+                query parameter with ``/128`` appended, as TS 29.521
+                requires; a value that already carries a prefix length is
+                sent as written.
 
         Returns:
             The binding dict (incl. a ready-to-use ``pcf_uri``) or ``None``.
@@ -9411,7 +9435,8 @@ class MockSbi:
         """Configure what ``discover_pcf_binding`` returns (test helper).
 
         Args:
-            binding: a binding dict (5G case) or ``None`` (404 / 4G case).
+            binding: a binding dict (5G case) or ``None`` (no binding: the
+                4G case).
         """
         self._binding = binding
 
@@ -9443,6 +9468,7 @@ class MockSbi:
         self._authorized = True
         self._binding = None
         self._bsf_error = False
+        self._notif_uri = None
 
 
 class MockIsc:

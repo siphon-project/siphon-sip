@@ -135,6 +135,12 @@ pub struct SbiYamlConfig {
     pub requester_nf_type: Option<String>,
     /// Listen address for incoming PCF event notifications (e.g. "0.0.0.0:8080").
     pub notif_listen: Option<String>,
+    /// The callback base URI the PCF reaches this node at, for example
+    /// `http://192.0.2.10:8080/sbi/events`. Sent as `notifUri` on every N5
+    /// create that does not pass its own `notif_uri`. TS 29.514 requires the
+    /// attribute, and the listen address cannot stand in for it: it is often
+    /// a wildcard, or sits behind an address translation.
+    pub notif_uri: Option<String>,
 }
 
 fn default_sbi_timeout() -> u64 {
