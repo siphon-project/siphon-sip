@@ -881,7 +881,7 @@
         "kind": "getset_descriptor"
       },
       "reject": {
-        "doc": "Build an error answer for this request (alias of `answer` kept for",
+        "doc": "Build an answer that refuses this request (alias of `answer` kept for",
         "kind": "method_descriptor",
         "sig": "($self, result_code, error_message=None)"
       },

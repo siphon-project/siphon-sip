@@ -599,9 +599,14 @@ impl Avp {
     }
 
     /// Build a Raw-valued AVP with the Mandatory bit (and Vendor bit when
-    /// `vendor != 0`) set — the common case for AVPs siphon constructs.
+    /// `vendor != 0`) set — the common case for AVPs siphon constructs. The
+    /// few base AVPs that must not carry the M bit go out without it.
     pub fn raw(code: u32, vendor: u32, value: Vec<u8>) -> Avp {
-        let mut flags = AVP_FLAG_MANDATORY;
+        let mut flags = if must_not_be_mandatory(code, vendor) {
+            0
+        } else {
+            AVP_FLAG_MANDATORY
+        };
         if vendor != 0 {
             flags |= AVP_FLAG_VENDOR;
         }
@@ -636,6 +641,19 @@ impl Avp {
             _ => None,
         }
     }
+}
+
+/// Whether RFC 6733 section 4.5 lists this AVP with the M bit under "MUST
+/// NOT": Firmware-Revision (267), Product-Name (269), Error-Message (281) and
+/// Error-Reporting-Host (294).
+pub fn must_not_be_mandatory(code: u32, vendor: u32) -> bool {
+    use dictionary::avp;
+    const ERROR_REPORTING_HOST: u32 = 294;
+    vendor == 0
+        && matches!(
+            code,
+            avp::FIRMWARE_REVISION | avp::PRODUCT_NAME | avp::ERROR_MESSAGE | ERROR_REPORTING_HOST
+        )
 }
 
 /// Parse a sequence of AVPs from the AVP region of a message (or the value of

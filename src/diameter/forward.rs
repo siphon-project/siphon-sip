@@ -2,7 +2,8 @@
 //!
 //! Pure functions over the lossless [`DiameterMsg`] tree: Route-Record append
 //! and loop detection (RFC 6733 §6.1.9 / §6.3), Origin identity rewrite for
-//! topology hiding, and protocol-error answer construction with the E-bit.
+//! topology hiding, and answer construction with the E-bit where RFC 6733
+//! puts it.
 //!
 //! The async relay driver that actually ships a request to a backend peer and
 //! awaits the answer is wired in the dispatch layer (Phase 5); these are the
@@ -79,19 +80,38 @@ pub fn prepare_forward(msg: &mut DiameterMsg, local_identity: &str) -> Result<()
     Ok(())
 }
 
-/// Whether a Result-Code carries the protocol E-bit. Protocol errors (3xxx)
-/// and permanent failures (5xxx) set it; informational (1xxx), success (2xxx),
-/// and transient failures (4xxx) do not — matching freeDiameter's behaviour
-/// (RFC 6733 §7.1).
-fn result_code_sets_error_bit(result_code: u32) -> bool {
-    (3000..4000).contains(&result_code) || (5000..6000).contains(&result_code)
+/// Which grammar an answer is written in, which is what the E bit tells the
+/// peer (RFC 6733 section 3: "If set, the message contains a protocol error,
+/// and the message will not conform to the CCF described for this command").
+#[derive(Clone, Copy)]
+enum Grammar {
+    /// The answer of the command, as a handler composes it. Protocol errors
+    /// "MUST only be used in answer messages whose 'E' bit is set" (section
+    /// 7.1.3), and the permanent failures "SHOULD be used in answer messages
+    /// whose 'E' bit is not set" (section 7.1.5).
+    Command,
+    /// The `answer-message` of section 7.2, which siphon sends when it has to
+    /// answer without a handler's answer to send. Section 7.1.5: "In error
+    /// conditions where it is not possible or efficient to compose
+    /// application-specific answer grammar, answer messages with the 'E' bit
+    /// set and which comply to the grammar described in Section 7.2 MAY also
+    /// be used for permanent errors."
+    AnswerMessage,
 }
 
-/// Build a Diameter answer for `request` carrying `result_code` and our
-/// identity. The R-bit is cleared; the P-bit mirrors the request; the E-bit is
-/// set for protocol/permanent errors. Session-Id, hop-by-hop, and end-to-end
-/// are echoed from the request (RFC 6733 §6.2 / §8.8).
-pub fn build_answer(
+impl Grammar {
+    fn sets_error_bit(self, result_code: u32) -> bool {
+        match self {
+            Grammar::Command => (3000..4000).contains(&result_code),
+            Grammar::AnswerMessage => {
+                (3000..4000).contains(&result_code) || (5000..6000).contains(&result_code)
+            }
+        }
+    }
+}
+
+fn answer_in(
+    grammar: Grammar,
     request: &DiameterMsg,
     origin_host: &str,
     origin_realm: &str,
@@ -99,7 +119,7 @@ pub fn build_answer(
     error_message: Option<&str>,
 ) -> DiameterMsg {
     let mut flags = request.flags & FLAG_PROXIABLE; // preserve P, drop R
-    if result_code_sets_error_bit(result_code) {
+    if grammar.sets_error_bit(result_code) {
         flags |= FLAG_ERROR;
     }
 
@@ -111,6 +131,7 @@ pub fn build_answer(
     avps.push(Avp::utf8(avp::ORIGIN_HOST, 0, origin_host));
     avps.push(Avp::utf8(avp::ORIGIN_REALM, 0, origin_realm));
     if let Some(message) = error_message {
+        // Without the M bit, which RFC 6733 section 4.5 forbids on this AVP.
         avps.push(Avp::utf8(avp::ERROR_MESSAGE, 0, message));
     }
 
@@ -122,6 +143,49 @@ pub fn build_answer(
         end_to_end: request.end_to_end,
         avps,
     }
+}
+
+/// Build the answer of the command for `request`, carrying `result_code` and
+/// our identity, for a handler to fill in. The R-bit is cleared; the P-bit
+/// mirrors the request; the E-bit is set for a protocol error (3xxx) only.
+/// Session-Id, hop-by-hop, and end-to-end are echoed from the request (RFC
+/// 6733 §6.2 / §8.8).
+pub fn build_answer(
+    request: &DiameterMsg,
+    origin_host: &str,
+    origin_realm: &str,
+    result_code: u32,
+    error_message: Option<&str>,
+) -> DiameterMsg {
+    answer_in(
+        Grammar::Command,
+        request,
+        origin_host,
+        origin_realm,
+        result_code,
+        error_message,
+    )
+}
+
+/// Build the generic error answer siphon sends when it answers in a
+/// handler's place: nothing served the request, the handler failed, the
+/// request did not parse, or relaying it failed. The E-bit is set for a
+/// protocol error (3xxx) and for a permanent failure (5xxx).
+pub fn build_error_answer(
+    request: &DiameterMsg,
+    origin_host: &str,
+    origin_realm: &str,
+    result_code: u32,
+    error_message: &str,
+) -> DiameterMsg {
+    answer_in(
+        Grammar::AnswerMessage,
+        request,
+        origin_host,
+        origin_realm,
+        result_code,
+        Some(error_message),
+    )
 }
 
 #[cfg(test)]
@@ -248,21 +312,64 @@ mod tests {
         assert!(answer.find(avp::ERROR_MESSAGE, 0).is_none());
     }
 
+    /// An answer in the grammar of the command carries the E bit only for a
+    /// protocol error (RFC 6733 section 7.1.3). Section 7.1.5 on the
+    /// permanent failures: "these errors SHOULD be used in answer messages
+    /// whose 'E' bit is not set".
     #[test]
-    fn transient_failure_clears_e_bit_permanent_sets_it() {
+    fn an_application_answer_sets_the_e_bit_for_protocol_errors_only() {
         let request = sample_request();
-        // 4xxx transient → no E-bit.
-        let transient = build_answer(&request, "h", "r", 4002, None);
-        assert!(!transient.is_error());
-        // 5xxx permanent → E-bit.
-        let permanent = build_answer(
-            &request,
-            "h",
-            "r",
-            dictionary::DIAMETER_INVALID_AVP_LENGTH,
-            None,
-        );
-        assert!(permanent.is_error());
+        for (result_code, error) in [
+            (1001, false),
+            (2001, false),
+            (3002, true),
+            (3999, true),
+            (4002, false),
+            (5001, false),
+            (dictionary::DIAMETER_UNABLE_TO_COMPLY, false),
+            (dictionary::DIAMETER_INVALID_AVP_LENGTH, false),
+        ] {
+            let answer = build_answer(&request, "h", "r", result_code, None);
+            assert_eq!(answer.is_error(), error, "{result_code}");
+        }
+    }
+
+    /// The generic `answer-message` of section 7.2, which siphon sends when
+    /// it cannot compose the answer of the command, may also report a
+    /// permanent failure (section 7.1.5).
+    #[test]
+    fn a_generic_error_answer_sets_the_e_bit_for_permanent_failures_too() {
+        let request = sample_request();
+        for (result_code, error) in [
+            (3002, true),
+            (dictionary::DIAMETER_UNABLE_TO_COMPLY, true),
+            (dictionary::DIAMETER_INVALID_AVP_LENGTH, true),
+        ] {
+            let answer = build_error_answer(&request, "h", "r", result_code, "why");
+            assert_eq!(answer.is_error(), error, "{result_code}");
+            assert_eq!(answer.get_str(avp::ERROR_MESSAGE).as_deref(), Some("why"));
+        }
+    }
+
+    /// RFC 6733 section 4.5: Error-Message MUST NOT carry the M bit.
+    #[test]
+    fn error_message_carries_no_m_bit() {
+        let request = sample_request();
+        for answer in [
+            build_answer(&request, "h", "r", 3005, Some("loop detected")),
+            build_error_answer(&request, "h", "r", 5012, "loop detected"),
+        ] {
+            let error_message = answer.find(avp::ERROR_MESSAGE, 0).unwrap();
+            assert_eq!(error_message.flags, 0);
+            // Code 281, no flag, length 8 + 13 = 21 (0x15), three of padding.
+            let mut expected = vec![0x00, 0x00, 0x01, 0x19, 0x00, 0x00, 0x00, 0x15];
+            expected.extend_from_slice(b"loop detected");
+            expected.extend_from_slice(&[0, 0, 0]);
+            let wire = answer.to_wire();
+            assert!(wire
+                .windows(expected.len())
+                .any(|window| window == expected));
+        }
     }
 
     #[test]
@@ -294,5 +401,60 @@ mod tests {
         let wire = answer.to_wire();
         let reparsed = DiameterMsg::from_wire(&wire).unwrap();
         assert_eq!(reparsed, answer);
+    }
+
+    /// Emit three answers as hex for
+    /// [`scripts/validate_diameter_answer_flags.sh`] to feed to tshark: a
+    /// handler's refusal with a permanent failure, a handler's protocol
+    /// error, and the generic error siphon sends for a handler that raised.
+    #[test]
+    fn emit_answers_for_external_dissection() {
+        let Ok(path) = std::env::var("SIPHON_DIAMETER_ANSWER_FLAGS_HEX_OUT") else {
+            // Nothing to do in an ordinary test run.
+            return;
+        };
+        let mut request = sample_request();
+        // A Cx Registration-Termination-Request.
+        request.command_code = dictionary::CMD_REGISTRATION_TERMINATION;
+        let host = "scscf.ims.mnc001.mcc001.3gppnetwork.org";
+        let realm = "ims.mnc001.mcc001.3gppnetwork.org";
+        let answers = [
+            build_answer(
+                &request,
+                host,
+                realm,
+                dictionary::DIAMETER_UNABLE_TO_COMPLY,
+                None,
+            ),
+            build_answer(
+                &request,
+                host,
+                realm,
+                dictionary::DIAMETER_UNABLE_TO_DELIVER,
+                Some("no route"),
+            ),
+            build_error_answer(
+                &request,
+                host,
+                realm,
+                dictionary::DIAMETER_UNABLE_TO_COMPLY,
+                "on_request handler raised",
+            ),
+        ];
+
+        // `text2pcap`'s hex-dump form: an offset, then the octets. An offset
+        // of zero starts the next packet.
+        let mut dump = String::new();
+        for answer in answers {
+            for (offset, chunk) in answer.to_wire().chunks(16).enumerate() {
+                dump.push_str(&format!("{:06x}", offset * 16));
+                for byte in chunk {
+                    dump.push_str(&format!(" {byte:02x}"));
+                }
+                dump.push('\n');
+            }
+            dump.push('\n');
+        }
+        std::fs::write(&path, dump).expect("hex dump must be writable");
     }
 }

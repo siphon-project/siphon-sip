@@ -82,6 +82,31 @@ entry, but a working config keeps working.
 
 ### Fixed
 
+- **A permanent failure a handler answers no longer sets the Diameter header E
+  bit. This changes the answers scripts send.** `request.answer(code)` and
+  `request.reject(code)` set the bit for every 3xxx and 5xxx Result-Code. RFC
+  6733 has it for protocol errors (section 7.1.3, "these errors MUST only be
+  used in answer messages whose 'E' bit is set") and says of the permanent
+  failures (section 7.1.5) that "these errors SHOULD be used in answer messages
+  whose 'E' bit is not set": the bit tells the peer the answer is the generic
+  `answer-message` and not the answer of the command, so application AVPs in
+  it, an Experimental-Result among them, had no place, and an agent could
+  treat a refusal as a routing fault. Both calls now set it for 3xxx only, and
+  `answer.is_error` reads accordingly. What siphon answers in a handler's place
+  is unchanged and keeps the bit, as section 7.1.5 allows where the answer of
+  the command cannot be composed: `3002` when nothing serves the request,
+  `5012` when the handler raised or returned something else, `5014` for a
+  request that did not parse. A script that built its refusal from
+  `request.answer(2001)` and overwrote Result-Code to keep the bit clear can
+  pass the code directly. The SDK mock's `is_error` follows.
+- **Error-Message is sent without the M bit.** RFC 6733 section 4.5 lists it
+  with V and M under "MUST NOT", and siphon set M on the one it adds when a
+  handler raises or passes `error_message=`, and on one a script sets. The
+  same holds for the other three base AVPs in that row of the table when a
+  script sets them: Error-Reporting-Host, Product-Name and Firmware-Revision.
+  Both checked against Wireshark's Diameter dissector with
+  `scripts/validate_diameter_answer_flags.sh`.
+
 - **The Diameter listener advertises its applications in the CEA, and refuses
   a peer that shares none (RFC 6733 §5.3).** The Capabilities-Exchange-Answer
   of a node with `diameter.listen` listed no application at all, so a strict
