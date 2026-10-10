@@ -751,6 +751,55 @@ class SipTestHarness:
 
         return CallResult(call=call, actions=list(call.actions))
 
+    def send_provisional(
+        self,
+        call: Optional[Call] = None,
+        reply: Optional[Any] = None,
+        status_code: int = 180,
+        reason: str = "Ringing",
+        **kwargs: Any,
+    ) -> CallResult:
+        """Send a provisional response of the callee (101-199) on a B2BUA call.
+
+        Runs ``@b2bua.on_provisional`` handlers, then ``@b2bua.on_early_media``
+        handlers when the reply has a body, on the same reply: what siphon
+        does for a provisional it relays to the caller.
+
+        Args:
+            call: Call object (auto-created from ``**kwargs`` if ``None``).
+            reply: The callee's response. Pass one to read back what the
+                handlers set on it; auto-created from ``status_code`` and
+                ``reason`` if ``None``.
+            status_code: Status of the auto-created reply.
+            reason: Reason phrase of the auto-created reply.
+        """
+        if call is None:
+            call = Call(**kwargs)
+
+        from siphon_sdk.reply import Reply
+
+        if reply is None:
+            reply = Reply(
+                status_code=status_code,
+                reason=reason,
+                from_uri=call.from_uri,
+                to_uri=call.to_uri,
+                call_id=call.call_id,
+            )
+
+        registry = mock_module.get_registry()
+        hooks = ["b2bua.on_provisional"]
+        if reply.body:
+            hooks.append("b2bua.on_early_media")
+        for hook in hooks:
+            for fn, is_async in registry.get(hook):
+                if is_async:
+                    self._loop.run_until_complete(fn(call, reply))
+                else:
+                    fn(call, reply)
+
+        return CallResult(call=call, actions=list(call.actions))
+
     def send_failure(
         self,
         call: Optional[Call] = None,
