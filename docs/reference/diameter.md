@@ -190,6 +190,30 @@ The inbound request passed to `@diameter.on_request`.
 
 ::: siphon_sdk.mock_module.MockDiameterRequest
 
+### Reading AVPs: two tuple orders, and `avps()`
+
+`get_avp` and `iter_avps` hand AVPs out as tuples, and the two shapes differ:
+
+| Where | Shape |
+|---|---|
+| `iter_avps()`, each top-level AVP | `(code, vendor, value)` |
+| the members of a grouped AVP, in the `value` of either call | `(code, value, vendor)` |
+
+The second is the shape `set_avp` takes for a child, so a group read out can be
+set back in. A handler that unpacks a member as `code, vendor, value` compares
+a value with a vendor id, finds nothing and, typically, refuses every request.
+Neither order can change without breaking scripts. `request.avps()` and
+`answer.avps()` list the same AVPs as `DiameterAvp` objects instead, with the
+fields by name at every level:
+
+```python
+for avp in request.avps():
+    if avp.name == "Deregistration-Reason" and avp.vendor == 10415:
+        reason = {member.name: member.value for member in avp.value}
+```
+
+::: siphon_sdk.mock_module.MockDiameterAvp
+
 ## `DiameterAnswer`
 
 The value a handler returns via `request.answer(...)` / `request.reject(...)`.

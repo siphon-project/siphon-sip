@@ -245,6 +245,40 @@ def test_get_avp_decodes_isdn_address_avps():
     assert req2.get_avp(3300, 10415) == "31611111111"  # SC-Address
 
 
+def test_avps_names_the_fields_at_every_level():
+    """``avps()`` gives each AVP as an object, so a handler reads ``.vendor``
+    and ``.value`` by name where the two tuple shapes put them in different
+    positions."""
+    reason = [(616, 0, 10415), (617, "subscription ended", 10415)]
+    req = mock_module.MockDiameterRequest(
+        application_name="Cx",
+        command_name="RTR",
+        avps={(601, 10415): "sip:alice@example.com", (615, 10415): reason},
+    )
+    # The documented tuples: (code, vendor, value) at the top level, and
+    # (code, value, vendor) for the members of a group.
+    assert req.iter_avps() == [
+        (601, 10415, "sip:alice@example.com"),
+        (615, 10415, reason),
+    ]
+
+    identity, group = req.avps()
+    assert (identity.code, identity.vendor, identity.value) == (
+        601, 10415, "sip:alice@example.com")
+    assert (group.code, group.vendor) == (615, 10415)
+    code, info = group.value
+    assert (code.code, code.vendor, code.value) == (616, 10415, 0)
+    assert (info.code, info.vendor, info.value) == (617, 10415, "subscription ended")
+
+    answer = req.answer(2001)
+    answer.set_avp("Auth-Session-State", 1)
+    (state,) = answer.avps()
+    assert (state.name, state.vendor, state.value) == ("Auth-Session-State", 0, 1)
+    assert repr(state) == (
+        "DiameterAvp(name='Auth-Session-State', code='Auth-Session-State', "
+        "vendor=0, value=1)")
+
+
 def test_ip_in_cidr_and_fnmatch_helpers():
     from siphon import diameter as d
 
