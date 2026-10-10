@@ -66,6 +66,7 @@ mod tests {
             super::super::diameter::PyDiameter,
             super::super::diameter::PyEventSink,
             super::super::diameter_server::PyDiameterAnswer,
+            super::super::diameter_server::PyDiameterAvp,
             super::super::diameter_server::PyDiameterRequest,
             super::super::diameter_server::PyInboundPeer,
             super::super::diameter_server::PyPeer,
