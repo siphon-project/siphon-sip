@@ -82,6 +82,24 @@ entry, but a working config keeps working.
 
 ### Fixed
 
+- **A re-INVITE no longer opens a second Rf accounting session.** The
+  automatic ACR-START of `rf.auto_emit_proxy` ran for every INVITE answered
+  2xx and relied on its duplicate check to skip a re-INVITE. That check keys
+  on the ICID of the request's `P-Charging-Vector`, or without one on the
+  Call-ID and the From tag, so a re-INVITE that reached the node without the
+  vector, or came from the called party (whose From tag is the dialog's other
+  tag), matched nothing: a hold or a resume produced an extra START for the
+  same call, with no IMS-Charging-Identifier for the collector to correlate
+  it by. At the BYE one session of each role was stopped, so depending on the
+  roles the two had resolved to, the extra one got its own STOP or was left
+  open until the orphan sweep. TS 32.260
+  Table 5.2.1.1-1 has the Start triggered by a "SIP 2xx acknowledging an
+  initial SIP INVITE". An INVITE with a To tag now opens nothing. No
+  ACR-INTERIM is sent for it either, as before. A P-CSCF script still has to
+  add the `P-Charging-Vector` with the dialog's ICID to a re-INVITE it
+  receives from the UE (TS 24.229 clause 5.2.6.3.5), which this does not do
+  for it.
+
 - **The Diameter listener advertises its applications in the CEA, and refuses
   a peer that shares none (RFC 6733 §5.3).** The Capabilities-Exchange-Answer
   of a node with `diameter.listen` listed no application at all, so a strict

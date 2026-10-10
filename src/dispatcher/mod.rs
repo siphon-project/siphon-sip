@@ -244,6 +244,8 @@ mod reply_script_header_tests;
 #[cfg(test)]
 mod retransmit_capture_tests;
 #[cfg(test)]
+mod rf_reinvite_tests;
+#[cfg(test)]
 mod ro_orphan_backstop_tests;
 #[cfg(test)]
 mod script_header_precedence_tests;
