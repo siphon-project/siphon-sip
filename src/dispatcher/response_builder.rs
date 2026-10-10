@@ -90,6 +90,26 @@ pub(super) fn response_establishes_dialog(request: &SipMessage, status_code: u16
     request.headers.to().is_some_and(|to| !to.contains(";tag="))
 }
 
+/// Put the `Record-Route` of `invite`, the caller's INVITE, on `response`, one
+/// a B2BUA call relays to the caller from the callee that establishes the
+/// caller's dialog: every value, in order, as received (RFC 3261 §12.1.1).
+///
+/// The relayed response arrives with the callee's `Record-Route`, which is the
+/// route set of the other dialog and is removed before this
+/// (`sanitize_b2bua_response`). The caller builds its route set from the first
+/// response that establishes its dialog (§12.1.2), which before the 2xx is an
+/// 18x with a To tag, the early dialog its PRACK and UPDATE are sent on (RFC
+/// 3262 §3), so that response carries the same values the 2xx will. As in
+/// [`response_establishes_dialog`] the tag is not tested for: on a provisional
+/// without one the header is inert.
+pub(super) fn restore_caller_record_route(response: &mut SipMessage, invite: &SipMessage) {
+    if let Some(record_routes) = invite.headers.get_all("Record-Route") {
+        response
+            .headers
+            .set_all("Record-Route", record_routes.clone());
+    }
+}
+
 /// Build a SIP response from a request, copying mandatory headers.
 pub(super) fn build_response(
     request: &SipMessage,

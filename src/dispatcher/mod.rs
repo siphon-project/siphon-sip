@@ -164,6 +164,8 @@ mod dialog_state_events_tests;
 #[cfg(test)]
 mod dialog_state_transfer_tests;
 #[cfg(test)]
+mod early_dialog_route_set_tests;
+#[cfg(test)]
 mod early_update_bridge_tests;
 #[cfg(test)]
 mod early_update_tests;

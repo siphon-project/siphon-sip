@@ -479,6 +479,14 @@ pub fn handle_b2bua_invite(inbound: InboundMessage, message: SipMessage, state: 
         a_leg.dialog.remote_contact = Some(crate::b2bua::actor::extract_contact_uri(contact));
     }
 
+    // The caller's dialog's route set, siphon being its UAS: the INVITE's
+    // Record-Route in order (RFC 3261 §12.1.1). In force from here on, so a
+    // request siphon sends the caller on the early dialog follows it (§12.2.1.1)
+    // as one after the answer does.
+    if let Some(record_routes) = message.headers.get_all("Record-Route") {
+        a_leg.dialog.route_set = flatten_record_route_headers(record_routes);
+    }
+
     // Store A-leg's remote AoR host (caller's From URI host) for in-dialog To headers.
     if let Some(from) = message.headers.from() {
         let from_str = crate::b2bua::actor::extract_contact_uri(from);
