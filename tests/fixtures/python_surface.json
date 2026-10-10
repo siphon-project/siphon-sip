@@ -51,9 +51,9 @@
         "sig": "($self, target, realm=None, password=None, ha1=None)"
       },
       "require_ims_digest": {
-        "doc": "IMS digest authentication via Diameter Cx MAR/MAA.",
+        "doc": "IMS AKA authentication via Diameter Cx MAR/MAA.",
         "kind": "method_descriptor",
-        "sig": "($self, request, realm=None)"
+        "sig": "($self, request, realm=None, server_name=None)"
       },
       "require_proxy_digest": {
         "doc": "Challenge with 407 Proxy-Authenticate if not yet authenticated.",
@@ -617,6 +617,11 @@
         "kind": "method_descriptor",
         "sig": "($self, public_identity)"
       },
+      "cx_mar": {
+        "doc": "Send a Cx Multimedia-Auth-Request to the HSS.",
+        "kind": "method_descriptor",
+        "sig": "($self, public_identity, user_name, server_name, scheme=None, number_auth_items=1, authorization=None)"
+      },
       "cx_sar": {
         "doc": "Send a Cx Server-Assignment-Request to the HSS.",
         "kind": "method_descriptor",
@@ -625,7 +630,7 @@
       "cx_uar": {
         "doc": "Send a Cx User-Authorization-Request to the HSS.",
         "kind": "method_descriptor",
-        "sig": "($self, public_identity, visited_network_id=None, user_auth_type=None)"
+        "sig": "($self, public_identity, visited_network_id=None, user_auth_type=None, user_name=None)"
       },
       "decode_isdn_address": {
         "doc": "Decode an ISDN-AddressString (3GPP TS 29.002 \u00a717.7.8) to its E.164",

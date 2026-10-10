@@ -38,7 +38,7 @@ import sys
 # Awaitable methods reached through a namespace imported from `siphon`.
 NAMESPACE_AWAITABLE = {
     "diameter": {
-        "cx_uar", "cx_sar", "cx_lir",
+        "cx_uar", "cx_sar", "cx_lir", "cx_mar",
         "rx_aar", "rx_str",
         "sh_udr", "sh_pur", "sh_snr",
         "rf_acr_start", "rf_acr_interim", "rf_acr_stop", "rf_acr_event",
