@@ -6529,8 +6529,11 @@ class MockDiameterAnswer:
 
     @property
     def is_error(self) -> bool:
-        rc = self.result_code
-        return (3000 <= rc < 4000) or (5000 <= rc < 6000)
+        """Whether the header E bit is set. An answer a handler builds with
+        ``request.answer`` / ``request.reject`` has it for a protocol error
+        (3xxx) only: a permanent failure (5xxx) answered by a handler is an
+        answer of the command (RFC 6733 section 7.1.5)."""
+        return 3000 <= self.result_code < 4000
 
     def get_avp(self, code: int, vendor: int = 0):
         """The value of the first AVP with this code and vendor, or ``None``."""
@@ -6686,6 +6689,9 @@ class MockDiameterRequest:
         return MockDiameterAnswer(result_code=result_code, command_code=self.command_code)
 
     def reject(self, result_code: int, error_message: Optional[str] = None) -> MockDiameterAnswer:
+        """Build an answer that refuses this request: an alias of
+        :meth:`answer`, kept for readability. The header E bit is set for a
+        protocol error (3xxx) and for nothing else."""
         return MockDiameterAnswer(result_code=result_code, command_code=self.command_code)
 
     async def forward_to(self, peer: MockPeer, identity=None,

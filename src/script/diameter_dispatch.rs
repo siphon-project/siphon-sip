@@ -796,12 +796,12 @@ fn build_answer_via_handler(
         Err(error) => {
             warn!(%error, "Diameter server: malformed inbound request");
             let stub = stub_message(incoming);
-            let answer = forward::build_answer(
+            let answer = forward::build_error_answer(
                 &stub,
                 local_origin_host,
                 local_origin_realm,
                 dictionary::DIAMETER_INVALID_AVP_LENGTH,
-                Some("malformed request"),
+                "malformed request",
             );
             return AnswerOutcome {
                 wire: answer.to_wire(),
@@ -818,12 +818,12 @@ fn build_answer_via_handler(
     let selected =
         select_request_handler(&state, request_msg.application_id, request_msg.command_code);
     let answer_with = |result_code: u32, error_message: &str| {
-        forward::build_answer(
+        forward::build_error_answer(
             &request_msg,
             local_origin_host,
             local_origin_realm,
             result_code,
-            Some(error_message),
+            error_message,
         )
     };
     // No route: nothing serves this request. Kept for the two cases that
@@ -1408,6 +1408,13 @@ mod handler_failure_tests {
         source: &str,
         request: &crate::diameter::peer::IncomingRequest,
     ) -> u32 {
+        let (base, _experimental) = answer_for(source, request).answer_result_codes();
+        base.expect("every failure answer carries a base Result-Code")
+    }
+
+    /// The answer siphon puts on the wire for one inbound request with
+    /// `source` as the running script.
+    fn answer_for(source: &str, request: &crate::diameter::peer::IncomingRequest) -> DiameterMsg {
         let engine =
             Arc::new(ScriptEngine::new_embedded(source).expect("the test script should compile"));
         let peer_info = peer();
@@ -1422,9 +1429,104 @@ mod handler_failure_tests {
             )
             .wire
         });
-        let answer = DiameterMsg::from_wire(&wire).expect("siphon's own answer should parse");
+        DiameterMsg::from_wire(&wire).expect("siphon's own answer should parse")
+    }
+
+    fn handler_returning(expression: &str) -> String {
+        format!(
+            "from siphon import diameter\n\n@diameter.on_request\ndef handle(request):\n    return {expression}\n"
+        )
+    }
+
+    /// RFC 6733 section 7.1.5 on the permanent failures: "these errors SHOULD
+    /// be used in answer messages whose 'E' bit is not set". A handler that
+    /// refuses a request has answered it in the grammar of the command, so
+    /// its answer is not the `answer-message` of section 7.2.
+    #[test]
+    fn a_handler_refusing_with_a_permanent_failure_sends_no_error_bit() {
+        for expression in [
+            "request.answer(5012)",
+            "request.reject(5012)",
+            "request.answer(5001)",
+            "request.reject(5002, 'unknown session')",
+        ] {
+            let answer = answer_for(&handler_returning(expression), &incoming());
+            assert!(!answer.is_error(), "{expression} set the E bit");
+            assert!(!answer.is_request());
+        }
+    }
+
+    /// RFC 6733 section 7.1.3 on the protocol errors: "these errors MUST only
+    /// be used in answer messages whose 'E' bit is set".
+    #[test]
+    fn a_handler_answering_a_protocol_error_sends_the_error_bit() {
+        for expression in ["request.reject(3002)", "request.answer(3004)"] {
+            let answer = answer_for(&handler_returning(expression), &incoming());
+            assert!(answer.is_error(), "{expression} left the E bit clear");
+        }
+    }
+
+    #[test]
+    fn a_handler_answering_success_or_a_transient_failure_sends_no_error_bit() {
+        for expression in ["request.answer(2001)", "request.answer(4002)"] {
+            let answer = answer_for(&handler_returning(expression), &incoming());
+            assert!(!answer.is_error(), "{expression} set the E bit");
+        }
+    }
+
+    const RAISING_HANDLER: &str = concat!(
+        "from siphon import diameter\n",
+        "\n",
+        "@diameter.on_request\n",
+        "def handle(request):\n",
+        "    raise RuntimeError('the bridge is down')\n",
+    );
+
+    /// When the handler raises, siphon answers for it and has no way to
+    /// compose the answer of the command. RFC 6733 section 7.1.5 allows the
+    /// generic form there: "In error conditions where it is not possible or
+    /// efficient to compose application-specific answer grammar, answer
+    /// messages with the 'E' bit set and which comply to the grammar
+    /// described in Section 7.2 MAY also be used for permanent errors."
+    #[test]
+    fn the_answer_for_a_handler_that_raised_is_a_generic_error_message() {
+        let answer = answer_for(RAISING_HANDLER, &incoming());
+        assert!(answer.is_error());
         let (base, _experimental) = answer.answer_result_codes();
-        base.expect("every failure answer carries a base Result-Code")
+        assert_eq!(base, Some(dictionary::DIAMETER_UNABLE_TO_COMPLY));
+    }
+
+    /// RFC 6733 section 4.5 lists Error-Message with V and M under "MUST
+    /// NOT". The AVP by hand: code 281 (0x119), no flag, length 8 plus the
+    /// 25 octets of the text (0x21), then padding.
+    #[test]
+    fn the_error_message_is_sent_without_the_m_bit() {
+        let answer = answer_for(RAISING_HANDLER, &incoming());
+        let error_message = answer
+            .find(dictionary::avp::ERROR_MESSAGE, 0)
+            .expect("the answer says what went wrong");
+        assert_eq!(error_message.flags, 0, "Error-Message MUST NOT carry M");
+
+        let mut expected = vec![0x00, 0x00, 0x01, 0x19, 0x00, 0x00, 0x00, 0x21];
+        expected.extend_from_slice(b"on_request handler raised");
+        expected.extend_from_slice(&[0, 0, 0]);
+        let wire = answer.to_wire();
+        assert!(
+            wire.windows(expected.len())
+                .any(|window| window == expected),
+            "{wire:02x?}"
+        );
+
+        // A handler that names its own reason gets the same AVP.
+        let answer = answer_for(
+            &handler_returning("request.reject(3002, 'no route')"),
+            &incoming(),
+        );
+        let error_message = answer
+            .find(dictionary::avp::ERROR_MESSAGE, 0)
+            .expect("the reason the handler gave");
+        assert_eq!(error_message.flags, 0);
+        assert_eq!(error_message.as_str().as_deref(), Some("no route"));
     }
 
     #[test]
