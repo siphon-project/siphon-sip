@@ -2342,7 +2342,7 @@
     },
     "SbiNamespace": {
       "BsfError": {
-        "doc": "Raised by sbi.discover_pcf_binding() when the BSF is unhealthy (5xx / timeout / transport / malformed body). A 404 (no binding) is NOT a BsfError \u2014 it returns None.",
+        "doc": "Raised by sbi.discover_pcf_binding() when the BSF is unhealthy (5xx / timeout / transport / malformed body). A 204 or a 404 (no binding) is NOT a BsfError: it returns None.",
         "kind": "type"
       },
       "create_session": {

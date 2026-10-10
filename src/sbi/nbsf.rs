@@ -6,11 +6,13 @@
 //!
 //! - **BSF `200 OK` + `PcfBinding`** ⇒ a 5G UE → use N5 (`Npcf_PolicyAuthorization`)
 //!   addressed at the binding's PCF.
-//! - **BSF `404 Not Found`** ⇒ no binding for this IP → a 4G UE → use Rx (Diameter).
+//! - **BSF `204 No Content`** ⇒ no binding for this IP → a 4G UE → use Rx (Diameter).
+//!   This is the answer TS 29.521 clause 4.2.4.2 defines; a `404 Not Found`,
+//!   which some servers send instead, is read the same way.
 //! - **`5xx` / timeout / transport / malformed body** ⇒ BSF unhealthy → [`BsfError`].
 //!
-//! The 200-vs-404 split is the whole contract: a clean miss is a 4G UE, **not**
-//! an error, and is surfaced as `Ok(None)`.
+//! The split between a binding and a clean miss is the whole contract: a
+//! clean miss is a 4G UE, **not** an error, and is surfaced as `Ok(None)`.
 
 use serde::Deserialize;
 
@@ -59,8 +61,9 @@ impl Scheme {
 pub enum BindingQuery {
     /// UE IPv4 address → `?ipv4Addr=...`.
     Ipv4(String),
-    /// UE IPv6 prefix (e.g. `2001:db8::/64`) → `?ipv6Prefix=...` (the `/` is
-    /// percent-encoded to `%2F` on the wire).
+    /// UE IPv6 address as a prefix → `?ipv6Prefix=...` (the `/` is
+    /// percent-encoded to `%2F` on the wire). TS 29.521 has the consumer
+    /// append `/128` to the UE's address, e.g. `2001:db8::1/128`.
     Ipv6Prefix(String),
 }
 
@@ -181,13 +184,14 @@ impl PcfBinding {
 }
 
 /// Error from a BSF discovery call. Distinct from the Npcf `SbiError` so the
-/// Python layer can raise a catchable `sbi.BsfError`. A `404` is **not** a
-/// `BsfError` — it is a clean miss returned as `Ok(None)`.
+/// Python layer can raise a catchable `sbi.BsfError`. A `204` or a `404` is
+/// **not** a `BsfError`: both are a clean miss returned as `Ok(None)`.
 #[derive(Debug)]
 pub enum BsfError {
     /// Transport-level failure (connection refused, timeout, TLS, etc.).
     Transport(String),
-    /// HTTP error status (5xx and any other non-200/404).
+    /// HTTP error status (5xx and any other status that is neither a 2xx nor
+    /// 404).
     Http(u16),
     /// `200 OK` body could not be deserialized into a [`PcfBinding`].
     Deserialization(String),
@@ -256,10 +260,11 @@ impl BsfClient {
 
     /// Look up the PCF binding for a UE IP (TS 29.521 §5.2.2.2.2).
     ///
-    /// `Ok(Some(binding))` on `200`, `Ok(None)` on `404`, `Err(BsfError)` on
-    /// anything else. In `Indirect` mode the request carries the
+    /// `Ok(Some(binding))` on `200`, `Ok(None)` on `204` or `404`,
+    /// `Err(BsfError)` on anything else, including a `200` whose body is not a
+    /// `PcfBinding`. In `Indirect` mode the request carries the
     /// `3gpp-Sbi-Discovery-*` headers so the SCP discovers the BSF via the NRF
-    /// (Model D); the 200/404 contract reaching the caller is unchanged.
+    /// (Model D); the contract reaching the caller is unchanged.
     pub async fn discover_binding(
         &self,
         key: &BindingQuery,
@@ -284,7 +289,10 @@ impl BsfClient {
             .map_err(|error| BsfError::Transport(format!("{url}: {error}")))?;
 
         let status = response.status();
-        if status.as_u16() == 404 {
+        // No binding matches the query: `204 No Content` (TS 29.521 clause
+        // 4.2.4.2). `404` is not what the specification asks for, but servers
+        // send it for the same thing.
+        if matches!(status.as_u16(), 204 | 404) {
             return Ok(None);
         }
         if !status.is_success() {
@@ -468,6 +476,48 @@ mod tests {
         assert!(result.is_none(), "404 must yield Ok(None)");
     }
 
+    /// TS 29.521 clause 4.2.4.2: with no binding matching the query the BSF
+    /// answers `204 No Content`. That is a clean miss, like the `404` some
+    /// servers send, not an unhealthy BSF.
+    #[tokio::test]
+    async fn discover_204_returns_none() {
+        use axum::routing::get;
+        let router = axum::Router::new().route(
+            "/nbsf-management/v1/pcfBindings",
+            get(|| async { axum::http::StatusCode::NO_CONTENT }),
+        );
+        let base = spawn_mock(router).await;
+        let client = BsfClient::new(&base, reqwest::Client::new());
+        let result = client
+            .discover_binding(&BindingQuery::Ipv4("192.0.2.99".into()))
+            .await
+            .expect("204 is a clean miss, not an error");
+        assert!(result.is_none(), "204 must yield Ok(None)");
+    }
+
+    /// A `200` promises a `PcfBinding`. One that carries something else, or
+    /// nothing, is a broken answer and must not pass for "no binding".
+    #[tokio::test]
+    async fn discover_200_without_a_binding_body_is_an_error() {
+        use axum::routing::get;
+        for body in ["", "not json", "\"pcf01\""] {
+            let router = axum::Router::new().route(
+                "/nbsf-management/v1/pcfBindings",
+                get(move || async move { ([("content-type", "application/json")], body) }),
+            );
+            let base = spawn_mock(router).await;
+            let client = BsfClient::new(&base, reqwest::Client::new());
+            let error = client
+                .discover_binding(&BindingQuery::Ipv4("192.0.2.7".into()))
+                .await
+                .expect_err("a 200 without a PcfBinding is an error");
+            assert!(
+                matches!(error, BsfError::Deserialization(_)),
+                "body {body:?}: {error}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn discover_500_returns_err() {
         use axum::routing::get;
@@ -517,7 +567,7 @@ mod tests {
         let base = spawn_mock(router).await;
         let client = BsfClient::new(&base, reqwest::Client::new());
         let result = client
-            .discover_binding(&BindingQuery::Ipv6Prefix("2001:db8::/64".into()))
+            .discover_binding(&BindingQuery::Ipv6Prefix("2001:db8::1/128".into()))
             .await
             .unwrap();
         assert!(result.is_none());
@@ -526,9 +576,9 @@ mod tests {
         assert_eq!(queries.len(), 1);
         let query = &queries[0];
         assert!(query.starts_with("ipv6Prefix="), "got: {query}");
-        // The `/` of the /64 prefix MUST be percent-encoded (TS 29.521 wire).
+        // The `/` of the /128 prefix MUST be percent-encoded (TS 29.521 wire).
         assert!(
-            query.contains("%2F64"),
+            query.contains("%2F128"),
             "slash must be %2F encoded: {query}"
         );
     }

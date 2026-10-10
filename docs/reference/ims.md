@@ -45,7 +45,9 @@ TS 29.514 suffix — which is what the spec defines — is unaffected.
 
 ### `BsfError`
 
-Raised by `sbi.discover_pcf_binding(...)` when the BSF is unhealthy.
+Raised by `sbi.discover_pcf_binding(...)` when the BSF is unhealthy. A BSF
+that has no binding for the address is healthy: it answers `204` (TS 29.521
+§4.2.4.2; some servers answer `404`) and the lookup returns `None`.
 
 ::: siphon_sdk.mock_module.BsfError
 

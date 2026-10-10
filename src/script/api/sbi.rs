@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyType};
-use tracing::warn;
+use tracing::{debug, warn};
 
 use indexmap::IndexMap;
 
@@ -20,8 +20,8 @@ pyo3::create_exception!(
     BsfError,
     pyo3::exceptions::PyRuntimeError,
     "Raised by sbi.discover_pcf_binding() when the BSF is unhealthy \
-     (5xx / timeout / transport / malformed body). A 404 (no binding) is \
-     NOT a BsfError — it returns None."
+     (5xx / timeout / transport / malformed body). A 204 or a 404 (no \
+     binding) is NOT a BsfError: it returns None."
 );
 
 /// Python-visible SBI namespace.
@@ -61,14 +61,17 @@ impl PySbi {
     /// Returns:
     ///   * a dict (the PcfBinding, incl. a ready-to-use ``pcf_uri``) when the
     ///     BSF has a binding → caller treats as 5G;
-    ///   * ``None`` when the BSF returns 404 (no binding) → caller treats as 4G;
+    ///   * ``None`` when the BSF has no binding (204, or 404 from a server
+    ///     that answers that way) → caller treats as 4G;
     ///   * raises ``sbi.BsfError`` on 5xx / timeout / transport / malformed body.
     ///
     /// Raises ``RuntimeError`` (NOT ``BsfError``) when ``sbi.bsf_url`` is unset,
     /// so a misconfiguration is loud rather than a silent always-4G.
     ///
     /// Exactly one of ``ue_ipv4`` / ``ue_ipv6`` must be supplied. ``ue_ipv6``
-    /// is treated as a prefix; a bare address gets ``/64`` appended.
+    /// is the UE's address: it is sent as the ``ipv6Prefix`` query parameter
+    /// with ``/128`` appended, as TS 29.521 requires. A value that already
+    /// carries a prefix length is sent as written.
     ///
     /// **Awaitable** — returns a coroutine, so `await` it. The request runs on
     /// tokio rather than on the calling thread, which for an `async def` handler
@@ -80,28 +83,8 @@ impl PySbi {
         ue_ipv4: Option<&str>,
         ue_ipv6: Option<&str>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let query = match (ue_ipv4, ue_ipv6) {
-            (Some(ipv4), None) => BindingQuery::Ipv4(ipv4.to_string()),
-            (None, Some(ipv6)) => {
-                // Treat a bare address as a /64 prefix (TS 29.521 wire form).
-                let prefix = if ipv6.contains('/') {
-                    ipv6.to_string()
-                } else {
-                    format!("{ipv6}/64")
-                };
-                BindingQuery::Ipv6Prefix(prefix)
-            }
-            (Some(_), Some(_)) => {
-                return Err(pyo3::exceptions::PyValueError::new_err(
-                    "discover_pcf_binding: supply exactly one of ue_ipv4 / ue_ipv6, not both",
-                ));
-            }
-            (None, None) => {
-                return Err(pyo3::exceptions::PyValueError::new_err(
-                    "discover_pcf_binding: one of ue_ipv4 / ue_ipv6 is required",
-                ));
-            }
-        };
+        let query = binding_query(ue_ipv4, ue_ipv6)
+            .map_err(|error| pyo3::exceptions::PyValueError::new_err(error.to_string()))?;
 
         let bsf = match &self.bsf {
             Some(bsf) => Arc::clone(bsf),
@@ -134,7 +117,9 @@ impl PySbi {
     ///
     /// Args:
     ///     af_app_id: AF-Application identifier (default ``"IMS Services"``).
-    ///     sip_call_id: SIP Call-ID for correlation.
+    ///     sip_call_id: SIP Call-ID of the call, for correlation in siphon's
+    ///         own log. It is not sent to the PCF: TS 29.514 has no such
+    ///         attribute.
     ///     supi: Subscription Permanent Identifier.
     ///     ue_ipv4: UE IPv4 address.
     ///     ue_ipv6: UE IPv6 address.
@@ -199,7 +184,6 @@ impl PySbi {
 
         let request_data = create_request_data(CreateSessionArguments {
             af_app_id,
-            sip_call_id,
             supi,
             ue_ipv4,
             ue_ipv6,
@@ -214,6 +198,9 @@ impl PySbi {
 
         let client = Arc::clone(&self.client);
         let target = pcf_uri.map(String::from);
+        // Local correlation only: the Call-ID names the call in the log lines
+        // of this session's creation and never reaches the PCF.
+        let sip_call_id = sip_call_id.map(String::from);
 
         crate::script::awaitable(python, async move {
             let result = client
@@ -221,15 +208,26 @@ impl PySbi {
                 .await;
 
             match result {
-                Ok(created) => Python::attach(|python| {
-                    let dict = PyDict::new(python);
-                    dict.set_item("app_session_id", &created.app_session_id)?;
-                    dict.set_item("authorized", created.authorized)?;
-                    dict.set_item("app_session_uri", created.location)?;
-                    Ok(Some(dict.unbind()))
-                }),
+                Ok(created) => {
+                    debug!(
+                        app_session_id = %created.app_session_id,
+                        sip_call_id = sip_call_id.as_deref(),
+                        "sbi.create_session: app session created"
+                    );
+                    Python::attach(|python| {
+                        let dict = PyDict::new(python);
+                        dict.set_item("app_session_id", &created.app_session_id)?;
+                        dict.set_item("authorized", created.authorized)?;
+                        dict.set_item("app_session_uri", created.location)?;
+                        Ok(Some(dict.unbind()))
+                    })
+                }
                 Err(error) => {
-                    warn!(error = %error, "sbi.create_session failed");
+                    warn!(
+                        error = %error,
+                        sip_call_id = sip_call_id.as_deref(),
+                        "sbi.create_session failed"
+                    );
                     Ok(None)
                 }
             }
@@ -467,6 +465,38 @@ fn flow_usage_to_sbi(s: &str) -> PyResult<String> {
     .to_string())
 }
 
+/// Why the address arguments of `sbi.discover_pcf_binding` were refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+enum BindingQueryError {
+    #[error("discover_pcf_binding: supply exactly one of ue_ipv4 / ue_ipv6, not both")]
+    BothAddresses,
+    #[error("discover_pcf_binding: one of ue_ipv4 / ue_ipv6 is required")]
+    NoAddress,
+}
+
+/// The `pcfBindings` query for `sbi.discover_pcf_binding`'s arguments.
+fn binding_query(
+    ue_ipv4: Option<&str>,
+    ue_ipv6: Option<&str>,
+) -> Result<BindingQuery, BindingQueryError> {
+    match (ue_ipv4, ue_ipv6) {
+        (Some(ipv4), None) => Ok(BindingQuery::Ipv4(ipv4.to_string())),
+        (None, Some(ipv6)) => {
+            // TS 29.521 `ipv6Prefix`: "The IPv6 Address of the served UE. The
+            // NF service consumer shall append '/128' to the IPv6 address in
+            // the attribute value." A prefix length the caller wrote stays.
+            let prefix = if ipv6.contains('/') {
+                ipv6.to_string()
+            } else {
+                format!("{ipv6}/128")
+            };
+            Ok(BindingQuery::Ipv6Prefix(prefix))
+        }
+        (Some(_), Some(_)) => Err(BindingQueryError::BothAddresses),
+        (None, None) => Err(BindingQueryError::NoAddress),
+    }
+}
+
 /// Why an `events` / `notif_uri` combination was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 enum EventsArgumentError {
@@ -486,7 +516,6 @@ enum EventsArgumentError {
 /// `sbi.create_session` keyword arguments, after Python extraction.
 struct CreateSessionArguments<'a> {
     af_app_id: &'a str,
-    sip_call_id: Option<&'a str>,
     supi: Option<&'a str>,
     ue_ipv4: Option<&'a str>,
     ue_ipv6: Option<&'a str>,
@@ -518,13 +547,14 @@ fn create_request_data(
     Ok(AppSessionContextReqData {
         af_app_id: Some(arguments.af_app_id.to_string()),
         med_components: components_to_map(arguments.media_components),
-        sip_call_id: arguments.sip_call_id.map(String::from),
         supi: arguments.supi.map(String::from),
         ue_ipv4: arguments.ue_ipv4.map(String::from),
         ue_ipv6: arguments.ue_ipv6.map(String::from),
         dnn: arguments.dnn.map(String::from),
         ev_subsc,
         notif_uri: arguments.notif_uri.map(String::from),
+        // Required by TS 29.514. None of the optional features of clause 5.8
+        // is implemented, which `None` serialises as: "0".
         supp_feat: None,
     })
 }
@@ -946,7 +976,6 @@ mod tests {
     ) -> CreateSessionArguments<'static> {
         CreateSessionArguments {
             af_app_id: "IMS Services",
-            sip_call_id: Some("call-1@example.com"),
             supi: Some("imsi-001010000000001"),
             ue_ipv4: Some("192.0.2.7"),
             ue_ipv6: None,
@@ -984,6 +1013,69 @@ mod tests {
         assert_eq!(value["notifUri"], NOTIF_URI, "{value}");
         assert_eq!(value["afAppId"], "IMS Services", "{value}");
         assert_eq!(value["ueIpv4"], "192.0.2.7", "{value}");
+    }
+
+    /// `suppFeat` is required (TS 29.514 `AppSessionContextReqData`); none of
+    /// the optional features is implemented, so the value is "0".
+    #[test]
+    fn create_request_data_sends_supp_feat_zero() {
+        let request_data = create_request_data(create_arguments(None, Some(NOTIF_URI)))
+            .expect("no events is accepted");
+        let value = serde_json::to_value(&request_data).unwrap();
+        assert_eq!(value["suppFeat"], "0", "{value}");
+    }
+
+    /// TS 29.514 defines no `sipCallId`. The `sip_call_id` argument stays on
+    /// this side, so the request data has nowhere to carry it: every member
+    /// it sends is one the specification names.
+    #[test]
+    fn create_request_data_has_no_sip_call_id_member() {
+        let request_data = create_request_data(create_arguments(None, Some(NOTIF_URI)))
+            .expect("no events is accepted");
+        let value = serde_json::to_value(&request_data).unwrap();
+        let mut members: Vec<&str> = value
+            .as_object()
+            .expect("JSON object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        members.sort_unstable();
+        assert_eq!(
+            members,
+            ["afAppId", "dnn", "notifUri", "supi", "suppFeat", "ueIpv4"],
+            "{value}"
+        );
+    }
+
+    /// TS 29.521 `ipv6Prefix` query parameter: "The IPv6 Address of the served
+    /// UE. The NF service consumer shall append '/128' to the IPv6 address in
+    /// the attribute value."
+    #[test]
+    fn a_bare_ipv6_address_is_queried_as_a_128_prefix() {
+        assert_eq!(
+            binding_query(None, Some("2001:db8:85a3::8a2e:370:7334")).unwrap(),
+            BindingQuery::Ipv6Prefix("2001:db8:85a3::8a2e:370:7334/128".into())
+        );
+    }
+
+    #[test]
+    fn an_ipv6_prefix_length_is_left_as_the_caller_wrote_it() {
+        for prefix in ["2001:db8:abcd:12::/64", "2001:db8::1/128", "2001:db8::/56"] {
+            assert_eq!(
+                binding_query(None, Some(prefix)).unwrap(),
+                BindingQuery::Ipv6Prefix(prefix.into())
+            );
+        }
+    }
+
+    #[test]
+    fn binding_query_takes_exactly_one_address() {
+        assert_eq!(
+            binding_query(Some("192.0.2.7"), None).unwrap(),
+            BindingQuery::Ipv4("192.0.2.7".into())
+        );
+        assert!(binding_query(None, None).is_err());
+        assert!(binding_query(Some("192.0.2.7"), Some("2001:db8::1")).is_err());
     }
 
     #[test]

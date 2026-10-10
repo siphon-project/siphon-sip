@@ -9039,8 +9039,9 @@ class BsfError(RuntimeError):
     """Raised by ``sbi.discover_pcf_binding()`` when the BSF is unhealthy
     (5xx / timeout / transport / malformed body).
 
-    A 404 (no binding for the UE IP) is **not** a ``BsfError`` — it returns
-    ``None`` (the 4G UE case). Mirrors the Rust ``sbi.BsfError`` exception.
+    No binding for the UE IP is **not** a ``BsfError``: the BSF answers 204
+    (TS 29.521), or 404 on some servers, and the lookup returns ``None`` (the
+    4G UE case). Mirrors the Rust ``sbi.BsfError`` exception.
     """
 
 
@@ -9070,7 +9071,7 @@ class MockSbi:
         self._sessions: dict[str, dict] = {}
         self._next_session_id: int = 1
         self._authorized: bool = True
-        #: discover_pcf_binding result: a binding dict (5G) or None (404 / 4G).
+        #: discover_pcf_binding result: a binding dict (5G) or None (no binding, 4G).
         self._binding: Optional[dict] = None
         #: when True, discover_pcf_binding raises BsfError (BSF unhealthy).
         self._bsf_error: bool = False
@@ -9130,7 +9131,9 @@ class MockSbi:
 
         Args:
             af_app_id: AF-Application identifier (default ``"IMS Services"``).
-            sip_call_id: SIP Call-ID for correlation.
+            sip_call_id: SIP Call-ID of the call, for correlation in siphon's
+                own log. It is not sent to the PCF: TS 29.514 has no such
+                attribute.
             supi: Subscription Permanent Identifier.
             ue_ipv4: UE IPv4 address.
             ue_ipv6: UE IPv6 address.
@@ -9283,14 +9286,18 @@ class MockSbi:
         """Nbsf_Management discovery — look up the PCF binding for a UE IP.
 
         Returns a binding dict (5G; configure via ``set_binding``), ``None``
-        when the BSF has no binding (404 / 4G), or raises ``sbi.BsfError`` when
-        configured unhealthy via ``set_bsf_error``.
+        when the BSF has no binding (it answers 204, or 404 on some servers;
+        4G), or raises ``sbi.BsfError`` when configured unhealthy via
+        ``set_bsf_error``.
 
         Exactly one of ``ue_ipv4`` / ``ue_ipv6`` must be supplied.
 
         Args:
             ue_ipv4: UE IPv4 address (the IPsec SA peer).
-            ue_ipv6: UE IPv6 address/prefix.
+            ue_ipv6: UE IPv6 address. siphon sends it as the ``ipv6Prefix``
+                query parameter with ``/128`` appended, as TS 29.521
+                requires; a value that already carries a prefix length is
+                sent as written.
 
         Returns:
             The binding dict (incl. a ready-to-use ``pcf_uri``) or ``None``.
@@ -9411,7 +9418,8 @@ class MockSbi:
         """Configure what ``discover_pcf_binding`` returns (test helper).
 
         Args:
-            binding: a binding dict (5G case) or ``None`` (404 / 4G case).
+            binding: a binding dict (5G case) or ``None`` (no binding: the
+                4G case).
         """
         self._binding = binding
 

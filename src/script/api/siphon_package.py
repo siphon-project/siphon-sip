@@ -1184,8 +1184,9 @@ class BsfError(RuntimeError):
     """Raised by ``sbi.discover_pcf_binding()`` when the BSF is unhealthy
     (5xx / timeout / transport / malformed body).
 
-    A 404 (no binding for the UE IP) is **not** a ``BsfError`` — it returns
-    ``None`` (the 4G UE case).  This Python class is only a pre-injection
+    No binding for the UE IP is **not** a ``BsfError``: the BSF answers 204
+    (TS 29.521), or 404 on some servers, and the lookup returns ``None`` (the
+    4G UE case).  This Python class is only a pre-injection
     fallback so ``except sbi.BsfError`` resolves before the Rust singleton is
     wired; once ``sbi._inner`` is injected, ``sbi.BsfError`` forwards to the
     Rust exception type (which is what ``discover_pcf_binding`` actually
@@ -1233,7 +1234,8 @@ class _SbiNamespace:
 
         Args:
             af_app_id: AF-Application identifier (default "IMS Services").
-            sip_call_id: SIP Call-ID for correlation.
+            sip_call_id: SIP Call-ID of the call, for correlation in siphon's
+                own log.  Not sent to the PCF (TS 29.514 has no such attribute).
             supi: Subscription Permanent Identifier.
             ue_ipv4: UE IPv4 address.
             ue_ipv6: UE IPv6 address.
@@ -1315,12 +1317,14 @@ class _SbiNamespace:
         """Nbsf_Management discovery — look up the PCF binding for a UE IP.
 
         Returns a binding dict (BSF 200, 5G; incl. a ready-to-use ``pcf_uri``),
-        ``None`` (BSF 404, 4G), or raises ``sbi.BsfError`` (BSF unhealthy).
+        ``None`` (BSF 204 or 404, 4G), or raises ``sbi.BsfError`` (BSF unhealthy).
         Requires ``sbi:`` configuration with ``bsf_url``.
 
         Args:
             ue_ipv4: UE IPv4 address (the IPsec SA peer).
-            ue_ipv6: UE IPv6 address/prefix.  Exactly one of ue_ipv4 / ue_ipv6.
+            ue_ipv6: UE IPv6 address, sent as ``ipv6Prefix`` with ``/128``
+                appended (TS 29.521) unless it already carries a prefix
+                length.  Exactly one of ue_ipv4 / ue_ipv6.
         """
         inner = self.__dict__.get("_inner")
         if inner is None:
