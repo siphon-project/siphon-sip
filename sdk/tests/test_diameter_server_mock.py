@@ -108,6 +108,46 @@ def test_event_sink_and_completed_hook():
     assert d.event_sink.rows == [{"app": "Rx", "rc": 2001, "us": 1234}]
 
 
+def test_answer_insert_avp_appends_and_set_avp_replaces():
+    req = mock_module.MockDiameterRequest(application_name="Cx", command_name="MAR")
+    answer = req.answer(2001)
+    first = [("SIP-Item-Number", 1)]
+    second = [("SIP-Item-Number", 2)]
+
+    # insert_avp appends: a repeated AVP stays, in the order it was added.
+    answer.set_avp("SIP-Number-Auth-Items", 2)
+    answer.insert_avp("SIP-Auth-Data-Item", first)
+    answer.insert_avp("SIP-Auth-Data-Item", second)
+    assert answer.iter_avps() == [
+        ("SIP-Number-Auth-Items", 0, 2),
+        ("SIP-Auth-Data-Item", 0, first),
+        ("SIP-Auth-Data-Item", 0, second),
+    ]
+    # get_avp reads the first one.
+    assert answer.get_avp("SIP-Auth-Data-Item") == first
+
+    # set_avp replaces every AVP with that code and vendor.
+    answer.set_avp("SIP-Auth-Data-Item", second)
+    assert answer.iter_avps() == [
+        ("SIP-Number-Auth-Items", 0, 2),
+        ("SIP-Auth-Data-Item", 0, second),
+    ]
+
+    # The same code under another vendor is another AVP.
+    answer.insert_avp(612, first, vendor=10415)
+    answer.insert_avp(612, second, vendor=10415)
+    assert answer.get_avp("SIP-Auth-Data-Item") == second
+    assert answer.remove_avp(612, 10415) == 2
+    assert answer.remove_avp(612, 10415) == 0
+    assert answer.get_avp(612, 10415) is None
+
+
+def test_answer_seeded_from_a_dict_keeps_its_avps():
+    answer = mock_module.MockDiameterAnswer(avps={(264, 0): "hss.example.org"})
+    assert answer.get_avp(264) == "hss.example.org"
+    assert answer.iter_avps() == [(264, 0, "hss.example.org")]
+
+
 def test_s6a_air_ulr_purge():
     _fresh_diameter()
     from siphon import diameter as d

@@ -415,6 +415,34 @@ impl PyDiameterAnswer {
         Ok(())
     }
 
+    /// Append an AVP, keeping the ones already there with its code and vendor.
+    ///
+    /// ``set_avp`` replaces: it removes every AVP of that code and vendor
+    /// first, so it cannot build an answer that carries the same AVP more
+    /// than once at the top level. Call ``insert_avp`` once per occurrence
+    /// for those, in the order they should go on the wire. The arguments are
+    /// the ones ``set_avp`` takes.
+    ///
+    /// ```python,ignore
+    /// answer = req.answer(2001)
+    /// answer.set_avp("SIP-Number-Auth-Items", len(vectors))
+    /// for vector in vectors:
+    ///     answer.insert_avp("SIP-Auth-Data-Item", vector)
+    /// ```
+    #[pyo3(signature = (code_or_name, value, vendor=0))]
+    fn insert_avp(
+        &self,
+        code_or_name: &Bound<'_, PyAny>,
+        value: &Bound<'_, PyAny>,
+        vendor: u32,
+    ) -> PyResult<()> {
+        let (code, name_vendor) = resolve_code(code_or_name)?;
+        let vendor = if vendor != 0 { vendor } else { name_vendor };
+        let avp = build_avp(code, vendor, value)?;
+        self.lock_mut()?.avps.push(avp);
+        Ok(())
+    }
+
     #[pyo3(signature = (code_or_name, vendor=0))]
     fn remove_avp(&self, code_or_name: &Bound<'_, PyAny>, vendor: u32) -> PyResult<usize> {
         let (code, name_vendor) = resolve_code(code_or_name)?;
@@ -607,7 +635,8 @@ impl PyDiameterRequest {
     ///
     /// The envelope is seeded with Session-Id (echoed), Result-Code,
     /// Origin-Host/Realm, and the request's hop-by-hop / end-to-end. Add the
-    /// application AVPs (including grouped ones) with `set_avp`.
+    /// application AVPs (including grouped ones) with `set_avp`, or with
+    /// `insert_avp` for an AVP the answer carries more than once.
     #[pyo3(signature = (result_code=2001, error_message=None))]
     fn answer(
         &self,
@@ -984,5 +1013,209 @@ mod tests {
             // Echoes the request command + session.
             assert_eq!(answer.command_code().unwrap(), 272);
         });
+    }
+
+    // ── DiameterAnswer.insert_avp: a repeated top-level AVP ─────────────────
+
+    /// A Cx Multimedia-Auth-Request (TS 29.229), the request whose answer
+    /// carries one SIP-Auth-Data-Item per authentication vector.
+    fn py_multimedia_auth_request() -> PyDiameterRequest {
+        PyDiameterRequest::new(
+            DiameterMsg {
+                flags: FLAG_REQUEST | FLAG_PROXIABLE,
+                command_code: dictionary::CMD_MULTIMEDIA_AUTH,
+                application_id: dictionary::CX_APP_ID,
+                hop_by_hop: 0x1111,
+                end_to_end: 0x2222,
+                avps: vec![
+                    Avp::utf8(
+                        dictionary::avp::SESSION_ID,
+                        0,
+                        "scscf.ims.mnc001.mcc001.3gppnetwork.org;7;7",
+                    ),
+                    Avp::utf8(
+                        dictionary::avp::ORIGIN_HOST,
+                        0,
+                        "scscf.ims.mnc001.mcc001.3gppnetwork.org",
+                    ),
+                ],
+            },
+            PyInboundPeer {
+                name: "scscf".into(),
+                tenant: "default".into(),
+                addr: "192.0.2.5:5000".into(),
+                transport: "tcp".into(),
+            },
+            "hss.ims.mnc001.mcc001.3gppnetwork.org".into(),
+            "ims.mnc001.mcc001.3gppnetwork.org".into(),
+        )
+    }
+
+    /// SIP-Item-Number (TS 29.229 §6.3.14), the ordinal of one item.
+    const SIP_ITEM_NUMBER: u32 = 613;
+
+    /// One SIP-Auth-Data-Item as a script writes it: a list of child tuples.
+    fn auth_data_item<'py>(py: Python<'py>, item_number: u32) -> Bound<'py, PyList> {
+        let fill = item_number as u8;
+        let item = PyList::empty(py);
+        item.append(("SIP-Item-Number", item_number)).unwrap();
+        item.append(("SIP-Authentication-Scheme", "Digest-AKAv1-MD5"))
+            .unwrap();
+        item.append(("SIP-Authenticate", PyBytes::new(py, &[fill; 32])))
+            .unwrap();
+        item.append(("SIP-Authorization", PyBytes::new(py, &[fill; 8])))
+            .unwrap();
+        item.append(("Confidentiality-Key", PyBytes::new(py, &[fill; 16])))
+            .unwrap();
+        item.append(("Integrity-Key", PyBytes::new(py, &[fill; 16])))
+            .unwrap();
+        item
+    }
+
+    /// A Multimedia-Auth-Answer with `vectors` SIP-Auth-Data-Item AVPs, each
+    /// appended with `insert_avp`.
+    fn multimedia_auth_answer(py: Python<'_>, vectors: u32) -> PyDiameterAnswer {
+        let answer = py_multimedia_auth_request().answer(2001, None).unwrap();
+        let name = |name: &str| name.into_pyobject(py).unwrap().into_any();
+        let set = |avp: &str, value: Bound<'_, PyAny>| {
+            answer.set_avp(&name(avp), &value, 0).unwrap();
+        };
+        set(
+            "User-Name",
+            "001010000000001@ims.mnc001.mcc001.3gppnetwork.org"
+                .into_pyobject(py)
+                .unwrap()
+                .into_any(),
+        );
+        set(
+            "Public-Identity",
+            "sip:001010000000001@ims.mnc001.mcc001.3gppnetwork.org"
+                .into_pyobject(py)
+                .unwrap()
+                .into_any(),
+        );
+        set(
+            "SIP-Number-Auth-Items",
+            vectors.into_pyobject(py).unwrap().into_any(),
+        );
+        for item_number in 1..=vectors {
+            answer
+                .insert_avp(
+                    &name("SIP-Auth-Data-Item"),
+                    auth_data_item(py, item_number).as_any(),
+                    0,
+                )
+                .unwrap();
+        }
+        answer
+    }
+
+    /// The SIP-Item-Number of every top-level SIP-Auth-Data-Item on the wire,
+    /// in wire order.
+    fn item_numbers_on_the_wire(answer: &PyDiameterAnswer) -> Vec<Option<u32>> {
+        let msg = DiameterMsg::from_wire(&answer.to_wire().unwrap()).unwrap();
+        msg.find_all(dictionary::avp::SIP_AUTH_DATA_ITEM, dictionary::VENDOR_3GPP)
+            .map(|item| match &item.value {
+                AvpData::Grouped(children) => children
+                    .iter()
+                    .find(|child| child.code == SIP_ITEM_NUMBER)
+                    .and_then(Avp::as_u32),
+                AvpData::Raw(_) => panic!("SIP-Auth-Data-Item must be grouped"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn answer_insert_avp_appends_a_repeated_top_level_avp() {
+        pyo3::Python::initialize();
+        Python::attach(|py| {
+            let answer = multimedia_auth_answer(py, 2);
+            // Both are on the wire, in the order they were appended.
+            assert_eq!(item_numbers_on_the_wire(&answer), vec![Some(1), Some(2)]);
+            // And what the envelope was seeded with is still there, once.
+            let msg = DiameterMsg::from_wire(&answer.to_wire().unwrap()).unwrap();
+            assert_eq!(msg.find_all(dictionary::avp::RESULT_CODE, 0).count(), 1);
+            assert_eq!(msg.find_all(dictionary::avp::SESSION_ID, 0).count(), 1);
+        });
+    }
+
+    #[test]
+    fn answer_insert_avp_takes_a_code_and_a_vendor_like_set_avp() {
+        pyo3::Python::initialize();
+        Python::attach(|py| {
+            let answer = py_multimedia_auth_request().answer(2001, None).unwrap();
+            let code = dictionary::avp::SIP_AUTH_DATA_ITEM
+                .into_pyobject(py)
+                .unwrap()
+                .into_any();
+            for item_number in [5, 6, 7] {
+                answer
+                    .insert_avp(
+                        &code,
+                        auth_data_item(py, item_number).as_any(),
+                        dictionary::VENDOR_3GPP,
+                    )
+                    .unwrap();
+            }
+            assert_eq!(
+                item_numbers_on_the_wire(&answer),
+                vec![Some(5), Some(6), Some(7)]
+            );
+        });
+    }
+
+    #[test]
+    fn answer_set_avp_still_replaces() {
+        pyo3::Python::initialize();
+        Python::attach(|py| {
+            let answer = multimedia_auth_answer(py, 2);
+            let name = "SIP-Auth-Data-Item".into_pyobject(py).unwrap().into_any();
+
+            // set_avp removes every AVP of that code and vendor, then adds one.
+            answer
+                .set_avp(&name, auth_data_item(py, 9).as_any(), 0)
+                .unwrap();
+            assert_eq!(item_numbers_on_the_wire(&answer), vec![Some(9)]);
+            answer
+                .set_avp(&name, auth_data_item(py, 3).as_any(), 0)
+                .unwrap();
+            assert_eq!(item_numbers_on_the_wire(&answer), vec![Some(3)]);
+
+            // insert_avp after it appends to what set_avp left.
+            answer
+                .insert_avp(&name, auth_data_item(py, 4).as_any(), 0)
+                .unwrap();
+            assert_eq!(item_numbers_on_the_wire(&answer), vec![Some(3), Some(4)]);
+
+            // remove_avp takes all of them and says how many.
+            assert_eq!(answer.remove_avp(&name, 0).unwrap(), 2);
+            assert!(item_numbers_on_the_wire(&answer).is_empty());
+        });
+    }
+
+    /// Emit a Multimedia-Auth-Answer with two SIP-Auth-Data-Item AVPs as hex
+    /// for [`scripts/validate_diameter_answer_avps.sh`] to feed to tshark.
+    ///
+    /// The tests above read the answer back with the decoder that shares a
+    /// dictionary with the encoder. tshark decodes the same bytes with its own.
+    #[test]
+    fn emit_answer_with_repeated_avp_for_external_dissection() {
+        let Ok(path) = std::env::var("SIPHON_DIAMETER_ANSWER_HEX_OUT") else {
+            // Nothing to do in an ordinary test run.
+            return;
+        };
+        pyo3::Python::initialize();
+        let wire = Python::attach(|py| multimedia_auth_answer(py, 2).to_wire().unwrap());
+
+        // `text2pcap`'s hex-dump form: an offset, then the octets.
+        let mut dump = String::new();
+        for (offset, chunk) in wire.chunks(16).enumerate() {
+            dump.push_str(&format!("{:06x}", offset * 16));
+            for byte in chunk {
+                dump.push_str(&format!(" {byte:02x}"));
+            }
+            dump.push('\n');
+        }
+        std::fs::write(&path, dump).expect("hex dump must be writable");
     }
 }
