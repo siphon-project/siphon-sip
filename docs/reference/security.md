@@ -82,7 +82,9 @@ success path.
 
 `require_ims_digest` and `require_aka_digest` take a `Request` only — IMS and
 AKA digest are REGISTER-time procedures, and REGISTER never reaches the B2BUA
-path.
+path. `require_ims_digest` also takes `server_name=`, the S-CSCF's own SIP URI,
+which the Multimedia-Auth-Request it sends to the HSS requires; see
+[Cx: registration](diameter.md#cx-registration).
 
 ## `auth` namespace
 

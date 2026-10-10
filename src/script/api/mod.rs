@@ -13,6 +13,7 @@ pub mod call;
 pub mod cdr;
 pub mod config;
 pub mod diameter;
+mod diameter_cx;
 pub mod diameter_server;
 pub mod gateway;
 pub mod ipsec;

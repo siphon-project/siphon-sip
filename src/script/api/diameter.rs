@@ -1037,6 +1037,12 @@ impl PyDiameter {
     ///     user_auth_type: User-Authorization-Type AVP value (3GPP TS 29.229).
     ///         ``0`` = REGISTRATION, ``1`` = DE_REGISTRATION,
     ///         ``2`` = REGISTRATION_AND_CAPABILITIES.  Omit to not send the AVP.
+    ///     user_name: The private user identity, sent as User-Name, which the
+    ///         UAR requires (TS 29.229 clause 6.1.1): the ``username`` of the
+    ///         REGISTER's Authorization header. Omit it for a REGISTER without
+    ///         that header, and the identity is derived from ``public_identity``
+    ///         by removing the scheme, port and parameters (TS 24.229 clause
+    ///         5.3.1.2).
     ///
     /// Returns:
     ///     Dict with ``result_code`` (int) and ``server_name`` (str or None),
@@ -1045,13 +1051,14 @@ impl PyDiameter {
     /// **Awaitable** — returns a coroutine, so `await` it. The request runs on
     /// tokio rather than on the calling thread, which for an `async def` handler
     /// is the asyncio driver its whole loop shares.
-    #[pyo3(signature = (public_identity, visited_network_id=None, user_auth_type=None))]
+    #[pyo3(signature = (public_identity, visited_network_id=None, user_auth_type=None, user_name=None))]
     fn cx_uar<'py>(
         &self,
         python: Python<'py>,
         public_identity: &str,
         visited_network_id: Option<&str>,
         user_auth_type: Option<u32>,
+        user_name: Option<&str>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let client = match self
             .manager
@@ -1064,12 +1071,18 @@ impl PyDiameter {
             }
         };
 
+        let user_name = super::diameter_cx::uar_user_name(user_name, public_identity);
         let public_identity = public_identity.to_string();
         let visited = visited_network_id.unwrap_or("").to_string();
 
         crate::script::awaitable(python, async move {
             let answer = client
-                .send_uar(&public_identity, &visited, user_auth_type)
+                .send_uar(&crate::diameter::cx::UserAuthorization {
+                    public_identity: &public_identity,
+                    user_name: &user_name,
+                    visited_network_id: &visited,
+                    user_auth_type,
+                })
                 .await;
 
             match answer {
@@ -1086,6 +1099,83 @@ impl PyDiameter {
                 }
                 Err(error) => {
                     warn!(error = %error, "cx_uar failed");
+                    Ok(None)
+                }
+            }
+        })
+    }
+
+    /// Send a Cx Multimedia-Auth-Request to the HSS.
+    ///
+    /// Used by the S-CSCF to fetch authentication vectors.
+    /// `auth.require_ims_digest` sends this request itself for an IMS AKA
+    /// registration; call this for another scheme or to hold the vector.
+    ///
+    /// Args:
+    ///     public_identity: The user's public identity.
+    ///     user_name: The private user identity (User-Name).
+    ///     server_name: This S-CSCF's SIP URI (Server-Name), which the HSS
+    ///         stores as the S-CSCF serving the user.
+    ///     scheme: SIP-Authentication-Scheme (TS 29.229 clause 6.3.9):
+    ///         ``"Digest-AKAv1-MD5"`` (the default), ``"SIP Digest"``,
+    ///         ``"NASS-Bundled"``, ``"EarlyIMSSecurity"`` or ``"Unknown"``.
+    ///     number_auth_items: How many vectors to ask for (default 1).
+    ///     authorization: ``bytes`` for SIP-Authorization: RAND then AUTS,
+    ///         after an IMS AKA synchronisation failure only.
+    ///
+    /// Returns:
+    ///     Dict with ``result_code`` (int) and ``auth_items``, a list with one
+    ///     dict per SIP-Auth-Data-Item in the order the HSS sent them. Each
+    ///     has the keys the HSS filled in: ``item_number`` (int), ``scheme``
+    ///     (str), ``authenticate``, ``authorization``, ``confidentiality_key``
+    ///     and ``integrity_key`` (bytes), and for SIP Digest ``digest_realm``,
+    ///     ``digest_algorithm``, ``digest_qop`` and ``digest_ha1`` (str).
+    ///     ``None`` if no Diameter peer is connected or the request failed.
+    ///
+    /// Raises:
+    ///     ValueError: an identity or ``server_name`` is empty, or
+    ///         ``number_auth_items`` is 0.
+    ///
+    /// **Awaitable**: returns a coroutine, so `await` it. The request runs on
+    /// tokio rather than on the calling thread, which for an `async def` handler
+    /// is the asyncio driver its whole loop shares.
+    #[pyo3(signature = (public_identity, user_name, server_name, scheme=None, number_auth_items=1, authorization=None))]
+    fn cx_mar<'py>(
+        &self,
+        python: Python<'py>,
+        public_identity: &str,
+        user_name: &str,
+        server_name: &str,
+        scheme: Option<&str>,
+        number_auth_items: u32,
+        authorization: Option<Vec<u8>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let arguments = super::diameter_cx::MarArguments::new(
+            public_identity,
+            user_name,
+            server_name,
+            scheme,
+            number_auth_items,
+            authorization,
+        )?;
+        let client = match self
+            .manager
+            .route_client(&crate::config::DiameterApplication::Cx, None)
+        {
+            Some(client) => client,
+            None => {
+                warn!("cx_mar: no Diameter peer connected");
+                return crate::script::ready(python, None::<Py<PyDict>>);
+            }
+        };
+
+        crate::script::awaitable(python, async move {
+            match client.send_mar(&arguments.request()).await {
+                Ok(message) => Python::attach(|python| {
+                    super::diameter_cx::mar_answer_dict(python, &message).map(Some)
+                }),
+                Err(error) => {
+                    warn!(error = %error, "cx_mar failed");
                     Ok(None)
                 }
             }
@@ -3669,7 +3759,7 @@ mod tests {
         let py_diameter = PyDiameter::new(manager);
         pyo3::Python::attach(|python| {
             let result = py_diameter
-                .cx_uar(python, "sip:alice@example.com", None, None)
+                .cx_uar(python, "sip:alice@example.com", None, None, None)
                 .unwrap();
             assert!(resolve(python, result).is_none());
         });
@@ -3682,7 +3772,7 @@ mod tests {
         let py_diameter = PyDiameter::new(manager);
         pyo3::Python::attach(|python| {
             let result = py_diameter
-                .cx_uar(python, "sip:alice@example.com", None, Some(0))
+                .cx_uar(python, "sip:alice@example.com", None, Some(0), None)
                 .unwrap();
             assert!(resolve(python, result).is_none());
         });
