@@ -148,6 +148,40 @@ advertises S6a alone, and refuses a peer that offers only Cx. List the other
 applications, or `relay`, under `applications`. And a peer that sends a CER
 with no application in it is refused by any node whose list is not empty.
 
+## Cx: registration
+
+The I-CSCF asks the HSS which S-CSCF serves a user with `diameter.cx_uar`,
+and the S-CSCF fetches authentication vectors with a Multimedia-Auth-Request.
+Both commands require the private user identity as User-Name, and the MAR
+also the S-CSCF's own SIP URI as Server-Name (TS 29.229 clauses 6.1.1 and
+6.1.7).
+
+```python
+from siphon import auth, diameter
+
+SCSCF_URI = "sip:scscf.ims.example.com:6060"
+
+# I-CSCF. user_name is the username of the REGISTER's Authorization header;
+# leave it out and it is derived from the public identity (TS 24.229 5.3.1.2).
+result = await diameter.cx_uar(public_identity, visited_network, user_name=private_identity)
+
+# S-CSCF, IMS AKA: the MAR, the 401 challenge and the verification in one call.
+if not await auth.require_ims_digest(request, realm=REALM, server_name=SCSCF_URI):
+    return
+
+# Or the MAR on its own, for another scheme or to hold the vector yourself.
+answer = await diameter.cx_mar(public_identity, private_identity, SCSCF_URI,
+                               scheme="SIP Digest")
+ha1 = answer["auth_items"][0]["digest_ha1"]
+```
+
+`auth.require_ims_digest` asks for the `Digest-AKAv1-MD5` scheme, takes
+User-Name from the Authorization header of the REGISTER (or derives it), and
+sends the MAR to the peer the `cx` route names. Pass `server_name`: without it
+the MAR goes out with no Server-Name, a warning is logged, and an HSS that
+checks the command answers `DIAMETER_MISSING_AVP`. Checked against Wireshark's
+Diameter dissector with `scripts/validate_diameter_cx_requests.sh`.
+
 ## Rx: QoS and bearer events
 
 `diameter.rx_aar` asks the PCRF to authorize the media of a call. With

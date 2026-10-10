@@ -70,6 +70,17 @@ entry, but a working config keeps working.
   AVPs in order and allows repeats, and its `remove_avp` returns how many AVPs
   it removed, as siphon does, where it returned at most 1.
 
+- **`diameter.cx_mar` sends a Cx Multimedia-Auth-Request from a script.**
+  `await diameter.cx_mar(public_identity, user_name, server_name,
+  scheme="Digest-AKAv1-MD5", number_auth_items=1, authorization=None)`
+  resolves to a dict with `result_code` and `auth_items`, one dict per
+  SIP-Auth-Data-Item in the order the HSS sent them (`scheme`, `authenticate`,
+  `authorization`, `confidentiality_key`, `integrity_key`, and for SIP Digest
+  `digest_realm`, `digest_algorithm`, `digest_qop`, `digest_ha1`), or to `None`
+  when no Cx peer is connected. The other Cx requests already had a script
+  call; `auth.require_ims_digest` still sends its own MAR. The SDK mock has
+  `cx_mar` and `set_mar_response`.
+
 ### Removed
 
 - **`ro.charge_message` is gone.** It was documented as one-shot charging of
@@ -81,6 +92,40 @@ entry, but a working config keeps working.
   `ro_ccr_event` call to their `MESSAGE` handler.
 
 ### Fixed
+
+- **Cx User-Authorization and Multimedia-Auth requests carry the AVPs TS 29.229
+  requires. This changes what goes to the HSS.** The UAR went out without
+  User-Name, and the MAR without User-Name and without Server-Name, although
+  clauses 6.1.1 and 6.1.7 list `{ User-Name }` and `{ Server-Name }` and TS
+  29.228 Tables 6.1.1.1 and 6.3.1 make them mandatory: an HSS that checks the
+  command answers `DIAMETER_MISSING_AVP`. Now:
+  - `diameter.cx_uar` takes `user_name=`, the private user identity. Without
+    it the identity is derived from `public_identity` by removing the scheme,
+    port and parameters, which is what TS 24.229 clause 5.3.1.2 has the I-CSCF
+    do for a REGISTER with no Authorization header. An I-CSCF script should
+    pass the `username` of that header when there is one.
+  - `auth.require_ims_digest` takes `server_name=`, the S-CSCF's own SIP URI,
+    and sends it as Server-Name. **Scripts have to pass it** (the URI they give
+    `diameter.cx_sar`): without it the MAR still goes out as before, with no
+    Server-Name, and a warning is logged per request. User-Name comes from the
+    `username` of the REGISTER's Authorization header, or is derived as above.
+  - The first MAR of `auth.require_ims_digest` asked for the scheme
+    `SIP Digest` and only the one after a synchronisation failure for
+    `Digest-AKAv1-MD5`. The call challenges with `AKAv1-MD5` in every case, so
+    both now ask for `Digest-AKAv1-MD5` (TS 29.229 clause 6.3.9). An HSS that
+    honours the scheme used to answer the first one with a digest HA1 and no
+    AKA vector.
+  - The MAR of `auth.require_ims_digest` goes to the peer the `cx` entry under
+    `diameter.routes` names, as the UAR, SAR and LIR do. It took the first
+    connected peer of any application, so with a second peer configured it
+    could reach, say, the charging function and every registration failed.
+    With a `cx` route whose peers are all down the call now raises
+    `RuntimeError` where it used to try an unrelated peer.
+
+  The Rust signatures of `DiameterClient::send_uar` and `send_mar` changed to
+  take `cx::UserAuthorization` and `cx::MultimediaAuth`. Checked against
+  Wireshark's Diameter dissector with
+  `scripts/validate_diameter_cx_requests.sh`.
 
 - **The Diameter listener advertises its applications in the CEA, and refuses
   a peer that shares none (RFC 6733 §5.3).** The Capabilities-Exchange-Answer

@@ -534,6 +534,31 @@ class TestMockDiameterCx:
         assert result is not None
         assert result["server_name"] == "sip:scscf:6060"
 
+    def test_cx_uar_takes_the_private_identity(self):
+        self.diameter.set_default_server_name("sip:scscf:6060")
+        result = run(self.diameter.cx_uar(
+            "sip:alice@example.com", user_name="alice-private@example.com"))
+        assert result["server_name"] == "sip:scscf:6060"
+
+    def test_cx_mar_returns_the_configured_vector(self):
+        self.diameter.set_mar_response(
+            "sip:alice@example.com",
+            auth_items=[{"scheme": "Digest-AKAv1-MD5", "authenticate": b"\x5a" * 32}],
+        )
+        result = run(self.diameter.cx_mar(
+            "sip:alice@example.com", "alice@example.com", "sip:scscf:6060"))
+        assert result["result_code"] == 2001
+        assert result["auth_items"][0]["scheme"] == "Digest-AKAv1-MD5"
+        assert result["auth_items"][0]["authenticate"] == b"\x5a" * 32
+
+    def test_cx_mar_no_config_returns_none(self):
+        assert run(self.diameter.cx_mar(
+            "sip:unknown@example.com", "unknown@example.com", "sip:scscf:6060")) is None
+
+    def test_cx_mar_refuses_an_empty_server_name(self):
+        with pytest.raises(ValueError, match="server_name"):
+            run(self.diameter.cx_mar("sip:alice@example.com", "alice@example.com", ""))
+
     def test_cx_sar_default_success(self):
         result = run(self.diameter.cx_sar("sip:alice@example.com"))
         assert result is not None
