@@ -82,6 +82,46 @@ entry, but a working config keeps working.
 
 ### Fixed
 
+- **The N5 and Nbsf clients follow TS 29.514 and TS 29.521 (Release 18) in
+  four places.** All four change what goes on the wire or how an answer is
+  read.
+  - *`suppFeat` is sent on create.* `AppSessionContextReqData` lists
+    `suppFeat` as required, and `sbi.create_session` never sent it, so a PCF
+    that validates the body against the schema could refuse the request. It
+    is now always sent, as `"0"`: none of the optional features of TS 29.514
+    §5.8 is implemented. The modify body is unchanged, since
+    `AppSessionContextUpdateData` has no `suppFeat`. The `suppFeat` of the
+    PCF's answer is not read: with `"0"` offered there is nothing to
+    negotiate.
+  - *A BSF answer of `204` means no binding.* TS 29.521 §4.2.4.2 has the BSF
+    answer `204 No Content` when no binding matches the query.
+    `sbi.discover_pcf_binding` tried to read a `PcfBinding` out of the empty
+    body and raised `sbi.BsfError`, so a script following the documented
+    pattern treated a UE without a binding as a BSF outage. It now returns
+    `None` for `204`, and still does for `404`, which some servers send
+    instead. A `200` whose body is not a `PcfBinding` still raises
+    `sbi.BsfError`.
+  - *A UE IPv6 address is looked up as a `/128`.*
+    `sbi.discover_pcf_binding(ue_ipv6="2001:db8::1")` sent
+    `ipv6Prefix=2001:db8::1/64`. TS 29.521 defines the parameter as "The IPv6
+    Address of the served UE. The NF service consumer shall append '/128' to
+    the IPv6 address in the attribute value", and that is what is sent now:
+    `ipv6Prefix=2001:db8::1/128`. An argument that already carries a prefix
+    length is sent as written, as before.
+  - *`sipCallId` is no longer sent.* The create body carried the
+    `sip_call_id=` argument as `sipCallId`, an attribute TS 29.514 does not
+    define. Nothing read it back, and the PCF's answer and callbacks
+    identify the session by its resource URI. The argument is kept: the
+    Call-ID now appears in siphon's own log lines for the create (`debug` on
+    success, the existing `warn` on failure). A script that correlates a
+    call with its app session keeps doing so with the `app_session_id` /
+    `app_session_uri` that `create_session` returns.
+
+  **BREAKING (Rust library):** `sbi::npcf::AppSessionContextReqData` loses
+  its `sip_call_id` field, and its `supp_feat: None` now serialises as
+  `"suppFeat":"0"` where the member was left out. The scripting API is
+  unchanged.
+
 - **The Diameter listener advertises its applications in the CEA, and refuses
   a peer that shares none (RFC 6733 §5.3).** The Capabilities-Exchange-Answer
   of a node with `diameter.listen` listed no application at all, so a strict

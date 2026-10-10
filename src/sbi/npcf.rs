@@ -130,9 +130,6 @@ pub struct AppSessionContextReqData {
     /// array.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub med_components: Option<IndexMap<String, MediaComponent>>,
-    /// SIP Call-ID for correlation with SIP signaling.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sip_call_id: Option<String>,
     /// Subscription Permanent Identifier (`supi`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supi: Option<String>,
@@ -153,9 +150,22 @@ pub struct AppSessionContextReqData {
     /// `/terminate` appended.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notif_uri: Option<String>,
-    /// Supported features (`suppFeat`, feature negotiation bitstring).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Supported features (`suppFeat`, the feature negotiation bitmask in
+    /// hexadecimal). The attribute is required in `AppSessionContextReqData`,
+    /// so it is always sent: `None` goes out as [`NO_OPTIONAL_FEATURES`].
+    #[serde(default, serialize_with = "serialize_supp_feat")]
     pub supp_feat: Option<String>,
+}
+
+/// `suppFeat` of a client that implements none of the optional features of
+/// TS 29.514 clause 5.8.
+pub const NO_OPTIONAL_FEATURES: &str = "0";
+
+fn serialize_supp_feat<S: serde::Serializer>(
+    supp_feat: &Option<String>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(supp_feat.as_deref().unwrap_or(NO_OPTIONAL_FEATURES))
 }
 
 /// Top-level POST body for an app-session create (TS 29.514 §5.6.2.2,
@@ -629,12 +639,10 @@ mod tests {
                 codecs: None,
                 med_sub_comps: None,
             }])),
-            sip_call_id: Some("call-123@siphon.local".to_string()),
             ..Default::default()
         };
         let json = serde_json::to_string(&request_data).unwrap();
         assert!(json.contains("afAppId"));
-        assert!(json.contains("sipCallId"));
         assert!(json.contains("medComponents"));
         // The media components are an object keyed by medCompN, not an array.
         assert!(json.contains("\"medComponents\":{\"1\":{"), "{json}");
@@ -734,7 +742,6 @@ mod tests {
                 codecs: None,
                 med_sub_comps: Some(sub_comps),
             }])),
-            sip_call_id: Some("call-456@siphon".to_string()),
             supi: Some("imsi-001010000000001".to_string()),
             ue_ipv4: Some("10.0.0.1".to_string()),
             dnn: Some("ims".to_string()),
@@ -1002,6 +1009,83 @@ mod tests {
             captured[0].is_none(),
             "direct mode must not send 3gpp-Sbi-Target-apiRoot"
         );
+    }
+
+    /// TS 29.514 lists `suppFeat` as required in `AppSessionContextReqData`.
+    /// The client implements none of the optional features of clause 5.8, so
+    /// request data that names none goes out with `"0"`.
+    #[test]
+    fn create_request_data_always_carries_supp_feat() {
+        let value = serde_json::to_value(AppSessionContextReqData::default()).unwrap();
+        assert_eq!(value["suppFeat"], "0", "{value}");
+
+        let named = AppSessionContextReqData {
+            supp_feat: Some("1".to_string()),
+            ..Default::default()
+        };
+        let value = serde_json::to_value(&named).unwrap();
+        assert_eq!(value["suppFeat"], "1", "{value}");
+    }
+
+    /// Every member the create body may carry is one TS 29.514 defines for
+    /// `AppSessionContextReqData`; `sipCallId` is not among them.
+    #[tokio::test]
+    async fn create_wire_body_has_supp_feat_and_only_defined_members() {
+        let _gauge = locked_gauge().await;
+        let captured: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
+        let pcf = spawn_mock(body_capturing_router(Arc::clone(&captured))).await;
+        let client = NpcfClient::new(&pcf, reqwest::Client::new());
+
+        let request_data = AppSessionContextReqData {
+            af_app_id: Some("IMS Services".to_string()),
+            supi: Some("imsi-001010000000001".to_string()),
+            ue_ipv4: Some("192.0.2.7".to_string()),
+            dnn: Some("ims".to_string()),
+            notif_uri: Some(NOTIF_URI.to_string()),
+            ..Default::default()
+        };
+        client
+            .create_app_session(None, &request_data)
+            .await
+            .expect("create must succeed");
+
+        let body = captured.lock().unwrap().clone().expect("captured body");
+        assert_eq!(body["ascReqData"]["suppFeat"], "0", "{body}");
+        let mut members: Vec<&str> = body["ascReqData"]
+            .as_object()
+            .expect("ascReqData object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        members.sort_unstable();
+        assert_eq!(
+            members,
+            ["afAppId", "dnn", "notifUri", "supi", "suppFeat", "ueIpv4"],
+            "{body}"
+        );
+    }
+
+    /// `AppSessionContextUpdateData` has no `suppFeat`: features are
+    /// negotiated once, at creation.
+    #[tokio::test]
+    async fn update_wire_body_has_no_supp_feat() {
+        let update_data = AppSessionContextUpdateData {
+            med_components: Some(components_map(vec![MediaComponent {
+                med_comp_n: 1,
+                med_type: "AUDIO".to_string(),
+                f_status: "ENABLED".to_string(),
+                codecs: None,
+                med_sub_comps: None,
+            }])),
+            ..Default::default()
+        };
+        let (_, body) = capture_update(&update_data).await;
+        let members: Vec<&String> = body["ascReqData"]
+            .as_object()
+            .expect("ascReqData object")
+            .keys()
+            .collect();
+        assert_eq!(members, vec!["medComponents"], "{body}");
     }
 
     /// A create router that records the raw request body it received.
