@@ -33,6 +33,14 @@ diameter:
   origin_host: "diam.epc.mnc001.mcc001.3gppnetwork.org"
   origin_realm: "epc.mnc001.mcc001.3gppnetwork.org"
 
+  # Applications advertised in the CER/CEA (RFC 6733 section 5.3), on top of
+  # the ones the script's @diameter.on_request("<App>:<CMD>") filters name.
+  # The script here relays everything through one catch-all handler, which
+  # names no application, so it says `relay`. A node that answers requests
+  # itself lists what it serves instead, for example [s6a, cx]. A client whose
+  # CER has no application in common with the result is refused with 5010.
+  applications: [relay]
+
   # Generic event sink for Python-emitted signalling events.
   event_sink:
     backend: file

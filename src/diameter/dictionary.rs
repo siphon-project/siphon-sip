@@ -1848,6 +1848,9 @@ pub const S6C_APP_ID: u32 = 16777312;
 pub const SGD_APP_ID: u32 = 16777313;
 /// S6a Application-Id (TS 29.272) — MME ↔ HSS for LTE attach/auth
 pub const S6A_APP_ID: u32 = 16777251;
+/// Relay Application-Id (RFC 6733 §2.4): advertised by a relay or redirect
+/// agent, and common with every application a peer advertises (§5.3)
+pub const RELAY_APP_ID: u32 = 0xffff_ffff;
 /// 3GPP Vendor-Id
 pub const VENDOR_3GPP: u32 = 10415;
 
@@ -2085,6 +2088,9 @@ pub const DIAMETER_LOOP_DETECTED: u32 = 3005;
 /// CER from a peer whose asserted Origin-Host fails validation (RFC 6733
 /// §5.2 / §7.1.3.4) — answered in the CEA, then the connection is closed.
 pub const DIAMETER_UNKNOWN_PEER: u32 = 3010;
+/// CER from a peer that has no application in common with this node (RFC
+/// 6733 §5.3 / §7.1.5). Answered in the CEA, then the connection is closed.
+pub const DIAMETER_NO_COMMON_APPLICATION: u32 = 5010;
 pub const DIAMETER_UNABLE_TO_COMPLY: u32 = 5012;
 /// Malformed AVP length on an inbound message (RFC 6733 §7.1.5).
 pub const DIAMETER_INVALID_AVP_LENGTH: u32 = 5014;

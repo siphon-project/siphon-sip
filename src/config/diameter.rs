@@ -102,6 +102,12 @@ pub struct DiameterConfig {
     /// Folded into the implicit `"default"` tenant.
     #[serde(default)]
     pub connect_to: Vec<DiameterServerEntry>,
+    /// Applications this server advertises in the capabilities exchange, for
+    /// the single-domain server, on top of the ones its `@diameter.on_request`
+    /// filters name. Folded into the implicit `"default"` tenant. See
+    /// [`DiameterTenant::applications`].
+    #[serde(default)]
+    pub applications: Vec<DiameterAdvertisedApplication>,
     /// Per-tenant identity + peer tables. Optional — the common single-domain
     /// case omits this and uses the flat `clients` / `servers` / `connect_to`
     /// fields above instead.
@@ -143,6 +149,7 @@ impl DiameterConfig {
                 clients: self.clients.clone(),
                 servers: self.servers.clone(),
                 connect_to: self.connect_to.clone(),
+                applications: self.applications.clone(),
             },
         );
         tenants
@@ -180,6 +187,66 @@ pub struct DiameterTenant {
     /// direction is independent of the request direction (RFC 6733 §2.1).
     #[serde(default)]
     pub connect_to: Vec<DiameterServerEntry>,
+    /// Applications advertised in the CEA this tenant's clients receive and in
+    /// the CER siphon sends on this tenant's `servers` and `connect_to`
+    /// connections (RFC 6733 §5.3), on top of the ones the script's
+    /// `@diameter.on_request("<App>:<CMD>")` filters name. A filter without an
+    /// application names none, so a script that serves through a bare-command
+    /// or catch-all handler lists its applications here; a relay lists
+    /// `relay`. When the resulting set is not empty, a client whose CER has no
+    /// application in common with it is refused with
+    /// `DIAMETER_NO_COMMON_APPLICATION` (5010).
+    #[serde(default)]
+    pub applications: Vec<DiameterAdvertisedApplication>,
+}
+
+impl DiameterTenant {
+    /// The configured `applications` as `(vendor_id, application_id)` pairs.
+    pub fn application_ids(&self) -> Vec<(u32, u32)> {
+        self.applications
+            .iter()
+            .map(DiameterAdvertisedApplication::to_app_id)
+            .collect()
+    }
+}
+
+/// One entry of a server-mode `applications` list: an application this node
+/// serves itself, or `relay` for an agent that forwards every application.
+#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum DiameterAdvertisedApplication {
+    /// The Relay application id, 0xffffffff (RFC 6733 §2.4): common with
+    /// whatever the peer advertises.
+    Relay,
+    #[serde(untagged)]
+    Application(DiameterApplication),
+}
+
+// By hand rather than derived: a derived untagged variant reports a typo as
+// "data did not match any variant", where this names the value and lists the
+// applications that would have been accepted.
+impl<'de> Deserialize<'de> for DiameterAdvertisedApplication {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::IntoDeserializer;
+        let name = String::deserialize(deserializer)?;
+        if name == "relay" {
+            return Ok(Self::Relay);
+        }
+        DiameterApplication::deserialize(name.as_str().into_deserializer()).map(Self::Application)
+    }
+}
+
+impl DiameterAdvertisedApplication {
+    /// Map to the `(vendor_id, application_id)` tuple for the CER/CEA.
+    pub fn to_app_id(&self) -> (u32, u32) {
+        match self {
+            Self::Relay => (0, crate::diameter::dictionary::RELAY_APP_ID),
+            Self::Application(application) => application.to_app_id(),
+        }
+    }
 }
 
 /// The (origin_host, origin_realm) a tenant advertises in its CEA.
@@ -271,7 +338,7 @@ pub struct DiameterRouteEntry {
 }
 
 /// Supported Diameter application identifiers.
-#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum DiameterApplication {
     Cx,
