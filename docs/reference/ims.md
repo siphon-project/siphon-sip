@@ -21,6 +21,18 @@ The PCF calls back over HTTP on the address in `sbi.notif_listen`. Advertise
 `http://<notif_listen>/sbi/events` as `notif_uri`; the PCF appends the
 TS 29.514 suffix for each callback, so one listener serves both.
 
+`notifUri` is a required attribute of the create (TS 29.514), so
+`sbi.create_session` needs a callback URI on every call, with or without
+`events`. Set it once in the configuration and a script can leave the
+argument out; `notif_uri=` on a call overrides it. With neither, the call
+raises `ValueError` and nothing is sent.
+
+```yaml
+sbi:
+  notif_listen: "0.0.0.0:8080"
+  notif_uri: "http://192.0.2.10:8080/sbi/events"   # how the PCF reaches notif_listen
+```
+
 | Route | Body (verbatim dict) | Hook |
 |---|---|---|
 | `POST /sbi/events/notify` | `EventsNotification` | `@sbi.on_event` |
@@ -45,7 +57,9 @@ TS 29.514 suffix — which is what the spec defines — is unaffected.
 
 ### `BsfError`
 
-Raised by `sbi.discover_pcf_binding(...)` when the BSF is unhealthy.
+Raised by `sbi.discover_pcf_binding(...)` when the BSF is unhealthy. A BSF
+that has no binding for the address is healthy: it answers `204` (TS 29.521
+§4.2.4.2; some servers answer `404`) and the lookup returns `None`.
 
 ::: siphon_sdk.mock_module.BsfError
 

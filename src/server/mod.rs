@@ -2397,8 +2397,12 @@ impl SiphonServer {
                 );
 
                 pyo3::Python::attach(|python| {
-                    let py_sbi =
-                        crate::script::api::sbi::PySbi::new(npcf_client, bsf_client, pcf_scheme);
+                    let py_sbi = crate::script::api::sbi::PySbi::new(
+                        npcf_client,
+                        bsf_client,
+                        pcf_scheme,
+                        sbi_config.notif_uri.clone(),
+                    );
                     if let Err(error) = crate::script::api::set_sbi_singleton(python, py_sbi) {
                         error!("failed to store SBI singleton: {error}");
                     }
