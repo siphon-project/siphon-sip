@@ -73,7 +73,8 @@ async def handle_register(request):
         if "@" not in public_id:
             public_id = f"{public_id}@{REALM}"
         sat = SAT_USER_DEREGISTRATION if is_dereg else SAT_REGISTRATION
-        result = await diameter.cx_sar(public_id, SCSCF_URI, sat)
+        result = await diameter.cx_sar(public_id, SCSCF_URI, sat,
+                                       user_name=request.auth_user)
         if result:
             log.info(f"SAR result_code={result.get('result_code')}")
             user_data_xml = result.get("user_data")

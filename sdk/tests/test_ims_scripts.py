@@ -559,6 +559,12 @@ class TestMockDiameterCx:
         with pytest.raises(ValueError, match="server_name"):
             run(self.diameter.cx_mar("sip:alice@example.com", "alice@example.com", ""))
 
+    def test_cx_sar_accepts_the_private_identity(self):
+        result = run(self.diameter.cx_sar(
+            "sip:alice@example.com", "sip:scscf:6060", 1,
+            user_name="alice@example.com"))
+        assert result["result_code"] == 2001
+
     def test_cx_sar_default_success(self):
         result = run(self.diameter.cx_sar("sip:alice@example.com"))
         assert result is not None

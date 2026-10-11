@@ -119,6 +119,24 @@ impl MarArguments {
     }
 }
 
+/// The dict `diameter.cx_sar` resolves to: `result_code`, and `user_data`,
+/// the iFC XML of the User-Data AVP (606, an OctetString) or `None`.
+pub(crate) fn sar_answer_dict(
+    python: Python<'_>,
+    answer: &DiameterMessage,
+) -> PyResult<Py<PyDict>> {
+    let dict = PyDict::new(python);
+    dict.set_item(
+        "result_code",
+        crate::diameter::rx::extract_result_code(&answer.avps),
+    )?;
+    dict.set_item(
+        "user_data",
+        cx::octet_string_as_utf8(&answer.avps, "User-Data"),
+    )?;
+    Ok(dict.unbind())
+}
+
 /// The members of a grouped AVP, whether or not the dictionary knew it was one.
 fn members(group: &Avp) -> Vec<Avp> {
     match &group.value {

@@ -28,6 +28,8 @@ Config: examples/ims_icscf.yaml
 Note: In a lab without a real HSS, you can hardcode the S-CSCF address
       and skip the Diameter lookups (see SCSCF_FALLBACK below).
 """
+import re
+
 from siphon import proxy, diameter, log
 
 REALM = "ims.example.com"
@@ -40,6 +42,12 @@ SCSCF_FALLBACK = "sip:scscf.ims.example.com:6060"
 UAT_REGISTRATION = 0
 UAT_DE_REGISTRATION = 1
 UAT_REGISTRATION_AND_CAPABILITIES = 2
+
+
+def authorization_username(request):
+    """The username of the REGISTER's Authorization header, or None."""
+    match = re.search(r'username="([^"]+)"', request.get_header("Authorization") or "")
+    return match.group(1) if match else None
 
 
 async def find_scscf_for_register(request, user_auth_type=None):
@@ -58,8 +66,12 @@ async def find_scscf_for_register(request, user_auth_type=None):
     """
     if diameter.peer_count() > 0:
         visited = request.get_header("P-Visited-Network-ID") or REALM
-        result = await diameter.cx_uar(str(request.from_uri), visited,
-                                 user_auth_type=user_auth_type)
+        # TS 24.229 clause 5.3.1.2: the public identity is the one of the To
+        # header. The private one is the Authorization username; without one
+        # cx_uar derives it from the public identity.
+        result = await diameter.cx_uar(str(request.to_uri), visited,
+                                 user_auth_type=user_auth_type,
+                                 user_name=authorization_username(request))
         if result and result.get("server_name"):
             log.info(f"UAR -> S-CSCF: {result['server_name']}")
             return result["server_name"]

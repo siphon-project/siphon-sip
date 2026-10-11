@@ -1191,6 +1191,10 @@ impl PyDiameter {
     ///     public_identity: The user's public identity.
     ///     server_name: This S-CSCF's SIP URI (defaults to ``""``).
     ///     assignment_type: Server-Assignment-Type (default 1 = REGISTRATION).
+    ///     user_name: The private user identity, sent as User-Name:
+    ///         ``request.auth_user`` after a successful authentication. TS
+    ///         29.228 Table 6.1.2.1 requires it whenever the S-CSCF has it;
+    ///         omit it and the AVP is not sent.
     ///
     /// Returns:
     ///     Dict with ``result_code`` (int) and ``user_data`` (str or None, iFC XML),
@@ -1199,13 +1203,14 @@ impl PyDiameter {
     /// **Awaitable** — returns a coroutine, so `await` it. The request runs on
     /// tokio rather than on the calling thread, which for an `async def` handler
     /// is the asyncio driver its whole loop shares.
-    #[pyo3(signature = (public_identity, server_name=None, assignment_type=1))]
+    #[pyo3(signature = (public_identity, server_name=None, assignment_type=1, user_name=None))]
     fn cx_sar<'py>(
         &self,
         python: Python<'py>,
         public_identity: &str,
         server_name: Option<&str>,
         assignment_type: u32,
+        user_name: Option<&str>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let client = match self
             .manager
@@ -1220,25 +1225,19 @@ impl PyDiameter {
 
         let public_identity = public_identity.to_string();
         let name = server_name.unwrap_or("").to_string();
+        let user_name = user_name.filter(|name| !name.is_empty()).map(String::from);
 
         crate::script::awaitable(python, async move {
-            let answer = client
-                .send_sar(&public_identity, &name, assignment_type)
-                .await;
-
-            match answer {
-                Ok(message) => {
-                    let result_code = extract_result_code(&message.avps);
-                    // User-Data AVP (code 606, 3GPP) carries iFC XML as OctetString
-                    let user_data = octet_string_as_utf8(&message.avps, "User-Data");
-
-                    Python::attach(|python| {
-                        let dict = PyDict::new(python);
-                        dict.set_item("result_code", result_code)?;
-                        dict.set_item("user_data", user_data)?;
-                        Ok(Some(dict.unbind()))
-                    })
-                }
+            let request = crate::diameter::cx::ServerAssignment {
+                public_identity: &public_identity,
+                user_name: user_name.as_deref(),
+                server_name: &name,
+                server_assignment_type: assignment_type,
+            };
+            match client.send_sar(&request).await {
+                Ok(message) => Python::attach(|python| {
+                    super::diameter_cx::sar_answer_dict(python, &message).map(Some)
+                }),
                 Err(error) => {
                     warn!(error = %error, "cx_sar failed");
                     Ok(None)
@@ -3840,7 +3839,7 @@ mod tests {
         let py_diameter = PyDiameter::new(manager);
         pyo3::Python::attach(|python| {
             let result = py_diameter
-                .cx_sar(python, "sip:alice@example.com", None, 1)
+                .cx_sar(python, "sip:alice@example.com", None, 1, None)
                 .unwrap();
             assert!(resolve(python, result).is_none());
         });

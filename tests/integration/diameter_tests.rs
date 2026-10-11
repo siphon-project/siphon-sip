@@ -776,15 +776,13 @@ fn cx_saa_encode_decode_roundtrip() {
     let user_data_bytes = hex::decode(user_data_hex).unwrap();
     assert_eq!(std::str::from_utf8(&user_data_bytes).unwrap(), ifc_xml);
 
-    // Experimental-Result
-    let exp_result = decoded.avps.get("Experimental-Result").unwrap();
-    let exp_code = exp_result
-        .get("Experimental-Result-Code")
-        .and_then(|v| v.as_u64());
+    // TS 29.228 clause 6.1.2.1: "The Result-Code shall be set to
+    // DIAMETER_SUCCESS", a base protocol result and not an Experimental-Result.
     assert_eq!(
-        exp_code,
-        Some(dictionary::DIAMETER_FIRST_REGISTRATION as u64)
+        decoded.avps.get("Result-Code").and_then(|v| v.as_u64()),
+        Some(2001)
     );
+    assert!(decoded.avps.get("Experimental-Result").is_none());
 }
 
 #[test]
