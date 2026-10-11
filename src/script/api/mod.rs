@@ -10,6 +10,7 @@ pub mod auth;
 pub mod b2bua;
 pub mod cache;
 pub mod call;
+mod call_media;
 pub mod cdr;
 pub mod config;
 pub mod diameter;
