@@ -85,6 +85,17 @@ impl CxAnswerBuilder {
         self
     }
 
+    /// Append Result-Code DIAMETER_SUCCESS. Success is a base protocol result
+    /// (RFC 6733 clause 7.1), so it is not an Experimental-Result: TS 29.229
+    /// clause 6.2 puts only the codes it defines itself there.
+    fn success(mut self) -> Self {
+        self.avp_buf.extend_from_slice(&encode_avp_u32(
+            avp::RESULT_CODE,
+            dictionary::DIAMETER_SUCCESS,
+        ));
+        self
+    }
+
     /// Append raw AVP bytes.
     fn raw_avps(mut self, data: &[u8]) -> Self {
         self.avp_buf.extend_from_slice(data);
@@ -228,7 +239,7 @@ pub fn build_saa_success(
     }
 
     CxAnswerBuilder::new(origin_host, origin_realm, session_id)
-        .experimental_result(dictionary::DIAMETER_FIRST_REGISTRATION)
+        .success()
         .raw_avps(&extra)
         .build_with_ids(dictionary::CMD_SERVER_ASSIGNMENT, hop_by_hop, end_to_end)
 }
@@ -269,7 +280,7 @@ pub fn build_lia_success(
     let server_avp = encode_avp_utf8_3gpp(avp::SERVER_NAME, server_name);
 
     CxAnswerBuilder::new(origin_host, origin_realm, session_id)
-        .experimental_result(dictionary::DIAMETER_FIRST_REGISTRATION)
+        .success()
         .raw_avps(&server_avp)
         .build_with_ids(dictionary::CMD_LOCATION_INFO, hop_by_hop, end_to_end)
 }
@@ -319,10 +330,14 @@ pub struct AuthVector<'a> {
 }
 
 /// Encode a MAA success carrying IMS-AKA authentication vectors.
+///
+/// The result is Result-Code DIAMETER_SUCCESS, and both identities are
+/// present, as TS 29.228 table 6.3.4 requires of a successful answer.
 pub fn build_maa_success(
     origin_host: &str,
     origin_realm: &str,
     session_id: &str,
+    user_name: &str,
     public_identity: &str,
     vector: &AuthVector<'_>,
     hop_by_hop: u32,
@@ -355,12 +370,13 @@ pub fn build_maa_success(
 
     // Extra AVPs beyond the standard answer scaffold
     let mut extra = Vec::with_capacity(128);
+    extra.extend_from_slice(&encode_avp_utf8(avp::USER_NAME, user_name));
     extra.extend_from_slice(&encode_avp_utf8_3gpp(avp::PUBLIC_IDENTITY, public_identity));
     extra.extend_from_slice(&encode_avp_u32_3gpp(avp::SIP_NUMBER_AUTH_ITEMS, 1));
     extra.extend_from_slice(&auth_data_item);
 
     CxAnswerBuilder::new(origin_host, origin_realm, session_id)
-        .experimental_result(dictionary::DIAMETER_FIRST_REGISTRATION)
+        .success()
         .raw_avps(&extra)
         .build_with_ids(dictionary::CMD_MULTIMEDIA_AUTH, hop_by_hop, end_to_end)
 }
@@ -425,7 +441,7 @@ pub fn build_rta(
     end_to_end: u32,
 ) -> Vec<u8> {
     CxAnswerBuilder::new(origin_host, origin_realm, session_id)
-        .experimental_result(dictionary::DIAMETER_SUCCESS)
+        .success()
         .build_with_ids(
             dictionary::CMD_REGISTRATION_TERMINATION,
             hop_by_hop,
@@ -504,6 +520,10 @@ fn append_request_header(payload: &mut Vec<u8>, config: &PeerConfig, session_id:
 /// IMS AKA, the scheme `Digest-AKAv1-MD5` of TS 29.229 clause 6.3.9.
 pub const SCHEME_IMS_AKA: &str = "Digest-AKAv1-MD5";
 
+/// "The authentication scheme indicated in an authentication request is not
+/// supported" (TS 29.229 clause 6.2.2.6), carried in Experimental-Result.
+pub const DIAMETER_ERROR_AUTH_SCHEME_NOT_SUPPORTED: u32 = 5006;
+
 /// The private user identity a REGISTER without an Authorization header
 /// implies.
 ///
@@ -576,6 +596,53 @@ pub fn build_uar(
     encode_diameter_message(
         FLAG_REQUEST | FLAG_PROXIABLE,
         dictionary::CMD_USER_AUTHORIZATION,
+        dictionary::CX_APP_ID,
+        hop_by_hop,
+        end_to_end,
+        &payload,
+    )
+}
+
+/// What a Server-Assignment-Request carries besides the routing AVPs.
+#[derive(Debug, Clone, Copy)]
+pub struct ServerAssignment<'a> {
+    pub public_identity: &'a str,
+    /// The private user identity, sent as User-Name. TS 29.229 clause 6.1.3
+    /// has `[ User-Name ]`, and TS 29.228 Table 6.1.2.1 says it "shall be
+    /// present if it is available when the S-CSCF issues the request".
+    /// `None` leaves the AVP out.
+    pub user_name: Option<&'a str>,
+    pub server_name: &'a str,
+    pub server_assignment_type: u32,
+}
+
+/// Encode a SAR (Server-Assignment-Request), S-CSCF to HSS.
+pub fn build_sar(
+    config: &PeerConfig,
+    session_id: &str,
+    request: &ServerAssignment<'_>,
+    hop_by_hop: u32,
+    end_to_end: u32,
+) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(512);
+    append_request_header(&mut payload, config, session_id);
+    if let Some(user_name) = request.user_name {
+        payload.extend_from_slice(&encode_avp_utf8(avp::USER_NAME, user_name));
+    }
+    payload.extend_from_slice(&encode_avp_utf8_3gpp(
+        avp::PUBLIC_IDENTITY,
+        request.public_identity,
+    ));
+    payload.extend_from_slice(&encode_avp_utf8_3gpp(avp::SERVER_NAME, request.server_name));
+    payload.extend_from_slice(&encode_avp_u32_3gpp(
+        avp::SERVER_ASSIGNMENT_TYPE,
+        request.server_assignment_type,
+    ));
+    payload.extend_from_slice(&encode_avp_u32_3gpp(avp::USER_DATA_ALREADY_AVAILABLE, 0));
+
+    encode_diameter_message(
+        FLAG_REQUEST | FLAG_PROXIABLE,
+        dictionary::CMD_SERVER_ASSIGNMENT,
         dictionary::CX_APP_ID,
         hop_by_hop,
         end_to_end,
@@ -787,24 +854,38 @@ mod tests {
         assert_eq!(mar.auth_scheme.as_deref(), Some("Digest-AKAv1-MD5"));
     }
 
-    #[test]
-    fn build_and_decode_maa() {
+    fn sample_maa() -> Vec<u8> {
         let vector = AuthVector {
             sip_authenticate: &[0xAA; 32],
             sip_authorization: &[0xBB; 16],
             confidentiality_key: &[0xCC; 16],
             integrity_key: &[0xDD; 16],
         };
-
-        let maa = build_maa_success(
+        build_maa_success(
             "hss.ims.example.com",
             "ims.example.com",
             "cx;mar;2",
+            "dave@ims.example.com",
             "sip:dave@ims.example.com",
             &vector,
             42,
             99,
-        );
+        )
+    }
+
+    fn sample_rta() -> Vec<u8> {
+        build_rta(
+            "scscf.ims.example.com",
+            "ims.example.com",
+            "cx;rtr;42",
+            70,
+            80,
+        )
+    }
+
+    #[test]
+    fn build_and_decode_maa() {
+        let maa = sample_maa();
 
         let decoded = decode_diameter(&maa).unwrap();
         assert!(!decoded.is_request);
@@ -832,6 +913,52 @@ mod tests {
         assert!(auth_item.get("SIP-Authenticate").is_some());
         assert!(auth_item.get("Confidentiality-Key").is_some());
         assert!(auth_item.get("Integrity-Key").is_some());
+
+        // TS 29.228 clause 6.3.1: "The Result-Code shall be set to
+        // DIAMETER_SUCCESS", which is what the S-CSCF side reads.
+        assert_base_success(&decoded.avps);
+        // Table 6.3.4: both identities "shall be present when the result is
+        // DIAMETER_SUCCESS".
+        assert_eq!(
+            decoded.avps.get("User-Name").and_then(|v| v.as_str()),
+            Some("dave@ims.example.com")
+        );
+        assert_eq!(
+            decoded.avps.get("Public-Identity").and_then(|v| v.as_str()),
+            Some("sip:dave@ims.example.com")
+        );
+    }
+
+    /// RFC 6733 clause 7.1 carries DIAMETER_SUCCESS (2001) in Result-Code.
+    /// TS 29.229 clause 6.2 reserves Experimental-Result for the codes it
+    /// defines, where 2001 is DIAMETER_FIRST_REGISTRATION and means something
+    /// else, and "Result-Code AVP shall be absent" next to one.
+    fn assert_base_success(avps: &serde_json::Value) {
+        assert_eq!(avps.get("Result-Code").and_then(|v| v.as_u64()), Some(2001));
+        assert!(avps.get("Experimental-Result").is_none());
+    }
+
+    fn sample_saa() -> Vec<u8> {
+        build_saa_success("hss.example.org", "example.org", "cx;sar;1", None, 1, 2)
+    }
+
+    fn sample_lia() -> Vec<u8> {
+        build_lia_success(
+            "hss.example.org",
+            "example.org",
+            "cx;lir;1",
+            "sip:scscf.example.org",
+            1,
+            2,
+        )
+    }
+
+    /// TS 29.228 clauses 6.1.2.1 and 6.1.4.1: "The Result-Code shall be set to
+    /// DIAMETER_SUCCESS" for a server assignment and a location query.
+    #[test]
+    fn saa_and_lia_success_is_a_result_code() {
+        assert_base_success(&decode_diameter(&sample_saa()).unwrap().avps);
+        assert_base_success(&decode_diameter(&sample_lia()).unwrap().avps);
     }
 
     #[test]
@@ -987,13 +1114,7 @@ mod tests {
 
     #[test]
     fn build_and_decode_rta() {
-        let rta = build_rta(
-            "scscf.ims.example.com",
-            "ims.example.com",
-            "cx;rtr;42",
-            70,
-            80,
-        );
+        let rta = sample_rta();
 
         let decoded = decode_diameter(&rta).unwrap();
         assert!(!decoded.is_request, "RTA should not have request flag");
@@ -1004,13 +1125,7 @@ mod tests {
         assert_eq!(decoded.hop_by_hop, 70);
         assert_eq!(decoded.end_to_end, 80);
 
-        // Verify Experimental-Result contains success code
-        let er = decoded.avps.get("Experimental-Result").unwrap();
-        let rc = er
-            .get("Experimental-Result-Code")
-            .and_then(|v| v.as_u64())
-            .map(|n| n as u32);
-        assert_eq!(rc, Some(dictionary::DIAMETER_SUCCESS));
+        assert_base_success(&decoded.avps);
     }
 
     // ── Requests this node sends: UAR and MAR ───────────────────────────
@@ -1118,6 +1233,42 @@ mod tests {
         assert_eq!(decoded.avps["Auth-Session-State"], 1);
     }
 
+    fn sample_sar(user_name: Option<&str>) -> Vec<u8> {
+        build_sar(
+            &client_config(),
+            "scscf;2;1",
+            &ServerAssignment {
+                public_identity: PUBLIC_IDENTITY,
+                user_name,
+                server_name: SCSCF_URI,
+                server_assignment_type: 1,
+            },
+            0x12d,
+            0x12d,
+        )
+    }
+
+    /// TS 29.228 Table 6.1.2.1: the private identity "shall be present if it
+    /// is available when the S-CSCF issues the request". TS 29.229 clause
+    /// 6.1.3 has it as `[ User-Name ]`, so the request is complete without.
+    #[test]
+    fn sar_carries_the_private_identity_when_it_is_given() {
+        let wire = sample_sar(Some(PRIVATE_IDENTITY));
+        assert!(contains(&wire, &user_name_octets()));
+        assert!(contains(&wire, &server_name_octets()));
+        let decoded = decode_diameter(&wire).unwrap();
+        assert_eq!(decoded.command_code, dictionary::CMD_SERVER_ASSIGNMENT);
+        assert_eq!(decoded.avps["Public-Identity"], PUBLIC_IDENTITY);
+        assert_eq!(decoded.avps["Server-Assignment-Type"], 1);
+        assert_eq!(decoded.avps["User-Data-Already-Available"], 0);
+
+        let without = DiameterMsg::from_wire(&sample_sar(None)).unwrap();
+        assert!(without.find(avp::USER_NAME, 0).is_none());
+        assert!(without
+            .find(avp::SERVER_NAME, dictionary::VENDOR_3GPP)
+            .is_some());
+    }
+
     #[test]
     fn mar_carries_user_name_and_server_name() {
         let wire = sample_mar(Some(SCSCF_URI), None);
@@ -1192,7 +1343,7 @@ mod tests {
         );
     }
 
-    /// Writes a UAR and a MAR as `text2pcap` hex dumps for
+    /// Writes the requests and the answer helpers' output as `text2pcap` hex dumps for
     /// `scripts/validate_diameter_cx_requests.sh` to feed to tshark, which
     /// reads them with its own dictionary.
     #[test]
@@ -1206,6 +1357,11 @@ mod tests {
             ("uar", sample_uar()),
             ("mar", sample_mar(Some(SCSCF_URI), None)),
             ("mar_resync", sample_mar(Some(SCSCF_URI), Some(&resync))),
+            ("sar", sample_sar(Some(PRIVATE_IDENTITY))),
+            ("saa", sample_saa()),
+            ("lia", sample_lia()),
+            ("maa", sample_maa()),
+            ("rta", sample_rta()),
         ] {
             let mut dump = String::new();
             for (offset, chunk) in wire.chunks(16).enumerate() {

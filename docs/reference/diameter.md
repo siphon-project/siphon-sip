@@ -176,11 +176,34 @@ ha1 = answer["auth_items"][0]["digest_ha1"]
 ```
 
 `auth.require_ims_digest` asks for the `Digest-AKAv1-MD5` scheme, takes
-User-Name from the Authorization header of the REGISTER (or derives it), and
-sends the MAR to the peer the `cx` route names. Pass `server_name`: without it
+Public-Identity from the To header of the REGISTER and User-Name from its
+Authorization header (or derives it), and sends the MAR to the peer the `cx`
+route names. Pass `server_name`: without it
 the MAR goes out with no Server-Name, a warning is logged, and an HSS that
 checks the command answers `DIAMETER_MISSING_AVP`. Checked against Wireshark's
 Diameter dissector with `scripts/validate_diameter_cx_requests.sh`.
+
+What the HSS answers decides what `require_ims_digest` does:
+
+| The HSS answers | `require_ims_digest` |
+|---|---|
+| `DIAMETER_SUCCESS` with an IMS AKA item | sets the 401 challenge, returns `False` |
+| `DIAMETER_SUCCESS` with an item that names another scheme | raises `RuntimeError` and logs an error, no challenge |
+| `DIAMETER_SUCCESS` without `SIP-Auth-Data-Item`, `SIP-Authenticate` or `SIP-Authorization` | raises `RuntimeError` and logs an error, no challenge |
+| `DIAMETER_ERROR_AUTH_SCHEME_NOT_SUPPORTED` (5006) | sets `403 Forbidden`, returns `False`, logs a warning |
+| any other result | sets `403 Forbidden`, returns `False`, logs a warning with the result |
+| nothing (transport error or timeout) | raises `RuntimeError` |
+
+Neither H(A1) nor the response of the UE is written to the log at any level.
+
+After a successful authentication the S-CSCF tells the HSS with
+`diameter.cx_sar`, which takes the private identity as `user_name=`
+(`request.auth_user`): TS 29.228 Table 6.1.2.1 requires it in the request
+whenever the S-CSCF has it.
+
+```python
+await diameter.cx_sar(public_identity, SCSCF_URI, 1, user_name=request.auth_user)
+```
 
 ## Rx: QoS and bearer events
 

@@ -4,15 +4,17 @@
 # dissector.
 #
 # The tests in src/diameter/cx.rs pin octets we derived, so they share whatever
-# we misread of TS 29.229. This feeds tshark a User-Authorization-Request and
-# two Multimedia-Auth-Requests (a first one, and one after an IMS AKA
-# synchronisation failure) and asserts tshark, with its own dictionary, reads
-# back the User-Name and Server-Name the commands require and the scheme.
+# we misread of TS 29.229. This feeds tshark a User-Authorization-Request, two
+# Multimedia-Auth-Requests (a first one, and one after an IMS AKA
+# synchronisation failure) and a Server-Assignment-Request, and asserts tshark,
+# with its own dictionary, reads back the User-Name and Server-Name the
+# commands require and the scheme. It then reads the answers the helpers for
+# the HSS side build, for success carried as Result-Code.
 #
 #   scripts/validate_diameter_cx_requests.sh
 #
 # Needs tshark and text2pcap (wireshark-common). CI runners have neither, so
-# run it locally after touching the request builders in src/diameter/cx.rs.
+# run it locally after touching the builders in src/diameter/cx.rs.
 
 set -euo pipefail
 
@@ -40,17 +42,18 @@ SIPHON_CX_REQUESTS_HEX_DIR="$WORK" \
   PYO3_PYTHON="${PYO3_PYTHON:-python3}" \
   cargo test --lib diameter::cx::tests::emit_cx_requests_for_external_dissection -- --exact >/dev/null
 
-for name in uar mar mar_resync; do
+for name in uar mar mar_resync sar saa lia maa rta; do
   if [[ ! -s "$WORK/$name.hex" ]]; then
     echo "the encoder produced no $name" >&2
     exit 1
   fi
 done
 
-# One packet per request: frame 1 the UAR, 2 the MAR, 3 the MAR after a
-# synchronisation failure. 3868 is Diameter's registered port, so tshark's own
-# dissector claims it.
-cat "$WORK/uar.hex" "$WORK/mar.hex" "$WORK/mar_resync.hex" >"$HEX"
+# One packet per message: frame 1 the UAR, 2 the MAR, 3 the MAR after a
+# synchronisation failure, 4 the SAR, then the answers SAA, LIA, MAA and RTA.
+# 3868 is Diameter's registered port, so tshark's own dissector claims it.
+cat "$WORK/uar.hex" "$WORK/mar.hex" "$WORK/mar_resync.hex" "$WORK/sar.hex" \
+  "$WORK/saa.hex" "$WORK/lia.hex" "$WORK/maa.hex" "$WORK/rta.hex" >"$HEX"
 text2pcap -q -T "3868,3868" "$HEX" "$PCAP"
 
 status=0
@@ -96,22 +99,48 @@ done
 expect 2 diameter.3GPP-SIP-Authorization ""
 expect 3 diameter.3GPP-SIP-Authorization "$(printf 'ab%.0s' $(seq 30))"
 
+echo "reading the SAR back with tshark"
+expect 4 diameter.cmd.code 301
+expect 4 diameter.flags.request True
+# TS 29.228 Table 6.1.2.1: present whenever the S-CSCF has it.
+expect 4 diameter.User-Name "$PRIVATE_IDENTITY"
+expect 4 diameter.Public-Identity "$PUBLIC_IDENTITY"
+expect 4 diameter.Server-Name "$SCSCF_URI"
+expect 4 diameter.Server-Assignment-Type 1
+expect 4 diameter.User-Data-Already-Available 0
+
+# TS 29.228 clauses 6.1.2.1, 6.1.4.1 and 6.3.1: "The Result-Code shall be set
+# to DIAMETER_SUCCESS". TS 29.229 clause 6.2 keeps Experimental-Result for the
+# codes it defines, where 2001 is DIAMETER_FIRST_REGISTRATION.
+echo "reading the SAA, LIA, MAA and RTA of the answer helpers back with tshark"
+for answer in "5 301" "6 302" "7 303" "8 304"; do
+  read -r frame code <<<"$answer"
+  expect "$frame" diameter.cmd.code "$code"
+  expect "$frame" diameter.flags.request False
+  expect "$frame" diameter.Result-Code 2001
+  expect "$frame" diameter.Experimental-Result-Code ""
+done
+# TS 29.228 Table 6.3.4: both identities in a successful MAA.
+expect 7 diameter.User-Name "dave@ims.example.com"
+expect 7 diameter.Public-Identity "sip:dave@ims.example.com"
+expect 7 diameter.3GPP-SIP-Authentication-Scheme Digest-AKAv1-MD5
+
 tree="$(tshark -r "$PCAP" -V -O diameter 2>/dev/null)"
 
 # User-Name is a base AVP: the M bit and no vendor (RFC 6733 clause 4.5).
 flags="$(grep -A1 -F "AVP Code: 1 User-Name" <<<"$tree" | grep -cF "AVP Flags: 0x40, Mandatory: Set" || true)"
-if [[ "$flags" != "3" ]]; then
-  echo "  FAIL User-Name flags: $flags of 3 requests carry it as M, no vendor" >&2
+if [[ "$flags" != "5" ]]; then
+  echo "  FAIL User-Name flags: $flags of 5 messages carry it as M, no vendor" >&2
   status=1
 else
-  echo "  ok   User-Name is M with no vendor in all three"
+  echo "  ok   User-Name is M with no vendor in the four requests and the MAA"
 fi
 flags="$(grep -A1 -F "AVP Code: 602 Server-Name" <<<"$tree" | grep -cF "AVP Flags: 0xc0, Vendor-Specific: Set, Mandatory: Set" || true)"
-if [[ "$flags" != "2" ]]; then
-  echo "  FAIL Server-Name flags: $flags of 2 MARs carry it as V and M" >&2
+if [[ "$flags" != "4" ]]; then
+  echo "  FAIL Server-Name flags: $flags of 4 messages carry it as V and M" >&2
   status=1
 else
-  echo "  ok   Server-Name is V and M in both MARs"
+  echo "  ok   Server-Name is V and M in both MARs, the SAR and the LIA"
 fi
 
 if grep -q "Unknown AVP" <<<"$tree"; then
@@ -119,15 +148,15 @@ if grep -q "Unknown AVP" <<<"$tree"; then
   status=1
 fi
 if [[ -n "$(tshark -r "$PCAP" -Y '_ws.malformed || _ws.expert' 2>/dev/null)" ]]; then
-  echo "  FAIL tshark flagged a request as malformed or raised expert info" >&2
+  echo "  FAIL tshark flagged a message as malformed or raised expert info" >&2
   status=1
 else
   echo "  ok   nothing malformed, no expert info"
 fi
 
 if [[ $status -ne 0 ]]; then
-  echo "Cx request validation FAILED" >&2
+  echo "Cx validation FAILED" >&2
   exit 1
 fi
 
-echo "Cx requests validated against tshark's Diameter dissector"
+echo "Cx requests and answers validated against tshark's Diameter dissector"

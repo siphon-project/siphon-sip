@@ -3046,7 +3046,13 @@ class MockAuth:
         """IMS AKA authentication via Diameter Cx MAR/MAA.
 
         Sends a Multimedia-Auth-Request to the HSS the Cx route names and uses
-        the returned authentication vector to challenge or verify the UE.
+        the returned authentication vector to challenge or verify the UE. The
+        mock has no HSS, so it checks the request against the test's users.
+
+        In siphon the request names the public user identity of the To header
+        (TS 24.229 clause 5.4.1.2.1), and the answer has to be an IMS AKA
+        vector: a successful answer in another scheme, or without
+        SIP-Authenticate or SIP-Authorization, is not turned into a challenge.
 
         Args:
             request: The REGISTER.
@@ -3061,7 +3067,14 @@ class MockAuth:
         does not accept a ``Call`` here either.
 
         Returns:
-            ``True`` if credentials are valid, ``False`` if a 401 challenge was sent.
+            ``True`` if credentials are valid, ``False`` if a 401 challenge was
+            sent or the HSS refused and a 403 was set.
+
+        Raises:
+            RuntimeError: in siphon, when no Diameter connection is available,
+                the request got no answer, or the answer carries another
+                authentication scheme than the one asked for or no vector to
+                challenge with.
         """
 
         # Raised at the call, as siphon does: PyO3 refuses a Call when it
@@ -6889,13 +6902,19 @@ class MockDiameter:
 
     async def cx_sar(self, public_identity: str,
                server_name: Optional[str] = None,
-               assignment_type: int = 1) -> Optional[dict]:
+               assignment_type: int = 1,
+               user_name: Optional[str] = None) -> Optional[dict]:
         """Send a Server-Assignment-Request after REGISTER auth.
 
         Args:
             public_identity: User's public identity.
             server_name: This S-CSCF's SIP URI.
             assignment_type: Server-Assignment-Type (default 1 = REGISTRATION).
+            user_name: The private user identity, sent as User-Name:
+                ``request.auth_user`` after a successful authentication. TS
+                29.228 Table 6.1.2.1 requires it whenever the S-CSCF has it;
+                omit it and the AVP is not sent. The mock accepts and ignores
+                it.
 
         Returns:
             Dict with ``result_code`` and ``user_data`` (iFC XML), or ``None``.

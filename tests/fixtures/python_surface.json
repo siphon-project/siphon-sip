@@ -625,7 +625,7 @@
       "cx_sar": {
         "doc": "Send a Cx Server-Assignment-Request to the HSS.",
         "kind": "method_descriptor",
-        "sig": "($self, public_identity, server_name=None, assignment_type=1)"
+        "sig": "($self, public_identity, server_name=None, assignment_type=1, user_name=None)"
       },
       "cx_uar": {
         "doc": "Send a Cx User-Authorization-Request to the HSS.",

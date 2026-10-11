@@ -70,6 +70,12 @@ entry, but a working config keeps working.
   AVPs in order and allows repeats, and its `remove_avp` returns how many AVPs
   it removed, as siphon does, where it returned at most 1.
 
+- **`diameter.cx_sar` takes `user_name=`, the private user identity.** TS
+  29.228 Table 6.1.2.1 has it in the Server-Assignment-Request "if it is
+  available when the S-CSCF issues the request", and it was never sent. Pass
+  `request.auth_user` after a successful authentication. Without the argument
+  the request goes out as before. `DiameterClient::send_sar` takes a
+  `cx::ServerAssignment`.
 - **`diameter.cx_mar` sends a Cx Multimedia-Auth-Request from a script.**
   `await diameter.cx_mar(public_identity, user_name, server_name,
   scheme="Digest-AKAv1-MD5", number_auth_items=1, authorization=None)`
@@ -217,6 +223,44 @@ entry, but a working config keeps working.
   take `cx::UserAuthorization` and `cx::MultimediaAuth`. Checked against
   Wireshark's Diameter dissector with
   `scripts/validate_diameter_cx_requests.sh`.
+- **The Multimedia-Auth-Request of `auth.require_ims_digest` names the public
+  user identity of the To header. Behaviour change on the wire.**
+  Public-Identity was the URI of P-Asserted-Identity, or of From when that
+  header was absent. TS 24.229 clause 5.4.1.2.1 has the S-CSCF "identify the
+  user by the public user identity as received in the To header field": a
+  REGISTER whose From or P-Asserted-Identity names another identity than the
+  one being registered was sent to the HSS under the wrong one. User-Name,
+  when the REGISTER has no Authorization header, is derived from that To URI.
+- **`auth.require_ims_digest` challenges only with a vector the HSS sent.** A
+  Multimedia-Auth-Answer with `DIAMETER_SUCCESS` was turned into a 401
+  whatever it held. One whose item names another scheme than the
+  `Digest-AKAv1-MD5` asked for does not hold RAND, AUTN and XRES. One without
+  SIP-Authenticate got a nonce siphon generated, which carries no AUTN, so no
+  UE accepts it. One without SIP-Authorization, or without the item, left no
+  expected response to verify an answer against. Each now raises
+  `RuntimeError` and logs an error naming the identity and what is missing or
+  mismatched, and nothing is stored. The scheme name is compared without
+  regard to case, and an item with no SIP-Authentication-Scheme is accepted
+  as before. A refusal is logged too, where it produced the 403 without a
+  line: `DIAMETER_ERROR_AUTH_SCHEME_NOT_SUPPORTED` (5006) by name, any other
+  with its result code.
+- **H(A1) and the response of the UE are no longer written to the debug log
+  of `auth.require_ims_digest`.** The line that reported a verification
+  carried both. Either is enough to answer the challenge it belongs to. The
+  line stays, with the username and the outcome.
+- **The Cx answer helpers encode success as Result-Code.**
+  `diameter::cx::build_maa_success`, `build_saa_success`, `build_lia_success`
+  and `build_rta` carried 2001 in Experimental-Result, where it is
+  `DIAMETER_FIRST_REGISTRATION` (TS 29.229 clause 6.2.1.1) and where
+  `require_ims_digest` does not look for the result of a
+  Multimedia-Auth-Answer. TS 29.228 sets "the Result-Code" to
+  `DIAMETER_SUCCESS` for these answers and clause 6.2 of TS 29.229 keeps
+  Experimental-Result for the codes it defines. `build_maa_success` also takes
+  the private identity and sends it as User-Name, which Table 6.3.4 requires
+  of a successful answer. `build_uaa_success` is unchanged: its 2001 and 2002
+  are Experimental-Result codes. `scripts/validate_diameter_cx_requests.sh`
+  reads the four answers and the Server-Assignment-Request back with
+  Wireshark's dissector as well.
 
 - **The Diameter listener advertises its applications in the CEA, and refuses
   a peer that shares none (RFC 6733 §5.3).** The Capabilities-Exchange-Answer

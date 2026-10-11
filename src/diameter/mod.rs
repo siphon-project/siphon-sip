@@ -78,49 +78,17 @@ impl DiameterClient {
     /// Send a SAR (Server-Assignment-Request) and return the SAA.
     pub async fn send_sar(
         &self,
-        public_identity: &str,
-        server_name: &str,
-        server_assignment_type: u32,
+        request: &cx::ServerAssignment<'_>,
     ) -> Result<codec::DiameterMessage, String> {
-        let config = self.peer.config();
-        let hbh = self.peer.next_hbh();
-        let e2e = self.peer.next_e2e();
         let session_id = self.peer.new_session_id();
-
-        let mut avp_bytes = Vec::new();
-        avp_bytes.extend_from_slice(&encode_avp_utf8(avp::SESSION_ID, &session_id));
-        avp_bytes.extend_from_slice(&encode_avp_utf8(avp::ORIGIN_HOST, &config.origin_host));
-        avp_bytes.extend_from_slice(&encode_avp_utf8(avp::ORIGIN_REALM, &config.origin_realm));
-        avp_bytes.extend_from_slice(&encode_avp_utf8(
-            avp::DESTINATION_REALM,
-            &config.destination_realm,
-        ));
-        if let Some(dest_host) = &config.destination_host {
-            avp_bytes.extend_from_slice(&encode_avp_utf8(avp::DESTINATION_HOST, dest_host));
-        }
-        avp_bytes.extend_from_slice(&encode_avp_u32(avp::AUTH_SESSION_STATE, 1));
-        avp_bytes.extend_from_slice(&encode_vendor_specific_app_id(
-            dictionary::VENDOR_3GPP,
-            dictionary::CX_APP_ID,
-        ));
-        avp_bytes.extend_from_slice(&encode_avp_utf8_3gpp(avp::PUBLIC_IDENTITY, public_identity));
-        avp_bytes.extend_from_slice(&encode_avp_utf8_3gpp(avp::SERVER_NAME, server_name));
-        avp_bytes.extend_from_slice(&encode_avp_u32_3gpp(
-            avp::SERVER_ASSIGNMENT_TYPE,
-            server_assignment_type,
-        ));
-        avp_bytes.extend_from_slice(&encode_avp_u32_3gpp(avp::USER_DATA_ALREADY_AVAILABLE, 0));
-
-        let msg = encode_diameter_message(
-            FLAG_REQUEST | FLAG_PROXIABLE,
-            dictionary::CMD_SERVER_ASSIGNMENT,
-            dictionary::CX_APP_ID,
-            hbh,
-            e2e,
-            &avp_bytes,
+        let wire = cx::build_sar(
+            self.peer.config(),
+            &session_id,
+            request,
+            self.peer.next_hbh(),
+            self.peer.next_e2e(),
         );
-
-        self.peer.send_request(msg).await
+        self.peer.send_request(wire).await
     }
 
     /// Send a LIR (Location-Info-Request) and return the LIA.
