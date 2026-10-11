@@ -11,6 +11,7 @@ use pyo3::types::PyDict;
 use super::sip_uri::PySipUri;
 use crate::sip::message::SipMessage;
 
+pub use super::call_media::PyMediaHandle;
 pub use crate::b2bua::session_timer::SessionTimerOverride;
 
 /// The action the script chose for this call.
@@ -236,69 +237,6 @@ pub struct PyByeInitiator {
     /// "a" (caller) or "b" (callee).
     #[pyo3(get)]
     pub side: String,
-}
-
-/// Media handle — sub-object on `Call` for media anchoring.
-///
-/// Usage in Python:
-///   call.media.anchor()                    # anchor through RTPEngine
-///   call.media.anchor(engine="rtpengine")  # explicit engine name
-///   call.media.release()                   # release media anchor
-#[pyclass(name = "MediaHandle", skip_from_py_object)]
-#[derive(Debug, Clone)]
-pub struct PyMediaHandle {
-    anchored: bool,
-    engine: String,
-    profile: String,
-}
-
-impl Default for PyMediaHandle {
-    fn default() -> Self {
-        Self {
-            anchored: false,
-            engine: "rtpengine".to_string(),
-            profile: "srtp_to_rtp".to_string(),
-        }
-    }
-}
-
-impl PyMediaHandle {
-    /// Check if media is anchored (for the B2BUA core to read after script runs).
-    pub fn is_anchored(&self) -> bool {
-        self.anchored
-    }
-
-    /// Get the media engine name.
-    pub fn engine(&self) -> &str {
-        &self.engine
-    }
-
-    /// Get the RTP profile name.
-    pub fn profile_name(&self) -> &str {
-        &self.profile
-    }
-}
-
-#[pymethods]
-impl PyMediaHandle {
-    /// Anchor media through a media proxy.
-    #[pyo3(signature = (engine="rtpengine", profile="srtp_to_rtp"))]
-    fn anchor(&mut self, engine: &str, profile: &str) {
-        self.anchored = true;
-        self.engine = engine.to_string();
-        self.profile = profile.to_string();
-    }
-
-    /// Release the media anchor.
-    fn release(&mut self) {
-        self.anchored = false;
-    }
-
-    /// Whether media is currently anchored.
-    #[getter]
-    fn is_active(&self) -> bool {
-        self.anchored
-    }
 }
 
 /// Python-visible B2BUA call object.
