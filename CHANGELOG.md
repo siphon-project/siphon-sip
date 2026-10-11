@@ -82,6 +82,36 @@ entry, but a working config keeps working.
 
 ### Fixed
 
+- **The Cx Multimedia-Auth-Request of `auth.require_ims_digest` asks for an
+  IMS-AKA vector by its name, `Digest-AKAv1-MD5` (TS 29.229 clause 6.3.9).
+  Behaviour change on the wire.** For a first REGISTER, and for a challenge
+  repeated after a response that did not verify, the request carried
+  SIP-Authentication-Scheme `SIP Digest` inside SIP-Auth-Data-Item, and the
+  answer was then read as an IMS-AKA vector (RAND and AUTN, XRES, CK, IK) and
+  turned into an `AKAv1-MD5` challenge. It now carries `Digest-AKAv1-MD5`, as
+  the request for a resynchronisation already did, so the three name the same
+  scheme. TS 29.229 clause 6.3.9 defines `Digest-AKAv1-MD5` as the IMS-AKA
+  scheme, for AKAv1 and AKAv2 alike, and `SIP Digest` as another one, in which
+  the subscriber server returns H(A1) in SIP-Digest-Authenticate and none of
+  the AKA AVPs (TS 29.228 table 6.3.5). TS 29.228 clause 6.3.1 step 4 has the
+  server check the scheme of the request and answer
+  `DIAMETER_ERROR_AUTH_SCHEME_NOT_SUPPORTED` (5006) when it does not support
+  it, and `Unknown` is no substitute: it resolves to NASS-Bundled or SIP
+  Digest only. A server that follows those clauses refused the old request or
+  answered it with SIP Digest data, so IMS-AKA registration worked only
+  against a server that ignores the AVP. **Check the subscriber server before
+  upgrading if it only handed out a vector when asked for `SIP Digest`**: it
+  now refuses, and every registration through `require_ims_digest` ends in
+  403. There is no switch to get the old value back. The answer is checked
+  too. `DIAMETER_ERROR_AUTH_SCHEME_NOT_SUPPORTED` still refuses the REGISTER
+  with 403 and is now logged as a warning naming the identity. A successful
+  answer whose item names another scheme than the one asked for raises
+  `RuntimeError` and is logged as an error, where it used to be turned into a
+  challenge no UE could answer; the name is compared without regard to case,
+  and an item with no SIP-Authentication-Scheme is accepted as before.
+  `require_ims_digest` keeps its signature and is IMS-AKA only: SIP Digest
+  through Cx is not implemented. `scripts/validate_cx_mar.sh` checks both
+  requests against Wireshark's Diameter dissector.
 - **Flow descriptions on Rx and N5 name the uplink flow `in` and the downlink
   flow `out` (TS 29.214 §5.3.8). Behaviour change on the wire.**
   `qos.media_flows_from_sdp` wrote the two direction keywords the wrong way

@@ -205,7 +205,10 @@ fn build_aar_wire() -> Vec<u8> {
 
 #[test]
 fn cx_mar_encode_decode_roundtrip() {
-    let wire = build_mar_wire("sip:alice@ims.mnc001.mcc001.3gppnetwork.org", "SIP Digest");
+    let wire = build_mar_wire(
+        "sip:alice@ims.mnc001.mcc001.3gppnetwork.org",
+        "Digest-AKAv1-MD5",
+    );
     let decoded = decode_diameter(&wire).unwrap();
 
     assert!(decoded.is_request);
@@ -221,7 +224,10 @@ fn cx_mar_encode_decode_roundtrip() {
 
 #[test]
 fn cx_mar_avps_resolve_through_dictionary() {
-    let wire = build_mar_wire("sip:alice@ims.mnc001.mcc001.3gppnetwork.org", "SIP Digest");
+    let wire = build_mar_wire(
+        "sip:alice@ims.mnc001.mcc001.3gppnetwork.org",
+        "Digest-AKAv1-MD5",
+    );
     let decoded = decode_diameter(&wire).unwrap();
 
     // Standard AVPs resolve by name
@@ -679,7 +685,7 @@ fn full_ims_call_flow_all_four_interfaces() {
 
 #[test]
 fn diameter_header_is_always_20_bytes() {
-    let wire = build_mar_wire("sip:test@example.com", "SIP Digest");
+    let wire = build_mar_wire("sip:test@example.com", "Digest-AKAv1-MD5");
     assert_eq!(wire[0], 1); // Version
     let length = u32::from_be_bytes([0, wire[1], wire[2], wire[3]]);
     assert_eq!(length as usize, wire.len());

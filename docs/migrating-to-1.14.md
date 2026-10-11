@@ -49,9 +49,20 @@ Only relevant when you link `siphon-sip` as a crate.
 | N5 create | no `suppFeat`, `notifUri` only when passed, `sipCallId` present | `suppFeat` `"0"`, `notifUri` always, no `sipCallId` |
 | Nbsf discovery, IPv6 | `ipv6Prefix=<address>/64` | `ipv6Prefix=<address>/128` |
 | Nbsf discovery, answer 204 | raised `sbi.BsfError` | no binding (`None`), as for 404 |
+| Cx MAR of `auth.require_ims_digest`, first REGISTER and repeated challenge | SIP-Authentication-Scheme `SIP Digest` | `Digest-AKAv1-MD5`, per TS 29.229 clause 6.3.9 |
 
 The flow descriptions are the one to test against the policy function in use.
 One that follows the specification built its packet filters reversed with the
 old form and is correct now. One that had adapted to the old form, by reading
 the addresses and ignoring the keyword or by swapping the keywords back, needs
 that adaptation removed at the same time. There is no switch for the old form.
+
+The MAR is the one to test against the HSS in use. One that follows TS 29.228
+clause 6.3.1 answered the old request with
+`DIAMETER_ERROR_AUTH_SCHEME_NOT_SUPPORTED` (5006) or with SIP Digest data, and
+answers the new one with an IMS-AKA vector. One that ignored the AVP is
+unaffected. One that only returned a vector when asked for `SIP Digest` now
+refuses, and every IMS registration fails with 403: check it before upgrading.
+There is no switch for the old value. A successful answer whose item names
+another scheme than `Digest-AKAv1-MD5` now raises `RuntimeError` from
+`require_ims_digest` where it used to be turned into a challenge.

@@ -278,6 +278,14 @@ pub fn build_lia_success(
 // Multimedia-Auth (MAR/MAA) — S-CSCF → HSS
 // ═══════════════════════════════════════════════════════════════════════════
 
+/// SIP-Authentication-Scheme of IMS-AKA (TS 29.229 clause 6.3.9). The one
+/// name covers AKAv1 and AKAv2: both need RAND, AUTN, XRES, CK and IK.
+pub const SIP_AUTH_SCHEME_IMS_AKA: &str = "Digest-AKAv1-MD5";
+
+/// "The authentication scheme indicated in an authentication request is not
+/// supported" (TS 29.229 clause 6.2.2.6), carried in Experimental-Result.
+pub const DIAMETER_ERROR_AUTH_SCHEME_NOT_SUPPORTED: u32 = 5006;
+
 /// Deserialized MAR fields.
 #[derive(Debug, Clone)]
 pub struct MultimediaAuthRequest {
@@ -333,7 +341,7 @@ pub fn build_maa_success(
     auth_children.extend_from_slice(&encode_avp_u32_3gpp(AVP_SIP_ITEM_NUMBER, 1));
     auth_children.extend_from_slice(&encode_avp_utf8_3gpp(
         avp::SIP_AUTHENTICATION_SCHEME,
-        "Digest-AKAv1-MD5",
+        SIP_AUTH_SCHEME_IMS_AKA,
     ));
     auth_children.extend_from_slice(&encode_avp_octet_3gpp(
         avp::SIP_AUTHENTICATE,

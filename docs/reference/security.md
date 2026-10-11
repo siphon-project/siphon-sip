@@ -84,6 +84,21 @@ success path.
 AKA digest are REGISTER-time procedures, and REGISTER never reaches the B2BUA
 path.
 
+`require_ims_digest` authenticates with IMS-AKA and nothing else. Its Cx
+Multimedia-Auth-Request carries SIP-Authentication-Scheme `Digest-AKAv1-MD5`
+(TS 29.229 clause 6.3.9) for the first REGISTER, for a challenge repeated after
+a response that did not verify, and for a resynchronisation, and the 401 it
+builds is an `AKAv1-MD5` challenge. SIP Digest with H(A1) from the HSS
+(TS 33.203 Annex N) is a different scheme and is not implemented on this path.
+
+| The HSS answers | `require_ims_digest` |
+|---|---|
+| `DIAMETER_SUCCESS` with an IMS-AKA item | sets the 401 challenge, returns `False` |
+| `DIAMETER_SUCCESS` with an item in another scheme | raises `RuntimeError` and logs an error, no challenge |
+| `DIAMETER_ERROR_AUTH_SCHEME_NOT_SUPPORTED` (5006) | sets `403 Forbidden`, returns `False`, logs a warning |
+| any other result | sets `403 Forbidden`, returns `False` |
+| nothing (transport error or timeout) | raises `RuntimeError` |
+
 ## `auth` namespace
 
 ### Which algorithms a challenge offers

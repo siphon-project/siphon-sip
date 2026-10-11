@@ -3047,13 +3047,24 @@ class MockAuth:
         Sends a Multimedia-Auth-Request to the HSS and uses the returned
         authentication vector to challenge or verify the UE.
 
+        The scheme is IMS-AKA: the request carries SIP-Authentication-Scheme
+        ``Digest-AKAv1-MD5`` (TS 29.229 clause 6.3.9) and the challenge is
+        ``AKAv1-MD5``. SIP Digest is not offered on this path. The mock has no
+        HSS, so it checks the request against the test's users instead.
+
         Takes a ``Request`` only — unlike :meth:`require_www_digest` /
         :meth:`require_proxy_digest`, IMS and AKA digest are REGISTER-time
         procedures and REGISTER never reaches the B2BUA path, so the engine
         does not accept a ``Call`` here either.
 
         Returns:
-            ``True`` if credentials are valid, ``False`` if a 401 challenge was sent.
+            ``True`` if credentials are valid, ``False`` if a 401 challenge was
+            sent or the HSS refused and a 403 was set.
+
+        Raises:
+            RuntimeError: in siphon, when no Diameter connection is available,
+                the request got no answer, or the answer carries another
+                authentication scheme than the one asked for.
         """
 
         # Raised at the call, as siphon does: PyO3 refuses a Call when it

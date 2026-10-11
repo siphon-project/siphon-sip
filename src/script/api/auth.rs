@@ -6,6 +6,7 @@
 //! Credentials come from `auth.users` (static), an HTTP lookup, or SQL —
 //! see [`crate::auth::server`] for the SQL source.
 
+mod ims;
 mod vectors;
 
 use std::collections::HashMap;
@@ -21,7 +22,7 @@ use crate::auth::server::{ha1_column_for, CredentialLookup, DatabaseCredentials}
 use crate::auth::DigestAlgorithm;
 use crate::config::{AkaCredential, AuthBackendType, DatabaseAuthConfig, HttpAuthConfig};
 use crate::diameter::DiameterManager;
-use vectors::{auth_vectors, ims_auth_store, store_auth_vector, take_auth_vector};
+use vectors::{store_auth_vector, take_auth_vector};
 
 /// A cached HTTP-auth credential lookup (HA1 hex when `http.ha1`, else the
 /// plaintext password), with the wall-clock instant it was fetched so the TTL
@@ -599,8 +600,14 @@ impl PyAuth {
     /// Sends a Multimedia-Auth-Request to the HSS and uses the returned
     /// authentication vector to challenge or verify the UE.
     ///
-    /// Returns True if credentials are valid, False if a 401 challenge was sent.
-    /// Raises RuntimeError if no Diameter connection is available.
+    /// The scheme is IMS-AKA: the request carries SIP-Authentication-Scheme
+    /// `Digest-AKAv1-MD5` (TS 29.229 clause 6.3.9) and the challenge is
+    /// `AKAv1-MD5`. SIP Digest is not offered on this path.
+    ///
+    /// Returns True if credentials are valid, False if a 401 challenge was
+    /// sent or the HSS refused and a 403 was set. Raises RuntimeError if no
+    /// Diameter connection is available, the request got no answer, or the
+    /// answer carries another authentication scheme than the one asked for.
     #[pyo3(signature = (request, realm=None))]
     fn require_ims_digest<'py>(
         &self,
@@ -871,147 +878,6 @@ impl PyAuth {
                 )
                 .await
                 .is_valid())
-        })
-    }
-}
-
-impl PyAuth {
-    /// The MAR round trips and everything they decide.
-    ///
-    /// Takes an owned `Py<PyRequest>` because the request is written to *after*
-    /// each await — a 403, an auth-user stamp, or the 401 challenge — and a
-    /// borrow cannot be held across one. Each write re-borrows inside
-    /// `Python::attach`, which is safe for the same reason the original borrow
-    /// was: nothing else holds the request while its handler runs.
-    async fn ims_digest_flow(
-        auth: PyAuth,
-        client: std::sync::Arc<crate::diameter::DiameterClient>,
-        request: Py<PyRequest>,
-        realm: String,
-        public_identity: String,
-        existing_auth: Option<String>,
-    ) -> PyResult<bool> {
-        use crate::diameter::codec;
-        use crate::diameter::dictionary::avp;
-        let realm = realm.as_str();
-
-        // ── Second REGISTER (has Authorization) — verify against stored vector ──
-        if let Some(ref auth_value) = existing_auth {
-            // Check for AUTS resynchronization (TS 29.228 §6.3.18).
-            // UE detected SQN out of sync → sends auts= in Authorization.
-            // We MUST send a new MAR with RAND||AUTS so the HSS can resync.
-            if let Some(auts_b64) = extract_digest_param(auth_value, "auts") {
-                if let Some(auts_bytes) = base64_decode(&auts_b64) {
-                    if auts_bytes.len() == 14 {
-                        if let Some(nonce_str) = extract_nonce_field(auth_value) {
-                            if let Some(nonce_bytes) = base64_decode(&nonce_str) {
-                                if nonce_bytes.len() >= 16 {
-                                    // Clean up the stale vector for the old nonce
-                                    ims_auth_store().remove(&nonce_str);
-
-                                    let mut resync_data = Vec::with_capacity(30);
-                                    resync_data.extend_from_slice(&nonce_bytes[..16]);
-                                    resync_data.extend_from_slice(&auts_bytes);
-
-                                    let maa_resync = client
-                                        .send_mar(
-                                            &public_identity,
-                                            1,
-                                            "Digest-AKAv1-MD5",
-                                            Some(&resync_data),
-                                        )
-                                        .await
-                                        .map_err(|error| {
-                                            pyo3::exceptions::PyRuntimeError::new_err(format!(
-                                                "MAR resync failed: {error}"
-                                            ))
-                                        })?;
-
-                                    let resync_result =
-                                        codec::extract_u32_avp(&maa_resync.avps, avp::RESULT_CODE);
-                                    if resync_result != Some(2001) {
-                                        Python::attach(|python| {
-                                            request
-                                                .borrow_mut(python)
-                                                .set_reply(403, "Forbidden".to_string())
-                                        });
-                                        return Ok(false);
-                                    }
-
-                                    // HSS resynced SQN — extract fresh auth vector and challenge again
-                                    return Python::attach(|python| {
-                                        auth.send_ims_challenge_from_maa(
-                                            &mut request.borrow_mut(python),
-                                            realm,
-                                            &maa_resync.avps,
-                                        )
-                                    });
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Normal verification: look up the stored XRES from the first MAR
-            let nonce_str = extract_nonce_field(auth_value);
-            let found = nonce_str
-                .as_ref()
-                .is_some_and(|n| auth_vectors().contains(n));
-            tracing::debug!(
-                nonce_prefix = nonce_str.as_ref().map(|n| &n[..n.len().min(16)]),
-                found,
-                store_size = auth_vectors().len(),
-                "IMS auth: cache lookup",
-            );
-            let stored = nonce_str.as_ref().and_then(|n| take_auth_vector(n));
-
-            if let Some(vector) = stored {
-                // Per RFC 3310 §3.3: for AKAv1-MD5, raw XRES bytes are used
-                // directly as the "password" in HA1 = MD5(username:realm:XRES).
-                // Not hex-encoded, not base64-encoded — raw binary bytes.
-                if let Some(fields) = DigestFields::parse(auth_value) {
-                    let ha1 = md5_ha1_aka(&fields.username, realm, &vector.expected_response);
-                    let matches = fields.verify(&ha1, "REGISTER");
-                    tracing::debug!(
-                        response = %fields.response,
-                        xres_len = vector.expected_response.len(),
-                        ha1 = %ha1,
-                        matches,
-                        "IMS auth: AKAv1-MD5 digest verification",
-                    );
-                    if matches {
-                        Python::attach(|python| {
-                            request.borrow_mut(python).set_auth_user(fields.username)
-                        });
-                        return Ok(true);
-                    }
-                }
-                // Response mismatch — re-challenge with a fresh vector
-            } else {
-                // No stored vector (expired or replayed nonce) — need fresh MAR
-                tracing::debug!("IMS auth: no cached vector, sending fresh MAR");
-            }
-        }
-
-        // ── First REGISTER (no Authorization) or re-challenge — send MAR ──
-        let maa = client
-            .send_mar(&public_identity, 1, "SIP Digest", None)
-            .await
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("MAR failed: {e}")))?;
-
-        let result_code = codec::extract_u32_avp(&maa.avps, avp::RESULT_CODE);
-        if result_code != Some(2001) {
-            Python::attach(|python| {
-                request
-                    .borrow_mut(python)
-                    .set_reply(403, "Forbidden".to_string())
-            });
-            return Ok(false);
-        }
-
-        Python::attach(|python| {
-            auth.send_ims_challenge_from_maa(&mut request.borrow_mut(python), realm, &maa.avps)
         })
     }
 }
@@ -2520,7 +2386,7 @@ pub(crate) fn base64_decode(input: &str) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use super::vectors::{ImsAuthVector, AUTH_VECTOR_TTL};
+    use super::vectors::{ims_auth_store, ImsAuthVector, AUTH_VECTOR_TTL};
     use super::*;
     use crate::script::api::request::RequestAction;
     use crate::sip::builder::SipMessageBuilder;
