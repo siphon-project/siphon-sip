@@ -599,9 +599,15 @@ impl Avp {
     }
 
     /// Build a Raw-valued AVP with the Mandatory bit (and Vendor bit when
-    /// `vendor != 0`) set — the common case for AVPs siphon constructs.
+    /// `vendor != 0`) set — the common case for AVPs siphon constructs. The
+    /// few AVPs that must not carry the M bit go out without it
+    /// ([`dictionary::avp_is_mandatory`]).
     pub fn raw(code: u32, vendor: u32, value: Vec<u8>) -> Avp {
-        let mut flags = AVP_FLAG_MANDATORY;
+        let mut flags = if dictionary::avp_is_mandatory(code, vendor) {
+            AVP_FLAG_MANDATORY
+        } else {
+            0
+        };
         if vendor != 0 {
             flags |= AVP_FLAG_VENDOR;
         }
