@@ -18,6 +18,9 @@ pub(crate) mod cx_test_support;
 pub mod dictionary;
 pub mod event_sink;
 pub mod forward;
+pub mod gba;
+#[cfg(test)]
+pub(crate) mod gba_test_vectors;
 pub mod peer;
 pub mod pool;
 pub mod rf;

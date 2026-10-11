@@ -918,6 +918,9 @@ pub fn command_name(code: u32, is_request: bool) -> &'static str {
         (308, false) => "SNA",
         (309, true) => "PNR",
         (309, false) => "PNA",
+        // Zn (TS 29.109)
+        (310, true) => "BIR",
+        (310, false) => "BIA",
         // S6a
         (316, true) => "ULR",
         (316, false) => "ULA",

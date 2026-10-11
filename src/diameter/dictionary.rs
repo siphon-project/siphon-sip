@@ -542,6 +542,79 @@ static AVP_TABLE: &[AvpDef] = &[
     },
     // ── 3GPP AVPs, vendor_id = 10415 (sorted by code) ─────────────────────
 
+    // GBA: Zh and Zn (TS 29.109 Table 6.1)
+    AvpDef {
+        code: 400,
+        vendor_id: TGPP,
+        name: "GBA-UserSecSettings",
+        data_type: AvpType::OctetString,
+    },
+    AvpDef {
+        code: 401,
+        vendor_id: TGPP,
+        name: "Transaction-Identifier",
+        data_type: AvpType::OctetString,
+    },
+    AvpDef {
+        code: 402,
+        vendor_id: TGPP,
+        name: "NAF-Id",
+        data_type: AvpType::OctetString,
+    },
+    AvpDef {
+        code: 403,
+        vendor_id: TGPP,
+        name: "GAA-Service-Identifier",
+        data_type: AvpType::OctetString,
+    },
+    AvpDef {
+        code: 404,
+        vendor_id: TGPP,
+        name: "Key-ExpiryTime",
+        data_type: AvpType::Time,
+    },
+    AvpDef {
+        code: 405,
+        vendor_id: TGPP,
+        name: "ME-Key-Material",
+        data_type: AvpType::OctetString,
+    },
+    AvpDef {
+        code: 406,
+        vendor_id: TGPP,
+        name: "UICC-Key-Material",
+        data_type: AvpType::OctetString,
+    },
+    AvpDef {
+        code: 407,
+        vendor_id: TGPP,
+        name: "GBA_U-Awareness-Indicator",
+        data_type: AvpType::Enumerated,
+    },
+    AvpDef {
+        code: 408,
+        vendor_id: TGPP,
+        name: "BootstrapInfoCreationTime",
+        data_type: AvpType::Time,
+    },
+    AvpDef {
+        code: 409,
+        vendor_id: TGPP,
+        name: "GUSS-Timestamp",
+        data_type: AvpType::Time,
+    },
+    AvpDef {
+        code: 410,
+        vendor_id: TGPP,
+        name: "GBA-Type",
+        data_type: AvpType::Enumerated,
+    },
+    AvpDef {
+        code: 421,
+        vendor_id: TGPP,
+        name: "SHA-256-Indication",
+        data_type: AvpType::Enumerated,
+    },
     // Rx (TS 29.214)
     AvpDef {
         code: 500,
@@ -1810,10 +1883,27 @@ pub fn lookup_by_name(name: &str) -> Option<&'static AvpDef> {
 ///   "sm_rp_ui"              → "SM-RP-UI"
 ///   "user_name"             → "User-Name"
 pub fn lookup_avp_by_python_name(name: &str) -> Option<&'static AvpDef> {
-    let kebab = name.replace('_', "-");
-    AVP_TABLE
-        .iter()
-        .find(|entry| entry.name.eq_ignore_ascii_case(&kebab))
+    // An underscore in the kwarg stands for a hyphen, or for the underscore a
+    // few AVP names hold themselves (`GBA_U-Awareness-Indicator`).
+    let same = |left: u8, right: u8| {
+        let fold = |byte: u8| if byte == b'_' { b'-' } else { byte };
+        fold(left).eq_ignore_ascii_case(&fold(right))
+    };
+    AVP_TABLE.iter().find(|entry| {
+        entry.name.len() == name.len()
+            && entry
+                .name
+                .bytes()
+                .zip(name.bytes())
+                .all(|(left, right)| same(left, right))
+    })
+}
+
+/// Whether an AVP goes out with the M bit. Every AVP this node builds does,
+/// except the few whose specification forbids it: GUSS-Timestamp, which
+/// TS 29.109 Table 6.1 lists with "V" under Must and "M" under Must not.
+pub fn avp_is_mandatory(code: u32, vendor_id: u32) -> bool {
+    !(vendor_id == VENDOR_3GPP && code == avp::GUSS_TIMESTAMP)
 }
 
 /// Look up an AVP name by code (tries vendor=0, then vendor=10415).
@@ -1848,6 +1938,10 @@ pub const S6C_APP_ID: u32 = 16777312;
 pub const SGD_APP_ID: u32 = 16777313;
 /// S6a Application-Id (TS 29.272) — MME ↔ HSS for LTE attach/auth
 pub const S6A_APP_ID: u32 = 16777251;
+/// 3GPP Zh application, BSF to HSS (TS 29.109 clause 6.0)
+pub const ZH_APP_ID: u32 = 16777221;
+/// 3GPP Zn application, NAF to BSF (TS 29.109 clause 6.0)
+pub const ZN_APP_ID: u32 = 16777220;
 /// Relay Application-Id (RFC 6733 §2.4): advertised by a relay or redirect
 /// agent, and common with every application a peer advertises (§5.3)
 pub const RELAY_APP_ID: u32 = 0xffff_ffff;
@@ -1856,7 +1950,8 @@ pub const VENDOR_3GPP: u32 = 10415;
 
 /// Resolve an application name (case-insensitive) to its
 /// `(vendor_id, app_id)` tuple. Accepts the canonical short form
-/// (`"Cx"`, `"Sh"`, `"Gx"`, `"Rx"`, `"Ro"`, `"Rf"`, `"S6c"`, `"SGd"`, `"S6a"`).
+/// (`"Cx"`, `"Sh"`, `"Gx"`, `"Rx"`, `"Ro"`, `"Rf"`, `"S6c"`, `"SGd"`, `"S6a"`,
+/// `"Zh"`, `"Zn"`).
 pub fn app_id_by_name(name: &str) -> Option<(u32, u32)> {
     let lower = name.to_ascii_lowercase();
     match lower.as_str() {
@@ -1869,6 +1964,8 @@ pub fn app_id_by_name(name: &str) -> Option<(u32, u32)> {
         "s6c" => Some((VENDOR_3GPP, S6C_APP_ID)),
         "sgd" => Some((VENDOR_3GPP, SGD_APP_ID)),
         "s6a" => Some((VENDOR_3GPP, S6A_APP_ID)),
+        "zh" => Some((VENDOR_3GPP, ZH_APP_ID)),
+        "zn" => Some((VENDOR_3GPP, ZN_APP_ID)),
         _ => None,
     }
 }
@@ -1877,7 +1974,7 @@ pub fn app_id_by_name(name: &str) -> Option<(u32, u32)> {
 /// advertised in the CER/CEA via `Acct-Application-Id (259)` rather than
 /// `Auth-Application-Id (258)` (RFC 6733 §2.4 / §6.9). Today only base
 /// accounting — Rf (id 3) — is an accounting application; every other app
-/// SIPhon speaks (Cx/Sh/Gx/Rx/Ro/S6a/S6c/SGd) is an auth application. Advertising
+/// SIPhon speaks (Cx/Sh/Gx/Rx/Ro/S6a/S6c/SGd/Zh/Zn) is an auth application. Advertising
 /// an accounting app as an auth app makes strict peers (freeDiameter,
 /// go-diameter/CGRateS) answer `DIAMETER_NO_COMMON_APPLICATION`.
 pub fn is_accounting_application(app_id: u32) -> bool {
@@ -1898,6 +1995,8 @@ pub fn app_name_by_id(app_id: u32) -> Option<&'static str> {
         S6C_APP_ID => Some("S6c"),
         SGD_APP_ID => Some("SGd"),
         S6A_APP_ID => Some("S6a"),
+        ZH_APP_ID => Some("Zh"),
+        ZN_APP_ID => Some("Zn"),
         _ => None,
     }
 }
@@ -1951,6 +2050,8 @@ pub fn command_code_by_name(name: &str) -> Option<u32> {
         "delete-subscriber-data" | "dsr" | "dsa" => Some(CMD_DELETE_SUBSCRIBER_DATA),
         "purge-ue" | "pua-s6a" => Some(CMD_PURGE_UE),
         "notify" | "nor" | "noa" => Some(CMD_NOTIFY),
+        // Zn (TS 29.109). Zh has no command of its own: it is "mar" above.
+        "bootstrapping-info" | "bir" | "bia" => Some(CMD_BOOTSTRAPPING_INFO),
         // Base
         "capabilities-exchange" | "cer" | "cea" => Some(CMD_CAPABILITIES_EXCHANGE),
         "device-watchdog" | "dwr" | "dwa" => Some(CMD_DEVICE_WATCHDOG),
@@ -1985,6 +2086,7 @@ pub fn command_name_by_code(code: u32) -> Option<&'static str> {
         CMD_REPORT_SM_DELIVERY_STATUS => "Report-SM-Delivery-Status",
         CMD_MO_FORWARD_SHORT_MESSAGE => "MO-Forward-Short-Message",
         CMD_MT_FORWARD_SHORT_MESSAGE => "MT-Forward-Short-Message",
+        CMD_BOOTSTRAPPING_INFO => "Bootstrapping-Info",
         CMD_CAPABILITIES_EXCHANGE => "Capabilities-Exchange",
         CMD_DEVICE_WATCHDOG => "Device-Watchdog",
         CMD_DISCONNECT_PEER => "Disconnect-Peer",
@@ -2006,6 +2108,11 @@ pub const CMD_MULTIMEDIA_AUTH: u32 = 303;
 pub const CMD_REGISTRATION_TERMINATION: u32 = 304;
 /// Push-Profile-Request/Answer
 pub const CMD_PUSH_PROFILE: u32 = 305;
+
+// ── Zn Command Code (TS 29.109 clause 6.1) ─────────────────────────────
+
+/// Bootstrapping-Info-Request/Answer
+pub const CMD_BOOTSTRAPPING_INFO: u32 = 310;
 
 // ── Sh Command Codes (TS 29.329) ────────────────────────────────────────
 
@@ -2107,6 +2214,12 @@ pub const DIAMETER_SUBSEQUENT_REGISTRATION: u32 = 2002;
 pub const DIAMETER_SERVER_NAME_NOT_STORED: u32 = 2003;
 /// Cx: identity not registered
 pub const DIAMETER_ERROR_IDENTITY_NOT_REGISTERED: u32 = 5003;
+/// Zh: the IMPI or IMPU is unknown to the HSS (TS 29.109 clause 6.2.2.1)
+pub const DIAMETER_ERROR_IDENTITY_UNKNOWN: u32 = 5401;
+/// Zn: the BSF cannot authorize the request (TS 29.109 clause 6.2.2.2)
+pub const DIAMETER_ERROR_NOT_AUTHORIZED: u32 = 5402;
+/// Zn: the B-TID is unknown or expired (TS 29.109 clause 6.2.2.3)
+pub const DIAMETER_ERROR_TRANSACTION_IDENTIFIER_INVALID: u32 = 5403;
 
 // ── Result-Code metric labels ────────────────────────────────────────────
 
@@ -2170,6 +2283,9 @@ const KNOWN_EXPERIMENTAL_RESULT_CODES: &[(u32, &str)] = &[
     (5008, "exp:5008"), // ERROR_TOO_MUCH_DATA
     (5061, "exp:5061"), // INVALID_SERVICE_INFORMATION (Rx)
     (5063, "exp:5063"), // REQUESTED_SERVICE_NOT_AUTHORIZED (Rx)
+    (5401, "exp:5401"), // ERROR_IDENTITY_UNKNOWN (Zh)
+    (5402, "exp:5402"), // ERROR_NOT_AUTHORIZED (Zn)
+    (5403, "exp:5403"), // ERROR_TRANSACTION_IDENTIFIER_INVALID (Zn)
 ];
 
 /// The class bucket an unlisted Result-Code falls into (RFC 6733 §7.1:
@@ -2348,6 +2464,19 @@ pub mod avp {
     pub const SUPPORTED_FEATURES: u32 = 628;
     pub const FEATURE_LIST_ID: u32 = 629;
     pub const FEATURE_LIST: u32 = 630;
+
+    // 3GPP GBA, Zh and Zn (TS 29.109 Table 6.1)
+    pub const GBA_USER_SEC_SETTINGS: u32 = 400;
+    pub const TRANSACTION_IDENTIFIER: u32 = 401;
+    pub const NAF_ID: u32 = 402;
+    pub const GAA_SERVICE_IDENTIFIER: u32 = 403;
+    pub const KEY_EXPIRY_TIME: u32 = 404;
+    pub const ME_KEY_MATERIAL: u32 = 405;
+    pub const UICC_KEY_MATERIAL: u32 = 406;
+    pub const GBA_U_AWARENESS_INDICATOR: u32 = 407;
+    pub const BOOTSTRAP_INFO_CREATION_TIME: u32 = 408;
+    pub const GUSS_TIMESTAMP: u32 = 409;
+    pub const GBA_TYPE: u32 = 410;
 
     // 3GPP Sh (TS 29.329)
     pub const MSISDN: u32 = 701;
@@ -2806,6 +2935,106 @@ mod tests {
         // mistaken for Gx (Rx is 16777236).
         assert_eq!(app_name_by_id(16_777_236), Some("Rx"));
         assert_eq!(app_name_by_id(16_777_237), None);
+    }
+
+    #[test]
+    fn zh_and_zn_resolve_to_their_3gpp_application_ids() {
+        // TS 29.109 clause 6.0: "The Diameter application identifier assigned
+        // to the Zh interface application is 16777221", and "to the Zn and
+        // Zpn interface application are 16777220 and 16777268 respectively".
+        // The vendor is 3GPP (10415).
+        for name in ["Zh", "zh", "ZH"] {
+            assert_eq!(app_id_by_name(name), Some((10415, 16_777_221)), "{name}");
+        }
+        for name in ["Zn", "zn", "ZN"] {
+            assert_eq!(app_id_by_name(name), Some((10415, 16_777_220)), "{name}");
+        }
+        assert_eq!(app_name_by_id(16_777_221), Some("Zh"));
+        assert_eq!(app_name_by_id(16_777_220), Some("Zn"));
+        // Both are advertised as Auth-Application-Id.
+        assert!(!is_accounting_application(16_777_221));
+        assert!(!is_accounting_application(16_777_220));
+        // The ids on either side belong to other applications.
+        assert_eq!(app_name_by_id(16_777_219), None);
+        assert_eq!(app_name_by_id(16_777_222), None);
+        assert_eq!(app_name_by_id(16_777_216), Some("Cx"));
+    }
+
+    #[test]
+    fn bootstrapping_info_is_command_310() {
+        // TS 29.109 clause 6.1: "The Zn and Zpn interfaces assign new
+        // Command-Codes 310 and 312."
+        for name in [
+            "Bootstrapping-Info-Request",
+            "Bootstrapping-Info-Answer",
+            "Bootstrapping-Info",
+            "bootstrapping-info-request",
+            "BIR",
+            "bia",
+        ] {
+            assert_eq!(command_code_by_name(name), Some(310), "{name}");
+        }
+        assert_eq!(command_name_by_code(310), Some("Bootstrapping-Info"));
+        // Zh reuses the Cx command: "The messages in Zh interface use the
+        // same Command-Code value 303".
+        assert_eq!(command_code_by_name("MAR"), Some(303));
+    }
+
+    #[test]
+    fn gba_avps_are_defined_as_ts_29_109_table_6_1_gives_them() {
+        // Code, name and value type from TS 29.109 Table 6.1; "The Vendor-Id
+        // header of all AVPs defined in this specification shall be set to
+        // 3GPP (10415)".
+        let table = [
+            (400, "GBA-UserSecSettings", AvpType::OctetString),
+            (401, "Transaction-Identifier", AvpType::OctetString),
+            (402, "NAF-Id", AvpType::OctetString),
+            (403, "GAA-Service-Identifier", AvpType::OctetString),
+            (404, "Key-ExpiryTime", AvpType::Time),
+            (405, "ME-Key-Material", AvpType::OctetString),
+            (406, "UICC-Key-Material", AvpType::OctetString),
+            (407, "GBA_U-Awareness-Indicator", AvpType::Enumerated),
+            (408, "BootstrapInfoCreationTime", AvpType::Time),
+            (409, "GUSS-Timestamp", AvpType::Time),
+            (410, "GBA-Type", AvpType::Enumerated),
+            (421, "SHA-256-Indication", AvpType::Enumerated),
+        ];
+        for (code, name, data_type) in table {
+            let def = lookup_avp(code, 10415)
+                .unwrap_or_else(|| panic!("{name} ({code}) is not in the dictionary"));
+            assert_eq!(def.name, name);
+            assert_eq!(def.data_type, data_type, "{name}");
+            assert_eq!(lookup_by_name(name).map(|def| def.code), Some(code));
+        }
+    }
+
+    #[test]
+    fn python_names_reach_the_gba_avps() {
+        for (python_name, code) in [
+            ("gba_usersecsettings", 400),
+            ("transaction_identifier", 401),
+            ("naf_id", 402),
+            ("gaa_service_identifier", 403),
+            ("key_expirytime", 404),
+            ("me_key_material", 405),
+            ("uicc_key_material", 406),
+            // The AVP name itself holds an underscore.
+            ("gba_u_awareness_indicator", 407),
+            ("bootstrapinfocreationtime", 408),
+            ("guss_timestamp", 409),
+            ("gba_type", 410),
+        ] {
+            assert_eq!(
+                lookup_avp_by_python_name(python_name).map(|def| (def.vendor_id, def.code)),
+                Some((10415, code)),
+                "{python_name}"
+            );
+        }
+        // Names without an underscore of their own are found as before.
+        assert_eq!(
+            lookup_avp_by_python_name("sm_rp_ui").map(|def| def.name),
+            Some("SM-RP-UI")
+        );
     }
 
     #[test]

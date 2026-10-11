@@ -4090,6 +4090,77 @@ fn diameter_route_accepts_the_gx_application() {
 }
 
 #[test]
+fn diameter_routes_accept_the_zh_and_zn_applications() {
+    let yaml = concat!(
+        "listen:\n",
+        "  udp:\n",
+        "    - \"0.0.0.0:5060\"\n",
+        "domain:\n",
+        "  local:\n",
+        "    - \"example.org\"\n",
+        "script:\n",
+        "  path: \"scripts/proxy_default.py\"\n",
+        "diameter:\n",
+        "  origin_host: \"bsf.example.org\"\n",
+        "  origin_realm: \"example.org\"\n",
+        "  peers:\n",
+        "    - name: \"hss1\"\n",
+        "      host: \"hss1.example.org\"\n",
+        "      destination_realm: \"example.org\"\n",
+        "    - name: \"bsf1\"\n",
+        "      host: \"bsf1.example.org\"\n",
+        "      destination_realm: \"example.org\"\n",
+        "  routes:\n",
+        "    - application: zh\n",
+        "      peers: [\"hss1\"]\n",
+        "    - application: zn\n",
+        "      peers: [\"bsf1\"]\n",
+    );
+    let config = Config::from_str(yaml).expect("zh and zn are application names");
+    let diameter = config.diameter.as_ref().unwrap();
+
+    // TS 29.109 clause 6.0: vendor 3GPP (10415), Zh 16777221, Zn 16777220.
+    assert_eq!(
+        diameter.routes[0].application.to_app_id(),
+        (10415, 16_777_221)
+    );
+    assert_eq!(
+        diameter.routes[1].application.to_app_id(),
+        (10415, 16_777_220)
+    );
+
+    // Each peer's CER advertises the application routed to it.
+    let hss = diameter.to_peer_config(&diameter.peers[0], "SIPhon", "1.2.3");
+    assert_eq!(hss.application_ids, vec![(10415, 16_777_221)]);
+    let bsf = diameter.to_peer_config(&diameter.peers[1], "SIPhon", "1.2.3");
+    assert_eq!(bsf.application_ids, vec![(10415, 16_777_220)]);
+
+    let zh_peers = diameter.peers_for_application(&diameter.routes[0].application, None);
+    assert_eq!(zh_peers.len(), 1);
+    assert_eq!(zh_peers[0].name, "hss1");
+}
+
+#[test]
+fn a_listening_node_can_advertise_zh_and_zn() {
+    let diameter = diameter_server_yaml(concat!(
+        "  origin_host: \"bsf.example.org\"\n",
+        "  origin_realm: \"example.org\"\n",
+        "  applications: [zn, zh]\n",
+        "  clients:\n",
+        "    - { name: naf, allowed_ips: [\"192.0.2.0/24\"] }\n",
+    ))
+    .expect("zn and zh are application names")
+    .diameter
+    .expect("diameter section");
+    let effective = diameter.effective_tenants();
+    let tenant = effective.get("default").expect("default tenant");
+    assert_eq!(
+        tenant.application_ids(),
+        vec![(10415, 16_777_220), (10415, 16_777_221)]
+    );
+}
+
+#[test]
 fn diameter_absent_when_not_configured() {
     let config = Config::from_str(minimal_yaml()).unwrap();
     assert!(config.diameter.is_none());

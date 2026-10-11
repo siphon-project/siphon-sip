@@ -58,14 +58,13 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
 use tracing::warn;
 
+use super::diameter_kwargs::encode_kwarg_avp;
 use crate::diameter::codec::{
-    encode_avp_address_ipv4, encode_avp_grouped, encode_avp_grouped_3gpp, encode_avp_octet,
-    encode_avp_octet_3gpp, encode_avp_u32, encode_avp_u32_3gpp, encode_avp_u64, encode_avp_utf8,
-    encode_avp_utf8_3gpp, encode_diameter_message, encode_vendor_specific_app_id, FLAG_PROXIABLE,
-    FLAG_REQUEST,
+    encode_avp_u32, encode_avp_utf8, encode_diameter_message, encode_vendor_specific_app_id,
+    FLAG_PROXIABLE, FLAG_REQUEST,
 };
 use crate::diameter::cx::{octet_string_as_utf8, required_str};
-use crate::diameter::dictionary::{self, avp, AvpDef, AvpType};
+use crate::diameter::dictionary::{self, avp};
 use crate::diameter::rf::{self, AccountingAnswer, AccountingParams, AccountingRecordType};
 use crate::diameter::ro::{
     self, CcRequestType, CreditControlAnswer, CreditControlParams, ImsChargingData,
@@ -1176,6 +1175,175 @@ impl PyDiameter {
                 }),
                 Err(error) => {
                     warn!(error = %error, "cx_mar failed");
+                    Ok(None)
+                }
+            }
+        })
+    }
+
+    /// Send a Zh Multimedia-Auth-Request to the HSS (GBA, TS 29.109).
+    ///
+    /// What a Bootstrapping Server Function asks for one authentication
+    /// vector and the user's GBA security settings (clause 4.2).
+    ///
+    /// It is the Cx command on the Zh application (16777221), without
+    /// Server-Name or SIP-Number-Auth-Items, so the HSS does not run its Cx
+    /// procedure. It goes to the peer the ``zh`` route names.
+    ///
+    /// Args:
+    ///     user_name: The private identity (IMPI), sent as User-Name.
+    ///     authorization: After a synchronisation failure, RAND as sent to
+    ///         the terminal followed by the AUTS it answered with: 30 octets
+    ///         (TS 29.229 clause 6.3.11), sent as SIP-Authorization inside a
+    ///         SIP-Auth-Data-Item.
+    ///     scheme: SIP-Authentication-Scheme. Leave it out for IMS AKA: the
+    ///         request then carries no SIP-Auth-Data-Item, which TS 29.109
+    ///         defines as ``Digest-AKAv1-MD5``.
+    ///     public_identity: The public identity, sent as Public-Identity.
+    ///         Only bootstrapping push uses it.
+    ///     guss_timestamp: The timestamp of the GUSS already held, in Unix
+    ///         seconds, sent as GUSS-Timestamp. The HSS then answers ``guss``
+    ///         ``"GUSS TIMESTAMP EQUAL"`` when its copy is the same.
+    ///
+    /// Returns:
+    ///     Dict with ``result_code`` (int: the Result-Code, or without one
+    ///     the Experimental-Result-Code), ``experimental_result_code`` (int
+    ///     or None; 5401 is DIAMETER_ERROR_IDENTITY_UNKNOWN), ``user_name``
+    ///     (str or None), ``auth_items`` (a list of dicts as ``cx_mar``
+    ///     returns them; the HSS sends one) and ``guss`` (str or None, the
+    ///     GBA-UserSecSettings XML). ``None`` if no Diameter peer is
+    ///     connected or the request failed.
+    ///
+    /// Raises:
+    ///     ValueError: neither ``user_name`` nor ``public_identity`` is
+    ///         given, ``authorization`` is not 30 octets, or ``scheme`` is
+    ///         empty.
+    ///
+    /// **Awaitable**: returns a coroutine, so `await` it. The request runs on
+    /// tokio rather than on the calling thread, which for an `async def` handler
+    /// is the asyncio driver its whole loop shares.
+    #[pyo3(signature = (user_name=None, authorization=None, scheme=None, public_identity=None, guss_timestamp=None))]
+    fn zh_mar<'py>(
+        &self,
+        python: Python<'py>,
+        user_name: Option<&str>,
+        authorization: Option<Vec<u8>>,
+        scheme: Option<&str>,
+        public_identity: Option<&str>,
+        guss_timestamp: Option<u64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let arguments = super::diameter_gba::ZhMarArguments::new(
+            user_name,
+            authorization,
+            scheme,
+            public_identity,
+            guss_timestamp,
+        )?;
+        let client = match self
+            .manager
+            .route_client(&crate::config::DiameterApplication::Zh, None)
+        {
+            Some(client) => client,
+            None => {
+                warn!("zh_mar: no Diameter peer connected");
+                return crate::script::ready(python, None::<Py<PyDict>>);
+            }
+        };
+
+        crate::script::awaitable(python, async move {
+            match client.send_zh_mar(&arguments.request()).await {
+                Ok(message) => Python::attach(|python| {
+                    super::diameter_gba::zh_mar_answer_dict(python, &message).map(Some)
+                }),
+                Err(error) => {
+                    warn!(error = %error, "zh_mar failed");
+                    Ok(None)
+                }
+            }
+        })
+    }
+
+    /// Send a Zn Bootstrapping-Info-Request to the BSF (GBA, TS 29.109).
+    ///
+    /// What a Network Application Function asks for the key material of a
+    /// bootstrapping transaction (clause 5.2). It goes to the peer the ``zn``
+    /// route names.
+    ///
+    /// Args:
+    ///     transaction_identifier: The B-TID the terminal presented (str or
+    ///         bytes), sent as Transaction-Identifier.
+    ///     naf_id: The NAF-Id (bytes): the FQDN of the NAF as the terminal
+    ///         used it, followed by the five octets of the Ua security
+    ///         protocol identifier (TS 33.220 annex H).
+    ///     gaa_service_identifiers: The services the settings are asked for
+    ///         (a list of str or bytes), one GAA-Service-Identifier each.
+    ///     gba_u_aware: GBA_U-Awareness-Indicator. Leave it out and the AVP
+    ///         is not sent, which means not aware.
+    ///     destination_realm: The realm of the subscriber's BSF, which is
+    ///         the part of the B-TID after the ``@``. Defaults to the peer's.
+    ///     destination_host: Destination-Host. Defaults to the peer's.
+    ///
+    /// Returns:
+    ///     Dict with ``result_code`` and ``experimental_result_code`` as
+    ///     ``zh_mar`` gives them (5403 is
+    ///     DIAMETER_ERROR_TRANSACTION_IDENTIFIER_INVALID, 5402
+    ///     DIAMETER_ERROR_NOT_AUTHORIZED), ``user_name`` (str),
+    ///     ``me_key_material`` and ``uicc_key_material`` (bytes),
+    ///     ``key_expiry_time`` and ``bootstrap_info_creation_time`` (int,
+    ///     Unix seconds), ``user_sec_settings`` (str, the selected USSs as
+    ///     XML) and ``gba_type`` (int; without it the type is 0, 3G GBA).
+    ///     A key whose AVP the BSF did not send is None. ``None`` if no
+    ///     Diameter peer is connected or the request failed.
+    ///
+    /// Raises:
+    ///     ValueError: ``transaction_identifier`` or ``naf_id`` is empty.
+    ///
+    /// **Awaitable**: returns a coroutine, so `await` it. The request runs on
+    /// tokio rather than on the calling thread, which for an `async def` handler
+    /// is the asyncio driver its whole loop shares.
+    #[pyo3(signature = (transaction_identifier, naf_id, gaa_service_identifiers=None, gba_u_aware=None, destination_realm=None, destination_host=None))]
+    fn zn_bir<'py>(
+        &self,
+        python: Python<'py>,
+        transaction_identifier: &Bound<'py, PyAny>,
+        naf_id: &Bound<'py, PyAny>,
+        gaa_service_identifiers: Option<Vec<Bound<'py, PyAny>>>,
+        gba_u_aware: Option<bool>,
+        destination_realm: Option<&str>,
+        destination_host: Option<&str>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        use super::diameter_gba::octets;
+        let services = gaa_service_identifiers
+            .unwrap_or_default()
+            .iter()
+            .map(|service| octets("gaa_service_identifiers", service))
+            .collect::<PyResult<Vec<_>>>()?;
+        let arguments = super::diameter_gba::ZnBirArguments::new(
+            octets("transaction_identifier", transaction_identifier)?,
+            octets("naf_id", naf_id)?,
+            services,
+            gba_u_aware,
+            destination_realm,
+            destination_host,
+        )?;
+        let client = match self
+            .manager
+            .route_client(&crate::config::DiameterApplication::Zn, None)
+        {
+            Some(client) => client,
+            None => {
+                warn!("zn_bir: no Diameter peer connected");
+                return crate::script::ready(python, None::<Py<PyDict>>);
+            }
+        };
+
+        crate::script::awaitable(python, async move {
+            match client.send_zn_bir(&arguments.request()).await {
+                Ok(message) => Python::attach(|python| {
+                    super::diameter_gba::zn_bir_answer_dict(python, &message).map(Some)
+                }),
+                Err(error) => {
+                    warn!(error = %error, "zn_bir failed");
                     Ok(None)
                 }
             }
@@ -2331,8 +2499,13 @@ impl PyDiameter {
     ///           Unsigned32 / Enumerated       → ``int``
     ///           Unsigned64                    → ``int``
     ///           Address (IPv4)                → ``str`` (dotted-quad)
-    ///         Grouped AVPs are not supported via kwargs — use the
-    ///         typed helper for those commands.
+    ///           Time                          → ``int`` (Unix seconds)
+    ///           Grouped                       → ``dict`` of its members,
+    ///             keyed and typed by these same rules and sent in the
+    ///             dict's order; a member may itself be a ``dict``.
+    ///             ``None`` sends the group empty.
+    ///         An AVP can be given once: a command that repeats one at the
+    ///         top level needs its typed helper.
     ///     peer: Optional peer name override (defaults to any
     ///         connected peer for the application).
     ///     timeout_ms: Per-request timeout (default 10000ms — the same
@@ -3470,149 +3643,6 @@ impl PyDiameter {
                 }
             }
         })
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Generic AVP encoding from Python kwargs
-// ---------------------------------------------------------------------------
-
-/// Encode a single AVP value (Python object → wire bytes) using the
-/// AVP's declared type from the dictionary. Picks the 3GPP-flagged
-/// encoder when the AVP is vendor-specific, the base encoder otherwise.
-fn encode_kwarg_avp(def: &AvpDef, value: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
-    let is_vendor = def.is_vendor_specific();
-    match def.data_type {
-        AvpType::UTF8String | AvpType::DiameterIdentity => {
-            let s: String = value.extract().map_err(|error| {
-                pyo3::exceptions::PyTypeError::new_err(format!(
-                    "{} expects str, got {error}",
-                    def.name
-                ))
-            })?;
-            Ok(if is_vendor {
-                encode_avp_utf8_3gpp(def.code, &s)
-            } else {
-                encode_avp_utf8(def.code, &s)
-            })
-        }
-        AvpType::OctetString => {
-            // Accept bytes directly (raw payload, e.g. SM-RP-UI TPDU)
-            // or str (encoded as UTF-8, e.g. MSISDN, SC-Address).
-            let bytes: Vec<u8> = if let Ok(b) = value.extract::<Vec<u8>>() {
-                b
-            } else if let Ok(s) = value.extract::<String>() {
-                s.into_bytes()
-            } else {
-                return Err(pyo3::exceptions::PyTypeError::new_err(format!(
-                    "{} expects bytes or str",
-                    def.name
-                )));
-            };
-            Ok(if is_vendor {
-                encode_avp_octet_3gpp(def.code, &bytes)
-            } else {
-                encode_avp_octet(def.code, &bytes)
-            })
-        }
-        AvpType::ISDNAddressString => {
-            // A str is an E.164 digit string → TBCD-encode with the
-            // international ToN/NPI byte (TS 29.002 §17.7.8). This is the fix
-            // for the MSISDN/SC-Address/SGSN-Number/MME-Number-for-MT-SMS
-            // encoding bug — the OctetString path used to ship raw ASCII.
-            // Bytes are taken as already-encoded ISDN-AddressString octets.
-            let bytes = if let Ok(digits) = value.extract::<String>() {
-                crate::diameter::codec::encode_isdn_address_string(
-                    &digits,
-                    crate::diameter::codec::TON_NPI_INTERNATIONAL_E164,
-                )
-            } else if let Ok(raw) = value.extract::<Vec<u8>>() {
-                raw
-            } else {
-                return Err(pyo3::exceptions::PyTypeError::new_err(format!(
-                    "{} expects str (E.164 digits) or bytes",
-                    def.name
-                )));
-            };
-            Ok(if is_vendor {
-                encode_avp_octet_3gpp(def.code, &bytes)
-            } else {
-                encode_avp_octet(def.code, &bytes)
-            })
-        }
-        AvpType::Unsigned32 | AvpType::Enumerated => {
-            let n: u32 = value.extract().map_err(|error| {
-                pyo3::exceptions::PyTypeError::new_err(format!(
-                    "{} expects int (u32 range), got {error}",
-                    def.name
-                ))
-            })?;
-            Ok(if is_vendor {
-                encode_avp_u32_3gpp(def.code, n)
-            } else {
-                encode_avp_u32(def.code, n)
-            })
-        }
-        AvpType::Unsigned64 => {
-            let n: u64 = value.extract().map_err(|error| {
-                pyo3::exceptions::PyTypeError::new_err(format!(
-                    "{} expects int (u64 range), got {error}",
-                    def.name
-                ))
-            })?;
-            // No vendor variant in the codec for u64 — only one Unsigned64
-            // 3GPP AVP exists in the dictionary today (CC-Sub-Session-Id).
-            // Treat as plain u64 with vendor flag handled by encode_avp.
-            Ok(encode_avp_u64(def.code, n))
-        }
-        AvpType::Integer32 => {
-            let n: i32 = value.extract().map_err(|error| {
-                pyo3::exceptions::PyTypeError::new_err(format!(
-                    "{} expects int (i32 range), got {error}",
-                    def.name
-                ))
-            })?;
-            Ok(crate::diameter::codec::encode_avp_i32_3gpp(def.code, n))
-        }
-        AvpType::Address => {
-            let s: String = value.extract().map_err(|error| {
-                pyo3::exceptions::PyTypeError::new_err(format!(
-                    "{} expects str (IPv4 dotted-quad), got {error}",
-                    def.name
-                ))
-            })?;
-            let ip: std::net::Ipv4Addr = s.parse().map_err(|error| {
-                pyo3::exceptions::PyValueError::new_err(format!(
-                    "{} invalid IPv4 address {s:?}: {error}",
-                    def.name
-                ))
-            })?;
-            Ok(encode_avp_address_ipv4(def.code, ip))
-        }
-        AvpType::Time => Err(pyo3::exceptions::PyTypeError::new_err(format!(
-            "{} (Time AVPs) is not supported via kwargs — use a typed helper",
-            def.name
-        ))),
-        AvpType::Grouped => {
-            // Allow an empty grouped marker by passing None — useful for
-            // a few AVPs that act as flags. Real grouped encoding (sub-AVPs
-            // from a nested dict) is deferred until an actual use case
-            // shows up; today scripts that need grouped AVPs use the
-            // typed helpers.
-            if value.is_none() {
-                Ok(if is_vendor {
-                    encode_avp_grouped_3gpp(def.code, &[])
-                } else {
-                    encode_avp_grouped(def.code, &[])
-                })
-            } else {
-                Err(pyo3::exceptions::PyTypeError::new_err(format!(
-                    "{} (Grouped AVP) requires a typed helper — \
-                     scripted nested-AVP construction is not yet supported",
-                    def.name
-                )))
-            }
-        }
     }
 }
 
@@ -4859,21 +4889,6 @@ mod tests {
             let value = pyo3::types::PyBytes::new(python, &[0xDE, 0xAD, 0xBE, 0xEF]);
             let encoded = encode_kwarg_avp(avp_def, value.as_any()).unwrap();
             assert!(!encoded.is_empty());
-        });
-    }
-
-    #[test]
-    fn encode_kwarg_avp_rejects_grouped_with_value() {
-        pyo3::Python::initialize();
-        let avp_def =
-            crate::diameter::dictionary::lookup_avp_by_python_name("smsmi_correlation_id")
-                .expect("smsmi_correlation_id must resolve");
-        pyo3::Python::attach(|python| {
-            let value = "anything".into_pyobject(python).unwrap();
-            let result = encode_kwarg_avp(avp_def, value.as_any());
-            let error = result.expect_err("grouped AVP must reject scalar value");
-            let msg = format!("{error}");
-            assert!(msg.contains("Grouped AVP"), "msg: {msg}");
         });
     }
 

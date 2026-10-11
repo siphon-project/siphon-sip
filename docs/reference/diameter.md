@@ -51,11 +51,14 @@ They are case-insensitive in a script and lowercase in `siphon.yaml`.
 | `S6a` | 16777251 | 10415 | TS 29.272 |
 | `S6c` | 16777312 | 10415 | TS 29.338 |
 | `SGd` | 16777313 | 10415 | TS 29.338 |
+| `Zh` | 16777221 | 10415 | TS 29.109 |
+| `Zn` | 16777220 | 10415 | TS 29.109 |
 | `Ro` | 4 | none | RFC 8506, TS 32.299 |
 | `Rf` | 3 | none | RFC 6733, TS 32.299 |
 
 Some command codes belong to more than one application: Credit-Control (272)
-is both Ro and Gx, Re-Auth (258) both Rx and Gx. A bare `"CCR"` filter matches
+is both Ro and Gx, Re-Auth (258) both Rx and Gx, Multimedia-Auth (303) both Cx
+and Zh. A bare `"CCR"` filter matches
 the command on any application; `"Gx:CCR"` and `"Ro:CCR"` match only their own
 Application-Id, so one script can serve both without either handler seeing the
 other's requests.
@@ -98,7 +101,7 @@ diameter:
     tcp: "0.0.0.0:3868"
   origin_host: "hss.epc.mnc001.mcc001.3gppnetwork.org"
   origin_realm: "epc.mnc001.mcc001.3gppnetwork.org"
-  applications: [s6a, cx]      # cx, sh, rx, gx, ro, rf, s6a, s6c, sgd, or relay
+  applications: [s6a, cx]      # cx, sh, rx, gx, ro, rf, s6a, s6c, sgd, zh, zn, or relay
   clients:
     - name: mme
       allowed_ips: ["192.0.2.0/24"]
@@ -204,6 +207,151 @@ whenever the S-CSCF has it.
 ```python
 await diameter.cx_sar(public_identity, SCSCF_URI, 1, user_name=request.auth_user)
 ```
+
+## GBA: Zh and Zn
+
+The Generic Bootstrapping Architecture (TS 33.220) has two Diameter reference
+points, both in TS 29.109. On **Zh** a Bootstrapping Server Function asks the
+HSS for one authentication vector and the user's GBA security settings (the
+GUSS). On **Zn** a Network Application Function asks the BSF for the key
+material of a bootstrapping transaction.
+
+```yaml
+diameter:
+  origin_host: "bsf.mnc001.mcc001.pub.3gppnetwork.org"
+  origin_realm: "mnc001.mcc001.pub.3gppnetwork.org"
+  peers:
+    - name: hss1
+      host: "192.0.2.10"
+      destination_realm: "ims.mnc001.mcc001.3gppnetwork.org"
+  routes:
+    - application: zh          # advertised to hss1 in the CER
+      peers: [hss1]
+```
+
+### Zh: the BSF asks the HSS
+
+Zh uses the Cx command, Multimedia-Auth (303), on its own application
+(16777221). The request has no Server-Name and no SIP-Number-Auth-Items, so the
+HSS does not run its Cx procedure and stores no S-CSCF name. Do not send a Cx
+MAR in its place.
+
+```python
+from siphon import diameter
+
+answer = await diameter.zh_mar(impi)
+if answer is None:
+    ...                                    # no zh peer, or no answer in time
+elif answer["experimental_result_code"] == 5401:
+    ...                                    # DIAMETER_ERROR_IDENTITY_UNKNOWN
+else:
+    vector = answer["auth_items"][0]       # the HSS provides one
+    rand, autn = vector["authenticate"][:16], vector["authenticate"][16:]
+    xres = vector["authorization"]
+    ck, ik = vector["confidentiality_key"], vector["integrity_key"]
+    guss = answer["guss"]                  # the GBA-UserSecSettings XML, or None
+
+# After a synchronisation failure: RAND as sent, then the AUTS of the terminal.
+answer = await diameter.zh_mar(impi, authorization=rand + auts)
+```
+
+For IMS AKA the request carries no `SIP-Auth-Data-Item`: TS 29.109 clause 4.2
+defines its absence as `Digest-AKAv1-MD5` and advises against sending it.
+`authorization=` (30 octets, TS 29.229 clause 6.3.11) adds the item with
+`SIP-Authorization`, `scheme=` names another scheme, and `guss_timestamp=`
+(Unix seconds) sends the timestamp of the GUSS already held, to which the HSS
+answers `guss` `"GUSS TIMESTAMP EQUAL"` when nothing changed.
+`GUSS-Timestamp` goes out without the M bit, as Table 6.1 of TS 29.109
+requires; every other GBA AVP carries it.
+
+### A Grouped AVP through `send_request`
+
+`diameter.send_request` takes a Grouped AVP as a `dict` of its members, each
+keyed and typed like a top-level keyword, in the order of the `dict`. A member
+can be a `dict` itself. A Time AVP takes Unix seconds. The Zh request above,
+in the generic form:
+
+```python
+answer = await diameter.send_request(
+    "Multimedia-Auth-Request", "Zh",
+    user_name=impi,
+    sip_auth_data_item={
+        "sip_authentication_scheme": "Digest-AKAv1-MD5",
+        "sip_authorization": rand + auts,          # bytes
+    })
+guss_hex = answer.get("gba_usersecsettings")       # an OctetString reads as hex
+```
+
+A member name the dictionary does not know raises `ValueError` naming the
+group and the member. A keyword gives an AVP once, so a command that repeats
+an AVP at the top level (several `GAA-Service-Identifier`) needs its typed
+call. With `peer=None` the generic call takes any connected peer, not the one
+the application's route names: pass `peer=` on a node with more than one.
+
+### Zn: the NAF asks the BSF
+
+```python
+answer = await diameter.zn_bir(
+    b_tid, naf_fqdn.encode() + ua_security_protocol_id,      # NAF-Id, bytes
+    gaa_service_identifiers=["1"],
+    destination_realm=b_tid.split("@", 1)[1])                # the BSF of the B-TID
+if answer and answer["result_code"] == 2001:
+    ks_naf = answer["me_key_material"]
+    expires = answer["key_expiry_time"]                      # Unix seconds
+elif answer and answer["experimental_result_code"] == 5403:
+    ...   # DIAMETER_ERROR_TRANSACTION_IDENTIFIER_INVALID: bootstrap again
+```
+
+### Zn: the BSF answers
+
+A BSF serves Zn with `@diameter.on_request("Zn:BIR")`, which also makes the
+node advertise Zn in its CEA. The handler reads the request with `get_avp`
+and builds the answer with `set_avp`. A Time AVP is set from Unix seconds.
+
+TS 29.109 clause 6.2 puts its own result codes (5401, 5402, 5403) "inside an
+Experimental-Result AVP and Result-Code AVP shall be absent". Start from
+`request.answer(2001)`, which does not set the error bit, remove the
+Result-Code and set the group:
+
+```python
+TGPP = 10415
+
+@diameter.on_request("Zn:BIR")
+def bootstrapping_info(request):
+    b_tid = request.get_avp("Transaction-Identifier")        # bytes
+    naf_id = request.get_avp("NAF-Id")                       # bytes
+    services = [value for code, vendor, value in request.iter_avps()
+                if (code, vendor) == (403, TGPP)]            # GAA-Service-Identifier
+    gba_u_aware = request.get_avp("GBA_U-Awareness-Indicator") == 1
+
+    answer = request.answer(2001)
+    answer.set_avp("Vendor-Specific-Application-Id",
+                   [("Vendor-Id", TGPP), ("Auth-Application-Id", 16777220)])
+    answer.set_avp("Auth-Session-State", 1)                  # NO_STATE_MAINTAINED
+
+    session = sessions.get(b_tid)
+    if session is None:
+        answer.remove_avp("Result-Code")
+        answer.set_avp("Experimental-Result",
+                       [("Vendor-Id", TGPP), ("Experimental-Result-Code", 5403)])
+        return answer
+
+    answer.set_avp("ME-Key-Material", session.ks_naf(naf_id))
+    answer.set_avp("Key-ExpiryTime", session.expires)        # Unix seconds
+    answer.set_avp("BootstrapInfoCreationTime", session.created)
+    answer.set_avp("GBA-UserSecSettings", session.uss_list(services))
+    return answer
+```
+
+siphon carries the messages and knows the AVPs. The key derivation of
+TS 33.220, the store of bootstrapping transactions and the authorisation of a
+NAF are the script's.
+
+Every message above is checked against Wireshark's Diameter dissector with
+`scripts/validate_diameter_gba.sh`: the application id and command code, each
+AVP's code, vendor and flags, and that nothing is malformed or unknown.
+Wireshark's dictionary names AVP 402 `NAF-Hostname`; TS 29.109 names it
+`NAF-Id`, and so does siphon. Not tested against an HSS.
 
 ## Rx: QoS and bearer events
 

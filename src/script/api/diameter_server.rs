@@ -11,7 +11,9 @@
 //!   - [`PyInboundPeer`] — the authenticated sender's identity (`req.peer`).
 //!
 //! AVP values round-trip per dictionary type: text → `str`, Unsigned32/
-//! Enumerated/Integer32/Unsigned64 → `int`, everything else → `bytes`.
+//! Enumerated/Integer32/Unsigned64 → `int`, everything else → `bytes`. A Time
+//! AVP reads as its four octets and is set from those or from an `int` of
+//! Unix seconds.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -129,8 +131,16 @@ fn py_to_avp_raw(code: u32, vendor: u32, value: &Bound<'_, PyAny>) -> PyResult<V
                 Ok(bytes)
             }
         }
+        Some(AvpType::Time) if value.is_instance_of::<pyo3::types::PyInt>() => {
+            // Unix seconds, written as seconds since 1900 (RFC 6733 clause
+            // 4.3.1). The four octets themselves are taken below, as before.
+            let unix_seconds: u64 = value.extract()?;
+            let seconds = unix_seconds.wrapping_add(crate::diameter::codec::NTP_UNIX_EPOCH_OFFSET)
+                & 0xFFFF_FFFF;
+            Ok((seconds as u32).to_be_bytes().to_vec())
+        }
         _ => {
-            // OctetString / Address / unknown: accept bytes or str.
+            // OctetString / Address / Time / unknown: accept bytes or str.
             if let Ok(bytes) = value.extract::<Vec<u8>>() {
                 Ok(bytes)
             } else {
@@ -300,7 +310,11 @@ fn build_avp(code: u32, vendor: u32, value: &Bound<'_, PyAny>) -> PyResult<Avp> 
         });
     }
     let raw = py_to_avp_raw(code, vendor, value)?;
-    Ok(Avp::raw(code, vendor, raw))
+    let mut avp = Avp::raw(code, vendor, raw);
+    if !dictionary::avp_is_mandatory(code, vendor) {
+        avp.flags &= !crate::diameter::codec::AVP_FLAG_MANDATORY;
+    }
+    Ok(avp)
 }
 
 /// Parse one grouped child spec — a `(code_or_name, value)` or
@@ -991,6 +1005,54 @@ mod tests {
                 .unwrap();
             let list = read.cast::<PyList>().unwrap();
             assert_eq!(list.len(), 1); // one E-UTRAN-Vector child
+        });
+    }
+
+    #[test]
+    fn a_time_avp_is_set_from_unix_seconds_or_from_its_four_octets() {
+        pyo3::Python::initialize();
+        Python::attach(|py| {
+            let answer = py_request().answer(2001, None).unwrap();
+            // Key-ExpiryTime (TS 29.109 clause 6.3.1.5), 2026-01-01T01:00:00Z.
+            // On the wire a Time is seconds since 1900 (RFC 6733 clause 4.3.1).
+            let name = "Key-ExpiryTime".into_pyobject(py).unwrap().into_any();
+            let seconds = 1_767_229_200u64.into_pyobject(py).unwrap().into_any();
+            answer.set_avp(&name, &seconds, 0).unwrap();
+            let read = |answer: &PyDiameterAnswer| {
+                let message = answer.msg.lock().unwrap();
+                let avp = message.find(404, 10415).expect("Key-ExpiryTime").clone();
+                (avp.flags, avp.raw_bytes().map(<[u8]>::to_vec))
+            };
+            assert_eq!(read(&answer), (0xc0, Some(vec![0xed, 0x00, 0x45, 0x90])));
+
+            // The octets themselves, as before.
+            let octets = PyBytes::new(py, &[0xed, 0x00, 0x37, 0x80]).into_any();
+            answer.set_avp(&name, &octets, 0).unwrap();
+            assert_eq!(read(&answer), (0xc0, Some(vec![0xed, 0x00, 0x37, 0x80])));
+        });
+    }
+
+    #[test]
+    fn an_avp_whose_specification_forbids_the_m_bit_is_built_without_it() {
+        pyo3::Python::initialize();
+        Python::attach(|py| {
+            // GUSS-Timestamp: "V" under Must, "M" under Must not (TS 29.109
+            // Table 6.1).
+            let answer = py_request().answer(2001, None).unwrap();
+            let name = "GUSS-Timestamp".into_pyobject(py).unwrap().into_any();
+            let seconds = 1_767_225_600u64.into_pyobject(py).unwrap().into_any();
+            answer.set_avp(&name, &seconds, 0).unwrap();
+            let message = answer.msg.lock().unwrap();
+            let avp = message.find(409, 10415).expect("GUSS-Timestamp");
+            assert_eq!(avp.flags, 0x80);
+            assert_eq!(avp.raw_bytes(), Some(&[0xed, 0x00, 0x37, 0x80][..]));
+            // Every other AVP keeps the M bit.
+            drop(message);
+            let name = "GBA-Type".into_pyobject(py).unwrap().into_any();
+            let value = 1u32.into_pyobject(py).unwrap().into_any();
+            answer.set_avp(&name, &value, 0).unwrap();
+            let message = answer.msg.lock().unwrap();
+            assert_eq!(message.find(410, 10415).expect("GBA-Type").flags, 0xc0);
         });
     }
 

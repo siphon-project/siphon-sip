@@ -44,6 +44,7 @@ NAMESPACE_AWAITABLE = {
         "rf_acr_start", "rf_acr_interim", "rf_acr_stop", "rf_acr_event",
         "s6a_air", "s6a_ulr", "s6a_purge_ue",
         "s6c_srr", "s6c_rsr", "sgd_tfr",
+        "zh_mar", "zn_bir",
         "send_request",
     },
     "auth": {

@@ -1972,7 +1972,8 @@ auth:
 #
 # Supported applications: cx (HSS auth/reg), sh (HSS user data),
 #   ro (online charging), rf (offline charging), rx (QoS policy),
-#   gx (policy and charging control).
+#   gx (policy and charging control), zh (GBA, BSF to HSS),
+#   zn (GBA, NAF to BSF).
 #
 # diameter:
 #   origin_host: "siphon.ims.example.com"
