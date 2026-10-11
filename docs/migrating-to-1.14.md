@@ -53,6 +53,8 @@ Only relevant when you link `siphon-sip` as a crate.
 | Nbsf discovery, IPv6 | `ipv6Prefix=<address>/64` | `ipv6Prefix=<address>/128` |
 | Nbsf discovery, answer 204 | raised `sbi.BsfError` | no binding (`None`), as for 404 |
 | Cx MAR of `auth.require_ims_digest`, `Public-Identity` | URI of P-Asserted-Identity, else of From | URI of the To header, per TS 24.229 clause 5.4.1.2.1 |
+| Outbound TCP connection with a request pending on it | closed after 30 s of silence | kept until the client transaction ends, then closed after 30 s of silence |
+| Response whose TCP or TLS connection has closed | new connection to the source port of the request | new connection to the port in the `sent-by` of the Via (5060, or 5061 for TLS, when it has none), per RFC 3261 clause 18.2.2 |
 
 The flow descriptions are the one to test against the policy function in use.
 One that follows the specification built its packet filters reversed with the
@@ -70,3 +72,12 @@ under that other identity and now goes under the one being registered.
 has no `SIP-Authenticate`, no `SIP-Authorization` or no item at all. Each used
 to become a 401, the last three with a nonce made up by siphon, which no UE
 can answer.
+
+Outbound TCP connections now stay open while a call relayed over them rings,
+and through any other request that is still waiting for its final response.
+Expect more of them open at once than before on a proxy whose calls ring for
+longer than 30 seconds: one per next hop, since requests to one destination
+share a connection. A firewall or load balancer between two nodes has to let a
+node open a TCP or TLS connection to the port its peer writes in its Via, which
+is the port that peer listens on. That is where a late response goes when the
+connection its request came on has been closed in the meantime.

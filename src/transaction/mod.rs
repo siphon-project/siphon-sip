@@ -17,6 +17,8 @@ pub mod timer;
 #[cfg(test)]
 mod cancel_tests;
 #[cfg(test)]
+mod connection_hold_tests;
+#[cfg(test)]
 mod timer_c_tests;
 
 use bytes::Bytes;
@@ -443,6 +445,27 @@ impl TransactionManager {
         if let Some(mut entry) = self.transactions.get_mut(key) {
             if let Transaction::Ict(ict) = &mut **entry {
                 ict.set_connection(connection_id);
+            }
+        }
+    }
+
+    /// Keep the connection the request of client transaction `key` left on
+    /// from being closed for idleness, for as long as the transaction lives.
+    ///
+    /// The hold is stored in the transaction, so it is released by whatever
+    /// removes that: its final response, Timer B, F or D, or
+    /// [`Self::remove`]. A key with no client transaction (it has already
+    /// ended) drops the hold here, which releases it at once.
+    pub fn hold_client_connection(
+        &self,
+        key: &TransactionKey,
+        hold: crate::transport::hold::ConnectionHold,
+    ) {
+        if let Some(mut entry) = self.transactions.get_mut(key) {
+            match &mut **entry {
+                Transaction::Ict(ict) => ict.hold_connection(hold),
+                Transaction::Nict(nict) => nict.hold_connection(hold),
+                Transaction::Ist(_) | Transaction::Nist(_) => {}
             }
         }
     }

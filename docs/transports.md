@@ -181,6 +181,36 @@ and a task held for the whole handshake timeout. See
 [Hardening & security](cookbook/security.md#bounding-what-one-source-can-spend),
 including the note on carrier NAT and `max_connections_per_source`.
 
+### How long a connection stays open
+
+An inbound TCP, TLS, WS or WSS connection is closed after 300 s in which the
+peer sent nothing. An outbound TCP connection, which siphon opens to relay a
+request and then reuses for every request to the same destination, is closed
+after 30 s in which the peer sent nothing, with two exceptions:
+
+- **A request is still waiting for its final response.** A call relayed over
+  the connection keeps it open while the callee rings, and so does any other
+  request the proxy relayed until its transaction ends. The response is owed on
+  the connection the request arrived on (RFC 3261 §18.2.2), so the connection
+  outlasts the transaction and idles out 30 s after the last one has ended. A
+  call that has been answered no longer holds it: a later request in the dialog
+  reuses the connection if it is still there and opens a new one if not.
+- **The destination is a registrar siphon is registered with** (`registrant:`),
+  for as long as the trunk is configured.
+
+Neither exception stops siphon noticing a dead peer: a connection is dropped
+as soon as the peer closes it, a read or write fails, or the socket keepalive
+gives up. An outbound TLS connection has no idle timeout at all.
+
+When a response has to be sent and the connection its request arrived on has
+closed, siphon opens a new connection for it: to the address the request came
+from, at the port in the `sent-by` of the request's top Via, or at 5060 (5061
+for TLS) when the `sent-by` names no port. That is the port the peer listens
+on. The source port of the closed connection is never used, and neither is the
+value of `rport`, which only means something for UDP. A WebSocket connection
+can only be opened by the client, so a response for one that has closed is
+dropped and logged.
+
 ### Per-domain certificates (inbound SNI)
 
 One listener can serve a different certificate per server name, selected from

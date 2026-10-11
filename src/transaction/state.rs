@@ -552,6 +552,9 @@ pub struct Nict {
     pub request_bytes: Bytes,
     /// Current Timer E interval.
     pub timer_e_interval: Duration,
+    /// Keeps the connection the request left on from being closed for
+    /// idleness while this transaction lives: see [`Ict::hold_connection`].
+    connection_hold: Option<crate::transport::hold::ConnectionHold>,
 }
 
 impl Nict {
@@ -573,6 +576,7 @@ impl Nict {
             timers,
             request_bytes,
             timer_e_interval,
+            connection_hold: None,
         };
         // Start Timer F (overall timeout)
         actions.push(Action::StartTimer(TimerName::F, nict.timers.timer_f()));
@@ -581,6 +585,12 @@ impl Nict {
             actions.push(Action::StartTimer(TimerName::E, timer_e_interval));
         }
         (nict, actions)
+    }
+
+    /// Keep the connection the request left on open until this transaction
+    /// is dropped: see [`Ict::hold_connection`].
+    pub fn hold_connection(&mut self, hold: crate::transport::hold::ConnectionHold) {
+        self.connection_hold = Some(hold);
     }
 
     pub fn process(&mut self, event: NictEvent) -> Vec<Action> {
@@ -829,6 +839,9 @@ pub struct Ict {
     last_progress: Option<std::time::Instant>,
     /// Where Timer C stands.
     timer_c: TimerCProgress,
+    /// Keeps the connection the INVITE left on from being closed for idleness
+    /// while this transaction lives: see [`Self::hold_connection`].
+    connection_hold: Option<crate::transport::hold::ConnectionHold>,
 }
 
 impl Ict {
@@ -854,6 +867,7 @@ impl Ict {
             hop: None,
             last_progress: None,
             timer_c: TimerCProgress::Idle,
+            connection_hold: None,
         };
         // Start Timer B (overall timeout)
         actions.push(Action::StartTimer(TimerName::B, ict.timers.timer_b()));
@@ -959,6 +973,19 @@ impl Ict {
         if let Some(hop) = self.hop.as_mut() {
             hop.connection_id = connection_id;
         }
+    }
+
+    /// Keep the connection the INVITE left on open until this transaction is
+    /// dropped.
+    ///
+    /// The response is owed on that connection (RFC 3261 §18.2.2), and a
+    /// connection with nothing but a ringing callee on it is silent for as
+    /// long as the callee rings. The hold ends with the transaction, which is
+    /// after the final response and, for a failure, after the ACK this
+    /// transaction sends for it (§17.1.1.3) has been handed to that same
+    /// connection. The ACK of a 2xx is the TU's and a request of its own.
+    pub fn hold_connection(&mut self, hold: crate::transport::hold::ConnectionHold) {
+        self.connection_hold = Some(hold);
     }
 
     /// The TU wants this INVITE cancelled. `reasons` are `Reason` header field

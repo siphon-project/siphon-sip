@@ -9,6 +9,8 @@
 //!   - Each pooled connection has a read task that feeds responses back to the inbound channel
 //!   - Idle connections are closed after [`POOL_IDLE_TIMEOUT`], except to a
 //!     destination named in [`ConnectionPool::set_idle_exempt_destinations`]
+//!     and except while a client transaction is pending on the connection
+//!     ([`ConnectionPool::hold`])
 //!   - Connections are removed on error and recreated on next use
 
 use std::collections::HashSet;
@@ -27,6 +29,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::config::TlsMethod;
 use crate::transport::crlf_keepalive::{drain_leading_crlf_keepalives, CrlfPongTracker};
+use crate::transport::hold::{ConnectionHold, ConnectionHolds};
 use crate::transport::tcp::{frame_sip_message, FrameVerdict};
 use crate::transport::{
     configure_tcp_socket, next_connection_id, ConnectionId, InboundMessage, StreamConnections,
@@ -42,6 +45,11 @@ use crate::transport::{
 ///
 /// A destination siphon holds a *standing* relationship with is exempt via
 /// [`ConnectionPool::set_idle_exempt_destinations`] — see the rationale there.
+///
+/// Silent is not the same as done. A connection a client transaction is still
+/// pending on (an INVITE whose callee is ringing) is kept through any amount of
+/// silence, because the response is owed on it (RFC 3261 §18.2.2): see
+/// [`ConnectionPool::hold`].
 const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Fail-fast timeout for outbound TCP/TLS connection establishment.
@@ -152,6 +160,9 @@ pub struct ConnectionPool {
     /// [`idle_timeout`](Self::idle_timeout) — see
     /// [`set_idle_exempt_destinations`](Self::set_idle_exempt_destinations).
     idle_exempt: Arc<DashMap<(SocketAddr, Transport), ()>>,
+    /// Connections a client transaction is pending on, which the idle timeout
+    /// leaves alone until the transaction ends: see [`hold`](Self::hold).
+    holds: ConnectionHolds,
 }
 
 /// A client identity siphon presents on OUTBOUND TLS connections when the
@@ -434,6 +445,7 @@ impl ConnectionPool {
             enqueue_timeout: ENQUEUE_TIMEOUT,
             idle_timeout: POOL_IDLE_TIMEOUT,
             idle_exempt: Arc::new(DashMap::new()),
+            holds: ConnectionHolds::new(),
         }
     }
 
@@ -706,6 +718,7 @@ impl ConnectionPool {
         let crlf_pong_tracker = self.crlf_pong_tracker.clone();
         let idle_timeout = self.idle_timeout;
         let idle_exempt = Arc::clone(&self.idle_exempt);
+        let holds = self.holds.clone();
         tokio::spawn(async move {
             let mut accumulator = BytesMut::with_capacity(65536);
             let mut read_buf = [0u8; 8192];
@@ -797,6 +810,19 @@ impl ConnectionPool {
                                 destination = %destination,
                                 idle = ?idle_timeout,
                                 "pool: TCP connection idle but kept open (exempt destination)"
+                            );
+                            continue;
+                        }
+                        // A client transaction is still pending on this
+                        // connection, and its response is owed here (RFC 3261
+                        // §18.2.2).  The timer starts over, so the connection
+                        // goes one idle period after the last of them ends.
+                        if holds.is_held(connection_id) {
+                            debug!(
+                                connection_id = ?connection_id,
+                                destination = %destination,
+                                idle = ?idle_timeout,
+                                "pool: TCP connection idle but kept open (transaction pending)"
                             );
                             continue;
                         }
@@ -1267,6 +1293,33 @@ impl ConnectionPool {
     /// from the idle timeout.
     pub fn is_idle_exempt(&self, destination: SocketAddr, transport: Transport) -> bool {
         self.idle_exempt.contains_key(&(destination, transport))
+    }
+
+    /// Keep `connection_id` from being closed for idleness until the returned
+    /// hold is dropped.
+    ///
+    /// For a client transaction, taken on the connection its request left on
+    /// and kept for as long as the transaction lives. The response to that
+    /// request is owed on that connection (RFC 3261 §18.2.2), and a callee may
+    /// take longer to answer than the idle timeout: an INVITE that rings for
+    /// 35 s is silent for 35 s. The transaction layer's own timers (B, F, C)
+    /// bound how long a hold can last.
+    ///
+    /// Only the idle *timer* is suspended, as with an exempt destination: the
+    /// peer closing the connection, a read or write error and the socket's own
+    /// keepalive all still end it. A dialog is not a transaction, so a
+    /// connection that carried a call's INVITE idles out once the INVITE is
+    /// answered, and a later request in the dialog opens a new one.
+    ///
+    /// Only the pool's TCP connections have an idle timer. A hold on any other
+    /// connection is accepted and changes nothing.
+    pub fn hold(&self, connection_id: ConnectionId) -> ConnectionHold {
+        self.holds.hold(connection_id)
+    }
+
+    /// Whether a client transaction still holds `connection_id` open.
+    pub fn is_held(&self, connection_id: ConnectionId) -> bool {
+        self.holds.is_held(connection_id)
     }
 
     /// Size of the idle-exemption set, for the drains-to-baseline leak test.
@@ -2924,5 +2977,173 @@ mod tests {
             baseline,
             "the exemption set did not drain once no destination was exempt"
         );
+    }
+
+    // --- a pending client transaction keeps its connection ------------------
+
+    /// An INVITE over TCP as a relay puts it on the wire.
+    fn ringing_invite(branch: &str) -> crate::sip::message::SipMessage {
+        crate::sip::builder::SipMessageBuilder::new()
+            .request(
+                crate::sip::message::Method::Invite,
+                crate::sip::uri::SipUri::new("example.org".to_string())
+                    .with_user("callee".to_string()),
+            )
+            .via(format!("SIP/2.0/TCP 192.0.2.1:5060;branch={branch}"))
+            .to("<sip:callee@example.org>".to_string())
+            .from("<sip:caller@example.org>;tag=caller-tag".to_string())
+            .call_id(format!("{branch}@example.org"))
+            .cseq("1 INVITE".to_string())
+            .content_length(0)
+            .build()
+            .expect("the INVITE builds")
+    }
+
+    /// Wait for the pool to stop offering its default connection to
+    /// `destination`.
+    async fn until_closed(pool: &ConnectionPool, destination: SocketAddr, what: &str) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while pool.has_live(destination, Transport::Tcp) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{what}"));
+    }
+
+    /// A connection an INVITE client transaction is pending on survives the
+    /// idle timeout for as long as the callee rings, and is closed for idleness
+    /// like any other once the transaction has ended.
+    ///
+    /// Before: the reader closed it after the idle timeout whatever was pending
+    /// on it, so a call answered later than that had lost the connection its
+    /// 200 was owed on (RFC 3261 §18.2.2).
+    ///
+    /// The control connections carry nothing pending. Each one being reaped
+    /// proves a whole idle period went by, so the survivor is held rather than
+    /// not yet due.
+    #[tokio::test]
+    async fn a_connection_with_a_pending_invite_outlives_the_idle_timeout() {
+        use crate::transaction::state::IctEvent;
+        use crate::transaction::{ClientEvent, TransactionManager};
+
+        let mut pool = test_pool();
+        pool.set_idle_timeout(Duration::from_millis(30));
+        let transactions = TransactionManager::default();
+        let (callee_listener, callee) = silent_peer().await;
+
+        let invite = ringing_invite("z9hG4bK-pool-ringing");
+        let wire = Bytes::from(invite.to_bytes());
+        let (key, _) = transactions
+            .new_client_transaction(
+                &invite,
+                wire.clone(),
+                crate::transaction::state::Transport::Reliable,
+            )
+            .expect("the client transaction starts");
+        let connection_id = pool.send_tcp(callee, wire).await.unwrap();
+        transactions.hold_client_connection(&key, pool.hold(connection_id));
+        let (_callee_peer, _) = callee_listener.accept().await.unwrap();
+        assert!(pool.is_held(connection_id));
+
+        // The callee rings: nothing is read on the connection for several idle
+        // periods, each one witnessed by a control connection being reaped.
+        for round in 0..3 {
+            let (control_listener, control) = silent_peer().await;
+            pool.send_tcp(control, Bytes::from_static(b"OPTIONS"))
+                .await
+                .unwrap();
+            let (_control_peer, _) = control_listener.accept().await.unwrap();
+            until_closed(
+                &pool,
+                control,
+                "the idle timeout never closed a connection with nothing pending",
+            )
+            .await;
+            assert!(
+                pool.has_live(callee, Transport::Tcp),
+                "the connection of a ringing INVITE was closed for idleness (round {round})"
+            );
+        }
+        // Still the same connection, not a replacement.
+        assert_eq!(
+            pool.send_tcp(callee, Bytes::from_static(b"\r\n"))
+                .await
+                .unwrap(),
+            connection_id
+        );
+
+        // Answered: the transaction ends and takes its hold with it.
+        let answer = crate::sip::builder::SipMessageBuilder::new()
+            .response(200, "OK".to_string())
+            .via("SIP/2.0/TCP 192.0.2.1:5060;branch=z9hG4bK-pool-ringing".to_string())
+            .to("<sip:callee@example.org>;tag=callee-tag".to_string())
+            .from("<sip:caller@example.org>;tag=caller-tag".to_string())
+            .call_id("z9hG4bK-pool-ringing@example.org".to_string())
+            .cseq("1 INVITE".to_string())
+            .content_length(0)
+            .build()
+            .expect("the 200 builds");
+        transactions
+            .process_client_event(&key, ClientEvent::Ict(IctEvent::Response2xx(answer)))
+            .expect("the 200 is taken");
+        assert!(!pool.is_held(connection_id));
+
+        until_closed(
+            &pool,
+            callee,
+            "a connection whose transaction had ended was never closed for idleness",
+        )
+        .await;
+        assert_eq!(pool.active_connections(), 0);
+    }
+
+    /// A hold suspends the idle timer and nothing else: the peer closing the
+    /// connection still takes it out of the pool at once.
+    #[tokio::test]
+    async fn a_held_connection_still_goes_when_the_peer_closes() {
+        let mut pool = test_pool();
+        pool.set_idle_timeout(Duration::from_millis(30));
+        let (listener, destination) = silent_peer().await;
+
+        let connection_id = pool
+            .send_tcp(destination, Bytes::from_static(b"INVITE"))
+            .await
+            .unwrap();
+        let _hold = pool.hold(connection_id);
+        let (peer, _) = listener.accept().await.unwrap();
+        drop(peer);
+
+        until_closed(
+            &pool,
+            destination,
+            "a held connection the peer closed still reads as live",
+        )
+        .await;
+    }
+
+    /// Holds are per connection: one on a connection does not keep another
+    /// connection open, and a hold on an id the pool never issued is inert.
+    #[tokio::test]
+    async fn a_hold_keeps_only_its_own_connection() {
+        let mut pool = test_pool();
+        pool.set_idle_timeout(Duration::from_millis(30));
+        let (held_listener, held) = silent_peer().await;
+        let (other_listener, other) = silent_peer().await;
+
+        let held_id = pool
+            .send_tcp(held, Bytes::from_static(b"INVITE"))
+            .await
+            .unwrap();
+        let _hold = pool.hold(held_id);
+        let _unknown = pool.hold(ConnectionId(u64::MAX));
+        let (_held_peer, _) = held_listener.accept().await.unwrap();
+        pool.send_tcp(other, Bytes::from_static(b"OPTIONS"))
+            .await
+            .unwrap();
+        let (_other_peer, _) = other_listener.accept().await.unwrap();
+
+        until_closed(&pool, other, "the connection with no hold was never closed").await;
+        assert!(pool.has_live(held, Transport::Tcp));
     }
 }
