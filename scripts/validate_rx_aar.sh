@@ -12,7 +12,8 @@
 #   scripts/validate_rx_aar.sh
 #
 # Needs tshark and text2pcap (wireshark-common). CI runners have neither, so
-# run it locally after touching src/diameter/rx.rs.
+# run it locally after touching src/diameter/rx.rs or the flow descriptions in
+# src/script/api/qos.rs.
 
 set -euo pipefail
 
@@ -37,7 +38,7 @@ rm -f "$HEX" "$PCAP"
 
 echo "encoding an AAR the way diameter.rx_aar does"
 SIPHON_RX_AAR_HEX_OUT="$HEX" \
-  PYO3_PYTHON=python3 \
+  PYO3_PYTHON="${PYO3_PYTHON:-python3}" \
   cargo test --lib script::api::diameter::tests::emit_rx_aar_for_external_dissection -- --exact >/dev/null
 
 if [[ ! -s "$HEX" ]]; then
@@ -100,6 +101,32 @@ check_tree "7 is INDICATION_OF_OUT_OF_CREDIT" 'Specific-Action: INDICATION_OF_OU
 check_tree "9 is INDICATION_OF_FAILED_RESOURCES_ALLOCATION" \
   'Specific-Action: INDICATION_OF_FAILED_RESOURCES_ALLOCATION \(9\)'
 check_tree "Rx-Request-Type is INITIAL_REQUEST" 'Rx-Request-Type: INITIAL_REQUEST \(0\)'
+
+# TS 29.214 clause 5.3.8: "in" is the uplink flow and "out" the downlink flow,
+# so the UE (Framed-IP-Address 192.0.2.1, Framed-IPv6-Prefix 2001:db8::1/128)
+# is the source of every "in" rule and the destination of every "out" rule.
+# The AAR carries what qos.media_flows_from_sdp builds for an audio stream
+# over IPv4 (RTP, then RTCP one port up) and a video stream over IPv6 with
+# rtcp-mux. tshark knows AVP 507 as an IPFilterRule and prints it as text.
+expect diameter.Framed-IP-Address.IPv4 192.0.2.1
+flow_descriptions="$(tshark -r "$PCAP" -T fields -E occurrence=a -E aggregator='|' \
+  -e diameter.Flow-Description 2>/dev/null | head -1)"
+want_flow_descriptions="permit in 17 from 192.0.2.1 50000 to 198.51.100.7 30000"
+want_flow_descriptions+="|permit out 17 from 198.51.100.7 30000 to 192.0.2.1 50000"
+want_flow_descriptions+="|permit in 17 from 192.0.2.1 50001 to 198.51.100.7 30001"
+want_flow_descriptions+="|permit out 17 from 198.51.100.7 30001 to 192.0.2.1 50001"
+want_flow_descriptions+="|permit in 17 from 2001:db8::1 50002 to 2001:db8:2::7 30002"
+want_flow_descriptions+="|permit out 17 from 2001:db8:2::7 30002 to 2001:db8::1 50002"
+if [[ "$flow_descriptions" == "$want_flow_descriptions" ]]; then
+  echo "  ok   6 Flow-Descriptions, uplink \"in\" from the UE, downlink \"out\" to the UE"
+else
+  echo "  FAIL Flow-Description: tshark read '$flow_descriptions'" >&2
+  echo "       we meant '$want_flow_descriptions'" >&2
+  status=1
+fi
+check_flags "Flow-Description flags M+V" "AVP Code: 507 Flow-Description" \
+  "AVP Flags: 0xc0, Vendor-Specific: Set, Mandatory: Set" 6
+check_tree "Flow-Usage RTCP on the RTCP sub-component" 'Flow-Usage: RTCP \(1\)'
 
 # Table 5.3.1: Specific-Action must carry M and V, Rx-Request-Type must not
 # carry M.

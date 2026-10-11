@@ -10378,6 +10378,14 @@ class MockQos:
 
         Returns:
             list[dict]: one entry per non-disabled ``m=`` section.
+
+        Each sub-component carries two descriptions, uplink first
+        (TS 29.214 clause 5.3.8: ``in`` is the uplink flow, ``out`` the
+        downlink flow; the UE is the source of ``in`` and the destination
+        of ``out``)::
+
+            permit in  <proto> from <UE> <port> to <remote> <port>
+            permit out <proto> from <remote> <port> to <UE> <port>
         """
         if direction not in ("orig", "term", "originating", "terminating"):
             raise ValueError(
@@ -10425,8 +10433,8 @@ class MockQos:
                     {
                         "number": 1,
                         "descriptions": [
-                            f"permit out {proto} from {ue_ip} {ue_port} to {remote_ip} {remote_port}",
-                            f"permit in {proto} from {remote_ip} {remote_port} to {ue_ip} {ue_port}",
+                            f"permit in {proto} from {ue_ip} {ue_port} to {remote_ip} {remote_port}",
+                            f"permit out {proto} from {remote_ip} {remote_port} to {ue_ip} {ue_port}",
                         ],
                     },
                 ],
@@ -10444,8 +10452,8 @@ class MockQos:
                     "number": 2,
                     "usage": "rtcp",
                     "descriptions": [
-                        f"permit out {proto} from {ue_ip} {ue_rtcp} to {remote_ip} {remote_rtcp}",
-                        f"permit in {proto} from {remote_ip} {remote_rtcp} to {ue_ip} {ue_rtcp}",
+                        f"permit in {proto} from {ue_ip} {ue_rtcp} to {remote_ip} {remote_rtcp}",
+                        f"permit out {proto} from {remote_ip} {remote_rtcp} to {ue_ip} {ue_rtcp}",
                     ],
                 })
 

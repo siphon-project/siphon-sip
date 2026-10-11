@@ -82,6 +82,47 @@ entry, but a working config keeps working.
 
 ### Fixed
 
+- **Flow descriptions on Rx and N5 name the uplink flow `in` and the downlink
+  flow `out` (TS 29.214 §5.3.8). Behaviour change on the wire.**
+  `qos.media_flows_from_sdp` wrote the two direction keywords the wrong way
+  round. For each RTP and RTCP sub-component it sent
+
+  ```text
+  permit out <proto> from <UE> <port> to <remote> <port>
+  permit in  <proto> from <remote> <port> to <UE> <port>
+  ```
+
+  and now sends
+
+  ```text
+  permit in  <proto> from <UE> <port> to <remote> <port>
+  permit out <proto> from <remote> <port> to <UE> <port>
+  ```
+
+  on the originating and the terminating leg, for IPv4 and IPv6. TS 29.214
+  §5.3.8 says that `in` refers to uplink IP flows and `out` to downlink IP
+  flows; RFC 6733 §4.3.1 defines `in` as from the terminal and `out` as to the
+  terminal; TS 29.212 §5.4.2 states that for `out` the source of the rule is
+  the remote end and the destination is the UE. TS 29.514 defines the N5
+  `FlowDescription` by the same clause, and the same list feeds both
+  interfaces, so the Flow-Description AVPs of `diameter.rx_aar` and the
+  `fDescs` of `sbi.create_session` / `sbi.update_session` change together.
+  The addresses, ports, protocol and the order of the pair (uplink first) are
+  unchanged: only the keyword of each rule moved. Neither specification
+  orders the two descriptions. **Check the policy function before upgrading
+  if it had adapted to the old form**, for example by reading the addresses
+  and ignoring the keyword, or by swapping the keywords back: with the old
+  form a policy function that follows the specification took the UE for the
+  remote end and built its packet filters reversed, and one that compensated
+  for that will now do the reverse. There is no switch to get the old form
+  back. A script that writes its own `descriptions` is not touched: siphon
+  sends them as given, so it has to follow the same convention. The SDK mock
+  of `qos.media_flows_from_sdp` produces the new form too, so a script test
+  that pinned the old strings fails until it is updated.
+  `scripts/validate_rx_aar.sh` now builds its AAR from
+  `qos.media_flows_from_sdp` and checks the six Flow-Description AVPs against
+  Wireshark's Diameter dissector.
+
 - **The Diameter listener advertises its applications in the CEA, and refuses
   a peer that shares none (RFC 6733 §5.3).** The Capabilities-Exchange-Answer
   of a node with `diameter.listen` listed no application at all, so a strict

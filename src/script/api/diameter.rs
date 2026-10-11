@@ -21,18 +21,18 @@
 //! # Cx: locate serving S-CSCF for non-REGISTER requests (I-CSCF)
 //! result = diameter.cx_lir("sip:alice@ims.example.com")
 //!
-//! # Rx: request QoS resources from PCRF (P-CSCF).  See the project docs for
-//! # the full media_components shape; here's a minimal one-component example.
+//! # Rx: request QoS resources from PCRF (P-CSCF).  A minimal one-component
+//! # example: "in" is the uplink flow, from the UE (TS 29.214 clause 5.3.8).
 //! result = diameter.rx_aar(
-//!     framed_ip="10.0.0.1",
+//!     framed_ip="192.0.2.2",
 //!     media_components=[{
 //!         "number": 1,
 //!         "media_type": "audio",
 //!         "flows": [{
 //!             "number": 1,
 //!             "descriptions": [
-//!                 "permit out 17 from 10.0.0.1 50000 to 10.0.0.2 30000",
-//!                 "permit in 17 from 10.0.0.2 30000 to 10.0.0.1 50000",
+//!                 "permit in 17 from 192.0.2.2 50000 to 198.51.100.10 30000",
+//!                 "permit out 17 from 198.51.100.10 30000 to 192.0.2.2 50000",
 //!             ],
 //!         }],
 //!     }],
@@ -3793,8 +3793,8 @@ mod tests {
             rtp.set_item(
                 "descriptions",
                 vec![
-                    "permit out 17 from 10.0.0.1 50000 to 10.0.0.2 30000",
-                    "permit in 17 from 10.0.0.2 30000 to 10.0.0.1 50000",
+                    "permit in 17 from 192.0.2.2 50000 to 198.51.100.10 30000",
+                    "permit out 17 from 198.51.100.10 30000 to 192.0.2.2 50000",
                 ],
             )
             .unwrap();
@@ -3806,8 +3806,8 @@ mod tests {
             rtcp.set_item(
                 "descriptions",
                 vec![
-                    "permit out 17 from 10.0.0.1 50001 to 10.0.0.2 30001",
-                    "permit in 17 from 10.0.0.2 30001 to 10.0.0.1 50001",
+                    "permit in 17 from 192.0.2.2 50001 to 198.51.100.10 30001",
+                    "permit out 17 from 198.51.100.10 30001 to 192.0.2.2 50001",
                 ],
             )
             .unwrap();
@@ -3838,7 +3838,7 @@ mod tests {
             // distinguishes the new structured form from the previous
             // wildcard placeholder.
             let encoded = mc.encode();
-            let rule = b"permit out 17 from 10.0.0.1 50000 to 10.0.0.2 30000";
+            let rule = b"permit in 17 from 192.0.2.2 50000 to 198.51.100.10 30000";
             assert!(
                 encoded.windows(rule.len()).any(|w| w == rule),
                 "encoded MCD must contain the full 5-tuple Flow-Description"
@@ -4061,22 +4061,55 @@ mod tests {
         });
     }
 
-    /// `rx_aar`'s arguments with every optional one set.
+    /// An audio call of the UE at 192.0.2.1, the address `full_rx_aar_request`
+    /// sends as Framed-IP-Address, with the remote end at 198.51.100.7.
+    const UE_AUDIO_OFFER: &str = concat!(
+        "v=0\r\n",
+        "o=- 1 1 IN IP4 192.0.2.1\r\n",
+        "s=-\r\n",
+        "c=IN IP4 192.0.2.1\r\n",
+        "t=0 0\r\n",
+        "m=audio 50000 RTP/AVP 0\r\n",
+    );
+    const REMOTE_AUDIO_ANSWER: &str = concat!(
+        "v=0\r\n",
+        "o=- 1 1 IN IP4 198.51.100.7\r\n",
+        "s=-\r\n",
+        "c=IN IP4 198.51.100.7\r\n",
+        "t=0 0\r\n",
+        "m=audio 30000 RTP/AVP 0\r\n",
+    );
+
+    /// The `media_components` a script gets from `qos.media_flows_from_sdp`
+    /// for an originating UE, called the way a script calls it.
+    fn qos_media_components<'py>(
+        python: Python<'py>,
+        offer: &str,
+        answer: &str,
+    ) -> Bound<'py, PyAny> {
+        let qos = Bound::new(python, crate::script::api::qos::PyQosNamespace::new()).unwrap();
+        let kwargs = PyDict::new(python);
+        kwargs.set_item("offer", offer).unwrap();
+        kwargs.set_item("answer", answer).unwrap();
+        kwargs.set_item("direction", "orig").unwrap();
+        qos.call_method("media_flows_from_sdp", (), Some(&kwargs))
+            .unwrap()
+    }
+
+    /// `rx_aar`'s arguments with every optional one set, the media components
+    /// being what `qos.media_flows_from_sdp` builds for an audio call.
     fn full_rx_aar_request(python: Python<'_>, specific_actions: &[i64]) -> RxAarRequest {
+        let components = qos_media_components(python, UE_AUDIO_OFFER, REMOTE_AUDIO_ANSWER);
+        rx_aar_request_with(python, &components, specific_actions)
+    }
+
+    fn rx_aar_request_with(
+        python: Python<'_>,
+        components: &Bound<'_, PyAny>,
+        specific_actions: &[i64],
+    ) -> RxAarRequest {
         use pyo3::types::{PyList, PyTuple};
 
-        let flow = PyDict::new(python);
-        flow.set_item("number", 1u32).unwrap();
-        flow.set_item(
-            "descriptions",
-            vec!["permit out 17 from 192.0.2.1 50000 to 198.51.100.7 30000"],
-        )
-        .unwrap();
-        let component = PyDict::new(python);
-        component.set_item("number", 1u32).unwrap();
-        component.set_item("media_type", "audio").unwrap();
-        component.set_item("flows", vec![flow]).unwrap();
-        let components = PyList::new(python, [component]).unwrap();
         let subscription = PyTuple::new(
             python,
             [
@@ -4095,7 +4128,7 @@ mod tests {
             None,
             Some("192.0.2.1"),
             Some(ipv6.as_any()),
-            Some(components.as_any()),
+            Some(components),
             "IMS Services",
             Some(subscription.as_any()),
             Some(actions.as_any()),
@@ -4116,8 +4149,33 @@ mod tests {
             return;
         };
         pyo3::Python::initialize();
+        // Audio over IPv4 with separate RTCP, video over IPv6 with rtcp-mux:
+        // every form of Flow-Description `qos.media_flows_from_sdp` writes.
+        let offer = concat!(
+            "v=0\r\n",
+            "o=- 1 1 IN IP4 192.0.2.1\r\n",
+            "s=-\r\n",
+            "t=0 0\r\n",
+            "m=audio 50000 RTP/AVP 0\r\n",
+            "c=IN IP4 192.0.2.1\r\n",
+            "m=video 50002 RTP/AVP 96\r\n",
+            "c=IN IP6 2001:db8::1\r\n",
+            "a=rtcp-mux\r\n",
+        );
+        let answer = concat!(
+            "v=0\r\n",
+            "o=- 1 1 IN IP4 198.51.100.7\r\n",
+            "s=-\r\n",
+            "t=0 0\r\n",
+            "m=audio 30000 RTP/AVP 0\r\n",
+            "c=IN IP4 198.51.100.7\r\n",
+            "m=video 30002 RTP/AVP 96\r\n",
+            "c=IN IP6 2001:db8:2::7\r\n",
+            "a=rtcp-mux\r\n",
+        );
         let wire = pyo3::Python::attach(|python| {
-            let request = full_rx_aar_request(python, &[6, 7, 9]);
+            let components = qos_media_components(python, offer, answer);
+            let request = rx_aar_request_with(python, &components, &[6, 7, 9]);
             rx_aar_wire(&request, Some("pcrf1.ims.mnc001.mcc001.3gppnetwork.org"))
         });
 
@@ -4434,8 +4492,27 @@ mod tests {
                     .and_then(|v| v.as_u64()),
                 Some(1)
             );
-            let rule = b"permit out 17 from 192.0.2.1 50000 to 198.51.100.7 30000";
-            assert!(wire.windows(rule.len()).any(|window| window == rule));
+            // The UE (Framed-IP-Address above) is the source of every "in"
+            // rule and the destination of every "out" rule, RTP then RTCP.
+            for rule in [
+                "permit in 17 from 192.0.2.1 50000 to 198.51.100.7 30000",
+                "permit out 17 from 198.51.100.7 30000 to 192.0.2.1 50000",
+                "permit in 17 from 192.0.2.1 50001 to 198.51.100.7 30001",
+                "permit out 17 from 198.51.100.7 30001 to 192.0.2.1 50001",
+            ] {
+                assert!(
+                    wire.windows(rule.len())
+                        .any(|window| window == rule.as_bytes()),
+                    "missing Flow-Description: {rule}"
+                );
+            }
+            let reversed = b"permit out 17 from 192.0.2.1 ";
+            assert!(
+                !wire
+                    .windows(reversed.len())
+                    .any(|window| window == reversed),
+                "the UE must never be the source of an \"out\" rule"
+            );
             // No Session-Id passed: an initial request, V-bit only.
             assert_eq!(
                 avps_with_code(&wire, avp::RX_REQUEST_TYPE)[0],

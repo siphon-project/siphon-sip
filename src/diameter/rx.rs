@@ -938,8 +938,8 @@ mod tests {
         let flow = MediaFlow {
             flow_number: 2,
             descriptions: vec![
-                "permit out 17 from 10.0.0.1 50001 to 10.0.0.2 30001".into(),
-                "permit in 17 from 10.0.0.2 30001 to 10.0.0.1 50001".into(),
+                "permit in 17 from 192.0.2.2 50001 to 198.51.100.10 30001".into(),
+                "permit out 17 from 198.51.100.10 30001 to 192.0.2.2 50001".into(),
             ],
             status: None,
             usage: Some(FlowUsage::Rtcp),

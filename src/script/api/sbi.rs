@@ -725,8 +725,8 @@ mod tests {
         flow.set_item(
             "descriptions",
             vec![
-                "permit out 17 from 10.0.0.1 50001 to 10.0.0.2 30001",
-                "permit in 17 from 10.0.0.2 30001 to 10.0.0.1 50001",
+                "permit in 17 from 192.0.2.2 50001 to 198.51.100.10 30001",
+                "permit out 17 from 198.51.100.10 30001 to 192.0.2.2 50001",
             ],
         )
         .unwrap();
@@ -756,7 +756,13 @@ mod tests {
             assert_eq!(sub.flow_usage.as_deref(), Some("RTCP"));
             let descs = sub.f_descs.as_ref().unwrap();
             assert_eq!(descs.len(), 2);
-            assert!(descs[0].starts_with("permit out 17 from"));
+            assert_eq!(
+                descs,
+                &[
+                    "permit in 17 from 192.0.2.2 50001 to 198.51.100.10 30001",
+                    "permit out 17 from 198.51.100.10 30001 to 192.0.2.2 50001",
+                ]
+            );
         });
     }
 
@@ -806,7 +812,9 @@ mod tests {
                 "Flow-Usage RTCP must survive: {json}"
             );
             assert!(
-                json.contains("permit out 17 from 10.0.0.1 50001"),
+                json.contains(
+                    r#""fDescs":["permit in 17 from 192.0.2.2 50001 to 198.51.100.10 30001","permit out 17 from 198.51.100.10 30001 to 192.0.2.2 50001"]"#
+                ),
                 "5-tuple Flow-Description must survive: {json}"
             );
         });
