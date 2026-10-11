@@ -189,6 +189,8 @@ pub(crate) struct MockHss {
     pub(crate) client: Arc<DiameterClient>,
     /// Every request received, as its decoded AVPs.
     captured: Arc<StdMutex<Vec<serde_json::Value>>>,
+    /// The same requests as they arrived on the wire.
+    wire: Arc<StdMutex<Vec<Vec<u8>>>>,
 }
 
 impl MockHss {
@@ -203,7 +205,8 @@ impl MockHss {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("a listener");
         let address = listener.local_addr().expect("the listener's address");
         let captured: Arc<StdMutex<Vec<serde_json::Value>>> = Arc::new(StdMutex::new(Vec::new()));
-        let capture = Arc::clone(&captured);
+        let wire: Arc<StdMutex<Vec<Vec<u8>>>> = Arc::new(StdMutex::new(Vec::new()));
+        let (capture, capture_wire) = (Arc::clone(&captured), Arc::clone(&wire));
         tokio::spawn(async move {
             let Ok((stream, _)) = listener.accept().await else {
                 return;
@@ -218,8 +221,9 @@ impl MockHss {
                     continue;
                 }
                 let reply = refuse_incomplete(&message).unwrap_or_else(|| answer(&message));
-                if let Ok(mut avps) = capture.lock() {
+                if let (Ok(mut avps), Ok(mut raw)) = (capture.lock(), capture_wire.lock()) {
                     avps.push(message.avps);
+                    raw.push(bytes);
                 }
                 if write_half.write_all(&reply).await.is_err() {
                     break;
@@ -237,6 +241,7 @@ impl MockHss {
         Self {
             client: Arc::new(DiameterClient::new(peer)),
             captured,
+            wire,
         }
     }
 
@@ -244,6 +249,25 @@ impl MockHss {
     pub(crate) fn requests(&self) -> Vec<serde_json::Value> {
         self.captured.lock().expect("the capture").clone()
     }
+
+    /// The first request received, decoded with its header.
+    pub(crate) fn first_request(&self) -> codec::DiameterMessage {
+        let wire = self.wire.lock().expect("the capture");
+        codec::decode_diameter(&wire[0]).expect("a request that decoded on arrival")
+    }
+}
+
+/// One message in `text2pcap`'s hex-dump form: an offset, then the octets.
+pub(crate) fn hex_dump(wire: &[u8]) -> String {
+    let mut dump = String::new();
+    for (offset, chunk) in wire.chunks(16).enumerate() {
+        dump.push_str(&format!("{:06x}", offset * 16));
+        for byte in chunk {
+            dump.push_str(&format!(" {byte:02x}"));
+        }
+        dump.push('\n');
+    }
+    dump
 }
 
 /// A connected client whose peer is a mock HSS, and every request that HSS

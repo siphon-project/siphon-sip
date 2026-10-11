@@ -7,6 +7,8 @@
 //! see [`crate::auth::server`] for the SQL source.
 
 mod ims;
+mod integrity;
+mod sip_digest;
 #[cfg(test)]
 mod test_support;
 mod vectors;
@@ -598,38 +600,57 @@ impl PyAuth {
         self.require_www_digest(python, target, realm, password, ha1)
     }
 
-    /// IMS AKA authentication via Diameter Cx MAR/MAA.
+    /// IMS authentication via Diameter Cx MAR/MAA: IMS AKA or SIP Digest.
     ///
     /// Sends a Multimedia-Auth-Request to the HSS the Cx route names and uses
-    /// the returned authentication vector to challenge or verify the UE. The
-    /// MAR asks for the `Digest-AKAv1-MD5` scheme (TS 29.229 clause 6.3.9) and
-    /// names the private user identity as User-Name: the `username` of the
-    /// Authorization header, or without one the identity TS 24.229 clause
-    /// 5.4.1.1 derives from the public user identity.
+    /// what it returns to challenge or verify the UE. The mechanism is the
+    /// one TS 24.229 clause 5.4.1.1 selects from the REGISTER.
+    /// `integrity-protected` `yes` or `no` in the Authorization header, which
+    /// a P-CSCF sets for IMS AKA, asks for the `Digest-AKAv1-MD5` scheme (TS
+    /// 29.229 clause 6.3.9) and challenges with `AKAv1-MD5`. `tls-pending`,
+    /// `tls-yes`, `ip-assoc-pending` or `ip-assoc-yes`, and a REGISTER without
+    /// Authorization that a non-3GPP access network vouches for in
+    /// P-Access-Network-Info, is SIP Digest (`SIP Digest`). An Authorization
+    /// header without the parameter, and a REGISTER with no Authorization
+    /// otherwise, leaves the choice to the HSS (`Unknown`). `tls-connected`
+    /// and `auth-done` are refused with 403.
+    ///
+    /// For SIP Digest the HSS returns H(A1) and the 401 carries one `Digest`
+    /// challenge per algorithm it sent one for, with a nonce generated here.
+    /// A response that verifies sets `Authentication-Info` on the 200, one
+    /// that does not is refused with 403, and one under an expired nonce or
+    /// with a repeated `nc` is challenged again with `stale=true`.
+    ///
+    /// The MAR names the public user identity of the To header (TS 24.229
+    /// clause 5.4.1.2.1) and the private user identity as User-Name: the
+    /// `username` of the Authorization header, or without one the identity
+    /// clause 5.4.1.1 derives from the public user identity.
     ///
     /// Args:
     ///     request: The REGISTER.
-    ///     realm: Digest realm of the challenge (defaults to the configured one).
+    ///     realm: Digest realm of an IMS AKA challenge (defaults to the
+    ///         configured one). A SIP Digest challenge carries the realm the
+    ///         HSS computed H(A1) with.
     ///     server_name: This S-CSCF's SIP URI, sent as Server-Name. The MAR
     ///         requires it (TS 29.229 clause 6.1.7) and the HSS stores it as the
     ///         S-CSCF serving the user, so pass the URI given to `cx_sar`.
     ///         Without it the AVP is left out and a warning is logged.
-    ///
-    /// The public user identity of the MAR is the URI of the To header, as
-    /// TS 24.229 clause 5.4.1.2.1 has it.
+    ///     nonce_lifetime: Seconds a SIP Digest nonce stays valid after a
+    ///         response under it verified (default 3600).
     ///
     /// Returns True if credentials are valid, False if a 401 challenge was
-    /// sent or the HSS refused and a 403 was set. Raises RuntimeError if no
-    /// Diameter connection is available, the request got no answer, or the
-    /// answer carries another authentication scheme than the one asked for
-    /// or no vector to challenge with.
-    #[pyo3(signature = (request, realm=None, server_name=None))]
+    /// sent or a 403 was set. Raises RuntimeError if no Diameter connection
+    /// is available, the request got no answer, or the answer carries
+    /// another authentication scheme than the one asked for or nothing to
+    /// challenge with.
+    #[pyo3(signature = (request, realm=None, server_name=None, nonce_lifetime=3600))]
     fn require_ims_digest<'py>(
         &self,
         python: Python<'py>,
         request: &Bound<'py, PyRequest>,
         realm: Option<&str>,
         server_name: Option<&str>,
+        nonce_lifetime: u64,
     ) -> PyResult<Bound<'py, PyAny>> {
         let diameter = self.diameter_manager.as_ref().ok_or_else(|| {
             pyo3::exceptions::PyRuntimeError::new_err(
@@ -641,13 +662,13 @@ impl PyAuth {
 
         // Read before the future: the message behind a `Bound` cannot cross an
         // `await`, and neither can the `Bound`.
-        let registration = {
+        let register = {
             let borrowed = request.borrow();
             let message = borrowed.message();
             let guard = message.lock().map_err(|e| {
                 pyo3::exceptions::PyRuntimeError::new_err(format!("lock poisoned: {e}"))
             })?;
-            ims::registration_of(&guard.headers, server_name)
+            ims::Register::read(&guard, server_name)
         };
         if server_name.is_none() {
             tracing::warn!(
@@ -658,9 +679,10 @@ impl PyAuth {
 
         let auth = self.clone();
         let handle: Py<PyRequest> = request.clone().unbind();
+        let nonce_lifetime = std::time::Duration::from_secs(nonce_lifetime);
         crate::script::awaitable(
             python,
-            Self::ims_digest_flow(auth, client, handle, realm, registration),
+            Self::ims_digest_flow(auth, client, handle, realm, register, nonce_lifetime),
         )
     }
 
@@ -806,6 +828,21 @@ impl PyAuth {
     /// header, or `None` (changing nothing) when there is no Authorization.
     fn stamp_integrity_protected(&self, request: &PyRequest) -> PyResult<Option<&'static str>> {
         super::ipsec::stamp_integrity_protected(request)
+    }
+
+    /// P-CSCF: set, or with `None` remove, the `integrity-protected`
+    /// parameter of every Authorization header of a REGISTER.
+    ///
+    /// For the mechanisms `stamp_integrity_protected` does not decide. With
+    /// SIP Digest (TS 24.229 clauses 5.2.2.3 and 5.2.2.4) the value is
+    /// `ip-assoc-pending`, `ip-assoc-yes`, `tls-pending` or `tls-yes`, or the
+    /// parameter is absent on a first REGISTER. Whatever the UE sent is
+    /// replaced (clause 5.2.2.1 step 4B). Returns False, changing nothing,
+    /// when the request has no Authorization header. Raises ValueError for a
+    /// value table 7.2A.2 does not list.
+    #[pyo3(signature = (request, value))]
+    fn set_integrity_protected(&self, request: &PyRequest, value: Option<&str>) -> PyResult<bool> {
+        integrity::set_integrity_protected(request, value)
     }
 
     /// S-CSCF: accept a protected re-/de-REGISTER without a new challenge.
@@ -1341,44 +1378,6 @@ impl PyAuth {
             Some(&vector.ck),
             Some(&vector.ik),
         )
-    }
-
-    /// Send a 401 AKA challenge whose nonce is `rand_and_autn`, base64-encoded.
-    fn send_ims_challenge(
-        &self,
-        request: &mut PyRequest,
-        realm: &str,
-        rand_and_autn: &[u8],
-        ck: Option<&[u8]>,
-        ik: Option<&[u8]>,
-    ) -> PyResult<()> {
-        request.set_reply(401, "Unauthorized".to_string());
-
-        let nonce = base64_encode(rand_and_autn);
-        // Per TS 33.203 §6.3, include CK and IK from the HSS MAA so the
-        // P-CSCF can extract them for IPsec SA setup with the UE.
-        let mut header_value = format!(
-            "Digest realm=\"{realm}\", nonce=\"{nonce}\", algorithm=AKAv1-MD5, qop=\"auth\""
-        );
-        if let Some(ck_bytes) = ck {
-            header_value.push_str(&format!(
-                ", ck=\"{}\"",
-                crate::diameter::codec::hex::encode(ck_bytes)
-            ));
-        }
-        if let Some(ik_bytes) = ik {
-            header_value.push_str(&format!(
-                ", ik=\"{}\"",
-                crate::diameter::codec::hex::encode(ik_bytes)
-            ));
-        }
-
-        let message = request.message();
-        let mut message_guard = message.lock().map_err(|error| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!("lock poisoned: {error}"))
-        })?;
-        message_guard.headers.set("WWW-Authenticate", header_value);
-        Ok(())
     }
 
     /// Validate credentials by dispatching to the configured backend.
@@ -2345,9 +2344,9 @@ pub(crate) fn base64_decode(input: &str) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use super::vectors::{ims_auth_store, ImsAuthVector, AUTH_VECTOR_TTL};
+    use super::vectors::{auth_vectors, store_expired_auth_vector};
     use super::*;
-    use crate::script::api::diameter_cx::{ims_private_identity, ImsRegistration};
+    use crate::script::api::diameter_cx::ims_private_identity;
     use crate::script::api::request::RequestAction;
     use crate::sip::builder::SipMessageBuilder;
     use crate::sip::message::Method;
@@ -3591,28 +3590,19 @@ mod tests {
 
     #[test]
     fn ims_auth_store_insert_lookup_consume() {
-        let store = ims_auth_store();
-        let nonce = "test-ims-nonce-123".to_string();
-
-        store.insert(
-            nonce.clone(),
-            ImsAuthVector {
-                expected_response: vec![0xAA; 16],
-                stored_at: std::time::Instant::now(),
-            },
-        );
+        let nonce = "test-ims-nonce-123";
+        store_auth_vector(nonce.to_string(), vec![0xAA; 16]);
 
         // Verify it exists
-        assert!(store.get(&nonce).is_some());
+        assert!(auth_vectors().contains(nonce));
 
-        // Remove consumes it (simulating verification lookup)
-        let removed = store.remove(&nonce);
-        assert!(removed.is_some());
-        let (_, vector) = removed.unwrap();
+        // Taking consumes it (simulating verification lookup)
+        let vector = take_auth_vector(nonce).expect("the stored vector");
         assert_eq!(vector.expected_response, vec![0xAA; 16]);
 
         // Gone after consumption — prevents replay
-        assert!(store.get(&nonce).is_none());
+        assert!(!auth_vectors().contains(nonce));
+        assert!(take_auth_vector(nonce).is_none());
     }
 
     #[test]
@@ -3892,21 +3882,14 @@ mod tests {
     #[test]
     fn auth_vector_expires_and_is_not_accepted() {
         let nonce = "aka-nonce-expired";
-        ims_auth_store().insert(
-            nonce.to_string(),
-            ImsAuthVector {
-                expected_response: vec![0xAA; 8],
-                stored_at: std::time::Instant::now()
-                    - (AUTH_VECTOR_TTL + std::time::Duration::from_secs(1)),
-            },
-        );
+        store_expired_auth_vector(nonce.to_string(), vec![0xAA; 8]);
 
         assert!(
             take_auth_vector(nonce).is_none(),
             "expired vector is refused"
         );
         assert!(
-            !ims_auth_store().contains_key(nonce),
+            !auth_vectors().contains(nonce),
             "and is dropped rather than left behind"
         );
     }
@@ -4342,19 +4325,15 @@ mod tests {
         pyo3::Python::initialize();
         let (client, captured) = crate::diameter::cx_test_support::mock_hss_client().await;
         let request = ims_register(authorization);
+        let registration = ims::Register::read(&request.message().lock().unwrap(), server_name);
         let handle = pyo3::Python::attach(|python| Py::new(python, request).unwrap());
-        let registration = ImsRegistration {
-            user_name: ims_private_identity(authorization, IMS_PUBLIC_IDENTITY),
-            public_identity: IMS_PUBLIC_IDENTITY.to_string(),
-            server_name: server_name.map(str::to_string),
-            authorization: authorization.map(str::to_string),
-        };
         let challenged = PyAuth::ims_digest_flow(
             make_auth(),
             client,
             handle,
             "ims.mnc001.mcc001.3gppnetwork.org".to_string(),
             registration,
+            std::time::Duration::from_secs(3600),
         )
         .await
         .unwrap();
@@ -4367,12 +4346,15 @@ mod tests {
     }
 
     /// The Authorization header of an initial IMS REGISTER (TS 24.229 clause
-    /// 5.1.1.2): the private identity, and empty nonce and response.
+    /// 5.1.1.2): the private identity, and empty nonce and response. The
+    /// P-CSCF forwards it with "integrity-protected" set to "no" (clause
+    /// 5.2.2.2), which is what selects IMS AKA at the S-CSCF.
     fn initial_ims_authorization() -> String {
         format!(
             "Digest username=\"{IMS_PRIVATE_IDENTITY}\", \
              realm=\"ims.mnc001.mcc001.3gppnetwork.org\", nonce=\"\", \
-             uri=\"sip:ims.mnc001.mcc001.3gppnetwork.org\", response=\"\""
+             uri=\"sip:ims.mnc001.mcc001.3gppnetwork.org\", response=\"\", \
+             integrity-protected=\"no\""
         )
     }
 

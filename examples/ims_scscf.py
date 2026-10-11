@@ -57,8 +57,11 @@ async def handle_register(request):
     if auth.verify_integrity_protected(request):
         log.info(f"accepted integrity-protected REGISTER from {request.auth_user}")
     # Authenticate with AKA digest.
-    # In production IMS this triggers Cx MAR to the HSS for auth vectors.
     # In lab mode, uses local Milenage credentials from aka_credentials config.
+    # Against an HSS, replace the call with
+    #     await auth.require_ims_digest(request, realm=REALM, server_name=SCSCF_URI)
+    # which asks it over Cx and authenticates with IMS-AKA or SIP Digest,
+    # whichever the REGISTER and the HSS call for (TS 24.229 clause 5.4.1.1).
     elif not auth.require_aka_digest(request, realm=REALM):
         log.info(f"sent 401 AKA challenge to {request.from_uri}")
         return

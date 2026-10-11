@@ -77,6 +77,7 @@ read exactly as before: `on` and `yes` are strings, `0101234567` is a string,
 | Outbound TCP connection from an IPsec protected port | closed after 30 s of silence | kept until the UE closes it, an error or the socket keepalive ends it; reset, not closed with a FIN, when siphon ends it |
 | Ro CCRs of `call.ro_authorize()`, Rf ACRs of `rf.auto_emit_b2bua`, `Role-Of-Node` | 3 (B2BUA_ROLE) | the session case of the A-leg INVITE: 0 originating, 1 terminating, 2 forwarding (`sescase=orig-cdiv`), per TS 32.299 V18 clause 7.2.177 |
 | Response whose TCP or TLS connection has closed | new connection to the source port of the request | new connection to the port in the `sent-by` of the Via (5060, or 5061 for TLS, when it has none), per RFC 3261 clause 18.2.2 |
+| Cx MAR of `auth.require_ims_digest`, REGISTER whose Authorization has no `integrity-protected`, or with no Authorization | `Digest-AKAv1-MD5` | `Unknown` (or `SIP Digest` behind a non-3GPP access the network vouches for), per TS 24.229 clause 5.4.1.1 |
 
 The flow descriptions are the one to test against the policy function in use.
 One that follows the specification built its packet filters reversed with the
@@ -109,3 +110,25 @@ registered UE it has sent a request to, from its protected client port to the
 protected server port of the UE, until the UE closes it or stops answering the
 keepalive. It used to close each after 30 seconds and then fail to open it
 again for the next request in the same call.
+
+`require_ims_digest` now selects the mechanism from the REGISTER, as TS 24.229
+clause 5.4.1.1 lists it, and implements SIP Digest next to IMS-AKA. For an
+S-CSCF behind a P-CSCF that calls `auth.stamp_integrity_protected` on every
+REGISTER nothing changes: `yes` and `no` are IMS-AKA. **An S-CSCF that
+receives REGISTERs without `integrity-protected` used to treat them as
+IMS-AKA and now asks the HSS for `Unknown`**, which a conformant HSS answers
+with `DIAMETER_ERROR_AUTH_SCHEME_NOT_SUPPORTED` (5006) for an IMS-AKA
+subscriber, so the REGISTER ends in 403. That is a UE registering straight at
+the S-CSCF, a test client, or a P-CSCF script that relays the REGISTER
+without stamping it. Stamp it in the P-CSCF:
+
+```python
+@proxy.on_request("REGISTER")
+def handle_register(request):
+    auth.stamp_integrity_protected(request)   # "yes" or "no", IMS-AKA
+    request.relay()
+```
+
+`integrity-protected="auth-done"` and `"tls-connected"` are refused with 403.
+They were treated as IMS-AKA. See `docs/reference/security.md` for the whole
+table.

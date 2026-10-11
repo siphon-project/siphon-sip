@@ -13,6 +13,8 @@ Uses the 3GPP test IMSI range (MCC 001 / MNC 01) only.
 import asyncio
 from pathlib import Path
 
+import pytest
+
 from siphon_sdk import mock_module
 from siphon_sdk.mock_module import MockSAHandle
 from siphon_sdk.request import Request
@@ -314,3 +316,52 @@ def test_pcscf_stamps_no_on_an_unprotected_register_before_relaying():
     header = result.request.get_header("Authorization")
     assert header.count("integrity-protected") == 1
     assert 'integrity-protected="no"' in header
+
+
+# ---------------------------------------------------------------------------
+# set_integrity_protected (P-CSCF, SIP Digest)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("value", [
+    "yes", "no", "tls-pending", "tls-yes", "ip-assoc-pending", "ip-assoc-yes",
+    "auth-done", "tls-connected",
+])
+def test_set_writes_each_value_of_the_table_over_what_the_ue_sent(value):
+    harness = _harness()
+    request = _register(_authorization(IMPI, 'integrity-protected="auth-done"'))
+
+    assert harness.auth.set_integrity_protected(request, value) is True
+
+    header = request.get_header("Authorization")
+    assert header.count("integrity-protected") == 1
+    assert f'integrity-protected="{value}"' in header
+    assert f'username="{IMPI}"' in header
+
+
+def test_set_none_removes_the_parameter():
+    harness = _harness()
+    request = _register(_authorization(IMPI, 'integrity-protected="yes"'))
+
+    assert harness.auth.set_integrity_protected(request, None) is True
+
+    header = request.get_header("Authorization")
+    assert "integrity-protected" not in header
+    assert f'username="{IMPI}"' in header
+
+
+def test_set_without_authorization_changes_nothing():
+    harness = _harness()
+    request = _register()
+
+    assert harness.auth.set_integrity_protected(request, "tls-pending") is False
+    assert request.get_header("Authorization") is None
+
+
+def test_set_refuses_a_value_the_table_does_not_list():
+    harness = _harness()
+    request = _register(_authorization(IMPI))
+
+    with pytest.raises(ValueError):
+        harness.auth.set_integrity_protected(request, "maybe")
+    assert "integrity-protected" not in request.get_header("Authorization")

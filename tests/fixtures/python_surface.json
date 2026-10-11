@@ -51,9 +51,9 @@
         "sig": "($self, target, realm=None, password=None, ha1=None)"
       },
       "require_ims_digest": {
-        "doc": "IMS AKA authentication via Diameter Cx MAR/MAA.",
+        "doc": "IMS authentication via Diameter Cx MAR/MAA: IMS AKA or SIP Digest.",
         "kind": "method_descriptor",
-        "sig": "($self, request, realm=None, server_name=None)"
+        "sig": "($self, request, realm=None, server_name=None, nonce_lifetime=3600)"
       },
       "require_proxy_digest": {
         "doc": "Challenge with 407 Proxy-Authenticate if not yet authenticated.",
@@ -64,6 +64,11 @@
         "doc": "If the message carries valid credentials, sets `request.auth_user` /",
         "kind": "method_descriptor",
         "sig": "($self, target, realm=None, password=None, ha1=None)"
+      },
+      "set_integrity_protected": {
+        "doc": "P-CSCF: set, or with `None` remove, the `integrity-protected`",
+        "kind": "method_descriptor",
+        "sig": "($self, request, value)"
       },
       "stamp_integrity_protected": {
         "doc": "P-CSCF: stamp `integrity-protected` into every Authorization header.",

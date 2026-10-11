@@ -191,7 +191,7 @@ pub(crate) fn zh_mar_answer_dict(
     dict.set_item("user_name", text(answer, "User-Name"))?;
     dict.set_item(
         "auth_items",
-        super::diameter_cx::auth_items(python, answer)?,
+        super::diameter_cx::auth_item_dicts(python, answer)?,
     )?;
     dict.set_item(
         "guss",

@@ -520,6 +520,15 @@ fn append_request_header(payload: &mut Vec<u8>, config: &PeerConfig, session_id:
 /// IMS AKA, the scheme `Digest-AKAv1-MD5` of TS 29.229 clause 6.3.9.
 pub const SCHEME_IMS_AKA: &str = "Digest-AKAv1-MD5";
 
+/// SIP Digest, the scheme `SIP Digest` of TS 29.229 clause 6.3.9: the answer
+/// carries H(A1) in SIP-Digest-Authenticate.
+pub const SCHEME_SIP_DIGEST: &str = "SIP Digest";
+
+/// The scheme `Unknown` of TS 29.229 clause 6.3.9: "the authentication scheme
+/// to be used is unknown at this point", so the HSS answers in the scheme it
+/// has stored.
+pub const SCHEME_UNKNOWN: &str = "Unknown";
+
 /// "The authentication scheme indicated in an authentication request is not
 /// supported" (TS 29.229 clause 6.2.2.6), carried in Experimental-Result.
 pub const DIAMETER_ERROR_AUTH_SCHEME_NOT_SUPPORTED: u32 = 5006;
@@ -1206,6 +1215,14 @@ mod tests {
     }
 
     fn sample_mar(server_name: Option<&str>, sip_authorization: Option<&[u8]>) -> Vec<u8> {
+        sample_mar_in(SCHEME_IMS_AKA, server_name, sip_authorization)
+    }
+
+    fn sample_mar_in(
+        sip_auth_scheme: &str,
+        server_name: Option<&str>,
+        sip_authorization: Option<&[u8]>,
+    ) -> Vec<u8> {
         build_mar(
             &client_config(),
             "scscf;1;1",
@@ -1214,7 +1231,7 @@ mod tests {
                 user_name: PRIVATE_IDENTITY,
                 server_name,
                 sip_number_auth_items: 1,
-                sip_auth_scheme: SCHEME_IMS_AKA,
+                sip_auth_scheme,
                 sip_authorization,
             },
             0x2d6,
@@ -1449,6 +1466,14 @@ mod tests {
             ("mar", sample_mar(Some(SCSCF_URI), None)),
             ("mar_resync", sample_mar(Some(SCSCF_URI), Some(&resync))),
             ("sar", sample_sar(Some(PRIVATE_IDENTITY))),
+            (
+                "mar_unknown",
+                sample_mar_in(SCHEME_UNKNOWN, Some(SCSCF_URI), None),
+            ),
+            (
+                "mar_sip_digest",
+                sample_mar_in(SCHEME_SIP_DIGEST, Some(SCSCF_URI), None),
+            ),
             ("saa", sample_saa()),
             ("lia", sample_lia()),
             ("maa", sample_maa()),

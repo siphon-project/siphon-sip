@@ -137,6 +137,7 @@ All four, plus the reliable-provisional scenario that had been driven only by
 | Static users backend | Implemented | `auth.backend: static` | Inline config credentials |
 | Diameter Cx backend (HSS) | **Production** | `auth.backend: diameter_cx` | 3GPP TS 29.228 |
 | AKA / AKAv1-MD5 (HSS-backed) | **Production** | `auth.require_ims_digest()` | 3GPP TS 33.203 via Cx MAR/MAA |
+| SIP Digest (HSS-backed) | Implemented | `auth.require_ims_digest()` | 3GPP TS 33.203 Annex N: H(A1) from the HSS in `SIP-Digest-Authenticate`, mechanism selected per TS 24.229 clause 5.4.1.1, MD5 and SHA-256, `Authentication-Info` with `rspauth`, nonce count replay check and `stale=true`. Unit-tested against RFC 2617 and RFC 7616 vectors and a mock HSS; the Cx messages are checked against the Wireshark dissector (`scripts/validate_diameter_cx_requests.sh`). Not run against a third-party client or HSS. |
 | AKA / AKAv1-MD5 (local Milenage) | Implemented | `auth.aka_credentials` | 3GPP TS 35.206 — local key derivation without HSS. The 401 carries `ck=`/`ik=` like the HSS path, so a P-CSCF in front sets up IPsec from it; exercised end-to-end over real XFRM SAs in the `sipp-ipsec` harness (sipp_ipsec UE) |
 | SHA-256 digest (RFC 7616) | Implemented | | |
 | Anti-spoofing (from=auth check) | **Production** | Script logic | `auth_user == from_uri.user` (caller-ID/From); the registrar-side AoR/To equivalent is `registrar.enforce_auth_aor_match` |

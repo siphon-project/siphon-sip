@@ -177,7 +177,8 @@ SCSCF_URI = "sip:scscf.ims.example.com:6060"
 # leave it out and it is derived from the public identity (TS 24.229 5.3.1.2).
 result = await diameter.cx_uar(public_identity, visited_network, user_name=private_identity)
 
-# S-CSCF, IMS AKA: the MAR, the 401 challenge and the verification in one call.
+# S-CSCF, IMS AKA or SIP Digest: the MAR, the 401 challenge and the
+# verification in one call.
 if not await auth.require_ims_digest(request, realm=REALM, server_name=SCSCF_URI):
     return
 
@@ -187,7 +188,9 @@ answer = await diameter.cx_mar(public_identity, private_identity, SCSCF_URI,
 ha1 = answer["auth_items"][0]["digest_ha1"]
 ```
 
-`auth.require_ims_digest` asks for the `Digest-AKAv1-MD5` scheme, takes
+`auth.require_ims_digest` asks for the scheme the REGISTER calls for
+(`Digest-AKAv1-MD5`, `SIP Digest` or `Unknown`, see
+[IMS AKA or SIP Digest](security.md#ims-aka-or-sip-digest)), takes
 Public-Identity from the To header of the REGISTER and User-Name from its
 Authorization header (or derives it), and sends the MAR to the peer the `cx`
 route names. Pass `server_name`: without it
@@ -199,9 +202,10 @@ What the HSS answers decides what `require_ims_digest` does:
 
 | The HSS answers | `require_ims_digest` |
 |---|---|
-| `DIAMETER_SUCCESS` with an IMS AKA item | sets the 401 challenge, returns `False` |
-| `DIAMETER_SUCCESS` with an item that names another scheme | raises `RuntimeError` and logs an error, no challenge |
-| `DIAMETER_SUCCESS` without `SIP-Auth-Data-Item`, `SIP-Authenticate` or `SIP-Authorization` | raises `RuntimeError` and logs an error, no challenge |
+| `DIAMETER_SUCCESS` with an item in the scheme asked for | sets the 401 challenge, returns `False` |
+| `DIAMETER_SUCCESS` with an item that names another scheme than the one named | raises `RuntimeError` and logs an error, no challenge |
+| `DIAMETER_SUCCESS` to `Unknown` in a scheme that is not implemented | sets `403 Forbidden`, returns `False`, logs an error |
+| `DIAMETER_SUCCESS` without `SIP-Auth-Data-Item`, or for IMS AKA without `SIP-Authenticate` or `SIP-Authorization`, or for SIP Digest without a usable `SIP-Digest-Authenticate` | raises `RuntimeError` and logs an error, no challenge |
 | `DIAMETER_ERROR_AUTH_SCHEME_NOT_SUPPORTED` (5006) | sets `403 Forbidden`, returns `False`, logs a warning |
 | any other result | sets `403 Forbidden`, returns `False`, logs a warning with the result |
 | nothing (transport error or timeout) | raises `RuntimeError` |

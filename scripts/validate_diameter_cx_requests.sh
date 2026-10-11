@@ -9,12 +9,16 @@
 # synchronisation failure) and a Server-Assignment-Request, and asserts tshark,
 # with its own dictionary, reads back the User-Name and Server-Name the
 # commands require and the scheme. It then reads the answers the helpers for
-# the HSS side build, for success carried as Result-Code.
+# the HSS side build, for success carried as Result-Code, and the SIP Digest
+# messages: Multimedia-Auth-Requests in the schemes "Unknown" and "SIP Digest",
+# and two answers with SIP-Digest-Authenticate, one as the mock HSS of the
+# tests encodes it and one built by a script through request.answer().
 #
 #   scripts/validate_diameter_cx_requests.sh
 #
 # Needs tshark and text2pcap (wireshark-common). CI runners have neither, so
-# run it locally after touching the builders in src/diameter/cx.rs.
+# run it locally after touching the builders in src/diameter/cx.rs, the
+# dictionary entries of the digest AVPs, or src/script/api/auth/sip_digest.rs.
 
 set -euo pipefail
 
@@ -40,9 +44,13 @@ rm -f "$WORK"/*.hex "$PCAP"
 echo "building the requests the way the client does"
 SIPHON_CX_REQUESTS_HEX_DIR="$WORK" \
   PYO3_PYTHON="${PYO3_PYTHON:-python3}" \
-  cargo test --lib diameter::cx::tests::emit_cx_requests_for_external_dissection -- --exact >/dev/null
+  cargo test --lib -- --exact \
+  diameter::cx::tests::emit_cx_requests_for_external_dissection \
+  script::api::auth::sip_digest::tests::emit_sip_digest_maa_for_external_dissection \
+  script::api::diameter_server::tests::emit_sip_digest_answer_for_external_dissection >/dev/null
 
-for name in uar mar mar_resync sar saa lia maa rta; do
+for name in uar mar mar_resync sar saa lia maa rta mar_unknown mar_sip_digest \
+  maa_sip_digest_mock maa_sip_digest_script; do
   if [[ ! -s "$WORK/$name.hex" ]]; then
     echo "the encoder produced no $name" >&2
     exit 1
@@ -50,10 +58,14 @@ for name in uar mar mar_resync sar saa lia maa rta; do
 done
 
 # One packet per message: frame 1 the UAR, 2 the MAR, 3 the MAR after a
-# synchronisation failure, 4 the SAR, then the answers SAA, LIA, MAA and RTA.
+# synchronisation failure, 4 the SAR, then the answers SAA, LIA, MAA and RTA,
+# 9 and 10 the MARs in the schemes "Unknown" and "SIP Digest", 11 and 12 the
+# SIP Digest MAAs of the mock HSS and of a script.
 # 3868 is Diameter's registered port, so tshark's own dissector claims it.
 cat "$WORK/uar.hex" "$WORK/mar.hex" "$WORK/mar_resync.hex" "$WORK/sar.hex" \
-  "$WORK/saa.hex" "$WORK/lia.hex" "$WORK/maa.hex" "$WORK/rta.hex" >"$HEX"
+  "$WORK/saa.hex" "$WORK/lia.hex" "$WORK/maa.hex" "$WORK/rta.hex" \
+  "$WORK/mar_unknown.hex" "$WORK/mar_sip_digest.hex" \
+  "$WORK/maa_sip_digest_mock.hex" "$WORK/maa_sip_digest_script.hex" >"$HEX"
 text2pcap -q -T "3868,3868" "$HEX" "$PCAP"
 
 status=0
@@ -125,33 +137,82 @@ expect 7 diameter.User-Name "dave@ims.example.com"
 expect 7 diameter.Public-Identity "sip:dave@ims.example.com"
 expect 7 diameter.3GPP-SIP-Authentication-Scheme Digest-AKAv1-MD5
 
+# TS 29.229 clause 6.3.9: "Unknown" for an Authorization header without
+# integrity-protected, "SIP Digest" for a protected REGISTER.
+echo "reading the SIP Digest MARs back with tshark"
+for request in "9 Unknown" "10 SIP Digest"; do
+  frame="${request%% *}"
+  expect "$frame" diameter.cmd.code 303
+  expect "$frame" diameter.flags.request True
+  expect "$frame" diameter.User-Name "$PRIVATE_IDENTITY"
+  expect "$frame" diameter.Server-Name "$SCSCF_URI"
+  expect "$frame" diameter.3GPP-SIP-Authentication-Scheme "${request#* }"
+done
+
+# TS 29.229 clause 6.3.36 and table 6.3.0.1: SIP-Digest-Authenticate is 635 of
+# the 3GPP vendor, its digest attributes the RFC 5090 ones with no vendor.
+echo "reading the SIP Digest MAAs back with tshark"
+MOCK_HA1="$(printf '%s' "$PRIVATE_IDENTITY:digest.example.org:a password for 001010000000001" |
+  md5sum | cut -d' ' -f1)"
+for answer in "11 $MOCK_HA1" "12 3d78807defe7de2157e2b0b6573a855f"; do
+  frame="${answer%% *}"
+  expect "$frame" diameter.cmd.code 303
+  expect "$frame" diameter.flags.request False
+  expect "$frame" diameter.Result-Code 2001
+  expect "$frame" diameter.3GPP-SIP-Authentication-Scheme "SIP Digest"
+  expect "$frame" diameter.Digest-Realm digest.example.org
+  expect "$frame" diameter.Digest-Algorithm MD5
+  expect "$frame" diameter.Digest-Qop auth
+  expect "$frame" diameter.Digest-HA1 "${answer#* }"
+  digest_tree="$(tshark -r "$PCAP" -Y "frame.number == $frame" -V -O diameter 2>/dev/null)"
+  for avp in "635 SIP-Digest-Authenticate" "104 Digest-Realm" "110 Digest-Qop" \
+    "111 Digest-Algorithm" "121 Digest-HA1" "662 " "663 "; do
+    if [[ "$(grep -cF "AVP Code: $avp" <<<"$digest_tree" || true)" != "1" ]]; then
+      echo "  FAIL frame $frame: not exactly one AVP Code: $avp" >&2
+      status=1
+    fi
+  done
+  # Three levels down: SIP-Auth-Data-Item, SIP-Digest-Authenticate, member.
+  nested="$(grep -cE '^ {20}Digest-(Realm|Algorithm|Qop|HA1): ' <<<"$digest_tree" || true)"
+  if [[ "$nested" == "4" ]]; then
+    echo "  ok   frame $frame: 635, 104, 110, 111, 121, 662 and 663 once each, the four digest attributes nested in SIP-Digest-Authenticate"
+  else
+    echo "  FAIL frame $frame: $nested of 4 digest attributes under SIP-Digest-Authenticate" >&2
+    status=1
+  fi
+done
+
 tree="$(tshark -r "$PCAP" -V -O diameter 2>/dev/null)"
 
 # User-Name is a base AVP: the M bit and no vendor (RFC 6733 clause 4.5).
 flags="$(grep -A1 -F "AVP Code: 1 User-Name" <<<"$tree" | grep -cF "AVP Flags: 0x40, Mandatory: Set" || true)"
-if [[ "$flags" != "5" ]]; then
-  echo "  FAIL User-Name flags: $flags of 5 messages carry it as M, no vendor" >&2
+if [[ "$flags" != "9" ]]; then
+  echo "  FAIL User-Name flags: $flags of 9 messages carry it as M, no vendor" >&2
   status=1
 else
-  echo "  ok   User-Name is M with no vendor in the four requests and the MAA"
+  echo "  ok   User-Name is M with no vendor in the six requests and the three MAAs"
 fi
 flags="$(grep -A1 -F "AVP Code: 602 Server-Name" <<<"$tree" | grep -cF "AVP Flags: 0xc0, Vendor-Specific: Set, Mandatory: Set" || true)"
-if [[ "$flags" != "4" ]]; then
-  echo "  FAIL Server-Name flags: $flags of 4 messages carry it as V and M" >&2
+if [[ "$flags" != "6" ]]; then
+  echo "  FAIL Server-Name flags: $flags of 6 messages carry it as V and M" >&2
   status=1
 else
-  echo "  ok   Server-Name is V and M in both MARs, the SAR and the LIA"
+  echo "  ok   Server-Name is V and M in the four MARs, the SAR and the LIA"
 fi
 
-if grep -q "Unknown AVP" <<<"$tree"; then
+# Wireshark's dictionary may predate Alternate-Digest-Algorithm (662) and
+# Alternate-Digest-HA1 (663) of TS 29.229 clauses 6.3.72 and 6.3.73. It then
+# lists them by code under the 3GPP vendor and raises "undecoded" expert info
+# for the two answers that carry them. Anything else it does not know fails.
+if grep -F "Unknown AVP" <<<"$tree" | grep -qvE 'Unknown AVP 66[23] \(vendor=3GPP\)'; then
   echo "  FAIL an AVP tshark does not recognise" >&2
   status=1
 fi
-if [[ -n "$(tshark -r "$PCAP" -Y '_ws.malformed || _ws.expert' 2>/dev/null)" ]]; then
+if [[ -n "$(tshark -r "$PCAP" -Y '_ws.malformed || (_ws.expert && frame.number < 11)' 2>/dev/null)" ]]; then
   echo "  FAIL tshark flagged a message as malformed or raised expert info" >&2
   status=1
 else
-  echo "  ok   nothing malformed, no expert info"
+  echo "  ok   nothing malformed, no expert info but for AVPs 662 and 663"
 fi
 
 if [[ $status -ne 0 ]]; then

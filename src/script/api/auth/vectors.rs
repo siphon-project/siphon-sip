@@ -1,9 +1,17 @@
-//! Pending IMS AKA auth vectors: the expected response cached between a 401
-//! challenge and the REGISTER that answers it.
+//! Pending IMS challenges: what is cached between a 401 and the REGISTER that
+//! answers it, keyed by the nonce of the challenge.
+//!
+//! One store holds both kinds. An IMS-AKA entry is the expected response and
+//! is used once. A SIP Digest entry is the H(A1) the subscriber server handed
+//! out and lives on after the first answer, with the last nonce count, so a
+//! later REGISTER under the same nonce is checked without another challenge.
 
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
+
+use super::sip_digest::SipDigestChallenge;
 
 /// Expected response, cached between the 401 challenge and the verification
 /// REGISTER so the second REGISTER can be checked without deriving a fresh
@@ -24,7 +32,51 @@ pub(super) struct ImsAuthVector {
     pub(super) expected_response: Vec<u8>,
     /// When the challenge was issued, so one that is never answered expires
     /// instead of sitting in the store for the life of the process.
-    pub(super) stored_at: std::time::Instant,
+    pub(super) stored_at: Instant,
+}
+
+/// A SIP Digest challenge and how far its nonce has been used.
+#[derive(Debug, Clone)]
+struct SipDigestEntry {
+    challenge: SipDigestChallenge,
+    /// The nonce count of the last REGISTER that verified, 0 before the first.
+    last_nonce_count: u32,
+    /// When the nonce stops being accepted.
+    valid_until: Instant,
+}
+
+/// What is pending under a nonce.
+#[derive(Debug, Clone)]
+enum Pending {
+    Aka(ImsAuthVector),
+    SipDigest(SipDigestEntry),
+}
+
+impl Pending {
+    fn is_live(&self) -> bool {
+        match self {
+            Pending::Aka(vector) => vector.stored_at.elapsed() < AUTH_VECTOR_TTL,
+            Pending::SipDigest(entry) => Instant::now() < entry.valid_until,
+        }
+    }
+}
+
+/// The scheme of the challenge a nonce belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PendingScheme {
+    Aka,
+    SipDigest,
+}
+
+/// What recording a verified nonce count found.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum NonceCount {
+    /// Higher than the last one: recorded, and the nonce stays valid.
+    Accepted,
+    /// Not higher than the last one: a replay, nothing recorded.
+    Replayed,
+    /// The nonce is gone or has expired.
+    Unknown,
 }
 
 /// How long a pending auth vector stays usable after its 401 went out.
@@ -34,23 +86,23 @@ pub(super) struct ImsAuthVector {
 /// link and a retransmitted REGISTER. The bound matters because the store only
 /// ever shrank on a *successful* verification, so a peer that collects 401s and
 /// never answers grew it for the life of the process.
-pub(super) const AUTH_VECTOR_TTL: std::time::Duration = std::time::Duration::from_secs(120);
+pub(super) const AUTH_VECTOR_TTL: Duration = Duration::from_secs(120);
 
 /// Prune every Nth insert rather than on each one, so a burst of challenges
 /// does not turn every insert into a full scan of the store. A trickle keeps
 /// the store small on its own, and a burst reaches the threshold quickly.
 const AUTH_VECTOR_PRUNE_EVERY: u64 = 64;
 
-/// Pending IMS auth vectors, keyed by nonce: stored with the 401 challenge,
-/// consumed by the REGISTER that answers it.
+/// Pending IMS challenges, keyed by nonce: stored with the 401 challenge,
+/// read by the REGISTER that answers it.
 ///
-/// Prunes expired vectors on every `AUTH_VECTOR_PRUNE_EVERY`th insert. The
+/// Prunes expired entries on every `AUTH_VECTOR_PRUNE_EVERY`th insert. The
 /// insert counter is atomic, so under concurrent inserts each threshold goes to
-/// exactly one insert, and that insert prunes before it stores its own vector. A
+/// exactly one insert, and that insert prunes before it stores its own entry. A
 /// prune can run on another thread than the insert that happens to push the
 /// store past a threshold, but none is skipped, which is what bounds the store.
 pub(super) struct AuthVectorStore {
-    vectors: DashMap<String, ImsAuthVector>,
+    vectors: DashMap<String, Pending>,
     inserts: std::sync::atomic::AtomicU64,
 }
 
@@ -62,35 +114,103 @@ impl AuthVectorStore {
         }
     }
 
-    /// Cache the expected response for `nonce`, dropping any vector whose
-    /// challenge has since expired.
-    fn insert(&self, nonce: String, expected_response: Vec<u8>) {
+    /// Store `pending` under `nonce`, dropping every entry that has expired.
+    fn insert_pending(&self, nonce: String, pending: Pending) {
         let count = self
             .inserts
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if count.is_multiple_of(AUTH_VECTOR_PRUNE_EVERY) {
-            self.vectors
-                .retain(|_, vector| vector.stored_at.elapsed() < AUTH_VECTOR_TTL);
+            self.vectors.retain(|_, pending| pending.is_live());
         }
-        self.vectors.insert(
+        self.vectors.insert(nonce, pending);
+    }
+
+    /// Cache the expected response for `nonce`, dropping any vector whose
+    /// challenge has since expired.
+    fn insert(&self, nonce: String, expected_response: Vec<u8>) {
+        self.insert_pending(
             nonce,
-            ImsAuthVector {
+            Pending::Aka(ImsAuthVector {
                 expected_response,
-                stored_at: std::time::Instant::now(),
-            },
+                stored_at: Instant::now(),
+            }),
         );
     }
 
-    /// Consume the vector for `nonce`, if one is cached and still within its
-    /// TTL.
+    /// Cache a SIP Digest challenge under its nonce. It waits for its first
+    /// answer as long as an AKA vector does.
+    fn insert_digest(&self, nonce: String, challenge: SipDigestChallenge) {
+        self.insert_pending(
+            nonce,
+            Pending::SipDigest(SipDigestEntry {
+                challenge,
+                last_nonce_count: 0,
+                valid_until: Instant::now() + AUTH_VECTOR_TTL,
+            }),
+        );
+    }
+
+    /// Consume the AKA vector for `nonce`, if one is cached and still within
+    /// its TTL.
     ///
     /// Removal is unconditional, so a nonce is single-use whether or not the
     /// response verifies: replaying a captured `Authorization` finds nothing.
+    /// A SIP Digest challenge under the nonce is left alone.
     fn take(&self, nonce: &str) -> Option<ImsAuthVector> {
-        self.vectors
-            .remove(nonce)
-            .map(|(_, vector)| vector)
-            .filter(|vector| vector.stored_at.elapsed() < AUTH_VECTOR_TTL)
+        let (_, pending) = self
+            .vectors
+            .remove_if(nonce, |_, pending| matches!(pending, Pending::Aka(_)))?;
+        match pending {
+            Pending::Aka(vector) if vector.stored_at.elapsed() < AUTH_VECTOR_TTL => Some(vector),
+            _ => None,
+        }
+    }
+
+    /// The scheme of the live challenge under `nonce`.
+    fn scheme(&self, nonce: &str) -> Option<PendingScheme> {
+        let pending = self.vectors.get(nonce)?;
+        pending.is_live().then(|| match pending.value() {
+            Pending::Aka(_) => PendingScheme::Aka,
+            Pending::SipDigest(_) => PendingScheme::SipDigest,
+        })
+    }
+
+    /// The live SIP Digest challenge under `nonce` and whether it has been
+    /// answered before.
+    fn digest(&self, nonce: &str) -> Option<(SipDigestChallenge, bool)> {
+        let pending = self.vectors.get(nonce)?;
+        match pending.value() {
+            Pending::SipDigest(entry) if pending.is_live() => {
+                Some((entry.challenge.clone(), entry.last_nonce_count > 0))
+            }
+            _ => None,
+        }
+    }
+
+    /// Record the nonce count of a response that verified. The check and the
+    /// write happen under the entry's lock, so of two REGISTERs with the same
+    /// count only one is accepted. An accepted count keeps the nonce valid for
+    /// `lifetime` from now.
+    fn record_nonce_count(&self, nonce: &str, count: u32, lifetime: Duration) -> NonceCount {
+        let Some(mut pending) = self.vectors.get_mut(nonce) else {
+            return NonceCount::Unknown;
+        };
+        if !pending.is_live() {
+            return NonceCount::Unknown;
+        }
+        match pending.value_mut() {
+            Pending::SipDigest(entry) if count > entry.last_nonce_count => {
+                entry.last_nonce_count = count;
+                entry.valid_until = Instant::now() + lifetime;
+                NonceCount::Accepted
+            }
+            Pending::SipDigest(_) => NonceCount::Replayed,
+            Pending::Aka(_) => NonceCount::Unknown,
+        }
+    }
+
+    fn forget(&self, nonce: &str) {
+        self.vectors.remove(nonce);
     }
 
     pub(super) fn contains(&self, nonce: &str) -> bool {
@@ -103,17 +223,16 @@ impl AuthVectorStore {
 }
 
 /// The process-wide [`AuthVectorStore`]: populated on the first REGISTER (401
-/// challenge), consumed on the second (credential verification).
+/// challenge), read on the second (credential verification).
 static AUTH_VECTORS: OnceLock<AuthVectorStore> = OnceLock::new();
 
 pub(super) fn auth_vectors() -> &'static AuthVectorStore {
     AUTH_VECTORS.get_or_init(AuthVectorStore::new)
 }
 
-/// The process-wide vectors themselves, for the lookups that read the map
-/// directly.
-pub(super) fn ims_auth_store() -> &'static DashMap<String, ImsAuthVector> {
-    &auth_vectors().vectors
+/// Drop whatever is pending under `nonce` in the process-wide store.
+pub(super) fn forget_challenge(nonce: &str) {
+    auth_vectors().forget(nonce);
 }
 
 /// Cache the expected response for `nonce` in the process-wide store.
@@ -126,18 +245,61 @@ pub(super) fn take_auth_vector(nonce: &str) -> Option<ImsAuthVector> {
     auth_vectors().take(nonce)
 }
 
+/// The scheme of the live challenge under `nonce` in the process-wide store.
+pub(super) fn pending_scheme(nonce: &str) -> Option<PendingScheme> {
+    auth_vectors().scheme(nonce)
+}
+
+/// Cache a SIP Digest challenge in the process-wide store.
+pub(super) fn store_digest_challenge(nonce: String, challenge: SipDigestChallenge) {
+    auth_vectors().insert_digest(nonce, challenge);
+}
+
+/// The live SIP Digest challenge under `nonce` and whether it has been
+/// answered before.
+pub(super) fn digest_challenge(nonce: &str) -> Option<(SipDigestChallenge, bool)> {
+    auth_vectors().digest(nonce)
+}
+
+/// Record a verified nonce count in the process-wide store.
+pub(super) fn record_nonce_count(nonce: &str, count: u32, lifetime: Duration) -> NonceCount {
+    auth_vectors().record_nonce_count(nonce, count, lifetime)
+}
+
+/// Store an AKA vector whose challenge went out longer ago than the TTL.
+#[cfg(test)]
+pub(super) fn store_expired_auth_vector(nonce: String, expected_response: Vec<u8>) {
+    auth_vectors().vectors.insert(
+        nonce,
+        Pending::Aka(ImsAuthVector {
+            expected_response,
+            stored_at: Instant::now() - (AUTH_VECTOR_TTL + Duration::from_secs(1)),
+        }),
+    );
+}
+
+/// Make the SIP Digest nonce expire now, as the passing of its lifetime does.
+#[cfg(test)]
+pub(super) fn expire_digest_challenge(nonce: &str) {
+    if let Some(mut pending) = auth_vectors().vectors.get_mut(nonce) {
+        if let Pending::SipDigest(entry) = pending.value_mut() {
+            entry.valid_until = Instant::now() - Duration::from_secs(1);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Arc;
 
     /// A vector whose challenge went out longer ago than the TTL.
-    fn expired_vector() -> ImsAuthVector {
-        ImsAuthVector {
+    fn expired_vector() -> Pending {
+        Pending::Aka(ImsAuthVector {
             expected_response: vec![0xBB; 8],
             stored_at: std::time::Instant::now()
                 - (AUTH_VECTOR_TTL + std::time::Duration::from_secs(1)),
-        }
+        })
     }
 
     /// The insert that reaches the prune threshold drops every expired vector
