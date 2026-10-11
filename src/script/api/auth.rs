@@ -16,6 +16,7 @@ use pyo3::prelude::*;
 use tracing::{debug, warn};
 
 use super::call::PyCall;
+use super::diameter_cx::{cx_client, ims_private_identity, ImsRegistration};
 use super::request::PyRequest;
 use crate::auth::server::{ha1_column_for, CredentialLookup, DatabaseCredentials};
 use crate::auth::DigestAlgorithm;
@@ -594,28 +595,39 @@ impl PyAuth {
         self.require_www_digest(python, target, realm, password, ha1)
     }
 
-    /// IMS digest authentication via Diameter Cx MAR/MAA.
+    /// IMS AKA authentication via Diameter Cx MAR/MAA.
     ///
-    /// Sends a Multimedia-Auth-Request to the HSS and uses the returned
-    /// authentication vector to challenge or verify the UE.
+    /// Sends a Multimedia-Auth-Request to the HSS the Cx route names and uses
+    /// the returned authentication vector to challenge or verify the UE. The
+    /// MAR asks for the `Digest-AKAv1-MD5` scheme (TS 29.229 clause 6.3.9) and
+    /// names the private user identity as User-Name: the `username` of the
+    /// Authorization header, or without one the identity TS 24.229 clause
+    /// 5.4.1.1 derives from the public user identity.
+    ///
+    /// Args:
+    ///     request: The REGISTER.
+    ///     realm: Digest realm of the challenge (defaults to the configured one).
+    ///     server_name: This S-CSCF's SIP URI, sent as Server-Name. The MAR
+    ///         requires it (TS 29.229 clause 6.1.7) and the HSS stores it as the
+    ///         S-CSCF serving the user, so pass the URI given to `cx_sar`.
+    ///         Without it the AVP is left out and a warning is logged.
     ///
     /// Returns True if credentials are valid, False if a 401 challenge was sent.
     /// Raises RuntimeError if no Diameter connection is available.
-    #[pyo3(signature = (request, realm=None))]
+    #[pyo3(signature = (request, realm=None, server_name=None))]
     fn require_ims_digest<'py>(
         &self,
         python: Python<'py>,
         request: &Bound<'py, PyRequest>,
         realm: Option<&str>,
+        server_name: Option<&str>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let diameter = self.diameter_manager.as_ref().ok_or_else(|| {
             pyo3::exceptions::PyRuntimeError::new_err(
                 "IMS digest auth requires a Diameter connection (diameter: section in config)",
             )
         })?;
-        let client = diameter.any_client().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err("no Diameter peer connected")
-        })?;
+        let client = cx_client(diameter)?;
         let realm = realm.unwrap_or(&self.default_realm).to_string();
 
         // Read before the future: the message behind a `Bound` cannot cross an
@@ -639,12 +651,24 @@ impl PyAuth {
                 guard.headers.get("Authorization").cloned(),
             )
         };
+        if server_name.is_none() {
+            tracing::warn!(
+                "require_ims_digest: no server_name given, the MAR goes out without the \
+                 mandatory Server-Name AVP"
+            );
+        }
+        let registration = ImsRegistration {
+            user_name: ims_private_identity(existing_auth.as_deref(), &public_identity),
+            public_identity,
+            server_name: server_name.map(str::to_string),
+            authorization: existing_auth,
+        };
 
         let auth = self.clone();
         let handle: Py<PyRequest> = request.clone().unbind();
         crate::script::awaitable(
             python,
-            Self::ims_digest_flow(auth, client, handle, realm, public_identity, existing_auth),
+            Self::ims_digest_flow(auth, client, handle, realm, registration),
         )
     }
 
@@ -888,12 +912,18 @@ impl PyAuth {
         client: std::sync::Arc<crate::diameter::DiameterClient>,
         request: Py<PyRequest>,
         realm: String,
-        public_identity: String,
-        existing_auth: Option<String>,
+        registration: ImsRegistration,
     ) -> PyResult<bool> {
         use crate::diameter::codec;
+        use crate::diameter::cx::{MultimediaAuth, SCHEME_IMS_AKA};
         use crate::diameter::dictionary::avp;
         let realm = realm.as_str();
+        let ImsRegistration {
+            public_identity,
+            user_name,
+            server_name,
+            authorization: existing_auth,
+        } = registration;
 
         // ── Second REGISTER (has Authorization) — verify against stored vector ──
         if let Some(ref auth_value) = existing_auth {
@@ -914,12 +944,14 @@ impl PyAuth {
                                     resync_data.extend_from_slice(&auts_bytes);
 
                                     let maa_resync = client
-                                        .send_mar(
-                                            &public_identity,
-                                            1,
-                                            "Digest-AKAv1-MD5",
-                                            Some(&resync_data),
-                                        )
+                                        .send_mar(&MultimediaAuth {
+                                            public_identity: &public_identity,
+                                            user_name: &user_name,
+                                            server_name: server_name.as_deref(),
+                                            sip_number_auth_items: 1,
+                                            sip_auth_scheme: SCHEME_IMS_AKA,
+                                            sip_authorization: Some(&resync_data),
+                                        })
                                         .await
                                         .map_err(|error| {
                                             pyo3::exceptions::PyRuntimeError::new_err(format!(
@@ -996,7 +1028,16 @@ impl PyAuth {
 
         // ── First REGISTER (no Authorization) or re-challenge — send MAR ──
         let maa = client
-            .send_mar(&public_identity, 1, "SIP Digest", None)
+            .send_mar(&MultimediaAuth {
+                public_identity: &public_identity,
+                user_name: &user_name,
+                server_name: server_name.as_deref(),
+                sip_number_auth_items: 1,
+                // The challenge below is always AKAv1-MD5, so the vector asked
+                // for is an IMS AKA one (TS 29.229 clause 6.3.9).
+                sip_auth_scheme: SCHEME_IMS_AKA,
+                sip_authorization: None,
+            })
             .await
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("MAR failed: {e}")))?;
 
@@ -2229,7 +2270,7 @@ fn md5_ha1_aka(username: &str, realm: &str, password_bytes: &[u8]) -> String {
 
 /// Extract a named parameter from a Digest header value.
 /// Handles both quoted and unquoted values.
-fn extract_digest_param(auth_value: &str, param: &str) -> Option<String> {
+pub(super) fn extract_digest_param(auth_value: &str, param: &str) -> Option<String> {
     let auth_lower = auth_value.to_lowercase();
     let needle = format!("{}=", param);
     let pos = auth_lower.find(&needle)?;
@@ -4474,5 +4515,192 @@ mod tests {
         // store_credential is a no-op and lookups always miss.
         auth.store_credential("alice", "x");
         assert!(auth.cached_credential("alice", 300).is_none());
+    }
+
+    // ── require_ims_digest: the Multimedia-Auth-Request it sends ─────────
+
+    const IMS_PUBLIC_IDENTITY: &str = "sip:001010000000001@ims.mnc001.mcc001.3gppnetwork.org";
+    const IMS_PRIVATE_IDENTITY: &str = "001010000000001@ims.mnc001.mcc001.3gppnetwork.org";
+    const IMS_SCSCF_URI: &str = "sip:scscf.ims.mnc001.mcc001.3gppnetwork.org:6060";
+
+    fn ims_register(authorization: Option<&str>) -> PyRequest {
+        let mut builder = SipMessageBuilder::new()
+            .request(
+                Method::Register,
+                SipUri::new("ims.mnc001.mcc001.3gppnetwork.org".to_string()),
+            )
+            .via("SIP/2.0/UDP 192.0.2.1:5060;branch=z9hG4bK-ims".to_string())
+            .to(format!("<{IMS_PUBLIC_IDENTITY}>"))
+            .from(format!("<{IMS_PUBLIC_IDENTITY}>;tag=ims-tag"))
+            .call_id("ims-register@192.0.2.1".to_string())
+            .cseq("1 REGISTER".to_string());
+        if let Some(value) = authorization {
+            builder = builder.header("Authorization", value.to_string());
+        }
+        let message = builder.content_length(0).build().unwrap();
+        PyRequest::new(
+            Arc::new(Mutex::new(message)),
+            "udp".to_string(),
+            "192.0.2.1".to_string(),
+            5060,
+        )
+    }
+
+    /// Run the MAR flow for a REGISTER against a mock HSS and return the
+    /// requests that HSS received.
+    async fn mars_sent_for(
+        authorization: Option<&str>,
+        server_name: Option<&str>,
+    ) -> Vec<serde_json::Value> {
+        pyo3::Python::initialize();
+        let (client, captured) = crate::diameter::cx_test_support::mock_hss_client().await;
+        let request = ims_register(authorization);
+        let handle = pyo3::Python::attach(|python| Py::new(python, request).unwrap());
+        let registration = ImsRegistration {
+            user_name: ims_private_identity(authorization, IMS_PUBLIC_IDENTITY),
+            public_identity: IMS_PUBLIC_IDENTITY.to_string(),
+            server_name: server_name.map(str::to_string),
+            authorization: authorization.map(str::to_string),
+        };
+        let challenged = PyAuth::ims_digest_flow(
+            make_auth(),
+            client,
+            handle,
+            "ims.mnc001.mcc001.3gppnetwork.org".to_string(),
+            registration,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !challenged,
+            "the first REGISTER is challenged, not accepted"
+        );
+        let requests = captured.lock().unwrap().clone();
+        requests
+    }
+
+    /// The Authorization header of an initial IMS REGISTER (TS 24.229 clause
+    /// 5.1.1.2): the private identity, and empty nonce and response.
+    fn initial_ims_authorization() -> String {
+        format!(
+            "Digest username=\"{IMS_PRIVATE_IDENTITY}\", \
+             realm=\"ims.mnc001.mcc001.3gppnetwork.org\", nonce=\"\", \
+             uri=\"sip:ims.mnc001.mcc001.3gppnetwork.org\", response=\"\""
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ims_mar_names_the_user_the_server_and_the_aka_scheme() {
+        let requests = mars_sent_for(Some(&initial_ims_authorization()), Some(IMS_SCSCF_URI)).await;
+        assert_eq!(requests.len(), 1);
+        let mar = &requests[0];
+        assert_eq!(mar["User-Name"], IMS_PRIVATE_IDENTITY);
+        assert_eq!(mar["Server-Name"], IMS_SCSCF_URI);
+        assert_eq!(mar["Public-Identity"], IMS_PUBLIC_IDENTITY);
+        assert_eq!(
+            mar["SIP-Auth-Data-Item"]["SIP-Authentication-Scheme"], "Digest-AKAv1-MD5",
+            "the flow challenges with AKAv1-MD5, so it asks the HSS for an AKA vector"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ims_mar_derives_the_user_name_when_the_register_has_no_authorization() {
+        let requests = mars_sent_for(None, Some(IMS_SCSCF_URI)).await;
+        assert_eq!(requests[0]["User-Name"], IMS_PRIVATE_IDENTITY);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ims_resynchronisation_mar_names_the_user_and_the_server_too() {
+        let nonce = base64_encode(&[0x5a; 32]);
+        let auts = base64_encode(&[0x77; 14]);
+        let authorization = format!(
+            "Digest username=\"{IMS_PRIVATE_IDENTITY}\", \
+             realm=\"ims.mnc001.mcc001.3gppnetwork.org\", nonce=\"{nonce}\", \
+             uri=\"sip:ims.mnc001.mcc001.3gppnetwork.org\", response=\"\", auts=\"{auts}\""
+        );
+        let requests = mars_sent_for(Some(&authorization), Some(IMS_SCSCF_URI)).await;
+        assert_eq!(requests.len(), 1);
+        let mar = &requests[0];
+        assert_eq!(mar["User-Name"], IMS_PRIVATE_IDENTITY);
+        assert_eq!(mar["Server-Name"], IMS_SCSCF_URI);
+        let item = &mar["SIP-Auth-Data-Item"];
+        assert_eq!(item["SIP-Authentication-Scheme"], "Digest-AKAv1-MD5");
+        // RAND (the first 16 octets of the nonce) then AUTS.
+        let mut expected = vec![0x5au8; 16];
+        expected.extend_from_slice(&[0x77; 14]);
+        assert_eq!(
+            item["SIP-Authorization"].as_str().unwrap(),
+            crate::diameter::codec::hex::encode(&expected)
+        );
+    }
+
+    #[test]
+    fn ims_private_identity_prefers_the_authorization_username() {
+        assert_eq!(
+            ims_private_identity(
+                Some("Digest username=\"private@example.com\", realm=\"example.com\""),
+                "sip:public@example.com"
+            ),
+            "private@example.com"
+        );
+        // An empty username names nobody.
+        assert_eq!(
+            ims_private_identity(
+                Some("Digest username=\"\", realm=\"example.com\""),
+                "sip:public@example.com:5060;transport=tcp"
+            ),
+            "public@example.com"
+        );
+        assert_eq!(
+            ims_private_identity(None, "sip:public@example.com"),
+            "public@example.com"
+        );
+    }
+
+    fn register_idle_peer(manager: &DiameterManager, name: &str) {
+        let (write_tx, write_rx) = tokio::sync::mpsc::channel(1);
+        // Keep the receiver alive for the peer's lifetime; nothing reads it.
+        std::mem::forget(write_rx);
+        let mut config = crate::diameter::cx_test_support::hss_peer_config();
+        config.host = name.to_string();
+        let peer = Arc::new(crate::diameter::peer::DiameterPeer::new_for_test(
+            config, write_tx,
+        ));
+        manager.register(
+            name.to_string(),
+            Arc::new(crate::diameter::DiameterClient::new(peer)),
+        );
+    }
+
+    fn cx_route(peers: &[&str]) -> crate::config::DiameterRouteEntry {
+        crate::config::DiameterRouteEntry {
+            application: crate::config::DiameterApplication::Cx,
+            realm: None,
+            peers: peers.iter().map(|peer| peer.to_string()).collect(),
+            algorithm: "failover".to_string(),
+        }
+    }
+
+    /// With a second peer configured the MAR went to whichever the map yielded
+    /// first. It follows the Cx route, as the UAR, SAR and LIR do.
+    #[test]
+    fn ims_mar_follows_the_cx_route() {
+        pyo3::Python::initialize();
+        let manager = DiameterManager::with_routes(&[cx_route(&["hss"])]);
+        register_idle_peer(&manager, "cdf");
+        register_idle_peer(&manager, "hss");
+        let client = cx_client(&manager).unwrap();
+        assert_eq!(client.peer().config().host, "hss");
+    }
+
+    #[test]
+    fn ims_mar_does_not_fall_through_to_a_peer_outside_the_cx_route() {
+        pyo3::Python::initialize();
+        let manager = DiameterManager::with_routes(&[cx_route(&["hss"])]);
+        register_idle_peer(&manager, "cdf");
+        let error = cx_client(&manager).err().expect("no Cx peer is connected");
+        pyo3::Python::attach(|python| {
+            assert!(error.is_instance_of::<pyo3::exceptions::PyRuntimeError>(python));
+        });
     }
 }

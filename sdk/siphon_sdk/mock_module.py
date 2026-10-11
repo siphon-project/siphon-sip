@@ -3041,11 +3041,19 @@ class MockAuth:
         return _run()
 
     def require_ims_digest(self, request: Any,
-                          realm: Optional[str] = None) -> bool:
-        """IMS digest authentication via Diameter Cx MAR/MAA.
+                          realm: Optional[str] = None,
+                          server_name: Optional[str] = None) -> bool:
+        """IMS AKA authentication via Diameter Cx MAR/MAA.
 
-        Sends a Multimedia-Auth-Request to the HSS and uses the returned
-        authentication vector to challenge or verify the UE.
+        Sends a Multimedia-Auth-Request to the HSS the Cx route names and uses
+        the returned authentication vector to challenge or verify the UE.
+
+        Args:
+            request: The REGISTER.
+            realm: Digest realm of the challenge.
+            server_name: This S-CSCF's SIP URI, sent as Server-Name. The MAR
+                requires it (TS 29.229 clause 6.1.7), so pass the URI given to
+                ``diameter.cx_sar``. The mock accepts and ignores it.
 
         Takes a ``Request`` only — unlike :meth:`require_www_digest` /
         :meth:`require_proxy_digest`, IMS and AKA digest are REGISTER-time
@@ -6720,6 +6728,7 @@ class MockDiameter:
     def __init__(self) -> None:
         self._peers: dict[str, bool] = {}  # peer_name -> connected
         self._uar_responses: dict[str, dict] = {}  # public_identity -> response
+        self._mar_responses: dict[str, dict] = {}
         self._sar_responses: dict[str, dict] = {}
         self._lir_responses: dict[str, dict] = {}
         self._aar_responses: dict[str, dict] = {}  # session_id -> response
@@ -6814,7 +6823,8 @@ class MockDiameter:
 
     async def cx_uar(self, public_identity: str,
                visited_network_id: Optional[str] = None,
-               user_auth_type: Optional[int] = None) -> Optional[dict]:
+               user_auth_type: Optional[int] = None,
+               user_name: Optional[str] = None) -> Optional[dict]:
         """Send a User-Authorization-Request to discover S-CSCF assignment.
 
         Args:
@@ -6823,6 +6833,9 @@ class MockDiameter:
             user_auth_type: User-Authorization-Type AVP value (3GPP TS 29.229).
                 ``0`` = REGISTRATION, ``1`` = DE_REGISTRATION,
                 ``2`` = REGISTRATION_AND_CAPABILITIES.  Omit to not send the AVP.
+            user_name: The private user identity (User-Name): the ``username``
+                of the REGISTER's Authorization header. Omitted, siphon derives
+                it from ``public_identity``. The mock accepts and ignores it.
 
         Returns:
             Dict with ``result_code`` and ``server_name``, or ``None``.
@@ -6831,6 +6844,47 @@ class MockDiameter:
             return dict(self._uar_responses[public_identity])
         if self._default_server_name:
             return {"result_code": 2001, "server_name": self._default_server_name}
+        return None
+
+    async def cx_mar(self, public_identity: str,
+               user_name: str,
+               server_name: str,
+               scheme: Optional[str] = None,
+               number_auth_items: int = 1,
+               authorization: Optional[bytes] = None) -> Optional[dict]:
+        """Send a Multimedia-Auth-Request to fetch authentication vectors.
+
+        Args:
+            public_identity: User's public identity.
+            user_name: The private user identity (User-Name).
+            server_name: This S-CSCF's SIP URI (Server-Name).
+            scheme: SIP-Authentication-Scheme, ``"Digest-AKAv1-MD5"`` by default.
+            number_auth_items: How many vectors to ask for.
+            authorization: RAND then AUTS, after an IMS AKA synchronisation
+                failure only.
+
+        Returns:
+            Dict with ``result_code`` and ``auth_items`` (one dict per
+            SIP-Auth-Data-Item), as configured with :meth:`set_mar_response`,
+            or ``None`` when nothing is configured for the identity.
+
+        Raises:
+            ValueError: an identity or ``server_name`` is empty, or
+                ``number_auth_items`` is 0.
+        """
+        for name, value in (("public_identity", public_identity),
+                            ("user_name", user_name),
+                            ("server_name", server_name)):
+            if not value:
+                raise ValueError(f"cx_mar: {name} must not be empty")
+        if number_auth_items == 0:
+            raise ValueError("cx_mar: number_auth_items must be at least 1")
+        if public_identity in self._mar_responses:
+            response = self._mar_responses[public_identity]
+            return {
+                "result_code": response["result_code"],
+                "auth_items": [dict(item) for item in response["auth_items"]],
+            }
         return None
 
     async def cx_sar(self, public_identity: str,
@@ -7092,6 +7146,22 @@ class MockDiameter:
             server_name: S-CSCF SIP URI (e.g. ``"sip:scscf.ims.example.com:6060"``).
         """
         self._default_server_name = server_name
+
+    def set_mar_response(self, public_identity: str,
+                         result_code: int = 2001,
+                         auth_items: Optional[list] = None) -> None:
+        """Configure a mock MAA response for a specific user (test helper).
+
+        Args:
+            public_identity: User's public identity.
+            result_code: Diameter result code (default 2001 = SUCCESS).
+            auth_items: One dict per SIP-Auth-Data-Item, with the keys
+                ``diameter.cx_mar`` returns (``scheme``, ``authenticate``, ...).
+        """
+        self._mar_responses[public_identity] = {
+            "result_code": result_code,
+            "auth_items": [dict(item) for item in (auth_items or [])],
+        }
 
     def set_uar_response(self, public_identity: str,
                          result_code: int = 2001,
@@ -8049,6 +8119,7 @@ class MockDiameter:
         """Reset all mock peers and responses (test helper)."""
         self._peers.clear()
         self._uar_responses.clear()
+        self._mar_responses.clear()
         self._sar_responses.clear()
         self._lir_responses.clear()
         self._aar_responses.clear()

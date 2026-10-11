@@ -12,7 +12,7 @@
 
 use crate::diameter::codec::{self, *};
 use crate::diameter::dictionary::{self, avp};
-use crate::diameter::peer::IncomingRequest;
+use crate::diameter::peer::{IncomingRequest, PeerConfig};
 
 /// SIP-Item-Number AVP code (613, 3GPP vendor) — not in base dictionary.
 const AVP_SIP_ITEM_NUMBER: u32 = 613;
@@ -478,6 +478,174 @@ pub fn build_rtr(
     )
 }
 
+// ---------------------------------------------------------------------------
+// Requests this node sends to the HSS (I-CSCF / S-CSCF side)
+// ---------------------------------------------------------------------------
+
+/// The AVPs every Cx request starts with, in the order TS 29.229 lists them.
+fn append_request_header(payload: &mut Vec<u8>, config: &PeerConfig, session_id: &str) {
+    payload.extend_from_slice(&encode_avp_utf8(avp::SESSION_ID, session_id));
+    payload.extend_from_slice(&encode_avp_utf8(avp::ORIGIN_HOST, &config.origin_host));
+    payload.extend_from_slice(&encode_avp_utf8(avp::ORIGIN_REALM, &config.origin_realm));
+    payload.extend_from_slice(&encode_avp_utf8(
+        avp::DESTINATION_REALM,
+        &config.destination_realm,
+    ));
+    if let Some(destination_host) = &config.destination_host {
+        payload.extend_from_slice(&encode_avp_utf8(avp::DESTINATION_HOST, destination_host));
+    }
+    payload.extend_from_slice(&encode_avp_u32(avp::AUTH_SESSION_STATE, 1));
+    payload.extend_from_slice(&encode_vendor_specific_app_id(
+        dictionary::VENDOR_3GPP,
+        dictionary::CX_APP_ID,
+    ));
+}
+
+/// IMS AKA, the scheme `Digest-AKAv1-MD5` of TS 29.229 clause 6.3.9.
+pub const SCHEME_IMS_AKA: &str = "Digest-AKAv1-MD5";
+
+/// The private user identity a REGISTER without an Authorization header
+/// implies.
+///
+/// TS 24.229 clause 5.3.1.2 (I-CSCF) and clause 5.4.1.1 (S-CSCF): the node
+/// "shall derive the private user identity from the public user identity
+/// being registered [...] by removing URI scheme and the following parts of
+/// the URI if present: port number, URI parameters, and To header field
+/// parameters".
+pub fn derive_private_identity(public_identity: &str) -> String {
+    let uri = public_identity.trim();
+    let uri = uri.strip_prefix('<').unwrap_or(uri);
+    let uri = uri.split('>').next().unwrap_or(uri);
+    let uri = uri.split(';').next().unwrap_or(uri);
+    let without_scheme = ["sips:", "sip:", "tel:"]
+        .iter()
+        .find_map(|scheme| {
+            uri.get(..scheme.len())
+                .filter(|prefix| prefix.eq_ignore_ascii_case(scheme))
+                .map(|_| &uri[scheme.len()..])
+        })
+        .unwrap_or(uri);
+    // The port follows the host, which an IPv6 reference closes with ']'.
+    let host_start = without_scheme.rfind('@').map_or(0, |at| at + 1);
+    let host = &without_scheme[host_start..];
+    let port_search_from = host.rfind(']').map_or(0, |bracket| bracket + 1);
+    match host[port_search_from..].find(':') {
+        Some(colon) => without_scheme[..host_start + port_search_from + colon].to_string(),
+        None => without_scheme.to_string(),
+    }
+}
+
+/// What a User-Authorization-Request carries besides the routing AVPs.
+#[derive(Debug, Clone, Copy)]
+pub struct UserAuthorization<'a> {
+    pub public_identity: &'a str,
+    /// The private user identity, sent as User-Name. TS 29.229 clause 6.1.1
+    /// has `{ User-Name }` in the command, and TS 29.228 Table 6.1.1.1 makes
+    /// the Private User Identity mandatory.
+    pub user_name: &'a str,
+    pub visited_network_id: &'a str,
+    pub user_auth_type: Option<u32>,
+}
+
+/// Encode a UAR (User-Authorization-Request), I-CSCF to HSS.
+pub fn build_uar(
+    config: &PeerConfig,
+    session_id: &str,
+    request: &UserAuthorization<'_>,
+    hop_by_hop: u32,
+    end_to_end: u32,
+) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(512);
+    append_request_header(&mut payload, config, session_id);
+    payload.extend_from_slice(&encode_avp_utf8(avp::USER_NAME, request.user_name));
+    payload.extend_from_slice(&encode_avp_utf8_3gpp(
+        avp::PUBLIC_IDENTITY,
+        request.public_identity,
+    ));
+    payload.extend_from_slice(&encode_avp_octet_3gpp(
+        avp::VISITED_NETWORK_IDENTIFIER,
+        request.visited_network_id.as_bytes(),
+    ));
+    if let Some(auth_type) = request.user_auth_type {
+        payload.extend_from_slice(&encode_avp_u32_3gpp(
+            avp::USER_AUTHORIZATION_TYPE,
+            auth_type,
+        ));
+    }
+
+    encode_diameter_message(
+        FLAG_REQUEST | FLAG_PROXIABLE,
+        dictionary::CMD_USER_AUTHORIZATION,
+        dictionary::CX_APP_ID,
+        hop_by_hop,
+        end_to_end,
+        &payload,
+    )
+}
+
+/// What a Multimedia-Auth-Request carries besides the routing AVPs.
+#[derive(Debug, Clone, Copy)]
+pub struct MultimediaAuth<'a> {
+    pub public_identity: &'a str,
+    /// The private user identity, sent as User-Name (TS 29.229 clause 6.1.7,
+    /// `{ User-Name }`; TS 29.228 Table 6.3.1, category M).
+    pub user_name: &'a str,
+    /// The SIP URI of this S-CSCF, sent as Server-Name (TS 29.229 clause
+    /// 6.1.7, `{ Server-Name }`; TS 29.228 Table 6.3.1, category M). The HSS
+    /// stores it as the S-CSCF serving the user (TS 29.228 clause 6.3.1).
+    /// `None` leaves the AVP out, which a conforming HSS refuses.
+    pub server_name: Option<&'a str>,
+    pub sip_number_auth_items: u32,
+    pub sip_auth_scheme: &'a str,
+    /// RAND || AUTS, only on a request after an IMS AKA synchronisation
+    /// failure (TS 29.228 Table 6.3.2).
+    pub sip_authorization: Option<&'a [u8]>,
+}
+
+/// Encode a MAR (Multimedia-Auth-Request), S-CSCF to HSS.
+pub fn build_mar(
+    config: &PeerConfig,
+    session_id: &str,
+    request: &MultimediaAuth<'_>,
+    hop_by_hop: u32,
+    end_to_end: u32,
+) -> Vec<u8> {
+    let mut auth_children = Vec::new();
+    auth_children.extend_from_slice(&encode_avp_utf8_3gpp(
+        avp::SIP_AUTHENTICATION_SCHEME,
+        request.sip_auth_scheme,
+    ));
+    if let Some(auth_data) = request.sip_authorization {
+        auth_children.extend_from_slice(&encode_avp_octet_3gpp(avp::SIP_AUTHORIZATION, auth_data));
+    }
+    let sip_auth_data_item = encode_avp_grouped_3gpp(avp::SIP_AUTH_DATA_ITEM, &auth_children);
+
+    let mut payload = Vec::with_capacity(512);
+    append_request_header(&mut payload, config, session_id);
+    payload.extend_from_slice(&encode_avp_utf8(avp::USER_NAME, request.user_name));
+    payload.extend_from_slice(&encode_avp_utf8_3gpp(
+        avp::PUBLIC_IDENTITY,
+        request.public_identity,
+    ));
+    payload.extend_from_slice(&encode_avp_u32_3gpp(
+        avp::SIP_NUMBER_AUTH_ITEMS,
+        request.sip_number_auth_items,
+    ));
+    payload.extend_from_slice(&sip_auth_data_item);
+    if let Some(server_name) = request.server_name {
+        payload.extend_from_slice(&encode_avp_utf8_3gpp(avp::SERVER_NAME, server_name));
+    }
+
+    encode_diameter_message(
+        FLAG_REQUEST | FLAG_PROXIABLE,
+        dictionary::CMD_MULTIMEDIA_AUTH,
+        dictionary::CX_APP_ID,
+        hop_by_hop,
+        end_to_end,
+        &payload,
+    )
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Tests
 // ═══════════════════════════════════════════════════════════════════════════
@@ -843,5 +1011,212 @@ mod tests {
             .and_then(|v| v.as_u64())
             .map(|n| n as u32);
         assert_eq!(rc, Some(dictionary::DIAMETER_SUCCESS));
+    }
+
+    // ── Requests this node sends: UAR and MAR ───────────────────────────
+
+    const PRIVATE_IDENTITY: &str = "001010000000001@ims.mnc001.mcc001.3gppnetwork.org";
+    const PUBLIC_IDENTITY: &str = "sip:001010000000001@ims.mnc001.mcc001.3gppnetwork.org";
+    const SCSCF_URI: &str = "sip:scscf.ims.mnc001.mcc001.3gppnetwork.org:6060";
+
+    fn client_config() -> PeerConfig {
+        PeerConfig {
+            host: "hss.example.com".to_string(),
+            port: 3868,
+            origin_host: "scscf.ims.mnc001.mcc001.3gppnetwork.org".to_string(),
+            origin_realm: "ims.mnc001.mcc001.3gppnetwork.org".to_string(),
+            destination_host: None,
+            destination_realm: "ims.mnc001.mcc001.3gppnetwork.org".to_string(),
+            local_ip: "192.0.2.10".parse().unwrap(),
+            application_ids: vec![(dictionary::VENDOR_3GPP, dictionary::CX_APP_ID)],
+            watchdog_interval: 30,
+            reconnect_delay: 5,
+            product_name: "SIPhon".to_string(),
+            firmware_revision: 100,
+        }
+    }
+
+    fn sample_uar() -> Vec<u8> {
+        build_uar(
+            &client_config(),
+            "icscf;1;1",
+            &UserAuthorization {
+                public_identity: PUBLIC_IDENTITY,
+                user_name: PRIVATE_IDENTITY,
+                visited_network_id: "ims.mnc001.mcc001.3gppnetwork.org",
+                user_auth_type: Some(0),
+            },
+            0x10e,
+            0x10e,
+        )
+    }
+
+    fn sample_mar(server_name: Option<&str>, sip_authorization: Option<&[u8]>) -> Vec<u8> {
+        build_mar(
+            &client_config(),
+            "scscf;1;1",
+            &MultimediaAuth {
+                public_identity: PUBLIC_IDENTITY,
+                user_name: PRIVATE_IDENTITY,
+                server_name,
+                sip_number_auth_items: 1,
+                sip_auth_scheme: SCHEME_IMS_AKA,
+                sip_authorization,
+            },
+            0x2d6,
+            0x2d6,
+        )
+    }
+
+    /// User-Name as RFC 6733 clause 8.14 and its AVP table give it: code 1,
+    /// the M bit and no vendor, so an 8-octet header. The identity is 49
+    /// octets, the length 57 (0x39), then 3 octets of padding.
+    fn user_name_octets() -> Vec<u8> {
+        let mut octets = vec![0x00, 0x00, 0x00, 0x01, 0x40, 0x00, 0x00, 0x39];
+        octets.extend_from_slice(PRIVATE_IDENTITY.as_bytes());
+        octets.extend_from_slice(&[0, 0, 0]);
+        octets
+    }
+
+    /// Server-Name as TS 29.229 Table 6.3.1 gives it: code 602 (0x25a), the V
+    /// and M bits, vendor 10415 (0x28af), so a 12-octet header. The URI is 48
+    /// octets, the length 60 (0x3c), no padding.
+    fn server_name_octets() -> Vec<u8> {
+        let mut octets = vec![
+            0x00, 0x00, 0x02, 0x5a, 0xc0, 0x00, 0x00, 0x3c, 0x00, 0x00, 0x28, 0xaf,
+        ];
+        octets.extend_from_slice(SCSCF_URI.as_bytes());
+        octets
+    }
+
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+    }
+
+    #[test]
+    fn uar_carries_the_private_identity_as_user_name() {
+        let wire = sample_uar();
+        assert!(
+            contains(&wire, &user_name_octets()),
+            "TS 29.229 6.1.1 has {{ User-Name }} in the UAR"
+        );
+        let message = DiameterMsg::from_wire(&wire).unwrap();
+        assert_eq!(message.find_all(avp::USER_NAME, 0).count(), 1);
+    }
+
+    #[test]
+    fn uar_keeps_the_avps_it_already_sent() {
+        let decoded = decode_diameter(&sample_uar()).unwrap();
+        assert!(decoded.is_request);
+        assert_eq!(decoded.command_code, dictionary::CMD_USER_AUTHORIZATION);
+        assert_eq!(decoded.application_id, dictionary::CX_APP_ID);
+        assert_eq!(decoded.avps["Session-Id"], "icscf;1;1");
+        assert_eq!(decoded.avps["Public-Identity"], PUBLIC_IDENTITY);
+        assert_eq!(decoded.avps["User-Authorization-Type"], 0);
+        assert_eq!(decoded.avps["Auth-Session-State"], 1);
+    }
+
+    #[test]
+    fn mar_carries_user_name_and_server_name() {
+        let wire = sample_mar(Some(SCSCF_URI), None);
+        assert!(
+            contains(&wire, &user_name_octets()),
+            "TS 29.229 6.1.7 has {{ User-Name }} in the MAR"
+        );
+        assert!(
+            contains(&wire, &server_name_octets()),
+            "TS 29.229 6.1.7 has {{ Server-Name }} in the MAR"
+        );
+        let message = DiameterMsg::from_wire(&wire).unwrap();
+        assert_eq!(message.find_all(avp::USER_NAME, 0).count(), 1);
+        assert_eq!(
+            message
+                .find_all(avp::SERVER_NAME, dictionary::VENDOR_3GPP)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn mar_without_a_server_name_leaves_the_avp_out() {
+        let wire = sample_mar(None, None);
+        let message = DiameterMsg::from_wire(&wire).unwrap();
+        assert!(message
+            .find(avp::SERVER_NAME, dictionary::VENDOR_3GPP)
+            .is_none());
+        assert!(contains(&wire, &user_name_octets()));
+    }
+
+    #[test]
+    fn mar_names_the_scheme_and_carries_the_resynchronisation_data() {
+        let resync = [0xabu8; 30];
+        let decoded = decode_diameter(&sample_mar(Some(SCSCF_URI), Some(&resync))).unwrap();
+        let item = &decoded.avps["SIP-Auth-Data-Item"];
+        assert_eq!(item["SIP-Authentication-Scheme"], "Digest-AKAv1-MD5");
+        assert_eq!(
+            item["SIP-Authorization"].as_str().unwrap(),
+            codec::hex::encode(&resync)
+        );
+        assert_eq!(decoded.avps["SIP-Number-Auth-Items"], 1);
+    }
+
+    #[test]
+    fn private_identity_is_derived_from_the_public_identity() {
+        // TS 24.229 5.3.1.2 and 5.4.1.1: remove the URI scheme and, if
+        // present, the port number and the URI parameters.
+        assert_eq!(
+            derive_private_identity("sip:001010000000001@ims.mnc001.mcc001.3gppnetwork.org"),
+            PRIVATE_IDENTITY
+        );
+        assert_eq!(
+            derive_private_identity("sip:alice@example.com:5060;transport=tcp"),
+            "alice@example.com"
+        );
+        assert_eq!(
+            derive_private_identity("sips:alice@example.com;user=phone"),
+            "alice@example.com"
+        );
+        assert_eq!(
+            derive_private_identity("<sip:alice@example.com>"),
+            "alice@example.com"
+        );
+        assert_eq!(
+            derive_private_identity("sip:alice@[2001:db8::1]:5060"),
+            "alice@[2001:db8::1]"
+        );
+        assert_eq!(
+            derive_private_identity("alice@example.com"),
+            "alice@example.com"
+        );
+    }
+
+    /// Writes a UAR and a MAR as `text2pcap` hex dumps for
+    /// `scripts/validate_diameter_cx_requests.sh` to feed to tshark, which
+    /// reads them with its own dictionary.
+    #[test]
+    fn emit_cx_requests_for_external_dissection() {
+        let Ok(directory) = std::env::var("SIPHON_CX_REQUESTS_HEX_DIR") else {
+            // Nothing to do in an ordinary test run.
+            return;
+        };
+        let resync = [0xabu8; 30];
+        for (name, wire) in [
+            ("uar", sample_uar()),
+            ("mar", sample_mar(Some(SCSCF_URI), None)),
+            ("mar_resync", sample_mar(Some(SCSCF_URI), Some(&resync))),
+        ] {
+            let mut dump = String::new();
+            for (offset, chunk) in wire.chunks(16).enumerate() {
+                dump.push_str(&format!("{:06x}", offset * 16));
+                for byte in chunk {
+                    dump.push_str(&format!(" {byte:02x}"));
+                }
+                dump.push('\n');
+            }
+            std::fs::write(format!("{directory}/{name}.hex"), dump)
+                .expect("hex dump must be writable");
+        }
     }
 }
