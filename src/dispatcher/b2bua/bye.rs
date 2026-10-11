@@ -10,7 +10,7 @@ pub fn handle_b2bua_bye(inbound: InboundMessage, message: SipMessage, state: &Di
         .map(|s| s.to_string())
         .unwrap_or_default();
 
-    let call_id = match state.call_actors.find_by_sip_call_id(&sip_call_id) {
+    let call_id = match state.call_actors.find_by_message(&message) {
         Some(id) => id,
         None => {
             // The call ended while its 2xx waited for this caller's ACK, with the

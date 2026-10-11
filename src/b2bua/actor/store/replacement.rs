@@ -495,9 +495,10 @@ impl CallActorStore {
             let old_referrer = std::mem::replace(&mut call.a_leg, target);
             // The referrer is transferred away and BYEd next: its dialog ends.
             let ended = call.end_orphaned_dialogs();
+            let call_id = call.id.clone();
             drop(call);
             publish_dialog_states(ended);
-            self.retire_promoted_referrer(&old_referrer);
+            self.retire_promoted_referrer(&call_id, &old_referrer);
             Some(old_referrer)
         } else {
             let old_winner_idx = call.winner?;
@@ -506,9 +507,10 @@ impl CallActorStore {
             // The referrer stays in its slot until the call ends, but it is
             // transferred away and BYEd next: its dialog ends now.
             let ended = call.advance_dialog(&old_referrer.id.0, DialogState::Terminated, None);
+            let call_id = call.id.clone();
             drop(call);
             publish_dialog_states(ended.into_iter().collect());
-            self.retire_promoted_referrer(&old_referrer);
+            self.retire_promoted_referrer(&call_id, &old_referrer);
             Some(old_referrer)
         }
     }

@@ -376,7 +376,7 @@ pub fn handle_b2bua_notify(inbound: InboundMessage, message: SipMessage, state: 
         .get("Call-ID")
         .map(|s| s.to_string())
         .unwrap_or_default();
-    let call_id = match state.call_actors.find_by_sip_call_id(&sip_call_id) {
+    let call_id = match state.call_actors.find_by_message(&message) {
         Some(id) => id,
         None => {
             // Raced a concurrent teardown. 481 like the no-dialog-leg arm below
