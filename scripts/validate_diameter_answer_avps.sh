@@ -7,7 +7,9 @@
 # decoder that shares a dictionary with the encoder. This feeds tshark a Cx
 # Multimedia-Auth-Answer (TS 29.229) whose two SIP-Auth-Data-Item AVPs were
 # appended with `DiameterAnswer.insert_avp`, and asserts tshark, with its own
-# dictionary, finds both, in order, each with its members.
+# dictionary, finds both, in order, each with its members, and the
+# Vendor-Specific-Application-Id and Auth-Session-State that
+# `DiameterRequest.answer` copies from the request.
 #
 #   scripts/validate_diameter_answer_avps.sh
 #
@@ -82,6 +84,11 @@ expect diameter.flags.request False
 expect diameter.applicationId 16777216
 expect diameter.Result-Code 2001
 expect diameter.Session-Id "scscf.ims.mnc001.mcc001.3gppnetwork.org;7;7"
+# The script set neither of these: `answer()` copied them from the request,
+# as TS 29.229 clause 6.1.8 lists them in the answer.
+expect diameter.Auth-Session-State 1
+expect diameter.Vendor-Id 10415
+expect diameter.Auth-Application-Id 16777216
 # Wireshark's dictionary prefixes the TS 29.229 AVPs with "3GPP-"; the bare
 # names are the RFC 4740 ones, which have other codes.
 expect diameter.3GPP-SIP-Number-Auth-Items 2
@@ -95,6 +102,8 @@ count "a SIP-Authorization in each" "AVP Code: 610 3GPP-SIP-Authorization" 2
 count "a Confidentiality-Key in each" "AVP Code: 625 Confidentiality-Key" 2
 count "an Integrity-Key in each" "AVP Code: 626 Integrity-Key" 2
 count "one Result-Code" "AVP Code: 268 Result-Code" 1
+count "one Vendor-Specific-Application-Id" "AVP Code: 260 Vendor-Specific-Application-Id" 1
+count "one Auth-Session-State" "AVP Code: 277 Auth-Session-State" 1
 
 if grep -q "Unknown AVP" <<<"$tree"; then
   echo "  FAIL an AVP tshark does not recognise" >&2
