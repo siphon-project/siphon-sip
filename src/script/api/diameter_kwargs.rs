@@ -50,17 +50,12 @@ pub(crate) fn encode_kwarg_avp(def: &AvpDef, value: &Bound<'_, PyAny>) -> PyResu
                 encode_avp_octet(def.code, &bytes)
             })
         }
-        AvpType::ISDNAddressString => {
-            // A str is an E.164 digit string → TBCD-encode with the
-            // international ToN/NPI byte (TS 29.002 §17.7.8). This is the fix
-            // for the MSISDN/SC-Address/SGSN-Number/MME-Number-for-MT-SMS
-            // encoding bug — the OctetString path used to ship raw ASCII.
-            // Bytes are taken as already-encoded ISDN-AddressString octets.
+        AvpType::TbcdString => {
+            // A str is an E.164 digit string, sent as the TBCD digits and
+            // nothing else (see `AvpType::TbcdString`). Bytes are taken as
+            // the octets to send.
             let bytes = if let Ok(digits) = value.extract::<String>() {
-                crate::diameter::codec::encode_isdn_address_string(
-                    &digits,
-                    crate::diameter::codec::TON_NPI_INTERNATIONAL_E164,
-                )
+                crate::diameter::codec::encode_tbcd_digits(&digits)
             } else if let Ok(raw) = value.extract::<Vec<u8>>() {
                 raw
             } else {

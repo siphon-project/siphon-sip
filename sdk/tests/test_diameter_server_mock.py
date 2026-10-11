@@ -229,16 +229,23 @@ def test_isdn_address_helpers_roundtrip_and_idempotent():
     assert d.encode_isdn_address("+31612345678") == encoded
 
 
-def test_get_avp_decodes_isdn_address_avps():
+def test_get_avp_decodes_tbcd_avps():
     """get_avp on MSISDN (701/3GPP) surfaces the decoded E.164 string, like
     the real server path — whether stored as raw bytes or already-decoded."""
-    raw = bytes([0x91, 0x13, 0x16, 0x32, 0x54, 0x76, 0xF8])
+    raw = bytes([0x13, 0x16, 0x32, 0x54, 0x76, 0xF8])
     req = mock_module.MockDiameterRequest(
         application_name="S6c",
         command_name="ALR",
         avps={(701, 10415): raw},  # MSISDN
     )
     assert req.get_avp(701, 10415) == "31612345678"
+
+    # The AVP is the digits and nothing else, so a first octet with its top
+    # bit set is the first two digits: 19995550100 starts with 0x91.
+    req = mock_module.MockDiameterRequest(
+        avps={(701, 10415): bytes([0x91, 0x99, 0x55, 0x05, 0x01, 0xF0])},
+    )
+    assert req.get_avp(701, 10415) == "19995550100"
 
     # An already-decoded str passes through unchanged.
     req2 = mock_module.MockDiameterRequest(avps={(3300, 10415): "31611111111"})
