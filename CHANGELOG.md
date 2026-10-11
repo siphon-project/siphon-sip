@@ -169,6 +169,18 @@ entry, but a working config keeps working.
   calls `answer.remove_avp(...)`. The SDK mock does the same. Checked against
   Wireshark's Diameter dissector with
   `scripts/validate_diameter_answer_avps.sh`.
+- **`DiameterRequest.avps()` and `DiameterAnswer.avps()` list AVPs with their
+  fields by name.** Each entry is a `DiameterAvp` with `.code`, `.vendor`,
+  `.name` (`None` when the dictionary does not know the AVP) and `.value`,
+  which for a grouped AVP is a list of `DiameterAvp`. It is there because the
+  two tuple shapes of the existing calls differ and are easy to mix up:
+  `iter_avps()` yields `(code, vendor, value)` for a top-level AVP, and the
+  members of a grouped AVP are `(code, value, vendor)`, the shape `set_avp`
+  takes for a child. A handler that unpacks a member in the top-level order
+  compares a value with a vendor id and matches nothing. Both orders are
+  documented behaviour that scripts depend on, so neither changed; the
+  docstrings of `iter_avps` and `docs/reference/diameter.md` now say so. The
+  SDK mock has `avps()` and `MockDiameterAvp`.
 
 ### Removed
 
