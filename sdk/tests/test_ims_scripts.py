@@ -559,6 +559,80 @@ class TestMockDiameterCx:
         with pytest.raises(ValueError, match="server_name"):
             run(self.diameter.cx_mar("sip:alice@example.com", "alice@example.com", ""))
 
+    def test_zh_mar_returns_the_configured_vector_and_guss(self):
+        self.diameter.set_zh_mar_response(
+            "alice@example.com",
+            auth_items=[{"scheme": "Digest-AKAv1-MD5", "authenticate": b"\x5a" * 32}],
+            guss="<guss/>",
+        )
+        result = run(self.diameter.zh_mar("alice@example.com"))
+        assert result["result_code"] == 2001
+        assert result["experimental_result_code"] is None
+        assert result["user_name"] == "alice@example.com"
+        assert result["auth_items"][0]["authenticate"] == b"\x5a" * 32
+        assert result["guss"] == "<guss/>"
+
+    def test_zh_mar_reports_an_experimental_result(self):
+        self.diameter.set_zh_mar_response("ghost@example.com", experimental_result_code=5401)
+        result = run(self.diameter.zh_mar("ghost@example.com"))
+        assert result["result_code"] == 5401
+        assert result["experimental_result_code"] == 5401
+        assert result["auth_items"] == []
+        assert result["guss"] is None
+
+    def test_zh_mar_no_config_returns_none(self):
+        assert run(self.diameter.zh_mar("unknown@example.com")) is None
+
+    def test_zh_mar_refuses_what_the_runtime_refuses(self):
+        with pytest.raises(ValueError, match="user_name or public_identity"):
+            run(self.diameter.zh_mar())
+        with pytest.raises(ValueError, match="30 octets"):
+            run(self.diameter.zh_mar("alice@example.com", authorization=b"\x00" * 16))
+        with pytest.raises(ValueError, match="scheme"):
+            run(self.diameter.zh_mar("alice@example.com", scheme=""))
+
+    def test_zh_mar_records_the_resynchronisation_material(self):
+        self.diameter.set_zh_mar_response("alice@example.com")
+        run(self.diameter.zh_mar("alice@example.com", authorization=b"\x01" * 30))
+        assert self.diameter.zh_mar_requests[-1]["authorization"] == b"\x01" * 30
+
+    def test_zn_bir_returns_the_configured_key_material(self):
+        self.diameter.set_zn_bir_response(
+            "btid@bsf.example.com",
+            user_name="alice@example.com",
+            me_key_material=b"\x11" * 32,
+            key_expiry_time=1767229200,
+            bootstrap_info_creation_time=1767225600,
+        )
+        result = run(self.diameter.zn_bir(
+            "btid@bsf.example.com", b"naf.example.com\x01\x00\x01\x13\x01",
+            gaa_service_identifiers=["1"], gba_u_aware=True))
+        assert result["result_code"] == 2001
+        assert result["me_key_material"] == b"\x11" * 32
+        assert result["uicc_key_material"] is None
+        assert result["key_expiry_time"] == 1767229200
+        assert result["gba_type"] is None
+        assert self.diameter.zn_bir_requests[-1]["gaa_service_identifiers"] == ["1"]
+
+    def test_zn_bir_reports_an_unknown_transaction(self):
+        self.diameter.set_zn_bir_response("old@bsf.example.com", experimental_result_code=5403)
+        result = run(self.diameter.zn_bir("old@bsf.example.com", b"naf.example.com"))
+        assert result["result_code"] == 5403
+        assert result["experimental_result_code"] == 5403
+        assert result["me_key_material"] is None
+
+    def test_zn_bir_accepts_the_transaction_as_bytes(self):
+        self.diameter.set_zn_bir_response("btid@bsf.example.com", me_key_material=b"k")
+        result = run(self.diameter.zn_bir(b"btid@bsf.example.com", b"naf.example.com"))
+        assert result["me_key_material"] == b"k"
+
+    def test_zn_bir_no_config_returns_none_and_refuses_empty_arguments(self):
+        assert run(self.diameter.zn_bir("x@bsf.example.com", b"naf.example.com")) is None
+        with pytest.raises(ValueError, match="transaction_identifier"):
+            run(self.diameter.zn_bir("", b"naf.example.com"))
+        with pytest.raises(ValueError, match="naf_id"):
+            run(self.diameter.zn_bir("x@bsf.example.com", b""))
+
     def test_cx_sar_accepts_the_private_identity(self):
         result = run(self.diameter.cx_sar(
             "sip:alice@example.com", "sip:scscf:6060", 1,

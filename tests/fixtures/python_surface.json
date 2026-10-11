@@ -794,6 +794,16 @@
         "doc": "Send a Sh User-Data-Request to the HSS (AS role).",
         "kind": "method_descriptor",
         "sig": "($self, public_identity, data_reference, service_indication=None)"
+      },
+      "zh_mar": {
+        "doc": "Send a Zh Multimedia-Auth-Request to the HSS (GBA, TS 29.109).",
+        "kind": "method_descriptor",
+        "sig": "($self, user_name=None, authorization=None, scheme=None, public_identity=None, guss_timestamp=None)"
+      },
+      "zn_bir": {
+        "doc": "Send a Zn Bootstrapping-Info-Request to the BSF (GBA, TS 29.109).",
+        "kind": "method_descriptor",
+        "sig": "($self, transaction_identifier, naf_id, gaa_service_identifiers=None, gba_u_aware=None, destination_realm=None, destination_host=None)"
       }
     },
     "DiameterPeer": {

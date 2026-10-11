@@ -6742,6 +6742,10 @@ class MockDiameter:
         self._peers: dict[str, bool] = {}  # peer_name -> connected
         self._uar_responses: dict[str, dict] = {}  # public_identity -> response
         self._mar_responses: dict[str, dict] = {}
+        self._zh_mar_responses: dict[str, dict] = {}
+        self._zn_bir_responses: dict[str, dict] = {}
+        self.zh_mar_requests: list[dict] = []
+        self.zn_bir_requests: list[dict] = []
         self._sar_responses: dict[str, dict] = {}
         self._lir_responses: dict[str, dict] = {}
         self._aar_responses: dict[str, dict] = {}  # session_id -> response
@@ -6899,6 +6903,126 @@ class MockDiameter:
                 "auth_items": [dict(item) for item in response["auth_items"]],
             }
         return None
+
+    async def zh_mar(self, user_name: Optional[str] = None,
+               authorization: Optional[bytes] = None,
+               scheme: Optional[str] = None,
+               public_identity: Optional[str] = None,
+               guss_timestamp: Optional[int] = None) -> Optional[dict]:
+        """Send a Zh Multimedia-Auth-Request to the HSS (GBA, TS 29.109).
+
+        What a Bootstrapping Server Function asks for one authentication
+        vector and the user's GBA security settings (clause 4.2). It is the Cx command on
+        the Zh application (16777221), without Server-Name or
+        SIP-Number-Auth-Items, and goes to the peer the ``zh`` route names.
+
+        Args:
+            user_name: The private identity (IMPI), sent as User-Name.
+            authorization: After a synchronisation failure, RAND as sent to
+                the terminal followed by the AUTS it answered with: 30 octets
+                (TS 29.229 clause 6.3.11).
+            scheme: SIP-Authentication-Scheme. Leave it out for IMS AKA: the
+                request then carries no SIP-Auth-Data-Item, which TS 29.109
+                defines as ``Digest-AKAv1-MD5``.
+            public_identity: The public identity, sent as Public-Identity.
+                Only bootstrapping push uses it.
+            guss_timestamp: The timestamp of the GUSS already held, in Unix
+                seconds. The HSS then answers ``guss``
+                ``"GUSS TIMESTAMP EQUAL"`` when its copy is the same.
+
+        Returns:
+            Dict with ``result_code`` (the Result-Code, or without one the
+            Experimental-Result-Code), ``experimental_result_code`` (int or
+            None; 5401 is DIAMETER_ERROR_IDENTITY_UNKNOWN), ``user_name``,
+            ``auth_items`` (as ``cx_mar`` returns them; the HSS sends one) and
+            ``guss`` (the GBA-UserSecSettings XML or None), as configured with
+            :meth:`set_zh_mar_response`. ``None`` when nothing is configured
+            for the identity, which is what a script sees with no peer.
+
+        Raises:
+            ValueError: neither ``user_name`` nor ``public_identity`` is
+                given, ``authorization`` is not 30 octets, or ``scheme`` is
+                empty.
+        """
+        if not user_name and not public_identity:
+            raise ValueError("zh_mar: user_name or public_identity is required")
+        if authorization is not None and len(authorization) != 30:
+            raise ValueError(
+                "zh_mar: authorization must be RAND || AUTS, 30 octets, "
+                f"got {len(authorization)}")
+        if scheme is not None and not scheme:
+            raise ValueError("zh_mar: scheme must not be empty")
+        self.zh_mar_requests.append({
+            "user_name": user_name,
+            "authorization": authorization,
+            "scheme": scheme,
+            "public_identity": public_identity,
+            "guss_timestamp": guss_timestamp,
+        })
+        response = self._zh_mar_responses.get(user_name or public_identity)
+        if response is None:
+            return None
+        answer = dict(response)
+        answer["auth_items"] = [dict(item) for item in response["auth_items"]]
+        return answer
+
+    async def zn_bir(self, transaction_identifier: Union[str, bytes],
+                     naf_id: bytes,
+                     gaa_service_identifiers: Optional[list] = None,
+                     gba_u_aware: Optional[bool] = None,
+                     destination_realm: Optional[str] = None,
+                     destination_host: Optional[str] = None) -> Optional[dict]:
+        """Send a Zn Bootstrapping-Info-Request to the BSF (GBA, TS 29.109).
+
+        What a Network Application Function asks for the key material of a
+        bootstrapping transaction (clause 5.2). It goes to the peer the ``zn`` route names.
+
+        Args:
+            transaction_identifier: The B-TID the terminal presented (str or
+                bytes).
+            naf_id: The NAF-Id (bytes): the FQDN of the NAF as the terminal
+                used it, followed by the five octets of the Ua security
+                protocol identifier (TS 33.220 annex H).
+            gaa_service_identifiers: The services the settings are asked for
+                (a list of str or bytes), one GAA-Service-Identifier each.
+            gba_u_aware: GBA_U-Awareness-Indicator. Leave it out and the AVP
+                is not sent, which means not aware.
+            destination_realm: The realm of the subscriber's BSF, which is
+                the part of the B-TID after the ``@``. Defaults to the peer's.
+            destination_host: Destination-Host. Defaults to the peer's.
+
+        Returns:
+            Dict with ``result_code`` and ``experimental_result_code`` as
+            ``zh_mar`` gives them (5403 is
+            DIAMETER_ERROR_TRANSACTION_IDENTIFIER_INVALID, 5402
+            DIAMETER_ERROR_NOT_AUTHORIZED), ``user_name``,
+            ``me_key_material`` and ``uicc_key_material`` (bytes),
+            ``key_expiry_time`` and ``bootstrap_info_creation_time`` (Unix
+            seconds), ``user_sec_settings`` (the selected USSs as XML) and
+            ``gba_type`` (without it the type is 0, 3G GBA), as configured
+            with :meth:`set_zn_bir_response`. A key not configured is None.
+            ``None`` when nothing is configured for the transaction.
+
+        Raises:
+            ValueError: ``transaction_identifier`` or ``naf_id`` is empty.
+        """
+        if not transaction_identifier:
+            raise ValueError("zn_bir: transaction_identifier must not be empty")
+        if not naf_id:
+            raise ValueError("zn_bir: naf_id must not be empty")
+        self.zn_bir_requests.append({
+            "transaction_identifier": transaction_identifier,
+            "naf_id": naf_id,
+            "gaa_service_identifiers": list(gaa_service_identifiers or []),
+            "gba_u_aware": gba_u_aware,
+            "destination_realm": destination_realm,
+            "destination_host": destination_host,
+        })
+        key = transaction_identifier
+        if isinstance(key, (bytes, bytearray)):
+            key = bytes(key).decode("utf-8", "replace")
+        response = self._zn_bir_responses.get(key)
+        return dict(response) if response is not None else None
 
     async def cx_sar(self, public_identity: str,
                server_name: Optional[str] = None,
@@ -7180,6 +7304,62 @@ class MockDiameter:
         self._mar_responses[public_identity] = {
             "result_code": result_code,
             "auth_items": [dict(item) for item in (auth_items or [])],
+        }
+
+    def set_zh_mar_response(self, identity: str,
+                            result_code: int = 2001,
+                            auth_items: Optional[list] = None,
+                            guss: Optional[str] = None,
+                            experimental_result_code: Optional[int] = None) -> None:
+        """Configure what ``zh_mar`` answers for an identity (test helper).
+
+        Args:
+            identity: The ``user_name`` (or, without one, the
+                ``public_identity``) of the request.
+            result_code: Result-Code (default 2001 = SUCCESS).
+            auth_items: One dict per SIP-Auth-Data-Item, with the keys
+                ``diameter.cx_mar`` returns (``scheme``, ``authenticate``, ...).
+            guss: The GBA-UserSecSettings XML.
+            experimental_result_code: An Experimental-Result-Code, e.g. 5401.
+                The answer then has no Result-Code, so ``result_code`` reads
+                this value, as it does at runtime.
+        """
+        failed = experimental_result_code is not None
+        self._zh_mar_responses[identity] = {
+            "result_code": experimental_result_code if failed else result_code,
+            "experimental_result_code": experimental_result_code,
+            "user_name": None if failed else identity,
+            "auth_items": [dict(item) for item in (auth_items or [])],
+            "guss": guss,
+        }
+
+    def set_zn_bir_response(self, transaction_identifier: str,
+                            result_code: int = 2001,
+                            user_name: Optional[str] = None,
+                            me_key_material: Optional[bytes] = None,
+                            uicc_key_material: Optional[bytes] = None,
+                            key_expiry_time: Optional[int] = None,
+                            bootstrap_info_creation_time: Optional[int] = None,
+                            user_sec_settings: Optional[str] = None,
+                            gba_type: Optional[int] = None,
+                            experimental_result_code: Optional[int] = None) -> None:
+        """Configure what ``zn_bir`` answers for a B-TID (test helper).
+
+        The keyword arguments are the keys of the dict ``zn_bir`` returns.
+        With ``experimental_result_code`` (e.g. 5403) the answer has no
+        Result-Code, so ``result_code`` reads that value.
+        """
+        failed = experimental_result_code is not None
+        self._zn_bir_responses[transaction_identifier] = {
+            "result_code": experimental_result_code if failed else result_code,
+            "experimental_result_code": experimental_result_code,
+            "user_name": user_name,
+            "me_key_material": me_key_material,
+            "uicc_key_material": uicc_key_material,
+            "key_expiry_time": key_expiry_time,
+            "bootstrap_info_creation_time": bootstrap_info_creation_time,
+            "user_sec_settings": user_sec_settings,
+            "gba_type": gba_type,
         }
 
     def set_uar_response(self, public_identity: str,
@@ -8087,6 +8267,13 @@ class MockDiameter:
                      **avps: Any) -> Optional[dict]:
         """Generic Diameter request by spec name.
 
+        Each keyword is an AVP by its ``snake_case`` name, with a value of the
+        AVP's type: ``str``, ``int``, ``bytes``, Unix seconds for a Time AVP,
+        and for a Grouped AVP a ``dict`` of its members by the same rules
+        (``sip_auth_data_item={"sip_authorization": rand + auts}``). The mock
+        records the values as given and does not check them against the
+        dictionary.
+
         Records every call on ``self.generic_requests`` for assertions.
         Returns a default 2001-success answer unless overridden via
         :meth:`set_generic_response`.
@@ -8139,6 +8326,10 @@ class MockDiameter:
         self._peers.clear()
         self._uar_responses.clear()
         self._mar_responses.clear()
+        self._zh_mar_responses.clear()
+        self._zn_bir_responses.clear()
+        self.zh_mar_requests.clear()
+        self.zn_bir_requests.clear()
         self._sar_responses.clear()
         self._lir_responses.clear()
         self._aar_responses.clear()

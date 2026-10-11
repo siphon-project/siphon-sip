@@ -1150,6 +1150,16 @@ mod served_applications_tests {
     }
 
     #[test]
+    fn a_zn_filter_makes_the_node_a_zn_server() {
+        let handlers = concat!(
+            "@on_request('Zn:BIR')\n",
+            "def on_bir(request):\n",
+            "    return request.answer(2001)\n",
+        );
+        assert_eq!(served(&[], handlers), vec![(10415, 16_777_220)]);
+    }
+
+    #[test]
     fn bare_and_catch_all_filters_name_no_application() {
         // Not "every application the dictionary knows": nothing at all.
         assert!(served(&[], CATCH_ALL_HANDLERS).is_empty());
@@ -1282,6 +1292,29 @@ mod filter_tests {
         // specificity than the app-qualified form.
         assert_eq!(request_filter_score(Some("CCR"), gx, ccr), Some(1));
         assert_eq!(request_filter_score(Some("CCR"), ro, ccr), Some(1));
+    }
+
+    #[test]
+    fn request_filter_score_keeps_zh_and_cx_multimedia_auth_apart() {
+        // Multimedia-Auth (303) is one command code on two applications: Cx
+        // (TS 29.229) and Zh (TS 29.109 clause 6.1, "the same Command-Code
+        // value 303"). Bootstrapping-Info (310) is Zn's own.
+        let zh = 16_777_221;
+        let zn = 16_777_220;
+        let cx = dictionary::CX_APP_ID;
+        let mar = dictionary::CMD_MULTIMEDIA_AUTH;
+
+        assert_eq!(request_filter_score(Some("Zh:MAR"), zh, mar), Some(2));
+        assert_eq!(request_filter_score(Some("Zh:MAR"), cx, mar), None);
+        assert_eq!(request_filter_score(Some("Cx:MAR"), zh, mar), None);
+        assert_eq!(request_filter_score(Some("Cx:MAR"), cx, mar), Some(2));
+        assert_eq!(request_filter_score(Some("Zn:BIR"), zn, 310), Some(2));
+        assert_eq!(
+            request_filter_score(Some(" zn : bootstrapping-info "), zn, 310),
+            Some(2)
+        );
+        assert_eq!(request_filter_score(Some("Zn:BIR"), zh, 310), None);
+        assert_eq!(request_filter_score(Some("BIR"), zn, 310), Some(1));
     }
 
     #[test]
@@ -1611,5 +1644,188 @@ mod handler_failure_tests {
             let not_a_function = python.None().into_bound(python);
             assert_eq!(handler_name(&not_a_function), "<unknown>");
         });
+    }
+}
+
+/// Serving Zn (TS 29.109 clause 5.2) from a script: a Bootstrapping-Info-
+/// Request a NAF sent reaches the handler with its AVPs readable, and the
+/// answer the handler builds is the one of the ABNF.
+#[cfg(test)]
+pub(crate) mod zn_serving_tests {
+    use super::*;
+    use crate::diameter::codec::{Avp, AvpData};
+    use crate::diameter::gba_test_vectors as vectors;
+
+    /// A BSF as a script: it knows one bootstrapping transaction. The handler
+    /// checks every AVP it reads against what the hand-written request holds,
+    /// so reading one wrongly raises and the answer is 5012.
+    pub(crate) const BSF_SCRIPT: &str = concat!(
+        "import _siphon_registry\n",
+        "\n",
+        "TGPP = 10415\n",
+        "B_TID = b'EBESExQVFhcYGRobHB0eHw==@bsf.mnc001.mcc001.pub.3gppnetwork.org'\n",
+        "NAF_ID = b'naf.example.com' + bytes([0x01, 0x00, 0x01, 0x13, 0x01])\n",
+        "\n",
+        "def on_bir(request):\n",
+        "    assert request.application_id == 16777220, request.application_id\n",
+        "    assert request.application_name == 'Zn', request.application_name\n",
+        "    assert request.command_code == 310, request.command_code\n",
+        "    assert request.command_name == 'BIR', request.command_name\n",
+        "    assert request.origin_host == 'naf.example.com', request.origin_host\n",
+        "    assert request.get_avp('NAF-Id') == NAF_ID, request.get_avp('NAF-Id')\n",
+        "    assert request.get_avp('GBA_U-Awareness-Indicator') == 1\n",
+        "    assert request.get_avp(407, TGPP) == 1\n",
+        "    services = [value for code, vendor, value in request.iter_avps()\n",
+        "                if (code, vendor) == (403, TGPP)]\n",
+        "    assert services == [b'1', b'4'], services\n",
+        "\n",
+        "    if request.get_avp('Transaction-Identifier') != B_TID:\n",
+        "        # TS 29.109 clause 6.2: an Experimental-Result, and no Result-Code.\n",
+        "        answer = request.answer(2001)\n",
+        "        answer.remove_avp('Result-Code')\n",
+        "        answer.set_avp('Experimental-Result', [\n",
+        "            ('Vendor-Id', TGPP),\n",
+        "            ('Experimental-Result-Code', 5403),\n",
+        "        ])\n",
+        "    else:\n",
+        "        answer = request.answer(2001)\n",
+        "        answer.set_avp('User-Name', '001010000000001@ims.mnc001.mcc001.3gppnetwork.org')\n",
+        "        answer.set_avp('ME-Key-Material', bytes(range(0x60, 0x80)))\n",
+        "        answer.set_avp('UICC-Key-Material', bytes(range(0x80, 0xa0)))\n",
+        "        answer.set_avp('Key-ExpiryTime', 1767229200)\n",
+        "        answer.set_avp('BootstrapInfoCreationTime', 1767225600)\n",
+        "        answer.set_avp('GBA-UserSecSettings', '<ussList><uss id=\"1\" type=\"1\"/></ussList>')\n",
+        "        answer.set_avp('GBA-Type', 0)\n",
+        "    answer.set_avp('Vendor-Specific-Application-Id', [\n",
+        "        ('Vendor-Id', TGPP),\n",
+        "        ('Auth-Application-Id', 16777220),\n",
+        "    ])\n",
+        "    answer.set_avp('Auth-Session-State', 1)\n",
+        "    return answer\n",
+        "\n",
+        "_siphon_registry.register('diameter.on_request', 'Zn:BIR', on_bir, False)\n",
+    );
+
+    /// The octets of the answer `source` gives to the request `raw`.
+    pub(crate) fn answer_wire(source: &str, raw: &[u8]) -> Vec<u8> {
+        let request = crate::diameter::codec::decode_diameter(raw).expect("a request");
+        let incoming = crate::diameter::peer::IncomingRequest {
+            command_code: request.command_code,
+            application_id: request.application_id,
+            hop_by_hop: request.hop_by_hop,
+            end_to_end: request.end_to_end,
+            avps: request.avps,
+            raw: raw.to_vec(),
+        };
+        let engine =
+            Arc::new(ScriptEngine::new_embedded(source).expect("the test script should compile"));
+        let peer = PyInboundPeer {
+            name: "naf".to_string(),
+            tenant: "default".to_string(),
+            addr: "192.0.2.20:3868".to_string(),
+            transport: "tcp".to_string(),
+        };
+        Python::attach(|python| {
+            build_answer_via_handler(
+                python,
+                &engine,
+                &incoming,
+                &peer,
+                "bsf.mnc001.mcc001.pub.3gppnetwork.org",
+                "mnc001.mcc001.pub.3gppnetwork.org",
+            )
+            .wire
+        })
+    }
+
+    /// The hand-written request with another B-TID of the same length.
+    pub(crate) fn bir_for_an_unknown_transaction() -> Vec<u8> {
+        let mut raw = vectors::ZN_BIR.to_vec();
+        let position = raw
+            .windows(vectors::B_TID.len())
+            .position(|window| window == vectors::B_TID.as_bytes())
+            .expect("the B-TID is in the request");
+        raw[position] = b'X';
+        raw
+    }
+
+    fn header(avp: &Avp) -> (u32, u32, u8) {
+        (avp.code, avp.vendor, avp.flags)
+    }
+
+    #[test]
+    fn a_bir_reaches_the_zn_handler_and_is_answered_with_the_key_material() {
+        let wire = answer_wire(BSF_SCRIPT, vectors::ZN_BIR);
+        let answer = DiameterMsg::from_wire(&wire).expect("the BIA");
+        assert_eq!(answer.answer_result_codes(), (Some(2001), None));
+        assert_eq!(answer.command_code, 310);
+        assert_eq!(answer.application_id, 16_777_220);
+        assert!(!answer.is_request());
+        assert!(!answer.is_error());
+        // Hop-by-hop and end-to-end of the request (RFC 6733 clause 6.2).
+        assert_eq!((answer.hop_by_hop, answer.end_to_end), (0x33, 0x44));
+        assert_eq!(
+            answer.get_str(dictionary::avp::SESSION_ID).as_deref(),
+            Some("naf.example.com;7;1")
+        );
+
+        let vendor = dictionary::VENDOR_3GPP;
+        let gba = |code: u32| answer.find(code, vendor).expect("a GBA AVP of the answer");
+        // TS 29.109 Table 6.1: each of these carries V and M.
+        for code in [400, 404, 405, 406, 408, 410] {
+            assert_eq!(header(gba(code)), (code, 10415, 0xc0), "AVP {code}");
+        }
+        assert_eq!(gba(405).raw_bytes(), Some(&vectors::KS_EXT_NAF[..]));
+        assert_eq!(gba(406).raw_bytes(), Some(&vectors::KS_INT_NAF[..]));
+        // Time: seconds since 1900 (RFC 6733 clause 4.3.1), the octets of the
+        // hand-written answer.
+        assert_eq!(gba(404).raw_bytes(), Some(&[0xed, 0x00, 0x45, 0x90][..]));
+        assert_eq!(gba(408).raw_bytes(), Some(&[0xed, 0x00, 0x37, 0x80][..]));
+        assert_eq!(gba(400).raw_bytes(), Some(vectors::USS_LIST.as_bytes()));
+        assert_eq!(gba(410).as_u32(), Some(0));
+        assert_eq!(
+            answer.get_str(dictionary::avp::USER_NAME).as_deref(),
+            Some(vectors::IMPI)
+        );
+    }
+
+    #[test]
+    fn an_unknown_transaction_is_answered_with_an_experimental_result_alone() {
+        let wire = answer_wire(BSF_SCRIPT, &bir_for_an_unknown_transaction());
+        let answer = DiameterMsg::from_wire(&wire).expect("the BIA");
+        // "it shall be inside an Experimental-Result AVP and Result-Code AVP
+        // shall be absent" (TS 29.109 clause 6.2).
+        assert_eq!(answer.answer_result_codes(), (None, Some(5403)));
+        assert!(!answer.is_error(), "an application error does not set E");
+        let group = answer
+            .find(dictionary::avp::EXPERIMENTAL_RESULT, 0)
+            .expect("Experimental-Result");
+        let AvpData::Grouped(members) = &group.value else {
+            panic!("Experimental-Result is grouped");
+        };
+        let vendor_id = members
+            .iter()
+            .find(|member| member.code == dictionary::avp::VENDOR_ID)
+            .and_then(Avp::as_u32);
+        assert_eq!(vendor_id, Some(10415));
+        assert!(answer.find(405, dictionary::VENDOR_3GPP).is_none());
+        assert_eq!(emitted_answer_result_label(&wire), "exp:5403");
+    }
+
+    #[test]
+    fn a_bir_is_not_served_by_a_handler_of_another_application() {
+        let cx_only = concat!(
+            "import _siphon_registry\n",
+            "def on_mar(request):\n",
+            "    return request.answer(2001)\n",
+            "_siphon_registry.register('diameter.on_request', 'Cx:MAR', on_mar, False)\n",
+            "_siphon_registry.register('diameter.on_request', 'Zh:MAR', on_mar, False)\n",
+        );
+        let wire = answer_wire(cx_only, vectors::ZN_BIR);
+        let answer = DiameterMsg::from_wire(&wire).expect("the answer");
+        assert_eq!(
+            answer.answer_result_codes().0,
+            Some(dictionary::DIAMETER_UNABLE_TO_DELIVER)
+        );
     }
 }

@@ -202,14 +202,24 @@ pub(crate) fn mar_answer_dict(
         "result_code",
         crate::diameter::rx::extract_result_code(&answer.avps),
     )?;
+    dict.set_item("auth_items", auth_items(python, answer)?)?;
+    Ok(dict.unbind())
+}
+
+/// One dict per SIP-Auth-Data-Item of a Multimedia-Auth-Answer, in the order
+/// the HSS sent them. Cx and Zh answers carry the same item (TS 29.109 clause
+/// 6.3: "The AVPs defined in 3GPP TS 29.229 [3] ... are used as they are").
+pub(crate) fn auth_items<'py>(
+    python: Python<'py>,
+    answer: &DiameterMessage,
+) -> PyResult<Bound<'py, PyList>> {
     let items = PyList::empty(python);
     if let Ok(message) = DiameterMsg::from_wire(&answer.raw) {
         for item in message.find_all(avp::SIP_AUTH_DATA_ITEM, dictionary::VENDOR_3GPP) {
             items.append(auth_item_dict(python, item)?)?;
         }
     }
-    dict.set_item("auth_items", items)?;
-    Ok(dict.unbind())
+    Ok(items)
 }
 
 #[cfg(test)]

@@ -46,6 +46,55 @@ entry, but a working config keeps working.
   that registered a namespace of its own called `config` has to rename it. See
   `docs/reference/script-config.md`.
 
+- **GBA over Diameter: Zh and Zn (TS 29.109).** What a Bootstrapping Server
+  Function, or a Network Application Function, built on siphon needs.
+  - `"Zh"` (Application-Id 16777221) and `"Zn"` (16777220), both Vendor-Id
+    10415, resolve wherever an application is given by name: `application: zh`
+    / `zn` under `diameter.routes`, which advertises it to that peer in the
+    CER, the `applications` list of a listening node,
+    `diameter.send_request(..., "Zh")`, which raised `ValueError: unknown
+    Diameter application name: Zh`, and the `@diameter.on_request("Zn:BIR")`
+    filter. Multimedia-Auth (303) is shared between Cx and Zh: an
+    application-qualified filter keeps the two apart.
+  - Bootstrapping-Info (310) is a known command: `"Bootstrapping-Info-Request"`,
+    `"BIR"` and `"BIA"`, and `request.command_name` reads `"BIR"`.
+  - The dictionary has the AVPs of TS 29.109 Table 6.1 used on the two
+    interfaces: GBA-UserSecSettings (400), Transaction-Identifier (401), NAF-Id
+    (402), GAA-Service-Identifier (403), Key-ExpiryTime (404), ME-Key-Material
+    (405), UICC-Key-Material (406), GBA_U-Awareness-Indicator (407),
+    BootstrapInfoCreationTime (408), GUSS-Timestamp (409), GBA-Type (410) and
+    SHA-256-Indication (421), all vendor 10415. GUSS-Timestamp is built
+    without the M bit, as the table requires.
+  - `diameter.zh_mar(user_name, authorization=None, scheme=None,
+    public_identity=None, guss_timestamp=None)` sends the Zh
+    Multimedia-Auth-Request and resolves to `result_code`,
+    `experimental_result_code`, `user_name`, `auth_items` (as `cx_mar` gives
+    them) and `guss`. `authorization` is RAND then AUTS, 30 octets, after a
+    synchronisation failure.
+  - `diameter.zn_bir(transaction_identifier, naf_id,
+    gaa_service_identifiers=None, gba_u_aware=None, destination_realm=None,
+    destination_host=None)` sends the Bootstrapping-Info-Request and resolves
+    to the key material, its expiry and creation time in Unix seconds, the
+    selected user security settings and the GBA type.
+  - `diameter.send_request` takes a Grouped AVP as a `dict` of its members
+    (`sip_auth_data_item={"sip_authorization": rand + auts}`), nested as deep
+    as the AVPs are, and a Time AVP as Unix seconds. Both raised `TypeError`.
+  - `DiameterAnswer.set_avp` / `insert_avp` take Unix seconds for a Time AVP,
+    next to the four octets they took before, so a script serving Zn can set
+    Key-ExpiryTime.
+
+  What changes for a script that already handled these messages through a
+  catch-all handler or the generic call: the AVPs above are now typed. In the
+  dict `send_request` resolves to, GBA-UserSecSettings is under
+  `gba_usersecsettings` where it was `avp_400_v10415`, and the three Time AVPs
+  read as Unix seconds where they were hex. `get_avp` returns an `int` for
+  GBA_U-Awareness-Indicator and GBA-Type where it returned four `bytes`.
+  `request.application_name` reads `"Zh"` / `"Zn"` where it was `None`. The
+  answers metric labels 5401, 5402 and 5403 as `exp:5401` to `exp:5403` where
+  they fell in `exp:5xxx_other`. Checked against Wireshark's Diameter
+  dissector with `scripts/validate_diameter_gba.sh`; not tested against an
+  HSS. See `docs/reference/diameter.md`.
+
 - **Gx is a named Diameter application.** `"Gx"` (TS 29.212, Vendor-Id 10415,
   Application-Id 16777238) resolves wherever an application is given by name:
   the `@diameter.on_request("Gx:CCR")` filter, which raised `ValueError:
