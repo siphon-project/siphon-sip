@@ -82,12 +82,11 @@ pub fn b_leg_provisional(
         let callee_sent_reliably = crate::sip::headers::rseq::requires_100rel(&message.headers)
             && crate::sip::headers::rseq::parse_rseq(&message.headers).is_some();
 
-        // Invoke @b2bua.on_early_media handlers when provisional has SDP body.
-        // This lets scripts process early media through RTPEngine before forwarding.
+        // A provisional with a session description is early media: on a call
+        // the control plane dialled its SDP is the media answer, and
+        // `@b2bua.on_early_media` below lets a script put it through the media
+        // engine before it is relayed.
         let has_sdp_body = !message.body.is_empty();
-        // Headers @b2bua.on_early_media set or removed on the response, which
-        // reach the caller as the script left them.
-        let mut reply_shaped_headers: Vec<String> = Vec::new();
         if has_sdp_body {
             if let Err(error) =
                 control_dial_media_answer(call_id, message, response_source.ip(), state)
@@ -100,72 +99,17 @@ pub fn b_leg_provisional(
                 report_control_dial_failure(call_id, 503, "Media negotiation failed", false, state);
                 return;
             }
-            let engine_state = state.engine.state();
-            let handlers = engine_state.handlers_for(&HandlerKind::B2buaEarlyMedia);
-            if !handlers.is_empty() {
-                if let Some(invite_arc) = &snapshot.a_leg_invite {
-                    let response_arc = Arc::new(std::sync::Mutex::new(message.clone()));
-                    let py_call = PyCall::new(
-                        call_id.to_string(),
-                        Arc::clone(invite_arc),
-                        snapshot.a_leg.transport.remote_addr.ip().to_string(),
-                        format!("{}", snapshot.a_leg.transport.transport).to_lowercase(),
-                    )
-                    .with_flow(py_flow_from_leg(&snapshot.a_leg.transport));
-                    let py_reply = PyReply::new(Arc::clone(&response_arc))
-                        .with_a_leg(Arc::clone(invite_arc))
-                        .with_response_source(
-                            response_source.ip().to_string(),
-                            response_source.port(),
-                        );
-
-                    reply_shaped_headers = Python::attach(|python| -> Vec<String> {
-                        let call_obj = match Py::new(python, py_call) {
-                            Ok(obj) => obj,
-                            Err(error) => {
-                                error!("failed to create PyCall for on_early_media: {error}");
-                                return Vec::new();
-                            }
-                        };
-                        let reply_obj = match Py::new(python, py_reply) {
-                            Ok(obj) => obj,
-                            Err(error) => {
-                                error!("failed to create PyReply for on_early_media: {error}");
-                                return Vec::new();
-                            }
-                        };
-
-                        for handler in &handlers {
-                            let callable = handler.callable.bind(python);
-                            match callable.call1((call_obj.bind(python), reply_obj.bind(python))) {
-                                Ok(ret) => {
-                                    if handler.is_async {
-                                        if let Err(error) = run_coroutine(python, &ret) {
-                                            record_script_error(
-                                                "async B2BUA on_early_media",
-                                                &error,
-                                            );
-                                        }
-                                    }
-                                }
-                                Err(error) => {
-                                    record_script_error("B2BUA on_early_media", &error);
-                                }
-                            }
-                        }
-                        let reply = reply_obj.borrow(python);
-                        reply.script_shaped_headers().to_vec()
-                    });
-
-                    // Replace message with potentially modified version (e.g. RTPEngine-rewritten SDP)
-                    if let Ok(modified) = response_arc.lock() {
-                        *message = modified.clone();
-                    };
-                } else {
-                    warn!(call_id = %call_id, "B2BUA: no stored A-leg INVITE for on_early_media");
-                }
-            }
         }
+        // Headers the script hooks set or removed on the response, which reach
+        // the caller as the script left them.
+        let reply_shaped_headers = run_provisional_hooks(
+            call_id,
+            message,
+            response_source,
+            has_sdp_body,
+            state,
+            snapshot,
+        );
 
         // Rewrite B-leg dialog headers back to A-leg identifiers.
         // For provisional responses that carry a To-tag (early dialogs —
@@ -240,4 +184,96 @@ pub fn b_leg_provisional(
             state,
         );
     }
+}
+
+/// Run the script hooks of a provisional about to be relayed to the caller, on
+/// one `reply` they share: `@b2bua.on_provisional` for every one, then
+/// `@b2bua.on_early_media` when it carries a session description. Leaves
+/// `message` as the hooks shaped it (headers, and the SDP a media engine
+/// rewrote) and returns the names of the headers they set or removed.
+///
+/// With neither hook registered for this response, nothing is built and the
+/// response is not copied.
+fn run_provisional_hooks(
+    call_id: &str,
+    message: &mut SipMessage,
+    response_source: SocketAddr,
+    has_sdp_body: bool,
+    state: &DispatcherState,
+    snapshot: &BLegResponseSnapshot,
+) -> Vec<String> {
+    let engine_state = state.engine.state();
+    let mut hooks = vec![(
+        "on_provisional",
+        engine_state.handlers_for(&HandlerKind::B2buaProvisional),
+    )];
+    if has_sdp_body {
+        hooks.push((
+            "on_early_media",
+            engine_state.handlers_for(&HandlerKind::B2buaEarlyMedia),
+        ));
+    }
+    hooks.retain(|(_, handlers)| !handlers.is_empty());
+    let Some((last_hook, _)) = hooks.last() else {
+        return Vec::new();
+    };
+    let Some(invite_arc) = &snapshot.a_leg_invite else {
+        warn!(call_id = %call_id, "B2BUA: no stored A-leg INVITE for {last_hook}");
+        return Vec::new();
+    };
+
+    let response_arc = Arc::new(std::sync::Mutex::new(message.clone()));
+    let py_call = PyCall::new(
+        call_id.to_string(),
+        Arc::clone(invite_arc),
+        snapshot.a_leg.transport.remote_addr.ip().to_string(),
+        format!("{}", snapshot.a_leg.transport.transport).to_lowercase(),
+    )
+    .with_flow(py_flow_from_leg(&snapshot.a_leg.transport));
+    let py_reply = PyReply::new(Arc::clone(&response_arc))
+        .with_a_leg(Arc::clone(invite_arc))
+        .with_response_source(response_source.ip().to_string(), response_source.port());
+
+    let shaped_headers = Python::attach(|python| -> Vec<String> {
+        let call_obj = match Py::new(python, py_call) {
+            Ok(obj) => obj,
+            Err(error) => {
+                error!("failed to create PyCall for {last_hook}: {error}");
+                return Vec::new();
+            }
+        };
+        let reply_obj = match Py::new(python, py_reply) {
+            Ok(obj) => obj,
+            Err(error) => {
+                error!("failed to create PyReply for {last_hook}: {error}");
+                return Vec::new();
+            }
+        };
+
+        for (hook, handlers) in &hooks {
+            for handler in handlers {
+                let callable = handler.callable.bind(python);
+                match callable.call1((call_obj.bind(python), reply_obj.bind(python))) {
+                    Ok(ret) => {
+                        if handler.is_async {
+                            if let Err(error) = run_coroutine(python, &ret) {
+                                record_script_error(&format!("async B2BUA {hook}"), &error);
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        record_script_error(&format!("B2BUA {hook}"), &error);
+                    }
+                }
+            }
+        }
+        let reply = reply_obj.borrow(python);
+        reply.script_shaped_headers().to_vec()
+    });
+
+    // Replace message with potentially modified version (e.g. RTPEngine-rewritten SDP)
+    if let Ok(modified) = response_arc.lock() {
+        *message = modified.clone();
+    };
+    shaped_headers
 }
