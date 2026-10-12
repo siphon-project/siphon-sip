@@ -8,6 +8,7 @@ pub mod hold;
 mod late_response_tests;
 pub mod mux;
 pub mod pool;
+mod pool_writer;
 pub mod proxy_protocol;
 pub mod rate_limit;
 pub(crate) mod response_route;

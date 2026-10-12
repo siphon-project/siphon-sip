@@ -10,7 +10,8 @@
 //!   - Idle connections are closed after [`POOL_IDLE_TIMEOUT`], except to a
 //!     destination named in [`ConnectionPool::set_idle_exempt_destinations`]
 //!     and except while a client transaction is pending on the connection
-//!     ([`ConnectionPool::hold`])
+//!     ([`ConnectionPool::hold`]); a connection from a pinned local port is
+//!     never closed for idleness ([`crate::transport::pool_writer`])
 //!   - Connections are removed on error and recreated on next use
 
 use std::collections::HashSet;
@@ -30,6 +31,7 @@ use tracing::{debug, error, info, warn};
 use crate::config::TlsMethod;
 use crate::transport::crlf_keepalive::{drain_leading_crlf_keepalives, CrlfPongTracker};
 use crate::transport::hold::{ConnectionHold, ConnectionHolds};
+use crate::transport::pool_writer::{pins_local_port, PoolWriter};
 use crate::transport::tcp::{frame_sip_message, FrameVerdict};
 use crate::transport::{
     configure_tcp_socket, next_connection_id, ConnectionId, InboundMessage, StreamConnections,
@@ -50,6 +52,9 @@ use crate::transport::{
 /// pending on (an INVITE whose callee is ringing) is kept through any amount of
 /// silence, because the response is owed on it (RFC 3261 §18.2.2): see
 /// [`ConnectionPool::hold`].
+///
+/// A connection from a pinned local port has no idle timeout: see
+/// [`crate::transport::pool_writer`].
 const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Fail-fast timeout for outbound TCP/TLS connection establishment.
@@ -479,6 +484,10 @@ impl ConnectionPool {
     /// Used for ESP-over-TCP IPsec (a fixed `pcscf_addr:pcscf_port_c`
     /// source) and for a script `send_socket=` egress pin (a chosen
     /// interface IP with an ephemeral port).
+    ///
+    /// A `source` with a port is kept open through any amount of silence and
+    /// reset when the pool is first to close it: see
+    /// [`crate::transport::pool_writer`].
     pub async fn send_tcp_from(
         &self,
         source: SocketAddr,
@@ -610,8 +619,11 @@ impl ConnectionPool {
         // when a pooled connection in TIME_WAIT collides on the 4-tuple
         // (local:5060 → remote:6060).  IPsec callers (`send_tcp_from`)
         // bind to a specific `(pcscf_addr, pcscf_port_c)` because
-        // ESP-over-TCP SA selectors require it; SO_REUSEADDR (set
-        // below) lets us survive single-UE TIME_WAIT churn.
+        // ESP-over-TCP SA selectors require it.  SO_REUSEADDR (set
+        // below) lets that bind succeed next to the listener and next
+        // to a connection in TIME_WAIT; it does not let the connect
+        // reuse a 4-tuple in TIME_WAIT, which is why such a connection
+        // is kept open and reset on close (see `pool_writer`).
         //
         // SO_REUSEPORT is also set: the inbound TCP listener on the
         // protected ports (P-CSCF) is created with SO_REUSEPORT (see
@@ -687,10 +699,11 @@ impl ConnectionPool {
             destination = %destination,
             "pool: opened outbound TCP connection (4-tuple)"
         );
-        let (mut reader, mut writer) = stream.into_split();
+        let (mut reader, writer) = stream.into_split();
+        let pinned = pins_local_port(bind_addr);
 
         // Per-connection write channel
-        let (write_tx, mut write_rx) = mpsc::channel::<Bytes>(64);
+        let (write_tx, write_rx) = mpsc::channel::<Bytes>(64);
 
         // Register in the shared connection map so the outbound distributor
         // can route responses back on this connection.
@@ -700,6 +713,16 @@ impl ConnectionPool {
             destination = %destination,
             connection_id = ?connection_id,
             "pool: opened outbound TCP connection"
+        );
+
+        // Write task
+        let mut writer = PoolWriter::spawn(
+            writer,
+            write_rx,
+            self.write_timeout,
+            connection_id,
+            destination,
+            pinned,
         );
 
         // Read task — responses from the remote server come back here.
@@ -722,13 +745,21 @@ impl ConnectionPool {
         tokio::spawn(async move {
             let mut accumulator = BytesMut::with_capacity(65536);
             let mut read_buf = [0u8; 8192];
+            let mut peer_closed = false;
             loop {
-                match tokio::time::timeout(idle_timeout, reader.read(&mut read_buf)).await {
+                let read = tokio::select! {
+                    read = tokio::time::timeout(idle_timeout, reader.read(&mut read_buf)) => read,
+                    // A pinned port only: its socket holds the 4-tuple the
+                    // replacement needs.
+                    () = writer.gave_up() => break,
+                };
+                match read {
                     Ok(Ok(0)) => {
                         info!(
                             "pool: TCP connection {:?} to {} closed by peer",
                             connection_id, destination
                         );
+                        peer_closed = true;
                         break;
                     }
                     Ok(Ok(size)) => {
@@ -826,6 +857,18 @@ impl ConnectionPool {
                             );
                             continue;
                         }
+                        // The next request to this peer can only leave on
+                        // this 4-tuple, which cannot be opened again while the
+                        // connection just closed is in TIME_WAIT.
+                        if pinned {
+                            debug!(
+                                connection_id = ?connection_id,
+                                destination = %destination,
+                                idle = ?idle_timeout,
+                                "pool: TCP connection idle but kept open (pinned local port)"
+                            );
+                            continue;
+                        }
                         info!(
                             "pool: TCP connection {:?} idle timeout ({}s)",
                             connection_id,
@@ -835,33 +878,12 @@ impl ConnectionPool {
                     }
                 }
             }
+            // A connection from a pinned port is closed before the pool offers
+            // its slot again, and its senders see the channel close only then.
+            let write_rx = writer.close(reader, peer_closed).await;
             conn_map.remove(&connection_id);
             evict_if_current(&connections, &key_for_cleanup, connection_id);
-        });
-
-        // Write task
-        let write_timeout = self.write_timeout;
-        tokio::spawn(async move {
-            while let Some(data) = write_rx.recv().await {
-                match tokio::time::timeout(write_timeout, writer.write_all(&data)).await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(error)) => {
-                        warn!("pool: TCP write error on {:?}: {}", connection_id, error);
-                        break;
-                    }
-                    Err(_) => {
-                        warn!(
-                            connection_id = ?connection_id,
-                            destination = %destination,
-                            timeout = ?write_timeout,
-                            "pool: TCP write stalled — peer accepted the connection \
-                             but is not draining it (zero receive window); dropping \
-                             the connection so callers stop queueing behind it"
-                        );
-                        break;
-                    }
-                }
-            }
+            drop(write_rx);
         });
 
         // Send the initial data.  Bounded like every other enqueue: the writer
@@ -3145,5 +3167,232 @@ mod tests {
 
         until_closed(&pool, other, "the connection with no hold was never closed").await;
         assert!(pool.has_live(held, Transport::Tcp));
+    }
+
+    // --- a connection from a pinned local port -------------------------------
+
+    /// A connection whose local port the caller chose, as an IPsec protected
+    /// port is chosen (TS 33.203 §7.1).
+    ///
+    /// What Linux does with a connect on a 4-tuple it has just closed depends
+    /// on TCP timestamps. With them, a connect from a bound port takes over
+    /// the connection in TIME-WAIT. With a peer that negotiates none it fails
+    /// with `EADDRNOTAVAIL` for the whole of TIME-WAIT, and `SO_REUSEADDR` does
+    /// not change that. Loopback negotiates timestamps, so to see the second
+    /// case run these in a network namespace with `net.ipv4.tcp_timestamps=0`.
+    mod pinned_port {
+        use super::*;
+
+        /// A free local port to pin, standing in for a protected client port.
+        /// `SO_REUSEADDR` lets the pool bind it once it is released here.
+        fn protected_source() -> SocketAddr {
+            let reserve = tokio::net::TcpSocket::new_v4().unwrap();
+            reserve.set_reuseaddr(true).unwrap();
+            reserve.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+            reserve.local_addr().unwrap()
+        }
+
+        fn pinned_key(source: SocketAddr, destination: SocketAddr) -> PoolKey {
+            PoolKey {
+                destination,
+                transport: Transport::Tcp,
+                bind: Some(source),
+            }
+        }
+
+        /// Wait for the pool to stop offering the connection under `key`.
+        async fn until_released(pool: &ConnectionPool, key: &PoolKey, what: &str) {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while pool.pooled(key).is_some() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("{what}"));
+        }
+
+        /// A connection from a pinned port is not closed for idleness, and the
+        /// next request to the same peer goes out on it.
+        ///
+        /// Before: the reader closed it after the idle timeout like any other.
+        /// The request that followed had to connect again from the same local
+        /// port to the same remote port, while the connection just closed was
+        /// still in TIME-WAIT on that 4-tuple, and failed with `EADDRNOTAVAIL`
+        /// against a peer without TCP timestamps.
+        ///
+        /// The control connections are what prove whole idle periods went by.
+        /// The peer closes when the pool does, as a peer does, which is what
+        /// put the pool's end in TIME-WAIT.
+        #[tokio::test]
+        async fn a_connection_outlives_the_idle_timeout_and_carries_the_next_request() {
+            let mut pool = test_pool();
+            pool.set_idle_timeout(Duration::from_millis(30));
+            let source = protected_source();
+            let (listener, destination) = silent_peer().await;
+
+            let first = pool
+                .send_tcp_from(source, destination, Bytes::from_static(b"INVITE"))
+                .await
+                .unwrap();
+            let (mut peer, from) = listener.accept().await.unwrap();
+            assert_eq!(from, source);
+            let (seen_sender, mut seen) = mpsc::unbounded_channel();
+            tokio::spawn(async move {
+                let mut scratch = [0u8; 64];
+                while let Ok(size) = peer.read(&mut scratch).await {
+                    if size == 0 || seen_sender.send(scratch[..size].to_vec()).is_err() {
+                        return;
+                    }
+                }
+            });
+
+            for _ in 0..3 {
+                let (control_listener, control) = silent_peer().await;
+                pool.send_tcp(control, Bytes::from_static(b"OPTIONS"))
+                    .await
+                    .unwrap();
+                let (_control_peer, _) = control_listener.accept().await.unwrap();
+                until_closed(
+                    &pool,
+                    control,
+                    "the idle timeout never closed a connection from an ephemeral port",
+                )
+                .await;
+            }
+
+            let second = pool
+                .send_tcp_from(source, destination, Bytes::from_static(b"BYE"))
+                .await
+                .expect("a request after the idle period could not be sent from the pinned port");
+            assert_eq!(
+                second, first,
+                "the connection from a pinned port was closed for idleness and replaced"
+            );
+            let mut received = Vec::new();
+            while received.len() < b"INVITEBYE".len() {
+                let chunk = tokio::time::timeout(Duration::from_secs(5), seen.recv())
+                    .await
+                    .expect("the peer never received both requests")
+                    .expect("the peer lost the connection both requests were owed on");
+                received.extend(chunk);
+            }
+            assert_eq!(received, b"INVITEBYE");
+        }
+
+        /// Only a pinned port is kept: a source-bound connection on an
+        /// ephemeral port (a `send_socket=` egress pin) idles out as before.
+        #[tokio::test]
+        async fn a_source_bound_connection_on_an_ephemeral_port_still_idles_out() {
+            let mut pool = test_pool();
+            pool.set_idle_timeout(Duration::from_millis(30));
+            let source: SocketAddr = "127.0.0.1:0".parse().unwrap();
+            let (listener, destination) = silent_peer().await;
+
+            pool.send_tcp_from(source, destination, Bytes::from_static(b"OPTIONS"))
+                .await
+                .unwrap();
+            let (_peer, _) = listener.accept().await.unwrap();
+
+            until_released(
+                &pool,
+                &pinned_key(source, destination),
+                "the idle timeout never closed a source-bound connection on an ephemeral port",
+            )
+            .await;
+        }
+
+        /// A peer that closes first leaves nothing behind on the pool's side:
+        /// the connection is gone from both maps and the next request connects
+        /// from the same port.
+        #[tokio::test]
+        async fn a_connection_the_peer_closes_is_replaced_from_the_same_port() {
+            let mut pool = test_pool();
+            pool.set_idle_timeout(Duration::from_millis(30));
+            let source = protected_source();
+            let (listener, destination) = silent_peer().await;
+            let key = pinned_key(source, destination);
+
+            let first = pool
+                .send_tcp_from(source, destination, Bytes::from_static(b"INVITE"))
+                .await
+                .unwrap();
+            let (peer, _) = listener.accept().await.unwrap();
+            drop(peer);
+            until_released(
+                &pool,
+                &key,
+                "a connection the peer closed is still offered for reuse",
+            )
+            .await;
+            assert_eq!(pool.active_connections(), 0);
+            assert!(pool.connection_map.is_empty());
+
+            let second = pool
+                .send_tcp_from(source, destination, Bytes::from_static(b"BYE"))
+                .await
+                .expect("no connect from the pinned port after the peer closed its connection");
+            assert_ne!(second, first);
+            let (_replacement, from) = listener.accept().await.unwrap();
+            assert_eq!(from, source);
+        }
+
+        /// A writer that gives up on a peer that stopped draining takes the
+        /// whole connection with it, so the replacement can leave from the same
+        /// port.
+        ///
+        /// Before: the reader stayed parked on the socket after the writer had
+        /// gone, the 4-tuple stayed taken, and every connect from the pinned
+        /// port failed with `EADDRNOTAVAIL` until the reader ended as well.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_connection_whose_writer_gave_up_frees_its_port_at_once() {
+            let (destination, mut accepted) = spawn_non_draining_peer().await;
+            let mut pool = test_pool();
+            pool.enqueue_timeout = Duration::from_millis(50);
+            pool.write_timeout = Duration::from_millis(200);
+            let source = protected_source();
+            let key = pinned_key(source, destination);
+
+            let payload = Bytes::from(vec![b'x'; 8 * 1024]);
+            let mut carried_on = std::collections::HashSet::new();
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while let Ok(connection_id) = pool
+                    .send_tcp_from(source, destination, payload.clone())
+                    .await
+                {
+                    carried_on.insert(connection_id);
+                }
+            })
+            .await
+            .expect("a send to a peer that never reads must be refused, not parked");
+            let (stalled_id, stalled_sender) = pool
+                .pooled(&key)
+                .expect("the refused send leaves the backed-up connection pooled");
+            tokio::time::timeout(Duration::from_secs(10), stalled_sender.closed())
+                .await
+                .expect("the writer must give up on a peer that never drains");
+
+            let replacement_id = tokio::time::timeout(
+                Duration::from_secs(10),
+                pool.send_tcp_from(source, destination, Bytes::from_static(b"PING")),
+            )
+            .await
+            .expect("a send after the writer gave up must not park")
+            .expect("no connect from the pinned port after the writer gave up");
+            assert_ne!(replacement_id, stalled_id);
+
+            // One accept for every connection the pool opened.  The last is the
+            // replacement, the only one not reset by now, and it came from the
+            // pinned port.
+            let mut held = Vec::new();
+            for _ in 0..=carried_on.len() {
+                let socket = tokio::time::timeout(Duration::from_secs(10), accepted.recv())
+                    .await
+                    .expect("every connection the pool opened must reach the peer")
+                    .expect("the peer's accept loop is still running");
+                held.push(socket);
+            }
+            let replacement = held.last().expect("the pool opened a connection");
+            assert_eq!(replacement.peer_addr().unwrap(), source);
+        }
     }
 }
