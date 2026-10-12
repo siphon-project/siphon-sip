@@ -642,6 +642,13 @@ pub(super) fn relay_request(
         }
     }
 
+    hold_client_connection(
+        client_key_opt.as_ref(),
+        outbound_transport,
+        connection_id,
+        state,
+    );
+
     // Patch the session's ClientBranch via the locally-held `Arc` we got
     // back from `session_store.insert(...)` rather than re-looking up
     // through the store: at high CPS on TCP loopback the UAS 200 OK can
@@ -1232,6 +1239,13 @@ pub(super) fn relay_fork_branch(
         "fork: sent branch"
     );
 
+    hold_client_connection(
+        client_key_opt.as_ref(),
+        outbound_transport,
+        connection_id,
+        state,
+    );
+
     // For TCP/TLS the actual connection_id may differ from the placeholder
     // — patch the session's ClientBranch so retransmits/CANCEL hit the right
     // connection.
@@ -1259,6 +1273,34 @@ pub(super) fn relay_fork_branch(
                 }
             }
         }
+    }
+}
+
+/// Keep the connection a relayed request left on open for as long as its
+/// client transaction lives.
+///
+/// The outbound pool closes a TCP connection that has been silent for its idle
+/// timeout, and a callee that rings for longer than that is silent for exactly
+/// that long. The final response is owed on the connection the request went
+/// out on (RFC 3261 §18.2.2), so that connection has to outlast the ringing.
+/// The hold is stored in the transaction and released with it.
+///
+/// TCP only: it is the one transport whose pooled connections idle out. A
+/// pooled TLS connection has no idle timer, and a WebSocket connection is the
+/// client's to keep.
+fn hold_client_connection(
+    client_key: Option<&TransactionKey>,
+    transport: Transport,
+    connection_id: ConnectionId,
+    state: &DispatcherState,
+) {
+    if transport != Transport::Tcp {
+        return;
+    }
+    if let Some(client_key) = client_key {
+        state
+            .transaction_manager
+            .hold_client_connection(client_key, state.connection_pool.hold(connection_id));
     }
 }
 

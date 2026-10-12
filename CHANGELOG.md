@@ -307,6 +307,43 @@ entry, but a working config keeps working.
   sends to its connected peer. The automatic ACRs and Credit-Control requests
   of `rf:` and `ro:` already followed the table. `diameter.send_request` is
   unchanged and still takes any connected peer without `peer=`.
+- **A final response that comes more than 30 s after its request is no longer
+  lost when the request was relayed over TCP.** A call relayed over TCP and
+  answered after ringing for more than 30 s never reached the caller, and
+  neither did any other late final response, such as the next node's own 408
+  at its transaction timeout. Two things went wrong, one at each end.
+  - *The sender closed the connection under its own transaction.* The
+    outbound pool closes a TCP connection that has been silent for 30 s, and
+    it did so whatever was pending on it (`pool: TCP connection ... idle
+    timeout (30s)`). A connection now stays open for as long as a client
+    transaction of the proxy is pending on it, INVITE or not, and is closed
+    for idleness one idle period after the last of them has ended. RFC 3261
+    §18 leaves the lifetime of a connection to the implementation, but the
+    response is owed on the connection the request arrived on (§18.2.2), so
+    closing that one defeats the transaction. Only the idle timer is
+    suspended: a peer that closes the connection, a read or write error and
+    the socket keepalive still end it. A dialog is not a transaction, so the
+    connection of an answered call still idles out and a later request in the
+    dialog opens a new one, as before. Pooled TLS connections never had an
+    idle timer and are unchanged. A B2BUA leg has no client transaction, so
+    its connection is not held; its answer depends on the second half.
+  - *The node sending the response connected to the wrong port.* With the
+    connection gone it opened a new one to the address the request had come
+    from, source port included, and that port was the peer's ephemeral one
+    (`pool: TCP connect failed: Connection refused ... destination=<peer>:<ephemeral port>`).
+    A response that has lost its connection is now sent to the address the
+    request came from at the port in the `sent-by` of its top Via, or at the
+    default port of the transport (5060, 5061 for TLS) when the `sent-by`
+    has none, per RFC 3261 §18.2.2. The address is the one the request was
+    received from, which is what `received` holds (§18.2.1); it is not taken
+    from the Via, so a Via cannot point a response at a third party. The
+    value of `rport` is not a port to connect to on a stream transport. This
+    applies to TCP and TLS; a WebSocket connection cannot be opened from the
+    server, so a response for one that has closed is still dropped with a
+    warning, and UDP, where RFC 3581 applies, is untouched. A response that
+    still cannot be delivered is logged at `warn` with its status, CSeq and
+    branch and the address tried. A connection that has closed but is still
+    being cleaned up now counts as closed instead of dropping the message.
 
 - **Flow descriptions on Rx and N5 name the uplink flow `in` and the downlink
   flow `out` (TS 29.214 §5.3.8). Behaviour change on the wire.**

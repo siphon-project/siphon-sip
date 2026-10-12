@@ -31,6 +31,7 @@ use tracing::{debug, error, warn};
 
 use crate::transport::crlf_keepalive::{drain_leading_crlf_keepalives, CrlfPongTracker};
 use crate::transport::pool::ConnectionPool;
+use crate::transport::response_route;
 use crate::transport::tcp::{frame_sip_message, FrameVerdict};
 use crate::transport::{
     ConnectionId, InboundMessage, OutboundMessage, StreamConnections, Transport,
@@ -136,6 +137,8 @@ async fn send_via_pool(
     let requested_connection_id = outbound.connection_id;
     let source = pool_tcp_source(outbound.source_local_addr, destination, is_protected);
     for frame in outbound.into_frames() {
+        // Kept for the log line of a failure: a refcount, not a copy.
+        let attempted = frame.clone();
         let sent = match transport {
             Transport::Tls => {
                 pool.send_tls(destination, server_name.as_deref(), frame)
@@ -165,15 +168,52 @@ async fn send_via_pool(
                 );
             }
             Err(error) => {
-                warn!(
-                    destination = %destination,
-                    connection_id = ?requested_connection_id,
-                    "{transport} outbound pool connect failed: {error}"
-                );
+                // A response has no retransmission of its own on a stream
+                // transport, so name the transaction that just lost it.
+                match response_route::describe_transaction(&attempted) {
+                    Some(transaction) => warn!(
+                        destination = %destination,
+                        connection_id = ?requested_connection_id,
+                        transaction = %transaction,
+                        "{transport} outbound pool connect failed, response not delivered: {error}"
+                    ),
+                    None => warn!(
+                        destination = %destination,
+                        connection_id = ?requested_connection_id,
+                        "{transport} outbound pool connect failed: {error}"
+                    ),
+                }
                 return;
             }
         }
     }
+}
+
+/// Readdress a response that has lost its connection to where its sender
+/// listens (RFC 3261 §18.2.2, [`response_route`]).
+///
+/// A response is handed down addressed to where its request came from, which
+/// on a stream transport ends in the peer's ephemeral source port. That is
+/// right for as long as the connection lives, because the connection is found
+/// by its id and the address goes unused. Once the connection is gone the
+/// address is all that is left, and a connect to an ephemeral port is refused:
+/// the peer listens on the port in the sent-by of its Via. Requests, and
+/// anything that travels with one, keep the address they were given.
+fn readdress_response(mut outbound: OutboundMessage, transport: Transport) -> OutboundMessage {
+    if let Some(target) =
+        response_route::reconnect_target(&outbound.data, transport, outbound.destination)
+    {
+        if target != outbound.destination {
+            debug!(
+                connection_id = ?outbound.connection_id,
+                received_from = %outbound.destination,
+                target = %target,
+                "{transport} response has no live connection: reconnecting to the sent-by port"
+            );
+            outbound.destination = target;
+        }
+    }
+    outbound
 }
 
 /// Queue depth of one fallback lane: the same bound a live connection's
@@ -339,6 +379,8 @@ fn retire_fallback_lane(
 /// `ConnectionId::default()`, or a connection that has since closed) it falls
 /// back to the outbound [`ConnectionPool`] where one is supplied, on a lane per
 /// destination ([`FallbackLanes`]) so a connect never stalls the distributor.
+/// A response that falls back is first readdressed to the port its sender
+/// listens on ([`readdress_response`]).
 pub(crate) fn spawn_outbound_distributor(
     outbound_rx: flume::Receiver<OutboundMessage>,
     connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>>,
@@ -366,7 +408,12 @@ fn spawn_outbound_distributor_with(
     let mut lanes = fallback.map(|send| FallbackLanes::new(send, FALLBACK_LANE_IDLE));
     tokio::spawn(async move {
         while let Ok(outbound) = outbound_rx.recv_async().await {
-            if let Some(sender) = connection_map.get(&outbound.connection_id) {
+            // A sender whose receiver is gone belongs to a connection that has
+            // closed and not yet left the map: the same as no connection.
+            let live = connection_map
+                .get(&outbound.connection_id)
+                .filter(|sender| !sender.is_closed());
+            if let Some(sender) = live {
                 // Non-blocking: NEVER park in `send().await` here. This task is
                 // the single outbound distributor and it holds the
                 // `connection_map` shard read guard for the whole `if let`. A
@@ -399,7 +446,7 @@ fn spawn_outbound_distributor_with(
             } else if let Some(lanes) = lanes.as_mut() {
                 // Never awaited here: a connect can run the pool's full timeout,
                 // and this task carries every other send too.
-                lanes.dispatch(outbound);
+                lanes.dispatch(readdress_response(outbound, transport));
             } else {
                 debug!(
                     "{transport} outbound: connection {:?} not found (may have closed)",

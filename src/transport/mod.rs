@@ -3,10 +3,14 @@ pub mod client_tls;
 pub mod crlf_keepalive;
 pub(crate) mod disconnect;
 pub mod flow;
+pub mod hold;
+#[cfg(test)]
+mod late_response_tests;
 pub mod mux;
 pub mod pool;
 pub mod proxy_protocol;
 pub mod rate_limit;
+pub(crate) mod response_route;
 #[cfg(feature = "sctp")]
 pub mod sctp;
 pub mod stream;
