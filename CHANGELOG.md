@@ -209,6 +209,57 @@ entry, but a working config keeps working.
 
 ### Fixed
 
+- **B2BUA: the caller's 2xx carries the answer when the callee's does not and
+  the caller's own dialog never had it reliably (RFC 3261 §13.2.1). Behaviour
+  change on the wire.** A callee that gives its answer in a reliable provisional
+  may send its 2xx without SDP, since the offer/answer exchange of its dialog
+  is complete (RFC 3262 §5). siphon relayed that 2xx to the caller as it came.
+  For a caller that does not use `100rel` the provisional was unreliable, so the
+  only session description it ever got was one RFC 3261 §13.2.1 does not count:
+  the answer "MUST be in a reliable non-failure message", and what an
+  unreliable provisional shows is a preview of it (RFC 6337 §3.1.1: "the UAS
+  MUST send the same exact answer in the 2xx"). Such a caller was sent
+
+  ```text
+  183 Session Progress   SDP, no Require: 100rel, no RSeq
+  200 OK                 no SDP
+  ```
+
+  and is now sent the 200 with the session description of the 183: the same
+  bytes, as they left the media engine and `media.sdp_strip_attributes` on the
+  way to the caller, under the same `o=` session id and version, which the
+  caller's dialog keeps for what siphon sends it next (RFC 3264 §8). The answer
+  is the one of the early dialog that sent the 2xx: with a fork, never what
+  another callee's provisional showed.
+
+  A callee's 2xx that does carry SDP after such a preview names the same
+  session as the preview did. The preview went out under the callee's `o=`
+  session id and version, and the 2xx under the session id of the caller's
+  dialog at version 0, so one INVITE showed the caller two sessions (RFC 4566
+  §5.2 makes the session id the identity of a description and the version its
+  revision). The 2xx now takes the preview's origin. When its description is
+  the previewed one, compared as the caller is sent it, the version is the
+  preview's too and the body is the same bytes. When it differs (the callee
+  changed its answer, or the media engine allocated again) it is the callee's
+  own description under the preview's session id at the next version, because
+  media follows the callee's 2xx, and siphon logs at `WARN` that the caller is
+  entitled to ignore it (RFC 3261 §13.2.1). Either way the caller's dialog
+  keeps that session id, and a later re-INVITE or session refresh toward the
+  caller takes the version after the 2xx's (RFC 3264 §8). Only the `o=` line of
+  that 2xx changes.
+
+  Unchanged: a caller that got the answer in a reliable provisional (a 2xx
+  without SDP stays without, one with SDP is stamped as before), a call with no
+  SDP in any provisional, a 2xx on another early dialog than the previewed
+  one, a call whose INVITE had no offer, and re-INVITEs. A 2xx without SDP from a callee that sent no session description
+  in a provisional either still reaches the caller without one, and is now
+  logged at `WARN`. `@b2bua.on_answer` sees the callee's 2xx as before, without
+  a body; the answer is added after it ran. Covered by
+  `dispatcher::answer_after_preview_tests`, by the SIPp scenario
+  `b2bua_bodyless_answer_*` in the `sipp-b2bua-reliable-prov` job, and read back
+  with Wireshark's SIP and SDP dissectors by
+  `scripts/validate_b2bua_previewed_answer.sh`.
+
 - **Flow descriptions on Rx and N5 name the uplink flow `in` and the downlink
   flow `out` (TS 29.214 §5.3.8). Behaviour change on the wire.**
   `qos.media_flows_from_sdp` wrote the two direction keywords the wrong way

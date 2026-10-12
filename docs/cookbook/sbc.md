@@ -233,6 +233,17 @@ caller's UAS on the A-leg, so RFC 3262 on each leg is SIPhon's, under every pres
   that ends while the 2xx waits (a BYE from the callee, a CANCEL from the caller, a
   timer) gives the caller `487 Request Terminated`, never a BYE, and the callee a
   BYE. A final response stops the retransmissions.
+- The 2xx carries the answer unless the caller's dialog already had it reliably
+  (RFC 3261 §13.2.1). A callee that answered in a reliable provisional may send its
+  2xx without SDP. A caller that got that provisional reliably has the answer, and
+  its 2xx goes without SDP too. A caller that does not use `100rel` was only shown
+  a preview of it in an unreliable provisional, so its 2xx carries that same session
+  description, as the media engine left it on the way to the caller and under the
+  same `o=` line (RFC 6337 §3.1.1). With a fork it is the answering callee's own.
+  A callee's 2xx that does carry SDP after such a preview goes out under the
+  preview's `o=` session id: at the same version, byte for byte, when it repeats the
+  previewed description, and at the next version, with a `WARN`, when it differs,
+  since the caller may ignore a second answer (RFC 3261 §13.2.1).
 - A caller that leaves a reliable provisional unacknowledged for 32 s (64×T1) is
   refused `500`. The callee is CANCELled, or BYEd if its 2xx was the one waiting.
   `@b2bua.on_failure` does not run: routing elsewhere cannot make the caller PRACK.
