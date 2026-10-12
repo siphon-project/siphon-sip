@@ -186,7 +186,7 @@ including the note on carrier NAT and `max_connections_per_source`.
 An inbound TCP, TLS, WS or WSS connection is closed after 300 s in which the
 peer sent nothing. An outbound TCP connection, which siphon opens to relay a
 request and then reuses for every request to the same destination, is closed
-after 30 s in which the peer sent nothing, with two exceptions:
+after 30 s in which the peer sent nothing, with three exceptions:
 
 - **A request is still waiting for its final response.** A call relayed over
   the connection keeps it open while the callee rings, and so does any other
@@ -197,8 +197,18 @@ after 30 s in which the peer sent nothing, with two exceptions:
   reuses the connection if it is still there and opens a new one if not.
 - **The destination is a registrar siphon is registered with** (`registrant:`),
   for as long as the trunk is configured.
+- **The connection leaves from an IPsec protected port.** A request toward a UE
+  leaves from the protected client port (TS 33.203 §7.1), so every connection
+  to that UE has the same local and remote port. Such a connection is kept
+  through any amount of silence, because once closed it cannot be opened again
+  for as long as the closed one is in TIME-WAIT unless both ends use TCP
+  timestamps. It ends when the UE closes it, when a read or write fails, or
+  when the socket keepalive gives up, which is also what ends it after the
+  security association is gone: 60 s of silence and three probes 10 s apart.
+  When siphon is the one to close it, it resets the connection instead, so the
+  next request can connect from the same port at once.
 
-Neither exception stops siphon noticing a dead peer: a connection is dropped
+None of these stops siphon noticing a dead peer: a connection is dropped
 as soon as the peer closes it, a read or write fails, or the socket keepalive
 gives up. An outbound TLS connection has no idle timeout at all.
 

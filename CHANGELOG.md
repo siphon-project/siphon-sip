@@ -345,6 +345,37 @@ entry, but a working config keeps working.
     branch and the address tried. A connection that has closed but is still
     being cleaned up now counts as closed instead of dropping the message.
 
+- **A request to a UE over IPsec and TCP no longer fails when it follows the
+  previous one by more than 30 s.** A request in a dialog, a re-INVITE or the
+  BYE, failed at the proxy with a transport error and a 503 (RFC 3261 §16.9)
+  when it came between 30 s and about 90 s after the one before it, so a BYE
+  could leave the far end in the call (`pool: TCP connect failed: Cannot
+  assign requested address (os error 99) bind_addr=<local>:<protected
+  port>`). A request toward a UE has to leave from the protected client port
+  (TS 33.203 §7.1), so every connection to one UE has the same four addresses
+  and ports. The outbound pool closed that connection after 30 s of silence
+  like any other, the closed connection then sat in TIME-WAIT, and Linux
+  refuses a connect on a 4-tuple in TIME-WAIT unless both ends negotiated TCP
+  timestamps. `SO_REUSEADDR`, which the pool already set, only lets the bind
+  through.
+  - *A connection from a pinned local port is no longer closed for idleness.*
+    The protected ports belong to the security association and the connection
+    between them is kept with it. It ends when the UE closes it, on a read or
+    write error, or when the socket keepalive gives up (60 s of silence, then
+    three probes 10 s apart), which is also what ends it once the association
+    is deleted and nothing answers on those ports. The pool is not told when
+    an association ends, so until the keepalive notices, a connection of a
+    deleted association stays open.
+  - *When the pool is the one to close such a connection, it resets it.* That
+    happens when its writer gives up on a write error or on a peer that
+    stopped reading. A reset leaves no TIME-WAIT, so the next request connects
+    from the same port at once. The reader used to stay on the socket after
+    the writer had gone, which kept the 4-tuple taken and failed every connect
+    the same way; the two now end together, and the pool offers the slot again
+    only once the socket is closed.
+  - Connections from an ephemeral port, a `send_socket=` egress pin included,
+    idle out after 30 s as before, and TLS is unchanged.
+
 - **Flow descriptions on Rx and N5 name the uplink flow `in` and the downlink
   flow `out` (TS 29.214 §5.3.8). Behaviour change on the wire.**
   `qos.media_flows_from_sdp` wrote the two direction keywords the wrong way

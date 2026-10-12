@@ -54,6 +54,7 @@ Only relevant when you link `siphon-sip` as a crate.
 | Nbsf discovery, answer 204 | raised `sbi.BsfError` | no binding (`None`), as for 404 |
 | Cx MAR of `auth.require_ims_digest`, `Public-Identity` | URI of P-Asserted-Identity, else of From | URI of the To header, per TS 24.229 clause 5.4.1.2.1 |
 | Outbound TCP connection with a request pending on it | closed after 30 s of silence | kept until the client transaction ends, then closed after 30 s of silence |
+| Outbound TCP connection from an IPsec protected port | closed after 30 s of silence | kept until the UE closes it, an error or the socket keepalive ends it; reset, not closed with a FIN, when siphon ends it |
 | Response whose TCP or TLS connection has closed | new connection to the source port of the request | new connection to the port in the `sent-by` of the Via (5060, or 5061 for TLS, when it has none), per RFC 3261 clause 18.2.2 |
 
 The flow descriptions are the one to test against the policy function in use.
@@ -81,3 +82,9 @@ share a connection. A firewall or load balancer between two nodes has to let a
 node open a TCP or TLS connection to the port its peer writes in its Via, which
 is the port that peer listens on. That is where a late response goes when the
 connection its request came on has been closed in the meantime.
+
+A P-CSCF that serves UEs over IPsec with TCP now keeps one connection open per
+registered UE it has sent a request to, from its protected client port to the
+protected server port of the UE, until the UE closes it or stops answering the
+keepalive. It used to close each after 30 seconds and then fail to open it
+again for the next request in the same call.
