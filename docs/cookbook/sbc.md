@@ -274,6 +274,47 @@ runs both, `on_provisional` first, on the same `reply`. Neither runs for a
 `100 Trying`, which is hop by hop, nor for a provisional SIPhon does not relay:
 one that arrives after the answer, or from a leg that has already ended.
 
+### Ringback toward the calling network
+
+A callee may answer the INVITE's offer in a reliable `183` "without any intention
+of sending early media (this is the case when preconditions are used)", so "by only
+looking at the SIP signalling, a UAC cannot be sure whether or not there will be
+early media" (RFC 3960 §3.2). Inside an IMS the `P-Early-Media` header settles it
+(RFC 5009): a gateway starts ringing on a `180` unless the most recent
+`P-Early-Media` authorises backward early media (TS 29.163 §7.2.3.2.4). A calling
+network that does not read the header, and takes any session description in a
+provisional for early media, stops generating ringback and plays its caller silence
+until the answer.
+
+At that edge, show the caller a session description only when the callee
+authorises media toward it, and relay every other provisional without its body:
+
+```python
+def early_media_authorised(reply):
+    early_media = (reply.get_header("P-Early-Media") or "").lower()
+    return "sendrecv" in early_media or "sendonly" in early_media
+
+@b2bua.on_provisional
+def on_provisional(call, reply):
+    if reply.has_body("application/sdp") and not early_media_authorised(reply):
+        reply.relay(body=False)
+```
+
+A `180` without SDP is relayed as it is, which is what makes the calling network
+ring (RFC 3960 §3.2: "If a 180 (Ringing) has been received but there are no
+incoming media packets, generate local ringing"). `reply.withhold()` relays nothing
+for a response instead. The callee's dialog goes on as it would have: SIPhon PRACKs
+the reliable provisional, `@b2bua.on_early_media` still runs with the session
+description for the media engine, and an UPDATE on the early dialog is handled as
+for any caller that has not had the answer reliably. The caller gets the answer in
+the 2xx, also when the callee's 2xx carries none (RFC 3261 §13.2.1). An authorised
+provisional that follows is relayed with its session description. With a fork each
+callee's provisional runs the handler and is judged on its own header.
+
+Toward a caller that uses `100rel` the provisional without its body is still sent
+reliably when the callee's was, which RFC 3262 allows, and a withheld one takes no
+`RSeq` on the caller's dialog.
+
 ### `Supported` and `Allow` on both legs
 
 SIPhon is the UAC of the B-leg and the UAS of the A-leg, so the B-leg INVITE's

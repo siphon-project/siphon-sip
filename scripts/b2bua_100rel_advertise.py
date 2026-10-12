@@ -13,6 +13,12 @@ handler runs, so the reliable-1xx strip toward the non-100rel A-leg trunk is
 still applied.  If siphon read the (now-mutated) INVITE back, it would conclude
 the trunk supports 100rel and leak the reliable 183 — and the trunk would
 CANCEL the call.
+
+For a call to dave it also decides what the caller is shown of a provisional:
+a session description is relayed only when the callee authorises early media
+toward the caller in P-Early-Media (RFC 5009), and otherwise the provisional
+goes out without its body, so the calling side keeps generating ringback
+(RFC 3960 §3.2). The answer then reaches the caller in the 200.
 """
 from siphon import b2bua, proxy, registrar, auth, log
 
@@ -57,6 +63,23 @@ def new_call(call):
         strategy="parallel",
         timeout=30,
     )
+
+
+def early_media_authorised(reply):
+    """Whether the callee authorises media toward the caller (RFC 5009)."""
+    early_media = (reply.get_header("P-Early-Media") or "").lower()
+    return "sendrecv" in early_media or "sendonly" in early_media
+
+
+@b2bua.on_provisional
+def provisional(call, reply):
+    # Only for the ringback scenario's callee, so the other scenarios on this
+    # instance see a provisional relayed as it is.
+    if call.ruri.user != "dave":
+        return
+    if reply.has_body("application/sdp") and not early_media_authorised(reply):
+        log.info(f"Call {call.id} {reply.status_code} relayed without its body")
+        reply.relay(body=False)
 
 
 @b2bua.on_early_media

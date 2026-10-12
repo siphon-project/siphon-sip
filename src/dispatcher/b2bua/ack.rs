@@ -603,6 +603,14 @@ pub fn set_sdp_body(message: &mut SipMessage, body: Vec<u8>, content_type: &str)
         .set("Content-Length", message.body.len().to_string());
 }
 
+/// Take the body off `message`, with its Content-Type, and say so in
+/// Content-Length.
+pub fn remove_body(message: &mut SipMessage) {
+    message.headers.remove("Content-Type");
+    message.body.clear();
+    message.headers.set("Content-Length", "0".to_string());
+}
+
 /// Give an SDP body siphon sends a B-leg what every SDP relayed toward a leg gets,
 /// in the same order as [`own_sdp_toward_leg`]: siphon's `o=` owner, `s=` and `o=`
 /// address (topology hiding), the leg's session id at its next version (RFC 3264

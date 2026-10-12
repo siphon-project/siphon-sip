@@ -537,6 +537,41 @@ fn a_dialog_adopts_the_origin_of_an_sdp_siphon_sent_as_given() {
 }
 
 #[test]
+fn a_b_leg_keeps_the_early_answer_the_caller_is_owed_per_early_dialog() {
+    let shown = |leg: &Leg| leg.early_answer_sent.clone();
+    let withheld = |leg: &Leg| leg.early_answer_withheld.clone();
+    let dialog = |tag: &str| Some(tag.to_string());
+
+    // One a script kept from the caller is held for the caller's 2xx.
+    let mut leg = make_b_leg(0);
+    leg.record_early_answer(b"kept".to_vec(), dialog("a"), false);
+    assert_eq!(
+        (shown(&leg), withheld(&leg)),
+        (None, Some(b"kept".to_vec()))
+    );
+
+    // One the caller is shown later on the same early dialog replaces it.
+    leg.record_early_answer(b"shown".to_vec(), dialog("a"), true);
+    assert_eq!(
+        (shown(&leg), withheld(&leg)),
+        (Some(b"shown".to_vec()), None)
+    );
+
+    // One kept from the caller after that leaves what the caller was shown,
+    // which is what its 2xx repeats (RFC 6337 §3.1.1).
+    leg.record_early_answer(b"kept".to_vec(), dialog("a"), false);
+    assert_eq!(shown(&leg), Some(b"shown".to_vec()));
+
+    // Another early dialog's answer is its own (RFC 3261 §13.2.1).
+    leg.record_early_answer(b"other".to_vec(), dialog("b"), false);
+    assert_eq!(
+        (shown(&leg), withheld(&leg)),
+        (None, Some(b"other".to_vec()))
+    );
+    assert_eq!(leg.early_answer_dialog, dialog("b"));
+}
+
+#[test]
 fn generated_sdp_session_id_fits_a_signed_64_bit_integer() {
     // RFC 3264 §5: the o= session-id MUST be representable in a signed
     // 64-bit integer.  The generator drew from the whole unsigned range, so

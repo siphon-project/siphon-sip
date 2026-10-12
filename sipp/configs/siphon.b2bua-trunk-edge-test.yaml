@@ -13,6 +13,10 @@
 #            and sends its 200 without SDP (carol): the 200 to the non-100rel
 #            A-leg carries the answer its unreliable 183 showed (RFC 3261
 #            §13.2.1).
+#            Ringback: for a call to dave the script relays a 183 that carries
+#            SDP and no P-Early-Media authorising it without its body
+#            (reply.relay(body=False)), and the answer reaches the A-leg in
+#            the 200 (RFC 3960 §3.2).
 #
 # This instance pins `sip-trunk-edge@2026`, whose response policy is
 # `default → Copy` and does NOT strip Require/RSeq.  The 100rel strip must
@@ -47,6 +51,7 @@ auth:
     alice: "secret"
     bob: "secret"
     carol: "secret"
+    dave: "secret"
 
 b2bua:
   default_header_policy: "sip-trunk-edge@2026"

@@ -763,7 +763,9 @@ class SipTestHarness:
 
         Runs ``@b2bua.on_provisional`` handlers, then ``@b2bua.on_early_media``
         handlers when the reply has a body, on the same reply: what siphon
-        does for a provisional it relays to the caller.
+        does for a provisional it relays to the caller. A handler may call
+        ``reply.relay(body=False)`` or ``reply.withhold()`` on it;
+        ``reply.provisional_relay`` reads the decision back.
 
         Args:
             call: Call object (auto-created from ``**kwargs`` if ``None``).
@@ -786,6 +788,8 @@ class SipTestHarness:
                 to_uri=call.to_uri,
                 call_id=call.call_id,
             )
+
+        reply._shaping_provisional = True
 
         registry = mock_module.get_registry()
         hooks = ["b2bua.on_provisional"]

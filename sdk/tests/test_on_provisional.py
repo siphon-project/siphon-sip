@@ -81,3 +81,108 @@ async def on_provisional(call, reply):
         ringing = Reply(status_code=180, reason="Ringing")
         harness.send_provisional(reply=ringing)
         assert ringing.get_header("X-Status") == "180"
+
+
+RINGBACK = """
+from siphon import b2bua
+
+@b2bua.on_provisional
+def on_provisional(call, reply):
+    early_media = reply.get_header("P-Early-Media") or ""
+    authorised = "sendrecv" in early_media or "sendonly" in early_media
+    if reply.has_body("application/sdp") and not authorised:
+        reply.relay(body=False)
+"""
+
+
+def progress(**headers):
+    return Reply(
+        status_code=183,
+        reason="Session Progress",
+        body=SDP,
+        content_type="application/sdp",
+        headers=headers,
+    )
+
+
+class TestWhatTheCallerIsSent:
+    def test_a_handler_that_decides_nothing_relays_the_response_whole(self, harness):
+        harness.load_source(
+            """
+from siphon import b2bua
+
+@b2bua.on_provisional
+def on_provisional(call, reply):
+    reply.set_header("X-Seen", "yes")
+"""
+        )
+        reply = progress()
+        harness.send_provisional(reply=reply)
+        assert reply.provisional_relay == "whole"
+
+    def test_relay_without_the_body(self, harness):
+        harness.load_source(RINGBACK)
+        reply = progress()
+        harness.send_provisional(reply=reply)
+        assert reply.provisional_relay == "without_body"
+        assert reply.last_action.kind == "relay"
+        assert reply.last_action.extras == {"body": False}
+        # The handlers still read the session description.
+        assert reply.has_body("application/sdp")
+
+    def test_an_authorised_provisional_is_relayed_whole(self, harness):
+        harness.load_source(RINGBACK)
+        reply = progress(**{"P-Early-Media": "sendrecv"})
+        harness.send_provisional(reply=reply)
+        assert reply.provisional_relay == "whole"
+
+    def test_ringing_without_a_body_is_relayed_as_it_is(self, harness):
+        harness.load_source(RINGBACK)
+        ringing = Reply(status_code=180, reason="Ringing")
+        harness.send_provisional(reply=ringing)
+        assert ringing.provisional_relay == "whole"
+        assert ringing.actions == []
+
+    def test_withhold(self, harness):
+        harness.load_source(
+            """
+from siphon import b2bua
+
+@b2bua.on_provisional
+def on_provisional(call, reply):
+    reply.withhold()
+"""
+        )
+        reply = progress()
+        harness.send_provisional(reply=reply)
+        assert reply.provisional_relay == "withheld"
+        assert reply.last_action.kind == "withhold"
+
+    def test_the_last_decision_stands(self, harness):
+        harness.load_source(
+            """
+from siphon import b2bua
+
+@b2bua.on_provisional
+def on_provisional(call, reply):
+    reply.withhold()
+    reply.relay(body=False)
+
+@b2bua.on_early_media
+def on_early_media(call, reply):
+    reply.relay()
+"""
+        )
+        reply = progress()
+        harness.send_provisional(reply=reply)
+        assert reply.provisional_relay == "whole"
+
+    def test_refused_on_a_reply_that_is_not_a_relayed_provisional(self):
+        reply = progress()
+        with pytest.raises(RuntimeError, match="@b2bua.on_provisional"):
+            reply.relay(body=False)
+        with pytest.raises(RuntimeError, match="@b2bua.on_provisional"):
+            reply.withhold()
+        assert reply.actions == []
+        reply.relay()
+        assert reply.last_action.kind == "relay"

@@ -1,0 +1,118 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  B2BUA ringback toward the calling network: A-leg UAC that does not use 100rel.
+
+  INVITE with an SDP offer (NO Supported: 100rel) → 100 → 183 WITHOUT SDP →
+  180 WITHOUT SDP → 200 with SDP → ACK → BYE → 200
+
+  The B-leg UAS (b2bua_bodyless_answer_uas.xml, registered as dave) gives its
+  answer in a reliable 183 with no P-Early-Media header: an answer "without any
+  intention of sending early media" (RFC 3960 §3.2). The script on the siphon
+  under test (scripts/b2bua_100rel_advertise.py) relays such a provisional with
+  reply.relay(body=False) for a call to dave, so this caller is shown no session
+  description before the answer and goes on generating ringback on the 180.
+
+  The callee's 200 has no body either, so the 200 siphon sends here is the only
+  message that can carry the answer, and it must (RFC 3261 §13.2.1).
+
+  The scenario fails when the 183 or the 180 carries a session description, or
+  the 200 does not.
+-->
+<scenario name="B2BUA ringback UAC (no 100rel)">
+
+  <send retrans="500">
+    <![CDATA[
+INVITE sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:alice@[local_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:[service]@[remote_ip]>
+Call-ID: [call_id]
+CSeq: 1 INVITE
+Contact: <sip:alice@[local_ip]:[local_port];transport=[transport]>
+Max-Forwards: 70
+User-Agent: SIPp/b2bua-no-100rel
+Content-Type: application/sdp
+Content-Length: [len]
+
+v=0
+o=alice 53655765 2353687637 IN IP[local_ip_type] [local_ip]
+s=-
+c=IN IP[media_ip_type] [media_ip]
+t=0 0
+m=audio [media_port] RTP/AVP 0 8 101
+a=rtpmap:0 PCMU/8000
+a=rtpmap:8 PCMA/8000
+a=rtpmap:101 telephone-event/8000
+a=fmtp:101 0-15
+]]>
+  </send>
+
+  <recv response="100" optional="true" />
+
+  <!-- The callee's 183, without the session description it carried. -->
+  <recv response="183" crlf="true">
+    <action>
+      <ereg regexp="100rel" search_in="hdr" header="Require:"
+            check_it_inverse="true" assign_to="junk" />
+      <ereg regexp="[0-9]+" search_in="hdr" header="RSeq:"
+            check_it_inverse="true" assign_to="junk" />
+      <ereg regexp="sdp" search_in="hdr" header="Content-Type:"
+            check_it_inverse="true" assign_to="junk" />
+      <ereg regexp="m=audio" search_in="msg"
+            check_it_inverse="true" assign_to="junk" />
+    </action>
+  </recv>
+
+  <!-- Ringing, as the callee sent it: no session description. -->
+  <recv response="180" crlf="true">
+    <action>
+      <ereg regexp="m=audio" search_in="msg"
+            check_it_inverse="true" assign_to="junk" />
+    </action>
+  </recv>
+
+  <!-- The answer is in the 200. -->
+  <recv response="200" rtd="true" crlf="true">
+    <action>
+      <ereg regexp="application/sdp" search_in="hdr" header="Content-Type:"
+            check_it="true" assign_to="junk" />
+      <ereg regexp="m=audio [0-9]+ RTP/AVP [0-9 ]+" search_in="msg"
+            check_it="true" assign_to="junk" />
+    </action>
+  </recv>
+
+  <send>
+    <![CDATA[
+ACK sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:alice@[local_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:[service]@[remote_ip]>[peer_tag_param]
+Call-ID: [call_id]
+CSeq: 1 ACK
+Max-Forwards: 70
+Content-Length: 0
+
+]]>
+  </send>
+
+  <pause milliseconds="500" />
+
+  <send retrans="500">
+    <![CDATA[
+BYE sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:alice@[local_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:[service]@[remote_ip]>[peer_tag_param]
+Call-ID: [call_id]
+CSeq: 2 BYE
+Max-Forwards: 70
+Content-Length: 0
+
+]]>
+  </send>
+
+  <recv response="200" rtd="true" />
+
+</scenario>

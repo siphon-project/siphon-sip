@@ -37,4 +37,35 @@ changed on the first copy, a header or the SDP, is not on the repeats: they
 exist to get an answer through that was lost, and the caller takes its dialog
 from whichever copy arrives first.
 
+## A callee's provisional in a B2BUA script
+
+In `@b2bua.on_provisional` and `@b2bua.on_early_media` the `Reply` is a
+provisional response of the callee that SIPhon is about to relay to the caller.
+It is relayed whether or not the handler calls `reply.relay()`, and the handler
+may decide what the caller is sent of it:
+
+| Call | The caller is sent |
+|---|---|
+| nothing, or `reply.relay()` | the response as it is |
+| `reply.relay(body=False)` | the response without its body |
+| `reply.withhold()` | nothing for this response |
+
+The last call decides. `reply.has_body("application/sdp")` says whether the
+response carries a session description and `reply.get_header("P-Early-Media")`
+returns the callee's early media authorisation (RFC 5009), or `None`.
+
+Only the caller's side changes. The callee's provisional is PRACKed when it was
+reliable, `@b2bua.on_early_media` still runs with the body in place, and a
+session description kept from the caller is the answer the caller has not had,
+so the 2xx carries it even when the callee's own 2xx has none (RFC 3261
+§13.2.1). Toward a caller that uses `100rel`, a provisional relayed without its
+body is still sent reliably when the callee's was, on SIPhon's own `RSeq`, and
+a withheld one takes no `RSeq` (RFC 3262 §3).
+
+On any other reply (`@proxy.on_reply`, `@proxy.on_failure`,
+`@b2bua.on_answer`) `reply.relay(body=False)` and `reply.withhold()` raise
+`RuntimeError`: nothing there would carry the decision out. The
+[SBC cookbook](../cookbook/sbc.md#ringback-toward-the-calling-network) has the
+recipe these exist for.
+
 ::: siphon_sdk.reply.Reply

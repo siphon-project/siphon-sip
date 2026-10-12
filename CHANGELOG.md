@@ -27,6 +27,37 @@ entry, but a working config keeps working.
   relayed (after the answer, or from a leg that has ended). In the SDK,
   `SipTestHarness.send_provisional()` runs the handlers against a reply.
 
+- **`reply.relay(body=False)` and `reply.withhold()`: a B2BUA script decides
+  what the caller is sent of a callee's provisional.** A callee may answer the
+  offer in a reliable `183` "without any intention of sending early media (this
+  is the case when preconditions are used)" (RFC 3960 §3.2). A calling network
+  that takes any session description in a provisional for early media then
+  stops generating ringback, and its caller hears silence until the answer.
+  Inside an IMS `P-Early-Media` says which it is (RFC 5009; TS 29.163
+  §7.2.3.2.4 has a gateway ring on `180` unless backward early media is
+  authorised), but a script could only change the headers of a relayed
+  provisional, not keep its body from the caller. In `@b2bua.on_provisional`
+  and `@b2bua.on_early_media`, `reply.relay(body=False)` now relays the
+  response without its body and `reply.withhold()` relays nothing for it; the
+  last call decides, and a handler that calls neither leaves the response
+  relayed as it is, so no existing script changes behaviour.
+  `reply.has_body("application/sdp")` and `reply.get_header("P-Early-Media")`
+  are what a handler decides on. Only the caller's side changes: the callee's
+  reliable provisional is PRACKed (at once when it is withheld),
+  `@b2bua.on_early_media` still runs with the session description for the
+  media engine, and the caller, who has then not had the answer, gets it in
+  the 2xx even when the callee's 2xx carries none (RFC 3261 §13.2.1), as the
+  first description it is sent: under its own dialog's `o=` session id at its
+  first version, like any answer no provisional showed. Toward a
+  caller that uses `100rel` the provisional without its body is still sent
+  reliably when the callee's was, on siphon's own `RSeq`, and a withheld one
+  takes no `RSeq` (RFC 3262 §3). On any other reply both raise `RuntimeError`
+  instead of recording a decision nothing carries out. siphon applies no
+  policy of its own and has no setting for one. The SBC cookbook has the
+  recipe under "Ringback toward the calling network"; the SDK mock has both
+  methods and `reply.provisional_relay` to read the decision back after
+  `SipTestHarness.send_provisional()`.
+
 - **Rf accounting records can carry Access-Network-Information.** The
   `P-Access-Network-Info` header of the request (RFC 7315) goes to the CDF as
   `Access-Network-Information` (TS 32.299, AVP 1263, vendor 10415) inside
