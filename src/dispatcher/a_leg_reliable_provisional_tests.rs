@@ -16,16 +16,16 @@ use super::test_dispatcher::{test_dispatcher_with_script, TestDispatcher};
 use super::*;
 use std::time::{Duration, Instant};
 
-const CALLEE: &str = "198.51.100.7:5060";
+pub(super) const CALLEE: &str = "198.51.100.7:5060";
 const CALLER: &str = "192.0.2.10:5060";
 const SIP_CALL_ID: &str = "a-leg-100rel@192.0.2.10";
 
 /// The caller offers `100rel`.
-const SUPPORTS: &str = "Supported: 100rel, timer\r\n";
+pub(super) const SUPPORTS: &str = "Supported: 100rel, timer\r\n";
 /// The caller requires `100rel`.
 const REQUIRES: &str = "Supported: timer\r\nRequire: 100rel\r\n";
 /// The caller knows nothing of `100rel`.
-const PLAIN: &str = "Supported: timer\r\n";
+pub(super) const PLAIN: &str = "Supported: timer\r\n";
 
 const PRESETS: [&str; 4] = [
     "transparent-b2bua@2026",
@@ -43,7 +43,7 @@ const CALLER_SDP: &str = concat!(
     "m=audio 40000 RTP/AVP 0\r\n",
 );
 
-const CALLEE_SDP: &str = concat!(
+pub(super) const CALLEE_SDP: &str = concat!(
     "v=0\r\n",
     "o=- 2 2 IN IP4 198.51.100.7\r\n",
     "s=-\r\n",
@@ -53,9 +53,11 @@ const CALLEE_SDP: &str = concat!(
 );
 
 /// The callee's reliable provisional: `Require: 100rel` and its own `RSeq`.
-const RELIABLY: &[(&str, &str)] = &[("Require", "100rel"), ("RSeq", "42")];
+pub(super) const RELIABLY: &[(&str, &str)] = &[("Require", "100rel"), ("RSeq", "42")];
 
-fn caller_invite(capability: &str) -> String {
+/// The caller's INVITE, offering [`CALLER_SDP`] when `offers`.
+fn caller_invite(capability: &str, offers: bool) -> String {
+    let sdp = if offers { CALLER_SDP } else { "" };
     format!(
         concat!(
             "INVITE sip:15550100042@siphon.example.com SIP/2.0\r\n",
@@ -74,13 +76,13 @@ fn caller_invite(capability: &str) -> String {
         ),
         call_id = SIP_CALL_ID,
         capability = capability,
-        length = CALLER_SDP.len(),
-        sdp = CALLER_SDP,
+        length = sdp.len(),
+        sdp = sdp,
     )
 }
 
 /// A script that dials the callee under `policy`, with `extra` appended.
-fn dial_script(policy: &str, extra: &str) -> String {
+pub(super) fn dial_script(policy: &str, extra: &str) -> String {
     format!(
         concat!(
             "from siphon import b2bua\n",
@@ -95,7 +97,7 @@ fn dial_script(policy: &str, extra: &str) -> String {
     )
 }
 
-fn default_dial() -> String {
+pub(super) fn default_dial() -> String {
     dial_script("transparent-b2bua@2026", "")
 }
 
@@ -115,7 +117,7 @@ fn rseq(message: &SipMessage) -> Option<String> {
 }
 
 /// Sent reliably: `Require: 100rel` and an `RSeq` (RFC 3262 §3, §7.1).
-fn is_reliable(message: &SipMessage) -> bool {
+pub(super) fn is_reliable(message: &SipMessage) -> bool {
     crate::sip::headers::rseq::requires_100rel(&message.headers) && rseq(message).is_some()
 }
 
@@ -126,19 +128,29 @@ fn rseq_number(message: &SipMessage) -> u32 {
 }
 
 /// A caller's call through a real dispatcher, dialled to the callee.
-struct Call {
-    state: Arc<DispatcherState>,
+pub(super) struct Call {
+    pub(super) state: Arc<DispatcherState>,
     udp: flume::Receiver<OutboundMessage>,
-    call_id: String,
+    pub(super) call_id: String,
     invite: SipMessage,
-    callee_invite: SipMessage,
+    pub(super) callee_invite: SipMessage,
 }
 
 impl Call {
-    fn place(capability: &str, script: &str) -> Call {
-        let TestDispatcher { state, udp } = test_dispatcher_with_script(script);
+    pub(super) fn place(capability: &str, script: &str) -> Call {
+        Call::place_on(test_dispatcher_with_script(script), capability, true).0
+    }
+
+    /// [`Call::place`] through `dispatcher`, the caller's INVITE without an
+    /// offer unless `offers`. Also returns the INVITEs a script that forks sent
+    /// to callees other than [`CALLEE`].
+    pub(super) fn place_on(
+        TestDispatcher { state, udp }: TestDispatcher,
+        capability: &str,
+        offers: bool,
+    ) -> (Call, Vec<SipMessage>) {
         let state = Arc::new(state);
-        let raw = caller_invite(capability);
+        let raw = caller_invite(capability, offers);
         let invite = parse(&raw);
         let inbound = InboundMessage {
             client_transport: None,
@@ -155,22 +167,31 @@ impl Call {
             .call_actors
             .find_by_sip_call_id(SIP_CALL_ID)
             .expect("the call was placed");
-        let callee_invite = invite_to(drain(&udp), CALLEE);
-        Call {
+        let dialled = drain(&udp);
+        let callee: SocketAddr = CALLEE.parse().expect("a literal address");
+        let others = dialled
+            .iter()
+            .filter(|sent| sent.destination != callee)
+            .filter(|sent| sent.message.method() == Some(&Method::Invite))
+            .map(|sent| sent.message.clone())
+            .collect();
+        let callee_invite = invite_to(dialled, CALLEE);
+        let call = Call {
             state,
             udp,
             call_id,
             invite,
             callee_invite,
-        }
+        };
+        (call, others)
     }
 
-    fn wire(&self) -> Vec<Sent> {
+    pub(super) fn wire(&self) -> Vec<Sent> {
         drain(&self.udp)
     }
 
     /// What went to the caller since the last look, in order.
-    fn to_caller(&self) -> Vec<SipMessage> {
+    pub(super) fn to_caller(&self) -> Vec<SipMessage> {
         self.wire()
             .into_iter()
             .filter(|sent| sent.destination == caller())
@@ -180,14 +201,34 @@ impl Call {
 
     /// The callee answers its INVITE with `status_code`, `headers` added, and
     /// `body` as SDP.
-    fn callee_sends(
+    pub(super) fn callee_sends(
         &self,
         status_code: u16,
         reason: &str,
         headers: &[(&str, &str)],
         body: Option<&str>,
     ) {
-        let invite = &self.callee_invite;
+        self.callee_at_sends(
+            &self.callee_invite,
+            (CALLEE, "callee-tag"),
+            status_code,
+            reason,
+            headers,
+            body,
+        );
+    }
+
+    /// [`Call::callee_sends`] for the callee at `source` that siphon sent
+    /// `invite`, on the early dialog its To tag `to_tag` names.
+    pub(super) fn callee_at_sends(
+        &self,
+        invite: &SipMessage,
+        (source, to_tag): (&str, &str),
+        status_code: u16,
+        reason: &str,
+        headers: &[(&str, &str)],
+        body: Option<&str>,
+    ) {
         let header = |name: &str| {
             invite
                 .headers
@@ -200,10 +241,10 @@ impl Call {
             raw.push_str(&format!("Via: {via}\r\n"));
         }
         raw.push_str(&format!("From: {}\r\n", header("From")));
-        raw.push_str(&format!("To: {};tag=callee-tag\r\n", header("To")));
+        raw.push_str(&format!("To: {};tag={to_tag}\r\n", header("To")));
         raw.push_str(&format!("Call-ID: {}\r\n", header("Call-ID")));
         raw.push_str(&format!("CSeq: {}\r\n", header("CSeq")));
-        raw.push_str("Contact: <sip:callee@198.51.100.7:5060>\r\n");
+        raw.push_str(&format!("Contact: <sip:callee@{source}>\r\n"));
         for (name, value) in headers {
             raw.push_str(&format!("{name}: {value}\r\n"));
         }
@@ -221,7 +262,7 @@ impl Call {
                 &top_via_branch(invite),
                 &mut response,
                 status_code,
-                CALLEE.parse().expect("a literal address"),
+                source.parse().expect("a literal address"),
                 &self.state,
             )
         });
@@ -267,7 +308,7 @@ impl Call {
     }
 
     /// The caller PRACKs `provisional` as its request with CSeq `cseq`.
-    fn caller_pracks(&self, provisional: &SipMessage, cseq: u32) {
+    pub(super) fn caller_pracks(&self, provisional: &SipMessage, cseq: u32) {
         let to = provisional
             .headers
             .get("To")
@@ -371,14 +412,14 @@ fn drain(udp: &flume::Receiver<OutboundMessage>) -> Vec<Sent> {
     sent
 }
 
-fn statuses(messages: &[SipMessage]) -> Vec<u16> {
+pub(super) fn statuses(messages: &[SipMessage]) -> Vec<u16> {
     messages
         .iter()
         .map(|message| message.status_code().unwrap_or_default())
         .collect()
 }
 
-fn cseq_method(message: &SipMessage) -> String {
+pub(super) fn cseq_method(message: &SipMessage) -> String {
     message
         .headers
         .cseq()
@@ -386,7 +427,7 @@ fn cseq_method(message: &SipMessage) -> String {
         .unwrap_or_default()
 }
 
-fn only(messages: Vec<SipMessage>, status_code: u16) -> SipMessage {
+pub(super) fn only(messages: Vec<SipMessage>, status_code: u16) -> SipMessage {
     let listed = statuses(&messages);
     let mut matching: Vec<SipMessage> = messages
         .into_iter()

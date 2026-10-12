@@ -1075,6 +1075,11 @@ jobs:
   # response default is Copy — it does not strip Require/RSeq — so the strip is
   # proven to be framework-auto rather than a side effect of the default preset.
   #
+  # A second call on the same instance has the B-leg answer in that reliable
+  # 183 and send its 200 without SDP, which RFC 3261 §13.2.1 allows it once the
+  # answer went reliably. The A-leg's 183 was unreliable, so the 200 siphon
+  # sends it must carry the session description that 183 previewed.
+  #
   # Its own job because it needs its own siphon instance and its own
   # registration, and because it was previously driven only by
   # scripts/run-tests.sh: a regression in the 100rel interworking was not caught
@@ -1096,6 +1101,12 @@ jobs:
 
       - name: Reliable 183 auto-PRACKed, 100rel stripped toward the A-leg
         run: docker compose -f sipp/docker-compose.yaml --profile b2bua-reliable-prov up --abort-on-container-exit --exit-code-from sipp-b2bua-reliable-prov-uac sipp-b2bua-reliable-prov-uac sipp-b2bua-reliable-prov-uas
+
+      - name: Register carol against the trunk-edge instance
+        run: docker compose -f sipp/docker-compose.yaml --profile b2bua-reliable-prov run --rm sipp-b2bua-bodyless-answer-register
+
+      - name: A 200 without SDP after a reliable 183 reaches the non-100rel A-leg with the answer
+        run: COMPOSE_PROFILES=b2bua-reliable-prov bash sipp/run_call.sh sipp-b2bua-bodyless-answer-uac sipp-b2bua-bodyless-answer-uas
 
       - name: Collect siphon logs
         if: always()

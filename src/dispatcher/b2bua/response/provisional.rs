@@ -81,6 +81,9 @@ pub fn b_leg_provisional(
         // off the wire before a script or the sanitizing below touches it.
         let callee_sent_reliably = crate::sip::headers::rseq::requires_100rel(&message.headers)
             && crate::sip::headers::rseq::parse_rseq(&message.headers).is_some();
+        // The callee's early dialog this provisional is on, read before the To
+        // tag is rewritten to the caller's.
+        let callee_dialog = crate::b2bua::actor::extract_to_tag(message);
 
         // A provisional with a session description is early media: on a call
         // the control plane dialled its SDP is the media answer, and
@@ -170,9 +173,10 @@ pub fn b_leg_provisional(
         // since the snapshot was taken, and a leg ahead of this one may have
         // been taken off the call meanwhile.
         if let Some(sdp) = sdp_in_body(message_content_type(message), &message.body) {
-            state
-                .call_actors
-                .update_b_leg_on(call_id, branch, |leg| leg.early_answer_sent = Some(sdp));
+            state.call_actors.update_b_leg_on(call_id, branch, |leg| {
+                leg.early_answer_sent = Some(sdp);
+                leg.early_answer_dialog = callee_dialog;
+            });
         }
         // To the caller: reliably on siphon's own numbering when it asked for
         // that (RFC 3262 §3), after the PRACK of a reliable one before it.

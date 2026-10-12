@@ -392,6 +392,10 @@ pub struct Leg {
     /// force on the caller's dialog when this leg answers with a 2xx that carries
     /// none.
     pub early_answer_sent: Option<Vec<u8>>,
+    /// The callee's To tag on that response: the early dialog whose answer it
+    /// is, which a fork beyond the callee can make one of several on this leg
+    /// (RFC 3261 §12.1.2). `None` when the response carried no tag.
+    pub early_answer_dialog: Option<String>,
     /// On a B-leg before its final response: siphon has PRACKed the reliable
     /// provisional that carried the callee's session description on this leg's
     /// early dialog, which completes the INVITE's offer/answer exchange there
@@ -438,6 +442,7 @@ impl Leg {
             auth_challenged: false,
             offered_sdp: None,
             early_answer_sent: None,
+            early_answer_dialog: None,
             early_exchange_complete: false,
             request_session_expires: None,
             session_refresh_request: None,
@@ -494,6 +499,7 @@ impl Leg {
             auth_challenged: false,
             offered_sdp: None,
             early_answer_sent: None,
+            early_answer_dialog: None,
             early_exchange_complete: false,
             request_session_expires: None,
             session_refresh_request: None,

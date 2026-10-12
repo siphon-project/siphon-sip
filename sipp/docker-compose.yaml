@@ -1315,6 +1315,99 @@ services:
     profiles:
       - b2bua-reliable-prov
 
+  # --- B2BUA answer after a preview (RFC 3261 §13.2.1) ---
+  # The B-leg gives its answer in a reliable 183, which siphon PRACKs, and then
+  # sends its 200 without a body. The A-leg never advertised 100rel, so the 183
+  # it got was unreliable and only previewed the answer: the 200 siphon sends it
+  # must carry that same session description.
+  #
+  # Same siphon instance as the reliable-provisional test above.
+  #
+  #   172.20.0.157: registration helper
+  #   172.20.0.158: B-leg UAS (reliable 183, 200 without SDP), registered as carol
+  #   172.20.0.159: A-leg UAC (no 100rel)
+
+  sipp-b2bua-bodyless-answer-register:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-b2bua-trunk-edge:
+        condition: service_healthy
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.157
+    entrypoint:
+      - sipp
+      - "172.20.0.58:5060"
+      - -sf
+      - /sipp/scenarios/register_alice_contact.xml
+      - -inf
+      - /sipp/scenarios/b2bua_bodyless_answer_carol_contact.csv
+      - -s
+      - carol
+      - -ap
+      - secret
+      - -m
+      - "1"
+      - -timeout
+      - "10"
+    profiles:
+      - b2bua-reliable-prov
+
+  sipp-b2bua-bodyless-answer-uas:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-b2bua-trunk-edge:
+        condition: service_healthy
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.158
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/b2bua_bodyless_answer_uas.xml
+      - -p
+      - "5060"
+      - -m
+      - "1"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - b2bua-reliable-prov
+
+  sipp-b2bua-bodyless-answer-uac:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-b2bua-trunk-edge:
+        condition: service_healthy
+      sipp-b2bua-bodyless-answer-uas:
+        condition: service_started
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.159
+    entrypoint:
+      - sipp
+      - "172.20.0.58:5060"
+      - -sf
+      - /sipp/scenarios/b2bua_bodyless_answer_uac.xml
+      - -s
+      - carol
+      - -m
+      - "1"
+      - -l
+      - "1"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - b2bua-reliable-prov
+
   # --- B2BUA reliable provisionals toward the caller (RFC 3262 §3) ---
   # siphon is the caller's UAS: a provisional reaches the caller reliably on
   # siphon's own RSeq, one at a time, the caller's PRACK is answered by siphon,

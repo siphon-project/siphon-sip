@@ -646,6 +646,149 @@ pub fn start_li_recording(
     }
 }
 
+/// The caller's 2xx when the callee's carried no SDP, which a callee may send
+/// once its own early dialog had the answer reliably (RFC 3262 §5). The answer
+/// in force on the caller's dialog is then the one siphon relayed in this leg's
+/// early media, and whether the caller has it is the caller's dialog's own
+/// matter: RFC 3261 §13.2.1 wants it "in a reliable non-failure message", which
+/// is this 2xx unless a reliable provisional carried it to the caller.
+///
+/// A caller that was only shown the answer in an unreliable provisional gets
+/// "the same exact answer in the 2xx" (RFC 6337 §3.1.1): the session description
+/// as it went to the caller then, after the media engine and everything else
+/// siphon does to one on that path, under the `o=` it went with, which the
+/// caller's dialog adopts. It is this early dialog's own (§13.2.1 lets the
+/// answers of two early dialogs differ): the 2xx of one forked callee never
+/// carries what another's provisional showed, and neither does a 2xx on another
+/// early dialog of this leg than the one siphon last relayed, where a fork
+/// beyond the callee made several. Such a 2xx is relayed as the callee sent it.
+///
+/// An INVITE without an offer is left alone: the session description of a
+/// provisional was the callee's offer, which an unreliable provisional does not
+/// make, and siphon turned it down on the callee's dialog when it PRACKed.
+fn carry_previewed_answer(
+    call_id: &str,
+    response: &mut SipMessage,
+    state: &DispatcherState,
+    snapshot: &BLegResponseSnapshot,
+) {
+    let (previewed, on_this_dialog) = previewed_answer(call_id, state, snapshot);
+    let owed = caller_is_owed_the_answer(call_id, state);
+    match (previewed, owed) {
+        (Some(answer), true) if on_this_dialog => {
+            debug!(call_id = %call_id, "B2BUA: the callee's 2xx carries no SDP, the caller's carries the answer its unreliable provisional previewed (RFC 3261 §13.2.1)");
+            set_sdp_body(response, answer.clone(), "application/sdp");
+            let origin = sdp_origin_identity(&answer);
+            state
+                .call_actors
+                .adopt_leg_sent_sdp(call_id, true, answer, origin);
+        }
+        (Some(answer), false) => state.call_actors.set_leg_sent_sdp(call_id, true, answer),
+        (_, true) => warn!(
+            call_id = %call_id,
+            branch = %snapshot.branch,
+            "B2BUA: the callee's 2xx carries no SDP and siphon relayed none on its early dialog, so the caller's 2xx goes without an answer (RFC 3261 §13.2.1)"
+        ),
+        (None, false) => {}
+    }
+}
+
+/// The session description siphon last relayed the caller in this leg's early
+/// media, and whether it was on the early dialog this leg's 2xx came on.
+fn previewed_answer(
+    call_id: &str,
+    state: &DispatcherState,
+    snapshot: &BLegResponseSnapshot,
+) -> (Option<Vec<u8>>, bool) {
+    state
+        .call_actors
+        .read_b_leg_on(call_id, &snapshot.branch, |leg| {
+            let on_this_dialog = leg.early_answer_dialog.is_none()
+                || leg.early_answer_dialog == leg.dialog.remote_tag;
+            (leg.early_answer_sent.clone(), on_this_dialog)
+        })
+        .unwrap_or_default()
+}
+
+/// Whether the caller offered in its INVITE and its dialog has not had the
+/// answer in a reliable provisional (RFC 3261 §13.2.1). Read off the call as it
+/// is now: the caller's dialog may have had it since the snapshot was taken.
+fn caller_is_owed_the_answer(call_id: &str, state: &DispatcherState) -> bool {
+    state.call_actors.get_call(call_id).is_some_and(|call| {
+        call.a_leg.last_sdp.is_some() && call.a_leg.dialog.last_sent_sdp.is_none()
+    })
+}
+
+/// Whether two session descriptions are the same apart from their `o=` line.
+fn same_description_under_another_origin(one: &[u8], other: &[u8]) -> bool {
+    let lines = |sdp: &'_ [u8]| -> Vec<Vec<u8>> {
+        sdp.split(|&byte| byte == b'\n')
+            .filter(|line| !line.starts_with(b"o="))
+            .map(<[u8]>::to_vec)
+            .collect()
+    };
+    lines(one) == lines(other)
+}
+
+/// The `o=` session id and version the SDP of the caller's 2xx goes out under
+/// when an unreliable provisional of this early dialog previewed the answer.
+/// `None` for every other 2xx, which takes the caller's dialog's own.
+///
+/// The preview and the 2xx describe one session to the caller, and the `o=`
+/// session id is what identifies it, the version its revision (RFC 4566 §5.2,
+/// RFC 3264 §5). The preview went out under the callee's, which the caller's
+/// dialog only adopts for a reliable provisional (`record_caller_session`), so
+/// the 2xx used to be stamped with the dialog's own and showed the caller a
+/// second session. It takes the preview's now, and the dialog adopts it here.
+///
+/// A 2xx that repeats the preview, compared as the caller is sent it, keeps the
+/// preview's version, so that it is "the same exact answer" (RFC 6337 §3.1.1).
+/// One that differs is a revision: the version after the preview's, around the
+/// callee's own description, because media follows the callee's 2xx. RFC 3261
+/// §13.2.1 lets the caller ignore it, which is logged.
+fn origin_after_preview(
+    call_id: &str,
+    response: &SipMessage,
+    state: &DispatcherState,
+    snapshot: &BLegResponseSnapshot,
+) -> Option<(u64, u64)> {
+    let (Some(preview), true) = previewed_answer(call_id, state, snapshot) else {
+        return None;
+    };
+    if !caller_is_owed_the_answer(call_id, state) {
+        return None;
+    }
+    let (session_id, previewed_version) = sdp_origin_identity(&preview)?;
+    let content_type = message_content_type(response);
+    let mut as_sent = response.body.clone();
+    if !state.sdp_strip_attributes.is_empty() {
+        crate::media::body::strip_sdp_attributes(
+            content_type,
+            &mut as_sent,
+            &state.sdp_strip_attributes,
+        );
+    }
+    let repeats_the_preview = sdp_in_body(content_type, &as_sent)
+        .is_some_and(|answer| same_description_under_another_origin(&answer, &preview));
+    let version = if repeats_the_preview {
+        previewed_version
+    } else {
+        warn!(
+            call_id = %call_id,
+            branch = %snapshot.branch,
+            session_id,
+            "B2BUA: the callee's 2xx answer differs from the one an unreliable provisional previewed to the caller, which may ignore it (RFC 3261 §13.2.1); sent as the next version of that session"
+        );
+        previewed_version.saturating_add(1)
+    };
+    // The caller's dialog takes the session over: what siphon sends it next has
+    // the version after this one (RFC 3264 §8).
+    state
+        .call_actors
+        .adopt_leg_sent_sdp(call_id, true, preview, Some((session_id, version)));
+    Some((session_id, version))
+}
+
 /// Turn the B-leg 2xx into the A-leg's answer: rewrite the dialog headers
 /// back to the A-leg's identifiers, restore its Via and CSeq (RFC 3261
 /// §8.2.6.2), sanitize, and persist both dialog route sets.
@@ -715,9 +858,12 @@ pub fn prepare_a_leg_answer(
     // Own the o= identity toward the A-leg on the answer it receives (RFC
     // 3264 §8): the first SDP siphon emits toward the caller fixes the leg's
     // stable session-id; a later re-anchor (transfer, hold) then presents a
-    // strictly greater version under the same session-id.
+    // strictly greater version under the same session-id. An answer the caller
+    // was previewed stays the session the preview named.
     if !response.body.is_empty() {
-        if let Some((sess_id, version)) = state.call_actors.reserve_leg_sdp_version(call_id, true) {
+        let origin = origin_after_preview(call_id, response, state, snapshot)
+            .or_else(|| state.call_actors.reserve_leg_sdp_version(call_id, true));
+        if let Some((sess_id, version)) = origin {
             stamp_sdp_origin(&mut response.body, &state.sdp_name, sess_id, version, None);
             response
                 .headers
@@ -734,17 +880,7 @@ pub fn prepare_a_leg_answer(
     // had in this leg's early media.
     match sdp_in_body(message_content_type(response), &response.body) {
         Some(answer) => state.call_actors.set_leg_sent_sdp(call_id, true, answer),
-        None => {
-            if let Some(early) = state
-                .call_actors
-                .read_b_leg_on(call_id, &snapshot.branch, |leg| {
-                    leg.early_answer_sent.clone()
-                })
-                .flatten()
-            {
-                state.call_actors.set_leg_sent_sdp(call_id, true, early);
-            }
-        }
+        None => carry_previewed_answer(call_id, response, state, snapshot),
     }
 
     // Restore A-leg Record-Route from the stored INVITE (same pattern as Via).

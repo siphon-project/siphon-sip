@@ -616,6 +616,11 @@ if [[ "$RUN_B2BUA" == true ]]; then
   run_sipp docker compose -f "$COMPOSE_FILE" --profile b2bua-reliable-prov run --rm sipp-b2bua-trunk-edge-register
   run_sipp docker compose -f "$COMPOSE_FILE" --profile b2bua-reliable-prov up --abort-on-container-exit --exit-code-from sipp-b2bua-reliable-prov-uac sipp-b2bua-reliable-prov-uac sipp-b2bua-reliable-prov-uas
   docker compose -f "$COMPOSE_FILE" --profile b2bua-reliable-prov rm -sf sipp-b2bua-reliable-prov-uac sipp-b2bua-reliable-prov-uas 2>/dev/null || true
+  # A B-leg 200 without SDP after its reliable 183: the non-100rel A-leg's 200
+  # carries the answer its unreliable 183 previewed (RFC 3261 §13.2.1).
+  run_sipp docker compose -f "$COMPOSE_FILE" --profile b2bua-reliable-prov run --rm sipp-b2bua-bodyless-answer-register
+  run_sipp env COMPOSE_PROFILES=b2bua-reliable-prov bash sipp/run_call.sh sipp-b2bua-bodyless-answer-uac sipp-b2bua-bodyless-answer-uas
+  docker compose -f "$COMPOSE_FILE" --profile b2bua-reliable-prov rm -sf sipp-b2bua-bodyless-answer-uac sipp-b2bua-bodyless-answer-uas 2>/dev/null || true
   docker compose -f "$COMPOSE_FILE" --profile b2bua-reliable-prov stop siphon-b2bua-trunk-edge 2>/dev/null || true
 
   echo "=== B2BUA session timer test (Session-Expires negotiation) ==="
