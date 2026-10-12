@@ -220,7 +220,7 @@ impl RfChargingService {
     }
 
     /// Resolve the CDF peer to send the next ACR on.  Configured peer
-    /// name takes precedence; falls back to the first registered peer
+    /// name takes precedence; falls back to the peer the `rf` route names
     /// (matching the existing pattern used by Cx/Sh/Rx).
     fn pick_peer(&self) -> Option<Arc<DiameterPeer>> {
         if let Some(name) = self.config.peer.as_deref() {

@@ -290,6 +290,23 @@ entry, but a working config keeps working.
   `b2bua_bodyless_answer_*` in the `sipp-b2bua-reliable-prov` job, and read back
   with Wireshark's SIP and SDP dissectors by
   `scripts/validate_b2bua_previewed_answer.sh`.
+- **`diameter.rf_acr_*`, `diameter.ro_ccr_*` and `diameter.s6a_*` go to the
+  peer `diameter.routes` names for their application. Behaviour change for a
+  node with a routing table.** Called without `peer=`, these took whichever
+  connected peer the peer map yielded first and never read the table. The map
+  is hashed with a random seed, so a node with two peers and
+  `routes: [{application: ro, peers: ["ocs1"]}]` sent its Credit-Control
+  request to `ocs1` in some process runs and to the other peer in the rest,
+  which answered `DIAMETER_APPLICATION_UNSUPPORTED` (3002). They now resolve
+  the way the Cx, Sh, Rx and S6c calls do: the first connected peer of the
+  `rf`, `ro` or `s6a` route, by its `failover` or `round_robin` algorithm. As
+  for those calls a table is authoritative, so on a node that has routes but
+  none for the application the call logs a warning and resolves to `None`
+  instead of reaching an arbitrary peer: add the route, or keep passing
+  `peer=`. `peer=` works as before, and a node with no `routes` at all still
+  sends to its connected peer. The automatic ACRs and Credit-Control requests
+  of `rf:` and `ro:` already followed the table. `diameter.send_request` is
+  unchanged and still takes any connected peer without `peer=`.
 
 - **Flow descriptions on Rx and N5 name the uplink flow `in` and the downlink
   flow `out` (TS 29.214 §5.3.8). Behaviour change on the wire.**
