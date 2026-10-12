@@ -59,6 +59,7 @@ use pyo3::types::{PyBytes, PyDict};
 use tracing::warn;
 
 use super::diameter_kwargs::encode_kwarg_avp;
+use crate::config::DiameterApplication;
 use crate::diameter::codec::{
     encode_avp_u32, encode_avp_utf8, encode_diameter_message, encode_vendor_specific_app_id,
     FLAG_PROXIABLE, FLAG_REQUEST,
@@ -599,20 +600,19 @@ impl PyDiameter {
         self
     }
 
-    /// Pick a Diameter peer for an Rf ACR.
-    ///
-    /// Resolution order matches the existing Cx/Sh/Rx pattern but allows
-    /// callers to override:
-    ///
-    /// 1. Explicit `peer` argument from Python (e.g. ``peer="cdf1"``).
-    /// 2. Otherwise the first registered client (`any_client`) — operators
-    ///    typically connect a single CDF, and routing tables aren't yet
-    ///    consulted by other applications either.
-    pub(crate) fn pick_rf_peer(&self, peer: Option<&str>) -> Option<Arc<DiameterClient>> {
-        if let Some(name) = peer {
-            return self.manager.client(name);
+    /// Pick the peer for a call that takes `peer=`: the peer the script named
+    /// (e.g. ``peer="cdf1"``), otherwise the one `diameter.routes` names for
+    /// `application`. A table is authoritative, so an application it does not
+    /// cover gets no peer rather than whichever one is connected.
+    pub(crate) fn pick_peer(
+        &self,
+        application: &DiameterApplication,
+        peer: Option<&str>,
+    ) -> Option<Arc<DiameterClient>> {
+        match peer {
+            Some(name) => self.manager.client(name),
+            None => self.manager.route_client(application, None),
         }
-        self.manager.any_client()
     }
 }
 
@@ -1494,7 +1494,7 @@ impl PyDiameter {
     ///     num_vectors: Number of E-UTRAN vectors to request (default 1).
     ///     immediate_response_preferred: TS 29.272 §7.3.10 (default True).
     ///     resync_info: Optional RAND‖AUTS ``bytes`` for SQN resync.
-    ///     peer: Optional peer name (defaults to the first connected peer).
+    ///     peer: Optional peer name (defaults to the peer the ``s6a`` route names).
     ///
     /// Returns:
     ///     Dict ``{"result_code": int, "vectors": [{"rand","xres","autn","kasme"}]}``
@@ -1515,7 +1515,7 @@ impl PyDiameter {
         resync_info: Option<Vec<u8>>,
         peer: Option<&str>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let client = match self.pick_rf_peer(peer) {
+        let client = match self.pick_peer(&DiameterApplication::S6a, peer) {
             Some(client) => client,
             None => {
                 warn!("s6a_air: no Diameter peer connected");
@@ -1593,7 +1593,7 @@ impl PyDiameter {
         ulr_flags: u32,
         peer: Option<&str>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let client = match self.pick_rf_peer(peer) {
+        let client = match self.pick_peer(&DiameterApplication::S6a, peer) {
             Some(client) => client,
             None => {
                 warn!("s6a_ulr: no Diameter peer connected");
@@ -1643,7 +1643,7 @@ impl PyDiameter {
         pur_flags: Option<u32>,
         peer: Option<&str>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let client = match self.pick_rf_peer(peer) {
+        let client = match self.pick_peer(&DiameterApplication::S6a, peer) {
             Some(client) => client,
             None => {
                 warn!("s6a_purge_ue: no Diameter peer connected");
@@ -2755,7 +2755,7 @@ impl PyDiameter {
         service_context_id: Option<&str>,
         peer: Option<&str>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let client = match self.pick_rf_peer(peer) {
+        let client = match self.pick_peer(&DiameterApplication::Rf, peer) {
             Some(client) => client,
             None => {
                 warn!("rf_acr_start: no Diameter peer connected");
@@ -2912,7 +2912,7 @@ impl PyDiameter {
         service_context_id: Option<&str>,
         peer: Option<&str>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let client = match self.pick_rf_peer(peer) {
+        let client = match self.pick_peer(&DiameterApplication::Rf, peer) {
             Some(client) => client,
             None => {
                 warn!("rf_acr_interim: no Diameter peer connected");
@@ -3076,7 +3076,7 @@ impl PyDiameter {
         service_context_id: Option<&str>,
         peer: Option<&str>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let client = match self.pick_rf_peer(peer) {
+        let client = match self.pick_peer(&DiameterApplication::Rf, peer) {
             Some(client) => client,
             None => {
                 warn!("rf_acr_stop: no Diameter peer connected");
@@ -3233,7 +3233,7 @@ impl PyDiameter {
         service_context_id: Option<&str>,
         peer: Option<&str>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let client = match self.pick_rf_peer(peer) {
+        let client = match self.pick_peer(&DiameterApplication::Rf, peer) {
             Some(client) => client,
             None => {
                 warn!("rf_acr_event: no Diameter peer connected");
@@ -3379,9 +3379,9 @@ impl PyDiameter {
         let service_context_id = service_context_id
             .unwrap_or(SERVICE_CONTEXT_ID_IMS)
             .to_string();
-        let peer_handle = self.pick_rf_peer(peer).map(|c| c.peer().clone());
+        let client = self.pick_peer(&DiameterApplication::Ro, peer);
         pyo3_async_runtimes::tokio::future_into_py(python, async move {
-            let Some(peer_handle) = peer_handle else {
+            let Some(client) = client else {
                 warn!("ro_ccr_initial: no Diameter peer connected");
                 return Python::attach(|py| Ok(py.None()));
             };
@@ -3400,7 +3400,7 @@ impl PyDiameter {
                 requested_action: None,
                 multiple_services_indicator: true,
             };
-            match ro::send_ccr(&peer_handle, &params).await {
+            match ro::send_ccr(client.peer(), &params).await {
                 Ok(answer) => Python::attach(|py| {
                     Ok(credit_control_answer_to_dict(py, answer)?
                         .into_any()
@@ -3570,9 +3570,9 @@ impl PyDiameter {
             .unwrap_or(SERVICE_CONTEXT_ID_IMS)
             .to_string();
         let requested_action = requested_action.unwrap_or(REQUESTED_ACTION_DIRECT_DEBITING);
-        let peer_handle = self.pick_rf_peer(peer).map(|c| c.peer().clone());
+        let client = self.pick_peer(&DiameterApplication::Ro, peer);
         pyo3_async_runtimes::tokio::future_into_py(python, async move {
-            let Some(peer_handle) = peer_handle else {
+            let Some(client) = client else {
                 warn!("ro_ccr_event: no Diameter peer connected");
                 return Python::attach(|py| Ok(py.None()));
             };
@@ -3591,7 +3591,7 @@ impl PyDiameter {
                 requested_action: Some(requested_action),
                 multiple_services_indicator: false,
             };
-            match ro::send_ccr(&peer_handle, &params).await {
+            match ro::send_ccr(client.peer(), &params).await {
                 Ok(answer) => Python::attach(|py| {
                     Ok(credit_control_answer_to_dict(py, answer)?
                         .into_any()
@@ -3634,9 +3634,9 @@ impl PyDiameter {
             .to_string();
         let used = time_service_unit(used_seconds);
         let requested = time_service_unit(requested_seconds);
-        let peer_handle = self.pick_rf_peer(peer).map(|c| c.peer().clone());
+        let client = self.pick_peer(&DiameterApplication::Ro, peer);
         pyo3_async_runtimes::tokio::future_into_py(python, async move {
-            let Some(peer_handle) = peer_handle else {
+            let Some(client) = client else {
                 warn!("ro_ccr: no Diameter peer connected");
                 return Python::attach(|py| Ok(py.None()));
             };
@@ -3655,7 +3655,7 @@ impl PyDiameter {
                 requested_action: None,
                 multiple_services_indicator: false,
             };
-            match ro::send_ccr(&peer_handle, &params).await {
+            match ro::send_ccr(client.peer(), &params).await {
                 Ok(answer) => Python::attach(|py| {
                     Ok(credit_control_answer_to_dict(py, answer)?
                         .into_any()
@@ -5083,5 +5083,106 @@ mod tests {
             let plus = py_diameter.encode_isdn_address(python, "+31612345678", None);
             assert_eq!(plus.as_bytes(), &[0x91, 0x13, 0x16, 0x32, 0x54, 0x76, 0xF8]);
         });
+    }
+
+    /// Register a connected peer called `name` and hand its client back.
+    fn register_routed_peer(manager: &DiameterManager, name: &str) -> Arc<DiameterClient> {
+        let (write_tx, write_rx) = tokio::sync::mpsc::channel(1);
+        // Keep the receiver alive for the peer's lifetime; nothing reads it.
+        std::mem::forget(write_rx);
+        let peer = Arc::new(crate::diameter::peer::DiameterPeer::new_for_test(
+            rx_test_peer_config(None),
+            write_tx,
+        ));
+        let client = Arc::new(DiameterClient::new(peer));
+        manager.register(name.to_string(), Arc::clone(&client));
+        client
+    }
+
+    fn route_to(
+        application: crate::config::DiameterApplication,
+        peer: &str,
+    ) -> crate::config::DiameterRouteEntry {
+        crate::config::DiameterRouteEntry {
+            application,
+            realm: None,
+            peers: vec![peer.to_string()],
+            algorithm: "failover".to_string(),
+        }
+    }
+
+    /// A manager with `routes` and the peers `names`, registered in that order.
+    fn routed_diameter(
+        routes: &[crate::config::DiameterRouteEntry],
+        names: &[&str],
+    ) -> (PyDiameter, Vec<Arc<DiameterClient>>) {
+        let manager = Arc::new(DiameterManager::with_routes(routes));
+        let clients = names
+            .iter()
+            .map(|name| register_routed_peer(&manager, name))
+            .collect();
+        (PyDiameter::new(manager), clients)
+    }
+
+    /// A call that takes `peer=` and is given none goes to the peer the table
+    /// routes its application at. It used to take whichever peer the map
+    /// yielded first, so with an OCS and a CDF connected a Credit-Control
+    /// request reached the CDF in some process runs and not in others.
+    #[test]
+    fn pick_peer_without_a_name_follows_the_route_of_the_application() {
+        use crate::config::DiameterApplication::{Rf, Ro, S6a};
+        let routes = [
+            route_to(Ro, "ocs"),
+            route_to(Rf, "cdf"),
+            route_to(S6a, "hss"),
+        ];
+        let order = ["ocs", "cdf", "hss"];
+        let reversed = ["hss", "cdf", "ocs"];
+        // The map hashes with a random seed, so its order differs from one
+        // manager to the next as well: build several per registration order.
+        for names in [order, reversed].into_iter().cycle().take(32) {
+            let (diameter, clients) = routed_diameter(&routes, &names);
+            for (application, routed) in [(Ro, "ocs"), (Rf, "cdf"), (S6a, "hss")] {
+                let index = names.iter().position(|name| *name == routed).unwrap();
+                let picked = diameter
+                    .pick_peer(&application, None)
+                    .unwrap_or_else(|| panic!("{application:?} resolves"));
+                assert!(
+                    Arc::ptr_eq(&picked, &clients[index]),
+                    "{application:?} must reach {routed} with peers registered as {names:?}"
+                );
+            }
+        }
+    }
+
+    /// The table is authoritative: an application it does not cover gets no
+    /// peer, rather than the one another application is routed at.
+    #[test]
+    fn pick_peer_without_a_name_gives_none_for_an_application_with_no_route() {
+        use crate::config::DiameterApplication::{Rf, Ro};
+        let (diameter, _clients) = routed_diameter(&[route_to(Rf, "cdf")], &["cdf", "ocs"]);
+        assert!(diameter.pick_peer(&Ro, None).is_none());
+        assert!(diameter.pick_peer(&Rf, None).is_some());
+    }
+
+    /// With no table at all, a node with one peer keeps sending to it.
+    #[test]
+    fn pick_peer_without_a_name_takes_the_connected_peer_when_no_routes_exist() {
+        use crate::config::DiameterApplication::{Rf, Ro, S6a};
+        let (diameter, clients) = routed_diameter(&[], &["ocs"]);
+        for application in [Ro, Rf, S6a] {
+            let picked = diameter.pick_peer(&application, None).unwrap();
+            assert!(Arc::ptr_eq(&picked, &clients[0]), "{application:?}");
+        }
+    }
+
+    /// A name the script passes wins over the table, as it always has.
+    #[test]
+    fn pick_peer_with_a_name_takes_that_peer_whatever_the_table_says() {
+        use crate::config::DiameterApplication::Ro;
+        let (diameter, clients) = routed_diameter(&[route_to(Ro, "ocs")], &["ocs", "standby"]);
+        let picked = diameter.pick_peer(&Ro, Some("standby")).unwrap();
+        assert!(Arc::ptr_eq(&picked, &clients[1]));
+        assert!(diameter.pick_peer(&Ro, Some("absent")).is_none());
     }
 }

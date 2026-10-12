@@ -65,7 +65,7 @@ pub struct RfConfig {
     #[serde(default)]
     pub access_network_information: bool,
     /// Explicit Diameter peer name to send ACRs to.  When unset, the
-    /// first peer registered with the manager is used (`any_client`).
+    /// peer the `rf` entry of `diameter.routes` names is used.
     pub peer: Option<String>,
 }
 
@@ -190,7 +190,7 @@ pub struct RoConfig {
     /// `on_ocs_failure: terminate` refuses the call.
     #[serde(default)]
     pub access_network_information: bool,
-    /// Explicit OCS peer name. When unset, the first registered peer is used.
+    /// Explicit OCS peer name. When unset, the `ro` route's peer is used.
     pub peer: Option<String>,
 }
 
