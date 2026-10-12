@@ -1408,6 +1408,98 @@ services:
     profiles:
       - b2bua-reliable-prov
 
+  # --- B2BUA ringback toward the calling network (RFC 3960 §3.2) ---
+  # The same B-leg as above: its answer in a reliable 183 that carries no
+  # P-Early-Media, then a 200 without a body. For a call to dave the script
+  # relays that 183 with reply.relay(body=False), so the A-leg is shown no
+  # session description before the answer, gets the 180 as it is, and gets the
+  # answer in the 200.
+  #
+  #   172.20.0.237: registration helper
+  #   172.20.0.238: B-leg UAS (reliable 183, 200 without SDP), registered as dave
+  #   172.20.0.239: A-leg UAC (no 100rel)
+
+  sipp-b2bua-ringback-register:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-b2bua-trunk-edge:
+        condition: service_healthy
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.237
+    entrypoint:
+      - sipp
+      - "172.20.0.58:5060"
+      - -sf
+      - /sipp/scenarios/register_alice_contact.xml
+      - -inf
+      - /sipp/scenarios/b2bua_ringback_dave_contact.csv
+      - -s
+      - dave
+      - -ap
+      - secret
+      - -m
+      - "1"
+      - -timeout
+      - "10"
+    profiles:
+      - b2bua-reliable-prov
+
+  sipp-b2bua-ringback-uas:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-b2bua-trunk-edge:
+        condition: service_healthy
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.238
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/b2bua_bodyless_answer_uas.xml
+      - -p
+      - "5060"
+      - -m
+      - "1"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - b2bua-reliable-prov
+
+  sipp-b2bua-ringback-uac:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-b2bua-trunk-edge:
+        condition: service_healthy
+      sipp-b2bua-ringback-uas:
+        condition: service_started
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.239
+    entrypoint:
+      - sipp
+      - "172.20.0.58:5060"
+      - -sf
+      - /sipp/scenarios/b2bua_ringback_uac.xml
+      - -s
+      - dave
+      - -m
+      - "1"
+      - -l
+      - "1"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - b2bua-reliable-prov
+
   # --- B2BUA reliable provisionals toward the caller (RFC 3262 §3) ---
   # siphon is the caller's UAS: a provisional reaches the caller reliably on
   # siphon's own RSeq, one at a time, the caller's PRACK is answered by siphon,

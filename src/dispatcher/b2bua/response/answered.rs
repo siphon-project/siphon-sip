@@ -657,7 +657,11 @@ pub fn start_li_recording(
 /// "the same exact answer in the 2xx" (RFC 6337 §3.1.1): the session description
 /// as it went to the caller then, after the media engine and everything else
 /// siphon does to one on that path, under the `o=` it went with, which the
-/// caller's dialog adopts. It is this early dialog's own (§13.2.1 lets the
+/// caller's dialog adopts. A caller a script kept it from
+/// (`reply.relay(body=False)`, `reply.withhold()`) gets it as it would have gone
+/// then, but as the first description it is sent: under its dialog's own `o=`
+/// at its first version, like any answer no provisional showed. Either is this
+/// early dialog's own (§13.2.1 lets the
 /// answers of two early dialogs differ): the 2xx of one forked callee never
 /// carries what another's provisional showed, and neither does a 2xx on another
 /// early dialog of this leg than the one siphon last relayed, where a fork
@@ -666,16 +670,28 @@ pub fn start_li_recording(
 /// An INVITE without an offer is left alone: the session description of a
 /// provisional was the callee's offer, which an unreliable provisional does not
 /// make, and siphon turned it down on the callee's dialog when it PRACKed.
-fn carry_previewed_answer(
+fn carry_answer_owed_to_caller(
     call_id: &str,
     response: &mut SipMessage,
     state: &DispatcherState,
     snapshot: &BLegResponseSnapshot,
 ) {
-    let (previewed, on_this_dialog) = previewed_answer(call_id, state, snapshot);
-    let owed = caller_is_owed_the_answer(call_id, state);
-    match (previewed, owed) {
-        (Some(answer), true) if on_this_dialog => {
+    let (shown, on_this_dialog) = previewed_answer(call_id, state, snapshot);
+    if !caller_is_owed_the_answer(call_id, state) {
+        // What the caller was sent stays the session in force on its dialog.
+        if let Some(answer) = shown {
+            state.call_actors.set_leg_sent_sdp(call_id, true, answer);
+        }
+        return;
+    }
+    let withheld = state
+        .call_actors
+        .read_b_leg_on(call_id, &snapshot.branch, |leg| {
+            leg.early_answer_withheld.clone()
+        })
+        .flatten();
+    match (shown, withheld) {
+        (Some(answer), _) if on_this_dialog => {
             debug!(call_id = %call_id, "B2BUA: the callee's 2xx carries no SDP, the caller's carries the answer its unreliable provisional previewed (RFC 3261 §13.2.1)");
             set_sdp_body(response, answer.clone(), "application/sdp");
             let origin = sdp_origin_identity(&answer);
@@ -683,13 +699,21 @@ fn carry_previewed_answer(
                 .call_actors
                 .adopt_leg_sent_sdp(call_id, true, answer, origin);
         }
-        (Some(answer), false) => state.call_actors.set_leg_sent_sdp(call_id, true, answer),
-        (_, true) => warn!(
+        (None, Some(mut answer)) if on_this_dialog => {
+            debug!(call_id = %call_id, "B2BUA: the callee's 2xx carries no SDP, the caller's carries the answer a script kept out of the provisional (RFC 3261 §13.2.1)");
+            if let Some((session_id, version)) =
+                state.call_actors.reserve_leg_sdp_version(call_id, true)
+            {
+                stamp_sdp_origin(&mut answer, &state.sdp_name, session_id, version, None);
+            }
+            set_sdp_body(response, answer.clone(), "application/sdp");
+            state.call_actors.set_leg_sent_sdp(call_id, true, answer);
+        }
+        _ => warn!(
             call_id = %call_id,
             branch = %snapshot.branch,
             "B2BUA: the callee's 2xx carries no SDP and siphon relayed none on its early dialog, so the caller's 2xx goes without an answer (RFC 3261 §13.2.1)"
         ),
-        (None, false) => {}
     }
 }
 
@@ -880,7 +904,7 @@ pub fn prepare_a_leg_answer(
     // had in this leg's early media.
     match sdp_in_body(message_content_type(response), &response.body) {
         Some(answer) => state.call_actors.set_leg_sent_sdp(call_id, true, answer),
-        None => carry_previewed_answer(call_id, response, state, snapshot),
+        None => carry_answer_owed_to_caller(call_id, response, state, snapshot),
     }
 
     // Restore A-leg Record-Route from the stored INVITE (same pattern as Via).

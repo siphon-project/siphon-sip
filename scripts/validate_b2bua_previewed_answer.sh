@@ -16,6 +16,10 @@
 # same o= session id (RFC 4566 §5.2), at the same version unless the
 # description changed, and then at the next one (RFC 3264 §8).
 #
+# A second capture is the same call with a script that relays the 183 without
+# its body (`reply.relay(body=False)`): tshark must read a 183 with no body at
+# all and the answer in the 200.
+#
 #   scripts/validate_b2bua_previewed_answer.sh
 #
 # Needs tshark and text2pcap (wireshark-common). CI runners have neither, so
@@ -137,3 +141,46 @@ if [[ "$status" -ne 0 ]]; then
   exit 1
 fi
 echo "tshark reads the same answer in the 183 and in the 200"
+
+HEX="$WORK/withheld_answer.hex"
+PCAP="$WORK/withheld_answer.pcap"
+rm -f "$HEX" "$PCAP"
+
+echo "relaying the same 183 without its body, as a script asked"
+SIPHON_B2BUA_WITHHELD_ANSWER_HEX_OUT="$HEX" \
+  PYO3_PYTHON="${PYO3_PYTHON:-python3}" \
+  cargo test --lib dispatcher::provisional_presentation_tests::emit_provisional_without_body_for_external_dissection -- --exact >/dev/null
+
+if [[ ! -s "$HEX" ]]; then
+  echo "siphon sent the caller nothing" >&2
+  exit 1
+fi
+text2pcap -q -u "5060,5060" "$HEX" "$PCAP"
+
+echo "reading them back with tshark"
+expect 1 sip.Status-Code 183
+expect 1 sip.Content-Length 0
+expect 1 sip.Content-Type ""
+expect 1 sdp.media ""
+expect 2 sip.Status-Code 200
+expect 2 sip.CSeq.method INVITE
+expect 2 sip.Content-Type application/sdp
+# The first description this caller is sent: the caller's dialog's own session
+# at its first version, as for any answer no provisional showed.
+expect 2 sdp.owner.username siphon
+expect 2 sdp.owner.version 0
+expect 2 sdp.media "audio 50000 RTP/AVP 0"
+
+malformed="$(tshark -r "$PCAP" -Y "_ws.malformed" -T fields -e frame.number 2>/dev/null)"
+if [[ -n "$malformed" ]]; then
+  echo "  FAIL tshark calls frame(s) $malformed malformed" >&2
+  status=1
+else
+  echo "  ok   no malformed frame"
+fi
+
+if [[ "$status" -ne 0 ]]; then
+  echo "tshark does not read the 183 without a body and the answer in the 2xx" >&2
+  exit 1
+fi
+echo "tshark reads no body in the 183 and the answer in the 200"

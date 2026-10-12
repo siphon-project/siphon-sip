@@ -2,11 +2,17 @@
 //! it carries SDP.
 
 use crate::dispatcher::*;
+use crate::script::api::reply::ProvisionalRelay;
 
 /// A 1xx on the B-leg: mark the call ringing and relay the provisional to
 /// the A-leg, anchoring early media when the response carries SDP. On an LCR
 /// attempt it is also the carrier's progress, which keeps the carrier past its
 /// ring timeout. A 1xx on a leg that has already ended is dropped.
+///
+/// A script may have the caller sent the provisional without its body, or
+/// nothing at all ([`ProvisionalRelay`]). That changes the caller's side only:
+/// the callee is PRACKed, its SDP anchored and recorded as on any other
+/// provisional, and the caller is owed the answer in its 2xx.
 pub fn b_leg_provisional(
     call_id: &str,
     branch: &str,
@@ -104,8 +110,9 @@ pub fn b_leg_provisional(
             }
         }
         // Headers the script hooks set or removed on the response, which reach
-        // the caller as the script left them.
-        let reply_shaped_headers = run_provisional_hooks(
+        // the caller as the script left them, and what they decided the caller
+        // is sent of it.
+        let (reply_shaped_headers, relay) = run_provisional_hooks(
             call_id,
             message,
             response_source,
@@ -167,16 +174,32 @@ pub fn b_leg_provisional(
         strip_relayed_sdp_attributes(message, state);
         // The early media answer as the caller receives it, which is the session
         // description in force on the caller's dialog when this leg's 2xx carries
-        // none.
+        // none. One a script keeps from the caller is recorded as the caller
+        // would have received it, for the 2xx that then has to carry it (RFC 3261
+        // §13.2.1).
         // Recorded on the leg this response's Via branch names, found under
         // the lock that records it: the handler and the media engine have run
         // since the snapshot was taken, and a leg ahead of this one may have
         // been taken off the call meanwhile.
         if let Some(sdp) = sdp_in_body(message_content_type(message), &message.body) {
+            let shown = relay == ProvisionalRelay::Whole;
             state.call_actors.update_b_leg_on(call_id, branch, |leg| {
-                leg.early_answer_sent = Some(sdp);
-                leg.early_answer_dialog = callee_dialog;
+                leg.record_early_answer(sdp, callee_dialog, shown)
             });
+        }
+        match relay {
+            ProvisionalRelay::Whole => {}
+            ProvisionalRelay::WithoutBody => remove_body(message),
+            ProvisionalRelay::Withheld => {
+                debug!(call_id = %call_id, status = status_code,
+                    "B2BUA: the script withheld this provisional from the caller");
+                // Not relayed, so the caller never PRACKs it: the callee still
+                // gets siphon's PRACK (RFC 3262 §4).
+                if let Some(link) = prack_link {
+                    release_unanswered_callee_prack(call_id, link, state);
+                }
+                return;
+            }
         }
         // To the caller: reliably on siphon's own numbering when it asked for
         // that (RFC 3262 §3), after the PRACK of a reliable one before it.
@@ -194,7 +217,9 @@ pub fn b_leg_provisional(
 /// one `reply` they share: `@b2bua.on_provisional` for every one, then
 /// `@b2bua.on_early_media` when it carries a session description. Leaves
 /// `message` as the hooks shaped it (headers, and the SDP a media engine
-/// rewrote) and returns the names of the headers they set or removed.
+/// rewrote) and returns the names of the headers they set or removed, with
+/// what they decided the caller is sent of the response: all of it unless one
+/// said otherwise.
 ///
 /// With neither hook registered for this response, nothing is built and the
 /// response is not copied.
@@ -205,7 +230,8 @@ fn run_provisional_hooks(
     has_sdp_body: bool,
     state: &DispatcherState,
     snapshot: &BLegResponseSnapshot,
-) -> Vec<String> {
+) -> (Vec<String>, ProvisionalRelay) {
+    let undecided = (Vec::new(), ProvisionalRelay::Whole);
     let engine_state = state.engine.state();
     let mut hooks = vec![(
         "on_provisional",
@@ -219,11 +245,11 @@ fn run_provisional_hooks(
     }
     hooks.retain(|(_, handlers)| !handlers.is_empty());
     let Some((last_hook, _)) = hooks.last() else {
-        return Vec::new();
+        return undecided;
     };
     let Some(invite_arc) = &snapshot.a_leg_invite else {
         warn!(call_id = %call_id, "B2BUA: no stored A-leg INVITE for {last_hook}");
-        return Vec::new();
+        return undecided;
     };
 
     let response_arc = Arc::new(std::sync::Mutex::new(message.clone()));
@@ -236,21 +262,22 @@ fn run_provisional_hooks(
     .with_flow(py_flow_from_leg(&snapshot.a_leg.transport));
     let py_reply = PyReply::new(Arc::clone(&response_arc))
         .with_a_leg(Arc::clone(invite_arc))
-        .with_response_source(response_source.ip().to_string(), response_source.port());
+        .with_response_source(response_source.ip().to_string(), response_source.port())
+        .shaping_provisional();
 
-    let shaped_headers = Python::attach(|python| -> Vec<String> {
+    let shaped = Python::attach(|python| -> (Vec<String>, ProvisionalRelay) {
         let call_obj = match Py::new(python, py_call) {
             Ok(obj) => obj,
             Err(error) => {
                 error!("failed to create PyCall for {last_hook}: {error}");
-                return Vec::new();
+                return undecided.clone();
             }
         };
         let reply_obj = match Py::new(python, py_reply) {
             Ok(obj) => obj,
             Err(error) => {
                 error!("failed to create PyReply for {last_hook}: {error}");
-                return Vec::new();
+                return undecided.clone();
             }
         };
 
@@ -272,12 +299,15 @@ fn run_provisional_hooks(
             }
         }
         let reply = reply_obj.borrow(python);
-        reply.script_shaped_headers().to_vec()
+        (
+            reply.script_shaped_headers().to_vec(),
+            reply.provisional_relay(),
+        )
     });
 
     // Replace message with potentially modified version (e.g. RTPEngine-rewritten SDP)
     if let Ok(modified) = response_arc.lock() {
         *message = modified.clone();
     };
-    shaped_headers
+    shaped
 }

@@ -621,6 +621,11 @@ if [[ "$RUN_B2BUA" == true ]]; then
   run_sipp docker compose -f "$COMPOSE_FILE" --profile b2bua-reliable-prov run --rm sipp-b2bua-bodyless-answer-register
   run_sipp env COMPOSE_PROFILES=b2bua-reliable-prov bash sipp/run_call.sh sipp-b2bua-bodyless-answer-uac sipp-b2bua-bodyless-answer-uas
   docker compose -f "$COMPOSE_FILE" --profile b2bua-reliable-prov rm -sf sipp-b2bua-bodyless-answer-uac sipp-b2bua-bodyless-answer-uas 2>/dev/null || true
+  # The script relays the 183 without its body for a call to dave: no SDP
+  # before the answer, the 180 as it is, the answer in the 200 (RFC 3960 §3.2).
+  run_sipp docker compose -f "$COMPOSE_FILE" --profile b2bua-reliable-prov run --rm sipp-b2bua-ringback-register
+  run_sipp env COMPOSE_PROFILES=b2bua-reliable-prov bash sipp/run_call.sh sipp-b2bua-ringback-uac sipp-b2bua-ringback-uas
+  docker compose -f "$COMPOSE_FILE" --profile b2bua-reliable-prov rm -sf sipp-b2bua-ringback-uac sipp-b2bua-ringback-uas 2>/dev/null || true
   docker compose -f "$COMPOSE_FILE" --profile b2bua-reliable-prov stop siphon-b2bua-trunk-edge 2>/dev/null || true
 
   echo "=== B2BUA session timer test (Session-Expires negotiation) ==="

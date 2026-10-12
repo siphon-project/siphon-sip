@@ -2,8 +2,8 @@
 Mock SIP Reply object — mirrors ``PyReply`` from the Rust engine.
 
 Passed to ``@proxy.on_reply``, ``@proxy.on_failure``,
-``@proxy.on_register_reply``, ``@b2bua.on_early_media``,
-and ``@b2bua.on_answer`` handlers.
+``@proxy.on_register_reply``, ``@b2bua.on_provisional``,
+``@b2bua.on_early_media`` and ``@b2bua.on_answer`` handlers.
 """
 
 from __future__ import annotations
@@ -60,6 +60,10 @@ class Reply:
         self._source_ip = source_ip
         self._source_port = source_port
         self._actions: list[Action] = []
+        # Set by ``SipTestHarness.send_provisional``: this is a callee's
+        # provisional the B2BUA relays, so a handler may decide what the
+        # caller is sent of it.
+        self._shaping_provisional = False
 
     @property
     def status_code(self) -> int:
@@ -281,20 +285,106 @@ class Reply:
 
     # -- Forwarding ------------------------------------------------------------
 
-    def relay(self) -> None:
+    def relay(self, body: bool = True) -> None:
         """Forward the reply upstream to the UAC.
+
+        In ``@b2bua.on_provisional`` and ``@b2bua.on_early_media`` the callee's
+        provisional is relayed to the caller whether or not this is called, and
+        ``body=False`` relays it without its body: the status line and the
+        headers reach the caller, the session description does not.
+
+        That is how a B2BUA keeps a calling network generating ringback. A
+        callee may answer the offer in a reliable ``183`` "without any
+        intention of sending early media (this is the case when preconditions
+        are used)" (RFC 3960 §3.2), and a caller that takes any session
+        description in a provisional for early media then plays nothing.
+        Inside an IMS the ``P-Early-Media`` header says which it is (RFC
+        5009); toward a network that is not shown that header, relay the
+        session description only when it authorises media toward the caller.
+
+        Nothing changes on the callee's dialog. The provisional is PRACKed
+        when it was reliable, ``@b2bua.on_early_media`` still runs with the
+        body in place so the media engine can anchor the callee's side, and
+        :attr:`body` / :meth:`has_body` keep reading it for the rest of the
+        handler. The caller has then not had the answer, so the 2xx carries
+        it, also when the callee's own 2xx has no body (RFC 3261 §13.2.1).
+        Toward a caller that uses ``100rel`` the provisional is still sent
+        reliably when the callee's was (RFC 3262 §3).
+
+        The last call decides: ``reply.relay()`` after
+        ``reply.relay(body=False)`` or :meth:`withhold` relays the response
+        whole again.
+
+        In a test, :attr:`provisional_relay` reads the decision back after
+        ``SipTestHarness.send_provisional()``.
+
+        Args:
+            body: ``False`` to relay a callee's provisional without its body.
+
+        Raises:
+            RuntimeError: ``body=False`` on any reply but a provisional in
+                ``@b2bua.on_provisional`` / ``@b2bua.on_early_media``.
 
         Example::
 
             @proxy.on_reply
             def handle_reply(request, reply):
                 reply.relay()
+
+            @b2bua.on_provisional
+            def on_provisional(call, reply):
+                early_media = reply.get_header("P-Early-Media") or ""
+                authorised = "sendrecv" in early_media or "sendonly" in early_media
+                if reply.has_body("application/sdp") and not authorised:
+                    reply.relay(body=False)
         """
+        if not body:
+            self._require_shaping_provisional("reply.relay(body=False)")
+            self._actions.append(Action(kind="relay", extras={"body": False}))
+            return
         self._actions.append(Action(kind="relay"))
 
     def forward(self) -> None:
         """Alias for :meth:`relay`."""
         self.relay()
+
+    def withhold(self) -> None:
+        """Relay nothing to the caller for this provisional of the callee.
+
+        For ``@b2bua.on_provisional`` and ``@b2bua.on_early_media``. The
+        caller is sent no response for this one; what the callee sends next is
+        relayed as usual. Nothing changes on the callee's dialog: a reliable
+        provisional is PRACKed at once, since no PRACK of the caller's will
+        release it, and ``@b2bua.on_early_media`` still runs when it carries a
+        session description. That session description is the answer the
+        caller has not had, so the 2xx carries it (RFC 3261 §13.2.1). On the
+        caller's dialog a withheld provisional takes no ``RSeq`` (RFC 3262
+        §3).
+
+        ``reply.relay()`` afterwards relays the response after all, and
+        ``reply.relay(body=False)`` relays it without its body.
+
+        Raises:
+            RuntimeError: on any reply but a provisional in
+                ``@b2bua.on_provisional`` / ``@b2bua.on_early_media``.
+
+        Example::
+
+            @b2bua.on_provisional
+            def on_provisional(call, reply):
+                if reply.status_code == 181:
+                    reply.withhold()
+        """
+        self._require_shaping_provisional("reply.withhold()")
+        self._actions.append(Action(kind="withhold"))
+
+    def _require_shaping_provisional(self, call: str) -> None:
+        if not self._shaping_provisional:
+            raise RuntimeError(
+                f"{call} decides what the caller is sent of a callee's "
+                "provisional response: it is only available in "
+                "@b2bua.on_provisional and @b2bua.on_early_media"
+            )
 
     def reject(self, code: int, reason: Optional[str] = None) -> bool:
         """Reject an in-progress proxied INVITE from ``@proxy.on_reply``.
@@ -368,6 +458,22 @@ class Reply:
     def last_action(self) -> Optional[Action]:
         """Most recent action, or ``None``."""
         return self._actions[-1] if self._actions else None
+
+    @property
+    def provisional_relay(self) -> str:
+        """What the caller is sent of this provisional (test-only).
+
+        ``"whole"`` unless a handler decided otherwise, ``"without_body"``
+        after ``reply.relay(body=False)``, ``"withheld"`` after
+        :meth:`withhold`. The last of those calls decides, as on a node.
+        """
+        for action in reversed(self._actions):
+            if action.kind == "withhold":
+                return "withheld"
+            if action.kind == "relay":
+                body = (action.extras or {}).get("body", True)
+                return "whole" if body else "without_body"
+        return "whole"
 
 
 _REJECT_REASONS = {

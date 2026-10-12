@@ -1080,6 +1080,11 @@ jobs:
   # answer went reliably. The A-leg's 183 was unreliable, so the 200 siphon
   # sends it must carry the session description that 183 previewed.
   #
+  # A third call has the script relay that 183 without its body
+  # (`reply.relay(body=False)`), as an edge does for a provisional that carries
+  # SDP and no P-Early-Media authorising it (RFC 3960 §3.2, RFC 5009): the A-leg
+  # sees a 183 and a 180 without SDP and gets the answer in the 200.
+  #
   # Its own job because it needs its own siphon instance and its own
   # registration, and because it was previously driven only by
   # scripts/run-tests.sh: a regression in the 100rel interworking was not caught
@@ -1107,6 +1112,12 @@ jobs:
 
       - name: A 200 without SDP after a reliable 183 reaches the non-100rel A-leg with the answer
         run: COMPOSE_PROFILES=b2bua-reliable-prov bash sipp/run_call.sh sipp-b2bua-bodyless-answer-uac sipp-b2bua-bodyless-answer-uas
+
+      - name: Register dave against the trunk-edge instance
+        run: docker compose -f sipp/docker-compose.yaml --profile b2bua-reliable-prov run --rm sipp-b2bua-ringback-register
+
+      - name: A 183 the script relays without its body, the 180 as it is, the answer in the 200
+        run: COMPOSE_PROFILES=b2bua-reliable-prov bash sipp/run_call.sh sipp-b2bua-ringback-uac sipp-b2bua-ringback-uas
 
       - name: Collect siphon logs
         if: always()

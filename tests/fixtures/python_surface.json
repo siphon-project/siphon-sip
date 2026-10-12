@@ -1716,7 +1716,7 @@
       "relay": {
         "doc": "Mark this reply for forwarding upstream.",
         "kind": "method_descriptor",
-        "sig": "($self)"
+        "sig": "($self, body=True)"
       },
       "remove_header": {
         "doc": "Remove a header entirely.",
@@ -1753,6 +1753,11 @@
       "to_uri": {
         "doc": "To URI parsed from the To header.",
         "kind": "getset_descriptor"
+      },
+      "withhold": {
+        "doc": "Relay nothing to the caller for this provisional of the callee.",
+        "kind": "method_descriptor",
+        "sig": "($self)"
       }
     },
     "Request": {

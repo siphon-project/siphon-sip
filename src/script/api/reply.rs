@@ -12,6 +12,20 @@ use crate::sip::headers::nameaddr::NameAddr;
 use crate::sip::message::{SipMessage, StartLine};
 use crate::sip::uri::{Scheme, SipUri};
 
+/// What the caller is sent of a callee's provisional response, as a script
+/// decides it in `@b2bua.on_provisional` or `@b2bua.on_early_media`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ProvisionalRelay {
+    /// The response with its body, which is what happens when no handler
+    /// decides otherwise.
+    #[default]
+    Whole,
+    /// The response without its body (`reply.relay(body=False)`).
+    WithoutBody,
+    /// Nothing (`reply.withhold()`).
+    Withheld,
+}
+
 /// Python-visible SIP reply object.
 ///
 /// Wraps an `Arc<Mutex<SipMessage>>` so mutations from Python
@@ -41,6 +55,10 @@ pub struct PyReply {
     /// records them on the A-leg INVITE. On a B2BUA response they go to the
     /// caller as the script left them.
     script_shaped_headers: Vec<String>,
+    /// On a callee's provisional the B2BUA is about to relay: what the script
+    /// decided the caller is sent of it. `None` on every other reply, where
+    /// `relay(body=False)` and `withhold()` have nothing to decide and raise.
+    provisional_relay: Option<ProvisionalRelay>,
 }
 
 impl PyReply {
@@ -62,7 +80,34 @@ impl PyReply {
             a_leg_message: None,
             reject_action: None,
             script_shaped_headers: Vec::new(),
+            provisional_relay: None,
         }
+    }
+
+    /// Make this the reply of a callee's provisional the B2BUA is about to
+    /// relay, so the script may decide what the caller is sent of it.
+    pub fn shaping_provisional(mut self) -> Self {
+        self.provisional_relay = Some(ProvisionalRelay::Whole);
+        self
+    }
+
+    /// What the script decided the caller is sent of this provisional: the
+    /// whole response unless a handler said otherwise.
+    pub fn provisional_relay(&self) -> ProvisionalRelay {
+        self.provisional_relay.unwrap_or_default()
+    }
+
+    /// Record `decision` for a provisional the B2BUA relays, and refuse it on
+    /// any other reply rather than accept a decision nothing carries out.
+    fn decide_provisional_relay(&mut self, decision: ProvisionalRelay, call: &str) -> PyResult<()> {
+        let Some(relay) = self.provisional_relay.as_mut() else {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "{call} decides what the caller is sent of a callee's provisional response: \
+                 it is only available in @b2bua.on_provisional and @b2bua.on_early_media"
+            )));
+        };
+        *relay = decision;
+        Ok(())
     }
 
     /// Headers the script set or removed on this response.
@@ -413,13 +458,97 @@ impl PyReply {
     }
 
     /// Mark this reply for forwarding upstream.
-    fn relay(&mut self) {
+    ///
+    /// In ``@b2bua.on_provisional`` and ``@b2bua.on_early_media`` the callee's
+    /// provisional is relayed to the caller whether or not this is called, and
+    /// ``body=False`` relays it without its body: the status line and the
+    /// headers reach the caller, the session description does not.
+    ///
+    /// That is how a B2BUA keeps a calling network generating ringback. A callee
+    /// may answer the offer in a reliable ``183`` "without any intention of
+    /// sending early media (this is the case when preconditions are used)"
+    /// (RFC 3960 §3.2), and a caller that takes any session description in a
+    /// provisional for early media then plays nothing. Inside an IMS the
+    /// ``P-Early-Media`` header says which it is (RFC 5009); toward a network
+    /// that is not shown that header, relay the session description only when it
+    /// authorises media toward the caller.
+    ///
+    /// Nothing changes on the callee's dialog. The provisional is PRACKed when
+    /// it was reliable, ``@b2bua.on_early_media`` still runs with the body in
+    /// place so the media engine can anchor the callee's side, and
+    /// ``reply.body`` / ``reply.has_body()`` keep reading it for the rest of the
+    /// handler. The caller has then not had the answer, so the 2xx carries it,
+    /// also when the callee's own 2xx has no body (RFC 3261 §13.2.1). Toward a
+    /// caller that uses ``100rel`` the provisional is still sent reliably when
+    /// the callee's was (RFC 3262 §3).
+    ///
+    /// The last call decides: ``reply.relay()`` after ``reply.relay(body=False)``
+    /// or ``reply.withhold()`` relays the response whole again.
+    ///
+    /// Args:
+    ///     body: ``False`` to relay a callee's provisional without its body.
+    ///
+    /// Raises:
+    ///     RuntimeError: ``body=False`` on any reply but a provisional in
+    ///         ``@b2bua.on_provisional`` / ``@b2bua.on_early_media``.
+    ///
+    /// Example:
+    ///
+    /// ```python,ignore
+    /// @b2bua.on_provisional
+    /// def on_provisional(call, reply):
+    ///     early_media = reply.get_header("P-Early-Media") or ""
+    ///     authorised = "sendrecv" in early_media or "sendonly" in early_media
+    ///     if reply.has_body("application/sdp") and not authorised:
+    ///         reply.relay(body=False)
+    /// ```
+    #[pyo3(signature = (body=true))]
+    fn relay(&mut self, body: bool) -> PyResult<()> {
+        if !body {
+            self.decide_provisional_relay(
+                ProvisionalRelay::WithoutBody,
+                "reply.relay(body=False)",
+            )?;
+        } else if let Some(relay) = self.provisional_relay.as_mut() {
+            *relay = ProvisionalRelay::Whole;
+        }
         self.forwarded = true;
+        Ok(())
     }
 
     /// Alias for `relay()` (used in P-CSCF and S-CSCF scripts).
-    fn forward(&mut self) {
-        self.forwarded = true;
+    fn forward(&mut self) -> PyResult<()> {
+        self.relay(true)
+    }
+
+    /// Relay nothing to the caller for this provisional of the callee.
+    ///
+    /// For ``@b2bua.on_provisional`` and ``@b2bua.on_early_media``. The caller
+    /// is sent no response for this one; what the callee sends next is relayed
+    /// as usual. Nothing changes on the callee's dialog: a reliable provisional
+    /// is PRACKed at once, since no PRACK of the caller's will release it, and
+    /// ``@b2bua.on_early_media`` still runs when it carries a session
+    /// description. That session description is the answer the caller has not
+    /// had, so the 2xx carries it (RFC 3261 §13.2.1). On the caller's dialog a
+    /// withheld provisional takes no ``RSeq`` (RFC 3262 §3).
+    ///
+    /// ``reply.relay()`` afterwards relays the response after all, and
+    /// ``reply.relay(body=False)`` relays it without its body.
+    ///
+    /// Raises:
+    ///     RuntimeError: on any reply but a provisional in
+    ///         ``@b2bua.on_provisional`` / ``@b2bua.on_early_media``.
+    ///
+    /// Example:
+    ///
+    /// ```python,ignore
+    /// @b2bua.on_provisional
+    /// def on_provisional(call, reply):
+    ///     if reply.status_code == 181:
+    ///         reply.withhold()
+    /// ```
+    fn withhold(&mut self) -> PyResult<()> {
+        self.decide_provisional_relay(ProvisionalRelay::Withheld, "reply.withhold()")
     }
 
     /// Reject an in-progress proxied INVITE from the reply context.
@@ -805,7 +934,44 @@ mod tests {
         let mut reply = PyReply::new(message);
 
         assert!(!reply.was_forwarded());
-        reply.relay();
+        reply.relay(true).unwrap();
+        assert!(reply.was_forwarded());
+    }
+
+    /// On a callee's provisional the B2BUA relays, the last decision stands,
+    /// and the whole response is the default.
+    #[test]
+    fn a_b2bua_provisional_records_what_the_caller_is_sent() {
+        let message = Arc::new(Mutex::new(make_response(183, "Session Progress")));
+        let mut reply = PyReply::new(message).shaping_provisional();
+        assert_eq!(reply.provisional_relay(), ProvisionalRelay::Whole);
+
+        reply.relay(false).unwrap();
+        assert_eq!(reply.provisional_relay(), ProvisionalRelay::WithoutBody);
+        reply.withhold().unwrap();
+        assert_eq!(reply.provisional_relay(), ProvisionalRelay::Withheld);
+        reply.forward().unwrap();
+        assert_eq!(reply.provisional_relay(), ProvisionalRelay::Whole);
+    }
+
+    /// Anywhere else nothing would carry the decision out, so it is refused
+    /// and names where it belongs. A plain `relay()` is unaffected.
+    #[test]
+    fn the_caller_presentation_is_refused_on_any_other_reply() {
+        pyo3::Python::initialize();
+        let message = Arc::new(Mutex::new(make_response(183, "Session Progress")));
+        let mut reply = PyReply::new(message);
+
+        for refused in [reply.relay(false), reply.withhold()] {
+            let error = refused.expect_err("nothing relays this reply to a caller");
+            Python::attach(|python| {
+                assert!(error.is_instance_of::<pyo3::exceptions::PyRuntimeError>(python));
+                assert!(error.to_string().contains("@b2bua.on_provisional"));
+            });
+        }
+        assert!(!reply.was_forwarded());
+        assert_eq!(reply.provisional_relay(), ProvisionalRelay::Whole);
+        reply.relay(true).unwrap();
         assert!(reply.was_forwarded());
     }
 
@@ -814,7 +980,7 @@ mod tests {
         let message = Arc::new(Mutex::new(make_response(200, "OK")));
         let mut reply = PyReply::new(message);
 
-        reply.forward();
+        reply.forward().unwrap();
         assert!(reply.was_forwarded());
     }
 
@@ -885,7 +1051,7 @@ mod tests {
         let message = Arc::new(Mutex::new(make_response(183, "Session Progress")));
         let mut reply = PyReply::new(message);
 
-        reply.relay();
+        reply.relay(true).unwrap();
         assert!(reply.reject(503, None).unwrap());
         // Both signals are set; the dispatcher checks reject_action() first.
         assert!(reply.was_forwarded());

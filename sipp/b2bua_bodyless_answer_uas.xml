@@ -13,7 +13,8 @@
   without a session description (RFC 3261 §13.2.1). Whether the caller's dialog
   has the answer is siphon's business on that dialog.
 
-  Registered as carol (172.20.0.158).  Pair with b2bua_bodyless_answer_uac.xml.
+  Registered as carol (172.20.0.158), paired with b2bua_bodyless_answer_uac.xml,
+  and as dave (172.20.0.238), paired with b2bua_ringback_uac.xml.
 -->
 <scenario name="B2BUA answer after a preview UAS (reliable 183, 200 without SDP)">
 
@@ -51,14 +52,14 @@ SIP/2.0 183 Session Progress
 [last_To:];tag=[pid]SIPpTag01[call_number]
 [last_Call-ID:]
 [last_CSeq:]
-Contact: <sip:carol@[local_ip]:[local_port];transport=[transport]>
+Contact: <sip:[local_ip]:[local_port];transport=[transport]>
 Require: 100rel
 RSeq: 42
 Content-Type: application/sdp
 Content-Length: [len]
 
 v=0
-o=carol 53655765 2353687637 IN IP[local_ip_type] [local_ip]
+o=callee 53655765 2353687637 IN IP[local_ip_type] [local_ip]
 s=-
 c=IN IP[media_ip_type] [media_ip]
 t=0 0
@@ -93,7 +94,7 @@ From:[$invite_from]
 To:[$invite_to];tag=[pid]SIPpTag01[call_number]
 Call-ID:[$invite_callid]
 CSeq:[$invite_cseq]
-Contact: <sip:carol@[local_ip]:[local_port];transport=[transport]>
+Contact: <sip:[local_ip]:[local_port];transport=[transport]>
 Content-Length: 0
 
 ]]>
@@ -110,7 +111,7 @@ From:[$invite_from]
 To:[$invite_to];tag=[pid]SIPpTag01[call_number]
 Call-ID:[$invite_callid]
 CSeq:[$invite_cseq]
-Contact: <sip:carol@[local_ip]:[local_port];transport=[transport]>
+Contact: <sip:[local_ip]:[local_port];transport=[transport]>
 Content-Length: 0
 
 ]]>

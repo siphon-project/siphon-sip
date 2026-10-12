@@ -87,9 +87,7 @@ pub fn forward_update_response(
                 status_code: status,
                 reason_phrase: "Server Internal Error".to_string(),
             });
-            message.headers.remove("Content-Type");
-            message.body.clear();
-            message.headers.set("Content-Length", "0".to_string());
+            remove_body(message);
             if retry_after {
                 message.headers.set("Retry-After", random_retry_after());
             }

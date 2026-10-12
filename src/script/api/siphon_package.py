@@ -505,6 +505,13 @@ class _B2buaNamespace:
         dialog headers stay siphon's. A provisional with SDP goes on to
         ``on_early_media`` afterwards, with the same ``reply``.
 
+        The handler may also decide what the caller is sent of the response:
+        ``reply.relay(body=False)`` relays it without its body, and
+        ``reply.withhold()`` relays nothing for it. Either way the callee's
+        dialog goes on as it would have, and the caller gets the answer in
+        the 2xx. A handler that does neither leaves the response relayed as
+        it is.
+
         Usage:
             @b2bua.on_provisional
             def provisional(call, reply):

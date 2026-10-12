@@ -652,7 +652,7 @@ class Action:
     kind: str
     """Action type: ``"reply"``, ``"relay"``, ``"fork"``, ``"reject"``,
     ``"dial"``, ``"terminate"``, ``"handover"``, ``"record_route"``,
-    ``"silent_drop"``."""
+    ``"silent_drop"``, ``"withhold"``."""
 
     status_code: Optional[int] = None
     """For ``reply`` / ``reject`` — the SIP status code (e.g. 200, 404)."""
@@ -679,7 +679,8 @@ class Action:
     """Headers that were removed before this action."""
 
     extras: Optional[dict] = None
-    """Additional action-specific data (e.g. session timer params, SRS URI)."""
+    """Additional action-specific data (e.g. session timer params, SRS URI;
+    ``{"body": False}`` on the ``relay`` of ``reply.relay(body=False)``)."""
 
     reliable: bool = False
     """For ``reply`` — RFC 3262 reliable provisional flag (``Require: 100rel``)."""

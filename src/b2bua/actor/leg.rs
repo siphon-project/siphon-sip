@@ -392,9 +392,15 @@ pub struct Leg {
     /// force on the caller's dialog when this leg answers with a 2xx that carries
     /// none.
     pub early_answer_sent: Option<Vec<u8>>,
-    /// The callee's To tag on that response: the early dialog whose answer it
-    /// is, which a fork beyond the callee can make one of several on this leg
-    /// (RFC 3261 §12.1.2). `None` when the response carried no tag.
+    /// On a B-leg: the SDP of an early media response from it that a script kept
+    /// from the caller (`reply.relay(body=False)`, `reply.withhold()`), as the
+    /// caller would have got it. The answer the caller's 2xx has to carry, when
+    /// no later response from this leg showed the caller one.
+    pub early_answer_withheld: Option<Vec<u8>>,
+    /// The callee's To tag on the response either of the two came in: the early
+    /// dialog whose answer it is, which a fork beyond the callee can make one of
+    /// several on this leg (RFC 3261 §12.1.2). `None` when the response carried
+    /// no tag.
     pub early_answer_dialog: Option<String>,
     /// On a B-leg before its final response: siphon has PRACKed the reliable
     /// provisional that carried the callee's session description on this leg's
@@ -442,6 +448,7 @@ impl Leg {
             auth_challenged: false,
             offered_sdp: None,
             early_answer_sent: None,
+            early_answer_withheld: None,
             early_answer_dialog: None,
             early_exchange_complete: false,
             request_session_expires: None,
@@ -499,11 +506,35 @@ impl Leg {
             auth_challenged: false,
             offered_sdp: None,
             early_answer_sent: None,
+            early_answer_withheld: None,
             early_answer_dialog: None,
             early_exchange_complete: false,
             request_session_expires: None,
             session_refresh_request: None,
             request_source: None,
+        }
+    }
+
+    /// Record `sdp`, the session description of an early media response from
+    /// this B-leg on the callee's early dialog `dialog`, as the caller got it,
+    /// or, when a script kept it from the caller (`shown` false), as the caller
+    /// would have.
+    ///
+    /// One the caller was shown replaces whatever was kept from it. One kept
+    /// from the caller leaves what the caller was shown on the same early
+    /// dialog, which is what its 2xx repeats (RFC 6337 §3.1.1). Another early
+    /// dialog starts over, since its answer is its own (RFC 3261 §13.2.1).
+    pub fn record_early_answer(&mut self, sdp: Vec<u8>, dialog: Option<String>, shown: bool) {
+        if self.early_answer_dialog != dialog {
+            self.early_answer_sent = None;
+            self.early_answer_withheld = None;
+            self.early_answer_dialog = dialog;
+        }
+        if shown {
+            self.early_answer_sent = Some(sdp);
+            self.early_answer_withheld = None;
+        } else {
+            self.early_answer_withheld = Some(sdp);
         }
     }
 
