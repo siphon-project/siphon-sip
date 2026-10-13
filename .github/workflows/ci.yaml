@@ -2764,6 +2764,12 @@ jobs:
             cargo test --test integration_tests -- --ignored --exact \
             siphon_rtp_tests::smoke_test_against_real_siphon_rtp --nocapture
 
+      - name: Two seats in one conference room of the real engine hear each other
+        run: |
+          SIPHON_RTP_BIN="$PWD/siphon-rtp" PYO3_PYTHON=python3.14 \
+            cargo test --test integration_tests -- --ignored --exact \
+            siphon_rtp_tests::two_seats_in_a_real_siphon_rtp_room_hear_each_other --nocapture
+
   # ── Real siphon-rtp: native JSON control plane ─────────────────────────
   # The media-anchoring analogue of sipp-rtpproxy, but against the real engine
   # instead of a mock: INVITE → offer → 200 → answer → BYE → delete, driven

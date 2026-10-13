@@ -2208,6 +2208,41 @@
         "kind": "method_descriptor",
         "sig": "($self, target)"
       },
+      "conference_bridge": {
+        "doc": "Link two live rooms: ``direction`` ``\"both\"``, ``\"a_to_b\"`` (room A is",
+        "kind": "method_descriptor",
+        "sig": "($self, conference_a, conference_b, direction=\"both\")"
+      },
+      "conference_join": {
+        "doc": "Seat a call in a conference room and resolve to the answer SDP for the",
+        "kind": "method_descriptor",
+        "sig": "($self, conference_id, call, role=\"talker\", target=None, whisper_target=None, profile=None)"
+      },
+      "conference_leave": {
+        "doc": "Free a call's seat; the room ends with its last seat. ``call`` is a",
+        "kind": "method_descriptor",
+        "sig": "($self, conference_id, call)"
+      },
+      "conference_play": {
+        "doc": "Play a ``file``, ``blob`` or ``tone`` into a room, heard by every seat,",
+        "kind": "method_descriptor",
+        "sig": "($self, conference_id, file=None, blob=None, tone=None, repeat=None, start_ms=None, duration_ms=None, gain_decibels=None)"
+      },
+      "conference_route": {
+        "doc": "Change who a seat hears and who hears it, live: ``role``, ``target``",
+        "kind": "method_descriptor",
+        "sig": "($self, conference_id, call, role, target=None, whisper_target=None)"
+      },
+      "conference_set_play_gain": {
+        "doc": "Retune a running room playback's gain (\u221260..=+12 dB).",
+        "kind": "method_descriptor",
+        "sig": "($self, conference_id, play_id, gain_decibels)"
+      },
+      "conference_stop_play": {
+        "doc": "Stop one room playback by ``play_id``, or all of them.",
+        "kind": "method_descriptor",
+        "sig": "($self, conference_id, play_id=None)"
+      },
       "delete": {
         "doc": "Send an RTPEngine `delete` command to tear down the media session.",
         "kind": "method_descriptor",
@@ -2236,6 +2271,11 @@
         "doc": "Send an RTPEngine `offer` command.",
         "kind": "method_descriptor",
         "sig": "($self, request, profile=None, ws_uri=None, beep_detection=None, beep_cadence_guard_ms=None, ws_sample_rate=None, ws_tee_sample_rate=None, ws_vad_engine=None, ws_vad_min_speech_ms=None)"
+      },
+      "on_active_speaker": {
+        "doc": "Register a handler for a conference room's **active speaker**: called",
+        "kind": "method_descriptor",
+        "sig": "($self, func_or_none=None, *, conference_id=None)"
       },
       "on_beep": {
         "doc": "Register a handler for **record-tone (voicemail beep)** events.",

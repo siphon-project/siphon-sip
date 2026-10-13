@@ -1,0 +1,29 @@
+# SIPhon conference focus with mixing — see examples/conference_focus.py
+#
+# Each participant's INVITE is answered by siphon itself, with an SDP the media
+# engine produced when it seated the participant in a room of its mixer. There
+# is no B leg.
+#
+# Requires the native siphon-rtp engine: rtpengine and rtpproxy have no mixer,
+# and the script's conference verbs raise on them.
+
+listen:
+  udp:
+    - "0.0.0.0:5060"
+  tcp:
+    - "0.0.0.0:5060"
+
+domain:
+  local:
+    - "conference.example.com"
+
+advertised_address: "conference.example.com"
+
+script:
+  path: "examples/conference_focus.py"
+
+media:
+  backend: siphon-rtp
+  siphon_rtp:
+    address: "127.0.0.1:8080"     # siphon-rtp --control
+    timeout_ms: 2000

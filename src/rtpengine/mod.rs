@@ -19,6 +19,8 @@ pub mod rtpproxy;
 pub mod session;
 pub mod siphon_rtp;
 #[cfg(test)]
+pub(crate) mod test_conference_engine;
+#[cfg(test)]
 pub(crate) mod test_engine;
 #[cfg(test)]
 pub(crate) mod test_native_engine;

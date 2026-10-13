@@ -33,6 +33,9 @@ use super::siphon_rtp::{PlayMediaOutcome, SiphonRtpClientSet};
 // local twin would only add a conversion that could be wrong.
 pub use siphon_rtp_proto::X3TargetLeg;
 
+mod conference;
+pub use conference::{BridgeDirection, ConferenceRole, ConferenceSeat};
+
 /// The configured media-control backend.
 pub enum MediaBackend {
     /// rtpengine NG protocol (bencode over UDP) — the default.
@@ -266,6 +269,15 @@ impl MediaBackend {
         // be the one way `ACTIVE_PLAYBACKS` could grow without bound.
         ACTIVE_PLAYBACKS.remove(&(call_id.to_string(), from_tag.to_string()));
         Self::recordings_session_ended(call_id, std::time::Instant::now());
+        // A seated call's media is its seat, which no engine call holds.
+        if let Some((left, holds_call)) = self.leave_seat_of(call_id).await {
+            if !holds_call {
+                return left;
+            }
+            if let Err(error) = left {
+                warn!(%call_id, %error, "conference seat not freed; deleting the call's own media session");
+            }
+        }
         match self {
             Self::RtpEngine(set) => set.delete(call_id, from_tag).await,
             Self::SiphonRtp(client) => client.delete(call_id, from_tag).await,

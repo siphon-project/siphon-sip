@@ -1154,6 +1154,19 @@ fn example_ims_ue_b2bua_yaml_parses() {
     assert!(ims.features.iter().any(|f| f == "mmtel"));
 }
 
+/// The conference focus example points at the native engine, the only backend
+/// whose rooms its script's conference verbs reach.
+#[test]
+fn example_conference_focus_yaml_parses() {
+    let yaml = include_str!("../../examples/conference_focus.yaml");
+    let config = Config::from_str(yaml).expect("example yaml must parse");
+    let media = config.media.expect("media block");
+    assert_eq!(
+        media.backend,
+        Some(crate::config::MediaBackendKind::SiphonRtp)
+    );
+}
+
 /// The shipped WhatsApp Business Calling gateway example must parse, and its
 /// WhatsApp-specific invariants must hold: no mutual-TLS client cert (Meta is
 /// server-auth only), no session timer (a re-INVITE would fail the WhatsApp

@@ -15,6 +15,32 @@ entry, but a working config keeps working.
 
 ### Added
 
+- **`rtpengine.conference_join` and its siblings: a script can seat calls in
+  a siphon-rtp mixing room.** siphon-rtp has an N-party mixer, but nothing in
+  the `rtpengine` namespace reached it, so a conference focus (RFC 4579) had no
+  way to mix its participants. On the siphon-rtp backend, `await
+  rtpengine.conference_join(conference_id, call, role="talker", target=None,
+  whisper_target=None, profile=None)` seats the participant of an INVITE in a
+  room and resolves to the answer SDP for the script's own 2xx; the room is
+  created on its first seat and ends with its last. A seat is the call's
+  From-tag. `conference_leave`, `conference_route` (talker, listener, muted,
+  whisper, monitor, live), `conference_bridge` (merge two rooms, one way or
+  both), `conference_play`, `conference_stop_play` and
+  `conference_set_play_gain` complete it, and `rtpengine.delete(call)` on a
+  seated call leaves its room rather than asking the engine for a call it never
+  had. A codec the room cannot mix raises `ValueError`, as on `answer_local`.
+  So does a profile that sets a codec policy, `ws_uri`, `ws_tee`, `record_call`
+  or a DSP knob, because siphon-rtp 0.14.0 applies none of them to a seat and
+  the call would otherwise be seated without them; and so does a second seat
+  for one call, which the engine would answer and then not mix. The new
+  `@rtpengine.on_active_speaker(conference_id, from_tag)` reports the floor; a
+  room's DTMF already reached `@rtpengine.on_dtmf` with the room id as
+  `call_id`, and a room playback's end now reaches `@rtpengine.on_play_finished`
+  the same way. rtpengine and rtpproxy have no mixer and raise "not supported
+  by this media backend". Recording a room is not exposed yet. The SDK mock
+  keeps rooms, seats, bridges and playbacks; the cookbook has "A conference
+  focus with mixing", with `examples/conference_focus.py`.
+
 - **`@b2bua.on_provisional`: a hook for every provisional response the B2BUA
   relays.** `@b2bua.on_early_media` runs only for a provisional with SDP, so a
   `180 Ringing` without a body, which is what a ringing phone normally sends,

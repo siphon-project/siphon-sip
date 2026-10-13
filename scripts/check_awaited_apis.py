@@ -57,6 +57,11 @@ NAMESPACE_AWAITABLE = {
         "delete_session",
     },
     "proxy": {"send_request"},
+    "rtpengine": {
+        "conference_join", "conference_leave", "conference_route",
+        "conference_bridge", "conference_play", "conference_stop_play",
+        "conference_set_play_gain",
+    },
 }
 
 # Awaitable methods on `<namespace>.subscribe_state`.
