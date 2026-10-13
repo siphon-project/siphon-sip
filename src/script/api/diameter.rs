@@ -1910,6 +1910,52 @@ impl PyDiameter {
         Ok(func)
     }
 
+    /// RFC 8506 5.5: request a credit update on the session's serving connection.
+    /// Returns its RAA result code; missing/disconnected peers and timeouts raise.
+    #[pyo3(signature = (peer, session_id, destination_host, destination_realm, tenant="default", timeout_ms=5000))]
+    fn reauthorize<'py>(
+        &self,
+        python: Python<'py>,
+        peer: &str,
+        session_id: &str,
+        destination_host: &str,
+        destination_realm: &str,
+        tenant: &str,
+        timeout_ms: u64,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        if [
+            peer,
+            session_id,
+            destination_host,
+            destination_realm,
+            tenant,
+        ]
+        .iter()
+        .any(|value| value.is_empty())
+        {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "nonempty reauthorization identity required",
+            ));
+        }
+        let connection = crate::diameter::reauthorize::connection(tenant, peer, destination_host)
+            .ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err("serving Diameter peer unavailable")
+        })?;
+        let wire = crate::diameter::reauthorize::wire(
+            &connection,
+            session_id,
+            destination_host,
+            destination_realm,
+        );
+        crate::script::awaitable(python, async move {
+            let answer = connection
+                .send_request_timeout(wire, request_timeout(timeout_ms))
+                .await
+                .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+            Ok(extract_result_code(&answer.avps))
+        })
+    }
+
     /// Build a backend peer pool for `target` (a peer name or list of names)
     /// resolved through the connected peers (state-as-truth liveness).
     ///

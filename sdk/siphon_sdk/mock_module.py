@@ -8893,6 +8893,23 @@ class MockDiameter:
     # -- Generic spec-name API (matches Rust `diameter.send_request` /
     # `@diameter.on_command`) --
 
+    async def reauthorize(self, peer: str, session_id: str, destination_host: str,
+                          destination_realm: str, tenant: str = "default",
+                          timeout_ms: int = 5000) -> int:
+        """Request RFC 8506 credit reauthorization on a serving peer.
+
+        Configure the test RAA through set_generic_response("RAR", "ro", ...).
+        """
+        if not all((peer, session_id, destination_host, destination_realm, tenant)):
+            raise ValueError("nonempty reauthorization identity required")
+        if not self._peers.get(peer, False):
+            raise RuntimeError("serving Diameter peer unavailable")
+        answer = await self.send_request("RAR", "ro", peer=peer, timeout_ms=timeout_ms,
+            session_id=session_id, destination_host=destination_host,
+            destination_realm=destination_realm, auth_application_id=4,
+            re_auth_request_type=0)
+        return answer["result_code"]
+
     async def send_request(self, command: str, application: str,
                      peer: Optional[str] = None,
                      timeout_ms: int = 10_000,

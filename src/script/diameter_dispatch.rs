@@ -642,6 +642,17 @@ pub(crate) async fn dispatch_request(
     local_origin_host: String,
     local_origin_realm: String,
 ) {
+    if let Some(host) = DiameterMsg::from_wire(&incoming.raw)
+        .ok()
+        .and_then(|message| message.get_str(264))
+    {
+        crate::diameter::reauthorize::register(
+            &peer_info.tenant,
+            &peer_info.name,
+            &host,
+            &inbound_peer,
+        );
+    }
     let start = Instant::now();
     // Captured before `incoming` moves into the handler closure below.
     let command_code = incoming.command_code;

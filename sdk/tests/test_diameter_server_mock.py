@@ -327,3 +327,15 @@ def test_ip_in_cidr_and_fnmatch_helpers():
     assert d.fnmatch("epc.mnc001.mcc001.3gppnetwork.org", "epc.*.3gppnetwork.org")
     assert not d.fnmatch("ims.example.org", "epc.*")
     assert isinstance(d.now_us(), int)
+
+
+def test_reauthorization_keeps_the_existing_session():
+    import asyncio
+    diameter = _fresh_diameter()
+    diameter.add_peer('local-ims', connected=True)
+    result = asyncio.run(diameter.reauthorize('local-ims', 'ims.example;1', 'ims.example', 'example'))
+    assert result == 2001
+    sent = diameter.generic_requests[-1]
+    assert sent['avps']['session_id'] == 'ims.example;1'
+    assert sent['avps']['auth_application_id'] == 4
+    assert sent['avps']['re_auth_request_type'] == 0

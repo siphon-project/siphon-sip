@@ -456,3 +456,17 @@ for avp in request.avps():
 The value a handler returns via `request.answer(...)` / `request.reject(...)`.
 
 ::: siphon_sdk.mock_module.MockDiameterAnswer
+
+
+### Credit reauthorization on a serving connection
+
+`await diameter.reauthorize(peer, session_id, destination_host, destination_realm,
+tenant="default", timeout_ms=5000)` sends RFC 8506 section 5.5 RAR on the existing
+connection that carried the client's charging request. It retains the supplied
+Session-Id, sets application/Auth-Application-Id 4 and AUTHORIZE_ONLY (0), and
+returns the RAA Result-Code. Missing/disconnected connections and timeouts raise;
+callers should persist their pending notification and retry. A 2001 or 2002 RAA
+acknowledges the request; the client's subsequent CCR performs the actual credit
+update. Connections are scoped by tenant, configured peer name and Origin-Host.
+The weak registry does not keep disconnected peers alive or route to arbitrary
+client-mode peers. A peer must first have sent a request on that connection.
