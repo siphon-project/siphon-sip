@@ -13,6 +13,10 @@
 //!   [`EarlyOfferState`](crate::b2bua::actor::EarlyOfferState) allows, relayed as
 //!   an UPDATE after the answer is ([`handle_b2bua_update`]), on the early dialog
 //!   of the one callee whose session the caller has.
+//! * A callee's offer that cannot cross because the caller takes the answer
+//!   to its INVITE in the 2xx is answered by siphon on the callee's dialog,
+//!   and the caller's 2xx carries what it changed
+//!   ([`answer_callee_early_update`]).
 //! * Otherwise it is refused with the status RFC 3311 §5.2 names, and the
 //!   session stays as it was.
 //!
@@ -31,7 +35,7 @@
 //! left unanswered, has the caller end its own dialog (RFC 3311 §5.3), so the
 //! caller is asked to try again instead.
 
-use crate::b2bua::actor::EarlyOffer;
+use crate::b2bua::actor::{EarlyOffer, OTHER_DIALOG_NOT_READY};
 use crate::dispatcher::*;
 
 /// The marker of a tracking leg for an UPDATE relayed from the caller to the
@@ -101,6 +105,28 @@ pub fn early_dialog_update(
         None => return EarlyUpdate::NotEarly,
         Some(EarlyOffer::Relay) if carries_offer => return EarlyUpdate::Relay,
         Some(EarlyOffer::Relay) => (200, false),
+        Some(EarlyOffer::Answer) => {
+            let answered = origin_branch
+                .ok_or("the request names no early dialog of a callee's")
+                .and_then(|branch| {
+                    answer_callee_early_update(inbound, message, call_id, branch, state)
+                });
+            match answered {
+                Ok(()) => return EarlyUpdate::Answered,
+                // Not one siphon can answer for the caller, so the callee is
+                // asked to try again, as before siphon answered any.
+                Err(why) => {
+                    info!(
+                        call_id = %call_id,
+                        status = 500,
+                        from_a_leg,
+                        "B2BUA UPDATE on the early dialog refused: {OTHER_DIALOG_NOT_READY}, \
+                         and siphon does not answer it for the caller: {why} (RFC 3311 §5.2)"
+                    );
+                    (500, true)
+                }
+            }
+        }
         Some(EarlyOffer::Refuse {
             status,
             retry_after,

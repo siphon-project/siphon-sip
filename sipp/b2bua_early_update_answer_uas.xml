@@ -1,0 +1,202 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  B2BUA preconditions toward a caller without 100rel: B-leg UAS.
+
+  recv INVITE -> 100 -> reliable 183 (Require: 100rel, RSeq: 42) with the
+  answer and nothing reserved (a=curr:qos local none) -> recv siphon's PRACK ->
+  200 PRACK -> send UPDATE with a new offer once this side has reserved
+  (a=curr:qos local sendrecv, another port) -> recv 200 UPDATE with siphon's
+  answer -> 180 -> 200 INVITE without a body -> recv ACK -> recv BYE -> 200 BYE.
+
+  The caller on the other side of siphon does not use 100rel, so its dialog
+  cannot be sent an UPDATE with an offer before its 2xx (RFC 3311 §5.1).
+  siphon is the UAC of this dialog and answers the UPDATE itself: its own
+  description, with the precondition status of an answerer that has nothing to
+  reserve (RFC 3312 §5.2). Every tag is turned round in an answer (table 4), so
+  this side's "local" comes back as "remote" and the other way.
+
+  The scenario fails when the UPDATE is refused, or its 200 carries no answer
+  or the wrong status lines: the preconditions would stay unmet and this side
+  would never alert.
+
+  Registered as grace (172.20.0.251) by sipp-b2bua-early-update-answer-register.
+  Pair with b2bua_early_update_answer_uac.xml on the A-leg side of siphon.
+-->
+<scenario name="B2BUA preconditions UAS: its UPDATE is answered by siphon">
+
+  <recv request="INVITE" crlf="true">
+    <action>
+      <ereg regexp="(.*)" search_in="hdr" header="Via:" assign_to="junk,invite_via" />
+      <ereg regexp="(.*)" search_in="hdr" header="From:" assign_to="junk,invite_from" />
+      <ereg regexp="(.*)" search_in="hdr" header="To:" assign_to="junk,invite_to" />
+      <ereg regexp="(.*)" search_in="hdr" header="Call-ID:" assign_to="junk,invite_callid" />
+      <ereg regexp="(.*)" search_in="hdr" header="CSeq:" assign_to="junk,invite_cseq" />
+      <ereg regexp="&lt;([^>]+)>" search_in="hdr" header="Contact:" assign_to="junk,remote_contact" />
+    </action>
+  </recv>
+
+  <send>
+    <![CDATA[
+SIP/2.0 100 Trying
+[last_Via:]
+[last_From:]
+[last_To:]
+[last_Call-ID:]
+[last_CSeq:]
+Content-Length: 0
+
+]]>
+  </send>
+
+  <!-- The answer, reliably, with nothing reserved yet. -->
+  <send retrans="500">
+    <![CDATA[
+SIP/2.0 183 Session Progress
+[last_Via:]
+[last_From:]
+[last_To:];tag=[pid]SIPpTag01[call_number]
+[last_Call-ID:]
+[last_CSeq:]
+Contact: <sip:grace@[local_ip]:[local_port];transport=[transport]>
+Allow: INVITE, ACK, CANCEL, BYE, PRACK, UPDATE
+Require: 100rel
+RSeq: 42
+Content-Type: application/sdp
+Content-Length: [len]
+
+v=0
+o=grace 53655765 2353687637 IN IP[local_ip_type] [local_ip]
+s=-
+c=IN IP[media_ip_type] [media_ip]
+t=0 0
+m=audio 49172 RTP/AVP 0
+a=rtpmap:0 PCMU/8000
+a=curr:qos local none
+a=curr:qos remote none
+a=des:qos mandatory local sendrecv
+a=des:qos optional remote sendrecv
+a=conf:qos remote sendrecv
+]]>
+  </send>
+
+  <recv request="PRACK" crlf="true" />
+
+  <send>
+    <![CDATA[
+SIP/2.0 200 OK
+[last_Via:]
+[last_From:]
+[last_To:]
+[last_Call-ID:]
+[last_CSeq:]
+Content-Length: 0
+
+]]>
+  </send>
+
+  <pause milliseconds="200" />
+
+  <!-- This side has reserved: a new offer on the early dialog, from another
+       port than the 183 named. -->
+  <send retrans="500">
+    <![CDATA[
+UPDATE [$remote_contact] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From:[$invite_to];tag=[pid]SIPpTag01[call_number]
+To:[$invite_from]
+Call-ID:[$invite_callid]
+CSeq: 1 UPDATE
+Contact: <sip:grace@[local_ip]:[local_port];transport=[transport]>
+Max-Forwards: 70
+Content-Type: application/sdp
+Content-Length: [len]
+
+v=0
+o=grace 53655765 2353687638 IN IP[local_ip_type] [local_ip]
+s=-
+c=IN IP[media_ip_type] [media_ip]
+t=0 0
+m=audio 49174 RTP/AVP 0
+a=rtpmap:0 PCMU/8000
+a=curr:qos local sendrecv
+a=curr:qos remote none
+a=des:qos mandatory local sendrecv
+a=des:qos optional remote sendrecv
+]]>
+  </send>
+
+  <recv response="100" optional="true" />
+
+  <!-- siphon's answer: its side is ready, this side's is confirmed. -->
+  <recv response="200" crlf="true">
+    <action>
+      <ereg regexp="application/sdp" search_in="hdr" header="Content-Type:"
+            check_it="true" assign_to="junk" />
+      <ereg regexp="m=audio [0-9]+ RTP/AVP 0" search_in="body"
+            check_it="true" assign_to="junk" />
+      <ereg regexp="a=curr:qos local sendrecv" search_in="body"
+            check_it="true" assign_to="junk" />
+      <ereg regexp="a=curr:qos remote sendrecv" search_in="body"
+            check_it="true" assign_to="junk" />
+      <ereg regexp="a=des:qos optional local sendrecv" search_in="body"
+            check_it="true" assign_to="junk" />
+      <ereg regexp="a=des:qos mandatory remote sendrecv" search_in="body"
+            check_it="true" assign_to="junk" />
+      <ereg regexp="o=grace" search_in="body"
+            check_it_inverse="true" assign_to="junk" />
+    </action>
+  </recv>
+
+  <!-- The preconditions are met: alert, then answer. -->
+  <send>
+    <![CDATA[
+SIP/2.0 180 Ringing
+Via:[$invite_via]
+From:[$invite_from]
+To:[$invite_to];tag=[pid]SIPpTag01[call_number]
+Call-ID:[$invite_callid]
+CSeq:[$invite_cseq]
+Contact: <sip:grace@[local_ip]:[local_port];transport=[transport]>
+Content-Length: 0
+
+]]>
+  </send>
+
+  <pause milliseconds="300" />
+
+  <!-- The 200 for the INVITE, without a session description: the exchange on
+       this dialog is done. -->
+  <send retrans="500">
+    <![CDATA[
+SIP/2.0 200 OK
+Via:[$invite_via]
+From:[$invite_from]
+To:[$invite_to];tag=[pid]SIPpTag01[call_number]
+Call-ID:[$invite_callid]
+CSeq:[$invite_cseq]
+Contact: <sip:grace@[local_ip]:[local_port];transport=[transport]>
+Content-Length: 0
+
+]]>
+  </send>
+
+  <recv request="ACK" optional="true" timeout="5000" />
+
+  <recv request="BYE" />
+
+  <send>
+    <![CDATA[
+SIP/2.0 200 OK
+[last_Via:]
+[last_From:]
+[last_To:]
+[last_Call-ID:]
+[last_CSeq:]
+Content-Length: 0
+
+]]>
+  </send>
+
+</scenario>

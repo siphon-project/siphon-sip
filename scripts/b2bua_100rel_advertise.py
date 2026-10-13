@@ -14,11 +14,14 @@ still applied.  If siphon read the (now-mutated) INVITE back, it would conclude
 the trunk supports 100rel and leak the reliable 183 — and the trunk would
 CANCEL the call.
 
-For a call to dave it also decides what the caller is shown of a provisional:
-a session description is relayed only when the callee authorises early media
-toward the caller in P-Early-Media (RFC 5009), and otherwise the provisional
-goes out without its body, so the calling side keeps generating ringback
-(RFC 3960 §3.2). The answer then reaches the caller in the 200.
+For a call to dave or grace it also decides what the caller is shown of a
+provisional: a session description is relayed only when the callee authorises
+early media toward the caller in P-Early-Media (RFC 5009), and otherwise the
+provisional goes out without its body, so the calling side keeps generating
+ringback (RFC 3960 §3.2). The answer then reaches the caller in the 200. The
+callee registered as grace uses preconditions and sends an UPDATE with a new
+offer before it alerts, which siphon answers itself: no handler here takes
+part in that.
 """
 from siphon import b2bua, proxy, registrar, auth, log
 
@@ -73,9 +76,9 @@ def early_media_authorised(reply):
 
 @b2bua.on_provisional
 def provisional(call, reply):
-    # Only for the ringback scenario's callee, so the other scenarios on this
-    # instance see a provisional relayed as it is.
-    if call.ruri.user != "dave":
+    # Only for the callees of the ringback and precondition scenarios, so the
+    # other scenarios on this instance see a provisional relayed as it is.
+    if call.ruri.user not in ("dave", "grace"):
         return
     if reply.has_body("application/sdp") and not early_media_authorised(reply):
         log.info(f"Call {call.id} {reply.status_code} relayed without its body")

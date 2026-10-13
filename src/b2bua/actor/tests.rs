@@ -537,6 +537,35 @@ fn a_dialog_adopts_the_origin_of_an_sdp_siphon_sent_as_given() {
 }
 
 #[test]
+fn a_b_leg_keeps_what_an_update_left_until_another_early_dialog_starts_over() {
+    let dialog = |tag: &str| Some(tag.to_string());
+    let mut leg = make_b_leg(0);
+    leg.record_early_answer(b"shown".to_vec(), dialog("a"), true);
+    leg.record_early_answer_revision(b"revised".to_vec(), dialog("a"));
+    assert_eq!(leg.early_answer_revised.as_deref(), Some(&b"revised"[..]));
+    assert_eq!(
+        leg.early_answer_sent.as_deref(),
+        Some(&b"shown"[..]),
+        "what the caller was shown is what the 2xx revises"
+    );
+
+    // A session description in a later provisional on the same early dialog
+    // is not another one.
+    leg.record_early_answer(b"repeated".to_vec(), dialog("a"), true);
+    leg.record_early_answer(b"kept".to_vec(), dialog("a"), false);
+    assert_eq!(leg.early_answer_revised.as_deref(), Some(&b"revised"[..]));
+
+    // Another early dialog has had no UPDATE.
+    leg.record_early_answer(b"other".to_vec(), dialog("b"), true);
+    assert_eq!(leg.early_answer_revised, None);
+
+    // An UPDATE on another early dialog starts over as a provisional does.
+    leg.record_early_answer_revision(b"revised".to_vec(), dialog("c"));
+    assert_eq!(leg.early_answer_sent, None);
+    assert_eq!(leg.early_answer_dialog, dialog("c"));
+}
+
+#[test]
 fn a_b_leg_keeps_the_early_answer_the_caller_is_owed_per_early_dialog() {
     let shown = |leg: &Leg| leg.early_answer_sent.clone();
     let withheld = |leg: &Leg| leg.early_answer_withheld.clone();
