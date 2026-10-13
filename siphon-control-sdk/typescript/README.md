@@ -138,8 +138,8 @@ addressing one:
 
 | Method | Wire verb (`module`) | Notes |
 | --- | --- | --- |
-| `originate(channel, to, media, options?)` | `originate` (`sip`) | one URI, resolved as written; resolves once the INVITE is on the wire |
-| `originateAor(channel, aor, media, options?, ring?)` | `originate` (`sip`) | ring every phone registered at `aor` over its own flow and Path; first to answer wins. `ring` is `{ strategy?, totalTimeout? }`. Nobody registered is `not_found` (`no_contacts`); `drop` is refused while the phones ring, use `hangup` |
+| `originate(channel, to, media, options?)` | `originate` (`sip`) | one URI, resolved as written; resolves once the INVITE is on the wire to the `Call` it placed, whose `nextEvent()` carries the answer, a rejection or the ring timeout. An id still live on this client is `conflict`, refused before anything is sent |
+| `originateAor(channel, aor, media, options?, ring?)` | `originate` (`sip`) | ring every phone registered at `aor` over its own flow and Path; first to answer wins. `ring` is `{ strategy?, totalTimeout? }`. The result carries the placed `call`. Nobody registered is `not_found` (`no_contacts`); `drop` is refused while the phones ring, use `hangup` |
 
 The server implements every verb in these tables. `unsupported_verb`
 (`error.isUnsupportedVerb()`) is what a verb answers when the configured media

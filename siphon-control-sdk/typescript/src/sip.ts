@@ -14,6 +14,7 @@
 
 import type { ControlClient, ClientConfig, ClientEvent } from "./client";
 import { ControlClient as ControlClientImpl } from "./client";
+import { ControlError } from "./errors";
 import { AsyncQueue } from "./internal";
 import {
   MODULE_SIP,
@@ -376,19 +377,6 @@ export interface OriginateOptions {
 }
 
 /**
- * What the server answers an accepted `originate` with: the call is `calling`,
- * not answered — the answer arrives later as an event on the channel.
- */
-export interface Originated {
-  /** The caller-supplied channel id the call is addressed by. */
-  channel: string;
-  /** siphon's internal call id. */
-  callId?: string;
-  /** The SIP Call-ID on the wire, for joining CDR / HEP. */
-  sipCallId?: string;
-}
-
-/**
  * How {@link SipClient.originateAor} rings the phones registered at an AoR.
  * Anything left out takes the server's own default.
  */
@@ -415,6 +403,11 @@ export interface OriginatedGroup {
   /** The caller-supplied channel id the group is addressed by. */
   channel: string;
   /**
+   * The placed call: its events (`DialBranch`, `DialAnswered`, then the
+   * winning phone's) and every verb on the channel.
+   */
+  call: Call;
+  /**
    * siphon's id for the group of phones. Until one answers, the channel's
    * events carry it as their `call_id` / `sip_call_id`, since no single dialog
    * is the call yet; from `DialAnswered` on they carry the winning leg's own.
@@ -428,6 +421,11 @@ export interface OriginatedGroup {
   totalTimeout?: number;
   /** One entry per phone INVITE built so far (a sequential group adds more as it hunts). */
   branches: DialBranchPayload[];
+}
+
+function text(result: Record<string, unknown> | null, name: string): string | undefined {
+  const value = result?.[name];
+  return typeof value === "string" ? value : undefined;
 }
 
 export function originateArgs(
@@ -940,7 +938,10 @@ export class Call {
     readonly sipCallId: string | null,
     /** The application this call was handed to. */
     readonly app: string | null,
-    /** The `StasisStart` payload (full SIP context), or the `resync` snapshot. */
+    /**
+     * The `StasisStart` payload (full SIP context), the `resync` snapshot, or
+     * the `originate` reply for a call this client placed.
+     */
     readonly payload: unknown,
     /** True when this call came from a `resync` re-attach after a reconnect. */
     readonly reattached: boolean,
@@ -1745,6 +1746,27 @@ class SipFacade {
     this.dispatch(call);
   }
 
+  /**
+   * Open the event queue of a call this client is placing, before its
+   * `originate` goes out: siphon sends no `StasisStart` for it, and its first
+   * event can overtake the reply. `null` when the channel is already live here,
+   * which must not be taken over.
+   */
+  openChannel(channel: string): AsyncQueue<CallEvent> | null {
+    if (this.channels.has(channel)) {
+      return null;
+    }
+    const queue = new AsyncQueue<CallEvent>();
+    this.channels.set(channel, queue);
+    return queue;
+  }
+
+  /** Close a channel {@link SipFacade.openChannel} opened for a refused originate. */
+  closeChannel(channel: string): void {
+    this.channels.get(channel)?.close();
+    this.channels.delete(channel);
+  }
+
   private route(channel: string, event: CallEvent): void {
     this.channels.get(channel)?.push(event);
   }
@@ -1852,8 +1874,14 @@ export class SipClient {
    *
    * The one verb that *creates* a channel rather than addressing one, which is
    * why it lives here and not on {@link Call}. It resolves as soon as the
-   * INVITE is on the wire — the call is `calling`, and the answer, failure or
-   * timeout arrives later as an event on the channel.
+   * INVITE is on the wire — the call is `calling` — to the {@link Call} it
+   * placed: the answer, failure or timeout arrives on {@link Call.nextEvent},
+   * exactly as a handed-over call's does, and `hangup` CANCELs or BYEs it.
+   *
+   * siphon sends no `StasisStart` for a channel its controller created, so the
+   * channel is opened here before the command goes out (a fast 180 can
+   * overtake the reply). An id still live on this client rejects with
+   * `code === "conflict"` before anything is sent.
    *
    * ```ts
    * const call = await client.originate(
@@ -1869,24 +1897,9 @@ export class SipClient {
     to: string,
     media: OriginateMedia,
     options?: OriginateOptions,
-  ): Promise<Originated> {
-    const result = (await this.client.command(
-      MODULE_SIP,
-      "originate",
-      null,
-      originateArgs(channel, to, media, options),
-    )) as Record<string, unknown> | null;
-    const text = (name: string): string | undefined => {
-      const value = result?.[name];
-      return typeof value === "string" ? value : undefined;
-    };
-    return {
-      // The server echoes the id back; fall back to the one we asked for
-      // rather than returning an empty channel a caller cannot address.
-      channel: text("channel") ?? channel,
-      callId: text("call_id"),
-      sipCallId: text("sip_call_id"),
-    };
+  ): Promise<Call> {
+    const { result, queue } = await this.place(channel, originateArgs(channel, to, media, options));
+    return this.placedCall(channel, text(result, "call_id"), text(result, "sip_call_id"), result, queue);
   }
 
   /**
@@ -1928,28 +1941,64 @@ export class SipClient {
     options?: OriginateOptions,
     ring?: OriginateRing,
   ): Promise<OriginatedGroup> {
-    const result = (await this.client.command(
-      MODULE_SIP,
-      "originate",
-      null,
+    const { result, queue } = await this.place(
+      channel,
       originateAorArgs(channel, aor, media, options, ring),
-    )) as Record<string, unknown> | null;
-    const text = (name: string): string | undefined => {
-      const value = result?.[name];
-      return typeof value === "string" ? value : undefined;
-    };
-    const count = (name: string): number | undefined => {
-      const value = result?.[name];
-      return typeof value === "number" ? value : undefined;
-    };
+    );
+    const groupId = text(result, "group_id");
+    const totalTimeout = result?.total_timeout;
     return {
-      channel: text("channel") ?? channel,
-      groupId: text("group_id"),
-      aor: text("aor"),
-      strategy: text("strategy"),
-      totalTimeout: count("total_timeout"),
+      // The server echoes the id back; fall back to the one we asked for
+      // rather than returning an empty channel a caller cannot address.
+      channel: text(result, "channel") ?? channel,
+      // Until a phone answers, the group stands in for the call, as its events say.
+      call: this.placedCall(channel, groupId, groupId, result, queue),
+      groupId,
+      aor: text(result, "aor"),
+      strategy: text(result, "strategy"),
+      totalTimeout: typeof totalTimeout === "number" ? totalTimeout : undefined,
       branches: branchList(result?.branches) ?? [],
     };
+  }
+
+  /** Open `channel`, send the originate, and close it again if the server refuses. */
+  private async place(
+    channel: string,
+    args: Record<string, unknown>,
+  ): Promise<{ result: Record<string, unknown> | null; queue: AsyncQueue<CallEvent> }> {
+    const queue = this.facade.openChannel(channel);
+    if (queue === null) {
+      throw ControlError.command("conflict", `channel ${channel} is already live on this client`);
+    }
+    try {
+      const result = (await this.client.command(MODULE_SIP, "originate", null, args)) as Record<
+        string,
+        unknown
+      > | null;
+      return { result, queue };
+    } catch (error) {
+      this.facade.closeChannel(channel);
+      throw error;
+    }
+  }
+
+  private placedCall(
+    channel: string,
+    callId: string | undefined,
+    sipCallId: string | undefined,
+    reply: unknown,
+    queue: AsyncQueue<CallEvent>,
+  ): Call {
+    return new Call(
+      this.client.commander(),
+      channel,
+      callId ?? null,
+      sipCallId ?? null,
+      null,
+      reply,
+      false,
+      queue,
+    );
   }
 
   /** Send a raw command on any module (the generic escape hatch). */
