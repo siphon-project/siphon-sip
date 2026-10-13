@@ -534,7 +534,7 @@ pub struct Call {
 }
 
 impl Call {
-    fn from_event(
+    pub(crate) fn from_event(
         commander: Arc<dyn CommandTransport>,
         frame: &EventFrame,
         events: mpsc::UnboundedReceiver<CallEvent>,
@@ -569,30 +569,6 @@ impl Call {
                 app: None,
                 payload,
                 reattached: true,
-                events: AsyncMutex::new(events),
-            }),
-        }
-    }
-
-    /// A call this client placed with `originate`: the ids from the reply, which
-    /// stands in for the `StasisStart` payload siphon never sends for it.
-    pub(crate) fn placed(
-        commander: Arc<dyn CommandTransport>,
-        channel: &str,
-        call_id: Option<String>,
-        sip_call_id: Option<String>,
-        reply: serde_json::Value,
-        events: mpsc::UnboundedReceiver<CallEvent>,
-    ) -> Self {
-        Self {
-            inner: Arc::new(CallInner {
-                commander,
-                channel_id: channel.to_string(),
-                call_id,
-                sip_call_id,
-                app: None,
-                payload: reply,
-                reattached: false,
                 events: AsyncMutex::new(events),
             }),
         }
@@ -1281,10 +1257,8 @@ impl SipFacade {
         self.dispatch(call);
     }
 
-    /// Open the event queue of a call this client is placing, before its
-    /// `originate` goes out: siphon sends no `StasisStart` for it, and its first
-    /// event can overtake the reply. `None` when the channel is already live
-    /// here, which must not be taken over.
+    /// Open a placed call's event queue before its `originate` goes out (no
+    /// `StasisStart` comes for it; a 1xx can beat the reply). `None` if live.
     pub(crate) fn open_channel(&self, channel: &str) -> Option<mpsc::UnboundedReceiver<CallEvent>> {
         let mut channels = lock(&self.channels);
         if channels.contains_key(channel) {
@@ -1295,8 +1269,7 @@ impl SipFacade {
         Some(event_rx)
     }
 
-    /// Close a channel [`SipFacade::open_channel`] opened for an originate the
-    /// server refused.
+    /// Close a channel opened for an originate the server refused.
     pub(crate) fn close_channel(&self, channel: &str) {
         lock(&self.channels).remove(channel);
     }

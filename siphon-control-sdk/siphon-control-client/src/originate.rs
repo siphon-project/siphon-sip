@@ -10,12 +10,13 @@ use std::sync::Arc;
 
 use siphon_control_proto::sip::{DialBranchPayload, SipVerb};
 use siphon_control_proto::verbs::MODULE_SIP;
-use siphon_control_proto::ControlErrorCode;
+use siphon_control_proto::{ControlErrorCode, EventFrame, FrameType};
+use tokio::sync::mpsc;
 
 use crate::dial::{branches, DialStrategy};
 use crate::error::ControlError;
 use crate::session::CommandTransport;
-use crate::sip::{headers_to_json, Call, SipClient, SipFacade};
+use crate::sip::{headers_to_json, Call, CallEvent, SipClient, SipFacade};
 
 /// The media plan for [`SipClient::originate`] — what the outbound INVITE
 /// offers.
@@ -511,8 +512,8 @@ pub(crate) async fn place_on(
         .open_channel(channel)
         .ok_or_else(|| channel_in_use(channel))?;
     match originate_on(transport, channel, to, media, options).await {
-        Ok(originated) => Ok(Call::placed(
-            Arc::clone(transport),
+        Ok(originated) => Ok(placed_call(
+            transport,
             channel,
             originated.call_id,
             originated.sip_call_id,
@@ -548,8 +549,8 @@ pub(crate) async fn place_aor_on(
     };
     // Until a phone answers, the group stands in for the call, as its events say.
     let group_id = string(&result, "group_id");
-    let call = Call::placed(
-        Arc::clone(transport),
+    let call = placed_call(
+        transport,
         channel,
         group_id.clone(),
         group_id.clone(),
@@ -565,6 +566,28 @@ pub(crate) async fn place_aor_on(
         total_timeout_secs: result.get("total_timeout").and_then(|value| value.as_u64()),
         branches: branches(&result),
     })
+}
+
+/// The [`Call`] for a channel this client placed: the ids from the reply, which
+/// stands in for the `StasisStart` payload siphon never sends for it.
+fn placed_call(
+    transport: &Arc<dyn CommandTransport>,
+    channel: &str,
+    call_id: Option<String>,
+    sip_call_id: Option<String>,
+    reply: serde_json::Value,
+    events: mpsc::UnboundedReceiver<CallEvent>,
+) -> Call {
+    let frame = EventFrame {
+        frame_type: FrameType::Event,
+        event: SipVerb::Originate.as_str().to_string(),
+        channel: Some(channel.to_string()),
+        app: None,
+        call_id,
+        sip_call_id,
+        payload: reply,
+    };
+    Call::from_event(Arc::clone(transport), &frame, events, false)
 }
 
 fn channel_in_use(channel: &str) -> ControlError {
@@ -655,7 +678,6 @@ mod tests {
     use crate::client::ClientEvent;
     use futures_util::future::BoxFuture;
     use siphon_control_proto::sip::SipEvent;
-    use siphon_control_proto::EventFrame;
     use std::sync::Mutex;
 
     /// One command as sent: module, verb, target, args.
