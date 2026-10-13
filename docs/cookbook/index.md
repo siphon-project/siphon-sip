@@ -37,6 +37,7 @@ available from [Real Time Telecom](../support.md).
 | [Least-Cost Routing](least-cost-routing.md) | Carrier LCR driven by an external API | `lcr.route`, `call.route` sequential failover, gateway pools, CDR |
 | [SBC (B2BUA)](sbc.md) | A topology-hiding SBC with media | `@b2bua.*`, `call.dial`/`fork`, **header policies**, RTPEngine |
 | [Number normalization](number-normalization.md) | E.164 identity rewriting at a trunk↔IMS edge | `numbers.parse`, `rewrite_identities`, **number policies**, diversion family |
+| [Conference focus](conference-focus.md) | An RFC 4579 focus mixing N parties in the media engine | `rtpengine.conference_join`/`leave`/`route`/`bridge`/`play`, `@rtpengine.on_active_speaker` |
 | [Media & RTP profiles](media-rtp.md) | SRTP↔RTP, WebRTC, transcoding, hold | `rtpengine.offer`/`answer`, profiles, the `sdp` namespace |
 | [Online charging (OCS)](online-charging-ocs.md) | Prepaid voice + SMS/RCS over Diameter Ro | `ro:` config, `diameter.ro_ccr_*`, SCUR reserve/re-auth/disconnect, IEC, CGRateS |
 | [Hardening & security](security.md) | A locked-down edge | rate-limit, scanner/auth bans, TLS/mTLS, STIR/SHAKEN, IPsec |

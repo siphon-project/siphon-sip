@@ -11,20 +11,21 @@ use siphon_rtp_proto::{
 use tracing::debug;
 
 use super::super::events::{
-    BeepDetectedEvent, CallLegSummary, CallSummary, DtmfEvent, MediaLeg, MediaStartedEvent,
-    PlayEndReason as SiphonPlayEndReason, PlayFinishedEvent, RecordingFinished, RtpEngineEvent,
-    TextEvent, TextStreamStats, WsBridgeEndReason, WsBridgeEnded, WsBridgeStarted, WsTeeEndReason,
-    WsTeeEnded, WsTeeStarted, X3EndedEvent, X3LossEvent, X3StartedEvent,
+    ActiveSpeakerEvent, BeepDetectedEvent, CallLegSummary, CallSummary, DtmfEvent, MediaLeg,
+    MediaStartedEvent, PlayEndReason as SiphonPlayEndReason, PlayFinishedEvent, RecordingFinished,
+    RtpEngineEvent, TextEvent, TextStreamStats, WsBridgeEndReason, WsBridgeEnded, WsBridgeStarted,
+    WsTeeEndReason, WsTeeEnded, WsTeeStarted, X3EndedEvent, X3LossEvent, X3StartedEvent,
 };
 use super::ws_tee_direction_from_proto;
 
 /// Convert a proto [`Event`] to siphon's [`RtpEngineEvent`].
 ///
 /// `Event::Dtmf` is a field-for-field twin of [`DtmfEvent`]; `MediaTimeout`
-/// maps to the dedicated variant. The conference/quality events
-/// (`ActiveSpeaker`, `CallQuality`) are not modelled by a typed handler yet, so
-/// they surface through `Unknown` (logged, not dropped) carrying their stream
-/// identifiers — a typed Python handler is a follow-up.
+/// maps to the dedicated variant. A conference room's events are keyed by the
+/// room: its DTMF already arrives with the room id as the call-id, and a room
+/// playback's end is given the same shape. `CallQuality` is not modelled by a
+/// typed handler yet, so it surfaces through `Unknown` (logged, not dropped)
+/// carrying its stream identifier — a typed Python handler is a follow-up.
 pub(super) fn convert_event(event: Event) -> RtpEngineEvent {
     match event {
         Event::Dtmf {
@@ -108,11 +109,10 @@ pub(super) fn convert_event(event: Event) -> RtpEngineEvent {
         Event::ActiveSpeaker {
             conference_id,
             from_tag,
-        } => RtpEngineEvent::Unknown {
-            event: "active_speaker".to_string(),
-            call_id: Some(conference_id),
+        } => RtpEngineEvent::ActiveSpeaker(ActiveSpeakerEvent {
+            conference_id,
             from_tag,
-        },
+        }),
         Event::CallQuality {
             conference_id,
             call_id,
@@ -125,16 +125,17 @@ pub(super) fn convert_event(event: Event) -> RtpEngineEvent {
         },
         Event::PlayFinished {
             call_id,
+            conference_id,
             from_tag,
             to_tag,
             play_id,
             reason,
             played_ms,
-            // Room playback (`conference_id`) has no siphon-sip concept to map
-            // onto yet — it lands with the conference verbs, not here.
-            ..
         } => RtpEngineEvent::PlayFinished(PlayFinishedEvent {
-            call_id,
+            // A room playback names its room and leaves the call-id empty.
+            // Keyed by the room, as the room's DTMF already is, so one
+            // `@rtpengine.on_play_finished(call_id=room)` filter serves both.
+            call_id: conference_id.unwrap_or(call_id),
             from_tag,
             to_tag,
             play_id,

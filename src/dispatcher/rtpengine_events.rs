@@ -65,6 +65,9 @@ pub fn spawn_rtpengine_events(
                     crate::rtpengine::events::RtpEngineEvent::MediaStarted(started) => {
                         on_media_started(&state_for_events, started).await;
                     }
+                    crate::rtpengine::events::RtpEngineEvent::ActiveSpeaker(speaker) => {
+                        on_active_speaker(&state_for_events, speaker).await;
+                    }
                     crate::rtpengine::events::RtpEngineEvent::Unknown {
                         event, call_id, ..
                     } => {
@@ -144,6 +147,58 @@ async fn run_dtmf_handlers(
                         tracing::error!(
                             error = %crate::script::error_report::describe(python, &error),
                             "rtpengine.on_dtmf handler failed"
+                        );
+                    }
+                }
+            }
+        });
+    })
+    .await;
+}
+
+/// The `@rtpengine.on_active_speaker` handlers for a room whose floor changed,
+/// handed the room and the seat now speaking (`None` when the floor went
+/// silent).
+async fn on_active_speaker(
+    state: &Arc<DispatcherState>,
+    speaker: crate::rtpengine::events::ActiveSpeakerEvent,
+) {
+    tracing::debug!(
+        conference_id = %speaker.conference_id,
+        from_tag = speaker.from_tag.as_deref().unwrap_or("-"),
+        "media engine reported a conference's active speaker"
+    );
+    let engine_state = state.engine.state();
+    let handlers = engine_state.active_speaker_handlers(&speaker.conference_id);
+    if handlers.is_empty() {
+        return;
+    }
+    let state_ref = Arc::clone(state);
+    run_event_handler("rtpengine.on_active_speaker", move || {
+        let engine_state = state_ref.engine.state();
+        let handlers = engine_state.active_speaker_handlers(&speaker.conference_id);
+        pyo3::Python::attach(|python| {
+            for handler in handlers {
+                let callable = handler.callable.bind(python);
+                let result =
+                    callable.call1((speaker.conference_id.as_str(), speaker.from_tag.as_deref()));
+                match result {
+                    Ok(ret) => {
+                        if handler.is_async {
+                            if let Err(error) = run_coroutine(python, &ret) {
+                                tracing::error!(
+                                    error = %crate::script::error_report::describe(python, &error),
+                                    conference_id = %speaker.conference_id,
+                                    "async rtpengine.on_active_speaker handler error"
+                                );
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        tracing::error!(
+                            error = %crate::script::error_report::describe(python, &error),
+                            conference_id = %speaker.conference_id,
+                            "rtpengine.on_active_speaker handler failed"
                         );
                     }
                 }

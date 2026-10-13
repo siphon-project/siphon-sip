@@ -469,3 +469,206 @@ async fn smoke_test_against_real_siphon_rtp() {
     assert!(!answered.is_empty());
     client.delete("smoke-native", "tag-a").await.unwrap();
 }
+
+/// G.711 µ-law (ITU-T G.711) of one linear sample.
+fn mu_law(sample: i16) -> u8 {
+    const BIAS: i32 = 0x84;
+    const CLIP: i32 = 32_635;
+    let sign = if sample < 0 { 0x80 } else { 0 };
+    let magnitude = (i32::from(sample).abs()).min(CLIP) + BIAS;
+    let exponent = (7 - (magnitude.leading_zeros() as i32 - 17)).clamp(0, 7);
+    let mantissa = (magnitude >> (exponent + 3)) & 0x0F;
+    !(sign | ((exponent as u8) << 4) | mantissa as u8)
+}
+
+/// One 20 ms PCMU packet: an RTP header (RFC 3550 §5.1) and 160 samples.
+fn pcmu_packet(ssrc: u32, sequence: u16, payload: &[u8]) -> Vec<u8> {
+    let timestamp = u32::from(sequence).wrapping_mul(160);
+    let mut packet = vec![0x80, 0x00];
+    packet.extend_from_slice(&sequence.to_be_bytes());
+    packet.extend_from_slice(&timestamp.to_be_bytes());
+    packet.extend_from_slice(&ssrc.to_be_bytes());
+    packet.extend_from_slice(payload);
+    packet
+}
+
+/// The engine's media address in an answer SDP: `c=` and `m=audio`'s port.
+fn answered_address(sdp: &str) -> SocketAddr {
+    let host = sdp
+        .lines()
+        .find_map(|line| line.strip_prefix("c=IN IP4 "))
+        .expect("a c= line");
+    let port = sdp
+        .lines()
+        .find_map(|line| line.strip_prefix("m=audio "))
+        .and_then(|rest| rest.split(' ').next())
+        .expect("an m=audio line");
+    format!("{}:{}", host.trim(), port)
+        .parse()
+        .expect("an address")
+}
+
+/// Two seats joined to one room of a REAL engine through the media backend
+/// the script API drives: the engine accepts both, the room carries one
+/// seat's tone to the other, `delete` of a seated call leaves the room, and
+/// the room is gone with its last seat. Also pins the engine's refusal texts
+/// the script API maps (a codec it cannot decode to `ValueError`, `no such
+/// conference participant` for a seat already released).
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a built siphon-rtp binary via SIPHON_RTP_BIN"]
+async fn two_seats_in_a_real_siphon_rtp_room_hear_each_other() {
+    use siphon::rtpengine::backend::{ConferenceRole, ConferenceSeat};
+    use tokio::net::UdpSocket;
+
+    let control_addr = "127.0.0.1:18081";
+    let Some(_engine) = spawn_engine(&["--control", control_addr]) else {
+        eprintln!("SIPHON_RTP_BIN not set — skipping the siphon-rtp conference test");
+        return;
+    };
+    let (event_tx, _event_rx) = mpsc::channel(64);
+    let set = SiphonRtpClientSet::new(
+        vec![(control_addr.parse().unwrap(), 2000, 1)],
+        None,
+        5_000,
+        event_tx,
+    )
+    .unwrap();
+    assert!(
+        wait_until(|| async { set.ping().await.is_ok() }).await,
+        "siphon-rtp control listener did not become ready"
+    );
+    let backend = MediaBackend::SiphonRtp(set);
+    let room = "real-room-1";
+    let offer = |port: u16, format: &str| {
+        format!(
+            "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n\
+             m=audio {port} RTP/AVP {format}\r\na=sendrecv\r\n"
+        )
+    };
+    let seat = |from_tag: &str| ConferenceSeat {
+        conference_id: room.to_string(),
+        from_tag: from_tag.to_string(),
+    };
+
+    let alice = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let bob = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let alice_seat = backend
+        .conference_join(
+            "alice@conference.example.com",
+            seat("alice"),
+            &offer(
+                alice.local_addr().unwrap().port(),
+                "0\r\na=rtpmap:0 PCMU/8000",
+            ),
+            ConferenceRole::Talker,
+            &NgFlags::default(),
+        )
+        .await
+        .expect("the engine seats alice");
+    let bob_seat = backend
+        .conference_join(
+            "bob@conference.example.com",
+            seat("bob"),
+            &offer(
+                bob.local_addr().unwrap().port(),
+                "0\r\na=rtpmap:0 PCMU/8000",
+            ),
+            ConferenceRole::Talker,
+            &NgFlags::default(),
+        )
+        .await
+        .expect("the engine seats bob");
+    let (alice_engine, bob_engine) = (answered_address(&alice_seat), answered_address(&bob_seat));
+    assert_ne!(alice_engine, bob_engine, "one engine endpoint per seat");
+
+    // Alice talks (a 1 kHz tone, loud enough for the room's VAD); Bob sends
+    // silence, so each seat's source is the one its SDP signalled.
+    let tone: Vec<u8> = (0..160)
+        .map(|index| {
+            let phase = 2.0 * std::f64::consts::PI * 1000.0 * f64::from(index) / 8000.0;
+            mu_law((phase.sin() * 12_000.0) as i16)
+        })
+        .collect();
+    let silence = vec![0xFFu8; 160];
+    let mut heard = Vec::new();
+    let mut buffer = [0u8; 2048];
+    for sequence in 0..100u16 {
+        alice
+            .send_to(&pcmu_packet(0x0A11_CE00, sequence, &tone), alice_engine)
+            .await
+            .unwrap();
+        bob.send_to(&pcmu_packet(0x0B0B_0000, sequence, &silence), bob_engine)
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(20);
+        while let Ok(Ok((read, from))) =
+            tokio::time::timeout_at(deadline, bob.recv_from(&mut buffer)).await
+        {
+            if from == bob_engine && read > 12 {
+                heard.extend_from_slice(&buffer[12..read]);
+            }
+        }
+    }
+    assert!(!heard.is_empty(), "bob's seat was sent nothing by the room");
+    let audible = heard
+        .iter()
+        .filter(|byte| !matches!(byte, 0xFF | 0x7F | 0xFE | 0x7E))
+        .count();
+    assert!(
+        audible * 4 > heard.len(),
+        "bob heard the room, but not alice's tone in it ({audible} of {} samples above silence)",
+        heard.len()
+    );
+
+    // A participant whose codec the room cannot mix is refused, with the text
+    // the script API turns into a ValueError (AMR needs an `amr` build).
+    let carol = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let refused = backend
+        .conference_join(
+            "carol@conference.example.com",
+            seat("carol"),
+            &offer(
+                carol.local_addr().unwrap().port(),
+                "97\r\na=rtpmap:97 AMR-WB/16000",
+            ),
+            ConferenceRole::Talker,
+            &NgFlags::default(),
+        )
+        .await;
+    assert!(
+        matches!(&refused, Err(siphon::rtpengine::RtpEngineError::EngineError(reason)) if reason.contains("conference_join: decoder")),
+        "{refused:?}"
+    );
+
+    // `delete` of a seated call leaves its room, and the room ends with its
+    // last seat.
+    backend
+        .delete("alice@conference.example.com", "alice")
+        .await
+        .expect("alice leaves");
+    backend
+        .delete("bob@conference.example.com", "bob")
+        .await
+        .expect("bob leaves");
+    let unseated = backend
+        .conference_leave("bob@conference.example.com", &seat("bob"))
+        .await;
+    assert!(
+        matches!(&unseated, Err(siphon::rtpengine::RtpEngineError::EngineError(reason)) if reason.contains("no such conference participant")),
+        "{unseated:?}"
+    );
+    let gone = backend
+        .conference_play(
+            room,
+            &siphon::rtpengine::client::PlayMediaSource::Tone("ringback_eu".into()),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+    assert!(
+        matches!(&gone, Err(siphon::rtpengine::RtpEngineError::EngineError(reason)) if reason.contains("unknown conference")),
+        "{gone:?}"
+    );
+}

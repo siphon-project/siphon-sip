@@ -239,6 +239,20 @@ impl ScriptState {
             .collect()
     }
 
+    /// Return all `RtpEngineOnActiveSpeaker` handlers whose optional room
+    /// filter matches `conference_id`.  A `None` filter matches every room.
+    pub fn active_speaker_handlers(&self, conference_id: &str) -> Vec<&HandlerEntry> {
+        self.handlers
+            .iter()
+            .filter(|h| match &h.kind {
+                HandlerKind::RtpEngineOnActiveSpeaker {
+                    conference_id: filter,
+                } => filter.as_deref().is_none_or(|v| v == conference_id),
+                _ => false,
+            })
+            .collect()
+    }
+
     /// Return all `RtpEngineOnBeep` handlers whose optional call-id/from-tag
     /// filters match the event.  `None` filters match everything.
     pub fn beep_handlers(&self, call_id: &str, from_tag: &str) -> Vec<&HandlerEntry> {

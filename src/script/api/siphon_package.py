@@ -755,6 +755,29 @@ class _RtpEngineNamespace:
     async def set_play_gain(self, target, play_id, gain_decibels, to_tag=None):
         raise NotImplementedError("rtpengine.set_play_gain() not available — no media.rtpengine in config")
 
+    async def conference_join(self, conference_id, call, role="talker", target=None,
+                              whisper_target=None, profile=None):
+        raise NotImplementedError("rtpengine.conference_join() not available — no media.rtpengine in config")
+
+    async def conference_leave(self, conference_id, call):
+        raise NotImplementedError("rtpengine.conference_leave() not available — no media.rtpengine in config")
+
+    async def conference_route(self, conference_id, call, role, target=None, whisper_target=None):
+        raise NotImplementedError("rtpengine.conference_route() not available — no media.rtpengine in config")
+
+    async def conference_bridge(self, conference_a, conference_b, direction="both"):
+        raise NotImplementedError("rtpengine.conference_bridge() not available — no media.rtpengine in config")
+
+    async def conference_play(self, conference_id, file=None, blob=None, tone=None, repeat=None,
+                              start_ms=None, duration_ms=None, gain_decibels=None):
+        raise NotImplementedError("rtpengine.conference_play() not available — no media.rtpengine in config")
+
+    async def conference_stop_play(self, conference_id, play_id=None):
+        raise NotImplementedError("rtpengine.conference_stop_play() not available — no media.rtpengine in config")
+
+    async def conference_set_play_gain(self, conference_id, play_id, gain_decibels):
+        raise NotImplementedError("rtpengine.conference_set_play_gain() not available — no media.rtpengine in config")
+
     def on_dtmf(self, func_or_none=None, *, call_id=None, from_tag=None):
         """Register a handler for inbound DTMF events from rtpengine.
 
@@ -889,6 +912,33 @@ class _RtpEngineNamespace:
             is_async = _asyncio.iscoroutinefunction(fn)
             metadata = {"call_id": call_id, "from_tag": from_tag}
             _registry.register("rtpengine.on_media_started", None, fn, is_async, metadata)
+            return fn
+        if func_or_none is not None:
+            return decorator(func_or_none)
+        return decorator
+
+    def on_active_speaker(self, func_or_none=None, *, conference_id=None):
+        """Register a handler for a conference room's active-speaker changes.
+
+        Fires when the loudest speaking seat of a room changes, with the room
+        and that seat's from-tag, and with ``from_tag=None`` when the floor goes
+        silent. siphon-rtp backend only.
+
+        Usage:
+            @rtpengine.on_active_speaker
+            def handle_any(conference_id, from_tag):
+                ...
+
+            @rtpengine.on_active_speaker(conference_id="room-1")
+            def handle_one_room(conference_id, from_tag):
+                ...
+        """
+        def decorator(fn):
+            is_async = _asyncio.iscoroutinefunction(fn)
+            # The room filter rides under `call_id`, where every media-event
+            # hook stores its id filter.
+            metadata = {"call_id": conference_id, "from_tag": None}
+            _registry.register("rtpengine.on_active_speaker", None, fn, is_async, metadata)
             return fn
         if func_or_none is not None:
             return decorator(func_or_none)

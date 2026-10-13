@@ -51,7 +51,9 @@ backends; only the transport underneath changes.
 !!! warning "siphon-rtp is experimental"
     The siphon-rtp engine is pre-release, so this backend is **experimental** —
     use the default `rtpengine` backend in production until it stabilises.
-    SIPREC/MPTY subscriptions are not yet implemented on siphon-rtp.
+    SIPREC/MPTY subscriptions are not yet implemented on siphon-rtp; for an
+    N-party call, seat the parties in one of its mixing rooms instead (see
+    [A conference focus with mixing](conference-focus.md)).
 
 See [Media engines: rtpengine vs siphon-rtp](../media-engines.md) for the full
 comparison, the `media.siphon_rtp` config, and how to run and operate each engine.
@@ -396,6 +398,8 @@ s.apply(request)
 The `rtpengine` namespace also drives announcements and tones (`play_media`,
 `play_dtmf`), gating (`silence_media` / `block_media`), DTMF events (`@rtpengine.on_dtmf`),
 and conference/MPTY subscriptions — useful for IVR, MMTel announcements, and recording.
+On siphon-rtp, `conference_join` seats a call in one of the engine's mixing rooms; see
+[A conference focus with mixing](conference-focus.md).
 
 ### React to a dead media path
 

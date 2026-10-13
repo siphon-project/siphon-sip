@@ -3842,6 +3842,21 @@ class MockRtpEngine:
         self._beep_handlers: list[dict[str, Any]] = []
         self._media_started_handlers: list[dict[str, Any]] = []
         self._play_overlay_id: Optional[int] = 1
+        self.conferences: dict[str, dict[str, dict[str, Any]]] = {}
+        """Live rooms: ``{conference_id: {from_tag: seat}}``.
+
+        Each seat is ``{"call_id", "role", "target", "whisper_target",
+        "profile"}``. A room appears on its first :meth:`conference_join` and
+        goes with its last :meth:`conference_leave`, as on the engine.
+        """
+        self.conference_bridges: list[tuple[str, str, str]] = []
+        """``(conference_a, conference_b, direction)`` per live bridge."""
+        self.conference_plays: dict[int, dict[str, Any]] = {}
+        """Running room playbacks by ``play_id``."""
+        self._conference_play_id = 1
+        self._conference_join_sdp: str = "v=0\r\nm=audio 40002 RTP/AVP 0 101\r\na=sendrecv\r\n"
+        self._conference_join_no_codec: bool = False
+        self._active_speaker_handlers: list[dict[str, Any]] = []
         self.media_overrides: list[tuple[str, dict[str, Any]]] = []
         """``(operation, overrides)`` per offer/answer/answer_local.
 
@@ -4243,12 +4258,20 @@ class MockRtpEngine:
     async def delete(self, request: Any) -> bool:
         """Send ``delete`` command to tear down media session.
 
+        On a call seated in a conference room (:meth:`conference_join`) this
+        leaves the room.
+
         Args:
             request: Request or Call object (uses Call-ID + From-tag).
 
         Returns:
             ``True`` on success.
         """
+        call_id, _ = _resolve_media_target(request)
+        seated = self.conference_seat(call_id) if call_id else None
+        if seated is not None:
+            self._leave_seat(*seated)
+            self.operations.append(("conference_leave", seated[0]))
         self.operations.append(("delete", None))
         return True
 
@@ -4508,6 +4531,411 @@ class MockRtpEngine:
             "to_tag": to_tag,
         })
         return True
+
+    # -- Conference rooms (siphon-rtp's mixer) ------------------------------
+
+    _CONFERENCE_ROLES = ("talker", "listener", "muted", "whisper", "monitor")
+
+    @staticmethod
+    def _conference_role(
+        role: str, target: Optional[str], whisper_target: Optional[str]
+    ) -> dict[str, Any]:
+        """Validate ``role`` and its targets the way the runtime does."""
+        if role not in MockRtpEngine._CONFERENCE_ROLES:
+            raise ValueError(
+                f"role must be one of {', '.join(MockRtpEngine._CONFERENCE_ROLES)}, got {role!r}"
+            )
+        if role in ("whisper", "monitor") and target is None:
+            raise ValueError(f"role {role!r} needs target= (the seat's from-tag it applies to)")
+        if role in ("talker", "listener", "muted") and (target or whisper_target):
+            raise ValueError(f"role {role!r} takes no target= or whisper_target=")
+        if role == "whisper" and whisper_target is not None:
+            raise ValueError("role 'whisper' takes no whisper_target=")
+        return {"role": role, "target": target, "whisper_target": whisper_target}
+
+    @staticmethod
+    def _conference_seat_of(target: Any) -> tuple[str, str]:
+        """``(call_id, from_tag)`` of the seat a verb names.
+
+        A ``Request`` carries its From-tag; a mock ``Call`` carries one only in
+        a ``From`` header passed to it, so without one the mock seats the call
+        under its Call-ID instead. A ``(call_id, from_tag)`` pair names the
+        seat directly; a bare string names none.
+        """
+        if isinstance(target, str):
+            raise TypeError(
+                "a conference seat is addressed by a Request/Call or a (call_id, from_tag) pair"
+            )
+        call_id, from_tag = _resolve_media_target(target)
+        if not from_tag and hasattr(target, "header"):
+            match = re.search(r";\s*tag=([^;>\s]+)", target.header("From") or "")
+            from_tag = match.group(1) if match else None
+        return call_id or "", from_tag or call_id or ""
+
+    def _conference_room(self, conference_id: str, verb: str) -> dict[str, dict[str, Any]]:
+        if not conference_id:
+            raise ValueError(f"rtpengine.{verb}(conference_id) is empty")
+        room = self.conferences.get(conference_id)
+        if room is None:
+            raise RuntimeError(f"rtpengine.{verb} failed: unknown conference: {conference_id}")
+        return room
+
+    def conference_seat(self, call_id: str) -> Optional[tuple[str, str]]:
+        """``(conference_id, from_tag)`` of the seat ``call_id`` holds, or
+        ``None`` (test helper)."""
+        for conference_id, room in self.conferences.items():
+            for from_tag, seat in room.items():
+                if seat["call_id"] == call_id:
+                    return conference_id, from_tag
+        return None
+
+    def _leave_seat(self, conference_id: str, from_tag: str) -> None:
+        room = self.conferences.get(conference_id, {})
+        room.pop(from_tag, None)
+        if not room:
+            # The room dies with its last seat, and its bridges and playbacks
+            # with it.
+            self.conferences.pop(conference_id, None)
+            self.conference_bridges = [
+                bridge for bridge in self.conference_bridges
+                if conference_id not in (bridge[0], bridge[1])
+            ]
+            self.conference_plays = {
+                play_id: play for play_id, play in self.conference_plays.items()
+                if play["conference_id"] != conference_id
+            }
+
+    async def conference_join(
+        self,
+        conference_id: str,
+        call: Any,
+        role: str = "talker",
+        target: Optional[str] = None,
+        whisper_target: Optional[str] = None,
+        profile: Optional[str] = None,
+    ) -> str:
+        """Seat a call in a conference room and resolve to the answer SDP for
+        the script's own 2xx.
+
+        The media engine mixes: every seat hears the room minus itself. The
+        first join of a ``conference_id`` creates the room and the last
+        :meth:`conference_leave` ends it, so the script owns the id (a
+        conference factory URI, RFC 4579 section 5.2, mints one per room).
+        The engine answers the participant's offer with its own endpoint and
+        the participant's codec, as :meth:`answer_local` does for a call it
+        answers alone.
+
+        A seat is the participant's From-tag. That is the name
+        :meth:`on_active_speaker` and a room's :meth:`on_dtmf` hand back (a
+        room's DTMF arrives with the room id as ``call_id``), so a roster keyed
+        by From-tag reads them directly.
+
+        Roles (``role=``), who hears whom:
+
+        * ``"talker"`` hears the room minus itself and is heard (default);
+        * ``"listener"`` and ``"muted"`` hear the room and are heard by no one;
+        * ``"whisper"`` is heard only by ``target`` (a seat's From-tag);
+        * ``"monitor"`` hears ``target`` alone, unknown to it, and may whisper
+          to ``whisper_target``.
+
+        Limits of the engine (siphon-rtp 0.14.0): 64 seats a room; the offer's
+        **first** audio codec is the seat's codec, and the engine must be able
+        to decode it and encode the mix back into it (AMR needs an ``amr``
+        build of the engine, G.729 a ``g729`` one, and EVS is not
+        implemented). The engine
+        does not apply a profile's codec policy, WebSocket bridge or tee,
+        recording or DSP knobs to a seat, so a profile that sets one raises
+        ``ValueError`` rather than seating the call without it. A call holds
+        one seat: a second join raises ``ValueError``; leave first.
+
+        ``rtpengine.delete(call)`` on a seated call leaves its room.
+
+        Native **siphon-rtp** backend only; the other backends raise
+        ``RuntimeError`` ("not supported by the ... media backend").
+
+        Args:
+            conference_id: The room.
+            call: The ``Call`` / ``Request`` carrying the participant's offer
+                (INVITE).
+            role: See above.
+            target: The seat a ``"whisper"`` / ``"monitor"`` role applies to.
+            whisper_target: The seat a ``"monitor"`` also whispers to.
+            profile: RTP profile name, resolved as for :meth:`answer_local`.
+
+        Returns:
+            The answer SDP as ``str``.
+
+        Raises:
+            ValueError: the engine cannot encode the room mix in the
+                participant's codec (primed in tests with
+                :meth:`set_conference_join_no_codec`), the call is already
+                seated, or ``role`` / targets do not fit.
+
+        Example::
+
+            @b2bua.on_invite
+            async def on_invite(call):
+                sdp = await rtpengine.conference_join("room-1", call)
+                call.answer(200, "OK", body=sdp, content_type="application/sdp")
+        """
+        if not conference_id:
+            raise ValueError("rtpengine.conference_join(conference_id) is empty")
+        seat_role = self._conference_role(role, target, whisper_target)
+        call_id, from_tag = self._conference_seat_of(call)
+        seated = self.conference_seat(call_id)
+        if seated is not None:
+            raise ValueError(
+                f"call {call_id} is already seated in conference {seated[0]!r}; "
+                "conference_leave it first"
+            )
+        if self._conference_join_no_codec:
+            raise ValueError("no encodable codec in offer")
+        room = self.conferences.setdefault(conference_id, {})
+        room[from_tag] = {"call_id": call_id, "profile": profile, **seat_role}
+        self.operations.append(("conference_join", conference_id))
+        self.media_calls.append({
+            "op": "conference_join",
+            "conference_id": conference_id,
+            "call_id": call_id,
+            "from_tag": from_tag,
+            "profile": profile,
+            **seat_role,
+        })
+        return self._conference_join_sdp
+
+    async def conference_leave(self, conference_id: str, call: Any) -> bool:
+        """Free a call's seat; the room ends with its last seat.
+
+        ``call`` is the ``Call`` / ``Request`` that joined, or a
+        ``(call_id, from_tag)`` pair. A seat the room does not hold raises
+        ``RuntimeError``, as the engine refuses it.
+
+        Returns:
+            ``True`` on success.
+        """
+        room = self._conference_room(conference_id, "conference_leave")
+        call_id, from_tag = self._conference_seat_of(call)
+        if from_tag not in room:
+            raise RuntimeError(
+                "rtpengine.conference_leave failed: no such conference participant"
+            )
+        self._leave_seat(conference_id, from_tag)
+        self.operations.append(("conference_leave", conference_id))
+        self.media_calls.append({
+            "op": "conference_leave",
+            "conference_id": conference_id,
+            "call_id": call_id,
+            "from_tag": from_tag,
+        })
+        return True
+
+    async def conference_route(
+        self,
+        conference_id: str,
+        call: Any,
+        role: str,
+        target: Optional[str] = None,
+        whisper_target: Optional[str] = None,
+    ) -> bool:
+        """Change who a seat hears and who hears it, live (no re-INVITE):
+        ``role``, ``target`` and ``whisper_target`` as for
+        :meth:`conference_join`. Muting a participant is
+        ``conference_route(room, call, "muted")``.
+
+        Returns:
+            ``True`` on success.
+        """
+        seat_role = self._conference_role(role, target, whisper_target)
+        room = self._conference_room(conference_id, "conference_route")
+        _, from_tag = self._conference_seat_of(call)
+        if from_tag not in room:
+            raise RuntimeError(
+                "rtpengine.conference_route failed: no such conference or participant"
+            )
+        room[from_tag].update(seat_role)
+        self.operations.append(("conference_route", role))
+        self.media_calls.append({
+            "op": "conference_route",
+            "conference_id": conference_id,
+            "from_tag": from_tag,
+            **seat_role,
+        })
+        return True
+
+    async def conference_bridge(
+        self, conference_a: str, conference_b: str, direction: str = "both"
+    ) -> bool:
+        """Link two live rooms, so one hears the other or each hears the other.
+
+        ``direction`` is ``"both"`` (default), ``"a_to_b"`` (room A's
+        participants are heard in room B) or ``"b_to_a"``. This is what
+        merging two conferences is. Both rooms run at 16 kHz while bridged,
+        and siphon-rtp has no verb to unbridge them: a bridge ends with
+        either room.
+
+        Returns:
+            ``True`` on success.
+        """
+        if direction not in ("both", "a_to_b", "b_to_a"):
+            raise ValueError(
+                f"direction must be one of both, a_to_b, b_to_a, got {direction!r}"
+            )
+        if conference_a == conference_b:
+            raise ValueError(
+                "rtpengine.conference_bridge links two rooms; both ids name the same one"
+            )
+        if conference_a not in self.conferences or conference_b not in self.conferences:
+            raise RuntimeError(
+                "rtpengine.conference_bridge failed: one or both conferences do not exist"
+            )
+        self.conference_bridges.append((conference_a, conference_b, direction))
+        self.operations.append(("conference_bridge", direction))
+        self.media_calls.append({
+            "op": "conference_bridge",
+            "conference_a": conference_a,
+            "conference_b": conference_b,
+            "direction": direction,
+        })
+        return True
+
+    async def conference_play(
+        self,
+        conference_id: str,
+        file: Optional[str] = None,
+        blob: Optional[bytes] = None,
+        tone: Optional[str] = None,
+        repeat: Any = None,
+        start_ms: Optional[int] = None,
+        duration_ms: Optional[int] = None,
+        gain_decibels: Optional[int] = None,
+    ) -> int:
+        """Play audio into a room and resolve to its ``play_id``.
+
+        Every seat hears it and nobody is mixed-minus-self against it, which
+        is what an entry tone, "this conference is being recorded" or music
+        for a lone participant need. Exactly one of ``file`` (a WAV on the
+        engine host), ``blob`` (WAV bytes) or ``tone`` (a preset or a cadence,
+        as for :meth:`play_media`). siphon-rtp plays no URL into a room. Up to
+        four run at once.
+
+        Accept-on-start: the end arrives as :meth:`on_play_finished` with the
+        room id as ``call_id`` and an empty ``from_tag`` (fire it in tests with
+        :meth:`fire_play_finished`). Retune with
+        :meth:`conference_set_play_gain`, end with
+        :meth:`conference_stop_play`.
+
+        Args:
+            conference_id: The room, which must exist.
+            file: A WAV on the engine host (exactly one of the three sources).
+            blob: WAV bytes.
+            tone: A tone preset name or cadence spec.
+            repeat: Total play count, or ``"inf"`` until stopped.
+            start_ms: Offset into the source.
+            duration_ms: Hard playout cap.
+            gain_decibels: Gain relative to the source, -60..=+12.
+
+        Returns:
+            The ``play_id``.
+        """
+        self._conference_room(conference_id, "conference_play")
+        sources = {"file": file, "blob": blob, "tone": tone}
+        given = [name for name, value in sources.items() if value is not None]
+        if len(given) != 1:
+            raise ValueError(
+                "rtpengine.conference_play needs exactly one of file, blob or tone"
+            )
+        if repeat is not None and not (
+            (isinstance(repeat, int) and repeat >= 0)
+            or (isinstance(repeat, str) and repeat.lower() == "inf")
+        ):
+            raise ValueError(
+                'repeat must be a total play count (a non-negative integer) or "inf"'
+            )
+        play_id = self._conference_play_id
+        self._conference_play_id += 1
+        play = {
+            "op": "conference_play",
+            "conference_id": conference_id,
+            "play_id": play_id,
+            "source": given[0],
+            given[0]: sources[given[0]],
+            "repeat": repeat,
+            "start_ms": start_ms,
+            "duration_ms": duration_ms,
+            "gain_decibels": gain_decibels,
+        }
+        self.conference_plays[play_id] = play
+        self.operations.append(("conference_play", given[0]))
+        self.media_calls.append(play)
+        return play_id
+
+    async def conference_stop_play(
+        self, conference_id: str, play_id: Optional[int] = None
+    ) -> bool:
+        """Stop one room playback by ``play_id``, or every one in the room.
+
+        A ``play_id`` that is not running raises ``RuntimeError``, as the
+        engine refuses it.
+
+        Returns:
+            ``True`` on success.
+        """
+        self._conference_room(conference_id, "conference_stop_play")
+        if play_id is not None:
+            play = self.conference_plays.get(play_id)
+            if play is None or play["conference_id"] != conference_id:
+                raise RuntimeError(
+                    f"rtpengine.conference_stop_play failed: no playback {play_id} in the room"
+                )
+            del self.conference_plays[play_id]
+        else:
+            self.conference_plays = {
+                running: play for running, play in self.conference_plays.items()
+                if play["conference_id"] != conference_id
+            }
+        self.operations.append(("conference_stop_play", conference_id))
+        self.media_calls.append({
+            "op": "conference_stop_play",
+            "conference_id": conference_id,
+            "play_id": play_id,
+        })
+        return True
+
+    async def conference_set_play_gain(
+        self, conference_id: str, play_id: int, gain_decibels: int
+    ) -> bool:
+        """Retune a running room playback's gain, -60..=+12 dB: how an
+        announcement ducks under the conversation rather than burying it.
+
+        Returns:
+            ``True`` on success.
+        """
+        self._conference_room(conference_id, "conference_set_play_gain")
+        play = self.conference_plays.get(play_id)
+        if play is None or play["conference_id"] != conference_id:
+            raise RuntimeError(
+                f"rtpengine.conference_set_play_gain failed: no playback {play_id} in the room"
+            )
+        play["gain_decibels"] = gain_decibels
+        self.operations.append(("conference_set_play_gain", conference_id))
+        self.media_calls.append({
+            "op": "conference_set_play_gain",
+            "conference_id": conference_id,
+            "play_id": play_id,
+            "gain_decibels": gain_decibels,
+        })
+        return True
+
+    def set_conference_join_no_codec(self, no_codec: bool = True) -> None:
+        """Prime :meth:`conference_join` to model an offer whose codec the
+        room cannot encode (test helper): the next join raises
+        ``ValueError``."""
+        self._conference_join_no_codec = no_codec
+
+    def set_conference_join_sdp(self, sdp: str) -> None:
+        """Set the answer SDP :meth:`conference_join` resolves to (test
+        helper)."""
+        self._conference_join_sdp = sdp
 
     async def play_dtmf(
         self,
@@ -5081,6 +5509,47 @@ class MockRtpEngine:
             fired += 1
         return fired
 
+    def on_active_speaker(self, func_or_none: Any = None, *,
+                          conference_id: Optional[str] = None) -> Any:
+        """Register a handler for a conference room's **active speaker**.
+
+        Called with ``(conference_id, from_tag)`` when the loudest speaking
+        seat of a room changes, and with ``from_tag=None`` when the floor goes
+        silent: what floor control or a roster's speaking indicator (the
+        RFC 4575 ``<media>`` status of a focus) reads. The seat is the
+        participant's From-tag, as :meth:`conference_join` seated it.
+        ``conference_id=`` filters on one room.
+
+        Delivered by the native **siphon-rtp** backend only.
+
+        Usage::
+
+            @rtpengine.on_active_speaker
+            def floor(conference_id, from_tag):
+                log.info(f"{conference_id}: {from_tag or 'nobody'} has the floor")
+        """
+        def decorator(fn: Any) -> Any:
+            self._active_speaker_handlers.append({
+                "fn": fn,
+                "conference_id": conference_id,
+            })
+            return fn
+        if func_or_none is not None:
+            return decorator(func_or_none)
+        return decorator
+
+    def fire_active_speaker(self, conference_id: str,
+                            from_tag: Optional[str]) -> int:
+        """Test helper: fire an active-speaker change.  Returns the number of
+        handlers that matched (and were invoked)."""
+        fired = 0
+        for entry in self._active_speaker_handlers:
+            if entry["conference_id"] is not None and entry["conference_id"] != conference_id:
+                continue
+            entry["fn"](conference_id, from_tag)
+            fired += 1
+        return fired
+
     def on_media_started(self, func_or_none: Any = None, *,
                          call_id: Optional[str] = None,
                          from_tag: Optional[str] = None) -> Any:
@@ -5448,7 +5917,12 @@ class MockRtpEngine:
         self._text_handlers.clear()
         self._beep_handlers.clear()
         self._media_started_handlers.clear()
+        self._active_speaker_handlers.clear()
         self._answer_local_no_codec = False
+        self.conferences.clear()
+        self.conference_bridges.clear()
+        self.conference_plays.clear()
+        self._conference_join_no_codec = False
 
 
 # ---------------------------------------------------------------------------

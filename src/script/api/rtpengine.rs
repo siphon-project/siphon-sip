@@ -28,6 +28,7 @@ use super::reply::PyReply;
 use super::request::PyRequest;
 
 mod answer;
+mod conference;
 mod decorators;
 mod message;
 mod repeat;
@@ -1492,6 +1493,150 @@ impl PyRtpEngine {
         })
     }
 
+    /// Seat a call in a conference room and resolve to the answer SDP for the
+    /// script's own 2xx (``siphon-rtp`` only). The engine creates the room on
+    /// its first seat, answers the participant's offer with its own endpoint,
+    /// and mixes it with everyone else; the seat is the call's From-tag.
+    ///
+    /// Args:
+    ///     conference_id: The room, an id the script chooses.
+    ///     call: The ``Call`` / ``Request`` carrying the participant's offer.
+    ///     role: ``"talker"``, ``"listener"``, ``"muted"``, ``"whisper"`` or
+    ///         ``"monitor"``; the last two need ``target=`` (a seat's
+    ///         from-tag), and ``"monitor"`` may whisper to ``whisper_target=``.
+    ///     profile: As for :meth:`answer_local`. A profile with a codec policy,
+    ///         ``ws_uri``, ``ws_tee``, ``record_call`` or a DSP knob raises
+    ///         ``ValueError``: siphon-rtp does not apply them to a seat.
+    ///
+    /// Raises ``ValueError`` when the engine cannot encode the room mix in the
+    /// participant's codec, or the call is already seated.
+    #[pyo3(signature = (conference_id, call, role="talker", target=None, whisper_target=None, profile=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn conference_join<'py>(
+        &self,
+        python: Python<'py>,
+        conference_id: String,
+        call: &Bound<'py, PyAny>,
+        role: &str,
+        target: Option<String>,
+        whisper_target: Option<String>,
+        profile: Option<&str>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        conference::join(
+            self,
+            python,
+            conference_id,
+            call,
+            role,
+            target,
+            whisper_target,
+            profile,
+        )
+    }
+
+    /// Free a call's seat; the room ends with its last seat. ``call`` is a
+    /// ``Call`` / ``Request`` or a ``(call_id, from_tag)`` pair.
+    /// ``rtpengine.delete(call)`` on a seated call does the same.
+    #[pyo3(signature = (conference_id, call))]
+    fn conference_leave<'py>(
+        &self,
+        python: Python<'py>,
+        conference_id: String,
+        call: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        conference::leave(self, python, conference_id, call)
+    }
+
+    /// Change who a seat hears and who hears it, live: ``role``, ``target``
+    /// and ``whisper_target`` as for :meth:`conference_join`.
+    #[pyo3(signature = (conference_id, call, role, target=None, whisper_target=None))]
+    fn conference_route<'py>(
+        &self,
+        python: Python<'py>,
+        conference_id: String,
+        call: &Bound<'py, PyAny>,
+        role: &str,
+        target: Option<String>,
+        whisper_target: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        conference::route(
+            self,
+            python,
+            conference_id,
+            call,
+            role,
+            target,
+            whisper_target,
+        )
+    }
+
+    /// Link two live rooms: ``direction`` ``"both"``, ``"a_to_b"`` (room A is
+    /// heard in room B) or ``"b_to_a"``. siphon-rtp has no unbridge verb.
+    #[pyo3(signature = (conference_a, conference_b, direction="both"))]
+    fn conference_bridge<'py>(
+        &self,
+        python: Python<'py>,
+        conference_a: String,
+        conference_b: String,
+        direction: &str,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        conference::bridge(self, python, conference_a, conference_b, direction)
+    }
+
+    /// Play a ``file``, ``blob`` or ``tone`` into a room, heard by every seat,
+    /// and resolve to its ``play_id``. Its end arrives as
+    /// ``@rtpengine.on_play_finished`` with the room id as ``call_id``.
+    #[pyo3(signature = (conference_id, file=None, blob=None, tone=None, repeat=None, start_ms=None, duration_ms=None, gain_decibels=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn conference_play<'py>(
+        &self,
+        python: Python<'py>,
+        conference_id: String,
+        file: Option<String>,
+        blob: Option<Vec<u8>>,
+        tone: Option<String>,
+        repeat: Option<Bound<'py, PyAny>>,
+        start_ms: Option<u64>,
+        duration_ms: Option<u64>,
+        gain_decibels: Option<i32>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        conference::play(
+            self,
+            python,
+            conference_id,
+            file,
+            blob,
+            tone,
+            repeat,
+            start_ms,
+            duration_ms,
+            gain_decibels,
+        )
+    }
+
+    /// Stop one room playback by ``play_id``, or all of them.
+    #[pyo3(signature = (conference_id, play_id=None))]
+    fn conference_stop_play<'py>(
+        &self,
+        python: Python<'py>,
+        conference_id: String,
+        play_id: Option<u64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        conference::stop_play(self, python, conference_id, play_id)
+    }
+
+    /// Retune a running room playback's gain (−60..=+12 dB).
+    #[pyo3(signature = (conference_id, play_id, gain_decibels))]
+    fn conference_set_play_gain<'py>(
+        &self,
+        python: Python<'py>,
+        conference_id: String,
+        play_id: u64,
+        gain_decibels: i32,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        conference::set_play_gain(self, python, conference_id, play_id, gain_decibels)
+    }
+
     /// Send a `play DTMF` command — inject DTMF tone(s) into the call.
     ///
     /// Args:
@@ -2406,6 +2551,21 @@ impl PyRtpEngine {
         from_tag: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
         event_decorator(python, "rtpengine.on_beep", func_or_none, call_id, from_tag)
+    }
+
+    /// Register a handler for a conference room's **active speaker**: called
+    /// with ``(conference_id, from_tag)`` when the loudest speaking seat
+    /// changes, and ``from_tag=None`` when the floor goes silent.
+    /// ``conference_id=`` filters on one room. ``siphon-rtp`` only.
+    #[pyo3(signature = (func_or_none=None, *, conference_id=None))]
+    fn on_active_speaker<'py>(
+        &self,
+        python: Python<'py>,
+        func_or_none: Option<Py<PyAny>>,
+        conference_id: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let kind = "rtpengine.on_active_speaker";
+        event_decorator(python, kind, func_or_none, conference_id, None)
     }
 
     /// Register a handler for **media started** events.

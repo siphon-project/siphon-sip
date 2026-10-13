@@ -106,12 +106,31 @@ pub enum RtpEngineEvent {
     /// once per leg, so a two-party call raises two, and not again on a
     /// re-latch or a re-offer.  `siphon-rtp` native backend only.
     MediaStarted(MediaStartedEvent),
+    /// The dominant speaker of a conference room changed, or the floor went
+    /// silent.  `siphon-rtp` native backend only.
+    ActiveSpeaker(ActiveSpeakerEvent),
     /// An event we didn't recognise — passed through for logging.
     Unknown {
         event: String,
         call_id: Option<String>,
         from_tag: Option<String>,
     },
+}
+
+/// The dominant speaker of a conference room, carried by
+/// [`RtpEngineEvent::ActiveSpeaker`].
+///
+/// Keyed by the room, not a call: a room is named by the id its controller
+/// chose and is no call's. The engine ranks seats by frame energy and reports
+/// the loudest one when it changes, which is what floor control and a roster's
+/// speaking indicator read.
+#[derive(Debug, Clone)]
+pub struct ActiveSpeakerEvent {
+    /// The room the floor changed in.
+    pub conference_id: String,
+    /// The seat now holding the floor (its participant's from-tag), or `None`
+    /// when nobody is speaking.
+    pub from_tag: Option<String>,
 }
 
 /// Decoded DTMF event.  Matches the payload rtpengine emits via

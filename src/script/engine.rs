@@ -208,6 +208,11 @@ pub enum HandlerKind {
         call_id: Option<String>,
         from_tag: Option<String>,
     },
+    /// `@rtpengine.on_active_speaker` — the dominant speaker of a conference
+    /// room changed, or the floor went silent.
+    ///
+    /// ``conference_id`` is an optional room filter.
+    RtpEngineOnActiveSpeaker { conference_id: Option<String> },
     /// `@rtpengine.on_media_started` — the first packet on one of a call's
     /// engine legs cleared the source gate. Fires once per leg.
     ///
@@ -1096,6 +1101,15 @@ fn extract_handlers(_python: Python<'_>, registry: &Bound<'_, PyAny>) -> Result<
                     .and_then(|meta| meta.get_item("from_tag").ok())
                     .and_then(|v| v.extract().ok());
                 HandlerKind::RtpEngineOnBeep { call_id, from_tag }
+            }
+            "rtpengine.on_active_speaker" => {
+                // The shared media-event decorator stores its id filter under
+                // `call_id`; for this hook the id is the room's.
+                let conference_id: Option<String> = metadata
+                    .as_ref()
+                    .and_then(|meta| meta.get_item("call_id").ok())
+                    .and_then(|v| v.extract().ok());
+                HandlerKind::RtpEngineOnActiveSpeaker { conference_id }
             }
             "rtpengine.on_media_started" => {
                 let call_id: Option<String> = metadata
@@ -1992,6 +2006,40 @@ async def specific_text(call_id, from_tag, to_tag, text, direction):
             })
             .expect("filtered text handler registered");
         assert!(specific.is_async);
+    }
+
+    #[test]
+    fn rtpengine_on_active_speaker_decorator_registers_and_filters_by_room() {
+        let source = r#"
+from siphon import rtpengine
+
+@rtpengine.on_active_speaker
+def any_room(conference_id, from_tag):
+    pass
+
+@rtpengine.on_active_speaker(conference_id="room-1")
+async def one_room(conference_id, from_tag):
+    pass
+"#;
+        let state = compile_temp_script(source).unwrap();
+        assert_eq!(state.handlers.len(), 2);
+        assert_eq!(state.active_speaker_handlers("room-2").len(), 1);
+        assert_eq!(state.active_speaker_handlers("room-1").len(), 2);
+        // A room's floor is no call's media event, and no call's media event
+        // reaches it.
+        assert_eq!(state.dtmf_handlers("room-1", "alice").len(), 0);
+        assert_eq!(state.media_started_handlers("room-1", "alice").len(), 0);
+        let one_room = state
+            .handlers
+            .iter()
+            .find(|h| {
+                matches!(
+                    &h.kind,
+                    HandlerKind::RtpEngineOnActiveSpeaker { conference_id: Some(c) } if c == "room-1"
+                )
+            })
+            .expect("filtered active-speaker handler registered");
+        assert!(one_room.is_async);
     }
 
     #[test]

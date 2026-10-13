@@ -46,6 +46,7 @@ use super::profile::{NgFlags, WsTeeDirection, WsVadEngine};
 /// Reserved request id for the auth handshake (real requests start at 1).
 const AUTH_REQUEST_ID: u64 = 0;
 
+mod conference;
 mod events;
 mod identity;
 use events::convert_event;
