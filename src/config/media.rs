@@ -181,7 +181,8 @@ pub struct MediaConfig {
     /// on every control connection, which is what lets a restarted process be
     /// recognised as the same owner and find its own orphans. An engine older
     /// than 0.8.0 ignores the claim and keys ownership on the connection; the
-    /// reap stays safe there and simply finds nothing.
+    /// reap stays safe there and simply finds nothing. With
+    /// `siphon_rtp.scope` set the enumeration is also limited to that scope.
     ///
     /// `rtpproxy` cannot enumerate at all; siphon warns at boot and skips.
     #[serde(default)]
@@ -314,6 +315,13 @@ pub struct SiphonRtpConfig {
     /// `timeout_ms`. Default: 300000 (5 min).
     #[serde(default = "default_siphon_rtp_play_timeout_ms")]
     pub play_timeout_ms: u64,
+    /// This node's call scope on an engine it shares with other nodes (engine
+    /// 0.14.0 or later). Every command that names a call carries it, and the
+    /// engine keys the call by `(scope, Call-ID)`, so two nodes that see one
+    /// Call-ID keep separate calls. 1 to 64 ASCII letters, digits, `-` and `_`,
+    /// checked at start. Unset (the default): no frame carries a scope.
+    #[serde(default)]
+    pub scope: Option<crate::rtpengine::CallScope>,
 }
 
 impl SiphonRtpConfig {

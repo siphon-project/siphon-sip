@@ -1836,6 +1836,61 @@ media:
     assert_eq!(instances[1], ("10.0.0.2:8080".to_string(), 3000, 1));
 }
 
+/// `media.siphon_rtp` with `scope:` set to `scope_line`, as a whole config.
+fn siphon_rtp_config_with_scope(scope_line: &str) -> String {
+    format!(
+        r#"
+listen:
+  udp:
+    - "192.0.2.1:5060"
+domain:
+  local:
+    - "example.com"
+script:
+  path: "scripts/proxy_default.py"
+media:
+  backend: siphon-rtp
+  siphon_rtp:
+    address: "192.0.2.10:8080"
+    {scope_line}
+"#
+    )
+}
+
+#[test]
+fn media_siphon_rtp_scope_is_unset_by_default_and_read_when_set() {
+    let config = Config::from_str(&siphon_rtp_config_with_scope("")).unwrap();
+    let siphon_rtp = config.media.unwrap().siphon_rtp.unwrap();
+    assert!(siphon_rtp.scope.is_none());
+
+    let config = Config::from_str(&siphon_rtp_config_with_scope(r#"scope: "pcscf""#)).unwrap();
+    let siphon_rtp = config.media.unwrap().siphon_rtp.unwrap();
+    assert_eq!(
+        siphon_rtp.scope.as_ref().map(|scope| scope.as_str()),
+        Some("pcscf")
+    );
+}
+
+/// A scope the engine would refuse stops the node at start, naming the key,
+/// rather than letting the engine refuse every call it is sent.
+#[test]
+fn media_siphon_rtp_scope_the_engine_would_refuse_fails_the_config() {
+    for scope_line in [
+        r#"scope: "p cscf""#,
+        r#"scope: "pcscf.orig""#,
+        r#"scope: """#,
+        "scope: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    ] {
+        let error = Config::from_str(&siphon_rtp_config_with_scope(scope_line))
+            .expect_err(scope_line)
+            .to_string();
+        assert!(
+            error.contains("media.siphon_rtp.scope"),
+            "{scope_line}: {error}"
+        );
+    }
+}
+
 #[test]
 fn parses_media_backend_rtpproxy() {
     let yaml = r#"

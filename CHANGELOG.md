@@ -41,6 +41,26 @@ entry, but a working config keeps working.
   keeps rooms, seats, bridges and playbacks; the cookbook has "A conference
   focus with mixing", with `examples/conference_focus.py`.
 
+- **`media.siphon_rtp.scope`: several nodes share one siphon-rtp engine.** A
+  proxy does not change the `Call-ID`, so every node that anchors media on one
+  call path named its engine call by the same id, and a second node on the same
+  engine got `unknown call` (or, from one node, a second unscoped offer replaced
+  the first call). Every such node needed an engine of its own. siphon-rtp
+  0.14.0 keys a call by `(scope, call_id)`; a node that sets `scope` now puts it
+  on every command that names a call (offer, reoffer, answer, answer_local,
+  delete, list, play/stop media, play gain, DTMF, silence, echo, block,
+  recording, subscriptions, WebSocket tee and bridge, X3) and skips any event
+  that names another scope, so two nodes keep separate calls for one
+  `Call-ID`. Conference verbs carry no scope (the engine refuses one there), so
+  room ids stay per engine. The value is checked at start against the
+  engine's own rule (1 to 64 of `A-Z a-z 0-9 - _`), and a node with a scope refuses, with an error, a
+  connection to an engine whose `node_info` does not list the `scope` feature,
+  since an older engine would read scoped frames as unscoped. Unset, which is
+  the default, every frame is byte for byte what it was. Scripts see no change.
+  The control connection task moves to `rtpengine/siphon_rtp/connection.rs`,
+  and a connection refused during its hand-shake is now retried with growing
+  backoff instead of at the initial 200 ms.
+
 - **`@b2bua.on_provisional`: a hook for every provisional response the B2BUA
   relays.** `@b2bua.on_early_media` runs only for a provisional with SDP, so a
   `180 Ringing` without a body, which is what a ringing phone normally sends,

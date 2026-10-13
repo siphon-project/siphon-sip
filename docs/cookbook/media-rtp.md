@@ -58,6 +58,41 @@ backends; only the transport underneath changes.
 See [Media engines: rtpengine vs siphon-rtp](../media-engines.md) for the full
 comparison, the `media.siphon_rtp` config, and how to run and operate each engine.
 
+### Sharing one media engine between several nodes
+
+A call that crosses several media-anchoring nodes (an edge proxy, a breakout
+gateway, a media server) carries one `Call-ID` through all of them, so on one
+engine they would collide. Give each node its own `media.siphon_rtp.scope` and
+point them all at the same siphon-rtp engine, which must be **0.14.0 or later**:
+
+```yaml
+# edge node
+media:
+  backend: siphon-rtp
+  siphon_rtp:
+    address: "192.0.2.10:8080"
+    scope: "edge"
+```
+
+```yaml
+# breakout node, same engine
+media:
+  backend: siphon-rtp
+  siphon_rtp:
+    address: "192.0.2.10:8080"
+    scope: "breakout"
+```
+
+Each node then holds its own call for the shared `Call-ID`, with its own ports
+and offer/answer state, and receives only its own calls' events; the script does
+not change. Both instances of a redundant pair use the same scope. What stays
+per engine is everything the engine owns: its capacity (sessions, transcoding)
+is shared by all the nodes on it, and every call is anchored on that engine's
+interfaces and relay addresses, so nodes that need media on different networks
+still need engines that reach them. A scope keeps cooperating nodes apart; it
+does not protect one from another (see
+[Media engines](../media-engines.md#several-nodes-on-one-engine-scope)).
+
 ### Classic rtpproxy (keep your existing relay)
 
 Migrating an OpenSIPS / Kamailio / Sippy deployment? Point siphon at your existing

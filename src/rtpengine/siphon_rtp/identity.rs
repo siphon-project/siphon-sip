@@ -4,12 +4,10 @@
 //! self-contained concern: who this siphon process says it is, and the one frame
 //! that says it. Nothing here touches a call.
 
-use super::{result_kind, Request, Response, AUTH_REQUEST_ID, READ_CHUNK};
+use super::connection::handshake;
+use super::result_kind;
 use crate::rtpengine::error::RtpEngineError;
-use siphon_rtp_proto::{frame, CmdResult, Command};
-use std::time::Duration;
-use tokio::io::AsyncReadExt;
-use tokio::io::AsyncWriteExt;
+use siphon_rtp_proto::{CmdResult, Command};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 
 /// This siphon process's stable control identity, presented on every siphon-rtp
@@ -69,78 +67,14 @@ pub(super) async fn authenticate(
     command: Command,
     timeout_ms: u64,
 ) -> Result<(), RtpEngineError> {
-    let bytes = frame::encode(&Request {
-        id: AUTH_REQUEST_ID,
-        command,
-    })
-    .map_err(|error| RtpEngineError::Protocol(format!("auth frame encode failed: {error}")))?;
-
-    let mut chunk = [0u8; READ_CHUNK];
-    let deadline = Duration::from_millis(timeout_ms.max(1));
-
-    // Bounded by the same deadline as the ack read below. Unbounded, an engine
-    // that accepts the TCP connection and then never drains it wedges the
-    // reconnect task here forever — and because that task is what re-establishes
-    // control, every subsequent command then fails on its own timeout with
-    // nothing left to recover it.
-    match tokio::time::timeout(deadline, write_half.write_all(&bytes)).await {
-        Ok(result) => result?,
-        Err(_) => {
-            return Err(RtpEngineError::Timeout {
-                timeout_ms: deadline.as_millis() as u64,
-            });
-        }
+    match handshake(write_half, read_half, buffer, "auth", command, timeout_ms).await? {
+        CmdResult::Ok { .. } => Ok(()),
+        CmdResult::Error { reason } => Err(RtpEngineError::EngineError(reason)),
+        other => Err(RtpEngineError::Protocol(format!(
+            "unexpected '{}' response for authenticate",
+            result_kind(&other)
+        ))),
     }
-    tokio::time::timeout(deadline, async {
-        loop {
-            // Consume buffered frames first; the auth ack is the Response with the
-            // reserved id. Any events arriving first are ignored during handshake.
-            loop {
-                match frame::decode::<serde_json::Value>(buffer) {
-                    Ok(Some((value, consumed))) => {
-                        buffer.drain(..consumed);
-                        if value.get("id").and_then(serde_json::Value::as_u64)
-                            == Some(AUTH_REQUEST_ID)
-                        {
-                            let response: Response =
-                                serde_json::from_value(value).map_err(|error| {
-                                    RtpEngineError::Protocol(format!(
-                                        "auth response decode failed: {error}"
-                                    ))
-                                })?;
-                            return match response.result {
-                                CmdResult::Ok { .. } => Ok(()),
-                                CmdResult::Error { reason } => {
-                                    Err(RtpEngineError::EngineError(reason))
-                                }
-                                other => Err(RtpEngineError::Protocol(format!(
-                                    "unexpected '{}' response for authenticate",
-                                    result_kind(&other)
-                                ))),
-                            };
-                        }
-                    }
-                    Ok(None) => break,
-                    Err(error) => {
-                        return Err(RtpEngineError::Protocol(format!(
-                            "auth frame decode failed: {error}"
-                        )))
-                    }
-                }
-            }
-            let n = read_half.read(&mut chunk).await?;
-            if n == 0 {
-                return Err(RtpEngineError::Protocol(
-                    "siphon-rtp closed connection during auth".to_string(),
-                ));
-            }
-            buffer.extend_from_slice(&chunk[..n]);
-        }
-    })
-    .await
-    .map_err(|_| RtpEngineError::Timeout {
-        timeout_ms: deadline.as_millis() as u64,
-    })?
 }
 
 #[cfg(test)]

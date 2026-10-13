@@ -28,37 +28,38 @@ use std::time::Duration;
 use dashmap::DashMap;
 use futures_util::future::join_all;
 use siphon_rtp_proto::{
-    frame, CmdResult, Command, Event, PlayEndReason, PlayMediaSource as ProtoPlayMediaSource,
-    ProfileFlags, Request, Response, WsTeeDirection as ProtoWsTeeDirection,
-    WsVadEngine as ProtoWsVadEngine, X3TargetLeg, Xid,
+    CmdResult, Command, PlayEndReason, PlayMediaSource as ProtoPlayMediaSource, ProfileFlags,
+    Request, WsTeeDirection as ProtoWsTeeDirection, WsVadEngine as ProtoWsVadEngine, X3TargetLeg,
+    Xid,
 };
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::net::TcpStream;
+use tokio::io::AsyncWriteExt;
+use tokio::net::tcp::OwnedWriteHalf;
 use tokio::sync::{mpsc, oneshot, watch, Mutex};
-use tracing::{debug, info, trace, warn};
+use tracing::{trace, warn};
 
 use super::client::PlayMediaSource;
 use super::error::RtpEngineError;
 use super::events::{RecordingChannels, RecordingDirection, RecordingRequest, RtpEngineEvent};
 use super::profile::{NgFlags, WsTeeDirection, WsVadEngine};
 
-/// Reserved request id for the auth handshake (real requests start at 1).
-const AUTH_REQUEST_ID: u64 = 0;
+/// Reserved request id for the hand-shake frames a connection sends before it
+/// serves commands (`authenticate`, then `node_info` on a scoped node); real
+/// requests start at 1.
+const HANDSHAKE_REQUEST_ID: u64 = 0;
 
 mod conference;
+mod connection;
 mod events;
 mod identity;
-use events::convert_event;
+mod scope;
+use connection::connection_manager;
 #[cfg(test)]
-use events::{convert_leg_summary, play_end_reason_from_proto, ws_bridge_end_reason_from_proto};
+use events::{
+    convert_event, convert_leg_summary, play_end_reason_from_proto, ws_bridge_end_reason_from_proto,
+};
 pub use identity::set_controller_id;
-use identity::{auth_frame_for, authenticate, controller_id};
+pub use scope::CallScope;
 
-/// Initial reconnect backoff; doubles up to [`MAX_BACKOFF`].
-const INITIAL_BACKOFF: Duration = Duration::from_millis(200);
-/// Maximum reconnect backoff.
-const MAX_BACKOFF: Duration = Duration::from_secs(5);
 /// Read buffer chunk size for the control connection.
 const READ_CHUNK: usize = 8192;
 
@@ -225,6 +226,8 @@ pub struct SiphonRtpClient {
     /// startup or post-reconnect window blocks for the connection rather than
     /// failing instantly.
     connected: watch::Receiver<bool>,
+    /// The scope every frame naming a call carries (`media.siphon_rtp.scope`).
+    scope: Option<CallScope>,
     /// Active call-ids (offer→insert, delete→remove) — mirrors `RtpEngineSet`'s
     /// affinity count for the `rtpengine.active_sessions` Python getter.
     sessions: DashMap<String, ()>,
@@ -248,6 +251,26 @@ impl SiphonRtpClient {
         play_timeout_ms: u64,
         event_tx: mpsc::Sender<RtpEngineEvent>,
     ) -> Arc<Self> {
+        Self::with_scope(
+            address,
+            control_secret,
+            None,
+            timeout_ms,
+            play_timeout_ms,
+            event_tx,
+        )
+    }
+
+    /// [`Self::new`] for a node that names its calls under `scope` on an
+    /// engine it may share with other nodes.
+    pub fn with_scope(
+        address: SocketAddr,
+        control_secret: Option<String>,
+        scope: Option<CallScope>,
+        timeout_ms: u64,
+        play_timeout_ms: u64,
+        event_tx: mpsc::Sender<RtpEngineEvent>,
+    ) -> Arc<Self> {
         let pending: Arc<DashMap<u64, oneshot::Sender<CmdResult>>> = Arc::new(DashMap::new());
         let play_pending: Arc<DashMap<u64, PlayWaiter>> = Arc::new(DashMap::new());
         let writer: Arc<Mutex<Option<OwnedWriteHalf>>> = Arc::new(Mutex::new(None));
@@ -257,6 +280,7 @@ impl SiphonRtpClient {
         tokio::spawn(connection_manager(
             address,
             control_secret,
+            scope.clone(),
             timeout_ms,
             Arc::clone(&pending),
             Arc::clone(&play_pending),
@@ -275,6 +299,7 @@ impl SiphonRtpClient {
             play_pending,
             writer,
             connected: connected_rx,
+            scope,
             sessions: DashMap::new(),
             _shutdown_tx: shutdown_tx,
         })
@@ -288,7 +313,7 @@ impl SiphonRtpClient {
     /// unreachable engine surfaces as [`RtpEngineError::Timeout`].
     async fn request(&self, command: Command) -> Result<CmdResult, RtpEngineError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let bytes = frame::encode(&Request { id, command })
+        let bytes = scope::encode_request(self.scope.as_ref(), &Request { id, command })
             .map_err(|error| RtpEngineError::Protocol(format!("frame encode failed: {error}")))?;
 
         let (sender, receiver) = oneshot::channel();
@@ -1131,6 +1156,18 @@ impl SiphonRtpClientSet {
         play_timeout_ms: u64,
         event_tx: mpsc::Sender<RtpEngineEvent>,
     ) -> Result<Arc<Self>, RtpEngineError> {
+        Self::with_scope(instances, control_secret, None, play_timeout_ms, event_tx)
+    }
+
+    /// [`Self::new`] for a scoped node: the scope is the node's, so every
+    /// instance's connection carries the same one.
+    pub fn with_scope(
+        instances: Vec<(SocketAddr, u64, u32)>,
+        control_secret: Option<String>,
+        scope: Option<CallScope>,
+        play_timeout_ms: u64,
+        event_tx: mpsc::Sender<RtpEngineEvent>,
+    ) -> Result<Arc<Self>, RtpEngineError> {
         if instances.is_empty() {
             return Err(RtpEngineError::Protocol(
                 "at least one siphon-rtp instance is required".to_string(),
@@ -1141,9 +1178,10 @@ impl SiphonRtpClientSet {
         let mut cumulative_weights = Vec::with_capacity(instances.len());
         let mut running_total = 0u32;
         for (address, timeout_ms, weight) in &instances {
-            clients.push(SiphonRtpClient::new(
+            clients.push(SiphonRtpClient::with_scope(
                 *address,
                 control_secret.clone(),
+                scope.clone(),
                 *timeout_ms,
                 play_timeout_ms,
                 event_tx.clone(),
@@ -1709,251 +1747,6 @@ fn result_kind(result: &CmdResult) -> &'static str {
     }
 }
 
-/// Background task: maintain the control connection, route responses/events, and
-/// reconnect (with backoff + re-auth) until the client is dropped.
-#[allow(clippy::too_many_arguments)]
-async fn connection_manager(
-    address: SocketAddr,
-    control_secret: Option<String>,
-    timeout_ms: u64,
-    pending: Arc<DashMap<u64, oneshot::Sender<CmdResult>>>,
-    play_pending: Arc<DashMap<u64, PlayWaiter>>,
-    writer: Arc<Mutex<Option<OwnedWriteHalf>>>,
-    connected_tx: watch::Sender<bool>,
-    event_tx: mpsc::Sender<RtpEngineEvent>,
-    mut shutdown_rx: mpsc::Receiver<()>,
-) {
-    let mut backoff = INITIAL_BACKOFF;
-    loop {
-        // Connect, cancellable by client shutdown.
-        let stream = tokio::select! {
-            biased;
-            _ = shutdown_rx.recv() => return,
-            result = TcpStream::connect(address) => match result {
-                Ok(stream) => stream,
-                Err(error) => {
-                    warn!(%address, %error, "siphon-rtp control connect failed; retrying");
-                    if sleep_or_shutdown(backoff, &mut shutdown_rx).await {
-                        return;
-                    }
-                    backoff = (backoff * 2).min(MAX_BACKOFF);
-                    continue;
-                }
-            },
-        };
-        let _ = stream.set_nodelay(true);
-        backoff = INITIAL_BACKOFF;
-        let (mut read_half, mut write_half) = stream.into_split();
-        let mut buffer: Vec<u8> = Vec::with_capacity(READ_CHUNK);
-
-        // Auth handshake (before publishing the writer, so concurrent commands
-        // fail fast until the connection is authenticated and ready).
-        //
-        // Also runs with no secret configured, to present the identity claim:
-        // the engine accepts any token when it has no secret, and without the
-        // frame there is no way to say who is reconnecting, so every restart
-        // would strand its own calls under a dead connection's id.
-        if let Some(command) = auth_frame_for(control_secret.as_deref(), controller_id()) {
-            match authenticate(
-                &mut write_half,
-                &mut read_half,
-                &mut buffer,
-                command,
-                timeout_ms,
-            )
-            .await
-            {
-                Ok(()) => {}
-                Err(error) => {
-                    warn!(%address, %error, "siphon-rtp control auth failed; retrying");
-                    if sleep_or_shutdown(backoff, &mut shutdown_rx).await {
-                        return;
-                    }
-                    backoff = (backoff * 2).min(MAX_BACKOFF);
-                    continue;
-                }
-            }
-        }
-
-        *writer.lock().await = Some(write_half);
-        let _ = connected_tx.send(true);
-        info!(%address, "siphon-rtp control connection established");
-
-        let outcome = read_loop(
-            &mut read_half,
-            &mut buffer,
-            &pending,
-            &play_pending,
-            &event_tx,
-            &mut shutdown_rx,
-        )
-        .await;
-
-        // Connection is gone: stop accepting commands and fail every in-flight
-        // request (dropping the senders makes their receivers resolve to Err).
-        // Blocking play_media waiters likewise unblock (dropped sender → Err →
-        // treated as not-completed) instead of hanging until the fallback.
-        let _ = connected_tx.send(false);
-        *writer.lock().await = None;
-        pending.clear();
-        play_pending.clear();
-
-        match outcome {
-            ReadOutcome::Shutdown => return,
-            ReadOutcome::Disconnected => {
-                warn!(%address, "siphon-rtp control disconnected; reconnecting");
-                if sleep_or_shutdown(backoff, &mut shutdown_rx).await {
-                    return;
-                }
-            }
-        }
-    }
-}
-
-/// Why [`read_loop`] returned.
-enum ReadOutcome {
-    /// The client was dropped — stop the manager entirely.
-    Shutdown,
-    /// The connection closed or errored — reconnect.
-    Disconnected,
-}
-
-/// Drive the read half: decode frames, route responses to pending requests and
-/// events onto `event_tx`, until shutdown or disconnect.
-async fn read_loop(
-    read_half: &mut OwnedReadHalf,
-    buffer: &mut Vec<u8>,
-    pending: &DashMap<u64, oneshot::Sender<CmdResult>>,
-    play_pending: &DashMap<u64, PlayWaiter>,
-    event_tx: &mpsc::Sender<RtpEngineEvent>,
-    shutdown_rx: &mut mpsc::Receiver<()>,
-) -> ReadOutcome {
-    let mut chunk = [0u8; READ_CHUNK];
-    loop {
-        // Drain any whole frames already buffered (e.g. left over from auth).
-        loop {
-            match frame::decode::<serde_json::Value>(buffer) {
-                Ok(Some((value, consumed))) => {
-                    buffer.drain(..consumed);
-                    route_frame(value, pending, play_pending, event_tx).await;
-                }
-                Ok(None) => break,
-                Err(error) => {
-                    warn!(%error, "siphon-rtp control frame decode failed; dropping connection");
-                    return ReadOutcome::Disconnected;
-                }
-            }
-        }
-
-        tokio::select! {
-            biased;
-            _ = shutdown_rx.recv() => return ReadOutcome::Shutdown,
-            result = read_half.read(&mut chunk) => match result {
-                Ok(0) => return ReadOutcome::Disconnected,
-                Ok(n) => buffer.extend_from_slice(&chunk[..n]),
-                Err(error) => {
-                    warn!(%error, "siphon-rtp control read error");
-                    return ReadOutcome::Disconnected;
-                }
-            },
-        }
-    }
-}
-
-/// Hand an event to the dispatcher without ever parking.
-///
-/// This runs on the control connection's **read** task, which is also what
-/// routes every `Response` back to its pending request. Awaiting a bounded
-/// channel here means a slow event consumer stops the read loop, so no response
-/// is routed, every in-flight and future command fails on its own timeout, and
-/// media control is dead process-wide with the connection still established —
-/// far worse than dropping one DTMF event. The comment on the old `let _ =
-/// send().await` called it best-effort; `try_send` is what actually makes it so.
-fn forward_event(event_tx: &mpsc::Sender<RtpEngineEvent>, event: RtpEngineEvent) {
-    match event_tx.try_send(event) {
-        Ok(()) => {}
-        Err(mpsc::error::TrySendError::Full(_)) => {
-            warn!(
-                "siphon-rtp event dropped: dispatcher event queue full (slow event \
-                 consumer) — dropping the event rather than stalling the control \
-                 read loop, which would fail every in-flight media command"
-            );
-        }
-        Err(mpsc::error::TrySendError::Closed(_)) => {
-            debug!("siphon-rtp event dropped: no event consumer");
-        }
-    }
-}
-
-/// Route one decoded JSON frame: a `Response` (has `id`) to its pending request,
-/// or an `Event` (has `event`) onto the event channel.
-async fn route_frame(
-    value: serde_json::Value,
-    pending: &DashMap<u64, oneshot::Sender<CmdResult>>,
-    play_pending: &DashMap<u64, PlayWaiter>,
-    event_tx: &mpsc::Sender<RtpEngineEvent>,
-) {
-    if value.get("event").is_some() {
-        match serde_json::from_value::<Event>(value) {
-            Ok(event @ Event::PlayFinished { .. }) => {
-                // Two consumers, and they are not alternatives. The waiter is a
-                // blocking play_media(wait=True) in this process, which takes
-                // the reason + played duration as its return value. The event
-                // stream is everything else — script handlers and the control
-                // rail — and a `play` issued over the rail is always
-                // fire-and-forget, so dropping the event whenever a waiter
-                // happened to exist would make an app's completion signal
-                // depend on an unrelated caller's choice.
-                if let Event::PlayFinished {
-                    play_id,
-                    reason,
-                    played_ms,
-                    ..
-                } = &event
-                {
-                    debug!(play_id, ?reason, played_ms, "siphon-rtp play finished");
-                    if let Some((_, sender)) = play_pending.remove(play_id) {
-                        let _ = sender.send((*reason, *played_ms));
-                    }
-                }
-                let converted = convert_event(event);
-                forward_event(event_tx, converted);
-            }
-            Ok(event) => {
-                let converted = convert_event(event);
-                debug!(?converted, "siphon-rtp event received");
-                forward_event(event_tx, converted);
-            }
-            Err(error) => warn!(%error, "siphon-rtp event decode failed; skipping"),
-        }
-    } else if value.get("id").is_some() {
-        match serde_json::from_value::<Response>(value) {
-            Ok(response) => {
-                if let Some((_, sender)) = pending.remove(&response.id) {
-                    let _ = sender.send(response.result);
-                } else {
-                    trace!(
-                        id = response.id,
-                        "siphon-rtp response for unknown/expired request"
-                    );
-                }
-            }
-            Err(error) => warn!(%error, "siphon-rtp response decode failed; skipping"),
-        }
-    } else {
-        warn!("siphon-rtp frame had neither 'id' nor 'event'; skipping");
-    }
-}
-
-/// Sleep for `duration`, returning `true` if a shutdown signal arrived first.
-async fn sleep_or_shutdown(duration: Duration, shutdown_rx: &mut mpsc::Receiver<()>) -> bool {
-    tokio::select! {
-        biased;
-        _ = shutdown_rx.recv() => true,
-        _ = tokio::time::sleep(duration) => false,
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Tests — exercise the client against an in-process fake engine that speaks the
 // real `siphon_rtp_proto` wire format (no external binary needed).
@@ -1964,10 +1757,12 @@ mod tests {
     use super::*;
     use crate::rtpengine::events::WsBridgeEndReason;
     use siphon_rtp_proto::SessionStats;
+    use siphon_rtp_proto::{frame, Event, Response};
     use siphon_rtp_proto::{
         LegSummary as ProtoLegSummary, WsBridgeEndReason as ProtoWsBridgeEndReason,
         WsTeeEndReason as ProtoWsTeeEndReason, X3EndReason,
     };
+    use tokio::io::AsyncReadExt;
     use tokio::net::TcpListener;
 
     /// Read exactly one framed value of type `T` off a stream, growing `buffer`.
@@ -3786,7 +3581,7 @@ mod tests {
             let mut buffer = Vec::new();
             // First frame must be the auth request.
             let auth: Request = read_frame(&mut stream, &mut buffer).await;
-            assert_eq!(auth.id, AUTH_REQUEST_ID);
+            assert_eq!(auth.id, HANDSHAKE_REQUEST_ID);
             match auth.command {
                 Command::Authenticate { token, .. } => assert_eq!(token, "s3cret"),
                 other => panic!("expected Authenticate, got {other:?}"),
@@ -3794,7 +3589,7 @@ mod tests {
             write_frame(
                 &mut stream,
                 &Response {
-                    id: AUTH_REQUEST_ID,
+                    id: HANDSHAKE_REQUEST_ID,
                     result: CmdResult::Ok {
                         sdp: None,
                         duration_ms: None,

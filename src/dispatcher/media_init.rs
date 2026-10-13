@@ -188,15 +188,17 @@ pub(super) fn build_siphon_rtp_backend(
     }
 
     let count = instance_tuples.len();
-    match crate::rtpengine::SiphonRtpClientSet::new(
+    match crate::rtpengine::SiphonRtpClientSet::with_scope(
         instance_tuples,
         siphon_rtp_config.control_secret.clone(),
+        siphon_rtp_config.scope.clone(),
         siphon_rtp_config.play_timeout_ms,
         event_sender,
     ) {
         Ok(set) => {
             info!(
                 instances = count,
+                scope = siphon_rtp_config.scope.as_ref().map(|scope| scope.as_str()),
                 "siphon-rtp native media backend configured ({count} instance{})",
                 if count == 1 { "" } else { "s" }
             );
