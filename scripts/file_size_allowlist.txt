@@ -34,5 +34,5 @@ src/script/api/auth.rs       2340  # UAS digest authenticator moves to src/auth/
 
 # ── Cohesive today, split when next touched ─────────────────────────────────
 src/registrar/mod.rs         2250  # one impl Registrar over one store; contact/store split when touched
-src/rtpengine/siphon_rtp.rs  1960  # one backend; client/set/events/connection split when touched — control identity + auth handshake now live in siphon_rtp/identity.rs, which took the file back under the previous 2410 budget, so this lowers it rather than leaving the headroom as a silent licence; the proto event mapping now lives in siphon_rtp/events.rs, lowered again to match
+src/rtpengine/siphon_rtp.rs  1751  # one backend; client/set/events/connection split when touched — control identity + auth handshake now live in siphon_rtp/identity.rs, which took the file back under the previous 2410 budget, so this lowers it rather than leaving the headroom as a silent licence; the proto event mapping now lives in siphon_rtp/events.rs, lowered again to match; the control connection task (connect, hand-shake, read loop, frame routing) now lives in siphon_rtp/connection.rs and the call scope in siphon_rtp/scope.rs, lowered again to match
 src/ipsec/mod.rs             2100  # types + impl IpsecManager; manager.rs split when touched

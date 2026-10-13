@@ -464,6 +464,61 @@ if an engine restarts (it boots fine even when the engine is down — commands
 issued during the connect window wait up to their `timeout_ms`), and runs the
 auth handshake on every (re)connect when `control_secret` is set.
 
+### Several nodes on one engine: `scope`
+
+A proxy does not change the `Call-ID`, so every node that anchors media on one
+call path (an edge proxy, a breakout gateway, a media server, a B2BUA
+application server) names its engine call by the same id. Without a scope a
+second node using a `Call-ID` the engine already holds gets `unknown call`, so
+each such node needs an engine of its own. From siphon-rtp **0.14.0** the engine
+keys a call by `(scope, Call-ID)`, and a node that sets a scope keeps its calls
+apart from every other node's on a shared engine:
+
+```yaml
+media:
+  backend: siphon-rtp
+  siphon_rtp:
+    address: "192.0.2.10:8080"
+    scope: "edge"          # 1 to 64 of A-Z a-z 0-9 - _ ; unset by default
+```
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `media.siphon_rtp.scope` | string | unset | This node's scope. Every command that names a call (`offer`, `reoffer`, `answer`, `answer_local`, `delete`, `list`, `play_media`, `stop_media`, `set_play_gain`, `play_dtmf`, silence, echo, block, recording, subscriptions, WebSocket tee and bridge, X3) carries it as a top-level `scope` key, and the node skips any event that names another scope. `ping`, `authenticate`, `node_info` and the `conference_*` verbs carry none (the engine refuses a scope on a room verb). |
+
+- **Validation.** 1 to 64 bytes of ASCII letters, digits, `-` and `_`, the set
+  the engine accepts. Anything else, the empty string included (an unset
+  `${VAR}`), stops SIPhon at start with an error naming
+  `media.siphon_rtp.scope`.
+- **Unset.** No frame carries a scope; every frame is byte for byte what
+  earlier releases sent, and no `node_info` is asked for.
+- **Engine support.** With a scope set, SIPhon asks each engine for `node_info`
+  on every (re)connect, before serving a call. An engine that does not list
+  `scope` in its `features` (older than 0.14.0) would read every scoped frame as
+  unscoped, silently, so SIPhon refuses that connection, logs an error naming
+  the key and the engine version, and keeps retrying with backoff. Commands
+  meanwhile fail on their `timeout_ms`; no call is anchored unscoped.
+- **Several instances.** The scope is the node's: with `instances:` every
+  connection carries the same one.
+- **One scope per function, not per instance.** Give both instances of a
+  redundant pair the same scope, so either can answer or release a call the
+  other offered, and each other function its own.
+- **Conference rooms.** A room is named by its `conference_id`, not by a
+  `Call-ID`, and its verbs carry no scope, so rooms on a shared engine are not
+  separated by scope: give each node's rooms ids no other node uses (put the
+  function in the id). A room's events, unscoped, still reach the node that
+  seated it.
+- **Reap.** `reap_orphans_at_startup` lists and deletes only the calls of this
+  node's scope.
+- **Scripts.** Nothing changes: the scope is node configuration, scripts still
+  name calls by their `Call-ID`, and the events they receive are this node's.
+
+A scope separates nodes that cooperate on one engine. It is a name, not a
+credential: any client that may reach the control port can name any scope, so
+keep nodes that must not reach each other's calls on separate engines. See the
+cookbook: [sharing one media engine between several
+nodes](cookbook/media-rtp.md#sharing-one-media-engine-between-several-nodes).
+
 ### Security
 
 The control channel is a management plane. Either bind `--control` to a trusted

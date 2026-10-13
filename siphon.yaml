@@ -920,6 +920,9 @@ auth:
 #     address: "127.0.0.1:8080"     # siphon-rtp --control <addr> (TCP)
 #     control_secret: "${SIPHON_RTP_CONTROL_SECRET}"  # optional shared secret
 #     timeout_ms: 2000               # per-command response timeout (default 2000)
+#     scope: "edge"                  # optional; this node's calls on an engine shared
+#                                    # with other nodes (engine >= 0.14.0). 1-64 of
+#                                    # A-Z a-z 0-9 - _ ; unset = unscoped, as before
 #
 # Multiple instances (weighted round-robin + per-call-id affinity, same as
 # rtpengine; control_secret is shared across all):

@@ -32,4 +32,4 @@ pub use error::RtpEngineError;
 pub use profile::{NgFlags, ProfileEntry, ProfileRegistry, WsTeeDirection};
 pub use rtpproxy::{RtpProxyClient, RtpProxyClientSet};
 pub use session::{MediaSession, MediaSessionStore};
-pub use siphon_rtp::{set_controller_id, SiphonRtpClient, SiphonRtpClientSet};
+pub use siphon_rtp::{set_controller_id, CallScope, SiphonRtpClient, SiphonRtpClientSet};
