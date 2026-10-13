@@ -1500,6 +1500,99 @@ services:
     profiles:
       - b2bua-reliable-prov
 
+  # --- B2BUA preconditions toward a caller without 100rel (RFC 3312 §5) ---
+  # A B-leg that uses preconditions: its answer in a reliable 183 with nothing
+  # reserved, then an UPDATE with a new offer once it has reserved, from another
+  # port. The A-leg does not use 100rel and, for a call to grace, is relayed the
+  # 183 without its body, so its dialog cannot be sent that offer before its
+  # 200. siphon answers the UPDATE itself on the B-leg's dialog, and the 200 to
+  # the A-leg carries the B-leg's description as the UPDATE left it.
+  #
+  #   172.20.0.250: registration helper
+  #   172.20.0.251: B-leg UAS (reliable 183, UPDATE, 200 without SDP), registered as grace
+  #   172.20.0.252: A-leg UAC (no 100rel)
+
+  sipp-b2bua-early-update-answer-register:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-b2bua-trunk-edge:
+        condition: service_healthy
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.250
+    entrypoint:
+      - sipp
+      - "172.20.0.58:5060"
+      - -sf
+      - /sipp/scenarios/register_alice_contact.xml
+      - -inf
+      - /sipp/scenarios/b2bua_early_update_answer_grace_contact.csv
+      - -s
+      - grace
+      - -ap
+      - secret
+      - -m
+      - "1"
+      - -timeout
+      - "10"
+    profiles:
+      - b2bua-reliable-prov
+
+  sipp-b2bua-early-update-answer-uas:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-b2bua-trunk-edge:
+        condition: service_healthy
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.251
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/b2bua_early_update_answer_uas.xml
+      - -p
+      - "5060"
+      - -m
+      - "1"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - b2bua-reliable-prov
+
+  sipp-b2bua-early-update-answer-uac:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-b2bua-trunk-edge:
+        condition: service_healthy
+      sipp-b2bua-early-update-answer-uas:
+        condition: service_started
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.252
+    entrypoint:
+      - sipp
+      - "172.20.0.58:5060"
+      - -sf
+      - /sipp/scenarios/b2bua_early_update_answer_uac.xml
+      - -s
+      - grace
+      - -m
+      - "1"
+      - -l
+      - "1"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - b2bua-reliable-prov
+
   # --- B2BUA reliable provisionals toward the caller (RFC 3262 §3) ---
   # siphon is the caller's UAS: a provisional reaches the caller reliably on
   # siphon's own RSeq, one at a time, the caller's PRACK is answered by siphon,

@@ -465,42 +465,16 @@ pub fn handle_b2bua_update(inbound: InboundMessage, message: SipMessage, state: 
             let sdp_addr = state.a_leg_advertised_host(target_local_addr, &transport);
             hide_sdp_identity(&mut forwarded.body, state, Some(&sdp_addr));
 
-            // Through the media engine, as a re-INVITE's offer goes: named by
-            // the offering party's own tag, pinned by its own policy, and
-            // shaped for the party it is relayed to.
-            match reoffer_through_media_engine(
-                state,
+            if !update_offer_through_media_engine(
+                &inbound,
+                &message,
+                &call_id,
                 &a_leg.dialog.call_id,
                 from_a_leg,
-                inbound.remote_addr.ip(),
-                &sip_call_id,
-                &forwarded.body,
+                &mut forwarded.body,
+                state,
             ) {
-                ReofferOutcome::NotAnchored => {}
-                ReofferOutcome::Rewritten(rewritten_sdp) => {
-                    forwarded.body = rewritten_sdp;
-                    debug!(call_id = %call_id, "RTPEngine: rewrote UPDATE SDP (offer)");
-                }
-                ReofferOutcome::NoOfferTag => {
-                    warn!(
-                        call_id = %call_id,
-                        "B2BUA UPDATE from the callee on a media session with no recorded \
-                         answerer tag — rejecting with 488 rather than naming the caller to \
-                         the media engine"
-                    );
-                    reject_unanchorable_offer(&message, &inbound, state, &call_id, None);
-                    return;
-                }
-                ReofferOutcome::Failed(error) => {
-                    error!(
-                        call_id = %call_id,
-                        "RTPEngine offer for UPDATE failed: {error} — rejecting the \
-                         UPDATE with 488 rather than forwarding SDP that routes both \
-                         parties around the anchor"
-                    );
-                    reject_unanchorable_offer(&message, &inbound, state, &call_id, None);
-                    return;
-                }
+                return;
             }
             // Own the o= identity toward the leg this UPDATE is sent to (RFC 3264
             // §8), after any rtpengine rewrite.

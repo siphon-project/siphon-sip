@@ -381,7 +381,7 @@ async fn a_2xx_to_an_invite_without_an_offer_is_left_as_the_callee_sent_it() {
 
 /// `text2pcap`'s hex-dump form of `messages`: an offset, then the octets. An
 /// offset of zero starts the next packet.
-fn hex_dump(messages: &[SipMessage]) -> String {
+pub(super) fn hex_dump(messages: &[SipMessage]) -> String {
     let mut dump = String::new();
     for message in messages {
         for (offset, chunk) in message.to_bytes().chunks(16).enumerate() {

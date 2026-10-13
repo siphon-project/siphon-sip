@@ -727,20 +727,62 @@ fn previewed_answer(
     state
         .call_actors
         .read_b_leg_on(call_id, &snapshot.branch, |leg| {
-            let on_this_dialog = leg.early_answer_dialog.is_none()
-                || leg.early_answer_dialog == leg.dialog.remote_tag;
-            (leg.early_answer_sent.clone(), on_this_dialog)
+            (
+                leg.early_answer_sent.clone(),
+                early_answer_is_of_the_answering_dialog(leg),
+            )
         })
         .unwrap_or_default()
+}
+
+/// Whether the session descriptions `leg` holds from before its 2xx are of the
+/// early dialog that 2xx came on, which a fork beyond the callee can make one
+/// of several (RFC 3261 §12.1.2).
+fn early_answer_is_of_the_answering_dialog(leg: &Leg) -> bool {
+    leg.early_answer_dialog.is_none() || leg.early_answer_dialog == leg.dialog.remote_tag
 }
 
 /// Whether the caller offered in its INVITE and its dialog has not had the
 /// answer in a reliable provisional (RFC 3261 §13.2.1). Read off the call as it
 /// is now: the caller's dialog may have had it since the snapshot was taken.
 fn caller_is_owed_the_answer(call_id: &str, state: &DispatcherState) -> bool {
-    state.call_actors.get_call(call_id).is_some_and(|call| {
-        call.a_leg.last_sdp.is_some() && call.a_leg.dialog.last_sent_sdp.is_none()
-    })
+    state
+        .call_actors
+        .get_call(call_id)
+        .is_some_and(|call| call.caller_is_owed_the_answer())
+}
+
+/// Put on the callee's 2xx, which carried no SDP, the session description an
+/// UPDATE of the callee's left on the early dialog the 2xx came on, when siphon
+/// answered that UPDATE without the caller (`answer_callee_early_update`) and
+/// the caller is still owed its answer.
+///
+/// It is the callee's description as the caller is to get it, so from here the
+/// 2xx is treated as one the callee sent with it: a revision of the session an
+/// unreliable provisional previewed, the same version when it changed nothing
+/// (`origin_after_preview`), or the first description of a caller that was
+/// shown none.
+fn carry_answer_revised_by_update(
+    call_id: &str,
+    response: &mut SipMessage,
+    state: &DispatcherState,
+    snapshot: &BLegResponseSnapshot,
+) {
+    if !response.body.is_empty() || !caller_is_owed_the_answer(call_id, state) {
+        return;
+    }
+    let revised = state
+        .call_actors
+        .read_b_leg_on(call_id, &snapshot.branch, |leg| {
+            leg.early_answer_revised
+                .clone()
+                .filter(|_| early_answer_is_of_the_answering_dialog(leg))
+        })
+        .flatten();
+    if let Some(answer) = revised {
+        debug!(call_id = %call_id, "B2BUA: the callee's 2xx carries no SDP, the caller's carries the callee's description as its UPDATE left it (RFC 3261 §13.2.1)");
+        set_sdp_body(response, answer, "application/sdp");
+    }
 }
 
 /// Whether two session descriptions are the same apart from their `o=` line.
@@ -878,6 +920,10 @@ pub fn prepare_a_leg_answer(
         call_id,
         script_shaped_headers,
     );
+
+    // An UPDATE of the callee's that siphon answered for the caller changed
+    // what the caller is owed: a 2xx without SDP carries that description.
+    carry_answer_revised_by_update(call_id, response, state, snapshot);
 
     // Own the o= identity toward the A-leg on the answer it receives (RFC
     // 3264 §8): the first SDP siphon emits toward the caller fixes the leg's

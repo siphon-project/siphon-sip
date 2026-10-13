@@ -1119,6 +1119,12 @@ jobs:
       - name: A 183 the script relays without its body, the 180 as it is, the answer in the 200
         run: COMPOSE_PROFILES=b2bua-reliable-prov bash sipp/run_call.sh sipp-b2bua-ringback-uac sipp-b2bua-ringback-uas
 
+      - name: Register grace against the trunk-edge instance
+        run: docker compose -f sipp/docker-compose.yaml --profile b2bua-reliable-prov run --rm sipp-b2bua-early-update-answer-register
+
+      - name: A callee's UPDATE answered by siphon, its description in the 200 to the non-100rel A-leg
+        run: COMPOSE_PROFILES=b2bua-reliable-prov bash sipp/run_call.sh sipp-b2bua-early-update-answer-uac sipp-b2bua-early-update-answer-uas
+
       - name: Collect siphon logs
         if: always()
         run: docker compose -f sipp/docker-compose.yaml logs siphon-b2bua-trunk-edge > siphon-reliable-prov.log 2>&1 || true

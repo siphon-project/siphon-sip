@@ -397,6 +397,11 @@ pub struct Leg {
     /// caller would have got it. The answer the caller's 2xx has to carry, when
     /// no later response from this leg showed the caller one.
     pub early_answer_withheld: Option<Vec<u8>>,
+    /// On a B-leg: the callee's session description after an UPDATE of its own
+    /// that siphon answered on this leg's early dialog without the caller
+    /// (`answer_callee_early_update`), as the caller is to get it. The answer
+    /// the caller's 2xx carries from then on, whatever a provisional showed.
+    pub early_answer_revised: Option<Vec<u8>>,
     /// The callee's To tag on the response either of the two came in: the early
     /// dialog whose answer it is, which a fork beyond the callee can make one of
     /// several on this leg (RFC 3261 §12.1.2). `None` when the response carried
@@ -449,6 +454,7 @@ impl Leg {
             offered_sdp: None,
             early_answer_sent: None,
             early_answer_withheld: None,
+            early_answer_revised: None,
             early_answer_dialog: None,
             early_exchange_complete: false,
             request_session_expires: None,
@@ -507,6 +513,7 @@ impl Leg {
             offered_sdp: None,
             early_answer_sent: None,
             early_answer_withheld: None,
+            early_answer_revised: None,
             early_answer_dialog: None,
             early_exchange_complete: false,
             request_session_expires: None,
@@ -524,17 +531,39 @@ impl Leg {
     /// from the caller leaves what the caller was shown on the same early
     /// dialog, which is what its 2xx repeats (RFC 6337 §3.1.1). Another early
     /// dialog starts over, since its answer is its own (RFC 3261 §13.2.1).
+    ///
+    /// Neither replaces a description an UPDATE on the same early dialog left
+    /// ([`record_early_answer_revision`](Self::record_early_answer_revision)):
+    /// once the callee has its answer, the session description of a later
+    /// provisional is not another one (RFC 3261 §13.2.1).
     pub fn record_early_answer(&mut self, sdp: Vec<u8>, dialog: Option<String>, shown: bool) {
-        if self.early_answer_dialog != dialog {
-            self.early_answer_sent = None;
-            self.early_answer_withheld = None;
-            self.early_answer_dialog = dialog;
-        }
+        self.start_over_on_another_early_dialog(dialog);
         if shown {
             self.early_answer_sent = Some(sdp);
             self.early_answer_withheld = None;
         } else {
             self.early_answer_withheld = Some(sdp);
+        }
+    }
+
+    /// Record `sdp`, this callee's session description as an UPDATE on its
+    /// early dialog `dialog` left it and as the caller is to get it, when
+    /// siphon answered that UPDATE without the caller. What a provisional on
+    /// the same early dialog showed the caller, or a script kept from it,
+    /// stays recorded: the caller's 2xx is a revision of what it was shown.
+    pub fn record_early_answer_revision(&mut self, sdp: Vec<u8>, dialog: Option<String>) {
+        self.start_over_on_another_early_dialog(dialog);
+        self.early_answer_revised = Some(sdp);
+    }
+
+    /// Forget the session descriptions of another early dialog than `dialog`,
+    /// which is the one the next is recorded for.
+    fn start_over_on_another_early_dialog(&mut self, dialog: Option<String>) {
+        if self.early_answer_dialog != dialog {
+            self.early_answer_sent = None;
+            self.early_answer_withheld = None;
+            self.early_answer_revised = None;
+            self.early_answer_dialog = dialog;
         }
     }
 

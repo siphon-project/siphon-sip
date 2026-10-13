@@ -202,60 +202,33 @@ pub fn forward_update_response(
         // RTPEngine answer for UPDATE 2xx with SDP body (codec/precondition
         // re-negotiation). Empty-body 2xx (session-timer refresh) bypasses.
         if (200..300).contains(&status_code) && !message.body.is_empty() {
-            if let (Some(ref rtpengine_set), Some(ref media_sessions), Some(ref profiles)) = (
-                &state.rtpengine_set,
-                &state.rtpengine_sessions,
-                &state.rtpengine_profiles,
+            match update_answer_through_media_engine(
+                state,
+                &snapshot.a_leg.dialog.call_id,
+                is_a2b,
+                response_source.ip(),
+                responder_headers.call_id().map(String::as_str),
+                &message.body,
             ) {
-                let a_sip_call_id = &snapshot.a_leg.dialog.call_id;
-                if let Some(session) = media_sessions.get(a_sip_call_id) {
-                    // Shaped for the party the answer is relayed to, the one that
-                    // offered, by its own side of the profile.
-                    if let Some(shape) = session.party_shape(is_a2b).resolve(profiles) {
-                        // Same rule as the re-INVITE answer above: a B→A answer must name the callee
-                        // as offerer, and a 2xx cannot be refused, so an unnameable pair leaves the
-                        // SDP alone rather than attributing it to the wrong party.
-                        if let Some((answer_from, answer_to)) = session.answer_tags(is_a2b) {
-                            let mut answer_flags = shape;
-                            // The answering party's own policy, as on a
-                            // re-INVITE's answer.
-                            session.party_ingress(!is_a2b).stamp_ingress(
-                                &mut answer_flags,
-                                profiles,
-                                response_source.ip(),
-                            );
-                            if let Some(responder_call_id) = responder_headers.call_id() {
-                                answer_flags.stamp_sip_call_id(responder_call_id);
-                            }
-                            match tokio::task::block_in_place(|| {
-                                tokio::runtime::Handle::current().block_on(rtpengine_set.answer(
-                                    session.rtpengine_id(),
-                                    answer_from,
-                                    answer_to,
-                                    &message.body,
-                                    &answer_flags,
-                                ))
-                            }) {
-                                Ok(rewritten_sdp) => {
-                                    message.body = rewritten_sdp;
-                                    message
-                                        .headers
-                                        .set("Content-Length", message.body.len().to_string());
-                                    debug!(call_id = %call_id, "RTPEngine: rewrote UPDATE response SDP (answer)");
-                                }
-                                Err(error) => {
-                                    warn!(call_id = %call_id, "RTPEngine answer for UPDATE failed: {error}");
-                                }
-                            }
-                        } else {
-                            error!(
-                                call_id = %call_id,
-                                "UPDATE from the callee answered on a media session with no \
-                                 recorded answerer tag — leaving the answer SDP unanchored rather \
-                                 than naming the caller to the media engine"
-                            );
-                        }
-                    }
+                UpdateAnswerOutcome::NotAnchored => {}
+                UpdateAnswerOutcome::Rewritten(rewritten_sdp) => {
+                    message.body = rewritten_sdp;
+                    message
+                        .headers
+                        .set("Content-Length", message.body.len().to_string());
+                    debug!(call_id = %call_id, "RTPEngine: rewrote UPDATE response SDP (answer)");
+                }
+                UpdateAnswerOutcome::Failed(error) => {
+                    warn!(call_id = %call_id, "RTPEngine answer for UPDATE failed: {error}");
+                }
+                // A 2xx cannot be refused, so the SDP is left alone.
+                UpdateAnswerOutcome::NoAnswererTag => {
+                    error!(
+                        call_id = %call_id,
+                        "UPDATE from the callee answered on a media session with no \
+                         recorded answerer tag — leaving the answer SDP unanchored rather \
+                         than naming the caller to the media engine"
+                    );
                 }
             }
         }

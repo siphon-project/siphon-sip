@@ -17,6 +17,12 @@
 #            SDP and no P-Early-Media authorising it without its body
 #            (reply.relay(body=False)), and the answer reaches the A-leg in
 #            the 200 (RFC 3960 §3.2).
+#            Preconditions toward a caller without 100rel: the B-leg (grace)
+#            answers in a reliable 183 with nothing reserved and reports its
+#            resources reserved in an UPDATE with a new offer. The A-leg cannot
+#            be sent that offer before its 200, so siphon answers the UPDATE
+#            itself and the 200 carries the B-leg's description as the UPDATE
+#            left it (RFC 3312 §5.2).
 #
 # This instance pins `sip-trunk-edge@2026`, whose response policy is
 # `default → Copy` and does NOT strip Require/RSeq.  The 100rel strip must
@@ -52,6 +58,7 @@ auth:
     bob: "secret"
     carol: "secret"
     dave: "secret"
+    grace: "secret"
 
 b2bua:
   default_header_policy: "sip-trunk-edge@2026"

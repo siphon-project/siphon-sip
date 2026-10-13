@@ -26,6 +26,7 @@ mod dial_cancel;
 mod dial_target;
 mod dialog_state;
 mod early_update;
+mod early_update_answer;
 mod forward;
 mod handover;
 mod held_bye;
@@ -60,6 +61,7 @@ mod transfer_fork;
 mod transfer_media;
 mod unanchored_reoffer;
 mod update;
+mod update_media;
 
 pub use ack::*;
 pub use b_leg::*;
@@ -76,6 +78,7 @@ pub use dial_cancel::*;
 pub use dial_target::*;
 pub use dialog_state::*;
 pub use early_update::*;
+pub use early_update_answer::*;
 pub use forward::*;
 pub use handover::*;
 pub use held_bye::*;
@@ -109,6 +112,7 @@ pub use transfer_fork::*;
 pub use transfer_media::*;
 pub use unanchored_reoffer::*;
 pub use update::*;
+pub use update_media::*;
 
 /// Whether B2BUA mode handles this call.
 ///

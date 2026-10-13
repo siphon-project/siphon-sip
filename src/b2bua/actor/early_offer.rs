@@ -22,6 +22,15 @@
 //! crossing, and will be takeable once that dialog catches up, so it is asked
 //! for again the same way: 500 with a Retry-After.
 //!
+//! One case of that last kind is not refused. A caller that offered in its
+//! INVITE and has not had the answer reliably takes it in its 2xx, and until
+//! then its dialog can be sent no offer at all (RFC 3311 §5.1: a UAS "cannot
+//! send an UPDATE with an offer" before its answer went reliably). Asking the
+//! callee to try again gets it the same refusal every time, although on the
+//! callee's dialog siphon is the UAC and owes its UPDATE an answer. siphon
+//! gives that answer itself, and the caller's 2xx carries the session
+//! description the callee's UPDATE left ([`EarlyOffer::Answer`]).
+//!
 //! Pure state: the dispatcher answers or relays what this decides.
 
 use super::{CallActor, CallState, Leg};
@@ -62,6 +71,10 @@ pub struct EarlyOfferState {
     /// An offer of the other party's is with the offerer, relayed by siphon on
     /// the dialog the UPDATE arrived on, and has no answer yet.
     pub crossing_offer_pending: bool,
+    /// The offer is a callee's and the caller takes the answer to its INVITE in
+    /// the 2xx: its dialog has not had it in a reliable provisional and none
+    /// that carries it is on its way, so no offer can be sent there before.
+    pub caller_takes_answer_in_final: bool,
 }
 
 /// What an UPDATE carrying an offer on a call nobody has answered comes to.
@@ -69,6 +82,9 @@ pub struct EarlyOfferState {
 pub enum EarlyOffer {
     /// It crosses to the other party.
     Relay,
+    /// siphon answers it on the callee's dialog it arrived on, and the caller
+    /// gets what it changes in its 2xx (RFC 3261 §13.2.1).
+    Answer,
     /// It is refused on the dialog it arrived on, and the session stays as it
     /// was (RFC 3311 §5.3).
     Refuse {
@@ -84,6 +100,8 @@ impl EarlyOfferState {
     /// Decide by RFC 3311 §5.2, in its order: the offerer's own unfinished
     /// offer, an offer of siphon's crossing it, the INVITE's exchange on the
     /// offerer's dialog, and last whether the other dialog can carry it (§5.1).
+    /// A callee's offer the caller's dialog can carry only after its 2xx is
+    /// answered by siphon instead of refused.
     pub fn decide(&self) -> EarlyOffer {
         if self.offerer_offer_pending {
             return EarlyOffer::Refuse {
@@ -118,14 +136,18 @@ impl EarlyOfferState {
         }
         match self.relay_dialog {
             Some(InitialExchange::Complete) => EarlyOffer::Relay,
+            _ if self.caller_takes_answer_in_final => EarlyOffer::Answer,
             _ => EarlyOffer::Refuse {
                 status: 500,
                 retry_after: true,
-                why: "the other party's dialog cannot carry an offer yet",
+                why: OTHER_DIALOG_NOT_READY,
             },
         }
     }
 }
+
+/// Why an offer is refused that the other party's dialog cannot carry yet.
+pub const OTHER_DIALOG_NOT_READY: &str = "the other party's dialog cannot carry an offer yet";
 
 impl CallActor {
     /// Whether the call's INVITE is still pending between the caller and at
@@ -214,6 +236,7 @@ impl CallActor {
                     .map(callee_exchange),
                 offerer_offer_pending: caller_offer_pending,
                 crossing_offer_pending: callee_offer_pending,
+                caller_takes_answer_in_final: false,
             },
             Some(origin) => EarlyOfferState {
                 offerer_dialog: self
@@ -223,8 +246,18 @@ impl CallActor {
                 relay_dialog: (bridged == Some(origin)).then(|| self.caller_exchange()),
                 offerer_offer_pending: callee_offer_pending,
                 crossing_offer_pending: caller_offer_pending,
+                caller_takes_answer_in_final: self.caller_is_owed_the_answer()
+                    && !self.a_leg_reliability.session_description_queued(),
             },
         }
+    }
+
+    /// Whether the caller offered in its INVITE and its dialog has not had the
+    /// answer in a reliable provisional, so that its 2xx has to carry it
+    /// (RFC 3261 §13.2.1). The answer a reliable provisional carries is in
+    /// force on the caller's dialog as that provisional goes.
+    pub fn caller_is_owed_the_answer(&self) -> bool {
+        self.a_leg.last_sdp.is_some() && self.a_leg.dialog.last_sent_sdp.is_none()
     }
 
     /// The INVITE's exchange on the caller's dialog. The caller offered in its
@@ -487,6 +520,7 @@ mod tests {
             relay_dialog,
             offerer_offer_pending,
             crossing_offer_pending,
+            caller_takes_answer_in_final: false,
         }
     }
 
@@ -498,6 +532,7 @@ mod tests {
                 ..
             } => (status, retry_after),
             EarlyOffer::Relay => panic!("relayed"),
+            EarlyOffer::Answer => panic!("answered"),
         }
     }
 
@@ -562,6 +597,96 @@ mod tests {
             let decision = state(complete, relay_dialog, false, false).decide();
             assert_eq!(refusal(decision), (500, true), "{relay_dialog:?}");
         }
+    }
+
+    /// The caller of [`ringing`] offered in its INVITE.
+    fn caller_offered(call: &mut CallActor) {
+        call.a_leg.last_sdp = Some(b"v=0\r\n".to_vec());
+    }
+
+    #[test]
+    fn a_callees_offer_is_answered_while_the_caller_takes_its_answer_in_the_2xx() {
+        let complete = InitialExchange::Complete;
+        for relay_dialog in [
+            None,
+            Some(InitialExchange::SiphonOwesAnswer),
+            Some(InitialExchange::SiphonAwaitsAnswer),
+        ] {
+            let mut state = state(complete, relay_dialog, false, false);
+            state.caller_takes_answer_in_final = true;
+            assert_eq!(state.decide(), EarlyOffer::Answer, "{relay_dialog:?}");
+        }
+    }
+
+    /// What RFC 3311 §5.2 has siphon refuse on the callee's own dialog comes
+    /// first, whatever the caller's dialog waits for.
+    #[test]
+    fn the_callees_own_dialog_is_judged_before_its_offer_is_answered() {
+        let complete = InitialExchange::Complete;
+        let answerable = |mut state: EarlyOfferState| {
+            state.caller_takes_answer_in_final = true;
+            state.decide()
+        };
+        assert_eq!(
+            refusal(answerable(state(complete, None, true, false))),
+            (500, true)
+        );
+        assert_eq!(
+            refusal(answerable(state(complete, None, false, true))),
+            (491, false)
+        );
+        assert_eq!(
+            refusal(answerable(state(
+                InitialExchange::SiphonAwaitsAnswer,
+                None,
+                false,
+                false
+            ))),
+            (491, false)
+        );
+        assert_eq!(
+            refusal(answerable(state(
+                InitialExchange::SiphonOwesAnswer,
+                None,
+                false,
+                false
+            ))),
+            (500, true)
+        );
+    }
+
+    #[test]
+    fn the_caller_takes_its_answer_in_the_2xx_until_it_had_it_reliably() {
+        // Shown the answer in an unreliable provisional, or kept from it.
+        let mut call = ringing(1);
+        caller_offered(&mut call);
+        answer_reliably(&mut call, 0);
+        assert!(call.caller_is_owed_the_answer());
+        let state = call.early_offer_state(Some(0));
+        assert!(state.caller_takes_answer_in_final);
+        assert_eq!(state.decide(), EarlyOffer::Answer);
+        call.b_legs[0].early_answer_sent = None;
+        assert_eq!(call.early_offer_state(Some(0)).decide(), EarlyOffer::Answer);
+        // The caller's own offer is never answered for the callee.
+        assert!(!call.early_offer_state(None).caller_takes_answer_in_final);
+
+        // The answer went to the caller in a reliable provisional: an offer
+        // waits for its PRACK and then crosses.
+        call.a_leg.dialog.last_sent_sdp = Some(b"v=0\r\n".to_vec());
+        assert!(!call.caller_is_owed_the_answer());
+        let state = call.early_offer_state(Some(0));
+        assert!(!state.caller_takes_answer_in_final);
+        assert_eq!(refusal(state.decide()), (500, true));
+    }
+
+    #[test]
+    fn a_caller_that_offered_nothing_is_owed_no_answer() {
+        let mut call = ringing(1);
+        answer_reliably(&mut call, 0);
+        assert!(!call.caller_is_owed_the_answer());
+        let state = call.early_offer_state(Some(0));
+        assert!(!state.caller_takes_answer_in_final);
+        assert_eq!(refusal(state.decide()), (500, true));
     }
 
     #[test]

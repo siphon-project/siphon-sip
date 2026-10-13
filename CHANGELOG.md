@@ -240,6 +240,77 @@ entry, but a working config keeps working.
 
 ### Fixed
 
+- **B2BUA: a callee's UPDATE with an offer is answered when the caller takes
+  its answer in the 2xx (RFC 3311 §5, RFC 3312 §5.2). Behaviour change on the
+  wire.** A callee that uses preconditions answers in a reliable 183 with
+  nothing reserved, is PRACKed, and reports its resources reserved in an
+  UPDATE with a new offer before it alerts. A caller that does not use
+  `100rel`, or that a script relayed the 183 to without its body
+  (`reply.relay(body=False)`, `reply.withhold()`), has not had its answer
+  reliably, and RFC 3311 §5.1 lets a UAS send it no offer until it has. siphon
+  refused the callee's UPDATE `500` with a `Retry-After` for that reason, and
+  went on refusing it however often it was tried, since the caller's dialog
+  only catches up with its 2xx. On the callee's dialog siphon is the UAC and
+  owes the UPDATE an answer, and a callee refused the UPDATE that completes
+  its side of the preconditions may never alert.
+
+  siphon now answers that UPDATE `200` on the callee's dialog, with what the
+  caller would say:
+
+  | In the answer | It is |
+  |---|---|
+  | address, port, session-level lines | the caller's own, as siphon's INVITE offered them to the callee: the caller's media did not change |
+  | formats | those the caller offered that the callee's new offer lists, the same payload type naming the same codec (RFC 3264 §8.3.2) |
+  | direction | the caller's, cut down to what the offer leaves: `sendonly` is answered `recvonly` (RFC 3264 §6.1) |
+  | a stream the caller has none for, or shares no format with | rejected, port 0 (RFC 3264 §6) |
+  | `a=curr:qos local` | `sendrecv`: siphon reserves nothing, so its side is met |
+  | `a=curr:qos remote` | what the callee reported as its `local`, turned round (RFC 3312 §5.2, table 3) |
+  | `a=curr:qos e2e` | what the callee reported, turned round, plus `send` (§13.1: each party reports the direction it sends in) |
+  | `a=des:` | every line of the offer at its own strength, `local`/`remote` and `send`/`recv` inverted (table 4) |
+  | `o=` | siphon's session on the callee's dialog at its next version (RFC 3264 §8) |
+
+  No `a=conf:` is sent. The caller is brought up to date where its dialog can
+  be, in its 2xx: when the callee's 2xx carries no SDP, the caller's carries
+  the callee's description as the UPDATE left it (address, port, formats the
+  caller offered, direction), without the callee's `a=curr:`, `a=des:` and
+  `a=conf:`, which the caller's leg never negotiated. It follows the `o=`
+  rules of the entry below: the session an unreliable provisional previewed
+  at its next version, at the same version when the UPDATE changed nothing
+  the caller sees, and the first version of the caller's own session when it
+  was shown none. A callee's 2xx that carries SDP is relayed as before.
+  siphon adds the description to no provisional: what the caller is shown
+  before the answer stays the script's to decide.
+
+  On an anchored call both steps go through the media engine as a relayed
+  UPDATE's do, with no script handler involved: the callee's offer as a
+  re-offer from the callee's side, so a changed address or port reaches the
+  engine, and the caller's description as the answer that completes it. The
+  callee is answered with the engine's description toward it and the caller's
+  2xx carries the engine's toward the caller. An engine that refuses either
+  step has the UPDATE refused `488`, as for a relayed one.
+
+  Still refused `500` with a `Retry-After`, with the reason logged, because
+  siphon cannot answer it for the caller: a caller whose own offer carries
+  preconditions (only it can report what it has reserved), streams that are
+  keyed, use ICE or are grouped (`a=crypto`, `a=fingerprint`, `a=ice-ufrag`,
+  `a=mid` and the like), an offer with no stream and format of the caller's or
+  with fewer streams than the session, a precondition type other than `qos`,
+  and an anchored session whose answerer is another callee's dialog. Each
+  callee of a fork is answered on its own dialog.
+
+  Unchanged: an UPDATE from the caller; an UPDATE without an offer, answered
+  `200` without a body in any state; a callee's UPDATE once the caller has
+  PRACKed the reliable provisional that carried its answer, which is relayed;
+  one that arrives before that PRACK, refused `491` because siphon's own PRACK
+  to the callee waits for the caller's; one on a call whose caller offered
+  nothing; the `491` and `500` of RFC 3311 §5.2 for offers that cross or
+  overlap, which are decided first; and an UPDATE after the answer. A
+  retransmitted UPDATE is answered again, as one without an offer already
+  was. Covered by `dispatcher::early_update_answer_tests`, `media::answer`,
+  `media::precondition`, the SIPp scenario `b2bua_early_update_answer_*` in
+  the `sipp-b2bua-reliable-prov` job, and read back with Wireshark's SIP and
+  SDP dissectors by `scripts/validate_b2bua_early_update_answer.sh`.
+
 - **B2BUA: the caller's 2xx carries the answer when the callee's does not and
   the caller's own dialog never had it reliably (RFC 3261 §13.2.1). Behaviour
   change on the wire.** A callee that gives its answer in a reliable provisional

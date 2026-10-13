@@ -358,6 +358,15 @@ impl ALegReliableProvisionals {
         self.offer_to_caller.is_some()
     }
 
+    /// Whether a reliable provisional that carries a session description waits
+    /// behind an unacknowledged one: the caller's answer is on its way to it
+    /// before the 2xx.
+    pub fn session_description_queued(&self) -> bool {
+        self.queued
+            .iter()
+            .any(|queued| queued.reliable && carries_session_description(&queued.response))
+    }
+
     /// The `RSeq` of the provisional awaiting its PRACK.
     pub fn unacknowledged_rseq(&self) -> Option<u32> {
         self.unacknowledged.as_ref().map(|pending| pending.rseq)
@@ -520,6 +529,33 @@ mod tests {
             }
             other => panic!("expected an acknowledgement, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_session_description_queued_behind_an_unacknowledged_provisional_is_on_its_way() {
+        let now = Instant::now();
+        let mut state = ALegReliableProvisionals::default();
+        let Offered::Send(first) = state.offer(provisional(180, false), true, None, now) else {
+            panic!("the first goes out");
+        };
+        assert!(!state.session_description_queued());
+        assert!(matches!(
+            state.offer(provisional(183, false), true, None, now),
+            Offered::Queued
+        ));
+        assert!(!state.session_description_queued(), "it carries none");
+        assert!(matches!(
+            state.offer(provisional(183, true), true, None, now),
+            Offered::Queued
+        ));
+        assert!(state.session_description_queued());
+        // Sent, it is no longer queued: the caller's dialog has it.
+        let rseq = first.rseq.expect("sent reliably");
+        let _ = state.acknowledge(rseq, 7, now);
+        assert!(state.session_description_queued(), "one reliable at a time");
+        let next = state.unacknowledged_rseq().expect("the next reliable one");
+        let _ = state.acknowledge(next, 7, now);
+        assert!(!state.session_description_queued());
     }
 
     #[test]

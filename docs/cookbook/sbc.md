@@ -306,7 +306,8 @@ incoming media packets, generate local ringing"). `reply.withhold()` relays noth
 for a response instead. The callee's dialog goes on as it would have: SIPhon PRACKs
 the reliable provisional, `@b2bua.on_early_media` still runs with the session
 description for the media engine, and an UPDATE on the early dialog is handled as
-for any caller that has not had the answer reliably. The caller gets the answer in
+for any caller that has not had the answer reliably: SIPhon answers a callee's
+itself (see "Preconditions before the answer"). The caller gets the answer in
 the 2xx, also when the callee's 2xx carries none (RFC 3261 §13.2.1). An authorised
 provisional that follows is relayed with its session description. With a fork each
 callee's provisional runs the handler and is judged on its own header.
@@ -386,6 +387,47 @@ has it, `500` with a `Retry-After` of 0 to 10 seconds to try again, or `491` whe
 crosses an offer of the other party's, and the session stays as it was. A callee
 that sends its 183 unreliably has not answered yet (RFC 3262 §5), so a caller's
 UPDATE waits for that callee's 2xx.
+
+One UPDATE that cannot cross is answered instead of refused. A caller that does
+not use `100rel`, or that a script relayed the callee's 183 to without its body,
+takes the answer to its INVITE in the 2xx, and until then its dialog can be sent
+no offer at all (RFC 3311 §5.1). The callee has its answer and may send an UPDATE
+all the same, typically the one that reports its resources reserved. SIPhon is
+the UAC of the callee's dialog, so it answers that UPDATE `200` there with what
+the caller would say: the caller's own stream as the INVITE offered it, the
+formats both sides list, and the precondition status of a party with nothing to
+reserve (RFC 3312 §5.2). For a callee's offer of
+
+```text
+a=curr:qos local sendrecv
+a=curr:qos remote none
+a=des:qos mandatory local sendrecv
+a=des:qos optional remote sendrecv
+```
+
+the answer carries, every tag inverted for the answerer:
+
+```text
+a=curr:qos local sendrecv
+a=curr:qos remote sendrecv
+a=des:qos optional local sendrecv
+a=des:qos mandatory remote sendrecv
+```
+
+The caller's 2xx then carries the callee's session description as that UPDATE
+left it (a changed address or port included) without the callee's precondition
+attributes, also when the callee's own 2xx has no SDP. On an anchored call the
+offer and the answer go through the media engine as a relayed UPDATE's do.
+Nothing in the script takes part here either: no handler runs for the UPDATE,
+`@b2bua.on_answer` sees the callee's 2xx as it came, and SIPhon adds the session
+description to no provisional.
+
+This holds only where SIPhon can speak for the caller. The UPDATE is still
+refused `500` with a `Retry-After` when the caller's own offer carries
+preconditions, which are then the two endpoints' to settle and need a caller
+that uses `100rel` (RFC 3312 §11), when a stream is keyed, uses ICE or is grouped
+(`a=crypto`, `a=fingerprint`, `a=ice-ufrag`, `a=mid`), or when the offer shares
+no format with the caller's.
 
 ### A caller's `Require`
 
