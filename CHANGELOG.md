@@ -293,6 +293,18 @@ entry, but a working config keeps working.
 
 ### Changed
 
+- **The dialog-state match over a captured flow no longer scans every
+  binding.** `binding_for_source`, which the dialog-state publisher runs for
+  each branch relayed with `request.relay(flow=...)`, read the whole table:
+  about 76 ms per call at 500k AoRs on a hit, 92 ms on a miss. The contact
+  index now also keys each binding by the address its REGISTER came from, kept
+  in step by the same paths, so it takes about 300 ns on a hit and 16 ns on a
+  miss at any registration count. It costs about 52 bytes of live memory per
+  binding with a known source (1030 → 1082 at 200k bindings,
+  `scripts/registrar_scale_test.sh`, two interleaved runs). Many AoRs behind
+  one address (a PBX or an SBC) are held as a counted map, so adding and
+  removing their bindings stays constant time.
+
 - **A registrar lookup by Contact no longer scans every binding.**
   `registrar.lookup_contact()`, `registrar.is_registered_contact()` and the
   binding match the dialog-state publisher runs for every branch it tracks

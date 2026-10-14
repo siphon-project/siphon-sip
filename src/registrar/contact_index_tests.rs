@@ -406,7 +406,12 @@ fn a_lookup_reads_only_the_aors_the_index_names() {
             None,
         );
     }
-    assert_eq!(registrar.contact_index.len(), 5_000);
+    // One entry by Contact and one by source address per binding.
+    assert_eq!(registrar.contact_index.len(), 5_001);
+    // All 5000 came from one address, as behind a PBX: owned by no one AoR.
+    assert!(registrar
+        .binding_for_source(source().expect("a source"))
+        .is_none());
     assert_eq!(
         registrar.contact_index.aors(
             registrar
@@ -423,4 +428,107 @@ fn a_lookup_reads_only_the_aors_the_index_names() {
                 .key_of(&uri("sip:nobody@198.51.100.7"))
         )
         .is_empty());
+}
+
+/// Binding `index`'s own source address.
+fn own_source(index: u32) -> SocketAddr {
+    SocketAddr::from((
+        [203, 0, 113, (index % 250 + 1) as u8],
+        10_000 + (index / 250) as u16,
+    ))
+}
+
+fn register_from(registrar: &Registrar, aor: &str, contact: &str, from: SocketAddr, expires: u32) {
+    registrar
+        .save_with_source(
+            aor,
+            uri(contact),
+            expires,
+            1.0,
+            format!("{aor}-{from}"),
+            1,
+            Some(from),
+            Some(Transport::Udp),
+        )
+        .expect("the REGISTER is accepted");
+}
+
+/// `binding_for_source` reads the AoRs the index names for the address a
+/// binding's REGISTER came from, and answers as the scan it replaces did: the
+/// one AoR with a live binding from there, none when two share it.
+#[test]
+fn a_binding_is_found_by_the_address_its_register_came_from() {
+    let registrar = Registrar::default();
+    for index in 0..1_000 {
+        register_from(
+            &registrar,
+            &format!("sip:user{index}@example.invalid"),
+            &format!("sip:user{index}@198.51.100.7:{}", 20_000 + index),
+            own_source(index),
+            3600,
+        );
+    }
+    consistent(&registrar, "bindings with their sources");
+    assert_eq!(
+        registrar.binding_for_source(own_source(42)),
+        Some((
+            "sip:user42@example.invalid".to_string(),
+            "sip:user42@198.51.100.7:20042".to_string()
+        ))
+    );
+    assert_eq!(
+        registrar
+            .contact_index
+            .aors(registrar.contact_index.source_key_of(own_source(42))),
+        ["sip:user42@example.invalid"],
+        "the index names the one AoR"
+    );
+    let nowhere = SocketAddr::from(([203, 0, 113, 1], 9_999));
+    assert!(registrar.binding_for_source(nowhere).is_none());
+
+    // A second AoR registering from the same address: owned by neither.
+    register_from(
+        &registrar,
+        BOB,
+        "sip:bob@198.51.100.8",
+        own_source(42),
+        3600,
+    );
+    assert!(registrar.binding_for_source(own_source(42)).is_none());
+    registrar.remove_all(BOB);
+    consistent(&registrar, "the second AoR removed");
+    assert!(registrar.binding_for_source(own_source(42)).is_some());
+
+    // A de-registered or expired binding is not found by its source.
+    register_from(
+        &registrar,
+        "sip:user42@example.invalid",
+        "sip:user42@198.51.100.7:20042",
+        own_source(42),
+        0,
+    );
+    consistent(&registrar, "a de-registration");
+    assert!(registrar.binding_for_source(own_source(42)).is_none());
+    expire(&registrar, "sip:user43@example.invalid");
+    assert!(registrar.binding_for_source(own_source(43)).is_none());
+    registrar.expire_stale();
+    consistent(&registrar, "the expiry sweep");
+
+    // A refresh from a new address moves the binding's source.
+    register_from(
+        &registrar,
+        "sip:user44@example.invalid",
+        "sip:user44@198.51.100.7:20044",
+        nowhere,
+        3600,
+    );
+    consistent(&registrar, "a refresh from a new address");
+    assert!(registrar.binding_for_source(own_source(44)).is_none());
+    assert_eq!(
+        registrar
+            .binding_for_source(nowhere)
+            .map(|(aor, _)| aor)
+            .as_deref(),
+        Some("sip:user44@example.invalid")
+    );
 }
