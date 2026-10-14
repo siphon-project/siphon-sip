@@ -861,11 +861,13 @@ impl SiphonServer {
                     crate::config::IpsecBackend::Netlink => crate::ipsec::XfrmBackend::Netlink,
                     crate::config::IpsecBackend::Ip => crate::ipsec::XfrmBackend::IpCommand,
                 };
-                let spi_start = ipsec_config.spi_range_start.unwrap_or(10000);
+                let spi_start = ipsec_config.effective_spi_range_start();
                 let spi_count = ipsec_config.spi_range_count;
                 let manager = Arc::new(crate::ipsec::IpsecManager::with_partition(
                     backend, spi_start, spi_count,
                 ));
+                // SAs a previous process left in the kernel keep their SPIs.
+                let surviving = manager.adopt_surviving_kernel_sas().await;
                 // Register the process-wide handle so the dispatcher's 30 s
                 // cleanup tick can sweep abandoned SA pairs (states + policies +
                 // map entry) once they pass their own hard-lifetime + grace.
@@ -874,6 +876,7 @@ impl SiphonServer {
                     backend = ?backend,
                     spi_start,
                     spi_count,
+                    surviving,
                     active = manager.active_count(),
                     "IPsec SA manager initialized (script-driven via siphon.ipsec)"
                 );

@@ -11,11 +11,15 @@ pub mod netlink;
 pub mod runtime;
 /// RFC 3329 verification of a request received over a security association.
 pub mod sec_agree;
+/// SPI partition, live owners and restart orphans.
+mod spi;
+#[cfg(test)]
+mod spi_reuse_tests;
+pub use spi::{MAX_SPI_RANGE_COUNT, MIN_SPI};
 
 pub mod ue;
 
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -636,6 +640,12 @@ pub enum IpsecError {
     Command(String),
     /// Invalid key material.
     InvalidKey(String),
+    /// Every SPI of the partition is held by a live or pending SA, so no pair
+    /// can be allocated without replacing one.
+    SpiExhausted { start: u32, count: u32 },
+    /// The SPI belongs to another live SA pair, whose state an install would
+    /// replace.
+    SpiInUse(u32),
 }
 
 impl std::fmt::Display for IpsecError {
@@ -643,6 +653,11 @@ impl std::fmt::Display for IpsecError {
         match self {
             Self::Command(message) => write!(formatter, "IPsec command error: {}", message),
             Self::InvalidKey(message) => write!(formatter, "IPsec invalid key: {}", message),
+            Self::SpiExhausted { start, count } => write!(
+                formatter,
+                "IPsec SPI partition exhausted: all {count} SPIs from {start} are in use"
+            ),
+            Self::SpiInUse(spi) => write!(formatter, "IPsec SPI {spi} is in use by another SA"),
         }
     }
 }
@@ -674,14 +689,9 @@ pub enum XfrmBackend {
 pub struct IpsecManager {
     /// contact_key (e.g. "ue_ip:ue_port") -> SA pair.
     associations: DashMap<String, SecurityAssociationPair>,
-    /// SPI counter for generating unique SPIs.
-    next_spi: AtomicU32,
-    /// Upper bound on `next_spi` — when an allocation would exceed
-    /// `spi_range_end`, the counter wraps back to `spi_range_start`.
-    /// Both default to a wide range starting at 10000 when no
-    /// partitioning is configured (matches Phase 1 behaviour).
-    spi_range_start: u32,
-    spi_range_end: u32,
+    /// The SPI partition this manager allocates from, and the owner of every
+    /// local inbound SPI of a live pair (see [`spi`]).
+    spis: spi::SpiAllocator,
     /// XFRM backend.  Picked at startup from `IpsecConfig.backend`.
     backend: XfrmBackend,
     /// Test-only in-memory kernel.  When set, the four kernel-op methods
@@ -700,30 +710,31 @@ impl Default for IpsecManager {
 }
 
 impl IpsecManager {
-    /// Create a new IPsec manager with no active SAs and the default
-    /// backend (netlink) and SPI range (`10000..10000+8192`).
+    /// Create a new IPsec manager with no active SAs, the default backend
+    /// (netlink) and the default SPI partition (`ipsec.spi_range_*`).
     pub fn new() -> Self {
-        Self::with_partition(XfrmBackend::default(), 10000, 8192)
+        Self::with_partition(
+            XfrmBackend::default(),
+            crate::config::DEFAULT_SPI_RANGE_START,
+            crate::config::DEFAULT_SPI_RANGE_COUNT,
+        )
     }
 
     /// Create with explicit backend + SPI partition.  Used by the
     /// server bootstrap to honour `ipsec.backend` /
     /// `ipsec.spi_range_start` / `ipsec.spi_range_count`.
     ///
-    /// `spi_range_count` is clamped to at least 2 (we always need to
-    /// allocate pairs).  Wraparound is handled inside `allocate_spi_pair`.
+    /// The start is raised to [`MIN_SPI`] and the count kept between 2,
+    /// [`MAX_SPI_RANGE_COUNT`] and `u32::MAX`; configuration refuses values
+    /// that need either.
     pub fn with_partition(
         backend: XfrmBackend,
         spi_range_start: u32,
         spi_range_count: u32,
     ) -> Self {
-        let count = spi_range_count.max(2);
-        let end = spi_range_start.saturating_add(count);
         Self {
             associations: DashMap::new(),
-            next_spi: AtomicU32::new(spi_range_start),
-            spi_range_start,
-            spi_range_end: end,
+            spis: spi::SpiAllocator::new(spi_range_start, spi_range_count),
             backend,
             #[cfg(test)]
             kernel_mock: None,
@@ -733,24 +744,6 @@ impl IpsecManager {
     /// Currently-active backend.
     pub fn backend(&self) -> XfrmBackend {
         self.backend
-    }
-
-    /// Generate a unique SPI pair (inbound, outbound) within the
-    /// configured partition.  Wraps when the counter exceeds
-    /// `spi_range_end` — guaranteed unique within the lifetime of the
-    /// process so long as `spi_range_count` is larger than any
-    /// reasonable concurrent SA count.
-    pub fn allocate_spi_pair(&self) -> (u32, u32) {
-        let mut spi1 = self.next_spi.fetch_add(2, Ordering::Relaxed);
-        // Wraparound: if we ran past the end, reset and grab another
-        // pair.  Worst case: two threads collide on the reset, but the
-        // counter still moves forward and uniqueness is maintained
-        // across this process.
-        if spi1.saturating_add(1) >= self.spi_range_end {
-            self.next_spi.store(self.spi_range_start, Ordering::Relaxed);
-            spi1 = self.next_spi.fetch_add(2, Ordering::Relaxed);
-        }
-        (spi1, spi1 + 1)
     }
 
     /// Contact key for looking up SAs.
@@ -780,6 +773,9 @@ impl IpsecManager {
         // as the kernel install, ignoring any placeholder the caller pre-set.
         sa.created_at = Instant::now();
 
+        // Refused, before any kernel op, when another live pair owns an SPI.
+        let claimed = self.claim_local_spis(&sa)?;
+
         // Idempotent install: clear any colliding kernel entry first
         // (best-effort — `ENOENT` is fine). The four SA *states* rarely collide
         // because the SPIs rotate per attempt, but the four XFRM *policy*
@@ -802,6 +798,7 @@ impl IpsecManager {
         // retry instead of a wedge.
         if let Err(error) = self.install_sa_kernel(&sa).await {
             self.teardown_sa_kernel(&sa).await;
+            self.release_claimed_spis(&sa, claimed);
             tracing::warn!(
                 ue = %sa.ue_addr,
                 ue_port_c = sa.ue_port_c,
@@ -822,7 +819,11 @@ impl IpsecManager {
             "IPsec: SA pair created"
         );
 
-        self.associations.insert(key, sa);
+        let (new_states, new_spis) = (sa.state_keys(), sa.local_inbound_spis());
+        if let Some(replaced) = self.associations.insert(key, sa) {
+            self.retire_replaced_pair(replaced, new_states, new_spis)
+                .await;
+        }
         Ok(())
     }
 
@@ -1058,6 +1059,8 @@ impl IpsecManager {
             // in-memory entry is already removed above, so the manager's view
             // stays authoritative regardless of kernel-side failures.
             self.teardown_sa_kernel(&sa).await;
+            // Only once the kernel states are gone may the SPIs be reused.
+            self.release_pair_spis(&sa);
             info!(ue = %ue_addr, ue_port_c, "IPsec: SA pair deleted");
         }
         Ok(())
@@ -1178,7 +1181,7 @@ impl IpsecManager {
         hard_lifetime_secs: Option<u64>,
     ) -> Result<(), IpsecError> {
         let key = Self::contact_key(ue_addr, ue_port_c);
-        let mut sa = match self.associations.get(&key) {
+        let sa = match self.associations.get(&key) {
             Some(entry) => entry.value().clone(),
             None => {
                 debug!(ue = %ue_addr, ue_port_c, "IPsec: update_sa_pair_lifetime — no active SA, ignoring");
@@ -1274,20 +1277,15 @@ impl IpsecManager {
             "IPsec: SA pair hard-lifetime re-pinned"
         );
 
-        // Mirror the new from-now value into the cached SecurityAssociationPair
-        // so any subsequent inspection (or downstream re-pin) sees it, and
-        // refresh the sweep deadline to `now + hard_lifetime_secs + grace`.
-        // The kernel was re-pinned with the elapsed-adjusted value above, so
-        // its true deadline is also `now + hard_lifetime_secs`; the two now
-        // agree (modulo the sub-second sweep grace), unlike before the
-        // elapsed adjustment where a late re-pin would leave the kernel SA
-        // dying early while `expires_at` claimed it was alive.  `created_at`
-        // is deliberately preserved (cloned through unchanged) — UPDSA keeps
-        // the kernel `add_time`, so the install anchor stays valid for the
-        // next re-pin's elapsed computation.
-        sa.hard_lifetime_secs = hard_lifetime_secs;
-        sa.expires_at = compute_sa_expires_at(hard_lifetime_secs);
-        self.associations.insert(key, sa);
+        // Mirror the from-now value and refresh the sweep deadline to
+        // `now + hard_lifetime_secs + grace`, which now agrees with the
+        // elapsed-adjusted kernel deadline. `created_at` stays (UPDSA keeps the
+        // kernel `add_time`). In place, never re-inserted: a pair deleted while
+        // the update was in flight stays deleted, and its SPIs stay free.
+        if let Some(mut entry) = self.associations.get_mut(&key) {
+            entry.hard_lifetime_secs = hard_lifetime_secs;
+            entry.expires_at = compute_sa_expires_at(hard_lifetime_secs);
+        }
         Ok(())
     }
 
@@ -1383,6 +1381,7 @@ impl IpsecManager {
     /// `Expires`.  The IPsec module stays free of a registrar dependency —
     /// the dispatcher correlates the returned UE addresses back to AoRs.
     pub async fn sweep_expired_reaped(&self) -> Vec<(IpAddr, u16)> {
+        self.release_departed_kernel_orphans().await;
         let victims = self.expired_keys(Instant::now());
         if victims.is_empty() {
             return Vec::new();
@@ -2152,7 +2151,13 @@ impl IpsecManager {
     /// Construct a manager whose four kernel-op methods route through an
     /// in-memory [`KernelMock`] instead of netlink / `ip xfrm`.
     fn with_mock_kernel() -> Self {
-        let mut manager = Self::with_partition(XfrmBackend::IpCommand, 60000, 1024);
+        Self::with_mock_kernel_partition(60000, 1024)
+    }
+
+    /// [`with_mock_kernel`](Self::with_mock_kernel) over a given SPI partition.
+    fn with_mock_kernel_partition(spi_range_start: u32, spi_range_count: u32) -> Self {
+        let mut manager =
+            Self::with_partition(XfrmBackend::IpCommand, spi_range_start, spi_range_count);
         manager.kernel_mock = Some(std::sync::Mutex::new(KernelMock::default()));
         manager
     }
@@ -2254,8 +2259,8 @@ mod tests {
     #[test]
     fn allocate_spi_pair_unique() {
         let manager = IpsecManager::new();
-        let (spi1_a, spi1_b) = manager.allocate_spi_pair();
-        let (spi2_a, spi2_b) = manager.allocate_spi_pair();
+        let (spi1_a, spi1_b) = manager.allocate_spi_pair().expect("an empty partition");
+        let (spi2_a, spi2_b) = manager.allocate_spi_pair().expect("an empty partition");
 
         // Each pair is consecutive.
         assert_eq!(spi1_b, spi1_a + 1);
@@ -2270,7 +2275,7 @@ mod tests {
     #[test]
     fn allocate_spi_pair_starts_above_well_known_range() {
         let manager = IpsecManager::new();
-        let (spi_a, _) = manager.allocate_spi_pair();
+        let (spi_a, _) = manager.allocate_spi_pair().expect("an empty partition");
         assert!(spi_a >= 10000);
     }
 

@@ -3396,3 +3396,8 @@ jobs:
       # thread, because both read back the one namespace's ruleset.
       - name: nftables live-kernel tests (isolated user+net namespace)
         run: "unshare -rn env PYO3_PYTHON=python3.14 cargo test --lib firewall:: -- --ignored --nocapture --test-threads=1"
+
+      # Same lib test binary, same kind of throwaway namespace: real XFRM states
+      # for the SPI allocator, proving a full partition never replaces a live SA.
+      - name: XFRM SPI allocation live-kernel test (isolated user+net namespace)
+        run: "unshare -rn env PYO3_PYTHON=python3.14 cargo test --lib ipsec::spi_reuse_tests -- --ignored --nocapture --test-threads=1"

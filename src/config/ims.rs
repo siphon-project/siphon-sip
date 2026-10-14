@@ -21,16 +21,19 @@ pub struct IpsecConfig {
     /// CAP_NET_ADMIN-on-netlink or for parity with older deployments).
     #[serde(default = "default_ipsec_backend")]
     pub backend: IpsecBackend,
-    /// Optional SPI range for this siphon instance.  When set,
-    /// `allocate_spi_pair()` only returns SPIs in `[start, start+count)`,
-    /// letting multiple siphon processes coexist on the same kernel
-    /// without colliding on SPI values.  When unset (default), siphon
-    /// uses the historical wide range starting at 10000.
+    /// First SPI of this instance's partition. The P-CSCF only allocates
+    /// SPIs in `[start, start+count)`, so several siphon processes on one
+    /// kernel can each take their own range. Unset means 10000. Must be at
+    /// least 256: RFC 4303 §2.1 reserves 1 to 255.
     #[serde(default)]
     pub spi_range_start: Option<u32>,
-    /// Number of SPIs available in the partition (paired with
-    /// `spi_range_start`).  Default 8192 — far more than any practical
-    /// concurrent registration count.
+    /// Number of SPIs in the partition. Each registered UE holds two (spi-c
+    /// and spi-s), and a re-registration holds two more until the old pair
+    /// is torn down, so the partition bounds concurrent IPsec registrations
+    /// at about half of this. An allocation never reuses an SPI a live SA
+    /// holds; with the partition full, `ipsec.allocate` fails instead.
+    /// Default 4194304 (2^22, about two million UEs). At most 2^28, and
+    /// `start + count - 1` must not pass `u32::MAX`.
     #[serde(default = "default_spi_range_count")]
     pub spi_range_count: u32,
     /// Host part siphon writes into the Path URI advertised by
@@ -69,8 +72,48 @@ fn default_ipsec_backend() -> IpsecBackend {
     IpsecBackend::Netlink
 }
 
+/// First SPI of the partition when `ipsec.spi_range_start` is unset.
+pub const DEFAULT_SPI_RANGE_START: u32 = 10_000;
+
+/// Default `ipsec.spi_range_count`: 2^22 SPIs, room for about two million
+/// concurrently registered UEs at two SPIs each, in a 512 KiB bitmap.
+pub const DEFAULT_SPI_RANGE_COUNT: u32 = 1 << 22;
+
 fn default_spi_range_count() -> u32 {
-    8192
+    DEFAULT_SPI_RANGE_COUNT
+}
+
+impl IpsecConfig {
+    /// The first SPI of the partition, with the default applied.
+    pub fn effective_spi_range_start(&self) -> u32 {
+        self.spi_range_start.unwrap_or(DEFAULT_SPI_RANGE_START)
+    }
+
+    /// Refuse an SPI partition that reaches into the reserved SPIs, runs past
+    /// `u32::MAX`, cannot hold one pair, or is larger than one manager tracks.
+    pub fn validate(&self) -> Result<(), String> {
+        let start = self.effective_spi_range_start();
+        let count = self.spi_range_count;
+        if start < crate::ipsec::MIN_SPI {
+            return Err(format!(
+                "ipsec.spi_range_start is {start}: SPIs below {} are reserved (RFC 4303 §2.1)",
+                crate::ipsec::MIN_SPI
+            ));
+        }
+        if !(2..=crate::ipsec::MAX_SPI_RANGE_COUNT).contains(&count) {
+            return Err(format!(
+                "ipsec.spi_range_count is {count}: it must be between 2 and {}",
+                crate::ipsec::MAX_SPI_RANGE_COUNT
+            ));
+        }
+        if u64::from(start) + u64::from(count) - 1 > u64::from(u32::MAX) {
+            return Err(format!(
+                "ipsec.spi_range_start {start} plus spi_range_count {count} runs past the largest SPI ({})",
+                u32::MAX
+            ));
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------

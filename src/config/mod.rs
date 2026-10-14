@@ -57,7 +57,10 @@ pub use gateway::{
     GatewayAuthConfig, GatewayBackendType, GatewayConfig, GatewayDatabaseConfig, GatewayDestConfig,
     GatewayGroupConfig, GatewayHttpConfig, GatewayProbeConfig, LcrConfig,
 };
-pub use ims::{IpsecBackend, IpsecConfig, IscConfig, SbiYamlConfig};
+pub use ims::{
+    IpsecBackend, IpsecConfig, IscConfig, SbiYamlConfig, DEFAULT_SPI_RANGE_COUNT,
+    DEFAULT_SPI_RANGE_START,
+};
 pub use lawful_intercept::{
     LawfulInterceptConfig, LiSiprecConfig, LiTlsConfig, LiX1AdmfConfig, LiX1Config, LiX1TlsConfig,
     LiX2Config, LiX3Config,
@@ -522,6 +525,9 @@ impl Config {
         config.validate_timer_intervals()?;
         config.validate_advertised_address()?;
         config.validate_inbound_limits()?;
+        if let Some(ipsec) = &config.ipsec {
+            ipsec.validate().map_err(SiphonError::Config)?;
+        }
         Ok(config)
     }
 

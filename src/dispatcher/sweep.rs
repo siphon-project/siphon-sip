@@ -187,6 +187,8 @@ pub(super) async fn sweep_stale_entries(state: &DispatcherState) {
             if state.registrar_liveness.enabled && !reaped.is_empty() {
                 liveness_dereg_reaped_sas(state, &reaped).await;
             }
+            let (spis_in_use, spi_partition_size) = manager.spi_usage();
+            crate::metrics::ipsec::publish_spi_usage(spis_in_use, spi_partition_size);
             (reaped.len() as u64, manager.active_count())
         }
         None => (0, 0),

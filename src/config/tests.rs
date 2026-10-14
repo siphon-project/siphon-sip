@@ -5744,3 +5744,51 @@ fn a_gateway_group_reject_code_outside_4xx_to_6xx_is_refused_at_load() {
         "{message}"
     );
 }
+
+#[test]
+fn the_default_spi_partition_holds_a_large_p_cscf() {
+    let config = base_yaml("ipsec: {}\n").expect("an empty ipsec block loads");
+    let ipsec = config.ipsec.expect("ipsec block");
+    assert_eq!(ipsec.effective_spi_range_start(), 10_000);
+    assert_eq!(ipsec.spi_range_count, 1 << 22);
+    // Two SPIs per UE: room for well over a million registered UEs.
+    assert!(ipsec.spi_range_count / 2 >= 1_000_000);
+}
+
+#[test]
+fn an_spi_partition_in_the_reserved_range_is_refused() {
+    // RFC 4303 §2.1 reserves SPIs 1 to 255.
+    let error = base_yaml("ipsec:\n  spi_range_start: 255\n  spi_range_count: 16\n")
+        .expect_err("a start below 256 must be refused");
+    assert!(
+        error.to_string().contains("ipsec.spi_range_start is 255"),
+        "{error}"
+    );
+    base_yaml("ipsec:\n  spi_range_start: 256\n  spi_range_count: 16\n")
+        .expect("256 is the first SPI that may be allocated");
+}
+
+#[test]
+fn an_spi_partition_past_the_largest_spi_is_refused() {
+    let error = base_yaml("ipsec:\n  spi_range_start: 4294967290\n  spi_range_count: 16\n")
+        .expect_err("a partition past u32::MAX must be refused");
+    assert!(
+        error.to_string().contains("runs past the largest SPI"),
+        "{error}"
+    );
+    base_yaml("ipsec:\n  spi_range_start: 4294967280\n  spi_range_count: 16\n")
+        .expect("a partition ending on u32::MAX loads");
+}
+
+#[test]
+fn an_spi_partition_too_small_or_too_large_is_refused() {
+    for count in ["0", "1", "268435457"] {
+        let error = base_yaml(&format!("ipsec:\n  spi_range_count: {count}\n"))
+            .expect_err("the count must be refused");
+        assert!(
+            error.to_string().contains("ipsec.spi_range_count"),
+            "{error}"
+        );
+    }
+    base_yaml("ipsec:\n  spi_range_count: 268435456\n").expect("2^28 is the largest partition");
+}
