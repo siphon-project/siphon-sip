@@ -482,6 +482,12 @@ impl super::Registrar {
 mod tests {
     use super::*;
 
+    /// The holders come out of a map, in no order.
+    fn sorted(mut aors: Vec<String>) -> Vec<String> {
+        aors.sort();
+        aors
+    }
+
     fn uri(text: &str) -> SipUri {
         crate::sip::parser::parse_uri_standalone(text).expect("a URI")
     }
@@ -533,12 +539,12 @@ mod tests {
         index.add(7, "sip:a@example.invalid");
         index.add(7, "sip:b@example.invalid");
         assert_eq!(
-            index.aors(7),
+            sorted(index.aors(7)),
             ["sip:a@example.invalid", "sip:b@example.invalid"]
         );
         index.remove(7, "sip:a@example.invalid");
         assert_eq!(
-            index.aors(7),
+            sorted(index.aors(7)),
             ["sip:a@example.invalid", "sip:b@example.invalid"]
         );
         index.remove(7, "sip:a@example.invalid");
