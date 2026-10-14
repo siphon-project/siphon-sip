@@ -1,4 +1,5 @@
 //! An inbound UPDATE on a bridged call (RFC 3311).
+use crate::b2bua::reoffer::ReofferDecision;
 use crate::dispatcher::*;
 
 /// Bridge an in-dialog UPDATE (RFC 3311) across the B2BUA.
@@ -167,6 +168,14 @@ pub fn handle_b2bua_update(inbound: InboundMessage, message: SipMessage, state: 
         return;
     }
 
+    // The description the offering party last gave on its dialog, before the
+    // lines below replace it (see the re-INVITE path).
+    let offerer = Offerer {
+        from_a_leg,
+        b_leg_branch: origin_branch.as_deref(),
+    };
+    let in_force = offerer.last_sdp(&call_id, state);
+
     // Track the offerer's own new endpoint SDP (its UPDATE offer, raw) so a
     // later siphon-terminated transfer offers this leg's current media if it is
     // the survivor.
@@ -277,8 +286,36 @@ pub fn handle_b2bua_update(inbound: InboundMessage, message: SipMessage, state: 
         state,
     );
 
+    // `@b2bua.on_reoffer`: relay the offer, refuse it, or answer it here.
+    let hook = run_reoffer_hook(
+        &call_id,
+        &inbound,
+        &message,
+        offerer,
+        on_early_dialog,
+        in_force.as_deref(),
+        state,
+    );
+    if hook.decision != ReofferDecision::Relay {
+        let response = decide_reoffer_here(
+            &inbound,
+            &message,
+            &call_id,
+            offerer,
+            on_early_dialog,
+            &hook.decision,
+            state,
+        );
+        if response.status_code().is_some_and(|code| code >= 300) {
+            restore_offerer_sdp(&call_id, offerer, in_force, state);
+        }
+        notify_reoffer_response(&call_id, hook.facts, &response, true, state);
+        return;
+    }
+    let reoffer = hook.facts;
+
     let branch = TransactionKey::generate_branch();
-    let mut forwarded = message.clone();
+    let mut forwarded = hook.edited.unwrap_or_else(|| message.clone());
 
     let update_target = if from_a_leg {
         if let Some(b_leg) = &winner_b_leg {
@@ -474,6 +511,7 @@ pub fn handle_b2bua_update(inbound: InboundMessage, message: SipMessage, state: 
                 &mut forwarded.body,
                 state,
             ) {
+                notify_reoffer_refused_here(&call_id, reoffer, 488, state);
                 return;
             }
             // Own the o= identity toward the leg this UPDATE is sent to (RFC 3264
@@ -580,6 +618,8 @@ pub fn handle_b2bua_update(inbound: InboundMessage, message: SipMessage, state: 
         update_leg.session_refresh_request = Some(
             crate::b2bua::session_timer::session_refresh_request(&message.headers),
         );
+        // Shown to `@b2bua.on_reoffer_answered` with the final response.
+        update_leg.reoffer = reoffer;
         state.call_actors.add_b_leg(&call_id, update_leg);
         note_session_refresh_request(&call_id, from_a_leg, &message.headers, state);
 

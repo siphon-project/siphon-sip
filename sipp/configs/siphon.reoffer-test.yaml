@@ -1,0 +1,19 @@
+# siphon config for the @b2bua.on_reoffer SIPp test
+# (scripts/b2bua_reoffer_test.sh). The caller's hold is answered by the script
+# itself and its resume is relayed to the callee.
+
+listen:
+  udp:
+    - "127.0.0.1:5060"
+
+domain:
+  local:
+    - "127.0.0.1"
+
+advertised_address: "127.0.0.1"
+
+script:
+  path: "scripts/b2bua_reoffer.py"
+
+log:
+  level: info

@@ -395,6 +395,80 @@ a line break or NUL is refused too. The control plane's `answer`, `ring`,
 `progress` and `reject` verbs take the same `headers` object with the same
 rules ([control plane](control-plane.md)).
 
+## Hold, resume and other re-offers: `@b2bua.on_reoffer`
+
+A re-INVITE or an UPDATE (RFC 3311) from either party of a bridged call
+renegotiates the session siphon relays between them, through the media engine
+when the call is anchored. `@b2bua.on_reoffer` sees it before it is relayed,
+and `@b2bua.on_reoffer_answered` once the offerer has its final response.
+Both are called with `(call, offer)`.
+
+```python
+from siphon import b2bua, rtpengine
+
+@b2bua.on_reoffer
+def hold(call, offer):
+    # The caller holds the callee: answer the hold here, keep the callee on
+    # the media engine, and leave the callee's dialog as it is.
+    if offer.kind == "hold" and offer.side == "a":
+        offer.answer()
+
+@b2bua.on_reoffer_answered
+async def held(call, offer):
+    if offer.kind == "hold" and offer.side == "a" and offer.status_code == 200:
+        await rtpengine.play_media(call, file="/srv/moh.wav",
+                                   repeat="inf", wait=False)
+    elif offer.kind == "resume" and offer.status_code == 200:
+        await rtpengine.stop_media(call)
+```
+
+What the offer says:
+
+| Attribute | |
+|---|---|
+| `offer.method` | `"INVITE"` or `"UPDATE"` |
+| `offer.side` | `"a"` (caller) or `"b"` (callee), as `call.refer_side` |
+| `offer.sdp` | the offer as sent; `None` for an offerless re-INVITE (the 2xx carries the other party's offer, RFC 3261 §14.1) |
+| `offer.request` | the request, for its headers; a header or body set on it is on the relayed request |
+| `offer.direction` | `sendrecv` / `sendonly` / `recvonly` / `inactive` over the streams not rejected; a `0.0.0.0` connection address receives nothing (RFC 3264 §8.4) |
+| `offer.previous_direction` | the same for the description that party last gave on its dialog |
+| `offer.kind` | `"hold"` (stops receiving, TS 24.610 §4.5.2), `"resume"`, `"refresh"` (same streams, addresses and directions, as an RFC 4028 refresh is, even one that repeats `sendonly` on a held call), `"change"` |
+| `offer.early` | an UPDATE between early dialogs (RFC 3311 §5.1) |
+
+What the handler can do with it:
+
+- **Nothing**: the offer is relayed as without the hook.
+- **`offer.reject(code, reason)`** (300-699): siphon answers the offerer and
+  relays nothing; the session stays as it was.
+- **`offer.answer(sdp=None)`**: siphon answers the offerer itself and relays
+  nothing. Without `sdp` the answer is the session in force toward the
+  offerer (what siphon last sent it, the media engine's ports on an anchored
+  call) with the formats both list and the direction the offer leaves, so a
+  `sendonly` hold is answered `recvonly` (RFC 3264 §6.1). The media engine is
+  not told: a two-party session cannot be answered by the engine for one side
+  alone, and keeping it as it is keeps the other party's media on the engine,
+  where `rtpengine.play_media` reaches it. An offerless re-INVITE gets that
+  session as siphon's offer. Streams that are keyed, use ICE or are grouped
+  cannot be answered this way and are refused `488`. With `sdp`, that SDP is
+  the answer. siphon puts its own `o=` on either (RFC 3264 §8).
+
+Every request is answered. A handler that raises, or an async one that runs
+past `script.handler_timeout_secs`, decides nothing and the offer is relayed.
+A crossing offer is answered `491 Request Pending` (RFC 3261 §14.1) before the
+script would see it. Not shown: a call siphon answered itself (no second
+party) and a leg of a controller bridge.
+
+`@b2bua.on_reoffer_answered` adds `offer.status_code`, `offer.answer_sdp` (as
+the offerer was sent it), `offer.answer_direction` and
+`offer.answered_locally`, which is true when siphon answered: the script's
+`reject()` or `answer()`, or a media engine that would not take the offer.
+It is a notification; a raise there changes nothing.
+
+In the SDK, `SipTestHarness.send_reoffer()` and `send_reoffer_answered()`
+drive both handlers:
+
+::: siphon_sdk.reoffer.Reoffer
+
 ## `MediaHandle`
 
 Returned by `call.media` — controls RTP anchoring for the call.

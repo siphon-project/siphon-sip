@@ -1,0 +1,88 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  @b2bua.on_reoffer test, the callee (B-leg).
+
+  INVITE -> 200 -> ACK, then the caller's RESUME relayed by the script, which
+  marks it X-Reoffer: resume. The caller's hold before it is answered by
+  siphon and must never arrive here: a hold relayed in its place fails the
+  header check. Then BYE.
+-->
+<scenario name="B2BUA on_reoffer UAS">
+
+  <recv request="INVITE" crlf="true" />
+
+  <send retrans="500">
+    <![CDATA[
+SIP/2.0 200 OK
+[last_Via:]
+[last_From:]
+[last_To:];tag=[pid]SIPpTagB[call_number]
+[last_Call-ID:]
+[last_CSeq:]
+Contact: <sip:bob@[local_ip]:[local_port];transport=[transport]>
+Content-Type: application/sdp
+Content-Length: [len]
+
+v=0
+o=bob 53655765 1 IN IP[local_ip_type] [local_ip]
+s=-
+c=IN IP[media_ip_type] [media_ip]
+t=0 0
+m=audio [media_port] RTP/AVP 0
+a=rtpmap:0 PCMU/8000
+]]>
+  </send>
+
+  <recv request="ACK" timeout="5000" />
+
+  <!-- The resume, and only the resume. -->
+  <recv request="INVITE" timeout="10000">
+    <action>
+      <ereg regexp="resume" search_in="hdr" header="X-Reoffer:" check_it="true" assign_to="1" />
+    </action>
+  </recv>
+
+  <send retrans="500">
+    <![CDATA[
+SIP/2.0 200 OK
+[last_Via:]
+[last_From:]
+[last_To:]
+[last_Call-ID:]
+[last_CSeq:]
+Contact: <sip:bob@[local_ip]:[local_port];transport=[transport]>
+Content-Type: application/sdp
+Content-Length: [len]
+
+v=0
+o=bob 53655765 2 IN IP[local_ip_type] [local_ip]
+s=-
+c=IN IP[media_ip_type] [media_ip]
+t=0 0
+m=audio [media_port] RTP/AVP 0
+a=rtpmap:0 PCMU/8000
+]]>
+  </send>
+
+  <recv request="ACK" timeout="5000" />
+
+  <recv request="BYE" timeout="10000" />
+
+  <send>
+    <![CDATA[
+SIP/2.0 200 OK
+[last_Via:]
+[last_From:]
+[last_To:]
+[last_Call-ID:]
+[last_CSeq:]
+Content-Length: 0
+
+]]>
+  </send>
+
+  <Reference variables="1" />
+
+</scenario>

@@ -15,6 +15,31 @@ entry, but a working config keeps working.
 
 ### Added
 
+- **`@b2bua.on_reoffer` and `@b2bua.on_reoffer_answered`: a script sees the
+  re-INVITEs and UPDATEs of a bridged call.** siphon relayed a hold or a resume
+  between the two parties, through the media engine where the call is
+  anchored, and no handler ran for it, so a telephony server could not play
+  music on hold to the held party (TS 24.610 §4.5.2). `on_reoffer(call, offer)`
+  now runs before the offer is relayed, for a re-INVITE or an UPDATE from
+  either party, the early-dialog UPDATE included. `offer.side`, `offer.sdp`,
+  `offer.request` and `offer.direction` say what came in, and `offer.kind`
+  reads it against the description that party last gave: `"hold"` when it
+  stops receiving (`sendonly`, `inactive`, or the `0.0.0.0` connection address
+  of RFC 2543 phones, RFC 3264 §8.4), `"resume"`, `"refresh"` when streams,
+  addresses and directions are as they were (an RFC 4028 refresh, even one
+  that repeats `sendonly` on a held call), `"change"` otherwise. Doing nothing
+  relays it, with any header the handler set on `offer.request`;
+  `offer.reject(code, reason)` refuses it; `offer.answer(sdp=None)` answers it
+  here from the session in force toward the offerer, with the direction the
+  offer leaves, and relays nothing, so the other party stays on the media
+  engine for an announcement. A raise or a timeout relays the offer. A crossing
+  offer is still answered `491` (RFC 3261 §14.1) without the script.
+  `on_reoffer_answered(call, offer)` runs once the offerer has its final
+  response, with `offer.status_code`, `offer.answer_sdp`,
+  `offer.answer_direction` and `offer.answered_locally`. A call siphon answered
+  itself, or one a controller bridged, is not shown. Mirrored in the SDK mock,
+  with `SipTestHarness.send_reoffer()` and `send_reoffer_answered()`.
+
 - **`headers=` on `call.progress()`, `call.answer()` and `call.reject()`.** A
   response siphon sends the caller itself could carry only a body: an
   announcement server had no way to put `P-Early-Media` (RFC 5009) on the 183

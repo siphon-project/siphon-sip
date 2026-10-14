@@ -22,6 +22,9 @@ pub fn forward_reinvite_response(
 
     if let Some(direction) = reinvite_direction {
         let is_a2b = direction == "a2b";
+        // The offer `@b2bua.on_reoffer_answered` is to be shown with the final
+        // response, taken so that only one response ever shows it.
+        let reoffer = take_reoffer_for_final(call_id, &snapshot.branch, status_code, state);
 
         // The responder's own dialog, read before the rewrites below put the
         // originator's Call-ID on a bridged re-INVITE's response: the ACK below
@@ -453,6 +456,7 @@ pub fn forward_reinvite_response(
                 state,
             );
         }
+        notify_reoffer_response(call_id, reoffer, message, false, state);
 
         debug!(
             call_id = %call_id,

@@ -1100,3 +1100,44 @@ async fn an_anchored_early_update_crosses_the_media_engine_both_ways() {
         sdp.contains("c=IN IP4 198.51.100.71") && sdp.contains("a=curr:qos e2e sendrecv")
     }));
 }
+
+/// `@b2bua.on_reoffer` is shown an UPDATE on the early dialog too, marked as
+/// early, and a refusal it decides is the caller's answer: nothing reaches the
+/// callee, and the early dialogs carry on (RFC 3311 §5.2).
+#[tokio::test(flavor = "multi_thread")]
+async fn an_early_update_is_shown_to_on_reoffer_and_may_be_refused() {
+    let script = format!(
+        concat!(
+            "{dial}\n",
+            "@b2bua.on_reoffer\n",
+            "def on_reoffer(call, offer):\n",
+            "    call.set_header(\"X-Early\", f\"{{offer.method}} {{offer.side}} {{offer.early}}\")\n",
+            "    offer.reject(488, \"Not Acceptable Here\")\n",
+        ),
+        dial = DIAL,
+    );
+    let call = EarlyCall::place(&script);
+    let progress = call.answered_reliably();
+    call.caller_updates(&progress, 3, UPDATE_OFFER);
+    let sent = call.wire();
+    assert!(
+        requests(&to(&sent, CALLEE), &Method::Update).is_empty(),
+        "{:?}",
+        summaries(&sent)
+    );
+    let finals: Vec<u16> = to(&sent, CALLER)
+        .iter()
+        .filter(|message| cseq_method(message) == "UPDATE")
+        .filter_map(SipMessage::status_code)
+        .filter(|code| *code >= 200)
+        .collect();
+    assert_eq!(finals, [488], "{:?}", summaries(&sent));
+    let shown = call
+        .state
+        .call_actors
+        .get_call(&call.call_id)
+        .and_then(|call| call.a_leg_invite.clone())
+        .and_then(|invite| invite.lock().ok()?.headers.get("X-Early").cloned());
+    assert_eq!(shown.as_deref(), Some("UPDATE a True"));
+    assert!(call.call_is_up());
+}

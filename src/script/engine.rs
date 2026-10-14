@@ -78,6 +78,13 @@ pub enum HandlerKind {
     B2buaBye,
     /// `@b2bua.on_refer` — call transfer (RFC 3515).
     B2buaRefer,
+    /// `@b2bua.on_reoffer` — an in-dialog offer (re-INVITE / UPDATE) on a
+    /// bridged call, before it is relayed: the handler may let it through,
+    /// refuse it, or answer it itself.
+    B2buaReoffer,
+    /// `@b2bua.on_reoffer_answered` — the final response the offerer of an
+    /// in-dialog offer got. A notification.
+    B2buaReofferAnswered,
     /// `@b2bua.on_route_failure` — one carrier of a `call.route(...)` sequential
     /// failover returned a non-2xx (or rang out). Fires once per failed attempt,
     /// including the last, so a script can count a carrier out or feed its own
@@ -1005,6 +1012,8 @@ fn extract_handlers(_python: Python<'_>, registry: &Bound<'_, PyAny>) -> Result<
             "b2bua.on_failure" => HandlerKind::B2buaFailure,
             "b2bua.on_bye" => HandlerKind::B2buaBye,
             "b2bua.on_refer" => HandlerKind::B2buaRefer,
+            "b2bua.on_reoffer" => HandlerKind::B2buaReoffer,
+            "b2bua.on_reoffer_answered" => HandlerKind::B2buaReofferAnswered,
             "b2bua.on_route_failure" => HandlerKind::B2buaRouteFailure,
             "b2bua.on_cancel" => HandlerKind::B2buaCancel,
             "registrar.on_change" => HandlerKind::RegistrarOnChange,
@@ -1874,6 +1883,30 @@ def on_cancel(call):
         assert_eq!(state.handlers[0].kind, HandlerKind::B2buaCancel);
         assert!(!state.handlers[0].is_async);
         assert_eq!(state.handlers_for(&HandlerKind::B2buaCancel).len(), 1);
+    }
+
+    #[test]
+    fn b2bua_on_reoffer_decorators_register_handlers() {
+        let source = r#"
+from siphon import b2bua
+
+@b2bua.on_reoffer
+def on_reoffer(call, offer):
+    pass
+
+@b2bua.on_reoffer_answered
+async def on_reoffer_answered(call, offer):
+    pass
+"#;
+        let state = compile_temp_script(source).unwrap();
+        assert_eq!(state.handlers.len(), 2);
+        let offered = state.handlers_for(&HandlerKind::B2buaReoffer);
+        assert_eq!(offered.len(), 1);
+        assert!(!offered[0].is_async);
+        let answered = state.handlers_for(&HandlerKind::B2buaReofferAnswered);
+        assert_eq!(answered.len(), 1);
+        assert!(answered[0].is_async);
+        assert!(state.has_b2bua_handlers());
     }
 
     #[test]

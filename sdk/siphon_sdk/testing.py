@@ -37,6 +37,7 @@ from siphon_sdk.types import Action, ByeInitiator, Contact, SipUri
 from siphon_sdk.request import Request, _parse_uri
 from siphon_sdk.reply import Reply
 from siphon_sdk.call import Call
+from siphon_sdk.reoffer import Reoffer
 from siphon_sdk import mock_module
 
 
@@ -945,6 +946,81 @@ class SipTestHarness:
                 fn(call)
 
         return CallResult(call=call, actions=list(call.actions))
+
+    def send_reoffer(
+        self,
+        call: Optional[Call] = None,
+        sdp: Optional[str] = None,
+        previous_sdp: Optional[str] = None,
+        method: str = "INVITE",
+        side: str = "a",
+        early: bool = False,
+        request: Optional[Request] = None,
+        **kwargs: Any,
+    ) -> Reoffer:
+        """Dispatch an in-dialog offer to ``@b2bua.on_reoffer`` handlers.
+
+        Builds a :class:`~siphon_sdk.reoffer.Reoffer` for a re-INVITE (or an
+        UPDATE with ``method="UPDATE"``) from ``side`` carrying ``sdp``, read
+        against ``previous_sdp`` (the session that party had in force), and
+        calls the handlers with ``(call, offer)``. Returns the offer: its
+        :attr:`~siphon_sdk.reoffer.Reoffer.decision` is ``("relay",)``,
+        ``("reject", code, reason)`` or ``("answer", sdp)``. A handler that
+        raises leaves the decision at relay, as siphon does.
+
+        Example::
+
+            offer = harness.send_reoffer(sdp=HELD, previous_sdp=TALKING)
+            assert offer.kind == "hold"
+            assert offer.decision == ("answer", None)
+        """
+        if call is None:
+            call = Call(state="answered", **kwargs)
+        offer = Reoffer(
+            sdp=sdp,
+            previous_sdp=previous_sdp,
+            method=method,
+            side=side,
+            early=early,
+            request=request,
+        )
+        for fn, is_async in mock_module.get_registry().get("b2bua.on_reoffer"):
+            try:
+                if is_async:
+                    self._loop.run_until_complete(fn(call, offer))
+                else:
+                    fn(call, offer)
+            except Exception:
+                offer._decision = ("relay",)
+                break
+        return offer
+
+    def send_reoffer_answered(
+        self,
+        offer: Reoffer,
+        status_code: int = 200,
+        answer_sdp: Optional[str] = None,
+        answered_locally: bool = False,
+        call: Optional[Call] = None,
+        **kwargs: Any,
+    ) -> Reoffer:
+        """Dispatch the final response to ``offer`` to
+        ``@b2bua.on_reoffer_answered`` handlers.
+
+        A raise in a handler is swallowed, as siphon logs it and goes on.
+        """
+        if call is None:
+            call = Call(state="answered", **kwargs)
+        offer._complete(status_code, answer_sdp, answered_locally)
+        for fn, is_async in mock_module.get_registry().get("b2bua.on_reoffer_answered"):
+            try:
+                if is_async:
+                    self._loop.run_until_complete(fn(call, offer))
+                else:
+                    fn(call, offer)
+            except Exception:
+                continue
+        return offer
 
     @property
     def diameter(self) -> mock_module.MockDiameter:

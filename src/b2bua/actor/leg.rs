@@ -425,6 +425,10 @@ pub struct Leg {
     /// which is where its response goes (RFC 3261 §18.2.2), wherever the other
     /// requests of the dialog arrived from.
     pub request_source: Option<TransportInfo>,
+    /// On a tracking leg for a relayed re-INVITE or UPDATE: the offer as
+    /// `@b2bua.on_reoffer_answered` is shown it with its final response. Set
+    /// only while a script has that hook, and taken by the final response.
+    pub reoffer: Option<std::sync::Arc<crate::b2bua::reoffer::ReofferFacts>>,
 }
 impl Leg {
     /// Create a new A-leg from an inbound INVITE.
@@ -458,6 +462,7 @@ impl Leg {
             early_answer_dialog: None,
             early_exchange_complete: false,
             request_session_expires: None,
+            reoffer: None,
             session_refresh_request: None,
             request_source: None,
         }
@@ -517,6 +522,7 @@ impl Leg {
             early_answer_dialog: None,
             early_exchange_complete: false,
             request_session_expires: None,
+            reoffer: None,
             session_refresh_request: None,
             request_source: None,
         }
