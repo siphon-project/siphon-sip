@@ -40,6 +40,39 @@ pub(super) fn response_args(
     (code, reason, body, content_type)
 }
 
+/// The `headers` argument of `answer`, `progress`, `ring` and `reject`: a JSON
+/// object of header name to string value, added to the response siphon sends
+/// (`P-Early-Media` on an announcement's 183, RFC 5009 §8). Absent or `null` is
+/// none. `Err` is the `bad_request` to hand back, for anything that is not such
+/// an object and for a header siphon owns on that response
+/// ([`crate::b2bua::uas_headers::validate`]), so nothing is sent.
+pub(super) fn response_headers(
+    args: &serde_json::Value,
+) -> Result<Vec<(String, String)>, ControlResult> {
+    let Some(given) = args.get("headers").filter(|value| !value.is_null()) else {
+        return Ok(Vec::new());
+    };
+    let not_an_object = || {
+        ControlResult::error(
+            ControlErrorCode::BadRequest,
+            "headers must be an object of header name to string value",
+        )
+    };
+    let Some(object) = given.as_object() else {
+        return Err(not_an_object());
+    };
+    let mut headers = Vec::with_capacity(object.len());
+    for (name, value) in object {
+        let Some(value) = value.as_str() else {
+            return Err(not_an_object());
+        };
+        headers.push((name.clone(), value.to_string()));
+    }
+    crate::b2bua::uas_headers::validate(&headers)
+        .map_err(|refusal| ControlResult::error(ControlErrorCode::BadRequest, refusal))?;
+    Ok(headers)
+}
+
 /// Whether an argument is present and not JSON `null` — an explicit `null` is
 /// how most clients spell "not set", so it has to read as absent.
 fn arg_present(args: &serde_json::Value, key: &str) -> bool {
@@ -72,6 +105,7 @@ fn send_uas_response(
     body: Option<Vec<u8>>,
     content_type: Option<&str>,
     final_response: bool,
+    headers: &[(String, String)],
 ) -> Result<(), ControlResult> {
     let Some(invite_arc) = stored_invite(&channel.call_actor_id) else {
         return Err(ControlResult::error(
@@ -93,6 +127,7 @@ fn send_uas_response(
             reason,
             body,
             content_type,
+            headers,
         )
     } else {
         crate::dispatcher::b2bua_progress_call(
@@ -102,6 +137,7 @@ fn send_uas_response(
             reason,
             body,
             content_type,
+            headers,
         )
     };
     if sent {
@@ -145,6 +181,10 @@ pub(super) fn answer(
     if !final_response && !(100..200).contains(&code) {
         return ControlResult::error(ControlErrorCode::BadRequest, "progress requires a 1xx code");
     }
+    let headers = match response_headers(args) {
+        Ok(headers) => headers,
+        Err(refusal) => return refusal,
+    };
 
     // Answer + anchor in one act, the verb form of
     // `call.handover(answer=True, profile=…, ws_uri=…)`. Without it an app that
@@ -189,6 +229,7 @@ pub(super) fn answer(
                 &reason,
                 profile,
                 ws_uri,
+                &headers,
             ) {
                 Ok(()) => ControlResult::Ok(serde_json::json!({
                     "channel": channel.channel_id,
@@ -209,6 +250,7 @@ pub(super) fn answer(
             &reason,
             profile,
             ws_uri,
+            &headers,
         ) {
             Ok(()) => ControlResult::Ok(serde_json::json!({
                 "channel": channel.channel_id,
@@ -252,6 +294,7 @@ pub(super) fn answer(
         body,
         content_type.as_deref(),
         final_response,
+        &headers,
     ) {
         return result;
     }
@@ -297,7 +340,11 @@ pub(super) fn ring(channel: &ChannelRef, args: &serde_json::Value) -> ControlRes
         .filter(|value| !value.is_empty())
         .unwrap_or("Ringing")
         .to_string();
-    if let Err(result) = send_uas_response(channel, 180, &reason, None, None, false) {
+    let headers = match response_headers(args) {
+        Ok(headers) => headers,
+        Err(refusal) => return refusal,
+    };
+    if let Err(result) = send_uas_response(channel, 180, &reason, None, None, false, &headers) {
         return result;
     }
     ControlResult::Ok(serde_json::json!({
@@ -316,7 +363,16 @@ pub(super) fn reject(channel: &ChannelRef, args: &serde_json::Value) -> ControlR
             "reject requires a 3xx-6xx code",
         );
     }
-    if crate::dispatcher::b2bua_reject_call(&channel.call_actor_id, code, &reason) {
+    let headers = match response_headers(args) {
+        Ok(headers) => headers,
+        Err(refusal) => return refusal,
+    };
+    if crate::dispatcher::b2bua_reject_call_with_headers(
+        &channel.call_actor_id,
+        code,
+        &reason,
+        &headers,
+    ) {
         ControlResult::Ok(
             serde_json::json!({ "channel": channel.channel_id, "state": "terminated", "code": code }),
         )

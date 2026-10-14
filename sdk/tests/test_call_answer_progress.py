@@ -44,6 +44,42 @@ class TestCallAnswerProgress:
         with pytest.raises(ValueError):
             call.progress(200, "OK")
 
+    def test_progress_records_the_scripts_headers(self):
+        call = Call()
+        call.progress(183, "Session Progress", body=b"v=0\r\n",
+                      content_type="application/sdp",
+                      headers={"P-Early-Media": "sendrecv"})
+        assert call._actions[-1].extras["headers"] == {"P-Early-Media": "sendrecv"}
+
+    def test_answer_and_reject_record_the_scripts_headers(self):
+        call = Call()
+        call.answer(200, "OK", headers={"X-Lab-Tag": "a"})
+        assert call._actions[-1].extras["headers"] == {"X-Lab-Tag": "a"}
+        call = Call()
+        call.reject(480, "Temporarily Unavailable", headers={"Retry-After": "120"})
+        assert call._actions[-1].extras == {"headers": {"Retry-After": "120"}}
+
+    @pytest.mark.parametrize("name", ["Contact", "to", "RSeq", "Require", "k", "Content-Type"])
+    def test_a_framework_owned_header_raises(self, name):
+        for send in (
+            lambda call: call.progress(183, "Session Progress", headers={name: "x"}),
+            lambda call: call.answer(200, "OK", headers={name: "x"}),
+            lambda call: call.reject(486, "Busy Here", headers={name: "x"}),
+        ):
+            call = Call()
+            with pytest.raises(ValueError):
+                send(call)
+            assert call._actions == []
+
+    def test_a_value_with_a_line_break_raises(self):
+        with pytest.raises(ValueError):
+            Call().progress(183, "Session Progress",
+                            headers={"P-Early-Media": "sendrecv\r\nVia: x"})
+
+    def test_a_value_that_is_not_a_string_raises_type_error(self):
+        with pytest.raises(TypeError):
+            Call().reject(503, "Service Unavailable", headers={"Retry-After": 120})
+
 
 @pytest.fixture
 def harness():

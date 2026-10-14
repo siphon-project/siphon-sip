@@ -313,6 +313,18 @@ pub fn control_notify_channel_event(sip_call_id: &str, event: &str, payload: ser
 /// the call. Returns `false` (never panics) when the call is gone / dispatcher
 /// down. Distinct from [`b2bua_terminate_call`] (which BYEs an *answered* call).
 pub fn b2bua_reject_call(internal_call_id: &str, code: u16, reason: &str) -> bool {
+    b2bua_reject_call_with_headers(internal_call_id, code, reason, &[])
+}
+
+/// [`b2bua_reject_call`] with the application's own `headers` on the response
+/// (the control plane's `reject` verb), already checked by
+/// [`crate::b2bua::uas_headers::validate`].
+pub fn b2bua_reject_call_with_headers(
+    internal_call_id: &str,
+    code: u16,
+    reason: &str,
+    headers: &[(String, String)],
+) -> bool {
     let Some(control) = B2BUA_CONTROL.get() else {
         return false;
     };
@@ -320,7 +332,7 @@ pub fn b2bua_reject_call(internal_call_id: &str, code: u16, reason: &str) -> boo
     // from a thread with no tokio context (an event-callback driver, a timer),
     // while the shutdown pass and the tests already run on one.
     let _enter = control.runtime.enter();
-    b2bua_reject_call_in(&control.state, internal_call_id, code, reason)
+    b2bua_reject_call_in(&control.state, internal_call_id, code, reason, headers)
 }
 
 /// [`b2bua_reject_call`] against an explicit dispatcher state, for a caller that
@@ -332,6 +344,7 @@ pub(crate) fn b2bua_reject_call_in(
     internal_call_id: &str,
     code: u16,
     reason: &str,
+    headers: &[(String, String)],
 ) -> bool {
     let (invite_arc, transport, remote_addr, connection_id, local_addr, local_tag, sip_call_id) =
         match state.call_actors.get_call(internal_call_id) {
@@ -367,7 +380,7 @@ pub(crate) fn b2bua_reject_call_in(
             ));
         }
     }
-    let response = build_response(
+    let mut response = build_response(
         &invite,
         code,
         reason,
@@ -375,6 +388,7 @@ pub(crate) fn b2bua_reject_call_in(
         &reply_headers,
     );
     drop(invite);
+    crate::b2bua::uas_headers::apply(&mut response, headers);
     // The caller's final response: siphon's reliable provisionals to it stop
     // (RFC 3262 §3).
     end_a_leg_reliability(internal_call_id, state);

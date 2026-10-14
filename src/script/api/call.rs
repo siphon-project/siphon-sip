@@ -23,8 +23,14 @@ pub enum CallAction {
     /// No action taken yet.
     #[default]
     None,
-    /// Reject the call with a status code and reason.
-    Reject { code: u16, reason: String },
+    /// Reject the call with a status code and reason, and the script's own
+    /// `headers` on the response (already checked by
+    /// [`crate::b2bua::uas_headers::validate`]).
+    Reject {
+        code: u16,
+        reason: String,
+        headers: Vec<(String, String)>,
+    },
     /// Dial a single B-leg target.
     Dial {
         target: String,
@@ -593,6 +599,7 @@ impl PyCall {
         self.action = CallAction::Reject {
             code,
             reason: reason.into(),
+            headers: Vec::new(),
         };
     }
 
@@ -930,6 +937,33 @@ impl PyCall {
     pub fn set_refer_from_a_leg(&mut self, from_a_leg: bool) {
         self.refer_from_a_leg = Some(from_a_leg);
     }
+}
+
+/// The `headers=` of `call.progress()` / `call.answer()` / `call.reject()`, in
+/// the order the mapping gives them, checked against the headers siphon owns on
+/// a response it sends ([`crate::b2bua::uas_headers::validate`]). A refused
+/// header raises `ValueError` naming `method` and the header, and a name or
+/// value that is not a `str` raises `TypeError`: nothing is sent either way.
+fn uas_response_headers(
+    method: &str,
+    headers: Option<&Bound<'_, pyo3::types::PyDict>>,
+) -> PyResult<Vec<(String, String)>> {
+    let Some(headers) = headers else {
+        return Ok(Vec::new());
+    };
+    let mut pairs = Vec::with_capacity(headers.len());
+    for (name, value) in headers.iter() {
+        let (Ok(name), Ok(value)) = (name.extract::<String>(), value.extract::<String>()) else {
+            return Err(pyo3::exceptions::PyTypeError::new_err(format!(
+                "{method}(headers=…) takes a mapping of str header names to str values"
+            )));
+        };
+        pairs.push((name, value));
+    }
+    crate::b2bua::uas_headers::validate(&pairs).map_err(|refusal| {
+        pyo3::exceptions::PyValueError::new_err(format!("{method}(headers=…): {refusal}"))
+    })?;
+    Ok(pairs)
 }
 
 #[pymethods]
@@ -1393,11 +1427,30 @@ impl PyCall {
     }
 
     /// Reject the call with a status code.
-    fn reject(&mut self, code: u16, reason: &str) {
+    ///
+    /// Args:
+    ///     code: Final failure status (3xx-6xx).
+    ///     reason: Reason phrase (e.g. ``"Busy Here"``).
+    ///     headers: Optional ``{name: value}`` mapping added to the response,
+    ///         e.g. ``{"Reason": "SIP;cause=486", "Retry-After": "120"}``. The
+    ///         headers siphon owns on a response it sends (Via, From, To,
+    ///         Call-ID, CSeq, Contact, Record-Route, Route, Max-Forwards,
+    ///         Content-Length, Content-Type, RSeq, RAck, Require, Supported,
+    ///         Session-Expires, Min-SE) raise ``ValueError``.
+    #[pyo3(signature = (code, reason, headers=None))]
+    fn reject(
+        &mut self,
+        code: u16,
+        reason: &str,
+        headers: Option<&Bound<'_, pyo3::types::PyDict>>,
+    ) -> PyResult<()> {
+        let headers = uas_response_headers("call.reject", headers)?;
         self.action = CallAction::Reject {
             code,
             reason: reason.to_string(),
+            headers,
         };
+        Ok(())
     }
 
     /// Hand this call over to an out-of-process control application (ARI
@@ -1512,19 +1565,23 @@ impl PyCall {
     ///     reason: Reason phrase (e.g. ``"OK"``).
     ///     body: Optional response body (``bytes`` or ``str``) — typically SDP.
     ///     content_type: Content-Type for the body (e.g. ``"application/sdp"``).
-    #[pyo3(signature = (code, reason, body=None, content_type=None))]
+    ///     headers: Optional ``{name: value}`` mapping added to the 2xx. The
+    ///         headers siphon owns on it raise ``ValueError`` (see ``reject()``).
+    #[pyo3(signature = (code, reason, body=None, content_type=None, headers=None))]
     fn answer(
         &mut self,
         code: u16,
         reason: &str,
         body: Option<&Bound<'_, PyAny>>,
         content_type: Option<&str>,
+        headers: Option<&Bound<'_, pyo3::types::PyDict>>,
     ) -> PyResult<()> {
         if !(200..300).contains(&code) {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
                 "call.answer() requires a 2xx status code; use call.reject() for failure responses (got {code})"
             )));
         }
+        let headers = uas_response_headers("call.answer", headers)?;
 
         let body_bytes = match body {
             Some(obj) => Some(super::request::extract_body_bytes(obj)?),
@@ -1542,6 +1599,7 @@ impl PyCall {
             reason,
             body_bytes,
             content_type,
+            &headers,
         );
         if !sent {
             tracing::error!(call_id = %self.id, "call.answer(): no 2xx sent: the call is gone, or it was refused 420 for an extension it requires or 422 for its session interval");
@@ -1566,19 +1624,31 @@ impl PyCall {
     ///     reason: Reason phrase (e.g. ``"Session Progress"``).
     ///     body: Optional response body (``bytes`` or ``str``) — early-media SDP.
     ///     content_type: Content-Type for the body (e.g. ``"application/sdp"``).
-    #[pyo3(signature = (code, reason="Ringing", body=None, content_type=None))]
+    ///     headers: Optional ``{name: value}`` mapping added to the 1xx, e.g.
+    ///         ``{"P-Early-Media": "sendrecv"}`` (RFC 5009) on an announcement's
+    ///         183. The headers siphon owns on it raise ``ValueError`` (see
+    ///         ``reject()``): ``Require`` / ``RSeq`` stay siphon's, which sends
+    ///         the provisional reliably when the caller asked for ``100rel``.
+    ///
+    /// Example:
+    ///     call.progress(183, "Session Progress", body=sdp,
+    ///                   content_type="application/sdp",
+    ///                   headers={"P-Early-Media": "sendrecv"})
+    #[pyo3(signature = (code, reason="Ringing", body=None, content_type=None, headers=None))]
     fn progress(
         &mut self,
         code: u16,
         reason: &str,
         body: Option<&Bound<'_, PyAny>>,
         content_type: Option<&str>,
+        headers: Option<&Bound<'_, pyo3::types::PyDict>>,
     ) -> PyResult<()> {
         if !(100..200).contains(&code) {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
                 "call.progress() requires a 1xx status code (got {code}); use call.answer() for the final response"
             )));
         }
+        let headers = uas_response_headers("call.progress", headers)?;
 
         let body_bytes = match body {
             Some(obj) => Some(super::request::extract_body_bytes(obj)?),
@@ -1593,6 +1663,7 @@ impl PyCall {
             reason,
             body_bytes,
             content_type,
+            &headers,
         );
         if !sent {
             tracing::error!(call_id = %self.id, "call.progress(): no live B2BUA call");
@@ -2794,14 +2865,94 @@ mod tests {
             "10.0.0.1".to_string(),
             "udp".to_string(),
         );
-        call.reject(404, "Not Found");
+        call.reject(404, "Not Found", None)
+            .expect("no headers to refuse");
         assert_eq!(
             call.action(),
             &CallAction::Reject {
                 code: 404,
-                reason: "Not Found".to_string()
+                reason: "Not Found".to_string(),
+                headers: Vec::new(),
             }
         );
+    }
+
+    fn uas_test_call() -> PyCall {
+        PyCall::new(
+            "test-id".to_string(),
+            Arc::new(Mutex::new(make_invite())),
+            "192.0.2.1".to_string(),
+            "udp".to_string(),
+        )
+    }
+
+    #[test]
+    fn call_reject_records_the_scripts_headers_in_order() {
+        Python::initialize();
+        Python::attach(|py| {
+            let headers = pyo3::types::PyDict::new(py);
+            headers.set_item("Reason", "SIP;cause=486").unwrap();
+            headers.set_item("Retry-After", "120").unwrap();
+            let mut call = uas_test_call();
+            call.reject(486, "Busy Here", Some(&headers))
+                .expect("neither header is siphon's");
+            assert_eq!(
+                call.action(),
+                &CallAction::Reject {
+                    code: 486,
+                    reason: "Busy Here".to_string(),
+                    headers: vec![
+                        ("Reason".to_string(), "SIP;cause=486".to_string()),
+                        ("Retry-After".to_string(), "120".to_string()),
+                    ],
+                }
+            );
+        });
+    }
+
+    #[test]
+    fn a_framework_owned_header_raises_value_error_on_every_uas_response() {
+        Python::initialize();
+        Python::attach(|py| {
+            let headers = pyo3::types::PyDict::new(py);
+            headers.set_item("Contact", "<sip:x@192.0.2.99>").unwrap();
+            let mut call = uas_test_call();
+
+            let refused = call
+                .reject(486, "Busy Here", Some(&headers))
+                .expect_err("Contact is siphon's");
+            assert!(refused.is_instance_of::<pyo3::exceptions::PyValueError>(py));
+            assert!(
+                refused
+                    .to_string()
+                    .contains("call.reject(headers=…): Contact"),
+                "{refused}"
+            );
+            assert_eq!(call.action(), &CallAction::None, "nothing was decided");
+
+            // Refused before the call is looked up, so no live call is needed.
+            let refused = call
+                .progress(183, "Session Progress", None, None, Some(&headers))
+                .expect_err("Contact is siphon's");
+            assert!(refused.to_string().contains("call.progress(headers=…)"));
+            let refused = call
+                .answer(200, "OK", None, None, Some(&headers))
+                .expect_err("Contact is siphon's");
+            assert!(refused.to_string().contains("call.answer(headers=…)"));
+        });
+    }
+
+    #[test]
+    fn a_header_value_that_is_not_a_string_raises_type_error() {
+        Python::initialize();
+        Python::attach(|py| {
+            let headers = pyo3::types::PyDict::new(py);
+            headers.set_item("Retry-After", 120).unwrap();
+            let refused = uas_test_call()
+                .reject(503, "Service Unavailable", Some(&headers))
+                .expect_err("120 is not a str");
+            assert!(refused.is_instance_of::<pyo3::exceptions::PyTypeError>(py));
+        });
     }
 
     #[test]
@@ -2820,7 +2971,8 @@ mod tests {
             call.action(),
             &CallAction::Reject {
                 code: 488,
-                reason: "Not Acceptable Here".to_string()
+                reason: "Not Acceptable Here".to_string(),
+                headers: Vec::new(),
             }
         );
     }

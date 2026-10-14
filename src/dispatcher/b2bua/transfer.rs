@@ -355,6 +355,7 @@ pub fn b2bua_bridge_inbound_replaces(
         Some(sdp_for_new_party),
         Some("application/sdp"),
         true,
+        &[],
     ) {
         warn!(call_id = %replaced_call_id, "B2BUA Replaces: failed to answer the taking-over INVITE");
     }

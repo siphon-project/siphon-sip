@@ -395,6 +395,7 @@ pub fn fail_b2bua_call_on_timeout(call_id: &str, state: &DispatcherState) {
         FailedCallEnd::Local {
             status_code: failure_status,
             reason: best_error_reason(failure_status).to_string(),
+            headers: Vec::new(),
         },
         state,
     );

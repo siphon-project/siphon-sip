@@ -86,6 +86,7 @@ pub fn control_handover(
             "OK",
             profile,
             ws_uri,
+            &[],
             state,
         ) {
             Ok(()) => {
@@ -210,6 +211,7 @@ pub fn answer_first_anchor(
     reason: &str,
     profile: Option<&str>,
     ws_uri: Option<&str>,
+    headers: &[(String, String)],
     state: &DispatcherState,
 ) -> Result<(), String> {
     // Checked before anything is anchored: siphon answers this call itself, so
@@ -246,6 +248,7 @@ pub fn answer_first_anchor(
         reason,
         Some(answer_sdp.into_bytes()),
         Some("application/sdp"),
+        headers,
         state,
     ) {
         return Err(format!(
@@ -332,6 +335,7 @@ pub fn early_media_anchor_progress(
     reason: &str,
     profile: Option<&str>,
     ws_uri: Option<&str>,
+    headers: &[(String, String)],
     state: &DispatcherState,
 ) -> Result<(), String> {
     let anchor = match state.call_actors.early_media_anchor(call_id) {
@@ -351,6 +355,7 @@ pub fn early_media_anchor_progress(
         reason,
         Some(anchor.answer_sdp.into_bytes()),
         Some("application/sdp"),
+        headers,
     ) {
         return Err(format!(
             "failed to send {code} {reason} (call gone / dispatcher down)"

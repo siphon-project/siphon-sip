@@ -3287,6 +3287,7 @@ mod tests {
             CallAction::Reject {
                 code: 407,
                 reason: "Proxy Authentication Required".to_string(),
+                headers: Vec::new(),
             }
         );
         assert_eq!(call.get_auth_user(), None);
@@ -3317,6 +3318,7 @@ mod tests {
             CallAction::Reject {
                 code: 401,
                 reason: "Unauthorized".to_string(),
+                headers: Vec::new(),
             }
         );
         assert_eq!(call_header_values(&call, "WWW-Authenticate").len(), 3);

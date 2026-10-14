@@ -170,6 +170,7 @@ fn an_inapplicable_action_is_surfaced_rather_than_dropped() {
     let reject = CallAction::Reject {
         code: 486,
         reason: "Busy Here".to_string(),
+        headers: Vec::new(),
     };
     assert_eq!(
         classify_answer_action(Some(reject.clone())),
@@ -2232,14 +2233,23 @@ fn b2bua_answer_and_progress_unknown_id_is_false_no_panic() {
         "\r\n",
     );
     let invite = parse_sip_message(raw).expect("test fixture must parse").1;
-    assert!(!b2bua_answer_call("nope", &invite, 200, "OK", None, None));
+    assert!(!b2bua_answer_call(
+        "nope",
+        &invite,
+        200,
+        "OK",
+        None,
+        None,
+        &[]
+    ));
     assert!(!b2bua_progress_call(
         "nope",
         &invite,
         183,
         "Session Progress",
         None,
-        None
+        None,
+        &[]
     ));
 }
 
@@ -7766,6 +7776,7 @@ fn call_action_names_every_variant() {
         CallAction::Reject {
             code: 486,
             reason: "Busy Here".to_string(),
+            headers: Vec::new(),
         }
         .name(),
         "reject"
