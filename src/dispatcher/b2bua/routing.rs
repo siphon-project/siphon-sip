@@ -392,6 +392,19 @@ pub fn b2bua_advance_route_with_numbers(
     // and media path halfway down its target list.
     let shaped = control_dial_shaping(call_id, original_request, state);
     let original_request = shaped.as_ref().unwrap_or(original_request);
+    // Behind an early answer siphon gave the caller, every attempt carries the
+    // engine's far-leg offer, made afresh when an earlier callee's SDP took it.
+    let behind_early_answer = match super::invite_for_dial(state, call_id, original_request) {
+        Ok(invite) => invite,
+        Err(reason) => {
+            warn!(call_id = %call_id, %reason, "LCR: no route can be dialled behind the caller's early answer");
+            return RouteAdvance {
+                dialed: false,
+                burned: Vec::new(),
+            };
+        }
+    };
+    let original_request = behind_early_answer.as_ref().unwrap_or(original_request);
     let send_socket_str = state.call_actors.route_send_socket(call_id);
     let send_socket = state.resolve_send_socket(send_socket_str.as_deref());
     let a_leg_ruri = match &original_request.start_line {

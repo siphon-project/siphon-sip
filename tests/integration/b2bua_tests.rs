@@ -2317,10 +2317,10 @@ fn an_early_media_anchor_is_kept_on_the_call_for_the_answer_to_repeat() {
         "a new call has no early-media anchor"
     );
 
-    let anchor = EarlyMediaAnchor {
-        answer_sdp: "v=0\r\nc=IN IP4 203.0.113.1\r\n".to_string(),
-        profile: "voice_ai".to_string(),
-    };
+    let anchor = EarlyMediaAnchor::engine(
+        "v=0\r\nc=IN IP4 203.0.113.1\r\n".to_string(),
+        "voice_ai".to_string(),
+    );
     store.set_early_media_anchor(&call_id, anchor.clone());
     assert_eq!(store.early_media_anchor(&call_id), Some(anchor));
     assert!(store.early_media_anchor("no-such-call").is_none());

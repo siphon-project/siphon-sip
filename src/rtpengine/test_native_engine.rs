@@ -78,11 +78,32 @@ fn native_engine_sdp(base: &str, port: &str, transport: Option<&str>, input: &st
     sdp
 }
 
+/// The SDP the engine returns for every `offer_far`: the offer for the far
+/// leg it binds behind a call it answered itself, on a port of its own, so a
+/// test can tell it from the caller's answer and from any SDP a peer sent.
+pub(crate) const NATIVE_ENGINE_FAR_OFFER: &str = concat!(
+    "v=0\r\n",
+    "o=- 11 11 IN IP4 203.0.113.62\r\n",
+    "s=-\r\n",
+    "c=IN IP4 203.0.113.62\r\n",
+    "t=0 0\r\n",
+    "m=audio 53000 RTP/AVP 0 8 101\r\n",
+    "a=rtpmap:0 PCMU/8000\r\n",
+    "a=rtpmap:8 PCMA/8000\r\n",
+    "a=rtpmap:101 telephone-event/8000\r\n",
+    "a=sendrecv\r\n",
+);
+
+/// An answer the engine refuses on a grown call, as the real one refuses a
+/// far party that picks a codec its offer did not list.
+pub(crate) const NATIVE_ENGINE_UNOFFERED_CODEC: &str = "G729/8000";
+
 /// One media command the engine was sent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct NativeCommand {
-    /// `answer_local`, `answer`, `delete`, `offer`, `reoffer`, `play_media`
-    /// or `stop_media`.
+    /// `answer_local`, `answer`, `delete`, `offer`, `reoffer`, `play_media`,
+    /// `stop_media`, `offer_far`, or `delete_far_leg` (a `delete` with a
+    /// `to_tag` on a call `offer_far` grew).
     pub(crate) name: &'static str,
     pub(crate) call_id: String,
     pub(crate) from_tag: String,
@@ -116,6 +137,80 @@ struct Recorded {
     detail: Option<String>,
     repeat: Option<String>,
     profile: Option<siphon_rtp_proto::ProfileFlags>,
+}
+
+/// What the engine makes of a command on a call `offer_far` grew (or the
+/// `offer_far` that grows it): the record, the SDP it answers with, and a
+/// refusal.
+struct GrownCall {
+    record: Recorded,
+    sdp: Option<String>,
+    refusal: Option<String>,
+}
+
+/// `command` as the engine handles it on a grown call, or `None` for any
+/// other command, which the ordinary arms handle.
+fn grown_call_command(command: &Command, grown: &Mutex<HashSet<String>>) -> Option<GrownCall> {
+    let Ok(mut set) = grown.lock() else {
+        return None;
+    };
+    match command {
+        Command::OfferFar {
+            call_id,
+            from_tag,
+            profile,
+        } => {
+            set.insert(call_id.clone());
+            Some(GrownCall {
+                record: Recorded {
+                    profile: Some(profile.clone()),
+                    ..Recorded::new("offer_far", call_id, from_tag)
+                },
+                sdp: Some(NATIVE_ENGINE_FAR_OFFER.to_string()),
+                refusal: None,
+            })
+        }
+        Command::Delete {
+            call_id,
+            from_tag,
+            to_tag: Some(to_tag),
+        } if set.contains(call_id) => {
+            set.remove(call_id);
+            Some(GrownCall {
+                record: Recorded {
+                    detail: Some(to_tag.clone()),
+                    ..Recorded::new("delete_far_leg", call_id, from_tag)
+                },
+                sdp: None,
+                refusal: None,
+            })
+        }
+        Command::Delete { call_id, .. } => {
+            // A whole-call delete forgets the far leg; the ordinary arm records it.
+            set.remove(call_id);
+            None
+        }
+        Command::Answer {
+            call_id,
+            from_tag,
+            to_tag,
+            profile,
+            sdp,
+        } if set.contains(call_id) => Some(GrownCall {
+            record: Recorded {
+                detail: Some(to_tag.clone()),
+                profile: Some(profile.clone()),
+                ..Recorded::new("answer", call_id, from_tag)
+            },
+            // The caller's own answer, unchanged.
+            sdp: Some(NATIVE_ENGINE_ANSWER.to_string()),
+            refusal: sdp.contains(NATIVE_ENGINE_UNOFFERED_CODEC).then(|| {
+                "answer: codec-not-offered: the far party answered a codec the far offer did not list"
+                    .to_string()
+            }),
+        }),
+        _ => None,
+    }
 }
 
 impl Recorded {
@@ -154,6 +249,9 @@ impl NativeTestEngine {
         let recorded = Arc::clone(&commands);
         let live: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
         let held = Arc::clone(&live);
+        // The calls `offer_far` grew a far leg on, which `answer` completes
+        // with the caller's own answer and a `delete` with a `to_tag` drops.
+        let grown: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
         let next_play_id = Arc::new(std::sync::atomic::AtomicU64::new(
             NATIVE_ENGINE_FIRST_PLAY_ID,
         ));
@@ -161,6 +259,7 @@ impl NativeTestEngine {
             while let Ok((mut stream, _)) = listener.accept().await {
                 let recorded = Arc::clone(&recorded);
                 let held = Arc::clone(&held);
+                let grown = Arc::clone(&grown);
                 let next_play_id = Arc::clone(&next_play_id);
                 tokio::spawn(async move {
                     let mut buffer = Vec::new();
@@ -186,7 +285,12 @@ impl NativeTestEngine {
                         let mut play_id = None;
                         // What the command is, what SDP an accepted one answers
                         // with, and what it does to the calls the engine holds.
+                        let grown_call = grown_call_command(&request.command, &grown);
+                        let refusal = grown_call.as_ref().and_then(|grown| grown.refusal.clone());
                         let (record, sdp, creates, needs_call) = match &request.command {
+                            _ if grown_call.is_some() => grown_call
+                                .map(|grown| (Some(grown.record), grown.sdp, false, true))
+                                .unwrap_or((None, None, false, false)),
                             Command::AnswerLocal {
                                 call_id,
                                 from_tag,
@@ -369,6 +473,9 @@ impl NativeTestEngine {
                             Command::Ping => CmdResult::Pong,
                             _ if refused => CmdResult::Error {
                                 reason: unknown_call.unwrap_or_default(),
+                            },
+                            _ if refusal.is_some() => CmdResult::Error {
+                                reason: refusal.clone().unwrap_or_default(),
                             },
                             _ => CmdResult::Ok {
                                 sdp,
