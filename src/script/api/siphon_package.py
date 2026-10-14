@@ -569,6 +569,63 @@ class _B2buaNamespace:
         return fn
 
     @staticmethod
+    def on_reoffer(fn):
+        """Register handler for an in-dialog offer on a bridged call.
+
+        Called with ``(call, offer)`` when either party sends a re-INVITE or
+        an UPDATE (RFC 3311, the early-dialog UPDATE included) that siphon
+        would relay to the other party, before it is relayed. ``offer`` is a
+        ``Reoffer``: ``offer.side`` says who sent it, ``offer.sdp`` is the
+        offer, ``offer.request`` the request for its headers, and
+        ``offer.kind`` reads it against the session in force (``"hold"``,
+        ``"resume"``, ``"refresh"``, ``"change"``).
+
+        The handler decides what happens to it: nothing relays it, as
+        without the hook; ``offer.reject(code, reason)`` refuses it;
+        ``offer.answer(sdp=None)`` answers it here and relays nothing, so
+        the other party can be put on an announcement. Every request is
+        answered: a handler that raises (or an async one that times out)
+        decides nothing, and the offer is relayed.
+
+        Not called for a 491 siphon answers to a crossing offer
+        (RFC 3261 §14.1), nor on a call siphon itself answered or one a
+        controller bridged.
+
+        Usage:
+            @b2bua.on_reoffer
+            def hold(call, offer):
+                if offer.kind == "hold":
+                    offer.answer()
+        """
+        is_async = _asyncio.iscoroutinefunction(fn)
+        _registry.register("b2bua.on_reoffer", None, fn, is_async)
+        return fn
+
+    @staticmethod
+    def on_reoffer_answered(fn):
+        """Register handler for the final response to an in-dialog offer.
+
+        Called with ``(call, offer)`` once the party that sent a re-INVITE or
+        an UPDATE on a bridged call has been sent its final response,
+        whoever gave it. ``offer.status_code``, ``offer.answer_sdp`` and
+        ``offer.answer_direction`` say how it ended, and
+        ``offer.answered_locally`` whether siphon answered it. Purely a
+        notification: a raise here changes nothing.
+
+        Usage:
+            @b2bua.on_reoffer_answered
+            async def held(call, offer):
+                # The caller held the callee: replace the caller's audio
+                # toward the callee with music on hold.
+                if offer.kind == "hold" and offer.side == "a" and offer.status_code == 200:
+                    await rtpengine.play_media(call, file="/srv/moh.wav",
+                                               repeat="inf", wait=False)
+        """
+        is_async = _asyncio.iscoroutinefunction(fn)
+        _registry.register("b2bua.on_reoffer_answered", None, fn, is_async)
+        return fn
+
+    @staticmethod
     def on_cancel(fn):
         """Register handler for a CANCELled call (RFC 3261 §9).
 

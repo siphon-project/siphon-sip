@@ -94,7 +94,15 @@ pub(super) fn sdp_naming(address: &str) -> String {
 /// caller offered and the callee answered on an engine call keyed by the
 /// caller's Call-ID, as a script's `rtpengine.offer` / `answer` leave it.
 pub(super) async fn anchored(prefix: u32, engine: &NativeTestEngine, profile: &str) -> Established {
-    let mut call = establish(prefix, "terminate");
+    anchored_on(establish(prefix, "terminate"), engine, profile).await
+}
+
+/// [`anchored`] for a call already set up, under its own script.
+pub(super) async fn anchored_on(
+    mut call: Established,
+    engine: &NativeTestEngine,
+    profile: &str,
+) -> Established {
     let registry = profiles();
     let backend = engine.backend();
     let entry = registry.get(profile).expect("a known profile");

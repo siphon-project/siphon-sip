@@ -3235,6 +3235,34 @@ jobs:
       - name: A call must be cut at its maximum duration, and only then
         run: PYO3_PYTHON=python3.14 scripts/b2bua_max_duration_test.sh
 
+  # A script has to see a bridged call's hold before siphon relays it, and be
+  # able to answer it itself. Deterministic: the caller's hold is answered by
+  # the script (the caller checks the 200 says a=recvonly) and must never reach
+  # the callee, whose scenario expects only the resume the script relays and
+  # marks. Both hooks log what they saw, and the runner checks those lines.
+  sipp-b2bua-reoffer:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Python 3.14 (free-threaded)
+        uses: deadsnakes/action@v3.2.0
+        with:
+          python-version: "3.14-dev"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install SIPp
+        run: sudo apt-get update && sudo apt-get install -y sip-tester
+
+      - name: Build siphon
+        run: PYO3_PYTHON=python3.14 cargo build --bin siphon
+
+      - name: A hold the script answers, a resume it relays
+        run: PYO3_PYTHON=python3.14 scripts/b2bua_reoffer_test.sh
+
   # ── Fuzz testing (nightly) ─────────────────────────────────────────────
   fuzz:
     runs-on: ubuntu-latest

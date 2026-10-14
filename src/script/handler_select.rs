@@ -290,6 +290,8 @@ impl ScriptState {
                     | HandlerKind::B2buaFailure
                     | HandlerKind::B2buaBye
                     | HandlerKind::B2buaRefer
+                    | HandlerKind::B2buaReoffer
+                    | HandlerKind::B2buaReofferAnswered
                     | HandlerKind::B2buaRouteFailure
             )
         })

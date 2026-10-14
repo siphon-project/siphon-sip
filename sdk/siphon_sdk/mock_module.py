@@ -896,6 +896,9 @@ class MockB2bua:
         - ``@b2bua.on_failure`` — all B-legs failed
         - ``@b2bua.on_bye`` — call ended
         - ``@b2bua.on_refer`` — call transfer (RFC 3515)
+        - ``@b2bua.on_reoffer`` / ``@b2bua.on_reoffer_answered`` — an in-dialog
+          re-INVITE or UPDATE (hold, resume, refresh), before it is relayed
+          and once it is answered
         - ``@b2bua.on_cancel`` — unanswered call cancelled (RFC 3261 §9)
 
     Imperative:
@@ -1574,6 +1577,61 @@ class MockB2bua:
         """
         is_async = asyncio.iscoroutinefunction(fn)
         _registry.register("b2bua.on_refer", None, fn, is_async)
+        return fn
+
+    @staticmethod
+    def on_reoffer(fn: Callable) -> Callable:
+        """Register handler for an in-dialog offer on a bridged call.
+
+        Handler signature: ``(call, offer) -> None`` where ``offer`` is a
+        :class:`siphon_sdk.reoffer.Reoffer`.
+
+        Called when either party sends a re-INVITE or an UPDATE (RFC 3311,
+        the early-dialog UPDATE included) that siphon would relay, before it
+        is relayed. ``offer.side`` says who sent it, ``offer.sdp`` is the
+        offer, ``offer.request`` the request for its headers, and
+        ``offer.kind`` reads it against the session in force: ``"hold"``,
+        ``"resume"``, ``"refresh"`` or ``"change"``.
+
+        Doing nothing relays the offer. ``offer.reject(code, reason)``
+        refuses it; ``offer.answer(sdp=None)`` answers it here and relays
+        nothing. A handler that raises decides nothing: the offer is relayed.
+        Not called for a 491 siphon answers to a crossing offer, nor on a call
+        siphon answered itself or a controller bridged.
+
+        Example::
+
+            @b2bua.on_reoffer
+            def hold(call, offer):
+                if offer.kind == "hold":
+                    offer.answer()
+        """
+        is_async = asyncio.iscoroutinefunction(fn)
+        _registry.register("b2bua.on_reoffer", None, fn, is_async)
+        return fn
+
+    @staticmethod
+    def on_reoffer_answered(fn: Callable) -> Callable:
+        """Register handler for the final response to an in-dialog offer.
+
+        Handler signature: ``(call, offer) -> None``.
+
+        Called once the party that sent a re-INVITE or an UPDATE on a bridged
+        call has its final response, whoever gave it:
+        ``offer.status_code``, ``offer.answer_sdp``,
+        ``offer.answer_direction`` and ``offer.answered_locally`` say how it
+        ended. A notification: a raise changes nothing.
+
+        Example::
+
+            @b2bua.on_reoffer_answered
+            async def held(call, offer):
+                if offer.kind == "hold" and offer.side == "a" and offer.status_code == 200:
+                    await rtpengine.play_media(call, file="/srv/moh.wav",
+                                               repeat="inf", wait=False)
+        """
+        is_async = asyncio.iscoroutinefunction(fn)
+        _registry.register("b2bua.on_reoffer_answered", None, fn, is_async)
         return fn
 
     @staticmethod

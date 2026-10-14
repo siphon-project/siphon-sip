@@ -23,6 +23,7 @@
 //! ICE, a grouping of streams. A description that needs one is refused rather
 //! than answered wrongly.
 
+use super::direction::{direction_attribute, stated_direction, DIRECTION_ATTRIBUTES};
 use super::sdp::{MediaLine, SdpBody};
 
 /// Attributes whose answer takes more than the two descriptions to work out.
@@ -38,9 +39,6 @@ const NEGOTIATED_ATTRIBUTES: [&str; 9] = [
     "mid",
 ];
 
-/// The attributes that give a stream its direction (RFC 3264 §5.1).
-const DIRECTION_ATTRIBUTES: [&str; 4] = ["sendrecv", "sendonly", "recvonly", "inactive"];
-
 /// Whether `sdp` carries an attribute this module cannot answer for.
 fn needs_more_than_formats(sdp: &SdpBody) -> bool {
     NEGOTIATED_ATTRIBUTES.iter().any(|name| {
@@ -50,34 +48,6 @@ fn needs_more_than_formats(sdp: &SdpBody) -> bool {
                 .iter()
                 .any(|section| section.has_attr(name))
     })
-}
-
-/// Whether the party of `own` may send and receive on a stream, as its
-/// description says: at media level, else at session level, else both.
-fn direction(session: &SdpBody, section: &MediaLine) -> (bool, bool) {
-    let named = DIRECTION_ATTRIBUTES
-        .iter()
-        .find(|name| section.has_attr(name))
-        .or_else(|| {
-            DIRECTION_ATTRIBUTES
-                .iter()
-                .find(|name| session.session_has_attr(name))
-        });
-    match named.copied() {
-        Some("sendonly") => (true, false),
-        Some("recvonly") => (false, true),
-        Some("inactive") => (false, false),
-        _ => (true, true),
-    }
-}
-
-fn direction_attribute(send: bool, receive: bool) -> &'static str {
-    match (send, receive) {
-        (true, true) => "sendrecv",
-        (true, false) => "sendonly",
-        (false, true) => "recvonly",
-        (false, false) => "inactive",
-    }
 }
 
 /// The `a=rtpmap:` encoding of `format` in `section`, when it gives one.
@@ -164,8 +134,8 @@ fn accepted(
         answer.remove_attr("rtcp-mux");
     }
 
-    let (may_send, may_receive) = direction(description, own);
-    let (offerer_sends, offerer_receives) = direction(offer, offered);
+    let (may_send, may_receive) = stated_direction(description, own);
+    let (offerer_sends, offerer_receives) = stated_direction(offer, offered);
     let answered = direction_attribute(may_send && offerer_receives, may_receive && offerer_sends);
     let stated = DIRECTION_ATTRIBUTES
         .iter()

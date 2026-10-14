@@ -24,6 +24,8 @@ pub fn forward_update_response(
 
     if let Some(direction) = update_direction {
         let is_a2b = direction == "a2b";
+        // As for a re-INVITE: the offer `@b2bua.on_reoffer_answered` is shown.
+        let reoffer = take_reoffer_for_final(call_id, &snapshot.branch, status_code, state);
 
         // The response as the responder sent it: its Session-Expires decides the
         // session timer of the responder's dialog.
@@ -346,6 +348,7 @@ pub fn forward_update_response(
             );
         }
 
+        notify_reoffer_response(call_id, reoffer, message, false, state);
         debug!(
             call_id = %call_id,
             status = status_code,

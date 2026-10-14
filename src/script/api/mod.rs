@@ -31,6 +31,7 @@ pub mod proxy_utils;
 pub mod qos;
 pub mod registrant;
 pub mod registrar;
+pub mod reoffer;
 pub mod reply;
 pub mod request;
 mod route_entries;

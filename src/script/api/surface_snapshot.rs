@@ -102,6 +102,7 @@ mod tests {
             super::super::registrar::PyContact,
             super::super::registrar::PyFlow,
             super::super::registrar::PyRegistrar,
+            super::super::reoffer::PyReoffer,
             super::super::reply::PyReply,
             super::super::request::PyRequest,
             super::super::rtpengine::PyRtpEngine,

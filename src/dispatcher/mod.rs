@@ -244,6 +244,8 @@ mod relayed_cancel_awaits_provisional_tests;
 #[cfg(test)]
 mod relayed_identity_tests;
 #[cfg(test)]
+mod reoffer_hook_tests;
+#[cfg(test)]
 mod reoffer_ingress_tests;
 #[cfg(test)]
 mod replacement_fork_tests;

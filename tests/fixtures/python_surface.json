@@ -1647,6 +1647,66 @@
         "sig": "($self, aor)"
       }
     },
+    "Reoffer": {
+      "answer": {
+        "doc": "Answer the offer here and relay nothing to the other party, which",
+        "kind": "method_descriptor",
+        "sig": "($self, sdp=None)"
+      },
+      "answer_direction": {
+        "doc": "Which way ``answer_sdp`` has media flow, for the party that answered",
+        "kind": "getset_descriptor"
+      },
+      "answer_sdp": {
+        "doc": "The SDP of the final response as the offerer was sent it, ``None``",
+        "kind": "getset_descriptor"
+      },
+      "answered_locally": {
+        "doc": "Whether siphon answered the offer itself (``offer.answer()``,",
+        "kind": "getset_descriptor"
+      },
+      "direction": {
+        "doc": "Which way the offer has media flow, for the party that sent it:",
+        "kind": "getset_descriptor"
+      },
+      "early": {
+        "doc": "Whether the offer crossed before the call was answered: an UPDATE",
+        "kind": "getset_descriptor"
+      },
+      "kind": {
+        "doc": "What the offer does to the session in force, compared stream by stream",
+        "kind": "getset_descriptor"
+      },
+      "method": {
+        "doc": "``\"INVITE\"`` for a re-INVITE, ``\"UPDATE\"`` for an UPDATE (RFC 3311).",
+        "kind": "getset_descriptor"
+      },
+      "previous_direction": {
+        "doc": "The same for the description that party last gave on its dialog: the",
+        "kind": "getset_descriptor"
+      },
+      "reject": {
+        "doc": "Refuse the offer with ``code`` (300-699) and ``reason``; nothing is",
+        "kind": "method_descriptor",
+        "sig": "($self, code, reason)"
+      },
+      "request": {
+        "doc": "The re-INVITE or UPDATE as it arrived, for its headers. Only in",
+        "kind": "getset_descriptor"
+      },
+      "sdp": {
+        "doc": "The offer's SDP as the party sent it, or ``None`` for an offerless",
+        "kind": "getset_descriptor"
+      },
+      "side": {
+        "doc": "Which party sent the offer: ``\"a\"`` for the caller, ``\"b\"`` for the",
+        "kind": "getset_descriptor"
+      },
+      "status_code": {
+        "doc": "The final response's status code. Only in",
+        "kind": "getset_descriptor"
+      }
+    },
     "Reply": {
       "body": {
         "doc": "Message body as bytes, or None if empty.",

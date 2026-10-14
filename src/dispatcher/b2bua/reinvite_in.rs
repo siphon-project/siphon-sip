@@ -1,5 +1,6 @@
 //! An inbound re-INVITE on a bridged call: glare, the offer/answer it drives
 //! across the bridge, and the media re-anchor behind it.
+use crate::b2bua::reoffer::ReofferDecision;
 use crate::dispatcher::*;
 
 #[allow(clippy::too_many_lines)] // TODO(1.9.0 split): decomposed by the dispatcher module split. handle_b2bua_reinvite
@@ -126,6 +127,19 @@ pub fn handle_b2bua_reinvite(
     if from_a_leg && answer_unanchored_reoffer(&inbound, &message, &call_id, state) {
         return;
     }
+
+    // The description the offering party last gave on its dialog, before the
+    // line below replaces it: what `@b2bua.on_reoffer` reads the offer
+    // against, and what a refused offer leaves in force (RFC 3261 §14.1).
+    let in_force = state.call_actors.get_call(&call_id).and_then(|call| {
+        if from_a_leg {
+            call.a_leg.last_sdp.clone()
+        } else {
+            call.winner
+                .and_then(|index| call.b_legs.get(index))
+                .and_then(|leg| leg.last_sdp.clone())
+        }
+    });
 
     // Track the offerer's own new endpoint SDP (its re-INVITE offer, raw —
     // before any topology/rtpengine rewrite) so a later siphon-terminated
@@ -274,10 +288,46 @@ pub fn handle_b2bua_reinvite(
         state,
     );
 
+    // `@b2bua.on_reoffer`: relay the offer, refuse it, or answer it here.
+    let offerer = Offerer {
+        from_a_leg,
+        b_leg_branch: winner_b_leg.as_ref().map(|leg| leg.branch.as_str()),
+    };
+    let hook = run_reoffer_hook(
+        &call_id,
+        &inbound,
+        &message,
+        offerer,
+        false,
+        in_force.as_deref(),
+        state,
+    );
+    if hook.decision != ReofferDecision::Relay {
+        // Nothing goes toward the target leg, so nothing is pending there.
+        state
+            .call_actors
+            .set_pending_reinvite(&call_id, /*on_a_leg=*/ !from_a_leg, false);
+        let response = decide_reoffer_here(
+            &inbound,
+            &message,
+            &call_id,
+            offerer,
+            false,
+            &hook.decision,
+            state,
+        );
+        if response.status_code().is_some_and(|code| code >= 300) {
+            restore_offerer_sdp(&call_id, offerer, in_force, state);
+        }
+        notify_reoffer_response(&call_id, hook.facts, &response, true, state);
+        return;
+    }
+    let reoffer = hook.facts;
+
     // Build the forwarded re-INVITE with new Via/branch
     let branch = TransactionKey::generate_branch();
 
-    let mut forwarded = message.clone();
+    let mut forwarded = hook.edited.unwrap_or_else(|| message.clone());
     // Register this branch for response routing back to the re-INVITE sender
     let reinvite_target = if from_a_leg {
         // A→B: forward to winning B-leg, rewrite A-leg → B-leg dialog headers
@@ -493,6 +543,7 @@ pub fn handle_b2bua_reinvite(
                         &call_id,
                         Some(!from_a_leg),
                     );
+                    notify_reoffer_refused_here(&call_id, reoffer, 488, state);
                     return;
                 }
                 ReofferOutcome::Failed(error) => {
@@ -509,6 +560,7 @@ pub fn handle_b2bua_reinvite(
                         &call_id,
                         Some(!from_a_leg),
                     );
+                    notify_reoffer_refused_here(&call_id, reoffer, 488, state);
                     return;
                 }
             }
@@ -622,6 +674,8 @@ pub fn handle_b2bua_reinvite(
         reinvite_leg.session_refresh_request = Some(
             crate::b2bua::session_timer::session_refresh_request(&message.headers),
         );
+        // Shown to `@b2bua.on_reoffer_answered` with the final response.
+        reinvite_leg.reoffer = reoffer;
         state.call_actors.add_b_leg(&call_id, reinvite_leg);
         note_session_refresh_request(&call_id, from_a_leg, &message.headers, state);
 
