@@ -1200,11 +1200,11 @@ impl PyRtpEngine {
     /// Exactly one of ``file``, ``blob``, ``db_id``, ``tone`` or ``url`` must be
     /// supplied.
     ///
-    /// Per rtpengine semantics, ``from-tag`` selects the monologue whose
-    /// outgoing audio is replaced by the prompt — the peer of that monologue
-    /// hears it. By default the from-tag is extracted from the SIP object.
-    /// Supply ``to_tag`` to scope the prompt to a specific peer when the
-    /// monologue has multiple subscribers (MPTY).
+    /// The party whose tag is passed hears the prompt, in place of the other
+    /// party's audio: the engine plays "toward a leg" (siphon-rtp control
+    /// protocol, ``play_media``). A SIP object gives the From-tag, so
+    /// ``play_media(call)`` plays to the caller and ``(call_id, callee_tag)``
+    /// to the callee. ``to_tag`` scopes it to one peer of several (MPTY).
     ///
     /// Requires rtpengine built with ``--with-transcoding`` and launched with
     /// ``--audio-player=on-demand``. VoLTE prompts (AMR-NB/WB) need licensed

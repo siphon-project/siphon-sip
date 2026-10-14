@@ -256,9 +256,12 @@ of their own.
 
 ## Prompts, tones and overlays
 
-`rtpengine.play_media(...)` replaces a party's outgoing audio with a prompt. Its
-source can be a file, raw bytes, an engine prompt-DB id, a **synthesised tone**,
-or a URL the **engine** fetches:
+`rtpengine.play_media(...)` plays a prompt to the party whose tag it is given:
+the engine plays toward that leg, replacing what the leg receives, and the
+other party keeps hearing it live. A SIP object gives the From-tag, so
+`play_media(call)` plays to the caller and `play_media((call_id, callee_tag), ...)`
+to the callee. Its source can be a file, raw bytes, an engine prompt-DB id, a
+**synthesised tone**, or a URL the **engine** fetches:
 
 ```python
 await rtpengine.play_media(call, tone="ringback_eu")            # preset
