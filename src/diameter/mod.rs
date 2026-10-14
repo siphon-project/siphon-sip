@@ -23,6 +23,7 @@ pub mod gba;
 pub(crate) mod gba_test_vectors;
 pub mod peer;
 pub mod pool;
+pub(crate) mod reauthorize;
 pub mod rf;
 pub mod rf_service;
 pub mod ro;

@@ -7333,6 +7333,20 @@ class MockDiameterRequest:
         return MockDiameterAnswer(result_code=2001, command_code=self.command_code)
 
 
+# Application names the Rust `dictionary::app_id_by_name` resolves.
+_DIAMETER_APPLICATION_IDS = {
+    "cx": 16777216, "sh": 16777217, "gx": 16777238, "rx": 16777236,
+    "ro": 4, "rf": 3, "s6c": 16777312, "sgd": 16777313, "s6a": 16777251,
+    "zh": 16777221, "zn": 16777220,
+}
+
+# AVPs `diameter.reauthorize` sets itself.
+_REAUTHORIZE_FIXED_AVPS = {
+    "session_id", "origin_host", "origin_realm", "destination_host",
+    "destination_realm", "auth_application_id", "re_auth_request_type",
+}
+
+
 class MockDiameter:
     """Mock Diameter namespace for testing scripts that use ``from siphon import diameter``.
 
@@ -8892,6 +8906,36 @@ class MockDiameter:
 
     # -- Generic spec-name API (matches Rust `diameter.send_request` /
     # `@diameter.on_command`) --
+
+    async def reauthorize(self, peer: str, session_id: str, destination_host: str,
+                          destination_realm: str, application: str,
+                          tenant: str = "default", timeout_ms: int = 5000,
+                          **avps: Any) -> int:
+        """Send a Re-Auth-Request for ``application`` on a serving peer.
+
+        The mock records it on ``generic_requests`` as a ``RAR`` for
+        ``application`` (configure the RAA through
+        ``set_generic_response("RAR", application, ...)``), with
+        ``auth_application_id`` resolved from the application name and any
+        extra AVP kwargs alongside.
+        """
+        if not all((peer, session_id, destination_host, destination_realm, tenant)):
+            raise ValueError("nonempty reauthorization identity required")
+        application_id = _DIAMETER_APPLICATION_IDS.get(application.lower())
+        if application_id is None:
+            raise ValueError(f"unknown Diameter application name: {application}")
+        fixed = set(avps) & _REAUTHORIZE_FIXED_AVPS
+        if fixed:
+            raise ValueError(f"{sorted(fixed)[0]} is set by the request itself "
+                             "and cannot be passed as a kwarg")
+        if not self._peers.get(peer, False):
+            raise RuntimeError("serving Diameter peer unavailable")
+        answer = await self.send_request("RAR", application, peer=peer,
+            timeout_ms=timeout_ms, session_id=session_id,
+            destination_host=destination_host,
+            destination_realm=destination_realm,
+            auth_application_id=application_id, re_auth_request_type=0, **avps)
+        return answer["result_code"]
 
     async def send_request(self, command: str, application: str,
                      peer: Optional[str] = None,
