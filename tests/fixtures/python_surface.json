@@ -721,9 +721,9 @@
         "sig": "($self, target, tenant=None)"
       },
       "reauthorize": {
-        "doc": "RFC 8506 5.5: request a credit update on the session's serving connection.",
+        "doc": "Send a Re-Auth-Request for `application` on the session's serving connection.",
         "kind": "method_descriptor",
-        "sig": "($self, peer, session_id, destination_host, destination_realm, tenant=\"default\", timeout_ms=5000)"
+        "sig": "($self, peer, session_id, destination_host, destination_realm, application, tenant=\"default\", timeout_ms=5000, **avps)"
       },
       "rf_acr_event": {
         "doc": "Send an Rf ACR-EVENT to the CDF.",

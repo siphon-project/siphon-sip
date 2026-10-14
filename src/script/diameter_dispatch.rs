@@ -30,6 +30,7 @@ use crate::diameter::auth::{AclMatch, OriginHostPolicy, SourceIpAcl};
 use crate::diameter::codec::{Avp, DiameterMsg};
 use crate::diameter::dictionary;
 use crate::diameter::peer::{self, DiameterPeer, IncomingRequest, PeerConfig};
+use crate::diameter::reauthorize::ServingConnection;
 use crate::diameter::server::{CerDecision, ServerHandshake, ServerIdentity, TenantApplications};
 use crate::diameter::transport::DiameterListener;
 use crate::diameter::{forward, DiameterClient, DiameterManager};
@@ -399,7 +400,9 @@ fn spawn_serving_connection(
                         tenant = %tenant_name,
                         "Diameter server: outbound serving connection established (inbound requests → on_request)"
                     );
+                    let mut serving = ServingConnection::new(&tenant_name, &entry.name, &connected);
                     while let Some(incoming) = incoming_rx.recv().await {
+                        serving.observe(&incoming.avps);
                         let engine = Arc::clone(&engine);
                         let semaphore = Arc::clone(&semaphore);
                         let inbound_peer = Arc::clone(&connected);
@@ -540,7 +543,11 @@ async fn serve_connection(
         transport: transport.to_string(),
     };
 
+    // Lets `diameter.reauthorize` reach the clients behind this connection;
+    // dropped (entries removed) when the connection ends.
+    let mut serving = ServingConnection::new(&peer_info.tenant, &peer_info.name, &admitted_peer);
     while let Some(incoming) = incoming_rx.recv().await {
+        serving.observe(&incoming.avps);
         let engine = Arc::clone(&engine);
         let semaphore = Arc::clone(&semaphore);
         let inbound_peer = Arc::clone(&admitted_peer);
@@ -642,17 +649,6 @@ pub(crate) async fn dispatch_request(
     local_origin_host: String,
     local_origin_realm: String,
 ) {
-    if let Some(host) = DiameterMsg::from_wire(&incoming.raw)
-        .ok()
-        .and_then(|message| message.get_str(264))
-    {
-        crate::diameter::reauthorize::register(
-            &peer_info.tenant,
-            &peer_info.name,
-            &host,
-            &inbound_peer,
-        );
-    }
     let start = Instant::now();
     // Captured before `incoming` moves into the handler closure below.
     let command_code = incoming.command_code;

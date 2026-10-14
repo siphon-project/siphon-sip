@@ -458,15 +458,47 @@ The value a handler returns via `request.answer(...)` / `request.reject(...)`.
 ::: siphon_sdk.mock_module.MockDiameterAnswer
 
 
-### Credit reauthorization on a serving connection
+### Reauthorization on a serving connection
 
-`await diameter.reauthorize(peer, session_id, destination_host, destination_realm,
-tenant="default", timeout_ms=5000)` sends RFC 8506 section 5.5 RAR on the existing
-connection that carried the client's charging request. It retains the supplied
-Session-Id, sets application/Auth-Application-Id 4 and AUTHORIZE_ONLY (0), and
-returns the RAA Result-Code. Missing/disconnected connections and timeouts raise;
-callers should persist their pending notification and retry. A 2001 or 2002 RAA
-acknowledges the request; the client's subsequent CCR performs the actual credit
-update. Connections are scoped by tenant, configured peer name and Origin-Host.
-The weak registry does not keep disconnected peers alive or route to arbitrary
-client-mode peers. A peer must first have sent a request on that connection.
+```python
+code = await diameter.reauthorize(peer, session_id, destination_host,
+                                  destination_realm, application,
+                                  tenant="default", timeout_ms=5000, **avps)
+```
+
+Sends a Re-Auth-Request (command 258, R and P bits set) to a client on the
+existing connection that carried that client's requests, for example an RFC 8506
+section 5.5 credit reauthorization (`"Ro"`), a TS 29.212 Gx RAR (`"Gx"`) or a
+TS 29.214 Rx RAR (`"Rx"`). `application` is an application name as
+`send_request` takes it; an unknown name raises `ValueError`. The header
+Application-Id and the Auth-Application-Id AVP both carry that application, and
+Re-Auth-Request-Type is AUTHORIZE_ONLY (0). Session-Id is the supplied one and
+goes first, then Origin-Host and Origin-Realm of the serving connection,
+Destination-Host and Destination-Realm.
+
+Extra keyword arguments are application AVPs, encoded the way `send_request`
+encodes them and appended after those, so a Gx RAR can carry Event-Trigger or
+Charging-Rule-Install and an Rx RAR its Specific-Action:
+
+```python
+await diameter.reauthorize("local-pcef", session_id, "pcef.example", "example",
+                           "Gx", event_trigger=2)
+```
+
+Passing one of the AVPs the request sets itself (`session_id`, `origin_host`,
+`origin_realm`, `destination_host`, `destination_realm`, `auth_application_id`,
+`re_auth_request_type`) raises `ValueError`, as does an empty identity.
+
+Returns the RAA Result-Code as an int. A missing or closed connection, or a
+timeout, raises `RuntimeError`; callers should keep their pending notification
+and retry. For credit control a 2001 or 2002 RAA only acknowledges the request;
+the client's next CCR carries the actual credit update.
+
+The connection is looked up by tenant, configured peer name and the client's
+Origin-Host. A connection becomes reachable for an Origin-Host once a request
+from that host has arrived on it, on a listener connection (`diameter.listen`)
+or an outbound serving connection. A relay can carry requests from several
+clients over one connection, so one connection can serve several Origin-Hosts.
+The entries are dropped when the connection ends, and a newer connection for the
+same client replaces an older one. Client-mode peers under `diameter.peers` are
+never used here; reach those with `send_request(peer=...)`.

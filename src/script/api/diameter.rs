@@ -58,7 +58,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
 use tracing::warn;
 
-use super::diameter_kwargs::encode_kwarg_avp;
+use super::diameter_kwargs::encode_kwarg_avps;
 use crate::config::DiameterApplication;
 use crate::diameter::codec::{
     encode_avp_u32, encode_avp_utf8, encode_diameter_message, encode_vendor_specific_app_id,
@@ -1910,9 +1910,19 @@ impl PyDiameter {
         Ok(func)
     }
 
-    /// RFC 8506 5.5: request a credit update on the session's serving connection.
+    /// Send a Re-Auth-Request for `application` on the session's serving connection.
     /// Returns its RAA result code; missing/disconnected peers and timeouts raise.
-    #[pyo3(signature = (peer, session_id, destination_host, destination_realm, tenant="default", timeout_ms=5000))]
+    #[pyo3(signature = (
+        peer,
+        session_id,
+        destination_host,
+        destination_realm,
+        application,
+        tenant="default",
+        timeout_ms=5000,
+        **avps,
+    ))]
+    #[allow(clippy::too_many_arguments)]
     fn reauthorize<'py>(
         &self,
         python: Python<'py>,
@@ -1920,8 +1930,10 @@ impl PyDiameter {
         session_id: &str,
         destination_host: &str,
         destination_realm: &str,
+        application: &str,
         tenant: &str,
         timeout_ms: u64,
+        avps: Option<&Bound<'py, PyDict>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         if [
             peer,
@@ -1937,6 +1949,12 @@ impl PyDiameter {
                 "nonempty reauthorization identity required",
             ));
         }
+        let (_, application_id) = dictionary::app_id_by_name(application).ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "unknown Diameter application name: {application}"
+            ))
+        })?;
+        let extra = encode_kwarg_avps(avps, &[], &crate::diameter::reauthorize::FIXED_AVPS)?;
         let connection = crate::diameter::reauthorize::connection(tenant, peer, destination_host)
             .ok_or_else(|| {
             pyo3::exceptions::PyRuntimeError::new_err("serving Diameter peer unavailable")
@@ -1946,6 +1964,8 @@ impl PyDiameter {
             session_id,
             destination_host,
             destination_realm,
+            application_id,
+            &extra,
         );
         crate::script::awaitable(python, async move {
             let answer = connection
@@ -2654,28 +2674,12 @@ impl PyDiameter {
         avp_bytes.extend_from_slice(&encode_avp_u32(avp::AUTH_SESSION_STATE, 1));
         avp_bytes.extend_from_slice(&encode_vendor_specific_app_id(app_vendor, app_id));
 
-        if let Some(kwargs) = avps {
-            for (key, value) in kwargs.iter() {
-                let key_str: String = key.extract().map_err(|error| {
-                    pyo3::exceptions::PyTypeError::new_err(format!(
-                        "AVP kwarg name must be str: {error}"
-                    ))
-                })?;
-                // Reserved kwargs siphon consumes itself — never travel
-                // on the wire.
-                if matches!(
-                    key_str.as_str(),
-                    "peer" | "timeout_ms" | "command" | "application"
-                ) {
-                    continue;
-                }
-                let avp_def = dictionary::lookup_avp_by_python_name(&key_str).ok_or_else(|| {
-                    pyo3::exceptions::PyValueError::new_err(format!("unknown AVP kwarg: {key_str}"))
-                })?;
-                let encoded = encode_kwarg_avp(avp_def, &value)?;
-                avp_bytes.extend_from_slice(&encoded);
-            }
-        }
+        // Reserved kwargs siphon consumes itself never travel on the wire.
+        avp_bytes.extend_from_slice(&encode_kwarg_avps(
+            avps,
+            &["peer", "timeout_ms", "command", "application"],
+            &[],
+        )?);
 
         let wire = encode_diameter_message(
             FLAG_REQUEST | FLAG_PROXIABLE,
@@ -3787,6 +3791,7 @@ fn json_to_py<'py>(python: Python<'py>, value: &serde_json::Value) -> PyResult<P
 
 #[cfg(test)]
 mod tests {
+    use super::super::diameter_kwargs::encode_kwarg_avp;
     use super::*;
     use crate::diameter::DiameterManager;
 
@@ -4973,6 +4978,63 @@ mod tests {
             let error = result.expect_err("unknown app must error");
             let msg = format!("{error}");
             assert!(msg.contains("unknown Diameter application"), "msg: {msg}");
+        });
+    }
+
+    fn reauthorize_error(
+        python: Python<'_>,
+        application: &str,
+        avps: Option<&Bound<'_, PyDict>>,
+    ) -> PyErr {
+        let py_diameter = PyDiameter::new(Arc::new(DiameterManager::new()));
+        py_diameter
+            .reauthorize(
+                python,
+                "local-pcef",
+                "chf.example;1;2",
+                "smf.example",
+                "example",
+                application,
+                "reauthorize-errors",
+                5000,
+                avps,
+            )
+            .expect_err("must refuse")
+    }
+
+    #[test]
+    fn reauthorize_refuses_an_unknown_application() {
+        pyo3::Python::initialize();
+        pyo3::Python::attach(|python| {
+            let error = reauthorize_error(python, "Bogus", None);
+            assert!(error.is_instance_of::<pyo3::exceptions::PyValueError>(python));
+        });
+    }
+
+    #[test]
+    fn reauthorize_refuses_a_kwarg_for_a_header_avp() {
+        pyo3::Python::initialize();
+        pyo3::Python::attach(|python| {
+            for name in ["origin_host", "auth_application_id", "re_auth_request_type"] {
+                let kwargs = PyDict::new(python);
+                kwargs.set_item(name, "x").unwrap();
+                let error = reauthorize_error(python, "Gx", Some(&kwargs));
+                assert!(
+                    error.is_instance_of::<pyo3::exceptions::PyValueError>(python),
+                    "{name}: {error}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn reauthorize_without_a_serving_connection_raises() {
+        pyo3::Python::initialize();
+        pyo3::Python::attach(|python| {
+            let kwargs = PyDict::new(python);
+            kwargs.set_item("event_trigger", 2u32).unwrap();
+            let error = reauthorize_error(python, "Gx", Some(&kwargs));
+            assert!(error.is_instance_of::<pyo3::exceptions::PyRuntimeError>(python));
         });
     }
 

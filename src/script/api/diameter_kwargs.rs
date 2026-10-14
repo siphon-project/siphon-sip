@@ -163,6 +163,40 @@ pub(crate) fn encode_kwarg_avp(def: &AvpDef, value: &Bound<'_, PyAny>) -> PyResu
     }
 }
 
+/// Every `**avps` keyword argument, in order, as AVP wire octets. Kwargs named
+/// in `skip` are the caller's own and are not encoded. An AVP whose base
+/// (vendor 0) code is in `fixed` is one the caller already sets, so supplying
+/// it again is refused rather than sent twice.
+pub(crate) fn encode_kwarg_avps(
+    kwargs: Option<&Bound<'_, PyDict>>,
+    skip: &[&str],
+    fixed: &[u32],
+) -> PyResult<Vec<u8>> {
+    let mut encoded = Vec::new();
+    let Some(kwargs) = kwargs else {
+        return Ok(encoded);
+    };
+    for (key, value) in kwargs.iter() {
+        let name: String = key.extract().map_err(|error| {
+            pyo3::exceptions::PyTypeError::new_err(format!("AVP kwarg name must be str: {error}"))
+        })?;
+        if skip.contains(&name.as_str()) {
+            continue;
+        }
+        let definition = dictionary::lookup_avp_by_python_name(&name).ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err(format!("unknown AVP kwarg: {name}"))
+        })?;
+        if definition.vendor_id == 0 && fixed.contains(&definition.code) {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "{} is set by the request itself and cannot be passed as a kwarg",
+                definition.name
+            )));
+        }
+        encoded.extend_from_slice(&encode_kwarg_avp(definition, &value)?);
+    }
+    Ok(encoded)
+}
+
 /// The members of a Grouped AVP given as a dict: each key is an AVP name the
 /// way a kwarg spells it, each value what that AVP's type takes.
 fn encode_members(group: &AvpDef, members: &Bound<'_, PyDict>) -> PyResult<Vec<u8>> {
@@ -205,6 +239,40 @@ mod tests {
         let mut message = DiameterMsg::from_wire(&wire).expect("one AVP");
         assert_eq!(message.avps.len(), 1);
         message.avps.remove(0)
+    }
+
+    #[test]
+    fn kwargs_encode_in_order_skipping_the_callers_own() {
+        pyo3::Python::initialize();
+        pyo3::Python::attach(|python| {
+            let kwargs = PyDict::new(python);
+            kwargs.set_item("peer", "ignored").unwrap();
+            kwargs.set_item("event_trigger", 2u32).unwrap();
+            kwargs.set_item("user_name", "001010000000001").unwrap();
+            let encoded = encode_kwarg_avps(Some(&kwargs), &["peer"], &[]).unwrap();
+            let wire = crate::diameter::codec::encode_diameter_message(0, 258, 0, 1, 1, &encoded);
+            let message = DiameterMsg::from_wire(&wire).unwrap();
+            let codes: Vec<u32> = message.avps.iter().map(|avp| avp.code).collect();
+            assert_eq!(codes, vec![1006, 1]);
+            assert_eq!(encode_kwarg_avps(None, &[], &[]).unwrap(), Vec::<u8>::new());
+        });
+    }
+
+    #[test]
+    fn a_kwarg_for_a_fixed_avp_is_refused() {
+        pyo3::Python::initialize();
+        pyo3::Python::attach(|python| {
+            let kwargs = PyDict::new(python);
+            kwargs
+                .set_item("auth_application_id", 16_777_238u32)
+                .unwrap();
+            let error = encode_kwarg_avps(Some(&kwargs), &[], &[258]).unwrap_err();
+            assert!(error.is_instance_of::<pyo3::exceptions::PyValueError>(python));
+            let kwargs = PyDict::new(python);
+            kwargs.set_item("not_a_real_avp", 1u32).unwrap();
+            let error = encode_kwarg_avps(Some(&kwargs), &[], &[]).unwrap_err();
+            assert!(error.is_instance_of::<pyo3::exceptions::PyValueError>(python));
+        });
     }
 
     #[test]

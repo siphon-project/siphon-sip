@@ -333,9 +333,43 @@ def test_reauthorization_keeps_the_existing_session():
     import asyncio
     diameter = _fresh_diameter()
     diameter.add_peer('local-ims', connected=True)
-    result = asyncio.run(diameter.reauthorize('local-ims', 'ims.example;1', 'ims.example', 'example'))
+    result = asyncio.run(diameter.reauthorize(
+        'local-ims', 'ims.example;1', 'ims.example', 'example', 'Ro'))
     assert result == 2001
     sent = diameter.generic_requests[-1]
+    assert sent['command'] == 'RAR'
+    assert sent['application'] == 'Ro'
     assert sent['avps']['session_id'] == 'ims.example;1'
     assert sent['avps']['auth_application_id'] == 4
     assert sent['avps']['re_auth_request_type'] == 0
+
+
+def test_reauthorization_names_its_application_and_carries_extra_avps():
+    import asyncio
+    diameter = _fresh_diameter()
+    diameter.add_peer('local-pcef', connected=True)
+    diameter.set_generic_response('RAR', 'Gx', result_code=5002)
+    result = asyncio.run(diameter.reauthorize(
+        'local-pcef', 'pcef.example;1', 'pcef.example', 'example', 'Gx',
+        event_trigger=2))
+    assert result == 5002
+    sent = diameter.generic_requests[-1]
+    assert sent['avps']['auth_application_id'] == 16777238
+    assert sent['avps']['event_trigger'] == 2
+
+
+def test_reauthorization_refuses_bad_arguments():
+    import asyncio
+    import pytest
+    diameter = _fresh_diameter()
+    diameter.add_peer('local-pcef', connected=True)
+    with pytest.raises(ValueError):
+        asyncio.run(diameter.reauthorize(
+            'local-pcef', 'pcef.example;1', 'pcef.example', 'example', 'Bogus'))
+    with pytest.raises(ValueError):
+        asyncio.run(diameter.reauthorize(
+            'local-pcef', 'pcef.example;1', 'pcef.example', 'example', 'Gx',
+            auth_application_id=4))
+    with pytest.raises(RuntimeError):
+        asyncio.run(diameter.reauthorize(
+            'absent', 'pcef.example;1', 'pcef.example', 'example', 'Gx'))
