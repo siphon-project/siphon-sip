@@ -7,6 +7,7 @@
 //! are feature-gated for later phases.
 
 pub mod backend;
+pub(crate) mod contact_index;
 pub mod reginfo;
 pub(crate) mod update;
 
@@ -254,10 +255,18 @@ fn parse_contact_target(contact_uri: &str) -> Option<SipUri> {
     crate::sip::parser::parse_uri_standalone(trimmed).ok()
 }
 
+/// `contact_uri` as the URI a Contact lookup matches against: as given, or
+/// canonicalised by [`normalize_aor`] (which adds a missing `sip:` scheme and
+/// drops what the parser would refuse after the host). `None` when neither
+/// is a URI.
+fn contact_target(contact_uri: &str) -> Option<SipUri> {
+    parse_contact_target(contact_uri).or_else(|| parse_contact_target(&normalize_aor(contact_uri)))
+}
+
 /// Whether two Contact URIs name the same device the way [`normalize_aor`]
 /// compares them — scheme, user, host (case-insensitively) and port, a default
 /// port equal to none, parameters ignored — without building a string per
-/// binding: the reverse lookups that use it scan every binding.
+/// binding. The contact index keys on the same fields.
 fn same_contact(stored: &SipUri, target: &SipUri) -> bool {
     let default_port = |uri: &SipUri| {
         if matches!(uri.scheme, crate::sip::uri::Scheme::Sips) {
@@ -492,6 +501,11 @@ pub struct Registrar {
     /// restart correctly starts empty (stream contacts are dropped on restart
     /// by `evict_connection_oriented`).
     connection_index: DashMap<u64, Vec<Aor>>,
+    /// Contact identity → AoRs with a UE binding that has it
+    /// ([`contact_index`]), so a lookup by Contact reads the AoRs it names
+    /// instead of every binding. Kept in step by every path that changes a
+    /// binding list.
+    contact_index: contact_index::ContactIndex,
     pub config: RegistrarConfig,
     /// Broadcast channel for registration change events.
     event_sender: broadcast::Sender<RegistrationEvent>,
@@ -524,6 +538,7 @@ impl Registrar {
             aliases: DashMap::new(),
             tokens: DashMap::new(),
             connection_index: DashMap::new(),
+            contact_index: contact_index::ContactIndex::default(),
             config,
             event_sender,
             backend_writer: OnceLock::new(),
@@ -888,6 +903,7 @@ impl Registrar {
         let removed = self.bindings.remove(aor);
         let had_bindings = removed.is_some();
         if let Some((_, contacts)) = removed {
+            self.contact_index.remove_all(aor, &contacts);
             for contact in contacts {
                 if let Some(token) = contact.flow_token {
                     self.tokens.remove(token.as_ref());
@@ -947,6 +963,7 @@ impl Registrar {
 
             if let Some(mut entry) = self.bindings.get_mut(&aor) {
                 before = entry.value().len();
+                let indexed = self.contact_index.keys_of(entry.value());
                 entry.value_mut().retain(|c| {
                     let transport = c.uri.get_param("transport").unwrap_or("");
                     let evict = matches!(
@@ -966,6 +983,11 @@ impl Registrar {
                     !evict
                 });
                 after = entry.value().len();
+                self.contact_index.replace(
+                    &aor,
+                    indexed,
+                    self.contact_index.keys_of(entry.value()),
+                );
             } else {
                 continue;
             }
@@ -1107,55 +1129,6 @@ impl Registrar {
         })
     }
 
-    /// Reverse lookup: non-expired UE-side contacts whose stored **Contact**
-    /// URI matches `contact_uri` (user + host + port, ignoring URI parameters
-    /// and default ports — the same canonicalisation `normalize_aor` applies).
-    ///
-    /// [`lookup`](Self::lookup) resolves a *logical* address (`user@domain`);
-    /// this resolves a *physical* one.  It exists for the terminating edge
-    /// where an upstream registrar-of-record (a PBX sitting in front of
-    /// siphon) retargets the INVITE straight at the cached Contact and
-    /// loose-routes it back through siphon: the Request-URI / To then carry
-    /// the contact (`sip:1001@203.0.113.7:17514`), not the registration
-    /// domain (`sip:1001@pbx.example`), so an AoR-keyed `lookup` misses even
-    /// though the binding is present.  Matching on the Contact recovers it.
-    ///
-    /// This is an **O(total contacts)** scan intended as a per-terminating-call
-    /// guard on edge / PBX-front deployments (moderate registration counts),
-    /// not a per-packet framework path.  AS-side contacts are excluded and the
-    /// result is sorted by q descending, both matching `lookup`.
-    pub fn lookup_contact(&self, contact_uri: &str) -> Vec<Contact> {
-        let target = normalize_aor(contact_uri);
-        let mut out: Vec<Contact> = Vec::new();
-        for entry in self.bindings.iter() {
-            for contact in entry.value().iter() {
-                if contact.kind == ContactKind::Ue
-                    && !contact.is_expired()
-                    && normalize_aor(&contact.uri.to_string()) == target
-                {
-                    out.push(contact.clone());
-                }
-            }
-        }
-        sort_by_preference(&mut out);
-        out
-    }
-
-    /// Whether any non-expired UE-side binding has a **Contact** URI matching
-    /// `contact_uri`.  Contact-keyed twin of [`is_registered`](Self::is_registered);
-    /// see [`lookup_contact`](Self::lookup_contact) for why the terminating
-    /// edge needs to match on the Contact rather than the AoR.
-    pub fn is_registered_contact(&self, contact_uri: &str) -> bool {
-        let target = normalize_aor(contact_uri);
-        self.bindings.iter().any(|entry| {
-            entry.value().iter().any(|c| {
-                c.kind == ContactKind::Ue
-                    && !c.is_expired()
-                    && normalize_aor(&c.uri.to_string()) == target
-            })
-        })
-    }
-
     /// The registered AoR `aor` names: its implicit-set primary, the key its
     /// bindings are stored under. `None` when it has no live UE binding.
     ///
@@ -1179,22 +1152,9 @@ impl Registrar {
     /// different AoRs share it: a request sent to that Contact reaches a device
     /// both AoRs registered, and naming either one would be a guess.
     ///
-    /// An **O(total contacts)** scan, like `lookup_contact`.
+    /// Reads the AoRs the contact index names, like `lookup_contact`.
     pub fn aor_for_contact(&self, contact_uri: &str) -> Option<Aor> {
         self.binding_for_contact(contact_uri).map(|(aor, _)| aor)
-    }
-
-    /// [`aor_for_contact`](Self::aor_for_contact) with the matched binding's
-    /// Contact URI, which is what [`has_live_contact`](Self::has_live_contact)
-    /// later asks about.
-    pub fn binding_for_contact(&self, contact_uri: &str) -> Option<(Aor, String)> {
-        match parse_contact_target(contact_uri) {
-            Some(target) => self.unique_binding(|contact| same_contact(&contact.uri, &target)),
-            None => {
-                let target = normalize_aor(contact_uri);
-                self.unique_binding(|contact| normalize_aor(&contact.uri.to_string()) == target)
-            }
-        }
     }
 
     /// The one AoR whose live UE binding's REGISTER came from `source`, with
@@ -1231,16 +1191,14 @@ impl Registrar {
     /// matches). `false` once it was de-registered, expired, or reaped.
     pub fn has_live_contact(&self, aor: &str, contact_uri: &str) -> bool {
         let primary = self.resolve_alias(aor);
-        let target = parse_contact_target(contact_uri);
-        let normalized = normalize_aor(contact_uri);
+        let Some(target) = contact_target(contact_uri) else {
+            return false;
+        };
         self.bindings.get(primary.as_str()).is_some_and(|entry| {
             entry.value().iter().any(|contact| {
                 contact.kind == ContactKind::Ue
                     && !contact.is_expired()
-                    && match &target {
-                        Some(target) => same_contact(&contact.uri, target),
-                        None => normalize_aor(&contact.uri.to_string()) == normalized,
-                    }
+                    && same_contact(&contact.uri, &target)
             })
         })
     }
@@ -1351,6 +1309,7 @@ impl Registrar {
         let mut conns_to_deindex: Vec<u64> = Vec::new();
         if let Some(mut entry) = self.bindings.get_mut(aor) {
             let before = entry.value().len();
+            let indexed = self.contact_index.keys_of(entry.value());
             entry.value_mut().retain(|c| {
                 if c.uri.to_string() == contact_uri {
                     if let Some(token) = &c.flow_token {
@@ -1367,6 +1326,8 @@ impl Registrar {
                 }
             });
             let removed = entry.value().len() < before;
+            self.contact_index
+                .replace(aor, indexed, self.contact_index.keys_of(entry.value()));
             let aor_empty = entry.value().is_empty();
             if aor_empty {
                 drop(entry);
@@ -1432,6 +1393,7 @@ impl Registrar {
         // binding that is technically gone; harvest stream connection ids so
         // the reverse index doesn't strand entries for the dropped bindings.
         let mut conns_to_deindex: Vec<u64> = Vec::new();
+        let indexed = self.contact_index.keys_of(contacts);
         contacts.retain(|c| {
             if c.is_expired() {
                 if is_stream_transport(c.source_transport) {
@@ -1444,6 +1406,9 @@ impl Registrar {
                 true
             }
         });
+        // AS contacts are not indexed, so what follows changes nothing there.
+        self.contact_index
+            .replace(aor, indexed, self.contact_index.keys_of(contacts));
         for id in &conns_to_deindex {
             self.deindex_connection(*id, aor);
         }
@@ -1829,6 +1794,7 @@ impl Registrar {
                 // is DETACHED (kept, id nulled) when its URI is in `keep`,
                 // otherwise REMOVED (and its token harvested for pruning).
                 // Contacts on other flows / transports are always kept.
+                let indexed = self.contact_index.keys_of(entry.value());
                 let contacts = std::mem::take(entry.value_mut());
                 let before = contacts.len();
                 let mut kept = Vec::with_capacity(before);
@@ -1864,6 +1830,11 @@ impl Registrar {
                 if !any_ue_left {
                     entry.value_mut().clear();
                 }
+                self.contact_index.replace(
+                    &aor,
+                    indexed,
+                    self.contact_index.keys_of(entry.value()),
+                );
                 emptied = entry.value().is_empty();
                 stored = entry
                     .value()
@@ -2026,6 +1997,7 @@ impl Registrar {
         let mut entry = self.bindings.entry(aor.to_string()).or_default();
         let contacts = entry.value_mut();
         let uri_string = uri.to_string();
+        let indexed = self.contact_index.keys_of(contacts);
 
         // Replace existing contact with same URI, or append
         if let Some(existing) = contacts
@@ -2036,6 +2008,8 @@ impl Registrar {
         } else {
             push_binding(contacts, contact);
         }
+        self.contact_index
+            .replace(aor, indexed, self.contact_index.keys_of(contacts));
     }
 
     /// Confirm pending contacts for an AoR (IMS: SAR succeeded).
@@ -2078,11 +2052,16 @@ impl Registrar {
         let mut empty_aors = Vec::new();
         let mut tokens_to_remove: Vec<String> = Vec::new();
         let mut conns_to_deindex: Vec<(u64, String)> = Vec::new();
+        let mut contacts_to_deindex: Vec<(u64, String)> = Vec::new();
         for mut entry in self.bindings.iter_mut() {
             let aor_key = entry.key().clone();
             let before = entry.value().len();
             entry.value_mut().retain(|c| {
                 if c.is_expired() {
+                    if c.kind == ContactKind::Ue {
+                        contacts_to_deindex
+                            .push((self.contact_index.key_of(&c.uri), aor_key.clone()));
+                    }
                     if let Some(token) = &c.flow_token {
                         tokens_to_remove.push(token.to_string());
                     }
@@ -2112,6 +2091,9 @@ impl Registrar {
         }
         for (id, aor) in &conns_to_deindex {
             self.deindex_connection(*id, aor);
+        }
+        for (key, aor) in &contacts_to_deindex {
+            self.contact_index.remove(*key, aor);
         }
         if !empty_aors.is_empty() {
             if let Some(metrics) = crate::metrics::try_metrics() {
@@ -2184,6 +2166,9 @@ pub fn is_aor_key_safe(aor: &str) -> bool {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod contact_index_tests;
 
 #[cfg(test)]
 mod tests {

@@ -2332,8 +2332,10 @@ class MockRegistrar:
 
         :meth:`lookup` resolves a *logical* address (``user@domain``);
         this resolves a *physical* one — it returns every registered
-        UE-side binding whose stored Contact matches ``uri`` (user +
-        host + port; URI parameters and default ports are ignored).
+        UE-side binding whose stored Contact matches ``uri`` (user, host
+        compared case-insensitively, and port; URI parameters and default
+        ports are ignored). siphon answers it from an index, so its cost
+        does not grow with the number of registrations.
 
         Use it on the terminating edge when the only thing you have is
         the contact. A common case: a PBX in front of siphon retargets
@@ -2360,13 +2362,20 @@ class MockRegistrar:
             excluded, matching :meth:`lookup`. Empty list if no binding
             has that contact.
         """
-        target = self._normalize_aor(str(uri))
+        def device(text: str) -> str:
+            # RFC 3261 §19.1.4: the host compares case-insensitively, the
+            # user does not.
+            normalized = self._normalize_aor(text)
+            user, at, host = normalized.rpartition("@")
+            return f"{user}{at}{host.lower()}" if at else normalized.lower()
+
+        target = device(str(uri))
         matches = [
             c
             for contacts in self._store.values()
             for c in contacts
             if getattr(c, "kind", "ue") == "ue"
-            and self._normalize_aor(str(c.uri)) == target
+            and device(str(c.uri)) == target
         ]
         return sorted(matches, key=lambda c: c.q, reverse=True)
 

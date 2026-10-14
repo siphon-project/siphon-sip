@@ -109,8 +109,9 @@ registration domain (`sip:1001@pbx.example`). An AoR-keyed lookup misses even
 though the binding is present (and visible in `/admin/registrations`).
 
 `registrar.lookup_contact(uri)` / `registrar.is_registered_contact(uri)` match on
-the stored **Contact** instead (user + host + port; URI parameters and default
-ports ignored), so the guard works on that edge:
+the stored **Contact** instead (user, host compared case-insensitively, and
+port; URI parameters and default ports ignored), so the guard works on that
+edge:
 
 ```python
 @b2bua.on_invite
@@ -121,9 +122,9 @@ def route(call):
     call.dial(str(call.ruri))   # the R-URI is already the reachable contact
 ```
 
-AS-side capability records are excluded, same as `lookup()`. The scan is over
-all bindings, so use it as a per-call guard on edge / PBX-front deployments, not
-as a per-packet framework path.
+AS-side capability records are excluded, same as `lookup()`. The registrar
+keeps an index from each Contact to the AoRs holding it, so the lookup reads
+only those and costs the same at any registration count.
 
 ## React to registration changes
 

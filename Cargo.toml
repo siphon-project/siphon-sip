@@ -244,6 +244,10 @@ name = "dialog_state"      # DialogStateChanged: per-message gate, per-branch ma
 harness = false
 
 [[bench]]
+name = "registrar_contact" # lookup by Contact (lookup_contact / binding_for_contact) at 100k and 500k AoRs
+harness = false
+
+[[bench]]
 name = "admission"         # b2bua.inbound_limit: the per-INVITE admission check and the refused-retransmission lookup
 harness = false
 

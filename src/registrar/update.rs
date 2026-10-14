@@ -166,6 +166,19 @@ impl Registrar {
             effects.push(self.stage(&mut contacts, update)?);
         }
 
+        // The contact index follows the list before it is committed, under the
+        // same shard lock: a binding is findable by its Contact the moment it
+        // is stored. A list a forced save clears is forgotten whole by
+        // `release_cleared`, so only the bindings staged here count against it.
+        let indexed = match &entry {
+            Entry::Occupied(occupied) if !clears_this_list => {
+                self.contact_index.keys_of(occupied.get())
+            }
+            _ => Vec::new(),
+        };
+        self.contact_index
+            .replace(&key, indexed, self.contact_index.keys_of(&contacts));
+
         let replaced = match entry {
             Entry::Occupied(occupied) if contacts.is_empty() => Some(occupied.remove()),
             Entry::Occupied(mut occupied) => Some(occupied.insert(contacts)),
@@ -434,6 +447,9 @@ impl Registrar {
     /// The index, backend and auxiliary-state half of clearing an AoR, for
     /// bindings already taken out of the map. Emits no change event.
     pub(super) fn release_cleared(&self, aor: &str, contacts: Option<Vec<Contact>>) {
+        if let Some(cleared) = &contacts {
+            self.contact_index.remove_all(aor, cleared);
+        }
         for contact in contacts.into_iter().flatten() {
             if let Some(token) = contact.flow_token {
                 self.tokens.remove(token.as_ref());

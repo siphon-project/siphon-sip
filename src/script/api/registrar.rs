@@ -1174,8 +1174,10 @@ impl PyRegistrar {
     }
 
     /// Reverse lookup by **Contact** URI: return the registered contacts whose
-    /// stored Contact matches `uri` (user + host + port; URI parameters and
-    /// default ports are ignored). Accepts a string or a SipUri.
+    /// stored Contact matches `uri` (user, host compared case-insensitively,
+    /// and port; URI parameters and default ports are ignored). Accepts a
+    /// string or a SipUri. Answered from an index, so its cost does not grow
+    /// with the number of registrations.
     ///
     /// Use this on the terminating edge when the only thing you have is the
     /// contact — e.g. a PBX in front of siphon retargets the INVITE at the

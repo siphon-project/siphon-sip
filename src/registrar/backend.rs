@@ -1382,7 +1382,7 @@ pub async fn restore_from_backend<B: RegistrarBackend>(
                 .sort_by(|a, b| b.q.partial_cmp(&a.q).unwrap_or(std::cmp::Ordering::Equal));
             contact_count += contacts_for_aor.len();
             aor_count += 1;
-            registrar.bindings.insert(aor.clone(), contacts_for_aor);
+            registrar.install_bindings(aor, contacts_for_aor);
         }
     }
 
