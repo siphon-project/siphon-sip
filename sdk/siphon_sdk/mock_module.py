@@ -7556,12 +7556,15 @@ class MockDiameter:
                 it from ``public_identity``. The mock accepts and ignores it.
 
         Returns:
-            Dict with ``result_code`` and ``server_name``, or ``None``.
+            Dict with ``result_code``, ``server_name`` and
+            ``server_capabilities`` (``None``, or a dict of ``mandatory``,
+            ``optional`` and ``server_names``), or ``None``.
         """
         if public_identity in self._uar_responses:
             return dict(self._uar_responses[public_identity])
         if self._default_server_name:
-            return {"result_code": 2001, "server_name": self._default_server_name}
+            return {"result_code": 2001, "server_name": self._default_server_name,
+                    "server_capabilities": None}
         return None
 
     async def cx_mar(self, public_identity: str,
@@ -7755,12 +7758,15 @@ class MockDiameter:
             public_identity: Target user's public identity.
 
         Returns:
-            Dict with ``result_code`` and ``server_name``, or ``None``.
+            Dict with ``result_code``, ``server_name`` and
+            ``server_capabilities`` (``None``, or a dict of ``mandatory``,
+            ``optional`` and ``server_names``), or ``None``.
         """
         if public_identity in self._lir_responses:
             return dict(self._lir_responses[public_identity])
         if self._default_server_name:
-            return {"result_code": 2001, "server_name": self._default_server_name}
+            return {"result_code": 2001, "server_name": self._default_server_name,
+                    "server_capabilities": None}
         return None
 
     # -- Rx: PCRF integration (P-CSCF) --
@@ -8077,17 +8083,21 @@ class MockDiameter:
 
     def set_uar_response(self, public_identity: str,
                          result_code: int = 2001,
-                         server_name: Optional[str] = None) -> None:
+                         server_name: Optional[str] = None,
+                         server_capabilities: Optional[dict] = None) -> None:
         """Configure a mock UAA response for a specific user (test helper).
 
         Args:
             public_identity: User's public identity.
             result_code: Diameter result code (default 2001 = SUCCESS).
             server_name: Assigned S-CSCF URI.
+            server_capabilities: Server-Capabilities as ``cx_uar``
+                returns it: ``mandatory``, ``optional``, ``server_names``.
         """
         self._uar_responses[public_identity] = {
             "result_code": result_code,
             "server_name": server_name,
+            "server_capabilities": server_capabilities,
         }
 
     def set_sar_response(self, public_identity: str,
@@ -8107,17 +8117,21 @@ class MockDiameter:
 
     def set_lir_response(self, public_identity: str,
                          result_code: int = 2001,
-                         server_name: Optional[str] = None) -> None:
+                         server_name: Optional[str] = None,
+                         server_capabilities: Optional[dict] = None) -> None:
         """Configure a mock LIA response for a specific user (test helper).
 
         Args:
             public_identity: User's public identity.
             result_code: Diameter result code.
             server_name: Serving S-CSCF URI.
+            server_capabilities: Server-Capabilities as ``cx_lir``
+                returns it: ``mandatory``, ``optional``, ``server_names``.
         """
         self._lir_responses[public_identity] = {
             "result_code": result_code,
             "server_name": server_name,
+            "server_capabilities": server_capabilities,
         }
 
     def set_aar_response(self, session_id: str,
