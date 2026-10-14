@@ -3,7 +3,7 @@
 use std::sync::{Arc, Mutex, PoisonError};
 
 use super::custom::CustomMetrics;
-use super::{admission, SiphonMetrics, CUSTOM_METRICS, METRICS, STARTED_AT};
+use super::{admission, ipsec, SiphonMetrics, CUSTOM_METRICS, METRICS, STARTED_AT};
 
 /// Initialize the global metrics. Call once at startup.
 /// Returns an error if metric creation fails (should never happen with
@@ -22,6 +22,7 @@ pub fn init() -> Result<(), prometheus::Error> {
     let _ = STARTED_AT.set(std::time::Instant::now());
     let metrics = SiphonMetrics::new()?;
     admission::init(&metrics.registry)?;
+    ipsec::init(&metrics.registry)?;
     let custom = Arc::new(CustomMetrics::new(&metrics.registry));
     let _ = CUSTOM_METRICS.set(custom);
     let _ = METRICS.set(metrics);

@@ -7,6 +7,7 @@
 pub mod admission;
 pub mod custom;
 pub mod glibc;
+pub mod ipsec;
 
 use std::sync::{Arc, OnceLock};
 

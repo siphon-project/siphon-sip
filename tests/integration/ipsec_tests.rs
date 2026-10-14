@@ -280,9 +280,9 @@ fn transform_compatible_with_rejects_aes_offer() {
 #[test]
 fn ipsec_manager_spi_allocator_returns_pair() {
     let manager = IpsecManager::new();
-    let (spi_a, spi_b) = manager.allocate_spi_pair();
+    let (spi_a, spi_b) = manager.allocate_spi_pair().expect("room in the partition");
     assert_ne!(spi_a, spi_b);
-    let (spi_c, spi_d) = manager.allocate_spi_pair();
+    let (spi_c, spi_d) = manager.allocate_spi_pair().expect("room in the partition");
     // Each call returns a fresh pair — no overlap across allocations.
     assert_ne!(spi_a, spi_c);
     assert_ne!(spi_a, spi_d);
@@ -312,10 +312,14 @@ fn ipsec_manager_with_partition_keeps_spis_in_range() {
     let mut a_spis = Vec::new();
     let mut b_spis = Vec::new();
     for _ in 0..40 {
-        let (spi_x, spi_y) = instance_a.allocate_spi_pair();
+        let (spi_x, spi_y) = instance_a
+            .allocate_spi_pair()
+            .expect("room in the partition");
         a_spis.push(spi_x);
         a_spis.push(spi_y);
-        let (spi_x, spi_y) = instance_b.allocate_spi_pair();
+        let (spi_x, spi_y) = instance_b
+            .allocate_spi_pair()
+            .expect("room in the partition");
         b_spis.push(spi_x);
         b_spis.push(spi_y);
     }
@@ -329,26 +333,35 @@ fn ipsec_manager_with_partition_keeps_spis_in_range() {
 }
 
 #[test]
-fn ipsec_manager_spi_allocator_wraps_within_partition() {
-    // Tight partition forces wraparound after 4 allocations.
+fn ipsec_manager_spi_allocator_refuses_a_full_partition() {
+    // Four pairs fill a partition of eight; the fifth is refused rather than
+    // wrapping onto an SPI a live SA still holds.
     let manager = IpsecManager::with_partition(XfrmBackend::IpCommand, 50000, 8);
     let mut seen = std::collections::HashSet::new();
-    for _ in 0..6 {
-        let (spi_a, spi_b) = manager.allocate_spi_pair();
+    for _ in 0..4 {
+        let (spi_a, spi_b) = manager.allocate_spi_pair().expect("room in the partition");
         assert!((50000..50008).contains(&spi_a));
         assert!((50000..50008).contains(&spi_b));
-        seen.insert(spi_a);
-        seen.insert(spi_b);
+        assert!(
+            seen.insert(spi_a) && seen.insert(spi_b),
+            "never handed out twice"
+        );
     }
-    // 6 calls × 2 SPIs = 12; partition is 8 → wraparound forced.
-    assert!(seen.len() <= 8);
+    assert!(matches!(
+        manager.allocate_spi_pair(),
+        Err(siphon::ipsec::IpsecError::SpiExhausted {
+            start: 50000,
+            count: 8
+        })
+    ));
+    assert_eq!(manager.spi_usage(), (8, 8));
 }
 
 #[test]
 fn ipsec_manager_with_partition_clamps_count_to_minimum_2() {
     // count=0 or 1 would deadlock allocate_spi_pair; manager must clamp.
     let manager = IpsecManager::with_partition(XfrmBackend::Netlink, 60000, 0);
-    let (spi_a, spi_b) = manager.allocate_spi_pair();
+    let (spi_a, spi_b) = manager.allocate_spi_pair().expect("room in the partition");
     assert_ne!(spi_a, spi_b);
 }
 

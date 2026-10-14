@@ -253,6 +253,15 @@ entry, but a working config keeps working.
 
 ### Changed
 
+- **`ipsec.spi_range_count` defaults to 4194304 (2^22) instead of 8192.** Each
+  registered UE holds two SPIs, so 8192 filled at about 4096 UEs. The new
+  default holds about two million and costs a 512 KiB bitmap. Config now
+  refuses an `ipsec.spi_range_start` below 256 (RFC 4303 §2.1), a count below
+  2 or above 2^28, and a partition that runs past SPI 4294967295. **BREAKING
+  for Rust library users:** `IpsecManager::allocate_spi_pair()` returns
+  `Result<(u32, u32), IpsecError>`, and `IpsecError` gains `SpiExhausted` and
+  `SpiInUse`.
+
 - **`DiameterRequest.answer()` and `.reject()` copy the application AVPs of the
   request into the answer. This changes the answers scripts send.** An answer
   built in a `@diameter.on_request` handler started with Session-Id,
@@ -285,6 +294,23 @@ entry, but a working config keeps working.
   `ro_ccr_event` call to their `MESSAGE` handler.
 
 ### Fixed
+
+- **IPsec: the P-CSCF never hands out an SPI a live security association
+  still uses (3GPP TS 33.203 §7.1).** The SPI allocator was a counter that
+  wrapped round its partition without checking what was still installed. SPIs
+  rotate on every registration, so a long-running P-CSCF wrapped onto live
+  UEs, and with the old default of 8192 the 4097th UE got the first UE's SPIs:
+  installing its SAs replaced that UE's inbound XFRM states and cut it off.
+  The allocator now tracks every SPI of the partition held by a live or
+  pending pair, skips them after a wrap, and frees them on delete, expiry,
+  sweep or replacement once the kernel states are gone. A full partition makes
+  `ipsec.allocate` raise `RuntimeError` instead of reusing an SPI, and an
+  install whose SPI another pair owns is refused before the kernel is touched.
+  SPIs of kernel SAs a restart left behind are held at startup and released as
+  the kernel reaps them. `PendingSA.refresh()` no longer deletes the pair
+  before re-installing it, so its SPIs are never free in between. New metrics:
+  `siphon_ipsec_spis_in_use`, `siphon_ipsec_spi_partition_size`,
+  `siphon_ipsec_spi_allocation_failures_total`.
 
 - **B2BUA: a callee's UPDATE with an offer is answered when the caller takes
   its answer in the 2xx (RFC 3311 §5, RFC 3312 §5.2). Behaviour change on the

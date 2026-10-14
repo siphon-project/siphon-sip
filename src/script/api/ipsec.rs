@@ -746,17 +746,10 @@ impl PyPendingSA {
             // relayed is not on this copy; keep it across the delete below. The
             // 401 for this re-key records it again.
             crate::ipsec::sec_agree::carry_recorded_security_server(&manager, &mut sa_new);
-            // Tear down the old SAs first; ignore errors (xfrm may have
-            // already lost them — we still want the new ones to land).
-            if let Err(error) = manager
-                .delete_sa_pair(&sa_new.ue_addr, sa_new.ue_port_c)
-                .await
-            {
-                debug!(
-                    %error,
-                    "ipsec.PendingSA.refresh: prior delete_sa_pair returned error (ignored)"
-                );
-            }
+            // No delete first: create_sa_pair clears the old states and
+            // policies itself and replaces the pair under the same key, and
+            // the SPIs stay owned throughout. A delete would free them for a
+            // moment, long enough for another UE's allocation to take one.
             sa_new.integrity_key = hex_encode(&new_keys.ik);
             sa_new.encryption_key = if sa_new.ealg == EncryptionAlgorithm::Null {
                 String::new()
@@ -1017,7 +1010,9 @@ impl PyIpsec {
         let pcscf_port_s = self.config.pcscf_port_s;
 
         future_into_py(python, async move {
-            let (spi_pc, spi_ps) = manager.allocate_spi_pair();
+            // A full partition fails the allocation (RuntimeError) rather than
+            // reuse an SPI another UE's SA still holds.
+            let (spi_pc, spi_ps) = manager.allocate_spi_pair().map_err(map_ipsec_error)?;
             let aalg = transform.aalg();
             let ealg = transform.ealg();
 

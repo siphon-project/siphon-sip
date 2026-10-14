@@ -100,8 +100,8 @@ ipsec:
   pcscf_port_c: 5064         # P-CSCF client port (protected, shared across UEs)
   pcscf_port_s: 5066         # P-CSCF server port (protected, shared across UEs)
   backend: netlink           # "netlink" (default, fastest) or "ip" (shell-out fallback)
-  # spi_range_start: 10000   # set per-instance for multi-process P-CSCFs
-  # spi_range_count: 8192
+  # spi_range_start: 10000   # set per-instance for multi-process P-CSCFs (>= 256)
+  # spi_range_count: 4194304 # 2 SPIs per registered UE; a full range fails ipsec.allocate
   # Path-token MT routing (RFC 3327 §5 / TS 24.229 §5.2.7.2): the
   # host part siphon writes into the Path URI from
   # ``request.add_pcscf_path(token)``.  Must resolve back to *this*
