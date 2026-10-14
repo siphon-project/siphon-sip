@@ -166,6 +166,8 @@ mod dialog_state_events_tests;
 #[cfg(test)]
 mod dialog_state_transfer_tests;
 #[cfg(test)]
+mod early_dial_tests;
+#[cfg(test)]
 mod early_dialog_route_set_tests;
 #[cfg(test)]
 mod early_update_answer_tests;
@@ -339,6 +341,7 @@ pub(crate) use b2bua::{
     OriginateLegProgress, ReplacementDial, RunningDispatcher, DIAL_BRIDGE_CALLER_GONE,
     DIAL_CANCELLED, DIAL_RINGBACK_ORIGIN,
 };
+pub(crate) use b2bua::{b2bua_dial_refusal, b2bua_progress_call_anchored_from};
 pub use charging::{ro_authorize_b2bua, RoAuthorizeOutcome};
 pub(crate) use liveness::liveness_on_flow_close;
 pub use media_init::{init_rtpengine, spawn_rtpengine_health_check};

@@ -153,12 +153,14 @@ fn the_public_surface_is_pinned() {
     // controller carries out goes through: the `accept_refer` entry point for
     // mode `controller`, the `complete_refer` one, and the refusal they share,
     // plus the crate-internal `b2bua_reject_call_with_headers` the `reject`
-    // verb puts the application's headers on its response through.
+    // verb puts the application's headers on its response through, plus the 2
+    // crate-internal items a script dials behind siphon's own early answer
+    // through: `b2bua_dial_refusal` and `b2bua_progress_call_anchored_from`.
     // All additive, so a minor-compatible change — recorded here because that
     // is the tripwire.
     assert_eq!(
         declared + re_exported,
-        89,
+        91,
         "the dispatcher's public surface is {} items ({declared} declared here, \
          {re_exported} re-exported), not 88. Adding one is a semver commitment on a \
          published crate; removing one breaks embedders. An extraction should move the \

@@ -3083,9 +3083,8 @@ checksum = "b2aa850e253778c88a04c3d7323b043aeda9d3e30d5971937c1855769763678e"
 
 [[package]]
 name = "siphon-rtp-proto"
-version = "0.12.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b2e009e023634c62ab8e9047e1a408441416326dadc5f42b9f7376246d715650"
+version = "0.14.0"
+source = "git+https://github.com/siphon-project/siphon-rtp?rev=02da084e1571a47af7071cd5c6e86e18d28740a9#02da084e1571a47af7071cd5c6e86e18d28740a9"
 dependencies = [
  "serde",
  "serde_json",
@@ -3378,7 +3377,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.4",
  "windows-sys 0.61.2",

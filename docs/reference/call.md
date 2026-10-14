@@ -395,6 +395,54 @@ a line break or NUL is refused too. The control plane's `answer`, `ring`,
 `progress` and `reject` verbs take the same `headers` object with the same
 rules ([control plane](control-plane.md)).
 
+## An announcement, then the callee
+
+A caller that hears a prompt in early media and is then put through to the
+callee already holds an answer: the engine's, in siphon's own 183. A caller
+takes the first SDP it receives as the answer (RFC 3261 §13.2.1) and an answer
+changes only through a new offer (RFC 3264 §8), so the callee is connected
+behind the answer the caller has rather than through a new one:
+
+```python
+from siphon import b2bua, rtpengine
+
+@b2bua.on_invite
+async def announce_then_connect(call):
+    call.progress(183, "Session Progress", anchor=True, profile="announcement",
+                  headers={"P-Early-Media": "sendrecv"})
+    await rtpengine.play_media(call, file="/prompts/pre-call.wav")
+    call.dial(call.ruri)
+```
+
+`call.progress(anchor=True)` runs `rtpengine.answer_local` and sends the
+engine's answer, like the control plane's anchored `progress`; `profile=` and
+`ws_uri=` pick the media plan. `rtpengine.answer_local` followed by
+`call.progress(183, body=sdp)` with that same SDP is the same thing.
+
+What the dial does differently:
+
+- The callee is offered a far leg the engine binds behind the caller's answer
+  (siphon-rtp `offer_far`), never the caller's own offer. It leads with the
+  codec the caller was answered with, so a callee that takes it is a plain
+  relay; another codec it offered is transcoded.
+- The callee's first SDP (early media or the 2xx) is that leg's answer, and
+  the prompt stops. The caller is sent its own answer again, byte for byte
+  with the same `o=`, in the 2xx and in a relayed 18x, or no SDP in an 18x
+  once it holds the answer reliably (RFC 6337 §3.1.1, RFC 3262 §5).
+- A callee that refuses or does not answer gives its far leg back before
+  `@b2bua.on_failure` runs, so the handler finds the caller on the engine
+  again: it can play another prompt, `dial()` someone else, `reject()`, or
+  `answer()` (the 2xx repeats the held answer). A sequential `route()` offers
+  each carrier the far leg, afresh when an earlier carrier's SDP took it.
+- A callee that answers a codec the engine's offer did not list is released
+  (ACK and BYE) and the call fails `488`.
+
+Two dials are refused with `ValueError`: a parallel `fork()`, since the engine
+connects one callee behind the answer at a time, and a `dial()` or `route()`
+after an early answer that is not the engine's (SDP a script took from
+elsewhere), since nothing can re-point that media. The engine side needs
+siphon-rtp with `offer_far`, and a plain RTP caller (not SRTP or ICE).
+
 ## `MediaHandle`
 
 Returned by `call.media` — controls RTP anchoring for the call.

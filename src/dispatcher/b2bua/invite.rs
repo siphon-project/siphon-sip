@@ -1008,6 +1008,38 @@ pub fn apply_routing_action(
         }
     }
 
+    // A dial behind an answer siphon already gave the caller in early media
+    // carries the engine's offer for a far leg, never the caller's own offer;
+    // one that cannot be connected behind that answer is refused here.
+    let behind_early_answer = match &action {
+        CallAction::Dial { .. } => {
+            super::invite_for_dial(state, call_id, &message_guard).map_err(Some)
+        }
+        CallAction::Fork { .. } => match super::dial_refusal(state, call_id, true) {
+            Some(refusal) => Err(Some(refusal)),
+            None => Ok(None),
+        },
+        _ => Ok(None),
+    };
+    let behind_early_answer = match behind_early_answer {
+        Ok(invite) => invite,
+        Err(refusal) => {
+            warn!(call_id = %call_id, reason = refusal.as_deref().unwrap_or_default(), "B2BUA: the dial cannot go out behind the caller's early answer");
+            drop(message_guard);
+            conclude_failed_call(
+                call_id,
+                FailedCallEnd::Local {
+                    status_code: 500,
+                    reason: "Server Internal Error".to_string(),
+                    headers: Vec::new(),
+                },
+                state,
+            );
+            return;
+        }
+    };
+    let dialled_invite: &SipMessage = behind_early_answer.as_ref().unwrap_or(&message_guard);
+
     match action {
         CallAction::Dial {
             target,
@@ -1039,7 +1071,7 @@ pub fn apply_routing_action(
                 &route,
                 send_socket.as_ref(),
                 None,
-                &message_guard,
+                dialled_invite,
                 None,
                 None,
                 None,
