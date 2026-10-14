@@ -326,6 +326,22 @@ entry, but a working config keeps working.
   before re-installing it, so its SPIs are never free in between. New metrics:
   `siphon_ipsec_spis_in_use`, `siphon_ipsec_spi_partition_size`,
   `siphon_ipsec_spi_allocation_failures_total`.
+- **A call placed with the control SDKs' `originate` now hears its own outcome.**
+  siphon sends no `StasisStart` for a channel its controller created, and the
+  SDKs only routed events to channels they had learned from one, so every event
+  on a placed call (ringing, the answer, a 486, the ring timeout, the far end's
+  BYE) was dropped and a controller could not tell whether its call was ever
+  answered. `originate` now opens the channel before the command goes out (a
+  fast 180 can overtake the reply) and resolves to the `Call` it placed, which
+  carries those events on `next_event()` and takes every per-call verb,
+  `hangup` included. **Breaking:** Rust `SipClient::originate` returns a `Call`
+  instead of `Originated`, which is gone (the ids are on the `Call`, the reply
+  is its `payload()`); `OriginatedGroup` gains a `call` and is no longer
+  `PartialEq`. Python `ControlClient.originate()` returns a `Call` instead of a
+  dict, its `payload` being that dict. TypeScript `originate()` returns a `Call`,
+  `Originated` is gone, and `OriginatedGroup` gains `call`. A channel id still
+  live on this client is now `conflict`, refused before anything is sent,
+  rather than letting the new call take over the live one's events.
 
 - **B2BUA: a callee's UPDATE with an offer is answered when the caller takes
   its answer in the 2xx (RFC 3311 §5, RFC 3312 §5.2). Behaviour change on the

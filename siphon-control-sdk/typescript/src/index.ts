@@ -145,7 +145,6 @@ export type {
   Recording,
   OriginateMedia,
   OriginateOptions,
-  Originated,
   OriginatedGroup,
   OriginateRing,
   SessionRefresher,

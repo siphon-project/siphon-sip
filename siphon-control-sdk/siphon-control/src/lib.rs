@@ -340,9 +340,12 @@ impl ControlClient {
     /// Place an outbound call under a caller-supplied channel id.
     ///
     /// The one verb that creates a channel rather than addressing one. It
-    /// resolves as soon as the INVITE is on the wire, to `{"channel", "call_id",
-    /// "sip_call_id"}`: the call is `calling`, and the answer, a failure or the
-    /// ring timeout arrive later as events on the channel.
+    /// resolves as soon as the INVITE is on the wire, to the `Call` it placed:
+    /// the call is `calling`, and the answer, a failure or the ring timeout
+    /// arrive on `call.next_event()` exactly as a handed-over call's do, while
+    /// `call.hangup()` CANCELs or BYEs it. `call.payload` is the server's reply.
+    /// A channel id still live on this client is `ControlError` `conflict`,
+    /// refused before anything is sent.
     ///
     /// Exactly one media plan: `media=True` (siphon anchors the leg, shaped by
     /// `profile` / `ws_uri`), `sdp=` (your own offer) or `body=` with its
@@ -359,9 +362,10 @@ impl ControlClient {
     /// registered over TCP, TLS or WSS behind NAT. The first phone to answer
     /// becomes the channel's call and the rest are CANCELled. `strategy`
     /// (`"parallel"` / `"sequential"`) and `total_timeout` (the group's bound in
-    /// seconds, `0` for none) go with `aor` only. It resolves to `{"channel",
-    /// "group_id", "aor", "strategy", "total_timeout", "branches"}`; until a
-    /// phone answers the channel's events carry the `group_id` as their call id.
+    /// seconds, `0` for none) go with `aor` only. It resolves to the `Call` too,
+    /// whose `payload` is the reply (`{"channel", "group_id", "aor", "strategy",
+    /// "total_timeout", "branches"}`); until a phone answers the channel's
+    /// events carry the `group_id` as their call id.
     /// An AoR with nobody registered is `ControlError` `not_found` with
     /// `details["reason"] == "no_contacts"`. While the phones ring, `hangup`
     /// CANCELs them all and `drop` is refused.
@@ -466,34 +470,20 @@ impl ControlClient {
         let inner = Arc::clone(&self.inner);
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let client = ensure_client(&inner).await?;
-            let value = match destination {
-                Destination::To(to) => {
-                    let placed = client
-                        .originate(&channel, &to, plan, options)
-                        .await
-                        .map_err(to_pyerr)?;
-                    serde_json::json!({
-                        "channel": placed.channel,
-                        "call_id": placed.call_id,
-                        "sip_call_id": placed.sip_call_id,
-                    })
-                }
+            let placed = match destination {
+                Destination::To(to) => client
+                    .originate(&channel, &to, plan, options)
+                    .await
+                    .map_err(to_pyerr)?,
                 Destination::Aor(aor, ring) => {
-                    let group = client
+                    client
                         .originate_aor(&channel, &aor, plan, options, ring)
                         .await
-                        .map_err(to_pyerr)?;
-                    serde_json::json!({
-                        "channel": group.channel,
-                        "group_id": group.group_id,
-                        "aor": group.aor,
-                        "strategy": group.strategy,
-                        "total_timeout": group.total_timeout_secs,
-                        "branches": group.branches,
-                    })
+                        .map_err(to_pyerr)?
+                        .call
                 }
             };
-            attach_if_running(|py| json_to_py(py, &value))
+            attach_if_running(|py| Ok(Bound::new(py, Call { inner: placed })?.unbind()))
                 .unwrap_or_else(|| Err(interpreter_gone()))
         })
     }

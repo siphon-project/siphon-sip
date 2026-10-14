@@ -10,11 +10,13 @@ use std::sync::Arc;
 
 use siphon_control_proto::sip::{DialBranchPayload, SipVerb};
 use siphon_control_proto::verbs::MODULE_SIP;
+use siphon_control_proto::{ControlErrorCode, EventFrame, FrameType};
+use tokio::sync::mpsc;
 
 use crate::dial::{branches, DialStrategy};
 use crate::error::ControlError;
 use crate::session::CommandTransport;
-use crate::sip::{headers_to_json, SipClient};
+use crate::sip::{headers_to_json, Call, CallEvent, SipClient, SipFacade};
 
 /// The media plan for [`SipClient::originate`] — what the outbound INVITE
 /// offers.
@@ -308,13 +310,15 @@ impl OriginateOptions {
 /// What the server answers an accepted `originate` with: the call is `calling`,
 /// not answered — the answer arrives later as an event on the channel.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Originated {
+pub(crate) struct Originated {
     /// The caller-supplied channel id the call is addressed by.
     pub channel: String,
     /// siphon's internal call id.
     pub call_id: Option<String>,
     /// The SIP Call-ID on the wire, for joining CDR / HEP.
     pub sip_call_id: Option<String>,
+    /// The reply as the server sent it.
+    pub reply: serde_json::Value,
 }
 
 /// How [`SipClient::originate_aor`] rings the phones registered at the AoR.
@@ -364,10 +368,13 @@ impl AorRing {
 /// `group_id` as their `call_id` and `sip_call_id`, since no single dialog is
 /// the call yet, and each phone's own Call-ID is in their payload. From
 /// `DialAnswered` on, the channel is the winning phone's call.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct OriginatedGroup {
     /// The caller-supplied channel id the call is addressed by.
     pub channel: String,
+    /// The placed call: its events (`DialBranch`, `DialAnswered`, then the
+    /// winning phone's) and every verb on the channel.
+    pub call: Call,
     /// The group's id, standing in for the call until a phone answers.
     pub group_id: Option<String>,
     /// The AoR as the registrar keys it.
@@ -385,10 +392,15 @@ impl SipClient {
     /// Place an outbound call under a caller-supplied channel id.
     ///
     /// The one verb that *creates* a channel rather than addressing one, which
-    /// is why it lives here and not on [`Call`](crate::sip::Call). It returns as soon as the
-    /// INVITE is on the wire — the call is `calling`, and the answer, failure or
-    /// timeout arrives later as an event on the channel, exactly as a handed-over
-    /// call's does.
+    /// is why it lives here and not on [`Call`]. It returns as soon as the
+    /// INVITE is on the wire — the call is `calling` — with the [`Call`] it
+    /// placed: the answer, failure or timeout arrives on [`Call::next_event`],
+    /// exactly as a handed-over call's does, and `hangup` CANCELs or BYEs it.
+    ///
+    /// siphon sends no `StasisStart` for a channel its controller created, so
+    /// the channel is opened here before the command goes out (a fast 180 can
+    /// overtake the reply). An id still live on this client is a `conflict`
+    /// refused before anything is sent.
     ///
     /// The channel id is yours to choose so the call is addressable before it is
     /// answered (and before any server-assigned id could have reached you). A id
@@ -407,7 +419,10 @@ impl SipClient {
     ///             .timeout(20),
     ///     )
     ///     .await?;
-    /// println!("ringing on {}", call.channel);
+    /// println!("ringing on {}", call.channel_id());
+    /// while let Some(event) = call.next_event().await {
+    ///     println!("{:?}", event.kind);
+    /// }
     /// # Ok(())
     /// # }
     /// ```
@@ -417,8 +432,16 @@ impl SipClient {
         to: &str,
         media: OriginateMedia,
         options: OriginateOptions,
-    ) -> Result<Originated, ControlError> {
-        originate_on(&self.client.commander(), channel, to, media, options).await
+    ) -> Result<Call, ControlError> {
+        place_on(
+            &self.facade,
+            &self.client.commander(),
+            channel,
+            to,
+            media,
+            options,
+        )
+        .await
     }
 
     /// Place an outbound call to every phone registered at `aor`, under a
@@ -462,7 +485,115 @@ impl SipClient {
         options: OriginateOptions,
         ring: AorRing,
     ) -> Result<OriginatedGroup, ControlError> {
-        originate_aor_on(&self.client.commander(), channel, aor, media, options, ring).await
+        place_aor_on(
+            &self.facade,
+            &self.client.commander(),
+            channel,
+            aor,
+            media,
+            options,
+            ring,
+        )
+        .await
+    }
+}
+
+/// Open `channel` on the facade, send the originate, and hand back the call, or
+/// close the channel again when the server refuses it.
+pub(crate) async fn place_on(
+    facade: &SipFacade,
+    transport: &Arc<dyn CommandTransport>,
+    channel: &str,
+    to: &str,
+    media: OriginateMedia,
+    options: OriginateOptions,
+) -> Result<Call, ControlError> {
+    let events = facade
+        .open_channel(channel)
+        .ok_or_else(|| channel_in_use(channel))?;
+    match originate_on(transport, channel, to, media, options).await {
+        Ok(originated) => Ok(placed_call(
+            transport,
+            channel,
+            originated.call_id,
+            originated.sip_call_id,
+            originated.reply,
+            events,
+        )),
+        Err(error) => {
+            facade.close_channel(channel);
+            Err(error)
+        }
+    }
+}
+
+/// [`place_on`] for `originate {aor}`.
+pub(crate) async fn place_aor_on(
+    facade: &SipFacade,
+    transport: &Arc<dyn CommandTransport>,
+    channel: &str,
+    aor: &str,
+    media: OriginateMedia,
+    options: OriginateOptions,
+    ring: AorRing,
+) -> Result<OriginatedGroup, ControlError> {
+    let events = facade
+        .open_channel(channel)
+        .ok_or_else(|| channel_in_use(channel))?;
+    let result = match originate_aor_on(transport, channel, aor, media, options, ring).await {
+        Ok(result) => result,
+        Err(error) => {
+            facade.close_channel(channel);
+            return Err(error);
+        }
+    };
+    // Until a phone answers, the group stands in for the call, as its events say.
+    let group_id = string(&result, "group_id");
+    let call = placed_call(
+        transport,
+        channel,
+        group_id.clone(),
+        group_id.clone(),
+        result.clone(),
+        events,
+    );
+    Ok(OriginatedGroup {
+        channel: string(&result, "channel").unwrap_or_else(|| channel.to_string()),
+        call,
+        group_id,
+        aor: string(&result, "aor"),
+        strategy: string(&result, "strategy"),
+        total_timeout_secs: result.get("total_timeout").and_then(|value| value.as_u64()),
+        branches: branches(&result),
+    })
+}
+
+/// The [`Call`] for a channel this client placed: the ids from the reply, which
+/// stands in for the `StasisStart` payload siphon never sends for it.
+fn placed_call(
+    transport: &Arc<dyn CommandTransport>,
+    channel: &str,
+    call_id: Option<String>,
+    sip_call_id: Option<String>,
+    reply: serde_json::Value,
+    events: mpsc::UnboundedReceiver<CallEvent>,
+) -> Call {
+    let frame = EventFrame {
+        frame_type: FrameType::Event,
+        event: SipVerb::Originate.as_str().to_string(),
+        channel: Some(channel.to_string()),
+        app: None,
+        call_id,
+        sip_call_id,
+        payload: reply,
+    };
+    Call::from_event(Arc::clone(transport), &frame, events, false)
+}
+
+fn channel_in_use(channel: &str) -> ControlError {
+    ControlError::Command {
+        code: ControlErrorCode::Conflict,
+        message: format!("channel {channel} is already live on this client"),
     }
 }
 
@@ -487,13 +618,14 @@ pub(crate) async fn originate_on(
     options.insert_into(&mut args);
 
     let result = send(transport, args).await?;
-    let string = |name: &str| string(&result, name);
+    let text = |name: &str| string(&result, name);
     Ok(Originated {
         // The server echoes the id back; fall back to the one we asked for
         // rather than inventing an empty channel a caller cannot address.
-        channel: string("channel").unwrap_or_else(|| channel.to_string()),
-        call_id: string("call_id"),
-        sip_call_id: string("sip_call_id"),
+        channel: text("channel").unwrap_or_else(|| channel.to_string()),
+        call_id: text("call_id"),
+        sip_call_id: text("sip_call_id"),
+        reply: result,
     })
 }
 
@@ -506,7 +638,7 @@ pub(crate) async fn originate_aor_on(
     media: OriginateMedia,
     options: OriginateOptions,
     ring: AorRing,
-) -> Result<OriginatedGroup, ControlError> {
+) -> Result<serde_json::Value, ControlError> {
     let mut args = serde_json::Map::new();
     args.insert("channel".to_string(), json!(channel));
     args.insert("aor".to_string(), json!(aor));
@@ -514,15 +646,7 @@ pub(crate) async fn originate_aor_on(
     options.insert_into(&mut args);
     ring.insert_into(&mut args);
 
-    let result = send(transport, args).await?;
-    Ok(OriginatedGroup {
-        channel: string(&result, "channel").unwrap_or_else(|| channel.to_string()),
-        group_id: string(&result, "group_id"),
-        aor: string(&result, "aor"),
-        strategy: string(&result, "strategy"),
-        total_timeout_secs: result.get("total_timeout").and_then(|value| value.as_u64()),
-        branches: branches(&result),
-    })
+    send(transport, args).await
 }
 
 /// `originate` is module-level: it creates the channel, so it carries no
@@ -551,7 +675,9 @@ fn string(result: &serde_json::Value, name: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client::ClientEvent;
     use futures_util::future::BoxFuture;
+    use siphon_control_proto::sip::SipEvent;
     use std::sync::Mutex;
 
     /// One command as sent: module, verb, target, args.
@@ -594,6 +720,228 @@ mod tests {
         })
     }
 
+    /// Answers `originate` the way siphon can: the call's first event on the
+    /// socket ahead of the reply, since the reply waits for the INVITE to go out
+    /// and a fast 180 can overtake it.
+    struct EarlyEvent {
+        facade: Arc<SipFacade>,
+        event: EventFrame,
+        reply: Result<serde_json::Value, ControlError>,
+    }
+
+    impl CommandTransport for EarlyEvent {
+        fn command(
+            &self,
+            _module: Option<String>,
+            _verb: String,
+            _target: serde_json::Value,
+            _args: serde_json::Value,
+        ) -> BoxFuture<'_, Result<serde_json::Value, ControlError>> {
+            let commander: Arc<dyn CommandTransport> = Arc::new(Recorder {
+                sent: Mutex::new(Vec::new()),
+                result: json!({}),
+            });
+            self.facade
+                .handle_client_event(ClientEvent::Event(self.event.clone()), &commander);
+            let reply = match &self.reply {
+                Ok(result) => Ok(result.clone()),
+                Err(_) => Err(ControlError::Command {
+                    code: ControlErrorCode::NotFound,
+                    message: "no route".to_string(),
+                }),
+            };
+            Box::pin(async move { reply })
+        }
+    }
+
+    fn placed_event(event: &str, payload: serde_json::Value) -> EventFrame {
+        EventFrame::new(
+            event,
+            "out-1",
+            "agent-app",
+            "call-uuid",
+            "sip@host",
+            payload,
+        )
+    }
+
+    fn deliver(facade: &SipFacade, frame: EventFrame) {
+        let commander: Arc<dyn CommandTransport> = Arc::new(Recorder {
+            sent: Mutex::new(Vec::new()),
+            result: json!({}),
+        });
+        facade.handle_client_event(ClientEvent::Event(frame), &commander);
+    }
+
+    /// A placed call hears its own outcome. siphon sends no `StasisStart` for a
+    /// channel this client created, so without the channel opened up front every
+    /// event for it, the answer included, had nowhere to go.
+    #[tokio::test]
+    async fn a_placed_call_hears_every_event_including_one_ahead_of_the_reply() {
+        let facade = SipFacade::new();
+        let transport: Arc<dyn CommandTransport> = Arc::new(EarlyEvent {
+            facade: Arc::clone(&facade),
+            event: placed_event(
+                "ChannelStateChange",
+                json!({"state": "ringing", "code": 180}),
+            ),
+            reply: Ok(json!({
+                "channel": "out-1",
+                "call_id": "call-uuid",
+                "sip_call_id": "sip@host",
+                "state": "calling",
+            })),
+        });
+
+        let call = place_on(
+            &facade,
+            &transport,
+            "out-1",
+            "sip:1001@pbx.example",
+            OriginateMedia::anchor(),
+            OriginateOptions::default(),
+        )
+        .await
+        .expect("originate");
+
+        assert_eq!(call.channel_id(), "out-1");
+        assert_eq!(call.call_id(), Some("call-uuid"));
+        assert_eq!(call.sip_call_id(), Some("sip@host"));
+        assert!(!call.is_reattached());
+        assert_eq!(call.payload()["state"], "calling");
+
+        deliver(
+            &facade,
+            placed_event(
+                "ChannelStateChange",
+                json!({"state": "answered", "code": 200}),
+            ),
+        );
+        deliver(&facade, placed_event("StasisEnd", json!({"reason": "bye"})));
+
+        let ringing = call.next_event().await.expect("ringing");
+        assert_eq!(ringing.kind, SipEvent::ChannelStateChange);
+        assert_eq!(ringing.payload["state"], "ringing");
+        let answered = call.next_event().await.expect("answered");
+        assert_eq!(answered.payload["state"], "answered");
+        let ended = call.next_event().await.expect("ended");
+        assert_eq!(ended.kind, SipEvent::StasisEnd);
+        // The channel is gone once it ends, so the stream ends with it.
+        assert!(call.next_event().await.is_none());
+    }
+
+    /// A refused originate leaves nothing behind: the id is free to place again.
+    #[tokio::test]
+    async fn a_refused_originate_releases_its_channel() {
+        let facade = SipFacade::new();
+        let refusing: Arc<dyn CommandTransport> = Arc::new(EarlyEvent {
+            facade: Arc::clone(&facade),
+            event: placed_event("ChannelStateChange", json!({"state": "ringing"})),
+            reply: Err(ControlError::Closed),
+        });
+        let error = place_on(
+            &facade,
+            &refusing,
+            "out-1",
+            "sip:1001@pbx.example",
+            OriginateMedia::anchor(),
+            OriginateOptions::default(),
+        )
+        .await
+        .expect_err("refused");
+        assert_eq!(error.code(), Some(ControlErrorCode::NotFound));
+
+        let recorder = Arc::new(Recorder {
+            sent: Mutex::new(Vec::new()),
+            result: json!({"channel": "out-1"}),
+        });
+        let transport: Arc<dyn CommandTransport> = recorder.clone();
+        place_on(
+            &facade,
+            &transport,
+            "out-1",
+            "sip:1001@pbx.example",
+            OriginateMedia::anchor(),
+            OriginateOptions::default(),
+        )
+        .await
+        .expect("the id is free again");
+    }
+
+    /// An id still live on this client is refused before anything is sent:
+    /// taking it over would hand the live call's events to the new one.
+    #[tokio::test]
+    async fn a_channel_already_live_here_is_a_conflict_and_nothing_is_sent() {
+        let facade = SipFacade::new();
+        let recorder = Arc::new(Recorder {
+            sent: Mutex::new(Vec::new()),
+            result: json!({"channel": "out-1"}),
+        });
+        let transport: Arc<dyn CommandTransport> = recorder.clone();
+        let _live = place_on(
+            &facade,
+            &transport,
+            "out-1",
+            "sip:1001@pbx.example",
+            OriginateMedia::anchor(),
+            OriginateOptions::default(),
+        )
+        .await
+        .expect("first");
+
+        let error = place_on(
+            &facade,
+            &transport,
+            "out-1",
+            "sip:1002@pbx.example",
+            OriginateMedia::anchor(),
+            OriginateOptions::default(),
+        )
+        .await
+        .expect_err("second");
+        assert_eq!(error.code(), Some(ControlErrorCode::Conflict));
+        assert_eq!(recorder.sent.lock().unwrap().len(), 1);
+    }
+
+    /// An AoR originate hands back its call too, bound to the group until a
+    /// phone answers.
+    #[tokio::test]
+    async fn an_aor_originate_hands_back_its_call() {
+        let facade = SipFacade::new();
+        let recorder = Arc::new(Recorder {
+            sent: Mutex::new(Vec::new()),
+            result: group_result(),
+        });
+        let transport: Arc<dyn CommandTransport> = recorder.clone();
+        let group = place_aor_on(
+            &facade,
+            &transport,
+            "wake-201",
+            "sip:201@example.com",
+            OriginateMedia::anchor(),
+            OriginateOptions::default(),
+            AorRing::default(),
+        )
+        .await
+        .expect("originate aor");
+
+        assert_eq!(group.call.channel_id(), "wake-201");
+        assert_eq!(group.call.payload()["group_id"], "originate-group-1");
+        deliver(
+            &facade,
+            EventFrame::new(
+                "DialAnswered",
+                "wake-201",
+                "agent-app",
+                "originate-group-1",
+                "originate-group-1",
+                json!({}),
+            ),
+        );
+        let answered = group.call.next_event().await.expect("answered");
+        assert_eq!(answered.kind, SipEvent::DialAnswered);
+    }
+
     /// `aor` replaces `to`: the server refuses an originate naming both, and one
     /// sent as `to` would be DNS-resolved and reach none of the phones.
     #[tokio::test]
@@ -603,7 +951,8 @@ mod tests {
             result: group_result(),
         });
         let transport: Arc<dyn CommandTransport> = recorder.clone();
-        let group = originate_aor_on(
+        let group = place_aor_on(
+            &SipFacade::new(),
             &transport,
             "wake-201",
             "sip:201@example.com",
@@ -652,7 +1001,8 @@ mod tests {
             result: json!({}),
         });
         let transport: Arc<dyn CommandTransport> = recorder.clone();
-        let group = originate_aor_on(
+        let group = place_aor_on(
+            &SipFacade::new(),
             &transport,
             "wake-201",
             "sip:201@example.com",

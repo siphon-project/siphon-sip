@@ -31,8 +31,8 @@ use siphon_control_proto::{ChannelSnapshot, EventFrame};
 use crate::client::{ClientConfig, ClientEvent, ControlClient};
 use crate::error::ControlError;
 pub use crate::originate::{
-    AorRing, OriginateMedia, OriginateOptions, OriginatePrivacy, Originated, OriginatedGroup,
-    SessionRefresher, SessionTimer,
+    AorRing, OriginateMedia, OriginateOptions, OriginatePrivacy, OriginatedGroup, SessionRefresher,
+    SessionTimer,
 };
 // `dial`, the recording pair and the stream pair hang their verbs off `Call` from their own
 // modules; their argument types are re-exported here so every SIP type is
@@ -534,7 +534,7 @@ pub struct Call {
 }
 
 impl Call {
-    fn from_event(
+    pub(crate) fn from_event(
         commander: Arc<dyn CommandTransport>,
         frame: &EventFrame,
         events: mpsc::UnboundedReceiver<CallEvent>,
@@ -597,7 +597,8 @@ impl Call {
     }
 
     /// The `StasisStart` payload (full SIP context) — or the `resync` snapshot
-    /// when [`Call::is_reattached`] is true.
+    /// when [`Call::is_reattached`] is true, or the `originate` reply for a call
+    /// this client placed.
     pub fn payload(&self) -> &serde_json::Value {
         &self.inner.payload
     }
@@ -1180,7 +1181,7 @@ type CallHandler = Arc<dyn Fn(Call) -> BoxFuture<'static, Result<(), ControlErro
 /// The SIP facade's event router: builds `Call`s from `StasisStart`/reattach,
 /// routes channel-scoped events to the owning call, and dispatches new calls to
 /// a handler or pull stream.
-struct SipFacade {
+pub(crate) struct SipFacade {
     handler: Mutex<Option<CallHandler>>,
     call_tx: Mutex<Option<mpsc::UnboundedSender<Call>>>,
     channels: Mutex<HashMap<String, mpsc::UnboundedSender<CallEvent>>>,
@@ -1188,7 +1189,7 @@ struct SipFacade {
 }
 
 impl SipFacade {
-    fn new() -> Arc<Self> {
+    pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self {
             handler: Mutex::new(None),
             call_tx: Mutex::new(None),
@@ -1213,7 +1214,11 @@ impl SipFacade {
         receiver
     }
 
-    fn handle_client_event(&self, event: ClientEvent, commander: &Arc<dyn CommandTransport>) {
+    pub(crate) fn handle_client_event(
+        &self,
+        event: ClientEvent,
+        commander: &Arc<dyn CommandTransport>,
+    ) {
         match event {
             ClientEvent::Event(frame) => self.handle_event(frame, commander),
             ClientEvent::Reattach(snapshot) => self.reattach(snapshot, commander),
@@ -1250,6 +1255,23 @@ impl SipFacade {
         lock(&self.channels).insert(snapshot.channel.clone(), event_tx);
         let call = Call::from_snapshot(Arc::clone(commander), snapshot, event_rx);
         self.dispatch(call);
+    }
+
+    /// Open a placed call's event queue before its `originate` goes out (no
+    /// `StasisStart` comes for it; a 1xx can beat the reply). `None` if live.
+    pub(crate) fn open_channel(&self, channel: &str) -> Option<mpsc::UnboundedReceiver<CallEvent>> {
+        let mut channels = lock(&self.channels);
+        if channels.contains_key(channel) {
+            return None;
+        }
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        channels.insert(channel.to_string(), event_tx);
+        Some(event_rx)
+    }
+
+    /// Close a channel opened for an originate the server refused.
+    pub(crate) fn close_channel(&self, channel: &str) {
+        lock(&self.channels).remove(channel);
     }
 
     fn route(&self, channel: &str, event: CallEvent) {
@@ -1310,9 +1332,9 @@ impl CallStream {
 /// # }
 /// ```
 pub struct SipClient {
-    // Reached by the `originate` verbs in their own module.
+    // Both reached by the `originate` verbs in their own module.
     pub(crate) client: Arc<ControlClient>,
-    facade: Arc<SipFacade>,
+    pub(crate) facade: Arc<SipFacade>,
 }
 
 impl std::fmt::Debug for SipClient {

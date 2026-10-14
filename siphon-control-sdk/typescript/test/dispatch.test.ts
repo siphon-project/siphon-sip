@@ -169,3 +169,99 @@ describe("per-call-connect SipServer dispatch (siphon dials in)", () => {
     dial.send(JSON.stringify({ id: answerCommand.id, type: "reply", status: "ok", result: {} }));
   });
 });
+
+describe("SipClient.originate hands back the call it placed", () => {
+  // siphon sends no StasisStart for a call its controller created, so the
+  // placed call's events had nowhere to go until the channel was opened up
+  // front. The 180 goes out ahead of the reply, since a fast one can overtake it.
+  it("delivers every event on the placed channel, one ahead of the reply too", async () => {
+    const event = (name: string, payload: Record<string, unknown>) => ({
+      event: name,
+      channel: "out-1",
+      app: "agent-app",
+      call_id: "call-uuid",
+      sip_call_id: "sipcid@host",
+      payload,
+    });
+    let originates = 0;
+    const stub = await ControlStub.start({
+      onCommand: (frame, socket) => {
+        if (frame.verb !== "originate") {
+          return { status: "ok", result: {} };
+        }
+        originates += 1;
+        if (originates === 1) {
+          stub.pushEvent(event("ChannelStateChange", { state: "ringing", code: 180 }), socket);
+        }
+        return {
+          status: "ok",
+          result: {
+            channel: "out-1",
+            call_id: "call-uuid",
+            sip_call_id: "sipcid@host",
+            state: "calling",
+          },
+        };
+      },
+    });
+    cleanup.push(() => stub.stop());
+
+    const sip = await SipClient.connect({ url: stub.url(), app: "agent-app", token: "t" });
+    const running = sip.run();
+
+    const call = await sip.originate("out-1", "sip:1001@pbx.example", { anchor: true });
+    expect(call.channelId).toBe("out-1");
+    expect(call.callId).toBe("call-uuid");
+    expect(call.sipCallId).toBe("sipcid@host");
+    expect(call.reattached).toBe(false);
+    expect(call.payload).toMatchObject({ state: "calling" });
+
+    stub.pushEvent(event("ChannelStateChange", { state: "answered", code: 200 }));
+    stub.pushEvent(event("StasisEnd", { reason: "bye" }));
+    const seen: Array<[string, unknown]> = [];
+    for (let next = await call.nextEvent(); next !== null; next = await call.nextEvent()) {
+      seen.push([next.kind, (next.payload as { state?: string } | null)?.state]);
+    }
+    expect(seen).toEqual([
+      ["ChannelStateChange", "ringing"],
+      ["ChannelStateChange", "answered"],
+      ["StasisEnd", undefined],
+    ]);
+
+    // The id is free again once the call ends; while it rings it is not, and
+    // the second originate is refused before anything is sent.
+    await sip.originate("out-1", "sip:1001@pbx.example", { anchor: true });
+    await expect(
+      sip.originate("out-1", "sip:1002@pbx.example", { anchor: true }),
+    ).rejects.toMatchObject({ code: "conflict" });
+    expect(stub.received.filter((f) => f.verb === "originate")).toHaveLength(2);
+
+    sip.shutdown();
+    await running;
+  });
+
+  it("releases the channel when the server refuses the originate", async () => {
+    let refuse = true;
+    const stub = await ControlStub.start({
+      onCommand: (frame) => {
+        if (frame.verb === "originate" && refuse) {
+          refuse = false;
+          return { status: "error", error: { code: "not_found", message: "no route" } };
+        }
+        return { status: "ok", result: { channel: "out-1" } };
+      },
+    });
+    cleanup.push(() => stub.stop());
+
+    const sip = await SipClient.connect({ url: stub.url(), app: "agent-app", token: "t" });
+    const running = sip.run();
+    await expect(
+      sip.originate("out-1", "sip:1001@pbx.example", { anchor: true }),
+    ).rejects.toMatchObject({ code: "not_found" });
+    const call = await sip.originate("out-1", "sip:1001@pbx.example", { anchor: true });
+    expect(call.channelId).toBe("out-1");
+
+    sip.shutdown();
+    await running;
+  });
+});

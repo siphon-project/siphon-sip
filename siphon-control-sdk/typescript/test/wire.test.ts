@@ -1074,7 +1074,12 @@ describe("originate {aor} args and reply", () => {
         },
       },
     ]);
-    expect(group).toEqual({
+    const { call, ...fields } = group;
+    // The placed call, bound to the group until a phone answers.
+    expect(call.channelId).toBe("wake-201");
+    expect(call.callId).toBe("originate-group-3");
+    expect(call.payload).toEqual(reply);
+    expect(fields).toEqual({
       channel: "wake-201",
       groupId: "originate-group-3",
       aor: "sip:201@pbx.example",

@@ -1077,11 +1077,10 @@ def test_originate_verb_roundtrip():
                 timeout=20,
                 session_timer={"expires": 90, "refresher": "UAC"},
             )
-            assert placed == {
-                "channel": "out-1",
-                "call_id": "call-uuid",
-                "sip_call_id": "sipcid@host",
-            }
+            assert placed.channel_id == "out-1"
+            assert placed.call_id == "call-uuid"
+            assert placed.sip_call_id == "sipcid@host"
+            assert placed.payload["state"] == "calling"
             await client.originate(
                 "out-2", "sip:1001@pbx.example", sdp="v=0\r\n"
             )
@@ -1125,6 +1124,98 @@ def test_originate_verb_roundtrip():
             }
 
             client.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_placed_call_hears_its_own_outcome():
+    """`client.originate(...)` hands back the `Call` it placed, and that call
+    hears every event on its channel: siphon sends no `StasisStart` for a call
+    its controller created, so these used to have nowhere to go. The 180 is sent
+    ahead of the reply, since a fast one can overtake it."""
+
+    def event(name, payload):
+        return json.dumps(
+            {
+                "type": "event",
+                "event": name,
+                "channel": "out-1",
+                "app": APP,
+                "call_id": "call-uuid",
+                "sip_call_id": "sipcid@host",
+                "payload": payload,
+            }
+        )
+
+    async def scenario():
+        async def originate_stub(websocket):
+            said_hello = False
+            originates = 0
+            async for message in websocket:
+                frame = json.loads(message)
+                frame_id = frame.get("id")
+                if not said_hello:
+                    await _reply_ok(
+                        websocket,
+                        frame_id,
+                        {"app": APP, "protocol": 1, "subprotocol": SUBPROTOCOL},
+                    )
+                    said_hello = True
+                elif frame.get("verb") == "originate" and originates > 0:
+                    # Later calls ring on: their channels stay live.
+                    originates += 1
+                    await _reply_ok(websocket, frame_id, {"channel": "out-1"})
+                elif frame.get("verb") == "originate":
+                    originates += 1
+                    await websocket.send(
+                        event("ChannelStateChange", {"state": "ringing", "code": 180})
+                    )
+                    await _reply_ok(
+                        websocket,
+                        frame_id,
+                        {
+                            "channel": "out-1",
+                            "call_id": "call-uuid",
+                            "sip_call_id": "sipcid@host",
+                            "state": "calling",
+                        },
+                    )
+                    await websocket.send(
+                        event("ChannelStateChange", {"state": "answered", "code": 200})
+                    )
+                    await websocket.send(event("StasisEnd", {"reason": "bye"}))
+                else:
+                    await _reply_ok(websocket, frame_id, {})
+
+        async with websockets.serve(
+            originate_stub, "127.0.0.1", 0, subprotocols=[SUBPROTOCOL]
+        ) as server:
+            port = server.sockets[0].getsockname()[1]
+            client = ControlClient(
+                app=APP, token=TOKEN, url=f"ws://127.0.0.1:{port}/control/ws"
+            )
+            await client.connect()
+            run_task = asyncio.ensure_future(client.run())
+
+            call = await client.originate("out-1", "sip:1001@pbx.example", media=True)
+            kinds = []
+            while (received := await asyncio.wait_for(call.next_event(), 5)) is not None:
+                kinds.append((received["kind"], received["payload"].get("state")))
+            assert kinds == [
+                ("ChannelStateChange", "ringing"),
+                ("ChannelStateChange", "answered"),
+                ("StasisEnd", None),
+            ]
+
+            # The id is free again once the call ends, and only then.
+            again = await client.originate("out-1", "sip:1001@pbx.example", media=True)
+            with pytest.raises(ControlError) as raised:
+                await client.originate("out-1", "sip:1002@pbx.example", media=True)
+            assert raised.value.code == "conflict"
+            assert again.channel_id == "out-1"
+
+            client.close()
+            run_task.cancel()
 
     asyncio.run(scenario())
 
@@ -1502,7 +1593,7 @@ def test_bridge_dial_roundtrip():
 
 def test_originate_aor_roundtrip():
     """`client.originate(channel, aor=...)` sends `aor` in place of `to` with its
-    ring options, resolves to the group, and refuses what the server would."""
+    ring options, resolves to the placed call, and refuses what the server would."""
 
     async def scenario():
         frames = []
@@ -1542,12 +1633,17 @@ def test_originate_aor_roundtrip():
                 strategy="sequential",
                 total_timeout=50,
             )
-            assert group == {
+            # The placed call, bound to the group until a phone answers; the
+            # group itself is the reply, as its payload.
+            assert group.channel_id == "wake-201"
+            assert group.call_id == "originate-group-1"
+            assert group.payload == {
                 "channel": "wake-201",
                 "group_id": "originate-group-1",
                 "aor": "sip:201@example.com",
                 "strategy": "sequential",
                 "total_timeout": 50,
+                "state": "calling",
                 "branches": [{
                     "leg_id": "leg-1",
                     "leg_sip_call_id": "b1@host",

@@ -107,8 +107,11 @@ reported as a failure. That is damage control, not a substitute for closing.
 - `await client.command(verb, module=None, target=None, args=None)` — the generic
   `{module, verb, target, args}` primitive for any adapter (SIP today; SMPP/SS7 later).
 - `await client.originate(channel, to=None, *, aor=None, strategy=None, total_timeout=None, media=False, sdp=None, body=None, content_type=None, …, session_timer=None)`
-  — place an outbound call under a channel id you choose; resolves to
-  `{"channel", "call_id", "sip_call_id"}` once the INVITE is on the wire. Exactly one
+  — place an outbound call under a channel id you choose; resolves to the `Call` it
+  placed once the INVITE is on the wire, so the answer, a rejection or the ring timeout
+  arrive on `await call.next_event()` and `await call.hangup()` CANCELs or BYEs it
+  (`call.payload` is the server's reply). A channel id still live on this client is
+  `ControlError` `conflict`, refused before anything is sent. Exactly one
   media plan (`media=True`, `sdp=` or `body=`). `session_timer={"expires", "min_se",
   "refresher"}` runs an RFC 4028 session timer on the call, each key left out taking the
   server's default. What the server would refuse raises `ValueError` before a frame goes out.
@@ -200,8 +203,8 @@ reported as a failure. That is damage control, not a substitute for closing.
 - `await client.originate(channel, aor=..., strategy=None, total_timeout=None, …)`
   rings every phone registered at the AoR, each over its own flow and Path; the first
   to answer becomes the channel's call. Exactly one of `to` and `aor`, and
-  `strategy` / `total_timeout` only with `aor`. Resolves to `{"channel", "group_id",
-  "aor", "strategy", "total_timeout", "branches"}`.
+  `strategy` / `total_timeout` only with `aor`. Resolves to the placed `Call` too, whose
+  `payload` is `{"channel", "group_id", "aor", "strategy", "total_timeout", "branches"}`.
 - `await call.record_start(direction=None, channels=None, max_duration_ms=None,
   silence_ms=None, path=None)` records the call's decoded audio to a wav file and
   returns the `recording_id` that `await call.record_stop(recording_id=None)`
