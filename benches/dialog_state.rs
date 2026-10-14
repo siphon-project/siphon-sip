@@ -8,8 +8,8 @@
 //!   tracking store's emptiness, one atomic load each). It has to stay at a
 //!   few nanoseconds.
 //! - With a subscriber, each INVITE branch pays the registrar match for its
-//!   target (`match_callee_1k_bindings`, an O(bindings) scan like
-//!   `registrar.lookup_contact`), and each tracked call the store's bookkeeping
+//!   target (`match_callee_1k_bindings`, read through the registrar's contact
+//!   index like `registrar.lookup_contact`), and each tracked call the store's bookkeeping
 //!   from INVITE to BYE (`track_proxied_call`).
 //!
 //! Fixtures use RFC 5737 addresses and example.com AoRs.

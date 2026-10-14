@@ -152,16 +152,19 @@ fn plain_binding_footprint() {
 
     // Ceilings, not targets: they exist so a field added to `Contact` without
     // thought, or a new per-binding allocation, reddens here instead of showing
-    // up as a memory report months later. Measured at 526 bytes across 8
+    // up as a memory report months later. Measured at 618 bytes across 9
     // allocations; the headroom is for allocator and std variation, not for
     // drift. Raise either only with a measurement saying the new cost is worth
-    // paying.
+    // paying. The last raise, from 526 bytes across 8, was the contact index:
+    // its entry per binding (an 8-byte key, the AoR's name and the table slot)
+    // is what lets a lookup by Contact read one AoR instead of every binding,
+    // which at half a million AoRs took hundreds of milliseconds per call.
     assert!(
-        per_binding_bytes <= 560,
+        per_binding_bytes <= 650,
         "a plain binding now costs {per_binding_bytes} bytes of live data"
     );
     assert!(
-        per_binding_allocs <= 8.0,
+        per_binding_allocs <= 9.0,
         "a plain binding now takes {per_binding_allocs:.2} allocations"
     );
 }

@@ -293,6 +293,19 @@ entry, but a working config keeps working.
 
 ### Changed
 
+- **A registrar lookup by Contact no longer scans every binding.**
+  `registrar.lookup_contact()`, `registrar.is_registered_contact()` and the
+  binding match the dialog-state publisher runs for every branch it tracks
+  read the whole table: about 220 ms per call at 500k AoRs on a miss or a
+  hit. The registrar now keeps a Contact → AoR index, maintained by every
+  save, refresh, de-registration, expiry sweep, flow failure, restart
+  eviction and backend restore, so the same lookup takes about 150 ns (miss)
+  and 270 ns (hit) at any registration count. It costs about 52 bytes of
+  live memory per binding (823 → 875 at 200k bindings,
+  `scripts/registrar_scale_test.sh`), resident unchanged within noise. The
+  host of a Contact now compares case-insensitively (RFC 3261 §19.1.4) in
+  `lookup_contact` too, as it already did in the dialog-state match.
+
 - **`ipsec.spi_range_count` defaults to 4194304 (2^22) instead of 8192.** Each
   registered UE holds two SPIs, so 8192 filled at about 4096 UEs. The new
   default holds about two million and costs a 512 KiB bitmap. Config now
