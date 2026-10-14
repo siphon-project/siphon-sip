@@ -277,6 +277,7 @@ fn fail_call_on_b_leg_failure(
             FailedCallEnd::Local {
                 status_code: undialable,
                 reason: best_error_reason(undialable).to_string(),
+                headers: Vec::new(),
             },
             state,
         );
@@ -303,6 +304,7 @@ fn fail_call_on_b_leg_failure(
         FailedCallEnd::Local {
             status_code: upstream,
             reason: best_error_reason(upstream).to_string(),
+            headers: Vec::new(),
         }
     } else {
         FailedCallEnd::Relayed { message, snapshot }

@@ -39,6 +39,49 @@ def _validate_replaces(replaces: Optional[dict]) -> None:
         )
 
 
+# The headers siphon owns on a response it sends the caller itself; mirrors
+# ``src/b2bua/uas_headers.rs``. Compact forms are folded to their long names.
+_UAS_FRAMEWORK_OWNED = frozenset(name.lower() for name in (
+    "Via", "From", "To", "Call-ID", "CSeq", "Max-Forwards", "Contact",
+    "Record-Route", "Route", "Content-Length", "Content-Type", "RSeq", "RAck",
+    "Require", "Supported", "Session-Expires", "Min-SE",
+))
+_COMPACT_FORMS = {
+    "v": "via", "f": "from", "t": "to", "i": "call-id", "m": "contact",
+    "l": "content-length", "c": "content-type", "k": "supported",
+    "x": "session-expires",
+}
+_TOKEN_CHARACTERS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-.!%*_+`'~"
+)
+
+
+def _uas_response_headers(method: str,
+                          headers: Optional[dict[str, str]]) -> dict[str, str]:
+    """Check the ``headers=`` of ``progress()`` / ``answer()`` / ``reject()``
+    the way siphon does, and return them in the order given."""
+    if not headers:
+        return {}
+    for name, value in headers.items():
+        if not isinstance(name, str) or not isinstance(value, str):
+            raise TypeError(
+                f"{method}(headers=…) takes a mapping of str header names to str values"
+            )
+        if not name or any(character not in _TOKEN_CHARACTERS for character in name):
+            raise ValueError(f"{method}(headers=…): '{name}' is not a SIP header name")
+        lowered = name.lower()
+        if _COMPACT_FORMS.get(lowered, lowered) in _UAS_FRAMEWORK_OWNED:
+            raise ValueError(
+                f"{method}(headers=…): {name} cannot be set by a script on a "
+                f"response siphon sends"
+            )
+        if any(character in value for character in "\r\n\0"):
+            raise ValueError(
+                f"{method}(headers=…): the value of {name} contains a line break or NUL"
+            )
+    return dict(headers)
+
+
 class Call:
     """A B2BUA call with two legs (A-leg = caller, B-leg = callee).
 
@@ -539,23 +582,39 @@ class Call:
         """Every ``ro_authorize`` call made on this call (for test assertions)."""
         return self._ro_authorizations
 
-    def reject(self, code: int, reason: str) -> None:
+    def reject(self, code: int, reason: str,
+               headers: dict[str, str] | None = None) -> None:
         """Reject the call with an error response.
 
         Args:
             code: SIP status code (e.g. 404, 486, 503).
             reason: Reason phrase.
+            headers: Optional ``{name: value}`` mapping added to the response.
+                The headers siphon owns on a response it sends itself (Via,
+                From, To, Call-ID, CSeq, Contact, Record-Route, Route,
+                Max-Forwards, Content-Length, Content-Type, RSeq, RAck,
+                Require, Supported, Session-Expires, Min-SE) raise
+                ``ValueError``, as does a value with a line break in it.
 
         Example::
 
             call.reject(486, "Busy Here")
+            call.reject(480, "Temporarily Unavailable",
+                        headers={"Retry-After": "120"})
         """
+        checked = _uas_response_headers("call.reject", headers)
         self._state = "terminated"
-        self._actions.append(Action(kind="reject", status_code=code, reason=reason))
+        self._actions.append(Action(
+            kind="reject",
+            status_code=code,
+            reason=reason,
+            extras={"headers": checked} if checked else None,
+        ))
 
     def answer(self, code: int, reason: str,
                body: Union[str, bytes, None] = None,
-               content_type: str | None = None) -> None:
+               content_type: str | None = None,
+               headers: dict[str, str] | None = None) -> None:
         """UAS-mode answer — send a final 2xx response to the inbound INVITE
         **immediately**, without bridging to a B-leg.
 
@@ -580,6 +639,8 @@ class Call:
             reason: Reason phrase.
             body: Optional response body (``bytes`` or ``str``) — typically SDP.
             content_type: Content-Type for the body (e.g. ``"application/sdp"``).
+            headers: Optional ``{name: value}`` mapping added to the 2xx. The
+                headers siphon owns raise ``ValueError`` (see ``reject()``).
 
         Example::
 
@@ -595,6 +656,7 @@ class Call:
                 f"call.answer() requires a 2xx status code; "
                 f"use call.reject() for failures (got {code})"
             )
+        checked = _uas_response_headers("call.answer", headers)
         if isinstance(body, str):
             body = body.encode("utf-8")
         self._state = "answered"
@@ -602,12 +664,14 @@ class Call:
             kind="answer",
             status_code=code,
             reason=reason,
-            extras={"body": body, "content_type": content_type},
+            extras={"body": body, "content_type": content_type,
+                    "headers": checked},
         ))
 
     def progress(self, code: int, reason: str = "Ringing",
                  body: Union[str, bytes, None] = None,
-                 content_type: str | None = None) -> None:
+                 content_type: str | None = None,
+                 headers: dict[str, str] | None = None) -> None:
         """UAS-mode provisional — send a 1xx response to the inbound INVITE
         **immediately** (e.g. ``183 Session Progress`` with early-media SDP, or
         ``180 Ringing``). Does not answer the call: the handler must still
@@ -624,23 +688,33 @@ class Call:
             reason: Reason phrase.
             body: Optional response body (``bytes`` or ``str``) — early-media SDP.
             content_type: Content-Type for the body (e.g. ``"application/sdp"``).
+            headers: Optional ``{name: value}`` mapping added to the 1xx, e.g.
+                ``{"P-Early-Media": "sendrecv"}`` (RFC 5009) on an
+                announcement's 183. The headers siphon owns raise
+                ``ValueError`` (see ``reject()``): ``Require`` and ``RSeq``
+                stay siphon's.
 
         Example::
 
             call.progress(183, "Session Progress", body=sdp, content_type="application/sdp")
+            call.progress(183, "Session Progress", body=sdp,
+                          content_type="application/sdp",
+                          headers={"P-Early-Media": "sendrecv"})
         """
         if not 100 <= code < 200:
             raise ValueError(
                 f"call.progress() requires a 1xx status code (got {code}); "
                 f"use call.answer() for the final response"
             )
+        checked = _uas_response_headers("call.progress", headers)
         if isinstance(body, str):
             body = body.encode("utf-8")
         self._actions.append(Action(
             kind="progress",
             status_code=code,
             reason=reason,
-            extras={"body": body, "content_type": content_type},
+            extras={"body": body, "content_type": content_type,
+                    "headers": checked},
         ))
 
     def handover(self, app: str, on_lost: str | None = None,

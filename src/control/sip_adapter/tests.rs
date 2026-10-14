@@ -1,5 +1,7 @@
 use super::bridge::{bridge_error, bridge_with_bus, unbridge};
-use super::call::{answer, drop_result, provisional_state, remove_header};
+use super::call::{
+    answer, drop_result, provisional_state, reject, remove_header, response_headers, ring,
+};
 use super::media::{
     dtmf, hold_result, media_error, parse_play_options, parse_play_source, parse_stream_channels,
     parse_stream_mode, play, play_accept, play_source_kind, record_start, stream_start, stream_uri,
@@ -2150,6 +2152,68 @@ fn remove_header_removes_from_the_stored_invite() {
     // The header is really gone from the stored invite.
     let invite = invite_arc.lock().unwrap();
     assert!(!invite.headers.has("X-Remove-Me"));
+}
+
+fn is_bad_request(result: &ControlResult) -> bool {
+    matches!(
+        result,
+        ControlResult::Error {
+            code: ControlErrorCode::BadRequest,
+            ..
+        }
+    )
+}
+
+#[test]
+fn response_headers_reads_an_object_of_strings_in_order() {
+    let headers = response_headers(&serde_json::json!({
+        "headers": { "P-Early-Media": "sendrecv", "Reason": "SIP;cause=480" }
+    }))
+    .expect("neither header is siphon's");
+    assert_eq!(
+        headers,
+        [
+            ("P-Early-Media".to_string(), "sendrecv".to_string()),
+            ("Reason".to_string(), "SIP;cause=480".to_string()),
+        ]
+    );
+    for absent in [
+        serde_json::json!({}),
+        serde_json::json!({ "headers": null }),
+    ] {
+        assert_eq!(
+            response_headers(&absent).expect("no headers is fine"),
+            Vec::<(String, String)>::new()
+        );
+    }
+}
+
+#[test]
+fn response_headers_refuses_anything_but_an_object_of_strings() {
+    for args in [
+        serde_json::json!({ "headers": ["P-Early-Media", "sendrecv"] }),
+        serde_json::json!({ "headers": "P-Early-Media: sendrecv" }),
+        serde_json::json!({ "headers": { "Retry-After": 120 } }),
+    ] {
+        let refused = response_headers(&args).expect_err("not an object of strings");
+        assert!(is_bad_request(&refused), "{args}: {refused:?}");
+    }
+}
+
+/// A header siphon owns is refused before the call is looked up, on every verb
+/// that sends the parked caller a response: `bad_request`, never `not_found`.
+#[test]
+fn every_uas_response_verb_refuses_a_framework_owned_header() {
+    let args = serde_json::json!({ "headers": { "Contact": "<sip:x@192.0.2.99>" } });
+    assert!(is_bad_request(&answer(&channel(), &args, true)));
+    assert!(is_bad_request(&answer(&channel(), &args, false)));
+    assert!(is_bad_request(&ring(&channel(), &args)));
+    assert!(is_bad_request(&reject(&channel(), &args)));
+    let anchored = serde_json::json!({
+        "anchor": true,
+        "headers": { "RSeq": "1" },
+    });
+    assert!(is_bad_request(&answer(&channel(), &anchored, false)));
 }
 
 #[test]

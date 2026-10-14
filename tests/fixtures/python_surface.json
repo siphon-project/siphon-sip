@@ -189,7 +189,7 @@
       "answer": {
         "doc": "UAS-mode answer \u2014 send a final 2xx response to the A-leg INVITE",
         "kind": "method_descriptor",
-        "sig": "($self, code, reason, body=None, content_type=None)"
+        "sig": "($self, code, reason, body=None, content_type=None, headers=None)"
       },
       "auth_user": {
         "doc": "Username the A-leg authenticated as, or `None` if it was never",
@@ -266,7 +266,7 @@
       "progress": {
         "doc": "UAS-mode provisional \u2014 send a 1xx response to the A-leg INVITE",
         "kind": "method_descriptor",
-        "sig": "($self, code, reason=\"Ringing\", body=None, content_type=None)"
+        "sig": "($self, code, reason=\"Ringing\", body=None, content_type=None, headers=None)"
       },
       "refer": {
         "doc": "Originate an outbound REFER on this call's connected leg \u2014 siphon is the",
@@ -288,7 +288,7 @@
       "reject": {
         "doc": "Reject the call with a status code.",
         "kind": "method_descriptor",
-        "sig": "($self, code, reason)"
+        "sig": "($self, code, reason, headers=None)"
       },
       "reject_refer": {
         "doc": "Reject the REFER with a status code and reason.",

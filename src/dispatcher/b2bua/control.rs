@@ -307,6 +307,8 @@ pub fn b2bua_media_set_ws_bridge_attached(sip_call_id: &str, attached: bool) {
 /// caller instead of being 481-rejected).
 ///
 /// `final_response` marks the call `Answered` and stamps the CDR answer time.
+/// `headers` are the script's own, already checked by
+/// [`crate::b2bua::uas_headers::validate`], and go on last.
 /// Returns `false` (never panics) if the call is gone or the dispatcher isn't
 /// running.
 pub fn b2bua_send_uas_response(
@@ -317,6 +319,7 @@ pub fn b2bua_send_uas_response(
     body: Option<Vec<u8>>,
     content_type: Option<&str>,
     final_response: bool,
+    headers: &[(String, String)],
 ) -> bool {
     let Some(control) = B2BUA_CONTROL.get() else {
         return false;
@@ -333,6 +336,7 @@ pub fn b2bua_send_uas_response(
         body,
         content_type,
         final_response,
+        headers,
     )
 }
 
@@ -352,6 +356,7 @@ pub fn send_uas_response(
     body: Option<Vec<u8>>,
     content_type: Option<&str>,
     final_response: bool,
+    headers: &[(String, String)],
 ) -> bool {
     // RFC 4028 §9: an INVITE asking for too brief a session interval is answered
     // 422, never 2xx, and the call ends.
@@ -434,6 +439,12 @@ pub fn send_uas_response(
             .set("Content-Length", body_bytes.len().to_string());
         response.body = body_bytes;
     }
+    // The script's own headers (`P-Early-Media` on an announcement's 183, RFC
+    // 5009 §8): precedence 1, as on a relayed response, so they go on last. The
+    // ones siphon owns here were refused before this point, so nothing below
+    // (the RSeq and Require of a reliable provisional, the 2xx's session timer)
+    // can collide with them.
+    crate::b2bua::uas_headers::apply(&mut response, headers);
     if !final_response && (101..200).contains(&code) {
         // siphon's own provisional is reliable toward a caller that required
         // `100rel` (RFC 3262 §3), and waits behind an unacknowledged one.
@@ -511,6 +522,7 @@ pub fn b2bua_answer_call(
     reason: &str,
     body: Option<Vec<u8>>,
     content_type: Option<&str>,
+    headers: &[(String, String)],
 ) -> bool {
     let Some(control) = B2BUA_CONTROL.get() else {
         return false;
@@ -523,6 +535,7 @@ pub fn b2bua_answer_call(
         reason,
         body,
         content_type,
+        headers,
         &control.state,
     )
 }
@@ -536,6 +549,7 @@ pub(crate) fn b2bua_answer_call_with_state(
     reason: &str,
     body: Option<Vec<u8>>,
     content_type: Option<&str>,
+    headers: &[(String, String)],
     state: &DispatcherState,
 ) -> bool {
     // RFC 3261 §8.2.2.3: answering the call itself makes siphon the only UAS the
@@ -573,6 +587,7 @@ pub(crate) fn b2bua_answer_call_with_state(
         body,
         content_type,
         true,
+        headers,
     )
 }
 
@@ -603,6 +618,7 @@ pub fn b2bua_answer_call_anchored(
     reason: &str,
     profile: Option<&str>,
     ws_uri: Option<&str>,
+    headers: &[(String, String)],
 ) -> Result<(), String> {
     let Some(control) = B2BUA_CONTROL.get() else {
         return Err("B2BUA is not running".to_string());
@@ -642,6 +658,7 @@ pub fn b2bua_answer_call_anchored(
         reason,
         profile,
         ws_uri,
+        headers,
         state,
     )
 }
@@ -660,6 +677,7 @@ pub fn b2bua_progress_call_anchored(
     reason: &str,
     profile: Option<&str>,
     ws_uri: Option<&str>,
+    headers: &[(String, String)],
 ) -> Result<(), String> {
     let Some(control) = B2BUA_CONTROL.get() else {
         return Err("B2BUA is not running".to_string());
@@ -692,6 +710,7 @@ pub fn b2bua_progress_call_anchored(
         reason,
         profile,
         ws_uri,
+        headers,
         state,
     )
 }
@@ -738,6 +757,7 @@ pub fn b2bua_progress_call(
     reason: &str,
     body: Option<Vec<u8>>,
     content_type: Option<&str>,
+    headers: &[(String, String)],
 ) -> bool {
     b2bua_send_uas_response(
         internal_call_id,
@@ -747,6 +767,7 @@ pub fn b2bua_progress_call(
         body,
         content_type,
         false,
+        headers,
     )
 }
 

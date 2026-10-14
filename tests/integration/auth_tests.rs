@@ -336,6 +336,7 @@ fn b2bua_invite_challenge_arms_a_407_reject_on_the_call() {
         CallAction::Reject {
             code: 407,
             reason: "Proxy Authentication Required".to_string(),
+            headers: Vec::new(),
         }
     );
 
@@ -424,6 +425,7 @@ fn b2bua_invite_challenge_rejects_wrong_password() {
         CallAction::Reject {
             code: 407,
             reason: "Proxy Authentication Required".to_string(),
+            headers: Vec::new(),
         }
     );
 }
@@ -472,6 +474,7 @@ fn b2bua_invite_www_challenge_arms_a_401_reject() {
         CallAction::Reject {
             code: 401,
             reason: "Unauthorized".to_string(),
+            headers: Vec::new(),
         }
     );
     assert_eq!(call_headers(&call, "WWW-Authenticate").len(), 3);

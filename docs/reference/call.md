@@ -356,6 +356,45 @@ Test a script against a limit with
 
 ::: siphon_sdk.testing.SipTestHarness.set_inbound_limit
 
+## Headers on siphon's own responses: `headers=`
+
+`call.progress()`, `call.answer()` and `call.reject()` send the caller a
+response siphon builds itself, with no B-leg response behind it for a header
+policy to shape. Each takes `headers=`, a `{name: value}` mapping put on that
+response last, replacing anything siphon put there first (`Server`, say). The
+typical use is an announcement or early-media server telling the caller's
+network to pass the media its 183 opens (RFC 5009 §8):
+
+```python
+from siphon import b2bua, rtpengine
+
+@b2bua.on_invite
+async def announce(call):
+    sdp = await rtpengine.answer_local(call, profile="announcement")
+    call.progress(183, "Session Progress", body=sdp,
+                  content_type="application/sdp",
+                  headers={"P-Early-Media": "sendrecv"})
+    await rtpengine.play_media(call, file="/prompts/closed.wav")
+    call.reject(480, "Temporarily Unavailable",
+                headers={"Reason": "SIP;cause=480", "Retry-After": "3600"})
+```
+
+A header siphon owns on the response raises `ValueError` naming it, and nothing
+is sent:
+
+| Headers | Why they are siphon's |
+|---|---|
+| Via, From, To, Call-ID, CSeq | copied from the INVITE, To with the dialog's tag (RFC 3261 §8.2.6.2) |
+| Contact, Record-Route, Route, Max-Forwards | the caller's remote target and route set (§12.1.1) |
+| Content-Length, Content-Type | the body framing; pass `content_type=` |
+| RSeq, RAck, Require, Supported | `100rel`: a provisional to a caller that asked for it goes out reliably on siphon's `RSeq` (RFC 3262 §3) |
+| Session-Expires, Min-SE | the session timer siphon negotiates on the 2xx (RFC 4028 §9) |
+
+Compact forms (`k`, `m`, `l`, ...) count as their long names, and a value with
+a line break or NUL is refused too. The control plane's `answer`, `ring`,
+`progress` and `reject` verbs take the same `headers` object with the same
+rules ([control plane](control-plane.md)).
+
 ## `MediaHandle`
 
 Returned by `call.media` — controls RTP anchoring for the call.

@@ -28,9 +28,13 @@ pub enum FailureDecision {
     /// No decision, or `call.terminate()`: end the call with the failure it
     /// ended on, as siphon always has.
     EndWithFailure,
-    /// `call.reject(code, reason)`: end the call with this response instead of
-    /// the one the failure produced.
-    Reject { code: u16, reason: String },
+    /// `call.reject(code, reason, headers=…)`: end the call with this response
+    /// instead of the one the failure produced.
+    Reject {
+        code: u16,
+        reason: String,
+        headers: Vec<(String, String)>,
+    },
     /// `call.dial()`, `call.fork()` or `call.route()`: route the call again.
     Reroute(CallAction),
     /// `call.handover(app)`: hand the still-unanswered call to a control app.
@@ -63,9 +67,15 @@ pub fn classify_failure_action(
             action,
             why: "a call siphon placed has no caller to answer and nothing to route again",
         },
-        CallAction::Reject { code, reason } if (300..700).contains(&code) => {
-            FailureDecision::Reject { code, reason }
-        }
+        CallAction::Reject {
+            code,
+            reason,
+            headers,
+        } if (300..700).contains(&code) => FailureDecision::Reject {
+            code,
+            reason,
+            headers,
+        },
         action @ CallAction::Reject { .. } => FailureDecision::Inapplicable {
             action,
             why: "call.reject() from on_failure needs a 3xx-6xx status",
@@ -102,8 +112,14 @@ pub enum FailedCallEnd<'a> {
         message: &'a mut SipMessage,
         snapshot: &'a BLegResponseSnapshot,
     },
-    /// A final response siphon builds for the caller from its own INVITE.
-    Local { status_code: u16, reason: String },
+    /// A final response siphon builds for the caller from its own INVITE, with
+    /// the script's own `headers` on it (`call.reject(headers=…)` from
+    /// `@b2bua.on_failure`; empty everywhere else).
+    Local {
+        status_code: u16,
+        reason: String,
+        headers: Vec<(String, String)>,
+    },
     /// A refusal of the caller's own request that siphon has already built, with
     /// the headers only that refusal carries: a 422 (Session Interval Too Small)
     /// and its `Min-SE` (RFC 4028 §9). Sent as it is.
@@ -125,6 +141,7 @@ impl FailedCallEnd<'_> {
             FailedCallEnd::Local {
                 status_code,
                 reason,
+                ..
             } => return (*status_code, reason.clone()),
             FailedCallEnd::BadExtension { unsupported } => {
                 let (status_code, reason) = unhonoured_tags_response(unsupported);
@@ -253,7 +270,11 @@ pub fn conclude_failed_call(call_id: &str, end: FailedCallEnd<'_>, state: &Dispa
 
     match classify_failure_action(action, false, reroutes) {
         FailureDecision::EndWithFailure => end_failed_call(call_id, end, state),
-        FailureDecision::Reject { code, reason } => {
+        FailureDecision::Reject {
+            code,
+            reason,
+            headers,
+        } => {
             info!(
                 call_id = %call_id,
                 failed_with = status_code,
@@ -265,6 +286,7 @@ pub fn conclude_failed_call(call_id: &str, end: FailedCallEnd<'_>, state: &Dispa
                 FailedCallEnd::Local {
                     status_code: code,
                     reason,
+                    headers,
                 },
                 state,
             );
@@ -408,8 +430,9 @@ pub fn end_failed_call(call_id: &str, end: FailedCallEnd<'_>, state: &Dispatcher
         FailedCallEnd::Local {
             status_code,
             reason,
+            headers,
         } => {
-            if let Some(response) = a_leg_final_response(
+            if let Some(mut response) = a_leg_final_response(
                 call_id,
                 &a_leg,
                 a_leg_invite.as_ref(),
@@ -417,6 +440,7 @@ pub fn end_failed_call(call_id: &str, end: FailedCallEnd<'_>, state: &Dispatcher
                 &reason,
                 state,
             ) {
+                crate::b2bua::uas_headers::apply(&mut response, &headers);
                 // From the listener the A-leg INVITE arrived on, so a multi-homed
                 // UDP host answers on the port it received on.
                 send_message_from(
@@ -486,6 +510,7 @@ pub fn end_call_without_rerouting(call_id: &str, status_code: u16, state: &Dispa
         FailedCallEnd::Local {
             status_code,
             reason: best_error_reason(status_code).to_string(),
+            headers: Vec::new(),
         },
         state,
     );
@@ -679,6 +704,7 @@ mod tests {
             CallAction::Reject {
                 code: 480,
                 reason: "Temporarily Unavailable".to_string(),
+                headers: Vec::new(),
             },
             false,
             0,
@@ -687,7 +713,8 @@ mod tests {
             decision,
             FailureDecision::Reject {
                 code: 480,
-                reason: "Temporarily Unavailable".to_string()
+                reason: "Temporarily Unavailable".to_string(),
+                headers: Vec::new(),
             }
         );
     }
@@ -701,6 +728,7 @@ mod tests {
                 CallAction::Reject {
                     code,
                     reason: "Not A Failure".to_string(),
+                    headers: Vec::new(),
                 },
                 false,
                 0,
@@ -766,7 +794,8 @@ mod tests {
             classify_failure_action(
                 CallAction::Reject {
                     code: 486,
-                    reason: "Busy Here".to_string()
+                    reason: "Busy Here".to_string(),
+                    headers: Vec::new(),
                 },
                 true,
                 0

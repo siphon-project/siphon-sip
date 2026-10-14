@@ -15,6 +15,21 @@ entry, but a working config keeps working.
 
 ### Added
 
+- **`headers=` on `call.progress()`, `call.answer()` and `call.reject()`.** A
+  response siphon sends the caller itself could carry only a body: an
+  announcement server had no way to put `P-Early-Media` (RFC 5009) on the 183
+  that plays its prompt, and a reject could not say `Reason` or `Retry-After`.
+  Each now takes a `{name: value}` mapping, e.g. `call.progress(183, "Session
+  Progress", body=sdp, content_type="application/sdp",
+  headers={"P-Early-Media": "sendrecv"})`, applied last over what siphon put
+  there. The headers siphon owns on such a response (Via, From, To, Call-ID,
+  CSeq, Contact, Record-Route, Route, Max-Forwards, Content-Length,
+  Content-Type, RSeq, RAck, Require, Supported, Session-Expires, Min-SE) raise
+  `ValueError` naming the header, so a reliable provisional keeps siphon's
+  `100rel`. Works from `@b2bua.on_failure` too. The control plane's `answer`,
+  `ring`, `progress` and `reject` verbs take the same `headers` object and
+  refuse the same names with `bad_request`. Mirrored in the SDK mock.
+
 - **`rtpengine.conference_join` and its siblings: a script can seat calls in
   a siphon-rtp mixing room.** siphon-rtp has an N-party mixer, but nothing in
   the `rtpengine` namespace reached it, so a conference focus (RFC 4579) had no

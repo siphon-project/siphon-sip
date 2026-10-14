@@ -51,6 +51,7 @@ impl CallHandlerOutcome {
             action: CallAction::Reject {
                 code: 500,
                 reason: "Script Error".to_string(),
+                headers: Vec::new(),
             },
             ..Self::default()
         }
@@ -849,7 +850,11 @@ pub fn handle_b2bua_invite(inbound: InboundMessage, message: SipMessage, state: 
             state.call_actors.remove_call(&call_id);
             state.call_event_receivers.remove(&call_id);
         }
-        CallAction::Reject { code, reason } => {
+        CallAction::Reject {
+            code,
+            reason,
+            headers,
+        } => {
             debug!(call_id = %call_id, code, "B2BUA: rejecting call");
             let Ok(message_guard) = message_arc.lock() else {
                 error!("message_arc lock poisoned in B2BUA invite handler");
@@ -887,6 +892,7 @@ pub fn handle_b2bua_invite(inbound: InboundMessage, message: SipMessage, state: 
                     &local_tag,
                 );
             }
+            crate::b2bua::uas_headers::apply(&mut response, &headers);
             send_message_from(
                 response,
                 inbound.transport,
@@ -1244,6 +1250,7 @@ pub fn b2bua_fail_undialed_call(
         FailedCallEnd::Local {
             status_code,
             reason: reason.to_string(),
+            headers: Vec::new(),
         },
         state,
     );

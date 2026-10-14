@@ -179,6 +179,7 @@ async fn an_answer_siphon_gives_itself_refuses_an_interval_below_its_minimum() {
         Some(endpoint_sdp("203.0.113.70").into_bytes()),
         Some("application/sdp"),
         true,
+        &[],
     );
 
     assert!(!answered, "the refused answer was reported as sent");

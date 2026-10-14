@@ -570,6 +570,7 @@ pub fn b2bua_fail_after_answer(
         FailedCallEnd::Local {
             status_code: STATUS,
             reason: best_error_reason(STATUS).to_string(),
+            headers: Vec::new(),
         },
         state,
     );

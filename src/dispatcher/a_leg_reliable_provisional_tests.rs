@@ -17,13 +17,13 @@ use super::*;
 use std::time::{Duration, Instant};
 
 pub(super) const CALLEE: &str = "198.51.100.7:5060";
-const CALLER: &str = "192.0.2.10:5060";
+pub(super) const CALLER: &str = "192.0.2.10:5060";
 const SIP_CALL_ID: &str = "a-leg-100rel@192.0.2.10";
 
 /// The caller offers `100rel`.
 pub(super) const SUPPORTS: &str = "Supported: 100rel, timer\r\n";
 /// The caller requires `100rel`.
-const REQUIRES: &str = "Supported: timer\r\nRequire: 100rel\r\n";
+pub(super) const REQUIRES: &str = "Supported: timer\r\nRequire: 100rel\r\n";
 /// The caller knows nothing of `100rel`.
 pub(super) const PLAIN: &str = "Supported: timer\r\n";
 
@@ -34,7 +34,7 @@ const PRESETS: [&str; 4] = [
     "sip-trunk-edge@2026",
 ];
 
-const CALLER_SDP: &str = concat!(
+pub(super) const CALLER_SDP: &str = concat!(
     "v=0\r\n",
     "o=- 1 1 IN IP4 192.0.2.10\r\n",
     "s=-\r\n",
@@ -56,7 +56,7 @@ pub(super) const CALLEE_SDP: &str = concat!(
 pub(super) const RELIABLY: &[(&str, &str)] = &[("Require", "100rel"), ("RSeq", "42")];
 
 /// The caller's INVITE, offering [`CALLER_SDP`] when `offers`.
-fn caller_invite(capability: &str, offers: bool) -> String {
+pub(super) fn caller_invite(capability: &str, offers: bool) -> String {
     let sdp = if offers { CALLER_SDP } else { "" };
     format!(
         concat!(
@@ -132,7 +132,7 @@ pub(super) struct Call {
     pub(super) state: Arc<DispatcherState>,
     udp: flume::Receiver<OutboundMessage>,
     pub(super) call_id: String,
-    invite: SipMessage,
+    pub(super) invite: SipMessage,
     pub(super) callee_invite: SipMessage,
 }
 
@@ -397,7 +397,7 @@ impl Call {
 
 /// Everything siphon put on the wire, in order, the frames of an ordered group
 /// (a response and what it released, an ACK and its BYE) included.
-fn drain(udp: &flume::Receiver<OutboundMessage>) -> Vec<Sent> {
+pub(super) fn drain(udp: &flume::Receiver<OutboundMessage>) -> Vec<Sent> {
     let mut sent = Vec::new();
     while let Ok(outbound) = udp.try_recv() {
         let frames = std::iter::once(outbound.data).chain(outbound.followups.unwrap_or_default());
@@ -749,6 +749,7 @@ async fn a_uas_provisional_is_reliable_toward_a_caller_that_requires_100rel() {
         Some(CALLER_SDP.as_bytes().to_vec()),
         Some("application/sdp"),
         false,
+        &[]
     ));
     let progress = only(call.to_caller(), 183);
     assert!(is_reliable(&progress));
@@ -762,6 +763,7 @@ async fn a_uas_provisional_is_reliable_toward_a_caller_that_requires_100rel() {
         Some(CALLER_SDP.as_bytes().to_vec()),
         Some("application/sdp"),
         true,
+        &[]
     ));
     assert_eq!(
         statuses(&call.to_caller()),
@@ -896,6 +898,7 @@ async fn siphons_own_18x_with_sdp_is_reliable_toward_a_caller_that_supports_100r
         None,
         None,
         false,
+        &[]
     ));
     assert!(!is_reliable(&only(call.to_caller(), 180)));
 
@@ -908,6 +911,7 @@ async fn siphons_own_18x_with_sdp_is_reliable_toward_a_caller_that_supports_100r
         Some(CALLER_SDP.as_bytes().to_vec()),
         Some("application/sdp"),
         false,
+        &[]
     ));
     assert!(is_reliable(&only(call.to_caller(), 183)));
 }

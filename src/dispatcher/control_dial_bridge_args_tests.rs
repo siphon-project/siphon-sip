@@ -107,6 +107,7 @@ async fn a_bridge_dial_needs_an_answered_anchored_caller() {
         "OK",
         None,
         None,
+        &[],
         state
     ));
     drain(&controller.dispatcher.udp);

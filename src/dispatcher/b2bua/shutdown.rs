@@ -103,7 +103,7 @@ pub(crate) fn tear_down_calls_in(state: &DispatcherState) -> TeardownReport {
                 // 503 is what the drain already answers a new INVITE with, so a
                 // caller that dialled during the drain and one whose ring the
                 // deadline cut short hear the same story.
-                if b2bua_reject_call_in(state, &call_id, 503, "Service Unavailable") {
+                if b2bua_reject_call_in(state, &call_id, 503, "Service Unavailable", &[]) {
                     report.rejected += 1;
                 } else {
                     report.already_ending += 1;

@@ -118,6 +118,7 @@ fn siphon_answers(dispatcher: &TestDispatcher, call_id: &str, invite: &SipMessag
         Some(endpoint_sdp("203.0.113.70").into_bytes()),
         Some("application/sdp"),
         true,
+        &[]
     ));
     response_to(&wire(dispatcher), CALLER, 200)
 }
