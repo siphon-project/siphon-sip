@@ -530,12 +530,22 @@ pub fn b2bua_fail_after_answer(
     response: &SipMessage,
     state: &DispatcherState,
 ) {
-    const STATUS: u16 = 500;
+    b2bua_fail_after_answer_with(call_id, cause, branch, response, 500, state);
+}
 
+/// [`b2bua_fail_after_answer`], concluding the call with `status` instead.
+pub fn b2bua_fail_after_answer_with(
+    call_id: &str,
+    cause: &str,
+    branch: &str,
+    response: &SipMessage,
+    status: u16,
+    state: &DispatcherState,
+) {
     error!(
         call_id = %call_id,
         cause = %cause,
-        "B2BUA: failing a call whose B-leg answered — the answered B-leg is released and the call concludes as a {STATUS}"
+        "B2BUA: failing a call whose B-leg answered — the answered B-leg is released and the call concludes as a {status}"
     );
 
     // Release the answered B-leg dialog. The leg is re-read here rather than
@@ -562,14 +572,14 @@ pub fn b2bua_fail_after_answer(
     // brought the call here, so neither has anything to take back.
     state
         .call_actors
-        .rewind_failed_answer_on(call_id, branch, STATUS);
+        .rewind_failed_answer_on(call_id, branch, status);
     cdr_clear_b2bua_answer(state, call_id);
 
     conclude_failed_call(
         call_id,
         FailedCallEnd::Local {
-            status_code: STATUS,
-            reason: best_error_reason(STATUS).to_string(),
+            status_code: status,
+            reason: best_error_reason(status).to_string(),
             headers: Vec::new(),
         },
         state,

@@ -253,6 +253,10 @@ pub fn conclude_failed_call(call_id: &str, end: FailedCallEnd<'_>, state: &Dispa
         }
     };
     let (status_code, reason) = end.status_and_reason();
+    // The dial is over without the caller connected: a far leg grown behind its
+    // early answer goes, so `@b2bua.on_failure` finds the caller on the engine's
+    // pipeline again, ready for another prompt or another dial.
+    super::release_far_leg_of(state, call_id);
     let mut outcome = run_b2bua_failure_handlers(call_id, status_code, &reason, state);
     let action = std::mem::take(&mut outcome.action);
 

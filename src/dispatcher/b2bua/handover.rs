@@ -311,12 +311,16 @@ pub fn anchor_a_leg(
             bridge_sides: None,
             created_at: std::time::Instant::now(),
         });
+        // A WebSocket takeover is its own far side; nothing can be dialled behind it.
+        if plan.flags.ws_uri.is_none() {
+            sessions.record_local_answer(&plan.media_call_id, &answer_sdp);
+        }
     }
 
-    Ok(crate::b2bua::actor::EarlyMediaAnchor {
-        answer_sdp,
-        profile: plan.profile_name,
-    })
+    let takeover = plan.flags.ws_uri.is_some();
+    let mut anchor = crate::b2bua::actor::EarlyMediaAnchor::engine(answer_sdp, plan.profile_name);
+    anchor.engine = !takeover;
+    Ok(anchor)
 }
 
 /// Open early media through the engine: anchor the A-leg (or reuse the anchor

@@ -39,6 +39,21 @@ class TestCallAnswerProgress:
         assert action.status_code == 183
         assert action.extras["body"] == b"v=0\r\n"
 
+    def test_progress_anchor_records_the_engine_answer_request(self):
+        call = Call()
+        call.progress(183, "Session Progress", anchor=True, profile="announcement",
+                      headers={"P-Early-Media": "sendrecv"})
+        extras = call._actions[-1].extras
+        assert extras["anchor"] is True
+        assert extras["profile"] == "announcement"
+        assert extras["body"] is None
+        assert call.state != "answered"
+
+    def test_progress_anchor_takes_no_body(self):
+        call = Call()
+        with pytest.raises(ValueError):
+            call.progress(183, "Session Progress", body=b"v=0\r\n", anchor=True)
+
     def test_progress_rejects_non_1xx(self):
         call = Call()
         with pytest.raises(ValueError):

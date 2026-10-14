@@ -108,6 +108,20 @@ pub fn b_leg_provisional(
                 report_control_dial_failure(call_id, 503, "Media negotiation failed", false, state);
                 return;
             }
+            // Behind siphon's own early answer, the callee's first SDP is the far
+            // leg's answer. One the engine refuses connects nothing, and the
+            // caller stays on the engine's pipeline until the callee's 2xx says
+            // whether it means it.
+            if let Some(invite_arc) = &snapshot.a_leg_invite {
+                let invite = invite_arc.lock().ok().map(|guard| guard.clone());
+                if let Some(invite) = invite {
+                    if let Err(error) =
+                        super::super::complete_far_leg(state, call_id, &invite, message)
+                    {
+                        warn!(%call_id, %error, "B2BUA: the callee's early SDP did not complete the far leg");
+                    }
+                }
+            }
         }
         // Headers the script hooks set or removed on the response, which reach
         // the caller as the script left them, and what they decided the caller
@@ -172,6 +186,9 @@ pub fn b_leg_provisional(
         // `media.sdp_strip_attributes`, after `@b2bua.on_early_media` had the
         // media engine rewrite the early media SDP.
         strip_relayed_sdp_attributes(message, state);
+        // Behind siphon's own early answer the caller is shown that answer again,
+        // never the callee's (RFC 3261 §13.2.1).
+        super::super::present_held_answer(state, call_id, message, false);
         // The early media answer as the caller receives it, which is the session
         // description in force on the caller's dialog when this leg's 2xx carries
         // none. One a script keeps from the caller is recorded as the caller

@@ -495,10 +495,10 @@ pub struct CallActor {
     /// it the callee's offer stays unanswered. `None` until the 2xx is answered,
     /// and for every call whose INVITE carried the offer.
     pub originate_answer_sdp: Option<String>,
-    /// The media anchor an early-media response opened on the A-leg, and the
-    /// SDP answer that response carried. The 2xx that follows repeats that
-    /// answer (RFC 3264 §4) instead of anchoring again. `None` until a
-    /// controller sends an anchored `progress`.
+    /// The SDP answer siphon's own 18x gave the caller, and whether the media
+    /// engine anchors it. The 2xx that follows repeats that answer (RFC 3264
+    /// §4), and a dial connects the callee behind it. `None` until siphon sends
+    /// an 18x with SDP of its own.
     pub early_media_anchor: Option<EarlyMediaAnchor>,
     /// This call's half of a bridge with another call this process owns, set
     /// while a `bridge` is forming and for as long as it holds. Mirrored on the
@@ -546,18 +546,6 @@ pub struct OriginateAnchor {
     pub profile: String,
     /// Per-call WebSocket bridge URI (templated), overriding the profile's.
     pub ws_uri: Option<String>,
-}
-/// Early media anchored on the media engine: the SDP answer siphon already sent
-/// the caller in an 18x, kept so the 2xx can repeat it.
-///
-/// Holds the SDP text rather than engine flags, like [`OriginateAnchor`], so the
-/// actor layer stays free of media types.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EarlyMediaAnchor {
-    /// The engine's SDP answer, exactly as the early response carried it.
-    pub answer_sdp: String,
-    /// The media profile the anchor was made with.
-    pub profile: String,
 }
 impl CallActor {
     /// Whether one of this call's legs carries the dialog `sip_call_id`. A
