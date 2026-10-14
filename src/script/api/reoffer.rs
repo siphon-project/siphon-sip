@@ -173,12 +173,12 @@ impl PyReoffer {
     /// Raises ``ValueError`` for a code outside 300-699, and ``RuntimeError``
     /// in ``@b2bua.on_reoffer_answered``.
     ///
-    /// Example::
-    ///
-    ///     @b2bua.on_reoffer
-    ///     def no_video(call, offer):
-    ///         if offer.sdp and "m=video" in offer.sdp:
-    ///             offer.reject(488, "Not Acceptable Here")
+    /// ```python
+    /// @b2bua.on_reoffer
+    /// def no_video(call, offer):
+    ///     if offer.sdp and "m=video" in offer.sdp:
+    ///         offer.reject(488, "Not Acceptable Here")
+    /// ```
     fn reject(&mut self, code: u16, reason: &str) -> PyResult<()> {
         self.still_open("reject")?;
         if !(300..=699).contains(&code) {
@@ -213,12 +213,12 @@ impl PyReoffer {
     ///
     /// Raises ``RuntimeError`` in ``@b2bua.on_reoffer_answered``.
     ///
-    /// Example::
-    ///
-    ///     @b2bua.on_reoffer
-    ///     def hold(call, offer):
-    ///         if offer.kind == "hold":
-    ///             offer.answer()
+    /// ```python
+    /// @b2bua.on_reoffer
+    /// def hold(call, offer):
+    ///     if offer.kind == "hold":
+    ///         offer.answer()
+    /// ```
     #[pyo3(signature = (sdp=None))]
     fn answer(&mut self, sdp: Option<String>) -> PyResult<()> {
         self.still_open("answer")?;
