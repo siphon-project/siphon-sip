@@ -157,14 +157,16 @@ fn the_public_surface_is_pinned() {
     // crate-internal `proxy_release_call` `proxy.release` ends a session the
     // proxy Record-Routed through, plus the 2
     // crate-internal entry points `call.accept_refer(mode="script")` and
-    // `b2bua.complete_refer()` reach the same subscription through.
+    // `b2bua.complete_refer()` reach the same subscription through, plus the
+    // crate-internal `b2bua_set_local_contact` `call.answer(contact=…)` names
+    // the caller's dialog's Contact through.
     // All additive, so a minor-compatible change — recorded here because that
     // is the tripwire.
     assert_eq!(
         declared + re_exported,
-        92,
+        93,
         "the dispatcher's public surface is {} items ({declared} declared here, \
-         {re_exported} re-exported), not 92. Adding one is a semver commitment on a \
+         {re_exported} re-exported), not 93. Adding one is a semver commitment on a \
          published crate; removing one breaks embedders. An extraction should move the \
          declaration and add a `pub use`, leaving this total unchanged.",
         declared + re_exported,

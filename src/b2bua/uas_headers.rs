@@ -109,6 +109,127 @@ pub fn validate(headers: &[(String, String)]) -> Result<(), String> {
     Ok(())
 }
 
+/// The Contact a script names for the caller's dialog when siphon answers it
+/// itself (`call.answer(contact=…, contact_params=…)`), as the header value
+/// siphon advertises from then on: `<uri>;param;param`.
+///
+/// The Contact stays siphon's to build, so a script hands over the URI and the
+/// parameters, never the header. The typical use is a conference focus, which
+/// puts the conference URI in the Contact of its 2xx with the `isfocus`
+/// feature parameter (RFC 4579 §5.1, RFC 3840 §9): the caller learns the URI
+/// of the conference it created there (§5.2).
+///
+/// `uri` must be a whole SIP or SIPS URI (RFC 3261 §8.1.1.8: the Contact of a
+/// dialog is one). `params` are `contact-params` of RFC 3261 §25.1, each a
+/// `generic-param` (`token [ "=" ( token / host / quoted-string ) ]`), with or
+/// without a leading `;`. `Err` says what is wrong.
+pub fn script_contact(uri: &str, params: Option<&str>) -> Result<String, String> {
+    if uri.bytes().any(|byte| matches!(byte, b'\r' | b'\n' | 0)) {
+        return Err("the contact URI contains a line break or NUL".to_string());
+    }
+    if uri.contains(['<', '>', ' ', '\t']) {
+        return Err(format!(
+            "{uri:?} is not a bare URI: pass the URI alone and its header parameters as contact_params="
+        ));
+    }
+    let parsed = crate::sip::parser::parse_uri_complete(uri)?;
+    if !matches!(
+        parsed.scheme,
+        crate::sip::uri::Scheme::Sip | crate::sip::uri::Scheme::Sips
+    ) {
+        return Err(format!(
+            "{uri:?} is not a SIP or SIPS URI, which the Contact of a dialog is (RFC 3261 §8.1.1.8)"
+        ));
+    }
+    let mut value = format!("<{uri}>");
+    let params = params.map(str::trim).unwrap_or_default();
+    let params = params.strip_prefix(';').unwrap_or(params);
+    if params.is_empty() {
+        return Ok(value);
+    }
+    for param in split_params(params)? {
+        check_generic_param(param)?;
+        value.push(';');
+        value.push_str(param);
+    }
+    Ok(value)
+}
+
+/// `params` cut at the `;` outside a quoted string.
+fn split_params(params: &str) -> Result<Vec<&str>, String> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut quoted = false;
+    let mut escaped = false;
+    for (index, character) in params.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match character {
+            '\\' if quoted => escaped = true,
+            '"' => quoted = !quoted,
+            ';' if !quoted => {
+                parts.push(params[start..index].trim());
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    if quoted {
+        return Err(format!("an unterminated quoted string in {params:?}"));
+    }
+    parts.push(params[start..].trim());
+    Ok(parts)
+}
+
+/// RFC 3261 §25.1 `generic-param`.
+fn check_generic_param(param: &str) -> Result<(), String> {
+    if param.bytes().any(|byte| matches!(byte, b'\r' | b'\n' | 0)) {
+        return Err("a contact parameter contains a line break or NUL".to_string());
+    }
+    let (name, value) = match param.split_once('=') {
+        Some((name, value)) => (name.trim(), Some(value.trim())),
+        None => (param, None),
+    };
+    if !is_token(name) {
+        return Err(format!("{param:?} is not a contact parameter"));
+    }
+    let Some(value) = value else {
+        return Ok(());
+    };
+    let well_formed = if let Some(inner) = value
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+    {
+        // A quoted string: every '"' inside is escaped (§25.1 quoted-pair).
+        let mut escaped = false;
+        inner.chars().all(|character| {
+            if escaped {
+                escaped = false;
+                true
+            } else if character == '\\' {
+                escaped = true;
+                true
+            } else {
+                character != '"'
+            }
+        }) && !escaped
+    } else {
+        // A token, or a host (an IPv6 reference has brackets and colons).
+        !value.is_empty()
+            && (is_token(value)
+                || value.bytes().all(|byte| {
+                    byte.is_ascii_hexdigit() || matches!(byte, b'[' | b']' | b':' | b'.')
+                }))
+    };
+    if well_formed {
+        Ok(())
+    } else {
+        Err(format!("{param:?} is not a contact parameter"))
+    }
+}
+
 /// Put the script's `headers` on `response`, each replacing any header of the
 /// same name the framework put there first (`Server`, say). Run after
 /// [`validate`], on a response siphon has otherwise finished building.
@@ -248,5 +369,78 @@ mod tests {
             response.headers.get("P-Early-Media").map(String::as_str),
             Some("sendrecv")
         );
+    }
+
+    #[test]
+    fn a_focus_contact_is_the_uri_in_brackets_with_isfocus() {
+        assert_eq!(
+            script_contact("sip:conf-7@conf.example.com", Some("isfocus")).as_deref(),
+            Ok("<sip:conf-7@conf.example.com>;isfocus")
+        );
+        assert_eq!(
+            script_contact("sip:conf-7@192.0.2.1:5060;transport=tcp", Some(";isfocus")).as_deref(),
+            Ok("<sip:conf-7@192.0.2.1:5060;transport=tcp>;isfocus")
+        );
+    }
+
+    #[test]
+    fn a_contact_without_params_is_the_uri_in_brackets() {
+        for params in [None, Some(""), Some(";"), Some("  ")] {
+            assert_eq!(
+                script_contact("sips:room@example.com", params).as_deref(),
+                Ok("<sips:room@example.com>")
+            );
+        }
+    }
+
+    #[test]
+    fn several_params_and_a_quoted_feature_value_are_kept() {
+        assert_eq!(
+            script_contact(
+                "sip:conf-7@conf.example.com",
+                Some("isfocus;+sip.instance=\"<urn:uuid:00000000-0000-0000-0000-000000000001>\";expires=60")
+            )
+            .as_deref(),
+            Ok("<sip:conf-7@conf.example.com>;isfocus;+sip.instance=\"<urn:uuid:00000000-0000-0000-0000-000000000001>\";expires=60")
+        );
+        assert_eq!(
+            script_contact("sip:a@example.com", Some("received=[2001:db8::1]")).as_deref(),
+            Ok("<sip:a@example.com>;received=[2001:db8::1]")
+        );
+    }
+
+    #[test]
+    fn a_contact_uri_that_is_not_a_whole_sip_uri_is_refused() {
+        for uri in [
+            "",
+            "tel:+15550100",
+            "<sip:conf-7@conf.example.com>",
+            "sip:conf-7@conf.example.com>;isfocus",
+            "sip:conf-7@conf.example.com garbage",
+            "sip:conf-7@conf.example.com\r\nVia: x",
+        ] {
+            assert!(
+                script_contact(uri, None).is_err(),
+                "{uri:?} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn a_param_that_is_not_a_generic_param_is_refused() {
+        for params in [
+            "isfocus\r\nVia: SIP/2.0/UDP 192.0.2.1",
+            "bad name",
+            "a=",
+            ";;",
+            "x=\"unterminated",
+            "x=\"a\"b\"",
+            "x=<sip:a@example.com>",
+        ] {
+            assert!(
+                script_contact("sip:conf-7@conf.example.com", Some(params)).is_err(),
+                "{params:?} must be refused"
+            );
+        }
     }
 }

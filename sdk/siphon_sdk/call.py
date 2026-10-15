@@ -8,6 +8,7 @@ Passed to ``@b2bua.on_invite``, ``@b2bua.on_early_media``,
 from __future__ import annotations
 
 import ipaddress
+import re
 import uuid
 from typing import Any, Optional, Union
 
@@ -80,6 +81,37 @@ def _uas_response_headers(method: str,
                 f"{method}(headers=…): the value of {name} contains a line break or NUL"
             )
     return dict(headers)
+
+
+_CONTACT_PARAM = re.compile(
+    r"""^[A-Za-z0-9.!%*_+`'~-]+(=([A-Za-z0-9.!%*_+`'~-]+|\[?[0-9A-Fa-f:.]+\]?|"([^"\\]|\\.)*"))?$"""
+)
+
+
+def _uas_contact(method: str, contact: Optional[str],
+                 contact_params: Optional[str]) -> Optional[str]:
+    """Check the ``contact=`` / ``contact_params=`` of ``progress()`` /
+    ``answer()`` the way siphon does, and return the Contact header value
+    siphon advertises (``<uri>;param``), or ``None``."""
+    if contact is None:
+        if contact_params is not None:
+            raise ValueError(f"{method}(contact_params=…) needs contact=, the URI they go with")
+        return None
+    if (any(character in contact for character in "\r\n\0<> \t")
+            or not contact.lower().startswith(("sip:", "sips:"))
+            or "@" in contact and not contact.split("@", 1)[1]):
+        raise ValueError(f"{method}(contact=…): {contact!r} is not a bare SIP or SIPS URI")
+    value = f"<{contact}>"
+    params = (contact_params or "").strip()
+    params = params[1:] if params.startswith(";") else params
+    if not params:
+        return value
+    for param in re.split(r';(?=(?:[^"]*"[^"]*")*[^"]*$)', params):
+        param = param.strip()
+        if not _CONTACT_PARAM.match(param):
+            raise ValueError(f"{method}(contact=…): {param!r} is not a contact parameter")
+        value += f";{param}"
+    return value
 
 
 class Call:
@@ -157,6 +189,11 @@ class Call:
         self._refer_side = refer_side
         self._contact_user_override: Optional[str] = None
         self._contact_override: Optional[str] = None
+        # The Contact siphon advertises to the caller when it answers the call
+        # itself, once ``answer(contact=…)`` / ``progress(contact=…)`` named
+        # one; ``None`` is siphon's own address. Kept for the dialog, as
+        # siphon keeps it.
+        self._local_contact: Optional[str] = None
         # Cap on how long the call may stay answered, from ``max_duration=`` on
         # dial/fork/route or from ``set_max_duration()``.  ``None`` inherits
         # ``b2bua.max_call_duration_secs``; ``0`` opts out of it.  Tests read it
@@ -627,7 +664,9 @@ class Call:
     def answer(self, code: int, reason: str,
                body: Union[str, bytes, None] = None,
                content_type: str | None = None,
-               headers: dict[str, str] | None = None) -> None:
+               headers: dict[str, str] | None = None,
+               contact: str | None = None,
+               contact_params: str | None = None) -> None:
         """UAS-mode answer — send a final 2xx response to the inbound INVITE
         **immediately**, without bridging to a B-leg.
 
@@ -654,6 +693,16 @@ class Call:
             content_type: Content-Type for the body (e.g. ``"application/sdp"``).
             headers: Optional ``{name: value}`` mapping added to the 2xx. The
                 headers siphon owns raise ``ValueError`` (see ``reject()``).
+            contact: Optional SIP or SIPS URI siphon advertises as its Contact
+                on this dialog instead of its own address: on this 2xx and on
+                every later request and response it sends the caller in the
+                dialog (RFC 3261 §12.1.1, the caller's remote target). A
+                conference focus puts the conference URI here (RFC 4579 §5.1),
+                which is where a caller that INVITEd the factory URI learns it
+                (§5.2). The URI must reach siphon: the caller's in-dialog
+                requests are sent to it, through the dialog's route set.
+            contact_params: Optional Contact header parameters for
+                ``contact``, e.g. ``"isfocus"`` (RFC 3840 feature parameters).
 
         Example::
 
@@ -663,6 +712,11 @@ class Call:
                 call.answer(200, "OK", body=call.body, content_type="application/sdp")
                 await rtpengine.play_media(call, file=prompt)   # 200 already sent
                 await rtpengine.echo(call)
+
+            # A conference focus answering its factory URI:
+            call.answer(200, "OK", body=sdp, content_type="application/sdp",
+                        contact=f"sip:{room}@conf.example.com",
+                        contact_params="isfocus")
         """
         if not 200 <= code < 300:
             raise ValueError(
@@ -670,21 +724,26 @@ class Call:
                 f"use call.reject() for failures (got {code})"
             )
         checked = _uas_response_headers("call.answer", headers)
+        local_contact = _uas_contact("call.answer", contact, contact_params)
         if isinstance(body, str):
             body = body.encode("utf-8")
+        if local_contact is not None:
+            self._local_contact = local_contact
         self._state = "answered"
         self._actions.append(Action(
             kind="answer",
             status_code=code,
             reason=reason,
             extras={"body": body, "content_type": content_type,
-                    "headers": checked},
+                    "headers": checked, "contact": self._local_contact},
         ))
 
     def progress(self, code: int, reason: str = "Ringing",
                  body: Union[str, bytes, None] = None,
                  content_type: str | None = None,
-                 headers: dict[str, str] | None = None) -> None:
+                 headers: dict[str, str] | None = None,
+                 contact: str | None = None,
+                 contact_params: str | None = None) -> None:
         """UAS-mode provisional — send a 1xx response to the inbound INVITE
         **immediately** (e.g. ``183 Session Progress`` with early-media SDP, or
         ``180 Ringing``). Does not answer the call: the handler must still
@@ -706,6 +765,10 @@ class Call:
                 announcement's 183. The headers siphon owns raise
                 ``ValueError`` (see ``reject()``): ``Require`` and ``RSeq``
                 stay siphon's.
+            contact: Optional SIP or SIPS URI siphon advertises as its Contact
+                on the early dialog and, unless ``answer()`` names another, on
+                the dialog after it (see ``answer()``).
+            contact_params: Optional Contact header parameters for ``contact``.
 
         Example::
 
@@ -720,14 +783,17 @@ class Call:
                 f"use call.answer() for the final response"
             )
         checked = _uas_response_headers("call.progress", headers)
+        local_contact = _uas_contact("call.progress", contact, contact_params)
         if isinstance(body, str):
             body = body.encode("utf-8")
+        if local_contact is not None:
+            self._local_contact = local_contact
         self._actions.append(Action(
             kind="progress",
             status_code=code,
             reason=reason,
             extras={"body": body, "content_type": content_type,
-                    "headers": checked},
+                    "headers": checked, "contact": self._local_contact},
         ))
 
     def handover(self, app: str, on_lost: str | None = None,

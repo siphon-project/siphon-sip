@@ -939,6 +939,19 @@ impl CallActorStore {
         }
     }
 
+    /// Replace the Contact siphon advertises to the caller, the local target of
+    /// the A-leg dialog (RFC 3261 §12.1.1). Every later response and request
+    /// siphon sends on that dialog carries it. `false` when the call is gone.
+    pub fn set_a_leg_local_contact(&self, call_id: &str, contact: String) -> bool {
+        match self.calls.get_mut(call_id) {
+            Some(mut call) => {
+                call.a_leg.dialog.local_contact = Some(contact);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Set transfer context.
     pub fn set_transfer(&self, call_id: &str, transfer: crate::b2bua::transfer::TransferContext) {
         if let Some(mut call) = self.calls.get_mut(call_id) {
