@@ -496,7 +496,7 @@ mod tests {
     #[test]
     fn a_non_invite_gives_up_at_the_configured_timer_f() {
         let store = B2buaRetransmits::new(TimerConfig {
-            timer_f_secs: std::num::NonZeroU32::new(5),
+            timer_f_secs: std::num::NonZeroU16::new(5),
             ..TimerConfig::default()
         });
         assert_eq!(store.non_invite_timeout(), Duration::from_secs(5));

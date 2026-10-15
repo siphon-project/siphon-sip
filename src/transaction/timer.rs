@@ -2,7 +2,7 @@
 //!
 //! All timer values are configurable but have RFC-defined defaults.
 
-use std::num::NonZeroU32;
+use std::num::NonZeroU16;
 use std::time::Duration;
 
 /// Default T1 value: round-trip-time estimate (500ms per RFC 3261).
@@ -48,8 +48,9 @@ pub struct TimerConfig {
     pub timer_c_secs: u32,
     /// Timer F (RFC 3261 §17.1.2.2), in seconds, where `transaction.timeout_secs`
     /// sets it; `None` is the RFC's 64*T1. See [`Self::timer_f`]. Seconds in
-    /// four bytes for the reason `timer_c_secs` is.
-    pub timer_f_secs: Option<NonZeroU32>,
+    /// two bytes, which fit the padding after `timer_c_secs`: anything wider
+    /// grows every transaction (`tests/transaction_footprint_tests.rs`).
+    pub timer_f_secs: Option<NonZeroU16>,
 }
 
 impl TimerConfig {
@@ -262,7 +263,7 @@ mod tests {
     fn a_configured_timer_f_replaces_64_times_t1() {
         for secs in [2, 5, 40] {
             let config = TimerConfig {
-                timer_f_secs: NonZeroU32::new(secs),
+                timer_f_secs: NonZeroU16::new(secs),
                 ..TimerConfig::default()
             };
             assert_eq!(config.timer_f(), Duration::from_secs(u64::from(secs)));

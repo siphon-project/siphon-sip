@@ -1873,7 +1873,7 @@ mod tests {
             })
         };
         let configured = TimerConfig {
-            timer_f_secs: std::num::NonZeroU32::new(5),
+            timer_f_secs: std::num::NonZeroU16::new(5),
             ..TimerConfig::default()
         };
         for transport in [Transport::Udp, Transport::Reliable] {

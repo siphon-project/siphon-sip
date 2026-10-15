@@ -500,6 +500,16 @@ pub async fn run(
             .unwrap_or(30)
             + 2,
     );
+    if tx_config
+        .and_then(|t| t.timeout_secs)
+        .is_some_and(|secs| secs > u32::from(u16::MAX))
+    {
+        warn!(
+            "transaction.timeout_secs is over {} s: non-INVITE transactions time out at {} s",
+            u16::MAX,
+            u16::MAX
+        );
+    }
     if tx_config.and_then(|t| t.timeout_secs) == Some(0) {
         warn!("transaction.timeout_secs is 0: ignored, non-INVITE transactions time out at Timer F's 64*T1 (32 s)");
     }

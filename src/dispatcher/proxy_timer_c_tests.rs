@@ -384,6 +384,14 @@ fn the_transaction_block_reaches_the_timers() {
         Duration::from_secs(32)
     );
 
+    // Past what two bytes of seconds hold, the most they hold.
+    let long: crate::config::TransactionConfig =
+        serde_yaml_ng::from_str("timeout_secs: 100000").expect("the block parses");
+    assert_eq!(
+        transaction_timers(Some(&long)).timer_f(),
+        Duration::from_secs(u64::from(u16::MAX))
+    );
+
     // A zero is no timeout at all, and is left to the default.
     let zero: crate::config::TransactionConfig =
         serde_yaml_ng::from_str("timeout_secs: 0").expect("the block parses");

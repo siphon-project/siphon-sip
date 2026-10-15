@@ -103,7 +103,11 @@ pub(super) fn transaction_timers(
         timers.auto_100_delay =
             std::time::Duration::from_millis(transaction.auto_emit_100_trying_delay_ms);
         timers.timer_c_secs = transaction.timer_c_secs;
-        timers.timer_f_secs = transaction.timeout_secs.and_then(std::num::NonZeroU32::new);
+        // Seconds in a u16: a longer timeout (over 18 hours) is held at the
+        // most it can say, which mod.rs warns about at startup.
+        timers.timer_f_secs = transaction
+            .timeout_secs
+            .and_then(|secs| std::num::NonZeroU16::new(u16::try_from(secs).unwrap_or(u16::MAX)));
     }
     timers
 }
