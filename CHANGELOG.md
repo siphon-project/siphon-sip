@@ -15,6 +15,23 @@ entry, but a working config keeps working.
 
 ### Added
 
+- **`proxy.enum_query`: ENUM that says what happened, follows delegation and
+  asks the ENUM servers you name.** `proxy.enum_lookup` returns one URI or
+  `None`, so a script could not tell "this number has no ENUM entry" from "the
+  ENUM service did not answer", could not fall back to the next record, and
+  only ever asked the node's resolver. `await proxy.enum_query(number,
+  service=..., servers=[...], timeout_ms=..., attempts=...)` returns an
+  `EnumAnswer` whose `outcome` is `ok`, `no_such_name`, `no_records`,
+  `no_usable_record`, `server_failure` or `timeout`, whose `uris` holds every
+  usable URI in ORDER / PREFERENCE sequence, and whose `records` say why each
+  other record was passed over. Non-terminal NAPTR records are followed
+  (RFC 6116 §5.2.1, RFC 3402 §3.3) with loop detection and a chain limit of
+  five. With `servers=` the query goes to those servers in order with its own
+  timeout and attempts, and a server that times out or refuses is held down
+  for the new `enum.server_hold_down_secs` (default 30). New metrics:
+  `siphon_enum_queries_total{outcome}`, `siphon_enum_server_up{server}`.
+  `enum_lookup` is unchanged.
+
 - **`diameter.cx_uar` and `diameter.cx_lir` return the Server-Capabilities the
   HSS sent.** Their dict has a new `server_capabilities` key: `None`, or
   `{"mandatory": [...], "optional": [...], "server_names": [...]}` in the order

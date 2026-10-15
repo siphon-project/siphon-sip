@@ -7,6 +7,8 @@
 //!    and fall back to A/AAAA on port 5060 if no SRV records exist.
 
 pub mod enum_naptr;
+pub mod enum_query;
+pub mod enum_servers;
 mod resolver;
 
 pub use resolver::SipResolver;

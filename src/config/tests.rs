@@ -5792,3 +5792,29 @@ fn an_spi_partition_too_small_or_too_large_is_refused() {
     }
     base_yaml("ipsec:\n  spi_range_count: 268435456\n").expect("2^28 is the largest partition");
 }
+
+/// `enum.server_hold_down_secs` defaults to 30 and loads when set.
+#[test]
+fn enum_server_hold_down_loads() {
+    assert_eq!(
+        crate::config::EnumConfig::default().server_hold_down_secs,
+        30
+    );
+    let config =
+        Config::from_str(&backend_yaml("enum:\n  server_hold_down_secs: 5\n")).expect("loads");
+    assert_eq!(
+        config
+            .enum_client
+            .expect("enum block")
+            .server_hold_down_secs,
+        5
+    );
+    let config = Config::from_str(&backend_yaml("enum: {}\n")).expect("loads");
+    assert_eq!(
+        config
+            .enum_client
+            .expect("enum block")
+            .server_hold_down_secs,
+        30
+    );
+}

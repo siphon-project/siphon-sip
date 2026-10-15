@@ -814,6 +814,8 @@ class MockProxyUtils:
         self._rate_limit_allow = True
         self._sanity_check_pass = True
         self._enum_results: dict[str, str] = {}
+        self._enum_answers: dict[str, "MockEnumAnswer"] = {}
+        self.enum_queries: list[dict] = []
         self._memory_pct = 25
 
     def rate_limit(self, request: Any, window_secs: float,
@@ -873,12 +875,138 @@ class MockProxyUtils:
         """
         return self._enum_results.get(number)
 
+    def set_enum_answer(self, number: str, outcome: str = "ok",
+                        uris: Optional[list[str]] = None,
+                        records: Optional[list[dict]] = None,
+                        server: Optional[str] = None) -> None:
+        """Test helper: what ``enum_query`` answers for ``number``."""
+        self._enum_answers[number] = MockEnumAnswer(outcome, uris or [], records or [], server)
+
+    def enum_query(self, number: str, suffix: str = "e164.arpa.",
+                   service: str = "E2U+sip", servers: Optional[list[str]] = None,
+                   timeout_ms: Optional[int] = None, attempts: Optional[int] = None,
+                   follow_non_terminal: bool = True) -> Any:
+        """Run an ENUM query (RFC 6116) and report what it came to. Awaitable;
+        resolves to an :class:`MockEnumAnswer` (``EnumAnswer``).
+
+        ``enum_lookup`` returns one URI or ``None`` and cannot tell "this
+        number has no ENUM entry" from "the ENUM service did not answer". This
+        does: ``answer.outcome`` is ``"ok"``, ``"no_such_name"`` (NXDOMAIN),
+        ``"no_records"`` (NODATA), ``"no_usable_record"``,
+        ``"server_failure"`` (SERVFAIL, REFUSED, no server reachable) or
+        ``"timeout"``, and ``answer.uris`` holds every usable URI in ORDER /
+        PREFERENCE sequence, so the caller can move on to the next when one
+        does not work (RFC 6116 section 5.2, RFC 3402 section 3.3).
+
+        A non-terminal record (empty Flags) names the next domain to ask in
+        its Replacement (RFC 6116 sections 3.4.2 and 5.2.1); with
+        ``follow_non_terminal`` (the default) that domain's records are walked
+        in its place, up to five in a chain, a loop back to a name already
+        asked ending the chain rather than the query.
+
+        Args:
+            number: the E.164 number; characters other than digits are ignored.
+            suffix: the ENUM domain (default ``"e164.arpa."``).
+            service: ``E2U+enumservice[+enumservice...]``, e.g.
+                ``"E2U+sip+pstn:tel"``; a record offering any of them qualifies.
+            servers: ENUM servers to ask instead of the node's resolver,
+                ``"ip"`` (port 53) or ``"ip:port"``, in order. The first that
+                answers wins; one that times out or answers with an error is
+                held down for ``enum.server_hold_down_secs`` (default 30) and
+                asked only after the others (``siphon_enum_server_up``).
+            timeout_ms: per attempt at one server (default 2000); needs
+                ``servers``.
+            attempts: per server (default 2); needs ``servers``.
+            follow_non_terminal: follow non-terminal records (default True).
+
+        Raises:
+            ValueError: the number holds no digit, ``service`` is not an E2U
+                field, ``servers`` is empty, or ``timeout_ms`` / ``attempts``
+                is given without ``servers``.
+
+        Example::
+
+            answer = await proxy.enum_query(
+                "+15550100106", service="E2U+sip+pstn:tel",
+                servers=["192.0.2.10:53", "192.0.2.20:53"], timeout_ms=500,
+            )
+            if answer.outcome in ("server_failure", "timeout"):
+                ...   # the ENUM service is down: retry or alarm
+            for uri in answer.uris:
+                ...   # try in turn
+
+        In the mock, the answer given to ``set_enum_answer()`` for the
+        number; else ``"ok"`` with the ``_enum_results`` URI for it, or
+        ``"no_such_name"``. Every call is recorded on ``enum_queries``.
+        """
+        if not any(character.isdigit() for character in number):
+            raise ValueError(f"proxy.enum_query: number {number!r} holds no digit")
+        tokens = service.split("+")
+        if "E2U" not in (tokens[0].upper(), tokens[-1].upper()) or len(tokens) < 2:
+            raise ValueError(
+                f"proxy.enum_query: service {service!r} is not an E2U service field"
+            )
+        if servers is not None and not servers:
+            raise ValueError(
+                "proxy.enum_query: servers is empty; pass None for the node's resolver"
+            )
+        if servers is None and (timeout_ms is not None or attempts is not None):
+            raise ValueError(
+                "proxy.enum_query: timeout_ms and attempts bound the servers= list"
+            )
+
+        async def _run() -> "MockEnumAnswer":
+            self.enum_queries.append({
+                "number": number, "suffix": suffix, "service": service,
+                "servers": servers, "timeout_ms": timeout_ms,
+                "attempts": attempts, "follow_non_terminal": follow_non_terminal,
+            })
+            if number in self._enum_answers:
+                return self._enum_answers[number]
+            uri = self._enum_results.get(number)
+            if uri is not None:
+                return MockEnumAnswer("ok", [uri], [], None)
+            return MockEnumAnswer("no_such_name", [], [], None)
+
+        return _run()
+
     def memory_used_pct(self) -> int:
         """Process RSS memory usage as percentage (0–100).
 
         In the mock, returns ``_memory_pct`` (default 25).
         """
         return self._memory_pct
+
+
+class MockEnumAnswer:
+    """The result of ``proxy.enum_query`` (``EnumAnswer``).
+
+    Attributes:
+        outcome: ``"ok"``, ``"no_such_name"`` (NXDOMAIN: the number has no
+            entry), ``"no_records"`` (NODATA), ``"no_usable_record"``,
+            ``"server_failure"`` or ``"timeout"``. The last two are failures
+            of the ENUM service, worth a retry or an alarm; the middle three
+            are answers.
+        uris: every usable URI, in ORDER / PREFERENCE sequence (RFC 6116
+            section 5.2). Try them in turn; the first is what ``enum_lookup``
+            would pick.
+        records: every record considered, as dicts with ``order``,
+            ``preference``, ``flags``, ``services``, ``regexp``,
+            ``replacement``, ``domain`` and ``rejected`` (``None``, or why it
+            gave no URI).
+        server: the server (``"ip:port"``) that answered, when ``servers=``
+            was given and one did; else ``None``.
+    """
+
+    def __init__(self, outcome: str, uris: list[str], records: list[dict],
+                 server: Optional[str]) -> None:
+        self.outcome = outcome
+        self.uris = list(uris)
+        self.records = list(records)
+        self.server = server
+
+    def __repr__(self) -> str:
+        return f"EnumAnswer(outcome={self.outcome!r}, uris={self.uris!r})"
 
 
 # ---------------------------------------------------------------------------

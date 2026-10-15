@@ -51,7 +51,8 @@ pub fn query_name(application_unique_string: &str, suffix: &str) -> String {
 /// Why a NAPTR record did not yield the URI of an ENUM query.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum RuleRejection {
-    /// The Flags field is empty: a non-terminal rule, which is not followed.
+    /// The Flags field is empty: a non-terminal rule, which
+    /// [`select_enum_uri`] does not follow (`enum_query` does).
     #[error("non-terminal rule (empty flags)")]
     NonTerminal,
     /// The Flags field holds something other than `u` (RFC 6116 section 3.4.2).
@@ -309,9 +310,17 @@ fn is_absolute_uri(candidate: &str) -> bool {
         && rest.chars().all(|character| character.is_ascii_graphic())
 }
 
-/// Evaluate one record: the URI it yields for the Application Unique String,
-/// or why it yields none.
-fn evaluate_rule(
+/// The Enumservices a script's `service` field asks for, lower-cased:
+/// `E2U+enumservice[+enumservice...]` (or the RFC 2916 order). `None` when it
+/// is not an ENUM service field.
+pub fn requested_enumservices(service: &str) -> Option<Vec<String>> {
+    enumservices(service)
+}
+
+/// Evaluate one terminal record: the URI it yields for the Application Unique
+/// String, or why it yields none. `requested` comes from
+/// [`requested_enumservices`].
+pub fn evaluate_rule(
     rule: &NaptrRule,
     application_unique_string: &str,
     requested: &[String],
