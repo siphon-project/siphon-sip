@@ -614,6 +614,41 @@ pub struct ServerAssignment<'a> {
     pub user_name: Option<&'a str>,
     pub server_name: &'a str,
     pub server_assignment_type: u32,
+    /// The Cx features of Feature-List-ID 1 this S-CSCF supports (TS 29.229
+    /// §7.1.1 Table 7.1.1), sent as Supported-Features; `0` sends none.
+    pub supported_features: u32,
+}
+
+/// Feature bit 0 of Cx Feature-List-ID 1, `SiFC`: shared iFC sets (TS 29.229
+/// §7.1.1 Table 7.1.1). With it advertised, an HSS that supports it too sends
+/// the SharedIFCSetIDs of a profile rather than the iFCs (TS 29.228 §6.1.2).
+pub const FEATURE_SIFC: u32 = 1 << 0;
+
+/// The Supported-Features AVP for Feature-List-ID 1 (TS 29.229 §6.3.29):
+/// Vendor-Id 3GPP, Feature-List-ID, Feature-List. TS 29.229 Table 6.3.1 has
+/// the V bit on all three and the M bit off on Feature-List-ID and
+/// Feature-List; it is left off the group too, where it may be set.
+fn supported_features_avp(feature_list: u32) -> Vec<u8> {
+    let mut children = Vec::new();
+    children.extend_from_slice(&encode_avp_u32(avp::VENDOR_ID, dictionary::VENDOR_3GPP));
+    children.extend_from_slice(&encode_avp_vendor(
+        avp::FEATURE_LIST_ID,
+        0,
+        dictionary::VENDOR_3GPP,
+        &1u32.to_be_bytes(),
+    ));
+    children.extend_from_slice(&encode_avp_vendor(
+        avp::FEATURE_LIST,
+        0,
+        dictionary::VENDOR_3GPP,
+        &feature_list.to_be_bytes(),
+    ));
+    encode_avp_vendor(
+        avp::SUPPORTED_FEATURES,
+        0,
+        dictionary::VENDOR_3GPP,
+        &children,
+    )
 }
 
 /// Encode a SAR (Server-Assignment-Request), S-CSCF to HSS.
@@ -639,6 +674,10 @@ pub fn build_sar(
         request.server_assignment_type,
     ));
     payload.extend_from_slice(&encode_avp_u32_3gpp(avp::USER_DATA_ALREADY_AVAILABLE, 0));
+    if request.supported_features != 0 {
+        // TS 29.229 §6.1.3: `*[ Supported-Features ]`.
+        payload.extend_from_slice(&supported_features_avp(request.supported_features));
+    }
 
     encode_diameter_message(
         FLAG_REQUEST | FLAG_PROXIABLE,
@@ -1242,6 +1281,7 @@ mod tests {
                 user_name,
                 server_name: SCSCF_URI,
                 server_assignment_type: 1,
+                supported_features: 0,
             },
             0x12d,
             0x12d,
@@ -1267,6 +1307,57 @@ mod tests {
         assert!(without
             .find(avp::SERVER_NAME, dictionary::VENDOR_3GPP)
             .is_some());
+    }
+
+    /// TS 29.229 §6.3.29 / §7.1.1: an S-CSCF with shared iFC sets says so
+    /// with Supported-Features { Vendor-Id 10415, Feature-List-ID 1,
+    /// Feature-List bit 0 (SiFC) }, the V bit set and, on Feature-List-ID and
+    /// Feature-List, the M bit clear (Table 6.3.1). Without, nothing is sent.
+    #[test]
+    fn sar_advertises_shared_ifc_sets_only_when_asked() {
+        let wire = build_sar(
+            &client_config(),
+            "scscf;2;2",
+            &ServerAssignment {
+                public_identity: PUBLIC_IDENTITY,
+                user_name: Some(PRIVATE_IDENTITY),
+                server_name: SCSCF_URI,
+                server_assignment_type: 1,
+                supported_features: FEATURE_SIFC,
+            },
+            0x12e,
+            0x12e,
+        );
+        let message = DiameterMsg::from_wire(&wire).unwrap();
+        let features = message
+            .find(avp::SUPPORTED_FEATURES, dictionary::VENDOR_3GPP)
+            .expect("Supported-Features is sent");
+        assert_eq!(features.flags & AVP_FLAG_VENDOR, AVP_FLAG_VENDOR);
+        let children = match &features.value {
+            AvpData::Grouped(children) => children.clone(),
+            AvpData::Raw(bytes) => parse_avps(bytes).unwrap(),
+        };
+        let child = |code: u32, vendor: u32| {
+            children
+                .iter()
+                .find(|avp| avp.code == code && avp.vendor == vendor)
+                .unwrap_or_else(|| panic!("AVP {code} in Supported-Features"))
+                .clone()
+        };
+        assert_eq!(
+            child(avp::VENDOR_ID, 0).as_u32(),
+            Some(dictionary::VENDOR_3GPP)
+        );
+        for (code, value) in [(avp::FEATURE_LIST_ID, 1), (avp::FEATURE_LIST, 1)] {
+            let avp = child(code, dictionary::VENDOR_3GPP);
+            assert_eq!(avp.as_u32(), Some(value), "AVP {code}");
+            assert_eq!(avp.flags & AVP_FLAG_MANDATORY, 0, "AVP {code} M bit");
+        }
+
+        let without = DiameterMsg::from_wire(&sample_sar(None)).unwrap();
+        assert!(without
+            .find(avp::SUPPORTED_FEATURES, dictionary::VENDOR_3GPP)
+            .is_none());
     }
 
     #[test]

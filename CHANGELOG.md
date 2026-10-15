@@ -46,6 +46,19 @@ entry, but a working config keeps working.
   its BYEs are answered gets `481` (§5.2.8.1.3). `toward="caller"` /
   `"callee"` sends one BYE, as §5.2.8.1.2 has a P-CSCF do for the user whose
   bearer it lost. Resolves `False` for a Call-ID it does not know.
+- **iFC: shared iFC sets, ORIGINATING_CDIV and SDP trigger points.** Three
+  parts of the TS 29.228 user profile the S-CSCF dropped: a service profile
+  made of `<SharedIFCSetID>`s stored zero iFCs with no warning; an SPT with
+  `<SessionCase>4</SessionCase>` never matched, and `isc.evaluate` refused
+  the session case; and the standard `<SessionDescription>` SPT was not read,
+  nor matched even under its old name. Now the sets in the new
+  `isc.shared_ifc_sets` (file or inline, reloaded on SIGHUP) are merged with a
+  profile's own iFCs by priority, an unknown id is logged at `warn`, Cx SAR
+  advertises the `SiFC` feature once a set is configured (TS 29.229 §7.1.1),
+  and `isc.shared_set_ids(aor)` lists what a profile names.
+  `isc.evaluate(..., session_case="originating_cdiv")` (alias `orig_cdiv`)
+  evaluates the originating services after retargeting, and a new `body=`
+  argument takes the request's SDP for SessionDescription SPTs (Annex F).
 
 - **`diameter.cx_uar` and `diameter.cx_lir` return the Server-Capabilities the
   HSS sent.** Their dict has a new `server_capabilities` key: `None`, or
@@ -345,6 +358,9 @@ entry, but a working config keeps working.
   `scripts/registrar_scale_test.sh`, two interleaved runs). Many AoRs behind
   one address (a PBX or an SBC) are held as a counted map, so adding and
   removing their bindings stays constant time.
+- **A `<SessionCase>` that is not 0 to 4 now fails `isc.store_profile`.** It
+  used to become an SPT with no condition, which never matched and silently
+  removed a service from the subscriber (TS 29.228 Annex E allows 0 to 4).
 
 - **A registrar lookup by Contact no longer scans every binding.**
   `registrar.lookup_contact()`, `registrar.is_registered_contact()` and the

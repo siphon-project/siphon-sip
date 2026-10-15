@@ -5836,3 +5836,26 @@ fn dialog_proxy_release_loads() {
         Config::from_str(&backend_yaml("dialog:\n  proxy_release: true\n")).expect("loads");
     assert!(config.dialog.as_ref().expect("dialog block").proxy_release);
 }
+
+/// `isc.shared_ifc_sets` is empty unless set, and takes `id` with `file` or
+/// `xml`.
+#[test]
+fn isc_shared_ifc_sets_load() {
+    let config = Config::from_str(&backend_yaml("isc:\n  ifc_key_prefix: \"siphon:ifc:\"\n"))
+        .expect("loads");
+    assert!(config.isc.expect("isc block").shared_ifc_sets.is_empty());
+    let config = Config::from_str(&backend_yaml(concat!(
+        "isc:\n",
+        "  shared_ifc_sets:\n",
+        "    - id: 1\n",
+        "      file: /etc/siphon/sifc/1.xml\n",
+        "    - id: 7\n",
+        "      xml: \"<InitialFilterCriteria/>\"\n",
+    )))
+    .expect("loads");
+    let sets = config.isc.expect("isc block").shared_ifc_sets;
+    assert_eq!(sets.len(), 2);
+    assert_eq!(sets[0].id, 1);
+    assert_eq!(sets[0].file.as_deref(), Some("/etc/siphon/sifc/1.xml"));
+    assert_eq!(sets[1].xml.as_deref(), Some("<InitialFilterCriteria/>"));
+}

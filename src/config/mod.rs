@@ -58,8 +58,8 @@ pub use gateway::{
     GatewayGroupConfig, GatewayHttpConfig, GatewayProbeConfig, LcrConfig,
 };
 pub use ims::{
-    IpsecBackend, IpsecConfig, IscConfig, SbiYamlConfig, DEFAULT_SPI_RANGE_COUNT,
-    DEFAULT_SPI_RANGE_START,
+    IpsecBackend, IpsecConfig, IscConfig, SbiYamlConfig, SharedIfcSetConfig,
+    DEFAULT_SPI_RANGE_COUNT, DEFAULT_SPI_RANGE_START,
 };
 pub use lawful_intercept::{
     LawfulInterceptConfig, LiSiprecConfig, LiTlsConfig, LiX1AdmfConfig, LiX1Config, LiX1TlsConfig,

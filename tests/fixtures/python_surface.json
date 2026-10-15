@@ -1124,7 +1124,7 @@
       "evaluate": {
         "doc": "Evaluate iFCs for a request and return matching Application Servers.",
         "kind": "method_descriptor",
-        "sig": "($self, aor, method, ruri, headers, session_case=\"originating\", start_after_priority=None)"
+        "sig": "($self, aor, method, ruri, headers, session_case=\"originating\", start_after_priority=None, body=None)"
       },
       "has_profile": {
         "doc": "Check whether a profile is stored for an AoR.",
@@ -1138,6 +1138,11 @@
       },
       "remove_profile": {
         "doc": "Remove the stored iFC profile for an AoR.",
+        "kind": "method_descriptor",
+        "sig": "($self, aor)"
+      },
+      "shared_set_ids": {
+        "doc": "The SharedIFCSetIDs the stored profile of an AoR names, for logging.",
         "kind": "method_descriptor",
         "sig": "($self, aor)"
       },

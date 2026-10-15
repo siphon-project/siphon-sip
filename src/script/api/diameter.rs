@@ -1412,6 +1412,7 @@ impl PyDiameter {
                 user_name: user_name.as_deref(),
                 server_name: &name,
                 server_assignment_type: assignment_type,
+                supported_features: super::diameter_cx::sar_supported_features(),
             };
             match client.send_sar(&request).await {
                 Ok(message) => Python::attach(|python| {

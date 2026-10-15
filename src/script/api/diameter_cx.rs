@@ -275,6 +275,18 @@ pub(crate) fn auth_items<'py>(
     Ok(items)
 }
 
+/// The Cx features a SAR advertises: `SiFC` once this S-CSCF has a shared
+/// iFC set to resolve ids against (TS 29.229 §7.1.1), else none, so an HSS
+/// keeps sending the complete iFCs (TS 29.228 §6.1.2).
+pub(super) fn sar_supported_features() -> u32 {
+    let shared_sets = super::ifc_store_arc().is_some_and(|store| store.has_shared_sets());
+    if shared_sets {
+        crate::diameter::cx::FEATURE_SIFC
+    } else {
+        0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
