@@ -997,16 +997,35 @@ impl PyCall {
     /// as an E.164 number. The rating group, requested quota and Service-Context
     /// come from the `ro:` config block.
     ///
+    /// `role_of_node` is the Role-Of-Node of the call's CCRs (TS 32.299 V18
+    /// clause 7.2.177): `"originating"`, `"terminating"` or `"forwarding"`
+    /// (or the session cases `"orig"`, `"term"`, `"orig-cdiv"`). When omitted
+    /// it is the session case of the INVITE: `P-Served-User` `sescase`, else
+    /// originating when the caller is in a local domain and terminating when
+    /// not. An unknown value raises `ValueError`.
+    ///
     /// Returns a dict `{"authorized": bool, "result_code": int|None,
     /// "granted_time": int|None, "session_id": str|None}`. When Ro is not
     /// configured the gate is a no-op that authorizes (uncharged).
-    #[pyo3(signature = (*, subscription_id=None, subscription_id_type=None))]
+    #[pyo3(signature = (*, subscription_id=None, subscription_id_type=None, role_of_node=None))]
     fn ro_authorize<'py>(
         &self,
         python: Python<'py>,
         subscription_id: Option<String>,
         subscription_id_type: Option<String>,
+        role_of_node: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
+        let role_of_node = match role_of_node.as_deref() {
+            Some(value) => Some(
+                crate::diameter::ro::NodeRole::from_str_ci(value).ok_or_else(|| {
+                    pyo3::exceptions::PyValueError::new_err(format!(
+                        "unknown role_of_node {value:?}; expected one of \
+                         'originating'/'terminating'/'forwarding'"
+                    ))
+                })?,
+            ),
+            None => None,
+        };
         let invite = match self.message.lock() {
             Ok(guard) => guard.clone(),
             Err(poisoned) => poisoned.into_inner().clone(),
@@ -1018,6 +1037,7 @@ impl PyCall {
                 invite,
                 subscription_id,
                 subscription_id_type,
+                role_of_node,
             )
             .await;
             Python::attach(|py| {

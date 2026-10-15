@@ -630,13 +630,10 @@ pub fn spawn_rf_b2bua_start(
         ));
         crate::diameter::rf_service::apply_charging_params(&mut ims_data, drained);
     }
-    // B2BUA mode → Role-of-Node = B2BUA_ROLE per TS 32.299 §7.2.149,
-    // overriding the orig/term derived from local-domain matching.
-    // Operators that need orig/term semantics (AS-as-B2BUA) can set
-    // node_functionality=as in YAML and we still emit B2BUA_ROLE; if
-    // they want the role override they can call
-    // diameter.rf_acr_* manually with role_of_node=...
-    ims_data.role_of_node = Some(crate::diameter::ro::NodeRole::B2buaRole);
+    // Role-Of-Node stays the session case `ims_data_from_request` read off
+    // the A-leg INVITE (TS 32.299 V18 clause 7.2.177): a B2BUA is not a role
+    // of its own in Release 18. A script that needs another role sends the
+    // record itself with diameter.rf_acr_*(role_of_node=...).
     let user_name = crate::diameter::rf_service::served_party_identities(&ims_data)
         .into_iter()
         .next();

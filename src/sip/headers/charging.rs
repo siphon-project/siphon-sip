@@ -29,7 +29,7 @@ pub struct ChargingVector {
 pub struct ServedUser {
     /// SIP/SIPS/TEL URI — unwrapped from `<...>` if present.
     pub uri: String,
-    /// Session case: `"orig"` or `"term"`.
+    /// Session case: `"orig"`, `"term"` or `"orig-cdiv"` (RFC 8498).
     pub sescase: Option<String>,
     /// Registration state: `"reg"` or `"unreg"`.
     pub regstate: Option<String>,
@@ -99,7 +99,9 @@ impl ServedUser {
                 let lower = key.trim().to_ascii_lowercase();
                 let v = strip_quotes(val.trim()).to_ascii_lowercase();
                 match lower.as_str() {
-                    "sescase" if v == "orig" || v == "term" => sescase = Some(v),
+                    "sescase" if v == "orig" || v == "term" || v == "orig-cdiv" => {
+                        sescase = Some(v)
+                    }
                     "regstate" if v == "reg" || v == "unreg" => regstate = Some(v),
                     _ => {}
                 }
@@ -298,6 +300,13 @@ mod tests {
         let su = ServedUser::parse("<sip:user2@example.com>;sescase=term;regstate=unreg").unwrap();
         assert_eq!(su.sescase.as_deref(), Some("term"));
         assert_eq!(su.regstate.as_deref(), Some("unreg"));
+    }
+
+    /// RFC 8498 adds `orig-cdiv`: the originating case of a diverted call.
+    #[test]
+    fn served_user_orig_cdiv() {
+        let su = ServedUser::parse("<sip:user3@example.com>;sescase=orig-cdiv").unwrap();
+        assert_eq!(su.sescase.as_deref(), Some("orig-cdiv"));
     }
 
     #[test]

@@ -7,6 +7,8 @@ call.ro_authorize()``); the sync tests drive the coroutines with
 
 import asyncio
 
+import pytest
+
 from siphon_sdk import mock_module
 from siphon_sdk.call import Call
 
@@ -135,4 +137,15 @@ class TestRoAuthorizeGate:
         assert call.ro_authorizations[-1] == {
             "subscription_id": "sip:alice@ims",
             "subscription_id_type": "sip",
+            "role_of_node": None,
         }
+
+    def test_authorize_records_role_of_node(self):
+        call = Call()
+        run(call.ro_authorize(role_of_node="terminating"))
+        assert call.ro_authorizations[-1]["role_of_node"] == "terminating"
+
+    def test_authorize_rejects_a_role_release_18_does_not_have(self):
+        call = Call()
+        with pytest.raises(ValueError):
+            run(call.ro_authorize(role_of_node="b2bua"))
