@@ -1862,6 +1862,39 @@ mod tests {
         assert!(!has_timer(&actions, TimerName::E));
     }
 
+    /// Timer F is started at the configured `transaction.timeout_secs` over
+    /// either transport, and at 64*T1 without one (RFC 3261 §17.1.2.2).
+    #[test]
+    fn nict_starts_timer_f_at_the_configured_timeout() {
+        let timer_f = |actions: &[Action]| {
+            actions.iter().find_map(|action| match action {
+                Action::StartTimer(TimerName::F, duration) => Some(*duration),
+                _ => None,
+            })
+        };
+        let configured = TimerConfig {
+            timer_f_secs: std::num::NonZeroU32::new(5),
+            ..TimerConfig::default()
+        };
+        for transport in [Transport::Udp, Transport::Reliable] {
+            let (_, actions) = Nict::new(request_frame(), transport, configured);
+            assert_eq!(
+                timer_f(&actions),
+                Some(Duration::from_secs(5)),
+                "{transport:?}"
+            );
+            let (_, actions) = Nict::new(request_frame(), transport, TimerConfig::default());
+            assert_eq!(
+                timer_f(&actions),
+                Some(Duration::from_secs(32)),
+                "{transport:?}"
+            );
+        }
+        // Timer E still starts at T1: retransmission runs up to the timeout.
+        let (nict, _) = Nict::new(request_frame(), Transport::Udp, configured);
+        assert_eq!(nict.timer_e_interval, Duration::from_millis(500));
+    }
+
     #[test]
     fn nict_timer_e_retransmits_and_doubles() {
         let (mut nict, _) = Nict::new(request_frame(), Transport::Udp, TimerConfig::default());

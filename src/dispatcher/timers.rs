@@ -103,6 +103,7 @@ pub(super) fn transaction_timers(
         timers.auto_100_delay =
             std::time::Duration::from_millis(transaction.auto_emit_100_trying_delay_ms);
         timers.timer_c_secs = transaction.timer_c_secs;
+        timers.timer_f_secs = transaction.timeout_secs.and_then(std::num::NonZeroU32::new);
     }
     timers
 }
@@ -177,7 +178,7 @@ pub(super) fn sweep_b2bua_retransmits_at(state: &DispatcherState, now: std::time
                     method = %key.method.as_str(),
                     %destination,
                     attempts,
-                    "B2BUA: no response after 64*T1 — giving up on retransmitting request"
+                    "B2BUA: no response within the transaction timeout — giving up on retransmitting request"
                 );
                 // Timer B (RFC 3261 §17.1.1.2): the INVITE's client transaction
                 // is over. A leg siphon had given up on, whose CANCEL was still
@@ -193,7 +194,11 @@ pub(super) fn sweep_b2bua_retransmits_at(state: &DispatcherState, now: std::time
 
 /// Fire all expired timers in the timer wheel.
 pub(super) fn fire_expired_timers(state: &DispatcherState) {
-    let now = std::time::Instant::now();
+    fire_expired_timers_at(state, std::time::Instant::now());
+}
+
+/// [`fire_expired_timers`] as of `now`.
+pub(super) fn fire_expired_timers_at(state: &DispatcherState, now: std::time::Instant) {
     let mut fired: Vec<TimerEntry> = Vec::new();
 
     state.timer_wheel.retain(|_id, entry| {

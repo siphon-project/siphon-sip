@@ -666,7 +666,7 @@ pub fn handle_callee_prack_response(
 }
 
 /// Fail a call whose callee has let the offer siphon's PRACK carried go
-/// unanswered for 64*T1, on the call's teardown claim. The caller's PRACK still
+/// unanswered past its PRACK's Timer F, on the call's teardown claim. The caller's PRACK still
 /// gets its 200, with every stream of its offer rejected.
 pub fn fail_overdue_prack_offer(call_id: &str, now: Instant, state: &DispatcherState) {
     // An UPDATE after the caller's 2xx left unanswered ends the call as a 408 for
@@ -681,7 +681,9 @@ pub fn fail_overdue_prack_offer(call_id: &str, now: Instant, state: &DispatcherS
     }
     let mut pending = None;
     let Some(refusal) = claim_refusal(call_id, state, |call| {
-        pending = call.prack_bridge.take_overdue_offer(now);
+        pending = call
+            .prack_bridge
+            .take_overdue_offer(now, state.b2bua_retransmits.non_invite_timeout());
         pending.is_some()
     }) else {
         return;
@@ -693,7 +695,7 @@ pub fn fail_overdue_prack_offer(call_id: &str, now: Instant, state: &DispatcherS
         call_id,
         refusal,
         PRACK_OFFER_FAILED_STATUS,
-        "the callee never answered the offer siphon's PRACK carried within 64*T1 (RFC 3262 §5)",
+        "the callee never answered the offer siphon's PRACK carried within its Timer F (RFC 3262 §5)",
         state,
     );
 }

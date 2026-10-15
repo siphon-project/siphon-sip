@@ -1368,7 +1368,8 @@ and is answered at once without touching the engine or the other leg: a
 re-INVITE with the session in force on that leg as the offer its 2xx has to
 carry (RFC 3261 §14.2), an UPDATE with no body. A leg that hangs up mid-relay
 has the other's pending request answered `487`, and one the other leg never
-answers is answered `408` after 64·T1, with the pair's session put back. The
+answers is answered `408` after its transaction timeout (an UPDATE's is
+`transaction.timeout_secs`, else 64·T1), with the pair's session put back. The
 `with` leg still has no media session of its own once bridged: media verbs
 address the pair through the target.
 

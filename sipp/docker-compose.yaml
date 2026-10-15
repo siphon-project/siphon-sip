@@ -5575,7 +5575,7 @@ services:
       - routing
 
   # ── Terminating failover across an AoR's bindings ───────────────────────────
-  # Two acceptance scenarios on one fixture (scripts/failover_proxy.py):
+  # Three acceptance scenarios on one fixture (scripts/failover_proxy.py):
   #
   #  1. Per-binding Path routing.  bob registers twice with different RFC 3327
   #     Path tokens (edge .90 and edge .91).  Edge .90 answers 404 (its binding
@@ -5587,6 +5587,10 @@ services:
   #     (.95) answers 503, then 486, then 200.  There is no fork, so this only
   #     works if @proxy.on_failure fires for a plain relay AND its
   #     request.relay() actually re-sends.
+  #
+  #  3. Non-INVITE timeout.  dave's MESSAGE goes to a next hop (.88) that never
+  #     answers; with transaction.timeout_secs 3 the caller (.89) must get the
+  #     408 between 2.5 and 5.5 s, not at 64*T1.
   #
   # Driver: scripts/failover_test.sh
 
@@ -5801,6 +5805,52 @@ services:
       - /sipp/scenarios/failover_uac.xml
       - -s
       - carol
+      - -m
+      - "1"
+      - -l
+      - "1"
+      - -timeout
+      - "40"
+      - -timeout_error
+      - -trace_err
+    profiles:
+      - failover
+
+  # dave's next hop — takes the MESSAGE and never answers (scenario 3).
+  sipp-failover-silent:
+    image: ctaloi/sipp:latest
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.88
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/non_invite_silent_uas.xml
+      - -p
+      - "5060"
+      - -m
+      - "1"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - failover
+
+  # Times the 408 for dave's MESSAGE: 2.5 to 5.5 s with timeout_secs 3.
+  sipp-failover-timeout-uac:
+    image: ctaloi/sipp:latest
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.89
+    entrypoint:
+      - sipp
+      - "172.20.0.13:5060"
+      - -sf
+      - /sipp/scenarios/non_invite_timeout_uac.xml
       - -m
       - "1"
       - -l

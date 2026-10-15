@@ -2,7 +2,7 @@
 //! keeps, whether its peer allows UPDATE, the early media answer a B-leg's caller
 //! was sent, and which dialogs the sweep has to act on.
 
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use crate::b2bua::session_timer::SessionTimerDue;
 
@@ -117,11 +117,7 @@ impl CallActorStore {
     /// Every dialog of an answered call whose session timer asks for something at
     /// `now`: the call, whether the dialog is the A-leg's, and what is due.
     /// Expirations come first, so a call being ended is not refreshed as well.
-    pub fn session_timers_due(
-        &self,
-        now: Instant,
-        transaction_timeout: Duration,
-    ) -> Vec<(String, bool, SessionTimerDue)> {
+    pub fn session_timers_due(&self, now: Instant) -> Vec<(String, bool, SessionTimerDue)> {
         let mut due = Vec::new();
         for entry in self.calls.iter() {
             let call = entry.value();
@@ -138,7 +134,7 @@ impl CallActorStore {
                 let Some(timer) = leg.and_then(|leg| leg.dialog.session_timer.as_ref()) else {
                     continue;
                 };
-                match timer.due(now, transaction_timeout) {
+                match timer.due(now) {
                     SessionTimerDue::Nothing => {}
                     what => due.push((call.id.clone(), on_a_leg, what)),
                 }

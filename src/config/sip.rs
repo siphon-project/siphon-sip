@@ -103,9 +103,13 @@ fn default_auto_options() -> bool {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct TransactionConfig {
-    /// Non-INVITE transaction timeout (fr_timeout). Default: 5s.
-    #[serde(default = "default_tx_timeout")]
-    pub timeout_secs: u32,
+    /// Non-INVITE transaction timeout: Timer F (RFC 3261 §17.1.2.2), how long
+    /// a non-INVITE client transaction waits for a final response before the
+    /// transaction layer ends it as a `408`. Unset (or `0`) it is the RFC's
+    /// 64*T1, 32 s. A proxy that fails over sets it below its upstream's own
+    /// Timer F, so the next target answers before the UAC gives up.
+    #[serde(default)]
+    pub timeout_secs: Option<u32>,
     /// INVITE transaction timeout (fr_inv_timeout). Default: 30s.
     #[serde(default = "default_tx_invite_timeout")]
     pub invite_timeout_secs: u32,
@@ -137,9 +141,6 @@ fn default_timer_c_secs() -> u32 {
     181
 }
 
-fn default_tx_timeout() -> u32 {
-    5
-}
 fn default_tx_invite_timeout() -> u32 {
     30
 }

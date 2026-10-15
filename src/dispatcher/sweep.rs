@@ -39,7 +39,13 @@ pub(super) async fn sweep_stale_entries(state: &DispatcherState) {
     // receiver timeout and drop the receiver, but that does not remove the
     // pending entry — only a matching response or this sweep does. Without it
     // the map grows by one stranded oneshot::Sender per unanswered probe.
-    let expired_uac = state.uac_sender.sweep_stale(ttl) as u64;
+    // Every request the UAC waits on is a non-INVITE (OPTIONS, SUBSCRIBE),
+    // so its transaction is over
+    // at Timer F (`transaction.timeout_secs`, RFC 3261 §17.1.2.2), and one
+    // still waiting is told it timed out.
+    let expired_uac = state
+        .uac_sender
+        .sweep_stale(state.transaction_manager.timers().timer_f()) as u64;
     // A re-offer relayed across a controller bridge that the other leg never
     // answered: the sender is answered 408 and the pair's media put back.
     crate::dispatcher::b2bua::bridge_relay_sweep(state, now);

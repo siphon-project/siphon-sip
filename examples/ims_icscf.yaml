@@ -60,6 +60,9 @@ diameter:
 # Transaction timers
 # ---------------------------------------------------------------------------
 transaction:
+  # Timer F, the non-INVITE timeout: a REGISTER to an S-CSCF that has stopped
+  # answering ends as a 408 after 5 s, in time for on_failure to try the next
+  # S-CSCF before the UE's own 32 s run out.
   timeout_secs: 5
   invite_timeout_secs: 30
 

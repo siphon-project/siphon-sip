@@ -264,6 +264,8 @@ pub fn b2bua_send_session_refresh(call_id: &str, on_a_leg: bool, state: &Dispatc
             },
         ),
     };
+    // RFC 4028 §10: the refresh has failed once its transaction times out.
+    let timeout = state.b2bua_retransmits.timeout_for(&method);
     let request = InDialogRequest {
         method,
         body: offer,
@@ -279,7 +281,7 @@ pub fn b2bua_send_session_refresh(call_id: &str, on_a_leg: bool, state: &Dispatc
             state
                 .call_actors
                 .update_leg_session_timer(call_id, on_a_leg, |timer| {
-                    timer.refresh_sent(branch.to_string(), session_expires, Instant::now())
+                    timer.refresh_sent(branch.to_string(), session_expires, Instant::now(), timeout)
                 });
         },
         state,
@@ -714,10 +716,7 @@ pub fn settle_reinvite_response(
 /// is due, and end each call one of whose sessions ran out or whose refresh went
 /// unanswered.
 pub fn session_timer_sweep(state: &DispatcherState) {
-    let due = state.call_actors.session_timers_due(
-        Instant::now(),
-        state.b2bua_retransmits.transaction_timeout(),
-    );
+    let due = state.call_actors.session_timers_due(Instant::now());
     let mut ended: Vec<String> = Vec::new();
     for (call_id, on_a_leg, what) in due {
         if ended.contains(&call_id) {

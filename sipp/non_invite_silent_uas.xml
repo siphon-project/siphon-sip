@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!-- A next hop that never answers, for the non-INVITE timeout case in
+     sipp-failover (scripts/failover_test.sh, scenario 3).
+
+     It takes the MESSAGE and says nothing. siphon's client transaction keeps
+     retransmitting it on Timer E (RFC 3261 §17.1.2.2) until its 3 s Timer F,
+     and SIPp absorbs those retransmissions. It stays up past the timeout, so
+     the 408 the caller gets is siphon's and not a closed port's. -->
+
+<scenario name="Silent next hop">
+
+  <recv request="MESSAGE" />
+
+  <pause milliseconds="6000" />
+
+</scenario>

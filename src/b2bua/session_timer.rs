@@ -395,11 +395,11 @@ impl SessionTimerState {
     ///
     /// Where siphon refreshes, the refresh is due at half the interval (RFC 4028
     /// §7.2), or at the retry time a refused refresh set. A refresh still without
-    /// a final response after `transaction_timeout` (64·T1) has timed out, and
-    /// §10 ends the session; so does reaching the expiration with no 2xx. Where
-    /// the other side refreshes, siphon ends the session slightly before it
-    /// expires (§10).
-    pub fn due(&self, now: Instant, transaction_timeout: Duration) -> SessionTimerDue {
+    /// a final response once its transaction's timeout has passed (Timer B for a
+    /// re-INVITE, Timer F for an UPDATE) has timed out, and §10 ends the session;
+    /// so does reaching the expiration with no 2xx. Where the other side
+    /// refreshes, siphon ends the session slightly before it expires (§10).
+    pub fn due(&self, now: Instant) -> SessionTimerDue {
         let expires_at = self.expires_at();
         if !self.siphon_refreshes {
             let interval = Duration::from_secs(u64::from(self.session_expires));
@@ -414,7 +414,7 @@ impl SessionTimerState {
             return SessionTimerDue::Expire;
         }
         if let Some(in_flight) = &self.refresh_in_flight {
-            return if now.saturating_duration_since(in_flight.sent_at) >= transaction_timeout {
+            return if now.saturating_duration_since(in_flight.sent_at) >= in_flight.timeout {
                 SessionTimerDue::Expire
             } else {
                 SessionTimerDue::Nothing
@@ -429,13 +429,21 @@ impl SessionTimerState {
         }
     }
 
-    /// siphon sent a refresh on `branch` asking for `session_expires`. Sending it
-    /// does not refresh anything: only its 2xx does (RFC 4028 §10).
-    pub fn refresh_sent(&mut self, branch: String, session_expires: u32, now: Instant) {
+    /// siphon sent a refresh on `branch` asking for `session_expires`, whose
+    /// transaction times out after `timeout`. Sending it does not refresh
+    /// anything: only its 2xx does (RFC 4028 §10).
+    pub fn refresh_sent(
+        &mut self,
+        branch: String,
+        session_expires: u32,
+        now: Instant,
+        timeout: Duration,
+    ) {
         self.refresh_in_flight = Some(RefreshInFlight {
             branch,
             sent_at: now,
             session_expires,
+            timeout,
         });
         self.retry_at = None;
     }
@@ -931,27 +939,42 @@ mod tests {
     #[test]
     fn a_refresher_refreshes_at_half_the_interval_and_expires_without_a_2xx() {
         let mut timer = SessionTimerState::new(1800, true, 90, Instant::now());
-        assert_eq!(
-            timer.due(at(&timer, 899), TIMEOUT),
-            SessionTimerDue::Nothing
-        );
-        assert_eq!(
-            timer.due(at(&timer, 900), TIMEOUT),
-            SessionTimerDue::Refresh
-        );
+        assert_eq!(timer.due(at(&timer, 899)), SessionTimerDue::Nothing);
+        assert_eq!(timer.due(at(&timer, 900)), SessionTimerDue::Refresh);
 
-        timer.refresh_sent("z9hG4bK-refresh".to_string(), 1800, at(&timer, 900));
+        timer.refresh_sent(
+            "z9hG4bK-refresh".to_string(),
+            1800,
+            at(&timer, 900),
+            TIMEOUT,
+        );
         assert!(timer.is_refresh("z9hG4bK-refresh"));
         assert_eq!(
-            timer.due(at(&timer, 920), TIMEOUT),
+            timer.due(at(&timer, 920)),
             SessionTimerDue::Nothing,
             "a refresh in flight is sent again"
         );
         assert_eq!(
-            timer.due(at(&timer, 932), TIMEOUT),
+            timer.due(at(&timer, 932)),
             SessionTimerDue::Expire,
             "a refresh with no response after 64*T1 did not end the session"
         );
+    }
+
+    /// An UPDATE refresh times out at Timer F, which `transaction.timeout_secs`
+    /// may set below 64*T1: the session ends then, not at 32 s.
+    #[test]
+    fn a_refresh_times_out_at_its_own_transaction_timeout() {
+        let mut timer = SessionTimerState::new(1800, true, 90, Instant::now());
+        let update_timeout = Duration::from_secs(5);
+        timer.refresh_sent(
+            "z9hG4bK-update".to_string(),
+            1800,
+            at(&timer, 900),
+            update_timeout,
+        );
+        assert_eq!(timer.due(at(&timer, 904)), SessionTimerDue::Nothing);
+        assert_eq!(timer.due(at(&timer, 905)), SessionTimerDue::Expire);
     }
 
     /// RFC 4028 §10: a refused refresh is retried, halfway to the expiration each
@@ -959,34 +982,27 @@ mod tests {
     #[test]
     fn a_refused_refresh_is_retried_halfway_to_the_expiration() {
         let mut timer = SessionTimerState::new(1800, true, 90, Instant::now());
-        timer.refresh_sent("z9hG4bK-refresh".to_string(), 1800, at(&timer, 900));
+        timer.refresh_sent(
+            "z9hG4bK-refresh".to_string(),
+            1800,
+            at(&timer, 900),
+            TIMEOUT,
+        );
         timer.refresh_refused(at(&timer, 900));
-        assert_eq!(
-            timer.due(at(&timer, 1349), TIMEOUT),
-            SessionTimerDue::Nothing
-        );
-        assert_eq!(
-            timer.due(at(&timer, 1350), TIMEOUT),
-            SessionTimerDue::Refresh
-        );
+        assert_eq!(timer.due(at(&timer, 1349)), SessionTimerDue::Nothing);
+        assert_eq!(timer.due(at(&timer, 1350)), SessionTimerDue::Refresh);
         timer.refresh_refused(at(&timer, 1350));
-        assert_eq!(
-            timer.due(at(&timer, 1575), TIMEOUT),
-            SessionTimerDue::Refresh
-        );
-        assert_eq!(
-            timer.due(at(&timer, 1800), TIMEOUT),
-            SessionTimerDue::Expire
-        );
+        assert_eq!(timer.due(at(&timer, 1575)), SessionTimerDue::Refresh);
+        assert_eq!(timer.due(at(&timer, 1800)), SessionTimerDue::Expire);
     }
 
     #[test]
     fn a_422_to_a_refresh_raises_the_floor_and_retries_at_once() {
         let mut timer = SessionTimerState::new(90, true, 90, Instant::now());
-        timer.refresh_sent("z9hG4bK-refresh".to_string(), 90, at(&timer, 45));
+        timer.refresh_sent("z9hG4bK-refresh".to_string(), 90, at(&timer, 45), TIMEOUT);
         timer.refresh_too_brief(1800, at(&timer, 46));
         assert_eq!(timer.refresh_interval(), 1800);
-        assert_eq!(timer.due(at(&timer, 46), TIMEOUT), SessionTimerDue::Refresh);
+        assert_eq!(timer.due(at(&timer, 46)), SessionTimerDue::Refresh);
     }
 
     /// RFC 4028 §10: the side that does not refresh ends the session ahead of the
@@ -994,17 +1010,11 @@ mod tests {
     #[test]
     fn a_non_refresher_ends_the_session_just_before_it_expires() {
         let timer = SessionTimerState::new(1800, false, 90, Instant::now());
-        assert_eq!(
-            timer.due(at(&timer, 1767), TIMEOUT),
-            SessionTimerDue::Nothing
-        );
-        assert_eq!(
-            timer.due(at(&timer, 1768), TIMEOUT),
-            SessionTimerDue::Expire
-        );
+        assert_eq!(timer.due(at(&timer, 1767)), SessionTimerDue::Nothing);
+        assert_eq!(timer.due(at(&timer, 1768)), SessionTimerDue::Expire);
         let short = SessionTimerState::new(90, false, 90, Instant::now());
-        assert_eq!(short.due(at(&short, 59), TIMEOUT), SessionTimerDue::Nothing);
-        assert_eq!(short.due(at(&short, 60), TIMEOUT), SessionTimerDue::Expire);
+        assert_eq!(short.due(at(&short, 59)), SessionTimerDue::Nothing);
+        assert_eq!(short.due(at(&short, 60)), SessionTimerDue::Expire);
     }
 
     #[test]

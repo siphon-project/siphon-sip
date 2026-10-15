@@ -53,6 +53,9 @@ pub struct RefreshInFlight {
     pub sent_at: std::time::Instant,
     /// The session interval its `Session-Expires` asked for, in seconds.
     pub session_expires: u32,
+    /// When its transaction times out: Timer B for a re-INVITE, Timer F
+    /// (`transaction.timeout_secs`) for an UPDATE.
+    pub timeout: std::time::Duration,
 }
 
 // ---------------------------------------------------------------------------

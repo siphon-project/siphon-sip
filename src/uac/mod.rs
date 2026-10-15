@@ -684,8 +684,8 @@ impl UacSender {
     /// this sweep does. Without it, every probe to a peer that never answers
     /// (NAT keepalive of an asleep UE, health probe of a down trunk) strands
     /// one entry plus its `oneshot::Sender` forever. The dispatcher's periodic
-    /// cleanup task calls this with the transaction timeout (RFC 3261 Timer F,
-    /// 32 s) as `max_age`.
+    /// cleanup task calls this with the non-INVITE transaction timeout (RFC 3261
+    /// Timer F: `transaction.timeout_secs`, else 32 s) as `max_age`.
     pub fn sweep_stale(&self, max_age: Duration) -> usize {
         let now = Instant::now();
         // Collect stale keys first, then remove: holding a DashMap iterator
@@ -703,6 +703,18 @@ impl UacSender {
             }
         }
         stale.len()
+    }
+
+    /// Make every pending request `by` older, for a test that steps past a
+    /// timeout without waiting it out.
+    #[cfg(test)]
+    pub(crate) fn age_pending(&self, by: Duration) {
+        for mut entry in self.pending.iter_mut() {
+            entry.inserted_at = entry
+                .inserted_at
+                .checked_sub(by)
+                .expect("the clock reaches back that far");
+        }
     }
 
     /// Expire a specific pending request by branch (called on timeout).

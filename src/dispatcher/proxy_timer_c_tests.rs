@@ -357,8 +357,10 @@ fn the_transaction_block_reaches_the_timers() {
         crate::transaction::timer::DEFAULT_TIMER_C
     );
     assert!(defaults.auto_100_trying);
+    assert_eq!(defaults.timer_f(), Duration::from_secs(32));
 
     let configured: crate::config::TransactionConfig = serde_yaml_ng::from_str(concat!(
+        "timeout_secs: 5\n",
         "timer_c_secs: 240\n",
         "auto_emit_100_trying: false\n",
         "auto_emit_100_trying_delay_ms: 350\n",
@@ -369,11 +371,26 @@ fn the_transaction_block_reaches_the_timers() {
     assert_eq!(timers.timer_c(), Duration::from_secs(240));
     assert!(!timers.auto_100_trying);
     assert_eq!(timers.auto_100_delay, Duration::from_millis(350));
+    assert_eq!(timers.timer_f(), Duration::from_secs(5));
+    // Timer F alone: the INVITE transaction keeps 64*T1.
+    assert_eq!(timers.timer_b(), Duration::from_secs(32));
 
     // An empty block is the defaults.
     let empty: crate::config::TransactionConfig =
         serde_yaml_ng::from_str("{}").expect("an empty transaction block parses");
     assert_eq!(transaction_timers(Some(&empty)).timer_c_secs, 181);
+    assert_eq!(
+        transaction_timers(Some(&empty)).timer_f(),
+        Duration::from_secs(32)
+    );
+
+    // A zero is no timeout at all, and is left to the default.
+    let zero: crate::config::TransactionConfig =
+        serde_yaml_ng::from_str("timeout_secs: 0").expect("the block parses");
+    assert_eq!(
+        transaction_timers(Some(&zero)).timer_f(),
+        Duration::from_secs(32)
+    );
 }
 
 /// RFC 3261 §16.6 step 11: "The timer MUST be larger than 3 minutes." A

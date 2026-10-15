@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Terminating failover across an AoR's bindings — SIPp acceptance test.
 #
-# Two scenarios, one fixture proxy (scripts/failover_proxy.py):
+# Three scenarios, one fixture proxy (scripts/failover_proxy.py):
 #
 #   1. Per-binding Path routing.  bob has two live bindings registered through
 #      different edge proxies (different RFC 3327 Path tokens).  The first
@@ -16,7 +16,13 @@
 #      call completes only if the handler runs for a plain relay AND its
 #      request.relay() actually re-sends.
 #
-# Both callers demand a 200; anything else fails the run.
+#   3. Non-INVITE timeout.  dave's MESSAGE is relayed to a next hop that never
+#      answers.  With transaction.timeout_secs 3 the client transaction times
+#      out at 3 s, not at 64*T1, and the caller must get the 408 between 2.5
+#      and 5.5 s after sending (sipp/non_invite_timeout_uac.xml times it).
+#
+# The first two callers demand a 200, the third a 408 on time; anything else
+# fails the run.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -48,7 +54,7 @@ echo "[*] Starting siphon..."
 
 # ── Scenario 1: per-binding Path routing ────────────────────────────────────
 echo
-echo "--- 1/2: per-binding Path routing (RFC 3327 §5.3) ---"
+echo "--- 1/3: per-binding Path routing (RFC 3327 §5.3) ---"
 
 echo "[*] Registering bob's two bindings (Path token-a q=1.0, token-b q=0.5)..."
 "${COMPOSE[@]}" run --rm sipp-failover-register-a >/dev/null \
@@ -102,7 +108,7 @@ echo "PASS: each fork branch was routed through its own binding's Path"
 
 # ── Scenario 2: failure re-targeting on a single relay ──────────────────────
 echo
-echo "--- 2/2: @proxy.on_failure re-target on a single-destination relay ---"
+echo "--- 2/3: @proxy.on_failure re-target on a single-destination relay ---"
 
 echo "[*] Starting carol's primary (rejects) and backup (answers) backends..."
 "${COMPOSE[@]}" up -d sipp-failover-backend-primary sipp-failover-backend-backup
@@ -125,5 +131,37 @@ wait_edge_received_invite sipp-failover-backend-backup \
   || fail "the backup backend never received the INVITE — on_failure's request.relay() did not re-send"
 
 echo "PASS: on_failure fired for a single-destination relay and its retry reached the backup"
+"${COMPOSE[@]}" rm -sf sipp-failover-backend-primary sipp-failover-backend-backup >/dev/null 2>&1 || true
+
+# ── Scenario 3: a non-INVITE times out at transaction.timeout_secs ──────────
+echo
+echo "--- 3/3: non-INVITE timeout at transaction.timeout_secs (RFC 3261 §17.1.2.2) ---"
+
+echo "[*] Starting dave's next hop, which never answers..."
+"${COMPOSE[@]}" up -d sipp-failover-silent
+sleep 2
+
+echo "[*] Messaging dave..."
+rc=0
+"${COMPOSE[@]}" run --rm sipp-failover-timeout-uac || rc=$?
+if [[ ${rc} -ne 0 ]]; then
+  echo "--- silent next hop logs ---"
+  "${COMPOSE[@]}" logs sipp-failover-silent 2>/dev/null | tail -30 || true
+  fail "no 408 between 2.5 and 5.5 s (exit ${rc}) — Timer F is not transaction.timeout_secs"
+fi
+
+# SIPp's screen counts the MESSAGE once and its Timer E retransmissions apart
+# (0.5 s and 1.5 s in, before the 3 s timeout): one message, two or more
+# retransmissions, or the 408 was not a timeout of a retransmitting transaction.
+silent_hop_was_retransmitted_to() {
+  "${COMPOSE[@]}" logs "$1" 2>/dev/null | grep -aqE "> MESSAGE +1 +[2-9] "
+}
+deadline=$((SECONDS + 15))
+until silent_hop_was_retransmitted_to sipp-failover-silent; do
+  (( SECONDS < deadline )) || fail "the silent next hop did not get the MESSAGE and its retransmissions"
+  sleep 0.5
+done
+
+echo "PASS: the MESSAGE to a silent next hop was retransmitted and answered 408 at the configured timeout"
 echo
 echo "ALL PASS"

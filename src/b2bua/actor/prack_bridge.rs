@@ -16,10 +16,6 @@ use super::HeldAnswer;
 use crate::sip::message::SipMessage;
 use crate::transport::{ConnectionId, Transport};
 
-/// How long siphon waits for the callee to answer an offer its PRACK carried
-/// before the call fails: 64*T1, a non-INVITE transaction's Timer F.
-pub const PRACK_OFFER_WAIT: Duration = Duration::from_secs(32);
-
 /// siphon's PRACK for a callee's reliable provisional, waiting for the caller's
 /// PRACK of siphon's copy.
 #[derive(Debug, Clone)]
@@ -214,16 +210,22 @@ impl PrackBridge {
         }
     }
 
-    /// Whether the callee has let the offer go unanswered for 64*T1.
-    pub fn offer_overdue(&self, now: Instant) -> bool {
-        self.pending_offer.as_ref().is_some_and(|pending| {
-            now.saturating_duration_since(pending.sent_at) >= PRACK_OFFER_WAIT
-        })
+    /// Whether the callee has let the offer go unanswered for `timeout`: the
+    /// Timer F of the PRACK or UPDATE that carried it, a non-INVITE
+    /// transaction's (`transaction.timeout_secs`, else 64*T1).
+    pub fn offer_overdue(&self, now: Instant, timeout: Duration) -> bool {
+        self.pending_offer
+            .as_ref()
+            .is_some_and(|pending| now.saturating_duration_since(pending.sent_at) >= timeout)
     }
 
     /// Take the offer when it is overdue.
-    pub fn take_overdue_offer(&mut self, now: Instant) -> Option<PendingPrackOffer> {
-        if self.offer_overdue(now) {
+    pub fn take_overdue_offer(
+        &mut self,
+        now: Instant,
+        timeout: Duration,
+    ) -> Option<PendingPrackOffer> {
+        if self.offer_overdue(now, timeout) {
             self.pending_offer.take()
         } else {
             None
@@ -280,6 +282,9 @@ impl PrackBridge {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Timer F at 64*T1.
+    const PRACK_OFFER_WAIT: Duration = Duration::from_secs(32);
 
     /// The Via branch of the test's B-leg number `leg`.
     fn branch(leg: usize) -> String {
@@ -379,9 +384,12 @@ mod tests {
         assert!(!bridge.offer_waits_on(7, Some(&new_prack)));
         assert!(bridge.take_offer("b-leg@198.51.100.70", 4).is_none());
         assert!(bridge.take_offer("another@198.51.100.70", 3).is_none());
-        assert!(!bridge.offer_overdue(now + PRACK_OFFER_WAIT - Duration::from_millis(1)));
-        assert!(bridge.take_overdue_offer(now).is_none());
-        assert!(bridge.offer_overdue(now + PRACK_OFFER_WAIT));
+        assert!(!bridge.offer_overdue(
+            now + PRACK_OFFER_WAIT - Duration::from_millis(1),
+            PRACK_OFFER_WAIT
+        ));
+        assert!(bridge.take_overdue_offer(now, PRACK_OFFER_WAIT).is_none());
+        assert!(bridge.offer_overdue(now + PRACK_OFFER_WAIT, PRACK_OFFER_WAIT));
         assert!(bridge.take_offer("b-leg@198.51.100.70", 3).is_some());
         assert!(!bridge.offer_waits_on(7, Some(&retransmission)));
         assert!(
@@ -392,8 +400,10 @@ mod tests {
         assert!(!bridge.offer_pending());
 
         bridge.begin_offer(pending(now));
-        assert!(bridge.take_overdue_offer(now + PRACK_OFFER_WAIT).is_some());
-        assert!(!bridge.offer_overdue(now + PRACK_OFFER_WAIT));
+        assert!(bridge
+            .take_overdue_offer(now + PRACK_OFFER_WAIT, PRACK_OFFER_WAIT)
+            .is_some());
+        assert!(!bridge.offer_overdue(now + PRACK_OFFER_WAIT, PRACK_OFFER_WAIT));
     }
 
     #[test]

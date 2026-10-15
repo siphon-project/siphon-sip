@@ -98,6 +98,11 @@ impl TransactionManager {
         }
     }
 
+    /// The timers every transaction this manager starts runs on.
+    pub fn timers(&self) -> &TimerConfig {
+        &self.timers
+    }
+
     /// Number of active transactions.
     pub fn count(&self) -> usize {
         self.transactions.len()

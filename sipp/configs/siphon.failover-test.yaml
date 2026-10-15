@@ -3,8 +3,8 @@
 # Used with: sipp/docker-compose.yaml --profile failover (scripts/failover_test.sh)
 # Script:    scripts/failover_proxy.py
 #
-# No auth: both acceptance scenarios are about routing, and the fixture
-# registers each UE exactly once.
+# No auth: the acceptance scenarios are about routing and timing, and the
+# fixture registers each UE exactly once.
 
 listen:
   udp:
@@ -20,6 +20,11 @@ advertised_address: "172.20.0.13"
 script:
   path: "scripts/failover_proxy.py"
   reload: auto
+
+# Scenario 3: Timer F of a relayed non-INVITE (RFC 3261 §17.1.2.2) is 3 s
+# instead of 64*T1. Scenarios 1 and 2 relay only INVITEs, which it leaves alone.
+transaction:
+  timeout_secs: 3
 
 registrar:
   backend: memory

@@ -73,8 +73,8 @@ struct RetransmitEntry {
     next_at: Instant,
     /// Current interval; doubles on each fire.
     interval: Duration,
-    /// Timer B (INVITE, §17.1.1.2) / Timer F (non-INVITE, §17.1.2.2) deadline:
-    /// 64·T1 after arming.
+    /// Timer B (INVITE, §17.1.1.2: 64·T1) / Timer F (non-INVITE, §17.1.2.2:
+    /// `transaction.timeout_secs`, else 64·T1) deadline after arming.
     give_up_at: Instant,
     /// INVITE doubles without a ceiling; non-INVITE caps each interval at T2.
     invite: bool,
@@ -94,8 +94,8 @@ pub enum Due {
         /// 1 for the first retransmission, 2 for the second, and so on.
         attempt: u32,
     },
-    /// 64·T1 elapsed with no response. The entry has already been removed;
-    /// the caller only reports it.
+    /// Timer B or Timer F elapsed with no response. The entry has already
+    /// been removed; the caller only reports it.
     GaveUp {
         key: RetransmitKey,
         destination: SocketAddr,
@@ -136,11 +136,27 @@ impl B2buaRetransmits {
         self.armed.load(std::sync::atomic::Ordering::Relaxed) != 0
     }
 
-    /// How long a request waits for a final response before its transaction has
-    /// timed out: Timer B (INVITE) and Timer F (non-INVITE), both 64·T1 (RFC 3261
-    /// §17.1.1.2, §17.1.2.2).
+    /// How long an INVITE waits for a final response before its transaction
+    /// has timed out: Timer B, 64·T1 (RFC 3261 §17.1.1.2).
     pub fn transaction_timeout(&self) -> Duration {
         self.timers.timer_b()
+    }
+
+    /// How long a non-INVITE request waits for a final response before its
+    /// transaction has timed out: Timer F (RFC 3261 §17.1.2.2), which
+    /// `transaction.timeout_secs` sets and is otherwise 64·T1.
+    pub fn non_invite_timeout(&self) -> Duration {
+        self.timers.timer_f()
+    }
+
+    /// [`Self::transaction_timeout`] for an INVITE, else
+    /// [`Self::non_invite_timeout`].
+    pub fn timeout_for(&self, method: &Method) -> Duration {
+        if *method == Method::Invite {
+            self.transaction_timeout()
+        } else {
+            self.non_invite_timeout()
+        }
     }
 
     /// Arm a schedule for a request just handed to the transport.
@@ -166,6 +182,7 @@ impl B2buaRetransmits {
 
         let interval = self.timers.timer_a_initial();
         let invite = key.method == Method::Invite;
+        let give_up_at = now + self.timeout_for(&key.method);
         let replaced = self.entries.insert(
             key,
             RetransmitEntry {
@@ -173,7 +190,7 @@ impl B2buaRetransmits {
                 target,
                 next_at: now + interval,
                 interval,
-                give_up_at: now + self.timers.timer_b(),
+                give_up_at,
                 invite,
                 attempts: 0,
             },
@@ -471,6 +488,50 @@ mod tests {
             "an expired schedule must not also emit a retransmit"
         );
         assert_eq!(store.len(), 0, "the expired entry must be removed");
+    }
+
+    /// `transaction.timeout_secs` is Timer F: a siphon-originated non-INVITE
+    /// is given up at it, while an INVITE keeps
+    /// Timer B's 64·T1.
+    #[test]
+    fn a_non_invite_gives_up_at_the_configured_timer_f() {
+        let store = B2buaRetransmits::new(TimerConfig {
+            timer_f_secs: std::num::NonZeroU32::new(5),
+            ..TimerConfig::default()
+        });
+        assert_eq!(store.non_invite_timeout(), Duration::from_secs(5));
+        assert_eq!(store.transaction_timeout(), Duration::from_secs(32));
+        let bye = RetransmitKey::new("z9hG4bK-bye-timeout", Method::Bye);
+        let invite = invite_key();
+        let armed_at = Instant::now();
+        for key in [&bye, &invite] {
+            assert!(store.arm(
+                key.clone(),
+                Bytes::from_static(b"REQUEST"),
+                target(Transport::Udp),
+                armed_at
+            ));
+        }
+
+        let before = store.due(armed_at + Duration::from_secs(5) - Duration::from_millis(1));
+        assert!(
+            before
+                .iter()
+                .all(|event| !matches!(event, Due::GaveUp { .. })),
+            "nothing is given up before Timer F"
+        );
+        let gave_up: Vec<RetransmitKey> = store
+            .due(armed_at + Duration::from_secs(5))
+            .into_iter()
+            .filter_map(|event| match event {
+                Due::GaveUp { key, .. } => Some(key),
+                Due::Send { .. } => None,
+            })
+            .collect();
+        assert_eq!(gave_up, [bye], "the BYE at Timer F, the INVITE not yet");
+        assert_eq!(store.len(), 1);
+        let _ = store.due(armed_at + store.timers.timer_b());
+        assert!(store.is_empty(), "the INVITE at Timer B");
     }
 
     /// An INVITE on a reliable transport is timed and never retransmitted:
