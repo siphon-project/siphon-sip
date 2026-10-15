@@ -313,6 +313,33 @@ impl PyB2buaControl {
         })
     }
 
+    /// Report the outcome of a REFER accepted with
+    /// `call.accept_refer(mode="script")`: the NOTIFY that ends its
+    /// subscription (RFC 3515 §2.4.5). `code` must be a final status, 200-699
+    /// (`ValueError` otherwise). True once sent; False when no REFER on the
+    /// call is awaiting its report.
+    #[pyo3(signature = (call_id, code, reason=None))]
+    fn complete_refer(&self, call_id: &str, code: u16, reason: Option<&str>) -> PyResult<bool> {
+        if !(200..=699).contains(&code) {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "b2bua.complete_refer(code=…) reports a final status, 200-699 (got {code})"
+            )));
+        }
+        if reason.is_some_and(|reason| reason.bytes().any(|byte| matches!(byte, b'\r' | b'\n' | 0)))
+        {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "b2bua.complete_refer(reason=…) contains a line break or NUL",
+            ));
+        }
+        match crate::dispatcher::b2bua_complete_refer(call_id, code, reason) {
+            Ok(()) => Ok(true),
+            Err(refusal) => {
+                tracing::warn!(%call_id, code, "b2bua.complete_refer(): {refusal}");
+                Ok(false)
+            }
+        }
+    }
+
     #[pyo3(signature = (call_id, target, replaces=None))]
     fn refer(
         &self,

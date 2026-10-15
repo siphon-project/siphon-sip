@@ -93,6 +93,11 @@
         "kind": "method_descriptor",
         "sig": "($self, call_id, with_call_id, on_peer_hangup=\"hangup\")"
       },
+      "complete_refer": {
+        "doc": "Report the outcome of a REFER accepted with",
+        "kind": "method_descriptor",
+        "sig": "($self, call_id, code, reason=None)"
+      },
       "originate": {
         "doc": "Imperatively send an outbound REFER on a live B2BUA call by SIP Call-ID.",
         "kind": "method_descriptor",
@@ -180,7 +185,7 @@
       "accept_refer": {
         "doc": "Accept the REFER and proceed with the transfer.",
         "kind": "method_descriptor",
-        "sig": "($self, target=None, next_hop=None, mode=None, profile=None, number_policy=None, format=None)"
+        "sig": "($self, target=None, next_hop=None, mode=None, profile=None, number_policy=None, format=None, timeout=None)"
       },
       "active_route": {
         "doc": "The carrier route that won an LCR sequence (`call.route(...)`), or `None`",

@@ -1141,9 +1141,15 @@ class MockB2bua:
         self.replacements: list[dict] = []
         # Sequence counter for the mock's synthetic originated Call-IDs.
         self._originate_seq = 0
+        # SIP Call-IDs with a REFER accepted by call.accept_refer(mode="script")
+        # and not reported yet, and the b2bua.complete_refer(...) reports.
+        self.open_script_refers: set[str] = set()
+        self.refer_reports: list[dict] = []
 
     def clear(self) -> None:
         """Reset recorded imperative calls (called by ``reset()``)."""
+        self.open_script_refers.clear()
+        self.refer_reports.clear()
         self.terminates.clear()
         self.refers.clear()
         self.originates.clear()
@@ -1543,6 +1549,53 @@ class MockB2bua:
                 "format": format,
             }
         )
+        return True
+
+    def complete_refer(self, call_id: str, code: int,
+                       reason: Optional[str] = None) -> bool:
+        """Report how a REFER the script accepted with
+        ``call.accept_refer(mode="script")`` went, ending its implicit
+        subscription: a NOTIFY whose ``message/sipfrag`` body is the status
+        line of ``code`` (RFC 3515 section 2.4.5), with
+        ``Subscription-State: terminated``. A 2xx tells the referrer it
+        succeeded, anything else that it failed.
+
+        Args:
+            call_id: the SIP Call-ID of the dialog the REFER came in
+                (``call.call_id`` in ``@b2bua.on_refer``).
+            code: the final status to report, 200-699.
+            reason: the reason phrase; the usual one for ``code`` when omitted.
+
+        Returns:
+            bool: True once the NOTIFY is sent. False when no REFER on that
+            call is awaiting its report (already reported, its deadline passed
+            and siphon reported 503 for it, or the referrer hung up).
+
+        Raises:
+            ValueError: ``code`` is not 200-699, or ``reason`` has a line break.
+
+        In the mock, records ``{"call_id", "code", "reason"}`` on
+        ``refer_reports`` for a call in ``open_script_refers`` (which
+        ``accept_refer(mode="script")`` adds to) and returns True.
+
+        Usage::
+
+            @b2bua.on_refer
+            async def on_refer(call):
+                call.accept_refer(mode="script")
+                code = await add_to_conference(call.refer_to)
+                b2bua.complete_refer(call.call_id, code)
+        """
+        if not 200 <= code <= 699:
+            raise ValueError(
+                f"b2bua.complete_refer(code=…) reports a final status, 200-699 (got {code})"
+            )
+        if reason is not None and any(character in reason for character in "\r\n\0"):
+            raise ValueError("b2bua.complete_refer(reason=…) contains a line break or NUL")
+        if call_id not in self.open_script_refers:
+            return False
+        self.open_script_refers.discard(call_id)
+        self.refer_reports.append({"call_id": call_id, "code": code, "reason": reason})
         return True
 
     def terminate(self, call_id: str, reason: str = "Normal Clearing") -> bool:

@@ -587,6 +587,11 @@ pub fn refer_decision_deadline(bus: &crate::control::ControlBus) -> std::time::D
     }
 }
 
+/// How long `@b2bua.on_refer` has to decide on a REFER before the sweep
+/// answers it `603 Decline`: inside the REFER's own transaction lifetime (64*T1,
+/// RFC 3261 §17.2.2), the same default a controller's decision gets.
+const SCRIPT_REFER_DECISION_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Who sent a REFER: the call it arrived on and the leg of it.
 pub struct Referrer<'a> {
     /// The `CallActor` id.
@@ -954,6 +959,18 @@ pub fn handle_b2bua_refer_on(
         return;
     }
 
+    // A transfer accepted in mode "script" is still awaiting the script's
+    // report: a retransmission of its REFER gets the 202 again, any other
+    // REFER on the call 491 (RFC 3261 §21.4.27).
+    let referrer = Referrer {
+        call_id: &call_id,
+        from_a_leg,
+        from_tag: from_tag.as_deref(),
+    };
+    if answer_refer_during_controller_transfer(&inbound, &message, &referrer, state) {
+        return;
+    }
+
     // The handler decides from here, and every path out of it answers. A copy
     // of this REFER arriving on another worker meanwhile is absorbed instead
     // of running the handler, and the transfer, a second time.
@@ -983,6 +1000,39 @@ pub fn handle_b2bua_refer_on(
         caller_transport,
     )
     .with_flow(py_flow_from_inbound(&inbound));
+
+    // Held while the handler runs, for `call.accept_refer(mode="script")` to
+    // answer at once: a script that carries the REFER out itself does the
+    // work inside the handler, after the 202 (RFC 3515 §2.4.2), not before
+    // it. Taken back once the handler returns for any other decision. A
+    // handler that outlives the deadline leaves it to the sweep's 603.
+    match state.pending_inbound_refer.hold(
+        &call_id,
+        PendingInboundRefer {
+            inbound,
+            message: message.clone(),
+            refer_to: refer_to.clone(),
+            deadline: std::time::Instant::now() + SCRIPT_REFER_DECISION_DEADLINE,
+            channel_sip_call_id: sip_call_id.clone(),
+        },
+    ) {
+        ReferHold::Held => {}
+        ReferHold::Retransmit => {
+            debug!(call_id = %call_id, "B2BUA REFER: retransmit of a REFER its script is deciding on — absorbed");
+            return;
+        }
+        ReferHold::Busy(second) => {
+            warn!(call_id = %call_id, "B2BUA REFER: another REFER on this call is still awaiting its decision — 491");
+            b2bua_refer_send_final(
+                &second.inbound,
+                &second.message,
+                491,
+                "Request Pending",
+                state,
+            );
+            return;
+        }
+    }
     py_call.set_refer_to(refer_to.uri.clone(), refer_to.replaces.clone());
     // Which side referred decides which side survives, and therefore what the
     // surviving pair's media profile has to be (see `accept_refer(profile=…)`).
@@ -1048,6 +1098,16 @@ pub fn handle_b2bua_refer_on(
             || borrowed.to_host_override().is_some();
         (borrowed.action().clone(), ignored_overrides)
     });
+
+    // Decided by the script on the spot (`accept_refer(mode="script")`), or
+    // already answered by the deadline sweep or the referrer's BYE.
+    let Some(PendingInboundRefer {
+        inbound, message, ..
+    }) = state.pending_inbound_refer.take(&call_id)
+    else {
+        debug!(call_id = %call_id, ?action, "B2BUA REFER: answered while the handler ran");
+        return;
+    };
 
     if ignored_overrides {
         warn!(

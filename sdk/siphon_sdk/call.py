@@ -1214,7 +1214,8 @@ class Call:
                      mode: Optional[str] = None,
                      profile: Optional[str] = None,
                      number_policy: Optional[str] = None,
-                     format: Optional[str] = None) -> None:
+                     format: Optional[str] = None,
+                     timeout: Optional[int] = None) -> None:
         """Accept an incoming REFER and honour the transfer.
 
         Call this from a ``@b2bua.on_refer`` handler to proceed with the
@@ -1327,11 +1328,45 @@ class Call:
                 call.accept_refer(target=target, next_hop=gw.uri,
                                   mode="terminate", profile="rtp_passthrough",
                                   format="plain")
+
+        ``mode="script"``: siphon transfers nothing and dials nothing. It
+        answers ``202 Accepted`` and sends the first NOTIFY (sipfrag ``100
+        Trying``, RFC 3515 section 2.4.4) **at once**, before the handler
+        returns, so the handler can go on to do what the REFER asks itself and
+        then report with ``b2bua.complete_refer(call.call_id, code)``. The
+        referrer stays in its dialog: a REFER to a conference focus inside a
+        participant's dialog (RFC 4579 section 5.5), say. ``timeout`` (seconds,
+        default 60, at most 180) is how long the script has to report before
+        siphon reports ``503`` for it. ``target``, ``next_hop``, ``profile``,
+        ``number_policy`` and ``format`` do not apply and raise ``ValueError``;
+        a REFER no longer awaiting a decision raises ``RuntimeError``::
+
+            @b2bua.on_refer
+            async def on_refer(call):
+                call.accept_refer(mode="script")     # 202 + NOTIFY 100 now
+                code = await add_to_conference(call.refer_to)
+                b2bua.complete_refer(call.call_id, code)
         """
+        if mode == "script":
+            if any(value is not None for value in
+                   (target, next_hop, profile, number_policy, format)):
+                raise ValueError(
+                    'accept_refer(mode="script") dials nothing: target, next_hop, '
+                    "profile, number_policy and format do not apply"
+                )
+            from siphon_sdk import mock_module
+            mock_module.get_b2bua().open_script_refers.add(self.call_id)
+            self._actions.append(Action(
+                kind="accept_refer",
+                extras={"mode": "script", "timeout": timeout},
+            ))
+            return
+        if timeout is not None:
+            raise ValueError('accept_refer(timeout=…) applies to mode="script" only')
         if mode not in (None, "terminate", "transparent"):
             raise ValueError(
-                f"accept_refer(mode=...) must be None, 'terminate', or "
-                f"'transparent' (got {mode!r})"
+                f"accept_refer(mode=...) must be None, 'terminate', 'transparent' "
+                f"or 'script' (got {mode!r})"
             )
         from siphon_sdk import mock_module
         mock_module.get_numbers()._resolve_dial(number_policy, format)

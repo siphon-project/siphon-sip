@@ -203,7 +203,68 @@ pub fn b2bua_accept_refer_controller_with_state(
     let Some(referrer_on_a_leg) = held_referrer_leg(&pending, &call_id, state) else {
         return Err(ControllerReferRefusal::ReferrerGone);
     };
+    open_reported_refer(state, pending, &call_id, referrer_on_a_leg, timeout_secs)
+}
 
+/// Accept the REFER `@b2bua.on_refer` is deciding on the call `call_id` for
+/// the script to carry out (`call.accept_refer(mode="script")`): the same
+/// `202 Accepted`, first NOTIFY and subscription record as mode `controller`,
+/// sent the moment the script asks, so the handler can go on to do the work
+/// and report it with `b2bua.complete_refer()`.
+///
+/// A focus answering a REFER inside a participant's dialog (RFC 4579 §5.5)
+/// needs exactly this: the referrer stays where it is, nothing is transferred,
+/// and the outcome is the focus's own.
+pub fn b2bua_accept_refer_script_with_state(
+    state: &DispatcherState,
+    call_id: &str,
+    timeout_secs: Option<u32>,
+) -> Result<u32, ControllerReferRefusal> {
+    let pending = state
+        .pending_inbound_refer
+        .take(call_id)
+        .ok_or(ControllerReferRefusal::NoPendingRefer)?;
+    let Some(referrer_on_a_leg) = held_referrer_leg(&pending, call_id, state) else {
+        return Err(ControllerReferRefusal::ReferrerGone);
+    };
+    open_reported_refer(state, pending, call_id, referrer_on_a_leg, timeout_secs)
+}
+
+/// [`b2bua_accept_refer_script_with_state`] on the running dispatcher.
+pub fn b2bua_accept_refer_script(
+    call_id: &str,
+    timeout_secs: Option<u32>,
+) -> Result<u32, ControllerReferRefusal> {
+    let Some(control) = B2BUA_CONTROL.get() else {
+        return Err(ControllerReferRefusal::Gone);
+    };
+    let _enter = control.runtime.enter();
+    b2bua_accept_refer_script_with_state(&control.state, call_id, timeout_secs)
+}
+
+/// [`b2bua_complete_refer_with_state`] on the running dispatcher, for
+/// `b2bua.complete_refer()`.
+pub fn b2bua_complete_refer(
+    sip_call_id: &str,
+    code: u16,
+    reason: Option<&str>,
+) -> Result<(), ControllerReferRefusal> {
+    let Some(control) = B2BUA_CONTROL.get() else {
+        return Err(ControllerReferRefusal::Gone);
+    };
+    let _enter = control.runtime.enter();
+    b2bua_complete_refer_with_state(&control.state, sip_call_id, code, reason)
+}
+
+/// The REFER `pending`, taken for its application or its script to carry out:
+/// the subscription record, then the `202` and the first NOTIFY.
+fn open_reported_refer(
+    state: &DispatcherState,
+    pending: PendingInboundRefer,
+    call_id: &str,
+    referrer_on_a_leg: bool,
+    timeout_secs: Option<u32>,
+) -> Result<u32, ControllerReferRefusal> {
     let expires = timeout_secs
         .unwrap_or(CONTROLLER_REFER_DEFAULT_SECS)
         .clamp(1, CONTROLLER_REFER_MAX_SECS);
@@ -211,7 +272,7 @@ pub fn b2bua_accept_refer_controller_with_state(
     // Recorded before the 202 goes out: the referrer may send another REFER
     // the moment it has it, and that one has to find this one open.
     let opened = state.controller_refers.insert(
-        &call_id,
+        call_id,
         ControllerRefer {
             referrer_on_a_leg,
             event_id,
@@ -219,7 +280,7 @@ pub fn b2bua_accept_refer_controller_with_state(
         },
     );
     if !opened {
-        warn!(call_id = %call_id, "control plane: accept_refer (controller) — a transfer is already awaiting its report on this call, 491");
+        warn!(call_id = %call_id, "B2BUA REFER: accept_refer (controller/script) — a transfer is already awaiting its report on this call, 491");
         b2bua_refer_send_final(
             &pending.inbound,
             &pending.message,
@@ -233,7 +294,7 @@ pub fn b2bua_accept_refer_controller_with_state(
     let notified = send_refer_accepted(
         &pending.inbound,
         &pending.message,
-        &call_id,
+        call_id,
         referrer_on_a_leg,
         event_id,
         expires,
@@ -245,14 +306,14 @@ pub fn b2bua_accept_refer_controller_with_state(
             referrer_on_a_leg,
             target = %pending.refer_to.uri,
             expires,
-            "B2BUA REFER: accepted for its controller to carry out — 202 + NOTIFY 100 Trying, nothing dialled"
+            "B2BUA REFER: accepted for its controller or script to carry out — 202 + NOTIFY 100 Trying, nothing dialled"
         );
     } else {
         // The 202 is out; the leg it came from is not on the call any more.
         // The record stays so the report, or the deadline, can clear it.
         warn!(
             call_id = %call_id,
-            "B2BUA REFER: accepted for its controller, but the referrer's leg is gone — 202 sent, no NOTIFY"
+            "B2BUA REFER: accepted for its controller or script, but the referrer's leg is gone — 202 sent, no NOTIFY"
         );
     }
     Ok(expires)

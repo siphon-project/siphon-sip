@@ -416,6 +416,36 @@ class _B2buaNamespace:
             return False
         return control.refer(call_id, target, replaces)
 
+    def complete_refer(self, call_id, code, reason=None):
+        """Report how a REFER the script accepted with
+        ``call.accept_refer(mode="script")`` went, ending its implicit
+        subscription: a NOTIFY whose ``message/sipfrag`` body is the status line
+        of ``code`` (RFC 3515 §2.4.5), with ``Subscription-State: terminated``.
+        A 2xx tells the referrer it succeeded, anything else that it failed.
+
+        Args:
+            call_id: the SIP Call-ID of the dialog the REFER came in
+                (``call.call_id`` in ``@b2bua.on_refer``).
+            code: the final status to report, 200-699.
+            reason: the reason phrase; the usual one for ``code`` when omitted.
+
+        Returns:
+            bool: True once the NOTIFY is sent. False when no REFER on that call
+            is awaiting its report (already reported, its deadline passed and
+            siphon reported 503 for it, or the referrer hung up).
+
+        Usage:
+            @b2bua.on_refer
+            async def on_refer(call):
+                call.accept_refer(mode="script")
+                code = await add_to_conference(call.refer_to)
+                b2bua.complete_refer(call.call_id, code)
+        """
+        control = object.__getattribute__(self, "__dict__").get("_control")
+        if control is None:
+            return False
+        return control.complete_refer(call_id, code, reason)
+
     def replace_peer(
         self,
         call_id,

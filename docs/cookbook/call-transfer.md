@@ -41,8 +41,10 @@ call.accept_refer(target=None, next_hop=None, mode=None)
     # Accept the transfer.
     #   target=   rewrite the destination (default: call.refer_to verbatim)
     #   next_hop= steer egress without changing the R-URI shape
-    #   mode=     "terminate" | "transparent" | None
+    #   mode=     "terminate" | "transparent" | "script" | None
     #             None -> b2bua.default_refer_mode (config; default "terminate")
+    #             "script": 202 + NOTIFY 100 now, nothing dialled; the script
+    #             reports with b2bua.complete_refer() (section 4b)
 call.reject_refer(code, reason)      # decline the transfer (e.g. 603 Decline)
 ```
 
@@ -659,6 +661,32 @@ Alice (A-leg)            siphon 198.51.100.1
      |  ACK                     |
      |------------------------->|
 ```
+
+## 4b. A REFER the script carries out itself
+
+A call siphon answered itself has no far leg to transfer, and a REFER in its
+dialog may ask for something else: a participant asking a conference focus to
+add the party in its Refer-To to the conference (RFC 4579 §5.5), and staying
+where it is. `accept_refer(mode="script")` answers `202 Accepted` and sends the
+first NOTIFY (`SIP/2.0 100 Trying`) at once, before the handler returns, and
+dials nothing. The handler does the work and reports it with
+`b2bua.complete_refer(call_id, code, reason=None)`, the NOTIFY that ends the
+subscription (RFC 3515 §2.4.5):
+
+```python
+from siphon import b2bua
+
+@b2bua.on_refer
+async def on_refer(call):
+    call.accept_refer(mode="script", timeout=60)
+    code = await add_to_conference(call.refer_to)   # e.g. 200, 486, 408
+    b2bua.complete_refer(call.call_id, code)
+```
+
+A second REFER on the call while the first awaits its report is answered
+`491 Request Pending`. A script that has not reported after `timeout` seconds
+(default 60, at most 180) is reported for with `503 Service Unavailable`.
+`complete_refer` returns `False` when there is nothing left to report on.
 
 ## 5. Outbound: IVR / TAS offload
 
