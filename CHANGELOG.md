@@ -15,6 +15,15 @@ entry, but a working config keeps working.
 
 ### Added
 
+- **`diameter.cx_uar` and `diameter.cx_lir` return the Server-Capabilities the
+  HSS sent.** Their dict has a new `server_capabilities` key: `None`, or
+  `{"mandatory": [...], "optional": [...], "server_names": [...]}` in the order
+  the HSS sent them (TS 29.229 §6.3.4). An I-CSCF needs it to select an S-CSCF
+  when the HSS returns capabilities instead of a Server-Name, which it does for
+  a UAR of type REGISTRATION_AND_CAPABILITIES (TS 29.228 §6.1.1.1) and may do
+  in a LIA (§6.1.4.1); with only `server_name` to read, S-CSCF failover had
+  nothing to choose from.
+
 - **`@b2bua.on_reoffer` and `@b2bua.on_reoffer_answered`: a script sees the
   re-INVITEs and UPDATEs of a bridged call.** siphon relayed a hold or a resume
   between the two parties, through the media engine where the call is

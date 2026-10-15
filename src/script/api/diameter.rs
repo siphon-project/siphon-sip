@@ -64,7 +64,7 @@ use crate::diameter::codec::{
     encode_avp_u32, encode_avp_utf8, encode_diameter_message, encode_vendor_specific_app_id,
     FLAG_PROXIABLE, FLAG_REQUEST,
 };
-use crate::diameter::cx::{octet_string_as_utf8, required_str};
+use crate::diameter::cx::octet_string_as_utf8;
 use crate::diameter::dictionary::{self, avp};
 use crate::diameter::rf::{self, AccountingAnswer, AccountingParams, AccountingRecordType};
 use crate::diameter::ro::{
@@ -1059,8 +1059,12 @@ impl PyDiameter {
     ///         5.3.1.2).
     ///
     /// Returns:
-    ///     Dict with ``result_code`` (int) and ``server_name`` (str or None),
-    ///     or ``None`` if no Diameter peer is connected.
+    ///     Dict with ``result_code`` (int), ``server_name`` (str or None) and
+    ///     ``server_capabilities``: ``None``, or the Server-Capabilities AVP
+    ///     (TS 29.229 clause 6.3.4) as a dict of ``mandatory`` and
+    ///     ``optional`` (lists of int) and ``server_names`` (list of str), the
+    ///     S-CSCFs the HSS lets the I-CSCF choose from. ``None`` if no
+    ///     Diameter peer is connected.
     ///
     /// **Awaitable** — returns a coroutine, so `await` it. The request runs on
     /// tokio rather than on the calling thread, which for an `async def` handler
@@ -1100,17 +1104,9 @@ impl PyDiameter {
                 .await;
 
             match answer {
-                Ok(message) => {
-                    let result_code = extract_result_code(&message.avps);
-                    let server_name = required_str(&message.avps, "Server-Name");
-
-                    Python::attach(|python| {
-                        let dict = PyDict::new(python);
-                        dict.set_item("result_code", result_code)?;
-                        dict.set_item("server_name", server_name)?;
-                        Ok(Some(dict.unbind()))
-                    })
-                }
+                Ok(message) => Python::attach(|python| {
+                    super::diameter_cx::server_answer_dict(python, &message).map(Some)
+                }),
                 Err(error) => {
                     warn!(error = %error, "cx_uar failed");
                     Ok(None)
@@ -1438,8 +1434,12 @@ impl PyDiameter {
     ///     public_identity: The target user's public identity.
     ///
     /// Returns:
-    ///     Dict with ``result_code`` (int) and ``server_name`` (str or None),
-    ///     or ``None`` if no Diameter peer is connected.
+    ///     Dict with ``result_code`` (int), ``server_name`` (str or None) and
+    ///     ``server_capabilities``: ``None``, or the Server-Capabilities AVP
+    ///     (TS 29.229 clause 6.3.4) as a dict of ``mandatory`` and
+    ///     ``optional`` (lists of int) and ``server_names`` (list of str), the
+    ///     S-CSCFs the HSS lets the I-CSCF choose from. ``None`` if no
+    ///     Diameter peer is connected.
     ///
     /// **Awaitable** — returns a coroutine, so `await` it. The request runs on
     /// tokio rather than on the calling thread, which for an `async def` handler
@@ -1467,17 +1467,9 @@ impl PyDiameter {
             let answer = client.send_lir(&public_identity).await;
 
             match answer {
-                Ok(message) => {
-                    let result_code = extract_result_code(&message.avps);
-                    let server_name = required_str(&message.avps, "Server-Name");
-
-                    Python::attach(|python| {
-                        let dict = PyDict::new(python);
-                        dict.set_item("result_code", result_code)?;
-                        dict.set_item("server_name", server_name)?;
-                        Ok(Some(dict.unbind()))
-                    })
-                }
+                Ok(message) => Python::attach(|python| {
+                    super::diameter_cx::server_answer_dict(python, &message).map(Some)
+                }),
                 Err(error) => {
                     warn!(error = %error, "cx_lir failed");
                     Ok(None)

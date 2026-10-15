@@ -137,6 +137,59 @@ pub(crate) fn sar_answer_dict(
     Ok(dict.unbind())
 }
 
+/// The dict `diameter.cx_uar` and `diameter.cx_lir` resolve to: `result_code`,
+/// `server_name` (the top-level Server-Name, or `None`) and
+/// `server_capabilities`, the Server-Capabilities AVP or `None` when the HSS
+/// sent none (TS 29.229 clause 6.3.4). A UAA and a LIA carry the same two
+/// AVPs (TS 29.228 clauses 6.1.1.1 and 6.1.4.1).
+pub(crate) fn server_answer_dict(
+    python: Python<'_>,
+    answer: &DiameterMessage,
+) -> PyResult<Py<PyDict>> {
+    let dict = PyDict::new(python);
+    dict.set_item(
+        "result_code",
+        crate::diameter::rx::extract_result_code(&answer.avps),
+    )?;
+    dict.set_item("server_name", cx::required_str(&answer.avps, "Server-Name"))?;
+    dict.set_item("server_capabilities", server_capabilities(python, answer)?)?;
+    Ok(dict.unbind())
+}
+
+/// Server-Capabilities as `{"mandatory": [int], "optional": [int],
+/// "server_names": [str]}`, each list in the order the HSS sent it, or `None`
+/// without the AVP.
+fn server_capabilities<'py>(
+    python: Python<'py>,
+    answer: &DiameterMessage,
+) -> PyResult<Option<Bound<'py, PyDict>>> {
+    let vendor = dictionary::VENDOR_3GPP;
+    let Ok(message) = DiameterMsg::from_wire(&answer.raw) else {
+        return Ok(None);
+    };
+    let Some(group) = message.find(avp::SERVER_CAPABILITIES, vendor) else {
+        return Ok(None);
+    };
+    let children = members(group);
+    let of = |code: u32| {
+        children
+            .iter()
+            .filter(move |c| c.code == code && c.vendor == vendor)
+    };
+    let mandatory: Vec<u32> = of(avp::MANDATORY_CAPABILITY)
+        .filter_map(Avp::as_u32)
+        .collect();
+    let optional: Vec<u32> = of(avp::OPTIONAL_CAPABILITY)
+        .filter_map(Avp::as_u32)
+        .collect();
+    let names: Vec<String> = of(avp::SERVER_NAME).filter_map(Avp::as_str).collect();
+    let dict = PyDict::new(python);
+    dict.set_item("mandatory", mandatory)?;
+    dict.set_item("optional", optional)?;
+    dict.set_item("server_names", names)?;
+    Ok(Some(dict))
+}
+
 /// The members of a grouped AVP, whether or not the dictionary knew it was one.
 fn members(group: &Avp) -> Vec<Avp> {
     match &group.value {
@@ -470,6 +523,132 @@ mod tests {
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[0]["User-Name"], PRIVATE_IDENTITY);
         assert_eq!(requests[1]["User-Name"], "private@example.com");
+    }
+
+    /// Server-Capabilities written out from TS 29.229 clause 6.3.4: two
+    /// Mandatory-Capability, one Optional-Capability, two Server-Name.
+    fn capabilities_avp() -> Vec<u8> {
+        let mut group = Vec::new();
+        group.extend_from_slice(&encode_avp_u32_3gpp(604, 7));
+        group.extend_from_slice(&encode_avp_u32_3gpp(604, 3));
+        group.extend_from_slice(&encode_avp_u32_3gpp(605, 9));
+        group.extend_from_slice(&encode_avp_utf8_3gpp(602, "sip:scscf-a.example.net:6060"));
+        group.extend_from_slice(&encode_avp_utf8_3gpp(602, "sip:scscf-b.example.net:6060"));
+        encode_avp_grouped_3gpp(603, &group)
+    }
+
+    fn capabilities_answer(command_code: u32) -> DiameterMessage {
+        let mut avps = Vec::new();
+        avps.extend_from_slice(&encode_avp_utf8(263, "icscf;1;1"));
+        avps.extend_from_slice(&encode_avp_u32(268, 2001));
+        avps.extend_from_slice(&capabilities_avp());
+        let wire = encode_diameter_message(FLAG_PROXIABLE, command_code, 16_777_216, 1, 1, &avps);
+        decode_diameter(&wire).unwrap()
+    }
+
+    fn assert_capabilities(dict: &Bound<'_, PyAny>) {
+        let capabilities = dict.get_item("server_capabilities").unwrap();
+        let mandatory: Vec<u32> = capabilities
+            .get_item("mandatory")
+            .unwrap()
+            .extract()
+            .unwrap();
+        let optional: Vec<u32> = capabilities
+            .get_item("optional")
+            .unwrap()
+            .extract()
+            .unwrap();
+        let names: Vec<String> = capabilities
+            .get_item("server_names")
+            .unwrap()
+            .extract()
+            .unwrap();
+        assert_eq!(mandatory, vec![7, 3]);
+        assert_eq!(optional, vec![9]);
+        assert_eq!(
+            names,
+            vec![
+                "sip:scscf-a.example.net:6060",
+                "sip:scscf-b.example.net:6060"
+            ]
+        );
+    }
+
+    #[test]
+    fn server_answer_dict_carries_the_capabilities_of_a_uaa_and_a_lia() {
+        pyo3::Python::initialize();
+        pyo3::Python::attach(|python| {
+            for command_code in [300, 302] {
+                let dict = server_answer_dict(python, &capabilities_answer(command_code)).unwrap();
+                let dict = dict.bind(python).clone().into_any();
+                let code: u32 = dict.get_item("result_code").unwrap().extract().unwrap();
+                assert_eq!(code, 2001);
+                // The names inside Server-Capabilities are candidates, not
+                // the assigned S-CSCF.
+                assert!(dict.get_item("server_name").unwrap().is_none());
+                assert_capabilities(&dict);
+            }
+        });
+    }
+
+    #[test]
+    fn server_answer_dict_without_capabilities_says_none() {
+        pyo3::Python::initialize();
+        pyo3::Python::attach(|python| {
+            let mut avps = Vec::new();
+            avps.extend_from_slice(&encode_avp_utf8(263, "icscf;1;1"));
+            avps.extend_from_slice(&encode_avp_u32(268, 2001));
+            avps.extend_from_slice(&encode_avp_utf8_3gpp(602, SCSCF_URI));
+            let wire = encode_diameter_message(FLAG_PROXIABLE, 300, 16_777_216, 1, 1, &avps);
+            let dict = server_answer_dict(python, &decode_diameter(&wire).unwrap()).unwrap();
+            let dict = dict.bind(python);
+            let name: String = dict
+                .get_item("server_name")
+                .unwrap()
+                .unwrap()
+                .extract()
+                .unwrap();
+            assert_eq!(name, SCSCF_URI);
+            assert!(dict
+                .get_item("server_capabilities")
+                .unwrap()
+                .unwrap()
+                .is_none());
+        });
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cx_uar_and_cx_lir_return_the_capabilities_the_hss_sent() {
+        use crate::diameter::cx_test_support::{answer_scaffold, finish_answer, MockHss};
+        pyo3::Python::initialize();
+        let hss = MockHss::start(|request| {
+            let mut avps = answer_scaffold(request);
+            avps.extend_from_slice(&encode_avp_u32(268, 2001));
+            avps.extend_from_slice(&capabilities_avp());
+            finish_answer(request, &avps)
+        })
+        .await;
+        let manager = Arc::new(DiameterManager::new());
+        manager.register("hss".to_string(), Arc::clone(&hss.client));
+        let diameter = PyDiameter::new(manager);
+        tokio::task::spawn_blocking(move || {
+            pyo3::Python::attach(|python| {
+                let diameter = Py::new(python, diameter).unwrap();
+                let diameter = diameter.bind(python);
+                let uar_keywords = PyDict::new(python);
+                uar_keywords.set_item("user_auth_type", 2).unwrap();
+                for (method, keywords) in
+                    [("cx_uar", uar_keywords), ("cx_lir", PyDict::new(python))]
+                {
+                    let arguments = pyo3::types::PyTuple::new(python, [PUBLIC_IDENTITY]).unwrap();
+                    let result = call(python, diameter, method, arguments, keywords).unwrap();
+                    assert_capabilities(&result);
+                }
+            });
+        })
+        .await
+        .unwrap();
+        assert_eq!(hss.requests().len(), 2);
     }
 
     #[test]
