@@ -79,7 +79,7 @@ Content-Length: 0
             check_it="true" assign_to="reason" />
       <ereg regexp="SIPpTag00" search_in="hdr" header="To:"
             check_it="true" assign_to="caller_tag" />
-      <ereg regexp="^BYE sip:alice@" search_in="msg"
+      <ereg regexp="BYE sip:alice@" search_in="msg"
             check_it="true" assign_to="request_uri" />
     </action>
   </recv>

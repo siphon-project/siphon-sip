@@ -43,7 +43,7 @@ a=rtpmap:0 PCMU/8000
     <action>
       <ereg regexp="cause=503" search_in="hdr" header="Reason:"
             check_it="true" assign_to="reason" />
-      <ereg regexp="^ *3 BYE" search_in="hdr" header="CSeq:"
+      <ereg regexp="3 BYE" search_in="hdr" header="CSeq:"
             check_it="true" assign_to="cseq" />
       <ereg regexp="SIPpTag01" search_in="hdr" header="To:"
             check_it="true" assign_to="callee_tag" />
