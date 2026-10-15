@@ -71,7 +71,7 @@ pub(super) struct Caller {
 
 /// The caller's INVITE from `address`, carrying an offer and a presented
 /// identity.
-fn caller_invite(call_id: &str, address: &str) -> SipMessage {
+pub(super) fn caller_invite(call_id: &str, address: &str) -> SipMessage {
     let host = address.split(':').next().unwrap_or(address);
     let sdp = format!(
         concat!(
