@@ -1524,6 +1524,7 @@ mod tests {
     #[test]
     fn release_refuses_an_unknown_end_and_a_status_that_is_not_a_final_failure() {
         let utils = make_proxy_utils();
+        pyo3::Python::initialize();
         Python::attach(|python| {
             for (toward, status) in [("sideways", 487), ("both", 200), ("callee", 700)] {
                 let error = utils
