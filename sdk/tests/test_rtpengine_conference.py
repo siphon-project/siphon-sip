@@ -202,3 +202,56 @@ def ended(call_id, from_tag, play_id, reason, played_ms):
         )
         assert harness.rtpengine.fire_play_finished("room-1", "", 3) == 1
         assert "room playback 3 completed" in [message for _, message in harness.log.messages]
+
+
+class TestDialOut:
+    """``conference_offer`` / ``conference_answer``: a seat the focus calls
+    out, and ``conference_unbridge``."""
+
+    def test_offer_then_answer_seats_the_participant(self):
+        import asyncio
+        from siphon_sdk.mock_module import MockRtpEngine
+        engine = MockRtpEngine()
+
+        async def run():
+            sdp = await engine.conference_offer("room-1", "carol")
+            assert "m=audio" in sdp
+            assert engine.conference_offers
+            await engine.conference_answer("room-1", ("out-1@example.com", "carol"), "v=0\r\n")
+            assert engine.conference_seat("out-1@example.com") == ("room-1", "carol")
+            assert not engine.conference_offers
+            with pytest.raises(ValueError):
+                await engine.conference_answer("room-1", ("out-1@example.com", "carol"), "v=0\r\n")
+            with pytest.raises(ValueError):
+                await engine.conference_offer("room-1", "bad tag")
+
+        asyncio.run(run())
+
+    def test_an_unanswered_offer_is_left(self):
+        import asyncio
+        from siphon_sdk.mock_module import MockRtpEngine
+        engine = MockRtpEngine()
+
+        async def run():
+            await engine.conference_offer("room-2", "dave")
+            assert await engine.conference_leave("room-2", ("x@example.com", "dave"))
+            assert not engine.conference_offers
+
+        asyncio.run(run())
+
+    def test_unbridge_undoes_a_bridge(self):
+        import asyncio
+        from siphon_sdk.mock_module import MockRtpEngine
+        engine = MockRtpEngine()
+
+        async def run():
+            for room, tag in (("a", "x"), ("b", "y")):
+                await engine.conference_offer(room, tag)
+                await engine.conference_answer(room, (f"{tag}@example.com", tag), "v=0\r\n")
+            await engine.conference_bridge("a", "b", "a_to_b")
+            assert await engine.conference_unbridge("b", "a")
+            assert engine.conference_bridges == []
+            with pytest.raises(RuntimeError):
+                await engine.conference_unbridge("a", "b")
+
+        asyncio.run(run())

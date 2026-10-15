@@ -111,6 +111,60 @@ impl SiphonRtpClient {
         )
     }
 
+    /// Undo a link between two rooms, whichever way it was made.
+    pub async fn conference_unbridge(
+        &self,
+        conference_id_a: &str,
+        conference_id_b: &str,
+    ) -> Result<(), RtpEngineError> {
+        expect_ok(
+            self.conference_request(Command::ConferenceUnbridge {
+                conference_id_a: conference_id_a.to_string(),
+                conference_id_b: conference_id_b.to_string(),
+            })
+            .await?,
+        )
+    }
+
+    /// Offer a new seat the focus calls out: the engine allocates the seat's
+    /// endpoint and writes the offer (RFC 3264 §5). The seat joins the room
+    /// on [`Self::conference_answer`]. Returns the offer SDP.
+    pub async fn conference_offer(
+        &self,
+        conference_id: &str,
+        from_tag: &str,
+        role: ConferenceRole,
+        flags: &NgFlags,
+    ) -> Result<String, RtpEngineError> {
+        let result = self
+            .conference_request(Command::ConferenceOffer {
+                conference_id: conference_id.to_string(),
+                from_tag: from_tag.to_string(),
+                role,
+                profile: profile_flags_from_ng(flags),
+            })
+            .await?;
+        let offer_sdp = expect_sdp(result)?;
+        Ok(String::from_utf8_lossy(&offer_sdp).into_owned())
+    }
+
+    /// Seat an offered seat on the participant's answer.
+    pub async fn conference_answer(
+        &self,
+        conference_id: &str,
+        from_tag: &str,
+        answer_sdp: &str,
+    ) -> Result<(), RtpEngineError> {
+        expect_ok(
+            self.conference_request(Command::ConferenceAnswer {
+                conference_id: conference_id.to_string(),
+                from_tag: from_tag.to_string(),
+                sdp: answer_sdp.to_string(),
+            })
+            .await?,
+        )
+    }
+
     /// Play audio into a room as a source nobody is mixed-minus-self against.
     ///
     /// Accept-on-start, like a leg playback: the end arrives later as a
@@ -249,6 +303,47 @@ impl SiphonRtpClientSet {
     ) -> Result<(), RtpEngineError> {
         self.select(&room_affinity_key(conference_id_a))
             .conference_bridge(conference_id_a, conference_id_b, direction)
+            .await
+    }
+
+    /// Unlink two rooms on the instance that holds the first.
+    pub async fn conference_unbridge(
+        &self,
+        conference_id_a: &str,
+        conference_id_b: &str,
+    ) -> Result<(), RtpEngineError> {
+        self.select(&room_affinity_key(conference_id_a))
+            .conference_unbridge(conference_id_a, conference_id_b)
+            .await
+    }
+
+    /// Offer a seat on the instance that holds the room, binding the room to
+    /// an instance when this is its first seat.
+    pub async fn conference_offer(
+        &self,
+        conference_id: &str,
+        from_tag: &str,
+        role: ConferenceRole,
+        flags: &NgFlags,
+    ) -> Result<String, RtpEngineError> {
+        let key = room_affinity_key(conference_id);
+        let offer = self
+            .select(&key)
+            .conference_offer(conference_id, from_tag, role, flags)
+            .await?;
+        self.bind_affinity(&key);
+        Ok(offer)
+    }
+
+    /// Hand the participant's answer to the instance that made the offer.
+    pub async fn conference_answer(
+        &self,
+        conference_id: &str,
+        from_tag: &str,
+        answer_sdp: &str,
+    ) -> Result<(), RtpEngineError> {
+        self.select(&room_affinity_key(conference_id))
+            .conference_answer(conference_id, from_tag, answer_sdp)
             .await
     }
 

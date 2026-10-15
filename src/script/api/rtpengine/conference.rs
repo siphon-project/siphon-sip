@@ -134,6 +134,34 @@ fn seat_ignores(flags: &NgFlags) -> Vec<&'static str> {
     .collect()
 }
 
+/// What an offered seat does not get from a media profile: [`seat_ignores`]
+/// less the codec policy, which the engine applies to the codecs it offers.
+fn offered_seat_ignores(flags: &NgFlags) -> Vec<&'static str> {
+    seat_ignores(flags)
+        .into_iter()
+        .filter(|name| *name != "a codec policy")
+        .collect()
+}
+
+/// Refuse a seat tag that could not be a From-tag (RFC 3261 §25.1 `token`):
+/// the engine keys the seat by it, and the script puts it on the INVITE.
+fn seat_tag(tag: String) -> PyResult<String> {
+    let token = !tag.is_empty()
+        && tag.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'-' | b'.' | b'!' | b'%' | b'*' | b'_' | b'+' | b'`' | b'\'' | b'~'
+                )
+        });
+    if !token {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "rtpengine.conference_offer(seat_tag) must be a SIP token (a From-tag), got {tag:?}"
+        )));
+    }
+    Ok(tag)
+}
+
 /// A join refused because the participant's codec cannot be mixed for it is a
 /// `ValueError`, as `answer_local`'s no-encodable-codec is: the script owns the
 /// SIP answer (488, RFC 3261 §13.3.1.2). Anything else is a `RuntimeError`.
@@ -305,6 +333,129 @@ pub(super) fn bridge<'py>(
             .conference_bridge(&conference_a, &conference_b, direction)
             .await
             .map_err(|error| failure("conference_bridge", error))?;
+        Ok(true)
+    })
+}
+
+/// `rtpengine.conference_unbridge`.
+pub(super) fn unbridge<'py>(
+    engine: &PyRtpEngine,
+    python: Python<'py>,
+    conference_a: String,
+    conference_b: String,
+) -> PyResult<Bound<'py, PyAny>> {
+    let conference_a = room_id(conference_a, "conference_unbridge(conference_a)")?;
+    let conference_b = room_id(conference_b, "conference_unbridge(conference_b)")?;
+    if conference_a == conference_b {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "rtpengine.conference_unbridge unlinks two rooms; both ids name the same one",
+        ));
+    }
+    let client = Arc::clone(&engine.client);
+    pyo3_async_runtimes::tokio::future_into_py(python, async move {
+        client
+            .conference_unbridge(&conference_a, &conference_b)
+            .await
+            .map_err(|error| failure("conference_unbridge", error))?;
+        Ok(true)
+    })
+}
+
+/// `rtpengine.conference_offer`: resolves to the offer SDP for the INVITE the
+/// focus sends a participant it calls out.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn offer<'py>(
+    engine: &PyRtpEngine,
+    python: Python<'py>,
+    conference_id: String,
+    seat_tag_value: String,
+    role: &str,
+    target: Option<String>,
+    whisper_target: Option<String>,
+    profile: Option<&str>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let conference_id = room_id(conference_id, "conference_offer(conference_id)")?;
+    let from_tag = seat_tag(seat_tag_value)?;
+    let role = parse_role(role, target, whisper_target)?;
+    // The engine is the offerer toward the participant, the far side of the
+    // call the focus places: the profile's offer half shapes what it is sent.
+    let profile_name = profile.unwrap_or(super::DEFAULT_PROFILE).to_string();
+    let entry = engine.registry.get(&profile_name).ok_or_else(|| {
+        pyo3::exceptions::PyValueError::new_err(format!(
+            "unknown RTP profile '{profile_name}'; valid profiles: {}",
+            engine.registry.profile_names().join(", ")
+        ))
+    })?;
+    let flags = finalise_flags(
+        entry.offer.clone(),
+        &engine.client,
+        None,
+        MediaOverrides::default(),
+        None,
+        &profile_name,
+    )?;
+    let ignored = offered_seat_ignores(&flags);
+    if !ignored.is_empty() {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "media profile '{profile_name}' sets {}, which siphon-rtp does not apply to a \
+             conference seat; offer with a profile that leaves {} unset",
+            ignored.join(", "),
+            if ignored.len() == 1 { "it" } else { "them" }
+        )));
+    }
+    let client = Arc::clone(&engine.client);
+    pyo3_async_runtimes::tokio::future_into_py(python, async move {
+        let seat = ConferenceSeat {
+            conference_id,
+            from_tag,
+        };
+        let offer_sdp = client
+            .conference_offer(&seat, role, &flags)
+            .await
+            .map_err(|error| failure("conference_offer", error))?;
+        debug!(
+            conference_id = %seat.conference_id,
+            from_tag = %seat.from_tag,
+            "rtpengine.conference_offer: seat offered"
+        );
+        Ok(offer_sdp)
+    })
+}
+
+/// `rtpengine.conference_answer`: seat the participant on its answer.
+pub(super) fn answer<'py>(
+    engine: &PyRtpEngine,
+    python: Python<'py>,
+    conference_id: String,
+    call: &Bound<'py, PyAny>,
+    answer_sdp: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let conference_id = room_id(conference_id, "conference_answer(conference_id)")?;
+    let (call_id, seat) = seat_of(conference_id, call)?;
+    let answer_sdp = super::super::request::extract_body_bytes(answer_sdp)?;
+    if answer_sdp.is_empty() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "rtpengine.conference_answer needs the participant's answer SDP",
+        ));
+    }
+    let answer_sdp = String::from_utf8_lossy(&answer_sdp).into_owned();
+    let client = Arc::clone(&engine.client);
+    pyo3_async_runtimes::tokio::future_into_py(python, async move {
+        client
+            .conference_answer(&call_id, seat.clone(), &answer_sdp)
+            .await
+            .map_err(|error| match &error {
+                RtpEngineError::EngineError(_) => pyo3::exceptions::PyValueError::new_err(format!(
+                    "rtpengine.conference_answer refused: {error}"
+                )),
+                _ => failure("conference_answer", error),
+            })?;
+        debug!(
+            %call_id,
+            conference_id = %seat.conference_id,
+            from_tag = %seat.from_tag,
+            "rtpengine.conference_answer: seated"
+        );
         Ok(true)
     })
 }

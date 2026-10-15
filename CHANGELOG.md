@@ -103,6 +103,17 @@ entry, but a working config keeps working.
   and response siphon sends the caller in the dialog carries it (RFC 3261
   §12.1.1). A URI that is not SIP or SIPS, or a parameter that is not a
   `generic-param`, raises `ValueError`.
+- **`rtpengine.conference_offer`, `rtpengine.conference_answer` and
+  `rtpengine.conference_unbridge`: a focus calls a participant into a room,
+  and splits two linked rooms.** `conference_join` answers a participant who
+  called in, so a conference grew only by dial-in: a REFER to the focus naming
+  a user (RFC 4579 §5.5, TS 24.605 CONF) had no seat to offer. Now
+  `conference_offer(room, seat_tag)` resolves to the engine's offer for a new
+  seat, the INVITE goes out with it (`b2bua.originate(sdp=…)`), and
+  `conference_answer(room, (call_id, seat_tag), answer_sdp)` seats the
+  participant on its answer, recorded under that call so its teardown leaves
+  the room. `conference_unbridge(room_a, room_b)` undoes a
+  `conference_bridge`. Needs siphon-rtp 0.15 (`siphon-rtp-proto` 0.15).
 
 - **`diameter.cx_uar` and `diameter.cx_lir` return the Server-Capabilities the
   HSS sent.** Their dict has a new `server_capabilities` key: `None`, or

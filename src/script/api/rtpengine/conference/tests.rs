@@ -12,7 +12,7 @@ use super::super::{PyCall, PyRtpEngine};
 use super::{join_failure, parse_direction, parse_role};
 use crate::rtpengine::backend::{BridgeDirection, ConferenceRole};
 use crate::rtpengine::profile::ProfileRegistry;
-use crate::rtpengine::test_conference_engine::{accept, FakeEngine, ANSWER, OFFER};
+use crate::rtpengine::test_conference_engine::{accept, FakeEngine, ANSWER, OFFER, SEAT_OFFER};
 use crate::rtpengine::test_engine::TestEngine;
 use crate::rtpengine::{MediaBackend, MediaSessionStore};
 use crate::sip::message::SipMessage;
@@ -409,6 +409,185 @@ async fn leave_route_bridge_and_play_reach_the_engine_and_delete_leaves_a_seat()
         engine.commands()
     );
     assert_eq!(MediaBackend::conference_seat("five-a@example.com"), None);
+}
+
+/// The participant's answer to a seat the focus offered.
+const SEAT_ANSWER: &str = "v=0\r\no=- 9 9 IN IP4 198.51.100.20\r\ns=-\r\nc=IN IP4 198.51.100.20\r\nt=0 0\r\nm=audio 31000 RTP/AVP 8 101\r\na=rtpmap:8 PCMA/8000\r\na=rtpmap:101 telephone-event/8000\r\na=sendrecv\r\n";
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_seat_the_focus_calls_out_is_offered_then_seated_on_its_answer() {
+    let engine = FakeEngine::start(accept, Vec::new()).await;
+    let namespace = namespace(engine.backend(), ProfileRegistry::new());
+
+    let outcomes = with_namespace(namespace, |python, namespace| {
+        let none = PyDict::new(python);
+        let mut outcomes = Vec::new();
+        let args = PyTuple::new(python, ["room-7", "carol"]).expect("args");
+        let kwargs = PyDict::new(python);
+        kwargs.set_item("role", "listener").expect("role");
+        outcomes.push(call_verb(
+            python,
+            namespace,
+            "conference_offer",
+            &args,
+            &kwargs,
+        ));
+
+        let seat = ("out-7@example.com", "carol")
+            .into_pyobject(python)
+            .expect("pair")
+            .into_any();
+        let args = PyTuple::new(
+            python,
+            [
+                python_str(python, "room-7"),
+                seat,
+                python_str(python, SEAT_ANSWER),
+            ],
+        )
+        .expect("args");
+        outcomes
+            .push(call_verb(python, namespace, "conference_answer", &args, &none).map(|_| None));
+
+        let args = PyTuple::new(python, ["room-7", "room-8"]).expect("args");
+        outcomes
+            .push(call_verb(python, namespace, "conference_unbridge", &args, &none).map(|_| None));
+        outcomes
+    })
+    .await;
+
+    assert_eq!(
+        outcomes[0],
+        Ok(Some(SEAT_OFFER.to_string())),
+        "the offer SDP"
+    );
+    assert!(outcomes[1..].iter().all(Result::is_ok), "{outcomes:?}");
+    assert_eq!(
+        engine.frames("conference_offer"),
+        vec![
+            json!({"command": "conference_offer", "conference_id": "room-7", "from_tag": "carol",
+                    "role": {"role": "listener"}, "profile": engine.frames("conference_offer")[0]["profile"].clone()})
+        ]
+    );
+    assert_eq!(
+        engine.frames("conference_answer"),
+        vec![
+            json!({"command": "conference_answer", "conference_id": "room-7", "from_tag": "carol",
+                    "sdp": SEAT_ANSWER})
+        ]
+    );
+    assert_eq!(
+        engine.frames("conference_unbridge"),
+        vec![
+            json!({"command": "conference_unbridge", "conference_id_a": "room-7", "conference_id_b": "room-8"})
+        ]
+    );
+    // Recorded under the call that carried the offer: its teardown leaves.
+    assert_eq!(
+        MediaBackend::conference_seat("out-7@example.com").map(|seat| seat.from_tag),
+        Some("carol".to_string())
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dial_out_or_unbridge_the_engine_would_refuse_is_refused_first() {
+    let engine = FakeEngine::start(accept, Vec::new()).await;
+    let namespace = namespace(engine.backend(), ProfileRegistry::new());
+
+    let outcomes = with_namespace(namespace, |python, namespace| {
+        let none = PyDict::new(python);
+        let mut outcomes = Vec::new();
+        for (room, tag) in [("room-9", "bad tag"), ("room-9", ""), ("", "carol")] {
+            let args = PyTuple::new(python, [room, tag]).expect("args");
+            outcomes.push(call_verb(
+                python,
+                namespace,
+                "conference_offer",
+                &args,
+                &none,
+            ));
+        }
+        let args = PyTuple::new(python, ["room-9", "room-9"]).expect("args");
+        outcomes.push(call_verb(
+            python,
+            namespace,
+            "conference_unbridge",
+            &args,
+            &none,
+        ));
+        let seat = ("out-9@example.com", "carol")
+            .into_pyobject(python)
+            .expect("pair")
+            .into_any();
+        let args = PyTuple::new(
+            python,
+            [python_str(python, "room-9"), seat, python_str(python, "")],
+        )
+        .expect("args");
+        outcomes.push(call_verb(
+            python,
+            namespace,
+            "conference_answer",
+            &args,
+            &none,
+        ));
+        outcomes
+    })
+    .await;
+
+    for outcome in &outcomes {
+        assert!(
+            outcome
+                .as_ref()
+                .is_err_and(|error| error.starts_with("ValueError")),
+            "{outcome:?}"
+        );
+    }
+    assert!(engine.commands().is_empty(), "{:?}", engine.commands());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_answer_the_engine_refuses_is_a_value_error() {
+    fn refuse_answers(request: &Value) -> Value {
+        match request["command"].as_str() {
+            Some("conference_answer") => json!({"result": "error",
+                "reason": "conference_answer: the answer chose payload type 18, which was not offered"}),
+            _ => accept(request),
+        }
+    }
+    let engine = FakeEngine::start(refuse_answers, Vec::new()).await;
+    let namespace = namespace(engine.backend(), ProfileRegistry::new());
+
+    let outcome = with_namespace(namespace, |python, namespace| {
+        let seat = ("out-10@example.com", "carol")
+            .into_pyobject(python)
+            .expect("pair")
+            .into_any();
+        let args = PyTuple::new(
+            python,
+            [
+                python_str(python, "room-10"),
+                seat,
+                python_str(python, SEAT_ANSWER),
+            ],
+        )
+        .expect("args");
+        call_verb(
+            python,
+            namespace,
+            "conference_answer",
+            &args,
+            &PyDict::new(python),
+        )
+    })
+    .await;
+
+    let refused = outcome.expect_err("refused");
+    assert!(
+        refused.starts_with("ValueError") && refused.contains("not offered"),
+        "{refused}"
+    );
+    assert_eq!(MediaBackend::conference_seat("out-10@example.com"), None);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
