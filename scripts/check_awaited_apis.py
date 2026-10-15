@@ -56,7 +56,7 @@ NAMESPACE_AWAITABLE = {
         "discover_pcf_binding", "create_session", "update_session",
         "delete_session",
     },
-    "proxy": {"send_request", "enum_lookup", "enum_query"},
+    "proxy": {"send_request", "enum_lookup", "enum_query", "release"},
     "rtpengine": {
         "conference_join", "conference_leave", "conference_route",
         "conference_bridge", "conference_play", "conference_stop_play",

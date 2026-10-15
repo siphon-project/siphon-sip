@@ -31,6 +31,21 @@ entry, but a working config keeps working.
   for the new `enum.server_hold_down_secs` (default 30). New metrics:
   `siphon_enum_queries_total{outcome}`, `siphon_enum_server_up{server}`.
   `enum_lookup` is unchanged.
+- **`proxy.release(call_id)`: a proxy ends a session it Record-Routed.** A
+  P-CSCF is told by the network, not by SIP, that a call has to end: an Rx ASR
+  for a released bearer, an N5 termination, dead media. The `proxy` namespace
+  had nothing to call from those handlers. With `dialog.proxy_release: true`
+  siphon keeps the dialog state of every INVITE the script Record-Routes, and
+  `await proxy.release(call_id, reason=None, toward="both", status=487)` sends
+  a BYE toward each end built from it (TS 24.229 §5.2.8.1.2: the stored
+  Contact, tags, route set, the CSeq one above that direction's last, the
+  script's `Reason`), from the SA's port toward a UE on IPsec. A session still
+  ringing has its branches CANCELled and the caller answered `status`, with
+  `@proxy.on_cancel` run once (§5.2.8.1.1). The Rf ACR-STOP and the CDR close
+  as for a relayed BYE, and a request arriving on the released dialog before
+  its BYEs are answered gets `481` (§5.2.8.1.3). `toward="caller"` /
+  `"callee"` sends one BYE, as §5.2.8.1.2 has a P-CSCF do for the user whose
+  bearer it lost. Resolves `False` for a Call-ID it does not know.
 
 - **`diameter.cx_uar` and `diameter.cx_lir` return the Server-Capabilities the
   HSS sent.** Their dict has a new `server_capabilities` key: `None`, or

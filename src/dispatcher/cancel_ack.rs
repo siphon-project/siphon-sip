@@ -770,52 +770,26 @@ pub(super) fn handle_cancel_via_session(
     session_arc: Arc<RwLock<ProxySession>>,
     state: &DispatcherState,
 ) {
-    // Whether the INVITE already has its final response, and if it has not,
-    // the mark that from here on it has: the 487 below. Latched before
-    // anything goes on the wire, as a reply-time reject does, so that what a
-    // branch answers its CANCEL with, on whichever worker and however soon,
-    // finds the INVITE finally answered and is absorbed: neither forwarded as
-    // a second final response nor taken for a branch failure by
-    // `@proxy.on_failure`.
-    //
-    // RFC 3261 §9.2: "the CANCEL request has no effect on the processing of
-    // the original request" once that has its final response, and an INVITE
-    // server transaction sends one final response (§17.2.1). An INVITE already
-    // rejected from the reply path, or already answered by a fork branch while
-    // this session lingers for the branches still to end, gets the CANCEL's
-    // 200 and nothing after it, least of all a 487.
-    let already_answered = match session_arc.write() {
-        Ok(mut session) => {
-            let answered = session.final_response_sent
-                || session.fork_aggregator.as_ref().is_some_and(|aggregator| {
-                    match aggregator.lock() {
-                        Ok(aggregator) => aggregator.has_settled(),
-                        Err(_) => false,
-                    }
-                });
-            session.final_response_sent = true;
-            answered
-        }
-        Err(_) => {
-            error!("ProxySession lock poisoned during CANCEL handling");
-            let response = build_response(
-                &message,
-                500,
-                "Internal Server Error",
-                state.server_header.as_deref(),
-                &[],
-            );
-            send_message_from(
-                response,
-                inbound.transport,
-                inbound.remote_addr,
-                inbound.connection_id,
-                Some(inbound.local_addr),
-                state,
-            );
-            return;
-        }
-    };
+    // A poisoned session lock still owes the CANCEL a response.
+    if session_arc.read().is_err() {
+        error!("ProxySession lock poisoned during CANCEL handling");
+        let response = build_response(
+            &message,
+            500,
+            "Internal Server Error",
+            state.server_header.as_deref(),
+            &[],
+        );
+        send_message_from(
+            response,
+            inbound.transport,
+            inbound.remote_addr,
+            inbound.connection_id,
+            Some(inbound.local_addr),
+            state,
+        );
+        return;
+    }
 
     // Send 200 OK to CANCEL (RFC 3261 §9.2: always 200) on the arrival socket —
     // the 487 below already pins `session.inbound_local_addr`; keep the 200 on the
@@ -829,61 +803,117 @@ pub(super) fn handle_cancel_via_session(
         Some(inbound.local_addr),
         state,
     );
-    if already_answered {
-        debug!(
-            server_key = %invite_server_key,
-            "CANCEL for an INVITE that already has its final response — answered 200, no effect (RFC 3261 §9.2)"
-        );
-        return;
-    }
-    let session = match session_arc.read() {
-        Ok(session) => session,
-        Err(_) => {
-            error!("ProxySession lock poisoned during CANCEL handling");
-            return;
-        }
-    };
 
-    // Forward CANCEL to each client branch still pending
+    // What the caller's CANCEL adds to each branch's is why (RFC 3326), and that
+    // is relayed.
     let reasons = message
         .headers
         .get_all("Reason")
         .cloned()
         .unwrap_or_default();
+    abandon_pending_invite(
+        invite_server_key,
+        session_arc,
+        &reasons,
+        487,
+        "Request Terminated",
+        state,
+    );
+}
+
+/// Give up a proxied INVITE that has no final response yet: CANCEL every
+/// pending branch with `reasons` (RFC 3326), answer the caller `status`, run
+/// `@proxy.on_cancel` and write the CDR. The caller's CANCEL comes here
+/// (`487`), and so does `proxy.release` of a session still being established
+/// (TS 24.229 §5.2.8.1.1). Returns `false`, with nothing sent, when the INVITE
+/// already has its final response.
+pub(super) fn abandon_pending_invite(
+    invite_server_key: &TransactionKey,
+    session_arc: Arc<RwLock<ProxySession>>,
+    reasons: &[String],
+    status: u16,
+    reason_phrase: &str,
+    state: &DispatcherState,
+) -> bool {
+    // Whether the INVITE already has its final response, and if it has not,
+    // the mark that from here on it has: the final response below. Latched
+    // before anything goes on the wire, as a reply-time reject does, so that
+    // what a branch answers its CANCEL with, on whichever worker and however
+    // soon, finds the INVITE finally answered and is absorbed: neither
+    // forwarded as a second final response nor taken for a branch failure by
+    // `@proxy.on_failure`.
+    //
+    // RFC 3261 §9.2: "the CANCEL request has no effect on the processing of
+    // the original request" once that has its final response, and an INVITE
+    // server transaction sends one final response (§17.2.1). An INVITE already
+    // rejected from the reply path, or already answered by a fork branch while
+    // this session lingers for the branches still to end, gets nothing more,
+    // least of all a 487.
+    let already_answered = match session_arc.write() {
+        Ok(mut session) => {
+            let answered = session.final_response_sent
+                || session.fork_aggregator.as_ref().is_some_and(|aggregator| {
+                    match aggregator.lock() {
+                        Ok(aggregator) => aggregator.has_settled(),
+                        Err(_) => false,
+                    }
+                });
+            session.final_response_sent = true;
+            answered
+        }
+        Err(_) => {
+            error!("ProxySession lock poisoned while abandoning an INVITE");
+            return false;
+        }
+    };
+    if already_answered {
+        debug!(
+            server_key = %invite_server_key,
+            "INVITE already has its final response — nothing to abandon (RFC 3261 §9.2)"
+        );
+        return false;
+    }
+    let session = match session_arc.read() {
+        Ok(session) => session,
+        Err(_) => {
+            error!("ProxySession lock poisoned while abandoning an INVITE");
+            return false;
+        }
+    };
+
     for client_key in &session.client_keys {
         // RFC 3261 §9.1 / §16.10: the CANCEL of a branch is that branch's
         // INVITE over again (Request-URI, Route, From, To, Call-ID, CSeq
         // number, and its top Via as the one Via), so it is built from the
         // INVITE as sent, not from the caller's CANCEL, whose Request-URI and
-        // route set are the caller's. What the caller's CANCEL adds is why
-        // (RFC 3326), and that is relayed.
+        // route set are the caller's.
         //
         // Sent now to a branch that has answered with a provisional, kept for
         // one that has answered nothing, dropped for one that already has its
         // final response (RFC 3261 §9.1).
-        cancel_proxy_branch(client_key, &reasons, state);
+        cancel_proxy_branch(client_key, reasons, state);
     }
 
-    // Send 487 Request Terminated upstream using the original INVITE from the
+    // The final response upstream, built from the original INVITE of the
     // session, as the final response of that INVITE's server transaction
     // (RFC 3261 §9.2, §17.2.1).
-    let response_487 = build_response(
+    let response = build_response(
         &session.original_request,
-        487,
-        "Request Terminated",
+        status,
+        reason_phrase,
         state.server_header.as_deref(),
         &[],
     );
     send_final_through_server_transaction(
         invite_server_key,
-        response_487,
+        response,
         session.transport,
         session.source_addr,
         session.connection_id,
         session.inbound_local_addr,
         state,
     );
-    // The caller abandoned the INVITE: its dialog, and every branch's, is over.
+    // The INVITE is abandoned: its dialog, and every branch's, is over.
     proxy_dialog_invite_abandoned(&session.original_request, state);
 
     // Fire @proxy.on_cancel before the session is evicted so scripts can
@@ -916,18 +946,18 @@ pub(super) fn handle_cancel_via_session(
         drop(session);
     }
 
-    // The call's record is written, as cancelled by the caller: after the
-    // `@proxy.on_cancel` handlers, so what one of them adds to it with
-    // `cdr.write` is on it. Nothing later closes it (what the branches answer
-    // is absorbed), and an open one would sit until the day-long backstop with
-    // no record written.
+    // The call's record is written, as cancelled: after the `@proxy.on_cancel`
+    // handlers, so what one of them adds to it with `cdr.write` is on it.
+    // Nothing later closes it (what the branches answer is absorbed), and an
+    // open one would sit until the day-long backstop with no record written.
     if let Ok(session) = session_arc.read() {
-        cdr_finalize_proxy_fail(state, &session.original_request, 487);
+        cdr_finalize_proxy_fail(state, &session.original_request, status);
     }
     release_cancelled_session(&session_arc, state);
     // A retransmitted CANCEL is answered 200 and does none of this again
     // (RFC 3261 §9.2).
     remember_cancelled_invite(&state.cancelled_invites, server_key);
+    true
 }
 
 /// Leave a cancelled INVITE's session to its branches still owed a final

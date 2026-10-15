@@ -1,4 +1,5 @@
-//! RFC 4235 dialog state of registered AoRs for INVITEs the proxy relays.
+//! The dialogs of INVITEs the proxy relays: RFC 4235 dialog state of
+//! registered AoRs, and the dialog state `proxy.release` ends a session from.
 //!
 //! A B2BUA is a party to its dialogs and ends them itself; a proxy is not, so
 //! this store follows each proxied dialog from what passes through siphon:
@@ -22,6 +23,15 @@
 //! ran out, an in-dialog OPTIONS probe that finds the dialog gone at an end,
 //! the Timer C bound on ringing, and a hard lifetime. None of them tears the
 //! call down; only the reported state ends.
+//!
+//! A dialog the script Record-Routed is also kept with nobody watching it when
+//! `dialog.proxy_release` is on, until a BYE, a failure or the liveness checks
+//! end it. [`ProxyDialogStore::release`] then hands back what the BYE toward
+//! each end needs (TS 24.229 §5.2.8.1.2: the Request-URI from the stored
+//! Contact, the dialog's From, To and Call-ID, the CSeq one above the last seen
+//! in that direction, the stored route set), and keeps the released dialog
+//! until those BYEs are answered, so a request that arrives on it meanwhile is
+//! answered `481` (§5.2.8.1.3).
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -98,6 +108,13 @@ pub struct NewBranch {
     pub hop: Hop,
     /// How many Record-Route entries siphon added to it (one per socket).
     pub own_record_routes: usize,
+    /// The script Record-Routed the INVITE and `dialog.proxy_release` is on:
+    /// the dialog is kept for [`ProxyDialogStore::release`], watched or not.
+    pub releasable: bool,
+    /// The INVITE carries a Via siphon stamped on an earlier branch of this
+    /// dialog: it spiralled back (RFC 3261 §16.3), and this branch is the second
+    /// leg of the same Call-ID and tags through siphon.
+    pub spiral: bool,
 }
 
 /// What a 2xx establishing the dialog carries.
@@ -132,6 +149,61 @@ pub struct Probe {
     pub hop: Hop,
 }
 
+/// Which ends of a dialog [`ProxyDialogStore::release`] sends a BYE.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Toward {
+    Both,
+    Caller,
+    Callee,
+}
+
+impl Toward {
+    fn includes(self, end: End) -> bool {
+        matches!(
+            (self, end),
+            (Toward::Both, _) | (Toward::Caller, End::Caller) | (Toward::Callee, End::Callee)
+        )
+    }
+}
+
+/// The BYE a release owes one end of a confirmed dialog (TS 24.229
+/// §5.2.8.1.2), as the other end would send it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReleaseBye {
+    pub end: End,
+    pub request_uri: String,
+    pub route: Vec<String>,
+    pub from: String,
+    pub to: String,
+    pub call_id: String,
+    /// One above the last CSeq the released end received from the other end.
+    pub cseq: u32,
+    pub hop: Hop,
+    /// The Via branch the BYE goes out with, recorded on the released dialog
+    /// so the BYE is told apart from a request of the dialog's own ends when
+    /// it spirals back through siphon.
+    pub branch: String,
+}
+
+/// What [`ProxyDialogStore::release`] did to one dialog of the Call-ID.
+#[derive(Debug, Clone)]
+pub enum Release {
+    /// Confirmed: these BYEs are owed, and the dialog is held until each is
+    /// answered (see [`ProxyDialogStore::release_answered`]).
+    Confirmed {
+        key: DialogKey,
+        byes: Vec<ReleaseBye>,
+        reports: Vec<DialogWatch>,
+    },
+    /// Not answered yet: the INVITE of `key` is the one to abandon (CANCEL
+    /// downstream, a final response upstream, TS 24.229 §5.2.8.1.1).
+    Early { key: DialogKey },
+}
+
+/// How long a released dialog is held for its BYEs at most: 64*T1, the non-INVITE
+/// transaction timeout (RFC 3261 §17.1.2.2).
+pub const RELEASE_HOLD: Duration = Duration::from_secs(32);
+
 /// What a probe found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProbeOutcome {
@@ -150,6 +222,36 @@ struct Branch {
     ended: bool,
     hop: Hop,
     own_record_routes: usize,
+    spiral: bool,
+}
+
+/// The callee's side as the first leg through siphon sees it: the branch that
+/// leg's INVITE was answered on and the route set from there to the callee.
+/// On a spiral the 2xx reaches the second leg first, and its route set is the
+/// second leg's, so this is kept apart from [`Confirmed`].
+#[derive(Debug, Clone)]
+struct OwnLeg {
+    branch: usize,
+    route_to_callee: Vec<String>,
+}
+
+/// Where a request to one end of a confirmed dialog goes, and the From and To
+/// it carries as a request from the other end.
+#[derive(Debug, Clone)]
+struct EndTarget {
+    request_uri: String,
+    route: Vec<String>,
+    from: String,
+    to: String,
+    hop: Hop,
+}
+
+/// A dialog `proxy.release` ended, held until its BYEs are answered.
+#[derive(Debug, Clone)]
+struct Released {
+    at: Instant,
+    bye_branches: Vec<String>,
+    outstanding: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -157,7 +259,6 @@ struct Confirmed {
     callee_tag: String,
     branch: usize,
     callee_contact: Option<String>,
-    route_to_callee: Vec<String>,
     session_expires: Option<Duration>,
     refreshed_at: Instant,
     /// The last CSeq the callee received from the caller.
@@ -181,6 +282,12 @@ struct Dialog {
     route_to_caller: Vec<String>,
     branches: Vec<Branch>,
     confirmed: Option<Confirmed>,
+    own_leg: Option<OwnLeg>,
+    /// Kept for `proxy.release` whether or not anyone watches it.
+    releasable: bool,
+    /// A BYE, a failure, a CANCEL or a liveness check ended it.
+    over: bool,
+    released: Option<Released>,
 }
 
 impl Dialog {
@@ -206,8 +313,21 @@ impl Dialog {
         live(&self.caller) || self.branches.iter().any(|branch| live(&branch.watch))
     }
 
+    /// Nothing more to keep this dialog for: no watch can change, it is not
+    /// kept for a release, and no BYE of a release is still out.
+    fn is_done(&self) -> bool {
+        if self.has_live_watch() {
+            return false;
+        }
+        match &self.released {
+            Some(released) => released.outstanding == 0,
+            None => !self.releasable || self.over,
+        }
+    }
+
     /// End every watch on this dialog.
     fn end_all(&mut self) -> Vec<DialogWatch> {
+        self.over = true;
         let mut reports = Vec::new();
         reports.extend(end(&mut self.caller));
         for branch in &mut self.branches {
@@ -232,12 +352,15 @@ fn end(watch: &mut Option<DialogWatch>) -> Option<DialogWatch> {
     advance(watch, DialogState::Terminated, None)
 }
 
-/// The proxied dialogs of registered AoRs, keyed by dialog.
+/// The proxied dialogs, keyed by dialog.
 #[derive(Debug, Default)]
 pub struct ProxyDialogStore {
     dialogs: DashMap<DialogKey, Dialog>,
     /// Via branch of each tracked branch → its dialog.
     by_branch: DashMap<String, DialogKey>,
+    /// Call-ID → the caller tags of its dialogs, for `proxy.release`, which
+    /// names a session by Call-ID alone.
+    by_call_id: DashMap<String, Vec<String>>,
     /// `dialogs.len()`, kept alongside so the check every proxied message makes
     /// is one atomic load: `DashMap::len` takes a read lock on every shard.
     tracked: AtomicUsize,
@@ -263,6 +386,11 @@ impl ProxyDialogStore {
         self.by_branch.len()
     }
 
+    /// Call-ID index entries, for the leak test.
+    pub fn call_id_index_len(&self) -> usize {
+        self.by_call_id.len()
+    }
+
     pub fn contains(&self, key: &DialogKey) -> bool {
         self.dialogs.contains_key(key)
     }
@@ -276,6 +404,10 @@ impl ProxyDialogStore {
         };
         let reports: Vec<DialogWatch> = dialog.caller.iter().cloned().collect();
         self.tracked.fetch_add(1, Ordering::AcqRel);
+        self.by_call_id
+            .entry(dialog.call_id.clone())
+            .or_default()
+            .push(dialog.caller_tag.clone());
         vacant.insert(Dialog {
             created_at: now,
             caller: dialog.caller,
@@ -287,6 +419,10 @@ impl ProxyDialogStore {
             route_to_caller: dialog.route_to_caller,
             branches: Vec::new(),
             confirmed: None,
+            own_leg: None,
+            releasable: false,
+            over: false,
+            released: None,
         });
         reports
     }
@@ -300,12 +436,14 @@ impl ProxyDialogStore {
         let reports: Vec<DialogWatch> = branch.watch.iter().cloned().collect();
         self.by_branch
             .insert(branch.via_branch.clone(), key.clone());
+        dialog.releasable |= branch.releasable;
         dialog.branches.push(Branch {
             via_branch: branch.via_branch,
             watch: branch.watch,
             ended: false,
             hop: branch.hop,
             own_record_routes: branch.own_record_routes,
+            spiral: branch.spiral,
         });
         reports
     }
@@ -357,22 +495,27 @@ impl ProxyDialogStore {
                     DialogState::Confirmed,
                     to_tag,
                 ));
+                let answer = answer.unwrap_or_default();
+                let own = dialog.branches[index].own_record_routes;
+                let upstream = dialog.route_to_caller.len();
+                let downstream = answer.record_routes.len().saturating_sub(own + upstream);
+                let route_to_callee: Vec<String> = answer.record_routes[..downstream]
+                    .iter()
+                    .rev()
+                    .cloned()
+                    .collect();
+                if dialog.own_leg.is_none() && !dialog.branches[index].spiral && to_tag.is_some() {
+                    dialog.own_leg = Some(OwnLeg {
+                        branch: index,
+                        route_to_callee,
+                    });
+                }
                 if let (None, Some(to_tag)) = (&dialog.confirmed, to_tag) {
-                    let answer = answer.unwrap_or_default();
-                    let own = dialog.branches[index].own_record_routes;
-                    let upstream = dialog.route_to_caller.len();
-                    let downstream = answer.record_routes.len().saturating_sub(own + upstream);
-                    let route_to_callee: Vec<String> = answer.record_routes[..downstream]
-                        .iter()
-                        .rev()
-                        .cloned()
-                        .collect();
                     let invite_cseq = dialog.invite_cseq;
                     dialog.confirmed = Some(Confirmed {
                         callee_tag: to_tag.to_string(),
                         branch: index,
                         callee_contact: answer.contact,
-                        route_to_callee,
                         session_expires: answer.session_expires.map(Duration::from_secs),
                         refreshed_at: now,
                         last_cseq_from_caller: invite_cseq,
@@ -429,6 +572,7 @@ impl ProxyDialogStore {
         let mut reports = Vec::new();
         if let Some(mut dialog) = self.dialogs.get_mut(key) {
             if dialog.confirmed.is_none() && dialog.branches.iter().all(|branch| branch.ended) {
+                dialog.over = true;
                 reports.extend(end(&mut dialog.caller));
             }
         }
@@ -510,6 +654,7 @@ impl ProxyDialogStore {
         let mut reports = Vec::new();
         if let Some(mut dialog) = self.dialogs.get_mut(&key) {
             if method.eq_ignore_ascii_case("BYE") {
+                dialog.over = true;
                 reports.extend(end(&mut dialog.caller));
                 if let Some(watch) = dialog.callee_watch_mut() {
                     reports.extend(
@@ -595,6 +740,16 @@ impl ProxyDialogStore {
             let Some(mut dialog) = self.dialogs.get_mut(&key) else {
                 continue;
             };
+            // A release whose BYEs are still unanswered past the non-INVITE
+            // transaction timeout will not hear from them any more.
+            if let Some(released) = dialog.released.as_mut() {
+                if now.saturating_duration_since(released.at) >= RELEASE_HOLD {
+                    released.outstanding = 0;
+                }
+                drop(dialog);
+                self.forget_if_done(&key);
+                continue;
+            }
             let age = now.saturating_duration_since(dialog.created_at);
             let lifetime_over = age >= Duration::from_secs(config.max_lifetime_secs);
             let ringing_too_long =
@@ -656,16 +811,12 @@ impl ProxyDialogStore {
         let callee_live = dialog
             .callee_watch_mut()
             .is_some_and(|watch| watch.state != DialogState::Terminated);
-        let from = dialog.from.clone();
-        let to = dialog.to.clone();
-        let caller_contact = dialog.caller_contact.clone();
-        let caller_hop = dialog.caller_hop;
-        let route_to_caller = dialog.route_to_caller.clone();
-        let callee_hop = dialog
-            .confirmed
-            .as_ref()
-            .and_then(|confirmed| dialog.branches.get(confirmed.branch))
-            .map(|branch| branch.hop);
+        let toward_caller = caller_live
+            .then(|| Self::toward(dialog, End::Caller))
+            .flatten();
+        let toward_callee = callee_live
+            .then(|| Self::toward(dialog, End::Callee))
+            .flatten();
         let Some(confirmed) = dialog.confirmed.as_mut() else {
             return Vec::new();
         };
@@ -673,48 +824,64 @@ impl ProxyDialogStore {
             return Vec::new();
         }
         confirmed.next_probe_at = now + Duration::from_secs(config.probe_interval_secs);
-        let to_tagged = format!("{to};tag={}", confirmed.callee_tag);
         let mut probes = Vec::new();
-        // Toward the caller, as a request from the callee.
-        if let (true, false, Some(contact)) = (
-            caller_live,
-            confirmed.in_flight[End::Caller.index()],
-            caller_contact,
-        ) {
-            confirmed.in_flight[End::Caller.index()] = true;
+        for (end, toward, last_cseq) in [
+            (
+                End::Caller,
+                toward_caller,
+                confirmed.last_cseq_from_callee.unwrap_or(0),
+            ),
+            (End::Callee, toward_callee, confirmed.last_cseq_from_caller),
+        ] {
+            let Some(toward) = toward else {
+                continue;
+            };
+            if confirmed.in_flight[end.index()] {
+                continue;
+            }
+            confirmed.in_flight[end.index()] = true;
             probes.push(Probe {
                 key: key.clone(),
-                end: End::Caller,
-                request_uri: contact,
-                route: route_to_caller,
-                from: to_tagged.clone(),
-                to: from.clone(),
+                end,
+                request_uri: toward.request_uri,
+                route: toward.route,
+                from: toward.from,
+                to: toward.to,
                 call_id: key.0.clone(),
-                cseq: confirmed.last_cseq_from_callee.unwrap_or(0),
-                hop: caller_hop,
-            });
-        }
-        // Toward the callee, as a request from the caller.
-        if let (true, false, Some(contact), Some(hop)) = (
-            callee_live,
-            confirmed.in_flight[End::Callee.index()],
-            confirmed.callee_contact.clone(),
-            callee_hop,
-        ) {
-            confirmed.in_flight[End::Callee.index()] = true;
-            probes.push(Probe {
-                key: key.clone(),
-                end: End::Callee,
-                request_uri: contact,
-                route: confirmed.route_to_callee.clone(),
-                from,
-                to: to_tagged,
-                call_id: key.0.clone(),
-                cseq: confirmed.last_cseq_from_caller,
-                hop,
+                cseq: last_cseq,
+                hop: toward.hop,
             });
         }
         probes
+    }
+
+    /// Where a request from the other end goes to reach `end` of a confirmed
+    /// dialog, and the From and To it carries: the stored Contact as
+    /// Request-URI, the stored route set, the hop the dialog's INVITE came
+    /// from or went to (RFC 3261 §12.2.1.1). `None` without a Contact, or
+    /// before the first leg's own 2xx.
+    fn toward(dialog: &Dialog, end: End) -> Option<EndTarget> {
+        let confirmed = dialog.confirmed.as_ref()?;
+        let to_tagged = format!("{};tag={}", dialog.to, confirmed.callee_tag);
+        match end {
+            End::Caller => Some(EndTarget {
+                request_uri: dialog.caller_contact.clone()?,
+                route: dialog.route_to_caller.clone(),
+                from: to_tagged,
+                to: dialog.from.clone(),
+                hop: dialog.caller_hop,
+            }),
+            End::Callee => {
+                let own_leg = dialog.own_leg.as_ref()?;
+                Some(EndTarget {
+                    request_uri: confirmed.callee_contact.clone()?,
+                    route: own_leg.route_to_callee.clone(),
+                    from: dialog.from.clone(),
+                    to: to_tagged,
+                    hop: dialog.branches.get(own_leg.branch)?.hop,
+                })
+            }
+        }
     }
 
     /// A probe to `end` of `key` came back with `outcome`. A `481` ends that
@@ -760,15 +927,140 @@ impl ProxyDialogStore {
         reports
     }
 
-    /// Drop a dialog nobody is watching any more, and its branch index.
+    /// End the dialogs of `call_id` for `proxy.release`: every one not already
+    /// over or released. A confirmed one hands back a BYE for each end in
+    /// `toward` (TS 24.229 §5.2.8.1.2) and is held as released until they are
+    /// answered; one not yet answered hands back its key, for the INVITE to be
+    /// abandoned (§5.2.8.1.1). Every watch on either ends. Empty when the
+    /// Call-ID names no tracked dialog.
+    ///
+    /// A spiral (the on-net case: one proxy serving both access legs of one
+    /// Call-ID) is one dialog here, released from its first leg: the BYE toward
+    /// the callee follows that leg's route set, which brings it back through
+    /// siphon onto the second leg like any other in-dialog request.
+    pub fn release(&self, call_id: &str, toward: Toward, now: Instant) -> Vec<Release> {
+        let tags: Vec<String> = match self.by_call_id.get(call_id) {
+            Some(tags) => tags.clone(),
+            None => return Vec::new(),
+        };
+        let mut releases = Vec::new();
+        for tag in tags {
+            let key = (call_id.to_string(), tag);
+            let Some(mut dialog) = self.dialogs.get_mut(&key) else {
+                continue;
+            };
+            if dialog.over || dialog.released.is_some() {
+                continue;
+            }
+            if dialog.own_leg.is_none() {
+                releases.push(Release::Early { key: key.clone() });
+                continue;
+            }
+            let Some(confirmed) = dialog.confirmed.as_ref() else {
+                continue;
+            };
+            let cseq_toward = |end: End| match end {
+                End::Caller => confirmed
+                    .last_cseq_from_callee
+                    .unwrap_or(0)
+                    .saturating_add(1),
+                End::Callee => confirmed.last_cseq_from_caller.saturating_add(1),
+            };
+            let mut byes = Vec::new();
+            for end in [End::Caller, End::Callee] {
+                if !toward.includes(end) {
+                    continue;
+                }
+                let Some(target) = Self::toward(&dialog, end) else {
+                    continue;
+                };
+                byes.push(ReleaseBye {
+                    end,
+                    request_uri: target.request_uri,
+                    route: target.route,
+                    from: target.from,
+                    to: target.to,
+                    call_id: call_id.to_string(),
+                    cseq: cseq_toward(end),
+                    hop: target.hop,
+                    branch: format!("z9hG4bK-uac-{}", uuid::Uuid::new_v4().simple()),
+                });
+            }
+            let reports = dialog.end_all();
+            dialog.released = Some(Released {
+                at: now,
+                bye_branches: byes.iter().map(|bye| bye.branch.clone()).collect(),
+                outstanding: byes.len(),
+            });
+            drop(dialog);
+            self.forget_if_done(&key);
+            releases.push(Release::Confirmed { key, byes, reports });
+        }
+        releases
+    }
+
+    /// The early dialog of `key` was abandoned by a release: it is over.
+    pub fn release_early(&self, key: &DialogKey) -> Vec<DialogWatch> {
+        let reports = match self.dialogs.get_mut(key) {
+            Some(mut dialog) => dialog.end_all(),
+            None => Vec::new(),
+        };
+        self.forget_if_done(key);
+        reports
+    }
+
+    /// A BYE of a release was answered, or gave up waiting. The dialog is
+    /// forgotten once the last one is (TS 24.229 §5.2.8.1.2: "Upon receipt of
+    /// the 2xx responses for the BYE requests, the P-CSCF shall delete all
+    /// information related to the dialog").
+    pub fn release_answered(&self, key: &DialogKey) {
+        if let Some(mut dialog) = self.dialogs.get_mut(key) {
+            if let Some(released) = dialog.released.as_mut() {
+                released.outstanding = released.outstanding.saturating_sub(1);
+            }
+        }
+        self.forget_if_done(key);
+    }
+
+    /// Whether an in-dialog request is on a dialog a release ended, and is not
+    /// one of that release's own BYEs coming back through siphon on a spiral:
+    /// TS 24.229 §5.2.8.1.3 has it answered `481`. `via_branches` are the
+    /// branches of every Via the request carries.
+    pub fn is_released(
+        &self,
+        call_id: &str,
+        from_tag: &str,
+        to_tag: &str,
+        via_branches: &[String],
+    ) -> bool {
+        let Some((key, _)) = self.confirmed_key(call_id, from_tag, to_tag) else {
+            return false;
+        };
+        let Some(dialog) = self.dialogs.get(&key) else {
+            return false;
+        };
+        dialog.released.as_ref().is_some_and(|released| {
+            !via_branches
+                .iter()
+                .any(|branch| released.bye_branches.contains(branch))
+        })
+    }
+
+    /// Drop a dialog there is nothing more to keep for, and its indexes.
     fn forget_if_done(&self, key: &DialogKey) {
-        let removed = self
-            .dialogs
-            .remove_if(key, |_, dialog| !dialog.has_live_watch());
+        let removed = self.dialogs.remove_if(key, |_, dialog| dialog.is_done());
         if let Some((_, dialog)) = removed {
             self.tracked.fetch_sub(1, Ordering::AcqRel);
             for branch in dialog.branches {
                 self.by_branch.remove(&branch.via_branch);
+            }
+            if let dashmap::mapref::entry::Entry::Occupied(mut tags) =
+                self.by_call_id.entry(key.0.clone())
+            {
+                tags.get_mut().retain(|tag| tag != &key.1);
+                if tags.get().is_empty() {
+                    tags.remove();
+                }
             }
         }
     }

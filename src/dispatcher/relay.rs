@@ -407,7 +407,15 @@ pub(super) fn relay_request(
             StartLine::Request(request_line) => request_line.request_uri.to_string(),
             StartLine::Response(_) => String::new(),
         };
-        proxy_dialog_branch(message, &request_uri, flow, next_hop, &branch, state)
+        proxy_dialog_branch(
+            message,
+            &request_uri,
+            flow,
+            next_hop,
+            &branch,
+            record_routed,
+            state,
+        )
     };
     let siphon_record_routes = !record_routed && tracked.is_some();
     // The session keeps the script's own choice: a later branch of this
@@ -1033,7 +1041,7 @@ pub(super) fn relay_fork_branch(
 
     // Tracked for `DialogStateChanged`, and then Record-Routed — see the same
     // step in [`relay_request`].
-    let tracked = proxy_dialog_branch(message, target, flow, None, &branch, state);
+    let tracked = proxy_dialog_branch(message, target, flow, None, &branch, record_routed, state);
     let siphon_record_routes = !record_routed && tracked.is_some();
     let record_routed = record_routed || tracked.is_some();
     let record_routes_before = record_route_count(&relayed);

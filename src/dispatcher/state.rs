@@ -111,9 +111,13 @@ pub struct DispatcherState {
     /// Liveness settings for the dialog state `DialogStateChanged` reports
     /// (`control.dialog_state`).
     pub dialog_state_config: crate::config::DialogStateConfig,
-    /// The proxied dialogs of registered AoRs being reported, keyed by dialog.
-    /// Empty unless an app subscribes to `dialog` events.
+    /// The proxied dialogs: those of registered AoRs being reported, and with
+    /// `proxy_release` every one the script Record-Routes. Empty unless an app
+    /// subscribes to `dialog` events or `proxy_release` is on.
     pub proxy_dialogs: Arc<crate::proxy::dialog_state::ProxyDialogStore>,
+    /// `dialog.proxy_release`: keep the dialog state of every INVITE the
+    /// script Record-Routes, so `proxy.release` can end the session.
+    pub proxy_release: bool,
     pub session_timer_config: Option<crate::config::SessionTimerConfig>,
     /// B2BUA header policy library — keyed by qualified name (e.g.
     /// `"transparent-b2bua@2026"`).  Built once at startup by

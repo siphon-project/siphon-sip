@@ -159,6 +159,13 @@ fn default_auto_emit_100_trying_delay_ms() -> u64 {
 pub struct DialogConfig {
     #[serde(default = "default_dialog_backend")]
     pub backend: DialogBackendType,
+    /// Keep the dialog state of every INVITE the script Record-Routes (both
+    /// remote targets, both route sets, the tags and the last CSeq each way)
+    /// so `proxy.release(call_id)` can end the session with a BYE toward each
+    /// end (TS 24.229 §5.2.8.1.2). Off by default: it costs a store entry per
+    /// Record-Routed call for its lifetime.
+    #[serde(default)]
+    pub proxy_release: bool,
 }
 
 #[derive(Debug, Deserialize, Clone, PartialEq)]

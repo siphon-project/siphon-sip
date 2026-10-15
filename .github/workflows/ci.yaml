@@ -786,6 +786,21 @@ jobs:
       - name: Route self-identity (in-dialog BYE must be relayed, not 404'd)
         run: scripts/route_selfid_test.sh
 
+  # ── proxy.release: a proxy ending a call it Record-Routed ──────────────────
+  # TS 24.229 §5.2.8.1.2. The script releases an answered call from a timer;
+  # both ends must receive siphon's BYE built from the dialog it stored.
+  sipp-proxy-release:
+    runs-on: ubuntu-latest
+    needs: build-image
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Load the siphon image
+        uses: ./.github/actions/load-siphon-image
+
+      - name: proxy.release BYEs both ends of an answered call
+        run: scripts/proxy_release_test.sh
+
   # ── Removing an outbound registration must clear it upstream ───────────────
   # RFC 3261 §10.2.2.  Dropping siphon's own state leaves the binding on the
   # registrar until the granted Expires runs out, so a trunk that was deleted

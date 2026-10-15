@@ -1,0 +1,30 @@
+# siphon.release-test.yaml — proxy.release acceptance test (TS 24.229 §5.2.8.1.2)
+#
+# Used with: sipp/docker-compose.yaml (--profile proxy-release)
+# Script:    scripts/proxy_release_proxy.py
+#
+# `dialog.proxy_release` keeps the dialog state of every INVITE the script
+# Record-Routes, which is what lets the script end the call with a BYE toward
+# each end.
+
+listen:
+  udp:
+    - "0.0.0.0:5060"
+
+domain:
+  local:
+    - "siphon.test"
+    - "172.20.0.11"
+
+advertised_address: "172.20.0.11"
+
+script:
+  path: "scripts/proxy_release_proxy.py"
+  reload: auto
+
+dialog:
+  proxy_release: true
+
+log:
+  level: debug
+  format: pretty

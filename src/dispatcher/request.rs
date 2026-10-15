@@ -335,6 +335,12 @@ pub(super) fn handle_request(
         }
     }
 
+    // A request on a dialog `proxy.release` ended is answered 481
+    // (TS 24.229 §5.2.8.1.3), whatever the script would have done with it.
+    if answer_request_on_released_dialog(&inbound, &message, &method, state) {
+        return;
+    }
+
     // An in-dialog request of a tracked proxied dialog: a BYE ends it, here and
     // before the script, so a BYE the script answers itself ends it too.
     proxy_dialog_in_dialog_request(&message, &method, state);

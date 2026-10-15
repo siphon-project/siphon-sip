@@ -576,6 +576,106 @@ impl PyProxyUtils {
         })
     }
 
+    /// End a session this proxy Record-Routed, by its Call-ID.
+    ///
+    /// Callable from any context: a Diameter handler (`Rx:ASR`),
+    /// `@sbi.on_terminate`, a media timeout, a timer. Awaitable; resolves to `True` once the session's
+    /// release is on the wire, `False` when the Call-ID names no session this
+    /// proxy keeps (unknown, already ended, never Record-Routed). Nothing goes
+    /// on the wire for `False`, and it never raises for an unknown Call-ID.
+    ///
+    /// Needs `dialog.proxy_release: true` in `siphon.yaml`, which keeps the
+    /// dialog state of every INVITE the script Record-Routes.
+    ///
+    /// * **Confirmed dialog** (TS 24.229 §5.2.8.1.2): a BYE toward each end in
+    ///   `toward`, built from the stored dialog: the Request-URI from that
+    ///   end's Contact, the dialog's From, To and Call-ID, the CSeq one above
+    ///   the last one seen in that direction, the stored route set toward that
+    ///   end, and `reason` as the `Reason` header (RFC 3326). Toward a UE on an
+    ///   IPsec SA the BYE leaves from the SA's P-CSCF port over the SA's
+    ///   transport, as a relayed in-dialog request does (TS 33.203 §7.4).
+    /// * **Session still being established** (§5.2.8.1.1): every pending branch
+    ///   is CANCELled (with `reason`) and the caller is answered `status`;
+    ///   `@proxy.on_cancel` runs once, as for the caller's own CANCEL.
+    ///
+    /// The Rf ACR-STOP and the CDR are closed as for a relayed BYE. Media and
+    /// QoS sessions belong to the script in proxy mode and are its to end
+    /// (`rtpengine.delete`, `diameter.rx_str`), as in its BYE handler. Until
+    /// the BYEs are answered, any other request on the released dialog is
+    /// answered `481` (§5.2.8.1.3).
+    ///
+    /// A spiral (one proxy on both access legs of one Call-ID, the on-net
+    /// case) is released from its first leg: the BYE toward the callee follows
+    /// that leg's route set back through siphon onto the second leg.
+    ///
+    /// Args:
+    ///     call_id: the session's Call-ID.
+    ///     reason: a `Reason` header value, e.g.
+    ///         `'SIP;cause=503;text="Bearer released"'`. None sends none.
+    ///     toward: `"both"` (default), `"caller"` or `"callee"`: which ends of
+    ///         a confirmed dialog get a BYE. TS 24.229 §5.2.8.1.2 has a P-CSCF
+    ///         that lost the bearer of the user it serves send it toward the
+    ///         other user only.
+    ///     status: the final response the caller gets when the session is
+    ///         still being established, 300-699. Default 487.
+    ///
+    /// Raises:
+    ///     ValueError: `toward` is not one of the three, or `status` is not a
+    ///         final non-2xx status.
+    ///
+    /// Example:
+    ///
+    /// ```text
+    /// @diameter.on_request("Rx:ASR")
+    /// async def on_abort(request):
+    ///     call_id = sessions.pop(request.session_id, None)
+    ///     if call_id:
+    ///         await proxy.release(call_id, reason='SIP;cause=503;text="Bearer released"')
+    ///     return request.answer(2001)
+    /// ```
+    #[pyo3(signature = (call_id, reason=None, toward="both", status=487))]
+    fn release<'py>(
+        &self,
+        py: Python<'py>,
+        call_id: String,
+        reason: Option<String>,
+        toward: &str,
+        status: u16,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let toward = match toward.to_ascii_lowercase().as_str() {
+            "both" => crate::proxy::dialog_state::Toward::Both,
+            "caller" => crate::proxy::dialog_state::Toward::Caller,
+            "callee" => crate::proxy::dialog_state::Toward::Callee,
+            other => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "proxy.release: toward must be \"both\", \"caller\" or \"callee\", not {other:?}"
+            )))
+            }
+        };
+        if !(300..=699).contains(&status) {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "proxy.release: status must be a final non-2xx status (300-699), not {status}"
+            )));
+        }
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            // The release sends on the dispatcher's blocking paths (the TCP
+            // pool), so it runs off the async worker.
+            match tokio::task::spawn_blocking(move || {
+                crate::dispatcher::proxy_release_call(&call_id, reason.as_deref(), toward, status)
+            })
+            .await
+            {
+                Ok(released) => Ok(released),
+                Err(error) => {
+                    tracing::error!(%error, "proxy.release: the release task failed");
+                    Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "proxy.release failed: {error}"
+                    )))
+                }
+            }
+        })
+    }
+
     /// Originate an outbound SIP request.
     ///
     /// Always returns a Python awaitable — scripts must ``await`` it.
@@ -1417,6 +1517,25 @@ mod tests {
             Some("[2001:db8::53]:53".parse().expect("a literal address"))
         );
         assert_eq!(parse_enum_server("enum.example.com"), None);
+    }
+
+    /// `proxy.release` refuses arguments it cannot act on before anything
+    /// is looked up.
+    #[test]
+    fn release_refuses_an_unknown_end_and_a_status_that_is_not_a_final_failure() {
+        let utils = make_proxy_utils();
+        Python::attach(|python| {
+            for (toward, status) in [("sideways", 487), ("both", 200), ("callee", 700)] {
+                let error = utils
+                    .release(python, "call@192.0.2.1".to_string(), None, toward, status)
+                    .err()
+                    .unwrap_or_else(|| panic!("{toward} / {status} is refused"));
+                assert!(
+                    error.is_instance_of::<pyo3::exceptions::PyValueError>(python),
+                    "{toward} / {status}: {error}"
+                );
+            }
+        });
     }
 
     #[test]

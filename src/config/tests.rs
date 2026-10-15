@@ -5826,3 +5826,13 @@ fn enum_server_hold_down_loads() {
         30
     );
 }
+
+/// `dialog.proxy_release` is off unless set, and loads when set.
+#[test]
+fn dialog_proxy_release_loads() {
+    let config = Config::from_str(&backend_yaml("dialog:\n  backend: memory\n")).expect("loads");
+    assert!(!config.dialog.as_ref().expect("dialog block").proxy_release);
+    let config =
+        Config::from_str(&backend_yaml("dialog:\n  proxy_release: true\n")).expect("loads");
+    assert!(config.dialog.as_ref().expect("dialog block").proxy_release);
+}

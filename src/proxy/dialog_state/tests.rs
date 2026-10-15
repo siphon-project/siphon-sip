@@ -70,6 +70,8 @@ fn forked(store: &ProxyDialogStore, now: Instant) -> Vec<DialogWatch> {
             watch: Some(watch("sip:202", DialogDirection::Recipient, "leg-202")),
             hop: hop("198.51.100.22:5060"),
             own_record_routes: 1,
+            releasable: false,
+            spiral: false,
         },
     ));
     reports.extend(store.add_branch(
@@ -79,6 +81,8 @@ fn forked(store: &ProxyDialogStore, now: Instant) -> Vec<DialogWatch> {
             watch: None,
             hop: hop("198.51.100.7:5060"),
             own_record_routes: 1,
+            releasable: false,
+            spiral: false,
         },
     ));
     reports
@@ -426,4 +430,204 @@ fn session_expires_values_parse() {
     assert_eq!(session_expires_secs("1800;refresher=uac"), Some(1800));
     assert_eq!(session_expires_secs(" 90 "), Some(90));
     assert_eq!(session_expires_secs("soon"), None);
+}
+
+/// A dialog kept for `proxy.release` only: nobody watches it, the script
+/// Record-Routed its INVITE on one branch.
+fn releasable(store: &ProxyDialogStore, now: Instant) {
+    store.begin(
+        NewDialog {
+            call_id: CALL_ID.to_string(),
+            caller_tag: "caller-tag".to_string(),
+            caller: None,
+            caller_hop: hop("192.0.2.21:5060"),
+            caller_contact: Some("sip:201@192.0.2.21:5060".to_string()),
+            from: "<sip:201@example.com>;tag=caller-tag".to_string(),
+            to: "<sip:202@example.com>".to_string(),
+            invite_cseq: 7,
+            route_to_caller: vec!["<sip:upstream.example.com;lr>".to_string()],
+        },
+        now,
+    );
+    store.add_branch(
+        &key(),
+        NewBranch {
+            via_branch: "z9hG4bK-b1".to_string(),
+            watch: None,
+            hop: hop("198.51.100.22:5060"),
+            own_record_routes: 1,
+            releasable: true,
+            spiral: false,
+        },
+    );
+}
+
+fn released_byes(store: &ProxyDialogStore, toward: Toward, now: Instant) -> Vec<ReleaseBye> {
+    match store.release(CALL_ID, toward, now).as_slice() {
+        [Release::Confirmed { byes, .. }] => byes.clone(),
+        other => panic!("one confirmed release, not {other:?}"),
+    }
+}
+
+/// A Record-Routed dialog nobody watches is kept through its answer and
+/// released with a BYE toward each end: TS 24.229 §5.2.8.1.2, field by field.
+#[test]
+fn a_releasable_dialog_hands_back_a_bye_for_each_end() {
+    let store = ProxyDialogStore::new();
+    let now = Instant::now();
+    releasable(&store, now);
+    answer(&store, now, None);
+    assert_eq!(store.len(), 1, "kept with no watch on it");
+    store.in_dialog_request(CALL_ID, "callee-tag", "caller-tag", "INFO", Some(41), None);
+
+    let byes = released_byes(&store, Toward::Both, now);
+    assert_eq!(byes.len(), 2);
+    let to_caller = &byes[0];
+    assert_eq!(to_caller.end, End::Caller);
+    assert_eq!(to_caller.request_uri, "sip:201@192.0.2.21:5060");
+    assert_eq!(to_caller.route, ["<sip:upstream.example.com;lr>"]);
+    assert_eq!(to_caller.from, "<sip:202@example.com>;tag=callee-tag");
+    assert_eq!(to_caller.to, "<sip:201@example.com>;tag=caller-tag");
+    assert_eq!(to_caller.cseq, 42);
+    assert_eq!(to_caller.hop, hop("192.0.2.21:5060"));
+    let to_callee = &byes[1];
+    assert_eq!(to_callee.end, End::Callee);
+    assert_eq!(to_callee.request_uri, "sip:202@198.51.100.22:5060");
+    assert_eq!(to_callee.route, ["<sip:downstream.example.com;lr>"]);
+    assert_eq!(to_callee.cseq, 8, "one above the INVITE's 7");
+    assert_eq!(to_callee.hop, hop("198.51.100.22:5060"));
+    assert_ne!(to_caller.branch, to_callee.branch);
+    assert!(to_caller.branch.starts_with("z9hG4bK-uac-"));
+
+    // Held, and a request on it is refused unless it is one of the BYEs.
+    assert!(
+        store.release(CALL_ID, Toward::Both, now).is_empty(),
+        "released once"
+    );
+    assert!(store.is_released(CALL_ID, "callee-tag", "caller-tag", &[]));
+    assert!(!store.is_released(
+        CALL_ID,
+        "caller-tag",
+        "callee-tag",
+        std::slice::from_ref(&to_callee.branch)
+    ));
+    store.release_answered(&key());
+    assert_eq!(store.len(), 1, "one BYE still out");
+    store.release_answered(&key());
+    assert_eq!(store.len(), 0);
+    assert_eq!(store.call_id_index_len(), 0);
+    assert!(!store.is_released(CALL_ID, "callee-tag", "caller-tag", &[]));
+}
+
+#[test]
+fn toward_one_end_hands_back_that_bye_only() {
+    let store = ProxyDialogStore::new();
+    let now = Instant::now();
+    releasable(&store, now);
+    answer(&store, now, None);
+    let byes = released_byes(&store, Toward::Caller, now);
+    assert_eq!(byes.len(), 1);
+    assert_eq!(byes[0].end, End::Caller);
+    store.release_answered(&key());
+    assert!(store.is_empty());
+}
+
+/// Unanswered BYEs do not hold a released dialog past 64*T1.
+#[test]
+fn a_release_nobody_answers_is_dropped_after_the_hold() {
+    let store = ProxyDialogStore::new();
+    let now = Instant::now();
+    releasable(&store, now);
+    answer(&store, now, None);
+    released_byes(&store, Toward::Both, now);
+    store.sweep(now + RELEASE_HOLD / 2, &config(), &|_, _| true);
+    assert_eq!(store.len(), 1);
+    store.sweep(now + RELEASE_HOLD, &config(), &|_, _| true);
+    assert!(store.is_empty());
+    assert_eq!(store.branch_index_len(), 0);
+    assert_eq!(store.call_id_index_len(), 0);
+}
+
+/// Before an answer the release is the INVITE's to abandon.
+#[test]
+fn an_unanswered_dialog_is_released_as_early() {
+    let store = ProxyDialogStore::new();
+    let now = Instant::now();
+    releasable(&store, now);
+    match store.release(CALL_ID, Toward::Both, now).as_slice() {
+        [Release::Early { key: released }] => assert_eq!(released, &key()),
+        other => panic!("an early release, not {other:?}"),
+    }
+    store.release_early(&key());
+    assert!(store.is_empty());
+    assert!(store.release(CALL_ID, Toward::Both, now).is_empty());
+}
+
+/// On a spiral the 2xx reaches the second leg first. The callee's side of the
+/// release is still the first leg's: its branch, its hop.
+#[test]
+fn a_spiral_leg_does_not_become_the_released_leg() {
+    let store = ProxyDialogStore::new();
+    let now = Instant::now();
+    releasable(&store, now);
+    store.add_branch(
+        &key(),
+        NewBranch {
+            via_branch: "z9hG4bK-b2".to_string(),
+            watch: None,
+            hop: hop("203.0.113.7:5060"),
+            own_record_routes: 1,
+            releasable: true,
+            spiral: true,
+        },
+    );
+    let record_routes = vec![
+        "<sip:192.0.2.1;lr>".to_string(),
+        "<sip:core.example.com;lr>".to_string(),
+        "<sip:192.0.2.1;lr>".to_string(),
+        "<sip:upstream.example.com;lr>".to_string(),
+    ];
+    for branch in ["z9hG4bK-b2", "z9hG4bK-b1"] {
+        store.branch_response(
+            branch,
+            200,
+            Some("callee-tag"),
+            Some(Answer {
+                contact: Some("sip:202@203.0.113.7:5060".to_string()),
+                record_routes: record_routes.clone(),
+                session_expires: None,
+            }),
+            now,
+            &config(),
+        );
+    }
+    let byes = released_byes(&store, Toward::Callee, now);
+    assert_eq!(byes.len(), 1);
+    assert_eq!(
+        byes[0].hop,
+        hop("198.51.100.22:5060"),
+        "the first leg's hop, not the spiral's"
+    );
+    assert_eq!(
+        byes[0].route,
+        ["<sip:core.example.com;lr>", "<sip:192.0.2.1;lr>"]
+    );
+}
+
+/// A released dialog that was also watched drains to baseline like any other.
+#[test]
+fn releases_drain_to_baseline() {
+    let store = ProxyDialogStore::new();
+    let now = Instant::now();
+    for round in 0..100u64 {
+        releasable(&store, now);
+        answer(&store, now, None);
+        let byes = released_byes(&store, Toward::Both, now);
+        for _ in &byes {
+            store.release_answered(&key());
+        }
+        assert_eq!(store.len(), 0, "round {round}");
+        assert_eq!(store.branch_index_len(), 0, "round {round}");
+        assert_eq!(store.call_id_index_len(), 0, "round {round}");
+    }
 }

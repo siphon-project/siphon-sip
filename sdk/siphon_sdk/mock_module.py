@@ -817,6 +817,8 @@ class MockProxyUtils:
         self._enum_answers: dict[str, "MockEnumAnswer"] = {}
         self.enum_queries: list[dict] = []
         self._memory_pct = 25
+        self._releasable: set[str] = set()
+        self.releases: list[dict] = []
 
     def rate_limit(self, request: Any, window_secs: float,
                    max_requests: int) -> bool:
@@ -967,6 +969,86 @@ class MockProxyUtils:
             if uri is not None:
                 return MockEnumAnswer("ok", [uri], [], None)
             return MockEnumAnswer("no_such_name", [], [], None)
+
+        return _run()
+
+    def add_releasable_session(self, call_id: str) -> None:
+        """Test helper: make ``call_id`` a session ``release()`` finds, as a
+        Record-Routed call is on a node with ``dialog.proxy_release: true``."""
+        self._releasable.add(call_id)
+
+    def release(self, call_id: str, reason: Optional[str] = None,
+                toward: str = "both", status: int = 487) -> Any:
+        """End a session this proxy Record-Routed, by its Call-ID. Awaitable.
+
+        Callable from any context: a Diameter handler (``Rx:ASR``),
+        ``@sbi.on_terminate``, a media timeout, a timer. Needs
+        ``dialog.proxy_release: true`` in ``siphon.yaml``, which keeps the
+        dialog state of every INVITE the script Record-Routes.
+
+        * A confirmed dialog gets a BYE toward each end in ``toward``, built
+          from the stored dialog (TS 24.229 §5.2.8.1.2): Request-URI from that
+          end's Contact, the dialog's From, To and Call-ID, the CSeq one above
+          the last seen in that direction, the stored route set, ``reason``
+          as the ``Reason`` header. Toward a UE on IPsec it leaves from the
+          SA's port, as a relayed in-dialog request does.
+        * A session still being established has every pending branch
+          CANCELled (with ``reason``) and the caller answered ``status``;
+          ``@proxy.on_cancel`` runs once (§5.2.8.1.1).
+
+        The Rf ACR-STOP and the CDR close as for a relayed BYE. Media and QoS
+        sessions are the script's to end, as in its BYE handler. Until the
+        BYEs are answered, other requests on the dialog are answered 481
+        (§5.2.8.1.3).
+
+        Args:
+            call_id: the session's Call-ID.
+            reason: ``Reason`` header value, e.g.
+                ``'SIP;cause=503;text="Bearer released"'``.
+            toward: ``"both"`` (default), ``"caller"`` or ``"callee"``.
+            status: final response for a session still being established,
+                300-699 (default 487).
+
+        Returns:
+            ``True`` once the release is on the wire, ``False`` when the
+            Call-ID names no session (nothing is sent; never raises for it).
+
+        Raises:
+            ValueError: ``toward`` or ``status`` is not one it accepts.
+
+        Example::
+
+            @diameter.on_request("Rx:ASR")
+            async def on_abort(request):
+                call_id = sessions.pop(request.session_id, None)
+                if call_id:
+                    await proxy.release(call_id, reason='SIP;cause=503;text="Bearer released"')
+                return request.answer(2001)
+
+        In the mock, ``True`` for a Call-ID given to
+        ``add_releasable_session()`` (once), ``False`` otherwise; every call
+        is recorded on ``releases``.
+        """
+        if toward.lower() not in ("both", "caller", "callee"):
+            raise ValueError(
+                f'proxy.release: toward must be "both", "caller" or "callee", not {toward!r}'
+            )
+        if not 300 <= status <= 699:
+            raise ValueError(
+                f"proxy.release: status must be a final non-2xx status (300-699), not {status}"
+            )
+
+        async def _run() -> bool:
+            released = call_id in self._releasable
+            self._releasable.discard(call_id)
+            self.releases.append({
+                "call_id": call_id,
+                "reason": reason,
+                "toward": toward.lower(),
+                "status": status,
+                "released": released,
+            })
+            return released
 
         return _run()
 

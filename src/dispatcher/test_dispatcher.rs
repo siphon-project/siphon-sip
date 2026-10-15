@@ -102,6 +102,7 @@ pub(super) fn test_dispatcher_with_script(source: &str) -> TestDispatcher {
         rtpengine_profiles: None,
         control_inbound: None,
         dialog_state_config: crate::config::DialogStateConfig::default(),
+        proxy_release: false,
         proxy_dialogs: Arc::new(crate::proxy::dialog_state::ProxyDialogStore::new()),
         session_timer_config: None,
         header_policy_registry: Arc::new(crate::b2bua::header_policy::builtin_presets()),
