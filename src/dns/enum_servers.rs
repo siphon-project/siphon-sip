@@ -33,6 +33,15 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(2);
 /// How many attempts one server gets, by default.
 pub const DEFAULT_ATTEMPTS: usize = 2;
 
+/// The most per-server resolvers kept. They are keyed by server and bounds,
+/// which come from the script, so a script that varies `timeout_ms` per call
+/// must not grow the map without end: past this the map starts over.
+const MAX_RESOLVERS: usize = 64;
+
+/// The most servers whose hold-down is remembered. Past this the ones whose
+/// hold-down has run out are forgotten, and if that is not enough, all.
+const MAX_HELD_SERVERS: usize = 1024;
+
 /// The text form of a NAPTR record's fields.
 pub(crate) fn naptr_rule(naptr: &hickory_resolver::proto::rr::rdata::NAPTR) -> NaptrRule {
     NaptrRule {
@@ -120,6 +129,14 @@ impl EnumServers {
 
     fn mark(&self, server: SocketAddr, failed: bool, now: Instant) {
         if failed {
+            if self.held_until.len() >= MAX_HELD_SERVERS {
+                self.held_until.retain(|_, until| now < *until);
+                if self.held_until.len() >= MAX_HELD_SERVERS {
+                    // Every one still held: forgetting them only means each is
+                    // asked once more before it is held down again.
+                    self.held_until.clear();
+                }
+            }
             if !self.is_held_down(server, now) {
                 warn!(%server, hold_down_secs = self.hold_down.as_secs(), "ENUM server failed, held down");
             }
@@ -162,6 +179,9 @@ impl EnumServers {
         builder.options_mut().use_hosts_file = ResolveHosts::Never;
         match builder.build() {
             Ok(resolver) => {
+                if self.resolvers.len() >= MAX_RESOLVERS {
+                    self.resolvers.clear();
+                }
                 self.resolvers.insert(key, resolver.clone());
                 Some(resolver)
             }
@@ -459,5 +479,30 @@ mod tests {
             ask(&servers, &[live.address], number).await;
         }
         assert_eq!(servers.resolvers.len(), 1);
+    }
+
+    /// Leak gate: a script varying its bounds call by call, or naming many
+    /// servers that fail, does not grow the state without end.
+    #[tokio::test]
+    async fn varying_bounds_and_failing_servers_stay_bounded() {
+        let live = server(Behaviour::Answer("bounded")).await;
+        let servers = EnumServers::new(Duration::from_millis(1));
+        for timeout_ms in 1..=(MAX_RESOLVERS as u64 * 3) {
+            servers
+                .naptr(
+                    &[live.address],
+                    "1.0.0.0.5.5.5.1.e164.arpa.",
+                    Duration::from_millis(100 + timeout_ms),
+                    1,
+                )
+                .await;
+            assert!(servers.resolvers.len() <= MAX_RESOLVERS);
+        }
+        let now = Instant::now();
+        for port in 0..(MAX_HELD_SERVERS as u16 * 2) {
+            let failed = SocketAddr::from(([192, 0, 2, 1], 1000 + port));
+            servers.mark(failed, true, now - Duration::from_secs(1));
+            assert!(servers.held_until.len() <= MAX_HELD_SERVERS);
+        }
     }
 }
