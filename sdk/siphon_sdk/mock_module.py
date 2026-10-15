@@ -4365,14 +4365,15 @@ class MockRtpEngine:
         to_tag: Optional[str] = None,
         wait: bool = True,
     ) -> Optional[int]:
-        """Inject an audio prompt, replacing the party's live egress.
+        """Inject an audio prompt toward a party, replacing what it receives.
 
         Exactly one of ``file``/``blob``/``db_id``/``tone``/``url`` must be
-        supplied. Per
-        rtpengine semantics, ``from-tag`` (derived from ``target``) selects
-        the monologue whose outgoing audio is replaced by the prompt — the
-        **peer** of that monologue hears it. Pass ``to_tag`` to scope to a
-        specific peer in MPTY scenarios.
+        supplied. The party whose tag ``target`` gives hears the prompt: the
+        engine plays toward that leg (siphon-rtp ``play_media``, "Play audio
+        toward a leg"), and the other party keeps hearing it live. A SIP
+        object gives the From-tag, so ``play_media(call)`` plays to the
+        caller; ``(call_id, callee_tag)`` plays to the callee. Pass ``to_tag``
+        to scope to a specific peer in MPTY scenarios.
 
         Requires rtpengine built with ``--with-transcoding`` and launched
         with ``--audio-player=on-demand``. AMR-NB/WB prompts need licensed
