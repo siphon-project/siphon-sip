@@ -136,19 +136,17 @@ pub static RO_CONTROL: std::sync::OnceLock<RoControlHandle> = std::sync::OnceLoc
 ///
 /// `subscription_id` overrides the charged identity; when `None`, the party is
 /// derived from `ro.charge` (orig = calling, term = called) off the INVITE.
+///
+/// `role_of_node` overrides the Role-Of-Node (TS 32.299 V18 clause 7.2.177);
+/// when `None` it is the session case of the INVITE (see
+/// [`crate::diameter::rf_service::ims_data_from_request`]).
 pub async fn ro_authorize_b2bua(
     internal_call_id: String,
     invite: SipMessage,
     subscription_id: Option<String>,
     subscription_id_type: Option<String>,
+    role_of_node: Option<crate::diameter::ro::NodeRole>,
 ) -> RoAuthorizeOutcome {
-    use crate::diameter::ro_service::ChargeDecision;
-    let deny = |code: Option<u32>| RoAuthorizeOutcome {
-        authorized: false,
-        result_code: code,
-        granted_time: None,
-        session_id: None,
-    };
     let Some(control) = RO_CONTROL.get() else {
         // Ro not configured — the gate is a no-op that authorizes (uncharged).
         return RoAuthorizeOutcome {
@@ -157,6 +155,34 @@ pub async fn ro_authorize_b2bua(
             granted_time: None,
             session_id: None,
         };
+    };
+    ro_authorize_with(
+        control,
+        internal_call_id,
+        invite,
+        subscription_id,
+        subscription_id_type,
+        role_of_node,
+    )
+    .await
+}
+
+/// [`ro_authorize_b2bua`] against an explicit Ro handle rather than the
+/// process-wide [`RO_CONTROL`].
+pub(crate) async fn ro_authorize_with(
+    control: &RoControlHandle,
+    internal_call_id: String,
+    invite: SipMessage,
+    subscription_id: Option<String>,
+    subscription_id_type: Option<String>,
+    role_of_node: Option<crate::diameter::ro::NodeRole>,
+) -> RoAuthorizeOutcome {
+    use crate::diameter::ro_service::ChargeDecision;
+    let deny = |code: Option<u32>| RoAuthorizeOutcome {
+        authorized: false,
+        result_code: code,
+        granted_time: None,
+        session_id: None,
     };
     let charger = Arc::clone(&control.charger);
 
@@ -169,7 +195,12 @@ pub async fn ro_authorize_b2bua(
         // present event and there is no response instant yet.
         crate::diameter::rf_service::SipTimestamps::now(),
     );
-    ims_data.role_of_node = Some(crate::diameter::ro::NodeRole::B2buaRole);
+    // The role is the session case this call is charged in, which
+    // `ims_data_from_request` read off the INVITE. A B2BUA is not a role of
+    // its own in Release 18.
+    if role_of_node.is_some() {
+        ims_data.role_of_node = role_of_node;
+    }
 
     let subscriber = match subscription_id {
         Some(id) => build_ro_subscriber(&id, subscription_id_type.as_deref()),

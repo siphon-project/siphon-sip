@@ -522,6 +522,7 @@ class Call:
         *,
         subscription_id: Optional[str] = None,
         subscription_id_type: Optional[str] = None,
+        role_of_node: Optional[str] = None,
     ) -> dict:
         """Reserve prepaid credit (Ro CCR-INITIAL) BEFORE dialing the B-leg — the
         reserve-before-connect gate. Await it in ``@b2bua.on_invite`` and branch:
@@ -540,16 +541,28 @@ class Call:
         OCS cadence, disconnects mid-call on exhaustion, and sends
         CCR-TERMINATION on BYE. ``subscription_id`` overrides the charged
         identity (a ``sip:`` URI is typed as a SIP URI, never as an E.164
-        number); when omitted it comes from the ``ro.charge`` config. Returns
+        number); when omitted it comes from the ``ro.charge`` config.
+        ``role_of_node`` sets the Role-Of-Node (TS 32.299 clause 7.2.177):
+        ``"originating"``, ``"terminating"`` or ``"forwarding"`` (or ``"orig"``,
+        ``"term"``, ``"orig-cdiv"``); when omitted it is the INVITE's session
+        case, and an unknown value raises ``ValueError``. Returns
         ``{"authorized": bool, "result_code": int|None, "granted_time": int|None,
         "session_id": str|None}``.
 
         Tests can force the outcome with :meth:`set_ro_authorize_result` and
         assert on :attr:`ro_authorizations`.
         """
+        if role_of_node is not None and role_of_node.strip().lower() not in (
+            "originating", "orig", "terminating", "term", "forwarding", "orig-cdiv",
+        ):
+            raise ValueError(
+                f"unknown role_of_node {role_of_node!r}; expected one of "
+                "'originating'/'terminating'/'forwarding'"
+            )
         self._ro_authorizations.append({
             "subscription_id": subscription_id,
             "subscription_id_type": subscription_id_type,
+            "role_of_node": role_of_node,
         })
         if self._ro_authorize_result is not None:
             return dict(self._ro_authorize_result)

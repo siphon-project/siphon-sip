@@ -435,6 +435,23 @@ entry, but a working config keeps working.
   `timeout_secs` changes timing**: every relayed non-INVITE is bounded by it,
   so an element must set it below the value of the element upstream of it and
   above the one downstream. The P-CSCF and S-CSCF examples no longer set it.
+- **Ro and Rf: a B2BUA call's charging requests carry the Release 18
+  Role-Of-Node of its session case (TS 32.299 V18 clause 7.2.177). Behaviour
+  change on the wire.** `call.ro_authorize()` and the Rf auto-emit of a B2BUA
+  call sent Role-Of-Node 3, B2BUA_ROLE of earlier releases. Release 18 defines
+  only ORIGINATING_ROLE (0), TERMINATING_ROLE (1) and FORWARDING_ROLE (2), so a
+  Release 18 charging function refused the CCR-INITIAL with
+  DIAMETER_INVALID_AVP_VALUE (5004) and the call was rejected. The role is now
+  the session case of the A-leg INVITE: `P-Served-User` `sescase=orig` is 0,
+  `term` 1, and `orig-cdiv` (RFC 8498, now parsed) 2; without the header a
+  caller in a local domain is 0 and any other 1, as for the proxy records.
+  `call.ro_authorize(role_of_node=...)` overrides it with `"originating"`,
+  `"terminating"` or `"forwarding"`. **BREAKING (scripting API):**
+  `role_of_node="proxy"` and `"b2bua"` on `diameter.ro_ccr_*` and
+  `diameter.rf_acr_*` raise `ValueError`. **BREAKING (Rust library):**
+  `diameter::ro::NodeRole` loses `ProxyRole` and `B2buaRole` and gains
+  `ForwardingRole` (2); `dispatcher::ro_authorize_b2bua` takes the role
+  override as a fifth argument. See `docs/migrating-to-1.14.md`.
 
 - **IPsec: the P-CSCF never hands out an SPI a live security association
   still uses (3GPP TS 33.203 §7.1).** The SPI allocator was a counter that

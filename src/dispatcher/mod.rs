@@ -117,6 +117,8 @@ mod cancel_awaits_provisional_tests;
 #[cfg(test)]
 mod carrier_attribution_tests;
 #[cfg(test)]
+mod charging_role_of_node_tests;
+#[cfg(test)]
 mod control_bridge_elsewhere_tests;
 #[cfg(test)]
 mod control_bridge_ingress_tests;

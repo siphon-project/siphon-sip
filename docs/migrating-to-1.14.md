@@ -30,6 +30,12 @@ setup, or pass `notif_uri=`.
 `sip_call_id=` is still accepted. It is no longer sent to the PCF (TS 29.514
 has no such attribute) and shows up in siphon's own log lines for the create.
 
+`role_of_node=` on `diameter.ro_ccr_*` and `diameter.rf_acr_*` takes
+`"originating"`, `"terminating"` or `"forwarding"` (TS 32.299 V18 clause
+7.2.177). `"proxy"` and `"b2bua"` raise `ValueError`: they sent 2 and 3, and
+in Release 18 2 is FORWARDING_ROLE and 3 does not exist. Drop the argument to
+send the session case of the request, or pass the role the node serves.
+
 ## Rust library
 
 Only relevant when you link `siphon-sip` as a crate.
@@ -42,6 +48,8 @@ Only relevant when you link `siphon-sip` as a crate.
 | `config::SbiYamlConfig` | New field `notif_uri`. |
 | `diameter::DiameterClient::send_sar` | Takes a `cx::ServerAssignment` (public identity, optional User-Name, Server-Name, assignment type) where it took three arguments. |
 | `diameter::cx::build_maa_success` | Takes the private identity before the public one and answers with Result-Code 2001. |
+| `diameter::ro::NodeRole` | `ProxyRole` and `B2buaRole` are removed; `ForwardingRole` is new and is 2. Use the role the node serves. |
+| `dispatcher::ro_authorize_b2bua` | Takes a fifth argument, the Role-Of-Node override (`Option<NodeRole>`); `None` sends the session case. |
 | `diameter::cx::build_saa_success`, `build_lia_success`, `build_rta` | Answer with Result-Code 2001 where they carried Experimental-Result 2001. |
 
 ## On the wire: check before upgrading
@@ -55,6 +63,7 @@ Only relevant when you link `siphon-sip` as a crate.
 | Cx MAR of `auth.require_ims_digest`, `Public-Identity` | URI of P-Asserted-Identity, else of From | URI of the To header, per TS 24.229 clause 5.4.1.2.1 |
 | Outbound TCP connection with a request pending on it | closed after 30 s of silence | kept until the client transaction ends, then closed after 30 s of silence |
 | Outbound TCP connection from an IPsec protected port | closed after 30 s of silence | kept until the UE closes it, an error or the socket keepalive ends it; reset, not closed with a FIN, when siphon ends it |
+| Ro CCRs of `call.ro_authorize()`, Rf ACRs of `rf.auto_emit_b2bua`, `Role-Of-Node` | 3 (B2BUA_ROLE) | the session case of the A-leg INVITE: 0 originating, 1 terminating, 2 forwarding (`sescase=orig-cdiv`), per TS 32.299 V18 clause 7.2.177 |
 | Response whose TCP or TLS connection has closed | new connection to the source port of the request | new connection to the port in the `sent-by` of the Via (5060, or 5061 for TLS, when it has none), per RFC 3261 clause 18.2.2 |
 
 The flow descriptions are the one to test against the policy function in use.

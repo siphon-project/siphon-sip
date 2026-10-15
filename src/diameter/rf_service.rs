@@ -885,7 +885,8 @@ fn push_identity(into: &mut Vec<String>, raw: &str) {
 ///
 /// Role-of-Node determination follows TS 24.229 §5.4.3.2 / RFC 5502:
 /// 1. `P-Served-User` `sescase=orig` → ORIGINATING_ROLE,
-///    `sescase=term` → TERMINATING_ROLE.
+///    `sescase=term` → TERMINATING_ROLE, `sescase=orig-cdiv` →
+///    FORWARDING_ROLE (TS 32.299 V18 clause 7.2.177, RFC 8498).
 /// 2. Fallback: caller supplies an `is_local_uri` predicate so the proxy
 ///    can decide based on whether the From / P-Asserted-Identity is a
 ///    locally-served identity.  When `None`, defaults to ORIGINATING_ROLE.
@@ -963,6 +964,7 @@ where
         .and_then(|su| match su.sescase.as_deref() {
             Some("orig") => Some(NodeRole::OriginatingRole),
             Some("term") => Some(NodeRole::TerminatingRole),
+            Some("orig-cdiv") => Some(NodeRole::ForwardingRole),
             _ => None,
         })
         .or_else(|| {
@@ -1327,6 +1329,31 @@ mod tests {
             SipTimestamps::now(),
         );
         assert_eq!(ims.role_of_node, Some(NodeRole::TerminatingRole));
+    }
+
+    /// `sescase=orig-cdiv` is FORWARDING_ROLE (TS 32.299 V18 clause 7.2.177).
+    #[test]
+    fn ims_data_role_forwarding_from_orig_cdiv() {
+        let raw = concat!(
+            "INVITE sip:carol@example.com SIP/2.0\r\n",
+            "Via: SIP/2.0/UDP host;branch=z9hG4bK1\r\n",
+            "From: <sip:alice@example.com>;tag=a\r\n",
+            "To: <sip:bob@example.com>\r\n",
+            "Call-ID: c\r\n",
+            "CSeq: 1 INVITE\r\n",
+            "P-Served-User: <sip:bob@example.com>;sescase=orig-cdiv\r\n",
+            "Max-Forwards: 70\r\n",
+            "Content-Length: 0\r\n",
+            "\r\n",
+        );
+        let msg = parse_test_sip(raw);
+        let ims = ims_data_from_request(
+            &msg,
+            Some(NodeFunctionality::ApplicationServer),
+            |_| true,
+            SipTimestamps::now(),
+        );
+        assert_eq!(ims.role_of_node, Some(NodeRole::ForwardingRole));
     }
 
     #[test]
