@@ -18,6 +18,11 @@
 //! instead of a copy of its URI. The hash is keyed per registrar (std's
 //! `RandomState`), so a peer cannot choose Contacts that collide.
 //!
+//! Each binding is also keyed by the address its REGISTER came from, for
+//! `binding_for_source`, the dialog-state match over a captured flow. Both
+//! keys are fixed for the life of a binding, so the same maintenance carries
+//! both.
+//!
 //! Only UE bindings are indexed: AS capability records are never what a
 //! Contact lookup returns.
 //!
@@ -30,6 +35,7 @@
 //! [`same_contact`]: super::same_contact
 
 use std::hash::{BuildHasher, BuildHasherDefault, Hasher};
+use std::net::SocketAddr;
 
 use dashmap::DashMap;
 
@@ -58,27 +64,75 @@ impl Hasher for PassThrough {
     }
 }
 
-/// The AoRs holding a binding with one Contact identity, once per binding.
-/// Nearly always one.
+/// The AoRs holding a binding with one identity, with how many bindings each.
+/// Nearly always one AoR with one binding. Many AoRs share a source address
+/// behind a PBX or an SBC, so the shared case is a counted map: adding and
+/// forgetting a binding stay O(1) however many AoRs it holds, and the map is
+/// boxed so the common case pays no more than a pointer for it.
 #[derive(Debug)]
 enum Holders {
     One(Box<str>),
-    Many(Box<[Box<str>]>),
+    // Boxed on purpose: an unboxed map would widen every slot of the index
+    // from 16 to 56 bytes to serve the rare shared identity.
+    #[allow(clippy::box_collection)]
+    Many(Box<std::collections::HashMap<Box<str>, u32>>),
 }
 
 impl Holders {
-    fn as_slice(&self) -> &[Box<str>] {
+    /// Each AoR once.
+    fn aors(&self) -> Vec<String> {
         match self {
-            Holders::One(aor) => std::slice::from_ref(aor),
-            Holders::Many(aors) => aors,
+            Holders::One(aor) => vec![aor.to_string()],
+            Holders::Many(counts) => counts.keys().map(|aor| aor.to_string()).collect(),
         }
     }
 
-    /// `self` with one more `aor`.
-    fn with(&self, aor: &str) -> Holders {
-        let mut aors: Vec<Box<str>> = self.as_slice().to_vec();
-        aors.push(aor.into());
-        Holders::Many(aors.into_boxed_slice())
+    /// Each AoR once per binding, sorted.
+    #[cfg(test)]
+    fn bindings(&self) -> Vec<String> {
+        let mut aors: Vec<String> = match self {
+            Holders::One(aor) => vec![aor.to_string()],
+            Holders::Many(counts) => counts
+                .iter()
+                .flat_map(|(aor, count)| std::iter::repeat_n(aor.to_string(), *count as usize))
+                .collect(),
+        };
+        aors.sort();
+        aors
+    }
+
+    /// Count one more binding of `aor`.
+    fn add(&mut self, aor: &str) {
+        if let Holders::One(held) = self {
+            let mut counts = std::collections::HashMap::with_capacity(2);
+            counts.insert(std::mem::take(held), 1);
+            *self = Holders::Many(Box::new(counts));
+        }
+        if let Holders::Many(counts) = self {
+            *counts.entry(aor.into()).or_insert(0) += 1;
+        }
+    }
+
+    /// Count one binding of `aor` fewer. `false` when nothing is left.
+    fn remove(&mut self, aor: &str) -> bool {
+        match self {
+            Holders::One(held) => held.as_ref() != aor,
+            Holders::Many(counts) => {
+                if let Some(count) = counts.get_mut(aor) {
+                    *count -= 1;
+                    if *count == 0 {
+                        counts.remove(aor);
+                    }
+                }
+                // Back to the compact form once one binding is left.
+                if counts.len() == 1 && counts.values().all(|count| *count == 1) {
+                    if let Some(last) = counts.keys().next().cloned() {
+                        *self = Holders::One(last);
+                    }
+                }
+                !matches!(self, Holders::Many(counts) if counts.is_empty())
+            }
+        }
     }
 }
 
@@ -140,22 +194,45 @@ impl ContactIndex {
         hasher.finish()
     }
 
-    /// The identities of the UE bindings among `contacts`, one per binding.
+    /// The identity of the address a binding's REGISTER came from: what
+    /// `binding_for_source` matches. Tagged apart from every Contact identity,
+    /// whose first byte is a scheme tag of 0 to 3.
+    pub(crate) fn source_key_of(&self, source: SocketAddr) -> u64 {
+        let mut hasher = self.keys.build_hasher();
+        hasher.write_u8(0xff);
+        match source.ip() {
+            std::net::IpAddr::V4(address) => hasher.write(&address.octets()),
+            std::net::IpAddr::V6(address) => hasher.write(&address.octets()),
+        }
+        hasher.write_u16(source.port());
+        hasher.finish()
+    }
+
+    /// The identities one UE binding is indexed under: its Contact, and the
+    /// address its REGISTER came from when that is known. Neither changes for
+    /// as long as the binding is stored; a refresh replaces the binding.
+    pub(crate) fn keys_of_binding(&self, contact: &Contact) -> impl Iterator<Item = u64> {
+        let indexed = contact.kind == ContactKind::Ue;
+        let by_contact = indexed.then(|| self.key_of(&contact.uri));
+        let by_source = contact
+            .source_addr
+            .filter(|_| indexed)
+            .map(|source| self.source_key_of(source));
+        by_contact.into_iter().chain(by_source)
+    }
+
+    /// The identities of the UE bindings among `contacts`, every one of each.
     pub(crate) fn keys_of(&self, contacts: &[Contact]) -> Vec<u64> {
         contacts
             .iter()
-            .filter(|contact| contact.kind == ContactKind::Ue)
-            .map(|contact| self.key_of(&contact.uri))
+            .flat_map(|contact| self.keys_of_binding(contact))
             .collect()
     }
 
     /// Record a binding of `aor` with identity `key`.
     pub(crate) fn add(&self, key: u64, aor: &str) {
         match self.holders.entry(key) {
-            dashmap::mapref::entry::Entry::Occupied(mut occupied) => {
-                let grown = occupied.get().with(aor);
-                *occupied.get_mut() = grown;
-            }
+            dashmap::mapref::entry::Entry::Occupied(mut occupied) => occupied.get_mut().add(aor),
             dashmap::mapref::entry::Entry::Vacant(vacant) => {
                 vacant.insert(Holders::One(aor.into()));
             }
@@ -167,21 +244,8 @@ impl ContactIndex {
         let dashmap::mapref::entry::Entry::Occupied(mut occupied) = self.holders.entry(key) else {
             return;
         };
-        let held = occupied.get().as_slice();
-        let Some(position) = held.iter().position(|holder| holder.as_ref() == aor) else {
-            return;
-        };
-        let mut rest: Vec<Box<str>> = held.to_vec();
-        rest.remove(position);
-        match rest.pop() {
-            None => {
-                occupied.remove();
-            }
-            Some(last) if rest.is_empty() => *occupied.get_mut() = Holders::One(last),
-            Some(last) => {
-                rest.push(last);
-                *occupied.get_mut() = Holders::Many(rest.into_boxed_slice());
-            }
+        if !occupied.get_mut().remove(aor) {
+            occupied.remove();
         }
     }
 
@@ -238,13 +302,7 @@ impl ContactIndex {
         let Some(holders) = self.holders.get(&key) else {
             return Vec::new();
         };
-        let mut aors: Vec<String> = Vec::with_capacity(holders.as_slice().len());
-        for aor in holders.as_slice() {
-            if !aors.iter().any(|seen| seen.as_str() == aor.as_ref()) {
-                aors.push(aor.to_string());
-            }
-        }
-        aors
+        holders.aors()
     }
 
     /// Every identity with the AoRs holding it, sorted: what a consistency
@@ -253,16 +311,7 @@ impl ContactIndex {
     pub(crate) fn snapshot(&self) -> std::collections::BTreeMap<u64, Vec<String>> {
         self.holders
             .iter()
-            .map(|entry| {
-                let mut aors: Vec<String> = entry
-                    .value()
-                    .as_slice()
-                    .iter()
-                    .map(|aor| aor.to_string())
-                    .collect();
-                aors.sort();
-                (*entry.key(), aors)
-            })
+            .map(|entry| (*entry.key(), entry.value().bindings()))
             .collect()
     }
 
@@ -283,6 +332,36 @@ impl ContactIndex {
 
 /// The lookups the index serves, and the install a restore goes through.
 impl super::Registrar {
+    /// The one AoR whose live UE binding's REGISTER came from `source`, with
+    /// that binding's Contact URI. `None` when none did, or bindings of two
+    /// AoRs did (a shared device or a front), as for
+    /// [`binding_for_contact`](Self::binding_for_contact). For a request
+    /// relayed over a captured flow, whose Request-URI need not be the
+    /// Contact. Reads the AoRs the index names for that address.
+    pub fn binding_for_source(&self, source: SocketAddr) -> Option<(Aor, String)> {
+        let mut found: Option<(Aor, String)> = None;
+        for aor in self
+            .contact_index
+            .aors(self.contact_index.source_key_of(source))
+        {
+            let Some(entry) = self.bindings.get(&aor) else {
+                continue;
+            };
+            let Some(contact) = entry.value().iter().find(|contact| {
+                contact.kind == ContactKind::Ue
+                    && !contact.is_expired()
+                    && contact.source_addr == Some(source)
+            }) else {
+                continue;
+            };
+            if found.is_some() {
+                return None;
+            }
+            found = Some((aor.clone(), contact.uri.to_string()));
+        }
+        found
+    }
+
     /// Reverse lookup: non-expired UE-side contacts whose stored **Contact**
     /// URI names the same device as `contact_uri`: scheme, user, host
     /// (case-insensitively, RFC 3261 §19.1.4) and port, a default port equal
@@ -403,6 +482,12 @@ impl super::Registrar {
 mod tests {
     use super::*;
 
+    /// The holders come out of a map, in no order.
+    fn sorted(mut aors: Vec<String>) -> Vec<String> {
+        aors.sort();
+        aors
+    }
+
     fn uri(text: &str) -> SipUri {
         crate::sip::parser::parse_uri_standalone(text).expect("a URI")
     }
@@ -454,12 +539,12 @@ mod tests {
         index.add(7, "sip:a@example.invalid");
         index.add(7, "sip:b@example.invalid");
         assert_eq!(
-            index.aors(7),
+            sorted(index.aors(7)),
             ["sip:a@example.invalid", "sip:b@example.invalid"]
         );
         index.remove(7, "sip:a@example.invalid");
         assert_eq!(
-            index.aors(7),
+            sorted(index.aors(7)),
             ["sip:a@example.invalid", "sip:b@example.invalid"]
         );
         index.remove(7, "sip:a@example.invalid");
@@ -487,6 +572,26 @@ mod tests {
         assert_eq!(snapshot[&2], ["sip:a@example.invalid"]);
         index.replace("sip:a@example.invalid", vec![2, 4, 3], vec![]);
         assert_eq!(index.len(), 0);
+    }
+
+    #[test]
+    fn a_slot_stays_two_words() {
+        assert_eq!(std::mem::size_of::<Holders>(), 16);
+    }
+
+    #[test]
+    fn a_source_identity_is_its_address_and_port() {
+        let index = ContactIndex::default();
+        let source: SocketAddr = "203.0.113.7:5060".parse().expect("an address");
+        assert_eq!(index.source_key_of(source), index.source_key_of(source));
+        assert_ne!(
+            index.source_key_of(source),
+            index.source_key_of("203.0.113.7:5061".parse().expect("an address"))
+        );
+        assert_ne!(
+            index.source_key_of(source),
+            index.source_key_of("[2001:db8::7]:5060".parse().expect("an address"))
+        );
     }
 
     #[test]

@@ -1157,35 +1157,6 @@ impl Registrar {
         self.binding_for_contact(contact_uri).map(|(aor, _)| aor)
     }
 
-    /// The one AoR whose live UE binding's REGISTER came from `source`, with
-    /// that binding's Contact URI. `None` when none did, or bindings of two
-    /// AoRs did (a shared device), as for [`binding_for_contact`](Self::binding_for_contact).
-    /// For a request relayed over a captured flow, whose Request-URI need not be
-    /// the Contact. An **O(total contacts)** scan.
-    pub fn binding_for_source(&self, source: SocketAddr) -> Option<(Aor, String)> {
-        self.unique_binding(|contact| contact.source_addr == Some(source))
-    }
-
-    /// The single AoR with a live UE binding `matches` accepts, with the first
-    /// such binding's Contact URI.
-    fn unique_binding(&self, matches: impl Fn(&Contact) -> bool) -> Option<(Aor, String)> {
-        let mut found: Option<(Aor, String)> = None;
-        for entry in self.bindings.iter() {
-            let Some(contact) = entry.value().iter().find(|contact| {
-                contact.kind == ContactKind::Ue && !contact.is_expired() && matches(contact)
-            }) else {
-                continue;
-            };
-            if found.as_ref().is_some_and(|(aor, _)| aor != entry.key()) {
-                return None;
-            }
-            if found.is_none() {
-                found = Some((entry.key().clone(), contact.uri.to_string()));
-            }
-        }
-        found
-    }
-
     /// Whether `aor` still has a live UE binding whose Contact is
     /// `contact_uri` (matched as [`lookup_contact`](Self::lookup_contact)
     /// matches). `false` once it was de-registered, expired, or reaped.
@@ -2058,9 +2029,8 @@ impl Registrar {
             let before = entry.value().len();
             entry.value_mut().retain(|c| {
                 if c.is_expired() {
-                    if c.kind == ContactKind::Ue {
-                        contacts_to_deindex
-                            .push((self.contact_index.key_of(&c.uri), aor_key.clone()));
+                    for key in self.contact_index.keys_of_binding(c) {
+                        contacts_to_deindex.push((key, aor_key.clone()));
                     }
                     if let Some(token) = &c.flow_token {
                         tokens_to_remove.push(token.to_string());
