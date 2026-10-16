@@ -82,6 +82,17 @@ entry, but a working config keeps working.
   report within `timeout` seconds (default 60, at most 180) is reported for
   with 503. The REFER is held while `@b2bua.on_refer` runs, so a second REFER
   on the call arriving then is answered 491 too.
+- **`call.answer(contact=…, contact_params=…)` and the same on
+  `call.progress()`: a script that answers the call itself names the URI in
+  siphon's Contact.** A conference focus answers an INVITE to its factory URI
+  with the conference URI as its Contact, with the `isfocus` feature parameter
+  (RFC 4579 §5.1), and that Contact is the only place the caller learns the
+  URI of the conference it created (§5.2). siphon always advertised its own
+  address there, so a handset merging its calls had nothing to refer the other
+  parties to. The URI becomes the dialog's local target: every later request
+  and response siphon sends the caller in the dialog carries it (RFC 3261
+  §12.1.1). A URI that is not SIP or SIPS, or a parameter that is not a
+  `generic-param`, raises `ValueError`.
 
 - **`diameter.cx_uar` and `diameter.cx_lir` return the Server-Capabilities the
   HSS sent.** Their dict has a new `server_capabilities` key: `None`, or

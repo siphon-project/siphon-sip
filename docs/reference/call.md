@@ -395,6 +395,30 @@ a line break or NUL is refused too. The control plane's `answer`, `ring`,
 `progress` and `reject` verbs take the same `headers` object with the same
 rules ([control plane](control-plane.md)).
 
+## The Contact of siphon's own answer: `contact=`
+
+The Contact stays siphon's to build, but a script that answers the call itself
+can name the URI in it: `call.answer()` and `call.progress()` take `contact=`,
+a SIP or SIPS URI, and `contact_params=`, its header parameters. It becomes the
+dialog's local target, so the 2xx, an 18x, and every later request and
+response siphon sends the caller in that dialog carry it (RFC 3261 §12.1.1),
+and the caller's in-dialog requests are addressed to it. The URI must route
+back to siphon through the dialog's route set.
+
+The use it is made for is a conference focus. It answers an INVITE to its
+factory URI with the URI of the conference it created as its Contact, with the
+`isfocus` feature parameter (RFC 4579 §5.1); the caller learns the conference
+URI there (§5.2), and refers the other parties to it:
+
+```python
+call.answer(200, "OK", body=sdp, content_type="application/sdp",
+            contact=f"sip:{room}@conf.example.com", contact_params="isfocus")
+```
+
+A URI siphon would not put in a Contact (not SIP or SIPS, in angle brackets,
+with anything after it) or a parameter that is not a `generic-param` (RFC 3261
+§25.1) raises `ValueError`, and nothing is sent.
+
 ## Hold, resume and other re-offers: `@b2bua.on_reoffer`
 
 A re-INVITE or an UPDATE (RFC 3311) from either party of a bridged call

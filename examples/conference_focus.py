@@ -48,7 +48,10 @@ async def on_invite(call):
         log.warn(f"{room}: {error}")
         call.reject(488, "Not Acceptable Here")
         return
-    call.answer(200, "OK", body=sdp, content_type="application/sdp")
+    # RFC 4579 section 5.1: the focus's Contact is the conference URI, with
+    # `isfocus`. A factory-minted room's creator learns its URI here.
+    call.answer(200, "OK", body=sdp, content_type="application/sdp",
+                contact=f"sip:{room}@{call.ruri.host}", contact_params="isfocus")
     ROOM_OF_CALL[call.call_id] = room
     ROSTER.setdefault(room, {})[call.call_id] = str(call.from_uri)
     log.info(f"{room}: {call.from_uri} joined, {len(ROSTER[room])} seated")

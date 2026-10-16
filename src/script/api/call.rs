@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
+use super::call_contact::{checked_contact, set_local_contact};
 use super::sip_uri::PySipUri;
 use crate::sip::message::SipMessage;
 
@@ -1587,7 +1588,23 @@ impl PyCall {
     ///     content_type: Content-Type for the body (e.g. ``"application/sdp"``).
     ///     headers: Optional ``{name: value}`` mapping added to the 2xx. The
     ///         headers siphon owns on it raise ``ValueError`` (see ``reject()``).
-    #[pyo3(signature = (code, reason, body=None, content_type=None, headers=None))]
+    ///     contact: Optional SIP or SIPS URI siphon advertises as its Contact
+    ///         on this dialog instead of its own address: on this 2xx and on
+    ///         every later request and response it sends the caller in the
+    ///         dialog (RFC 3261 §12.1.1, the caller's remote target). A
+    ///         conference focus puts the conference URI here (RFC 4579 §5.1),
+    ///         which is where a caller that INVITEd the factory URI learns it.
+    ///         The URI must reach siphon: in-dialog requests are sent to it
+    ///         (through the dialog's route set).
+    ///     contact_params: Optional Contact header parameters for ``contact``,
+    ///         e.g. ``"isfocus"`` (RFC 3840 feature parameters, RFC 4579 §5.1).
+    ///
+    /// Example (a conference focus answering the factory URI):
+    ///     call.answer(200, "OK", body=sdp, content_type="application/sdp",
+    ///                 contact=f"sip:{room}@conf.example.com",
+    ///                 contact_params="isfocus")
+    #[pyo3(signature = (code, reason, body=None, content_type=None, headers=None, contact=None, contact_params=None))]
+    #[allow(clippy::too_many_arguments)]
     fn answer(
         &mut self,
         code: u16,
@@ -1595,6 +1612,8 @@ impl PyCall {
         body: Option<&Bound<'_, PyAny>>,
         content_type: Option<&str>,
         headers: Option<&Bound<'_, pyo3::types::PyDict>>,
+        contact: Option<&str>,
+        contact_params: Option<&str>,
     ) -> PyResult<()> {
         if !(200..300).contains(&code) {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
@@ -1602,6 +1621,7 @@ impl PyCall {
             )));
         }
         let headers = uas_response_headers("call.answer", headers)?;
+        let contact = checked_contact("call.answer", contact, contact_params)?;
 
         let body_bytes = match body {
             Some(obj) => Some(super::request::extract_body_bytes(obj)?),
@@ -1612,6 +1632,7 @@ impl PyCall {
         if let Some(timer) = &self.session_timer_override {
             crate::dispatcher::b2bua_set_session_timer(&self.id, timer.clone());
         }
+        set_local_contact("call.answer", &self.id, contact);
         let sent = crate::dispatcher::b2bua_answer_call(
             &self.id,
             &invite,
@@ -1649,12 +1670,17 @@ impl PyCall {
     ///         183. The headers siphon owns on it raise ``ValueError`` (see
     ///         ``reject()``): ``Require`` / ``RSeq`` stay siphon's, which sends
     ///         the provisional reliably when the caller asked for ``100rel``.
+    ///     contact: Optional SIP or SIPS URI siphon advertises as its Contact
+    ///         on the early dialog and, unless ``answer()`` names another, on
+    ///         the dialog after it (see ``answer()``). Ignored on a ``100``.
+    ///     contact_params: Optional Contact header parameters for ``contact``.
     ///
     /// Example:
     ///     call.progress(183, "Session Progress", body=sdp,
     ///                   content_type="application/sdp",
     ///                   headers={"P-Early-Media": "sendrecv"})
-    #[pyo3(signature = (code, reason="Ringing", body=None, content_type=None, headers=None))]
+    #[pyo3(signature = (code, reason="Ringing", body=None, content_type=None, headers=None, contact=None, contact_params=None))]
+    #[allow(clippy::too_many_arguments)]
     fn progress(
         &mut self,
         code: u16,
@@ -1662,6 +1688,8 @@ impl PyCall {
         body: Option<&Bound<'_, PyAny>>,
         content_type: Option<&str>,
         headers: Option<&Bound<'_, pyo3::types::PyDict>>,
+        contact: Option<&str>,
+        contact_params: Option<&str>,
     ) -> PyResult<()> {
         if !(100..200).contains(&code) {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
@@ -1669,6 +1697,7 @@ impl PyCall {
             )));
         }
         let headers = uas_response_headers("call.progress", headers)?;
+        let contact = checked_contact("call.progress", contact, contact_params)?;
 
         let body_bytes = match body {
             Some(obj) => Some(super::request::extract_body_bytes(obj)?),
@@ -1676,6 +1705,7 @@ impl PyCall {
         };
 
         let invite = self.locked_invite()?;
+        set_local_contact("call.progress", &self.id, contact);
         let sent = crate::dispatcher::b2bua_progress_call(
             &self.id,
             &invite,
@@ -2999,13 +3029,55 @@ mod tests {
 
             // Refused before the call is looked up, so no live call is needed.
             let refused = call
-                .progress(183, "Session Progress", None, None, Some(&headers))
+                .progress(
+                    183,
+                    "Session Progress",
+                    None,
+                    None,
+                    Some(&headers),
+                    None,
+                    None,
+                )
                 .expect_err("Contact is siphon's");
             assert!(refused.to_string().contains("call.progress(headers=…)"));
             let refused = call
-                .answer(200, "OK", None, None, Some(&headers))
+                .answer(200, "OK", None, None, Some(&headers), None, None)
                 .expect_err("Contact is siphon's");
             assert!(refused.to_string().contains("call.answer(headers=…)"));
+        });
+    }
+
+    #[test]
+    fn a_contact_siphon_would_not_advertise_raises_value_error() {
+        Python::initialize();
+        Python::attach(|_py| {
+            let mut call = uas_test_call();
+            // Refused before the call is looked up, so no live call is needed.
+            for (contact, params) in [
+                (Some("<sip:conf-7@conf.example.com>"), None),
+                (Some("tel:+15550100"), None),
+                (
+                    Some("sip:conf-7@conf.example.com"),
+                    Some("isfocus\r\nVia: x"),
+                ),
+                (None, Some("isfocus")),
+            ] {
+                let refused = call
+                    .answer(200, "OK", None, None, None, contact, params)
+                    .expect_err("not a Contact siphon puts on the wire");
+                assert!(
+                    refused.to_string().contains("call.answer(contact"),
+                    "{refused}"
+                );
+                let refused = call
+                    .progress(183, "Session Progress", None, None, None, contact, params)
+                    .expect_err("not a Contact siphon puts on the wire");
+                assert!(
+                    refused.to_string().contains("call.progress(contact"),
+                    "{refused}"
+                );
+            }
+            assert_eq!(call.action(), &CallAction::None, "nothing was decided");
         });
     }
 

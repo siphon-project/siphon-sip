@@ -366,7 +366,7 @@ pub fn send_uas_response(
             return false;
         }
     }
-    let (transport, remote_addr, connection_id, local_addr, local_tag) =
+    let (transport, remote_addr, connection_id, local_addr, local_tag, local_contact) =
         match state.call_actors.get_call(internal_call_id) {
             Some(call) => (
                 call.a_leg.transport.transport,
@@ -374,6 +374,7 @@ pub fn send_uas_response(
                 call.a_leg.transport.connection_id,
                 call.a_leg_local_addr,
                 call.a_leg.dialog.local_tag.clone(),
+                call.a_leg.dialog.local_contact.clone(),
             ),
             None => return false,
         };
@@ -416,18 +417,23 @@ pub fn send_uas_response(
     // leaks an unspecified bind address, and the port is the listener the INVITE
     // actually arrived on — on a multi-homed host that is not `via_port()`, and
     // a Contact naming the wrong port strands every in-dialog request.
+    //
+    // It is the dialog's local target, the one siphon's later requests and
+    // responses on it carry too, which the INVITE path records on the leg. A
+    // script that named its own (`call.answer(contact=…)`, a conference focus's
+    // URI with `isfocus`, RFC 4579 §5.1) replaced it there.
     if code > 100 {
-        let host = state.a_leg_advertised_host(local_addr, &transport);
-        let port = state.a_leg_advertised_port(local_addr, &transport);
-        response.headers.set(
-            "Contact",
+        let contact = local_contact.unwrap_or_else(|| {
+            let host = state.a_leg_advertised_host(local_addr, &transport);
+            let port = state.a_leg_advertised_port(local_addr, &transport);
             format!(
                 "<sip:{}:{};transport={}>",
                 host,
                 port,
                 transport.to_string().to_lowercase()
-            ),
-        );
+            )
+        });
+        response.headers.set("Contact", contact);
     }
 
     if let Some(body_bytes) = body {
@@ -745,6 +751,21 @@ pub fn b2bua_local_tag(internal_call_id: &str) -> Option<String> {
     let control = B2BUA_CONTROL.get()?;
     let call = control.state.call_actors.get_call(internal_call_id)?;
     Some(call.a_leg.dialog.local_tag.clone())
+}
+
+/// Make `contact` (a value [`crate::b2bua::uas_headers::script_contact`]
+/// built) the Contact siphon advertises to the caller of a call it answers
+/// itself: on the responses `call.progress()` / `call.answer()` send, and on
+/// every later request and response of that dialog (RFC 3261 §12.1.1). `false`
+/// when the call is gone or the dispatcher is not running.
+pub fn b2bua_set_local_contact(internal_call_id: &str, contact: String) -> bool {
+    let Some(control) = B2BUA_CONTROL.get() else {
+        return false;
+    };
+    control
+        .state
+        .call_actors
+        .set_a_leg_local_contact(internal_call_id, contact)
 }
 
 /// Imperatively send a provisional (1xx) for a UAS-mode B2BUA call

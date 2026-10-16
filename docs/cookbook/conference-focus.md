@@ -69,7 +69,10 @@ async def on_invite(call):
         log.warn(f"{room}: {error}")
         call.reject(488, "Not Acceptable Here")
         return
-    call.answer(200, "OK", body=sdp, content_type="application/sdp")
+    # RFC 4579 section 5.1: the focus's Contact is the conference URI, with
+    # `isfocus`. A factory-minted room's creator learns its URI here.
+    call.answer(200, "OK", body=sdp, content_type="application/sdp",
+                contact=f"sip:{room}@{call.ruri.host}", contact_params="isfocus")
     ROOM_OF_CALL[call.call_id] = room
     ROSTER.setdefault(room, {})[call.call_id] = str(call.from_uri)
     log.info(f"{room}: {call.from_uri} joined, {len(ROSTER[room])} seated")
@@ -97,11 +100,11 @@ def floor(conference_id, from_tag):
     log.info(f"{conference_id}: {from_tag or 'nobody'} has the floor")
 ```
 
-A factory-minted room needs its conference URI handed back to the participant
-(the focus's Contact, with the `isfocus` feature parameter of RFC 4579
-section 5.1), so that later participants can dial it; that part of the
-signalling is not shown here. Nor is the RFC 4575 event package itself: the
-comments mark where its NOTIFYs would go.
+A factory-minted room's URI goes back to its creator as the focus's Contact,
+with the `isfocus` feature parameter (RFC 4579 section 5.1), so that later
+participants can dial it, or be referred to it. The URI has to route back to
+siphon: the creator's in-dialog requests are sent to it. The RFC 4575 event
+package itself is not shown: the comments mark where its NOTIFYs would go.
 
 With five participants the room has five seats and each hears the other four.
 `rtpengine.delete(call)` on a seated call leaves its room as well, so a script

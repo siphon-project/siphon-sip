@@ -117,3 +117,41 @@ async def on_invite(call):
         assert "offer" in ops
         assert "play_media" in ops
         assert "echo" in ops
+
+
+class TestUasContact:
+    """``contact=`` / ``contact_params=``: the Contact a conference focus
+    answers its factory URI with (RFC 4579 §5.1)."""
+
+    def test_answer_records_the_focus_contact(self):
+        call = Call()
+        call.answer(200, "OK", body="v=0\r\n", content_type="application/sdp",
+                    contact="sip:conf-7@conf.example.com", contact_params="isfocus")
+        assert call._actions[-1].extras["contact"] == "<sip:conf-7@conf.example.com>;isfocus"
+
+    def test_a_contact_named_on_progress_stays_on_the_answer(self):
+        call = Call()
+        call.progress(183, "Session Progress", contact="sip:conf-7@conf.example.com",
+                      contact_params=";isfocus")
+        call.answer(200, "OK")
+        assert call._actions[-1].extras["contact"] == "<sip:conf-7@conf.example.com>;isfocus"
+
+    def test_without_a_contact_siphon_keeps_its_own(self):
+        call = Call()
+        call.answer(200, "OK")
+        assert call._actions[-1].extras["contact"] is None
+
+    @pytest.mark.parametrize("contact, params", [
+        ("<sip:conf-7@conf.example.com>", None),
+        ("tel:+15550100", None),
+        ("sip:conf-7@conf.example.com garbage", None),
+        ("sip:conf-7@conf.example.com", "isfocus\r\nVia: x"),
+        ("sip:conf-7@conf.example.com", "bad name"),
+        (None, "isfocus"),
+    ])
+    def test_a_contact_siphon_would_not_advertise_raises(self, contact, params):
+        call = Call()
+        with pytest.raises(ValueError):
+            call.answer(200, "OK", contact=contact, contact_params=params)
+        with pytest.raises(ValueError):
+            call.progress(183, "Session Progress", contact=contact, contact_params=params)
