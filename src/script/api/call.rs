@@ -2545,7 +2545,27 @@ impl PyCall {
     ///
     ///   call.accept_refer(target=target, next_hop=gw.uri, mode="terminate",
     ///                     profile="rtp_passthrough", format="plain")
-    #[pyo3(signature = (target=None, next_hop=None, mode=None, profile=None, number_policy=None, format=None))]
+    ///
+    /// `mode="script"`: siphon transfers nothing and dials nothing. It answers
+    /// `202 Accepted` and sends the first NOTIFY (sipfrag `100 Trying`, RFC 3515
+    /// §2.4.4) **at once**, before the handler returns, so the handler can go
+    /// on to do what the REFER asks itself and then report how it went with
+    /// `b2bua.complete_refer(call.call_id, code)`, which ends the subscription.
+    /// The referrer stays in its dialog. This is a REFER to a conference focus
+    /// inside a participant's dialog (RFC 4579 §5.5: add the Refer-To to the
+    /// conference), or any request a UA that answered the call itself carries
+    /// out. `timeout` (seconds, default 60, at most 180) is how long the script
+    /// has to report before siphon reports `503` for it. `target`, `next_hop`,
+    /// `profile`, `number_policy` and `format` do not apply and raise
+    /// `ValueError`; a REFER that is no longer awaiting a decision raises
+    /// `RuntimeError`.
+    ///
+    ///   @b2bua.on_refer
+    ///   async def on_refer(call):
+    ///       call.accept_refer(mode="script")       # 202 + NOTIFY 100 now
+    ///       code = await add_to_conference(call.refer_to)
+    ///       b2bua.complete_refer(call.call_id, code)
+    #[pyo3(signature = (target=None, next_hop=None, mode=None, profile=None, number_policy=None, format=None, timeout=None))]
     #[allow(clippy::too_many_arguments)]
     fn accept_refer(
         &mut self,
@@ -2555,14 +2575,41 @@ impl PyCall {
         profile: Option<String>,
         number_policy: Option<&str>,
         format: Option<&str>,
+        timeout: Option<u32>,
     ) -> PyResult<()> {
+        if mode == Some("script") {
+            if target.is_some()
+                || next_hop.is_some()
+                || profile.is_some()
+                || number_policy.is_some()
+                || format.is_some()
+            {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "accept_refer(mode=\"script\") dials nothing: target, next_hop, profile, number_policy and format do not apply",
+                ));
+            }
+            return match crate::dispatcher::b2bua_accept_refer_script(&self.id, timeout) {
+                Ok(_) => {
+                    self.action = CallAction::None;
+                    Ok(())
+                }
+                Err(refusal) => Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "accept_refer(mode=\"script\"): {refusal}"
+                ))),
+            };
+        }
+        if timeout.is_some() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "accept_refer(timeout=…) applies to mode=\"script\" only",
+            ));
+        }
         let mode = match mode {
             None => None,
             Some("terminate") => Some(ReferMode::Terminate),
             Some("transparent") => Some(ReferMode::Transparent),
             Some(other) => {
                 return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                    "accept_refer(mode=…) must be 'terminate' or 'transparent', got {other:?}"
+                    "accept_refer(mode=…) must be 'terminate', 'transparent' or 'script', got {other:?}"
                 )));
             }
         };
@@ -4013,6 +4060,43 @@ mod tests {
     }
 
     #[test]
+    fn accept_refer_in_script_mode_checks_its_arguments() {
+        Python::initialize();
+        Python::attach(|_py| {
+            let message = Arc::new(Mutex::new(make_invite()));
+            let mut call = PyCall::new(
+                "test-id".to_string(),
+                message,
+                "10.0.0.1".to_string(),
+                "udp".to_string(),
+            );
+            let refused = call
+                .accept_refer(
+                    Some("sip:a@example.com".to_string()),
+                    None,
+                    Some("script"),
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .expect_err("script mode dials nothing");
+            assert!(refused.to_string().contains("dials nothing"), "{refused}");
+            let refused = call
+                .accept_refer(None, None, Some("terminate"), None, None, None, Some(30))
+                .expect_err("timeout is script mode's");
+            assert!(refused.to_string().contains("timeout"), "{refused}");
+            // No REFER awaiting a decision (no dispatcher here): never a
+            // silent success.
+            let refused = call
+                .accept_refer(None, None, Some("script"), None, None, None, None)
+                .expect_err("nothing to accept");
+            assert!(refused.is_instance_of::<pyo3::exceptions::PyRuntimeError>(_py));
+            assert_eq!(call.action(), &CallAction::None);
+        });
+    }
+
+    #[test]
     fn call_accept_refer() {
         let message = Arc::new(Mutex::new(make_invite()));
         let mut call = PyCall::new(
@@ -4021,7 +4105,7 @@ mod tests {
             "10.0.0.1".to_string(),
             "udp".to_string(),
         );
-        call.accept_refer(None, None, None, None, None, None)
+        call.accept_refer(None, None, None, None, None, None, None)
             .unwrap();
         assert_eq!(
             call.action(),
@@ -4051,6 +4135,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -4074,7 +4159,7 @@ mod tests {
             "10.0.0.1".to_string(),
             "udp".to_string(),
         );
-        call.accept_refer(None, None, Some("terminate"), None, None, None)
+        call.accept_refer(None, None, Some("terminate"), None, None, None, None)
             .unwrap();
         assert_eq!(
             call.action(),
@@ -4132,6 +4217,7 @@ mod tests {
             Some("rtp_passthrough".to_string()),
             None,
             None,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -4155,7 +4241,7 @@ mod tests {
             "10.0.0.1".to_string(),
             "udp".to_string(),
         );
-        let result = call.accept_refer(None, None, Some("bridge"), None, None, None);
+        let result = call.accept_refer(None, None, Some("bridge"), None, None, None, None);
         assert!(result.is_err());
         // The invalid call must not have mutated the action.
         assert_eq!(call.action(), &CallAction::None);
@@ -4174,7 +4260,7 @@ mod tests {
             "10.0.0.1".to_string(),
             "udp".to_string(),
         );
-        let result = call.accept_refer(None, None, None, None, Some("nope@2026"), None);
+        let result = call.accept_refer(None, None, None, None, Some("nope@2026"), None, None);
         assert!(result.is_err());
         assert_eq!(call.action(), &CallAction::None);
     }
@@ -4197,6 +4283,7 @@ mod tests {
             Some("sip:+15550142@carrier.example".to_string()),
             None,
             Some("terminate"),
+            None,
             None,
             None,
             None,

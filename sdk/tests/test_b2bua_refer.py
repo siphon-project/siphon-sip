@@ -348,3 +348,43 @@ def on_ivr_dtmf(call_id, from_tag, digit, duration_ms, volume):
         assert harness.b2bua.refers
         harness.reset()
         assert harness.b2bua.refers == []
+
+
+class TestScriptMode:
+    """``call.accept_refer(mode="script")`` + ``b2bua.complete_refer``: a
+    focus carrying a REFER in a participant's dialog out itself (RFC 4579
+    section 5.5)."""
+
+    def test_accept_then_report(self, harness):
+        harness.load_source(
+            """
+from siphon import b2bua
+
+@b2bua.on_refer
+def on_refer(call):
+    call.accept_refer(mode="script")
+    assert b2bua.complete_refer(call.call_id, 200)
+    assert not b2bua.complete_refer(call.call_id, 200)
+"""
+        )
+        result = harness.send_refer(refer_to="sip:15550100042@example.com")
+        assert result.action == "accept_refer"
+        assert result.call._actions[-1].extras == {"mode": "script", "timeout": None}
+        from siphon_sdk import mock_module
+        assert mock_module.get_b2bua().refer_reports == [
+            {"call_id": result.call.call_id, "code": 200, "reason": None}
+        ]
+
+    def test_script_mode_dials_nothing(self):
+        from siphon_sdk.call import Call
+        call = Call()
+        with pytest.raises(ValueError):
+            call.accept_refer(target="sip:a@example.com", mode="script")
+        with pytest.raises(ValueError):
+            call.accept_refer(mode="terminate", timeout=30)
+
+    def test_a_report_is_a_final_status(self):
+        from siphon_sdk import mock_module
+        with pytest.raises(ValueError):
+            mock_module.get_b2bua().complete_refer("x@example.com", 100)
+        assert mock_module.get_b2bua().complete_refer("x@example.com", 200) is False

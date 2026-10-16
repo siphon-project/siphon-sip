@@ -68,6 +68,20 @@ entry, but a working config keeps working.
   `offer.answer()` answers from the session in force with the direction the
   offer leaves (RFC 3264 §8.4), `offer.answer(sdp=…)` with the script's own,
   `offer.reject()` refuses, and leaving it alone keeps the old behaviour.
+- **`call.accept_refer(mode="script")` and `b2bua.complete_refer(call_id,
+  code, reason=None)`: a script carries out a REFER itself and reports how it
+  went.** `@b2bua.on_refer` could only transfer (`terminate`, `transparent`) or
+  refuse, and with no handler a REFER was answered 603. A REFER inside the
+  dialog of a call the script answered itself, such as a participant asking a
+  conference focus to add the party it names (RFC 4579 §5.5), asks for
+  neither. In mode `script` siphon answers `202` and sends the first NOTIFY
+  (`100 Trying`) at once, before the handler returns, and dials nothing; the
+  script reports with `complete_refer`, the NOTIFY that ends the subscription
+  (RFC 3515 §2.4.5). It is the control plane's mode `controller` for a routing
+  script: a second REFER meanwhile is answered 491, and a script that does not
+  report within `timeout` seconds (default 60, at most 180) is reported for
+  with 503. The REFER is held while `@b2bua.on_refer` runs, so a second REFER
+  on the call arriving then is answered 491 too.
 
 - **`diameter.cx_uar` and `diameter.cx_lir` return the Server-Capabilities the
   HSS sent.** Their dict has a new `server_capabilities` key: `None`, or
