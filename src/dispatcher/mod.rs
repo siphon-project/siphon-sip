@@ -177,6 +177,8 @@ mod early_update_bridge_tests;
 #[cfg(test)]
 mod early_update_tests;
 #[cfg(test)]
+mod handover_no_controller_tests;
+#[cfg(test)]
 mod held_bye_tests;
 #[cfg(test)]
 mod inbound_drop_tests;

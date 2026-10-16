@@ -346,10 +346,50 @@ pub(crate) fn b2bua_reject_call_in(
     reason: &str,
     headers: &[(String, String)],
 ) -> bool {
-    let (invite_arc, transport, remote_addr, connection_id, local_addr, local_tag, sip_call_id) =
+    let Some(invite_arc) = state
+        .call_actors
+        .get_call(internal_call_id)
+        .and_then(|call| call.a_leg_invite.clone())
+    else {
+        return false;
+    };
+    let Ok(invite) = invite_arc.lock() else {
+        error!(call_id = %internal_call_id, "b2bua_reject_call: invite lock poisoned");
+        return false;
+    };
+    reject_with_invite(state, internal_call_id, code, reason, headers, &invite)
+}
+
+/// [`b2bua_reject_call_in`] for a caller that already holds the lock on the
+/// call's stored A-leg INVITE and passes the INVITE itself.
+///
+/// The control handover is one: it runs with the INVITE locked, and the call's
+/// stored A-leg INVITE is that same `Mutex`. Taking it again from the same
+/// thread never returns (`std::sync::Mutex` is not re-entrant), so a call handed
+/// to an application with no controller connected was never answered and the
+/// worker that took it was lost.
+pub(crate) fn b2bua_reject_call_holding_invite(
+    state: &DispatcherState,
+    internal_call_id: &str,
+    code: u16,
+    reason: &str,
+    invite: &SipMessage,
+) -> bool {
+    reject_with_invite(state, internal_call_id, code, reason, &[], invite)
+}
+
+/// The rejection itself, from the A-leg INVITE the caller holds.
+fn reject_with_invite(
+    state: &DispatcherState,
+    internal_call_id: &str,
+    code: u16,
+    reason: &str,
+    headers: &[(String, String)],
+    invite: &SipMessage,
+) -> bool {
+    let (transport, remote_addr, connection_id, local_addr, local_tag, sip_call_id) =
         match state.call_actors.get_call(internal_call_id) {
             Some(call) => (
-                call.a_leg_invite.clone(),
                 call.a_leg.transport.transport,
                 call.a_leg.transport.remote_addr,
                 call.a_leg.transport.connection_id,
@@ -359,13 +399,6 @@ pub(crate) fn b2bua_reject_call_in(
             ),
             None => return false,
         };
-    let Some(invite_arc) = invite_arc else {
-        return false;
-    };
-    let Ok(invite) = invite_arc.lock() else {
-        error!(call_id = %internal_call_id, "b2bua_reject_call: invite lock poisoned");
-        return false;
-    };
 
     // RFC 3261 §12.1.1: tag the To header with the A-leg dialog local_tag so the
     // final response terminates the same dialog the 180 opened.
@@ -381,13 +414,12 @@ pub(crate) fn b2bua_reject_call_in(
         }
     }
     let mut response = build_response(
-        &invite,
+        invite,
         code,
         reason,
         state.server_header.as_deref(),
         &reply_headers,
     );
-    drop(invite);
     crate::b2bua::uas_headers::apply(&mut response, headers);
     // The caller's final response: siphon's reliable provisionals to it stop
     // (RFC 3262 §3).

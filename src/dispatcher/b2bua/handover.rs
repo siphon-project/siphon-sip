@@ -183,7 +183,16 @@ pub fn control_handover(
                 // delete + StasisEnd) rather than leave an orphaned answered call.
                 b2bua_terminate_call(&sip_call_id, Some("no control app connected"));
             } else {
-                b2bua_reject_call(call_id, 503, "No Controller Available");
+                // The INVITE is locked for the whole handover, and it is the
+                // call's stored A-leg INVITE: rejecting through the lookup
+                // would take that lock a second time on this thread.
+                b2bua_reject_call_holding_invite(
+                    state,
+                    call_id,
+                    503,
+                    "No Controller Available",
+                    invite,
+                );
             }
         }
     }
