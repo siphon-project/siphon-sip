@@ -185,6 +185,24 @@ These are limits of siphon-rtp 0.14.0, not of the script API:
   applied to a seat, so `conference_join` refuses a profile that sets one
   rather than seating the call without it (the same goes for `ws_uri`,
   `ws_tee`, `record_call` and the DSP knobs).
+- **Hold and mute by re-INVITE.** A seat is no media session of its call, so
+  siphon answers a participant's re-INVITE or UPDATE that changes the media
+  `488` unless `@b2bua.on_reoffer` answers it. A hold (`sendonly`) is answered
+  by `offer.answer()`, after `conference_route(room, call, "listener")` or
+  `"muted"` so the room stops hearing it:
+
+  ```python
+  @b2bua.on_reoffer
+  async def seat_reoffer(call, offer):
+      room = ROOM_OF_CALL.get(call.call_id)
+      if room is None:
+          return
+      if offer.kind == "hold":
+          await rtpengine.conference_route(room, call, "muted")
+      elif offer.kind == "resume":
+          await rtpengine.conference_route(room, call, "talker")
+      offer.answer()
+  ```
 - **Re-seating.** There is no verb that updates a seat in place, and the
   engine does not report a second seat under one From-tag, so a call holds one
   seat and a second `conference_join` raises `ValueError`. A re-INVITE that

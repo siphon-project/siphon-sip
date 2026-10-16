@@ -28,6 +28,12 @@
 //!   §14.1 the session stays exactly as it was, which is held. The offer is
 //!   not recorded as the party's media either, so a bridge afterwards offers
 //!   what the party really has.
+//!
+//! Before either, `@b2bua.on_reoffer` is shown the offer, as on a bridged call.
+//! A leg the script answered itself (a conference seat, RFC 4579) has no one
+//! else to relay to, so a handler that answers it (`offer.answer()`) or
+//! refuses it (`offer.reject()`) decides; one that leaves it gets the above.
+use crate::b2bua::reoffer::ReofferDecision;
 use crate::dispatcher::*;
 
 /// The `o=` line of `sdp`, which names a session description and its version.
@@ -66,6 +72,39 @@ pub fn answer_unanchored_reoffer(
         .is_some_and(|session| session.to_tag.is_none())
     {
         return false;
+    }
+
+    // `@b2bua.on_reoffer` decides first: a script that seated the leg in a
+    // conference (RFC 4579), or answered it some other way of its own, is the
+    // one that can answer a hold, a mute or a refresh for it (RFC 3264 §8.4,
+    // RFC 4028 §10), with `offer.answer(sdp=…)` or from the session in force.
+    // A script that leaves the offer alone gets what follows.
+    let offerer = Offerer {
+        from_a_leg: true,
+        b_leg_branch: None,
+    };
+    let last_given = offerer.last_sdp(call_id, state);
+    let hook = run_reoffer_hook(
+        call_id,
+        inbound,
+        message,
+        offerer,
+        false,
+        last_given.as_deref(),
+        state,
+    );
+    if !matches!(hook.decision, ReofferDecision::Relay) {
+        let response = decide_reoffer_here(
+            inbound,
+            message,
+            call_id,
+            offerer,
+            false,
+            &hook.decision,
+            state,
+        );
+        notify_reoffer_response(call_id, hook.facts, &response, true, state);
+        return true;
     }
 
     let is_invite = message.method() == Some(&Method::Invite);

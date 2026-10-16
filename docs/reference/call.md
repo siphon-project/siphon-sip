@@ -403,6 +403,15 @@ when the call is anchored. `@b2bua.on_reoffer` sees it before it is relayed,
 and `@b2bua.on_reoffer_answered` once the offerer has its final response.
 Both are called with `(call, offer)`.
 
+It also sees an offer from the caller of a call the script answered itself
+with SDP the media engine holds no session for, a conference seat
+(`rtpengine.conference_join`) for one. There is no other party to relay to:
+`offer.answer()` answers it from the seat's answer with the direction the
+offer leaves (a hold, RFC 3264 §8.4), `offer.answer(sdp=…)` with the script's
+own, and `offer.reject()` refuses it. A handler that leaves it alone gets what
+siphon does without one: a refresh answered from the session in force, a
+change refused `488`.
+
 ```python
 from siphon import b2bua, rtpengine
 

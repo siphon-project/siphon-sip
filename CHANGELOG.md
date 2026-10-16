@@ -59,6 +59,15 @@ entry, but a working config keeps working.
   `isc.evaluate(..., session_case="originating_cdiv")` (alias `orig_cdiv`)
   evaluates the originating services after retargeting, and a new `body=`
   argument takes the request's SDP for SessionDescription SPTs (Annex F).
+- **`@b2bua.on_reoffer` sees an offer from a party the script answered
+  itself.** A re-INVITE or UPDATE from a call answered with SDP the media
+  engine holds no session for, a conference seat, was answered by siphon
+  alone: a refresh from the session in force, anything else `488`. A
+  participant could not hold or be muted by re-INVITE, and a session refresh
+  carrying an offer ended the call at expiry. The handler now runs first;
+  `offer.answer()` answers from the session in force with the direction the
+  offer leaves (RFC 3264 §8.4), `offer.answer(sdp=…)` with the script's own,
+  `offer.reject()` refuses, and leaving it alone keeps the old behaviour.
 
 - **`diameter.cx_uar` and `diameter.cx_lir` return the Server-Capabilities the
   HSS sent.** Their dict has a new `server_capabilities` key: `None`, or
