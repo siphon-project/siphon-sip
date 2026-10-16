@@ -10743,22 +10743,57 @@ class MockIsc:
     def __init__(self) -> None:
         self._profiles: dict[str, str] = {}  # aor -> raw XML (stored for has_profile)
         self._eval_results: dict[str, list[dict]] = {}  # aor -> list of match dicts
+        self._shared_ids: dict[str, list[int]] = {}  # aor -> SharedIFCSetIDs
+        self.evaluations: list[dict] = []  # every evaluate() call, for assertions
 
     def store_profile(self, aor: str, ifc_xml: str) -> int:
         """Parse and store an iFC XML profile for an AoR.
 
-        In the mock, the XML is stored as-is (no actual parsing).
-        Use ``set_eval_results()`` to configure what ``evaluate()`` returns.
+        A service profile may name shared iFC sets (``<SharedIFCSetID>``,
+        TS 29.228 Annex B.2 / Annex E) instead of, or next to, its own iFCs;
+        each is resolved against ``isc.shared_ifc_sets`` in ``siphon.yaml``,
+        and an id with no local set is logged at ``warn`` with the AoR.
+
+        In the mock, the XML is stored as-is (no actual parsing) apart from
+        its ``SharedIFCSetID``s, which ``shared_set_ids()`` returns. Use
+        ``set_eval_results()`` to configure what ``evaluate()`` returns.
 
         Args:
             aor: Address of Record.
             ifc_xml: Raw iFC XML string.
 
         Returns:
-            Number of iFCs "parsed" (always 1 in mock unless configured otherwise).
+            The number of iFC rules the profile applies: its own plus those
+            of the shared sets it names that the S-CSCF has (always 1 in the
+            mock).
+
+        Raises:
+            ValueError: If the XML cannot be parsed, or holds a
+                ``<SessionCase>`` that is not 0 to 4 or a
+                ``<SharedIFCSetID>`` that is not an integer of at least 0.
         """
+        import re as _re
+        for case in _re.findall(r"<SessionCase>\s*([^<]*?)\s*</SessionCase>", ifc_xml):
+            if case not in ("0", "1", "2", "3", "4"):
+                raise ValueError(f"iFC XML parse error: SessionCase {case!r} is not 0 to 4")
+        ids: list[int] = []
+        for value in _re.findall(r"<SharedIFCSetID>\s*([^<]*?)\s*</SharedIFCSetID>", ifc_xml):
+            if not value.isdigit():
+                raise ValueError(f"iFC XML parse error: SharedIFCSetID {value!r}")
+            if int(value) not in ids:
+                ids.append(int(value))
         self._profiles[aor] = ifc_xml
+        self._shared_ids[aor] = ids
         return 1
+
+    def shared_set_ids(self, aor: str) -> list[int]:
+        """The SharedIFCSetIDs the stored profile of an AoR names, for logging.
+
+        Returns:
+            The ids in profile order; empty when it names none or no profile
+            is stored.
+        """
+        return list(self._shared_ids.get(aor, []))
 
     def remove_profile(self, aor: str) -> bool:
         """Remove a stored profile.
@@ -10772,6 +10807,7 @@ class MockIsc:
         removed = aor in self._profiles
         self._profiles.pop(aor, None)
         self._eval_results.pop(aor, None)
+        self._shared_ids.pop(aor, None)
         return removed
 
     def has_profile(self, aor: str) -> bool:
@@ -10785,6 +10821,13 @@ class MockIsc:
         """
         return aor in self._profiles
 
+    _SESSION_CASES = {
+        "originating", "orig", "terminating", "term",
+        "originating_unregistered", "orig_unreg",
+        "terminating_unregistered", "term_unreg",
+        "originating_cdiv", "orig_cdiv",
+    }
+
     def evaluate(
         self,
         aor: str,
@@ -10792,23 +10835,58 @@ class MockIsc:
         ruri: str,
         headers: "list[tuple[str, str]]",
         session_case: str = "originating",
+        start_after_priority: Optional[int] = None,
+        body: "Optional[str | bytes]" = None,
     ) -> list[dict]:
         """Evaluate iFCs for a request.
 
-        Returns pre-configured results (via ``set_eval_results``) or an empty list.
+        The stored profile's own iFCs and those of the shared iFC sets it
+        names are merged by priority.
 
         Args:
             aor: Address of Record.
             method: SIP method (e.g. ``"INVITE"``).
             ruri: Request-URI string.
             headers: List of (name, value) tuples.
-            session_case: Session case string.
+            session_case: ``"originating"``, ``"terminating"``,
+                ``"originating_unregistered"``, ``"terminating_unregistered"``
+                or ``"originating_cdiv"`` (TS 29.228 Annex E value 4: the
+                originating services after retargeting, TS 24.229 §5.4.3.3
+                NOTE 4); short forms ``orig``, ``term``, ``orig_unreg``,
+                ``term_unreg``, ``orig_cdiv``.
+            start_after_priority: Only iFCs with a higher priority, to resume
+                after the AS the request came back from.
+            body: The request's SDP (``str`` or ``bytes``), for
+                ``<SessionDescription>`` trigger points (TS 29.228 Annex F:
+                ``Line`` matched against each field's type, ``Content``
+                against its value). ``None`` for a request without SDP, which
+                such a trigger point does not match. For a multipart body,
+                pass the ``application/sdp`` part.
 
         Returns:
             List of dicts with keys: ``server_name``, ``default_handling``,
             ``service_info``, ``priority``.
+
+        Raises:
+            ValueError: ``session_case`` is not one of the above.
+
+        In the mock, returns what ``set_eval_results`` configured (an empty
+        list otherwise), without priorities at or below
+        ``start_after_priority``; every call is recorded on ``evaluations``.
         """
-        return list(self._eval_results.get(aor, []))
+        if session_case.lower() not in self._SESSION_CASES:
+            raise ValueError(f"invalid session_case: {session_case!r}")
+        if body is not None and not isinstance(body, (str, bytes)):
+            raise TypeError("body must be str, bytes or None")
+        self.evaluations.append({
+            "aor": aor, "method": method, "ruri": ruri, "headers": list(headers),
+            "session_case": session_case.lower(),
+            "start_after_priority": start_after_priority, "body": body,
+        })
+        return [
+            match for match in self._eval_results.get(aor, [])
+            if start_after_priority is None or match.get("priority", 0) > start_after_priority
+        ]
 
     def profile_count(self) -> int:
         """Number of stored per-user iFC profiles."""
@@ -10837,6 +10915,8 @@ class MockIsc:
         """Reset all stored profiles and evaluation results."""
         self._profiles.clear()
         self._eval_results.clear()
+        self._shared_ids.clear()
+        self.evaluations.clear()
 
 
 _isc = MockIsc()

@@ -4,10 +4,24 @@
 //! Used by the S-CSCF to determine which Application Servers a SIP
 //! request must be routed through, based on the subscriber's service
 //! profile received from the HSS via Diameter Cx SAA.
+//!
+//! Three parts of the user profile beyond plain iFCs:
+//!
+//! - **Shared iFC sets** (TS 29.228 Annex B.2, Annex E `tServiceProfileExtension`;
+//!   TS 29.229 §7.1.1 feature `SiFC`): a service profile may carry
+//!   `SharedIFCSetID`s instead of, or next to, its iFCs. Each names a set
+//!   provisioned locally at the S-CSCF (`isc.shared_ifc_sets`), merged with the
+//!   profile's own iFCs by Priority at evaluation.
+//! - **Session case 4, ORIGINATING_CDIV** (Annex E `tDirectionOfRequest`): the
+//!   originating services after retargeting that TS 24.229 §5.4.3.3 NOTE 4 has
+//!   the S-CSCF evaluate for a diverted request.
+//! - **SessionDescription SPTs** (Annex F): `Line` is a regular expression
+//!   matched against the type of each SDP field, `Content` one matched against
+//!   its value, and the SPT matches when one field matches both.
 
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::OnceLock;
+use std::sync::{OnceLock, RwLock};
 
 use dashmap::DashMap;
 use quick_xml::events::Event;
@@ -70,7 +84,7 @@ impl std::error::Error for IfcError {}
 /// Session case for iFC evaluation (originating vs terminating).
 ///
 /// The integer codes are those of `tDirectionOfRequest` in 3GPP TS 29.228
-/// Annex E.
+/// Annex E, which allows 0 to 4.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionCase {
     /// Originating, request from a registered user (code 0).
@@ -81,6 +95,11 @@ pub enum SessionCase {
     OriginatingUnregistered,
     /// Terminating for an unregistered user (code 2).
     TerminatingUnregistered,
+    /// Originating after call diversion, on behalf of the diverting user
+    /// (code 4, ORIGINATING_CDIV): the originating services after retargeting
+    /// of TS 24.229 §5.4.3.3 NOTE 4, signalled onward with
+    /// `P-Served-User: ...;sescase=orig-cdiv` (RFC 8498, §5.4.3.2).
+    OriginatingCdiv,
 }
 
 impl SessionCase {
@@ -92,6 +111,7 @@ impl SessionCase {
             1 => Some(SessionCase::Terminating),
             2 => Some(SessionCase::TerminatingUnregistered),
             3 => Some(SessionCase::OriginatingUnregistered),
+            4 => Some(SessionCase::OriginatingCdiv),
             _ => None,
         }
     }
@@ -104,6 +124,7 @@ impl fmt::Display for SessionCase {
             SessionCase::Terminating => write!(formatter, "Terminating"),
             SessionCase::OriginatingUnregistered => write!(formatter, "OriginatingUnregistered"),
             SessionCase::TerminatingUnregistered => write!(formatter, "TerminatingUnregistered"),
+            SessionCase::OriginatingCdiv => write!(formatter, "OriginatingCdiv"),
         }
     }
 }
@@ -155,8 +176,32 @@ pub struct ServicePointTrigger {
     pub request_uri: Option<String>,
     /// Match on session case.
     pub session_case: Option<SessionCase>,
-    /// Match on SDP line content: (sdp_line_type, optional_content_regex).
+    /// Match on the SDP of the request (TS 29.228 Annex F `SessionDescription`):
+    /// (`Line`, a regular expression on the field type; `Content`, an optional
+    /// one on the field value).
     pub sdp_line: Option<(String, Option<String>)>,
+}
+
+impl ServicePointTrigger {
+    /// Whether this SPT carries any condition at all.
+    fn has_condition(&self) -> bool {
+        self.method.is_some()
+            || self.header.is_some()
+            || self.request_uri.is_some()
+            || self.session_case.is_some()
+            || self.sdp_line.is_some()
+    }
+}
+
+/// What a user profile document holds: its iFCs and the shared iFC sets its
+/// service profiles name (TS 29.228 Annex B.2: "A SharedIFCSetID attribute
+/// points to a set of Initial Filter Criteria locally administered and
+/// stored at the S-CSCF").
+#[derive(Debug, Clone, Default)]
+pub struct UserProfile {
+    pub ifcs: Vec<InitialFilterCriteria>,
+    /// In document order, duplicates removed.
+    pub shared_ifc_set_ids: Vec<u32>,
 }
 
 /// Application Server to route to.
@@ -180,11 +225,25 @@ pub struct ApplicationServer {
 ///
 /// Expects XML conforming to 3GPP TS 29.228 §6.6, with a root
 /// `<ServiceProfile>` element containing one or more
-/// `<InitialFilterCriteria>` children.
+/// `<InitialFilterCriteria>` children. The iFCs only: see
+/// [`parse_user_profile`] for the shared iFC sets the profile names.
 pub fn parse_service_profile(xml: &str) -> Result<Vec<InitialFilterCriteria>, IfcError> {
+    parse_user_profile(xml).map(|profile| profile.ifcs)
+}
+
+/// Parse a user profile document (`<IMSSubscription>`, a `<ServiceProfile>`,
+/// or bare `<InitialFilterCriteria>` elements): its iFCs and the
+/// `SharedIFCSetID`s of its service profiles (TS 29.228 Annex E).
+///
+/// A `<SessionCase>` that is not a `tDirectionOfRequest` value (0 to 4) is an
+/// error rather than an SPT with no condition, which would never match and
+/// silently drop a service. So is a `SharedIFCSetID` that is not an integer
+/// of at least 0.
+pub fn parse_user_profile(xml: &str) -> Result<UserProfile, IfcError> {
     let mut reader = Reader::from_str(xml);
 
     let mut results: Vec<InitialFilterCriteria> = Vec::new();
+    let mut shared_ifc_set_ids: Vec<u32> = Vec::new();
     let mut depth: Vec<String> = Vec::new();
 
     // State for building the current iFC.
@@ -308,9 +367,27 @@ pub fn parse_service_profile(xml: &str) -> Result<Vec<InitialFilterCriteria>, If
                     }
                     "SessionCase" => {
                         if let Some(ref mut spt) = current_spt {
-                            if let Ok(code) = text.parse::<u32>() {
-                                spt.session_case = SessionCase::from_code(code);
+                            let case = text.parse::<u32>().ok().and_then(SessionCase::from_code);
+                            match case {
+                                Some(case) => spt.session_case = Some(case),
+                                None => {
+                                    return Err(IfcError::InvalidFormat(format!(
+                                        "SessionCase {text:?} is not a tDirectionOfRequest value \
+                                         (0 to 4, TS 29.228 Annex E)"
+                                    )))
+                                }
                             }
+                        }
+                    }
+                    "SharedIFCSetID" => {
+                        let id = text.parse::<u32>().map_err(|_| {
+                            IfcError::InvalidFormat(format!(
+                                "SharedIFCSetID {text:?} is not an integer of at least 0 \
+                                 (TS 29.228 Annex E tSharedIFCSetID)"
+                            ))
+                        })?;
+                        if !shared_ifc_set_ids.contains(&id) {
+                            shared_ifc_set_ids.push(id);
                         }
                     }
                     "SIPHeader" => {
@@ -324,7 +401,9 @@ pub fn parse_service_profile(xml: &str) -> Result<Vec<InitialFilterCriteria>, If
                             }
                         }
                     }
-                    "SDPLine" => {
+                    // `SessionDescription` is the TS 29.228 Annex E element;
+                    // `SDPLine` is kept for profiles written to the older name.
+                    "SessionDescription" | "SDPLine" => {
                         if current_spt.is_some() {
                             if let Some(ref mut spt) = current_spt {
                                 spt.sdp_line = Some((
@@ -343,7 +422,14 @@ pub fn parse_service_profile(xml: &str) -> Result<Vec<InitialFilterCriteria>, If
                         if let (Some(spt), Some(ref mut trigger)) =
                             (current_spt.take(), &mut current_trigger)
                         {
-                            trigger.spts.push(spt.build());
+                            let spt = spt.build();
+                            if !spt.has_condition() {
+                                warn!(
+                                    "iFC SPT with no condition siphon reads (RequestURI, Method, \
+                                     SIPHeader, SessionCase, SessionDescription); it never matches"
+                                );
+                            }
+                            trigger.spts.push(spt);
                         }
                     }
 
@@ -424,7 +510,10 @@ pub fn parse_service_profile(xml: &str) -> Result<Vec<InitialFilterCriteria>, If
         }
     }
 
-    Ok(results)
+    Ok(UserProfile {
+        ifcs: results,
+        shared_ifc_set_ids,
+    })
 }
 
 /// Extract the local name (without namespace prefix) from a tag.
@@ -581,6 +670,18 @@ impl AppServerBuilder {
 // Evaluation engine
 // ---------------------------------------------------------------------------
 
+/// The parts of a request iFC evaluation reads.
+#[derive(Debug, Clone, Copy)]
+pub struct IfcRequest<'a> {
+    pub method: &'a str,
+    pub request_uri: &'a str,
+    pub headers: &'a [(String, String)],
+    pub session_case: SessionCase,
+    /// The SDP of the request, for SessionDescription SPTs. `None` when the
+    /// request carries none: such an SPT then does not match.
+    pub body: Option<&'a str>,
+}
+
 /// Evaluate iFC rules against a SIP request.
 ///
 /// Returns the list of Application Servers to route through, ordered by
@@ -592,40 +693,43 @@ pub fn evaluate<'a>(
     session_case: SessionCase,
     ifcs: &'a [InitialFilterCriteria],
 ) -> Vec<&'a ApplicationServer> {
+    evaluate_request(
+        &IfcRequest {
+            method,
+            request_uri,
+            headers,
+            session_case,
+            body: None,
+        },
+        ifcs,
+    )
+}
+
+/// [`evaluate`] over a whole [`IfcRequest`], the body included.
+pub fn evaluate_request<'a>(
+    request: &IfcRequest<'_>,
+    ifcs: &'a [InitialFilterCriteria],
+) -> Vec<&'a ApplicationServer> {
     let mut sorted: Vec<&InitialFilterCriteria> = ifcs.iter().collect();
     sorted.sort_by_key(|ifc| ifc.priority);
 
     sorted
         .into_iter()
-        .filter(|ifc| matches_ifc(ifc, method, request_uri, headers, session_case))
+        .filter(|ifc| matches_ifc(ifc, request))
         .map(|ifc| &ifc.application_server)
         .collect()
 }
 
 /// Check whether a single iFC matches the given request parameters.
-fn matches_ifc(
-    ifc: &InitialFilterCriteria,
-    method: &str,
-    request_uri: &str,
-    headers: &[(String, String)],
-    session_case: SessionCase,
-) -> bool {
+fn matches_ifc(ifc: &InitialFilterCriteria, request: &IfcRequest<'_>) -> bool {
     match &ifc.trigger_point {
         None => true, // No trigger point → always matches.
-        Some(trigger) => {
-            evaluate_trigger_point(trigger, method, request_uri, headers, session_case)
-        }
+        Some(trigger) => evaluate_trigger_point(trigger, request),
     }
 }
 
 /// Evaluate a trigger point (CNF or DNF) against request parameters.
-fn evaluate_trigger_point(
-    trigger: &TriggerPoint,
-    method: &str,
-    request_uri: &str,
-    headers: &[(String, String)],
-    session_case: SessionCase,
-) -> bool {
+fn evaluate_trigger_point(trigger: &TriggerPoint, request: &IfcRequest<'_>) -> bool {
     if trigger.service_point_triggers.is_empty() {
         return true;
     }
@@ -634,7 +738,7 @@ fn evaluate_trigger_point(
     // ("trigger on INVITE", "trigger on REGISTER") this skips the SPT walk
     // and the HashMap allocation below for any non-matching method.
     if let Some(ref required) = trigger.method_fast_path {
-        if !method.eq_ignore_ascii_case(required) {
+        if !request.method.eq_ignore_ascii_case(required) {
             return false;
         }
     }
@@ -643,13 +747,7 @@ fn evaluate_trigger_point(
     // deployments are single-SPT method filters that survived the fast-path
     // guard above; eval them directly.
     if trigger.service_point_triggers.len() == 1 {
-        return evaluate_spt(
-            &trigger.service_point_triggers[0],
-            method,
-            request_uri,
-            headers,
-            session_case,
-        );
+        return evaluate_spt(&trigger.service_point_triggers[0], request);
     }
 
     // Group SPTs by their group indices.
@@ -668,29 +766,21 @@ fn evaluate_trigger_point(
     if trigger.condition_type_cnf {
         // CNF: AND of OR groups.
         // For each group, at least one SPT must match. All groups must pass.
-        groups.values().all(|spts| {
-            spts.iter()
-                .any(|spt| evaluate_spt(spt, method, request_uri, headers, session_case))
-        })
+        groups
+            .values()
+            .all(|spts| spts.iter().any(|spt| evaluate_spt(spt, request)))
     } else {
         // DNF: OR of AND groups.
         // For each group, all SPTs must match. At least one group must pass.
-        groups.values().any(|spts| {
-            spts.iter()
-                .all(|spt| evaluate_spt(spt, method, request_uri, headers, session_case))
-        })
+        groups
+            .values()
+            .any(|spts| spts.iter().all(|spt| evaluate_spt(spt, request)))
     }
 }
 
 /// Evaluate a single Service Point Trigger condition.
-fn evaluate_spt(
-    spt: &ServicePointTrigger,
-    method: &str,
-    request_uri: &str,
-    headers: &[(String, String)],
-    session_case: SessionCase,
-) -> bool {
-    let raw_result = evaluate_spt_condition(spt, method, request_uri, headers, session_case);
+fn evaluate_spt(spt: &ServicePointTrigger, request: &IfcRequest<'_>) -> bool {
+    let raw_result = evaluate_spt_condition(spt, request);
 
     if spt.condition_negated {
         !raw_result
@@ -699,22 +789,38 @@ fn evaluate_spt(
     }
 }
 
+/// Whether `text` matches `pattern`, a regular expression; a pattern that
+/// does not compile is taken as a literal substring, as the header SPT has
+/// always done.
+fn pattern_matches(pattern: &str, text: &str) -> bool {
+    match Regex::new(pattern) {
+        Ok(regex) => regex.is_match(text),
+        Err(_) => text.contains(pattern),
+    }
+}
+
+/// The `<type>=<value>` fields of an SDP body (RFC 4566 §5: the type is
+/// exactly one character). Anything else in the body, such as another part
+/// of a multipart body, is not a field and is skipped.
+fn sdp_fields(body: &str) -> impl Iterator<Item = (&str, &str)> {
+    body.lines().filter_map(|line| {
+        let line = line.trim_end_matches('\r');
+        let (field_type, value) = line.split_once('=')?;
+        (field_type.len() == 1).then_some((field_type, value))
+    })
+}
+
 /// Evaluate the raw condition of an SPT (before negation).
-fn evaluate_spt_condition(
-    spt: &ServicePointTrigger,
-    method: &str,
-    request_uri: &str,
-    headers: &[(String, String)],
-    session_case: SessionCase,
-) -> bool {
+fn evaluate_spt_condition(spt: &ServicePointTrigger, request: &IfcRequest<'_>) -> bool {
     // Method match.
     if let Some(ref expected_method) = spt.method {
-        return method.eq_ignore_ascii_case(expected_method);
+        return request.method.eq_ignore_ascii_case(expected_method);
     }
 
     // Header match.
     if let Some((ref header_name, ref content_pattern)) = spt.header {
-        let matching_headers: Vec<&str> = headers
+        let matching_headers: Vec<&str> = request
+            .headers
             .iter()
             .filter(|(name, _)| name.eq_ignore_ascii_case(header_name))
             .map(|(_, value)| value.as_str())
@@ -742,23 +848,31 @@ fn evaluate_spt_condition(
     // Request-URI match.
     if let Some(ref uri_pattern) = spt.request_uri {
         if let Ok(regex) = Regex::new(uri_pattern) {
-            return regex.is_match(request_uri);
+            return regex.is_match(request.request_uri);
         }
-        return request_uri.contains(uri_pattern.as_str());
+        return request.request_uri.contains(uri_pattern.as_str());
     }
 
     // Session case match.
     if let Some(ref expected_case) = spt.session_case {
-        return session_case == *expected_case;
+        return request.session_case == *expected_case;
     }
 
-    // SDP line match (simplified — checks headers for Content-Type: application/sdp
-    // and body content via headers list, since we don't have full body access here).
-    if let Some((ref _line_type, ref _content_pattern)) = spt.sdp_line {
-        // SDP matching requires body access which is not provided in the
-        // evaluation interface. Return false for now; callers should
-        // pre-filter or extend the API if SDP matching is needed.
-        return false;
+    // SessionDescription match (TS 29.228 Annex F): "evaluated separately
+    // against each SDP field instance within the SIP message", matching "if at
+    // least one field occurrence matches". `Line` is matched against the field
+    // type, `Content` against its value. A request without SDP has no field to
+    // match.
+    if let Some((ref line_pattern, ref content_pattern)) = spt.sdp_line {
+        let Some(body) = request.body else {
+            return false;
+        };
+        return sdp_fields(body).any(|(field_type, value)| {
+            pattern_matches(line_pattern, field_type)
+                && content_pattern
+                    .as_deref()
+                    .is_none_or(|pattern| pattern_matches(pattern, value))
+        });
     }
 
     // No condition matched — should not happen for a well-formed SPT.
@@ -946,11 +1060,12 @@ pub async fn restore_ifc_profiles(
 
         if let Some(xml) = xml {
             let aor = key.strip_prefix(key_prefix).unwrap_or(key);
-            match parse_service_profile(&xml) {
-                Ok(ifcs) => {
-                    ifc_count += ifcs.len();
+            match parse_user_profile(&xml) {
+                Ok(profile) => {
+                    ifc_count +=
+                        profile.ifcs.len() + store.note_shared_ids(aor, profile.shared_ifc_set_ids);
                     profile_count += 1;
-                    store.profiles.insert(aor.to_string(), ifcs);
+                    store.profiles.insert(aor.to_string(), profile.ifcs);
                     // Also store the raw XML for potential re-persistence.
                     store.raw_xml.insert(aor.to_string(), xml);
                 }
@@ -980,10 +1095,15 @@ pub async fn restore_ifc_profiles(
 pub struct IfcStore {
     /// Per-user iFC profiles (AoR → parsed iFCs).
     profiles: DashMap<String, Vec<InitialFilterCriteria>>,
+    /// The shared iFC sets each AoR's profile names, when it names any.
+    shared_ids: DashMap<String, Vec<u32>>,
     /// Raw XML per AoR — kept for Redis persistence (we persist XML, not structs).
     raw_xml: DashMap<String, String>,
     /// Global/static iFCs from config (fallback when no per-user profile exists).
     global: Vec<InitialFilterCriteria>,
+    /// The shared iFC sets provisioned at this S-CSCF (`isc.shared_ifc_sets`),
+    /// by SharedIFCSetID. Replaced whole on a reload.
+    shared_sets: RwLock<HashMap<u32, Vec<InitialFilterCriteria>>>,
     /// Optional backend writer for Redis persistence.
     backend_writer: OnceLock<IfcBackendWriter>,
 }
@@ -993,10 +1113,72 @@ impl IfcStore {
     pub fn new(global: Vec<InitialFilterCriteria>) -> Self {
         Self {
             profiles: DashMap::new(),
+            shared_ids: DashMap::new(),
             raw_xml: DashMap::new(),
             global,
+            shared_sets: RwLock::new(HashMap::new()),
             backend_writer: OnceLock::new(),
         }
+    }
+
+    /// Replace the shared iFC sets provisioned at this S-CSCF.
+    pub fn set_shared_sets(&self, sets: HashMap<u32, Vec<InitialFilterCriteria>>) {
+        match self.shared_sets.write() {
+            Ok(mut current) => *current = sets,
+            Err(poisoned) => *poisoned.into_inner() = sets,
+        }
+    }
+
+    /// Whether any shared iFC set is provisioned: what the `SiFC` feature
+    /// (TS 29.229 §7.1.1) the S-CSCF advertises on Cx depends on.
+    pub fn has_shared_sets(&self) -> bool {
+        self.read_shared_sets(|sets| !sets.is_empty())
+    }
+
+    /// The SharedIFCSetIDs the profile of `aor` names.
+    pub fn shared_set_ids(&self, aor: &str) -> Vec<u32> {
+        self.shared_ids
+            .get(aor)
+            .map(|ids| ids.clone())
+            .unwrap_or_default()
+    }
+
+    fn read_shared_sets<T>(
+        &self,
+        read: impl FnOnce(&HashMap<u32, Vec<InitialFilterCriteria>>) -> T,
+    ) -> T {
+        match self.shared_sets.read() {
+            Ok(sets) => read(&sets),
+            Err(poisoned) => read(&poisoned.into_inner()),
+        }
+    }
+
+    /// Record the shared iFC sets `aor`'s profile names, saying loudly which
+    /// of them this S-CSCF does not have: dropping one silently would remove
+    /// the subscriber's services. Returns how many iFCs the known ones hold.
+    fn note_shared_ids(&self, aor: &str, ids: Vec<u32>) -> usize {
+        let resolved = self.read_shared_sets(|sets| {
+            ids.iter()
+                .map(|id| match sets.get(id) {
+                    Some(set) => set.len(),
+                    None => {
+                        warn!(
+                            aor,
+                            shared_ifc_set_id = id,
+                            "iFC profile names a shared iFC set this S-CSCF has no local set for \
+                             (isc.shared_ifc_sets); its services are not applied"
+                        );
+                        0
+                    }
+                })
+                .sum()
+        });
+        if ids.is_empty() {
+            self.shared_ids.remove(aor);
+        } else {
+            self.shared_ids.insert(aor.to_string(), ids);
+        }
+        resolved
     }
 
     /// Set the backend writer for Redis persistence.
@@ -1015,11 +1197,13 @@ impl IfcStore {
 
     /// Store raw iFC XML for an AoR — parses, stores, and persists to backend.
     ///
-    /// Returns the number of iFCs parsed, or an error if the XML is invalid.
+    /// Returns the number of iFCs the profile now applies: its own, and those
+    /// of the shared iFC sets it names that this S-CSCF has. An error if the
+    /// XML is invalid.
     pub fn store_profile_xml(&self, aor: &str, xml: &str) -> Result<usize, IfcError> {
-        let ifcs = parse_service_profile(xml)?;
-        let count = ifcs.len();
-        self.profiles.insert(aor.to_string(), ifcs);
+        let profile = parse_user_profile(xml)?;
+        let count = profile.ifcs.len() + self.note_shared_ids(aor, profile.shared_ifc_set_ids);
+        self.profiles.insert(aor.to_string(), profile.ifcs);
         self.raw_xml.insert(aor.to_string(), xml.to_string());
 
         // Persist to Redis (fire-and-forget).
@@ -1035,6 +1219,7 @@ impl IfcStore {
     /// Returns `true` if a profile was actually removed.
     pub fn remove_profile(&self, aor: &str) -> bool {
         let removed = self.profiles.remove(aor).is_some();
+        self.shared_ids.remove(aor);
         self.raw_xml.remove(aor);
 
         // Remove from Redis (fire-and-forget).
@@ -1055,7 +1240,9 @@ impl IfcStore {
     /// Evaluate iFCs for a request, returning matching Application Servers.
     ///
     /// Checks per-user profile first; falls back to global rules if no
-    /// per-user profile exists for the given AoR.
+    /// per-user profile exists for the given AoR. A per-user profile's own
+    /// iFCs and those of the shared iFC sets it names are merged by Priority.
+    #[allow(clippy::too_many_arguments)]
     pub fn evaluate(
         &self,
         aor: &str,
@@ -1064,25 +1251,31 @@ impl IfcStore {
         headers: &[(String, String)],
         session_case: SessionCase,
         start_after_priority: Option<i32>,
+        body: Option<&str>,
     ) -> Vec<MatchedApplicationServer> {
+        let request = IfcRequest {
+            method,
+            request_uri,
+            headers,
+            session_case,
+            body,
+        };
         if let Some(user_ifcs) = self.profiles.get(aor) {
-            Self::evaluate_ifcs(
-                &user_ifcs,
-                method,
-                request_uri,
-                headers,
-                session_case,
-                start_after_priority,
-            )
+            let shared_ids = self.shared_ids.get(aor);
+            self.read_shared_sets(|sets| {
+                let shared = shared_ids
+                    .iter()
+                    .flat_map(|ids| ids.value().iter())
+                    .filter_map(|id| sets.get(id))
+                    .flatten();
+                Self::evaluate_ifcs(
+                    user_ifcs.iter().chain(shared),
+                    &request,
+                    start_after_priority,
+                )
+            })
         } else {
-            Self::evaluate_ifcs(
-                &self.global,
-                method,
-                request_uri,
-                headers,
-                session_case,
-                start_after_priority,
-            )
+            Self::evaluate_ifcs(self.global.iter(), &request, start_after_priority)
         }
     }
 
@@ -1091,15 +1284,14 @@ impl IfcStore {
         self.profiles.len()
     }
 
-    fn evaluate_ifcs(
-        ifcs: &[InitialFilterCriteria],
-        method: &str,
-        request_uri: &str,
-        headers: &[(String, String)],
-        session_case: SessionCase,
+    fn evaluate_ifcs<'a>(
+        ifcs: impl Iterator<Item = &'a InitialFilterCriteria>,
+        request: &IfcRequest<'_>,
         start_after_priority: Option<i32>,
     ) -> Vec<MatchedApplicationServer> {
-        let mut sorted: Vec<&InitialFilterCriteria> = ifcs.iter().collect();
+        let mut sorted: Vec<&InitialFilterCriteria> = ifcs.collect();
+        // Stable: iFCs of equal Priority keep profile order, the profile's own
+        // ahead of those of its shared sets.
         sorted.sort_by_key(|ifc| ifc.priority);
 
         sorted
@@ -1111,16 +1303,107 @@ impl IfcStore {
                         return false;
                     }
                 }
-                matches_ifc(ifc, method, request_uri, headers, session_case)
+                matches_ifc(ifc, request)
             })
             .map(MatchedApplicationServer::from)
             .collect()
     }
 }
 
+/// Load the shared iFC sets `isc.shared_ifc_sets` names, each from its file
+/// or its inline XML: `<InitialFilterCriteria>` elements in the TS 29.228
+/// Annex E form, bare or inside any wrapper. A set that cannot be read, does
+/// not parse or holds no iFC is left out, said at `error`; a set whose `file`
+/// and `xml` are both missing too.
+pub fn load_shared_ifc_sets(
+    configured: &[crate::config::SharedIfcSetConfig],
+) -> HashMap<u32, Vec<InitialFilterCriteria>> {
+    let mut sets = HashMap::new();
+    for set in configured {
+        let xml = match (&set.file, &set.xml) {
+            (Some(path), _) => match std::fs::read_to_string(path) {
+                Ok(xml) => xml,
+                Err(error) => {
+                    tracing::error!(id = set.id, path, %error, "could not read the shared iFC set");
+                    continue;
+                }
+            },
+            (None, Some(xml)) => xml.clone(),
+            (None, None) => {
+                tracing::error!(id = set.id, "shared iFC set has neither file nor xml");
+                continue;
+            }
+        };
+        match parse_service_profile(&xml) {
+            // A set exists to hold iFCs; one that parses to none is a file cut
+            // short or the wrong file, not a set to apply.
+            Ok(ifcs) if ifcs.is_empty() => {
+                tracing::error!(id = set.id, "shared iFC set holds no InitialFilterCriteria");
+            }
+            Ok(ifcs) => {
+                tracing::info!(id = set.id, count = ifcs.len(), "shared iFC set loaded");
+                sets.insert(set.id, ifcs);
+            }
+            Err(error) => {
+                tracing::error!(id = set.id, %error, "could not parse the shared iFC set");
+            }
+        }
+    }
+    sets
+}
+
+/// Reload the shared iFC sets on `SIGHUP`, for the life of the process. A set
+/// that no longer loads keeps what it had, so a bad edit does not take a
+/// subscriber's services away.
+#[cfg(unix)]
+pub fn spawn_shared_set_reloader(
+    store: std::sync::Arc<IfcStore>,
+    configured: Vec<crate::config::SharedIfcSetConfig>,
+) {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    if configured.is_empty() {
+        return;
+    }
+    tokio::spawn(async move {
+        let mut hangup = match signal(SignalKind::hangup()) {
+            Ok(stream) => stream,
+            Err(error) => {
+                tracing::error!(%error, "isc: failed to install the SIGHUP handler for shared iFC sets");
+                return;
+            }
+        };
+        while hangup.recv().await.is_some() {
+            store.reload_shared_sets(&configured);
+        }
+    });
+}
+
+#[cfg(not(unix))]
+pub fn spawn_shared_set_reloader(
+    _store: std::sync::Arc<IfcStore>,
+    _configured: Vec<crate::config::SharedIfcSetConfig>,
+) {
+}
+
+impl IfcStore {
+    /// Read the shared iFC sets again: each that loads replaces its old self,
+    /// each that does not keeps it.
+    pub fn reload_shared_sets(&self, configured: &[crate::config::SharedIfcSetConfig]) {
+        let loaded = load_shared_ifc_sets(configured);
+        let mut merged = self.read_shared_sets(HashMap::clone);
+        merged.retain(|id, _| configured.iter().any(|set| set.id == *id));
+        merged.extend(loaded);
+        self.set_shared_sets(merged);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod spec_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2112,6 +2395,7 @@ mod tests {
             &[],
             SessionCase::Originating,
             None,
+            None,
         );
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].server_name, "sip:mmtel@example.com");
@@ -2131,6 +2415,7 @@ mod tests {
             "sip:bob@example.com",
             &[],
             SessionCase::Originating,
+            None,
             None,
         );
         assert_eq!(results.len(), 1);
@@ -2172,6 +2457,7 @@ mod tests {
             "sip:bob@example.com",
             &[],
             SessionCase::Originating,
+            None,
             None,
         );
         assert_eq!(results.len(), 1);
@@ -2230,6 +2516,7 @@ mod tests {
             &[],
             SessionCase::Originating,
             None,
+            None,
         );
         assert!(results.is_empty());
     }
@@ -2252,6 +2539,7 @@ mod tests {
                     "sip:bob@example.com",
                     &[],
                     SessionCase::Originating,
+                    None,
                     None,
                 );
                 assert_eq!(results.len(), 1);
@@ -2334,6 +2622,7 @@ mod tests {
             &[],
             SessionCase::Originating,
             None,
+            None,
         );
         assert_eq!(all.len(), 3);
         assert_eq!(all[0].server_name, "sip:as1@example.com");
@@ -2346,6 +2635,7 @@ mod tests {
             &[],
             SessionCase::Originating,
             Some(10),
+            None,
         );
         assert_eq!(remaining.len(), 2);
         assert_eq!(remaining[0].server_name, "sip:as2@example.com");
@@ -2359,6 +2649,7 @@ mod tests {
             &[],
             SessionCase::Originating,
             Some(20),
+            None,
         );
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].server_name, "sip:as3@example.com");
@@ -2371,6 +2662,7 @@ mod tests {
             &[],
             SessionCase::Originating,
             Some(30),
+            None,
         );
         assert!(remaining.is_empty());
     }

@@ -2098,6 +2098,17 @@ auth:
 #   ifc_xml_path: "/etc/siphon/ifc.xml"     # path to ServiceProfile XML
 #   # ifc_xml: "<ServiceProfile>...</ServiceProfile>"  # inline XML (alternative)
 #   ifc_key_prefix: "siphon:ifc:"            # Redis key prefix (default)
+#   # Shared iFC sets (TS 29.228 Annex B.2, TS 29.229 SiFC): a service profile
+#   # may name a set by SharedIFCSetID instead of carrying its iFCs. Each file
+#   # holds <InitialFilterCriteria> elements in the HSS's own XML form. With at
+#   # least one set, Cx SAR advertises the SiFC feature so the HSS sends the
+#   # ids; a profile naming an id with no set here is logged at warn. Reloaded
+#   # on SIGHUP (a set that no longer parses keeps what it had).
+#   # shared_ifc_sets:
+#   #   - id: 1
+#   #     file: /etc/siphon/sifc/1.xml
+#   #   - id: 7
+#   #     xml: "<InitialFilterCriteria>...</InitialFilterCriteria>"
 
 # ---------------------------------------------------------------------------
 # STIR/SHAKEN — caller-ID attestation (RFC 8224/8225/8226, ATIS-1000074)

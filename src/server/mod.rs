@@ -785,6 +785,18 @@ impl SiphonServer {
             };
 
             let ifc_store = Arc::new(crate::ifc::IfcStore::new(global_ifcs));
+            // Shared iFC sets before any profile is stored or restored, so a
+            // profile naming one is resolved, and one naming an unknown id is
+            // reported, against what this S-CSCF actually has.
+            let shared_ifc_sets = config
+                .isc
+                .as_ref()
+                .map(|isc_config| isc_config.shared_ifc_sets.clone())
+                .unwrap_or_default();
+            if !shared_ifc_sets.is_empty() {
+                ifc_store.set_shared_sets(crate::ifc::load_shared_ifc_sets(&shared_ifc_sets));
+                crate::ifc::spawn_shared_set_reloader(Arc::clone(&ifc_store), shared_ifc_sets);
+            }
             pyo3::Python::attach(|python| {
                 let py_isc = crate::script::api::isc::PyIsc::new(Arc::clone(&ifc_store));
                 if let Err(error) =

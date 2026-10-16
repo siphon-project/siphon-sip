@@ -8,6 +8,29 @@ lawful intercept (`li`), and the Session Recording Server hooks (`srs`).
 
 Initial Filter Criteria evaluation (3GPP TS 29.228 / IMS Service Control).
 
+A service profile may name shared iFC sets (`<SharedIFCSetID>`, TS 29.228
+Annex B.2) that the S-CSCF holds locally, configured under `isc:`:
+
+```yaml
+isc:
+  shared_ifc_sets:
+    - id: 1
+      file: /etc/siphon/sifc/1.xml   # <InitialFilterCriteria> elements
+```
+
+They are merged with the profile's own iFCs by priority at evaluation, and
+with one configured Cx SAR advertises the `SiFC` feature so the HSS sends the
+ids (TS 29.229 §7.1.1). A diverted request takes the ORIGINATING_CDIV iFCs,
+and SessionDescription trigger points read the SDP passed as `body`:
+
+```python
+matches = isc.evaluate(
+    served_user, request.method, str(request.ruri), headers,
+    session_case="originating_cdiv",
+    body=request.body if request.get_header("Content-Type") == "application/sdp" else None,
+)
+```
+
 ::: siphon_sdk.mock_module.MockIsc
 
 ## `sbi` namespace

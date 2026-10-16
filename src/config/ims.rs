@@ -132,6 +132,24 @@ pub struct IscConfig {
     /// persisted and restored alongside registrations.
     #[serde(default = "default_ifc_key_prefix")]
     pub ifc_key_prefix: String,
+    /// The shared iFC sets provisioned at this S-CSCF (TS 29.228 Annex B.2,
+    /// TS 29.229 §7.1.1 `SiFC`), by the SharedIFCSetID a service profile
+    /// names them with. Reloaded on `SIGHUP`. With at least one, Cx SAR
+    /// advertises the `SiFC` feature so the HSS sends the ids.
+    #[serde(default)]
+    pub shared_ifc_sets: Vec<SharedIfcSetConfig>,
+}
+
+/// One shared iFC set: `<InitialFilterCriteria>` elements in the TS 29.228
+/// Annex E form, from `file` or inline `xml`.
+#[derive(Debug, Deserialize, Clone, PartialEq)]
+pub struct SharedIfcSetConfig {
+    /// The SharedIFCSetID (an integer of at least 0).
+    pub id: u32,
+    /// Path to the set's XML.
+    pub file: Option<String>,
+    /// The set's XML inline, when there is no `file`.
+    pub xml: Option<String>,
 }
 
 fn default_ifc_key_prefix() -> String {
