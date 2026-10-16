@@ -96,6 +96,7 @@ mod tests {
             super::super::numbers::PyNumber,
             super::super::numbers::PyNumbersNamespace,
             super::super::presence::PyPresence,
+            super::super::proxy_utils::PyEnumAnswer,
             super::super::proxy_utils::PyProxyUtils,
             super::super::qos::PyQosNamespace,
             super::super::registrant::PyRegistration,

@@ -27,6 +27,40 @@ Reached as `proxy.rate_limit`, `proxy.sanity_check`, `proxy.enum_lookup`, and
 
 ::: siphon_sdk.mock_module.MockProxyUtils
 
+### ENUM with outcome and failover
+
+`proxy.enum_lookup` gives one URI or `None`. `proxy.enum_query` says what the
+query came to, so "no ENUM entry" and "ENUM service down" take different
+paths, and gives every candidate so the next one can be tried:
+
+```python
+from siphon import proxy
+
+ENUM_SERVERS = ["192.0.2.10:53", "192.0.2.20:53"]
+
+@proxy.on_request("INVITE")
+async def route(request):
+    answer = await proxy.enum_query(
+        request.ruri.user, service="E2U+sip+pstn:tel",
+        servers=ENUM_SERVERS, timeout_ms=500, attempts=1,
+    )
+    if answer.outcome in ("server_failure", "timeout"):
+        request.reply(503, "Service Unavailable")
+        return
+    sip_uris = [uri for uri in answer.uris if uri.startswith("sip:")]
+    if sip_uris:
+        request.relay(sip_uris[0])
+    else:
+        request.relay()   # off-net: the default route
+```
+
+A server that times out or answers with an error is passed over for
+`enum.server_hold_down_secs` (default 30); `siphon_enum_server_up{server}`
+shows which are in use and `siphon_enum_queries_total{outcome}` counts the
+outcomes.
+
+::: siphon_sdk.mock_module.MockEnumAnswer
+
 ## `b2bua` namespace
 
 ::: siphon_sdk.mock_module.MockB2bua

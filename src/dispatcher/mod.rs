@@ -873,7 +873,17 @@ pub fn inject_python_singletons(config: &Config) {
     let py_log = PyLogNamespace::new();
 
     // Proxy utilities (rate limiter, sanity check, ENUM lookup, memory stats)
-    let py_proxy_utils = crate::script::api::proxy_utils::PyProxyUtils::new(dns_resolver);
+    let enum_servers = std::sync::Arc::new(crate::dns::enum_servers::EnumServers::new(
+        std::time::Duration::from_secs(
+            config
+                .enum_client
+                .as_ref()
+                .map(|enum_client| enum_client.server_hold_down_secs)
+                .unwrap_or_else(|| crate::config::EnumConfig::default().server_hold_down_secs),
+        ),
+    ));
+    let py_proxy_utils = crate::script::api::proxy_utils::PyProxyUtils::new(dns_resolver)
+        .with_enum_servers(enum_servers);
 
     // Cache namespace (local LRU + optional Redis)
     let cache_manager = std::sync::Arc::new(crate::cache::CacheManager::new(

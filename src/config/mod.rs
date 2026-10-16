@@ -92,8 +92,8 @@ pub use security::{
     MIN_MAX_MESSAGE_BYTES,
 };
 pub use sip::{
-    DialogBackendType, DialogConfig, NamedCacheConfig, ServerIdentityConfig, SubscribeStateConfig,
-    TransactionConfig,
+    DialogBackendType, DialogConfig, EnumConfig, NamedCacheConfig, ServerIdentityConfig,
+    SubscribeStateConfig, TransactionConfig,
 };
 pub use srs::{SrsConfig, SrsFileConfig, SrsHttpConfig};
 pub use stir::{StirConfig, StirSigningConfig, StirVerificationConfig};
@@ -342,6 +342,11 @@ pub struct Config {
 
     /// Initial Filter Criteria (3GPP TS 29.228) — S-CSCF iFC evaluation.
     pub isc: Option<IscConfig>,
+
+    /// ENUM client (`proxy.enum_query`): how long a failed ENUM server is
+    /// passed over.
+    #[serde(default, rename = "enum")]
+    pub enum_client: Option<EnumConfig>,
 
     /// 5G SBI client configuration (Npcf, Nchf).
     pub sbi: Option<SbiYamlConfig>,

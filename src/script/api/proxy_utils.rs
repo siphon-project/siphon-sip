@@ -10,6 +10,8 @@ use dashmap::DashMap;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
+use crate::dns::enum_query::{enum_query, EnumAnswer};
+use crate::dns::enum_servers::{EnumServers, ServerList, DEFAULT_ATTEMPTS, DEFAULT_TIMEOUT};
 use crate::dns::SipResolver;
 use crate::sip::builder::SipMessageBuilder;
 use crate::sip::headers::cseq::CSeq;
@@ -20,6 +22,7 @@ use crate::sip::parser::parse_uri_standalone;
 use crate::sip::uri::SipUri;
 use crate::transport::Transport;
 use crate::uac::UacSender;
+use std::net::SocketAddr;
 
 use super::reply::PyReply;
 use super::request::PyRequest;
@@ -222,6 +225,7 @@ impl RateLimiter {
 pub struct PyProxyUtils {
     rate_limiter: Arc<RateLimiter>,
     dns_resolver: Arc<SipResolver>,
+    enum_servers: Arc<EnumServers>,
 }
 
 impl PyProxyUtils {
@@ -229,8 +233,96 @@ impl PyProxyUtils {
         Self {
             rate_limiter: Arc::new(RateLimiter::new()),
             dns_resolver,
+            enum_servers: Arc::new(EnumServers::default()),
         }
     }
+
+    /// The ENUM server state `enum_query` keeps, with the hold-down of the
+    /// `enum:` block.
+    pub fn with_enum_servers(mut self, enum_servers: Arc<EnumServers>) -> Self {
+        self.enum_servers = enum_servers;
+        self
+    }
+}
+
+/// The result of `proxy.enum_query`: what the query came to, every usable
+/// URI in sequence, every record considered and why it was passed over, and
+/// the server that answered.
+#[pyclass(name = "EnumAnswer", frozen)]
+pub struct PyEnumAnswer {
+    answer: EnumAnswer,
+}
+
+#[pymethods]
+impl PyEnumAnswer {
+    /// `"ok"`, `"no_such_name"` (NXDOMAIN: the number has no entry),
+    /// `"no_records"` (NODATA), `"no_usable_record"` (records, none usable
+    /// for the service), `"server_failure"` (SERVFAIL, REFUSED, no server
+    /// reachable) or `"timeout"`. The last two are failures of the ENUM
+    /// service, worth a retry or an alarm; the middle three are answers.
+    #[getter]
+    fn outcome(&self) -> &'static str {
+        self.answer.outcome.as_str()
+    }
+
+    /// Every usable URI, in ORDER / PREFERENCE sequence (RFC 6116 section
+    /// 5.2), the URIs a followed non-terminal record leads to in its place.
+    /// Try them in turn: the first is what `enum_lookup` would pick.
+    #[getter]
+    fn uris(&self) -> Vec<String> {
+        self.answer.uris.clone()
+    }
+
+    /// Every record considered, in the same sequence, as dicts with
+    /// `order`, `preference`, `flags`, `services`, `regexp`, `replacement`,
+    /// `domain` (the name whose set held it) and `rejected` (`None`, or why it
+    /// gave no URI).
+    #[getter]
+    fn records<'py>(&self, python: Python<'py>) -> PyResult<Vec<Bound<'py, PyDict>>> {
+        self.answer
+            .records
+            .iter()
+            .map(|record| {
+                let dict = PyDict::new(python);
+                dict.set_item("order", record.rule.order)?;
+                dict.set_item("preference", record.rule.preference)?;
+                dict.set_item("flags", &record.rule.flags)?;
+                dict.set_item("services", &record.rule.services)?;
+                dict.set_item("regexp", &record.rule.regexp)?;
+                dict.set_item("replacement", &record.rule.replacement)?;
+                dict.set_item("domain", &record.domain)?;
+                dict.set_item("rejected", record.rejected.as_deref())?;
+                Ok(dict)
+            })
+            .collect()
+    }
+
+    /// The server (`"ip:port"`) that answered, when `servers=` was given and
+    /// one did; else `None`.
+    #[getter]
+    fn server(&self) -> Option<String> {
+        self.answer.server.map(|server| server.to_string())
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "EnumAnswer(outcome={:?}, uris={:?})",
+            self.answer.outcome.as_str(),
+            self.answer.uris
+        )
+    }
+}
+
+/// An ENUM server as a script names it: `"ip"` (port 53), `"ip:port"` or
+/// `"[v6]:port"`.
+fn parse_enum_server(server: &str) -> Option<SocketAddr> {
+    if let Ok(address) = server.parse::<SocketAddr>() {
+        return Some(address);
+    }
+    let bare = server.trim_start_matches('[').trim_end_matches(']');
+    bare.parse::<std::net::IpAddr>()
+        .ok()
+        .map(|ip| SocketAddr::new(ip, 53))
 }
 
 #[pymethods]
@@ -333,6 +425,154 @@ impl PyProxyUtils {
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             Ok(resolver.enum_lookup(&number, &suffix, &service).await)
+        })
+    }
+
+    /// Run an ENUM query (RFC 6116) and report what it came to. Awaitable;
+    /// resolves to an `EnumAnswer`.
+    ///
+    /// `enum_lookup` returns one URI or `None` and cannot tell "this number
+    /// has no ENUM entry" from "the ENUM service did not answer". This does:
+    /// `answer.outcome` is `"ok"`, `"no_such_name"` (NXDOMAIN),
+    /// `"no_records"` (NODATA), `"no_usable_record"`, `"server_failure"`
+    /// (SERVFAIL, REFUSED, no server reachable) or `"timeout"`, and
+    /// `answer.uris` holds every usable URI in ORDER / PREFERENCE sequence, so
+    /// the caller can move on to the next when one does not work (RFC 6116
+    /// section 5.2, RFC 3402 section 3.3).
+    ///
+    /// A non-terminal record (empty Flags) names the next domain to ask in its
+    /// Replacement (RFC 6116 sections 3.4.2 and 5.2.1); with
+    /// `follow_non_terminal` (the default) that domain's records are walked in
+    /// its place, up to five in a chain, a loop back to a name already asked
+    /// ending the chain rather than the query.
+    ///
+    /// Args:
+    ///     number: the E.164 number; characters other than digits are ignored.
+    ///     suffix: the ENUM domain (default `"e164.arpa."`).
+    ///     service: `E2U+enumservice[+enumservice...]`, e.g.
+    ///         `"E2U+sip+pstn:tel"`; a record offering any of them qualifies.
+    ///     servers: ENUM servers to ask instead of the node's resolver,
+    ///         `"ip"` (port 53) or `"ip:port"`, in order. The first that
+    ///         answers wins; one that times out or answers with an error is
+    ///         held down for `enum.server_hold_down_secs` (default 30) and
+    ///         asked only after the others (`siphon_enum_server_up`).
+    ///     timeout_ms: per attempt at one server (default 2000); needs
+    ///         `servers`.
+    ///     attempts: per server (default 2); needs `servers`.
+    ///     follow_non_terminal: follow non-terminal records (default True).
+    ///
+    /// Raises:
+    ///     ValueError: the number holds no digit, `service` is not an E2U
+    ///         field, a server does not parse, `servers` is empty, or
+    ///         `timeout_ms` / `attempts` is given without `servers`.
+    ///
+    /// Example:
+    ///
+    /// ```text
+    /// answer = await proxy.enum_query(
+    ///     "+15550100106", service="E2U+sip+pstn:tel",
+    ///     servers=["192.0.2.10:53", "192.0.2.20:53"], timeout_ms=500,
+    /// )
+    /// if answer.outcome in ("server_failure", "timeout"):
+    ///     ...   # the ENUM service is down: retry or alarm
+    /// for uri in answer.uris:
+    ///     ...   # try in turn
+    /// ```
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (
+        number,
+        suffix="e164.arpa.",
+        service="E2U+sip",
+        servers=None,
+        timeout_ms=None,
+        attempts=None,
+        follow_non_terminal=true,
+    ))]
+    fn enum_query<'py>(
+        &self,
+        py: Python<'py>,
+        number: String,
+        suffix: &str,
+        service: &str,
+        servers: Option<Vec<String>>,
+        timeout_ms: Option<u64>,
+        attempts: Option<usize>,
+        follow_non_terminal: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let value_error = |message: String| pyo3::exceptions::PyValueError::new_err(message);
+        let servers = match servers {
+            Some(servers) => {
+                if servers.is_empty() {
+                    return Err(value_error(
+                        "proxy.enum_query: servers is empty; pass None for the node's resolver"
+                            .to_string(),
+                    ));
+                }
+                let mut parsed = Vec::with_capacity(servers.len());
+                for server in &servers {
+                    parsed.push(parse_enum_server(server).ok_or_else(|| {
+                        value_error(format!(
+                            "proxy.enum_query: server {server:?} is not \"ip\" or \"ip:port\""
+                        ))
+                    })?);
+                }
+                Some(parsed)
+            }
+            None if timeout_ms.is_some() || attempts.is_some() => {
+                return Err(value_error(
+                    "proxy.enum_query: timeout_ms and attempts bound the servers= list; the node's resolver keeps its own"
+                        .to_string(),
+                ))
+            }
+            None => None,
+        };
+        if attempts == Some(0) || timeout_ms == Some(0) {
+            return Err(value_error(
+                "proxy.enum_query: timeout_ms and attempts must be above 0".to_string(),
+            ));
+        }
+        // Refuse a bad number or service now, not from inside the awaitable.
+        if crate::dns::enum_naptr::application_unique_string(&number).is_none() {
+            return Err(value_error(format!(
+                "proxy.enum_query: number {number:?} holds no digit"
+            )));
+        }
+        if crate::dns::enum_naptr::requested_enumservices(service).is_none() {
+            return Err(value_error(format!(
+                "proxy.enum_query: service {service:?} is not an E2U service field"
+            )));
+        }
+
+        let resolver = Arc::clone(&self.dns_resolver);
+        let enum_servers = Arc::clone(&self.enum_servers);
+        let suffix = suffix.to_string();
+        let service = service.to_string();
+        let timeout = timeout_ms.map_or(DEFAULT_TIMEOUT, std::time::Duration::from_millis);
+        let attempts = attempts.unwrap_or(DEFAULT_ATTEMPTS);
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let result = match &servers {
+                Some(list) => {
+                    let source = ServerList {
+                        servers: &enum_servers,
+                        list,
+                        timeout,
+                        attempts,
+                    };
+                    enum_query(&source, &number, &suffix, &service, follow_non_terminal).await
+                }
+                None => {
+                    enum_query(&*resolver, &number, &suffix, &service, follow_non_terminal).await
+                }
+            };
+            match result {
+                Ok(answer) => {
+                    crate::metrics::enum_servers::record_query(answer.outcome);
+                    Ok(PyEnumAnswer { answer })
+                }
+                Err(error) => Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "proxy.enum_query: {error}"
+                ))),
+            }
         })
     }
 
@@ -1100,6 +1340,83 @@ mod tests {
     fn make_proxy_utils() -> PyProxyUtils {
         let resolver = Arc::new(SipResolver::from_system().unwrap());
         PyProxyUtils::new(resolver)
+    }
+
+    /// `proxy.enum_query` refuses what it cannot ask before anything is
+    /// sent, and `timeout_ms` / `attempts` only with a server list.
+    #[test]
+    fn enum_query_refuses_arguments_it_cannot_act_on() {
+        let utils = make_proxy_utils();
+        pyo3::Python::initialize();
+        Python::attach(|python| {
+            type Case = (
+                &'static str,
+                &'static str,
+                Option<Vec<String>>,
+                Option<u64>,
+                Option<usize>,
+            );
+            let cases: [Case; 6] = [
+                ("+", "E2U+sip", None, None, None),
+                ("+15550100106", "SIP+D2U", None, None, None),
+                ("+15550100106", "E2U+sip", Some(Vec::new()), None, None),
+                (
+                    "+15550100106",
+                    "E2U+sip",
+                    Some(vec!["enum.example.com".into()]),
+                    None,
+                    None,
+                ),
+                ("+15550100106", "E2U+sip", None, Some(500), None),
+                (
+                    "+15550100106",
+                    "E2U+sip",
+                    Some(vec!["192.0.2.10".into()]),
+                    None,
+                    Some(0),
+                ),
+            ];
+            for (number, service, servers, timeout_ms, attempts) in cases {
+                let error = utils
+                    .enum_query(
+                        python,
+                        number.to_string(),
+                        "e164.arpa.",
+                        service,
+                        servers.clone(),
+                        timeout_ms,
+                        attempts,
+                        true,
+                    )
+                    .err()
+                    .unwrap_or_else(|| panic!("{number} {service} {servers:?} is refused"));
+                assert!(
+                    error.is_instance_of::<pyo3::exceptions::PyValueError>(python),
+                    "{error}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn enum_servers_parse_with_and_without_a_port() {
+        assert_eq!(
+            parse_enum_server("192.0.2.10"),
+            Some("192.0.2.10:53".parse().expect("a literal address"))
+        );
+        assert_eq!(
+            parse_enum_server("192.0.2.10:5353"),
+            Some("192.0.2.10:5353".parse().expect("a literal address"))
+        );
+        assert_eq!(
+            parse_enum_server("[2001:db8::53]:53"),
+            Some("[2001:db8::53]:53".parse().expect("a literal address"))
+        );
+        assert_eq!(
+            parse_enum_server("2001:db8::53"),
+            Some("[2001:db8::53]:53".parse().expect("a literal address"))
+        );
+        assert_eq!(parse_enum_server("enum.example.com"), None);
     }
 
     #[test]

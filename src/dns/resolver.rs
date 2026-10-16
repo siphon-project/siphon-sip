@@ -6,19 +6,9 @@ use std::net::{IpAddr, SocketAddr};
 use tracing::{debug, warn};
 
 use super::enum_naptr::{application_unique_string, query_name, select_enum_uri, NaptrRule};
+use super::enum_query::{NaptrAnswer, NaptrLookup, NaptrSource};
+use super::enum_servers::{classify, naptr_rule};
 use crate::sip::uri::strip_ipv6_brackets;
-
-/// The text form of a NAPTR record's fields.
-fn naptr_rule(naptr: &hickory_resolver::proto::rr::rdata::NAPTR) -> NaptrRule {
-    NaptrRule {
-        order: naptr.order,
-        preference: naptr.preference,
-        flags: String::from_utf8_lossy(&naptr.flags).into_owned(),
-        services: String::from_utf8_lossy(&naptr.services).into_owned(),
-        regexp: String::from_utf8_lossy(&naptr.regexp).into_owned(),
-        replacement: naptr.replacement.to_string(),
-    }
-}
 
 /// A resolved SIP target: address + transport hint from SRV.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -310,6 +300,23 @@ impl SipResolver {
         }
     }
 
+    /// The NAPTR records at `query_name`, or which kind of nothing it gave:
+    /// NXDOMAIN, NODATA, an error response or a timeout, within the resolver's
+    /// total budget. What `proxy.enum_query` asks when it names no servers.
+    pub async fn naptr_lookup(&self, query_name: &str) -> NaptrLookup {
+        use hickory_resolver::proto::rr::RecordType;
+
+        match tokio::time::timeout(
+            self.total_budget,
+            self.resolver.lookup(query_name, RecordType::NAPTR),
+        )
+        .await
+        {
+            Ok(result) => classify(result),
+            Err(_) => NaptrLookup::Timeout,
+        }
+    }
+
     /// Resolve an E.164 number to a URI through ENUM (RFC 6116).
     ///
     /// Queries the NAPTR records of the number under `suffix` and returns the
@@ -467,6 +474,16 @@ fn random_u32_inclusive(max: u32) -> u32 {
     }
     let value = u64::from_le_bytes(buf);
     (value % range) as u32
+}
+
+/// The node's own resolver as the source of an ENUM query.
+impl NaptrSource for SipResolver {
+    async fn naptr(&self, name: &str) -> NaptrAnswer {
+        NaptrAnswer {
+            lookup: self.naptr_lookup(name).await,
+            server: None,
+        }
+    }
 }
 
 #[cfg(test)]

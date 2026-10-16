@@ -2068,6 +2068,16 @@ auth:
 #   peer: cdf1                            # explicit peer; default = first registered
 
 # ---------------------------------------------------------------------------
+# ENUM client (proxy.enum_query with servers=)
+# ---------------------------------------------------------------------------
+# enum:
+#   # Seconds an ENUM server that timed out or answered with an error
+#   # (SERVFAIL, REFUSED, ...) is passed over: asked only after every server
+#   # still in use, back in order once this runs out. siphon_enum_server_up
+#   # shows the state.
+#   server_hold_down_secs: 30
+
+# ---------------------------------------------------------------------------
 # ISC — Initial Filter Criteria (3GPP TS 29.228)
 # ---------------------------------------------------------------------------
 # Initial Filter Criteria define which Application Servers a SIP request must

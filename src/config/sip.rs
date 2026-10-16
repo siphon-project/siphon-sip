@@ -173,6 +173,27 @@ fn default_dialog_backend() -> DialogBackendType {
     DialogBackendType::Memory
 }
 
+/// ENUM client settings (`enum:`), for `proxy.enum_query` with `servers=`.
+#[derive(Debug, Deserialize, Clone, PartialEq)]
+pub struct EnumConfig {
+    /// Seconds an ENUM server that timed out or answered with an error is
+    /// passed over (asked only after every server still in use). Default 30.
+    #[serde(default = "default_enum_server_hold_down_secs")]
+    pub server_hold_down_secs: u64,
+}
+
+impl Default for EnumConfig {
+    fn default() -> Self {
+        Self {
+            server_hold_down_secs: default_enum_server_hold_down_secs(),
+        }
+    }
+}
+
+fn default_enum_server_hold_down_secs() -> u64 {
+    30
+}
+
 // ---------------------------------------------------------------------------
 // Named cache connections (accessible from Python scripts via cache.fetch)
 // ---------------------------------------------------------------------------

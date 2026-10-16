@@ -947,6 +947,24 @@
         "sig": "($self, code_or_name, value, vendor=0)"
       }
     },
+    "EnumAnswer": {
+      "outcome": {
+        "doc": "`\"ok\"`, `\"no_such_name\"` (NXDOMAIN: the number has no entry),",
+        "kind": "getset_descriptor"
+      },
+      "records": {
+        "doc": "Every record considered, in the same sequence, as dicts with",
+        "kind": "getset_descriptor"
+      },
+      "server": {
+        "doc": "The server (`\"ip:port\"`) that answered, when `servers=` was given and",
+        "kind": "getset_descriptor"
+      },
+      "uris": {
+        "doc": "Every usable URI, in ORDER / PREFERENCE sequence (RFC 6116 section",
+        "kind": "getset_descriptor"
+      }
+    },
     "Flow": {
       "connection_id": {
         "doc": "Identifier of the accepted inbound connection this flow was captured on.",
@@ -1447,6 +1465,11 @@
         "doc": "Look up a phone number via ENUM (DNS NAPTR) query.",
         "kind": "method_descriptor",
         "sig": "($self, number, suffix=\"e164.arpa.\", service=\"E2U+sip\")"
+      },
+      "enum_query": {
+        "doc": "Run an ENUM query (RFC 6116) and report what it came to. Awaitable;",
+        "kind": "method_descriptor",
+        "sig": "($self, number, suffix=\"e164.arpa.\", service=\"E2U+sip\", servers=None, timeout_ms=None, attempts=None, follow_non_terminal=True)"
       },
       "memory_used_pct": {
         "doc": "Return approximate RSS memory usage as a percentage (0-100).",
