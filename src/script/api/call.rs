@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
+use super::call_contact::{checked_contact, set_local_contact};
 use super::sip_uri::PySipUri;
 use crate::sip::message::SipMessage;
 
@@ -964,40 +965,6 @@ fn uas_response_headers(
         pyo3::exceptions::PyValueError::new_err(format!("{method}(headers=…): {refusal}"))
     })?;
     Ok(pairs)
-}
-
-/// The Contact a script named for `call.answer()` / `call.progress()`, as the
-/// header value siphon will advertise. `Ok(None)` with no `contact`;
-/// `ValueError` for a URI or parameters siphon would not put in a Contact, or
-/// `contact_params` without a `contact`.
-fn checked_contact(
-    method: &str,
-    contact: Option<&str>,
-    contact_params: Option<&str>,
-) -> PyResult<Option<String>> {
-    let Some(uri) = contact else {
-        if contact_params.is_some() {
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "{method}(contact_params=…) needs contact=, the URI they go with"
-            )));
-        }
-        return Ok(None);
-    };
-    crate::b2bua::uas_headers::script_contact(uri, contact_params)
-        .map(Some)
-        .map_err(|why| {
-            pyo3::exceptions::PyValueError::new_err(format!("{method}(contact=…): {why}"))
-        })
-}
-
-/// Make a checked script Contact the caller's dialog's local target, before
-/// the response that first carries it goes out.
-fn set_local_contact(method: &str, call_id: &str, contact: Option<String>) {
-    if let Some(contact) = contact {
-        if !crate::dispatcher::b2bua_set_local_contact(call_id, contact) {
-            tracing::error!(call_id = %call_id, "{method}(contact=…): no live B2BUA call to name the Contact of");
-        }
-    }
 }
 
 #[pymethods]
