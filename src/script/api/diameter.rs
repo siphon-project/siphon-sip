@@ -665,7 +665,7 @@ fn build_ims_data(
         Some(value) => Some(NodeRole::from_str_ci(value).ok_or_else(|| {
             pyo3::exceptions::PyValueError::new_err(format!(
                 "unknown role_of_node {value:?}; expected one of \
-                 'originating'/'terminating'/'proxy'/'b2bua'"
+                 'originating'/'terminating'/'forwarding'"
             ))
         })?),
         None => None,
@@ -2715,7 +2715,7 @@ impl PyDiameter {
     /// ACA-START, the CTF MUST honor this cadence per RFC 6733 §8.19).
     ///
     /// ``role_of_node`` accepts ``"originating"``, ``"terminating"``,
-    /// ``"proxy"``, ``"b2bua"`` (TS 32.299 §7.2.149).
+    /// ``"forwarding"`` (TS 32.299 V18 clause 7.2.177).
     ///
     /// ``node_functionality`` accepts ``"scscf"``, ``"pcscf"``, ``"icscf"``,
     /// ``"mrfc"``, ``"mgcf"``, ``"bgcf"``, ``"as"``, ``"ibcf"``, ``"ecscf"``,

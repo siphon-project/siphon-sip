@@ -62,16 +62,25 @@ impl SubscriberIdKind {
     }
 }
 
-// ── Role-of-Node (TS 32.299 §7.2.149) ──────────────────────────────────
+// ── Role-of-Node (TS 32.299 §7.2.177) ──────────────────────────────────
 
-/// IMS node role for charging purposes per TS 32.299 §7.2.149.
+/// The role of the node in a session, per TS 32.299 V18 clause 7.2.177.
+///
+/// The role is the session case the node serves, not the kind of node it is:
+/// an application server acting as a B2BUA on the originating side of a call
+/// is in the originating role. Release 18 has only these three values; the
+/// PROXY and B2BUA roles of earlier releases are gone, and 2 now means
+/// FORWARDING, so a Release 18 charging function refuses a 3.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub enum NodeRole {
+    /// ORIGINATING_ROLE: serving the calling party.
     OriginatingRole = 0,
+    /// TERMINATING_ROLE: serving the called party.
     TerminatingRole = 1,
-    ProxyRole = 2,
-    B2buaRole = 3,
+    /// FORWARDING_ROLE: an originating role, serving the forwarding party of
+    /// a diverted call (session case `orig-cdiv`, RFC 8498).
+    ForwardingRole = 2,
 }
 
 impl NodeRole {
@@ -80,14 +89,14 @@ impl NodeRole {
     }
 
     /// Parse a Python-style role string (`"originating"`, `"terminating"`,
-    /// `"proxy"`, `"b2bua"`).  Case-insensitive.  Returns `None` for
-    /// unknown values so the caller can emit a structured error.
+    /// `"forwarding"`, or the session cases `"orig"`, `"term"`,
+    /// `"orig-cdiv"`).  Case-insensitive.  Returns `None` for unknown
+    /// values so the caller can emit a structured error.
     pub fn from_str_ci(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "originating" | "orig" => Some(NodeRole::OriginatingRole),
             "terminating" | "term" => Some(NodeRole::TerminatingRole),
-            "proxy" => Some(NodeRole::ProxyRole),
-            "b2bua" | "b2b-ua" => Some(NodeRole::B2buaRole),
+            "forwarding" | "orig-cdiv" => Some(NodeRole::ForwardingRole),
             _ => None,
         }
     }
@@ -1112,12 +1121,43 @@ mod tests {
         assert_eq!(SubscriberIdKind::EndUserPrivate.as_u32(), 4);
     }
 
+    /// TS 32.299 V18 clause 7.2.177 defines exactly three values.
     #[test]
     fn node_role_ts32299_values() {
         assert_eq!(NodeRole::OriginatingRole.as_u32(), 0);
         assert_eq!(NodeRole::TerminatingRole.as_u32(), 1);
-        assert_eq!(NodeRole::ProxyRole.as_u32(), 2);
-        assert_eq!(NodeRole::B2buaRole.as_u32(), 3);
+        assert_eq!(NodeRole::ForwardingRole.as_u32(), 2);
+    }
+
+    /// Each role reaches the wire as the clause value, inside IMS-Information.
+    #[test]
+    fn node_role_encodes_to_the_clause_value() {
+        for (role, value) in [
+            (NodeRole::OriginatingRole, 0u64),
+            (NodeRole::TerminatingRole, 1),
+            (NodeRole::ForwardingRole, 2),
+        ] {
+            let ims = ImsChargingData {
+                role_of_node: Some(role),
+                ..Default::default()
+            };
+            let wire = build_ccr_wire_for_test(
+                CcRequestType::Initial,
+                0,
+                &SubscriberId::msisdn("+15551234567"),
+                Some(&ims),
+                None,
+                None,
+            );
+            let decoded = crate::diameter::codec::decode_diameter(&wire).expect("a CCR");
+            let encoded = decoded
+                .avps
+                .get("Service-Information")
+                .and_then(|v| v.get("IMS-Information"))
+                .and_then(|v| v.get("Role-of-Node"))
+                .and_then(|v| v.as_u64());
+            assert_eq!(encoded, Some(value), "{role:?}");
+        }
     }
 
     #[test]
@@ -1138,9 +1178,17 @@ mod tests {
             NodeRole::from_str_ci("term"),
             Some(NodeRole::TerminatingRole)
         );
-        assert_eq!(NodeRole::from_str_ci("proxy"), Some(NodeRole::ProxyRole));
-        assert_eq!(NodeRole::from_str_ci("b2bua"), Some(NodeRole::B2buaRole));
-        assert_eq!(NodeRole::from_str_ci("b2b-ua"), Some(NodeRole::B2buaRole));
+        assert_eq!(
+            NodeRole::from_str_ci("forwarding"),
+            Some(NodeRole::ForwardingRole)
+        );
+        assert_eq!(
+            NodeRole::from_str_ci("orig-cdiv"),
+            Some(NodeRole::ForwardingRole)
+        );
+        // Earlier releases' PROXY/B2BUA values are not Release 18 roles.
+        assert_eq!(NodeRole::from_str_ci("proxy"), None);
+        assert_eq!(NodeRole::from_str_ci("b2bua"), None);
         assert_eq!(NodeRole::from_str_ci("unknown"), None);
     }
 

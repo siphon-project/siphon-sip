@@ -115,7 +115,12 @@ async def route(call):
 "granted_time": int|None, "session_id": str|None}`. The charged party defaults to
 the `ro.charge` config (orig = caller, term = callee); pass
 `subscription_id="+31…"` / `subscription_id="sip:alice@…"` to override it (a
-`sip:` URI is typed as a SIP URI, never mislabeled as an E.164 MSISDN). Rating
+`sip:` URI is typed as a SIP URI, never mislabeled as an E.164 MSISDN).
+Role-Of-Node (TS 32.299 clause 7.2.177) is the session case of the INVITE:
+`P-Served-User` `sescase=orig` sends 0 (originating), `term` 1 (terminating),
+`orig-cdiv` 2 (forwarding), and without the header the caller's domain decides
+between 0 and 1. Pass `role_of_node="originating"` / `"terminating"` /
+`"forwarding"` to set it yourself. Rating
 group, requested quota and Service-Context come from the `ro:` config block.
 `4011 CREDIT_CONTROL_NOT_APPLICABLE` returns `authorized: True` with no session
 (the call runs free of charge). Skip the `ro_authorize()` call entirely for calls

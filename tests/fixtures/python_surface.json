@@ -318,7 +318,7 @@
       "ro_authorize": {
         "doc": "Reserve prepaid credit (Ro CCR-INITIAL) for this call BEFORE dialing the",
         "kind": "method_descriptor",
-        "sig": "($self, *, subscription_id=None, subscription_id_type=None)"
+        "sig": "($self, *, subscription_id=None, subscription_id_type=None, role_of_node=None)"
       },
       "route": {
         "doc": "Route this call across an ordered list of carrier `Route`s with",
