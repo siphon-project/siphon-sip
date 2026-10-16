@@ -9,10 +9,10 @@
 
 use std::sync::Arc;
 
+use crate::config::yaml::Value;
 use pyo3::exceptions::PyLookupError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
-use serde_yaml_ng::Value;
 
 use crate::script::script_config::{lookup, ScriptConfigStore};
 
@@ -151,7 +151,7 @@ mod tests {
     );
 
     fn namespace(yaml: &str) -> PyScriptConfig {
-        let document: Value = serde_yaml_ng::from_str(yaml).unwrap();
+        let document = crate::config::yaml::parse_value(yaml).unwrap();
         PyScriptConfig::new(Arc::new(ScriptConfigStore::inline(document).unwrap()))
     }
 

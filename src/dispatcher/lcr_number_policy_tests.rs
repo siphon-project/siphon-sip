@@ -39,7 +39,7 @@ fn numbers(default: Option<&str>) -> NumberRuntime {
     ] {
         policies.insert(
             name.to_string(),
-            serde_yaml_ng::from_str::<NumberPolicyConfig>(yaml).expect("the policy parses"),
+            crate::config::yaml::from_str::<NumberPolicyConfig>(yaml).expect("the policy parses"),
         );
     }
     let (registry, warnings) = NumberRegistry::build(&numbering, &policies);

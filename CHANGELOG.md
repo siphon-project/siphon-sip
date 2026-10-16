@@ -381,6 +381,18 @@ entry, but a working config keeps working.
 
 ### Changed
 
+- **The YAML reader is now serde-saphyr.** serde_yaml_ng sat on
+  unsafe-libyaml, unmaintained (RUSTSEC-2024-0449). `siphon.yaml`, a
+  `script_config` document and `extensions` entries read as before: the
+  differential run over every YAML file in the repository found no value that
+  changed. `script_config` keeps the YAML 1.2 core schema it always had, so
+  `on` / `yes` stay strings, digits with a leading zero stay strings and `<<`
+  is an ordinary key. A typed key now also takes a quoted number or boolean
+  and `_` in an integer, and a parse error gives the line and column instead
+  of the key path. **BREAKING (Rust library):** `Config::extensions`,
+  `Config::script_config`, `Config::extension_config` and the
+  `script::script_config` functions use `config::yaml::Value` in place of
+  `serde_yaml_ng::Value`; see `docs/migrating-to-1.14.md`.
 - **The dialog-state match over a captured flow no longer scans every
   binding.** `binding_for_source`, which the dialog-state publisher runs for
   each branch relayed with `request.relay(flow=...)`, read the whole table:

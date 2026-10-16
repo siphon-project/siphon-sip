@@ -104,7 +104,7 @@ fn the_default_timer_c_is_larger_than_three_minutes() {
     assert!(DEFAULT_TIMER_C > Duration::from_secs(180));
     assert_eq!(TimerConfig::default().timer_c(), DEFAULT_TIMER_C);
     let unset: crate::config::TransactionConfig =
-        serde_yaml_ng::from_str("{}").expect("an empty transaction block parses");
+        crate::config::yaml::from_str("{}").expect("an empty transaction block parses");
     assert_eq!(
         Duration::from_secs(u64::from(unset.timer_c_secs)),
         DEFAULT_TIMER_C
@@ -116,7 +116,7 @@ fn the_default_timer_c_is_larger_than_three_minutes() {
 #[test]
 fn the_configured_timer_c_is_what_the_transaction_runs() {
     let configured: crate::config::TransactionConfig =
-        serde_yaml_ng::from_str("timer_c_secs: 240").expect("the transaction block parses");
+        crate::config::yaml::from_str("timer_c_secs: 240").expect("the transaction block parses");
     let timers = TimerConfig {
         timer_c_secs: configured.timer_c_secs,
         ..TimerConfig::default()

@@ -40,7 +40,7 @@ const FAIL_OVER_ON_408: &str = concat!(
 /// A proxy running [`FAIL_OVER_ON_408`] whose transaction layer has
 /// `timeout_secs` (`None`: unset) as `transaction.timeout_secs`.
 fn failing_over_proxy(timeout_secs: Option<u32>) -> Proxy {
-    let transaction: crate::config::TransactionConfig = serde_yaml_ng::from_str(
+    let transaction: crate::config::TransactionConfig = crate::config::yaml::from_str(
         &timeout_secs.map_or("{}".to_string(), |secs| format!("timeout_secs: {secs}")),
     )
     .expect("the transaction block parses");

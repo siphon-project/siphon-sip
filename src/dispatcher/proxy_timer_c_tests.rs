@@ -359,7 +359,7 @@ fn the_transaction_block_reaches_the_timers() {
     assert!(defaults.auto_100_trying);
     assert_eq!(defaults.timer_f(), Duration::from_secs(32));
 
-    let configured: crate::config::TransactionConfig = serde_yaml_ng::from_str(concat!(
+    let configured: crate::config::TransactionConfig = crate::config::yaml::from_str(concat!(
         "timeout_secs: 5\n",
         "timer_c_secs: 240\n",
         "auto_emit_100_trying: false\n",
@@ -377,7 +377,7 @@ fn the_transaction_block_reaches_the_timers() {
 
     // An empty block is the defaults.
     let empty: crate::config::TransactionConfig =
-        serde_yaml_ng::from_str("{}").expect("an empty transaction block parses");
+        crate::config::yaml::from_str("{}").expect("an empty transaction block parses");
     assert_eq!(transaction_timers(Some(&empty)).timer_c_secs, 181);
     assert_eq!(
         transaction_timers(Some(&empty)).timer_f(),
@@ -386,7 +386,7 @@ fn the_transaction_block_reaches_the_timers() {
 
     // Past what two bytes of seconds hold, the most they hold.
     let long: crate::config::TransactionConfig =
-        serde_yaml_ng::from_str("timeout_secs: 100000").expect("the block parses");
+        crate::config::yaml::from_str("timeout_secs: 100000").expect("the block parses");
     assert_eq!(
         transaction_timers(Some(&long)).timer_f(),
         Duration::from_secs(u64::from(u16::MAX))
@@ -394,7 +394,7 @@ fn the_transaction_block_reaches_the_timers() {
 
     // A zero is no timeout at all, and is left to the default.
     let zero: crate::config::TransactionConfig =
-        serde_yaml_ng::from_str("timeout_secs: 0").expect("the block parses");
+        crate::config::yaml::from_str("timeout_secs: 0").expect("the block parses");
     assert_eq!(
         transaction_timers(Some(&zero)).timer_f(),
         Duration::from_secs(32)

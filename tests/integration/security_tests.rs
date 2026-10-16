@@ -40,7 +40,7 @@ const SECURITY_YAML: &str = concat!(
 
 fn deployment_filter() -> std::sync::Arc<SecurityFilter> {
     let config: SecurityConfig =
-        serde_yaml_ng::from_str(SECURITY_YAML).expect("security block should deserialize");
+        siphon::config::yaml::from_str(SECURITY_YAML).expect("security block should deserialize");
     SecurityFilter::from_config(&config).expect("rate_limit + scanner_block => filter installed")
 }
 
@@ -214,7 +214,7 @@ fn filter_is_opt_in_when_neither_rate_limit_nor_scanner_block_set() {
         "  api_key: \"test-key-not-a-real-key\"\n",
         "  interval_secs: 900\n",
     );
-    let config: SecurityConfig = serde_yaml_ng::from_str(yaml).expect("should deserialize");
+    let config: SecurityConfig = siphon::config::yaml::from_str(yaml).expect("should deserialize");
     assert!(SecurityFilter::from_config(&config).is_none());
 }
 
@@ -226,7 +226,7 @@ fn scanner_block_only_still_installs_filter() {
         "  user_agents:\n",
         "    - \"sipvicious\"\n",
     );
-    let config: SecurityConfig = serde_yaml_ng::from_str(yaml).expect("should deserialize");
+    let config: SecurityConfig = siphon::config::yaml::from_str(yaml).expect("should deserialize");
     let filter = SecurityFilter::from_config(&config).expect("scanner_block installs the filter");
 
     let attacker = ip("203.0.113.70");

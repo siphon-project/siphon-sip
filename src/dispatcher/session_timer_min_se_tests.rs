@@ -53,7 +53,7 @@ const MINIMUM_300: &str = "session_expires: 1800\nmin_se: 300\n";
 fn dispatcher_with(script: &str, config: Option<&str>) -> TestDispatcher {
     let mut dispatcher = test_dispatcher_with_script(script);
     dispatcher.state.session_timer_config =
-        config.map(|yaml| serde_yaml_ng::from_str(yaml).expect("a session timer config"));
+        config.map(|yaml| crate::config::yaml::from_str(yaml).expect("a session timer config"));
     dispatcher
 }
 

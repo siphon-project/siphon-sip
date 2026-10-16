@@ -23,7 +23,7 @@ use super::*;
 pub(super) fn timer_dispatcher(config: Option<&str>) -> TestDispatcher {
     let mut dispatcher = strip_dispatcher(&[]);
     dispatcher.state.session_timer_config =
-        config.map(|yaml| serde_yaml_ng::from_str(yaml).expect("a session timer config"));
+        config.map(|yaml| crate::config::yaml::from_str(yaml).expect("a session timer config"));
     dispatcher
 }
 
