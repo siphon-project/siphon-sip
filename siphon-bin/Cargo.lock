@@ -1067,9 +1067,9 @@ dependencies = [
 
 [[package]]
 name = "gsm_cap"
-version = "1.2.0"
+version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "41f20d4ebad4f25dec4e9bc7b61f660a8124541cbea73b4dee3b081c16ea7c66"
+checksum = "6c6cc4e0d6df2c2a825f65c5a8c31759203f309fa2a823c13c4b81828663e7f3"
 dependencies = [
  "inap",
  "rasn 0.28.13",
@@ -1078,9 +1078,9 @@ dependencies = [
 
 [[package]]
 name = "gsm_map"
-version = "1.1.0"
+version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "525404d2ad1965e5b64b4548ac8f63b138a0fdd805a889b49fa3ef6e4b5ab9fc"
+checksum = "e5f4a773ade83f2cf0dde54e5c6b7faf3b2a70edb451dbd891f79d60656c87f5"
 dependencies = [
  "hex",
  "rasn 0.28.13",
@@ -1470,9 +1470,9 @@ dependencies = [
 
 [[package]]
 name = "inap"
-version = "1.1.0"
+version = "2.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d377252b44d8202a736736b49896653055903646d14c33bec33824af01476729"
+checksum = "ad9e33756e8b519cb21a2900ea28fff7745edada59b2c64cdc1b6d7ffd47f58d"
 dependencies = [
  "rasn 0.28.13",
  "thiserror 2.0.21",
@@ -2927,9 +2927,9 @@ dependencies = [
 
 [[package]]
 name = "sccp"
-version = "1.1.0"
+version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a3e9d3ce21fee346de7ec34ecf5897699e1c6693b6184b3d1bcfa13854f9b809"
+checksum = "f368d458b6c1421119b8e8130a5c930e4e1df7d2600046088333595404bfbebe"
 dependencies = [
  "thiserror 2.0.21",
 ]
@@ -3232,8 +3232,8 @@ dependencies = [
 
 [[package]]
 name = "siphon-sigtran"
-version = "1.0.0"
-source = "git+https://github.com/siphon-project/siphon-sigtran?tag=v1.0.0#e57635d2a6e70e4497172f1af70771bb4629d5bb"
+version = "3.0.0"
+source = "git+https://github.com/siphon-project/siphon-sigtran?tag=v3.0.0#299a2cf292db7fdfd0909ed2ca8abf30d63f3ab0"
 dependencies = [
  "async-sctp",
  "gsm_cap",
@@ -3588,9 +3588,9 @@ checksum = "adb6935a6f5c20170eeceb1a3835a49e12e19d792f6dd344ccc76a985ca5a6ca"
 
 [[package]]
 name = "tcap"
-version = "1.0.0"
+version = "2.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5b0b3ae9ef7e1f435857ee51059c1db6a30f512b450ad232bf63e4ad84b3090a"
+checksum = "2487e2dd5c81e55c4fb7f4d4ce8b8a4024c20e8e4069e9fa99c48e5634952cdc"
 dependencies = [
  "hex",
  "rasn 0.28.13",
