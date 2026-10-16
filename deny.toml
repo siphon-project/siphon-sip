@@ -17,6 +17,9 @@ yanked = "deny"
 ignore = [
     # paste — unmaintained transitive (no vuln); remove when the parent crate drops it.
     "RUSTSEC-2024-0436",
+    # unsafe-libyaml — unmaintained (no vuln, no maintained successor); the YAML
+    # parser under serde_yaml_ng and serde_yaml. Remove when both move off it.
+    "RUSTSEC-2024-0449",
 ]
 
 [bans]
