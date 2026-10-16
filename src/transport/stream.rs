@@ -683,9 +683,10 @@ pub(crate) async fn serve_sip_stream<R, W>(
             let _ = tokio::time::timeout(FINAL_WRITE_GRACE, &mut write_task).await;
         }
         _ = &mut write_task => {}
-        // The source was banned while this connection was established. Nothing
-        // is flushed to it: the ban is the answer. `close_banned_source` already
-        // logged the connection it is closing and why.
+        // The source was banned while this connection was established, or its
+        // peer stopped answering CRLF keep-alives. Nothing is flushed to it:
+        // `close_banned_source` / `close_connection` already logged the
+        // connection they are closing and why.
         _ = closer.closed() => {}
     }
 
@@ -1744,6 +1745,79 @@ mod tests {
         assert!(!connection_map.contains_key(&ConnectionId(42)));
         // RFC 5626 §4.2.2 flow failure is reported to the registrar.
         assert_eq!(close_rx.recv_async().await.unwrap(), 42);
+    }
+
+    /// RFC 5626 §4.4.1: a peer that answered a CRLF ping and then stops
+    /// answering is closed after `failure_threshold` misses. Closed means the
+    /// socket goes and the flow failure reaches the registrar (§4.2.2), not
+    /// only that the keepalive forgets the connection: the read half holds a
+    /// sender of its own (for the pongs it writes), so taking the entry out of
+    /// the connection map left the connection up until the 300 s idle timeout.
+    #[tokio::test]
+    async fn a_peer_that_stops_answering_crlf_pings_is_closed() {
+        let (mut client, server) = tokio::io::duplex(4096);
+        let (reader, writer) = tokio::io::split(server);
+        let (inbound_tx, _inbound_rx) = flume::unbounded();
+        let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
+            Arc::new(DashMap::new());
+        let tracker = Arc::new(crate::transport::crlf_keepalive::CrlfPongTracker::new());
+        let (close_tx, close_rx) = flume::unbounded();
+        // An id no other test uses: the closer registry is process-wide.
+        let connection_id = ConnectionId(5626);
+        let served = tokio::spawn(serve_sip_stream(
+            reader,
+            writer,
+            StreamContext {
+                connection_id,
+                ..context()
+            },
+            BytesMut::new(),
+            inbound_tx,
+            connection_map.clone(),
+            None,
+            Some(tracker.clone()),
+            Some(close_tx),
+        ));
+        while !connection_map.contains_key(&connection_id) {
+            tokio::task::yield_now().await;
+        }
+        crate::transport::crlf_keepalive::spawn(
+            crate::config::CrlfKeepaliveConfig {
+                enabled: true,
+                interval_secs: 1,
+                failure_threshold: 1,
+            },
+            vec![connection_map.clone()],
+            tracker,
+        );
+
+        // The first ping is answered, which shows the peer does keep-alives.
+        let mut ping = [0u8; 4];
+        client.read_exact(&mut ping).await.unwrap();
+        assert_eq!(&ping, b"\r\n\r\n");
+        client.write_all(b"\r\n").await.unwrap();
+
+        // Then silence. The peer reads what it is sent (so nothing blocks on
+        // a full pipe) until the connection ends.
+        let drained = tokio::spawn(async move {
+            let mut sink = [0u8; 64];
+            while client
+                .read(&mut sink)
+                .await
+                .map(|read| read > 0)
+                .unwrap_or(false)
+            {}
+        });
+        tokio::time::timeout(Duration::from_secs(10), served)
+            .await
+            .expect("the connection must be closed once its peer stops answering pings")
+            .expect("the connection's task must not panic");
+        tokio::time::timeout(Duration::from_secs(5), drained)
+            .await
+            .expect("the peer must see its connection end")
+            .unwrap();
+        assert_eq!(close_rx.recv_async().await.unwrap(), connection_id.0);
+        assert!(!connection_map.contains_key(&connection_id));
     }
 
     /// The registry holds one connection per peer address, and a later

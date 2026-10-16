@@ -469,6 +469,16 @@ entry, but a working config keeps working.
   that lock, and `std::sync::Mutex` is not re-entrant, so the thread never
   returned, the caller was never answered and the worker was lost. The rejection
   now uses the INVITE the handover holds.
+- **A peer that stops answering CRLF keep-alives is disconnected
+  (`nat.crlf_keepalive`, RFC 5626 §4.4.1).** After `failure_threshold` missed
+  pongs the keepalive dropped the connection's sender from the connection map,
+  but the read half of an inbound connection holds a sender of its own for the
+  pongs it writes, so the channel stayed open: the socket, the flow and the
+  registrar's binding lived on until the 300 s idle timeout, and with
+  `registrar.liveness` no flow-failure deregistration (§4.2.2) happened at
+  the keepalive's time. The connection's own task is now told to close, as a
+  ban does, and its cleanup reports the flow failure.
+
 - **`transaction.timeout_secs` sets Timer F, the non-INVITE transaction
   timeout (RFC 3261 §17.1.2.2). It was read and never used.** Every non-INVITE
   client transaction waited 64*T1 (32 s) whatever it said, so a proxy that
