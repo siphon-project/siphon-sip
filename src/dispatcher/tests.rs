@@ -3660,6 +3660,29 @@ fn collect_route_set_splits_lines_and_top_level_commas() {
     assert!(collect_route_set(&message, "P-Associated-URI").is_empty());
 }
 
+/// The username of the de-REGISTER is the private identity the binding
+/// recorded when there is one, so an S-CSCF that waives the challenge only
+/// for the identity that registered the AoR still does.
+#[test]
+fn build_dereg_register_names_the_recorded_private_identity() {
+    let destination = "192.0.2.5:6060".parse().unwrap();
+    let routes = vec!["<sip:scscf.example.com:6060;lr>".to_string()];
+    let message = build_dereg_register(
+        "sip:+15550100@example.com",
+        "sip:alice@10.0.0.1:5060",
+        Some("001010000000001@example.com"),
+        &routes,
+        destination,
+    )
+    .expect("de-REGISTER builds");
+    let wire = String::from_utf8(message.to_bytes()).unwrap();
+    assert!(
+        wire.contains("Authorization: Digest username=\"001010000000001@example.com\""),
+        "{wire}"
+    );
+    assert!(wire.contains("integrity-protected=\"yes\""), "{wire}");
+}
+
 #[test]
 fn build_dereg_register_has_expires_zero_routes_and_aor() {
     let destination = "192.0.2.5:6060".parse().unwrap();
@@ -3667,6 +3690,7 @@ fn build_dereg_register_has_expires_zero_routes_and_aor() {
     let message = build_dereg_register(
         "sip:alice@example.com",
         "sip:alice@10.0.0.1:5060",
+        None,
         &routes,
         destination,
     )
@@ -3703,7 +3727,7 @@ fn build_dereg_register_has_expires_zero_routes_and_aor() {
     // IMS-AKA re-challenge (TS 24.229 §5.4.1.2.2) and actually completes
     // the de-registration.
     assert!(
-        wire.contains("integrity-protected=\"ip-assoc-yes\""),
+        wire.contains("integrity-protected=\"yes\""),
         "missing integrity-protected marker in Authorization:\n{wire}"
     );
     assert!(

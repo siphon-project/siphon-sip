@@ -387,6 +387,15 @@ entry, but a working config keeps working.
   and `alternate_digest_ha1`. `scripts/validate_diameter_cx_requests.sh`
   checks the `Unknown` and `SIP Digest` requests and such an answer against
   Wireshark's Diameter dissector.
+- **The de-REGISTER registrar liveness sends on a UE's behalf says
+  `integrity-protected="yes"`, and names the private identity the binding
+  recorded.** It said `ip-assoc-yes`, which is SIP Digest without TLS
+  (TS 24.229 table 7.2A.2) and which `require_ims_digest` now authenticates
+  as such; the binding it stands for was IMS-AKA over IPsec. Its username was
+  made from the AoR, which an S-CSCF that waives the challenge only for the
+  identity that registered the AoR (`auth.verify_integrity_protected`) does
+  not accept for a number AoR; the recorded `auth_user` is used when there is
+  one.
 - **`auth.set_integrity_protected(request, value)` for a P-CSCF in front of
   SIP Digest clients.** It writes one of the eight values of TS 24.229 table
   7.2A.2 into every Authorization header, replacing what the UE sent, or
