@@ -388,8 +388,8 @@ entry, but a working config keeps working.
   changed. `script_config` keeps the YAML 1.2 core schema it always had, so
   `on` / `yes` stay strings, digits with a leading zero stay strings and `<<`
   is an ordinary key. A typed key now also takes a quoted number or boolean
-  and `_` in an integer, and a parse error gives the line and column instead
-  of the key path. **BREAKING (Rust library):** `Config::extensions`,
+  and `_` in an integer, and a parse error gives the line and column as well
+  as the key path. **BREAKING (Rust library):** `Config::extensions`,
   `Config::script_config`, `Config::extension_config` and the
   `script::script_config` functions use `config::yaml::Value` in place of
   `serde_yaml_ng::Value`; see `docs/migrating-to-1.14.md`.

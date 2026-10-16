@@ -4670,7 +4670,7 @@ fn an_unknown_application_name_is_refused_at_load() {
     let message = result
         .expect_err("an unknown application must not parse")
         .to_string();
-    // The reader names the offending value and where it sits in the file.
+    assert!(message.contains("diameter.applications"), "{message}");
     assert!(message.contains("s6z"), "{message}");
     assert!(message.contains("line 8"), "{message}");
 }

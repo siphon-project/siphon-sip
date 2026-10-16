@@ -108,6 +108,9 @@ fn options() -> serde_saphyr::Options {
         duplicate_keys: serde_saphyr::DuplicateKeyPolicy::Error,
         merge_keys: serde_saphyr::MergeKeyPolicy::AsOrdinary,
         ignore_binary_tag_for_string: true,
+        // A key siphon does not read is skipped whatever it holds, `.inf`
+        // and `1e400` included, as it always was.
+        non_finite_float_policy: serde_saphyr::options::NonFiniteFloatPolicy::PassThrough,
         // Errors name the line and column but do not quote the file: a
         // `siphon.yaml` holds secrets, and its errors end up in logs.
         with_snippet: false,
@@ -115,8 +118,25 @@ fn options() -> serde_saphyr::Options {
 }
 
 /// Parse `text` as one YAML document into `T`.
+///
+/// An error names the key path it is at (`diameter.applications[0]: ...`)
+/// as well as the line and column.
 pub fn from_str<T: DeserializeOwned>(text: &str) -> Result<T, Error> {
-    serde_saphyr::from_str_with_options(text, options()).map_err(Error::from)
+    let mut path = None;
+    let result = serde_saphyr::with_deserializer_from_str_with_options(text, options(), |de| {
+        serde_path_to_error::deserialize(de).map_err(|error| {
+            path = Some(error.path().to_string());
+            error.into_inner()
+        })
+    });
+    result.map_err(|error| {
+        // `.` is the document root and `?` a key the reader had not finished
+        // reading (a repeated key, say): neither adds anything.
+        match path.as_deref().map(|path| path.trim_end_matches(".?")) {
+            Some(path) if !matches!(path, "." | "?" | "") => Error::new(format!("{path}: {error}")),
+            _ => Error::from(error),
+        }
+    })
 }
 
 /// Parse `text` as one YAML document into an untyped [`Value`] tree.
@@ -1114,6 +1134,77 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("line 2"), "{message}");
         assert!(!message.contains("hunter2"), "{message}");
+    }
+
+    #[test]
+    fn a_typed_error_names_the_key_path_and_the_line() {
+        #[derive(serde::Deserialize, Debug)]
+        #[allow(dead_code)]
+        struct Listener {
+            port: u16,
+        }
+        #[derive(serde::Deserialize, Debug)]
+        #[allow(dead_code)]
+        struct Server {
+            listeners: Vec<Listener>,
+        }
+        #[derive(serde::Deserialize, Debug)]
+        #[allow(dead_code)]
+        struct Typed {
+            server: Server,
+        }
+        let error = from_str::<Typed>(concat!(
+            "server:\n",
+            "  listeners:\n",
+            "    - port: 5060\n",
+            "    - port: many\n",
+        ))
+        .expect_err("not a port");
+        let message = error.to_string();
+        assert!(
+            message.starts_with("server.listeners[1].port: "),
+            "{message}"
+        );
+        assert!(message.contains("line 4"), "{message}");
+    }
+
+    #[test]
+    fn an_unread_key_may_hold_any_float() {
+        #[derive(serde::Deserialize, Debug)]
+        struct Typed {
+            port: u16,
+        }
+        let typed = from_str::<Typed>("port: 5060\nx-limits: [.inf, 1e400, .nan]\n")
+            .expect("an unread key is skipped");
+        assert_eq!(typed.port, 5060);
+    }
+
+    #[test]
+    fn a_repeated_key_error_has_no_placeholder_path() {
+        #[derive(serde::Deserialize, Debug)]
+        #[allow(dead_code)]
+        struct Typed {
+            port: u16,
+        }
+        let message = from_str::<Typed>("port: 1\nport: 2\n")
+            .expect_err("duplicate")
+            .to_string();
+        assert!(!message.starts_with('?'), "{message}");
+        assert!(message.contains("duplicate"), "{message}");
+    }
+
+    #[test]
+    fn a_syntax_error_has_no_key_path() {
+        #[derive(serde::Deserialize, Debug)]
+        #[allow(dead_code)]
+        struct Typed {
+            port: u16,
+        }
+        let message = from_str::<Typed>("port: [\n")
+            .expect_err("unterminated")
+            .to_string();
+        assert!(!message.starts_with(". "), "{message}");
+        assert!(message.contains("line"), "{message}");
     }
 
     #[test]

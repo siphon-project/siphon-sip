@@ -59,8 +59,8 @@ Only relevant when you link `siphon-sip` as a crate.
 The YAML reader is new; a config that loaded before loads the same. Three
 things that used to be refused are now accepted: a quoted number or boolean
 in a typed key (`drain_secs: "10"`, `log_dial: "true"`), and an integer with
-`_` separators (`1_000`). A parse error names the line and column where it
-named the key path (`b2bua.log_dial: ...`). `script_config` and `extensions`
+`_` separators (`1_000`). A parse error still names the key path
+(`b2bua.log_dial: ...`) and now also the line and column. `script_config` and `extensions`
 read exactly as before: `on` and `yes` are strings, `0101234567` is a string,
 `+15551234567` is an integer.
 
