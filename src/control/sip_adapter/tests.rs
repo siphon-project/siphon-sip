@@ -2589,6 +2589,109 @@ fn dial_target_carries_its_called_party() {
     assert_eq!(bare[0].to, None);
 }
 
+/// A `{uri}` target's `route` is carried to the dispatcher as the branch's
+/// route set, in order; a target naming none has none.
+#[test]
+fn dial_target_carries_its_route_set() {
+    let parsed = parse_dial_target(&serde_json::json!({
+        "uri": "sip:+15550100@ims.example.test",
+        "route": [
+            "<sip:term@scscf.example.test;lr;odi=4f1c>",
+            "<sip:198.51.100.51:5080;lr>",
+        ],
+    }))
+    .expect("the object form is a target");
+    assert_eq!(
+        parsed[0].route,
+        [
+            "<sip:term@scscf.example.test;lr;odi=4f1c>",
+            "<sip:198.51.100.51:5080;lr>"
+        ]
+    );
+    for bare in [
+        serde_json::json!({"uri": "sip:+15550100@ims.example.test"}),
+        serde_json::json!({"uri": "sip:+15550100@ims.example.test", "route": null}),
+    ] {
+        let parsed = parse_dial_target(&bare).expect("the object form is a target");
+        assert!(parsed[0].route.is_empty(), "{bare}");
+    }
+}
+
+/// A route set siphon cannot put on the wire is refused, not dropped: a
+/// request sent without it goes somewhere else entirely.
+#[test]
+fn dial_target_refuses_a_route_set_it_cannot_send() {
+    for route in [
+        serde_json::json!("<sip:term@scscf.example.test;lr>"),
+        serde_json::json!([42]),
+        serde_json::json!(["not a uri"]),
+        // RFC 3261 §25.1: a Route entry is a name-addr, so a bare URI, whose `;lr` would be a
+        // header parameter rather than the URI's, is refused rather than guessed at.
+        serde_json::json!(["sip:198.51.100.51:5080;lr"]),
+        serde_json::json!(["<sip:a.example.test;lr>, <sip:b.example.test;lr>"]),
+    ] {
+        let refused = parse_dial_target(&serde_json::json!({
+            "uri": "sip:+15550100@ims.example.test",
+            "route": route,
+        }));
+        assert!(refused.is_err(), "{route} was accepted: {refused:?}");
+    }
+}
+
+/// An AoR's branches follow their own binding's Path, so a route set beside
+/// one is refused rather than silently replacing or extending it. The positive
+/// control is the same AoR target without one, which is accepted.
+#[test]
+fn an_aor_target_refuses_a_route_set() {
+    let error = parse_dial_target(&serde_json::json!({
+        "aor": "sip:nobody@pbx.example",
+        "route": ["<sip:term@scscf.example.test;lr>"],
+    }))
+    .expect_err("an AoR with a route set must be refused");
+    assert!(error.contains("route") && error.contains("Path"), "{error}");
+    assert!(parse_dial_target(&serde_json::json!({"aor": "sip:nobody@pbx.example"})).is_ok());
+}
+
+/// The `route` verb's targets take a route set too, and refuse one that will
+/// not parse.
+#[test]
+fn route_target_carries_its_route_set() {
+    let parsed = parse_route_target(&serde_json::json!({
+        "uri": "sip:+15550100@ims.example.test",
+        "route": ["<sip:orig@scscf.example.test;lr;odi=9a>"],
+    }))
+    .expect("the object form is a target");
+    assert_eq!(parsed.route, ["<sip:orig@scscf.example.test;lr;odi=9a>"]);
+    assert!(
+        parse_route_target(&serde_json::json!("sip:1@carrier.example"))
+            .expect("a URI string is a target")
+            .route
+            .is_empty()
+    );
+    assert!(parse_route_target(&serde_json::json!({
+        "uri": "sip:+15550100@ims.example.test",
+        "route": ["not a uri"],
+    }))
+    .is_err());
+}
+
+/// The verb refuses a malformed route set as `bad_request` before anything is
+/// dialled.
+#[test]
+fn dial_refuses_a_malformed_route_set_as_bad_request() {
+    let result = sip_command(
+        "dial",
+        serde_json::json!({"targets": [{"uri": "sip:201@example.com", "route": "nope"}]}),
+    );
+    assert!(matches!(
+        result,
+        ControlResult::Error {
+            code: ControlErrorCode::BadRequest,
+            ..
+        }
+    ));
+}
+
 /// An `{aor}` target's identity fields reach every contact it forks to, as
 /// its headers and `to` do. They used to be dropped without a word on this
 /// form while the reference documented them on both.

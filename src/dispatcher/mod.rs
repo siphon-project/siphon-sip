@@ -141,6 +141,8 @@ mod control_dial_bridge_tests;
 #[cfg(test)]
 mod control_dial_identity_tests;
 #[cfg(test)]
+mod control_dial_route_tests;
+#[cfg(test)]
 mod control_dial_rpid_tests;
 #[cfg(test)]
 mod control_dial_to_tests;

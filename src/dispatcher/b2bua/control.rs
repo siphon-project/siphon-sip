@@ -22,6 +22,9 @@ pub struct RouteTarget {
     /// Fail this carrier over at its ring timeout even after it has shown
     /// progress. See [`crate::lcr::Route::reroute_after_progress`].
     pub reroute_after_progress: bool,
+    /// Route set for this attempt's INVITE, topmost first. See
+    /// [`crate::lcr::Route::route`].
+    pub route: Vec<String>,
 }
 
 /// The failover queue a `route` verb's targets become: R-URI carriers, as
@@ -48,6 +51,7 @@ fn route_verb_routes(
                 timeout_secs: Some(target.timeout_secs.unwrap_or(default_timeout)),
                 headers,
                 reroute_after_progress: target.reroute_after_progress,
+                route: target.route,
                 ..Default::default()
             }
         })
@@ -1226,6 +1230,9 @@ fn sequential_dial_routes(
                 // The called party, which the attempts after the first would
                 // otherwise rebuild from the stored A-leg INVITE's `To`.
                 presented_to: branch_to,
+                // The target's own route set, which an attempt would otherwise
+                // go without: the failover engine builds each INVITE afresh.
+                route: target.route,
                 ..Default::default()
             }
         })
@@ -1387,6 +1394,7 @@ mod tests {
             headers: Vec::new(),
             timeout_secs,
             reroute_after_progress,
+            route: Vec::new(),
         }
     }
 

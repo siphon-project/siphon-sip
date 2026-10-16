@@ -255,6 +255,7 @@ fn route_target() -> RouteTarget {
         headers: Vec::new(),
         timeout_secs: None,
         reroute_after_progress: false,
+        route: Vec::new(),
     }
 }
 

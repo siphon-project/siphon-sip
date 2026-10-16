@@ -15,6 +15,16 @@ entry, but a working config keeps working.
 
 ### Added
 
+- **Control plane: a `dial` or `route` target can carry its own route set.** A
+  `{uri}` target of `dial` (connecting or bridging, parallel or sequential) and
+  a target of `route` take `route: ["<sip:...;lr>", ...]`, topmost first. The
+  B-leg INVITE carries exactly that route set and goes to its topmost entry
+  unless `next_hop` pins it. This is what a controller acting as an IMS
+  application server needs to continue a session through the S-CSCF with the
+  Route (and original dialog identifier) the S-CSCF gave it (TS 24.229
+  §5.7.5.2.1). `Route` is framework-managed on a B-leg and could not be set
+  through `headers`. A malformed entry, or a `route` on an `{aor}` target
+  (whose branches follow their binding's Path), is `bad_request`.
 - **`proxy.enum_query`: ENUM that says what happened, follows delegation and
   asks the ENUM servers you name.** `proxy.enum_lookup` returns one URI or
   `None`, so a script could not tell "this number has no ENUM entry" from "the
