@@ -1220,12 +1220,11 @@ async fn a_session_timer_leaves_a_call_another_teardown_has_claimed_alone() {
     age(&dispatcher, &call_id, false, 61);
     assert!(dispatcher.state.call_actors.claim_teardown(&call_id));
 
-    let transaction_timeout = dispatcher.state.b2bua_retransmits.transaction_timeout();
     assert!(
         dispatcher
             .state
             .call_actors
-            .session_timers_due(std::time::Instant::now(), transaction_timeout)
+            .session_timers_due(std::time::Instant::now())
             .is_empty(),
         "the sweep still acts on a call another teardown has claimed"
     );

@@ -1416,8 +1416,16 @@ transaction:
 "#;
     let config = Config::from_str(yaml).unwrap();
     let tx = config.transaction.unwrap();
-    assert_eq!(tx.timeout_secs, 5);
+    assert_eq!(tx.timeout_secs, Some(5));
     assert_eq!(tx.invite_timeout_secs, 30);
+}
+
+/// Without `timeout_secs` the non-INVITE timeout is left to Timer F's 64*T1.
+#[test]
+fn transaction_timeout_secs_is_unset_unless_configured() {
+    let tx: crate::config::TransactionConfig =
+        serde_yaml_ng::from_str("invite_timeout_secs: 30").expect("the block parses");
+    assert_eq!(tx.timeout_secs, None);
 }
 
 #[test]

@@ -1,6 +1,6 @@
 """Test fixture proxy for terminating failover across an AoR's bindings.
 
-Two acceptance scenarios share this script.
+Three acceptance scenarios share this script.
 
 1. **Per-binding Path routing** (`sip:bob@…`).  Two bindings for one AoR, each
    registered through a different edge proxy (the REGISTERs carry different RFC
@@ -15,6 +15,10 @@ Two acceptance scenarios share this script.
    (there is no fork here, so nothing aggregates) and its `request.relay()` has
    to actually re-send, or the caller never gets an answer.
 
+3. **Non-INVITE timeout** (`sip:dave@…`).  A MESSAGE relayed to a next hop
+   that never answers times out at `transaction.timeout_secs` (Timer F), not
+   at 64*T1, and the caller gets the 408.
+
 Run by scripts/failover_test.sh via sipp/docker-compose.yaml
 (`--profile failover`), config sipp/configs/siphon.failover-test.yaml.
 """
@@ -23,6 +27,9 @@ from siphon import proxy, registrar, log
 # Scenario 2's two backends: the primary rejects, the backup answers.
 CAROL_PRIMARY = "sip:carol@172.20.0.95:5060"
 CAROL_BACKUP = "sip:carol@172.20.0.97:5060"
+
+# Scenario 3's next hop, which never answers.
+DAVE_SILENT = "sip:dave@172.20.0.88:5060"
 
 
 @proxy.on_request("REGISTER")
@@ -73,6 +80,12 @@ def handle_other(request):
     if request.in_dialog:
         request.loose_route()
         request.relay()
+        return
+    if request.method == "MESSAGE" and request.ruri.user == "dave":
+        # Scenario 3: a non-INVITE to a next hop that never answers. Timer F is
+        # transaction.timeout_secs, and its 408 reaches the caller through
+        # on_failure's reply.relay().
+        request.relay(DAVE_SILENT)
         return
     request.reply(200, "OK")
 

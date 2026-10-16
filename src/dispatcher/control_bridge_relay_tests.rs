@@ -689,6 +689,36 @@ async fn unbridge_after_relayed_offers_holds_each_leg_on_its_own_media() {
     assert!(text(&to_carrier).contains("RTP/AVP") && text(&to_carrier).contains("a=sendonly"));
 }
 
+/// A relayed UPDATE is a non-INVITE transaction: nobody answering it, the
+/// sender is answered `408` at Timer F.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_update_relay_nobody_answers_times_out_408_at_timer_f() {
+    const PHONE: &str = "198.51.100.181:5060";
+    let pair = srtp_pair("update-relay-timeout", PHONE).await;
+    deliver(
+        &pair,
+        CALLER,
+        request(&pair, true, "UPDATE", Some(&sdp_from(CALLER, "sendonly"))),
+    );
+    wait_for(&pair, |sent| !updates_to(sent, PHONE).is_empty()).await;
+    let state = pair.state();
+    let timer_f = state.b2bua_retransmits.non_invite_timeout();
+    let sent_at = std::time::Instant::now();
+    tokio::task::block_in_place(|| {
+        bridge_relay_sweep(state, sent_at + timer_f - std::time::Duration::from_secs(1))
+    });
+    assert!(finals_to(&drain(pair.udp()), CALLER).is_empty());
+    tokio::task::block_in_place(|| {
+        bridge_relay_sweep(
+            state,
+            sent_at + timer_f + std::time::Duration::from_millis(10),
+        )
+    });
+    let sent = wait_for(&pair, |sent| !finals_to(sent, CALLER).is_empty()).await;
+    assert_eq!(finals_to(&sent, CALLER)[0].status_code(), Some(408));
+    assert_eq!(state.bridge_relays.len(), 0);
+}
+
 /// The other leg never answers: after a whole transaction timeout the sender
 /// is answered `408` and the pair's session put back.
 #[tokio::test(flavor = "multi_thread")]

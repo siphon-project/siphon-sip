@@ -33,8 +33,9 @@
 //!   none), with nothing sent to the engine or to the other party.
 //! * **A leg ending mid-relay** — the sender's pending request is answered
 //!   `487` (RFC 3261 §15.1.2), and the relay forgotten.
-//! * **No answer** — a relay with no final response after 64·T1 answers the
-//!   sender `408` and restores the engine as for a refusal.
+//! * **No answer** — a relay with no final response within its transaction
+//!   timeout (Timer F for an UPDATE) answers the sender `408` and restores the
+//!   engine as for a refusal.
 use crate::dispatcher::*;
 
 /// Tracking-leg target of a relayed re-INVITE on the receiving leg.
@@ -703,14 +704,24 @@ pub fn bridge_relay_call_ended(internal_call_id: &str, state: &DispatcherState) 
 }
 
 /// Answer `408` to every relay that has had no final response for a whole
-/// transaction timeout (64·T1), and put the engine back as for a refusal.
+/// transaction timeout, and put the engine back as for a refusal. A relayed
+/// UPDATE is a non-INVITE transaction and times out at Timer F
+/// (`transaction.timeout_secs`, RFC 3261 §17.1.2.2).
 pub fn bridge_relay_sweep(state: &DispatcherState, now: std::time::Instant) {
-    let timeout = state.transaction_timeout;
+    let invite_timeout = state.transaction_timeout;
+    let update_timeout = state.b2bua_retransmits.non_invite_timeout();
     let expired: Vec<String> = state
         .bridge_relays
         .pending
         .iter()
-        .filter(|entry| now.saturating_duration_since(entry.created_at) >= timeout)
+        .filter(|entry| {
+            let timeout = if entry.request.method() == Some(&Method::Update) {
+                update_timeout
+            } else {
+                invite_timeout
+            };
+            now.saturating_duration_since(entry.created_at) >= timeout
+        })
         .map(|entry| entry.key().clone())
         .collect();
     for receiver in expired {

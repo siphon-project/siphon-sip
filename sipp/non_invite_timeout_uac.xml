@@ -1,0 +1,71 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!-- Caller for the non-INVITE timeout case in sipp-failover
+     (scripts/failover_test.sh, scenario 3).
+
+     The MESSAGE to dave is relayed to a next hop that never answers
+     (non_invite_silent_uas.xml), with transaction.timeout_secs at 3 in
+     siphon.failover-test.yaml. Timer F is that 3 s rather than 64*T1, so the
+     client transaction times out, the proxy answers the branch 408 (RFC 3261
+     §16.7 step 2) and, the script failing nothing over, the 408 is the
+     response this caller gets. What this caller must see: that 408, with
+     nothing before it but an optional 100, no earlier than 2.5 s and no later
+     than 5.5 s after the MESSAGE. Without the setting it would come at 32 s. -->
+
+<scenario name="Non-INVITE timeout caller (408 at the configured Timer F)">
+
+  <nop>
+    <action>
+      <gettimeofday assign_to="sent_seconds,sent_microseconds" />
+    </action>
+  </nop>
+
+  <send retrans="500">
+    <![CDATA[
+MESSAGE sip:dave@siphon.test SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:alice@siphon.test>;tag=[pid]SIPpTag00[call_number]
+To: <sip:dave@siphon.test>
+Call-ID: [call_id]
+CSeq: 1 MESSAGE
+Max-Forwards: 70
+Content-Type: text/plain
+Content-Length: [len]
+
+ping
+]]>
+  </send>
+
+  <recv response="100" optional="true" />
+
+  <recv response="408" timeout="11000">
+    <action>
+      <gettimeofday assign_to="timed_out_seconds,timed_out_microseconds" />
+      <assign assign_to="elapsed" variable="timed_out_seconds" />
+      <subtract assign_to="elapsed" variable="sent_seconds" />
+      <assign assign_to="fraction" variable="timed_out_microseconds" />
+      <subtract assign_to="fraction" variable="sent_microseconds" />
+      <divide assign_to="fraction" value="1000000" />
+      <add assign_to="elapsed" variable="fraction" />
+      <test assign_to="too_early" variable="elapsed" compare="less_than" value="2.5" />
+      <test assign_to="too_late" variable="elapsed" compare="greater_than" value="5.5" />
+      <log message="408 after [$elapsed] s" />
+    </action>
+  </recv>
+  <nop next="wrong_time" test="too_early" />
+  <nop next="wrong_time" test="too_late" />
+  <nop next="done" />
+
+  <label id="wrong_time" />
+  <nop>
+    <action>
+      <log message="WRONG TIME: the 408 came [$elapsed] s after the MESSAGE, expected 2.5 to 5.5 s" />
+    </action>
+  </nop>
+  <!-- Nothing sends this; the timeout fails the call. -->
+  <recv request="WRONG_TIME" timeout="100" />
+
+  <label id="done" />
+
+</scenario>

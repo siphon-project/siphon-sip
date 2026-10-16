@@ -357,6 +357,25 @@ entry, but a working config keeps working.
 
 ### Fixed
 
+- **`transaction.timeout_secs` sets Timer F, the non-INVITE transaction
+  timeout (RFC 3261 §17.1.2.2). It was read and never used.** Every non-INVITE
+  client transaction waited 64*T1 (32 s) whatever it said, so a proxy that
+  fails over could not do so before its upstream gave up: an I-CSCF with a
+  dead S-CSCF waited as long as the UE did, and the UE's re-REGISTER failed. A
+  relayed non-INVITE with no final response at `timeout_secs` now ends as a
+  `408` for the branch (§16.7 step 2), which `@proxy.on_failure` sees and can
+  fail over from; Timer E keeps retransmitting over UDP until then. The same
+  value bounds the non-INVITE requests siphon sends itself: a B2BUA's
+  in-dialog requests stop retransmitting at it, an UPDATE session refresh or
+  an UPDATE relayed across a controller bridge times out at it, the offer in
+  siphon's PRACK is given up at it, and a waiting OPTIONS or SUBSCRIBE is
+  told it timed out at the next sweep after it. INVITE transactions keep
+  Timer B's 64*T1. Unset (or `0`), Timer F is 64*T1 as before; the 5 s default
+  the documentation gave was never applied and is gone. **A config that sets
+  `timeout_secs` changes timing**: every relayed non-INVITE is bounded by it,
+  so an element must set it below the value of the element upstream of it and
+  above the one downstream. The P-CSCF and S-CSCF examples no longer set it.
+
 - **IPsec: the P-CSCF never hands out an SPI a live security association
   still uses (3GPP TS 33.203 §7.1).** The SPI allocator was a counter that
   wrapped round its partition without checking what was still installed. SPIs

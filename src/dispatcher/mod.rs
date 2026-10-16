@@ -226,6 +226,8 @@ mod proxy_dialog_state_tests;
 #[cfg(test)]
 mod proxy_late_answer_tests;
 #[cfg(test)]
+mod proxy_non_invite_timeout_tests;
+#[cfg(test)]
 mod proxy_protocol_tests;
 #[cfg(test)]
 mod proxy_reply_filter_tests;
@@ -498,8 +500,19 @@ pub async fn run(
             .unwrap_or(30)
             + 2,
     );
-    let _non_invite_timeout =
-        std::time::Duration::from_secs(tx_config.map(|t| t.timeout_secs as u64).unwrap_or(5));
+    if tx_config
+        .and_then(|t| t.timeout_secs)
+        .is_some_and(|secs| secs > u32::from(u16::MAX))
+    {
+        warn!(
+            "transaction.timeout_secs is over {} s: non-INVITE transactions time out at {} s",
+            u16::MAX,
+            u16::MAX
+        );
+    }
+    if tx_config.and_then(|t| t.timeout_secs) == Some(0) {
+        warn!("transaction.timeout_secs is 0: ignored, non-INVITE transactions time out at Timer F's 64*T1 (32 s)");
+    }
 
     let timer_config = transaction_timers(tx_config);
     if timer_c_is_below_the_rfc_minimum(timer_config.timer_c_secs) {

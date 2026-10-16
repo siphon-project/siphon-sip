@@ -2,6 +2,7 @@
 //!
 //! All timer values are configurable but have RFC-defined defaults.
 
+use std::num::NonZeroU16;
 use std::time::Duration;
 
 /// Default T1 value: round-trip-time estimate (500ms per RFC 3261).
@@ -45,6 +46,11 @@ pub struct TimerConfig {
     /// transaction carries this configuration, and the size of the largest
     /// one is what each of them costs.
     pub timer_c_secs: u32,
+    /// Timer F (RFC 3261 §17.1.2.2), in seconds, where `transaction.timeout_secs`
+    /// sets it; `None` is the RFC's 64*T1. See [`Self::timer_f`]. Seconds in
+    /// two bytes, which fit the padding after `timer_c_secs`: anything wider
+    /// grows every transaction (`tests/transaction_footprint_tests.rs`).
+    pub timer_f_secs: Option<NonZeroU16>,
 }
 
 impl TimerConfig {
@@ -56,6 +62,7 @@ impl TimerConfig {
             auto_100_trying: true,
             auto_100_delay: DEFAULT_AUTO_100_TRYING_DELAY,
             timer_c_secs: DEFAULT_TIMER_C_SECS,
+            timer_f_secs: None,
         }
     }
 
@@ -102,9 +109,15 @@ impl TimerConfig {
         self.t1
     }
 
-    /// Timer F: non-INVITE transaction timeout. 64 * T1.
+    /// Timer F: how long a non-INVITE client transaction waits for a final
+    /// response before it times out, with the TU told `408` (§8.1.3.1). 64*T1
+    /// (32 s) unless [`Self::timer_f_secs`] sets it. Timer E retransmits run
+    /// until it fires.
     pub fn timer_f(&self) -> Duration {
-        self.t1 * 64
+        match self.timer_f_secs {
+            Some(secs) => Duration::from_secs(u64::from(secs.get())),
+            None => self.t1 * 64,
+        }
     }
 
     /// Timer K: Wait time in Completed state for response retransmits. T4 for UDP, 0 for TCP.
@@ -207,6 +220,7 @@ impl Default for TimerConfig {
             auto_100_trying: true,
             auto_100_delay: DEFAULT_AUTO_100_TRYING_DELAY,
             timer_c_secs: DEFAULT_TIMER_C_SECS,
+            timer_f_secs: None,
         }
     }
 }
@@ -241,6 +255,33 @@ mod tests {
     fn timer_f_is_64_times_t1() {
         let config = TimerConfig::default();
         assert_eq!(config.timer_f(), Duration::from_secs(32));
+    }
+
+    /// `transaction.timeout_secs` is Timer F: the configured value replaces
+    /// 64*T1, shorter or longer.
+    #[test]
+    fn a_configured_timer_f_replaces_64_times_t1() {
+        for secs in [2, 5, 40] {
+            let config = TimerConfig {
+                timer_f_secs: NonZeroU16::new(secs),
+                ..TimerConfig::default()
+            };
+            assert_eq!(config.timer_f(), Duration::from_secs(u64::from(secs)));
+            // Timer F alone: the INVITE transaction's Timer B stays 64*T1.
+            assert_eq!(config.timer_b(), Duration::from_secs(32));
+        }
+    }
+
+    /// Unset, Timer F follows T1.
+    #[test]
+    fn an_unset_timer_f_is_64_times_t1_whatever_t1_is() {
+        let config = TimerConfig::new(
+            Duration::from_millis(100),
+            Duration::from_secs(2),
+            Duration::from_secs(3),
+        );
+        assert_eq!(config.timer_f_secs, None);
+        assert_eq!(config.timer_f(), Duration::from_millis(6400));
     }
 
     #[test]

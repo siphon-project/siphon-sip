@@ -147,7 +147,9 @@ nat:
 # Transaction timers
 # ---------------------------------------------------------------------------
 transaction:
-  timeout_secs: 5
+  # timeout_secs (Timer F, the non-INVITE timeout) is left at 64*T1, the UE's
+  # own: a shorter one here would 408 a REGISTER before the I-CSCF behind it
+  # has failed over to another S-CSCF (ims_icscf.yaml sets 5).
   invite_timeout_secs: 30
 
 # ---------------------------------------------------------------------------

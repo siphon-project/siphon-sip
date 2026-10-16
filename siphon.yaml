@@ -814,7 +814,16 @@ auth:
 # SIP transaction layer
 # ---------------------------------------------------------------------------
 # transaction:
-#   timeout_secs: 5        # non-INVITE transaction timeout (fr_timeout)
+#   timeout_secs: 5        # non-INVITE transaction timeout: RFC 3261 §17.1.2.2
+#                            # Timer F. A relayed non-INVITE with no final
+#                            # response by then ends as a 408 for the branch,
+#                            # which @proxy.on_failure sees and can fail over
+#                            # from; Timer E retransmits over UDP until then.
+#                            # Also bounds the non-INVITEs siphon sends itself
+#                            # (B2BUA in-dialog requests, UPDATE refreshes, OPTIONS,
+#                            # SUBSCRIBE). Default (unset or 0): 64*T1 = 32 s.
+#                            # Set it below the timeout of the element upstream
+#                            # so a failover lands before that one gives up.
 #   invite_timeout_secs: 30  # how long proxy state for an INVITE no branch of which
 #                            # is still waiting for a final response is kept; a
 #                            # call that is still ringing is bounded by timer_c_secs

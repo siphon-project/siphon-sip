@@ -29,7 +29,7 @@
 //! | 491: an offer of the callee's own crossed it | 491 |
 //! | 500: the callee has an offer unanswered, with `Retry-After` | 500, with that `Retry-After` |
 //! | 504: the answer needs the callee's user | 504 |
-//! | 481, 408, or none within 64*T1: the dialog is gone (§5.3) | 500, and the call ends |
+//! | 481, 408, or none within Timer F: the dialog is gone (§5.3) | 500, and the call ends |
 //! | anything else, or a 2xx without an answer | 500 |
 //!
 //! Before any of that the offer is refused without an UPDATE: 488 to a callee
@@ -350,7 +350,7 @@ pub fn end_call_on_unrelayable_update_answer(
 }
 
 /// End a call whose callee has left the UPDATE carrying the caller's offer
-/// unanswered for 64*T1, as a 408 for it would (RFC 3311 §5.3).
+/// unanswered past the UPDATE's Timer F, as a 408 for it would (RFC 3311 §5.3).
 pub fn end_call_on_overdue_update(call_id: &str, now: Instant, state: &DispatcherState) {
     let pending = state
         .call_actors
@@ -359,7 +359,8 @@ pub fn end_call_on_overdue_update(call_id: &str, now: Instant, state: &Dispatche
             if call.teardown_claimed {
                 return None;
             }
-            call.prack_bridge.take_overdue_offer(now)
+            call.prack_bridge
+                .take_overdue_offer(now, state.b2bua_retransmits.non_invite_timeout())
         });
     if let Some(pending) = pending {
         refuse_late_prack_offer(call_id, pending, 408, None, state);

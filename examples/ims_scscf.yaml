@@ -135,7 +135,8 @@ diameter:
 # Transaction timers
 # ---------------------------------------------------------------------------
 transaction:
-  timeout_secs: 5
+  # timeout_secs (Timer F, the non-INVITE timeout) is left at 64*T1: a MESSAGE
+  # or NOTIFY to a UE goes through the P-CSCF, which waits as long itself.
   invite_timeout_secs: 30
 
 # ---------------------------------------------------------------------------

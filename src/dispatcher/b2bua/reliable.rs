@@ -879,7 +879,7 @@ pub fn end_held_answer_for_caller(
 
 /// Refuse every caller that has let a reliable provisional go unacknowledged for
 /// 64*T1 (RFC 3262 §3), and fail every call whose callee has left an offer
-/// siphon's PRACK carried unanswered as long (§5). Runs on the dispatcher's fast
+/// siphon's PRACK carried unanswered past that PRACK's Timer F (§5). Runs on the dispatcher's fast
 /// call-lifetime interval.
 pub fn check_b2bua_prack_timeouts(state: &DispatcherState) {
     check_b2bua_prack_timeouts_at(state, Instant::now());
@@ -897,10 +897,11 @@ pub fn check_b2bua_prack_timeouts_at(state: &DispatcherState, now: Instant) {
     for call_id in overdue {
         refuse_unacknowledging_caller(&call_id, now, state);
     }
+    let timeout = state.b2bua_retransmits.non_invite_timeout();
     let unanswered: Vec<String> = state
         .call_actors
         .iter_calls()
-        .filter(|entry| entry.value().prack_bridge.offer_overdue(now))
+        .filter(|entry| entry.value().prack_bridge.offer_overdue(now, timeout))
         .map(|entry| entry.key().clone())
         .collect();
     for call_id in unanswered {
