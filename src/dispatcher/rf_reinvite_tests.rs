@@ -15,11 +15,11 @@ use super::*;
 use crate::sip::parse_sip_message;
 use std::sync::Mutex as StdMutex;
 
-type ReceivedAcrs = Arc<StdMutex<Vec<serde_json::Value>>>;
+pub(super) type ReceivedAcrs = Arc<StdMutex<Vec<serde_json::Value>>>;
 
 /// A loopback charging function that answers every ACR with 2001 and keeps
 /// the decoded AVPs of each one it was sent.
-async fn mock_cdf() -> (Arc<crate::diameter::DiameterManager>, ReceivedAcrs) {
+pub(super) async fn mock_cdf() -> (Arc<crate::diameter::DiameterManager>, ReceivedAcrs) {
     use crate::diameter::codec::{self, encode_avp_u32, encode_avp_utf8, encode_diameter_message};
     use crate::diameter::dictionary::{self, avp};
     use tokio::io::{AsyncWriteExt, BufReader};

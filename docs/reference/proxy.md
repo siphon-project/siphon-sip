@@ -22,8 +22,44 @@ async def call(call):
 
 ## `proxy` utilities
 
-Reached as `proxy.rate_limit`, `proxy.sanity_check`, `proxy.enum_lookup`, and
-`proxy.memory_used_pct`.
+Reached as `proxy.rate_limit`, `proxy.sanity_check`, `proxy.enum_lookup`,
+`proxy.release`, and `proxy.memory_used_pct`.
+
+### Ending a session from outside a transaction
+
+`await proxy.release(call_id, reason=None, toward="both", status=487)` ends a
+session the proxy Record-Routed, from a Diameter handler, `@sbi.on_terminate`,
+a media timeout or a timer. It needs `dialog.proxy_release: true`, which keeps
+the dialog state of every INVITE the script Record-Routes.
+
+A P-CSCF told by the PCRF that the bearer is gone (Rx ASR, TS 29.214 §4.4.6.1):
+
+```python
+from siphon import diameter, proxy
+
+@diameter.on_request("Rx:ASR")
+async def on_abort(request):
+    call_id = rx_sessions.pop(request.session_id, None)
+    if call_id:
+        await proxy.release(call_id, reason='SIP;cause=503;text="Bearer released"')
+    return request.answer(2001)
+```
+
+| State of the session | What goes on the wire |
+|---|---|
+| Confirmed | A BYE toward each end in `toward` (TS 24.229 §5.2.8.1.2), built from the stored dialog: Request-URI from that end's Contact, the dialog's From, To and Call-ID, the CSeq one above the last seen in that direction, the route set toward that end, `reason` as the `Reason` header (RFC 3326). Toward a UE on IPsec it leaves from the SA's port, as a relayed in-dialog request does. |
+| Being established | Every pending branch CANCELled (with `reason`), the caller answered `status`, `@proxy.on_cancel` run once (§5.2.8.1.1). |
+| Unknown, ended, never Record-Routed | Nothing; resolves `False`. |
+
+While its BYEs are out, any other request on the released dialog is answered
+`481` (§5.2.8.1.3). The Rf ACR-STOP and the CDR are closed as for a relayed
+BYE; the media and QoS sessions belong to the script in proxy mode, and it ends
+them itself (`rtpengine.delete`, `diameter.rx_str`). TS 24.229 §5.2.8.1.2 has a
+P-CSCF that lost the bearer of the user it serves send its BYE toward the other
+user only: `toward="callee"` when it serves the caller, `toward="caller"` when
+it serves the callee. A spiral (one proxy on both access legs of one Call-ID)
+is released from its first leg: the BYE toward the callee follows that leg's
+route set back through siphon onto the second.
 
 ::: siphon_sdk.mock_module.MockProxyUtils
 

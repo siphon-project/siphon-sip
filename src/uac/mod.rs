@@ -717,6 +717,23 @@ impl UacSender {
         }
     }
 
+    /// Register a pending entry for a request sent by another path (the
+    /// dispatcher's own send, which retransmits and pins the egress), so its
+    /// response is delivered on the returned receiver and consumed here rather
+    /// than taken for a stray. `branch` must start with `z9hG4bK-uac-`, which
+    /// is what [`match_response`](Self::match_response) keys on.
+    pub fn expect_response(&self, branch: &str) -> oneshot::Receiver<UacResult> {
+        let (sender, receiver) = oneshot::channel();
+        self.pending.insert(
+            branch.to_string(),
+            PendingRequest {
+                sender,
+                inserted_at: Instant::now(),
+            },
+        );
+        receiver
+    }
+
     /// Expire a specific pending request by branch (called on timeout).
     pub fn expire_branch(&self, branch: &str) {
         if let Some((_, pending)) = self.pending.remove(branch) {

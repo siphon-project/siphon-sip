@@ -1481,6 +1481,11 @@
         "kind": "method_descriptor",
         "sig": "($self, request, window_secs, max_requests)"
       },
+      "release": {
+        "doc": "End a session this proxy Record-Routed, by its Call-ID.",
+        "kind": "method_descriptor",
+        "sig": "($self, call_id, reason=None, toward=\"both\", status=487)"
+      },
       "sanity_check": {
         "doc": "Perform basic RFC 3261 sanity checks on a request.",
         "kind": "method_descriptor",

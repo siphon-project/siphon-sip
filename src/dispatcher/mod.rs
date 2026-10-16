@@ -66,6 +66,7 @@ mod late_answer;
 mod liveness;
 mod media_init;
 mod proxy_dialog_state;
+mod proxy_release;
 mod registrant;
 mod relay;
 mod request;
@@ -230,6 +231,8 @@ mod proxy_non_invite_timeout_tests;
 #[cfg(test)]
 mod proxy_protocol_tests;
 #[cfg(test)]
+mod proxy_release_tests;
+#[cfg(test)]
 mod proxy_reply_filter_tests;
 #[cfg(test)]
 mod proxy_stateless_2xx_tests;
@@ -346,6 +349,7 @@ pub(crate) use b2bua::{
 pub use charging::{ro_authorize_b2bua, RoAuthorizeOutcome};
 pub(crate) use liveness::liveness_on_flow_close;
 pub use media_init::{init_rtpengine, spawn_rtpengine_health_check};
+pub(crate) use proxy_release::proxy_release_call;
 pub(crate) use state::ProxyRfState;
 pub use state::{publish_store_gauges, DrainState, ReliableProvisional};
 
@@ -365,6 +369,7 @@ use late_answer::*;
 use liveness::*;
 use media_init::*;
 use proxy_dialog_state::*;
+use proxy_release::*;
 use registrant::*;
 use relay::*;
 use request::*;
@@ -647,6 +652,10 @@ pub async fn run(
             .map(|control| control.dialog_state.clone())
             .unwrap_or_default(),
         proxy_dialogs: Arc::new(crate::proxy::dialog_state::ProxyDialogStore::new()),
+        proxy_release: config
+            .dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.proxy_release),
         session_timer_config: config.session_timer.clone(),
         mtu: config.listen.mtu,
         header_policy_registry,

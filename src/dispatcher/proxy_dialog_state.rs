@@ -213,25 +213,32 @@ pub(super) struct PendingBranch {
     key: DialogKey,
     via_branch: String,
     watch: Option<DialogWatch>,
+    releasable: bool,
+    spiral: bool,
 }
 
 /// Decide whether the branch of `message` relayed to `target_uri` (over
 /// `flow`, or to `next_hop`) is tracked: when its INVITE's dialog already is
-/// (the caller is a registered phone, or an earlier branch rang one), or this
-/// branch rings a registered phone. A tracked branch is Record-Routed.
+/// (the caller is a registered phone, or an earlier branch rang one), this
+/// branch rings a registered phone, or the script Record-Routed it
+/// (`record_routed`) with `dialog.proxy_release` on. A tracked branch is
+/// Record-Routed.
 pub(super) fn proxy_dialog_branch(
     message: &SipMessage,
     target_uri: &str,
     flow: Option<&crate::script::api::registrar::PyFlow>,
     next_hop: Option<&str>,
     via_branch: &str,
+    record_routed: bool,
     state: &DispatcherState,
 ) -> Option<PendingBranch> {
-    if !dialog_state_wanted() {
+    let watching = dialog_state_wanted();
+    let releasable = record_routed && state.proxy_release;
+    if !watching && !releasable {
         return None;
     }
     let key = invite_dialog_key(message)?;
-    let binding = registrar().and_then(|registrar| {
+    let binding = watching.then(registrar).flatten().and_then(|registrar| {
         match flow {
             // Over a captured flow the Request-URI need not be the Contact: the
             // flow names the binding.
@@ -240,9 +247,22 @@ pub(super) fn proxy_dialog_branch(
         }
         .or_else(|| next_hop.and_then(|hop| registrar.binding_for_contact(hop)))
     });
-    if binding.is_none() && !state.proxy_dialogs.contains(&key) {
+    let tracked = state.proxy_dialogs.contains(&key);
+    if binding.is_none() && !releasable && !(watching && tracked) {
         return None;
     }
+    // An INVITE that carries a Via siphon stamped on a branch of this same
+    // dialog came back through siphon (a spiral, RFC 3261 §16.3).
+    let spiral = tracked
+        && message
+            .headers
+            .get_all("Via")
+            .into_iter()
+            .flatten()
+            .filter_map(|raw| Via::parse_multi(raw).ok())
+            .flatten()
+            .filter_map(|via| via.branch)
+            .any(|branch| state.proxy_dialogs.key_of_branch(&branch).as_ref() == Some(&key));
     let watch = binding.map(|(aor, contact)| {
         let (remote_uri, remote_display_name) = identity_of(
             message
@@ -270,6 +290,8 @@ pub(super) fn proxy_dialog_branch(
         key,
         via_branch: via_branch.to_string(),
         watch,
+        releasable,
+        spiral,
     })
 }
 
@@ -298,6 +320,8 @@ impl PendingBranch {
                 watch: self.watch,
                 hop,
                 own_record_routes,
+                releasable: self.releasable,
+                spiral: self.spiral,
             },
         ));
     }

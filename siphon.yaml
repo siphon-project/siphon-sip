@@ -855,6 +855,13 @@ auth:
 #   backend: memory   # memory | redis | postgres
 #   # redis:
 #   #   url: "redis://127.0.0.1:6379/0"
+#   # Keep the dialog state of every INVITE the script Record-Routes (remote
+#   # targets, route sets, tags, last CSeq each way) so `proxy.release(call_id)`
+#   # can end the session from outside a transaction: an Rx ASR, an N5
+#   # termination, a media timeout (TS 24.229 §5.2.8.1). One store entry per
+#   # Record-Routed call for its lifetime; liveness bounds come from
+#   # `control.dialog_state` (max_early_secs, max_lifetime_secs).
+#   proxy_release: false
 
 # ---------------------------------------------------------------------------
 # Named cache connections (available to Python scripts via cache.fetch)
