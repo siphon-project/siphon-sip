@@ -1246,6 +1246,17 @@ entry, but a working config keeps working.
   URI; they now keep the display name and header parameters of a full
   `name-addr`, which they wrapped in a second pair of brackets.
 
+### Security
+
+- **rustls moves to 0.23.46 for RUSTSEC-2026-0346, -0347, -0348 and -0349.**
+  The fix covers session-value `Debug` output leaking TLS secrets, buffered
+  data going to the outer server after an ECH rejection, a Brotli certificate
+  decompression allocation, and an unauthenticated ServerHello pinning later
+  connections to classical key exchange. siphon uses neither ECH nor the
+  `brotli` feature, but its TLS listeners, outbound TLS and HTTP clients all
+  run on rustls, so the `siphon-sip`, `siphon-bin`, control SDK and fuzz
+  lockfiles now carry 0.23.46.
+
 ## [1.13.1] — 2026-10-08
 
 ### Added
