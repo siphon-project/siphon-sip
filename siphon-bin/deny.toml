@@ -29,7 +29,9 @@ ignore = [
     # paste — unmaintained transitive (no vuln); remove when the parent crate drops it.
     "RUSTSEC-2024-0436",
     # unsafe-libyaml — unmaintained (no vuln, no maintained successor); the YAML
-    # parser under serde_yaml_ng and serde_yaml. Remove when both move off it.
+    # parser under serde_yaml_ng and serde_yaml. siphon-sip itself no longer
+    # uses it; remove once the locked siphon-sip and every extension crate
+    # (siphon-http, siphon-smpp, siphon-sigtran) are on releases off it.
     "RUSTSEC-2024-0449",
 ]
 

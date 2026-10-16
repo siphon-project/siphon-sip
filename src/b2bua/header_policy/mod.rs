@@ -2205,7 +2205,7 @@ mod tests {
     // ----- Operator-defined policies (`header_policies:`) -----
 
     fn policies(yaml: &str) -> HashMap<String, HeaderPolicyConfig> {
-        serde_yaml_ng::from_str(yaml).expect("valid header_policies YAML")
+        crate::config::yaml::from_str(yaml).expect("valid header_policies YAML")
     }
 
     /// Parse one policy out of a `header_policies:`-shaped YAML fragment and
@@ -2689,7 +2689,7 @@ mod tests {
         // `deny_unknown_fields` — a misspelled key must not be silently ignored.
         let yaml = "\"x@1\":\n  extends: \"transparent-b2bua@2026\"\n  requests:\n    copy: []\n";
         let parsed: std::result::Result<HashMap<String, HeaderPolicyConfig>, _> =
-            serde_yaml_ng::from_str(yaml);
+            crate::config::yaml::from_str(yaml);
         assert!(parsed.is_err(), "misspelled `requests:` must not parse");
     }
 

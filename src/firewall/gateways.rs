@@ -495,7 +495,7 @@ mod tests {
 
     fn allow_set() -> GatewayAllowSet {
         let config: crate::config::FirewallConfig =
-            serde_yaml_ng::from_str("{}").expect("an empty firewall section parses");
+            crate::config::yaml::from_str("{}").expect("an empty firewall section parses");
         GatewayAllowSet::new(&config, &[], Arc::new(DispatcherManager::new()))
     }
 
@@ -529,7 +529,8 @@ mod tests {
     #[ignore = "requires CAP_NET_ADMIN (run under `unshare -rn`)"]
     async fn allow_set_survives_the_operator_reloading_its_table() {
         let config: crate::config::FirewallConfig =
-            serde_yaml_ng::from_str("table: edge\nmanage_rule: false\n").expect("firewall section");
+            crate::config::yaml::from_str("table: edge\nmanage_rule: false\n")
+                .expect("firewall section");
         super::super::declare(&config)
             .await
             .expect("start-up declaration");

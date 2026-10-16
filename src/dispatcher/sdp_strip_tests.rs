@@ -576,8 +576,9 @@ pub(super) fn response_to_request(
 
 /// The session timer siphon runs, with an interval a callee can refuse.
 pub(super) fn with_session_timer(dispatcher: &mut TestDispatcher) {
-    dispatcher.state.session_timer_config =
-        Some(serde_yaml_ng::from_str("session_expires: 90\n").expect("a session timer config"));
+    dispatcher.state.session_timer_config = Some(
+        crate::config::yaml::from_str("session_expires: 90\n").expect("a session timer config"),
+    );
 }
 
 /// A 422 retry re-sends the offer the callee refused (RFC 4028 §6), so it is

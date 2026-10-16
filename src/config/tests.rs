@@ -304,7 +304,7 @@ fn codec_flags_are_rtpengine_only() {
 /// unnoticed while implying siphon was restricting codecs.
 #[test]
 fn codec_block_parses_as_a_dict_and_rejects_the_old_list_form() {
-    let good: NgFlagsConfig = serde_yaml_ng::from_str(
+    let good: NgFlagsConfig = crate::config::yaml::from_str(
         r#"
 transport_protocol: "RTP/AVP"
 codec:
@@ -318,11 +318,12 @@ codec:
     assert!(good.codec.transcode.is_empty());
 
     assert!(
-        serde_yaml_ng::from_str::<NgFlagsConfig>("codec: [\"offer\", \"PCMA,PCMU\"]").is_err(),
+        crate::config::yaml::from_str::<NgFlagsConfig>("codec: [\"offer\", \"PCMA,PCMU\"]")
+            .is_err(),
         "the old list form must be rejected, not ignored"
     );
     assert!(
-        serde_yaml_ng::from_str::<NgFlagsConfig>("codec:\n  bogus: [\"PCMA\"]").is_err(),
+        crate::config::yaml::from_str::<NgFlagsConfig>("codec:\n  bogus: [\"PCMA\"]").is_err(),
         "an unknown codec key must be rejected, not ignored"
     );
 }
@@ -372,21 +373,21 @@ fn dial_logging_is_off_unless_enabled() {
 #[test]
 fn dial_logging_parses_from_yaml() {
     let config: B2buaConfig =
-        serde_yaml_ng::from_str("log_dial: true").expect("b2bua block must parse");
+        crate::config::yaml::from_str("log_dial: true").expect("b2bua block must parse");
     assert!(config.log_dial_enabled());
     let empty: B2buaConfig =
-        serde_yaml_ng::from_str("default_refer_mode: terminate").expect("must parse");
+        crate::config::yaml::from_str("default_refer_mode: terminate").expect("must parse");
     assert!(!empty.log_dial_enabled());
 }
 
 #[test]
 fn replaces_takeover_parses_from_yaml() {
     let config: B2buaConfig =
-        serde_yaml_ng::from_str("accept_replaces: true").expect("b2bua block must parse");
+        crate::config::yaml::from_str("accept_replaces: true").expect("b2bua block must parse");
     assert!(config.replaces_takeover_enabled());
     // An omitted key leaves the capability off.
     let empty: B2buaConfig =
-        serde_yaml_ng::from_str("default_refer_mode: terminate").expect("must parse");
+        crate::config::yaml::from_str("default_refer_mode: terminate").expect("must parse");
     assert!(!empty.replaces_takeover_enabled());
 }
 
@@ -1424,7 +1425,7 @@ transaction:
 #[test]
 fn transaction_timeout_secs_is_unset_unless_configured() {
     let tx: crate::config::TransactionConfig =
-        serde_yaml_ng::from_str("invite_timeout_secs: 30").expect("the block parses");
+        crate::config::yaml::from_str("invite_timeout_secs: 30").expect("the block parses");
     assert_eq!(tx.timeout_secs, None);
 }
 
@@ -4671,6 +4672,7 @@ fn an_unknown_application_name_is_refused_at_load() {
         .to_string();
     assert!(message.contains("diameter.applications"), "{message}");
     assert!(message.contains("s6z"), "{message}");
+    assert!(message.contains("line 8"), "{message}");
 }
 
 #[test]
@@ -5101,12 +5103,12 @@ fn extensions_inline_form() {
         .expect("bar extension should resolve to a value");
     let mapping = value.as_mapping().expect("bar should be a mapping");
     let listen = mapping
-        .get(serde_yaml_ng::Value::String("listen".to_owned()))
+        .get("listen")
         .and_then(|v| v.as_str())
         .expect("listen key");
     assert_eq!(listen, "0.0.0.0:8080");
     let workers = mapping
-        .get(serde_yaml_ng::Value::String("workers".to_owned()))
+        .get("workers")
         .and_then(|v| v.as_u64())
         .expect("workers key");
     assert_eq!(workers, 4);
@@ -5858,4 +5860,104 @@ fn isc_shared_ifc_sets_load() {
     assert_eq!(sets[0].id, 1);
     assert_eq!(sets[0].file.as_deref(), Some("/etc/siphon/sifc/1.xml"));
     assert_eq!(sets[1].xml.as_deref(), Some("<InitialFilterCriteria/>"));
+}
+
+/// Every shipped siphon configuration loads: the reference `siphon.yaml`, the
+/// examples, and the configs the SIPp suites start siphon with. Catches a
+/// reader or schema change that would stop an operator's existing file from
+/// starting.
+#[test]
+fn every_shipped_siphon_config_loads() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files = vec![root.join("siphon.yaml")];
+    for directory in ["examples", "sipp/configs"] {
+        for entry in std::fs::read_dir(root.join(directory)).expect("the directory") {
+            let path = entry.expect("an entry").path();
+            if path
+                .extension()
+                .is_some_and(|extension| extension == "yaml")
+            {
+                files.push(path);
+            }
+        }
+    }
+    // Not a loadable siphon.yaml on its own: it has no `domain:` block.
+    files.retain(|path| !path.ends_with("examples/diameter_http_bridge.yaml"));
+    assert!(files.len() > 30, "found only {} configs", files.len());
+    for path in files {
+        let text = std::fs::read_to_string(&path).expect("readable");
+        if let Err(error) = Config::from_str(&text) {
+            panic!("{} does not load: {error}", path.display());
+        }
+    }
+}
+
+/// `script_config` and `extensions` keep their scalars as written: a dialled
+/// number with a leading zero stays text, `on` stays text, and a quoted
+/// numeric key stays a string key beside an unquoted integer key.
+#[test]
+fn untyped_sections_keep_scalars_as_written() {
+    let config = Config::from_str(concat!(
+        "listen:\n  udp: [\"0.0.0.0:5060\"]\n",
+        "domain:\n  local: [\"example.com\"]\n",
+        "script_config:\n",
+        "  mode: on\n",
+        "  prefixes:\n",
+        "    \"1233\": quoted\n",
+        "    1234: integer\n",
+        "    001: zeros\n",
+        "  numbers: [0101234567, +15551234567, \"+15551234568\"]\n",
+        "extensions:\n",
+        "  sample:\n",
+        "    tls: off\n",
+        "    workers: 4\n",
+    ))
+    .expect("config loads");
+    let document = config.script_config.as_ref().expect("script_config");
+    use crate::config::yaml::Value;
+    assert_eq!(document["mode"], Value::String("on".to_owned()));
+    let prefixes = document["prefixes"].as_mapping().expect("a mapping");
+    assert_eq!(
+        prefixes.get("1233"),
+        Some(&Value::String("quoted".to_owned()))
+    );
+    assert_eq!(
+        prefixes.get(Value::Number(1234u64.into())),
+        Some(&Value::String("integer".to_owned()))
+    );
+    assert_eq!(
+        prefixes.get("001"),
+        Some(&Value::String("zeros".to_owned()))
+    );
+    assert_eq!(
+        document["numbers"],
+        Value::Sequence(vec![
+            Value::String("0101234567".to_owned()),
+            Value::Number(15_551_234_567u64.into()),
+            Value::String("+15551234568".to_owned()),
+        ])
+    );
+    let sample = config.extension_config("sample").expect("the extension");
+    assert_eq!(sample["tls"], Value::String("off".to_owned()));
+    assert_eq!(sample["workers"].as_u64(), Some(4));
+}
+
+#[test]
+fn a_null_script_config_or_extensions_is_absent() {
+    let config = Config::from_str(concat!(
+        "listen:\n  udp: [\"0.0.0.0:5060\"]\n",
+        "domain:\n  local: [\"example.com\"]\n",
+        "script_config: ~\n",
+        "extensions:\n",
+    ))
+    .expect("config loads");
+    assert!(config.script_config.is_none());
+    assert!(config.extensions.is_none());
+}
+
+#[test]
+fn extensions_must_be_a_mapping_of_names() {
+    let base = "listen:\n  udp: [\"0.0.0.0:5060\"]\ndomain:\n  local: [\"example.com\"]\n";
+    Config::from_str(&format!("{base}extensions: [a, b]\n")).expect_err("not a mapping");
+    Config::from_str(&format!("{base}extensions:\n  5: /etc/x.yaml\n")).expect_err("not a name");
 }

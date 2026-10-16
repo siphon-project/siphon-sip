@@ -107,7 +107,10 @@ serde_json = "1"
 
 # Config
 serde = { version = "1", features = ["derive"] }
-serde_yaml_ng = "0.10"
+serde-saphyr = { version = "2.0.0", default-features = false, features = ["deserialize"] }
+# Names the key path (`diameter.applications`) in a typed config error.
+# Already in the tree through axum.
+serde_path_to_error = "0.1.20"
 clap = { version = "4", features = ["derive"] }
 
 # HTTP client (APIBAN, HTTP auth backend)

@@ -116,7 +116,7 @@ fn plain_policy() -> Arc<crate::numbers::policy::NumberPolicy> {
     let mut policies = HashMap::new();
     policies.insert(
         "plain@test".to_string(),
-        serde_yaml_ng::from_str::<NumberPolicyConfig>("default: plain\n")
+        crate::config::yaml::from_str::<NumberPolicyConfig>("default: plain\n")
             .expect("the policy parses"),
     );
     let (registry, warnings) = NumberRegistry::build(&numbering, &policies);

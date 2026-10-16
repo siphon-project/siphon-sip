@@ -246,8 +246,8 @@ mod tests {
 
     #[test]
     fn access_network_information_is_off_unless_asked_for() {
-        let rf: RfConfig = serde_yaml_ng::from_str("enabled: true\n").unwrap();
-        let ro: RoConfig = serde_yaml_ng::from_str("enabled: true\n").unwrap();
+        let rf: RfConfig = crate::config::yaml::from_str("enabled: true\n").unwrap();
+        let ro: RoConfig = crate::config::yaml::from_str("enabled: true\n").unwrap();
         assert!(!rf.access_network_information);
         assert!(!ro.access_network_information);
     }
@@ -255,16 +255,18 @@ mod tests {
     #[test]
     fn access_network_information_is_read_from_both_sections() {
         let rf: RfConfig =
-            serde_yaml_ng::from_str("enabled: true\naccess_network_information: true\n").unwrap();
+            crate::config::yaml::from_str("enabled: true\naccess_network_information: true\n")
+                .unwrap();
         let ro: RoConfig =
-            serde_yaml_ng::from_str("enabled: true\naccess_network_information: true\n").unwrap();
+            crate::config::yaml::from_str("enabled: true\naccess_network_information: true\n")
+                .unwrap();
         assert!(rf.access_network_information);
         assert!(ro.access_network_information);
     }
 
     #[test]
     fn ro_defaults_from_a_minimal_section() {
-        let config: RoConfig = serde_yaml_ng::from_str("enabled: true\n").unwrap();
+        let config: RoConfig = crate::config::yaml::from_str("enabled: true\n").unwrap();
         assert!(config.enabled);
         assert_eq!(config.reauth_interval_secs, 30);
         assert_eq!(config.requested_seconds, 30);
@@ -293,9 +295,10 @@ mod tests {
     /// either value, and reads the same as one without it.
     #[test]
     fn ro_section_carrying_the_removed_charge_message_key_still_loads() {
-        let without: RoConfig = serde_yaml_ng::from_str("enabled: true\ncharge: both\n").unwrap();
+        let without: RoConfig =
+            crate::config::yaml::from_str("enabled: true\ncharge: both\n").unwrap();
         for value in ["true", "false"] {
-            let with: RoConfig = serde_yaml_ng::from_str(&format!(
+            let with: RoConfig = crate::config::yaml::from_str(&format!(
                 "enabled: true\ncharge: both\ncharge_message: {value}\n"
             ))
             .unwrap();

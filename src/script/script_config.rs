@@ -16,8 +16,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::config::yaml::{Mapping, Value};
 use arc_swap::ArcSwap;
-use serde_yaml_ng::{Mapping, Value};
 use tracing::{debug, error, info, warn};
 
 use crate::config::expand_env_vars;
@@ -227,7 +227,8 @@ fn validate_value(value: &Value, location: &str) -> std::result::Result<(), Stri
 /// Expand `${VAR}` / `${VAR:-default}` in `text`, parse it as YAML and check it.
 fn parse_document(text: &str) -> std::result::Result<(String, Value), String> {
     let expanded = expand_env_vars(text);
-    let document: Value = serde_yaml_ng::from_str(&expanded).map_err(|error| error.to_string())?;
+    let document =
+        crate::config::yaml::parse_value(&expanded).map_err(|error| error.to_string())?;
     let document = validated_document(document)?;
     Ok((expanded, document))
 }
@@ -527,7 +528,7 @@ mod tests {
     );
 
     fn document(yaml: &str) -> Value {
-        serde_yaml_ng::from_str(yaml).unwrap()
+        crate::config::yaml::parse_value(yaml).unwrap()
     }
 
     #[test]

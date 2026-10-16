@@ -1,4 +1,4 @@
-//! YAML configuration — `siphon.yaml` deserialization via serde_yaml_ng.
+//! YAML configuration — `siphon.yaml` deserialization (see [`yaml`] for the dialect).
 //!
 //! This module holds the top-level [`Config`], loading and load-time
 //! validation, and the helpers shared across sections. Each YAML section's
@@ -35,6 +35,7 @@ mod stir;
 #[cfg(test)]
 mod tests;
 mod tls;
+pub mod yaml;
 
 pub use admin::{
     AdminAuthConfig, AdminCaptureConfig, AdminConfig, AdminLogTailConfig, AdminUiConfig, CorsConfig,
@@ -398,8 +399,11 @@ pub struct Config {
     /// Extensions read their entry via [`Config::extension_path`] (when
     /// they expect an external file) or [`Config::extension_config`]
     /// (when they consume the value directly).
-    #[serde(default)]
-    pub extensions: Option<IndexMap<String, serde_yaml_ng::Value>>,
+    ///
+    /// Read by [`yaml::parse_value`], not by the typed pass, so an entry's
+    /// scalars resolve exactly as a `script_config` document's do.
+    #[serde(skip)]
+    pub extensions: Option<IndexMap<String, yaml::Value>>,
 
     /// Structured configuration for the script, read through the `config`
     /// script namespace. Opaque to siphon-core: the script gives it meaning.
@@ -416,9 +420,11 @@ pub struct Config {
     ///     default: { gateway: carrier-a }
     /// ```
     ///
-    /// See [`crate::script::script_config`].
-    #[serde(default)]
-    pub script_config: Option<serde_yaml_ng::Value>,
+    /// See [`crate::script::script_config`]. Read by [`yaml::parse_value`]:
+    /// the typed pass would resolve its scalars by the field types, and this
+    /// has none.
+    #[serde(skip)]
+    pub script_config: Option<yaml::Value>,
 }
 
 // ---------------------------------------------------------------------------
@@ -492,9 +498,39 @@ impl Config {
         for include_path in &mut self.script.include_paths {
             anchor(include_path);
         }
-        if let Some(serde_yaml_ng::Value::String(script_config_path)) = &mut self.script_config {
+        if let Some(yaml::Value::String(script_config_path)) = &mut self.script_config {
             anchor(script_config_path);
         }
+    }
+
+    /// Fill `extensions` and `script_config` from the untyped tree of the
+    /// whole document.
+    fn read_untyped_sections(&mut self, document: &yaml::Value) -> Result<()> {
+        self.script_config = document
+            .get("script_config")
+            .filter(|value| !value.is_null())
+            .cloned();
+        self.extensions = match document.get("extensions") {
+            None | Some(yaml::Value::Null) => None,
+            Some(yaml::Value::Mapping(entries)) => Some(
+                entries
+                    .iter()
+                    .map(|(name, value)| match name {
+                        yaml::Value::String(name) => Ok((name.clone(), value.clone())),
+                        _ => Err(SiphonError::Config(
+                            "invalid siphon.yaml: extensions: an extension name must be a string"
+                                .to_owned(),
+                        )),
+                    })
+                    .collect::<Result<_>>()?,
+            ),
+            Some(_) => {
+                return Err(SiphonError::Config(
+                    "invalid siphon.yaml: extensions must be a mapping of name to entry".to_owned(),
+                ))
+            }
+        };
+        Ok(())
     }
 
     #[allow(clippy::should_implement_trait)]
@@ -505,8 +541,9 @@ impl Config {
 
     /// Parse YAML without env-var expansion (used after expansion is already done).
     fn from_str_raw(yaml: &str) -> Result<Self> {
-        let config: Self = serde_yaml_ng::from_str(yaml)
-            .map_err(|e| SiphonError::Config(format!("invalid siphon.yaml: {e}")))?;
+        let invalid = |e: yaml::Error| SiphonError::Config(format!("invalid siphon.yaml: {e}"));
+        let mut config: Self = yaml::from_str(yaml).map_err(invalid)?;
+        config.read_untyped_sections(&yaml::parse_value(yaml).map_err(invalid)?)?;
         config.validate_backends()?;
         config.validate_auth_algorithms()?;
         config.validate_cdr()?;
@@ -1417,7 +1454,7 @@ impl Config {
     /// file"). Returns `None` when the entry is absent or its value is an
     /// inline mapping/sequence — extensions that accept inline config
     /// should call [`Config::extension_config`] instead and walk the
-    /// `serde_yaml_ng::Value` themselves.
+    /// `yaml::Value` themselves.
     pub fn extension_path(&self, name: &str) -> Option<&Path> {
         self.extensions.as_ref()?.get(name)?.as_str().map(Path::new)
     }
@@ -1425,7 +1462,7 @@ impl Config {
     /// Raw-value accessor for an extension entry. Returns the entry's
     /// YAML value (any shape) for the extension to interpret. Returns
     /// `None` when the entry is absent.
-    pub fn extension_config(&self, name: &str) -> Option<&serde_yaml_ng::Value> {
+    pub fn extension_config(&self, name: &str) -> Option<&yaml::Value> {
         self.extensions.as_ref()?.get(name)
     }
 }

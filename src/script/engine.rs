@@ -2949,7 +2949,7 @@ def route(request):
         let mut policies = HashMap::new();
         policies.insert(
             "test-e164@2026".to_string(),
-            serde_yaml_ng::from_str::<NumberPolicyConfig>("default: e164\n").unwrap(),
+            crate::config::yaml::from_str::<NumberPolicyConfig>("default: e164\n").unwrap(),
         );
         let (registry, warnings) = NumberRegistry::build(&numbering, &policies);
         assert!(warnings.is_empty(), "policy warnings: {warnings:?}");
@@ -3210,7 +3210,7 @@ def on_invite(call):
         let mut policies = HashMap::new();
         policies.insert(
             "test-e164@2026".to_string(),
-            serde_yaml_ng::from_str::<NumberPolicyConfig>("default: e164\n").unwrap(),
+            crate::config::yaml::from_str::<NumberPolicyConfig>("default: e164\n").unwrap(),
         );
         let (registry, warnings) = NumberRegistry::build(&numbering, &policies);
         assert!(warnings.is_empty(), "policy warnings: {warnings:?}");

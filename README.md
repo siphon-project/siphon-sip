@@ -597,7 +597,7 @@ src/
   li/            # Lawful Intercept (ETSI X1/X2/X3, SIPREC)
   metrics/       # Prometheus metrics
   admin/         # HTTP admin API
-  config.rs      # YAML config (serde_yml)
+  config.rs      # YAML config (serde-saphyr)
   dispatcher.rs  # Message routing and dispatch
   error.rs       # Error types (thiserror)
   shutdown.rs    # Graceful shutdown coordinator

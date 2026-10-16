@@ -51,6 +51,18 @@ Only relevant when you link `siphon-sip` as a crate.
 | `diameter::ro::NodeRole` | `ProxyRole` and `B2buaRole` are removed; `ForwardingRole` is new and is 2. Use the role the node serves. |
 | `dispatcher::ro_authorize_b2bua` | Takes a fifth argument, the Role-Of-Node override (`Option<NodeRole>`); `None` sends the session case. |
 | `diameter::cx::build_saa_success`, `build_lia_success`, `build_rta` | Answer with Result-Code 2001 where they carried Experimental-Result 2001. |
+| `config::Config::extensions`, `script_config`, `extension_config` | Hold `config::yaml::Value` where they held `serde_yaml_ng::Value`. Same variants and accessors (`as_str`, `as_u64`, `get`, `value["key"]`); read a document into one with `config::yaml::parse_value`. |
+| `script::script_config` (`lookup`, `describe`, `ScriptConfigStore::from_setting`, `snapshot`) | Take and return `config::yaml::Value`. |
+
+## siphon.yaml
+
+The YAML reader is new; a config that loaded before loads the same. Three
+things that used to be refused are now accepted: a quoted number or boolean
+in a typed key (`drain_secs: "10"`, `log_dial: "true"`), and an integer with
+`_` separators (`1_000`). A parse error still names the key path
+(`b2bua.log_dial: ...`) and now also the line and column. `script_config` and `extensions`
+read exactly as before: `on` and `yes` are strings, `0101234567` is a string,
+`+15551234567` is an integer.
 
 ## On the wire: check before upgrading
 

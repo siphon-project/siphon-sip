@@ -1116,7 +1116,7 @@ on_unparseable: strip
 preserve_users:
   - "0800*"
 "#;
-        let config: NumberPolicyConfig = serde_yaml_ng::from_str(yaml).unwrap();
+        let config: NumberPolicyConfig = crate::config::yaml::from_str(yaml).unwrap();
         let mut warnings = Vec::new();
         let policy = config.resolve("test@2026", &nl_locale(), &mut warnings);
         assert!(warnings.is_empty(), "warnings: {warnings:?}");
@@ -1138,7 +1138,7 @@ default: e164
 headers:
   Bogus-Header: e164
 "#;
-        let config: NumberPolicyConfig = serde_yaml_ng::from_str(yaml).unwrap();
+        let config: NumberPolicyConfig = crate::config::yaml::from_str(yaml).unwrap();
         let mut warnings = Vec::new();
         let policy = config.resolve("test@2026", &nl_locale(), &mut warnings);
         assert_eq!(warnings.len(), 1);
@@ -1151,7 +1151,7 @@ headers:
 default: national
 country_code: "44"
 "#;
-        let config: NumberPolicyConfig = serde_yaml_ng::from_str(yaml).unwrap();
+        let config: NumberPolicyConfig = crate::config::yaml::from_str(yaml).unwrap();
         let mut warnings = Vec::new();
         let policy = config.resolve("uk@2026", &nl_locale(), &mut warnings);
         assert_eq!(policy.locale.country_code, "44");
@@ -1206,7 +1206,7 @@ country_code: "44"
             ..Default::default()
         };
         let mut policies = HashMap::new();
-        let config: NumberPolicyConfig = serde_yaml_ng::from_str("default: e164\n").unwrap();
+        let config: NumberPolicyConfig = crate::config::yaml::from_str("default: e164\n").unwrap();
         policies.insert("teams-outbound@2026".to_string(), config);
         let (registry, warnings) = NumberRegistry::build(&numbering, &policies);
         assert!(warnings.is_empty());
