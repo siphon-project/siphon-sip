@@ -463,6 +463,12 @@ entry, but a working config keeps working.
 
 ### Fixed
 
+- **A call handed to a control application with no controller connected is
+  answered `503`.** The default for such a call rejected it through the
+  ordinary path, which locks the stored A-leg INVITE; the handover already holds
+  that lock, and `std::sync::Mutex` is not re-entrant, so the thread never
+  returned, the caller was never answered and the worker was lost. The rejection
+  now uses the INVITE the handover holds.
 - **`transaction.timeout_secs` sets Timer F, the non-INVITE transaction
   timeout (RFC 3261 §17.1.2.2). It was read and never used.** Every non-INVITE
   client transaction waited 64*T1 (32 s) whatever it said, so a proxy that
