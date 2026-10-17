@@ -498,7 +498,7 @@ pub fn b2bua_advance_route_with_numbers(
             &target,
             next_hop.as_deref(),
             None,
-            &[],
+            &route.route,
             send_socket.as_ref(),
             None,
             presented.as_ref().unwrap_or(original_request),

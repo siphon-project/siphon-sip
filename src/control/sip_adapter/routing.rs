@@ -470,7 +470,20 @@ pub(super) fn parse_dial_target(
         ..Default::default()
     };
 
+    let route = parse_route_set(object)?;
+
     if let Some(aor) = object.get("aor").and_then(|v| v.as_str()) {
+        // Each branch of an AoR is routed over its own binding's Path, which
+        // is the route set that contact needs. One named here would have to
+        // replace that Path or sit in front of it, and either silently changes
+        // where a registered phone is reached, so the two are not combined.
+        if !route.is_empty() {
+            return Err(
+                "a target's 'route' applies to a {uri} target: an {aor} routes each branch over \
+                 its own binding's Path"
+                    .to_string(),
+            );
+        }
         return match crate::dispatcher::dial_targets_for_aor(aor) {
             Ok(mut branches) => {
                 for branch in &mut branches {
@@ -497,6 +510,7 @@ pub(super) fn parse_dial_target(
     Ok(vec![crate::dispatcher::DialTarget {
         uri: uri.to_string(),
         next_hop: string_field("next_hop"),
+        route,
         // A URI dialled as written names no registered AoR, even one that
         // happens to be a registered contact: only an `{aor}` target says whom
         // the branch was dialled for.
@@ -517,6 +531,7 @@ pub(super) fn parse_route_target(
             headers: Vec::new(),
             timeout_secs: None,
             reroute_after_progress: false,
+            route: Vec::new(),
         });
     }
     let Some(object) = item.as_object() else {
@@ -548,13 +563,58 @@ pub(super) fn parse_route_target(
             .as_bool()
             .ok_or_else(|| "target 'reroute_after_progress' must be a boolean".to_string())?,
     };
+    let route = parse_route_set(object)?;
     Ok(crate::dispatcher::RouteTarget {
         uri: uri.to_string(),
         next_hop,
         headers,
         timeout_secs,
         reroute_after_progress,
+        route,
     })
+}
+
+/// Read a target's `route`: the route set its B-leg INVITE carries (RFC 3261
+/// §8.1.2, §12.2.1.1), in order, topmost first.
+///
+/// What a controller acting as a routing B2BUA needs to send a request back
+/// where it came from: an IMS application server continues the session through
+/// the S-CSCF by copying the Route the S-CSCF gave it, which carries the
+/// original dialog identifier (TS 24.229 §5.7.5.2.1 step 4, §5.4.3.4). Route
+/// is framework-managed on a B-leg, so it cannot ride `headers`, and a
+/// `next_hop` sends the INVITE without the entry that tells the S-CSCF which
+/// session it continues.
+///
+/// Absent or `null` is no route set. Anything else must be an array of
+/// strings, each exactly one Route entry in its name-addr form (`<sip:...;lr>`,
+/// RFC 3261 §25.1, so a URI's `;lr` cannot be mistaken for a header parameter); a
+/// value siphon cannot put on the wire is refused rather than dropped, because
+/// a request sent without its route set goes somewhere else entirely.
+fn parse_route_set(
+    object: &serde_json::Map<String, serde_json::Value>,
+) -> Result<Vec<String>, String> {
+    let entries = match object.get("route") {
+        None | Some(serde_json::Value::Null) => return Ok(Vec::new()),
+        Some(serde_json::Value::Array(entries)) => entries,
+        Some(_) => return Err("target 'route' must be an array of Route entries".to_string()),
+    };
+    entries
+        .iter()
+        .map(|entry| {
+            let value = entry
+                .as_str()
+                .ok_or_else(|| "each target 'route' entry must be a string".to_string())?;
+            match crate::sip::headers::route::RouteEntry::parse_multi(value) {
+                Ok(parsed) if parsed.len() == 1 => Ok(value.trim().to_string()),
+                Ok(_) => Err(format!(
+                    "target 'route' entry {value:?} must be exactly one Route entry"
+                )),
+                Err(error) => Err(format!(
+                    "target 'route' entry {value:?} is not a Route entry: {error}"
+                )),
+            }
+        })
+        .collect()
 }
 
 /// Parse a command-level `headers` object (applied to every route attempt).

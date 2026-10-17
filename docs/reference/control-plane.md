@@ -320,7 +320,9 @@ what lets a refused verb be lined up against a capture, a CDR and HEP.
 decides routing out-of-process (LCR / rating / business logic), then hands
 control back to siphon with the decision. `targets` is a non-empty array of
 either bare URI strings or objects
-`{uri, next_hop?, headers?, timeout?, reroute_after_progress?}`. A target's
+`{uri, next_hop?, headers?, timeout?, reroute_after_progress?, route?}`. A
+target's `route` is the route set its attempt carries, as for
+[`dial`](#dial-ring-while-the-caller-waits). A target's
 `timeout` bounds the wait for that carrier to show progress (a 101-199); a
 carrier that has keeps the call to the later of its `timeout` and 30 s, then
 the call fails with `408` rather than trying the next target, unless the target
@@ -1532,6 +1534,24 @@ dial's `privacy`. This is what a hunt across two carriers needs: the number a
 carrier will accept is a property of that carrier, not of the call, and
 presenting another carrier's number leaves it challenging the INVITE however
 correct the digest is. A target naming nothing presents the dial's identity.
+
+A `{uri}` target may carry `route?`, an array of Route entries in name-addr
+form (`"<sip:...;lr>"`, RFC 3261 §25.1), topmost first. The branch's INVITE carries exactly that route
+set and is sent to its topmost entry, unless the target's `next_hop` pins the
+destination (RFC 3261 §16.6 step 6). This is what a routing B2BUA needs to
+continue a request through the proxy that sent it: an IMS application server
+sends the session back through the S-CSCF with the Route the S-CSCF gave it,
+which carries the original dialog identifier (TS 24.229 §5.7.5.2.1,
+§5.4.3.4). `Route` is framework-managed on a B-leg, so it cannot ride
+`headers`. An entry that is not exactly one Route entry is `bad_request`, and
+so is a `route` on an `{aor}` target, whose branches each follow their own
+binding's Path.
+
+```json
+{ "verb": "dial", "target": { "channel": "ch_caller" },
+  "args": { "targets": [ { "uri": "sip:+15550100@ims.example.test",
+                           "route": ["<sip:term@scscf.example.test;lr;odi=4f1c>"] } ] } }
+```
 
 `strategy` is `parallel` (default) or `sequential`; `timeout` is the ring
 timeout in seconds (default 30). Dialling a call that is already answered is

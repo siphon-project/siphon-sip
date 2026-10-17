@@ -315,6 +315,16 @@ pub struct Route {
     /// `To` host.
     #[serde(skip)]
     pub presented_to: Option<String>,
+    /// The route set this attempt's INVITE carries, topmost first, when a
+    /// controller `route` or sequential `dial` target named one (`route`).
+    /// The attempt goes to the topmost entry unless `next_hop` pins it
+    /// elsewhere, and keeps every entry on the wire (RFC 3261 §16.6 step 6).
+    ///
+    /// Not part of the LCR API: a routing decision names carriers, while a
+    /// route set belongs to a controller continuing a request where it came
+    /// from — an IMS application server sending it back through the S-CSCF.
+    #[serde(skip)]
+    pub route: Vec<String>,
 }
 
 impl Route {
