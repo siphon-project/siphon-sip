@@ -164,10 +164,19 @@ pub fn spawn(
                                 missed = missed,
                                 "closing unresponsive connection (CRLF keepalive timeout)"
                             );
-                            // Dropping the sender closes the mpsc channel, which
-                            // causes the write task to exit and triggers cleanup
-                            // in tcp.rs / tls.rs.
+                            // The map's sender is not the only one: the read
+                            // half of an inbound connection keeps a clone for
+                            // the pongs it writes, so dropping this copy does
+                            // not end the connection. The connection's own task
+                            // is told to close (and reports the flow failure to
+                            // the registrar, RFC 5626 §4.2.2); an outbound pool
+                            // connection, which has no such task, ends with its
+                            // channel.
                             map.remove(&id);
+                            crate::transport::disconnect::close_connection(
+                                id,
+                                "CRLF keepalive timeout",
+                            );
                             pong_tracker.remove(id);
                         } else {
                             // Peer never responded to any CRLF ping — it probably

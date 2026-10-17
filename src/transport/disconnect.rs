@@ -147,12 +147,54 @@ pub(crate) fn close_banned_source(source: IpAddr, reason: &str) -> usize {
     held.len()
 }
 
+/// Signal one live inbound stream connection to close because `reason`: its
+/// peer stopped answering CRLF keep-alives (RFC 5626 §4.4.1). Returns whether
+/// the connection was live.
+///
+/// The way to end a connection from outside its task. Its sender in the
+/// connection map is not: the read half holds a clone of it (for the pongs it
+/// writes), so dropping the map's copy leaves the channel, the socket and the
+/// registrar's binding up until the 300 s idle timeout. This wakes the task,
+/// which closes the socket and runs its ordinary cleanup, the flow-failure
+/// report to the registrar (RFC 5626 §4.2.2) included.
+pub(crate) fn close_connection(connection_id: ConnectionId, reason: &str) -> bool {
+    let Some(close) = LIVE_CONNECTIONS
+        .get(&connection_id)
+        .map(|entry| Arc::clone(&entry.value().close))
+    else {
+        return false;
+    };
+    close.notify_one();
+    info!(connection_id = ?connection_id, reason, "closing a connection");
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn ip(value: &str) -> IpAddr {
         value.parse().expect("a test address")
+    }
+
+    #[tokio::test]
+    async fn closing_one_connection_signals_that_one_alone() {
+        let closed =
+            ConnectionCloser::register(ConnectionId(9101), ip("203.0.113.15"), Transport::Tls);
+        let kept =
+            ConnectionCloser::register(ConnectionId(9102), ip("203.0.113.15"), Transport::Tls);
+
+        assert!(close_connection(ConnectionId(9101), "a test signal"));
+        tokio::time::timeout(std::time::Duration::from_secs(5), closed.closed())
+            .await
+            .expect("the named connection must be signalled");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), kept.closed())
+                .await
+                .is_err(),
+            "another connection from the same address must be left alone"
+        );
+        assert!(!close_connection(ConnectionId(9199), "a test signal"));
     }
 
     #[tokio::test]
