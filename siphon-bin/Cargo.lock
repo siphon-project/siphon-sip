@@ -32,6 +32,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "annotate-snippets"
+version = "0.12.16"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f211a51805bc641f3ad5b7664c77d2547af685cc33b4cd8d31964027a46f13f1"
+dependencies = [
+ "anstyle",
+ "memchr",
+ "unicode-width",
+]
+
+[[package]]
 name = "anstream"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -95,6 +106,12 @@ name = "arcstr"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "03918c3dbd7701a85c6b9887732e2921175f26c350b4563841d0958c21d57e6d"
+
+[[package]]
+name = "arraydeque"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7d902e3d592a523def97af8f317b08ce16b7ab854c1985a0c671e6f15cebc236"
 
 [[package]]
 name = "async-lock"
@@ -528,6 +545,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
+name = "core_detect"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7f8f80099a98041a3d1622845c271458a2d73e688351bf3cb999266764b81d48"
+
+[[package]]
 name = "cpubits"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -767,6 +790,29 @@ dependencies = [
  "sec1",
  "subtle",
  "zeroize",
+]
+
+[[package]]
+name = "encoding_rs"
+version = "0.8.42"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8e985e0451871ad22fb8d2b6b076e2028a502a0d3950998c2c5c0a4f9b5d9679"
+dependencies = [
+ "cfg-if",
+ "core_detect",
+ "multiversion_no_op",
+ "rustversion",
+ "scopeguard",
+ "simdutf8",
+]
+
+[[package]]
+name = "encoding_rs_io"
+version = "0.1.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fba3fe847045ecff794b9c138293a80db914678c453ad63fbf0c6a9eb6e00b22"
+dependencies = [
+ "encoding_rs",
 ]
 
 [[package]]
@@ -1052,6 +1098,16 @@ dependencies = [
  "libc",
  "r-efi 6.0.0",
  "rand_core 0.10.1",
+]
+
+[[package]]
+name = "granit-parser"
+version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "da55feca5d1625466bae068f9fd4b87892caeae70c3fe671ddb0f50d41aebf37"
+dependencies = [
+ "arraydeque",
+ "smallvec",
 ]
 
 [[package]]
@@ -1862,6 +1918,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "multiversion_no_op"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "743fb55ba31b18fb1ecef6bdc9aa2743314978ac084044301a7eee33fb99a20d"
+
+[[package]]
 name = "native-tls"
 version = "0.2.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1894,6 +1956,12 @@ dependencies = [
  "libc",
  "log",
 ]
+
+[[package]]
+name = "nohash-hasher"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2bf50223579dc7cdcfb3bfcacf7069ff68243f8c363f62ffa99cf000a6b9c451"
 
 [[package]]
 name = "nom"
@@ -3003,6 +3071,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde-saphyr"
+version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a253edfdea34032da21af84e16fcc94f4c7a6ba237f9f3bc2dbf43cea8535c44"
+dependencies = [
+ "annotate-snippets",
+ "base64 0.23.1",
+ "encoding_rs_io",
+ "granit-parser",
+ "nohash-hasher",
+ "num-traits",
+ "serde_core",
+ "smallvec",
+ "zmij",
+]
+
+[[package]]
 name = "serde_core"
 version = "1.0.228"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3056,32 +3141,6 @@ dependencies = [
  "itoa",
  "ryu",
  "serde",
-]
-
-[[package]]
-name = "serde_yaml"
-version = "0.9.34+deprecated"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6a8b1a1a2ebf674015cc02edccce75287f1a0130d394307b36743c2f5d504b47"
-dependencies = [
- "indexmap",
- "itoa",
- "ryu",
- "serde",
- "unsafe-libyaml",
-]
-
-[[package]]
-name = "serde_yaml_ng"
-version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7b4db627b98b36d4203a7b458cf3573730f2bb591b28871d916dfa9efabfd41f"
-dependencies = [
- "indexmap",
- "itoa",
- "ryu",
- "serde",
- "unsafe-libyaml",
 ]
 
 [[package]]
@@ -3193,8 +3252,8 @@ dependencies = [
 
 [[package]]
 name = "siphon-http"
-version = "1.1.0"
-source = "git+https://github.com/siphon-project/siphon-http?tag=v1.1.0#c95b9d61a201c004ea1143a6f7c55379e892b42f"
+version = "2.0.0"
+source = "git+https://github.com/siphon-project/siphon-http?tag=v2.0.0#5b6d287f8c36f3ce9dd8439dda13ac2c6e5ec35c"
 dependencies = [
  "async-trait",
  "axum",
@@ -3209,7 +3268,8 @@ dependencies = [
  "reqwest",
  "rustls",
  "serde",
- "serde_yaml",
+ "serde-saphyr",
+ "serde_path_to_error",
  "siphon-sip",
  "thiserror 2.0.21",
  "tokio",
@@ -3221,9 +3281,9 @@ dependencies = [
 
 [[package]]
 name = "siphon-rtp-proto"
-version = "0.12.1"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b2e009e023634c62ab8e9047e1a408441416326dadc5f42b9f7376246d715650"
+checksum = "0bfffb7a6d46faf2b0f99ecf3f3f727180ff78d1bede52c6a801e3180a713a80"
 dependencies = [
  "serde",
  "serde_json",
@@ -3232,8 +3292,8 @@ dependencies = [
 
 [[package]]
 name = "siphon-sigtran"
-version = "3.0.0"
-source = "git+https://github.com/siphon-project/siphon-sigtran?tag=v3.0.0#299a2cf292db7fdfd0909ed2ca8abf30d63f3ab0"
+version = "4.0.0"
+source = "git+https://github.com/siphon-project/siphon-sigtran?tag=v4.0.0#7b92460188b0980ae5d5f4616310d84ca70122b4"
 dependencies = [
  "async-sctp",
  "gsm_cap",
@@ -3248,7 +3308,8 @@ dependencies = [
  "rasn 0.28.13",
  "sccp",
  "serde",
- "serde_yaml",
+ "serde-saphyr",
+ "serde_path_to_error",
  "siphon-sip",
  "sua",
  "tcap",
@@ -3259,7 +3320,7 @@ dependencies = [
 [[package]]
 name = "siphon-sip"
 version = "1.13.1"
-source = "git+https://github.com/siphon-project/siphon-sip?branch=main#2b1179709ba9883a4c3120172b800304723c7bf9"
+source = "git+https://github.com/siphon-project/siphon-sip?branch=main#010bb8dd82f067e384b71be2373daabd400abe77"
 dependencies = [
  "aes",
  "arc-swap",
@@ -3299,8 +3360,9 @@ dependencies = [
  "rust-embed",
  "rustls-pki-types",
  "serde",
+ "serde-saphyr",
  "serde_json",
- "serde_yaml_ng",
+ "serde_path_to_error",
  "sha2 0.11.0",
  "siphon-rtp-proto",
  "socket2 0.6.4",
@@ -3326,14 +3388,15 @@ dependencies = [
 
 [[package]]
 name = "siphon-smpp"
-version = "1.5.1"
-source = "git+https://github.com/siphon-project/siphon-smpp?tag=v1.5.1#0d64d37f5421302afa59de6f03afc4b3e7f38051"
+version = "2.0.0"
+source = "git+https://github.com/siphon-project/siphon-smpp?tag=v2.0.0#bf893e47f9ff68061e8e9f38a001539560c18b72"
 dependencies = [
  "async-trait",
  "pyo3",
  "pyo3-async-runtimes",
  "serde",
- "serde_yaml",
+ "serde-saphyr",
+ "serde_path_to_error",
  "siphon-sip",
  "smpp34",
  "thiserror 2.0.21",
@@ -4093,10 +4156,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7df058c713841ad818f1dc5d3fd88063241cc61f49f5fbea4b951e8cf5a8d71d"
 
 [[package]]
-name = "unsafe-libyaml"
-version = "0.2.11"
+name = "unicode-width"
+version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "673aac59facbab8a9007c7f6108d11f63b603f7cabff99fabf650fea5c32b861"
+checksum = "b4ac048d71ede7ee76d585517add45da530660ef4390e49b098733c6e897f254"
 
 [[package]]
 name = "untrusted"
@@ -4106,9 +4169,9 @@ checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 
 [[package]]
 name = "uppsala"
-version = "0.10.1"
+version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a27f7d40a93824eefcf6b62fd2fa86bca9ea6a5825de56b4aa9a5ed7804b766c"
+checksum = "717b252544d044a701181a32cf7ff443b86603acf99faf8d45e14b20a8c769be"
 
 [[package]]
 name = "url"
