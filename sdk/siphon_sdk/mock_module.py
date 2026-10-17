@@ -5310,7 +5310,9 @@ class MockRtpEngine:
             seat_tag: The seat's name, a SIP token unique in the room. The
                 engine names the seat by it where it names a joined seat by
                 its From-tag (:meth:`on_active_speaker`, a room's DTMF).
-            role, target, whisper_target: As for :meth:`conference_join`.
+            role: The seat's role, as for :meth:`conference_join`.
+            target: As for :meth:`conference_join`.
+            whisper_target: As for :meth:`conference_join`.
             profile: The RTP profile whose offer half shapes the seat.
 
         Returns:
