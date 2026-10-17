@@ -1571,7 +1571,7 @@ impl PyRtpEngine {
     }
 
     /// Link two live rooms: ``direction`` ``"both"``, ``"a_to_b"`` (room A is
-    /// heard in room B) or ``"b_to_a"``. siphon-rtp has no unbridge verb.
+    /// heard in room B) or ``"b_to_a"``. :meth:`conference_unbridge` undoes it.
     #[pyo3(signature = (conference_a, conference_b, direction="both"))]
     fn conference_bridge<'py>(
         &self,
@@ -1581,6 +1581,86 @@ impl PyRtpEngine {
         direction: &str,
     ) -> PyResult<Bound<'py, PyAny>> {
         conference::bridge(self, python, conference_a, conference_b, direction)
+    }
+
+    /// Unlink two rooms a :meth:`conference_bridge` linked, in both
+    /// directions whichever way it was made. Raises ``RuntimeError`` when the
+    /// rooms are not linked.
+    #[pyo3(signature = (conference_a, conference_b))]
+    fn conference_unbridge<'py>(
+        &self,
+        python: Python<'py>,
+        conference_a: String,
+        conference_b: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        conference::unbridge(self, python, conference_a, conference_b)
+    }
+
+    /// Offer a seat for a participant the focus calls out (``siphon-rtp``
+    /// only), and resolve to the offer SDP for the INVITE: RFC 4579 §5.5, a
+    /// REFER to the focus naming a user, or TS 24.605 CONF. The engine
+    /// allocates the seat and offers every codec the room can mix; the seat
+    /// joins the room on :meth:`conference_answer`, and one that is never
+    /// answered is freed by :meth:`conference_leave` or the engine's setup
+    /// timeout.
+    ///
+    /// Args:
+    ///     conference_id: The room; created on its first seat.
+    ///     seat_tag: The seat's name, a token the script chooses and unique in
+    ///         the room. The engine names the seat by it where it names a
+    ///         joined seat by its From-tag (``@rtpengine.on_active_speaker``,
+    ///         a room's ``on_dtmf``).
+    ///     role, target, whisper_target: As for :meth:`conference_join`.
+    ///     profile: The media profile whose offer half shapes the seat (its
+    ///         interface and codec flags). ``ws_uri``, ``ws_tee``,
+    ///         ``record_call`` or a DSP knob raise ``ValueError``.
+    ///
+    /// Example:
+    ///     sdp = await rtpengine.conference_offer(room, tag)
+    ///     call_id = b2bua.originate(target, sdp=sdp, ...)
+    ///     # @b2bua.on_answer(call, reply):
+    ///     await rtpengine.conference_answer(room, (call.call_id, tag), reply.body)
+    #[pyo3(signature = (conference_id, seat_tag, role="talker", target=None, whisper_target=None, profile=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn conference_offer<'py>(
+        &self,
+        python: Python<'py>,
+        conference_id: String,
+        seat_tag: String,
+        role: &str,
+        target: Option<String>,
+        whisper_target: Option<String>,
+        profile: Option<&str>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        conference::offer(
+            self,
+            python,
+            conference_id,
+            seat_tag,
+            role,
+            target,
+            whisper_target,
+            profile,
+        )
+    }
+
+    /// Seat a participant the focus called out, on its answer to the offer
+    /// :meth:`conference_offer` made. ``call`` names the seat: the
+    /// ``(call_id, seat_tag)`` pair of the call that carried the offer (its
+    /// teardown, ``rtpengine.delete(call)``, then leaves the room), or that
+    /// ``Call``. ``answer_sdp`` is the participant's answer (``str`` or
+    /// ``bytes``, e.g. ``reply.body`` in ``@b2bua.on_answer``). Raises
+    /// ``ValueError`` when the engine refuses the answer (a codec it did not
+    /// offer, a rejected stream, no offer pending); the offered seat is freed.
+    #[pyo3(signature = (conference_id, call, answer_sdp))]
+    fn conference_answer<'py>(
+        &self,
+        python: Python<'py>,
+        conference_id: String,
+        call: &Bound<'py, PyAny>,
+        answer_sdp: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        conference::answer(self, python, conference_id, call, answer_sdp)
     }
 
     /// Play a ``file``, ``blob`` or ``tone`` into a room, heard by every seat,

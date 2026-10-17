@@ -24,6 +24,10 @@ pub(crate) const OFFER: &str = "v=0\r\no=- 1 1 IN IP4 198.51.100.10\r\ns=-\r\nc=
 /// codec.
 pub(crate) const ANSWER: &str = "v=0\r\no=- 2 2 IN IP4 203.0.113.7\r\ns=-\r\nc=IN IP4 203.0.113.7\r\nt=0 0\r\nm=audio 40000 RTP/AVP 0 101\r\na=sendrecv\r\n";
 
+/// What the engine offers a seat the focus calls out: its own address, the
+/// codecs the room can mix.
+pub(crate) const SEAT_OFFER: &str = "v=0\r\no=- 3 3 IN IP4 203.0.113.7\r\ns=-\r\nc=IN IP4 203.0.113.7\r\nt=0 0\r\nm=audio 40002 RTP/AVP 9 0 8 101\r\na=rtpmap:9 G722/8000\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:8 PCMA/8000\r\na=rtpmap:101 telephone-event/8000\r\na=sendrecv\r\na=rtcp-mux\r\n";
+
 /// The engine's accept for every verb: `ok`, with an SDP for a join (and an
 /// `answer_local`) and a play id for a play, as the documented responses carry.
 pub(crate) fn accept(request: &Value) -> Value {
@@ -32,6 +36,9 @@ pub(crate) fn accept(request: &Value) -> Value {
             json!({"result": "ok", "sdp": ANSWER, "to_tag": request["from_tag"]})
         }
         Some("answer_local") => json!({"result": "ok", "sdp": ANSWER}),
+        Some("conference_offer") => {
+            json!({"result": "ok", "sdp": SEAT_OFFER, "to_tag": request["from_tag"]})
+        }
         Some("conference_play") => json!({"result": "ok", "play_id": 12, "duration_ms": 800}),
         _ => json!({"result": "ok"}),
     }

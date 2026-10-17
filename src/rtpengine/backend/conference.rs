@@ -167,6 +167,55 @@ impl MediaBackend {
         }
     }
 
+    /// Unlink two rooms.
+    pub async fn conference_unbridge(
+        &self,
+        conference_id_a: &str,
+        conference_id_b: &str,
+    ) -> Result<(), RtpEngineError> {
+        match self {
+            Self::SiphonRtp(set) => {
+                set.conference_unbridge(conference_id_a, conference_id_b)
+                    .await
+            }
+            Self::RtpEngine(_) | Self::RtpProxy(_) => Err(self.no_mixer("conference_unbridge")),
+        }
+    }
+
+    /// Offer a seat for a participant the focus calls out, under `seat`'s
+    /// from-tag. Nothing is recorded until the answer seats it: an offered
+    /// seat no answer reaches is the engine's to expire.
+    pub async fn conference_offer(
+        &self,
+        seat: &ConferenceSeat,
+        role: ConferenceRole,
+        flags: &NgFlags,
+    ) -> Result<String, RtpEngineError> {
+        let Self::SiphonRtp(set) = self else {
+            return Err(self.no_mixer("conference_offer"));
+        };
+        set.conference_offer(&seat.conference_id, &seat.from_tag, role, flags)
+            .await
+    }
+
+    /// Seat an offered seat on the participant's answer, recording it under
+    /// the SIP Call-ID of the call that carried the offer, so that call's
+    /// teardown leaves the room.
+    pub async fn conference_answer(
+        &self,
+        call_id: &str,
+        seat: ConferenceSeat,
+        answer_sdp: &str,
+    ) -> Result<(), RtpEngineError> {
+        let Self::SiphonRtp(set) = self else {
+            return Err(self.no_mixer("conference_answer"));
+        };
+        set.conference_answer(&seat.conference_id, &seat.from_tag, answer_sdp)
+            .await?;
+        SEATS.insert(call_id.to_string(), seat);
+        Ok(())
+    }
+
     /// Play audio into a room.
     pub async fn conference_play(
         &self,

@@ -4290,6 +4290,14 @@ class MockRtpEngine:
         """Running room playbacks by ``play_id``."""
         self._conference_play_id = 1
         self._conference_join_sdp: str = "v=0\r\nm=audio 40002 RTP/AVP 0 101\r\na=sendrecv\r\n"
+        self.conference_offers: dict[tuple[str, str], dict[str, Any]] = {}
+        """Seats offered by :meth:`conference_offer` and not yet answered,
+        by ``(conference_id, seat_tag)``."""
+        self._conference_offer_sdp: str = (
+            "v=0\r\nc=IN IP4 203.0.113.7\r\nm=audio 40004 RTP/AVP 0 8 101\r\n"
+            "a=rtpmap:0 PCMU/8000\r\na=rtpmap:8 PCMA/8000\r\n"
+            "a=rtpmap:101 telephone-event/8000\r\na=sendrecv\r\n"
+        )
         self._conference_join_no_codec: bool = False
         self._active_speaker_handlers: list[dict[str, Any]] = []
         self.media_overrides: list[tuple[str, dict[str, Any]]] = []
@@ -5149,8 +5157,17 @@ class MockRtpEngine:
         Returns:
             ``True`` on success.
         """
-        room = self._conference_room(conference_id, "conference_leave")
         call_id, from_tag = self._conference_seat_of(call)
+        if self.conference_offers.pop((conference_id, from_tag), None) is not None:
+            # An offered seat never answered: freed, as the engine frees it.
+            self.media_calls.append({
+                "op": "conference_leave",
+                "conference_id": conference_id,
+                "call_id": call_id,
+                "from_tag": from_tag,
+            })
+            return True
+        room = self._conference_room(conference_id, "conference_leave")
         if from_tag not in room:
             raise RuntimeError(
                 "rtpengine.conference_leave failed: no such conference participant"
@@ -5206,7 +5223,7 @@ class MockRtpEngine:
         ``direction`` is ``"both"`` (default), ``"a_to_b"`` (room A's
         participants are heard in room B) or ``"b_to_a"``. This is what
         merging two conferences is. Both rooms run at 16 kHz while bridged,
-        and siphon-rtp has no verb to unbridge them: a bridge ends with
+        and :meth:`conference_unbridge` unlinks them; a bridge also ends with
         either room.
 
         Returns:
@@ -5231,6 +5248,143 @@ class MockRtpEngine:
             "conference_a": conference_a,
             "conference_b": conference_b,
             "direction": direction,
+        })
+        return True
+
+    async def conference_unbridge(self, conference_a: str, conference_b: str) -> bool:
+        """Unlink two rooms :meth:`conference_bridge` linked, in both
+        directions, whichever way the link was made. Splitting two merged
+        conferences again.
+
+        Returns:
+            ``True`` on success.
+
+        Raises:
+            ValueError: both ids name one room, or one is empty.
+            RuntimeError: the rooms are not linked.
+        """
+        if not conference_a or not conference_b:
+            raise ValueError("rtpengine.conference_unbridge(conference_a/b) is empty")
+        if conference_a == conference_b:
+            raise ValueError(
+                "rtpengine.conference_unbridge unlinks two rooms; both ids name the same one"
+            )
+        pair = {conference_a, conference_b}
+        linked = [bridge for bridge in self.conference_bridges if {bridge[0], bridge[1]} == pair]
+        if not linked:
+            raise RuntimeError(
+                "rtpengine.conference_unbridge failed: the two conferences are not bridged"
+            )
+        self.conference_bridges = [
+            bridge for bridge in self.conference_bridges if bridge not in linked
+        ]
+        self.operations.append(("conference_unbridge", conference_a))
+        self.media_calls.append({
+            "op": "conference_unbridge",
+            "conference_a": conference_a,
+            "conference_b": conference_b,
+        })
+        return True
+
+    async def conference_offer(
+        self,
+        conference_id: str,
+        seat_tag: str,
+        role: str = "talker",
+        target: Optional[str] = None,
+        whisper_target: Optional[str] = None,
+        profile: Optional[str] = None,
+    ) -> str:
+        """Offer a seat for a participant the focus calls out, and resolve to
+        the offer SDP for the INVITE (RFC 4579 section 5.5, a REFER to the
+        focus naming a user; TS 24.605 CONF).
+
+        The engine allocates the seat and offers every codec the room can mix
+        (plain RTP/AVP; a profile's codec flags edit the list). The seat joins
+        the room on :meth:`conference_answer`; one never answered is freed by
+        :meth:`conference_leave` with ``(call_id, seat_tag)`` or by the
+        engine's setup timeout.
+
+        Args:
+            conference_id: The room; created on its first seat.
+            seat_tag: The seat's name, a SIP token unique in the room. The
+                engine names the seat by it where it names a joined seat by
+                its From-tag (:meth:`on_active_speaker`, a room's DTMF).
+            role: The seat's role, as for :meth:`conference_join`.
+            target: As for :meth:`conference_join`.
+            whisper_target: As for :meth:`conference_join`.
+            profile: The RTP profile whose offer half shapes the seat.
+
+        Returns:
+            The offer SDP as ``str``.
+
+        Example::
+
+            sdp = await rtpengine.conference_offer(room, tag)
+            call_id = b2bua.originate(target, sdp=sdp)
+            # in @b2bua.on_answer(call, reply):
+            await rtpengine.conference_answer(room, (call.call_id, tag), reply.body)
+        """
+        if not conference_id:
+            raise ValueError("rtpengine.conference_offer(conference_id) is empty")
+        if not seat_tag or not re.fullmatch(r"[A-Za-z0-9.!%*_+`'~-]+", seat_tag):
+            raise ValueError(
+                f"rtpengine.conference_offer(seat_tag) must be a SIP token (a From-tag), got {seat_tag!r}"
+            )
+        seat_role = self._conference_role(role, target, whisper_target)
+        key = (conference_id, seat_tag)
+        if key in self.conference_offers or seat_tag in self.conferences.get(conference_id, {}):
+            raise RuntimeError(
+                f"rtpengine.conference_offer failed: {seat_tag} is already offered or seated"
+            )
+        self.conference_offers[key] = {"profile": profile, **seat_role}
+        self.operations.append(("conference_offer", conference_id))
+        self.media_calls.append({
+            "op": "conference_offer",
+            "conference_id": conference_id,
+            "from_tag": seat_tag,
+            "profile": profile,
+            **seat_role,
+        })
+        return self._conference_offer_sdp
+
+    async def conference_answer(
+        self, conference_id: str, call: Any, answer_sdp: Union[str, bytes]
+    ) -> bool:
+        """Seat a participant the focus called out, on its answer to the offer
+        :meth:`conference_offer` made.
+
+        ``call`` names the seat: the ``(call_id, seat_tag)`` pair of the call
+        that carried the offer (its teardown, ``rtpengine.delete(call)``, then
+        leaves the room). ``answer_sdp`` is the participant's answer, e.g.
+        ``reply.body`` in ``@b2bua.on_answer``.
+
+        Returns:
+            ``True`` once seated.
+
+        Raises:
+            ValueError: no offer is pending for the seat, the answer is empty,
+                or the engine refused it (a codec it did not offer, a
+                rejected stream); the offered seat is freed.
+        """
+        if not conference_id:
+            raise ValueError("rtpengine.conference_answer(conference_id) is empty")
+        call_id, seat_tag = self._conference_seat_of(call)
+        if not answer_sdp:
+            raise ValueError("rtpengine.conference_answer needs the participant's answer SDP")
+        offered = self.conference_offers.pop((conference_id, seat_tag), None)
+        if offered is None:
+            raise ValueError(
+                "rtpengine.conference_answer refused: no offer is pending for this seat"
+            )
+        room = self.conferences.setdefault(conference_id, {})
+        room[seat_tag] = {"call_id": call_id, **offered}
+        self.operations.append(("conference_answer", conference_id))
+        self.media_calls.append({
+            "op": "conference_answer",
+            "conference_id": conference_id,
+            "call_id": call_id,
+            "from_tag": seat_tag,
         })
         return True
 
@@ -6357,6 +6511,7 @@ class MockRtpEngine:
         self._answer_local_no_codec = False
         self.conferences.clear()
         self.conference_bridges.clear()
+        self.conference_offers.clear()
         self.conference_plays.clear()
         self._conference_join_no_codec = False
 

@@ -2316,6 +2316,11 @@
         "kind": "method_descriptor",
         "sig": "($self, target)"
       },
+      "conference_answer": {
+        "doc": "Seat a participant the focus called out, on its answer to the offer",
+        "kind": "method_descriptor",
+        "sig": "($self, conference_id, call, answer_sdp)"
+      },
       "conference_bridge": {
         "doc": "Link two live rooms: ``direction`` ``\"both\"``, ``\"a_to_b\"`` (room A is",
         "kind": "method_descriptor",
@@ -2330,6 +2335,11 @@
         "doc": "Free a call's seat; the room ends with its last seat. ``call`` is a",
         "kind": "method_descriptor",
         "sig": "($self, conference_id, call)"
+      },
+      "conference_offer": {
+        "doc": "Offer a seat for a participant the focus calls out (``siphon-rtp``",
+        "kind": "method_descriptor",
+        "sig": "($self, conference_id, seat_tag, role=\"talker\", target=None, whisper_target=None, profile=None)"
       },
       "conference_play": {
         "doc": "Play a ``file``, ``blob`` or ``tone`` into a room, heard by every seat,",
@@ -2350,6 +2360,11 @@
         "doc": "Stop one room playback by ``play_id``, or all of them.",
         "kind": "method_descriptor",
         "sig": "($self, conference_id, play_id=None)"
+      },
+      "conference_unbridge": {
+        "doc": "Unlink two rooms a :meth:`conference_bridge` linked, in both",
+        "kind": "method_descriptor",
+        "sig": "($self, conference_a, conference_b)"
       },
       "delete": {
         "doc": "Send an RTPEngine `delete` command to tear down the media session.",

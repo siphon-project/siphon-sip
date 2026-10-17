@@ -149,7 +149,56 @@ async def merge(room_a, room_b):
     # await rtpengine.conference_bridge(room_a, room_b, direction="a_to_b")
 ```
 
-The engine has no verb to unbridge; a bridge ends with either room.
+`rtpengine.conference_unbridge(room_a, room_b)` splits them again, whichever
+way the link was made; a link also ends with either room.
+
+## Calling a participant in
+
+To add someone who has not dialled in (RFC 4579 §5.5, a REFER to the focus
+naming a user; TS 24.605 CONF) the focus places the call, so the engine is the
+offerer: `conference_offer` allocates a new seat and resolves to the offer for
+the INVITE, and `conference_answer` seats the participant on its answer. A seat
+is named by a tag the script chooses.
+
+```python
+import uuid
+
+from siphon import b2bua, rtpengine
+
+DIALLING = {}   # Call-ID of the INVITE the focus sent -> (room, seat tag)
+
+
+async def call_in(room, target, replaces=None, referred_by=None):
+    tag = uuid.uuid4().hex[:10]
+    sdp = await rtpengine.conference_offer(room, tag)
+    headers = {}
+    if replaces:
+        headers["Replaces"] = replaces          # RFC 3891: take a call over
+    if referred_by:
+        headers["Referred-By"] = referred_by    # RFC 3892
+    call_id = b2bua.originate(target, sdp=sdp, headers=headers)
+    DIALLING[call_id] = (room, tag)
+
+
+@b2bua.on_answer
+async def answered(call, reply):
+    room, tag = DIALLING.pop(call.call_id, (None, None))
+    if room is not None:
+        await rtpengine.conference_answer(room, (call.call_id, tag), reply.body)
+
+
+@b2bua.on_failure
+async def not_answered(call, code, reason):
+    room, tag = DIALLING.pop(call.call_id, (None, None))
+    if room is not None:
+        await rtpengine.conference_leave(room, (call.call_id, tag))
+```
+
+The offer lists every codec the room can mix in that engine build (a profile's
+codec flags edit it) as plain RTP/AVP; an answer has to pick one of them.
+`rtpengine.delete(call)` on the answered call leaves the room, as for a joined
+seat. An offer nobody answers is freed by `conference_leave` or by the engine's
+setup timeout.
 
 ## Playing into a room
 

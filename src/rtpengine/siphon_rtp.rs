@@ -514,6 +514,7 @@ impl SiphonRtpClient {
                 max_duration_ms: request.max_duration_ms,
                 silence_ms: request.silence_ms,
                 path: request.path.map(str::to_string),
+                bitrate_bps: None, // an Opus setting, refused on a wav recording
             })
             .await?;
         match result {
