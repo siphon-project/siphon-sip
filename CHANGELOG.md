@@ -13,6 +13,8 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
+## [1.14.0] — 2026-10-17
+
 ### Added
 
 - **Control plane: a `dial` or `route` target can carry its own route set.** A
