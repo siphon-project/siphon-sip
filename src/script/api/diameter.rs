@@ -1139,7 +1139,7 @@ impl PyDiameter {
     ///     has the keys the HSS filled in: ``item_number`` (int), ``scheme``
     ///     (str), ``authenticate``, ``authorization``, ``confidentiality_key``
     ///     and ``integrity_key`` (bytes), and for SIP Digest ``digest_realm``,
-    ///     ``digest_algorithm``, ``digest_qop`` and ``digest_ha1`` (str).
+    ///     ``digest_algorithm``, ``digest_qop``, ``digest_ha1`` and ``alternate_digest_*`` (str).
     ///     ``None`` if no Diameter peer is connected or the request failed.
     ///
     /// Raises:

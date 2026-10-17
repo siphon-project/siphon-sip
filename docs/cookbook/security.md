@@ -369,6 +369,13 @@ stops it de-registering someone else's IMPU. The S-CSCF takes the header on the
 P-CSCF's word, so only use `verify_integrity_protected` behind a P-CSCF that
 stamps every REGISTER.
 
+A client that is not an IMS UE (a softphone with a password) registers with
+SIP Digest instead. Its P-CSCF sets up no SA and writes the SIP Digest values
+with `auth.set_integrity_protected`, and the S-CSCF's
+`auth.require_ims_digest` then asks the HSS for H(A1) rather than an AKA
+vector. See the mechanism table in the
+[security reference](../reference/security.md#ims-aka-or-sip-digest).
+
 When SIPhon terminates the Gm hop as a B2BUA, an INVITE that requires `sec-agree`
 (in `Require` or `Proxy-Require`) is checked before your script runs, per RFC 3329
 §2.3.1. It is answered `494 Security Agreement Required` unless it arrived on a

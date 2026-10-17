@@ -307,7 +307,8 @@ harness.reset()
 | `require_proxy_digest(request, realm) -> bool` | 407 challenge |
 | `require_digest(request, realm) -> bool` | Alias for www_digest |
 | `verify_digest(request, realm) -> bool` | Verify without challenge |
-| `require_ims_digest(request, realm, server_name) -> bool` | IMS AKA via Diameter Cx MAR |
+| `require_ims_digest(request, realm, server_name, nonce_lifetime) -> bool` | IMS AKA or SIP Digest via Diameter Cx MAR, selected from the REGISTER; `server_name` is the S-CSCF's SIP URI |
+| `set_integrity_protected(request, value) -> bool` | P-CSCF: set or remove `integrity-protected` (SIP Digest values) |
 | `require_aka_digest(request, realm) -> bool` | Local Milenage AKA (no HSS) |
 
 ### B2BUA call

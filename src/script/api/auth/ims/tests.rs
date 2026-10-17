@@ -2,9 +2,12 @@ use super::super::base64_encode;
 use super::super::test_support::{
     aka_first_authorization, register, requested_authorization, requested_scheme, text, Hss,
     MockHss, Outcome, Registration, AUTN, AUTS, IMS_AKA, PRIVATE_IDENTITY, PUBLIC_IDENTITY, REALM,
-    SCSCF,
+    SCSCF, SIP_DIGEST, UNKNOWN,
 };
 use super::*;
+use crate::sip::builder::SipMessageBuilder;
+use crate::sip::message::Method;
+use crate::sip::uri::SipUri;
 
 /// The nonce of the challenge built from a vector whose RAND is `fill`.
 fn nonce(fill: u8) -> String {
@@ -40,6 +43,109 @@ fn assert_aka_challenge(outcome: &Outcome, rand_fill: u8) {
     );
 }
 
+/// A REGISTER as the selection reads it, with these headers on top of the
+/// mandatory ones.
+fn selected(headers: &[(&str, &str)]) -> Mechanism {
+    let mut builder = SipMessageBuilder::new()
+        .request(Method::Register, SipUri::new(REALM.to_string()))
+        .via("SIP/2.0/UDP 192.0.2.10:5060;branch=z9hG4bK-select".to_string())
+        .to(format!("<{PUBLIC_IDENTITY}>"))
+        .from(format!("<{PUBLIC_IDENTITY}>;tag=select"))
+        .call_id("select@192.0.2.10".to_string())
+        .cseq("1 REGISTER".to_string())
+        .content_length(0);
+    for (name, value) in headers {
+        builder = builder.header(name, (*value).to_string());
+    }
+    Register::read(&builder.build().unwrap(), Some(SCSCF)).mechanism()
+}
+
+fn with_integrity_protected(value: &str) -> Mechanism {
+    let header = format!(
+        "Digest username=\"{PRIVATE_IDENTITY}\", realm=\"{REALM}\", nonce=\"\", \
+         uri=\"sip:{REALM}\", response=\"\", integrity-protected=\"{value}\""
+    );
+    selected(&[("Authorization", &header)])
+}
+
+const ASK_SIP_DIGEST: Mechanism = Mechanism::SipDigest { scheme: SIP_DIGEST };
+const ASK_UNKNOWN: Mechanism = Mechanism::SipDigest { scheme: UNKNOWN };
+
+/// TS 24.229 clause 5.4.1.1 items 1 and 2: "integrity-protected" "no" is the
+/// initial registration with IMS-AKA and "yes" the protected one.
+#[test]
+fn integrity_protected_yes_and_no_select_ims_aka() {
+    assert_eq!(with_integrity_protected("no"), Mechanism::ImsAka);
+    assert_eq!(with_integrity_protected("yes"), Mechanism::ImsAka);
+}
+
+/// Item 10: "tls-pending", "tls-yes", "ip-assoc-pending" or "ip-assoc-yes" is
+/// the protected registration for SIP digest.
+#[test]
+fn the_four_sip_digest_values_select_sip_digest() {
+    for value in ["tls-pending", "tls-yes", "ip-assoc-pending", "ip-assoc-yes"] {
+        assert_eq!(with_integrity_protected(value), ASK_SIP_DIGEST, "{value}");
+    }
+}
+
+/// Item 9: an Authorization header without the parameter has the S-CSCF
+/// "send an authentication request for the user to the HSS indicating that
+/// the authentication scheme is unknown".
+#[test]
+fn authorization_without_integrity_protected_leaves_it_to_the_subscriber_server() {
+    let header = format!("Digest username=\"{PRIVATE_IDENTITY}\", realm=\"{REALM}\"");
+    assert_eq!(selected(&[("Authorization", &header)]), ASK_UNKNOWN);
+}
+
+/// Items 2A and 11 name mechanisms this S-CSCF does not implement, and a
+/// value outside table 7.2A.2 names none. Each is refused.
+#[test]
+fn mechanisms_that_are_not_implemented_are_refused() {
+    for value in ["tls-connected", "auth-done", "maybe"] {
+        assert!(
+            matches!(with_integrity_protected(value), Mechanism::Refused(_)),
+            "{value}"
+        );
+    }
+}
+
+/// Item 5: without an Authorization header, an access "different from 3GPP
+/// and containing the "network provided" header field parameter" is SIP
+/// digest for an S-CSCF that supports it and not NASS-IMS bundled
+/// authentication. Items 4, 6, 7 and 8 need a mechanism this S-CSCF does not
+/// support, so every other REGISTER without the header is left to the
+/// subscriber server.
+#[test]
+fn without_authorization_the_access_network_decides() {
+    for access in [
+        "IEEE-802.11;i-wlan-node-id=000000000001;network-provided",
+        "xDSL;dsl-location=\"example\";network-provided",
+        "3GPP2-1X;network-provided",
+        // What the UE says first, what the network says second.
+        "3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=0010100010000001, IEEE-802.11;network-provided",
+    ] {
+        assert_eq!(
+            selected(&[("P-Access-Network-Info", access)]),
+            ASK_SIP_DIGEST,
+            "{access}"
+        );
+    }
+    for access in [
+        // A 3GPP access the network vouches for.
+        "3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=0010100010000001;network-provided",
+        "3GPP-NR-FDD;network-provided",
+        // Only the UE's word for it.
+        "IEEE-802.11;i-wlan-node-id=000000000001",
+    ] {
+        assert_eq!(
+            selected(&[("P-Access-Network-Info", access)]),
+            ASK_UNKNOWN,
+            "{access}"
+        );
+    }
+    assert_eq!(selected(&[]), ASK_UNKNOWN);
+}
+
 /// TS 29.229 clause 6.3.9: "Digest-AKAv1-MD5" indicates the IMS-AKA
 /// scheme and "SIP Digest" a different one, which a subscriber server
 /// following TS 29.228 clause 6.3.1 refuses for an IMS-AKA subscriber.
@@ -58,7 +164,9 @@ async fn the_first_register_asks_for_an_ims_aka_vector() {
 }
 
 /// A response that does not verify consumes the vector, and the fresh one
-/// is asked for under the same scheme as the first.
+/// is asked for under the same scheme as the first, whatever the P-CSCF
+/// wrote into "integrity-protected": the nonce is one of an IMS-AKA
+/// challenge.
 #[tokio::test]
 async fn a_failed_response_is_challenged_again_with_an_ims_aka_vector() {
     let hss = MockHss::start(Hss::Conformant, 0x18).await;
@@ -179,7 +287,7 @@ async fn the_mar_names_the_identities_of_to_and_authorization_and_the_scscf() {
 /// the port number and the URI parameters.
 #[tokio::test]
 async fn without_authorization_the_private_identity_is_derived_from_to() {
-    let hss = MockHss::start(Hss::Conformant, 0x58).await;
+    let hss = MockHss::start(Hss::SipDigest { alternate: false }, 0x58).await;
     let mut registration = Registration::new(None);
     registration.to = format!("<sip:001010000000001@{REALM}:5060;transport=tcp>;tag=to");
 
@@ -191,7 +299,7 @@ async fn without_authorization_the_private_identity_is_derived_from_to() {
         Some(format!("sip:001010000000001@{REALM}:5060;transport=tcp").as_str())
     );
     assert_eq!(text(&requests[0], "User-Name"), Some(PRIVATE_IDENTITY));
-    assert_aka_challenge(&outcome, 0x58);
+    assert_eq!(outcome.reply, Some(401));
 }
 
 /// A script that passes no `server_name=` sends the MAR without

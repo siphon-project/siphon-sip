@@ -11,14 +11,6 @@ use crate::diameter::dictionary::{self, avp};
 
 /// SIP-Item-Number (TS 29.229 clause 6.3.14).
 const SIP_ITEM_NUMBER: u32 = 613;
-/// SIP-Digest-Authenticate (TS 29.229 clause 6.3.36), grouped, vendor 10415.
-const SIP_DIGEST_AUTHENTICATE: u32 = 635;
-/// The members of SIP-Digest-Authenticate, which TS 29.229 clauses 6.3.37 to
-/// 6.3.41 take from RFC 4740 with no vendor.
-const DIGEST_REALM: u32 = 104;
-const DIGEST_QOP: u32 = 110;
-const DIGEST_ALGORITHM: u32 = 111;
-const DIGEST_HA1: u32 = 121;
 
 /// The User-Name of a UAR: the private identity the script gave, or the one
 /// TS 24.229 clause 5.3.1.2 derives from the public identity.
@@ -204,44 +196,112 @@ fn member(children: &[Avp], code: u32, vendor: u32) -> Option<&Avp> {
         .find(|child| child.code == code && child.vendor == vendor)
 }
 
-/// One SIP-Auth-Data-Item as a dict. A key is absent when the HSS did not
-/// send the AVP.
-fn auth_item_dict<'py>(python: Python<'py>, item: &Avp) -> PyResult<Bound<'py, PyDict>> {
-    let children = members(item);
-    let dict = PyDict::new(python);
-    let vendor = dictionary::VENDOR_3GPP;
-    if let Some(number) = member(&children, SIP_ITEM_NUMBER, vendor).and_then(Avp::as_u32) {
-        dict.set_item("item_number", number)?;
-    }
-    if let Some(scheme) =
-        member(&children, avp::SIP_AUTHENTICATION_SCHEME, vendor).and_then(Avp::as_str)
-    {
-        dict.set_item("scheme", scheme)?;
-    }
-    for (key, code) in [
-        ("authenticate", avp::SIP_AUTHENTICATE),
-        ("authorization", avp::SIP_AUTHORIZATION),
-        ("confidentiality_key", avp::CONFIDENTIALITY_KEY),
-        ("integrity_key", avp::INTEGRITY_KEY),
-    ] {
-        if let Some(bytes) = member(&children, code, vendor).and_then(Avp::raw_bytes) {
-            dict.set_item(key, PyBytes::new(python, bytes))?;
+/// One SIP-Auth-Data-Item of a Multimedia-Auth-Answer (TS 29.228 tables
+/// 6.3.5 and 6.3.7). A member is `None` when the HSS did not send the AVP.
+#[derive(Default)]
+pub(crate) struct AuthItem {
+    pub(crate) item_number: Option<u32>,
+    pub(crate) scheme: Option<String>,
+    /// SIP-Authenticate: RAND then AUTN.
+    pub(crate) authenticate: Option<Vec<u8>>,
+    /// SIP-Authorization: XRES.
+    pub(crate) authorization: Option<Vec<u8>>,
+    pub(crate) confidentiality_key: Option<Vec<u8>>,
+    pub(crate) integrity_key: Option<Vec<u8>>,
+    /// Whether the item carries SIP-Digest-Authenticate, the group the
+    /// members below come from. The digest attributes are the RFC 5090 ones
+    /// with no vendor, the alternate pair is 3GPP (TS 29.229 table 6.3.0.1).
+    pub(crate) has_digest: bool,
+    pub(crate) digest_realm: Option<String>,
+    pub(crate) digest_algorithm: Option<String>,
+    pub(crate) digest_qop: Option<String>,
+    pub(crate) digest_ha1: Option<String>,
+    pub(crate) alternate_digest_algorithm: Option<String>,
+    pub(crate) alternate_digest_ha1: Option<String>,
+}
+
+impl AuthItem {
+    fn read(item: &Avp) -> Self {
+        let children = members(item);
+        let vendor = dictionary::VENDOR_3GPP;
+        let octets = |code: u32| {
+            member(&children, code, vendor)
+                .and_then(Avp::raw_bytes)
+                .map(<[u8]>::to_vec)
+        };
+        let digest = member(&children, avp::SIP_DIGEST_AUTHENTICATE, vendor).map(members);
+        let text = |code: u32, vendor: u32| {
+            digest
+                .as_deref()
+                .and_then(|members| member(members, code, vendor))
+                .and_then(Avp::as_str)
+        };
+        Self {
+            item_number: member(&children, SIP_ITEM_NUMBER, vendor).and_then(Avp::as_u32),
+            scheme: member(&children, avp::SIP_AUTHENTICATION_SCHEME, vendor).and_then(Avp::as_str),
+            authenticate: octets(avp::SIP_AUTHENTICATE),
+            authorization: octets(avp::SIP_AUTHORIZATION),
+            confidentiality_key: octets(avp::CONFIDENTIALITY_KEY),
+            integrity_key: octets(avp::INTEGRITY_KEY),
+            has_digest: digest.is_some(),
+            digest_realm: text(avp::DIGEST_REALM, 0),
+            digest_algorithm: text(avp::DIGEST_ALGORITHM, 0),
+            digest_qop: text(avp::DIGEST_QOP, 0),
+            digest_ha1: text(avp::DIGEST_HA1, 0),
+            alternate_digest_algorithm: text(avp::ALTERNATE_DIGEST_ALGORITHM, vendor),
+            alternate_digest_ha1: text(avp::ALTERNATE_DIGEST_HA1, vendor),
         }
     }
-    if let Some(digest) = member(&children, SIP_DIGEST_AUTHENTICATE, vendor) {
-        let digest_children = members(digest);
-        for (key, code) in [
-            ("digest_realm", DIGEST_REALM),
-            ("digest_algorithm", DIGEST_ALGORITHM),
-            ("digest_qop", DIGEST_QOP),
-            ("digest_ha1", DIGEST_HA1),
+
+    /// As a dict: a key is absent when the HSS did not send the AVP.
+    fn dict<'py>(&self, python: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let dict = PyDict::new(python);
+        if let Some(number) = self.item_number {
+            dict.set_item("item_number", number)?;
+        }
+        if let Some(scheme) = &self.scheme {
+            dict.set_item("scheme", scheme)?;
+        }
+        for (key, bytes) in [
+            ("authenticate", &self.authenticate),
+            ("authorization", &self.authorization),
+            ("confidentiality_key", &self.confidentiality_key),
+            ("integrity_key", &self.integrity_key),
         ] {
-            if let Some(text) = member(&digest_children, code, 0).and_then(Avp::as_str) {
+            if let Some(bytes) = bytes {
+                dict.set_item(key, PyBytes::new(python, bytes))?;
+            }
+        }
+        for (key, text) in [
+            ("digest_realm", &self.digest_realm),
+            ("digest_algorithm", &self.digest_algorithm),
+            ("digest_qop", &self.digest_qop),
+            ("digest_ha1", &self.digest_ha1),
+            (
+                "alternate_digest_algorithm",
+                &self.alternate_digest_algorithm,
+            ),
+            ("alternate_digest_ha1", &self.alternate_digest_ha1),
+        ] {
+            if let Some(text) = text {
                 dict.set_item(key, text)?;
             }
         }
+        Ok(dict)
     }
-    Ok(dict)
+}
+
+/// The SIP-Auth-Data-Items of a Multimedia-Auth-Answer, in the order the HSS
+/// sent them.
+pub(crate) fn auth_items(answer: &DiameterMessage) -> Vec<AuthItem> {
+    DiameterMsg::from_wire(&answer.raw)
+        .map(|message| {
+            message
+                .find_all(avp::SIP_AUTH_DATA_ITEM, dictionary::VENDOR_3GPP)
+                .map(AuthItem::read)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// The dict `diameter.cx_mar` resolves to: `result_code`, and `auth_items`,
@@ -255,22 +315,20 @@ pub(crate) fn mar_answer_dict(
         "result_code",
         crate::diameter::rx::extract_result_code(&answer.avps),
     )?;
-    dict.set_item("auth_items", auth_items(python, answer)?)?;
+    dict.set_item("auth_items", auth_item_dicts(python, answer)?)?;
     Ok(dict.unbind())
 }
 
 /// One dict per SIP-Auth-Data-Item of a Multimedia-Auth-Answer, in the order
 /// the HSS sent them. Cx and Zh answers carry the same item (TS 29.109 clause
 /// 6.3: "The AVPs defined in 3GPP TS 29.229 [3] ... are used as they are").
-pub(crate) fn auth_items<'py>(
+pub(crate) fn auth_item_dicts<'py>(
     python: Python<'py>,
     answer: &DiameterMessage,
 ) -> PyResult<Bound<'py, PyList>> {
     let items = PyList::empty(python);
-    if let Ok(message) = DiameterMsg::from_wire(&answer.raw) {
-        for item in message.find_all(avp::SIP_AUTH_DATA_ITEM, dictionary::VENDOR_3GPP) {
-            items.append(auth_item_dict(python, item)?)?;
-        }
+    for item in auth_items(answer) {
+        items.append(item.dict(python)?)?;
     }
     Ok(items)
 }
@@ -374,6 +432,12 @@ mod tests {
             AVP_FLAG_MANDATORY,
             b"0123456789abcdef0123456789abcdef",
         ));
+        // TS 29.229 clauses 6.3.72 and 6.3.73: 662 and 663, vendor 10415.
+        digest.extend_from_slice(&encode_avp_utf8_3gpp(662, "SHA-256"));
+        digest.extend_from_slice(&encode_avp_utf8_3gpp(
+            663,
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        ));
         let mut sip_digest = Vec::new();
         sip_digest.extend_from_slice(&encode_avp_u32_3gpp(613, 2));
         sip_digest.extend_from_slice(&encode_avp_utf8_3gpp(608, "SIP Digest"));
@@ -429,6 +493,11 @@ mod tests {
             assert_eq!(
                 text(&digest, "digest_ha1"),
                 "0123456789abcdef0123456789abcdef"
+            );
+            assert_eq!(text(&digest, "alternate_digest_algorithm"), "SHA-256");
+            assert_eq!(
+                text(&digest, "alternate_digest_ha1"),
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
             );
             assert!(!digest.contains("authenticate").unwrap());
         });

@@ -1944,6 +1944,98 @@ mod tests {
         });
     }
 
+    /// What a subscriber-server script writes to answer a Multimedia-Auth-Request
+    /// for a SIP Digest subscriber (TS 29.228 tables 6.3.4, 6.3.5 and 6.3.7):
+    /// every AVP by its name, the grouped ones as lists of children.
+    const SIP_DIGEST_ANSWER_SOURCE: &str = "def build(request):\n    answer = request.answer(2001)\n    answer.set_avp('User-Name', '001010000000001@ims.mnc001.mcc001.3gppnetwork.org')\n    answer.set_avp('Public-Identity', 'sip:001010000000001@ims.mnc001.mcc001.3gppnetwork.org')\n    answer.set_avp('SIP-Number-Auth-Items', 1)\n    answer.insert_avp('SIP-Auth-Data-Item', [\n        ('SIP-Authentication-Scheme', 'SIP Digest'),\n        ('SIP-Digest-Authenticate', [\n            ('Digest-Realm', 'digest.example.org'),\n            ('Digest-Algorithm', 'MD5'),\n            ('Digest-QoP', 'auth'),\n            ('Digest-HA1', '3d78807defe7de2157e2b0b6573a855f'),\n            ('Alternate-Digest-Algorithm', 'SHA-256'),\n            ('Alternate-Digest-HA1', '7987c64c30e25f1b74be53f966b49b90f2808aa92faf9a00262392d7b4794232'),\n        ]),\n    ])\n    return answer\n";
+
+    fn sip_digest_answer(py: Python<'_>) -> Vec<u8> {
+        let script = pyo3::types::PyModule::from_code(
+            py,
+            &std::ffi::CString::new(SIP_DIGEST_ANSWER_SOURCE).unwrap(),
+            &std::ffi::CString::new("_sip_digest_answer.py").unwrap(),
+            &std::ffi::CString::new("_sip_digest_answer").unwrap(),
+        )
+        .unwrap();
+        let request = Py::new(py, py_multimedia_auth_request()).unwrap();
+        let answer = script.getattr("build").unwrap().call1((request,)).unwrap();
+        let answer = answer.cast::<PyDiameterAnswer>().unwrap().borrow();
+        answer.to_wire().unwrap()
+    }
+
+    /// TS 29.229 table 6.3.0.1: the digest attributes inside
+    /// SIP-Digest-Authenticate are the RFC 5090 ones, codes 104, 110, 111 and
+    /// 121 without a vendor, and the grouped AVP and the alternate pair are
+    /// 3GPP ones, 635, 662 and 663. A script reaches all of them by name.
+    #[test]
+    fn a_script_builds_a_sip_digest_answer_by_avp_name() {
+        pyo3::Python::initialize();
+        let wire = Python::attach(sip_digest_answer);
+
+        let msg = DiameterMsg::from_wire(&wire).unwrap();
+        let item = msg
+            .find_all(dictionary::avp::SIP_AUTH_DATA_ITEM, dictionary::VENDOR_3GPP)
+            .next()
+            .expect("SIP-Auth-Data-Item");
+        let AvpData::Grouped(children) = &item.value else {
+            panic!("SIP-Auth-Data-Item must be grouped");
+        };
+        let digest = children
+            .iter()
+            .find(|child| (child.code, child.vendor) == (635, dictionary::VENDOR_3GPP))
+            .expect("SIP-Digest-Authenticate, 635 of vendor 10415");
+        let AvpData::Grouped(members) = &digest.value else {
+            panic!("SIP-Digest-Authenticate must be grouped");
+        };
+        let found: Vec<(u32, u32)> = members
+            .iter()
+            .map(|member| (member.code, member.vendor))
+            .collect();
+        assert_eq!(
+            found,
+            vec![
+                (104, 0),
+                (111, 0),
+                (110, 0),
+                (121, 0),
+                (662, dictionary::VENDOR_3GPP),
+                (663, dictionary::VENDOR_3GPP),
+            ]
+        );
+
+        // And the decoder of the client side names them back.
+        let decoded = crate::diameter::codec::decode_diameter(&wire).unwrap();
+        let digest = &decoded.avps["SIP-Auth-Data-Item"]["SIP-Digest-Authenticate"];
+        assert_eq!(digest["Digest-Realm"], "digest.example.org");
+        assert_eq!(digest["Digest-QoP"], "auth");
+        assert_eq!(digest["Digest-Algorithm"], "MD5");
+        assert_eq!(digest["Digest-HA1"], "3d78807defe7de2157e2b0b6573a855f");
+        assert_eq!(digest["Alternate-Digest-Algorithm"], "SHA-256");
+    }
+
+    /// Emit that answer as hex for `scripts/validate_diameter_cx_requests.sh`
+    /// to feed to tshark, which reads SIP-Digest-Authenticate with its own
+    /// dictionary.
+    #[test]
+    fn emit_sip_digest_answer_for_external_dissection() {
+        let Ok(directory) = std::env::var("SIPHON_CX_REQUESTS_HEX_DIR") else {
+            // Nothing to do in an ordinary test run.
+            return;
+        };
+        pyo3::Python::initialize();
+        let wire = Python::attach(sip_digest_answer);
+        let mut dump = String::new();
+        for (offset, chunk) in wire.chunks(16).enumerate() {
+            dump.push_str(&format!("{:06x}", offset * 16));
+            for byte in chunk {
+                dump.push_str(&format!(" {byte:02x}"));
+            }
+            dump.push('\n');
+        }
+        std::fs::write(format!("{directory}/maa_sip_digest_script.hex"), dump)
+            .expect("hex dump must be writable");
+    }
+
     /// Emit a Multimedia-Auth-Answer with two SIP-Auth-Data-Item AVPs as hex
     /// for [`scripts/validate_diameter_answer_avps.sh`] to feed to tshark.
     ///

@@ -240,7 +240,13 @@ async fn liveness_flow_failure_network_dereg(
     };
     for (aor, contact) in removed {
         if contact.flow_token.is_some() {
-            send_liveness_network_dereg(&context, &aor, &contact.uri.to_string()).await;
+            send_liveness_network_dereg(
+                &context,
+                &aor,
+                &contact.uri.to_string(),
+                contact.auth_user.as_deref(),
+            )
+            .await;
         }
     }
 }
@@ -634,7 +640,7 @@ pub(super) async fn liveness_dereg_contact(
     //    Service-Route is still available).  Only for a proxy-cached binding
     //    (one carrying a flow_token) under network-dereg mode.
     if network_dereg {
-        send_liveness_network_dereg(context, aor, &contact_uri).await;
+        send_liveness_network_dereg(context, aor, &contact_uri, contact.auth_user.as_deref()).await;
     }
 
     // 2. Drop the local binding — emits Deregistered → on_change cascade.
@@ -664,6 +670,7 @@ pub(super) async fn send_liveness_network_dereg(
     context: &LivenessDeregCtx,
     aor: &str,
     contact_uri: &str,
+    private_identity: Option<&str>,
 ) {
     let routes = context.registrar.service_routes(aor);
     let top_route = match routes.first() {
@@ -699,13 +706,14 @@ pub(super) async fn send_liveness_network_dereg(
         }
     };
 
-    let register = match build_dereg_register(aor, contact_uri, &routes, destination) {
-        Ok(message) => message,
-        Err(error) => {
-            warn!(aor = %aor, %error, "registrar liveness: failed to build de-REGISTER");
-            return;
-        }
-    };
+    let register =
+        match build_dereg_register(aor, contact_uri, private_identity, &routes, destination) {
+            Ok(message) => message,
+            Err(error) => {
+                warn!(aor = %aor, %error, "registrar liveness: failed to build de-REGISTER");
+                return;
+            }
+        };
     info!(aor = %aor, %destination, "registrar liveness: sending network de-REGISTER (Expires: 0) to S-CSCF");
     context
         .uac_sender
@@ -733,6 +741,7 @@ pub(super) fn parse_route_uri(route: &str) -> Option<SipUri> {
 pub(super) fn build_dereg_register(
     aor: &str,
     contact_uri: &str,
+    private_identity: Option<&str>,
     routes: &[String],
     destination: SocketAddr,
 ) -> Result<SipMessage, String> {
@@ -743,23 +752,27 @@ pub(super) fn build_dereg_register(
         .unwrap_or_else(|| destination.ip().to_string());
     // The S-CSCF skips the IMS-AKA re-challenge on a re-/de-REGISTER only when
     // it arrives integrity-protected (TS 24.229 §5.4.1.2.2): a real UE de-REG
-    // rides the IPsec SA and the P-CSCF stamps `integrity-protected="ip-assoc-yes"`
-    // (§5.2.6.3).  This synthesized de-REGISTER asserts that same protection on
-    // the (now-torn-down) SA's behalf — the P-CSCF *was* the entity holding the
+    // rides the IPsec SA and the P-CSCF stamps `integrity-protected="yes"`
+    // (§5.2.2.1, table 7.2A.2; `auth.stamp_integrity_protected`).  This
+    // synthesized de-REGISTER asserts that same protection on the
+    // (now-torn-down) SA's behalf — the P-CSCF *was* the entity holding the
     // SA — so it must carry the marker; without it the S-CSCF challenges
     // (401/403) and the de-registration never completes (no SAR
     // User-Deregistration, no AS 3rd-party de-REGISTER, no terminated NOTIFY).
-    // The S-CSCF keys the skip on the marker substring + `is_registered(pub_id)`
-    // (pub_id from To/From, not the Authorization username), so the digest
-    // fields are placeholders.
-    let username = aor_uri
-        .as_ref()
-        .and_then(|uri| uri.user.clone())
-        .map(|user| format!("{user}@{domain}"))
-        .unwrap_or_else(|| domain.clone());
+    // `yes` and not `ip-assoc-yes`: the latter is SIP Digest without TLS
+    // (§5.4.1.1 item 10), which `require_ims_digest` would authenticate as
+    // such. The username is the private identity the binding recorded, or
+    // one derived from the AoR.
+    let username = private_identity.map(str::to_string).unwrap_or_else(|| {
+        aor_uri
+            .as_ref()
+            .and_then(|uri| uri.user.clone())
+            .map(|user| format!("{user}@{domain}"))
+            .unwrap_or_else(|| domain.clone())
+    });
     let authorization = format!(
         "Digest username=\"{username}\", realm=\"{domain}\", nonce=\"\", \
-         uri=\"sip:{domain}\", response=\"\", integrity-protected=\"ip-assoc-yes\""
+         uri=\"sip:{domain}\", response=\"\", integrity-protected=\"yes\""
     );
     let request_uri = SipUri::new(domain);
 

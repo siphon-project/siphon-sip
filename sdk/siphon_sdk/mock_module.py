@@ -2085,6 +2085,25 @@ def _with_integrity_protected(value: str, protected: str) -> str:
     return f"{scheme} {', '.join(kept)}"
 
 
+# The values of ``integrity-protected`` (3GPP TS 24.229 table 7.2A.2).
+_INTEGRITY_PROTECTED_VALUES = (
+    "yes", "no", "tls-pending", "tls-yes", "ip-assoc-pending", "ip-assoc-yes",
+    "auth-done", "tls-connected",
+)
+
+
+def _without_integrity_protected(value: str) -> str:
+    """``value`` without any ``integrity-protected`` parameter."""
+    scheme, params = _auth_scheme_and_params(value)
+    kept = [
+        token.strip()
+        for token in _split_outside_quotes(params, ",")
+        if token.strip()
+        and token.partition("=")[0].strip().lower() != "integrity-protected"
+    ]
+    return f"{scheme} {', '.join(kept)}" if kept else scheme
+
+
 def _replace_header_values(request: Any, name: str, values: list[str]) -> None:
     """Replace every value of a request header, keeping its spelling."""
     headers = getattr(request, "_headers", None)
@@ -3411,24 +3430,59 @@ class MockAuth:
 
     def require_ims_digest(self, request: Any,
                           realm: Optional[str] = None,
-                          server_name: Optional[str] = None) -> bool:
-        """IMS AKA authentication via Diameter Cx MAR/MAA.
+                          server_name: Optional[str] = None,
+                          nonce_lifetime: int = 3600) -> bool:
+        """IMS authentication via Diameter Cx MAR/MAA: IMS AKA or SIP Digest.
 
         Sends a Multimedia-Auth-Request to the HSS the Cx route names and uses
-        the returned authentication vector to challenge or verify the UE. The
-        mock has no HSS, so it checks the request against the test's users.
+        what it returns to challenge or verify the UE. The mock has no HSS, so
+        it checks the request against the test's users.
 
-        In siphon the request names the public user identity of the To header
-        (TS 24.229 clause 5.4.1.2.1), and the answer has to be an IMS AKA
-        vector: a successful answer in another scheme, or without
-        SIP-Authenticate or SIP-Authorization, is not turned into a challenge.
+        In siphon the mechanism is the one TS 24.229 clause 5.4.1.1 selects
+        from the REGISTER:
+
+        - ``integrity-protected`` ``yes`` or ``no``: asks the HSS for
+          ``Digest-AKAv1-MD5`` and challenges with ``AKAv1-MD5``;
+        - ``tls-pending``, ``tls-yes``, ``ip-assoc-pending`` or
+          ``ip-assoc-yes``: asks for ``SIP Digest`` and challenges with
+          ``Digest``;
+        - an Authorization header without the parameter: asks for ``Unknown``
+          and challenges in the scheme the HSS answers with;
+        - no Authorization header and a P-Access-Network-Info with
+          ``network-provided`` naming a non-3GPP access: ``SIP Digest``;
+        - no Authorization header otherwise: ``Unknown``;
+        - ``tls-connected`` or ``auth-done``: refused with 403, the HSS is
+          not asked.
+
+        A REGISTER that answers a challenge siphon issued is handled under the
+        mechanism of that challenge. So IMS AKA needs a P-CSCF that calls
+        :meth:`stamp_integrity_protected` on every REGISTER.
+
+        For SIP Digest (TS 33.203 Annex N) the HSS returns H(A1) and the 401
+        carries one ``Digest`` challenge per algorithm it sent a hash for,
+        SHA-256 before MD5, with a nonce siphon generates, the realm of the
+        HSS and ``qop="auth"``. A response that verifies sets
+        ``Authentication-Info`` (``qop``, ``rspauth``, ``cnonce``, ``nc``) on
+        the 200. The nonce then stays valid for ``nonce_lifetime`` seconds as
+        long as each REGISTER raises ``nc``. A response that does not verify
+        is refused with 403. One under an expired nonce, or with an ``nc``
+        that is not higher than the last, is challenged again with
+        ``stale=true``.
+
+        The request names the public user identity of the To header (TS
+        24.229 clause 5.4.1.2.1). A successful answer in another scheme than
+        the one named, or without the vector or the H(A1) of its scheme, is
+        not turned into a challenge.
 
         Args:
             request: The REGISTER.
-            realm: Digest realm of the challenge.
+            realm: Digest realm of an IMS AKA challenge. A SIP Digest
+                challenge carries the realm of the HSS.
             server_name: This S-CSCF's SIP URI, sent as Server-Name. The MAR
                 requires it (TS 29.229 clause 6.1.7), so pass the URI given to
                 ``diameter.cx_sar``. The mock accepts and ignores it.
+            nonce_lifetime: Seconds a SIP Digest nonce stays valid after a
+                response under it verified. The mock accepts and ignores it.
 
         Takes a ``Request`` only — unlike :meth:`require_www_digest` /
         :meth:`require_proxy_digest`, IMS and AKA digest are REGISTER-time
@@ -3437,12 +3491,12 @@ class MockAuth:
 
         Returns:
             ``True`` if credentials are valid, ``False`` if a 401 challenge was
-            sent or the HSS refused and a 403 was set.
+            sent or a 403 was set.
 
         Raises:
             RuntimeError: in siphon, when no Diameter connection is available,
                 the request got no answer, or the answer carries another
-                authentication scheme than the one asked for or no vector to
+                authentication scheme than the one asked for or nothing to
                 challenge with.
         """
 
@@ -3538,6 +3592,57 @@ class MockAuth:
             stamped.append(_with_integrity_protected(value, protected))
         _replace_header_values(request, "Authorization", stamped)
         return decisions[0]
+
+    def set_integrity_protected(self, request: Any, value: Optional[str]) -> bool:
+        """P-CSCF: set or remove ``integrity-protected`` in every ``Authorization`` header.
+
+        For the mechanisms :meth:`stamp_integrity_protected` does not decide.
+        With SIP Digest the P-CSCF writes (3GPP TS 24.229 clauses 5.2.2.3 and
+        5.2.2.4):
+
+        - nothing on a REGISTER without a challenge response that maps to no
+          IP association or TLS session: pass ``None``, which also removes
+          what the UE sent (clause 5.2.2.1 step 4B);
+        - ``"ip-assoc-pending"`` on one with a challenge response and no IP
+          association yet, ``"ip-assoc-yes"`` on one that maps to an existing
+          IP association;
+        - ``"tls-pending"`` and ``"tls-yes"`` for the same two cases over TLS.
+
+        Example::
+
+            authorization = request.get_header("Authorization") or ""
+            answered = 'response="' in authorization and 'response=""' not in authorization
+            auth.set_integrity_protected(
+                request, "ip-assoc-pending" if answered else None)
+            request.relay()
+
+        Args:
+            request: The REGISTER ``Request``.
+            value: One of ``"yes"``, ``"no"``, ``"tls-pending"``, ``"tls-yes"``,
+                ``"ip-assoc-pending"``, ``"ip-assoc-yes"``, ``"auth-done"``,
+                ``"tls-connected"``, or ``None`` to remove the parameter.
+
+        Returns:
+            ``False``, changing nothing, when the request has no
+            ``Authorization`` header; ``True`` otherwise.
+
+        Raises:
+            ValueError: for a value table 7.2A.2 does not list.
+        """
+        self._reject_call_target(request, "set_integrity_protected")
+        if value is not None and value not in _INTEGRITY_PROTECTED_VALUES:
+            raise ValueError(
+                "integrity-protected is one of "
+                f"{', '.join(_INTEGRITY_PROTECTED_VALUES)}, not \"{value}\"")
+        values = _header_values(request, "Authorization")
+        if not values:
+            return False
+        if value is None:
+            rewritten = [_without_integrity_protected(item) for item in values]
+        else:
+            rewritten = [_with_integrity_protected(item, value) for item in values]
+        _replace_header_values(request, "Authorization", rewritten)
+        return True
 
     def verify_integrity_protected(self, request: Any) -> bool:
         """S-CSCF: accept a protected re-/de-REGISTER without challenging it again.

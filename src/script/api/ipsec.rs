@@ -1248,7 +1248,7 @@ pub fn strip_ck_ik(value: &str) -> (String, Option<CkIkPair>) {
 /// double-quoted strings as opaque (commas inside quotes are kept).
 /// The result is a list of slices including their original interior
 /// whitespace; callers trim as needed.
-fn split_top_level_commas(value: &str) -> Vec<&str> {
+pub(crate) fn split_top_level_commas(value: &str) -> Vec<&str> {
     let bytes = value.as_bytes();
     let mut out = Vec::new();
     let mut start = 0usize;
@@ -1288,7 +1288,7 @@ fn unquote(raw: &str) -> &str {
 }
 
 /// `("Digest", "username=…, realm=…")` from an auth header value.
-fn auth_scheme_and_params(value: &str) -> (&str, &str) {
+pub(crate) fn auth_scheme_and_params(value: &str) -> (&str, &str) {
     let value = value.trim_start();
     value.split_once(char::is_whitespace).unwrap_or((value, ""))
 }
