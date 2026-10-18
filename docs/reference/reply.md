@@ -14,6 +14,24 @@ def observe(request, reply):
     reply.relay()
 ```
 
+An `@proxy.on_failure` handler decides what the caller gets: `reply.relay()`
+forwards the failure, `request.relay()` / `request.fork()` tries elsewhere,
+and `request.reply(code, reason)` answers the caller itself instead, with the
+headers and body it set through `request.set_reply_header()` /
+`request.set_reply_body()`, as from `@proxy.on_request`. That reply must be a
+final failure (300-699); anything else is logged and the failure goes on. A
+handler that does none of these drops the failure silently.
+
+```python
+@proxy.on_failure
+def failed(request, reply):
+    if reply.status_code == 408:          # the next hop never answered
+        request.set_reply_body(BODY, "application/3gpp-ims+xml")
+        request.reply(504, "Server Time-out")
+    else:
+        reply.relay()
+```
+
 `@proxy.on_reply("INVITE")` / `@proxy.on_reply("INVITE|UPDATE")` narrows a
 handler to responses to those request methods, the same filter shape as
 `@proxy.on_request`. Filtered and unfiltered handlers all run, in registration

@@ -33,8 +33,12 @@ pub(super) struct FailureRetarget {
 pub(super) struct FailureHandlerOutcome {
     /// The error response, as the handlers left it.
     pub(super) response: SipMessage,
-    /// Whether a handler called `reply.relay()` — false means "suppress".
+    /// Whether a handler called `reply.relay()`, or answered the caller with
+    /// `request.reply()` — false means "suppress".
     pub(super) forwarded: bool,
+    /// Set when `response` is the reply a handler made with
+    /// `request.reply()` rather than the failure: its status code.
+    pub(super) script_reply: Option<u16>,
     /// Set when a handler re-targeted the request instead.
     pub(super) retarget: Option<FailureRetarget>,
 }
@@ -62,6 +66,7 @@ pub(super) fn run_proxy_failure_handlers(
         return FailureHandlerOutcome {
             response,
             forwarded: true,
+            script_reply: None,
             retarget: None,
         };
     }
@@ -90,19 +95,39 @@ pub(super) fn run_proxy_failure_handlers(
         on_failure_callback,
         send_via_transport,
         send_via_target,
+        reply_headers,
+        reply_body,
     ) = Python::attach(|python| {
         let py_reply = match Py::new(python, reply) {
             Ok(obj) => obj,
             Err(error) => {
                 error!("failed to create PyReply for on_failure: {error}");
-                return (true, RequestAction::None, None, None, None, None);
+                return (
+                    true,
+                    RequestAction::None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Vec::new(),
+                    None,
+                );
             }
         };
         let py_req = match Py::new(python, py_request) {
             Ok(obj) => obj,
             Err(error) => {
                 error!("failed to create PyRequest for on_failure: {error}");
-                return (true, RequestAction::None, None, None, None, None);
+                return (
+                    true,
+                    RequestAction::None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Vec::new(),
+                    None,
+                );
             }
         };
 
@@ -113,13 +138,31 @@ pub(super) fn run_proxy_failure_handlers(
                     if handler.is_async {
                         if let Err(error) = run_coroutine(python, &ret) {
                             record_script_error("async on_failure", &error);
-                            return (true, RequestAction::None, None, None, None, None);
+                            return (
+                                true,
+                                RequestAction::None,
+                                None,
+                                None,
+                                None,
+                                None,
+                                Vec::new(),
+                                None,
+                            );
                         }
                     }
                 }
                 Err(error) => {
                     record_script_error("on_failure", &error);
-                    return (true, RequestAction::None, None, None, None, None);
+                    return (
+                        true,
+                        RequestAction::None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        Vec::new(),
+                        None,
+                    );
                 }
             }
         }
@@ -133,6 +176,8 @@ pub(super) fn run_proxy_failure_handlers(
             borrowed.take_on_failure_callback(),
             borrowed.via_transport_override().map(|s| s.to_string()),
             borrowed.via_target_override().map(|s| s.to_string()),
+            borrowed.take_reply_headers(),
+            borrowed.take_reply_body(),
         )
     });
 
@@ -141,9 +186,42 @@ pub(super) fn run_proxy_failure_handlers(
         Err(arc) => arc.lock().unwrap_or_else(|e| e.into_inner()).clone(),
     };
 
-    // Only Relay/Fork is a retarget.  `RequestAction::Reply` is the script
-    // answering the UAC itself — that lands on the normal reply path below via
-    // the response the handler mutated; `None` is the documented silent drop.
+    // `request.reply()`: the handler answers the UAC itself, on the original
+    // server transaction, with the headers and body it set, as from
+    // `@proxy.on_request`.  A provisional or 2xx is no answer to a failed
+    // relay; the failure goes on instead, with an error, and is not dropped.
+    let mut forwarded = forwarded;
+    let mut response = response;
+    let mut script_reply = None;
+    if let RequestAction::Reply { code, reason, .. } = &action {
+        if (300..700).contains(code) {
+            let request = request_arc.lock().unwrap_or_else(|e| e.into_inner());
+            let mut reply = build_response(
+                &request,
+                *code,
+                reason,
+                state.server_header.as_deref(),
+                &reply_headers,
+            );
+            if let Some((body, content_type)) = &reply_body {
+                reply.headers.set("Content-Type", content_type.clone());
+                reply.headers.set("Content-Length", body.len().to_string());
+                reply.body = body.clone();
+            }
+            response = reply;
+            forwarded = true;
+            script_reply = Some(*code);
+        } else {
+            error!(
+                code = *code,
+                "on_failure: request.reply() needs a final failure (300-699); \
+                 forwarding the failure instead"
+            );
+            forwarded = true;
+        }
+    }
+
+    // Only Relay/Fork is a retarget; `None` is the documented silent drop.
     let retarget = match action {
         RequestAction::Relay { .. } | RequestAction::Fork { .. } => {
             let request = match Arc::try_unwrap(request_arc) {
@@ -165,6 +243,7 @@ pub(super) fn run_proxy_failure_handlers(
     FailureHandlerOutcome {
         response,
         forwarded,
+        script_reply,
         retarget,
     }
 }

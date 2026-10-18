@@ -13,9 +13,12 @@ use super::ipsec_lifecycle;
 pub(super) fn handle_response(
     inbound: InboundMessage,
     mut message: SipMessage,
-    status_code: u16,
+    mut status_code: u16,
     state: &DispatcherState,
 ) {
+    // The response an `@proxy.on_failure` handler made with `request.reply()`
+    // replaces the failure, status code and all.
+    let mut script_replied = false;
     // RFC 3261 §17.1.1.2 / §17.1.2.2: the first response on a branch ends
     // retransmission of the request that provoked it — a provisional moves an
     // INVITE client transaction Calling -> Proceeding and cancels Timer A, and
@@ -889,6 +892,10 @@ pub(super) fn handle_response(
                     return;
                 }
                 message = outcome.response;
+                if let Some(code) = outcome.script_reply {
+                    status_code = code;
+                    script_replied = true;
+                }
             }
 
             // --- Fork aggregator decision ---
@@ -1053,6 +1060,9 @@ pub(super) fn handle_response(
                             state.session_store.remove_by_server_key(&server_key);
                             return;
                         }
+                        // The handler's own reply, when it made one, is what the
+                        // caller gets and what the records say.
+                        let best_code = outcome.script_reply.unwrap_or(best_code);
 
                         proxy_dialog_upstream(&outcome.response, best_code, state);
                         // 3GPP TS 33.203 §7.4: the relayed-back response must
@@ -1184,7 +1194,13 @@ pub(super) fn handle_response(
             // `reply.reject(503)`) never reach here — they are not responses
             // this proxy is forwarding on behalf of a branch — so the IMS
             // P-CSCF media-authorization 503 is unaffected.
-            let status_code = downgrade_503_for_upstream(&mut message, status_code, &server_key);
+            // A reply the on_failure handler made itself is its own answer, as
+            // `request.reply()` from on_request is, and keeps its code.
+            let status_code = if script_replied {
+                status_code
+            } else {
+                downgrade_503_for_upstream(&mut message, status_code, &server_key)
+            };
 
             // RFC 3329 §2.3.1: a later Security-Verify must mirror the
             // Security-Server on this 401, so it is recorded on the SA pair it
