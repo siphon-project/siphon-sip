@@ -2612,6 +2612,16 @@
         "kind": "method_descriptor",
         "sig": "($self, target, file=None, blob=None, db_id=None, tone=None, url=None, repeat=None, start_ms=None, duration_ms=None, gain_decibels=None, to_tag=None)"
       },
+      "read_digits": {
+        "doc": "Collect the digits the caller keys (RFC 4733 telephone-events, as the",
+        "kind": "method_descriptor",
+        "sig": "($self, target, terminators=..., max_digits=None, timeout_ms=5000, inter_digit_timeout_ms=3000)"
+      },
+      "record": {
+        "doc": "Record what the caller says and wait until the file is closed: a dict",
+        "kind": "method_descriptor",
+        "sig": "($self, target, path=None, direction=\"ingress\", channels=\"mono\", max_duration_ms=None, silence_ms=None, timeout_ms=None)"
+      },
       "set_play_gain": {
         "doc": "Retune the playout gain of a playback that is already running \u2014 how a",
         "kind": "method_descriptor",
@@ -2622,10 +2632,20 @@
         "kind": "method_descriptor",
         "sig": "($self, target)"
       },
+      "start_recording": {
+        "doc": "Start recording what the caller says to a file, returning the engine's",
+        "kind": "method_descriptor",
+        "sig": "($self, target, path=None, direction=\"ingress\", channels=\"mono\", max_duration_ms=None, silence_ms=None)"
+      },
       "stop_media": {
         "doc": "Send a `stop media` command \u2014 stop prompt playback on the monologue",
         "kind": "method_descriptor",
         "sig": "($self, target, play_id=None)"
+      },
+      "stop_recording": {
+        "doc": "Stop a recording: the one ``recording_id`` names, or every recording on",
+        "kind": "method_descriptor",
+        "sig": "($self, target, recording_id=None)"
       },
       "subscribe_answer": {
         "doc": "Send a `subscribe answer` \u2014 complete the SDP negotiation for a",
@@ -2651,6 +2671,11 @@
         "doc": "Send an `unsubscribe` command \u2014 tear down a subscription created via",
         "kind": "method_descriptor",
         "sig": "($self, call_id, from_tag, to_tag)"
+      },
+      "wait_recording": {
+        "doc": "Wait until a recording :meth:`start_recording` started has ended and",
+        "kind": "method_descriptor",
+        "sig": "($self, target, recording_id, timeout_ms=3600000)"
       }
     },
     "SAHandle": {
