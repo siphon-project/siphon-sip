@@ -96,6 +96,8 @@ mod answer_after_preview_tests;
 #[cfg(test)]
 mod b2bua_conclude_once_tests;
 #[cfg(test)]
+mod b2bua_invite_filter_tests;
+#[cfg(test)]
 mod b2bua_invite_retransmission_tests;
 #[cfg(test)]
 mod b_leg_2xx_ack_tests;

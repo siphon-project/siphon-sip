@@ -658,7 +658,12 @@ pub fn handle_b2bua_invite(inbound: InboundMessage, message: SipMessage, state: 
         inbound.client_or_hop_transport().as_scheme(),
     );
 
-    // Invoke @b2bua.on_invite
+    // Invoke @b2bua.on_invite: the unfiltered handlers and the filtered ones
+    // whose pattern matches the Request-URI.
+    let request_uri = match &message.start_line {
+        StartLine::Request(request_line) => request_line.request_uri.to_string(),
+        StartLine::Response(_) => String::new(),
+    };
     let message_arc = Arc::new(std::sync::Mutex::new(message));
     let py_call = PyCall::new(
         call_id.clone(),
@@ -669,7 +674,7 @@ pub fn handle_b2bua_invite(inbound: InboundMessage, message: SipMessage, state: 
     .with_flow(py_flow_from_inbound(&inbound));
 
     let engine_state = state.engine.state();
-    let handlers = engine_state.handlers_for(&HandlerKind::B2buaInvite);
+    let handlers = engine_state.b2bua_invite_handlers(&request_uri);
 
     // From here until the handler returns, a CANCEL defers `@b2bua.on_cancel`
     // to this path instead of running it beside the handler.

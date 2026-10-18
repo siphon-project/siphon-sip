@@ -14,6 +14,7 @@
 //! this module wants.
 
 use super::engine::{HandlerEntry, HandlerKind, ScriptState};
+use crate::sip::message::{SipMessage, StartLine};
 
 /// A pipe-separated method filter (`"INVITE|SUBSCRIBE"`) matches `method`;
 /// no filter matches every method.
@@ -285,7 +286,7 @@ impl ScriptState {
         self.handlers.iter().any(|h| {
             matches!(
                 h.kind,
-                HandlerKind::B2buaInvite
+                HandlerKind::B2buaInvite { .. }
                     | HandlerKind::B2buaAnswer
                     | HandlerKind::B2buaFailure
                     | HandlerKind::B2buaBye
@@ -296,6 +297,69 @@ impl ScriptState {
                     | HandlerKind::B2buaRouteFailure
             )
         })
+    }
+
+    /// The `@b2bua.on_invite` handlers an INVITE for `request_uri` runs, in
+    /// registration order: every unfiltered one, and every filtered one whose
+    /// pattern matches `request_uri`.
+    pub fn b2bua_invite_handlers(&self, request_uri: &str) -> Vec<&HandlerEntry> {
+        self.handlers
+            .iter()
+            .filter(|h| match &h.kind {
+                HandlerKind::B2buaInvite {
+                    request_uri: filter,
+                } => filter
+                    .as_ref()
+                    .is_none_or(|filter| filter.matches(request_uri)),
+                _ => false,
+            })
+            .collect()
+    }
+
+    /// Whether the script's B2BUA takes an INVITE that matches no B2BUA call,
+    /// rather than the proxy path. `message` is the INVITE.
+    ///
+    /// Without B2BUA handlers it does not. With them it takes every such
+    /// INVITE, as it always has, unless every `@b2bua.on_invite` handler
+    /// carries a `request_uri` filter. Then it takes an initial INVITE (no
+    /// To-tag) whose Request-URI a filter matches, and nothing else: an
+    /// in-dialog INVITE that is no B2BUA call's belongs to a dialog the proxy
+    /// path set up.
+    ///
+    /// `control.inbound` takes every INVITE whatever the script says; the
+    /// dispatcher asks that first.
+    pub fn b2bua_claims_invite(&self, message: &SipMessage) -> bool {
+        if !self.has_b2bua_handlers() {
+            return false;
+        }
+        let mut filters = Vec::new();
+        for handler in &self.handlers {
+            if let HandlerKind::B2buaInvite { request_uri } = &handler.kind {
+                match request_uri {
+                    Some(filter) => filters.push(filter),
+                    None => return true,
+                }
+            }
+        }
+        if filters.is_empty() {
+            return true;
+        }
+        let in_dialog = message
+            .headers
+            .get("To")
+            .or_else(|| message.headers.get("t"))
+            .is_some_and(|to| {
+                to.split(';')
+                    .any(|parameter| parameter.trim().starts_with("tag="))
+            });
+        if in_dialog {
+            return false;
+        }
+        let StartLine::Request(request_line) = &message.start_line else {
+            return false;
+        };
+        let request_uri = request_line.request_uri.to_string();
+        filters.iter().any(|filter| filter.matches(&request_uri))
     }
 
     /// Return all timer handlers.
@@ -311,5 +375,104 @@ impl ScriptState {
         self.handlers
             .iter()
             .any(|h| matches!(h.kind, HandlerKind::TimerEvery { .. }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use pyo3::prelude::*;
+
+    use super::*;
+    use crate::script::engine::RequestUriFilter;
+    use crate::sip::parser::parse_sip_message_bytes;
+
+    fn entry(python: Python<'_>, kind: HandlerKind) -> HandlerEntry {
+        HandlerEntry {
+            kind,
+            callable: python.None(),
+            is_async: false,
+            options: None,
+        }
+    }
+
+    fn on_invite(pattern: Option<&str>) -> HandlerKind {
+        HandlerKind::B2buaInvite {
+            request_uri: pattern.map(|pattern| RequestUriFilter::new(pattern).unwrap()),
+        }
+    }
+
+    fn state(kinds: Vec<HandlerKind>) -> ScriptState {
+        Python::initialize();
+        Python::attach(|python| ScriptState {
+            source_path: PathBuf::from("<test>"),
+            handlers: kinds.into_iter().map(|kind| entry(python, kind)).collect(),
+        })
+    }
+
+    fn invite(request_uri: &str, to_tag: Option<&str>) -> SipMessage {
+        let to = match to_tag {
+            Some(tag) => format!("<sip:bob@example.com>;tag={tag}"),
+            None => "<sip:bob@example.com>".to_string(),
+        };
+        let raw = format!(
+            "INVITE {request_uri} SIP/2.0\r\n\
+             Via: SIP/2.0/UDP 192.0.2.10:5060;branch=z9hG4bK-1\r\n\
+             From: <sip:alice@example.com>;tag=a\r\n\
+             To: {to}\r\n\
+             Call-ID: claim@192.0.2.10\r\n\
+             CSeq: 1 INVITE\r\n\
+             Content-Length: 0\r\n\r\n"
+        );
+        parse_sip_message_bytes(raw.as_bytes()).unwrap()
+    }
+
+    #[test]
+    fn without_b2bua_handlers_nothing_is_claimed() {
+        let state = state(vec![HandlerKind::ProxyRequest(None)]);
+        assert!(!state.b2bua_claims_invite(&invite("sip:transfer@example.com", None)));
+    }
+
+    #[test]
+    fn an_unfiltered_on_invite_claims_every_invite() {
+        let state = state(vec![on_invite(Some("^sip:transfer@")), on_invite(None)]);
+        assert!(state.b2bua_claims_invite(&invite("sip:bob@example.com", None)));
+        assert!(state.b2bua_claims_invite(&invite("sip:bob@example.com", Some("b"))));
+    }
+
+    #[test]
+    fn b2bua_handlers_without_on_invite_still_claim_every_invite() {
+        let state = state(vec![HandlerKind::B2buaBye]);
+        assert!(state.b2bua_claims_invite(&invite("sip:bob@example.com", None)));
+    }
+
+    #[test]
+    fn filtered_handlers_claim_only_the_initial_invites_they_match() {
+        let state = state(vec![
+            on_invite(Some("^sip:transfer@")),
+            on_invite(Some("ssn=")),
+            HandlerKind::B2buaBye,
+        ]);
+        assert!(state.b2bua_claims_invite(&invite("sip:transfer@example.com", None)));
+        // Searched, not anchored: a parameter anywhere in the URI matches.
+        assert!(state.b2bua_claims_invite(&invite("sip:x@example.com;ssn=1", None)));
+        assert!(!state.b2bua_claims_invite(&invite("sip:bob@example.com", None)));
+        // In-dialog and no B2BUA call's: a dialog the proxy path set up.
+        assert!(!state.b2bua_claims_invite(&invite("sip:transfer@example.com", Some("b"))));
+    }
+
+    #[test]
+    fn a_claimed_invite_runs_the_matching_and_unfiltered_handlers() {
+        let state = state(vec![
+            on_invite(Some("^sip:transfer@")),
+            on_invite(None),
+            on_invite(Some("^sip:other@")),
+        ]);
+        let selected = state.b2bua_invite_handlers("sip:transfer@example.com");
+        assert_eq!(selected.len(), 2);
+        assert_eq!(selected[0].kind, on_invite(Some("^sip:transfer@")));
+        assert_eq!(selected[1].kind, on_invite(None));
+        assert_eq!(state.b2bua_invite_handlers("sip:bob@example.com").len(), 1);
     }
 }

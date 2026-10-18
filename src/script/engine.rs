@@ -63,8 +63,13 @@ pub enum HandlerKind {
     /// original INVITE so a script can release per-call resources
     /// (Diameter Rx/N5 QoS, rtpengine media) that no BYE will ever clear.
     ProxyCancel,
-    /// `@b2bua.on_invite`
-    B2buaInvite,
+    /// `@b2bua.on_invite`, or `@b2bua.on_invite(request_uri=r"...")`: with a
+    /// filter, the handler takes only the initial INVITEs whose Request-URI it
+    /// matches, and when every `on_invite` handler is filtered the INVITEs
+    /// none of them match take the proxy path.
+    B2buaInvite {
+        request_uri: Option<RequestUriFilter>,
+    },
     /// `@b2bua.on_provisional`: every provisional response relayed to the
     /// caller (101-199), with or without SDP.
     B2buaProvisional,
@@ -237,6 +242,46 @@ pub enum HandlerKind {
     /// `"audit.sink"`); siphon-core does not interpret it. Per-handler
     /// metadata travels alongside on [`HandlerEntry::options`].
     Custom { kind: String },
+}
+
+/// The Request-URI filter of a `@b2bua.on_invite(request_uri=...)` handler: a
+/// regular expression searched for (not anchored) in the Request-URI as it is
+/// serialised. Compiled once, when the script loads.
+///
+/// Compared and hashed by its pattern, so a [`HandlerKind`] carrying one keeps
+/// the equality the handler table relies on.
+#[derive(Debug, Clone)]
+pub struct RequestUriFilter(regex::Regex);
+
+impl RequestUriFilter {
+    /// Compile `pattern`, or say why it is not a valid regular expression.
+    pub fn new(pattern: &str) -> std::result::Result<Self, regex::Error> {
+        regex::Regex::new(pattern).map(Self)
+    }
+
+    /// The pattern the filter was compiled from.
+    pub fn pattern(&self) -> &str {
+        self.0.as_str()
+    }
+
+    /// Whether the filter matches anywhere in `request_uri`.
+    pub fn matches(&self, request_uri: &str) -> bool {
+        self.0.is_match(request_uri)
+    }
+}
+
+impl PartialEq for RequestUriFilter {
+    fn eq(&self, other: &Self) -> bool {
+        self.pattern() == other.pattern()
+    }
+}
+
+impl Eq for RequestUriFilter {}
+
+impl std::hash::Hash for RequestUriFilter {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.pattern().hash(state);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1009,7 +1054,24 @@ fn extract_handlers(_python: Python<'_>, registry: &Bound<'_, PyAny>) -> Result<
             "proxy.on_reply" => HandlerKind::ProxyReply(filter),
             "proxy.on_failure" => HandlerKind::ProxyFailure,
             "proxy.on_cancel" => HandlerKind::ProxyCancel,
-            "b2bua.on_invite" => HandlerKind::B2buaInvite,
+            "b2bua.on_invite" => {
+                let pattern: Option<String> = metadata
+                    .as_ref()
+                    .and_then(|meta| meta.get_item("request_uri").ok())
+                    .filter(|value| !value.is_none())
+                    .map(|value| value.extract())
+                    .transpose()
+                    .map_err(|error| {
+                        SiphonError::Script(format!("b2bua.on_invite request_uri: {error}"))
+                    })?;
+                let request_uri = pattern
+                    .map(|pattern| RequestUriFilter::new(&pattern))
+                    .transpose()
+                    .map_err(|error| {
+                        SiphonError::Script(format!("b2bua.on_invite request_uri: {error}"))
+                    })?;
+                HandlerKind::B2buaInvite { request_uri }
+            }
             "b2bua.on_provisional" => HandlerKind::B2buaProvisional,
             "b2bua.on_early_media" => HandlerKind::B2buaEarlyMedia,
             "b2bua.on_answer" => HandlerKind::B2buaAnswer,
@@ -1830,9 +1892,77 @@ def ended(call, initiator):
 "#;
         let state = compile_temp_script(source).unwrap();
         assert_eq!(state.handlers.len(), 3);
-        assert!(state.handlers_for(&HandlerKind::B2buaInvite).len() == 1);
+        assert!(
+            state
+                .handlers_for(&HandlerKind::B2buaInvite { request_uri: None })
+                .len()
+                == 1
+        );
         assert!(state.handlers_for(&HandlerKind::B2buaAnswer).len() == 1);
         assert!(state.handlers_for(&HandlerKind::B2buaBye).len() == 1);
+    }
+
+    #[test]
+    fn b2bua_on_invite_takes_a_request_uri_filter() {
+        let source = r#"
+from siphon import b2bua
+
+@b2bua.on_invite(request_uri=r"^sip:\+?881")
+def satellite(call):
+    pass
+
+@b2bua.on_invite
+def everything(call):
+    pass
+"#;
+        let state = compile_temp_script(source).unwrap();
+        assert_eq!(state.handlers.len(), 2);
+        let HandlerKind::B2buaInvite {
+            request_uri: Some(filter),
+        } = &state.handlers[0].kind
+        else {
+            panic!("a filtered on_invite: {:?}", state.handlers[0].kind);
+        };
+        assert_eq!(filter.pattern(), r"^sip:\+?881");
+        assert_eq!(
+            state.handlers[1].kind,
+            HandlerKind::B2buaInvite { request_uri: None }
+        );
+        assert!(state.has_b2bua_handlers());
+    }
+
+    #[test]
+    fn b2bua_on_invite_refuses_a_bad_request_uri_filter_at_decoration() {
+        for (filter, error) in [
+            ("\"(\"", "ValueError"),
+            ("\"\"", "ValueError"),
+            ("42", "TypeError"),
+        ] {
+            let source = format!(
+                "from siphon import b2bua\n\n@b2bua.on_invite(request_uri={filter})\ndef h(call):\n    pass\n"
+            );
+            let message = compile_temp_script(&source).unwrap_err().to_string();
+            assert!(message.contains(error), "{filter}: {message}");
+        }
+        // Positional filters are refused: the keyword names what is matched.
+        let message = compile_temp_script(
+            "from siphon import b2bua\n\n@b2bua.on_invite(\"^sip:\")\ndef h(call):\n    pass\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(message.contains("TypeError"), "{message}");
+    }
+
+    #[test]
+    fn request_uri_filter_searches_and_compares_by_pattern() {
+        let filter = RequestUriFilter::new("transfer@").unwrap();
+        assert!(filter.matches("sip:transfer@example.com"));
+        assert!(!filter.matches("sip:bob@example.com"));
+        let anchored = RequestUriFilter::new("^transfer@").unwrap();
+        assert!(!anchored.matches("sip:transfer@example.com"));
+        assert_eq!(filter, RequestUriFilter::new("transfer@").unwrap());
+        assert_ne!(filter, anchored);
+        assert!(RequestUriFilter::new("(").is_err());
     }
 
     #[test]
@@ -2799,7 +2929,10 @@ def new_call(call):
 "#;
         let state = compile_temp_script(source).unwrap();
         assert_eq!(state.handlers.len(), 1);
-        assert_eq!(state.handlers[0].kind, HandlerKind::B2buaInvite);
+        assert_eq!(
+            state.handlers[0].kind,
+            HandlerKind::B2buaInvite { request_uri: None }
+        );
 
         // Build a real SIP INVITE
         let invite = SipMessageBuilder::new()
@@ -3845,7 +3978,10 @@ async def new_call(call):
             state.handlers[0].kind,
             HandlerKind::ProxyRequest(Some("REGISTER".to_owned()))
         );
-        assert_eq!(state.handlers[1].kind, HandlerKind::B2buaInvite);
+        assert_eq!(
+            state.handlers[1].kind,
+            HandlerKind::B2buaInvite { request_uri: None }
+        );
         assert!(state.handlers[1].is_async);
     }
 

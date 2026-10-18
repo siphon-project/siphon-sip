@@ -668,12 +668,40 @@ pub fn ensure_registry(python: Python<'_>) -> Result<()> {
         .map_err(|error| SiphonError::Script(format!("registry module name CString: {error}")))?;
     let module = PyModule::from_code(python, &registry_source, &file_name, &module_cname)
         .map_err(|error| SiphonError::Script(format!("registry module: {error}")))?;
+    // `@b2bua.on_invite(request_uri=...)` checks its pattern with the engine
+    // the dispatcher matches with, so a bad one raises at decoration time.
+    let check = pyo3::types::PyCFunction::new_closure(
+        python,
+        Some(c"check_request_uri_pattern"),
+        None,
+        |args: &Bound<'_, pyo3::types::PyTuple>,
+         _kwargs: Option<&Bound<'_, pyo3::types::PyDict>>|
+         -> PyResult<()> {
+            check_request_uri_pattern(&args.get_item(0)?.extract::<String>()?)
+        },
+    )
+    .map_err(|error| SiphonError::Script(format!("registry pattern check: {error}")))?;
+    module
+        .setattr("check_request_uri_pattern", check)
+        .map_err(|error| SiphonError::Script(format!("registry pattern check: {error}")))?;
 
     modules
         .set_item(registry_name, &module)
         .map_err(|error| SiphonError::Script(format!("sys.modules insert: {error}")))?;
 
     Ok(())
+}
+
+/// Refuse a `@b2bua.on_invite(request_uri=...)` pattern that does not compile,
+/// with `ValueError`.
+fn check_request_uri_pattern(pattern: &str) -> PyResult<()> {
+    crate::script::engine::RequestUriFilter::new(pattern)
+        .map(|_| ())
+        .map_err(|error| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "b2bua.on_invite(request_uri=...) is not a valid regular expression: {error}"
+            ))
+        })
 }
 
 /// Tell the namespaces that keep state across script loads that a new load

@@ -256,6 +256,14 @@ pub(super) fn remember_invite_final(message: &SipMessage, data: &Bytes, state: &
     if !to_an_invite || !b2bua_mode_active(&state.engine.state(), state) {
         return;
     }
+    // An INVITE the proxy path took has an INVITE server transaction of its
+    // own, which answers its retransmissions. Kept here as well, a flood of
+    // proxied rejections would push the B2BUA's responses out past CAPACITY.
+    if crate::transaction::TransactionManager::key_from_message(message)
+        .is_ok_and(|key| state.transaction_manager.contains(&key))
+    {
+        return;
+    }
     let (Some(call_id), Some(via_branch)) = (message.headers.call_id(), top_via_branch(message))
     else {
         return;

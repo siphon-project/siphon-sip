@@ -466,9 +466,14 @@ pub(super) fn handle_request(
             return;
         }
 
-        drop(engine_state);
-        handle_b2bua_invite(inbound, message, state);
-        return;
+        // An INVITE the B2BUA does not take (its `on_invite` handlers are all
+        // filtered by Request-URI and none matches, or it is in-dialog on a
+        // dialog the proxy path set up) goes on down the proxy path below.
+        if b2bua_takes_invite(&engine_state, state, &message) {
+            drop(engine_state);
+            handle_b2bua_invite(inbound, message, state);
+            return;
+        }
     }
     if method == "BYE" && b2bua_mode_active(&engine_state, state) {
         // Check if this BYE belongs to a B2BUA call

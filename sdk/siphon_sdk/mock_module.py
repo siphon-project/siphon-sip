@@ -1735,10 +1735,31 @@ class MockB2bua:
         return True
 
     @staticmethod
-    def on_invite(fn: Callable) -> Callable:
+    def on_invite(fn: Optional[Callable] = None, *,
+                  request_uri: Optional[str] = None) -> Callable:
         """Register handler for new INVITE (new call).
 
         Handler signature: ``(call) -> None``
+
+        Usage::
+
+            @b2bua.on_invite                                  # every new INVITE
+            @b2bua.on_invite(request_uri=r"^sip:transfer@")   # only these
+
+        ``request_uri`` is a regular expression searched for anywhere in the
+        Request-URI as it is serialised (anchor it with ``^`` / ``$`` to match
+        the whole URI). The runtime compiles it with Rust's ``regex`` syntax
+        (no look-around, no backreferences); an invalid pattern raises
+        ``ValueError`` at decoration. The mock checks it with Python's ``re``.
+
+        With no filter, any ``@b2bua.*`` handler makes every new INVITE a
+        B2BUA call. When every ``on_invite`` handler carries a filter, the
+        B2BUA takes only the initial INVITEs (no To-tag) a filter matches and
+        runs only the handlers that match (plus any unfiltered ones). Every
+        other INVITE, an in-dialog one included, takes the proxy path, where
+        ``@proxy.on_request`` sees it as in a script with no B2BUA handlers.
+        ``control.inbound`` still takes every INVITE. Drive both paths with
+        :meth:`siphon_sdk.testing.SipTestHarness.dispatch_invite`.
 
         Not every inbound INVITE reaches this handler. With
         ``b2bua.inbound_limit`` configured, a call past
@@ -1756,9 +1777,36 @@ class MockB2bua:
         Test it with
         :meth:`siphon_sdk.testing.SipTestHarness.set_inbound_limit`.
         """
-        is_async = asyncio.iscoroutinefunction(fn)
-        _registry.register("b2bua.on_invite", None, fn, is_async)
-        return fn
+        if request_uri is not None:
+            if not isinstance(request_uri, str):
+                raise TypeError(
+                    "b2bua.on_invite(request_uri=...) must be a str, "
+                    f"got {type(request_uri).__name__}"
+                )
+            if not request_uri:
+                raise ValueError("b2bua.on_invite(request_uri=...) is empty")
+            try:
+                re.compile(request_uri)
+            except re.error as error:
+                raise ValueError(
+                    "b2bua.on_invite(request_uri=...) is not a valid regular "
+                    f"expression: {error}"
+                ) from None
+        metadata = None if request_uri is None else {"request_uri": request_uri}
+
+        def decorator(handler: Callable) -> Callable:
+            is_async = asyncio.iscoroutinefunction(handler)
+            _registry.register("b2bua.on_invite", None, handler, is_async, metadata)
+            return handler
+
+        if fn is None:
+            return decorator
+        if not callable(fn):
+            raise TypeError(
+                "b2bua.on_invite expects a handler function; pass a filter as "
+                "request_uri=..."
+            )
+        return decorator(fn)
 
     @staticmethod
     def on_provisional(fn: Callable) -> Callable:
@@ -12845,6 +12893,46 @@ def reset() -> None:
 def get_registry() -> _HandlerRegistry:
     """Access the handler registry (test helper)."""
     return _registry
+
+
+def _request_uri_filter(metadata: Optional[dict[str, Any]]) -> Optional[str]:
+    return (metadata or {}).get("request_uri")
+
+
+def b2bua_invite_handlers(request_uri: str) -> list[tuple[Callable, bool]]:
+    """The ``@b2bua.on_invite`` handlers an INVITE for ``request_uri`` runs:
+    every unfiltered one and every filtered one whose pattern matches (test
+    helper, mirrors the runtime)."""
+    selected = []
+    for _method, fn, is_async, metadata in _registry.handlers.get("b2bua.on_invite", []):
+        pattern = _request_uri_filter(metadata)
+        if pattern is None or re.search(pattern, request_uri):
+            selected.append((fn, is_async))
+    return selected
+
+
+def b2bua_claims_invite(request_uri: str, in_dialog: bool = False) -> bool:
+    """Whether the script's B2BUA takes an INVITE that matches no B2BUA call
+    (test helper, mirrors the runtime; ``control.inbound`` is not modelled).
+
+    No ``@b2bua.*`` handler: no. Otherwise yes, unless every ``on_invite``
+    handler carries a ``request_uri`` filter: then only an initial INVITE
+    (``in_dialog`` false) whose Request-URI a filter matches.
+    """
+    if not any(event.startswith("b2bua.") and handlers
+               for event, handlers in _registry.handlers.items()):
+        return False
+    patterns = []
+    for _method, _fn, _is_async, metadata in _registry.handlers.get("b2bua.on_invite", []):
+        pattern = _request_uri_filter(metadata)
+        if pattern is None:
+            return True
+        patterns.append(pattern)
+    if not patterns:
+        return True
+    if in_dialog:
+        return False
+    return any(re.search(pattern, request_uri) for pattern in patterns)
 
 
 def get_numbers() -> MockNumbersNamespace:

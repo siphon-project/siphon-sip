@@ -16,6 +16,42 @@ async def call(call):
     call.dial(call.ruri)
 ```
 
+## Which INVITEs the B2BUA takes
+
+Any registered `@b2bua.*` handler makes every new INVITE a B2BUA call, and
+`@proxy.on_request` never sees one. To be a B2BUA for some INVITEs and a proxy
+for the rest, give each `@b2bua.on_invite` a `request_uri=` filter:
+
+```python
+from siphon import b2bua, proxy
+
+@b2bua.on_invite(request_uri=r"^sip:transfer@")
+async def transfer(call):
+    call.dial(call.ruri)
+
+@proxy.on_request
+def route(request):
+    request.relay()
+```
+
+The filter is a regular expression in Rust `regex` syntax (no look-around or
+backreferences), **searched for** anywhere in the Request-URI as it is
+serialised, so anchor it with `^` and `$` when it should match the whole URI. A
+pattern that does not compile raises `ValueError` at decoration.
+
+- When at least one `on_invite` handler has no filter, every new INVITE is the
+  B2BUA's, as before.
+- When every `on_invite` handler is filtered, the B2BUA takes an initial INVITE
+  (no To-tag) whose Request-URI some filter matches, and runs only the handlers
+  that match. Every other INVITE takes the proxy path exactly as in a script with
+  no B2BUA handlers, and so does an in-dialog INVITE that belongs to no B2BUA call
+  (a re-INVITE on a dialog the proxy set up), whatever its Request-URI.
+- `control.inbound` still takes every INVITE.
+
+The rest of a dialog follows the call it belongs to: an ACK, BYE, CANCEL, UPDATE,
+INFO, PRACK, REFER or NOTIFY reaches the B2BUA when it matches one of its calls
+and the proxy path otherwise.
+
 ## `proxy` namespace
 
 ::: siphon_sdk.mock_module.MockProxy
