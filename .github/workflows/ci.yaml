@@ -683,6 +683,9 @@ jobs:
       - name: SIPp REGISTER test
         run: docker compose -f sipp/docker-compose.yaml run --rm sipp-register
 
+      - name: SIPp REGISTER Contact wildcard (400 unless alone with Expires 0)
+        run: docker compose -f sipp/docker-compose.yaml run --rm sipp-register-wildcard
+
       - name: Proxy REFER passthrough (in-dialog REFER loose-routed once, no loop)
         run: docker compose -f sipp/docker-compose.yaml --profile proxy-refer up --abort-on-container-exit --exit-code-from sipp-proxy-refer-uac sipp-proxy-refer-uac sipp-proxy-refer-uas
 

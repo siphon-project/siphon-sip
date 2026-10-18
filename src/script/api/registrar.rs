@@ -12,7 +12,7 @@ use super::reply::PyReply;
 use super::request::PyRequest;
 use crate::registrar::update::ContactUpdate;
 use crate::registrar::{normalize_aor, reginfo, Contact, Registrar, RegistrarError};
-use crate::sip::headers::nameaddr::NameAddr;
+use crate::sip::headers::nameaddr::{contact_wildcard, ContactWildcard, NameAddr};
 use crate::sip::message::SipMessage;
 
 /// Grace seconds added to the registrar's granted Expires when caching a
@@ -557,6 +557,8 @@ impl PyRegistrar {
     /// - A new binding past `max_contacts`: `503 Service Unavailable` with
     ///   `Retry-After`, the seconds until the soonest held binding expires.
     /// - An AoR that is not a safe storage key: `404 Not Found`.
+    /// - `Contact: *` beside another Contact entry, or with an `Expires` that
+    ///   is absent or not zero: `400 Bad Request` (RFC 3261 §10.3 step 6).
     ///
     /// A refused REGISTER stores nothing: none of its Contacts, and with
     /// `force=True` the existing bindings stay.
@@ -601,9 +603,31 @@ impl PyRegistrar {
             }
         }
 
-        // Check for wildcard Contact: *
-        if let Some(contact_raw) = message.headers.get("Contact") {
-            if contact_raw.trim() == "*" {
+        // Every Contact entry, across all Contact header lines.
+        let contact_values = message
+            .headers
+            .get_all("Contact")
+            .cloned()
+            .unwrap_or_default();
+
+        // RFC 3261 §10.3 step 6: `Contact: *` removes every binding only as the
+        // sole entry with `Expires: 0`; anything else is a 400 that changes nothing.
+        let expires_header = message.headers.get("Expires").map(String::as_str);
+        match contact_wildcard(&contact_values, expires_header) {
+            ContactWildcard::Absent => {}
+            ContactWildcard::Invalid => {
+                tracing::warn!(aor = %aor.escape_debug(), "rejecting REGISTER: invalid Contact: *");
+                if let Some(metrics) = crate::metrics::try_metrics() {
+                    metrics
+                        .registrar_refusals_total
+                        .with_label_values(&["invalid_wildcard"])
+                        .inc();
+                }
+                drop(message);
+                request.set_reply(400, "Bad Request".to_string());
+                return Ok(false);
+            }
+            ContactWildcard::RemoveAll => {
                 if force {
                     self.inner.clear_bindings(&aor);
                 }
@@ -663,13 +687,6 @@ impl PyRegistrar {
         // Extract Path headers (RFC 3327) — stored per-contact binding so
         // terminating requests can be routed through the proxy chain.
         let path: Vec<String> = message.headers.get_all("Path").cloned().unwrap_or_default();
-
-        // Parse Contact headers
-        let contact_values = message
-            .headers
-            .get_all("Contact")
-            .cloned()
-            .unwrap_or_default();
 
         // Track the granted expires (capped by max_expires) for the response.
         let mut granted_expires = 0u32;
@@ -3359,6 +3376,159 @@ mod tests {
                 assert!(!returned.extract::<bool>().expect("save returns a bool"));
                 assert_eq!(reply_of(&request.bind(python).borrow()).0, 503);
             });
+        }
+    }
+
+    /// RFC 3261 §10.3 step 6: `Contact: *` removes every binding only with
+    /// `Expires: 0` and no other Contact entry; anything else is a 400 that
+    /// leaves the bindings as they were.
+    mod wildcard_contact {
+        use super::*;
+
+        const AOR: &str = "sip:001010000000001@ims.example.com";
+        const FIRST: &str = "<sip:001010000000001@192.0.2.10:5060>";
+        const SECOND: &str = "<sip:001010000000001@192.0.2.11:5060>";
+
+        /// A REGISTER for [`AOR`] with one Contact header line per entry of
+        /// `contact_lines`, and an Expires header only when `expires` is set.
+        fn register(contact_lines: &[&str], expires: Option<&str>) -> PyRequest {
+            let mut builder = SipMessageBuilder::new()
+                .request(Method::Register, SipUri::new("ims.example.com".to_string()))
+                .via("SIP/2.0/UDP 192.0.2.10:5060;branch=z9hG4bK-wildcard".to_string())
+                .to(format!("<{AOR}>"))
+                .from(format!("<{AOR}>;tag=wildcard"))
+                .call_id("wildcard@192.0.2.10".to_string())
+                .cseq("2 REGISTER".to_string());
+            for line in contact_lines {
+                builder = builder.header("Contact", (*line).to_string());
+            }
+            if let Some(expires) = expires {
+                builder = builder.header("Expires", expires.to_string());
+            }
+            let message = builder.content_length(0).build().unwrap();
+            PyRequest::new(
+                Arc::new(Mutex::new(message)),
+                "udp".to_string(),
+                "192.0.2.10".to_string(),
+                5060,
+            )
+        }
+
+        /// A registrar holding two bindings for [`AOR`].
+        fn registered_twice() -> PyRegistrar {
+            let registrar = PyRegistrar::new(Arc::new(Registrar::new(RegistrarConfig {
+                default_expires: 3600,
+                max_expires: 7200,
+                min_expires: 60,
+                max_contacts: 10,
+                ..Default::default()
+            })));
+            let mut request = register(&[FIRST, SECOND], Some("3600"));
+            assert!(registrar.save(&mut request, false, vec![], None).unwrap());
+            assert_eq!(registrar.lookup_str(AOR).len(), 2);
+            registrar
+        }
+
+        fn reply_of(request: &PyRequest) -> (u16, String) {
+            match request.action() {
+                RequestAction::Reply { code, reason, .. } => (*code, reason.clone()),
+                other => panic!("expected a reply, the request action is {other:?}"),
+            }
+        }
+
+        /// `save()` answers 400, returns `False`, and both bindings remain.
+        fn assert_rejected(contact_lines: &[&str], expires: Option<&str>, force: bool) {
+            let registrar = registered_twice();
+            let mut request = register(contact_lines, expires);
+
+            let accepted = registrar.save(&mut request, force, vec![], None).unwrap();
+
+            assert!(
+                !accepted,
+                "an invalid wildcard REGISTER must not be accepted"
+            );
+            assert_eq!(reply_of(&request), (400, "Bad Request".to_string()));
+            assert_eq!(
+                registrar.lookup_str(AOR).len(),
+                2,
+                "a rejected wildcard REGISTER must leave every binding in place"
+            );
+        }
+
+        #[test]
+        fn wildcard_with_a_non_zero_expires_is_answered_400() {
+            assert_rejected(&["*"], Some("3600"), false);
+        }
+
+        #[test]
+        fn wildcard_without_an_expires_header_is_answered_400() {
+            assert_rejected(&["*"], None, false);
+        }
+
+        #[test]
+        fn wildcard_with_an_unparseable_expires_is_answered_400() {
+            assert_rejected(&["*"], Some("soon"), false);
+        }
+
+        #[test]
+        fn wildcard_with_another_contact_on_the_same_line_is_answered_400() {
+            assert_rejected(
+                &["*, <sip:001010000000001@192.0.2.12:5060>"],
+                Some("0"),
+                false,
+            );
+            assert_rejected(
+                &["<sip:001010000000001@192.0.2.12:5060>, *"],
+                Some("0"),
+                false,
+            );
+        }
+
+        #[test]
+        fn wildcard_with_another_contact_on_a_separate_line_is_answered_400() {
+            assert_rejected(
+                &["*", "<sip:001010000000001@192.0.2.12:5060>"],
+                Some("0"),
+                false,
+            );
+            assert_rejected(
+                &["<sip:001010000000001@192.0.2.12:5060>", "*"],
+                Some("0"),
+                false,
+            );
+        }
+
+        #[test]
+        fn wildcard_repeated_on_two_lines_is_answered_400() {
+            assert_rejected(&["*", "*"], Some("0"), false);
+        }
+
+        /// `force=True` must not clear the bindings ahead of the rejection.
+        #[test]
+        fn a_rejected_wildcard_with_force_keeps_the_bindings() {
+            assert_rejected(&["*"], Some("3600"), true);
+        }
+
+        #[test]
+        fn wildcard_alone_with_expires_zero_removes_every_binding() {
+            let registrar = registered_twice();
+            let mut request = register(&["*"], Some("0"));
+
+            let accepted = registrar.save(&mut request, false, vec![], None).unwrap();
+
+            assert!(accepted);
+            assert_eq!(reply_of(&request), (200, "OK".to_string()));
+            assert!(registrar.lookup_str(AOR).is_empty());
+        }
+
+        /// Linear whitespace around the `*` and the `0` is not a second entry.
+        #[test]
+        fn wildcard_with_surrounding_whitespace_and_expires_zero_removes_every_binding() {
+            let registrar = registered_twice();
+            let mut request = register(&[" * "], Some(" 0 "));
+
+            assert!(registrar.save(&mut request, false, vec![], None).unwrap());
+            assert!(registrar.lookup_str(AOR).is_empty());
         }
     }
 }

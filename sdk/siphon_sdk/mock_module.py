@@ -2284,7 +2284,10 @@ class MockRegistrar:
         the same URI, and ``expires=0`` removes it.  Its lifetime is the
         Contact's ``expires`` parameter, else the ``Expires`` header, else
         ``default_expires``, capped at ``max_expires``.  ``Contact: *``
-        removes every binding.  Bindings are stamped with
+        with ``Expires: 0`` removes every binding; a ``*`` alongside another
+        Contact entry, or with an ``Expires`` other than zero or none at all,
+        is answered ``400 Bad Request`` and returns ``False`` with the bindings
+        untouched (RFC 3261 §10.3 step 6).  Bindings are stamped with
         :attr:`~siphon_sdk.types.Contact.received` from the request's source
         address, as the engine does, so ``contact.received or contact.uri``
         resolves the same way it will there.
@@ -2349,7 +2352,23 @@ class MockRegistrar:
         aor = self._resolve_alias(self._normalize_aor(raw_aor))
         contact_values = _header_values(request, "Contact")
 
-        if contact_values and contact_values[0].strip() == "*":
+        # RFC 3261 §10.3 step 6: ``*`` removes every binding only as the sole
+        # Contact entry and with ``Expires: 0``; otherwise 400, nothing changes.
+        entries = [
+            entry.strip()
+            for value in contact_values
+            for entry in _split_outside_quotes(value, ",")
+            if entry.strip()
+        ]
+        if "*" in entries:
+            expires_header = _header_values(request, "Expires")
+            expires = (
+                _as_number(expires_header[0], int, None) if expires_header else None
+            )
+            if len(entries) != 1 or expires != 0:
+                if hasattr(request, "reply"):
+                    request.reply(400, "Bad Request")
+                return False
             self._drop_bindings(aor)
             self._fire_on_change(aor, "deregistered")
             if hasattr(request, "reply"):

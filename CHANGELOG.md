@@ -24,6 +24,15 @@ entry, but a working config keeps working.
   its media to the wrong place. The forwarded 2xx is now kept, with its
   destination, transport and local socket, until its ACK or 64*T1, and a
   retransmission re-sends it. A 2xx from another branch is unchanged.
+- **`registrar.save()` no longer de-registers on an invalid `Contact: *`.** A
+  wildcard Contact removed every binding whatever the `Expires` header said,
+  and a `*` on a second Contact line was ignored. Per RFC 3261 §10.3 step 6, a
+  `*` beside any other Contact entry (same line or another), or with an
+  `Expires` that is absent or not zero, is now answered `400 Bad Request`,
+  `save()` returns `False` and the bindings stay. `Contact: *` alone with
+  `Expires: 0` removes every binding as before. Counted in
+  `siphon_registrar_refusals_total{reason="invalid_wildcard"}`. The SDK mock
+  registrar does the same.
 
 ## [1.14.0] — 2026-10-17
 

@@ -1,0 +1,351 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  Contact: * handling at the registrar (RFC 3261 10.3 step 6).
+  A wildcard is a de-registration only as the sole Contact entry with
+  Expires: 0. With another Contact entry, or an Expires that is absent or not
+  zero, the registrar MUST answer 400 and change nothing.
+  Run: sipp -sf register_wildcard.xml -s carol -ap secret <target>:<port>
+-->
+<scenario name="REGISTER Contact: * validation">
+
+  <!-- Hold a binding the invalid wildcards below must leave alone. -->
+  <send retrans="500">
+    <![CDATA[
+REGISTER sip:[remote_ip] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:[service]@[remote_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:[service]@[remote_ip]>
+Call-ID: [call_id]
+CSeq: 1 REGISTER
+Contact: <sip:[service]@[local_ip]:[local_port];transport=[transport]>
+Expires: 3600
+Max-Forwards: 70
+User-Agent: SIPp/siphon-test
+Content-Length: 0
+
+]]>
+  </send>
+
+  <recv response="100" optional="true" />
+  <recv response="401" auth="true" />
+
+  <send retrans="500">
+    <![CDATA[
+REGISTER sip:[remote_ip] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:[service]@[remote_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:[service]@[remote_ip]>
+Call-ID: [call_id]
+CSeq: 2 REGISTER
+Contact: <sip:[service]@[local_ip]:[local_port];transport=[transport]>
+Expires: 3600
+[authentication]
+Max-Forwards: 70
+User-Agent: SIPp/siphon-test
+Content-Length: 0
+
+]]>
+  </send>
+
+  <recv response="100" optional="true" />
+  <recv response="200" />
+
+  <!-- Wildcard with a non-zero Expires. -->
+  <send retrans="500">
+    <![CDATA[
+REGISTER sip:[remote_ip] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:[service]@[remote_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:[service]@[remote_ip]>
+Call-ID: [call_id]
+CSeq: 3 REGISTER
+Contact: *
+Expires: 3600
+Max-Forwards: 70
+User-Agent: SIPp/siphon-test
+Content-Length: 0
+
+]]>
+  </send>
+
+  <recv response="100" optional="true" />
+  <recv response="401" auth="true" />
+
+  <send retrans="500">
+    <![CDATA[
+REGISTER sip:[remote_ip] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:[service]@[remote_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:[service]@[remote_ip]>
+Call-ID: [call_id]
+CSeq: 4 REGISTER
+Contact: *
+Expires: 3600
+[authentication]
+Max-Forwards: 70
+User-Agent: SIPp/siphon-test
+Content-Length: 0
+
+]]>
+  </send>
+
+  <recv response="100" optional="true" />
+  <recv response="400" />
+
+  <!-- Wildcard without an Expires header. -->
+  <send retrans="500">
+    <![CDATA[
+REGISTER sip:[remote_ip] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:[service]@[remote_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:[service]@[remote_ip]>
+Call-ID: [call_id]
+CSeq: 5 REGISTER
+Contact: *
+Max-Forwards: 70
+User-Agent: SIPp/siphon-test
+Content-Length: 0
+
+]]>
+  </send>
+
+  <recv response="100" optional="true" />
+  <recv response="401" auth="true" />
+
+  <send retrans="500">
+    <![CDATA[
+REGISTER sip:[remote_ip] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:[service]@[remote_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:[service]@[remote_ip]>
+Call-ID: [call_id]
+CSeq: 6 REGISTER
+Contact: *
+[authentication]
+Max-Forwards: 70
+User-Agent: SIPp/siphon-test
+Content-Length: 0
+
+]]>
+  </send>
+
+  <recv response="100" optional="true" />
+  <recv response="400" />
+
+  <!-- Wildcard and another contact on the same line. -->
+  <send retrans="500">
+    <![CDATA[
+REGISTER sip:[remote_ip] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:[service]@[remote_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:[service]@[remote_ip]>
+Call-ID: [call_id]
+CSeq: 7 REGISTER
+Contact: *, <sip:[service]@192.0.2.1:5060>
+Expires: 0
+Max-Forwards: 70
+User-Agent: SIPp/siphon-test
+Content-Length: 0
+
+]]>
+  </send>
+
+  <recv response="100" optional="true" />
+  <recv response="401" auth="true" />
+
+  <send retrans="500">
+    <![CDATA[
+REGISTER sip:[remote_ip] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:[service]@[remote_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:[service]@[remote_ip]>
+Call-ID: [call_id]
+CSeq: 8 REGISTER
+Contact: *, <sip:[service]@192.0.2.1:5060>
+Expires: 0
+[authentication]
+Max-Forwards: 70
+User-Agent: SIPp/siphon-test
+Content-Length: 0
+
+]]>
+  </send>
+
+  <recv response="100" optional="true" />
+  <recv response="400" />
+
+  <!-- Wildcard and another contact on a separate line. -->
+  <send retrans="500">
+    <![CDATA[
+REGISTER sip:[remote_ip] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:[service]@[remote_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:[service]@[remote_ip]>
+Call-ID: [call_id]
+CSeq: 9 REGISTER
+Contact: *
+Contact: <sip:[service]@192.0.2.1:5060>
+Expires: 0
+Max-Forwards: 70
+User-Agent: SIPp/siphon-test
+Content-Length: 0
+
+]]>
+  </send>
+
+  <recv response="100" optional="true" />
+  <recv response="401" auth="true" />
+
+  <send retrans="500">
+    <![CDATA[
+REGISTER sip:[remote_ip] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:[service]@[remote_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:[service]@[remote_ip]>
+Call-ID: [call_id]
+CSeq: 10 REGISTER
+Contact: *
+Contact: <sip:[service]@192.0.2.1:5060>
+Expires: 0
+[authentication]
+Max-Forwards: 70
+User-Agent: SIPp/siphon-test
+Content-Length: 0
+
+]]>
+  </send>
+
+  <recv response="100" optional="true" />
+  <recv response="400" />
+
+  <!-- A query REGISTER: the binding is still there. -->
+  <send retrans="500">
+    <![CDATA[
+REGISTER sip:[remote_ip] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:[service]@[remote_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:[service]@[remote_ip]>
+Call-ID: [call_id]
+CSeq: 11 REGISTER
+Max-Forwards: 70
+User-Agent: SIPp/siphon-test
+Content-Length: 0
+
+]]>
+  </send>
+
+  <recv response="100" optional="true" />
+  <recv response="401" auth="true" />
+
+  <send retrans="500">
+    <![CDATA[
+REGISTER sip:[remote_ip] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:[service]@[remote_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:[service]@[remote_ip]>
+Call-ID: [call_id]
+CSeq: 12 REGISTER
+[authentication]
+Max-Forwards: 70
+User-Agent: SIPp/siphon-test
+Content-Length: 0
+
+]]>
+  </send>
+
+  <recv response="100" optional="true" />
+  <recv response="200">
+    <action>
+      <ereg regexp="transport=" search_in="hdr" header="Contact:" check_it="true" assign_to="bound" />
+    </action>
+  </recv>
+
+  <!-- Wildcard alone with Expires: 0 removes every binding. -->
+  <send retrans="500">
+    <![CDATA[
+REGISTER sip:[remote_ip] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:[service]@[remote_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:[service]@[remote_ip]>
+Call-ID: [call_id]
+CSeq: 13 REGISTER
+Contact: *
+Expires: 0
+Max-Forwards: 70
+User-Agent: SIPp/siphon-test
+Content-Length: 0
+
+]]>
+  </send>
+
+  <recv response="100" optional="true" />
+  <recv response="401" auth="true" />
+
+  <send retrans="500">
+    <![CDATA[
+REGISTER sip:[remote_ip] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:[service]@[remote_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:[service]@[remote_ip]>
+Call-ID: [call_id]
+CSeq: 14 REGISTER
+Contact: *
+Expires: 0
+[authentication]
+Max-Forwards: 70
+User-Agent: SIPp/siphon-test
+Content-Length: 0
+
+]]>
+  </send>
+
+  <recv response="100" optional="true" />
+  <recv response="200" />
+
+  <!-- A query REGISTER: no binding is left. -->
+  <send retrans="500">
+    <![CDATA[
+REGISTER sip:[remote_ip] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:[service]@[remote_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:[service]@[remote_ip]>
+Call-ID: [call_id]
+CSeq: 15 REGISTER
+Max-Forwards: 70
+User-Agent: SIPp/siphon-test
+Content-Length: 0
+
+]]>
+  </send>
+
+  <recv response="100" optional="true" />
+  <recv response="401" auth="true" />
+
+  <send retrans="500">
+    <![CDATA[
+REGISTER sip:[remote_ip] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:[service]@[remote_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:[service]@[remote_ip]>
+Call-ID: [call_id]
+CSeq: 16 REGISTER
+[authentication]
+Max-Forwards: 70
+User-Agent: SIPp/siphon-test
+Content-Length: 0
+
+]]>
+  </send>
+
+  <recv response="100" optional="true" />
+  <recv response="200">
+    <action>
+      <ereg regexp="sip:" search_in="hdr" header="Contact:" check_it_inverse="true" assign_to="unbound" />
+    </action>
+  </recv>
+
+  <Reference variables="bound,unbound" />
+
+</scenario>
