@@ -1564,6 +1564,13 @@ static AVP_TABLE: &[AvpDef] = &[
         name: "Cancellation-Type",
         data_type: AvpType::Enumerated,
     },
+    // S13 (TS 29.272 clause 7.3.51), EIR to MME/SGSN
+    AvpDef {
+        code: 1445,
+        vendor_id: TGPP,
+        name: "Equipment-Status",
+        data_type: AvpType::Enumerated,
+    },
     AvpDef {
         code: 1447,
         vendor_id: TGPP,
@@ -1586,6 +1593,13 @@ static AVP_TABLE: &[AvpDef] = &[
         code: 1450,
         vendor_id: TGPP,
         name: "KASME",
+        data_type: AvpType::OctetString,
+    },
+    // Terminal-Information member of a 3GPP2 terminal (TS 29.272 clause 7.3.6)
+    AvpDef {
+        code: 1471,
+        vendor_id: TGPP,
+        name: "3GPP2-MEID",
         data_type: AvpType::OctetString,
     },
     // S6c served-node identifiers (TS 29.336 / 29.272)
@@ -2000,6 +2014,9 @@ pub const S6C_APP_ID: u32 = 16777312;
 pub const SGD_APP_ID: u32 = 16777313;
 /// S6a Application-Id (TS 29.272) — MME ↔ HSS for LTE attach/auth
 pub const S6A_APP_ID: u32 = 16777251;
+/// S13 Application-Id (TS 29.272 clause 7.1.8): MME or SGSN to EIR for the
+/// ME identity check
+pub const S13_APP_ID: u32 = 16777252;
 /// 3GPP Zh application, BSF to HSS (TS 29.109 clause 6.0)
 pub const ZH_APP_ID: u32 = 16777221;
 /// 3GPP Zn application, NAF to BSF (TS 29.109 clause 6.0)
@@ -2013,7 +2030,7 @@ pub const VENDOR_3GPP: u32 = 10415;
 /// Resolve an application name (case-insensitive) to its
 /// `(vendor_id, app_id)` tuple. Accepts the canonical short form
 /// (`"Cx"`, `"Sh"`, `"Gx"`, `"Rx"`, `"Ro"`, `"Rf"`, `"S6c"`, `"SGd"`, `"S6a"`,
-/// `"Zh"`, `"Zn"`).
+/// `"S13"`, `"Zh"`, `"Zn"`).
 pub fn app_id_by_name(name: &str) -> Option<(u32, u32)> {
     let lower = name.to_ascii_lowercase();
     match lower.as_str() {
@@ -2026,6 +2043,7 @@ pub fn app_id_by_name(name: &str) -> Option<(u32, u32)> {
         "s6c" => Some((VENDOR_3GPP, S6C_APP_ID)),
         "sgd" => Some((VENDOR_3GPP, SGD_APP_ID)),
         "s6a" => Some((VENDOR_3GPP, S6A_APP_ID)),
+        "s13" => Some((VENDOR_3GPP, S13_APP_ID)),
         "zh" => Some((VENDOR_3GPP, ZH_APP_ID)),
         "zn" => Some((VENDOR_3GPP, ZN_APP_ID)),
         _ => None,
@@ -2036,7 +2054,7 @@ pub fn app_id_by_name(name: &str) -> Option<(u32, u32)> {
 /// advertised in the CER/CEA via `Acct-Application-Id (259)` rather than
 /// `Auth-Application-Id (258)` (RFC 6733 §2.4 / §6.9). Today only base
 /// accounting — Rf (id 3) — is an accounting application; every other app
-/// SIPhon speaks (Cx/Sh/Gx/Rx/Ro/S6a/S6c/SGd/Zh/Zn) is an auth application. Advertising
+/// SIPhon speaks (Cx/Sh/Gx/Rx/Ro/S6a/S13/S6c/SGd/Zh/Zn) is an auth application. Advertising
 /// an accounting app as an auth app makes strict peers (freeDiameter,
 /// go-diameter/CGRateS) answer `DIAMETER_NO_COMMON_APPLICATION`.
 pub fn is_accounting_application(app_id: u32) -> bool {
@@ -2057,6 +2075,7 @@ pub fn app_name_by_id(app_id: u32) -> Option<&'static str> {
         S6C_APP_ID => Some("S6c"),
         SGD_APP_ID => Some("SGd"),
         S6A_APP_ID => Some("S6a"),
+        S13_APP_ID => Some("S13"),
         ZH_APP_ID => Some("Zh"),
         ZN_APP_ID => Some("Zn"),
         _ => None,
@@ -2112,6 +2131,8 @@ pub fn command_code_by_name(name: &str) -> Option<u32> {
         "delete-subscriber-data" | "dsr" | "dsa" => Some(CMD_DELETE_SUBSCRIBER_DATA),
         "purge-ue" | "pua-s6a" => Some(CMD_PURGE_UE),
         "notify" | "nor" | "noa" => Some(CMD_NOTIFY),
+        // S13 (TS 29.272 clause 5.2.4)
+        "me-identity-check" | "ecr" | "eca" => Some(CMD_ME_IDENTITY_CHECK),
         // Zn (TS 29.109). Zh has no command of its own: it is "mar" above.
         "bootstrapping-info" | "bir" | "bia" => Some(CMD_BOOTSTRAPPING_INFO),
         // Base
@@ -2149,6 +2170,7 @@ pub fn command_name_by_code(code: u32) -> Option<&'static str> {
         CMD_MO_FORWARD_SHORT_MESSAGE => "MO-Forward-Short-Message",
         CMD_MT_FORWARD_SHORT_MESSAGE => "MT-Forward-Short-Message",
         CMD_BOOTSTRAPPING_INFO => "Bootstrapping-Info",
+        CMD_ME_IDENTITY_CHECK => "ME-Identity-Check",
         CMD_CAPABILITIES_EXCHANGE => "Capabilities-Exchange",
         CMD_DEVICE_WATCHDOG => "Device-Watchdog",
         CMD_DISCONNECT_PEER => "Disconnect-Peer",
@@ -2241,6 +2263,20 @@ pub const CMD_PURGE_UE: u32 = 321;
 /// Notify-Request/Answer (NOR/NOA) — MME → HSS.
 pub const CMD_NOTIFY: u32 = 323;
 
+// ── S13 Command Code (TS 29.272 clause 7.2.2) ───────────────────────────
+
+/// ME-Identity-Check-Request/Answer (ECR/ECA) — MME or SGSN → EIR.
+pub const CMD_ME_IDENTITY_CHECK: u32 = 324;
+
+// ── Equipment-Status values (TS 29.272 clause 7.3.51) ───────────────────
+
+/// The mobile equipment is permitted to be used.
+pub const EQUIPMENT_STATUS_PERMITTEDLISTED: u32 = 0;
+/// The mobile equipment is prohibited from use.
+pub const EQUIPMENT_STATUS_PROHIBITEDLISTED: u32 = 1;
+/// The mobile equipment is to be tracked.
+pub const EQUIPMENT_STATUS_TRACKINGLISTED: u32 = 2;
+
 // ── Base Diameter Command Codes ──────────────────────────────────────────
 
 pub const CMD_CAPABILITIES_EXCHANGE: u32 = 257;
@@ -2282,6 +2318,8 @@ pub const DIAMETER_ERROR_IDENTITY_UNKNOWN: u32 = 5401;
 pub const DIAMETER_ERROR_NOT_AUTHORIZED: u32 = 5402;
 /// Zn: the B-TID is unknown or expired (TS 29.109 clause 6.2.2.3)
 pub const DIAMETER_ERROR_TRANSACTION_IDENTIFIER_INVALID: u32 = 5403;
+/// S13: the EIR does not know the mobile equipment (TS 29.272 clause 7.4.3.5)
+pub const DIAMETER_ERROR_EQUIPMENT_UNKNOWN: u32 = 5422;
 
 // ── Result-Code metric labels ────────────────────────────────────────────
 
@@ -2348,6 +2386,7 @@ const KNOWN_EXPERIMENTAL_RESULT_CODES: &[(u32, &str)] = &[
     (5401, "exp:5401"), // ERROR_IDENTITY_UNKNOWN (Zh)
     (5402, "exp:5402"), // ERROR_NOT_AUTHORIZED (Zn)
     (5403, "exp:5403"), // ERROR_TRANSACTION_IDENTIFIER_INVALID (Zn)
+    (5422, "exp:5422"), // ERROR_EQUIPMENT_UNKNOWN (S13)
 ];
 
 /// The class bucket an unlisted Result-Code falls into (RFC 6733 §7.1:
@@ -2747,6 +2786,90 @@ mod tests {
         // mistaken for Gx (Rx is 16777236).
         assert_eq!(app_name_by_id(16_777_236), Some("Rx"));
         assert_eq!(app_name_by_id(16_777_237), None);
+    }
+
+    #[test]
+    fn s13_resolves_to_its_3gpp_application_id() {
+        // TS 29.272 clause 7.1.8: S13/S13' is a vendor-specific Diameter
+        // application of 3GPP (10415) with application identifier 16777252.
+        for name in ["S13", "s13"] {
+            assert_eq!(app_id_by_name(name), Some((10415, 16_777_252)), "{name}");
+        }
+        assert_eq!(app_name_by_id(16_777_252), Some("S13"));
+        assert!(!is_accounting_application(16_777_252));
+        // S6a is the id before it, and stays S6a.
+        assert_eq!(app_name_by_id(16_777_251), Some("S6a"));
+        assert_eq!(app_name_by_id(16_777_253), None);
+    }
+
+    #[test]
+    fn me_identity_check_is_command_324() {
+        // TS 29.272 clause 7.2.2, Table 7.2.2/1: ME-Identity-Check-Request
+        // ECR 324 and ME-Identity-Check-Answer ECA 324.
+        for name in [
+            "ME-Identity-Check-Request",
+            "ME-Identity-Check-Answer",
+            "ME-Identity-Check",
+            "me-identity-check-request",
+            "ECR",
+            "eca",
+        ] {
+            assert_eq!(command_code_by_name(name), Some(324), "{name}");
+        }
+        assert_eq!(command_name_by_code(324), Some("ME-Identity-Check"));
+        assert_eq!(super::super::codec::command_name(324, true), "ECR");
+        assert_eq!(super::super::codec::command_name(324, false), "ECA");
+    }
+
+    #[test]
+    fn s13_avps_are_defined_as_ts_29_272_gives_them() {
+        // Code and value type from TS 29.272 Table 7.3.1/1 and clauses
+        // 7.3.3 (Terminal-Information), 7.3.4 (IMEI), 7.3.5 (Software-
+        // Version), 7.3.6 (3GPP2-MEID) and 7.3.51 (Equipment-Status). Every
+        // one of them is vendor 3GPP and goes out with M and V.
+        let table = [
+            (1401, "Terminal-Information", AvpType::Grouped),
+            (1402, "IMEI", AvpType::UTF8String),
+            (1403, "Software-Version", AvpType::UTF8String),
+            (1445, "Equipment-Status", AvpType::Enumerated),
+            (1471, "3GPP2-MEID", AvpType::OctetString),
+        ];
+        for (code, name, data_type) in table {
+            let def = lookup_avp(code, 10415)
+                .unwrap_or_else(|| panic!("{name} ({code}) is not in the dictionary"));
+            assert_eq!(def.name, name);
+            assert_eq!(def.data_type, data_type, "{name}");
+            assert_eq!(lookup_by_name(name).map(|def| def.code), Some(code));
+            assert!(avp_is_mandatory(code, 10415), "{name} carries M");
+        }
+        for (python_name, code) in [
+            ("terminal_information", 1401),
+            ("imei", 1402),
+            ("software_version", 1403),
+            ("equipment_status", 1445),
+        ] {
+            assert_eq!(
+                lookup_avp_by_python_name(python_name).map(|def| (def.vendor_id, def.code)),
+                Some((10415, code)),
+                "{python_name}"
+            );
+        }
+    }
+
+    #[test]
+    fn equipment_status_values_are_those_of_ts_29_272_clause_7_3_51() {
+        // PERMITTEDLISTED (0), PROHIBITEDLISTED (1), TRACKINGLISTED (2).
+        assert_eq!(EQUIPMENT_STATUS_PERMITTEDLISTED, 0);
+        assert_eq!(EQUIPMENT_STATUS_PROHIBITEDLISTED, 1);
+        assert_eq!(EQUIPMENT_STATUS_TRACKINGLISTED, 2);
+    }
+
+    #[test]
+    fn equipment_unknown_is_experimental_result_5422() {
+        // TS 29.272 clause 7.4.3.5: DIAMETER_ERROR_EQUIPMENT_UNKNOWN (5422),
+        // sent by the EIR for a mobile equipment it does not know.
+        assert_eq!(DIAMETER_ERROR_EQUIPMENT_UNKNOWN, 5422);
+        assert_eq!(answer_result_label(None, Some(5422)), "exp:5422");
     }
 
     #[test]

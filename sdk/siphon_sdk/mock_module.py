@@ -7947,7 +7947,7 @@ class MockDiameterRequest:
 _DIAMETER_APPLICATION_IDS = {
     "cx": 16777216, "sh": 16777217, "gx": 16777238, "rx": 16777236,
     "ro": 4, "rf": 3, "s6c": 16777312, "sgd": 16777313, "s6a": 16777251,
-    "zh": 16777221, "zn": 16777220,
+    "zh": 16777221, "zn": 16777220, "s13": 16777252,
 }
 
 # AVPs `diameter.reauthorize` sets itself.

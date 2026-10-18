@@ -1167,6 +1167,16 @@ mod served_applications_tests {
     }
 
     #[test]
+    fn an_s13_filter_makes_the_node_an_s13_server() {
+        let handlers = concat!(
+            "@on_request('S13:ECR')\n",
+            "def on_ecr(request):\n",
+            "    return request.answer(2001)\n",
+        );
+        assert_eq!(served(&[], handlers), vec![(10415, 16_777_252)]);
+    }
+
+    #[test]
     fn bare_and_catch_all_filters_name_no_application() {
         // Not "every application the dictionary knows": nothing at all.
         assert!(served(&[], CATCH_ALL_HANDLERS).is_empty());
@@ -1322,6 +1332,20 @@ mod filter_tests {
         );
         assert_eq!(request_filter_score(Some("Zn:BIR"), zh, 310), None);
         assert_eq!(request_filter_score(Some("BIR"), zn, 310), Some(1));
+    }
+
+    #[test]
+    fn request_filter_score_finds_the_s13_identity_check() {
+        let s13 = dictionary::S13_APP_ID;
+        let s6a = dictionary::S6A_APP_ID;
+        assert_eq!(request_filter_score(Some("S13:ECR"), s13, 324), Some(2));
+        assert_eq!(request_filter_score(Some("s13:ECR"), s13, 324), Some(2));
+        assert_eq!(
+            request_filter_score(Some("S13:ME-Identity-Check"), s13, 324),
+            Some(2)
+        );
+        assert_eq!(request_filter_score(Some("S13:ECR"), s6a, 324), None);
+        assert_eq!(request_filter_score(Some("ECR"), s13, 324), Some(1));
     }
 
     #[test]
@@ -1936,5 +1960,252 @@ pub(crate) mod zn_serving_tests {
             answer.answer_result_codes().0,
             Some(dictionary::DIAMETER_UNABLE_TO_DELIVER)
         );
+    }
+}
+
+/// Serving S13 (TS 29.272 clause 5.2.4) from a script: the
+/// ME-Identity-Check-Request an MME sent reaches the handler with the
+/// Terminal-Information readable, and the answer the handler builds is the
+/// hand-written ME-Identity-Check-Answer, octet for octet.
+#[cfg(test)]
+mod s13_serving_tests {
+    use super::*;
+    use crate::diameter::s13_test_vectors as vectors;
+
+    /// An EIR as a script: it knows one terminal, prohibited from use. The
+    /// handler checks every field it reads against what the hand-written
+    /// request holds, so reading one wrongly raises and the answer is 5012.
+    const EIR_SCRIPT: &str = concat!(
+        "import _siphon_registry\n",
+        "\n",
+        "TGPP = 10415\n",
+        "PROHIBITEDLISTED = 1\n",
+        "EQUIPMENT = {'00100001000001': PROHIBITEDLISTED}\n",
+        "\n",
+        "def on_ecr(request):\n",
+        "    assert request.application_id == 16777252, request.application_id\n",
+        "    assert request.application_name == 'S13', request.application_name\n",
+        "    assert request.command_code == 324, request.command_code\n",
+        "    assert request.command_name == 'ECR', request.command_name\n",
+        "    assert request.get_avp('User-Name') == '001010000000001'\n",
+        "    terminal = {code: value for code, value, vendor\n",
+        "                in request.get_avp('Terminal-Information')}\n",
+        "    assert set(terminal) == {1402, 1403}, terminal\n",
+        "    assert terminal[1403] == '01', terminal\n",
+        "    named = {member.name: member.value for avp in request.avps()\n",
+        "             if avp.name == 'Terminal-Information' for member in avp.value}\n",
+        "    assert named['IMEI'] == terminal[1402], named\n",
+        "\n",
+        "    status = EQUIPMENT.get(terminal[1402])\n",
+        "    answer = request.answer(2001)\n",
+        "    if status is None:\n",
+        "        # TS 29.272 clause 7.4.3.5, in an Experimental-Result.\n",
+        "        answer.remove_avp('Result-Code')\n",
+        "        answer.set_avp('Experimental-Result', [\n",
+        "            ('Vendor-Id', TGPP),\n",
+        "            ('Experimental-Result-Code', 5422),\n",
+        "        ])\n",
+        "        return answer\n",
+        "    answer.set_avp('Equipment-Status', status)\n",
+        "    return answer\n",
+        "\n",
+        "_siphon_registry.register('diameter.on_request', 'S13:ECR', on_ecr, False)\n",
+    );
+
+    /// The octets of the answer `source` gives to the request `raw`.
+    fn answer_wire(source: &str, raw: &[u8]) -> Vec<u8> {
+        let request = crate::diameter::codec::decode_diameter(raw).expect("a request");
+        let incoming = crate::diameter::peer::IncomingRequest {
+            command_code: request.command_code,
+            application_id: request.application_id,
+            hop_by_hop: request.hop_by_hop,
+            end_to_end: request.end_to_end,
+            avps: request.avps,
+            raw: raw.to_vec(),
+        };
+        let engine =
+            Arc::new(ScriptEngine::new_embedded(source).expect("the test script should compile"));
+        let peer = PyInboundPeer {
+            name: "mme".to_string(),
+            tenant: "default".to_string(),
+            addr: "192.0.2.30:3868".to_string(),
+            transport: "tcp".to_string(),
+        };
+        Python::attach(|python| {
+            build_answer_via_handler(
+                python,
+                &engine,
+                &incoming,
+                &peer,
+                "eir.epc.mnc001.mcc001.3gppnetwork.org",
+                "epc.mnc001.mcc001.3gppnetwork.org",
+            )
+            .wire
+        })
+    }
+
+    /// The hand-written request for a terminal the EIR does not know: the
+    /// last digit of the IMEI changed.
+    fn ecr_for_unknown_equipment() -> Vec<u8> {
+        let mut raw = vectors::S13_ECR.to_vec();
+        let position = raw
+            .windows(vectors::IMEI.len())
+            .position(|window| window == vectors::IMEI.as_bytes())
+            .expect("the IMEI is in the request");
+        raw[position + vectors::IMEI.len() - 1] = b'2';
+        raw
+    }
+
+    /// The hand-written request decodes as TS 29.272 has it: the command and
+    /// application of the header, and Terminal-Information a group of IMEI
+    /// and Software-Version, every one of them with V and M.
+    #[test]
+    fn the_hand_written_ecr_decodes_as_an_identity_check() {
+        let request = DiameterMsg::from_wire(vectors::S13_ECR).expect("the ECR");
+        assert_eq!(request.command_code, dictionary::CMD_ME_IDENTITY_CHECK);
+        assert_eq!(request.application_id, dictionary::S13_APP_ID);
+        assert!(request.is_request());
+        assert_eq!(request.flags, 0xc0, "REQ and PXY (TS 29.272 clause 7.2.19)");
+        let terminal = request
+            .find(
+                dictionary::avp::TERMINAL_INFORMATION,
+                dictionary::VENDOR_3GPP,
+            )
+            .expect("Terminal-Information");
+        assert_eq!(terminal.flags, 0xc0);
+        let crate::diameter::codec::AvpData::Grouped(members) = &terminal.value else {
+            panic!("Terminal-Information is grouped");
+        };
+        let member = |code: u32| {
+            members
+                .iter()
+                .find(|member| member.code == code && member.vendor == 10415)
+                .expect("a member of Terminal-Information")
+        };
+        assert_eq!(member(dictionary::avp::IMEI).flags, 0xc0);
+        assert_eq!(
+            member(dictionary::avp::IMEI).raw_bytes(),
+            Some(vectors::IMEI.as_bytes())
+        );
+        assert_eq!(
+            member(dictionary::avp::SOFTWARE_VERSION).raw_bytes(),
+            Some(vectors::SOFTWARE_VERSION.as_bytes())
+        );
+        assert_eq!(
+            request.get_str(dictionary::avp::USER_NAME).as_deref(),
+            Some(vectors::IMSI)
+        );
+        // Re-encoding gives back the same octets.
+        assert_eq!(request.to_wire(), vectors::S13_ECR);
+    }
+
+    #[test]
+    fn an_ecr_is_answered_with_the_equipment_status() {
+        pyo3::Python::initialize();
+        let wire = answer_wire(EIR_SCRIPT, vectors::S13_ECR);
+        assert_eq!(wire, vectors::S13_ECA, "the ECA, octet for octet");
+
+        let answer = DiameterMsg::from_wire(&wire).expect("the ECA");
+        assert_eq!(answer.answer_result_codes(), (Some(2001), None));
+        assert!(!answer.is_request());
+        assert!(!answer.is_error());
+        let status = answer
+            .find(dictionary::avp::EQUIPMENT_STATUS, dictionary::VENDOR_3GPP)
+            .expect("Equipment-Status");
+        assert_eq!(status.flags, 0xc0, "V and M (TS 29.272 Table 7.3.1/1)");
+        assert_eq!(
+            status.as_u32(),
+            Some(dictionary::EQUIPMENT_STATUS_PROHIBITEDLISTED)
+        );
+    }
+
+    #[test]
+    fn unknown_equipment_is_answered_with_experimental_result_5422_alone() {
+        pyo3::Python::initialize();
+        let wire = answer_wire(EIR_SCRIPT, &ecr_for_unknown_equipment());
+        assert_eq!(wire, vectors::S13_ECA_UNKNOWN, "the ECA, octet for octet");
+
+        let answer = DiameterMsg::from_wire(&wire).expect("the ECA");
+        assert_eq!(
+            answer.answer_result_codes(),
+            (None, Some(dictionary::DIAMETER_ERROR_EQUIPMENT_UNKNOWN))
+        );
+        assert!(!answer.is_error(), "an application error does not set E");
+        assert!(answer
+            .find(dictionary::avp::EQUIPMENT_STATUS, dictionary::VENDOR_3GPP)
+            .is_none());
+        assert_eq!(emitted_answer_result_label(&wire), "exp:5422");
+    }
+
+    #[test]
+    fn an_ecr_is_not_served_by_a_handler_of_s6a() {
+        pyo3::Python::initialize();
+        let s6a_only = concat!(
+            "import _siphon_registry\n",
+            "def on_request(request):\n",
+            "    return request.answer(2001)\n",
+            "_siphon_registry.register('diameter.on_request', 'S6a:ULR', on_request, False)\n",
+        );
+        let wire = answer_wire(s6a_only, vectors::S13_ECR);
+        let answer = DiameterMsg::from_wire(&wire).expect("the answer");
+        assert_eq!(
+            answer.answer_result_codes().0,
+            Some(dictionary::DIAMETER_UNABLE_TO_DELIVER)
+        );
+    }
+
+    fn hex_dump(wire: &[u8]) -> String {
+        let mut dump = String::new();
+        for (offset, chunk) in wire.chunks(16).enumerate() {
+            dump.push_str(&format!("{:06x}", offset * 16));
+            for byte in chunk {
+                dump.push_str(&format!(" {byte:02x}"));
+            }
+            dump.push('\n');
+        }
+        dump.push_str(&format!("{:06x}\n", wire.len()));
+        dump
+    }
+
+    /// Emit the capabilities exchange of an EIR, the answers its script
+    /// built, and the hand-written messages, as hex for
+    /// `scripts/validate_diameter_s13.sh` to feed to tshark.
+    #[test]
+    fn emit_s13_messages_for_external_dissection() {
+        let Ok(directory) = std::env::var("SIPHON_S13_HEX_DIR") else {
+            // Nothing to do in an ordinary test run.
+            return;
+        };
+        pyo3::Python::initialize();
+        let write = |name: &str, wire: &[u8]| {
+            std::fs::write(format!("{directory}/{name}.hex"), hex_dump(wire))
+                .expect("hex dump must be writable");
+        };
+        let config = crate::diameter::peer::PeerConfig {
+            host: "127.0.0.1".to_string(),
+            port: 0,
+            origin_host: "eir.epc.mnc001.mcc001.3gppnetwork.org".to_string(),
+            origin_realm: "epc.mnc001.mcc001.3gppnetwork.org".to_string(),
+            destination_host: None,
+            destination_realm: "epc.mnc001.mcc001.3gppnetwork.org".to_string(),
+            local_ip: "127.0.0.1".parse().expect("a literal address"),
+            application_ids: vec![(dictionary::VENDOR_3GPP, dictionary::S13_APP_ID)],
+            watchdog_interval: 3600,
+            reconnect_delay: 5,
+            product_name: "SIPhon".to_string(),
+            firmware_revision: 1,
+        };
+        write(
+            "cea",
+            &crate::diameter::peer::build_cea(&config, 2001, 1, 1),
+        );
+        write("eca", &answer_wire(EIR_SCRIPT, vectors::S13_ECR));
+        write(
+            "eca_unknown",
+            &answer_wire(EIR_SCRIPT, &ecr_for_unknown_equipment()),
+        );
+        write("written_ecr", vectors::S13_ECR);
+        write("written_eca", vectors::S13_ECA);
+        write("written_eca_unknown", vectors::S13_ECA_UNKNOWN);
     }
 }
