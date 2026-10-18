@@ -165,14 +165,21 @@ pub(crate) fn b2bua_route_call_with_state(
     // RFC 3261 §8.2.2.3, checked as `call.route()` is, under the call's policy,
     // before any carrier is dialled: refused the way a route with no routable
     // carrier ends the call.
-    let (script_shaped_headers, sec_agree_verified) = state
+    let (script_shaped_headers, sec_agree_verified, caller_required) = state
         .call_actors
         .get_call(&internal_call_id)
-        .map(|call| (call.script_shaped_headers.clone(), call.sec_agree_verified))
+        .map(|call| {
+            (
+                call.script_shaped_headers.clone(),
+                call.sec_agree_verified,
+                call.a_leg_required.clone(),
+            )
+        })
         .unwrap_or_default();
     let unsupported = unhonourable_required_tags(
         &template.headers,
         &script_shaped_headers,
+        caller_required.as_deref(),
         &state.resolve_header_policy(&internal_call_id),
         sec_agree_verified,
     );
@@ -972,14 +979,21 @@ pub(crate) fn b2bua_dial_call_with_state(
     // RFC 3261 §8.2.2.3, checked as `call.dial()` is, under the call's policy.
     // A controller cannot change that policy, so no other dial could connect the
     // caller either: it is refused now, not reported as a dial to retry.
-    let (script_shaped_headers, sec_agree_verified) = state
+    let (script_shaped_headers, sec_agree_verified, caller_required) = state
         .call_actors
         .get_call(&internal_call_id)
-        .map(|call| (call.script_shaped_headers.clone(), call.sec_agree_verified))
+        .map(|call| {
+            (
+                call.script_shaped_headers.clone(),
+                call.sec_agree_verified,
+                call.a_leg_required.clone(),
+            )
+        })
         .unwrap_or_default();
     let unsupported = unhonourable_required_tags(
         &template.headers,
         &script_shaped_headers,
+        caller_required.as_deref(),
         &state.resolve_header_policy(&internal_call_id),
         sec_agree_verified,
     );

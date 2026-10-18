@@ -3193,6 +3193,7 @@ fn unhonourable_required_tags_keeps_what_siphon_or_the_callee_can_honour() {
         unhonourable_required_tags(
             &invite,
             &[],
+            None,
             &builtin_policy("transparent-b2bua@2026"),
             true
         ),
@@ -3203,6 +3204,7 @@ fn unhonourable_required_tags_keeps_what_siphon_or_the_callee_can_honour() {
         unhonourable_required_tags(
             &invite,
             &[],
+            None,
             &builtin_policy("ims-trust-domain-boundary@2026"),
             true
         ),
@@ -3211,14 +3213,46 @@ fn unhonourable_required_tags_keeps_what_siphon_or_the_callee_can_honour() {
 }
 
 #[test]
+fn unhonourable_required_tags_checks_only_what_the_caller_required() {
+    // The script wrote `Require: tdialog, histinfo` on the B-leg of a call whose
+    // caller required histinfo alone: tdialog, which cannot cross a B2BUA, is
+    // the script's own and does not refuse the caller.
+    let mut invite = SipHeaders::new();
+    invite.set("Require", "tdialog, X-Lab-Extension".to_string());
+    let policy = builtin_policy("ims-intra-trust-domain@2026");
+    let script = ["Require".to_string()];
+    assert_eq!(
+        unhonourable_required_tags(&invite, &script, None, &policy, false),
+        vec!["tdialog".to_string(), "X-Lab-Extension".to_string()]
+    );
+    let caller = ["x-lab-extension".to_string()];
+    assert_eq!(
+        unhonourable_required_tags(&invite, &script, Some(&caller), &policy, false),
+        vec!["X-Lab-Extension".to_string()]
+    );
+    assert!(unhonourable_required_tags(&invite, &script, Some(&[]), &policy, false).is_empty());
+    // sec-agree belongs to siphon's own hop: a script cannot waive it.
+    let mut hop = SipHeaders::new();
+    hop.set("Require", "sec-agree".to_string());
+    assert_eq!(
+        unhonourable_required_tags(&hop, &script, Some(&[]), &policy, false),
+        vec!["sec-agree".to_string()]
+    );
+    assert_eq!(
+        required_option_tags(&invite),
+        vec!["tdialog".to_string(), "X-Lab-Extension".to_string()]
+    );
+}
+
+#[test]
 fn unhonourable_required_tags_needs_require_to_reach_the_callee() {
     let mut invite = SipHeaders::new();
     invite.set("Require", "precondition, replaces".to_string());
     let mut no_require = builtin_policy("ims-intra-trust-domain@2026");
-    assert!(unhonourable_required_tags(&invite, &[], &no_require, false).is_empty());
+    assert!(unhonourable_required_tags(&invite, &[], None, &no_require, false).is_empty());
     no_require.deltas_strip = vec!["Require".to_string()];
     assert_eq!(
-        unhonourable_required_tags(&invite, &[], &no_require, false),
+        unhonourable_required_tags(&invite, &[], None, &no_require, false),
         vec!["precondition".to_string()]
     );
     // A Require the script set goes out over the strip, so the callee is shown
@@ -3228,11 +3262,11 @@ fn unhonourable_required_tags_needs_require_to_reach_the_callee() {
     let mut history = SipHeaders::new();
     history.set("Require", "histinfo, precondition".to_string());
     assert_eq!(
-        unhonourable_required_tags(&history, &[], &no_require, false),
+        unhonourable_required_tags(&history, &[], None, &no_require, false),
         vec!["histinfo".to_string(), "precondition".to_string()]
     );
     assert_eq!(
-        unhonourable_required_tags(&history, &["require".to_string()], &no_require, false),
+        unhonourable_required_tags(&history, &["require".to_string()], None, &no_require, false),
         vec!["precondition".to_string()]
     );
 }
@@ -3243,6 +3277,7 @@ fn unhonourable_required_tags_is_empty_without_require() {
     assert!(unhonourable_required_tags(
         &invite,
         &[],
+        None,
         &builtin_policy("transparent-b2bua@2026"),
         false
     )
@@ -3257,10 +3292,10 @@ fn sec_agree_is_honoured_only_on_a_call_whose_agreement_was_verified() {
     invite.set("Require", "sec-agree, 100rel".to_string());
     let policy = builtin_policy("ims-intra-trust-domain@2026");
     assert_eq!(
-        unhonourable_required_tags(&invite, &[], &policy, false),
+        unhonourable_required_tags(&invite, &[], None, &policy, false),
         vec!["sec-agree".to_string()]
     );
-    assert!(unhonourable_required_tags(&invite, &[], &policy, true).is_empty());
+    assert!(unhonourable_required_tags(&invite, &[], None, &policy, true).is_empty());
     assert_eq!(
         unimplemented_required_tags(&invite, false),
         vec!["sec-agree".to_string()]

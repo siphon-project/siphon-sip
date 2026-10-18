@@ -632,6 +632,8 @@ pub fn handle_b2bua_invite(inbound: InboundMessage, message: SipMessage, state: 
         call.a_leg_requires_100rel = a_leg_requires_100rel;
         // Decided before the script ran, by the RFC 3329 check above.
         call.sec_agree_verified = sec_agree_verified;
+        // Read before the script can add a Require of its own to the B-leg.
+        call.a_leg_required = Some(required_option_tags(&message.headers));
         // Listener the INVITE arrived on, so an imperative call.answer() /
         // call.progress() (which has no `inbound` in scope) sends the UAS
         // response back out the same socket.
@@ -1040,14 +1042,21 @@ pub fn apply_routing_action(
         action,
         CallAction::Dial { .. } | CallAction::Fork { .. } | CallAction::RouteSequence { .. }
     ) {
-        let (script_shaped_headers, sec_agree_verified) = state
+        let (script_shaped_headers, sec_agree_verified, caller_required) = state
             .call_actors
             .get_call(call_id)
-            .map(|call| (call.script_shaped_headers.clone(), call.sec_agree_verified))
+            .map(|call| {
+                (
+                    call.script_shaped_headers.clone(),
+                    call.sec_agree_verified,
+                    call.a_leg_required.clone(),
+                )
+            })
             .unwrap_or_default();
         let unsupported = unhonourable_required_tags(
             &message_guard.headers,
             &script_shaped_headers,
+            caller_required.as_deref(),
             &state.resolve_header_policy(call_id),
             sec_agree_verified,
         );
