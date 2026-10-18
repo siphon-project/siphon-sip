@@ -59,6 +59,7 @@ mod drop_call;
 mod error;
 mod originate;
 mod recording;
+mod route_target;
 mod server;
 mod session;
 pub mod sip;

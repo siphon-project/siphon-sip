@@ -1381,6 +1381,117 @@ def test_dial_verb_roundtrip():
     asyncio.run(scenario())
 
 
+def test_target_route_set_roundtrip():
+    """A `dial` or `route` target's `route` goes out as the list it was given,
+    topmost first, and the shapes the server would refuse never leave."""
+
+    async def scenario():
+        frames = []
+        refused = []
+
+        def reply(frame):
+            return {"channel": "ch1", "state": frame["verb"], "targets": 1}
+
+        stub = _verb_stub({"dial", "route"}, reply, frames)
+        async with websockets.serve(
+            stub, "127.0.0.1", 0, subprotocols=[SUBPROTOCOL]
+        ) as server:
+            port = server.sockets[0].getsockname()[1]
+            url = f"ws://127.0.0.1:{port}/control/ws"
+            client = ControlClient(app=APP, token=TOKEN, url=url)
+            done = asyncio.get_event_loop().create_future()
+
+            @client.on_call
+            async def handle(call):
+                await call.dial(
+                    [
+                        {
+                            "uri": "sip:+15550100@ims.example.test",
+                            "route": [
+                                "<sip:term@scscf.example.test;lr;odi=4f1c>",
+                                "<sip:edge.example.test;lr>",
+                            ],
+                        },
+                        {
+                            "uri": "sip:alice@ims.example.test",
+                            "next_hop": "sip:192.0.2.10:5060",
+                            "route": ["<sip:scscf.example.test;lr>"],
+                        },
+                        # An empty route set is no route set.
+                        {"uri": "sip:1001@pbx.example", "route": []},
+                    ]
+                )
+                await call.route(
+                    [
+                        {
+                            "uri": "sip:+15550100@ims.example.test",
+                            "route": ["<sip:orig@scscf.example.test;lr>"],
+                        }
+                    ]
+                )
+                for bad in (
+                    # An AoR's branches follow their own binding's Path.
+                    {"aor": "sip:204@pbx.example", "route": ["<sip:p.example;lr>"]},
+                    # A lone string is not read as a one-entry list.
+                    {"uri": "sip:1001@pbx.example", "route": "<sip:p.example;lr>"},
+                    {"uri": "sip:1001@pbx.example", "route": [7]},
+                ):
+                    try:
+                        call.dial([bad])
+                    except (TypeError, ValueError) as error:
+                        refused.append(str(error))
+                try:
+                    call.route([{"uri": "sip:gw", "route": "<sip:p.example;lr>"}])
+                except TypeError as error:
+                    refused.append(str(error))
+                if not done.done():
+                    done.set_result(True)
+
+            await client.connect()
+            run_task = asyncio.ensure_future(client.run())
+            await asyncio.sleep(0.3)
+            await client.command("test_push_stasis")
+            await asyncio.wait_for(done, timeout=5)
+
+            assert frames[0]["verb"] == "dial"
+            assert frames[0]["args"] == {
+                "targets": [
+                    {
+                        "uri": "sip:+15550100@ims.example.test",
+                        "route": [
+                            "<sip:term@scscf.example.test;lr;odi=4f1c>",
+                            "<sip:edge.example.test;lr>",
+                        ],
+                    },
+                    {
+                        "uri": "sip:alice@ims.example.test",
+                        "next_hop": "sip:192.0.2.10:5060",
+                        "route": ["<sip:scscf.example.test;lr>"],
+                    },
+                    "sip:1001@pbx.example",
+                ]
+            }
+            assert frames[1]["verb"] == "route"
+            assert frames[1]["args"] == {
+                "targets": [
+                    {
+                        "uri": "sip:+15550100@ims.example.test",
+                        "route": ["<sip:orig@scscf.example.test;lr>"],
+                    }
+                ],
+                "strategy": "sequential",
+            }
+            assert len(frames) == 2, frames
+            assert len(refused) == 4, refused
+            assert "aor" in refused[0] and "route" in refused[0], refused[0]
+
+            client.shutdown()
+            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+                await asyncio.wait_for(run_task, timeout=5)
+
+    asyncio.run(scenario())
+
+
 def test_record_verbs_roundtrip():
     """`call.record_start(...)` / `call.record_stop(...)` emit the exact args the
     server parses, and the start's reply carries the id a stop addresses."""

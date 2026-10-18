@@ -37,8 +37,11 @@ pub use crate::originate::{
 // `dial`, the recording pair and the stream pair hang their verbs off `Call` from their own
 // modules; their argument types are re-exported here so every SIP type is
 // reachable under one path.
-pub use crate::dial::{DialOnAnswer, DialOptions, DialStrategy, DialTarget, Dialing, Ringback};
+pub use crate::dial::{
+    DialOnAnswer, DialOptions, DialStrategy, DialTarget, Dialing, Ringback, TargetIdentity,
+};
 pub use crate::recording::{RecordChannels, RecordDirection, RecordOptions, Recording};
+pub use crate::route_target::RouteTarget;
 use crate::server::{ControlServer, ServerConfig};
 use crate::session::CommandTransport;
 pub use crate::stream::{StreamChannels, StreamDirection, StreamMode, StreamOptions};
@@ -51,95 +54,6 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-// ---------------------------------------------------------------------------
-// route() target
-// ---------------------------------------------------------------------------
-
-/// One entry in a [`Call::route`] target list: a B-leg URI plus optional
-/// per-target overrides.
-///
-/// A bare URI (no overrides) serializes to a plain string on the wire; a target
-/// carrying any override serializes to
-/// `{uri, next_hop?, headers?, timeout?, reroute_after_progress?}` — both shapes
-/// the server's `route` verb accepts. Build a bare-URI target with
-/// [`RouteTarget::uri`], or from a `&str` / `String`, and set overrides with
-/// struct-update syntax: `RouteTarget { timeout_secs: Some(6), ..RouteTarget::uri(uri) }`.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct RouteTarget {
-    /// The B-leg request URI to dial.
-    pub uri: String,
-    /// Route egress to this next hop instead of resolving `uri` (optional).
-    pub next_hop: Option<String>,
-    /// Headers injected on this attempt's B-leg INVITE (optional).
-    pub headers: Vec<(String, String)>,
-    /// Per-target ring timeout in seconds (optional). It bounds the wait for
-    /// this carrier to show progress (a 101-199), not the wait for its answer.
-    pub timeout_secs: Option<u32>,
-    /// Fail this carrier over at its ring timeout even after it has shown
-    /// progress.
-    ///
-    /// By default a carrier that has sent a 180/183 keeps the call past its
-    /// timeout, and the call then fails with 408 rather than trying the next
-    /// target. `true` is for a carrier that plays its own ringback before it has
-    /// reached anyone. Default `false`, which is never sent.
-    pub reroute_after_progress: bool,
-}
-
-impl RouteTarget {
-    /// A bare-URI target with no overrides.
-    pub fn uri(uri: impl Into<String>) -> Self {
-        Self {
-            uri: uri.into(),
-            next_hop: None,
-            headers: Vec::new(),
-            timeout_secs: None,
-            reroute_after_progress: false,
-        }
-    }
-
-    /// True when this target carries no overrides (serializes as a bare string).
-    fn is_bare(&self) -> bool {
-        self.next_hop.is_none()
-            && self.headers.is_empty()
-            && self.timeout_secs.is_none()
-            && !self.reroute_after_progress
-    }
-
-    fn to_json(&self) -> serde_json::Value {
-        if self.is_bare() {
-            return json!(self.uri);
-        }
-        let mut object = serde_json::Map::new();
-        object.insert("uri".to_string(), json!(self.uri));
-        if let Some(next_hop) = &self.next_hop {
-            object.insert("next_hop".to_string(), json!(next_hop));
-        }
-        if !self.headers.is_empty() {
-            object.insert("headers".to_string(), headers_to_json(&self.headers));
-        }
-        if let Some(timeout) = self.timeout_secs {
-            object.insert("timeout".to_string(), json!(timeout));
-        }
-        // Off is the server's default, so only `true` goes on the wire.
-        if self.reroute_after_progress {
-            object.insert("reroute_after_progress".to_string(), json!(true));
-        }
-        serde_json::Value::Object(object)
-    }
-}
-
-impl From<&str> for RouteTarget {
-    fn from(uri: &str) -> Self {
-        Self::uri(uri)
-    }
-}
-
-impl From<String> for RouteTarget {
-    fn from(uri: String) -> Self {
-        Self::uri(uri)
-    }
 }
 
 pub(crate) fn headers_to_json(headers: &[(String, String)]) -> serde_json::Value {
@@ -1861,6 +1775,7 @@ mod tests {
                         headers: vec![("X-Foo".to_string(), "bar".to_string())],
                         timeout_secs: Some(30),
                         reroute_after_progress: false,
+                        route: Vec::new(),
                     },
                 ],
                 Some("sequential"),

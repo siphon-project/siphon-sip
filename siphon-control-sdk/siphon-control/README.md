@@ -150,6 +150,10 @@ reported as a failure. That is damage control, not a substitute for closing.
   registered contact over that contact's own captured flow, which is the only way to
   reach a phone registered on TCP, TLS or WSS behind NAT. A bare string is refused,
   because it does not say which of the two was meant.
+  A `{"uri": ...}` target (of `dial` or `route`) may carry `"route"`, the route set
+  its INVITE carries, topmost first: `["<sip:term@scscf.example;lr;odi=4f1c>"]`.
+  That is how an IMS application server sends a session back through the S-CSCF
+  with the Route the S-CSCF gave it.
   With `on_answer="bridge"` it instead rings phones for a caller the app already
   answered and anchored (after a greeting or a menu), plays `ringback` (a tone
   preset or cadence, `True` for the default, `False` for none) while they alert, and

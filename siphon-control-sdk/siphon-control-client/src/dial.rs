@@ -48,12 +48,16 @@ pub enum DialTarget {
         identity: TargetIdentity,
         /// Called party: the B-leg's `To` URI. See [`DialTarget::to`].
         to: Option<String>,
+        /// The route set this branch's INVITE carries, topmost first. See
+        /// [`DialTarget::uri_routed`].
+        route: Vec<String>,
     },
     /// An address of record, forked to every contact registered against it.
     ///
-    /// There is no `next_hop` here on purpose: each branch routes over its own
-    /// binding's captured flow and Path route set, so a next hop for "the AoR"
-    /// would have nothing to apply to. An AoR nobody has registered contributes
+    /// There is no `next_hop` or `route` here on purpose: each branch routes
+    /// over its own binding's captured flow and Path route set, so a next hop or
+    /// route set for "the AoR" would have nothing to apply to, and the server
+    /// refuses a `route` on one. An AoR nobody has registered contributes
     /// no branch, and a `dial` whose targets all resolve to nothing answers
     /// `not_found`.
     Aor {
@@ -98,6 +102,7 @@ impl DialTarget {
             headers: Vec::new(),
             identity: TargetIdentity::default(),
             to: None,
+            route: Vec::new(),
         }
     }
 
@@ -113,6 +118,36 @@ impl DialTarget {
             headers: Vec::new(),
             identity: TargetIdentity::default(),
             to: None,
+            route: Vec::new(),
+        }
+    }
+
+    /// A URI target whose INVITE carries `route` as its route set, topmost
+    /// first, and is sent to the topmost entry.
+    ///
+    /// Each entry is one Route value in name-addr form
+    /// (`"<sip:scscf.example;lr>"`, RFC 3261 §25.1); the server refuses one that
+    /// is not exactly one Route value with `bad_request`. This is how a
+    /// controller acting as an IMS application server continues a session
+    /// through the S-CSCF with the Route the S-CSCF gave it, which carries the
+    /// original dialog identifier (TS 24.229 §5.7.5.2.1). `Route` is
+    /// framework-managed on a B-leg, so it cannot ride [`DialTarget::header`].
+    ///
+    /// A constructor for the reason [`DialTarget::uri_via`] is one: an
+    /// [`DialTarget::Aor`] cannot carry a route set. To pin a next hop as well,
+    /// build the [`DialTarget::Uri`] variant directly.
+    pub fn uri_routed<I, S>(uri: impl Into<String>, route: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self::Uri {
+            uri: uri.into(),
+            next_hop: None,
+            headers: Vec::new(),
+            identity: TargetIdentity::default(),
+            to: None,
+            route: route.into_iter().map(Into::into).collect(),
         }
     }
 
@@ -201,6 +236,7 @@ impl DialTarget {
                 headers,
                 identity,
                 to,
+                route,
             } => {
                 // A bare URI with no overrides is a plain string on the wire —
                 // the shape the server's own examples use. An identity counts
@@ -210,12 +246,16 @@ impl DialTarget {
                     && headers.is_empty()
                     && identity == &TargetIdentity::default()
                     && to.is_none()
+                    && route.is_empty()
                 {
                     return json!(uri);
                 }
                 object.insert("uri".to_string(), json!(uri));
                 if let Some(next_hop) = next_hop {
                     object.insert("next_hop".to_string(), json!(next_hop));
+                }
+                if !route.is_empty() {
+                    object.insert("route".to_string(), json!(route));
                 }
                 (headers, identity, to)
             }
@@ -823,6 +863,53 @@ mod tests {
             DialTarget::uri("sip:204@pbx.example").to_json(),
             json!("sip:204@pbx.example")
         );
+    }
+
+    #[test]
+    fn a_routed_target_carries_its_route_set_topmost_first() {
+        let target = DialTarget::uri_routed(
+            "sip:+15550100@ims.example.test",
+            [
+                "<sip:term@scscf.example.test;lr;odi=4f1c>",
+                "<sip:edge.example.test;lr>",
+            ],
+        );
+        assert_eq!(
+            target.to_json(),
+            json!({
+                "uri": "sip:+15550100@ims.example.test",
+                "route": [
+                    "<sip:term@scscf.example.test;lr;odi=4f1c>",
+                    "<sip:edge.example.test;lr>"
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn a_route_set_rides_beside_a_pinned_next_hop() {
+        let target = DialTarget::Uri {
+            uri: "sip:alice@ims.example.test".to_string(),
+            next_hop: Some("sip:192.0.2.10:5060".to_string()),
+            headers: Vec::new(),
+            identity: TargetIdentity::default(),
+            to: None,
+            route: vec!["<sip:scscf.example.test;lr>".to_string()],
+        };
+        assert_eq!(
+            target.to_json(),
+            json!({
+                "uri": "sip:alice@ims.example.test",
+                "next_hop": "sip:192.0.2.10:5060",
+                "route": ["<sip:scscf.example.test;lr>"]
+            })
+        );
+    }
+
+    #[test]
+    fn an_empty_route_set_stays_off_the_wire() {
+        let target = DialTarget::uri_routed("sip:204@pbx.example", Vec::<String>::new());
+        assert_eq!(target.to_json(), json!("sip:204@pbx.example"));
     }
 
     /// A called party defeats the bare-string shortcut too, on either target
