@@ -926,10 +926,22 @@ where
                 .map(|s| vec![extract_uri(s).to_string()])
         })
         .unwrap_or_default();
-    let called_party = message
-        .headers
-        .get("To")
-        .map(|s| extract_uri(s).to_string());
+    // TS 32.299 7.2.32: the Request-URI, which on a diverted call is the
+    // diverted-to user while To still names the original one; for a
+    // registration the To header field.
+    let to_uri = || {
+        message
+            .headers
+            .get("To")
+            .map(|s| extract_uri(s).to_string())
+    };
+    let called_party = match message.method() {
+        Some(crate::sip::message::Method::Register) => to_uri(),
+        _ => message
+            .request_uri()
+            .map(|uri| uri.to_string())
+            .or_else(to_uri),
+    };
     let user_session_id = message.headers.get("Call-ID").cloned();
 
     let charging_vector = message
@@ -1438,6 +1450,63 @@ mod tests {
         );
         assert_eq!(ims.calling_party, vec!["sip:alice@example.com".to_string()]);
         assert_eq!(ims.called_party.as_deref(), Some("sip:bob@example.com"));
+    }
+
+    /// TS 32.299 7.2.32: Called-Party-Address is the Request-URI, not the To
+    /// header field. They differ on a diverted call: the request to the
+    /// diverted-to user keeps the original To. The orig-cdiv invocation (RFC
+    /// 8498) is charged in the forwarding role.
+    #[test]
+    fn a_diverted_request_is_charged_to_its_request_uri_in_the_forwarding_role() {
+        let raw = concat!(
+            "INVITE sip:carol@example.com SIP/2.0\r\n",
+            "Via: SIP/2.0/UDP host;branch=z9hG4bK1\r\n",
+            "From: <sip:alice@example.com>;tag=a\r\n",
+            "To: <sip:bob@example.com>\r\n",
+            "P-Served-User: <sip:bob@example.com>; orig-cdiv; regstate=reg\r\n",
+            "Call-ID: c\r\n",
+            "CSeq: 1 INVITE\r\n",
+            "Max-Forwards: 70\r\n",
+            "Content-Length: 0\r\n",
+            "\r\n",
+        );
+        let msg = parse_test_sip(raw);
+        let ims = ims_data_from_request(
+            &msg,
+            Some(NodeFunctionality::ApplicationServer),
+            |_| true,
+            SipTimestamps::now(),
+        );
+        assert_eq!(ims.called_party.as_deref(), Some("sip:carol@example.com"));
+        assert_eq!(ims.role_of_node, Some(NodeRole::ForwardingRole));
+    }
+
+    /// For a registration Called-Party-Address is the To header field (TS
+    /// 32.299 7.2.32), not the registrar's Request-URI.
+    #[test]
+    fn a_register_is_charged_to_its_to_header_field() {
+        let raw = concat!(
+            "REGISTER sip:ims.example.com SIP/2.0\r\n",
+            "Via: SIP/2.0/UDP host;branch=z9hG4bK1\r\n",
+            "From: <sip:alice@ims.example.com>;tag=a\r\n",
+            "To: <sip:alice@ims.example.com>\r\n",
+            "Call-ID: c\r\n",
+            "CSeq: 1 REGISTER\r\n",
+            "Max-Forwards: 70\r\n",
+            "Content-Length: 0\r\n",
+            "\r\n",
+        );
+        let msg = parse_test_sip(raw);
+        let ims = ims_data_from_request(
+            &msg,
+            Some(NodeFunctionality::SCscf),
+            |_| true,
+            SipTimestamps::now(),
+        );
+        assert_eq!(
+            ims.called_party.as_deref(),
+            Some("sip:alice@ims.example.com")
+        );
     }
 
     #[test]

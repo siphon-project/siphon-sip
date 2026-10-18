@@ -166,6 +166,18 @@ entry, but a working config keeps working.
   `ValueError`. **BREAKING (Rust library):** `NodeFunctionality::SCscfRestore`,
   `Mmtel`, `Tpf` and `Atgw` are gone, `Ecscf` and `Atcf` change value. See
   `docs/migrating-to-1.15.md`.
+### Fixed
+
+- **Charging: an orig-cdiv request is recognised in the RFC 8498 form and
+  charged to its Request-URI.** `P-Served-User: <sip:bob@example.com>;
+  orig-cdiv; regstate=reg` (RFC 8498 section 6, a parameter without a value)
+  read as no session case, so the Ro and Rf records of a forwarded leg went out
+  with the role guessed from the From header instead of FORWARDING_ROLE. The
+  parameter is now read, and wins over a `sescase=orig` sent next to it;
+  `sescase=orig-cdiv` is still accepted. Called-Party-Address is the
+  Request-URI as TS 32.299 7.2.32 says, not the To header field, which on a
+  diverted call still names the forwarding user; a REGISTER keeps To.
+  Behaviour change on the wire.
 
 ## [1.14.0] — 2026-10-17
 
