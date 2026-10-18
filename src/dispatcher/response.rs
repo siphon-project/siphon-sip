@@ -6,6 +6,7 @@
 use super::*;
 // The B2BUA builders and send path live in their own subtree.
 use super::b2bua::*;
+use super::ipsec_lifecycle;
 
 /// Handle an inbound SIP response — route back to the original sender.
 #[allow(clippy::too_many_lines)] // TODO(1.9.0 split): decomposed by the dispatcher module split. handle_response: pre-session guards + session forwarding; splits in two
@@ -1192,22 +1193,7 @@ pub(super) fn handle_response(
                 && server_key.method == crate::sip::message::Method::Register
                 && message.headers.has("Security-Server")
             {
-                if let Some(manager) = state.ipsec_manager.as_ref() {
-                    // The REGISTER came over a pair of the UE's: its source is
-                    // that pair's client port, on the protected server port.
-                    let protected_by_port_c = state
-                        .ipsec_config
-                        .as_ref()
-                        .is_some_and(|config| inbound_local_addr.port() == config.pcscf_port_s)
-                        .then_some(source_addr.port())
-                        .filter(|port_c| manager.has_sa(&source_addr.ip(), *port_c));
-                    crate::ipsec::runtime::record_security_server_with(
-                        manager,
-                        &source_addr.ip(),
-                        &message,
-                        protected_by_port_c,
-                    );
-                }
+                ipsec_lifecycle::record_challenge(state, &message, source_addr, inbound_local_addr);
             }
 
             // What the caller is sent moves the caller's dialog state.
@@ -1272,18 +1258,9 @@ pub(super) fn handle_response(
                 );
             }
 
-            // A 2xx to a REGISTER over a security association: the pair now
-            // carries a registration, or, for a de-REGISTER, goes once the
-            // server transaction is over (TS 24.229 clause 5.2.5.1).
-            if (200..300).contains(&status_code)
-                && server_key.method == crate::sip::message::Method::Register
-            {
-                super::ipsec_lifecycle::after_register_2xx(
-                    state,
-                    &original_request,
-                    source_addr,
-                    transport,
-                );
+            // A 2xx to a REGISTER over a security association (TS 24.229 5.2.5.1).
+            if (200..300).contains(&status_code) && server_key.method == Method::Register {
+                ipsec_lifecycle::on_register_2xx(state, &original_request, source_addr, transport);
             }
 
             // Clean up on final response

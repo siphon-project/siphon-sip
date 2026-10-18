@@ -17,7 +17,7 @@ use crate::sip::message::SipMessage;
 use crate::transport::Transport;
 
 /// A 2xx to `register`, which `ue` sent over `transport`, has been sent to it.
-pub(super) fn after_register_2xx(
+pub(super) fn on_register_2xx(
     state: &DispatcherState,
     register: &SipMessage,
     ue: SocketAddr,
@@ -44,6 +44,34 @@ pub(super) fn after_register_2xx(
     {
         manager.note_registered(&ue.ip(), ue.port());
     }
+}
+
+/// A 401 with Security-Server to a REGISTER `ue` sent, arriving on `local`, is
+/// being relayed to it: record the offer, and, when the REGISTER came over a
+/// pair of the UE's (its source is that pair's client port, on the protected
+/// server port), the pair a re-registration keeps for a while (TS 33.203
+/// clause 7.4.2a).
+pub(super) fn record_challenge(
+    state: &DispatcherState,
+    challenge: &SipMessage,
+    ue: SocketAddr,
+    local: SocketAddr,
+) {
+    let Some(manager) = state.ipsec_manager.as_ref() else {
+        return;
+    };
+    let protected_by_port_c = state
+        .ipsec_config
+        .as_ref()
+        .is_some_and(|config| local.port() == config.pcscf_port_s)
+        .then_some(ue.port())
+        .filter(|port_c| manager.has_sa(&ue.ip(), *port_c));
+    crate::ipsec::runtime::record_security_server_with(
+        manager,
+        &ue.ip(),
+        challenge,
+        protected_by_port_c,
+    );
 }
 
 /// How long the server transaction of a REGISTER answered over `transport`

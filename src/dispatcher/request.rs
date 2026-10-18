@@ -1134,7 +1134,7 @@ pub(super) fn handle_request(
             // deletes its pair once this server transaction is over (TS 24.229
             // clause 5.2.5.1).
             if (200..300).contains(code) && method == "REGISTER" {
-                super::ipsec_lifecycle::after_register_2xx(
+                super::ipsec_lifecycle::on_register_2xx(
                     state,
                     &message_guard,
                     inbound.remote_addr,

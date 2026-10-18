@@ -1094,10 +1094,10 @@ impl PyIpsec {
     /// of a registration the network ended, so the NOTIFY telling the UE still
     /// reaches it.  ``0`` (the default) deletes now.
     ///
-    /// Example::
-    ///
-    ///     # reg-event NOTIFY: the network ended the registration
-    ///     await ipsec.delete(ue_ip, ue_port_c, delay_secs=5)
+    /// ```python,ignore
+    /// # reg-event NOTIFY: the network ended the registration
+    /// await ipsec.delete(ue_ip, ue_port_c, delay_secs=5)
+    /// ```
     ///
     /// Raises :class:`ValueError` when ``ue_addr`` is not an IP literal or
     /// ``delay_secs`` is negative or not finite.
