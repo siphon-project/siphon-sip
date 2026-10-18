@@ -26,8 +26,8 @@ use crate::rtpengine::{MediaBackend, RtpEngineError};
 use crate::sip::message::SipMessage;
 
 use super::{
-    dialog_ids, extract_answer_params, extract_delete_params, extract_message, extract_tag,
-    lock_message, PyCall, PyReply, PyRequest,
+    dialog_ids, extract_answer_params, extract_delete_params, extract_message, extract_raw_sdp,
+    extract_tag, lock_message, PyCall, PyReply, PyRequest,
 };
 
 /// What `answer` sends to the engine, resolved from either mode.
@@ -68,7 +68,7 @@ impl AnswerExchange {
         to_tag: Option<&str>,
         sessions: &MediaSessionStore,
     ) -> PyResult<Self> {
-        match sdp.map(extract_answer_sdp).transpose()? {
+        match sdp.map(|sdp| extract_raw_sdp(sdp, "answer")).transpose()? {
             Some(sdp) => {
                 if to_tag == Some("") {
                     return Err(pyo3::exceptions::PyValueError::new_err(
@@ -333,19 +333,6 @@ struct RawAnswerTarget {
     to_tag: Option<String>,
 }
 
-/// The SDP a script passed to `answer(sdp=...)`: `str` or `bytes`, not blank.
-fn extract_answer_sdp(sdp: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
-    let bytes = crate::script::api::request::extract_body_bytes(sdp).map_err(|_| {
-        pyo3::exceptions::PyTypeError::new_err("rtpengine.answer(sdp=...) must be str or bytes")
-    })?;
-    if bytes.iter().all(u8::is_ascii_whitespace) {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "rtpengine.answer(sdp=...) is empty",
-        ));
-    }
-    Ok(bytes)
-}
-
 /// The tag on a message's To header, if it has one.
 fn message_to_tag(message: &Arc<Mutex<SipMessage>>) -> PyResult<Option<String>> {
     let message = lock_message(message)?;
@@ -588,15 +575,21 @@ mod tests {
         Python::initialize();
         Python::attach(|python| {
             let text = PyString::new(python, "v=0\r\n");
-            assert_eq!(extract_answer_sdp(text.as_any()).unwrap(), b"v=0\r\n");
+            assert_eq!(
+                extract_raw_sdp(text.as_any(), "answer").unwrap(),
+                b"v=0\r\n"
+            );
             let bytes = PyBytes::new(python, b"v=0\r\n");
-            assert_eq!(extract_answer_sdp(bytes.as_any()).unwrap(), b"v=0\r\n");
+            assert_eq!(
+                extract_raw_sdp(bytes.as_any(), "answer").unwrap(),
+                b"v=0\r\n"
+            );
 
             let blank = PyString::new(python, " \r\n");
-            let error = extract_answer_sdp(blank.as_any()).unwrap_err();
+            let error = extract_raw_sdp(blank.as_any(), "answer").unwrap_err();
             assert!(error.is_instance_of::<pyo3::exceptions::PyValueError>(python));
             let number = 42i64.into_pyobject(python).unwrap();
-            let error = extract_answer_sdp(number.as_any()).unwrap_err();
+            let error = extract_raw_sdp(number.as_any(), "answer").unwrap_err();
             assert!(error.is_instance_of::<pyo3::exceptions::PyTypeError>(python));
         });
     }

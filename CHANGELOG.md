@@ -203,6 +203,18 @@ entry, but a working config keeps working.
   call. The script authorises it, so `b2bua.accept_replaces` does not gate it.
   An unknown dialog is refused `481`, an early one `480` (TS 24.237), and `tdialog` is
   honoured on this path. The `Replaces` path is unchanged.
+- **`rtpengine.offer(target, sdp=...)`: offer a raw SDP.** For an offering
+  party's SDP that reaches the script outside the call's own dialog, such as
+  one party's new SDP on an access transfer (TS 24.237), which arrives in a new
+  INVITE with a Call-ID of its own. `target` names the offerer: a Request,
+  Reply or Call, or a `(call_id, from_tag)` tuple (a bare `call_id` raises
+  `TypeError`). No message body is read or written and the coroutine resolves
+  to the rewritten SDP as `str`. On an anchored call it goes to the engine as a
+  `reoffer` on the session's engine call-id, so the call keeps its ports, and
+  either party may re-offer by its tag; the far party's answer can come back
+  through `answer(..., sdp=..., to_tag=...)` with the tags reversed. On any
+  other call it is the first offer and records the session. No source address
+  is carried. Without `sdp=` nothing changes.
 
 ## [1.14.0] — 2026-10-17
 

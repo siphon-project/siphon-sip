@@ -44,6 +44,22 @@ pub(in crate::script::api) fn extract_sdp_body(message: &SipMessage) -> PyResult
     }
 }
 
+/// The SDP a script passed to `offer(sdp=...)` or `answer(sdp=...)` (`verb`):
+/// `str` or `bytes`, not blank.
+pub(super) fn extract_raw_sdp(sdp: &Bound<'_, PyAny>, verb: &str) -> PyResult<Vec<u8>> {
+    let bytes = crate::script::api::request::extract_body_bytes(sdp).map_err(|_| {
+        pyo3::exceptions::PyTypeError::new_err(format!(
+            "rtpengine.{verb}(sdp=...) must be str or bytes"
+        ))
+    })?;
+    if bytes.iter().all(u8::is_ascii_whitespace) {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "rtpengine.{verb}(sdp=...) is empty"
+        )));
+    }
+    Ok(bytes)
+}
+
 /// Extract call-id, from-tag, and SDP body from a SIP message (offer direction).
 pub(super) fn extract_offer_params(
     message: &Arc<Mutex<SipMessage>>,

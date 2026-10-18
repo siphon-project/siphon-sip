@@ -202,6 +202,30 @@ media work, transcoding included when the two sides share no codec. No source
 address is carried for the far side (siphon never heard from it), so a profile's
 `received_from` does not gate its media.
 
+### When a party's new SDP arrives in another dialog
+
+On an access transfer (an SRVCC handover, TS 24.237) one party of a call siphon
+already anchors comes back in a new INVITE, with a Call-ID of its own, and its
+leg has to be re-pointed at the SDP of that INVITE. Pass the SDP to `offer()` and
+name the party by the anchored call's Call-ID and that party's tag:
+
+```python
+# old_call_id / far_tag: the anchored call, and the tag of the party moving.
+sdp = await rtpengine.offer((old_call_id, far_tag), sdp=new_invite.body)
+# ... send `sdp` to the party that stays, get its answer back ...
+answer = await rtpengine.answer((old_call_id, far_tag), sdp=their_sdp, to_tag=near_tag)
+```
+
+On a call siphon has anchored this goes to the engine as a re-offer, so every
+port the call holds stays put, addressed by the engine's own call-id even after a
+transfer re-anchored the call. Either party may re-offer: the tag of the party
+that made the first offer, or the tag its answer recorded for the other one, and
+the profile half that shapes it follows the same rule as a re-INVITE's. The
+answer comes back with the two tags the other way round. On a call siphon has not
+anchored, a raw offer is the call's first offer. No message body is read or
+written, the coroutine resolves to the rewritten SDP, and no source address is
+carried, so `received_from` does not gate that party's media.
+
 !!! warning "Always release"
     `offer` without a matching `delete` leaks an RTPEngine session until its
     inactivity timeout. Handle every teardown path — `on_bye`, `on_failure`,
