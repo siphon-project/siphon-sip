@@ -289,9 +289,9 @@ what lets a refused verb be lined up against a capture, a CDR and HEP.
 | verb | module | args | notes |
 |---|---|---|---|
 | `originate` | sip | `{channel, to \| aor, from?, from_display?, to_display?, next_hop?, p_asserted_identity?, privacy?, headers?, sdp \| body + content_type? \| media, profile?, ws_uri?, timeout?, on_lost?, vars?, session_timer?, strategy?, total_timeout?, contact_host?}` | place an outbound call under a **caller-supplied** channel id; returns as soon as the INVITE is on the wire. `aor` rings every phone registered at it, each over its own flow and Path, and the first to answer becomes the channel's call (`strategy` and `total_timeout` go with `aor` only). See [ringing a registered AoR](#ringing-a-registered-aor-originate-aor) |
-| `answer` | sip | `{code, reason?, body?, content_type?, headers?, anchor?, profile?, ws_uri?}` | UAS 2xx to the parked A-leg. `headers` (here and on `ring`, `progress` and `reject`) is an object of header name to string value added to the response; a header siphon owns on it (Via, From, To, Call-ID, CSeq, Contact, Record-Route, Route, Max-Forwards, Content-Length, Content-Type, RSeq, RAck, Require, Supported, Session-Expires, Min-SE) is refused `bad_request` and nothing is sent. With `anchor` (or a `profile` / `ws_uri`, which imply it) siphon synthesizes the RFC 3264 answer against the media engine and anchors the leg's audio to it in the same act — the verb form of `call.handover(answer=True, …)`, and the only way an app that took the call **un-answered** can connect it. Without a `ws_uri` the leg is anchored on the engine with **no bridge** — which is what `play`, DTMF and recording need, and what an IVR menu, a queue announcement, music on hold and a voicemail greeting all are. `siphon-rtp` only: on rtpengine / rtpproxy it answers `unavailable` rather than a 200 with nothing behind it, and on any media failure the 2xx is never sent, so the call stays parked and answerable |
-| `ring` | sip | `{reason?, headers?}` | `180 Ringing` — alerting only (RFC 3261 §13.2.1); a body is refused |
-| `progress` | sip | `{code, reason?, body?, content_type?, headers?, anchor?, profile?, ws_uri?}` | a UAS 1xx, optionally opening an early-media path with SDP (RFC 3960 §3.1); defaults to `183 Session Progress`. `headers: {"P-Early-Media": "sendrecv"}` tells the caller's network to pass the early media it carries (RFC 5009). With `anchor` (or a `profile` / `ws_uri`, which imply it) siphon synthesizes the early-media SDP against the media engine instead of taking a `body` (pass one or the other), and the later 2xx repeats that answer. An anchored progress needs a 101-199 code, since a 100 carries no body. On a media failure nothing is sent and it answers `unavailable`, with the call still parked |
+| `answer` | sip | `{code, reason?, body?, content_type?, headers?, anchor?, profile?, ws_uri?, contact_host?}` | UAS 2xx to the parked A-leg. `headers` (here and on `ring`, `progress` and `reject`) is an object of header name to string value added to the response; a header siphon owns on it (Via, From, To, Call-ID, CSeq, Contact, Record-Route, Route, Max-Forwards, Content-Length, Content-Type, RSeq, RAck, Require, Supported, Session-Expires, Min-SE) is refused `bad_request` and nothing is sent. With `anchor` (or a `profile` / `ws_uri`, which imply it) siphon synthesizes the RFC 3264 answer against the media engine and anchors the leg's audio to it in the same act — the verb form of `call.handover(answer=True, …)`, and the only way an app that took the call **un-answered** can connect it. Without a `ws_uri` the leg is anchored on the engine with **no bridge** — which is what `play`, DTMF and recording need, and what an IVR menu, a queue announcement, music on hold and a voicemail greeting all are. `siphon-rtp` only: on rtpengine / rtpproxy it answers `unavailable` rather than a 200 with nothing behind it, and on any media failure the 2xx is never sent, so the call stays parked and answerable |
+| `ring` | sip | `{reason?, headers?, contact_host?}` | `180 Ringing` — alerting only (RFC 3261 §13.2.1); a body is refused. `contact_host` here and on `answer` / `progress` is the host of siphon's Contact toward the caller (see [the caller's side](#the-callers-side)) |
+| `progress` | sip | `{code, reason?, body?, content_type?, headers?, anchor?, profile?, ws_uri?, contact_host?}` | a UAS 1xx, optionally opening an early-media path with SDP (RFC 3960 §3.1); defaults to `183 Session Progress`. `headers: {"P-Early-Media": "sendrecv"}` tells the caller's network to pass the early media it carries (RFC 5009). With `anchor` (or a `profile` / `ws_uri`, which imply it) siphon synthesizes the early-media SDP against the media engine instead of taking a `body` (pass one or the other), and the later 2xx repeats that answer. An anchored progress needs a 101-199 code, since a 100 carries no body. On a media failure nothing is sent and it answers `unavailable`, with the call still parked |
 | `reject` | sip | `{code, reason?, headers?}` | final non-2xx + tear down |
 | `hangup` | sip | `{reason?}` | BYE an answered call, or reject an unanswered one |
 | `drop` | sip | `{reason?, ban?}` | abandon an **unanswered** call with no final response and no CANCEL on the wire (the `100 Trying` siphon sent when the INVITE arrived has already gone) and release it; `ban: true` also scores the caller's source toward an auto-ban; refused (`invalid_state`) on an answered call, whose dialog is owed a BYE, and on an `originate {aor}` whose phones are still ringing, whose INVITEs are owed a CANCEL (`hangup`). See [dropping unsolicited traffic](#drop--abandon-a-call-without-answering-it) |
@@ -1881,6 +1881,37 @@ URI and wins, because a deployment that fronts siphon owns where in-dialog
 requests go; siphon logs a warning naming both. A transfer's new leg
 (`replace_peer`, `accept_refer`) presents the advertised host, and a
 `contact_host` on either verb or its target is `bad_request`.
+
+#### The caller's side
+
+A call that came in from such a peer needs the host on what siphon answers it
+with too. The controller names it once for the call: `contact_host` on
+`answer`, `ring` and `progress` (whose subject is the caller), or
+`caller_contact_host` on `dial` and `route` (whose targets' `contact_host`
+already means the legs siphon places). Every Contact siphon presents the
+caller then carries it: its own 18x and 2xx, the 18x and 2xx a connecting
+`dial` or a `route` relays from the callee, the answer to the caller's
+re-INVITE, UPDATE or REFER, and the re-INVITE, UPDATE and session refresh
+siphon sends the caller. As on a target, only the host changes; the port stays
+the listener the INVITE arrived on. A final 4xx-6xx siphon relays carries
+siphon's Contact today and takes the host as well (a 3xx keeps its redirect
+target); a CANCELled call's 487 carries none and still does not.
+
+```json
+{"verb": "dial", "args": {"caller_contact_host": "tenant-a.example.com",
+  "targets": [{"uri": "sip:+15550199@pbx.example", "contact_host": "tenant-a.example.com"}]}}
+```
+
+It sticks for the dialog. Before any 18x or 2xx went to the caller the last
+one named wins. After one did, the caller may already hold that Contact as its
+remote target (RFC 3261 §12.1.2): the same host again is accepted, and a
+different one is `invalid_state` with `error.details: {verb, argument, reason:
+"contact_already_presented", presented}`, nothing sent. That makes it an
+assertion on a bridging `dial`, whose caller was answered already. A Contact a
+script named whole (`call.answer(contact=...)`, `call.progress(contact=...)`)
+went out with the response that named it, so a controller can only repeat its
+host afterwards. `originate` has no caller side: siphon is the UAC there, and
+its own `contact_host` is the call's.
 
 ### Anchoring the media
 

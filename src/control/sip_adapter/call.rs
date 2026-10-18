@@ -185,6 +185,22 @@ pub(super) fn answer(
         Ok(headers) => headers,
         Err(refusal) => return refusal,
     };
+    let verb = if final_response { "answer" } else { "progress" };
+    let contact_host = match super::caller_contact::parse(verb, "contact_host", args) {
+        Ok(contact_host) => contact_host,
+        Err(refusal) => return refusal,
+    };
+    // Set once every argument has been checked, right before the response goes
+    // out, so a refused command leaves the call as it found it.
+    let present_contact_host = || {
+        super::caller_contact::apply(
+            &crate::dispatcher::RunningDispatcher,
+            channel,
+            verb,
+            "contact_host",
+            contact_host.as_deref(),
+        )
+    };
 
     // Answer + anchor in one act, the verb form of
     // `call.handover(answer=True, profile=…, ws_uri=…)`. Without it an app that
@@ -223,6 +239,9 @@ pub(super) fn answer(
                      Trying opens no early dialog and carries no body",
                 );
             }
+            if let Err(refusal) = present_contact_host() {
+                return refusal;
+            }
             return match crate::dispatcher::b2bua_progress_call_anchored(
                 &channel.call_actor_id,
                 code,
@@ -243,6 +262,9 @@ pub(super) fn answer(
                 // parked — retry with another profile, answer plainly, or reject.
                 Err(reason) => ControlResult::error(ControlErrorCode::Unavailable, reason),
             };
+        }
+        if let Err(refusal) = present_contact_host() {
+            return refusal;
         }
         return match crate::dispatcher::b2bua_answer_call_anchored(
             &channel.call_actor_id,
@@ -287,6 +309,9 @@ pub(super) fn answer(
     }
 
     let has_body = body.as_ref().is_some_and(|bytes| !bytes.is_empty());
+    if let Err(refusal) = present_contact_host() {
+        return refusal;
+    }
     if let Err(result) = send_uas_response(
         channel,
         code,
@@ -344,6 +369,19 @@ pub(super) fn ring(channel: &ChannelRef, args: &serde_json::Value) -> ControlRes
         Ok(headers) => headers,
         Err(refusal) => return refusal,
     };
+    let contact_host = match super::caller_contact::parse("ring", "contact_host", args) {
+        Ok(contact_host) => contact_host,
+        Err(refusal) => return refusal,
+    };
+    if let Err(refusal) = super::caller_contact::apply(
+        &crate::dispatcher::RunningDispatcher,
+        channel,
+        "ring",
+        "contact_host",
+        contact_host.as_deref(),
+    ) {
+        return refusal;
+    }
     if let Err(result) = send_uas_response(channel, 180, &reason, None, None, false, &headers) {
         return result;
     }

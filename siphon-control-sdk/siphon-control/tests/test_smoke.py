@@ -2300,3 +2300,76 @@ def test_contact_host_roundtrip():
                 await asyncio.wait_for(run_task, timeout=5)
 
     asyncio.run(scenario())
+
+
+def test_caller_contact_host_roundtrip():
+    """The caller side: `contact_host` on answer / answer_with / answer_anchored /
+    ring / progress, `caller_contact_host` on dial and route, each only when given."""
+
+    async def scenario():
+        frames = []
+        verbs = {"answer", "ring", "progress", "dial", "route"}
+
+        def reply(frame):
+            return {"channel": "ch1", "state": frame["verb"], "targets": 1}
+
+        stub = _verb_stub(verbs, reply, frames)
+        async with websockets.serve(
+            stub, "127.0.0.1", 0, subprotocols=[SUBPROTOCOL]
+        ) as server:
+            port = server.sockets[0].getsockname()[1]
+            url = f"ws://127.0.0.1:{port}/control/ws"
+            client = ControlClient(app=APP, token=TOKEN, url=url)
+            done = asyncio.get_event_loop().create_future()
+
+            @client.on_call
+            async def handle(call):
+                await call.ring(contact_host="tenant-a.example.com")
+                await call.ring("Ringing", contact_host="tenant-a.example.com")
+                await call.progress(contact_host="tenant-a.example.com")
+                await call.answer(contact_host="tenant-a.example.com")
+                await call.answer_with(183, contact_host="2001:db8::5")
+                await call.answer_anchored(profile="voice_ai", contact_host="tenant-a.example.com")
+                await call.answer()
+                await call.dial(
+                    [{"uri": "sip:204@pbx.example"}],
+                    caller_contact_host="tenant-a.example.com",
+                )
+                await call.route(
+                    ["sip:+15550100@carrier.example"],
+                    caller_contact_host="tenant-a.example.com",
+                )
+                if not done.done():
+                    done.set_result(True)
+
+            await client.connect()
+            run_task = asyncio.ensure_future(client.run())
+            await asyncio.sleep(0.3)
+            await client.command("test_push_stasis")
+            await asyncio.wait_for(done, timeout=5)
+
+            args = [(frame["verb"], frame["args"]) for frame in frames]
+            assert args[0] == ("ring", {"contact_host": "tenant-a.example.com"})
+            assert args[1] == (
+                "ring",
+                {"reason": "Ringing", "contact_host": "tenant-a.example.com"},
+            )
+            assert args[2] == ("progress", {"contact_host": "tenant-a.example.com"})
+            assert args[3] == ("answer", {"contact_host": "tenant-a.example.com"})
+            assert args[4] == ("answer", {"code": 183, "contact_host": "2001:db8::5"})
+            assert args[5] == (
+                "answer",
+                {"anchor": True, "profile": "voice_ai", "contact_host": "tenant-a.example.com"},
+            )
+            assert args[6][0] == "answer" and "contact_host" not in args[6][1]
+            assert args[7][0] == "dial"
+            assert args[7][1]["caller_contact_host"] == "tenant-a.example.com"
+            assert args[8][0] == "route"
+            assert args[8][1]["caller_contact_host"] == "tenant-a.example.com"
+            assert args[8][1]["targets"] == ["sip:+15550100@carrier.example"]
+
+            client.shutdown()
+            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+                await asyncio.wait_for(run_task, timeout=5)
+
+    asyncio.run(scenario())

@@ -28,8 +28,15 @@ entry, but a working config keeps working.
   `call.set_contact_user()` composes with it, `call.set_contact_uri()` wins.
   Anything but a hostname or an IP address is `bad_request` before anything is
   sent, and so is a `contact_host` on `replace_peer` or `accept_refer`. The
-  Rust, Python and TypeScript control SDKs take it as `contact_host` /
-  `contactHost`.
+  caller's side of a call that came in from such a peer takes one too:
+  `contact_host` on `answer`, `ring` and `progress`, `caller_contact_host` on
+  `dial` and `route`. It goes on every Contact siphon presents the caller (its
+  own 18x and 2xx, the ones a dial relays, the answer to the caller's
+  re-INVITE or UPDATE, and siphon's re-INVITE, UPDATE and session refresh to
+  it). It is fixed once the caller has been sent an 18x or 2xx: the same host
+  again is fine, another is `invalid_state`. The Rust, Python and TypeScript
+  control SDKs take them as `contact_host` / `caller_contact_host` and
+  `contactHost` / `callerContactHost`.
 - **Ro: sessions held in Rust, as many per call as needed, or none bound to a
   call.** `await diameter.ro_session(...)` opens a credit-control session and
   returns a `RoSession` handle; each has its own Session-Id, Subscription-Ids,

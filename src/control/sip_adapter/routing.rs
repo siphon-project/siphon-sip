@@ -40,6 +40,22 @@ pub(super) fn route(channel: &ChannelRef, args: &serde_json::Value) -> ControlRe
         .unwrap_or("sequential");
     let extra_headers = parse_extra_headers(args.get("headers"));
     let target_count = targets.len();
+    // The caller's own Contact host, which the 2xx relayed to it carries; the
+    // targets' `contact_host` is the one each attempt presents its carrier.
+    let caller_contact_host =
+        match super::caller_contact::parse("route", "caller_contact_host", args) {
+            Ok(host) => host,
+            Err(refusal) => return refusal,
+        };
+    if let Err(refusal) = super::caller_contact::apply(
+        &crate::dispatcher::RunningDispatcher,
+        channel,
+        "route",
+        "caller_contact_host",
+        caller_contact_host.as_deref(),
+    ) {
+        return refusal;
+    }
 
     match crate::dispatcher::b2bua_route_call(
         &channel.sip_call_id,
@@ -187,6 +203,13 @@ pub(super) fn dial(channel: &ChannelRef, command: &AdapterCommand) -> ControlRes
         .clamp(1, 3600) as u32;
     let extra_headers = parse_extra_headers(args.get("headers"));
     let target_count = targets.len();
+    // The caller's own Contact host. The targets' `contact_host` belongs to the
+    // legs siphon places, so the caller side has a name of its own.
+    let caller_contact_host =
+        match super::caller_contact::parse("dial", "caller_contact_host", args) {
+            Ok(host) => host,
+            Err(refusal) => return refusal,
+        };
 
     if on_answer == OnAnswer::Bridge {
         return super::dial_bridge::dial_bridge(
@@ -199,8 +222,19 @@ pub(super) fn dial(channel: &ChannelRef, command: &AdapterCommand) -> ControlRes
                 strategy: strategy.to_string(),
                 timeout_secs,
                 ringback,
+                caller_contact_host,
             },
         );
+    }
+    let dispatcher = super::dial_bridge::dispatcher_for(&command.origin.app);
+    if let Err(refusal) = super::caller_contact::apply(
+        dispatcher.as_ref(),
+        channel,
+        "dial",
+        "caller_contact_host",
+        caller_contact_host.as_deref(),
+    ) {
+        return refusal;
     }
 
     match crate::dispatcher::b2bua_dial_call(

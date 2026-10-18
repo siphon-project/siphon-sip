@@ -493,6 +493,13 @@ pub struct DialOptions {
     /// What happens when a phone picks up: connect the caller (the default) or
     /// bridge an already-answered caller to it.
     pub on_answer: Option<DialOnAnswer>,
+    /// Host of siphon's own Contact toward the caller (`caller_contact_host`),
+    /// on the answer a connecting dial relays it and everything after, for a
+    /// peer that identifies the tenant by that host. Each target's own
+    /// [`DialTarget::contact_host`] is the host its leg presents. Fixed once
+    /// the caller has been sent an 18x or 2xx, so on a bridging dial it can
+    /// only repeat the host its answer carried (another is `invalid_state`).
+    pub caller_contact_host: Option<String>,
 }
 
 impl DialOptions {
@@ -550,6 +557,12 @@ impl DialOptions {
         self
     }
 
+    /// Present this host in siphon's Contact toward the caller.
+    pub fn caller_contact_host(mut self, host: impl Into<String>) -> Self {
+        self.caller_contact_host = Some(host.into());
+        self
+    }
+
     fn insert_into(&self, args: &mut serde_json::Map<String, serde_json::Value>) {
         if let Some(strategy) = self.strategy {
             args.insert("strategy".to_string(), json!(strategy.as_str()));
@@ -565,6 +578,7 @@ impl DialOptions {
             ("from", &self.from),
             ("from_display", &self.from_display),
             ("p_asserted_identity", &self.p_asserted_identity),
+            ("caller_contact_host", &self.caller_contact_host),
         ] {
             if let Some(value) = value {
                 args.insert(name.to_string(), json!(value));
@@ -943,6 +957,23 @@ mod tests {
                 "route": ["<sip:scscf.example.test;lr>"]
             })
         );
+    }
+
+    /// The caller's Contact host rides the dial's own arguments, apart from
+    /// each target's.
+    #[test]
+    fn dial_options_carry_the_caller_contact_host() {
+        let mut args = serde_json::Map::new();
+        DialOptions::default()
+            .caller_contact_host("tenant-a.example.com")
+            .insert_into(&mut args);
+        assert_eq!(
+            serde_json::Value::Object(args),
+            json!({ "caller_contact_host": "tenant-a.example.com" })
+        );
+        let mut args = serde_json::Map::new();
+        DialOptions::default().insert_into(&mut args);
+        assert!(args.get("caller_contact_host").is_none());
     }
 
     /// A Contact host defeats the bare-string shortcut on either target form,

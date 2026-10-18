@@ -52,6 +52,7 @@
 
 #![forbid(unsafe_code)]
 
+mod caller_contact;
 mod cancel_dial;
 mod client;
 mod dial;

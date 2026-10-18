@@ -87,6 +87,36 @@ export interface ResponseOptions {
   reason?: string;
   body?: string;
   contentType?: string;
+  /**
+   * Host siphon presents in its own `Contact` toward the caller, in place of
+   * the address it advertises, for a peer that identifies the tenant or
+   * account by that host. Only the host changes, and every later Contact
+   * siphon presents the caller carries it. Fixed once an 18x or 2xx went out:
+   * the same host again is accepted, another rejects with `invalid_state`.
+   */
+  contactHost?: string;
+}
+
+/** Options for {@link Call.ring}. */
+export interface RingOptions {
+  /**
+   * Host siphon presents in its own `Contact` toward the caller, in place of
+   * the address it advertises, for a peer that identifies the tenant or
+   * account by that host. Only the host changes, and every later Contact
+   * siphon presents the caller carries it. Fixed once an 18x or 2xx went out:
+   * the same host again is accepted, another rejects with `invalid_state`.
+   */
+  contactHost?: string;
+}
+
+/** Options for {@link Call.route}. */
+export interface RouteOptions {
+  /**
+   * Host of siphon's own `Contact` toward the caller, as `contactHost` is on
+   * {@link Call.answer}. Each target's `contactHost` is the host its attempt
+   * presents the carrier.
+   */
+  callerContactHost?: string;
 }
 
 function responseArgs(options: ResponseOptions): Record<string, unknown> {
@@ -102,6 +132,9 @@ function responseArgs(options: ResponseOptions): Record<string, unknown> {
   }
   if (options.contentType !== undefined) {
     args.content_type = options.contentType;
+  }
+  if (options.contactHost !== undefined) {
+    args.contact_host = options.contactHost;
   }
   return args;
 }
@@ -121,6 +154,8 @@ export interface AnchoredAnswerOptions {
    * `callId`.
    */
   wsUri?: string;
+  /** Host of siphon's own `Contact` toward the caller; see {@link ResponseOptions}. */
+  contactHost?: string;
 }
 
 /** The RFC 3891 `Replaces` triple for an attended transfer. */
@@ -691,6 +726,14 @@ export interface DialOptions {
    * (`bad_request`, `requires_bridge`).
    */
   ringback?: string | boolean;
+  /**
+   * Host of siphon's own `Contact` toward the caller, as `contactHost` is on
+   * {@link Call.answer}; each target's `contactHost` is the host its leg
+   * presents. On a bridging dial, whose caller is answered already, it can
+   * only repeat the host that answer carried (another rejects with
+   * `invalid_state`).
+   */
+  callerContactHost?: string;
 }
 
 /**
@@ -837,6 +880,9 @@ export function dialArgs(
   }
   if (options.onAnswer !== undefined) args.on_answer = options.onAnswer;
   if (options.ringback !== undefined) args.ringback = options.ringback;
+  if (options.callerContactHost !== undefined) {
+    args.caller_contact_host = options.callerContactHost;
+  }
   return args;
 }
 
@@ -1098,6 +1144,9 @@ export class Call {
     if (options?.wsUri !== undefined) {
       args.ws_uri = options.wsUri;
     }
+    if (options?.contactHost !== undefined) {
+      args.contact_host = options.contactHost;
+    }
     await this.sip(SipVerb.Answer, args);
   }
 
@@ -1110,8 +1159,12 @@ export class Call {
    * then {@link Call.answer}; open an early-media path with
    * {@link Call.progress}.
    */
-  async ring(reason?: string): Promise<void> {
-    await this.sip(SipVerb.Ring, reason !== undefined ? { reason } : {});
+  async ring(reason?: string, options?: RingOptions): Promise<void> {
+    const args: Record<string, unknown> = reason !== undefined ? { reason } : {};
+    if (options?.contactHost !== undefined) {
+      args.contact_host = options.contactHost;
+    }
+    await this.sip(SipVerb.Ring, args);
   }
 
   /**
@@ -1269,6 +1322,7 @@ export class Call {
     targets: RouteTarget[],
     strategy = "sequential",
     headers?: Record<string, string>,
+    options?: RouteOptions,
   ): Promise<unknown> {
     const args: Record<string, unknown> = {
       targets: targets.map(routeTargetToWire),
@@ -1276,6 +1330,9 @@ export class Call {
     };
     if (headers !== undefined) {
       args.headers = headers;
+    }
+    if (options?.callerContactHost !== undefined) {
+      args.caller_contact_host = options.callerContactHost;
     }
     return this.sip(SipVerb.Route, args);
   }

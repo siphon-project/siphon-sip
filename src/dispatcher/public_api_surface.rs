@@ -170,14 +170,16 @@ fn the_public_surface_is_pinned() {
     // plus the 2 crate-internal items a `dial`, `route` or `originate` names
     // the host of siphon's own Contact through: the check of that host and the
     // originate entry point carrying it (`OriginateParams` is published and
-    // built literally, so it gains no field).
+    // built literally, so it gains no field), plus the 2 the caller's side of
+    // it goes through: setting the host on a call and the refusal it can
+    // answer with.
     // All additive, so a minor-compatible change — recorded here because that
     // is the tripwire.
     assert_eq!(
         declared + re_exported,
-        101,
+        103,
         "the dispatcher's public surface is {} items ({declared} declared here, \
-         {re_exported} re-exported), not 101. Adding one is a semver commitment on a \
+         {re_exported} re-exported), not 103. Adding one is a semver commitment on a \
          published crate; removing one breaks embedders. An extraction should move the \
          declaration and add a `pub use`, leaving this total unchanged.",
         declared + re_exported,

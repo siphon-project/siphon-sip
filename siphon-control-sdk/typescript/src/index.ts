@@ -151,6 +151,8 @@ export type {
   SessionTimer,
   ResponseOptions,
   AnchoredAnswerOptions,
+  RingOptions,
+  RouteOptions,
   ReferReplaces,
   AcceptReferOptions,
   BridgeOptions,

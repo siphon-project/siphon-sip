@@ -1383,3 +1383,45 @@ describe("recording args map to the names the server parses", () => {
     expect(recordStopArgs()).toEqual({});
   });
 });
+
+describe("the caller's contact host rides the verbs whose subject is the caller", () => {
+  it("answer / answerAnchored / ring / progress send contact_host only when given", async () => {
+    const transport = new RecordingTransport({ channel: "ch1", state: "answered" });
+    const call = makeCall(transport);
+    await call.ring(undefined, { contactHost: "tenant-a.example.com" });
+    await call.ring("Ringing");
+    await call.progress({ code: 183, contactHost: "tenant-a.example.com" });
+    await call.answer({ contactHost: "2001:db8::5" });
+    await call.answerAnchored({ profile: "voice_ai", contactHost: "tenant-a.example.com" });
+    await call.answer();
+    expect(transport.calls.map((sent) => [sent.verb, sent.args])).toEqual([
+      ["ring", { contact_host: "tenant-a.example.com" }],
+      ["ring", { reason: "Ringing" }],
+      ["progress", { code: 183, contact_host: "tenant-a.example.com" }],
+      ["answer", { contact_host: "2001:db8::5" }],
+      ["answer", { anchor: true, profile: "voice_ai", contact_host: "tenant-a.example.com" }],
+      ["answer", {}],
+    ]);
+  });
+
+  it("dial and route name it caller_contact_host, apart from each target's", async () => {
+    expect(
+      dialArgs([{ uri: "sip:204@pbx.example", contactHost: "tenant-b.example.com" }], {
+        callerContactHost: "tenant-a.example.com",
+      }),
+    ).toEqual({
+      targets: [{ uri: "sip:204@pbx.example", contact_host: "tenant-b.example.com" }],
+      caller_contact_host: "tenant-a.example.com",
+    });
+    const transport = new RecordingTransport({ channel: "ch1", state: "routing", targets: 1 });
+    const call = makeCall(transport);
+    await call.route(["sip:+15550100@carrier.example"], "sequential", undefined, {
+      callerContactHost: "tenant-a.example.com",
+    });
+    expect(transport.calls[0]?.args).toEqual({
+      targets: ["sip:+15550100@carrier.example"],
+      strategy: "sequential",
+      caller_contact_host: "tenant-a.example.com",
+    });
+  });
+});

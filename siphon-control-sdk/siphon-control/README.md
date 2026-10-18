@@ -142,7 +142,11 @@ reported as a failure. That is damage control, not a substitute for closing.
 - `Call` verbs: `answer()`, `answer_with(code, …)`, `answer_anchored(profile=None,
   ws_uri=None)`, `ring(reason=None)`, `progress()`, `reject(code, reason)`,
   `hangup(reason=None)`, `refer(to)` / `transfer(to)`, `route(targets, strategy="sequential",
-  headers=None)`, `set_header(name, value)`, `get_header(name)`, `remove_header(name)`,
+  headers=None, *, caller_contact_host=None)`. `answer`, `answer_with`, `answer_anchored`,
+  `ring` and `progress` take `contact_host=`, the host siphon presents in its own Contact
+  toward the caller (fixed once an 18x or 2xx went out; another host is `invalid_state`),
+  and `dial` / `route` take the same as `caller_contact_host=`. Also
+  `set_header(name, value)`, `get_header(name)`, `remove_header(name)`,
   `set_var(key, value)`, `get_var(key)`, `command(verb, args=None)`, `next_event()`.
 - `await call.dial(targets, strategy=None, timeout=None, headers=None, profile=None,
   from_uri=None, from_display=None, p_asserted_identity=None, privacy=None,

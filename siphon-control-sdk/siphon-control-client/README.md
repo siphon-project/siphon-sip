@@ -63,6 +63,11 @@ Every verb the server's `sip` adapter describes has a typed method:
   name the host siphon presents in its own Contact on that leg, in place of the
   address it advertises, for a peer that identifies the tenant or account by
   that host. Only the host changes.
+  The caller's side of the same: `ResponseOptions::contact_host` with
+  `answer_with_options` / `progress_with_options` (anchored too),
+  `ring_with_contact_host`, `DialOptions::caller_contact_host` and
+  `route_with_caller_contact_host`, the host of siphon's Contact toward the
+  caller, fixed once an 18x or 2xx went out.
 - **Transfers:** `refer` / `transfer` / `refer_replaces` send a REFER.
   `accept_refer` and `reject_refer` decide a pending inbound one.
   `accept_refer_dialling(target, mode, profile, &TransferDial)` names who the

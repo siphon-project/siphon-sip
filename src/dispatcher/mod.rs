@@ -132,6 +132,8 @@ mod control_bridge_media_tests;
 #[cfg(test)]
 mod control_bridge_relay_tests;
 #[cfg(test)]
+mod control_caller_contact_host_tests;
+#[cfg(test)]
 mod control_cancel_dial_tests;
 #[cfg(test)]
 mod control_dial_branch_events_tests;
@@ -372,13 +374,13 @@ pub(crate) use b2bua::{
     b2bua_take_over_is_anchored, bridge_calls_with_state, checked_contact_host,
     dial_answered_payload, dial_branch_identity, dial_branch_summary, dial_bridge_caller,
     dial_bridge_join, dial_bridge_refuse_phone, dial_bridge_spec, dial_bridge_start,
-    dial_targets_for_aor, forget_sent_info, ControllerReferRefusal, DialBridgeCaller,
-    DialBridgeListener, DialBridgePlan, DialBridgeRefusal, DialBridgeSender, DialBridgeSignal,
-    DialBridgeStartError, DialCancelRefusal, DialError, DialShaping, DialTarget, DispatcherHandle,
-    DropOutcome, OriginateGroupAnswers, OriginateGroupFailure, OriginateGroupSink,
-    OriginateGroupSpec, OriginateGroupStrategy, OriginateGroupWinner, OriginateLegProgress,
-    ReplacementDial, RunningDispatcher, DIAL_BRIDGE_CALLER_GONE, DIAL_CANCELLED,
-    DIAL_RINGBACK_ORIGIN,
+    dial_targets_for_aor, forget_sent_info, set_caller_contact_host, CallerContactHostRefusal,
+    ControllerReferRefusal, DialBridgeCaller, DialBridgeListener, DialBridgePlan,
+    DialBridgeRefusal, DialBridgeSender, DialBridgeSignal, DialBridgeStartError, DialCancelRefusal,
+    DialError, DialShaping, DialTarget, DispatcherHandle, DropOutcome, OriginateGroupAnswers,
+    OriginateGroupFailure, OriginateGroupSink, OriginateGroupSpec, OriginateGroupStrategy,
+    OriginateGroupWinner, OriginateLegProgress, ReplacementDial, RunningDispatcher,
+    DIAL_BRIDGE_CALLER_GONE, DIAL_CANCELLED, DIAL_RINGBACK_ORIGIN,
 };
 pub(crate) use charging::{ro_answer_ocs_request, ro_bind_call, RO_CONTROL};
 pub use charging::{ro_authorize_b2bua, RoAuthorizeOutcome};

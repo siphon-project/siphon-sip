@@ -3651,3 +3651,55 @@ fn a_refused_controller_transfer_names_its_verb_and_reason() {
         assert_eq!(details["reason"], reason);
     }
 }
+
+/// The caller's Contact host is checked before any verb sends anything: on
+/// `answer`, `ring` and `progress` as `contact_host`, on `dial` and `route`
+/// as `caller_contact_host`. A port, a URI or a non-string is `bad_request`
+/// naming the argument.
+#[test]
+fn a_caller_contact_host_siphon_cannot_present_is_bad_request() {
+    for (verb, argument) in [
+        ("answer", "contact_host"),
+        ("ring", "contact_host"),
+        ("progress", "contact_host"),
+        ("dial", "caller_contact_host"),
+        ("route", "caller_contact_host"),
+    ] {
+        for value in [
+            serde_json::json!("tenant-a.example.com:5070"),
+            serde_json::json!("sip:tenant-a.example.com"),
+            serde_json::json!(7),
+        ] {
+            let mut args = serde_json::json!({ argument: value });
+            if matches!(verb, "dial" | "route") {
+                args["targets"] = serde_json::json!(["sip:201@example.com"]);
+            }
+            let ControlResult::Error { code, message, .. } = sip_command(verb, args) else {
+                panic!("{verb} accepted {argument} {value}");
+            };
+            assert_eq!(code, ControlErrorCode::BadRequest, "{verb} {value}");
+            assert!(message.contains(argument), "{verb}: {message}");
+        }
+    }
+}
+
+/// A different host once the caller holds one is `invalid_state`, with the
+/// host it holds in the details.
+#[test]
+fn a_caller_contact_host_the_caller_already_holds_otherwise_is_invalid_state() {
+    let result = super::caller_contact::refused(
+        "dial",
+        "caller_contact_host",
+        crate::dispatcher::CallerContactHostRefusal::AlreadyPresented {
+            presented: "192.0.2.1".to_string(),
+        },
+    );
+    let ControlResult::Error { code, details, .. } = result else {
+        panic!("a refusal");
+    };
+    assert_eq!(code, ControlErrorCode::InvalidState);
+    let details = details.expect("details");
+    assert_eq!(details["reason"], "contact_already_presented");
+    assert_eq!(details["presented"], "192.0.2.1");
+    assert_eq!(details["argument"], "caller_contact_host");
+}

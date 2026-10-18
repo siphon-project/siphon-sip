@@ -70,6 +70,148 @@ pub(crate) fn prepare_originate_with_contact_host(
     )
 }
 
+/// Why a caller-side Contact host was not set.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum CallerContactHostRefusal {
+    /// Not a host siphon can put in its Contact ([`checked_contact_host`]).
+    #[error("{0}")]
+    Invalid(String),
+    /// The caller already holds a Contact with another host, from an 18x or
+    /// 2xx siphon sent it: it may have taken that as its remote target (RFC
+    /// 3261 §12.1.2), so siphon does not move it under the dialog.
+    #[error(
+        "the caller was already sent siphon's Contact with host {presented:?}, which it may \
+         hold as its remote target; contact_host can only repeat it now"
+    )]
+    AlreadyPresented {
+        /// The host the caller was sent.
+        presented: String,
+    },
+    /// No such call.
+    #[error("call is gone")]
+    UnknownCall,
+}
+
+/// Present `value` as the host of siphon's own Contact toward the caller of
+/// `internal_call_id`, on every response and request siphon sends that dialog
+/// from here on.
+///
+/// The caller side of [`DialTarget::contact_host`]: a call that came in from a
+/// peer which identifies the tenant or account by the host of the Contact
+/// needs that host in what siphon answers it with too. Only the host changes;
+/// port (the listener the INVITE arrived on), transport and user part stay.
+/// It sticks for the dialog: the same value again is a no-op, and a different
+/// one is refused once the caller has been sent an 18x or 2xx carrying a
+/// Contact. Before that the last one set wins.
+pub(crate) fn set_caller_contact_host(
+    state: &DispatcherState,
+    internal_call_id: &str,
+    value: &str,
+) -> Result<(), CallerContactHostRefusal> {
+    let host = checked_contact_host(value).map_err(CallerContactHostRefusal::Invalid)?;
+    let mut call = state
+        .call_actors
+        .get_call_mut(internal_call_id)
+        .ok_or(CallerContactHostRefusal::UnknownCall)?;
+    if call.caller_contact_host.as_deref() == Some(host.as_str()) {
+        return Ok(());
+    }
+    // A call siphon placed has no caller: siphon is the UAC of its INVITE,
+    // which already carried its Contact (an `originate`'s own `contact_host`),
+    // so that Contact is as fixed as one an answer presented.
+    if call.originated
+        || call
+            .caller_contact_presented
+            .load(std::sync::atomic::Ordering::Acquire)
+    {
+        let presented = call.caller_contact_host.clone().unwrap_or_else(|| {
+            call.a_leg
+                .dialog
+                .local_contact
+                .as_deref()
+                .and_then(contact_uri_host)
+                .unwrap_or_default()
+        });
+        if presented == host {
+            return Ok(());
+        }
+        return Err(CallerContactHostRefusal::AlreadyPresented { presented });
+    }
+    // The dialog's local Contact is what siphon's own answers and every
+    // request it sends the caller carry, so the host goes there as well.
+    if let Some(contact) = call.a_leg.dialog.local_contact.as_deref() {
+        match rewrite_contact_host(contact, &host) {
+            Some(rewritten) => call.a_leg.dialog.local_contact = Some(rewritten),
+            None => warn!(
+                call_id = %internal_call_id,
+                %contact,
+                "B2BUA: cannot put the caller contact_host into the dialog's Contact"
+            ),
+        }
+    }
+    info!(call_id = %internal_call_id, contact_host = %host, "B2BUA: caller-side Contact host set");
+    call.caller_contact_host = Some(host);
+    Ok(())
+}
+
+/// The Contact a response to the caller of `internal_call_id` carries, from
+/// the one siphon built for it (`built`): its host replaced by the caller's
+/// `contact_host` when one was named. An 18x or 2xx marks the Contact as
+/// presented, which is what fixes the host for the rest of the dialog.
+pub(crate) fn caller_response_contact(
+    state: &DispatcherState,
+    internal_call_id: &str,
+    status_code: Option<u16>,
+    built: String,
+) -> String {
+    let Some(call) = state.call_actors.get_call(internal_call_id) else {
+        return built;
+    };
+    if status_code.is_some_and(|code| (101..300).contains(&code)) {
+        call.caller_contact_presented
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+    match call.caller_contact_host.as_deref() {
+        Some(host) => rewrite_contact_host(&built, host).unwrap_or(built),
+        None => built,
+    }
+}
+
+/// Record that the caller of `internal_call_id` was sent siphon's Contact on
+/// an 18x or 2xx, for a response whose Contact is the dialog's own.
+pub(crate) fn note_caller_contact_presented(state: &DispatcherState, internal_call_id: &str) {
+    if let Some(call) = state.call_actors.get_call(internal_call_id) {
+        call.caller_contact_presented
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// `contact` (a Contact header value, `<uri>` with any parameters after it, or
+/// a bare URI) with the URI's host replaced by `host`, everything else as it
+/// was. `None` when the URI does not parse.
+fn rewrite_contact_host(contact: &str, host: &str) -> Option<String> {
+    let (before, uri, after) = match (contact.find('<'), contact.find('>')) {
+        (Some(open), Some(close)) if open < close => (
+            &contact[..=open],
+            &contact[open + 1..close],
+            &contact[close..],
+        ),
+        _ => ("", contact.trim(), ""),
+    };
+    let mut parsed = parse_uri_standalone(uri).ok()?;
+    parsed.host = host.to_string();
+    Some(format!("{before}{parsed}{after}"))
+}
+
+/// The host of the URI in a Contact header value.
+fn contact_uri_host(contact: &str) -> Option<String> {
+    let uri = match (contact.find('<'), contact.find('>')) {
+        (Some(open), Some(close)) if open < close => &contact[open + 1..close],
+        _ => contact.trim(),
+    };
+    parse_uri_standalone(uri).ok().map(|uri| uri.host)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -121,5 +263,26 @@ mod tests {
 
         targets[1].contact_host = Some("tenant.example.com:5070".to_string());
         assert!(check_branch_contact_hosts(&mut targets).is_err());
+    }
+
+    #[test]
+    fn a_contact_keeps_everything_but_its_host() {
+        assert_eq!(
+            rewrite_contact_host("<sip:192.0.2.1:5060;transport=udp>", "tenant-a.example.com")
+                .as_deref(),
+            Some("<sip:tenant-a.example.com:5060;transport=udp>")
+        );
+        assert_eq!(
+            rewrite_contact_host("<sip:focus@192.0.2.1:5070>;isfocus", "[2001:db8::5]").as_deref(),
+            Some("<sip:focus@[2001:db8::5]:5070>;isfocus")
+        );
+        assert_eq!(
+            rewrite_contact_host("<not a uri>", "tenant-a.example.com"),
+            None
+        );
+        assert_eq!(
+            contact_uri_host("<sip:192.0.2.1:5060;transport=udp>").as_deref(),
+            Some("192.0.2.1")
+        );
     }
 }

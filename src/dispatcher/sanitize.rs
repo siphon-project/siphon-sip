@@ -70,6 +70,10 @@ pub(super) fn sanitize_b2bua_response_keeping(
         a_leg_transport.to_string().to_lowercase(),
     );
     if !relayed_response_keeps_its_contact(response.status_code()) {
+        // The host the controller named for the caller's side, when it named
+        // one (`contact_host` on `answer`, `caller_contact_host` on `dial`).
+        let contact_value =
+            caller_response_contact(state, call_id, response.status_code(), contact_value);
         response.headers.set("Contact", contact_value);
     }
 

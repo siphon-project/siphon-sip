@@ -37,6 +37,7 @@ pub use crate::originate::{
 // `dial`, the recording pair and the stream pair hang their verbs off `Call` from their own
 // modules; their argument types are re-exported here so every SIP type is
 // reachable under one path.
+pub use crate::caller_contact::ResponseOptions;
 pub use crate::dial::{
     DialOnAnswer, DialOptions, DialStrategy, DialTarget, Dialing, Ringback, TargetIdentity,
 };
@@ -896,15 +897,7 @@ impl Call {
         strategy: Option<&str>,
         headers: Vec<(String, String)>,
     ) -> Result<serde_json::Value, ControlError> {
-        let mut args = json!({
-            "targets": targets.iter().map(RouteTarget::to_json).collect::<Vec<_>>(),
-        });
-        if let Some(strategy) = strategy {
-            args["strategy"] = json!(strategy);
-        }
-        if !headers.is_empty() {
-            args["headers"] = headers_to_json(&headers);
-        }
+        let args = crate::caller_contact::route_args(&targets, strategy, &headers, None);
         self.sip(SipVerb::Route, args).await
     }
 

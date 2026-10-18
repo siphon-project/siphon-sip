@@ -439,16 +439,29 @@ pub fn send_uas_response(
     // script that named its own (`call.answer(contact=…)`, a conference focus's
     // URI with `isfocus`, RFC 4579 §5.1) replaced it there.
     if code > 100 {
-        let contact = local_contact.unwrap_or_else(|| {
-            let host = state.a_leg_advertised_host(local_addr, &transport);
-            let port = state.a_leg_advertised_port(local_addr, &transport);
-            format!(
-                "<sip:{}:{};transport={}>",
-                host,
-                port,
-                transport.to_string().to_lowercase()
-            )
-        });
+        // The dialog's own Contact carries a caller `contact_host` already (it
+        // was rewritten when the host was set) or is a script's whole Contact,
+        // which wins as `set_contact_uri()` does on a B-leg. Only the one
+        // built here, for a leg that recorded none, takes the host now.
+        let contact = match local_contact {
+            Some(contact) => {
+                if code < 300 {
+                    note_caller_contact_presented(state, internal_call_id);
+                }
+                contact
+            }
+            None => {
+                let host = state.a_leg_advertised_host(local_addr, &transport);
+                let port = state.a_leg_advertised_port(local_addr, &transport);
+                let built = format!(
+                    "<sip:{}:{};transport={}>",
+                    host,
+                    port,
+                    transport.to_string().to_lowercase()
+                );
+                caller_response_contact(state, internal_call_id, Some(code), built)
+            }
+        };
         response.headers.set("Contact", contact);
     }
 
