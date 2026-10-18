@@ -110,9 +110,13 @@ async fn a_retransmitted_answer_reaches_the_caller_each_time() {
             for name in ["From", "To", "Call-ID", "CSeq"] {
                 assert_eq!(header(again, name), header(first, name), "{name}");
             }
-            assert!(
-                again.headers.get("X-Reply-Handler").is_none(),
-                "the script saw this request end with the first 200"
+            // The script saw this request end with the first 200 and is not
+            // run again; the copy is the first as it was forwarded, with
+            // what the script did to it (RFC 3261 §13.3.1.4).
+            assert_eq!(
+                again.to_bytes(),
+                first.to_bytes(),
+                "copy {copy} is the first as it was forwarded"
             );
         }
         // Nothing was brought back for them.

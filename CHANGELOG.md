@@ -13,6 +13,18 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Proxy: a retransmitted 2xx to an INVITE goes out as the first copy was
+  forwarded.** A UAS retransmits its 2xx until the ACK arrives (RFC 3261
+  §13.3.1.4). Each copy used to be forwarded statelessly as the UAS sent it:
+  without what `@proxy.on_reply` did to the first (an anchored SDP, say) and
+  from the default listener rather than the socket the INVITE came in on, so
+  on a P-CSCF outside the UE's IPsec SA. A caller that took a later copy sent
+  its media to the wrong place. The forwarded 2xx is now kept, with its
+  destination, transport and local socket, until its ACK or 64*T1, and a
+  retransmission re-sends it. A 2xx from another branch is unchanged.
+
 ## [1.14.0] — 2026-10-17
 
 ### Added

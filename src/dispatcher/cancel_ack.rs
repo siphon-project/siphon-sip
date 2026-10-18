@@ -583,6 +583,8 @@ pub(super) fn handle_ack_via_session(
     session_arc: Arc<RwLock<ProxySession>>,
     state: &DispatcherState,
 ) {
+    // The ACK ends the 2xx's retransmissions (RFC 3261 §13.3.1.4).
+    state.session_store.forget_forwarded_answer(&message);
     let session = match session_arc.read() {
         Ok(s) => s,
         Err(_) => {
