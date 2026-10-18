@@ -542,11 +542,52 @@ class _B2buaNamespace:
         )
 
     @staticmethod
-    def on_invite(fn):
-        """Register handler for new INVITE (new call)."""
-        is_async = _asyncio.iscoroutinefunction(fn)
-        _registry.register("b2bua.on_invite", None, fn, is_async)
-        return fn
+    def on_invite(fn=None, *, request_uri=None):
+        """Register handler for new INVITE (new call).
+
+        Usage:
+            @b2bua.on_invite                          # every new INVITE
+            @b2bua.on_invite(request_uri=r"^sip:\+?881")  # only these
+
+        ``request_uri`` is a regular expression (Rust ``regex`` syntax)
+        searched for anywhere in the Request-URI as it is serialised, so
+        anchor it with ``^`` / ``$`` to match the whole URI. An invalid
+        pattern raises ``ValueError`` here.
+
+        With no filter, any ``@b2bua.*`` handler makes every new INVITE a
+        B2BUA call. When every ``on_invite`` handler carries a filter, the
+        B2BUA takes only the initial INVITEs (no To-tag) a filter matches,
+        and runs only the handlers that match (plus any unfiltered ones).
+        Every other INVITE takes the proxy path, where ``@proxy.on_request``
+        sees it as it would in a script with no B2BUA handlers.
+        ``control.inbound`` still takes every INVITE.
+        """
+        if request_uri is not None:
+            if not isinstance(request_uri, str):
+                raise TypeError(
+                    "b2bua.on_invite(request_uri=...) must be a str, "
+                    f"got {type(request_uri).__name__}"
+                )
+            if not request_uri:
+                raise ValueError("b2bua.on_invite(request_uri=...) is empty")
+            check = getattr(_registry, "check_request_uri_pattern", None)
+            if check is not None:
+                check(request_uri)
+        metadata = None if request_uri is None else {"request_uri": request_uri}
+
+        def decorator(handler):
+            is_async = _asyncio.iscoroutinefunction(handler)
+            _registry.register("b2bua.on_invite", None, handler, is_async, metadata)
+            return handler
+
+        if fn is None:
+            return decorator
+        if not callable(fn):
+            raise TypeError(
+                "b2bua.on_invite expects a handler function; pass a filter as "
+                "request_uri=..."
+            )
+        return decorator(fn)
 
     @staticmethod
     def on_provisional(fn):

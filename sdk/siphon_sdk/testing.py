@@ -708,8 +708,9 @@ class SipTestHarness:
         if refusal is not None:
             return refusal
 
-        registry = mock_module.get_registry()
-        handlers = registry.get("b2bua.on_invite")
+        # The unfiltered handlers, and the filtered ones whose
+        # `request_uri=` pattern matches this call's Request-URI.
+        handlers = mock_module.b2bua_invite_handlers(str(call.ruri))
 
         for fn, is_async in handlers:
             if is_async:
@@ -723,6 +724,57 @@ class SipTestHarness:
             self._release_inbound(call)
 
         return CallResult(call=call, actions=list(call.actions))
+
+    def dispatch_invite(
+        self,
+        ruri: Union[str, SipUri] = "sip:bob@example.com",
+        *,
+        call_id: Optional[str] = None,
+        from_uri: Union[str, SipUri, None] = "sip:alice@example.com",
+        to_uri: Union[str, SipUri, None] = None,
+        to_tag: Optional[str] = None,
+        body: Optional[bytes] = None,
+        headers: Optional[dict[str, str]] = None,
+        source_ip: str = "127.0.0.1",
+    ) -> Union[CallResult, RequestResult]:
+        """Send an INVITE down the path siphon would take it.
+
+        A script whose ``@b2bua.on_invite`` handlers all carry a
+        ``request_uri=`` filter is a B2BUA for the INVITEs a filter matches
+        and a proxy for the rest. This sends an initial INVITE (no
+        ``to_tag``) the B2BUA takes to :meth:`send_invite` and returns its
+        :class:`CallResult`; any other INVITE, an in-dialog one included, goes
+        to :meth:`send_request` and returns its :class:`RequestResult`. With
+        unfiltered B2BUA handlers every INVITE is the B2BUA's, and with none
+        every INVITE is the proxy's, as at runtime.
+
+        Example::
+
+            result = harness.dispatch_invite("sip:transfer@example.com")
+            assert isinstance(result, CallResult)
+        """
+        uri = str(ruri)
+        if mock_module.b2bua_claims_invite(uri, in_dialog=to_tag is not None):
+            return self.send_invite(Call(
+                call_id=call_id,
+                from_uri=from_uri,
+                to_uri=to_uri if to_uri is not None else uri,
+                ruri=uri,
+                body=body,
+                headers=headers,
+                source_ip=source_ip,
+            ))
+        return self.send_request(
+            "INVITE",
+            uri,
+            call_id=call_id,
+            from_uri=from_uri,
+            to_uri=to_uri,
+            to_tag=to_tag,
+            body=body,
+            headers=headers,
+            source_ip=source_ip,
+        )
 
     def send_answer(self, call: Optional[Call] = None, **kwargs: Any) -> CallResult:
         """Send a B2BUA answer event."""

@@ -129,3 +129,21 @@ pub fn b2bua_mode_active(
 ) -> bool {
     engine_state.has_b2bua_handlers() || state.control_inbound.is_some()
 }
+
+/// Whether B2BUA mode takes `invite`, an INVITE that matches no B2BUA call,
+/// as a new call. One it does not take goes down the proxy path, exactly as in
+/// a script with no B2BUA handlers.
+///
+/// `control.inbound` takes every one. Otherwise the script decides
+/// ([`ScriptState::b2bua_claims_invite`]): every one, unless all its
+/// `@b2bua.on_invite` handlers carry a `request_uri` filter, which then pick
+/// the initial INVITEs it takes.
+///
+/// [`ScriptState::b2bua_claims_invite`]: crate::script::engine::ScriptState::b2bua_claims_invite
+pub fn b2bua_takes_invite(
+    engine_state: &crate::script::engine::ScriptState,
+    state: &crate::dispatcher::DispatcherState,
+    invite: &crate::sip::message::SipMessage,
+) -> bool {
+    state.control_inbound.is_some() || engine_state.b2bua_claims_invite(invite)
+}

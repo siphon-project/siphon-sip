@@ -178,6 +178,18 @@ entry, but a working config keeps working.
   Request-URI as TS 32.299 7.2.32 says, not the To header field, which on a
   diverted call still names the forwarding user; a REGISTER keeps To.
   Behaviour change on the wire.
+- **`@b2bua.on_invite(request_uri=r"...")`: pick the INVITEs the B2BUA takes.**
+  Any `@b2bua.*` handler used to make every INVITE of the process a B2BUA call.
+  When every `on_invite` handler carries a `request_uri=` filter (a Rust regex,
+  searched for in the serialised Request-URI), the B2BUA takes only the initial
+  INVITEs a filter matches and runs only the matching handlers; every other
+  INVITE, and an in-dialog INVITE that is no B2BUA call's, takes the proxy path
+  as in a script without B2BUA handlers. An unfiltered `on_invite` and
+  `control.inbound` keep taking every INVITE. A bad pattern raises `ValueError`
+  at decoration. A final response the proxy path sends on its own INVITE server
+  transaction is no longer also kept in the B2BUA's retransmission table. SDK:
+  the mock decorator takes the keyword and `SipTestHarness.dispatch_invite()`
+  sends an INVITE down the path siphon would take.
 
 ## [1.14.0] — 2026-10-17
 
