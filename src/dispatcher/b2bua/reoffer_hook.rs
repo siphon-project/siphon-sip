@@ -104,7 +104,7 @@ impl Offerer<'_> {
 
 /// The `Call` a handler is shown: over the caller's INVITE as every other
 /// `@b2bua.*` handler, or `fallback` when the call has none stored.
-fn py_call_for(
+pub(crate) fn py_call_for(
     call_id: &str,
     fallback: Option<&SipMessage>,
     state: &DispatcherState,

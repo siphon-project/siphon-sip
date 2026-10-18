@@ -127,10 +127,212 @@ pub fn handle_b2bua_info(inbound: InboundMessage, message: SipMessage, state: &D
         return;
     }
 
-    // One-legged: siphon is the far party, so it answers. RFC 6086 §4.2.2 —
-    // an INFO a UAS understood is a 200, with no body owed back.
-    debug!(call_id = %call_id, "B2BUA INFO: answering on a one-legged call");
-    respond(&inbound, &message, 200, "OK", state);
+    // One-legged: siphon is the far party, so it answers. A retransmission of
+    // an INFO already handed to the script gets the same answer again, and is
+    // not handed over twice (RFC 3261 §17.2.2).
+    let key = InfoKey::of(&message);
+    if let Some(key) = &key {
+        match answered_infos().begin(key) {
+            InfoSeen::New => {}
+            InfoSeen::InProgress => {
+                debug!(call_id = %call_id, "B2BUA INFO: retransmission while the script decides, absorbed");
+                return;
+            }
+            InfoSeen::Answered(response) => {
+                debug!(call_id = %call_id, "B2BUA INFO: retransmission, the answer sent again");
+                send_message_from(
+                    response,
+                    inbound.transport,
+                    inbound.remote_addr,
+                    inbound.connection_id,
+                    Some(inbound.local_addr),
+                    state,
+                );
+                return;
+            }
+        }
+    }
+    // `@b2bua.on_info` may answer it itself, with a status and a body (RFC
+    // 6086 §4.2.2 lets a 200 to an INFO carry one, and an application package
+    // that carries requests in INFO needs it for their results). Without a
+    // handler, or a handler that does not answer, it is a bare 200: an INFO a
+    // UAS understood, with no body owed back.
+    let response = run_info_hook(&call_id, &inbound, &message, state).unwrap_or_else(|| {
+        debug!(call_id = %call_id, "B2BUA INFO: answering on a one-legged call");
+        build_response(&message, 200, "OK", state.server_header.as_deref(), &[])
+    });
+    if let Some(key) = key {
+        answered_infos().answered(key, &response);
+    }
+    send_message_from(
+        response,
+        inbound.transport,
+        inbound.remote_addr,
+        inbound.connection_id,
+        Some(inbound.local_addr),
+        state,
+    );
+}
+
+/// Show an INFO on a one-legged call to `@b2bua.on_info` and build the
+/// response it asked for with `request.reply()` (and `set_reply_body()` /
+/// `set_reply_header()`). `None` when no handler ran, a handler raised, or
+/// none answered: the caller then sends the default 200.
+fn run_info_hook(
+    call_id: &str,
+    inbound: &InboundMessage,
+    message: &SipMessage,
+    state: &DispatcherState,
+) -> Option<SipMessage> {
+    let engine_state = state.engine.state();
+    let handlers = engine_state.handlers_for(&HandlerKind::B2buaInfo);
+    if handlers.is_empty() {
+        return None;
+    }
+    let py_call = py_call_for(call_id, Some(message), state)?;
+    let request = Arc::new(std::sync::Mutex::new(message.clone()));
+    let py_request = PyRequest::new(
+        Arc::clone(&request),
+        format!("{}", inbound.transport).to_lowercase(),
+        inbound.remote_addr.ip().to_string(),
+        inbound.remote_addr.port(),
+    );
+    let decided = Python::attach(|python| {
+        let (call_object, request_object) = match (
+            Py::new(python, py_call),
+            Py::new(python, py_request),
+        ) {
+            (Ok(call), Ok(request)) => (call, request),
+            (Err(error), _) | (_, Err(error)) => {
+                error!(call_id = %call_id, "B2BUA on_info: could not build its arguments: {error}");
+                return None;
+            }
+        };
+        for handler in &handlers {
+            let callable = handler.callable.bind(python);
+            let raised =
+                match callable.call1((call_object.bind(python), request_object.bind(python))) {
+                    Ok(returned) if handler.is_async => run_coroutine(python, &returned).err(),
+                    Ok(_) => None,
+                    Err(error) => Some(error),
+                };
+            if let Some(error) = raised {
+                record_script_error("B2BUA on_info", &error);
+                return None;
+            }
+        }
+        if !matches!(call_object.borrow(python).action(), CallAction::None) {
+            warn!(call_id = %call_id, "B2BUA on_info: a call action has no effect here; answer the INFO with request.reply()");
+        }
+        let mut borrowed = request_object.borrow_mut(python);
+        match borrowed.action().clone() {
+            RequestAction::Reply { code, reason, .. } => {
+                let headers = borrowed.take_reply_headers();
+                let body = borrowed.take_reply_body();
+                Some((code, reason, headers, body))
+            }
+            RequestAction::None => None,
+            _ => {
+                warn!(call_id = %call_id, "B2BUA on_info: only request.reply() answers an INFO here; sending the default 200");
+                None
+            }
+        }
+    })?;
+    let (code, reason, headers, body) = decided;
+    if !(200..=699).contains(&code) {
+        warn!(call_id = %call_id, code, "B2BUA on_info: an INFO is answered with a final status; sending the default 200");
+        return None;
+    }
+    let mut response = build_response(
+        message,
+        code,
+        &reason,
+        state.server_header.as_deref(),
+        &headers,
+    );
+    if let Some((body, content_type)) = body {
+        response.headers.set("Content-Type", content_type);
+        response
+            .headers
+            .set("Content-Length", body.len().to_string());
+        response.body = body;
+    }
+    Some(response)
+}
+
+/// An INFO transaction on a dialog: the request's Call-ID, CSeq number and
+/// top Via branch (RFC 3261 §17.2.3).
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct InfoKey {
+    call_id: String,
+    cseq: u32,
+    branch: String,
+}
+
+impl InfoKey {
+    fn of(message: &SipMessage) -> Option<Self> {
+        let call_id = message.headers.call_id()?.to_string();
+        let cseq = message
+            .headers
+            .get("CSeq")
+            .and_then(|raw| crate::sip::headers::cseq::CSeq::parse(raw).ok())?
+            .sequence;
+        let branch = message
+            .headers
+            .get("Via")
+            .and_then(|raw| Via::parse_multi(raw).ok())
+            .and_then(|vias| vias.first().and_then(|via| via.branch.clone()))?;
+        Some(Self {
+            call_id,
+            cseq,
+            branch,
+        })
+    }
+}
+
+enum InfoSeen {
+    New,
+    InProgress,
+    Answered(SipMessage),
+}
+
+/// INFOs answered on one-legged calls, kept for the life of a server
+/// transaction (Timer J, 64·T1) so a retransmission is answered from here.
+struct AnsweredInfos {
+    entries: dashmap::DashMap<InfoKey, (std::time::Instant, Option<SipMessage>)>,
+}
+
+/// RFC 3261 §17.2.2 Timer J for an unreliable transport: 64·T1.
+const INFO_REMEMBERED_FOR: std::time::Duration = std::time::Duration::from_secs(32);
+
+impl AnsweredInfos {
+    fn begin(&self, key: &InfoKey) -> InfoSeen {
+        let now = std::time::Instant::now();
+        self.entries
+            .retain(|_, (seen, _)| now.duration_since(*seen) < INFO_REMEMBERED_FOR);
+        match self.entries.entry(key.clone()) {
+            dashmap::mapref::entry::Entry::Occupied(entry) => match &entry.get().1 {
+                Some(response) => InfoSeen::Answered(response.clone()),
+                None => InfoSeen::InProgress,
+            },
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                entry.insert((now, None));
+                InfoSeen::New
+            }
+        }
+    }
+
+    fn answered(&self, key: InfoKey, response: &SipMessage) {
+        self.entries
+            .insert(key, (std::time::Instant::now(), Some(response.clone())));
+    }
+}
+
+fn answered_infos() -> &'static AnsweredInfos {
+    static ANSWERED: std::sync::OnceLock<AnsweredInfos> = std::sync::OnceLock::new();
+    ANSWERED.get_or_init(|| AnsweredInfos {
+        entries: dashmap::DashMap::new(),
+    })
 }
 
 /// Send a plain response on the flow the request arrived on.
