@@ -58,8 +58,15 @@ impl std::fmt::Display for SendInfoRefusal {
     }
 }
 
-/// The final response to a sent INFO: its status and reason phrase.
-pub type InfoResponse = (u16, String);
+/// The final response to a sent INFO: its status, reason phrase, and body
+/// with its Content-Type (an application package answers a request in it).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InfoResponse {
+    pub status: u16,
+    pub reason: String,
+    pub body: Vec<u8>,
+    pub content_type: Option<String>,
+}
 
 /// An INFO on its way: its Via branch, and where its final response arrives.
 pub struct SentInfo {
@@ -92,12 +99,14 @@ pub fn check_info_headers(headers: &[(String, String)]) -> Result<(), SendInfoRe
     Ok(())
 }
 
-/// Send an INFO in the caller's dialog of the call `sip_call_id` (the A leg:
-/// on a call siphon answered itself, its only dialog). Returns the INFO's
-/// branch and the receiver of its final response; a caller that stops
-/// waiting hands the branch to [`forget_sent_info`].
+/// Send an INFO in a dialog of the call `sip_call_id`: the caller's
+/// (`on_a_leg`; on a call siphon answered itself, its only dialog) or the
+/// answered callee's. Returns the INFO's branch and the receiver of its final
+/// response; a caller that stops waiting hands the branch to
+/// [`forget_sent_info`].
 pub fn b2bua_send_info(
     sip_call_id: &str,
+    on_a_leg: bool,
     content_type: Option<&str>,
     body: Vec<u8>,
     headers: &[(String, String)],
@@ -110,25 +119,38 @@ pub fn b2bua_send_info(
         .find_by_sip_call_id(sip_call_id)
         .ok_or(SendInfoRefusal::NotFound)?;
     let _enter = control.runtime.enter();
-    send_info_on_a_leg(state, &internal_call_id, content_type, body, headers)
+    send_info_on_leg(
+        state,
+        &internal_call_id,
+        on_a_leg,
+        content_type,
+        body,
+        headers,
+    )
 }
 
 /// [`b2bua_send_info`] on a known call, for the dispatcher's own callers and
 /// tests.
-pub fn send_info_on_a_leg(
+pub fn send_info_on_leg(
     state: &DispatcherState,
     internal_call_id: &str,
+    on_a_leg: bool,
     content_type: Option<&str>,
     body: Vec<u8>,
     headers: &[(String, String)],
 ) -> Result<SentInfo, SendInfoRefusal> {
     let cseq = state
         .call_actors
-        .reserve_leg_cseq(internal_call_id, true)
-        .ok_or(SendInfoRefusal::NotFound)?;
+        .reserve_leg_cseq(internal_call_id, on_a_leg)
+        // A call without an answered callee has no callee dialog yet.
+        .ok_or(if on_a_leg {
+            SendInfoRefusal::NotFound
+        } else {
+            SendInfoRefusal::NoDialog
+        })?;
     let leg = state
         .call_actors
-        .clone_leg(internal_call_id, true)
+        .clone_leg(internal_call_id, on_a_leg)
         .ok_or(SendInfoRefusal::NotFound)?;
     let extra: Vec<(&str, String)> = headers
         .iter()
@@ -215,9 +237,17 @@ pub fn take_sent_info_response(message: &SipMessage, status_code: u16) -> bool {
         return true;
     }
     if let Some((_, sender)) = pending.remove(&branch) {
-        let reason = response_reason_phrase(message).to_string();
+        let response = InfoResponse {
+            status: status_code,
+            reason: response_reason_phrase(message).to_string(),
+            body: message.body.clone(),
+            content_type: message
+                .headers
+                .get("Content-Type")
+                .map(|value| value.to_string()),
+        };
         // The script may have stopped waiting; the response is still taken.
-        let _ = sender.send((status_code, reason));
+        let _ = sender.send(response);
     }
     true
 }
