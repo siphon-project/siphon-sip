@@ -133,9 +133,14 @@ impl ConnectionCloser {
     }
 }
 
+/// Woken each time a connection leaves [`LIVE_CONNECTIONS`], for
+/// [`peer_closed_within`].
+static CONNECTION_LEFT: LazyLock<Notify> = LazyLock::new(Notify::new);
+
 impl Drop for ConnectionCloser {
     fn drop(&mut self) {
         LIVE_CONNECTIONS.remove(&self.connection_id);
+        CONNECTION_LEFT.notify_waiters();
     }
 }
 
@@ -208,6 +213,38 @@ pub(crate) fn close_peer(peer: SocketAddr, reason: &str) -> usize {
         );
     }
     held.len()
+}
+
+/// Wait until no live stream connection with `peer` is left, for at most
+/// `bound`. Returns whether none is.
+///
+/// A connection [`close_peer`] signalled tears itself down in its own task and
+/// leaves [`LIVE_CONNECTIONS`] only once its socket is closed, so this is how a
+/// caller orders something after that close: a P-CSCF deleting the security
+/// associations a connection ran over, whose FIN would otherwise leave in
+/// plaintext on the protected port. Bounded, so a connection whose teardown
+/// stalls holds the caller up for `bound` and no longer.
+pub(crate) async fn peer_closed_within(peer: SocketAddr, bound: std::time::Duration) -> bool {
+    let open = || {
+        LIVE_CONNECTIONS
+            .iter()
+            .any(|entry| entry.value().peer == peer)
+    };
+    tokio::time::timeout(bound, async {
+        loop {
+            // Armed before the check, so a connection leaving in between
+            // still wakes this.
+            let left = CONNECTION_LEFT.notified();
+            tokio::pin!(left);
+            left.as_mut().enable();
+            if !open() {
+                return;
+            }
+            left.await;
+        }
+    })
+    .await
+    .is_ok()
 }
 
 /// Signal one live inbound stream connection to close because `reason`: its

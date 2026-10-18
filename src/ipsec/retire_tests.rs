@@ -146,6 +146,17 @@ fn register_binding(aor: &str, from: SocketAddr) {
         .expect("the REGISTER is accepted");
 }
 
+/// A stream connection with `peer` that, like a real one, tears itself down
+/// when it is signalled to close. The handle is finished once it has.
+fn connection(id: u64, peer: SocketAddr, outbound: bool) -> tokio::task::JoinHandle<()> {
+    let closer = if outbound {
+        ConnectionCloser::register_outbound(ConnectionId(id), peer, Transport::Tcp)
+    } else {
+        ConnectionCloser::register(ConnectionId(id), peer, Transport::Tcp)
+    };
+    tokio::spawn(async move { closer.closed().await })
+}
+
 /// Let every retirement due by `after` from now run.
 async fn advance(after: Duration) {
     tokio::time::sleep(after).await;
@@ -232,16 +243,8 @@ async fn deleting_the_newer_pair_gives_the_shared_policies_back_to_the_older() {
 async fn a_scheduled_pair_goes_when_due_with_its_connections() {
     let manager = manager();
     let sa = install(&manager, ue(20), 6100, 6101).await;
-    let client = ConnectionCloser::register(
-        ConnectionId(20_001),
-        SocketAddr::new(ue(20), 6100),
-        Transport::Tcp,
-    );
-    let server = ConnectionCloser::register_outbound(
-        ConnectionId(20_002),
-        SocketAddr::new(ue(20), 6101),
-        Transport::Tcp,
-    );
+    let client = connection(20_001, SocketAddr::new(ue(20), 6100), false);
+    let server = connection(20_002, SocketAddr::new(ue(20), 6101), true);
 
     assert!(manager.retire_pair(ue(20), 6100, DELAY, RetireCondition::Always, "a test"));
     advance(DELAY - Duration::from_millis(1)).await;
@@ -252,12 +255,64 @@ async fn a_scheduled_pair_goes_when_due_with_its_connections() {
     for key in policies(&sa) {
         assert!(!live(&manager, &key), "{key} left behind");
     }
-    for closer in [&client, &server] {
-        tokio::time::timeout(Duration::from_millis(1), closer.closed())
-            .await
-            .expect("a connection with the UE's ports is closed");
+    for closed in [client, server] {
+        assert!(
+            closed.is_finished(),
+            "a connection with the UE's ports is closed"
+        );
     }
     assert_eq!(manager.lifecycle.sizes(), (0, 0, 0));
+}
+
+/// A connection's teardown runs in its own task. The pair is deleted only once
+/// that task has let the connection go, so the close it sends the UE still
+/// leaves in the association and not in plaintext on the protected port.
+#[tokio::test(start_paused = true)]
+async fn a_pair_outlives_the_teardown_of_the_connections_it_carried() {
+    let manager = manager();
+    let sa = install(&manager, ue(21), 6110, 6111).await;
+    let closer = ConnectionCloser::register(
+        ConnectionId(21_001),
+        SocketAddr::new(ue(21), 6110),
+        Transport::Tcp,
+    );
+    let observer = Arc::clone(&manager);
+    let teardown = tokio::spawn(async move {
+        closer.closed().await;
+        // The socket is still being closed here.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let present = observer.has_sa(&ue(21), 6110);
+        drop(closer);
+        present
+    });
+
+    assert!(manager.retire_pair(ue(21), 6110, DELAY, RetireCondition::Always, "a test"));
+    advance(DELAY + Duration::from_millis(100)).await;
+
+    assert!(
+        teardown.await.expect("the teardown ran"),
+        "the pair was deleted while its connection was still closing"
+    );
+    assert!(nothing_left_of(&manager, &sa));
+}
+
+/// A connection that does not finish closing holds the deletion up for a
+/// bounded time only.
+#[tokio::test(start_paused = true)]
+async fn a_connection_stuck_in_teardown_does_not_keep_the_pair() {
+    let manager = manager();
+    let sa = install(&manager, ue(22), 6120, 6121).await;
+    let stuck = ConnectionCloser::register(
+        ConnectionId(22_001),
+        SocketAddr::new(ue(22), 6120),
+        Transport::Tcp,
+    );
+
+    assert!(manager.retire_pair(ue(22), 6120, DELAY, RetireCondition::Always, "a test"));
+    advance(DELAY + Duration::from_secs(2)).await;
+
+    assert!(nothing_left_of(&manager, &sa));
+    drop(stuck);
 }
 
 /// Another public user identity of the UE still registered over the pair
@@ -408,16 +463,8 @@ async fn a_re_registration_keeps_the_pair_its_register_came_over_for_the_grace()
     let old = install(&manager, ue(40), 6100, 6101).await;
     let new = install(&manager, ue(40), 6200, 6101).await;
     manager.record_predecessor(&ue(40), 6100, &["198.51.100.40:6200".to_string()]);
-    let old_connection = ConnectionCloser::register(
-        ConnectionId(40_001),
-        SocketAddr::new(ue(40), 6100),
-        Transport::Tcp,
-    );
-    let shared_connection = ConnectionCloser::register_outbound(
-        ConnectionId(40_002),
-        SocketAddr::new(ue(40), 6101),
-        Transport::Tcp,
-    );
+    let old_connection = connection(40_001, SocketAddr::new(ue(40), 6100), false);
+    let shared_connection = connection(40_002, SocketAddr::new(ue(40), 6101), true);
 
     manager
         .supersede_pairs_for_ue(&ue(40), 6200, SA_RETIRE_GRACE)
@@ -433,13 +480,12 @@ async fn a_re_registration_keeps_the_pair_its_register_came_over_for_the_grace()
 
     advance(SA_RETIRE_GRACE).await;
     assert!(nothing_left_of(&manager, &old));
-    tokio::time::timeout(Duration::from_millis(1), old_connection.closed())
-        .await
-        .expect("the old client port's connection is closed");
     assert!(
-        tokio::time::timeout(Duration::from_millis(1), shared_connection.closed())
-            .await
-            .is_err(),
+        old_connection.is_finished(),
+        "the old client port's connection is closed"
+    );
+    assert!(
+        !shared_connection.is_finished(),
         "the protected server port carries the new pair's connection now"
     );
     for key in policies(&new).iter().chain(states(&new).iter()) {

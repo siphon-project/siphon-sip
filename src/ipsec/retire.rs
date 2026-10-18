@@ -50,6 +50,10 @@ use super::{IpsecManager, SecurityAssociationPair};
 /// 5.2.5.2 NOTE 2).
 pub const SA_RETIRE_GRACE: Duration = Duration::from_secs(32);
 
+/// How long a retirement waits for the connections it closed to finish
+/// closing before it deletes the pair under them.
+const CONNECTION_CLOSE_BOUND: Duration = Duration::from_millis(500);
+
 /// What must still hold when a scheduled retirement comes due.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RetireCondition {
@@ -300,7 +304,8 @@ impl IpsecManager {
         self.retire_now(&pair, retirement.reason).await;
     }
 
-    /// End the connections the pair carried, then delete it.
+    /// End the connections the pair carried, wait (bounded) until they are
+    /// closed, then delete it.
     async fn retire_now(&self, pair: &SecurityAssociationPair, reason: &'static str) {
         // A port another pair of the UE also uses (the protected server port
         // stays across a re-registration, TS 33.203 clause 7.4.0) carries that
@@ -315,12 +320,21 @@ impl IpsecManager {
             .flat_map(|entry| [entry.value().ue_port_c, entry.value().ue_port_s])
             .collect();
         let mut closed = 0;
+        let mut closing = Vec::new();
         for port in [pair.ue_port_c, pair.ue_port_s] {
             if !shared.contains(&port) {
-                closed += crate::transport::disconnect::close_peer(
-                    SocketAddr::new(pair.ue_addr, port),
-                    reason,
-                );
+                let peer = SocketAddr::new(pair.ue_addr, port);
+                closed += crate::transport::disconnect::close_peer(peer, reason);
+                closing.push(peer);
+            }
+        }
+        // The connections close in their own tasks: wait for them, so what
+        // they send the UE on the way out (the FIN) still leaves in the pair.
+        for peer in closing {
+            if !crate::transport::disconnect::peer_closed_within(peer, CONNECTION_CLOSE_BOUND).await
+            {
+                debug!(ue = %pair.ue_addr, port = peer.port(),
+                    "IPsec: a connection still closing as its SA pair goes");
             }
         }
         if let Err(error) = self.delete_sa_pair(&pair.ue_addr, pair.ue_port_c).await {
