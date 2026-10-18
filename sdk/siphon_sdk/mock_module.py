@@ -1603,7 +1603,8 @@ class MockB2bua:
         self.refer_reports.append({"call_id": call_id, "code": code, "reason": reason})
         return True
 
-    async def send_info(self, call_id: str, body=None,
+    async def send_info(self, call_id: str,
+                        body: Optional[Union[str, bytes]] = None,
                         content_type: Optional[str] = None,
                         headers: Optional[dict] = None,
                         timeout_ms: int = 5000) -> Optional[int]:
