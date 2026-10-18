@@ -111,8 +111,12 @@ impl MarArguments {
     }
 }
 
-/// The dict `diameter.cx_sar` resolves to: `result_code`, and `user_data`,
-/// the iFC XML of the User-Data AVP (606, an OctetString) or `None`.
+/// The dict `diameter.cx_sar` resolves to: `result_code`,
+/// `experimental_result_code`, `user_data` (the iFC XML of the User-Data AVP,
+/// 606, an OctetString, or `None`), `scscf_restoration_info` (a list of
+/// dicts, see [`scscf_restoration_info_dict`]), `associated_registered_identities`
+/// (a list of private identities) and `supported_features` (the Feature-List
+/// of Feature-List-ID 1, `0` without).
 pub(crate) fn sar_answer_dict(
     python: Python<'_>,
     answer: &DiameterMessage,
@@ -122,11 +126,257 @@ pub(crate) fn sar_answer_dict(
         "result_code",
         crate::diameter::rx::extract_result_code(&answer.avps),
     )?;
+    let experimental = answer
+        .avps
+        .get("Result-Code")
+        .is_none()
+        .then(|| {
+            answer
+                .avps
+                .get("Experimental-Result")
+                .and_then(|group| group.get("Experimental-Result-Code"))
+                .and_then(|value| value.as_u64())
+        })
+        .flatten();
+    dict.set_item("experimental_result_code", experimental)?;
     dict.set_item(
         "user_data",
         cx::octet_string_as_utf8(&answer.avps, "User-Data"),
     )?;
+    let restoration = PyList::empty(python);
+    let mut associated: Vec<String> = Vec::new();
+    let mut features = 0u32;
+    if let Ok(message) = DiameterMsg::from_wire(&answer.raw) {
+        for info in cx::scscf_restoration_infos(&message) {
+            restoration.append(scscf_restoration_info_dict(python, &info)?)?;
+        }
+        associated = cx::associated_registered_identities(&message);
+        features = cx::supported_feature_list(&message);
+    }
+    dict.set_item("scscf_restoration_info", restoration)?;
+    dict.set_item("associated_registered_identities", associated)?;
+    dict.set_item("supported_features", features)?;
     Ok(dict.unbind())
+}
+
+/// One SCSCF-Restoration-Info as the dict a script reads and writes:
+/// `user_name`, `restoration_info` (list of dicts with `path`, `contact`,
+/// `initial_cseq_sequence_number`, `call_id`, `subscription_info`,
+/// `pcscf_subscription_info`), `registration_time_out` (Unix seconds) and
+/// `sip_authentication_scheme`. An absent member is `None`.
+pub(crate) fn scscf_restoration_info_dict<'py>(
+    python: Python<'py>,
+    info: &cx::ScscfRestorationInfo,
+) -> PyResult<Bound<'py, PyDict>> {
+    let dict = PyDict::new(python);
+    dict.set_item("user_name", &info.user_name)?;
+    let entries = PyList::empty(python);
+    for entry in &info.restoration_info {
+        let item = PyDict::new(python);
+        item.set_item("path", &entry.path)?;
+        item.set_item("contact", &entry.contact)?;
+        item.set_item(
+            "initial_cseq_sequence_number",
+            entry.initial_cseq_sequence_number,
+        )?;
+        item.set_item("call_id", entry.call_id.as_deref())?;
+        let subscription = match &entry.subscription_info {
+            Some(info) => {
+                let value = PyDict::new(python);
+                value.set_item("call_id", &info.call_id)?;
+                value.set_item("from", &info.from)?;
+                value.set_item("to", &info.to)?;
+                value.set_item("record_route", &info.record_route)?;
+                value.set_item("contact", &info.contact)?;
+                Some(value)
+            }
+            None => None,
+        };
+        item.set_item("subscription_info", subscription)?;
+        let pcscf_subscription = match &entry.pcscf_subscription_info {
+            Some(info) => {
+                let value = PyDict::new(python);
+                value.set_item("call_id", &info.call_id)?;
+                value.set_item("from", &info.from)?;
+                value.set_item("to", &info.to)?;
+                value.set_item("contact", &info.contact)?;
+                Some(value)
+            }
+            None => None,
+        };
+        item.set_item("pcscf_subscription_info", pcscf_subscription)?;
+        entries.append(item)?;
+    }
+    dict.set_item("restoration_info", entries)?;
+    dict.set_item("registration_time_out", info.registration_time_out)?;
+    dict.set_item(
+        "sip_authentication_scheme",
+        info.sip_authentication_scheme.as_deref(),
+    )?;
+    Ok(dict)
+}
+
+fn value_error(message: impl Into<String>) -> PyErr {
+    pyo3::exceptions::PyValueError::new_err(message.into())
+}
+
+/// A required, non-empty string member of a dict argument.
+fn required_text(dict: &Bound<'_, PyDict>, key: &str, what: &str) -> PyResult<String> {
+    match dict.get_item(key)? {
+        Some(value) if !value.is_none() => {
+            let text: String = value
+                .extract()
+                .map_err(|_| value_error(format!("{what}: `{key}` must be a str")))?;
+            if text.is_empty() {
+                return Err(value_error(format!("{what}: `{key}` is empty")));
+            }
+            Ok(text)
+        }
+        _ => Err(value_error(format!("{what}: `{key}` is required"))),
+    }
+}
+
+fn optional_text(dict: &Bound<'_, PyDict>, key: &str, what: &str) -> PyResult<Option<String>> {
+    match dict.get_item(key)? {
+        Some(value) if !value.is_none() => value
+            .extract()
+            .map(Some)
+            .map_err(|_| value_error(format!("{what}: `{key}` must be a str"))),
+        _ => Ok(None),
+    }
+}
+
+fn optional_int(dict: &Bound<'_, PyDict>, key: &str, what: &str) -> PyResult<Option<u64>> {
+    match dict.get_item(key)? {
+        Some(value) if !value.is_none() => value
+            .extract::<u64>()
+            .map(Some)
+            .map_err(|_| value_error(format!("{what}: `{key}` must be a non-negative int"))),
+        _ => Ok(None),
+    }
+}
+
+fn as_dict<'py>(value: &Bound<'py, PyAny>, what: &str) -> PyResult<Bound<'py, PyDict>> {
+    value
+        .cast::<PyDict>()
+        .cloned()
+        .map_err(|_| value_error(format!("{what} must be a dict")))
+}
+
+fn optional_group<'py>(
+    dict: &Bound<'py, PyDict>,
+    key: &str,
+    what: &str,
+) -> PyResult<Option<Bound<'py, PyDict>>> {
+    match dict.get_item(key)? {
+        Some(value) if !value.is_none() => as_dict(&value, &format!("{what}: `{key}`")).map(Some),
+        _ => Ok(None),
+    }
+}
+
+/// `restoration_info=` of `diameter.cx_sar` as SCSCF-Restoration-Info, every
+/// member TS 29.229 §6.3.46 to §6.3.52 has in braces required.
+pub(crate) fn scscf_restoration_info_from_py(
+    value: &Bound<'_, PyAny>,
+) -> PyResult<cx::ScscfRestorationInfo> {
+    let what = "restoration_info";
+    let dict = as_dict(value, what)?;
+    let user_name = required_text(&dict, "user_name", what)?;
+    let entries = match dict.get_item("restoration_info")? {
+        Some(entries) if !entries.is_none() => entries,
+        _ => {
+            return Err(value_error(
+                "restoration_info: `restoration_info` is required",
+            ))
+        }
+    };
+    let entries = entries
+        .cast::<PyList>()
+        .map_err(|_| value_error("restoration_info: `restoration_info` must be a list"))?;
+    if entries.is_empty() {
+        return Err(value_error(
+            "restoration_info: `restoration_info` needs one entry at least (1*{ Restoration-Info })",
+        ));
+    }
+    let mut restoration_info = Vec::with_capacity(entries.len());
+    for entry in entries.iter() {
+        let what = "restoration_info entry";
+        let entry = as_dict(&entry, what)?;
+        let subscription_info = optional_group(&entry, "subscription_info", what)?
+            .map(|group| -> PyResult<cx::SubscriptionInfo> {
+                let what = "subscription_info";
+                Ok(cx::SubscriptionInfo {
+                    call_id: required_text(&group, "call_id", what)?,
+                    from: required_text(&group, "from", what)?,
+                    to: required_text(&group, "to", what)?,
+                    record_route: required_text(&group, "record_route", what)?,
+                    contact: required_text(&group, "contact", what)?,
+                })
+            })
+            .transpose()?;
+        let pcscf_subscription_info = optional_group(&entry, "pcscf_subscription_info", what)?
+            .map(|group| -> PyResult<cx::PcscfSubscriptionInfo> {
+                let what = "pcscf_subscription_info";
+                Ok(cx::PcscfSubscriptionInfo {
+                    call_id: required_text(&group, "call_id", what)?,
+                    from: required_text(&group, "from", what)?,
+                    to: required_text(&group, "to", what)?,
+                    contact: required_text(&group, "contact", what)?,
+                })
+            })
+            .transpose()?;
+        restoration_info.push(cx::RestorationInfo {
+            path: required_text(&entry, "path", what)?,
+            contact: required_text(&entry, "contact", what)?,
+            initial_cseq_sequence_number: optional_int(
+                &entry,
+                "initial_cseq_sequence_number",
+                what,
+            )?
+            .map(|cseq| {
+                u32::try_from(cseq).map_err(|_| {
+                    value_error(
+                        "restoration_info entry: `initial_cseq_sequence_number` exceeds 32 bits",
+                    )
+                })
+            })
+            .transpose()?,
+            call_id: optional_text(&entry, "call_id", what)?,
+            subscription_info,
+            pcscf_subscription_info,
+        });
+    }
+    Ok(cx::ScscfRestorationInfo {
+        user_name,
+        restoration_info,
+        registration_time_out: optional_int(&dict, "registration_time_out", what)?,
+        sip_authentication_scheme: optional_text(&dict, "sip_authentication_scheme", what)?,
+    })
+}
+
+/// `failed_pcscf=` of `diameter.cx_sar` as Failed-PCSCF (TS 29.229
+/// §6.3.74): `fqdn` and/or `ip_addresses`, at least one of them.
+pub(crate) fn failed_pcscf_from_py(value: &Bound<'_, PyAny>) -> PyResult<cx::FailedPcscf> {
+    let what = "failed_pcscf";
+    let dict = as_dict(value, what)?;
+    let fqdn = optional_text(&dict, "fqdn", what)?;
+    let mut ip_addresses = Vec::new();
+    if let Some(addresses) = dict.get_item("ip_addresses")? {
+        if !addresses.is_none() {
+            let addresses: Vec<String> = addresses
+                .extract()
+                .map_err(|_| value_error("failed_pcscf: `ip_addresses` must be a list of str"))?;
+            for address in addresses {
+                ip_addresses.push(address.parse().map_err(|_| {
+                    value_error(format!("failed_pcscf: `{address}` is not an IP address"))
+                })?);
+            }
+        }
+    }
+    if fqdn.is_none() && ip_addresses.is_empty() {
+        return Err(value_error("failed_pcscf: give `fqdn` or `ip_addresses`"));
+    }
+    Ok(cx::FailedPcscf { fqdn, ip_addresses })
 }
 
 /// The dict `diameter.cx_uar` and `diameter.cx_lir` resolve to: `result_code`,

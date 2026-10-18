@@ -103,6 +103,25 @@ pub const SUPPORTED_FEATURES: u32 = 628;
 pub const FEATURE_LIST_ID: u32 = 629;
 pub const FEATURE_LIST: u32 = 630;
 pub const SIP_DIGEST_AUTHENTICATE: u32 = 635;
+// IMS restoration (TS 29.229 table 6.3.1)
+pub const SCSCF_RESTORATION_INFO: u32 = 639;
+pub const PATH: u32 = 640;
+pub const CONTACT: u32 = 641;
+pub const SUBSCRIPTION_INFO: u32 = 642;
+pub const CALL_ID_SIP_HEADER: u32 = 643;
+pub const FROM_SIP_HEADER: u32 = 644;
+pub const TO_SIP_HEADER: u32 = 645;
+pub const RECORD_ROUTE: u32 = 646;
+pub const ASSOCIATED_REGISTERED_IDENTITIES: u32 = 647;
+pub const MULTIPLE_REGISTRATION_INDICATION: u32 = 648;
+pub const RESTORATION_INFO: u32 = 649;
+pub const INITIAL_CSEQ_SEQUENCE_NUMBER: u32 = 654;
+pub const SAR_FLAGS: u32 = 655;
+pub const PCSCF_SUBSCRIPTION_INFO: u32 = 660;
+pub const REGISTRATION_TIME_OUT: u32 = 661;
+pub const FAILED_PCSCF: u32 = 664;
+pub const PCSCF_FQDN: u32 = 665;
+pub const PCSCF_IP_ADDRESS: u32 = 666;
 pub const ALTERNATE_DIGEST_ALGORITHM: u32 = 662;
 pub const ALTERNATE_DIGEST_HA1: u32 = 663;
 // RFC 5090 digest attributes, no vendor (TS 29.229 table 6.3.0.1)

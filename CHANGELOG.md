@@ -104,6 +104,31 @@ entry, but a working config keeps working.
   `request.set_reply_body()`, for a single relay and a failed fork alike,
   keeps its code (a 503 is not turned into 500) and is what the CDR and Rf
   record. A reply outside 300-699 is logged and the failure forwarded.
+### Added
+
+- **Cx IMS restoration (TS 23.380 clause 4, TS 29.229).** `diameter.cx_sar`
+  takes the S-CSCF restoration information and its companions
+  (`ims_restoration`, `restoration_info`, `user_data_already_available`,
+  `multiple_registration`, `pcscf_restoration_mechanism`,
+  `pcscf_restoration_indication`, `failed_pcscf`), and its answer adds
+  `experimental_result_code`, `scscf_restoration_info`,
+  `associated_registered_identities` and `supported_features`.
+  `diameter.cx_lir` takes `user_authorization_type`. `registrar.restore()`
+  rebuilds a binding from what the HSS returned, and `Contact.sip_instance` /
+  `Contact.reg_id` expose the RFC 5626 parameters, and `presence.subscribe_dialog`
+  takes `local_cseq` for a dialog rebuilt from the restoration information. The restoration AVPs
+  (639-649, 654, 655, 660, 661, 664-666) are in the dictionary with the M bit
+  clear, as table 6.3.1 has them. Checked against a hand-written vector and
+  Wireshark's dissector (`scripts/validate_diameter_cx_requests.sh`).
+
+### Fixed
+
+- **The M bit of grouped AVPs a script builds, and of Supported-Features.**
+  A grouped AVP from `set_avp(..., [...])` always carried the M bit, so an
+  answer's SCSCF-Restoration-Info or Associated-Registered-Identities did
+  against TS 29.229 table 6.3.1; it now follows the dictionary.
+  Supported-Features in an answer never has the M bit, and Feature-List-ID /
+  Feature-List never do (§7.2.1). A SAR built with restoration members sets it.
 
 ## [1.14.0] — 2026-10-17
 

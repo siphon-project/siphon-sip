@@ -492,10 +492,23 @@ class Contact:
         bindings = registrar.lookup("sip:001010000000001@ims.example.com")
         owners = {c.auth_user for c in bindings}"""
 
+    reg_id: Optional[int] = None
+    """RFC 5626 ``reg-id`` Contact parameter the binding was registered with,
+    or ``None``.  Like ``+sip.instance`` it is kept out of :attr:`params`."""
+
     _sip_instance: Optional[str] = field(default=None, repr=False, compare=False)
-    """RFC 5627 ``+sip.instance`` the binding was registered with.  Private to
-    the mock registrar, which replaces a binding by instance before URI the
-    way the engine does; the engine does not expose it to scripts."""
+    """RFC 5627 ``+sip.instance`` the binding was registered with, read
+    through :attr:`sip_instance`.  The mock registrar replaces a binding by
+    instance before URI the way the engine does."""
+
+    @property
+    def sip_instance(self) -> Optional[str]:
+        """The binding's ``+sip.instance`` Contact parameter (RFC 5626 §4.1)
+        as the REGISTER sent it, quotes and angle brackets included, or
+        ``None``.  With :attr:`reg_id` it is what a script needs to write the
+        binding back as a Contact (the S-CSCF's restoration information, TS
+        23.380 §4.6.2)."""
+        return self._sip_instance
 
 
 def _split_route_entries(value: str) -> list:

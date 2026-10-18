@@ -2411,10 +2411,79 @@ class MockRegistrar:
             request.reply(200, "OK")
         return True
 
+    def restore(
+        self,
+        aor: str,
+        contact: str,
+        *,
+        expires: int,
+        path: Optional[list[str]] = None,
+        call_id: Optional[str] = None,
+        cseq: Optional[int] = None,
+        auth_user: Optional[str] = None,
+        aliases: Optional[list[str]] = None,
+    ) -> bool:
+        """Rebuild a binding no REGISTER reached this node for: IMS
+        restoration (TS 23.380 §4.3.2, §4.4.2), from the
+        SCSCF-Restoration-Info the HSS returned.
+
+        Each Contact in ``contact`` is bound to ``aor`` for ``expires``
+        seconds (capped at ``max_expires``), with its ``+sip.instance``,
+        ``reg-id`` and other parameters, the RFC 3327 ``path``, and
+        ``auth_user`` as the identity that authenticated it.  ``aliases`` is
+        the implicit registration set, as for :meth:`save`.  ``call_id`` and
+        ``cseq`` are what the registrar compares a later refresh against; the
+        mock keeps no CSeq state and accepts them.
+
+        Returns:
+            ``True`` when the binding was stored, ``False`` when the registrar
+            refused it (an AoR that is not a safe storage key).
+
+        Raises:
+            ValueError: ``contact`` is not a Contact header field value, or
+                ``expires`` is 0.
+        """
+        if expires == 0:
+            raise ValueError("restore: expires is 0, there is nothing to restore")
+        parsed = [entry for entry in (_parse_contact(value)
+                                      for value in _split_outside_quotes(contact, ","))
+                  if entry is not None]
+        if not parsed:
+            raise ValueError(f"restore: not a Contact header field value: {contact}")
+        key = self._resolve_alias(self._normalize_aor(aor))
+        if not _is_storage_key_safe(key):
+            return False
+        lifetime = min(expires, self._max_expires)
+        held = list(self._store.get(key, []))
+        event = "refreshed" if held else "registered"
+        for uri, params in parsed:
+            named = dict(params)
+            instance = named.get("+sip.instance")
+            held = [binding for binding in held
+                    if not (instance and binding._sip_instance == instance)
+                    and binding.uri != uri]
+            held.append(Contact(
+                uri=uri,
+                q=_as_number(named.get("q"), float, 1.0),
+                expires=lifetime,
+                path=[entry for entry in path or [] if entry],
+                params=[(name, value) for name, value in params
+                        if name not in ("expires", "q", "tag", "+sip.instance", "reg-id")],
+                reg_id=_as_number(named.get("reg-id"), int, None),
+                _sip_instance=instance,
+                auth_user=auth_user,
+            ))
+        self._store[key] = held
+        self._fire_on_change(key, event)
+        if aliases:
+            self.set_associated_uris(key, list(aliases))
+        return True
+
     def _contact_updates(
         self, request: Any, contact_values: list[str]
-    ) -> list[tuple[str, int, float, Optional[str], list[tuple[str, Optional[str]]]]]:
-        """``(uri, asked expires, q, +sip.instance, other params)`` per Contact."""
+    ) -> list[tuple[str, int, float, Optional[str], list[tuple[str, Optional[str]]], Optional[int]]]:
+        """``(uri, asked expires, q, +sip.instance, other params, reg-id)`` per
+        Contact."""
         expires_header = _header_values(request, "Expires")
         default_expires = (
             _as_number(expires_header[0], int, None) if expires_header else None
@@ -2425,7 +2494,7 @@ class MockRegistrar:
             asked = getattr(request, "contact_expires", None)
             user = getattr(getattr(request, "ruri", None), "user", None) or "user"
             uri = f"sip:{user}@{request.source_ip}:5060"
-            return [(uri, default_expires if asked is None else asked, 1.0, None, [])]
+            return [(uri, default_expires if asked is None else asked, 1.0, None, [], None)]
         updates = []
         for value in contact_values:
             for entry in _split_outside_quotes(value, ","):
@@ -2445,13 +2514,14 @@ class MockRegistrar:
                         for name, param in params
                         if name not in ("expires", "q", "tag", "+sip.instance", "reg-id")
                     ],
+                    _as_number(named.get("reg-id"), int, None),
                 ))
         return updates
 
     def _stage(
         self,
         staged: list[Contact],
-        updates: list[tuple[str, int, float, Optional[str], list[tuple[str, Optional[str]]]]],
+        updates: list[tuple[str, int, float, Optional[str], list[tuple[str, Optional[str]]], Optional[int]]],
         events: list[str],
         request: Any,
         flow_token: Optional[str],
@@ -2461,7 +2531,7 @@ class MockRegistrar:
         Returns the refusal reason, or ``None`` when every Contact was
         accepted.  ``staged`` is a copy; on a refusal the caller drops it.
         """
-        for uri, asked, q, instance, params in updates:
+        for uri, asked, q, instance, params, reg_id in updates:
             expires = min(asked, self._max_expires)
             if 0 < expires < self._min_expires:
                 return "interval_too_brief"
@@ -2481,6 +2551,7 @@ class MockRegistrar:
                 expires=expires,
                 received=_received_of(request),
                 params=params,
+                reg_id=reg_id,
                 _sip_instance=instance,
                 # Whoever authenticated this REGISTER, and nobody else: no
                 # carry-over from the binding it replaces, as in the engine.
@@ -7989,6 +8060,9 @@ class MockDiameter:
         self.zn_bir_requests: list[dict] = []
         self._sar_responses: dict[str, dict] = {}
         self._lir_responses: dict[str, dict] = {}
+        # Every cx_sar / cx_lir request, in order (test inspection).
+        self.sar_requests: list[dict] = []
+        self.lir_requests: list[dict] = []
         self._aar_responses: dict[str, dict] = {}  # session_id -> response
         # Sh (AS → HSS) responses, keyed by public_identity
         self._udr_responses: dict[str, dict] = {}
@@ -8274,7 +8348,15 @@ class MockDiameter:
     async def cx_sar(self, public_identity: str,
                server_name: Optional[str] = None,
                assignment_type: int = 1,
-               user_name: Optional[str] = None) -> Optional[dict]:
+               user_name: Optional[str] = None,
+               *,
+               user_data_already_available: bool = False,
+               ims_restoration: bool = False,
+               restoration_info: Optional[dict] = None,
+               multiple_registration: Optional[bool] = None,
+               pcscf_restoration_mechanism: bool = False,
+               pcscf_restoration_indication: bool = False,
+               failed_pcscf: Optional[dict] = None) -> Optional[dict]:
         """Send a Server-Assignment-Request after REGISTER auth.
 
         Args:
@@ -8286,25 +8368,55 @@ class MockDiameter:
                 29.228 Table 6.1.2.1 requires it whenever the S-CSCF has it;
                 omit it and the AVP is not sent. The mock accepts and ignores
                 it.
+            user_data_already_available, ims_restoration, restoration_info,
+                multiple_registration, pcscf_restoration_mechanism,
+                pcscf_restoration_indication, failed_pcscf: the IMS
+                restoration members of the request (TS 29.229 §6.1.3), as the
+                engine documents them. The mock records each request in
+                ``sar_requests``.
 
         Returns:
-            Dict with ``result_code`` and ``user_data`` (iFC XML), or ``None``.
+            Dict with ``result_code``, ``experimental_result_code``,
+            ``user_data`` (iFC XML), ``scscf_restoration_info``,
+            ``associated_registered_identities`` and ``supported_features``,
+            or ``None``. A response set with :meth:`set_sar_response` is
+            returned with the keys it lacks filled in.
         """
+        self.sar_requests.append({
+            "public_identity": public_identity, "server_name": server_name,
+            "assignment_type": assignment_type, "user_name": user_name,
+            "user_data_already_available": user_data_already_available,
+            "ims_restoration": ims_restoration, "restoration_info": restoration_info,
+            "multiple_registration": multiple_registration,
+            "pcscf_restoration_mechanism": pcscf_restoration_mechanism,
+            "pcscf_restoration_indication": pcscf_restoration_indication,
+            "failed_pcscf": failed_pcscf,
+        })
+        answer = {"result_code": 2001, "experimental_result_code": None,
+                  "user_data": None, "scscf_restoration_info": [],
+                  "associated_registered_identities": [], "supported_features": 0}
         if public_identity in self._sar_responses:
-            return dict(self._sar_responses[public_identity])
-        return {"result_code": 2001, "user_data": None}
+            answer.update(self._sar_responses[public_identity])
+        return answer
 
-    async def cx_lir(self, public_identity: str) -> Optional[dict]:
+    async def cx_lir(self, public_identity: str,
+                     user_authorization_type: Optional[int] = None) -> Optional[dict]:
         """Send a Location-Info-Request to find the serving S-CSCF.
 
         Args:
             public_identity: Target user's public identity.
+            user_authorization_type: User-Authorization-Type, ``2``
+                (REGISTRATION_AND_CAPABILITIES) to ask for the S-CSCF
+                capabilities when the assigned one cannot be contacted (TS
+                23.380 §4.3.3). The mock records it in ``lir_requests``.
 
         Returns:
             Dict with ``result_code``, ``server_name`` and
             ``server_capabilities`` (``None``, or a dict of ``mandatory``,
             ``optional`` and ``server_names``), or ``None``.
         """
+        self.lir_requests.append({"public_identity": public_identity,
+                                  "user_authorization_type": user_authorization_type})
         if public_identity in self._lir_responses:
             return dict(self._lir_responses[public_identity])
         if self._default_server_name:
@@ -8645,17 +8757,34 @@ class MockDiameter:
 
     def set_sar_response(self, public_identity: str,
                          result_code: int = 2001,
-                         user_data: Optional[str] = None) -> None:
+                         user_data: Optional[str] = None,
+                         *,
+                         experimental: bool = False,
+                         scscf_restoration_info: Optional[list[dict]] = None,
+                         associated_registered_identities: Optional[list[str]] = None,
+                         supported_features: int = 0) -> None:
         """Configure a mock SAA response for a specific user (test helper).
 
         Args:
             public_identity: User's public identity.
             result_code: Diameter result code.
             user_data: iFC XML string from user profile.
+            experimental: ``result_code`` came as an Experimental-Result-Code
+                (e.g. 5007 DIAMETER_ERROR_IN_ASSIGNMENT_TYPE with the
+                restoration information, TS 29.228 §6.1.2.1).
+            scscf_restoration_info: The SCSCF-Restoration-Info groups, in the
+                shape ``cx_sar`` documents.
+            associated_registered_identities: Other registered private
+                identities.
+            supported_features: Feature-List of Feature-List-ID 1.
         """
         self._sar_responses[public_identity] = {
             "result_code": result_code,
+            "experimental_result_code": result_code if experimental else None,
             "user_data": user_data,
+            "scscf_restoration_info": list(scscf_restoration_info or []),
+            "associated_registered_identities": list(associated_registered_identities or []),
+            "supported_features": supported_features,
         }
 
     def set_lir_response(self, public_identity: str,
@@ -9632,6 +9761,8 @@ class MockDiameter:
         self.zn_bir_requests.clear()
         self._sar_responses.clear()
         self._lir_responses.clear()
+        self.sar_requests.clear()
+        self.lir_requests.clear()
         self._aar_responses.clear()
         self._udr_responses.clear()
         self._pur_responses.clear()
@@ -9759,7 +9890,8 @@ class MockPresence:
                          call_id: str = "", from_tag: str = "",
                          to_tag: str = "", route_set: Optional[list] = None,
                          local_uri: Optional[str] = None,
-                         remote_uri: Optional[str] = None) -> str:
+                         remote_uri: Optional[str] = None,
+                         local_cseq: int = 0) -> str:
         """Create a subscription with dialog state for in-dialog NOTIFY.
 
         Args:
@@ -9782,6 +9914,10 @@ class MockPresence:
                 in-dialog NOTIFY.  Pass ``str(request.to_uri)``.
             remote_uri: The SUBSCRIBE's **From URI** — the dialog's remote
                 URI, required in the ``To``.  Pass ``str(request.from_uri)``.
+            local_cseq: The CSeq number of the dialog's last NOTIFY; the next
+                carries one more. ``0`` for a new dialog; a dialog rebuilt
+                from stored state (IMS restoration) starts high enough for the
+                subscriber to accept it. Kept as ``local_cseq`` in the record.
 
         Both URI arguments default to ``resource``, which is correct for any
         package where the subscriber watches an AoR directly (the reg event
@@ -9804,6 +9940,7 @@ class MockPresence:
             "route_set": route_set,
             "local_uri": _strip_nameaddr(local_uri) if local_uri else resource,
             "remote_uri": _strip_nameaddr(remote_uri) if remote_uri else resource,
+            "local_cseq": local_cseq,
         }
         return sub_id
 

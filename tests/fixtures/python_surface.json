@@ -514,6 +514,14 @@
         "doc": "The transport source address of the REGISTER, as a SIP URI:",
         "kind": "getset_descriptor"
       },
+      "reg_id": {
+        "doc": "The binding's ``reg-id`` Contact parameter (RFC 5626 \u00a74.2), or",
+        "kind": "getset_descriptor"
+      },
+      "sip_instance": {
+        "doc": "The binding's ``+sip.instance`` Contact parameter (RFC 5626 \u00a74.1), as",
+        "kind": "getset_descriptor"
+      },
       "uri": {
         "doc": "The contact URI as a string.",
         "kind": "getset_descriptor"
@@ -649,7 +657,7 @@
       "cx_lir": {
         "doc": "Send a Cx Location-Info-Request to the HSS.",
         "kind": "method_descriptor",
-        "sig": "($self, public_identity)"
+        "sig": "($self, public_identity, user_authorization_type=None)"
       },
       "cx_mar": {
         "doc": "Send a Cx Multimedia-Auth-Request to the HSS.",
@@ -659,7 +667,7 @@
       "cx_sar": {
         "doc": "Send a Cx Server-Assignment-Request to the HSS.",
         "kind": "method_descriptor",
-        "sig": "($self, public_identity, server_name=None, assignment_type=1, user_name=None)"
+        "sig": "($self, public_identity, server_name=None, assignment_type=1, user_name=None, *, user_data_already_available=False, ims_restoration=False, restoration_info=None, multiple_registration=None, pcscf_restoration_mechanism=False, pcscf_restoration_indication=False, failed_pcscf=None)"
       },
       "cx_uar": {
         "doc": "Send a Cx User-Authorization-Request to the HSS.",
@@ -1457,7 +1465,7 @@
       "subscribe_dialog": {
         "doc": "Create a subscription with full dialog state from a SUBSCRIBE request.",
         "kind": "method_descriptor",
-        "sig": "($self, subscriber, resource, event, expires, call_id, from_tag, to_tag, route_set=None, local_uri=None, remote_uri=None)"
+        "sig": "($self, subscriber, resource, event, expires, call_id, from_tag, to_tag, route_set=None, local_uri=None, remote_uri=None, local_cseq=0)"
       },
       "subscribers": {
         "doc": "List subscribers (watchers) for a resource.",
@@ -1611,6 +1619,11 @@
         "doc": "Remove all contacts for a URI (deregistration).",
         "kind": "method_descriptor",
         "sig": "($self, uri)"
+      },
+      "restore": {
+        "doc": "Rebuild a binding from S-CSCF restoration information, without a",
+        "kind": "method_descriptor",
+        "sig": "($self, aor, contact, *, expires, path=..., call_id=None, cseq=None, auth_user=None, aliases=...)"
       },
       "save": {
         "doc": "Save contact bindings from a REGISTER and send 200 OK with granted",

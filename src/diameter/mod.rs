@@ -98,7 +98,16 @@ impl DiameterClient {
     }
 
     /// Send a LIR (Location-Info-Request) and return the LIA.
-    pub async fn send_lir(&self, public_identity: &str) -> Result<codec::DiameterMessage, String> {
+    ///
+    /// `user_authorization_type` is sent as User-Authorization-Type (TS
+    /// 29.229 §6.1.5 `[ User-Authorization-Type ]`): REGISTRATION_AND_CAPABILITIES
+    /// (2) asks the HSS for the S-CSCF capabilities when the assigned S-CSCF
+    /// cannot be contacted (TS 29.228 §6.1.4.1 step 2a, TS 23.380 §4.3.3).
+    pub async fn send_lir(
+        &self,
+        public_identity: &str,
+        user_authorization_type: Option<u32>,
+    ) -> Result<codec::DiameterMessage, String> {
         let config = self.peer.config();
         let hbh = self.peer.next_hbh();
         let e2e = self.peer.next_e2e();
@@ -121,6 +130,12 @@ impl DiameterClient {
             dictionary::CX_APP_ID,
         ));
         avp_bytes.extend_from_slice(&encode_avp_utf8_3gpp(avp::PUBLIC_IDENTITY, public_identity));
+        if let Some(authorization_type) = user_authorization_type {
+            avp_bytes.extend_from_slice(&encode_avp_u32_3gpp(
+                avp::USER_AUTHORIZATION_TYPE,
+                authorization_type,
+            ));
+        }
 
         let msg = encode_diameter_message(
             FLAG_REQUEST | FLAG_PROXIABLE,

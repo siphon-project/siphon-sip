@@ -623,9 +623,189 @@ pub struct ServerAssignment<'a> {
     pub user_name: Option<&'a str>,
     pub server_name: &'a str,
     pub server_assignment_type: u32,
+    /// User-Data-Already-Available (TS 29.229 §6.3.26): `0`
+    /// USER_DATA_NOT_AVAILABLE, `1` USER_DATA_ALREADY_AVAILABLE. A refresh of
+    /// the S-CSCF restoration information sends `1` (TS 23.380 §4.6.2).
+    pub user_data_already_available: u32,
     /// The Cx features of Feature-List-ID 1 this S-CSCF supports (TS 29.229
     /// §7.1.1 Table 7.1.1), sent as Supported-Features; `0` sends none.
     pub supported_features: u32,
+    /// SCSCF-Restoration-Info to back up in the HSS (TS 23.380 §4.6).
+    pub restoration: Option<&'a ScscfRestorationInfo>,
+    /// Multiple-Registration-Indication (TS 29.229 §6.3.51).
+    pub multiple_registration_indication: Option<u32>,
+    /// SAR-Flags (TS 29.229 §6.3.63); bit 0 is the P-CSCF Restoration
+    /// Indication.
+    pub sar_flags: Option<u32>,
+    /// Failed-PCSCF (TS 29.229 §6.3.74), only with the P-CSCF Restoration
+    /// Indication (TS 29.228 §7.31).
+    pub failed_pcscf: Option<&'a FailedPcscf>,
+}
+
+/// Feature bit 2 of Cx Feature-List-ID 1, `IMSRestorationInd` (TS 29.229
+/// §7.1.1 Table 7.1.1): the S-CSCF sends S-CSCF restoration information and
+/// the HSS returns it when required.
+pub const FEATURE_IMS_RESTORATION: u32 = 1 << 2;
+
+/// Feature bit 3 of Cx Feature-List-ID 1, `P-CSCF-Restoration-mechanism`
+/// (TS 29.229 §7.1.1 Table 7.1.1).
+pub const FEATURE_PCSCF_RESTORATION: u32 = 1 << 3;
+
+/// SAR-Flags bit 0, P-CSCF Restoration Indication (TS 29.229 Table 6.3.63.1).
+pub const SAR_FLAG_PCSCF_RESTORATION: u32 = 1 << 0;
+
+/// Subscription-Info (TS 29.229 §6.3.49): the reg-event subscription of a UE.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SubscriptionInfo {
+    pub call_id: String,
+    pub from: String,
+    pub to: String,
+    /// Comma separated Record-Route header field values.
+    pub record_route: String,
+    pub contact: String,
+}
+
+/// P-CSCF-Subscription-Info (TS 29.229 §6.3.70): the reg-event subscription
+/// of a P-CSCF.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PcscfSubscriptionInfo {
+    pub call_id: String,
+    pub from: String,
+    pub to: String,
+    pub contact: String,
+}
+
+/// Restoration-Info (TS 29.229 §6.3.52): one registered contact.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RestorationInfo {
+    /// Comma separated Path header field values (RFC 3327).
+    pub path: String,
+    /// Contact address and parameters of the registration (RFC 3261).
+    pub contact: String,
+    pub initial_cseq_sequence_number: Option<u32>,
+    pub call_id: Option<String>,
+    pub subscription_info: Option<SubscriptionInfo>,
+    pub pcscf_subscription_info: Option<PcscfSubscriptionInfo>,
+}
+
+/// SCSCF-Restoration-Info (TS 29.229 §6.3.46): what an S-CSCF needs to serve
+/// the registrations of one private user identity.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ScscfRestorationInfo {
+    pub user_name: String,
+    pub restoration_info: Vec<RestorationInfo>,
+    /// Registration-Time-Out (TS 29.229 §6.3.71) as Unix seconds.
+    pub registration_time_out: Option<u64>,
+    pub sip_authentication_scheme: Option<String>,
+}
+
+/// Failed-PCSCF (TS 29.229 §6.3.74).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FailedPcscf {
+    pub fqdn: Option<String>,
+    pub ip_addresses: Vec<std::net::IpAddr>,
+}
+
+/// A 3GPP AVP whose M bit TS 29.229 Table 6.3.1 has as "must not": every AVP
+/// of IMS restoration, so a node without the feature skips them (RFC 6733
+/// §4.1).
+fn optional_3gpp(code: u32, data: &[u8]) -> Vec<u8> {
+    encode_avp_vendor(code, 0, dictionary::VENDOR_3GPP, data)
+}
+
+fn subscription_info_avp(info: &SubscriptionInfo) -> Vec<u8> {
+    let mut children = Vec::new();
+    children.extend(optional_3gpp(
+        avp::CALL_ID_SIP_HEADER,
+        info.call_id.as_bytes(),
+    ));
+    children.extend(optional_3gpp(avp::FROM_SIP_HEADER, info.from.as_bytes()));
+    children.extend(optional_3gpp(avp::TO_SIP_HEADER, info.to.as_bytes()));
+    children.extend(optional_3gpp(
+        avp::RECORD_ROUTE,
+        info.record_route.as_bytes(),
+    ));
+    children.extend(optional_3gpp(avp::CONTACT, info.contact.as_bytes()));
+    optional_3gpp(avp::SUBSCRIPTION_INFO, &children)
+}
+
+fn pcscf_subscription_info_avp(info: &PcscfSubscriptionInfo) -> Vec<u8> {
+    let mut children = Vec::new();
+    children.extend(optional_3gpp(
+        avp::CALL_ID_SIP_HEADER,
+        info.call_id.as_bytes(),
+    ));
+    children.extend(optional_3gpp(avp::FROM_SIP_HEADER, info.from.as_bytes()));
+    children.extend(optional_3gpp(avp::TO_SIP_HEADER, info.to.as_bytes()));
+    children.extend(optional_3gpp(avp::CONTACT, info.contact.as_bytes()));
+    optional_3gpp(avp::PCSCF_SUBSCRIPTION_INFO, &children)
+}
+
+fn restoration_info_avp(info: &RestorationInfo) -> Vec<u8> {
+    let mut children = Vec::new();
+    children.extend(optional_3gpp(avp::PATH, info.path.as_bytes()));
+    children.extend(optional_3gpp(avp::CONTACT, info.contact.as_bytes()));
+    if let Some(cseq) = info.initial_cseq_sequence_number {
+        children.extend(optional_3gpp(
+            avp::INITIAL_CSEQ_SEQUENCE_NUMBER,
+            &cseq.to_be_bytes(),
+        ));
+    }
+    if let Some(call_id) = &info.call_id {
+        children.extend(optional_3gpp(avp::CALL_ID_SIP_HEADER, call_id.as_bytes()));
+    }
+    if let Some(subscription) = &info.subscription_info {
+        children.extend(subscription_info_avp(subscription));
+    }
+    if let Some(subscription) = &info.pcscf_subscription_info {
+        children.extend(pcscf_subscription_info_avp(subscription));
+    }
+    optional_3gpp(avp::RESTORATION_INFO, &children)
+}
+
+/// The SCSCF-Restoration-Info AVP (TS 29.229 §6.3.46):
+/// `{ User-Name } 1*{ Restoration-Info } [ Registration-Time-Out ]
+/// [ SIP-Authentication-Scheme ]`. User-Name and SIP-Authentication-Scheme
+/// keep the flags they carry everywhere else (M set, Table 6.3.1).
+pub fn scscf_restoration_info_avp(info: &ScscfRestorationInfo) -> Vec<u8> {
+    let mut children = Vec::new();
+    children.extend(encode_avp_utf8(avp::USER_NAME, &info.user_name));
+    for restoration in &info.restoration_info {
+        children.extend(restoration_info_avp(restoration));
+    }
+    if let Some(unix_secs) = info.registration_time_out {
+        let time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(unix_secs);
+        children.extend(optional_3gpp(
+            avp::REGISTRATION_TIME_OUT,
+            &system_time_to_diameter_time(time).to_be_bytes(),
+        ));
+    }
+    if let Some(scheme) = &info.sip_authentication_scheme {
+        children.extend(encode_avp_utf8_3gpp(avp::SIP_AUTHENTICATION_SCHEME, scheme));
+    }
+    optional_3gpp(avp::SCSCF_RESTORATION_INFO, &children)
+}
+
+fn failed_pcscf_avp(failed: &FailedPcscf) -> Vec<u8> {
+    let mut children = Vec::new();
+    if let Some(fqdn) = &failed.fqdn {
+        children.extend(optional_3gpp(avp::PCSCF_FQDN, fqdn.as_bytes()));
+    }
+    for address in &failed.ip_addresses {
+        let mut data = Vec::with_capacity(18);
+        match address {
+            std::net::IpAddr::V4(v4) => {
+                data.extend_from_slice(&1u16.to_be_bytes());
+                data.extend_from_slice(&v4.octets());
+            }
+            std::net::IpAddr::V6(v6) => {
+                data.extend_from_slice(&2u16.to_be_bytes());
+                data.extend_from_slice(&v6.octets());
+            }
+        }
+        children.extend(optional_3gpp(avp::PCSCF_IP_ADDRESS, &data));
+    }
+    optional_3gpp(avp::FAILED_PCSCF, &children)
 }
 
 /// Feature bit 0 of Cx Feature-List-ID 1, `SiFC`: shared iFC sets (TS 29.229
@@ -637,7 +817,10 @@ pub const FEATURE_SIFC: u32 = 1 << 0;
 /// Vendor-Id 3GPP, Feature-List-ID, Feature-List. TS 29.229 Table 6.3.1 has
 /// the V bit on all three and the M bit off on Feature-List-ID and
 /// Feature-List; it is left off the group too, where it may be set.
-fn supported_features_avp(feature_list: u32) -> Vec<u8> {
+/// Supported-Features with Feature-List-ID 1. TS 29.229 §7.2.1: the M bit is
+/// set in a request the features were used to construct (`mandatory`), and
+/// never in an answer.
+fn supported_features_avp(feature_list: u32, mandatory: bool) -> Vec<u8> {
     let mut children = Vec::new();
     children.extend_from_slice(&encode_avp_u32(avp::VENDOR_ID, dictionary::VENDOR_3GPP));
     children.extend_from_slice(&encode_avp_vendor(
@@ -654,10 +837,149 @@ fn supported_features_avp(feature_list: u32) -> Vec<u8> {
     ));
     encode_avp_vendor(
         avp::SUPPORTED_FEATURES,
-        0,
+        if mandatory { AVP_FLAG_MANDATORY } else { 0 },
         dictionary::VENDOR_3GPP,
         &children,
     )
+}
+
+/// The members of a grouped AVP, whether or not the dictionary knew it was one.
+fn group_members(group: &Avp) -> Vec<Avp> {
+    match &group.value {
+        AvpData::Grouped(children) => children.clone(),
+        AvpData::Raw(bytes) => parse_avps(bytes).unwrap_or_default(),
+    }
+}
+
+fn member_text(children: &[Avp], code: u32, vendor: u32) -> Option<String> {
+    children
+        .iter()
+        .find(|child| child.code == code && child.vendor == vendor)
+        .and_then(Avp::as_str)
+}
+
+fn member_u32(children: &[Avp], code: u32) -> Option<u32> {
+    children
+        .iter()
+        .find(|child| child.code == code && child.vendor == dictionary::VENDOR_3GPP)
+        .and_then(Avp::as_u32)
+}
+
+/// A Diameter Time (RFC 6733 §4.3.1, NTP seconds) as Unix seconds. Values
+/// below the 1970 offset are read in the era that begins in 2036, as the RFC
+/// asks of times past the 32-bit wrap.
+fn diameter_time_to_unix(ntp: u32) -> u64 {
+    let ntp = u64::from(ntp);
+    if ntp >= NTP_UNIX_EPOCH_OFFSET {
+        ntp - NTP_UNIX_EPOCH_OFFSET
+    } else {
+        ntp + (1u64 << 32) - NTP_UNIX_EPOCH_OFFSET
+    }
+}
+
+fn read_subscription_info(group: &Avp) -> Option<SubscriptionInfo> {
+    let children = group_members(group);
+    let vendor = dictionary::VENDOR_3GPP;
+    Some(SubscriptionInfo {
+        call_id: member_text(&children, avp::CALL_ID_SIP_HEADER, vendor)?,
+        from: member_text(&children, avp::FROM_SIP_HEADER, vendor)?,
+        to: member_text(&children, avp::TO_SIP_HEADER, vendor)?,
+        record_route: member_text(&children, avp::RECORD_ROUTE, vendor)?,
+        contact: member_text(&children, avp::CONTACT, vendor)?,
+    })
+}
+
+fn read_pcscf_subscription_info(group: &Avp) -> Option<PcscfSubscriptionInfo> {
+    let children = group_members(group);
+    let vendor = dictionary::VENDOR_3GPP;
+    Some(PcscfSubscriptionInfo {
+        call_id: member_text(&children, avp::CALL_ID_SIP_HEADER, vendor)?,
+        from: member_text(&children, avp::FROM_SIP_HEADER, vendor)?,
+        to: member_text(&children, avp::TO_SIP_HEADER, vendor)?,
+        contact: member_text(&children, avp::CONTACT, vendor)?,
+    })
+}
+
+fn read_restoration_info(group: &Avp) -> Option<RestorationInfo> {
+    let children = group_members(group);
+    let vendor = dictionary::VENDOR_3GPP;
+    let find = |code: u32| {
+        children
+            .iter()
+            .find(move |child| child.code == code && child.vendor == vendor)
+    };
+    Some(RestorationInfo {
+        // `{ Path }` and `{ Contact }` are required (TS 29.229 §6.3.52).
+        path: member_text(&children, avp::PATH, vendor)?,
+        contact: member_text(&children, avp::CONTACT, vendor)?,
+        initial_cseq_sequence_number: member_u32(&children, avp::INITIAL_CSEQ_SEQUENCE_NUMBER),
+        call_id: member_text(&children, avp::CALL_ID_SIP_HEADER, vendor),
+        subscription_info: find(avp::SUBSCRIPTION_INFO).and_then(read_subscription_info),
+        pcscf_subscription_info: find(avp::PCSCF_SUBSCRIPTION_INFO)
+            .and_then(read_pcscf_subscription_info),
+    })
+}
+
+/// One SCSCF-Restoration-Info AVP (TS 29.229 §6.3.46), or `None` when it
+/// lacks its User-Name or holds no complete Restoration-Info.
+pub fn read_scscf_restoration_info(group: &Avp) -> Option<ScscfRestorationInfo> {
+    let children = group_members(group);
+    let vendor = dictionary::VENDOR_3GPP;
+    let restoration_info: Vec<RestorationInfo> = children
+        .iter()
+        .filter(|child| child.code == avp::RESTORATION_INFO && child.vendor == vendor)
+        .filter_map(read_restoration_info)
+        .collect();
+    if restoration_info.is_empty() {
+        return None;
+    }
+    Some(ScscfRestorationInfo {
+        user_name: member_text(&children, avp::USER_NAME, 0)?,
+        restoration_info,
+        registration_time_out: member_u32(&children, avp::REGISTRATION_TIME_OUT)
+            .map(diameter_time_to_unix),
+        sip_authentication_scheme: member_text(&children, avp::SIP_AUTHENTICATION_SCHEME, vendor),
+    })
+}
+
+/// Every SCSCF-Restoration-Info of a Server-Assignment-Answer, in order
+/// (`*[ SCSCF-Restoration-Info ]`, TS 29.229 §6.1.4: one group per private
+/// user identity).
+pub fn scscf_restoration_infos(message: &DiameterMsg) -> Vec<ScscfRestorationInfo> {
+    message
+        .find_all(avp::SCSCF_RESTORATION_INFO, dictionary::VENDOR_3GPP)
+        .filter_map(read_scscf_restoration_info)
+        .collect()
+}
+
+/// The User-Names of Associated-Registered-Identities (TS 29.229 §6.3.50):
+/// the private identities registered with the public identity.
+pub fn associated_registered_identities(message: &DiameterMsg) -> Vec<String> {
+    message
+        .find(
+            avp::ASSOCIATED_REGISTERED_IDENTITIES,
+            dictionary::VENDOR_3GPP,
+        )
+        .map(|group| {
+            group_members(group)
+                .iter()
+                .filter(|child| child.code == avp::USER_NAME && child.vendor == 0)
+                .filter_map(Avp::as_str)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Feature-List of the Supported-Features for Feature-List-ID 1 (TS 29.229
+/// §6.3.29) in a message, `0` without one.
+pub fn supported_feature_list(message: &DiameterMsg) -> u32 {
+    let vendor = dictionary::VENDOR_3GPP;
+    message
+        .find_all(avp::SUPPORTED_FEATURES, vendor)
+        .map(group_members)
+        .find(|children| member_u32(children, avp::FEATURE_LIST_ID) == Some(1))
+        .and_then(|children| member_u32(&children, avp::FEATURE_LIST))
+        .unwrap_or(0)
 }
 
 /// Encode a SAR (Server-Assignment-Request), S-CSCF to HSS.
@@ -682,10 +1004,42 @@ pub fn build_sar(
         avp::SERVER_ASSIGNMENT_TYPE,
         request.server_assignment_type,
     ));
-    payload.extend_from_slice(&encode_avp_u32_3gpp(avp::USER_DATA_ALREADY_AVAILABLE, 0));
+    payload.extend_from_slice(&encode_avp_u32_3gpp(
+        avp::USER_DATA_ALREADY_AVAILABLE,
+        request.user_data_already_available,
+    ));
     if request.supported_features != 0 {
         // TS 29.229 §6.1.3: `*[ Supported-Features ]`.
-        payload.extend_from_slice(&supported_features_avp(request.supported_features));
+        // The restoration members are built with the IMS restoration and
+        // P-CSCF restoration features; without them the request uses none
+        // (SiFC only shapes the answer) and the M bit is the option §7.2.1
+        // leaves.
+        let uses_features = request.restoration.is_some()
+            || request.multiple_registration_indication.is_some()
+            || request.sar_flags.is_some()
+            || request.failed_pcscf.is_some();
+        payload.extend_from_slice(&supported_features_avp(
+            request.supported_features,
+            uses_features,
+        ));
+    }
+    // TS 29.229 §6.1.3, in the order of the command:
+    // `[ SCSCF-Restoration-Info ] [ Multiple-Registration-Indication ]
+    // [ Session-Priority ] [ SAR-Flags ] [ Failed-PCSCF ]`.
+    if let Some(restoration) = request.restoration {
+        payload.extend_from_slice(&scscf_restoration_info_avp(restoration));
+    }
+    if let Some(indication) = request.multiple_registration_indication {
+        payload.extend_from_slice(&optional_3gpp(
+            avp::MULTIPLE_REGISTRATION_INDICATION,
+            &indication.to_be_bytes(),
+        ));
+    }
+    if let Some(flags) = request.sar_flags {
+        payload.extend_from_slice(&optional_3gpp(avp::SAR_FLAGS, &flags.to_be_bytes()));
+    }
+    if let Some(failed) = request.failed_pcscf {
+        payload.extend_from_slice(&failed_pcscf_avp(failed));
     }
 
     encode_diameter_message(
@@ -1298,7 +1652,12 @@ mod tests {
                 user_name,
                 server_name: SCSCF_URI,
                 server_assignment_type: 1,
+                user_data_already_available: 0,
                 supported_features: 0,
+                restoration: None,
+                multiple_registration_indication: None,
+                sar_flags: None,
+                failed_pcscf: None,
             },
             0x12d,
             0x12d,
@@ -1340,7 +1699,12 @@ mod tests {
                 user_name: Some(PRIVATE_IDENTITY),
                 server_name: SCSCF_URI,
                 server_assignment_type: 1,
+                user_data_already_available: 0,
                 supported_features: FEATURE_SIFC,
+                restoration: None,
+                multiple_registration_indication: None,
+                sar_flags: None,
+                failed_pcscf: None,
             },
             0x12e,
             0x12e,
@@ -1451,6 +1815,328 @@ mod tests {
         );
     }
 
+    // ── IMS restoration (TS 23.380 clause 4, TS 29.229) ──────────────────
+
+    /// 2026-10-18T08:00:00Z, as Unix seconds.
+    const TIME_OUT_UNIX: u64 = 1_792_310_400;
+
+    fn sample_restoration() -> ScscfRestorationInfo {
+        ScscfRestorationInfo {
+            user_name: "001010000000001@ims.example.net".to_string(),
+            restoration_info: vec![RestorationInfo {
+                path: "<sip:pcscf.example.net;lr>".to_string(),
+                contact: "<sip:192.0.2.1:5060>;expires=600000".to_string(),
+                initial_cseq_sequence_number: Some(2),
+                call_id: Some("reg-1@192.0.2.1".to_string()),
+                subscription_info: None,
+                pcscf_subscription_info: None,
+            }],
+            registration_time_out: Some(TIME_OUT_UNIX),
+            sip_authentication_scheme: Some("Digest-AKAv1-MD5".to_string()),
+        }
+    }
+
+    /// SCSCF-Restoration-Info written out by hand from TS 29.229: codes 639
+    /// (group), 1 (User-Name, base, M), 649 (Restoration-Info), 640 (Path),
+    /// 641 (Contact), 654 (Initial-CSeq-Sequence-Number), 643
+    /// (Call-ID-SIP-Header), 661 (Registration-Time-Out, NTP seconds
+    /// 0xee7efb00) and 608 (SIP-Authentication-Scheme, V and M). Table 6.3.1
+    /// has the restoration AVPs with V under Must and M under Must not, so
+    /// their flags octet is 0x80.
+    const RESTORATION_KAT: &str = concat!(
+        "0000027f800000f0000028af",
+        "000000014000002730303130313030303030303030303140696d732e6578616d706c652e6e657400",
+        "0000028980000090000028af",
+        "0000028080000026000028af3c7369703a70637363662e6578616d706c652e6e65743b6c723e0000",
+        "0000028180",
+        "00002f000028af3c7369703a3139322e302e322e313a353036303e3b657870697265733d36303030303000",
+        "0000028e80000010000028af00000002",
+        "000002838000001b000028af7265672d31403139322e302e322e3100",
+        "0000029580000010000028afee7efb00",
+        "00000260c000001c000028af4469676573742d414b4176312d4d4435",
+    );
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    fn unhex(text: &str) -> Vec<u8> {
+        (0..text.len())
+            .step_by(2)
+            .map(|at| u8::from_str_radix(&text[at..at + 2], 16).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn scscf_restoration_info_matches_the_hand_written_vector() {
+        assert_eq!(
+            hex(&scscf_restoration_info_avp(&sample_restoration())),
+            RESTORATION_KAT
+        );
+    }
+
+    #[test]
+    fn scscf_restoration_info_is_read_from_the_hand_written_vector() {
+        let group = parse_avps(&unhex(RESTORATION_KAT)).unwrap().remove(0);
+        assert_eq!(
+            read_scscf_restoration_info(&group),
+            Some(sample_restoration())
+        );
+    }
+
+    #[test]
+    fn restoration_info_without_path_or_contact_is_not_read() {
+        // `{ Path }` and `{ Contact }` are required (TS 29.229 §6.3.52); a
+        // group whose only Restoration-Info lacks one restores nothing.
+        let mut children = Vec::new();
+        children.extend(encode_avp_utf8(
+            avp::USER_NAME,
+            "001010000000001@ims.example.net",
+        ));
+        children.extend(optional_3gpp(
+            avp::RESTORATION_INFO,
+            &optional_3gpp(avp::CONTACT, b"<sip:192.0.2.1>"),
+        ));
+        let group = parse_avps(&optional_3gpp(avp::SCSCF_RESTORATION_INFO, &children))
+            .unwrap()
+            .remove(0);
+        assert_eq!(read_scscf_restoration_info(&group), None);
+    }
+
+    fn restoration_sar(request: &ServerAssignment<'_>) -> DiameterMsg {
+        DiameterMsg::from_wire(&build_sar(&client_config(), "scscf;2;9", request, 9, 9)).unwrap()
+    }
+
+    fn sar_with<'a>(
+        restoration: Option<&'a ScscfRestorationInfo>,
+        failed: Option<&'a FailedPcscf>,
+    ) -> ServerAssignment<'a> {
+        ServerAssignment {
+            public_identity: PUBLIC_IDENTITY,
+            user_name: Some(PRIVATE_IDENTITY),
+            server_name: SCSCF_URI,
+            server_assignment_type: 2,
+            user_data_already_available: 1,
+            supported_features: FEATURE_IMS_RESTORATION,
+            restoration,
+            multiple_registration_indication: Some(1),
+            sar_flags: Some(SAR_FLAG_PCSCF_RESTORATION),
+            failed_pcscf: failed,
+        }
+    }
+
+    /// TS 23.380 §4.6.2: an update of the restoration information is a
+    /// RE_REGISTRATION with USER_DATA_ALREADY_AVAILABLE; the SAR carries the
+    /// group as given, after Supported-Features (TS 29.229 §6.1.3).
+    #[test]
+    fn sar_carries_the_restoration_information_and_its_companions() {
+        let restoration = sample_restoration();
+        let failed = FailedPcscf {
+            fqdn: Some("pcscf.example.net".to_string()),
+            ip_addresses: vec!["192.0.2.1".parse().unwrap(), "2001:db8::1".parse().unwrap()],
+        };
+        let message = restoration_sar(&sar_with(Some(&restoration), Some(&failed)));
+        let vendor = dictionary::VENDOR_3GPP;
+        assert_eq!(
+            message
+                .find(avp::USER_DATA_ALREADY_AVAILABLE, vendor)
+                .and_then(Avp::as_u32),
+            Some(1)
+        );
+        let group = message.find(avp::SCSCF_RESTORATION_INFO, vendor).unwrap();
+        assert_eq!(group.flags, AVP_FLAG_VENDOR, "M bit must not be set");
+        assert_eq!(read_scscf_restoration_info(group), Some(restoration));
+        assert_eq!(
+            message
+                .find(avp::MULTIPLE_REGISTRATION_INDICATION, vendor)
+                .and_then(Avp::as_u32),
+            Some(1)
+        );
+        assert_eq!(
+            message.find(avp::SAR_FLAGS, vendor).and_then(Avp::as_u32),
+            Some(1)
+        );
+        let failed_avp = message.find(avp::FAILED_PCSCF, vendor).unwrap();
+        let members = group_members(failed_avp);
+        assert_eq!(
+            member_text(&members, avp::PCSCF_FQDN, vendor).as_deref(),
+            Some("pcscf.example.net")
+        );
+        let addresses: Vec<Vec<u8>> = members
+            .iter()
+            .filter(|child| child.code == avp::PCSCF_IP_ADDRESS)
+            .filter_map(|child| child.raw_bytes().map(<[u8]>::to_vec))
+            .collect();
+        assert_eq!(
+            addresses,
+            vec![
+                vec![0, 1, 192, 0, 2, 1],
+                [
+                    vec![0, 2],
+                    "2001:db8::1"
+                        .parse::<std::net::Ipv6Addr>()
+                        .unwrap()
+                        .octets()
+                        .to_vec()
+                ]
+                .concat(),
+            ]
+        );
+        assert_eq!(supported_feature_list(&message), FEATURE_IMS_RESTORATION);
+        // The order of TS 29.229 §6.1.3.
+        let order: Vec<u32> = message.avps.iter().map(|avp| avp.code).collect();
+        let at = |code: u32| order.iter().position(|c| *c == code).unwrap();
+        assert!(at(avp::SUPPORTED_FEATURES) < at(avp::SCSCF_RESTORATION_INFO));
+        assert!(at(avp::SCSCF_RESTORATION_INFO) < at(avp::MULTIPLE_REGISTRATION_INDICATION));
+        assert!(at(avp::MULTIPLE_REGISTRATION_INDICATION) < at(avp::SAR_FLAGS));
+        assert!(at(avp::SAR_FLAGS) < at(avp::FAILED_PCSCF));
+    }
+
+    /// TS 29.229 §7.2.1: a request that a feature was used to construct
+    /// carries Supported-Features with the M bit, so an HSS without the
+    /// feature answers DIAMETER_ERROR_FEATURE_UNSUPPORTED rather than
+    /// dropping the restoration information.
+    #[test]
+    fn sar_with_restoration_marks_supported_features_mandatory() {
+        let restoration = sample_restoration();
+        let message = restoration_sar(&sar_with(Some(&restoration), None));
+        let features = message
+            .find(avp::SUPPORTED_FEATURES, dictionary::VENDOR_3GPP)
+            .unwrap();
+        assert_eq!(features.flags, AVP_FLAG_VENDOR | AVP_FLAG_MANDATORY);
+    }
+
+    #[test]
+    fn sar_without_restoration_sends_none_of_it() {
+        let message = restoration_sar(&ServerAssignment {
+            restoration: None,
+            multiple_registration_indication: None,
+            sar_flags: None,
+            failed_pcscf: None,
+            user_data_already_available: 0,
+            ..sar_with(None, None)
+        });
+        let vendor = dictionary::VENDOR_3GPP;
+        for code in [
+            avp::SCSCF_RESTORATION_INFO,
+            avp::MULTIPLE_REGISTRATION_INDICATION,
+            avp::SAR_FLAGS,
+            avp::FAILED_PCSCF,
+        ] {
+            assert!(message.find(code, vendor).is_none(), "AVP {code}");
+        }
+        assert_eq!(
+            message
+                .find(avp::USER_DATA_ALREADY_AVAILABLE, vendor)
+                .and_then(Avp::as_u32),
+            Some(0)
+        );
+    }
+
+    /// A subscription in Restoration-Info (TS 29.229 §6.3.49, §6.3.70): every
+    /// member is required, and both kinds come back as they went.
+    #[test]
+    fn restoration_info_carries_the_reg_event_subscriptions() {
+        let mut restoration = sample_restoration();
+        restoration.restoration_info[0].subscription_info = Some(SubscriptionInfo {
+            call_id: "sub-1@192.0.2.1".to_string(),
+            from: "<sip:001010000000001@ims.example.net>;tag=ue".to_string(),
+            to: "<sip:001010000000001@ims.example.net>;tag=scscf".to_string(),
+            record_route: "<sip:pcscf.example.net;lr>".to_string(),
+            contact: "<sip:192.0.2.1:5060>".to_string(),
+        });
+        restoration.restoration_info[0].pcscf_subscription_info = Some(PcscfSubscriptionInfo {
+            call_id: "sub-2@198.51.100.1".to_string(),
+            from: "<sip:pcscf.example.net>;tag=p".to_string(),
+            to: "<sip:001010000000001@ims.example.net>;tag=s".to_string(),
+            contact: "<sip:198.51.100.1:5060>".to_string(),
+        });
+        let group = parse_avps(&scscf_restoration_info_avp(&restoration))
+            .unwrap()
+            .remove(0);
+        assert_eq!(read_scscf_restoration_info(&group), Some(restoration));
+    }
+
+    fn restoration_saa() -> Vec<u8> {
+        let mut second = sample_restoration();
+        second.user_name = "alice.desk@ims.example.net".to_string();
+        second.sip_authentication_scheme = Some("SIP Digest".to_string());
+        second.registration_time_out = None;
+        let mut extra = unhex(RESTORATION_KAT);
+        extra.extend(scscf_restoration_info_avp(&second));
+        let mut associated = Vec::new();
+        associated.extend(encode_avp_utf8(
+            avp::USER_NAME,
+            "001010000000001@ims.example.net",
+        ));
+        associated.extend(encode_avp_utf8(
+            avp::USER_NAME,
+            "alice.desk@ims.example.net",
+        ));
+        extra.extend(optional_3gpp(
+            avp::ASSOCIATED_REGISTERED_IDENTITIES,
+            &associated,
+        ));
+        extra.extend(supported_features_avp(FEATURE_IMS_RESTORATION, false));
+        // DIAMETER_ERROR_IN_ASSIGNMENT_TYPE: the answer to UNREGISTERED_USER
+        // for a registered identity with restoration information (TS 29.228
+        // §6.1.2.1, TS 23.380 §4.3.2).
+        CxAnswerBuilder::new("hss.example.org", "example.org", "cx;sar;9")
+            .experimental_result(5007)
+            .raw_avps(&extra)
+            .build_with_ids(dictionary::CMD_SERVER_ASSIGNMENT, 9, 9)
+    }
+
+    #[test]
+    fn saa_yields_every_restoration_group_and_the_registered_identities() {
+        let message = DiameterMsg::from_wire(&restoration_saa()).unwrap();
+        let groups = scscf_restoration_infos(&message);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0], sample_restoration());
+        assert_eq!(groups[1].user_name, "alice.desk@ims.example.net");
+        assert_eq!(
+            groups[1].sip_authentication_scheme.as_deref(),
+            Some("SIP Digest")
+        );
+        assert_eq!(
+            associated_registered_identities(&message),
+            vec![
+                "001010000000001@ims.example.net".to_string(),
+                "alice.desk@ims.example.net".to_string()
+            ]
+        );
+        assert_eq!(supported_feature_list(&message), FEATURE_IMS_RESTORATION);
+    }
+
+    /// RFC 6733 §4.3.1: Time is NTP seconds, and a value with the high bit
+    /// clear is in the era that starts in 2036.
+    #[test]
+    fn diameter_time_reads_both_eras() {
+        assert_eq!(diameter_time_to_unix(0xee7e_fb00), TIME_OUT_UNIX);
+        assert_eq!(diameter_time_to_unix(0x83aa_7e80), 0);
+        assert_eq!(
+            diameter_time_to_unix(0),
+            (1u64 << 32) - NTP_UNIX_EPOCH_OFFSET
+        );
+    }
+
+    fn capabilities_lir() -> Vec<u8> {
+        // As DiameterClient::send_lir writes it with User-Authorization-Type.
+        let config = client_config();
+        let mut payload = Vec::new();
+        append_request_header(&mut payload, &config, "icscf;3;1");
+        payload.extend(encode_avp_utf8_3gpp(avp::PUBLIC_IDENTITY, PUBLIC_IDENTITY));
+        payload.extend(encode_avp_u32_3gpp(avp::USER_AUTHORIZATION_TYPE, 2));
+        encode_diameter_message(
+            FLAG_REQUEST | FLAG_PROXIABLE,
+            dictionary::CMD_LOCATION_INFO,
+            dictionary::CX_APP_ID,
+            3,
+            3,
+            &payload,
+        )
+    }
+
     /// Writes the requests and the answer helpers' output as `text2pcap` hex dumps for
     /// `scripts/validate_diameter_cx_requests.sh` to feed to tshark, which
     /// reads them with its own dictionary.
@@ -1478,6 +2164,24 @@ mod tests {
             ("lia", sample_lia()),
             ("maa", sample_maa()),
             ("rta", sample_rta()),
+            (
+                "sar_restoration",
+                build_sar(
+                    &client_config(),
+                    "scscf;2;9",
+                    &sar_with(
+                        Some(&sample_restoration()),
+                        Some(&FailedPcscf {
+                            fqdn: Some("pcscf.example.net".to_string()),
+                            ip_addresses: vec!["192.0.2.1".parse().unwrap()],
+                        }),
+                    ),
+                    9,
+                    9,
+                ),
+            ),
+            ("saa_restoration", restoration_saa()),
+            ("lir_capabilities", capabilities_lir()),
         ] {
             let mut dump = String::new();
             for (offset, chunk) in wire.chunks(16).enumerate() {
