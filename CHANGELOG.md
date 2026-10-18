@@ -215,6 +215,15 @@ entry, but a working config keeps working.
   through `answer(..., sdp=..., to_tag=...)` with the tags reversed. On any
   other call it is the first offer and records the session. No source address
   is carried. Without `sdp=` nothing changes.
+- **B2BUA: `@b2bua.on_failure` sees the response the call failed on.**
+  `call.failure_response` is the dialled leg's own final response that `code`
+  was derived from, read-only (`status_code`, `reason`, `get_header`,
+  `get_headers`, `body`, `content_type`). `code` is unchanged and stays what
+  the caller is sent, so a B-leg `503` is still `500` there, while the script
+  can now read the `503`, its `Reason`, or a `488`'s SDP (TS 24.292 §10.4.7 CS
+  breakout). For an exhausted route sequence or a fork it is the leg whose
+  failure won (RFC 3261 §16.7). `None` when siphon ended the leg itself: ring
+  timeout, B-leg never sent, LCR ended on undialable carriers.
 
 ## [1.14.0] — 2026-10-17
 

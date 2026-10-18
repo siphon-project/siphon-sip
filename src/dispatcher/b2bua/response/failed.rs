@@ -211,6 +211,11 @@ fn fail_call_on_b_leg_failure(
             status = status_code,
             "B2BUA: relaying auth challenge to A-leg (auth_passthrough) — not a failure"
         );
+    } else {
+        // Kept as the leg sent it, before the route sequence or the relay
+        // touches it: `@b2bua.on_failure` shows it as `call.failure_response`
+        // when the failure code turns out to have come from it.
+        state.call_actors.record_failure_response(call_id, message);
     }
 
     // LCR / sequential failover: this carrier produced a final failure. If it is

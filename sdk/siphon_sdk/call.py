@@ -12,7 +12,9 @@ import re
 import uuid
 from typing import Any, Optional, Union
 
-from siphon_sdk.types import Action, Contact, Flow, MediaHandle, SipUri, route_name_addrs
+from siphon_sdk.types import (
+    Action, Contact, FailureResponse, Flow, MediaHandle, SipUri, route_name_addrs,
+)
 from siphon_sdk.request import _parse_uri, _validate_send_socket
 from siphon_sdk.lcr import Route
 
@@ -162,6 +164,7 @@ class Call:
         route_attempts: Optional[list[dict]] = None,
         flow: Optional[Flow] = None,
         local_tag: Optional[str] = _UNSET_LOCAL_TAG,
+        failure_response: Optional[FailureResponse] = None,
     ) -> None:
         self._id = call_id or str(uuid.uuid4())
         self._from_uri = _parse_uri(from_uri)
@@ -215,6 +218,10 @@ class Call:
         # dispatcher fills this from the call actor's recorded attempts; pass
         # ``route_attempts=`` to simulate a call that failed over.
         self._route_attempts: list[dict] = list(route_attempts) if route_attempts else []
+        # The dialled leg's own final response a failure code came from; the
+        # dispatcher attaches it for ``@b2bua.on_failure``. Pass
+        # ``failure_response=`` to simulate what the far end sent.
+        self._failure_response = failure_response
         # Ro reserve-before-connect gate: the result ``ro_authorize`` returns
         # (default a grant), and a record of each call for test assertions.
         self._ro_authorize_result: Optional[dict] = None
@@ -262,6 +269,39 @@ class Call:
                              f"{attempt['status']} after {attempt['elapsed_ms']}ms")
         """
         return self._route_attempts
+
+    @property
+    def failure_response(self) -> Optional[FailureResponse]:
+        """In ``@b2bua.on_failure``: the dialled leg's own final response that
+        the handler's ``code`` was derived from, read-only, or ``None``.
+
+        ``code`` is what the caller is sent, which is not always what the far
+        end said: a ``503`` reaches the caller as ``500`` (RFC 3261 §16.7 step
+        6), and an exhausted ``call.route()`` sequence or a fork ends on the
+        best failure of all its legs. This is that leg's response as it
+        arrived: ``status_code``, ``reason``, ``get_header(name)``,
+        ``get_headers(name)``, ``body`` and ``content_type``.
+
+        ``None`` when siphon concluded the leg itself: a ring timeout, a B-leg
+        INVITE that was never sent, a sequence that ended on carriers it could
+        not dial, or a refusal of the caller's own request. ``None`` outside
+        ``@b2bua.on_failure``.
+
+        Example (TS 24.292 §10.4.7, CS breakout)::
+
+            @b2bua.on_failure
+            def failed(call, code, reason):
+                response = call.failure_response
+                if response is None:
+                    return
+                cause = response.get_header("Reason") or ""
+                no_audio = (response.status_code == 488
+                            and b"m=audio" not in (response.body or b""))
+                if no_audio or (response.status_code == 500
+                                and "FAILURE_CAUSE;cause=2" in cause):
+                    call.dial(cs_breakout_uri(call))
+        """
+        return self._failure_response
 
     @property
     def id(self) -> str:
