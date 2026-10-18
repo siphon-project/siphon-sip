@@ -502,6 +502,12 @@ static AVP_TABLE: &[AvpDef] = &[
         data_type: AvpType::Enumerated,
     },
     AvpDef {
+        code: 451,
+        vendor_id: 0,
+        name: "Tariff-Time-Change",
+        data_type: AvpType::Time,
+    },
+    AvpDef {
         code: 452,
         vendor_id: 0,
         name: "Tariff-Change-Usage",
@@ -1303,6 +1309,12 @@ static AVP_TABLE: &[AvpDef] = &[
         data_type: AvpType::UTF8String,
     },
     AvpDef {
+        code: 854,
+        vendor_id: TGPP,
+        name: "Bearer-Service",
+        data_type: AvpType::OctetString,
+    },
+    AvpDef {
         code: 861,
         vendor_id: TGPP,
         name: "Cause-Code",
@@ -1313,6 +1325,18 @@ static AVP_TABLE: &[AvpDef] = &[
         vendor_id: TGPP,
         name: "Node-Functionality",
         data_type: AvpType::Enumerated,
+    },
+    AvpDef {
+        code: 866,
+        vendor_id: TGPP,
+        name: "PS-Free-Format-Data",
+        data_type: AvpType::OctetString,
+    },
+    AvpDef {
+        code: 868,
+        vendor_id: TGPP,
+        name: "Time-Quota-Threshold",
+        data_type: AvpType::Unsigned32,
     },
     AvpDef {
         code: 873,
@@ -1858,6 +1882,18 @@ static AVP_TABLE: &[AvpDef] = &[
     // off-net trunk, which is exactly what it looked like before: the SGd path silently unused.
     // Codes cross-checked against Wireshark's own 3GPP Diameter dissector, not just our table.
     AvpDef {
+        code: 2041,
+        vendor_id: TGPP,
+        name: "Start-Time",
+        data_type: AvpType::Time,
+    },
+    AvpDef {
+        code: 2042,
+        vendor_id: TGPP,
+        name: "Stop-Time",
+        data_type: AvpType::Time,
+    },
+    AvpDef {
         code: 2401,
         vendor_id: TGPP,
         name: "Serving-Node",
@@ -2027,6 +2063,90 @@ static AVP_TABLE: &[AvpDef] = &[
         code: 3409,
         vendor_id: TGPP,
         name: "SMS-Result",
+        data_type: AvpType::Unsigned32,
+    },
+    AvpDef {
+        code: 3410,
+        vendor_id: TGPP,
+        name: "VCS-Information",
+        data_type: AvpType::Grouped,
+    },
+    AvpDef {
+        code: 3411,
+        vendor_id: TGPP,
+        name: "Basic-Service-Code",
+        data_type: AvpType::Grouped,
+    },
+    AvpDef {
+        code: 3412,
+        vendor_id: TGPP,
+        name: "Bearer-Capability",
+        data_type: AvpType::OctetString,
+    },
+    AvpDef {
+        code: 3413,
+        vendor_id: TGPP,
+        name: "Teleservice",
+        data_type: AvpType::OctetString,
+    },
+    AvpDef {
+        code: 3414,
+        vendor_id: TGPP,
+        name: "ISUP-Location-Number",
+        data_type: AvpType::OctetString,
+    },
+    AvpDef {
+        code: 3415,
+        vendor_id: TGPP,
+        name: "Forwarding-Pending",
+        data_type: AvpType::Enumerated,
+    },
+    AvpDef {
+        code: 3416,
+        vendor_id: TGPP,
+        name: "ISUP-Cause",
+        data_type: AvpType::Grouped,
+    },
+    AvpDef {
+        code: 3417,
+        vendor_id: TGPP,
+        name: "MSC-Address",
+        data_type: AvpType::OctetString,
+    },
+    AvpDef {
+        code: 3418,
+        vendor_id: TGPP,
+        name: "Network-Call-Reference-Number",
+        data_type: AvpType::OctetString,
+    },
+    AvpDef {
+        code: 3419,
+        vendor_id: TGPP,
+        name: "Start-of-Charging",
+        data_type: AvpType::Time,
+    },
+    AvpDef {
+        code: 3420,
+        vendor_id: TGPP,
+        name: "VLR-Number",
+        data_type: AvpType::OctetString,
+    },
+    AvpDef {
+        code: 3422,
+        vendor_id: TGPP,
+        name: "ISUP-Cause-Diagnostics",
+        data_type: AvpType::OctetString,
+    },
+    AvpDef {
+        code: 3423,
+        vendor_id: TGPP,
+        name: "ISUP-Cause-Location",
+        data_type: AvpType::Unsigned32,
+    },
+    AvpDef {
+        code: 3424,
+        vendor_id: TGPP,
+        name: "ISUP-Cause-Value",
         data_type: AvpType::Unsigned32,
     },
 ];
@@ -2420,6 +2540,8 @@ pub const DIAMETER_UNKNOWN_PEER: u32 = 3010;
 /// 6733 §5.3 / §7.1.5). Answered in the CEA, then the connection is closed.
 pub const DIAMETER_NO_COMMON_APPLICATION: u32 = 5010;
 pub const DIAMETER_UNABLE_TO_COMPLY: u32 = 5012;
+/// RFC 6733 §7.1.5: a request for a session the receiver does not hold.
+pub const DIAMETER_UNKNOWN_SESSION_ID: u32 = 5002;
 /// Malformed AVP length on an inbound message (RFC 6733 §7.1.5).
 pub const DIAMETER_INVALID_AVP_LENGTH: u32 = 5014;
 pub const DIAMETER_ERROR_USER_UNKNOWN: u32 = 5001;
@@ -2798,6 +2920,7 @@ mod tests {
             ("Validity-Time", 448, 0),
             ("Final-Unit-Action", 449, 0),
             ("Subscription-Id-Type", 450, 0),
+            ("Tariff-Time-Change", 451, 0),
             ("G-S-U-Pool-Identifier", 453, 0),
             ("Multiple-Services-Indicator", 455, 0),
             ("Multiple-Services-Credit-Control", 456, 0),
@@ -2812,6 +2935,27 @@ mod tests {
             ("SMS-Information", 2000, TGPP),
             ("Node-Functionality", 862, TGPP),
             ("Role-of-Node", 829, TGPP),
+            ("Time-Quota-Threshold", 868, TGPP),
+            // VCS-Information and members (TS 32.299, TS 32.276), as in
+            // Wireshark's diameter/dictionary.xml.
+            ("VCS-Information", 3410, TGPP),
+            ("Basic-Service-Code", 3411, TGPP),
+            ("Bearer-Capability", 3412, TGPP),
+            ("Teleservice", 3413, TGPP),
+            ("ISUP-Location-Number", 3414, TGPP),
+            ("Forwarding-Pending", 3415, TGPP),
+            ("ISUP-Cause", 3416, TGPP),
+            ("MSC-Address", 3417, TGPP),
+            ("Network-Call-Reference-Number", 3418, TGPP),
+            ("Start-of-Charging", 3419, TGPP),
+            ("VLR-Number", 3420, TGPP),
+            ("ISUP-Cause-Diagnostics", 3422, TGPP),
+            ("ISUP-Cause-Location", 3423, TGPP),
+            ("ISUP-Cause-Value", 3424, TGPP),
+            ("Bearer-Service", 854, TGPP),
+            ("PS-Free-Format-Data", 866, TGPP),
+            ("Start-Time", 2041, TGPP),
+            ("Stop-Time", 2042, TGPP),
             ("SMSC-Address", 2017, TGPP),
             ("MTC-IWF-Address", 3406, TGPP),
             ("SMS-Result", 3409, TGPP),

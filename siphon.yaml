@@ -2065,7 +2065,7 @@ auth:
 #   auto_emit_proxy: true                 # ACR-START/STOP from proxy 2xx-forward + in-dialog BYE
 #   auto_emit_b2bua: true                 # ACR-START/STOP from B2BUA Answered/Bye/Terminated
 #   interim_interval_secs: 0              # 0 = disabled; CDF Acct-Interim-Interval overrides
-#   node_functionality: scscf             # scscf|pcscf|icscf|mrfc|mgcf|bgcf|as|ibcf|ecscf|atcf|mmtel|tpf|atgw
+#   node_functionality: scscf             # scscf|pcscf|icscf|mrfc|mgcf|bgcf|as(mmtel)|ibcf|ecscf|atcf|proxy|... (TS 32.299 7.2.113)
 #   service_context_id: "32260@3gpp.org"  # TS 32.260 IMS = 32260, MMTel SC = 32274
 #   access_network_information: false     # true: the automatic ACRs carry the request's
 #                                         # P-Access-Network-Info as Access-Network-Information

@@ -102,9 +102,14 @@ impl NodeRole {
     }
 }
 
-// ── Node-Functionality (TS 32.299 §7.2.111) ────────────────────────────
+// ── Node-Functionality (TS 32.299 §7.2.113) ────────────────────────────
 
-/// IMS node functionality for charging correlation per TS 32.299 §7.2.111.
+/// The functionality of the node that sends the record, TS 32.299 clause
+/// 7.2.113 (Node-Functionality, AVP 862). The values are the specification's
+/// and Wireshark's (dictionary.xml), and they are not contiguous with the IMS
+/// names alone: 8 to 10 are the EPC gateways, 11 the E-CSCF, 15 the ATCF and
+/// 16 the Proxy Function of TS 32.276 voice call charging (an SCP), up to 21
+/// IWK-SCEF.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub enum NodeFunctionality {
@@ -116,12 +121,21 @@ pub enum NodeFunctionality {
     Bgcf = 5,
     ApplicationServer = 6,
     Ibcf = 7,
-    SCscfRestore = 8,
-    Ecscf = 9,
-    Atcf = 10,
-    Mmtel = 11,
-    Tpf = 12,
-    Atgw = 13,
+    SGw = 8,
+    PGw = 9,
+    Hsgw = 10,
+    Ecscf = 11,
+    Mme = 12,
+    Trf = 13,
+    Tf = 14,
+    Atcf = 15,
+    /// Proxy Function (TS 32.276): the gsmSCF / SCP charging a CS call.
+    ProxyFunction = 16,
+    Epdg = 17,
+    Tdf = 18,
+    Twag = 19,
+    Scef = 20,
+    IwkScef = 21,
 }
 
 impl NodeFunctionality {
@@ -129,9 +143,9 @@ impl NodeFunctionality {
         self as u32
     }
 
-    /// Parse a Python-style functionality string.  Accepts the role
-    /// short-names commonly used by operators (`"scscf"`, `"pcscf"`,
-    /// `"as"`, `"mmtel"`, …).  Case-insensitive.
+    /// Parse a functionality name (`"scscf"`, `"pcscf"`, `"as"`,
+    /// `"proxy"`, ...). Case-insensitive. An MMTel AS is an application
+    /// server: `"mmtel"` is `ApplicationServer`, there is no value of its own.
     pub fn from_str_ci(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "scscf" | "s-cscf" => Some(NodeFunctionality::SCscf),
@@ -140,16 +154,24 @@ impl NodeFunctionality {
             "mrfc" => Some(NodeFunctionality::Mrfc),
             "mgcf" => Some(NodeFunctionality::Mgcf),
             "bgcf" => Some(NodeFunctionality::Bgcf),
-            "as" | "applicationserver" | "application-server" => {
+            "as" | "applicationserver" | "application-server" | "mmtel" => {
                 Some(NodeFunctionality::ApplicationServer)
             }
             "ibcf" => Some(NodeFunctionality::Ibcf),
-            "scscf-restore" | "scscf_restore" => Some(NodeFunctionality::SCscfRestore),
+            "sgw" | "s-gw" => Some(NodeFunctionality::SGw),
+            "pgw" | "p-gw" => Some(NodeFunctionality::PGw),
+            "hsgw" => Some(NodeFunctionality::Hsgw),
             "ecscf" | "e-cscf" => Some(NodeFunctionality::Ecscf),
+            "mme" => Some(NodeFunctionality::Mme),
+            "trf" => Some(NodeFunctionality::Trf),
+            "tf" => Some(NodeFunctionality::Tf),
             "atcf" => Some(NodeFunctionality::Atcf),
-            "mmtel" => Some(NodeFunctionality::Mmtel),
-            "tpf" => Some(NodeFunctionality::Tpf),
-            "atgw" => Some(NodeFunctionality::Atgw),
+            "proxy" | "proxy-function" | "proxy_function" => Some(NodeFunctionality::ProxyFunction),
+            "epdg" => Some(NodeFunctionality::Epdg),
+            "tdf" => Some(NodeFunctionality::Tdf),
+            "twag" => Some(NodeFunctionality::Twag),
+            "scef" => Some(NodeFunctionality::Scef),
+            "iwk-scef" | "iwk_scef" | "iwkscef" => Some(NodeFunctionality::IwkScef),
             _ => None,
         }
     }
@@ -469,6 +491,16 @@ pub fn encode_service_information(
     ims: Option<&ImsChargingData>,
     sms: Option<&SmsChargingData>,
 ) -> Vec<u8> {
+    encode_service_information_with(ims, sms, None)
+}
+
+/// [`encode_service_information`] with `VCS-Information` (TS 32.276) as a
+/// third member.
+pub fn encode_service_information_with(
+    ims: Option<&ImsChargingData>,
+    sms: Option<&SmsChargingData>,
+    vcs: Option<&VcsInformation>,
+) -> Vec<u8> {
     let mut inner = Vec::new();
     if let Some(ims) = ims {
         inner.extend_from_slice(&ims.encode_ims_information_avp());
@@ -476,10 +508,165 @@ pub fn encode_service_information(
     if let Some(sms) = sms {
         inner.extend_from_slice(&sms.encode_sms_information_avp());
     }
+    if let Some(vcs) = vcs {
+        inner.extend_from_slice(&vcs.encode_vcs_information_avp());
+    }
     if inner.is_empty() {
         return Vec::new();
     }
     encode_avp_grouped_3gpp(avp::SERVICE_INFORMATION, &inner)
+}
+
+// ── VCS charging information (TS 32.276) ───────────────────────────────
+
+/// Basic-Service-Code (TS 32.299, AVP 3411): the bearer service or the
+/// teleservice of the call, as the gsmSSF reported it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BasicServiceCode {
+    /// Bearer-Service (854), octets as in TS 29.002 BearerServiceCode.
+    pub bearer_service: Option<Vec<u8>>,
+    /// Teleservice (3413), octets as in TS 29.002 TeleserviceCode.
+    pub teleservice: Option<Vec<u8>>,
+}
+
+/// ISUP-Cause (AVP 3416, TS 32.299 §7.2.80B): why the circuit-switched call
+/// was released, from the ISUP cause (ITU-T Q.850). Sent on CCR-TERMINATION
+/// only (TS 32.276 table 6.3.1.4.1). Wireshark labels the AVP
+/// ISUP-Release-Cause.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IsupCause {
+    /// ISUP-Cause-Location (3423), Unsigned32 per TS 32.299 §7.2.80D (Wireshark's
+    /// dictionary has it as an OctetString).
+    pub location: Option<u32>,
+    /// ISUP-Cause-Value (3424): the Q.850 cause value.
+    pub value: Option<u32>,
+    /// ISUP-Cause-Diagnostics (3422).
+    pub diagnostics: Option<Vec<u8>>,
+}
+
+/// VCS-Information (TS 32.299 §7.2.242A, AVP 3410): what a Proxy Function
+/// (an SCP, TS 32.276) knows of a circuit-switched call. MSC-Address,
+/// ISUP-Location-Number and VLR-Number are the TBCD digits only, without the
+/// nature-of-address / numbering-plan octet an ISDN-AddressString starts with
+/// (TS 32.299 §7.2.111B, §7.2.80F, §7.2.242B): the caller strips it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VcsInformation {
+    /// Bearer-Capability (3412).
+    pub bearer_capability: Option<Vec<u8>>,
+    /// Network-Call-Reference-Number (3418).
+    pub network_call_reference_number: Option<Vec<u8>>,
+    /// MSC-Address (3417).
+    pub msc_address: Option<Vec<u8>>,
+    pub basic_service_code: Option<BasicServiceCode>,
+    /// ISUP-Location-Number (3414).
+    pub isup_location_number: Option<Vec<u8>>,
+    /// VLR-Number (3420).
+    pub vlr_number: Option<Vec<u8>>,
+    /// Forwarding-Pending (3415): 0 not pending, 1 pending.
+    pub forwarding_pending: Option<u32>,
+    pub isup_cause: Option<IsupCause>,
+    /// Start-Time (2041).
+    pub start_time: Option<std::time::SystemTime>,
+    /// Start-of-Charging (3419).
+    pub start_of_charging: Option<std::time::SystemTime>,
+    /// Stop-Time (2042).
+    pub stop_time: Option<std::time::SystemTime>,
+    /// PS-Free-Format-Data (866). TS 32.276 has the OCS send it (in the
+    /// answer, see [`CreditControlAnswer::free_format_data`]), not the Proxy
+    /// Function; kept for an OCS that wants it echoed.
+    pub ps_free_format_data: Option<Vec<u8>>,
+}
+
+impl VcsInformation {
+    /// Encode the `VCS-Information` grouped AVP, members in the order of the
+    /// TS 32.299 ABNF.
+    pub fn encode_vcs_information_avp(&self) -> Vec<u8> {
+        let mut inner = Vec::new();
+        let octets = |inner: &mut Vec<u8>, code: u32, value: &Option<Vec<u8>>| {
+            if let Some(value) = value {
+                inner.extend_from_slice(&encode_avp_octet_3gpp(code, value));
+            }
+        };
+        octets(&mut inner, avp::BEARER_CAPABILITY, &self.bearer_capability);
+        octets(
+            &mut inner,
+            avp::NETWORK_CALL_REFERENCE_NUMBER,
+            &self.network_call_reference_number,
+        );
+        octets(&mut inner, avp::MSC_ADDRESS, &self.msc_address);
+        if let Some(code) = &self.basic_service_code {
+            let mut members = Vec::new();
+            octets(&mut members, avp::BEARER_SERVICE, &code.bearer_service);
+            octets(&mut members, avp::TELESERVICE, &code.teleservice);
+            inner.extend_from_slice(&encode_avp_grouped_3gpp(avp::BASIC_SERVICE_CODE, &members));
+        }
+        octets(
+            &mut inner,
+            avp::ISUP_LOCATION_NUMBER,
+            &self.isup_location_number,
+        );
+        octets(&mut inner, avp::VLR_NUMBER, &self.vlr_number);
+        if let Some(pending) = self.forwarding_pending {
+            inner.extend_from_slice(&encode_avp_u32_3gpp(avp::FORWARDING_PENDING, pending));
+        }
+        if let Some(cause) = &self.isup_cause {
+            let mut members = Vec::new();
+            if let Some(location) = cause.location {
+                members.extend_from_slice(&encode_avp_u32_3gpp(avp::ISUP_CAUSE_LOCATION, location));
+            }
+            if let Some(value) = cause.value {
+                members.extend_from_slice(&encode_avp_u32_3gpp(avp::ISUP_CAUSE_VALUE, value));
+            }
+            octets(
+                &mut members,
+                avp::ISUP_CAUSE_DIAGNOSTICS,
+                &cause.diagnostics,
+            );
+            inner.extend_from_slice(&encode_avp_grouped_3gpp(avp::ISUP_CAUSE, &members));
+        }
+        if let Some(time) = self.start_time {
+            inner.extend_from_slice(&encode_avp_time_3gpp(avp::START_TIME, time));
+        }
+        if let Some(time) = self.start_of_charging {
+            inner.extend_from_slice(&encode_avp_time_3gpp(avp::START_OF_CHARGING, time));
+        }
+        if let Some(time) = self.stop_time {
+            inner.extend_from_slice(&encode_avp_time_3gpp(avp::STOP_TIME, time));
+        }
+        octets(
+            &mut inner,
+            avp::PS_FREE_FORMAT_DATA,
+            &self.ps_free_format_data,
+        );
+        encode_avp_grouped_3gpp(avp::VCS_INFORMATION, &inner)
+    }
+
+    /// Lay `update` over this: every member `update` carries replaces the one
+    /// held, the rest stay. A Proxy Function learns ISUP-Cause and Stop-Time
+    /// only at the release (TS 32.276 table 6.3.1.4.1: CCR-TERMINATION only)
+    /// and Start-of-Charging at the answer, after the CCR-INITIAL went out.
+    pub fn overlay(&mut self, update: VcsInformation) {
+        fn take<T>(held: &mut Option<T>, new: Option<T>) {
+            if new.is_some() {
+                *held = new;
+            }
+        }
+        take(&mut self.bearer_capability, update.bearer_capability);
+        take(
+            &mut self.network_call_reference_number,
+            update.network_call_reference_number,
+        );
+        take(&mut self.msc_address, update.msc_address);
+        take(&mut self.basic_service_code, update.basic_service_code);
+        take(&mut self.isup_location_number, update.isup_location_number);
+        take(&mut self.vlr_number, update.vlr_number);
+        take(&mut self.forwarding_pending, update.forwarding_pending);
+        take(&mut self.isup_cause, update.isup_cause);
+        take(&mut self.start_time, update.start_time);
+        take(&mut self.start_of_charging, update.start_of_charging);
+        take(&mut self.stop_time, update.stop_time);
+        take(&mut self.ps_free_format_data, update.ps_free_format_data);
+    }
 }
 
 // ── SMS charging information ────────────────────────────────────────────
@@ -748,8 +935,30 @@ pub struct CreditControlAnswer {
     /// 1 = REDIRECT, 2 = RESTRICT_ACCESS) — present on the last grant.
     pub final_unit_action: Option<u32>,
     /// Session-Id echoed by the OCS (falls back to the request's for
-    /// continuity so UPDATE/TERMINATE key the same session).
+    /// continuity so UPDATE/TERMINATION key the same session).
     pub session_id: Option<String>,
+    /// Time-Quota-Threshold (TS 32.299 §7.2.229): re-authorise when this many
+    /// seconds of the granted time are left, not when it has all gone.
+    pub time_quota_threshold: Option<u32>,
+    /// Redirect-Server-Address inside Final-Unit-Indication, for a final grant
+    /// whose action is REDIRECT (RFC 8506 §5.6.2).
+    pub redirect_server_address: Option<String>,
+    /// Credit-Control-Failure-Handling (RFC 8506 §8.14): what the client does
+    /// when the server stops answering. It overrides the configured default for
+    /// the rest of the session (RFC 8506 §5.7).
+    pub credit_control_failure_handling: Option<u32>,
+    /// CC-Session-Failover (RFC 8506 §8.4): whether the session may move to an
+    /// alternative server when this one stops answering.
+    pub cc_session_failover: Option<u32>,
+    /// Tariff-Time-Change (RFC 8506 §8.20), Unix seconds: the instant the
+    /// tariff of the grant changes. Read from the Granted-Service-Unit, where
+    /// RFC 8506 §8.17 and TS 32.276 table 6.3.1.4.2 put it.
+    pub tariff_time_change: Option<u64>,
+    /// PS-Free-Format-Data (TS 32.299 §7.2.156) the OCS returns in the
+    /// answer's Service-Information / VCS-Information: the Free Format Data a
+    /// Proxy Function passes to the MSC (CAMEL FurnishChargingInformation),
+    /// TS 32.276 table 6.3.1.4.2.
+    pub free_format_data: Option<Vec<u8>>,
 }
 
 impl CreditControlAnswer {
@@ -826,6 +1035,32 @@ fn parse_cca(avps: &serde_json::Value) -> CreditControlAnswer {
             .get("Session-Id")
             .and_then(|v| v.as_str())
             .map(String::from),
+        time_quota_threshold: at_either("Time-Quota-Threshold")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as u32),
+        redirect_server_address: fui
+            .and_then(|f| f.get("Redirect-Server"))
+            .and_then(|r| r.get("Redirect-Server-Address"))
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        credit_control_failure_handling: avps
+            .get("Credit-Control-Failure-Handling")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as u32),
+        cc_session_failover: avps
+            .get("CC-Session-Failover")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as u32),
+        tariff_time_change: granted
+            .and_then(|g| g.get("Tariff-Time-Change"))
+            .or_else(|| at_either("Tariff-Time-Change"))
+            .and_then(|v| v.as_u64()),
+        free_format_data: avps
+            .get("Service-Information")
+            .and_then(|s| s.get("VCS-Information"))
+            .and_then(|v| v.get("PS-Free-Format-Data"))
+            .and_then(|v| v.as_str())
+            .and_then(hex::decode),
     }
 }
 
@@ -863,6 +1098,11 @@ pub struct CreditControlParams<'a> {
     pub requested_action: Option<u32>,
     /// Emit Multiple-Services-Indicator = SUPPORTED (set on CCR-INITIAL).
     pub multiple_services_indicator: bool,
+    /// More Subscription-Id AVPs after `subscriber` (`*[ Subscription-Id ]`,
+    /// RFC 8506 §3.1): the IMSI next to the MSISDN, say.
+    pub additional_subscribers: &'a [SubscriberId],
+    /// VCS-Information for a Proxy Function's record (TS 32.276).
+    pub vcs_data: Option<&'a VcsInformation>,
 }
 
 /// Send a Credit-Control-Request to the OCS.
@@ -875,9 +1115,33 @@ pub async fn send_ccr(
     peer: &Arc<DiameterPeer>,
     params: &CreditControlParams<'_>,
 ) -> Result<CreditControlAnswer, String> {
+    send_ccr_with(peer, params, &CcrSendOptions::default()).await
+}
+
+/// How one Credit-Control-Request goes on the wire, beyond its AVPs.
+#[derive(Debug, Clone, Default)]
+pub struct CcrSendOptions {
+    /// End-to-End Identifier to use. A request re-sent to an alternative
+    /// server keeps the identifier of the first attempt (RFC 6733 §5.5.4), so
+    /// the caller mints it once and passes it to both. `None` mints one.
+    pub end_to_end: Option<u32>,
+    /// Set the T (potentially retransmitted) flag: this request may already
+    /// have reached another server (RFC 6733 §3, RFC 8506 §5.7).
+    pub retransmit: bool,
+    /// How long to wait for the answer: the client's Tx timer (RFC 8506
+    /// §13). `None` is the peer's default request timeout.
+    pub timeout: Option<std::time::Duration>,
+}
+
+/// [`send_ccr`] with the wire options a failover needs.
+pub async fn send_ccr_with(
+    peer: &Arc<DiameterPeer>,
+    params: &CreditControlParams<'_>,
+    options: &CcrSendOptions,
+) -> Result<CreditControlAnswer, String> {
     let config = peer.config();
     let hbh = peer.next_hbh();
-    let e2e = peer.next_e2e();
+    let e2e = options.end_to_end.unwrap_or_else(|| peer.next_e2e());
     // Session-Id continuity: reuse the caller's (UPDATE/TERMINATION) or mint one.
     let owned_session;
     let session_id: &str = match params.session_id {
@@ -919,8 +1183,11 @@ pub async fn send_ccr(
         params.request_number,
     ));
 
-    // Subscription-Id
+    // Subscription-Id, then any more of them.
     payload.extend_from_slice(&params.subscriber.encode());
+    for subscriber in params.additional_subscribers {
+        payload.extend_from_slice(&subscriber.encode());
+    }
 
     // Event-Timestamp (RFC 6733 §8.21) — many OCS templates key on it.
     payload.extend_from_slice(&encode_avp_time(avp::EVENT_TIMESTAMP, SystemTime::now()));
@@ -969,13 +1236,19 @@ pub async fn send_ccr(
 
     // A single Service-Information carrying IMS-Information and/or
     // SMS-Information (IEC SMS/RCS).
-    payload.extend_from_slice(&encode_service_information(
+    payload.extend_from_slice(&encode_service_information_with(
         params.ims_data,
         params.sms_data,
+        params.vcs_data,
     ));
 
+    let flags = if options.retransmit {
+        FLAG_REQUEST | FLAG_PROXIABLE | FLAG_RETRANSMITTED
+    } else {
+        FLAG_REQUEST | FLAG_PROXIABLE
+    };
     let wire = encode_diameter_message(
-        FLAG_REQUEST | FLAG_PROXIABLE,
+        flags,
         dictionary::CMD_CREDIT_CONTROL,
         dictionary::RO_APP_ID,
         hbh,
@@ -989,7 +1262,10 @@ pub async fn send_ccr(
         request_number = params.request_number,
         "Ro: sending CCR"
     );
-    let answer = peer.send_request(wire).await?;
+    let answer = match options.timeout {
+        Some(timeout) => peer.send_request_timeout(wire, timeout).await?,
+        None => peer.send_request(wire).await?,
+    };
 
     let mut parsed = parse_cca(&answer.avps);
     // Session-Id continuity: fall back to the request's if the OCS omitted it.
@@ -997,6 +1273,38 @@ pub async fn send_ccr(
         parsed.session_id = Some(session_id.to_string());
     }
     Ok(parsed)
+}
+
+/// Build the answer to a Re-Auth-Request or an Abort-Session-Request on a
+/// Credit-Control session: `command_code` is
+/// [`dictionary::CMD_RE_AUTH`] or [`dictionary::CMD_ABORT_SESSION`].
+///
+/// RFC 6733 §8.3.2 / §8.5.2: `< Session-Id > { Result-Code } { Origin-Host }
+/// { Origin-Realm }`, the request's Hop-by-Hop and End-to-End Identifiers, the
+/// P bit copied from the request, and the application of the request (Ro).
+pub fn build_session_answer(
+    command_code: u32,
+    session_id: &str,
+    result_code: u32,
+    origin_host: &str,
+    origin_realm: &str,
+    hop_by_hop: u32,
+    end_to_end: u32,
+    proxiable: bool,
+) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(128);
+    payload.extend_from_slice(&encode_avp_utf8(avp::SESSION_ID, session_id));
+    payload.extend_from_slice(&encode_avp_u32(avp::RESULT_CODE, result_code));
+    payload.extend_from_slice(&encode_avp_utf8(avp::ORIGIN_HOST, origin_host));
+    payload.extend_from_slice(&encode_avp_utf8(avp::ORIGIN_REALM, origin_realm));
+    encode_diameter_message(
+        if proxiable { FLAG_PROXIABLE } else { 0 },
+        command_code,
+        dictionary::RO_APP_ID,
+        hop_by_hop,
+        end_to_end,
+        &payload,
+    )
 }
 
 /// Send CCR-Initial (start of charging session) with the IMS voice service
@@ -1024,6 +1332,8 @@ pub async fn send_ccr_initial(
             service_identifier: None,
             requested_action: None,
             multiple_services_indicator: true,
+            additional_subscribers: &[],
+            vcs_data: None,
         },
     )
     .await
@@ -1055,6 +1365,8 @@ pub async fn send_ccr_termination(
             service_identifier: None,
             requested_action: None,
             multiple_services_indicator: false,
+            additional_subscribers: &[],
+            vcs_data: None,
         },
     )
     .await
@@ -1085,6 +1397,8 @@ pub async fn send_ccr_event(
             service_identifier: None,
             requested_action,
             multiple_services_indicator: false,
+            additional_subscribers: &[],
+            vcs_data: None,
         },
     )
     .await
@@ -1202,12 +1516,81 @@ mod tests {
         assert_eq!(NodeFunctionality::Bgcf.as_u32(), 5);
         assert_eq!(NodeFunctionality::ApplicationServer.as_u32(), 6);
         assert_eq!(NodeFunctionality::Ibcf.as_u32(), 7);
-        assert_eq!(NodeFunctionality::SCscfRestore.as_u32(), 8);
-        assert_eq!(NodeFunctionality::Ecscf.as_u32(), 9);
-        assert_eq!(NodeFunctionality::Atcf.as_u32(), 10);
-        assert_eq!(NodeFunctionality::Mmtel.as_u32(), 11);
-        assert_eq!(NodeFunctionality::Tpf.as_u32(), 12);
-        assert_eq!(NodeFunctionality::Atgw.as_u32(), 13);
+        // TS 32.299 §7.2.113; Wireshark's dictionary.xml agrees. The table
+        // pinned here before had 8 = "S-CSCF restore", 9 = E-CSCF,
+        // 10 = ATCF, 11 = MMTel: an E-CSCF record went out as a P-GW one.
+        assert_eq!(NodeFunctionality::SGw.as_u32(), 8);
+        assert_eq!(NodeFunctionality::PGw.as_u32(), 9);
+        assert_eq!(NodeFunctionality::Hsgw.as_u32(), 10);
+        assert_eq!(NodeFunctionality::Ecscf.as_u32(), 11);
+        assert_eq!(NodeFunctionality::Mme.as_u32(), 12);
+        assert_eq!(NodeFunctionality::Trf.as_u32(), 13);
+        assert_eq!(NodeFunctionality::Tf.as_u32(), 14);
+        assert_eq!(NodeFunctionality::Atcf.as_u32(), 15);
+        assert_eq!(NodeFunctionality::ProxyFunction.as_u32(), 16);
+        assert_eq!(NodeFunctionality::Epdg.as_u32(), 17);
+        assert_eq!(NodeFunctionality::Tdf.as_u32(), 18);
+        assert_eq!(NodeFunctionality::Twag.as_u32(), 19);
+        assert_eq!(NodeFunctionality::Scef.as_u32(), 20);
+        assert_eq!(NodeFunctionality::IwkScef.as_u32(), 21);
+    }
+
+    /// Known-answer bytes for VCS-Information (TS 32.299, AVP 3410), built
+    /// by hand from the RFC 6733 §4.1 AVP header: code, V+M flags (0xC0),
+    /// 24-bit length, vendor 10415 (0x28AF), data padded to 32 bits. Members
+    /// in the order of the TS 32.299 ABNF: MSC-Address (3417) before
+    /// Forwarding-Pending (3415).
+    #[test]
+    fn vcs_information_encodes_to_the_known_answer() {
+        let vcs = VcsInformation {
+            msc_address: Some(vec![0x21, 0x43, 0x65]),
+            forwarding_pending: Some(1),
+            ..Default::default()
+        };
+        let expected: Vec<u8> = vec![
+            0x00, 0x00, 0x0d, 0x52, 0xc0, 0x00, 0x00, 0x2c, 0x00, 0x00, 0x28,
+            0xaf, // 3410, 44
+            0x00, 0x00, 0x0d, 0x59, 0xc0, 0x00, 0x00, 0x0f, 0x00, 0x00, 0x28,
+            0xaf, // 3417, 15
+            0x21, 0x43, 0x65, 0x00, // TBCD digits 123456 + 1 pad
+            0x00, 0x00, 0x0d, 0x57, 0xc0, 0x00, 0x00, 0x10, 0x00, 0x00, 0x28,
+            0xaf, // 3415, 16
+            0x00, 0x00, 0x00, 0x01, // FORWARDING_PENDING
+        ];
+        assert_eq!(vcs.encode_vcs_information_avp(), expected);
+    }
+
+    /// Basic-Service-Code (3411) groups Bearer-Service (854) and Teleservice
+    /// (3413); ISUP-Cause (3416) its location, value, diagnostics.
+    #[test]
+    fn vcs_information_nests_its_two_groups() {
+        let vcs = VcsInformation {
+            basic_service_code: Some(BasicServiceCode {
+                bearer_service: None,
+                teleservice: Some(vec![0x11]),
+            }),
+            isup_cause: Some(IsupCause {
+                location: None,
+                value: Some(16),
+                diagnostics: None,
+            }),
+            ..Default::default()
+        };
+        let expected: Vec<u8> = vec![
+            0x00, 0x00, 0x0d, 0x52, 0xc0, 0x00, 0x00, 0x44, 0x00, 0x00, 0x28,
+            0xaf, // 3410, 68
+            0x00, 0x00, 0x0d, 0x53, 0xc0, 0x00, 0x00, 0x1c, 0x00, 0x00, 0x28,
+            0xaf, // 3411, 28
+            0x00, 0x00, 0x0d, 0x55, 0xc0, 0x00, 0x00, 0x0d, 0x00, 0x00, 0x28,
+            0xaf, // 3413, 13
+            0x11, 0x00, 0x00, 0x00, // telephony + 3 pad
+            0x00, 0x00, 0x0d, 0x58, 0xc0, 0x00, 0x00, 0x1c, 0x00, 0x00, 0x28,
+            0xaf, // 3416, 28
+            0x00, 0x00, 0x0d, 0x60, 0xc0, 0x00, 0x00, 0x10, 0x00, 0x00, 0x28,
+            0xaf, // 3424, 16
+            0x00, 0x00, 0x00, 0x10, // normal call clearing
+        ];
+        assert_eq!(vcs.encode_vcs_information_avp(), expected);
     }
 
     #[test]
@@ -1234,7 +1617,11 @@ mod tests {
         );
         assert_eq!(
             NodeFunctionality::from_str_ci("mmtel"),
-            Some(NodeFunctionality::Mmtel)
+            Some(NodeFunctionality::ApplicationServer)
+        );
+        assert_eq!(
+            NodeFunctionality::from_str_ci("proxy"),
+            Some(NodeFunctionality::ProxyFunction)
         );
         assert_eq!(NodeFunctionality::from_str_ci("bogus"), None);
     }
@@ -1659,6 +2046,68 @@ mod tests {
         let answer = parse_cca(&json);
         assert!(!answer.is_success());
         assert_eq!(answer.result_code, 4012);
+    }
+
+    /// TS 32.276 table 6.3.1.4.2: the OCS answers a Proxy Function with
+    /// Tariff-Time-Change inside the Granted-Service-Unit (RFC 8506 §8.17)
+    /// and Free Format Data as PS-Free-Format-Data in
+    /// Service-Information / VCS-Information. Decoded from wire bytes so the
+    /// dictionary path is the one exercised.
+    #[test]
+    fn cca_carries_the_tariff_change_and_free_format_data_of_a_vcs_grant() {
+        let tariff_change = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_800_003_600);
+        let mut granted = encode_avp_u32(avp::CC_TIME, 300);
+        granted.extend_from_slice(&encode_avp_time(avp::TARIFF_TIME_CHANGE, tariff_change));
+        let mut mscc = encode_avp_grouped(avp::GRANTED_SERVICE_UNIT, &granted);
+        mscc.extend_from_slice(&encode_avp_u32(avp::VALIDITY_TIME, 600));
+        let vcs = encode_avp_grouped_3gpp(
+            avp::VCS_INFORMATION,
+            &encode_avp_octet_3gpp(avp::PS_FREE_FORMAT_DATA, &[0x30, 0x03, 0x80, 0x01, 0x07]),
+        );
+        let mut avps = encode_avp_utf8(avp::SESSION_ID, "pf.example;1;1");
+        avps.extend_from_slice(&encode_avp_u32(avp::RESULT_CODE, 2001));
+        avps.extend_from_slice(&encode_avp_grouped(
+            avp::MULTIPLE_SERVICES_CREDIT_CONTROL,
+            &mscc,
+        ));
+        avps.extend_from_slice(&encode_avp_grouped_3gpp(avp::SERVICE_INFORMATION, &vcs));
+        let wire = encode_diameter_message(
+            0,
+            dictionary::CMD_CREDIT_CONTROL,
+            dictionary::RO_APP_ID,
+            1,
+            2,
+            &avps,
+        );
+        let message = decode_diameter(&wire).expect("a CCA");
+        let answer = parse_cca(&message.avps);
+        assert_eq!(answer.granted_time, Some(300));
+        assert_eq!(answer.validity_time, Some(600));
+        assert_eq!(answer.tariff_time_change, Some(1_800_003_600));
+        assert_eq!(
+            answer.free_format_data.as_deref(),
+            Some(&[0x30, 0x03, 0x80, 0x01, 0x07][..])
+        );
+    }
+
+    #[test]
+    fn vcs_overlay_replaces_only_what_the_update_carries() {
+        let mut held = VcsInformation {
+            msc_address: Some(vec![0x21, 0x43]),
+            forwarding_pending: Some(1),
+            ..Default::default()
+        };
+        held.overlay(VcsInformation {
+            forwarding_pending: Some(0),
+            isup_cause: Some(IsupCause {
+                value: Some(16),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        assert_eq!(held.msc_address, Some(vec![0x21, 0x43]));
+        assert_eq!(held.forwarding_pending, Some(0));
+        assert_eq!(held.isup_cause.and_then(|cause| cause.value), Some(16));
     }
 
     #[test]

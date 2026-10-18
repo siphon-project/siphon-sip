@@ -649,6 +649,19 @@ pub(crate) async fn dispatch_request(
     local_origin_host: String,
     local_origin_realm: String,
 ) {
+    // A Re-Auth-Request or Abort-Session-Request for one of siphon's own Ro
+    // sessions is answered by the session (RFC 8506 §5.5), never by a script:
+    // the session state it acts on is Rust's. Anything else — including a RAR
+    // for a session a script opened with the raw `diameter.ro_ccr_*` calls —
+    // goes on to `@diameter.on_request` as before.
+    if let Some(wire) =
+        crate::dispatcher::ro_answer_ocs_request(&incoming, &local_origin_host, &local_origin_realm)
+    {
+        if let Err(error) = inbound_peer.send_response(wire).await {
+            tracing::warn!(error = %error, "ro: could not send the answer to the charging system");
+        }
+        return;
+    }
     let start = Instant::now();
     // Captured before `incoming` moves into the handler closure below.
     let command_code = incoming.command_code;

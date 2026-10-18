@@ -538,6 +538,39 @@ impl DiameterManager {
         None
     }
 
+    /// Every connected peer on the route for `application`, in route order:
+    /// the candidates a session may fail over to (RFC 8506 §5.7). With no
+    /// routing table at all, every connected peer.
+    pub fn route_clients(
+        &self,
+        application: &crate::config::DiameterApplication,
+    ) -> Vec<Arc<DiameterClient>> {
+        match self
+            .routes
+            .iter()
+            .find(|route| &route.application == application)
+        {
+            Some(route) => route
+                .peers
+                .iter()
+                .filter_map(|name| self.live_client(name))
+                .collect(),
+            None if self.routes.is_empty() => {
+                let mut names: Vec<String> = self
+                    .clients
+                    .iter()
+                    .map(|entry| entry.key().clone())
+                    .collect();
+                names.sort();
+                names
+                    .iter()
+                    .filter_map(|name| self.live_client(name))
+                    .collect()
+            }
+            None => Vec::new(),
+        }
+    }
+
     /// Register a connected client under its peer name.
     pub fn register(&self, name: String, client: Arc<DiameterClient>) {
         self.clients.insert(name, client);

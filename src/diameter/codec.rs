@@ -20,6 +20,9 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 pub const FLAG_REQUEST: u8 = 0x80;
 pub const FLAG_PROXIABLE: u8 = 0x40;
 pub const FLAG_ERROR: u8 = 0x20;
+/// T bit: potentially retransmitted (RFC 6733 §3), set on a request re-sent
+/// after a failover.
+pub const FLAG_RETRANSMITTED: u8 = 0x10;
 
 /// AVP flag: Vendor-Id field is present
 pub const AVP_FLAG_VENDOR: u8 = 0x80;

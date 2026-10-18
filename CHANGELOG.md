@@ -13,6 +13,32 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
+### Added
+
+- **Ro: sessions held in Rust, as many per call as needed, or none bound to a
+  call.** `await diameter.ro_session(...)` opens a credit-control session and
+  returns a `RoSession` handle; each has its own Session-Id, Subscription-Ids,
+  Service-Context-Id and IMS-Information, so a forwarded leg can be charged to
+  the forwarding user (Role-Of-Node FORWARDING) next to the caller's session,
+  and a conference focus can charge each dial-out leg. siphon runs the session:
+  re-authorization at the grant less its Time-Quota-Threshold or at its
+  Validity-Time, the OCS's RAR and ASR (answered before scripts),
+  Final-Unit-Indication, the Tx timer and Credit-Control-Failure-Handling with
+  failover to another `ro` peer under the T flag (RFC 8506 §5.7;
+  `ro.tx_timeout_ms`, `ro.session_failover`). `call_id=` or `RoSession.bind()`
+  ties it to a B2BUA call; `metering="external"` is for an owner whose network
+  element counts the time (an SCP): `report(used_total)` sends the difference
+  to the last report. `key=` files it for `diameter.ro_find(key)`, `on_event=`
+  hears `released` / `aborted` / `reauthorize`. `call.ro_authorize()` is
+  unchanged, now on the same primitive.
+- **Ro: VCS-Information for a Proxy Function (TS 32.276).** `vcs_information=`
+  on `ro_session`, `report` and `terminate` sends the VCS-Information group
+  (TS 32.299 §7.2.242A); `terminate(vcs_information=...)` adds ISUP-Cause and
+  Stop-Time to the CCR-TERMINATION only. More Subscription-Ids
+  (`additional_subscription_ids`, the IMSI next to the MSISDN). The grant
+  reports Tariff-Time-Change (read from the Granted-Service-Unit, where it was
+  never found before) and the PS-Free-Format-Data the OCS returns.
+
 ### Fixed
 
 - **Proxy: a retransmitted 2xx to an INVITE goes out as the first copy was
@@ -129,6 +155,17 @@ entry, but a working config keeps working.
   against TS 29.229 table 6.3.1; it now follows the dictionary.
   Supported-Features in an answer never has the M bit, and Feature-List-ID /
   Feature-List never do (§7.2.1). A SAR built with restoration members sets it.
+- **Node-Functionality values from 8 upward follow TS 32.299 §7.2.113.** They
+  did not: an `ecscf` went out as 9 (P-GW), an `atcf` as 10 (HSGW), `mmtel` as
+  11 (E-CSCF). `mmtel` now sends `as` (6), and S-GW to IWK-SCEF (8 to 21,
+  Proxy Function 16 as `proxy`) are added. `tpf`, `atgw` and `scscf-restore`
+  are not values of the clause: in `rf` / `ro` `node_functionality` they log
+  the existing warning and the AVP is left out, as for any unknown name (a
+  working config keeps loading). **BREAKING (scripting API):**
+  `node_functionality="tpf"`, `"atgw"` and `"scscf-restore"` raise
+  `ValueError`. **BREAKING (Rust library):** `NodeFunctionality::SCscfRestore`,
+  `Mmtel`, `Tpf` and `Atgw` are gone, `Ecscf` and `Atcf` change value. See
+  `docs/migrating-to-1.15.md`.
 
 ## [1.14.0] — 2026-10-17
 

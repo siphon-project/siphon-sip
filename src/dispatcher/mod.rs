@@ -366,6 +366,7 @@ pub(crate) use b2bua::{
     ReplacementDial, RunningDispatcher, DIAL_BRIDGE_CALLER_GONE, DIAL_CANCELLED,
     DIAL_RINGBACK_ORIGIN,
 };
+pub(crate) use charging::{ro_answer_ocs_request, ro_bind_call, RO_CONTROL};
 pub use charging::{ro_authorize_b2bua, RoAuthorizeOutcome};
 pub(crate) use liveness::liveness_on_flow_close;
 pub use media_init::{init_rtpengine, spawn_rtpengine_health_check};

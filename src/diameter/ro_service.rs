@@ -2,25 +2,36 @@
 //! charging (Diameter Credit-Control, RFC 8506 / 3GPP TS 32.299). The online
 //! analogue of [`super::rf_service`].
 //!
-//! Two flows:
-//!   * **SCUR** (voice) — [`RoChargingService::authorize_call`] reserves credit
-//!     at setup (CCR-INITIAL); on grant a per-session Tokio timer re-authorizes
-//!     (CCR-UPDATE) on a two-clock cadence and **disconnects the call** (via the
-//!     teardown hook) when the OCS refuses further credit or sends a
-//!     Final-Unit-Indication. [`RoChargingService::terminate_call`] sends
-//!     CCR-TERMINATION on BYE.
+//! Three flows:
+//!   * **SCUR sessions** — [`RoChargingService::open_session`] reserves credit
+//!     (CCR-INITIAL) for one [`RoSessionSpec`] and keeps the credit-control
+//!     session in Rust: its own Session-Id, Subscription-Id, Service-Context-Id
+//!     and IMS-Information, CC-Request-Number, grant, failure handling and
+//!     peer. Any number may be open at once, for one call or for none: a
+//!     conference opens one per participant leg, a forwarded call one per
+//!     forwarding user, an SCP one per CAMEL dialogue. A session with
+//!     [`Metering::Local`] re-authorizes (CCR-UPDATE) on its own clock and
+//!     **disconnects the call it is bound to** (via the teardown hook) when the
+//!     OCS refuses further credit or its final units are used; one with
+//!     [`Metering::External`] is driven by its owner's usage reports
+//!     ([`RoChargingService::report_usage`]). An OCS Re-Auth-Request or
+//!     Abort-Session-Request for a live session is answered here
+//!     ([`RoChargingService::handle_rar`], [`RoChargingService::handle_asr`]).
+//!   * **`call.ro_authorize()`** — [`RoChargingService::authorize_call`], one
+//!     session bound to a B2BUA call, kept for the scripts written against it.
 //!   * **IEC** (SMS/RCS) — [`RoChargingService::charge_event`] does a one-shot
 //!     CCR-EVENT (DIRECT_DEBITING) before delivery; no session, no timer.
 //!
-//! The mechanism (CCR/CCA state machine, timer, enforcement, session store) is
-//! entirely Rust-side; policy (which subscriber, rating group, denial response)
-//! is the caller's / the script's.
+//! The mechanism (CCR/CCA state machine, timers, enforcement, failover, session
+//! store) is entirely Rust-side; policy (which subscriber, rating group, denial
+//! response) is the caller's / the script's.
 
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
-use tokio::sync::Mutex;
+use dashmap::DashMap;
+use tokio::sync::{Mutex, Notify};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
@@ -28,8 +39,9 @@ use crate::config::RoConfig;
 use crate::diameter::dictionary;
 use crate::diameter::peer::DiameterPeer;
 use crate::diameter::ro::{
-    self, CcRequestType, CreditControlParams, ImsChargingData, NodeFunctionality, ServiceUnit,
-    SmsChargingData, SubscriberId, REQUESTED_ACTION_DIRECT_DEBITING,
+    self, CcRequestType, CcrSendOptions, CreditControlAnswer, CreditControlParams, ImsChargingData,
+    NodeFunctionality, ServiceUnit, SmsChargingData, SubscriberId,
+    REQUESTED_ACTION_DIRECT_DEBITING,
 };
 use crate::diameter::DiameterManager;
 
@@ -38,8 +50,13 @@ use crate::diameter::DiameterManager;
 /// end the CC session, do NOT deny.
 const DIAMETER_CREDIT_CONTROL_NOT_APPLICABLE: u32 = 4011;
 const DIAMETER_CREDIT_LIMIT_REACHED: u32 = 4012;
-/// Final-Unit-Action TERMINATE (RFC 8506 §8.35).
-const FINAL_UNIT_ACTION_TERMINATE: u32 = 0;
+
+/// Credit-Control-Failure-Handling values (RFC 8506 §8.14).
+pub const CCFH_TERMINATE: u32 = 0;
+pub const CCFH_CONTINUE: u32 = 1;
+pub const CCFH_RETRY_AND_TERMINATE: u32 = 2;
+/// CC-Session-Failover FAILOVER_SUPPORTED (RFC 8506 §8.4).
+const FAILOVER_SUPPORTED: u32 = 1;
 
 /// Bounded metric label for a teardown reason.
 ///
@@ -55,6 +72,7 @@ fn teardown_reason_label(reason: &str) -> &'static str {
         "credit exhausted (final unit)" => "final_unit",
         "session lifetime exceeded" => "session_lifetime_exceeded",
         "ocs unreachable" => "ocs_unreachable",
+        "aborted by the charging system" => "aborted",
         _ => "other",
     }
 }
@@ -73,7 +91,7 @@ pub enum ChargeFrom {
 impl ChargeFrom {
     /// Parse the config string. Anything unrecognised falls back to `Answer`
     /// with a warning rather than silently billing ring time.
-    fn from_config(value: &str) -> Self {
+    pub fn from_config(value: &str) -> Self {
         match value.trim().to_ascii_lowercase().as_str() {
             "invite" => ChargeFrom::Invite,
             "answer" => ChargeFrom::Answer,
@@ -86,6 +104,22 @@ impl ChargeFrom {
             }
         }
     }
+}
+
+/// Who measures a session's usage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Metering {
+    /// siphon does: the chargeable clock runs from the answer (or the
+    /// reservation, per [`ChargeFrom`]) and the session re-authorizes on its
+    /// own when the grant, its threshold or its Validity-Time is reached.
+    Local,
+    /// The owner does — an SCP whose gsmSSF reports call time in
+    /// ApplyChargingReport. Each report is the cumulative figure; siphon sends
+    /// the difference to the last one it reported. No re-authorization timer:
+    /// the owner reports when its own grant runs out, and is told (with a
+    /// [`RoEventKind::Reauthorize`] event) when the OCS asks for one or the
+    /// Validity-Time expires.
+    External,
 }
 
 /// IMS-Information `Cause-Code` (TS 32.299 §7.2.35) for a call siphon cut
@@ -112,11 +146,82 @@ const MAX_RO_SESSION_LIFETIME_SECS: u64 = 24 * 60 * 60;
 /// Hook the dispatcher installs so the Rust-side re-auth loop can disconnect a
 /// live call from a background task. `(sip_call_id, reason)`.
 ///
-/// Ro enforcement is **B2BUA-only** (see [`RoChargingService`]): the target is
-/// always a tracked B2BUA call identified by its SIP Call-ID. There is no
-/// proxy-mode teardown — a P-CSCF/proxy cannot own and cut the session, which is
-/// exactly why 3GPP triggers online charging at the AS, not the P-CSCF.
+/// The target is the B2BUA call a session is bound to, identified by its SIP
+/// Call-ID. A session bound to no call (an SCP's) is never torn down through
+/// it: its owner learns of the end from its [`RoEventHook`].
 pub type RoTeardownHook = Arc<dyn Fn(&str, &str) + Send + Sync>;
+
+/// What happened to a session that its owner did not do itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoEventKind {
+    /// siphon ended the session: credit refused or used up, the OCS
+    /// unreachable, CREDIT_CONTROL_NOT_APPLICABLE mid-session, or the lifetime
+    /// backstop. A bound call has been torn down where the reason calls for it.
+    Released,
+    /// The OCS aborted the session (ASR, RFC 8506 §5.5): answered, CCR-T sent,
+    /// a bound call torn down.
+    Aborted,
+    /// An externally metered session must report now: the OCS sent a RAR, or
+    /// the Validity-Time of the grant expired.
+    Reauthorize,
+}
+
+impl RoEventKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            RoEventKind::Released => "released",
+            RoEventKind::Aborted => "aborted",
+            RoEventKind::Reauthorize => "reauthorize",
+        }
+    }
+}
+
+/// One event on a session, handed to its [`RoEventHook`].
+#[derive(Debug, Clone)]
+pub struct RoSessionEvent {
+    pub kind: RoEventKind,
+    pub reason: String,
+    /// The Result-Code that caused it, when an answer did.
+    pub result_code: Option<u32>,
+    /// Final-Unit-Action of the grant that ran out (RFC 8506 §8.35).
+    pub final_unit_action: Option<u32>,
+    /// Redirect-Server-Address of that grant, for REDIRECT.
+    pub redirect_server_address: Option<String>,
+}
+
+/// Per-session observer the owner registers ([`RoSessionSpec::event_hook`]).
+pub type RoEventHook = Arc<dyn Fn(&CcCreditSession, &RoSessionEvent) + Send + Sync>;
+
+/// Everything one credit-control session is opened with. Build it with
+/// [`RoChargingService::session_spec`] (the `ro:` defaults) and override what
+/// differs for this session.
+pub struct RoSessionSpec {
+    /// The party charged — for a forwarded leg the forwarding user
+    /// (TS 32.260 §5.2.2, TS 24.604 §4.5.2.6), for a conference dial-out the
+    /// participant who asked for it.
+    pub subscriber: SubscriberId,
+    /// More Subscription-Ids on every request (the IMSI next to the MSISDN).
+    pub additional_subscribers: Vec<SubscriberId>,
+    /// VCS-Information on every request (a Proxy Function, TS 32.276).
+    pub vcs_data: Option<ro::VcsInformation>,
+    /// IMS-Information for every request of the session; `None` sends none
+    /// (a session that describes itself otherwise, e.g. VCS-Information).
+    pub ims_data: Option<ImsChargingData>,
+    pub service_context_id: String,
+    pub rating_group: Option<u32>,
+    pub service_identifier: Option<u32>,
+    /// CC-Time asked for on CCR-I/U; 0 sends an empty Requested-Service-Unit.
+    pub requested_seconds: u32,
+    pub charge_from: ChargeFrom,
+    pub metering: Metering,
+    /// SIP Call-ID of the B2BUA call to disconnect when credit runs out.
+    /// [`RoChargingService::bind_call`] sets it after the fact too.
+    pub teardown_call: Option<String>,
+    /// Owner's key to find the session by (a TCAP dialogue id). Unique among
+    /// live sessions.
+    pub key: Option<String>,
+    pub event_hook: Option<RoEventHook>,
+}
 
 /// Outcome of a setup-time authorization.
 pub enum ChargeDecision {
@@ -130,8 +235,34 @@ pub enum ChargeDecision {
     AllowUncharged,
 }
 
-/// Per-call credit-control session (SCUR). Cloneable handle over `Arc` inner
-/// state so the re-auth timer, the store and the BYE path can share it.
+/// The grant a session currently holds, from its last successful CCA.
+#[derive(Debug, Clone, Default)]
+pub struct RoGrant {
+    pub granted_time: Option<u32>,
+    pub validity_time: Option<u32>,
+    pub time_quota_threshold: Option<u32>,
+    pub final_unit_action: Option<u32>,
+    /// Tariff-Time-Change, Unix seconds.
+    pub tariff_time_change: Option<u64>,
+    /// PS-Free-Format-Data from the answer's VCS-Information (TS 32.276).
+    pub free_format_data: Option<Vec<u8>>,
+}
+
+impl RoGrant {
+    fn from_answer(answer: &CreditControlAnswer) -> Self {
+        Self {
+            granted_time: answer.granted_time,
+            validity_time: answer.validity_time,
+            time_quota_threshold: answer.time_quota_threshold,
+            final_unit_action: answer.final_unit_action,
+            tariff_time_change: answer.tariff_time_change,
+            free_format_data: answer.free_format_data.clone(),
+        }
+    }
+}
+
+/// Credit-control session (SCUR). Cloneable handle over `Arc` inner state so
+/// the re-auth timer, the stores and the owner can share it.
 #[derive(Clone)]
 pub struct CcCreditSession {
     inner: Arc<CcSessionInner>,
@@ -145,48 +276,64 @@ struct CcSessionInner {
     stopped: AtomicU32,
     reauth_handle: Mutex<Option<JoinHandle<()>>>,
     last_result_code: AtomicU32,
-    /// SIP Call-ID of the B2BUA call to disconnect on credit exhaustion.
-    sip_call_id: String,
-    // Context needed to build UPDATE / TERMINATION without the caller re-supplying it.
-    peer: Arc<DiameterPeer>,
+    /// SIP Call-ID of the B2BUA call to disconnect on credit exhaustion, if the
+    /// session is bound to one.
+    teardown_call: StdMutex<Option<String>>,
+    /// Internal call id the dispatcher filed this session under by
+    /// [`RoChargingService::bind_call`], so ending it removes the entry.
+    bound_internal_call: StdMutex<Option<String>>,
+    key: Option<String>,
+    /// The server this session talks to. Moves on failover (RFC 8506 §5.7).
+    peer: StdMutex<Arc<DiameterPeer>>,
     subscriber: SubscriberId,
+    additional_subscribers: Vec<SubscriberId>,
+    /// VCS-Information for every request of the session; the owner adds the
+    /// members it learns later with [`CcCreditSession::update_vcs`]. Only
+    /// held to clone out or overlay, never across an await.
+    vcs_data: StdMutex<Option<ro::VcsInformation>>,
     service_context_id: String,
     rating_group: Option<u32>,
     service_identifier: Option<u32>,
     requested_seconds: u32,
+    metering: Metering,
     /// The `ImsChargingData` built at CCR-INITIAL, carried on the session so
     /// every later request in it can describe the same call.
     ///
-    /// CCR-UPDATE and CCR-TERMINATION used to send `ims_data: None`, so only
-    /// the Session-Id, the subscriber and the units went down the pipe. A
-    /// charging backend could not attribute mid-call usage or the final record
-    /// to a carrier, an ICID or a calling/called party — and with LCR failover
-    /// the carrier on the record is the one that actually carried the call, so
-    /// it cannot be inferred from the INITIAL either.
-    ///
     /// A `std::sync::Mutex` rather than a `tokio` one: it is only ever held to
     /// clone the value out, never across an await.
-    ims_data: std::sync::Mutex<ImsChargingData>,
+    ims_data: StdMutex<Option<ImsChargingData>>,
     /// Where the chargeable clock starts for this session.
     charge_from: ChargeFrom,
-    /// When the reservation was made (CCR-INITIAL). Always the session's own
-    /// age, whatever `charge_from` says — the max-lifetime backstop measures
-    /// from here, because an abandoned reservation has to be released whether
-    /// or not the call was ever answered.
+    /// When the reservation was made (CCR-INITIAL); the max-lifetime backstop
+    /// measures from here.
     started_at: Instant,
-    /// Wall-clock instant of the same moment, for `SIP-Request-Timestamp`
-    /// (TS 32.299 §7.2.183) — `Instant` is monotonic and cannot be formatted
-    /// as a date.
+    /// Wall-clock instant of the same moment, for `SIP-Request-Timestamp`.
     requested_at: std::time::SystemTime,
     /// Set once when the call is answered. `None` while it is still ringing.
-    answered_at: std::sync::Mutex<Option<Instant>>,
-    /// The OCS's first-grant CC-Time (seconds) — surfaced to the script gate as
-    /// `granted_time` so it can log / decide on the reserved quota.
+    answered_at: StdMutex<Option<Instant>>,
+    /// The OCS's first-grant CC-Time (seconds).
     initial_grant: u32,
-    /// Seconds already reported to the OCS via an *answered* CCR-UPDATE
-    /// Used-Service-Unit. CCR-TERMINATION reports only `elapsed - reported`
-    /// (the unreported remainder), so the last interval is never double-counted.
+    /// Seconds already reported to the OCS in an *answered* request; the next
+    /// Used-Service-Unit carries only what came after (RFC 8506 §5.6).
     reported_secs: AtomicU32,
+    /// The grant from the last successful CCA.
+    grant: StdMutex<RoGrant>,
+    /// Credit-Control-Failure-Handling in force: the configured default until
+    /// a CCA carries the AVP (RFC 8506 §5.7).
+    failure_handling: AtomicU32,
+    /// CC-Session-Failover in force, same precedence.
+    failover_supported: AtomicBool,
+    /// Wakes the re-auth loop for a RAR (RFC 8506 §5.5).
+    wake: Notify,
+    reauth_requested: AtomicBool,
+    event_hook: Option<RoEventHook>,
+}
+
+fn lock<T>(mutex: &StdMutex<T>) -> std::sync::MutexGuard<'_, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
 }
 
 impl CcCreditSession {
@@ -206,8 +353,88 @@ impl CcCreditSession {
         self.inner.initial_grant
     }
 
+    /// The grant of the last successful answer.
+    pub fn grant(&self) -> RoGrant {
+        lock(&self.inner.grant).clone()
+    }
+
+    /// Lay `update` over the session's VCS-Information for its next requests
+    /// (see [`ro::VcsInformation::overlay`]). A session opened without one
+    /// starts from `update`.
+    pub fn update_vcs(&self, update: ro::VcsInformation) {
+        let mut held = lock(&self.inner.vcs_data);
+        match held.as_mut() {
+            Some(vcs) => vcs.overlay(update),
+            None => *held = Some(update),
+        }
+    }
+
+    fn vcs_snapshot(&self) -> Option<ro::VcsInformation> {
+        lock(&self.inner.vcs_data).clone()
+    }
+
+    /// The charged party.
+    pub fn subscriber(&self) -> &SubscriberId {
+        &self.inner.subscriber
+    }
+
+    pub fn service_context_id(&self) -> &str {
+        &self.inner.service_context_id
+    }
+
+    pub fn key(&self) -> Option<&str> {
+        self.inner.key.as_deref()
+    }
+
+    pub fn metering(&self) -> Metering {
+        self.inner.metering
+    }
+
+    /// Whether the session is still open.
+    pub fn is_open(&self) -> bool {
+        self.inner.stopped.load(Ordering::Relaxed) == 0
+    }
+
+    /// SIP Call-ID of the call this session releases, if it is bound to one.
+    pub fn teardown_call(&self) -> Option<String> {
+        lock(&self.inner.teardown_call).clone()
+    }
+
+    /// CC-Request-Number the next request will carry.
+    pub fn next_request_number(&self) -> u32 {
+        self.inner.cc_request_number.load(Ordering::Relaxed)
+    }
+
+    /// Credit-Control-Failure-Handling now in force.
+    pub fn failure_handling(&self) -> u32 {
+        self.inner.failure_handling.load(Ordering::Relaxed)
+    }
+
+    fn peer(&self) -> Arc<DiameterPeer> {
+        Arc::clone(&lock(&self.inner.peer))
+    }
+
     fn next_cc_request_number(&self) -> u32 {
         self.inner.cc_request_number.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Take what a successful answer says about the rest of the session: its
+    /// grant, and the failure handling the server wants (RFC 8506 §5.7).
+    fn absorb(&self, answer: &CreditControlAnswer) {
+        self.inner
+            .last_result_code
+            .store(answer.result_code, Ordering::Relaxed);
+        if let Some(ccfh) = answer.credit_control_failure_handling {
+            self.inner.failure_handling.store(ccfh, Ordering::Relaxed);
+        }
+        if let Some(failover) = answer.cc_session_failover {
+            self.inner
+                .failover_supported
+                .store(failover == FAILOVER_SUPPORTED, Ordering::Relaxed);
+        }
+        if answer.is_success() {
+            *lock(&self.inner.grant) = RoGrant::from_answer(answer);
+        }
     }
 
     /// Snapshot the session's `ImsChargingData` for one outgoing request,
@@ -220,28 +447,22 @@ impl CcCreditSession {
         sip_method: &str,
         cause_code: Option<i32>,
     ) -> Option<ImsChargingData> {
-        let mut data = match self.inner.ims_data.lock() {
-            Ok(guard) => guard.clone(),
-            Err(poisoned) => poisoned.into_inner().clone(),
-        };
+        let mut data = lock(&self.inner.ims_data).clone()?;
         data.sip_method = Some(sip_method.to_string());
         data.cause_code = cause_code;
         // Time-Stamps describes *this* record's trigger, not the INVITE the
-        // INITIAL already reported (TS 32.299 §7.2.183) — carrying the setup
-        // instant forward would leave a record whose Event-Type says BYE and
-        // whose request timestamp is minutes older.
+        // INITIAL already reported (TS 32.299 §7.2.183).
         let now = std::time::SystemTime::now();
         data.request_timestamp = Some(now);
         data.response_timestamp = Some(now);
         Some(data)
     }
 
-    /// Seconds of *chargeable* time elapsed so far.
+    /// Seconds of *chargeable* time elapsed so far (local metering).
     ///
     /// Under `charge_from: answer` this is zero until the call is answered and
-    /// counts from the 200 OK thereafter — so ring time is never billed, and a
-    /// call that is never answered reports nothing. Under `charge_from: invite`
-    /// it is the whole session age, the pre-`charge_from` behaviour.
+    /// counts from the 200 OK thereafter. Under `charge_from: invite` it is the
+    /// whole session age.
     fn chargeable_secs(&self) -> u32 {
         match self.inner.charge_from {
             ChargeFrom::Invite => self.inner.started_at.elapsed().as_secs() as u32,
@@ -253,32 +474,27 @@ impl CcCreditSession {
     }
 
     fn answered_at(&self) -> Option<Instant> {
-        match self.inner.answered_at.lock() {
-            Ok(guard) => *guard,
-            Err(poisoned) => *poisoned.into_inner(),
-        }
+        *lock(&self.inner.answered_at)
     }
 
-    /// Usage not yet reported to the OCS, and therefore what the next
-    /// Used-Service-Unit must carry (RFC 8506 §5.6).
-    ///
-    /// Reporting the delta rather than the interval just slept also means a
-    /// CCR-UPDATE that fails leaves its seconds unreported, so the next
-    /// successful report — or the CCR-TERMINATION — still covers them exactly
-    /// once.
+    /// Usage not yet reported to the OCS (local metering), and therefore what
+    /// the next Used-Service-Unit must carry (RFC 8506 §5.6).
     fn unreported_secs(&self) -> u32 {
         self.chargeable_secs()
             .saturating_sub(self.inner.reported_secs.load(Ordering::Relaxed))
+    }
+
+    /// The part of a cumulative usage figure not yet reported (external
+    /// metering). A figure below what was already reported reports nothing.
+    fn unreported_of(&self, used_total: u32) -> u32 {
+        used_total.saturating_sub(self.inner.reported_secs.load(Ordering::Relaxed))
     }
 
     /// Mark the call answered, starting the chargeable clock under
     /// `charge_from: answer`. Idempotent — a retransmitted 200 OK must not
     /// restart it.
     fn mark_answered(&self) -> bool {
-        let mut guard = match self.inner.answered_at.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        let mut guard = lock(&self.inner.answered_at);
         if guard.is_some() {
             return false;
         }
@@ -290,10 +506,7 @@ impl CcCreditSession {
     /// `Time-Stamps` pair: the INVITE that triggered the reservation, and the
     /// answer now.
     fn answer_charging_data(&self) -> Option<ImsChargingData> {
-        let mut data = match self.inner.ims_data.lock() {
-            Ok(guard) => guard.clone(),
-            Err(poisoned) => poisoned.into_inner().clone(),
-        };
+        let mut data = lock(&self.inner.ims_data).clone()?;
         data.sip_method = Some("INVITE".to_string());
         data.cause_code = None;
         data.request_timestamp = Some(self.inner.requested_at);
@@ -303,36 +516,89 @@ impl CcCreditSession {
 
     /// Record the carrier that actually carried the call, as
     /// `Outgoing-Trunk-Group-Id` (TS 32.299 §7.2.71).
-    ///
-    /// Load-bearing under LCR failover: the carrier on the final record is the
-    /// one that answered, which is not necessarily the first one tried, so it
-    /// cannot be inferred from the CCR-INITIAL.
     pub fn set_outgoing_trunk_group(&self, carrier_id: &str) {
-        let mut guard = match self.inner.ims_data.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        guard.outgoing_trunk_group_id = Some(carrier_id.to_string());
+        if let Some(data) = lock(&self.inner.ims_data).as_mut() {
+            data.outgoing_trunk_group_id = Some(carrier_id.to_string());
+        }
+    }
+
+    fn requested_units(&self) -> Option<ServiceUnit> {
+        (self.inner.requested_seconds > 0).then(|| ServiceUnit {
+            time_seconds: Some(self.inner.requested_seconds),
+            ..Default::default()
+        })
+    }
+
+    fn params<'a>(
+        &'a self,
+        request_type: CcRequestType,
+        request_number: u32,
+        ims_data: Option<&'a ImsChargingData>,
+        vcs_data: Option<&'a ro::VcsInformation>,
+        requested: Option<&'a ServiceUnit>,
+        used: Option<&'a ServiceUnit>,
+    ) -> CreditControlParams<'a> {
+        CreditControlParams {
+            request_type,
+            request_number,
+            subscriber: &self.inner.subscriber,
+            service_context_id: &self.inner.service_context_id,
+            session_id: Some(&self.inner.session_id),
+            ims_data,
+            sms_data: None,
+            requested_units: requested,
+            used_units: used,
+            rating_group: self.inner.rating_group,
+            service_identifier: self.inner.service_identifier,
+            requested_action: None,
+            multiple_services_indicator: false,
+            additional_subscribers: &self.inner.additional_subscribers,
+            vcs_data,
+        }
+    }
+
+    fn emit(&self, event: RoSessionEvent) {
+        if let Some(hook) = self.inner.event_hook.as_ref() {
+            hook(self, &event);
+        }
     }
 }
 
-/// Online-charging service. Holds the OCS peer resolution, the live-session
-/// count, and the teardown hook.
-///
-/// **B2BUA-only.** Ro enforcement (reserve → re-authorize → disconnect the call
-/// on credit exhaustion) requires owning and being able to tear down the
-/// session — a B2BUA capability, and the reason 3GPP triggers online charging
-/// at the AS/MMTel-AS, not the P-CSCF. There is no proxy-mode auto-emit or
-/// teardown; run the charging siphon as a B2BUA (e.g. an MMTel-AS on ISC).
+/// Re-authorization deadline from a CCA (RFC 8506 §5.1.2, TS 32.299 §6.3.5):
+/// the earlier of the granted CC-Time less its Time-Quota-Threshold, and the
+/// Validity-Time; the configured fallback when the answer grants neither.
+fn reauth_after(answer: &CreditControlAnswer, fallback: u32) -> u32 {
+    let quota = answer
+        .granted_time
+        .filter(|granted| *granted > 0)
+        .map(|granted| granted.saturating_sub(answer.time_quota_threshold.unwrap_or(0)));
+    let validity = answer.validity_time.filter(|validity| *validity > 0);
+    let deadline = match (quota, validity) {
+        (Some(quota), Some(validity)) => quota.min(validity),
+        (Some(quota), None) => quota,
+        (None, Some(validity)) => validity,
+        (None, None) => fallback,
+    };
+    deadline.max(MIN_REAUTH_SECS)
+}
+
+/// Online-charging service. Holds the OCS peer resolution, the live sessions,
+/// and the teardown hook.
 pub struct RoChargingService {
     manager: Arc<DiameterManager>,
     config: RoConfig,
     node_functionality: Option<NodeFunctionality>,
-    /// Resolved `ro.charge_from`, parsed once at construction rather than per
-    /// call.
+    /// Resolved `ro.charge_from`, parsed once at construction.
     charge_from: ChargeFrom,
     active_sessions: Arc<AtomicUsize>,
     teardown_hook: StdMutex<Option<RoTeardownHook>>,
+    /// Every open session by Session-Id: what a RAR or ASR is matched against.
+    live: DashMap<String, CcCreditSession>,
+    /// Open sessions by their owner's key.
+    keys: DashMap<String, CcCreditSession>,
+    /// Sessions filed under a B2BUA call by [`Self::bind_call`], by internal
+    /// call id: they end with the call.
+    bound: DashMap<String, Vec<CcCreditSession>>,
 }
 
 impl RoChargingService {
@@ -352,6 +618,9 @@ impl RoChargingService {
             charge_from,
             active_sessions: Arc::new(AtomicUsize::new(0)),
             teardown_hook: StdMutex::new(None),
+            live: DashMap::new(),
+            keys: DashMap::new(),
+            bound: DashMap::new(),
         })
     }
 
@@ -365,9 +634,7 @@ impl RoChargingService {
 
     /// Install the call-teardown hook (dispatcher wiring).
     pub fn set_teardown_hook(&self, hook: RoTeardownHook) {
-        if let Ok(mut guard) = self.teardown_hook.lock() {
-            *guard = Some(hook);
-        }
+        *lock(&self.teardown_hook) = Some(hook);
     }
 
     /// Number of live credit-control sessions — the per-module leak gate.
@@ -375,15 +642,54 @@ impl RoChargingService {
         self.active_sessions.load(Ordering::Relaxed)
     }
 
-    fn track_session_started(&self) {
+    /// An open session by Session-Id.
+    pub fn session(&self, session_id: &str) -> Option<CcCreditSession> {
+        self.live.get(session_id).map(|entry| entry.clone())
+    }
+
+    /// An open session by its owner's key.
+    pub fn session_by_key(&self, key: &str) -> Option<CcCreditSession> {
+        self.keys.get(key).map(|entry| entry.clone())
+    }
+
+    /// The `ro:` defaults for a session charged to `subscriber`.
+    pub fn session_spec(
+        &self,
+        subscriber: SubscriberId,
+        ims_data: Option<ImsChargingData>,
+    ) -> RoSessionSpec {
+        RoSessionSpec {
+            subscriber,
+            additional_subscribers: Vec::new(),
+            vcs_data: None,
+            ims_data,
+            service_context_id: self.config.service_context_id.clone(),
+            rating_group: self.config.rating_group,
+            service_identifier: self.config.service_identifier,
+            requested_seconds: self.config.requested_seconds,
+            charge_from: self.charge_from,
+            metering: Metering::Local,
+            teardown_call: None,
+            key: None,
+            event_hook: None,
+        }
+    }
+
+    fn track_session_started(&self, session: &CcCreditSession) {
         self.active_sessions.fetch_add(1, Ordering::Relaxed);
         if let Some(metrics) = crate::metrics::metrics() {
             metrics.ro_sessions.inc();
         }
+        self.live
+            .insert(session.inner.session_id.clone(), session.clone());
+        if let Some(key) = session.inner.key.as_ref() {
+            self.keys.insert(key.clone(), session.clone());
+        }
     }
 
-    /// Flip `session` to stopped exactly once and release its slot from the
-    /// count/gauge. Returns `true` only for the caller that won the race.
+    /// Flip `session` to stopped exactly once, release its slot from the
+    /// count/gauge and drop it from every index. Returns `true` only for the
+    /// caller that won the race.
     fn claim_stop(&self, session: &CcCreditSession) -> bool {
         let won = session
             .inner
@@ -395,22 +701,43 @@ impl RoChargingService {
             if let Some(metrics) = crate::metrics::metrics() {
                 metrics.ro_sessions.dec();
             }
+            self.live.remove(&session.inner.session_id);
+            if let Some(key) = session.inner.key.as_ref() {
+                self.keys
+                    .remove_if(key, |_, held| Arc::ptr_eq(&held.inner, &session.inner));
+            }
+            let bound = lock(&session.inner.bound_internal_call).take();
+            if let Some(internal_call_id) = bound {
+                let empty = match self.bound.get_mut(&internal_call_id) {
+                    Some(mut sessions) => {
+                        sessions.retain(|held| !Arc::ptr_eq(&held.inner, &session.inner));
+                        sessions.is_empty()
+                    }
+                    None => false,
+                };
+                if empty {
+                    self.bound
+                        .remove_if(&internal_call_id, |_, sessions| sessions.is_empty());
+                }
+            }
         }
         won
     }
 
-    fn fire_teardown(&self, sip_call_id: &str, reason: &str) {
-        let hook = self.teardown_hook.lock().ok().and_then(|g| g.clone());
+    fn fire_teardown(&self, session: &CcCreditSession, reason: &str) {
+        let Some(sip_call_id) = session.teardown_call() else {
+            // Bound to no call: the owner is told through its event hook.
+            return;
+        };
+        let hook = lock(&self.teardown_hook).clone();
         match hook {
             Some(hook) => {
                 crate::metrics::record_ro_credit_teardown(teardown_reason_label(reason));
-                hook(sip_call_id, reason)
+                hook(&sip_call_id, reason)
             }
             None => {
                 // Distinct label: credit ran out, nothing was wired to enforce
-                // it, and the call is still up and unpaid. That is a different
-                // and worse outcome than a teardown that fired, so it must not
-                // share a series with one.
+                // it, and the call is still up and unpaid.
                 crate::metrics::record_ro_credit_teardown("no_teardown_hook");
                 warn!(
                     call_id = %sip_call_id,
@@ -419,6 +746,80 @@ impl RoChargingService {
             }
         }
     }
+
+    // ── Binding to B2BUA calls ──────────────────────────────────────────
+
+    /// Bind `session` to a B2BUA call: credit exhaustion disconnects that call
+    /// (by `sip_call_id`), and the call's end terminates the session (the
+    /// dispatcher calls [`Self::end_bound`] with `internal_call_id`). Several
+    /// sessions may be bound to one call. Returns `false` for a session that
+    /// has already ended.
+    pub fn bind_call(
+        &self,
+        session: &CcCreditSession,
+        internal_call_id: &str,
+        sip_call_id: &str,
+    ) -> bool {
+        if !session.is_open() {
+            return false;
+        }
+        *lock(&session.inner.teardown_call) = Some(sip_call_id.to_string());
+        let previous =
+            lock(&session.inner.bound_internal_call).replace(internal_call_id.to_string());
+        if previous.as_deref() == Some(internal_call_id) {
+            return true;
+        }
+        if let Some(previous) = previous {
+            if let Some(mut sessions) = self.bound.get_mut(&previous) {
+                sessions.retain(|held| !Arc::ptr_eq(&held.inner, &session.inner));
+            }
+        }
+        self.bound
+            .entry(internal_call_id.to_string())
+            .or_default()
+            .push(session.clone());
+        // Lost a race with the session's end: undo, so nothing is filed for a
+        // session that will never be removed by its stop.
+        if !session.is_open() {
+            if let Some(mut sessions) = self.bound.get_mut(internal_call_id) {
+                sessions.retain(|held| !Arc::ptr_eq(&held.inner, &session.inner));
+            }
+            return false;
+        }
+        true
+    }
+
+    /// Sessions bound to a call (by internal call id).
+    pub fn bound_sessions(&self, internal_call_id: &str) -> Vec<CcCreditSession> {
+        self.bound
+            .get(internal_call_id)
+            .map(|sessions| sessions.clone())
+            .unwrap_or_default()
+    }
+
+    /// Internal call ids that have sessions bound to them.
+    pub fn bound_call_ids(&self) -> Vec<String> {
+        self.bound.iter().map(|entry| entry.key().clone()).collect()
+    }
+
+    /// The call ended: terminate every session bound to it.
+    pub async fn end_bound(&self, internal_call_id: &str, cause_code: Option<i32>) {
+        let Some((_, sessions)) = self.bound.remove(internal_call_id) else {
+            return;
+        };
+        for session in sessions {
+            self.terminate_call(&session, cause_code).await;
+        }
+    }
+
+    /// The call was answered: start the clock of every session bound to it.
+    pub async fn answer_bound(&self, internal_call_id: &str) {
+        for session in self.bound_sessions(internal_call_id) {
+            self.report_answer(&session).await;
+        }
+    }
+
+    // ── Peers and failover ──────────────────────────────────────────────
 
     fn pick_peer(&self) -> Option<Arc<DiameterPeer>> {
         if let Some(name) = self.config.peer.as_deref() {
@@ -432,31 +833,141 @@ impl RoChargingService {
             .map(|c| c.peer().clone())
     }
 
-    /// Requested-Service-Unit for a voice reservation. `None` when
-    /// `requested_seconds == 0` (empty RSU — let the OCS decide the quota).
-    fn requested_units(&self) -> Option<ServiceUnit> {
-        (self.config.requested_seconds > 0).then(|| ServiceUnit {
-            time_seconds: Some(self.config.requested_seconds),
-            ..Default::default()
-        })
+    /// Another connected peer on the `ro` route than `current`.
+    fn alternate_peer(&self, current: &Arc<DiameterPeer>) -> Option<Arc<DiameterPeer>> {
+        self.manager
+            .route_clients(&crate::config::DiameterApplication::Ro)
+            .into_iter()
+            .map(|client| client.peer().clone())
+            .find(|peer| !Arc::ptr_eq(peer, current))
+    }
+
+    fn send_options(&self, end_to_end: u32, retransmit: bool) -> CcrSendOptions {
+        CcrSendOptions {
+            end_to_end: Some(end_to_end),
+            retransmit,
+            timeout: (self.config.tx_timeout_ms > 0)
+                .then(|| Duration::from_millis(self.config.tx_timeout_ms as u64)),
+        }
+    }
+
+    /// The configured default Credit-Control-Failure-Handling.
+    fn default_failure_handling(&self) -> u32 {
+        let value = self.config.on_ocs_failure.trim().to_ascii_lowercase();
+        match value.as_str() {
+            "continue" => CCFH_CONTINUE,
+            "retry_and_terminate" | "retry-and-terminate" => CCFH_RETRY_AND_TERMINATE,
+            _ => CCFH_TERMINATE,
+        }
     }
 
     fn fail_closed(&self) -> bool {
-        !self.config.on_ocs_failure.eq_ignore_ascii_case("continue")
+        self.default_failure_handling() != CCFH_CONTINUE
     }
 
-    /// SCUR: reserve credit at call setup (CCR-INITIAL). On grant, a session is
-    /// created, the re-auth timer armed, and the handle returned for the caller
-    /// to store (so BYE / enforced teardown can find it). `sip_call_id` is the
-    /// B2BUA call's SIP Call-ID used to disconnect it on credit exhaustion.
+    /// Send one request, failing over once to another `ro` peer when the
+    /// server does not answer and both the failure handling and
+    /// CC-Session-Failover allow it (RFC 8506 §5.7). The re-sent request keeps
+    /// its End-to-End Identifier and CC-Request-Number and carries the T flag.
+    /// Returns the answer and the peer that gave it.
+    async fn exchange(
+        &self,
+        peer: &Arc<DiameterPeer>,
+        params: &CreditControlParams<'_>,
+        failure_handling: u32,
+        failover_supported: bool,
+    ) -> Result<(CreditControlAnswer, Arc<DiameterPeer>), String> {
+        let end_to_end = peer.next_e2e();
+        let first = ro::send_ccr_with(peer, params, &self.send_options(end_to_end, false)).await;
+        let error = match first {
+            Ok(answer) => return Ok((answer, Arc::clone(peer))),
+            Err(error) => error,
+        };
+        if failure_handling == CCFH_TERMINATE || !failover_supported {
+            return Err(error);
+        }
+        let Some(alternate) = self.alternate_peer(peer) else {
+            return Err(error);
+        };
+        warn!(
+            session = params.session_id.unwrap_or("-"),
+            error = %error,
+            from = %peer.config().host,
+            to = %alternate.config().host,
+            "ro: no answer from the charging server, failing over"
+        );
+        match ro::send_ccr_with(&alternate, params, &self.send_options(end_to_end, true)).await {
+            Ok(answer) => Ok((answer, alternate)),
+            Err(retry_error) => Err(format!("{error}; failover: {retry_error}")),
+        }
+    }
+
+    /// [`Self::exchange`] for a request of an open session: its peer, its
+    /// failure handling, and its peer moved to the one that answered.
+    async fn exchange_in(
+        &self,
+        session: &CcCreditSession,
+        params: &CreditControlParams<'_>,
+    ) -> Result<CreditControlAnswer, String> {
+        let peer = session.peer();
+        let (answer, answered_by) = self
+            .exchange(
+                &peer,
+                params,
+                session.failure_handling(),
+                session.inner.failover_supported.load(Ordering::Relaxed),
+            )
+            .await?;
+        if !Arc::ptr_eq(&answered_by, &peer) {
+            *lock(&session.inner.peer) = answered_by;
+        }
+        session.absorb(&answer);
+        Ok(answer)
+    }
+
+    // ── Opening sessions ────────────────────────────────────────────────
+
+    /// SCUR: reserve credit at call setup (CCR-INITIAL) for one call, bound to
+    /// it by SIP Call-ID. The `call.ro_authorize()` path: a session with the
+    /// `ro:` defaults, metered locally.
     pub async fn authorize_call(
         self: &Arc<Self>,
         subscriber: SubscriberId,
-        mut ims_data: ImsChargingData,
+        ims_data: ImsChargingData,
         sip_call_id: String,
     ) -> ChargeDecision {
+        let mut spec = self.session_spec(subscriber, Some(ims_data));
+        spec.teardown_call = Some(sip_call_id);
+        self.open_session(spec).await
+    }
+
+    /// Open a credit-control session (CCR-INITIAL). On a grant the session is
+    /// registered (by Session-Id, and by key when it has one), its timer armed,
+    /// and the handle returned for the owner to keep.
+    pub async fn open_session(self: &Arc<Self>, spec: RoSessionSpec) -> ChargeDecision {
         if !self.config.enabled {
             return ChargeDecision::AllowUncharged;
+        }
+        let RoSessionSpec {
+            subscriber,
+            additional_subscribers,
+            vcs_data,
+            mut ims_data,
+            service_context_id,
+            rating_group,
+            service_identifier,
+            requested_seconds,
+            charge_from,
+            metering,
+            teardown_call,
+            key,
+            event_hook,
+        } = spec;
+        if let Some(key) = key.as_deref() {
+            if self.keys.contains_key(key) {
+                warn!(key = %key, "ro: a session is already open under this key");
+                return ChargeDecision::Denied(dictionary::DIAMETER_UNABLE_TO_COMPLY);
+            }
         }
         let Some(peer) = self.pick_peer() else {
             return if self.fail_closed() {
@@ -466,37 +977,55 @@ impl RoChargingService {
                 ChargeDecision::AllowUncharged
             };
         };
-        if ims_data.node_functionality.is_none() {
-            ims_data.node_functionality = self.node_functionality;
+        if let Some(data) = ims_data.as_mut() {
+            if data.node_functionality.is_none() {
+                data.node_functionality = self.node_functionality;
+            }
+            // The session keeps this copy for its re-authorizations and its
+            // termination, so the setting holds for every CCR of the call.
+            if !self.config.access_network_information {
+                data.access_network_information.clear();
+            }
         }
-        // The session keeps this copy for its re-authorizations and its
-        // termination, so the setting holds for every CCR of the call.
-        if !self.config.access_network_information {
-            ims_data.access_network_information.clear();
-        }
+        // Minted here rather than by the sender, so a CCR-INITIAL re-sent to
+        // another server on failover is the same request (RFC 8506 §5.7).
+        let new_session_id = peer.new_session_id();
 
-        let requested = self.requested_units();
+        let requested = (requested_seconds > 0).then(|| ServiceUnit {
+            time_seconds: Some(requested_seconds),
+            ..Default::default()
+        });
         let params = CreditControlParams {
             request_type: CcRequestType::Initial,
             request_number: 0,
             subscriber: &subscriber,
-            service_context_id: &self.config.service_context_id,
-            session_id: None,
-            ims_data: Some(&ims_data),
+            service_context_id: &service_context_id,
+            session_id: Some(&new_session_id),
+            ims_data: ims_data.as_ref(),
             sms_data: None,
             requested_units: requested.as_ref(),
             used_units: None,
-            rating_group: self.config.rating_group,
-            service_identifier: self.config.service_identifier,
+            rating_group,
+            service_identifier,
             requested_action: None,
             multiple_services_indicator: true,
+            additional_subscribers: &additional_subscribers,
+            vcs_data: vcs_data.as_ref(),
         };
-
-        let answer = match ro::send_ccr(&peer, &params).await {
-            Ok(answer) => answer,
+        let failure_handling = self.default_failure_handling();
+        let (answer, peer) = match self
+            .exchange(
+                &peer,
+                &params,
+                failure_handling,
+                self.config.session_failover,
+            )
+            .await
+        {
+            Ok(exchanged) => exchanged,
             Err(error) => {
                 warn!(error = %error, "ro: CCR-INITIAL failed");
-                return if self.fail_closed() {
+                return if failure_handling != CCFH_CONTINUE {
                     crate::metrics::record_ro_denial(dictionary::DIAMETER_UNABLE_TO_DELIVER);
                     ChargeDecision::Denied(dictionary::DIAMETER_UNABLE_TO_DELIVER)
                 } else {
@@ -526,41 +1055,57 @@ impl RoChargingService {
             }
         };
 
-        let grant_secs = grant_from(&answer, self.config.reauth_interval_secs);
+        let first_wait = reauth_after(&answer, self.config.reauth_interval_secs);
         let session = CcCreditSession {
             inner: Arc::new(CcSessionInner {
                 session_id,
                 cc_request_number: AtomicU32::new(1),
                 stopped: AtomicU32::new(0),
                 reauth_handle: Mutex::new(None),
-                last_result_code: AtomicU32::new(answer.result_code),
-                sip_call_id,
-                peer,
+                last_result_code: AtomicU32::new(0),
+                teardown_call: StdMutex::new(teardown_call),
+                bound_internal_call: StdMutex::new(None),
+                key,
+                peer: StdMutex::new(peer),
                 subscriber,
-                service_context_id: self.config.service_context_id.clone(),
-                rating_group: self.config.rating_group,
-                service_identifier: self.config.service_identifier,
-                requested_seconds: self.config.requested_seconds,
-                ims_data: std::sync::Mutex::new(ims_data),
-                charge_from: self.charge_from,
+                additional_subscribers,
+                vcs_data: StdMutex::new(vcs_data),
+                service_context_id,
+                rating_group,
+                service_identifier,
+                requested_seconds,
+                metering,
+                ims_data: StdMutex::new(ims_data),
+                charge_from,
                 started_at: Instant::now(),
                 requested_at: std::time::SystemTime::now(),
-                answered_at: std::sync::Mutex::new(None),
-                initial_grant: grant_secs,
+                answered_at: StdMutex::new(None),
+                initial_grant: answer
+                    .granted_time
+                    .filter(|granted| *granted > 0)
+                    .unwrap_or(first_wait),
                 reported_secs: AtomicU32::new(0),
+                grant: StdMutex::new(RoGrant::default()),
+                failure_handling: AtomicU32::new(failure_handling),
+                failover_supported: AtomicBool::new(self.config.session_failover),
+                wake: Notify::new(),
+                reauth_requested: AtomicBool::new(false),
+                event_hook,
             }),
         };
-        self.track_session_started();
-        // If the OCS already flagged this (initial) grant Final-Unit-Action =
-        // TERMINATE — the low-balance case where the whole balance fits in one
-        // grant — consume it, then cut, without ever sending a CCR-UPDATE.
-        let initial_final = answer.final_unit_action == Some(FINAL_UNIT_ACTION_TERMINATE);
-        self.spawn_reauth_timer(&session, grant_secs, initial_final)
+        session.absorb(&answer);
+        self.track_session_started(&session);
+        // If the OCS already flagged this (initial) grant final — the
+        // low-balance case where the whole balance fits in one grant — consume
+        // it, then cut, without ever sending a CCR-UPDATE.
+        let initial_final = answer.final_unit_action.is_some();
+        self.spawn_session_timer(&session, first_wait, initial_final)
             .await;
 
         info!(
             session_id = %session.inner.session_id,
-            grant_secs,
+            subscriber = %session.inner.subscriber.data,
+            first_wait,
             "ro: CCR-INITIAL granted, session open"
         );
         ChargeDecision::Granted(Some(session))
@@ -600,6 +1145,8 @@ impl RoChargingService {
             service_identifier: None,
             requested_action: Some(REQUESTED_ACTION_DIRECT_DEBITING),
             multiple_services_indicator: false,
+            additional_subscribers: &[],
+            vcs_data: None,
         };
         match ro::send_ccr(&peer, &params).await {
             Ok(answer) if answer.is_success() => {
@@ -626,22 +1173,17 @@ impl RoChargingService {
         }
     }
 
+    // ── Session lifecycle ───────────────────────────────────────────────
+
     /// Report that the call was answered: start the chargeable clock (under
     /// `charge_from: answer`) and tell the OCS, with a CCR-UPDATE carrying
     /// `Time-Stamps` (TS 32.299 §7.2.97).
     ///
-    /// Without this there was no credit-control request at the 200 OK at all,
-    /// so an OCS could not tell when charging actually started and a
-    /// Diameter-to-HTTP bridge had nothing to translate into a connect event.
-    /// TS 32.299 has the place for it already: `SIP-Request-Timestamp` (834) is
-    /// when the INVITE triggered the reservation and `SIP-Response-Timestamp`
-    /// (835) is the answer — `ImsChargingData.response_timestamp` existed and
-    /// was never set, because at CCR-INITIAL there is no answer yet.
-    ///
     /// Idempotent: a retransmitted 200 OK does not restart the clock or send a
-    /// second request. A no-op on a session already stopped.
+    /// second request. A no-op on a session already stopped, and on an
+    /// externally metered one (its owner's clock is the one that counts).
     pub async fn report_answer(&self, session: &CcCreditSession) {
-        if session.inner.stopped.load(Ordering::Relaxed) != 0 {
+        if !session.is_open() || session.inner.metering == Metering::External {
             return;
         }
         if !session.mark_answered() {
@@ -649,41 +1191,27 @@ impl RoChargingService {
         }
 
         // Whatever is chargeable at this instant — zero under
-        // `charge_from: answer` (the clock has only just started), the ring
-        // time under `charge_from: invite`.
+        // `charge_from: answer`, the ring time under `charge_from: invite`.
         let unreported = session.unreported_secs();
         let used = ServiceUnit {
             time_seconds: Some(unreported),
             ..Default::default()
         };
-        let requested = (session.inner.requested_seconds > 0).then(|| ServiceUnit {
-            time_seconds: Some(session.inner.requested_seconds),
-            ..Default::default()
-        });
+        let requested = session.requested_units();
         let ims_data = session.answer_charging_data();
         let record_number = session.next_cc_request_number();
-        let params = CreditControlParams {
-            request_type: CcRequestType::Update,
-            request_number: record_number,
-            subscriber: &session.inner.subscriber,
-            service_context_id: &session.inner.service_context_id,
-            session_id: Some(&session.inner.session_id),
-            ims_data: ims_data.as_ref(),
-            sms_data: None,
-            requested_units: requested.as_ref(),
-            used_units: Some(&used),
-            rating_group: session.inner.rating_group,
-            service_identifier: session.inner.service_identifier,
-            requested_action: None,
-            multiple_services_indicator: false,
-        };
+        let vcs_data = session.vcs_snapshot();
+        let params = session.params(
+            CcRequestType::Update,
+            record_number,
+            ims_data.as_ref(),
+            vcs_data.as_ref(),
+            requested.as_ref(),
+            Some(&used),
+        );
 
-        match ro::send_ccr(&session.inner.peer, &params).await {
+        match self.exchange_in(session, &params).await {
             Ok(answer) => {
-                session
-                    .inner
-                    .last_result_code
-                    .store(answer.result_code, Ordering::Relaxed);
                 if unreported > 0 {
                     session
                         .inner
@@ -697,8 +1225,7 @@ impl RoChargingService {
                 );
             }
             // The clock has already started locally, so a failed report costs
-            // one record, not the call's chargeable duration — the seconds stay
-            // unreported and the next CCR covers them.
+            // one record, not the call's chargeable duration.
             Err(error) => warn!(
                 session_id = %session.inner.session_id,
                 error = %error,
@@ -707,59 +1234,155 @@ impl RoChargingService {
         }
     }
 
-    /// Send CCR-TERMINATION for a session (BYE path). Idempotent — a session
-    /// already stopped by the enforced-teardown path is a no-op.
-    /// `cause_code` is the IMS-Information `Cause-Code` for the record
-    /// (TS 32.299 §7.2.35), in the same negative-SIP convention Rf's ACR-STOP
-    /// uses: `Some(0)` for a normal hangup, `Some(-486)` for a busy, and so on.
-    /// Derive it with [`crate::diameter::rf::sip_status_to_cause_code`] so the
-    /// two interfaces never disagree about why a call ended. `None` omits the
-    /// AVP, for a teardown with no cause to report.
-    pub async fn terminate_call(&self, session: &CcCreditSession, cause_code: Option<i32>) {
-        if !self.claim_stop(session) {
-            return;
+    /// Externally metered session: report the cumulative usage `used_total`
+    /// (seconds since the call was answered, as the owner's network element
+    /// counted it) and ask for more (CCR-UPDATE). siphon sends the difference
+    /// to the last answered report as Used-Service-Unit.
+    ///
+    /// A refusal ends the session (CCR-TERMINATION reporting nothing more) and
+    /// is returned for the owner to act on — it is the owner's call to release.
+    /// A request that gets no answer from any server leaves the session open
+    /// under CONTINUE and ends it under the other failure handlings; either way
+    /// the error is returned. `Err` too for a session already ended.
+    pub async fn report_usage(
+        self: &Arc<Self>,
+        session: &CcCreditSession,
+        used_total: u32,
+    ) -> Result<CreditControlAnswer, String> {
+        if !session.is_open() {
+            return Err("the credit-control session has ended".to_string());
         }
-        if let Some(handle) = session.inner.reauth_handle.lock().await.take() {
-            handle.abort();
-        }
-        self.send_terminate(session, cause_code).await;
-    }
-
-    /// Build + send a CCR-TERMINATION reporting the *unreported* usage
-    /// (`elapsed - already-reported`, RFC 8506 §5.6). Does not touch the stopped
-    /// flag (callers use `claim_stop` first).
-    async fn send_terminate(&self, session: &CcCreditSession, cause_code: Option<i32>) {
+        let unreported = session.unreported_of(used_total);
         let used = ServiceUnit {
-            time_seconds: Some(session.unreported_secs()),
+            time_seconds: Some(unreported),
             ..Default::default()
         };
+        let requested = session.requested_units();
+        let ims_data = session.charging_data_for("INVITE", None);
         let record_number = session.next_cc_request_number();
-        // Describe the call on the final record too, not just on the INITIAL:
-        // without this the CCR-T carried only Session-Id, subscriber and units,
-        // so nothing downstream could attribute the record to a carrier, an
-        // ICID or a calling/called party.
-        let ims_data = session.charging_data_for("BYE", cause_code);
-        let params = CreditControlParams {
-            request_type: CcRequestType::Termination,
-            request_number: record_number,
-            subscriber: &session.inner.subscriber,
-            service_context_id: &session.inner.service_context_id,
-            session_id: Some(&session.inner.session_id),
-            ims_data: ims_data.as_ref(),
-            sms_data: None,
-            requested_units: None,
-            used_units: Some(&used),
-            rating_group: session.inner.rating_group,
-            service_identifier: session.inner.service_identifier,
-            requested_action: None,
-            multiple_services_indicator: false,
-        };
-        match ro::send_ccr(&session.inner.peer, &params).await {
+        let vcs_data = session.vcs_snapshot();
+        let params = session.params(
+            CcRequestType::Update,
+            record_number,
+            ims_data.as_ref(),
+            vcs_data.as_ref(),
+            requested.as_ref(),
+            Some(&used),
+        );
+        match self.exchange_in(session, &params).await {
             Ok(answer) => {
                 session
                     .inner
-                    .last_result_code
-                    .store(answer.result_code, Ordering::Relaxed);
+                    .reported_secs
+                    .fetch_add(unreported, Ordering::Relaxed);
+                if answer.is_success() {
+                    // A new grant: the Validity-Time clock restarts from it.
+                    self.restart_session_timer(session).await;
+                } else if self.claim_stop(session) {
+                    info!(session_id = %session.inner.session_id,
+                        result_code = answer.result_code,
+                        "ro: CCR-UPDATE refused, session ends");
+                    self.abort_timer(session).await;
+                    if answer.result_code != DIAMETER_CREDIT_CONTROL_NOT_APPLICABLE {
+                        self.send_terminate(session, Some(CAUSE_CODE_CREDIT_EXHAUSTED), 0)
+                            .await;
+                    }
+                }
+                Ok(answer)
+            }
+            Err(error) => {
+                if session.failure_handling() != CCFH_CONTINUE && self.claim_stop(session) {
+                    warn!(session_id = %session.inner.session_id, error = %error,
+                        "ro: CCR-UPDATE unanswered, session ends (failure handling)");
+                    self.abort_timer(session).await;
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// Send CCR-TERMINATION for a session. Idempotent — a session already
+    /// stopped is a no-op. `cause_code` is the IMS-Information `Cause-Code`
+    /// (TS 32.299 §7.2.35), in the negative-SIP convention Rf's ACR-STOP uses;
+    /// `None` omits the AVP. Local metering reports the unreported chargeable
+    /// time.
+    pub async fn terminate_call(&self, session: &CcCreditSession, cause_code: Option<i32>) {
+        self.terminate_with(session, None, cause_code, None).await;
+    }
+
+    /// Externally metered session: end it reporting the cumulative usage
+    /// `used_total` (CCR-TERMINATION with the difference to the last report).
+    pub async fn terminate_with_usage(
+        &self,
+        session: &CcCreditSession,
+        used_total: u32,
+        cause_code: Option<i32>,
+    ) {
+        self.terminate_with(session, Some(used_total), cause_code, None)
+            .await;
+    }
+
+    /// End a session with what its owner learnt at the release: `vcs` is laid
+    /// over its VCS-Information for the CCR-TERMINATION alone (ISUP-Cause and
+    /// Stop-Time are TERMINATION-only, TS 32.276 table 6.3.1.4.1), after the
+    /// session is claimed so no re-authorization still in its timer can carry
+    /// them. `used_total` is the final cumulative usage (external metering),
+    /// of which the part not yet reported goes out; `None` reports what local
+    /// metering counted, nothing for an external session. Idempotent.
+    pub async fn terminate_with(
+        &self,
+        session: &CcCreditSession,
+        used_total: Option<u32>,
+        cause_code: Option<i32>,
+        vcs: Option<ro::VcsInformation>,
+    ) {
+        if !self.claim_stop(session) {
+            return;
+        }
+        self.abort_timer(session).await;
+        if let Some(vcs) = vcs {
+            session.update_vcs(vcs);
+        }
+        let unreported = match (used_total, session.inner.metering) {
+            (Some(used_total), _) => session.unreported_of(used_total),
+            (None, Metering::Local) => session.unreported_secs(),
+            (None, Metering::External) => 0,
+        };
+        self.send_terminate(session, cause_code, unreported).await;
+    }
+
+    async fn abort_timer(&self, session: &CcCreditSession) {
+        if let Some(handle) = session.inner.reauth_handle.lock().await.take() {
+            handle.abort();
+        }
+    }
+
+    /// Build + send a CCR-TERMINATION reporting `unreported` seconds. Does not
+    /// touch the stopped flag (callers use `claim_stop` first).
+    async fn send_terminate(
+        &self,
+        session: &CcCreditSession,
+        cause_code: Option<i32>,
+        unreported: u32,
+    ) {
+        let used = ServiceUnit {
+            time_seconds: Some(unreported),
+            ..Default::default()
+        };
+        let record_number = session.next_cc_request_number();
+        // Describe the call on the final record too, not just on the INITIAL.
+        let ims_data = session.charging_data_for("BYE", cause_code);
+        let vcs_data = session.vcs_snapshot();
+        let params = session.params(
+            CcRequestType::Termination,
+            record_number,
+            ims_data.as_ref(),
+            vcs_data.as_ref(),
+            None,
+            Some(&used),
+        );
+        match self.exchange_in(session, &params).await {
+            Ok(answer) => {
                 info!(
                     session_id = %session.inner.session_id,
                     result_code = answer.result_code,
@@ -774,46 +1397,153 @@ impl RoChargingService {
         }
     }
 
-    async fn spawn_reauth_timer(
+    // ── Requests from the OCS ───────────────────────────────────────────
+
+    /// A Re-Auth-Request (RFC 8506 §5.5) for `session_id`. `Some(2001)` when
+    /// the session is one of ours — a locally metered session sends its
+    /// CCR-UPDATE now, an externally metered one tells its owner to report —
+    /// and `None` when it is not (the caller passes the request on).
+    pub fn handle_rar(&self, session_id: &str) -> Option<u32> {
+        let session = self.session(session_id)?;
+        info!(session_id = %session_id, "ro: Re-Auth-Request from the charging system");
+        match session.inner.metering {
+            Metering::Local => {
+                session
+                    .inner
+                    .reauth_requested
+                    .store(true, Ordering::Release);
+                session.inner.wake.notify_one();
+            }
+            Metering::External => session.emit(RoSessionEvent {
+                kind: RoEventKind::Reauthorize,
+                reason: "re-auth requested by the charging system".to_string(),
+                result_code: None,
+                final_unit_action: None,
+                redirect_server_address: None,
+            }),
+        }
+        Some(dictionary::DIAMETER_SUCCESS)
+    }
+
+    /// An Abort-Session-Request (RFC 8506 §5.5, RFC 6733 §8.5) for
+    /// `session_id`. `Some(2001)` when the session is one of ours: it is
+    /// ended — bound call torn down, owner told, CCR-TERMINATION sent in the
+    /// background — and `None` when it is not.
+    pub fn handle_asr(self: &Arc<Self>, session_id: &str) -> Option<u32> {
+        let session = self.session(session_id)?;
+        if !self.claim_stop(&session) {
+            return Some(dictionary::DIAMETER_SUCCESS);
+        }
+        info!(session_id = %session_id, "ro: Abort-Session-Request from the charging system, ending the session");
+        let reason = "aborted by the charging system";
+        self.fire_teardown(&session, reason);
+        session.emit(RoSessionEvent {
+            kind: RoEventKind::Aborted,
+            reason: reason.to_string(),
+            result_code: None,
+            final_unit_action: None,
+            redirect_server_address: None,
+        });
+        let service = Arc::clone(self);
+        tokio::spawn(async move {
+            service.abort_timer(&session).await;
+            let unreported = match session.inner.metering {
+                Metering::Local => session.unreported_secs(),
+                Metering::External => 0,
+            };
+            service.send_terminate(&session, Some(0), unreported).await;
+        });
+        Some(dictionary::DIAMETER_SUCCESS)
+    }
+
+    // ── Timers ──────────────────────────────────────────────────────────
+
+    async fn spawn_session_timer(
         self: &Arc<Self>,
         session: &CcCreditSession,
-        initial_grant: u32,
+        first_wait: u32,
         initial_final: bool,
     ) {
         let service = Arc::clone(self);
         let task_session = session.clone();
-        let handle = tokio::spawn(async move {
-            service
-                .reauth_loop(task_session, initial_grant, initial_final)
-                .await;
-        });
+        let handle = match session.inner.metering {
+            Metering::Local => tokio::spawn(async move {
+                service
+                    .reauth_loop(task_session, first_wait, initial_final)
+                    .await;
+            }),
+            Metering::External => tokio::spawn(async move {
+                service.external_watch(task_session).await;
+            }),
+        };
         *session.inner.reauth_handle.lock().await = Some(handle);
     }
 
-    /// The two-clock re-authorization loop. Sleeps the granted quota, sends a
-    /// CCR-UPDATE reporting the elapsed usage, and enforces teardown on denial
-    /// or Final-Unit-Indication.
+    /// External metering: restart the watch after a new grant.
+    async fn restart_session_timer(self: &Arc<Self>, session: &CcCreditSession) {
+        if session.inner.metering != Metering::External {
+            return;
+        }
+        let service = Arc::clone(self);
+        let task_session = session.clone();
+        let handle = tokio::spawn(async move {
+            service.external_watch(task_session).await;
+        });
+        if let Some(previous) = session.inner.reauth_handle.lock().await.replace(handle) {
+            previous.abort();
+        }
+    }
+
+    async fn external_watch(self: Arc<Self>, session: CcCreditSession) {
+        external_watch_inner(session.clone()).await;
+        // Reached only through the lifetime backstop.
+        if session.is_open() && self.claim_stop(&session) {
+            warn!(session_id = %session.inner.session_id,
+                "ro: externally metered session exceeded max lifetime, terminating");
+            session.emit(RoSessionEvent {
+                kind: RoEventKind::Released,
+                reason: "session lifetime exceeded".to_string(),
+                result_code: None,
+                final_unit_action: None,
+                redirect_server_address: None,
+            });
+            self.send_terminate(&session, Some(CAUSE_CODE_SESSION_LIFETIME_EXCEEDED), 0)
+                .await;
+        }
+    }
+
+    /// The re-authorization loop of a locally metered session. Sleeps until
+    /// the grant (less its threshold) or its Validity-Time is reached, or a RAR
+    /// arrives; sends a CCR-UPDATE reporting the unreported usage; enforces
+    /// teardown on denial or after the final units.
     async fn reauth_loop(
         self: Arc<Self>,
         session: CcCreditSession,
-        initial_grant: u32,
+        first_wait: u32,
         initial_final: bool,
     ) {
-        let mut grant = initial_grant.max(MIN_REAUTH_SECS);
-        // Set once the current grant is the last one (Final-Unit-Action =
-        // TERMINATE): the *next* wake-up consumes it and tears down, with no
-        // further CCR-UPDATE (RFC 8506 §5.6).
+        let mut wait = first_wait.max(MIN_REAUTH_SECS);
+        // Set once the current grant is the last one: the *next* wake-up
+        // consumes it and tears down, with no further CCR-UPDATE (RFC 8506
+        // §5.6). A RAR in the meantime still asks — the OCS sends one after a
+        // top-up.
         let mut is_final = initial_final;
         loop {
-            let sleep_secs = grant.max(MIN_REAUTH_SECS);
-            tokio::time::sleep(Duration::from_secs(sleep_secs as u64)).await;
-            if session.inner.stopped.load(Ordering::Relaxed) != 0 {
+            let reauth_by_rar = tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(wait.max(MIN_REAUTH_SECS) as u64)) => false,
+                _ = session.inner.wake.notified() => true,
+            };
+            if !session.is_open() {
                 return;
             }
-            if is_final {
+            if reauth_by_rar && !session.inner.reauth_requested.swap(false, Ordering::AcqRel) {
+                // A stale wake-up with no RAR behind it: wait out the grant.
+                continue;
+            }
+            if is_final && !reauth_by_rar {
                 // The grant just consumed was the final one — cut now. Its
                 // seconds are unreported, so the CCR-T's USU covers them once.
-                self.enforce(&session, "credit exhausted (final unit)")
+                self.enforce(&session, "credit exhausted (final unit)", None)
                     .await;
                 return;
             }
@@ -823,9 +1553,21 @@ impl RoChargingService {
                         "ro: session exceeded max lifetime, disconnecting + terminating");
                     // Fail-closed: a session with no BYE must not run forever
                     // free of charge — disconnect it too, not just CCR-T.
-                    self.fire_teardown(&session.inner.sip_call_id, "session lifetime exceeded");
-                    self.send_terminate(&session, Some(CAUSE_CODE_SESSION_LIFETIME_EXCEEDED))
-                        .await;
+                    self.fire_teardown(&session, "session lifetime exceeded");
+                    session.emit(RoSessionEvent {
+                        kind: RoEventKind::Released,
+                        reason: "session lifetime exceeded".to_string(),
+                        result_code: None,
+                        final_unit_action: None,
+                        redirect_server_address: None,
+                    });
+                    let unreported = session.unreported_secs();
+                    self.send_terminate(
+                        &session,
+                        Some(CAUSE_CODE_SESSION_LIFETIME_EXCEEDED),
+                        unreported,
+                    )
+                    .await;
                 }
                 return;
             }
@@ -838,32 +1580,22 @@ impl RoChargingService {
                 time_seconds: Some(unreported),
                 ..Default::default()
             };
-            let requested = (session.inner.requested_seconds > 0).then(|| ServiceUnit {
-                time_seconds: Some(session.inner.requested_seconds),
-                ..Default::default()
-            });
+            let requested = session.requested_units();
             let record_number = session.next_cc_request_number();
-            // Mid-call usage has to be attributable too — an OCS that cannot
-            // tell which carrier a re-authorization belongs to cannot rate it.
-            // No Cause-Code: the session has not ended, so there is no cause.
+            // Mid-call usage has to be attributable too. No Cause-Code: the
+            // session has not ended, so there is no cause.
             let ims_data = session.charging_data_for("INVITE", None);
-            let params = CreditControlParams {
-                request_type: CcRequestType::Update,
-                request_number: record_number,
-                subscriber: &session.inner.subscriber,
-                service_context_id: &session.inner.service_context_id,
-                session_id: Some(&session.inner.session_id),
-                ims_data: ims_data.as_ref(),
-                sms_data: None,
-                requested_units: requested.as_ref(),
-                used_units: Some(&used),
-                rating_group: session.inner.rating_group,
-                service_identifier: session.inner.service_identifier,
-                requested_action: None,
-                multiple_services_indicator: false,
-            };
+            let vcs_data = session.vcs_snapshot();
+            let params = session.params(
+                CcRequestType::Update,
+                record_number,
+                ims_data.as_ref(),
+                vcs_data.as_ref(),
+                requested.as_ref(),
+                Some(&used),
+            );
 
-            let result = ro::send_ccr(&session.inner.peer, &params).await;
+            let result = self.exchange_in(&session, &params).await;
             if result.is_ok() {
                 // The Used-Service-Unit was answered by the OCS, so it is now
                 // reported — the eventual CCR-TERMINATION reports only what
@@ -875,22 +1607,26 @@ impl RoChargingService {
             }
             match result {
                 Ok(answer) if answer.is_success() => {
-                    session
-                        .inner
-                        .last_result_code
-                        .store(answer.result_code, Ordering::Relaxed);
-                    grant = grant_from(&answer, session.inner.requested_seconds);
-                    if answer.final_unit_action == Some(FINAL_UNIT_ACTION_TERMINATE) {
-                        // This grant is the last one — consume it next cycle,
-                        // then tear down (no more CCR-UPDATE, RFC 8506 §5.6).
-                        is_final = true;
-                    }
+                    wait = reauth_after(&answer, session.inner.requested_seconds);
+                    // This grant is the last one — consume it next cycle, then
+                    // tear down. Any Final-Unit-Action: siphon has no way to
+                    // redirect or restrict a voice call itself, so REDIRECT and
+                    // RESTRICT_ACCESS end it too, and the owner is told which.
+                    is_final = answer.final_unit_action.is_some();
                 }
                 Ok(answer) if answer.result_code == DIAMETER_CREDIT_CONTROL_NOT_APPLICABLE => {
                     // Free of charge from here on — stop charging, leave the call up.
                     info!(session_id = %session.inner.session_id,
                         "ro: CCR-UPDATE returned CREDIT_CONTROL_NOT_APPLICABLE, call continues uncharged");
-                    self.claim_stop(&session);
+                    if self.claim_stop(&session) {
+                        session.emit(RoSessionEvent {
+                            kind: RoEventKind::Released,
+                            reason: "credit control not applicable".to_string(),
+                            result_code: Some(answer.result_code),
+                            final_unit_action: None,
+                            redirect_server_address: None,
+                        });
+                    }
                     return;
                 }
                 Ok(answer) => {
@@ -904,49 +1640,78 @@ impl RoChargingService {
                     };
                     info!(session_id = %session.inner.session_id,
                         result_code = answer.result_code, "ro: CCR-UPDATE denied, tearing down");
-                    self.enforce(&session, reason).await;
+                    self.enforce(&session, reason, Some(answer.result_code))
+                        .await;
                     return;
                 }
                 Err(error) => {
-                    // Tx timeout / transport error → Credit-Control-Failure-Handling.
-                    // The interval was NOT counted as reported (the CCR-U wasn't
-                    // answered), so the CCR-T re-reports it.
-                    if self.fail_closed() {
+                    // No answer from any server → Credit-Control-Failure-
+                    // Handling, as the OCS last set it (RFC 8506 §5.7). The
+                    // interval was NOT counted as reported, so the CCR-T
+                    // re-reports it.
+                    if session.failure_handling() != CCFH_CONTINUE {
                         warn!(session_id = %session.inner.session_id, error = %error,
                             "ro: CCR-UPDATE failed, fail-closed teardown");
-                        self.enforce(&session, "ocs unreachable").await;
+                        self.enforce(&session, "ocs unreachable", None).await;
                         return;
                     }
                     warn!(session_id = %session.inner.session_id, error = %error,
                         "ro: CCR-UPDATE failed, fail-open (continue uncharged retry)");
-                    // Fail-open: keep the call, retry next cycle at the fallback cadence.
-                    grant = self.config.reauth_interval_secs.max(MIN_REAUTH_SECS);
+                    wait = self.config.reauth_interval_secs.max(MIN_REAUTH_SECS);
                 }
             }
         }
     }
 
-    /// Disconnect the call and send CCR-TERMINATION (enforced teardown path).
-    async fn enforce(&self, session: &CcCreditSession, reason: &str) {
+    /// Disconnect the call, tell the owner and send CCR-TERMINATION (enforced
+    /// teardown path).
+    async fn enforce(&self, session: &CcCreditSession, reason: &str, result_code: Option<u32>) {
         if !self.claim_stop(session) {
             return;
         }
-        self.fire_teardown(&session.inner.sip_call_id, reason);
-        self.send_terminate(session, Some(CAUSE_CODE_CREDIT_EXHAUSTED))
+        let grant = session.grant();
+        self.fire_teardown(session, reason);
+        session.emit(RoSessionEvent {
+            kind: RoEventKind::Released,
+            reason: reason.to_string(),
+            result_code,
+            final_unit_action: grant.final_unit_action,
+            redirect_server_address: None,
+        });
+        let unreported = session.unreported_secs();
+        self.send_terminate(session, Some(CAUSE_CODE_CREDIT_EXHAUSTED), unreported)
             .await;
     }
 }
 
-/// Re-authorization cadence from a CCA: prefer the granted CC-Time, then
-/// Validity-Time, then the configured fallback. The two clocks collapse to the
-/// tighter deadline here (a full split of quota-vs-validity is a follow-up).
-fn grant_from(answer: &ro::CreditControlAnswer, fallback: u32) -> u32 {
-    answer
-        .granted_time
-        .or(answer.validity_time)
-        .filter(|v| *v > 0)
-        .unwrap_or(fallback)
-        .max(MIN_REAUTH_SECS)
+/// External metering's watch: tell the owner to report when the grant's
+/// Validity-Time runs out (RFC 8506 §5.1.2), once per grant, and return at the
+/// lifetime backstop.
+async fn external_watch_inner(session: CcCreditSession) {
+    let lifetime = Duration::from_secs(MAX_RO_SESSION_LIFETIME_SECS);
+    let remaining = lifetime.saturating_sub(session.inner.started_at.elapsed());
+    let validity = session
+        .grant()
+        .validity_time
+        .filter(|validity| *validity > 0)
+        .map(|validity| Duration::from_secs(validity.max(MIN_REAUTH_SECS) as u64));
+    let Some(wait) = validity.filter(|wait| *wait < remaining) else {
+        tokio::time::sleep(remaining).await;
+        return;
+    };
+    tokio::time::sleep(wait).await;
+    if !session.is_open() {
+        return;
+    }
+    session.emit(RoSessionEvent {
+        kind: RoEventKind::Reauthorize,
+        reason: "validity time expired".to_string(),
+        result_code: None,
+        final_unit_action: None,
+        redirect_server_address: None,
+    });
+    // The owner's report brings a new grant, which restarts this watch.
+    tokio::time::sleep(remaining.saturating_sub(wait)).await;
 }
 
 #[cfg(test)]
@@ -1955,3 +2720,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "ro_session_tests.rs"]
+mod session_tests;
