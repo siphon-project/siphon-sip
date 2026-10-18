@@ -209,6 +209,25 @@ pub(super) fn establish(prefix: u32, refer_mode: &str) -> Established {
 /// [`establish`] with `on_refer` as the one statement of the script's
 /// `@b2bua.on_refer` handler.
 pub(super) fn establish_deciding(prefix: u32, on_refer: &str) -> Established {
+    let routing = format!(
+        concat!(
+            "call.dial(str(call.ruri))\n",
+            "\n",
+            "@b2bua.on_refer\n",
+            "def on_refer(call):\n",
+            "    {on_refer}",
+        ),
+        on_refer = on_refer,
+    );
+    let mut call = establish_running(prefix, &script(&routing));
+    call.dispatcher.state.accept_replaces = true;
+    call
+}
+
+/// Registered phones A, B and C, and a call A → B answered through a B2BUA
+/// running `source`, whose `@b2bua.on_invite` must dial an INVITE carrying no
+/// header of the test's own straight to its request URI.
+pub(super) fn establish_running(prefix: u32, source: &str) -> Established {
     let aor =
         |n: u32| -> &'static str { Box::leak(format!("sip:{n}@example.com").into_boxed_str()) };
     let a = (
@@ -226,18 +245,7 @@ pub(super) fn establish_deciding(prefix: u32, on_refer: &str) -> Established {
     for (aor, address) in [a, b, c] {
         register(aor, address);
     }
-    let routing = format!(
-        concat!(
-            "call.dial(str(call.ruri))\n",
-            "\n",
-            "@b2bua.on_refer\n",
-            "def on_refer(call):\n",
-            "    {on_refer}",
-        ),
-        on_refer = on_refer,
-    );
-    let mut dispatcher = test_dispatcher_with_script(&script(&routing));
-    dispatcher.state.accept_replaces = true;
+    let dispatcher = test_dispatcher_with_script(source);
     let user = |aor: &str| {
         aor.trim_start_matches("sip:")
             .split('@')
@@ -1033,11 +1041,11 @@ async fn a_handed_over_call_names_the_hosted_dialog_its_invite_replaces() {
 
     state.call_actors.set_pending_replaces(
         &internal_call_id,
-        crate::b2bua::actor::PendingReplaces {
-            replaced_call_id: internal_call_id.clone(),
-            replaced_on_a_leg: true,
-            early_only: true,
-        },
+        crate::b2bua::actor::PendingReplaces::from_replaces_header(
+            internal_call_id.clone(),
+            true,
+            true,
+        ),
     );
     let replaces =
         pending_replaces_payload(&bus, &internal_call_id, state).expect("a pending Replaces");

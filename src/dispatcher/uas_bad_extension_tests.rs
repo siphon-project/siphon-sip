@@ -302,11 +302,11 @@ async fn a_replaces_takeover_refuses_an_extension_siphon_does_not_implement() {
         remote_addr: CALLER.parse().expect("a literal address"),
         data: Bytes::from(raw.clone().into_bytes()),
     };
-    let pending = crate::b2bua::actor::PendingReplaces {
-        replaced_call_id: "held-call".to_string(),
-        replaced_on_a_leg: true,
-        early_only: false,
-    };
+    let pending = crate::b2bua::actor::PendingReplaces::from_replaces_header(
+        "held-call".to_string(),
+        true,
+        false,
+    );
     b2bua_bridge_inbound_replaces(
         &inbound,
         &parse(&raw),

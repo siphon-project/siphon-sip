@@ -40,6 +40,7 @@ mod prack_bridge;
 mod reliable;
 mod replacement;
 mod store;
+mod takeover;
 
 #[cfg(test)]
 mod tests;
@@ -59,6 +60,7 @@ pub use prack_bridge::*;
 pub use reliable::*;
 pub use replacement::*;
 pub use store::*;
+pub use takeover::*;
 
 // ---------------------------------------------------------------------------
 

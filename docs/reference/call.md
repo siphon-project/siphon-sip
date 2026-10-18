@@ -133,6 +133,72 @@ that is still up. The out-of-process twin is the control plane's
 
 ::: siphon_sdk.mock_module.MockB2bua.replace_peer
 
+## Taking over a dialog an INVITE names: `call.take_over`
+
+`replace_peer` is siphon deciding to swap a party out. The mirror is a new
+INVITE asking to take one of siphon's dialogs over. With `Replaces` (RFC 3891)
+siphon does that itself, behind `b2bua.accept_replaces`. Other headers name a
+dialog for the same purpose, and there the script decides: an SCC AS anchoring
+a call gets a new INVITE from the access transfer function on SRVCC, carrying
+`Target-Dialog` (RFC 4538) and `Require: tdialog`, naming the SCC AS's dialog
+with the UE (TS 24.237 §12.3.5).
+
+`call.take_over(call_id, local_tag, remote_tag, reinvite=True, headers=None)` in
+`@b2bua.on_invite` runs the same takeover as `Replaces`. Once the handler
+returns, siphon answers the new INVITE `200` with the SDP the surviving party
+last gave, BYEs the named dialog's party (closing its leg exactly as a
+`Replaces` takeover does), keeps the surviving party's dialog, and
+relays between the two from then on. `headers=` go on that `200`, checked as
+`answer(headers=…)` checks them; TS 24.237 §6A.4.3A has the SCC AS put the remote
+party's `P-Asserted-Identity`, `Feature-Caps`, `Accept` and `Recv-Info` there.
+
+```python
+from siphon import b2bua
+
+@b2bua.on_invite
+def on_invite(call):
+    target = call.get_header("Target-Dialog")
+    if target and "tdialog" in (call.get_header("Require") or "") and from_atcf(call):
+        dialog_call_id, _, rest = target.partition(";")
+        params = dict(p.strip().split("=", 1) for p in rest.split(";") if "=" in p)
+        # Target-Dialog is written from its sender's side of the dialog:
+        # its remote-tag is siphon's tag, its local-tag the far party's.
+        call.take_over(dialog_call_id.strip(),
+                       local_tag=params["remote-tag"],
+                       remote_tag=params["local-tag"],
+                       reinvite=False,
+                       headers={"P-Asserted-Identity": remote_identity(call)})
+        return
+    call.dial(call.ruri)
+```
+
+The dialog is named as siphon holds it: its Call-ID, siphon's own tag on it,
+and the far party's tag on it. Either leg of a call can be named.
+
+- **The script authorises it.** It works whether or not `b2bua.accept_replaces`
+  is set, because calling it is the decision that switch stands in for. Knowing
+  a dialog's identifiers is no authority to end it (RFC 3891 §5, RFC 4538 §4),
+  so check the request first: where it came from, `Require: tdialog`, and your
+  own correlation of the session.
+- **Same timing as `Replaces`.** It runs after the handler returns, in place of
+  any routing. It is an action like `dial()`, so the last action of the handler
+  wins: a later `reject()` or `dial()` replaces it. It cannot be combined with
+  `answer()`, whose `2xx` is already on the wire (`ValueError` either way
+  round). It supersedes a takeover a `Replaces` on the same INVITE asked for.
+- **`reinvite`.** `True` re-INVITEs the surviving party with the new INVITE's
+  offer, exactly as a `Replaces` takeover does (TS 24.237 §12.3.5 C a).
+  `False` leaves it alone, for a new leg whose media is the old one's because an
+  access gateway kept the ports (§12.3.5 C b); the new party is then answered
+  with the survivor's SDP as it stands, direction included. `False` raises
+  `ValueError` on a call siphon anchors on a media engine: the takeover moves
+  the surviving party onto a new engine session, which only a re-INVITE can
+  tell it. A script that anchors the INVITE after calling `take_over` gets the
+  takeover refused `500` instead.
+- **Refusals** go on the wire once the handler returns: `481` when no dialog of
+  this node matches, `488` when the named dialog is still early (only confirmed
+  dialogs are taken over) or the INVITE carries no offer, `420` for a required
+  extension siphon does not honour. `tdialog` is honoured on this path.
+
 ## Logging the outbound leg: `b2bua.log_dial`
 
 A B2BUA call says nothing at `log.level: info` about where it dialled. The

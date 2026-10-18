@@ -333,6 +333,42 @@ impl CallActorStore {
         None
     }
 
+    /// Find the call holding the dialog named as siphon holds it: its Call-ID,
+    /// siphon's own tag on it (`local_tag`) and the far party's (`remote_tag`).
+    ///
+    /// The orientation a script's `call.take_over()` uses, mapped onto the
+    /// `Replaces` index: there `to-tag` is siphon's tag and `from-tag` the far
+    /// party's (see [`find_call_by_replaces_dialog`]).
+    ///
+    /// [`find_call_by_replaces_dialog`]: Self::find_call_by_replaces_dialog
+    pub fn find_call_by_hosted_dialog(
+        &self,
+        call_id: &str,
+        local_tag: &str,
+        remote_tag: &str,
+    ) -> Option<ReplacesMatch> {
+        self.find_call_by_replaces_dialog(call_id, remote_tag, local_tag)
+    }
+
+    /// Whether a call other than `except_call_id`, not answered yet, has a leg
+    /// on the dialog with Call-ID `call_id` on which siphon's tag is
+    /// `local_tag`: an early dialog of this node.
+    ///
+    /// A B-leg learns the far party's tag only from its 2xx, so an early
+    /// dialog is recognised by siphon's own side of it. Lets a takeover tell a
+    /// dialog that is not confirmed yet from one that does not exist.
+    pub fn hosts_early_dialog(&self, call_id: &str, local_tag: &str, except_call_id: &str) -> bool {
+        self.calls.iter().any(|entry| {
+            let call = entry.value();
+            entry.key() != except_call_id
+                && call.state != CallState::Answered
+                && call.state != CallState::Terminated
+                && std::iter::once(&call.a_leg)
+                    .chain(call.b_legs.iter())
+                    .any(|leg| leg.dialog.call_id == call_id && leg.dialog.local_tag == local_tag)
+        })
+    }
+
     /// Record the `Replaces` match resolved for a call still being admitted.
     pub fn set_pending_replaces(&self, call_id: &str, pending: PendingReplaces) {
         if let Some(mut call) = self.calls.get_mut(call_id) {

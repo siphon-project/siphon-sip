@@ -367,11 +367,11 @@ async fn a_caller_replaced_before_it_acks_is_sent_its_bye_after_its_ack() {
         &inbound,
         &invite,
         &new_call_id,
-        &crate::b2bua::actor::PendingReplaces {
-            replaced_call_id: call.call_id.clone(),
-            replaced_on_a_leg: true,
-            early_only: false,
-        },
+        &crate::b2bua::actor::PendingReplaces::from_replaces_header(
+            call.call_id.clone(),
+            true,
+            false,
+        ),
         &call.state,
     );
     let sent = call.wire();
@@ -400,11 +400,11 @@ async fn a_new_party_that_has_not_acked_the_takeover_200_has_its_bye_held() {
         &inbound,
         &invite,
         &new_call_id,
-        &crate::b2bua::actor::PendingReplaces {
-            replaced_call_id: call.call_id.clone(),
-            replaced_on_a_leg: true,
-            early_only: false,
-        },
+        &crate::b2bua::actor::PendingReplaces::from_replaces_header(
+            call.call_id.clone(),
+            true,
+            false,
+        ),
         &call.state,
     );
     let answer = answer_to_new_party(&call.wire());
@@ -445,11 +445,11 @@ async fn a_caller_moved_to_the_b_leg_slot_by_a_takeover_still_has_its_bye_held()
         &inbound,
         &invite,
         &new_call_id,
-        &crate::b2bua::actor::PendingReplaces {
-            replaced_call_id: call.call_id.clone(),
-            replaced_on_a_leg: false,
-            early_only: false,
-        },
+        &crate::b2bua::actor::PendingReplaces::from_replaces_header(
+            call.call_id.clone(),
+            false,
+            false,
+        ),
         &call.state,
     );
     let sent = call.wire();

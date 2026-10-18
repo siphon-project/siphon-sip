@@ -1058,11 +1058,11 @@ async fn the_200_to_a_replaces_newcomer_hides_the_survivors_sdp() {
         Arc::new(std::sync::Mutex::new(invite.clone())),
     );
     let inbound = inbound_from(NEWCOMER);
-    let pending = crate::b2bua::actor::PendingReplaces {
-        replaced_call_id: replaced_call_id.clone(),
-        replaced_on_a_leg: true,
-        early_only: false,
-    };
+    let pending = crate::b2bua::actor::PendingReplaces::from_replaces_header(
+        replaced_call_id.clone(),
+        true,
+        false,
+    );
 
     b2bua_bridge_inbound_replaces(&inbound, &invite, &new_call_id, &pending, state);
 

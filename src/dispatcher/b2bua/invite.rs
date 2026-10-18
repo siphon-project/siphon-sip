@@ -428,11 +428,12 @@ pub fn handle_b2bua_invite(inbound: InboundMessage, message: SipMessage, state: 
                             source = %inbound.remote_addr,
                             "B2BUA: INVITE with Replaces matched a confirmed dialog — takeover deferred to script admission"
                         );
-                        pending_replaces = Some(crate::b2bua::actor::PendingReplaces {
-                            replaced_call_id: matched.call_id,
-                            replaced_on_a_leg: matched.on_a_leg,
-                            early_only: replaces.early_only,
-                        });
+                        pending_replaces =
+                            Some(crate::b2bua::actor::PendingReplaces::from_replaces_header(
+                                matched.call_id,
+                                matched.on_a_leg,
+                                replaces.early_only,
+                            ));
                     }
                     None => {
                         debug!(
@@ -762,6 +763,55 @@ pub fn handle_b2bua_invite(inbound: InboundMessage, message: SipMessage, state: 
     let auth_user = outcome.auth_user.clone();
     apply_handler_side_state(&call_id, outcome, state);
 
+    // The script took a dialog over itself (`call.take_over()`), for whatever
+    // header named it. Same timing as a `Replaces`: after the handler, so a
+    // reject it chose instead wins (last action wins), and in place of any
+    // routing. It supersedes a `Replaces` the same INVITE carried: the script
+    // has decided which dialog this INVITE joins.
+    if let CallAction::TakeOver {
+        call_id: named_call_id,
+        local_tag,
+        remote_tag,
+        reinvite,
+        headers,
+    } = &action
+    {
+        let _superseded = state.call_actors.take_pending_replaces(&call_id);
+        if refuse_too_brief_invite(&call_id, &message_arc, state) {
+            return;
+        }
+        let Ok(message_guard) = message_arc.lock() else {
+            error!("message_arc lock poisoned in B2BUA invite handler");
+            return;
+        };
+        let joined = b2bua_take_over_dialog(
+            &inbound,
+            &message_guard,
+            &call_id,
+            &TakeOverRequest {
+                call_id: named_call_id,
+                local_tag,
+                remote_tag,
+                reinvite: *reinvite,
+                headers,
+            },
+            state,
+        );
+        drop(message_guard);
+        // As for a `Replaces`: a registered phone that took the call over is
+        // on it now.
+        if let Some(joined) = joined {
+            let adopted = state
+                .call_actors
+                .get_call(&joined)
+                .is_some_and(|call| call.a_leg.dialog.call_id == sip_call_id);
+            if adopted {
+                watch_caller_dialog(&joined, auth_user.as_deref(), state);
+            }
+        }
+        return;
+    }
+
     // The INVITE carried a `Replaces` naming a dialog this node hosts, and the
     // script has now had its say. A reject (a digest challenge, a policy refusal)
     // is honoured below like any other; anything else means the request was
@@ -928,6 +978,10 @@ pub fn handle_b2bua_invite(inbound: InboundMessage, message: SipMessage, state: 
         }
         CallAction::SendRefer { .. } => {
             debug!(call_id = %call_id, "B2BUA: call.refer() during on_invite has no effect — the call is not yet established; use it from @b2bua.on_answer or the imperative b2bua.refer()");
+        }
+        CallAction::TakeOver { .. } => {
+            // Carried out above, before any routing.
+            debug!(call_id = %call_id, "B2BUA: take_over() already handled");
         }
         CallAction::Answered => {
             // The script called call.answer() imperatively — the 2xx has already

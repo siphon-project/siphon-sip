@@ -190,6 +190,19 @@ entry, but a working config keeps working.
   transaction is no longer also kept in the B2BUA's retransmission table. SDK:
   the mock decorator takes the keyword and `SipTestHarness.dispatch_invite()`
   sends an INVITE down the path siphon would take.
+- **B2BUA: `call.take_over()` lets a script take over a dialog an INVITE
+  names.** The `Replaces` takeover, for headers other than `Replaces`: an SCC
+  AS handed an SRVCC transfer INVITE with `Target-Dialog` and `Require:
+  tdialog` (RFC 4538, TS 24.237 §12.3.5) calls `call.take_over(call_id,
+  local_tag, remote_tag, reinvite=True, headers=None)` in `@b2bua.on_invite`.
+  After the handler returns, siphon answers the INVITE `200` with the
+  surviving party's last SDP (plus the script's `headers`, checked as
+  `answer(headers=…)` checks them), BYEs the named dialog's party, and relays
+  between the survivor and the new leg. `reinvite=False` leaves the survivor
+  un-re-INVITEd (TS 24.237 §12.3.5 C b) and is refused on a media-anchored
+  call. The script authorises it, so `b2bua.accept_replaces` does not gate it.
+  An unknown dialog is refused `481`, an early one `488`, and `tdialog` is
+  honoured on this path. The `Replaces` path is unchanged.
 
 ## [1.14.0] — 2026-10-17
 
