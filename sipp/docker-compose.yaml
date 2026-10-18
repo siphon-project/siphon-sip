@@ -86,6 +86,37 @@ services:
       - "15"
       - -trace_err
 
+  # Contact: * at the registrar (RFC 3261 §10.3 step 6): a wildcard with another
+  # Contact entry or an Expires other than 0 is answered 400 and removes
+  # nothing; alone with Expires: 0 it removes every binding. Registers carol,
+  # whom no other scenario on this siphon uses.
+  sipp-register-wildcard:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon:
+        condition: service_healthy
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.79
+    entrypoint:
+      - sipp
+      - "172.20.0.10:5060"
+      - -sf
+      - /sipp/scenarios/register_wildcard.xml
+      - -s
+      - carol
+      - -ap
+      - secret
+      - -m
+      - "1"
+      - -l
+      - "1"
+      - -timeout
+      - "20"
+      - -trace_err
+
   # ── Call test (UAC + UAS through siphon) ───────────────────────────────────
   # Requires both alice and bob to be registered first.
   # Run sipp-register before this.

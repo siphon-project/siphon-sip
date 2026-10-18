@@ -181,6 +181,46 @@ fn strip_quotes(s: &str) -> &str {
         .unwrap_or(s)
 }
 
+/// How a REGISTER's Contact header field values use the `*` wildcard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContactWildcard {
+    /// No `*` entry: the Contacts are ordinary bindings.
+    Absent,
+    /// `*` is the only Contact entry and `Expires` is zero: remove every binding.
+    RemoveAll,
+    /// `*` together with another Contact entry, or with an `Expires` that is
+    /// absent or not zero.
+    Invalid,
+}
+
+/// Classify a REGISTER's Contacts per RFC 3261 §10.3 step 6.
+///
+/// `contact_values` holds every Contact header line; each line may carry
+/// several comma-separated entries, and all of them count. `expires` is the
+/// request's `Expires` header. A wildcard is valid only as the sole entry with
+/// `Expires: 0`; anything else "MUST return a 400" and skip the remaining steps.
+pub fn contact_wildcard<S: AsRef<str>>(
+    contact_values: &[S],
+    expires: Option<&str>,
+) -> ContactWildcard {
+    let mut entries = 0usize;
+    let mut wildcard = false;
+    for value in contact_values {
+        for entry in split_comma_respecting_angles(value.as_ref()) {
+            entries += 1;
+            wildcard |= entry == "*";
+        }
+    }
+    if !wildcard {
+        ContactWildcard::Absent
+    } else if entries == 1 && expires.and_then(|value| value.trim().parse::<u32>().ok()) == Some(0)
+    {
+        ContactWildcard::RemoveAll
+    } else {
+        ContactWildcard::Invalid
+    }
+}
+
 /// Split comma-separated values while respecting angle brackets.
 /// `"A" <sip:a@x>;tag=1, "B" <sip:b@y>;tag=2` → two parts.
 fn split_comma_respecting_angles(input: &str) -> Vec<&str> {
@@ -279,6 +319,45 @@ mod tests {
         assert_eq!(contacts[1].uri.user.as_deref(), Some("bob"));
         assert_eq!(contacts[1].q, Some(0.5));
         assert_eq!(contacts[1].expires, Some(600));
+    }
+
+    #[test]
+    fn contact_wildcard_classifies_every_entry_across_lines() {
+        let other = "<sip:a@192.0.2.1>";
+        assert_eq!(
+            contact_wildcard(&[other], Some("3600")),
+            ContactWildcard::Absent
+        );
+        assert_eq!(contact_wildcard::<&str>(&[], None), ContactWildcard::Absent);
+        assert_eq!(
+            contact_wildcard(&["*"], Some("0")),
+            ContactWildcard::RemoveAll
+        );
+        assert_eq!(
+            contact_wildcard(&[" * "], Some(" 0 ")),
+            ContactWildcard::RemoveAll
+        );
+        assert_eq!(
+            contact_wildcard(&["*"], Some("3600")),
+            ContactWildcard::Invalid
+        );
+        assert_eq!(contact_wildcard(&["*"], None), ContactWildcard::Invalid);
+        assert_eq!(
+            contact_wildcard(&["*"], Some("never")),
+            ContactWildcard::Invalid
+        );
+        assert_eq!(
+            contact_wildcard(&["*, <sip:a@192.0.2.1>"], Some("0")),
+            ContactWildcard::Invalid
+        );
+        assert_eq!(
+            contact_wildcard(&[other, "*"], Some("0")),
+            ContactWildcard::Invalid
+        );
+        assert_eq!(
+            contact_wildcard(&["*", "*"], Some("0")),
+            ContactWildcard::Invalid
+        );
     }
 
     #[test]
