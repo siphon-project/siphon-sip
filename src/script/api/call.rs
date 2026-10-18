@@ -149,6 +149,25 @@ pub enum CallAction {
         /// is `false`.
         ws_uri: Option<String>,
     },
+    /// Take over a dialog this node hosts for the party whose INVITE this is
+    /// (`call.take_over(...)`): the INVITE is answered with the surviving
+    /// party's media, the named dialog's party is BYE'd, and the surviving
+    /// party is relayed to the new one from then on. The script's own
+    /// authorisation of what a header like `Target-Dialog` (RFC 4538) asks
+    /// for; performed after the handler returns, as a `Replaces` takeover is.
+    TakeOver {
+        /// Call-ID of the named dialog.
+        call_id: String,
+        /// siphon's own tag on the named dialog.
+        local_tag: String,
+        /// The far party's tag on the named dialog.
+        remote_tag: String,
+        /// Whether the surviving party is re-INVITEd with the newcomer's offer.
+        reinvite: bool,
+        /// The script's own headers on the `200` that answers the newcomer
+        /// (already checked by [`crate::b2bua::uas_headers::validate`]).
+        headers: Vec<(String, String)>,
+    },
     /// Sequential failover across an ordered list of carrier routes — LCR
     /// (`call.route(...)`) or `call.fork(strategy="sequential")`. The dispatcher
     /// dials the first routable carrier, stores the rest as the call's failover
@@ -183,6 +202,7 @@ impl CallAction {
             CallAction::Answered => "answered",
             CallAction::Handover { .. } => "handover",
             CallAction::RouteSequence { .. } => "route",
+            CallAction::TakeOver { .. } => "take_over",
         }
     }
 }
@@ -945,7 +965,7 @@ impl PyCall {
 /// a response it sends ([`crate::b2bua::uas_headers::validate`]). A refused
 /// header raises `ValueError` naming `method` and the header, and a name or
 /// value that is not a `str` raises `TypeError`: nothing is sent either way.
-fn uas_response_headers(
+pub(super) fn uas_response_headers(
     method: &str,
     headers: Option<&Bound<'_, pyo3::types::PyDict>>,
 ) -> PyResult<Vec<(String, String)>> {
@@ -1620,6 +1640,11 @@ impl PyCall {
                 "call.answer() requires a 2xx status code; use call.reject() for failure responses (got {code})"
             )));
         }
+        if matches!(self.action, CallAction::TakeOver { .. }) {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "call.answer() after call.take_over(): the takeover answers the INVITE itself",
+            ));
+        }
         let headers = uas_response_headers("call.answer", headers)?;
         let contact = checked_contact("call.answer", contact, contact_params)?;
 
@@ -1985,6 +2010,92 @@ impl PyCall {
             send_socket,
             default_timeout: timeout,
         };
+        Ok(())
+    }
+
+    /// Take over a dialog this node hosts for the party whose INVITE this is.
+    ///
+    /// The `Replaces` takeover (RFC 3891) for any header that names a dialog
+    /// to hand over, decided by the script: an SCC AS taking the source access
+    /// leg over for the INVITE an SRVCC transfer sends with `Target-Dialog`
+    /// and `Require: tdialog` (RFC 4538, TS 24.237 §12.3.5). Once the handler
+    /// returns, siphon answers this INVITE `200` with the SDP the surviving
+    /// party last gave, BYEs the named dialog's party (closing its leg as any
+    /// takeover does), keeps the surviving party's dialog, and relays between
+    /// it and this INVITE's dialog from then on.
+    ///
+    /// The dialog is named the way siphon holds it: its Call-ID, siphon's own
+    /// tag on it, and the far party's tag on it. A `Target-Dialog` is written
+    /// as its recipient sees the dialog (RFC 4538 §3), so siphon's tag is its
+    /// `local-tag` and the far party's its `remote-tag`.
+    ///
+    /// This is the script's authorisation, so it works whether or not
+    /// `b2bua.accept_replaces` is set. Holding a dialog's identifiers is no
+    /// authority to end it (RFC 3891 §5, RFC 4538 §4): check the request
+    /// (its source, `Require: tdialog`, your own correlation) before calling
+    /// this. It is an action like `dial()`: the last action of the handler
+    /// wins, so a later `dial()` or `reject()` replaces it, and it runs after
+    /// the handler returns. It cannot follow or precede `answer()`, whose 2xx
+    /// is already on the wire (`ValueError`). It replaces a takeover a
+    /// `Replaces` header on the same INVITE asked for.
+    ///
+    /// Refused on the wire once the handler returns: `481` when no dialog of
+    /// this node matches (RFC 4538 §4), `480` when the named dialog is not
+    /// confirmed yet (TS 24.237 §12.3.2.3 step 2), `488` when the INVITE
+    /// carries no offer, `420` for a required extension siphon does not
+    /// honour (`tdialog` is honoured on this path).
+    ///
+    /// Args:
+    ///     call_id: Call-ID of the dialog to take over.
+    ///     local_tag: siphon's own tag on that dialog.
+    ///     remote_tag: the far party's tag on that dialog.
+    ///     reinvite: ``True`` (default) re-INVITEs the surviving party with
+    ///         this INVITE's offer, as a `Replaces` takeover does. ``False``
+    ///         leaves it alone: right when the new leg's media is the old
+    ///         one's (an access gateway kept the ports, TS 24.237 §12.3.5).
+    ///         Raises ``ValueError`` on a call siphon anchors on a media
+    ///         engine: the takeover moves the surviving party onto a new
+    ///         engine session, and only a re-INVITE tells it so.
+    ///     headers: Optional ``{name: value}`` mapping added to the ``200``
+    ///         that answers this INVITE, e.g. the remote party's
+    ///         ``P-Asserted-Identity``, ``Feature-Caps``, ``Accept`` and
+    ///         ``Recv-Info`` an SCC AS owes the transfer (TS 24.237
+    ///         §6A.4.3A). The headers siphon owns raise ``ValueError`` (see
+    ///         ``reject()``).
+    ///
+    /// Example:
+    ///     @b2bua.on_invite
+    ///     def on_invite(call):
+    ///         target = call.get_header("Target-Dialog")
+    ///         if target and "tdialog" in (call.get_header("Require") or ""):
+    ///             dialog_call_id, _, rest = target.partition(";")
+    ///             params = dict(p.strip().split("=", 1)
+    ///                           for p in rest.split(";") if "=" in p)
+    ///             call.take_over(dialog_call_id.strip(),
+    ///                            local_tag=params["local-tag"],
+    ///                            remote_tag=params["remote-tag"],
+    ///                            reinvite=False,
+    ///                            headers={"P-Asserted-Identity": "<tel:+15550100001>"})
+    ///             return
+    ///         call.dial(call.ruri)
+    #[pyo3(signature = (call_id, local_tag, remote_tag, reinvite=true, headers=None))]
+    fn take_over(
+        &mut self,
+        call_id: &str,
+        local_tag: &str,
+        remote_tag: &str,
+        reinvite: bool,
+        headers: Option<&Bound<'_, pyo3::types::PyDict>>,
+    ) -> PyResult<()> {
+        self.action = super::call_take_over::take_over_action(
+            &self.action,
+            &self.id,
+            call_id,
+            local_tag,
+            remote_tag,
+            reinvite,
+            uas_response_headers("call.take_over", headers)?,
+        )?;
         Ok(())
     }
 
@@ -3197,6 +3308,155 @@ mod tests {
         assert!(call
             .handover("app", None, None, None, false, None, Some("wss://ai"))
             .is_err());
+    }
+
+    fn take_over_call() -> PyCall {
+        PyCall::new(
+            "test-id".to_string(),
+            Arc::new(Mutex::new(make_invite())),
+            "192.0.2.10".to_string(),
+            "udp".to_string(),
+        )
+    }
+
+    #[test]
+    fn call_take_over_records_the_named_dialog() {
+        let mut call = take_over_call();
+        call.take_over("dialog@example.com", "siphon-tag", "far-tag", false, None)
+            .unwrap();
+        assert_eq!(
+            call.action(),
+            &CallAction::TakeOver {
+                call_id: "dialog@example.com".to_string(),
+                local_tag: "siphon-tag".to_string(),
+                remote_tag: "far-tag".to_string(),
+                reinvite: false,
+                headers: Vec::new(),
+            }
+        );
+        assert_eq!(call.action().name(), "take_over");
+    }
+
+    #[test]
+    fn call_take_over_refuses_an_empty_name() {
+        Python::initialize();
+        let mut call = take_over_call();
+        for (call_id, local_tag, remote_tag) in [
+            ("", "siphon-tag", "far-tag"),
+            ("dialog@example.com", " ", "far-tag"),
+            ("dialog@example.com", "siphon-tag", ""),
+        ] {
+            let refused = call
+                .take_over(call_id, local_tag, remote_tag, true, None)
+                .expect_err("an empty name is refused");
+            Python::attach(|python| {
+                assert!(refused.is_instance_of::<pyo3::exceptions::PyValueError>(python));
+            });
+        }
+        assert_eq!(call.action(), &CallAction::None);
+    }
+
+    /// The 200's own headers are checked as `answer(headers=…)` checks them.
+    #[test]
+    fn call_take_over_carries_checked_headers_for_the_200() {
+        Python::initialize();
+        Python::attach(|python| {
+            let mut call = take_over_call();
+            let headers = pyo3::types::PyDict::new(python);
+            headers
+                .set_item("P-Asserted-Identity", "<sip:+15550100001@example.com>")
+                .unwrap();
+            headers.set_item("Recv-Info", "dtmf").unwrap();
+            call.take_over(
+                "dialog@example.com",
+                "siphon-tag",
+                "far-tag",
+                true,
+                Some(&headers),
+            )
+            .unwrap();
+            match call.action() {
+                CallAction::TakeOver { headers, .. } => assert_eq!(
+                    headers,
+                    &vec![
+                        (
+                            "P-Asserted-Identity".to_string(),
+                            "<sip:+15550100001@example.com>".to_string()
+                        ),
+                        ("Recv-Info".to_string(), "dtmf".to_string()),
+                    ]
+                ),
+                other => panic!("not a takeover: {other:?}"),
+            }
+
+            for owned in ["Contact", "Via", "Require", "Content-Type"] {
+                let mut refused_call = take_over_call();
+                let headers = pyo3::types::PyDict::new(python);
+                headers.set_item(owned, "x").unwrap();
+                let refused = refused_call
+                    .take_over(
+                        "dialog@example.com",
+                        "siphon-tag",
+                        "far-tag",
+                        true,
+                        Some(&headers),
+                    )
+                    .expect_err("a header siphon owns is refused");
+                assert!(
+                    refused.is_instance_of::<pyo3::exceptions::PyValueError>(python),
+                    "{owned}"
+                );
+                assert_eq!(refused_call.action(), &CallAction::None, "{owned}");
+            }
+        });
+    }
+
+    /// Like every deferred action, the last one the handler records wins.
+    #[test]
+    fn call_take_over_and_dial_last_one_wins() {
+        let mut call = take_over_call();
+        call.take_over("dialog@example.com", "siphon-tag", "far-tag", true, None)
+            .unwrap();
+        call.set_reject(403, "Forbidden");
+        assert!(matches!(
+            call.action(),
+            CallAction::Reject { code: 403, .. }
+        ));
+        call.take_over("dialog@example.com", "siphon-tag", "far-tag", true, None)
+            .unwrap();
+        assert!(matches!(
+            call.action(),
+            CallAction::TakeOver { reinvite: true, .. }
+        ));
+    }
+
+    /// `answer()` puts a 2xx on the wire at once, which a takeover cannot take
+    /// back, and the takeover answers the INVITE itself.
+    #[test]
+    fn call_take_over_and_answer_exclude_each_other() {
+        Python::initialize();
+        let mut call = take_over_call();
+        call.take_over("dialog@example.com", "siphon-tag", "far-tag", true, None)
+            .unwrap();
+        let refused = call
+            .answer(200, "OK", None, None, None, None, None)
+            .expect_err("answer after take_over");
+        Python::attach(|python| {
+            assert!(refused.is_instance_of::<pyo3::exceptions::PyValueError>(python));
+        });
+        assert!(matches!(call.action(), CallAction::TakeOver { .. }));
+
+        let mut answered = take_over_call();
+        answered
+            .answer(200, "OK", None, None, None, None, None)
+            .unwrap();
+        let refused = answered
+            .take_over("dialog@example.com", "siphon-tag", "far-tag", true, None)
+            .expect_err("take_over after answer");
+        Python::attach(|python| {
+            assert!(refused.is_instance_of::<pyo3::exceptions::PyValueError>(python));
+        });
+        assert_eq!(answered.action(), &CallAction::Answered);
     }
 
     #[test]

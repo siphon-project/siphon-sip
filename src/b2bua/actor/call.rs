@@ -140,24 +140,6 @@ pub struct ReplacesMatch {
     /// B-leg. Determines which party survives the takeover — the *other* one.
     pub on_a_leg: bool,
 }
-/// An inbound INVITE carrying a `Replaces` (RFC 3891) that matched a dialog this
-/// node hosts, recorded on the new call while the INVITE is still being admitted.
-///
-/// The takeover is deliberately NOT performed at header-parse time. RFC 3891 §5
-/// warns that a party who learns a dialog's identifiers can use `Replaces` to
-/// hijack the call, so the request has to clear the same admission the script
-/// applies to any other INVITE — `auth.require_proxy_digest()` in
-/// `@b2bua.on_invite` — before siphon acts on it. This carries the resolved
-/// match across that gap.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PendingReplaces {
-    /// The call whose dialog is being taken over.
-    pub replaced_call_id: String,
-    /// Which leg of that call the header named.
-    pub replaced_on_a_leg: bool,
-    /// The `early-only` flag (RFC 3891 §3) as it arrived.
-    pub early_only: bool,
-}
 /// Per-call supervisor managing A-leg + B-leg(s).
 ///
 /// Each call actor owns its legs as independent entities. The dispatcher

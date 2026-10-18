@@ -2032,15 +2032,70 @@ fn find_call_by_replaces_reports_a_b_leg_match() {
     );
 }
 
+/// `call.take_over()` names a dialog as siphon holds it: siphon's own tag,
+/// then the far party's. Both legs resolve, and the reversed pair does not.
+#[test]
+fn find_call_by_hosted_dialog_takes_siphons_tag_first_on_either_leg() {
+    let store = CallActorStore::new();
+    let a_leg = make_a_leg();
+    let a_call_id = a_leg.dialog.call_id.clone();
+    let a_local = a_leg.dialog.local_tag.clone();
+    let a_remote = a_leg.dialog.remote_tag.clone().unwrap();
+    let call_id = store.create_call(a_leg);
+    let mut b_leg = make_b_leg(0);
+    b_leg.dialog.remote_tag = Some("tag-callee".to_string());
+    let b_call_id = b_leg.dialog.call_id.clone();
+    let b_local = b_leg.dialog.local_tag.clone();
+    store.add_b_leg(&call_id, b_leg);
+    store.set_winner(&call_id, 0);
+
+    assert_eq!(
+        store.find_call_by_hosted_dialog(&a_call_id, &a_local, &a_remote),
+        Some(ReplacesMatch {
+            call_id: call_id.clone(),
+            on_a_leg: true
+        })
+    );
+    assert_eq!(
+        store.find_call_by_hosted_dialog(&b_call_id, &b_local, "tag-callee"),
+        Some(ReplacesMatch {
+            call_id,
+            on_a_leg: false
+        })
+    );
+    assert_eq!(
+        store.find_call_by_hosted_dialog(&a_call_id, &a_remote, &a_local),
+        None
+    );
+    assert_eq!(
+        store.find_call_by_hosted_dialog(&b_call_id, "tag-callee", &b_local),
+        None
+    );
+}
+
+/// An unanswered call's legs are early dialogs of this node, found by
+/// siphon's own tag; once answered, or for the call asking, they are not.
+#[test]
+fn hosts_early_dialog_finds_an_unanswered_leg_by_siphons_tag() {
+    let store = CallActorStore::new();
+    let call_id = store.create_call(make_a_leg());
+    let b_leg = make_b_leg(0);
+    let b_call_id = b_leg.dialog.call_id.clone();
+    let b_local = b_leg.dialog.local_tag.clone();
+    store.add_b_leg(&call_id, b_leg);
+
+    assert!(store.hosts_early_dialog(&b_call_id, &b_local, "another-call"));
+    assert!(!store.hosts_early_dialog(&b_call_id, &b_local, &call_id));
+    assert!(!store.hosts_early_dialog(&b_call_id, "not-siphons-tag", "another-call"));
+    store.set_winner(&call_id, 0);
+    assert!(!store.hosts_early_dialog(&b_call_id, &b_local, "another-call"));
+}
+
 #[test]
 fn pending_replaces_round_trips_and_is_taken_once() {
     let store = CallActorStore::new();
     let call_id = store.create_call(make_a_leg());
-    let pending = PendingReplaces {
-        replaced_call_id: "other-call".to_string(),
-        replaced_on_a_leg: true,
-        early_only: false,
-    };
+    let pending = PendingReplaces::from_replaces_header("other-call".to_string(), true, false);
     store.set_pending_replaces(&call_id, pending.clone());
     assert_eq!(store.take_pending_replaces(&call_id), Some(pending));
     // Taken once — a second admission pass must not re-run the takeover.

@@ -164,14 +164,16 @@ fn the_public_surface_is_pinned() {
     // handle, binding a session to a B2BUA call, and answering the OCS's RAR
     // and ASR before the script sees them, plus the 2 crate-internal items
     // `b2bua.send_info()` sends a script's INFO in a call's dialog through and
-    // stops waiting for its answer with.
+    // stops waiting for its answer with,
+    // plus the crate-internal `b2bua_take_over_is_anchored`
+    // `call.take_over(reinvite=False)` refuses a media-anchored call through.
     // All additive, so a minor-compatible change — recorded here because that
     // is the tripwire.
     assert_eq!(
         declared + re_exported,
-        98,
+        99,
         "the dispatcher's public surface is {} items ({declared} declared here, \
-         {re_exported} re-exported), not 98. Adding one is a semver commitment on a \
+         {re_exported} re-exported), not 99. Adding one is a semver commitment on a \
          published crate; removing one breaks embedders. An extraction should move the \
          declaration and add a `pub use`, leaving this total unchanged.",
         declared + re_exported,

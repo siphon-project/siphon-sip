@@ -442,6 +442,11 @@
         "doc": "Call state: \"calling\", \"ringing\", \"answered\", \"terminated\".",
         "kind": "getset_descriptor"
       },
+      "take_over": {
+        "doc": "Take over a dialog this node hosts for the party whose INVITE this is.",
+        "kind": "method_descriptor",
+        "sig": "($self, call_id, local_tag, remote_tag, reinvite=True, headers=None)"
+      },
       "terminate": {
         "doc": "Terminate the call (send BYE to both legs).",
         "kind": "method_descriptor",

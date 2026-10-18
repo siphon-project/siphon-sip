@@ -100,6 +100,10 @@ pub fn classify_failure_action(
             action,
             why: "REFER decisions only apply inside @b2bua.on_refer or to an answered call",
         },
+        action @ CallAction::TakeOver { .. } => FailureDecision::Inapplicable {
+            action,
+            why: "call.take_over() only applies inside @b2bua.on_invite",
+        },
     }
 }
 

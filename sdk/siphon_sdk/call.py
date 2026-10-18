@@ -40,6 +40,14 @@ def _validate_replaces(replaces: Optional[dict]) -> None:
         )
 
 
+# The action kinds that decide what happens to the INVITE, mirroring the Rust
+# ``CallAction`` a handler leaves behind: the most recent one wins.
+_DECISION_KINDS = frozenset((
+    "reject", "answer", "dial", "fork", "route", "handover", "terminate",
+    "take_over",
+))
+
+
 # The headers siphon owns on a response it sends the caller itself; mirrors
 # ``src/b2bua/uas_headers.rs``. Compact forms are folded to their long names.
 _UAS_FRAMEWORK_OWNED = frozenset(name.lower() for name in (
@@ -723,6 +731,10 @@ class Call:
                 f"call.answer() requires a 2xx status code; "
                 f"use call.reject() for failures (got {code})"
             )
+        if self._last_decision() == "take_over":
+            raise ValueError(
+                "call.answer() after call.take_over(): the takeover answers the INVITE itself"
+            )
         checked = _uas_response_headers("call.answer", headers)
         local_contact = _uas_contact("call.answer", contact, contact_params)
         if isinstance(body, str):
@@ -1242,6 +1254,95 @@ class Call:
         """
         self._state = "terminated"
         self._actions.append(Action(kind="terminate"))
+
+    def _last_decision(self) -> Optional[str]:
+        for action in reversed(self._actions):
+            if action.kind in _DECISION_KINDS:
+                return action.kind
+        return None
+
+    def take_over(self, call_id: str, local_tag: str, remote_tag: str,
+                  reinvite: bool = True,
+                  headers: dict[str, str] | None = None) -> None:
+        """Take over a dialog this node hosts for the party whose INVITE this is.
+
+        The ``Replaces`` takeover (RFC 3891) for any header that names a
+        dialog to hand over, decided by the script: an SCC AS taking the
+        source access leg over for the INVITE an SRVCC transfer sends with
+        ``Target-Dialog`` and ``Require: tdialog`` (RFC 4538, TS 24.237
+        §12.3.5). Once the handler returns, siphon answers this INVITE
+        ``200`` with the SDP the surviving party last gave, BYEs the named
+        dialog's party, keeps the surviving party's dialog, and relays between
+        it and this INVITE's dialog from then on.
+
+        The dialog is named the way siphon holds it: its Call-ID, siphon's own
+        tag on it, and the far party's tag on it. A ``Target-Dialog`` is
+        written as its recipient sees the dialog (RFC 4538 §3), so siphon's tag
+        is its ``local-tag`` and the far party's its ``remote-tag``.
+
+        This is the script's authorisation, so it works whether or not
+        ``b2bua.accept_replaces`` is set. Holding a dialog's identifiers is no
+        authority to end it (RFC 3891 §5, RFC 4538 §4): check the request (its
+        source, ``Require: tdialog``, your own correlation) first. It is an
+        action like ``dial()``: the last action of the handler wins, and it
+        runs after the handler returns. It cannot follow or precede
+        ``answer()`` (``ValueError``).
+
+        Refused on the wire once the handler returns: ``481`` when no dialog
+        of this node matches, ``480`` when the named dialog is not confirmed
+        yet (TS 24.237 §12.3.2.3), ``488`` when the INVITE carries no offer.
+
+        Args:
+            call_id: Call-ID of the dialog to take over.
+            local_tag: siphon's own tag on that dialog.
+            remote_tag: the far party's tag on that dialog.
+            reinvite: ``True`` (default) re-INVITEs the surviving party with
+                this INVITE's offer. ``False`` leaves it alone, for a new leg
+                whose media is the old one's (TS 24.237 §12.3.5). The real
+                engine raises ``ValueError`` for ``False`` on a call it
+                anchors on a media engine.
+            headers: Optional ``{name: value}`` mapping added to the ``200``
+                that answers this INVITE (TS 24.237 §6A.4.3A: the remote
+                party's ``P-Asserted-Identity``, ``Feature-Caps``, ``Accept``,
+                ``Recv-Info``). The headers siphon owns raise ``ValueError``
+                (see ``reject()``).
+
+        Example::
+
+            @b2bua.on_invite
+            def on_invite(call):
+                target = call.get_header("Target-Dialog")
+                if target and "tdialog" in (call.get_header("Require") or ""):
+                    dialog_call_id, _, rest = target.partition(";")
+                    params = dict(p.strip().split("=", 1)
+                                  for p in rest.split(";") if "=" in p)
+                    call.take_over(dialog_call_id.strip(),
+                                   local_tag=params["local-tag"],
+                                   remote_tag=params["remote-tag"],
+                                   reinvite=False,
+                                   headers={"P-Asserted-Identity": "<tel:+15550100001>"})
+                    return
+                call.dial(call.ruri)
+        """
+        for name, value in (("call_id", call_id), ("local_tag", local_tag),
+                            ("remote_tag", remote_tag)):
+            if not isinstance(value, str):
+                raise TypeError(f"call.take_over() {name} must be a str")
+            if not value.strip():
+                raise ValueError(f"call.take_over() requires a non-empty {name}")
+        if not isinstance(reinvite, bool):
+            raise TypeError("call.take_over() reinvite must be a bool")
+        if self._last_decision() == "answer":
+            raise ValueError(
+                "call.take_over() after call.answer(): the INVITE is already answered"
+            )
+        checked = _uas_response_headers("call.take_over", headers)
+        self._actions.append(Action(
+            kind="take_over",
+            extras={"call_id": call_id, "local_tag": local_tag,
+                    "remote_tag": remote_tag, "reinvite": reinvite,
+                    "headers": checked},
+        ))
 
     @property
     def max_duration(self) -> Optional[int]:

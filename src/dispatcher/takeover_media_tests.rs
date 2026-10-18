@@ -167,11 +167,11 @@ async fn a_takeover_of_a_newcomer_the_script_anchored_completes_that_session() {
             &source,
             &message,
             &new_call_id,
-            &crate::b2bua::actor::PendingReplaces {
-                replaced_call_id: call.call_id(),
-                replaced_on_a_leg: false,
-                early_only: false,
-            },
+            &crate::b2bua::actor::PendingReplaces::from_replaces_header(
+                call.call_id(),
+                false,
+                false,
+            ),
             state,
         )
     });
