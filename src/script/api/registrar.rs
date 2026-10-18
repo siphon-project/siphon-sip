@@ -205,6 +205,10 @@ pub struct PyContact {
     kind_value: crate::registrar::ContactKind,
     /// Identity the REGISTER that stored this binding authenticated as.
     auth_user_value: Option<String>,
+    /// The binding's `+sip.instance` Contact parameter (RFC 5626), as sent.
+    sip_instance_value: Option<String>,
+    /// The binding's `reg-id` Contact parameter (RFC 5626).
+    reg_id_value: Option<u32>,
     /// Transport the client used to reach the front, when a PROXY header
     /// declared one that differs from the hop the REGISTER arrived on.
     client_transport_value: Option<String>,
@@ -384,6 +388,23 @@ impl PyContact {
         self.auth_user_value.as_deref()
     }
 
+    /// The binding's ``+sip.instance`` Contact parameter (RFC 5626 §4.1), as
+    /// the REGISTER sent it (quotes and angle brackets included), or
+    /// ``None``. Kept out of :attr:`params`; with :attr:`reg_id` it is what
+    /// a script needs to write the binding back as a Contact, as the S-CSCF
+    /// does for its restoration information (TS 23.380 §4.6.2).
+    #[getter]
+    fn sip_instance(&self) -> Option<&str> {
+        self.sip_instance_value.as_deref()
+    }
+
+    /// The binding's ``reg-id`` Contact parameter (RFC 5626 §4.2), or
+    /// ``None``.
+    #[getter]
+    fn reg_id(&self) -> Option<u32> {
+        self.reg_id_value
+    }
+
     fn __str__(&self) -> &str {
         &self.uri_string
     }
@@ -468,6 +489,8 @@ impl PyContact {
             params_value: contact.params.clone(),
             kind_value: contact.kind,
             auth_user_value: contact.auth_user.as_deref().map(str::to_string),
+            sip_instance_value: contact.sip_instance.as_deref().map(str::to_string),
+            reg_id_value: contact.reg_id,
         }
     }
 }
@@ -1124,6 +1147,124 @@ impl PyRegistrar {
             }
         }
         Ok(wrote)
+    }
+
+    /// Rebuild a binding from S-CSCF restoration information, without a
+    /// REGISTER (TS 23.380 clauses 4.3.2 and 4.4.2).
+    ///
+    /// An S-CSCF that serves a request for a user whose registration it does
+    /// not hold gets the registration back from the HSS in the
+    /// SCSCF-Restoration-Info of a Server-Assignment-Answer (TS 29.229 clause
+    /// 6.3.46): one Restoration-Info per registered contact, with the Contact
+    /// header field value and the Path. This stores that contact under `aor`
+    /// the way `save()` stores one from a REGISTER, so `lookup()` and
+    /// terminating routing through the Path work as before the failure.
+    ///
+    /// Args:
+    ///     aor: The public user identity the registration is for.
+    ///     contact: The Contact header field value of the registration
+    ///         (Contact AVP, TS 29.229 clause 6.3.48): address and
+    ///         parameters, `+sip.instance` and `reg-id` included.
+    ///     path: The Path header field values (Path AVP, a comma separated
+    ///         list, TS 29.229 clause 6.3.47), stored with the binding.
+    ///     expires: Seconds the binding has left: the Registration-Time-Out
+    ///         less the current time. Capped at `max_expires`.
+    ///     call_id: Call-ID of the REGISTER (Call-ID-SIP-Header), if known.
+    ///     cseq: CSeq sequence number of the REGISTER
+    ///         (Initial-CSeq-Sequence-Number), if known.
+    ///     auth_user: The private user identity the registration was
+    ///         authenticated as (the User-Name of the SCSCF-Restoration-Info),
+    ///         so a protected re- or de-REGISTER from it is recognised.
+    ///     aliases: The implicit registration set, as for `save()`.
+    ///
+    /// Returns:
+    ///     ``True`` when every contact was stored, ``False`` when the registrar
+    ///     refused the binding (an interval under `min_expires`, past
+    ///     `max_contacts`, or an AoR that is not a safe storage key).
+    ///
+    /// Raises:
+    ///     ValueError: `contact` is not a Contact header field value, or
+    ///         `expires` is 0.
+    #[pyo3(signature = (aor, contact, *, expires, path=Vec::new(), call_id=None, cseq=None, auth_user=None, aliases=Vec::new()))]
+    #[allow(clippy::too_many_arguments)]
+    fn restore(
+        &self,
+        aor: &str,
+        contact: &str,
+        expires: u32,
+        path: Vec<String>,
+        call_id: Option<String>,
+        cseq: Option<u32>,
+        auth_user: Option<String>,
+        aliases: Vec<String>,
+    ) -> PyResult<bool> {
+        if expires == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "restore: expires is 0, there is nothing to restore",
+            ));
+        }
+        let aor = normalize_aor(aor);
+        let nameaddrs = NameAddr::parse_multi(contact).map_err(|_| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "restore: not a Contact header field value: {contact}"
+            ))
+        })?;
+        if nameaddrs.is_empty() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "restore: the Contact names no address",
+            ));
+        }
+        let capped = std::cmp::min(expires, self.inner.config.max_expires);
+        let path: Vec<String> = path.into_iter().filter(|entry| !entry.is_empty()).collect();
+        let updates = nameaddrs
+            .into_iter()
+            .map(|nameaddr| {
+                let sip_instance = nameaddr
+                    .other_params
+                    .iter()
+                    .find(|(name, _)| name == "+sip.instance")
+                    .and_then(|(_, value)| value.clone());
+                let reg_id = nameaddr
+                    .other_params
+                    .iter()
+                    .find(|(name, _)| name == "reg-id")
+                    .and_then(|(_, value)| value.as_ref()?.parse::<u32>().ok());
+                let params: Vec<(String, Option<String>)> = nameaddr
+                    .other_params
+                    .iter()
+                    .filter(|(name, _)| name != "+sip.instance" && name != "reg-id")
+                    .cloned()
+                    .collect();
+                ContactUpdate {
+                    q: nameaddr.q.unwrap_or(1.0),
+                    uri: nameaddr.uri,
+                    expires_secs: capped,
+                    call_id: call_id.clone().unwrap_or_default(),
+                    cseq: cseq.unwrap_or(0),
+                    // No REGISTER reached this node: no source, no flow.
+                    source_addr: None,
+                    source_transport: None,
+                    sip_instance,
+                    reg_id,
+                    path: path.clone(),
+                    flow: crate::registrar::FlowCapture::default(),
+                    params,
+                    auth_user: auth_user.clone(),
+                }
+            })
+            .collect();
+        if let Err(refusal) = self.inner.apply_register(&aor, updates, false) {
+            tracing::warn!(
+                aor = %aor.escape_debug(),
+                reason = refusal.reason_label(),
+                "restore: the registrar refused the restored binding"
+            );
+            return Ok(false);
+        }
+        if !aliases.is_empty() {
+            self.inner.set_associated_uris(&aor, aliases);
+        }
+        Ok(true)
     }
 
     /// Look up contacts for a URI string or SipUri.
@@ -2265,6 +2406,8 @@ mod tests {
             params_value: vec![],
             kind_value: crate::registrar::ContactKind::Ue,
             auth_user_value: None,
+            sip_instance_value: None,
+            reg_id_value: None,
         };
         assert_eq!(contact.__str__(), "sip:alice@10.0.0.1");
         assert!(contact.__repr__().contains("q=1"));
@@ -2428,6 +2571,78 @@ mod tests {
         let message = dereg_request.message();
         let message = message.lock().unwrap();
         assert_eq!(message.headers.get("Expires").unwrap(), "0");
+    }
+
+    /// `restore()` rebuilds a binding from SCSCF-Restoration-Info (TS 23.380
+    /// clause 4.3.2): no REGISTER reached this node, yet the contact, its
+    /// Path, Call-ID, CSeq, the authenticated IMPI and the implicit set come
+    /// back as if it had.
+    #[test]
+    fn restore_rebuilds_the_binding_from_restoration_info() {
+        let registrar = make_registrar();
+        let py_reg = PyRegistrar::new(Arc::clone(&registrar));
+        let restored = py_reg
+            .restore(
+                "sip:alice@ims.example.com",
+                "<sip:alice@192.0.2.10:5060>;+sip.instance=\"<urn:gsma:imei:35145120-840600-0>\";+g.3gpp.icsi-ref=\"urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel\"",
+                10_000,
+                vec!["<sip:term@pcscf.example.com;lr>".to_string()],
+                Some("restore-call@192.0.2.10".to_string()),
+                Some(7),
+                Some("alice@ims.example.com".to_string()),
+                vec!["tel:+15551234".to_string()],
+            )
+            .unwrap();
+        assert!(restored);
+        let contacts = py_reg.lookup_str("sip:alice@ims.example.com");
+        assert_eq!(contacts.len(), 1);
+        let contact = &contacts[0];
+        assert!(contact.uri().contains("192.0.2.10"));
+        assert_eq!(contact.path(), vec!["<sip:term@pcscf.example.com;lr>"]);
+        assert_eq!(contact.auth_user(), Some("alice@ims.example.com"));
+        assert_eq!(
+            contact.sip_instance(),
+            Some("\"<urn:gsma:imei:35145120-840600-0>\"")
+        );
+        assert!(contact
+            .params()
+            .iter()
+            .any(|(name, _)| name == "+g.3gpp.icsi-ref"));
+        // Capped to max_expires like a REGISTER would be.
+        assert!(contact.expires() <= 7200 && contact.expires() > 7100);
+        // The implicit set resolves to the restored contact.
+        assert_eq!(py_reg.lookup_str("tel:+15551234").len(), 1);
+    }
+
+    #[test]
+    fn restore_refuses_zero_expires_and_a_non_contact() {
+        let registrar = make_registrar();
+        let py_reg = PyRegistrar::new(Arc::clone(&registrar));
+        assert!(py_reg
+            .restore(
+                "sip:alice@ims.example.com",
+                "<sip:alice@192.0.2.10>",
+                0,
+                vec![],
+                None,
+                None,
+                None,
+                vec![],
+            )
+            .is_err());
+        assert!(py_reg
+            .restore(
+                "sip:alice@ims.example.com",
+                "not a contact <<<",
+                600,
+                vec![],
+                None,
+                None,
+                None,
+                vec![],
+            )
+            .is_err());
+        assert!(!py_reg.is_registered_str("sip:alice@ims.example.com"));
     }
 
     /// `save(aliases=…)` declares the IMS implicit registration set: the

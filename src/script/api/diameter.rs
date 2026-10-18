@@ -1364,7 +1364,8 @@ impl PyDiameter {
     /// Send a Cx Server-Assignment-Request to the HSS.
     ///
     /// Used by the S-CSCF after successful REGISTER authentication to confirm
-    /// server assignment and download the user profile (iFC XML).
+    /// server assignment and download the user profile (iFC XML), and for the
+    /// IMS restoration procedures of TS 23.380 clause 4.
     ///
     /// Args:
     ///     public_identity: The user's public identity.
@@ -1374,15 +1375,69 @@ impl PyDiameter {
     ///         ``request.auth_user`` after a successful authentication. TS
     ///         29.228 Table 6.1.2.1 requires it whenever the S-CSCF has it;
     ///         omit it and the AVP is not sent.
+    ///     user_data_already_available: ``True`` sends
+    ///         User-Data-Already-Available USER_DATA_ALREADY_AVAILABLE (1), as
+    ///         a refresh of the restoration information does (TS 23.380
+    ///         clause 4.6.2). Default ``False`` (0).
+    ///     ims_restoration: ``True`` advertises IMSRestorationInd (feature
+    ///         bit 2 of Feature-List-ID 1, TS 29.229 clause 7.1.1): this
+    ///         S-CSCF supports IMS restoration, so the HSS may return the
+    ///         restoration information.
+    ///     restoration_info: The SCSCF-Restoration-Info to back up (TS 29.229
+    ///         clause 6.3.46), as a dict with ``user_name`` (str),
+    ///         ``restoration_info`` (a non-empty list of dicts with ``path``
+    ///         and ``contact`` (str) and optionally
+    ///         ``initial_cseq_sequence_number`` (int), ``call_id`` (str),
+    ///         ``subscription_info`` (dict of ``call_id``, ``from``, ``to``,
+    ///         ``record_route``, ``contact``) and ``pcscf_subscription_info``
+    ///         (dict of ``call_id``, ``from``, ``to``, ``contact``)), and
+    ///         optionally ``registration_time_out`` (int, Unix seconds) and
+    ///         ``sip_authentication_scheme`` (str). The same shape as the
+    ///         answer's ``scscf_restoration_info`` entries.
+    ///     multiple_registration: Multiple-Registration-Indication (TS 29.229
+    ///         clause 6.3.51): ``True`` MULTIPLE_REGISTRATION, ``False``
+    ///         NOT_MULTIPLE_REGISTRATION, ``None`` (default) not sent.
+    ///     pcscf_restoration_mechanism: ``True`` advertises
+    ///         P-CSCF-Restoration-mechanism (feature bit 3).
+    ///     pcscf_restoration_indication: ``True`` sets the P-CSCF Restoration
+    ///         Indication, bit 0 of SAR-Flags (TS 29.229 clause 6.3.63), for an
+    ///         UNREGISTERED_USER or ADMINISTRATIVE_DEREGISTRATION.
+    ///     failed_pcscf: Failed-PCSCF (TS 29.229 clause 6.3.74), with the
+    ///         indication only: a dict with ``fqdn`` (str) and/or
+    ///         ``ip_addresses`` (list of str).
     ///
     /// Returns:
-    ///     Dict with ``result_code`` (int) and ``user_data`` (str or None, iFC XML),
-    ///     or ``None`` if no Diameter peer is connected.
+    ///     Dict with ``result_code`` (int, the Result-Code or else the
+    ///     Experimental-Result-Code), ``experimental_result_code`` (int, or
+    ///     ``None`` when the answer carried a Result-Code), ``user_data`` (str
+    ///     or None, iFC XML), ``scscf_restoration_info`` (list of dicts in the
+    ///     shape described for ``restoration_info``, one per private
+    ///     identity, empty when none), ``associated_registered_identities``
+    ///     (list of str) and ``supported_features`` (int, the Feature-List of
+    ///     Feature-List-ID 1 the HSS returned, 0 without). ``None`` if no
+    ///     Diameter peer is connected.
+    ///
+    /// Raises:
+    ///     ValueError: ``restoration_info`` or ``failed_pcscf`` is malformed.
     ///
     /// **Awaitable** — returns a coroutine, so `await` it. The request runs on
     /// tokio rather than on the calling thread, which for an `async def` handler
     /// is the asyncio driver its whole loop shares.
-    #[pyo3(signature = (public_identity, server_name=None, assignment_type=1, user_name=None))]
+    #[pyo3(signature = (
+        public_identity,
+        server_name=None,
+        assignment_type=1,
+        user_name=None,
+        *,
+        user_data_already_available=false,
+        ims_restoration=false,
+        restoration_info=None,
+        multiple_registration=None,
+        pcscf_restoration_mechanism=false,
+        pcscf_restoration_indication=false,
+        failed_pcscf=None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
     fn cx_sar<'py>(
         &self,
         python: Python<'py>,
@@ -1390,7 +1445,25 @@ impl PyDiameter {
         server_name: Option<&str>,
         assignment_type: u32,
         user_name: Option<&str>,
+        user_data_already_available: bool,
+        ims_restoration: bool,
+        restoration_info: Option<&Bound<'py, PyAny>>,
+        multiple_registration: Option<bool>,
+        pcscf_restoration_mechanism: bool,
+        pcscf_restoration_indication: bool,
+        failed_pcscf: Option<&Bound<'py, PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
+        // Malformed arguments are the caller's error whether or not a peer
+        // is up, so they are read first.
+        let restoration = restoration_info
+            .filter(|value| !value.is_none())
+            .map(super::diameter_cx::scscf_restoration_info_from_py)
+            .transpose()?;
+        let failed = failed_pcscf
+            .filter(|value| !value.is_none())
+            .map(super::diameter_cx::failed_pcscf_from_py)
+            .transpose()?;
+
         let client = match self
             .manager
             .route_client(&crate::config::DiameterApplication::Cx, None)
@@ -1405,6 +1478,15 @@ impl PyDiameter {
         let public_identity = public_identity.to_string();
         let name = server_name.unwrap_or("").to_string();
         let user_name = user_name.filter(|name| !name.is_empty()).map(String::from);
+        let mut supported_features = super::diameter_cx::sar_supported_features();
+        if ims_restoration {
+            supported_features |= crate::diameter::cx::FEATURE_IMS_RESTORATION;
+        }
+        if pcscf_restoration_mechanism {
+            supported_features |= crate::diameter::cx::FEATURE_PCSCF_RESTORATION;
+        }
+        let sar_flags =
+            pcscf_restoration_indication.then_some(crate::diameter::cx::SAR_FLAG_PCSCF_RESTORATION);
 
         crate::script::awaitable(python, async move {
             let request = crate::diameter::cx::ServerAssignment {
@@ -1412,7 +1494,12 @@ impl PyDiameter {
                 user_name: user_name.as_deref(),
                 server_name: &name,
                 server_assignment_type: assignment_type,
-                supported_features: super::diameter_cx::sar_supported_features(),
+                user_data_already_available: u32::from(user_data_already_available),
+                supported_features,
+                restoration: restoration.as_ref(),
+                multiple_registration_indication: multiple_registration.map(u32::from),
+                sar_flags,
+                failed_pcscf: failed.as_ref(),
             };
             match client.send_sar(&request).await {
                 Ok(message) => Python::attach(|python| {
@@ -1433,6 +1520,11 @@ impl PyDiameter {
     ///
     /// Args:
     ///     public_identity: The target user's public identity.
+    ///     user_authorization_type: User-Authorization-Type (TS 29.229
+    ///         clause 6.1.5), not sent when ``None`` (the default). ``2``
+    ///         (REGISTRATION_AND_CAPABILITIES) asks for the S-CSCF
+    ///         capabilities when the assigned S-CSCF cannot be contacted (TS
+    ///         23.380 clause 4.3.3, TS 29.228 clause 6.1.4.1 step 2a).
     ///
     /// Returns:
     ///     Dict with ``result_code`` (int), ``server_name`` (str or None) and
@@ -1445,11 +1537,12 @@ impl PyDiameter {
     /// **Awaitable** — returns a coroutine, so `await` it. The request runs on
     /// tokio rather than on the calling thread, which for an `async def` handler
     /// is the asyncio driver its whole loop shares.
-    #[pyo3(signature = (public_identity,))]
+    #[pyo3(signature = (public_identity, user_authorization_type=None))]
     fn cx_lir<'py>(
         &self,
         python: Python<'py>,
         public_identity: &str,
+        user_authorization_type: Option<u32>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let client = match self
             .manager
@@ -1465,7 +1558,9 @@ impl PyDiameter {
         let public_identity = public_identity.to_string();
 
         crate::script::awaitable(python, async move {
-            let answer = client.send_lir(&public_identity).await;
+            let answer = client
+                .send_lir(&public_identity, user_authorization_type)
+                .await;
 
             match answer {
                 Ok(message) => Python::attach(|python| {
@@ -3937,9 +4032,79 @@ mod tests {
         let py_diameter = PyDiameter::new(manager);
         pyo3::Python::attach(|python| {
             let result = py_diameter
-                .cx_sar(python, "sip:alice@example.com", None, 1, None)
+                .cx_sar(
+                    python,
+                    "sip:alice@example.com",
+                    None,
+                    1,
+                    None,
+                    false,
+                    false,
+                    None,
+                    None,
+                    false,
+                    false,
+                    None,
+                )
                 .unwrap();
             assert!(resolve(python, result).is_none());
+        });
+    }
+
+    #[test]
+    fn cx_sar_rejects_malformed_restoration_arguments_without_peer() {
+        use pyo3::types::{PyDict, PyList};
+        pyo3::Python::initialize();
+        let manager = Arc::new(DiameterManager::new());
+        let py_diameter = PyDiameter::new(manager);
+        pyo3::Python::attach(|python| {
+            // No Restoration-Info entry: 1*{ Restoration-Info } is required.
+            let restoration = PyDict::new(python);
+            restoration
+                .set_item("user_name", "alice@example.com")
+                .unwrap();
+            restoration
+                .set_item("restoration_info", PyList::empty(python))
+                .unwrap();
+            let error = py_diameter
+                .cx_sar(
+                    python,
+                    "sip:alice@example.com",
+                    Some("sip:scscf.example.com"),
+                    1,
+                    None,
+                    false,
+                    true,
+                    Some(restoration.as_any()),
+                    None,
+                    false,
+                    false,
+                    None,
+                )
+                .err()
+                .unwrap();
+            assert!(error.is_instance_of::<pyo3::exceptions::PyValueError>(python));
+
+            // Failed-PCSCF with neither an FQDN nor an address.
+            let failed = PyDict::new(python);
+            let error = py_diameter
+                .cx_sar(
+                    python,
+                    "sip:alice@example.com",
+                    None,
+                    1,
+                    None,
+                    false,
+                    false,
+                    None,
+                    None,
+                    true,
+                    true,
+                    Some(failed.as_any()),
+                )
+                .err()
+                .unwrap();
+            assert!(error.is_instance_of::<pyo3::exceptions::PyValueError>(python));
         });
     }
 
@@ -3949,7 +4114,9 @@ mod tests {
         let manager = Arc::new(DiameterManager::new());
         let py_diameter = PyDiameter::new(manager);
         pyo3::Python::attach(|python| {
-            let result = py_diameter.cx_lir(python, "sip:alice@example.com").unwrap();
+            let result = py_diameter
+                .cx_lir(python, "sip:alice@example.com", Some(2))
+                .unwrap();
             assert!(resolve(python, result).is_none());
         });
     }

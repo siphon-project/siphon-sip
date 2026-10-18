@@ -980,6 +980,98 @@ static AVP_TABLE: &[AvpDef] = &[
         name: "SIP-Digest-Authenticate",
         data_type: AvpType::Grouped,
     },
+    // IMS restoration (TS 23.380; TS 29.229 table 6.3.1 and clauses
+    // 6.3.46 to 6.3.52, 6.3.62, 6.3.63, 6.3.70, 6.3.71, 6.3.74 to 6.3.76).
+    AvpDef {
+        code: 639,
+        vendor_id: TGPP,
+        name: "SCSCF-Restoration-Info",
+        data_type: AvpType::Grouped,
+    },
+    AvpDef {
+        code: 640,
+        vendor_id: TGPP,
+        name: "Path",
+        data_type: AvpType::OctetString,
+    },
+    AvpDef {
+        code: 641,
+        vendor_id: TGPP,
+        name: "Contact",
+        data_type: AvpType::OctetString,
+    },
+    AvpDef {
+        code: 642,
+        vendor_id: TGPP,
+        name: "Subscription-Info",
+        data_type: AvpType::Grouped,
+    },
+    AvpDef {
+        code: 643,
+        vendor_id: TGPP,
+        name: "Call-ID-SIP-Header",
+        data_type: AvpType::OctetString,
+    },
+    AvpDef {
+        code: 644,
+        vendor_id: TGPP,
+        name: "From-SIP-Header",
+        data_type: AvpType::OctetString,
+    },
+    AvpDef {
+        code: 645,
+        vendor_id: TGPP,
+        name: "To-SIP-Header",
+        data_type: AvpType::OctetString,
+    },
+    AvpDef {
+        code: 646,
+        vendor_id: TGPP,
+        name: "Record-Route",
+        data_type: AvpType::OctetString,
+    },
+    AvpDef {
+        code: 647,
+        vendor_id: TGPP,
+        name: "Associated-Registered-Identities",
+        data_type: AvpType::Grouped,
+    },
+    AvpDef {
+        code: 648,
+        vendor_id: TGPP,
+        name: "Multiple-Registration-Indication",
+        data_type: AvpType::Enumerated,
+    },
+    AvpDef {
+        code: 649,
+        vendor_id: TGPP,
+        name: "Restoration-Info",
+        data_type: AvpType::Grouped,
+    },
+    AvpDef {
+        code: 654,
+        vendor_id: TGPP,
+        name: "Initial-CSeq-Sequence-Number",
+        data_type: AvpType::Unsigned32,
+    },
+    AvpDef {
+        code: 655,
+        vendor_id: TGPP,
+        name: "SAR-Flags",
+        data_type: AvpType::Unsigned32,
+    },
+    AvpDef {
+        code: 660,
+        vendor_id: TGPP,
+        name: "P-CSCF-Subscription-Info",
+        data_type: AvpType::Grouped,
+    },
+    AvpDef {
+        code: 661,
+        vendor_id: TGPP,
+        name: "Registration-Time-Out",
+        data_type: AvpType::Time,
+    },
     AvpDef {
         code: 662,
         vendor_id: TGPP,
@@ -991,6 +1083,24 @@ static AVP_TABLE: &[AvpDef] = &[
         vendor_id: TGPP,
         name: "Alternate-Digest-HA1",
         data_type: AvpType::UTF8String,
+    },
+    AvpDef {
+        code: 664,
+        vendor_id: TGPP,
+        name: "Failed-PCSCF",
+        data_type: AvpType::Grouped,
+    },
+    AvpDef {
+        code: 665,
+        vendor_id: TGPP,
+        name: "PCSCF-FQDN",
+        data_type: AvpType::DiameterIdentity,
+    },
+    AvpDef {
+        code: 666,
+        vendor_id: TGPP,
+        name: "PCSCF-IP-Address",
+        data_type: AvpType::Address,
     },
     // Sh (TS 29.329)
     AvpDef {
@@ -1969,11 +2079,22 @@ pub fn lookup_avp_by_python_name(name: &str) -> Option<&'static AvpDef> {
 /// TS 29.109 Table 6.1 lists with "V" under Must and "M" under Must not, and
 /// the four base AVPs RFC 6733 section 4.5 lists with M under "MUST NOT":
 /// Firmware-Revision (267), Product-Name (269), Error-Message (281) and
-/// Error-Reporting-Host (294).
+/// Error-Reporting-Host (294). The AVPs of IMS restoration, which TS 29.229
+/// Table 6.3.1 lists with "V" under Must and "M" under Must not, go without
+/// it too.
 pub fn avp_is_mandatory(code: u32, vendor_id: u32) -> bool {
     const ERROR_REPORTING_HOST: u32 = 294;
     match vendor_id {
-        VENDOR_3GPP => code != avp::GUSS_TIMESTAMP,
+        VENDOR_3GPP => !matches!(
+            code,
+            avp::GUSS_TIMESTAMP
+                | avp::SCSCF_RESTORATION_INFO..=avp::RESTORATION_INFO
+                | avp::INITIAL_CSEQ_SEQUENCE_NUMBER
+                | avp::SAR_FLAGS
+                | avp::PCSCF_SUBSCRIPTION_INFO
+                | avp::REGISTRATION_TIME_OUT
+                | avp::FAILED_PCSCF..=avp::PCSCF_IP_ADDRESS
+        ),
         0 => !matches!(
             code,
             avp::FIRMWARE_REVISION | avp::PRODUCT_NAME | avp::ERROR_MESSAGE | ERROR_REPORTING_HOST

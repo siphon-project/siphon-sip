@@ -222,6 +222,51 @@ whenever the S-CSCF has it.
 await diameter.cx_sar(public_identity, SCSCF_URI, 1, user_name=request.auth_user)
 ```
 
+### IMS restoration
+
+TS 23.380 clause 4 has the S-CSCF back a registration up in the HSS and
+rebuild it from there after a restart or on a reselected S-CSCF. The Cx
+members (TS 29.229 clause 6.3.46 to 6.3.52, 6.3.62, 6.3.63, 6.3.70, 6.3.71,
+6.3.74 to 6.3.76) are keywords of `diameter.cx_sar`:
+
+| Keyword | Sent as |
+|---|---|
+| `ims_restoration=True` | feature bit 2 (IMS-Restoration-Indication) in Supported-Features |
+| `restoration_info={...}` | SCSCF-Restoration-Info: `user_name`, `restoration_info` (list of `path`, `contact`, optional `initial_cseq_sequence_number`, `call_id`, `subscription_info`, `pcscf_subscription_info`), optional `registration_time_out` (Unix seconds), `sip_authentication_scheme` |
+| `user_data_already_available=True` | User-Data-Already-Available 1, for an update of the restoration information alone (§4.6.2) |
+| `multiple_registration=True` | Multiple-Registration-Indication |
+| `pcscf_restoration_mechanism=True` | feature bit 3 (P-CSCF-Restoration-mechanism) |
+| `pcscf_restoration_indication=True` | SAR-Flags bit 0 |
+| `failed_pcscf={"fqdn": ..., "ip_addresses": [...]}` | Failed-PCSCF |
+
+A malformed `restoration_info` or `failed_pcscf` raises `ValueError`, peer or
+no peer. The answer adds `experimental_result_code`, `scscf_restoration_info`
+(one dict per private identity, in the shape above), `associated_registered_identities`
+and `supported_features`. An HSS returning the restoration information of a
+registered user answers `DIAMETER_ERROR_IN_ASSIGNMENT_TYPE` (5007) as an
+Experimental-Result, so `result_code` is 5007 there.
+
+The restoration AVPs carry the V bit and never the M bit (TS 29.229 table
+6.3.1). `diameter.cx_lir(public_identity, user_authorization_type=2)` asks
+for the S-CSCF capabilities when the assigned S-CSCF cannot be contacted
+(TS 29.228 clause 6.1.4.1 step 2a). `registrar.restore(aor, contact, *,
+expires, path=, call_id=, cseq=, auth_user=, aliases=)` binds what came back;
+`Contact.sip_instance` and `Contact.reg_id` give a script what it needs to
+write a binding back as a Contact.
+
+```python
+answer = await diameter.cx_sar(public_identity, SCSCF_URI, 3, ims_restoration=True)
+if answer and answer["experimental_result_code"] == 5007:
+    for group in answer["scscf_restoration_info"]:
+        for entry in group["restoration_info"]:
+            registrar.restore(public_identity, entry["contact"], expires=600,
+                              path=[entry["path"]], auth_user=group["user_name"])
+```
+
+Wireshark's Diameter dictionary (4.6) lacks Registration-Time-Out (661) and
+Failed-PCSCF (664 to 666) and marks 654 and 655 M; the validation script
+checks those against the table and hand-written octets.
+
 ## GBA: Zh and Zn
 
 The Generic Bootstrapping Architecture (TS 33.220) has two Diameter reference
