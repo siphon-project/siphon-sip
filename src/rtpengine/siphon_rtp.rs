@@ -52,6 +52,7 @@ mod connection;
 mod events;
 mod identity;
 mod scope;
+mod waiters;
 use connection::connection_manager;
 #[cfg(test)]
 use events::{
@@ -59,6 +60,8 @@ use events::{
 };
 pub use identity::set_controller_id;
 pub use scope::CallScope;
+use waiters::Waiters;
+pub use waiters::{DigitRead, DigitReadEnd, DigitReadLimits};
 
 /// Read buffer chunk size for the control connection.
 const READ_CHUNK: usize = 8192;
@@ -217,6 +220,9 @@ pub struct SiphonRtpClient {
     /// Blocking `play_media` waiters keyed by the accept's `play_id`; resolved by
     /// the reader when the matching `Event::PlayFinished` arrives.
     play_pending: Arc<DashMap<u64, PlayWaiter>>,
+    /// Scripts waiting on a recording's closed file or on keyed digits;
+    /// resolved by the reader.
+    waiters: Arc<Waiters>,
     /// Write half of the live connection, swapped by the connection manager on
     /// (re)connect and cleared (`None`) while disconnected.
     writer: Arc<Mutex<Option<OwnedWriteHalf>>>,
@@ -273,6 +279,7 @@ impl SiphonRtpClient {
     ) -> Arc<Self> {
         let pending: Arc<DashMap<u64, oneshot::Sender<CmdResult>>> = Arc::new(DashMap::new());
         let play_pending: Arc<DashMap<u64, PlayWaiter>> = Arc::new(DashMap::new());
+        let waiters = Arc::new(Waiters::default());
         let writer: Arc<Mutex<Option<OwnedWriteHalf>>> = Arc::new(Mutex::new(None));
         let (connected_tx, connected_rx) = watch::channel(false);
         let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>(1);
@@ -284,6 +291,7 @@ impl SiphonRtpClient {
             timeout_ms,
             Arc::clone(&pending),
             Arc::clone(&play_pending),
+            Arc::clone(&waiters),
             Arc::clone(&writer),
             connected_tx,
             event_tx,
@@ -297,6 +305,7 @@ impl SiphonRtpClient {
             next_id: AtomicU64::new(1),
             pending,
             play_pending,
+            waiters,
             writer,
             connected: connected_rx,
             scope,

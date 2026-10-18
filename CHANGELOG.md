@@ -220,6 +220,14 @@ entry, but a working config keeps working.
   Request-URI as TS 32.299 7.2.32 says, not the To header field, which on a
   diverted call still names the forwarding user; a REGISTER keeps To.
   Behaviour change on the wire.
+- **`rtpengine`: a script records the caller and collects keyed digits.**
+  `start_recording` / `stop_recording` / `wait_recording` and the blocking
+  `record` write the decoded audio of a call the engine answered itself to a
+  WAV and return the closed file (`path`, `duration_ms`, `reason`), bounded by
+  `max_duration_ms` and `silence_ms`. `read_digits` collects RFC 4733 digits
+  until a terminator, a count or a timeout and returns `(digits, reason)`;
+  digits a read takes are not also `@rtpengine.on_dtmf` events. The waiting is
+  keyed in the media client, not in script state. siphon-rtp only.
 
 ## [1.14.0] — 2026-10-17
 

@@ -5201,6 +5201,124 @@ class MockRtpEngine:
         })
         return self._play_overlay_id
 
+    async def start_recording(self, target: Any, path: Optional[str] = None,
+                              direction: str = "ingress", channels: str = "mono",
+                              max_duration_ms: Optional[int] = None,
+                              silence_ms: Optional[int] = None) -> str:
+        """Start recording what the caller says to a 16-bit PCM WAV file.
+
+        Returns on the engine's accept with the ``recording_id``; the recording
+        runs until :meth:`stop_recording`, ``max_duration_ms``, ``silence_ms``
+        or the end of the call. Works on a call the engine answered itself
+        (``answer_local``), which is what a voicemail box is. ``direction`` is
+        ``"ingress"`` (default), ``"egress"`` or ``"both"``; ``channels``
+        ``"mono"`` or ``"stereo"``. Native **siphon-rtp** backend only.
+
+        In the mock the id is ``"rec-<n>"`` and the recording is pending until
+        the test calls :meth:`finish_recording`.
+        """
+        if direction not in ("ingress", "egress", "both"):
+            raise ValueError(f"direction {direction!r} is ingress, egress or both")
+        if channels not in ("mono", "stereo"):
+            raise ValueError(f"channels {channels!r} is mono or stereo")
+        call_id, from_tag = _resolve_media_target(target)
+        self._recording_serial = getattr(self, "_recording_serial", 0) + 1
+        recording_id = f"rec-{self._recording_serial}"
+        self.operations.append(("start_recording", recording_id))
+        self.media_calls.append({
+            "op": "start_recording", "call_id": call_id, "from_tag": from_tag,
+            "recording_id": recording_id, "path": path, "direction": direction,
+            "channels": channels, "max_duration_ms": max_duration_ms,
+            "silence_ms": silence_ms,
+        })
+        return recording_id
+
+    def finish_recording(self, recording_id: str, *, path: Optional[str] = None,
+                         duration_ms: int = 0, reason: str = "stopped") -> None:
+        """Test helper: the engine reports ``recording_id`` ended and closed."""
+        finished = getattr(self, "finished_recordings", {})
+        finished[recording_id] = {
+            "recording_id": recording_id, "path": path,
+            "duration_ms": duration_ms, "reason": reason,
+        }
+        self.finished_recordings = finished
+
+    async def wait_recording(self, target: Any, recording_id: str,
+                             timeout_ms: int = 3_600_000) -> Optional[dict]:
+        """Wait until a recording ended and its file is closed.
+
+        Returns ``{"recording_id", "path", "duration_ms", "reason"}`` (reason
+        ``"stopped"``, ``"max_duration"``, ``"silence"``, ``"call_ended"`` or
+        ``"error"``), or ``None`` when no end was reported in ``timeout_ms``.
+        In the mock: what :meth:`finish_recording` set, else ``None``.
+        """
+        return getattr(self, "finished_recordings", {}).get(recording_id)
+
+    async def record(self, target: Any, path: Optional[str] = None,
+                     direction: str = "ingress", channels: str = "mono",
+                     max_duration_ms: Optional[int] = None,
+                     silence_ms: Optional[int] = None,
+                     timeout_ms: Optional[int] = None) -> Optional[dict]:
+        """Record and wait for the closed file: :meth:`start_recording` then
+        :meth:`wait_recording`.
+
+        Example::
+
+            message = await rtpengine.record(call, path="/spool/m1.wav",
+                                             max_duration_ms=120000,
+                                             silence_ms=5000)
+        """
+        recording_id = await self.start_recording(
+            target, path=path, direction=direction, channels=channels,
+            max_duration_ms=max_duration_ms, silence_ms=silence_ms)
+        return await self.wait_recording(target, recording_id)
+
+    async def stop_recording(self, target: Any,
+                             recording_id: Optional[str] = None) -> bool:
+        """Stop one recording, or every recording on the call."""
+        call_id, from_tag = _resolve_media_target(target)
+        self.operations.append(("stop_recording", recording_id))
+        self.media_calls.append({
+            "op": "stop_recording", "call_id": call_id, "from_tag": from_tag,
+            "recording_id": recording_id,
+        })
+        return True
+
+    def key_digits(self, call_id: str, digits: str) -> None:
+        """Test helper: queue digits the caller keys on ``call_id``, read by the
+        next :meth:`read_digits` calls."""
+        keyed = getattr(self, "keyed_digits", {})
+        keyed.setdefault(call_id, []).extend(digits)
+        self.keyed_digits = keyed
+
+    async def read_digits(self, target: Any, terminators: str = "#",
+                          max_digits: Optional[int] = None,
+                          timeout_ms: int = 5000,
+                          inter_digit_timeout_ms: int = 3000) -> tuple:
+        """Collect the digits the caller keys (RFC 4733) until a terminator
+        (not included), ``max_digits``, ``timeout_ms`` with nothing keyed or
+        ``inter_digit_timeout_ms`` after the last digit.
+
+        Returns ``(digits, reason)``, reason ``"terminator"``,
+        ``"max_digits"``, ``"timeout"``, ``"inter_digit_timeout"`` or
+        ``"interrupted"``. Digits a read takes are not also
+        ``@rtpengine.on_dtmf`` events. In the mock the digits come from
+        :meth:`key_digits`.
+        """
+        if max_digits == 0:
+            raise ValueError("max_digits is at least 1 when given")
+        call_id, _ = _resolve_media_target(target)
+        queue = getattr(self, "keyed_digits", {}).get(call_id, [])
+        digits = ""
+        while queue:
+            digit = queue.pop(0)
+            if digit in terminators:
+                return digits, "terminator"
+            digits += digit
+            if max_digits is not None and len(digits) >= max_digits:
+                return digits, "max_digits"
+        return digits, "inter_digit_timeout" if digits else "timeout"
+
     async def stop_media(self, target: Any, play_id: Optional[int] = None) -> bool:
         """Stop prompt playback on the selected monologue.
 

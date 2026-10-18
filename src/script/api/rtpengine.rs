@@ -28,6 +28,7 @@ use super::reply::PyReply;
 use super::request::PyRequest;
 
 mod answer;
+mod capture;
 mod conference;
 mod decorators;
 mod message;
@@ -1431,6 +1432,174 @@ impl PyRtpEngine {
             debug!(call_id = %call_id, play_id = ?play_id, "rtpengine stop_media");
             Ok(true)
         })
+    }
+
+    /// Start recording what the caller says to a file, returning the engine's
+    /// ``recording_id``. Returns on the engine's accept; the recording runs
+    /// until :meth:`stop_recording`, ``max_duration_ms``, ``silence_ms`` or
+    /// the end of the call. :meth:`wait_recording` waits for its end.
+    ///
+    /// The engine decodes the audio and writes a 16-bit PCM WAV. It works on a
+    /// call the engine answered itself (``answer_local``), which is what a
+    /// voicemail box is. ``path`` names the file (its directory must exist);
+    /// without one the engine picks a name in its recording directory.
+    /// ``direction`` is ``"ingress"`` (what the caller sent, the default),
+    /// ``"egress"`` (what the engine played) or ``"both"``. Native
+    /// **siphon-rtp** backend only.
+    #[pyo3(signature = (target, path=None, direction="ingress", channels="mono", max_duration_ms=None, silence_ms=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn start_recording<'py>(
+        &self,
+        python: Python<'py>,
+        target: &Bound<'py, PyAny>,
+        path: Option<String>,
+        direction: &str,
+        channels: &str,
+        max_duration_ms: Option<u64>,
+        silence_ms: Option<u64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let options = capture::RecordingOptions::parse(
+            path,
+            direction,
+            channels,
+            max_duration_ms,
+            silence_ms,
+        )?;
+        let (call_id, from_tag) = resolve_call_from_tag(target)?;
+        let client = Arc::clone(&self.client);
+        pyo3_async_runtimes::tokio::future_into_py(python, async move {
+            capture::start(&client, &call_id, &from_tag, &options, "start_recording").await
+        })
+    }
+
+    /// Record what the caller says and wait until the file is closed: a dict
+    /// with ``recording_id``, ``path``, ``duration_ms`` and ``reason``
+    /// (``"stopped"``, ``"max_duration"``, ``"silence"``, ``"call_ended"`` or
+    /// ``"error"``), or ``None`` when no end was reported within
+    /// ``timeout_ms`` (default: ``max_duration_ms`` plus ten seconds, or an
+    /// hour). Options as for :meth:`start_recording`. A coroutine running
+    /// beside it (a :meth:`read_digits` for "press # to finish") ends it early
+    /// with :meth:`stop_recording`.
+    ///
+    /// ```python,ignore
+    /// message = await rtpengine.record(call, path=f"/spool/{call.call_id}.wav",
+    ///                                  max_duration_ms=120000, silence_ms=5000)
+    /// if message and message["duration_ms"] > 0:
+    ///     keep(message["path"])
+    /// ```
+    #[pyo3(signature = (target, path=None, direction="ingress", channels="mono", max_duration_ms=None, silence_ms=None, timeout_ms=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn record<'py>(
+        &self,
+        python: Python<'py>,
+        target: &Bound<'py, PyAny>,
+        path: Option<String>,
+        direction: &str,
+        channels: &str,
+        max_duration_ms: Option<u64>,
+        silence_ms: Option<u64>,
+        timeout_ms: Option<u64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let options = capture::RecordingOptions::parse(
+            path,
+            direction,
+            channels,
+            max_duration_ms,
+            silence_ms,
+        )?;
+        let wait_ms = timeout_ms.unwrap_or_else(|| options.default_wait_ms());
+        let (call_id, from_tag) = resolve_call_from_tag(target)?;
+        let client = Arc::clone(&self.client);
+        pyo3_async_runtimes::tokio::future_into_py(python, async move {
+            let recording_id =
+                capture::start(&client, &call_id, &from_tag, &options, "record").await?;
+            capture::wait(&client, &call_id, &recording_id, wait_ms, "record").await
+        })
+    }
+
+    /// Wait until a recording :meth:`start_recording` started has ended and
+    /// its file is closed: the same dict as :meth:`record`, or ``None`` after
+    /// ``timeout_ms``.
+    #[pyo3(signature = (target, recording_id, timeout_ms=3_600_000))]
+    fn wait_recording<'py>(
+        &self,
+        python: Python<'py>,
+        target: &Bound<'py, PyAny>,
+        recording_id: String,
+        timeout_ms: u64,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let (call_id, _from_tag) = resolve_call_from_tag(target)?;
+        let client = Arc::clone(&self.client);
+        pyo3_async_runtimes::tokio::future_into_py(python, async move {
+            capture::wait(
+                &client,
+                &call_id,
+                &recording_id,
+                timeout_ms,
+                "wait_recording",
+            )
+            .await
+        })
+    }
+
+    /// Stop a recording: the one ``recording_id`` names, or every recording on
+    /// the call. Returns on the engine's accept; the file is closed when
+    /// :meth:`record` / :meth:`wait_recording` return.
+    #[pyo3(signature = (target, recording_id=None))]
+    fn stop_recording<'py>(
+        &self,
+        python: Python<'py>,
+        target: &Bound<'py, PyAny>,
+        recording_id: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let (call_id, from_tag) = resolve_call_from_tag(target)?;
+        let client = Arc::clone(&self.client);
+        pyo3_async_runtimes::tokio::future_into_py(python, async move {
+            client
+                .stop_recording(&call_id, &from_tag, recording_id.as_deref())
+                .await
+                .map_err(|error| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "rtpengine.stop_recording failed: {error}"
+                    ))
+                })?;
+            Ok(true)
+        })
+    }
+
+    /// Collect the digits the caller keys (RFC 4733 telephone-events, as the
+    /// engine detects them) until the first of: a digit of ``terminators``
+    /// (not included), ``max_digits`` digits, ``timeout_ms`` with nothing
+    /// keyed, ``inter_digit_timeout_ms`` after the last digit. Returns
+    /// ``(digits, reason)``, reason one of ``"terminator"``,
+    /// ``"max_digits"``, ``"timeout"``, ``"inter_digit_timeout"``,
+    /// ``"interrupted"`` (another read on the call, or the engine connection
+    /// went away). While a read is active its digits are not also
+    /// ``@rtpengine.on_dtmf`` events. Run it beside a ``play_media(...,
+    /// wait=False)`` and stop the prompt on the first digit for barge-in.
+    ///
+    /// ```python,ignore
+    /// pin, reason = await rtpengine.read_digits(call, terminators="#",
+    ///                                           timeout_ms=10000)
+    /// ```
+    #[pyo3(signature = (target, terminators="#".to_string(), max_digits=None, timeout_ms=5000, inter_digit_timeout_ms=3000))]
+    fn read_digits<'py>(
+        &self,
+        python: Python<'py>,
+        target: &Bound<'py, PyAny>,
+        terminators: String,
+        max_digits: Option<usize>,
+        timeout_ms: u64,
+        inter_digit_timeout_ms: u64,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let limits =
+            capture::digit_limits(terminators, max_digits, timeout_ms, inter_digit_timeout_ms)?;
+        let (call_id, _from_tag) = resolve_call_from_tag(target)?;
+        let client = Arc::clone(&self.client);
+        pyo3_async_runtimes::tokio::future_into_py(
+            python,
+            capture::read_digits(client, call_id, limits),
+        )
     }
 
     /// Retune the playout gain of a playback that is already running — how a
