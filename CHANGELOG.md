@@ -115,10 +115,20 @@ entry, but a working config keeps working.
   `associated_registered_identities` and `supported_features`.
   `diameter.cx_lir` takes `user_authorization_type`. `registrar.restore()`
   rebuilds a binding from what the HSS returned, and `Contact.sip_instance` /
-  `Contact.reg_id` expose the RFC 5626 parameters. The restoration AVPs
+  `Contact.reg_id` expose the RFC 5626 parameters, and `presence.subscribe_dialog`
+  takes `local_cseq` for a dialog rebuilt from the restoration information. The restoration AVPs
   (639-649, 654, 655, 660, 661, 664-666) are in the dictionary with the M bit
   clear, as table 6.3.1 has them. Checked against a hand-written vector and
   Wireshark's dissector (`scripts/validate_diameter_cx_requests.sh`).
+
+### Fixed
+
+- **The M bit of grouped AVPs a script builds, and of Supported-Features.**
+  A grouped AVP from `set_avp(..., [...])` always carried the M bit, so an
+  answer's SCSCF-Restoration-Info or Associated-Registered-Identities did
+  against TS 29.229 table 6.3.1; it now follows the dictionary.
+  Supported-Features in an answer never has the M bit, and Feature-List-ID /
+  Feature-List never do (§7.2.1). A SAR built with restoration members sets it.
 
 ## [1.14.0] — 2026-10-17
 

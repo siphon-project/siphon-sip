@@ -2088,6 +2088,8 @@ pub fn avp_is_mandatory(code: u32, vendor_id: u32) -> bool {
         VENDOR_3GPP => !matches!(
             code,
             avp::GUSS_TIMESTAMP
+                | avp::FEATURE_LIST_ID
+                | avp::FEATURE_LIST
                 | avp::SCSCF_RESTORATION_INFO..=avp::RESTORATION_INFO
                 | avp::INITIAL_CSEQ_SEQUENCE_NUMBER
                 | avp::SAR_FLAGS

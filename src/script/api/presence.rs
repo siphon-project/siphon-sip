@@ -153,6 +153,12 @@ impl PyPresence {
     ///     remote_uri: The SUBSCRIBE's **From URI** — the dialog's remote URI,
     ///         required in the ``To``.  Pass ``str(request.from_uri)``.
     ///
+    ///     local_cseq: The CSeq number the dialog's last NOTIFY had; the next
+    ///         one carries one more.  ``0`` (the default) for a new dialog.
+    ///         A dialog rebuilt from stored state (IMS restoration, TS 23.380
+    ///         §4.6.3, which keeps no CSeq) starts high enough for the
+    ///         subscriber to accept its next NOTIFY (RFC 3261 §12.2.2).
+    ///
     /// Both URI arguments default to ``resource`` when omitted, which is
     /// correct for any package where the subscriber watches an AoR directly
     /// (the reg event package, TS 24.341 §5.3.2.4).  Supply them explicitly for
@@ -161,7 +167,7 @@ impl PyPresence {
     ///
     /// Returns:
     ///     Subscription ID string.
-    #[pyo3(signature = (subscriber, resource, event, expires, call_id, from_tag, to_tag, route_set=None, local_uri=None, remote_uri=None))]
+    #[pyo3(signature = (subscriber, resource, event, expires, call_id, from_tag, to_tag, route_set=None, local_uri=None, remote_uri=None, local_cseq=0))]
     #[allow(clippy::too_many_arguments)]
     fn subscribe_dialog(
         &self,
@@ -175,12 +181,13 @@ impl PyPresence {
         route_set: Option<Vec<String>>,
         local_uri: Option<String>,
         remote_uri: Option<String>,
+        local_cseq: u32,
     ) -> PyResult<String> {
         // Each NOTIFY carries these as its `Route`, which takes `name-addr`
         // values (RFC 3261 §20.34): one per entry, whatever form it came in.
         let route_set = super::route_entries::route_set_from(&route_set.unwrap_or_default())?;
         let subscription_id = format!("sub-{}", uuid::Uuid::new_v4());
-        let subscription = Subscription::with_dialog(
+        let mut subscription = Subscription::with_dialog(
             subscription_id.clone(),
             subscriber.to_string(),
             resource.to_string(),
@@ -194,6 +201,7 @@ impl PyPresence {
             local_uri.map(|uri| strip_nameaddr(&uri)),
             remote_uri.map(|uri| strip_nameaddr(&uri)),
         );
+        subscription.local_cseq = local_cseq;
         self.store.add_subscription(subscription);
         Ok(subscription_id)
     }
@@ -726,6 +734,7 @@ mod tests {
                 None,
                 Some(format!("<{aor}>")),
                 Some(format!("<{aor}>;tag=ftag-ue")),
+                0,
             )
             .expect("a subscription");
 
@@ -742,6 +751,31 @@ mod tests {
         assert!(!dialog.local_uri.contains('<'));
     }
 
+    /// A dialog rebuilt from stored state (IMS restoration keeps no CSeq)
+    /// continues from the CSeq it is given: the next NOTIFY carries one more.
+    #[test]
+    fn a_rebuilt_dialog_notifies_above_the_cseq_it_is_given() {
+        let store = make_store();
+        let presence = PyPresence::new(Arc::clone(&store));
+        let sub_id = presence
+            .subscribe_dialog(
+                "sip:uuid@192.0.2.7:43080",
+                "sip:001010000000001@ims.example.com",
+                "reg",
+                600,
+                "call-restored",
+                "ftag",
+                "notif",
+                None,
+                None,
+                None,
+                1_792_310_400,
+            )
+            .expect("a subscription");
+        let dialog = store.prepare_notify(&sub_id).expect("dialog state");
+        assert_eq!(dialog.cseq, 1_792_310_401);
+    }
+
     /// A subscription created before the dialog URIs were captured must not
     /// fall back to the Contact — the resource AoR is the notifier's URI for
     /// every package where the subscriber watches an AoR directly.
@@ -754,7 +788,7 @@ mod tests {
         let aor = "sip:001010000000001@ims.example.com";
         let sub_id = presence
             .subscribe_dialog(
-                contact, aor, "reg", 7200, "call-2", "ftag", "notif", None, None, None,
+                contact, aor, "reg", 7200, "call-2", "ftag", "notif", None, None, None, 0,
             )
             .expect("a subscription");
 
@@ -785,6 +819,7 @@ mod tests {
                 None,
                 Some("<sip:alice@example.com>".to_string()),
                 Some("<sip:bob@example.com>".to_string()),
+                0,
             )
             .expect("a subscription");
 
@@ -813,6 +848,7 @@ mod tests {
                 Some(route_set.into_iter().map(str::to_string).collect()),
                 None,
                 None,
+                0,
             )
         };
 
@@ -860,6 +896,7 @@ mod tests {
                 None,
                 None,
                 None,
+                0,
             )
             .expect("a subscription");
 

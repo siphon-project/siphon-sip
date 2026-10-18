@@ -817,7 +817,10 @@ pub const FEATURE_SIFC: u32 = 1 << 0;
 /// Vendor-Id 3GPP, Feature-List-ID, Feature-List. TS 29.229 Table 6.3.1 has
 /// the V bit on all three and the M bit off on Feature-List-ID and
 /// Feature-List; it is left off the group too, where it may be set.
-fn supported_features_avp(feature_list: u32) -> Vec<u8> {
+/// Supported-Features with Feature-List-ID 1. TS 29.229 §7.2.1: the M bit is
+/// set in a request the features were used to construct (`mandatory`), and
+/// never in an answer.
+fn supported_features_avp(feature_list: u32, mandatory: bool) -> Vec<u8> {
     let mut children = Vec::new();
     children.extend_from_slice(&encode_avp_u32(avp::VENDOR_ID, dictionary::VENDOR_3GPP));
     children.extend_from_slice(&encode_avp_vendor(
@@ -834,7 +837,7 @@ fn supported_features_avp(feature_list: u32) -> Vec<u8> {
     ));
     encode_avp_vendor(
         avp::SUPPORTED_FEATURES,
-        0,
+        if mandatory { AVP_FLAG_MANDATORY } else { 0 },
         dictionary::VENDOR_3GPP,
         &children,
     )
@@ -1007,7 +1010,18 @@ pub fn build_sar(
     ));
     if request.supported_features != 0 {
         // TS 29.229 §6.1.3: `*[ Supported-Features ]`.
-        payload.extend_from_slice(&supported_features_avp(request.supported_features));
+        // The restoration members are built with the IMS restoration and
+        // P-CSCF restoration features; without them the request uses none
+        // (SiFC only shapes the answer) and the M bit is the option §7.2.1
+        // leaves.
+        let uses_features = request.restoration.is_some()
+            || request.multiple_registration_indication.is_some()
+            || request.sar_flags.is_some()
+            || request.failed_pcscf.is_some();
+        payload.extend_from_slice(&supported_features_avp(
+            request.supported_features,
+            uses_features,
+        ));
     }
     // TS 29.229 §6.1.3, in the order of the command:
     // `[ SCSCF-Restoration-Info ] [ Multiple-Registration-Indication ]
@@ -1978,6 +1992,20 @@ mod tests {
         assert!(at(avp::SAR_FLAGS) < at(avp::FAILED_PCSCF));
     }
 
+    /// TS 29.229 §7.2.1: a request that a feature was used to construct
+    /// carries Supported-Features with the M bit, so an HSS without the
+    /// feature answers DIAMETER_ERROR_FEATURE_UNSUPPORTED rather than
+    /// dropping the restoration information.
+    #[test]
+    fn sar_with_restoration_marks_supported_features_mandatory() {
+        let restoration = sample_restoration();
+        let message = restoration_sar(&sar_with(Some(&restoration), None));
+        let features = message
+            .find(avp::SUPPORTED_FEATURES, dictionary::VENDOR_3GPP)
+            .unwrap();
+        assert_eq!(features.flags, AVP_FLAG_VENDOR | AVP_FLAG_MANDATORY);
+    }
+
     #[test]
     fn sar_without_restoration_sends_none_of_it() {
         let message = restoration_sar(&ServerAssignment {
@@ -2049,7 +2077,7 @@ mod tests {
             avp::ASSOCIATED_REGISTERED_IDENTITIES,
             &associated,
         ));
-        extra.extend(supported_features_avp(FEATURE_IMS_RESTORATION));
+        extra.extend(supported_features_avp(FEATURE_IMS_RESTORATION, false));
         // DIAMETER_ERROR_IN_ASSIGNMENT_TYPE: the answer to UNREGISTERED_USER
         // for a registered identity with restoration information (TS 29.228
         // §6.1.2.1, TS 23.380 §4.3.2).

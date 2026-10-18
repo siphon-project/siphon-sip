@@ -1465,7 +1465,7 @@
       "subscribe_dialog": {
         "doc": "Create a subscription with full dialog state from a SUBSCRIBE request.",
         "kind": "method_descriptor",
-        "sig": "($self, subscriber, resource, event, expires, call_id, from_tag, to_tag, route_set=None, local_uri=None, remote_uri=None)"
+        "sig": "($self, subscriber, resource, event, expires, call_id, from_tag, to_tag, route_set=None, local_uri=None, remote_uri=None, local_cseq=0)"
       },
       "subscribers": {
         "doc": "List subscribers (watchers) for a resource.",

@@ -268,6 +268,22 @@ done
 if [[ $flags_ok -eq 1 ]]; then
   echo "  ok   every restoration AVP is V without M, as table 6.3.1 has it"
 fi
+# TS 29.229 §7.2.1: Supported-Features has the M bit in a request the
+# features were used to construct and never in an answer; its members have
+# none (table 6.3.1).
+for check in "13 0xc0, Vendor-Specific: Set, Mandatory: Set" "14 0x80, Vendor-Specific: Set"; do
+  frame="${check%% *}"
+  want="AVP Flags: ${check#* }"
+  got="$(tshark -r "$PCAP" -Y "frame.number == $frame" -V -O diameter 2>/dev/null |
+    awk '/AVP Code: 628 Supported-Features/ { pending = 1; next }
+      pending && /AVP Flags:/ { pending = 0; sub(/^ +/, ""); print; exit }')"
+  if [[ "$got" == "$want" ]]; then
+    echo "  ok   frame $frame Supported-Features $got"
+  else
+    echo "  FAIL frame $frame Supported-Features '$got', want '$want'" >&2
+    status=1
+  fi
+done
 unknown_note=", if you know what this is you can add it to dictionary.xml"
 other_expert="$(tshark -r "$PCAP" -Y 'frame.number >= 13 && (_ws.malformed || _ws.expert)' \
   -T fields -e _ws.expert.message 2>/dev/null |

@@ -357,7 +357,13 @@ fn build_avp(code: u32, vendor: u32, value: &Bound<'_, PyAny>) -> PyResult<Avp> 
         for item in list.iter() {
             children.push(build_child_spec(&item)?);
         }
-        let mut flags = crate::diameter::codec::AVP_FLAG_MANDATORY;
+        // The dictionary decides the M bit of a group as of any other AVP:
+        // the restoration groups of TS 29.229 table 6.3.1 never carry it.
+        let mut flags = if dictionary::avp_is_mandatory(code, vendor) {
+            crate::diameter::codec::AVP_FLAG_MANDATORY
+        } else {
+            0
+        };
         if vendor != 0 {
             flags |= crate::diameter::codec::AVP_FLAG_VENDOR;
         }
@@ -559,7 +565,12 @@ impl PyDiameterAnswer {
     ) -> PyResult<()> {
         let (code, name_vendor) = resolve_code(code_or_name)?;
         let vendor = if vendor != 0 { vendor } else { name_vendor };
-        let avp = build_avp(code, vendor, value)?;
+        let mut avp = build_avp(code, vendor, value)?;
+        // TS 29.229 §7.2.1: Supported-Features "within an answer application
+        // message ... shall never have the 'M' bit set" (in a request it has).
+        if code == dictionary::avp::SUPPORTED_FEATURES && vendor == dictionary::VENDOR_3GPP {
+            avp.flags &= !crate::diameter::codec::AVP_FLAG_MANDATORY;
+        }
         self.take_copied(code, vendor)?;
         let mut msg = self.lock_mut()?;
         msg.remove(code, vendor);
@@ -1471,6 +1482,89 @@ mod tests {
             answer.set_avp(&name, &value, 0).unwrap();
             let message = answer.msg.lock().unwrap();
             assert_eq!(message.find(410, 10415).expect("GBA-Type").flags, 0xc0);
+        });
+    }
+
+    /// TS 29.229 §7.2.1: "within an answer application message the AVP shall
+    /// never have the 'M' bit set", and table 6.3.1 has Feature-List-ID and
+    /// Feature-List, and the restoration groups, without it. A grouped AVP a
+    /// script builds follows the dictionary like any other.
+    #[test]
+    fn supported_features_and_restoration_groups_in_an_answer_carry_no_m_bit() {
+        pyo3::Python::initialize();
+        Python::attach(|py| {
+            let answer = py_request().answer(2001, None).unwrap();
+            let features = PyList::new(
+                py,
+                [
+                    PyTuple::new(
+                        py,
+                        [
+                            266u32.into_pyobject(py).unwrap().into_any(),
+                            10415u32.into_pyobject(py).unwrap().into_any(),
+                        ],
+                    )
+                    .unwrap(),
+                    PyTuple::new(
+                        py,
+                        [
+                            629u32.into_pyobject(py).unwrap().into_any(),
+                            1u32.into_pyobject(py).unwrap().into_any(),
+                            10415u32.into_pyobject(py).unwrap().into_any(),
+                        ],
+                    )
+                    .unwrap(),
+                    PyTuple::new(
+                        py,
+                        [
+                            630u32.into_pyobject(py).unwrap().into_any(),
+                            5u32.into_pyobject(py).unwrap().into_any(),
+                            10415u32.into_pyobject(py).unwrap().into_any(),
+                        ],
+                    )
+                    .unwrap(),
+                ],
+            )
+            .unwrap();
+            let name = "Supported-Features".into_pyobject(py).unwrap().into_any();
+            answer.set_avp(&name, features.as_any(), 10415).unwrap();
+            let group = PyList::new(
+                py,
+                [PyTuple::new(
+                    py,
+                    [
+                        1u32.into_pyobject(py).unwrap().into_any(),
+                        "alice@example.com".into_pyobject(py).unwrap().into_any(),
+                    ],
+                )
+                .unwrap()],
+            )
+            .unwrap();
+            answer
+                .set_avp(
+                    &647u32.into_pyobject(py).unwrap().into_any(),
+                    group.as_any(),
+                    10415,
+                )
+                .unwrap();
+
+            let msg = DiameterMsg::from_wire(&answer.to_wire().unwrap()).unwrap();
+            let supported = msg.find(628, 10415).expect("Supported-Features");
+            assert_eq!(supported.flags, 0x80, "V, never M in an answer");
+            let members = match &supported.value {
+                AvpData::Grouped(children) => children.clone(),
+                AvpData::Raw(bytes) => crate::diameter::codec::parse_avps(bytes).unwrap(),
+            };
+            for member in &members {
+                let want = if member.code == 266 { 0x40 } else { 0x80 };
+                assert_eq!(member.flags, want, "member {}", member.code);
+            }
+            assert_eq!(
+                msg.find(647, 10415)
+                    .expect("Associated-Registered-Identities")
+                    .flags,
+                0x80
+            );
         });
     }
 

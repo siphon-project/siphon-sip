@@ -9890,7 +9890,8 @@ class MockPresence:
                          call_id: str = "", from_tag: str = "",
                          to_tag: str = "", route_set: Optional[list] = None,
                          local_uri: Optional[str] = None,
-                         remote_uri: Optional[str] = None) -> str:
+                         remote_uri: Optional[str] = None,
+                         local_cseq: int = 0) -> str:
         """Create a subscription with dialog state for in-dialog NOTIFY.
 
         Args:
@@ -9913,6 +9914,10 @@ class MockPresence:
                 in-dialog NOTIFY.  Pass ``str(request.to_uri)``.
             remote_uri: The SUBSCRIBE's **From URI** — the dialog's remote
                 URI, required in the ``To``.  Pass ``str(request.from_uri)``.
+            local_cseq: The CSeq number of the dialog's last NOTIFY; the next
+                carries one more. ``0`` for a new dialog; a dialog rebuilt
+                from stored state (IMS restoration) starts high enough for the
+                subscriber to accept it. Kept as ``local_cseq`` in the record.
 
         Both URI arguments default to ``resource``, which is correct for any
         package where the subscriber watches an AoR directly (the reg event
@@ -9935,6 +9940,7 @@ class MockPresence:
             "route_set": route_set,
             "local_uri": _strip_nameaddr(local_uri) if local_uri else resource,
             "remote_uri": _strip_nameaddr(remote_uri) if remote_uri else resource,
+            "local_cseq": local_cseq,
         }
         return sub_id
 
