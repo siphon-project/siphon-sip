@@ -340,6 +340,75 @@ impl PyB2buaControl {
         }
     }
 
+    /// Send an INFO (RFC 6086) in the caller's dialog of a call (on a call
+    /// siphon answered itself, its only dialog) with `body` (str or bytes)
+    /// of `content_type`, and any extra `headers` (a dict; the headers that
+    /// place a request in its dialog are siphon's and refused). The CSeq is
+    /// the dialog's, the request goes to the remote target through the route
+    /// set, and on UDP it is retransmitted until answered.
+    ///
+    /// Awaitable: resolves to the final status code (an int), or `None` when
+    /// none arrives within `timeout_ms`. Raises `ValueError` when the call is
+    /// unknown (`not_found`), a header may not be set (`bad_request`), or the
+    /// call has no dialog yet (`invalid_state`).
+    ///
+    /// ```python
+    /// status = await b2bua.send_info(call.call_id, body, "application/example+xml")
+    /// ```
+    #[pyo3(signature = (call_id, body=None, content_type=None, headers=None, timeout_ms=5000))]
+    fn send_info<'py>(
+        &self,
+        python: Python<'py>,
+        call_id: &str,
+        body: Option<&Bound<'py, PyAny>>,
+        content_type: Option<&str>,
+        headers: Option<&Bound<'py, pyo3::types::PyDict>>,
+        timeout_ms: u64,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        use pyo3::exceptions::PyValueError;
+        let body: Vec<u8> = match body {
+            None => Vec::new(),
+            Some(value) => {
+                if let Ok(text) = value.extract::<String>() {
+                    text.into_bytes()
+                } else {
+                    value.extract::<Vec<u8>>().map_err(|_| {
+                        PyValueError::new_err("b2bua.send_info(body=…) takes str or bytes")
+                    })?
+                }
+            }
+        };
+        if content_type
+            .is_some_and(|value| value.bytes().any(|byte| matches!(byte, b'\r' | b'\n' | 0)))
+        {
+            return Err(PyValueError::new_err(
+                "b2bua.send_info(content_type=…) contains a line break or NUL",
+            ));
+        }
+        let mut extra = Vec::new();
+        if let Some(headers) = headers {
+            for (name, value) in headers.iter() {
+                extra.push((name.extract::<String>()?, value.extract::<String>()?));
+            }
+        }
+        let sent = crate::dispatcher::b2bua_send_info(call_id, content_type, body, &extra)
+            .map_err(|refusal| PyValueError::new_err(format!("b2bua.send_info(): {refusal}")))?;
+        pyo3_async_runtimes::tokio::future_into_py(python, async move {
+            let waited =
+                tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), sent.response)
+                    .await;
+            Ok(match waited {
+                Ok(Ok((status, _reason))) => Some(status),
+                // Timed out, or the wait was dropped with the dispatcher: a
+                // late response is then absorbed as one to no request.
+                _ => {
+                    crate::dispatcher::forget_sent_info(&sent.branch);
+                    None
+                }
+            })
+        })
+    }
+
     #[pyo3(signature = (call_id, target, replaces=None))]
     fn refer(
         &self,

@@ -44,6 +44,12 @@ pub(super) fn handle_response(
     // through to the paths that absorb it.
     release_deferred_referrer_bye(&message, status_code, state);
 
+    // A response to an INFO a script sent with `b2bua.send_info()`: siphon's
+    // own request on the dialog, which belongs to no leg's branch.
+    if take_sent_info_response(&message, status_code) {
+        return;
+    }
+
     // Check if this response matches a UAC request (keepalive, health probe)
     if state.uac_sender.match_response(&message) {
         debug!(status_code = status_code, "UAC response matched");

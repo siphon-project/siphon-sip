@@ -78,6 +78,10 @@ pub enum HandlerKind {
     B2buaBye,
     /// `@b2bua.on_refer` — call transfer (RFC 3515).
     B2buaRefer,
+    /// `@b2bua.on_info`: an in-dialog INFO (RFC 6086) on a call siphon is
+    /// the far party of (one leg): the handler may answer it with a status and
+    /// a body.
+    B2buaInfo,
     /// `@b2bua.on_reoffer` — an in-dialog offer (re-INVITE / UPDATE) on a
     /// bridged call, before it is relayed: the handler may let it through,
     /// refuse it, or answer it itself.
@@ -1012,6 +1016,7 @@ fn extract_handlers(_python: Python<'_>, registry: &Bound<'_, PyAny>) -> Result<
             "b2bua.on_failure" => HandlerKind::B2buaFailure,
             "b2bua.on_bye" => HandlerKind::B2buaBye,
             "b2bua.on_refer" => HandlerKind::B2buaRefer,
+            "b2bua.on_info" => HandlerKind::B2buaInfo,
             "b2bua.on_reoffer" => HandlerKind::B2buaReoffer,
             "b2bua.on_reoffer_answered" => HandlerKind::B2buaReofferAnswered,
             "b2bua.on_route_failure" => HandlerKind::B2buaRouteFailure,

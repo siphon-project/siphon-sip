@@ -1145,11 +1145,16 @@ class MockB2bua:
         # and not reported yet, and the b2bua.complete_refer(...) reports.
         self.open_script_refers: set[str] = set()
         self.refer_reports: list[dict] = []
+        # Records b2bua.send_info(...) calls, and the status they resolve to.
+        self.sent_infos: list[dict] = []
+        self.info_status: Optional[int] = 200
 
     def clear(self) -> None:
         """Reset recorded imperative calls (called by ``reset()``)."""
         self.open_script_refers.clear()
         self.refer_reports.clear()
+        self.sent_infos.clear()
+        self.info_status = 200
         self.terminates.clear()
         self.refers.clear()
         self.originates.clear()
@@ -1598,6 +1603,49 @@ class MockB2bua:
         self.refer_reports.append({"call_id": call_id, "code": code, "reason": reason})
         return True
 
+    async def send_info(self, call_id: str,
+                        body: Optional[Union[str, bytes]] = None,
+                        content_type: Optional[str] = None,
+                        headers: Optional[dict] = None,
+                        timeout_ms: int = 5000) -> Optional[int]:
+        """Send an INFO (RFC 6086) in the caller's dialog of a call (on a call
+        siphon answered itself, its only dialog). The CSeq is the dialog's,
+        the request goes to the remote target through the route set, and on
+        UDP it is retransmitted until answered.
+
+        Args:
+            call_id: the SIP Call-ID of the call.
+            body: str or bytes.
+            content_type: the body's Content-Type.
+            headers: extra headers; the ones that place a request in its
+                dialog (Call-ID, CSeq, From, To, Via, Route, Contact, ...)
+                are siphon's and refused.
+            timeout_ms: how long to wait for the final response.
+
+        Returns:
+            int | None: the final status code, or None when none arrived in
+            ``timeout_ms``.
+
+        Raises:
+            ValueError: the call is unknown (``not_found``), a header may not
+                be set (``bad_request``), or the call has no dialog yet
+                (``invalid_state``).
+
+        In the mock, records ``{"call_id", "body", "content_type",
+        "headers"}`` on ``sent_infos`` and returns ``info_status`` (200).
+
+        Usage::
+
+            status = await b2bua.send_info(call.call_id, body,
+                                           "application/example+xml")
+        """
+        if isinstance(body, str):
+            body = body.encode()
+        self.sent_infos.append({"call_id": call_id, "body": body or b"",
+                                "content_type": content_type,
+                                "headers": dict(headers or {})})
+        return self.info_status
+
     def terminate(self, call_id: str, reason: str = "Normal Clearing") -> bool:
         """Imperatively end a B2BUA call by its SIP Call-ID.
 
@@ -1895,6 +1943,34 @@ class MockB2bua:
         """
         is_async = asyncio.iscoroutinefunction(fn)
         _registry.register("b2bua.on_reoffer_answered", None, fn, is_async)
+        return fn
+
+    @staticmethod
+    def on_info(fn: Callable) -> Callable:
+        """Register handler for an in-dialog INFO (RFC 6086) on a call siphon
+        answered itself (no far leg).
+
+        Handler signature: ``(call, request) -> None``.
+
+        Read ``request.body`` and ``request.content_type``; answer with
+        ``request.set_reply_body(body, content_type)`` (optional) and
+        ``request.reply(code, reason)``, a final status. Without a handler,
+        or when it answers nothing, siphon answers a bare ``200 OK``. A
+        retransmission gets the same response without running the handler
+        again. An INFO on a call with a far leg is relayed, not shown here.
+
+        Example::
+
+            @b2bua.on_info
+            async def info(call, request):
+                if request.content_type == "application/example+xml":
+                    request.set_reply_body(b"<ok/>", "application/example+xml")
+                    request.reply(200, "OK")
+                else:
+                    request.reply(415, "Unsupported Media Type")
+        """
+        is_async = asyncio.iscoroutinefunction(fn)
+        _registry.register("b2bua.on_info", None, fn, is_async)
         return fn
 
     @staticmethod
