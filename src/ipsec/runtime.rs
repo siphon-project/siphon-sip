@@ -100,21 +100,42 @@ static IPSEC_CONFIG_REF: OnceLock<Arc<IpsecConfig>> = OnceLock::new();
 /// ([`IpsecManager::record_security_server`]), so a later `Security-Verify` is
 /// checked against exactly that value. Nothing happens without IPsec or without
 /// a `Security-Server`.
+///
+/// `protected_by_port_c` is the UE client port of the pair the REGISTER arrived
+/// over, when it arrived protected: the re-registration keeps that pair until
+/// its pending transactions are done (TS 33.203 clause 7.4.2a,
+/// [`IpsecManager::supersede_pairs_for_ue`]).
 pub fn record_security_server(
     ue_addr: &std::net::IpAddr,
     response: &crate::sip::message::SipMessage,
+    protected_by_port_c: Option<u16>,
 ) {
     let Some(manager) = IPSEC_MANAGER_REF.get() else {
         return;
     };
+    record_security_server_with(manager, ue_addr, response, protected_by_port_c);
+}
+
+/// [`record_security_server`] against `manager`.
+pub fn record_security_server_with(
+    manager: &IpsecManager,
+    ue_addr: &std::net::IpAddr,
+    response: &crate::sip::message::SipMessage,
+    protected_by_port_c: Option<u16>,
+) {
     let Some(lines) = response.headers.get_all("Security-Server") else {
         return;
     };
-    if !manager.record_security_server(ue_addr, &lines.join(", ")) {
+    let recorded = manager.record_security_server_on(ue_addr, &lines.join(", "));
+    if recorded.is_empty() {
         tracing::debug!(
             ue = %ue_addr,
             "IPsec: the Security-Server on a relayed REGISTER 401 names no SA pair of that UE"
         );
+        return;
+    }
+    if let Some(port_c) = protected_by_port_c {
+        manager.record_predecessor(ue_addr, port_c, &recorded);
     }
 }
 

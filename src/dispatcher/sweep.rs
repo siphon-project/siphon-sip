@@ -187,6 +187,11 @@ pub(super) async fn sweep_stale_entries(state: &DispatcherState) {
     let (expired_ipsec_sas, ipsec_sa_pairs) = match crate::ipsec::global_manager() {
         Some(manager) => {
             let reaped = manager.sweep_expired_reaped().await;
+            // A pair whose registration ended without a de-REGISTER through
+            // here — the script removed the binding on a reg-event NOTIFY, or
+            // it just expired above — is shortened to what lets the NOTIFY to
+            // the UE through, then deleted (TS 24.229 clause 5.2.5.2).
+            manager.reconcile_registrations(state.transaction_manager.timers().timer_j_udp());
             // Registrar-liveness Part B.4: an abandoned UE's SA pair just
             // aged out of the kernel — its SIP registration should go with it
             // rather than linger to its own Expires.  Only when liveness is on.

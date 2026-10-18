@@ -1127,40 +1127,19 @@ pub(super) fn handle_request(
             }
             let _ = reliable_provisional_armed;
 
-            // IPsec Security-Server / SA setup on 401 REGISTER is now driven
-            // by the P-CSCF script (see `siphon.ipsec` and `reply.take_av()`).
-            // The dispatcher only retains de-register auto-cleanup as a safety
-            // net for SA leaks.
-
-            // IPsec: delete SA pair on deregistration (REGISTER with Expires: 0)
-            if *code == 200 && method == "REGISTER" {
-                if let (Some(ref _ipsec_config), Some(ref ipsec_manager)) =
-                    (&state.ipsec_config, &state.ipsec_manager)
-                {
-                    let is_deregister = message_guard
-                        .headers
-                        .get("Expires")
-                        .map(|value| value.trim() == "0")
-                        .unwrap_or(false)
-                        || message_guard
-                            .headers
-                            .get("Contact")
-                            .map(|value| value.contains("expires=0"))
-                            .unwrap_or(false);
-
-                    if is_deregister {
-                        let ue_addr = inbound.remote_addr.ip();
-                        let ue_port = inbound.remote_addr.port();
-                        let ipsec_manager = Arc::clone(ipsec_manager);
-                        tokio::spawn(async move {
-                            if let Err(error) =
-                                ipsec_manager.delete_sa_pair(&ue_addr, ue_port).await
-                            {
-                                warn!(ue = %ue_addr, %error, "IPsec: failed to delete SA pair");
-                            }
-                        });
-                    }
-                }
+            // IPsec Security-Server / SA setup on 401 REGISTER is driven by the
+            // P-CSCF script (see `siphon.ipsec` and `reply.take_av()`). A 2xx the
+            // script answered a REGISTER with moves the SA lifecycle as a
+            // relayed one does: a de-REGISTER that removed the UE's last binding
+            // deletes its pair once this server transaction is over (TS 24.229
+            // clause 5.2.5.1).
+            if (200..300).contains(code) && method == "REGISTER" {
+                super::ipsec_lifecycle::after_register_2xx(
+                    state,
+                    &message_guard,
+                    inbound.remote_addr,
+                    inbound.transport,
+                );
             }
 
             // Messages the handler deferred (subscribe_state.notify(),

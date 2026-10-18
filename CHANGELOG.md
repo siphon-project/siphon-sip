@@ -33,6 +33,39 @@ entry, but a working config keeps working.
   `Expires: 0` removes every binding as before. Counted in
   `siphon_registrar_refusals_total{reason="invalid_wildcard"}`. The SDK mock
   registrar does the same.
+### Added
+
+- **`ipsec.delete(ue_addr, ue_port_c=None, *, delay_secs=0)`.** Awaitable;
+  deletes the UE's security association pair (or every pair of the UE) and
+  the stream connections over it, now or after `delay_secs`. Returns how many
+  pairs it deleted or scheduled.
+
+### Fixed
+
+- **A P-CSCF that relays a de-REGISTER now deletes the UE's security
+  associations.** Only a 200 the script answered itself did, so a relayed
+  de-registration left the pair, and since 1.14.0 the TCP connections siphon
+  opened over it, until the hard lifetime, retransmitting into ESP toward an
+  address the access network could hand to another UE. The pair now goes
+  once the server transaction of the 2xx is over (Timer J over UDP, TS 24.229
+  clause 5.2.5.1), unless another identity is still registered over it (TS
+  33.203 clause 7.4.2a); a script-answered 2xx waits for that too instead of
+  deleting before the 200 left. When the registrar loses the last binding
+  registered over a pair without a de-REGISTER (the script removing it on a
+  reg-event NOTIFY, or expiry), the next sweep shortens the pair to 64*T1 and
+  deletes it (TS 24.229 clause 5.2.5.2). Pooled outbound TCP connections can
+  now be closed from outside their task, and one from a protected port closes
+  with a reset.
+- **A re-registration no longer cuts the transactions pending on the old
+  pair.** Activating the new pair deleted every old one at once; the pair the
+  REGISTER came over now stays 32 s and any other goes at once (TS 33.203
+  clause 7.4.2a).
+- **Deleting one pair of a UE no longer takes the policies of another.** The
+  old and new pair of a re-registration share the selectors of the UE's
+  protected server port (TS 33.203 clause 7.4.0 keeps that port); deleting the
+  old one removed the new one's SA #3/#4 policies, so requests to the UE went
+  out unprotected. They now stay with the newer pair, or are given back to the
+  older one when the newer goes.
 
 ## [1.14.0] — 2026-10-17
 

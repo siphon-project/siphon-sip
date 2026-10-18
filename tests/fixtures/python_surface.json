@@ -1107,6 +1107,11 @@
         "kind": "method_descriptor",
         "sig": "($self, av, offer, transform, expires_secs=None, protocol=None)"
       },
+      "delete": {
+        "doc": "Delete the security associations of the UE at ``ue_addr``: the pair",
+        "kind": "method_descriptor",
+        "sig": "($self, ue_addr, ue_port_c=None, *, delay_secs=0.0)"
+      },
       "pcscf_port_c": {
         "doc": "The configured P-CSCF protected client port (shared across all UEs).",
         "kind": "getset_descriptor"

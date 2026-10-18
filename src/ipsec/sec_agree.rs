@@ -248,19 +248,25 @@ impl IpsecManager {
     /// `Security-Verify` over the pair must mirror it ([`verify_sec_agree`]).
     /// Returns whether a pair took it.
     pub fn record_security_server(&self, ue_addr: &IpAddr, value: &str) -> bool {
+        !self.record_security_server_on(ue_addr, value).is_empty()
+    }
+
+    /// [`record_security_server`](Self::record_security_server), returning the
+    /// contact keys of the pairs that took it.
+    pub(crate) fn record_security_server_on(&self, ue_addr: &IpAddr, value: &str) -> Vec<String> {
         let named: Vec<(u32, u32)> = mechanism_list([value])
             .iter()
             .filter_map(|mechanism| Some((mechanism.number("spi-c")?, mechanism.number("spi-s")?)))
             .collect();
         if named.is_empty() {
-            return false;
+            return Vec::new();
         }
-        let mut recorded = false;
+        let mut recorded = Vec::new();
         for mut entry in self.associations.iter_mut() {
             let sa = entry.value_mut();
             if sa.ue_addr == *ue_addr && named.contains(&(sa.spi_pc, sa.spi_ps)) {
                 sa.security_server = Some(value.to_string());
-                recorded = true;
+                recorded.push(entry.key().clone());
             }
         }
         recorded

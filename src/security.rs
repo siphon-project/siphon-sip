@@ -1469,7 +1469,7 @@ mod tests {
             let source = ip(address);
             let closer = crate::transport::disconnect::ConnectionCloser::register(
                 crate::transport::ConnectionId(8_000_100 + index as u64),
-                source,
+                std::net::SocketAddr::new(source, 5061),
                 crate::transport::Transport::Tls,
             );
             assert!(signal(&store, source), "{address} must ban on one signal");

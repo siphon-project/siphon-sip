@@ -7,6 +7,10 @@ pub mod milenage;
 
 #[cfg(target_os = "linux")]
 pub mod netlink;
+/// When a UE's security associations are deleted (TS 33.203 clause 7.4.2a).
+pub mod retire;
+#[cfg(test)]
+mod retire_tests;
 /// Process-wide access to the running manager/config, used by the datapath.
 pub mod runtime;
 /// RFC 3329 verification of a request received over a security association.
@@ -678,6 +682,166 @@ pub enum XfrmBackend {
     IpCommand,
 }
 
+/// One of the eight kernel objects of a pair, with what it takes to install it
+/// again. Compared by [`KernelObject::same_kernel_key`], the key the kernel
+/// itself holds it under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KernelObject {
+    /// An SA state, keyed by the kernel on `(destination, spi)`.
+    State {
+        source: IpAddr,
+        source_port: u16,
+        destination: IpAddr,
+        destination_port: u16,
+        spi: u32,
+    },
+    /// A policy, keyed by the kernel on its selector and direction; the SPI is
+    /// only in its template.
+    Policy {
+        source: IpAddr,
+        source_port: u16,
+        destination: IpAddr,
+        destination_port: u16,
+        direction: PolicyDir,
+        protocol: SaProtocol,
+        spi: u32,
+    },
+}
+
+impl KernelObject {
+    /// Whether the kernel holds `self` and `other` under one key, so only one
+    /// of them can be installed at a time.
+    fn same_kernel_key(&self, other: &KernelObject) -> bool {
+        match (self, other) {
+            (
+                KernelObject::State {
+                    destination: ours,
+                    spi: our_spi,
+                    ..
+                },
+                KernelObject::State {
+                    destination: theirs,
+                    spi: their_spi,
+                    ..
+                },
+            ) => ours == theirs && our_spi == their_spi,
+            (
+                KernelObject::Policy {
+                    source,
+                    source_port,
+                    destination,
+                    destination_port,
+                    direction,
+                    protocol,
+                    ..
+                },
+                KernelObject::Policy {
+                    source: their_source,
+                    source_port: their_source_port,
+                    destination: their_destination,
+                    destination_port: their_destination_port,
+                    direction: their_direction,
+                    protocol: their_protocol,
+                    ..
+                },
+            ) => {
+                source == their_source
+                    && source_port == their_source_port
+                    && destination == their_destination
+                    && destination_port == their_destination_port
+                    && direction == their_direction
+                    && protocol == their_protocol
+            }
+            _ => false,
+        }
+    }
+}
+
+/// The four states and four policies `create_sa_pair` installs for `sa`.
+fn kernel_objects(sa: &SecurityAssociationPair) -> [KernelObject; 8] {
+    let role = sa.role;
+    let state = |source, source_port, destination, destination_port, spi| KernelObject::State {
+        source,
+        source_port,
+        destination,
+        destination_port,
+        spi,
+    };
+    let policy = |source, source_port, destination, destination_port, ue_sourced, spi| {
+        KernelObject::Policy {
+            source,
+            source_port,
+            destination,
+            destination_port,
+            direction: role.policy_dir(ue_sourced),
+            protocol: sa.protocol,
+            spi,
+        }
+    };
+    [
+        state(
+            sa.ue_addr,
+            sa.ue_port_c,
+            sa.pcscf_addr,
+            sa.pcscf_port_s,
+            sa.spi_ps,
+        ),
+        state(
+            sa.pcscf_addr,
+            sa.pcscf_port_s,
+            sa.ue_addr,
+            sa.ue_port_c,
+            sa.spi_uc,
+        ),
+        state(
+            sa.pcscf_addr,
+            sa.pcscf_port_c,
+            sa.ue_addr,
+            sa.ue_port_s,
+            sa.spi_us,
+        ),
+        state(
+            sa.ue_addr,
+            sa.ue_port_s,
+            sa.pcscf_addr,
+            sa.pcscf_port_c,
+            sa.spi_pc,
+        ),
+        policy(
+            sa.ue_addr,
+            sa.ue_port_c,
+            sa.pcscf_addr,
+            sa.pcscf_port_s,
+            true,
+            sa.spi_ps,
+        ),
+        policy(
+            sa.pcscf_addr,
+            sa.pcscf_port_s,
+            sa.ue_addr,
+            sa.ue_port_c,
+            false,
+            sa.spi_uc,
+        ),
+        policy(
+            sa.pcscf_addr,
+            sa.pcscf_port_c,
+            sa.ue_addr,
+            sa.ue_port_s,
+            false,
+            sa.spi_us,
+        ),
+        policy(
+            sa.ue_addr,
+            sa.ue_port_s,
+            sa.pcscf_addr,
+            sa.pcscf_port_c,
+            true,
+            sa.spi_pc,
+        ),
+    ]
+}
+
 /// Manages active IPsec SAs for UE registrations.
 ///
 /// Each UE registration that negotiates IPsec (via
@@ -692,6 +856,9 @@ pub struct IpsecManager {
     /// The SPI partition this manager allocates from, and the owner of every
     /// local inbound SPI of a live pair (see [`spi`]).
     spis: spi::SpiAllocator,
+    /// What is known of each pair's registration: which carry a binding, which
+    /// protected the REGISTER that set up another, which are due to go.
+    lifecycle: retire::Lifecycle,
     /// XFRM backend.  Picked at startup from `IpsecConfig.backend`.
     backend: XfrmBackend,
     /// Test-only in-memory kernel.  When set, the four kernel-op methods
@@ -735,6 +902,7 @@ impl IpsecManager {
         Self {
             associations: DashMap::new(),
             spis: spi::SpiAllocator::new(spi_range_start, spi_range_count),
+            lifecycle: retire::Lifecycle::default(),
             backend,
             #[cfg(test)]
             kernel_mock: None,
@@ -792,7 +960,7 @@ impl IpsecManager {
         // partial state before propagating. Otherwise a failure partway through
         // (e.g. the first add_policy EEXISTs) strands the already-installed SAs
         // in the kernel with no `associations` record — unreachable by
-        // delete_sa_pair / cleanup_other_pairs_for_ue / the sweeper, i.e. a
+        // delete_sa_pair / supersede_pairs_for_ue / the sweeper, i.e. a
         // permanent leak. Rollback guarantees a failed allocate leaves the
         // kernel exactly as it found it, so the failure degrades to a clean
         // retry instead of a wedge.
@@ -960,72 +1128,174 @@ impl IpsecManager {
     }
 
     /// Best-effort teardown of the four XFRM states + four policies for `sa`
-    /// (ignores `ENOENT`). Used to clear a colliding orphan before install, to
-    /// roll back a partial install, and by [`delete_sa_pair`]. Every delete is
+    /// (ignores `ENOENT`). Used to clear a colliding orphan before install and
+    /// to roll back a partial install; [`delete_sa_pair`] goes through
+    /// [`teardown_unshared`](Self::teardown_unshared) instead. Every delete is
     /// independent — one failure never skips the rest, so a single missing key
     /// can't strand the other seven (the latent leak in the old `?`-chained
     /// `delete_sa_pair`). Keys on exactly the kernel's own key, so it removes a
     /// colliding orphan regardless of which registration created it.
     async fn teardown_sa_kernel(&self, sa: &SecurityAssociationPair) {
-        let proto = sa.protocol;
-        let role = sa.role;
+        for object in kernel_objects(sa) {
+            self.delete_kernel_object(&object).await;
+        }
+    }
 
-        // States — keyed on (dst, spi); src is ignored by the kernel del.
-        self.del_sa(&sa.ue_addr, &sa.pcscf_addr, sa.spi_ps)
-            .await
-            .ok();
-        self.del_sa(&sa.pcscf_addr, &sa.ue_addr, sa.spi_uc)
-            .await
-            .ok();
-        self.del_sa(&sa.pcscf_addr, &sa.ue_addr, sa.spi_us)
-            .await
-            .ok();
-        self.del_sa(&sa.ue_addr, &sa.pcscf_addr, sa.spi_pc)
-            .await
-            .ok();
+    /// Delete one kernel object, best-effort.
+    async fn delete_kernel_object(&self, object: &KernelObject) {
+        match *object {
+            // States are keyed on (dst, spi); src is ignored by the kernel del.
+            KernelObject::State {
+                source,
+                destination,
+                spi,
+                ..
+            } => {
+                self.del_sa(&source, &destination, spi).await.ok();
+            }
+            KernelObject::Policy {
+                source,
+                source_port,
+                destination,
+                destination_port,
+                direction,
+                protocol,
+                ..
+            } => {
+                self.del_policy(
+                    &source,
+                    source_port,
+                    &destination,
+                    destination_port,
+                    direction,
+                    protocol,
+                )
+                .await
+                .ok();
+            }
+        }
+    }
 
-        // Policies — the colliding objects; same four selectors + dirs as the
-        // install, so this clears exactly what install_sa_kernel would add.
-        self.del_policy(
-            &sa.ue_addr,
-            sa.ue_port_c,
-            &sa.pcscf_addr,
-            sa.pcscf_port_s,
-            role.policy_dir(true),
-            proto,
-        )
-        .await
-        .ok();
-        self.del_policy(
-            &sa.pcscf_addr,
-            sa.pcscf_port_s,
-            &sa.ue_addr,
-            sa.ue_port_c,
-            role.policy_dir(false),
-            proto,
-        )
-        .await
-        .ok();
-        self.del_policy(
-            &sa.pcscf_addr,
-            sa.pcscf_port_c,
-            &sa.ue_addr,
-            sa.ue_port_s,
-            role.policy_dir(false),
-            proto,
-        )
-        .await
-        .ok();
-        self.del_policy(
-            &sa.ue_addr,
-            sa.ue_port_s,
-            &sa.pcscf_addr,
-            sa.pcscf_port_c,
-            role.policy_dir(true),
-            proto,
-        )
-        .await
-        .ok();
+    /// Install `holder`'s version of `object` again, for the rest of
+    /// `holder`'s lifetime.
+    async fn reinstall_kernel_object(
+        &self,
+        holder: &SecurityAssociationPair,
+        object: &KernelObject,
+    ) -> Result<(), IpsecError> {
+        // A fresh kernel object counts its lifetime from now; the holder's ends
+        // where it always did.
+        let remaining = holder.hard_lifetime_secs.map(|secs| {
+            secs.saturating_sub(holder.created_at.elapsed().as_secs())
+                .max(1)
+        });
+        match *object {
+            KernelObject::State {
+                source,
+                source_port,
+                destination,
+                destination_port,
+                spi,
+            } => {
+                self.add_sa(
+                    &source,
+                    source_port,
+                    &destination,
+                    destination_port,
+                    spi,
+                    &holder.ealg,
+                    &holder.aalg,
+                    &holder.encryption_key,
+                    &holder.integrity_key,
+                    holder.protocol,
+                    remaining,
+                )
+                .await
+            }
+            KernelObject::Policy {
+                source,
+                source_port,
+                destination,
+                destination_port,
+                direction,
+                protocol,
+                spi,
+            } => {
+                self.add_policy(
+                    &source,
+                    source_port,
+                    &destination,
+                    destination_port,
+                    direction,
+                    spi,
+                    protocol,
+                    remaining,
+                )
+                .await
+            }
+        }
+    }
+
+    /// Tear down `sa`, which has already left `associations`, without taking a
+    /// kernel object another live pair of the same UE holds.
+    ///
+    /// Two pairs of one UE can share kernel keys. The P-CSCF's protected ports
+    /// are fixed, and 3GPP TS 33.203 clause 7.4.0 keeps the UE's protected
+    /// server port across an authenticated re-registration, so the policies of
+    /// SA #3 and #4 (`port_pc` <-> `port_us`) have one selector in the old pair
+    /// and the new: the kernel holds one policy for both, the one installed
+    /// last. Deleting the old pair while the new one is in use (clause 7.4.2a
+    /// retires it after the new one is taken into use) must leave that policy
+    /// alone, and deleting the new one while the old one stays (an
+    /// authentication that failed, clause 7.4.2a: "the P-CSCF shall delete the
+    /// new SAs", the old ones still protect) must put the old one's back.
+    async fn teardown_unshared(&self, sa: &SecurityAssociationPair) {
+        let siblings: Vec<SecurityAssociationPair> = self
+            .associations
+            .iter()
+            .filter(|entry| entry.value().ue_addr == sa.ue_addr)
+            .map(|entry| entry.value().clone())
+            .collect();
+        for object in kernel_objects(sa) {
+            // The kernel holds the version of the sibling installed last, or
+            // this pair's when it came after every sibling.
+            let holder = siblings
+                .iter()
+                .filter(|sibling| {
+                    kernel_objects(sibling)
+                        .iter()
+                        .any(|theirs| theirs.same_kernel_key(&object))
+                })
+                .max_by_key(|sibling| sibling.created_at);
+            match holder {
+                None => self.delete_kernel_object(&object).await,
+                Some(holder) if holder.created_at >= sa.created_at => {
+                    debug!(
+                        ue = %sa.ue_addr,
+                        ue_port_c = sa.ue_port_c,
+                        holder_port_c = holder.ue_port_c,
+                        object = ?object,
+                        "IPsec: kernel object held by a newer pair of the UE, left in place"
+                    );
+                }
+                Some(holder) => {
+                    self.delete_kernel_object(&object).await;
+                    let theirs = kernel_objects(holder)
+                        .into_iter()
+                        .find(|theirs| theirs.same_kernel_key(&object));
+                    if let Some(theirs) = theirs {
+                        if let Err(error) = self.reinstall_kernel_object(holder, &theirs).await {
+                            tracing::warn!(
+                                ue = %sa.ue_addr,
+                                holder_port_c = holder.ue_port_c,
+                                %error,
+                                "IPsec: could not give a kernel object back to the older pair of the UE"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Create the UE-side IPsec SAs for an outbound IMS registration.
@@ -1052,96 +1322,20 @@ impl IpsecManager {
     pub async fn delete_sa_pair(&self, ue_addr: &IpAddr, ue_port_c: u16) -> Result<(), IpsecError> {
         let key = Self::contact_key(ue_addr, ue_port_c);
         if let Some((_, sa)) = self.associations.remove(&key) {
+            self.forget_lifecycle(&key);
             // Best-effort teardown — every delete is independent, so a single
             // missing key (e.g. an SA already reaped on hard-lifetime) can't
             // skip the rest. (The old code `?`-chained the four del_sa, so the
             // first ENOENT aborted before the policies, leaking them.) The
             // in-memory entry is already removed above, so the manager's view
-            // stays authoritative regardless of kernel-side failures.
-            self.teardown_sa_kernel(&sa).await;
+            // stays authoritative regardless of kernel-side failures. A kernel
+            // object another pair of the UE holds is left to it.
+            self.teardown_unshared(&sa).await;
             // Only once the kernel states are gone may the SPIs be reused.
             self.release_pair_spis(&sa);
             info!(ue = %ue_addr, ue_port_c, "IPsec: SA pair deleted");
         }
         Ok(())
-    }
-
-    /// Tear down every SA pair belonging to `ue_addr` other than the one
-    /// keyed by `keep_port_c`.
-    ///
-    /// A UE's `port_uc` is a fresh random port on every REGISTER (3GPP
-    /// TS 24.229 §5.1.1.2 — the IMS UE generates new protected ports for
-    /// each registration).  The manager's `contact_key` includes
-    /// `ue_port_c`, so the previous binding's entry sits in
-    /// `associations` under the old port until something tears it down.
-    /// The kernel reaps the four SAs on hard-lifetime expiry, but XFRM
-    /// policies have no lifetime — they accumulate until a future
-    /// REGISTER picks a `port_uc` that collides with a leaked selector,
-    /// at which point policy install hits `EEXIST` and the new
-    /// registration fails to protect.
-    ///
-    /// Called from `PyPendingSA::activate` once the 200 OK to the auth
-    /// REGISTER has landed: at that point the new binding is granted by
-    /// the registrar of record, the UE has proven possession of the
-    /// fresh keys, and any earlier binding for the same UE address is
-    /// definitionally stale.  Per-victim failures are logged but never
-    /// propagated — the in-memory entry is removed (via
-    /// `delete_sa_pair`'s `remove`-before-kernel-call ordering) even
-    /// when individual kernel deletes fail, so the manager's view stays
-    /// authoritative.
-    ///
-    /// Walks `associations` once (O(N) in active SA count); the inner
-    /// `delete_sa_pair` call deletes four SAs + four policies per
-    /// victim.
-    pub async fn cleanup_other_pairs_for_ue(&self, ue_addr: &IpAddr, keep_port_c: u16) {
-        let victim_ports: Vec<u16> = self
-            .associations
-            .iter()
-            .filter_map(|entry| {
-                let sa = entry.value();
-                if sa.ue_addr == *ue_addr && sa.ue_port_c != keep_port_c {
-                    Some(sa.ue_port_c)
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        if victim_ports.is_empty() {
-            return;
-        }
-
-        debug!(
-            ue = %ue_addr,
-            keep_port_c,
-            victim_count = victim_ports.len(),
-            "IPsec: tearing down stale SA pairs for re-REGISTER"
-        );
-
-        for victim_port_c in victim_ports {
-            if let Err(error) = self.delete_sa_pair(ue_addr, victim_port_c).await {
-                // delete_sa_pair removes the in-memory entry before the
-                // kernel call, so the map is already clean here — just
-                // log the kernel-side failure.  Leaving stale policies
-                // in the kernel for this victim is at worst a no-op:
-                // the new pair's selectors don't collide (different
-                // port_c by construction), and the victim's SAs will
-                // expire on hard-lifetime even if policies linger.
-                tracing::warn!(
-                    ue = %ue_addr,
-                    victim_port_c,
-                    %error,
-                    "IPsec: stale SA pair cleanup — kernel delete failed (in-memory entry already removed)"
-                );
-            } else {
-                info!(
-                    ue = %ue_addr,
-                    victim_port_c,
-                    keep_port_c,
-                    "IPsec: stale SA pair torn down on re-REGISTER"
-                );
-            }
-        }
     }
 
     /// Re-pin the kernel hard-lifetime on all four SAs of an existing
@@ -1350,7 +1544,7 @@ impl IpsecManager {
     /// in-memory entry.  Returns the number of pairs reaped.
     ///
     /// This is the background-cleanup counterpart to the re-REGISTER /
-    /// de-REGISTER paths (`cleanup_other_pairs_for_ue` / `delete_sa_pair`),
+    /// de-REGISTER paths (`supersede_pairs_for_ue` / `delete_sa_pair`),
     /// which only fire when the UE comes back.  A UE that registers once
     /// and then vanishes (crash, radio loss, never refreshes) would
     /// otherwise leak its four states + four policies + one map entry
@@ -2148,6 +2342,12 @@ struct KernelMock {
 
 #[cfg(test)]
 impl IpsecManager {
+    /// [`with_mock_kernel`](Self::with_mock_kernel), for tests outside this
+    /// module, which then need no `CAP_NET_ADMIN` to install a pair.
+    pub(crate) fn with_test_kernel() -> Self {
+        Self::with_mock_kernel()
+    }
+
     /// Construct a manager whose four kernel-op methods route through an
     /// in-memory [`KernelMock`] instead of netlink / `ip xfrm`.
     fn with_mock_kernel() -> Self {
@@ -2687,13 +2887,17 @@ mod tests {
     /// SAs).  Eventually a new random `port_uc` collides with a leaked
     /// selector and policy install hits `EEXIST`.
     ///
-    /// `cleanup_other_pairs_for_ue` is invoked from `PendingSA.activate`
+    /// `supersede_pairs_for_ue` is invoked from `PendingSA.activate`
     /// (once the 200 OK has landed and the new binding is granted by
     /// the registrar of record) and tears down every prior pair for the
     /// same UE address other than the one being kept.
     #[tokio::test]
-    async fn cleanup_other_pairs_removes_stale_entries_for_same_ue() {
-        let manager = IpsecManager::with_partition(XfrmBackend::IpCommand, 60000, 1024);
+    async fn superseding_pairs_removes_stale_entries_for_same_ue() {
+        let manager = Arc::new(IpsecManager::with_partition(
+            XfrmBackend::IpCommand,
+            60000,
+            1024,
+        ));
         let ue: IpAddr = "192.0.2.50".parse().unwrap();
 
         // Simulate four prior REGISTER cycles for the same UE — each with
@@ -2709,7 +2913,9 @@ mod tests {
         insert_test_pair(&manager, test_sa_pair(ue, 6500, 10016));
         assert_eq!(manager.active_count(), 5);
 
-        manager.cleanup_other_pairs_for_ue(&ue, 6500).await;
+        manager
+            .supersede_pairs_for_ue(&ue, 6500, retire::SA_RETIRE_GRACE)
+            .await;
 
         // Only the kept pair survives; the four prior ones have been
         // removed from the in-memory map.  Per-victim kernel deletes may
@@ -2730,8 +2936,12 @@ mod tests {
     /// Pairs for other UE addresses must be untouched — the cleanup is
     /// scoped to `ue_addr`, not "all UEs".
     #[tokio::test]
-    async fn cleanup_other_pairs_leaves_other_ues_untouched() {
-        let manager = IpsecManager::with_partition(XfrmBackend::IpCommand, 60000, 1024);
+    async fn superseding_pairs_leaves_other_ues_untouched() {
+        let manager = Arc::new(IpsecManager::with_partition(
+            XfrmBackend::IpCommand,
+            60000,
+            1024,
+        ));
         let ue_a: IpAddr = "192.0.2.50".parse().unwrap();
         let ue_b: IpAddr = "192.0.2.51".parse().unwrap();
 
@@ -2743,7 +2953,9 @@ mod tests {
 
         // Activate cleanup for ue_a, keeping port_c=6201 — must remove
         // ue_a:6101 only.
-        manager.cleanup_other_pairs_for_ue(&ue_a, 6201).await;
+        manager
+            .supersede_pairs_for_ue(&ue_a, 6201, retire::SA_RETIRE_GRACE)
+            .await;
 
         assert_eq!(manager.active_count(), 3);
         assert!(manager.has_sa(&ue_a, 6201));
@@ -2756,14 +2968,20 @@ mod tests {
     /// First REGISTER for a UE (no prior pair in the map) must complete
     /// the cleanup as a no-op — no kernel calls, no map mutations.
     #[tokio::test]
-    async fn cleanup_other_pairs_no_op_on_first_register() {
-        let manager = IpsecManager::with_partition(XfrmBackend::IpCommand, 60000, 1024);
+    async fn superseding_pairs_no_op_on_first_register() {
+        let manager = Arc::new(IpsecManager::with_partition(
+            XfrmBackend::IpCommand,
+            60000,
+            1024,
+        ));
         let ue: IpAddr = "192.0.2.50".parse().unwrap();
 
         insert_test_pair(&manager, test_sa_pair(ue, 6500, 10000));
         assert_eq!(manager.active_count(), 1);
 
-        manager.cleanup_other_pairs_for_ue(&ue, 6500).await;
+        manager
+            .supersede_pairs_for_ue(&ue, 6500, retire::SA_RETIRE_GRACE)
+            .await;
 
         assert_eq!(manager.active_count(), 1);
         assert!(manager.has_sa(&ue, 6500));
@@ -2978,11 +3196,17 @@ mod tests {
     /// pairs in the map at all — defends against the race where the
     /// stash TTL fires `cleanup` before `activate` runs.
     #[tokio::test]
-    async fn cleanup_other_pairs_no_op_when_ue_has_no_pairs() {
-        let manager = IpsecManager::with_partition(XfrmBackend::IpCommand, 60000, 1024);
+    async fn superseding_pairs_no_op_when_ue_has_no_pairs() {
+        let manager = Arc::new(IpsecManager::with_partition(
+            XfrmBackend::IpCommand,
+            60000,
+            1024,
+        ));
         let unknown_ue: IpAddr = "192.0.2.99".parse().unwrap();
 
-        manager.cleanup_other_pairs_for_ue(&unknown_ue, 6500).await;
+        manager
+            .supersede_pairs_for_ue(&unknown_ue, 6500, retire::SA_RETIRE_GRACE)
+            .await;
 
         assert_eq!(manager.active_count(), 0);
     }

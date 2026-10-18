@@ -62,6 +62,9 @@ mod in_dialog;
 mod inbound;
 mod inbound_filter;
 mod intercept;
+mod ipsec_lifecycle;
+#[cfg(test)]
+mod ipsec_lifecycle_tests;
 mod late_answer;
 mod liveness;
 mod media_init;

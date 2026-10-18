@@ -509,7 +509,7 @@ pub(crate) async fn serve_sip_stream<R, W>(
     // (see [`crate::transport::disconnect`]).
     let closer = crate::transport::disconnect::ConnectionCloser::register(
         connection_id,
-        remote_addr.ip(),
+        remote_addr,
         transport,
     );
     if crate::security::is_source_banned(remote_addr.ip()) {

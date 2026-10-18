@@ -34,7 +34,7 @@
 //! the accept loop, before any of this): a ban matches the client that earned
 //! it, not the front every client shares.
 
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, LazyLock};
 
 use dashmap::DashMap;
@@ -43,18 +43,24 @@ use tracing::info;
 
 use crate::transport::{ConnectionId, Transport};
 
-/// One live inbound stream connection: whose it is, and how to end it.
+/// One live stream connection: whose it is, and how to end it.
 struct LiveConnection {
     /// The peer address the connection is served as — the PROXY-declared client
     /// behind a front, the socket's own peer otherwise.
-    source: IpAddr,
+    peer: SocketAddr,
+    /// Whether the peer opened it ([`ConnectionCloser::register`]) rather than
+    /// siphon ([`ConnectionCloser::register_outbound`]). Only the former is a
+    /// ban's business.
+    inbound: bool,
     transport: Transport,
     /// Signalled once, by [`close_banned_source`]. The connection's own task
     /// waits on it and tears itself down; nothing here touches its socket.
     close: Arc<Notify>,
 }
 
-/// Every live inbound stream connection, keyed by its connection id.
+/// Every live stream connection, keyed by its connection id: the ones peers
+/// opened to us, and the outbound pool's own (which a ban never touches, see
+/// [`close_peer`]).
 ///
 /// Written once per accepted connection and once more when it ends (never per
 /// message), and read only when a ban is *newly* raised — so the linear scan in
@@ -75,17 +81,38 @@ pub(crate) struct ConnectionCloser {
 }
 
 impl ConnectionCloser {
-    /// Register a connection from `source`, served on `transport`.
+    /// Register a connection `peer` opened to us, served on `transport`.
     pub(crate) fn register(
         connection_id: ConnectionId,
-        source: IpAddr,
+        peer: SocketAddr,
         transport: Transport,
+    ) -> Self {
+        Self::register_with(connection_id, peer, transport, true)
+    }
+
+    /// Register a connection siphon opened to `peer` (the outbound pool's), so
+    /// it can be ended from outside its task by [`close_peer`] and
+    /// [`close_connection`]. A ban never closes it.
+    pub(crate) fn register_outbound(
+        connection_id: ConnectionId,
+        peer: SocketAddr,
+        transport: Transport,
+    ) -> Self {
+        Self::register_with(connection_id, peer, transport, false)
+    }
+
+    fn register_with(
+        connection_id: ConnectionId,
+        peer: SocketAddr,
+        transport: Transport,
+        inbound: bool,
     ) -> Self {
         let close = Arc::new(Notify::new());
         LIVE_CONNECTIONS.insert(
             connection_id,
             LiveConnection {
-                source,
+                peer,
+                inbound,
                 transport,
                 close: Arc::clone(&close),
             },
@@ -124,7 +151,7 @@ pub(crate) fn close_banned_source(source: IpAddr, reason: &str) -> usize {
     // must not be live while a woken connection's cleanup removes its own entry.
     let held: Vec<(ConnectionId, Transport, Arc<Notify>)> = LIVE_CONNECTIONS
         .iter()
-        .filter(|entry| entry.value().source == source)
+        .filter(|entry| entry.value().inbound && entry.value().peer.ip() == source)
         .map(|entry| {
             (
                 *entry.key(),
@@ -142,6 +169,42 @@ pub(crate) fn close_banned_source(source: IpAddr, reason: &str) -> usize {
             connection_id = ?connection_id,
             reason,
             "auto-ban: closing a connection the banned source already had open"
+        );
+    }
+    held.len()
+}
+
+/// Signal every live stream connection with `peer`, the exact address and
+/// port, to close because `reason`, whichever end opened it. Returns how many
+/// were signalled.
+///
+/// For a P-CSCF deleting a UE's security associations: the connections between
+/// the protected ports and the UE's (3GPP TS 33.203 clause 7.1) are carried by
+/// them and are of no use without them, and one siphon opened is otherwise kept
+/// until the peer closes it or keepalive gives up (see
+/// [`crate::transport::pool_writer`]), retransmitting into an association that
+/// is gone, toward an address the access network may have given to another UE.
+/// A connection siphon opened from a pinned port closes with a reset.
+pub(crate) fn close_peer(peer: SocketAddr, reason: &str) -> usize {
+    let held: Vec<(ConnectionId, Transport, Arc<Notify>)> = LIVE_CONNECTIONS
+        .iter()
+        .filter(|entry| entry.value().peer == peer)
+        .map(|entry| {
+            (
+                *entry.key(),
+                entry.value().transport,
+                Arc::clone(&entry.value().close),
+            )
+        })
+        .collect();
+    for (connection_id, transport, close) in &held {
+        close.notify_one();
+        info!(
+            peer = %peer,
+            transport = %transport,
+            connection_id = ?connection_id,
+            reason,
+            "closing a connection"
         );
     }
     held.len()
@@ -177,12 +240,74 @@ mod tests {
         value.parse().expect("a test address")
     }
 
+    fn peer(value: &str) -> SocketAddr {
+        SocketAddr::new(ip(value), 5060)
+    }
+
+    /// `close_peer` ends every connection with that exact address and port,
+    /// inbound or outbound, and nothing on another port of the same host.
+    #[tokio::test]
+    async fn closing_a_peer_signals_its_connections_in_both_directions_only() {
+        let accepted = ConnectionCloser::register(
+            ConnectionId(9201),
+            "198.51.100.21:6100".parse().expect("an address"),
+            Transport::Tcp,
+        );
+        let opened = ConnectionCloser::register_outbound(
+            ConnectionId(9202),
+            "198.51.100.21:6100".parse().expect("an address"),
+            Transport::Tcp,
+        );
+        let other_port = ConnectionCloser::register_outbound(
+            ConnectionId(9203),
+            "198.51.100.21:6101".parse().expect("an address"),
+            Transport::Tcp,
+        );
+
+        assert_eq!(
+            close_peer(
+                "198.51.100.21:6100".parse().expect("an address"),
+                "a test signal"
+            ),
+            2
+        );
+        for closer in [&accepted, &opened] {
+            tokio::time::timeout(std::time::Duration::from_secs(5), closer.closed())
+                .await
+                .expect("a connection with the peer must be signalled");
+        }
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), other_port.closed())
+                .await
+                .is_err(),
+            "a connection to another port of the host must be left alone"
+        );
+    }
+
+    /// A ban is about connections the banned source opened; one siphon opened
+    /// to that host is not closed by it.
+    #[tokio::test]
+    async fn a_ban_leaves_outbound_connections_alone() {
+        let opened = ConnectionCloser::register_outbound(
+            ConnectionId(9301),
+            peer("203.0.113.31"),
+            Transport::Tcp,
+        );
+        assert_eq!(close_banned_source(ip("203.0.113.31"), "a test signal"), 0);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), opened.closed())
+                .await
+                .is_err(),
+            "an outbound connection must not be closed by a ban"
+        );
+    }
+
     #[tokio::test]
     async fn closing_one_connection_signals_that_one_alone() {
         let closed =
-            ConnectionCloser::register(ConnectionId(9101), ip("203.0.113.15"), Transport::Tls);
+            ConnectionCloser::register(ConnectionId(9101), peer("203.0.113.15"), Transport::Tls);
         let kept =
-            ConnectionCloser::register(ConnectionId(9102), ip("203.0.113.15"), Transport::Tls);
+            ConnectionCloser::register(ConnectionId(9102), peer("203.0.113.15"), Transport::Tls);
 
         assert!(close_connection(ConnectionId(9101), "a test signal"));
         tokio::time::timeout(std::time::Duration::from_secs(5), closed.closed())
@@ -200,9 +325,9 @@ mod tests {
     #[tokio::test]
     async fn a_ban_signals_only_the_banned_source() {
         let banned =
-            ConnectionCloser::register(ConnectionId(9001), ip("203.0.113.5"), Transport::Tls);
+            ConnectionCloser::register(ConnectionId(9001), peer("203.0.113.5"), Transport::Tls);
         let other =
-            ConnectionCloser::register(ConnectionId(9002), ip("203.0.113.6"), Transport::Tcp);
+            ConnectionCloser::register(ConnectionId(9002), peer("203.0.113.6"), Transport::Tcp);
 
         assert_eq!(close_banned_source(ip("203.0.113.5"), "a test signal"), 1);
 
@@ -223,7 +348,7 @@ mod tests {
     #[tokio::test]
     async fn a_ban_raised_before_the_wait_is_still_delivered() {
         let closer =
-            ConnectionCloser::register(ConnectionId(9003), ip("203.0.113.7"), Transport::Tcp);
+            ConnectionCloser::register(ConnectionId(9003), peer("203.0.113.7"), Transport::Tcp);
         assert_eq!(close_banned_source(ip("203.0.113.7"), "a test signal"), 1);
         tokio::time::timeout(std::time::Duration::from_secs(5), closer.closed())
             .await
@@ -248,7 +373,7 @@ mod tests {
             .collect();
         for connection_id in &ids {
             let closer =
-                ConnectionCloser::register(*connection_id, ip("203.0.113.10"), Transport::Tcp);
+                ConnectionCloser::register(*connection_id, peer("203.0.113.10"), Transport::Tcp);
             assert!(LIVE_CONNECTIONS.contains_key(connection_id));
             drop(closer);
             assert!(!LIVE_CONNECTIONS.contains_key(connection_id));

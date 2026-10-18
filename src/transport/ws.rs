@@ -123,7 +123,7 @@ pub(crate) async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send +
     // again (see [`crate::transport::disconnect`]).
     let closer = crate::transport::disconnect::ConnectionCloser::register(
         connection_id,
-        remote_addr.ip(),
+        remote_addr,
         transport_variant,
     );
     if crate::security::is_source_banned(remote_addr.ip()) {
