@@ -1612,7 +1612,8 @@ class MockB2bua:
                         content_type: Optional[str] = None,
                         headers: Optional[dict] = None,
                         timeout_ms: int = 5000,
-                        leg: str = "caller", with_body: bool = False):
+                        leg: str = "caller",
+                        with_body: bool = False) -> Optional[Union[int, tuple]]:
         """Send an INFO (RFC 6086) in the caller's dialog of a call (on a call
         siphon answered itself, its only dialog), or with ``leg="callee"`` in
         the answered callee's. The CSeq is the dialog's,
@@ -1631,8 +1632,9 @@ class MockB2bua:
             with_body: resolve to ``(status, body, content_type)`` instead.
 
         Returns:
-            int | tuple | None: the final status code (or the tuple), or None
-            when none arrived in ``timeout_ms``.
+            Optional[Union[int, tuple]]: the final status code (or the
+                ``(status, body, content_type)`` tuple), or None when none
+                arrived in ``timeout_ms``.
 
         Raises:
             ValueError: the call is unknown (``not_found``), a header may not
@@ -8664,12 +8666,23 @@ class MockDiameter:
                 29.228 Table 6.1.2.1 requires it whenever the S-CSCF has it;
                 omit it and the AVP is not sent. The mock accepts and ignores
                 it.
-            user_data_already_available, ims_restoration, restoration_info,
-                multiple_registration, pcscf_restoration_mechanism,
-                pcscf_restoration_indication, failed_pcscf: the IMS
-                restoration members of the request (TS 29.229 §6.1.3), as the
-                engine documents them. The mock records each request in
-                ``sar_requests``.
+            user_data_already_available: ``True`` sends
+                User-Data-Already-Available (1), as a refresh of the
+                restoration information does (TS 23.380 clause 4.6.2).
+            ims_restoration: ``True`` advertises IMSRestorationInd (feature
+                bit 2 of Feature-List-ID 1, TS 29.229 clause 7.1.1).
+            restoration_info: the SCSCF-Restoration-Info to back up (TS
+                29.229 clause 6.3.46), a dict in the shape of the answer's
+                ``scscf_restoration_info`` entries.
+            multiple_registration: Multiple-Registration-Indication (TS
+                29.229 clause 6.3.51); ``None`` leaves it out.
+            pcscf_restoration_mechanism: ``True`` advertises
+                P-CSCF-Restoration-mechanism (feature bit 3).
+            pcscf_restoration_indication: ``True`` sets bit 0 of SAR-Flags
+                (TS 29.229 clause 6.3.63).
+            failed_pcscf: Failed-PCSCF (TS 29.229 clause 6.3.74), a dict with
+                ``fqdn`` and/or ``ip_addresses``. The mock records each
+                request in ``sar_requests``.
 
         Returns:
             Dict with ``result_code``, ``experimental_result_code``,
