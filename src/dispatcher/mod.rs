@@ -221,6 +221,8 @@ mod prack_offer_answer_tests;
 #[cfg(test)]
 mod provisional_presentation_tests;
 #[cfg(test)]
+mod proxy_2xx_retransmission_tests;
+#[cfg(test)]
 mod proxy_branch_final_tests;
 #[cfg(test)]
 mod proxy_cancel_awaits_provisional_tests;

@@ -240,7 +240,37 @@ pub struct ProxySessionStore {
     /// How many `late_dialogs` there are, so that the BYE path, which asks on
     /// every BYE, pays one atomic load while there are none.
     late_dialog_total: AtomicUsize,
+    /// The 2xx responses to an INVITE as they were forwarded upstream, by
+    /// Call-ID, both tags and CSeq number, so that a retransmission of one
+    /// goes out as it did. See [`Self::note_forwarded_answer`].
+    forwarded_answers: DashMap<String, ForwardedAnswer>,
+    /// How many `forwarded_answers` there are, so that a response path with
+    /// none recorded pays one atomic load.
+    forwarded_answer_total: AtomicUsize,
 }
+
+/// A 2xx to an INVITE as the proxy forwarded it upstream: the message after
+/// `@proxy.on_reply` ran, and where and how it was sent.
+#[derive(Debug, Clone)]
+pub struct ForwardedAnswer {
+    /// The branch of the proxy's own Via on the response it came in as: a
+    /// retransmission comes in on the same one.
+    pub branch: String,
+    pub message: SipMessage,
+    pub destination: SocketAddr,
+    pub transport: Transport,
+    pub connection_id: ConnectionId,
+    /// The local socket it left from: an IPsec SA's local endpoint on a
+    /// P-CSCF (3GPP TS 33.203 §7.4).
+    pub source_local_addr: Option<SocketAddr>,
+    pub forwarded_at: Instant,
+}
+
+/// How long a forwarded 2xx is kept for its retransmissions: 64*T1, the time a
+/// UAS retransmits a 2xx it has no ACK for (RFC 3261 §13.3.1.4) and the
+/// lifetime of the INVITE server transaction's Accepted state (RFC 6026
+/// Timer L). Its ACK removes it sooner.
+pub const FORWARDED_ANSWER_LIFETIME: std::time::Duration = std::time::Duration::from_secs(32);
 
 /// How long a late dialog nobody ended stays recorded: the backstop of a
 /// call-lifetime store. Its BYE removes it long before, whenever that comes.
@@ -254,7 +284,77 @@ impl ProxySessionStore {
             by_dialog_key: DashMap::new(),
             late_dialogs: DashMap::new(),
             late_dialog_total: AtomicUsize::new(0),
+            forwarded_answers: DashMap::new(),
+            forwarded_answer_total: AtomicUsize::new(0),
         }
+    }
+
+    /// The key of the 2xx `message` answers, or of the ACK `message` is for:
+    /// Call-ID, From tag, To tag and CSeq number (RFC 3261 §17.1.1.3).
+    fn answer_key(message: &SipMessage) -> Option<String> {
+        let dialog = Self::full_dialog_key(message, false)?;
+        let cseq = message.headers.get("CSeq")?;
+        let number = cseq.split_whitespace().next()?;
+        Some(format!("{dialog}\0{number}"))
+    }
+
+    /// Record `answer`, a 2xx to an INVITE as it was forwarded upstream, so a
+    /// retransmission of it is forwarded the same (RFC 3261 §13.3.1.4: a
+    /// retransmission is the same response).
+    pub fn note_forwarded_answer(&self, answer: ForwardedAnswer) {
+        let Some(key) = Self::answer_key(&answer.message) else {
+            return;
+        };
+        if self.forwarded_answers.insert(key, answer).is_none() {
+            self.forwarded_answer_total.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// The forwarded 2xx `response` is a retransmission of, if it was
+    /// forwarded less than [`FORWARDED_ANSWER_LIFETIME`] ago.
+    pub fn forwarded_answer(&self, response: &SipMessage) -> Option<ForwardedAnswer> {
+        if self.forwarded_answer_total.load(Ordering::SeqCst) == 0 {
+            return None;
+        }
+        let key = Self::answer_key(response)?;
+        let answer = self.forwarded_answers.get(&key)?;
+        (answer.forwarded_at.elapsed() <= FORWARDED_ANSWER_LIFETIME).then(|| answer.clone())
+    }
+
+    /// The caller ACKed the forwarded 2xx `ack` is for: no retransmission of
+    /// it is coming.
+    pub fn forget_forwarded_answer(&self, ack: &SipMessage) {
+        if self.forwarded_answer_total.load(Ordering::SeqCst) == 0 {
+            return;
+        }
+        let Some(key) = Self::answer_key(ack) else {
+            return;
+        };
+        if self.forwarded_answers.remove(&key).is_some() {
+            self.forwarded_answer_total.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    /// Forget the forwarded 2xx responses older than `lifetime` at `now`.
+    pub fn sweep_forwarded_answers(&self, now: Instant, lifetime: std::time::Duration) {
+        if self.forwarded_answer_total.load(Ordering::SeqCst) == 0 {
+            return;
+        }
+        let mut removed = 0;
+        self.forwarded_answers.retain(|_, answer| {
+            let keep = now.saturating_duration_since(answer.forwarded_at) <= lifetime;
+            if !keep {
+                removed += 1;
+            }
+            keep
+        });
+        self.forwarded_answer_total
+            .fetch_sub(removed, Ordering::SeqCst);
+    }
+
+    /// Number of forwarded 2xx responses kept for their retransmissions.
+    pub fn forwarded_answer_count(&self) -> usize {
+        self.forwarded_answers.len()
     }
 
     /// Insert a session, indexing it by all its client keys, server key, and dialog key.
@@ -788,6 +888,7 @@ impl ProxySessionStore {
         }
 
         self.sweep_late_dialogs(now, LATE_DIALOG_BACKSTOP);
+        self.sweep_forwarded_answers(now, FORWARDED_ANSWER_LIFETIME);
 
         count + stale_dialog_keys.len()
     }

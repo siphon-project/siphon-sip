@@ -1236,6 +1236,10 @@ pub(super) fn handle_response(
                 }
             }
 
+            // A retransmission of this 2xx goes out as this copy does.
+            let flow = (source_addr, transport, connection_id, inbound_local_addr);
+            remember_forwarded_answer(&message, status_code, &server_key, &branch, flow, state);
+
             if !sent_by_transaction {
                 debug!(
                     status = status_code,

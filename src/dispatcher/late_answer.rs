@@ -77,6 +77,37 @@ pub(super) fn forward_if_late_2xx(
     true
 }
 
+/// Keep `message`, a response forwarded upstream on `server_key` over `flow`
+/// (destination, transport, connection, local socket), when it is a 2xx to an
+/// INVITE: a retransmission of it then goes out as this copy did, with what
+/// the reply handler made of it and from the same socket (RFC 3261
+/// §13.3.1.4; the IPsec SA's local endpoint on a P-CSCF, 3GPP TS 33.203 §7.4).
+/// `branch` is the proxy's own Via branch on the response.
+pub(super) fn remember_forwarded_answer(
+    message: &SipMessage,
+    status_code: u16,
+    server_key: &TransactionKey,
+    branch: &str,
+    flow: (SocketAddr, Transport, ConnectionId, SocketAddr),
+    state: &DispatcherState,
+) {
+    if !(200..300).contains(&status_code) || server_key.method != Method::Invite {
+        return;
+    }
+    let (destination, transport, connection_id, source_local_addr) = flow;
+    state
+        .session_store
+        .note_forwarded_answer(crate::proxy::session::ForwardedAnswer {
+            branch: branch.to_string(),
+            message: message.clone(),
+            destination,
+            transport,
+            connection_id,
+            source_local_addr: Some(source_local_addr),
+            forwarded_at: std::time::Instant::now(),
+        });
+}
+
 /// Send `message`, a late 2xx with the proxy's own Via already removed, to the
 /// caller, and keep the dialog it opens routable for the caller's ACK.
 ///
@@ -264,6 +295,30 @@ pub(super) fn forward_2xx_statelessly(
     };
     if !is_own_forwarding_via(own, state) {
         return false;
+    }
+    // The retransmission of a 2xx this proxy forwarded is that response again
+    // (RFC 3261 §13.3.1.4): it goes out as the first copy went, with what the
+    // reply handler made of it, from the same socket (the IPsec SA's local
+    // endpoint on a P-CSCF, 3GPP TS 33.203 §7.4), not as the UAS sent it.
+    if let Some(answer) = state
+        .session_store
+        .forwarded_answer(response)
+        .filter(|answer| own.branch.as_deref() == Some(answer.branch.as_str()))
+    {
+        info!(
+            destination = %answer.destination,
+            transport = %answer.transport,
+            "forwarding a retransmitted 2xx to an INVITE as its first copy was forwarded (RFC 3261 §13.3.1.4)"
+        );
+        send_message_from(
+            answer.message,
+            answer.transport,
+            answer.destination,
+            answer.connection_id,
+            answer.source_local_addr,
+            state,
+        );
+        return true;
     }
     let Some((destination, transport)) = response_hop(upstream, state) else {
         warn!(
