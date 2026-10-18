@@ -31,13 +31,14 @@ mod answer;
 mod conference;
 mod decorators;
 mod message;
+mod offer;
 mod repeat;
 
 use answer::AnswerExchange;
 use decorators::event_decorator;
 use message::{
-    dialog_ids, extract_answer_params, extract_delete_params, extract_offer_params, extract_tag,
-    lock_message,
+    dialog_ids, extract_answer_params, extract_delete_params, extract_offer_params,
+    extract_raw_sdp, extract_tag, lock_message,
 };
 pub(super) use message::{extract_sdp_body, replace_body};
 
@@ -560,8 +561,18 @@ fn resolve_call_from_tag(target: &Bound<'_, PyAny>) -> PyResult<(String, String)
 impl PyRtpEngine {
     /// Send an RTPEngine `offer` command.
     ///
-    /// Extracts SDP from the object body, sends it to RTPEngine, and replaces
-    /// the body with the rewritten SDP. Returns True on success.
+    /// Two ways to hand it the offer:
+    ///
+    /// * **A SIP message** (the usual case): the SDP comes off the body of
+    ///   `request` (a Request, or a Call's INVITE), the body is replaced with
+    ///   the rewritten SDP, and the coroutine resolves to ``True``.
+    /// * **Raw SDP** with ``sdp=``: for an offering party's SDP that reached the
+    ///   script some other way, such as one party's new SDP on an access
+    ///   transfer, which arrives in a dialog of its own. `request` then only
+    ///   names the offerer: a Request, Reply or Call (its Call-ID and From-tag),
+    ///   or a ``(call_id, from_tag)`` tuple. No message body is read or written;
+    ///   the coroutine resolves to the rewritten SDP as ``str`` for the script
+    ///   to send itself.
     ///
     /// The profile's two halves describe the two parties of the call, not the
     /// two commands: the ``offer`` half is what the callee is sent and the
@@ -579,8 +590,21 @@ impl PyRtpEngine {
     /// offer and each party keeps the transport, direction and
     /// ``received_from`` policy it started with, whoever re-offers.
     ///
+    /// A raw re-offer names its party by tag: the tag of the party that made
+    /// the first offer, or the tag its answer recorded for the other party.
+    /// It is shaped by the same rule, and goes to the engine as ``reoffer``
+    /// on the call-id the engine knows the call by, which differs from the
+    /// SIP Call-ID after a siphon-terminated transfer re-anchored the call. The
+    /// other party's answer can then be handed back raw too, with
+    /// ``answer((call_id, offerer_tag), sdp=..., to_tag=answerer_tag)``. On a
+    /// call siphon has not anchored, a raw offer is the call's first offer and
+    /// records the session, as a message's does.
+    ///
     /// Args:
     ///     request: A Request or Call object containing the INVITE with SDP.
+    ///             With ``sdp=`` it only names the offerer: a Call, Request or
+    ///             Reply, or a ``(call_id, from_tag)`` tuple. A bare
+    ///             ``call_id`` string names no party and raises ``TypeError``.
     ///     profile: RTP profile name (default: "rtp_passthrough").
     ///     ws_uri: Bridge this leg's audio to an external WebSocket media server
     ///             (``siphon-rtp`` backend only), overriding the profile's own
@@ -610,7 +634,14 @@ impl PyRtpEngine {
     ///             the speech-start edge (and barge-in) fires — distinct from the
     ///             trailing hangover. Rounded up to whole ptime frames and added
     ///             to turn-start latency, so 60-120 ms is the useful range.
-    #[pyo3(signature = (request, profile=None, ws_uri=None, beep_detection=None, beep_cadence_guard_ms=None, ws_sample_rate=None, ws_tee_sample_rate=None, ws_vad_engine=None, ws_vad_min_speech_ms=None))]
+    ///     sdp: The offering party's SDP (``str`` or ``bytes``). Switches to raw
+    ///          mode. Blank raises ``ValueError``. No source address is carried,
+    ///          so a profile's ``received_from`` does not gate the party's
+    ///          media.
+    ///
+    /// Returns:
+    ///     ``True``, or the rewritten SDP as ``str`` when ``sdp`` was passed.
+    #[pyo3(signature = (request, profile=None, ws_uri=None, beep_detection=None, beep_cadence_guard_ms=None, ws_sample_rate=None, ws_tee_sample_rate=None, ws_vad_engine=None, ws_vad_min_speech_ms=None, sdp=None))]
     #[allow(clippy::too_many_arguments)]
     fn offer<'py>(
         &self,
@@ -624,6 +655,7 @@ impl PyRtpEngine {
         ws_tee_sample_rate: Option<u32>,
         ws_vad_engine: Option<&str>,
         ws_vad_min_speech_ms: Option<u32>,
+        sdp: Option<&Bound<'py, PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let profile_name = profile.unwrap_or(DEFAULT_PROFILE);
         let entry = self.registry.get(profile_name).ok_or_else(|| {
@@ -632,13 +664,20 @@ impl PyRtpEngine {
                 self.registry.profile_names().join(", ")
             ))
         })?;
-        let message = extract_message(request)?;
-        let (call_id, from_tag, sdp) = extract_offer_params(&message)?;
+        let offer::OfferInput {
+            call_id,
+            from_tag,
+            sdp: offer_sdp,
+            body,
+            identity,
+            source_ip,
+        } = offer::OfferInput::resolve(request, sdp)?;
         let anchored = self.sessions.get(&call_id);
         // Shaped for the party the rewritten offer is sent to: the callee of
         // the call under the `offer` half, and on a re-offer from the callee
         // the caller, under the `answer` half that has described it since the
-        // call was set up.
+        // call was set up. The offerer is named by its tag, so a raw re-offer
+        // from either party follows the same rule.
         let mut flags = match answer::shaping_half(
             anchored.as_ref(),
             &from_tag,
@@ -661,7 +700,6 @@ impl PyRtpEngine {
         // Resolve + template the bridge URI, then finalise the flags. Both run
         // before the async block so a bad template or an unhonourable flag
         // raises to the script instead of failing a call already in flight.
-        let source_ip = extract_source_ip(request);
         let resolved_ws_uri = resolve_ws_uri(
             ws_uri,
             &self.sessions,
@@ -684,81 +722,38 @@ impl PyRtpEngine {
             source_ip.as_deref(),
             profile_name,
         )?;
-        // The offer is the message's own SDP.
-        flags.stamp_sip_call_id(&call_id);
-        expand_stream_uris(&mut flags, &call_id, &from_tag, Some(&message))?;
-        let resolved_ws_uri = flags.ws_uri.clone();
+        // The message mode's offer is the message's own SDP, so its Call-ID
+        // labels the captures. A raw SDP need not belong to the call's SIP
+        // dialog (an access transfer hands one party's over in another), so it
+        // stamps none, as a raw answer does not.
+        if body.is_some() {
+            flags.stamp_sip_call_id(&call_id);
+        }
+        expand_stream_uris(&mut flags, &call_id, &from_tag, identity.as_ref())?;
+        let command = offer::OfferCommand::new(
+            &self.sessions,
+            call_id,
+            from_tag,
+            offer_sdp,
+            profile_name.to_string(),
+            flags.ws_uri.clone(),
+        );
 
         let client = Arc::clone(&self.client);
         let sessions = Arc::clone(&self.sessions);
-        let profile_str = profile_name.to_string();
-
-        // A call this process has already anchored is a *re*-offer — a re-INVITE
-        // or an UPDATE, the shape hold/unhold and an ICE restart arrive in. It
-        // has to keep the ports it already holds, so it goes out as `reoffer`;
-        // a plain `offer` on a live call-id replaces it on the siphon-rtp
-        // backend, taking its WebSocket bridge, tee and SIPREC subscription with
-        // it. Address the engine by the session's own id, not the SIP Call-ID:
-        // a siphon-terminated transfer re-anchors the surviving pair on a fresh
-        // engine call-id while the store key stays the SIP one.
-        let existing = sessions.get(&call_id);
-        let engine_call_id = existing
-            .as_ref()
-            .map(|session| session.rtpengine_id().to_string())
-            .unwrap_or_else(|| call_id.clone());
-        let is_reoffer = existing.is_some();
-
-        pyo3_async_runtimes::tokio::future_into_py(python, async move {
-            let rewritten_sdp = if is_reoffer {
-                client
-                    .reoffer(&engine_call_id, &from_tag, &sdp, &flags)
-                    .await
-                    .map_err(|error| {
-                        pyo3::exceptions::PyRuntimeError::new_err(format!(
-                            "rtpengine.offer failed (re-offer): {error}"
-                        ))
-                    })?
-            } else {
-                client
-                    .offer(&engine_call_id, &from_tag, &sdp, &flags)
-                    .await
-                    .map_err(|error| {
-                        pyo3::exceptions::PyRuntimeError::new_err(format!(
-                            "rtpengine.offer failed: {error}"
-                        ))
-                    })?
-            };
-
-            debug!(
-                call_id = %call_id,
-                sdp_len = rewritten_sdp.len(),
-                "RTPEngine offer: SDP rewritten"
-            );
-
-            replace_body(&message, &rewritten_sdp)?;
-
-            // Only an *initial* offer creates the session. Re-inserting on a
-            // re-offer would reset `rtpengine_call_id` to the SIP Call-ID —
-            // stranding a transfer-re-anchored call, whose engine id is
-            // deliberately different — and clear the `to_tag` the answer set,
-            // which is what every later `answer`/`delete` addresses the leg by.
-            if !is_reoffer {
-                sessions.insert(MediaSession {
-                    rtpengine_call_id: call_id.clone(),
-                    call_id,
-                    from_tag,
-                    to_tag: None,
-                    profile: profile_str,
-                    ws_uri: resolved_ws_uri,
-                    ws_tee: flags.ws_tee.clone(),
-                    ws_bridge_attached: false,
-                    bridge_sides: None,
-                    created_at: std::time::Instant::now(),
-                });
-            }
-
-            Ok(true)
-        })
+        match body {
+            // Message mode: the rewritten SDP replaces the message's body.
+            Some(message) => pyo3_async_runtimes::tokio::future_into_py(python, async move {
+                let rewritten_sdp = command.send(&client, &sessions, &flags).await?;
+                replace_body(&message, &rewritten_sdp)?;
+                Ok(true)
+            }),
+            // Raw mode: the script sends the rewritten SDP itself.
+            None => pyo3_async_runtimes::tokio::future_into_py(python, async move {
+                let rewritten_sdp = command.send(&client, &sessions, &flags).await?;
+                Ok(String::from_utf8_lossy(&rewritten_sdp).into_owned())
+            }),
+        }
     }
 
     /// Send an RTPEngine `answer` command.
@@ -4138,6 +4133,321 @@ mod tests {
                     "{profile}: {reoffer}"
                 );
             }
+        }
+
+        // -- offer(sdp=...): the offering party's own SDP, handed over raw
+
+        /// A party's new SDP, as an access transfer hands it over.
+        const NEW_SDP: &str = "v=0\r\no=- 2 2 IN IP4 192.0.2.20\r\ns=-\r\n\
+            c=IN IP4 192.0.2.20\r\nt=0 0\r\nm=audio 40000 RTP/AVP 0\r\n";
+
+        /// `await engine.offer(target, **kwargs)` from inside a coroutine.
+        fn await_offer(
+            python: Python<'_>,
+            engine: &Bound<'_, PyRtpEngine>,
+            target: &Bound<'_, PyAny>,
+            kwargs: &Bound<'_, PyDict>,
+        ) -> PyResult<Py<PyAny>> {
+            let code = CString::new(
+                "async def run(engine, target, kwargs):\n\
+                 \x20\x20\x20\x20return await engine.offer(target, **kwargs)\n",
+            )
+            .unwrap();
+            let globals = PyDict::new(python);
+            python.run(code.as_c_str(), Some(&globals), None)?;
+            let run = globals.get_item("run")?.unwrap();
+            let coroutine = run.call1((engine, target, kwargs))?;
+            crate::script::engine::run_coroutine_value(python, &coroutine)
+        }
+
+        /// The namespace on the stand-in native engine, over `sessions` and
+        /// `registry`.
+        async fn stand_in_namespace(
+            sessions: &Arc<MediaSessionStore>,
+            registry: Arc<ProfileRegistry>,
+        ) -> (PyRtpEngine, mpsc::UnboundedReceiver<serde_json::Value>) {
+            let (address, requests) = spawn_siphon_rtp_engine().await;
+            let (event_sender, _events) = mpsc::channel(16);
+            let set = crate::rtpengine::SiphonRtpClientSet::new(
+                vec![(address, 2_000, 1)],
+                None,
+                5_000,
+                event_sender,
+            )
+            .unwrap();
+            let engine = PyRtpEngine::new(
+                Arc::new(MediaBackend::SiphonRtp(set)),
+                Arc::clone(sessions),
+                registry,
+            );
+            (engine, requests)
+        }
+
+        /// Every media command the stand-in has been sent so far, ping aside.
+        fn sent_commands(
+            requests: &mut mpsc::UnboundedReceiver<serde_json::Value>,
+        ) -> Vec<serde_json::Value> {
+            let mut sent = Vec::new();
+            while let Ok(body) = requests.try_recv() {
+                if body["command"] != "ping" {
+                    sent.push(body);
+                }
+            }
+            sent
+        }
+
+        /// `offer(call, sdp=...)` on an anchored call from the near party: a
+        /// `reoffer` on the session's engine call-id carrying the SDP given,
+        /// resolving to the rewritten SDP. The Call's own INVITE body is neither
+        /// read nor written, and no source address goes with it even when the
+        /// party's own half asks for `received_from`.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_raw_reoffer_from_the_near_tag_keeps_the_ports_and_touches_no_message() {
+            Python::initialize();
+            let sessions = Arc::new(MediaSessionStore::new());
+            sessions.insert(MediaSession {
+                profile: "pins_caller".to_string(),
+                ..offered("call-20", "engine-20", Some("tag-b"))
+            });
+            let (namespace, mut requests) = stand_in_namespace(&sessions, pinning_profiles()).await;
+            let invite = dialog_message("call-20", None, OFFER_SDP);
+            let call_invite = Arc::clone(&invite);
+
+            let offered_sdp = with_engine(namespace, move |python, engine| {
+                let call = PyCall::new(
+                    "id-20".to_string(),
+                    call_invite,
+                    CALLER_SOURCE.to_string(),
+                    "udp".to_string(),
+                );
+                let target = Bound::new(python, call).unwrap();
+                let kwargs = PyDict::new(python);
+                kwargs.set_item("sdp", NEW_SDP).unwrap();
+                kwargs.set_item("profile", "pins_caller").unwrap();
+                let value = await_offer(python, engine, target.as_any(), &kwargs).unwrap();
+                value.bind(python).extract::<String>().unwrap()
+            })
+            .await;
+
+            assert_eq!(offered_sdp, ENGINE_SDP);
+            let sent = sent_commands(&mut requests);
+            assert_eq!(sent.len(), 1, "one command: {sent:?}");
+            let reoffer = &sent[0];
+            assert_eq!(reoffer["command"], "reoffer");
+            assert_eq!(reoffer["call_id"], "engine-20");
+            assert_eq!(reoffer["from_tag"], "tag-a");
+            assert_eq!(reoffer["sdp"], NEW_SDP);
+            assert_eq!(hint(reoffer), None, "no source address in raw mode");
+            assert_eq!(invite.lock().unwrap().body, OFFER_SDP.as_bytes());
+            let session = sessions.get("call-20").expect("the session");
+            assert_eq!(session.rtpengine_id(), "engine-20");
+            assert_eq!(session.from_tag, "tag-a");
+            assert_eq!(session.to_tag.as_deref(), Some("tag-b"));
+        }
+
+        /// Either party may re-offer raw, named by its tag. The command is
+        /// shaped for the party the rewritten offer goes to, by the rule the
+        /// message mode re-offer follows: the near party's re-offer by the
+        /// `offer` half, the far party's by the `answer` half.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_raw_reoffer_from_either_tag_is_shaped_for_the_other_party() {
+            Python::initialize();
+            let registry = Arc::new(ProfileRegistry::new());
+            let entry = registry.get("srtp_to_rtp").expect("a built-in profile");
+            let offer_transport = entry.offer.transport_protocol.clone();
+            let answer_transport = entry.answer.transport_protocol.clone();
+            assert_ne!(offer_transport, answer_transport, "halves tell apart");
+
+            for (sender, expected) in [("tag-a", offer_transport), ("tag-b", answer_transport)] {
+                let sessions = Arc::new(MediaSessionStore::new());
+                sessions.insert(MediaSession {
+                    profile: "srtp_to_rtp".to_string(),
+                    ..offered("call-21", "engine-21", Some("tag-b"))
+                });
+                let (namespace, mut requests) =
+                    stand_in_namespace(&sessions, Arc::clone(&registry)).await;
+                let offered_sdp = with_engine(namespace, move |python, engine| {
+                    let target = PyTuple::new(python, ["call-21", sender]).unwrap();
+                    let kwargs = PyDict::new(python);
+                    kwargs.set_item("sdp", NEW_SDP).unwrap();
+                    kwargs.set_item("profile", "srtp_to_rtp").unwrap();
+                    let value = await_offer(python, engine, target.as_any(), &kwargs).unwrap();
+                    value.bind(python).extract::<String>().unwrap()
+                })
+                .await;
+
+                assert_eq!(offered_sdp, ENGINE_SDP);
+                let sent = sent_commands(&mut requests);
+                assert_eq!(sent.len(), 1, "{sender}: {sent:?}");
+                let reoffer = &sent[0];
+                assert_eq!(reoffer["command"], "reoffer", "{sender}");
+                assert_eq!(reoffer["call_id"], "engine-21", "{sender}");
+                assert_eq!(reoffer["from_tag"], sender);
+                assert_eq!(
+                    reoffer["profile"]["transport_protocol"].as_str(),
+                    expected.as_deref(),
+                    "{sender}: {reoffer}"
+                );
+                let session = sessions.get("call-21").expect("the session");
+                assert_eq!(session.from_tag, "tag-a", "{sender}");
+                assert_eq!(session.to_tag.as_deref(), Some("tag-b"), "{sender}");
+            }
+        }
+
+        /// On a call not in the store, a raw offer is the call's first offer
+        /// and records the session as the message mode does.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_raw_offer_on_a_new_call_records_the_session() {
+            Python::initialize();
+            let engine = TestEngine::start(false).await;
+            let sessions = Arc::new(MediaSessionStore::new());
+            let namespace = namespace_on(&engine, &sessions).await;
+
+            let offered_sdp = with_engine(namespace, |python, engine| {
+                let target = PyTuple::new(python, ["call-22", "tag-a"]).unwrap();
+                let kwargs = PyDict::new(python);
+                kwargs
+                    .set_item("sdp", PyBytes::new(python, NEW_SDP.as_bytes()))
+                    .unwrap();
+                let value = await_offer(python, engine, target.as_any(), &kwargs).unwrap();
+                value.bind(python).extract::<String>().unwrap()
+            })
+            .await;
+
+            assert_eq!(offered_sdp, ENGINE_SDP);
+            let offers = engine.commands("offer");
+            assert_eq!(offers.len(), 1, "one offer reaches the engine");
+            assert_eq!(offers[0].call_id.as_deref(), Some("call-22"));
+            assert_eq!(offers[0].from_tag.as_deref(), Some("tag-a"));
+            assert_eq!(offers[0].sdp.as_deref(), Some(NEW_SDP));
+            let session = sessions
+                .get("call-22")
+                .expect("the offer records a session");
+            assert_eq!(session.rtpengine_id(), "call-22");
+            assert_eq!(session.from_tag, "tag-a");
+            assert_eq!(session.to_tag, None);
+            assert_eq!(session.profile, DEFAULT_PROFILE);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn bad_raw_offers_are_refused_before_anything_reaches_the_engine() {
+            Python::initialize();
+            let engine = TestEngine::start(false).await;
+            let sessions = Arc::new(MediaSessionStore::new());
+            let namespace = namespace_on(&engine, &sessions).await;
+
+            let refusals = with_engine(namespace, |python, engine| {
+                let tuple = PyTuple::new(python, ["call-25", "tag-a"]).unwrap();
+                let bare_call_id = PyString::new(python, "call-25");
+                let refuse = |target: &Bound<'_, PyAny>, sdp: Bound<'_, PyAny>| {
+                    let kwargs = PyDict::new(python);
+                    kwargs.set_item("sdp", sdp).unwrap();
+                    await_offer(python, engine, target, &kwargs).unwrap_err()
+                };
+                let text = |value: &str| PyString::new(python, value).into_any();
+                vec![
+                    // A bare call_id names no from-tag, and the offer needs one.
+                    refuse(bare_call_id.as_any(), text(NEW_SDP))
+                        .is_instance_of::<pyo3::exceptions::PyTypeError>(python),
+                    refuse(tuple.as_any(), text(""))
+                        .is_instance_of::<pyo3::exceptions::PyValueError>(python),
+                    refuse(tuple.as_any(), text(" \r\n"))
+                        .is_instance_of::<pyo3::exceptions::PyValueError>(python),
+                    refuse(
+                        tuple.as_any(),
+                        42i64.into_pyobject(python).unwrap().into_any(),
+                    )
+                    .is_instance_of::<pyo3::exceptions::PyTypeError>(python),
+                ]
+            })
+            .await;
+
+            assert_eq!(refusals, vec![true; 4]);
+            assert!(
+                engine.all_commands().is_empty(),
+                "nothing may reach the engine"
+            );
+            assert!(sessions.get("call-25").is_none());
+        }
+
+        /// The engine refusing the re-offer (here: it holds no such call)
+        /// raises `RuntimeError`, as the message mode does.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_raw_offer_the_engine_refuses_raises_runtime_error() {
+            Python::initialize();
+            let engine = crate::rtpengine::test_native_engine::NativeTestEngine::start().await;
+            let sessions = Arc::new(MediaSessionStore::new());
+            sessions.insert(offered("call-24", "call-24", Some("tag-b")));
+            let namespace = PyRtpEngine::new(
+                engine.backend(),
+                Arc::clone(&sessions),
+                Arc::new(ProfileRegistry::new()),
+            );
+
+            let is_runtime_error = with_engine(namespace, |python, engine| {
+                let target = PyTuple::new(python, ["call-24", "tag-b"]).unwrap();
+                let kwargs = PyDict::new(python);
+                kwargs.set_item("sdp", NEW_SDP).unwrap();
+                let error = await_offer(python, engine, target.as_any(), &kwargs).unwrap_err();
+                error.is_instance_of::<pyo3::exceptions::PyRuntimeError>(python)
+            })
+            .await;
+
+            assert!(is_runtime_error);
+            let reoffers = engine.commands("reoffer");
+            assert_eq!(reoffers.len(), 1);
+            assert!(reoffers[0].refused);
+        }
+
+        /// The far party re-offers raw and the near party's answer comes back
+        /// raw: `reoffer` from the far tag, then `answer` with the tags the
+        /// other way round, both on the session's engine call-id, and the
+        /// session keeps naming each party as before.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_raw_far_party_reoffer_and_its_raw_answer_drive_one_engine_call() {
+            Python::initialize();
+            let sessions = Arc::new(MediaSessionStore::new());
+            sessions.insert(offered("call-23", "engine-23", Some("tag-b")));
+            let (namespace, mut requests) =
+                stand_in_namespace(&sessions, Arc::new(ProfileRegistry::new())).await;
+
+            let (offered_sdp, answered_sdp) = with_engine(namespace, |python, engine| {
+                let target = PyTuple::new(python, ["call-23", "tag-b"]).unwrap();
+                let kwargs = PyDict::new(python);
+                kwargs.set_item("sdp", NEW_SDP).unwrap();
+                let offered_sdp = await_offer(python, engine, target.as_any(), &kwargs)
+                    .unwrap()
+                    .bind(python)
+                    .extract::<String>()
+                    .unwrap();
+                let kwargs = PyDict::new(python);
+                kwargs.set_item("sdp", OFFER_SDP).unwrap();
+                kwargs.set_item("to_tag", "tag-a").unwrap();
+                let answered_sdp = await_answer(python, engine, target.as_any(), &kwargs)
+                    .unwrap()
+                    .bind(python)
+                    .extract::<String>()
+                    .unwrap();
+                (offered_sdp, answered_sdp)
+            })
+            .await;
+
+            assert_eq!(offered_sdp, ENGINE_SDP);
+            assert_eq!(answered_sdp, ENGINE_SDP);
+            let sent = sent_commands(&mut requests);
+            let names: Vec<_> = sent.iter().map(|body| body["command"].clone()).collect();
+            assert_eq!(names, ["reoffer", "answer"], "{sent:?}");
+            let (reoffer, answer) = (&sent[0], &sent[1]);
+            assert_eq!(reoffer["call_id"], "engine-23");
+            assert_eq!(reoffer["from_tag"], "tag-b");
+            assert_eq!(reoffer["sdp"], NEW_SDP);
+            assert_eq!(answer["call_id"], "engine-23");
+            assert_eq!(answer["from_tag"], "tag-b");
+            assert_eq!(answer["to_tag"], "tag-a");
+            assert_eq!(answer["sdp"], OFFER_SDP);
+            let session = sessions.get("call-23").expect("the session");
+            assert_eq!(session.from_tag, "tag-a");
+            assert_eq!(session.to_tag.as_deref(), Some("tag-b"));
         }
     }
 }

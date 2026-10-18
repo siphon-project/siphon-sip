@@ -452,6 +452,68 @@ async def on_invite(call):
         assert harness.rtpengine.media_calls[-1]["op"] == "answer"
 
 
+class TestOfferRawSdp:
+    """``offer(target, sdp=...)`` for an offering party's SDP that reached the
+    script outside the call's own dialog."""
+
+    NEW_SDP = "v=0\r\nc=IN IP4 192.0.2.20\r\nm=audio 40000 RTP/AVP 0\r\n"
+
+    def test_returns_the_sdp_and_records_the_exchange(self, harness):
+        sdp = asyncio.run(
+            harness.rtpengine.offer(("call-1", "far-1"), sdp=self.NEW_SDP)
+        )
+        assert sdp == self.NEW_SDP
+        assert harness.rtpengine.media_calls[-1] == {
+            "op": "offer",
+            "call_id": "call-1",
+            "from_tag": "far-1",
+            "sdp": self.NEW_SDP,
+            "profile": "rtp_passthrough",
+        }
+        assert ("offer", "rtp_passthrough") in harness.rtpengine.operations
+
+    def test_a_sip_object_names_the_offerer_and_bytes_are_accepted(self, harness):
+        request = Request(method="INVITE", call_id="call-2", from_tag="ftag-2")
+        sdp = asyncio.run(
+            harness.rtpengine.offer(request, profile="ivr", sdp=self.NEW_SDP.encode())
+        )
+        assert sdp == self.NEW_SDP
+        recorded = harness.rtpengine.media_calls[-1]
+        assert (recorded["call_id"], recorded["from_tag"], recorded["profile"]) == (
+            "call-2",
+            "ftag-2",
+            "ivr",
+        )
+
+    def test_reoffer_then_raw_answer_with_reversed_tags(self, harness):
+        asyncio.run(harness.rtpengine.offer(("call-3", "far-3"), sdp=self.NEW_SDP))
+        asyncio.run(
+            harness.rtpengine.answer(
+                ("call-3", "far-3"), sdp=self.NEW_SDP, to_tag="near-3"
+            )
+        )
+        ops = [call["op"] for call in harness.rtpengine.media_calls]
+        assert ops[-2:] == ["offer", "answer"]
+        assert harness.rtpengine.media_calls[-1]["to_tag"] == "near-3"
+
+    def test_bare_call_id_is_refused(self, harness):
+        with pytest.raises(TypeError, match="tag"):
+            asyncio.run(harness.rtpengine.offer("call-1", sdp=self.NEW_SDP))
+        assert harness.rtpengine.operations == []
+
+    @pytest.mark.parametrize(
+        "bad, error", [("", ValueError), (" \r\n", ValueError), (42, TypeError)]
+    )
+    def test_bad_sdp_is_refused(self, harness, bad, error):
+        with pytest.raises(error):
+            asyncio.run(harness.rtpengine.offer(("call-1", "far-1"), sdp=bad))
+        assert harness.rtpengine.operations == []
+
+    def test_message_mode_still_resolves_to_true(self, harness):
+        assert asyncio.run(harness.rtpengine.offer(Call())) is True
+        assert harness.rtpengine.media_calls == []
+
+
 class TestMediaTargetForms:
     """Media verbs accept a SIP object, a (call_id, from_tag) pair, or a bare
     call_id string — all resolving to the same recorded (call_id, from_tag)."""

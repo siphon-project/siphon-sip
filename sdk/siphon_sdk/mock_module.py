@@ -4610,11 +4610,21 @@ class MockRtpEngine:
                     ws_sample_rate: Optional[int] = None,
                     ws_tee_sample_rate: Optional[int] = None,
                     ws_vad_engine: Optional[str] = None,
-                    ws_vad_min_speech_ms: Optional[int] = None) -> bool:
+                    ws_vad_min_speech_ms: Optional[int] = None,
+                    sdp: Union[str, bytes, None] = None) -> Union[bool, str]:
         """Send ``offer`` command to RTPEngine.
 
-        Extracts SDP from message body, sends to engine, replaces body
-        with rewritten SDP.
+        Two ways to hand it the offer:
+
+        * **A SIP message** (the usual case): the SDP comes off the body of
+          ``request``, the body is replaced with the rewritten SDP, and the
+          call resolves to ``True``.
+        * **Raw SDP** with ``sdp=``: for an offering party's SDP that reached
+          the script some other way, such as one party's new SDP on an access
+          transfer, which arrives in a dialog of its own. ``request`` then
+          only names the offerer. No message body is read or written; the call
+          resolves to the rewritten SDP as ``str`` for the script to send
+          itself.
 
         The profile's two halves describe the two parties of the call, not
         the two commands: the ``offer`` half is what the callee is sent and
@@ -4633,8 +4643,20 @@ class MockRtpEngine:
         ``received_from`` policy it started with, whoever re-offers. The mock
         records the profile name and rewrites nothing.
 
+        A raw re-offer names its party by tag: the tag of the party that made
+        the first offer, or the tag its answer recorded for the other party.
+        It is shaped by the same rule and goes to the engine as ``reoffer`` on
+        the call-id the engine knows the call by. The other party's answer can
+        be handed back raw too, with ``answer((call_id, offerer_tag),
+        sdp=..., to_tag=answerer_tag)``. On a call siphon has not anchored, a
+        raw offer is the call's first offer and records the session.
+
         Args:
-            request: Request or Call object with SDP body.
+            request: Request or Call object with SDP body. With ``sdp=`` it
+                     only names the offerer: a ``Call``, ``Request`` or
+                     ``Reply``, or a ``(call_id, from_tag)`` tuple. A bare
+                     ``call_id`` string names no party and raises
+                     ``TypeError``.
             profile: RTP profile name. Defaults to ``"rtp_passthrough"``.
             ws_uri: Bridge this leg's audio to an external WebSocket media
                     server (``siphon-rtp`` backend only), overriding the
@@ -4643,9 +4665,14 @@ class MockRtpEngine:
                     ``{to_user}`` placeholders. The resolved URI is recorded on
                     the media session, so a later ``answer`` reuses it
                     automatically.
+            sdp: The offering party's SDP (``str`` or ``bytes``). Switches to
+                 raw mode. Blank raises ``ValueError``. No source address is
+                 carried, so a profile's ``received_from`` does not gate the
+                 party's media.
 
         Returns:
-            ``True`` on success.
+            ``True``, or the rewritten SDP as ``str`` when ``sdp=`` was passed.
+            The mock rewrites nothing and returns ``sdp`` as given.
 
         Example::
 
@@ -4656,14 +4683,48 @@ class MockRtpEngine:
                     profile="voice_ai",
                     ws_uri=f"wss://ai.example.com/stream/{call.call_id}",
                 )
+
+            # Re-point the far party of an anchored call at an SDP that
+            # arrived in another dialog, then hand its answer back raw.
+            sdp = await rtpengine.offer((call_id, far_tag), sdp=new_sdp)
         """
-        self.operations.append(("offer", profile or "rtp_passthrough"))
+        # Validate before recording anything: the runtime refuses these before
+        # a command reaches the engine.
+        sdp_text: Optional[str] = None
+        if sdp is not None:
+            if isinstance(sdp, bytes):
+                sdp_text = sdp.decode("utf-8", errors="replace")
+            elif isinstance(sdp, str):
+                sdp_text = sdp
+            else:
+                raise TypeError("rtpengine.offer(sdp=...) must be str or bytes")
+            if not sdp_text.strip():
+                raise ValueError("rtpengine.offer(sdp=...) is empty")
+            if isinstance(request, str):
+                raise TypeError(
+                    "rtpengine.offer(sdp=...) needs the offerer's tag: pass the "
+                    "Call, Request or Reply, or a (call_id, from_tag) tuple, "
+                    "not a bare call_id"
+                )
+
+        resolved_profile = profile or "rtp_passthrough"
+        self.operations.append(("offer", resolved_profile))
         self.ws_uris.append(("offer", self._resolve_ws_uri(ws_uri, request)))
         self.media_overrides.append(("offer", _media_overrides(
             beep_detection, beep_cadence_guard_ms, ws_sample_rate,
             ws_tee_sample_rate, ws_vad_engine, ws_vad_min_speech_ms,
         )))
-        return True
+        if sdp_text is None:
+            return True
+        call_id, from_tag = _resolve_media_target(request)
+        self.media_calls.append({
+            "op": "offer",
+            "call_id": call_id,
+            "from_tag": from_tag,
+            "sdp": sdp_text,
+            "profile": resolved_profile,
+        })
+        return sdp_text
 
     async def answer(self, reply: Any,
                      profile: Optional[str] = None,
