@@ -106,6 +106,7 @@ mod tests {
             super::super::reoffer::PyReoffer,
             super::super::reply::PyReply,
             super::super::request::PyRequest,
+            super::super::ro_session::PyRoSession,
             super::super::rtpengine::PyRtpEngine,
             super::super::sbi::PySbi,
             super::super::sdp::PyMediaSection,

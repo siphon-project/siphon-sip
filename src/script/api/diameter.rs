@@ -3449,6 +3449,166 @@ impl PyDiameter {
         })
     }
 
+    /// Open a Ro credit-control session held by siphon (RFC 8506, TS 32.299)
+    /// and return a ``RoSession`` handle. Any number may be open at once — one
+    /// per conference leg, per forwarded leg, per CAMEL dialogue — each with
+    /// its own Session-Id, Subscription-Id, Service-Context-Id and
+    /// IMS-Information. siphon runs the session: re-authorization at the grant
+    /// less its Time-Quota-Threshold or at its Validity-Time, the OCS's RAR and
+    /// ASR, Final-Unit-Indication, Tx timer and Credit-Control-Failure-Handling
+    /// with failover to another ``ro`` peer (RFC 8506 §5.7).
+    ///
+    /// ``call_id`` binds it to a live B2BUA call (SIP Call-ID): it ends with
+    /// the call and credit exhaustion disconnects the call. ``RoSession.bind``
+    /// does the same later (reserve, then ``b2bua.originate``, then bind).
+    /// ``metering="external"`` is for an owner whose network element counts
+    /// the time (an SCP): no timer, ``RoSession.report(used_total)`` sends the
+    /// difference to the last report. ``additional_subscription_ids`` is a
+    /// list of ``(id, type)`` pairs sent as further Subscription-Id AVPs (the
+    /// IMSI next to the MSISDN). ``vcs_information`` is a dict of
+    /// VCS-Information members (TS 32.276, a Proxy Function's record):
+    /// ``bearer_capability``, ``network_call_reference_number``,
+    /// ``msc_address``, ``bearer_service``, ``teleservice``,
+    /// ``isup_location_number``, ``vlr_number`` (bytes, or a hex string),
+    /// ``forwarding_pending`` (0/1), ``isup_cause_location``,
+    /// ``isup_cause_value``, ``isup_cause_diagnostics``, ``start_time``,
+    /// ``start_of_charging``, ``stop_time`` (Unix seconds),
+    /// ``ps_free_format_data``. ``key`` files the session for
+    /// ``diameter.ro_find(key)``. ``on_event(session, event)`` is called when
+    /// siphon ends the session or the OCS aborts it or asks an external one to
+    /// report (``event["event"]`` is ``released`` / ``aborted`` /
+    /// ``reauthorize``). Defaults come from the ``ro:`` block; with Ro not
+    /// enabled the handle is ``authorized`` with no session.
+    #[pyo3(signature = (
+        subscription_id, *, subscription_id_type=None,
+        additional_subscription_ids=None, key=None, call_id=None,
+        metering="local", charge_from=None, on_event=None, vcs_information=None,
+        service_context_id=None, requested_seconds=None,
+        rating_group=None, service_identifier=None,
+        calling_party=None, called_party=None,
+        role_of_node=None, node_functionality=None,
+        ims_charging_identifier=None, user_session_id=None,
+        originating_ioi=None, terminating_ioi=None,
+        application_server=None, application_provided_called_party_address=None,
+        incoming_trunk_group_id=None, outgoing_trunk_group_id=None,
+        visited_network_id=None, access_network_information=None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn ro_session<'py>(
+        &self,
+        python: Python<'py>,
+        subscription_id: &str,
+        subscription_id_type: Option<&str>,
+        additional_subscription_ids: Option<Vec<(String, Option<String>)>>,
+        key: Option<String>,
+        call_id: Option<String>,
+        metering: &str,
+        charge_from: Option<&str>,
+        on_event: Option<Py<PyAny>>,
+        vcs_information: Option<&Bound<'_, pyo3::types::PyDict>>,
+        service_context_id: Option<String>,
+        requested_seconds: Option<u32>,
+        rating_group: Option<u32>,
+        service_identifier: Option<u32>,
+        calling_party: Option<&str>,
+        called_party: Option<&str>,
+        role_of_node: Option<&str>,
+        node_functionality: Option<&str>,
+        ims_charging_identifier: Option<&str>,
+        user_session_id: Option<&str>,
+        originating_ioi: Option<&str>,
+        terminating_ioi: Option<&str>,
+        application_server: Option<&str>,
+        application_provided_called_party_address: Option<&str>,
+        incoming_trunk_group_id: Option<&str>,
+        outgoing_trunk_group_id: Option<&str>,
+        visited_network_id: Option<&str>,
+        access_network_information: Option<&str>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        use crate::diameter::ro_service::{ChargeFrom, Metering};
+        let subscriber = build_subscriber(subscription_id, subscription_id_type)?;
+        let ims_data = build_ims_data(
+            calling_party,
+            called_party,
+            None,
+            role_of_node,
+            node_functionality,
+            ims_charging_identifier,
+            user_session_id,
+            originating_ioi,
+            terminating_ioi,
+            application_server,
+            application_provided_called_party_address,
+            incoming_trunk_group_id,
+            outgoing_trunk_group_id,
+            visited_network_id,
+            None,
+            access_network_information,
+        )?;
+        let additional_subscribers = additional_subscription_ids
+            .unwrap_or_default()
+            .iter()
+            .map(|(id, id_type)| build_subscriber(id, id_type.as_deref()))
+            .collect::<PyResult<Vec<_>>>()?;
+        let vcs_data = vcs_information
+            .map(super::ro_session::vcs_from_dict)
+            .transpose()?;
+        let metering = match metering.trim().to_ascii_lowercase().as_str() {
+            "local" => Metering::Local,
+            "external" => Metering::External,
+            other => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "diameter.ro_session: metering must be \"local\" or \"external\", not {other:?}"
+                )))
+            }
+        };
+        let charge_from = match charge_from.map(|value| value.trim().to_ascii_lowercase()) {
+            None => None,
+            Some(value) if value == "answer" => Some(ChargeFrom::Answer),
+            Some(value) if value == "invite" => Some(ChargeFrom::Invite),
+            Some(other) => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "diameter.ro_session: charge_from must be \"answer\" or \"invite\", not {other:?}"
+            )))
+            }
+        };
+        let event_hook = match on_event {
+            Some(handler) => {
+                let is_async = python
+                    .import("asyncio")?
+                    .call_method1("iscoroutinefunction", (handler.bind(python),))?
+                    .is_truthy()?;
+                Some(super::ro_session::event_hook(handler, is_async))
+            }
+            None => None,
+        };
+        let request = super::ro_session::OpenRequest {
+            subscriber,
+            additional_subscribers,
+            vcs_data,
+            ims_data,
+            service_context_id,
+            requested_seconds,
+            rating_group,
+            service_identifier,
+            metering,
+            charge_from,
+            key,
+            call_id,
+            event_hook,
+        };
+        crate::script::awaitable(
+            python,
+            async move { super::ro_session::open(request).await },
+        )
+    }
+
+    /// The open ``RoSession`` filed under ``key`` by ``diameter.ro_session``,
+    /// or None.
+    fn ro_find(&self, key: &str) -> Option<super::ro_session::PyRoSession> {
+        super::ro_session::find(key)
+    }
+
     /// Send a Ro CCR-INITIAL (open a Credit-Control session, RFC 8506 / TS
     /// 32.299). Returns ``{result_code, session_id, request_number,
     /// granted_time, validity_time, final_unit_action}`` or ``None`` when no
@@ -3539,6 +3699,8 @@ impl PyDiameter {
                 service_identifier,
                 requested_action: None,
                 multiple_services_indicator: true,
+                additional_subscribers: &[],
+                vcs_data: None,
             };
             match ro::send_ccr(client.peer(), &params).await {
                 Ok(answer) => Python::attach(|py| {
@@ -3730,6 +3892,8 @@ impl PyDiameter {
                 service_identifier: None,
                 requested_action: Some(requested_action),
                 multiple_services_indicator: false,
+                additional_subscribers: &[],
+                vcs_data: None,
             };
             match ro::send_ccr(client.peer(), &params).await {
                 Ok(answer) => Python::attach(|py| {
@@ -3794,6 +3958,8 @@ impl PyDiameter {
                 service_identifier,
                 requested_action: None,
                 multiple_services_indicator: false,
+                additional_subscribers: &[],
+                vcs_data: None,
             };
             match ro::send_ccr(client.peer(), &params).await {
                 Ok(answer) => Python::attach(|py| {

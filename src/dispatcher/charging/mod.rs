@@ -11,4 +11,5 @@ mod ro;
 
 pub(super) use rf::*;
 pub(super) use ro::*;
+pub(crate) use ro::{ro_answer_ocs_request, ro_bind_call, RO_CONTROL};
 pub use ro::{ro_authorize_b2bua, RoAuthorizeOutcome};

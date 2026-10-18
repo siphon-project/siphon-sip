@@ -122,7 +122,9 @@ fn default_rf_service_context_id() -> String {
 ///   service_context_id: "32260@3gpp.org"       # voice (SCUR); 32275 for MMTel-AS
 ///   sms_service_context_id: "32274@3gpp.org"   # SMS/RCS (IEC)
 ///   charge: orig                  # orig | term | both
-///   on_ocs_failure: terminate     # terminate (fail-closed) | continue (fail-open)
+///   on_ocs_failure: terminate     # terminate | continue | retry_and_terminate
+///   tx_timeout_ms: 0              # Tx timer; 0 = the peer's request timeout
+///   session_failover: false       # move a session to another `ro` peer when its server goes quiet
 ///   credit_denied_status: 402     # SIP status when the OCS denies at setup
 ///   rating_group: 100             # optional; presence selects the MSCC (multi-service) shape
 ///   access_network_information: false   # send P-Access-Network-Info as AVP 1263
@@ -169,9 +171,11 @@ pub struct RoConfig {
     /// reserve-before-connect is the entire point of the prepaid gate.
     #[serde(default = "default_ro_charge_from")]
     pub charge_from: String,
-    /// Behavior when the OCS is unreachable / times out (Credit-Control-Failure-
-    /// Handling): ``"terminate"`` (fail-closed) | ``"continue"`` (fail-open).
-    /// Default ``"terminate"``.
+    /// Behavior when the OCS is unreachable / times out: the default
+    /// Credit-Control-Failure-Handling (RFC 8506 §5.7), which a CCA carrying
+    /// the AVP overrides for its session. ``"terminate"`` (fail-closed) |
+    /// ``"continue"`` (fail-open) | ``"retry_and_terminate"`` (try another
+    /// peer, then fail closed). Default ``"terminate"``.
     #[serde(default = "default_ro_ocs_failure")]
     pub on_ocs_failure: String,
     /// SIP status returned when the OCS denies credit at setup. Default: 402.
@@ -193,6 +197,19 @@ pub struct RoConfig {
     pub access_network_information: bool,
     /// Explicit OCS peer name. When unset, the `ro` route's peer is used.
     pub peer: Option<String>,
+    /// The Tx timer (RFC 8506 §13): milliseconds to wait for a
+    /// Credit-Control-Answer before the request counts as failed and
+    /// Credit-Control-Failure-Handling decides. 0 keeps the peer's request
+    /// timeout. Default: 0.
+    #[serde(default)]
+    pub tx_timeout_ms: u32,
+    /// Whether a session may move to another peer on the `ro` route when its
+    /// server stops answering (CC-Session-Failover, RFC 8506 §5.7), until an
+    /// answer says otherwise. The request is re-sent there with the T flag.
+    /// Only under an `on_ocs_failure` other than `terminate`. Default: false,
+    /// the FAILOVER_NOT_SUPPORTED a CCA without the AVP means.
+    #[serde(default)]
+    pub session_failover: bool,
 }
 
 impl Default for RoConfig {
@@ -212,6 +229,8 @@ impl Default for RoConfig {
             service_identifier: None,
             access_network_information: false,
             peer: None,
+            tx_timeout_ms: 0,
+            session_failover: false,
         }
     }
 }

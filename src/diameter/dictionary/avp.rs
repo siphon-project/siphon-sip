@@ -67,6 +67,7 @@ pub const SUBSCRIPTION_ID_DATA: u32 = 444;
 pub const USED_SERVICE_UNIT: u32 = 446;
 pub const VALIDITY_TIME: u32 = 448;
 pub const FINAL_UNIT_ACTION: u32 = 449;
+pub const TARIFF_TIME_CHANGE: u32 = 451;
 pub const SUBSCRIPTION_ID_TYPE: u32 = 450;
 pub const G_S_U_POOL_IDENTIFIER: u32 = 453;
 pub const MULTIPLE_SERVICES_INDICATOR: u32 = 455;
@@ -221,6 +222,10 @@ pub const INCOMING_TRUNK_GROUP_ID: u32 = 852;
 pub const OUTGOING_TRUNK_GROUP_ID: u32 = 853;
 pub const CAUSE_CODE: u32 = 861;
 pub const NODE_FUNCTIONALITY: u32 = 862;
+/// Time-Quota-Threshold (TS 32.299 §7.2.229): seconds of the granted time
+/// left at which the CTF re-authorises, so the next grant arrives before the
+/// current one runs out.
+pub const TIME_QUOTA_THRESHOLD: u32 = 868;
 pub const SERVICE_INFORMATION: u32 = 873;
 pub const IMS_INFORMATION: u32 = 876;
 pub const ACCESS_NETWORK_INFORMATION: u32 = 1263;
@@ -307,3 +312,23 @@ pub const AUTN: u32 = 1449;
 pub const KASME: u32 = 1450;
 pub const MEID_3GPP2: u32 = 1471;
 pub const PUR_FLAGS: u32 = 1635;
+
+// TS 32.299 VCS-Information (TS 32.276 voice call charging), vendor 10415.
+pub const BEARER_SERVICE: u32 = 854;
+pub const PS_FREE_FORMAT_DATA: u32 = 866;
+pub const START_TIME: u32 = 2041;
+pub const STOP_TIME: u32 = 2042;
+pub const VCS_INFORMATION: u32 = 3410;
+pub const BASIC_SERVICE_CODE: u32 = 3411;
+pub const BEARER_CAPABILITY: u32 = 3412;
+pub const TELESERVICE: u32 = 3413;
+pub const ISUP_LOCATION_NUMBER: u32 = 3414;
+pub const FORWARDING_PENDING: u32 = 3415;
+pub const ISUP_CAUSE: u32 = 3416;
+pub const MSC_ADDRESS: u32 = 3417;
+pub const NETWORK_CALL_REFERENCE_NUMBER: u32 = 3418;
+pub const START_OF_CHARGING: u32 = 3419;
+pub const VLR_NUMBER: u32 = 3420;
+pub const ISUP_CAUSE_DIAGNOSTICS: u32 = 3422;
+pub const ISUP_CAUSE_LOCATION: u32 = 3423;
+pub const ISUP_CAUSE_VALUE: u32 = 3424;

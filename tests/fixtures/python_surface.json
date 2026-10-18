@@ -5,6 +5,7 @@
     "Flow",
     "LcrDecision",
     "PendingSA",
+    "RoSession",
     "Route",
     "SAHandle",
     "SecurityOffer",
@@ -782,6 +783,16 @@
         "doc": "Send a Ro CCR-UPDATE for an existing session. `request_number` MUST be a",
         "kind": "method_descriptor",
         "sig": "($self, subscription_id, session_id, request_number, *, subscription_id_type=None, service_context_id=None, used_seconds=None, requested_seconds=None, rating_group=None, service_identifier=None, peer=None)"
+      },
+      "ro_find": {
+        "doc": "The open ``RoSession`` filed under ``key`` by ``diameter.ro_session``,",
+        "kind": "method_descriptor",
+        "sig": "($self, key)"
+      },
+      "ro_session": {
+        "doc": "Open a Ro credit-control session held by siphon (RFC 8506, TS 32.299)",
+        "kind": "method_descriptor",
+        "sig": "($self, subscription_id, *, subscription_id_type=None, additional_subscription_ids=None, key=None, call_id=None, metering=\"local\", charge_from=None, on_event=None, vcs_information=None, service_context_id=None, requested_seconds=None, rating_group=None, service_identifier=None, calling_party=None, called_party=None, role_of_node=None, node_functionality=None, ims_charging_identifier=None, user_session_id=None, originating_ioi=None, terminating_ioi=None, application_server=None, application_provided_called_party_address=None, incoming_trunk_group_id=None, outgoing_trunk_group_id=None, visited_network_id=None, access_network_information=None)"
       },
       "rx_aar": {
         "doc": "Send an Rx AA-Request to authorize an IMS media session.",
@@ -2222,6 +2233,77 @@
       },
       "user_agent": {
         "doc": "User-Agent header value.",
+        "kind": "getset_descriptor"
+      }
+    },
+    "RoSession": {
+      "answered": {
+        "doc": "The call was answered: start the chargeable clock (local metering) and",
+        "kind": "method_descriptor",
+        "sig": "($self)"
+      },
+      "authorized": {
+        "kind": "getset_descriptor"
+      },
+      "bind": {
+        "doc": "Bind the session to the live B2BUA call with this SIP Call-ID: it ends",
+        "kind": "method_descriptor",
+        "sig": "($self, call_id)"
+      },
+      "call_id": {
+        "doc": "SIP Call-ID of the call the session is bound to.",
+        "kind": "getset_descriptor"
+      },
+      "final_unit_action": {
+        "doc": "Final-Unit-Action of the grant in force: 0 TERMINATE, 1 REDIRECT,",
+        "kind": "getset_descriptor"
+      },
+      "free_format_data": {
+        "doc": "PS-Free-Format-Data the OCS returned in VCS-Information (TS 32.276),",
+        "kind": "getset_descriptor"
+      },
+      "granted_time": {
+        "doc": "CC-Time of the grant in force (seconds).",
+        "kind": "getset_descriptor"
+      },
+      "key": {
+        "kind": "getset_descriptor"
+      },
+      "open": {
+        "doc": "Whether the credit-control session is live.",
+        "kind": "getset_descriptor"
+      },
+      "report": {
+        "doc": "External metering: report the cumulative usage in seconds and ask for",
+        "kind": "method_descriptor",
+        "sig": "($self, used_total, vcs_information=None)"
+      },
+      "result_code": {
+        "doc": "Result-Code of the last answer in the session, or of the refusal.",
+        "kind": "getset_descriptor"
+      },
+      "service_context_id": {
+        "kind": "getset_descriptor"
+      },
+      "session_id": {
+        "kind": "getset_descriptor"
+      },
+      "subscription_id": {
+        "kind": "getset_descriptor"
+      },
+      "tariff_time_change": {
+        "doc": "Tariff-Time-Change of the grant in force, Unix seconds.",
+        "kind": "getset_descriptor"
+      },
+      "terminate": {
+        "doc": "End the session (CCR-TERMINATION). ``cause_code`` is the",
+        "kind": "method_descriptor",
+        "sig": "($self, cause_code=..., used_total=None, vcs_information=None)"
+      },
+      "time_quota_threshold": {
+        "kind": "getset_descriptor"
+      },
+      "validity_time": {
         "kind": "getset_descriptor"
       }
     },

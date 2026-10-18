@@ -35,6 +35,7 @@ pub mod registrar;
 pub mod reoffer;
 pub mod reply;
 pub mod request;
+pub mod ro_session;
 mod route_entries;
 pub mod rtpengine;
 pub mod sbi;
@@ -760,6 +761,10 @@ pub fn install_siphon_module(python: Python<'_>) -> Result<()> {
     // LCR: `Route` / `LcrDecision` are returned by `await lcr.route(call)` and
     // consumed by `call.route(...)`. Registered so scripts can type-check /
     // repr them (`from siphon import Route` also resolves).
+    // Ro: `RoSession` is returned by `await diameter.ro_session(...)`.
+    module
+        .add_class::<ro_session::PyRoSession>()
+        .map_err(|error| SiphonError::Script(format!("add_class RoSession: {error}")))?;
     module
         .add_class::<lcr::PyRoute>()
         .map_err(|error| SiphonError::Script(format!("add_class Route: {error}")))?;

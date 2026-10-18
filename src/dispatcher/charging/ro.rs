@@ -75,9 +75,26 @@ pub fn orphaned_ro_session_keys<V>(
 /// omitted rather than reported as `0`, because siphon does not know what status
 /// the A-leg was sent from here and "normal end" would be a claim, not a gap.
 pub fn check_orphaned_ro_sessions(state: &DispatcherState) {
+    let Some(charger) = state.ro_charger.as_ref() else {
+        return;
+    };
+    // Sessions bound to a call with `ro_bind_call` end with it. The release
+    // paths end them with the call's own Cause-Code; this catches a call that
+    // went without passing one (an originated leg that never connected, among
+    // others) — expected for a bound session, so it is not a warning.
+    for internal_call_id in charger.bound_call_ids() {
+        if state.call_actors.contains_call(&internal_call_id) {
+            continue;
+        }
+        debug!(call = %internal_call_id, "ro: call gone, terminating the sessions bound to it");
+        let charger = Arc::clone(charger);
+        tokio::spawn(async move {
+            charger.end_bound(&internal_call_id, None).await;
+        });
+    }
     // Ro off, or nothing reserved: the overwhelmingly common case, and the
     // reason this is cheap enough for a 500 ms tick.
-    if state.ro_charger.is_none() || state.ro_sessions.is_empty() {
+    if state.ro_sessions.is_empty() {
         return;
     }
     // Collect first, then remove: iterating a DashMap while removing from it on
@@ -105,6 +122,66 @@ pub fn check_orphaned_ro_sessions(state: &DispatcherState) {
             charger.terminate_call(&session, None).await;
         });
     }
+}
+
+/// Answer an OCS Re-Auth-Request or Abort-Session-Request for one of the
+/// live Ro sessions (RFC 8506 §5.5). `None` when the request is not one —
+/// another application or command, Ro off, or a Session-Id siphon does not
+/// hold — so the caller hands it to the script as before.
+pub fn ro_answer_ocs_request(
+    incoming: &crate::diameter::peer::IncomingRequest,
+    origin_host: &str,
+    origin_realm: &str,
+) -> Option<Vec<u8>> {
+    use crate::diameter::dictionary;
+    if incoming.application_id != dictionary::RO_APP_ID {
+        return None;
+    }
+    let command = incoming.command_code;
+    if command != dictionary::CMD_RE_AUTH && command != dictionary::CMD_ABORT_SESSION {
+        return None;
+    }
+    let control = RO_CONTROL.get()?;
+    let session_id = incoming.avps.get("Session-Id")?.as_str()?;
+    let result_code = if command == dictionary::CMD_RE_AUTH {
+        control.charger.handle_rar(session_id)?
+    } else {
+        control.charger.handle_asr(session_id)?
+    };
+    let proxiable = incoming
+        .raw
+        .get(4)
+        .is_some_and(|flags| flags & crate::diameter::codec::FLAG_PROXIABLE != 0);
+    Some(crate::diameter::ro::build_session_answer(
+        command,
+        session_id,
+        result_code,
+        origin_host,
+        origin_realm,
+        incoming.hop_by_hop,
+        incoming.end_to_end,
+        proxiable,
+    ))
+}
+
+/// Bind an open Ro session to the live B2BUA call whose SIP Call-ID is
+/// `sip_call_id`: it then ends with that call (every path that releases the
+/// call's own reservation releases it too, with the same Cause-Code), and
+/// credit exhaustion disconnects that call. `false` when no such call is live
+/// or the session has ended.
+pub fn ro_bind_call(
+    session: &crate::diameter::ro_service::CcCreditSession,
+    sip_call_id: &str,
+) -> bool {
+    let (Some(control), Some(b2bua)) = (RO_CONTROL.get(), B2BUA_CONTROL.get()) else {
+        return false;
+    };
+    let Some(internal_call_id) = b2bua.state.call_actors.find_by_sip_call_id(sip_call_id) else {
+        return false;
+    };
+    control
+        .charger
+        .bind_call(session, &internal_call_id, sip_call_id)
 }
 
 /// Outcome of a script `call.ro_authorize()` gate — returned to Python as a
@@ -310,6 +387,7 @@ pub fn spawn_ro_b2bua_answer(state: &DispatcherState, internal_call_id: &str) {
     let Some(charger) = state.ro_charger.as_ref().map(Arc::clone) else {
         return;
     };
+    spawn_ro_bound_answer(state, internal_call_id);
     let Some(session) = state
         .ro_sessions
         .get(&ro_b2bua_key(internal_call_id))
@@ -319,6 +397,20 @@ pub fn spawn_ro_b2bua_answer(state: &DispatcherState, internal_call_id: &str) {
     };
     tokio::spawn(async move {
         charger.report_answer(&session).await;
+    });
+}
+
+/// Start the clock of the sessions bound to a call that was answered.
+fn spawn_ro_bound_answer(state: &DispatcherState, internal_call_id: &str) {
+    let Some(charger) = state.ro_charger.as_ref().map(Arc::clone) else {
+        return;
+    };
+    if charger.bound_sessions(internal_call_id).is_empty() {
+        return;
+    }
+    let internal_call_id = internal_call_id.to_string();
+    tokio::spawn(async move {
+        charger.answer_bound(&internal_call_id).await;
     });
 }
 
@@ -342,6 +434,16 @@ pub fn spawn_ro_b2bua_stop(
         Some(c) => Arc::clone(c),
         None => return,
     };
+    // Sessions bound to the call end with it, under the same cause.
+    if !charger.bound_sessions(internal_call_id).is_empty() {
+        let bound_charger = Arc::clone(&charger);
+        let bound_call = internal_call_id.to_string();
+        tokio::spawn(async move {
+            bound_charger
+                .end_bound(&bound_call, Some(cause_code.unwrap_or(0)))
+                .await;
+        });
+    }
     let key = ro_b2bua_key(internal_call_id);
     let Some((_, session)) = state.ro_sessions.remove(&key) else {
         return;

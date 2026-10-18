@@ -8028,6 +8028,102 @@ _REAUTHORIZE_FIXED_AVPS = {
 }
 
 
+class MockRoSession:
+    """Mock of the ``RoSession`` handle ``diameter.ro_session`` returns."""
+
+    def __init__(self, diameter: "MockDiameter", answer: Optional[dict], *,
+                 authorized: bool, result_code: Optional[int],
+                 subscription_id: Optional[str] = None, key: Optional[str] = None,
+                 call_id: Optional[str] = None, metering: str = "local",
+                 on_event: Optional[Callable] = None,
+                 service_context_id: Optional[str] = None,
+                 vcs_information: Optional[dict] = None) -> None:
+        self._diameter = diameter
+        self.authorized = authorized
+        self.result_code = result_code
+        self.session_id = answer["session_id"] if answer else None
+        self.subscription_id = subscription_id if answer else None
+        self.service_context_id = service_context_id
+        self.key = key if answer else None
+        self.call_id = call_id if answer else None
+        self.granted_time = answer["granted_time"] if answer else None
+        self.validity_time = answer["validity_time"] if answer else None
+        self.time_quota_threshold = None
+        self.final_unit_action = answer["final_unit_action"] if answer else None
+        self.tariff_time_change = None
+        self.free_format_data = None
+        self._metering = metering
+        self._on_event = on_event
+        self._vcs = dict(vcs_information or {})
+        self._open = answer is not None
+        self._request_number = 1
+        self._reported = 0
+
+    @property
+    def open(self) -> bool:
+        return self._open
+
+    def _close(self) -> None:
+        self._open = False
+        if self.key is not None and self._diameter._ro_sessions_by_key.get(self.key) is self:
+            del self._diameter._ro_sessions_by_key[self.key]
+
+    def bind(self, call_id: str) -> bool:
+        if not self._open:
+            return False
+        self.call_id = call_id
+        return True
+
+    async def answered(self) -> None:
+        return None
+
+    def _grant(self, result_code: Optional[int]) -> dict:
+        return {
+            "result_code": result_code, "open": self._open,
+            "granted_time": self.granted_time, "validity_time": self.validity_time,
+            "time_quota_threshold": self.time_quota_threshold,
+            "final_unit_action": self.final_unit_action,
+            "tariff_time_change": self.tariff_time_change,
+            "free_format_data": self.free_format_data,
+        }
+
+    async def report(self, used_total: int, vcs_information: Optional[dict] = None) -> dict:
+        if not self._open:
+            raise RuntimeError("RoSession.report: no credit-control session")
+        self._vcs.update(vcs_information or {})
+        used = max(0, used_total - self._reported)
+        answer = self._diameter._record_ccr(
+            "UPDATE", source="ro_session", session_id=self.session_id,
+            request_number=self._request_number, used_seconds=used,
+            vcs_information=dict(self._vcs))
+        self._request_number += 1
+        self._reported += used
+        if answer["result_code"] != 2001:
+            self._close()
+        return self._grant(answer["result_code"])
+
+    async def terminate(self, cause_code: Optional[int] = 0,
+                        used_total: Optional[int] = None,
+                        vcs_information: Optional[dict] = None) -> None:
+        if not self._open:
+            return None
+        self._close()
+        vcs = dict(self._vcs)
+        vcs.update(vcs_information or {})
+        used = None
+        if self._metering == "external" and used_total is not None:
+            used = max(0, used_total - self._reported)
+        self._diameter._record_ccr(
+            "TERMINATION", source="ro_session", session_id=self.session_id,
+            request_number=self._request_number, used_seconds=used,
+            cause_code=cause_code, vcs_information=vcs)
+        return None
+
+    def __repr__(self) -> str:
+        return (f"RoSession(session_id={self.session_id!r}, "
+                f"subscription_id={self.subscription_id!r}, open={self._open})")
+
+
 class MockDiameter:
     """Mock Diameter namespace for testing scripts that use ``from siphon import diameter``.
 
@@ -8083,6 +8179,7 @@ class MockDiameter:
         self._default_ro_final_unit_action: Optional[int] = None
         self._ro_session_counter: int = 0
         self._ro_ccrs: list[dict] = []  # captured CCRs for assertions
+        self._ro_sessions_by_key: dict[str, "MockRoSession"] = {}
 
     def is_connected(self, peer_name: str) -> bool:
         """Check if a Diameter peer is connected.
@@ -9307,6 +9404,91 @@ class MockDiameter:
         """Configure the Final-Unit-Action (0=TERMINATE) returned in the CCA."""
         self._default_ro_final_unit_action = action
 
+    # -- Ro sessions held by siphon (diameter.ro_session) --
+
+    async def ro_session(
+        self,
+        subscription_id: str,
+        *,
+        subscription_id_type: Optional[str] = None,
+        additional_subscription_ids: Optional[list] = None,
+        key: Optional[str] = None,
+        call_id: Optional[str] = None,
+        metering: str = "local",
+        charge_from: Optional[str] = None,
+        on_event: Optional[Callable] = None,
+        vcs_information: Optional[dict] = None,
+        **ims: Any,
+    ) -> "MockRoSession":
+        """Open a Ro session held by siphon and return its ``RoSession``.
+
+        Any number may be open at once; ``key`` files it for
+        :meth:`ro_find`. The CCRs land in :meth:`captured_ccrs` with
+        ``source="ro_session"``. Drive the OCS side with
+        :meth:`trigger_ro_event`.
+
+        Example:
+            camel = await diameter.ro_session(
+                "15550100004", subscription_id_type="e164",
+                additional_subscription_ids=[("001010000000004", "imsi")],
+                key="dialogue-1", metering="external",
+                service_context_id="32276@3gpp.org",
+                role_of_node="forwarding", node_functionality="proxy",
+                vcs_information={"msc_address": "51551000f9"})
+            grant = await camel.report(used_total=30)
+            await camel.terminate(used_total=42,
+                                  vcs_information={"isup_cause_value": 16})
+        """
+        if metering not in ("local", "external"):
+            raise ValueError(f"diameter.ro_session: metering must be \"local\" or \"external\", not {metering!r}")
+        if key is not None and key in self._ro_sessions_by_key:
+            return MockRoSession(self, None, authorized=False, result_code=5012)
+        answer = self._record_ccr(
+            "INITIAL",
+            request_number=0,
+            source="ro_session",
+            subscription_id=subscription_id,
+            subscription_id_type=subscription_id_type,
+            additional_subscription_ids=list(additional_subscription_ids or []),
+            key=key,
+            call_id=call_id,
+            metering=metering,
+            charge_from=charge_from,
+            vcs_information=dict(vcs_information or {}),
+            **ims,
+        )
+        if answer["result_code"] != 2001:
+            return MockRoSession(self, None, authorized=False, result_code=answer["result_code"])
+        session = MockRoSession(
+            self, answer, authorized=True, result_code=2001,
+            subscription_id=subscription_id, key=key, call_id=call_id,
+            metering=metering, on_event=on_event,
+            service_context_id=ims.get("service_context_id"),
+            vcs_information=dict(vcs_information or {}),
+        )
+        if key is not None:
+            self._ro_sessions_by_key[key] = session
+        return session
+
+    def ro_find(self, key: str) -> Optional["MockRoSession"]:
+        """The open ``RoSession`` filed under ``key``, or None."""
+        return self._ro_sessions_by_key.get(key)
+
+    def trigger_ro_event(self, session: "MockRoSession", event: str,
+                         result_code: Optional[int] = None) -> Any:
+        """Act as the OCS: ``"aborted"`` (ASR, ends the session),
+        ``"reauthorize"`` (RAR or Validity-Time on an external session) or
+        ``"released"``. Calls the session's ``on_event(session, event)`` and
+        returns what it returned (a coroutine for an ``async def``)."""
+        if event in ("aborted", "released"):
+            session._close()
+        if session._on_event is None:
+            return None
+        return session._on_event(session, {
+            "event": event, "reason": event, "result_code": result_code,
+            "final_unit_action": None, "redirect_server_address": None,
+        })
+
     def captured_ccrs(self) -> list[dict]:
         """Return all CCRs the script has emitted via ``ro_ccr_*`` (fresh copy)."""
         return [dict(entry) for entry in self._ro_ccrs]
@@ -9780,6 +9962,7 @@ class MockDiameter:
         self._default_ro_final_unit_action = None
         self._ro_session_counter = 0
         self._ro_ccrs.clear()
+        self._ro_sessions_by_key.clear()
 
 
 # ---------------------------------------------------------------------------

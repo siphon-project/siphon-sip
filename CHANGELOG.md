@@ -13,6 +13,32 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
+### Added
+
+- **Ro: sessions held in Rust, as many per call as needed, or none bound to a
+  call.** `await diameter.ro_session(...)` opens a credit-control session and
+  returns a `RoSession` handle; each has its own Session-Id, Subscription-Ids,
+  Service-Context-Id and IMS-Information, so a forwarded leg can be charged to
+  the forwarding user (Role-Of-Node FORWARDING) next to the caller's session,
+  and a conference focus can charge each dial-out leg. siphon runs the session:
+  re-authorization at the grant less its Time-Quota-Threshold or at its
+  Validity-Time, the OCS's RAR and ASR (answered before scripts),
+  Final-Unit-Indication, the Tx timer and Credit-Control-Failure-Handling with
+  failover to another `ro` peer under the T flag (RFC 8506 §5.7;
+  `ro.tx_timeout_ms`, `ro.session_failover`). `call_id=` or `RoSession.bind()`
+  ties it to a B2BUA call; `metering="external"` is for an owner whose network
+  element counts the time (an SCP): `report(used_total)` sends the difference
+  to the last report. `key=` files it for `diameter.ro_find(key)`, `on_event=`
+  hears `released` / `aborted` / `reauthorize`. `call.ro_authorize()` is
+  unchanged, now on the same primitive.
+- **Ro: VCS-Information for a Proxy Function (TS 32.276).** `vcs_information=`
+  on `ro_session`, `report` and `terminate` sends the VCS-Information group
+  (TS 32.299 §7.2.242A); `terminate(vcs_information=...)` adds ISUP-Cause and
+  Stop-Time to the CCR-TERMINATION only. More Subscription-Ids
+  (`additional_subscription_ids`, the IMSI next to the MSISDN). The grant
+  reports Tariff-Time-Change (read from the Granted-Service-Unit, where it was
+  never found before) and the PS-Free-Format-Data the OCS returns.
+
 ### Fixed
 
 - **Proxy: a retransmitted 2xx to an INVITE goes out as the first copy was

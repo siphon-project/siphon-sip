@@ -149,3 +149,52 @@ class TestRoAuthorizeGate:
         call = Call()
         with pytest.raises(ValueError):
             run(call.ro_authorize(role_of_node="b2bua"))
+
+
+class TestRoSessionMock:
+    def setup_method(self):
+        mock_module.install()
+        mock_module.reset()
+        self.diameter = mock_module.get_diameter()
+
+    def test_two_sessions_are_independent_and_keyed(self):
+        from siphon import diameter
+        caller = run(diameter.ro_session("sip:+15550100001@ims.example.net",
+                                         role_of_node="originating"))
+        camel = run(diameter.ro_session(
+            "15550100004", subscription_id_type="e164",
+            additional_subscription_ids=[("001010000000004", "imsi")],
+            key="dialogue-1", metering="external",
+            service_context_id="32276@3gpp.org",
+            role_of_node="forwarding", node_functionality="proxy",
+            vcs_information={"msc_address": "51551000f9"}))
+        assert caller.open and camel.open
+        assert caller.session_id != camel.session_id
+        assert diameter.ro_find("dialogue-1") is camel
+        duplicate = run(diameter.ro_session("15550100004", key="dialogue-1"))
+        assert not duplicate.authorized
+
+        run(camel.report(30))
+        run(camel.terminate(used_total=42, vcs_information={"isup_cause_value": 16}))
+        assert not camel.open and caller.open
+        assert diameter.ro_find("dialogue-1") is None
+        ccrs = [c for c in self.diameter.captured_ccrs() if c["session_id"] == camel.session_id]
+        assert [c["request_type"] for c in ccrs] == ["INITIAL", "UPDATE", "TERMINATION"]
+        assert [c.get("used_seconds") for c in ccrs[1:]] == [30, 12]
+        assert "isup_cause_value" not in ccrs[1]["vcs_information"]
+        assert ccrs[2]["vcs_information"] == {"msc_address": "51551000f9", "isup_cause_value": 16}
+
+    def test_an_abort_reaches_the_owner_and_ends_the_session(self):
+        from siphon import diameter
+        events = []
+        camel = run(diameter.ro_session("15550100004", key="dialogue-2", metering="external",
+                                        on_event=lambda session, event: events.append(event["event"])))
+        self.diameter.trigger_ro_event(camel, "aborted")
+        assert events == ["aborted"]
+        assert not camel.open and diameter.ro_find("dialogue-2") is None
+
+    def test_a_refusal_is_not_authorized(self):
+        from siphon import diameter
+        self.diameter.set_ro_result_code(4012)
+        session = run(diameter.ro_session("15550100004"))
+        assert not session.authorized and session.result_code == 4012 and not session.open
