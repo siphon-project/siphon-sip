@@ -280,6 +280,8 @@ mod ro_orphan_backstop_tests;
 #[cfg(test)]
 mod script_header_precedence_tests;
 #[cfg(test)]
+mod script_info_far_leg_tests;
+#[cfg(test)]
 mod script_info_tests;
 #[cfg(test)]
 mod script_refer_tests;

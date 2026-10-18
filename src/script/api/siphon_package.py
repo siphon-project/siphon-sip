@@ -447,17 +447,19 @@ class _B2buaNamespace:
         return control.complete_refer(call_id, code, reason)
 
     def send_info(self, call_id, body=None, content_type=None, headers=None,
-                  timeout_ms=5000):
+                  timeout_ms=5000, leg="caller", with_body=False):
         """Send an INFO (RFC 6086) in the caller's dialog of a call (on a call
-        siphon answered itself, its only dialog), with ``body`` (str or bytes)
+        siphon answered itself, its only dialog), or with ``leg="callee"`` in
+        the answered callee's, with ``body`` (str or bytes)
         of ``content_type`` and any extra ``headers`` (a dict; the headers
         that place a request in its dialog are siphon's and refused). The CSeq
         is the dialog's, the request goes to the remote target through the
         route set, and on UDP it is retransmitted until answered.
 
         Returns:
-            An awaitable of the final status code (int), or ``None`` when
-            none arrives within ``timeout_ms``.
+            An awaitable of the final status code (int), or with
+            ``with_body=True`` of ``(status, body bytes, content_type)``, or
+            ``None`` when none arrives within ``timeout_ms``.
 
         Raises:
             ValueError: the call is unknown (``not_found``), a header may not
@@ -471,7 +473,8 @@ class _B2buaNamespace:
         control = object.__getattribute__(self, "__dict__").get("_control")
         if control is None:
             raise ValueError("b2bua.send_info(): not_found: no B2BUA running")
-        return control.send_info(call_id, body, content_type, headers, timeout_ms)
+        return control.send_info(call_id, body, content_type, headers, timeout_ms, leg,
+                                 with_body)
 
     def replace_peer(
         self,
@@ -696,7 +699,10 @@ class _B2buaNamespace:
         ``200 OK`` as before. A DTMF payload still reaches
         ``@rtpengine.on_dtmf`` first. A retransmission of the INFO is
         answered with the same response and does not run the handler again.
-        An INFO on a call with a far leg is relayed to it and not shown here.
+        On a call with a far leg the handler sees an INFO from either party
+        (``request.get_header("Call-ID")`` says whose dialog it came on): one
+        it answers is answered here and not relayed, one it leaves is relayed
+        to the other party as before.
 
         Usage:
             @b2bua.on_info

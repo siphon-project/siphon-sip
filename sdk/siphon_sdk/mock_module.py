@@ -1148,6 +1148,8 @@ class MockB2bua:
         # Records b2bua.send_info(...) calls, and the status they resolve to.
         self.sent_infos: list[dict] = []
         self.info_status: Optional[int] = 200
+        self.info_body: bytes = b""
+        self.info_content_type: Optional[str] = None
 
     def clear(self) -> None:
         """Reset recorded imperative calls (called by ``reset()``)."""
@@ -1155,6 +1157,8 @@ class MockB2bua:
         self.refer_reports.clear()
         self.sent_infos.clear()
         self.info_status = 200
+        self.info_body = b""
+        self.info_content_type = None
         self.terminates.clear()
         self.refers.clear()
         self.originates.clear()
@@ -1607,9 +1611,11 @@ class MockB2bua:
                         body: Optional[Union[str, bytes]] = None,
                         content_type: Optional[str] = None,
                         headers: Optional[dict] = None,
-                        timeout_ms: int = 5000) -> Optional[int]:
+                        timeout_ms: int = 5000,
+                        leg: str = "caller", with_body: bool = False):
         """Send an INFO (RFC 6086) in the caller's dialog of a call (on a call
-        siphon answered itself, its only dialog). The CSeq is the dialog's,
+        siphon answered itself, its only dialog), or with ``leg="callee"`` in
+        the answered callee's. The CSeq is the dialog's,
         the request goes to the remote target through the route set, and on
         UDP it is retransmitted until answered.
 
@@ -1621,10 +1627,12 @@ class MockB2bua:
                 dialog (Call-ID, CSeq, From, To, Via, Route, Contact, ...)
                 are siphon's and refused.
             timeout_ms: how long to wait for the final response.
+            leg: ``"caller"`` or ``"callee"``.
+            with_body: resolve to ``(status, body, content_type)`` instead.
 
         Returns:
-            int | None: the final status code, or None when none arrived in
-            ``timeout_ms``.
+            int | tuple | None: the final status code (or the tuple), or None
+            when none arrived in ``timeout_ms``.
 
         Raises:
             ValueError: the call is unknown (``not_found``), a header may not
@@ -1632,18 +1640,23 @@ class MockB2bua:
                 (``invalid_state``).
 
         In the mock, records ``{"call_id", "body", "content_type",
-        "headers"}`` on ``sent_infos`` and returns ``info_status`` (200).
+        "headers", "leg"}`` on ``sent_infos`` and returns ``info_status``
+        (200), or ``(info_status, info_body, info_content_type)``.
 
         Usage::
 
             status = await b2bua.send_info(call.call_id, body,
                                            "application/example+xml")
         """
+        if leg not in ("caller", "callee"):
+            raise ValueError(f'b2bua.send_info(leg=…) is "caller" or "callee" (got {leg!r})')
         if isinstance(body, str):
             body = body.encode()
         self.sent_infos.append({"call_id": call_id, "body": body or b"",
                                 "content_type": content_type,
-                                "headers": dict(headers or {})})
+                                "headers": dict(headers or {}), "leg": leg})
+        if with_body:
+            return (self.info_status, self.info_body, self.info_content_type)
         return self.info_status
 
     def terminate(self, call_id: str, reason: str = "Normal Clearing") -> bool:
@@ -1948,7 +1961,7 @@ class MockB2bua:
     @staticmethod
     def on_info(fn: Callable) -> Callable:
         """Register handler for an in-dialog INFO (RFC 6086) on a call siphon
-        answered itself (no far leg).
+        answered itself, or from either party of a bridged call.
 
         Handler signature: ``(call, request) -> None``.
 
@@ -1957,7 +1970,8 @@ class MockB2bua:
         ``request.reply(code, reason)``, a final status. Without a handler,
         or when it answers nothing, siphon answers a bare ``200 OK``. A
         retransmission gets the same response without running the handler
-        again. An INFO on a call with a far leg is relayed, not shown here.
+        again. On a call with a far leg the handler sees an INFO from either
+        party; one it answers is not relayed, one it leaves is relayed.
 
         Example::
 

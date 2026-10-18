@@ -269,9 +269,10 @@ async fn a_handler_that_raises_leaves_the_default_answer() {
 async fn a_sent_info_is_in_the_dialog_and_its_answer_comes_back() {
     let call = answered("info-send@192.0.2.10", &script(""));
     let state = &call.dispatcher.state;
-    let mut sent = send_info_on_a_leg(
+    let mut sent = send_info_on_leg(
         state,
         &call.internal_call_id,
+        true,
         Some(PACKAGE),
         b"<event/>".to_vec(),
         &[("X-Note".to_string(), "1".to_string())],
@@ -333,10 +334,9 @@ async fn a_sent_info_is_in_the_dialog_and_its_answer_comes_back() {
     );
     let response = parse_sip_message_bytes(raw.as_bytes()).expect("parses");
     assert!(take_sent_info_response(&response, 200));
-    assert_eq!(
-        sent.response.try_recv().expect("answered"),
-        (200, "OK".to_string())
-    );
+    let answered = sent.response.try_recv().expect("answered");
+    assert_eq!((answered.status, answered.reason.as_str()), (200, "OK"));
+    assert!(answered.body.is_empty());
     // Taken once.
     assert!(!take_sent_info_response(&response, 200));
 

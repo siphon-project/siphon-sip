@@ -121,7 +121,7 @@
       "send_info": {
         "doc": "Send an INFO (RFC 6086) in the caller's dialog of a call (on a call",
         "kind": "method_descriptor",
-        "sig": "($self, call_id, body=None, content_type=None, headers=None, timeout_ms=5000)"
+        "sig": "($self, call_id, body=None, content_type=None, headers=None, timeout_ms=5000, leg=\"caller\", with_body=False)"
       },
       "terminate": {
         "doc": "Imperatively end a B2BUA call by its SIP Call-ID, sending an in-dialog",

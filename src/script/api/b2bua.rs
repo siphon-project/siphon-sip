@@ -341,21 +341,24 @@ impl PyB2buaControl {
     }
 
     /// Send an INFO (RFC 6086) in the caller's dialog of a call (on a call
-    /// siphon answered itself, its only dialog) with `body` (str or bytes)
+    /// siphon answered itself, its only dialog), or with `leg="callee"` in
+    /// the answered callee's, with `body` (str or bytes)
     /// of `content_type`, and any extra `headers` (a dict; the headers that
     /// place a request in its dialog are siphon's and refused). The CSeq is
     /// the dialog's, the request goes to the remote target through the route
     /// set, and on UDP it is retransmitted until answered.
     ///
-    /// Awaitable: resolves to the final status code (an int), or `None` when
-    /// none arrives within `timeout_ms`. Raises `ValueError` when the call is
+    /// Awaitable: resolves to the final status code (an int), or with
+    /// `with_body=True` to `(status, body bytes, content_type)`, or `None`
+    /// when none arrives within `timeout_ms`. Raises `ValueError` when the call is
     /// unknown (`not_found`), a header may not be set (`bad_request`), or the
     /// call has no dialog yet (`invalid_state`).
     ///
     /// ```python
     /// status = await b2bua.send_info(call.call_id, body, "application/example+xml")
     /// ```
-    #[pyo3(signature = (call_id, body=None, content_type=None, headers=None, timeout_ms=5000))]
+    #[pyo3(signature = (call_id, body=None, content_type=None, headers=None, timeout_ms=5000, leg="caller", with_body=false))]
+    #[allow(clippy::too_many_arguments)]
     fn send_info<'py>(
         &self,
         python: Python<'py>,
@@ -364,8 +367,19 @@ impl PyB2buaControl {
         content_type: Option<&str>,
         headers: Option<&Bound<'py, pyo3::types::PyDict>>,
         timeout_ms: u64,
+        leg: &str,
+        with_body: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
         use pyo3::exceptions::PyValueError;
+        let on_a_leg = match leg {
+            "caller" => true,
+            "callee" => false,
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "b2bua.send_info(leg=…) is \"caller\" or \"callee\" (got {other:?})"
+                )))
+            }
+        };
         let body: Vec<u8> = match body {
             None => Vec::new(),
             Some(value) => {
@@ -391,20 +405,37 @@ impl PyB2buaControl {
                 extra.push((name.extract::<String>()?, value.extract::<String>()?));
             }
         }
-        let sent = crate::dispatcher::b2bua_send_info(call_id, content_type, body, &extra)
-            .map_err(|refusal| PyValueError::new_err(format!("b2bua.send_info(): {refusal}")))?;
+        let sent =
+            crate::dispatcher::b2bua_send_info(call_id, on_a_leg, content_type, body, &extra)
+                .map_err(|refusal| {
+                    PyValueError::new_err(format!("b2bua.send_info(): {refusal}"))
+                })?;
         pyo3_async_runtimes::tokio::future_into_py(python, async move {
             let waited =
                 tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), sent.response)
                     .await;
-            Ok(match waited {
-                Ok(Ok((status, _reason))) => Some(status),
+            let answered = match waited {
+                Ok(Ok(response)) => Some(response),
                 // Timed out, or the wait was dropped with the dispatcher: a
                 // late response is then absorbed as one to no request.
                 _ => {
                     crate::dispatcher::forget_sent_info(&sent.branch);
                     None
                 }
+            };
+            Python::attach(|python| -> PyResult<Py<PyAny>> {
+                Ok(match answered {
+                    None => python.None(),
+                    Some(response) if with_body => (
+                        response.status,
+                        pyo3::types::PyBytes::new(python, &response.body),
+                        response.content_type,
+                    )
+                        .into_pyobject(python)?
+                        .into_any()
+                        .unbind(),
+                    Some(response) => response.status.into_pyobject(python)?.into_any().unbind(),
+                })
             })
         })
     }

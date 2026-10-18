@@ -114,22 +114,22 @@ pub fn handle_b2bua_info(inbound: InboundMessage, message: SipMessage, state: &D
         }
     }
 
-    if has_far_leg {
-        b2bua_forward_indialog_request(
-            &inbound,
-            &message,
-            &call_id,
-            from_a_leg,
-            Method::Info,
-            crate::b2bua::actor::ForwardedMarker::Info,
-            state,
-        );
+    // `@b2bua.on_info` sees the INFO first. On a call with a far leg it may
+    // answer it itself (an application package spoken between the script
+    // and that party, never meant for the other one); left unanswered it is
+    // relayed as before. Without a handler a two-leg INFO is relayed at once.
+    let has_handler = !state
+        .engine
+        .state()
+        .handlers_for(&HandlerKind::B2buaInfo)
+        .is_empty();
+    if has_far_leg && !has_handler {
+        relay_info(&inbound, &message, &call_id, from_a_leg, state);
         return;
     }
 
-    // One-legged: siphon is the far party, so it answers. A retransmission of
-    // an INFO already handed to the script gets the same answer again, and is
-    // not handed over twice (RFC 3261 §17.2.2).
+    // A retransmission of an INFO already handed to the script gets the same
+    // answer again, and is not handed over twice (RFC 3261 §17.2.2).
     let key = InfoKey::of(&message);
     if let Some(key) = &key {
         match answered_infos().begin(key) {
@@ -152,15 +152,26 @@ pub fn handle_b2bua_info(inbound: InboundMessage, message: SipMessage, state: &D
             }
         }
     }
-    // `@b2bua.on_info` may answer it itself, with a status and a body (RFC
-    // 6086 §4.2.2 lets a 200 to an INFO carry one, and an application package
-    // that carries requests in INFO needs it for their results). Without a
-    // handler, or a handler that does not answer, it is a bare 200: an INFO a
-    // UAS understood, with no body owed back.
-    let response = run_info_hook(&call_id, &inbound, &message, state).unwrap_or_else(|| {
-        debug!(call_id = %call_id, "B2BUA INFO: answering on a one-legged call");
-        build_response(&message, 200, "OK", state.server_header.as_deref(), &[])
-    });
+    // The handler may answer it with a status and a body (RFC 6086 §4.2.2
+    // lets a 200 to an INFO carry one, and an application package that
+    // carries requests in INFO needs it for their results).
+    let response = match run_info_hook(&call_id, &inbound, &message, state) {
+        Some(response) => response,
+        None if has_far_leg => {
+            // Not the script's: relayed, and its retransmissions with it.
+            if let Some(key) = &key {
+                answered_infos().forget(key);
+            }
+            relay_info(&inbound, &message, &call_id, from_a_leg, state);
+            return;
+        }
+        // One-legged and unanswered: siphon is the far party, so it is a bare
+        // 200, an INFO a UAS understood with no body owed back.
+        None => {
+            debug!(call_id = %call_id, "B2BUA INFO: answering on a one-legged call");
+            build_response(&message, 200, "OK", state.server_header.as_deref(), &[])
+        }
+    };
     if let Some(key) = key {
         answered_infos().answered(key, &response);
     }
@@ -174,7 +185,25 @@ pub fn handle_b2bua_info(inbound: InboundMessage, message: SipMessage, state: &D
     );
 }
 
-/// Show an INFO on a one-legged call to `@b2bua.on_info` and build the
+fn relay_info(
+    inbound: &InboundMessage,
+    message: &SipMessage,
+    call_id: &str,
+    from_a_leg: bool,
+    state: &DispatcherState,
+) {
+    b2bua_forward_indialog_request(
+        inbound,
+        message,
+        call_id,
+        from_a_leg,
+        Method::Info,
+        crate::b2bua::actor::ForwardedMarker::Info,
+        state,
+    );
+}
+
+/// Show an INFO to `@b2bua.on_info` and build the
 /// response it asked for with `request.reply()` (and `set_reply_body()` /
 /// `set_reply_header()`). `None` when no handler ran, a handler raised, or
 /// none answered: the caller then sends the default 200.
@@ -320,6 +349,10 @@ impl AnsweredInfos {
                 InfoSeen::New
             }
         }
+    }
+
+    fn forget(&self, key: &InfoKey) {
+        self.entries.remove(key);
     }
 
     fn answered(&self, key: InfoKey, response: &SipMessage) {
