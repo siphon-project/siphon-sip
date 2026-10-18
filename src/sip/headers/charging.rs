@@ -29,7 +29,8 @@ pub struct ChargingVector {
 pub struct ServedUser {
     /// SIP/SIPS/TEL URI — unwrapped from `<...>` if present.
     pub uri: String,
-    /// Session case: `"orig"`, `"term"` or `"orig-cdiv"` (RFC 8498).
+    /// Session case: `"orig"`, `"term"` or `"orig-cdiv"` (RFC 8498, sent as
+    /// the bare `orig-cdiv` parameter; `sescase=orig-cdiv` is read too).
     pub sescase: Option<String>,
     /// Registration state: `"reg"` or `"unreg"`.
     pub regstate: Option<String>,
@@ -90,9 +91,16 @@ impl ServedUser {
 
         let mut sescase = None;
         let mut regstate = None;
+        let mut orig_cdiv = false;
         for raw in params_part.split(';') {
             let part = raw.trim();
             if part.is_empty() {
+                continue;
+            }
+            // RFC 8498: `orig-cdiv` is a session case of its own, a parameter
+            // with no value. Next to a `sescase=orig` it is the one that holds.
+            if part.eq_ignore_ascii_case("orig-cdiv") {
+                orig_cdiv = true;
                 continue;
             }
             if let Some((key, val)) = part.split_once('=') {
@@ -108,6 +116,9 @@ impl ServedUser {
             }
         }
 
+        if orig_cdiv {
+            sescase = Some("orig-cdiv".to_string());
+        }
         Some(ServedUser {
             uri,
             sescase,
@@ -306,6 +317,23 @@ mod tests {
     #[test]
     fn served_user_orig_cdiv() {
         let su = ServedUser::parse("<sip:user3@example.com>;sescase=orig-cdiv").unwrap();
+        assert_eq!(su.sescase.as_deref(), Some("orig-cdiv"));
+    }
+
+    /// RFC 8498 section 6 ABNF: `sessioncase-param = "sescase" EQUAL
+    /// ("orig"/"term") / orig-cdiv`, a parameter without a value, as in its
+    /// examples `P-Served-User: <sip:user@example.com>; orig-cdiv; regstate=reg`.
+    #[test]
+    fn served_user_orig_cdiv_is_a_parameter_of_its_own() {
+        let su = ServedUser::parse("<sip:bob@example.com>; orig-cdiv; regstate=reg").unwrap();
+        assert_eq!(su.sescase.as_deref(), Some("orig-cdiv"));
+        assert_eq!(su.regstate.as_deref(), Some("reg"));
+        // Sent next to `sescase=orig` by some S-CSCFs: orig-cdiv still wins,
+        // it is the more specific case, whatever the order.
+        let su =
+            ServedUser::parse("<sip:bob@example.com>;sescase=orig;regstate=reg;orig-cdiv").unwrap();
+        assert_eq!(su.sescase.as_deref(), Some("orig-cdiv"));
+        let su = ServedUser::parse("<sip:bob@example.com>;orig-cdiv;sescase=orig").unwrap();
         assert_eq!(su.sescase.as_deref(), Some("orig-cdiv"));
     }
 
