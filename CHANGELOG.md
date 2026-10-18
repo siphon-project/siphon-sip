@@ -129,6 +129,17 @@ entry, but a working config keeps working.
   against TS 29.229 table 6.3.1; it now follows the dictionary.
   Supported-Features in an answer never has the M bit, and Feature-List-ID /
   Feature-List never do (§7.2.1). A SAR built with restoration members sets it.
+- **Node-Functionality values from 8 upward follow TS 32.299 §7.2.113.** They
+  did not: an `ecscf` went out as 9 (P-GW), an `atcf` as 10 (HSGW), `mmtel` as
+  11 (E-CSCF). `mmtel` now sends `as` (6), and S-GW to IWK-SCEF (8 to 21,
+  Proxy Function 16 as `proxy`) are added. `tpf`, `atgw` and `scscf-restore`
+  are not values of the clause: in `rf` / `ro` `node_functionality` they log
+  the existing warning and the AVP is left out, as for any unknown name (a
+  working config keeps loading). **BREAKING (scripting API):**
+  `node_functionality="tpf"`, `"atgw"` and `"scscf-restore"` raise
+  `ValueError`. **BREAKING (Rust library):** `NodeFunctionality::SCscfRestore`,
+  `Mmtel`, `Tpf` and `Atgw` are gone, `Ecscf` and `Atcf` change value. See
+  `docs/migrating-to-1.15.md`.
 
 ## [1.14.0] — 2026-10-17
 

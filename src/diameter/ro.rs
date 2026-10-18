@@ -102,9 +102,14 @@ impl NodeRole {
     }
 }
 
-// ── Node-Functionality (TS 32.299 §7.2.111) ────────────────────────────
+// ── Node-Functionality (TS 32.299 §7.2.113) ────────────────────────────
 
-/// IMS node functionality for charging correlation per TS 32.299 §7.2.111.
+/// The functionality of the node that sends the record, TS 32.299 clause
+/// 7.2.113 (Node-Functionality, AVP 862). The values are the specification's
+/// and Wireshark's (dictionary.xml), and they are not contiguous with the IMS
+/// names alone: 8 to 10 are the EPC gateways, 11 the E-CSCF, 15 the ATCF and
+/// 16 the Proxy Function of TS 32.276 voice call charging (an SCP), up to 21
+/// IWK-SCEF.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub enum NodeFunctionality {
@@ -116,12 +121,21 @@ pub enum NodeFunctionality {
     Bgcf = 5,
     ApplicationServer = 6,
     Ibcf = 7,
-    SCscfRestore = 8,
-    Ecscf = 9,
-    Atcf = 10,
-    Mmtel = 11,
-    Tpf = 12,
-    Atgw = 13,
+    SGw = 8,
+    PGw = 9,
+    Hsgw = 10,
+    Ecscf = 11,
+    Mme = 12,
+    Trf = 13,
+    Tf = 14,
+    Atcf = 15,
+    /// Proxy Function (TS 32.276): the gsmSCF / SCP charging a CS call.
+    ProxyFunction = 16,
+    Epdg = 17,
+    Tdf = 18,
+    Twag = 19,
+    Scef = 20,
+    IwkScef = 21,
 }
 
 impl NodeFunctionality {
@@ -144,12 +158,20 @@ impl NodeFunctionality {
                 Some(NodeFunctionality::ApplicationServer)
             }
             "ibcf" => Some(NodeFunctionality::Ibcf),
-            "scscf-restore" | "scscf_restore" => Some(NodeFunctionality::SCscfRestore),
+            "sgw" | "s-gw" => Some(NodeFunctionality::SGw),
+            "pgw" | "p-gw" => Some(NodeFunctionality::PGw),
+            "hsgw" => Some(NodeFunctionality::Hsgw),
             "ecscf" | "e-cscf" => Some(NodeFunctionality::Ecscf),
+            "mme" => Some(NodeFunctionality::Mme),
+            "trf" => Some(NodeFunctionality::Trf),
+            "tf" => Some(NodeFunctionality::Tf),
             "atcf" => Some(NodeFunctionality::Atcf),
-            "mmtel" => Some(NodeFunctionality::Mmtel),
-            "tpf" => Some(NodeFunctionality::Tpf),
-            "atgw" => Some(NodeFunctionality::Atgw),
+            "proxy" | "proxy-function" | "proxy_function" => Some(NodeFunctionality::ProxyFunction),
+            "epdg" => Some(NodeFunctionality::Epdg),
+            "tdf" => Some(NodeFunctionality::Tdf),
+            "twag" => Some(NodeFunctionality::Twag),
+            "scef" => Some(NodeFunctionality::Scef),
+            "iwk-scef" | "iwk_scef" | "iwkscef" => Some(NodeFunctionality::IwkScef),
             _ => None,
         }
     }
@@ -1202,12 +1224,23 @@ mod tests {
         assert_eq!(NodeFunctionality::Bgcf.as_u32(), 5);
         assert_eq!(NodeFunctionality::ApplicationServer.as_u32(), 6);
         assert_eq!(NodeFunctionality::Ibcf.as_u32(), 7);
-        assert_eq!(NodeFunctionality::SCscfRestore.as_u32(), 8);
-        assert_eq!(NodeFunctionality::Ecscf.as_u32(), 9);
-        assert_eq!(NodeFunctionality::Atcf.as_u32(), 10);
-        assert_eq!(NodeFunctionality::Mmtel.as_u32(), 11);
-        assert_eq!(NodeFunctionality::Tpf.as_u32(), 12);
-        assert_eq!(NodeFunctionality::Atgw.as_u32(), 13);
+        // TS 32.299 §7.2.113; Wireshark's dictionary.xml agrees. The table
+        // pinned here before had 8 = "S-CSCF restore", 9 = E-CSCF,
+        // 10 = ATCF, 11 = MMTel: an E-CSCF record went out as a P-GW one.
+        assert_eq!(NodeFunctionality::SGw.as_u32(), 8);
+        assert_eq!(NodeFunctionality::PGw.as_u32(), 9);
+        assert_eq!(NodeFunctionality::Hsgw.as_u32(), 10);
+        assert_eq!(NodeFunctionality::Ecscf.as_u32(), 11);
+        assert_eq!(NodeFunctionality::Mme.as_u32(), 12);
+        assert_eq!(NodeFunctionality::Trf.as_u32(), 13);
+        assert_eq!(NodeFunctionality::Tf.as_u32(), 14);
+        assert_eq!(NodeFunctionality::Atcf.as_u32(), 15);
+        assert_eq!(NodeFunctionality::ProxyFunction.as_u32(), 16);
+        assert_eq!(NodeFunctionality::Epdg.as_u32(), 17);
+        assert_eq!(NodeFunctionality::Tdf.as_u32(), 18);
+        assert_eq!(NodeFunctionality::Twag.as_u32(), 19);
+        assert_eq!(NodeFunctionality::Scef.as_u32(), 20);
+        assert_eq!(NodeFunctionality::IwkScef.as_u32(), 21);
     }
 
     #[test]
@@ -1234,7 +1267,11 @@ mod tests {
         );
         assert_eq!(
             NodeFunctionality::from_str_ci("mmtel"),
-            Some(NodeFunctionality::Mmtel)
+            Some(NodeFunctionality::ApplicationServer)
+        );
+        assert_eq!(
+            NodeFunctionality::from_str_ci("proxy"),
+            Some(NodeFunctionality::ProxyFunction)
         );
         assert_eq!(NodeFunctionality::from_str_ci("bogus"), None);
     }

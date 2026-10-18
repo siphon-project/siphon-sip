@@ -674,8 +674,8 @@ fn build_ims_data(
         Some(value) => Some(NodeFunctionality::from_str_ci(value).ok_or_else(|| {
             pyo3::exceptions::PyValueError::new_err(format!(
                 "unknown node_functionality {value:?}; expected one of \
-                 'scscf'/'pcscf'/'icscf'/'mrfc'/'mgcf'/'bgcf'/'as'/'ibcf'/\
-                 'ecscf'/'atcf'/'mmtel'/'tpf'/'atgw'"
+                 'scscf'/'pcscf'/'icscf'/'mrfc'/'mgcf'/'bgcf'/'as'/'mmtel'/'ibcf'/\
+                 'sgw'/'pgw'/'hsgw'/'ecscf'/'mme'/'trf'/'tf'/'atcf'/'proxy'/'epdg'"
             ))
         })?),
         None => None,
@@ -2814,7 +2814,9 @@ impl PyDiameter {
     ///
     /// ``node_functionality`` accepts ``"scscf"``, ``"pcscf"``, ``"icscf"``,
     /// ``"mrfc"``, ``"mgcf"``, ``"bgcf"``, ``"as"``, ``"ibcf"``, ``"ecscf"``,
-    /// ``"atcf"``, ``"mmtel"``, ``"tpf"``, ``"atgw"`` (TS 32.299 §7.2.111).
+    /// ``"sgw"``, ``"pgw"``, ``"hsgw"``, ``"mme"``, ``"trf"``, ``"tf"``,
+    /// ``"atcf"``, ``"proxy"`` (Proxy Function, TS 32.276), ``"epdg"``;
+    /// ``"mmtel"`` is ``"as"`` (TS 32.299 §7.2.113).
     ///
     /// ``access_network_information`` takes the value of the request's
     /// ``P-Access-Network-Info`` header as received. It is sent inside

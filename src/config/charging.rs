@@ -44,8 +44,9 @@ pub struct RfConfig {
     #[serde(default)]
     pub interim_interval_secs: u32,
     /// Node-Functionality value baked into auto-emitted records
-    /// (TS 32.299 §7.2.111 — `scscf`, `pcscf`, `icscf`, `mrfc`, `mgcf`,
-    /// `bgcf`, `as`, `ibcf`, `ecscf`, `atcf`, `mmtel`, `tpf`, `atgw`).
+    /// (TS 32.299 §7.2.113 — `scscf`, `pcscf`, `icscf`, `mrfc`, `mgcf`,
+    /// `bgcf`, `as` (alias `mmtel`), `ibcf`, `sgw`, `pgw`, `hsgw`, `ecscf`, `mme`,
+    /// `trf`, `tf`, `atcf`, `proxy`, `epdg`).
     /// Default: ``"scscf"``.
     #[serde(default = "default_rf_node_functionality")]
     pub node_functionality: String,
@@ -141,7 +142,7 @@ pub struct RoConfig {
     /// 0 = emit an empty RSU and let the OCS decide the quota. Default: 30.
     #[serde(default = "default_ro_interval")]
     pub requested_seconds: u32,
-    /// Node-Functionality for the IMS-Information (TS 32.299 §7.2.111). The
+    /// Node-Functionality for the IMS-Information (TS 32.299 §7.2.113). The
     /// textbook Ro trigger is the AS/S-CSCF; `pcscf` reflects edge enforcement.
     /// Default: ``"pcscf"``.
     #[serde(default = "default_ro_node_functionality")]
