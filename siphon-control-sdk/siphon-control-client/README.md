@@ -55,6 +55,9 @@ Every verb the server's `sip` adapter describes has a typed method:
   `cancel_dial(reason)` gives the ringing dial up and leaves the caller as the
   dial found it: the phones are CANCELled and the dial ends in `DialFailed`
   with code 487. `route` hands the call back to siphon with a routing decision.
+  A URI target of either (`DialTarget::uri_routed`, `RouteTarget { route, .. }`) can
+  carry its own route set, topmost first, which is how an IMS application
+  server sends a session back through the S-CSCF with the Route it was given.
 - **Transfers:** `refer` / `transfer` / `refer_replaces` send a REFER.
   `accept_refer` and `reject_refer` decide a pending inbound one.
   `accept_refer_dialling(target, mode, profile, &TransferDial)` names who the

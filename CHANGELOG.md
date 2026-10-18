@@ -66,6 +66,23 @@ entry, but a working config keeps working.
   old one removed the new one's SA #3/#4 policies, so requests to the UE went
   out unprotected. They now stay with the newer pair, or are given back to the
   older one when the newer goes.
+### Added
+
+- **The control SDKs send a `dial` or `route` target's route set.** 1.14.0 let a
+  `{uri}` target carry `route: ["<sip:...;lr>", ...]`, but no SDK could send
+  it, so an application server built on them still could not continue a session
+  through the S-CSCF with the Route it was given (TS 24.229 §5.7.5.2.1). Rust:
+  `DialTarget::uri_routed(uri, route)` and `RouteTarget::route`. Python: a
+  `"route"` list on a `dial` or `route` target dict. TypeScript: `route` on
+  `DialTarget` and `RouteTargetObject`. An empty route set stays off the wire.
+  Python and TypeScript refuse a lone string (not read as a one-entry list) and
+  a `route` on an `{aor}` target before anything is sent; Rust makes the
+  `{aor}` case unrepresentable. **Breaking (Rust):** `RouteTarget` gains a
+  public `route` field and `DialTarget::Uri` a `route` field, so a struct
+  literal or exhaustive pattern without `..` has to name it.
+  `TargetIdentity` is now exported from `siphon_control_client::sip`, which
+  makes `DialTarget::Uri` buildable by hand (needed to pin `next_hop` and a
+  route set together).
 
 ## [1.14.0] — 2026-10-17
 

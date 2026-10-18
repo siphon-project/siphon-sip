@@ -261,6 +261,28 @@ export interface RouteTargetObject {
    * reached anyone. Default `false`, which is never sent.
    */
   rerouteAfterProgress?: boolean;
+  /**
+   * The route set this attempt's INVITE carries, topmost first, each entry one
+   * Route value in name-addr form (`"<sip:scscf.example;lr>"`). The attempt
+   * goes to the topmost entry unless `nextHop` pins it. See
+   * {@link DialTarget}'s `route`.
+   */
+  route?: string[];
+}
+
+/**
+ * A target's `route` as the wire carries it: the list as given, or nothing for
+ * an absent or empty one. A lone string is refused rather than read as a
+ * one-entry list, since a request sent with the wrong route set goes somewhere
+ * else entirely. Whether each entry is exactly one Route value is the server's
+ * call, which answers `bad_request` when it is not.
+ */
+function routeSetToWire(route: unknown): string[] | undefined {
+  if (route === undefined || route === null) return undefined;
+  if (!Array.isArray(route) || route.some((entry) => typeof entry !== "string")) {
+    throw new TypeError('a target\'s "route" is an array of Route entry strings');
+  }
+  return route.length === 0 ? undefined : [...(route as string[])];
 }
 
 /**
@@ -273,6 +295,7 @@ function routeTargetToWire(target: RouteTarget): unknown {
   if (typeof target === "string") {
     return target;
   }
+  const route = routeSetToWire(target.route);
   const object: Record<string, unknown> = { uri: target.uri };
   if (target.nextHop !== undefined) {
     object.next_hop = target.nextHop;
@@ -286,6 +309,9 @@ function routeTargetToWire(target: RouteTarget): unknown {
   // Off is the server's default, so only `true` goes on the wire.
   if (target.rerouteAfterProgress === true) {
     object.reroute_after_progress = true;
+  }
+  if (route !== undefined) {
+    object.route = route;
   }
   return object;
 }
@@ -526,12 +552,21 @@ export type DialTarget =
        * requests carry it too, which a `To` header override cannot do.
        */
       to?: string;
+      /**
+       * The route set this branch's INVITE carries, topmost first, each entry
+       * one Route value in name-addr form (`"<sip:scscf.example;lr>"`,
+       * RFC 3261 §25.1). The branch goes to the topmost entry unless `nextHop`
+       * pins it. This is how a controller acting as an IMS application server
+       * continues a session through the S-CSCF with the Route the S-CSCF gave
+       * it (TS 24.229 §5.7.5.2.1); `Route` cannot ride `headers`.
+       */
+      route?: string[];
     }
   | {
       /**
        * The address of record to fork to its registered contacts. It takes no
-       * `nextHop`: each branch routes over its own binding's captured flow, so
-       * there would be nothing for one to apply to.
+       * `nextHop` or `route`: each branch routes over its own binding's
+       * captured flow and Path, so there would be nothing for one to apply to.
        */
       aor: string;
       /** Headers injected on every branch the AoR expands to. */
@@ -685,6 +720,7 @@ function dialTargetToWire(target: DialTarget): unknown {
   const nextHop = (target as { nextHop?: unknown }).nextHop;
   const headers = (target as { headers?: Record<string, string> }).headers;
   const to = (target as { to?: unknown }).to;
+  const route = routeSetToWire((target as { route?: unknown }).route);
   if (to !== undefined && typeof to !== "string") {
     throw new TypeError('a dial target\'s "to" is a SIP URI string');
   }
@@ -701,6 +737,12 @@ function dialTargetToWire(target: DialTarget): unknown {
           "its own contact's captured flow",
       );
     }
+    if (route !== undefined) {
+      throw new TypeError(
+        'an aor target takes no "route": each of its branches follows its own ' +
+          "contact's Path",
+      );
+    }
     const object: Record<string, unknown> = { aor };
     if (headers !== undefined) object.headers = headers;
     if (to !== undefined) object.to = to;
@@ -710,11 +752,19 @@ function dialTargetToWire(target: DialTarget): unknown {
     throw new TypeError('a dial target requires a string "uri" or "aor"');
   }
   // A bare URI with no overrides is a plain string on the wire.
-  if (nextHop === undefined && headers === undefined && to === undefined) return uri;
+  if (
+    nextHop === undefined &&
+    headers === undefined &&
+    to === undefined &&
+    route === undefined
+  ) {
+    return uri;
+  }
   const object: Record<string, unknown> = { uri };
   if (nextHop !== undefined) object.next_hop = nextHop;
   if (headers !== undefined) object.headers = headers;
   if (to !== undefined) object.to = to;
+  if (route !== undefined) object.route = route;
   return object;
 }
 
@@ -1159,7 +1209,7 @@ export class Call {
    *
    * `targets` is a non-empty list of carriers tried cheapest-first: each entry
    * is a bare URI string or a {@link RouteTargetObject}
-   * (`{uri, nextHop?, headers?, timeout?, rerouteAfterProgress?}`). A target
+   * (`{uri, nextHop?, headers?, timeout?, rerouteAfterProgress?, route?}`). A target
    * that has shown progress keeps the call past its `timeout` unless it sets
    * `rerouteAfterProgress`. `strategy` defaults to
    * `"sequential"` (v1 supports only sequential/single — anything else rejects

@@ -10,18 +10,19 @@ use siphon_control_client::proto::sip::{PeerHangupPolicy, PlayRepeat};
 use siphon_control_client::sip::{
     AorRing, DialOnAnswer, DialStrategy, DialTarget, OriginateMedia, OriginatePrivacy, PlaySource,
     RecordChannels, RecordDirection, Ringback, RouteTarget, SessionRefresher, SessionTimer,
-    StreamChannels, StreamDirection, StreamMode,
+    StreamChannels, StreamDirection, StreamMode, TargetIdentity,
 };
 
 /// Extract one `route` target: a bare URI `str`, or a dict
-/// `{uri, next_hop?, headers?, timeout?, reroute_after_progress?}`.
+/// `{uri, next_hop?, headers?, timeout?, reroute_after_progress?, route?}`.
 pub(crate) fn extract_route_target(item: &Bound<'_, PyAny>) -> PyResult<RouteTarget> {
     if let Ok(uri) = item.extract::<String>() {
         return Ok(RouteTarget::uri(uri));
     }
     let dict = item.cast::<pyo3::types::PyDict>().map_err(|_| {
         PyValueError::new_err(
-            "each route target must be a URI str or a dict {uri, next_hop, headers, timeout}",
+            "each route target must be a URI str or a dict \
+             {uri, next_hop, headers, timeout, reroute_after_progress, route}",
         )
     })?;
     let uri: String = match dict.get_item("uri")? {
@@ -52,13 +53,37 @@ pub(crate) fn extract_route_target(item: &Bound<'_, PyAny>) -> PyResult<RouteTar
         })?,
         _ => false,
     };
+    let route = extract_route_set(dict)?;
     Ok(RouteTarget {
         uri,
         next_hop,
         headers,
         timeout_secs,
         reroute_after_progress,
+        route,
     })
+}
+
+/// Read a target's `route`: the route set its INVITE carries, a list of Route
+/// values in name-addr form (`"<sip:scscf.example;lr>"`), topmost first.
+///
+/// A lone string is refused rather than taken as a one-entry list: a request
+/// sent with the wrong route set goes somewhere else entirely. Whether each
+/// entry is exactly one Route value is the server's call, which answers
+/// `bad_request` when it is not.
+fn extract_route_set(dict: &Bound<'_, pyo3::types::PyDict>) -> PyResult<Vec<String>> {
+    let value = match dict.get_item("route")? {
+        Some(value) if !value.is_none() => value,
+        _ => return Ok(Vec::new()),
+    };
+    if value.is_instance_of::<pyo3::types::PyString>() {
+        return Err(PyTypeError::new_err(
+            "target 'route' must be a list of Route entries, not a str",
+        ));
+    }
+    value
+        .extract::<Vec<String>>()
+        .map_err(|_| PyTypeError::new_err("target 'route' must be a list of Route entry strings"))
 }
 
 /// Extract the `targets` of a `dial` into typed targets, refusing every shape
@@ -71,8 +96,9 @@ pub(crate) fn extract_dial_targets(items: &[Bound<'_, PyAny>]) -> PyResult<Vec<D
     Ok(targets)
 }
 
-/// Extract one `dial` target: a dict `{uri, next_hop?, headers?, to?}` dialed
-/// as written, or `{aor, headers?, to?}` forked to every registered contact.
+/// Extract one `dial` target: a dict `{uri, next_hop?, headers?, to?, route?}`
+/// dialed as written, or `{aor, headers?, to?}` forked to every registered
+/// contact.
 ///
 /// A bare string is refused although the server accepts one as a URI. The two
 /// forms do entirely different things — an AoR forks to every contact over that
@@ -91,6 +117,7 @@ fn extract_dial_target(item: &Bound<'_, PyAny>) -> PyResult<DialTarget> {
     let aor = optional_string(dict, "aor")?;
     let next_hop = optional_string(dict, "next_hop")?;
     let to = optional_string(dict, "to")?;
+    let route = extract_route_set(dict)?;
     let headers = match dict.get_item("headers")? {
         Some(value) if !value.is_none() => extract_headers(&value)?,
         _ => Vec::new(),
@@ -108,9 +135,13 @@ fn extract_dial_target(item: &Bound<'_, PyAny>) -> PyResult<DialTarget> {
                 "a dial target requires a string \"uri\" or \"aor\"",
             ))
         }
-        (Some(uri), None) => match next_hop {
-            Some(next_hop) => DialTarget::uri_via(uri, next_hop),
-            None => DialTarget::uri(uri),
+        (Some(uri), None) => DialTarget::Uri {
+            uri,
+            next_hop,
+            headers: Vec::new(),
+            identity: TargetIdentity::default(),
+            to: None,
+            route,
         },
         (None, Some(aor)) => {
             if next_hop.is_some() {
@@ -120,6 +151,15 @@ fn extract_dial_target(item: &Bound<'_, PyAny>) -> PyResult<DialTarget> {
                 return Err(PyValueError::new_err(
                     "an aor target takes no \"next_hop\": each of its branches routes \
                      over its own contact's captured flow",
+                ));
+            }
+            if !route.is_empty() {
+                // Each branch of an AoR follows its own binding's Path, which
+                // a route set here would replace or sit in front of, so the
+                // server refuses the pair.
+                return Err(PyValueError::new_err(
+                    "an aor target takes no \"route\": each of its branches follows \
+                     its own contact's Path",
                 ));
             }
             DialTarget::aor(aor)

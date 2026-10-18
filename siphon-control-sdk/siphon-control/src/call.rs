@@ -625,7 +625,10 @@ impl Call {
     ///
     /// `targets` is a non-empty list of carriers tried cheapest-first: each entry
     /// is a bare URI `str` or a dict
-    /// `{"uri", "next_hop"?, "headers"?, "timeout"?, "reroute_after_progress"?}`.
+    /// `{"uri", "next_hop"?, "headers"?, "timeout"?, "reroute_after_progress"?, "route"?}`.
+    /// A target's `route` is the route set its attempt's INVITE carries, a list
+    /// of Route values in name-addr form (`"<sip:scscf.example;lr>"`), topmost
+    /// first; the attempt goes to the topmost entry unless `next_hop` pins it.
     /// A target's `timeout` bounds the wait for it to show progress (a 101-199);
     /// one that has keeps the call past it, and the call then fails with 408,
     /// unless it sets `"reroute_after_progress": True`. That flag must be a
@@ -961,6 +964,15 @@ impl Call {
     /// NAT. A bare string raises ``ValueError``: it does not say which was
     /// meant, and the wrong one places a call that connects to nothing while the
     /// trace looks healthy.
+    ///
+    /// A ``{"uri": ...}`` target may carry ``"route"``, the route set its
+    /// INVITE carries: a list of Route values in name-addr form
+    /// (``"<sip:scscf.example;lr>"``), topmost first. The branch goes to the
+    /// topmost entry unless ``next_hop`` pins it. This is how an IMS
+    /// application server continues a session through the S-CSCF with the
+    /// Route the S-CSCF gave it (TS 24.229 §5.7.5.2.1); ``Route`` cannot ride
+    /// ``headers``. A ``route`` beside an ``"aor"`` raises ``ValueError``, since
+    /// each of its branches follows its own contact's Path.
     ///
     /// Either form may carry ``"to"``, the branch's called party: its ``To``
     /// URI. The target's URI is the Request-URI, and without ``to`` the B-leg's

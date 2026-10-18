@@ -544,6 +544,34 @@ describe("Call verbs map to the in-process-mirrored wire verbs", () => {
     ]);
   });
 
+  it("route — a target's route set rides the wire, a lone string is refused", async () => {
+    const transport = new RecordingTransport({ channel: "ch1", state: "routing", targets: 1 });
+    const call = makeCall(transport);
+    await call.route([
+      { uri: "sip:+15550100@ims.example.test", route: ["<sip:orig@scscf.example.test;lr>"] },
+    ]);
+    expect(transport.calls).toEqual([
+      {
+        module: MODULE_SIP,
+        verb: "route",
+        target: { channel: "ch1" },
+        args: {
+          targets: [
+            {
+              uri: "sip:+15550100@ims.example.test",
+              route: ["<sip:orig@scscf.example.test;lr>"],
+            },
+          ],
+          strategy: "sequential",
+        },
+      },
+    ]);
+    await expect(
+      call.route([{ uri: "sip:gw", route: "<sip:p.example;lr>" } as never]),
+    ).rejects.toThrow(/route/);
+    expect(transport.calls).toHaveLength(1);
+  });
+
   it("route — defaults strategy to sequential, omits headers when unset", async () => {
     const transport = new RecordingTransport({ channel: "ch1", state: "routing", targets: 1 });
     const call = makeCall(transport);
@@ -1159,6 +1187,51 @@ describe("dial args map to the target shapes the server parses", () => {
     expect(() =>
       dialArgs([{ uri: "sip:+15550199@trunk.example", to: 7 } as never]),
     ).toThrow(/to/);
+  });
+
+  it("sends a URI target's route set topmost first, beside a pinned next hop", () => {
+    expect(
+      dialArgs([
+        {
+          uri: "sip:+15550100@ims.example.test",
+          route: ["<sip:term@scscf.example.test;lr;odi=4f1c>", "<sip:edge.example.test;lr>"],
+        },
+        {
+          uri: "sip:alice@ims.example.test",
+          nextHop: "sip:192.0.2.10:5060",
+          route: ["<sip:scscf.example.test;lr>"],
+        },
+        // An empty route set is no route set.
+        { uri: "sip:1001@pbx.example", route: [] },
+      ]),
+    ).toEqual({
+      targets: [
+        {
+          uri: "sip:+15550100@ims.example.test",
+          route: ["<sip:term@scscf.example.test;lr;odi=4f1c>", "<sip:edge.example.test;lr>"],
+        },
+        {
+          uri: "sip:alice@ims.example.test",
+          next_hop: "sip:192.0.2.10:5060",
+          route: ["<sip:scscf.example.test;lr>"],
+        },
+        "sip:1001@pbx.example",
+      ],
+    });
+  });
+
+  it("refuses a route set on an aor, and one that is not a list of strings", () => {
+    // Each branch of an AoR follows its own binding's Path.
+    expect(() =>
+      dialArgs([{ aor: "sip:204@pbx.example", route: ["<sip:p.example;lr>"] } as never]),
+    ).toThrow(/aor/);
+    // A lone string is not read as a one-entry list.
+    expect(() =>
+      dialArgs([{ uri: "sip:1001@pbx.example", route: "<sip:p.example;lr>" } as never]),
+    ).toThrow(/route/);
+    expect(() =>
+      dialArgs([{ uri: "sip:1001@pbx.example", route: [7] } as never]),
+    ).toThrow(/route/);
   });
 
   it("refuses a target that names both a uri and an aor, and one that names neither", () => {
