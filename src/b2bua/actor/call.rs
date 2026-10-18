@@ -355,6 +355,9 @@ pub struct CallActor {
     /// decided at INVITE receipt before the script runs. Only then does a
     /// required `sec-agree` count as honoured.
     pub sec_agree_verified: bool,
+    /// The option tags of the `Require` the caller sent, read at INVITE receipt
+    /// before the script runs: the ones a 420 may refuse it for.
+    pub a_leg_required: Option<Vec<String>>,
     /// Number of credentialed outbound INVITEs already sent on the 401/407
     /// auto-retry path for this call. Capped (see `MAX_B2BUA_AUTH_RETRIES` in
     /// the dispatcher): once the cap is hit, a further challenge is treated as a
@@ -595,6 +598,7 @@ impl CallActor {
             a_leg_reliability: super::ALegReliableProvisionals::default(),
             prack_bridge: super::PrackBridge::default(),
             sec_agree_verified: false,
+            a_leg_required: None,
             auth_retry_count: 0,
             answer_deadline: None,
             answered_at: None,

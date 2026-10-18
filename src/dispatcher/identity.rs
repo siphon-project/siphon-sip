@@ -106,19 +106,52 @@ fn implements_option_tag(tag: &str, sec_agree_verified: bool) -> bool {
 ///
 /// `sec_agree_verified` is whether the call's security agreement was verified
 /// when its INVITE arrived; `sec-agree` counts as honoured only then.
+///
+/// `caller_required` is the `Require` the caller sent, read before the script
+/// ran ([`required_option_tags`]). A tag outside it is one the script put on the
+/// B-leg itself, such as `tdialog` beside a `Target-Dialog` it wrote (TS 24.237
+/// §12.7.2.2): the B2BUA's own requirement of the callee, which the callee
+/// answers for, so it does not refuse the caller. A tag of siphon's own hop
+/// (`sec-agree`) is checked whoever added it: only the caller's verified
+/// agreement can honour it. `None` checks every tag.
 pub(super) fn unhonourable_required_tags(
     invite: &SipHeaders,
     script_shaped_headers: &[String],
+    caller_required: Option<&[String]>,
     policy: &crate::b2bua::header_policy::ResolvedPolicy,
     sec_agree_verified: bool,
 ) -> Vec<String> {
     let require_crosses =
         crate::b2bua::header_policy::is_script_shaped(script_shaped_headers, "Require")
             || policy.verb_for_request("Require") == crate::b2bua::header_policy::Verb::Copy;
+    let hop_tag = |tag: &str| {
+        HOP_OPTION_TAGS
+            .iter()
+            .any(|hop| hop.eq_ignore_ascii_case(tag))
+    };
     required_tags_not_honoured(invite, |tag| {
-        implements_option_tag(tag, sec_agree_verified)
+        (!hop_tag(tag)
+            && caller_required.is_some_and(|required| {
+                !required
+                    .iter()
+                    .any(|caller_tag| caller_tag.eq_ignore_ascii_case(tag))
+            }))
+            || implements_option_tag(tag, sec_agree_verified)
             || (require_crosses && policy.passes_end_to_end(tag))
     })
+}
+
+/// Every option tag in `headers`' `Require` lines, in order.
+pub(super) fn required_option_tags(headers: &SipHeaders) -> Vec<String> {
+    headers
+        .get_all("Require")
+        .into_iter()
+        .flatten()
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .filter(|tag| !tag.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 /// The option tags in `invite`'s `Require` that siphon does not implement

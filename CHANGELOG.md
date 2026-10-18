@@ -144,6 +144,14 @@ entry, but a working config keeps working.
 
 ### Fixed
 
+- **B2BUA: a `Require` tag only the script added no longer refuses the caller
+  `420`.** The required-extension check (RFC 3261 §8.2.2.3) held the caller to
+  every tag in the A-leg `Require` as the script left it, so a script that put
+  `Require: tdialog` on the B-leg beside a `Target-Dialog` it wrote (an ATCF's
+  INVITE due to ATU-STI, TS 24.237 §12.7.2.2) had its own caller refused
+  `420 Bad Extension`. The caller's `Require` is now read when the INVITE
+  arrives, and only those tags can refuse it; the script's own go to the callee.
+
 - **Proxy: a retransmitted 2xx to an INVITE goes out as the first copy was
   forwarded.** A UAS retransmits its 2xx until the ACK arrives (RFC 3261
   §13.3.1.4). Each copy used to be forwarded statelessly as the UAS sent it:

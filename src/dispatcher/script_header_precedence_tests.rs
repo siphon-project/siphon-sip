@@ -214,3 +214,25 @@ async fn a_script_require_reaches_the_callee_and_is_not_refused() {
         "sent: {listed:?}"
     );
 }
+
+/// A tag the script puts on the B-leg's `Require` that the caller never
+/// required is the B2BUA's own requirement of the callee: an ATCF's INVITE due
+/// to ATU-STI carries `Require: tdialog` beside the `Target-Dialog` it wrote
+/// (TS 24.237 §12.7.2.2). The caller is not refused 420 for it (RFC 3261
+/// §8.2.2.3 concerns the caller's own `Require`), though `tdialog` cannot be
+/// negotiated across a B2BUA.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_require_tag_only_the_script_added_does_not_refuse_the_caller() {
+    let sent = run_on_invite(&[
+        "call.set_header(\"Target-Dialog\", \"source@192.0.2.1;local-tag=a;remote-tag=b\")",
+        "call.set_header(\"Require\", \"tdialog\")",
+        "call.dial(\"sip:15550100042@198.51.100.7:5060\")",
+    ]);
+    let listed = summaries(&sent);
+    assert!(
+        !listed.iter().any(|line| line.starts_with("420")),
+        "sent: {listed:?}"
+    );
+    let invite = invite_to(sent, CALLEE);
+    assert_eq!(header(&invite, "Require").as_deref(), Some("tdialog"));
+}
