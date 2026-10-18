@@ -440,6 +440,47 @@ impl MediaBackend {
         }
     }
 
+    /// Wait until a recording [`Self::start_recording`] started has ended and
+    /// its file is closed, at most `deadline`. `Ok(None)` when it had not.
+    pub async fn wait_recording(
+        &self,
+        call_id: &str,
+        recording_id: &str,
+        deadline: std::time::Duration,
+    ) -> Result<Option<crate::rtpengine::events::RecordingFinished>, RtpEngineError> {
+        match self {
+            Self::SiphonRtp(set) => Ok(set.wait_recording(call_id, recording_id, deadline).await),
+            Self::RtpEngine(_) => Err(RtpEngineError::Unsupported {
+                operation: "record_wait",
+                backend: "rtpengine",
+            }),
+            Self::RtpProxy(_) => Err(RtpEngineError::Unsupported {
+                operation: "record_wait",
+                backend: "rtpproxy",
+            }),
+        }
+    }
+
+    /// Collect the digits keyed on a call until `limits` end the read. The
+    /// digits taken are not also `@rtpengine.on_dtmf` events.
+    pub async fn read_digits(
+        &self,
+        call_id: &str,
+        limits: &crate::rtpengine::siphon_rtp::DigitReadLimits,
+    ) -> Result<crate::rtpengine::siphon_rtp::DigitRead, RtpEngineError> {
+        match self {
+            Self::SiphonRtp(set) => Ok(set.read_digits(call_id, limits).await),
+            Self::RtpEngine(_) => Err(RtpEngineError::Unsupported {
+                operation: "read_digits",
+                backend: "rtpengine",
+            }),
+            Self::RtpProxy(_) => Err(RtpEngineError::Unsupported {
+                operation: "read_digits",
+                backend: "rtpproxy",
+            }),
+        }
+    }
+
     /// The backend dispatch behind [`Self::play_media`], split out so the
     /// playback bookkeeping wraps every arm rather than being repeated in each.
     #[allow(clippy::too_many_arguments)]

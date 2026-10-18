@@ -19,6 +19,7 @@ use tracing::{debug, error, info, trace, warn};
 use super::events::convert_event;
 use super::identity::{auth_frame_for, authenticate, controller_id};
 use super::scope::{event_is_for, require_scope_support, CallScope};
+use super::waiters::Waiters;
 use super::{PlayWaiter, HANDSHAKE_REQUEST_ID, READ_CHUNK};
 use crate::rtpengine::error::RtpEngineError;
 use crate::rtpengine::events::RtpEngineEvent;
@@ -38,6 +39,7 @@ pub(super) async fn connection_manager(
     timeout_ms: u64,
     pending: Arc<DashMap<u64, oneshot::Sender<CmdResult>>>,
     play_pending: Arc<DashMap<u64, PlayWaiter>>,
+    waiters: Arc<Waiters>,
     writer: Arc<Mutex<Option<OwnedWriteHalf>>>,
     connected_tx: watch::Sender<bool>,
     event_tx: mpsc::Sender<RtpEngineEvent>,
@@ -132,6 +134,7 @@ pub(super) async fn connection_manager(
             scope.as_ref(),
             &pending,
             &play_pending,
+            &waiters,
             &event_tx,
             &mut shutdown_rx,
         )
@@ -145,6 +148,7 @@ pub(super) async fn connection_manager(
         *writer.lock().await = None;
         pending.clear();
         play_pending.clear();
+        waiters.clear();
 
         match outcome {
             ReadOutcome::Shutdown => return,
@@ -174,6 +178,7 @@ async fn read_loop(
     scope: Option<&CallScope>,
     pending: &DashMap<u64, oneshot::Sender<CmdResult>>,
     play_pending: &DashMap<u64, PlayWaiter>,
+    waiters: &Waiters,
     event_tx: &mpsc::Sender<RtpEngineEvent>,
     shutdown_rx: &mut mpsc::Receiver<()>,
 ) -> ReadOutcome {
@@ -184,7 +189,7 @@ async fn read_loop(
             match frame::decode::<serde_json::Value>(buffer) {
                 Ok(Some((value, consumed))) => {
                     buffer.drain(..consumed);
-                    route_frame(value, scope, pending, play_pending, event_tx).await;
+                    route_frame(value, scope, pending, play_pending, waiters, event_tx).await;
                 }
                 Ok(None) => break,
                 Err(error) => {
@@ -319,6 +324,7 @@ async fn route_frame(
     scope: Option<&CallScope>,
     pending: &DashMap<u64, oneshot::Sender<CmdResult>>,
     play_pending: &DashMap<u64, PlayWaiter>,
+    waiters: &Waiters,
     event_tx: &mpsc::Sender<RtpEngineEvent>,
 ) {
     if value.get("event").is_some() {
@@ -362,6 +368,22 @@ async fn route_frame(
             Ok(event) => {
                 let converted = convert_event(event);
                 debug!(?converted, "siphon-rtp event received");
+                match &converted {
+                    // A digit a script's `read_digits` is collecting belongs
+                    // to that read alone, so the global `on_dtmf` handlers do
+                    // not act on it a second time.
+                    RtpEngineEvent::Dtmf(dtmf)
+                        if waiters.offer_digit(&dtmf.call_id, &dtmf.digit) =>
+                    {
+                        return;
+                    }
+                    // Both consumers, as for PlayFinished: a script waiting in
+                    // `record` and the handlers / control rail.
+                    RtpEngineEvent::RecordingFinished(finished) => {
+                        waiters.recording_finished(finished);
+                    }
+                    _ => {}
+                }
                 forward_event(event_tx, converted);
             }
             Err(error) => warn!(%error, "siphon-rtp event decode failed; skipping"),
