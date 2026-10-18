@@ -107,6 +107,7 @@ pub fn b2bua_send_b_leg_invite(
     caller_id_presentation: Option<crate::sip::privacy::CallerIdPresentation>,
     branch_from_host: Option<&str>,
     branch_to: Option<&str>,
+    branch_contact_host: Option<&str>,
     extra_headers: &[(String, String)],
     state: &DispatcherState,
 ) -> bool {
@@ -125,6 +126,7 @@ pub fn b2bua_send_b_leg_invite(
         caller_id_presentation,
         branch_from_host,
         branch_to,
+        branch_contact_host,
         extra_headers,
         state,
     )
@@ -179,9 +181,25 @@ pub fn b2bua_dial_b_leg(
     // caller's `To` outright, so neither the authority rewrite, a pinned To
     // host nor a retarget number touches it.
     branch_to: Option<&str>,
+    // The host this branch alone presents in siphon's own `Contact`, in place
+    // of the advertised one: a controller `dial` or `route` target naming its
+    // `contact_host` ([`DialTarget::contact_host`]). Port, transport and user
+    // part stay as built below, and the leg keeps it as its dialog's local
+    // Contact, so every in-dialog request siphon sends on the leg presents it.
+    branch_contact_host: Option<&str>,
     extra_headers: &[(String, String)],
     state: &DispatcherState,
 ) -> Option<String> {
+    // Checked where every caller converges, so no path can put a port or a
+    // parameter into the Contact's host: the controller paths refuse one before
+    // they get here, and anything else is refused now, before a leg exists.
+    let branch_contact_host = match branch_contact_host.map(checked_contact_host).transpose() {
+        Ok(host) => host,
+        Err(error) => {
+            warn!(call_id = %call_id, target = %target_uri, "B2BUA: cannot dial the B-leg: {error}");
+            return None;
+        }
+    };
     // Where the INVITE goes: over the captured flow, or to the topmost Route of
     // a Path route set, an explicit next hop or the target. The same decision
     // an originate to a registered phone makes (`resolve_leg_destination`).
@@ -453,10 +471,26 @@ pub fn b2bua_dial_b_leg(
     // pin deliberately does NOT move the Contact — that feature pins egress and
     // the Via so the *response* returns to the chosen listener; the in-dialog
     // remote target stays the advertised address, as it was before flows.
+    //
+    // A branch's `contact_host` replaces the host alone, composing with
+    // `set_contact_user()`. `set_contact_uri()` names the whole URI and wins:
+    // a deployment that fronts siphon owns where in-dialog requests go, and
+    // splicing a host into its URI would send them somewhere neither meant.
     let (b_contact_host, b_contact_port) =
         b_leg_sent_by(flow_local_addr, state, &outbound_transport);
+    if let (Some(pinned), Some(script_contact)) =
+        (branch_contact_host.as_deref(), contact_override.as_deref())
+    {
+        warn!(
+            call_id = %call_id,
+            contact_host = %pinned,
+            contact = %script_contact,
+            "B2BUA: the script pinned the whole B-leg Contact with set_contact_uri(); \
+             the target's contact_host is not applied"
+        );
+    }
     let b_contact_value = build_b_leg_contact(
-        &b_contact_host,
+        branch_contact_host.as_deref().unwrap_or(&b_contact_host),
         b_contact_port,
         outbound_transport,
         contact_user_override.as_deref(),

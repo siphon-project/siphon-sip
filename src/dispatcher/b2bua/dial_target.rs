@@ -57,6 +57,19 @@ pub struct DialTarget {
     /// the original number and can send it straight back. Per branch for the
     /// same reason `from` is: a hunt across two trunks can reach two numbers.
     pub to: Option<String>,
+    /// Host siphon presents in its own `Contact` on this branch's leg, in place
+    /// of the address it advertises on the leg's transport.
+    ///
+    /// The advertised address is one per transport, so without this every leg
+    /// presents the same Contact host. A peer that identifies the tenant or
+    /// account by the host of the Contact can then be served for one tenant
+    /// per siphon. Only the host changes: port, transport and any user part
+    /// stay what siphon advertises, so the in-dialog requests the peer sends to
+    /// that Contact still reach the listener the INVITE left from (RFC 3261
+    /// §12.1.2). The DNS for the host is the deployment's to point there.
+    /// Validated and stored bracketed when it is an IPv6 address
+    /// ([`checked_contact_host`]).
+    pub contact_host: Option<String>,
     /// The registered AoR this target is a contact of, when it came from an
     /// `{aor}` target ([`dial_targets_for_aor`]). What the branch's events name
     /// as the AoR it was dialled for; `None` for a URI dialled as written.

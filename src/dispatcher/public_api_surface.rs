@@ -166,14 +166,18 @@ fn the_public_surface_is_pinned() {
     // `b2bua.send_info()` sends a script's INFO in a call's dialog through and
     // stops waiting for its answer with,
     // plus the crate-internal `b2bua_take_over_is_anchored`
-    // `call.take_over(reinvite=False)` refuses a media-anchored call through.
+    // `call.take_over(reinvite=False)` refuses a media-anchored call through,
+    // plus the 2 crate-internal items a `dial`, `route` or `originate` names
+    // the host of siphon's own Contact through: the check of that host and the
+    // originate entry point carrying it (`OriginateParams` is published and
+    // built literally, so it gains no field).
     // All additive, so a minor-compatible change — recorded here because that
     // is the tripwire.
     assert_eq!(
         declared + re_exported,
-        99,
+        101,
         "the dispatcher's public surface is {} items ({declared} declared here, \
-         {re_exported} re-exported), not 99. Adding one is a semver commitment on a \
+         {re_exported} re-exported), not 101. Adding one is a semver commitment on a \
          published crate; removing one breaks embedders. An extraction should move the \
          declaration and add a `pub use`, leaving this total unchanged.",
         declared + re_exported,

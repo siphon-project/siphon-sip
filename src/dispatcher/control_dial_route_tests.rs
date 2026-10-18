@@ -162,6 +162,7 @@ async fn a_route_verb_target_with_a_route_set_is_sent_through_it() {
             timeout_secs: None,
             reroute_after_progress: false,
             route: vec![ROUTE_ENTRY.to_string()],
+            contact_host: None,
         }],
         &[],
         &dispatcher.state,

@@ -12,7 +12,7 @@ use crate::sip::headers_to_json;
 ///
 /// A bare URI (no overrides) serializes to a plain string on the wire; a target
 /// carrying any override serializes to
-/// `{uri, next_hop?, headers?, timeout?, reroute_after_progress?, route?}` — both
+/// `{uri, next_hop?, headers?, timeout?, reroute_after_progress?, route?, contact_host?}` — both
 /// shapes the server's `route` verb accepts. Build a bare-URI target with
 /// [`RouteTarget::uri`], or from a `&str` / `String`, and set overrides with
 /// struct-update syntax: `RouteTarget { timeout_secs: Some(6), ..RouteTarget::uri(uri) }`.
@@ -46,6 +46,12 @@ pub struct RouteTarget {
     /// `headers`. The server refuses an entry that is not exactly one Route
     /// value with `bad_request`. Empty (the default) sends no route set.
     pub route: Vec<String>,
+    /// Host of siphon's own Contact on this attempt's leg, in place of the
+    /// address siphon advertises, for a peer that identifies the tenant or
+    /// account by that host. Only the host changes; see
+    /// [`DialTarget::contact_host`](crate::DialTarget::contact_host). `None`
+    /// (the default) presents the advertised host.
+    pub contact_host: Option<String>,
 }
 
 impl RouteTarget {
@@ -64,6 +70,7 @@ impl RouteTarget {
             && self.timeout_secs.is_none()
             && !self.reroute_after_progress
             && self.route.is_empty()
+            && self.contact_host.is_none()
     }
 
     pub(crate) fn to_json(&self) -> serde_json::Value {
@@ -87,6 +94,9 @@ impl RouteTarget {
         }
         if !self.route.is_empty() {
             object.insert("route".to_string(), json!(self.route));
+        }
+        if let Some(contact_host) = &self.contact_host {
+            object.insert("contact_host".to_string(), json!(contact_host));
         }
         serde_json::Value::Object(object)
     }
@@ -130,6 +140,21 @@ mod tests {
                     "<sip:term@scscf.example.test;lr;odi=4f1c>",
                     "<sip:edge.example.test;lr>"
                 ]
+            })
+        );
+    }
+
+    #[test]
+    fn a_contact_host_goes_out_on_the_target() {
+        let target = RouteTarget {
+            contact_host: Some("tenant-a.example.com".to_string()),
+            ..RouteTarget::uri("sip:+15550100@carrier.example")
+        };
+        assert_eq!(
+            target.to_json(),
+            json!({
+                "uri": "sip:+15550100@carrier.example",
+                "contact_host": "tenant-a.example.com"
             })
         );
     }

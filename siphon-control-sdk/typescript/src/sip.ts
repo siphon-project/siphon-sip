@@ -268,6 +268,24 @@ export interface RouteTargetObject {
    * {@link DialTarget}'s `route`.
    */
   route?: string[];
+  /**
+   * Host siphon presents in its own `Contact` on this attempt, in place of the
+   * address it advertises. See {@link DialTarget}'s `contactHost`.
+   */
+  contactHost?: string;
+}
+
+/**
+ * A target's `contactHost` as the wire carries it. Anything but a string is
+ * refused here; whether the string is a hostname or an IP address is the
+ * server's call, which answers `bad_request` when it is not.
+ */
+function contactHostToWire(contactHost: unknown): string | undefined {
+  if (contactHost === undefined || contactHost === null) return undefined;
+  if (typeof contactHost !== "string") {
+    throw new TypeError('a target\'s "contactHost" is a hostname or IP address string');
+  }
+  return contactHost;
 }
 
 /**
@@ -296,6 +314,7 @@ function routeTargetToWire(target: RouteTarget): unknown {
     return target;
   }
   const route = routeSetToWire(target.route);
+  const contactHost = contactHostToWire(target.contactHost);
   const object: Record<string, unknown> = { uri: target.uri };
   if (target.nextHop !== undefined) {
     object.next_hop = target.nextHop;
@@ -312,6 +331,9 @@ function routeTargetToWire(target: RouteTarget): unknown {
   }
   if (route !== undefined) {
     object.route = route;
+  }
+  if (contactHost !== undefined) {
+    object.contact_host = contactHost;
   }
   return object;
 }
@@ -400,6 +422,13 @@ export interface OriginateOptions {
    * has configured runs, if any.
    */
   sessionTimer?: SessionTimer;
+  /**
+   * Host siphon presents in its own `Contact` on the call (on every leg of an
+   * {@link SipClient.originateAor}), in place of the address it advertises,
+   * for a peer that identifies the tenant or account by that host. Only the
+   * host changes, and every in-dialog request on the call presents it too.
+   */
+  contactHost?: string;
 }
 
 /**
@@ -512,6 +541,7 @@ function originateCommonArgs(
   if (options.timeout !== undefined) args.timeout = options.timeout;
   if (options.onLost !== undefined) args.on_lost = options.onLost;
   if (options.vars !== undefined) args.vars = options.vars;
+  if (options.contactHost !== undefined) args.contact_host = options.contactHost;
   if (options.sessionTimer !== undefined) {
     const timer: Record<string, unknown> = {};
     const { expires, minSe, refresher } = options.sessionTimer;
@@ -561,6 +591,15 @@ export type DialTarget =
        * it (TS 24.229 §5.7.5.2.1); `Route` cannot ride `headers`.
        */
       route?: string[];
+      /**
+       * Host siphon presents in its own `Contact` on this branch, in place of
+       * the address it advertises, for a peer that identifies the tenant or
+       * account by that host. Only the host changes (port, transport and user
+       * part stay siphon's), and siphon keeps it as the leg's dialog Contact,
+       * so every in-dialog request on the leg presents it too. A hostname or an
+       * IP address; the server refuses anything else with `bad_request`.
+       */
+      contactHost?: string;
     }
   | {
       /**
@@ -573,6 +612,8 @@ export type DialTarget =
       headers?: Record<string, string>;
       /** Called party for every branch the AoR expands to (see the URI form). */
       to?: string;
+      /** Host of siphon's own `Contact` on every branch the AoR expands to (see the URI form). */
+      contactHost?: string;
     };
 
 /**
@@ -721,6 +762,7 @@ function dialTargetToWire(target: DialTarget): unknown {
   const headers = (target as { headers?: Record<string, string> }).headers;
   const to = (target as { to?: unknown }).to;
   const route = routeSetToWire((target as { route?: unknown }).route);
+  const contactHost = contactHostToWire((target as { contactHost?: unknown }).contactHost);
   if (to !== undefined && typeof to !== "string") {
     throw new TypeError('a dial target\'s "to" is a SIP URI string');
   }
@@ -746,6 +788,7 @@ function dialTargetToWire(target: DialTarget): unknown {
     const object: Record<string, unknown> = { aor };
     if (headers !== undefined) object.headers = headers;
     if (to !== undefined) object.to = to;
+    if (contactHost !== undefined) object.contact_host = contactHost;
     return object;
   }
   if (typeof uri !== "string") {
@@ -756,7 +799,8 @@ function dialTargetToWire(target: DialTarget): unknown {
     nextHop === undefined &&
     headers === undefined &&
     to === undefined &&
-    route === undefined
+    route === undefined &&
+    contactHost === undefined
   ) {
     return uri;
   }
@@ -765,6 +809,7 @@ function dialTargetToWire(target: DialTarget): unknown {
   if (headers !== undefined) object.headers = headers;
   if (to !== undefined) object.to = to;
   if (route !== undefined) object.route = route;
+  if (contactHost !== undefined) object.contact_host = contactHost;
   return object;
 }
 
@@ -1209,7 +1254,7 @@ export class Call {
    *
    * `targets` is a non-empty list of carriers tried cheapest-first: each entry
    * is a bare URI string or a {@link RouteTargetObject}
-   * (`{uri, nextHop?, headers?, timeout?, rerouteAfterProgress?, route?}`). A target
+   * (`{uri, nextHop?, headers?, timeout?, rerouteAfterProgress?, route?, contactHost?}`). A target
    * that has shown progress keeps the call past its `timeout` unless it sets
    * `rerouteAfterProgress`. `strategy` defaults to
    * `"sequential"` (v1 supports only sequential/single — anything else rejects

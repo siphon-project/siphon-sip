@@ -68,7 +68,9 @@ pub(super) fn controller_on(app: &str, dispatcher: TestDispatcher) -> Controller
         OriginateRail {
             bus: Arc::clone(&bus),
             dispatcher: Arc::clone(&dispatcher) as Arc<dyn DispatcherHandle>,
-            prepare: Box::new(move |params| prepare_originate(&staged_on.state, params)),
+            prepare: Box::new(move |params, contact_host| {
+                prepare_originate_with_contact_host(&staged_on.state, params, contact_host)
+            }),
             dial: Box::new(move |prepared| dial_originate(&dialled_on.state, prepared)),
             create_group: Box::new(move |spec, sink| {
                 create_originate_group(&grouped_on.state, spec, sink)
@@ -152,7 +154,7 @@ pub(super) async fn originate(
 
 /// The callee answers the originate's `invite` with a 200 carrying `headers` and
 /// an answer.
-fn callee_answers(
+pub(super) fn callee_answers(
     controller: &Controller,
     call_id: &str,
     invite: &SipMessage,

@@ -17,6 +17,23 @@ pub fn strip_ipv6_brackets(host: &str) -> &str {
         .unwrap_or(host)
 }
 
+/// A bare URI host (RFC 3261 §25.1 `host`): a hostname, an IPv4 address or an
+/// IPv6 address, brackets optional. Returns it the way a URI carries it, an
+/// IPv6 address bracketed, or `None` when `value` is not a host on its own: a
+/// port, a scheme, a user part or a parameter beside it, or a colon that is not
+/// part of an IPv6 address.
+pub fn checked_uri_host(value: &str) -> Option<String> {
+    if !value.contains(['[', ':']) {
+        let hostname_char = |c: char| c.is_ascii_alphanumeric() || c == '-' || c == '.';
+        return (!value.is_empty() && value.chars().all(hostname_char)).then(|| value.to_string());
+    }
+    let unbracketed = strip_ipv6_brackets(value);
+    unbracketed
+        .parse::<std::net::Ipv6Addr>()
+        .ok()
+        .map(|_| format_sip_host(unbracketed))
+}
+
 /// Split a SIP `host[:port]` authority into its host and optional port,
 /// IPv6-bracket aware.  The returned host keeps its brackets for a v6 literal.
 ///
@@ -356,6 +373,44 @@ impl fmt::Display for SipUri {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn checked_uri_host_takes_a_host_alone_and_brackets_ipv6() {
+        assert_eq!(
+            checked_uri_host("tenant-a.example.com").as_deref(),
+            Some("tenant-a.example.com")
+        );
+        assert_eq!(
+            checked_uri_host("192.0.2.10").as_deref(),
+            Some("192.0.2.10")
+        );
+        assert_eq!(
+            checked_uri_host("2001:db8::10").as_deref(),
+            Some("[2001:db8::10]")
+        );
+        assert_eq!(
+            checked_uri_host("[2001:db8::10]").as_deref(),
+            Some("[2001:db8::10]")
+        );
+        for refused in [
+            "",
+            "tenant.example.com:5060",
+            "192.0.2.10:5060",
+            "[2001:db8::10]:5060",
+            "sip:tenant.example.com",
+            "user@tenant.example.com",
+            "tenant.example.com;transport=tcp",
+            "tenant example.com",
+            "[tenant.example.com]",
+            "[2001:db8::10",
+        ] {
+            assert_eq!(
+                checked_uri_host(refused),
+                None,
+                "{refused:?} must be refused"
+            );
+        }
+    }
 
     #[test]
     fn format_sip_host_ipv4() {

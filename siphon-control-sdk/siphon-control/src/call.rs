@@ -625,7 +625,9 @@ impl Call {
     ///
     /// `targets` is a non-empty list of carriers tried cheapest-first: each entry
     /// is a bare URI `str` or a dict
-    /// `{"uri", "next_hop"?, "headers"?, "timeout"?, "reroute_after_progress"?, "route"?}`.
+    /// `{"uri", "next_hop"?, "headers"?, "timeout"?, "reroute_after_progress"?, "route"?,
+    /// "contact_host"?}`. A target's `contact_host` is the host of siphon's own
+    /// Contact on that attempt, as for `dial`.
     /// A target's `route` is the route set its attempt's INVITE carries, a list
     /// of Route values in name-addr form (`"<sip:scscf.example;lr>"`), topmost
     /// first; the attempt goes to the topmost entry unless `next_hop` pins it.
@@ -981,6 +983,14 @@ impl Call {
     /// the call as one to the original number and can send it straight back.
     /// siphon keeps it as the leg's dialog ``To``, so a ``headers`` override is
     /// no substitute.
+    ///
+    /// Either form may carry ``"contact_host"``, the host siphon presents in its
+    /// own ``Contact`` on the branch (every branch of an AoR) in place of the
+    /// address it advertises, for a peer that identifies the tenant or account
+    /// by that host. Only the host changes, so in-dialog requests still reach the
+    /// listener that sent the INVITE, and siphon keeps it as the leg's dialog
+    /// Contact. The server refuses anything but a hostname or an IP address
+    /// with ``bad_request``.
     ///
     /// ``strategy`` is ``"parallel"`` or ``"sequential"`` and ``timeout`` is the
     /// ring timeout in seconds; each left out takes the server's own default

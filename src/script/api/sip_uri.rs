@@ -298,14 +298,7 @@ pub(crate) fn check_host(value: &str) -> PyResult<String> {
              no scheme, user or port (use set_ruri() to change the port)"
         ))
     };
-    let hostname_char = |c: char| c.is_ascii_alphanumeric() || c == '-' || c == '.';
-    if !value.contains(['[', ':']) {
-        if value.is_empty() || !value.chars().all(hostname_char) {
-            return Err(refuse());
-        }
-        return Ok(value.to_string());
-    }
-    checked_address(value).map_err(|_| refuse())
+    crate::sip::uri::checked_uri_host(value).ok_or_else(refuse)
 }
 
 /// Host shape the parser alone does not enforce: it takes anything between

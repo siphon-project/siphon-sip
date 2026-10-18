@@ -15,6 +15,21 @@ entry, but a working config keeps working.
 
 ### Added
 
+- **Control plane: a `dial`, `route` or `originate` can name the host of
+  siphon's own Contact.** `contact_host` on a `dial` target (`{uri}` or
+  `{aor}`, connecting or `on_answer: "bridge"`), on a `route` target and on
+  `originate` (every leg of an `originate {aor}`) replaces the host of the
+  Contact siphon presents on that leg, and nothing else: port, transport and
+  user part stay siphon's own, so in-dialog requests still reach the listener
+  that sent the INVITE. siphon advertises one address per transport, so a peer
+  that identifies the tenant or account by the host of the Contact could be
+  served for one tenant per siphon. The host is the leg's dialog Contact from
+  then on: re-INVITE, UPDATE, session refresh and PRACK present it too.
+  `call.set_contact_user()` composes with it, `call.set_contact_uri()` wins.
+  Anything but a hostname or an IP address is `bad_request` before anything is
+  sent, and so is a `contact_host` on `replace_peer` or `accept_refer`. The
+  Rust, Python and TypeScript control SDKs take it as `contact_host` /
+  `contactHost`.
 - **Ro: sessions held in Rust, as many per call as needed, or none bound to a
   call.** `await diameter.ro_session(...)` opens a credit-control session and
   returns a `RoSession` handle; each has its own Session-Id, Subscription-Ids,
@@ -152,6 +167,12 @@ entry, but a working config keeps working.
   `420 Bad Extension`. The caller's `Require` is now read when the INVITE
   arrives, and only those tags can refuse it; the script's own go to the callee.
 
+- **B2BUA: the answer to a re-INVITE, UPDATE or REFER the callee sent carries
+  the callee dialog's own Contact.** It carried the address siphon advertises
+  on the transport, not the Contact the callee's INVITE had, which moved the
+  callee's remote target (RFC 3261 §12.2.2) whenever the two differed: a leg
+  dialled over a captured flow, a script's `set_contact_uri()`, a
+  `contact_host`.
 - **Proxy: a retransmitted 2xx to an INVITE goes out as the first copy was
   forwarded.** A UAS retransmits its 2xx until the ACK arrives (RFC 3261
   §13.3.1.4). Each copy used to be forwarded statelessly as the UAS sent it:

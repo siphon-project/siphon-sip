@@ -479,6 +479,7 @@ pub(super) fn dial_callee(dispatcher: &TestDispatcher, call_id: &str, invite: &S
             None,
             None,
             None,
+            None,
             &[],
             &dispatcher.state,
         ),

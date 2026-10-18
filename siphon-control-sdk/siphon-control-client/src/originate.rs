@@ -226,6 +226,10 @@ pub struct OriginateOptions {
     /// The RFC 4028 session timer to run on the call; `None` runs the one the
     /// server has configured, if any.
     pub session_timer: Option<SessionTimer>,
+    /// Host of siphon's own Contact on the call (on every leg of an
+    /// [`SipClient::originate_aor`]), in place of the address siphon
+    /// advertises. See [`OriginateOptions::contact_host`].
+    pub contact_host: Option<String>,
 }
 
 impl OriginateOptions {
@@ -277,6 +281,21 @@ impl OriginateOptions {
         self
     }
 
+    /// Present `host` as the host of siphon's own Contact on the call, in
+    /// place of the address siphon advertises, for a peer that identifies the
+    /// tenant or account by that host.
+    ///
+    /// Only the host changes: port, transport and user part stay siphon's own,
+    /// so the callee's in-dialog requests still reach the listener that sent
+    /// the INVITE, and every in-dialog request siphon sends on the call
+    /// presents it too. A hostname, an IPv4 address or an IPv6 address; the
+    /// server refuses anything else with `bad_request` before anything is
+    /// sent.
+    pub fn contact_host(mut self, host: impl Into<String>) -> Self {
+        self.contact_host = Some(host.into());
+        self
+    }
+
     pub(crate) fn insert_into(&self, args: &mut serde_json::Map<String, serde_json::Value>) {
         let mut put = |name: &str, value: &Option<String>| {
             if let Some(value) = value {
@@ -289,6 +308,7 @@ impl OriginateOptions {
         put("next_hop", &self.next_hop);
         put("p_asserted_identity", &self.p_asserted_identity);
         put("on_lost", &self.on_lost);
+        put("contact_host", &self.contact_host);
         if let Some(privacy) = self.privacy {
             args.insert("privacy".to_string(), json!(privacy.as_str()));
         }
@@ -959,7 +979,8 @@ mod tests {
             OriginateMedia::anchor(),
             OriginateOptions::default()
                 .from("sip:reception@example.com")
-                .timeout(25),
+                .timeout(25)
+                .contact_host("tenant-a.example.com"),
             AorRing::default()
                 .strategy(DialStrategy::Sequential)
                 .total_timeout(50),
@@ -979,6 +1000,7 @@ mod tests {
                 "media": true,
                 "from": "sip:reception@example.com",
                 "timeout": 25,
+                "contact_host": "tenant-a.example.com",
                 "strategy": "sequential",
                 "total_timeout": 50,
             })
@@ -991,6 +1013,35 @@ mod tests {
         assert_eq!(group.total_timeout_secs, Some(50));
         assert_eq!(group.branches.len(), 1);
         assert_eq!(group.branches[0].leg_sip_call_id, "b1@host");
+    }
+
+    /// A Contact host rides on a single originate as on an AoR one, and stays
+    /// off the wire when it was not asked for.
+    #[tokio::test]
+    async fn originate_sends_the_contact_host_it_was_given() {
+        let recorder = Arc::new(Recorder {
+            sent: Mutex::new(Vec::new()),
+            result: json!({}),
+        });
+        let transport: Arc<dyn CommandTransport> = recorder.clone();
+        for contact_host in [Some("2001:db8::5"), None] {
+            let mut options = OriginateOptions::default();
+            if let Some(host) = contact_host {
+                options = options.contact_host(host);
+            }
+            originate_on(
+                &transport,
+                "cb-1",
+                "sip:+15550100@trunk.example",
+                OriginateMedia::sdp("v=0\r\n"),
+                options,
+            )
+            .await
+            .expect("originate");
+        }
+        let sent = recorder.sent.lock().unwrap().clone();
+        assert_eq!(sent[0].3["contact_host"], json!("2001:db8::5"));
+        assert!(sent[1].3.get("contact_host").is_none());
     }
 
     /// Ring options left unset take the server's defaults rather than a copy.

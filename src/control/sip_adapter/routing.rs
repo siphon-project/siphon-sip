@@ -467,6 +467,7 @@ pub(super) fn parse_dial_target(
         privacy: super::originate::parse_privacy("dial target", object.get("privacy"))
             .map_err(|error| error.to_string())?,
         to: string_field("to"),
+        contact_host: parse_contact_host(object).map_err(|error| format!("target {error}"))?,
         ..Default::default()
     };
 
@@ -495,6 +496,7 @@ pub(super) fn parse_dial_target(
                         .clone_from(&shaped.p_asserted_identity);
                     branch.privacy = shaped.privacy;
                     branch.to.clone_from(&shaped.to);
+                    branch.contact_host.clone_from(&shaped.contact_host);
                 }
                 Ok(branches)
             }
@@ -532,6 +534,7 @@ pub(super) fn parse_route_target(
             timeout_secs: None,
             reroute_after_progress: false,
             route: Vec::new(),
+            contact_host: None,
         });
     }
     let Some(object) = item.as_object() else {
@@ -564,6 +567,7 @@ pub(super) fn parse_route_target(
             .ok_or_else(|| "target 'reroute_after_progress' must be a boolean".to_string())?,
     };
     let route = parse_route_set(object)?;
+    let contact_host = parse_contact_host(object).map_err(|error| format!("target {error}"))?;
     Ok(crate::dispatcher::RouteTarget {
         uri: uri.to_string(),
         next_hop,
@@ -571,7 +575,29 @@ pub(super) fn parse_route_target(
         timeout_secs,
         reroute_after_progress,
         route,
+        contact_host,
     })
+}
+
+/// Read a `contact_host`: the host siphon presents in its own Contact on the
+/// leg, in place of the address it advertises, for a peer that identifies the
+/// tenant or account by the host of the Contact.
+///
+/// Absent or `null` is none. Anything else must be a hostname or an IP
+/// address and nothing more, returned as the Contact carries it (an IPv6
+/// address bracketed). A value siphon cannot put there is refused before
+/// anything is sent rather than dropped: the peer would serve the call as some
+/// other tenant's. The error names the argument; the caller says whose it is.
+pub(super) fn parse_contact_host(
+    object: &serde_json::Map<String, serde_json::Value>,
+) -> Result<Option<String>, String> {
+    match object.get("contact_host") {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(host)) => {
+            crate::dispatcher::checked_contact_host(host).map(Some)
+        }
+        Some(_) => Err("contact_host must be a string".to_string()),
+    }
 }
 
 /// Read a target's `route`: the route set its B-leg INVITE carries (RFC 3261

@@ -106,7 +106,7 @@ reported as a failure. That is damage control, not a substitute for closing.
 - `await client.connect()` / `await client.run()` — connect / drive (reconnect + resync).
 - `await client.command(verb, module=None, target=None, args=None)` — the generic
   `{module, verb, target, args}` primitive for any adapter (SIP today; SMPP/SS7 later).
-- `await client.originate(channel, to=None, *, aor=None, strategy=None, total_timeout=None, media=False, sdp=None, body=None, content_type=None, …, session_timer=None)`
+- `await client.originate(channel, to=None, *, aor=None, strategy=None, total_timeout=None, media=False, sdp=None, body=None, content_type=None, …, session_timer=None, contact_host=None)`
   — place an outbound call under a channel id you choose; resolves to the `Call` it
   placed once the INVITE is on the wire, so the answer, a rejection or the ring timeout
   arrive on `await call.next_event()` and `await call.hangup()` CANCELs or BYEs it
@@ -114,7 +114,9 @@ reported as a failure. That is damage control, not a substitute for closing.
   `ControlError` `conflict`, refused before anything is sent. Exactly one
   media plan (`media=True`, `sdp=` or `body=`). `session_timer={"expires", "min_se",
   "refresher"}` runs an RFC 4028 session timer on the call, each key left out taking the
-  server's default. What the server would refuse raises `ValueError` before a frame goes out.
+  server's default. `contact_host="tenant-a.example.com"` presents that host in siphon's
+  own Contact on the call (on every leg with `aor=`), for a peer that identifies the
+  tenant by it. What the server would refuse raises `ValueError` before a frame goes out.
 - `await client.describe()` — adapter schema.
 - `client.shutdown()` — stop the client and unblock `run()`.
 - `client.close()` — shutdown, plus drop the handler so nothing else is
@@ -153,7 +155,10 @@ reported as a failure. That is damage control, not a substitute for closing.
   A `{"uri": ...}` target (of `dial` or `route`) may carry `"route"`, the route set
   its INVITE carries, topmost first: `["<sip:term@scscf.example;lr;odi=4f1c>"]`.
   That is how an IMS application server sends a session back through the S-CSCF
-  with the Route the S-CSCF gave it.
+  with the Route the S-CSCF gave it. Any target (of `dial`, `{"uri"}` or `{"aor"}`,
+  or of `route`) may carry `"contact_host"`, the host siphon presents in its own
+  Contact on that leg in place of the address it advertises, for a peer that
+  identifies the tenant or account by that host. Only the host changes.
   With `on_answer="bridge"` it instead rings phones for a caller the app already
   answered and anchored (after a greeting or a menu), plays `ringback` (a tone
   preset or cadence, `True` for the default, `False` for none) while they alert, and

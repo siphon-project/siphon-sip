@@ -1776,6 +1776,7 @@ mod tests {
                         timeout_secs: Some(30),
                         reroute_after_progress: false,
                         route: Vec::new(),
+                        contact_host: None,
                     },
                 ],
                 Some("sequential"),

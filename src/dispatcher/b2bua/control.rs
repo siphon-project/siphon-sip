@@ -2,6 +2,7 @@
 //! layers call into: route, answer, progress, and the media handles.
 use crate::dispatcher::*;
 
+use super::contact_host::check_branch_contact_hosts;
 use super::dial_target::{
     apply_dial_identity, branch_called_parties, branch_identities, ShapedFrom,
 };
@@ -25,6 +26,9 @@ pub struct RouteTarget {
     /// Route set for this attempt's INVITE, topmost first. See
     /// [`crate::lcr::Route::route`].
     pub route: Vec<String>,
+    /// Host siphon presents in its own `Contact` on this attempt's leg. See
+    /// [`DialTarget::contact_host`].
+    pub contact_host: Option<String>,
 }
 
 /// The failover queue a `route` verb's targets become: R-URI carriers, as
@@ -52,6 +56,7 @@ fn route_verb_routes(
                 headers,
                 reroute_after_progress: target.reroute_after_progress,
                 route: target.route,
+                contact_host: target.contact_host,
                 ..Default::default()
             }
         })
@@ -1030,6 +1035,8 @@ pub(crate) fn b2bua_dial_call_with_state(
     let branch_froms =
         branch_identities(&targets, &template, shaping).map_err(DialError::InvalidIdentity)?;
     let branch_tos = branch_called_parties(&targets).map_err(DialError::InvalidIdentity)?;
+    let mut targets = targets;
+    check_branch_contact_hosts(&mut targets).map_err(DialError::InvalidIdentity)?;
 
     if let Some(profile) = shaping.profile.as_deref() {
         let source_ip = state
@@ -1179,6 +1186,7 @@ fn dial_parallel(
                 .as_ref()
                 .and_then(|shaped| shaped.host.as_deref()),
             branch_to.as_deref(),
+            target.contact_host.as_deref(),
             &headers,
             state,
         ) {
@@ -1247,6 +1255,9 @@ fn sequential_dial_routes(
                 // The target's own route set, which an attempt would otherwise
                 // go without: the failover engine builds each INVITE afresh.
                 route: target.route,
+                // The Contact host this target presents, which every attempt
+                // has to carry for the same reason its route set does.
+                contact_host: target.contact_host,
                 ..Default::default()
             }
         })
@@ -1409,6 +1420,7 @@ mod tests {
             timeout_secs,
             reroute_after_progress,
             route: Vec::new(),
+            contact_host: None,
         }
     }
 

@@ -141,6 +141,35 @@ pub(super) fn sanitize_b2bua_response_keeping(
     }
 }
 
+/// Put siphon's own Contact on the callee's dialog on a response siphon relays
+/// to the callee: the answer to a re-INVITE, UPDATE or REFER the callee sent.
+///
+/// [`sanitize_b2bua_response`] points Contact at the address siphon advertises,
+/// which is what the caller's dialog presents. The callee's dialog presents the
+/// Contact its INVITE carried, kept as the leg's local Contact: the host a
+/// controller's `contact_host` named, a captured flow's socket, a script's
+/// `set_contact_uri()`. A 2xx to a target refresh request carries the
+/// answerer's Contact and becomes the peer's remote target (RFC 3261 §12.2.2),
+/// so presenting the advertised one here would move it for the rest of the
+/// dialog. A 3xx keeps the redirect target it carries.
+pub(super) fn present_callee_dialog_contact(
+    response: &mut SipMessage,
+    call_id: &str,
+    state: &DispatcherState,
+) {
+    if relayed_response_keeps_its_contact(response.status_code()) {
+        return;
+    }
+    let contact = state.call_actors.get_call(call_id).and_then(|call| {
+        call.bridged_b_leg_index()
+            .and_then(|index| call.b_legs.get(index))
+            .and_then(|leg| leg.dialog.local_contact.clone())
+    });
+    if let Some(contact) = contact {
+        response.headers.set("Contact", contact);
+    }
+}
+
 /// Whether a response relayed to the A-leg keeps the Contact the far end put on
 /// it, rather than siphon's own.
 ///

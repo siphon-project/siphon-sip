@@ -183,7 +183,7 @@ pub fn forward_reinvite_response(
             .cloned();
 
         // A-facing (is_a2b) response: anchor Contact to the A-leg's arrival socket;
-        // B-facing: leave it to via_port (the B-side advertised address). Skipped
+        // B-facing: the callee dialog's own Contact, the one its INVITE carried. Skipped
         // for a siphon-originated re-INVITE — its response is absorbed, not
         // forwarded, and the ACK needs the responder's own Contact intact.
         if is_bridged_reinvite {
@@ -198,6 +198,9 @@ pub fn forward_reinvite_response(
                 },
                 call_id,
             );
+            if !is_a2b {
+                present_callee_dialog_contact(message, call_id, state);
+            }
         }
 
         rewrite_reinvite_answer_sdp(

@@ -288,7 +288,7 @@ what lets a refused verb be lined up against a capture, a CDR and HEP.
 
 | verb | module | args | notes |
 |---|---|---|---|
-| `originate` | sip | `{channel, to \| aor, from?, from_display?, to_display?, next_hop?, p_asserted_identity?, privacy?, headers?, sdp \| body + content_type? \| media, profile?, ws_uri?, timeout?, on_lost?, vars?, session_timer?, strategy?, total_timeout?}` | place an outbound call under a **caller-supplied** channel id; returns as soon as the INVITE is on the wire. `aor` rings every phone registered at it, each over its own flow and Path, and the first to answer becomes the channel's call (`strategy` and `total_timeout` go with `aor` only). See [ringing a registered AoR](#ringing-a-registered-aor-originate-aor) |
+| `originate` | sip | `{channel, to \| aor, from?, from_display?, to_display?, next_hop?, p_asserted_identity?, privacy?, headers?, sdp \| body + content_type? \| media, profile?, ws_uri?, timeout?, on_lost?, vars?, session_timer?, strategy?, total_timeout?, contact_host?}` | place an outbound call under a **caller-supplied** channel id; returns as soon as the INVITE is on the wire. `aor` rings every phone registered at it, each over its own flow and Path, and the first to answer becomes the channel's call (`strategy` and `total_timeout` go with `aor` only). See [ringing a registered AoR](#ringing-a-registered-aor-originate-aor) |
 | `answer` | sip | `{code, reason?, body?, content_type?, headers?, anchor?, profile?, ws_uri?}` | UAS 2xx to the parked A-leg. `headers` (here and on `ring`, `progress` and `reject`) is an object of header name to string value added to the response; a header siphon owns on it (Via, From, To, Call-ID, CSeq, Contact, Record-Route, Route, Max-Forwards, Content-Length, Content-Type, RSeq, RAck, Require, Supported, Session-Expires, Min-SE) is refused `bad_request` and nothing is sent. With `anchor` (or a `profile` / `ws_uri`, which imply it) siphon synthesizes the RFC 3264 answer against the media engine and anchors the leg's audio to it in the same act — the verb form of `call.handover(answer=True, …)`, and the only way an app that took the call **un-answered** can connect it. Without a `ws_uri` the leg is anchored on the engine with **no bridge** — which is what `play`, DTMF and recording need, and what an IVR menu, a queue announcement, music on hold and a voicemail greeting all are. `siphon-rtp` only: on rtpengine / rtpproxy it answers `unavailable` rather than a 200 with nothing behind it, and on any media failure the 2xx is never sent, so the call stays parked and answerable |
 | `ring` | sip | `{reason?, headers?}` | `180 Ringing` — alerting only (RFC 3261 §13.2.1); a body is refused |
 | `progress` | sip | `{code, reason?, body?, content_type?, headers?, anchor?, profile?, ws_uri?}` | a UAS 1xx, optionally opening an early-media path with SDP (RFC 3960 §3.1); defaults to `183 Session Progress`. `headers: {"P-Early-Media": "sendrecv"}` tells the caller's network to pass the early media it carries (RFC 5009). With `anchor` (or a `profile` / `ws_uri`, which imply it) siphon synthesizes the early-media SDP against the media engine instead of taking a `body` (pass one or the other), and the later 2xx repeats that answer. An anchored progress needs a 101-199 code, since a 100 carries no body. On a media failure nothing is sent and it answers `unavailable`, with the call still parked |
@@ -320,9 +320,11 @@ what lets a refused verb be lined up against a capture, a CDR and HEP.
 decides routing out-of-process (LCR / rating / business logic), then hands
 control back to siphon with the decision. `targets` is a non-empty array of
 either bare URI strings or objects
-`{uri, next_hop?, headers?, timeout?, reroute_after_progress?, route?}`. A
+`{uri, next_hop?, headers?, timeout?, reroute_after_progress?, route?, contact_host?}`. A
 target's `route` is the route set its attempt carries, as for
-[`dial`](#dial-ring-while-the-caller-waits). A target's
+[`dial`](#dial-ring-while-the-caller-waits), and its `contact_host` the host of
+siphon's own Contact on that attempt (see
+[presenting a Contact host](#presenting-a-contact-host)). A target's
 `timeout` bounds the wait for that carrier to show progress (a 101-199); a
 carrier that has keeps the call to the later of its `timeout` and 30 s, then
 the call fails with `408` rather than trying the next target, unless the target
@@ -1138,6 +1140,10 @@ headers in `headers` (Via, From, To, Call-ID, CSeq, Contact, Max-Forwards,
 Content-Length, Route, Record-Route) are ignored: the stack owns them, and
 overwriting one would leave the leg unaddressable for its own ACK / BYE.
 
+**Contact host.** `contact_host` is the host siphon presents in its own Contact
+on the call, or on every leg of an `originate {aor}`, in place of the address it
+advertises. See [presenting a Contact host](#presenting-a-contact-host).
+
 **Ending it.** `hangup` works on an originated channel like any other: a BYE once
 answered, and a CANCEL (RFC 3261 §9.1) while it is still ringing — never a SIP
 response, which a UAC has no business sending to the party it is calling. The
@@ -1154,7 +1160,7 @@ Left out, the configured timer runs, if there is one. A key no timer has, a
 not a whole number of seconds is `bad_request`, and nothing is placed.
 
 Refusals are typed and separately actionable: `bad_request` (missing/contradictory
-args, unparseable URI, bad `privacy` or `session_timer`), `conflict` (the id is in use), `not_found`
+args, unparseable URI, bad `privacy`, `session_timer` or `contact_host`), `conflict` (the id is in use), `not_found`
 (no route to the target), `unsupported_verb` (the backend cannot serve the media
 plan), `unavailable` (the B2BUA is not running, or the commanding connection has
 gone — nothing would own the call).
@@ -1520,7 +1526,9 @@ A target is a URI string, `{uri, next_hop?, headers?}`, or `{aor}`, and either
 object form may also carry `from?`, `from_display?`, `p_asserted_identity?` and
 `privacy?` for that branch alone. Either form may also carry `to?`, the called
 party the branch is addressed to, on every contact an `aor` forks to (see
-[naming the called party](#naming-the-called-party)). An `aor`
+[naming the called party](#naming-the-called-party)), and `contact_host?`, the
+host siphon presents in its own Contact on the branch (see
+[presenting a Contact host](#presenting-a-contact-host)). An `aor`
 resolves against the registrar and forks to **every** registered contact, each
 over that contact's own captured flow and Path route set — which is the only way
 to reach a phone registered over TCP, TLS or WSS behind NAT, since such a
@@ -1827,6 +1835,52 @@ attempt of a sequential hunt, and each phone of an `on_answer: "bridge"` dial.
 ```
 
 A `to` that is not a SIP URI is `bad_request`, refused before any phone rings.
+
+### Presenting a Contact host
+
+siphon's own Contact on a leg it places names the address it advertises on that
+transport, and there is one of those per transport. Every leg of every call
+presents the same Contact host. A peer that identifies the tenant or account by
+the host of the Contact (some hosted trunks and SBC services do) can then be
+served for one tenant per siphon.
+
+`contact_host` names the host for one leg: on a `dial` target (`{uri}` or
+`{aor}`, connecting or `on_answer: "bridge"`, every branch of a fork and every
+attempt of a sequential hunt), on a [`route`](#route) target, and on
+[`originate`](#placing-a-call-originate) (every phone of an `originate {aor}`).
+It replaces the host and nothing else. The port, the `transport` parameter and
+any user part stay siphon's own, because they are what keep the peer's
+in-dialog requests reaching the listener that sent the INVITE (RFC 3261
+§12.1.2). Pointing the name at that listener is the deployment's job, in its
+DNS.
+
+```json
+{"verb": "dial", "args": {"targets": [
+  {"uri": "sip:+15550199@trunk.example", "contact_host": "tenant-a.example.com"}
+]}}
+```
+
+```
+INVITE sip:+15550199@trunk.example SIP/2.0
+Contact: <sip:tenant-a.example.com:5060;transport=udp>
+```
+
+The host becomes the leg's dialog local Contact, so everything siphon sends on
+that dialog afterwards presents it too: the re-INVITE and UPDATE of a hold,
+bridge or media change, an RFC 4028 session refresh, a PRACK, a retry after a
+401/407 or 422, and the 2xx siphon answers the peer's own re-INVITE or UPDATE
+with. siphon is a UA on the leg and adds no Record-Route to it, so there is no
+other host of its own to match.
+
+A hostname, an IPv4 address or an IPv6 address is accepted (an IPv6 address is
+put in brackets whether or not it came with them). Anything else, a port, a
+scheme, a user part or a parameter included, is `bad_request` before anything
+is sent. A script's `call.set_contact_user()` composes with it: the user part
+rides on the target's host. A script's `call.set_contact_uri()` names the whole
+URI and wins, because a deployment that fronts siphon owns where in-dialog
+requests go; siphon logs a warning naming both. A transfer's new leg
+(`replace_peer`, `accept_refer`) presents the advertised host, and a
+`contact_host` on either verb or its target is `bad_request`.
 
 ### Anchoring the media
 

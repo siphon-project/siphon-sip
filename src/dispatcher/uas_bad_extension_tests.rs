@@ -256,6 +256,7 @@ fn route_target() -> RouteTarget {
         timeout_secs: None,
         reroute_after_progress: false,
         route: Vec::new(),
+        contact_host: None,
     }
 }
 
