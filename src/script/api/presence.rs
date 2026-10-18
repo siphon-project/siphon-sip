@@ -152,7 +152,6 @@ impl PyPresence {
     ///         NOTIFY.  Pass ``str(request.to_uri)``.
     ///     remote_uri: The SUBSCRIBE's **From URI** — the dialog's remote URI,
     ///         required in the ``To``.  Pass ``str(request.from_uri)``.
-    ///
     ///     local_cseq: The CSeq number the dialog's last NOTIFY had; the next
     ///         one carries one more.  ``0`` (the default) for a new dialog.
     ///         A dialog rebuilt from stored state (IMS restoration, TS 23.380
