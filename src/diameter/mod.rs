@@ -31,6 +31,8 @@ pub mod ro_service;
 #[cfg(test)]
 pub(crate) mod ro_test_support;
 pub mod rx;
+#[cfg(test)]
+pub(crate) mod s13_test_vectors;
 pub mod s6a;
 pub mod s6c;
 pub mod server;

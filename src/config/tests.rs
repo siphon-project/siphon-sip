@@ -4609,6 +4609,24 @@ fn diameter_server_yaml(diameter_block: &str) -> Result<Config> {
 }
 
 #[test]
+fn a_listening_eir_can_advertise_s13() {
+    let diameter = diameter_server_yaml(concat!(
+        "  origin_host: \"eir.example.org\"\n",
+        "  origin_realm: \"example.org\"\n",
+        "  applications: [s13]\n",
+        "  clients:\n",
+        "    - { name: mme, allowed_ips: [\"192.0.2.0/24\"] }\n",
+    ))
+    .expect("s13 is an application name")
+    .diameter
+    .expect("diameter section");
+    let effective = diameter.effective_tenants();
+    let tenant = effective.get("default").expect("default tenant");
+    // TS 29.272 clause 7.1.8: vendor 3GPP (10415), S13 16777252.
+    assert_eq!(tenant.application_ids(), vec![(10415, 16_777_252)]);
+}
+
+#[test]
 fn flat_applications_fold_into_the_default_tenant() {
     let diameter = diameter_server_yaml(concat!(
         "  origin_host: \"hss.example.org\"\n",

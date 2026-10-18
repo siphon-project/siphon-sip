@@ -354,6 +354,8 @@ pub enum DiameterApplication {
     Sgd,
     /// S6a (TS 29.272) — MME ↔ HSS for LTE attach/auth.
     S6a,
+    /// S13 (TS 29.272) — MME or SGSN ↔ EIR for the ME identity check.
+    S13,
     /// Zh (TS 29.109), GBA: BSF to HSS for the authentication vector and
     /// the user security settings.
     Zh,
@@ -376,6 +378,7 @@ impl DiameterApplication {
             Self::S6c => (dictionary::VENDOR_3GPP, dictionary::S6C_APP_ID),
             Self::Sgd => (dictionary::VENDOR_3GPP, dictionary::SGD_APP_ID),
             Self::S6a => (dictionary::VENDOR_3GPP, dictionary::S6A_APP_ID),
+            Self::S13 => (dictionary::VENDOR_3GPP, dictionary::S13_APP_ID),
             Self::Zh => (dictionary::VENDOR_3GPP, dictionary::ZH_APP_ID),
             Self::Zn => (dictionary::VENDOR_3GPP, dictionary::ZN_APP_ID),
         }

@@ -628,6 +628,45 @@ mod tests {
         assert_eq!(authentication, vec![Some(dictionary::S6A_APP_ID)]);
     }
 
+    /// An EIR advertises S13 the way TS 29.272 clause 7.1.8 has it: the
+    /// application identifier in the Auth-Application-Id of a
+    /// Vendor-Specific-Application-Id with Vendor-Id 10415.
+    #[tokio::test]
+    async fn an_eir_advertises_s13_inside_a_vendor_specific_application_id() {
+        const S13: (u32, u32) = (dictionary::VENDOR_3GPP, dictionary::S13_APP_ID);
+        let admitted = exchange(vec![S13], vec![S13]).await;
+        assert!(admitted.result.is_ok());
+        assert_eq!(admitted.result_code(), dictionary::DIAMETER_SUCCESS);
+
+        // Written out by hand: Vendor-Specific-Application-Id (260, M, 32
+        // octets) { Vendor-Id (266, M) 10415, Auth-Application-Id (258, M)
+        // 16777252 }.
+        #[rustfmt::skip]
+        let vendor_specific: [u8; 32] = [
+            0x00, 0x00, 0x01, 0x04, 0x40, 0x00, 0x00, 0x20,
+            0x00, 0x00, 0x01, 0x0a, 0x40, 0x00, 0x00, 0x0c, 0x00, 0x00, 0x28, 0xaf,
+            0x00, 0x00, 0x01, 0x02, 0x40, 0x00, 0x00, 0x0c, 0x01, 0x00, 0x00, 0x24,
+        ];
+        assert!(
+            admitted
+                .cea_wire
+                .windows(vendor_specific.len())
+                .any(|window| window == vendor_specific),
+            "the CEA carries S13 inside a Vendor-Specific-Application-Id"
+        );
+        assert_eq!(
+            advertised_application_ids(&admitted.cea.avps),
+            vec![dictionary::S13_APP_ID, dictionary::S13_APP_ID]
+        );
+
+        // An MME that offers only S6a has nothing in common with an EIR.
+        let refused = exchange(vec![S13], vec![S6A]).await;
+        assert_eq!(
+            refused.result_code(),
+            dictionary::DIAMETER_NO_COMMON_APPLICATION
+        );
+    }
+
     #[tokio::test]
     async fn a_peer_with_a_common_application_is_admitted() {
         let exchange = exchange(vec![S6A, RF], vec![CX, S6A]).await;

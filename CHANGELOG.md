@@ -83,6 +83,20 @@ entry, but a working config keeps working.
   `TargetIdentity` is now exported from `siphon_control_client::sip`, which
   makes `DialTarget::Uri` buildable by hand (needed to pin `next_hop` and a
   route set together).
+### Added
+
+- **Diameter S13: an EIR can answer the ME identity check (TS 29.272).**
+  `"S13"` (Application-Id 16777252, Vendor-Id 10415) resolves wherever an
+  application is given by name: the `applications` list of a listening node,
+  which advertises it in the CEA, `diameter.routes`, `diameter.send_request`
+  and the `@diameter.on_request("S13:ECR")` filter. ME-Identity-Check (324) is
+  a known command (`"ME-Identity-Check-Request"`, `"ECR"`, `"ECA"`), and the
+  dictionary knows Equipment-Status (1445) with its PERMITTEDLISTED,
+  PROHIBITEDLISTED and TRACKINGLISTED values and 3GPP2-MEID (1471). An unknown
+  terminal is answered with DIAMETER_ERROR_EQUIPMENT_UNKNOWN (5422) in an
+  Experimental-Result, with a metrics result label of its own, `exp:5422`.
+  Checked against hand-written messages and Wireshark's Diameter dissector
+  with `scripts/validate_diameter_s13.sh`; not tested against an MME.
 
 ## [1.14.0] — 2026-10-17
 

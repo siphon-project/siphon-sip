@@ -58,6 +58,7 @@ They are case-insensitive in a script and lowercase in `siphon.yaml`.
 | `Rx` | 16777236 | 10415 | TS 29.214 |
 | `Gx` | 16777238 | 10415 | TS 29.212 |
 | `S6a` | 16777251 | 10415 | TS 29.272 |
+| `S13` | 16777252 | 10415 | TS 29.272 |
 | `S6c` | 16777312 | 10415 | TS 29.338 |
 | `SGd` | 16777313 | 10415 | TS 29.338 |
 | `Zh` | 16777221 | 10415 | TS 29.109 |
@@ -110,7 +111,7 @@ diameter:
     tcp: "0.0.0.0:3868"
   origin_host: "hss.epc.mnc001.mcc001.3gppnetwork.org"
   origin_realm: "epc.mnc001.mcc001.3gppnetwork.org"
-  applications: [s6a, cx]      # cx, sh, rx, gx, ro, rf, s6a, s6c, sgd, zh, zn, or relay
+  applications: [s6a, cx]      # cx, sh, rx, gx, ro, rf, s6a, s13, s6c, sgd, zh, zn, or relay
   clients:
     - name: mme
       allowed_ips: ["192.0.2.0/24"]
@@ -365,6 +366,63 @@ Every message above is checked against Wireshark's Diameter dissector with
 AVP's code, vendor and flags, and that nothing is malformed or unknown.
 Wireshark's dictionary names AVP 402 `NAF-Hostname`; TS 29.109 names it
 `NAF-Id`, and so does siphon. Not tested against an HSS.
+
+## S13: the EIR answers
+
+On S13 (TS 29.272 clause 5.2.4) an MME, or an SGSN on S13', asks the Equipment
+Identity Register whether a terminal may use the network. The request is
+ME-Identity-Check (324) on application 16777252, `"ECR"` and `"ECA"` by name.
+An EIR serves it with `@diameter.on_request("S13:ECR")`, which also makes the
+node advertise S13 in its CEA; a node whose handlers name no application lists
+it with `applications: [s13]`.
+
+```yaml
+diameter:
+  listen:
+    tcp: "0.0.0.0:3868"
+  origin_host: "eir.epc.mnc001.mcc001.3gppnetwork.org"
+  origin_realm: "epc.mnc001.mcc001.3gppnetwork.org"
+  applications: [s13]
+  clients:
+    - name: mme
+      allowed_ips: ["192.0.2.0/24"]
+```
+
+Terminal-Information is a Grouped AVP: `get_avp` returns its members as
+`(code, value, vendor)` tuples, IMEI (1402) and Software-Version (1403) for a
+3GPP terminal, or 3GPP2-MEID (1471). The answer carries Equipment-Status
+(1445): 0 PERMITTEDLISTED, 1 PROHIBITEDLISTED, 2 TRACKINGLISTED. A terminal the
+EIR does not know is answered with DIAMETER_ERROR_EQUIPMENT_UNKNOWN (5422)
+inside an Experimental-Result, with no Result-Code and no Equipment-Status
+(TS 29.272 clause 7.4.3.5):
+
+```python
+TGPP = 10415
+
+@diameter.on_request("S13:ECR")
+def me_identity_check(request):
+    terminal = {code: value for code, value, vendor
+                in request.get_avp("Terminal-Information")}
+    imei = terminal.get(1402)                     # 14 digits, no check digit
+    status = equipment.get(imei)                  # 0, 1 or 2, or None
+
+    answer = request.answer(2001)
+    if status is None:
+        answer.remove_avp("Result-Code")
+        answer.set_avp("Experimental-Result",
+                       [("Vendor-Id", TGPP), ("Experimental-Result-Code", 5422)])
+        return answer
+    answer.set_avp("Equipment-Status", status)
+    return answer
+```
+
+siphon carries the messages and knows the AVPs. The equipment list, and what a
+tracked terminal means, are the script's.
+
+The CEA of an EIR and the answers above are checked against Wireshark's
+Diameter dissector with `scripts/validate_diameter_s13.sh`. Wireshark's
+dictionary still names the Equipment-Status values WHITELISTED, BLACKLISTED
+and GREYLISTED; TS 29.272 names them as siphon does. Not tested against an MME.
 
 ## Rx: QoS and bearer events
 
