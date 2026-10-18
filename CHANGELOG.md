@@ -38,6 +38,109 @@ entry, but a working config keeps working.
   (`additional_subscription_ids`, the IMSI next to the MSISDN). The grant
   reports Tariff-Time-Change (read from the Granted-Service-Unit, where it was
   never found before) and the PS-Free-Format-Data the OCS returns.
+- **Cx IMS restoration (TS 23.380 clause 4, TS 29.229).** `diameter.cx_sar`
+  takes the S-CSCF restoration information and its companions
+  (`ims_restoration`, `restoration_info`, `user_data_already_available`,
+  `multiple_registration`, `pcscf_restoration_mechanism`,
+  `pcscf_restoration_indication`, `failed_pcscf`), and its answer adds
+  `experimental_result_code`, `scscf_restoration_info`,
+  `associated_registered_identities` and `supported_features`.
+  `diameter.cx_lir` takes `user_authorization_type`. `registrar.restore()`
+  rebuilds a binding from what the HSS returned, and `Contact.sip_instance` /
+  `Contact.reg_id` expose the RFC 5626 parameters, and
+  `presence.subscribe_dialog` takes `local_cseq` for a dialog rebuilt from the
+  restoration information. The restoration AVPs (639-649, 654, 655, 660, 661,
+  664-666) are in the dictionary with the M bit clear, as table 6.3.1 has
+  them. Checked against a hand-written vector and Wireshark's dissector
+  (`scripts/validate_diameter_cx_requests.sh`).
+- **Diameter S13: an EIR can answer the ME identity check (TS 29.272).**
+  `"S13"` (Application-Id 16777252, Vendor-Id 10415) resolves wherever an
+  application is given by name: the `applications` list of a listening node,
+  which advertises it in the CEA, `diameter.routes`, `diameter.send_request`
+  and the `@diameter.on_request("S13:ECR")` filter. ME-Identity-Check (324) is
+  a known command (`"ME-Identity-Check-Request"`, `"ECR"`, `"ECA"`), and the
+  dictionary knows Equipment-Status (1445) with its PERMITTEDLISTED,
+  PROHIBITEDLISTED and TRACKINGLISTED values and 3GPP2-MEID (1471). An unknown
+  terminal is answered with DIAMETER_ERROR_EQUIPMENT_UNKNOWN (5422) in an
+  Experimental-Result, with a metrics result label of its own, `exp:5422`.
+  Checked against hand-written messages and Wireshark's Diameter dissector
+  with `scripts/validate_diameter_s13.sh`; not tested against an MME.
+- **`ipsec.delete(ue_addr, ue_port_c=None, *, delay_secs=0)`.** Awaitable;
+  deletes the UE's security association pair (or every pair of the UE) and
+  the stream connections over it, now or after `delay_secs`. Returns how many
+  pairs it deleted or scheduled.
+- **The control SDKs send a `dial` or `route` target's route set.** 1.14.0 let a
+  `{uri}` target carry `route: ["<sip:...;lr>", ...]`, but no SDK could send
+  it, so an application server built on them still could not continue a session
+  through the S-CSCF with the Route it was given (TS 24.229 §5.7.5.2.1). Rust:
+  `DialTarget::uri_routed(uri, route)` and `RouteTarget::route`. Python: a
+  `"route"` list on a `dial` or `route` target dict. TypeScript: `route` on
+  `DialTarget` and `RouteTargetObject`. An empty route set stays off the wire.
+  Python and TypeScript refuse a lone string (not read as a one-entry list) and
+  a `route` on an `{aor}` target before anything is sent; Rust makes the
+  `{aor}` case unrepresentable. **Breaking (Rust):** `RouteTarget` gains a
+  public `route` field and `DialTarget::Uri` a `route` field, so a struct
+  literal or exhaustive pattern without `..` has to name it.
+  `TargetIdentity` is now exported from `siphon_control_client::sip`, which
+  makes `DialTarget::Uri` buildable by hand (needed to pin `next_hop` and a
+  route set together).
+- **`@b2bua.on_invite(request_uri=r"...")`: pick the INVITEs the B2BUA takes.**
+  Any `@b2bua.*` handler used to make every INVITE of the process a B2BUA call.
+  When every `on_invite` handler carries a `request_uri=` filter (a Rust regex,
+  searched for in the serialised Request-URI), the B2BUA takes only the initial
+  INVITEs a filter matches and runs only the matching handlers; every other
+  INVITE, and an in-dialog INVITE that is no B2BUA call's, takes the proxy path
+  as in a script without B2BUA handlers. An unfiltered `on_invite` and
+  `control.inbound` keep taking every INVITE. A bad pattern raises `ValueError`
+  at decoration. A final response the proxy path sends on its own INVITE server
+  transaction is no longer also kept in the B2BUA's retransmission table. SDK:
+  the mock decorator takes the keyword and `SipTestHarness.dispatch_invite()`
+  sends an INVITE down the path siphon would take.
+- **B2BUA: `call.take_over()` lets a script take over a dialog an INVITE
+  names.** The `Replaces` takeover, for headers other than `Replaces`: an SCC
+  AS handed an SRVCC transfer INVITE with `Target-Dialog` and `Require:
+  tdialog` (RFC 4538, TS 24.237 §12.3.5) calls `call.take_over(call_id,
+  local_tag, remote_tag, reinvite=True, headers=None)` in `@b2bua.on_invite`.
+  After the handler returns, siphon answers the INVITE `200` with the
+  surviving party's last SDP (plus the script's `headers`, checked as
+  `answer(headers=…)` checks them), BYEs the named dialog's party, and relays
+  between the survivor and the new leg. `reinvite=False` leaves the survivor
+  un-re-INVITEd (TS 24.237 §12.3.5 C b) and is refused on a media-anchored
+  call. The script authorises it, so `b2bua.accept_replaces` does not gate it.
+  An unknown dialog is refused `481`, an early one `480` (TS 24.237), and
+  `tdialog` is honoured on this path. The `Replaces` path is unchanged.
+- **`rtpengine.offer(target, sdp=...)`: offer a raw SDP.** For an offering
+  party's SDP that reaches the script outside the call's own dialog, such as
+  one party's new SDP on an access transfer (TS 24.237), which arrives in a new
+  INVITE with a Call-ID of its own. `target` names the offerer: a Request,
+  Reply or Call, or a `(call_id, from_tag)` tuple (a bare `call_id` raises
+  `TypeError`). No message body is read or written and the coroutine resolves
+  to the rewritten SDP as `str`. On an anchored call it goes to the engine as a
+  `reoffer` on the session's engine call-id, so the call keeps its ports, and
+  either party may re-offer by its tag; the far party's answer can come back
+  through `answer(..., sdp=..., to_tag=...)` with the tags reversed. On any
+  other call it is the first offer and records the session. No source address
+  is carried. Without `sdp=` nothing changes.
+- **B2BUA: `@b2bua.on_failure` sees the response the call failed on.**
+  `call.failure_response` is the dialled leg's own final response that `code`
+  was derived from, read-only (`status_code`, `reason`, `get_header`,
+  `get_headers`, `body`, `content_type`). `code` is unchanged and stays what
+  the caller is sent, so a B-leg `503` is still `500` there, while the script
+  can now read the `503`, its `Reason`, or a `488`'s SDP (TS 24.292 §10.4.7 CS
+  breakout). For an exhausted route sequence or a fork it is the leg whose
+  failure won (RFC 3261 §16.7). `None` when siphon ended the leg itself: ring
+  timeout, B-leg never sent, LCR ended on undialable carriers.
+- **B2BUA: a script answers and sends INFO (RFC 6086).** `@b2bua.on_info`
+  sees an in-dialog INFO on a call siphon answered itself, and from either
+  party of a bridged call; it answers with `request.set_reply_body()` and
+  `request.reply()`, a retransmission gets the same answer without running the
+  handler again, and an INFO it leaves on a bridged call is relayed as before.
+  `await b2bua.send_info(call_id, body, content_type, headers=None,
+  timeout_ms=5000, leg="caller", with_body=False)` sends one in the caller's
+  dialog, or with `leg="callee"` in the answered callee's, with the dialog's
+  CSeq and route set, retransmitted over UDP, and resolves to the final status
+  (or `(status, body, content_type)` with `with_body=True`), or `None` on
+  timeout.
 
 ### Fixed
 
@@ -50,6 +153,13 @@ entry, but a working config keeps working.
   its media to the wrong place. The forwarded 2xx is now kept, with its
   destination, transport and local socket, until its ACK or 64*T1, and a
   retransmission re-sends it. A 2xx from another branch is unchanged.
+- **`request.reply()` in `@proxy.on_failure` was dropped.** The handler's
+  reply never reached the caller and the failure was suppressed, so the caller
+  got nothing at all. It is now sent on the original server transaction with
+  the headers and body set through `request.set_reply_header()` /
+  `request.set_reply_body()`, for a single relay and a failed fork alike,
+  keeps its code (a 503 is not turned into 500) and is what the CDR and Rf
+  record. A reply outside 300-699 is logged and the failure forwarded.
 - **`registrar.save()` no longer de-registers on an invalid `Contact: *`.** A
   wildcard Contact removed every binding whatever the `Expires` header said,
   and a `*` on a second Contact line was ignored. Per RFC 3261 §10.3 step 6, a
@@ -59,15 +169,6 @@ entry, but a working config keeps working.
   `Expires: 0` removes every binding as before. Counted in
   `siphon_registrar_refusals_total{reason="invalid_wildcard"}`. The SDK mock
   registrar does the same.
-### Added
-
-- **`ipsec.delete(ue_addr, ue_port_c=None, *, delay_secs=0)`.** Awaitable;
-  deletes the UE's security association pair (or every pair of the UE) and
-  the stream connections over it, now or after `delay_secs`. Returns how many
-  pairs it deleted or scheduled.
-
-### Fixed
-
 - **A P-CSCF that relays a de-REGISTER now deletes the UE's security
   associations.** Only a 200 the script answered itself did, so a relayed
   de-registration left the pair, and since 1.14.0 the TCP connections siphon
@@ -92,63 +193,6 @@ entry, but a working config keeps working.
   old one removed the new one's SA #3/#4 policies, so requests to the UE went
   out unprotected. They now stay with the newer pair, or are given back to the
   older one when the newer goes.
-### Added
-
-- **The control SDKs send a `dial` or `route` target's route set.** 1.14.0 let a
-  `{uri}` target carry `route: ["<sip:...;lr>", ...]`, but no SDK could send
-  it, so an application server built on them still could not continue a session
-  through the S-CSCF with the Route it was given (TS 24.229 §5.7.5.2.1). Rust:
-  `DialTarget::uri_routed(uri, route)` and `RouteTarget::route`. Python: a
-  `"route"` list on a `dial` or `route` target dict. TypeScript: `route` on
-  `DialTarget` and `RouteTargetObject`. An empty route set stays off the wire.
-  Python and TypeScript refuse a lone string (not read as a one-entry list) and
-  a `route` on an `{aor}` target before anything is sent; Rust makes the
-  `{aor}` case unrepresentable. **Breaking (Rust):** `RouteTarget` gains a
-  public `route` field and `DialTarget::Uri` a `route` field, so a struct
-  literal or exhaustive pattern without `..` has to name it.
-  `TargetIdentity` is now exported from `siphon_control_client::sip`, which
-  makes `DialTarget::Uri` buildable by hand (needed to pin `next_hop` and a
-  route set together).
-### Added
-
-- **Diameter S13: an EIR can answer the ME identity check (TS 29.272).**
-  `"S13"` (Application-Id 16777252, Vendor-Id 10415) resolves wherever an
-  application is given by name: the `applications` list of a listening node,
-  which advertises it in the CEA, `diameter.routes`, `diameter.send_request`
-  and the `@diameter.on_request("S13:ECR")` filter. ME-Identity-Check (324) is
-  a known command (`"ME-Identity-Check-Request"`, `"ECR"`, `"ECA"`), and the
-  dictionary knows Equipment-Status (1445) with its PERMITTEDLISTED,
-  PROHIBITEDLISTED and TRACKINGLISTED values and 3GPP2-MEID (1471). An unknown
-  terminal is answered with DIAMETER_ERROR_EQUIPMENT_UNKNOWN (5422) in an
-  Experimental-Result, with a metrics result label of its own, `exp:5422`.
-  Checked against hand-written messages and Wireshark's Diameter dissector
-  with `scripts/validate_diameter_s13.sh`; not tested against an MME.
-- **`request.reply()` in `@proxy.on_failure` was dropped.** The handler's
-  reply never reached the caller and the failure was suppressed, so the caller
-  got nothing at all. It is now sent on the original server transaction with
-  the headers and body set through `request.set_reply_header()` /
-  `request.set_reply_body()`, for a single relay and a failed fork alike,
-  keeps its code (a 503 is not turned into 500) and is what the CDR and Rf
-  record. A reply outside 300-699 is logged and the failure forwarded.
-### Added
-
-- **Cx IMS restoration (TS 23.380 clause 4, TS 29.229).** `diameter.cx_sar`
-  takes the S-CSCF restoration information and its companions
-  (`ims_restoration`, `restoration_info`, `user_data_already_available`,
-  `multiple_registration`, `pcscf_restoration_mechanism`,
-  `pcscf_restoration_indication`, `failed_pcscf`), and its answer adds
-  `experimental_result_code`, `scscf_restoration_info`,
-  `associated_registered_identities` and `supported_features`.
-  `diameter.cx_lir` takes `user_authorization_type`. `registrar.restore()`
-  rebuilds a binding from what the HSS returned, and `Contact.sip_instance` /
-  `Contact.reg_id` expose the RFC 5626 parameters, and `presence.subscribe_dialog`
-  takes `local_cseq` for a dialog rebuilt from the restoration information. The restoration AVPs
-  (639-649, 654, 655, 660, 661, 664-666) are in the dictionary with the M bit
-  clear, as table 6.3.1 has them. Checked against a hand-written vector and
-  Wireshark's dissector (`scripts/validate_diameter_cx_requests.sh`).
-
-### Fixed
-
 - **The M bit of grouped AVPs a script builds, and of Supported-Features.**
   A grouped AVP from `set_avp(..., [...])` always carried the M bit, so an
   answer's SCSCF-Restoration-Info or Associated-Registered-Identities did
@@ -166,8 +210,6 @@ entry, but a working config keeps working.
   `ValueError`. **BREAKING (Rust library):** `NodeFunctionality::SCscfRestore`,
   `Mmtel`, `Tpf` and `Atgw` are gone, `Ecscf` and `Atcf` change value. See
   `docs/migrating-to-1.15.md`.
-### Fixed
-
 - **Charging: an orig-cdiv request is recognised in the RFC 8498 form and
   charged to its Request-URI.** `P-Served-User: <sip:bob@example.com>;
   orig-cdiv; regstate=reg` (RFC 8498 section 6, a parameter without a value)
@@ -178,52 +220,6 @@ entry, but a working config keeps working.
   Request-URI as TS 32.299 7.2.32 says, not the To header field, which on a
   diverted call still names the forwarding user; a REGISTER keeps To.
   Behaviour change on the wire.
-- **`@b2bua.on_invite(request_uri=r"...")`: pick the INVITEs the B2BUA takes.**
-  Any `@b2bua.*` handler used to make every INVITE of the process a B2BUA call.
-  When every `on_invite` handler carries a `request_uri=` filter (a Rust regex,
-  searched for in the serialised Request-URI), the B2BUA takes only the initial
-  INVITEs a filter matches and runs only the matching handlers; every other
-  INVITE, and an in-dialog INVITE that is no B2BUA call's, takes the proxy path
-  as in a script without B2BUA handlers. An unfiltered `on_invite` and
-  `control.inbound` keep taking every INVITE. A bad pattern raises `ValueError`
-  at decoration. A final response the proxy path sends on its own INVITE server
-  transaction is no longer also kept in the B2BUA's retransmission table. SDK:
-  the mock decorator takes the keyword and `SipTestHarness.dispatch_invite()`
-  sends an INVITE down the path siphon would take.
-- **B2BUA: `call.take_over()` lets a script take over a dialog an INVITE
-  names.** The `Replaces` takeover, for headers other than `Replaces`: an SCC
-  AS handed an SRVCC transfer INVITE with `Target-Dialog` and `Require:
-  tdialog` (RFC 4538, TS 24.237 §12.3.5) calls `call.take_over(call_id,
-  local_tag, remote_tag, reinvite=True, headers=None)` in `@b2bua.on_invite`.
-  After the handler returns, siphon answers the INVITE `200` with the
-  surviving party's last SDP (plus the script's `headers`, checked as
-  `answer(headers=…)` checks them), BYEs the named dialog's party, and relays
-  between the survivor and the new leg. `reinvite=False` leaves the survivor
-  un-re-INVITEd (TS 24.237 §12.3.5 C b) and is refused on a media-anchored
-  call. The script authorises it, so `b2bua.accept_replaces` does not gate it.
-  An unknown dialog is refused `481`, an early one `480` (TS 24.237), and `tdialog` is
-  honoured on this path. The `Replaces` path is unchanged.
-- **`rtpengine.offer(target, sdp=...)`: offer a raw SDP.** For an offering
-  party's SDP that reaches the script outside the call's own dialog, such as
-  one party's new SDP on an access transfer (TS 24.237), which arrives in a new
-  INVITE with a Call-ID of its own. `target` names the offerer: a Request,
-  Reply or Call, or a `(call_id, from_tag)` tuple (a bare `call_id` raises
-  `TypeError`). No message body is read or written and the coroutine resolves
-  to the rewritten SDP as `str`. On an anchored call it goes to the engine as a
-  `reoffer` on the session's engine call-id, so the call keeps its ports, and
-  either party may re-offer by its tag; the far party's answer can come back
-  through `answer(..., sdp=..., to_tag=...)` with the tags reversed. On any
-  other call it is the first offer and records the session. No source address
-  is carried. Without `sdp=` nothing changes.
-- **B2BUA: `@b2bua.on_failure` sees the response the call failed on.**
-  `call.failure_response` is the dialled leg's own final response that `code`
-  was derived from, read-only (`status_code`, `reason`, `get_header`,
-  `get_headers`, `body`, `content_type`). `code` is unchanged and stays what
-  the caller is sent, so a B-leg `503` is still `500` there, while the script
-  can now read the `503`, its `Reason`, or a `488`'s SDP (TS 24.292 §10.4.7 CS
-  breakout). For an exhausted route sequence or a fork it is the leg whose
-  failure won (RFC 3261 §16.7). `None` when siphon ended the leg itself: ring
-  timeout, B-leg never sent, LCR ended on undialable carriers.
 
 ## [1.14.0] — 2026-10-17
 
