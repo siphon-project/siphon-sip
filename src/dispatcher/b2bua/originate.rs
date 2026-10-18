@@ -1067,7 +1067,13 @@ pub fn handle_originated_call_response(
     if crate::cdr::auto_emit_enabled() {
         cdr_finalize_b2bua_fail(state, internal_call_id, status_code);
     }
-    run_originated_failure_handlers(internal_call_id, status_code, &reason_phrase, state);
+    run_originated_failure_handlers(
+        internal_call_id,
+        status_code,
+        &reason_phrase,
+        Some(message.clone()),
+        state,
+    );
     control_notify_terminated_with_cause(
         &sip_call_id,
         "rejected",

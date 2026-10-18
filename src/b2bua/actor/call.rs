@@ -266,6 +266,10 @@ pub struct CallActor {
     /// this node hosts. Acted on only once the script has admitted the INVITE
     /// (see [`PendingReplaces`]).
     pub pending_replaces: Option<PendingReplaces>,
+    /// The dialled legs' best final failure so far (RFC 3261 §16.7 step 6), as
+    /// sent: `call.failure_response` in `@b2bua.on_failure`. Taken when the
+    /// failure is concluded, so a call routed again starts without one.
+    pub failure_response: Option<crate::sip::message::SipMessage>,
     /// REFER subscriptions siphon owns for transfers in progress (RFC 3515).
     /// Present for the siphon-terminated inbound path (siphon is the notifier,
     /// sending `message/sipfrag` NOTIFYs to the referrer) and the
@@ -571,6 +575,7 @@ impl CallActor {
             session_timer_override: None,
             transfer: None,
             pending_replaces: None,
+            failure_response: None,
             refer_subscriptions: Vec::new(),
             outbound_credentials: None,
             digest_nc: crate::auth::NonceCounter::new(),

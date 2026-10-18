@@ -224,6 +224,10 @@
         "kind": "method_descriptor",
         "sig": "($self, uri, timeout=30, max_duration=None, next_hop=None, flow=None, header_policy=None, copy=..., strip=..., translate=..., route=..., send_socket=None, auth_passthrough=False, number_policy=None, format=None)"
       },
+      "failure_response": {
+        "doc": "In ``@b2bua.on_failure``: the dialled leg's own final response that",
+        "kind": "getset_descriptor"
+      },
       "flow": {
         "doc": "The inbound flow this call's INVITE arrived on \u2014 the B2BUA twin of",
         "kind": "getset_descriptor"
@@ -1001,6 +1005,34 @@
       },
       "uris": {
         "doc": "Every usable URI, in ORDER / PREFERENCE sequence (RFC 6116 section",
+        "kind": "getset_descriptor"
+      }
+    },
+    "FailureResponse": {
+      "body": {
+        "doc": "The response body as ``bytes``, or ``None`` when it has none.",
+        "kind": "getset_descriptor"
+      },
+      "content_type": {
+        "doc": "The ``Content-Type`` header value, or ``None``.",
+        "kind": "getset_descriptor"
+      },
+      "get_header": {
+        "doc": "The first value of a header, or ``None``.",
+        "kind": "method_descriptor",
+        "sig": "($self, name)"
+      },
+      "get_headers": {
+        "doc": "Every value of a header, in order; an empty list when it is absent.",
+        "kind": "method_descriptor",
+        "sig": "($self, name)"
+      },
+      "reason": {
+        "doc": "The leg's own reason phrase.",
+        "kind": "getset_descriptor"
+      },
+      "status_code": {
+        "doc": "The leg's own status code, e.g. ``503`` where the caller is sent ``500``.",
         "kind": "getset_descriptor"
       }
     },

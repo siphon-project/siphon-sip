@@ -60,6 +60,7 @@ mod tests {
             super::super::cache::PyCacheNamespace,
             super::super::call::PyByeInitiator,
             super::super::call::PyCall,
+            super::super::call::PyFailureResponse,
             super::super::call::PyMediaHandle,
             super::super::cdr::PyCdrNamespace,
             super::super::config::PyScriptConfig,

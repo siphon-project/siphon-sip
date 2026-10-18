@@ -369,6 +369,40 @@ impl CallActorStore {
         })
     }
 
+    /// Keep `response`, a dialled leg's final failure, as the call's failure
+    /// response if it ranks above the one kept so far (RFC 3261 §16.7 step 6,
+    /// [`crate::sip::best_response::ResponseRank`]). An equal rank (the same
+    /// status) replaces it: the best-status choice over a route sequence's
+    /// attempts keeps the last of equals too.
+    pub fn record_failure_response(&self, call_id: &str, response: &SipMessage) {
+        let Some(status) = response.status_code() else {
+            return;
+        };
+        if let Some(mut call) = self.calls.get_mut(call_id) {
+            let better = match call
+                .failure_response
+                .as_ref()
+                .and_then(SipMessage::status_code)
+            {
+                Some(kept) => {
+                    crate::sip::best_response::ResponseRank::of(status)
+                        >= crate::sip::best_response::ResponseRank::of(kept)
+                }
+                None => true,
+            };
+            if better {
+                call.failure_response = Some(response.clone());
+            }
+        }
+    }
+
+    /// Take the call's kept failure response, leaving none behind.
+    pub fn take_failure_response(&self, call_id: &str) -> Option<SipMessage> {
+        self.calls
+            .get_mut(call_id)
+            .and_then(|mut call| call.failure_response.take())
+    }
+
     /// Record the `Replaces` match resolved for a call still being admitted.
     pub fn set_pending_replaces(&self, call_id: &str, pending: PendingReplaces) {
         if let Some(mut call) = self.calls.get_mut(call_id) {

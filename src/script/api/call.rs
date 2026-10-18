@@ -266,6 +266,8 @@ pub struct PyByeInitiator {
     pub side: String,
 }
 
+pub use super::call_failure_response::PyFailureResponse;
+
 /// Python-visible B2BUA call object.
 #[pyclass(name = "Call")]
 pub struct PyCall {
@@ -352,6 +354,9 @@ pub struct PyCall {
     /// that one names the carrier that carried the call, this one names the
     /// carriers it had to burn to get there.
     route_attempts: Vec<crate::b2bua::actor::RouteAttempt>,
+    /// The dialled leg's own final response the failure code came from, in
+    /// `@b2bua.on_failure` (`call.failure_response`).
+    failure_response: Option<SipMessage>,
     /// Username verified by `auth.require_proxy_digest(call, …)` /
     /// `require_www_digest` on the A-leg INVITE. `None` until a challenge is
     /// answered correctly. The B2BUA twin of `request.auth_user`; the
@@ -454,6 +459,7 @@ impl PyCall {
             max_duration_secs: None,
             active_route: None,
             route_attempts: Vec::new(),
+            failure_response: None,
             auth_user: None,
         }
     }
@@ -496,6 +502,12 @@ impl PyCall {
     /// the handler `Call`.
     pub fn set_active_route(&mut self, route: crate::lcr::Route) {
         self.active_route = Some(route);
+    }
+
+    /// Attach the dialled leg's own final response the failure code came
+    /// from, for `call.failure_response`.
+    pub fn set_failure_response(&mut self, response: Option<SipMessage>) {
+        self.failure_response = response;
     }
 
     /// Attach the failed carrier attempts read off the call actor, for
@@ -2202,6 +2214,39 @@ impl PyCall {
             .collect()
     }
 
+    /// In ``@b2bua.on_failure``: the dialled leg's own final response that
+    /// the handler's ``code`` was derived from, read-only, or ``None``.
+    ///
+    /// ``code`` is what the caller is sent, which is not always what the far
+    /// end said: a ``503`` reaches the caller as ``500`` (RFC 3261 §16.7 step
+    /// 6), and an exhausted ``call.route()`` sequence or a fork ends on the best
+    /// failure of all its legs. This is that leg's response as it arrived:
+    /// ``status_code``, ``reason``, ``get_header(name)``, ``get_headers(name)``,
+    /// ``body`` and ``content_type``.
+    ///
+    /// ``None`` when siphon concluded the leg itself: a ring timeout, a B-leg
+    /// INVITE that was never sent, a sequence that ended on carriers it could
+    /// not dial, or a refusal of the caller's own request. ``None`` outside
+    /// ``@b2bua.on_failure``.
+    ///
+    /// ```python,ignore
+    /// @b2bua.on_failure
+    /// def failed(call, code, reason):
+    ///     response = call.failure_response
+    ///     if response is None:
+    ///         return
+    ///     cause = response.get_header("Reason") or ""
+    ///     no_audio = (response.status_code == 488
+    ///                 and b"m=audio" not in (response.body or b""))
+    ///     if no_audio or (response.status_code == 500
+    ///                     and "FAILURE_CAUSE;cause=2" in cause):
+    ///         call.dial(cs_breakout_uri(call))
+    /// ```
+    #[getter]
+    fn failure_response(&self) -> Option<PyFailureResponse> {
+        self.failure_response.clone().map(PyFailureResponse::new)
+    }
+
     /// The Refer-To URI (only set during @b2bua.on_refer handler).
     #[getter]
     fn refer_to(&self) -> Option<&str> {
@@ -3457,6 +3502,57 @@ mod tests {
             assert!(refused.is_instance_of::<pyo3::exceptions::PyValueError>(python));
         });
         assert_eq!(answered.action(), &CallAction::Answered);
+    }
+
+    /// `call.failure_response` is `None` until the dispatcher attaches one,
+    /// then shows the leg's response read-only, fields as it arrived.
+    #[test]
+    fn call_failure_response_shows_the_attached_response() {
+        Python::initialize();
+        let mut call = PyCall::new(
+            "test-id".to_string(),
+            Arc::new(Mutex::new(make_invite())),
+            "192.0.2.10".to_string(),
+            "udp".to_string(),
+        );
+        assert!(call.failure_response().is_none());
+
+        let response = crate::sip::parser::parse_sip_message_bytes(
+            concat!(
+                "SIP/2.0 503 Service Unavailable\r\n",
+                "Reason: FAILURE_CAUSE;cause=3\r\n",
+                "X-Carrier: one\r\n",
+                "X-Carrier: two\r\n",
+                "Content-Type: application/sdp\r\n",
+                "Content-Length: 4\r\n",
+                "\r\n",
+                "v=0\n",
+            )
+            .as_bytes(),
+        )
+        .expect("the response parses");
+        call.set_failure_response(Some(response));
+        let shown = call.failure_response().expect("the attached response");
+        assert_eq!(shown.status_code(), 503);
+        assert_eq!(shown.reason(), "Service Unavailable");
+        assert_eq!(
+            shown.get_header("Reason").as_deref(),
+            Some("FAILURE_CAUSE;cause=3")
+        );
+        assert_eq!(shown.get_headers("X-Carrier"), vec!["one", "two"]);
+        assert!(shown.get_headers("X-Absent").is_empty());
+        assert_eq!(shown.content_type().as_deref(), Some("application/sdp"));
+        assert_eq!(
+            shown.__repr__(),
+            "<FailureResponse 503 Service Unavailable>"
+        );
+        Python::attach(|python| {
+            let body = shown.body(python).expect("a body");
+            assert_eq!(body.as_bytes(), b"v=0\n");
+        });
+
+        call.set_failure_response(None);
+        assert!(call.failure_response().is_none());
     }
 
     #[test]

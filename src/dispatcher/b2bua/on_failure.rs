@@ -173,6 +173,7 @@ pub fn run_b2bua_failure_handlers(
     call_id: &str,
     status_code: u16,
     reason: &str,
+    failure_response: Option<SipMessage>,
     state: &DispatcherState,
 ) -> CallHandlerOutcome {
     let engine_state = state.engine.state();
@@ -198,6 +199,8 @@ pub fn run_b2bua_failure_handlers(
     // Every carrier tried, so a handler for an exhausted sequence can report
     // which ones failed and how, not just the code the call ended on.
     py_call.set_route_attempts(state.call_actors.route_attempts(call_id));
+    // The dialled leg's own response `status_code` was derived from, if one was.
+    py_call.set_failure_response(failure_response);
 
     Python::attach(|python| {
         let call_obj = match Py::new(python, py_call) {
@@ -257,7 +260,21 @@ pub fn conclude_failed_call(call_id: &str, end: FailedCallEnd<'_>, state: &Dispa
         }
     };
     let (status_code, reason) = end.status_and_reason();
-    let mut outcome = run_b2bua_failure_handlers(call_id, status_code, &reason, state);
+    // The best failure a dialled leg sent, shown only when it is what the
+    // caller's status came from: the status itself, or the 500 a 503 becomes
+    // upstream (RFC 3261 §16.7 step 6). A ring timeout, a carrier siphon could
+    // not dial or a refusal of the caller's own request has none.
+    let failure_response = state
+        .call_actors
+        .take_failure_response(call_id)
+        .filter(|response| {
+            response
+                .status_code()
+                .map(crate::sip::best_response::upstream_status)
+                == Some(status_code)
+        });
+    let mut outcome =
+        run_b2bua_failure_handlers(call_id, status_code, &reason, failure_response, state);
     let action = std::mem::take(&mut outcome.action);
 
     // The handlers may have taken a while, and a CANCEL landing meanwhile has
@@ -344,13 +361,17 @@ pub fn conclude_failed_call(call_id: &str, end: FailedCallEnd<'_>, state: &Dispa
 /// caller to answer and nothing to route again, so a decision it takes is
 /// logged as one that cannot apply rather than dropped without a word. The
 /// caller tears the call down.
+///
+/// `failure_response` is the callee's rejection, as it sent it: the one
+/// `status_code` is.
 pub fn run_originated_failure_handlers(
     call_id: &str,
     status_code: u16,
     reason: &str,
+    failure_response: Option<SipMessage>,
     state: &DispatcherState,
 ) {
-    let outcome = run_b2bua_failure_handlers(call_id, status_code, reason, state);
+    let outcome = run_b2bua_failure_handlers(call_id, status_code, reason, failure_response, state);
     if let FailureDecision::Inapplicable { action, why } =
         classify_failure_action(outcome.action, true, 0)
     {

@@ -4100,3 +4100,40 @@ mod originate_tests {
         );
     }
 }
+
+fn failure(status_code: u16, reason: &str) -> crate::sip::message::SipMessage {
+    crate::sip::parser::parse_sip_message_bytes(
+        format!("SIP/2.0 {status_code} {reason}\r\nContent-Length: 0\r\n\r\n").as_bytes(),
+    )
+    .expect("the response parses")
+}
+
+/// The kept failure response is the best one by RFC 3261 §16.7 step 6, and
+/// taking it leaves none.
+#[test]
+fn record_failure_response_keeps_the_best_and_take_empties_it() {
+    let store = CallActorStore::new();
+    let call_id = store.create_call(make_a_leg());
+    assert!(store.take_failure_response(&call_id).is_none());
+
+    store.record_failure_response(&call_id, &failure(503, "Service Unavailable"));
+    store.record_failure_response(&call_id, &failure(480, "Temporarily Unavailable"));
+    store.record_failure_response(&call_id, &failure(500, "Server Internal Error"));
+    let kept = store
+        .take_failure_response(&call_id)
+        .expect("a kept response");
+    assert_eq!(kept.status_code(), Some(480));
+    assert!(store.take_failure_response(&call_id).is_none());
+
+    store.record_failure_response(&call_id, &failure(486, "Busy Here"));
+    store.record_failure_response(&call_id, &failure(603, "Decline"));
+    assert_eq!(
+        store
+            .take_failure_response(&call_id)
+            .and_then(|response| response.status_code()),
+        Some(603)
+    );
+    // A call that is gone keeps nothing.
+    store.record_failure_response("no-such-call", &failure(486, "Busy Here"));
+    assert!(store.take_failure_response("no-such-call").is_none());
+}

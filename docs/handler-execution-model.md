@@ -150,6 +150,29 @@ has the same single action slot, and its final value is carried out:
 | `call.handover(app)` | the unanswered call goes to a control app |
 | `call.answer()` | siphon answers the caller itself, and the call lives on |
 
+`code` is what the caller is sent, which is not always what the far end said: a
+B-leg's `503` reaches the caller (and `code`) as `500`, and an exhausted route
+sequence or fork ends on the best failure of all its legs. `call.failure_response`
+is that leg's own final response, read-only (`status_code`, `reason`,
+`get_header(name)`, `get_headers(name)`, `body`, `content_type`), so a handler
+can act on what the far end actually sent, such as a CS breakout on a `488` whose
+SDP offers no audio or on a `500` whose `Reason` carries a failure cause
+(TS 24.292 §10.4.7). It is `None` when siphon ended the leg itself: a ring
+timeout, a B-leg INVITE that never left, a sequence that ended on carriers it
+could not dial, or a refusal of the caller's own request.
+
+```python
+@b2bua.on_failure
+def failed(call, code, reason):
+    response = call.failure_response
+    if response is None:
+        return
+    cause = response.get_header("Reason") or ""
+    no_audio = response.status_code == 488 and b"m=audio" not in (response.body or b"")
+    if no_audio or (response.status_code == 500 and "FAILURE_CAUSE;cause=2" in cause):
+        call.dial(cs_breakout_uri(call))
+```
+
 Re-routes are capped at 10 per call, so a handler that keeps dialling a target
 that keeps failing still ends the call. A decision that cannot apply (a
 `reject()` with a 1xx or 2xx, a REFER decision, anything on a call siphon placed

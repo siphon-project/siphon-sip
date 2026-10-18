@@ -711,6 +711,69 @@ class ByeInitiator:
     """``"a"`` for the A-leg (caller) or ``"b"`` for the B-leg (callee)."""
 
 
+class FailureResponse:
+    """A dialled leg's own final failure response, read-only, as
+    ``call.failure_response`` shows it in ``@b2bua.on_failure``.
+
+    Build one in a test to stand for what the far end sent::
+
+        FailureResponse(503, "Service Unavailable",
+                        headers={"Reason": "FAILURE_CAUSE;cause=2"})
+
+    ``headers`` maps a name to one value or a list of values (one per header
+    line). Names match case-insensitively, as on the wire.
+    """
+
+    def __init__(self, status_code: int, reason: str,
+                 headers: Optional[dict] = None,
+                 body: Optional[bytes] = None,
+                 content_type: Optional[str] = None) -> None:
+        self._status_code = status_code
+        self._reason = reason
+        self._headers: dict[str, list[str]] = {}
+        for name, value in (headers or {}).items():
+            values = list(value) if isinstance(value, (list, tuple)) else [value]
+            self._headers.setdefault(name.lower(), []).extend(values)
+        if isinstance(body, str):
+            body = body.encode("utf-8")
+        self._body = body or None
+        if content_type is None and "content-type" in self._headers:
+            content_type = self._headers["content-type"][0]
+        self._content_type = content_type
+
+    @property
+    def status_code(self) -> int:
+        """The leg's own status code, e.g. ``503`` where the caller is sent ``500``."""
+        return self._status_code
+
+    @property
+    def reason(self) -> str:
+        """The leg's own reason phrase."""
+        return self._reason
+
+    def get_header(self, name: str) -> Optional[str]:
+        """The first value of a header, or ``None``."""
+        values = self._headers.get(name.lower())
+        return values[0] if values else None
+
+    def get_headers(self, name: str) -> list[str]:
+        """Every value of a header, in order; an empty list when it is absent."""
+        return list(self._headers.get(name.lower(), []))
+
+    @property
+    def body(self) -> Optional[bytes]:
+        """The response body as ``bytes``, or ``None`` when it has none."""
+        return self._body
+
+    @property
+    def content_type(self) -> Optional[str]:
+        """The ``Content-Type`` header value, or ``None``."""
+        return self._content_type
+
+    def __repr__(self) -> str:
+        return f"<FailureResponse {self._status_code} {self._reason}>"
+
+
 @dataclass
 class MediaHandle:
     """Handle for media anchoring operations on a B2BUA call.
