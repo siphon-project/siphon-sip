@@ -634,25 +634,18 @@ impl PyPendingSA {
             });
         }
 
-        // Tear down any prior SA pair for this UE address that's still
-        // sitting in the manager under a stale (port_uc, port_us).  The
-        // UE picks a fresh random port_uc on every REGISTER, so a
-        // re-REGISTER from the same UE address always installs its new
-        // pair under a different contact_key than the previous one — and
-        // without explicit cleanup the previous pair's four XFRM
-        // policies leak into the kernel forever.  After enough refresh
-        // cycles a new random port_uc collides with a leaked selector
-        // and the policy add returns EEXIST, breaking the registration.
-        // Fired here (post-200-OK, post-state-transition) because that's
-        // the point where the new binding has been granted by the
-        // registrar of record and the old one is definitionally stale.
-        // Fire-and-forget for the same reason as the lifetime repin —
-        // the activate transition has already committed and a missed
-        // cleanup degrades to "kernel policy table grows by 4 until the
-        // next successful activate", which the next round will catch.
+        // The UE's other pairs go now that this one is in use (3GPP TS 33.203
+        // clause 7.4.2a). The UE picks a fresh port_uc on every REGISTER, so a
+        // re-REGISTER installs under a new contact key and the previous pair's
+        // policies would otherwise stay in the kernel until a later port_uc
+        // collides with one (EEXIST). The pair the REGISTER arrived over is
+        // kept until the transactions pending on it can be done; any other is
+        // deleted at once. Fired here, post-200-OK, because that is where the
+        // registrar of record has granted the new binding. Fire-and-forget
+        // like the repin: the transition has committed.
         tokio::spawn(async move {
             manager
-                .cleanup_other_pairs_for_ue(&ue_addr, ue_port_c)
+                .supersede_pairs_for_ue(&ue_addr, ue_port_c, crate::ipsec::retire::SA_RETIRE_GRACE)
                 .await;
         });
 
@@ -1076,6 +1069,71 @@ impl PyIpsec {
             };
             let pending = PyPendingSA::new(manager, sa, params);
             Python::attach(|python| Py::new(python, pending))
+        })
+    }
+
+    /// Delete the security associations of the UE at ``ue_addr``: the pair
+    /// whose UE client port is ``ue_port_c``, or every pair of the UE when it is
+    /// ``None``.  Awaitable; returns how many pairs were deleted, or with
+    /// ``delay_secs`` how many were scheduled.
+    ///
+    /// Each pair goes with the stream connections between the protected ports
+    /// and the UE's (siphon's own are reset), so nothing more is sent into an
+    /// association that is gone.
+    ///
+    /// siphon already does this on its own (3GPP TS 33.203 clause 7.4.2a, TS
+    /// 24.229 clauses 5.2.5.1 and 5.2.5.2): when a 2xx to a de-REGISTER that
+    /// removed the UE's last binding is sent (once its server transaction is
+    /// over), and on the sweep after the registrar loses the last binding that
+    /// was registered over a pair (a script removing it on a reg-event NOTIFY,
+    /// or its expiry), 32 s on.  This is for what siphon cannot see, such as a
+    /// registration the script ends without the registrar.
+    ///
+    /// ``delay_secs`` keeps the pair that long first, re-checked when it comes
+    /// due: TS 24.229 clause 5.2.5.2 has the P-CSCF *shorten* the associations
+    /// of a registration the network ended, so the NOTIFY telling the UE still
+    /// reaches it.  ``0`` (the default) deletes now.
+    ///
+    /// ```python,ignore
+    /// # reg-event NOTIFY: the network ended the registration
+    /// await ipsec.delete(ue_ip, ue_port_c, delay_secs=5)
+    /// ```
+    ///
+    /// Raises :class:`ValueError` when ``ue_addr`` is not an IP literal or
+    /// ``delay_secs`` is negative or not finite.
+    #[pyo3(signature = (ue_addr, ue_port_c=None, *, delay_secs=0.0))]
+    fn delete<'py>(
+        &self,
+        python: Python<'py>,
+        ue_addr: &str,
+        ue_port_c: Option<u16>,
+        delay_secs: f64,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ue_addr: IpAddr = ue_addr.parse().map_err(|error| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "ue_addr {ue_addr:?} is not a valid IP: {error}"
+            ))
+        })?;
+        let delay = Duration::try_from_secs_f64(delay_secs).map_err(|error| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "delay_secs {delay_secs} is not a duration: {error}"
+            ))
+        })?;
+        let manager = Arc::clone(&self.manager);
+        future_into_py(python, async move {
+            if delay.is_zero() {
+                Ok(manager
+                    .retire_ue_now(ue_addr, ue_port_c, "deleted by the script")
+                    .await)
+            } else {
+                Ok(manager.retire_ue(
+                    ue_addr,
+                    ue_port_c,
+                    delay,
+                    crate::ipsec::retire::RetireCondition::Always,
+                    "deleted by the script",
+                ))
+            }
         })
     }
 

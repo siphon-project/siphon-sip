@@ -11505,6 +11505,9 @@ class MockIpsec:
         self._stash: dict[str, MockPendingSA] = {}
         self._allocate_should_fail: Optional[type[BaseException]] = None
         self._allocate_failure_message = "mock allocate failure"
+        self._allocated: list[MockPendingSA] = []
+        #: Every ``delete()`` call, as ``(ue_addr, ue_port_c, delay_secs)``.
+        self.deleted: list[tuple[str, Optional[int], float]] = []
 
     @property
     def stash_size(self) -> int:
@@ -11577,7 +11580,59 @@ class MockIpsec:
         # to assert multi-protocol installation specifically.  Not on
         # the Rust binding (use SAHandle.protocol for that).
         pending.sa_protocol = sa_protocol  # type: ignore[attr-defined]
+        self._allocated.append(pending)
         return pending
+
+    async def delete(self, ue_addr: str, ue_port_c: Optional[int] = None, *,
+                     delay_secs: float = 0.0) -> int:
+        """Delete the security associations of the UE at ``ue_addr``.
+
+        The pair whose UE client port is ``ue_port_c``, or every pair of the
+        UE when it is ``None``, goes with the stream connections between the
+        protected ports and the UE's.  Returns how many pairs were deleted,
+        or with ``delay_secs`` how many were scheduled.
+
+        siphon already does this itself (3GPP TS 33.203 clause 7.4.2a, TS
+        24.229 clauses 5.2.5.1 and 5.2.5.2): once the server transaction of
+        a 2xx to a de-REGISTER that removed the UE's last binding is over,
+        and on the sweep after the registrar loses the last binding that
+        was registered over a pair (a script removing it on a reg-event
+        NOTIFY, or its expiry), 32 s on.  Call this for what siphon cannot
+        see.  ``delay_secs`` keeps the pair that long first, so the NOTIFY
+        of a network-initiated de-registration still reaches the UE.
+
+        Example::
+
+            await ipsec.delete(request.source_ip, request.source_port,
+                               delay_secs=5)
+
+        In the mock, matching pairs from ``allocate()`` are marked cleaned
+        (immediately, whatever the delay) and the call is recorded in
+        :attr:`deleted`.
+
+        Raises:
+            ValueError: ``ue_addr`` is not an IP literal, or ``delay_secs``
+                is negative or not finite.
+        """
+        import ipaddress
+        import math
+        try:
+            ipaddress.ip_address(ue_addr)
+        except ValueError as error:
+            raise ValueError(f"ue_addr {ue_addr!r} is not a valid IP: {error}") from None
+        if not math.isfinite(delay_secs) or delay_secs < 0:
+            raise ValueError(f"delay_secs {delay_secs} is not a duration")
+        self.deleted.append((ue_addr, ue_port_c, float(delay_secs)))
+        matched = [
+            pending for pending in self._allocated
+            if not pending.is_cleaned
+            and pending._offer.ue_addr == ue_addr
+            and (ue_port_c is None or pending._offer.port_c == ue_port_c)
+        ]
+        for pending in matched:
+            pending.is_cleaned = True
+            pending.is_active = False
+        return len(matched)
 
     def stash(self, call_id: str, pending: MockPendingSA) -> None:
         self._stash[call_id] = pending
@@ -11608,6 +11663,8 @@ class MockIpsec:
 
     def clear(self) -> None:
         self._stash.clear()
+        self._allocated.clear()
+        self.deleted.clear()
         self._allocate_should_fail = None
         self.pcscf_addr_v4 = "10.0.0.10"
         self.pcscf_addr_v6 = "2001:db8::10"

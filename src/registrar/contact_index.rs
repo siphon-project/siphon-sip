@@ -362,6 +362,28 @@ impl super::Registrar {
         found
     }
 
+    /// Whether any AoR holds a live UE binding whose REGISTER came from
+    /// `source`. Unlike [`binding_for_source`](Self::binding_for_source), two
+    /// AoRs sharing the address is still a yes: this is the question a P-CSCF
+    /// asks before deleting the security associations a UE registered over,
+    /// which go only "once all the associated IMPUs are de-registered" (3GPP
+    /// TS 33.203 clause 7.4.2a). Reads the AoRs the index names for that
+    /// address.
+    pub fn has_live_binding_from(&self, source: SocketAddr) -> bool {
+        self.contact_index
+            .aors(self.contact_index.source_key_of(source))
+            .iter()
+            .any(|aor| {
+                self.bindings.get(aor).is_some_and(|entry| {
+                    entry.value().iter().any(|contact| {
+                        contact.kind == ContactKind::Ue
+                            && !contact.is_expired()
+                            && contact.source_addr == Some(source)
+                    })
+                })
+            })
+    }
+
     /// Reverse lookup: non-expired UE-side contacts whose stored **Contact**
     /// URI names the same device as `contact_uri`: scheme, user, host
     /// (case-insensitively, RFC 3261 §19.1.4) and port, a default port equal

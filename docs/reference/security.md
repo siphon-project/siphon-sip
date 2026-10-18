@@ -316,6 +316,23 @@ P-CSCF IPsec security association management for the sec-agree handshake.
 
 ::: siphon_sdk.mock_module.MockIpsec
 
+### When security associations are deleted
+
+A pair is taken into use by `PendingSA.activate()` on the 200 to the REGISTER
+that authenticated it. siphon deletes it, with the stream connections between
+the protected ports and the UE's (its own are reset), when:
+
+| What happened | When the pair goes |
+|---|---|
+| A 2xx to a de-REGISTER (`Expires: 0`, or every Contact at `expires=0`) is sent to the UE, relayed or answered by the script, and no live registrar binding was registered over the pair any more | When the server transaction is over: Timer J (64*T1) over UDP, T1 over TCP (TS 24.229 clause 5.2.5.1) |
+| The registrar loses the last binding registered over a pair without a de-REGISTER through siphon: the script removed it on a reg-event NOTIFY, or it expired | 64*T1 after the next sweep sees it, so the NOTIFY to the UE still gets through (TS 24.229 clause 5.2.5.2) |
+| A re-registration's new pair is activated | The old pair the REGISTER came over after 32 s, for the transactions pending on it; any other old pair at once (TS 33.203 clause 7.4.2a) |
+| The script calls `await ipsec.delete(ue_addr, ue_port_c, delay_secs=...)` | After `delay_secs`, or at once |
+
+A pair goes only when no other identity of the UE is still registered over it.
+The old and new pair of a re-registration share the policies of the UE's
+protected server port; deleting one leaves the other's in place.
+
 ### `SecurityOffer`
 
 A `Security-Client` offer parsed from a REGISTER (`request.parse_security_client()`).

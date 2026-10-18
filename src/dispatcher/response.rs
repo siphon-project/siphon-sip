@@ -6,6 +6,7 @@
 use super::*;
 // The B2BUA builders and send path live in their own subtree.
 use super::b2bua::*;
+use super::ipsec_lifecycle;
 
 /// Handle an inbound SIP response — route back to the original sender.
 #[allow(clippy::too_many_lines)] // TODO(1.9.0 split): decomposed by the dispatcher module split. handle_response: pre-session guards + session forwarding; splits in two
@@ -1192,7 +1193,7 @@ pub(super) fn handle_response(
                 && server_key.method == crate::sip::message::Method::Register
                 && message.headers.has("Security-Server")
             {
-                crate::ipsec::runtime::record_security_server(&source_addr.ip(), &message);
+                ipsec_lifecycle::record_challenge(state, &message, source_addr, inbound_local_addr);
             }
 
             // What the caller is sent moves the caller's dialog state.
@@ -1255,6 +1256,11 @@ pub(super) fn handle_response(
                     Some(inbound_local_addr),
                     state,
                 );
+            }
+
+            // A 2xx to a REGISTER over a security association (TS 24.229 5.2.5.1).
+            if (200..300).contains(&status_code) && server_key.method == Method::Register {
+                ipsec_lifecycle::on_register_2xx(state, &original_request, source_addr, transport);
             }
 
             // Clean up on final response

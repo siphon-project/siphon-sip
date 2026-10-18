@@ -509,7 +509,7 @@ pub(crate) async fn serve_sip_stream<R, W>(
     // (see [`crate::transport::disconnect`]).
     let closer = crate::transport::disconnect::ConnectionCloser::register(
         connection_id,
-        remote_addr.ip(),
+        remote_addr,
         transport,
     );
     if crate::security::is_source_banned(remote_addr.ip()) {
@@ -697,6 +697,16 @@ pub(crate) async fn serve_sip_stream<R, W>(
     // arm a reader holding the socket until the 300 s idle timeout.
     read_task.abort();
     write_task.abort();
+    // Aborting only asks: the socket closes when each half's task is dropped.
+    // Wait for that, so this connection leaves the closer registry (with
+    // `closer`, at the end of this function) only once its socket is closed;
+    // `disconnect::peer_closed_within` orders a P-CSCF's SA deletion after it.
+    if !read_task.is_finished() {
+        let _ = (&mut read_task).await;
+    }
+    if !write_task.is_finished() {
+        let _ = (&mut write_task).await;
+    }
 
     connection_map.remove(&connection_id);
     if let Some(registry) = stream_connections.as_ref() {

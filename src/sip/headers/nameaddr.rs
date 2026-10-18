@@ -34,6 +34,7 @@ impl NameAddr {
     pub fn parse(input: &str) -> Result<Self, String> {
         let input = input.trim();
 
+        let bracketed = input.contains('<');
         let (display_name, uri_str, params_str) = if let Some(lt_pos) = input.find('<') {
             // Angle-bracket form: optional display name before '<'
             let display = input[..lt_pos].trim();
@@ -77,7 +78,9 @@ impl NameAddr {
         // If we had angle brackets, params_str contains header params.
         // If bare URI, we need to check if the URI's own params contain tag/q/expires
         // and pull them out as header params.
-        if params_str.is_empty() && display_name.is_none() {
+        // Only the bare form: inside `<...>` a `;expires=` is the URI's own
+        // parameter (RFC 3261 §20.10), not the Contact's expiration.
+        if !bracketed {
             // Bare URI form — move tag/q/expires from URI params to header params
             let mut uri_clean = uri.clone();
             let mut kept_params = Vec::new();
@@ -319,6 +322,22 @@ mod tests {
         assert_eq!(contacts[1].uri.user.as_deref(), Some("bob"));
         assert_eq!(contacts[1].q, Some(0.5));
         assert_eq!(contacts[1].expires, Some(600));
+    }
+
+    /// A parameter inside the angle brackets belongs to the URI: `expires`
+    /// there is not the Contact's (RFC 3261 §20.10), even with no header
+    /// parameter after `>`.
+    #[test]
+    fn a_bracketed_uri_keeps_its_own_expires_parameter() {
+        let parsed = NameAddr::parse("<sip:ue@198.51.100.7:6101;expires=0>").unwrap();
+        assert_eq!(parsed.expires, None);
+        assert!(parsed
+            .uri
+            .params
+            .iter()
+            .any(|(name, value)| name == "expires" && value.as_deref() == Some("0")));
+        let bare = NameAddr::parse("sip:ue@198.51.100.7:6101;expires=0").unwrap();
+        assert_eq!(bare.expires, Some(0));
     }
 
     #[test]

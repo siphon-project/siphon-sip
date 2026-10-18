@@ -125,3 +125,30 @@ def test_allocate_v4_ue_without_v4_listener_raises():
     assert _allocate_for(ipsec, "2001:db8::1") is not None
     with pytest.raises(ValueError, match="no IPv4 P-CSCF listener"):
         _allocate_for(ipsec, "10.0.0.1")
+
+
+def test_delete_cleans_the_ues_pairs_and_records_the_call():
+    ipsec = _fresh_ipsec()
+    pending = _allocate(ipsec)
+    pending.activate()
+
+    assert asyncio.run(ipsec.delete("10.0.0.2")) == 0, "another UE's pair stays"
+    assert not pending.is_cleaned
+    assert asyncio.run(ipsec.delete("10.0.0.1", 50000, delay_secs=5)) == 1
+    assert pending.is_cleaned and not pending.is_active
+    assert asyncio.run(ipsec.delete("10.0.0.1")) == 0, "already gone"
+    assert ipsec.deleted == [
+        ("10.0.0.2", None, 0.0),
+        ("10.0.0.1", 50000, 5.0),
+        ("10.0.0.1", None, 0.0),
+    ]
+
+
+def test_delete_rejects_what_the_binding_rejects():
+    ipsec = _fresh_ipsec()
+    with pytest.raises(ValueError):
+        asyncio.run(ipsec.delete("not-an-ip"))
+    with pytest.raises(ValueError):
+        asyncio.run(ipsec.delete("10.0.0.1", delay_secs=-1))
+    with pytest.raises(ValueError):
+        asyncio.run(ipsec.delete("10.0.0.1", delay_secs=float("inf")))

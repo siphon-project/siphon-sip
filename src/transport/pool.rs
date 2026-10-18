@@ -742,6 +742,14 @@ impl ConnectionPool {
         let idle_timeout = self.idle_timeout;
         let idle_exempt = Arc::clone(&self.idle_exempt);
         let holds = self.holds.clone();
+        // Reachable from outside this task, so a P-CSCF deleting a UE's
+        // security associations can end the connection they carried
+        // ([`crate::transport::disconnect::close_peer`]); dropped with the task.
+        let closer = crate::transport::disconnect::ConnectionCloser::register_outbound(
+            connection_id,
+            destination,
+            Transport::Tcp,
+        );
         tokio::spawn(async move {
             let mut accumulator = BytesMut::with_capacity(65536);
             let mut read_buf = [0u8; 8192];
@@ -752,6 +760,8 @@ impl ConnectionPool {
                     // A pinned port only: its socket holds the 4-tuple the
                     // replacement needs.
                     () = writer.gave_up() => break,
+                    // Closed from outside: a pinned port resets it below.
+                    () = closer.closed() => break,
                 };
                 match read {
                     Ok(Ok(0)) => {
@@ -3297,6 +3307,48 @@ mod tests {
                 &pool,
                 &pinned_key(source, destination),
                 "the idle timeout never closed a source-bound connection on an ephemeral port",
+            )
+            .await;
+        }
+
+        /// A pinned connection is ended from outside its task when its peer is
+        /// closed (a P-CSCF deleting the UE's security associations), with a
+        /// reset, and the pool stops offering it.
+        ///
+        /// Before: nothing outside the task could end it, so it stayed up until
+        /// the peer closed it or keepalive gave up, retransmitting toward an
+        /// address with no association behind it.
+        #[tokio::test]
+        async fn closing_its_peer_resets_a_pinned_connection() {
+            let pool = test_pool();
+            let source = protected_source();
+            let (listener, destination) = silent_peer().await;
+            let key = pinned_key(source, destination);
+
+            pool.send_tcp_from(source, destination, Bytes::from_static(b"NOTIFY"))
+                .await
+                .unwrap();
+            let (mut peer, _) = listener.accept().await.unwrap();
+            let mut scratch = [0u8; 16];
+            let size = peer.read(&mut scratch).await.unwrap();
+            assert_eq!(&scratch[..size], b"NOTIFY");
+
+            assert_eq!(
+                crate::transport::disconnect::close_peer(destination, "a test signal"),
+                1
+            );
+            let ended = tokio::time::timeout(Duration::from_secs(5), peer.read(&mut scratch))
+                .await
+                .expect("the connection was never closed");
+            assert_eq!(
+                ended.map_err(|error| error.kind()),
+                Err(std::io::ErrorKind::ConnectionReset),
+                "a pinned connection closed from outside must end with a reset"
+            );
+            until_released(
+                &pool,
+                &key,
+                "a closed connection is still offered for reuse",
             )
             .await;
         }

@@ -532,3 +532,64 @@ fn a_binding_is_found_by_the_address_its_register_came_from() {
         Some("sip:user44@example.invalid")
     );
 }
+
+/// `has_live_binding_from` answers whether ANY AoR still holds a live binding
+/// registered from an address — the question a P-CSCF asks before it deletes
+/// the security associations a UE's registrations used (3GPP TS 33.203 clause
+/// 7.4.2a: "once all the associated IMPUs are de-registered"). Unlike
+/// `binding_for_source`, two AoRs sharing the address is still a yes.
+#[test]
+fn any_live_binding_from_an_address_is_seen_whichever_aor_holds_it() {
+    let registrar = Registrar::default();
+    let from = SocketAddr::from(([203, 0, 113, 77], 6_100));
+    let elsewhere = SocketAddr::from(([203, 0, 113, 77], 6_200));
+    assert!(!registrar.has_live_binding_from(from));
+
+    register_from(
+        &registrar,
+        "sip:impu1@example.invalid",
+        "sip:ue@198.51.100.77:6101",
+        from,
+        3600,
+    );
+    register_from(
+        &registrar,
+        "sip:impu2@example.invalid",
+        "sip:ue@198.51.100.77:6101",
+        from,
+        3600,
+    );
+    assert!(registrar.has_live_binding_from(from));
+    assert!(!registrar.has_live_binding_from(elsewhere));
+
+    // One IMPU de-registered: the other still holds the address.
+    register_from(
+        &registrar,
+        "sip:impu1@example.invalid",
+        "sip:ue@198.51.100.77:6101",
+        from,
+        0,
+    );
+    assert!(registrar.has_live_binding_from(from));
+
+    // The last one de-registered: nothing holds it.
+    register_from(
+        &registrar,
+        "sip:impu2@example.invalid",
+        "sip:ue@198.51.100.77:6101",
+        from,
+        0,
+    );
+    assert!(!registrar.has_live_binding_from(from));
+
+    // An expired binding does not count either.
+    register_from(
+        &registrar,
+        "sip:impu3@example.invalid",
+        "sip:ue@198.51.100.77:6101",
+        from,
+        3600,
+    );
+    expire(&registrar, "sip:impu3@example.invalid");
+    assert!(!registrar.has_live_binding_from(from));
+}
