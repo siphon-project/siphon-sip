@@ -161,11 +161,11 @@ def on_invite(call):
     if target and "tdialog" in (call.get_header("Require") or "") and from_atcf(call):
         dialog_call_id, _, rest = target.partition(";")
         params = dict(p.strip().split("=", 1) for p in rest.split(";") if "=" in p)
-        # Target-Dialog is written from its sender's side of the dialog:
-        # its remote-tag is siphon's tag, its local-tag the far party's.
+        # Target-Dialog names the dialog as its recipient sees it
+        # (RFC 4538 §3): local-tag is siphon's tag, remote-tag the far party's.
         call.take_over(dialog_call_id.strip(),
-                       local_tag=params["remote-tag"],
-                       remote_tag=params["local-tag"],
+                       local_tag=params["local-tag"],
+                       remote_tag=params["remote-tag"],
                        reinvite=False,
                        headers={"P-Asserted-Identity": remote_identity(call)})
         return
@@ -195,8 +195,10 @@ and the far party's tag on it. Either leg of a call can be named.
   tell it. A script that anchors the INVITE after calling `take_over` gets the
   takeover refused `500` instead.
 - **Refusals** go on the wire once the handler returns: `481` when no dialog of
-  this node matches, `488` when the named dialog is still early (only confirmed
-  dialogs are taken over) or the INVITE carries no offer, `420` for a required
+  this node matches, `480` when the named dialog is still early (only confirmed
+  dialogs are taken over; TS 24.237 §12.3.2.3 answers an access transfer it
+  cannot associate with an established dialog `480`), `488` when the INVITE
+  carries no offer, `420` for a required
   extension siphon does not honour. `tdialog` is honoured on this path.
 
 ## Logging the outbound leg: `b2bua.log_dial`

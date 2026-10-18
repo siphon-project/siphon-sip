@@ -500,7 +500,9 @@ pub struct TakeOverRequest<'a> {
 /// Resolved here, after the handler, not when the script asked: the named
 /// dialog can end while the handler runs, and the answer for one that does not
 /// exist is a `481` on the wire (RFC 4538 §4), as for a `Replaces`. Only a
-/// confirmed dialog is taken over (`488` otherwise). Not gated on
+/// confirmed dialog is taken over: an early one is refused `480`, the answer
+/// TS 24.237 gives an access transfer it cannot associate with a previously
+/// established dialog (§12.3.2.3 step 2, §10.3.2). Not gated on
 /// `b2bua.accept_replaces`: the script's call is the authorisation that switch
 /// stands in for.
 ///
@@ -538,8 +540,8 @@ pub fn b2bua_take_over_dialog(
         {
             refuse(
                 "",
-                488,
-                "Not Acceptable Here",
+                480,
+                "Temporarily Unavailable",
                 "the named dialog is not confirmed — only a confirmed dialog is taken over",
             );
             return None;
@@ -568,8 +570,8 @@ pub fn b2bua_take_over_dialog(
     if !confirmed {
         refuse(
             &matched.call_id,
-            488,
-            "Not Acceptable Here",
+            480,
+            "Temporarily Unavailable",
             "the named dialog is not confirmed — only a confirmed dialog is taken over",
         );
         return None;

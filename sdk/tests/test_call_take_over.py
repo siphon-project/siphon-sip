@@ -81,14 +81,14 @@ class TestCallTakeOver:
 
     def test_docstring_example_reads_target_dialog(self):
         call = Call(headers={
-            "Target-Dialog": "dialog@example.com;local-tag=far-tag;remote-tag=siphon-tag",
+            "Target-Dialog": "dialog@example.com;local-tag=siphon-tag;remote-tag=far-tag",
             "Require": "tdialog",
         })
         target = call.get_header("Target-Dialog")
         dialog_call_id, _, rest = target.partition(";")
         params = dict(p.strip().split("=", 1) for p in rest.split(";") if "=" in p)
-        call.take_over(dialog_call_id.strip(), local_tag=params["remote-tag"],
-                       remote_tag=params["local-tag"], reinvite=False)
+        call.take_over(dialog_call_id.strip(), local_tag=params["local-tag"],
+                       remote_tag=params["remote-tag"], reinvite=False)
         extras = call._actions[-1].extras
         assert extras["local_tag"] == "siphon-tag"
         assert extras["remote_tag"] == "far-tag"

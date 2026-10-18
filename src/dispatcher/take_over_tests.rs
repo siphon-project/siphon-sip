@@ -5,8 +5,8 @@
 //!
 //! The script names the dialog by its Call-ID, siphon's own tag on it and the
 //! far party's tag on it. These tests read the names from a `Target-Dialog`
-//! header, whose tags are written from the sending UA's side of the dialog, so
-//! its `remote-tag` is siphon's.
+//! header, whose tags are written as the recipient sees the dialog (RFC 4538
+//! §3), so its `local-tag` is siphon's.
 //!
 //! Driven through [`handle_b2bua_invite`] and [`handle_b2bua_bye`], with what
 //! siphon sent read back off the UDP egress. `b2bua.accept_replaces` is left at
@@ -39,8 +39,8 @@ const TAKE_OVER: &str = concat!(
     "    headers = ANSWER_HEADERS.get(call.get_header(\"X-Answer-Headers\"))\n",
     "    call.take_over(\n",
     "        dialog_call_id.strip(),\n",
-    "        params[\"remote-tag\"],\n",
     "        params[\"local-tag\"],\n",
+    "        params[\"remote-tag\"],\n",
     "        reinvite=call.get_header(\"X-Reinvite\") == \"yes\",\n",
     "        headers=headers,\n",
     "    )\n",
@@ -68,17 +68,18 @@ enum Named {
     BLeg,
 }
 
-/// `Target-Dialog` naming one of `call`'s dialogs, from the view of the party
-/// at its far end: `local-tag` that party's tag, `remote-tag` siphon's.
+/// `Target-Dialog` naming one of `call`'s dialogs as siphon, its recipient,
+/// sees it (RFC 4538 §3): `local-tag` siphon's tag, `remote-tag` the far
+/// party's.
 fn target_dialog(call: &Established, named: Named) -> String {
     match named {
         Named::ALeg => format!(
-            "Target-Dialog: {};local-tag=a-tag;remote-tag={}\r\n",
+            "Target-Dialog: {};local-tag={};remote-tag=a-tag\r\n",
             call.a_call_id,
             tag_of(&header(&call.answer_to_a, "To"))
         ),
         Named::BLeg => format!(
-            "Target-Dialog: {};local-tag=b-tag;remote-tag={}\r\n",
+            "Target-Dialog: {};local-tag={};remote-tag=b-tag\r\n",
             header(&call.to_b, "Call-ID"),
             tag_of(&header(&call.to_b, "From"))
         ),
@@ -306,7 +307,7 @@ async fn a_take_over_of_an_unknown_dialog_is_refused_481() {
         &newcomer_invite(
             "takeover-6160@192.0.2.240",
             &format!(
-                "Target-Dialog: {};local-tag=b-tag;remote-tag=not-siphons-tag\r\n",
+                "Target-Dialog: {};local-tag=not-siphons-tag;remote-tag=b-tag\r\n",
                 header(&call.to_b, "Call-ID")
             ),
         ),
@@ -322,9 +323,9 @@ async fn a_take_over_of_an_unknown_dialog_is_refused_481() {
 }
 
 /// Only a confirmed dialog is taken over in this release: a named dialog still
-/// early is refused 488, and the ringing call goes on.
+/// early is refused 480 (TS 24.237 §12.3.2.3), and the ringing call goes on.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_take_over_of_an_early_dialog_is_refused_488() {
+async fn a_take_over_of_an_early_dialog_is_refused_480() {
     let dispatcher = test_dispatcher_with_script(TAKE_OVER);
     let (a, b) = ("192.0.2.170:5060", "198.51.100.170:5060");
     let a_call_id = "early-6170@192.0.2.170";
@@ -350,12 +351,12 @@ async fn a_take_over_of_an_early_dialog_is_refused_488() {
 
     for target in [
         format!(
-            "Target-Dialog: {};local-tag=b-tag;remote-tag={}\r\n",
+            "Target-Dialog: {};local-tag={};remote-tag=b-tag\r\n",
             header(&to_b, "Call-ID"),
             tag_of(&header(&to_b, "From"))
         ),
         format!(
-            "Target-Dialog: {a_call_id};local-tag=a-tag;remote-tag={}\r\n",
+            "Target-Dialog: {a_call_id};local-tag={};remote-tag=a-tag\r\n",
             dispatcher
                 .state
                 .call_actors
@@ -370,7 +371,7 @@ async fn a_take_over_of_an_early_dialog_is_refused_488() {
             &newcomer_invite("takeover-6170@192.0.2.240", &target),
         );
         let sent = wire(&dispatcher);
-        let _ = response_to_phone(&sent, NEWCOMER, 488);
+        let _ = response_to_phone(&sent, NEWCOMER, 480);
         assert!(sent_to(&sent, a, Method::Bye).is_none(), "{target}");
         assert!(sent_to(&sent, b, Method::Cancel).is_none(), "{target}");
     }

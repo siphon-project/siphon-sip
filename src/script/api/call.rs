@@ -2026,8 +2026,8 @@ impl PyCall {
     ///
     /// The dialog is named the way siphon holds it: its Call-ID, siphon's own
     /// tag on it, and the far party's tag on it. A `Target-Dialog` is written
-    /// from its sender's side of the dialog, so siphon's tag is its
-    /// `remote-tag` and the far party's its `local-tag`.
+    /// as its recipient sees the dialog (RFC 4538 §3), so siphon's tag is its
+    /// `local-tag` and the far party's its `remote-tag`.
     ///
     /// This is the script's authorisation, so it works whether or not
     /// `b2bua.accept_replaces` is set. Holding a dialog's identifiers is no
@@ -2040,8 +2040,8 @@ impl PyCall {
     /// `Replaces` header on the same INVITE asked for.
     ///
     /// Refused on the wire once the handler returns: `481` when no dialog of
-    /// this node matches (RFC 4538 §4), `488` when the named dialog is not
-    /// confirmed yet (early dialogs are not taken over), `488` when the INVITE
+    /// this node matches (RFC 4538 §4), `480` when the named dialog is not
+    /// confirmed yet (TS 24.237 §12.3.2.3 step 2), `488` when the INVITE
     /// carries no offer, `420` for a required extension siphon does not
     /// honour (`tdialog` is honoured on this path).
     ///
@@ -2072,8 +2072,8 @@ impl PyCall {
     ///             params = dict(p.strip().split("=", 1)
     ///                           for p in rest.split(";") if "=" in p)
     ///             call.take_over(dialog_call_id.strip(),
-    ///                            local_tag=params["remote-tag"],
-    ///                            remote_tag=params["local-tag"],
+    ///                            local_tag=params["local-tag"],
+    ///                            remote_tag=params["remote-tag"],
     ///                            reinvite=False,
     ///                            headers={"P-Asserted-Identity": "<tel:+15550100001>"})
     ///             return

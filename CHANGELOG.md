@@ -201,7 +201,7 @@ entry, but a working config keeps working.
   between the survivor and the new leg. `reinvite=False` leaves the survivor
   un-re-INVITEd (TS 24.237 §12.3.5 C b) and is refused on a media-anchored
   call. The script authorises it, so `b2bua.accept_replaces` does not gate it.
-  An unknown dialog is refused `481`, an early one `488`, and `tdialog` is
+  An unknown dialog is refused `481`, an early one `480` (TS 24.237), and `tdialog` is
   honoured on this path. The `Replaces` path is unchanged.
 
 ## [1.14.0] — 2026-10-17
