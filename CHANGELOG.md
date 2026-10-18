@@ -97,6 +97,13 @@ entry, but a working config keeps working.
   Experimental-Result, with a metrics result label of its own, `exp:5422`.
   Checked against hand-written messages and Wireshark's Diameter dissector
   with `scripts/validate_diameter_s13.sh`; not tested against an MME.
+- **`request.reply()` in `@proxy.on_failure` was dropped.** The handler's
+  reply never reached the caller and the failure was suppressed, so the caller
+  got nothing at all. It is now sent on the original server transaction with
+  the headers and body set through `request.set_reply_header()` /
+  `request.set_reply_body()`, for a single relay and a failed fork alike,
+  keeps its code (a 503 is not turned into 500) and is what the CDR and Rf
+  record. A reply outside 300-699 is logged and the failure forwarded.
 
 ## [1.14.0] — 2026-10-17
 
