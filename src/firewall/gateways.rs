@@ -60,10 +60,11 @@ pub struct GatewayAllowSet {
     set_v4: String,
     set_v6: String,
     dispatcher: Arc<DispatcherManager>,
-    /// `security.trusted_cidrs`, already parsed. Present in the allow set
-    /// because it is already the estate's "not an abuser" list: own trunks,
-    /// monitoring, management.
-    trusted: Vec<IpNet>,
+    /// `security.trusted_cidrs`, the list every abuse control shares (a reload
+    /// swaps it and asks for a publish). Present in the allow set because it
+    /// is already the estate's "not an abuser" list: own trunks, monitoring,
+    /// management.
+    trusted: crate::security::trust::TrustedCidrs,
     /// What the kernel was last told, so an unchanged view issues no netlink
     /// transaction at all. Stored only after the kernel acked, so a failed
     /// publish is retried on the next tick rather than remembered as done.
@@ -105,23 +106,9 @@ fn compare_declaration(known: Option<&[u64]>, current: Option<&[u64]>) -> Declar
 impl GatewayAllowSet {
     pub fn new(
         config: &crate::config::FirewallConfig,
-        trusted_cidrs: &[String],
+        trusted: crate::security::trust::TrustedCidrs,
         dispatcher: Arc<DispatcherManager>,
     ) -> Self {
-        let mut trusted = Vec::new();
-        for entry in trusted_cidrs {
-            match crate::gateway::parse_source_network(entry) {
-                Some(network) => trusted.push(network),
-                // Skipped, not fatal — every other `trusted_cidrs` consumer
-                // drops an unparseable entry the same way, and failing start-up
-                // here would make the firewall stricter about the list than the
-                // userspace ACL that also reads it.
-                None => tracing::warn!(
-                    entry = %entry,
-                    "kernel firewall: security.trusted_cidrs entry is neither a CIDR nor an address — skipped"
-                ),
-            }
-        }
         Self {
             table: config.table.clone(),
             set_v4: config.set_gateways_v4.clone(),
@@ -138,7 +125,7 @@ impl GatewayAllowSet {
     /// The ranges the kernel should hold right now, v4 and v6, normalised.
     fn desired(&self) -> (Vec<IpNet>, Vec<IpNet>) {
         let mut sources = self.dispatcher.admitted_sources();
-        sources.extend_from_slice(&self.trusted);
+        sources.extend_from_slice(&self.trusted.load());
         let (v4, v6): (Vec<IpNet>, Vec<IpNet>) = sources
             .into_iter()
             .partition(|network| network.addr().is_ipv4());
@@ -496,7 +483,11 @@ mod tests {
     fn allow_set() -> GatewayAllowSet {
         let config: crate::config::FirewallConfig =
             crate::config::yaml::from_str("{}").expect("an empty firewall section parses");
-        GatewayAllowSet::new(&config, &[], Arc::new(DispatcherManager::new()))
+        GatewayAllowSet::new(
+            &config,
+            Default::default(),
+            Arc::new(DispatcherManager::new()),
+        )
     }
 
     #[test]
@@ -536,7 +527,7 @@ mod tests {
             .expect("start-up declaration");
         let allow_set = GatewayAllowSet::new(
             &config,
-            &["192.0.2.0/24".to_string()],
+            crate::security::trust::TrustedCidrs::from_entries(&["192.0.2.0/24".to_string()]),
             Arc::new(DispatcherManager::new()),
         );
         assert!(!allow_set.reassert().await.expect("first look"));

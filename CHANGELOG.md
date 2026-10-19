@@ -55,11 +55,19 @@ entry, but a working config keeps working.
   nothing. Comments and key order are not changes. Listeners and dialogs are
   never touched, `advertised_address` included. Behind the admin bearer token;
   `501` on a node started from a config string. Not wired to `SIGHUP`.
+  `security.trusted_cidrs`, `rate_limit`, `scanner_block` and
+  `failed_auth_ban` apply at once too: thresholds change from the next
+  request, bans in force keep their expiry, removing a section turns that
+  control off and lifts its bans (kernel included), and adding one that was
+  absent at startup switches it on. A source newly in `trusted_cidrs` has its
+  auto-ban, rate-limit and APIBAN entries lifted and the kernel gateway allow
+  set follows; an unreadable entry is skipped and listed under `warnings`.
   **BREAKING (Rust library):** `UacSender::new` and `RegistrantManager::new`
   take a `SharedIdentityHeaders` in place of the `Option<String>` User-Agent,
   `DispatcherState`'s `server_header` / `user_agent_header` become one
-  `identity`, `dispatcher::run` takes the shared value, and `AdminState` gains
-  `config_reloader`.
+  `identity`, `dispatcher::run` takes the shared value, `AdminState` gains
+  `config_reloader`, and `firewall::gateways::GatewayAllowSet::new` takes the
+  shared `security::trust::TrustedCidrs` in place of `&[String]`.
 - **Ro: sessions held in Rust, as many per call as needed, or none bound to a
   call.** `await diameter.ro_session(...)` opens a credit-control session and
   returns a `RoSession` handle; each has its own Session-Id, Subscription-Ids,
@@ -214,6 +222,12 @@ entry, but a working config keeps working.
   refuses leaves the call as it was and the new party gets its status. A
   survivor SDP that does answer the offer is still replayed at once.
 
+- **A bare address in `security.trusted_cidrs` is trusted.** Userspace parsed
+  the list as CIDRs only, so `203.0.113.7` (no prefix) was silently dropped by
+  the rate limiter, scanner block, auto-ban, connection ceilings and APIBAN
+  while the kernel gateway allow set took it as a host route. One parser now
+  reads it everywhere, a bare address as `/32` or `/128`. An entry that is
+  neither is still skipped, not refused, and is now logged at startup.
 - **B2BUA: a `Require` tag only the script added no longer refuses the caller
   `420`.** The required-extension check (RFC 3261 §8.2.2.3) held the caller to
   every tag in the A-leg `Require` as the script left it, so a script that put

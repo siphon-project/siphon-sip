@@ -45,7 +45,11 @@ use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 
+mod filter;
+pub mod runtime;
 pub mod trust;
+
+pub use filter::SecurityFilter;
 
 use trust::SourceTrust;
 
@@ -68,6 +72,19 @@ pub fn auto_ban() -> Option<&'static Arc<AutoBanStore>> {
     AUTO_BAN.get()
 }
 
+/// The auto-ban store while `failed_auth_ban` is in force: `None` when it was
+/// never configured, and also once a config reload removed it (the store stays
+/// installed, empty and counting nothing). For the admin API, which reports
+/// "not enabled" rather than an empty list; the hot paths use [`auto_ban`].
+pub fn auto_ban_enabled() -> Option<&'static Arc<AutoBanStore>> {
+    AUTO_BAN.get().filter(|store| store.is_enabled())
+}
+
+/// The slot [`runtime::SecurityRuntime`] installs the auto-ban store into.
+pub(crate) fn auto_ban_slot() -> &'static OnceLock<Arc<AutoBanStore>> {
+    &AUTO_BAN
+}
+
 /// Process-wide request-level security filter (PIKE-style per-source rate
 /// limiting + scanner User-Agent blocking). `None` until installed at startup,
 /// and only installed when `security.rate_limit` or `security.scanner_block` is
@@ -86,6 +103,11 @@ pub fn set_security_filter(filter: Arc<SecurityFilter>) {
 /// dispatcher's inbound-request path before transaction/dialog processing.
 pub fn security_filter() -> Option<&'static Arc<SecurityFilter>> {
     SECURITY_FILTER.get()
+}
+
+/// The slot [`runtime::SecurityRuntime`] installs the request filter into.
+pub(crate) fn security_filter_slot() -> &'static OnceLock<Arc<SecurityFilter>> {
+    &SECURITY_FILTER
 }
 
 /// Default ceiling on a single SIP message over a stream transport, in bytes.
@@ -390,6 +412,12 @@ impl ConnectionLimiter {
         self
     }
 
+    /// Consult the shared `trusted_cidrs` list a reload swaps.
+    pub fn with_trusted(mut self, trusted: trust::TrustedCidrs) -> Self {
+        self.trust = self.trust.with_trusted(trusted);
+        self
+    }
+
     fn is_trusted(&self, source: IpAddr) -> bool {
         self.trust.is_trusted(source)
     }
@@ -658,33 +686,11 @@ pub struct AutoBanStore {
     bans: DashMap<IpAddr, BanEntry>,
     /// Sources that are never counted and never banned.
     trust: SourceTrust,
-    threshold: u32,
-    window: Duration,
-    ban_duration: Duration,
-    /// Ceiling on how far continued abuse may push a single ban's expiry,
-    /// measured from the instant the ban was first raised. See [`BanEntry`].
-    max_ban_duration: Duration,
-    /// Failure weight applied by [`Self::record_strong_failure`] — how many
-    /// counts a single high-confidence abuse signal (present-but-invalid
-    /// credentials, forged/stale/replayed nonce, non-SIP garbage on a stream,
-    /// scanner User-Agent) contributes toward `threshold`. A weight > 1 bans
-    /// these unambiguous signals faster than a bare scanning probe (weight 1)
-    /// while reusing the single per-IP window. Always ≥ 1.
-    strong_weight: u32,
-    /// Failure weight applied by [`Self::record_missing_credentials`] — a
-    /// challenge issued because the request carried no credentials at all.
-    ///
-    /// **Zero by default, and that is deliberate.** RFC 3261 §22.2 makes the
-    /// credential-less request the opening leg of challenge-response: every
-    /// client sends one before it has a nonce, so counting it bans clients for
-    /// behaving correctly. It fired in production — a subscriber address
-    /// accrued five in one window and lost an hour — and behind CGNAT the blast
-    /// radius is every subscriber sharing the address, none of whom did
-    /// anything. The signal it was reaching for (a scanner that only ever
-    /// probes) is covered better by `scanner_block`, `rate_limit`, apiban and
-    /// the non-SIP/handshake signals, all of which a real client never trips.
-    /// Set it to 1 to restore the old behaviour.
-    missing_credentials_weight: u32,
+    /// The `failed_auth_ban` policy, swapped by `POST /admin/config/reload`.
+    /// `None` once the section is removed: nothing is counted, and every ban
+    /// was lifted when it went. Read on the signal paths only; the per-packet
+    /// [`Self::is_banned`] never loads it.
+    policy: arc_swap::ArcSwapOption<BanPolicy>,
     /// Optional kernel-firewall handle. When wired, every new ban is also
     /// pushed to the nf_tables set so the source is dropped pre-userspace.
     firewall: OnceLock<crate::firewall::KernelFirewall>,
@@ -702,30 +708,81 @@ impl AutoBanStore {
         missing_credentials_weight: u32,
         max_ban_duration_secs: u32,
     ) -> Self {
-        let threshold = threshold.max(1);
-        let ban_duration = Duration::from_secs(u64::from(ban_duration_secs.max(1)));
+        Self::with_policy(
+            BanPolicy::new(
+                threshold,
+                window_secs,
+                ban_duration_secs,
+                strong_weight,
+                missing_credentials_weight,
+                max_ban_duration_secs,
+            ),
+            SourceTrust::from_cidrs(trusted_cidrs),
+        )
+    }
+
+    /// Build a store enforcing `policy`, exempting what `trust` exempts.
+    pub fn with_policy(policy: BanPolicy, trust: SourceTrust) -> Self {
         Self {
             failures: DashMap::new(),
             bans: DashMap::new(),
-            trust: SourceTrust::from_cidrs(trusted_cidrs),
-            // Guard against a zero policy disabling the feature by accident.
-            threshold,
-            window: Duration::from_secs(u64::from(window_secs.max(1))),
-            ban_duration,
-            // Never below one ban_duration: a cap under the base duration would
-            // shorten the very first ban, which is not what a *max* means.
-            max_ban_duration: Duration::from_secs(u64::from(max_ban_duration_secs))
-                .max(ban_duration),
-            strong_weight: strong_weight.max(1),
-            // Zero is a meaningful value here (do not count it at all) and is
-            // the default, so unlike the others this one is not clamped up.
-            // Clamped down to the threshold only to keep it on the same scale
-            // it is measured against; at exactly the threshold one
-            // credential-less request bans, which is a policy an operator can
-            // legitimately ask for.
-            missing_credentials_weight: missing_credentials_weight.min(threshold),
+            trust,
+            policy: arc_swap::ArcSwapOption::from_pointee(policy),
             firewall: OnceLock::new(),
         }
+    }
+
+    /// Enforce `policy` from the next signal on. Bans in force keep their
+    /// expiry and failure windows keep their count, so a source part-way to
+    /// the old threshold is judged against the new one.
+    pub fn set_policy(&self, policy: BanPolicy) {
+        self.policy.store(Some(Arc::new(policy)));
+    }
+
+    /// Stop counting, and lift every ban and failure window, from the kernel
+    /// set too: what `failed_auth_ban` being removed means.
+    pub fn disable(&self) {
+        self.policy.store(None);
+        self.failures.clear();
+        let banned: Vec<IpAddr> = self.bans.iter().map(|entry| *entry.key()).collect();
+        for source in banned {
+            if self.bans.remove(&source).is_some() {
+                if let Some(firewall) = self.firewall.get() {
+                    firewall.unban(source);
+                }
+            }
+        }
+    }
+
+    /// Whether `failed_auth_ban` is in force (it was configured, and has not
+    /// been removed by a reload since).
+    pub fn is_enabled(&self) -> bool {
+        self.policy.load().is_some()
+    }
+
+    /// Lift bans (kernel included) and failure windows on every source
+    /// `trusted` now holds. Returns how many bans were lifted.
+    pub fn lift_trusted(&self, trusted: &[ipnet::IpNet]) -> usize {
+        let inside = |source: &IpAddr| trusted.iter().any(|network| network.contains(source));
+        self.failures.retain(|source, _| !inside(source));
+        let lifted: Vec<IpAddr> = self
+            .bans
+            .iter()
+            .map(|entry| *entry.key())
+            .filter(|source| inside(source))
+            .collect();
+        for source in &lifted {
+            if self.bans.remove(source).is_some() {
+                if let Some(firewall) = self.firewall.get() {
+                    firewall.unban(*source);
+                }
+                tracing::warn!(
+                    source = %source,
+                    "auto-ban: ban lifted, the source is now in security.trusted_cidrs"
+                );
+            }
+        }
+        lifted.len()
     }
 
     /// Attach a kernel-firewall handle so new bans are also programmed into the
@@ -744,6 +801,12 @@ impl AutoBanStore {
         gateways: Option<Arc<crate::gateway::view::GatewayView>>,
     ) -> Self {
         self.trust = self.trust.with_gateways(gateways);
+        self
+    }
+
+    /// Consult the shared `trusted_cidrs` list a reload swaps.
+    pub fn with_trusted(mut self, trusted: trust::TrustedCidrs) -> Self {
+        self.trust = self.trust.with_trusted(trusted);
         self
     }
 
@@ -828,7 +891,7 @@ impl AutoBanStore {
     pub fn record_failure(&self, source: IpAddr) -> bool {
         self.record_failure_weighted_at(
             source,
-            1,
+            |_| 1,
             Instant::now(),
             "repeated low-confidence failure signals",
         )
@@ -844,7 +907,7 @@ impl AutoBanStore {
     pub fn record_missing_credentials(&self, source: IpAddr) -> bool {
         self.record_failure_weighted_at(
             source,
-            self.missing_credentials_weight,
+            |policy| policy.missing_credentials_weight,
             Instant::now(),
             "repeated requests carrying no credentials",
         )
@@ -860,7 +923,7 @@ impl AutoBanStore {
     pub fn record_strong_failure(&self, source: IpAddr) -> bool {
         self.record_failure_weighted_at(
             source,
-            self.strong_weight,
+            |policy| policy.strong_weight,
             Instant::now(),
             "repeated high-confidence abuse signals",
         )
@@ -878,14 +941,15 @@ impl AutoBanStore {
     /// credential over UDP: a threshold's worth of forged INVITEs is then what
     /// it takes to ban an innocent address, never a single one.
     pub fn record_unwanted_call(&self, source: IpAddr, verified_source: bool) -> bool {
-        let weight = if verified_source {
-            self.strong_weight
-        } else {
-            1
-        };
         self.record_failure_weighted_at(
             source,
-            weight,
+            |policy| {
+                if verified_source {
+                    policy.strong_weight
+                } else {
+                    1
+                }
+            },
             Instant::now(),
             "repeated calls the controller dropped as unwanted",
         )
@@ -898,10 +962,16 @@ impl AutoBanStore {
     fn record_failure_weighted_at(
         &self,
         source: IpAddr,
-        weight: u32,
+        weight: impl FnOnce(&BanPolicy) -> u32,
         now: Instant,
         reason: &str,
     ) -> bool {
+        let policy = self.policy.load();
+        // Not in force (removed by a reload): nothing is counted.
+        let Some(policy) = policy.as_deref() else {
+            return false;
+        };
+        let weight = weight(policy);
         // A zero-weight signal is not counted at all — and specifically does not
         // touch `failures`, so a policy that declines to act on a signal also
         // declines to allocate a per-source row for it.
@@ -911,7 +981,7 @@ impl AutoBanStore {
         if self.is_trusted(source) {
             return false;
         }
-        if self.extend_ban_at(source, now) {
+        if self.extend_ban_at(source, now, policy) {
             // Already banned. The expiry was just pushed out (up to the hard
             // deadline); the source stays banned and this is not a *new* ban, so
             // the caller must not log a second ban transition for it.
@@ -924,12 +994,12 @@ impl AutoBanStore {
                 window_start: now,
             });
             // Roll the window if it has elapsed.
-            if now.duration_since(entry.window_start) > self.window {
+            if now.duration_since(entry.window_start) > policy.window {
                 entry.count = 0;
                 entry.window_start = now;
             }
             entry.count = entry.count.saturating_add(weight);
-            entry.count >= self.threshold
+            entry.count >= policy.threshold
             // `entry` (shard write guard) dropped here, before we touch `bans`
             // or `failures` again — never hold a DashMap guard across another
             // op on the same map.
@@ -940,8 +1010,8 @@ impl AutoBanStore {
             self.bans.insert(
                 source,
                 BanEntry {
-                    expiry: now + self.ban_duration,
-                    hard_deadline: now + self.max_ban_duration,
+                    expiry: now + policy.ban_duration,
+                    hard_deadline: now + policy.max_ban_duration,
                 },
             );
             // Mirror the ban into the kernel firewall (nf_tables) if wired, so
@@ -950,7 +1020,7 @@ impl AutoBanStore {
             // expire in lockstep. Non-blocking (drops silently if the actor
             // queue is full — the userspace ACL still enforces the ban).
             if let Some(firewall) = self.firewall.get() {
-                firewall.ban(source, self.ban_duration);
+                firewall.ban(source, policy.ban_duration);
             }
             // Both of those only ever meet the source again at accept, which a
             // peer that keeps the connection it already has never reaches: it
@@ -972,7 +1042,7 @@ impl AutoBanStore {
     /// A scanner that trips the threshold and then keeps hammering used to have
     /// every subsequent signal discarded, so it walked out at exactly the
     /// original TTL no matter how hard it leaned on the box in between.
-    fn extend_ban_at(&self, source: IpAddr, now: Instant) -> bool {
+    fn extend_ban_at(&self, source: IpAddr, now: Instant, policy: &BanPolicy) -> bool {
         if self.is_trusted(source) {
             return false;
         }
@@ -992,7 +1062,7 @@ impl AutoBanStore {
         let state = {
             match self.bans.get_mut(&source) {
                 Some(mut entry) if entry.expiry > now => {
-                    let extended = (now + self.ban_duration).min(entry.hard_deadline);
+                    let extended = (now + policy.ban_duration).min(entry.hard_deadline);
                     // Only ever forward. At the hard deadline this is a no-op
                     // rather than a rollback of an expiry already further out.
                     if extended > entry.expiry {
@@ -1028,7 +1098,7 @@ impl AutoBanStore {
     /// Test-only weight-1 shim preserving the pre-weighting call shape.
     #[cfg(test)]
     fn record_failure_at(&self, source: IpAddr, now: Instant) -> bool {
-        self.record_failure_weighted_at(source, 1, now, "a test signal")
+        self.record_failure_weighted_at(source, |_| 1, now, "a test signal")
     }
 
     /// Test-only shim preserving the pre-cap constructor shape, defaulting the
@@ -1136,8 +1206,102 @@ impl AutoBanStore {
 
     fn prune_at(&self, now: Instant) {
         self.bans.retain(|_, ban| ban.expiry > now);
-        self.failures
-            .retain(|_, window| now.duration_since(window.window_start) <= self.window);
+        match self.policy.load().as_deref() {
+            Some(policy) => self
+                .failures
+                .retain(|_, window| now.duration_since(window.window_start) <= policy.window),
+            None => self.failures.clear(),
+        }
+    }
+
+    /// Rows held, as `(failure windows, bans)`. Test-only: both are keyed by a
+    /// live source and must drain.
+    #[cfg(test)]
+    pub(crate) fn tracked_sources(&self) -> (usize, usize) {
+        (self.failures.len(), self.bans.len())
+    }
+}
+
+/// A `failed_auth_ban` policy, with the clamps that keep a zero from turning
+/// the feature off by accident.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BanPolicy {
+    threshold: u32,
+    window: Duration,
+    ban_duration: Duration,
+    /// Ceiling on how far continued abuse may push a single ban's expiry,
+    /// measured from the instant the ban was first raised. See [`BanEntry`].
+    max_ban_duration: Duration,
+    /// Failure weight applied by [`AutoBanStore::record_strong_failure`] — how
+    /// many counts a single high-confidence abuse signal (present-but-invalid
+    /// credentials, forged/stale/replayed nonce, non-SIP garbage on a stream,
+    /// scanner User-Agent) contributes toward `threshold`. A weight > 1 bans
+    /// these unambiguous signals faster than a bare scanning probe (weight 1)
+    /// while reusing the single per-IP window. Always ≥ 1.
+    strong_weight: u32,
+    /// Failure weight applied by [`AutoBanStore::record_missing_credentials`] —
+    /// a challenge issued because the request carried no credentials at all.
+    ///
+    /// **Zero by default, and that is deliberate.** RFC 3261 §22.2 makes the
+    /// credential-less request the opening leg of challenge-response: every
+    /// client sends one before it has a nonce, so counting it bans clients for
+    /// behaving correctly. It fired in production — a subscriber address
+    /// accrued five in one window and lost an hour — and behind CGNAT the blast
+    /// radius is every subscriber sharing the address, none of whom did
+    /// anything. The signal it was reaching for (a scanner that only ever
+    /// probes) is covered better by `scanner_block`, `rate_limit`, apiban and
+    /// the non-SIP/handshake signals, all of which a real client never trips.
+    /// Set it to 1 to restore the old behaviour.
+    missing_credentials_weight: u32,
+}
+
+impl BanPolicy {
+    pub fn new(
+        threshold: u32,
+        window_secs: u32,
+        ban_duration_secs: u32,
+        strong_weight: u32,
+        missing_credentials_weight: u32,
+        max_ban_duration_secs: u32,
+    ) -> Self {
+        // Guard against a zero policy disabling the feature by accident.
+        let threshold = threshold.max(1);
+        let ban_duration = Duration::from_secs(u64::from(ban_duration_secs.max(1)));
+        Self {
+            threshold,
+            window: Duration::from_secs(u64::from(window_secs.max(1))),
+            ban_duration,
+            // Never below one ban_duration: a cap under the base duration would
+            // shorten the very first ban, which is not what a *max* means.
+            max_ban_duration: Duration::from_secs(u64::from(max_ban_duration_secs))
+                .max(ban_duration),
+            strong_weight: strong_weight.max(1),
+            // Zero is a meaningful value here (do not count it at all) and is
+            // the default, so unlike the others this one is not clamped up.
+            // Clamped down to the threshold only to keep it on the same scale
+            // it is measured against; at exactly the threshold one
+            // credential-less request bans, which is a policy an operator can
+            // legitimately ask for.
+            missing_credentials_weight: missing_credentials_weight.min(threshold),
+        }
+    }
+
+    /// The policy `security.failed_auth_ban` describes. An unset
+    /// `max_ban_duration_secs` is a day's worth of bans at the configured
+    /// duration: long enough that a scanner leaning on the box stays pinned
+    /// across a working day, short enough that a wrong verdict on a CGNAT
+    /// address ages out on its own.
+    pub fn from_config(config: &crate::config::FailedAuthBanConfig) -> Self {
+        Self::new(
+            config.threshold,
+            config.window_secs,
+            config.ban_duration_secs,
+            config.strong_signal_weight,
+            config.missing_credentials_weight,
+            config
+                .max_ban_duration_secs
+                .unwrap_or_else(|| config.ban_duration_secs.saturating_mul(24)),
+        )
     }
 }
 
@@ -1152,262 +1316,6 @@ pub enum SecurityVerdict {
     /// Source exceeded `security.rate_limit.max_requests` within the window (or
     /// is inside the resulting ban) — drop silently.
     RateLimited,
-}
-
-/// Fixed-window per-source-IP rate limiter with TTL bans. Replaces the Kamailio
-/// PIKE module: once a source sends more than `max_requests` within `window`, it
-/// is banned for `ban_duration` and every further request is dropped until the
-/// ban expires.
-struct RateLimitState {
-    /// IP → current request-count window.
-    windows: DashMap<IpAddr, FailureWindow>,
-    /// IP → ban expiry instant.
-    bans: DashMap<IpAddr, Instant>,
-    /// IP → request-count window for gateway sources exempted by
-    /// `trust_gateways`. Counted apart from `windows` so the only thing it can
-    /// do is say, once per window, that a carrier went over the limit it is
-    /// exempt from — and so a carrier removed from the source starts back
-    /// under the policy at zero rather than with the count it ran up while
-    /// trusted. Pruned with the rest; one row per busy gateway at most.
-    exempt_windows: DashMap<IpAddr, FailureWindow>,
-    max_requests: u32,
-    window: Duration,
-    ban_duration: Duration,
-}
-
-impl RateLimitState {
-    /// Count one request from `source`. Returns `true` when the request is
-    /// within the limit, `false` when the source is over the limit (and now
-    /// banned) or already inside an active ban.
-    fn check_at(&self, source: IpAddr, now: Instant) -> bool {
-        // Active ban? (Copy the expiry out before any mutation so we never hold
-        // a DashMap shard guard across a second op on the same map.)
-        //
-        // Deliberately NOT the sliding expiry [`AutoBanStore`] uses, and the
-        // asymmetry is the design, not an oversight. A rate-limit ban is a
-        // capacity verdict — "this source is asking for more than its share" —
-        // where the auto-ban's is an abuse verdict. Extending on every request
-        // during the ban would mean a legitimate client that retries on a timer
-        // (and behind CGNAT, one client speaking for a whole NAT) could never
-        // serve out its ban. Fixed duration here; sliding only where the signal
-        // is evidence of intent.
-        let ban_expiry = self.bans.get(&source).map(|entry| *entry.value());
-        match ban_expiry {
-            Some(expiry) if expiry > now => return false,
-            Some(_) => {
-                self.bans.remove(&source);
-            }
-            None => {}
-        }
-
-        let over_limit = {
-            let mut entry = self.windows.entry(source).or_insert(FailureWindow {
-                count: 0,
-                window_start: now,
-            });
-            if now.duration_since(entry.window_start) > self.window {
-                entry.count = 0;
-                entry.window_start = now;
-            }
-            entry.count += 1;
-            entry.count > self.max_requests
-            // shard write guard dropped here, before touching `bans`/`windows`.
-        };
-
-        if over_limit {
-            self.windows.remove(&source);
-            self.bans.insert(source, now + self.ban_duration);
-            return false;
-        }
-        true
-    }
-
-    /// Count one request from an exempt gateway source. Returns `true` exactly
-    /// once per window: on the request that takes it past the limit. Never
-    /// bans and never drops.
-    fn count_exempt_at(&self, source: IpAddr, now: Instant) -> bool {
-        let mut entry = self.exempt_windows.entry(source).or_insert(FailureWindow {
-            count: 0,
-            window_start: now,
-        });
-        if now.duration_since(entry.window_start) > self.window {
-            entry.count = 0;
-            entry.window_start = now;
-        }
-        entry.count = entry.count.saturating_add(1);
-        entry.count == self.max_requests.saturating_add(1)
-    }
-
-    fn active_bans(&self) -> usize {
-        self.bans.len()
-    }
-
-    fn prune_at(&self, now: Instant) {
-        self.bans.retain(|_, expiry| *expiry > now);
-        self.windows
-            .retain(|_, window| now.duration_since(window.window_start) <= self.window);
-        self.exempt_windows
-            .retain(|_, window| now.duration_since(window.window_start) <= self.window);
-    }
-
-    /// Rows held across the three maps. Test-only: each is keyed by a live
-    /// source, so all three must drain once their windows lapse.
-    #[cfg(test)]
-    fn tracked_sources(&self) -> (usize, usize, usize) {
-        (
-            self.windows.len(),
-            self.bans.len(),
-            self.exempt_windows.len(),
-        )
-    }
-}
-
-/// Request-level security filter: per-source rate limiting (`rate_limit`) plus
-/// scanner User-Agent blocking (`scanner_block`), both bypassed for
-/// `trusted_cidrs`. Consulted by the dispatcher before any request processing.
-///
-/// The whole feature is opt-in: [`SecurityFilter::from_config`] returns `None`
-/// unless at least one of `rate_limit` / `scanner_block` is configured.
-pub struct SecurityFilter {
-    /// Per-source rate limiter — `None` when `rate_limit` is not configured.
-    rate_limit: Option<RateLimitState>,
-    /// Lower-cased `User-Agent` substrings to block. Empty = scanner blocking off.
-    scanner_user_agents: Vec<String>,
-    /// Sources exempt from both rate limiting and scanner blocking (own
-    /// infrastructure: AS, trunks, monitoring — and gateways, under
-    /// `trust_gateways`).
-    trust: SourceTrust,
-}
-
-impl SecurityFilter {
-    /// Build a filter from the `security` config block. Returns `None` when
-    /// neither `rate_limit` nor `scanner_block` is set (feature is opt-in, so
-    /// the dispatcher check is a no-op). Invalid `trusted_cidrs` are ignored.
-    pub fn from_config(config: &crate::config::SecurityConfig) -> Option<Arc<Self>> {
-        Self::from_config_with_gateways(config, None)
-    }
-
-    /// [`Self::from_config`], also exempting every source `gateways` admits —
-    /// what start-up passes when `security.trust_gateways` is on.
-    pub fn from_config_with_gateways(
-        config: &crate::config::SecurityConfig,
-        gateways: Option<Arc<crate::gateway::view::GatewayView>>,
-    ) -> Option<Arc<Self>> {
-        let rate_limit = config.rate_limit.as_ref().map(|policy| RateLimitState {
-            windows: DashMap::new(),
-            bans: DashMap::new(),
-            exempt_windows: DashMap::new(),
-            // Guard against a zero policy permitting nothing / dividing by zero.
-            max_requests: policy.max_requests.max(1),
-            window: Duration::from_secs(u64::from(policy.window_secs.max(1))),
-            ban_duration: Duration::from_secs(u64::from(policy.ban_duration_secs.max(1))),
-        });
-
-        let scanner_user_agents: Vec<String> = config
-            .scanner_block
-            .as_ref()
-            .map(|block| {
-                block
-                    .user_agents
-                    .iter()
-                    .map(|agent| agent.to_lowercase())
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        if rate_limit.is_none() && scanner_user_agents.is_empty() {
-            return None;
-        }
-
-        Some(Arc::new(Self {
-            rate_limit,
-            scanner_user_agents,
-            trust: SourceTrust::from_cidrs(&config.trusted_cidrs).with_gateways(gateways),
-        }))
-    }
-
-    /// Whether `user_agent` matches a configured scanner signature
-    /// (case-insensitive substring — sipvicious advertises `friendly-scanner`).
-    fn is_scanner(&self, user_agent: Option<&str>) -> bool {
-        if self.scanner_user_agents.is_empty() {
-            return false;
-        }
-        match user_agent {
-            Some(agent) => {
-                let agent = agent.to_lowercase();
-                self.scanner_user_agents
-                    .iter()
-                    .any(|needle| agent.contains(needle))
-            }
-            None => false,
-        }
-    }
-
-    /// Evaluate one inbound request from `source` carrying `user_agent`. Trusted
-    /// sources always pass. Scanner blocking is checked before the rate limit so
-    /// a flood of scanner traffic doesn't burn a rate-limit ban slot it doesn't
-    /// need.
-    pub fn evaluate(&self, source: IpAddr, user_agent: Option<&str>) -> SecurityVerdict {
-        self.evaluate_at(source, user_agent, Instant::now())
-    }
-
-    fn evaluate_at(
-        &self,
-        source: IpAddr,
-        user_agent: Option<&str>,
-        now: Instant,
-    ) -> SecurityVerdict {
-        if self.trust.is_configured(source) {
-            return SecurityVerdict::Allow;
-        }
-        if self.trust.is_gateway(source) {
-            self.note_exempt_gateway(source, now);
-            return SecurityVerdict::Allow;
-        }
-        if self.is_scanner(user_agent) {
-            return SecurityVerdict::Scanner;
-        }
-        if let Some(ref rate) = self.rate_limit {
-            if !rate.check_at(source, now) {
-                return SecurityVerdict::RateLimited;
-            }
-        }
-        SecurityVerdict::Allow
-    }
-
-    /// Count a request from a gateway that `trust_gateways` exempts, and say so
-    /// once per window when it goes over the limit that would otherwise have
-    /// dropped it and banned it. Nothing else: the request is allowed.
-    fn note_exempt_gateway(&self, source: IpAddr, now: Instant) {
-        let Some(ref rate) = self.rate_limit else {
-            return;
-        };
-        if rate.count_exempt_at(source, now) {
-            let group = self.trust.gateways().and_then(|view| view.group_of(source));
-            tracing::warn!(
-                source = %source,
-                gateway_group = %group.as_deref().unwrap_or("-"),
-                max_requests = rate.max_requests,
-                window_secs = rate.window.as_secs(),
-                "rate_limit: gateway source is over the limit and not dropped (security.trust_gateways)"
-            );
-        }
-    }
-
-    /// Drop expired rate-limit bans and stale windows. Call periodically to keep
-    /// memory bounded under scanner churn. No-op when rate limiting is off.
-    pub fn prune(&self) {
-        if let Some(ref rate) = self.rate_limit {
-            rate.prune_at(Instant::now());
-        }
-    }
-
-    /// Number of currently-tracked rate-limit bans (0 when rate limiting is off).
-    pub fn rate_limit_bans(&self) -> usize {
-        self.rate_limit
-            .as_ref()
-            .map_or(0, RateLimitState::active_bans)
-    }
 }
 
 #[cfg(test)]
@@ -2196,9 +2104,7 @@ mod tests {
         filter.evaluate_at(source, None, now);
         filter.evaluate_at(source, None, now); // ban
         assert_eq!(filter.rate_limit_bans(), 1);
-        if let Some(ref rate) = filter.rate_limit {
-            rate.prune_at(now + Duration::from_secs(61));
-        }
+        filter.prune_at(now + Duration::from_secs(61));
         assert_eq!(filter.rate_limit_bans(), 0);
     }
 

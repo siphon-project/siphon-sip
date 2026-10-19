@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use super::*;
 use crate::registrant::{RegistrantCredentials, RegistrantEntry, RegistrantManager};
+use crate::security::runtime::SecurityRuntime;
 use crate::sip::uri::SipUri;
 use crate::transport::{OutboundRouter, Transport};
 
@@ -582,4 +583,108 @@ fn measure_reload_cycles() {
             eprintln!("[reload_cycles_do_not_leak] no /proc/self/status — RSS check skipped");
         }
     });
+}
+
+fn security_document(security: &str) -> String {
+    document(SERVER_A, &format!("security:\n{security}"))
+}
+
+/// Without the security runtime (a reloader nothing installed the controls
+/// for) the security fields cannot be applied, so they are named as needing a
+/// restart rather than reported applied.
+#[tokio::test]
+async fn security_fields_without_a_runtime_need_a_restart() {
+    let fixture = Fixture::new(&security_document("  trusted_cidrs: []\n"));
+    fixture.rewrite(&security_document(
+        "  trusted_cidrs: [\"198.51.100.0/24\"]\n",
+    ));
+    let report = fixture
+        .reloader
+        .reload()
+        .await
+        .expect("the reload validates");
+    assert_eq!(report.restart_required, ["security.trusted_cidrs"]);
+}
+
+/// The four runtime fields apply; every other `security` key waits for a
+/// restart and is named.
+#[tokio::test]
+async fn the_runtime_security_fields_apply_and_the_rest_wait_for_a_restart() {
+    let text = security_document("  trusted_cidrs: []\n");
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let path = directory.path().join("siphon.yaml");
+    std::fs::write(&path, &text).expect("write the config");
+    let (_, baseline) = Config::load_with_document(&path).expect("the config loads");
+    let security = Arc::new(SecurityRuntime::detached(&[], None, None, || None));
+    let reloader = ConfigReloader::new(
+        path.clone(),
+        baseline,
+        ReloadTargets::new(
+            IdentityHeaders::default().shared(),
+            PRODUCT_NAME,
+            PRODUCT_VERSION,
+        )
+        .with_security(Arc::clone(&security)),
+    );
+    std::fs::write(
+        &path,
+        security_document(concat!(
+            "  trusted_cidrs: [\"198.51.100.0/24\", \"bogus\"]\n",
+            "  rate_limit: { window_secs: 60, max_requests: 5 }\n",
+            "  scanner_block: { user_agents: [\"friendly-scanner\"] }\n",
+            "  failed_auth_ban: { threshold: 3, window_secs: 600, ban_duration_secs: 3600 }\n",
+            "  trust_gateways: true\n",
+            "  max_message_bytes: 65536\n",
+            "  connection_limits: { max_connections: 100 }\n",
+        )),
+    )
+    .expect("rewrite");
+    let report = reloader.reload().await.expect("the reload validates");
+    let section = &report.sections["security"];
+    assert_eq!(section.status, SectionStatus::RestartRequired);
+    assert_eq!(
+        section.applied,
+        [
+            "security.failed_auth_ban",
+            "security.rate_limit",
+            "security.scanner_block",
+            "security.trusted_cidrs",
+        ]
+    );
+    assert_eq!(
+        section.restart_required,
+        [
+            "security.connection_limits",
+            "security.max_message_bytes",
+            "security.trust_gateways",
+        ]
+    );
+    assert_eq!(report.warnings.len(), 1, "{:?}", report.warnings);
+    assert!(report.warnings[0].contains("bogus"));
+    assert_eq!(security.trusted().load().len(), 1);
+    assert!(security.auto_ban().is_some_and(|store| store.is_enabled()));
+    assert!(security
+        .security_filter()
+        .is_some_and(|filter| filter.is_enabled()));
+
+    // Removing the section turns each control off. The restart-only keys
+    // were never running, so with them gone from the file nothing waits.
+    std::fs::write(&path, document(SERVER_A, "")).expect("rewrite");
+    let report = reloader.reload().await.expect("the reload validates");
+    let section = &report.sections["security"];
+    assert_eq!(
+        section.applied,
+        [
+            "security.failed_auth_ban",
+            "security.rate_limit",
+            "security.scanner_block",
+            "security.trusted_cidrs",
+        ]
+    );
+    assert!(section.restart_required.is_empty());
+    assert!(security.trusted().load().is_empty());
+    assert!(security.auto_ban().is_some_and(|store| !store.is_enabled()));
+    assert!(security
+        .security_filter()
+        .is_some_and(|filter| !filter.is_enabled()));
 }

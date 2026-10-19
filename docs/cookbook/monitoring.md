@@ -94,11 +94,23 @@ draining pod leaves rotation cleanly — see [Deployment & operations](../deploy
 fields that can change without a restart. Listeners, dialogs and transactions
 are left alone. It is not tied to `SIGHUP`, which reloads the script only.
 
-Applied at runtime today: `server.server_header` and
-`server.user_agent_header`. The next response siphon builds carries the new
-`Server`, and the next request it originates (UAC probes, outbound
-REGISTERs, B2BUA legs) the new `User-Agent`. Removing the key puts the
-product default back. Every other change is reported as needing a restart
+Applied at runtime today:
+
+- `server.server_header` and `server.user_agent_header`. The next response
+  siphon builds carries the new `Server`, and the next request it originates
+  (UAC probes, outbound REGISTERs, B2BUA legs) the new `User-Agent`. Removing
+  the key puts the product default back.
+- `security.trusted_cidrs`, one list shared by the rate limiter, scanner
+  block, auto-ban, connection ceilings, APIBAN and the kernel gateway allow
+  set. A newly trusted source has its bans lifted (kernel elements included);
+  one taken off is counted from zero.
+- `security.rate_limit`, `security.scanner_block` and
+  `security.failed_auth_ban`. New thresholds apply from the next request or
+  signal, bans in force keep their expiry, and removing a section turns the
+  control off and lifts its bans. A control absent at start-up is switched on
+  by the reload that adds it.
+
+Every other change is reported as needing a restart
 and keeps being reported on each reload until the process restarts with it.
 `advertised_address` is one of these on purpose: moving it under live calls
 would change the address dialogs already in progress were set up on.
@@ -131,8 +143,10 @@ with the same three fields. `status` is `unchanged`, `applied` (everything
 that changed in it took effect) or `restart_required` (at least one change in
 it waits for a restart; the ones that could be applied still were, and are
 listed under `applied`). The top-level `applied` and `restart_required` lists
-gather the dotted paths across sections. `warnings` is reserved for notices
-that did not stop the reload and is empty today.
+gather the dotted paths across sections. `warnings` lists what was skipped
+rather than refused: today, a `trusted_cidrs` entry that is neither a CIDR nor
+an address (the valid entries still apply). It only covers fields this reload
+applied.
 
 | Status | When |
 |---|---|

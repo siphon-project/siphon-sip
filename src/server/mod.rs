@@ -396,17 +396,6 @@ impl SiphonServer {
             product_version,
         )
         .shared();
-        let config_reloader = config_document.map(|(path, document)| {
-            Arc::new(config_reload::ConfigReloader::new(
-                path.into(),
-                document,
-                config_reload::ReloadTargets::new(
-                    Arc::clone(&identity),
-                    product_name,
-                    product_version,
-                ),
-            ))
-        });
 
         // --- Initialise structured logging ---
         let _log_guard = if self.skip_logging_init {
@@ -1200,16 +1189,36 @@ impl SiphonServer {
             None => None,
         };
 
-        // --- Gateway allow set ---
-        init_gateway_allow_set(&config, gateway_manager.as_ref(), kernel_firewall.is_some()).await;
-
         // --- security.trust_gateways: the gateway view every abuse control consults ---
         let gateway_trust =
             crate::security::trust::gateway_view_for(&config, gateway_manager.as_ref());
 
+        // --- The shared trusted list and the reloadable abuse controls ---
+        let security_runtime = Arc::new(crate::security::runtime::SecurityRuntime::new(
+            config
+                .security
+                .as_ref()
+                .map_or(&[][..], |security| &security.trusted_cidrs),
+            gateway_trust.clone(),
+            kernel_firewall.clone(),
+        ));
+
+        // --- Gateway allow set ---
+        init_gateway_allow_set(
+            &config,
+            gateway_manager.as_ref(),
+            kernel_firewall.is_some(),
+            security_runtime.trusted(),
+        )
+        .await;
+
         // --- Build transport ACL ---
-        let transport_acl =
-            build_transport_acl(&config, kernel_firewall.clone(), gateway_trust.clone());
+        let transport_acl = build_transport_acl(
+            &config,
+            kernel_firewall.clone(),
+            gateway_trust.clone(),
+            security_runtime.trusted(),
+        );
 
         // --- Stream message-size ceiling ---
         // Always installed (unlike the opt-in guards below): a stream reader
@@ -1235,14 +1244,10 @@ impl SiphonServer {
             .as_ref()
             .map(|sec| sec.connection_limits.clone())
             .unwrap_or_default();
-        let trusted_cidrs = config
-            .security
-            .as_ref()
-            .map(|sec| sec.trusted_cidrs.clone())
-            .unwrap_or_default();
         let connection_limits = crate::security::ConnectionLimits::from(&connection_limits_config);
         crate::security::set_connection_limiter(Arc::new(
-            crate::security::ConnectionLimiter::new(connection_limits, &trusted_cidrs)
+            crate::security::ConnectionLimiter::new(connection_limits, &[])
+                .with_trusted(security_runtime.trusted())
                 .with_gateway_trust(gateway_trust.clone()),
         ));
         info!(
@@ -1250,95 +1255,25 @@ impl SiphonServer {
             max_handshakes = connection_limits.max_handshakes,
             max_connections_per_source = connection_limits.max_connections_per_source,
             max_connections = connection_limits.max_connections,
-            trusted_cidrs = trusted_cidrs.len(),
+            trusted_cidrs = security_runtime.trusted().load().len(),
             "inbound connection ceilings installed (0 = unlimited)"
         );
 
-        // --- Auto-ban (failed_auth_ban scanner protection) ---
-        // Opt-in: only installed when configured. Once installed, the auth path
-        // (challenge/success), the dispatcher (non-ACK INVITE Timer H), and the
-        // transport ACL (is_allowed) all reach it via crate::security::auto_ban().
-        if let Some(ref sec) = config.security {
-            if let Some(ref fab) = sec.failed_auth_ban {
-                // Default the sliding-expiry cap to a day's worth of bans at the
-                // configured duration. Long enough that a scanner leaning on the
-                // box stays pinned across a working day, short enough that a
-                // wrong verdict on a CGNAT address ages out on its own.
-                let max_ban_duration_secs = fab
-                    .max_ban_duration_secs
-                    .unwrap_or_else(|| fab.ban_duration_secs.saturating_mul(24));
-                let store = Arc::new(
-                    crate::security::AutoBanStore::new(
-                        fab.threshold,
-                        fab.window_secs,
-                        fab.ban_duration_secs,
-                        &sec.trusted_cidrs,
-                        fab.strong_signal_weight,
-                        fab.missing_credentials_weight,
-                        max_ban_duration_secs,
-                    )
-                    .with_gateway_trust(gateway_trust.clone()),
-                );
-                store.follow_gateway_view();
-                crate::security::set_auto_ban(Arc::clone(&store));
-                if let Some(ref firewall) = kernel_firewall {
-                    store.set_firewall(firewall.clone());
-                }
-                info!(
-                    threshold = fab.threshold,
-                    window_secs = fab.window_secs,
-                    ban_duration_secs = fab.ban_duration_secs,
-                    max_ban_duration_secs,
-                    strong_signal_weight = fab.strong_signal_weight,
-                    missing_credentials_weight = fab.missing_credentials_weight,
-                    trusted_cidrs = sec.trusted_cidrs.len(),
-                    "failed_auth_ban scanner protection enabled"
-                );
-                // Periodic prune (bounds memory under scanner churn) + publish the
-                // banned_ips gauge authoritatively each tick.
-                tokio::spawn(async move {
-                    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
-                    loop {
-                        ticker.tick().await;
-                        store.prune();
-                        if let Some(metrics) = crate::metrics::try_metrics() {
-                            metrics.banned_ips.set(store.active_bans() as i64);
-                        }
-                    }
-                });
-            }
-
-            // --- Request security filter (rate_limit + scanner_block) ---
-            // Opt-in: only installed when `security.rate_limit` and/or
-            // `security.scanner_block` is set. Once installed, the dispatcher
-            // consults it on every inbound request (before transaction/dialog
-            // processing) via crate::security::security_filter(). trusted_cidrs
-            // are exempt from both checks.
-            if let Some(filter) = crate::security::SecurityFilter::from_config_with_gateways(
-                sec,
-                gateway_trust.clone(),
-            ) {
-                crate::security::set_security_filter(Arc::clone(&filter));
-                info!(
-                    rate_limit = sec.rate_limit.is_some(),
-                    scanner_user_agents = sec
-                        .scanner_block
-                        .as_ref()
-                        .map(|block| block.user_agents.len())
-                        .unwrap_or(0),
-                    trusted_cidrs = sec.trusted_cidrs.len(),
-                    "request security filter enabled (rate_limit / scanner_block)"
-                );
-                // Periodic prune to bound the rate-limiter maps under scanner churn.
-                tokio::spawn(async move {
-                    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
-                    loop {
-                        ticker.tick().await;
-                        filter.prune();
-                    }
-                });
-            }
-        }
+        // --- Auto-ban (failed_auth_ban) and request filter (rate_limit +
+        // scanner_block) ---
+        // Opt-in: each is installed only when configured, or later when a config
+        // reload turns it on, through the same runtime. Once installed, the auth
+        // path, the dispatcher and the transport ACL reach them via
+        // crate::security::auto_ban() / security_filter(). trusted_cidrs (the
+        // shared list) are exempt from both.
+        security_runtime.apply_auto_ban(
+            config
+                .security
+                .as_ref()
+                .and_then(|security| security.failed_auth_ban.as_ref())
+                .map(crate::security::BanPolicy::from_config),
+        );
+        security_runtime.apply_filter(config.security.as_ref());
 
         // --- Transport channels ---
         let (inbound_tx, inbound_rx) = flume::unbounded();
@@ -2511,6 +2446,18 @@ impl SiphonServer {
         let drain = Arc::new(dispatcher::DrainState::new());
 
         // --- HTTP admin API (health/readiness probes + registration inspection) ---
+        let config_reloader = config_document.map(|(path, document)| {
+            Arc::new(config_reload::ConfigReloader::new(
+                path.into(),
+                document,
+                config_reload::ReloadTargets::new(
+                    Arc::clone(&identity),
+                    product_name,
+                    product_version,
+                )
+                .with_security(Arc::clone(&security_runtime)),
+            ))
+        });
         admin_start::start_admin_api(
             &config,
             &drain,

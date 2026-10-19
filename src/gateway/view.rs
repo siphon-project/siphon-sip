@@ -233,6 +233,12 @@ impl GatewayView {
         true
     }
 
+    /// Listeners subscribed. Test-only: a reload must never add one.
+    #[cfg(test)]
+    pub(crate) fn listener_count(&self) -> usize {
+        self.lock_listeners().len()
+    }
+
     fn lock_listeners(&self) -> std::sync::MutexGuard<'_, Vec<ViewListener>> {
         self.listeners
             .lock()

@@ -548,6 +548,41 @@ fn bench_build_response(criterion: &mut Criterion) {
     group.finish();
 }
 
+/// The request filter every inbound request passes through when `rate_limit`
+/// or `scanner_block` is configured: one load of the reloadable policy, the
+/// trusted-list check, the scanner match and the rate-limit window.
+///
+/// `untrusted_counted` is the common case (a source under the limit, its
+/// window bumped); `trusted` returns at the trusted-list check;
+/// `scanner_user_agent` matches a signature.
+fn bench_security_filter(criterion: &mut Criterion) {
+    use siphon::config::SecurityConfig;
+    use siphon::security::SecurityFilter;
+    use std::net::IpAddr;
+
+    let config: SecurityConfig = siphon::config::yaml::from_str(concat!(
+        "trusted_cidrs: [\"198.51.100.0/24\", \"192.0.2.7\"]\n",
+        "rate_limit: { window_secs: 60, max_requests: 4000000000, ban_duration_secs: 600 }\n",
+        "scanner_block: { user_agents: [\"friendly-scanner\", \"sipvicious\"] }\n",
+    ))
+    .expect("the fixture parses");
+    let filter = SecurityFilter::from_config(&config).expect("the filter is on");
+    let untrusted: IpAddr = "203.0.113.9".parse().expect("an address");
+    let trusted: IpAddr = "198.51.100.20".parse().expect("an address");
+
+    let mut group = criterion.benchmark_group("security_filter");
+    group.bench_function("untrusted_counted", |bencher| {
+        bencher.iter(|| filter.evaluate(black_box(untrusted), black_box(Some("SIPhon/1.0"))));
+    });
+    group.bench_function("trusted", |bencher| {
+        bencher.iter(|| filter.evaluate(black_box(trusted), black_box(Some("SIPhon/1.0"))));
+    });
+    group.bench_function("scanner_user_agent", |bencher| {
+        bencher.iter(|| filter.evaluate(black_box(untrusted), black_box(Some("friendly-scanner"))));
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_parse,
@@ -562,6 +597,7 @@ criterion_group!(
     bench_framing,
     bench_traffic_counters,
     bench_source_trust,
-    bench_build_response
+    bench_build_response,
+    bench_security_filter
 );
 criterion_main!(benches);

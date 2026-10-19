@@ -44,6 +44,21 @@ security:
                                 # policy. 0 = never expire.
 ```
 
+Each `trusted_cidrs` entry is a CIDR or a bare address (taken as a host route,
+`/32` or `/128`). An entry that is neither is skipped with a warning at start-up,
+not refused.
+
+`rate_limit`, `scanner_block`, `failed_auth_ban` and `trusted_cidrs` can be
+changed without a restart through `POST /admin/config/reload` (see
+[Monitoring](monitoring.md#reloading-the-config-file)). A new threshold applies
+from the next request or signal; bans in force keep their expiry. Removing a
+section turns that control off and lifts its bans, kernel elements included.
+A source added to `trusted_cidrs` has every ban held against it lifted
+(auto-ban, rate limit, APIBAN, in the kernel too) and the gateway allow set is
+republished; one taken off is counted again from zero. The rest of `security:`
+(`firewall`, `trust_gateways`, `max_message_bytes`, `connection_limits`,
+`apiban`) needs a restart.
+
 `trusted_cidrs` covers the feed too: an address listed by APIBAN that matches a
 trusted CIDR is dropped as the feed is ingested, so it reaches neither the
 userspace ACL nor the kernel set. Put your own trunks, monitoring and management
