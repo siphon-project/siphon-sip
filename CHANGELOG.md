@@ -453,6 +453,21 @@ entry, but a working config keeps working.
   itself, or one a controller bridged, is not shown. Mirrored in the SDK mock,
   with `SipTestHarness.send_reoffer()` and `send_reoffer_answered()`.
 
+- **Dial a callee after siphon's own early media.** A script that answered the
+  caller in its own 183 with the media engine's answer (an announcement) and
+  then called `call.dial()` sent the callee the caller's own offer and relayed
+  the callee's answer to a caller that already held one, which a compliant
+  caller ignores (RFC 3261 §13.2.1), so the callee was not heard. The callee is
+  now offered a far leg the engine binds behind the caller's answer
+  (siphon-rtp `offer_far`), its first SDP completes it, and every SDP the
+  caller is sent afterwards is the answer it already has, byte for byte. A
+  refused or unanswered dial gives the far leg back before `@b2bua.on_failure`
+  runs, so the handler can play another prompt or dial someone else; a
+  sequential `call.route()` and the control plane's `dial` work the same way.
+  `call.progress()` gains `anchor=`, `profile=` and `ws_uri=`, the script twin
+  of the control plane's anchored `progress`. A parallel `call.fork()` there,
+  and a dial behind an early answer that is not the engine's, raise
+  `ValueError`. Needs siphon-rtp 0.15.0 or later.
 - **`headers=` on `call.progress()`, `call.answer()` and `call.reject()`.** A
   response siphon sends the caller itself could carry only a body: an
   announcement server had no way to put `P-Early-Media` (RFC 5009) on the 183

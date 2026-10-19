@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  The busy callee of a dial behind siphon's own early answer.
+
+  INVITE (the engine's far-leg offer) -> 486 -> ACK
+
+  Pair with b2bua_early_dial_busy_uac.xml.
+-->
+<scenario name="B2BUA dial behind siphon's own early answer, busy callee, UAS">
+
+  <recv request="INVITE" crlf="true">
+    <action>
+      <ereg regexp="c=IN IP4 172\.20\.0\.130" search_in="body"
+            check_it="true" assign_to="junk" />
+      <ereg regexp="IN IP4 172\.20\.0\.6" search_in="body"
+            check_it_inverse="true" assign_to="junk" />
+    </action>
+  </recv>
+
+  <send>
+    <![CDATA[
+SIP/2.0 486 Busy Here
+[last_Via:]
+[last_From:]
+[last_To:];tag=[pid]SIPpTag01[call_number]
+[last_Call-ID:]
+[last_CSeq:]
+Content-Length: 0
+
+]]>
+  </send>
+
+  <recv request="ACK" crlf="true" />
+
+</scenario>

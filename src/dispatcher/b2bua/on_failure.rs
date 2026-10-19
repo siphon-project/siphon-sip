@@ -260,6 +260,10 @@ pub fn conclude_failed_call(call_id: &str, end: FailedCallEnd<'_>, state: &Dispa
         }
     };
     let (status_code, reason) = end.status_and_reason();
+    // The dial is over without the caller connected: a far leg grown behind its
+    // early answer goes, so `@b2bua.on_failure` finds the caller on the engine's
+    // pipeline again, ready for another prompt or another dial.
+    super::release_far_leg_of(state, call_id);
     // The best failure a dialled leg sent, shown only when it is what the
     // caller's status came from: the status itself, or the 500 a 503 becomes
     // upstream (RFC 3261 §16.7 step 6). A ring timeout, a carrier siphon could

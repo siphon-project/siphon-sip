@@ -53,6 +53,20 @@ pub fn b_leg_answered(
             b2bua_fail_after_answer(call_id, &error, &snapshot.branch, message, state);
             return;
         }
+        // Behind siphon's own early answer, the callee's SDP completes the far
+        // leg unless an early one already did. A codec the engine's offer did not
+        // list cannot be connected: the callee is released and the call fails
+        // `488` (RFC 3264 §6.1).
+        let behind_early_answer = snapshot
+            .a_leg_invite
+            .as_ref()
+            .and_then(|invite_arc| invite_arc.lock().ok().map(|guard| guard.clone()))
+            .map(|invite| super::super::complete_far_leg(state, call_id, &invite, message));
+        if let Some(Err(error)) = behind_early_answer {
+            error!(%call_id, %error, "B2BUA: the callee's answer cannot be connected behind the caller's early answer");
+            b2bua_fail_after_answer_with(call_id, &error, &snapshot.branch, message, 488, state);
+            return;
+        }
 
         // CDR: stamp the answer time (cdr.auto_emit).
         // A controller-issued `dial` is decided the moment somebody answers:
@@ -930,7 +944,10 @@ pub fn prepare_a_leg_answer(
     // stable session-id; a later re-anchor (transfer, hold) then presents a
     // strictly greater version under the same session-id. An answer the caller
     // was previewed stays the session the preview named.
-    if !response.body.is_empty() {
+    // Behind siphon's own early answer the caller's 2xx repeats that answer
+    // byte for byte, its `o=` included (RFC 6337 §3.1.1).
+    let held = super::super::present_held_answer(state, call_id, response, true);
+    if !held && !response.body.is_empty() {
         let origin = origin_after_preview(call_id, response, state, snapshot)
             .or_else(|| state.call_actors.reserve_leg_sdp_version(call_id, true));
         if let Some((sess_id, version)) = origin {
@@ -944,7 +961,9 @@ pub fn prepare_a_leg_answer(
     // `media.sdp_strip_attributes`, last: after `@b2bua.on_answer` had the media
     // engine answer and after the o= stamp. The A-leg 2xx retransmit is cloned
     // from this message.
-    strip_relayed_sdp_attributes(response, state);
+    if !held {
+        strip_relayed_sdp_attributes(response, state);
+    }
     // The answer as the caller receives it is the session description in force on
     // the caller's dialog. A 2xx with no SDP leaves in force the answer the caller
     // had in this leg's early media.
