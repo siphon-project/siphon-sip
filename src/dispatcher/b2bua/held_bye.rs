@@ -300,7 +300,13 @@ pub fn answer_caller_bye_for_held_dialog(
         call_id = %held.internal_call_id,
         "B2BUA: the peer hung up before its held BYE went out; answered, and the held BYE dropped"
     );
-    let response = build_response(message, 200, "OK", state.server_header.as_deref(), &[]);
+    let response = build_response(
+        message,
+        200,
+        "OK",
+        state.identity.load().server.as_deref(),
+        &[],
+    );
     send_message_from(
         response,
         inbound.transport,

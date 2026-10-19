@@ -441,7 +441,7 @@ pub fn handle_b2bua_prack(inbound: InboundMessage, message: SipMessage, state: &
             &message,
             status_code,
             reason,
-            state.server_header.as_deref(),
+            state.identity.load().server.as_deref(),
             &[],
         )
     };
@@ -761,7 +761,13 @@ pub fn answer_prack_of_tracked_provisional(
         call_id = %key.0, rseq = rack.response_number,
         "PRACK matches our reliable 1xx — cancelling retransmits and sending 200 OK"
     );
-    let response = build_response(message, 200, "OK", state.server_header.as_deref(), &[]);
+    let response = build_response(
+        message,
+        200,
+        "OK",
+        state.identity.load().server.as_deref(),
+        &[],
+    );
     send_message_from(
         response,
         inbound.transport,

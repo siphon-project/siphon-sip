@@ -118,7 +118,7 @@ fn send_refusal(
         message,
         answer.reject_code,
         best_error_reason(answer.reject_code),
-        state.server_header.as_deref(),
+        state.identity.load().server.as_deref(),
         &[],
     );
     if answer.retry_after_secs > 0 {

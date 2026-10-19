@@ -584,11 +584,12 @@ pub fn b2bua_dial_b_leg(
     // INVITE construction — Authorization strip + User-Agent/PAI rewrite).
     {
         let policy = state.resolve_header_policy(call_id);
+        let identity = state.identity.load();
         let ctx = crate::b2bua::header_policy::PolicyContext {
             b2bua_host: &b_contact_host,
             b2bua_port: b_contact_port,
-            user_agent_header: state.user_agent_header.as_deref(),
-            server_header: state.server_header.as_deref(),
+            user_agent_header: identity.user_agent.as_deref(),
+            server_header: identity.server.as_deref(),
         };
         // A header the script set or removed on the A-leg INVITE is precedence 1:
         // the policy leaves it as the script left it. The framework-managed

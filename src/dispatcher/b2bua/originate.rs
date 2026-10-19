@@ -337,6 +337,7 @@ pub fn prepare_originate_routed(
         None,
         None,
     );
+    let identity = state.identity.load();
     let mut invite = build_originate_invite(
         &params,
         target_uri,
@@ -348,10 +349,10 @@ pub fn prepare_originate_routed(
             via_port,
             transport,
             contact: &contact,
-            user_agent: state
-                .user_agent_header
+            user_agent: identity
+                .user_agent
                 .as_deref()
-                .or(state.server_header.as_deref()),
+                .or(identity.server.as_deref()),
         },
         session_timer_policy_for(state, params.session_timer.as_ref()),
     )?;

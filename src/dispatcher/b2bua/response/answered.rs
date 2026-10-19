@@ -624,7 +624,7 @@ pub fn start_li_recording(
                     callee_sdp.as_deref(),
                     Some(&a_sip_call_id),
                     tags_ref,
-                    state.user_agent_header.as_deref(),
+                    state.identity.load().user_agent.as_deref(),
                 )
             {
                 let data = Bytes::from(rec_invite.to_bytes());

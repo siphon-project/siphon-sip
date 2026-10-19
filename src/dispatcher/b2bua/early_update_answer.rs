@@ -228,7 +228,7 @@ pub fn answer_callee_early_update(
             message,
             481,
             "Call/Transaction Does Not Exist",
-            state.server_header.as_deref(),
+            state.identity.load().server.as_deref(),
             &[],
         );
         send_message_from(
@@ -247,7 +247,13 @@ pub fn answer_callee_early_update(
         "B2BUA UPDATE on the early dialog answered for the caller, which takes the answer to \
          its INVITE in the 2xx (RFC 3311 §5.1, RFC 3261 §13.2.1)"
     );
-    let mut response = build_response(message, 200, "OK", state.server_header.as_deref(), &[]);
+    let mut response = build_response(
+        message,
+        200,
+        "OK",
+        state.identity.load().server.as_deref(),
+        &[],
+    );
     // A target refresh request is answered with siphon's own target on the
     // dialog (RFC 3311 §5.2, RFC 3261 §12.2.2).
     if let Some(contact) = local_contact {

@@ -25,7 +25,7 @@ pub fn handle_b2bua_reinvite(
                 &message,
                 481,
                 "Call/Transaction Does Not Exist",
-                state.server_header.as_deref(),
+                state.identity.load().server.as_deref(),
                 &[],
             );
             send_message_from(
@@ -58,7 +58,7 @@ pub fn handle_b2bua_reinvite(
                 &message,
                 481,
                 "Call/Transaction Does Not Exist",
-                state.server_header.as_deref(),
+                state.identity.load().server.as_deref(),
                 &[],
             );
             send_message_from(
@@ -222,7 +222,7 @@ pub fn handle_b2bua_reinvite(
             &message,
             491,
             "Request Pending",
-            state.server_header.as_deref(),
+            state.identity.load().server.as_deref(),
             &[],
         );
         send_message_from(
@@ -254,7 +254,7 @@ pub fn handle_b2bua_reinvite(
             &message,
             491,
             "Request Pending",
-            state.server_header.as_deref(),
+            state.identity.load().server.as_deref(),
             &[],
         );
         send_message_from(
@@ -275,7 +275,13 @@ pub fn handle_b2bua_reinvite(
     );
 
     // Send 100 Trying to the re-INVITE sender
-    let trying = build_response(&message, 100, "Trying", state.server_header.as_deref(), &[]);
+    let trying = build_response(
+        &message,
+        100,
+        "Trying",
+        state.identity.load().server.as_deref(),
+        &[],
+    );
     // Answer on the same listener the request arrived on so a multi-homed UDP
     // host keeps a symmetric source port (a peer that sent to :5066 rejects a
     // reply sourced from :5060). No-op for stream transports / single listener.
@@ -356,7 +362,7 @@ pub fn handle_b2bua_reinvite(
                 &message,
                 500,
                 "Server Internal Error",
-                state.server_header.as_deref(),
+                state.identity.load().server.as_deref(),
                 &[],
             );
             send_message_from(
@@ -421,8 +427,8 @@ pub fn handle_b2bua_reinvite(
 
         // Sanitize: strip headers that leak the other leg's identity/capabilities.
         // A B2BUA terminates the dialog — no cross-leg headers should pass through.
-        if let Some(ref ua) = state.user_agent_header {
-            forwarded.headers.set("User-Agent", ua.clone());
+        if let Some(ref user_agent) = state.identity.load().user_agent {
+            forwarded.headers.set("User-Agent", user_agent.clone());
         } else {
             forwarded.headers.remove("User-Agent");
         }
@@ -878,7 +884,13 @@ pub fn send_one_legged_ok(
     body: Vec<u8>,
     state: &DispatcherState,
 ) {
-    let mut response = build_response(message, 200, "OK", state.server_header.as_deref(), &[]);
+    let mut response = build_response(
+        message,
+        200,
+        "OK",
+        state.identity.load().server.as_deref(),
+        &[],
+    );
     // A 2xx to a target refresh request carries siphon's Contact on the dialog
     // it arrived on (RFC 3261 §12.2.2, §13.3.1.4; RFC 3311 §5.2). Every caller
     // here answers a leg's A-side dialog.

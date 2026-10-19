@@ -80,11 +80,69 @@ admin:
 | `POST /admin/gateways/{group}/{destination}/{up\|down}` | mark a gateway destination up/down (drain / restore a carrier) |
 | `POST /admin/registrants/refresh` | re-read a `registrant.backend: database` / `http` source and reconcile now |
 | `POST /admin/gateways/refresh` | re-read a `gateway.backend: database` / `http` source and reconcile now |
+| `POST /admin/config/reload` | re-read the `--config` file and apply what can change at runtime (see below) |
 | `GET /admin/calls` | active B2BUA calls (Call-ID, state, caller, callee, B-legs) |
 | `GET /admin/metrics.json` | curated JSON snapshot of the live gauges + counters |
 
 Point Kubernetes liveness at `/admin/health` and readiness at `/admin/ready` so a
 draining pod leaves rotation cleanly — see [Deployment & operations](../deployment.md).
+
+### Reloading the config file
+
+`POST /admin/config/reload` reads the file siphon was started with
+(`--config`) again, validates it exactly as startup does, and applies the
+fields that can change without a restart. Listeners, dialogs and transactions
+are left alone. It is not tied to `SIGHUP`, which reloads the script only.
+
+Applied at runtime today: `server.server_header` and
+`server.user_agent_header`. The next response siphon builds carries the new
+`Server`, and the next request it originates (UAC probes, outbound
+REGISTERs, B2BUA legs) the new `User-Agent`. Removing the key puts the
+product default back. Every other change is reported as needing a restart
+and keeps being reported on each reload until the process restarts with it.
+`advertised_address` is one of these on purpose: moving it under live calls
+would change the address dialogs already in progress were set up on.
+
+The comparison is between the YAML documents (after `${VAR}` expansion), so
+comments, whitespace and key order are never changes. `server` and `security`
+are compared key by key, every other top-level key as a whole.
+
+```bash
+curl -s -X POST -H "Authorization: Bearer $ADMIN_TOKEN" \
+  http://127.0.0.1:9091/admin/config/reload
+```
+
+```json
+{
+  "sections": {
+    "advertised_address": { "status": "restart_required", "applied": [], "restart_required": ["advertised_address"] },
+    "listen": { "status": "unchanged", "applied": [], "restart_required": [] },
+    "server": { "status": "applied", "applied": ["server.server_header"], "restart_required": [] }
+  },
+  "applied": ["server.server_header"],
+  "restart_required": ["advertised_address"],
+  "warnings": []
+}
+```
+
+Every top-level key of the old or the new file appears under `sections`
+(keys siphon does not read included, so a misspelt section shows up), each
+with the same three fields. `status` is `unchanged`, `applied` (everything
+that changed in it took effect) or `restart_required` (at least one change in
+it waits for a restart; the ones that could be applied still were, and are
+listed under `applied`). The top-level `applied` and `restart_required` lists
+gather the dotted paths across sections. `warnings` is reserved for notices
+that did not stop the reload and is empty today.
+
+| Status | When |
+|---|---|
+| `200` | the file validated; the report above |
+| `422` | the file could not be read, does not parse, or fails validation: `{"error": "...", "detail": "nothing was changed"}`. Nothing was applied, and the next reload still compares against what the node is running |
+| `501` | the node was started from a config string, so there is no file |
+| `401` | a token is configured and was not presented |
+
+Reloads run one at a time. A reload either applies every runtime change in
+the file or none of them.
 
 ### Bearer-token auth
 

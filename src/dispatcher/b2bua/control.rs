@@ -415,7 +415,7 @@ pub fn send_uas_response(
         invite,
         code,
         reason,
-        state.server_header.as_deref(),
+        state.identity.load().server.as_deref(),
         &reply_headers,
     );
 

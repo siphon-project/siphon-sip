@@ -97,6 +97,54 @@ fn default_auto_options() -> bool {
     true
 }
 
+/// The `Server` and `User-Agent` values siphon stamps on what it generates,
+/// resolved from `server.server_header` / `server.user_agent_header` with the
+/// product default (`"{product_name}/{product_version}"`) for an unset key.
+///
+/// One instance is shared, behind [`SharedIdentityHeaders`], by the dispatcher
+/// (locally built responses, B2BUA legs), the UAC sender and the registrant, so
+/// `POST /admin/config/reload` swaps it once and every one of them sees the new
+/// value on its next message.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct IdentityHeaders {
+    /// `Server` on locally generated responses. `None` sends none.
+    pub server: Option<String>,
+    /// `User-Agent` on locally originated requests. `None` sends none.
+    pub user_agent: Option<String>,
+}
+
+/// The live identity headers. A read is one `ArcSwap::load`, no lock.
+pub type SharedIdentityHeaders = std::sync::Arc<arc_swap::ArcSwap<IdentityHeaders>>;
+
+impl IdentityHeaders {
+    /// Resolve both values from the `server:` section, falling back to the
+    /// product default for a key that is not set.
+    pub fn resolve(
+        server: Option<&ServerIdentityConfig>,
+        product_name: &str,
+        product_version: &str,
+    ) -> Self {
+        let default = || format!("{product_name}/{product_version}");
+        Self {
+            server: Some(
+                server
+                    .and_then(|server| server.server_header.clone())
+                    .unwrap_or_else(default),
+            ),
+            user_agent: Some(
+                server
+                    .and_then(|server| server.user_agent_header.clone())
+                    .unwrap_or_else(default),
+            ),
+        }
+    }
+
+    /// Wrap these values for sharing.
+    pub fn shared(self) -> SharedIdentityHeaders {
+        std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(self))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Transaction layer timers
 // ---------------------------------------------------------------------------

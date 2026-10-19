@@ -501,6 +501,47 @@ fn bench_source_trust(criterion: &mut Criterion) {
     group.finish();
 }
 
+/// A locally built response stamping `Server`, the per-message read
+/// `POST /admin/config/reload` made swappable.
+///
+/// `server_header_owned` reads the value the way the dispatcher did before it
+/// was reloadable (an `Option<String>` fixed at startup); `server_header_arcswap`
+/// reads it through the shared `ArcSwap` it now lives in. The gap between the
+/// two is the whole per-message cost of making the header reloadable.
+fn bench_build_response(criterion: &mut Criterion) {
+    use siphon::config::IdentityHeaders;
+    use siphon::sip::builder::build_response_skeleton;
+
+    let (_, invite) = parse_sip_message(&invite_with_sdp()).expect("the fixture parses");
+    let owned: Option<String> = Some("SIPhon/1.0".to_string());
+    let identity = IdentityHeaders {
+        server: Some("SIPhon/1.0".to_string()),
+        user_agent: None,
+    }
+    .shared();
+
+    let mut group = criterion.benchmark_group("build_response");
+    group.bench_function("server_header_owned", |bencher| {
+        bencher.iter(|| {
+            let mut response = build_response_skeleton(black_box(&invite), 200, "OK");
+            if let Some(server) = black_box(&owned).as_deref() {
+                response.headers.set("Server", server.to_string());
+            }
+            response
+        });
+    });
+    group.bench_function("server_header_arcswap", |bencher| {
+        bencher.iter(|| {
+            let mut response = build_response_skeleton(black_box(&invite), 200, "OK");
+            if let Some(server) = black_box(&identity).load().server.as_deref() {
+                response.headers.set("Server", server.to_string());
+            }
+            response
+        });
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_parse,
@@ -514,6 +555,7 @@ criterion_group!(
     bench_txn_key,
     bench_framing,
     bench_traffic_counters,
-    bench_source_trust
+    bench_source_trust,
+    bench_build_response
 );
 criterion_main!(benches);

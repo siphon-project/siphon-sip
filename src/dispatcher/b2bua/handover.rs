@@ -49,7 +49,13 @@ pub fn control_handover(
     } = params;
 
     let reject_and_drop = |code: u16, reason: &str| {
-        let response = build_response(invite, code, reason, state.server_header.as_deref(), &[]);
+        let response = build_response(
+            invite,
+            code,
+            reason,
+            state.identity.load().server.as_deref(),
+            &[],
+        );
         send_message_from(
             response,
             inbound.transport,

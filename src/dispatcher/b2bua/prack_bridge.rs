@@ -608,7 +608,7 @@ pub fn handle_callee_prack_response(
                 &pending.caller_prack,
                 200,
                 "OK",
-                state.server_header.as_deref(),
+                state.identity.load().server.as_deref(),
                 &[],
             );
             set_sdp_body(&mut ok, answer, &content_type);
@@ -707,7 +707,7 @@ fn answer_caller_prack_rejecting(pending: &PendingPrackOffer, state: &Dispatcher
         &pending.caller_prack,
         200,
         "OK",
-        state.server_header.as_deref(),
+        state.identity.load().server.as_deref(),
         &[],
     );
     set_sdp_body(&mut ok, rejecting_answer(&pending.offer), "application/sdp");

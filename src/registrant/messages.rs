@@ -58,7 +58,7 @@ impl RegistrantManager {
             .max_forwards(70)
             .content_length(0);
 
-        if let Some(ref user_agent) = self.user_agent_header {
+        if let Some(ref user_agent) = self.identity.load().user_agent {
             builder = builder.header("User-Agent", user_agent.clone());
         }
 
@@ -212,7 +212,7 @@ impl RegistrantManager {
             .max_forwards(70)
             .content_length(0);
 
-        if let Some(ref user_agent) = self.user_agent_header {
+        if let Some(ref user_agent) = self.identity.load().user_agent {
             builder = builder.header("User-Agent", user_agent.clone());
         }
 
@@ -345,7 +345,7 @@ impl RegistrantManager {
             .max_forwards(70)
             .content_length(0);
 
-        if let Some(ref user_agent) = self.user_agent_header {
+        if let Some(ref user_agent) = self.identity.load().user_agent {
             builder = builder.header("User-Agent", user_agent.clone());
         }
 

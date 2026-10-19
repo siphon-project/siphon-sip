@@ -200,7 +200,7 @@ pub(super) fn run_proxy_failure_handlers(
                 &request,
                 *code,
                 reason,
-                state.server_header.as_deref(),
+                state.identity.load().server.as_deref(),
                 &reply_headers,
             );
             if let Some((body, content_type)) = &reply_body {
@@ -471,7 +471,7 @@ pub(super) fn fail_branch_locally(
         &original_request,
         status_code,
         reason,
-        state.server_header.as_deref(),
+        state.identity.load().server.as_deref(),
         &[],
     );
 

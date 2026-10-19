@@ -1,0 +1,585 @@
+//! Tests for the config reloader: the diff, the all-or-nothing apply, the
+//! baseline that moves only for applied fields, serialisation, and the
+//! steady-state leak gate.
+
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+
+use super::*;
+use crate::registrant::{RegistrantCredentials, RegistrantEntry, RegistrantManager};
+use crate::sip::uri::SipUri;
+use crate::transport::{OutboundRouter, Transport};
+
+const PRODUCT_NAME: &str = "SIPhon";
+const PRODUCT_VERSION: &str = "9.9.9";
+
+/// A config file with `server:` set to `server_block` (indented two spaces,
+/// one key per line) and `extra` appended at the top level.
+fn document(server_block: &str, extra: &str) -> String {
+    format!(
+        concat!(
+            "# a node config\n",
+            "listen:\n",
+            "  udp: [\"0.0.0.0:5060\"]\n",
+            "domain:\n",
+            "  local: [\"example.com\"]\n",
+            "server:\n",
+            "{server}",
+            "{extra}",
+        ),
+        server = server_block,
+        extra = extra,
+    )
+}
+
+const SERVER_A: &str = concat!(
+    "  server_header: \"edge-a\"\n",
+    "  user_agent_header: \"edge-a-agent\"\n",
+    "  drain_secs: 10\n",
+);
+
+const SERVER_B: &str = concat!(
+    "  server_header: \"edge-b\"\n",
+    "  user_agent_header: \"edge-b-agent\"\n",
+    "  drain_secs: 10\n",
+);
+
+struct Fixture {
+    _directory: tempfile::TempDir,
+    path: PathBuf,
+    identity: SharedIdentityHeaders,
+    reloader: Arc<ConfigReloader>,
+}
+
+impl Fixture {
+    /// A reloader over a file holding `text`, its baseline and identity taken
+    /// from that file the way startup takes them.
+    fn new(text: &str) -> Self {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let path = directory.path().join("siphon.yaml");
+        std::fs::write(&path, text).expect("write the config");
+        let (config, baseline) = Config::load_with_document(&path).expect("the config loads");
+        let identity =
+            IdentityHeaders::resolve(config.server.as_ref(), PRODUCT_NAME, PRODUCT_VERSION)
+                .shared();
+        let reloader = Arc::new(ConfigReloader::new(
+            path.clone(),
+            baseline,
+            ReloadTargets::new(Arc::clone(&identity), PRODUCT_NAME, PRODUCT_VERSION),
+        ));
+        Self {
+            _directory: directory,
+            path,
+            identity,
+            reloader,
+        }
+    }
+
+    fn rewrite(&self, text: &str) {
+        std::fs::write(&self.path, text).expect("rewrite the config");
+    }
+
+    fn server(&self) -> Option<String> {
+        self.identity.load().server.clone()
+    }
+
+    fn user_agent(&self) -> Option<String> {
+        self.identity.load().user_agent.clone()
+    }
+}
+
+fn status(report: &ReloadReport, section: &str) -> SectionStatus {
+    report
+        .sections
+        .get(section)
+        .unwrap_or_else(|| panic!("no {section} in {report:?}"))
+        .status
+}
+
+#[tokio::test]
+async fn an_untouched_file_reports_every_section_unchanged() {
+    let fixture = Fixture::new(&document(SERVER_A, ""));
+    let report = fixture
+        .reloader
+        .reload()
+        .await
+        .expect("the reload validates");
+    let names: Vec<&str> = report.sections.keys().map(String::as_str).collect();
+    assert_eq!(names, ["domain", "listen", "server"]);
+    assert!(report
+        .sections
+        .values()
+        .all(|section| section.status == SectionStatus::Unchanged));
+    assert!(report.applied.is_empty());
+    assert!(report.restart_required.is_empty());
+}
+
+/// A comment, whitespace, key order and flow-vs-block style are not changes.
+#[tokio::test]
+async fn comment_whitespace_and_reorder_edits_change_nothing() {
+    let fixture = Fixture::new(&document(SERVER_A, ""));
+    fixture.rewrite(concat!(
+        "# rewritten by hand\n",
+        "server:\n",
+        "  drain_secs: 10      # seconds\n",
+        "  user_agent_header: \"edge-a-agent\"\n",
+        "\n",
+        "  server_header: edge-a\n",
+        "domain: { local: [ \"example.com\" ] }\n",
+        "listen:\n",
+        "  udp:\n",
+        "    - \"0.0.0.0:5060\"\n",
+    ));
+    let report = fixture
+        .reloader
+        .reload()
+        .await
+        .expect("the reload validates");
+    assert!(
+        report
+            .sections
+            .values()
+            .all(|section| section.status == SectionStatus::Unchanged),
+        "{report:?}"
+    );
+    assert_eq!(fixture.server().as_deref(), Some("edge-a"));
+}
+
+#[tokio::test]
+async fn a_server_header_change_is_applied() {
+    let fixture = Fixture::new(&document(SERVER_A, ""));
+    fixture.rewrite(&document(SERVER_B, ""));
+    let report = fixture
+        .reloader
+        .reload()
+        .await
+        .expect("the reload validates");
+    assert_eq!(status(&report, "server"), SectionStatus::Applied);
+    assert_eq!(
+        report.sections["server"].applied,
+        ["server.server_header", "server.user_agent_header"]
+    );
+    assert_eq!(report.applied, report.sections["server"].applied);
+    assert!(report.restart_required.is_empty());
+    assert_eq!(fixture.server().as_deref(), Some("edge-b"));
+    assert_eq!(fixture.user_agent().as_deref(), Some("edge-b-agent"));
+
+    // The baseline moved with it: the same file again is unchanged.
+    let report = fixture
+        .reloader
+        .reload()
+        .await
+        .expect("the reload validates");
+    assert_eq!(status(&report, "server"), SectionStatus::Unchanged);
+}
+
+/// Taking the key out restores what an unset key means at startup.
+#[tokio::test]
+async fn removing_the_key_reverts_to_the_product_default() {
+    let fixture = Fixture::new(&document(SERVER_A, ""));
+    fixture.rewrite(&document("  drain_secs: 10\n", ""));
+    let report = fixture
+        .reloader
+        .reload()
+        .await
+        .expect("the reload validates");
+    assert_eq!(status(&report, "server"), SectionStatus::Applied);
+    assert_eq!(fixture.server().as_deref(), Some("SIPhon/9.9.9"));
+    assert_eq!(fixture.user_agent().as_deref(), Some("SIPhon/9.9.9"));
+
+    // Gone from the baseline too, so the next reload is quiet.
+    let report = fixture
+        .reloader
+        .reload()
+        .await
+        .expect("the reload validates");
+    assert_eq!(status(&report, "server"), SectionStatus::Unchanged);
+
+    // And the whole section going is the same as its keys going.
+    fixture.rewrite(&document("  drain_secs: 10\n", "").replace("server:\n  drain_secs: 10\n", ""));
+    let report = fixture
+        .reloader
+        .reload()
+        .await
+        .expect("the reload validates");
+    assert_eq!(status(&report, "server"), SectionStatus::RestartRequired);
+    assert_eq!(report.restart_required, ["server.drain_secs"]);
+}
+
+#[tokio::test]
+async fn a_file_that_does_not_parse_changes_nothing() {
+    let fixture = Fixture::new(&document(SERVER_A, ""));
+    fixture.rewrite("server: [unterminated\n");
+    let error = fixture.reloader.reload().await.expect_err("refused");
+    assert!(matches!(error, ConfigReloadError::Invalid(_)), "{error}");
+    assert_eq!(fixture.server().as_deref(), Some("edge-a"));
+
+    // A valid file afterwards diffs against the document the node started on.
+    fixture.rewrite(&document(SERVER_B, ""));
+    let report = fixture
+        .reloader
+        .reload()
+        .await
+        .expect("the reload validates");
+    assert_eq!(status(&report, "server"), SectionStatus::Applied);
+    assert_eq!(fixture.server().as_deref(), Some("edge-b"));
+}
+
+#[tokio::test]
+async fn a_missing_file_changes_nothing() {
+    let fixture = Fixture::new(&document(SERVER_A, ""));
+    std::fs::remove_file(&fixture.path).expect("remove the config");
+    let error = fixture.reloader.reload().await.expect_err("refused");
+    assert!(matches!(error, ConfigReloadError::Invalid(_)), "{error}");
+    assert_eq!(fixture.server().as_deref(), Some("edge-a"));
+}
+
+/// A validator refusing another section stops the header change with it.
+#[tokio::test]
+async fn a_validator_failure_beside_a_header_change_changes_nothing() {
+    let fixture = Fixture::new(&document(SERVER_A, ""));
+    fixture.rewrite(&document(
+        SERVER_B,
+        "advertised_address: \"198.51.100.7:5070\"\n",
+    ));
+    let error = fixture.reloader.reload().await.expect_err("refused");
+    assert!(error.to_string().contains("advertised_address"), "{error}");
+    assert_eq!(fixture.server().as_deref(), Some("edge-a"));
+    assert_eq!(fixture.user_agent().as_deref(), Some("edge-a-agent"));
+
+    // The baseline did not move: a valid file still sees the header change.
+    fixture.rewrite(&document(SERVER_B, ""));
+    let report = fixture
+        .reloader
+        .reload()
+        .await
+        .expect("the reload validates");
+    assert_eq!(
+        report.sections["server"].applied,
+        ["server.server_header", "server.user_agent_header"]
+    );
+}
+
+/// Moving `advertised_address` would move dialogs already in progress, so it
+/// waits for a restart, and keeps saying so until one happens.
+#[tokio::test]
+async fn advertised_address_is_restart_required_until_a_restart() {
+    let fixture = Fixture::new(&document(SERVER_A, ""));
+    fixture.rewrite(&document(
+        SERVER_A,
+        "advertised_address: \"198.51.100.7\"\n",
+    ));
+    for _ in 0..2 {
+        let report = fixture
+            .reloader
+            .reload()
+            .await
+            .expect("the reload validates");
+        assert_eq!(
+            status(&report, "advertised_address"),
+            SectionStatus::RestartRequired
+        );
+        assert_eq!(report.restart_required, ["advertised_address"]);
+        assert_eq!(status(&report, "server"), SectionStatus::Unchanged);
+    }
+}
+
+/// A section holding a hot and a restart-only change applies the one and
+/// names the other.
+#[tokio::test]
+async fn a_mixed_server_section_applies_the_hot_field_and_names_the_other() {
+    let fixture = Fixture::new(&document(SERVER_A, ""));
+    fixture.rewrite(&document(
+        concat!(
+            "  server_header: \"edge-b\"\n",
+            "  user_agent_header: \"edge-a-agent\"\n",
+            "  drain_secs: 20\n",
+        ),
+        "",
+    ));
+    let report = fixture
+        .reloader
+        .reload()
+        .await
+        .expect("the reload validates");
+    let server = &report.sections["server"];
+    assert_eq!(server.status, SectionStatus::RestartRequired);
+    assert_eq!(server.applied, ["server.server_header"]);
+    assert_eq!(server.restart_required, ["server.drain_secs"]);
+    assert_eq!(fixture.server().as_deref(), Some("edge-b"));
+
+    // Only the applied field joined the baseline.
+    let report = fixture
+        .reloader
+        .reload()
+        .await
+        .expect("the reload validates");
+    let server = &report.sections["server"];
+    assert!(server.applied.is_empty());
+    assert_eq!(server.restart_required, ["server.drain_secs"]);
+}
+
+/// A key siphon does not read is still reported, so a typo is visible.
+#[tokio::test]
+async fn an_unknown_top_level_key_is_reported() {
+    let fixture = Fixture::new(&document(SERVER_A, ""));
+    fixture.rewrite(&document(SERVER_A, "sever:\n  server_header: \"edge-b\"\n"));
+    let report = fixture
+        .reloader
+        .reload()
+        .await
+        .expect("the reload validates");
+    assert_eq!(status(&report, "sever"), SectionStatus::RestartRequired);
+    assert_eq!(fixture.server().as_deref(), Some("edge-a"));
+}
+
+#[tokio::test]
+async fn the_report_serialises_to_the_documented_shape() {
+    let fixture = Fixture::new(&document(SERVER_A, ""));
+    fixture.rewrite(&document(
+        SERVER_A,
+        "advertised_address: \"198.51.100.7\"\n",
+    ));
+    let report = fixture
+        .reloader
+        .reload()
+        .await
+        .expect("the reload validates");
+    let json = serde_json::to_value(&report).expect("serialises");
+    assert_eq!(
+        json["sections"]["advertised_address"],
+        serde_json::json!({
+            "status": "restart_required",
+            "applied": [],
+            "restart_required": ["advertised_address"],
+        })
+    );
+    assert_eq!(
+        json["sections"]["listen"],
+        serde_json::json!({ "status": "unchanged", "applied": [], "restart_required": [] })
+    );
+    assert_eq!(json["applied"], serde_json::json!([]));
+    assert_eq!(
+        json["restart_required"],
+        serde_json::json!(["advertised_address"])
+    );
+    assert_eq!(json["warnings"], serde_json::json!([]));
+}
+
+/// Reloads run one at a time: of many racing over one change, exactly one
+/// applies it and every other one finds it already in the baseline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_reloads_serialise() {
+    let fixture = Fixture::new(&document(SERVER_A, ""));
+    fixture.rewrite(&document(SERVER_B, ""));
+
+    // Held, the lock keeps a reload from starting at all.
+    let held = fixture.reloader.baseline.lock().await;
+    let blocked = tokio::spawn({
+        let reloader = Arc::clone(&fixture.reloader);
+        async move { reloader.reload().await }
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(!blocked.is_finished());
+    assert_eq!(fixture.server().as_deref(), Some("edge-a"));
+    drop(held);
+    let first = blocked.await.expect("joins").expect("validates");
+    assert_eq!(status(&first, "server"), SectionStatus::Applied);
+
+    fixture.rewrite(&document(SERVER_A, ""));
+    let racers: Vec<_> = (0..16)
+        .map(|_| {
+            let reloader = Arc::clone(&fixture.reloader);
+            tokio::spawn(async move { reloader.reload().await })
+        })
+        .collect();
+    let mut applied = 0;
+    for racer in racers {
+        let report = racer.await.expect("joins").expect("validates");
+        if status(&report, "server") == SectionStatus::Applied {
+            applied += 1;
+        } else {
+            assert_eq!(status(&report, "server"), SectionStatus::Unchanged);
+        }
+    }
+    assert_eq!(applied, 1);
+    assert_eq!(fixture.server().as_deref(), Some("edge-a"));
+}
+
+/// The UAC sender and the registrant read the same shared value, so a reload
+/// reaches both on their next request.
+#[tokio::test]
+async fn uac_and_registrant_requests_carry_the_reloaded_user_agent() {
+    let fixture = Fixture::new(&document(SERVER_A, ""));
+    let (udp_sender, udp) = flume::unbounded();
+    let (stream_sender, _stream) = flume::unbounded();
+    let router = Arc::new(OutboundRouter {
+        udp: udp_sender.into(),
+        udp_by_local: std::collections::HashMap::new(),
+        tcp: stream_sender.clone(),
+        tls: stream_sender.clone(),
+        ws: stream_sender.clone(),
+        wss: stream_sender.clone(),
+        sctp: Some(stream_sender),
+    });
+    let uac = crate::uac::UacSender::new(
+        router,
+        "192.0.2.1:5060".parse().expect("an address"),
+        std::collections::HashMap::new(),
+        std::collections::HashMap::new(),
+        None,
+        None,
+        Arc::clone(&fixture.identity),
+    );
+    let registrant = RegistrantManager::new(
+        3600,
+        Duration::from_secs(60),
+        Duration::from_secs(300),
+        Arc::clone(&fixture.identity),
+    );
+    registrant.add(RegistrantEntry::new(
+        "sip:trunk@example.com".to_string(),
+        "sip:registrar.example.com".to_string(),
+        "198.51.100.20:5060".parse().expect("an address"),
+        Transport::Udp,
+        RegistrantCredentials::password("trunk".to_string(), "secret".to_string(), None),
+        3600,
+        None,
+    ));
+
+    let options_user_agent = || {
+        let _response = uac.send_options(
+            "198.51.100.10:5060".parse().expect("an address"),
+            Transport::Udp,
+            SipUri::new("198.51.100.10".to_string()),
+        );
+        let sent = udp.try_recv().expect("the OPTIONS went out");
+        crate::sip::parser::parse_sip_message_bytes(&sent.data)
+            .expect("parses")
+            .headers
+            .get("User-Agent")
+            .cloned()
+    };
+    let register_user_agent = || {
+        let (register, _, _, _) = registrant
+            .build_register(
+                "sip:trunk@example.com",
+                "192.0.2.1:5060".parse().expect("an address"),
+                &std::collections::HashMap::new(),
+                3600,
+            )
+            .expect("a REGISTER");
+        register.headers.get("User-Agent").cloned()
+    };
+
+    assert_eq!(options_user_agent().as_deref(), Some("edge-a-agent"));
+    assert_eq!(register_user_agent().as_deref(), Some("edge-a-agent"));
+
+    fixture.rewrite(&document(SERVER_B, ""));
+    fixture
+        .reloader
+        .reload()
+        .await
+        .expect("the reload validates");
+    assert_eq!(options_user_agent().as_deref(), Some("edge-b-agent"));
+    assert_eq!(register_user_agent().as_deref(), Some("edge-b-agent"));
+
+    fixture.rewrite(&document("  drain_secs: 10\n", ""));
+    fixture
+        .reloader
+        .reload()
+        .await
+        .expect("the reload validates");
+    assert_eq!(options_user_agent().as_deref(), Some("SIPhon/9.9.9"));
+    assert_eq!(register_user_agent().as_deref(), Some("SIPhon/9.9.9"));
+}
+
+#[cfg(target_os = "linux")]
+fn read_rss_kb() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("VmRSS:"))
+        .and_then(|rest| rest.split_whitespace().next()?.parse().ok())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_rss_kb() -> Option<u64> {
+    None
+}
+
+/// Leak gate: reloading alternating files holds nothing per reload. The
+/// runtime's live-task count returns to where it was (each reload's blocking
+/// read finishes), every replaced `IdentityHeaders` is freed, and resident
+/// memory plateaus across a steady batch after a warm-up batch.
+///
+/// Runs in its own process: RSS belongs to the whole test binary.
+#[test]
+fn reload_cycles_do_not_leak() {
+    crate::own_process::run(
+        concat!(module_path!(), "::reload_cycles_do_not_leak"),
+        measure_reload_cycles,
+    );
+}
+
+fn measure_reload_cycles() {
+    const CYCLES: usize = 1_000;
+    const PER_RELOAD_BUDGET_BYTES: u64 = 1_024;
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("a runtime");
+    runtime.block_on(async {
+        let fixture = Fixture::new(&document(SERVER_A, ""));
+        let first = document(SERVER_A, "");
+        let second = document(SERVER_B, "");
+        let cycle = |count: usize| {
+            let fixture = &fixture;
+            let (first, second) = (&first, &second);
+            async move {
+                for index in 0..count {
+                    fixture.rewrite(if index % 2 == 0 { second } else { first });
+                    let report = fixture.reloader.reload().await.expect("validates");
+                    assert_eq!(status(&report, "server"), SectionStatus::Applied);
+                }
+            }
+        };
+
+        let replaced = Arc::downgrade(&fixture.identity.load_full());
+        let tasks_before = tokio::runtime::Handle::current()
+            .metrics()
+            .num_alive_tasks();
+
+        // Warm-up: allocator free lists, the blocking pool's threads.
+        cycle(CYCLES).await;
+        let rss_baseline = read_rss_kb();
+        cycle(CYCLES).await;
+        let rss_after = read_rss_kb();
+
+        assert!(
+            replaced.upgrade().is_none(),
+            "a replaced IdentityHeaders is still alive"
+        );
+        assert_eq!(
+            tokio::runtime::Handle::current()
+                .metrics()
+                .num_alive_tasks(),
+            tasks_before,
+            "a reload left a task behind"
+        );
+        if let (Some(baseline), Some(after)) = (rss_baseline, rss_after) {
+            let delta_kb = after.saturating_sub(baseline);
+            let budget_kb = (CYCLES as u64 * PER_RELOAD_BUDGET_BYTES) / 1024;
+            assert!(
+                delta_kb < budget_kb,
+                "RSS grew {delta_kb} KB across {CYCLES} steady-state reloads \
+                 (budget {budget_kb} KB) — likely a leak",
+            );
+        } else {
+            eprintln!("[reload_cycles_do_not_leak] no /proc/self/status — RSS check skipped");
+        }
+    });
+}

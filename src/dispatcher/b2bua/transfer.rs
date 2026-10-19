@@ -454,7 +454,7 @@ fn adopt_and_answer(
             invite,
             481,
             "Call/Transaction Does Not Exist",
-            state.server_header.as_deref(),
+            state.identity.load().server.as_deref(),
             &[],
         );
         send_message_from(
@@ -676,7 +676,13 @@ fn refuse_takeover(
         replaced_call = %replaced_call_id,
         "{label}: refusing takeover with {code} — {why}"
     );
-    let response = build_response(invite, code, reason, state.server_header.as_deref(), &[]);
+    let response = build_response(
+        invite,
+        code,
+        reason,
+        state.identity.load().server.as_deref(),
+        &[],
+    );
     send_message_from(
         response,
         inbound.transport,

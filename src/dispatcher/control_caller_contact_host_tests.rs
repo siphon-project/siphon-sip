@@ -271,6 +271,7 @@ async fn siphons_requests_to_the_caller_present_the_contact_host() {
         Some(endpoint_sdp("192.0.2.1").into_bytes()),
         &[],
         "reinvite:b2a",
+        |_| {},
         &dispatcher.state,
     ));
     assert!(send_in_dialog_request(

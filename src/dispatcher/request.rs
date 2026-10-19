@@ -387,7 +387,7 @@ pub(super) fn handle_request(
             &message,
             503,
             "Service Unavailable",
-            state.server_header.as_deref(),
+            state.identity.load().server.as_deref(),
             &[],
         );
         send_message_from(
@@ -429,7 +429,7 @@ pub(super) fn handle_request(
             &message,
             481,
             "Call/Transaction Does Not Exist",
-            state.server_header.as_deref(),
+            state.identity.load().server.as_deref(),
             &[],
         );
         send_message_from(
@@ -674,7 +674,7 @@ pub(super) fn handle_request(
             &message,
             483,
             "Too Many Hops",
-            state.server_header.as_deref(),
+            state.identity.load().server.as_deref(),
             &[],
         );
         send_message_from(
@@ -696,8 +696,13 @@ pub(super) fn handle_request(
         let mut routed = message;
         core::consume_self_routes(&mut routed.headers, &state.self_identity);
         if method == "INVITE" {
-            let trying =
-                build_response(&routed, 100, "Trying", state.server_header.as_deref(), &[]);
+            let trying = build_response(
+                &routed,
+                100,
+                "Trying",
+                state.identity.load().server.as_deref(),
+                &[],
+            );
             send_message_from(
                 trying,
                 inbound.transport,
@@ -741,7 +746,7 @@ pub(super) fn handle_request(
                     &message,
                     481,
                     "Subscription Does Not Exist",
-                    state.server_header.as_deref(),
+                    state.identity.load().server.as_deref(),
                     &[],
                 );
                 answer_locally(response, server_key.as_ref(), &inbound, state);
@@ -789,7 +794,7 @@ pub(super) fn handle_request(
             &message,
             &method,
             state.auto_options,
-            state.server_header.as_deref(),
+            state.identity.load().server.as_deref(),
             // Family-matched to the socket the probe arrived on, so a v6 probe
             // gets a v6 Contact and the exact arrival port.
             &state.a_leg_advertised_host(Some(inbound.local_addr), &inbound.transport),
@@ -1060,7 +1065,7 @@ pub(super) fn handle_request(
                 &message_guard,
                 *code,
                 reason,
-                state.server_header.as_deref(),
+                state.identity.load().server.as_deref(),
                 &reply_headers,
             );
 
@@ -1251,7 +1256,7 @@ pub(super) fn handle_request(
                     &message_guard,
                     100,
                     "Trying",
-                    state.server_header.as_deref(),
+                    state.identity.load().server.as_deref(),
                     &[],
                 );
                 send_message_from(
@@ -1296,7 +1301,7 @@ pub(super) fn handle_request(
                     &message_guard,
                     500,
                     "No Targets",
-                    state.server_header.as_deref(),
+                    state.identity.load().server.as_deref(),
                     &[],
                 );
                 send_message_from(
@@ -1313,7 +1318,7 @@ pub(super) fn handle_request(
                         &message_guard,
                         100,
                         "Trying",
-                        state.server_header.as_deref(),
+                        state.identity.load().server.as_deref(),
                         &[],
                     );
                     send_message_from(

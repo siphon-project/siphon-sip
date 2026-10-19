@@ -417,7 +417,7 @@ fn reject_with_invite(
         invite,
         code,
         reason,
-        state.server_header.as_deref(),
+        state.identity.load().server.as_deref(),
         &reply_headers,
     );
     crate::b2bua::uas_headers::apply(&mut response, headers);

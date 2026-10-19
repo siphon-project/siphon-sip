@@ -132,7 +132,7 @@ fn respond(
         request,
         status_code,
         reason,
-        state.server_header.as_deref(),
+        state.identity.load().server.as_deref(),
         &[],
     );
     send_message_from(

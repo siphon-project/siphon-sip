@@ -44,6 +44,22 @@ entry, but a working config keeps working.
   it originates to its S-CSCF this way, with the session case in the Route entry
   (TS 24.229 §5.7.3), which `next_hop` alone cannot say.
 
+- **`POST /admin/config/reload` reads the config file again without a
+  restart.** The file passed to `--config` is validated in full, as at
+  startup, and compared with the running one section by section: each is
+  reported `unchanged`, `applied`, or `restart_required` with the fields that
+  wait for a restart. `server.server_header` and `server.user_agent_header`
+  apply at once, to responses siphon builds and requests it originates (UAC,
+  registrant, B2BUA legs); removing either restores the product default. A
+  file that does not read, parse or validate is answered `422` and changes
+  nothing. Comments and key order are not changes. Listeners and dialogs are
+  never touched, `advertised_address` included. Behind the admin bearer token;
+  `501` on a node started from a config string. Not wired to `SIGHUP`.
+  **BREAKING (Rust library):** `UacSender::new` and `RegistrantManager::new`
+  take a `SharedIdentityHeaders` in place of the `Option<String>` User-Agent,
+  `DispatcherState`'s `server_header` / `user_agent_header` become one
+  `identity`, `dispatcher::run` takes the shared value, and `AdminState` gains
+  `config_reloader`.
 - **Ro: sessions held in Rust, as many per call as needed, or none bound to a
   call.** `await diameter.ro_session(...)` opens a credit-control session and
   returns a `RoSession` handle; each has its own Session-Id, Subscription-Ids,

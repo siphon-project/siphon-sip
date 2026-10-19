@@ -990,7 +990,7 @@ pub(super) fn handle_response(
                                     &original_request,
                                     best_code,
                                     best_error_reason(best_code),
-                                    state.server_header.as_deref(),
+                                    state.identity.load().server.as_deref(),
                                     &[],
                                 ),
                             };

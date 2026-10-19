@@ -59,14 +59,13 @@ pub struct DispatcherState {
     /// Path MTU (bytes) for the outbound UDP request path (RFC 3261 §18.1.1).
     /// `Some(mtu)` biases an over-`(mtu - 200)` UDP request to TCP; `None` = off.
     pub mtu: Option<u16>,
-    /// Server header value injected into locally-generated responses.
-    pub server_header: Option<String>,
+    /// `Server` for locally generated responses and `User-Agent` for locally
+    /// originated requests, shared with the UAC sender and the registrant and
+    /// swapped by `POST /admin/config/reload`. Read with `identity.load()`.
+    pub identity: crate::config::SharedIdentityHeaders,
     /// Answer an OPTIONS no script handler claims with 200 (`server.auto_options`).
     /// False drops it silently instead — see the config field for why.
     pub auto_options: bool,
-    /// User-Agent header value for outbound requests (UAC, registrant).
-    #[allow(dead_code)]
-    pub user_agent_header: Option<String>,
     /// Transaction timeout for pending branch TTL.
     pub transaction_timeout: std::time::Duration,
     /// B2BUA call actor store (active when script has @b2bua handlers).

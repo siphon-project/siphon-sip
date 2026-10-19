@@ -588,7 +588,7 @@ pub fn session_interval_refusal(
         a_leg.stored_to.as_ref(),
         422,
         "Session Interval Too Small",
-        state.server_header.as_deref(),
+        state.identity.load().server.as_deref(),
     );
     response.headers.set("Min-SE", minimum.to_string());
     info!(
@@ -649,7 +649,7 @@ pub fn refuse_too_brief_refresh(
         request,
         422,
         "Session Interval Too Small",
-        state.server_header.as_deref(),
+        state.identity.load().server.as_deref(),
         &[],
     );
     response.headers.set("Min-SE", minimum.to_string());

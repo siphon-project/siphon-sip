@@ -615,7 +615,7 @@ pub fn refuse_bad_extension(
         a_leg.stored_to.as_ref(),
         status_code,
         reason,
-        state.server_header.as_deref(),
+        state.identity.load().server.as_deref(),
     );
     if status_code == 420 {
         // RFC 3261 §8.2.2.3: a 420 MUST list the extensions it refuses.
@@ -654,7 +654,7 @@ pub fn refuse_unhonoured_on_transaction(
         invite,
         status_code,
         reason,
-        state.server_header.as_deref(),
+        state.identity.load().server.as_deref(),
         &[],
     );
     if status_code == 420 {

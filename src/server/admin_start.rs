@@ -21,6 +21,7 @@ pub(super) fn start_admin_api(
     drain: &Arc<DrainState>,
     engine: &Arc<ScriptEngine>,
     script_config: &Arc<crate::script::script_config::ScriptConfigStore>,
+    config_reloader: Option<Arc<super::config_reload::ConfigReloader>>,
 ) {
     let Some(ref admin_config) = config.admin else {
         return;
@@ -113,6 +114,7 @@ pub(super) fn start_admin_api(
                     features: crate::admin::AdminFeatures::from_config(config),
                     script_engine: Some(Arc::clone(engine)),
                     script_config: Some(Arc::clone(script_config)),
+                    config_reloader,
                     // Overwritten by `router` from its own argument;
                     // set here only to satisfy the initializer.
                     ui_enabled: false,
