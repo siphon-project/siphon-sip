@@ -202,6 +202,47 @@ pub fn prepare_originate(
     prepare_originate_routed(state, params, &OriginateRoute::default())
 }
 
+/// [`b2bua_originate`] with a pre-loaded route set (RFC 3261 §8.1.2): `route`
+/// is carried as the INVITE's Route headers, and its CANCEL and the ACK of a
+/// failure copy them (§9.1, §17.1.1.3). With no `next_hop` the INVITE goes to
+/// the topmost entry (§16.6 step 6). What an application server needs to hand
+/// a request it originates to its S-CSCF with the session case in the Route
+/// entry (TS 24.229 §5.7.3), which steering the INVITE there cannot say.
+pub fn b2bua_originate_with_route(
+    params: OriginateParams,
+    route: Vec<String>,
+) -> Result<PreparedOriginate, OriginateError> {
+    let Some(control) = B2BUA_CONTROL.get() else {
+        return Err(OriginateError::Unavailable(
+            "b2bua is not running — nothing to originate from".to_string(),
+        ));
+    };
+    let prepared = prepare_originate_with_route(&control.state, params, route)?;
+    if !b2bua_originate_dial(&prepared) {
+        return Err(OriginateError::Unavailable(
+            "originate was staged but the call vanished before dialling".to_string(),
+        ));
+    }
+    Ok(prepared)
+}
+
+/// [`prepare_originate`] with a pre-loaded route set, on the dispatcher the
+/// caller already holds (see [`b2bua_originate_with_route`]).
+pub fn prepare_originate_with_route(
+    state: &DispatcherState,
+    params: OriginateParams,
+    route: Vec<String>,
+) -> Result<PreparedOriginate, OriginateError> {
+    prepare_originate_routed(
+        state,
+        params,
+        &OriginateRoute {
+            route,
+            ..OriginateRoute::default()
+        },
+    )
+}
+
 /// [`prepare_originate`] to a registered contact: the INVITE is addressed to
 /// `route.request_uri`, carries `route.route` as its Route headers and goes
 /// over `route.flow`, resolved exactly as a dialled B-leg is

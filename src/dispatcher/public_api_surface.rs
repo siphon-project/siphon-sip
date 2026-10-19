@@ -172,14 +172,16 @@ fn the_public_surface_is_pinned() {
     // originate entry point carrying it (`OriginateParams` is published and
     // built literally, so it gains no field), plus the 2 the caller's side of
     // it goes through: setting the host on a call and the refusal it can
-    // answer with.
+    // answer with,
+    // plus the crate-internal `b2bua_originate_with_route`
+    // `b2bua.originate(route=…)` pre-loads a route set through.
     // All additive, so a minor-compatible change — recorded here because that
     // is the tripwire.
     assert_eq!(
         declared + re_exported,
-        103,
+        104,
         "the dispatcher's public surface is {} items ({declared} declared here, \
-         {re_exported} re-exported), not 103. Adding one is a semver commitment on a \
+         {re_exported} re-exported), not 104. Adding one is a semver commitment on a \
          published crate; removing one breaks embedders. An extraction should move the \
          declaration and add a `pub use`, leaving this total unchanged.",
         declared + re_exported,

@@ -208,6 +208,8 @@ class _B2buaNamespace:
         timeout=30,
         body=None,
         content_type=None,
+        session_timer=None,
+        route=None,
     ):
         """Place an outbound call siphon owns, with no inbound INVITE behind it.
 
@@ -268,6 +270,13 @@ class _B2buaNamespace:
             content_type: Content-Type for ``body`` (e.g.
                 ``"multipart/mixed;boundary=…"``). Defaults to
                 ``"application/sdp"``, which makes ``body`` identical to ``sdp``.
+            session_timer: the RFC 4028 session timer to run on the call, a dict
+                with ``expires``, ``min_se`` and ``refresher``; ``None`` runs the
+                configured one, if any.
+            route: a pre-loaded route set (RFC 3261 §8.1.2), e.g.
+                ``["<sip:orig@scscf.example.com;lr>"]``: the INVITE's Route
+                headers, also on its CANCEL and the ACK of a failure. With no
+                ``next_hop`` the INVITE goes to the topmost entry.
 
         Returns:
             str: the new leg's SIP Call-ID.
@@ -293,20 +302,22 @@ class _B2buaNamespace:
             raise ValueError("b2bua.originate requires a running siphon B2BUA")
         return control.originate(
             to,
-            from_uri,
-            from_display,
-            to_display,
-            next_hop,
-            p_asserted_identity,
-            privacy,
-            headers,
-            sdp,
-            media,
-            profile,
-            ws_uri,
-            timeout,
-            body,
-            content_type,
+            from_uri=from_uri,
+            from_display=from_display,
+            to_display=to_display,
+            next_hop=next_hop,
+            p_asserted_identity=p_asserted_identity,
+            privacy=privacy,
+            headers=headers,
+            sdp=sdp,
+            media=media,
+            profile=profile,
+            ws_uri=ws_uri,
+            timeout=timeout,
+            body=body,
+            content_type=content_type,
+            session_timer=session_timer,
+            route=route if route is not None else [],
         )
 
     def bridge(self, call_id, with_call_id, on_peer_hangup="hangup"):

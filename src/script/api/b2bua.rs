@@ -103,6 +103,15 @@ impl PyB2buaControl {
     /// each key left out defaulting as in `call.session_timer()`. The INVITE asks
     /// for it and the callee's 2xx says who refreshes.
     ///
+    /// `route=["<sip:orig@scscf.example.com;lr>"]` pre-loads a route set (RFC 3261
+    /// §8.1.2): the entries go out as the INVITE's Route headers, in order, and
+    /// its CANCEL and the ACK of a failure carry them too. With no `next_hop`
+    /// the INVITE goes to the topmost entry. An application server originating
+    /// a request on a user's or a service identity's behalf hands it to its
+    /// S-CSCF this way, the session case in the Route entry (TS 24.229 §5.7.3);
+    /// `next_hop` alone only says where the packet goes. Route is not accepted
+    /// in `headers`.
+    ///
     /// Raises `ValueError` when the target/identity URIs do not parse, no route
     /// exists, the media plan is not one the configured backend can serve, the
     /// body carries no offer, `session_timer` names an unknown key or refresher,
@@ -126,6 +135,7 @@ impl PyB2buaControl {
         body=None,
         content_type=None,
         session_timer=None,
+        route=Vec::new(),
     ))]
     fn originate(
         &self,
@@ -145,10 +155,12 @@ impl PyB2buaControl {
         body: Option<&Bound<'_, pyo3::types::PyAny>>,
         content_type: Option<&str>,
         session_timer: Option<&Bound<'_, pyo3::types::PyDict>>,
+        route: Vec<String>,
     ) -> PyResult<String> {
         use pyo3::exceptions::PyValueError;
 
         let session_timer = session_timer.map(session_timer_from_dict).transpose()?;
+        let route = super::route_entries::route_set_from(&route)?;
 
         // `sdp=` and `body=` are one slot with two spellings — `sdp=` is the
         // body carried as application/sdp, `body=` is the body with its type
@@ -233,7 +245,12 @@ impl PyB2buaControl {
             media: media_plan,
             session_timer,
         };
-        crate::dispatcher::b2bua_originate(params)
+        let placed = if route.is_empty() {
+            crate::dispatcher::b2bua_originate(params)
+        } else {
+            crate::dispatcher::b2bua_originate_with_route(params, route)
+        };
+        placed
             .map(|placed| placed.sip_call_id)
             .map_err(|error| PyValueError::new_err(error.to_string()))
     }
@@ -575,6 +592,73 @@ mod tests {
     use crate::config::SessionRefresher;
     use crate::script::api::call::SessionTimerOverride;
     use pyo3::types::PyDict;
+    use pyo3::PyTypeInfo;
+
+    /// What a script calls is the pure-Python `siphon.b2bua.originate`, which
+    /// hands its arguments on to this binding. Every argument the binding takes
+    /// has to get through it, and arrive as itself.
+    #[test]
+    fn the_script_namespace_forwards_every_originate_argument() {
+        crate::own_process::run(
+            concat!(
+                module_path!(),
+                "::the_script_namespace_forwards_every_originate_argument"
+            ),
+            forwards_every_originate_argument,
+        );
+    }
+
+    fn forwards_every_originate_argument() {
+        pyo3::Python::initialize();
+        Python::attach(|python| {
+            crate::script::api::ensure_registry(python).expect("ensure registry");
+            crate::script::api::install_siphon_module(python).expect("install siphon module");
+            let globals = PyDict::new(python);
+            globals
+                .set_item("native", PyB2buaControl::type_object(python))
+                .expect("set the binding's type");
+            let code = std::ffi::CString::new(concat!(
+                "import inspect, siphon\n",
+                "native_names = [name for name in inspect.signature(native.originate).parameters][1:]\n",
+                "wrapper_names = [name for name in inspect.signature(siphon.b2bua.originate).parameters]\n",
+                "class Control:\n",
+                "    def originate(self, *args, **kwargs):\n",
+                "        self.received = inspect.signature(native.originate).bind(self, *args, **kwargs).arguments\n",
+                "        return 'placed'\n",
+                "control = Control()\n",
+                "siphon.b2bua.__dict__['_control'] = control\n",
+                "sent = {name: f'value-of-{name}' for name in native_names}\n",
+                "siphon.b2bua.originate(**sent)\n",
+                "received = {name: value for name, value in control.received.items() if name != 'self'}\n",
+            ))
+            .expect("CString");
+            python
+                .run(code.as_c_str(), Some(&globals), None)
+                .expect("the forwarding probe runs");
+            let names = |key: &str| -> Vec<String> {
+                globals
+                    .get_item(key)
+                    .expect("get")
+                    .expect("present")
+                    .extract()
+                    .expect("a list of names")
+            };
+            assert_eq!(names("wrapper_names"), names("native_names"));
+            let sent: std::collections::HashMap<String, String> = globals
+                .get_item("sent")
+                .expect("get")
+                .expect("present")
+                .extract()
+                .expect("a dict");
+            let received: std::collections::HashMap<String, String> = globals
+                .get_item("received")
+                .expect("get")
+                .expect("present")
+                .extract()
+                .expect("a dict");
+            assert_eq!(received, sent);
+        });
+    }
 
     #[test]
     fn a_session_timer_dict_defaults_each_key_it_leaves_out() {

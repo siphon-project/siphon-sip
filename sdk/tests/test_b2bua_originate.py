@@ -22,6 +22,23 @@ def harness():
 
 
 class TestB2buaOriginate:
+    def test_records_a_pre_loaded_route_set(self, harness):
+        import siphon
+
+        siphon.b2bua.originate(
+            to="sip:+14035551212@ims.example.com;user=phone",
+            sdp="v=0\r\n",
+            route=["<sip:orig@scscf.example.com:6060;lr>"],
+        )
+        placed = harness.b2bua.originates[-1]
+        assert placed["route"] == ["<sip:orig@scscf.example.com:6060;lr>"]
+
+    def test_records_no_route_set_by_default(self, harness):
+        import siphon
+
+        siphon.b2bua.originate(to="sip:+14035551212@carrier.example", media=True)
+        assert harness.b2bua.originates[-1]["route"] == []
+
     def test_returns_a_call_id_and_records_the_target(self, harness):
         import siphon
 

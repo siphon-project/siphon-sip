@@ -56,6 +56,13 @@ sets on it (keys left out default as in `call.session_timer()`). The INVITE asks
 for it, the callee's 2xx says who refreshes, and siphon refreshes the dialog or
 releases the call just before a session the callee let run out expires.
 
+An application server that places a call on a user's or a service identity's
+behalf hands it to its S-CSCF with `route=["<sip:orig@scscf.example.com;lr>"]`:
+the entries go out as the INVITE's Route headers (and on its CANCEL and the ACK
+of a failure), so the S-CSCF reads the session case from its own Route entry
+(TS 24.229 §5.7.3). `next_hop` only says where the packet goes; with no
+`next_hop` the INVITE goes to the topmost Route entry.
+
 ::: siphon_sdk.mock_module.MockB2bua.originate
 
 ## Joining two calls: `b2bua.bridge`
