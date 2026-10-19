@@ -237,6 +237,16 @@ pub fn arm_reliable_provisional_retransmit_on(
 
     let store = Arc::clone(&state.reliable_provisionals);
     let outbound = Arc::clone(&state.outbound);
+    let bytes = bytes::Bytes::from(response.to_bytes());
+    // Resolved once: the copies go where the first one went (TS 33.203 7.1).
+    let mut route = route;
+    (route.destination, route.source_local_addr) = protected_udp_response_egress(
+        &bytes,
+        route.transport,
+        route.destination,
+        route.source_local_addr,
+        state,
+    );
     let capture = TaskCapture::for_task(state, route.transport, route.source_local_addr);
 
     tokio::spawn(async move {
@@ -246,7 +256,6 @@ pub fn arm_reliable_provisional_retransmit_on(
         let cap = std::time::Duration::from_secs(4);
         let started = tokio::time::Instant::now();
         let deadline = started + std::time::Duration::from_secs(32);
-        let bytes = bytes::Bytes::from(response.to_bytes());
 
         loop {
             let sleep = tokio::time::sleep(interval);
@@ -388,13 +397,16 @@ pub fn start_2xx_retransmits(
 ) {
     let timers = crate::transaction::timer::TimerConfig::default();
     let outbound = Arc::clone(&state.outbound);
+    let bytes = bytes::Bytes::from(response.to_bytes());
+    // Resolved once: the copies go where the first one went (TS 33.203 7.1).
+    let (destination, source_local_addr) =
+        protected_udp_response_egress(&bytes, transport, destination, source_local_addr, state);
     // Each copy is captured to HEP as the first send was.
     let capture = TaskCapture::for_task(state, transport, source_local_addr);
     let key = unacked.internal_call_id.clone();
 
     tokio::spawn(async move {
         let mut interval = timers.t1;
-        let bytes = bytes::Bytes::from(response.to_bytes());
 
         loop {
             let sleep = tokio::time::sleep(interval);
