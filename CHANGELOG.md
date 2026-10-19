@@ -13,6 +13,8 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
+## [1.15.0] — 2026-10-19
+
 ### Added
 
 - **Control plane: a `dial`, `route` or `originate` can name the host of
