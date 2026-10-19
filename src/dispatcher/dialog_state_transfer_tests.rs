@@ -534,6 +534,61 @@ async fn a_replaces_takeover_reports_the_new_party_and_ends_the_replaced() {
     assert_eq!(call.dispatcher.state.call_actors.count(), 0);
 }
 
+/// A node with no `@b2bua.on_invite` that hands every call to `control.inbound`
+/// takes a hosted dialog over for an INVITE whose `Replaces` names it, as a
+/// script that hands the call over does: the takeover runs instead of the
+/// handover, D is answered, B is BYEd and A goes on with D. Without
+/// `b2bua.accept_replaces` the same INVITE is declined, as on every path.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_replaces_takeover_runs_on_a_node_with_no_script_that_hands_calls_to_the_control_plane() {
+    for accept in [true, false] {
+        let prefix = if accept { 5450 } else { 5460 };
+        let mut call = establish(prefix, "terminate");
+        // From here the node has no routing script, and control.inbound says
+        // where an undecided call goes: the shape of a script-free controller.
+        call.dispatcher.state.engine =
+            Arc::new(ScriptEngine::new_embedded("").expect("an empty script compiles"));
+        call.dispatcher.state.control_inbound = Some(crate::config::ControlInboundConfig {
+            app: format!("controller-{prefix}"),
+            ..Default::default()
+        });
+        call.dispatcher.state.accept_replaces = accept;
+        let (d_aor, d) = (
+            Box::leak(format!("sip:{}@example.com", prefix + 4).into_boxed_str()) as &str,
+            Box::leak(format!("192.0.2.{}:5060", 200 + prefix % 50).into_boxed_str()) as &str,
+        );
+        register(d_aor, d);
+        let siphon_tag = tag_of(&header(&call.to_b, "From"));
+        let d_call_id = format!("takeover-{prefix}@192.0.2.199");
+        place(
+            &call.dispatcher,
+            d,
+            &invite(
+                d,
+                &d_call_id,
+                &format!("<{d_aor}>;tag=d-tag"),
+                &format!("sip:{prefix}@siphon.example.com"),
+                &format!(
+                    "Replaces: {};to-tag={siphon_tag};from-tag=b-tag\r\n",
+                    header(&call.to_b, "Call-ID")
+                ),
+            ),
+        );
+        let sent = wire(&call.dispatcher);
+        if accept {
+            response_to_phone(&sent, d, 200);
+            assert!(
+                sent_to(&sent, call.b.1, Method::Bye).is_some(),
+                "the replaced party was BYEd"
+            );
+            assert!(dialog_events(call.a.0).is_empty(), "A stays, now with D");
+        } else {
+            response_to_phone(&sent, d, 603);
+            assert!(sent_to(&sent, call.b.1, Method::Bye).is_none());
+        }
+    }
+}
+
 /// A control plane of the test's own, with one connected application.
 pub(super) fn control_plane(
     app: &str,

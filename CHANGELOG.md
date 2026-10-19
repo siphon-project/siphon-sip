@@ -176,6 +176,14 @@ entry, but a working config keeps working.
 - **`b2bua.originate(session_timer=...)` reaches the call from a script.** The
   `siphon.b2bua` namespace scripts call did not take the argument and raised
   `TypeError`; it now hands every argument of the binding on by name.
+- **An INVITE with `Replaces` is taken over on a node that hands its calls to
+  `control.inbound`.** With no `@b2bua.on_invite` and `b2bua.accept_replaces:
+  true`, an INVITE whose `Replaces` named a hosted dialog was handed to the
+  application as a new call, which had no verb to join it to the call it named:
+  a conference focus pulling a party in through a B2BUA application server
+  (TS 24.147, RFC 4579 §5.5) rang that party again instead. The takeover now
+  runs there as it does after a script that hands the call over; without
+  `accept_replaces` the INVITE is still declined `603`.
 
 - **B2BUA: a `Require` tag only the script added no longer refuses the caller
   `420`.** The required-extension check (RFC 3261 §8.2.2.3) held the caller to

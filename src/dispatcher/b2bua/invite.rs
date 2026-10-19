@@ -820,7 +820,19 @@ pub fn handle_b2bua_invite(inbound: InboundMessage, message: SipMessage, state: 
     // admitted, so the takeover runs instead of the routing the script asked for
     // — an INVITE with `Replaces` is a request to join an existing call, not a
     // new one to route, and the dial plan has no say in where it goes.
-    if !matches!(action, CallAction::Reject { .. } | CallAction::None) {
+    //
+    // A node with no `@b2bua.on_invite` that hands every call to
+    // `control.inbound` admits it the way a script that hands the call over
+    // does: the operator's `b2bua.accept_replaces` already let it this far.
+    // Handing it over instead would give the application a second, unrelated
+    // call for the party that asked to join an existing one, and no verb
+    // with which to join them.
+    let takeover_admitted = match &action {
+        CallAction::Reject { .. } => false,
+        CallAction::None => handlers.is_empty() && state.control_inbound.is_some(),
+        _ => true,
+    };
+    if takeover_admitted {
         if let Some(pending) = state.call_actors.take_pending_replaces(&call_id) {
             if refuse_too_brief_invite(&call_id, &message_arc, state) {
                 return;
