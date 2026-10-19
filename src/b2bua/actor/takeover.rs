@@ -68,3 +68,24 @@ impl TakeoverSource {
         }
     }
 }
+
+/// A takeover of an unanchored call waiting on the survivor's answer.
+///
+/// With no media anchor siphon has no answer of its own to give the newcomer:
+/// the survivor's last SDP answered another party's offer, and replayed to the
+/// newcomer it can name formats the newcomer never offered (RFC 3264 §6). So the
+/// survivor is re-INVITEd with the newcomer's offer first, and the newcomer is
+/// answered with what the survivor answers; a survivor that refuses leaves the
+/// call as it was and the newcomer is refused with its status. This is what
+/// carries the newcomer's INVITE across that wait, on the call being taken over.
+#[derive(Debug, Clone)]
+pub struct DeferredTakeover {
+    /// The Via branch of the re-INVITE sent to the survivor.
+    pub branch: String,
+    /// The newcomer's INVITE and where it arrived, to answer it from.
+    pub inbound: crate::transport::InboundMessage,
+    pub invite: crate::sip::message::SipMessage,
+    /// The newcomer's own call, until it is moved onto the call it joins.
+    pub new_call_id: String,
+    pub pending: PendingReplaces,
+}

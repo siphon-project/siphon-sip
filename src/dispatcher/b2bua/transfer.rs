@@ -272,6 +272,156 @@ pub fn b2bua_bridge_inbound_replaces(
         _ => (survivor_sdp.clone(), invite.body.clone()),
     };
 
+    // Unanchored, siphon has no answer of its own to give the new party: the
+    // survivor's last SDP answered somebody else's offer. Where it names
+    // formats the new party never offered it is no answer at all (RFC 3264
+    // §6), which a conference focus offering G.711 to a handset's AMR-WB call
+    // refuses. Then the survivor is offered the new party's SDP first, and the
+    // new party is answered with what the survivor answers
+    // (`complete_deferred_takeover`).
+    if pair_profile.is_none()
+        && pending.reinvite_survivor
+        && !answers_the_offer(&survivor_sdp, &invite.body)
+    {
+        defer_until_the_survivor_answers(
+            inbound,
+            invite,
+            new_call_id,
+            pending,
+            survivor_on_a_leg,
+            state,
+        );
+        return;
+    }
+
+    if !adopt_and_answer(
+        inbound,
+        invite,
+        new_call_id,
+        pending,
+        sdp_for_new_party,
+        state,
+    ) {
+        return;
+    }
+
+    // Re-point the survivor at the new party (RFC 3261 §14) — it is still
+    // sending to the address of the party that just left. The survivor is the
+    // winning B-leg after the swap, always. A script's
+    // `take_over(reinvite=False)` says the new party's media is where the old
+    // party's was (TS 24.237 §12.3.5), so the survivor is left alone.
+    if pending.reinvite_survivor {
+        b2bua_send_media_reinvite(&replaced_call_id, false, sdp_for_survivor, state);
+    }
+
+    // The pair's media session, keyed on the new A-leg Call-ID, and the old
+    // anchor dropped, mirroring the terminate-transfer re-anchor.
+    if let (Some(profile), Some(store)) = (&pair_profile, state.rtpengine_sessions.as_ref()) {
+        // Each party's own ingress policy stays with the pair, for the next
+        // time this call is re-paired.
+        let bridge_sides = repaired
+            .as_ref()
+            .map(|repaired| repaired.sides(profile, true, true));
+        store.insert(takeover_session(
+            own_anchor,
+            &cid_new,
+            &new_tag,
+            &survivor_tag,
+            profile,
+            bridge_sides,
+        ));
+    }
+    if let Some((old_key, old_session)) = &old_anchor {
+        if let Some(store) = state.rtpengine_sessions.as_ref() {
+            store.remove(old_key);
+        }
+        b2bua_transfer_rtpengine_delete(state, old_session.rtpengine_id(), &old_session.from_tag);
+    }
+
+    info!(
+        call_id = %replaced_call_id,
+        replaced_on_a_leg = pending.replaced_on_a_leg,
+        survivor_reinvited = pending.reinvite_survivor,
+        "{label}: dialog taken over — replaced party BYE'd, survivor relayed to the new party"
+    );
+}
+
+/// The tags in the taking-over INVITE's `Require` siphon does not honour.
+///
+/// A script that took the dialog over named in a `Target-Dialog` has done what
+/// `Require: tdialog` asks of the UAS (RFC 4538 §6), so on that path the tag is
+/// honoured.
+fn takeover_unhonoured_tags(
+    invite: &SipMessage,
+    new_call_id: &str,
+    source: crate::b2bua::actor::TakeoverSource,
+    state: &DispatcherState,
+) -> Vec<String> {
+    let verified = state
+        .call_actors
+        .get_call(new_call_id)
+        .is_some_and(|call| call.sec_agree_verified);
+    let mut unsupported = unimplemented_required_tags(&invite.headers, verified);
+    if source == crate::b2bua::actor::TakeoverSource::Script {
+        unsupported.retain(|tag| !tag.eq_ignore_ascii_case("tdialog"));
+    }
+    unsupported
+}
+
+/// Whether `answer` can stand as the answer to `offer` (RFC 3264 §6): as many
+/// media streams, of the same kinds, and every format a stream of the answer
+/// names offered in that stream, as the same codec. A stream the answer
+/// rejects (port 0), and one that is not RTP, are not held to it.
+fn answers_the_offer(answer: &[u8], offer: &[u8]) -> bool {
+    let answer = crate::media::sdp::SdpBody::parse(&String::from_utf8_lossy(answer));
+    let offer = crate::media::sdp::SdpBody::parse(&String::from_utf8_lossy(offer));
+    answer.media_sections.len() == offer.media_sections.len()
+        && answer
+            .media_sections
+            .iter()
+            .zip(&offer.media_sections)
+            .all(|(answered, offered)| {
+                answered
+                    .media_type
+                    .eq_ignore_ascii_case(&offered.media_type)
+                    && (answered.port == 0
+                        || !answered.is_rtp()
+                        || answered.formats.iter().all(|format| {
+                            offered.formats.contains(format)
+                                && match (answered.codec_of(format), offered.codec_of(format)) {
+                                    (Some(mine), Some(theirs)) => mine.eq_ignore_ascii_case(theirs),
+                                    (None, None) => true,
+                                    _ => false,
+                                }
+                        }))
+            })
+}
+
+/// Move the new party onto the call it takes over, answer it `200` with
+/// `sdp_for_new_party`, and end the replaced party's dialog (RFC 3891 §3).
+/// `false` when the new party was refused instead (it, or the call, went
+/// away), and the caller stops there.
+fn adopt_and_answer(
+    inbound: &InboundMessage,
+    invite: &SipMessage,
+    new_call_id: &str,
+    pending: &crate::b2bua::actor::PendingReplaces,
+    sdp_for_new_party: Vec<u8>,
+    state: &DispatcherState,
+) -> bool {
+    let replaced_call_id = pending.replaced_call_id.clone();
+    let label = pending.source.label();
+    let refuse = |code: u16, reason: &str, why: &str| {
+        refuse_takeover(
+            inbound,
+            invite,
+            new_call_id,
+            &replaced_call_id,
+            label,
+            (code, reason, why),
+            state,
+        );
+    };
     // Move the new party's leg onto the call it is joining. Its own (now empty)
     // call is dropped without retiring the dialog — the leg is moving, not ending.
     let (stored_invite, stored_local_addr) = match state.call_actors.get_call(new_call_id) {
@@ -284,7 +434,7 @@ pub fn b2bua_bridge_inbound_replaces(
             "Call/Transaction Does Not Exist",
             "the new call went away",
         );
-        return;
+        return false;
     };
     state.call_event_receivers.remove(new_call_id);
 
@@ -315,7 +465,7 @@ pub fn b2bua_bridge_inbound_replaces(
             Some(inbound.local_addr),
             state,
         );
-        return;
+        return false;
     };
 
     // The newcomer holds the A-leg slot now, on a Call-ID of its own: a control
@@ -385,67 +535,128 @@ pub fn b2bua_bridge_inbound_replaces(
         send_or_hold_bye(&replaced_call_id, &replaced, bye, ByeSender::Dialog, state);
     }
 
-    // Re-point the survivor at the new party (RFC 3261 §14) — it is still
-    // sending to the address of the party that just left. The survivor is the
-    // winning B-leg after the swap, always. A script's
-    // `take_over(reinvite=False)` says the new party's media is where the old
-    // party's was (TS 24.237 §12.3.5), so the survivor is left alone.
-    if pending.reinvite_survivor {
-        b2bua_send_media_reinvite(&replaced_call_id, false, sdp_for_survivor, state);
-    }
+    true
+}
 
-    // The pair's media session, keyed on the new A-leg Call-ID, and the old
-    // anchor dropped, mirroring the terminate-transfer re-anchor.
-    if let (Some(profile), Some(store)) = (&pair_profile, state.rtpengine_sessions.as_ref()) {
-        // Each party's own ingress policy stays with the pair, for the next
-        // time this call is re-paired.
-        let bridge_sides = repaired
-            .as_ref()
-            .map(|repaired| repaired.sides(profile, true, true));
-        store.insert(takeover_session(
-            own_anchor,
-            &cid_new,
-            &new_tag,
-            &survivor_tag,
-            profile,
-            bridge_sides,
-        ));
-    }
-    if let Some((old_key, old_session)) = &old_anchor {
-        if let Some(store) = state.rtpengine_sessions.as_ref() {
-            store.remove(old_key);
+/// The survivor of an unanchored takeover is offered the new party's SDP; the
+/// new party waits for the answer (see `DeferredTakeover`). A re-INVITE that
+/// cannot be sent refuses the new party and leaves the call as it was.
+fn defer_until_the_survivor_answers(
+    inbound: &InboundMessage,
+    invite: &SipMessage,
+    new_call_id: &str,
+    pending: &crate::b2bua::actor::PendingReplaces,
+    survivor_on_a_leg: bool,
+    state: &DispatcherState,
+) {
+    let replaced_call_id = pending.replaced_call_id.clone();
+    let tracking = if survivor_on_a_leg {
+        "reinvite:b2a"
+    } else {
+        "reinvite:a2b"
+    };
+    let sent = b2bua_send_reinvite_on_leg_then(
+        &replaced_call_id,
+        survivor_on_a_leg,
+        invite.body.clone(),
+        tracking,
+        |branch| {
+            state.call_actors.set_deferred_takeover(
+                &replaced_call_id,
+                crate::b2bua::actor::DeferredTakeover {
+                    branch: branch.to_string(),
+                    inbound: inbound.clone(),
+                    invite: invite.clone(),
+                    new_call_id: new_call_id.to_string(),
+                    pending: pending.clone(),
+                },
+            );
+        },
+        state,
+    );
+    if !sent {
+        let _abandoned = state.call_actors.take_pending_replaces(&replaced_call_id);
+        if let Some(mut call) = state.call_actors.get_call_mut(&replaced_call_id) {
+            call.deferred_takeover = None;
         }
-        b2bua_transfer_rtpengine_delete(state, old_session.rtpengine_id(), &old_session.from_tag);
+        refuse_takeover(
+            inbound,
+            invite,
+            new_call_id,
+            &replaced_call_id,
+            pending.source.label(),
+            (
+                503,
+                "Service Unavailable",
+                "the surviving party could not be re-INVITEd",
+            ),
+            state,
+        );
+        return;
     }
-
-    info!(
-        call_id = %replaced_call_id,
-        replaced_on_a_leg = pending.replaced_on_a_leg,
-        survivor_reinvited = pending.reinvite_survivor,
-        "{label}: dialog taken over — replaced party BYE'd, survivor relayed to the new party"
+    debug!(
+        call_id = %new_call_id,
+        replaced_call = %replaced_call_id,
+        "{}: unanchored — the survivor is offered the new party's SDP, and the new party is answered with its answer",
+        pending.source.label()
     );
 }
 
-/// The tags in the taking-over INVITE's `Require` siphon does not honour.
-///
-/// A script that took the dialog over named in a `Target-Dialog` has done what
-/// `Require: tdialog` asks of the UAS (RFC 4538 §6), so on that path the tag is
-/// honoured.
-fn takeover_unhonoured_tags(
-    invite: &SipMessage,
-    new_call_id: &str,
-    source: crate::b2bua::actor::TakeoverSource,
+/// The survivor of an unanchored takeover answered the new party's offer.
+/// `2xx` with an answer: the new party is moved onto the call and answered
+/// with it, and the replaced party is sent its BYE. Anything else: the new
+/// party is refused with that status, and the call goes on as it was, the
+/// survivor's session unchanged by the failed re-INVITE (RFC 3261 §14.1).
+pub fn complete_deferred_takeover(
+    deferred: crate::b2bua::actor::DeferredTakeover,
+    status_code: u16,
+    reason: &str,
+    answer: &[u8],
     state: &DispatcherState,
-) -> Vec<String> {
-    let verified = state
-        .call_actors
-        .get_call(new_call_id)
-        .is_some_and(|call| call.sec_agree_verified);
-    let mut unsupported = unimplemented_required_tags(&invite.headers, verified);
-    if source == crate::b2bua::actor::TakeoverSource::Script {
-        unsupported.retain(|tag| !tag.eq_ignore_ascii_case("tdialog"));
+) {
+    let crate::b2bua::actor::DeferredTakeover {
+        inbound,
+        invite,
+        new_call_id,
+        pending,
+        ..
+    } = deferred;
+    let label = pending.source.label();
+    if (200..300).contains(&status_code) && !answer.is_empty() {
+        if adopt_and_answer(
+            &inbound,
+            &invite,
+            &new_call_id,
+            &pending,
+            answer.to_vec(),
+            state,
+        ) {
+            info!(
+                call_id = %pending.replaced_call_id,
+                replaced_on_a_leg = pending.replaced_on_a_leg,
+                "{label}: dialog taken over — the new party answered with the survivor's answer to its offer, replaced party BYE'd"
+            );
+        }
+        return;
     }
-    unsupported
+    let (code, reason) = if (200..300).contains(&status_code) {
+        (488, "Not Acceptable Here")
+    } else {
+        (status_code, reason)
+    };
+    refuse_takeover(
+        &inbound,
+        &invite,
+        &new_call_id,
+        &pending.replaced_call_id,
+        label,
+        (
+            code,
+            reason,
+            "the surviving party did not take the new party's offer",
+        ),
+        state,
+    );
 }
 
 /// Refuse a takeover on the newcomer's INVITE transaction and drop the call

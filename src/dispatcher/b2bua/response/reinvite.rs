@@ -440,6 +440,8 @@ pub fn forward_reinvite_response(
                 direction = direction,
                 "B2BUA: absorbing siphon-originated re-INVITE response (no originator to forward to)"
             );
+            // The survivor of an unanchored takeover answered the new party's offer.
+            settle_deferred_takeover(call_id, &snapshot.branch, status_code, message, state);
         } else if is_a2b {
             // A→B re-INVITE: the response goes to the A-leg — pin its arrival socket.
             send_message_from(
@@ -631,4 +633,27 @@ fn release_owed_reinvite_ack(dialog_call_id: Option<&str>, state: &DispatcherSta
         return;
     };
     release_bye_held_for_reinvite_ack(dialog_call_id, state);
+}
+
+/// The survivor of an unanchored takeover answered the new party's offer with
+/// this final response (`status_code` >= 200): the new party gets that answer,
+/// or the refusal. Nothing for any other re-INVITE.
+fn settle_deferred_takeover(
+    call_id: &str,
+    branch: &str,
+    status_code: u16,
+    message: &SipMessage,
+    state: &DispatcherState,
+) {
+    if status_code < 200 {
+        return;
+    }
+    let Some(deferred) = state.call_actors.take_deferred_takeover(call_id, branch) else {
+        return;
+    };
+    let reason = match &message.start_line {
+        crate::sip::message::StartLine::Response(line) => line.reason_phrase.clone(),
+        crate::sip::message::StartLine::Request(_) => String::new(),
+    };
+    complete_deferred_takeover(deferred, status_code, &reason, &message.body, state);
 }

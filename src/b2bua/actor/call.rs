@@ -266,6 +266,9 @@ pub struct CallActor {
     /// this node hosts. Acted on only once the script has admitted the INVITE
     /// (see [`PendingReplaces`]).
     pub pending_replaces: Option<PendingReplaces>,
+    /// A takeover of this call waiting on its survivor's answer to the
+    /// newcomer's offer (see [`DeferredTakeover`]).
+    pub deferred_takeover: Option<Box<DeferredTakeover>>,
     /// The dialled legs' best final failure so far (RFC 3261 §16.7 step 6), as
     /// sent: `call.failure_response` in `@b2bua.on_failure`. Taken when the
     /// failure is concluded, so a call routed again starts without one.
@@ -587,6 +590,7 @@ impl CallActor {
             session_timer_override: None,
             transfer: None,
             pending_replaces: None,
+            deferred_takeover: None,
             failure_response: None,
             refer_subscriptions: Vec::new(),
             outbound_credentials: None,

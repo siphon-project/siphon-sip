@@ -410,6 +410,23 @@ impl CallActorStore {
         }
     }
 
+    /// Record a takeover of `call_id` waiting on its survivor's answer.
+    pub fn set_deferred_takeover(&self, call_id: &str, deferred: DeferredTakeover) {
+        if let Some(mut call) = self.calls.get_mut(call_id) {
+            call.deferred_takeover = Some(Box::new(deferred));
+        }
+    }
+
+    /// Take the takeover of `call_id` that waits on the re-INVITE sent with
+    /// `branch`, leaving none behind; `None` for any other response.
+    pub fn take_deferred_takeover(&self, call_id: &str, branch: &str) -> Option<DeferredTakeover> {
+        let mut call = self.calls.get_mut(call_id)?;
+        if call.deferred_takeover.as_ref()?.branch != branch {
+            return None;
+        }
+        call.deferred_takeover.take().map(|deferred| *deferred)
+    }
+
     /// Take the recorded `Replaces` match, if any, leaving none behind.
     pub fn take_pending_replaces(&self, call_id: &str) -> Option<PendingReplaces> {
         self.calls

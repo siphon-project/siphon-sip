@@ -473,6 +473,9 @@ def on_refer(call):
     takeover. When the handler admits it, siphon performs the handover instead of
     the routing the handler asked for — an INVITE with `Replaces` is a request to
     join an existing call, not a new one to route.
+    On a node with no `@b2bua.on_invite` that hands its calls to
+    `control.inbound`, `accept_replaces` is the whole admission: the takeover
+    runs instead of the handover, as it does after a script's `call.handover()`.
 
 !!! note "The `Replaces` is rewritten for the target"
     The INVITE siphon triggers towards the transfer target carries the `Replaces`
