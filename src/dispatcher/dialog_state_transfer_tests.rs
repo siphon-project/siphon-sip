@@ -589,6 +589,127 @@ async fn a_replaces_takeover_runs_on_a_node_with_no_script_that_hands_calls_to_t
     }
 }
 
+/// The survivor's final response to a re-INVITE siphon sent it, `status` with
+/// `body` (an answer) when it is a 2xx.
+fn survivor_answers(reinvite: &SipMessage, address: &str, status: u16, body: &str) -> SipMessage {
+    let reason = if status == 200 {
+        "OK"
+    } else {
+        "Not Acceptable Here"
+    };
+    let mut raw = format!("SIP/2.0 {status} {reason}\r\n");
+    for via in reinvite.headers.get_all("Via").cloned().unwrap_or_default() {
+        raw.push_str(&format!("Via: {via}\r\n"));
+    }
+    for name in ["From", "To", "Call-ID", "CSeq"] {
+        raw.push_str(&format!("{name}: {}\r\n", header(reinvite, name)));
+    }
+    raw.push_str(&format!("Contact: <sip:phone@{address}>\r\n"));
+    if status == 200 {
+        raw.push_str("Content-Type: application/sdp\r\n");
+        raw.push_str(&format!("Content-Length: {}\r\n\r\n{body}", body.len()));
+    } else {
+        raw.push_str("Content-Length: 0\r\n\r\n");
+    }
+    parse_sip_message_bytes(raw.as_bytes()).expect("the response parses")
+}
+
+/// RFC 3264 §6: the answer is to the offer in hand. When the survivor's last SDP
+/// names formats the new party never offered (a conference focus offering G.711
+/// to a handset's AMR-WB call), it is no answer to give: the survivor is
+/// re-INVITEd with the new party's offer first, and the new party is answered
+/// with the survivor's answer. A survivor that refuses leaves the call as it
+/// was and the new party is refused with its status.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unanchored_takeover_answers_the_new_party_with_the_survivors_answer_to_its_offer() {
+    for survivor_takes_it in [true, false] {
+        let prefix = if survivor_takes_it { 5470 } else { 5480 };
+        let call = establish(prefix, "terminate");
+        let (d_aor, d) = (
+            Box::leak(format!("sip:{}@example.com", prefix + 4).into_boxed_str()) as &str,
+            Box::leak(format!("192.0.2.{}:5060", 200 + prefix % 50).into_boxed_str()) as &str,
+        );
+        register(d_aor, d);
+        let siphon_tag = tag_of(&header(&call.to_b, "From"));
+        let d_call_id = format!("pcma-{prefix}@192.0.2.199");
+        // The new party offers PCMA alone; the call it joins was set up on PCMU.
+        let offer = invite(
+            d,
+            &d_call_id,
+            &format!("<{d_aor}>;tag=d-tag"),
+            &format!("sip:{prefix}@siphon.example.com"),
+            &format!(
+                "Replaces: {};to-tag={siphon_tag};from-tag=b-tag\r\n",
+                header(&call.to_b, "Call-ID")
+            ),
+        )
+        .replace(
+            "RTP/AVP 0\r\na=rtpmap:0 PCMU/8000",
+            "RTP/AVP 8\r\na=rtpmap:8 PCMA/8000",
+        );
+        place(&call.dispatcher, d, &offer);
+        let sent = wire(&call.dispatcher);
+        assert!(
+            !sent
+                .iter()
+                .any(|sent| sent.destination == d && sent.message.status_code() == Some(200)),
+            "the new party is not answered with the survivor's PCMU"
+        );
+        assert!(
+            sent_to(&sent, call.b.1, Method::Bye).is_none(),
+            "nobody is BYEd yet"
+        );
+        let reinvite =
+            sent_to(&sent, call.a.1, Method::Invite).expect("the survivor is re-INVITEd");
+        assert!(
+            text_of(&reinvite).contains("a=rtpmap:8 PCMA/8000"),
+            "with the new party's offer"
+        );
+
+        let internal_call_id = call
+            .dispatcher
+            .state
+            .call_actors
+            .find_by_sip_call_id(&call.a_call_id)
+            .expect("the call");
+        let survivor_answer = sdp(host_of(call.a.1)).replace(
+            "RTP/AVP 0\r\na=rtpmap:0 PCMU/8000",
+            "RTP/AVP 8\r\na=rtpmap:8 PCMA/8000",
+        );
+        let status = if survivor_takes_it { 200 } else { 488 };
+        respond(
+            &call.dispatcher,
+            &internal_call_id,
+            call.a.1,
+            &reinvite,
+            survivor_answers(&reinvite, call.a.1, status, &survivor_answer),
+        );
+        let sent = wire(&call.dispatcher);
+        if survivor_takes_it {
+            let to_d = response_to_phone(&sent, d, 200);
+            assert!(
+                text_of(&to_d).contains("a=rtpmap:8 PCMA/8000"),
+                "{}",
+                text_of(&to_d)
+            );
+            assert!(
+                sent_to(&sent, call.b.1, Method::Bye).is_some(),
+                "the replaced party was BYEd"
+            );
+        } else {
+            response_to_phone(&sent, d, 488);
+            assert!(
+                sent_to(&sent, call.b.1, Method::Bye).is_none(),
+                "the call goes on as it was"
+            );
+        }
+    }
+}
+
+fn text_of(message: &SipMessage) -> String {
+    String::from_utf8_lossy(&message.body).into_owned()
+}
+
 /// A control plane of the test's own, with one connected application.
 pub(super) fn control_plane(
     app: &str,

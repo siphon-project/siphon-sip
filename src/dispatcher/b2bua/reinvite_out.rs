@@ -40,6 +40,27 @@ pub fn b2bua_send_reinvite_on_leg(
     tracking_target: &str,
     state: &DispatcherState,
 ) -> bool {
+    b2bua_send_reinvite_on_leg_then(
+        call_id,
+        surviving_on_a_leg,
+        sdp_body,
+        tracking_target,
+        |_| {},
+        state,
+    )
+}
+
+/// [`b2bua_send_reinvite_on_leg`], running `before_send` with the re-INVITE's
+/// Via branch once it is tracked and before it goes out, so whatever waits on
+/// its response is recorded before a response can come back.
+pub fn b2bua_send_reinvite_on_leg_then(
+    call_id: &str,
+    surviving_on_a_leg: bool,
+    sdp_body: Vec<u8>,
+    tracking_target: &str,
+    before_send: impl FnOnce(&str),
+    state: &DispatcherState,
+) -> bool {
     let Some(surviving) = state.call_actors.clone_leg(call_id, surviving_on_a_leg) else {
         return false;
     };
@@ -73,6 +94,7 @@ pub fn b2bua_send_reinvite_on_leg(
         Some(sdp_body),
         &[],
         tracking_target,
+        before_send,
         state,
     )
 }
@@ -93,6 +115,7 @@ pub fn send_in_dialog_reinvite(
     offer: Option<Vec<u8>>,
     extra_headers: &[(&str, String)],
     tracking_target: &str,
+    before_send: impl FnOnce(&str),
     state: &DispatcherState,
 ) -> bool {
     // A re-INVITE is a session refresh of its dialog (RFC 4028 §7.4).
@@ -112,7 +135,7 @@ pub fn send_in_dialog_reinvite(
             tracking_target,
             requested_session_expires,
         },
-        |_| {},
+        before_send,
         state,
     )
 }

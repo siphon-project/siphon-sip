@@ -184,6 +184,15 @@ entry, but a working config keeps working.
   (TS 24.147, RFC 4579 §5.5) rang that party again instead. The takeover now
   runs there as it does after a script that hands the call over; without
   `accept_replaces` the INVITE is still declined `603`.
+- **An unanchored takeover answers the new party with an answer to its own
+  offer.** siphon answered the INVITE with `Replaces` with the survivor's last
+  SDP, which answered another party's offer: where it named formats the new
+  party never offered (a conference focus offering G.711 to a handset's
+  AMR-WB call) the new party refused it, and the merge failed `488`. Then
+  the survivor is now re-INVITEd with the new party's offer first and the new
+  party is answered with the survivor's answer (RFC 3264 §6); a survivor that
+  refuses leaves the call as it was and the new party gets its status. A
+  survivor SDP that does answer the offer is still replayed at once.
 
 - **B2BUA: a `Require` tag only the script added no longer refuses the caller
   `420`.** The required-extension check (RFC 3261 §8.2.2.3) held the caller to

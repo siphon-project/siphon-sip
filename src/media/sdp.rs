@@ -184,6 +184,16 @@ impl MediaLine {
             .collect()
     }
 
+    /// The codec a format of this section names: its `rtpmap` encoding, or a
+    /// static payload type's well-known name. `None` for a format that names
+    /// no codec, and for every format of a section that is not RTP.
+    pub fn codec_of(&self, format: &str) -> Option<&str> {
+        if !self.is_rtp() {
+            return None;
+        }
+        codec_name(&self.rtpmap, format)
+    }
+
     /// Whether this section carries RTP, which is what makes its formats RTP
     /// payload type numbers (RFC 8866 §5.14). `RTP/AVP`, `RTP/SAVPF`,
     /// `UDP/TLS/RTP/SAVPF` and `TCP/RTP/AVP` do; `udptl`, `UDP/DTLS/SCTP`,
