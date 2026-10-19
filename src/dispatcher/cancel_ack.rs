@@ -664,8 +664,17 @@ pub(super) fn handle_ack_via_session(
             // the wrong node (or reuse an unrelated keepalive connection to it).
             // It falls back to the cached branch on resolution failure, so
             // non-routed dialogs (loopback baseline) are unaffected.
-            let next_hop_uri =
-                ack_next_hop_uri(&ack_downstream.headers, &ack_downstream.start_line);
+            //
+            // A branch the script pinned to a flow, ACKed at the same remote
+            // target with no Route left, keeps that flow: the target's Contact
+            // may be a private address only the flow reaches
+            // (`ack_rides_branch_flow`). No next hop makes
+            // `resolve_in_dialog_flow_uri` reuse the branch's connection.
+            let next_hop_uri = if ack_rides_branch_flow(&ack_downstream, client_branch) {
+                None
+            } else {
+                ack_next_hop_uri(&ack_downstream.headers, &ack_downstream.start_line)
+            };
             let (destination, out_transport, ack_connection_id) = resolve_in_dialog_flow_uri(
                 next_hop_uri.as_deref(),
                 &state.dns_resolver,

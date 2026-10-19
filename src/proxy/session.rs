@@ -35,6 +35,16 @@ pub struct ClientBranch {
     pub transport: Transport,
     /// Connection ID for the downstream leg.
     pub connection_id: ConnectionId,
+    /// The Request-URI this branch was relayed with when the script pinned it
+    /// to a captured flow (`relay(flow=...)` or a flow-pinned fork branch);
+    /// `None` when the branch was routed by resolving a URI.
+    ///
+    /// A flow-pinned branch reached its target over a connection the target
+    /// opened (RFC 5626 §5.3 / RFC 5923), so the target's Contact may name an
+    /// address nobody can reach: a private address behind NAT, a WebSocket
+    /// `.invalid` host. A 2xx ACK addressed to that same remote target has to
+    /// take the same flow instead of resolving the Contact.
+    pub flow_request_uri: Option<crate::sip::uri::SipUri>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1565,6 +1575,7 @@ mod tests {
                 destination: "10.0.0.2:5060".parse().unwrap(),
                 transport: Transport::Udp,
                 connection_id: ConnectionId::default(),
+                flow_request_uri: None,
             },
         );
 
@@ -1691,6 +1702,7 @@ mod tests {
                 destination: "10.0.0.2:5060".parse().unwrap(), // the B2BUA
                 transport: Transport::Tcp,
                 connection_id: ConnectionId::default(),
+                flow_request_uri: None,
             },
         );
         store.insert(session1);
@@ -1732,6 +1744,7 @@ mod tests {
                 destination: "10.0.0.3:5060".parse().unwrap(), // callee
                 transport: Transport::Tls,
                 connection_id: ConnectionId::default(),
+                flow_request_uri: None,
             },
         );
         store.insert(session2);

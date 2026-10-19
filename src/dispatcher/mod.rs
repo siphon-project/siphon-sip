@@ -254,6 +254,8 @@ mod proxy_dialog_state_tests;
 #[cfg(test)]
 mod proxy_failure_reply_tests;
 #[cfg(test)]
+mod proxy_flow_ack_tests;
+#[cfg(test)]
 mod proxy_late_answer_tests;
 #[cfg(test)]
 mod proxy_non_invite_timeout_tests;
