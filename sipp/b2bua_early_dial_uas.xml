@@ -1,0 +1,106 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  The callee of a dial behind siphon's own early answer.
+
+  INVITE (the engine's far-leg offer) -> 183 (SDP) -> 200 (SDP) -> ACK -> [RTP]
+  -> BYE -> 200
+
+  The INVITE must carry the engine's offer for the far leg (offer_far): on the
+  engine's address, naming nothing of the caller's (172.20.0.6), so not the
+  caller's own offer relayed. The callee answers
+  in its 183 already, so its first SDP completes the far leg, and the caller's
+  scenario checks that neither the 183 nor the 200 reaches it with this SDP.
+
+  Pair with b2bua_early_dial_uac.xml.
+-->
+<scenario name="B2BUA dial behind siphon's own early answer UAS">
+
+  <recv request="INVITE" crlf="true">
+    <action>
+      <ereg regexp="c=IN IP4 172\.20\.0\.130" search_in="body"
+            check_it="true" assign_to="junk" />
+      <ereg regexp="IN IP4 172\.20\.0\.6" search_in="body"
+            check_it_inverse="true" assign_to="junk" />
+      <ereg regexp="m=audio [0-9]+ RTP/AVP 8( |\r|\n)" search_in="body"
+            check_it="true" assign_to="junk" />
+    </action>
+  </recv>
+
+  <send>
+    <![CDATA[
+SIP/2.0 183 Session Progress
+[last_Via:]
+[last_From:]
+[last_To:];tag=[pid]SIPpTag01[call_number]
+[last_Call-ID:]
+[last_CSeq:]
+Contact: <sip:callee@[local_ip]:[local_port];transport=[transport]>
+Content-Type: application/sdp
+Content-Length: [len]
+
+v=0
+o=callee 7 7 IN IP[local_ip_type] [local_ip]
+s=-
+c=IN IP[media_ip_type] [media_ip]
+t=0 0
+m=audio [media_port] RTP/AVP 8 101
+a=rtpmap:8 PCMA/8000
+a=rtpmap:101 telephone-event/8000
+a=fmtp:101 0-15
+a=ptime:30
+]]>
+  </send>
+
+  <pause milliseconds="500" />
+
+  <send retrans="500">
+    <![CDATA[
+SIP/2.0 200 OK
+[last_Via:]
+[last_From:]
+[last_To:];tag=[pid]SIPpTag01[call_number]
+[last_Call-ID:]
+[last_CSeq:]
+Contact: <sip:callee@[local_ip]:[local_port];transport=[transport]>
+Content-Type: application/sdp
+Content-Length: [len]
+
+v=0
+o=callee 7 7 IN IP[local_ip_type] [local_ip]
+s=-
+c=IN IP[media_ip_type] [media_ip]
+t=0 0
+m=audio [media_port] RTP/AVP 8 101
+a=rtpmap:8 PCMA/8000
+a=rtpmap:101 telephone-event/8000
+a=fmtp:101 0-15
+a=ptime:30
+]]>
+  </send>
+
+  <recv request="ACK" crlf="true" />
+
+  <nop>
+    <action>
+      <exec play_pcap_audio="/sipp/g711a.pcap" />
+    </action>
+  </nop>
+
+  <recv request="BYE" timeout="20000" />
+
+  <send>
+    <![CDATA[
+SIP/2.0 200 OK
+[last_Via:]
+[last_From:]
+[last_To:]
+[last_Call-ID:]
+[last_CSeq:]
+Content-Length: 0
+
+]]>
+  </send>
+
+</scenario>

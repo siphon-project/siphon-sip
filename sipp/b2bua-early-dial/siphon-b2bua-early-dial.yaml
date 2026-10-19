@@ -1,0 +1,45 @@
+# siphon for a dial behind its own early answer, on the REAL siphon-rtp engine.
+# The cases are in b2bua_early_dial.py next to this file.
+listen:
+  udp:
+    - "0.0.0.0:5060"
+
+domain:
+  local:
+    - "siphon.test"
+    - "172.20.0.3"
+
+advertised_address: "172.20.0.3"
+
+script:
+  path: "/etc/siphon/scripts/b2bua_early_dial.py"
+
+media:
+  backend: siphon-rtp
+  siphon_rtp:
+    address: "172.20.0.130:8080"
+    timeout_ms: 2000
+
+  profiles:
+    # Plain RTP, no ICE and no DTLS: the caller's early answer and the callee's
+    # far-leg offer are both SDP SIPp takes as it is.
+    early_dial:
+      offer: &early_dial_flags
+        transport_protocol: "RTP/AVP"
+        ice: "remove"
+        dtls: "off"
+        replace: ["origin"]
+      answer: *early_dial_flags
+
+# The audio oracle: the engine's end-of-call summary, written out as a MEDIA
+# record, carries per-leg packet counts. Caller and callee both non-zero in both
+# directions is what says the callee was really connected behind the answer.
+cdr:
+  enabled: true
+  auto_emit: true
+  backend: file
+  file:
+    path: "/var/log/siphon/cdr.jsonl"
+
+log:
+  level: debug
