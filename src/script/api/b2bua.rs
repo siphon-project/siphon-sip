@@ -592,6 +592,73 @@ mod tests {
     use crate::config::SessionRefresher;
     use crate::script::api::call::SessionTimerOverride;
     use pyo3::types::PyDict;
+    use pyo3::PyTypeInfo;
+
+    /// What a script calls is the pure-Python `siphon.b2bua.originate`, which
+    /// hands its arguments on to this binding. Every argument the binding takes
+    /// has to get through it, and arrive as itself.
+    #[test]
+    fn the_script_namespace_forwards_every_originate_argument() {
+        crate::own_process::run(
+            concat!(
+                module_path!(),
+                "::the_script_namespace_forwards_every_originate_argument"
+            ),
+            forwards_every_originate_argument,
+        );
+    }
+
+    fn forwards_every_originate_argument() {
+        pyo3::Python::initialize();
+        Python::attach(|python| {
+            crate::script::api::ensure_registry(python).expect("ensure registry");
+            crate::script::api::install_siphon_module(python).expect("install siphon module");
+            let globals = PyDict::new(python);
+            globals
+                .set_item("native", PyB2buaControl::type_object(python))
+                .expect("set the binding's type");
+            let code = std::ffi::CString::new(concat!(
+                "import inspect, siphon\n",
+                "native_names = [name for name in inspect.signature(native.originate).parameters][1:]\n",
+                "wrapper_names = [name for name in inspect.signature(siphon.b2bua.originate).parameters]\n",
+                "class Control:\n",
+                "    def originate(self, *args, **kwargs):\n",
+                "        self.received = inspect.signature(native.originate).bind(self, *args, **kwargs).arguments\n",
+                "        return 'placed'\n",
+                "control = Control()\n",
+                "siphon.b2bua.__dict__['_control'] = control\n",
+                "sent = {name: f'value-of-{name}' for name in native_names}\n",
+                "siphon.b2bua.originate(**sent)\n",
+                "received = {name: value for name, value in control.received.items() if name != 'self'}\n",
+            ))
+            .expect("CString");
+            python
+                .run(code.as_c_str(), Some(&globals), None)
+                .expect("the forwarding probe runs");
+            let names = |key: &str| -> Vec<String> {
+                globals
+                    .get_item(key)
+                    .expect("get")
+                    .expect("present")
+                    .extract()
+                    .expect("a list of names")
+            };
+            assert_eq!(names("wrapper_names"), names("native_names"));
+            let sent: std::collections::HashMap<String, String> = globals
+                .get_item("sent")
+                .expect("get")
+                .expect("present")
+                .extract()
+                .expect("a dict");
+            let received: std::collections::HashMap<String, String> = globals
+                .get_item("received")
+                .expect("get")
+                .expect("present")
+                .extract()
+                .expect("a dict");
+            assert_eq!(received, sent);
+        });
+    }
 
     #[test]
     fn a_session_timer_dict_defaults_each_key_it_leaves_out() {

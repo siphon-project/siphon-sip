@@ -173,6 +173,10 @@ entry, but a working config keeps working.
 
 ### Fixed
 
+- **`b2bua.originate(session_timer=...)` reaches the call from a script.** The
+  `siphon.b2bua` namespace scripts call did not take the argument and raised
+  `TypeError`; it now hands every argument of the binding on by name.
+
 - **B2BUA: a `Require` tag only the script added no longer refuses the caller
   `420`.** The required-extension check (RFC 3261 §8.2.2.3) held the caller to
   every tag in the A-leg `Require` as the script left it, so a script that put
