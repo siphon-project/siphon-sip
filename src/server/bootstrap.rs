@@ -1204,6 +1204,7 @@ pub(super) fn build_transport_acl(
     config: &Config,
     firewall: Option<crate::firewall::KernelFirewall>,
     gateway_trust: Option<Arc<crate::gateway::view::GatewayView>>,
+    trusted: crate::security::trust::TrustedCidrs,
 ) -> Arc<transport::acl::TransportAcl> {
     use transport::acl::TransportAcl;
 
@@ -1216,6 +1217,7 @@ pub(super) fn build_transport_acl(
                 Ok(client) => {
                     let client = client
                         .with_firewall(firewall.clone())
+                        .with_trusted(trusted)
                         .with_gateway_trust(gateway_trust);
                     let banned = client.banned();
                     client.start();
@@ -1452,6 +1454,7 @@ pub(super) async fn init_gateway_allow_set(
     config: &Config,
     gateway_manager: Option<&Arc<crate::gateway::DispatcherManager>>,
     kernel_firewall_up: bool,
+    trusted: crate::security::trust::TrustedCidrs,
 ) {
     if !kernel_firewall_up {
         return;
@@ -1468,14 +1471,9 @@ pub(super) async fn init_gateway_allow_set(
     if !firewall_config.gateway_set {
         return;
     }
-    let trusted_cidrs = config
-        .security
-        .as_ref()
-        .map(|security| security.trusted_cidrs.clone())
-        .unwrap_or_default();
     let allow_set = Arc::new(crate::firewall::gateways::GatewayAllowSet::new(
         firewall_config,
-        &trusted_cidrs,
+        trusted,
         Arc::clone(manager),
     ));
     // Records what start-up declared, so the first floor tick can tell a

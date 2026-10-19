@@ -167,14 +167,52 @@ pub(crate) fn installed() -> Option<&'static InstalledBlocklist> {
 pub(crate) struct InstalledBlocklist {
     store: Arc<ApiBanStore>,
     trust: SourceTrust,
+    /// The kernel handle the entries were programmed through, so an entry
+    /// lifted at run time leaves the kernel set too.
+    firewall: Option<crate::firewall::KernelFirewall>,
 }
 
 impl InstalledBlocklist {
     /// A blocklist that is not the process-wide one, for a test driving the
     /// replay without starting a poller.
     #[cfg(test)]
-    pub(crate) fn for_test(store: Arc<ApiBanStore>, trust: SourceTrust) -> Self {
-        Self { store, trust }
+    pub(crate) fn for_test(
+        store: Arc<ApiBanStore>,
+        trust: SourceTrust,
+        firewall: Option<crate::firewall::KernelFirewall>,
+    ) -> Self {
+        Self {
+            store,
+            trust,
+            firewall,
+        }
+    }
+
+    /// Evict every listed address inside `trusted`, from the store and the
+    /// kernel set: what `security.trusted_cidrs` gaining it at run time means,
+    /// the same as ingest refusing it. Returns how many were evicted.
+    pub(crate) fn lift_trusted(&self, trusted: &[ipnet::IpNet]) -> usize {
+        let listed: Vec<IpAddr> = self
+            .store
+            .entries
+            .iter()
+            .map(|entry| *entry.key())
+            .filter(|source| trusted.iter().any(|network| network.contains(source)))
+            .collect();
+        let mut evicted = 0;
+        for source in listed {
+            if self.store.entries.remove(&source).is_some() {
+                evicted += 1;
+                if let Some(firewall) = &self.firewall {
+                    firewall.unban(source);
+                }
+                warn!(
+                    ip = %source,
+                    "APIBAN: listed address is now in security.trusted_cidrs, evicted"
+                );
+            }
+        }
+        evicted
     }
 
     /// Every entry in force at `now` with its remaining lifetime (`None` =
@@ -268,6 +306,12 @@ impl ApiBanClient {
         self
     }
 
+    /// Consult the shared `trusted_cidrs` list a reload swaps.
+    pub fn with_trusted(mut self, trusted: crate::security::trust::TrustedCidrs) -> Self {
+        self.trust = self.trust.with_trusted(trusted);
+        self
+    }
+
     /// Whether `source` is exempt from the feed.
     #[cfg(test)]
     fn is_trusted(&self, source: IpAddr) -> bool {
@@ -314,6 +358,7 @@ impl ApiBanClient {
         let _ = INSTALLED.set(InstalledBlocklist {
             store: Arc::clone(&self.banned),
             trust: self.trust.clone(),
+            firewall: self.firewall.clone(),
         });
         tokio::spawn(async move {
             self.poll_loop().await;

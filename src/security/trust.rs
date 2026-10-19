@@ -21,6 +21,7 @@
 use std::net::IpAddr;
 use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use ipnet::IpNet;
 
 use crate::gateway::view::GatewayView;
@@ -34,24 +35,89 @@ pub enum Exemption {
     Gateway(Arc<str>),
 }
 
+/// `security.trusted_cidrs`, parsed once and shared by every abuse control,
+/// the APIBAN client and the kernel gateway allow set.
+///
+/// One handle behind an `ArcSwap`, so `POST /admin/config/reload` swaps the
+/// list for all of them at once and a read is one lock-free load. Every entry
+/// is parsed by [`crate::gateway::parse_source_network`], the parser the kernel
+/// allow set always used: a CIDR, or a bare address taken as a host route.
+#[derive(Clone, Default)]
+pub struct TrustedCidrs(Arc<ArcSwap<Vec<IpNet>>>);
+
+impl TrustedCidrs {
+    /// Parse `entries`, returning the networks and every entry that is neither
+    /// a CIDR nor an address, in order.
+    pub fn parse(entries: &[String]) -> (Vec<IpNet>, Vec<String>) {
+        let mut networks = Vec::with_capacity(entries.len());
+        let mut invalid = Vec::new();
+        for entry in entries {
+            match crate::gateway::parse_source_network(entry) {
+                Some(network) => networks.push(network),
+                None => invalid.push(entry.clone()),
+            }
+        }
+        (networks, invalid)
+    }
+
+    /// A list holding `networks`.
+    pub fn new(networks: Vec<IpNet>) -> Self {
+        Self(Arc::new(ArcSwap::from_pointee(networks)))
+    }
+
+    /// A list holding the valid `entries`; the rest are skipped.
+    pub fn from_entries(entries: &[String]) -> Self {
+        Self::new(Self::parse(entries).0)
+    }
+
+    /// The networks right now.
+    pub fn load(&self) -> arc_swap::Guard<Arc<Vec<IpNet>>> {
+        self.0.load()
+    }
+
+    /// The list right now, as an `Arc` a snapshot can carry.
+    pub fn load_full(&self) -> Arc<Vec<IpNet>> {
+        self.0.load_full()
+    }
+
+    /// Replace the list for every holder of this handle.
+    pub fn store(&self, networks: Vec<IpNet>) {
+        self.0.store(Arc::new(networks));
+    }
+
+    /// Whether `source` is inside the list.
+    #[inline]
+    pub fn contains(&self, source: IpAddr) -> bool {
+        self.0
+            .load()
+            .iter()
+            .any(|network| network.contains(&source))
+    }
+}
+
 /// The exemption list one abuse control consults. Cheap to clone.
 #[derive(Clone, Default)]
 pub struct SourceTrust {
-    configured: Vec<IpNet>,
+    configured: TrustedCidrs,
     gateways: Option<Arc<GatewayView>>,
 }
 
 impl SourceTrust {
-    /// Trust `trusted_cidrs` only. Unparseable entries are skipped, as every
-    /// consumer of the list always has (the caller logs them).
+    /// Trust `trusted_cidrs` only, in a list of its own. Entries that are
+    /// neither a CIDR nor an address are skipped (the caller logs them).
+    /// Start-up shares one list instead, through [`Self::with_trusted`].
     pub fn from_cidrs(trusted_cidrs: &[String]) -> Self {
         Self {
-            configured: trusted_cidrs
-                .iter()
-                .filter_map(|cidr| cidr.parse::<IpNet>().ok())
-                .collect(),
+            configured: TrustedCidrs::from_entries(trusted_cidrs),
             gateways: None,
         }
+    }
+
+    /// Consult `trusted` — the shared list a reload swaps — in place of the
+    /// list this trust was built with.
+    pub fn with_trusted(mut self, trusted: TrustedCidrs) -> Self {
+        self.configured = trusted;
+        self
     }
 
     /// Also trust every source `gateways` admits. `None` leaves the list as
@@ -67,12 +133,16 @@ impl SourceTrust {
         self.is_configured(source) || self.is_gateway(source)
     }
 
+    /// The `trusted_cidrs` list right now, for a control that carries it in
+    /// its own snapshot (see [`super::SecurityFilter`]).
+    pub fn configured_snapshot(&self) -> Arc<Vec<IpNet>> {
+        self.configured.load_full()
+    }
+
     /// Whether `source` is inside `trusted_cidrs`.
     #[inline]
     pub fn is_configured(&self, source: IpAddr) -> bool {
-        self.configured
-            .iter()
-            .any(|network| network.contains(&source))
+        self.configured.contains(source)
     }
 
     /// Whether `source` is exempt only because a gateway admits it. `false`
@@ -103,7 +173,7 @@ impl SourceTrust {
 
     /// Number of parsed `trusted_cidrs` entries, for start-up logging.
     pub fn configured_len(&self) -> usize {
-        self.configured.len()
+        self.configured.load().len()
     }
 }
 
@@ -349,10 +419,9 @@ mod tests {
         for host in 1..=200u32 {
             flood(&filter, &format!("192.0.2.{}", host % 250), 3, now);
         }
-        let rate = filter.rate_limit.as_ref().unwrap();
-        assert_eq!(rate.tracked_sources(), (0, 0, 200));
-        rate.prune_at(now + Duration::from_secs(61));
-        assert_eq!(rate.tracked_sources(), (0, 0, 0));
+        assert_eq!(filter.rate.tracked_sources(), (0, 0, 200));
+        filter.prune_at(now + Duration::from_secs(61));
+        assert_eq!(filter.rate.tracked_sources(), (0, 0, 0));
     }
 
     #[test]
@@ -433,8 +502,8 @@ mod tests {
         let view = Arc::new(GatewayView::new());
         let store = auto_ban(Some(Arc::clone(&view)));
         let now = Instant::now();
-        assert!(store.record_failure_weighted_at(ip(STRANGER), 3, now, "test"));
-        assert!(store.record_failure_weighted_at(ip(GATEWAY), 3, now, "test"));
+        assert!(store.record_failure_weighted_at(ip(STRANGER), |_| 3, now, "test"));
+        assert!(store.record_failure_weighted_at(ip(GATEWAY), |_| 3, now, "test"));
         // Trusted since it was banned, without the lift having run.
         view.publish(|| {
             vec![AdmittedRange {

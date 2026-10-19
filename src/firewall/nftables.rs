@@ -1559,6 +1559,7 @@ mod tests {
         let installed = crate::apiban::InstalledBlocklist::for_test(
             blocklist,
             crate::security::trust::SourceTrust::from_cidrs(&[]),
+            None,
         );
 
         // The reload, ten minutes on.

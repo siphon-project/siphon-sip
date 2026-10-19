@@ -124,6 +124,8 @@ mod carrier_attribution_tests;
 #[cfg(test)]
 mod charging_role_of_node_tests;
 #[cfg(test)]
+mod config_reload_security_tests;
+#[cfg(test)]
 mod config_reload_tests;
 #[cfg(test)]
 mod control_bridge_elsewhere_tests;

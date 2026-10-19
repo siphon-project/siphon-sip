@@ -30,6 +30,9 @@ use tracing::{info, warn};
 
 use crate::config::yaml::{Mapping, Value};
 use crate::config::{Config, IdentityHeaders, SharedIdentityHeaders};
+use crate::security::runtime::SecurityRuntime;
+use crate::security::trust::TrustedCidrs;
+use crate::security::BanPolicy;
 
 /// Sections compared key by key rather than as a whole.
 const SPLIT_SECTIONS: &[&str] = &["server", "security"];
@@ -37,26 +40,68 @@ const SPLIT_SECTIONS: &[&str] = &["server", "security"];
 /// Installs a value an applier built. Infallible by construction.
 type Install = Box<dyn FnOnce() + Send>;
 
+/// A built value, ready to install, and what building it noticed.
+struct Prepared {
+    install: Install,
+    /// Reported under `warnings`: something in the file was skipped, not
+    /// refused (a `trusted_cidrs` entry that is neither a CIDR nor an address).
+    warnings: Vec<String>,
+}
+
+impl Prepared {
+    fn new(install: Install) -> Self {
+        Self {
+            install,
+            warnings: Vec::new(),
+        }
+    }
+}
+
 /// A group of fields that take effect without a restart.
 struct HotApplier {
     /// The dotted paths this applier covers (`section.key`).
     paths: &'static [&'static str],
+    /// Whether this node holds what the applier writes to. When it does not
+    /// (a reloader built without the security runtime), its paths are
+    /// reported as needing a restart.
+    available: fn(&ReloadTargets) -> bool,
     /// Build the new value from the validated config, returning what installs
     /// it. An error refuses the whole reload with nothing changed.
-    prepare: fn(&ReloadTargets, &Config) -> Result<Install, String>,
+    prepare: fn(&ReloadTargets, &Config) -> Result<Prepared, String>,
 }
 
-/// Every field `POST /admin/config/reload` applies at runtime.
-const HOT_APPLIERS: &[HotApplier] = &[HotApplier {
-    paths: &["server.server_header", "server.user_agent_header"],
-    prepare: prepare_identity_headers,
-}];
+/// Every field `POST /admin/config/reload` applies at runtime, installed in
+/// this order (the trusted list first, so a control enabled by the same
+/// reload starts from it).
+const HOT_APPLIERS: &[HotApplier] = &[
+    HotApplier {
+        paths: &["server.server_header", "server.user_agent_header"],
+        available: |_| true,
+        prepare: prepare_identity_headers,
+    },
+    HotApplier {
+        paths: &["security.trusted_cidrs"],
+        available: has_security,
+        prepare: prepare_trusted_cidrs,
+    },
+    HotApplier {
+        paths: &["security.rate_limit", "security.scanner_block"],
+        available: has_security,
+        prepare: prepare_security_filter,
+    },
+    HotApplier {
+        paths: &["security.failed_auth_ban"],
+        available: has_security,
+        prepare: prepare_auto_ban,
+    },
+];
 
 /// The live handles the appliers write to.
 pub struct ReloadTargets {
     identity: SharedIdentityHeaders,
     product_name: &'static str,
     product_version: &'static str,
+    security: Option<Arc<SecurityRuntime>>,
 }
 
 impl ReloadTargets {
@@ -71,18 +116,76 @@ impl ReloadTargets {
             identity,
             product_name,
             product_version,
+            security: None,
         }
+    }
+
+    /// Apply the `security` fields through `runtime`, the one start-up
+    /// installed them with. Without it they are reported as needing a restart.
+    pub fn with_security(mut self, runtime: Arc<SecurityRuntime>) -> Self {
+        self.security = Some(runtime);
+        self
     }
 }
 
-fn prepare_identity_headers(targets: &ReloadTargets, config: &Config) -> Result<Install, String> {
+fn has_security(targets: &ReloadTargets) -> bool {
+    targets.security.is_some()
+}
+
+fn security_runtime(targets: &ReloadTargets) -> Result<Arc<SecurityRuntime>, String> {
+    targets
+        .security
+        .clone()
+        .ok_or_else(|| "no security runtime on this node".to_owned())
+}
+
+fn prepare_identity_headers(targets: &ReloadTargets, config: &Config) -> Result<Prepared, String> {
     let headers = Arc::new(IdentityHeaders::resolve(
         config.server.as_ref(),
         targets.product_name,
         targets.product_version,
     ));
     let identity = Arc::clone(&targets.identity);
-    Ok(Box::new(move || identity.store(headers)))
+    Ok(Prepared::new(Box::new(move || identity.store(headers))))
+}
+
+fn prepare_trusted_cidrs(targets: &ReloadTargets, config: &Config) -> Result<Prepared, String> {
+    let runtime = security_runtime(targets)?;
+    let entries = config
+        .security
+        .as_ref()
+        .map_or(&[][..], |security| &security.trusted_cidrs);
+    let (networks, invalid) = TrustedCidrs::parse(entries);
+    let warnings = invalid
+        .iter()
+        .map(|entry| {
+            format!("security.trusted_cidrs: '{entry}' is neither a CIDR nor an address, skipped")
+        })
+        .collect();
+    Ok(Prepared {
+        install: Box::new(move || runtime.apply_trusted(networks)),
+        warnings,
+    })
+}
+
+fn prepare_security_filter(targets: &ReloadTargets, config: &Config) -> Result<Prepared, String> {
+    let runtime = security_runtime(targets)?;
+    let security = config.security.clone();
+    Ok(Prepared::new(Box::new(move || {
+        runtime.apply_filter(security.as_ref())
+    })))
+}
+
+fn prepare_auto_ban(targets: &ReloadTargets, config: &Config) -> Result<Prepared, String> {
+    let runtime = security_runtime(targets)?;
+    let policy = config
+        .security
+        .as_ref()
+        .and_then(|security| security.failed_auth_ban.as_ref())
+        .map(BanPolicy::from_config);
+    Ok(Prepared::new(Box::new(move || {
+        runtime.apply_auto_ban(policy)
+    })))
 }
 
 /// Why a reload changed nothing.
@@ -169,8 +272,12 @@ impl ConfigReloader {
 
         // Build every value first; install only once all of them have built.
         let mut installs = Vec::new();
+        let mut warnings = Vec::new();
         let mut hot = BTreeSet::new();
         for applier in HOT_APPLIERS {
+            if !(applier.available)(&self.targets) {
+                continue;
+            }
             let touched: Vec<&str> = applier
                 .paths
                 .iter()
@@ -180,13 +287,14 @@ impl ConfigReloader {
             if touched.is_empty() {
                 continue;
             }
-            let install = (applier.prepare)(&self.targets, &config).map_err(|reason| {
+            let prepared = (applier.prepare)(&self.targets, &config).map_err(|reason| {
                 ConfigReloadError::Build {
                     path: touched.join(", "),
                     reason,
                 }
             })?;
-            installs.push(install);
+            installs.push(prepared.install);
+            warnings.extend(prepared.warnings);
             hot.extend(touched);
         }
         for install in installs {
@@ -196,7 +304,11 @@ impl ConfigReloader {
             adopt_path(&mut baseline, &document, path);
         }
 
-        let report = build_report(changes, &hot);
+        let mut report = build_report(changes, &hot);
+        for warning in &warnings {
+            warn!(file = %self.path.display(), "config reload: {warning}");
+        }
+        report.warnings = warnings;
         if !report.applied.is_empty() {
             info!(file = %self.path.display(), applied = ?report.applied, "config reloaded");
         }

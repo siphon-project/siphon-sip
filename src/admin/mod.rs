@@ -1028,7 +1028,7 @@ async fn metrics_json_handler(State(state): State<AdminState>) -> impl IntoRespo
         "security": {
             // `null` when auto-ban is off: a zero would read as "watching, and
             // nothing banned". The rest of this block is live either way.
-            "banned_ips": crate::security::auto_ban().is_some().then(|| metrics.banned_ips.get()),
+            "banned_ips": crate::security::auto_ban_enabled().is_some().then(|| metrics.banned_ips.get()),
             // TLS/WS handshakes that failed outright, and connections refused by
             // the per-source ceilings. Both were live and both were invisible.
             "handshake_failures": metrics.handshake_failures_total.get(),
@@ -1176,7 +1176,7 @@ async fn registration_delete_handler(
 /// An empty list is the healthy "watching, nothing banned"; it used to be the
 /// answer for "not watching at all" too, and those have to render differently.
 async fn bans_handler() -> Response {
-    bans_response(crate::security::auto_ban().map(|store| store.as_ref()))
+    bans_response(crate::security::auto_ban_enabled().map(|store| store.as_ref()))
 }
 
 fn bans_response(store: Option<&crate::security::AutoBanStore>) -> Response {
@@ -1219,7 +1219,7 @@ async fn ban_delete_handler(Path(ip): Path<String>) -> impl IntoResponse {
         }
     };
 
-    match crate::security::auto_ban() {
+    match crate::security::auto_ban_enabled() {
         Some(store) if store.unban(address) => (
             StatusCode::OK,
             Json(serde_json::json!({ "status": "unbanned", "ip": address.to_string() })),
@@ -1927,7 +1927,7 @@ mod tests {
     #[tokio::test]
     async fn bans_route_and_metrics_json_agree_on_whether_auto_ban_is_configured() {
         crate::metrics::init().ok();
-        let configured = crate::security::auto_ban().is_some();
+        let configured = crate::security::auto_ban_enabled().is_some();
 
         let response = test_app()
             .oneshot(Request::get("/admin/bans").body(Body::empty()).unwrap())
