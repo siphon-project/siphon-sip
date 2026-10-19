@@ -6268,6 +6268,7 @@ fn rescue_store_with_dialog(call_id: &str) -> ProxySessionStore {
             destination: RESCUE_CALLEE.parse().unwrap(),
             transport: Transport::Udp,
             connection_id: ConnectionId::default(),
+            flow_request_uri: None,
         },
     );
     store.insert(session);
@@ -6322,6 +6323,7 @@ fn resume_reinvite_still_reroutes_after_hold_transaction_cleanup() {
             destination: RESCUE_CALLEE.parse().unwrap(),
             transport: Transport::Udp,
             connection_id: ConnectionId::default(),
+            flow_request_uri: None,
         },
     );
     store.insert(hold_session);
@@ -6389,6 +6391,7 @@ fn rescue_declines_when_established_branch_is_also_ourselves() {
             destination: RESCUE_PROXY.parse().unwrap(),
             transport: Transport::Udp,
             connection_id: ConnectionId::default(),
+            flow_request_uri: None,
         },
     );
     store.insert(session);
@@ -8789,4 +8792,98 @@ fn a_generated_failure_carries_its_rfc_reason_phrase() {
     assert_eq!(best_error_reason(580), "Precondition Failure");
     assert_eq!(best_error_reason(604), "Does Not Exist Anywhere");
     assert_eq!(best_error_reason(499), "Error");
+}
+
+// -- 2xx ACK over the flow its INVITE took (RFC 5626 §5.3 / RFC 5923) --
+
+/// The phone's Contact: the private address it has behind its NAT.
+const FLOW_CONTACT: &str = "sip:+15550100001@10.20.30.40:12104;transport=TLS";
+
+/// The INVITE branch relayed over the phone's TLS flow, from its public side.
+fn flow_pinned_branch(flow_request_uri: Option<&str>) -> ClientBranch {
+    ClientBranch {
+        destination: "203.0.113.37:12104".parse().unwrap(),
+        transport: Transport::Tls,
+        connection_id: ConnectionId(77),
+        flow_request_uri: flow_request_uri.map(|uri| parse_uri_standalone(uri).unwrap()),
+    }
+}
+
+/// A 2xx ACK as it stands after siphon consumed its own Route entries.
+fn flow_ack(request_uri: &str, route: Option<&str>) -> SipMessage {
+    let mut builder = SipMessageBuilder::new()
+        .request(Method::Ack, parse_uri_standalone(request_uri).unwrap())
+        .via("SIP/2.0/UDP 192.0.2.10:5060;branch=z9hG4bK-flow-ack".to_string())
+        .to("<sip:+15550100001@siphon.example.com>;tag=phone-tag".to_string())
+        .from("<sip:+15550100002@siphon.example.com>;tag=caller-tag".to_string())
+        .call_id("flow-ack".to_string())
+        .cseq("1 ACK".to_string())
+        .content_length(0);
+    if let Some(route) = route {
+        builder = builder.header("Route", route.to_string());
+    }
+    builder.build().unwrap()
+}
+
+#[test]
+fn ack_to_the_flow_target_with_no_route_left_rides_the_branch_flow() {
+    // RFC 3261 §12.2.1.1: no route set, so the ACK goes to the remote target,
+    // which is exactly what the INVITE was relayed to over the flow.
+    let ack = flow_ack(FLOW_CONTACT, None);
+    assert!(ack_rides_branch_flow(
+        &ack,
+        &flow_pinned_branch(Some(FLOW_CONTACT))
+    ));
+}
+
+#[test]
+fn ack_to_the_flow_target_rides_the_flow_despite_contact_parameter_drift() {
+    // The 2xx Contact can carry parameters the registered one did not (`ob`),
+    // and the transport token is case-insensitive: the same remote target.
+    let ack = flow_ack("sip:+15550100001@10.20.30.40:12104;transport=tls;ob", None);
+    assert!(ack_rides_branch_flow(
+        &ack,
+        &flow_pinned_branch(Some(FLOW_CONTACT))
+    ));
+}
+
+#[test]
+fn ack_with_a_route_left_follows_the_route_set_not_the_flow() {
+    // A downstream proxy Record-Routed: the route set, not the flow, decides.
+    let ack = flow_ack(
+        FLOW_CONTACT,
+        Some("<sip:198.51.100.20:5061;transport=tls;lr>"),
+    );
+    assert!(!ack_rides_branch_flow(
+        &ack,
+        &flow_pinned_branch(Some(FLOW_CONTACT))
+    ));
+}
+
+#[test]
+fn ack_to_another_target_does_not_ride_the_flow() {
+    // A fork's other flow-pinned branch, or a different port: not this target.
+    let ack = flow_ack("sip:+15550100001@10.20.30.41:12104;transport=TLS", None);
+    assert!(!ack_rides_branch_flow(
+        &ack,
+        &flow_pinned_branch(Some(FLOW_CONTACT))
+    ));
+    let ack = flow_ack("sip:+15550100001@10.20.30.40:12105;transport=TLS", None);
+    assert!(!ack_rides_branch_flow(
+        &ack,
+        &flow_pinned_branch(Some(FLOW_CONTACT))
+    ));
+    let ack = flow_ack("sip:+15550100001@10.20.30.40:12104;transport=TCP", None);
+    assert!(!ack_rides_branch_flow(
+        &ack,
+        &flow_pinned_branch(Some(FLOW_CONTACT))
+    ));
+}
+
+#[test]
+fn ack_for_a_branch_routed_by_resolution_does_not_ride_a_flow() {
+    // No flow pin: resolve_in_dialog_flow_uri keeps deciding (load-balanced
+    // members, IMS route-set divergence).
+    let ack = flow_ack(FLOW_CONTACT, None);
+    assert!(!ack_rides_branch_flow(&ack, &flow_pinned_branch(None)));
 }

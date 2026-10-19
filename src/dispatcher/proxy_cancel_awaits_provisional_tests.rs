@@ -913,6 +913,7 @@ fn caller_gave_up_on_a_silent_stream_branch(
             destination,
             transport: Transport::Tcp,
             connection_id: STREAM_CONNECTION,
+            flow_request_uri: None,
         },
     );
     state.session_store.insert(session);

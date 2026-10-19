@@ -473,6 +473,7 @@ pub(super) fn relay_request(
 
     // Serialize the relayed request
     let data = Bytes::from(relayed.to_bytes());
+    let flow_request_uri = flow.and_then(|_| relayed_request_uri(&relayed));
 
     debug!(
         branch = %branch,
@@ -547,6 +548,7 @@ pub(super) fn relay_request(
                         destination,
                         transport: outbound_transport,
                         connection_id: placeholder_connection_id,
+                        flow_request_uri: flow_request_uri.clone(),
                     },
                 );
                 session.on_reply_callback = on_reply_callback;
@@ -683,6 +685,7 @@ pub(super) fn relay_request(
                         destination,
                         transport: outbound_transport,
                         connection_id,
+                        flow_request_uri,
                     },
                 );
             }
@@ -1094,6 +1097,7 @@ pub(super) fn relay_fork_branch(
     }
 
     let data = Bytes::from(relayed.to_bytes());
+    let flow_request_uri = flow.and_then(|_| relayed_request_uri(&relayed));
 
     // Mark branch as Trying in aggregator (before any send, so a synchronous
     // response can find a branch in the right state).
@@ -1153,6 +1157,7 @@ pub(super) fn relay_fork_branch(
                     destination,
                     transport: outbound_transport,
                     connection_id: placeholder_connection_id,
+                    flow_request_uri,
                 },
                 branch_index,
             );
@@ -1336,6 +1341,15 @@ fn record_client_hop(
 }
 
 /// Record-Route entries on `message`, flattened.
+/// The Request-URI a relayed request went out with: for a flow-pinned branch,
+/// the remote target it reached over that flow ([`ClientBranch::flow_request_uri`]).
+fn relayed_request_uri(relayed: &SipMessage) -> Option<crate::sip::uri::SipUri> {
+    match &relayed.start_line {
+        StartLine::Request(request_line) => Some(request_line.request_uri.clone()),
+        StartLine::Response(_) => None,
+    }
+}
+
 fn record_route_count(message: &SipMessage) -> usize {
     message
         .headers

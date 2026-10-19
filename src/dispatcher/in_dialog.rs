@@ -155,6 +155,48 @@ pub(super) fn ack_forward_hop(
     Some(established)
 }
 
+/// Whether an end-to-end 2xx ACK goes over the flow its INVITE branch took
+/// rather than to a resolution of its Request-URI.
+///
+/// With no Route left once our own are consumed, the ACK's next hop is its
+/// Request-URI: the dialog's remote target (RFC 3261 §12.2.1.1 / §16.12). When
+/// the INVITE branch was pinned to a captured flow and relayed to that same
+/// remote target, the flow is how that target is reached (RFC 5626 §5.3,
+/// RFC 5923): its Contact may name a private address behind NAT, which a fresh
+/// resolution would try to connect to and never reach. The ACK takes the
+/// branch's connection, as the INVITE did.
+///
+/// A remaining Route (a downstream proxy Record-Routed) or a branch routed by
+/// resolution leaves the decision to [`resolve_in_dialog_flow_uri`].
+pub(super) fn ack_rides_branch_flow(ack: &SipMessage, branch: &ClientBranch) -> bool {
+    let Some(flow_target) = branch.flow_request_uri.as_ref() else {
+        return false;
+    };
+    if core::next_hop_from_route(&ack.headers).is_some() {
+        return false;
+    }
+    match &ack.start_line {
+        StartLine::Request(request_line) => {
+            same_remote_target(&request_line.request_uri, flow_target)
+        }
+        StartLine::Response(_) => false,
+    }
+}
+
+/// Whether two URIs name the same remote target: scheme, user, host, port and
+/// transport, compared as RFC 3261 §19.1.4 compares them (host and the
+/// transport token case-insensitively). Other parameters are ignored, since a
+/// 2xx Contact routinely carries ones the URI the INVITE was relayed to did not
+/// (`ob`, RFC 5626 §5.4).
+fn same_remote_target(left: &SipUri, right: &SipUri) -> bool {
+    let transport = |uri: &SipUri| uri.get_param("transport").map(str::to_ascii_lowercase);
+    left.scheme == right.scheme
+        && left.user == right.user
+        && left.host.eq_ignore_ascii_case(&right.host)
+        && left.port == right.port
+        && transport(left) == transport(right)
+}
+
 /// Pin the outbound transport to a matching IPsec SA's protocol
 /// (3GPP TS 33.203 §7.1).  When `destination` matches a registered UE binding,
 /// the SA's pinned protocol (UDP vs TCP) overrides whatever the dialog route

@@ -189,6 +189,10 @@ entry, but a working config keeps working.
 
 ### Fixed
 
+- **A 2xx ACK goes over the flow its INVITE took.** For an INVITE relayed with
+  `request.relay(flow=...)`, the ACK addressed to the callee's Contact with no
+  Route left now reuses the branch's connection (RFC 5626 §5.3, RFC 5923)
+  instead of resolving a Contact that may be a private address behind NAT.
 - **`b2bua.originate(session_timer=...)` reaches the call from a script.** The
   `siphon.b2bua` namespace scripts call did not take the argument and raised
   `TypeError`; it now hands every argument of the binding on by name.
