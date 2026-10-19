@@ -1711,12 +1711,18 @@ impl PyCall {
     ///         on the early dialog and, unless ``answer()`` names another, on
     ///         the dialog after it (see ``answer()``). Ignored on a ``100``.
     ///     contact_params: Optional Contact header parameters for ``contact``.
+    ///     anchor: Answer the caller's offer on the media engine
+    ///         (``answer_local``) and send the engine's answer as the body, so
+    ///         ``rtpengine.play_media`` plays into it and a later ``dial()``
+    ///         connects the callee behind it. Takes no ``body``.
+    ///     profile: Media profile for ``anchor=True``.
+    ///     ws_uri: WebSocket bridge URI for ``anchor=True``.
     ///
     /// Example:
     ///     call.progress(183, "Session Progress", body=sdp,
     ///                   content_type="application/sdp",
     ///                   headers={"P-Early-Media": "sendrecv"})
-    #[pyo3(signature = (code, reason="Ringing", body=None, content_type=None, headers=None, contact=None, contact_params=None))]
+    #[pyo3(signature = (code, reason="Ringing", body=None, content_type=None, headers=None, contact=None, contact_params=None, anchor=false, profile=None, ws_uri=None))]
     #[allow(clippy::too_many_arguments)]
     fn progress(
         &mut self,
@@ -1727,6 +1733,9 @@ impl PyCall {
         headers: Option<&Bound<'_, pyo3::types::PyDict>>,
         contact: Option<&str>,
         contact_params: Option<&str>,
+        anchor: bool,
+        profile: Option<&str>,
+        ws_uri: Option<&str>,
     ) -> PyResult<()> {
         if !(100..200).contains(&code) {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
@@ -1735,6 +1744,23 @@ impl PyCall {
         }
         let headers = uas_response_headers("call.progress", headers)?;
         let contact = checked_contact("call.progress", contact, contact_params)?;
+        if anchor {
+            if body.is_some() || code == 100 {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "call.progress(anchor=True) sends the media engine's answer: it takes no body, and not a 100",
+                ));
+            }
+            let invite = self.locked_invite()?;
+            set_local_contact("call.progress", &self.id, contact);
+            return crate::dispatcher::b2bua_progress_call_anchored_from(
+                &self.id, &invite, code, reason, profile, ws_uri, &headers,
+            )
+            .map_err(|error| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "call.progress(anchor=True): {error}"
+                ))
+            });
+        }
 
         let body_bytes = match body {
             Some(obj) => Some(super::request::extract_body_bytes(obj)?),
@@ -1816,6 +1842,7 @@ impl PyCall {
         format: Option<&str>,
     ) -> PyResult<()> {
         super::request::validate_send_socket(send_socket.as_deref())?;
+        super::call_media::refuse_dial_behind_early_answer(&self.id, false)?;
         let route = super::route_entries::route_set_from(&route)?;
         self.max_duration_secs = max_duration.or(self.max_duration_secs);
         // Number normalization (a named `number_policy=`, an inline `format=`,
@@ -1958,6 +1985,7 @@ impl PyCall {
                 default_timeout: timeout,
             };
         } else {
+            super::call_media::refuse_dial_behind_early_answer(&self.id, true)?;
             self.action = CallAction::Fork {
                 targets: target_uris,
                 flows,
@@ -2017,6 +2045,7 @@ impl PyCall {
                 "call.route() requires at least one route",
             ));
         }
+        super::call_media::refuse_dial_behind_early_answer(&self.id, false)?;
         self.action = CallAction::RouteSequence {
             routes: collected,
             send_socket,
@@ -3193,6 +3222,9 @@ mod tests {
                     Some(&headers),
                     None,
                     None,
+                    false,
+                    None,
+                    None,
                 )
                 .expect_err("Contact is siphon's");
             assert!(refused.to_string().contains("call.progress(headers=…)"));
@@ -3226,7 +3258,18 @@ mod tests {
                     "{refused}"
                 );
                 let refused = call
-                    .progress(183, "Session Progress", None, None, None, contact, params)
+                    .progress(
+                        183,
+                        "Session Progress",
+                        None,
+                        None,
+                        None,
+                        contact,
+                        params,
+                        false,
+                        None,
+                        None,
+                    )
                     .expect_err("not a Contact siphon puts on the wire");
                 assert!(
                     refused.to_string().contains("call.progress(contact"),

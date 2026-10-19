@@ -481,6 +481,10 @@ pub fn send_uas_response(
     // can collide with them.
     crate::b2bua::uas_headers::apply(&mut response, headers);
     if !final_response && (101..200).contains(&code) {
+        // An SDP answer in siphon's own 18x is the caller's answer from now on.
+        if sdp_in_body(content_type.unwrap_or_default(), &response.body).is_some() {
+            super::hold_early_answer(state, internal_call_id, invite, &response.body);
+        }
         // siphon's own provisional is reliable toward a caller that required
         // `100rel` (RFC 3262 §3), and waits behind an unacknowledged one.
         return send_a_leg_provisional(internal_call_id, response, false, None, state);
@@ -797,6 +801,47 @@ pub fn b2bua_set_local_contact(internal_call_id: &str, contact: String) -> bool 
         .set_a_leg_local_contact(internal_call_id, contact)
 }
 
+/// Why a script's dial on `internal_call_id` cannot go out behind the early
+/// answer siphon gave the caller ([`super::dial_refusal`]), or `None`.
+pub fn b2bua_dial_refusal(internal_call_id: &str, fork: bool) -> Option<String> {
+    let control = B2BUA_CONTROL.get()?;
+    super::dial_refusal(&control.state, internal_call_id, fork)
+}
+
+/// A script's anchored `call.progress(anchor=True)`: answer the caller's offer
+/// on the media engine (`answer_local`) and send its answer in the 1xx, as the
+/// control plane's anchored `progress` does. `invite` is the script's own, since
+/// the call does not hold it until the handler returns.
+pub fn b2bua_progress_call_anchored_from(
+    internal_call_id: &str,
+    invite: &SipMessage,
+    code: u16,
+    reason: &str,
+    profile: Option<&str>,
+    ws_uri: Option<&str>,
+    headers: &[(String, String)],
+) -> Result<(), String> {
+    let control = B2BUA_CONTROL.get().ok_or("B2BUA is not running")?;
+    let state = &control.state;
+    let source_ip = state
+        .call_actors
+        .get_call(internal_call_id)
+        .map(|call| call.a_leg.transport.remote_addr.ip())
+        .ok_or("call is gone")?;
+    let _enter = control.runtime.enter();
+    early_media_anchor_progress(
+        internal_call_id,
+        invite,
+        source_ip,
+        code,
+        reason,
+        profile,
+        ws_uri,
+        headers,
+        state,
+    )
+}
+
 /// Imperatively send a provisional (1xx) for a UAS-mode B2BUA call
 /// (`call.progress()`) — e.g. a 183 with early-media SDP. Does not answer the
 /// call. Returns `false` if the call is gone / dispatcher down.
@@ -1069,6 +1114,19 @@ pub(crate) fn b2bua_dial_call_with_state(
         // stored A-leg INVITE, which keeps the caller's own offer so a failed
         // dial is still answerable into voicemail.
         call.control_dial_offer = Some(template.body.clone());
+    }
+
+    // Behind an early answer siphon already gave the caller, the callee is
+    // offered the engine's far leg (see `early_dial`), one target at a time.
+    if shaping.profile.is_none() {
+        if let Some(refusal) = super::dial_refusal(state, &internal_call_id, parallel) {
+            return Err(DialError::Media(refusal));
+        }
+        if let Some(invite) =
+            super::invite_for_dial(state, &internal_call_id, &template).map_err(DialError::Media)?
+        {
+            template = invite;
+        }
     }
 
     let extra_headers =

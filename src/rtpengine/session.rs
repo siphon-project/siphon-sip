@@ -370,6 +370,11 @@ pub struct MediaSessionStore {
     /// What each call was first anchored with, once a bridge has retired its
     /// own session or made it a pair's. See [`own_media`].
     own_media: DashMap<String, own_media::Recorded>,
+    /// The answer the media engine gave each call it answered itself
+    /// (`answer_local`), until another session replaces it. An 18x carrying
+    /// exactly this answer is early media the engine can still connect a
+    /// callee behind (`offer_far`).
+    local_answers: DashMap<String, String>,
 }
 
 mod own_media;
@@ -400,7 +405,20 @@ impl MediaSessionStore {
             sessions: DashMap::new(),
             parties: Default::default(),
             own_media: DashMap::new(),
+            local_answers: DashMap::new(),
         }
+    }
+
+    /// Record that the engine answered `call_id` itself with `answer_sdp`.
+    /// Called after the session is inserted, which clears any earlier one.
+    pub fn record_local_answer(&self, call_id: &str, answer_sdp: &str) {
+        self.local_answers
+            .insert(call_id.to_string(), answer_sdp.to_string());
+    }
+
+    /// The answer the engine gave `call_id` itself, while that session lasts.
+    pub fn local_answer(&self, call_id: &str) -> Option<String> {
+        self.local_answers.get(call_id).map(|entry| entry.clone())
     }
 
     /// Insert or update a media session.
@@ -412,6 +430,7 @@ impl MediaSessionStore {
     pub fn insert(&self, session: MediaSession) {
         let engine_call_id = session.rtpengine_id().to_string();
         let call_id = session.call_id.clone();
+        self.local_answers.remove(&call_id);
         if engine_call_id != call_id {
             match self.parties.get_mut(&engine_call_id) {
                 Some(mut parties) => parties.expires_at = None,
@@ -616,6 +635,7 @@ impl MediaSessionStore {
     /// call when it retired that session ([`own_media`]).
     pub fn remove(&self, call_id: &str) -> Option<MediaSession> {
         self.forget_own_media(call_id);
+        self.local_answers.remove(call_id);
         self.take_session(call_id)
     }
 
@@ -645,6 +665,14 @@ impl MediaSessionStore {
             if entry.from_tag != to_tag {
                 entry.to_tag = Some(to_tag);
             }
+        }
+    }
+
+    /// Forget the answering party of `call_id`'s session: the far leg it was on
+    /// is gone and the engine holds the offerer alone again.
+    pub fn clear_to_tag(&self, call_id: &str) {
+        if let Some(mut entry) = self.sessions.get_mut(call_id) {
+            entry.to_tag = None;
         }
     }
 

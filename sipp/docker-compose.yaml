@@ -7027,7 +7027,7 @@ services:
   #   docker compose -f sipp/docker-compose.yaml --profile siphon-rtp-native \
   #     up --abort-on-container-exit sipp-rtp-native-uac
   siphon-rtp-engine:
-    image: ghcr.io/siphon-project/siphon-rtp:0.12.0
+    image: ghcr.io/siphon-project/siphon-rtp:0.15.0
     container_name: siphon-rtp-engine
     command:
       - "--control"
@@ -7060,6 +7060,7 @@ services:
       - dial-bridge
       - control-transfer
       - b2bua-replaces-srtp-siphon-rtp
+      - b2bua-early-dial
 
   # Readiness gate for the distroless engine: exits 0 once /readyz answers.
   siphon-rtp-engine-ready:
@@ -7093,6 +7094,7 @@ services:
       - dial-bridge
       - control-transfer
       - b2bua-replaces-srtp-siphon-rtp
+      - b2bua-early-dial
 
   # ── Native JSON control plane (media.backend: siphon-rtp) ─────────────────
   siphon-rtp-native:
@@ -10017,12 +10019,185 @@ services:
     profiles:
       - b2bua-admission-gateway
 
+  # ── B2BUA: a dial behind siphon's own early answer, real siphon-rtp ──────
+  # The script answers the caller in early media on the engine (answer_local
+  # in a 183) and dials the callee behind it on an engine far leg (offer_far).
+  # The caller's scenario asserts every later 18x and the 200 repeat the 183's
+  # SDP byte for byte; the MEDIA CDR says the audio met; the failure handler
+  # asserts a busy callee's far leg was released before it ran. The cases are in
+  # sipp/b2bua-early-dial/b2bua_early_dial.py.
+  #
+  #   172.20.0.3  siphon    172.20.0.4  callee (answers)   172.20.0.5  callee (486)
+  #   172.20.0.6  caller    172.20.0.7  CDR assertion one-shot
+  siphon-b2bua-early-dial:
+    image: sipp-siphon   # reuse the siphon image (built by the `siphon` service)
+    build:
+      context: ..
+    container_name: siphon-b2bua-early-dial
+    depends_on:
+      siphon-rtp-engine-ready:
+        condition: service_completed_successfully
+    volumes:
+      - ./b2bua-early-dial/siphon-b2bua-early-dial.yaml:/etc/siphon/siphon.yaml:ro
+      - ./b2bua-early-dial/b2bua_early_dial.py:/etc/siphon/scripts/b2bua_early_dial.py:ro
+      - early-dial-cdr:/var/log/siphon
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.3
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import socket; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(2); s.sendto(b'OPTIONS sip:siphon.test SIP/2.0\\r\\nVia: SIP/2.0/UDP 127.0.0.1:15060;branch=z9hG4bK-hc\\r\\nFrom: <sip:hc@siphon.test>;tag=hc\\r\\nTo: <sip:siphon.test>\\r\\nCall-ID: hc@check\\r\\nCSeq: 1 OPTIONS\\r\\nMax-Forwards: 1\\r\\nContent-Length: 0\\r\\n\\r\\n', ('127.0.0.1',5060)); s.recv(1024); s.close()\""]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+      start_period: 10s
+    profiles:
+      - b2bua-early-dial
+
+  sipp-b2bua-early-dial-uas:
+    image: ctaloi/sipp:latest
+    container_name: sipp-b2bua-early-dial-uas
+    depends_on:
+      siphon-b2bua-early-dial:
+        condition: service_healthy
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.4
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/b2bua_early_dial_uas.xml
+      - -p
+      - "5060"
+      - -mi
+      - "172.20.0.4"
+      - -m
+      - "1"
+      - -timeout
+      - "40"
+      - -timeout_error
+      - -trace_err
+    profiles:
+      - b2bua-early-dial
+
+  sipp-b2bua-early-dial-busy-uas:
+    image: ctaloi/sipp:latest
+    container_name: sipp-b2bua-early-dial-busy-uas
+    depends_on:
+      siphon-b2bua-early-dial:
+        condition: service_healthy
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.5
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/b2bua_early_dial_busy_uas.xml
+      - -p
+      - "5060"
+      - -mi
+      - "172.20.0.5"
+      - -m
+      - "1"
+      - -timeout
+      - "40"
+      - -timeout_error
+      - -trace_err
+    profiles:
+      - b2bua-early-dial
+
+  sipp-b2bua-early-dial-uac:
+    image: ctaloi/sipp:latest
+    container_name: sipp-b2bua-early-dial-uac
+    depends_on:
+      siphon-b2bua-early-dial:
+        condition: service_healthy
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.6
+    entrypoint:
+      - sipp
+      - "172.20.0.3:5060"
+      - -sf
+      - /sipp/scenarios/b2bua_early_dial_uac.xml
+      - -s
+      - connect
+      - -mi
+      - "172.20.0.6"
+      - -m
+      - "1"
+      - -l
+      - "1"
+      - -timeout
+      - "40"
+      - -timeout_error
+      - -trace_err
+    profiles:
+      - b2bua-early-dial
+
+  sipp-b2bua-early-dial-busy-uac:
+    image: ctaloi/sipp:latest
+    container_name: sipp-b2bua-early-dial-busy-uac
+    depends_on:
+      siphon-b2bua-early-dial:
+        condition: service_healthy
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.6
+    entrypoint:
+      - sipp
+      - "172.20.0.3:5060"
+      - -sf
+      - /sipp/scenarios/b2bua_early_dial_busy_uac.xml
+      - -s
+      - busy
+      - -mi
+      - "172.20.0.6"
+      - -m
+      - "1"
+      - -l
+      - "1"
+      - -timeout
+      - "40"
+      - -timeout_error
+      - -trace_err
+    profiles:
+      - b2bua-early-dial
+
+  # Reads the MEDIA CDR siphon wrote into the shared volume, after the call.
+  early-dial-cdr-assert:
+    image: python:3.12-slim
+    container_name: sipp-early-dial-cdr-assert
+    volumes:
+      - .:/app:ro
+      - early-dial-cdr:/var/log/siphon:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.7
+    entrypoint:
+      - python3
+      - /app/assert_media.py
+      - cdr
+      - --path
+      - /var/log/siphon/cdr.jsonl
+    profiles:
+      - b2bua-early-dial
+
 # ── Volumes ────────────────────────────────────────────────────────────────
 volumes:
   # siphon's CDR file, shared with the assertion one-shot. Removed by
   # `down -v` between runs so a stale record from an earlier run can never be
   # what makes the assertion pass.
   bridge-cdr:
+  # The same, for the b2bua-early-dial profile.
+  early-dial-cdr:
 
 # ── Network ────────────────────────────────────────────────────────────────
 networks:

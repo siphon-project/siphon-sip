@@ -64,3 +64,13 @@ impl PyMediaHandle {
         self.anchored
     }
 }
+
+/// Raise `ValueError` for a dial that cannot go out behind an early answer
+/// siphon already gave the caller (see `dispatcher::b2bua::early_dial`): one
+/// that is not a media engine session, or a parallel `fork`.
+pub(super) fn refuse_dial_behind_early_answer(call_id: &str, fork: bool) -> PyResult<()> {
+    match crate::dispatcher::b2bua_dial_refusal(call_id, fork) {
+        Some(refusal) => Err(pyo3::exceptions::PyValueError::new_err(refusal)),
+        None => Ok(()),
+    }
+}
