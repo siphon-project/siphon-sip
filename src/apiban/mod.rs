@@ -242,12 +242,79 @@ struct ApiBanResponse {
     ipaddress: Option<Vec<String>>,
 }
 
-/// Client that polls APIBAN and maintains a shared set of banned IPs.
-pub struct ApiBanClient {
+/// The `security.apiban` parameters the poller reads at every iteration, so a
+/// config reload changes them without restarting it.
+///
+/// `Debug` never prints the key.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ApiBanParams {
     api_key: String,
     interval: Duration,
     /// How long a fetched entry stays blocked. `None` = never expires.
     ban_ttl: Option<Duration>,
+}
+
+impl ApiBanParams {
+    /// The parameters `security.apiban` describes.
+    pub fn from_config(config: &ApiBanConfig) -> Self {
+        Self {
+            api_key: config.api_key.clone(),
+            interval: Duration::from_secs(config.interval_secs),
+            // 0 means "never expire" — the pre-TTL behaviour, kept reachable.
+            ban_ttl: match config.ban_ttl_secs {
+                0 => None,
+                secs => Some(Duration::from_secs(secs)),
+            },
+        }
+    }
+}
+
+impl std::fmt::Debug for ApiBanParams {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ApiBanParams")
+            .field("api_key", &"<redacted>")
+            .field("interval", &self.interval)
+            .field("ban_ttl", &self.ban_ttl)
+            .finish()
+    }
+}
+
+/// The running poller's parameters, held by the config reloader. Applying
+/// new ones wakes the poller, which reads them before its next fetch: a new
+/// interval or key does not wait out the old interval. The poller is never
+/// respawned.
+#[derive(Clone)]
+pub struct ApiBanControl {
+    params: Arc<arc_swap::ArcSwap<ApiBanParams>>,
+    wake: Arc<tokio::sync::Notify>,
+}
+
+impl ApiBanControl {
+    /// Hand `params` to the poller. A no-op when nothing changed.
+    pub fn apply(&self, params: ApiBanParams) {
+        if **self.params.load() == params {
+            return;
+        }
+        self.params.store(Arc::new(params));
+        self.wake.notify_one();
+    }
+
+    /// The parameters in force.
+    pub fn params(&self) -> Arc<ApiBanParams> {
+        self.params.load_full()
+    }
+}
+
+/// Client that polls APIBAN and maintains a shared set of banned IPs.
+pub struct ApiBanClient {
+    /// Key, interval and entry lifetime, swapped by a config reload through
+    /// the [`ApiBanControl`] that [`Self::start`] returns.
+    params: Arc<arc_swap::ArcSwap<ApiBanParams>>,
+    /// Woken by a reload so new parameters do not wait out the old interval.
+    wake: Arc<tokio::sync::Notify>,
+    /// Where the feed is fetched from: the APIBAN API, or a test's mock.
+    base_url: String,
     /// Sources that must never be blocked no matter what the feed says
     /// (`security.trusted_cidrs`, and gateways under `trust_gateways`): own
     /// trunks, monitoring, management.
@@ -270,18 +337,23 @@ impl ApiBanClient {
             .build()?;
 
         Ok(Self {
-            api_key: config.api_key.clone(),
-            interval: Duration::from_secs(config.interval_secs),
-            // 0 means "never expire" — the pre-TTL behaviour, kept reachable.
-            ban_ttl: match config.ban_ttl_secs {
-                0 => None,
-                secs => Some(Duration::from_secs(secs)),
-            },
+            params: Arc::new(arc_swap::ArcSwap::from_pointee(ApiBanParams::from_config(
+                config,
+            ))),
+            wake: Arc::new(tokio::sync::Notify::new()),
+            base_url: APIBAN_BASE_URL.to_owned(),
             trust: SourceTrust::from_cidrs(trusted_cidrs),
             banned: Arc::new(ApiBanStore::new()),
             client,
             firewall: None,
         })
+    }
+
+    /// Fetch from `base_url` instead of the APIBAN API: a test's mock feed.
+    #[cfg(test)]
+    pub(crate) fn with_base_url(mut self, base_url: String) -> Self {
+        self.base_url = base_url;
+        self
     }
 
     /// Returns the shared banned IP store for ACL integration.
@@ -352,32 +424,65 @@ impl ApiBanClient {
         }));
     }
 
-    /// Spawn the background polling task. Returns a `JoinHandle` for the poll loop.
-    pub fn start(self) -> tokio::task::JoinHandle<()> {
+    /// Spawn the background polling task, once, returning the handle a config
+    /// reload changes its parameters through.
+    pub fn start(self) -> ApiBanControl {
         self.follow_gateway_view();
         let _ = INSTALLED.set(InstalledBlocklist {
             store: Arc::clone(&self.banned),
             trust: self.trust.clone(),
             firewall: self.firewall.clone(),
         });
+        self.spawn_poller()
+    }
+
+    /// The control handle for this client's parameters.
+    pub(crate) fn control(&self) -> ApiBanControl {
+        ApiBanControl {
+            params: Arc::clone(&self.params),
+            wake: Arc::clone(&self.wake),
+        }
+    }
+
+    /// Spawn the poll loop alone, without installing the process-wide
+    /// blocklist: [`Self::start`]'s last step, and what a test drives.
+    pub(crate) fn spawn_poller(self) -> ApiBanControl {
+        let control = self.control();
         tokio::spawn(async move {
             self.poll_loop().await;
-        })
+        });
+        control
     }
 
     async fn poll_loop(self) {
         let mut last_id = INITIAL_ID.to_string();
+        let mut params = self.params.load_full();
 
         info!(
-            interval_secs = self.interval.as_secs(),
-            ban_ttl_secs = self.ban_ttl.map(|ttl| ttl.as_secs()).unwrap_or(0),
+            interval_secs = params.interval.as_secs(),
+            ban_ttl_secs = params.ban_ttl.map(|ttl| ttl.as_secs()).unwrap_or(0),
             trusted_cidrs = self.trust.configured_len(),
             trust_gateways = self.trust.gateways().is_some(),
             "APIBAN client started"
         );
 
         loop {
-            match self.fetch_all(&mut last_id).await {
+            let current = self.params.load_full();
+            if current.api_key != params.api_key {
+                // The cursor belongs to the old account's view of the feed.
+                last_id = INITIAL_ID.to_string();
+                info!("APIBAN: key changed by a config reload, fetching the feed from the start");
+            }
+            if current.interval != params.interval || current.ban_ttl != params.ban_ttl {
+                info!(
+                    interval_secs = current.interval.as_secs(),
+                    ban_ttl_secs = current.ban_ttl.map(|ttl| ttl.as_secs()).unwrap_or(0),
+                    "APIBAN: parameters changed by a config reload"
+                );
+            }
+            params = current;
+
+            match self.fetch_all(&mut last_id, &params.api_key).await {
                 Ok(count) => {
                     if count > 0 {
                         info!(
@@ -401,7 +506,12 @@ impl ApiBanClient {
                 info!(expired, total = self.banned.len(), "APIBAN entries expired");
             }
 
-            tokio::time::sleep(self.interval).await;
+            // A reload wakes this early; `Notify` keeps a wake that arrives
+            // mid-fetch, so it is not lost.
+            tokio::select! {
+                () = tokio::time::sleep(params.interval) => {}
+                () = self.wake.notified() => {}
+            }
         }
     }
 
@@ -413,6 +523,9 @@ impl ApiBanClient {
     /// exercised on the path that actually runs, not on a re-creation of it.
     pub(crate) fn ingest(&self, addresses: &[String]) -> usize {
         let mut added = 0;
+        // A reload's new lifetime applies to what is ingested from now on; an
+        // entry already held keeps the deadline it was given.
+        let ban_ttl = self.params.load().ban_ttl;
 
         for ip_str in addresses {
             let Ok(ip_address) = ip_str.parse::<IpAddr>() else {
@@ -443,10 +556,10 @@ impl ApiBanClient {
                 None => {}
             }
 
-            if self.banned.insert(ip_address, self.ban_ttl) {
+            if self.banned.insert(ip_address, ban_ttl) {
                 added += 1;
                 if let Some(firewall) = &self.firewall {
-                    match self.ban_ttl {
+                    match ban_ttl {
                         Some(ttl) => firewall.ban(ip_address, ttl),
                         None => firewall.ban_permanent(ip_address),
                     }
@@ -460,25 +573,30 @@ impl ApiBanClient {
     /// Fetch all new entries since `last_id`, paginating in batches of 250.
     /// Updates `last_id` to the most recent ID returned.
     /// Returns the number of new IPs added.
-    async fn fetch_all(&self, last_id: &mut String) -> Result<usize, ApiBanError> {
+    async fn fetch_all(&self, last_id: &mut String, api_key: &str) -> Result<usize, ApiBanError> {
         let mut total_added = 0;
 
         loop {
-            let url = format!("{}/{}/banned/{}", APIBAN_BASE_URL, self.api_key, last_id);
+            // The key is part of the path, so no error built from this request
+            // may carry its URL: `without_url` strips it from every one.
+            let url = format!("{}/{}/banned/{}", self.base_url, api_key, last_id);
 
             let response = self
                 .client
                 .get(&url)
                 .send()
                 .await
-                .map_err(ApiBanError::Http)?;
+                .map_err(|error| ApiBanError::Http(error.without_url()))?;
 
             let status = response.status();
             if status == reqwest::StatusCode::UNAUTHORIZED {
                 return Err(ApiBanError::InvalidApiKey);
             }
 
-            let body = response.text().await.map_err(ApiBanError::Http)?;
+            let body = response
+                .text()
+                .await
+                .map_err(|error| ApiBanError::Http(error.without_url()))?;
 
             // APIBAN returns a plain text message when there are no new bans
             if body.contains("no new bans") {
@@ -486,7 +604,16 @@ impl ApiBanClient {
             }
 
             if !status.is_success() {
-                return Err(ApiBanError::BadStatus(status.as_u16(), body));
+                // A server that echoes the request path would put the key in
+                // the log line this error becomes.
+                return Err(ApiBanError::BadStatus(
+                    status.as_u16(),
+                    if api_key.is_empty() {
+                        body
+                    } else {
+                        body.replace(api_key, "<redacted>")
+                    },
+                ));
             }
 
             let parsed: ApiBanResponse = serde_json::from_str(&body).map_err(ApiBanError::Json)?;
@@ -679,9 +806,9 @@ mod tests {
 
     #[test]
     fn ban_ttl_secs_zero_means_permanent() {
-        assert_eq!(client_with(&[], 0).ban_ttl, None);
+        assert_eq!(client_with(&[], 0).params.load().ban_ttl, None);
         assert_eq!(
-            client_with(&[], 604_800).ban_ttl,
+            client_with(&[], 604_800).params.load().ban_ttl,
             Some(Duration::from_secs(604_800))
         );
     }
@@ -869,3 +996,7 @@ mod tests {
         assert_eq!(live[1], (ip("198.51.100.3"), None));
     }
 }
+
+#[cfg(test)]
+#[path = "reload_tests.rs"]
+mod reload_tests;

@@ -33,6 +33,9 @@ pub struct SecurityRuntime {
     auto_ban_slot: &'static OnceLock<Arc<AutoBanStore>>,
     filter_slot: &'static OnceLock<Arc<SecurityFilter>>,
     apiban: fn() -> Option<&'static InstalledBlocklist>,
+    /// The running APIBAN poller's parameters, when `security.apiban` was
+    /// configured at start-up. Set once, by [`Self::attach_apiban`].
+    apiban_control: OnceLock<crate::apiban::ApiBanControl>,
     publish_allow_set: fn(),
 }
 
@@ -62,6 +65,7 @@ impl SecurityRuntime {
             auto_ban_slot: super::auto_ban_slot(),
             filter_slot: super::security_filter_slot(),
             apiban: crate::apiban::installed,
+            apiban_control: OnceLock::new(),
             publish_allow_set: crate::firewall::gateways::request_publish,
         }
     }
@@ -82,8 +86,20 @@ impl SecurityRuntime {
             auto_ban_slot: Box::leak(Box::new(OnceLock::new())),
             filter_slot: Box::leak(Box::new(OnceLock::new())),
             apiban,
+            apiban_control: OnceLock::new(),
             publish_allow_set: || {},
         }
+    }
+
+    /// Hold the running APIBAN poller's parameters, so a reload can change
+    /// them. Called once at start-up, when `security.apiban` is configured.
+    pub fn attach_apiban(&self, control: crate::apiban::ApiBanControl) {
+        let _ = self.apiban_control.set(control);
+    }
+
+    /// The running APIBAN poller's parameters, when there is one.
+    pub fn apiban(&self) -> Option<&crate::apiban::ApiBanControl> {
+        self.apiban_control.get()
     }
 
     /// The shared `trusted_cidrs` list.

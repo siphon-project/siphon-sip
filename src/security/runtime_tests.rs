@@ -316,8 +316,10 @@ fn read_rss_kb() -> Option<u64> {
 /// Leak gate for reloading the security section: 1,000 reloads cycling every
 /// hot field through on, changed and off. The live-task count settles after
 /// the first enable (each prune task is spawned once), no reload subscribes
-/// another gateway-view listener, every replaced policy and trusted list is
-/// freed, the tables drain to nothing after a prune, and RSS plateaus.
+/// another gateway-view listener, every replaced policy, trusted list and set
+/// of APIBAN parameters is freed (the one APIBAN poller is woken by each
+/// reload, never respawned), the tables drain to nothing after a prune, and
+/// RSS plateaus.
 ///
 /// Runs in its own process: RSS and the task count belong to the whole binary.
 #[test]
@@ -341,14 +343,20 @@ fn measure_security_reload_cycles() {
             "  rate_limit: { window_secs: 60, max_requests: 5, ban_duration_secs: 600 }\n",
             "  scanner_block: { user_agents: [\"friendly-scanner\"] }\n",
             "  failed_auth_ban: { threshold: 3, window_secs: 600, ban_duration_secs: 3600 }\n",
+            "  apiban: { api_key: \"leak-key-one\", interval_secs: 3600 }\n",
         ),
         concat!(
             "security:\n",
             "  trusted_cidrs: [\"198.51.100.0/24\", \"203.0.113.9\", \"bogus\"]\n",
             "  rate_limit: { window_secs: 30, max_requests: 9, ban_duration_secs: 60 }\n",
             "  failed_auth_ban: { threshold: 5, window_secs: 60, ban_duration_secs: 600 }\n",
+            "  apiban: { api_key: \"leak-key-two\", interval_secs: 1800, ban_ttl_secs: 60 }\n",
         ),
-        "security:\n  trusted_cidrs: []\n",
+        concat!(
+            "security:\n",
+            "  trusted_cidrs: []\n",
+            "  apiban: { api_key: \"leak-key-one\", interval_secs: 900 }\n",
+        ),
     ];
     let config = |security: &str| {
         format!(
@@ -373,6 +381,25 @@ fn measure_security_reload_cycles() {
             None,
             no_blocklist,
         ));
+        // An APIBAN poller pointed at a closed port: every reload changes its
+        // parameters and wakes it, and it must stay the one task.
+        let closed = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a port");
+        let closed_url = format!("http://{}", closed.local_addr().expect("its address"));
+        drop(closed);
+        let apiban = crate::apiban::ApiBanClient::new(
+            &crate::config::ApiBanConfig {
+                api_key: "leak-key-one".to_owned(),
+                interval_secs: 900,
+                ban_ttl_secs: 604_800,
+            },
+            &[],
+        )
+        .expect("client builds")
+        .with_base_url(closed_url)
+        .spawn_poller();
+        security.attach_apiban(apiban.clone());
         let reloader = ConfigReloader::new(
             path.clone(),
             baseline,
@@ -417,6 +444,7 @@ fn measure_security_reload_cycles() {
         let replaced_policy = Arc::downgrade(&store.policy.load_full().expect("enabled"));
         let replaced_filter_policy = Arc::downgrade(&filter.policy.load_full());
         let replaced_trusted = Arc::downgrade(&*security.trusted().load());
+        let replaced_apiban = Arc::downgrade(&apiban.params());
 
         let cycle = |count: usize| {
             let security = &security;
@@ -452,6 +480,10 @@ fn measure_security_reload_cycles() {
         assert!(
             replaced_trusted.upgrade().is_none(),
             "a replaced list lives"
+        );
+        assert!(
+            replaced_apiban.upgrade().is_none(),
+            "replaced APIBAN parameters live"
         );
 
         // Still on, a prune past every window and ban empties the tables;

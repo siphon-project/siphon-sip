@@ -177,7 +177,8 @@ fn default_firewall_set_gateways_v6() -> String {
     "gateways6".to_string()
 }
 
-#[derive(Debug, Deserialize, Clone)]
+/// `Debug` never prints the key: a `{:?}` of the config must not leak it.
+#[derive(Deserialize, Clone)]
 pub struct ApiBanConfig {
     /// API key from apiban.org.
     pub api_key: String,
@@ -192,6 +193,17 @@ pub struct ApiBanConfig {
     /// stayed blocked for the life of the process.
     #[serde(default = "default_apiban_ban_ttl_secs")]
     pub ban_ttl_secs: u64,
+}
+
+impl std::fmt::Debug for ApiBanConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ApiBanConfig")
+            .field("api_key", &"<redacted>")
+            .field("interval_secs", &self.interval_secs)
+            .field("ban_ttl_secs", &self.ban_ttl_secs)
+            .finish()
+    }
 }
 
 fn default_apiban_interval_secs() -> u64 {

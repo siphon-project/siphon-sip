@@ -1217,7 +1217,7 @@ impl SiphonServer {
             &config,
             kernel_firewall.clone(),
             gateway_trust.clone(),
-            security_runtime.trusted(),
+            &security_runtime,
         );
 
         // --- Stream message-size ceiling ---

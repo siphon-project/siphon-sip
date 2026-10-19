@@ -62,6 +62,13 @@ entry, but a working config keeps working.
   absent at startup switches it on. A source newly in `trusted_cidrs` has its
   auto-ban, rate-limit and APIBAN entries lifted and the kernel gateway allow
   set follows; an unreadable entry is skipped and listed under `warnings`.
+  The `security.apiban` parameters apply to the running poller, which is woken
+  rather than respawned: a new `api_key` fetches the feed from the start, a new
+  `interval_secs` takes effect without waiting out the old one, and a new
+  `ban_ttl_secs` applies to entries ingested from then on. Turning APIBAN on or
+  off still needs a restart and is reported as such. The key is redacted from
+  the report, errors and logs, including the HTTP client's errors, which
+  carried the request URL with the key in it.
   **BREAKING (Rust library):** `UacSender::new` and `RegistrantManager::new`
   take a `SharedIdentityHeaders` in place of the `Option<String>` User-Agent,
   `DispatcherState`'s `server_header` / `user_agent_header` become one
@@ -201,6 +208,11 @@ entry, but a working config keeps working.
   `request.relay(flow=...)`, the ACK addressed to the callee's Contact with no
   Route left now reuses the branch's connection (RFC 5626 §5.3, RFC 5923)
   instead of resolving a Contact that may be a private address behind NAT.
+- **APIBAN: the API key no longer reaches the log.** The key is part of the
+  feed's request path, and a failed fetch logged the HTTP client's error, which
+  names the request URL, so every network error wrote the key in clear. The
+  URL is now stripped from those errors, a response body echoing the path is
+  redacted, and `Debug` of the `apiban` config prints `<redacted>`.
 - **`b2bua.originate(session_timer=...)` reaches the call from a script.** The
   `siphon.b2bua` namespace scripts call did not take the argument and raised
   `TypeError`; it now hands every argument of the binding on by name.
