@@ -109,6 +109,14 @@ Applied at runtime today:
   signal, bans in force keep their expiry, and removing a section turns the
   control off and lifts its bans. A control absent at start-up is switched on
   by the reload that adds it.
+- `security.apiban` parameters (`api_key`, `interval_secs`, `ban_ttl_secs`)
+  when APIBAN was configured at start-up. The running poller is woken and
+  uses them at once: a new interval does not wait out the old one, a new key
+  fetches the feed from the start, and a new lifetime applies to entries
+  ingested from then on. Adding or removing the whole `apiban` block is
+  reported as `security.apiban` needing a restart, since the transport ACL
+  only holds a blocklist when it was configured at start-up. The key never
+  appears in the report, an error or a log line.
 
 Every other change is reported as needing a restart
 and keeps being reported on each reload until the process restarts with it.

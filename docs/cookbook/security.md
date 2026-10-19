@@ -55,9 +55,12 @@ from the next request or signal; bans in force keep their expiry. Removing a
 section turns that control off and lifts its bans, kernel elements included.
 A source added to `trusted_cidrs` has every ban held against it lifted
 (auto-ban, rate limit, APIBAN, in the kernel too) and the gateway allow set is
-republished; one taken off is counted again from zero. The rest of `security:`
-(`firewall`, `trust_gateways`, `max_message_bytes`, `connection_limits`,
-`apiban`) needs a restart.
+republished; one taken off is counted again from zero. The `apiban`
+parameters apply to the running poller too (a new key fetches the feed from
+the start, a new interval takes effect at once, a new `ban_ttl_secs` applies to
+entries ingested from then on), but turning APIBAN on or off needs a restart.
+The rest of `security:` (`firewall`, `trust_gateways`, `max_message_bytes`,
+`connection_limits`) needs a restart.
 
 `trusted_cidrs` covers the feed too: an address listed by APIBAN that matches a
 trusted CIDR is dropped as the feed is ingested, so it reaches neither the

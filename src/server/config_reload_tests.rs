@@ -688,3 +688,132 @@ async fn the_runtime_security_fields_apply_and_the_rest_wait_for_a_restart() {
         .security_filter()
         .is_some_and(|filter| !filter.is_enabled()));
 }
+
+/// An APIBAN poller that never reaches a feed: a closed loopback port.
+async fn offline_apiban(api_key: &str) -> crate::apiban::ApiBanControl {
+    let closed = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("a port");
+    let url = format!("http://{}", closed.local_addr().expect("its address"));
+    drop(closed);
+    crate::apiban::ApiBanClient::new(
+        &crate::config::ApiBanConfig {
+            api_key: api_key.to_owned(),
+            interval_secs: 3600,
+            ban_ttl_secs: 604_800,
+        },
+        &[],
+    )
+    .expect("client builds")
+    .with_base_url(url)
+    .spawn_poller()
+}
+
+fn apiban_block(api_key: &str, interval_secs: u64) -> String {
+    format!("  apiban: {{ api_key: \"{api_key}\", interval_secs: {interval_secs} }}\n")
+}
+
+/// A reloader over `text` with a security runtime, its APIBAN poller attached
+/// when `apiban` is given.
+async fn security_fixture(
+    text: &str,
+    apiban: Option<crate::apiban::ApiBanControl>,
+) -> (tempfile::TempDir, PathBuf, ConfigReloader) {
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let path = directory.path().join("siphon.yaml");
+    std::fs::write(&path, text).expect("write the config");
+    let (_, baseline) = Config::load_with_document(&path).expect("the config loads");
+    let security = Arc::new(SecurityRuntime::detached(&[], None, None, || None));
+    if let Some(control) = apiban {
+        security.attach_apiban(control);
+    }
+    let reloader = ConfigReloader::new(
+        path.clone(),
+        baseline,
+        ReloadTargets::new(
+            IdentityHeaders::default().shared(),
+            PRODUCT_NAME,
+            PRODUCT_VERSION,
+        )
+        .with_security(security),
+    );
+    (directory, path, reloader)
+}
+
+/// New APIBAN parameters reach the running poller; the key never appears in
+/// the report, nor in the error of a file that fails validation beside it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn apiban_parameter_changes_apply_to_the_running_poller() {
+    let control = offline_apiban("first-secret-key").await;
+    let (_directory, path, reloader) = security_fixture(
+        &security_document(&apiban_block("first-secret-key", 3600)),
+        Some(control.clone()),
+    )
+    .await;
+
+    std::fs::write(
+        &path,
+        security_document(&apiban_block("second-secret-key", 60)),
+    )
+    .expect("rewrite");
+    let report = reloader.reload().await.expect("the reload validates");
+    assert_eq!(report.applied, ["security.apiban"]);
+    assert!(report.restart_required.is_empty());
+    assert_eq!(
+        *control.params(),
+        crate::apiban::ApiBanParams::from_config(&crate::config::ApiBanConfig {
+            api_key: "second-secret-key".to_owned(),
+            interval_secs: 60,
+            ban_ttl_secs: 604_800,
+        })
+    );
+    let json = serde_json::to_string(&report).expect("serialises");
+    assert!(!json.contains("secret-key"), "{json}");
+
+    std::fs::write(
+        &path,
+        security_document(&format!(
+            "{}  max_message_bytes: lots\n",
+            apiban_block("third-secret-key", 60)
+        )),
+    )
+    .expect("rewrite");
+    let error = reloader.reload().await.expect_err("fails validation");
+    assert!(!error.to_string().contains("secret-key"), "{error}");
+}
+
+/// Turning APIBAN on or off waits for a restart: off at start-up the ACL holds
+/// no blocklist at all. Only that transition is named, and nothing changes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn turning_apiban_on_or_off_needs_a_restart() {
+    // Off at start-up, on in the file.
+    let (_directory, path, reloader) =
+        security_fixture(&security_document("  trusted_cidrs: []\n"), None).await;
+    std::fs::write(
+        &path,
+        security_document(&format!(
+            "  trusted_cidrs: [\"198.51.100.0/24\"]\n{}",
+            apiban_block("a-secret-key", 300)
+        )),
+    )
+    .expect("rewrite");
+    let report = reloader.reload().await.expect("the reload validates");
+    assert_eq!(report.applied, ["security.trusted_cidrs"]);
+    assert_eq!(report.restart_required, ["security.apiban"]);
+    // And keeps being named until a restart.
+    let report = reloader.reload().await.expect("the reload validates");
+    assert_eq!(report.restart_required, ["security.apiban"]);
+
+    // On at start-up, gone from the file: the poller keeps what it had.
+    let control = offline_apiban("b-secret-key").await;
+    let before = control.params();
+    let (_directory, path, reloader) = security_fixture(
+        &security_document(&apiban_block("b-secret-key", 300)),
+        Some(control.clone()),
+    )
+    .await;
+    std::fs::write(&path, security_document("  trusted_cidrs: []\n")).expect("rewrite");
+    let report = reloader.reload().await.expect("the reload validates");
+    assert_eq!(report.restart_required, ["security.apiban"]);
+    assert_eq!(control.params(), before);
+}

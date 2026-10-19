@@ -1204,7 +1204,7 @@ pub(super) fn build_transport_acl(
     config: &Config,
     firewall: Option<crate::firewall::KernelFirewall>,
     gateway_trust: Option<Arc<crate::gateway::view::GatewayView>>,
-    trusted: crate::security::trust::TrustedCidrs,
+    security: &crate::security::runtime::SecurityRuntime,
 ) -> Arc<transport::acl::TransportAcl> {
     use transport::acl::TransportAcl;
 
@@ -1217,10 +1217,12 @@ pub(super) fn build_transport_acl(
                 Ok(client) => {
                     let client = client
                         .with_firewall(firewall.clone())
-                        .with_trusted(trusted)
+                        .with_trusted(security.trusted())
                         .with_gateway_trust(gateway_trust);
                     let banned = client.banned();
-                    client.start();
+                    // Held by the config reloader, which changes the key,
+                    // interval and entry lifetime of this one poller.
+                    security.attach_apiban(client.start());
                     info!("APIBAN blocklist poller started");
                     Some(banned)
                 }

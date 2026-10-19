@@ -28,6 +28,7 @@ use std::sync::Arc;
 use serde::Serialize;
 use tracing::{info, warn};
 
+use crate::apiban::ApiBanParams;
 use crate::config::yaml::{Mapping, Value};
 use crate::config::{Config, IdentityHeaders, SharedIdentityHeaders};
 use crate::security::runtime::SecurityRuntime;
@@ -42,7 +43,10 @@ type Install = Box<dyn FnOnce() + Send>;
 
 /// A built value, ready to install, and what building it noticed.
 struct Prepared {
-    install: Install,
+    /// `None` when this change, though in a field that can apply at runtime,
+    /// cannot apply on this node now (APIBAN turned on or off): its paths are
+    /// reported as needing a restart and nothing is installed.
+    install: Option<Install>,
     /// Reported under `warnings`: something in the file was skipped, not
     /// refused (a `trusted_cidrs` entry that is neither a CIDR nor an address).
     warnings: Vec<String>,
@@ -51,7 +55,14 @@ struct Prepared {
 impl Prepared {
     fn new(install: Install) -> Self {
         Self {
-            install,
+            install: Some(install),
+            warnings: Vec::new(),
+        }
+    }
+
+    fn restart_required() -> Self {
+        Self {
+            install: None,
             warnings: Vec::new(),
         }
     }
@@ -93,6 +104,11 @@ const HOT_APPLIERS: &[HotApplier] = &[
         paths: &["security.failed_auth_ban"],
         available: has_security,
         prepare: prepare_auto_ban,
+    },
+    HotApplier {
+        paths: &["security.apiban"],
+        available: has_security,
+        prepare: prepare_apiban,
     },
 ];
 
@@ -163,7 +179,7 @@ fn prepare_trusted_cidrs(targets: &ReloadTargets, config: &Config) -> Result<Pre
         })
         .collect();
     Ok(Prepared {
-        install: Box::new(move || runtime.apply_trusted(networks)),
+        install: Some(Box::new(move || runtime.apply_trusted(networks))),
         warnings,
     })
 }
@@ -174,6 +190,22 @@ fn prepare_security_filter(targets: &ReloadTargets, config: &Config) -> Result<P
     Ok(Prepared::new(Box::new(move || {
         runtime.apply_filter(security.as_ref())
     })))
+}
+
+/// `security.apiban` changed. Only a change of its parameters applies: the
+/// poller exists only when APIBAN was configured at start-up, and the ACL holds
+/// a blocklist only then, so turning it on or off waits for a restart.
+fn prepare_apiban(targets: &ReloadTargets, config: &Config) -> Result<Prepared, String> {
+    let runtime = security_runtime(targets)?;
+    let params = config
+        .security
+        .as_ref()
+        .and_then(|security| security.apiban.as_ref())
+        .map(ApiBanParams::from_config);
+    match (runtime.apiban().cloned(), params) {
+        (Some(control), Some(params)) => Ok(Prepared::new(Box::new(move || control.apply(params)))),
+        _ => Ok(Prepared::restart_required()),
+    }
 }
 
 fn prepare_auto_ban(targets: &ReloadTargets, config: &Config) -> Result<Prepared, String> {
@@ -293,9 +325,11 @@ impl ConfigReloader {
                     reason,
                 }
             })?;
-            installs.push(prepared.install);
             warnings.extend(prepared.warnings);
-            hot.extend(touched);
+            if let Some(install) = prepared.install {
+                installs.push(install);
+                hot.extend(touched);
+            }
         }
         for install in installs {
             install();
