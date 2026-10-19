@@ -1185,6 +1185,7 @@ class MockB2bua:
         body: Optional[Union[str, bytes]] = None,
         content_type: Optional[str] = None,
         session_timer: Optional[dict] = None,
+        route: Optional[list] = None,
     ) -> str:
         """Place an outbound call siphon owns, with no inbound INVITE behind it.
 
@@ -1253,6 +1254,13 @@ class MockB2bua:
                 for it, the callee's 2xx decides who refreshes, and siphon
                 refreshes the dialog or ends the call at expiry. ``None`` runs the
                 configured timer, if any.
+            route: a pre-loaded route set (RFC 3261 §8.1.2), e.g.
+                ``["<sip:orig@scscf.example.com;lr>"]``: the INVITE's Route
+                headers, in order, copied onto its CANCEL and the ACK of a
+                failure. With no ``next_hop`` the INVITE goes to the topmost
+                entry. How an application server hands a request it originates
+                to its S-CSCF with the session case in the Route entry
+                (TS 24.229 §5.7.3); ``next_hop`` only says where the packet goes.
 
         Returns:
             str: the new leg's SIP Call-ID.
@@ -1357,6 +1365,7 @@ class MockB2bua:
             "ws_uri": ws_uri,
             "timeout": timeout,
             "body": body,
+            "route": list(route) if route else [],
             # What the INVITE would actually carry the body under, so a test can
             # assert the wire shape without restating the default.
             "content_type": (

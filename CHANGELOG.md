@@ -37,6 +37,13 @@ entry, but a working config keeps working.
   again is fine, another is `invalid_state`. The Rust, Python and TypeScript
   control SDKs take them as `contact_host` / `caller_contact_host` and
   `contactHost` / `callerContactHost`.
+- **`b2bua.originate(route=[...])`: a call siphon places can carry a
+  pre-loaded route set** (RFC 3261 §8.1.2). The entries go out as the INVITE's
+  Route headers and on its CANCEL and the ACK of a failure; with no `next_hop`
+  the INVITE goes to the topmost entry. An application server hands a request
+  it originates to its S-CSCF this way, with the session case in the Route entry
+  (TS 24.229 §5.7.3), which `next_hop` alone cannot say.
+
 - **Ro: sessions held in Rust, as many per call as needed, or none bound to a
   call.** `await diameter.ro_session(...)` opens a credit-control session and
   returns a `RoSession` handle; each has its own Session-Id, Subscription-Ids,
