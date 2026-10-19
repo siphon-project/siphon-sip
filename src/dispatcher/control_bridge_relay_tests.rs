@@ -59,6 +59,16 @@ impl Pair {
 /// Bridge a carrier caller to an SRTP phone at `phone` through a bridge dial,
 /// and wait until the bridge has formed.
 pub(super) async fn srtp_pair(app: &str, phone: &'static str) -> Pair {
+    srtp_pair_dialling(app, phone, None).await
+}
+
+/// [`srtp_pair`] with the phone's target naming `contact_host`, the host
+/// siphon presents in its own Contact on the phone's leg.
+pub(super) async fn srtp_pair_dialling(
+    app: &str,
+    phone: &'static str,
+    contact_host: Option<&str>,
+) -> Pair {
     let contact = format!("sip:relay@{phone}");
     let engine = NativeTestEngine::start().await;
     let mut dispatcher = bridging_dispatcher(&engine);
@@ -68,7 +78,14 @@ pub(super) async fn srtp_pair(app: &str, phone: &'static str) -> Pair {
     let (reply, _) = dial(
         &controller,
         app,
-        serde_json::json!({ "targets": [contact], "on_answer": "bridge", "profile": SRTP_PHONE }),
+        serde_json::json!({
+            "targets": [match contact_host {
+                Some(host) => serde_json::json!({ "uri": contact, "contact_host": host }),
+                None => serde_json::json!(contact),
+            }],
+            "on_answer": "bridge",
+            "profile": SRTP_PHONE,
+        }),
     )
     .await;
     assert_eq!(reply["status"], "ok", "{reply}");

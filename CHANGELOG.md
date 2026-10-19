@@ -174,6 +174,12 @@ entry, but a working config keeps working.
   `420 Bad Extension`. The caller's `Require` is now read when the INVITE
   arrives, and only those tags can refuse it; the script's own go to the callee.
 
+- **B2BUA: a re-INVITE or UPDATE siphon answers itself gets a Contact.** The
+  200 to a session refresh or re-offer on a call with nobody on the other side,
+  on a leg of a controller bridge, and to a bodyless UPDATE on an early dialog
+  went out with no Contact, although a 2xx to a target refresh request carries
+  the answerer's (RFC 3261 §12.2.2, RFC 3311 §5.2). It now carries siphon's
+  Contact on the dialog the request arrived on, a `contact_host` included.
 - **B2BUA: the answer to a re-INVITE, UPDATE or REFER the callee sent carries
   the callee dialog's own Contact.** It carried the address siphon advertises
   on the transport, not the Contact the callee's INVITE had, which moved the

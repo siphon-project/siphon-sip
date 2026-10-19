@@ -212,6 +212,66 @@ fn contact_uri_host(contact: &str) -> Option<String> {
     parse_uri_standalone(uri).ok().map(|uri| uri.host)
 }
 
+/// The dialog a request siphon answers itself arrived on.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum AnsweringDialog<'a> {
+    /// The call's A-leg: the caller of a call that came in, or the leg siphon
+    /// placed for an `originate`.
+    Caller,
+    /// The callee leg whose INVITE rode this Via branch.
+    Callee {
+        /// That INVITE's Via branch.
+        branch: &'a str,
+    },
+}
+
+/// The Contact a 2xx siphon sends itself to a target refresh request (a
+/// re-INVITE or an UPDATE) carries: the local Contact of the dialog it arrived
+/// on (RFC 3261 §12.2.2, §13.3.1.4; RFC 3311 §5.2). The answer is the peer's
+/// remote target from then on, so it has to be the one that dialog already
+/// presents: a caller's `contact_host`, a placed leg's target `contact_host`, a
+/// flow-pinned leg's own socket. A leg that recorded none gets one built the
+/// way the other responses on that side build it. `None` when the call is
+/// gone.
+pub(crate) fn local_answer_contact(
+    state: &DispatcherState,
+    internal_call_id: &str,
+    dialog: AnsweringDialog<'_>,
+    inbound: &InboundMessage,
+) -> Option<String> {
+    let (recorded, built) = {
+        let call = state.call_actors.get_call(internal_call_id)?;
+        match dialog {
+            AnsweringDialog::Caller => {
+                let built = format!(
+                    "<sip:{}:{};transport={}>",
+                    state.a_leg_advertised_host(Some(inbound.local_addr), &inbound.transport),
+                    state.a_leg_advertised_port(Some(inbound.local_addr), &inbound.transport),
+                    inbound.transport.to_string().to_lowercase(),
+                );
+                (call.a_leg.dialog.local_contact.clone(), built)
+            }
+            AnsweringDialog::Callee { branch } => {
+                let (_, leg) = call.find_b_leg_by_branch(branch)?;
+                let (host, port) =
+                    b_leg_sent_by(leg.transport.local_addr, state, &leg.transport.transport);
+                let built = format!(
+                    "<sip:{host}:{port};transport={}>",
+                    leg.transport.transport.to_string().to_lowercase(),
+                );
+                return Some(leg.dialog.local_contact.clone().unwrap_or(built));
+            }
+        }
+    };
+    Some(match recorded {
+        Some(contact) => {
+            note_caller_contact_presented(state, internal_call_id);
+            contact
+        }
+        None => caller_response_contact(state, internal_call_id, Some(200), built),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
