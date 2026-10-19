@@ -1091,9 +1091,10 @@ impl PyRtpEngine {
                     // Record the session exactly as `offer` does, so `delete`,
                     // active-session accounting, and a later `rtpengine.answer`
                     // profile-reuse all work.
+                    let takeover = resolved_ws_uri.is_some();
                     sessions.insert(MediaSession {
                         rtpengine_call_id: call_id.clone(),
-                        call_id,
+                        call_id: call_id.clone(),
                         from_tag,
                         to_tag: None,
                         profile: profile_str,
@@ -1103,6 +1104,9 @@ impl PyRtpEngine {
                         bridge_sides: None,
                         created_at: std::time::Instant::now(),
                     });
+                    if !takeover {
+                        sessions.record_local_answer(&call_id, &answer_sdp);
+                    }
                     Ok(Some(answer_sdp))
                 }
                 AnswerLocalOutcome::Reject488 => {

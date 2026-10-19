@@ -174,14 +174,16 @@ fn the_public_surface_is_pinned() {
     // it goes through: setting the host on a call and the refusal it can
     // answer with,
     // plus the crate-internal `b2bua_originate_with_route`
-    // `b2bua.originate(route=…)` pre-loads a route set through.
+    // `b2bua.originate(route=…)` pre-loads a route set through, plus the 2
+    // crate-internal items a script dials behind siphon's own early answer
+    // through: `b2bua_dial_refusal` and `b2bua_progress_call_anchored_from`.
     // All additive, so a minor-compatible change — recorded here because that
     // is the tripwire.
     assert_eq!(
         declared + re_exported,
-        104,
+        106,
         "the dispatcher's public surface is {} items ({declared} declared here, \
-         {re_exported} re-exported), not 104. Adding one is a semver commitment on a \
+         {re_exported} re-exported), not 106. Adding one is a semver commitment on a \
          published crate; removing one breaks embedders. An extraction should move the \
          declaration and add a `pub use`, leaving this total unchanged.",
         declared + re_exported,

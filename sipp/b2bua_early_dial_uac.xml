@@ -1,0 +1,132 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  A caller answered in early media by the media engine, then put through.
+
+  INVITE (SDP, no 100rel) -> 100 -> 183 (the engine's answer) -> [RTP]
+  -> 183 (the callee's early media, relayed) -> 200 -> ACK -> [RTP] -> BYE -> 200
+
+  siphon answers the INVITE itself with the engine's SDP (answer_local) and
+  dials the callee behind it. The caller took the first SDP as the answer
+  (RFC 3261 §13.2.1) and an unreliable 183 only previews it, so the 2xx has to
+  repeat it exactly (RFC 6337 §3.1.1). Every later 18x and the 200 must carry
+  the first 183's session description byte for byte, whatever the callee sent.
+
+  Pair with b2bua_early_dial_uas.xml on the callee side of siphon.
+-->
+<scenario name="B2BUA dial behind siphon's own early answer UAC">
+
+  <send retrans="500">
+    <![CDATA[
+INVITE sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:alice@[local_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:[service]@[remote_ip]>
+Call-ID: [call_id]
+CSeq: 1 INVITE
+Contact: <sip:alice@[local_ip]:[local_port];transport=[transport]>
+Max-Forwards: 70
+User-Agent: SIPp/b2bua-early-dial
+Content-Type: application/sdp
+Content-Length: [len]
+
+v=0
+o=alice 53655765 2353687637 IN IP[local_ip_type] [local_ip]
+s=-
+c=IN IP[media_ip_type] [media_ip]
+t=0 0
+m=audio [media_port] RTP/AVP 8 101
+a=rtpmap:8 PCMA/8000
+a=rtpmap:101 telephone-event/8000
+a=fmtp:101 0-15
+a=ptime:30
+]]>
+  </send>
+
+  <recv response="100" optional="true" />
+
+  <!-- siphon's own early answer: the engine's, anchored on the engine. -->
+  <recv response="183" crlf="true">
+    <action>
+      <ereg regexp="v=0.*" search_in="body" check_it="true" assign_to="early_answer" />
+      <ereg regexp="c=IN IP4 172\.20\.0\.130" search_in="body"
+            check_it="true" assign_to="junk" />
+      <ereg regexp="IN IP4 172\.20\.0\.6" search_in="body"
+            check_it_inverse="true" assign_to="junk" />
+    </action>
+  </recv>
+
+  <!-- The callee's 183, relayed with the answer the caller holds. -->
+  <recv response="183" crlf="true">
+    <action>
+      <ereg regexp="v=0.*" search_in="body" check_it="true" assign_to="relayed_early" />
+      <strcmp assign_to="early_differs" variable="early_answer" variable2="relayed_early" />
+      <test assign_to="early_changed" variable="early_differs" compare="not_equal" value="0" />
+    </action>
+  </recv>
+
+  <nop condexec="early_changed">
+    <action>
+      <error message="the relayed 183 carries [$relayed_early], the caller holds [$early_answer]" />
+    </action>
+  </nop>
+
+  <recv response="200" rtd="true" crlf="true">
+    <action>
+      <ereg regexp="v=0.*" search_in="body" check_it="true" assign_to="final_answer" />
+      <strcmp assign_to="final_differs" variable="early_answer" variable2="final_answer" />
+      <test assign_to="final_changed" variable="final_differs" compare="not_equal" value="0" />
+    </action>
+  </recv>
+
+  <nop condexec="final_changed">
+    <action>
+      <error message="the 200 carries [$final_answer], the 183 gave [$early_answer]" />
+    </action>
+  </nop>
+
+  <send>
+    <![CDATA[
+ACK sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:alice@[local_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:[service]@[remote_ip]>[peer_tag_param]
+Call-ID: [call_id]
+CSeq: 1 ACK
+Max-Forwards: 70
+Content-Length: 0
+
+]]>
+  </send>
+
+  <!-- Audio toward the engine's address the 183 named; the callee sends its
+       own, and the MEDIA CDR says whether it met. -->
+  <nop>
+    <action>
+      <exec play_pcap_audio="/sipp/g711a.pcap" />
+    </action>
+  </nop>
+
+  <pause milliseconds="4000" />
+
+  <send retrans="500">
+    <![CDATA[
+BYE sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:alice@[local_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:[service]@[remote_ip]>[peer_tag_param]
+Call-ID: [call_id]
+CSeq: 2 BYE
+Max-Forwards: 70
+Content-Length: 0
+
+]]>
+  </send>
+
+  <recv response="200" crlf="true" />
+
+  <!-- Let siphon finish the teardown before the run ends. -->
+  <pause milliseconds="1000" />
+
+</scenario>

@@ -50,6 +50,7 @@ const HANDSHAKE_REQUEST_ID: u64 = 0;
 mod conference;
 mod connection;
 mod events;
+mod far_leg;
 mod identity;
 mod scope;
 mod waiters;

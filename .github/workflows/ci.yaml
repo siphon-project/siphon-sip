@@ -2962,6 +2962,97 @@ jobs:
             *.log
 
 
+  # ── B2BUA: a dial behind siphon's own early answer, real siphon-rtp ─────
+  # The script answers the caller in early media on the engine (answer_local in
+  # a 183) and dials the callee behind it on an engine far leg (offer_far). The
+  # SIPp scenarios decide each case: the callee is offered the engine's far leg
+  # and not the caller's offer, and the caller gets every later 18x and the 200
+  # with the 183's SDP byte for byte. The MEDIA CDR says the audio met, and the
+  # failure handler's verdict says a busy callee's far leg went back to the
+  # engine before @b2bua.on_failure ran.
+  sipp-b2bua-early-dial:
+    runs-on: ubuntu-latest
+    needs: build-image
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Load the siphon image
+        uses: ./.github/actions/load-siphon-image
+
+      - name: Start the media engine and siphon
+        run: docker compose -f sipp/docker-compose.yaml --profile b2bua-early-dial up -d --wait siphon-rtp-engine siphon-b2bua-early-dial
+
+      - name: Start the callee
+        run: docker compose -f sipp/docker-compose.yaml --profile b2bua-early-dial up -d sipp-b2bua-early-dial-uas
+
+      - name: Early answer on the engine, then the callee behind it
+        run: docker compose -f sipp/docker-compose.yaml --profile b2bua-early-dial up --no-deps --abort-on-container-exit --exit-code-from sipp-b2bua-early-dial-uac sipp-b2bua-early-dial-uac
+
+      # The callee ran detached, so without this its scenario could fail and the
+      # job would still be green.
+      - name: Assert the callee scenario passed
+        run: |
+          code="$(timeout 60 docker wait sipp-b2bua-early-dial-uas || echo "no exit within 60 s")"
+          if [ "$code" != "0" ]; then
+            echo "the callee scenario exited $code"
+            docker compose -f sipp/docker-compose.yaml logs sipp-b2bua-early-dial-uas | tail -60
+            exit 1
+          fi
+
+      - name: Assert audio flowed both ways between the caller and the callee
+        run: docker compose -f sipp/docker-compose.yaml --profile b2bua-early-dial run --rm early-dial-cdr-assert
+
+      - name: Start the busy callee
+        run: docker compose -f sipp/docker-compose.yaml --profile b2bua-early-dial up -d sipp-b2bua-early-dial-busy-uas
+
+      - name: Early answer on the engine, then a busy callee
+        run: docker compose -f sipp/docker-compose.yaml --profile b2bua-early-dial up --no-deps --abort-on-container-exit --exit-code-from sipp-b2bua-early-dial-busy-uac sipp-b2bua-early-dial-busy-uac
+
+      - name: Assert the busy callee scenario passed
+        run: |
+          code="$(timeout 60 docker wait sipp-b2bua-early-dial-busy-uas || echo "no exit within 60 s")"
+          if [ "$code" != "0" ]; then
+            echo "the busy callee scenario exited $code"
+            docker compose -f sipp/docker-compose.yaml logs sipp-b2bua-early-dial-busy-uas | tail -60
+            exit 1
+          fi
+
+      - name: Assert the far leg was released before on_failure
+        run: |
+          logs="$(docker logs siphon-b2bua-early-dial 2>&1)"
+          verdicts="$(grep -o 'EARLY-DIAL-FAILURE .*' <<<"$logs" || true)"
+          if [ "$(grep -c . <<<"$verdicts")" != "1" ] || ! grep -q '"pass": true' <<<"$verdicts"; then
+            echo "expected one passing EARLY-DIAL-FAILURE verdict, got:"
+            echo "$verdicts"
+            exit 1
+          fi
+          echo "$verdicts"
+
+      - name: Assert the engine accepted every command and let go of both calls
+        run: docker compose -f sipp/docker-compose.yaml --profile b2bua-early-dial run --rm --entrypoint python3 early-dial-cdr-assert /app/assert_media.py metrics --url http://172.20.0.130:9091/metrics --min-answers 1 --min-deletes 3 --max-control-errors 0 --max-sessions 0
+
+      - name: Collect logs
+        if: always()
+        run: |
+          docker compose -f sipp/docker-compose.yaml logs siphon-b2bua-early-dial > siphon-b2bua-early-dial.log 2>&1 || true
+          docker compose -f sipp/docker-compose.yaml logs sipp-b2bua-early-dial-uas sipp-b2bua-early-dial-busy-uas > sipp-b2bua-early-dial-callees.log 2>&1 || true
+          docker compose -f sipp/docker-compose.yaml logs siphon-rtp-engine > siphon-rtp-engine.log 2>&1 || true
+
+      - name: Teardown
+        if: always()
+        run: docker compose -f sipp/docker-compose.yaml --profile b2bua-early-dial down --remove-orphans -v
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: sipp-b2bua-early-dial-logs
+          path: |
+            siphon-b2bua-early-dial.log
+            sipp-b2bua-early-dial-callees.log
+            siphon-rtp-engine.log
+            *.log
+
   # ── rtpengine mock proxy test (previously not run anywhere) ────────────
   # The `rtpengine` compose profile has existed for a long time and no CI job
   # ever started it, so the mock rtpengine client path was dark. It costs one

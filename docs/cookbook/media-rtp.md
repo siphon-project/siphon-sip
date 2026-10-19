@@ -243,6 +243,26 @@ carried, so `received_from` does not gate that party's media.
     either direction. `call.terminate()` from the same handler does the same
     thing explicitly.
 
+### An announcement before the callee rings
+
+Answer the caller in early media on the engine, play the prompt, then dial:
+
+```python
+@b2bua.on_invite
+async def announce_then_connect(call):
+    call.progress(183, "Session Progress", anchor=True, profile="announcement",
+                  headers={"P-Early-Media": "sendrecv"})
+    await rtpengine.play_media(call, file="/prompts/pre-call.wav")
+    call.dial(call.ruri)
+```
+
+The callee is offered a far leg the engine binds behind the caller's answer,
+and the caller keeps that answer for the whole call: its 2xx repeats it byte for
+byte. A busy callee gives the far leg back, so `@b2bua.on_failure` can play
+another prompt or dial again. See
+[An announcement, then the callee](../reference/call.md#an-announcement-then-the-callee)
+for what is refused and why. Needs the native siphon-rtp engine, 0.15.0 or later.
+
 ## Built-in profiles
 
 | Profile | Interworking |

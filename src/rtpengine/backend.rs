@@ -771,6 +771,41 @@ impl MediaBackend {
         }
     }
 
+    /// Grow a call the engine answered itself (`answer_local`) into a relay
+    /// toward a far party: the engine binds a far leg behind the caller's
+    /// answer and returns the SDP offer for it. The callee's SDP then completes
+    /// it through [`Self::answer`], which returns the caller's original answer.
+    /// Native `siphon-rtp` backend only, like `answer_local`.
+    pub async fn offer_far(
+        &self,
+        call_id: &str,
+        from_tag: &str,
+        flags: &NgFlags,
+    ) -> Result<Vec<u8>, RtpEngineError> {
+        match self {
+            Self::SiphonRtp(client) => client.offer_far(call_id, from_tag, flags).await,
+            Self::RtpEngine(_) | Self::RtpProxy(_) => Err(RtpEngineError::Protocol(
+                "offer_far is only supported by the native siphon-rtp backend".to_string(),
+            )),
+        }
+    }
+
+    /// Drop the far leg [`Self::offer_far`] grew, keeping the call on the
+    /// engine's own pipeline for another prompt or another dial.
+    pub async fn delete_far_leg(
+        &self,
+        call_id: &str,
+        from_tag: &str,
+        to_tag: &str,
+    ) -> Result<(), RtpEngineError> {
+        match self {
+            Self::SiphonRtp(client) => client.delete_far_leg(call_id, from_tag, to_tag).await,
+            Self::RtpEngine(_) | Self::RtpProxy(_) => Err(RtpEngineError::Protocol(
+                "offer_far is only supported by the native siphon-rtp backend".to_string(),
+            )),
+        }
+    }
+
     /// Drop the selected monologue's outgoing packets entirely.
     pub async fn block_media(&self, call_id: &str, from_tag: &str) -> Result<(), RtpEngineError> {
         match self {

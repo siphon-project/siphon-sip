@@ -795,7 +795,10 @@ class Call:
                  content_type: str | None = None,
                  headers: dict[str, str] | None = None,
                  contact: str | None = None,
-                 contact_params: str | None = None) -> None:
+                 contact_params: str | None = None,
+                 anchor: bool = False,
+                 profile: str | None = None,
+                 ws_uri: str | None = None) -> None:
         """UAS-mode provisional — send a 1xx response to the inbound INVITE
         **immediately** (e.g. ``183 Session Progress`` with early-media SDP, or
         ``180 Ringing``). Does not answer the call: the handler must still
@@ -821,6 +824,18 @@ class Call:
                 on the early dialog and, unless ``answer()`` names another, on
                 the dialog after it (see ``answer()``).
             contact_params: Optional Contact header parameters for ``contact``.
+            anchor: Answer the caller's offer on the media engine
+                (``answer_local``) and send the engine's answer as the body, so
+                ``rtpengine.play_media`` plays into it and a later ``dial()``
+                connects the callee behind it. Takes no ``body``.
+            profile: Media profile for ``anchor=True``.
+            ws_uri: WebSocket bridge URI for ``anchor=True``.
+
+        A ``dial()`` or sequential ``route()`` after the engine's own early
+        answer offers the callee a far leg the engine binds behind it, and
+        every later response repeats the caller's answer unchanged. A parallel
+        ``fork()`` there, and a ``dial()`` after an early answer that is not
+        the engine's, raise ``ValueError`` in siphon.
 
         Example::
 
@@ -836,6 +851,11 @@ class Call:
             )
         checked = _uas_response_headers("call.progress", headers)
         local_contact = _uas_contact("call.progress", contact, contact_params)
+        if anchor and (body is not None or code == 100):
+            raise ValueError(
+                "call.progress(anchor=True) sends the media engine's answer: "
+                "it takes no body, and not a 100"
+            )
         if isinstance(body, str):
             body = body.encode("utf-8")
         if local_contact is not None:
@@ -845,7 +865,8 @@ class Call:
             status_code=code,
             reason=reason,
             extras={"body": body, "content_type": content_type,
-                    "headers": checked, "contact": self._local_contact},
+                    "headers": checked, "contact": self._local_contact,
+                    "anchor": anchor, "profile": profile, "ws_uri": ws_uri},
         ))
 
     def handover(self, app: str, on_lost: str | None = None,
