@@ -51,6 +51,9 @@ pub enum DialTarget {
         /// The route set this branch's INVITE carries, topmost first. See
         /// [`DialTarget::uri_routed`].
         route: Vec<String>,
+        /// Host of siphon's own Contact on this branch. See
+        /// [`DialTarget::contact_host`].
+        contact_host: Option<String>,
     },
     /// An address of record, forked to every contact registered against it.
     ///
@@ -71,6 +74,9 @@ pub enum DialTarget {
         /// Called party for every branch the AoR expands to. See
         /// [`DialTarget::to`].
         to: Option<String>,
+        /// Host of siphon's own Contact on every branch the AoR expands to.
+        /// See [`DialTarget::contact_host`].
+        contact_host: Option<String>,
     },
 }
 
@@ -103,6 +109,7 @@ impl DialTarget {
             identity: TargetIdentity::default(),
             to: None,
             route: Vec::new(),
+            contact_host: None,
         }
     }
 
@@ -119,6 +126,7 @@ impl DialTarget {
             identity: TargetIdentity::default(),
             to: None,
             route: Vec::new(),
+            contact_host: None,
         }
     }
 
@@ -148,6 +156,7 @@ impl DialTarget {
             identity: TargetIdentity::default(),
             to: None,
             route: route.into_iter().map(Into::into).collect(),
+            contact_host: None,
         }
     }
 
@@ -159,6 +168,7 @@ impl DialTarget {
             headers: Vec::new(),
             identity: TargetIdentity::default(),
             to: None,
+            contact_host: None,
         }
     }
 
@@ -227,9 +237,31 @@ impl DialTarget {
         self
     }
 
+    /// Present `host` as the host of siphon's own Contact on this branch (on
+    /// every branch an AoR expands to), in place of the address siphon
+    /// advertises.
+    ///
+    /// siphon advertises one address per transport, so every leg presents the
+    /// same Contact host unless told otherwise, and a peer that identifies the
+    /// tenant or account by the host of the Contact can then be served for one
+    /// tenant per siphon. Only the host changes: port, transport and user part
+    /// stay siphon's own, so in-dialog requests still reach the listener that
+    /// sent the INVITE, and the server keeps it as the leg's dialog Contact
+    /// for every in-dialog request after. `host` is a hostname, an IPv4 address
+    /// or an IPv6 address; the server refuses anything else with
+    /// `bad_request` before anything is sent.
+    pub fn contact_host(mut self, host: impl Into<String>) -> Self {
+        match &mut self {
+            Self::Uri { contact_host, .. } | Self::Aor { contact_host, .. } => {
+                *contact_host = Some(host.into());
+            }
+        }
+        self
+    }
+
     pub(crate) fn to_json(&self) -> serde_json::Value {
         let mut object = serde_json::Map::new();
-        let (headers, identity, to) = match self {
+        let (headers, identity, to, contact_host) = match self {
             Self::Uri {
                 uri,
                 next_hop,
@@ -237,6 +269,7 @@ impl DialTarget {
                 identity,
                 to,
                 route,
+                contact_host,
             } => {
                 // A bare URI with no overrides is a plain string on the wire —
                 // the shape the server's own examples use. An identity counts
@@ -247,6 +280,7 @@ impl DialTarget {
                     && identity == &TargetIdentity::default()
                     && to.is_none()
                     && route.is_empty()
+                    && contact_host.is_none()
                 {
                     return json!(uri);
                 }
@@ -257,20 +291,24 @@ impl DialTarget {
                 if !route.is_empty() {
                     object.insert("route".to_string(), json!(route));
                 }
-                (headers, identity, to)
+                (headers, identity, to, contact_host)
             }
             Self::Aor {
                 aor,
                 headers,
                 identity,
                 to,
+                contact_host,
             } => {
                 object.insert("aor".to_string(), json!(aor));
-                (headers, identity, to)
+                (headers, identity, to, contact_host)
             }
         };
         if let Some(to) = to {
             object.insert("to".to_string(), json!(to));
+        }
+        if let Some(contact_host) = contact_host {
+            object.insert("contact_host".to_string(), json!(contact_host));
         }
         if !headers.is_empty() {
             object.insert("headers".to_string(), headers_to_json(headers));
@@ -455,6 +493,13 @@ pub struct DialOptions {
     /// What happens when a phone picks up: connect the caller (the default) or
     /// bridge an already-answered caller to it.
     pub on_answer: Option<DialOnAnswer>,
+    /// Host of siphon's own Contact toward the caller (`caller_contact_host`),
+    /// on the answer a connecting dial relays it and everything after, for a
+    /// peer that identifies the tenant by that host. Each target's own
+    /// [`DialTarget::contact_host`] is the host its leg presents. Fixed once
+    /// the caller has been sent an 18x or 2xx, so on a bridging dial it can
+    /// only repeat the host its answer carried (another is `invalid_state`).
+    pub caller_contact_host: Option<String>,
 }
 
 impl DialOptions {
@@ -512,6 +557,12 @@ impl DialOptions {
         self
     }
 
+    /// Present this host in siphon's Contact toward the caller.
+    pub fn caller_contact_host(mut self, host: impl Into<String>) -> Self {
+        self.caller_contact_host = Some(host.into());
+        self
+    }
+
     fn insert_into(&self, args: &mut serde_json::Map<String, serde_json::Value>) {
         if let Some(strategy) = self.strategy {
             args.insert("strategy".to_string(), json!(strategy.as_str()));
@@ -527,6 +578,7 @@ impl DialOptions {
             ("from", &self.from),
             ("from_display", &self.from_display),
             ("p_asserted_identity", &self.p_asserted_identity),
+            ("caller_contact_host", &self.caller_contact_host),
         ] {
             if let Some(value) = value {
                 args.insert(name.to_string(), json!(value));
@@ -895,6 +947,7 @@ mod tests {
             identity: TargetIdentity::default(),
             to: None,
             route: vec!["<sip:scscf.example.test;lr>".to_string()],
+            contact_host: None,
         };
         assert_eq!(
             target.to_json(),
@@ -902,6 +955,51 @@ mod tests {
                 "uri": "sip:alice@ims.example.test",
                 "next_hop": "sip:192.0.2.10:5060",
                 "route": ["<sip:scscf.example.test;lr>"]
+            })
+        );
+    }
+
+    /// The caller's Contact host rides the dial's own arguments, apart from
+    /// each target's.
+    #[test]
+    fn dial_options_carry_the_caller_contact_host() {
+        let mut args = serde_json::Map::new();
+        DialOptions::default()
+            .caller_contact_host("tenant-a.example.com")
+            .insert_into(&mut args);
+        assert_eq!(
+            serde_json::Value::Object(args),
+            json!({ "caller_contact_host": "tenant-a.example.com" })
+        );
+        let mut args = serde_json::Map::new();
+        DialOptions::default().insert_into(&mut args);
+        assert!(args.get("caller_contact_host").is_none());
+    }
+
+    /// A Contact host defeats the bare-string shortcut on either target form,
+    /// or the branch would present the advertised host after all.
+    #[test]
+    fn a_targets_contact_host_goes_out_on_either_form() {
+        assert_eq!(
+            DialTarget::uri("sip:+15550199@trunk.example")
+                .contact_host("tenant-a.example.com")
+                .to_json(),
+            json!({"uri": "sip:+15550199@trunk.example", "contact_host": "tenant-a.example.com"})
+        );
+        assert_eq!(
+            DialTarget::aor("sip:204@pbx.example")
+                .contact_host("203.0.113.5")
+                .to_json(),
+            json!({"aor": "sip:204@pbx.example", "contact_host": "203.0.113.5"})
+        );
+        assert_eq!(
+            DialTarget::uri_via("sip:+15550199@trunk.example", "sip:192.0.2.9:5060")
+                .contact_host("tenant-a.example.com")
+                .to_json(),
+            json!({
+                "uri": "sip:+15550199@trunk.example",
+                "next_hop": "sip:192.0.2.9:5060",
+                "contact_host": "tenant-a.example.com"
             })
         );
     }

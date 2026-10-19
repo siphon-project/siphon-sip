@@ -2692,6 +2692,152 @@ fn dial_refuses_a_malformed_route_set_as_bad_request() {
     ));
 }
 
+/// A target's `contact_host` reaches the dispatcher as the host its Contact
+/// carries, an IPv6 address bracketed, on a `{uri}` and on every contact an
+/// `{aor}` forks to. A target naming none has none.
+#[test]
+fn dial_target_carries_its_contact_host() {
+    let parsed = parse_dial_target(&serde_json::json!({
+        "uri": "sip:201@198.51.100.7",
+        "contact_host": "tenant-a.example.com",
+    }))
+    .expect("the object form is a target");
+    assert_eq!(
+        parsed[0].contact_host.as_deref(),
+        Some("tenant-a.example.com")
+    );
+    let parsed = parse_dial_target(&serde_json::json!({
+        "uri": "sip:201@198.51.100.7",
+        "contact_host": "2001:db8::5",
+    }))
+    .expect("an IPv6 address is a host");
+    assert_eq!(parsed[0].contact_host.as_deref(), Some("[2001:db8::5]"));
+    for bare in [
+        serde_json::json!("sip:201@198.51.100.7"),
+        serde_json::json!({"uri": "sip:201@198.51.100.7"}),
+        serde_json::json!({"uri": "sip:201@198.51.100.7", "contact_host": null}),
+    ] {
+        let parsed = parse_dial_target(&bare).expect("a target");
+        assert_eq!(parsed[0].contact_host, None, "{bare}");
+    }
+
+    let registrar = crate::script::api::test_registrar();
+    for (instance, host) in [("a", "198.51.100.131"), ("b", "198.51.100.132")] {
+        registrar
+            .save(
+                "sip:3203@siphon.example.com",
+                crate::sip::uri::SipUri::new(host.to_string()),
+                3600,
+                1.0,
+                format!("register-3203-{instance}"),
+                1,
+            )
+            .expect("the binding saves");
+    }
+    let parsed = parse_dial_target(&serde_json::json!({
+        "aor": "sip:3203@siphon.example.com",
+        "contact_host": "203.0.113.5",
+    }))
+    .expect("the AoR form is a target");
+    assert_eq!(parsed.len(), 2, "one branch per registered contact");
+    assert!(parsed
+        .iter()
+        .all(|branch| branch.contact_host.as_deref() == Some("203.0.113.5")));
+}
+
+/// A host siphon cannot put in its Contact is refused, not dropped: the peer
+/// would serve the call as another tenant's. On the `route` verb's targets too.
+#[test]
+fn a_target_refuses_a_contact_host_it_cannot_present() {
+    for contact_host in [
+        serde_json::json!("tenant-a.example.com:5070"),
+        serde_json::json!("sip:tenant-a.example.com"),
+        serde_json::json!("trunk@tenant-a.example.com"),
+        serde_json::json!("tenant-a.example.com;transport=tls"),
+        serde_json::json!(""),
+        serde_json::json!(5070),
+        serde_json::json!(["tenant-a.example.com"]),
+    ] {
+        let object = serde_json::json!({
+            "uri": "sip:201@198.51.100.7",
+            "contact_host": contact_host,
+        });
+        let error = parse_dial_target(&object).expect_err("a dial target must refuse it");
+        assert!(error.contains("contact_host"), "{contact_host}: {error}");
+        let error = parse_route_target(&object).expect_err("a route target must refuse it");
+        assert!(error.contains("contact_host"), "{contact_host}: {error}");
+    }
+}
+
+/// The `route` verb's targets carry a `contact_host` as `dial`'s do.
+#[test]
+fn route_target_carries_its_contact_host() {
+    let parsed = parse_route_target(&serde_json::json!({
+        "uri": "sip:+15550100@carrier.example",
+        "contact_host": "tenant-a.example.com",
+    }))
+    .expect("the object form is a target");
+    assert_eq!(parsed.contact_host.as_deref(), Some("tenant-a.example.com"));
+    assert_eq!(
+        parse_route_target(&serde_json::json!("sip:1@carrier.example"))
+            .expect("a URI string is a target")
+            .contact_host,
+        None
+    );
+}
+
+/// `dial` and `route` refuse an unusable `contact_host` as `bad_request` before
+/// anything is dialled.
+#[test]
+fn dial_and_route_refuse_an_unusable_contact_host_as_bad_request() {
+    for verb in ["dial", "route"] {
+        let result = sip_command(
+            verb,
+            serde_json::json!({"targets": [{
+                "uri": "sip:201@example.com",
+                "contact_host": "tenant-a.example.com:5070",
+            }]}),
+        );
+        assert!(
+            matches!(
+                result,
+                ControlResult::Error {
+                    code: ControlErrorCode::BadRequest,
+                    ..
+                }
+            ),
+            "{verb}: {result:?}"
+        );
+    }
+}
+
+/// A transfer's new leg presents the advertised Contact host, so a
+/// `contact_host` on `replace_peer` or `accept_refer`, on the verb or its
+/// target, is refused rather than ignored. The positive control is the same
+/// target without one.
+#[test]
+fn a_transfer_refuses_a_contact_host() {
+    for verb in ["replace_peer", "accept_refer"] {
+        for args in [
+            serde_json::json!({
+                "target": { "uri": "sip:204@198.51.100.7", "contact_host": "tenant-a.example.com" },
+            }),
+            serde_json::json!({
+                "target": "sip:204@198.51.100.7",
+                "contact_host": "tenant-a.example.com",
+            }),
+        ] {
+            let (code, _) = transfer_refusal(verb, args.clone());
+            assert_eq!(code, ControlErrorCode::BadRequest, "{verb}: {args}");
+        }
+        assert!(parse_transfer_dial(
+            verb,
+            &serde_json::json!({ "target": { "uri": "sip:204@198.51.100.7" } }),
+        )
+        .is_ok());
+    }
+}
+
 /// An `{aor}` target's identity fields reach every contact it forks to, as
 /// its headers and `to` do. They used to be dropped without a word on this
 /// form while the reference documented them on both.
@@ -3504,4 +3650,56 @@ fn a_refused_controller_transfer_names_its_verb_and_reason() {
         assert_eq!(details["verb"], "complete_refer");
         assert_eq!(details["reason"], reason);
     }
+}
+
+/// The caller's Contact host is checked before any verb sends anything: on
+/// `answer`, `ring` and `progress` as `contact_host`, on `dial` and `route`
+/// as `caller_contact_host`. A port, a URI or a non-string is `bad_request`
+/// naming the argument.
+#[test]
+fn a_caller_contact_host_siphon_cannot_present_is_bad_request() {
+    for (verb, argument) in [
+        ("answer", "contact_host"),
+        ("ring", "contact_host"),
+        ("progress", "contact_host"),
+        ("dial", "caller_contact_host"),
+        ("route", "caller_contact_host"),
+    ] {
+        for value in [
+            serde_json::json!("tenant-a.example.com:5070"),
+            serde_json::json!("sip:tenant-a.example.com"),
+            serde_json::json!(7),
+        ] {
+            let mut args = serde_json::json!({ argument: value });
+            if matches!(verb, "dial" | "route") {
+                args["targets"] = serde_json::json!(["sip:201@example.com"]);
+            }
+            let ControlResult::Error { code, message, .. } = sip_command(verb, args) else {
+                panic!("{verb} accepted {argument} {value}");
+            };
+            assert_eq!(code, ControlErrorCode::BadRequest, "{verb} {value}");
+            assert!(message.contains(argument), "{verb}: {message}");
+        }
+    }
+}
+
+/// A different host once the caller holds one is `invalid_state`, with the
+/// host it holds in the details.
+#[test]
+fn a_caller_contact_host_the_caller_already_holds_otherwise_is_invalid_state() {
+    let result = super::caller_contact::refused(
+        "dial",
+        "caller_contact_host",
+        crate::dispatcher::CallerContactHostRefusal::AlreadyPresented {
+            presented: "192.0.2.1".to_string(),
+        },
+    );
+    let ControlResult::Error { code, details, .. } = result else {
+        panic!("a refusal");
+    };
+    assert_eq!(code, ControlErrorCode::InvalidState);
+    let details = details.expect("details");
+    assert_eq!(details["reason"], "contact_already_presented");
+    assert_eq!(details["presented"], "192.0.2.1");
+    assert_eq!(details["argument"], "caller_contact_host");
 }

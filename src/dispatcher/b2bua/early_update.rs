@@ -156,6 +156,20 @@ pub fn early_dialog_update(
     if retry_after {
         response.headers.set("Retry-After", random_retry_after());
     }
+    // A 2xx to an UPDATE, a target refresh request, carries siphon's Contact
+    // on the early dialog it arrived on (RFC 3311 §5.2).
+    if status_code == 200 {
+        let dialog = match (from_a_leg, origin_branch) {
+            (true, _) => Some(AnsweringDialog::Caller),
+            (false, Some(branch)) => Some(AnsweringDialog::Callee { branch }),
+            (false, None) => None,
+        };
+        if let Some(contact) =
+            dialog.and_then(|dialog| local_answer_contact(state, call_id, dialog, inbound))
+        {
+            response.headers.set("Contact", contact);
+        }
+    }
     send_message_from(
         response,
         inbound.transport,

@@ -188,7 +188,7 @@ pub fn forward_update_response(
         }
 
         // A-facing (is_a2b) response: anchor Contact to the A-leg's arrival socket;
-        // B-facing: leave it to via_port (the B-side advertised address).
+        // B-facing: the callee dialog's own Contact, the one its INVITE carried.
         sanitize_b2bua_response(
             message,
             state,
@@ -200,6 +200,9 @@ pub fn forward_update_response(
             },
             call_id,
         );
+        if !is_a2b {
+            present_callee_dialog_contact(message, call_id, state);
+        }
 
         // RTPEngine answer for UPDATE 2xx with SDP body (codec/precondition
         // re-negotiation). Empty-body 2xx (session-timer refresh) bypasses.

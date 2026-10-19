@@ -572,6 +572,18 @@ describe("Call verbs map to the in-process-mirrored wire verbs", () => {
     expect(transport.calls).toHaveLength(1);
   });
 
+  it("route — a target's contactHost rides the wire as contact_host", async () => {
+    const transport = new RecordingTransport({ channel: "ch1", state: "routing", targets: 1 });
+    const call = makeCall(transport);
+    await call.route([
+      { uri: "sip:+15550100@carrier.example", contactHost: "tenant-b.example.com" },
+    ]);
+    expect(transport.calls[0]?.args).toEqual({
+      targets: [{ uri: "sip:+15550100@carrier.example", contact_host: "tenant-b.example.com" }],
+      strategy: "sequential",
+    });
+  });
+
   it("route — defaults strategy to sequential, omits headers when unset", async () => {
     const transport = new RecordingTransport({ channel: "ch1", state: "routing", targets: 1 });
     const call = makeCall(transport);
@@ -929,6 +941,29 @@ describe("originate args map to the names the server parses", () => {
     expect(args).toEqual({ channel: "out-1", to: "sip:1001@pbx.example", media: true });
   });
 
+  it("sends contactHost as contact_host, on to and on aor", () => {
+    expect(
+      originateArgs("out-1", "sip:1001@pbx.example", { sdp: "v=0\r\n" }, {
+        contactHost: "2001:db8::5",
+      }),
+    ).toEqual({
+      channel: "out-1",
+      to: "sip:1001@pbx.example",
+      sdp: "v=0\r\n",
+      contact_host: "2001:db8::5",
+    });
+    expect(
+      originateAorArgs("wake-201", "sip:201@example.com", { anchor: true }, {
+        contactHost: "tenant-a.example.com",
+      }),
+    ).toEqual({
+      channel: "wake-201",
+      aor: "sip:201@example.com",
+      media: true,
+      contact_host: "tenant-a.example.com",
+    });
+  });
+
   it("emits exactly one media plan per variant", () => {
     expect(
       originateArgs("out-1", "sip:1001@pbx.example", { anchor: true, profile: "voice_ai" }),
@@ -1220,6 +1255,25 @@ describe("dial args map to the target shapes the server parses", () => {
     });
   });
 
+  it("sends a target's contactHost as contact_host on either form", () => {
+    expect(
+      dialArgs([
+        { uri: "sip:+15550199@trunk.example", contactHost: "tenant-a.example.com" },
+        { aor: "sip:204@pbx.example", contactHost: "203.0.113.5" },
+        { uri: "sip:1001@pbx.example" },
+      ]),
+    ).toEqual({
+      targets: [
+        { uri: "sip:+15550199@trunk.example", contact_host: "tenant-a.example.com" },
+        { aor: "sip:204@pbx.example", contact_host: "203.0.113.5" },
+        "sip:1001@pbx.example",
+      ],
+    });
+    expect(() =>
+      dialArgs([{ uri: "sip:1001@pbx.example", contactHost: 5070 } as never]),
+    ).toThrow(/contactHost/);
+  });
+
   it("refuses a route set on an aor, and one that is not a list of strings", () => {
     // Each branch of an AoR follows its own binding's Path.
     expect(() =>
@@ -1327,5 +1381,47 @@ describe("recording args map to the names the server parses", () => {
     // Absent, not null — which is what makes the server stop every recording on
     // the call rather than one named `null`.
     expect(recordStopArgs()).toEqual({});
+  });
+});
+
+describe("the caller's contact host rides the verbs whose subject is the caller", () => {
+  it("answer / answerAnchored / ring / progress send contact_host only when given", async () => {
+    const transport = new RecordingTransport({ channel: "ch1", state: "answered" });
+    const call = makeCall(transport);
+    await call.ring(undefined, { contactHost: "tenant-a.example.com" });
+    await call.ring("Ringing");
+    await call.progress({ code: 183, contactHost: "tenant-a.example.com" });
+    await call.answer({ contactHost: "2001:db8::5" });
+    await call.answerAnchored({ profile: "voice_ai", contactHost: "tenant-a.example.com" });
+    await call.answer();
+    expect(transport.calls.map((sent) => [sent.verb, sent.args])).toEqual([
+      ["ring", { contact_host: "tenant-a.example.com" }],
+      ["ring", { reason: "Ringing" }],
+      ["progress", { code: 183, contact_host: "tenant-a.example.com" }],
+      ["answer", { contact_host: "2001:db8::5" }],
+      ["answer", { anchor: true, profile: "voice_ai", contact_host: "tenant-a.example.com" }],
+      ["answer", {}],
+    ]);
+  });
+
+  it("dial and route name it caller_contact_host, apart from each target's", async () => {
+    expect(
+      dialArgs([{ uri: "sip:204@pbx.example", contactHost: "tenant-b.example.com" }], {
+        callerContactHost: "tenant-a.example.com",
+      }),
+    ).toEqual({
+      targets: [{ uri: "sip:204@pbx.example", contact_host: "tenant-b.example.com" }],
+      caller_contact_host: "tenant-a.example.com",
+    });
+    const transport = new RecordingTransport({ channel: "ch1", state: "routing", targets: 1 });
+    const call = makeCall(transport);
+    await call.route(["sip:+15550100@carrier.example"], "sequential", undefined, {
+      callerContactHost: "tenant-a.example.com",
+    });
+    expect(transport.calls[0]?.args).toEqual({
+      targets: ["sip:+15550100@carrier.example"],
+      strategy: "sequential",
+      caller_contact_host: "tenant-a.example.com",
+    });
   });
 });

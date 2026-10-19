@@ -132,6 +132,8 @@ mod control_bridge_media_tests;
 #[cfg(test)]
 mod control_bridge_relay_tests;
 #[cfg(test)]
+mod control_caller_contact_host_tests;
+#[cfg(test)]
 mod control_cancel_dial_tests;
 #[cfg(test)]
 mod control_dial_branch_events_tests;
@@ -143,6 +145,8 @@ mod control_dial_bridge_fallback_tests;
 mod control_dial_bridge_from_host_tests;
 #[cfg(test)]
 mod control_dial_bridge_tests;
+#[cfg(test)]
+mod control_dial_contact_host_tests;
 #[cfg(test)]
 mod control_dial_identity_tests;
 #[cfg(test)]
@@ -201,6 +205,8 @@ mod lcr_number_policy_tests;
 mod lcr_ring_timeout_tests;
 #[cfg(test)]
 mod lcr_route_bookkeeping_tests;
+#[cfg(test)]
+mod local_answer_contact_tests;
 #[cfg(test)]
 mod media_started_event_tests;
 #[cfg(test)]
@@ -364,12 +370,14 @@ pub(crate) use b2bua::{
     b2bua_accept_refer_call_dialling, b2bua_accept_refer_controller_with_state,
     b2bua_accept_refer_script, b2bua_cancel_dial_with_state, b2bua_complete_refer,
     b2bua_complete_refer_with_state, b2bua_dial_call, b2bua_drop_call, b2bua_media_profile,
-    b2bua_originate_group_create, b2bua_originate_group_start, b2bua_reject_call_with_headers,
+    b2bua_originate_group_create, b2bua_originate_group_start,
+    b2bua_originate_prepare_with_contact_host, b2bua_reject_call_with_headers,
     b2bua_replace_peer_dialling, b2bua_send_info, b2bua_set_local_contact, b2bua_set_session_timer,
-    b2bua_take_over_is_anchored, bridge_calls_with_state, dial_answered_payload,
-    dial_branch_identity, dial_branch_summary, dial_bridge_caller, dial_bridge_join,
-    dial_bridge_refuse_phone, dial_bridge_spec, dial_bridge_start, dial_targets_for_aor,
-    forget_sent_info, ControllerReferRefusal, DialBridgeCaller, DialBridgeListener, DialBridgePlan,
+    b2bua_take_over_is_anchored, bridge_calls_with_state, checked_contact_host,
+    dial_answered_payload, dial_branch_identity, dial_branch_summary, dial_bridge_caller,
+    dial_bridge_join, dial_bridge_refuse_phone, dial_bridge_spec, dial_bridge_start,
+    dial_targets_for_aor, forget_sent_info, set_caller_contact_host, CallerContactHostRefusal,
+    ControllerReferRefusal, DialBridgeCaller, DialBridgeListener, DialBridgePlan,
     DialBridgeRefusal, DialBridgeSender, DialBridgeSignal, DialBridgeStartError, DialCancelRefusal,
     DialError, DialShaping, DialTarget, DispatcherHandle, DropOutcome, OriginateGroupAnswers,
     OriginateGroupFailure, OriginateGroupSink, OriginateGroupSpec, OriginateGroupStrategy,

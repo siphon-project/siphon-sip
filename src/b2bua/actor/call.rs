@@ -307,6 +307,15 @@ pub struct CallActor {
     /// in-dialog anchor off siphon, so the deployment must route it back or the
     /// dialog breaks. Takes precedence over `contact_user_override`.
     pub contact_override: Option<String>,
+    /// Host of siphon's own Contact toward the caller, named by a controller
+    /// (`contact_host` on `answer`/`ring`/`progress`, `caller_contact_host` on
+    /// `dial`/`route`). Every Contact siphon presents the caller carries it.
+    pub caller_contact_host: Option<String>,
+    /// Whether the caller has been sent an 18x or 2xx carrying siphon's
+    /// Contact, which it may have taken as its remote target: past this a
+    /// different `caller_contact_host` is refused. Atomic so a response path
+    /// holding only a read of the call can record it.
+    pub caller_contact_presented: std::sync::atomic::AtomicBool,
     /// Headers a script set or removed on the A-leg INVITE, gathered from every
     /// handler that ran on this call (`@b2bua.on_invite`, `@b2bua.on_failure`).
     /// Their values on the stored INVITE are the script's, so the B-leg builder
@@ -588,6 +597,8 @@ impl CallActor {
             to_host_override: None,
             contact_user_override: None,
             contact_override: None,
+            caller_contact_host: None,
+            caller_contact_presented: std::sync::atomic::AtomicBool::new(false),
             script_shaped_headers: Vec::new(),
             delayed_offer_ack: None,
             refresh_offer_relays: Vec::new(),

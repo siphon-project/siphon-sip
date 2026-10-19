@@ -20,8 +20,13 @@ use super::string_arg;
 /// Where `originate` places its calls: the running B2BUA in production, a
 /// test's own dispatcher when it drives the verb end to end.
 pub(super) trait OriginatePlacer {
-    /// Stage a call to one URI (`args.to`).
-    fn prepare(&self, params: OriginateParams) -> Result<PreparedOriginate, OriginateError>;
+    /// Stage a call to one URI (`args.to`), presenting `contact_host` as the
+    /// host of siphon's own Contact when it names one.
+    fn prepare(
+        &self,
+        params: OriginateParams,
+        contact_host: Option<String>,
+    ) -> Result<PreparedOriginate, OriginateError>;
     /// Send a staged call's INVITE.
     fn dial(&self, prepared: &PreparedOriginate) -> bool;
     /// Create a group ringing the contacts of an AoR (`args.aor`).
@@ -38,8 +43,12 @@ pub(super) trait OriginatePlacer {
 struct RunningB2bua;
 
 impl OriginatePlacer for RunningB2bua {
-    fn prepare(&self, params: OriginateParams) -> Result<PreparedOriginate, OriginateError> {
-        crate::dispatcher::b2bua_originate_prepare(params)
+    fn prepare(
+        &self,
+        params: OriginateParams,
+        contact_host: Option<String>,
+    ) -> Result<PreparedOriginate, OriginateError> {
+        crate::dispatcher::b2bua_originate_prepare_with_contact_host(params, contact_host)
     }
 
     fn dial(&self, prepared: &PreparedOriginate) -> bool {
@@ -150,6 +159,22 @@ pub(super) fn originate_on(
         Ok(session_timer) => session_timer,
         Err(message) => return ControlResult::error(ControlErrorCode::BadRequest, message),
     };
+    // The host of siphon's own Contact on the call, or on every leg of an
+    // `{aor}` group: refused here, before anything is placed, when it is not
+    // one siphon can put there.
+    let contact_host = match args
+        .as_object()
+        .map(super::routing::parse_contact_host)
+        .transpose()
+    {
+        Ok(contact_host) => contact_host.flatten(),
+        Err(error) => {
+            return ControlResult::error(
+                ControlErrorCode::BadRequest,
+                format!("originate args.{error}"),
+            )
+        }
+    };
     let headers = parse_extra_headers(args.get("headers"));
     let timeout_secs = args
         .get("timeout")
@@ -232,12 +257,13 @@ pub(super) fn originate_on(
                 total_timeout_secs,
                 on_lost: &on_lost,
                 vars,
+                contact_host,
             },
         );
     }
     let params = OriginateParams { to, ..params };
 
-    let prepared = match placer.prepare(params) {
+    let prepared = match placer.prepare(params, contact_host) {
         Ok(prepared) => prepared,
         Err(error) => return originate_error(error),
     };
@@ -354,6 +380,9 @@ struct AorOriginate<'a> {
     total_timeout_secs: Option<u32>,
     on_lost: &'a str,
     vars: HashMap<String, String>,
+    /// Host of siphon's own Contact on every leg, when `args.contact_host`
+    /// names one.
+    contact_host: Option<String>,
 }
 
 /// The deadline of a whole group when the controller names none: one ring
@@ -382,7 +411,7 @@ fn originate_aor(
     placer: &dyn OriginatePlacer,
     request: AorOriginate<'_>,
 ) -> ControlResult {
-    let targets = match crate::dispatcher::dial_targets_for_aor(request.aor) {
+    let mut targets = match crate::dispatcher::dial_targets_for_aor(request.aor) {
         Ok(targets) => targets,
         Err(error) => {
             return ControlResult::error_with_details(
@@ -396,6 +425,11 @@ fn originate_aor(
             )
         }
     };
+    // Every phone is a leg siphon places, and each presents the Contact host
+    // the controller named, as a single originate does.
+    for target in &mut targets {
+        target.contact_host.clone_from(&request.contact_host);
+    }
     // Every leg's To is the AoR as it is registered, however the controller
     // spelled it; each leg's Request-URI is its own contact.
     let registered = targets
@@ -733,8 +767,11 @@ pub(crate) mod staged {
     };
 
     /// Stages an originate on the test's dispatcher.
-    pub(crate) type Prepare =
-        Box<dyn Fn(OriginateParams) -> Result<PreparedOriginate, OriginateError> + Send + Sync>;
+    pub(crate) type Prepare = Box<
+        dyn Fn(OriginateParams, Option<String>) -> Result<PreparedOriginate, OriginateError>
+            + Send
+            + Sync,
+    >;
     /// Sends a staged originate's INVITE.
     pub(crate) type Dial = Box<dyn Fn(&PreparedOriginate) -> bool + Send + Sync>;
     /// Creates an originate group on the test's dispatcher.
@@ -760,8 +797,12 @@ pub(crate) mod staged {
     }
 
     impl super::OriginatePlacer for OriginateRail {
-        fn prepare(&self, params: OriginateParams) -> Result<PreparedOriginate, OriginateError> {
-            (self.prepare)(params)
+        fn prepare(
+            &self,
+            params: OriginateParams,
+            contact_host: Option<String>,
+        ) -> Result<PreparedOriginate, OriginateError> {
+            (self.prepare)(params, contact_host)
         }
 
         fn dial(&self, prepared: &PreparedOriginate) -> bool {

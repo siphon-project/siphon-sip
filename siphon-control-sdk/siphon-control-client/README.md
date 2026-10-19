@@ -58,6 +58,16 @@ Every verb the server's `sip` adapter describes has a typed method:
   A URI target of either (`DialTarget::uri_routed`, `RouteTarget { route, .. }`) can
   carry its own route set, topmost first, which is how an IMS application
   server sends a session back through the S-CSCF with the Route it was given.
+  Any target (`DialTarget::contact_host(..)` on either form,
+  `RouteTarget { contact_host, .. }`) and `OriginateOptions::contact_host(..)`
+  name the host siphon presents in its own Contact on that leg, in place of the
+  address it advertises, for a peer that identifies the tenant or account by
+  that host. Only the host changes.
+  The caller's side of the same: `ResponseOptions::contact_host` with
+  `answer_with_options` / `progress_with_options` (anchored too),
+  `ring_with_contact_host`, `DialOptions::caller_contact_host` and
+  `route_with_caller_contact_host`, the host of siphon's Contact toward the
+  caller, fixed once an 18x or 2xx went out.
 - **Transfers:** `refer` / `transfer` / `refer_replaces` send a REFER.
   `accept_refer` and `reject_refer` decide a pending inbound one.
   `accept_refer_dialling(target, mode, profile, &TransferDial)` names who the

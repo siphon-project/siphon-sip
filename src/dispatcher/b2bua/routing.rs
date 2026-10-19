@@ -508,6 +508,7 @@ pub fn b2bua_advance_route_with_numbers(
             caller_id_presentation,
             route.from_host.as_deref(),
             route.presented_to.as_deref(),
+            route.contact_host.as_deref(),
             &extra_headers,
             state,
         );

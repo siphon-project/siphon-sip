@@ -80,6 +80,7 @@ async fn ringing_and_anchored(engine: &NativeTestEngine) -> Sequence {
             None,
             None,
             None,
+            None,
             &[],
             &sequence.dispatcher.state,
         )

@@ -879,6 +879,12 @@ pub fn send_one_legged_ok(
     state: &DispatcherState,
 ) {
     let mut response = build_response(message, 200, "OK", state.server_header.as_deref(), &[]);
+    // A 2xx to a target refresh request carries siphon's Contact on the dialog
+    // it arrived on (RFC 3261 §12.2.2, §13.3.1.4; RFC 3311 §5.2). Every caller
+    // here answers a leg's A-side dialog.
+    if let Some(contact) = local_answer_contact(state, call_id, AnsweringDialog::Caller, inbound) {
+        response.headers.set("Contact", contact);
+    }
     note_session_refresh_request(call_id, true, &message.headers, state);
     negotiate_relayed_session_timer(
         call_id,

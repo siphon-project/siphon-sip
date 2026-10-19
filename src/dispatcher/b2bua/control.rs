@@ -2,6 +2,7 @@
 //! layers call into: route, answer, progress, and the media handles.
 use crate::dispatcher::*;
 
+use super::contact_host::check_branch_contact_hosts;
 use super::dial_target::{
     apply_dial_identity, branch_called_parties, branch_identities, ShapedFrom,
 };
@@ -25,6 +26,9 @@ pub struct RouteTarget {
     /// Route set for this attempt's INVITE, topmost first. See
     /// [`crate::lcr::Route::route`].
     pub route: Vec<String>,
+    /// Host siphon presents in its own `Contact` on this attempt's leg. See
+    /// [`DialTarget::contact_host`].
+    pub contact_host: Option<String>,
 }
 
 /// The failover queue a `route` verb's targets become: R-URI carriers, as
@@ -52,6 +56,7 @@ fn route_verb_routes(
                 headers,
                 reroute_after_progress: target.reroute_after_progress,
                 route: target.route,
+                contact_host: target.contact_host,
                 ..Default::default()
             }
         })
@@ -434,16 +439,29 @@ pub fn send_uas_response(
     // script that named its own (`call.answer(contact=…)`, a conference focus's
     // URI with `isfocus`, RFC 4579 §5.1) replaced it there.
     if code > 100 {
-        let contact = local_contact.unwrap_or_else(|| {
-            let host = state.a_leg_advertised_host(local_addr, &transport);
-            let port = state.a_leg_advertised_port(local_addr, &transport);
-            format!(
-                "<sip:{}:{};transport={}>",
-                host,
-                port,
-                transport.to_string().to_lowercase()
-            )
-        });
+        // The dialog's own Contact carries a caller `contact_host` already (it
+        // was rewritten when the host was set) or is a script's whole Contact,
+        // which wins as `set_contact_uri()` does on a B-leg. Only the one
+        // built here, for a leg that recorded none, takes the host now.
+        let contact = match local_contact {
+            Some(contact) => {
+                if code < 300 {
+                    note_caller_contact_presented(state, internal_call_id);
+                }
+                contact
+            }
+            None => {
+                let host = state.a_leg_advertised_host(local_addr, &transport);
+                let port = state.a_leg_advertised_port(local_addr, &transport);
+                let built = format!(
+                    "<sip:{}:{};transport={}>",
+                    host,
+                    port,
+                    transport.to_string().to_lowercase()
+                );
+                caller_response_contact(state, internal_call_id, Some(code), built)
+            }
+        };
         response.headers.set("Contact", contact);
     }
 
@@ -1030,6 +1048,8 @@ pub(crate) fn b2bua_dial_call_with_state(
     let branch_froms =
         branch_identities(&targets, &template, shaping).map_err(DialError::InvalidIdentity)?;
     let branch_tos = branch_called_parties(&targets).map_err(DialError::InvalidIdentity)?;
+    let mut targets = targets;
+    check_branch_contact_hosts(&mut targets).map_err(DialError::InvalidIdentity)?;
 
     if let Some(profile) = shaping.profile.as_deref() {
         let source_ip = state
@@ -1179,6 +1199,7 @@ fn dial_parallel(
                 .as_ref()
                 .and_then(|shaped| shaped.host.as_deref()),
             branch_to.as_deref(),
+            target.contact_host.as_deref(),
             &headers,
             state,
         ) {
@@ -1247,6 +1268,9 @@ fn sequential_dial_routes(
                 // The target's own route set, which an attempt would otherwise
                 // go without: the failover engine builds each INVITE afresh.
                 route: target.route,
+                // The Contact host this target presents, which every attempt
+                // has to carry for the same reason its route set does.
+                contact_host: target.contact_host,
                 ..Default::default()
             }
         })
@@ -1409,6 +1433,7 @@ mod tests {
             timeout_secs,
             reroute_after_progress,
             route: Vec::new(),
+            contact_host: None,
         }
     }
 

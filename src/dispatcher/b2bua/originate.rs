@@ -106,6 +106,11 @@ pub struct OriginateRoute {
     /// Settled here rather than by the caller because that address is only
     /// known once the leg's destination has resolved to a transport.
     pub hide_from_host: bool,
+    /// Host siphon presents in its own `Contact` on this leg, in place of the
+    /// address it advertises on the leg's transport (see
+    /// [`DialTarget::contact_host`]). Kept as the leg's dialog local Contact,
+    /// so every in-dialog request siphon sends on the leg presents it too.
+    pub contact_host: Option<String>,
 }
 
 /// Why an originate was refused. Each variant maps to its own control-plane
@@ -228,6 +233,15 @@ pub fn prepare_originate_routed(
             })?;
         }
     }
+    let contact_host = route
+        .contact_host
+        .as_deref()
+        .map(checked_contact_host)
+        .transpose()
+        .map_err(|detail| OriginateError::InvalidUri {
+            field: "contact_host",
+            detail,
+        })?;
 
     // Validate the media plan against the *configured* backend before anything
     // is created: a plan this deployment cannot serve must fail visibly at the
@@ -273,7 +287,15 @@ pub fn prepare_originate_routed(
     // identity, never `0.0.0.0` (see `pinned_sent_by`).
     let (via_host, via_port) = b_leg_sent_by(flow_local_addr, state, &transport);
 
-    let contact = build_b_leg_contact(&via_host, via_port, transport, None, None);
+    // A `contact_host` replaces the Contact's host alone: the port and transport
+    // stay the socket's, so the phone's in-dialog requests still reach it.
+    let contact = build_b_leg_contact(
+        contact_host.as_deref().unwrap_or(&via_host),
+        via_port,
+        transport,
+        None,
+        None,
+    );
     let mut invite = build_originate_invite(
         &params,
         target_uri,

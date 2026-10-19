@@ -143,6 +143,7 @@ fn b_leg_invite_bytes(caller: &str, policy: Option<ResolvedPolicy>) -> Vec<u8> {
         None,
         None,
         None,
+        None,
         &[],
         &dispatcher.state,
     );

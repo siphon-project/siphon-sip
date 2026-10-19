@@ -49,7 +49,10 @@ pub(super) fn wire(dispatcher: &TestDispatcher) -> Vec<(SocketAddr, SipMessage)>
 /// A call ringing at the callee whose caller's INVITE carries `caller_headers`.
 /// siphon dialled the callee with an offer, and the callee's leg has the dialog
 /// identity the callee's answer gives it.
-fn ringing_call_from(dispatcher: &TestDispatcher, caller_headers: &[(&str, &str)]) -> String {
+pub(super) fn ringing_call_from(
+    dispatcher: &TestDispatcher,
+    caller_headers: &[(&str, &str)],
+) -> String {
     let state = &dispatcher.state;
     let call_id = ringing_call(dispatcher);
     let mut invite = caller_invite(&endpoint_sdp("192.0.2.10"));
@@ -76,7 +79,7 @@ fn ringing_call_from(dispatcher: &TestDispatcher, caller_headers: &[(&str, &str)
 
 /// The callee answers with a 200 carrying `callee_headers` and `body`, and the
 /// caller ACKs the 200 siphon relays it, which it returns.
-fn callee_answers(
+pub(super) fn callee_answers(
     dispatcher: &TestDispatcher,
     call_id: &str,
     callee_headers: &[(&str, &str)],

@@ -325,6 +325,16 @@ pub struct Route {
     /// from — an IMS application server sending it back through the S-CSCF.
     #[serde(skip)]
     pub route: Vec<String>,
+    /// The host siphon presents in its own `Contact` on this attempt's leg, in
+    /// place of the advertised one, when a controller `route` or sequential
+    /// `dial` target named one (`contact_host`). Only the host: port,
+    /// transport and user part stay siphon's own.
+    ///
+    /// Not part of the LCR API, like `route`: it serves a peer that identifies
+    /// the tenant or account by the host of the Contact, which is the
+    /// controller's to know, not a rating decision.
+    #[serde(skip)]
+    pub contact_host: Option<String>,
 }
 
 impl Route {

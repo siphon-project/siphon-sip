@@ -355,6 +355,12 @@ impl ControlClient {
     /// `session_timer={"expires": 1800, "min_se": 90, "refresher": "b2bua"}` runs an
     /// RFC 4028 session timer on it, each key left out taking the server's
     /// default; left out entirely, the configured timer runs.
+    /// `contact_host="tenant-a.example.com"` presents that host in siphon's own
+    /// Contact on the call (on every leg with `aor=`) in place of the address
+    /// siphon advertises, for a peer that identifies the tenant or account by
+    /// that host; only the host changes, and every in-dialog request on the call
+    /// presents it too. The server refuses anything but a hostname or an IP
+    /// address with `bad_request`.
     ///
     /// `aor=` in place of `to` rings every phone registered at the AoR, each over
     /// its own flow and Path (RFC 5626 §5.3, RFC 3327 §5.3), as a `dial` to an
@@ -401,6 +407,7 @@ impl ControlClient {
         on_lost=None,
         vars=None,
         session_timer=None,
+        contact_host=None,
     ))]
     fn originate<'py>(
         &self,
@@ -427,6 +434,7 @@ impl ControlClient {
         on_lost: Option<String>,
         vars: Option<Bound<'py, PyAny>>,
         session_timer: Option<Bound<'py, PyAny>>,
+        contact_host: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let destination = match (to, aor) {
             (Some(to), None) if strategy.is_none() && total_timeout.is_none() => {
@@ -466,6 +474,7 @@ impl ControlClient {
             session_timer: session_timer
                 .map(|timer| extract_session_timer(&timer))
                 .transpose()?,
+            contact_host,
         };
         let inner = Arc::clone(&self.inner);
         pyo3_async_runtimes::tokio::future_into_py(py, async move {

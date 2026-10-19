@@ -148,6 +148,9 @@ pub fn forward_transfer_response(
             },
             call_id,
         );
+        if !is_a2b {
+            present_callee_dialog_contact(message, call_id, state);
+        }
 
         if (200..300).contains(&status_code) {
             mark_tracking_leg_done(call_id, snapshot, marker.done_target(direction), state);
