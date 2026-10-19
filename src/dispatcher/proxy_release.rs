@@ -122,7 +122,7 @@ pub(super) fn release_bye_request(
     if let Some(reason) = reason {
         raw.push_str(&format!("Reason: {reason}\r\n"));
     }
-    if let Some(user_agent) = state.user_agent_header.as_deref() {
+    if let Some(user_agent) = state.identity.load().user_agent.as_deref() {
         raw.push_str(&format!("User-Agent: {user_agent}\r\n"));
     }
     raw.push_str("Content-Length: 0\r\n\r\n");
@@ -370,7 +370,7 @@ pub(super) fn answer_request_on_released_dialog(
         message,
         481,
         "Call/Transaction Does Not Exist",
-        state.server_header.as_deref(),
+        state.identity.load().server.as_deref(),
         &[],
     );
     send_message_from(

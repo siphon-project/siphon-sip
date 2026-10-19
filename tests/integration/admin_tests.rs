@@ -27,6 +27,7 @@ fn test_state() -> AdminState {
         features: siphon::admin::AdminFeatures::default(),
         script_engine: None,
         script_config: None,
+        config_reloader: None,
         ui_enabled: false,
     }
 }

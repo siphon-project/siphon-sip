@@ -21,7 +21,7 @@ pub fn handle_b2bua_cancel(inbound: InboundMessage, message: SipMessage, state: 
                 &message,
                 481,
                 "Call/Transaction Does Not Exist",
-                state.server_header.as_deref(),
+                state.identity.load().server.as_deref(),
                 &[],
             );
             send_message_from(
@@ -55,7 +55,13 @@ pub fn handle_b2bua_cancel(inbound: InboundMessage, message: SipMessage, state: 
     if call.cancel_claimed {
         drop(call);
         debug!(call_id = %call_id, "B2BUA CANCEL: the call is already being cancelled — answering the copy 200");
-        let response = build_response(&message, 200, "OK", state.server_header.as_deref(), &[]);
+        let response = build_response(
+            &message,
+            200,
+            "OK",
+            state.identity.load().server.as_deref(),
+            &[],
+        );
         send_message_from(
             response,
             inbound.transport,
@@ -76,7 +82,13 @@ pub fn handle_b2bua_cancel(inbound: InboundMessage, message: SipMessage, state: 
         // caller its 487 and the callee, which answered, a BYE.
         let answer_held = call.a_leg_reliability.holds_answer() || call.prack_bridge.holds_answer();
         drop(call);
-        let response = build_response(&message, 200, "OK", state.server_header.as_deref(), &[]);
+        let response = build_response(
+            &message,
+            200,
+            "OK",
+            state.identity.load().server.as_deref(),
+            &[],
+        );
         send_message_from(
             response,
             inbound.transport,
@@ -106,7 +118,13 @@ pub fn handle_b2bua_cancel(inbound: InboundMessage, message: SipMessage, state: 
     // Send 200 OK to CANCEL (on the socket the CANCEL arrived on — the same
     // listener the INVITE landed on, per RFC 3261 §9: the caller sends CANCEL to
     // the INVITE's next hop). Pins the source port for multi-homed UDP.
-    let cancel_response = build_response(&message, 200, "OK", state.server_header.as_deref(), &[]);
+    let cancel_response = build_response(
+        &message,
+        200,
+        "OK",
+        state.identity.load().server.as_deref(),
+        &[],
+    );
     send_message_from(
         cancel_response,
         inbound.transport,
@@ -201,7 +219,7 @@ pub fn handle_b2bua_cancel(inbound: InboundMessage, message: SipMessage, state: 
         &message,
         487,
         "Request Terminated",
-        state.server_header.as_deref(),
+        state.identity.load().server.as_deref(),
     );
     send_message_from(
         response_487,

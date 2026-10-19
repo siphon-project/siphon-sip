@@ -169,7 +169,13 @@ pub fn handle_b2bua_info(inbound: InboundMessage, message: SipMessage, state: &D
         // 200, an INFO a UAS understood with no body owed back.
         None => {
             debug!(call_id = %call_id, "B2BUA INFO: answering on a one-legged call");
-            build_response(&message, 200, "OK", state.server_header.as_deref(), &[])
+            build_response(
+                &message,
+                200,
+                "OK",
+                state.identity.load().server.as_deref(),
+                &[],
+            )
         }
     };
     if let Some(key) = key {
@@ -276,7 +282,7 @@ fn run_info_hook(
         message,
         code,
         &reason,
-        state.server_header.as_deref(),
+        state.identity.load().server.as_deref(),
         &headers,
     );
     if let Some((body, content_type)) = body {
@@ -376,7 +382,13 @@ fn respond(
     reason: &str,
     state: &DispatcherState,
 ) {
-    let response = build_response(message, code, reason, state.server_header.as_deref(), &[]);
+    let response = build_response(
+        message,
+        code,
+        reason,
+        state.identity.load().server.as_deref(),
+        &[],
+    );
     send_message_from(
         response,
         inbound.transport,

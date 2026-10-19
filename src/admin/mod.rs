@@ -20,9 +20,11 @@ use axum::Router;
 use serde::Serialize;
 use tracing::{info, warn};
 
+mod config_reload;
 mod refresh;
 mod script_reload;
 mod serve;
+use config_reload::config_reload_handler;
 use refresh::{gateways_refresh_handler, registrants_refresh_handler};
 use script_reload::script_reload_handler;
 pub use serve::serve;
@@ -62,6 +64,9 @@ pub struct AdminState {
     /// The `script_config:` document, so `POST /admin/script/reload` reads its
     /// file again as `SIGHUP` does. `None` in tests that do not exercise it.
     pub script_config: Option<Arc<crate::script::script_config::ScriptConfigStore>>,
+    /// Re-reads the `--config` file for `POST /admin/config/reload`. `None`
+    /// when the node was started from a config string, which has no file.
+    pub config_reloader: Option<Arc<crate::server::config_reload::ConfigReloader>>,
     /// Whether the embedded dashboard is served from this listener. Set by
     /// [`router`] from its own argument rather than by each caller, so the
     /// auth layer and the route table can never disagree about it. Read only to
@@ -158,6 +163,7 @@ pub(super) fn router(mut state: AdminState, cors: Option<&CorsConfig>, ui_enable
         .route("/admin/drain", post(drain_handler))
         .route("/admin/drain", delete(drain_handler))
         .route("/admin/script/reload", post(script_reload_handler))
+        .route("/admin/config/reload", post(config_reload_handler))
         .route(
             "/admin/registrants/refresh",
             post(registrants_refresh_handler),
@@ -1480,6 +1486,7 @@ mod tests {
             features: AdminFeatures::default(),
             script_engine: None,
             script_config: None,
+            config_reloader: None,
             ui_enabled: false,
         }
     }
@@ -1780,6 +1787,7 @@ mod tests {
             features: AdminFeatures::default(),
             script_engine: None,
             script_config: None,
+            config_reloader: None,
             ui_enabled: false,
         };
         let app = router(state, None, false);

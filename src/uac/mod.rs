@@ -145,8 +145,9 @@ pub struct UacSender {
     advertised_address: Option<String>,
     /// HEP capture sender (if tracing is enabled).
     hep_sender: Option<Arc<HepSender>>,
-    /// User-Agent header value (from `server.user_agent_header` config).
-    user_agent_header: Option<String>,
+    /// The live `User-Agent` value, shared with the dispatcher and swapped by
+    /// `POST /admin/config/reload`.
+    identity: crate::config::SharedIdentityHeaders,
     /// Pending requests keyed by branch parameter.
     pending: Arc<DashMap<String, PendingRequest>>,
     cseq_counter: std::sync::atomic::AtomicU32,
@@ -160,7 +161,7 @@ impl UacSender {
         advertised_addrs: HashMap<Transport, String>,
         advertised_address: Option<String>,
         hep_sender: Option<Arc<HepSender>>,
-        user_agent_header: Option<String>,
+        identity: crate::config::SharedIdentityHeaders,
     ) -> Self {
         Self {
             outbound,
@@ -170,7 +171,7 @@ impl UacSender {
             advertised_ports: HashMap::new(),
             advertised_address,
             hep_sender,
-            user_agent_header,
+            identity,
             pending: Arc::new(DashMap::new()),
             cseq_counter: std::sync::atomic::AtomicU32::new(1),
         }
@@ -397,7 +398,7 @@ impl UacSender {
             .header("Allow", crate::sip::SUPPORTED_METHODS.to_string())
             .content_length(0);
 
-        if let Some(ref user_agent) = self.user_agent_header {
+        if let Some(ref user_agent) = self.identity.load().user_agent {
             builder = builder.header("User-Agent", user_agent.clone());
         }
 
@@ -776,7 +777,7 @@ mod tests {
             HashMap::new(),
             None,
             None,
-            None,
+            crate::config::IdentityHeaders::default().shared(),
         );
         let receivers = vec![udp_rx, tcp_rx, tls_rx, ws_rx, wss_rx, sctp_rx];
         (sender, receivers)
@@ -1134,7 +1135,11 @@ mod tests {
             HashMap::new(),
             None,
             None,
-            Some("SIPhon/0.1".to_string()),
+            crate::config::IdentityHeaders {
+                server: None,
+                user_agent: Some("SIPhon/0.1".to_string()),
+            }
+            .shared(),
         );
 
         let _receiver = sender.send_options(
@@ -1177,7 +1182,7 @@ mod tests {
             HashMap::new(),
             None,
             None,
-            None,
+            crate::config::IdentityHeaders::default().shared(),
         );
 
         let _receiver = sender.send_options_with_identity(
@@ -1408,7 +1413,7 @@ mod tests {
             HashMap::new(),
             Some("sbc.example.org".to_string()),
             None,
-            None,
+            crate::config::IdentityHeaders::default().shared(),
         );
 
         let _receiver = sender.send_options(
@@ -1469,7 +1474,7 @@ mod tests {
             HashMap::from([(Transport::Udp, "sip.example.com".to_string())]),
             None,
             None,
-            None,
+            crate::config::IdentityHeaders::default().shared(),
         )
         .with_advertised_ports(HashMap::from([(Transport::Udp, 5060)]));
 

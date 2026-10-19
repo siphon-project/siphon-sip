@@ -190,8 +190,13 @@ pub fn handle_b2bua_invite(inbound: InboundMessage, message: SipMessage, state: 
                 );
             }
             crate::b2bua::actor::InviteRetransmissionReply::Trying => {
-                let trying =
-                    build_response(&message, 100, "Trying", state.server_header.as_deref(), &[]);
+                let trying = build_response(
+                    &message,
+                    100,
+                    "Trying",
+                    state.identity.load().server.as_deref(),
+                    &[],
+                );
                 send_message_from(
                     trying,
                     inbound.transport,
@@ -210,7 +215,7 @@ pub fn handle_b2bua_invite(inbound: InboundMessage, message: SipMessage, state: 
                     &message,
                     482,
                     "Loop Detected",
-                    state.server_header.as_deref(),
+                    state.identity.load().server.as_deref(),
                     &[],
                 );
                 send_message_from(
@@ -247,7 +252,7 @@ pub fn handle_b2bua_invite(inbound: InboundMessage, message: SipMessage, state: 
             &message,
             483,
             "Too Many Hops",
-            state.server_header.as_deref(),
+            state.identity.load().server.as_deref(),
             &[],
         );
         send_message_from(
@@ -292,7 +297,7 @@ pub fn handle_b2bua_invite(inbound: InboundMessage, message: SipMessage, state: 
                 &message,
                 494,
                 "Security Agreement Required",
-                state.server_header.as_deref(),
+                state.identity.load().server.as_deref(),
                 &[],
             );
             for line in crate::ipsec::sec_agree::refusal_security_server(protected_sa.as_ref()) {
@@ -353,7 +358,7 @@ pub fn handle_b2bua_invite(inbound: InboundMessage, message: SipMessage, state: 
                                 &message,
                                 486,
                                 "Busy Here",
-                                state.server_header.as_deref(),
+                                state.identity.load().server.as_deref(),
                                 &[],
                             );
                             send_message_from(
@@ -376,7 +381,7 @@ pub fn handle_b2bua_invite(inbound: InboundMessage, message: SipMessage, state: 
                                 &message,
                                 486,
                                 "Busy Here",
-                                state.server_header.as_deref(),
+                                state.identity.load().server.as_deref(),
                                 &[],
                             );
                             send_message_from(
@@ -408,7 +413,7 @@ pub fn handle_b2bua_invite(inbound: InboundMessage, message: SipMessage, state: 
                                 &message,
                                 603,
                                 "Decline",
-                                state.server_header.as_deref(),
+                                state.identity.load().server.as_deref(),
                                 &[],
                             );
                             send_message_from(
@@ -445,7 +450,7 @@ pub fn handle_b2bua_invite(inbound: InboundMessage, message: SipMessage, state: 
                             &message,
                             481,
                             "Call/Transaction Does Not Exist",
-                            state.server_header.as_deref(),
+                            state.identity.load().server.as_deref(),
                             &[],
                         );
                         send_message_from(
@@ -470,7 +475,7 @@ pub fn handle_b2bua_invite(inbound: InboundMessage, message: SipMessage, state: 
                     &message,
                     400,
                     "Bad Replaces Header",
-                    state.server_header.as_deref(),
+                    state.identity.load().server.as_deref(),
                     &[],
                 );
                 send_message_from(
@@ -502,7 +507,13 @@ pub fn handle_b2bua_invite(inbound: InboundMessage, message: SipMessage, state: 
 
     // Send 100 Trying immediately to suppress A-leg retransmissions
     // (RFC 3261 §8.2.6.1: SHOULD send 100 within 200ms for INVITE)
-    let trying = build_response(&message, 100, "Trying", state.server_header.as_deref(), &[]);
+    let trying = build_response(
+        &message,
+        100,
+        "Trying",
+        state.identity.load().server.as_deref(),
+        &[],
+    );
     // Answer on the same listener the request arrived on so a multi-homed UDP
     // host keeps a symmetric source port (a peer that sent to :5066 rejects a
     // reply sourced from :5060). No-op for stream transports / single listener.
@@ -933,7 +944,7 @@ pub fn handle_b2bua_invite(inbound: InboundMessage, message: SipMessage, state: 
                 &message_guard,
                 code,
                 &reason,
-                state.server_header.as_deref(),
+                state.identity.load().server.as_deref(),
                 &[],
             );
             drop(message_guard);

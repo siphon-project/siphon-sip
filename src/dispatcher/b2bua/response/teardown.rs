@@ -33,7 +33,7 @@ pub fn a_leg_final_response(
             a_leg.stored_to.as_ref(),
             status_code,
             reason,
-            state.server_header.as_deref(),
+            state.identity.load().server.as_deref(),
         )),
         Err(error) => {
             error!(

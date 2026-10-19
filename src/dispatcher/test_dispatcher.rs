@@ -64,6 +64,8 @@ pub(super) fn test_dispatcher_with_script(source: &str) -> TestDispatcher {
         )
         .expect("an outbound TLS config"),
     ));
+    // Shared with the UAC sender, as the server wires it.
+    let identity = crate::config::IdentityHeaders::default().shared();
     let state = DispatcherState {
         engine: Arc::new(ScriptEngine::new_embedded(source).expect("the test script compiles")),
         outbound: Arc::clone(&outbound),
@@ -75,9 +77,8 @@ pub(super) fn test_dispatcher_with_script(source: &str) -> TestDispatcher {
         listen_addrs: HashMap::new(),
         listener_registry: crate::transport::ListenerRegistry::from_entries(Vec::new()),
         mtu: None,
-        server_header: None,
+        identity: Arc::clone(&identity),
         auto_options: true,
-        user_agent_header: None,
         transaction_timeout: std::time::Duration::from_secs(34),
         call_actors: Arc::new(CallActorStore::new()),
         transaction_manager: Arc::new(TransactionManager::new(timer_config)),
@@ -95,7 +96,7 @@ pub(super) fn test_dispatcher_with_script(source: &str) -> TestDispatcher {
             HashMap::new(),
             None,
             None,
-            None,
+            identity,
         )),
         rtpengine_set: None,
         rtpengine_sessions: None,

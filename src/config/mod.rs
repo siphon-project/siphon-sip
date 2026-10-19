@@ -93,8 +93,8 @@ pub use security::{
     MIN_MAX_MESSAGE_BYTES,
 };
 pub use sip::{
-    DialogBackendType, DialogConfig, EnumConfig, NamedCacheConfig, ServerIdentityConfig,
-    SubscribeStateConfig, TransactionConfig,
+    DialogBackendType, DialogConfig, EnumConfig, IdentityHeaders, NamedCacheConfig,
+    ServerIdentityConfig, SharedIdentityHeaders, SubscribeStateConfig, TransactionConfig,
 };
 pub use srs::{SrsConfig, SrsFileConfig, SrsHttpConfig};
 pub use stir::{StirConfig, StirSigningConfig, StirVerificationConfig};
@@ -445,13 +445,22 @@ fn default_true() -> bool {
 
 impl Config {
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self> {
+        Self::load_with_document(path).map(|(config, _)| config)
+    }
+
+    /// Load and validate the file as [`from_file`](Self::from_file) does, also
+    /// returning the untyped tree of the env-expanded document it was built
+    /// from. `POST /admin/config/reload` diffs these trees: `Config` has no
+    /// equality, and comparing the document makes a comment or a reorder a
+    /// no-op.
+    pub fn load_with_document(path: impl AsRef<Path>) -> Result<(Self, yaml::Value)> {
         let path = path.as_ref();
         let content = std::fs::read_to_string(path)
             .map_err(|e| SiphonError::Config(format!("cannot read siphon.yaml: {e}")))?;
         let expanded = expand_env_vars(&content);
-        let mut config = Self::from_str_raw(&expanded)?;
+        let (mut config, document) = Self::from_str_document(&expanded)?;
         config.anchor_script_paths(path);
-        Ok(config)
+        Ok((config, document))
     }
 
     /// Re-anchor a relative `script.path` / `script.include_paths` / path-form
@@ -541,9 +550,15 @@ impl Config {
 
     /// Parse YAML without env-var expansion (used after expansion is already done).
     fn from_str_raw(yaml: &str) -> Result<Self> {
+        Self::from_str_document(yaml).map(|(config, _)| config)
+    }
+
+    /// [`from_str_raw`](Self::from_str_raw), keeping the untyped tree.
+    fn from_str_document(yaml: &str) -> Result<(Self, yaml::Value)> {
         let invalid = |e: yaml::Error| SiphonError::Config(format!("invalid siphon.yaml: {e}"));
         let mut config: Self = yaml::from_str(yaml).map_err(invalid)?;
-        config.read_untyped_sections(&yaml::parse_value(yaml).map_err(invalid)?)?;
+        let document = yaml::parse_value(yaml).map_err(invalid)?;
+        config.read_untyped_sections(&document)?;
         config.validate_backends()?;
         config.validate_auth_algorithms()?;
         config.validate_cdr()?;
@@ -570,7 +585,7 @@ impl Config {
         if let Some(ipsec) = &config.ipsec {
             ipsec.validate().map_err(SiphonError::Config)?;
         }
-        Ok(config)
+        Ok((config, document))
     }
 
     /// Refuse an `inbound_limit` whose refusal is not a failure response.

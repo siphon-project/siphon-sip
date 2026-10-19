@@ -124,6 +124,8 @@ mod carrier_attribution_tests;
 #[cfg(test)]
 mod charging_role_of_node_tests;
 #[cfg(test)]
+mod config_reload_tests;
+#[cfg(test)]
 mod control_bridge_elsewhere_tests;
 #[cfg(test)]
 mod control_bridge_ingress_tests;
@@ -473,6 +475,7 @@ pub async fn run(
     rf_charger: Option<Arc<crate::diameter::rf_service::RfChargingService>>,
     ro_charger: Option<Arc<crate::diameter::ro_service::RoChargingService>>,
     drain: Arc<DrainState>,
+    identity: crate::config::SharedIdentityHeaders,
     product_name: &'static str,
     product_version: &'static str,
 ) {
@@ -520,21 +523,6 @@ pub async fn run(
         }
     }
 
-    let default_server = format!("{product_name}/{product_version}");
-    let server_header = Some(
-        config
-            .server
-            .as_ref()
-            .and_then(|s| s.server_header.clone())
-            .unwrap_or_else(|| default_server.clone()),
-    );
-    let user_agent_header = Some(
-        config
-            .server
-            .as_ref()
-            .and_then(|s| s.user_agent_header.clone())
-            .unwrap_or(default_server),
-    );
     // `map_or(true, …)` not `is_none_or` — the latter is stable since 1.82 and
     // the crate's MSRV is 1.80 (clippy::incompatible_msrv gates on it).
     #[allow(clippy::unnecessary_map_or)]
@@ -667,9 +655,8 @@ pub async fn run(
         advertised_ports,
         listen_addrs,
         listener_registry,
-        server_header,
+        identity,
         auto_options,
-        user_agent_header,
         transaction_timeout,
         call_actors,
         transaction_manager,

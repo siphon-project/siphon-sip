@@ -5,6 +5,7 @@
 
 mod admin_start;
 mod bootstrap;
+pub mod config_reload;
 mod shutdown_sequence;
 use shutdown_sequence::run_shutdown_sequence;
 mod event_clock;
@@ -373,18 +374,39 @@ impl SiphonServer {
         let product_version = self.product_version.unwrap_or(env!("CARGO_PKG_VERSION"));
 
         // --- Load configuration ---
-        let config = if let Some(ref yaml) = self.config_string {
-            Arc::new(Config::from_str(yaml).unwrap_or_else(|error| {
+        let (config, config_document) = if let Some(ref yaml) = self.config_string {
+            let config = Config::from_str(yaml).unwrap_or_else(|error| {
                 eprintln!("Failed to parse config: {error}");
                 std::process::exit(1);
-            }))
+            });
+            (Arc::new(config), None)
         } else {
             let path = self.config_path.as_deref().unwrap_or("siphon.yaml");
-            Arc::new(Config::from_file(path).unwrap_or_else(|error| {
+            let (config, document) = Config::load_with_document(path).unwrap_or_else(|error| {
                 eprintln!("Failed to load {path}: {error}");
                 std::process::exit(1);
-            }))
+            });
+            (Arc::new(config), Some((path.to_owned(), document)))
         };
+        // One `Server` / `User-Agent` pair shared by the dispatcher, the UAC
+        // and the registrant; `POST /admin/config/reload` swaps it.
+        let identity = crate::config::IdentityHeaders::resolve(
+            config.server.as_ref(),
+            product_name,
+            product_version,
+        )
+        .shared();
+        let config_reloader = config_document.map(|(path, document)| {
+            Arc::new(config_reload::ConfigReloader::new(
+                path.into(),
+                document,
+                config_reload::ReloadTargets::new(
+                    Arc::clone(&identity),
+                    product_name,
+                    product_version,
+                ),
+            ))
+        });
 
         // --- Initialise structured logging ---
         let _log_guard = if self.skip_logging_init {
@@ -1023,16 +1045,11 @@ impl SiphonServer {
         // are wired later in `init_registrant` using this same manager.
         let registrant_manager: Option<Arc<crate::registrant::RegistrantManager>> =
             config.registrant.as_ref().map(|registrant_config| {
-                let registrant_user_agent = config
-                    .server
-                    .as_ref()
-                    .and_then(|server| server.user_agent_header.clone())
-                    .or_else(|| Some(format!("{product_name}/{product_version}")));
                 let manager = Arc::new(crate::registrant::RegistrantManager::new(
                     registrant_config.default_interval,
                     std::time::Duration::from_secs(registrant_config.retry_interval),
                     std::time::Duration::from_secs(registrant_config.max_retry_interval),
-                    registrant_user_agent,
+                    Arc::clone(&identity),
                 ));
                 // Reachable from the gateway's selection gate, which has no
                 // `Arc` in scope but must ask whether a linked registration is
@@ -2155,11 +2172,6 @@ impl SiphonServer {
         }
 
         // --- UAC sender ---
-        let uac_user_agent = config
-            .server
-            .as_ref()
-            .and_then(|server| server.user_agent_header.clone())
-            .or_else(|| Some(format!("{product_name}/{product_version}")));
         let uac_sender = Arc::new(
             UacSender::new(
                 Arc::clone(&outbound_senders),
@@ -2168,7 +2180,7 @@ impl SiphonServer {
                 advertised_addrs.clone(),
                 config.advertised_address.clone(),
                 hep_sender.clone(),
-                uac_user_agent,
+                Arc::clone(&identity),
             )
             .with_advertised_ports(advertised_ports.clone()),
         );
@@ -2499,7 +2511,13 @@ impl SiphonServer {
         let drain = Arc::new(dispatcher::DrainState::new());
 
         // --- HTTP admin API (health/readiness probes + registration inspection) ---
-        admin_start::start_admin_api(&config, &drain, &engine, &script_config_store);
+        admin_start::start_admin_api(
+            &config,
+            &drain,
+            &engine,
+            &script_config_store,
+            config_reloader,
+        );
 
         // --- External remote-control plane (ARI/ESL-class) ---
         // Installs the ControlBus, spawns the command consumer + inbound WS
@@ -2544,6 +2562,7 @@ impl SiphonServer {
             rf_charger.clone(),
             ro_charger.clone(),
             Arc::clone(&drain),
+            identity,
             product_name,
             product_version,
         ));

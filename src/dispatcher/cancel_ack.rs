@@ -216,7 +216,7 @@ pub(super) fn reject_pending_invite(
         original_request,
         code,
         reason,
-        state.server_header.as_deref(),
+        state.identity.load().server.as_deref(),
         &[],
     );
 
@@ -479,7 +479,13 @@ pub(super) fn handle_cancel(
     // response on one INVITE server transaction (§17.2.1).
     if state.cancelled_invites.contains_key(&invite_server_key) {
         debug!(uac_branch = %uac_branch, "CANCEL retransmission — answering 200, side effects already done");
-        let response = build_response(&message, 200, "OK", state.server_header.as_deref(), &[]);
+        let response = build_response(
+            &message,
+            200,
+            "OK",
+            state.identity.load().server.as_deref(),
+            &[],
+        );
         send_message_from(
             response,
             inbound.transport,
@@ -507,7 +513,13 @@ pub(super) fn handle_cancel(
         .invite_server_has_final(&invite_server_key)
     {
         debug!(uac_branch = %uac_branch, "CANCEL for an INVITE that already has its final response — answered 200, no effect (RFC 3261 §9.2)");
-        let response = build_response(&message, 200, "OK", state.server_header.as_deref(), &[]);
+        let response = build_response(
+            &message,
+            200,
+            "OK",
+            state.identity.load().server.as_deref(),
+            &[],
+        );
         send_message_from(
             response,
             inbound.transport,
@@ -525,7 +537,7 @@ pub(super) fn handle_cancel(
         &message,
         481,
         "Call/Transaction Does Not Exist",
-        state.server_header.as_deref(),
+        state.identity.load().server.as_deref(),
         &[],
     );
     send_message_from(
@@ -779,7 +791,7 @@ pub(super) fn handle_cancel_via_session(
             &message,
             500,
             "Internal Server Error",
-            state.server_header.as_deref(),
+            state.identity.load().server.as_deref(),
             &[],
         );
         send_message_from(
@@ -796,7 +808,13 @@ pub(super) fn handle_cancel_via_session(
     // Send 200 OK to CANCEL (RFC 3261 §9.2: always 200) on the arrival socket —
     // the 487 below already pins `session.inbound_local_addr`; keep the 200 on the
     // same listener so a multi-homed UDP host answers both from one source port.
-    let cancel_response = build_response(&message, 200, "OK", state.server_header.as_deref(), &[]);
+    let cancel_response = build_response(
+        &message,
+        200,
+        "OK",
+        state.identity.load().server.as_deref(),
+        &[],
+    );
     send_message_from(
         cancel_response,
         inbound.transport,
@@ -903,7 +921,7 @@ pub(super) fn abandon_pending_invite(
         &session.original_request,
         status,
         reason_phrase,
-        state.server_header.as_deref(),
+        state.identity.load().server.as_deref(),
         &[],
     );
     send_final_through_server_transaction(

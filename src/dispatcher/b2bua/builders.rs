@@ -159,10 +159,11 @@ pub fn build_b2bua_bye(
     }
 
     // User-Agent / Server header (topology hiding)
-    if let Some(ref ua) = state.user_agent_header {
-        builder = builder.header("User-Agent", ua.clone());
-    } else if let Some(ref srv) = state.server_header {
-        builder = builder.header("User-Agent", srv.clone());
+    let identity = state.identity.load();
+    if let Some(ref user_agent) = identity.user_agent {
+        builder = builder.header("User-Agent", user_agent.clone());
+    } else if let Some(ref server) = identity.server {
+        builder = builder.header("User-Agent", server.clone());
     }
 
     // Route headers from stored dialog route set (RFC 3261 §12.2.1.1)

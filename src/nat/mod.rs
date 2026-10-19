@@ -300,7 +300,7 @@ mod tests {
             std::collections::HashMap::new(),
             None,
             None,
-            None,
+            crate::config::IdentityHeaders::default().shared(),
         ));
         (sender, vec![udp_rx, tcp_rx, tls_rx, ws_rx, wss_rx, sctp_rx])
     }

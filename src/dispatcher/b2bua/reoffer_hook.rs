@@ -371,7 +371,13 @@ pub fn decide_reoffer_here(
     let response = match decision {
         ReofferDecision::Refuse { code, reason } => {
             debug!(call_id = %call_id, code, "B2BUA: on_reoffer refused the offer");
-            build_response(message, *code, reason, state.server_header.as_deref(), &[])
+            build_response(
+                message,
+                *code,
+                reason,
+                state.identity.load().server.as_deref(),
+                &[],
+            )
         }
         ReofferDecision::TakeOver { sdp } => {
             answer_reoffer_here(message, call_id, offerer, early, sdp.as_deref(), state)
@@ -384,7 +390,7 @@ pub fn decide_reoffer_here(
                 message,
                 500,
                 "Server Internal Error",
-                state.server_header.as_deref(),
+                state.identity.load().server.as_deref(),
                 &[],
             )
         }
@@ -432,7 +438,7 @@ fn answer_reoffer_here(
             message,
             488,
             "Not Acceptable Here",
-            state.server_header.as_deref(),
+            state.identity.load().server.as_deref(),
             &[],
         )
     };
@@ -470,7 +476,13 @@ fn answer_reoffer_here(
         (None, None, _) => None,
     };
 
-    let mut response = build_response(message, 200, "OK", state.server_header.as_deref(), &[]);
+    let mut response = build_response(
+        message,
+        200,
+        "OK",
+        state.identity.load().server.as_deref(),
+        &[],
+    );
     // A 2xx to a target refresh request carries the answerer's Contact
     // (RFC 3261 §12.2.2): what siphon advertises on this dialog.
     if let Some(contact) = contact {

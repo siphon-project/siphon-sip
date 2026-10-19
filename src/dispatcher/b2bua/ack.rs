@@ -536,7 +536,7 @@ pub fn reject_unanchorable_offer(
         message,
         488,
         "Not Acceptable Here",
-        state.server_header.as_deref(),
+        state.identity.load().server.as_deref(),
         &[],
     );
     send_message_from(

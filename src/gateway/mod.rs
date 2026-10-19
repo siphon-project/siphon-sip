@@ -1865,7 +1865,7 @@ pub(crate) mod tests {
             std::collections::HashMap::new(),
             None,
             None,
-            None,
+            crate::config::IdentityHeaders::default().shared(),
         ));
         let manager = Arc::new(DispatcherManager::new());
 
@@ -1919,7 +1919,7 @@ pub(crate) mod tests {
                 std::collections::HashMap::new(),
                 None,
                 None,
-                None,
+                crate::config::IdentityHeaders::default().shared(),
             )),
             udp: udp_rx,
             _other: vec![tcp_rx, tls_rx, ws_rx, wss_rx, sctp_rx],

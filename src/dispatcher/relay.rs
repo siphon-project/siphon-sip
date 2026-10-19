@@ -129,7 +129,7 @@ pub(super) fn relay_request(
                                 message,
                                 502,
                                 "Bad Gateway",
-                                state.server_header.as_deref(),
+                                state.identity.load().server.as_deref(),
                                 &[],
                             );
                             send_message_from(
@@ -210,7 +210,7 @@ pub(super) fn relay_request(
                 message,
                 482,
                 "Loop Detected",
-                state.server_header.as_deref(),
+                state.identity.load().server.as_deref(),
                 &[],
             );
             send_message_from(
@@ -234,7 +234,7 @@ pub(super) fn relay_request(
             message,
             483,
             "Too Many Hops",
-            state.server_header.as_deref(),
+            state.identity.load().server.as_deref(),
             &[],
         );
         send_message_from(
@@ -723,7 +723,7 @@ pub(super) fn relay_fork_request(
             message,
             500,
             "No Valid Targets",
-            state.server_header.as_deref(),
+            state.identity.load().server.as_deref(),
             &[],
         );
         send_message_from(

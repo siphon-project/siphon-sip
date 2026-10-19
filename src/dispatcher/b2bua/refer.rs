@@ -373,7 +373,13 @@ pub fn b2bua_refer_send_final(
     reason: &str,
     state: &DispatcherState,
 ) {
-    let response = build_response(message, code, reason, state.server_header.as_deref(), &[]);
+    let response = build_response(
+        message,
+        code,
+        reason,
+        state.identity.load().server.as_deref(),
+        &[],
+    );
     // Kept for the REFER's retransmissions, which get this response again
     // rather than a second decision (RFC 3261 §17.2.2).
     remember_refer_response(&response, state);
@@ -416,7 +422,7 @@ pub fn build_refer_accepted(
         message,
         202,
         "Accepted",
-        state.server_header.as_deref(),
+        state.identity.load().server.as_deref(),
         &[],
     );
     if let Some(contact) = origin_leg.and_then(|leg| leg.dialog.local_contact.clone()) {
@@ -851,7 +857,7 @@ pub fn handle_b2bua_refer_on(
                 &message,
                 481,
                 "Call/Transaction Does Not Exist",
-                state.server_header.as_deref(),
+                state.identity.load().server.as_deref(),
                 &[],
             );
             send_message_from(
@@ -882,7 +888,7 @@ pub fn handle_b2bua_refer_on(
                 &message,
                 481,
                 "Call/Transaction Does Not Exist",
-                state.server_header.as_deref(),
+                state.identity.load().server.as_deref(),
                 &[],
             );
             send_message_from(

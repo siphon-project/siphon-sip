@@ -72,7 +72,7 @@ pub(super) fn handle_srs_invite(
                     &message,
                     400,
                     "Bad Request",
-                    state.server_header.as_deref(),
+                    state.identity.load().server.as_deref(),
                     &[],
                 );
                 send_message_from(
@@ -93,7 +93,7 @@ pub(super) fn handle_srs_invite(
                 &message,
                 400,
                 "Bad Request",
-                state.server_header.as_deref(),
+                state.identity.load().server.as_deref(),
                 &[],
             );
             send_message_from(
@@ -116,7 +116,7 @@ pub(super) fn handle_srs_invite(
                     &message,
                     400,
                     "Bad Request",
-                    state.server_header.as_deref(),
+                    state.identity.load().server.as_deref(),
                     &[],
                 );
                 send_message_from(
@@ -143,7 +143,7 @@ pub(super) fn handle_srs_invite(
                     &message,
                     400,
                     "Bad Request",
-                    state.server_header.as_deref(),
+                    state.identity.load().server.as_deref(),
                     &[],
                 );
                 send_message_from(
@@ -167,7 +167,7 @@ pub(super) fn handle_srs_invite(
                     &message,
                     400,
                     "Bad Request",
-                    state.server_header.as_deref(),
+                    state.identity.load().server.as_deref(),
                     &[],
                 );
                 send_message_from(
@@ -235,7 +235,7 @@ pub(super) fn handle_srs_invite(
                 &message,
                 403,
                 "Forbidden",
-                state.server_header.as_deref(),
+                state.identity.load().server.as_deref(),
                 &[],
             );
             send_message_from(
@@ -267,7 +267,7 @@ pub(super) fn handle_srs_invite(
                         &message,
                         481,
                         "Call/Transaction Does Not Exist",
-                        state.server_header.as_deref(),
+                        state.identity.load().server.as_deref(),
                         &[],
                     );
                     send_message_from(
@@ -291,7 +291,7 @@ pub(super) fn handle_srs_invite(
                         &message,
                         503,
                         "Service Unavailable",
-                        state.server_header.as_deref(),
+                        state.identity.load().server.as_deref(),
                         &[],
                     );
                     send_message_from(
@@ -460,7 +460,7 @@ pub(super) fn handle_srs_invite(
             response_builder = response_builder.content_length(0);
         }
 
-        if let Some(ref server) = state.server_header {
+        if let Some(ref server) = state.identity.load().server {
             response_builder = response_builder.header("Server", server.clone());
         }
 
@@ -523,7 +523,13 @@ pub(super) fn handle_srs_bye(
         let record = srs_manager.stop_session(&call_id);
 
         // Send 200 OK for the BYE.
-        let response = build_response(&message, 200, "OK", state.server_header.as_deref(), &[]);
+        let response = build_response(
+            &message,
+            200,
+            "OK",
+            state.identity.load().server.as_deref(),
+            &[],
+        );
         send_message_from(
             response,
             inbound.transport,

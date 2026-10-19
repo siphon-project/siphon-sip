@@ -579,8 +579,8 @@ pub struct RegistrantManager {
     pub retry_interval: Duration,
     /// Maximum retry interval (backoff cap).
     pub max_retry_interval: Duration,
-    /// User-Agent header value for outbound REGISTERs.
-    user_agent_header: Option<String>,
+    /// The live `User-Agent` for outbound REGISTERs (`server.user_agent_header`).
+    identity: crate::config::SharedIdentityHeaders,
     /// Broadcast channel for registrant state change events.
     event_sender: broadcast::Sender<RegistrantEvent>,
     /// Monotonic counter for UE-side IPsec SPIs (sec-agree). Each initial
@@ -617,7 +617,7 @@ impl RegistrantManager {
         default_interval: u32,
         retry_interval: Duration,
         max_retry_interval: Duration,
-        user_agent_header: Option<String>,
+        identity: crate::config::SharedIdentityHeaders,
     ) -> Self {
         let (event_sender, _) = broadcast::channel(64);
         Self {
@@ -625,7 +625,7 @@ impl RegistrantManager {
             default_interval,
             retry_interval,
             max_retry_interval,
-            user_agent_header,
+            identity,
             event_sender,
             ue_spi_counter: AtomicU32::new(Self::UE_SPI_BASE),
             egress: std::sync::OnceLock::new(),
@@ -1505,7 +1505,11 @@ mod tests {
             3600,
             Duration::from_secs(60),
             Duration::from_secs(300),
-            Some("SIPhon/test".to_string()),
+            crate::config::IdentityHeaders {
+                server: None,
+                user_agent: Some("SIPhon/test".to_string()),
+            }
+            .shared(),
         )
     }
 
@@ -1771,8 +1775,12 @@ mod tests {
 
     #[test]
     fn backoff_capped_at_max() {
-        let manager =
-            RegistrantManager::new(3600, Duration::from_secs(10), Duration::from_secs(30), None);
+        let manager = RegistrantManager::new(
+            3600,
+            Duration::from_secs(10),
+            Duration::from_secs(30),
+            crate::config::IdentityHeaders::default().shared(),
+        );
         manager.add(make_entry("sip:alice@carrier.com"));
 
         // Fail many times
@@ -2410,7 +2418,7 @@ mod tests {
             3600,
             Duration::from_secs(60),
             Duration::from_secs(300),
-            None,
+            crate::config::IdentityHeaders::default().shared(),
         );
         manager.add(make_entry("sip:alice@carrier.com"));
 
@@ -3099,7 +3107,11 @@ mod liveness_tests {
             3600,
             Duration::from_secs(60),
             Duration::from_secs(300),
-            Some("SIPhon/test".to_string()),
+            crate::config::IdentityHeaders {
+                server: None,
+                user_agent: Some("SIPhon/test".to_string()),
+            }
+            .shared(),
         )
     }
 

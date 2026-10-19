@@ -380,7 +380,7 @@ fn answer_caller_prack(
         &pending.caller_prack,
         status,
         prack_refusal_reason(status),
-        state.server_header.as_deref(),
+        state.identity.load().server.as_deref(),
         &[],
     );
     if let Some(retry_after) = retry_after {

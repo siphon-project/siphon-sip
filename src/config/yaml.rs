@@ -465,6 +465,11 @@ impl Mapping {
         self.0.insert(key, value)
     }
 
+    /// Remove `key`, keeping the order of the rest, and return its value.
+    pub fn remove(&mut self, key: &str) -> Option<Value> {
+        self.0.shift_remove(key)
+    }
+
     pub fn len(&self) -> usize {
         self.0.len()
     }

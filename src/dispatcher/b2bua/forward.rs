@@ -113,8 +113,8 @@ pub fn b2bua_forward_indialog_request(
                 code,
                 "B2BUA {method_str}: no far leg to forward to — answering {code} {reason}"
             );
-            let response =
-                build_response(message, code, reason, state.server_header.as_deref(), &[]);
+            let identity = state.identity.load();
+            let response = build_response(message, code, reason, identity.server.as_deref(), &[]);
             // A REFER's final response is kept for its retransmissions.
             if method == Method::Refer {
                 remember_refer_response(&response, state);
@@ -182,8 +182,8 @@ pub fn b2bua_forward_indialog_request(
     // Strip cross-leg headers (same hygiene set as the UPDATE bridge). Refer-To,
     // Referred-By, Event and Subscription-State are NOT in this set, so they ride
     // across intact — exactly what the transparent transfer needs.
-    if let Some(ref ua) = state.user_agent_header {
-        forwarded.headers.set("User-Agent", ua.clone());
+    if let Some(ref user_agent) = state.identity.load().user_agent {
+        forwarded.headers.set("User-Agent", user_agent.clone());
     } else {
         forwarded.headers.remove("User-Agent");
     }
@@ -387,7 +387,7 @@ pub fn handle_b2bua_notify(inbound: InboundMessage, message: SipMessage, state: 
                 &message,
                 481,
                 "Call/Transaction Does Not Exist",
-                state.server_header.as_deref(),
+                state.identity.load().server.as_deref(),
                 &[],
             );
             send_message_from(
@@ -416,7 +416,7 @@ pub fn handle_b2bua_notify(inbound: InboundMessage, message: SipMessage, state: 
                 &message,
                 481,
                 "Call/Transaction Does Not Exist",
-                state.server_header.as_deref(),
+                state.identity.load().server.as_deref(),
                 &[],
             );
             send_message_from(
@@ -437,7 +437,13 @@ pub fn handle_b2bua_notify(inbound: InboundMessage, message: SipMessage, state: 
     {
         // siphon owns this subscription (it sent the REFER). Absorb: 200 OK and
         // read the sipfrag progress; on terminated, drop the subscription.
-        let response = build_response(&message, 200, "OK", state.server_header.as_deref(), &[]);
+        let response = build_response(
+            &message,
+            200,
+            "OK",
+            state.identity.load().server.as_deref(),
+            &[],
+        );
         send_message_from(
             response,
             inbound.transport,

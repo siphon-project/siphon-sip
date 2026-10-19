@@ -2206,7 +2206,7 @@ mod tests {
             HashMap::new(),
             None,
             None,
-            None,
+            crate::config::IdentityHeaders::default().shared(),
         ));
         let resolver = Arc::new(SipResolver::from_system().unwrap());
 

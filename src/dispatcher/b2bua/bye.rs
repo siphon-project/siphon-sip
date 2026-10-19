@@ -26,7 +26,7 @@ pub fn handle_b2bua_bye(inbound: InboundMessage, message: SipMessage, state: &Di
                 &message,
                 481,
                 "Call/Transaction Does Not Exist",
-                state.server_header.as_deref(),
+                state.identity.load().server.as_deref(),
                 &[],
             );
             send_message_from(
@@ -61,7 +61,7 @@ pub fn handle_b2bua_bye(inbound: InboundMessage, message: SipMessage, state: &Di
                 &message,
                 481,
                 "Call/Transaction Does Not Exist",
-                state.server_header.as_deref(),
+                state.identity.load().server.as_deref(),
                 &[],
             );
             send_message_from(
@@ -102,7 +102,13 @@ pub fn handle_b2bua_bye(inbound: InboundMessage, message: SipMessage, state: &Di
         .call_actors
         .mark_transfer_referrer_gone(&call_id, from_a_leg)
     {
-        let bye_response = build_response(&message, 200, "OK", state.server_header.as_deref(), &[]);
+        let bye_response = build_response(
+            &message,
+            200,
+            "OK",
+            state.identity.load().server.as_deref(),
+            &[],
+        );
         send_message_from(
             bye_response,
             inbound.transport,
@@ -124,7 +130,13 @@ pub fn handle_b2bua_bye(inbound: InboundMessage, message: SipMessage, state: &Di
     // timer, a script, the other party's own BYE) is answered, and that teardown
     // sends what is owed: running this one too would BYE a leg twice.
     if !state.call_actors.claim_teardown(&call_id) {
-        let bye_response = build_response(&message, 200, "OK", state.server_header.as_deref(), &[]);
+        let bye_response = build_response(
+            &message,
+            200,
+            "OK",
+            state.identity.load().server.as_deref(),
+            &[],
+        );
         send_message_from(
             bye_response,
             inbound.transport,
@@ -266,7 +278,13 @@ pub fn handle_b2bua_bye(inbound: InboundMessage, message: SipMessage, state: &Di
     // Send 200 OK to the BYE sender on the socket the BYE arrived on (multi-homed
     // UDP source-port parity — the in-dialog BYE now lands on the A-leg's anchored
     // listener after the Contact fix, so its 200 must leave from there too).
-    let bye_response = build_response(&message, 200, "OK", state.server_header.as_deref(), &[]);
+    let bye_response = build_response(
+        &message,
+        200,
+        "OK",
+        state.identity.load().server.as_deref(),
+        &[],
+    );
     send_message_from(
         bye_response,
         inbound.transport,

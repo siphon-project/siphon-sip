@@ -37,7 +37,7 @@ pub fn handle_b2bua_update(inbound: InboundMessage, message: SipMessage, state: 
                 &message,
                 481,
                 "Call/Transaction Does Not Exist",
-                state.server_header.as_deref(),
+                state.identity.load().server.as_deref(),
                 &[],
             );
             send_message_from(
@@ -69,7 +69,7 @@ pub fn handle_b2bua_update(inbound: InboundMessage, message: SipMessage, state: 
                 &message,
                 481,
                 "Call/Transaction Does Not Exist",
-                state.server_header.as_deref(),
+                state.identity.load().server.as_deref(),
                 &[],
             );
             send_message_from(
@@ -219,7 +219,7 @@ pub fn handle_b2bua_update(inbound: InboundMessage, message: SipMessage, state: 
             &message,
             481,
             "Call/Transaction Does Not Exist",
-            state.server_header.as_deref(),
+            state.identity.load().server.as_deref(),
             &[],
         );
         send_message_from(
@@ -273,7 +273,13 @@ pub fn handle_b2bua_update(inbound: InboundMessage, message: SipMessage, state: 
     // Send 100 Trying so the originator stops T1-backoff retransmits while we
     // forward. UPDATE responses are usually fast, but the 100 keeps the
     // request-side UAC quiet over UDP if the far end stalls.
-    let trying = build_response(&message, 100, "Trying", state.server_header.as_deref(), &[]);
+    let trying = build_response(
+        &message,
+        100,
+        "Trying",
+        state.identity.load().server.as_deref(),
+        &[],
+    );
     // Answer on the same listener the request arrived on so a multi-homed UDP
     // host keeps a symmetric source port (a peer that sent to :5066 rejects a
     // reply sourced from :5060). No-op for stream transports / single listener.
@@ -343,7 +349,7 @@ pub fn handle_b2bua_update(inbound: InboundMessage, message: SipMessage, state: 
                 &message,
                 500,
                 "Server Internal Error",
-                state.server_header.as_deref(),
+                state.identity.load().server.as_deref(),
                 &[],
             );
             send_message_from(
@@ -403,8 +409,8 @@ pub fn handle_b2bua_update(inbound: InboundMessage, message: SipMessage, state: 
         forwarded.headers.set("Via", via_value);
 
         // Strip cross-leg headers (same set as re-INVITE bridging).
-        if let Some(ref ua) = state.user_agent_header {
-            forwarded.headers.set("User-Agent", ua.clone());
+        if let Some(ref user_agent) = state.identity.load().user_agent {
+            forwarded.headers.set("User-Agent", user_agent.clone());
         } else {
             forwarded.headers.remove("User-Agent");
         }
@@ -766,10 +772,11 @@ pub fn build_b2bua_in_dialog_request(
     if let Some(ref contact) = dialog.local_contact {
         builder = builder.header("Contact", contact.clone());
     }
-    if let Some(ref ua) = state.user_agent_header {
-        builder = builder.header("User-Agent", ua.clone());
-    } else if let Some(ref srv) = state.server_header {
-        builder = builder.header("User-Agent", srv.clone());
+    let identity = state.identity.load();
+    if let Some(ref user_agent) = identity.user_agent {
+        builder = builder.header("User-Agent", user_agent.clone());
+    } else if let Some(ref server) = identity.server {
+        builder = builder.header("User-Agent", server.clone());
     }
     for route in &dialog.route_set {
         builder = builder.header("Route", route.clone());

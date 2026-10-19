@@ -109,11 +109,12 @@ pub(super) fn sanitize_b2bua_response_keeping(
     // sanitize_b2bua_response strips — Allow/Allow-Events/Supported/Require/
     // RSeq/Content-Disposition/User-Agent strip + Server rewrite).
     let policy = state.resolve_header_policy(call_id);
+    let identity = state.identity.load();
     let ctx = crate::b2bua::header_policy::PolicyContext {
         b2bua_host: &a_leg_host,
         b2bua_port: a_leg_port,
-        user_agent_header: state.user_agent_header.as_deref(),
-        server_header: state.server_header.as_deref(),
+        user_agent_header: identity.user_agent.as_deref(),
+        server_header: identity.server.as_deref(),
     };
     crate::b2bua::header_policy::apply_to_response_keeping(
         response,

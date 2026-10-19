@@ -95,7 +95,7 @@ pub(super) fn handle_inbound(inbound: InboundMessage, state: &Arc<DispatcherStat
                         &message,
                         rejection.status,
                         rejection.reason,
-                        state.server_header.as_deref(),
+                        state.identity.load().server.as_deref(),
                         &[],
                     );
                     send_message_from(

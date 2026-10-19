@@ -368,7 +368,7 @@ mod tests {
             3600,
             Duration::from_secs(60),
             Duration::from_secs(300),
-            None,
+            crate::config::IdentityHeaders::default().shared(),
         ))
     }
 

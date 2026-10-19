@@ -150,7 +150,7 @@ pub fn early_dialog_update(
         message,
         status_code,
         reason,
-        state.server_header.as_deref(),
+        state.identity.load().server.as_deref(),
         &[],
     );
     if retry_after {
@@ -310,7 +310,7 @@ fn caller_update_refusal(
         .call_id(a_leg.dialog.call_id.clone())
         .cseq(tracking.stored_cseq.clone()?)
         .header("Retry-After", random_retry_after());
-    if let Some(server) = state.server_header.as_deref() {
+    if let Some(server) = state.identity.load().server.as_deref() {
         builder = builder.header("Server", server.to_string());
     }
     match builder.content_length(0).build() {

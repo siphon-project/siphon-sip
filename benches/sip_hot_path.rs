@@ -501,6 +501,53 @@ fn bench_source_trust(criterion: &mut Criterion) {
     group.finish();
 }
 
+/// A locally built response stamping `Server`, read the way the dispatcher
+/// reads it since `POST /admin/config/reload` made it swappable.
+///
+/// The cost the reload added is the `ArcSwap` read itself, so that is measured
+/// on its own in `identity_headers`, next to the plain `Option<String>` read it
+/// replaced. Two whole-response rows differing only in that read are not a
+/// like-for-like comparison: on the reference machine a second copy of the
+/// *identical* owned-read body measured 693–851 ns against the first copy's
+/// 679 ns, depending on which row ran first, so the gap between two such rows is
+/// code placement, not the read. `build_response/server_header_arcswap` stays
+/// as the product-shaped row for the regression gate.
+fn bench_build_response(criterion: &mut Criterion) {
+    use siphon::config::IdentityHeaders;
+    use siphon::sip::builder::build_response_skeleton;
+
+    let (_, invite) = parse_sip_message(&invite_with_sdp()).expect("the fixture parses");
+    let owned: Option<String> = Some("SIPhon/1.0".to_string());
+    let identity = IdentityHeaders {
+        server: Some("SIPhon/1.0".to_string()),
+        user_agent: None,
+    }
+    .shared();
+
+    let mut group = criterion.benchmark_group("build_response");
+    group.bench_function("server_header_arcswap", |bencher| {
+        bencher.iter(|| {
+            let mut response = build_response_skeleton(black_box(&invite), 200, "OK");
+            if let Some(server) = black_box(&identity).load().server.as_deref() {
+                response.headers.set("Server", server.to_string());
+            }
+            response
+        });
+    });
+    group.finish();
+
+    // The read alone: what each locally built message pays for the header
+    // being reloadable.
+    let mut group = criterion.benchmark_group("identity_headers");
+    group.bench_function("owned_read", |bencher| {
+        bencher.iter(|| black_box(&owned).as_deref().map(str::len));
+    });
+    group.bench_function("arcswap_load", |bencher| {
+        bencher.iter(|| black_box(&identity).load().server.as_deref().map(str::len));
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_parse,
@@ -514,6 +561,7 @@ criterion_group!(
     bench_txn_key,
     bench_framing,
     bench_traffic_counters,
-    bench_source_trust
+    bench_source_trust,
+    bench_build_response
 );
 criterion_main!(benches);
