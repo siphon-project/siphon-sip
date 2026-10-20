@@ -1280,9 +1280,12 @@ fn dial_parallel(
 /// A sequential `dial` as a failover queue.
 ///
 /// Its targets are phones being hunted, and a phone that rings sends a 180, so
-/// each target moves on when `timeout_secs` passes whether it rang or not:
-/// every route sets `reroute_after_progress`, where an LCR carrier that has
-/// shown progress would keep the call.
+/// by default each target moves on when `timeout_secs` passes whether it rang
+/// or not: its route sets `reroute_after_progress`, where an LCR carrier that
+/// has shown progress would keep the call. A target that sets it `false` keeps
+/// the call once it has rung, and every attempt is marked a hunt, which also
+/// ends the dial on that target's final failure and on any 6xx
+/// ([`crate::b2bua::actor::hunt_stops_at`]).
 fn sequential_dial_routes(
     targets: Vec<DialTarget>,
     branch_froms: Vec<Option<ShapedFrom>>,
@@ -1302,6 +1305,7 @@ fn sequential_dial_routes(
             // number for this carrier alone, tag-preserving, and reaches
             // `P-Asserted-Identity` with it. The dial's own identity is already
             // on the template, so a route only carries what differs.
+            let reroute_after_progress = target.reroutes_after_progress();
             let caller_id = target
                 .from
                 .as_deref()
@@ -1318,7 +1322,8 @@ fn sequential_dial_routes(
                 )
                 .into_iter()
                 .collect(),
-                reroute_after_progress: true,
+                reroute_after_progress,
+                hunt: true,
                 caller_id,
                 // The failover engine applies this per attempt, after the
                 // number policy, which is where CLIR belongs: the presentation

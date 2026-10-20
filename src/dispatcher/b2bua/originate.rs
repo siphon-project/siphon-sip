@@ -1223,14 +1223,12 @@ pub fn handle_originated_call_response(
     state.call_actors.remove_call(internal_call_id);
     state.call_event_receivers.remove(internal_call_id);
     // A leg of an originate group: the group decides what its rejection means.
-    originate_group_leg_ended(
+    originate_group_leg_rejected(
         state,
         internal_call_id,
-        crate::b2bua::actor::DialBranchOutcome::new(
-            status_code,
-            &reason_phrase,
-            crate::b2bua::actor::DialBranchCause::Rejected,
-        ),
+        status_code,
+        &reason_phrase,
+        message,
     );
 }
 

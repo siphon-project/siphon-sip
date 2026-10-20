@@ -1274,6 +1274,39 @@ describe("dial args map to the target shapes the server parses", () => {
     ).toThrow(/contactHost/);
   });
 
+  it("sends a target's rerouteAfterProgress as reroute_after_progress, false included", () => {
+    expect(
+      dialArgs(
+        [
+          {
+            uri: "sip:204@pbx.example",
+            nextHop: "sip:192.0.2.21:5060",
+            rerouteAfterProgress: false,
+          },
+          { aor: "sip:204@pbx.example", rerouteAfterProgress: true },
+          { uri: "sip:204@pbx.example", rerouteAfterProgress: false },
+          { uri: "sip:1001@pbx.example" },
+        ],
+        { strategy: "sequential" },
+      ),
+    ).toEqual({
+      targets: [
+        {
+          uri: "sip:204@pbx.example",
+          next_hop: "sip:192.0.2.21:5060",
+          reroute_after_progress: false,
+        },
+        { aor: "sip:204@pbx.example", reroute_after_progress: true },
+        { uri: "sip:204@pbx.example", reroute_after_progress: false },
+        "sip:1001@pbx.example",
+      ],
+      strategy: "sequential",
+    });
+    expect(() =>
+      dialArgs([{ uri: "sip:1001@pbx.example", rerouteAfterProgress: "no" } as never]),
+    ).toThrow(/rerouteAfterProgress/);
+  });
+
   it("sends a target's profile on either form, beside the dial's own", () => {
     expect(
       dialArgs(
