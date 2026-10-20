@@ -646,6 +646,7 @@ pub fn start_li_recording(
                     address: destination,
                     transport: Some(transport),
                     server_name: None,
+                    verify_server: None,
                 };
                 send_to_target(
                     data,

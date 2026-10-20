@@ -1649,25 +1649,49 @@ impl SiphonServer {
         // No `tls:` block at all means the default floor (TLS 1.2), i.e. exactly
         // what outbound TLS negotiated before the setting was honored.
         let outbound_tls_method = config.tls.as_ref().map(|t| t.method).unwrap_or_default();
-        let tls_client_config = match transport::pool::build_outbound_tls_config(
+        // Outbound server verification (`tls.verify_server` / `tls.server_ca`):
+        // the roots are loaded even with the default off, because a gateway or
+        // a control `dial` target can ask for verification on its own.
+        let server_verification = match config.tls.as_ref().map_or(
+            Ok(transport::outbound_tls::ServerVerification::public_roots(
+                false,
+            )),
+            |tls| {
+                transport::outbound_tls::ServerVerification::new(
+                    tls.verify_server,
+                    tls.server_ca.as_deref(),
+                )
+            },
+        ) {
+            Ok(verification) => verification,
+            Err(error) => {
+                eprintln!("Failed to load tls.server_ca: {error}");
+                std::process::exit(1);
+            }
+        };
+        let tls_client_configs = match transport::outbound_tls::build_outbound_tls_configs(
             outbound_client_identity,
             outbound_tls_method,
+            &server_verification,
         ) {
-            Ok(config) => config,
+            Ok(configs) => configs,
             Err(error) => {
                 eprintln!("Failed to build outbound TLS client config: {error}");
                 std::process::exit(1);
             }
         };
-        let connection_pool = Arc::new(transport::pool::ConnectionPool::new(
-            Arc::clone(&tcp_connection_map),
-            inbound_tx.clone(),
-            pool_local_addr,
-            pool_tos,
-            Some(stream_connections.clone()),
-            crlf_pong_tracker.clone(),
-            tls_client_config,
-        ));
+        let connection_pool = Arc::new(
+            transport::pool::ConnectionPool::new(
+                Arc::clone(&tcp_connection_map),
+                inbound_tx.clone(),
+                pool_local_addr,
+                pool_tos,
+                Some(stream_connections.clone()),
+                crlf_pong_tracker.clone(),
+                Arc::clone(&tls_client_configs.unverified),
+            )
+            .with_tls_configs(tls_client_configs),
+        );
 
         // Hot-reload the outbound client certificate alongside the inbound
         // acceptor: when `tls.client_certificate` + `tls.client_private_key` are
@@ -1684,6 +1708,7 @@ impl SiphonServer {
                 certificate_path,
                 private_key_path,
                 outbound_tls_method,
+                server_verification,
             );
         }
 

@@ -72,6 +72,61 @@ sends the resolved target hostname as SNI (RFC 6066) instead of the destination
 IP, so a hostname-vhost front-end can route the handshake; bare-IP next hops
 send no SNI, as before.
 
+### Verifying the server siphon dials
+
+By default siphon does **not** verify the certificate of a TLS peer it dials
+out to. The connection is encrypted, but not authenticated: the caller identity
+and any SDES keys in the SDP go to whoever answers on the address. That has
+always been the default (and is Kamailio's and OpenSIPS's) because trunks often
+present certificates nothing trusts, so it stays off. Turn it on for any
+gateway you reach by hostname.
+
+```yaml
+tls:
+  certificate: "/etc/siphon/tls/example.com.crt"
+  private_key:  "/etc/siphon/tls/example.com.key"
+  verify_server: true                          # every outbound SIP TLS connection
+  server_ca: "/etc/siphon/tls/trunk-ca.pem"    # optional; else the Mozilla roots
+
+gateway:
+  groups:
+    - name: "carriers"
+      verify_server: true                      # this group's destinations
+      destinations:
+        - uri: "sip:trunk.example.net;transport=tls"
+        - uri: "sip:192.0.2.20:5061;transport=tls"
+          verify_server: false                 # this one alone, over the group
+```
+
+A verified connection checks two things. The chain has to reach `server_ca`
+(which **replaces** the bundled Mozilla roots rather than adding to them), and
+the certificate has to name the host siphon routed on: the host of the next hop,
+gateway or dial target URI. Never the address that host resolved to, and not an
+SRV target either: RFC 5922 §4 takes the identity from the URI being resolved,
+because DNS without DNSSEC cannot vouch for an SRV answer. The name is matched as
+a SIP domain (RFC 5922 §7): a `sip:` URI subjectAltName without a user part wins
+over the dNSName entries, matching is exact, and a wildcard such as
+`*.example.net` never matches. An IP-literal target needs that address as an
+iPAddress subjectAltName. The common name is not consulted.
+
+Precedence, highest first: a control `dial` / `route` target's `verify_server`,
+the gateway destination's, its group's, then `tls.verify_server`. A gateway
+destination's setting applies to everything routed to it, script relays and
+dials included, and to its OPTIONS health probe, so a trunk whose certificate
+stops verifying is marked down. A verified connection is never shared with an
+unverified one to the same address, nor with one verified for another name;
+siphon also stops reusing a connection the peer opened inbound for a verified
+send. An in-dialog request that routes by address reuses the connection verified
+when the dialog was set up.
+
+A certificate that fails is refused during the handshake. The request fails the
+way a refused connect does (a relayed request gets 503 upstream, RFC 3261 §16.9;
+a B-leg fails the call), and siphon logs `outbound TLS server verification
+failed` with the destination, the expected name and the reason. Client
+certificate presentation (`client_certificate`) keeps working with verification
+on. These keys need a restart to change; a renewed client certificate still
+hot-reloads.
+
 ### One port for SIP and WebSocket
 
 Give the same address to both `tls:` and `wss:` (or to both `tcp:` and `ws:`)

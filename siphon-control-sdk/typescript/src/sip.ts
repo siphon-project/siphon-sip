@@ -308,6 +308,25 @@ export interface RouteTargetObject {
    * address it advertises. See {@link DialTarget}'s `contactHost`.
    */
   contactHost?: string;
+  /**
+   * Verify (`true`) or not (`false`) the server certificate when this attempt
+   * opens a new outbound TLS connection. See {@link DialTarget}'s
+   * `verifyServer`.
+   */
+  verifyServer?: boolean;
+}
+
+/**
+ * A target's `verifyServer` as the wire carries it. Anything but a boolean is
+ * refused, as the server refuses it: read as `false`, it would send the call to
+ * a peer the app asked to have authenticated without authenticating it.
+ */
+function verifyServerToWire(verifyServer: unknown): boolean | undefined {
+  if (verifyServer === undefined || verifyServer === null) return undefined;
+  if (typeof verifyServer !== "boolean") {
+    throw new TypeError('a target\'s "verifyServer" is a boolean');
+  }
+  return verifyServer;
 }
 
 /**
@@ -350,6 +369,7 @@ function routeTargetToWire(target: RouteTarget): unknown {
   }
   const route = routeSetToWire(target.route);
   const contactHost = contactHostToWire(target.contactHost);
+  const verifyServer = verifyServerToWire(target.verifyServer);
   const object: Record<string, unknown> = { uri: target.uri };
   if (target.nextHop !== undefined) {
     object.next_hop = target.nextHop;
@@ -369,6 +389,9 @@ function routeTargetToWire(target: RouteTarget): unknown {
   }
   if (contactHost !== undefined) {
     object.contact_host = contactHost;
+  }
+  if (verifyServer !== undefined) {
+    object.verify_server = verifyServer;
   }
   return object;
 }
@@ -635,6 +658,16 @@ export type DialTarget =
        * IP address; the server refuses anything else with `bad_request`.
        */
       contactHost?: string;
+      /**
+       * Verify (`true`) or not (`false`) the server certificate when this branch
+       * opens a new outbound TLS connection, over the gateway it routes to and
+       * the server's `tls.verify_server`: the chain against the server's
+       * `tls.server_ca` (or its bundled public roots), and the host this branch
+       * routes to (`nextHop`, else `uri`) as a SIP domain (RFC 5922 §7: exact
+       * match, no wildcards), or its IP address for an IP-literal target. A
+       * branch that fails is not sent. Unset leaves it to the server.
+       */
+      verifyServer?: boolean;
     }
   | {
       /**
@@ -649,6 +682,8 @@ export type DialTarget =
       to?: string;
       /** Host of siphon's own `Contact` on every branch the AoR expands to (see the URI form). */
       contactHost?: string;
+      /** Server certificate verification on every branch the AoR expands to (see the URI form). */
+      verifyServer?: boolean;
     };
 
 /**
@@ -806,6 +841,7 @@ function dialTargetToWire(target: DialTarget): unknown {
   const to = (target as { to?: unknown }).to;
   const route = routeSetToWire((target as { route?: unknown }).route);
   const contactHost = contactHostToWire((target as { contactHost?: unknown }).contactHost);
+  const verifyServer = verifyServerToWire((target as { verifyServer?: unknown }).verifyServer);
   if (to !== undefined && typeof to !== "string") {
     throw new TypeError('a dial target\'s "to" is a SIP URI string');
   }
@@ -832,6 +868,7 @@ function dialTargetToWire(target: DialTarget): unknown {
     if (headers !== undefined) object.headers = headers;
     if (to !== undefined) object.to = to;
     if (contactHost !== undefined) object.contact_host = contactHost;
+    if (verifyServer !== undefined) object.verify_server = verifyServer;
     return object;
   }
   if (typeof uri !== "string") {
@@ -843,7 +880,8 @@ function dialTargetToWire(target: DialTarget): unknown {
     headers === undefined &&
     to === undefined &&
     route === undefined &&
-    contactHost === undefined
+    contactHost === undefined &&
+    verifyServer === undefined
   ) {
     return uri;
   }
@@ -853,6 +891,7 @@ function dialTargetToWire(target: DialTarget): unknown {
   if (to !== undefined) object.to = to;
   if (route !== undefined) object.route = route;
   if (contactHost !== undefined) object.contact_host = contactHost;
+  if (verifyServer !== undefined) object.verify_server = verifyServer;
   return object;
 }
 

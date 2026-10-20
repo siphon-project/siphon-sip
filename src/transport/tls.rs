@@ -1014,6 +1014,8 @@ mod tests {
             client_ca: None,
             client_certificate: None,
             client_private_key: None,
+            verify_server: false,
+            server_ca: None,
         }
     }
 
@@ -1042,6 +1044,8 @@ mod tests {
             client_ca: None,
             client_certificate: None,
             client_private_key: None,
+            verify_server: false,
+            server_ca: None,
         };
         let result = build_tls_acceptor(&tls_config);
         assert!(result.is_err());
@@ -1094,6 +1098,8 @@ mod tests {
             client_ca: None,
             client_certificate: None,
             client_private_key: None,
+            verify_server: false,
+            server_ca: None,
         };
         let result = build_tls_acceptor(&tls_config);
         assert!(result.is_err());

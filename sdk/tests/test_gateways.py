@@ -147,3 +147,11 @@ def test_a_linked_row_can_gate_on_its_registration():
     # No credentials of its own: it inherits the registration's.
     assert "password" not in encoded
     assert "username" not in encoded
+
+
+def test_verify_server_rides_the_row_only_when_set():
+    assert "verify_server" not in row().to_dict()
+    for verify in (True, False):
+        encoded = row(verify_server=verify).to_dict()
+        assert encoded["verify_server"] is verify
+        assert GatewayRow.from_dict(encoded).verify_server is verify

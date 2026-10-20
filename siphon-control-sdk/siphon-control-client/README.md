@@ -63,6 +63,9 @@ Every verb the server's `sip` adapter describes has a typed method:
   name the host siphon presents in its own Contact on that leg, in place of the
   address it advertises, for a peer that identifies the tenant or account by
   that host. Only the host changes.
+  `DialTarget::verify_server(bool)` and `RouteTarget { verify_server, .. }` verify
+  (or not) the server certificate when that leg opens a new outbound TLS
+  connection, over the gateway it routes to and the server's `tls.verify_server`.
   The caller's side of the same: `ResponseOptions::contact_host` with
   `answer_with_options` / `progress_with_options` (anchored too),
   `ring_with_contact_host`, `DialOptions::caller_contact_host` and

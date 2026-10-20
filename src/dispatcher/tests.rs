@@ -6073,6 +6073,7 @@ fn candidate(addr: &str) -> RelayTarget {
         address: addr.parse().unwrap(),
         transport: None,
         server_name: None,
+        verify_server: None,
     }
 }
 

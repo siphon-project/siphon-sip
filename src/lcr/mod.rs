@@ -335,6 +335,12 @@ pub struct Route {
     /// controller's to know, not a rating decision.
     #[serde(skip)]
     pub contact_host: Option<String>,
+    /// Server verification on a new TLS connection for this attempt's leg,
+    /// when a controller `route` or sequential `dial` target named one
+    /// (`verify_server`). Not part of the LCR API: a carrier reached through a
+    /// gateway takes the gateway destination's own `verify_server`.
+    #[serde(skip)]
+    pub verify_server: Option<bool>,
 }
 
 impl Route {

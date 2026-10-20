@@ -20,6 +20,7 @@ pub fn b2bua_stop_siprec(internal_call_id: &str, state: &DispatcherState) {
             address: destination,
             transport: Some(transport),
             server_name: None,
+            verify_server: None,
         };
         send_to_target(
             data,

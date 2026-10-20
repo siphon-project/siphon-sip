@@ -278,6 +278,7 @@ pub fn arm_reliable_provisional_retransmit_on(
                         data: bytes.clone(),
                         source_local_addr: route.source_local_addr,
                         server_name: None,
+                        verify_server: None,
                     });
                     interval = (interval * 2).min(cap);
                 }
@@ -424,6 +425,7 @@ pub fn start_2xx_retransmits(
                         data: bytes.clone(),
                         source_local_addr,
                         server_name: None,
+                        verify_server: None,
                     });
                     interval = (interval * 2).min(timers.t2);
                 }

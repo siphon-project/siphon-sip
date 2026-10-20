@@ -2207,6 +2207,72 @@ def test_play_sources_gain_and_number_shaping_roundtrip():
     asyncio.run(scenario())
 
 
+def test_verify_server_roundtrip():
+    """`verify_server` goes out as a bool on a `dial` target of either form and on
+    a `route` target, stays off the wire when not given, and anything but a bool
+    is refused before a frame is sent."""
+
+    async def scenario():
+        frames = []
+
+        def reply(frame):
+            return {"channel": "ch1", "state": frame["verb"], "targets": 1}
+
+        stub = _verb_stub({"dial", "route"}, reply, frames)
+        async with websockets.serve(
+            stub, "127.0.0.1", 0, subprotocols=[SUBPROTOCOL]
+        ) as server:
+            port = server.sockets[0].getsockname()[1]
+            url = f"ws://127.0.0.1:{port}/control/ws"
+            client = ControlClient(app=APP, token=TOKEN, url=url)
+            done = asyncio.get_event_loop().create_future()
+            refused = []
+
+            @client.on_call
+            async def handle(call):
+                await call.dial(
+                    [
+                        {"uri": "sip:+15550199@trunk.example.net", "verify_server": True},
+                        {"aor": "sip:204@pbx.example", "verify_server": False},
+                        {"uri": "sip:1001@pbx.example", "verify_server": None},
+                    ]
+                )
+                await call.route(
+                    [{"uri": "sip:+15550100@trunk.example.net", "verify_server": True}]
+                )
+                try:
+                    await call.dial([{"uri": "sip:1001@pbx.example", "verify_server": "yes"}])
+                except (TypeError, ValueError) as error:
+                    refused.append(str(error))
+                if not done.done():
+                    done.set_result(True)
+
+            await client.connect()
+            run_task = asyncio.ensure_future(client.run())
+            await asyncio.sleep(0.3)
+            await client.command("test_push_stasis")
+            await asyncio.wait_for(done, timeout=5)
+
+            assert frames[0]["verb"] == "dial"
+            assert frames[0]["args"]["targets"] == [
+                {"uri": "sip:+15550199@trunk.example.net", "verify_server": True},
+                {"aor": "sip:204@pbx.example", "verify_server": False},
+                "sip:1001@pbx.example",
+            ]
+            assert frames[1]["verb"] == "route"
+            assert frames[1]["args"]["targets"] == [
+                {"uri": "sip:+15550100@trunk.example.net", "verify_server": True}
+            ]
+            assert len(frames) == 2, "a non-bool verify_server must not reach the wire"
+            assert refused and "verify_server" in refused[0]
+
+            client.shutdown()
+            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+                await asyncio.wait_for(run_task, timeout=5)
+
+    asyncio.run(scenario())
+
+
 def test_contact_host_roundtrip():
     """`contact_host` goes out on a `dial` target of either form, on a `route`
     target and on `originate` (to and aor), and stays off the wire when not given."""

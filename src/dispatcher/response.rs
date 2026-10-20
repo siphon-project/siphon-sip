@@ -152,6 +152,7 @@ pub(super) fn handle_response(
                                     address: destination,
                                     transport: Some(transport),
                                     server_name: None,
+                                    verify_server: None,
                                 };
                                 send_to_target(
                                     data,

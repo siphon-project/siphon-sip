@@ -1590,6 +1590,8 @@ mod tests {
             client_ca: None,
             client_certificate: None,
             client_private_key: None,
+            verify_server: false,
+            server_ca: None,
         };
         let acceptor =
             crate::transport::tls::build_hot_reload_acceptor(&tls).expect("hot reload acceptor");
