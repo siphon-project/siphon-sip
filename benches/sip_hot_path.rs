@@ -626,8 +626,58 @@ fn bench_security_filter(criterion: &mut Criterion) {
     group.finish();
 }
 
+/// Which listener a message leaves on, and what that listener advertises —
+/// resolved for every relayed request and B-leg on a transport with several
+/// listeners (`ListenerRegistry::identity`), after looking up the listener of
+/// the connection the send reuses (`StreamConnections::reuse_listener`). A
+/// single-listener deployment skips both, so this is the cost the
+/// multi-listener shape adds per message.
+fn bench_listener_identity(criterion: &mut Criterion) {
+    use siphon::transport::{
+        AdvertisedAddress, ConnectionId, ListenerRegistry, StreamConnections, Transport,
+    };
+    let phones: std::net::SocketAddr = "192.0.2.10:5061".parse().expect("literal");
+    let trunk: std::net::SocketAddr = "192.0.2.10:15068".parse().expect("literal");
+    let registry = ListenerRegistry::from_entries(vec![
+        (Transport::Tls, phones, None),
+        (
+            Transport::Tls,
+            trunk,
+            Some(AdvertisedAddress::parse("sip.example.com:5068").expect("valid")),
+        ),
+    ])
+    .with_global_advertised(Some("192.0.2.1"));
+    let connections = StreamConnections::new();
+    for index in 0..1_000u16 {
+        let peer = std::net::SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, (index % 250) as u8)),
+            40_000 + index,
+        );
+        connections.register_on_listener(
+            peer,
+            Transport::Tls,
+            ConnectionId(u64::from(index)),
+            phones,
+        );
+    }
+    let known: std::net::SocketAddr = "192.0.2.7:40007".parse().expect("literal");
+
+    let mut group = criterion.benchmark_group("listener_identity");
+    group.bench_function("identity_advertised", |bencher| {
+        bencher.iter(|| black_box(registry.identity(Transport::Tls, black_box(trunk))));
+    });
+    group.bench_function("identity_unadvertised", |bencher| {
+        bencher.iter(|| black_box(registry.identity(Transport::Tls, black_box(phones))));
+    });
+    group.bench_function("reuse_listener_exact", |bencher| {
+        bencher.iter(|| black_box(connections.reuse_listener(black_box(known), Transport::Tls)));
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
+    bench_listener_identity,
     bench_parse,
     bench_parse_bytes,
     bench_validate,

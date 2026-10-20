@@ -412,7 +412,7 @@ pub fn handle_b2bua_reinvite(
         // Unanchored legs keep the per-transport via_host/via_port.
         let transport_str = format!("{}", transport).to_uppercase();
         let (via_host, via_port) = if from_a_leg {
-            b_leg_sent_by(target_local_addr, state, &transport)
+            b_leg_sent_by(target_local_addr, destination, state, &transport)
         } else {
             (
                 state.a_leg_advertised_host(target_local_addr, &transport),
