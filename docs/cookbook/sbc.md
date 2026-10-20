@@ -370,6 +370,36 @@ call.set_header("Supported", call.get_header("Supported"))
 `replaces`, and `timer` when SIPhon runs the session timer, are still merged into a
 `Supported` the script set. `call.remove_header("Allow")` sends no `Allow` at all.
 
+#### A smaller `Allow` toward one trunk
+
+Some trunk peers pick their transfer method from the `Allow` they are shown: with
+`REFER` listed they send SIPhon a REFER, without it they transfer the call
+themselves. To keep `REFER` (or anything else) out of what one peer sees, give its
+gateway group `allow_methods`:
+
+```yaml
+gateway:
+  groups:
+    - name: "trunk-a"
+      allow_methods: [INVITE, ACK, CANCEL, BYE, OPTIONS, PRACK, UPDATE]
+      destinations:
+        - uri: "sip:198.51.100.7:5060"
+```
+
+That set replaces the full one on everything SIPhon sends that peer or answers it
+with: responses relayed to a caller from the group, SIPhon's own 18x/2xx
+(`answer`/`ring`/`progress`), its OPTIONS and 405 answers, the health-probe OPTIONS,
+and B-leg or originated INVITEs sent to the group. Every other peer keeps the full
+set. A peer is in the group by the membership `call.from_gateway()` uses (resolved
+destination addresses plus `source_networks`); a peer two groups with a set admit
+gets the set of the group listed first. An `Allow` a script sets, or one in a
+controller's `headers`, still wins.
+
+Each entry must be a method SIPhon implements, in upper case, listed once, and
+`INVITE`, `ACK`, `CANCEL` and `BYE` are required; anything else refuses the config.
+The set only changes what is advertised: a REFER the peer sends anyway is still
+handled.
+
 ### Preconditions before the answer
 
 With `precondition` crossing, the exchange itself runs on the early dialog
