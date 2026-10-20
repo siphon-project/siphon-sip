@@ -115,6 +115,7 @@ mod tests {
             script_engine: None,
             script_config: None,
             config_reloader: Some(Arc::new(reloader)),
+            credential_cache: None,
             ui_enabled: false,
         };
         Node {
@@ -206,6 +207,7 @@ mod tests {
     async fn without_a_config_file_it_is_501() {
         let state = AdminState {
             config_reloader: None,
+            credential_cache: None,
             ..node(None).state
         };
         let (status, body) = post_reload(state, None).await;

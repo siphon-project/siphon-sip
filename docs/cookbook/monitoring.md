@@ -81,6 +81,7 @@ admin:
 | `POST /admin/gateways/{group}/{destination}/{up\|down}` | mark a gateway destination up/down (drain / restore a carrier) |
 | `POST /admin/registrants/refresh` | re-read a `registrant.backend: database` / `http` source and reconcile now |
 | `POST /admin/gateways/refresh` | re-read a `gateway.backend: database` / `http` source and reconcile now |
+| `POST /admin/auth/cache/invalidate` | drop cached digest credentials: `{"realm","username"}` one user, `{"realm"}` one realm, `{}` all; `204`, or `404` when `cache_ttl_secs` is 0 |
 | `POST /admin/config/reload` | re-read the `--config` file and apply what can change at runtime (see below) |
 | `GET /admin/calls` | active B2BUA calls (Call-ID, state, caller, callee, B-legs) |
 | `GET /admin/metrics.json` | curated JSON snapshot of the live gauges + counters |

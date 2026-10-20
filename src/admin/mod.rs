@@ -6,6 +6,7 @@
 //! - Health/readiness probes (`GET /admin/health`)
 //! - Force-unregister (`DELETE /admin/registrations/:aor`)
 //! - List / lift auto-bans (`GET /admin/bans`, `DELETE /admin/bans/:ip`)
+//! - Flush the credential cache (`POST /admin/auth/cache/invalidate`)
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -20,10 +21,12 @@ use axum::Router;
 use serde::Serialize;
 use tracing::{info, warn};
 
+mod auth_cache;
 mod config_reload;
 mod refresh;
 mod script_reload;
 mod serve;
+use auth_cache::auth_cache_invalidate_handler;
 use config_reload::config_reload_handler;
 use refresh::{gateways_refresh_handler, registrants_refresh_handler};
 use script_reload::script_reload_handler;
@@ -67,6 +70,9 @@ pub struct AdminState {
     /// Re-reads the `--config` file for `POST /admin/config/reload`. `None`
     /// when the node was started from a config string, which has no file.
     pub config_reloader: Option<Arc<crate::server::config_reload::ConfigReloader>>,
+    /// The digest credential cache, for `POST /admin/auth/cache/invalidate`.
+    /// `None` when `cache_ttl_secs` is 0 (or no credential backend caches).
+    pub credential_cache: Option<Arc<crate::auth::credential_cache::CredentialCache>>,
     /// Whether the embedded dashboard is served from this listener. Set by
     /// [`router`] from its own argument rather than by each caller, so the
     /// auth layer and the route table can never disagree about it. Read only to
@@ -169,6 +175,10 @@ pub(super) fn router(mut state: AdminState, cors: Option<&CorsConfig>, ui_enable
             post(registrants_refresh_handler),
         )
         .route("/admin/gateways/refresh", post(gateways_refresh_handler))
+        .route(
+            "/admin/auth/cache/invalidate",
+            post(auth_cache_invalidate_handler),
+        )
         .route("/admin/capture/{call_id}", get(capture_handler))
         .route("/admin/search", get(search_handler))
         .route("/admin/logs", get(logs_handler))
@@ -1487,6 +1497,7 @@ mod tests {
             script_engine: None,
             script_config: None,
             config_reloader: None,
+            credential_cache: None,
             ui_enabled: false,
         }
     }
@@ -1791,6 +1802,7 @@ mod tests {
             script_engine: None,
             script_config: None,
             config_reloader: None,
+            credential_cache: None,
             ui_enabled: false,
         };
         let app = router(state, None, false);
