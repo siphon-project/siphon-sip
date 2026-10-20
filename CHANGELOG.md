@@ -33,6 +33,42 @@ entry, but a working config keeps working.
 - **A controller `dial` with a media profile no longer leaves its media
   allocation behind when the caller cancels while it rings.** Nothing released
   it on the caller's CANCEL; the engine held it until its own timeout.
+### Fixed
+
+- **P-CSCF: a UDP response to a UE over IPsec goes from the P-CSCF's protected
+  client port to the UE's protected server port.** It went back to the port the
+  request came from (port_ps to port_uc), so a UE that takes UDP responses only
+  on its protected server port, as TS 33.203 clause 7.1 has it ("The P-CSCF
+  sends requests and responses protected with ESP to a UE on the port
+  port_pc"; the UE "receives requests and responses protected with ESP on the
+  port port_us"), never saw them and retransmitted every UDP request until it
+  timed out. This covers responses siphon answers, relays, refuses and
+  retransmits, including the B2BUA's 2xx and reliable provisional
+  retransmissions. TCP is unchanged: the response goes on the connection the
+  request came in on. A pair that admits TCP only is logged at error and the
+  response is sent as before. `request.fix_nated_register()` on a request that
+  came over an IPsec UDP flow now writes the UE's protected server port into
+  `rport`, as TS 24.229 clause 5.2.6.3.1 requires, so the Via names the port
+  the response goes to.
+### Added
+
+- **Diameter: `diameter.originate` sends a request this node starts on a
+  connection it already has, and awaits its answer.** A node in server mode
+  can now run the procedures that begin at the server, such as an HSS's
+  Cancel-Location, Insert-Subscriber-Data, Delete-Subscriber-Data and Reset
+  (TS 29.272) or an S6c Alert-Service-Centre (TS 29.338). The connection is
+  the serving connection that last carried a request from the destination
+  host, else one that carried a request from its realm, else a named peer.
+  The caller gives the AVPs after the envelope as `set_avp` tuples, with an
+  optional fourth element to set or clear the M bit. The answer is a
+  `DiameterAnswer`; no connection, a timeout and a lost connection raise
+  `LookupError`, `TimeoutError` and `ConnectionError`.
+
+### Fixed
+
+- **Diameter: a request waiting on a connection that closes fails at once**
+  instead of at its timeout, so a caller tells a lost connection from a peer
+  that does not answer.
 
 ## [1.15.0] — 2026-10-19
 

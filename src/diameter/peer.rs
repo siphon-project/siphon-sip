@@ -707,6 +707,10 @@ where
         // Reader loop exited → the connection is no longer usable. Mark Closed
         // so the peer pool stops handing it out (state-as-truth).
         state_r.store(PeerState::Closed.as_u8(), Ordering::Release);
+        // No answer can arrive any more: fail the requests still waiting now
+        // (their senders dropped) rather than at their timeouts, so a caller
+        // tells a lost connection from a peer that does not answer.
+        pending_r.lock().await.clear();
         if let Some(metrics) = crate::metrics::try_metrics() {
             metrics.diameter_peers_connected.dec();
         }

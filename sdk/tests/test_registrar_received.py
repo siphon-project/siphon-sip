@@ -191,3 +191,29 @@ def test_fix_nated_register_writes_the_observed_source_port():
     via = request.get_header("Via")
     assert ";received=198.51.100.27" in via
     assert ";rport=41234" in via
+
+
+def test_fix_nated_register_over_an_ipsec_udp_flow_writes_the_protected_server_port():
+    """TS 24.229 clause 5.2.6.3.1: with IMS AKA, ``rport=`` is the UE's
+    protected server port, where the UDP response goes (TS 33.203 clause 7.1)."""
+    request = _register("198.51.100.27", 41234)
+    request.set_header("Via", "SIP/2.0/UDP 198.51.100.27:41235;branch=z9hG4bKsa;rport")
+    request._is_ipsec_protected = True
+    request._matched_sa = SimpleNamespace(ue_port_c=41234, ue_port_s=41235, protocol="any")
+
+    request.fix_nated_register()
+
+    assert ";rport=41235" in request.get_header("Via")
+
+
+def test_fix_nated_register_over_an_ipsec_tcp_flow_writes_the_source_port():
+    """Over TCP the response goes on the connection, so ``rport=`` stays the
+    source port."""
+    request = _register("198.51.100.27", 41234, transport="tcp")
+    request.set_header("Via", "SIP/2.0/TCP 198.51.100.27:41235;branch=z9hG4bKsa;rport")
+    request._is_ipsec_protected = True
+    request._matched_sa = SimpleNamespace(ue_port_c=41234, ue_port_s=41235, protocol="any")
+
+    request.fix_nated_register()
+
+    assert ";rport=41234" in request.get_header("Via")
