@@ -973,6 +973,12 @@ export interface RegistrationContact {
 export interface RegistrationChangedPayload {
   /** Per-process number, one higher per event published. */
   seq?: number;
+  /**
+   * The server process's boot epoch, new at every start: `seq` restarts with
+   * it, so a changed epoch means the numbers began again. An identifier, not an
+   * order; `null` without a registrar identity.
+   */
+  instance_epoch?: string | null;
   aor: string;
   /**
    * `registered`, `refreshed`, `deregistered`, `expired` or `snapshot` (a
@@ -987,6 +993,12 @@ export interface RegistrationChangedPayload {
 export interface RegistrationsReply {
   /** Every event numbered at or below this is reflected here; across pages keep the first's. */
   seq: number;
+  /**
+   * The server process's boot epoch, new at every start: `seq` restarts with
+   * it, so a changed epoch means the numbers began again. An identifier, not an
+   * order; `null` without a registrar identity.
+   */
+  instance_epoch?: string | null;
   /** The registered AoRs of this page; over the whole set, one not listed has no binding. */
   registrations: { aor: string; contacts: RegistrationContact[] }[];
   /** The `after` that asks for the next page; `null` on the last. */
@@ -1012,6 +1024,12 @@ export interface OutboundRegistration {
 export interface RegistrantChangedPayload extends OutboundRegistration {
   /** Per-process number, its own sequence. */
   seq?: number;
+  /**
+   * The server process's boot epoch, new at every start: `seq` restarts with
+   * it, so a changed epoch means the numbers began again. An identifier, not an
+   * order; `null` without a registrar identity.
+   */
+  instance_epoch?: string | null;
   /** `registered`, `refreshed`, `failed`, `deregistered` or `snapshot`. */
   event: string;
 }
@@ -1019,6 +1037,12 @@ export interface RegistrantChangedPayload extends OutboundRegistration {
 /** The reply of `outbound_registrations`, paged like {@link RegistrationsReply}. */
 export interface OutboundRegistrationsReply {
   seq: number;
+  /**
+   * The server process's boot epoch, new at every start: `seq` restarts with
+   * it, so a changed epoch means the numbers began again. An identifier, not an
+   * order; `null` without a registrar identity.
+   */
+  instance_epoch?: string | null;
   registrations: OutboundRegistration[];
   /** The `after` that asks for the next page; `null` on the last. */
   next?: string | null;

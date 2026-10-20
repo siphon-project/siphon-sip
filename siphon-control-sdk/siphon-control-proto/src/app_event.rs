@@ -217,6 +217,12 @@ pub struct RegistrationChangedPayload {
     /// `None` from a server that predates it.
     #[serde(default)]
     pub seq: Option<u64>,
+    /// The server process's boot epoch, new at every start: `seq` restarts
+    /// with it, so a changed epoch means the numbers began again (resync). An
+    /// identifier, not an order. `None` from a server without a registrar
+    /// identity, or one that predates it.
+    #[serde(default)]
+    pub instance_epoch: Option<String>,
     /// The registered AoR, by its registrar key.
     pub aor: String,
     /// `registered`, `refreshed`, `deregistered`, `expired` or `snapshot` (a
@@ -246,6 +252,12 @@ pub struct RegistrationsReply {
     /// here; apply only events numbered above it. Across pages, keep the
     /// first page's.
     pub seq: u64,
+    /// The server process's boot epoch, new at every start: `seq` restarts
+    /// with it, so a changed epoch means the numbers began again (resync). An
+    /// identifier, not an order. `None` from a server without a registrar
+    /// identity, or one that predates it.
+    #[serde(default)]
+    pub instance_epoch: Option<String>,
     /// The registered AoRs of this page. Over the whole set, an AoR not listed
     /// has no binding.
     #[serde(default)]
@@ -287,6 +299,12 @@ pub struct RegistrantChangedPayload {
     /// [`RegistrationChangedPayload::seq`].
     #[serde(default)]
     pub seq: Option<u64>,
+    /// The server process's boot epoch, new at every start: `seq` restarts
+    /// with it, so a changed epoch means the numbers began again (resync). An
+    /// identifier, not an order. `None` from a server without a registrar
+    /// identity, or one that predates it.
+    #[serde(default)]
+    pub instance_epoch: Option<String>,
     /// `registered`, `refreshed`, `failed`, `deregistered` or `snapshot`.
     pub event: String,
     /// The registration's state now.
@@ -300,6 +318,12 @@ pub struct RegistrantChangedPayload {
 pub struct OutboundRegistrationsReply {
     /// Every `RegistrantChanged` numbered at or below this is reflected here.
     pub seq: u64,
+    /// The server process's boot epoch, new at every start: `seq` restarts
+    /// with it, so a changed epoch means the numbers began again (resync). An
+    /// identifier, not an order. `None` from a server without a registrar
+    /// identity, or one that predates it.
+    #[serde(default)]
+    pub instance_epoch: Option<String>,
     /// The outbound registrations of this page.
     #[serde(default)]
     pub registrations: Vec<OutboundRegistration>,
@@ -317,6 +341,7 @@ mod tests {
     fn a_registration_changed_payload_reads_every_contact_field() {
         let payload: RegistrationChangedPayload = serde_json::from_value(json!({
             "seq": 12,
+            "instance_epoch": "boot-1",
             "aor": "sip:201@example.com",
             "event": "registered",
             "contacts": [{
@@ -335,6 +360,7 @@ mod tests {
         }))
         .expect("parses");
         assert_eq!(payload.seq, Some(12));
+        assert_eq!(payload.instance_epoch.as_deref(), Some("boot-1"));
         let contact = &payload.contacts[0];
         assert_eq!(
             contact.received.as_deref(),
@@ -357,6 +383,7 @@ mod tests {
         }))
         .expect("parses");
         assert_eq!(payload.seq, None);
+        assert_eq!(payload.instance_epoch, None);
         assert_eq!(payload.contacts[0].received, None);
         assert!(payload.contacts[0].path.is_empty());
     }

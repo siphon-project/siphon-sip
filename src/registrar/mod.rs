@@ -572,6 +572,13 @@ impl Registrar {
         let _ = self.instance_identity.set(Arc::new(identity));
     }
 
+    /// This process's boot epoch: the `instance_epoch` stamped on every binding
+    /// it accepts, new at every start. `None` when no identity is set.
+    pub fn instance_epoch(&self) -> Option<String> {
+        self.instance_identity()
+            .map(|identity| identity.epoch.clone())
+    }
+
     /// Returns the configured per-process identity, if any.
     pub fn instance_identity(&self) -> Option<&InstanceIdentity> {
         self.instance_identity.get().map(Arc::as_ref)

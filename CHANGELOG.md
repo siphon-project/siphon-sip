@@ -15,6 +15,16 @@ entry, but a working config keeps working.
 
 ### Added
 
+- **Registration hooks are numbered.** `@registrar.on_change` is passed a
+  `sequence` keyword when the handler takes one (a three-argument handler is
+  called as before), and `@registration.on_change` gets `state["sequence"]`:
+  a per-process number, one higher per change, the same `seq` the control
+  plane's `RegistrationChanged` / `RegistrantChanged` carry. Handlers can
+  overlap once one runs past the event-handler window, so out-of-order
+  delivery is possible and the number is what orders them. The process boot
+  epoch is `registrar.instance_epoch` (the `instance_epoch` already on each
+  binding), and `instance_epoch` is also on both events and in both state
+  verbs' replies, so a consumer can tell the numbers restarted.
 - **Control plane: registration state a controller can rely on.**
   `RegistrationChanged` contacts now say where the REGISTER came from:
   `received` (byte for byte the script's `Contact.received`), `transport`,

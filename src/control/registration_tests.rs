@@ -129,10 +129,10 @@ fn every_registration_changed_is_numbered_and_a_loss_leaves_a_gap() {
     app_event_capture::watch(aor);
     save(&registrar, aor, "seq-check");
 
-    publish_registration_change(&registrar, aor, "registered");
-    publish_registration_change(&registrar, aor, "refreshed");
+    publish_registration_change(&registrar, aor, "registered", next_registration_sequence());
+    publish_registration_change(&registrar, aor, "refreshed", next_registration_sequence());
     skip_registration_events(5);
-    publish_registration_change(&registrar, aor, "snapshot");
+    publish_registration_change(&registrar, aor, "snapshot", next_registration_sequence());
 
     let events = app_event_capture::take(aor);
     assert_eq!(events.len(), 3);
@@ -147,6 +147,10 @@ fn every_registration_changed_is_numbered_and_a_loss_leaves_a_gap() {
     );
     let snapshot = &events[2].1;
     assert_eq!(snapshot["event"], "snapshot");
+    assert!(
+        snapshot.get("instance_epoch").is_some(),
+        "the boot epoch rides along (null without a registrar identity)"
+    );
     assert_eq!(snapshot["aor"], aor);
     assert_eq!(
         snapshot["contacts"][0]["received"],
@@ -162,7 +166,7 @@ fn the_registrations_reply_is_current_to_its_seq() {
     let aor = "sip:reply-check@example.com";
     app_event_capture::watch(aor);
     save(&registrar, aor, "reply-check");
-    publish_registration_change(&registrar, aor, "registered");
+    publish_registration_change(&registrar, aor, "registered", next_registration_sequence());
     let before = seqs(&app_event_capture::take(aor))[0];
 
     let reply = registrations_reply(&registrar, None, DEFAULT_PAGE_LIMIT);
@@ -182,7 +186,12 @@ fn the_registrations_reply_is_current_to_its_seq() {
     // A change after the reply is numbered above it, so the controller applies
     // it on top of the reply.
     registrar.remove_all(aor);
-    publish_registration_change(&registrar, aor, "deregistered");
+    publish_registration_change(
+        &registrar,
+        aor,
+        "deregistered",
+        next_registration_sequence(),
+    );
     let after = app_event_capture::take(aor);
     assert!(seqs(&after)[0] > mark);
     assert_eq!(after[0].1["contacts"], serde_json::json!([]));
@@ -222,11 +231,23 @@ fn a_registrant_change_carries_its_state_and_is_numbered() {
     manager.add(trunk(aor));
     manager.handle_failure(aor, 503, None);
 
-    publish_registrant_change(&manager, aor, "failed", Some(503));
+    publish_registrant_change(
+        &manager,
+        aor,
+        "failed",
+        Some(503),
+        next_registrant_sequence(),
+    );
     skip_registrant_events(2);
-    publish_registrant_change(&manager, aor, "snapshot", None);
+    publish_registrant_change(&manager, aor, "snapshot", None, next_registrant_sequence());
     manager.handle_success(aor, 600);
-    publish_registrant_change(&manager, aor, "registered", None);
+    publish_registrant_change(
+        &manager,
+        aor,
+        "registered",
+        None,
+        next_registrant_sequence(),
+    );
 
     let events = app_event_capture::take(aor);
     assert!(events.iter().all(|(event, _)| event == "RegistrantChanged"));
@@ -264,7 +285,13 @@ fn a_removed_trunk_reports_no_state() {
     let manager = registrant();
     let aor = "sip:trunk-removed@example.net";
     app_event_capture::watch(aor);
-    publish_registrant_change(&manager, aor, "deregistered", None);
+    publish_registrant_change(
+        &manager,
+        aor,
+        "deregistered",
+        None,
+        next_registrant_sequence(),
+    );
     let events = app_event_capture::take(aor);
     let payload = &events[0].1;
     assert!(payload["registrar"].is_null());

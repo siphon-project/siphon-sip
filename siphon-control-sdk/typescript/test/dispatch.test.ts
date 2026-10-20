@@ -131,6 +131,7 @@ describe("registration state on SipClient", () => {
             status: "ok",
             result: {
               seq: 41,
+              instance_epoch: "boot-1",
               next: "sip:200@example.com",
               registrations: [{ aor: "sip:200@example.com", contacts: [] }],
             },
@@ -215,6 +216,7 @@ describe("registration state on SipClient", () => {
 
     const registrations = await sip.registrations();
     expect(registrations.seq).toBe(41);
+    expect(registrations.instance_epoch).toBe("boot-1");
     expect(registrations.registrations.length).toBe(2);
     expect(registrations.registrations[1]?.contacts[0]?.cseq).toBe(3);
     expect(

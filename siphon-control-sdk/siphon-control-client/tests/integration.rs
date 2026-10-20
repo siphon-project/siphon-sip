@@ -187,6 +187,7 @@ async fn drive_stub(mut socket: WebSocket, stub: Arc<Stub>) {
                     &id,
                     serde_json::json!({
                         "seq": 41,
+                        "instance_epoch": "boot-1",
                         "next": "sip:200@example.com",
                         "registrations": [{"aor": "sip:200@example.com", "contacts": []}]
                     }),
@@ -320,6 +321,7 @@ async fn registration_state_verbs_return_typed_replies() {
 
     let registrations = client.registrations().await.expect("registrations");
     assert_eq!(registrations.seq, 41, "the first page's seq is kept");
+    assert_eq!(registrations.instance_epoch.as_deref(), Some("boot-1"));
     assert_eq!(
         registrations.registrations.len(),
         2,

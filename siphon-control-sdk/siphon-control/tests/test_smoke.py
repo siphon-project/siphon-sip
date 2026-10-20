@@ -117,6 +117,7 @@ async def _stub_handler(websocket):
                 frame_id,
                 {
                     "seq": 41,
+                    "instance_epoch": "boot-1",
                     "next": "sip:200@example.com",
                     "registrations": [{"aor": "sip:200@example.com", "contacts": []}],
                 },
@@ -251,6 +252,7 @@ def test_registration_state_verbs():
 
             registrations = await client.registrations()
             assert registrations["seq"] == 41, "the first page's seq is kept"
+            assert registrations["instance_epoch"] == "boot-1"
             assert len(registrations["registrations"]) == 2, "both pages are merged"
             assert registrations["next"] is None
             contact = registrations["registrations"][1]["contacts"][0]

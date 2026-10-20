@@ -97,22 +97,46 @@ fn contacts_of(registrar: &Registrar, aor: &str) -> Vec<Value> {
 /// Publish a `RegistrationChanged` for `aor` to every app subscribed to
 /// [`REGISTRATION_CLASS`]: `event` is what happened (`snapshot` for a re-report
 /// after siphon's event task fell behind), and the contacts are read now.
-pub fn publish_registration_change(registrar: &Registrar, aor: &str, event: &str) {
+///
+/// `seq` is the change's number from [`next_registration_sequence`], taken
+/// before the contacts are read (see the module notes) and handed to the
+/// script's `@registrar.on_change` too, so the rail and the script agree.
+pub fn publish_registration_change(registrar: &Registrar, aor: &str, event: &str, seq: u64) {
     if !super::app_event_wanted(REGISTRATION_CLASS) {
         return;
     }
-    // Numbered before the state is read: see the module notes.
-    let seq = REGISTRATION_SEQUENCE.fetch_add(1, Ordering::SeqCst) + 1;
     super::notify_app_event(
         REGISTRATION_CLASS,
         "RegistrationChanged",
         json!({
             "seq": seq,
+            "instance_epoch": instance_epoch(),
             "aor": aor,
             "event": event,
             "contacts": contacts_of(registrar, aor),
         }),
     );
+}
+
+/// Number the next registration change (a `RegistrationChanged` and the
+/// matching `@registrar.on_change` call): one higher than the last.
+pub fn next_registration_sequence() -> u64 {
+    REGISTRATION_SEQUENCE.fetch_add(1, Ordering::SeqCst) + 1
+}
+
+/// Number the next outbound-registration change (a `RegistrantChanged` and
+/// the matching `@registration.on_change` call).
+pub fn next_registrant_sequence() -> u64 {
+    REGISTRANT_SEQUENCE.fetch_add(1, Ordering::SeqCst) + 1
+}
+
+/// This process's boot epoch: the `instance_epoch` stamped on the bindings it
+/// accepts, fresh at every start. `seq` restarts with the process, so a
+/// controller that sees the epoch change knows the numbers began again and
+/// resyncs. An identifier, not an order: it says the process restarted, not
+/// which of two epochs is newer. `None` when no registrar identity is set.
+pub fn instance_epoch() -> Option<String> {
+    crate::script::api::registrar_arc().and_then(|registrar| registrar.instance_epoch())
 }
 
 /// Account for `skipped` registration events siphon's own event task lost: the
@@ -199,7 +223,12 @@ pub fn registrations_reply(registrar: &Registrar, after: Option<&str>, limit: us
             (!contacts.is_empty()).then(|| json!({ "aor": aor, "contacts": contacts }))
         })
         .collect();
-    json!({ "seq": seq, "registrations": registrations, "next": next })
+    json!({
+        "seq": seq,
+        "instance_epoch": instance_epoch(),
+        "registrations": registrations,
+        "next": next,
+    })
 }
 
 /// One outbound registration's current state. `status_code` is the status of
@@ -221,19 +250,20 @@ fn registrant_state(registrant: &RegistrantManager, aor: &str, status_code: Opti
 
 /// Publish a `RegistrantChanged` for `aor` to every app subscribed to
 /// [`OUTBOUND_REGISTRATION_CLASS`]. `status_code` is the status a `failed`
-/// event carries.
+/// event carries; `seq` comes from [`next_registrant_sequence`].
 pub fn publish_registrant_change(
     registrant: &RegistrantManager,
     aor: &str,
     event: &str,
     status_code: Option<u16>,
+    seq: u64,
 ) {
     if !super::app_event_wanted(OUTBOUND_REGISTRATION_CLASS) {
         return;
     }
-    let seq = REGISTRANT_SEQUENCE.fetch_add(1, Ordering::SeqCst) + 1;
     let mut payload = registrant_state(registrant, aor, status_code);
     payload["seq"] = json!(seq);
+    payload["instance_epoch"] = json!(instance_epoch());
     payload["event"] = json!(event);
     super::notify_app_event(OUTBOUND_REGISTRATION_CLASS, "RegistrantChanged", payload);
 }
@@ -262,7 +292,12 @@ pub fn outbound_registrations_reply(
         .filter(|aor| registrant.status(aor).is_some())
         .map(|aor| registrant_state(registrant, aor, None))
         .collect();
-    json!({ "seq": seq, "registrations": registrations, "next": next })
+    json!({
+        "seq": seq,
+        "instance_epoch": instance_epoch(),
+        "registrations": registrations,
+        "next": next,
+    })
 }
 
 /// The `after` and `limit` a state verb was given.

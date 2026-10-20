@@ -710,6 +710,7 @@ The payload of a `RegistrationChanged`:
 | field | meaning |
 |---|---|
 | `seq` | per-process number, one higher on every `RegistrationChanged` siphon publishes (every subscribed app sees every one, so the numbers an app receives are contiguous unless one was lost) |
+| `instance_epoch` | this process's boot epoch (the `instance_epoch` on the bindings it accepts), new at every start: `seq` restarts with it, so a changed epoch means start over with `registrations`. It identifies a boot, it does not order two. `null` without a registrar identity |
 | `aor` | the registered AoR, by its registrar key |
 | `event` | `registered`, `refreshed`, `deregistered`, `expired` or `snapshot`. `snapshot` is not a change: when siphon's registration event task fell so far behind the registrar that events were lost, it re-reports every registered AoR with its current contacts under `snapshot` |
 | `contacts` | the AoR's bindings now (empty once it has none), each as below |
@@ -737,7 +738,7 @@ Every loss shows as a gap in `seq`. The `registrations` verb answers with the
 registered AoRs and the `seq` they are current to, a page at a time:
 
 ```json
-{"seq": 1042, "next": "sip:299@example.com",
+{"seq": 1042, "instance_epoch": "<uuid>", "next": "sip:299@example.com",
  "registrations": [{"aor": "sip:200@example.com", "contacts": [ ... ]}, ...]}
 ```
 
@@ -760,6 +761,11 @@ with the typed `AppEvent::registration()` / `registrant()`, Python
 `client.registrations()` / `client.outbound_registrations()`, TypeScript
 `sip.registrations()` / `sip.outboundRegistrations()`.
 
+The `seq` is the one the scripts see: `@registrar.on_change` is handed the same
+number as a `sequence` keyword, and `@registration.on_change` as
+`state["sequence"]`, so a deployment moving from a script push to the rail
+keeps its ordering.
+
 A reply rather than a burst of `snapshot` events on connect: the reply is one
 frame and is never dropped, where a registrar's worth of events would land on a
 queue that drops its oldest, and a complete set says which AoRs are gone, which
@@ -774,6 +780,7 @@ whether or not a `@registration.on_change` handler is registered:
 | field | meaning |
 |---|---|
 | `seq` | per-process number, its own sequence, as for `RegistrationChanged` |
+| `instance_epoch` | as for `RegistrationChanged` |
 | `aor` | the registration's AoR |
 | `event` | `registered`, `refreshed`, `failed`, `deregistered` or `snapshot` (as above) |
 | `registrar` | the registrar it registers with, `null` once the registration was removed |

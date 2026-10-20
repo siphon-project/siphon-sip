@@ -542,6 +542,12 @@ impl PyRegistrar {
 
 #[pymethods]
 impl PyRegistrar {
+    /// This process's boot epoch (each binding's `instance_epoch`), new at every start: `sequence` restarts with it.
+    #[getter]
+    fn instance_epoch(&self) -> Option<String> {
+        self.inner.instance_epoch()
+    }
+
     /// Save contact bindings from a REGISTER and send 200 OK with granted
     /// Expires (like OpenSIPS `save("location")`).
     ///
@@ -1751,6 +1757,21 @@ mod tests {
             Some("sip:192.0.2.70:41001;transport=tls")
         );
         assert_eq!(control["received"].as_str(), script.received());
+    }
+
+    #[test]
+    fn instance_epoch_is_the_boot_epoch_or_none() {
+        let registrar = make_registrar();
+        let namespace = PyRegistrar::new(Arc::clone(&registrar));
+        assert_eq!(namespace.instance_epoch(), None);
+        registrar.set_instance_identity(crate::registrar::InstanceIdentity {
+            id: "siphon-0".to_string(),
+            epoch: "00000000-0000-4000-8000-000000000001".to_string(),
+        });
+        assert_eq!(
+            namespace.instance_epoch().as_deref(),
+            Some("00000000-0000-4000-8000-000000000001")
+        );
     }
 
     /// The registrar half of the re-/de-REGISTER trust chain: a binding records
