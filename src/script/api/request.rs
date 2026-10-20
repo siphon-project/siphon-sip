@@ -66,6 +66,12 @@ pub enum RequestAction {
         /// configured listeners in the dispatcher.  Ignored when `flow` is set
         /// (the flow already pins the egress listener).
         send_socket: Option<String>,
+        /// Header fields removed from the forwarded copy only
+        /// (`strip=["P-Charging-Vector"]`). The request the proxy session
+        /// holds keeps them, so charging and CDRs, which read that request,
+        /// still see what the script left on it. Validated by
+        /// [`validate_strip`].
+        strip: Vec<String>,
     },
     /// Fork to multiple targets.
     ///
@@ -91,7 +97,54 @@ pub enum RequestAction {
         /// [`RequestAction::Relay::send_socket`]).  A per-branch flow (`flows[i]`)
         /// still takes precedence over it for that branch.
         send_socket: Option<String>,
+        /// Header fields removed from every branch as it is sent (see
+        /// [`RequestAction::Relay::strip`]).
+        strip: Vec<String>,
     },
+}
+
+/// Header fields siphon builds or routes on itself, which `strip=` refuses:
+/// removing one from a forwarded request would break the transaction, the
+/// dialog or the routing (RFC 3261 §8.1.1, §16.6), not just leave something
+/// off the wire.
+const UNSTRIPPABLE_HEADERS: &[&str] = &[
+    "via",
+    "v",
+    "route",
+    "record-route",
+    "call-id",
+    "i",
+    "cseq",
+    "from",
+    "f",
+    "to",
+    "t",
+    "max-forwards",
+    "content-length",
+    "l",
+];
+
+/// Validate a `strip=` argument: header field names, none siphon needs to
+/// forward the request. Raises `ValueError` naming the offending entry.
+pub(crate) fn validate_strip(strip: Option<Vec<String>>) -> PyResult<Vec<String>> {
+    let strip = strip.unwrap_or_default();
+    for name in &strip {
+        let trimmed = name.trim();
+        if trimmed.is_empty() || trimmed.contains(|c: char| c == ':' || c.is_whitespace()) {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "strip: {name:?} is not a header field name"
+            )));
+        }
+        if UNSTRIPPABLE_HEADERS.contains(&trimmed.to_ascii_lowercase().as_str()) {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "strip: {trimmed} is managed by siphon and cannot be stripped from a relayed request"
+            )));
+        }
+    }
+    Ok(strip
+        .into_iter()
+        .map(|name| name.trim().to_string())
+        .collect())
 }
 
 /// Format-validate a `send_socket=` argument, raising a Python `ValueError`
@@ -1090,7 +1143,14 @@ impl PyRequest {
     /// Optional callbacks:
     /// - `on_reply`: called with `(request, reply)` when a response arrives
     /// - `on_failure`: called with `(request, code, reason)` on error response
-    #[pyo3(signature = (next_hop=None, on_reply=None, on_failure=None, flow=None, send_socket=None))]
+    ///
+    /// `strip` names header fields to leave off the forwarded request while
+    /// the request siphon keeps for the session (the one Rf, Ro and CDRs read)
+    /// still carries them. A P-CSCF removes P-Charging-Vector towards the UE
+    /// (TS 24.229 §5.2.1) and still reports the leg with its ICID this way.
+    /// Names are case-insensitive; Via, Route, Record-Route, Call-ID, CSeq,
+    /// From, To, Max-Forwards and Content-Length are refused (`ValueError`).
+    #[pyo3(signature = (next_hop=None, on_reply=None, on_failure=None, flow=None, send_socket=None, strip=None))]
     fn relay(
         &mut self,
         next_hop: Option<String>,
@@ -1098,14 +1158,17 @@ impl PyRequest {
         on_failure: Option<Py<PyAny>>,
         flow: Option<super::registrar::PyFlow>,
         send_socket: Option<String>,
+        strip: Option<Vec<String>>,
     ) -> PyResult<()> {
         validate_send_socket(send_socket.as_deref())?;
+        let strip = validate_strip(strip)?;
         self.on_reply_callback = on_reply;
         self.on_failure_callback = on_failure;
         self.action = RequestAction::Relay {
             next_hop,
             flow,
             send_socket,
+            strip,
         };
         Ok(())
     }
@@ -1131,14 +1194,19 @@ impl PyRequest {
     ///
     /// Pass a bare URI string (`request.fork([c.uri for c in contacts])`) to
     /// opt a target out of Path routing and route purely by Request-URI.
-    #[pyo3(signature = (targets, strategy="parallel", send_socket=None))]
+    ///
+    /// `strip` leaves the named header fields off every branch, as for
+    /// [`relay`](Self::relay).
+    #[pyo3(signature = (targets, strategy="parallel", send_socket=None, strip=None))]
     fn fork(
         &mut self,
         targets: Vec<Bound<'_, PyAny>>,
         strategy: &str,
         send_socket: Option<String>,
+        strip: Option<Vec<String>>,
     ) -> PyResult<()> {
         validate_send_socket(send_socket.as_deref())?;
+        let strip = validate_strip(strip)?;
         let mut target_uris: Vec<String> = Vec::with_capacity(targets.len());
         let mut flows: Vec<Option<super::registrar::PyFlow>> = Vec::with_capacity(targets.len());
         let mut routes: Vec<Vec<String>> = Vec::with_capacity(targets.len());
@@ -1161,6 +1229,7 @@ impl PyRequest {
             routes,
             strategy: strategy.to_string(),
             send_socket,
+            strip,
         };
         Ok(())
     }
@@ -2417,13 +2486,14 @@ mod tests {
         ));
 
         // Handler 2, which never knew handler 1 ran.
-        request.relay(None, None, None, None, None).unwrap();
+        request.relay(None, None, None, None, None, None).unwrap();
         assert_eq!(
             *request.action(),
             RequestAction::Relay {
                 next_hop: None,
                 flow: None,
-                send_socket: None
+                send_socket: None,
+                strip: Vec::new(),
             },
             "the reply is gone, not merged — only the last assignment executes"
         );
@@ -2462,13 +2532,14 @@ mod tests {
     #[test]
     fn relay_sets_action() {
         let mut request = make_request();
-        request.relay(None, None, None, None, None).unwrap();
+        request.relay(None, None, None, None, None, None).unwrap();
         assert_eq!(
             *request.action(),
             RequestAction::Relay {
                 next_hop: None,
                 flow: None,
-                send_socket: None
+                send_socket: None,
+                strip: Vec::new(),
             }
         );
     }
@@ -2483,6 +2554,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap();
         assert_eq!(
@@ -2491,6 +2563,7 @@ mod tests {
                 next_hop: Some("sip:proxy@next.com:5060".to_string()),
                 flow: None,
                 send_socket: None,
+                strip: Vec::new(),
             }
         );
     }
@@ -2509,7 +2582,7 @@ mod tests {
             connection_id: 0xabcdef,
         };
         request
-            .relay(None, None, None, Some(flow.clone()), None)
+            .relay(None, None, None, Some(flow.clone()), None, None)
             .unwrap();
         assert_eq!(
             *request.action(),
@@ -2517,6 +2590,7 @@ mod tests {
                 next_hop: None,
                 flow: Some(flow),
                 send_socket: None,
+                strip: Vec::new(),
             }
         );
     }
@@ -2541,6 +2615,7 @@ mod tests {
                 None,
                 None,
                 Some(flow.clone()),
+                None,
                 None,
             )
             .unwrap();
@@ -2604,6 +2679,7 @@ mod tests {
                 None,
                 None,
                 Some("udp:10.0.0.1:5060".to_string()),
+                None,
             )
             .unwrap();
         assert_eq!(
@@ -2612,6 +2688,7 @@ mod tests {
                 next_hop: None,
                 flow: None,
                 send_socket: Some("udp:10.0.0.1:5060".to_string()),
+                strip: Vec::new(),
             }
         );
     }
@@ -2622,10 +2699,14 @@ mod tests {
         // ValueError rather than a silently-ignored egress pin.
         let mut request = make_request();
         assert!(request
-            .relay(None, None, None, None, Some("10.0.0.1:5060".to_string()))
-            .is_err());
-        assert!(request
-            .relay(None, None, None, None, Some("udp:nonsense".to_string()))
+            .relay(
+                None,
+                None,
+                None,
+                None,
+                Some("10.0.0.1:5060".to_string()),
+                None
+            )
             .is_err());
         assert!(request
             .relay(
@@ -2633,7 +2714,18 @@ mod tests {
                 None,
                 None,
                 None,
-                Some("pigeon:10.0.0.1:5060".to_string())
+                Some("udp:nonsense".to_string()),
+                None
+            )
+            .is_err());
+        assert!(request
+            .relay(
+                None,
+                None,
+                None,
+                None,
+                Some("pigeon:10.0.0.1:5060".to_string()),
+                None,
             )
             .is_err());
         // A well-formed spec is accepted here (existence is checked later, in
@@ -2644,9 +2736,56 @@ mod tests {
                 None,
                 None,
                 None,
-                Some("tls:[2001:db8::1]:5061".to_string())
+                Some("tls:[2001:db8::1]:5061".to_string()),
+                None,
             )
             .is_ok());
+    }
+
+    #[test]
+    fn relay_strip_is_stored_and_refuses_what_siphon_routes_on() {
+        let mut request = make_request();
+        request
+            .relay(
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(vec![" P-Charging-Vector ".to_string()]),
+            )
+            .expect("a header field name is accepted");
+        match request.action() {
+            RequestAction::Relay { strip, .. } => {
+                assert_eq!(strip, &vec!["P-Charging-Vector".to_string()]);
+            }
+            other => panic!("expected Relay, got {other:?}"),
+        }
+        for refused in [
+            "Via",
+            "route",
+            "Call-ID",
+            "CSeq",
+            "To",
+            "f",
+            "Max-Forwards",
+            "",
+            "X: y",
+        ] {
+            assert!(
+                request
+                    .relay(
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        Some(vec![refused.to_string()])
+                    )
+                    .is_err(),
+                "{refused:?} is refused"
+            );
+        }
     }
 
     #[test]
@@ -2657,7 +2796,12 @@ mod tests {
             let targets: Vec<Bound<'_, PyAny>> =
                 vec![pyo3::types::PyString::new(py, "sip:a@host").into_any()];
             request
-                .fork(targets, "parallel", Some("tcp:10.0.0.1:5060".to_string()))
+                .fork(
+                    targets,
+                    "parallel",
+                    Some("tcp:10.0.0.1:5060".to_string()),
+                    None,
+                )
                 .unwrap();
             match request.action() {
                 RequestAction::Fork { send_socket, .. } => {
@@ -2669,7 +2813,7 @@ mod tests {
             let targets: Vec<Bound<'_, PyAny>> =
                 vec![pyo3::types::PyString::new(py, "sip:a@host").into_any()];
             assert!(request
-                .fork(targets, "parallel", Some("bad-spec".to_string()))
+                .fork(targets, "parallel", Some("bad-spec".to_string()), None)
                 .is_err());
         });
     }
@@ -2683,7 +2827,7 @@ mod tests {
                 pyo3::types::PyString::new(py, "sip:a@host").into_any(),
                 pyo3::types::PyString::new(py, "sip:b@host").into_any(),
             ];
-            request.fork(targets, "sequential", None).unwrap();
+            request.fork(targets, "sequential", None, None).unwrap();
             assert_eq!(
                 *request.action(),
                 RequestAction::Fork {
@@ -2692,6 +2836,7 @@ mod tests {
                     routes: vec![vec![], vec![]],
                     strategy: "sequential".to_string(),
                     send_socket: None,
+                    strip: Vec::new(),
                 }
             );
         });
@@ -2720,7 +2865,7 @@ mod tests {
                 // A bare string opts out of Path routing entirely.
                 pyo3::types::PyString::new(py, "sip:carol@10.0.0.3").into_any(),
             ];
-            request.fork(targets, "sequential", None).unwrap();
+            request.fork(targets, "sequential", None, None).unwrap();
             match request.action() {
                 RequestAction::Fork {
                     targets, routes, ..

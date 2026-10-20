@@ -295,6 +295,8 @@ mod refer_answer_tests;
 #[cfg(test)]
 mod relay_connection_hold_tests;
 #[cfg(test)]
+mod relay_strip_tests;
+#[cfg(test)]
 mod relayed_cancel_awaits_provisional_tests;
 #[cfg(test)]
 mod relayed_identity_tests;

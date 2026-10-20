@@ -102,6 +102,9 @@ pub struct ProxySession {
     /// branches started after the first.  `SendSocket` is plain data (no
     /// `Py<PyAny>`), so cloning it off the dispatcher thread is sound.
     pub fork_send_socket: Option<crate::transport::SendSocket>,
+    /// Script `strip=` header fields for the whole fork, stored so a branch
+    /// started after the first leaves them off as well.
+    pub fork_strip: Vec<String>,
     /// Maps client transaction key → branch index in the ForkAggregator.
     pub branch_index_map: HashMap<TransactionKey, usize>,
     /// Whether `record_route()` was called by the script.
@@ -167,6 +170,7 @@ impl ProxySession {
             fork_flows: Vec::new(),
             fork_routes: Vec::new(),
             fork_send_socket: None,
+            fork_strip: Vec::new(),
             branch_index_map: HashMap::new(),
             source_addr,
             inbound_local_addr,

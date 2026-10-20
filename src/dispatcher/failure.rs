@@ -295,6 +295,7 @@ pub(super) fn execute_failure_retarget(
             ref next_hop,
             ref flow,
             ref send_socket,
+            ref strip,
         } => {
             let send_socket = state.resolve_send_socket(send_socket.as_deref());
             relay_request(
@@ -310,6 +311,7 @@ pub(super) fn execute_failure_retarget(
                 retarget.send_via_target.as_deref(),
                 flow.as_ref(),
                 send_socket.as_ref(),
+                strip,
             );
         }
         RequestAction::Fork {
@@ -318,6 +320,7 @@ pub(super) fn execute_failure_retarget(
             ref routes,
             ref strategy,
             ref send_socket,
+            ref strip,
         } => {
             if targets.is_empty() {
                 warn!(server_key = %server_key, "on_failure: fork with no targets — forwarding the failure");
@@ -341,6 +344,7 @@ pub(super) fn execute_failure_retarget(
                 send_socket.as_ref(),
                 retarget.on_reply_callback,
                 retarget.on_failure_callback,
+                strip,
             );
         }
         _ => return false,
