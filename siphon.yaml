@@ -595,13 +595,17 @@ auth:
   #   timeout_ms: 2000
   #   connect_timeout_ms: 500
   #   ha1: true            # true = response body is pre-hashed HA1 hex string
-  #   cache_ttl_secs: 300  # cache a successful lookup per-username for this long
-  #                        # (0 = disabled, the default). Each uncached digest
-  #                        # verification makes a BLOCKING HTTP fetch that pins a
-  #                        # handler-pool worker, so a registration storm without
-  #                        # caching can exhaust the pool. Credentials rarely
-  #                        # change, so a non-zero TTL is recommended in
-  #                        # production; a change propagates after <= cache_ttl_secs.
+  #   cache_ttl_secs: 300  # cache a successful lookup per realm + username for
+  #                        # this long (0 = disabled, the default). Each uncached
+  #                        # digest verification makes a BLOCKING HTTP fetch that
+  #                        # pins a handler-pool worker, so a registration storm
+  #                        # without caching can exhaust the pool. Non-zero is
+  #                        # recommended in production. A digest that fails
+  #                        # against a cached credential re-reads the backend
+  #                        # once, so a reset password works at once and a user
+  #                        # the backend no longer knows is refused. To drop a
+  #                        # deleted user whose old password still matches, call
+  #                        # POST /admin/auth/cache/invalidate when you write it.
   #                        # Hits are counted by siphon_auth_ha1_cache_hits_total.
 
   # SQL credential source (backend: database). Needs the postgres-backend
@@ -633,7 +637,9 @@ auth:
   #   cache_ttl_secs: 300  # same contract as auth.http.cache_ttl_secs above:
   #                        # 0 (the default) means every digest verification
   #                        # makes a BLOCKING query that pins a handler-pool
-  #                        # worker. Non-zero is the production setting.
+  #                        # worker. Non-zero is the production setting. Keyed
+  #                        # by realm + username + H(A1) column; re-read once on
+  #                        # a failed digest, flushed by the admin route.
   #   timeout_ms: 2000     # per-lookup deadline, connection included
   #
   # The connection is lazy and reconnects on its own, so a database that is

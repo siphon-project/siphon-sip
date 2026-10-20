@@ -15,6 +15,13 @@ entry, but a working config keeps working.
 
 ### Added
 
+- **`POST /admin/auth/cache/invalidate`** drops cached digest credentials
+  (`auth.http` / `auth.database`): `{"realm","username"}` for one user,
+  `{"realm"}` for one realm, `{}` for all. `204`, or `404 {"error":"no
+  credential cache"}` when caching is off. Behind the admin bearer token like the
+  other mutating routes. A controller can flush on every credential write and keep
+  a long `cache_ttl_secs`.
+
 - **Opt-in server certificate verification on outbound SIP TLS.** Outbound TLS
   to trunks was encrypted but never authenticated: caller identity and SDES keys
   went to whoever answered on the address. `tls.verify_server: true` (or
@@ -81,6 +88,16 @@ entry, but a working config keeps working.
   listener.
 
 ### Fixed
+
+- **Digest credential cache keyed without the realm, and stale for the whole
+  TTL.** The `auth.http` / `auth.database` cache keyed on the username alone while
+  the database query binds the realm, so two realms with the same username shared
+  one entry and one tenant's phone was checked against the other's hash. It is now
+  keyed by realm and username (and the H(A1) column). A changed password was
+  refused, and scored by `failed_auth_ban`, until the entry expired: a digest that
+  fails against a cached credential now re-reads the backend once, accepts the new
+  credential, and refuses and drops a user the backend no longer knows. A lookup
+  the cache missed is still made once.
 
 - **A TLS B-leg and an originate to a hostname now present that hostname as
   SNI.** They sent the resolved address, so a hostname-vhost trunk could not
