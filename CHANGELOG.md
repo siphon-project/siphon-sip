@@ -139,6 +139,23 @@ entry, but a working config keeps working.
 
 ### Fixed
 
+- **Registration events no longer stop for good after a burst.** The task that
+  feeds registrar changes to `@registrar.on_change` and the control plane's
+  `RegistrationChanged` ended on the first broadcast lag (more than 1024 events
+  behind, e.g. a registration storm after a restart against a slow handler),
+  and neither fired again until restart, with nothing logged. The
+  `@registration.on_change` task for outbound registrations had the same flaw.
+  A lag is now logged, counted in the new
+  `siphon_event_consumer_lagged_total{consumer}` counter (`registrar`,
+  `registrant`, and `rf_register` for the Rf ACR-EVENT emitter, which already
+  survived a lag but did not count it), and answered with a snapshot: every
+  registered AoR (every outbound registration) is re-reported with its current
+  state under the new event type `"snapshot"`, then the queued events follow.
+  `@registration.on_change` also gains a `state` key in its dict (the
+  registration's current state, `None` once removed), so a snapshot says
+  whether a trunk is registered or failed. A shutdown-phase receiver that
+  lagged now reads on instead of reporting shutdown over.
+
 - **A controller `dial` with a media profile no longer leaves its media
   allocation behind when the caller cancels while it rings.** Nothing released
   it on the caller's CANCEL; the engine held it until its own timeout.

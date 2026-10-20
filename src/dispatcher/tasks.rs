@@ -184,244 +184,239 @@ pub fn spawn_dialog_state_sweep(state: &Arc<DispatcherState>) {
     });
 }
 
-/// Registration state changes to the script's `@registrar.on_change`, and
-/// the Rf ACR-EVENT that TS 32.260 §5.1 owes each one.
+/// Registration state changes to the script's `@registrar.on_change`, the
+/// control plane's `RegistrationChanged`, and the Rf ACR-EVENT that TS 32.260
+/// §5.1 owes each one. Survives a broadcast lag: see
+/// [`super::registration_events`].
 pub fn spawn_registrar_events(
     state: &Arc<DispatcherState>,
     registrar_event_rx: Option<
         tokio::sync::broadcast::Receiver<crate::registrar::RegistrationEvent>,
     >,
 ) {
-    // Spawn background task: registrar change event → on_change handlers
     if let Some(registrar) = crate::script::api::registrar_arc() {
-        let mut event_receiver = registrar_event_rx.unwrap_or_else(|| registrar.subscribe_events());
-        let state_for_events = Arc::clone(state);
+        let event_receiver = registrar_event_rx.unwrap_or_else(|| registrar.subscribe_events());
+        let state = Arc::clone(state);
         let registrar = Arc::clone(registrar);
-        tokio::spawn(async move {
-            while let Ok(event) = event_receiver.recv().await {
-                let (aor, event_type) = match &event {
-                    crate::registrar::RegistrationEvent::Registered { aor } => {
-                        (aor.clone(), "registered")
-                    }
-                    crate::registrar::RegistrationEvent::Refreshed { aor } => {
-                        (aor.clone(), "refreshed")
-                    }
-                    crate::registrar::RegistrationEvent::Deregistered { aor } => {
-                        (aor.clone(), "deregistered")
-                    }
-                    crate::registrar::RegistrationEvent::Expired { aor } => {
-                        (aor.clone(), "expired")
-                    }
-                };
-
-                // A binding that went away ends the dialogs it vouched for at
-                // once, rather than at the next liveness pass.
-                if matches!(event_type, "deregistered" | "expired") {
-                    dialog_state_sweep_at(&state_for_events, std::time::Instant::now());
-                }
-
-                // CDR: emit a REGISTER record for this state change when
-                // cdr.auto_emit + cdr.include_register are on — independent of
-                // whether a @registrar.on_change handler is registered.
-                if crate::cdr::auto_emit_enabled() && crate::cdr::include_register_enabled() {
-                    cdr_emit_register(&aor, event_type);
-                }
-
-                // Control applications that asked for the registration class
-                // (`control.apps[].events`). Emitted before the Python
-                // short-circuit below so it fires whether or not a
-                // `@registrar.on_change` handler is registered — a dashboard
-                // should not depend on a script existing.
-                if let Some(bus) = crate::control::ControlBus::global() {
-                    let bindings: Vec<serde_json::Value> = registrar
-                        .lookup(&aor)
-                        .into_iter()
-                        .map(|contact| {
-                            serde_json::json!({
-                                "uri": contact.uri.to_string(),
-                                "expires": contact.remaining_seconds(),
-                                "q": contact.q,
-                            })
-                        })
-                        .collect();
-                    bus.publish_app_event(
-                        "registration",
-                        "RegistrationChanged",
-                        serde_json::json!({
-                            "aor": aor,
-                            "event": event_type,
-                            "contacts": bindings,
-                        }),
-                    );
-                }
-
-                // Quick check if any handlers exist (avoids spawn_blocking overhead)
-                {
-                    let engine_state = state_for_events.engine.state();
-                    if engine_state
-                        .handlers_for(&HandlerKind::RegistrarOnChange)
-                        .is_empty()
-                    {
-                        continue;
-                    }
-                }
-
-                // Build contacts list for the callback
-                let contacts: Vec<crate::script::api::registrar::PyContact> = registrar
-                    .lookup(&aor)
-                    .iter()
-                    .map(crate::script::api::registrar::PyContact::from_rust_contact)
-                    .collect();
-
-                let event_type_str = event_type.to_string();
-                let state_ref = Arc::clone(&state_for_events);
-
-                // Invoke Python handlers in a blocking context
-                run_event_handler("registrar.on_change", move || {
-                    let engine_state = state_ref.engine.state();
-                    let handlers = engine_state.handlers_for(&HandlerKind::RegistrarOnChange);
-
-                    pyo3::Python::attach(|python| {
-                        let py_items: Vec<_> = contacts
-                            .into_iter()
-                            .filter_map(|contact| match pyo3::Py::new(python, contact) {
-                                Ok(py) => Some(py.into_bound(python)),
-                                Err(error) => {
-                                    error!("PyContact creation failed: {error}");
-                                    None
-                                }
-                            })
-                            .collect();
-                        let Ok(py_contacts) = pyo3::types::PyList::new(python, py_items) else {
-                            error!("PyList creation failed for registrar on_change contacts");
-                            return;
-                        };
-
-                        for handler in handlers {
-                            let callable = handler.callable.bind(python);
-                            let result = callable.call1((
-                                aor.as_str(),
-                                event_type_str.as_str(),
-                                &py_contacts,
-                            ));
-                            match result {
-                                Ok(ret) => {
-                                    if handler.is_async {
-                                        if let Err(error) = run_coroutine(python, &ret) {
-                                            tracing::error!(
-                                                error = %crate::script::error_report::describe(python, &error),
-                                                "async registrar.on_change handler error"
-                                            );
-                                        }
-                                    }
-                                }
-                                Err(error) => {
-                                    tracing::error!(
-                                        error = %crate::script::error_report::describe(python, &error),
-                                        "registrar.on_change handler failed"
-                                    );
-                                }
-                            }
-                        }
-                    });
-                })
-                .await;
-            }
-        });
+        tokio::spawn(super::registration_events::drain_registrar_events(
+            event_receiver,
+            Arc::clone(&registrar),
+            move |change| {
+                deliver_registrar_change(Arc::clone(&state), Arc::clone(&registrar), change)
+            },
+        ));
     }
 }
 
-/// Outbound-REGISTER state changes to the script's `@registrar.on_change`.
-pub fn spawn_registrant_events(state: &Arc<DispatcherState>) {
-    // Spawn background task: registrant change event → on_change handlers
-    if let Some(ref registrant) = state.registrant_manager {
-        let mut event_receiver = registrant.subscribe_events();
-        let state_for_events = Arc::clone(state);
-        let registrant = Arc::clone(registrant);
-        tokio::spawn(async move {
-            while let Ok(event) = event_receiver.recv().await {
-                let (aor, event_type, failed_status_code) = match &event {
-                    crate::registrant::RegistrantEvent::Registered { aor } => {
-                        (aor.clone(), "registered", None)
+/// One registrar change (or one AoR of a lag snapshot) to every consumer.
+pub(super) async fn deliver_registrar_change(
+    state: Arc<DispatcherState>,
+    registrar: Arc<crate::registrar::Registrar>,
+    change: super::registration_events::RegistrarChange,
+) {
+    // A snapshot re-reports held state: it is not a change, so it neither ends
+    // dialogs nor owes a REGISTER CDR.
+    let is_change = !change.is_snapshot();
+    let super::registration_events::RegistrarChange {
+        aor,
+        event: event_type,
+    } = change;
+
+    // A binding that went away ends the dialogs it vouched for at once, rather
+    // than at the next liveness pass.
+    if matches!(event_type, "deregistered" | "expired") {
+        dialog_state_sweep_at(&state, std::time::Instant::now());
+    }
+
+    // CDR: emit a REGISTER record for this state change when cdr.auto_emit +
+    // cdr.include_register are on — independent of whether a
+    // @registrar.on_change handler is registered.
+    if is_change && crate::cdr::auto_emit_enabled() && crate::cdr::include_register_enabled() {
+        cdr_emit_register(&aor, event_type);
+    }
+
+    // Control applications that asked for the registration class
+    // (`control.apps[].events`). Emitted before the Python short-circuit below
+    // so it fires whether or not a `@registrar.on_change` handler is registered
+    // — a dashboard should not depend on a script existing.
+    if crate::control::app_event_wanted("registration") {
+        let bindings: Vec<serde_json::Value> = registrar
+            .lookup(&aor)
+            .into_iter()
+            .map(|contact| {
+                serde_json::json!({
+                    "uri": contact.uri.to_string(),
+                    "expires": contact.remaining_seconds(),
+                    "q": contact.q,
+                })
+            })
+            .collect();
+        crate::control::notify_app_event(
+            "registration",
+            "RegistrationChanged",
+            serde_json::json!({
+                "aor": aor,
+                "event": event_type,
+                "contacts": bindings,
+            }),
+        );
+    }
+
+    // Quick check if any handlers exist (avoids spawn_blocking overhead)
+    if state
+        .engine
+        .state()
+        .handlers_for(&HandlerKind::RegistrarOnChange)
+        .is_empty()
+    {
+        return;
+    }
+
+    // Build contacts list for the callback
+    let contacts: Vec<crate::script::api::registrar::PyContact> = registrar
+        .lookup(&aor)
+        .iter()
+        .map(crate::script::api::registrar::PyContact::from_rust_contact)
+        .collect();
+
+    // Invoke Python handlers in a blocking context
+    run_event_handler("registrar.on_change", move || {
+        let engine_state = state.engine.state();
+        let handlers = engine_state.handlers_for(&HandlerKind::RegistrarOnChange);
+
+        pyo3::Python::attach(|python| {
+            let py_items: Vec<_> = contacts
+                .into_iter()
+                .filter_map(|contact| match pyo3::Py::new(python, contact) {
+                    Ok(py) => Some(py.into_bound(python)),
+                    Err(error) => {
+                        error!("PyContact creation failed: {error}");
+                        None
                     }
-                    crate::registrant::RegistrantEvent::Refreshed { aor } => {
-                        (aor.clone(), "refreshed", None)
-                    }
-                    crate::registrant::RegistrantEvent::Failed { aor, status_code } => {
-                        (aor.clone(), "failed", Some(*status_code))
-                    }
-                    crate::registrant::RegistrantEvent::Deregistered { aor } => {
-                        (aor.clone(), "deregistered", None)
-                    }
-                };
+                })
+                .collect();
+            let Ok(py_contacts) = pyo3::types::PyList::new(python, py_items) else {
+                error!("PyList creation failed for registrar on_change contacts");
+                return;
+            };
 
-                // Quick check if any handlers exist (avoids spawn_blocking overhead)
-                {
-                    let engine_state = state_for_events.engine.state();
-                    if engine_state
-                        .handlers_for(&HandlerKind::RegistrantOnChange)
-                        .is_empty()
-                    {
-                        continue;
-                    }
-                }
-
-                // Build state dict for the callback
-                let (expires_in, failure_count, registrar_uri) =
-                    registrant.entry_info(&aor).unwrap_or((0, 0, String::new()));
-
-                let event_type_str = event_type.to_string();
-                let state_ref = Arc::clone(&state_for_events);
-
-                // Invoke Python handlers in a blocking context
-                run_event_handler("registrant.on_change", move || {
-                    let engine_state = state_ref.engine.state();
-                    let handlers = engine_state.handlers_for(&HandlerKind::RegistrantOnChange);
-
-                    pyo3::Python::attach(|python| {
-                        let py_state = pyo3::types::PyDict::new(python);
-                        let status_code_ok = match failed_status_code {
-                            Some(code) => py_state.set_item("status_code", code).is_ok(),
-                            None => true,
-                        };
-                        if py_state.set_item("expires_in", expires_in).is_err()
-                            || py_state.set_item("failure_count", failure_count).is_err()
-                            || py_state.set_item("registrar", &registrar_uri).is_err()
-                            || !status_code_ok
-                        {
-                            error!("PyDict creation failed for registration on_change state");
-                            return;
-                        }
-
-                        for handler in handlers {
-                            let callable = handler.callable.bind(python);
-                            let result =
-                                callable.call1((aor.as_str(), event_type_str.as_str(), &py_state));
-                            match result {
-                                Ok(ret) => {
-                                    if handler.is_async {
-                                        if let Err(error) = run_coroutine(python, &ret) {
-                                            tracing::error!(
-                                                error = %crate::script::error_report::describe(python, &error),
-                                                "async registration.on_change handler error"
-                                            );
-                                        }
-                                    }
-                                }
-                                Err(error) => {
-                                    tracing::error!(
-                                        error = %crate::script::error_report::describe(python, &error),
-                                        "registration.on_change handler failed"
-                                    );
-                                }
+            for handler in handlers {
+                let callable = handler.callable.bind(python);
+                let result = callable.call1((aor.as_str(), event_type, &py_contacts));
+                match result {
+                    Ok(ret) => {
+                        if handler.is_async {
+                            if let Err(error) = run_coroutine(python, &ret) {
+                                tracing::error!(
+                                    error = %crate::script::error_report::describe(python, &error),
+                                    "async registrar.on_change handler error"
+                                );
                             }
                         }
-                    });
-                })
-                .await;
+                    }
+                    Err(error) => {
+                        tracing::error!(
+                            error = %crate::script::error_report::describe(python, &error),
+                            "registrar.on_change handler failed"
+                        );
+                    }
+                }
             }
         });
+    })
+    .await;
+}
+
+/// Outbound-REGISTER state changes to the script's `@registration.on_change`.
+/// Survives a broadcast lag: see [`super::registration_events`].
+pub fn spawn_registrant_events(state: &Arc<DispatcherState>) {
+    if let Some(ref registrant) = state.registrant_manager {
+        let event_receiver = registrant.subscribe_events();
+        let state = Arc::clone(state);
+        let registrant = Arc::clone(registrant);
+        tokio::spawn(super::registration_events::drain_registrant_events(
+            event_receiver,
+            Arc::clone(&registrant),
+            move |change| {
+                deliver_registrant_change(Arc::clone(&state), Arc::clone(&registrant), change)
+            },
+        ));
     }
+}
+
+/// One registrant change (or one entry of a lag snapshot) to the script.
+pub(super) async fn deliver_registrant_change(
+    state: Arc<DispatcherState>,
+    registrant: Arc<crate::registrant::RegistrantManager>,
+    change: super::registration_events::RegistrantChange,
+) {
+    let super::registration_events::RegistrantChange {
+        aor,
+        event: event_type,
+        status_code: failed_status_code,
+    } = change;
+
+    // Quick check if any handlers exist (avoids spawn_blocking overhead)
+    if state
+        .engine
+        .state()
+        .handlers_for(&HandlerKind::RegistrantOnChange)
+        .is_empty()
+    {
+        return;
+    }
+
+    // Build state dict for the callback
+    let (expires_in, failure_count, registrar_uri) =
+        registrant.entry_info(&aor).unwrap_or((0, 0, String::new()));
+    let registration_state = registrant.state(&aor).map(|state| state.to_string());
+
+    // Invoke Python handlers in a blocking context
+    run_event_handler("registrant.on_change", move || {
+        let engine_state = state.engine.state();
+        let handlers = engine_state.handlers_for(&HandlerKind::RegistrantOnChange);
+
+        pyo3::Python::attach(|python| {
+            let py_state = pyo3::types::PyDict::new(python);
+            let status_code_ok = match failed_status_code {
+                Some(code) => py_state.set_item("status_code", code).is_ok(),
+                None => true,
+            };
+            if py_state.set_item("expires_in", expires_in).is_err()
+                || py_state.set_item("failure_count", failure_count).is_err()
+                || py_state.set_item("registrar", &registrar_uri).is_err()
+                || py_state.set_item("state", &registration_state).is_err()
+                || !status_code_ok
+            {
+                error!("PyDict creation failed for registration on_change state");
+                return;
+            }
+
+            for handler in handlers {
+                let callable = handler.callable.bind(python);
+                let result = callable.call1((aor.as_str(), event_type, &py_state));
+                match result {
+                    Ok(ret) => {
+                        if handler.is_async {
+                            if let Err(error) = run_coroutine(python, &ret) {
+                                tracing::error!(
+                                    error = %crate::script::error_report::describe(python, &error),
+                                    "async registration.on_change handler error"
+                                );
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        tracing::error!(
+                            error = %crate::script::error_report::describe(python, &error),
+                            "registration.on_change handler failed"
+                        );
+                    }
+                }
+            }
+        });
+    })
+    .await;
 }
 
 /// Serve inbound Diameter requests (RFC 6733): every command on every

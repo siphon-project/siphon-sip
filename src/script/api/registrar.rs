@@ -1501,7 +1501,7 @@ impl PyRegistrar {
     ///
     /// The handler receives (aor, event_type, contacts) where:
     ///   - aor: str — Address of Record (e.g. "sip:alice@example.com")
-    ///   - event_type: str — "registered", "refreshed", "deregistered", or "expired"
+    ///   - event_type: str — "registered", "refreshed", "deregistered", "expired", "snapshot"
     ///   - contacts: list[Contact] — current contact bindings
     #[staticmethod]
     fn on_change(python: Python<'_>, func: Py<PyAny>) -> PyResult<Py<PyAny>> {
