@@ -596,6 +596,10 @@
       "command_code": {
         "kind": "getset_descriptor"
       },
+      "experimental_result_code": {
+        "doc": "The Experimental-Result-Code inside Experimental-Result (RFC 6733",
+        "kind": "getset_descriptor"
+      },
       "get_avp": {
         "kind": "method_descriptor",
         "sig": "($self, code_or_name, vendor=0)"

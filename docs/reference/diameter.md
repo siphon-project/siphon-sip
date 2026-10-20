@@ -625,7 +625,10 @@ its answer. A node in server mode needs it for the procedures that begin at
 the server: an HSS's Cancel-Location, Insert-Subscriber-Data,
 Delete-Subscriber-Data and Reset towards an MME (TS 29.272 clauses 5.2.1.2,
 5.2.2.1, 5.2.2.2 and 5.2.4.1), or an Alert-Service-Centre over S6c
-(TS 29.338 clause 5.2.2).
+(TS 29.338 clause 5.2.2). The same call serves a PCRF's Rx Abort-Session
+and Re-Auth towards the P-CSCF and Gx Re-Auth towards the PCEF (TS 29.214,
+TS 29.212), an HSS's Cx Registration-Termination and Sh Push-Notification
+(TS 29.229, TS 29.329), and a client's Gx Credit-Control.
 
 `command` is a name as `send_request` takes it (`"CLR"`,
 `"Insert-Subscriber-Data"`) or a command code (`322` for the S6a Reset,
@@ -642,8 +645,43 @@ for the members of a group, and a list as value for a grouped AVP. An AVP
 can repeat. `mandatory` sets or clears the M bit the dictionary would give,
 for an AVP whose table marks it "must not" that the dictionary does not
 know. Auth-Session-State and Vendor-Specific-Application-Id are the
-caller's to add or leave out. Passing one of the envelope AVPs raises
-`ValueError`.
+caller's to add or leave out, as are Auth-Application-Id,
+Re-Auth-Request-Type and CC-Request-Type / CC-Request-Number. Passing one
+of the envelope AVPs raises `ValueError`.
+
+A value is checked against the dictionary type before anything is sent: a
+list for an AVP that is not grouped, a str or int for a grouped one, a
+number out of range, text for a number, a vendor that is not an int or
+`None`, or a `mandatory` that is not a bool raises `TypeError`. Bytes stay
+accepted for a grouped AVP, as `get_avp` hands back one it could not
+decode.
+
+A request of an existing session passes its `session_id` and carries
+that one Session-Id and no other: a PCRF's RAR and ASR on the session
+its AAR or CCR-I opened, and a client's CCR-U and CCR-T with the
+CC-Request-Number it counts.
+
+```python
+# PCRF: install a PCC rule on the Gx session the PGW opened (TS 29.212 5.6.4).
+answer = await diameter.originate("RAR", "Gx", [
+    ("Auth-Application-Id", 16777238),
+    ("Re-Auth-Request-Type", 0),
+    ("Event-Trigger", 2),
+    ("Event-Trigger", 13),
+    ("Charging-Rule-Install", [
+        ("Charging-Rule-Definition", [
+            ("Charging-Rule-Name", b"ims-voice"),
+            ("Flow-Information", [("Flow-Description", b"permit out 17 from 198.51.100.20 50000 to 198.51.100.7 40000"),
+                                  ("Flow-Direction", 1)]),
+            ("Flow-Information", [("Flow-Description", b"permit out 17 from 198.51.100.7 40000 to 198.51.100.20 50000"),
+                                  ("Flow-Direction", 2)]),
+            ("QoS-Information", [("QoS-Class-Identifier", 1),
+                                 ("Allocation-Retention-Priority", [("Priority-Level", 2)])]),
+        ]),
+    ]),
+], destination_realm="epc.mnc001.mcc001.3gppnetwork.org",
+   destination_host=gx_session.origin_host, session_id=gx_session.session_id)
+```
 
 ```python
 answer = await diameter.originate("CLR", "S6a", [
@@ -659,17 +697,28 @@ if answer.result_code == 2001: ...
 ```
 
 The connection: with `peer`, the serving connection of that configured
-entry that carried requests from `destination_host`, else the client-mode
-peer of that name (`diameter.peers`). Without, the serving connection that
+entry that carried requests from `destination_host`, else the tenant's relay
+backend of that name, else the client-mode peer of that name
+(`diameter.peers`). Client-mode peers belong to the node, not to a tenant,
+so only `tenant="default"` reaches them: a PCEF's Gx CCR to its PCRF is
+`originate("CCR", "Gx", ..., peer="pcrf")`. Without, the serving connection that
 last carried a request from `destination_host`, else one that carried a
 request from a node of `destination_realm` (a direct peer of the realm or
 an agent relaying for it, which routes on to the host). A serving
 connection becomes reachable once a request from that host or realm has
 arrived on it (`diameter.listen` or `connect_to`). All scoped to `tenant`.
 
-Resolves to a `DiameterAnswer` (`result_code`, `get_avp`, `avps()`),
-whatever its result. No open connection raises `LookupError` and nothing is
+Resolves to a `DiameterAnswer` (`result_code`, `experimental_result_code`,
+`get_avp`, `avps()`), whatever its result: a negative answer is told from a
+failure to get one. `experimental_result_code` is the code inside
+Experimental-Result, where the 3GPP applications put the ones they define
+(5001 DIAMETER_ERROR_USER_UNKNOWN of TS 29.229, for one), and `None` when
+the answer carries a Result-Code. No open connection raises `LookupError` and nothing is
 sent; no answer within `timeout_ms` raises `TimeoutError`; a connection that
 closes before the answer raises `ConnectionError`. siphon does not resend:
 the script decides whether to repeat.
 
+`scripts/validate_diameter_originate.sh` reads the requests built from these
+AVP lists back with Wireshark's Diameter dissector: Cx RTR, Sh PNR, Rx ASR
+and RAR, Gx RAR with a rule installation, Gx CCR-I, -U and -T on one
+session, and S6a CLR, IDR and DSR.
