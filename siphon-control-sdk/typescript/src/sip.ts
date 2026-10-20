@@ -659,6 +659,20 @@ export type DialTarget =
        */
       contactHost?: string;
       /**
+       * Media profile for this branch alone, over the dial's own. A target
+       * without one inherits the dial's. One ring can then reach a phone behind
+       * NAT that needs a latching relay and a trunk that asks for SDES-SRTP. An
+       * unknown name fails the dial as an unknown dial-level `profile` does; a
+       * connecting dial that names no `profile` anchors every branch or none, so
+       * either every target names one or none does (a mix is `bad_request`).
+       */
+      profile?: string;
+      /**
+       * When this branch's INVITE carries its SDP offer, over the dial's own
+       * `offer` (see {@link DialOptions.offer}). Bridge dials only.
+       */
+      offer?: DialOffer;
+      /**
        * Verify (`true`) or not (`false`) the server certificate when this branch
        * opens a new outbound TLS connection, over the gateway it routes to and
        * the server's `tls.verify_server`: the chain against the server's
@@ -682,9 +696,23 @@ export type DialTarget =
       to?: string;
       /** Host of siphon's own `Contact` on every branch the AoR expands to (see the URI form). */
       contactHost?: string;
+      /** Media profile for every branch the AoR expands to (see the URI form). */
+      profile?: string;
+      /** When every branch the AoR expands to carries its offer (see the URI form). */
+      offer?: DialOffer;
       /** Server certificate verification on every branch the AoR expands to (see the URI form). */
       verifyServer?: boolean;
     };
+
+/**
+ * When a phone an `onAnswer: "bridge"` dial rings is sent its SDP offer:
+ * `"delayed"` (the server's default) sends the INVITE offerless and the phone
+ * offers in its 2xx; `"early"` sends an offer the media engine allocated from
+ * the caller's media under the phone's profile, for peers that refuse a
+ * delayed-offer INVITE. The phone then answers in its 2xx (one without SDP
+ * fails that branch with 488) and only the caller is re-INVITEd at the bridge.
+ */
+export type DialOffer = "early" | "delayed";
 
 /**
  * Optional shaping for {@link Call.dial}; anything left out takes the server's
@@ -769,6 +797,14 @@ export interface DialOptions {
    * `invalid_state`).
    */
   callerContactHost?: string;
+  /**
+   * When each phone of an `onAnswer: "bridge"` dial is sent its offer, where
+   * its target names none ({@link DialOffer}). Bridge-only: naming it, on the
+   * dial or on a target, without `onAnswer: "bridge"` throws a `TypeError`
+   * before anything is sent, since the server refuses it on a connecting dial
+   * (`bad_request`, `requires_bridge`).
+   */
+  offer?: DialOffer;
 }
 
 /**
@@ -798,6 +834,8 @@ export interface Dialing {
   totalTimeout?: number;
   /** The ringback in force on a bridge dial (a preset or cadence, or `false`). */
   ringback?: string | boolean;
+  /** The offer mode of a bridge dial's phones, where a target names none. */
+  offer?: DialOffer;
   /** The phone INVITEs a bridge dial built, one per branch. */
   branches?: DialBranchPayload[];
 }
@@ -841,6 +879,14 @@ function dialTargetToWire(target: DialTarget): unknown {
   const to = (target as { to?: unknown }).to;
   const route = routeSetToWire((target as { route?: unknown }).route);
   const contactHost = contactHostToWire((target as { contactHost?: unknown }).contactHost);
+  const profile = (target as { profile?: unknown }).profile ?? undefined;
+  if (profile !== undefined && typeof profile !== "string") {
+    throw new TypeError('a dial target\'s "profile" is a media profile name string');
+  }
+  const offer = (target as { offer?: unknown }).offer ?? undefined;
+  if (offer !== undefined && offer !== "early" && offer !== "delayed") {
+    throw new TypeError('a dial target\'s "offer" is "early" or "delayed"');
+  }
   const verifyServer = verifyServerToWire((target as { verifyServer?: unknown }).verifyServer);
   if (to !== undefined && typeof to !== "string") {
     throw new TypeError('a dial target\'s "to" is a SIP URI string');
@@ -868,6 +914,8 @@ function dialTargetToWire(target: DialTarget): unknown {
     if (headers !== undefined) object.headers = headers;
     if (to !== undefined) object.to = to;
     if (contactHost !== undefined) object.contact_host = contactHost;
+    if (profile !== undefined) object.profile = profile;
+    if (offer !== undefined) object.offer = offer;
     if (verifyServer !== undefined) object.verify_server = verifyServer;
     return object;
   }
@@ -881,6 +929,8 @@ function dialTargetToWire(target: DialTarget): unknown {
     to === undefined &&
     route === undefined &&
     contactHost === undefined &&
+    profile === undefined &&
+    offer === undefined &&
     verifyServer === undefined
   ) {
     return uri;
@@ -891,6 +941,8 @@ function dialTargetToWire(target: DialTarget): unknown {
   if (to !== undefined) object.to = to;
   if (route !== undefined) object.route = route;
   if (contactHost !== undefined) object.contact_host = contactHost;
+  if (profile !== undefined) object.profile = profile;
+  if (offer !== undefined) object.offer = offer;
   if (verifyServer !== undefined) object.verify_server = verifyServer;
   return object;
 }
@@ -900,6 +952,18 @@ export function dialArgs(
   options?: DialOptions,
 ): Record<string, unknown> {
   const args: Record<string, unknown> = { targets: targets.map(dialTargetToWire) };
+  const targetOffer = targets.some(
+    (target) => (target as { offer?: unknown }).offer !== undefined,
+  );
+  if ((options?.offer !== undefined || targetOffer) && options?.onAnswer !== "bridge") {
+    throw new TypeError(
+      'dial "offer" requires onAnswer: "bridge" — a connecting dial\'s branches ' +
+        "carry the caller's own offer, and siphon refuses it there",
+    );
+  }
+  if (options?.offer !== undefined && options.offer !== "early" && options.offer !== "delayed") {
+    throw new TypeError('dial "offer" is "early" or "delayed"');
+  }
   if (!options) return args;
   if (options.strategy !== undefined) args.strategy = options.strategy;
   if (options.timeout !== undefined) args.timeout = options.timeout;
@@ -919,6 +983,7 @@ export function dialArgs(
   }
   if (options.onAnswer !== undefined) args.on_answer = options.onAnswer;
   if (options.ringback !== undefined) args.ringback = options.ringback;
+  if (options.offer !== undefined) args.offer = options.offer;
   if (options.callerContactHost !== undefined) {
     args.caller_contact_host = options.callerContactHost;
   }
@@ -1455,6 +1520,10 @@ export class Call {
       ringback: (() => {
         const value = result?.ringback;
         return typeof value === "string" || typeof value === "boolean" ? value : undefined;
+      })(),
+      offer: (() => {
+        const value = result?.offer;
+        return value === "early" || value === "delayed" ? value : undefined;
       })(),
       branches: branchList(result?.branches),
     };

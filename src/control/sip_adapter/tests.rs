@@ -3737,3 +3737,98 @@ fn a_caller_contact_host_the_caller_already_holds_otherwise_is_invalid_state() {
     assert_eq!(details["presented"], "192.0.2.1");
     assert_eq!(details["argument"], "caller_contact_host");
 }
+
+/// A target's media `profile` reaches the dispatcher on a `{uri}` and on every
+/// contact an `{aor}` forks to; a target naming none inherits the dial's later,
+/// so it carries none here.
+#[test]
+fn dial_target_carries_its_media_profile() {
+    let parsed = parse_dial_target(&serde_json::json!({
+        "uri": "sip:+15550100@trunk.example.com",
+        "profile": "sdes_srtp",
+    }))
+    .expect("the object form is a target");
+    assert_eq!(parsed[0].profile.as_deref(), Some("sdes_srtp"));
+    for bare in [
+        serde_json::json!("sip:201@198.51.100.7"),
+        serde_json::json!({"uri": "sip:201@198.51.100.7"}),
+        serde_json::json!({"uri": "sip:201@198.51.100.7", "profile": null}),
+    ] {
+        let parsed = parse_dial_target(&bare).expect("a target");
+        assert_eq!(parsed[0].profile, None, "{bare}");
+    }
+
+    let registrar = crate::script::api::test_registrar();
+    for (instance, host) in [("a", "198.51.100.141"), ("b", "198.51.100.142")] {
+        registrar
+            .save(
+                "sip:3204@siphon.example.com",
+                crate::sip::uri::SipUri::new(host.to_string()),
+                3600,
+                1.0,
+                format!("register-3204-{instance}"),
+                1,
+            )
+            .expect("the binding saves");
+    }
+    let parsed = parse_dial_target(&serde_json::json!({
+        "aor": "sip:3204@siphon.example.com",
+        "profile": "latching",
+    }))
+    .expect("the AoR form is a target");
+    assert_eq!(parsed.len(), 2, "one branch per registered contact");
+    assert!(parsed
+        .iter()
+        .all(|branch| branch.profile.as_deref() == Some("latching")));
+}
+
+/// A target profile that names nothing is refused as the dial's own is, with
+/// `bad_request` before anything is dialled.
+#[test]
+fn a_dial_target_refuses_a_profile_that_names_nothing() {
+    for profile in [
+        serde_json::json!(""),
+        serde_json::json!("  "),
+        serde_json::json!(7),
+    ] {
+        let error = parse_dial_target(&serde_json::json!({
+            "uri": "sip:201@198.51.100.7",
+            "profile": profile,
+        }))
+        .expect_err("refused");
+        assert_eq!(
+            error,
+            "dial target profile must be a non-empty profile name"
+        );
+        let result = sip_command(
+            "dial",
+            serde_json::json!({"targets": [{"uri": "sip:201@example.com", "profile": profile}]}),
+        );
+        assert!(
+            matches!(
+                result,
+                ControlResult::Error {
+                    code: ControlErrorCode::BadRequest,
+                    ..
+                }
+            ),
+            "{result:?}"
+        );
+    }
+}
+
+/// A connecting dial that anchors some branches and leaves others on the
+/// caller's own SDP is a request error, as the dispatcher reports it.
+#[test]
+fn mixed_anchoring_is_a_bad_request() {
+    let result = dial_error(crate::dispatcher::DialError::InvalidMedia(
+        "a dial anchors every branch's media or none".to_string(),
+    ));
+    assert!(matches!(
+        result,
+        ControlResult::Error {
+            code: ControlErrorCode::BadRequest,
+            ..
+        }
+    ));
+}

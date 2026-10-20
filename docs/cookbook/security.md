@@ -289,7 +289,21 @@ dials, so check both sides can do 1.3 before hardening. `TLSv1_2` (the default)
 negotiates 1.2 or 1.3.
 
 `verify_client: true` requires a client cert chaining to `client_ca` (fails closed at
-startup if `client_ca` is missing). It applies to `listen.tls` **and** `listen.wss`.
+config load if `client_ca` is missing). It applies to `listen.tls` **and** `listen.wss`,
+unless a listener overrides it. To require a client certificate on a trunk-facing
+listener only, and to check who it was issued to, set it on that entry:
+
+```yaml
+listen:
+  tls:
+    - "192.0.2.10:5061"                       # phones: no client cert
+    - address: "192.0.2.10:5062"              # trunk peer only
+      verify_client: true
+      client_ca: "/etc/siphon/tls/trunk-ca.pem"
+      client_subject: ["*.sip.example.net"]   # right CA, wrong name: refused
+```
+
+See [Per-listener mutual TLS](../transports.md#per-listener-mutual-tls).
 
 ## 4. Authenticate subscribers (script + config)
 
@@ -371,6 +385,15 @@ run AKA, install kernel IPsec SAs, and route MT requests back over the flow. It'
 substantial flow — see [`examples/ims_pcscf.py`](https://github.com/siphon-project/siphon-sip/blob/main/examples/ims_pcscf.py)
 and the `ipsec:` config block. The SA lifetime tracks the registration lifetime
 automatically.
+
+Over UDP the four SAs are used as TS 33.203 clause 7.1 lays them out: the UE
+sends its requests from its protected client port to the P-CSCF's protected
+server port, and SIPhon sends every response to it from the P-CSCF's protected
+client port to the UE's protected server port, whatever the
+`rport` of the request says (TS 24.229 clause 5.2.2.2 NOTE 3). Over TCP the
+response goes on the connection the request arrived on.
+`request.fix_nated_register()` on a protected UDP request writes the UE's
+protected server port as `rport` (TS 24.229 clause 5.2.6.3.1).
 
 A re-REGISTER or de-REGISTER over the SA is not challenged again, and that
 rests on a chain of trust worth knowing. AKA nonces are single-use, so the UE

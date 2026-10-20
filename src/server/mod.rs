@@ -1774,7 +1774,7 @@ impl SiphonServer {
                 // learns of it from a customer instead of from us.
                 if let Err(error) = transport::tls::listen(
                     addr,
-                    tls_config,
+                    &tls_config.for_listener(entry.client_auth()),
                     inbound_tx.clone(),
                     tls_outbound_rx.clone(),
                     Arc::clone(&tls_connection_map),
@@ -1885,7 +1885,7 @@ impl SiphonServer {
                 // learns of it from a customer instead of from us.
                 if let Err(error) = transport::ws::listen_secure(
                     addr,
-                    tls_config,
+                    &tls_config.for_listener(entry.client_auth()),
                     inbound_tx.clone(),
                     wss_outbound_rx.clone(),
                     Arc::clone(&wss_connection_map),
@@ -1987,9 +1987,11 @@ impl SiphonServer {
                 // A configured listener that cannot bind is fatal. Coming up
                 // "healthy" while silently missing a transport is how an operator
                 // learns of it from a customer instead of from us.
+                // Client-certificate settings agree across the pair (refused
+                // at load otherwise), so the listen.tls entry speaks for both.
                 if let Err(error) = transport::mux::listen(
                     addr,
-                    Some(tls_config),
+                    Some(&tls_config.for_listener(tls_listen[&addr].client_auth())),
                     transport::mux::MuxChannels {
                         sip_outbound_rx: tls_outbound_rx.clone(),
                         sip_connection_map: Arc::clone(&tls_connection_map),

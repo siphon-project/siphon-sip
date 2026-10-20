@@ -30,6 +30,14 @@ use std::time::Instant;
 use crate::b2bua::actor::{DialBranch, DialBranchCause, DialBranchOutcome};
 use crate::dispatcher::*;
 
+/// The next legs a group places, and what each is placed with.
+struct LegsToPlace {
+    targets: Vec<DialTarget>,
+    params: OriginateParams,
+    sink: Arc<dyn OriginateGroupSink>,
+    early_offer: Option<LegOfferCaller>,
+}
+
 /// How an originate group rings its targets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OriginateGroupStrategy {
@@ -80,6 +88,9 @@ pub struct OriginateGroupSpec {
     pub total_timeout_secs: u32,
     /// Whether the first answer is final.
     pub answers: OriginateGroupAnswers,
+    /// The caller a bridging dial's legs are offered from, for the targets
+    /// whose `offer` is [`DialOffer::Early`]. `None` sends every leg offerless.
+    pub early_offer: Option<LegOfferCaller>,
 }
 
 /// When an answer settles a group.
@@ -247,6 +258,8 @@ struct OriginateGroup {
     /// Why the last target that could not be placed was refused.
     last_refusal: Option<OriginateError>,
     answers: OriginateGroupAnswers,
+    /// What an early-offer leg is offered from ([`OriginateGroupSpec::early_offer`]).
+    early_offer: Option<LegOfferCaller>,
     /// The deadline passed while an answer awaited confirmation: the ringing
     /// legs were CANCELled and nothing more is placed, but the answers already
     /// in are still the creator's to confirm or reject.
@@ -372,7 +385,7 @@ enum Claim {
     /// Not a group's leg.
     Ungrouped,
     /// The first to answer.
-    Won(GroupClaimed),
+    Won(Box<GroupClaimed>),
     /// This leg already won, and the first copy of its 2xx is being carried
     /// out.
     Duplicate,
@@ -512,14 +525,7 @@ impl OriginateGroupStore {
     /// The targets to place now, with what their INVITEs carry: every target
     /// left for a parallel group, the next one for a sequential group. `None`
     /// for a group that is gone or concluded.
-    fn targets_to_place(
-        &self,
-        group_id: &str,
-    ) -> Option<(
-        Vec<DialTarget>,
-        OriginateParams,
-        Arc<dyn OriginateGroupSink>,
-    )> {
+    fn targets_to_place(&self, group_id: &str) -> Option<LegsToPlace> {
         let mut group = self.groups.get_mut(group_id)?;
         if group.concluded {
             group.placing = false;
@@ -531,7 +537,12 @@ impl OriginateGroupStore {
         };
         let targets = group.targets[group.next_target..end].to_vec();
         group.next_target = end;
-        Some((targets, group.params.clone(), Arc::clone(&group.sink)))
+        Some(LegsToPlace {
+            targets,
+            params: group.params.clone(),
+            sink: Arc::clone(&group.sink),
+            early_offer: group.early_offer.clone(),
+        })
     }
 
     /// Record why a target could not be placed.
@@ -674,13 +685,13 @@ impl OriginateGroupStore {
                 internal_call_id.to_string(),
                 LegRole::Answered(group_id.clone()),
             );
-            return Claim::Won(GroupClaimed {
+            return Claim::Won(Box::new(GroupClaimed {
                 sink: Arc::clone(&group.sink),
                 group_id,
                 winner: reported,
                 losers: Vec::new(),
                 provisional: true,
-            });
+            }));
         }
         winner.branch.outcome = Some(answered);
         let winner = winner.branch.clone();
@@ -696,13 +707,13 @@ impl OriginateGroupStore {
             losers.push(leg.clone());
         }
         group.concluded = true;
-        Claim::Won(GroupClaimed {
+        Claim::Won(Box::new(GroupClaimed {
             sink: Arc::clone(&group.sink),
             group_id,
             winner,
             losers,
             provisional: false,
-        })
+        }))
     }
 
     /// End a group from outside: settle every live leg on `end`'s outcome.
@@ -870,6 +881,7 @@ pub fn create_originate_group(
             deadline: None,
             last_refusal: None,
             answers: spec.answers,
+            early_offer: spec.early_offer,
             expired: false,
         },
     );
@@ -1046,13 +1058,11 @@ fn drive(
         match next {
             Next::Nothing | Next::Continue => return Ok(placed),
             Next::Place => {
-                let Some((targets, params, sink)) =
-                    state.originate_groups.targets_to_place(group_id)
-                else {
+                let Some(legs) = state.originate_groups.targets_to_place(group_id) else {
                     return Ok(placed);
                 };
-                for target in targets {
-                    if let Some(branch) = place_leg(state, group_id, &target, &params, &sink) {
+                for target in &legs.targets {
+                    if let Some(branch) = place_leg(state, group_id, target, &legs) {
                         placed.push(branch);
                     }
                 }
@@ -1084,6 +1094,8 @@ fn drive(
 ///   none either (a group of URIs dialled as written, each its own callee).
 /// * A target's `next_hop` and headers (in a stable order) replace the
 ///   group's.
+/// * A target that names a media `profile` anchors its leg with it, over the
+///   group's (a group that sends its own offer has no profile to replace).
 /// * A target that names a calling identity presents it: `from` and
 ///   `from_display` together (an empty display name presents none), and its
 ///   `p_asserted_identity` and `privacy` where it names them. A contact an AoR
@@ -1116,6 +1128,13 @@ fn leg_params(template: &OriginateParams, target: &DialTarget) -> OriginateParam
     if target.privacy.is_some() {
         params.privacy = target.privacy;
     }
+    // A media profile the target names anchors its own leg: each leg of a group
+    // is a call siphon placed, with a media session of its own.
+    if let (Some(own), OriginateMedia::Anchor { profile, .. }) =
+        (&target.profile, &mut params.media)
+    {
+        profile.clone_from(own);
+    }
     let mut headers: Vec<(&String, &String)> = target.headers.iter().collect();
     headers.sort();
     for (name, value) in headers {
@@ -1134,16 +1153,21 @@ fn place_leg(
     state: &DispatcherState,
     group_id: &str,
     target: &DialTarget,
-    template: &OriginateParams,
-    sink: &Arc<dyn OriginateGroupSink>,
+    legs: &LegsToPlace,
 ) -> Option<DialBranch> {
-    let params = leg_params(template, target);
+    let sink = &legs.sink;
+    let params = leg_params(&legs.params, target);
     let route = OriginateRoute {
         request_uri: Some(target.uri.clone()),
         flow: target.flow.clone(),
         route: target.route.clone(),
         hide_from_host: target.hide_from_host,
         contact_host: target.contact_host.clone(),
+        // Offered in its INVITE when its target resolved to an early offer.
+        early_offer: legs
+            .early_offer
+            .clone()
+            .filter(|_| target.offer == Some(DialOffer::Early)),
         verify_server: target.verify_server,
     };
     let prepared = match prepare_originate_routed(state, params, &route) {
@@ -1166,11 +1190,13 @@ fn place_leg(
         .originate_groups
         .attach_leg(group_id, &prepared.internal_call_id, branch.clone())
     {
-        // The group ended while this leg was staged: its INVITE never goes.
+        // The group ended while this leg was staged: its INVITE never goes,
+        // and an early offer's allocation goes with it.
         state.call_actors.remove_call(&prepared.internal_call_id);
         state
             .call_event_receivers
             .remove(&prepared.internal_call_id);
+        originate_delete_media(&prepared.sip_call_id, state);
         return None;
     }
     sink.branch_created(group_id, &branch);
@@ -1302,7 +1328,7 @@ pub fn originate_group_claim_answer(
     code: u16,
 ) -> OriginateGroupClaim {
     let claimed = match state.originate_groups.claim_answer(internal_call_id, code) {
-        Claim::Won(claimed) => claimed,
+        Claim::Won(claimed) => *claimed,
         Claim::Ungrouped => return OriginateGroupClaim::Ungrouped,
         Claim::Duplicate => return OriginateGroupClaim::Duplicate,
         Claim::Lost => return OriginateGroupClaim::Lost,
@@ -1377,6 +1403,7 @@ mod tests {
             target: target.to_string(),
             aor: Some("sip:201@example.com".to_string()),
             outcome,
+            media_profile: None,
         }
     }
 
@@ -1424,6 +1451,7 @@ mod tests {
             deadline: None,
             last_refusal: None,
             answers: OriginateGroupAnswers::First,
+            early_offer: None,
             expired: false,
         }
     }
@@ -1736,7 +1764,7 @@ mod tests {
         );
         assert!(store.start("group", Instant::now()));
         assert!(!store.start("group", Instant::now()), "a group starts once");
-        let (first, _, _) = store.targets_to_place("group").expect("a target");
+        let first = store.targets_to_place("group").expect("a target").targets;
         assert_eq!(first.len(), 1);
         assert!(store.attach_leg("group", "leg-0", branch("a", None)));
         assert!(matches!(store.finish_placement("group"), Next::Continue));
@@ -1747,11 +1775,11 @@ mod tests {
             )
             .expect("a live leg");
         assert!(matches!(ended.next, Next::Place));
-        let (second, _, _) = store.targets_to_place("group").expect("a target");
+        let second = store.targets_to_place("group").expect("a target").targets;
         assert_eq!(second[0].uri, "sip:201@198.51.100.1");
         assert!(store
             .targets_to_place("group")
-            .is_some_and(|(rest, _, _)| rest.is_empty()));
+            .is_some_and(|rest| rest.targets.is_empty()));
     }
 
     #[test]
@@ -1808,6 +1836,38 @@ mod tests {
         assert_eq!(params.from, template.from);
         assert_eq!(params.from_display, template.from_display);
         assert_eq!(params.privacy, None);
+    }
+
+    /// A bridge dial's phone is a call of its own, so a target's media profile
+    /// anchors its leg, over the group's; one naming none takes the group's.
+    #[test]
+    fn a_target_that_names_a_media_profile_anchors_its_own_leg_with_it() {
+        let mut template = group(OriginateGroupStrategy::Parallel, 0).params;
+        template.media = OriginateMedia::Anchor {
+            profile: "latching".to_string(),
+            ws_uri: None,
+        };
+        let trunk = DialTarget {
+            uri: "sip:+15550100@trunk.example.com".to_string(),
+            profile: Some("sdes_srtp".to_string()),
+            ..Default::default()
+        };
+        let desk = DialTarget {
+            uri: "sip:201@198.51.100.7".to_string(),
+            ..Default::default()
+        };
+        let anchored = |params: OriginateParams| match params.media {
+            OriginateMedia::Anchor { profile, .. } => Some(profile),
+            OriginateMedia::Offer { .. } => None,
+        };
+        assert_eq!(
+            anchored(leg_params(&template, &trunk)).as_deref(),
+            Some("sdes_srtp")
+        );
+        assert_eq!(
+            anchored(leg_params(&template, &desk)).as_deref(),
+            Some("latching")
+        );
     }
 
     #[test]

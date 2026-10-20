@@ -1284,6 +1284,68 @@ describe("dial args map to the target shapes the server parses", () => {
     ).toThrow(/contactHost/);
   });
 
+  it("sends a target's profile on either form, beside the dial's own", () => {
+    expect(
+      dialArgs(
+        [
+          { uri: "sip:+15550199@trunk.example", profile: "sdes_srtp" },
+          { aor: "sip:204@pbx.example", profile: "latching" },
+          { uri: "sip:1001@pbx.example" },
+        ],
+        { profile: "rtp_passthrough" },
+      ),
+    ).toEqual({
+      targets: [
+        { uri: "sip:+15550199@trunk.example", profile: "sdes_srtp" },
+        { aor: "sip:204@pbx.example", profile: "latching" },
+        "sip:1001@pbx.example",
+      ],
+      profile: "rtp_passthrough",
+    });
+    expect(() =>
+      dialArgs([{ aor: "sip:204@pbx.example", profile: 7 } as never]),
+    ).toThrow(/profile/);
+  });
+
+  it("sends offer on a bridge dial and its targets, and refuses it elsewhere", () => {
+    expect(
+      dialArgs(
+        [
+          { uri: "sip:+15550199@trunk.example", offer: "early" },
+          { aor: "sip:204@pbx.example", offer: "delayed" },
+          { uri: "sip:1001@pbx.example" },
+        ],
+        { onAnswer: "bridge", offer: "early" },
+      ),
+    ).toEqual({
+      targets: [
+        { uri: "sip:+15550199@trunk.example", offer: "early" },
+        { aor: "sip:204@pbx.example", offer: "delayed" },
+        "sip:1001@pbx.example",
+      ],
+      on_answer: "bridge",
+      offer: "early",
+    });
+    // A connecting dial's branches carry the caller's own offer.
+    expect(() => dialArgs([{ uri: "sip:1001@pbx.example" }], { offer: "early" })).toThrow(
+      /onAnswer/,
+    );
+    expect(() => dialArgs([{ uri: "sip:1001@pbx.example", offer: "early" }])).toThrow(
+      /onAnswer/,
+    );
+    expect(() =>
+      dialArgs([{ uri: "sip:1001@pbx.example", offer: "late" as never }], {
+        onAnswer: "bridge",
+      }),
+    ).toThrow(/offer/);
+    expect(() =>
+      dialArgs([{ uri: "sip:1001@pbx.example" }], {
+        onAnswer: "bridge",
+        offer: "late" as never,
+      }),
+    ).toThrow(/offer/);
+  });
+
   it("sends a target's verifyServer as verify_server on either form", () => {
     expect(
       dialArgs([

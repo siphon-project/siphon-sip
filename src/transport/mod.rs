@@ -18,6 +18,7 @@ pub mod sctp;
 pub mod stream;
 pub mod tcp;
 pub mod tls;
+pub(crate) mod tls_client_auth;
 pub mod tls_listener;
 /// Transport layer — UDP, TCP, TLS, WebSocket, WSS, SCTP.
 /// Each transport sends inbound SIP messages to the core via a channel

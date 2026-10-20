@@ -22,9 +22,9 @@ use crate::ipsec::{
 };
 use crate::transaction::timer::TimerConfig;
 
-const REGISTRAR: &str = "198.51.100.12:5060";
+pub(super) const REGISTRAR: &str = "198.51.100.12:5060";
 
-const RELAY: &str = concat!(
+pub(super) const RELAY: &str = concat!(
     "from siphon import proxy\n",
     "\n",
     "@proxy.on_request\n",
@@ -32,7 +32,7 @@ const RELAY: &str = concat!(
     "    request.relay(\"sip:registrar@198.51.100.12:5060\")\n",
 );
 
-const ANSWER: &str = concat!(
+pub(super) const ANSWER: &str = concat!(
     "from siphon import proxy\n",
     "\n",
     "@proxy.on_request\n",
@@ -45,7 +45,7 @@ const T1: Duration = Duration::from_millis(2);
 /// Comfortably past Timer J (64*T1 = 128 ms).
 const PAST_TIMER_J: Duration = Duration::from_millis(600);
 
-fn p_cscf(script: &str) -> (Proxy, Arc<IpsecManager>) {
+pub(super) fn p_cscf(script: &str) -> (Proxy, Arc<IpsecManager>) {
     let mut dispatcher = test_dispatcher_with_script(script);
     let timers = TimerConfig::new(T1, Duration::from_millis(8), Duration::from_millis(10));
     dispatcher.state.transaction_manager = Arc::new(TransactionManager::new(timers));
@@ -67,7 +67,7 @@ fn p_cscf(script: &str) -> (Proxy, Arc<IpsecManager>) {
 
 /// The pair a UE at `ue` (its protected client port) set up, with its own
 /// server port next to it.
-async fn install(manager: &IpsecManager, ue: SocketAddr) -> SecurityAssociationPair {
+pub(super) async fn install(manager: &IpsecManager, ue: SocketAddr) -> SecurityAssociationPair {
     let (spi_pc, spi_ps) = manager.allocate_spi_pair().expect("room in the partition");
     let sa = SecurityAssociationPair {
         ue_addr: ue.ip(),
@@ -157,7 +157,13 @@ fn registrar_answers(
     proxy
         .wire()
         .into_iter()
-        .filter(|sent| sent.destination == ue.to_string())
+        // Over UDP the response goes to the UE's protected server port, not
+        // the client port the request came from (TS 33.203 clause 7.1).
+        .filter(|sent| {
+            sent.destination
+                .parse::<SocketAddr>()
+                .is_ok_and(|destination| destination.ip() == ue.ip())
+        })
         .filter_map(|sent| sent.message.status_code())
         .collect()
 }

@@ -47,12 +47,20 @@ pub fn b_leg_answered(
                 .set_leg_last_sdp(call_id, false, &message.body);
         }
 
-        if let Err(error) = control_dial_media_answer(call_id, message, response_source.ip(), state)
-        {
+        if let Err(error) = control_dial_media_answer(
+            call_id,
+            &snapshot.branch,
+            message,
+            response_source.ip(),
+            state,
+        ) {
             error!(%call_id, %error, "control dial media failed before answering caller");
             b2bua_fail_after_answer(call_id, &error, &snapshot.branch, message, state);
             return;
         }
+        // The dial is settled on this branch's media: the allocation it was
+        // answered through becomes the call's, and every other is released.
+        settle_control_dial_media(call_id, &snapshot.branch, state);
         // Behind siphon's own early answer, the callee's SDP completes the far
         // leg unless an early one already did. A codec the engine's offer did not
         // list cannot be connected: the callee is released and the call fails

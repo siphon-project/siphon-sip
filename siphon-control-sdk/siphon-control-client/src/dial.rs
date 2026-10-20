@@ -54,6 +54,11 @@ pub enum DialTarget {
         /// Host of siphon's own Contact on this branch. See
         /// [`DialTarget::contact_host`].
         contact_host: Option<String>,
+        /// Media profile for this branch alone. See [`DialTarget::profile`].
+        profile: Option<String>,
+        /// When this branch's INVITE carries its offer. See
+        /// [`DialTarget::offer`].
+        offer: Option<DialOffer>,
         /// Server certificate verification on this branch's outbound TLS. See
         /// [`DialTarget::verify_server`].
         verify_server: Option<bool>,
@@ -80,6 +85,12 @@ pub enum DialTarget {
         /// Host of siphon's own Contact on every branch the AoR expands to.
         /// See [`DialTarget::contact_host`].
         contact_host: Option<String>,
+        /// Media profile for every branch the AoR expands to. See
+        /// [`DialTarget::profile`].
+        profile: Option<String>,
+        /// When every branch the AoR expands to carries its offer. See
+        /// [`DialTarget::offer`].
+        offer: Option<DialOffer>,
         /// Server certificate verification on every branch the AoR expands
         /// to. See [`DialTarget::verify_server`].
         verify_server: Option<bool>,
@@ -116,6 +127,8 @@ impl DialTarget {
             to: None,
             route: Vec::new(),
             contact_host: None,
+            profile: None,
+            offer: None,
             verify_server: None,
         }
     }
@@ -134,6 +147,8 @@ impl DialTarget {
             to: None,
             route: Vec::new(),
             contact_host: None,
+            profile: None,
+            offer: None,
             verify_server: None,
         }
     }
@@ -165,6 +180,8 @@ impl DialTarget {
             to: None,
             route: route.into_iter().map(Into::into).collect(),
             contact_host: None,
+            profile: None,
+            offer: None,
             verify_server: None,
         }
     }
@@ -178,6 +195,8 @@ impl DialTarget {
             identity: TargetIdentity::default(),
             to: None,
             contact_host: None,
+            profile: None,
+            offer: None,
             verify_server: None,
         }
     }
@@ -269,6 +288,51 @@ impl DialTarget {
         self
     }
 
+    /// Media profile for this branch alone (every branch an AoR expands to),
+    /// over the dial's own. A target without one inherits the dial's.
+    ///
+    /// One ring can then reach a phone behind NAT that needs a latching relay
+    /// and a trunk that asks for SDES-SRTP. The server refuses an unknown
+    /// profile name the way it refuses an unknown dial-level one, and on a
+    /// connecting dial that names no profile of its own it anchors every
+    /// branch or none: either every target names a profile or none does, and
+    /// a mix is `bad_request`.
+    pub fn profile(mut self, profile: impl Into<String>) -> Self {
+        match &mut self {
+            Self::Uri {
+                profile: media_profile,
+                ..
+            }
+            | Self::Aor {
+                profile: media_profile,
+                ..
+            } => {
+                *media_profile = Some(profile.into());
+            }
+        }
+        self
+    }
+
+    /// When this branch's INVITE carries its SDP offer (every branch an AoR
+    /// expands to), over [`DialOptions::offer`]. Only an
+    /// [`DialOnAnswer::Bridge`] dial places its legs itself: the server refuses
+    /// `offer` on a connecting dial with `bad_request`.
+    pub fn offer(mut self, offer: DialOffer) -> Self {
+        match &mut self {
+            Self::Uri {
+                offer: branch_offer,
+                ..
+            }
+            | Self::Aor {
+                offer: branch_offer,
+                ..
+            } => {
+                *branch_offer = Some(offer);
+            }
+        }
+        self
+    }
+
     /// Verify (`true`) or do not verify (`false`) the server certificate when
     /// this branch opens a new outbound TLS connection, over the gateway it
     /// routes to and the server's `tls.verify_server`.
@@ -290,7 +354,7 @@ impl DialTarget {
 
     pub(crate) fn to_json(&self) -> serde_json::Value {
         let mut object = serde_json::Map::new();
-        let (headers, identity, to, contact_host, verify_server) = match self {
+        let (headers, identity, to, contact_host, profile, offer, verify_server) = match self {
             Self::Uri {
                 uri,
                 next_hop,
@@ -299,6 +363,8 @@ impl DialTarget {
                 to,
                 route,
                 contact_host,
+                profile,
+                offer,
                 verify_server,
             } => {
                 // A bare URI with no overrides is a plain string on the wire —
@@ -311,6 +377,8 @@ impl DialTarget {
                     && to.is_none()
                     && route.is_empty()
                     && contact_host.is_none()
+                    && profile.is_none()
+                    && offer.is_none()
                     && verify_server.is_none()
                 {
                     return json!(uri);
@@ -322,7 +390,15 @@ impl DialTarget {
                 if !route.is_empty() {
                     object.insert("route".to_string(), json!(route));
                 }
-                (headers, identity, to, contact_host, verify_server)
+                (
+                    headers,
+                    identity,
+                    to,
+                    contact_host,
+                    profile,
+                    offer,
+                    verify_server,
+                )
             }
             Self::Aor {
                 aor,
@@ -330,10 +406,20 @@ impl DialTarget {
                 identity,
                 to,
                 contact_host,
+                profile,
+                offer,
                 verify_server,
             } => {
                 object.insert("aor".to_string(), json!(aor));
-                (headers, identity, to, contact_host, verify_server)
+                (
+                    headers,
+                    identity,
+                    to,
+                    contact_host,
+                    profile,
+                    offer,
+                    verify_server,
+                )
             }
         };
         if let Some(verify_server) = verify_server {
@@ -344,6 +430,12 @@ impl DialTarget {
         }
         if let Some(contact_host) = contact_host {
             object.insert("contact_host".to_string(), json!(contact_host));
+        }
+        if let Some(profile) = profile {
+            object.insert("profile".to_string(), json!(profile));
+        }
+        if let Some(offer) = offer {
+            object.insert("offer".to_string(), json!(offer.as_str()));
         }
         if !headers.is_empty() {
             object.insert("headers".to_string(), headers_to_json(headers));
@@ -361,6 +453,37 @@ impl DialTarget {
             object.insert("privacy".to_string(), json!(privacy.as_str()));
         }
         serde_json::Value::Object(object)
+    }
+}
+
+/// When a phone an [`DialOnAnswer::Bridge`] dial rings is sent its SDP offer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DialOffer {
+    /// The INVITE carries no SDP: the phone offers in its 2xx. The server's
+    /// default.
+    Delayed,
+    /// The INVITE carries an offer the media engine allocated from the
+    /// caller's media, for peers that refuse a delayed-offer INVITE. The phone
+    /// answers in its 2xx; a 2xx without SDP fails that branch with 488.
+    Early,
+}
+
+impl DialOffer {
+    /// The wire token the server parses.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            DialOffer::Delayed => "delayed",
+            DialOffer::Early => "early",
+        }
+    }
+
+    /// The mode called `name`: `early` or `delayed`.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "early" => Some(DialOffer::Early),
+            "delayed" => Some(DialOffer::Delayed),
+            _ => None,
+        }
     }
 }
 
@@ -535,6 +658,10 @@ pub struct DialOptions {
     /// the caller has been sent an 18x or 2xx, so on a bridging dial it can
     /// only repeat the host its answer carried (another is `invalid_state`).
     pub caller_contact_host: Option<String>,
+    /// When each phone of an [`DialOnAnswer::Bridge`] dial is sent its SDP
+    /// offer, where its target names none ([`DialTarget::offer`]). Unset is the
+    /// server's default, [`DialOffer::Delayed`].
+    pub offer: Option<DialOffer>,
 }
 
 impl DialOptions {
@@ -592,6 +719,12 @@ impl DialOptions {
         self
     }
 
+    /// Send each phone of a bridging dial its offer this way.
+    pub fn offer(mut self, offer: DialOffer) -> Self {
+        self.offer = Some(offer);
+        self
+    }
+
     /// Present this host in siphon's Contact toward the caller.
     pub fn caller_contact_host(mut self, host: impl Into<String>) -> Self {
         self.caller_contact_host = Some(host.into());
@@ -621,6 +754,9 @@ impl DialOptions {
         }
         if let Some(privacy) = self.privacy {
             args.insert("privacy".to_string(), json!(privacy.as_str()));
+        }
+        if let Some(offer) = self.offer {
+            args.insert("offer".to_string(), json!(offer.as_str()));
         }
         if let Some(on_answer) = &self.on_answer {
             args.insert("on_answer".to_string(), json!(on_answer.as_str()));
@@ -658,6 +794,9 @@ pub struct Dialing {
     pub total_timeout_secs: Option<u32>,
     /// The ringback a bridge dial plays.
     pub ringback: Option<Ringback>,
+    /// When a bridge dial's phones are sent their offer, where a target names
+    /// none of its own. `None` for a connecting dial.
+    pub offer: Option<DialOffer>,
     /// The phones a bridge dial rang at once, each named as its `DialBranch`
     /// event names it. Empty for a connecting dial, which reports its branches
     /// only as events.
@@ -773,6 +912,7 @@ impl Dialing {
             group_id: string(result, "group_id"),
             total_timeout_secs: seconds(result, "total_timeout"),
             ringback: result.get("ringback").and_then(Ringback::from_json),
+            offer: string(result, "offer").and_then(|name| DialOffer::from_name(&name)),
             branches: branches(result),
         }
     }
@@ -1004,6 +1144,8 @@ mod tests {
             to: None,
             route: vec!["<sip:scscf.example.test;lr>".to_string()],
             contact_host: None,
+            profile: None,
+            offer: None,
             verify_server: None,
         };
         assert_eq!(
@@ -1058,6 +1200,88 @@ mod tests {
                 "next_hop": "sip:192.0.2.9:5060",
                 "contact_host": "tenant-a.example.com"
             })
+        );
+    }
+
+    /// A media profile defeats the bare-string shortcut on either target form,
+    /// or the branch would fall back to the dial's profile after all.
+    #[test]
+    fn a_targets_profile_goes_out_on_either_form() {
+        assert_eq!(
+            DialTarget::uri("sip:+15550199@trunk.example")
+                .profile("sdes_srtp")
+                .to_json(),
+            json!({"uri": "sip:+15550199@trunk.example", "profile": "sdes_srtp"})
+        );
+        assert_eq!(
+            DialTarget::aor("sip:204@pbx.example")
+                .profile("latching")
+                .to_json(),
+            json!({"aor": "sip:204@pbx.example", "profile": "latching"})
+        );
+        assert_eq!(
+            DialTarget::uri_via("sip:+15550199@trunk.example", "sip:192.0.2.9:5060")
+                .profile("sdes_srtp")
+                .contact_host("tenant-a.example.com")
+                .to_json(),
+            json!({
+                "uri": "sip:+15550199@trunk.example",
+                "next_hop": "sip:192.0.2.9:5060",
+                "contact_host": "tenant-a.example.com",
+                "profile": "sdes_srtp"
+            })
+        );
+        // A target without one carries no profile key and inherits the dial's.
+        assert_eq!(
+            DialTarget::uri("sip:1001@pbx.example").to_json(),
+            json!("sip:1001@pbx.example")
+        );
+        assert!(DialTarget::aor("sip:204@pbx.example")
+            .to_json()
+            .get("profile")
+            .is_none());
+    }
+
+    /// A target's offer mode and the dial's go out by their wire names, and a
+    /// target naming one is no longer a bare string.
+    #[test]
+    fn offer_modes_go_out_on_the_dial_and_on_either_target_form() {
+        assert_eq!(
+            DialTarget::uri("sip:+15550199@trunk.example")
+                .offer(DialOffer::Early)
+                .to_json(),
+            json!({"uri": "sip:+15550199@trunk.example", "offer": "early"})
+        );
+        assert_eq!(
+            DialTarget::aor("sip:204@pbx.example")
+                .offer(DialOffer::Delayed)
+                .to_json(),
+            json!({"aor": "sip:204@pbx.example", "offer": "delayed"})
+        );
+        let mut args = serde_json::Map::new();
+        DialOptions::default()
+            .on_answer(DialOnAnswer::bridge())
+            .offer(DialOffer::Early)
+            .insert_into(&mut args);
+        assert_eq!(args.get("offer"), Some(&json!("early")));
+        let mut args = serde_json::Map::new();
+        DialOptions::default().insert_into(&mut args);
+        assert!(args.get("offer").is_none(), "unset is the server's default");
+        for mode in [DialOffer::Early, DialOffer::Delayed] {
+            assert_eq!(DialOffer::from_name(mode.as_str()), Some(mode));
+        }
+        assert_eq!(DialOffer::from_name("late"), None);
+    }
+
+    /// The last profile named on a target wins, as with every other builder.
+    #[test]
+    fn a_targets_profile_replaces_an_earlier_one() {
+        assert_eq!(
+            DialTarget::aor("sip:204@pbx.example")
+                .profile("sdes_srtp")
+                .profile("latching")
+                .to_json(),
+            json!({"aor": "sip:204@pbx.example", "profile": "latching"})
         );
     }
 

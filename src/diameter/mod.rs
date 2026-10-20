@@ -21,6 +21,7 @@ pub mod forward;
 pub mod gba;
 #[cfg(test)]
 pub(crate) mod gba_test_vectors;
+pub(crate) mod originate;
 pub mod peer;
 pub mod pool;
 pub(crate) mod reauthorize;

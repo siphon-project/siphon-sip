@@ -68,6 +68,7 @@ pub use lawful_intercept::{
 };
 pub use listen::{
     dscp_to_tos, parse_dscp, AdvertisedAddress, DomainConfig, ListenConfig, ListenEntry,
+    ListenerClientAuth,
 };
 pub use media::{
     CodecFlagsConfig, MediaBackendKind, MediaConfig, MediaProfileConfig, NgFlagsConfig,
@@ -583,6 +584,8 @@ impl Config {
         config.validate_admin_log_tail()?;
         config.validate_control_connect_urls()?;
         config.validate_listen()?;
+        tls::validate_listener_client_auth(&config.listen, config.tls.as_ref())
+            .map_err(SiphonError::Config)?;
         config.validate_timer_intervals()?;
         config.validate_advertised_address()?;
         config.validate_inbound_limits()?;
