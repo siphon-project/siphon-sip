@@ -13,6 +13,29 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
+### Added
+
+- **Control plane: registration state a controller can rely on.**
+  `RegistrationChanged` contacts now say where the REGISTER came from:
+  `received` (byte for byte the script's `Contact.received`), `transport`,
+  `client_transport` when a PROXY-protocol front declared a different one,
+  `instance` (`+sip.instance`), `reg_id`, `path`, and the `call_id` / `cseq` of
+  the REGISTER that last wrote the binding. Every event carries a per-process
+  `seq`, so a lost event (a queue overflow, siphon's own event task falling
+  behind, a controller restart) shows as a gap. The new `registrations` verb
+  returns the registered AoRs with their contacts and the `seq` the set is
+  current to, for an app subscribed to `registration`, paged in AoR order
+  (`after`, `limit` up to 1000, `next`) so a large registrar never needs one
+  oversized frame: resync on connect or on a gap and apply only events
+  numbered above the first page's `seq`. A new
+  `outbound_registration` event class publishes `RegistrantChanged`
+  (`aor`, `event`, `registrar`, `state`, `expires_in`, `failure_count`,
+  `status_code`, `seq`) for the REGISTERs siphon sends upstream, with an
+  `outbound_registrations` verb in the same shape. A snapshot after a lag
+  carries the last failure's status, in `@registration.on_change` too. The
+  Rust, Python and TypeScript control SDKs model the new fields, event and
+  verbs.
+
 ### Fixed
 
 - **Registration events no longer stop for good after a burst.** The task that

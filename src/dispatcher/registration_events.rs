@@ -17,7 +17,8 @@
 //! lost window is not in the snapshot; the events still held after the lag are
 //! delivered once the snapshot is done and may name it, but if its removal was
 //! among the `n` lost, only a consumer that reconciles against the full set
-//! learns it is gone.
+//! (the control plane's `registrations` verb, which a controller asks for when
+//! it sees the gap the lost events leave in `seq`) learns it is gone.
 //!
 //! Only the end of the channel (`RecvError::Closed`, the source dropped) ends
 //! a loop.
@@ -118,6 +119,9 @@ pub(crate) async fn drain_registrar_events<D, F>(
             Received::Event(event) => deliver(RegistrarChange::from_event(event)).await,
             Received::Lagged(skipped) => {
                 record_lag(LaggedConsumer::Registrar, skipped);
+                // The lost changes are numbered too, so a controller sees the
+                // gap in `seq` and can ask for the full set.
+                crate::control::registration::skip_registration_events(skipped);
                 let aors = registrar.registered_aors();
                 warn!(
                     skipped,
@@ -162,6 +166,7 @@ pub(crate) async fn drain_registrant_events<D, F>(
             Received::Event(event) => deliver(RegistrantChange::from_event(event)).await,
             Received::Lagged(skipped) => {
                 record_lag(LaggedConsumer::Registrant, skipped);
+                crate::control::registration::skip_registrant_events(skipped);
                 let aors: Vec<String> = registrant
                     .list()
                     .into_iter()

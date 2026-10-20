@@ -35,6 +35,7 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod app_event;
 pub mod sip;
 pub mod verbs;
 

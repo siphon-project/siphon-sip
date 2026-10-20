@@ -449,15 +449,9 @@ impl PyContact {
         contact: &Contact,
         registrar: Option<&Registrar>,
     ) -> Self {
-        let received_string = contact.source_addr.map(|addr| {
-            // Build a SIP URI from source address + transport, matching the
-            // format OpenSIPS uses for its received_avp / $param(received).
-            let transport = contact
-                .source_transport
-                .unwrap_or(crate::transport::Transport::Udp)
-                .as_scheme();
-            format!("sip:{}:{};transport={}", addr.ip(), addr.port(), transport)
-        });
+        // The OpenSIPS received_avp / $param(received) shape, rendered once
+        // for the script and the control plane alike.
+        let received_string = contact.received_uri();
         let is_local_value = registrar
             .map(|registrar| registrar.is_local_contact(contact))
             .unwrap_or(false);
@@ -1730,6 +1724,33 @@ mod tests {
         assert!(contacts[0].uri().contains("10.0.0.1"));
         assert_eq!(contacts[0].q(), 1.0);
         assert!(contacts[0].expires() > 3500);
+    }
+
+    /// `Contact.received` and the control plane's `received` are one rendering:
+    /// a controller matches an INVITE's source against what a script saw.
+    #[test]
+    fn received_is_the_control_plane_received_byte_for_byte() {
+        let registrar = make_registrar();
+        registrar
+            .save_with_source(
+                "sip:alice@example.com",
+                SipUri::new("203.0.113.9".to_string()).with_user("alice".to_string()),
+                3600,
+                1.0,
+                "received-call".to_string(),
+                1,
+                Some("192.0.2.70:41001".parse().unwrap()),
+                Some(crate::transport::Transport::Tls),
+            )
+            .unwrap();
+        let contact = registrar.lookup("sip:alice@example.com").remove(0);
+        let script = PyContact::from_rust_contact(&contact);
+        let control = crate::control::registration::contact_payload(&contact);
+        assert_eq!(
+            script.received(),
+            Some("sip:192.0.2.70:41001;transport=tls")
+        );
+        assert_eq!(control["received"].as_str(), script.received());
     }
 
     /// The registrar half of the re-/de-REGISTER trust chain: a binding records

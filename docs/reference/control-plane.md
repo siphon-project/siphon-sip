@@ -314,6 +314,8 @@ what lets a refused verb be lined up against a capture, a CDR and HEP.
 | `stream_stop` | sip | `{mode?}` | detach the WebSocket audio tee (`mode: tee`, the default) or bridge |
 | `set_var` / `get_var` | — | `{key, value?}` | per-call variables (drain with the call) |
 | `resync` | — | — | re-attach + enumerate this app's owned calls |
+| `registrations` | — | `{after?, limit?}` | the registered AoRs with their contacts, a page at a time in AoR order, and the `seq` the set is current to; for an app subscribed to `registration` (otherwise `forbidden`). See [registration state](#registration-state-registrationchanged-and-registrations) |
+| `outbound_registrations` | — | `{after?, limit?}` | the outbound registrations' state, paged the same way, and its `seq`; for an app subscribed to `outbound_registration` (otherwise `forbidden`, `unavailable` without a `registrant:` block) |
 | `describe` | — | — | list the registered adapters + their verb/event schema |
 
 `route` is the consult-and-return flow: an app parks a call (deferred handover),
@@ -684,14 +686,10 @@ control:
       events: [registration]
 ```
 
-The frame carries no `channel`, `call_id` or `sip_call_id` — there is no call
-for it to be about — and its payload is
-`{aor, event, contacts: [{uri, expires, q}]}`, where `event` is `registered`,
-`refreshed`, `deregistered`, `expired` or `snapshot`. `snapshot` is not a
-change: when siphon's registration event task fell so far behind the registrar
-that events were lost, it re-reports every registered AoR with its current
-contacts under `snapshot` (an AoR whose bindings went away among the lost
-events is not in it). It reaches **every** connection of a
+The frame carries no `channel`, `call_id` or `sip_call_id`, since there is no
+call for it to be about. Its payload is described in
+[registration state](#registration-state-registrationchanged-and-registrations)
+below. It reaches **every** connection of a
 subscribed app rather than one picked round robin: a dashboard behind two
 replicas needs both to see it, and there is no call here whose ownership would
 decide which.
@@ -704,6 +702,89 @@ wait forever with nothing to tell it.
 
 It fires whether or not a `@registrar.on_change` handler is registered: a
 dashboard should not depend on a script existing.
+
+#### Registration state: `RegistrationChanged` and `registrations`
+
+The payload of a `RegistrationChanged`:
+
+| field | meaning |
+|---|---|
+| `seq` | per-process number, one higher on every `RegistrationChanged` siphon publishes (every subscribed app sees every one, so the numbers an app receives are contiguous unless one was lost) |
+| `aor` | the registered AoR, by its registrar key |
+| `event` | `registered`, `refreshed`, `deregistered`, `expired` or `snapshot`. `snapshot` is not a change: when siphon's registration event task fell so far behind the registrar that events were lost, it re-reports every registered AoR with its current contacts under `snapshot` |
+| `contacts` | the AoR's bindings now (empty once it has none), each as below |
+
+A contact:
+
+| field | meaning |
+|---|---|
+| `uri` | the Contact URI |
+| `expires` | seconds left on the binding |
+| `q` | its q-value |
+| `received` | where the REGISTER came from, `sip:<ip>:<port>;transport=<proto>`, byte for byte the script's `Contact.received`; `null` when the binding was stored without a source. This, not `uri`, is what an INVITE from the same phone comes from: the Contact can name a private address behind NAT, and over TCP or TLS the port names the connection |
+| `transport` | the transport the REGISTER arrived on (`udp`, `tcp`, `tls`, `ws`, `wss`), `null` when unknown |
+| `client_transport` | the transport the client used to reach a front that declared a different one (PROXY protocol); absent when nothing contradicted `transport` |
+| `instance` | the `+sip.instance` (RFC 5626), `null` when absent |
+| `reg_id` | the `reg-id` (RFC 5626), `null` when absent |
+| `path` | the binding's Path (RFC 3327), topmost first |
+| `call_id` / `cseq` | the Call-ID and CSeq number of the REGISTER that last wrote the binding |
+
+**Staying whole.** Events can be lost: a connection's queue drops its oldest
+event when it overflows (`slow_consumer: drop_oldest`), siphon's own event task
+can fall behind the registrar (siphon then numbers past the events it lost),
+and a controller that restarts misses whatever happened while it was away.
+Every loss shows as a gap in `seq`. The `registrations` verb answers with the
+registered AoRs and the `seq` they are current to, a page at a time:
+
+```json
+{"seq": 1042, "next": "sip:299@example.com",
+ "registrations": [{"aor": "sip:200@example.com", "contacts": [ ... ]}, ...]}
+```
+
+A page holds `limit` AoRs (default 500, at most 1000, since one reply is one
+WebSocket frame and a frame past the client's limit closes the connection), in
+AoR order; `next` is the `after` that asks for the following page, `null` on
+the last. On connecting, and on any gap, read every page, keep the **first**
+page's `seq`, replace your copy with the AoRs the pages listed (which also drops
+every AoR no longer registered), and apply only the events numbered above that
+`seq`. That is safe in any order: an event takes its
+number before it reads the state it reports and a page reads its number before
+the state, so any change the pages do not show comes in an event numbered above
+the first page's `seq`, and events applied in `seq` order end on the newest
+state of every AoR. Only an app subscribed to `registration` may ask (`forbidden`
+otherwise), since the set names every phone's source address.
+
+The SDKs read every page for you and return them merged with the first page's
+`seq`: Rust `SipClient::registrations()` / `outbound_registrations()`
+with the typed `AppEvent::registration()` / `registrant()`, Python
+`client.registrations()` / `client.outbound_registrations()`, TypeScript
+`sip.registrations()` / `sip.outboundRegistrations()`.
+
+A reply rather than a burst of `snapshot` events on connect: the reply is one
+frame and is never dropped, where a registrar's worth of events would land on a
+queue that drops its oldest, and a complete set says which AoRs are gone, which
+per-AoR events cannot.
+
+#### Outbound registrations: `RegistrantChanged`
+
+`events: [outbound_registration]` subscribes an app to the REGISTERs siphon
+itself sends to upstream registrars (`registrant:` and `registration.add()`),
+whether or not a `@registration.on_change` handler is registered:
+
+| field | meaning |
+|---|---|
+| `seq` | per-process number, its own sequence, as for `RegistrationChanged` |
+| `aor` | the registration's AoR |
+| `event` | `registered`, `refreshed`, `failed`, `deregistered` or `snapshot` (as above) |
+| `registrar` | the registrar it registers with, `null` once the registration was removed |
+| `state` | `unregistered`, `registering`, `challenging`, `registered` or `failed`, `null` once removed |
+| `expires_in` | seconds left on the binding the registrar granted, `0` when none |
+| `failure_count` | consecutive failed attempts |
+| `status_code` | the status of the last failed attempt (on `failed`, the one that failed it), `null` once an attempt succeeded |
+
+`outbound_registrations` answers with the registrations in the same shape,
+without `event`, paged like `registrations`:
+`{seq, next, registrations: [{aor, registrar, state, expires_in, failure_count, status_code}]}`.
 
 #### Dialog state of registered AoRs: `DialogStateChanged`
 

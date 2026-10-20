@@ -180,6 +180,56 @@ async fn drive_stub(mut socket: WebSocket, stub: Arc<Stub>) {
                 )
                 .await;
             }
+            // Two pages: the first names the second by `next`.
+            "registrations" if frame["args"]["after"].is_null() => {
+                send_ok(
+                    &mut socket,
+                    &id,
+                    serde_json::json!({
+                        "seq": 41,
+                        "next": "sip:200@example.com",
+                        "registrations": [{"aor": "sip:200@example.com", "contacts": []}]
+                    }),
+                )
+                .await;
+            }
+            "registrations" => {
+                assert_eq!(frame["args"]["after"], "sip:200@example.com");
+                send_ok(
+                    &mut socket,
+                    &id,
+                    serde_json::json!({
+                        "seq": 45,
+                        "next": null,
+                        "registrations": [{
+                            "aor": "sip:201@example.com",
+                            "contacts": [{
+                                "uri": "sip:201@203.0.113.40", "expires": 600, "q": 1.0,
+                                "received": "sip:192.0.2.50:41000;transport=tcp",
+                                "transport": "tcp", "instance": null, "reg_id": null,
+                                "path": [], "call_id": "reg-1", "cseq": 3
+                            }]
+                        }]
+                    }),
+                )
+                .await;
+            }
+            "outbound_registrations" => {
+                send_ok(
+                    &mut socket,
+                    &id,
+                    serde_json::json!({
+                        "seq": 7,
+                        "registrations": [{
+                            "aor": "sip:trunk@example.net",
+                            "registrar": "sip:registrar.example.net",
+                            "state": "failed", "expires_in": 0,
+                            "failure_count": 2, "status_code": 503
+                        }]
+                    }),
+                )
+                .await;
+            }
             // Test trigger: push a StasisStart, then ack.
             "test_push_stasis" => {
                 let event = serde_json::json!({
@@ -259,6 +309,37 @@ async fn hello_then_command_correlates_a_typed_reply() {
     // A substrate command round-trips.
     let value = client.describe().await.expect("describe ok");
     assert_eq!(value["adapters"][0]["module"], "sip");
+}
+
+#[tokio::test]
+async fn registration_state_verbs_return_typed_replies() {
+    let addr = start_stub(Arc::new(Stub::default())).await;
+    let client = SipClient::connect(client_config(addr))
+        .await
+        .expect("connect + hello");
+
+    let registrations = client.registrations().await.expect("registrations");
+    assert_eq!(registrations.seq, 41, "the first page's seq is kept");
+    assert_eq!(
+        registrations.registrations.len(),
+        2,
+        "both pages are merged"
+    );
+    assert_eq!(registrations.next, None);
+    let contact = &registrations.registrations[1].contacts[0];
+    assert_eq!(
+        contact.received.as_deref(),
+        Some("sip:192.0.2.50:41000;transport=tcp")
+    );
+    assert_eq!(contact.cseq, Some(3));
+
+    let outbound = client
+        .outbound_registrations()
+        .await
+        .expect("outbound registrations");
+    assert_eq!(outbound.seq, 7);
+    assert_eq!(outbound.registrations[0].status_code, Some(503));
+    assert_eq!(outbound.registrations[0].state.as_deref(), Some("failed"));
 }
 
 #[tokio::test]

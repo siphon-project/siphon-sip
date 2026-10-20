@@ -14,6 +14,9 @@
 pub mod aka;
 pub mod messages;
 pub mod source;
+mod status;
+
+pub use status::RegistrantStatus;
 
 use std::collections::HashMap;
 use std::fmt;
@@ -424,6 +427,8 @@ pub struct RegistrantEntry {
     pub call_id: String,
     /// Number of consecutive failures.
     pub failure_count: u32,
+    /// The status of the last failed attempt, cleared by a success.
+    pub last_failure_status: Option<u16>,
     /// When the last REGISTER was sent (for transaction timeout detection).
     pub last_sent_at: Option<Instant>,
     /// Who created this entry.
@@ -495,6 +500,7 @@ impl RegistrantEntry {
             nonce_counter: NonceCounter::new(),
             call_id: format!("reg-{}", uuid::Uuid::new_v4()),
             failure_count: 0,
+            last_failure_status: None,
             last_sent_at: None,
             origin: EntryOrigin::Script,
             source_fingerprint: None,
@@ -800,19 +806,6 @@ impl RegistrantManager {
             .collect()
     }
 
-    /// Get extended info for a single entry (used by dispatcher for event callbacks).
-    ///
-    /// Returns `(expires_in, failure_count, registrar_uri)`.
-    pub fn entry_info(&self, aor: &str) -> Option<(u64, u32, String)> {
-        self.entries.get(aor).map(|entry| {
-            (
-                entry.expires_in(),
-                entry.failure_count,
-                entry.registrar_uri.clone(),
-            )
-        })
-    }
-
     /// Force an immediate refresh for a specific AoR.
     pub fn refresh(&self, aor: &str) -> bool {
         if let Some(mut entry) = self.entries.get_mut(aor) {
@@ -943,6 +936,7 @@ impl RegistrantManager {
             entry.expires_at = Some(Instant::now() + Duration::from_secs(granted_expires as u64));
             entry.next_attempt = Instant::now() + refresh_at;
             entry.failure_count = 0;
+            entry.last_failure_status = None;
             entry.backoff = Duration::from_secs(5);
             entry.last_sent_at = None;
             info!(
@@ -974,6 +968,7 @@ impl RegistrantManager {
         if let Some(mut entry) = self.entries.get_mut(aor) {
             entry.state = RegistrantState::Failed;
             entry.failure_count += 1;
+            entry.last_failure_status = Some(status_code);
             entry.expires_at = None;
 
             // Exponential backoff capped at max_retry_interval.
@@ -2274,25 +2269,6 @@ mod tests {
         manager.remove("sip:nobody@carrier.com");
 
         assert!(receiver.try_recv().is_err());
-    }
-
-    #[test]
-    fn entry_info_returns_data() {
-        let manager = make_manager();
-        manager.add(make_entry("sip:alice@carrier.com"));
-        manager.handle_success("sip:alice@carrier.com", 3600);
-
-        let (expires_in, failure_count, registrar) =
-            manager.entry_info("sip:alice@carrier.com").unwrap();
-        assert!(expires_in > 0);
-        assert_eq!(failure_count, 0);
-        assert_eq!(registrar, "sip:registrar.carrier.com:5060");
-    }
-
-    #[test]
-    fn entry_info_none_for_missing() {
-        let manager = make_manager();
-        assert!(manager.entry_info("sip:nobody@carrier.com").is_none());
     }
 
     #[test]

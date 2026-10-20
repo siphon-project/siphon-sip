@@ -7967,8 +7967,9 @@ class MockRegistration:
             ``"failed"``, ``"deregistered"``, or ``"snapshot"``
           - ``state``: dict -- ``{"expires_in": int, "failure_count": int,
             "registrar": str, "state": str | None, "status_code": int}``
-            (``status_code`` only present when ``event_type`` is
-            ``"failed"``; ``state`` is the registration's current state,
+            (``status_code`` present when ``event_type`` is ``"failed"``,
+            and on a ``"snapshot"`` of a registration whose last attempt
+            failed; ``state`` is the registration's current state,
             ``"unregistered"``, ``"registering"``, ``"challenging"``,
             ``"registered"`` or ``"failed"``, ``None`` once it was removed)
 

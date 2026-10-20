@@ -239,28 +239,7 @@ pub(super) async fn deliver_registrar_change(
     // (`control.apps[].events`). Emitted before the Python short-circuit below
     // so it fires whether or not a `@registrar.on_change` handler is registered
     // — a dashboard should not depend on a script existing.
-    if crate::control::app_event_wanted("registration") {
-        let bindings: Vec<serde_json::Value> = registrar
-            .lookup(&aor)
-            .into_iter()
-            .map(|contact| {
-                serde_json::json!({
-                    "uri": contact.uri.to_string(),
-                    "expires": contact.remaining_seconds(),
-                    "q": contact.q,
-                })
-            })
-            .collect();
-        crate::control::notify_app_event(
-            "registration",
-            "RegistrationChanged",
-            serde_json::json!({
-                "aor": aor,
-                "event": event_type,
-                "contacts": bindings,
-            }),
-        );
-    }
+    crate::control::registration::publish_registration_change(&registrar, &aor, event_type);
 
     // Quick check if any handlers exist (avoids spawn_blocking overhead)
     if state
@@ -356,6 +335,15 @@ pub(super) async fn deliver_registrant_change(
         status_code: failed_status_code,
     } = change;
 
+    // Control applications that asked for the outbound_registration class,
+    // whether or not a script handles the change.
+    crate::control::registration::publish_registrant_change(
+        &registrant,
+        &aor,
+        event_type,
+        failed_status_code,
+    );
+
     // Quick check if any handlers exist (avoids spawn_blocking overhead)
     if state
         .engine
@@ -366,10 +354,21 @@ pub(super) async fn deliver_registrant_change(
         return;
     }
 
-    // Build state dict for the callback
-    let (expires_in, failure_count, registrar_uri) =
-        registrant.entry_info(&aor).unwrap_or((0, 0, String::new()));
-    let registration_state = registrant.state(&aor).map(|state| state.to_string());
+    // Build state dict for the callback. A snapshot carries the status of the
+    // last failed attempt, so it says why a failed trunk failed.
+    let status = registrant.status(&aor);
+    let expires_in = status.as_ref().map_or(0, |status| status.expires_in);
+    let failure_count = status.as_ref().map_or(0, |status| status.failure_count);
+    let registrar_uri = status
+        .as_ref()
+        .map(|status| status.registrar_uri.clone())
+        .unwrap_or_default();
+    let registration_state = status.as_ref().map(|status| status.state.to_string());
+    let failed_status_code = if event_type == super::registration_events::SNAPSHOT {
+        status.and_then(|status| status.last_failure_status)
+    } else {
+        failed_status_code
+    };
 
     // Invoke Python handlers in a blocking context
     run_event_handler("registrant.on_change", move || {

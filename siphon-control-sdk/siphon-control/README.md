@@ -58,6 +58,16 @@ async def on_app_event(event, payload):
         print(payload["aor"], payload["state"])   # early / confirmed / terminated
 ```
 
+`RegistrationChanged` (`events: [registration]`) and `RegistrantChanged`
+(`events: [outbound_registration]`) carry a `seq` that rises by one per event.
+On connecting, and whenever it skips a number, ask for the whole set and apply
+only events numbered above its `seq`:
+
+```python
+state = await client.registrations()          # {"seq": ..., "registrations": [...]}
+trunks = await client.outbound_registrations()
+```
+
 ### Per-call-connect
 
 ```python

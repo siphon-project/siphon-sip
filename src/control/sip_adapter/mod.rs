@@ -140,6 +140,9 @@ impl ControlAdapter for SipControlAdapter {
                 // deployment rather than a call, and only reaches an app that
                 // opted in with `control.apps[].events: [registration]`.
                 "RegistrationChanged".to_string(),
+                // The same for the REGISTERs siphon sends upstream, behind
+                // `events: [outbound_registration]`.
+                "RegistrantChanged".to_string(),
                 // Application-level too, behind `events: [dialog]`: the RFC
                 // 4235 state of each dialog of a registered AoR through siphon,
                 // B2BUA or proxy, as siphon observed it on the wire.

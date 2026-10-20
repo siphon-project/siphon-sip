@@ -36,6 +36,16 @@ export const DESCRIBE = "describe";
 export const SET_VAR = "set_var";
 /** Substrate verb: read a per-channel variable. */
 export const GET_VAR = "get_var";
+/**
+ * Substrate verb: every registered AoR and the `seq` the set is current to
+ * (the app must subscribe to `registration`).
+ */
+export const REGISTRATIONS = "registrations";
+/**
+ * Substrate verb: every outbound registration and its `seq` (the app must
+ * subscribe to `outbound_registration`).
+ */
+export const OUTBOUND_REGISTRATIONS = "outbound_registrations";
 
 /** The `type` discriminator on every frame. */
 export type FrameType = "command" | "reply" | "event";
@@ -263,6 +273,8 @@ export type SipEventKind =
   | "DialAnswered"
   | "DialFailed"
   | "DialogStateChanged"
+  | "RegistrationChanged"
+  | "RegistrantChanged"
   | (string & {});
 
 /** Parse a wire event name; unknown names pass through verbatim (forward-compatible). */
@@ -916,6 +928,100 @@ export interface DialogStateChangedPayload {
   /** The other end's tag, or `null` until known. */
   remote_tag: string | null;
   remote_identity: DialogIdentity;
+}
+
+/**
+ * One binding of a registered AoR, as `RegistrationChanged` and the
+ * `registrations` reply report it. Fields past `q` are absent from a server
+ * older than the one that added them.
+ */
+export interface RegistrationContact {
+  /** The Contact URI. */
+  uri: string;
+  /** Seconds left on the binding. */
+  expires: number;
+  /** Its q-value. */
+  q: number;
+  /**
+   * Where the REGISTER came from, `sip:<ip>:<port>;transport=<proto>`, byte for
+   * byte the script's `Contact.received`; `null` when unknown. This, not `uri`,
+   * is what an INVITE from the same phone comes from.
+   */
+  received?: string | null;
+  /** The transport the REGISTER arrived on. */
+  transport?: string | null;
+  /** The transport the client used to reach a front that declared a different one. */
+  client_transport?: string;
+  /** The `+sip.instance` (RFC 5626). */
+  instance?: string | null;
+  /** The `reg-id` (RFC 5626). */
+  reg_id?: number | null;
+  /** The binding's Path (RFC 3327), topmost first. */
+  path?: string[];
+  /** The Call-ID of the REGISTER that last wrote the binding. */
+  call_id?: string;
+  /** The CSeq number of the REGISTER that last wrote the binding. */
+  cseq?: number;
+}
+
+/**
+ * The `payload` of a `RegistrationChanged` event (`events: [registration]`).
+ * A gap in `seq` means events were lost: call
+ * {@link import("./sip").SipClient.registrations} and apply only events numbered
+ * above its `seq`.
+ */
+export interface RegistrationChangedPayload {
+  /** Per-process number, one higher per event published. */
+  seq?: number;
+  aor: string;
+  /**
+   * `registered`, `refreshed`, `deregistered`, `expired` or `snapshot` (a
+   * re-report after the server's event task fell behind, not a change).
+   */
+  event: string;
+  /** The AoR's bindings now; empty once it has none. */
+  contacts: RegistrationContact[];
+}
+
+/** The reply of `registrations`, one page in AoR order. */
+export interface RegistrationsReply {
+  /** Every event numbered at or below this is reflected here; across pages keep the first's. */
+  seq: number;
+  /** The registered AoRs of this page; over the whole set, one not listed has no binding. */
+  registrations: { aor: string; contacts: RegistrationContact[] }[];
+  /** The `after` that asks for the next page; `null` on the last. */
+  next?: string | null;
+}
+
+/** One outbound registration (a REGISTER the server sends upstream). */
+export interface OutboundRegistration {
+  aor: string;
+  /** The registrar it registers with; `null` once removed. */
+  registrar: string | null;
+  /** `unregistered`, `registering`, `challenging`, `registered` or `failed`; `null` once removed. */
+  state: string | null;
+  /** Seconds left on the granted binding, `0` when none. */
+  expires_in: number;
+  /** Consecutive failed attempts. */
+  failure_count: number;
+  /** The status of the last failed attempt, `null` once one succeeded. */
+  status_code: number | null;
+}
+
+/** The `payload` of a `RegistrantChanged` event (`events: [outbound_registration]`). */
+export interface RegistrantChangedPayload extends OutboundRegistration {
+  /** Per-process number, its own sequence. */
+  seq?: number;
+  /** `registered`, `refreshed`, `failed`, `deregistered` or `snapshot`. */
+  event: string;
+}
+
+/** The reply of `outbound_registrations`, paged like {@link RegistrationsReply}. */
+export interface OutboundRegistrationsReply {
+  seq: number;
+  registrations: OutboundRegistration[];
+  /** The `after` that asks for the next page; `null` on the last. */
+  next?: string | null;
 }
 
 /**
