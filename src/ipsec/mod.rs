@@ -444,8 +444,9 @@ impl std::fmt::Display for IntegrityAlgorithm {
 ///
 /// The four SAs cover two port pairs (client and server) in both directions:
 /// 1. UE:port_uc → PCSCF:port_ps, SPI=spi_ps (UE sends requests to P-CSCF server)
-/// 2. PCSCF:port_ps → UE:port_uc, SPI=spi_uc (P-CSCF replies from server port)
-/// 3. PCSCF:port_pc → UE:port_us, SPI=spi_us (P-CSCF sends requests from client port)
+/// 2. PCSCF:port_ps → UE:port_uc, SPI=spi_uc (P-CSCF replies on the UE's TCP connection)
+/// 3. PCSCF:port_pc → UE:port_us, SPI=spi_us (P-CSCF sends requests, and UDP
+///    responses, from its client port: TS 33.203 clause 7.1)
 /// 4. UE:port_us → PCSCF:port_pc, SPI=spi_pc (UE replies to P-CSCF client port)
 #[derive(Debug, Clone)]
 pub struct SecurityAssociationPair {
@@ -529,6 +530,39 @@ pub struct SecurityAssociationPair {
     /// that set this pair up, which a later `Security-Verify` must mirror.
     /// `None` until that 401 is relayed, and for a pair installed without one.
     pub security_server: Option<String>,
+}
+
+/// Where a UDP response to a UE goes, from [`IpsecManager::udp_response_flow`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UdpResponseFlow {
+    /// The destination is not the client port of a P-CSCF pair: send as is.
+    NotProtected,
+    /// Send from the P-CSCF's protected client port to the UE's protected
+    /// server port (TS 33.203 clause 7.1).
+    Protected {
+        local: std::net::SocketAddr,
+        destination: std::net::SocketAddr,
+    },
+    /// The pair's selector does not admit UDP, so no UDP response can reach
+    /// the UE over it.
+    Unusable(SaProtocol),
+}
+
+impl SecurityAssociationPair {
+    /// [`IpsecManager::udp_response_flow`] for this pair.
+    pub fn udp_response_flow(&self) -> UdpResponseFlow {
+        if self.role != SaRole::PCscf {
+            // Siphon is the UE here and answers from its own client port.
+            return UdpResponseFlow::NotProtected;
+        }
+        if self.protocol == SaProtocol::Tcp {
+            return UdpResponseFlow::Unusable(self.protocol);
+        }
+        UdpResponseFlow::Protected {
+            local: std::net::SocketAddr::new(self.pcscf_addr, self.pcscf_port_c),
+            destination: std::net::SocketAddr::new(self.ue_addr, self.ue_port_s),
+        }
+    }
 }
 
 /// A row of the SA-liveness snapshot ([`IpsecManager::liveness_snapshot`]):
@@ -1294,6 +1328,30 @@ impl IpsecManager {
         self.associations
             .get(&Self::contact_key(ue_addr, ue_port_c))
             .map(|entry| entry.value().clone())
+    }
+
+    /// Where a UDP response siphon would send to `destination`, the client
+    /// port a UE sent its request from, must go instead.
+    ///
+    /// 3GPP TS 33.203 clause 7.1, UDP case: the P-CSCF "sends requests and
+    /// responses protected with ESP to a UE on the port port_pc", and the UE
+    /// "receives requests and responses protected with ESP on the port
+    /// port_us" and "sends requests and responses ... on the port port_uc".
+    /// So a request that arrived on (port_uc -> port_ps) is answered on
+    /// (port_pc -> port_us), never back to its source port (TS 24.229
+    /// clause 5.2.2.2 NOTE 3). TCP is untouched: there the response goes on
+    /// the connection the request arrived on.
+    ///
+    /// Keyed on the pair's `(ue_addr, ue_port_c)`, so it is one map lookup
+    /// and the pair a re-registration set up answers from its own entry.
+    pub fn udp_response_flow(&self, destination: std::net::SocketAddr) -> UdpResponseFlow {
+        let Some(entry) = self
+            .associations
+            .get(&Self::contact_key(&destination.ip(), destination.port()))
+        else {
+            return UdpResponseFlow::NotProtected;
+        };
+        entry.value().udp_response_flow()
     }
 
     /// Find an SA pair where the given UE address sends from either of
@@ -2986,5 +3044,116 @@ mod tests {
         let reaped = manager.sweep_expired_reaped().await;
         assert_eq!(reaped, vec![(abandoned, 6920)]);
         assert!(!manager.has_sa(&abandoned, 6920));
+    }
+
+    // --- UDP response flow (3GPP TS 33.203 clause 7.1, UDP case) ---
+
+    fn sock(text: &str) -> std::net::SocketAddr {
+        text.parse().expect("a socket address literal")
+    }
+
+    /// A request the UE sent from port_uc to port_ps is answered from port_pc
+    /// to port_us: the P-CSCF "sends requests and responses protected with
+    /// ESP to a UE on the port port_pc" and the UE "receives requests and
+    /// responses protected with ESP on the port port_us".
+    #[test]
+    fn udp_response_to_the_client_port_goes_from_port_pc_to_port_us() {
+        let manager = IpsecManager::new();
+        let ue = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 30));
+        insert_test_pair(&manager, test_sa_pair(ue, 6100, 7_000));
+
+        assert_eq!(
+            manager.udp_response_flow(sock("198.51.100.30:6100")),
+            UdpResponseFlow::Protected {
+                local: sock("192.0.2.1:5064"),
+                destination: sock("198.51.100.30:6101"),
+            }
+        );
+    }
+
+    /// The pair is found by the client port the request came from, so a
+    /// re-registration's new pair (new port_uc, same port_us) answers on its
+    /// own entry and an unrelated address is left alone.
+    #[test]
+    fn udp_response_flow_is_keyed_on_the_ue_client_port() {
+        let manager = IpsecManager::new();
+        let ue = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 31));
+        insert_test_pair(&manager, test_sa_pair(ue, 6100, 7_100));
+
+        assert_eq!(
+            manager.udp_response_flow(sock("198.51.100.31:6101")),
+            UdpResponseFlow::NotProtected,
+            "port_us is already where the UE listens"
+        );
+        assert_eq!(
+            manager.udp_response_flow(sock("198.51.100.32:6100")),
+            UdpResponseFlow::NotProtected,
+            "no pair for this UE"
+        );
+    }
+
+    /// A pair whose selector admits TCP only cannot carry a UDP response at
+    /// all, so it is reported rather than silently readdressed.
+    #[test]
+    fn a_tcp_only_pair_reports_that_it_cannot_carry_a_udp_response() {
+        let manager = IpsecManager::new();
+        let ue = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 33));
+        let mut sa = test_sa_pair(ue, 6100, 7_200);
+        sa.protocol = SaProtocol::Tcp;
+        insert_test_pair(&manager, sa);
+
+        assert_eq!(
+            manager.udp_response_flow(sock("198.51.100.33:6100")),
+            UdpResponseFlow::Unusable(SaProtocol::Tcp)
+        );
+    }
+
+    /// A UDP-only pair readdresses like the default any-protocol pair.
+    #[test]
+    fn a_udp_only_pair_is_readdressed() {
+        let manager = IpsecManager::new();
+        let ue = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 34));
+        let mut sa = test_sa_pair(ue, 6100, 7_300);
+        sa.protocol = SaProtocol::Udp;
+        insert_test_pair(&manager, sa);
+
+        assert!(matches!(
+            manager.udp_response_flow(sock("198.51.100.34:6100")),
+            UdpResponseFlow::Protected { .. }
+        ));
+    }
+
+    /// Siphon acting as the UE answers from its own client port (TS 33.203
+    /// clause 7.1: the UE "sends requests and responses ... on the port
+    /// port_uc"), so a UE-role pair is never readdressed.
+    #[test]
+    fn a_ue_role_pair_is_not_readdressed() {
+        let manager = IpsecManager::new();
+        let ue = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 35));
+        let mut sa = test_sa_pair(ue, 6100, 7_400);
+        sa.role = SaRole::Ue;
+        insert_test_pair(&manager, sa);
+
+        assert_eq!(
+            manager.udp_response_flow(sock("198.51.100.35:6100")),
+            UdpResponseFlow::NotProtected
+        );
+    }
+
+    #[test]
+    fn udp_response_flow_handles_ipv6_pairs() {
+        let manager = IpsecManager::new();
+        let ue: IpAddr = "2001:db8::30".parse().expect("an address");
+        let mut sa = test_sa_pair(ue, 6100, 7_500);
+        sa.pcscf_addr = "2001:db8::1".parse().expect("an address");
+        insert_test_pair(&manager, sa);
+
+        assert_eq!(
+            manager.udp_response_flow(sock("[2001:db8::30]:6100")),
+            UdpResponseFlow::Protected {
+                local: sock("[2001:db8::1]:5064"),
+                destination: sock("[2001:db8::30]:6101"),
+            }
+        );
     }
 }

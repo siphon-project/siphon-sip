@@ -65,10 +65,10 @@ pub enum GatewayBackendType {
 /// The query is the operator's. Columns are read by name: `group` (or
 /// `group_name`) and `uri` are required; `address`, `transport`, `weight`,
 /// `priority`, `username`, `password`, `ha1`, `ha1_algorithm`,
-/// `source_networks`, `enabled`, `registers` and `require_registration` are
-/// optional. When the statement references `$1`, the instance id
-/// (`server.instance_id`) is bound to it, so a deployment can shard its
-/// gateways across nodes.
+/// `source_networks`, `enabled`, `registers`, `require_registration` and
+/// `verify_server` are optional. When the statement references `$1`, the
+/// instance id (`server.instance_id`) is bound to it, so a deployment can shard
+/// its gateways across nodes.
 #[derive(Debug, Deserialize, Clone)]
 pub struct GatewayDatabaseConfig {
     /// libpq connection URI.
@@ -193,6 +193,11 @@ pub struct GatewayGroupConfig {
     /// ```
     #[serde(default)]
     pub inbound_limit: Option<super::InboundLimitConfig>,
+    /// Verify the server certificate on outbound TLS connections to this
+    /// group's destinations (see `tls.verify_server`), for each destination
+    /// that does not set its own. Unset: `tls.verify_server` decides.
+    #[serde(default)]
+    pub verify_server: Option<bool>,
 }
 
 impl GatewayGroupConfig {
@@ -321,6 +326,13 @@ pub struct GatewayDestConfig {
     /// registered peer, where dialling it unregistered just earns a 403.
     #[serde(default)]
     pub require_registration: bool,
+    /// Verify this destination's server certificate on outbound TLS: the chain
+    /// against `tls.server_ca` (or the bundled Mozilla roots), and the host of
+    /// `uri` as a SIP domain (RFC 5922 §7), or an iPAddress subjectAltName for
+    /// an IP-literal `uri`. Wins over the group's `verify_server` and over
+    /// `tls.verify_server`. Unset: the group, then `tls.verify_server`, decide.
+    #[serde(default)]
+    pub verify_server: Option<bool>,
 }
 
 /// Digest credentials for one gateway destination.

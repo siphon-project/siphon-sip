@@ -134,6 +134,7 @@ async fn send_via_pool(
 ) {
     let destination = outbound.destination;
     let server_name = outbound.server_name.clone();
+    let verify_server = outbound.verify_server;
     let requested_connection_id = outbound.connection_id;
     let source = pool_tcp_source(outbound.source_local_addr, destination, is_protected);
     let tls_listener = outbound
@@ -148,12 +149,23 @@ async fn send_via_pool(
             // that listener, so the peer sees the address it is advertised.
             Transport::Tls => match tls_listener {
                 Some(listener) => {
-                    pool.send_tls_from(listener, destination, server_name.as_deref(), frame)
-                        .await
+                    pool.send_tls_from(
+                        listener,
+                        destination,
+                        server_name.as_deref(),
+                        verify_server,
+                        frame,
+                    )
+                    .await
                 }
                 None => {
-                    pool.send_tls(destination, server_name.as_deref(), frame)
-                        .await
+                    pool.send_tls_with_policy(
+                        destination,
+                        server_name.as_deref(),
+                        verify_server,
+                        frame,
+                    )
+                    .await
                 }
             },
             Transport::Tcp => match source {
@@ -1131,6 +1143,7 @@ mod tests {
                 data: Bytes::from_static(b"OPTIONS sip:ue.example.invalid SIP/2.0\r\n\r\n"),
                 source_local_addr: Some(source),
                 server_name: None,
+                verify_server: None,
                 followups: None,
             })
             .unwrap();
@@ -1154,6 +1167,7 @@ mod tests {
             data: Bytes::from_static(b"OPTIONS sip:ue.example.invalid SIP/2.0\r\n\r\n"),
             source_local_addr: None,
             server_name: None,
+            verify_server: None,
             followups: None,
         }
     }

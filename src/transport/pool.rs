@@ -20,7 +20,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use arc_swap::ArcSwap;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use arc_swap::{ArcSwap, ArcSwapOption};
 use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -93,11 +95,19 @@ const ENQUEUE_TIMEOUT: Duration = Duration::from_millis(250);
 /// pooled connection — reusing the wrong source, or hitting `EADDRNOTAVAIL`
 /// when a rebind conflicts on the 4-tuple.  `None` means "no explicit bind"
 /// (the OS picks the source — the default TLS outbound path).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+///
+/// `verified_name` keeps a TLS connection whose server was verified apart from
+/// one that was not, and apart from one verified for another name at the same
+/// address: `None` for an unverified connection (and every TCP one), else the
+/// name the server's certificate was checked against. Without it a per-destination
+/// `verify_server` would be bypassed by reusing whatever connection an
+/// unverified send had already opened to the same address.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct PoolKey {
     destination: SocketAddr,
     transport: Transport,
     bind: Option<SocketAddr>,
+    verified_name: Option<Arc<str>>,
 }
 
 /// A pooled outbound connection.
@@ -136,6 +146,14 @@ pub struct ConnectionPool {
     /// `send_tls_inner`; replaced atomically by the client-cert watcher spawned
     /// from [`ConnectionPool::spawn_client_cert_hot_reload`].
     tls_connector: ArcSwap<TlsConnector>,
+    /// The verifying twin of `tls_connector`, for a send whose destination (or
+    /// `tls.verify_server`) asks for server verification. `None` until
+    /// [`with_tls_configs`](Self::with_tls_configs) installs one, and a send
+    /// that wants verification without it is refused, never downgraded.
+    verified_tls_connector: ArcSwapOption<TlsConnector>,
+    /// `tls.verify_server`: whether a send naming no policy of its own is
+    /// verified. Swapped together with the connectors.
+    verify_by_default: AtomicBool,
     /// Unified stream-connection registry — the pool registers the outbound
     /// TLS connections it creates here (tagged `Transport::Tls`) so the
     /// dispatcher can reuse them for inbound routing (e.g., INVITEs to
@@ -170,186 +188,12 @@ pub struct ConnectionPool {
     holds: ConnectionHolds,
 }
 
-/// A client identity siphon presents on OUTBOUND TLS connections when the
-/// upstream peer requests one (mutual TLS — SIP trunks that require
-/// client-certificate auth, e.g. carrier interconnects).
-///
-/// Owned (`'static`) so it can be moved into the long-lived `ClientConfig`.
-pub struct OutboundClientIdentity {
-    pub chain: Vec<tokio_rustls::rustls::pki_types::CertificateDer<'static>>,
-    pub key: tokio_rustls::rustls::pki_types::PrivateKeyDer<'static>,
-}
-
-/// Load an [`OutboundClientIdentity`] from a PEM certificate-chain path and a
-/// PEM private-key path.
-///
-/// Mirrors the loading/validation in [`crate::transport::tls::build_tls_acceptor`]:
-/// the files must be readable, the chain must contain at least one certificate,
-/// and the key must parse. Returns a clear `io::Error` otherwise.
-pub fn load_outbound_client_identity(
-    certificate_path: &str,
-    private_key_path: &str,
-) -> Result<OutboundClientIdentity, std::io::Error> {
-    use std::fs::File;
-    use std::io::BufReader;
-    use tokio_rustls::rustls::pki_types::pem::PemObject;
-    use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
-
-    let cert_file = File::open(certificate_path).map_err(|error| {
-        std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!("failed to open outbound client certificate '{certificate_path}': {error}"),
-        )
-    })?;
-    let chain: Vec<CertificateDer<'static>> =
-        CertificateDer::pem_reader_iter(&mut BufReader::new(cert_file))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("failed to parse outbound client certificate PEM: {error}"),
-                )
-            })?;
-    if chain.is_empty() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "outbound client certificate file contains no certificates",
-        ));
-    }
-
-    let key_file = File::open(private_key_path).map_err(|error| {
-        std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!("failed to open outbound client private key '{private_key_path}': {error}"),
-        )
-    })?;
-    let key =
-        PrivateKeyDer::from_pem_reader(&mut BufReader::new(key_file)).map_err(
-            |error| match error {
-                tokio_rustls::rustls::pki_types::pem::Error::NoItemsFound => std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "outbound client private key file contains no private key",
-                ),
-                other => std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("failed to parse outbound client private key PEM: {other}"),
-                ),
-            },
-        )?;
-
-    Ok(OutboundClientIdentity { chain, key })
-}
-
-/// Build a permissive TLS client config that accepts any server certificate.
-///
-/// SIP trunks and interconnect peers rarely present certificates chained to
-/// public CAs, so we disable server verification by default (same as
-/// OpenSIPS/Kamailio `tls_verify_server = 0`). Server verification is
-/// unchanged; the only variable is whether siphon presents a *client*
-/// certificate when the peer requests one (mutual TLS).
-///
-/// When `identity` is `Some`, siphon presents that client certificate chain +
-/// key; when `None`, no client certificate is presented (prior behavior).
-///
-/// `method` is the `tls.method` floor, applied here as well as on the inbound
-/// acceptor: it is one process-wide statement about which TLS versions siphon
-/// speaks, so `TLSv1_3` refuses to *dial* a TLS 1.2 trunk just as it refuses to
-/// accept a TLS 1.2 client. Without a `tls:` block the default floor (1.2)
-/// applies, which is what outbound TLS has always negotiated.
-pub fn build_outbound_tls_config(
-    identity: Option<OutboundClientIdentity>,
-    method: TlsMethod,
-) -> Result<Arc<tokio_rustls::rustls::ClientConfig>, std::io::Error> {
-    use tokio_rustls::rustls;
-
-    let builder = rustls::ClientConfig::builder_with_protocol_versions(
-        crate::transport::tls::protocol_versions(method),
-    )
-    .dangerous()
-    .with_custom_certificate_verifier(Arc::new(NoVerify));
-
-    let config = match identity {
-        Some(identity) => builder
-            .with_client_auth_cert(identity.chain, identity.key)
-            .map_err(|error| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("failed to build outbound client-auth TLS config: {error}"),
-                )
-            })?,
-        None => builder.with_no_client_auth(),
-    };
-
-    Ok(Arc::new(config))
-}
-
-/// Resolve the TLS `ServerName` (SNI / certificate hostname) for an outbound
-/// handshake.
-///
-/// When `sni` is `Some(host)`, the hostname is used verbatim — RFC 6066 SNI is
-/// emitted so a hostname-vhost front-end (an upstream SIP trunk) can route
-/// the handshake. When `None`, the destination IP literal
-/// is used; rustls sends no SNI for an IP literal (RFC 6066).
-fn resolve_server_name(
-    destination: SocketAddr,
-    sni: Option<&str>,
-) -> Result<tokio_rustls::rustls::pki_types::ServerName<'static>, std::io::Error> {
-    use tokio_rustls::rustls::pki_types::ServerName;
-    let name = match sni {
-        Some(host) => host.to_owned(),
-        None => destination.ip().to_string(),
-    };
-    ServerName::try_from(name)
-        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))
-}
-
-/// Certificate verifier that accepts any server certificate (no verification).
-#[derive(Debug)]
-struct NoVerify;
-
-impl tokio_rustls::rustls::client::danger::ServerCertVerifier for NoVerify {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &tokio_rustls::rustls::pki_types::CertificateDer<'_>,
-        _intermediates: &[tokio_rustls::rustls::pki_types::CertificateDer<'_>],
-        _server_name: &tokio_rustls::rustls::pki_types::ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: tokio_rustls::rustls::pki_types::UnixTime,
-    ) -> Result<tokio_rustls::rustls::client::danger::ServerCertVerified, tokio_rustls::rustls::Error>
-    {
-        Ok(tokio_rustls::rustls::client::danger::ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &tokio_rustls::rustls::pki_types::CertificateDer<'_>,
-        _dss: &tokio_rustls::rustls::DigitallySignedStruct,
-    ) -> Result<
-        tokio_rustls::rustls::client::danger::HandshakeSignatureValid,
-        tokio_rustls::rustls::Error,
-    > {
-        Ok(tokio_rustls::rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        _message: &[u8],
-        _cert: &tokio_rustls::rustls::pki_types::CertificateDer<'_>,
-        _dss: &tokio_rustls::rustls::DigitallySignedStruct,
-    ) -> Result<
-        tokio_rustls::rustls::client::danger::HandshakeSignatureValid,
-        tokio_rustls::rustls::Error,
-    > {
-        Ok(tokio_rustls::rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<tokio_rustls::rustls::SignatureScheme> {
-        tokio_rustls::rustls::crypto::ring::default_provider()
-            .signature_verification_algorithms
-            .supported_schemes()
-    }
-}
+pub use crate::transport::outbound_tls::{
+    build_outbound_tls_config, load_outbound_client_identity, OutboundClientIdentity,
+};
+use crate::transport::outbound_tls::{
+    build_outbound_tls_configs, resolve_server_name, OutboundTlsConfigs, ServerVerification,
+};
 
 /// Outcome of the coalesced-establishment step, carried out of the
 /// per-destination lock so the enqueue can happen with the guard released.
@@ -443,6 +287,8 @@ impl ConnectionPool {
             local_addr,
             tos,
             tls_connector: ArcSwap::from_pointee(TlsConnector::from(tls_client_config)),
+            verified_tls_connector: ArcSwapOption::empty(),
+            verify_by_default: AtomicBool::new(false),
             stream_connections,
             crlf_pong_tracker,
             connect_timeout: TCP_CONNECT_TIMEOUT,
@@ -507,6 +353,7 @@ impl ConnectionPool {
             destination,
             transport: Transport::Tcp,
             bind: Some(bind_addr),
+            verified_name: None,
         };
 
         // At most two attempts: the second exists only for the race where the
@@ -538,7 +385,7 @@ impl ConnectionPool {
             // the result.
             let connect_lock = self
                 .connect_locks
-                .entry(key)
+                .entry(key.clone())
                 .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
                 .clone();
             let coalesced = {
@@ -553,8 +400,13 @@ impl ConnectionPool {
                     // peer became a per-destination stall.
                     Some(existing) => Coalesced::Reuse(existing),
                     None => Coalesced::Established(
-                        self.establish_tcp_connection(key, bind_addr, destination, data.clone())
-                            .await,
+                        self.establish_tcp_connection(
+                            key.clone(),
+                            bind_addr,
+                            destination,
+                            data.clone(),
+                        )
+                        .await,
                     ),
                 }
             };
@@ -736,7 +588,7 @@ impl ConnectionPool {
         let inbound_tx = self.inbound_tx.clone();
         let conn_map = self.connection_map.clone();
         let connections = self.connections.clone();
-        let key_for_cleanup = key;
+        let key_for_cleanup = key.clone();
         let keepalive_writer = write_tx.clone();
         let crlf_pong_tracker = self.crlf_pong_tracker.clone();
         let idle_timeout = self.idle_timeout;
@@ -928,10 +780,14 @@ impl ConnectionPool {
     ///
     /// `server_name` is the SNI / certificate hostname to present in the TLS
     /// handshake. When `Some(host)`, that hostname is used (RFC 6066 SNI is
-    /// emitted, letting a hostname-vhost front-end route the handshake — and
-    /// server-certificate hostname validation, if ever enabled, would match).
-    /// When `None`, the destination IP literal is used (RFC 6066 forbids SNI
-    /// for IP literals, so none is sent — prior behavior).
+    /// emitted, letting a hostname-vhost front-end route the handshake, and it
+    /// is the name a verified server's certificate is checked against). When
+    /// `None`, the destination IP literal is used (RFC 6066 forbids SNI for IP
+    /// literals, so none is sent — prior behavior).
+    ///
+    /// The server is verified when `tls.verify_server` says so; see
+    /// [`send_tls_with_policy`](Self::send_tls_with_policy) for a destination
+    /// that carries its own setting.
     ///
     /// Returns the `ConnectionId` used (so responses can be correlated).
     pub async fn send_tls(
@@ -940,8 +796,28 @@ impl ConnectionPool {
         server_name: Option<&str>,
         data: Bytes,
     ) -> Result<ConnectionId, std::io::Error> {
-        self.send_tls_inner(None, destination, server_name, data)
+        self.send_tls_inner(None, destination, server_name, None, data)
             .await
+    }
+
+    /// [`send_tls`](Self::send_tls) with the destination's own server
+    /// verification setting: `Some(true)` verifies, `Some(false)` does not,
+    /// `None` follows `tls.verify_server` ([`verifies`](Self::verifies)).
+    pub async fn send_tls_with_policy(
+        &self,
+        destination: SocketAddr,
+        server_name: Option<&str>,
+        verify_server: Option<bool>,
+        data: Bytes,
+    ) -> Result<ConnectionId, std::io::Error> {
+        self.send_tls_inner(None, destination, server_name, verify_server, data)
+            .await
+    }
+
+    /// Whether a send whose destination says `verify_server` about server
+    /// verification is verified: its own setting, else `tls.verify_server`.
+    pub fn verifies(&self, verify_server: Option<bool>) -> bool {
+        verify_server.unwrap_or_else(|| self.verify_by_default.load(Ordering::Relaxed))
     }
 
     /// Send over TLS from `listener` (a script `send_socket=` egress pin): the
@@ -950,15 +826,67 @@ impl ConnectionPool {
     /// `TIME_WAIT`). The listener is the pool key's source, so two listeners
     /// sharing an IP keep separate connections, and the connection is recorded
     /// as that listener's: its traffic advertises the listener's identity.
+    /// `verify_server` as for [`send_tls_with_policy`](Self::send_tls_with_policy).
     pub async fn send_tls_from(
         &self,
         listener: SocketAddr,
         destination: SocketAddr,
         server_name: Option<&str>,
+        verify_server: Option<bool>,
         data: Bytes,
     ) -> Result<ConnectionId, std::io::Error> {
-        self.send_tls_inner(Some(listener), destination, server_name, data)
-            .await
+        self.send_tls_inner(
+            Some(listener),
+            destination,
+            server_name,
+            verify_server,
+            data,
+        )
+        .await
+    }
+
+    /// The pool key a TLS send lands under.
+    ///
+    /// A verified send is keyed by the name it verifies, so it never picks up
+    /// an unverified connection, or one verified for another name, to the same
+    /// address. One that routed by address alone (no name: an in-dialog request
+    /// to where the dialog's peer is, a response reconnect) takes a connection
+    /// already verified to that destination under whatever name it was opened
+    /// for, which is the peer the dialog was set up with. Only with none does
+    /// it verify the destination's IP literal.
+    fn tls_key(
+        &self,
+        bind: Option<SocketAddr>,
+        destination: SocketAddr,
+        server_name: Option<&str>,
+        verify: bool,
+    ) -> PoolKey {
+        let key = PoolKey {
+            destination,
+            transport: Transport::Tls,
+            bind,
+            verified_name: verify.then(|| {
+                Arc::from(crate::transport::outbound_tls::expected_server_name(
+                    destination,
+                    server_name,
+                ))
+            }),
+        };
+        if !verify || server_name.is_some() || self.connections.contains_key(&key) {
+            return key;
+        }
+        self.connections
+            .iter()
+            .find(|entry| {
+                let candidate = entry.key();
+                candidate.destination == destination
+                    && candidate.transport == Transport::Tls
+                    && candidate.bind == bind
+                    && candidate.verified_name.is_some()
+                    && !entry.value().sender.is_closed()
+            })
+            .map(|entry| entry.key().clone())
+            .unwrap_or(key)
     }
 
     async fn send_tls_inner(
@@ -966,13 +894,11 @@ impl ConnectionPool {
         listener: Option<SocketAddr>,
         destination: SocketAddr,
         server_name: Option<&str>,
+        verify_server: Option<bool>,
         data: Bytes,
     ) -> Result<ConnectionId, std::io::Error> {
-        let key = PoolKey {
-            destination,
-            transport: Transport::Tls,
-            bind: listener,
-        };
+        let verify = self.verifies(verify_server);
+        let key = self.tls_key(listener, destination, server_name, verify);
 
         // Try existing connection first.  Bounded, and with the sender cloned
         // out of the map so no shard guard is held across the await — same
@@ -987,6 +913,26 @@ impl ConnectionPool {
                 }
             }
         }
+
+        // The connector, read once per new connection so a hot-reloaded client
+        // certificate is presented on fresh handshakes (an Arc load, only on
+        // establishment). Chosen before connecting: a send that wants the
+        // server verified and has no verifying config is refused outright,
+        // never downgraded to an unverified handshake.
+        let connector = if verify {
+            match self.verified_tls_connector.load_full() {
+                Some(connector) => connector,
+                None => {
+                    error!(destination = %destination, "pool: TLS server verification requested but no verifying client config is installed; refusing the connection");
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "TLS server verification requested but not configured",
+                    ));
+                }
+            }
+        } else {
+            self.tls_connector.load_full()
+        };
 
         // Create new TCP connection, then wrap with TLS handshake.
         // The default outbound path does NOT bind a specific local port — the
@@ -1033,21 +979,33 @@ impl ConnectionPool {
         };
         configure_tcp_socket(&tcp_stream, self.tos);
 
-        // TLS handshake — SNI/certificate hostname from `server_name` when the
-        // relay resolved a hostname; else the destination IP literal.
-        //
-        // Read the live connector once per new connection so a hot-reloaded
-        // outbound client certificate is presented on fresh handshakes
-        // (Arc load — negligible; only on establishment, never per message).
-        let handshake_name = resolve_server_name(destination, server_name)?;
-        let connector = self.tls_connector.load_full();
+        // TLS handshake — SNI/certificate name from `server_name` when the relay
+        // resolved a hostname; else the destination IP literal. A verified
+        // connection presents the name its key verifies, which for an
+        // address-routed send reusing a verified key is that key's name.
+        let handshake_name =
+            resolve_server_name(destination, key.verified_name.as_deref().or(server_name))?;
         let tls_stream = match tokio::time::timeout(
             self.connect_timeout,
             connector.connect(handshake_name, tcp_stream),
         )
         .await
         {
-            Ok(result) => result?,
+            Ok(Ok(stream)) => stream,
+            Ok(Err(error)) => {
+                // A refused certificate is the case worth naming: the request
+                // fails as any connect failure does, and this line is the only
+                // place that says it was the peer's identity, not its reachability.
+                if verify {
+                    warn!(
+                        destination = %destination,
+                        server_name = key.verified_name.as_deref().unwrap_or_default(),
+                        %error,
+                        "pool: outbound TLS server verification failed; connection refused"
+                    );
+                }
+                return Err(error);
+            }
             Err(_) => {
                 warn!(destination = %destination, timeout = ?self.connect_timeout, "pool: TLS handshake timed out");
                 return Err(std::io::Error::new(
@@ -1096,7 +1054,7 @@ impl ConnectionPool {
         let conn_map = self.connection_map.clone();
         let connections = self.connections.clone();
         let stream_connections = self.stream_connections.clone();
-        let key_for_cleanup = key;
+        let key_for_cleanup = key.clone();
         let keepalive_writer = write_tx.clone();
         let crlf_pong_tracker = self.crlf_pong_tracker.clone();
         tokio::spawn(async move {
@@ -1238,12 +1196,20 @@ impl ConnectionPool {
 
         // Store in pool
         self.connections.insert(
-            key,
+            key.clone(),
             PoolEntry {
                 connection_id,
                 sender: write_tx,
             },
         );
+        // A peer that closes straight after the first message can end the read
+        // task before the insert above, and its eviction then found nothing to
+        // remove. The reader leaves the connection map before it evicts, so a
+        // connection already gone from it is a dead entry: drop it now rather
+        // than leave it in the pool until the next send to this key trips on it.
+        if !self.connection_map.contains_key(&connection_id) {
+            evict_if_current(&self.connections, &key, connection_id);
+        }
 
         Ok(connection_id)
     }
@@ -1268,20 +1234,31 @@ impl ConnectionPool {
     ///
     /// The pool opens only TCP and TLS connections, so every other transport
     /// is `false`.
+    ///
+    /// A default TLS send can land under a verified or an unverified key, so
+    /// for TLS any open default-source connection to `destination` counts.
     pub fn has_live(&self, destination: SocketAddr, transport: Transport) -> bool {
-        let bind = match transport {
-            Transport::Tcp => Some(self.default_tcp_bind()),
-            Transport::Tls => None,
-            _ => return false,
-        };
-        let key = PoolKey {
-            destination,
-            transport,
-            bind,
-        };
-        self.connections
-            .get(&key)
-            .is_some_and(|entry| !entry.sender.is_closed())
+        match transport {
+            Transport::Tcp => {
+                let key = PoolKey {
+                    destination,
+                    transport,
+                    bind: Some(self.default_tcp_bind()),
+                    verified_name: None,
+                };
+                self.connections
+                    .get(&key)
+                    .is_some_and(|entry| !entry.sender.is_closed())
+            }
+            Transport::Tls => self.connections.iter().any(|entry| {
+                let key = entry.key();
+                key.destination == destination
+                    && key.transport == Transport::Tls
+                    && key.bind.is_none()
+                    && !entry.value().sender.is_closed()
+            }),
+            _ => false,
+        }
     }
 
     /// The bind address of a default outbound TCP connection: the local IP
@@ -1372,9 +1349,28 @@ impl ConnectionPool {
         self.idle_timeout = idle_timeout;
     }
 
-    /// Atomically swap the outbound TLS client config (e.g. after a renewed
+    /// Install the verifying and non-verifying client configs and the
+    /// `tls.verify_server` default, at construction.
+    ///
+    /// A pool built without this dials unverified only, and refuses a send
+    /// that asks for verification rather than downgrade it.
+    pub fn with_tls_configs(self, configs: OutboundTlsConfigs) -> Self {
+        self.store_tls_configs(configs);
+        self
+    }
+
+    fn store_tls_configs(&self, configs: OutboundTlsConfigs) {
+        self.tls_connector
+            .store(Arc::new(TlsConnector::from(configs.unverified)));
+        self.verified_tls_connector
+            .store(Some(Arc::new(TlsConnector::from(configs.verified))));
+        self.verify_by_default
+            .store(configs.verify_by_default, Ordering::Relaxed);
+    }
+
+    /// Atomically swap both outbound TLS client configs (e.g. after a renewed
     /// client certificate on disk) so subsequent outbound handshakes present
-    /// the new identity.
+    /// the new identity, verified or not.
     ///
     /// Existing pooled `Transport::Tls` connections are dropped from the reuse
     /// map so the next outbound send re-handshakes with the fresh identity. This
@@ -1382,9 +1378,8 @@ impl ConnectionPool {
     /// `stream_connections` and finish any in-flight exchange naturally — they
     /// are simply no longer offered for reuse. Pooled TCP connections are
     /// retained (their identity is transport-level, unaffected by the cert).
-    pub fn reload_tls_client_config(&self, new_config: Arc<tokio_rustls::rustls::ClientConfig>) {
-        self.tls_connector
-            .store(Arc::new(TlsConnector::from(new_config)));
+    pub fn reload_tls_client_configs(&self, configs: OutboundTlsConfigs) {
+        self.store_tls_configs(configs);
         self.connections
             .retain(|key, _| key.transport != Transport::Tls);
         info!(
@@ -1395,7 +1390,9 @@ impl ConnectionPool {
 
     /// Spawn a watcher that rebuilds the outbound TLS client identity whenever
     /// the certificate or private-key file on disk changes, and swaps it into
-    /// the pool via [`ConnectionPool::reload_tls_client_config`].
+    /// the pool via [`ConnectionPool::reload_tls_client_configs`]. Both client
+    /// configs are rebuilt, against the same `verification`, so a renewed
+    /// identity never leaves the verifying one presenting the old certificate.
     ///
     /// This is the outbound counterpart to
     /// [`crate::transport::tls::build_hot_reload_acceptor`] (which hot-reloads
@@ -1411,6 +1408,7 @@ impl ConnectionPool {
         certificate_path: &str,
         private_key_path: &str,
         method: TlsMethod,
+        verification: ServerVerification,
     ) {
         let cert_path = PathBuf::from(certificate_path);
         let key_path = PathBuf::from(private_key_path);
@@ -1487,9 +1485,10 @@ impl ConnectionPool {
                         // then the cert; wait for the pair to settle.
                         std::thread::sleep(std::time::Duration::from_millis(150));
                         match load_outbound_client_identity(&certificate_path, &private_key_path)
-                            .and_then(|identity| build_outbound_tls_config(Some(identity), method))
-                        {
-                            Ok(new_config) => pool.reload_tls_client_config(new_config),
+                            .and_then(|identity| {
+                                build_outbound_tls_configs(Some(identity), method, &verification)
+                            }) {
+                            Ok(configs) => pool.reload_tls_client_configs(configs),
                             Err(error) => warn!(%error,
                                 "outbound TLS client-cert hot-reload failed — keeping previous cert. Renewal half-written?"),
                         }
@@ -1571,6 +1570,7 @@ mod tests {
             destination: peer,
             transport: Transport::Tcp,
             bind: Some(SocketAddr::new(pool.local_addr.ip(), 0)),
+            verified_name: None,
         }
     }
 
@@ -2301,7 +2301,7 @@ mod tests {
     async fn reload_swaps_outbound_identity_for_new_connections() {
         // The client-cert-renewal path: an outbound handshake with the OLD
         // (untrusted) client identity must fail, and after
-        // `reload_tls_client_config` swaps in the renewed identity, a fresh
+        // `reload_tls_client_configs` swaps in the renewed identity, a fresh
         // outbound handshake must succeed — proving the live swap reaches new
         // outbound connections (not just the inbound acceptor).
         ensure_crypto_provider();
@@ -2352,9 +2352,13 @@ mod tests {
 
         // Swap in the renewed identity signed by CA-B.
         let identity_b = identity_from_pem(&certs_b.client_cert_pem, &certs_b.client_key_pem);
-        let config_b =
-            build_outbound_tls_config(Some(identity_b), TlsMethod::default()).expect("config b");
-        pool.reload_tls_client_config(config_b);
+        let configs_b = build_outbound_tls_configs(
+            Some(identity_b),
+            TlsMethod::default(),
+            &ServerVerification::public_roots(false),
+        )
+        .expect("config b");
+        pool.reload_tls_client_configs(configs_b);
 
         // (b) A fresh outbound handshake now SUCCEEDS with the new identity.
         let acceptor2 = mtls_server_acceptor(&certs_b);
@@ -2445,8 +2449,13 @@ mod tests {
             .expect("establish pooled TCP connection");
         assert_eq!(pool.active_connections(), 2, "both connections pooled");
 
-        pool.reload_tls_client_config(
-            build_outbound_tls_config(None, TlsMethod::default()).expect("outbound tls config"),
+        pool.reload_tls_client_configs(
+            build_outbound_tls_configs(
+                None,
+                TlsMethod::default(),
+                &ServerVerification::public_roots(false),
+            )
+            .expect("outbound tls config"),
         );
 
         assert_eq!(
@@ -2721,8 +2730,13 @@ mod tests {
             .expect("the first connection must reach the peer")
             .expect("the peer's accept loop is still running");
 
-        pool.reload_tls_client_config(
-            build_outbound_tls_config(None, TlsMethod::default()).expect("outbound tls config"),
+        pool.reload_tls_client_configs(
+            build_outbound_tls_configs(
+                None,
+                TlsMethod::default(),
+                &ServerVerification::public_roots(false),
+            )
+            .expect("outbound tls config"),
         );
         let replacement_id = pool
             .send_tls(peer, Some("localhost"), ping())
@@ -3212,6 +3226,7 @@ mod tests {
                 destination,
                 transport: Transport::Tcp,
                 bind: Some(source),
+                verified_name: None,
             }
         }
 

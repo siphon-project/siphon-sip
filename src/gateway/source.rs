@@ -138,6 +138,10 @@ pub struct GatewayRow {
     /// registered.
     #[serde(default)]
     pub require_registration: bool,
+    /// Verify the destination's server certificate on outbound TLS (see the
+    /// YAML destination's `verify_server`). Absent: `tls.verify_server` decides.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verify_server: Option<bool>,
     /// `false` drops the destination without removing the row.
     #[serde(default = "default_enabled")]
     pub enabled: bool,
@@ -175,6 +179,7 @@ pub struct DesiredDestination {
     pub credentials: Option<StoredCredentials>,
     pub registers: Option<String>,
     pub require_registration: bool,
+    pub verify_server: Option<bool>,
 }
 
 impl DesiredDestination {
@@ -192,6 +197,7 @@ impl DesiredDestination {
             && existing.attrs == self.attrs
             && existing.registers == self.registers
             && existing.require_registration == self.require_registration
+            && existing.verify_server == self.verify_server
             && existing
                 .credentials
                 .as_deref()
@@ -213,7 +219,8 @@ impl DesiredDestination {
             self.weight,
             self.priority,
         )
-        .with_attrs(self.attrs.clone());
+        .with_attrs(self.attrs.clone())
+        .with_verify_server(self.verify_server);
         if let Some(ref credentials) = self.credentials {
             destination = destination.with_credentials(credentials.clone());
         }
@@ -475,6 +482,7 @@ fn desired_destination(row: &GatewayRow) -> Result<DesiredDestination, String> {
         credentials,
         registers: row.registers.clone(),
         require_registration: row.require_registration,
+        verify_server: row.verify_server,
     })
 }
 
@@ -1001,6 +1009,7 @@ mod postgres {
             ha1_algorithm: text(row, "ha1_algorithm").unwrap_or_else(|| "md5".to_string()),
             registers: text(row, "registers"),
             require_registration: boolean(row, "require_registration").unwrap_or(false),
+            verify_server: boolean(row, "verify_server"),
             enabled: boolean(row, "enabled").unwrap_or(true),
             probe: boolean(row, "probe"),
             // Clamped rather than dropped: a negative interval reaches the row
@@ -1100,6 +1109,7 @@ mod tests {
             ha1_algorithm: "md5".to_string(),
             registers: None,
             require_registration: false,
+            verify_server: None,
             enabled: true,
             probe: None,
             probe_interval_secs: None,

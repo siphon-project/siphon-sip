@@ -926,8 +926,16 @@ pub fn advance_route_sequence(
         // Fail over only on a configured reroute cause (per-route from the
         // API > per-gateway override > global set). A definitive response
         // (486 Busy, 603 Decline, …) is forwarded to the A-leg as-is —
-        // trying another carrier won't help.
-        let reroute = b2bua_status_reroutes(call_id, status_code, state);
+        // trying another carrier won't help. A sequential controller `dial`
+        // also stops on a 6xx, and on any failure of a target that showed
+        // progress and does not reroute after it: the callee has answered,
+        // unless it is a 503 with Retry-After, the element being unavailable.
+        let reroute = b2bua_status_reroutes(call_id, status_code, state)
+            && !state.call_actors.hunt_stops_on(
+                call_id,
+                status_code,
+                crate::b2bua::actor::is_retry_elsewhere(status_code, message),
+            );
         if reroute && state.call_actors.has_pending_routes(call_id) {
             // ACK this carrier's non-2xx (RFC 3261 §17.1.1.3) before the
             // next try. The failed carrier's media session is keyed by the

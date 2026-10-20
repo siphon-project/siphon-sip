@@ -1824,13 +1824,20 @@ impl PyRequest {
     // -----------------------------------------------------------------------
 
     /// Fix NAT for REGISTER: add `received=` and `rport=` to the top Via
-    /// using the actual source IP and port.
+    /// using the actual source IP and port. On a request that came over an
+    /// IPsec UDP flow `rport` is the UE's protected server port instead, the
+    /// port its response goes to (TS 24.229 clause 5.2.6.3.1).
     fn fix_nated_register(&self) -> PyResult<()> {
+        let rport = crate::ipsec::runtime::received_rport(
+            self.source_port,
+            self.transport_name.eq_ignore_ascii_case("udp"),
+            self.resolve_protected_sa().as_ref(),
+        );
         let mut message = self.lock_mut()?;
         if let Some(raw_via) = message.headers.get("Via").cloned() {
             if let Ok(mut via) = Via::parse(&raw_via) {
                 via.received = Some(self.source_ip.clone());
-                via.rport = Some(Some(self.source_port));
+                via.rport = Some(Some(rport));
                 message.headers.set("Via", via.to_string());
             }
         }

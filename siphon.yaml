@@ -97,6 +97,23 @@ listen:
   #                                                   # without one the bound port is used.
   #       dscp: EF                                    # per-listener override (default is global dscp)
   #
+  # Per-listener mutual TLS (listen.tls / listen.wss only): verify_client,
+  # client_ca and client_subject on one entry override the tls: block for that
+  # listener alone, so one listener can serve phones with no client cert while
+  # another requires one from a trunk peer:
+  #   tls:
+  #     - "192.0.2.10:5061"                          # phones: tls: block as-is
+  #     - address: "192.0.2.10:5062"                 # trunk peer: mutual TLS
+  #       verify_client: true
+  #       client_ca: "/etc/siphon/tls/trunk-ca.pem"
+  #       client_subject: ["*.sip.example.net"]      # optional identity check
+  # An unset key inherits from tls:. Refused at config load: these keys on a
+  # udp/tcp/ws/sctp entry, client_ca or client_subject on a listener that ends
+  # up not verifying, verify_client without any client_ca, an unreadable CA,
+  # a malformed subject pattern, and a tls+wss pair on one address whose
+  # settings differ (one socket, one handshake). Changing them needs a restart:
+  # a config reload reports `listen` under restart_required.
+  #
   # The global `advertised_address` (below) serves as fallback for listeners
   # that don't have a per-socket advertise.
   #
@@ -214,8 +231,17 @@ advertised_address: "127.0.0.1"
 #   verify_client: false  # true for mTLS (e.g. SIP trunks with mutual auth)
 #   client_ca: "/etc/siphon/tls/client-ca.pem"
 #     # PEM bundle of CA certs that client certs must chain to. REQUIRED when
-#     # verify_client is true (startup fails otherwise). Applies to listen.tls
-#     # and listen.wss (they share this block).
+#     # verify_client is true (config load fails otherwise). Applies to every
+#     # listen.tls and listen.wss listener that does not override it.
+#   client_subject: ["*.sip.example.net"]
+#     # Optional, needs verify_client: true. On top of chaining to client_ca,
+#     # the client cert must name one of these: an exact DNS name or a
+#     # whole-leftmost-label wildcard (one label, RFC 6125 §6.4.3). Matched
+#     # against the cert's DNS subjectAltNames, or its subject CN only when it
+#     # carries none. Right CA, wrong name: refused at the handshake.
+#   # PER-LISTENER mTLS: verify_client / client_ca / client_subject can also be
+#   # set on one listen.tls / listen.wss entry (object form), overriding this
+#   # block for that listener only. See listen.tls above.
 #   # OUTBOUND mTLS — the cert siphon PRESENTS when it dials OUT to an upstream
 #   # trunk that requires a client certificate (e.g. Teams Direct Routing):
 #   client_certificate: "/etc/siphon/tls/client.crt"
@@ -223,6 +249,26 @@ advertised_address: "127.0.0.1"
 #     # PEM chain + key. Both must be set together, or neither (startup fails on
 #     # a one-sided setting or an unreadable/unparseable file). Outbound TLS also
 #     # sends the resolved target hostname as SNI (was the destination IP).
+#   # OUTBOUND server verification — whether siphon checks the certificate of
+#   # the trunk it dials. OFF by default (encrypted, NOT authenticated: caller
+#   # identity and any SDES keys in the SDP go to whoever answers on the
+#   # address). Consider turning it on for any gateway reached by hostname.
+#   verify_server: false
+#     # true: the chain must reach server_ca (else the bundled Mozilla roots),
+#     # and the certificate must name the host siphon ROUTED on — the URI host
+#     # (next_hop / gateway uri / dial target), never the address it resolved to
+#     # or an SRV target (RFC 5922 §4). Matched as a SIP domain (RFC 5922 §7): a
+#     # sip: URI subjectAltName wins over dNSName, exact match, NO wildcards. An
+#     # IP-literal target needs an iPAddress subjectAltName. A refused
+#     # certificate fails the request as a refused connect does (503 upstream).
+#     # A gateway destination / group and a control `dial` / `route` target can
+#     # set their own `verify_server`, which wins over this one. Applies to
+#     # every outbound SIP TLS connection, including REGISTERs and the OPTIONS
+#     # health probe. Restart to change.
+#   server_ca: "/etc/siphon/tls/trunk-ca.pem"
+#     # PEM bundle verified servers must chain to. REPLACES the Mozilla roots
+#     # (a private CA does not leave every public CA acceptable too). Checked
+#     # at load: an unreadable / empty / non-PEM file refuses the config.
 #   # INBOUND SNI (RFC 6066) — serve a different certificate per server name on
 #   # the SAME listener, instead of one SAN cert covering every domain (which
 #   # couples all of them to a single renewal). `certificate`/`private_key`
@@ -241,8 +287,8 @@ advertised_address: "127.0.0.1"
 #     # Applies to listen.tls AND listen.wss (they share this block). Every pair
 #     # is hot-reloaded independently, so each tenant renews on its own ACME
 #     # schedule. A server name configured twice is a startup error.
-#     # verify_client/client_ca stay listener-wide — per-name client-cert trust
-#     # anchors are not expressible here.
+#     # Client-cert trust is per LISTENER (see listen.tls), not per server
+#     # name: the client cert is checked before SNI could pick anything.
 
 # ---------------------------------------------------------------------------
 # Python script
@@ -1722,6 +1768,12 @@ auth:
 #         # opt-in, for a carrier that only accepts calls from a registered peer.
 #         #   registers: "sip:trunk1@carrier.example"
 #         #   require_registration: true
+#         #
+#         # `verify_server` checks this destination's TLS certificate (chain
+#         # against tls.server_ca, name = the host of `uri`; see
+#         # tls.verify_server). Wins over the group's `verify_server`, which
+#         # wins over tls.verify_server. Worth it for any TLS trunk by hostname.
+#         #   verify_server: true
 #         - uri: "sip:gw1.carrier.com:5060"         # port + transport derived from URI
 #           weight: 3             # higher = more traffic (weighted algorithm)
 #           priority: 1           # lower = higher priority (failover tiers)

@@ -5,20 +5,68 @@ use crate::dispatcher::*;
 /// Allocate a two-party media path, retaining the original caller offer.
 /// Nothing is sent to either SIP party until the allocation succeeds.
 ///
-/// One allocation serves the whole dial, however many branches it has. Each
-/// phone is offered the same anchored SDP, exactly as a forking proxy offers
-/// one body to every branch, and whichever branch sends SDP is answered against
-/// it — the media engine re-points the far side of the relay on each answer, so
-/// the last SDP to arrive is what the caller hears and the 2xx settles it on
-/// the branch that won (RFC 3261 §16.7). What a single allocation cannot do is
-/// give two *simultaneously* ringing branches separate early-media paths; that
-/// needs one allocation per branch and is not what this is.
+/// One allocation serves every branch of the dial that is offered this
+/// profile. Each such phone is offered the same anchored SDP, exactly as a
+/// forking proxy offers one body to every branch, and whichever branch sends
+/// SDP is answered against it — the media engine re-points the far side of the
+/// relay on each answer, so the last SDP to arrive is what the caller hears and
+/// the 2xx settles it on the branch that won (RFC 3261 §16.7). A branch naming
+/// another profile is offered an allocation of its own
+/// ([`control_dial_branch_media_offer`]).
 pub fn control_dial_media_offer(
     invite: &SipMessage,
     source_ip: std::net::IpAddr,
     profile_name: &str,
     state: &DispatcherState,
 ) -> Result<SipMessage, String> {
+    let (body, session) = allocate_dial_media(invite, source_ip, profile_name, true, state)?;
+    state
+        .rtpengine_sessions
+        .as_ref()
+        .ok_or("dial profile requires a media session store")?
+        .insert(session);
+    let mut rewritten = invite.clone();
+    rewritten.body = body;
+    rewritten
+        .headers
+        .set("Content-Length", rewritten.body.len().to_string());
+    Ok(rewritten)
+}
+
+/// Allocate the media for the branches of a dial that name `profile_name`, a
+/// profile other than the one the call's own session was anchored with, and
+/// return the anchored offer those branches are sent.
+///
+/// The allocation is held beside the call's session
+/// ([`crate::rtpengine::MediaSessionStore::insert_dial_branch`]) until a branch
+/// answers. It answers the caller from the same offer, so whichever branch
+/// wins, the caller is answered through the relay its own profile shaped.
+pub fn control_dial_branch_media_offer(
+    invite: &SipMessage,
+    source_ip: std::net::IpAddr,
+    profile_name: &str,
+    state: &DispatcherState,
+) -> Result<Vec<u8>, String> {
+    let (body, session) = allocate_dial_media(invite, source_ip, profile_name, false, state)?;
+    state
+        .rtpengine_sessions
+        .as_ref()
+        .ok_or("dial profile requires a media session store")?
+        .insert_dial_branch(session);
+    Ok(body)
+}
+
+/// Offer `invite`'s SDP to the media engine under `profile_name` on an engine
+/// call of its own, returning the anchored offer and the session that records
+/// it. `own_session` is the call's own session, which may not replace one the
+/// call already has.
+fn allocate_dial_media(
+    invite: &SipMessage,
+    source_ip: std::net::IpAddr,
+    profile_name: &str,
+    own_session: bool,
+    state: &DispatcherState,
+) -> Result<(Vec<u8>, crate::rtpengine::MediaSession), String> {
     let backend = state
         .rtpengine_set
         .as_ref()
@@ -38,7 +86,7 @@ pub fn control_dial_media_offer(
         .headers
         .call_id()
         .ok_or("dial offer has no Call-ID")?;
-    if sessions.get(call_id).is_some() {
+    if own_session && sessions.get(call_id).is_some() {
         return Err("dial profile cannot replace an existing media session".into());
     }
     if sdp_in_body(message_content_type(invite), &invite.body).is_none() {
@@ -78,29 +126,31 @@ pub fn control_dial_media_offer(
         ))
     })
     .map_err(|error| format!("dial media offer failed: {error}"))?;
-    sessions.insert(crate::rtpengine::MediaSession {
-        call_id: call_id.clone(),
-        rtpengine_call_id: engine_call_id,
-        from_tag,
-        to_tag: None,
-        profile: profile_name.to_string(),
-        ws_uri: None,
-        ws_tee: None,
-        ws_bridge_attached: false,
-        bridge_sides: None,
-        created_at: std::time::Instant::now(),
-    });
-    let mut rewritten = invite.clone();
-    rewritten.body = body;
-    rewritten
-        .headers
-        .set("Content-Length", rewritten.body.len().to_string());
-    Ok(rewritten)
+    Ok((
+        body,
+        crate::rtpengine::MediaSession {
+            call_id: call_id.clone(),
+            rtpengine_call_id: engine_call_id,
+            from_tag,
+            to_tag: None,
+            profile: profile_name.to_string(),
+            ws_uri: None,
+            ws_tee: None,
+            ws_bridge_attached: false,
+            bridge_sides: None,
+            created_at: std::time::Instant::now(),
+        },
+    ))
 }
 
 /// Rewrite a dialled phone's early/final answer for the caller using the
-/// opposite half of the selected profile. Once a call is known to own an
+/// opposite half of the profile its branch was offered, through the
+/// allocation made for that profile. Once a call is known to own an
 /// allocation, a missing session fails closed.
+///
+/// `branch` is the Via branch the response carries, which names the B-leg and
+/// so the profile it was offered. A branch the dial did not name a profile of
+/// its own for is answered through the call's own session.
 ///
 /// Every B-leg answer and every provisional carrying SDP comes through here, so
 /// the two "this is not a profiled dial" exits have to be plain no-ops: a call
@@ -109,6 +159,7 @@ pub fn control_dial_media_offer(
 /// or cancel the ringing branches of a call the control plane never touched.
 pub fn control_dial_media_answer(
     call_id: &str,
+    branch: &str,
     response: &mut SipMessage,
     source_ip: std::net::IpAddr,
     state: &DispatcherState,
@@ -120,14 +171,20 @@ pub fn control_dial_media_answer(
         return Ok(());
     }
     let sip_call_id = call.a_leg.dialog.call_id.clone();
+    let branch_profile = call.dial_branch_media_profile(branch);
     drop(call);
     let sessions = state
         .rtpengine_sessions
         .as_ref()
         .ok_or("dial media store is gone")?;
-    let session = sessions
-        .get(&sip_call_id)
-        .ok_or("dial media session is gone")?;
+    let held = branch_profile.and_then(|profile| sessions.dial_branch(&sip_call_id, &profile));
+    let on_held = held.is_some();
+    let session = match held {
+        Some(session) => session,
+        None => sessions
+            .get(&sip_call_id)
+            .ok_or("dial media session is gone")?,
+    };
     // A final response may repeat an early answer without carrying SDP, but
     // cannot establish a media session that the phone never answered.
     if response.body.is_empty() {
@@ -165,7 +222,11 @@ pub fn control_dial_media_answer(
         ))
     })
     .map_err(|error| format!("dial media answer failed: {error}"))?;
-    sessions.set_to_tag(&sip_call_id, to_tag);
+    if on_held {
+        sessions.set_dial_branch_to_tag(&sip_call_id, &session.profile, to_tag);
+    } else {
+        sessions.set_to_tag(&sip_call_id, to_tag);
+    }
     response.body = body;
     response
         .headers
@@ -184,6 +245,7 @@ pub fn release_control_dial_media(call_id: &str, state: &DispatcherState) {
             }
             call.control_dial_media = false;
             call.control_dial_offer = None;
+            call.dial_media = crate::b2bua::actor::DialMedia::default();
             Some(call.a_leg.dialog.call_id.clone())
         });
     if let Some(sip_call_id) = sip_call_id {
@@ -294,6 +356,7 @@ mod tests {
         assert_eq!(
             control_dial_media_answer(
                 "a-call-that-has-been-torn-down",
+                "z9hG4bK-unknown",
                 &mut gone,
                 "192.0.2.10".parse().unwrap(),
                 &dispatcher.state,
@@ -307,6 +370,7 @@ mod tests {
         assert_eq!(
             control_dial_media_answer(
                 &call_id,
+                "z9hG4bK-unknown",
                 &mut unprofiled,
                 "192.0.2.10".parse().unwrap(),
                 &dispatcher.state,

@@ -72,6 +72,117 @@ sends the resolved target hostname as SNI (RFC 6066) instead of the destination
 IP, so a hostname-vhost front-end can route the handshake; bare-IP next hops
 send no SNI, as before.
 
+### Verifying the server siphon dials
+
+By default siphon does **not** verify the certificate of a TLS peer it dials
+out to. The connection is encrypted, but not authenticated: the caller identity
+and any SDES keys in the SDP go to whoever answers on the address. That has
+always been the default (and is Kamailio's and OpenSIPS's) because trunks often
+present certificates nothing trusts, so it stays off. Turn it on for any
+gateway you reach by hostname.
+
+```yaml
+tls:
+  certificate: "/etc/siphon/tls/example.com.crt"
+  private_key:  "/etc/siphon/tls/example.com.key"
+  verify_server: true                          # every outbound SIP TLS connection
+  server_ca: "/etc/siphon/tls/trunk-ca.pem"    # optional; else the Mozilla roots
+
+gateway:
+  groups:
+    - name: "carriers"
+      verify_server: true                      # this group's destinations
+      destinations:
+        - uri: "sip:trunk.example.net;transport=tls"
+        - uri: "sip:192.0.2.20:5061;transport=tls"
+          verify_server: false                 # this one alone, over the group
+```
+
+A verified connection checks two things. The chain has to reach `server_ca`
+(which **replaces** the bundled Mozilla roots rather than adding to them), and
+the certificate has to name the host siphon routed on: the host of the next hop,
+gateway or dial target URI. Never the address that host resolved to, and not an
+SRV target either: RFC 5922 §4 takes the identity from the URI being resolved,
+because DNS without DNSSEC cannot vouch for an SRV answer. The name is matched as
+a SIP domain (RFC 5922 §7): a `sip:` URI subjectAltName without a user part wins
+over the dNSName entries, matching is exact, and a wildcard such as
+`*.example.net` never matches. An IP-literal target needs that address as an
+iPAddress subjectAltName. The common name is not consulted.
+
+Precedence, highest first: a control `dial` / `route` target's `verify_server`,
+the gateway destination's, its group's, then `tls.verify_server`. A gateway
+destination's setting applies to everything routed to it, script relays and
+dials included, and to its OPTIONS health probe, so a trunk whose certificate
+stops verifying is marked down. A verified connection is never shared with an
+unverified one to the same address, nor with one verified for another name;
+siphon also stops reusing a connection the peer opened inbound for a verified
+send. An in-dialog request that routes by address reuses the connection verified
+when the dialog was set up.
+
+A certificate that fails is refused during the handshake. The request fails the
+way a refused connect does (a relayed request gets 503 upstream, RFC 3261 §16.9;
+a B-leg fails the call), and siphon logs `outbound TLS server verification
+failed` with the destination, the expected name and the reason. Client
+certificate presentation (`client_certificate`) keeps working with verification
+on. These keys need a restart to change; a renewed client certificate still
+hot-reloads.
+### Per-listener mutual TLS
+
+`verify_client`, `client_ca` and `client_subject` in the `tls:` block are the
+default for every `listen.tls` and `listen.wss` listener. A listener in the
+object form can set any of them for itself, which overrides the block for that
+listener only. The server certificate stays shared. A typical split: phones
+reach siphon through a TLS front and present no client certificate, a SIP
+trunk peer connects to its own listener and must present one.
+
+```yaml
+listen:
+  tls:
+    - "192.0.2.10:5061"                       # phones: the tls: block as-is
+    - address: "192.0.2.10:5062"              # trunk peer: mutual TLS
+      verify_client: true
+      client_ca: "/etc/siphon/tls/trunk-ca.pem"
+      client_subject: ["*.sip.example.net", "trunk.example.net"]
+
+tls:
+  certificate: "/etc/siphon/tls/example.net.crt"
+  private_key:  "/etc/siphon/tls/example.net.key"
+  verify_client: false
+```
+
+Each listener builds its own acceptor from the merged settings, so a
+certificate-less client is accepted on `:5061` and refused at the handshake on
+`:5062`. A key the entry does not set is inherited from `tls:`; a listener that
+sets `verify_client: false` drops an inherited `client_subject` with it.
+
+`client_subject` (optional, also valid in `tls:`) checks *who* the certificate
+was issued to, on top of the chain: a certificate from the right CA naming
+someone else is refused. Each entry is an exact DNS name or a wildcard whose
+whole leftmost label is `*`, matching exactly one label (RFC 6125 §6.4.3:
+`*.sip.example.net` matches `edge1.sip.example.net`, not `sip.example.net` or
+`a.b.sip.example.net`), case-insensitively. siphon matches it against the
+certificate's DNS subjectAltNames, and against the subject Common Name only when
+the certificate carries no DNS name at all (RFC 6125 §6.4.4). A refused client
+gets an `access_denied` alert; siphon logs the presented and allowed names at
+WARN and counts the failure in `siphon_handshake_failures_total`, which also
+feeds `failed_auth_ban` like any other failed handshake.
+
+Refused at config load, naming the listener:
+
+- these keys on a `udp`, `tcp`, `ws` or `sctp` entry (no TLS handshake there);
+- per-listener settings without a top-level `tls:` block;
+- `client_ca` or `client_subject` on a listener that ends up not verifying;
+- `verify_client: true` with no `client_ca` here or in `tls:`, an unreadable or
+  empty CA bundle, or a malformed `client_subject` pattern;
+- a `tls` and a `wss` entry on one shared address whose settings differ: the
+  muxed socket runs one handshake before it can tell SIP from WebSocket.
+
+A config reload (`POST /admin/config/reload`) validates these rules in full and
+reports a changed `listen` section under `restart_required`: listeners keep the
+acceptor they started with until the next restart. The CA bundle is read when
+the listener starts; certificate hot-reload re-reads it whenever the server
+certificate is renewed.
+
 ### One port for SIP and WebSocket
 
 Give the same address to both `tls:` and `wss:` (or to both `tcp:` and `ws:`)
@@ -261,9 +372,11 @@ empty `server_names`, a malformed wildcard, or a certificate that does not match
 its key are all hard startup errors naming the offending path — none of them
 degrade into "some peers silently get the wrong certificate".
 
-`verify_client` / `client_ca` stay listener-wide: rustls can only vary client
-verification per name with a distinct config per handshake, and a per-domain
-trust anchor is a different feature from a per-domain server certificate.
+Client-certificate trust is set per **listener**, not per server name (see
+[Per-listener mutual TLS](#per-listener-mutual-tls)): the client certificate is
+requested in the same handshake SNI picks the server certificate in, and a
+per-domain trust anchor is a different feature from a per-domain server
+certificate.
 
 !!! note "SNI is not an authentication signal"
     The server name is client-supplied plaintext chosen by whoever dialled in.
@@ -272,7 +385,8 @@ trust anchor is a different feature from a per-domain server certificate.
 
 A listener can be a **plain string** (`"10.0.0.1:5060"`) or the **extended form**
 with a per-socket advertised host and optional port, a DSCP override (like OpenSIPS
-`socket … as …`), and — on stream transports — a PROXY-protocol allowlist:
+`socket … as …`), on stream transports a PROXY-protocol allowlist, and on
+`tls` / `wss` the listener's own client-certificate settings:
 
 ```yaml
 listen:
@@ -283,9 +397,14 @@ listen:
       dscp: EF                       # overrides the global listen.dscp
       proxy_protocol:                # stream listeners only — see below
         from: ["198.51.100.7/32"]    # the front(s) allowed to name the client
+      verify_client: true            # tls / wss only: override the tls: block
+      client_ca: "/etc/siphon/tls/trunk-ca.pem"
+      client_subject: ["*.sip.example.net"]
 ```
 
-`proxy_protocol` is covered in
+`verify_client` / `client_ca` / `client_subject` are covered in
+[Per-listener mutual TLS](#per-listener-mutual-tls). `proxy_protocol` is
+covered in
 [Behind a connection-terminating front](#behind-a-connection-terminating-front);
 the other two fields are covered under
 [Behind NAT or a load balancer](#behind-nat-or-a-load-balancer).

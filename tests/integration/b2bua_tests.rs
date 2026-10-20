@@ -3121,6 +3121,7 @@ fn route(router: &siphon::transport::OutboundRouter, event: &siphon::b2bua::retr
                 data: data.clone(),
                 source_local_addr: target.source_local_addr,
                 server_name: None,
+                verify_server: None,
             })
             .expect("router send");
     }

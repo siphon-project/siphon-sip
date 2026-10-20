@@ -2064,6 +2064,60 @@ impl PyDiameter {
         })
     }
 
+    /// Originate a request on a connection this node has, e.g. an HSS's
+    /// Cancel-Location towards the MME that sent the Update Location.
+    /// `avps` are `(code_or_name, value[, vendor[, mandatory]])` tuples after
+    /// the envelope; awaits the answer as a `DiameterAnswer`. No connection
+    /// raises LookupError, a timeout TimeoutError, a lost connection
+    /// ConnectionError.
+    ///
+    /// **Awaitable** — returns a coroutine, so `await` it.
+    #[pyo3(signature = (
+        command,
+        application,
+        avps,
+        destination_realm,
+        destination_host=None,
+        peer=None,
+        session_id=None,
+        tenant="default",
+        proxiable=true,
+        timeout_ms=10_000,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn originate<'py>(
+        &self,
+        python: Python<'py>,
+        command: &Bound<'py, PyAny>,
+        application: &str,
+        avps: &Bound<'py, PyAny>,
+        destination_realm: &str,
+        destination_host: Option<&str>,
+        peer: Option<&str>,
+        session_id: Option<&str>,
+        tenant: &str,
+        proxiable: bool,
+        timeout_ms: u64,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let destination = super::diameter_originate::Destination {
+            peer,
+            tenant,
+            host: destination_host,
+            realm: destination_realm,
+        };
+        super::diameter_originate::originate(
+            python,
+            &self.manager,
+            command,
+            application,
+            avps,
+            destination,
+            session_id,
+            proxiable,
+            request_timeout(timeout_ms),
+        )
+    }
+
     /// Build a backend peer pool for `target` (a peer name or list of names)
     /// resolved through the connected peers (state-as-truth liveness).
     ///

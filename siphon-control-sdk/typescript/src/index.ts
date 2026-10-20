@@ -137,6 +137,7 @@ export type {
   CallEvent,
   CallHandler,
   DialTarget,
+  DialOffer,
   DialOptions,
   Dialing,
   RecordDirection,

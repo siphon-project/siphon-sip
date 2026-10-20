@@ -70,7 +70,7 @@ pub(super) fn relay_request(
     //   a) flow=Some — use the captured inbound flow directly,
     //      bypassing DNS resolution of any URI.
     //   b) flow=None — resolve the next_hop / top Route / R-URI as usual.
-    let (target_uri_string, mut destination, mut outbound_transport, flow_local_addr) =
+    let (target_uri_string, mut destination, mut outbound_transport, flow_local_addr, mut tls_peer) =
         if let Some(flow) = flow {
             let (flow_destination, transport, flow_local, _) =
                 flow_relay_egress(flow, inbound.transport);
@@ -82,7 +82,13 @@ pub(super) fn relay_request(
                     return;
                 }
             };
-            (uri_string, flow_destination, transport, Some(flow_local))
+            (
+                uri_string,
+                flow_destination,
+                transport,
+                Some(flow_local),
+                (None, None),
+            )
         } else {
             // Determine target URI string (RFC 3261 §16.6 step 6):
             // 1. Explicit next-hop from script
@@ -122,6 +128,7 @@ pub(super) fn relay_request(
                             address: dest,
                             transport: Some(transport),
                             server_name: None,
+                            verify_server: None,
                         },
                         None => {
                             warn!(target = %target_uri_string, "cannot resolve relay target");
@@ -150,6 +157,8 @@ pub(super) fn relay_request(
                 target.address,
                 target.transport.unwrap_or(inbound.transport),
                 None,
+                // The routed host and its verify_server, for a new TLS connection.
+                (target.server_name, target.verify_server),
             )
         };
 
@@ -188,6 +197,8 @@ pub(super) fn relay_request(
             );
             destination = established_destination;
             outbound_transport = established_transport;
+            // Routed by address now, so no name of the original next hop.
+            tls_peer = (None, None);
         } else {
             // ACK to 2xx is end-to-end and should go to the UAS Contact, not the
             // proxy. If the R-URI still points at us, silently drop rather than
@@ -596,6 +607,7 @@ pub(super) fn relay_request(
             data,
             source_local_addr: Some(local),
             server_name: None,
+            verify_server: None,
         };
         let cid = outbound_message.connection_id;
         if let Err(error) = state.outbound.send(outbound_message) {
@@ -619,7 +631,8 @@ pub(super) fn relay_request(
         let target = RelayTarget {
             address: destination,
             transport: Some(outbound_transport),
-            server_name: None,
+            server_name: tls_peer.0,
+            verify_server: tls_peer.1,
         };
         send_to_target(
             data,
@@ -924,19 +937,17 @@ pub(super) fn relay_fork_branch(
     // Resolve the branch destination + transport: over the captured inbound flow
     // when one applies, else by DNS-resolving the branch's top Route (RFC 3261
     // §16.6 step 6) or, with no route set, the target URI.
-    let (mut destination, mut outbound_transport) = if let Some(flow) = flow {
-        let transport = match flow.transport.as_str() {
-            "udp" => Transport::Udp,
-            "tcp" => Transport::Tcp,
-            "tls" => Transport::Tls,
-            "ws" => Transport::WebSocket,
-            "wss" => Transport::WebSocketSecure,
-            other => {
-                warn!(target = %target, branch = branch_index, transport = %other, "fork: unknown flow transport");
-                return;
-            }
+    // The routed host and its verify_server go with a resolved destination, so
+    // a new TLS connection presents and verifies the name it was routed on.
+    let (mut destination, mut outbound_transport, tls_server_name, verify_server) = if let Some(
+        flow,
+    ) = flow
+    {
+        let Some(transport) = transport_from_token(&flow.transport) else {
+            warn!(target = %target, branch = branch_index, transport = %flow.transport, "fork: unknown flow transport");
+            return;
         };
-        (flow.source_addr, transport)
+        (flow.source_addr, transport, None, None)
     } else {
         // Route set present → the next hop is its topmost entry, not the
         // Contact URI (RFC 3261 §16.6 step 6).  This is what actually sends
@@ -951,6 +962,8 @@ pub(super) fn relay_fork_branch(
         (
             relay_target.address,
             relay_target.transport.unwrap_or(inbound.transport),
+            relay_target.server_name,
+            relay_target.verify_server,
         )
     };
 
@@ -1197,6 +1210,7 @@ pub(super) fn relay_fork_branch(
             data,
             source_local_addr: Some(flow.local_addr),
             server_name: None,
+            verify_server: None,
         };
         let cid = outbound_message.connection_id;
         if let Err(error) = state.outbound.send(outbound_message) {
@@ -1209,7 +1223,8 @@ pub(super) fn relay_fork_branch(
         let relay_target = RelayTarget {
             address: destination,
             transport: Some(outbound_transport),
-            server_name: None,
+            server_name: tls_server_name,
+            verify_server,
         };
         send_to_target(
             data,

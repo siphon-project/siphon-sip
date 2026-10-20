@@ -77,6 +77,7 @@ pub fn send_b2bua_to_bleg_checked(
         address: destination,
         transport: Some(transport),
         server_name: None,
+        verify_server: None,
     };
     let send_source = match transport {
         Transport::Udp => source_local_addr,

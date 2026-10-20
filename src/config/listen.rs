@@ -269,7 +269,41 @@ pub enum ListenEntry {
         /// abuse controls"), so inheriting it would hand that power to every
         /// monitoring box listed there.
         proxy_protocol: Option<ProxyProtocolConfig>,
+        /// Per-listener override of the `tls:` block's client-certificate
+        /// settings (`listen.tls` / `listen.wss` only; refused elsewhere at
+        /// load). Empty when the entry sets none of them.
+        client_auth: ListenerClientAuth,
     },
+}
+
+/// A `listen.tls` / `listen.wss` entry's own `verify_client`, `client_ca` and
+/// `client_subject`, each overriding the `tls:` block's value for that
+/// listener only. `None` inherits.
+///
+/// ```yaml
+/// listen:
+///   tls:
+///     - "192.0.2.10:5061"                       # phones: tls: block as-is
+///     - address: "192.0.2.10:5062"              # trunk peer: mutual TLS
+///       verify_client: true
+///       client_ca: "/etc/siphon/trunk-ca.pem"
+///       client_subject: ["*.sip.example.net"]
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ListenerClientAuth {
+    /// Require and verify a client certificate on this listener.
+    pub verify_client: Option<bool>,
+    /// PEM CA bundle client certificates on this listener must chain to.
+    pub client_ca: Option<String>,
+    /// DNS identities a client certificate on this listener must carry.
+    pub client_subject: Option<Vec<String>>,
+}
+
+impl ListenerClientAuth {
+    /// True when the entry overrides nothing.
+    pub fn is_empty(&self) -> bool {
+        self.verify_client.is_none() && self.client_ca.is_none() && self.client_subject.is_none()
+    }
 }
 
 /// The on-disk shape of a [`ListenEntry`], before `advertise` is parsed.
@@ -285,6 +319,12 @@ enum RawListenEntry {
         dscp: Option<u8>,
         #[serde(default)]
         proxy_protocol: Option<ProxyProtocolConfig>,
+        #[serde(default)]
+        verify_client: Option<bool>,
+        #[serde(default)]
+        client_ca: Option<String>,
+        #[serde(default)]
+        client_subject: Option<Vec<String>>,
     },
 }
 
@@ -299,6 +339,9 @@ impl TryFrom<RawListenEntry> for ListenEntry {
                 advertise,
                 dscp,
                 proxy_protocol,
+                verify_client,
+                client_ca,
+                client_subject,
             } => {
                 let advertise = advertise
                     .map(|value| {
@@ -311,6 +354,11 @@ impl TryFrom<RawListenEntry> for ListenEntry {
                     advertise,
                     dscp,
                     proxy_protocol,
+                    client_auth: ListenerClientAuth {
+                        verify_client,
+                        client_ca,
+                        client_subject,
+                    },
                 })
             }
         }
@@ -348,6 +396,16 @@ impl ListenEntry {
         match self {
             ListenEntry::Plain(_) => None,
             ListenEntry::Extended { dscp, .. } => *dscp,
+        }
+    }
+
+    /// This listener's client-certificate overrides, when it sets any.
+    pub fn client_auth(&self) -> Option<&ListenerClientAuth> {
+        match self {
+            ListenEntry::Plain(_) => None,
+            ListenEntry::Extended { client_auth, .. } => {
+                (!client_auth.is_empty()).then_some(client_auth)
+            }
         }
     }
 
