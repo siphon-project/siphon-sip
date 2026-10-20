@@ -29,6 +29,8 @@ pub struct RouteTarget {
     /// Host siphon presents in its own `Contact` on this attempt's leg. See
     /// [`DialTarget::contact_host`].
     pub contact_host: Option<String>,
+    /// This attempt's server verification: see [`DialTarget::verify_server`].
+    pub verify_server: Option<bool>,
 }
 
 /// The failover queue a `route` verb's targets become: R-URI carriers, as
@@ -57,6 +59,7 @@ fn route_verb_routes(
                 reroute_after_progress: target.reroute_after_progress,
                 route: target.route,
                 contact_host: target.contact_host,
+                verify_server: target.verify_server,
                 ..Default::default()
             }
         })
@@ -1268,6 +1271,7 @@ fn dial_parallel(
                 .and_then(|shaped| shaped.host.as_deref()),
             branch_to.as_deref(),
             target.contact_host.as_deref(),
+            target.verify_server,
             &headers,
             state,
         ) {
@@ -1346,6 +1350,7 @@ fn sequential_dial_routes(
                 contact_host: target.contact_host,
                 // The media profile its attempt is offered (see `dial_media`).
                 media_profile: target.profile,
+                verify_server: target.verify_server,
                 ..Default::default()
             }
         })
@@ -1509,6 +1514,7 @@ mod tests {
             reroute_after_progress,
             route: Vec::new(),
             contact_host: None,
+            verify_server: None,
         }
     }
 

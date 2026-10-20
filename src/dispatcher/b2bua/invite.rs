@@ -1170,6 +1170,7 @@ pub fn apply_routing_action(
                 None,
                 None,
                 None,
+                None,
                 &[],
                 state,
             );
@@ -1223,6 +1224,7 @@ pub fn apply_routing_action(
                     send_socket.as_ref(),
                     None,
                     &message_guard,
+                    None,
                     None,
                     None,
                     None,

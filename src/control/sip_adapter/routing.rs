@@ -520,6 +520,7 @@ pub(super) fn parse_dial_target(
         reroute_after_progress: parse_reroute_after_progress(object)?,
         profile: parse_profile("dial target", object.get("profile"))?,
         offer: parse_offer("dial target", object.get("offer"))?,
+        verify_server: parse_verify_server(object)?,
         ..Default::default()
     };
 
@@ -552,6 +553,7 @@ pub(super) fn parse_dial_target(
                     branch.reroute_after_progress = shaped.reroute_after_progress;
                     branch.profile.clone_from(&shaped.profile);
                     branch.offer = shaped.offer;
+                    branch.verify_server = shaped.verify_server;
                 }
                 Ok(branches)
             }
@@ -590,6 +592,7 @@ pub(super) fn parse_route_target(
             reroute_after_progress: false,
             route: Vec::new(),
             contact_host: None,
+            verify_server: None,
         });
     }
     let Some(object) = item.as_object() else {
@@ -624,6 +627,7 @@ pub(super) fn parse_route_target(
         reroute_after_progress,
         route,
         contact_host,
+        verify_server: parse_verify_server(object)?,
     })
 }
 
@@ -684,6 +688,21 @@ fn offer_refusal(message: String, reason: &str) -> ControlResult {
         message,
         serde_json::json!({ "verb": "dial", "argument": "offer", "reason": reason }),
     )
+}
+
+/// Read a target's `verify_server`: whether a new TLS connection for its leg
+/// verifies the server's certificate, over the gateway it routes to and
+/// `tls.verify_server`. Absent or `null` is no opinion. Anything but a boolean
+/// is refused, because reading it as `false` would quietly send the call to an
+/// unauthenticated peer the controller asked to have authenticated.
+pub(super) fn parse_verify_server(
+    object: &serde_json::Map<String, serde_json::Value>,
+) -> Result<Option<bool>, String> {
+    match object.get("verify_server") {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::Bool(verify)) => Ok(Some(*verify)),
+        Some(_) => Err("target 'verify_server' must be a boolean".to_string()),
+    }
 }
 
 /// Read a `contact_host`: the host siphon presents in its own Contact on the

@@ -119,6 +119,7 @@ impl Node {
                 data: Bytes::from(response.to_bytes()),
                 source_local_addr: Some(request.local_addr),
                 server_name: None,
+                verify_server: None,
                 followups: None,
             })
             .expect("the outbound queue is open");
@@ -415,6 +416,7 @@ impl Fallback {
                 data: Bytes::from(data),
                 source_local_addr: None,
                 server_name: None,
+                verify_server: None,
                 followups: None,
             })
             .expect("the outbound queue is open");

@@ -5015,6 +5015,7 @@ fn gateway_dest(uri: &str, transport: Option<&str>) -> GatewayDestConfig {
         auth: None,
         registers: None,
         require_registration: false,
+        verify_server: None,
     }
 }
 
@@ -5978,4 +5979,55 @@ fn extensions_must_be_a_mapping_of_names() {
     let base = "listen:\n  udp: [\"0.0.0.0:5060\"]\ndomain:\n  local: [\"example.com\"]\n";
     Config::from_str(&format!("{base}extensions: [a, b]\n")).expect_err("not a mapping");
     Config::from_str(&format!("{base}extensions:\n  5: /etc/x.yaml\n")).expect_err("not a name");
+}
+
+// --- tls.verify_server / tls.server_ca ---
+
+fn tls_yaml(extra: &str) -> String {
+    format!(
+        "listen:\n  udp: [\"0.0.0.0:5060\"]\ndomain:\n  local: [\"example.com\"]\nscript:\n  path: \"scripts/proxy_default.py\"\ntls:\n  certificate: \"/etc/siphon/cert.pem\"\n  private_key: \"/etc/siphon/key.pem\"\n{extra}"
+    )
+}
+
+#[test]
+fn outbound_tls_server_verification_is_off_by_default() {
+    let config = Config::from_str(&tls_yaml("")).expect("config");
+    let tls = config.tls.expect("tls");
+    assert!(!tls.verify_server);
+    assert_eq!(tls.server_ca, None);
+}
+
+#[test]
+fn a_readable_server_ca_loads_with_verify_server_on() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let path = directory.path().join("server-ca.pem");
+    let key = rcgen::KeyPair::generate().expect("key");
+    let mut params = rcgen::CertificateParams::new(vec!["server-ca".to_string()]).expect("params");
+    params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    std::fs::write(&path, params.self_signed(&key).expect("sign").pem()).expect("write");
+    let config = Config::from_str(&tls_yaml(&format!(
+        "  verify_server: true\n  server_ca: \"{}\"\n",
+        path.display()
+    )))
+    .expect("a readable server_ca loads");
+    let tls = config.tls.expect("tls");
+    assert!(tls.verify_server);
+    assert_eq!(
+        tls.server_ca.as_deref(),
+        Some(path.to_str().expect("utf-8"))
+    );
+}
+
+#[test]
+fn an_unreadable_server_ca_is_refused_at_load() {
+    let error = Config::from_str(&tls_yaml(
+        "  verify_server: true\n  server_ca: \"/nonexistent/siphon-server-ca.pem\"\n",
+    ))
+    .expect_err("a missing server_ca must refuse the config");
+    let message = error.to_string();
+    assert!(message.contains("tls.server_ca"), "{message}");
+    assert!(
+        message.contains("/nonexistent/siphon-server-ca.pem"),
+        "{message}"
+    );
 }

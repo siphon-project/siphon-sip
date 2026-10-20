@@ -62,6 +62,9 @@ pub enum DialTarget {
         /// When this branch's INVITE carries its offer. See
         /// [`DialTarget::offer`].
         offer: Option<DialOffer>,
+        /// Server certificate verification on this branch's outbound TLS. See
+        /// [`DialTarget::verify_server`].
+        verify_server: Option<bool>,
     },
     /// An address of record, forked to every contact registered against it.
     ///
@@ -94,6 +97,9 @@ pub enum DialTarget {
         /// When every branch the AoR expands to carries its offer. See
         /// [`DialTarget::offer`].
         offer: Option<DialOffer>,
+        /// Server certificate verification on every branch the AoR expands
+        /// to. See [`DialTarget::verify_server`].
+        verify_server: Option<bool>,
     },
 }
 
@@ -130,6 +136,7 @@ impl DialTarget {
             reroute_after_progress: None,
             profile: None,
             offer: None,
+            verify_server: None,
         }
     }
 
@@ -150,6 +157,7 @@ impl DialTarget {
             reroute_after_progress: None,
             profile: None,
             offer: None,
+            verify_server: None,
         }
     }
 
@@ -183,6 +191,7 @@ impl DialTarget {
             reroute_after_progress: None,
             profile: None,
             offer: None,
+            verify_server: None,
         }
     }
 
@@ -198,6 +207,7 @@ impl DialTarget {
             reroute_after_progress: None,
             profile: None,
             offer: None,
+            verify_server: None,
         }
     }
 
@@ -357,57 +367,98 @@ impl DialTarget {
         self
     }
 
+    /// Verify (`true`) or do not verify (`false`) the server certificate when
+    /// this branch opens a new outbound TLS connection, over the gateway it
+    /// routes to and the server's `tls.verify_server`.
+    ///
+    /// Verified means the chain checks out against the server's `tls.server_ca`
+    /// (or its bundled public roots) and the certificate names the host this
+    /// branch routes to (`next_hop`, else the URI) as a SIP domain (RFC 5922
+    /// §7: exact match, no wildcards), or its IP address for an IP-literal
+    /// target. A branch that fails is not sent and fails as an unreachable one
+    /// does. Unset leaves it to the server.
+    pub fn verify_server(mut self, verify: bool) -> Self {
+        match &mut self {
+            Self::Uri { verify_server, .. } | Self::Aor { verify_server, .. } => {
+                *verify_server = Some(verify);
+            }
+        }
+        self
+    }
+
     pub(crate) fn to_json(&self) -> serde_json::Value {
         let mut object = serde_json::Map::new();
-        let (headers, identity, to, contact_host, profile, offer, reroute_after_progress) =
-            match self {
-                Self::Uri {
-                    uri,
-                    next_hop,
+        let (
+            headers,
+            identity,
+            to,
+            contact_host,
+            profile,
+            offer,
+            reroute_after_progress,
+            verify_server,
+        ) = match self {
+            Self::Uri {
+                uri,
+                next_hop,
+                headers,
+                identity,
+                to,
+                route,
+                contact_host,
+                profile,
+                offer,
+                reroute_after_progress,
+                verify_server,
+            } => {
+                // A bare URI with no overrides is a plain string on the wire —
+                // the shape the server's own examples use. An identity counts
+                // as an override, or the carrier's own number would be
+                // silently dropped on the way out.
+                if next_hop.is_none()
+                    && headers.is_empty()
+                    && identity == &TargetIdentity::default()
+                    && to.is_none()
+                    && route.is_empty()
+                    && contact_host.is_none()
+                    && profile.is_none()
+                    && offer.is_none()
+                    && reroute_after_progress.is_none()
+                    && verify_server.is_none()
+                {
+                    return json!(uri);
+                }
+                object.insert("uri".to_string(), json!(uri));
+                if let Some(next_hop) = next_hop {
+                    object.insert("next_hop".to_string(), json!(next_hop));
+                }
+                if !route.is_empty() {
+                    object.insert("route".to_string(), json!(route));
+                }
+                (
                     headers,
                     identity,
                     to,
-                    route,
                     contact_host,
                     profile,
                     offer,
                     reroute_after_progress,
-                } => {
-                    // A bare URI with no overrides is a plain string on the wire —
-                    // the shape the server's own examples use. An identity counts
-                    // as an override, or the carrier's own number would be
-                    // silently dropped on the way out.
-                    if next_hop.is_none()
-                        && headers.is_empty()
-                        && identity == &TargetIdentity::default()
-                        && to.is_none()
-                        && route.is_empty()
-                        && contact_host.is_none()
-                        && profile.is_none()
-                        && offer.is_none()
-                        && reroute_after_progress.is_none()
-                    {
-                        return json!(uri);
-                    }
-                    object.insert("uri".to_string(), json!(uri));
-                    if let Some(next_hop) = next_hop {
-                        object.insert("next_hop".to_string(), json!(next_hop));
-                    }
-                    if !route.is_empty() {
-                        object.insert("route".to_string(), json!(route));
-                    }
-                    (
-                        headers,
-                        identity,
-                        to,
-                        contact_host,
-                        profile,
-                        offer,
-                        reroute_after_progress,
-                    )
-                }
-                Self::Aor {
-                    aor,
+                    verify_server,
+                )
+            }
+            Self::Aor {
+                aor,
+                headers,
+                identity,
+                to,
+                contact_host,
+                profile,
+                offer,
+                reroute_after_progress,
+                verify_server,
+            } => {
+                object.insert("aor".to_string(), json!(aor));
+                (
                     headers,
                     identity,
                     to,
@@ -415,19 +466,13 @@ impl DialTarget {
                     profile,
                     offer,
                     reroute_after_progress,
-                } => {
-                    object.insert("aor".to_string(), json!(aor));
-                    (
-                        headers,
-                        identity,
-                        to,
-                        contact_host,
-                        profile,
-                        offer,
-                        reroute_after_progress,
-                    )
-                }
-            };
+                    verify_server,
+                )
+            }
+        };
+        if let Some(verify_server) = verify_server {
+            object.insert("verify_server".to_string(), json!(verify_server));
+        }
         if let Some(reroute) = reroute_after_progress {
             object.insert("reroute_after_progress".to_string(), json!(reroute));
         }
@@ -1120,6 +1165,27 @@ mod tests {
     }
 
     #[test]
+    fn verify_server_rides_on_the_wire_only_when_set() {
+        assert_eq!(
+            DialTarget::uri("sip:trunk.example.net;transport=tls")
+                .verify_server(true)
+                .to_json(),
+            json!({"uri": "sip:trunk.example.net;transport=tls", "verify_server": true})
+        );
+        assert_eq!(
+            DialTarget::aor("sip:204@pbx.example.test")
+                .verify_server(false)
+                .to_json(),
+            json!({"aor": "sip:204@pbx.example.test", "verify_server": false})
+        );
+        assert_eq!(
+            DialTarget::uri("sip:trunk.example.net").to_json(),
+            json!("sip:trunk.example.net"),
+            "an unset verify_server leaves a bare URI a plain string"
+        );
+    }
+
+    #[test]
     fn a_route_set_rides_beside_a_pinned_next_hop() {
         let target = DialTarget::Uri {
             uri: "sip:alice@ims.example.test".to_string(),
@@ -1132,6 +1198,7 @@ mod tests {
             reroute_after_progress: None,
             profile: None,
             offer: None,
+            verify_server: None,
         };
         assert_eq!(
             target.to_json(),

@@ -967,6 +967,8 @@ mod tests {
             client_subject: Vec::new(),
             client_certificate: None,
             client_private_key: None,
+            verify_server: false,
+            server_ca: None,
         }
     }
 
@@ -996,6 +998,8 @@ mod tests {
             client_subject: Vec::new(),
             client_certificate: None,
             client_private_key: None,
+            verify_server: false,
+            server_ca: None,
         };
         let result = build_tls_acceptor(&tls_config);
         assert!(result.is_err());
@@ -1049,6 +1053,8 @@ mod tests {
             client_subject: Vec::new(),
             client_certificate: None,
             client_private_key: None,
+            verify_server: false,
+            server_ca: None,
         };
         let result = build_tls_acceptor(&tls_config);
         assert!(result.is_err());

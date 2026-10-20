@@ -342,6 +342,7 @@ pub(super) fn select_b2bua_retry_destination(
                 address: member_addr,
                 transport: Some(member_transport),
                 server_name: None,
+                verify_server: None,
             },
         )),
         None => resolve_target(target_uri, resolver).map(|relay_target| {

@@ -58,6 +58,41 @@ pub struct TlsServerConfig {
     /// `client_certificate` is set; a one-sided setting is a startup error.
     #[serde(default)]
     pub client_private_key: Option<String>,
+    /// Verify the server's certificate on OUTBOUND SIP TLS connections from
+    /// the connection pool: the chain, against `server_ca` or the bundled
+    /// Mozilla roots, and the name the connection was opened for (the host of
+    /// the URI siphon routed on, matched as a SIP domain per RFC 5922 §7; an
+    /// iPAddress subjectAltName for an IP-literal target). A connection that
+    /// fails is refused, and the request fails as a connect failure does.
+    ///
+    /// Off by default, which is what outbound SIP TLS has always done:
+    /// encrypted, not authenticated. A gateway destination or group, or a
+    /// control `dial` target, can set its own `verify_server` either way, which
+    /// wins over this one. Worth turning on for any trunk reached by hostname.
+    #[serde(default)]
+    pub verify_server: bool,
+    /// PEM bundle of CA certificates an outbound SIP TLS server must chain to
+    /// when it is verified. **Replaces** the bundled Mozilla roots rather than
+    /// adding to them, so naming a private CA does not also leave every public
+    /// CA acceptable. Unset: the Mozilla roots.
+    #[serde(default)]
+    pub server_ca: Option<String>,
+}
+
+impl TlsServerConfig {
+    /// Refuse a `server_ca` that cannot be loaded, at config load rather than
+    /// as a refused handshake on the first verified call.
+    pub fn validate_outbound_verification(&self) -> Result<(), String> {
+        match self.server_ca.as_deref() {
+            Some(path) => crate::transport::outbound_tls::ServerVerification::new(
+                self.verify_server,
+                Some(path),
+            )
+            .map(|_| ())
+            .map_err(|error| format!("tls.server_ca: {error}")),
+            None => Ok(()),
+        }
+    }
 }
 
 impl TlsServerConfig {

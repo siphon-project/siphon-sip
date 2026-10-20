@@ -576,6 +576,10 @@ impl Config {
         config.validate_max_message_bytes()?;
         config.validate_control_tls()?;
         config.validate_admin_tls()?;
+        if let Some(tls) = &config.tls {
+            tls.validate_outbound_verification()
+                .map_err(SiphonError::Config)?;
+        }
         config.validate_admin_listen()?;
         config.validate_admin_log_tail()?;
         config.validate_control_connect_urls()?;

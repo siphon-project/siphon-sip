@@ -39,6 +39,7 @@ use crate::ipsec::{
 use crate::sip::builder::SipMessageBuilder;
 use crate::sip::message::{Method, SipMessage};
 use crate::sip::uri::SipUri;
+use crate::transport::outbound_tls::registrar_server_name;
 use crate::transport::pool::ConnectionPool;
 use crate::transport::{ConnectionId, OutboundMessage, OutboundRouter, Transport};
 use crate::uac::resolve_via_addr;
@@ -1240,7 +1241,8 @@ pub async fn registration_loop(
                     destination,
                     data,
                     source_local_addr,
-                    server_name: None,
+                    server_name: registrar_server_name(&message, transport),
+                    verify_server: None,
                 };
                 debug!(aor = %aor, branch = %branch, "sending REGISTER");
                 if let Err(error) = outbound.send(outbound_message) {
@@ -1357,7 +1359,8 @@ fn send_registrant_message(
         destination,
         data,
         source_local_addr,
-        server_name: None,
+        server_name: registrar_server_name(&message, transport),
+        verify_server: None,
     });
 }
 
@@ -1561,6 +1564,31 @@ mod tests {
             manager.state("sip:alice@carrier.com"),
             Some(RegistrantState::Unregistered)
         );
+    }
+
+    #[test]
+    fn a_register_over_tls_presents_the_registrar_domain() {
+        let register = crate::sip::parser::parse_sip_message_bytes(
+            concat!(
+                "REGISTER sip:registrar.example.net SIP/2.0\r\n",
+                "Via: SIP/2.0/TLS 192.0.2.1:5061;branch=z9hG4bK-reg\r\n",
+                "From: <sip:trunk@example.net>;tag=reg\r\n",
+                "To: <sip:trunk@example.net>\r\n",
+                "Call-ID: reg@192.0.2.1\r\n",
+                "CSeq: 1 REGISTER\r\n",
+                "Content-Length: 0\r\n",
+                "\r\n",
+            )
+            .as_bytes(),
+        )
+        .expect("REGISTER parses");
+        assert_eq!(
+            registrar_server_name(&register, Transport::Tls).as_deref(),
+            Some("registrar.example.net"),
+            "TLS presents (and verifies) the Request-URI host, not the resolved address"
+        );
+        assert_eq!(registrar_server_name(&register, Transport::Tcp), None);
+        assert_eq!(registrar_server_name(&register, Transport::Udp), None);
     }
 
     #[test]
