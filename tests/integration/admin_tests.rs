@@ -28,6 +28,7 @@ fn test_state() -> AdminState {
         script_engine: None,
         script_config: None,
         config_reloader: None,
+        credential_cache: None,
         ui_enabled: false,
     }
 }

@@ -115,8 +115,9 @@ pub(super) struct BridgeDialRequest {
     pub(super) strategy: String,
     pub(super) timeout_secs: u32,
     pub(super) ringback: Option<PlayMediaSource>,
-    /// The caller's own Contact host (`caller_contact_host`), already checked.
-    pub(super) caller_contact_host: Option<String>,
+    /// The caller's own Contact host and user (`caller_contact_host`,
+    /// `caller_contact_user`), already checked.
+    pub(super) caller_contact: super::caller_contact::CallerContact,
     /// When each phone's INVITE carries its offer, where its target names none.
     pub(super) offer: Option<crate::dispatcher::DialOffer>,
 }
@@ -220,14 +221,14 @@ pub(super) fn dial_bridge(
         Ok(spec) => spec,
         Err(error) => return ControlResult::error(ControlErrorCode::BadRequest, error.to_string()),
     };
-    // The caller is answered already, so this can only repeat the host its
-    // answer carried; a different one is `invalid_state`.
+    // The caller is answered already, so this can only repeat the host and
+    // user its answer carried; a different one is `invalid_state`.
     if let Err(refusal) = super::caller_contact::apply(
         dispatcher.as_ref(),
         channel,
         "dial",
-        "caller_contact_host",
-        request.caller_contact_host.as_deref(),
+        "caller_",
+        &request.caller_contact,
     ) {
         return refusal;
     }

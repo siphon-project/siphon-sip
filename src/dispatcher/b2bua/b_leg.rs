@@ -2,6 +2,8 @@
 //! and classifying the responses that come back.
 use crate::dispatcher::*;
 
+use super::contact_user::presented_contact_user;
+
 /// Give a call the credentials of the gateway destination its B-leg is going
 /// to, when it has none of its own.
 ///
@@ -108,6 +110,7 @@ pub fn b2bua_send_b_leg_invite(
     branch_from_host: Option<&str>,
     branch_to: Option<&str>,
     branch_contact_host: Option<&str>,
+    branch_contact_user: Option<&str>,
     verify_server: Option<bool>,
     extra_headers: &[(String, String)],
     state: &DispatcherState,
@@ -128,6 +131,7 @@ pub fn b2bua_send_b_leg_invite(
         branch_from_host,
         branch_to,
         branch_contact_host,
+        branch_contact_user,
         verify_server,
         extra_headers,
         state,
@@ -189,6 +193,11 @@ pub fn b2bua_dial_b_leg(
     // part stay as built below, and the leg keeps it as its dialog's local
     // Contact, so every in-dialog request siphon sends on the leg presents it.
     branch_contact_host: Option<&str>,
+    // The user part this branch alone presents in siphon's own `Contact`: a
+    // controller target's `contact_user` ([`DialTarget::contact_user`]). Over
+    // the script's `set_contact_user()`, under its `set_contact_uri()`, and
+    // kept with the rest of the Contact for every in-dialog request.
+    branch_contact_user: Option<&str>,
     // Server verification on a new TLS connection for this branch alone: a
     // controller `dial` target's `verify_server`. Wins over the gateway the
     // branch routes to and over `tls.verify_server`; `None` leaves it to them.
@@ -201,6 +210,13 @@ pub fn b2bua_dial_b_leg(
     // they get here, and anything else is refused now, before a leg exists.
     let branch_contact_host = match branch_contact_host.map(checked_contact_host).transpose() {
         Ok(host) => host,
+        Err(error) => {
+            warn!(call_id = %call_id, target = %target_uri, "B2BUA: cannot dial the B-leg: {error}");
+            return None;
+        }
+    };
+    let branch_contact_user = match branch_contact_user.map(checked_contact_user).transpose() {
+        Ok(user) => user,
         Err(error) => {
             warn!(call_id = %call_id, target = %target_uri, "B2BUA: cannot dial the B-leg: {error}");
             return None;
@@ -312,28 +328,34 @@ pub fn b2bua_dial_b_leg(
 
     // Build a new INVITE for the B-leg
     let branch = TransactionKey::generate_branch();
-    // The one identity this B-leg advertises — Via sent-by AND Contact.  Both
-    // have to name the socket the INVITE actually leaves from, or the far end
-    // answers somewhere we are not listening on this flow.
+    // The one identity this B-leg advertises — Via sent-by, Contact and the
+    // From host.  All of them have to name the listener the INVITE actually
+    // leaves from: a flow's socket, the `send_socket=` listener, the listener
+    // whose connection the send reuses, else the transport's identity.  The
+    // far end answers to the Via, sends every in-dialog request to the
+    // Contact, and a peer that admits only one name refuses any other.
     let (via_host, via_port) = if flow_local_addr.is_some() {
-        b_leg_sent_by(flow_local_addr, state, &outbound_transport)
+        b_leg_sent_by(flow_local_addr, destination, state, &outbound_transport)
     } else {
         egress_sent_by(
             None,
             |local| state.wildcard_pinned_sent_by(&outbound_transport, local),
-            send_socket.map(|pin| pin.via_sent_by()),
-            || {
-                (
-                    state.via_host(&outbound_transport),
-                    state.via_port(&outbound_transport),
-                )
-            },
+            send_socket.map(|pin| state.pin_sent_by(pin)),
+            || state.connection_sent_by(outbound_transport, destination),
         )
     };
     let via_value = format!(
         "SIP/2.0/{} {}:{};branch={}",
         outbound_transport, via_host, via_port, branch,
     );
+    // The host the From and the SDP `o=` hide the caller behind: the B-leg's
+    // identity, except over a captured flow, whose Via names a socket (an IPsec
+    // protected port, say) rather than a name to present; that keeps the
+    // transport's advertised host it has always had.
+    let identity_host = match flow_local_addr {
+        Some(_) => state.via_host(&outbound_transport),
+        None => via_host.clone(),
+    };
 
     let mut b_leg_invite = original_request.clone();
 
@@ -453,15 +475,15 @@ pub fn b2bua_dial_b_leg(
         let from_host = branch_from_host
             .map(str::to_string)
             .or(from_host_override)
-            .unwrap_or_else(|| state.via_host(&outbound_transport));
+            .unwrap_or_else(|| identity_host.clone());
         new_from = crate::b2bua::actor::rewrite_uri_host(&new_from, &from_host);
 
         b_leg_invite.headers.set("From", new_from);
     }
 
-    // Set Contact to siphon's own address so in-dialog requests route through us.
-    // via_host()/via_port() apply advertised_address fallback and substitute the
-    // sanitized local_addr when the bind is 0.0.0.0/[::] — never leak unspecified.
+    // Set Contact to siphon's own address so in-dialog requests route through us:
+    // the B-leg identity resolved for the Via above, which applies the
+    // advertised_address fallback and never leaks an unspecified bind.
     //
     // The Contact is userless by default (RFC 3261 §8.1.1.8 puts no identity in
     // the Contact userpart; siphon's own address is all that's needed for the
@@ -474,34 +496,42 @@ pub fn b2bua_dial_b_leg(
     //
     // A datagram flow's Contact names its protected socket. A stream flow keeps
     // the same listener port but advertises its public identity so a peer can
-    // route later in-dialog requests through a NAT or TLS proxy. Both match the
-    // Via above; the held connection still owns stream delivery. A `send_socket=`
-    // pin deliberately does NOT move the Contact — that feature pins egress and
-    // the Via so the *response* returns to the chosen listener; the in-dialog
-    // remote target stays the advertised address, as it was before flows.
+    // route later in-dialog requests through a NAT or TLS proxy. A
+    // `send_socket=` pin, and a reused connection on one of several listeners,
+    // name that listener: the in-dialog remote target is the listener the
+    // dialog was set up through, the same identity as the Via above.
     //
     // A branch's `contact_host` replaces the host alone, composing with
     // `set_contact_user()`. `set_contact_uri()` names the whole URI and wins:
     // a deployment that fronts siphon owns where in-dialog requests go, and
     // splicing a host into its URI would send them somewhere neither meant.
-    let (b_contact_host, b_contact_port) =
-        b_leg_sent_by(flow_local_addr, state, &outbound_transport);
-    if let (Some(pinned), Some(script_contact)) =
-        (branch_contact_host.as_deref(), contact_override.as_deref())
-    {
-        warn!(
-            call_id = %call_id,
-            contact_host = %pinned,
-            contact = %script_contact,
-            "B2BUA: the script pinned the whole B-leg Contact with set_contact_uri(); \
-             the target's contact_host is not applied"
-        );
+    let (b_contact_host, b_contact_port) = (via_host.clone(), via_port);
+    if let Some(script_contact) = contact_override.as_deref() {
+        for (argument, pinned) in [
+            ("contact_host", branch_contact_host.as_deref()),
+            ("contact_user", branch_contact_user.as_deref()),
+        ] {
+            if let Some(pinned) = pinned {
+                warn!(
+                    call_id = %call_id,
+                    %argument,
+                    value = %pinned,
+                    contact = %script_contact,
+                    "B2BUA: the script pinned the whole B-leg Contact with set_contact_uri(); \
+                     the target's {argument} is not applied"
+                );
+            }
+        }
     }
+    // A target's `contact_user` outranks the script's `set_contact_user()`.
     let b_contact_value = build_b_leg_contact(
         branch_contact_host.as_deref().unwrap_or(&b_contact_host),
         b_contact_port,
         outbound_transport,
-        contact_user_override.as_deref(),
+        presented_contact_user(
+            branch_contact_user.as_deref(),
+            contact_user_override.as_deref(),
+        ),
         contact_override.as_deref(),
     );
     b_leg_invite.headers.set("Contact", b_contact_value.clone());
@@ -721,8 +751,7 @@ pub fn b2bua_dial_b_leg(
 
     // Sanitize SDP: mask A-leg identity in o= and s= lines, and rewrite
     // the o= address to our advertised address for topology hiding.
-    let sdp_addr = state.via_host(&outbound_transport);
-    hide_sdp_identity(&mut b_leg_invite.body, state, Some(&sdp_addr));
+    hide_sdp_identity(&mut b_leg_invite.body, state, Some(&identity_host));
 
     // Update Content-Length after SDP rewrite (o=/s= changes may alter body size)
     if !b_leg_invite.body.is_empty() {
@@ -787,7 +816,7 @@ pub fn b2bua_dial_b_leg(
             &state.sdp_name,
             b_leg.dialog.sdp_session_id,
             b_leg.dialog.sdp_version,
-            Some(&sdp_addr),
+            Some(&identity_host),
         );
         b_leg.dialog.sdp_version += 1;
         b_leg_invite

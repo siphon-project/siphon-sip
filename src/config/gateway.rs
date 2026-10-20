@@ -135,6 +135,17 @@ pub struct GatewayGroupConfig {
     /// Per-group health probe configuration.
     #[serde(default)]
     pub probe: GatewayProbeConfig,
+    /// The listener the group's OPTIONS probes leave from and advertise, by
+    /// its bound address (`"192.0.2.10:5068"`, as written under `listen:`).
+    ///
+    /// For a peer that admits only one of siphon's identities: the probe's
+    /// Via, From and Contact name that listener's `advertise`, a UDP probe is
+    /// written to its socket and a TLS probe opens its connection from its IP.
+    /// Unset, a probe leaves the default way and advertises the transport's
+    /// identity. Every destination's transport must have a listener bound at
+    /// this address; the load refuses one that does not.
+    #[serde(default)]
+    pub probe_listener: Option<String>,
     /// Destinations in this group.
     pub destinations: Vec<GatewayDestConfig>,
     /// Source IP CIDR ranges whose senders count as members of this group for
@@ -216,6 +227,49 @@ pub struct GatewayGroupConfig {
 }
 
 impl GatewayGroupConfig {
+    /// Check [`probe_listener`](Self::probe_listener) against the configured
+    /// listeners: it must be a socket address, and a listener of every
+    /// destination's transport must be bound there, or a probe would advertise
+    /// a socket it does not leave from.
+    pub fn validate_probe_listener(&self, listen: &super::ListenConfig) -> Result<(), String> {
+        let Some(spec) = self.probe_listener.as_deref() else {
+            return Ok(());
+        };
+        let field = format!("gateway.groups[{}].probe_listener", self.name);
+        let address: std::net::SocketAddr = spec
+            .parse()
+            .map_err(|error| format!("{field}: '{spec}' is not an <ip>:<port> address: {error}"))?;
+        for destination in &self.destinations {
+            let transport = destination.outbound_transport(&field)?;
+            let listeners = match transport {
+                crate::transport::Transport::Udp => &listen.udp,
+                crate::transport::Transport::Tcp => &listen.tcp,
+                crate::transport::Transport::Tls => &listen.tls,
+                crate::transport::Transport::WebSocket => &listen.ws,
+                crate::transport::Transport::WebSocketSecure => &listen.wss,
+                crate::transport::Transport::Sctp => &listen.sctp,
+            };
+            let bound = listeners
+                .iter()
+                .any(|entry| entry.address().parse::<std::net::SocketAddr>() == Ok(address));
+            if !bound {
+                return Err(format!(
+                    "{field}: no {transport} listener is bound at {address}, and destination \
+                     {} is probed over {transport}",
+                    destination.uri
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// [`probe_listener`](Self::probe_listener) as an address, once validated.
+    pub fn probe_listener_addr(&self) -> Option<std::net::SocketAddr> {
+        self.probe_listener
+            .as_deref()
+            .and_then(|spec| spec.parse().ok())
+    }
+
     /// The group's inbound limit with the defaults filled in, or `None` when
     /// the block is absent — see [`inbound_limit`](Self::inbound_limit).
     pub fn resolved_inbound_limits(&self) -> Option<crate::admission::InboundLimits> {

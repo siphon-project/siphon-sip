@@ -134,14 +134,20 @@ pub struct HttpAuthConfig {
     /// If false, it is a plaintext password (SIPhon hashes it internally).
     #[serde(default)]
     pub ha1: bool,
-    /// TTL (seconds) for caching a successful credential lookup keyed by
-    /// username. `0` (the default) disables caching — every digest
+    /// TTL (seconds) for caching a successful credential lookup, keyed by
+    /// realm and username. `0` (the default) disables caching — every digest
     /// verification performs a blocking HTTP fetch, so a registration storm
     /// translates 1:1 into blocking calls on the fixed Python executor pool.
     /// Set this (e.g. `300`) so repeated REGISTERs for the same subscriber
     /// reuse the cached HA1/password instead of re-hitting the backend.
-    /// Credentials rarely change, so a non-zero TTL is the recommended
-    /// production setting; a change propagates after at most `cache_ttl_secs`.
+    ///
+    /// A changed credential does not wait out the TTL: a digest that fails
+    /// against a cached credential re-reads the backend once, so a reset
+    /// password verifies at once and a user the backend no longer knows is
+    /// refused and dropped. Only the final verdict feeds the auto-ban. The one
+    /// case the re-read cannot see is a deleted user presenting its *old*
+    /// password, which still matches the cached entry; flush it with
+    /// `POST /admin/auth/cache/invalidate` when the credential is written.
     #[serde(default)]
     pub cache_ttl_secs: u64,
 }
@@ -170,11 +176,14 @@ pub struct DatabaseAuthConfig {
     /// computed for.
     #[serde(default)]
     pub ha1: bool,
-    /// TTL (seconds) for caching a successful lookup, keyed by username. `0`
-    /// (the default) disables caching, so every digest verification performs a
-    /// blocking query and a registration storm translates 1:1 into queries on
-    /// the fixed Python executor pool. Credentials rarely change, so a non-zero
-    /// TTL is the production setting; a change propagates within it.
+    /// TTL (seconds) for caching a successful lookup, keyed by realm, username
+    /// and H(A1) column. `0` (the default) disables caching, so every digest
+    /// verification performs a blocking query and a registration storm
+    /// translates 1:1 into queries on the fixed Python executor pool.
+    /// Credentials rarely change, so a non-zero TTL is the production setting.
+    /// Same staleness contract as `auth.http.cache_ttl_secs`: a failed digest
+    /// against a cached credential re-reads once, and
+    /// `POST /admin/auth/cache/invalidate` flushes on demand.
     #[serde(default)]
     pub cache_ttl_secs: u64,
     /// Per-query deadline in milliseconds, connection included.

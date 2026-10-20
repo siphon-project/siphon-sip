@@ -81,6 +81,12 @@ Every verb the server's `sip` adapter describes has a typed method:
   `ring_with_contact_host`, `DialOptions::caller_contact_host` and
   `route_with_caller_contact_host`, the host of siphon's Contact toward the
   caller, fixed once an 18x or 2xx went out.
+  `contact_user` works the same way for the user part of that Contact, which
+  is otherwise userless (`<sip:trunk-7@sbc.example.net:5061;transport=tls>`):
+  `DialTarget::contact_user(..)`, `RouteTarget { contact_user, .. }`,
+  `OriginateOptions::contact_user(..)`, `ResponseOptions::contact_user`,
+  `DialOptions::caller_contact_user`, and `ring_with_caller_contact` /
+  `route_with_caller_contact`, which take a `CallerContact { host, user }`.
   `DialTarget::reroute_after_progress(false)` ends a sequential dial on that
   target once it has rung (a 101-199): its ring timeout, busy or other failure
   is the dial's and no later target is rung, for a hunt across several routes

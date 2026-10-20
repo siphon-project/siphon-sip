@@ -137,14 +137,37 @@ async fn send_via_pool(
     let verify_server = outbound.verify_server;
     let requested_connection_id = outbound.connection_id;
     let source = pool_tcp_source(outbound.source_local_addr, destination, is_protected);
+    let tls_listener = outbound
+        .source_local_addr
+        .filter(|listener| listener.is_ipv4() == destination.is_ipv4());
     for frame in outbound.into_frames() {
         // Kept for the log line of a failure: a refcount, not a copy.
         let attempted = frame.clone();
         let sent = match transport {
-            Transport::Tls => {
-                pool.send_tls_with_policy(destination, server_name.as_deref(), verify_server, frame)
+            // A send pinned to a listener (a probe's `probe_listener`, a
+            // response to a connection that has since closed) reconnects from
+            // that listener, so the peer sees the address it is advertised.
+            Transport::Tls => match tls_listener {
+                Some(listener) => {
+                    pool.send_tls_from(
+                        listener,
+                        destination,
+                        server_name.as_deref(),
+                        verify_server,
+                        frame,
+                    )
                     .await
-            }
+                }
+                None => {
+                    pool.send_tls_with_policy(
+                        destination,
+                        server_name.as_deref(),
+                        verify_server,
+                        frame,
+                    )
+                    .await
+                }
+            },
             Transport::Tcp => match source {
                 Some(source) => pool.send_tcp_from(source, destination, frame).await,
                 None => pool.send_tcp(destination, frame).await,
@@ -523,7 +546,7 @@ pub(crate) async fn serve_sip_stream<R, W>(
     let (outbound_tx, mut outbound_rx) = mpsc::channel::<Bytes>(64);
     connection_map.insert(connection_id, outbound_tx.clone());
     if let Some(registry) = stream_connections.as_ref() {
-        registry.register(remote_addr, transport, connection_id);
+        registry.register_on_listener(remote_addr, transport, connection_id, local_addr);
     }
     let keepalive_writer = outbound_tx;
 

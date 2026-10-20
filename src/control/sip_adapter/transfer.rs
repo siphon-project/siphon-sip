@@ -101,20 +101,23 @@ pub(super) fn parse_transfer_dial(
     args: &serde_json::Value,
 ) -> Result<TransferDial, ControlResult> {
     let bad = |message: String| ControlResult::error(ControlErrorCode::BadRequest, message);
-    // A transfer's new leg presents siphon's advertised Contact host. Refused
-    // rather than ignored, as on the verb or its target: a peer that identifies
-    // the tenant by that host would otherwise serve the new party as another
-    // tenant's without the controller ever being told.
-    let names_contact_host = |value: Option<&serde_json::Value>| {
-        value
-            .and_then(|value| value.get("contact_host"))
-            .is_some_and(|host| !host.is_null())
-    };
-    if names_contact_host(Some(args)) || names_contact_host(args.get("target")) {
-        return Err(bad(format!(
-            "{verb} does not take contact_host: the new leg presents siphon's advertised \
-             Contact host"
-        )));
+    // A transfer's new leg presents siphon's advertised Contact host, with no
+    // user part. Refused rather than ignored, as on the verb or its target: a
+    // peer that identifies the tenant by that host or user would otherwise
+    // serve the new party as another tenant's without the controller ever
+    // being told.
+    for argument in ["contact_host", "contact_user"] {
+        let names = |value: Option<&serde_json::Value>| {
+            value
+                .and_then(|value| value.get(argument))
+                .is_some_and(|named| !named.is_null())
+        };
+        if names(Some(args)) || names(args.get("target")) {
+            return Err(bad(format!(
+                "{verb} does not take {argument}: the new leg presents siphon's advertised \
+                 Contact"
+            )));
+        }
     }
     let shaping = crate::dispatcher::DialShaping {
         profile: None,

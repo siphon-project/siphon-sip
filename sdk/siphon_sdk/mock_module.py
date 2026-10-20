@@ -3283,8 +3283,16 @@ class MockRegistrar:
         The handler receives ``(aor, event_type, contacts)`` where:
           - ``aor``: str — Address of Record
           - ``event_type``: str — ``"registered"``, ``"refreshed"``,
-            ``"deregistered"``, or ``"expired"``
+            ``"deregistered"``, ``"expired"``, or ``"snapshot"``
           - ``contacts``: list[Contact] — current contact bindings
+
+        ``"snapshot"`` is not a change: when the handler fell so far behind
+        the registrar that events were lost (a registration storm against a
+        slow handler), siphon re-reports every registered AoR with its current
+        contacts under ``"snapshot"``, so a script that keeps its own copy is
+        whole again. An AoR whose bindings went away among the lost events is
+        not in the snapshot. A handler that only reacts to changes can ignore
+        it.
 
         Usage::
 
@@ -8003,10 +8011,17 @@ class MockRegistration:
         The handler receives ``(aor, event_type, state)`` where:
           - ``aor``: str -- Address of Record (e.g. "sip:trunk@carrier.com")
           - ``event_type``: str -- ``"registered"``, ``"refreshed"``,
-            ``"failed"``, or ``"deregistered"``
+            ``"failed"``, ``"deregistered"``, or ``"snapshot"``
           - ``state``: dict -- ``{"expires_in": int, "failure_count": int,
-            "registrar": str, "status_code": int}`` (``status_code`` only
-            present when ``event_type`` is ``"failed"``)
+            "registrar": str, "state": str | None, "status_code": int}``
+            (``status_code`` only present when ``event_type`` is
+            ``"failed"``; ``state`` is the registration's current state,
+            ``"unregistered"``, ``"registering"``, ``"challenging"``,
+            ``"registered"`` or ``"failed"``, ``None`` once it was removed)
+
+        ``"snapshot"`` is not a change: when the handler fell so far behind
+        that events were lost, siphon re-reports every outbound registration
+        under ``"snapshot"``, with its current ``state``.
 
         Usage::
 
@@ -8032,6 +8047,7 @@ class MockRegistration:
             "expires_in": entry["expires_in"] if entry else 0,
             "failure_count": entry.get("failure_count", 0) if entry else 0,
             "registrar": entry["registrar"] if entry else "",
+            "state": entry["state"] if entry else None,
         }
         if status_code is not None:
             state["status_code"] = status_code

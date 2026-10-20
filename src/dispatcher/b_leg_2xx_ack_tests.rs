@@ -143,6 +143,7 @@ impl Call {
                 None,
                 None,
                 None,
+                None,
                 &[],
                 &state,
             )
@@ -836,6 +837,7 @@ async fn a_stream_flow_dial_advertises_the_public_listener_and_keeps_its_connect
             None,
             None,
             None,
+            None,
             &[],
             &state,
         ));
@@ -874,6 +876,7 @@ fn a_datagram_flow_keeps_its_protected_socket_even_with_an_advertised_address() 
     assert_eq!(
         b_leg_sent_by(
             Some("192.0.2.10:6100".parse().unwrap()),
+            "198.51.100.20:5060".parse().unwrap(),
             &dispatcher.state,
             &Transport::Udp
         ),

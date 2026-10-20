@@ -70,6 +70,14 @@ pub struct DialTarget {
     /// Validated and stored bracketed when it is an IPv6 address
     /// ([`checked_contact_host`]).
     pub contact_host: Option<String>,
+    /// User part siphon presents in its own `Contact` on this branch's leg,
+    /// where the Contact is otherwise userless: a peer that keys the account on
+    /// the Contact user (`<sip:user@host>`). Host, port and transport stay as
+    /// for [`Self::contact_host`], and the leg keeps it for every in-dialog
+    /// request. Outranks a script's `call.set_contact_user()`; a script's
+    /// `call.set_contact_uri()` outranks both. Validated
+    /// ([`checked_contact_user`]).
+    pub contact_user: Option<String>,
     /// Verify the server certificate on a new outbound TLS connection for this
     /// branch: the chain against `tls.server_ca` (or the bundled Mozilla
     /// roots) and the host of the URI it routes to (`next_hop`, else `uri`) as

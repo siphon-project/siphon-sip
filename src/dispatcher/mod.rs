@@ -73,6 +73,7 @@ mod media_init;
 mod proxy_dialog_state;
 mod proxy_release;
 mod registrant;
+mod registration_events;
 mod relay;
 mod request;
 mod response;
@@ -140,7 +141,11 @@ mod control_bridge_relay_tests;
 #[cfg(test)]
 mod control_caller_contact_host_tests;
 #[cfg(test)]
+mod control_caller_contact_user_tests;
+#[cfg(test)]
 mod control_cancel_dial_tests;
+#[cfg(test)]
+mod control_contact_user_tests;
 #[cfg(test)]
 mod control_dial_branch_events_tests;
 #[cfg(test)]
@@ -221,6 +226,8 @@ mod lcr_number_policy_tests;
 mod lcr_ring_timeout_tests;
 #[cfg(test)]
 mod lcr_route_bookkeeping_tests;
+#[cfg(test)]
+mod listener_identity_tests;
 #[cfg(test)]
 mod local_answer_contact_tests;
 #[cfg(test)]
@@ -332,6 +339,8 @@ mod session_timer_tests;
 #[cfg(test)]
 mod shutdown_teardown_tests;
 #[cfg(test)]
+mod single_listener_snapshot_tests;
+#[cfg(test)]
 mod spiral_invite_tests;
 #[cfg(test)]
 mod stale_in_dialog_request_tests;
@@ -396,16 +405,16 @@ pub(crate) use b2bua::{
     b2bua_originate_prepare_with_contact_host, b2bua_originate_with_route,
     b2bua_reject_call_with_headers, b2bua_replace_peer_dialling, b2bua_send_info,
     b2bua_set_local_contact, b2bua_set_session_timer, b2bua_take_over_is_anchored,
-    bridge_calls_with_state, checked_contact_host, dial_answered_payload, dial_branch_identity,
-    dial_branch_summary, dial_bridge_caller, dial_bridge_join, dial_bridge_refuse_phone,
-    dial_bridge_spec, dial_bridge_start, dial_targets_for_aor, forget_sent_info,
-    set_caller_contact_host, CallerContactHostRefusal, ControllerReferRefusal, DialBridgeCaller,
-    DialBridgeListener, DialBridgePlan, DialBridgeRefusal, DialBridgeSender, DialBridgeSignal,
-    DialBridgeStartError, DialCancelRefusal, DialError, DialOffer, DialShaping, DialTarget,
-    DispatcherHandle, DropOutcome, OriginateGroupAnswers, OriginateGroupFailure,
-    OriginateGroupSink, OriginateGroupSpec, OriginateGroupStrategy, OriginateGroupWinner,
-    OriginateLegProgress, ReplacementDial, RunningDispatcher, DIAL_BRIDGE_CALLER_GONE,
-    DIAL_CANCELLED, DIAL_RINGBACK_ORIGIN,
+    bridge_calls_with_state, checked_contact_host, checked_contact_user, dial_answered_payload,
+    dial_branch_identity, dial_branch_summary, dial_bridge_caller, dial_bridge_join,
+    dial_bridge_refuse_phone, dial_bridge_spec, dial_bridge_start, dial_targets_for_aor,
+    forget_sent_info, set_caller_contact_host, set_caller_contact_user, CallerContactHostRefusal,
+    ControllerReferRefusal, DialBridgeCaller, DialBridgeListener, DialBridgePlan,
+    DialBridgeRefusal, DialBridgeSender, DialBridgeSignal, DialBridgeStartError, DialCancelRefusal,
+    DialError, DialOffer, DialShaping, DialTarget, DispatcherHandle, DropOutcome,
+    OriginateGroupAnswers, OriginateGroupFailure, OriginateGroupSink, OriginateGroupSpec,
+    OriginateGroupStrategy, OriginateGroupWinner, OriginateLegProgress, ReplacementDial,
+    RunningDispatcher, DIAL_BRIDGE_CALLER_GONE, DIAL_CANCELLED, DIAL_RINGBACK_ORIGIN,
 };
 pub(crate) use b2bua::{b2bua_dial_refusal, b2bua_progress_call_anchored_from};
 pub(crate) use charging::{ro_answer_ocs_request, ro_bind_call, RO_CONTROL};
@@ -915,6 +924,12 @@ pub fn inject_python_singletons(config: &Config) {
             cache_ttl_secs = database_config.cache_ttl_secs,
             "database auth backend configured"
         );
+    }
+
+    // Register the credential cache so `POST /admin/auth/cache/invalidate`
+    // can flush it. Absent when caching is off, which the route reports.
+    if let Some(cache) = py_auth.credential_cache() {
+        crate::auth::credential_cache::install(cache);
     }
 
     // Wire AKA credentials for local Milenage auth (IMS P-CSCF)

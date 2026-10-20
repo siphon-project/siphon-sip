@@ -647,24 +647,106 @@ impl DispatcherState {
     }
 
     /// Sent-by for a leg pinned to a wildcard-bound socket (`0.0.0.0:5060`),
-    /// whose own IP cannot go in a header: that listener's `advertise` (host,
-    /// and port when it names one) when configured, else the transport's
-    /// advertised host with the socket's bound port. See [`pinned_sent_by`].
+    /// whose own IP cannot go in a header: that listener's own identity
+    /// ([`ListenerRegistry::identity`]: its `advertise`, else the global
+    /// `advertised_address`, else a routable local IP), never a sibling
+    /// listener's. A socket that is no listener's keeps the transport's
+    /// advertised host with the socket's port. See [`pinned_sent_by`].
+    ///
+    /// [`ListenerRegistry::identity`]: crate::transport::ListenerRegistry::identity
     pub fn wildcard_pinned_sent_by(
         &self,
         transport: &Transport,
         local: SocketAddr,
     ) -> (String, u16) {
-        match self
-            .listener_registry
-            .resolve(*transport, local)
-            .and_then(|socket| socket.advertise)
+        self.listener_registry
+            .identity(*transport, local)
+            .unwrap_or_else(|| (self.via_host(transport), local.port()))
+    }
+
+    /// The sent-by `(host, port)` of the listener `local` belongs to: the
+    /// identity a message leaving on that listener's socket, or on a connection
+    /// it accepted, puts in its Via, Contact and Record-Route. Same resolution
+    /// as [`a_leg_advertised_host`](Self::a_leg_advertised_host) and
+    /// [`a_leg_advertised_port`](Self::a_leg_advertised_port).
+    pub fn listener_sent_by(&self, transport: Transport, local: SocketAddr) -> (String, u16) {
+        (
+            self.a_leg_advertised_host(Some(local), &transport),
+            self.a_leg_advertised_port(Some(local), &transport),
+        )
+    }
+
+    /// The sent-by of a script `send_socket=` pin (or a family egress socket):
+    /// the listener's `advertise`, else its bound IP, with its advertised port.
+    /// A wildcard-bound listener with no `advertise` takes its identity instead
+    /// of putting `0.0.0.0` in a header (see [`pinned_sent_by`]).
+    pub fn pin_sent_by(&self, pin: &crate::transport::SendSocket) -> (String, u16) {
+        if pin.advertise.is_none() && pin.addr.ip().is_unspecified() {
+            return self.listener_sent_by(pin.transport, pin.addr);
+        }
+        let (host, port) = pin.via_sent_by();
+        (format_sip_host(&host), port)
+    }
+
+    /// The listener an unpinned request to `destination` is going to leave on,
+    /// when that is decided before the send: the listener that accepted the
+    /// live connection [`send_to_target`] reuses for it (TLS, WS, WSS, the
+    /// transports it reuses inbound connections for), or the one a pinned pool
+    /// connection was opened from.
+    ///
+    /// Only looked up on a transport with more than one listener: with one,
+    /// every connection is that listener's and the transport's identity is
+    /// already its identity, so a single-listener deployment pays nothing and
+    /// its headers are what they always were.
+    pub fn stream_egress_listener(
+        &self,
+        transport: Transport,
+        destination: SocketAddr,
+    ) -> Option<SocketAddr> {
+        if !matches!(
+            transport,
+            Transport::Tls | Transport::WebSocket | Transport::WebSocketSecure
+        ) || !self.listener_registry.is_shared(transport)
         {
-            Some(advertise) => (
-                format_sip_host(&advertise.host),
-                advertise.port.unwrap_or(local.port()),
-            ),
-            None => (self.via_host(transport), local.port()),
+            return None;
+        }
+        self.stream_connections
+            .reuse_listener(destination, transport)
+    }
+
+    /// The socket a request to `destination` with no egress pin leaves from,
+    /// when siphon knows it before sending: the listener whose connection it
+    /// reuses ([`stream_egress_listener`](Self::stream_egress_listener)), or
+    /// for UDP the default egress socket, the first configured UDP listener.
+    /// `None` on a transport with a single listener, where there is only one
+    /// socket to leave from, and for a new outbound stream connection.
+    pub fn default_egress_listener(
+        &self,
+        transport: Transport,
+        destination: SocketAddr,
+    ) -> Option<SocketAddr> {
+        if transport == Transport::Udp {
+            return self
+                .listener_registry
+                .is_shared(transport)
+                .then(|| self.listen_addrs.get(&transport).copied())
+                .flatten();
+        }
+        self.stream_egress_listener(transport, destination)
+    }
+
+    /// Sent-by for a request to `destination` with no egress pin and no
+    /// address-family switch: the listener of the connection it will reuse
+    /// (see [`stream_egress_listener`](Self::stream_egress_listener)), else the
+    /// transport's `via_host` / `via_port`.
+    pub fn connection_sent_by(
+        &self,
+        transport: Transport,
+        destination: SocketAddr,
+    ) -> (String, u16) {
+        match self.stream_egress_listener(transport, destination) {
+            Some(listener) => self.listener_sent_by(transport, listener),
+            None => (self.via_host(&transport), self.via_port(&transport)),
         }
     }
 
@@ -771,14 +853,11 @@ impl DispatcherState {
     /// Via sent-by for a request with no egress pin: the listener it will leave
     /// from when its destination is outside the default listener's address
     /// family (see [`family_egress_socket`](Self::family_egress_socket)), else
-    /// the transport's usual `via_host` / `via_port`.
+    /// [`connection_sent_by`](Self::connection_sent_by).
     pub fn unpinned_sent_by(&self, transport: Transport, destination: SocketAddr) -> (String, u16) {
         match self.family_egress_socket(transport, destination) {
-            Some(socket) => {
-                let (host, port) = socket.via_sent_by();
-                (format_sip_host(&host), port)
-            }
-            None => (self.via_host(&transport), self.via_port(&transport)),
+            Some(socket) => self.pin_sent_by(&socket),
+            None => self.connection_sent_by(transport, destination),
         }
     }
 

@@ -7,6 +7,7 @@
 pub mod admission;
 pub mod custom;
 pub mod enum_servers;
+pub mod event_lag;
 pub mod glibc;
 pub mod ipsec;
 

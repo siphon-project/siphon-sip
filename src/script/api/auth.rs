@@ -6,6 +6,8 @@
 //! Credentials come from `auth.users` (static), an HTTP lookup, or SQL —
 //! see [`crate::auth::server`] for the SQL source.
 
+#[cfg(test)]
+mod credential_cache_tests;
 mod ims;
 mod integrity;
 mod sip_digest;
@@ -16,35 +18,18 @@ mod vectors;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use dashmap::DashMap;
 use pyo3::prelude::*;
 use tracing::{debug, warn};
 
 use super::call::PyCall;
 use super::diameter_cx::cx_client;
 use super::request::PyRequest;
+use crate::auth::credential_cache::{CredentialCache, CredentialKey};
 use crate::auth::server::{ha1_column_for, CredentialLookup, DatabaseCredentials};
 use crate::auth::DigestAlgorithm;
 use crate::config::{AkaCredential, AuthBackendType, DatabaseAuthConfig, HttpAuthConfig};
 use crate::diameter::DiameterManager;
 use vectors::{store_auth_vector, take_auth_vector};
-
-/// A cached HTTP-auth credential lookup (HA1 hex when `http.ha1`, else the
-/// plaintext password), with the wall-clock instant it was fetched so the TTL
-/// can be checked on read.
-#[derive(Debug, Clone)]
-struct CachedHa1 {
-    /// The backend response body — used verbatim as today's fetch result.
-    value: String,
-    /// When this entry was fetched, for TTL expiry.
-    fetched_at: std::time::Instant,
-}
-
-/// Whether a cache entry of the given age is still within its TTL.
-/// Pure so the boundary is unit-testable without touching the clock.
-fn is_cache_fresh(age: std::time::Duration, ttl: std::time::Duration) -> bool {
-    age < ttl
-}
 
 /// A credential the script handed to a digest helper, in place of the
 /// configured backend.
@@ -227,6 +212,7 @@ struct HttpPrelude<'a> {
     fields: DigestFields,
     http_config: &'a HttpAuthConfig,
     client: &'a reqwest::Client,
+    cache_key: CredentialKey,
     /// `Some` when the TTL cache already holds the credential.
     cached: Option<String>,
 }
@@ -239,7 +225,7 @@ struct DatabasePrelude {
     fields: DigestFields,
     database: Arc<DatabaseCredentials>,
     ha1_column: &'static str,
-    cache_key: String,
+    cache_key: CredentialKey,
     /// `Some` when the TTL cache already holds the credential.
     cached: Option<String>,
 }
@@ -284,12 +270,11 @@ pub struct PyAuth {
     http_client: Option<reqwest::Client>,
     /// SQL credential source for `auth.backend: database`.
     database: Option<Arc<DatabaseCredentials>>,
-    /// In-process TTL cache of successful credential lookups, keyed by
-    /// username. `Some` only when `auth.http.cache_ttl_secs > 0`. Flattens a
+    /// In-process TTL cache of successful credential lookups, keyed by realm
+    /// and username. `Some` only when `cache_ttl_secs > 0`. Flattens a
     /// registration storm: repeated REGISTERs for the same subscriber reuse the
-    /// cached HA1/password instead of each making a blocking backend fetch that
-    /// pins a Python-executor worker.
-    http_ha1_cache: Option<Arc<DashMap<String, CachedHa1>>>,
+    /// cached HA1/password instead of each making a backend fetch.
+    credential_cache: Option<Arc<CredentialCache>>,
     /// Optional shared secret for stateless-nonce HMAC integrity (RFC 7616
     /// §3.3). When set, nonces the cluster did not issue are rejected. When
     /// None, the nonce is timestamp-only — which still bounds digest replay to
@@ -334,7 +319,7 @@ impl PyAuth {
             aka_credentials: Arc::new(HashMap::new()),
             http_config: None,
             http_client: None,
-            http_ha1_cache: None,
+            credential_cache: None,
             database: None,
             nonce_secret: None,
             nonce_ttl_secs: DEFAULT_NONCE_TTL_SECS,
@@ -353,7 +338,7 @@ impl PyAuth {
             aka_credentials: Arc::new(HashMap::new()),
             http_config: None,
             http_client: None,
-            http_ha1_cache: None,
+            credential_cache: None,
             database: None,
             nonce_secret: None,
             nonce_ttl_secs: DEFAULT_NONCE_TTL_SECS,
@@ -379,11 +364,8 @@ impl PyAuth {
             .map_err(|error| format!("failed to build reqwest client for HTTP auth: {error}"))?;
         // Only allocate the cache when caching is enabled — `cache_ttl_secs == 0`
         // keeps the per-request blocking-fetch behaviour.
-        self.http_ha1_cache = if config.cache_ttl_secs > 0 {
-            Some(Arc::new(DashMap::new()))
-        } else {
-            None
-        };
+        self.credential_cache =
+            (config.cache_ttl_secs > 0).then(|| Arc::new(CredentialCache::new()));
         self.http_config = Some(config);
         self.http_client = Some(client);
         Ok(())
@@ -395,12 +377,14 @@ impl PyAuth {
     /// question (the credential for a username) and only one is ever the
     /// configured backend, so a second cache would be dead weight.
     pub fn set_database_config(&mut self, config: DatabaseAuthConfig) {
-        self.http_ha1_cache = if config.cache_ttl_secs > 0 {
-            Some(Arc::new(DashMap::new()))
-        } else {
-            None
-        };
+        self.credential_cache =
+            (config.cache_ttl_secs > 0).then(|| Arc::new(CredentialCache::new()));
         self.database = Some(Arc::new(DatabaseCredentials::new(config)));
+    }
+
+    /// The credential cache, when caching is on, so the admin API can flush it.
+    pub(crate) fn credential_cache(&self) -> Option<Arc<CredentialCache>> {
+        self.credential_cache.clone()
     }
 
     /// Set the Diameter manager for IMS authentication (Cx MAR).
@@ -1537,7 +1521,11 @@ impl PyAuth {
     }
 
     /// HTTP backend: fetch HA1 (or password) from REST endpoint, then verify digest.
-    fn http_prelude(&self, auth_value: &str) -> Result<HttpPrelude<'_>, CredentialCheck> {
+    fn http_prelude(
+        &self,
+        auth_value: &str,
+        realm: &str,
+    ) -> Result<HttpPrelude<'_>, CredentialCheck> {
         let fields = match DigestFields::parse(auth_value) {
             Some(f) => f,
             None => return Err(CredentialCheck::Rejected),
@@ -1570,8 +1558,9 @@ impl PyAuth {
         // Serve from the TTL cache when possible — this is what keeps a
         // registration storm for the same subscribers from translating 1:1 into
         // blocking HTTP fetches that each pin a Python-executor worker.
+        let cache_key = CredentialKey::new(realm, &fields.username, None);
         let cached = self
-            .cached_credential(&fields.username, http_config.cache_ttl_secs)
+            .cached_credential(&cache_key, http_config.cache_ttl_secs)
             .inspect(|_| {
                 if let Some(metrics) = crate::metrics::try_metrics() {
                     metrics.auth_ha1_cache_hits_total.inc();
@@ -1583,6 +1572,7 @@ impl PyAuth {
             fields,
             http_config,
             client,
+            cache_key,
             cached,
         })
     }
@@ -1622,26 +1612,25 @@ impl PyAuth {
     /// HTTP backend, blocking — siphon's own callers, which reach this from a
     /// sync worker they may block.
     fn validate_http(&self, auth_value: &str, realm: &str, method: &str) -> CredentialCheck {
-        let prelude = match self.http_prelude(auth_value) {
+        let prelude = match self.http_prelude(auth_value, realm) {
             Ok(prelude) => prelude,
             Err(decided) => return decided,
         };
-        let body = match &prelude.cached {
-            Some(cached) => cached.clone(),
-            None => match self.fetch_http_credential(
-                prelude.http_config,
-                prelude.client,
-                &prelude.fields.username,
-            ) {
-                CredentialLookup::Found(body) => {
-                    self.store_credential(&prelude.fields.username, &body);
-                    body
-                }
-                CredentialLookup::NotFound => return CredentialCheck::Rejected,
-                CredentialLookup::Unavailable => return CredentialCheck::Unavailable,
-            },
-        };
-        self.http_finish(&prelude, body, realm, method)
+        if let Some(cached) = &prelude.cached {
+            let verdict = self.http_finish(&prelude, cached.clone(), realm, method);
+            if verdict.is_valid() {
+                return verdict;
+            }
+        }
+        let lookup = self.fetch_http_credential(
+            prelude.http_config,
+            prelude.client,
+            &prelude.fields.username,
+        );
+        match self.settle_lookup(&prelude.cache_key, lookup, prelude.cached.is_some()) {
+            Ok(body) => self.http_finish(&prelude, body, realm, method),
+            Err(decided) => decided,
+        }
     }
 
     /// HTTP backend, awaitable — the script APIs, which reach this from an
@@ -1656,29 +1645,27 @@ impl PyAuth {
         realm: &str,
         method: &str,
     ) -> CredentialCheck {
-        let prelude = match self.http_prelude(auth_value) {
+        let prelude = match self.http_prelude(auth_value, realm) {
             Ok(prelude) => prelude,
             Err(decided) => return decided,
         };
-        let body = match &prelude.cached {
-            Some(cached) => cached.clone(),
-            None => match self
-                .fetch_http_credential_async(
-                    prelude.http_config,
-                    prelude.client,
-                    &prelude.fields.username,
-                )
-                .await
-            {
-                CredentialLookup::Found(body) => {
-                    self.store_credential(&prelude.fields.username, &body);
-                    body
-                }
-                CredentialLookup::NotFound => return CredentialCheck::Rejected,
-                CredentialLookup::Unavailable => return CredentialCheck::Unavailable,
-            },
-        };
-        self.http_finish(&prelude, body, realm, method)
+        if let Some(cached) = &prelude.cached {
+            let verdict = self.http_finish(&prelude, cached.clone(), realm, method);
+            if verdict.is_valid() {
+                return verdict;
+            }
+        }
+        let lookup = self
+            .fetch_http_credential_async(
+                prelude.http_config,
+                prelude.client,
+                &prelude.fields.username,
+            )
+            .await;
+        match self.settle_lookup(&prelude.cache_key, lookup, prelude.cached.is_some()) {
+            Ok(body) => self.http_finish(&prelude, body, realm, method),
+            Err(decided) => decided,
+        }
     }
 
     /// Database backend: look the credential up in SQL, then verify the digest.
@@ -1686,7 +1673,11 @@ impl PyAuth {
     /// Same shape as [`Self::validate_http`] — the two differ only in where the
     /// credential comes from — so the username bound, the TTL cache and the
     /// `Unavailable`-is-not-evidence rule all behave identically.
-    fn database_prelude(&self, auth_value: &str) -> Result<DatabasePrelude, CredentialCheck> {
+    fn database_prelude(
+        &self,
+        auth_value: &str,
+        realm: &str,
+    ) -> Result<DatabasePrelude, CredentialCheck> {
         let fields = match DigestFields::parse(auth_value) {
             Some(f) => f,
             None => return Err(CredentialCheck::Rejected),
@@ -1716,13 +1707,11 @@ impl PyAuth {
 
         // With one H(A1) column per hash (RFC 8760) the row holds a different
         // credential per algorithm, so the cache has to be keyed by both or a
-        // SHA-256 phone would be served the MD5 phone's cached hash.
+        // SHA-256 phone would be served the MD5 phone's cached hash. The realm
+        // is in the key because the query binds it (issue #714).
         let ha1_column = ha1_column_for(fields.algorithm);
-        let cache_key = if database.stores_ha1() {
-            format!("{}|{ha1_column}", fields.username)
-        } else {
-            fields.username.clone()
-        };
+        let column = database.stores_ha1().then_some(ha1_column);
+        let cache_key = CredentialKey::new(realm, &fields.username, column);
 
         let cached = self
             .cached_credential(&cache_key, database.cache_ttl_secs())
@@ -1770,27 +1759,23 @@ impl PyAuth {
 
     /// Database backend, blocking — siphon's own sync callers.
     fn validate_database(&self, auth_value: &str, realm: &str, method: &str) -> CredentialCheck {
-        let prelude = match self.database_prelude(auth_value) {
+        let prelude = match self.database_prelude(auth_value, realm) {
             Ok(prelude) => prelude,
             Err(decided) => return decided,
         };
-        let credential = match &prelude.cached {
-            Some(cached) => cached.clone(),
-            None => {
-                match prelude
-                    .database
-                    .lookup(&prelude.fields.username, realm, prelude.ha1_column)
-                {
-                    CredentialLookup::Found(credential) => {
-                        self.store_credential(&prelude.cache_key, &credential);
-                        credential
-                    }
-                    CredentialLookup::NotFound => return CredentialCheck::Rejected,
-                    CredentialLookup::Unavailable => return CredentialCheck::Unavailable,
-                }
+        if let Some(cached) = &prelude.cached {
+            let verdict = self.database_finish(&prelude, cached.clone(), realm, method);
+            if verdict.is_valid() {
+                return verdict;
             }
-        };
-        self.database_finish(&prelude, credential, realm, method)
+        }
+        let lookup = prelude
+            .database
+            .lookup(&prelude.fields.username, realm, prelude.ha1_column);
+        match self.settle_lookup(&prelude.cache_key, lookup, prelude.cached.is_some()) {
+            Ok(credential) => self.database_finish(&prelude, credential, realm, method),
+            Err(decided) => decided,
+        }
     }
 
     /// Database backend, awaitable — the script APIs. Identical but for the one
@@ -1801,58 +1786,74 @@ impl PyAuth {
         realm: &str,
         method: &str,
     ) -> CredentialCheck {
-        let prelude = match self.database_prelude(auth_value) {
+        let prelude = match self.database_prelude(auth_value, realm) {
             Ok(prelude) => prelude,
             Err(decided) => return decided,
         };
-        let credential = match &prelude.cached {
-            Some(cached) => cached.clone(),
-            None => match prelude
-                .database
-                .lookup_async(&prelude.fields.username, realm, prelude.ha1_column)
-                .await
-            {
-                CredentialLookup::Found(credential) => {
-                    self.store_credential(&prelude.cache_key, &credential);
-                    credential
+        if let Some(cached) = &prelude.cached {
+            let verdict = self.database_finish(&prelude, cached.clone(), realm, method);
+            if verdict.is_valid() {
+                return verdict;
+            }
+        }
+        let lookup = prelude
+            .database
+            .lookup_async(&prelude.fields.username, realm, prelude.ha1_column)
+            .await;
+        match self.settle_lookup(&prelude.cache_key, lookup, prelude.cached.is_some()) {
+            Ok(credential) => self.database_finish(&prelude, credential, realm, method),
+            Err(decided) => decided,
+        }
+    }
+
+    /// The cached credential for `key`, if caching is on and it is in its TTL.
+    fn cached_credential(&self, key: &CredentialKey, ttl_secs: u64) -> Option<String> {
+        self.credential_cache.as_ref()?.get(key, ttl_secs)
+    }
+
+    /// Store a credential the backend answered. No-op when caching is off.
+    fn store_credential(&self, key: &CredentialKey, value: &str) {
+        if let Some(cache) = self.credential_cache.as_ref() {
+            cache.store(key, value);
+        }
+    }
+
+    /// Fold a backend lookup into the cache: the credential to verify, or the
+    /// verdict already reached. `revalidating` marks the one re-read of a cached
+    /// credential that failed to verify (reset password, deleted user); only the
+    /// verdict the caller then returns is scored, never the cached mismatch.
+    fn settle_lookup(
+        &self,
+        key: &CredentialKey,
+        lookup: CredentialLookup,
+        revalidating: bool,
+    ) -> Result<String, CredentialCheck> {
+        match lookup {
+            CredentialLookup::Found(credential) => {
+                if revalidating {
+                    debug!(username = %key.username(), "auth: re-read a cached credential that failed to verify");
                 }
-                CredentialLookup::NotFound => return CredentialCheck::Rejected,
-                CredentialLookup::Unavailable => return CredentialCheck::Unavailable,
-            },
-        };
-        self.database_finish(&prelude, credential, realm, method)
-    }
-
-    /// Return a cached credential body for `username` if caching is enabled and
-    /// the entry is still within `ttl_secs`. Expired entries miss (and are left
-    /// for the next fetch to overwrite).
-    fn cached_credential(&self, username: &str, ttl_secs: u64) -> Option<String> {
-        if ttl_secs == 0 {
-            return None;
-        }
-        let cache = self.http_ha1_cache.as_ref()?;
-        let entry = cache.get(username)?;
-        if is_cache_fresh(
-            entry.fetched_at.elapsed(),
-            std::time::Duration::from_secs(ttl_secs),
-        ) {
-            Some(entry.value.clone())
-        } else {
-            None
-        }
-    }
-
-    /// Store a successful credential lookup in the TTL cache. No-op when caching
-    /// is disabled.
-    fn store_credential(&self, username: &str, value: &str) {
-        if let Some(cache) = self.http_ha1_cache.as_ref() {
-            cache.insert(
-                username.to_string(),
-                CachedHa1 {
-                    value: value.to_string(),
-                    fetched_at: std::time::Instant::now(),
-                },
-            );
+                self.store_credential(key, &credential);
+                Ok(credential)
+            }
+            CredentialLookup::NotFound => {
+                // A deleted user must stop authenticating now, not at expiry.
+                if let Some(cache) = self.credential_cache.as_ref() {
+                    cache.remove(key);
+                }
+                Err(CredentialCheck::Rejected)
+            }
+            // The cached credential already said no and the backend cannot say
+            // otherwise: that answer stands, as it did before the re-read.
+            CredentialLookup::Unavailable if revalidating => {
+                warn!(
+                    username = %key.username(),
+                    "auth: could not re-read a cached credential that failed to verify; \
+                     rejecting on the cached one"
+                );
+                Err(CredentialCheck::Rejected)
+            }
+            CredentialLookup::Unavailable => Err(CredentialCheck::Unavailable),
         }
     }
 
@@ -4017,7 +4018,9 @@ mod tests {
 
     fn database_config(query: &str, ha1: bool) -> DatabaseAuthConfig {
         DatabaseAuthConfig {
-            url: "postgresql://127.0.0.1/siphon".to_string(),
+            // Port 9 (discard): nothing listens, so the re-read a cached
+            // credential that fails to verify triggers is refused at once.
+            url: "postgresql://127.0.0.1:9/siphon".to_string(),
             query: query.to_string(),
             ha1,
             cache_ttl_secs: 300,
@@ -4062,15 +4065,16 @@ mod tests {
     /// Driven through the TTL cache rather than a live database: the cache is
     /// the seam that lets the verification half be tested without one, and it
     /// is the path a registration storm actually takes.
-    #[test]
-    fn database_backend_verifies_a_stored_password() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn database_backend_verifies_a_stored_password() {
+        pyo3::Python::initialize();
         let mut auth = PyAuth::empty();
         auth.set_backend_type(AuthBackendType::Database);
         auth.set_database_config(database_config(
             "SELECT password FROM subscribers WHERE username = $1 AND realm = $2",
             false,
         ));
-        auth.store_credential("alice", "pass123");
+        auth.store_credential(&CredentialKey::new("example.com", "alice", None), "pass123");
 
         assert_eq!(
             auth.validate_credentials(
@@ -4092,15 +4096,19 @@ mod tests {
     }
 
     /// `ha1: true` means the column is already H(A1) and is used verbatim.
-    #[test]
-    fn database_backend_verifies_a_stored_ha1() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn database_backend_verifies_a_stored_ha1() {
+        pyo3::Python::initialize();
         let mut auth = PyAuth::empty();
         auth.set_backend_type(AuthBackendType::Database);
         auth.set_database_config(database_config(
             "SELECT ha1 FROM subscribers WHERE username = $1",
             true,
         ));
-        auth.store_credential("bob|ha1_md5", &md5_hex("bob:example.com:secret"));
+        auth.store_credential(
+            &CredentialKey::new("example.com", "bob", Some("ha1_md5")),
+            &md5_hex("bob:example.com:secret"),
+        );
 
         assert_eq!(
             auth.validate_credentials(
@@ -4167,8 +4175,9 @@ mod tests {
     /// Driven through the cache, whose key carries the column for the same
     /// reason the query does: one cache entry per username would serve the
     /// first algorithm's hash to every other.
-    #[test]
-    fn database_backend_selects_the_ha1_for_the_clients_algorithm() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn database_backend_selects_the_ha1_for_the_clients_algorithm() {
+        pyo3::Python::initialize();
         use crate::auth::DigestAlgorithm;
 
         let mut auth = PyAuth::empty();
@@ -4181,11 +4190,11 @@ mod tests {
         let realm = "example.com";
         let password = "s3cret";
         auth.store_credential(
-            "carol|ha1_md5",
+            &CredentialKey::new(realm, "carol", Some("ha1_md5")),
             &md5_hex(&format!("carol:{realm}:{password}")),
         );
         auth.store_credential(
-            "carol|ha1_sha256",
+            &CredentialKey::new(realm, "carol", Some("ha1_sha256")),
             &crate::auth::hash_hex_public(
                 DigestAlgorithm::Sha256,
                 format!("carol:{realm}:{password}").as_bytes(),
@@ -4236,55 +4245,35 @@ mod tests {
     }
 
     #[test]
-    fn cache_freshness_boundary() {
-        use std::time::Duration;
-        assert!(is_cache_fresh(
-            Duration::from_secs(0),
-            Duration::from_secs(300)
-        ));
-        assert!(is_cache_fresh(
-            Duration::from_secs(299),
-            Duration::from_secs(300)
-        ));
-        // At and beyond the TTL the entry is stale.
-        assert!(!is_cache_fresh(
-            Duration::from_secs(300),
-            Duration::from_secs(300)
-        ));
-        assert!(!is_cache_fresh(
-            Duration::from_secs(400),
-            Duration::from_secs(300)
-        ));
-    }
-
-    #[test]
     fn ha1_cache_miss_then_store_then_hit() {
         let auth = http_auth_with_cache(300);
+        let alice = CredentialKey::new("example.com", "alice", None);
 
         // Cold: nothing stored yet.
-        assert!(auth.cached_credential("alice", 300).is_none());
+        assert!(auth.cached_credential(&alice, 300).is_none());
 
         // After a successful lookup is stored, it hits within the TTL.
-        auth.store_credential("alice", "deadbeefcafe");
+        auth.store_credential(&alice, "deadbeefcafe");
         assert_eq!(
-            auth.cached_credential("alice", 300).as_deref(),
+            auth.cached_credential(&alice, 300).as_deref(),
             Some("deadbeefcafe")
         );
 
         // A ttl of 0 always misses (caching disabled for this call).
-        assert!(auth.cached_credential("alice", 0).is_none());
+        assert!(auth.cached_credential(&alice, 0).is_none());
     }
 
     #[test]
     fn ha1_cache_not_allocated_when_ttl_zero() {
         let auth = http_auth_with_cache(0);
         assert!(
-            auth.http_ha1_cache.is_none(),
+            auth.credential_cache().is_none(),
             "no cache map should be allocated when cache_ttl_secs is 0"
         );
         // store_credential is a no-op and lookups always miss.
-        auth.store_credential("alice", "x");
-        assert!(auth.cached_credential("alice", 300).is_none());
+        let alice = CredentialKey::new("example.com", "alice", None);
+        auth.store_credential(&alice, "x");
+        assert!(auth.cached_credential(&alice, 300).is_none());
     }
 
     // ── require_ims_digest: the Multimedia-Auth-Request it sends ─────────

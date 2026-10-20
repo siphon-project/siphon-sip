@@ -511,6 +511,7 @@ pub(super) async fn init_gateway(config: &Config) -> Option<Arc<DispatcherManage
         manager.add_group(
             DispatcherGroup::new(group_config.name.clone(), algorithm, destinations)
                 .with_probe_config(probe)
+                .with_probe_listener(group_config.probe_listener_addr())
                 .with_source_networks(source_networks)
                 .with_reroute_causes(group_config.reroute_causes.clone())
                 .with_inbound_limits(group_config.resolved_inbound_limits())
@@ -733,6 +734,7 @@ pub(super) fn spawn_rf_register_emitter(
     mut events: tokio::sync::broadcast::Receiver<crate::registrar::RegistrationEvent>,
 ) {
     use crate::diameter::ro::{ImsChargingData, NodeRole};
+    use crate::metrics::event_lag::{record_lag, LaggedConsumer};
     use crate::registrar::RegistrationEvent;
 
     tokio::spawn(async move {
@@ -741,7 +743,9 @@ pub(super) fn spawn_rf_register_emitter(
             let event = match events.recv().await {
                 Ok(event) => event,
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                    warn!(skipped, "rf: registrar event emitter lagged");
+                    // A lost ACR-EVENT is a charging record, not state: count it.
+                    record_lag(LaggedConsumer::RfRegister, skipped);
+                    warn!(skipped, "rf: registrar events lagged, ACR-EVENTs lost");
                     continue;
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,

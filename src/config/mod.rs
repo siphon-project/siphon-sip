@@ -1094,6 +1094,9 @@ impl Config {
                     .outbound_transport(&field)
                     .map_err(SiphonError::Config)?;
             }
+            group
+                .validate_probe_listener(&self.listen)
+                .map_err(SiphonError::Config)?;
         }
         Ok(())
     }

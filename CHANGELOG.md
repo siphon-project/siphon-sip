@@ -22,6 +22,41 @@ entry, but a working config keeps working.
   (`path`, `duration_ms`, `reason`), bounded by `max_duration_ms` and
   `silence_ms`. A seat is not a call, so `start_recording` cannot reach a
   caller the script seated in a room; this can. siphon-rtp only.
+- **`POST /admin/auth/cache/invalidate`** drops cached digest credentials
+  (`auth.http` / `auth.database`): `{"realm","username"}` for one user,
+  `{"realm"}` for one realm, `{}` for all. `204`, or `404 {"error":"no
+  credential cache"}` when caching is off. Behind the admin bearer token like the
+  other mutating routes. A controller can flush on every credential write and keep
+  a long `cache_ttl_secs`.
+
+- **`probe_listener` on a gateway group.** `gateway.groups[].probe_listener:
+  "192.0.2.10:15068"` sends the group's OPTIONS probes from that listener and
+  puts its identity in their Via, From and Contact: a UDP probe is written to
+  its socket, a TLS probe opens its connection from its IP. For a peer that
+  admits only one of siphon's names, whose probes were refused and the group
+  marked down. Checked at startup against the configured listeners: a listener
+  of every destination's transport must be bound at that address. YAML groups
+  only.
+- **Control plane: `contact_user` names the user part of siphon's own
+  Contact**, beside `contact_host` and everywhere it can be named: on a `dial`
+  target (`{uri}` or `{aor}`, connecting or `on_answer: "bridge"`), a `route`
+  target and `originate` (every leg of an `originate {aor}`), and for the
+  caller's side on `answer`, `ring` and `progress` (`contact_user`) or `dial`
+  and `route` (`caller_contact_user`). siphon's Contact is userless, and a
+  trunk peer that documents its Contact as `<sip:user@host;transport=tls>`
+  keys the account on that user, which until now only a script's
+  `call.set_contact_user()` could add. Host, port and transport stay as they
+  were (a `contact_host` composes), and the user sticks as the host does: the
+  leg's dialog Contact carries it on re-INVITE, UPDATE, session refresh and
+  PRACK, and the caller's side is fixed once an 18x or 2xx went out (another
+  user is `invalid_state`, `presented` is `null` for the userless Contact).
+  The value is an RFC 3261 `user`; an empty string, `@`, `:`, whitespace, a
+  bad `%` escape or a `;` (where user parameters start) is `bad_request`
+  before anything is sent, as is a `contact_user` on `replace_peer` or
+  `accept_refer`. A target's `contact_user` outranks the script's
+  `set_contact_user()`; the script's `set_contact_uri()` outranks both. The
+  Rust, Python and TypeScript control SDKs take it as `contact_user` /
+  `caller_contact_user` and `contactUser` / `callerContactUser`.
 - **Gateway: `allow_methods` per gateway group.** The methods siphon advertises
   in `Allow` to one group's peers, instead of every method it implements. For a
   trunk that picks its transfer method from `Allow`: leave `REFER` out and it
@@ -98,6 +133,42 @@ entry, but a working config keeps working.
 
 ### Fixed
 
+- **Digest credential cache keyed without the realm, and stale for the whole
+  TTL.** The `auth.http` / `auth.database` cache keyed on the username alone while
+  the database query binds the realm, so two realms with the same username shared
+  one entry and one tenant's phone was checked against the other's hash. It is now
+  keyed by realm and username (and the H(A1) column). A changed password was
+  refused, and scored by `failed_auth_ban`, until the entry expired: a digest that
+  fails against a cached credential now re-reads the backend once, accepts the new
+  credential, and refuses and drops a user the backend no longer knows. A lookup
+  the cache missed is still made once.
+
+- **A listener's `advertise` is that listener's, not its transport's.** The
+  first listener of a transport with an `advertise` lent it to every listener
+  of the transport, so with two TLS listeners (phones on one, a trunk that
+  requires its FQDN on the other) phones were handed the trunk listener's name
+  in Contact, Via and Record-Route and reconnected to the wrong listener, while
+  listing the listeners the other way round broke the trunk. Each message now
+  carries the identity of the listener it leaves on: an answer the listener the
+  request arrived on, a request over a reused TLS/WS/WSS connection (including
+  NAT keepalives, NOTIFY, `proxy.send_request`, B2BUA B-legs and their
+  in-dialog requests) the listener that accepted it, a stream flow its
+  listener's `advertise`, a `send_socket=` pin the pinned listener in the Via
+  and now also the B2BUA Contact and From, an unpinned UDP request the first UDP
+  listener (the socket it leaves from). A listener without `advertise` falls
+  back to `advertised_address`, then its own address, never a sibling's: if you
+  relied on the borrowing, put the `advertise` on each listener that should
+  present it. A relay crossing two listeners on one port but two interfaces now
+  stamps a Record-Route per listener (RFC 5658), as one crossing two ports
+  already did. A new outbound connection from the default source still
+  advertises the transport's identity. A proxy relay over a captured TLS, TCP
+  or WebSocket flow now advertises that listener's public identity
+  (`advertise`, else `advertised_address`) rather than the socket's own IP, as a
+  B2BUA leg over a flow already did; a UDP or IPsec flow still names its
+  socket. Otherwise a configuration with one listener per transport is
+  unchanged.
+
+## [1.15.0] — 2026-10-19
 - **A TLS B-leg and an originate to a hostname now present that hostname as
   SNI.** They sent the resolved address, so a hostname-vhost trunk could not
   route the handshake. Outbound TLS REGISTERs present the registrar's domain the
@@ -145,6 +216,23 @@ entry, but a working config keeps working.
   on `originate` are `bad_request`; `originate` has no caller to offer from.
 
 ### Fixed
+
+- **Registration events no longer stop for good after a burst.** The task that
+  feeds registrar changes to `@registrar.on_change` and the control plane's
+  `RegistrationChanged` ended on the first broadcast lag (more than 1024 events
+  behind, e.g. a registration storm after a restart against a slow handler),
+  and neither fired again until restart, with nothing logged. The
+  `@registration.on_change` task for outbound registrations had the same flaw.
+  A lag is now logged, counted in the new
+  `siphon_event_consumer_lagged_total{consumer}` counter (`registrar`,
+  `registrant`, and `rf_register` for the Rf ACR-EVENT emitter, which already
+  survived a lag but did not count it), and answered with a snapshot: every
+  registered AoR (every outbound registration) is re-reported with its current
+  state under the new event type `"snapshot"`, then the queued events follow.
+  `@registration.on_change` also gains a `state` key in its dict (the
+  registration's current state, `None` once removed), so a snapshot says
+  whether a trunk is registered or failed. A shutdown-phase receiver that
+  lagged now reads on instead of reporting shutdown over.
 
 - **A controller `dial` with a media profile no longer leaves its media
   allocation behind when the caller cancels while it rings.** Nothing released

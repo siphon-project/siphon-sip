@@ -29,42 +29,48 @@ pub(crate) fn checked_contact_host(value: &str) -> Result<String, String> {
 
 /// Check every target's `contact_host` and store it as the Contact carries it,
 /// before any branch is sent: a host siphon cannot put on the wire refuses the
-/// dial before anything rings, as a `to` does ([`branch_called_parties`]).
+/// dial before anything rings, as a `to` does ([`branch_called_parties`]). Its
+/// `contact_user` is checked the same way, here, so no dial path can check one
+/// and not the other ([`super::contact_user::check_branch_contact_users`]).
 pub(super) fn check_branch_contact_hosts(targets: &mut [DialTarget]) -> Result<(), String> {
     for target in targets.iter_mut() {
         if let Some(host) = target.contact_host.as_deref() {
             target.contact_host = Some(checked_contact_host(host)?);
         }
     }
-    Ok(())
+    super::contact_user::check_branch_contact_users(targets)
 }
 
-/// [`b2bua_originate_prepare`] presenting `contact_host` as the host of
-/// siphon's own Contact on the call (the `originate` verb's `contact_host`).
+/// [`b2bua_originate_prepare`] presenting `contact_host` as the host and
+/// `contact_user` as the user part of siphon's own Contact on the call (the
+/// `originate` verb's arguments of those names).
 pub(crate) fn b2bua_originate_prepare_with_contact_host(
     params: OriginateParams,
     contact_host: Option<String>,
+    contact_user: Option<String>,
 ) -> Result<PreparedOriginate, OriginateError> {
     let Some(control) = B2BUA_CONTROL.get() else {
         return Err(OriginateError::Unavailable(
             "b2bua is not running — nothing to originate from".to_string(),
         ));
     };
-    prepare_originate_with_contact_host(&control.state, params, contact_host)
+    prepare_originate_with_contact_host(&control.state, params, contact_host, contact_user)
 }
 
-/// [`prepare_originate`] presenting `contact_host` as the host of siphon's own
-/// Contact on the call.
+/// [`prepare_originate`] presenting `contact_host` as the host and
+/// `contact_user` as the user part of siphon's own Contact on the call.
 pub(crate) fn prepare_originate_with_contact_host(
     state: &DispatcherState,
     params: OriginateParams,
     contact_host: Option<String>,
+    contact_user: Option<String>,
 ) -> Result<PreparedOriginate, OriginateError> {
     prepare_originate_routed(
         state,
         params,
         &OriginateRoute {
             contact_host,
+            contact_user,
             ..OriginateRoute::default()
         },
     )
@@ -90,6 +96,18 @@ pub(crate) enum CallerContactHostRefusal {
     /// No such call.
     #[error("call is gone")]
     UnknownCall,
+    /// The `contact_user` twin of [`Self::AlreadyPresented`]: the caller
+    /// already holds a Contact whose user part is `presented` (`None` for the
+    /// userless one siphon presents by default).
+    #[error(
+        "the caller was already sent siphon's Contact with {}, which it may hold as its remote \
+         target; contact_user can only repeat it now",
+        presented.as_deref().map_or_else(|| "no user part".to_string(), |user| format!("user {user:?}"))
+    )]
+    UserAlreadyPresented {
+        /// The user part the caller was sent, if any.
+        presented: Option<String>,
+    },
 }
 
 /// Present `value` as the host of siphon's own Contact toward the caller of
@@ -99,7 +117,8 @@ pub(crate) enum CallerContactHostRefusal {
 /// The caller side of [`DialTarget::contact_host`]: a call that came in from a
 /// peer which identifies the tenant or account by the host of the Contact
 /// needs that host in what siphon answers it with too. Only the host changes;
-/// port (the listener the INVITE arrived on), transport and user part stay.
+/// port (the listener the INVITE arrived on), transport and user part stay (the
+/// user part is [`set_caller_contact_user`]'s).
 /// It sticks for the dialog: the same value again is a no-op, and a different
 /// one is refused once the caller has been sent an 18x or 2xx carrying a
 /// Contact. Before that the last one set wins.
@@ -171,10 +190,24 @@ pub(crate) fn caller_response_contact(
         call.caller_contact_presented
             .store(true, std::sync::atomic::Ordering::Release);
     }
-    match call.caller_contact_host.as_deref() {
-        Some(host) => rewrite_contact_host(&built, host).unwrap_or(built),
-        None => built,
+    // The host and the user part a controller named (`contact_host`,
+    // `contact_user`), each replacing its own part of the built Contact alone.
+    let (host, user) = (
+        call.caller_contact_host.clone(),
+        call.caller_contact_user.clone(),
+    );
+    if host.is_none() && user.is_none() {
+        return built;
     }
+    rewrite_contact_uri(&built, |uri| {
+        if let Some(host) = host {
+            uri.host = host;
+        }
+        if user.is_some() {
+            uri.user = user;
+        }
+    })
+    .unwrap_or(built)
 }
 
 /// Record that the caller of `internal_call_id` was sent siphon's Contact on
@@ -190,6 +223,16 @@ pub(crate) fn note_caller_contact_presented(state: &DispatcherState, internal_ca
 /// a bare URI) with the URI's host replaced by `host`, everything else as it
 /// was. `None` when the URI does not parse.
 fn rewrite_contact_host(contact: &str, host: &str) -> Option<String> {
+    rewrite_contact_uri(contact, |uri| uri.host = host.to_string())
+}
+
+/// `contact` (a Contact header value, `<uri>` with any parameters after it, or
+/// a bare URI) with its URI changed by `change`, everything around the URI as
+/// it was. `None` when the URI does not parse.
+pub(super) fn rewrite_contact_uri(
+    contact: &str,
+    change: impl FnOnce(&mut SipUri),
+) -> Option<String> {
     let (before, uri, after) = match (contact.find('<'), contact.find('>')) {
         (Some(open), Some(close)) if open < close => (
             &contact[..=open],
@@ -199,7 +242,7 @@ fn rewrite_contact_host(contact: &str, host: &str) -> Option<String> {
         _ => ("", contact.trim(), ""),
     };
     let mut parsed = parse_uri_standalone(uri).ok()?;
-    parsed.host = host.to_string();
+    change(&mut parsed);
     Some(format!("{before}{parsed}{after}"))
 }
 
@@ -253,8 +296,7 @@ pub(crate) fn local_answer_contact(
             }
             AnsweringDialog::Callee { branch } => {
                 let (_, leg) = call.find_b_leg_by_branch(branch)?;
-                let (host, port) =
-                    b_leg_sent_by(leg.transport.local_addr, state, &leg.transport.transport);
+                let (host, port) = placed_leg_sent_by(leg, state);
                 let built = format!(
                     "<sip:{host}:{port};transport={}>",
                     leg.transport.transport.to_string().to_lowercase(),

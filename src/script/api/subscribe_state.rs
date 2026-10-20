@@ -123,11 +123,17 @@ impl PySubscribeState {
         let contact = UAC_SENDER
             .get()
             .map(|sender| {
-                format_default_contact(
-                    &sender.via_host_for(&transport),
-                    sender.via_port_for(&transport),
-                    transport,
-                )
+                // The listener the SUBSCRIBE reached is the subscription's
+                // local target (RFC 6665 §4.2.1 / RFC 3261 §12.1.1).
+                let (host, port) = match borrowed.inbound_local_addr() {
+                    Some(local) => sender.listener_sent_by(transport, local),
+                    None => sender.sent_by_for(
+                        transport,
+                        None,
+                        crate::transport::ConnectionId::default(),
+                    ),
+                };
+                format_default_contact(&host, port, transport)
             })
             .unwrap_or_else(|| format!("<{}>", dialog.local_uri));
         borrowed.push_reply_header_replace("Contact", contact);
@@ -880,14 +886,14 @@ async fn send_notify(
         (target.address, transport)
     };
 
+    // The listener of the subscriber's connection, when known, names us.
+    let connection = dialog
+        .received_connection_id
+        .map(crate::transport::ConnectionId);
+    let (local_host, local_port) =
+        uac_sender.sent_by_for(transport, Some(destination), connection.unwrap_or_default());
     let branch = format!("z9hG4bK-uac-py-{}", Uuid::new_v4());
-    let via = format!(
-        "SIP/2.0/{} {}:{};branch={}",
-        transport,
-        uac_sender.via_host_for(&transport),
-        uac_sender.via_port_for(&transport),
-        branch
-    );
+    let via = format!("SIP/2.0/{transport} {local_host}:{local_port};branch={branch}");
     let cseq_str = format!("{} NOTIFY", dialog.cseq);
 
     // NOTIFY tag orientation (RFC 6665 §4.4.1): From = notifier (us),
@@ -905,11 +911,7 @@ async fn send_notify(
         .to(to_header)
         .header(
             "Contact",
-            format_default_contact(
-                &uac_sender.via_host_for(&transport),
-                uac_sender.via_port_for(&transport),
-                transport,
-            ),
+            format_default_contact(&local_host, local_port, transport),
         )
         .header("Event", dialog.event.clone())
         .header("Subscription-State", subscription_state.to_string());

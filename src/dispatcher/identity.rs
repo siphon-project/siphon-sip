@@ -479,7 +479,7 @@ pub(super) fn a_leg_advertised_port(
 ) -> u16 {
     match a_leg_local_addr {
         Some(addr) => registry
-            .advertised_port(*transport, addr)
+            .identity_port(*transport, addr)
             .unwrap_or(addr.port()),
         None => default_via_port,
     }
@@ -504,24 +504,61 @@ pub(super) fn a_leg_advertised_port(
 /// Stream flows instead advertise the listener's public identity: delivery uses
 /// the held connection, but the peer's later BYE or re-INVITE targets our Contact
 /// and must not learn an internal bind address behind a NAT or TLS proxy.
-/// Unpinned legs fall back to the per-transport advertised identity.
+/// See [`flow_sent_by`].
+///
+/// An unpinned leg names the listener of the connection the send to
+/// `destination` reuses, when there is one (a phone reached over the
+/// connection it opened to one of two TLS listeners), else the per-transport
+/// advertised identity; see [`DispatcherState::connection_sent_by`].
 pub(super) fn b_leg_sent_by(
     b_leg_local_addr: Option<SocketAddr>,
+    destination: SocketAddr,
     state: &DispatcherState,
     transport: &Transport,
 ) -> (String, u16) {
     match b_leg_local_addr {
-        Some(local)
-            if *transport == Transport::Udp
-                || crate::ipsec::runtime::is_protected_local_port(local.port()) =>
-        {
-            pinned_sent_by(local, || state.wildcard_pinned_sent_by(transport, local))
-        }
-        Some(local) => (
-            state.a_leg_advertised_host(Some(local), transport),
-            state.a_leg_advertised_port(Some(local), transport),
-        ),
-        None => (state.via_host(transport), state.via_port(transport)),
+        Some(local) => flow_sent_by(local, state, transport),
+        None => state.connection_sent_by(*transport, destination),
+    }
+}
+
+/// [`b_leg_sent_by`] for a leg siphon placed, from the leg's own transport:
+/// its flow socket when it has one, else the connection to its peer.
+pub(super) fn placed_leg_sent_by(
+    leg: &crate::b2bua::actor::Leg,
+    state: &DispatcherState,
+) -> (String, u16) {
+    b_leg_sent_by(
+        leg.transport.local_addr,
+        leg.transport.remote_addr,
+        state,
+        &leg.transport.transport,
+    )
+}
+
+/// The sent-by of a request written to a captured flow anchored on `local`.
+///
+/// A datagram flow, and any flow on a configured IPsec protected port, names
+/// the socket exactly: the response has to come back to that port, and on an
+/// SA it is the only one the kernel selector matches (3GPP TS 33.203 §7.4).
+/// A wildcard socket takes its listener's identity there, never `0.0.0.0`
+/// (see [`pinned_sent_by`]).
+///
+/// A stream flow names the identity of the listener that accepted the
+/// connection, its `advertise` included: the response rides the held
+/// connection whatever the Via says, and the Contact / Record-Route a peer
+/// later reconnects to has to be the public name of *that* listener, which a
+/// TLS peer also validates the certificate against.
+pub(super) fn flow_sent_by(
+    local: SocketAddr,
+    state: &DispatcherState,
+    transport: &Transport,
+) -> (String, u16) {
+    if *transport == Transport::Udp || crate::ipsec::runtime::is_protected_local_port(local.port())
+    {
+        pinned_sent_by(local, || state.wildcard_pinned_sent_by(transport, local))
+    } else {
+        state.listener_sent_by(*transport, local)
     }
 }
 
@@ -576,25 +613,46 @@ pub(super) fn pinned_sent_by(
 /// so the *second* entry ends up topmost, which is what the downstream peer
 /// reads as its next hop.
 ///
-/// Known limitation, unchanged from the transport-keyed version it replaces: two
-/// listeners sharing a transport and port but bound to different IPs still get
-/// one entry (the outbound host). Separating them needs the inbound host
-/// resolved on every relay, and that address shape has not shown up in the
-/// field the way the port one has.
+/// Two listeners sharing a transport and port but bound to different IPs are
+/// two sockets too (RFC 5658 §4: each entry names the interface facing its
+/// peer). `crosses_interfaces` says the relay is known to leave from another IP
+/// than it arrived on (see [`crosses_interfaces`]); the inbound host is then
+/// resolved, and both entries are stamped unless they come out identical (two
+/// listeners advertising the same name), in which case one is enough.
 pub(super) fn record_route_uris(
     inbound_transport: Transport,
     inbound_port: u16,
     inbound_host: impl FnOnce() -> String,
+    crosses_interfaces: bool,
     outbound_transport: Transport,
     outbound_port: u16,
     outbound_host: &str,
 ) -> (String, Option<String>) {
     let outbound = record_route_uri(outbound_host, outbound_port, outbound_transport);
-    if inbound_transport == outbound_transport && inbound_port == outbound_port {
+    if inbound_transport == outbound_transport
+        && inbound_port == outbound_port
+        && !crosses_interfaces
+    {
         return (outbound, None);
     }
     let inbound = record_route_uri(&inbound_host(), inbound_port, inbound_transport);
+    if inbound == outbound {
+        return (outbound, None);
+    }
     (inbound, Some(outbound))
+}
+
+/// Whether a relay that arrived on `inbound_local` leaves from a listener on
+/// another IP: `egress_listener` is the socket it leaves from when that is
+/// known before sending (a flow, an IPsec source, a `send_socket=` pin, the
+/// connection it reuses, the default UDP socket), `None` otherwise. A
+/// different port alone is already a second socket to [`record_route_uris`];
+/// this catches the same port on another interface.
+pub(super) fn crosses_interfaces(
+    inbound_local: SocketAddr,
+    egress_listener: Option<SocketAddr>,
+) -> bool {
+    egress_listener.is_some_and(|egress| egress.ip() != inbound_local.ip())
 }
 
 /// One `Record-Route` URI. `host` is already SIP-formatted (a v6 literal
@@ -656,9 +714,7 @@ pub(super) fn leg_sent_by(
 ) -> (String, u16) {
     let transport = &leg.transport.transport;
     match leg.side {
-        crate::b2bua::actor::LegSide::B => {
-            b_leg_sent_by(leg.transport.local_addr, state, transport)
-        }
+        crate::b2bua::actor::LegSide::B => placed_leg_sent_by(leg, state),
         crate::b2bua::actor::LegSide::A => (
             state.a_leg_advertised_host(leg.transport.local_addr, transport),
             state.a_leg_advertised_port(leg.transport.local_addr, transport),
@@ -786,15 +842,23 @@ pub(super) fn build_self_identity(
 /// [`DispatcherState::a_leg_advertised_host`], factored out as a free function
 /// so it is unit-testable without a `DispatcherState` fixture.
 ///
-/// With `a_leg_local_addr = Some(addr)` the resolution, most-specific first:
+/// With `a_leg_local_addr = Some(addr)` on a socket that belongs to a listener
+/// (bound there, or accepted on a wildcard listener of that port), the host is
+/// that listener's own identity, [`ListenerRegistry::identity`]: its
+/// `advertise`, else the global `advertised_address` of its family, else the
+/// socket's IP, else a routable local IP. Never another listener's `advertise`.
 ///
-/// 1. the per-listener `advertise` configured for that exact socket;
-/// 2. a transport-level advertised host of the **same family** (preserves the
+/// On a socket that is no listener's (an outbound pool connection's ephemeral
+/// port), the resolution, most-specific first:
+///
+/// 1. a transport-level advertised host of the **same family** (preserves the
 ///    global `advertised_address` / NAT case, but never hands a v4 literal to a
 ///    v6 UE or vice-versa; an FQDN is family-agnostic and always accepted);
-/// 3. the exact bound IP, when concrete (explicit per-family listener);
-/// 4. a wildcard bind → a family-matched listener's advertise/bound IP, else a
+/// 2. the exact socket IP, when concrete;
+/// 3. a wildcard → a family-matched listener's advertise/bound IP, else a
 ///    routable local IP of that family, else that family's loopback.
+///
+/// [`ListenerRegistry::identity`]: crate::transport::ListenerRegistry::identity
 ///
 /// `None` reproduces the legacy per-transport `via_host` (first advertised host,
 /// else the resolved `default_local_ip`).
@@ -811,14 +875,16 @@ pub(super) fn resolve_advertised_host(
             .map(|host| format_sip_host(host))
             .unwrap_or_else(|| format_sip_host(&default_local_ip.to_string()));
     };
+    // A socket that belongs to a listener advertises that listener's identity
+    // and never a sibling listener's (see `ListenerRegistry::identity`).
+    if let Some((host, _)) = registry.identity(*transport, addr) {
+        return host;
+    }
+    // Below: a socket that is no listener's, such as an outbound connection
+    // the pool opened from an ephemeral port.  Unchanged.
     let ipv6 = addr.is_ipv6();
 
-    // 1. Per-listener advertise for this exact socket.
-    if let Some(advertise) = registry.resolve(*transport, addr).and_then(|s| s.advertise) {
-        return format_sip_host(&advertise.host);
-    }
-
-    // 2. A transport-level advertised host of the same family (or an FQDN).
+    // 1. A transport-level advertised host of the same family (or an FQDN).
     //    Strip any v6 brackets before parsing so a bracketed literal
     //    (`[2001:db8::1]`) is still classified as an IP, not an FQDN.
     if let Some(host) = advertised_addrs.get(transport) {
@@ -831,12 +897,12 @@ pub(super) fn resolve_advertised_host(
         }
     }
 
-    // 3. The exact bound IP, when concrete.
+    // 2. The exact socket IP, when concrete.
     if !addr.ip().is_unspecified() {
         return format_sip_host(&addr.ip().to_string());
     }
 
-    // 4. Wildcard bind → family-matched fallback.
+    // 3. Wildcard → family-matched fallback.
     if let Some(send) = registry.resolve_family(*transport, ipv6) {
         if let Some(advertise) = send.advertise {
             return format_sip_host(&advertise.host);
@@ -862,10 +928,7 @@ pub(super) fn resolve_advertised_host(
 /// per-message, and the probe does a socket create + `connect` + `getsockname`.
 /// The routable local IP doesn't change at runtime, so memoise it.
 pub(super) fn cached_routable_local_ip(ipv6: bool) -> Option<IpAddr> {
-    static V4: std::sync::OnceLock<Option<IpAddr>> = std::sync::OnceLock::new();
-    static V6: std::sync::OnceLock<Option<IpAddr>> = std::sync::OnceLock::new();
-    let cache = if ipv6 { &V6 } else { &V4 };
-    *cache.get_or_init(|| crate::transport::detect_routable_local_ip(ipv6))
+    crate::transport::cached_routable_local_ip(ipv6)
 }
 
 /// Every host siphon writes into its own Via, Contact and Record-Route for a TLS

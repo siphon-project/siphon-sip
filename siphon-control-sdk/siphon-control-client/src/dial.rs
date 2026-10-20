@@ -54,6 +54,9 @@ pub enum DialTarget {
         /// Host of siphon's own Contact on this branch. See
         /// [`DialTarget::contact_host`].
         contact_host: Option<String>,
+        /// User part of siphon's own Contact on this branch. See
+        /// [`DialTarget::contact_user`].
+        contact_user: Option<String>,
         /// Whether a sequential dial moves on from this target once it has
         /// rung. See [`DialTarget::reroute_after_progress`].
         reroute_after_progress: Option<bool>,
@@ -88,6 +91,9 @@ pub enum DialTarget {
         /// Host of siphon's own Contact on every branch the AoR expands to.
         /// See [`DialTarget::contact_host`].
         contact_host: Option<String>,
+        /// User part of siphon's own Contact on every branch the AoR expands
+        /// to. See [`DialTarget::contact_user`].
+        contact_user: Option<String>,
         /// Whether a sequential dial moves on from any branch the AoR expands
         /// to once it has rung. See [`DialTarget::reroute_after_progress`].
         reroute_after_progress: Option<bool>,
@@ -133,6 +139,7 @@ impl DialTarget {
             to: None,
             route: Vec::new(),
             contact_host: None,
+            contact_user: None,
             reroute_after_progress: None,
             profile: None,
             offer: None,
@@ -154,6 +161,7 @@ impl DialTarget {
             to: None,
             route: Vec::new(),
             contact_host: None,
+            contact_user: None,
             reroute_after_progress: None,
             profile: None,
             offer: None,
@@ -188,6 +196,7 @@ impl DialTarget {
             to: None,
             route: route.into_iter().map(Into::into).collect(),
             contact_host: None,
+            contact_user: None,
             reroute_after_progress: None,
             profile: None,
             offer: None,
@@ -204,6 +213,7 @@ impl DialTarget {
             identity: TargetIdentity::default(),
             to: None,
             contact_host: None,
+            contact_user: None,
             reroute_after_progress: None,
             profile: None,
             offer: None,
@@ -293,6 +303,26 @@ impl DialTarget {
         match &mut self {
             Self::Uri { contact_host, .. } | Self::Aor { contact_host, .. } => {
                 *contact_host = Some(host.into());
+            }
+        }
+        self
+    }
+
+    /// Present `user` as the user part of siphon's own Contact on this branch
+    /// (on every branch an AoR expands to), which is otherwise userless:
+    /// `<sip:trunk-7@sbc.example.net:5061;transport=tls>`.
+    ///
+    /// For a peer that identifies the trunk or account by the user of the
+    /// Contact. Only the user part changes, and it rides beside
+    /// [`DialTarget::contact_host`] when both are named; the server keeps it as
+    /// the leg's dialog Contact for every in-dialog request after. `user` is an
+    /// RFC 3261 SIP URI user; the server refuses an empty or invalid one with
+    /// `bad_request` before anything is sent. A script's `set_contact_uri()`
+    /// still wins over it, and it wins over a script's `set_contact_user()`.
+    pub fn contact_user(mut self, user: impl Into<String>) -> Self {
+        match &mut self {
+            Self::Uri { contact_user, .. } | Self::Aor { contact_user, .. } => {
+                *contact_user = Some(user.into());
             }
         }
         self
@@ -393,6 +423,7 @@ impl DialTarget {
             identity,
             to,
             contact_host,
+            contact_user,
             profile,
             offer,
             reroute_after_progress,
@@ -406,6 +437,7 @@ impl DialTarget {
                 to,
                 route,
                 contact_host,
+                contact_user,
                 profile,
                 offer,
                 reroute_after_progress,
@@ -421,6 +453,7 @@ impl DialTarget {
                     && to.is_none()
                     && route.is_empty()
                     && contact_host.is_none()
+                    && contact_user.is_none()
                     && profile.is_none()
                     && offer.is_none()
                     && reroute_after_progress.is_none()
@@ -440,6 +473,7 @@ impl DialTarget {
                     identity,
                     to,
                     contact_host,
+                    contact_user,
                     profile,
                     offer,
                     reroute_after_progress,
@@ -452,6 +486,7 @@ impl DialTarget {
                 identity,
                 to,
                 contact_host,
+                contact_user,
                 profile,
                 offer,
                 reroute_after_progress,
@@ -463,6 +498,7 @@ impl DialTarget {
                     identity,
                     to,
                     contact_host,
+                    contact_user,
                     profile,
                     offer,
                     reroute_after_progress,
@@ -481,6 +517,9 @@ impl DialTarget {
         }
         if let Some(contact_host) = contact_host {
             object.insert("contact_host".to_string(), json!(contact_host));
+        }
+        if let Some(contact_user) = contact_user {
+            object.insert("contact_user".to_string(), json!(contact_user));
         }
         if let Some(profile) = profile {
             object.insert("profile".to_string(), json!(profile));
@@ -709,6 +748,12 @@ pub struct DialOptions {
     /// the caller has been sent an 18x or 2xx, so on a bridging dial it can
     /// only repeat the host its answer carried (another is `invalid_state`).
     pub caller_contact_host: Option<String>,
+    /// User part of siphon's own Contact toward the caller
+    /// (`caller_contact_user`), which is otherwise userless, with the same
+    /// stickiness as [`DialOptions::caller_contact_host`]: fixed once the
+    /// caller has been sent an 18x or 2xx (another is `invalid_state`). Each
+    /// target's own [`DialTarget::contact_user`] is the user its leg presents.
+    pub caller_contact_user: Option<String>,
     /// When each phone of an [`DialOnAnswer::Bridge`] dial is sent its SDP
     /// offer, where its target names none ([`DialTarget::offer`]). Unset is the
     /// server's default, [`DialOffer::Delayed`].
@@ -782,6 +827,12 @@ impl DialOptions {
         self
     }
 
+    /// Present this user part in siphon's Contact toward the caller.
+    pub fn caller_contact_user(mut self, user: impl Into<String>) -> Self {
+        self.caller_contact_user = Some(user.into());
+        self
+    }
+
     fn insert_into(&self, args: &mut serde_json::Map<String, serde_json::Value>) {
         if let Some(strategy) = self.strategy {
             args.insert("strategy".to_string(), json!(strategy.as_str()));
@@ -798,6 +849,7 @@ impl DialOptions {
             ("from_display", &self.from_display),
             ("p_asserted_identity", &self.p_asserted_identity),
             ("caller_contact_host", &self.caller_contact_host),
+            ("caller_contact_user", &self.caller_contact_user),
         ] {
             if let Some(value) = value {
                 args.insert(name.to_string(), json!(value));
@@ -1195,6 +1247,7 @@ mod tests {
             to: None,
             route: vec!["<sip:scscf.example.test;lr>".to_string()],
             contact_host: None,
+            contact_user: None,
             reroute_after_progress: None,
             profile: None,
             offer: None,
@@ -1253,6 +1306,77 @@ mod tests {
                 "contact_host": "tenant-a.example.com"
             })
         );
+    }
+
+    /// The caller's Contact user rides the dial's own arguments, beside the
+    /// host when both are named, and stays off the wire when not.
+    #[test]
+    fn dial_options_carry_the_caller_contact_user() {
+        let mut args = serde_json::Map::new();
+        DialOptions::default()
+            .caller_contact_user("trunk-7")
+            .insert_into(&mut args);
+        assert_eq!(
+            serde_json::Value::Object(args),
+            json!({ "caller_contact_user": "trunk-7" })
+        );
+        let mut args = serde_json::Map::new();
+        DialOptions::default()
+            .caller_contact_host("sbc.example.net")
+            .caller_contact_user("trunk-7")
+            .insert_into(&mut args);
+        assert_eq!(
+            serde_json::Value::Object(args),
+            json!({ "caller_contact_host": "sbc.example.net", "caller_contact_user": "trunk-7" })
+        );
+        let mut args = serde_json::Map::new();
+        DialOptions::default().insert_into(&mut args);
+        assert!(args.get("caller_contact_user").is_none());
+    }
+
+    /// A Contact user defeats the bare-string shortcut on either target form,
+    /// and rides beside a Contact host when both are named.
+    #[test]
+    fn a_targets_contact_user_goes_out_on_either_form() {
+        assert_eq!(
+            DialTarget::uri("sip:+15550199@trunk.example")
+                .contact_user("trunk-7")
+                .to_json(),
+            json!({"uri": "sip:+15550199@trunk.example", "contact_user": "trunk-7"})
+        );
+        assert_eq!(
+            DialTarget::aor("sip:204@pbx.example")
+                .contact_user("trunk-7")
+                .to_json(),
+            json!({"aor": "sip:204@pbx.example", "contact_user": "trunk-7"})
+        );
+        assert_eq!(
+            DialTarget::uri("sip:+15550199@trunk.example")
+                .contact_host("sbc.example.net")
+                .contact_user("trunk-7")
+                .to_json(),
+            json!({
+                "uri": "sip:+15550199@trunk.example",
+                "contact_host": "sbc.example.net",
+                "contact_user": "trunk-7"
+            })
+        );
+        assert_eq!(
+            DialTarget::aor("sip:204@pbx.example")
+                .contact_host("203.0.113.5")
+                .contact_user("trunk-7")
+                .to_json(),
+            json!({
+                "aor": "sip:204@pbx.example",
+                "contact_host": "203.0.113.5",
+                "contact_user": "trunk-7"
+            })
+        );
+        assert!(DialTarget::aor("sip:204@pbx.example")
+            .header("X-Tenant", "a")
+            .to_json()
+            .get("contact_user")
+            .is_none());
     }
 
     /// `reroute_after_progress` defeats the bare-string shortcut and goes out

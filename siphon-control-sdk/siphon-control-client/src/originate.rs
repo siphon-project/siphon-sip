@@ -230,6 +230,10 @@ pub struct OriginateOptions {
     /// [`SipClient::originate_aor`]), in place of the address siphon
     /// advertises. See [`OriginateOptions::contact_host`].
     pub contact_host: Option<String>,
+    /// User part of siphon's own Contact on the call (on every leg of an
+    /// [`SipClient::originate_aor`]), which is otherwise userless. See
+    /// [`OriginateOptions::contact_user`].
+    pub contact_user: Option<String>,
 }
 
 impl OriginateOptions {
@@ -296,6 +300,20 @@ impl OriginateOptions {
         self
     }
 
+    /// Present `user` as the user part of siphon's own Contact on the call,
+    /// which is otherwise userless
+    /// (`<sip:trunk-7@sbc.example.net:5061;transport=tls>`), for a peer that
+    /// identifies the trunk or account by it.
+    ///
+    /// Only the user part changes, beside [`OriginateOptions::contact_host`]
+    /// when both are named, and every in-dialog request siphon sends on the
+    /// call presents it too. An RFC 3261 SIP URI user; the server refuses an
+    /// empty or invalid one with `bad_request` before anything is sent.
+    pub fn contact_user(mut self, user: impl Into<String>) -> Self {
+        self.contact_user = Some(user.into());
+        self
+    }
+
     pub(crate) fn insert_into(&self, args: &mut serde_json::Map<String, serde_json::Value>) {
         let mut put = |name: &str, value: &Option<String>| {
             if let Some(value) = value {
@@ -309,6 +327,7 @@ impl OriginateOptions {
         put("p_asserted_identity", &self.p_asserted_identity);
         put("on_lost", &self.on_lost);
         put("contact_host", &self.contact_host);
+        put("contact_user", &self.contact_user);
         if let Some(privacy) = self.privacy {
             args.insert("privacy".to_string(), json!(privacy.as_str()));
         }
@@ -1042,6 +1061,64 @@ mod tests {
         let sent = recorder.sent.lock().unwrap().clone();
         assert_eq!(sent[0].3["contact_host"], json!("2001:db8::5"));
         assert!(sent[1].3.get("contact_host").is_none());
+    }
+
+    /// A Contact user rides on a single originate alone or beside a Contact
+    /// host, and stays off the wire when it was not asked for.
+    #[tokio::test]
+    async fn originate_sends_the_contact_user_it_was_given() {
+        let recorder = Arc::new(Recorder {
+            sent: Mutex::new(Vec::new()),
+            result: json!({}),
+        });
+        let transport: Arc<dyn CommandTransport> = recorder.clone();
+        for options in [
+            OriginateOptions::default().contact_user("trunk-7"),
+            OriginateOptions::default()
+                .contact_host("sbc.example.net")
+                .contact_user("trunk-7"),
+            OriginateOptions::default(),
+        ] {
+            originate_on(
+                &transport,
+                "cb-1",
+                "sip:+15550100@trunk.example",
+                OriginateMedia::sdp("v=0\r\n"),
+                options,
+            )
+            .await
+            .expect("originate");
+        }
+        let sent = recorder.sent.lock().unwrap().clone();
+        assert_eq!(sent[0].3["contact_user"], json!("trunk-7"));
+        assert!(sent[0].3.get("contact_host").is_none());
+        assert_eq!(sent[1].3["contact_host"], json!("sbc.example.net"));
+        assert_eq!(sent[1].3["contact_user"], json!("trunk-7"));
+        assert!(sent[2].3.get("contact_user").is_none());
+    }
+
+    /// An AoR originate carries the Contact user on the wire like a single one.
+    #[tokio::test]
+    async fn originate_aor_sends_the_contact_user() {
+        let recorder = Arc::new(Recorder {
+            sent: Mutex::new(Vec::new()),
+            result: group_result(),
+        });
+        let transport: Arc<dyn CommandTransport> = recorder.clone();
+        place_aor_on(
+            &SipFacade::new(),
+            &transport,
+            "wake-202",
+            "sip:202@example.com",
+            OriginateMedia::anchor(),
+            OriginateOptions::default().contact_user("trunk-7"),
+            AorRing::default(),
+        )
+        .await
+        .expect("originate aor");
+        let sent = recorder.sent.lock().unwrap().clone();
+        assert_eq!(sent[0].3["aor"], json!("sip:202@example.com"));
+        assert_eq!(sent[0].3["contact_user"], json!("trunk-7"));
     }
 
     /// Ring options left unset take the server's defaults rather than a copy.
