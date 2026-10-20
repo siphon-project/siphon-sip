@@ -23,6 +23,35 @@ entry, but a working config keeps working.
   sequential fork starts later. Via, Route, Record-Route, Call-ID, CSeq, From,
   To, Max-Forwards and Content-Length are refused with `ValueError`.
 
+- **Diameter: `DiameterAnswer.experimental_result_code`.** The code inside
+  Experimental-Result, where Cx, Sh, Gx and Rx put the codes they define, so a
+  script reads a negative answer to `diameter.originate` without walking the
+  group. `None` when the answer carries a Result-Code.
+
+- **Diameter: Flow-Information, Flow-Direction and Called-Station-Id in the
+  dictionary**, so a Gx rule installation and a CCR-I are built by name.
+
+### Fixed
+
+- **Diameter: an AVP value of the wrong shape is refused before sending.**
+  `diameter.originate` and `set_avp` raise `TypeError` for a list given to an
+  AVP the dictionary does not type as grouped, a str or int given to a grouped
+  one, a vendor that is not an int or `None`, a `mandatory` that is not a
+  bool, and a tuple of more than four elements. They were sent as something
+  else, or the vendor was silently dropped.
+
+- **Diameter: a named peer in `diameter.originate` stays inside its tenant.**
+  With `peer`, a tenant reaches its own serving connections and relay backends;
+  the node's client-mode peers are reached from `tenant="default"` only.
+
+- **Diameter: no M bit on the Gx and Rx AVPs TS 29.212 and TS 29.214 forbid it
+  on.** Rx-Request-Type, RAT-Type, Allocation-Retention-Priority and its
+  Priority-Level and Pre-emption members, APN-Aggregate-Max-Bitrate-UL/DL,
+  Default-EPS-Bearer-QoS and AN-GW-Address are V without M in table 5.3.1 of
+  both (Rel-18); the dictionary set M on them, and a peer that does not know
+  one could reject the whole request. The S6a Update-Location keeps M on
+  RAT-Type, as TS 29.272 table 7.3.1/2 sets it there.
+
 ## [1.15.1] — 2026-10-20
 
 ### Added

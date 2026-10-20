@@ -351,8 +351,24 @@ fn msg_iter_avps<'py>(py: Python<'py>, msg: &DiameterMsg) -> PyResult<Bound<'py,
 /// specs — `(code_or_name, value)` or `(code_or_name, value, vendor)` tuples —
 /// and each child `value` may itself be a list (a nested group). Any other
 /// value (str / int / bytes) is a leaf, encoded per the dictionary type.
+///
+/// A value of the wrong shape for the dictionary type is refused rather than
+/// sent as something else: a list for an AVP the dictionary types as a leaf,
+/// and a str or int for a grouped AVP. Bytes stay accepted for a grouped AVP,
+/// the form `get_avp` hands back for one it could not decode.
 fn build_avp(code: u32, vendor: u32, value: &Bound<'_, PyAny>) -> PyResult<Avp> {
+    let known = avp_type(code, vendor);
+    let display = || {
+        dictionary::lookup_avp(code, vendor)
+            .map_or_else(|| format!("{code}"), |def| def.name.to_string())
+    };
     if let Ok(list) = value.cast::<PyList>() {
+        if known.is_some_and(|data_type| data_type != AvpType::Grouped) {
+            return Err(pyo3::exceptions::PyTypeError::new_err(format!(
+                "AVP {} is not grouped; a list is the value of a grouped AVP",
+                display()
+            )));
+        }
         let mut children = Vec::with_capacity(list.len());
         for item in list.iter() {
             children.push(build_child_spec(&item)?);
@@ -374,6 +390,12 @@ fn build_avp(code: u32, vendor: u32, value: &Bound<'_, PyAny>) -> PyResult<Avp> 
             value: AvpData::Grouped(children),
         });
     }
+    if known == Some(AvpType::Grouped) && !value.is_instance_of::<pyo3::types::PyBytes>() {
+        return Err(pyo3::exceptions::PyTypeError::new_err(format!(
+            "AVP {} is grouped; give its members as a list of (code_or_name, value) tuples",
+            display()
+        )));
+    }
     let raw = py_to_avp_raw(code, vendor, value)?;
     Ok(Avp::raw(code, vendor, raw))
 }
@@ -389,17 +411,19 @@ pub(crate) fn build_child_spec(spec: &Bound<'_, PyAny>) -> PyResult<Avp> {
             "grouped AVP children must be (code, value) or (code, value, vendor) tuples",
         )
     })?;
-    if tuple.len() < 2 {
+    if !(2..=4).contains(&tuple.len()) {
         return Err(pyo3::exceptions::PyTypeError::new_err(
-            "grouped AVP child tuple needs at least (code, value)",
+            "an AVP is a (code_or_name, value[, vendor[, mandatory]]) tuple",
         ));
     }
     let (code, name_vendor) = resolve_code(&tuple.get_item(0)?)?;
     let value = tuple.get_item(1)?;
-    let explicit_vendor = if tuple.len() >= 3 {
-        tuple.get_item(2)?.extract::<u32>().unwrap_or(0)
-    } else {
-        0
+    // None stands for "the dictionary's vendor"; anything else must be one.
+    let explicit_vendor = match tuple.get_item(2) {
+        Ok(vendor) if !vendor.is_none() => vendor.extract::<u32>().map_err(|_| {
+            pyo3::exceptions::PyTypeError::new_err("an AVP's vendor must be an int or None")
+        })?,
+        _ => 0,
     };
     let vendor = if explicit_vendor != 0 {
         explicit_vendor
@@ -407,8 +431,10 @@ pub(crate) fn build_child_spec(spec: &Bound<'_, PyAny>) -> PyResult<Avp> {
         name_vendor
     };
     let mut avp = build_avp(code, vendor, &value)?;
-    if tuple.len() >= 4 {
-        let mandatory: bool = tuple.get_item(3)?.extract()?;
+    if tuple.len() == 4 {
+        let mandatory: bool = tuple.get_item(3)?.extract().map_err(|_| {
+            pyo3::exceptions::PyTypeError::new_err("an AVP's mandatory flag must be a bool")
+        })?;
         avp.flags = if mandatory {
             avp.flags | crate::diameter::codec::AVP_FLAG_MANDATORY
         } else {
@@ -517,6 +543,24 @@ impl PyDiameterAnswer {
         Ok(msg
             .find(dictionary::avp::RESULT_CODE, 0)
             .and_then(|avp| avp.as_u32()))
+    }
+
+    /// The Experimental-Result-Code inside Experimental-Result (RFC 6733
+    /// section 7.6), where the 3GPP applications put the codes they define
+    /// (DIAMETER_ERROR_USER_UNKNOWN 5001 of TS 29.229, 5030 of TS 29.212 and
+    /// so on). None when the answer carries a Result-Code instead.
+    #[getter]
+    fn experimental_result_code(&self) -> PyResult<Option<u32>> {
+        let msg = self.lock()?;
+        Ok(msg
+            .find(dictionary::avp::EXPERIMENTAL_RESULT, 0)
+            .and_then(|group| match &group.value {
+                AvpData::Grouped(members) => members.iter().find(|member| {
+                    member.code == dictionary::avp::EXPERIMENTAL_RESULT_CODE && member.vendor == 0
+                }),
+                AvpData::Raw(_) => None,
+            })
+            .and_then(Avp::as_u32))
     }
 
     #[getter]

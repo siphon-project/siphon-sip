@@ -30,9 +30,15 @@ pub(crate) const ENVELOPE_AVPS: [u32; 5] = [
     avp::DESTINATION_REALM,
 ];
 
+/// The tenant a script names when it names none. Client-mode peers of
+/// `diameter.peers` belong to the node rather than to a tenant, so only this
+/// tenant reaches them; any other tenant reaches its own connections alone.
+pub(crate) const DEFAULT_TENANT: &str = "default";
+
 /// The connection a request to `destination_host` / `destination_realm` of
 /// `tenant` leaves on. With `peer`, the serving connection of that configured
-/// peer that carried requests from the host, else the client-mode peer of
+/// peer that carried requests from the host, else the tenant's relay backend
+/// of that name, else (for [`DEFAULT_TENANT`] only) the client-mode peer of
 /// that name. Without, the serving connection that carried requests from the
 /// host, else one that carried requests from a node of the realm: an agent
 /// routes the request on to the host (RFC 6733 section 6.1.5). Only an open
@@ -49,7 +55,12 @@ pub(crate) fn connection(
             .and_then(|host| reauthorize::connection(tenant, name, host))
             .or_else(|| {
                 manager
-                    .live_client(name)
+                    .live_backend(tenant, name)
+                    .or_else(|| {
+                        (tenant == DEFAULT_TENANT)
+                            .then(|| manager.live_client(name))
+                            .flatten()
+                    })
                     .map(|client| Arc::clone(client.peer()))
             }),
         None => destination_host
@@ -377,5 +388,272 @@ mod tests {
         assert_eq!(failure("request timed out after 5s"), Failure::Timeout);
         assert_eq!(failure("write channel closed"), Failure::Connection);
         assert_eq!(failure("peer outbound queue full"), Failure::Connection);
+    }
+
+    /// The Session-Id AVPs of a request on the wire, in order.
+    fn session_ids(wire: &[u8]) -> Vec<String> {
+        DiameterMsg::from_wire(wire)
+            .unwrap()
+            .avps
+            .iter()
+            .filter(|item| item.code == avp::SESSION_ID && item.vendor == 0)
+            .map(|item| match &item.value {
+                AvpData::Raw(bytes) => String::from_utf8(bytes.clone()).unwrap(),
+                AvpData::Grouped(_) => panic!("Session-Id is not grouped"),
+            })
+            .collect()
+    }
+
+    /// A PCRF's Re-Auth then Abort-Session on one Rx session, and a PCEF's
+    /// CCR-I, -U and -T on one Gx session: each request carries the one
+    /// Session-Id given, never a second one, and its own identifiers (RFC 6733
+    /// sections 3 and 8.8; TS 29.214 clauses 4.4.6 and 4.4.4; TS 29.212
+    /// clause 4.5.1).
+    #[test]
+    fn a_given_session_id_is_the_only_one_and_is_reused_across_requests() {
+        const RE_AUTH: u32 = 258;
+        const ABORT_SESSION: u32 = 274;
+        const CREDIT_CONTROL: u32 = 272;
+        let peer = open_peer();
+        let rx_session = "pcrf.epc.mnc001.mcc001.3gppnetwork.org;7;1";
+        let gx_session = "pgw.epc.mnc001.mcc001.3gppnetwork.org;9;2";
+        let request = |command_code, application_id, session_id, avps| Request {
+            command_code,
+            application_id,
+            proxiable: true,
+            session_id: Some(session_id),
+            destination_host: Some("peer.epc.mnc001.mcc001.3gppnetwork.org"),
+            destination_realm: "epc.mnc001.mcc001.3gppnetwork.org",
+            avps,
+        };
+        let u32_avp = |code, value: u32| Avp::raw(code, 0, value.to_be_bytes().to_vec());
+        let mut identifiers = Vec::new();
+        for command_code in [RE_AUTH, ABORT_SESSION] {
+            let wire = wire(
+                &peer,
+                request(command_code, dictionary::RX_APP_ID, rx_session, Vec::new()),
+            )
+            .unwrap();
+            assert_eq!(session_ids(&wire), vec![rx_session.to_string()]);
+            let message = DiameterMsg::from_wire(&wire).unwrap();
+            identifiers.push((message.hop_by_hop, message.end_to_end));
+        }
+        // CC-Request-Type 416 and CC-Request-Number 415 are the caller's.
+        for (request_type, number) in [(1u32, 0u32), (2, 1), (3, 2)] {
+            let avps = vec![u32_avp(416, request_type), u32_avp(415, number)];
+            let wire = wire(
+                &peer,
+                request(CREDIT_CONTROL, dictionary::GX_APP_ID, gx_session, avps),
+            )
+            .unwrap();
+            assert_eq!(session_ids(&wire), vec![gx_session.to_string()]);
+            let message = DiameterMsg::from_wire(&wire).unwrap();
+            assert_eq!(
+                message.find(416, 0).and_then(Avp::as_u32),
+                Some(request_type)
+            );
+            assert_eq!(message.find(415, 0).and_then(Avp::as_u32), Some(number));
+            identifiers.push((message.hop_by_hop, message.end_to_end));
+        }
+        let mut distinct = identifiers.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert_eq!(distinct.len(), identifiers.len(), "{identifiers:?}");
+        // A Session-Id in the caller's AVPs would be a second one: refused.
+        let doubled = request(
+            RE_AUTH,
+            dictionary::GX_APP_ID,
+            gx_session,
+            vec![Avp::raw(avp::SESSION_ID, 0, gx_session.as_bytes().to_vec())],
+        );
+        assert_eq!(
+            wire(&peer, doubled),
+            Err(Refusal::EnvelopeAvp(avp::SESSION_ID))
+        );
+    }
+
+    /// A named peer reaches the tenant's own connections; the node's
+    /// client-mode peers only from the default tenant.
+    #[test]
+    fn a_named_peer_stays_inside_its_tenant() {
+        let manager = DiameterManager::new();
+        let client = open_peer();
+        manager.register(
+            "pcrf".into(),
+            Arc::new(crate::diameter::DiameterClient::new(Arc::clone(&client))),
+        );
+        let backend = open_peer();
+        manager.register_backend(
+            "t-isolated",
+            "pcrf",
+            Arc::new(crate::diameter::DiameterClient::new(Arc::clone(&backend))),
+        );
+        let found = |tenant| connection(&manager, tenant, Some("pcrf"), None, "epc.example");
+        assert!(Arc::ptr_eq(&found(DEFAULT_TENANT).unwrap(), &client));
+        assert!(Arc::ptr_eq(&found("t-isolated").unwrap(), &backend));
+        assert!(found("t-other").is_none());
+    }
+
+    /// Answer `received` on `remote` with `result_code`, echoing its
+    /// Session-Id and identifiers.
+    async fn answer(
+        remote: &mut tokio::io::DuplexStream,
+        received: &DiameterMsg,
+        result_code: u32,
+    ) {
+        use tokio::io::AsyncWriteExt;
+        let answer = DiameterMsg {
+            flags: FLAG_PROXIABLE,
+            command_code: received.command_code,
+            application_id: received.application_id,
+            hop_by_hop: received.hop_by_hop,
+            end_to_end: received.end_to_end,
+            avps: vec![
+                received.avps[0].clone(),
+                Avp::raw(avp::RESULT_CODE, 0, result_code.to_be_bytes().to_vec()),
+            ],
+        };
+        remote.write_all(&answer.to_wire()).await.unwrap();
+    }
+
+    /// Two requests in flight on one connection, answered in the reverse
+    /// order: each caller gets the answer to its own request.
+    #[tokio::test]
+    async fn concurrent_requests_each_get_their_own_answer() {
+        let (local, mut remote) = tokio::io::duplex(65_536);
+        let (incoming, _incoming) = tokio::sync::mpsc::channel(4);
+        let peer =
+            crate::diameter::peer::spawn_connection_tasks(connection_config(), local, incoming);
+        let answering = tokio::spawn(async move {
+            let first = codec::read_diameter_message(&mut remote).await.unwrap();
+            let second = codec::read_diameter_message(&mut remote).await.unwrap();
+            let first = DiameterMsg::from_wire(&first).unwrap();
+            let second = DiameterMsg::from_wire(&second).unwrap();
+            // Result-Code tells the answers apart: 2001 for the first session,
+            // 5002 (DIAMETER_UNKNOWN_SESSION_ID) for the second.
+            let code = |message: &DiameterMsg| {
+                if message.get_str(avp::SESSION_ID).as_deref() == Some("hss.epc.example;1;1") {
+                    2001
+                } else {
+                    5002
+                }
+            };
+            answer(&mut remote, &second, code(&second)).await;
+            answer(&mut remote, &first, code(&first)).await;
+            remote
+        });
+        let send = |session: &'static str| {
+            let mut request = cancel_location(Vec::new());
+            request.session_id = Some(session);
+            let wire = wire(&peer, request).unwrap();
+            let peer = Arc::clone(&peer);
+            async move {
+                peer.send_request_timeout(wire, std::time::Duration::from_secs(5))
+                    .await
+                    .unwrap()
+            }
+        };
+        let (one, two) = tokio::join!(send("hss.epc.example;1;1"), send("hss.epc.example;1;2"));
+        let _remote = answering.await.unwrap();
+        let read = |raw: &[u8]| {
+            let message = DiameterMsg::from_wire(raw).unwrap();
+            (
+                message.get_str(avp::SESSION_ID).unwrap(),
+                message.find(avp::RESULT_CODE, 0).and_then(Avp::as_u32),
+            )
+        };
+        assert_eq!(read(&one.raw), ("hss.epc.example;1;1".into(), Some(2001)));
+        assert_eq!(read(&two.raw), ("hss.epc.example;1;2".into(), Some(5002)));
+    }
+
+    /// A peer that reads the request and never answers is a timeout, not a
+    /// lost connection.
+    #[tokio::test]
+    async fn a_peer_that_does_not_answer_is_a_timeout() {
+        let (local, mut remote) = tokio::io::duplex(65_536);
+        let (incoming, _incoming) = tokio::sync::mpsc::channel(4);
+        let peer =
+            crate::diameter::peer::spawn_connection_tasks(connection_config(), local, incoming);
+        let request = wire(&peer, cancel_location(Vec::new())).unwrap();
+        let holding = tokio::spawn(async move {
+            let _ = codec::read_diameter_message(&mut remote).await;
+            remote
+        });
+        let reason = peer
+            .send_request_timeout(request, std::time::Duration::from_millis(50))
+            .await
+            .unwrap_err();
+        assert_eq!(failure(&reason), Failure::Timeout, "{reason}");
+        let _remote = holding.await.unwrap();
+    }
+
+    /// A connection the server accepted, found by the host its requests came
+    /// from, and one this node initiated as a client-mode peer: the request
+    /// leaves on each and the answer comes back on it.
+    #[tokio::test]
+    async fn requests_leave_on_an_accepted_and_on_an_initiated_connection() {
+        let manager = DiameterManager::new();
+        let (accepted_local, mut accepted_remote) = tokio::io::duplex(65_536);
+        let (initiated_local, mut initiated_remote) = tokio::io::duplex(65_536);
+        let (incoming, _incoming) = tokio::sync::mpsc::channel(4);
+        let accepted = crate::diameter::peer::spawn_connection_tasks(
+            connection_config(),
+            accepted_local,
+            incoming.clone(),
+        );
+        let initiated = crate::diameter::peer::spawn_connection_tasks(
+            connection_config(),
+            initiated_local,
+            incoming,
+        );
+        let mut serving = ServingConnection::new("t-both-ways", "pcscf", &accepted);
+        serving.observe(&json!({
+            "Origin-Host": "pcscf1.ims.example",
+            "Origin-Realm": "ims.example",
+        }));
+        manager.register(
+            "pcrf".into(),
+            Arc::new(crate::diameter::DiameterClient::new(Arc::clone(&initiated))),
+        );
+        for (tenant, peer, host, remote) in [
+            (
+                "t-both-ways",
+                None,
+                Some("pcscf1.ims.example"),
+                &mut accepted_remote,
+            ),
+            (DEFAULT_TENANT, Some("pcrf"), None, &mut initiated_remote),
+        ] {
+            let chosen = connection(&manager, tenant, peer, host, "ims.example").unwrap();
+            let request = Request {
+                command_code: 258,
+                application_id: dictionary::RX_APP_ID,
+                proxiable: true,
+                session_id: Some("pcrf.ims.example;3;4"),
+                destination_host: host,
+                destination_realm: "ims.example",
+                avps: Vec::new(),
+            };
+            let wire = wire(&chosen, request).unwrap();
+            let pending = {
+                let chosen = Arc::clone(&chosen);
+                tokio::spawn(async move {
+                    chosen
+                        .send_request_timeout(wire, std::time::Duration::from_secs(5))
+                        .await
+                })
+            };
+            let bytes = codec::read_diameter_message(remote).await.unwrap();
+            let received = DiameterMsg::from_wire(&bytes).unwrap();
+            assert_eq!(received.command_code, 258);
+            answer(remote, &received, 2001).await;
+            let answered = pending.await.unwrap().unwrap();
+            let answered = DiameterMsg::from_wire(&answered.raw).unwrap();
+            assert_eq!(
+                answered.find(avp::RESULT_CODE, 0).and_then(Avp::as_u32),
+                Some(2001)
+            );
+        }
+        drop(serving);
     }
 }

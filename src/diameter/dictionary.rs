@@ -91,6 +91,13 @@ static AVP_TABLE: &[AvpDef] = &[
         name: "Session-Timeout",
         data_type: AvpType::Unsigned32,
     },
+    // The APN of a Gx session (TS 29.212 clause 4.5.1, RFC 7155 clause 4.2.2).
+    AvpDef {
+        code: 30,
+        vendor_id: 0,
+        name: "Called-Station-Id",
+        data_type: AvpType::UTF8String,
+    },
     AvpDef {
         code: 33,
         vendor_id: 0,
@@ -1598,6 +1605,19 @@ static AVP_TABLE: &[AvpDef] = &[
         name: "AN-GW-Address",
         data_type: AvpType::Address,
     },
+    // The packet filters of a PCC rule (TS 29.212 clauses 5.3.53 and 5.3.65).
+    AvpDef {
+        code: 1058,
+        vendor_id: TGPP,
+        name: "Flow-Information",
+        data_type: AvpType::Grouped,
+    },
+    AvpDef {
+        code: 1080,
+        vendor_id: TGPP,
+        name: "Flow-Direction",
+        data_type: AvpType::Enumerated,
+    },
     // SMS-Information envelope: Recipient-Address (TS 32.299 §7.2.155)
     AvpDef {
         code: 1201,
@@ -2216,6 +2236,17 @@ pub fn avp_is_mandatory(code: u32, vendor_id: u32) -> bool {
                 | avp::PCSCF_SUBSCRIPTION_INFO
                 | avp::REGISTRATION_TIME_OUT
                 | avp::FAILED_PCSCF..=avp::PCSCF_IP_ADDRESS
+                // TS 29.212 table 5.3.1 and TS 29.214 table 5.3.1: V must,
+                // M must not. S6a overrides it for RAT-Type (TS 29.272 table
+                // 7.3.1/2), which its own encoder sets.
+                | avp::RX_REQUEST_TYPE
+                | avp::RAT_TYPE
+                | avp::ALLOCATION_RETENTION_PRIORITY
+                | avp::APN_AGGREGATE_MAX_BITRATE_DL
+                | avp::APN_AGGREGATE_MAX_BITRATE_UL
+                | avp::PRIORITY_LEVEL..=avp::AN_GW_ADDRESS
+                | avp::FLOW_INFORMATION
+                | avp::FLOW_DIRECTION
         ),
         0 => !matches!(
             code,
@@ -2713,6 +2744,43 @@ pub mod avp;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The Gx and Rx AVPs that TS 29.212 table 5.3.1 and TS 29.214 table
+    /// 5.3.1 (Rel-18) list with M under "Must not" go without it; their
+    /// neighbours in the same tables, listed "M,V", keep it. A reusing
+    /// application that overrides the rule (TS 29.272 table 7.3.1/2 "Must
+    /// set" for RAT-Type on S6a) sets the bit in its own encoder.
+    #[test]
+    fn gx_and_rx_avps_the_tables_forbid_the_m_bit_go_without_it() {
+        for code in [
+            avp::RX_REQUEST_TYPE,
+            avp::RAT_TYPE,
+            avp::ALLOCATION_RETENTION_PRIORITY,
+            avp::APN_AGGREGATE_MAX_BITRATE_DL,
+            avp::APN_AGGREGATE_MAX_BITRATE_UL,
+            avp::PRIORITY_LEVEL,
+            avp::PRE_EMPTION_CAPABILITY,
+            avp::PRE_EMPTION_VULNERABILITY,
+            avp::DEFAULT_EPS_BEARER_QOS,
+            avp::AN_GW_ADDRESS,
+            avp::FLOW_INFORMATION,
+            avp::FLOW_DIRECTION,
+        ] {
+            assert!(!avp_is_mandatory(code, VENDOR_3GPP), "AVP {code}");
+        }
+        for code in [
+            avp::CHARGING_RULE_INSTALL,
+            avp::CHARGING_RULE_DEFINITION,
+            avp::CHARGING_RULE_NAME,
+            avp::EVENT_TRIGGER,
+            avp::PRECEDENCE,
+            avp::QOS_INFORMATION,
+            avp::QOS_CLASS_IDENTIFIER,
+            avp::IP_CAN_TYPE,
+        ] {
+            assert!(avp_is_mandatory(code, VENDOR_3GPP), "AVP {code}");
+        }
+    }
 
     #[test]
     fn known_result_codes_label_as_themselves() {

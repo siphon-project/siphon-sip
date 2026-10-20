@@ -407,3 +407,45 @@ def test_originate_refuses_bad_arguments_and_raises_the_configured_failure():
     diameter.set_originate_outcome('ALR', 'S6c', LookupError('no open Diameter connection'))
     with pytest.raises(LookupError):
         asyncio.run(diameter.originate('ALR', 'S6c', [], 'ims.example'))
+
+
+def test_originate_takes_nested_groups_and_a_given_session_id():
+    import asyncio
+    diameter = _fresh_diameter()
+    rule = ('Charging-Rule-Install', [
+        ('Charging-Rule-Definition', [
+            ('Charging-Rule-Name', b'ims-voice'),
+            ('Flow-Information', [('Flow-Description', b'permit out 17 from 198.51.100.20 to 198.51.100.7'),
+                                  ('Flow-Direction', 1)]),
+            ('Flow-Information', [('Flow-Description', b'permit out 17 from 198.51.100.7 to 198.51.100.20'),
+                                  ('Flow-Direction', 2)]),
+        ]),
+    ])
+    answer = asyncio.run(diameter.originate(
+        'RAR', 'Gx', [('Auth-Application-Id', 16777238), ('Re-Auth-Request-Type', 0), rule],
+        'epc.example', destination_host='pgw.epc.example', session_id='pgw.epc.example;1;1'))
+    assert answer.result_code == 2001
+    sent = diameter.originated[-1]
+    assert sent['session_id'] == 'pgw.epc.example;1;1'
+    assert sent['avps'][2] == rule
+
+
+def test_originate_refuses_a_bad_member_and_reports_an_experimental_result():
+    import asyncio
+    import pytest
+    from siphon_sdk.mock_module import MockDiameterAnswer
+    diameter = _fresh_diameter()
+    for avps in (
+        [('Charging-Rule-Install', [('Charging-Rule-Name',)])],
+        [('User-Name', '001010000000001', '10415')],
+        [('User-Name', '001010000000001', 0, 'yes')],
+        [('Precedence', 1.5)],
+    ):
+        with pytest.raises(TypeError):
+            asyncio.run(diameter.originate('RAR', 'Gx', avps, 'epc.example'))
+    diameter.set_originate_outcome('RTR', 'Cx', MockDiameterAnswer(
+        result_code=None, experimental_result_code=5001))
+    answer = asyncio.run(diameter.originate('RTR', 'Cx', [], 'ims.example'))
+    assert answer.result_code is None
+    assert answer.experimental_result_code == 5001
+    assert not answer.is_error

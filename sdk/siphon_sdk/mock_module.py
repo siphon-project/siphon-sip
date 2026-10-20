@@ -8205,9 +8205,13 @@ class MockDiameterAvp:
 class MockDiameterAnswer:
     """Mock ``DiameterAnswer`` — the value a handler returns / forwards."""
 
-    def __init__(self, result_code: int = 2001, command_code: int = 0,
-                 avps: Optional[dict] = None) -> None:
+    def __init__(self, result_code: Optional[int] = 2001, command_code: int = 0,
+                 avps: Optional[dict] = None,
+                 experimental_result_code: Optional[int] = None) -> None:
         self.result_code = result_code
+        # The code inside Experimental-Result, where the 3GPP applications
+        # put the ones they define; None when the answer has a Result-Code.
+        self.experimental_result_code = experimental_result_code
         self.command_code = command_code
         # An ordered list rather than a dict: an answer can carry the same AVP
         # more than once, and the order is the order on the wire.
@@ -8223,7 +8227,7 @@ class MockDiameterAnswer:
         ``request.answer`` / ``request.reject`` has it for a protocol error
         (3xxx) only: a permanent failure (5xxx) answered by a handler is an
         answer of the command (RFC 6733 section 7.1.5)."""
-        return 3000 <= self.result_code < 4000
+        return self.result_code is not None and 3000 <= self.result_code < 4000
 
     def get_avp(self, code: int, vendor: int = 0):
         """The value of the first AVP with this code and vendor, or ``None``."""
@@ -8563,6 +8567,27 @@ _ORIGINATE_ENVELOPE_AVPS = {
     "Session-Id", "Origin-Host", "Origin-Realm", "Destination-Host",
     "Destination-Realm", 263, 264, 296, 293, 283,
 }
+
+
+
+def _check_originate_avps(avps: list) -> None:
+    """The shape checks ``diameter.originate`` makes before anything is sent,
+    at every level of a group. The mock has no dictionary, so a value of the
+    wrong type for its AVP is caught only by siphon itself."""
+    for item in avps:
+        if not isinstance(item, tuple) or not 2 <= len(item) <= 4:
+            raise TypeError("an AVP is a (code_or_name, value[, vendor[, mandatory]]) tuple")
+        if not isinstance(item[0], (int, str)) or isinstance(item[0], bool):
+            raise TypeError("AVP must be an int code or a str name")
+        if len(item) >= 3 and item[2] is not None and (
+                not isinstance(item[2], int) or isinstance(item[2], bool)):
+            raise TypeError("an AVP's vendor must be an int or None")
+        if len(item) == 4 and not isinstance(item[3], bool):
+            raise TypeError("an AVP's mandatory flag must be a bool")
+        if isinstance(item[1], list):
+            _check_originate_avps(item[1])
+        elif not isinstance(item[1], (int, str, bytes)) or isinstance(item[1], bool):
+            raise TypeError(f"AVP {item[0]}: a value is an int, str, bytes or a list of members")
 
 
 class MockDiameter:
@@ -10346,9 +10371,8 @@ class MockDiameter:
             raise ValueError(f"unknown Diameter application name: {application}")
         if not isinstance(avps, list):
             raise TypeError("avps must be a list of (code_or_name, value) tuples")
+        _check_originate_avps(avps)
         for item in avps:
-            if not isinstance(item, tuple) or not 2 <= len(item) <= 4:
-                raise TypeError("each AVP is a (code_or_name, value[, vendor[, mandatory]]) tuple")
             if item[0] in _ORIGINATE_ENVELOPE_AVPS and (len(item) < 3 or not item[2]):
                 raise ValueError(f"AVP {item[0]} is set by the request itself and cannot be passed in avps")
         if not hasattr(self, "originated"):
