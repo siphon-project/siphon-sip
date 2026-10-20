@@ -29,6 +29,8 @@ pub struct RouteTarget {
     /// Host siphon presents in its own `Contact` on this attempt's leg. See
     /// [`DialTarget::contact_host`].
     pub contact_host: Option<String>,
+    /// This attempt's server verification: see [`DialTarget::verify_server`].
+    pub verify_server: Option<bool>,
 }
 
 /// The failover queue a `route` verb's targets become: R-URI carriers, as
@@ -57,6 +59,7 @@ fn route_verb_routes(
                 reroute_after_progress: target.reroute_after_progress,
                 route: target.route,
                 contact_host: target.contact_host,
+                verify_server: target.verify_server,
                 ..Default::default()
             }
         })
@@ -474,20 +477,12 @@ pub fn send_uas_response(
             .set("Content-Length", body_bytes.len().to_string());
         response.body = body_bytes;
     }
-    // siphon's method set on its own 18x and 2xx, as on the relayed ones (RFC
-    // 3261 §13.3.1.4: a 2xx to INVITE SHOULD carry Allow), or the caller's
-    // gateway group `allow_methods`. A script's or controller's `Allow` below
-    // replaces it.
-    if (101..300).contains(&code) {
-        let allow = allow_toward(state, || Some(remote_addr.ip()));
-        advertise_allow(&mut response.headers, allow_value(&allow));
-    }
-    // The script's own headers (`P-Early-Media` on an announcement's 183, RFC
-    // 5009 §8): precedence 1, as on a relayed response, so they go on last. The
-    // ones siphon owns here were refused before this point, so nothing below
-    // (the RSeq and Require of a reliable provisional, the 2xx's session timer)
-    // can collide with them.
-    crate::b2bua::uas_headers::apply(&mut response, headers);
+    // siphon's `Allow`, then the script's own headers (`P-Early-Media` on an
+    // announcement's 183, RFC 5009 §8): precedence 1, as on a relayed response,
+    // so they go on last. The ones siphon owns here were refused before this
+    // point, so nothing below (the RSeq and Require of a reliable provisional,
+    // the 2xx's session timer) can collide with them.
+    finish_uas_headers(state, &mut response, remote_addr.ip(), headers);
     if !final_response && (101..200).contains(&code) {
         // An SDP answer in siphon's own 18x is the caller's answer from now on.
         if sdp_in_body(content_type.unwrap_or_default(), &response.body).is_some() {
@@ -931,6 +926,8 @@ pub enum DialError {
     Media(String),
     /// An identity argument siphon cannot put on the wire.
     InvalidIdentity(String),
+    /// Media arguments that cannot be honoured together.
+    InvalidMedia(String),
 }
 
 impl std::fmt::Display for DialError {
@@ -947,8 +944,9 @@ impl std::fmt::Display for DialError {
             DialError::NoContacts(aor) => {
                 write!(formatter, "no registered contact for {aor}")
             }
-            DialError::Media(reason) => write!(formatter, "{reason}"),
-            DialError::InvalidIdentity(reason) => write!(formatter, "{reason}"),
+            DialError::Media(reason)
+            | DialError::InvalidIdentity(reason)
+            | DialError::InvalidMedia(reason) => write!(formatter, "{reason}"),
         }
     }
 }
@@ -1104,29 +1102,27 @@ pub(crate) fn b2bua_dial_call_with_state(
     let mut targets = targets;
     check_branch_contact_hosts(&mut targets).map_err(DialError::InvalidIdentity)?;
 
-    if let Some(profile) = shaping.profile.as_deref() {
-        let source_ip = state
-            .call_actors
-            .get_call(&internal_call_id)
-            .map(|call| call.a_leg.transport.remote_addr.ip())
-            .ok_or_else(|| DialError::Media("call is gone".into()))?;
-        template = control_dial_media_offer(&template, source_ip, profile, state)
-            .map_err(DialError::Media)?;
-        let Some(mut call) = state.call_actors.get_call_mut(&internal_call_id) else {
-            release_failed_call_media(sip_call_id, state);
+    // Each branch's media profile, its own over the dial's: one allocation per
+    // profile, the first the call's own session (see `dial_media`).
+    let primary_profile = super::dial_media::resolve_branch_profiles(&mut targets, shaping)?;
+    if let Some(primary) = primary_profile.as_deref() {
+        let dial_profile = shaping.profile.as_deref();
+        let anchored = super::dial_media::anchor_dial_media(
+            &internal_call_id,
+            &mut template,
+            &targets,
+            primary,
+            dial_profile,
+            state,
+        )?;
+        if !anchored {
             return Ok(false);
-        };
-        call.control_dial_media = true;
-        // One allocation serves every branch: they are all offered this body,
-        // and the attempts a sequential hunt makes later are rebuilt from the
-        // stored A-leg INVITE, which keeps the caller's own offer so a failed
-        // dial is still answerable into voicemail.
-        call.control_dial_offer = Some(template.body.clone());
+        }
     }
 
     // Behind an early answer siphon already gave the caller, the callee is
     // offered the engine's far leg (see `early_dial`), one target at a time.
-    if shaping.profile.is_none() {
+    if primary_profile.is_none() {
         if let Some(refusal) = super::dial_refusal(state, &internal_call_id, parallel) {
             return Err(DialError::Media(refusal));
         }
@@ -1235,11 +1231,20 @@ fn dial_parallel(
         // name and pinned host — on a template of its own. The dial's identity
         // is already on the shared template, so only a target that asked to
         // differ costs a clone.
-        let branch_template = branch_from.as_ref().map(|shaped| {
+        let mut branch_template = branch_from.as_ref().map(|shaped| {
             let mut own = template.clone();
             crate::sip::privacy::present_calling_identity(&mut own, shaped.header.clone());
             own
         });
+        // And its media profile's anchored offer, when that is not the call's own.
+        let profile = target.profile.as_deref();
+        super::dial_media::offer_branch_media(
+            call_id,
+            profile,
+            &mut branch_template,
+            template,
+            state,
+        );
         // Its number also goes through the tag-preserving substitution a
         // per-carrier LCR route uses, which carries it onto an asserted
         // identity the header policy let through.
@@ -1266,6 +1271,7 @@ fn dial_parallel(
                 .and_then(|shaped| shaped.host.as_deref()),
             branch_to.as_deref(),
             target.contact_host.as_deref(),
+            target.verify_server,
             &headers,
             state,
         ) {
@@ -1278,9 +1284,12 @@ fn dial_parallel(
 /// A sequential `dial` as a failover queue.
 ///
 /// Its targets are phones being hunted, and a phone that rings sends a 180, so
-/// each target moves on when `timeout_secs` passes whether it rang or not:
-/// every route sets `reroute_after_progress`, where an LCR carrier that has
-/// shown progress would keep the call.
+/// by default each target moves on when `timeout_secs` passes whether it rang
+/// or not: its route sets `reroute_after_progress`, where an LCR carrier that
+/// has shown progress would keep the call. A target that sets it `false` keeps
+/// the call once it has rung, and every attempt is marked a hunt, which also
+/// ends the dial on that target's final failure and on any 6xx
+/// ([`crate::b2bua::actor::hunt_stops_at`]).
 fn sequential_dial_routes(
     targets: Vec<DialTarget>,
     branch_froms: Vec<Option<ShapedFrom>>,
@@ -1300,6 +1309,7 @@ fn sequential_dial_routes(
             // number for this carrier alone, tag-preserving, and reaches
             // `P-Asserted-Identity` with it. The dial's own identity is already
             // on the template, so a route only carries what differs.
+            let reroute_after_progress = target.reroutes_after_progress();
             let caller_id = target
                 .from
                 .as_deref()
@@ -1316,7 +1326,8 @@ fn sequential_dial_routes(
                 )
                 .into_iter()
                 .collect(),
-                reroute_after_progress: true,
+                reroute_after_progress,
+                hunt: true,
                 caller_id,
                 // The failover engine applies this per attempt, after the
                 // number policy, which is where CLIR belongs: the presentation
@@ -1337,6 +1348,9 @@ fn sequential_dial_routes(
                 // The Contact host this target presents, which every attempt
                 // has to carry for the same reason its route set does.
                 contact_host: target.contact_host,
+                // The media profile its attempt is offered (see `dial_media`).
+                media_profile: target.profile,
+                verify_server: target.verify_server,
                 ..Default::default()
             }
         })
@@ -1500,6 +1514,7 @@ mod tests {
             reroute_after_progress,
             route: Vec::new(),
             contact_host: None,
+            verify_server: None,
         }
     }
 

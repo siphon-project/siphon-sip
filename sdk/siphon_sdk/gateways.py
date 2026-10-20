@@ -163,6 +163,11 @@ class GatewayRow:
     """Keep this destination out of selection while :attr:`registers` is not
     registered. Needs :attr:`registers`."""
 
+    verify_server: Optional[bool] = None
+    """Verify this destination's server certificate on outbound TLS: the chain
+    against ``tls.server_ca`` and the host of :attr:`uri` as a SIP domain
+    (RFC 5922 §7). ``None`` (omitted) leaves it to ``tls.verify_server``."""
+
     enabled: bool = True
     """``False`` drops the destination without removing the row."""
 
@@ -184,6 +189,7 @@ class GatewayRow:
             "password",
             "ha1",
             "registers",
+            "verify_server",
             "probe",
             "probe_interval_secs",
             "probe_failure_threshold",
@@ -221,6 +227,7 @@ class GatewayRow:
             ha1_algorithm=data.get("ha1_algorithm", "md5"),
             registers=data.get("registers"),
             require_registration=data.get("require_registration", False),
+            verify_server=data.get("verify_server"),
             enabled=data.get("enabled", True),
             probe=data.get("probe"),
             probe_interval_secs=data.get("probe_interval_secs"),

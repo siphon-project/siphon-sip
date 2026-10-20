@@ -70,13 +70,87 @@ pub struct DialTarget {
     /// Validated and stored bracketed when it is an IPv6 address
     /// ([`checked_contact_host`]).
     pub contact_host: Option<String>,
+    /// Verify the server certificate on a new outbound TLS connection for this
+    /// branch: the chain against `tls.server_ca` (or the bundled Mozilla
+    /// roots) and the host of the URI it routes to (`next_hop`, else `uri`) as
+    /// a SIP domain (RFC 5922 §7). Wins over the gateway the branch routes to
+    /// and over `tls.verify_server`; `None` leaves it to them.
+    pub verify_server: Option<bool>,
     /// The registered AoR this target is a contact of, when it came from an
     /// `{aor}` target ([`dial_targets_for_aor`]). What the branch's events name
     /// as the AoR it was dialled for; `None` for a URI dialled as written.
     pub aor: Option<String>,
+    /// Whether a sequential dial still moves on from this target once it has
+    /// shown progress (a 101-199 from the far end). `None` is the verb's
+    /// default, which is `true`: a hunt through phones moves on when a phone
+    /// rings out or is busy.
+    ///
+    /// `Some(false)` makes this target's outcome the dial's once it has rung:
+    /// its ring timeout, busy, decline or any other failure ends the dial and
+    /// no later target is tried ([`crate::b2bua::actor::hunt_stops_at`]). For
+    /// a hunt across several routes to the same destination, where the next
+    /// target would ring the same person again. The field a `route` target
+    /// has, pointing the same way (`false` keeps the call on a target that
+    /// rang); on a `dial` it covers the target's final failures too, where a
+    /// `route` carrier still fails over on its reroute causes, and its default
+    /// is `true` rather than `false`. Ignored by a parallel dial, which has no
+    /// next target to stop.
+    pub reroute_after_progress: Option<bool>,
+    /// Media profile for this branch alone, over the dial's own.
+    ///
+    /// The media a peer can take is a property of that peer, not of the call:
+    /// a desk phone behind NAT needs a latching relay while a trunk asks for
+    /// SDES-SRTP, and one ring can reach both. A branch naming a profile the
+    /// others do not is offered an allocation of its own, and the branch that
+    /// answers is answered through it (see `dial_media`).
+    pub profile: Option<String>,
+    /// When this branch's INVITE carries its SDP offer, over the dial's own.
+    /// Only a bridging dial places its legs itself, so only it reads this.
+    pub offer: Option<DialOffer>,
+}
+
+/// When a leg a bridging `dial` places carries its SDP offer.
+///
+/// Every leg of a bridging dial is a call siphon places itself, with no
+/// caller's INVITE behind it to take an offer from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DialOffer {
+    /// The INVITE goes out with no SDP: the callee offers in its 2xx and siphon
+    /// answers in the ACK (RFC 3261 §13.2.1, RFC 3264 §5). What a bridging dial
+    /// has always done.
+    #[default]
+    Delayed,
+    /// The INVITE carries an offer the media engine allocated for the leg from
+    /// the caller's media description, and the callee answers in its 2xx. For
+    /// peers that refuse a delayed-offer INVITE.
+    Early,
+}
+
+impl DialOffer {
+    /// The offer mode named `text` (`early` / `delayed`).
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "early" => Some(Self::Early),
+            "delayed" => Some(Self::Delayed),
+            _ => None,
+        }
+    }
+
+    /// The name the control plane uses.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Delayed => "delayed",
+            Self::Early => "early",
+        }
+    }
 }
 
 impl DialTarget {
+    /// Whether this target, once it has rung, still moves a sequential dial on.
+    pub fn reroutes_after_progress(&self) -> bool {
+        self.reroute_after_progress.unwrap_or(true)
+    }
+
     /// This branch's effective identity: its own where it names one, the
     /// dial's otherwise.
     ///
@@ -85,9 +159,7 @@ impl DialTarget {
     /// `headers`, which a target already layers over the command's.
     pub(super) fn shaping_over(&self, dial: &DialShaping) -> DialShaping {
         DialShaping {
-            // Media is allocated once for the whole dial, so a branch cannot
-            // pick its own profile.
-            profile: dial.profile.clone(),
+            profile: self.profile.clone().or_else(|| dial.profile.clone()),
             from: self.from.clone().or_else(|| dial.from.clone()),
             from_display: self
                 .from_display

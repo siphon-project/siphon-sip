@@ -8,14 +8,14 @@ use pyo3::prelude::*;
 
 use siphon_control_client::proto::sip::{PeerHangupPolicy, PlayRepeat};
 use siphon_control_client::sip::{
-    AorRing, DialOnAnswer, DialStrategy, DialTarget, OriginateMedia, OriginatePrivacy, PlaySource,
-    RecordChannels, RecordDirection, Ringback, RouteTarget, SessionRefresher, SessionTimer,
-    StreamChannels, StreamDirection, StreamMode, TargetIdentity,
+    AorRing, DialOffer, DialOnAnswer, DialStrategy, DialTarget, OriginateMedia, OriginatePrivacy,
+    PlaySource, RecordChannels, RecordDirection, Ringback, RouteTarget, SessionRefresher,
+    SessionTimer, StreamChannels, StreamDirection, StreamMode, TargetIdentity,
 };
 
 /// Extract one `route` target: a bare URI `str`, or a dict
 /// `{uri, next_hop?, headers?, timeout?, reroute_after_progress?, route?,
-/// contact_host?}`.
+/// contact_host?, verify_server?}`.
 pub(crate) fn extract_route_target(item: &Bound<'_, PyAny>) -> PyResult<RouteTarget> {
     if let Ok(uri) = item.extract::<String>() {
         return Ok(RouteTarget::uri(uri));
@@ -23,7 +23,8 @@ pub(crate) fn extract_route_target(item: &Bound<'_, PyAny>) -> PyResult<RouteTar
     let dict = item.cast::<pyo3::types::PyDict>().map_err(|_| {
         PyValueError::new_err(
             "each route target must be a URI str or a dict \
-             {uri, next_hop, headers, timeout, reroute_after_progress, route, contact_host}",
+             {uri, next_hop, headers, timeout, reroute_after_progress, route, contact_host, \
+             verify_server}",
         )
     })?;
     let uri: String = match dict.get_item("uri")? {
@@ -64,6 +65,7 @@ pub(crate) fn extract_route_target(item: &Bound<'_, PyAny>) -> PyResult<RouteTar
         reroute_after_progress,
         route,
         contact_host,
+        verify_server: optional_verify_server(dict)?,
     })
 }
 
@@ -100,10 +102,16 @@ pub(crate) fn extract_dial_targets(items: &[Bound<'_, PyAny>]) -> PyResult<Vec<D
 }
 
 /// Extract one `dial` target: a dict `{uri, next_hop?, headers?, to?, route?,
-/// contact_host?}` dialed as written, or `{aor, headers?, to?, contact_host?}`
-/// forked to every registered contact. `contact_host` is the host of siphon's
-/// own Contact on the branch (every branch of an AoR), for a peer that
-/// identifies the tenant by that host.
+/// contact_host?, profile?, offer?, reroute_after_progress?, verify_server?}`
+/// dialed as written, or `{aor, headers?, to?, contact_host?, profile?, offer?,
+/// reroute_after_progress?, verify_server?}` forked to every registered contact.
+/// `contact_host` is the host of siphon's own Contact on the branch (every
+/// branch of an AoR), for a peer that identifies the tenant by that host.
+/// `profile` is the media profile for that branch alone, over the dial's own; a
+/// target without one inherits the dial's. `reroute_after_progress` (a `bool`,
+/// server default `True`) set `False` ends a sequential dial on this target once
+/// it has rung. `verify_server` (a bool) verifies the server certificate on the
+/// branch's outbound TLS.
 ///
 /// A bare string is refused although the server accepts one as a URI. The two
 /// forms do entirely different things — an AoR forks to every contact over that
@@ -123,6 +131,17 @@ fn extract_dial_target(item: &Bound<'_, PyAny>) -> PyResult<DialTarget> {
     let next_hop = optional_string(dict, "next_hop")?;
     let to = optional_string(dict, "to")?;
     let contact_host = optional_string(dict, "contact_host")?;
+    // A policy flag: anything but a real bool is refused, as the server refuses
+    // it, rather than read as the default and quietly left on the old rule.
+    let reroute_after_progress = match dict.get_item("reroute_after_progress")? {
+        Some(value) if !value.is_none() => Some(value.extract::<bool>().map_err(|_| {
+            PyTypeError::new_err("dial target 'reroute_after_progress' must be a bool")
+        })?),
+        _ => None,
+    };
+    let profile = optional_string(dict, "profile")?;
+    let offer = extract_dial_offer(optional_string(dict, "offer")?)?;
+    let verify_server = optional_verify_server(dict)?;
     let route = extract_route_set(dict)?;
     let headers = match dict.get_item("headers")? {
         Some(value) if !value.is_none() => extract_headers(&value)?,
@@ -149,6 +168,10 @@ fn extract_dial_target(item: &Bound<'_, PyAny>) -> PyResult<DialTarget> {
             to: None,
             route,
             contact_host: None,
+            reroute_after_progress: None,
+            profile: None,
+            offer: None,
+            verify_server: None,
         },
         (None, Some(aor)) => {
             if next_hop.is_some() {
@@ -181,7 +204,36 @@ fn extract_dial_target(item: &Bound<'_, PyAny>) -> PyResult<DialTarget> {
     if let Some(contact_host) = contact_host {
         target = target.contact_host(contact_host);
     }
+    if let Some(reroute) = reroute_after_progress {
+        target = target.reroute_after_progress(reroute);
+    }
+    if let Some(profile) = profile {
+        target = target.profile(profile);
+    }
+    if let Some(offer) = offer {
+        target = target.offer(offer);
+    }
+    if let Some(verify_server) = verify_server {
+        target = target.verify_server(verify_server);
+    }
     Ok(target)
+}
+
+/// Read a target's optional `verify_server`. Anything but a real bool is
+/// refused, as the server refuses it: read as `false`, it would send the call
+/// to a peer the app asked to have authenticated without authenticating it.
+fn optional_verify_server(dict: &Bound<'_, pyo3::types::PyDict>) -> PyResult<Option<bool>> {
+    match dict.get_item("verify_server")? {
+        Some(value) if !value.is_none() => {
+            if !value.is_instance_of::<pyo3::types::PyBool>() {
+                return Err(PyTypeError::new_err(
+                    "a target's 'verify_server' must be a bool",
+                ));
+            }
+            Ok(Some(value.extract::<bool>()?))
+        }
+        _ => Ok(None),
+    }
 }
 
 /// Read an optional non-`None` string entry out of a dict.
@@ -226,6 +278,20 @@ pub(crate) fn extract_dial_strategy(strategy: Option<String>) -> PyResult<Option
 ///
 /// A ringback is refused on a connecting dial, as the server refuses it
 /// (`requires_bridge`): it would otherwise be sent and fail the whole dial.
+/// A dial's or a target's `offer`: `"early"` or `"delayed"`, `None` for the
+/// server's default.
+pub(crate) fn extract_dial_offer(offer: Option<String>) -> PyResult<Option<DialOffer>> {
+    offer
+        .map(|name| {
+            DialOffer::from_name(&name).ok_or_else(|| {
+                PyValueError::new_err(format!(
+                    "dial offer must be \"early\" or \"delayed\", not {name:?}"
+                ))
+            })
+        })
+        .transpose()
+}
+
 pub(crate) fn extract_dial_on_answer(
     on_answer: Option<String>,
     ringback: Option<Bound<'_, PyAny>>,

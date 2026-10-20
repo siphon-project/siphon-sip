@@ -499,6 +499,10 @@ pub fn b2bua_advance_route_with_numbers(
             next_hop = ?next_hop,
             "LCR: dialing carrier",
         );
+        // A sequential `dial` target that named its own media profile is
+        // offered that profile's allocation on this attempt alone.
+        let offered = route_media_request(call_id, &route, original_request, state);
+        let original_request = offered.as_ref().unwrap_or(original_request);
         // A sequential `dial` target that named its own identity presents it
         // on this attempt alone, over the dial's.
         let presented = route.presented_from.as_ref().map(|from| {
@@ -522,6 +526,7 @@ pub fn b2bua_advance_route_with_numbers(
             route.from_host.as_deref(),
             route.presented_to.as_deref(),
             route.contact_host.as_deref(),
+            route.verify_server,
             &extra_headers,
             state,
         );

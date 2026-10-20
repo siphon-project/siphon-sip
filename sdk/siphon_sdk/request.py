@@ -1402,12 +1402,26 @@ class Request:
         values come from :attr:`source_ip` / :attr:`source_port`, so a
         ``Request`` constructed with a NATed source port writes that port
         into ``rport=`` rather than a fixed 5060.
+
+        On a request that came over an IPsec UDP flow (from the
+        :attr:`matched_sa`'s ``ue_port_c``), ``rport=`` is the UE's protected
+        server port instead, the port its response goes to
+        (TS 24.229 clause 5.2.6.3.1).
         """
+        rport = self._source_port
+        sa = self.matched_sa
+        if (
+            sa is not None
+            and self._transport.lower() == "udp"
+            and sa.ue_port_c == self._source_port
+            and getattr(sa, "protocol", "any") != "tcp"
+        ):
+            rport = sa.ue_port_s
         via = self.get_header("Via")
         if via:
             self.set_header(
                 "Via",
-                f"{via};received={self._source_ip};rport={self._source_port}",
+                f"{via};received={self._source_ip};rport={rport}",
             )
 
     def fix_nated_contact(self) -> None:

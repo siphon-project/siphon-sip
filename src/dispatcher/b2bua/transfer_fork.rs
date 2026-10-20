@@ -515,6 +515,9 @@ impl ReplacementPlan<'_> {
                 // A transfer's new leg presents the advertised Contact host:
                 // `replace_peer` and `accept_refer` refuse a `contact_host`.
                 None,
+                // Its own server verification comes from where it routes (a
+                // gateway's `verify_server`), else `tls.verify_server`.
+                None,
                 shaped.headers.as_slice(),
                 self.state,
             )

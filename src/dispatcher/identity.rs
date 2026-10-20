@@ -39,6 +39,27 @@ pub(super) fn allow_toward(
     gateway.allow_methods_for_peer(peer()?)
 }
 
+/// The last headers on a response siphon sends the caller as its UAS
+/// (`answer` / `ring` / `progress`): on an 18x or 2xx siphon's `Allow`, as on
+/// the relayed ones (RFC 3261 §13.3.1.4: a 2xx to INVITE SHOULD carry it), or
+/// the caller's gateway group `allow_methods`; then the script's or
+/// controller's `headers`, already checked, whose own `Allow` replaces it.
+pub(super) fn finish_uas_headers(
+    state: &DispatcherState,
+    response: &mut SipMessage,
+    caller: std::net::IpAddr,
+    headers: &[(String, String)],
+) {
+    if response
+        .status_code()
+        .is_some_and(|code| (101..300).contains(&code))
+    {
+        let allow = allow_toward(state, || Some(caller));
+        advertise_allow(&mut response.headers, allow_value(&allow));
+    }
+    crate::b2bua::uas_headers::apply(response, headers);
+}
+
 /// The `Allow` value [`allow_toward`] found, or the full set.
 pub(super) fn allow_value(allow: &Option<Arc<str>>) -> &str {
     allow.as_deref().unwrap_or(crate::sip::SUPPORTED_METHODS)

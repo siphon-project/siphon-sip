@@ -307,6 +307,7 @@ pub(super) fn handle_registrant_ipsec_challenge(
             data,
             source_local_addr: Some(source),
             server_name: None,
+            verify_server: None,
         };
         if let Err(error) = outbound.send(outbound_message) {
             warn!(aor = %aor_task, %error, "IPsec UE: failed to send protected REGISTER");

@@ -605,8 +605,24 @@ def on_invite(call):
 Both `client_certificate` and `client_private_key` must be set together (or
 neither); a one-sided setting or an unreadable file fails startup. The outbound
 handshake also sends the target hostname (`sbc.example.com`) as SNI, so a
-hostname-vhost trunk front-end can route it. Server-certificate verification is
-unchanged (permissive) — this only adds the client certificate siphon presents.
+hostname-vhost trunk front-end can route it.
+
+The client certificate proves siphon to the trunk; it says nothing about the
+trunk to siphon. To authenticate the trunk too, turn on server verification for
+it, globally or on the gateway that reaches it:
+
+```yaml
+tls:
+  # ...client_certificate / client_private_key as above...
+  verify_server: true          # check the certificate of every trunk dialled
+  # server_ca: "/etc/siphon/tls/trunk-ca.pem"   # only for a private CA
+```
+
+The trunk then has to present a certificate for `sbc.example.com` (the host you
+dial, never its resolved address) that chains to a trusted CA, or the call fails
+as an unreachable trunk would. See [Verifying the server siphon
+dials](../transports.md#verifying-the-server-siphon-dials) for the matching
+rules and per-gateway settings.
 
 !!! warning "Terminate strict peers (Teams) as a B2BUA, not a plain proxy"
     Microsoft Teams Direct Routing rejects any `Contact` or `Record-Route` whose

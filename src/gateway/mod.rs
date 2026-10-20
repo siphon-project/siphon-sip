@@ -102,6 +102,11 @@ pub struct Destination {
     /// Keep this destination out of [`DispatcherGroup::select`] while the
     /// registration named by `registers` is not registered.
     pub require_registration: bool,
+    /// Server verification on a new outbound TLS connection to this
+    /// destination (`verify_server` on the destination, else on its group):
+    /// `Some(true)` verifies, `Some(false)` does not, `None` follows
+    /// `tls.verify_server`.
+    pub verify_server: Option<bool>,
     /// Whether this destination is currently healthy.
     healthy: AtomicBool,
     /// Consecutive failure count.
@@ -133,6 +138,7 @@ impl Destination {
             credentials: None,
             registers: None,
             require_registration: false,
+            verify_server: None,
             healthy: AtomicBool::new(true),
             failures: AtomicU32::new(0),
             down_until: std::sync::Mutex::new(None),
@@ -142,6 +148,12 @@ impl Destination {
     /// Attach the digest credentials this destination challenges with.
     pub fn with_credentials(mut self, credentials: crate::auth::StoredCredentials) -> Self {
         self.credentials = Some(Arc::new(credentials));
+        self
+    }
+
+    /// Set this destination's own server verification setting.
+    pub fn with_verify_server(mut self, verify_server: Option<bool>) -> Self {
+        self.verify_server = verify_server;
         self
     }
 
@@ -1025,6 +1037,18 @@ impl DispatcherManager {
         None
     }
 
+    /// The `verify_server` setting of the gateway destination a next hop
+    /// belongs to, matched the way an outbound leg finds its credentials: on
+    /// the configured hostname first (`host_port` as
+    /// [`extract_address_from_uri`] normalises it), then on the resolved
+    /// address, which is how a destination configured as a bare `IP:port` is
+    /// found. `None` when no destination matches or it sets nothing.
+    pub fn verify_server_for(&self, host_port: &str, address: SocketAddr) -> Option<bool> {
+        self.hostname_destination_for(host_port)
+            .or_else(|| self.destination_for_address(address))
+            .and_then(|(_, destination)| destination.verify_server)
+    }
+
     /// Select a destination from a named group.
     pub fn select(
         &self,
@@ -1224,7 +1248,11 @@ async fn probe_destination(
     // Keep the configured hostname for TLS SNI — the probe addresses the
     // resolved IP (`current_addr`), but a hostname-vhost peer routes the TLS
     // handshake on SNI, so a new outbound TLS connection must present it.
-    let server_name = host.clone();
+    // Taken from the parsed URI, so a `;transport=tls` parameter or a user part
+    // never reaches the SNI (or the name a verified certificate must carry).
+    let server_name = crate::sip::parser::parse_uri_standalone(&dest.uri)
+        .map(|uri| uri.host)
+        .unwrap_or_else(|_| host.clone());
     let mut request_uri = SipUri::new(host).with_port(port);
     if dest.transport != Transport::Udp {
         request_uri = request_uri.with_param(
@@ -1244,6 +1272,7 @@ async fn probe_destination(
         } else {
             None
         },
+        dest.verify_server,
         // The group's `allow_methods`, so the peer reads the same `Allow` off
         // the probe as off everything else siphon sends it.
         allow_methods,

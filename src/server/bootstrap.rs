@@ -443,7 +443,8 @@ pub(super) async fn init_gateway(config: &Config) -> Option<Arc<DispatcherManage
                 dest_config.weight,
                 dest_config.priority,
             )
-            .with_attrs(dest_config.attrs.clone());
+            .with_attrs(dest_config.attrs.clone())
+            .with_verify_server(dest_config.verify_server.or(group_config.verify_server));
             if is_hostname {
                 dest = dest.with_address_str(address_str.clone());
             }

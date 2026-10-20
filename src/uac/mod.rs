@@ -238,7 +238,16 @@ impl UacSender {
         transport: Transport,
         request_uri: SipUri,
     ) -> oneshot::Receiver<UacResult> {
-        self.send_options_with_identity(destination, transport, request_uri, None, None, None, None)
+        self.send_options_with_identity(
+            destination,
+            transport,
+            request_uri,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
     }
 
     /// Send an OPTIONS request on a specific existing connection (TLS reuse).
@@ -258,6 +267,7 @@ impl UacSender {
             transport,
             request_uri,
             connection_id,
+            None,
             None,
             None,
             None,
@@ -296,6 +306,7 @@ impl UacSender {
             Some(source_local_addr),
             None,
             None,
+            None,
         )
     }
 
@@ -303,7 +314,11 @@ impl UacSender {
     ///
     /// `server_name` is the TLS SNI / certificate hostname to present when the
     /// probe opens a new outbound TLS connection (the gateway health probe knows
-    /// the configured hostname; an IP-addressed probe passes `None`).
+    /// the configured hostname; an IP-addressed probe passes `None`), and
+    /// `verify_server` the destination's own server verification setting
+    /// (`None` follows `tls.verify_server`), so a gateway that must be verified
+    /// is probed over a verified connection and a refused certificate counts
+    /// against its health.
     ///
     /// `allow_methods` is the `Allow` value to advertise, when the peer is
     /// shown fewer methods than siphon implements (`gateway.groups[].allow_methods`);
@@ -317,6 +332,7 @@ impl UacSender {
         from_user: Option<&str>,
         from_domain: Option<&str>,
         server_name: Option<&str>,
+        verify_server: Option<bool>,
         allow_methods: Option<&str>,
     ) -> oneshot::Receiver<UacResult> {
         self.send_options_on_connection_inner(
@@ -328,6 +344,7 @@ impl UacSender {
             from_domain,
             None,
             server_name,
+            verify_server,
             allow_methods,
         )
     }
@@ -350,6 +367,7 @@ impl UacSender {
         from_domain: Option<&str>,
         source_local_addr: Option<SocketAddr>,
         server_name: Option<&str>,
+        verify_server: Option<bool>,
         allow_methods: Option<&str>,
     ) -> oneshot::Receiver<UacResult> {
         let branch = format!("z9hG4bK-uac-{}", uuid::Uuid::new_v4());
@@ -453,6 +471,7 @@ impl UacSender {
             data,
             source_local_addr,
             server_name: server_name.map(str::to_owned),
+            verify_server,
         };
 
         let (sender, receiver) = oneshot::channel();
@@ -584,6 +603,7 @@ impl UacSender {
             data,
             source_local_addr,
             server_name: None,
+            verify_server: None,
         };
 
         self.pending.insert(
@@ -644,6 +664,7 @@ impl UacSender {
             data,
             source_local_addr: None,
             server_name: None,
+            verify_server: None,
         };
 
         debug!(
@@ -676,6 +697,7 @@ impl UacSender {
             data,
             source_local_addr: None,
             server_name: None,
+            verify_server: None,
         };
 
         if let Err(error) = self.outbound.send(outbound_message) {
@@ -1209,6 +1231,7 @@ mod tests {
             Some("sip.connect.example.com"),
             None,
             None,
+            None,
         );
 
         let outbound = udp_rx.try_recv().unwrap();
@@ -1232,6 +1255,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             Some(narrowed),
         );
         let outbound = rxs[0].try_recv().unwrap();
@@ -1245,6 +1269,7 @@ mod tests {
             "198.51.100.7:5060".parse().unwrap(),
             Transport::Udp,
             SipUri::new("198.51.100.7".to_string()),
+            None,
             None,
             None,
             None,
