@@ -97,6 +97,23 @@ listen:
   #                                                   # without one the bound port is used.
   #       dscp: EF                                    # per-listener override (default is global dscp)
   #
+  # Per-listener mutual TLS (listen.tls / listen.wss only): verify_client,
+  # client_ca and client_subject on one entry override the tls: block for that
+  # listener alone, so one listener can serve phones with no client cert while
+  # another requires one from a trunk peer:
+  #   tls:
+  #     - "192.0.2.10:5061"                          # phones: tls: block as-is
+  #     - address: "192.0.2.10:5062"                 # trunk peer: mutual TLS
+  #       verify_client: true
+  #       client_ca: "/etc/siphon/tls/trunk-ca.pem"
+  #       client_subject: ["*.sip.example.net"]      # optional identity check
+  # An unset key inherits from tls:. Refused at config load: these keys on a
+  # udp/tcp/ws/sctp entry, client_ca or client_subject on a listener that ends
+  # up not verifying, verify_client without any client_ca, an unreadable CA,
+  # a malformed subject pattern, and a tls+wss pair on one address whose
+  # settings differ (one socket, one handshake). Changing them needs a restart:
+  # a config reload reports `listen` under restart_required.
+  #
   # The global `advertised_address` (below) serves as fallback for transports
   # that don't have a per-socket advertise.
   #
@@ -203,8 +220,17 @@ advertised_address: "127.0.0.1"
 #   verify_client: false  # true for mTLS (e.g. SIP trunks with mutual auth)
 #   client_ca: "/etc/siphon/tls/client-ca.pem"
 #     # PEM bundle of CA certs that client certs must chain to. REQUIRED when
-#     # verify_client is true (startup fails otherwise). Applies to listen.tls
-#     # and listen.wss (they share this block).
+#     # verify_client is true (config load fails otherwise). Applies to every
+#     # listen.tls and listen.wss listener that does not override it.
+#   client_subject: ["*.sip.example.net"]
+#     # Optional, needs verify_client: true. On top of chaining to client_ca,
+#     # the client cert must name one of these: an exact DNS name or a
+#     # whole-leftmost-label wildcard (one label, RFC 6125 §6.4.3). Matched
+#     # against the cert's DNS subjectAltNames, or its subject CN only when it
+#     # carries none. Right CA, wrong name: refused at the handshake.
+#   # PER-LISTENER mTLS: verify_client / client_ca / client_subject can also be
+#   # set on one listen.tls / listen.wss entry (object form), overriding this
+#   # block for that listener only. See listen.tls above.
 #   # OUTBOUND mTLS — the cert siphon PRESENTS when it dials OUT to an upstream
 #   # trunk that requires a client certificate (e.g. Teams Direct Routing):
 #   client_certificate: "/etc/siphon/tls/client.crt"
@@ -230,8 +256,8 @@ advertised_address: "127.0.0.1"
 #     # Applies to listen.tls AND listen.wss (they share this block). Every pair
 #     # is hot-reloaded independently, so each tenant renews on its own ACME
 #     # schedule. A server name configured twice is a startup error.
-#     # verify_client/client_ca stay listener-wide — per-name client-cert trust
-#     # anchors are not expressible here.
+#     # Client-cert trust is per LISTENER (see listen.tls), not per server
+#     # name: the client cert is checked before SNI could pick anything.
 
 # ---------------------------------------------------------------------------
 # Python script

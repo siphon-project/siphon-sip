@@ -142,22 +142,16 @@ pub(super) fn dial(channel: &ChannelRef, command: &AdapterCommand) -> ControlRes
         Ok(ringback) => ringback,
         Err(refusal) => return refusal,
     };
-    let profile = match args.get("profile") {
-        None | Some(serde_json::Value::Null) => None,
-        Some(serde_json::Value::String(name)) if !name.trim().is_empty() => Some(name.as_str()),
-        Some(_) => {
-            return ControlResult::error(
-                ControlErrorCode::BadRequest,
-                "dial profile must be a non-empty profile name",
-            )
-        }
+    let profile = match parse_profile("dial", args.get("profile")) {
+        Ok(profile) => profile,
+        Err(message) => return ControlResult::error(ControlErrorCode::BadRequest, message),
     };
     let privacy = match super::originate::parse_privacy("dial", args.get("privacy")) {
         Ok(privacy) => privacy,
         Err(message) => return ControlResult::error(ControlErrorCode::BadRequest, message),
     };
     let shaping = crate::dispatcher::DialShaping {
-        profile: profile.map(str::to_string),
+        profile,
         from: super::string_arg(args, "from"),
         from_display: super::string_arg(args, "from_display"),
         p_asserted_identity: super::string_arg(args, "p_asserted_identity"),
@@ -408,7 +402,9 @@ pub(super) fn dial_error(error: crate::dispatcher::DialError) -> ControlResult {
         }
         DialError::UnsupportedStrategy(_) => ControlErrorCode::UnsupportedVerb,
         DialError::NoContacts(_) => ControlErrorCode::NotFound,
-        DialError::NoTargets | DialError::InvalidIdentity(_) => ControlErrorCode::BadRequest,
+        DialError::NoTargets | DialError::InvalidIdentity(_) | DialError::InvalidMedia(_) => {
+            ControlErrorCode::BadRequest
+        }
         DialError::Media(_) => ControlErrorCode::Unavailable,
     };
     ControlResult::error(code, error.to_string())
@@ -502,6 +498,7 @@ pub(super) fn parse_dial_target(
             .map_err(|error| error.to_string())?,
         to: string_field("to"),
         contact_host: parse_contact_host(object).map_err(|error| format!("target {error}"))?,
+        profile: parse_profile("dial target", object.get("profile"))?,
         ..Default::default()
     };
 
@@ -531,6 +528,7 @@ pub(super) fn parse_dial_target(
                     branch.privacy = shaped.privacy;
                     branch.to.clone_from(&shaped.to);
                     branch.contact_host.clone_from(&shaped.contact_host);
+                    branch.profile.clone_from(&shaped.profile);
                 }
                 Ok(branches)
             }
@@ -611,6 +609,17 @@ pub(super) fn parse_route_target(
         route,
         contact_host,
     })
+}
+
+/// Read a media `profile` argument: absent or `null` is none, anything else
+/// must name a profile. Whether siphon defines it is the media layer's to say,
+/// at dial time, the same for a dial's own profile and a target's.
+fn parse_profile(whose: &str, value: Option<&serde_json::Value>) -> Result<Option<String>, String> {
+    match value {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(name)) if !name.trim().is_empty() => Ok(Some(name.clone())),
+        Some(_) => Err(format!("{whose} profile must be a non-empty profile name")),
+    }
 }
 
 /// Read a `contact_host`: the host siphon presents in its own Contact on the

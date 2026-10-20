@@ -1078,6 +1078,16 @@ impl Call {
     /// hands over plain RTP at a routable address and every phone answers from
     /// an address on its own LAN.
     ///
+    /// Either target form may carry ``"profile"``, the media profile for that
+    /// branch alone (every branch of an AoR) over the dial's own; a target
+    /// without one inherits the dial's. One ring can then reach a phone behind
+    /// NAT that needs a latching relay and a trunk that asks for SDES-SRTP. An
+    /// unknown name fails the dial as an unknown dial-level ``profile`` does.
+    /// A connecting dial that names no ``profile`` anchors every branch or
+    /// none, so either every target names one or none does (a mix raises
+    /// ``bad_request``). On ``on_answer="bridge"`` each phone leg is anchored
+    /// with its target's profile over the dial's.
+    ///
     /// ``from`` / ``from_display`` / ``p_asserted_identity`` / ``privacy``
     /// present a calling identity of the app's choosing. Without them a B-leg
     /// presents the caller's own ``From``, which on a call out to a trunk is the

@@ -65,6 +65,8 @@ mod intercept;
 mod ipsec_lifecycle;
 #[cfg(test)]
 mod ipsec_lifecycle_tests;
+#[cfg(test)]
+mod ipsec_response_flow_tests;
 mod late_answer;
 mod liveness;
 mod media_init;
