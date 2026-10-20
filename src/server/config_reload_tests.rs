@@ -817,3 +817,68 @@ async fn turning_apiban_on_or_off_needs_a_restart() {
     assert_eq!(report.restart_required, ["security.apiban"]);
     assert_eq!(control.params(), before);
 }
+
+/// Per-listener client-certificate settings live under `listen`, which no
+/// applier covers: a change is reported as needing a restart (the running
+/// listeners keep their acceptors), never silently dropped, and a setting the
+/// load-time rules refuse refuses the whole reload.
+#[tokio::test]
+async fn a_listener_client_certificate_change_needs_a_restart_and_a_bad_one_is_refused() {
+    let tls_document = |listen_tls: &str| {
+        format!(
+            concat!(
+                "listen:\n",
+                "  tls:\n",
+                "{listen_tls}",
+                "domain:\n",
+                "  local: [\"example.com\"]\n",
+                "tls:\n",
+                "  certificate: \"/etc/siphon/server.pem\"\n",
+                "  private_key: \"/etc/siphon/server.key\"\n",
+            ),
+            listen_tls = listen_tls,
+        )
+    };
+    let fixture = Fixture::new(&tls_document("    - \"192.0.2.10:5061\"\n"));
+
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let ca_key = rcgen::KeyPair::generate().expect("keygen");
+    let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).expect("params");
+    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let ca_path = directory.path().join("trunk-ca.pem");
+    std::fs::write(
+        &ca_path,
+        ca_params.self_signed(&ca_key).expect("self-sign").pem(),
+    )
+    .expect("write the CA");
+
+    fixture.rewrite(&tls_document(&format!(
+        concat!(
+            "    - address: \"192.0.2.10:5061\"\n",
+            "      verify_client: true\n",
+            "      client_ca: \"{ca}\"\n",
+        ),
+        ca = ca_path.display()
+    )));
+    let report = fixture
+        .reloader
+        .reload()
+        .await
+        .expect("the reload validates");
+    assert_eq!(status(&report, "listen"), SectionStatus::RestartRequired);
+    assert_eq!(report.restart_required, ["listen"]);
+
+    fixture.rewrite(&tls_document(concat!(
+        "    - address: \"192.0.2.10:5061\"\n",
+        "      verify_client: true\n",
+    )));
+    let error = fixture
+        .reloader
+        .reload()
+        .await
+        .expect_err("verify_client without any client_ca is refused");
+    assert!(
+        error.to_string().contains("listen.tls[192.0.2.10:5061]"),
+        "{error}"
+    );
+}

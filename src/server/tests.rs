@@ -310,6 +310,7 @@ fn default_udp_egress_addr_honours_extended_form() {
         advertise: Some(config::AdvertisedAddress::host_only("sip.example.org")),
         dscp: None,
         proxy_protocol: None,
+        client_auth: config::ListenerClientAuth::default(),
     }];
     assert_eq!(
         default_udp_egress_addr(&entries),

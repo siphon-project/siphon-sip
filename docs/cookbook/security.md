@@ -289,7 +289,21 @@ dials, so check both sides can do 1.3 before hardening. `TLSv1_2` (the default)
 negotiates 1.2 or 1.3.
 
 `verify_client: true` requires a client cert chaining to `client_ca` (fails closed at
-startup if `client_ca` is missing). It applies to `listen.tls` **and** `listen.wss`.
+config load if `client_ca` is missing). It applies to `listen.tls` **and** `listen.wss`,
+unless a listener overrides it. To require a client certificate on a trunk-facing
+listener only, and to check who it was issued to, set it on that entry:
+
+```yaml
+listen:
+  tls:
+    - "192.0.2.10:5061"                       # phones: no client cert
+    - address: "192.0.2.10:5062"              # trunk peer only
+      verify_client: true
+      client_ca: "/etc/siphon/tls/trunk-ca.pem"
+      client_subject: ["*.sip.example.net"]   # right CA, wrong name: refused
+```
+
+See [Per-listener mutual TLS](../transports.md#per-listener-mutual-tls).
 
 ## 4. Authenticate subscribers (script + config)
 

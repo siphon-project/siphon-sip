@@ -13,6 +13,34 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
+### Added
+
+- **Mutual TLS per listener.** A `listen.tls` or `listen.wss` entry in the
+  object form can set `verify_client`, `client_ca` and `client_subject` for
+  itself, overriding the `tls:` block for that listener only. One listener can
+  serve phones behind a TLS front with no client certificate while another
+  requires one from a trunk peer. Each listener builds its own acceptor; a
+  plain string entry, or an object entry without these keys, behaves exactly as
+  before. Settings a listener cannot honour are refused at config load naming
+  it: the keys on a udp/tcp/ws/sctp entry, `client_ca` or `client_subject` on a
+  listener that ends up not verifying, `verify_client` without any `client_ca`,
+  an unreadable CA bundle, and a tls+wss pair on one shared address whose
+  settings differ. A reload reports a changed `listen` as `restart_required`.
+- **`client_subject`: check who a client certificate was issued to.** On top of
+  chaining to `client_ca`, the certificate must name one of the listed DNS
+  identities, exact or a whole-leftmost-label wildcard matching one label
+  (RFC 6125 §6.4.3), checked against its DNS subjectAltNames, or its subject CN
+  only when it has none. Right CA, wrong name is refused at the handshake with
+  an `access_denied` alert, logged at WARN with the presented and allowed names
+  and counted in `siphon_handshake_failures_total`. Valid in `tls:` and per
+  listener.
+
+### Changed
+
+- `tls.verify_client: true` without `tls.client_ca`, on a TLS or WSS listener
+  that inherits it, is now refused at config load (and so on a reload) instead
+  of when the listener starts.
+
 ## [1.15.0] — 2026-10-19
 
 ### Added
