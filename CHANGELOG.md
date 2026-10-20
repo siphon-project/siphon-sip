@@ -35,14 +35,6 @@ entry, but a working config keeps working.
   building them by struct literal), `verify_server` in Python target dicts,
   `verifyServer` in TypeScript.
 
-### Fixed
-
-- **A TLS B-leg and an originate to a hostname now present that hostname as
-  SNI.** They sent the resolved address, so a hostname-vhost trunk could not
-  route the handshake. Outbound TLS REGISTERs present the registrar's domain the
-  same way, and the gateway OPTIONS probe no longer puts a `;transport=` URI
-  parameter into the SNI of a destination configured without a port. A
-  bracketed IPv6 host is accepted as a TLS server name.
 - **Control plane: `reroute_after_progress` on `dial` targets.** A sequential
   `dial` moves on when a target rings out or fails, which is right for a hunt
   through phones and wrong for a hunt across several routes to one
@@ -90,6 +82,12 @@ entry, but a working config keeps working.
 
 ### Fixed
 
+- **A TLS B-leg and an originate to a hostname now present that hostname as
+  SNI.** They sent the resolved address, so a hostname-vhost trunk could not
+  route the handshake. Outbound TLS REGISTERs present the registrar's domain the
+  same way, and the gateway OPTIONS probe no longer puts a `;transport=` URI
+  parameter into the SNI of a destination configured without a port. A
+  bracketed IPv6 host is accepted as a TLS server name.
 - **A `6xx` ends a sequential control-plane `dial`.** A bridging dial
   (`on_answer: "bridge"`) and a sequential `originate {aor}` moved on to their
   next target after a `600`/`603`/`604`/`606`, ringing the person who had just
