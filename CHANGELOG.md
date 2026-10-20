@@ -13,6 +13,16 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
+### Added
+
+- **`strip=` on `request.relay()` and `request.fork()`.** Header fields left off
+  the forwarded request only. The request the proxy session keeps, which Rf, Ro
+  and CDRs read, still carries them, so an edge proxy can remove
+  P-Charging-Vector towards a UE (TS 24.229 §5.2.1) and still report the leg
+  with its ICID and IOIs. Applies to every branch of a fork, including ones a
+  sequential fork starts later. Via, Route, Record-Route, Call-ID, CSeq, From,
+  To, Max-Forwards and Content-Length are refused with `ValueError`.
+
 ## [1.15.1] — 2026-10-20
 
 ### Added
@@ -94,13 +104,6 @@ entry, but a working config keeps working.
   Rust, Python and TypeScript control SDKs take it as `contact_user` /
   `caller_contact_user` and `contactUser` / `callerContactUser`.
 
-- **`strip=` on `request.relay()` and `request.fork()`.** Header fields left off
-  the forwarded request only. The request the proxy session keeps, which Rf, Ro
-  and CDRs read, still carries them, so an edge proxy can remove
-  P-Charging-Vector towards a UE (TS 24.229 §5.2.1) and still report the leg
-  with its ICID and IOIs. Applies to every branch of a fork, including ones a
-  sequential fork starts later. Via, Route, Record-Route, Call-ID, CSeq, From,
-  To, Max-Forwards and Content-Length are refused with `ValueError`.
 - **Gateway: `allow_methods` per gateway group.** The methods siphon advertises
   in `Allow` to one group's peers, instead of every method it implements. For a
   trunk that picks its transfer method from `Allow`: leave `REFER` out and it
