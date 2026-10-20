@@ -13,6 +13,23 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
+### Fixed
+
+- **P-CSCF: a UDP response to a UE over IPsec goes from the P-CSCF's protected
+  client port to the UE's protected server port.** It went back to the port the
+  request came from (port_ps to port_uc), so a UE that takes UDP responses only
+  on its protected server port, as TS 33.203 clause 7.1 has it ("The P-CSCF
+  sends requests and responses protected with ESP to a UE on the port
+  port_pc"; the UE "receives requests and responses protected with ESP on the
+  port port_us"), never saw them and retransmitted every UDP request until it
+  timed out. This covers responses siphon answers, relays, refuses and
+  retransmits, including the B2BUA's 2xx and reliable provisional
+  retransmissions. TCP is unchanged: the response goes on the connection the
+  request came in on. A pair that admits TCP only is logged at error and the
+  response is sent as before. `request.fix_nated_register()` on a request that
+  came over an IPsec UDP flow now writes the UE's protected server port into
+  `rport`, as TS 24.229 clause 5.2.6.3.1 requires, so the Via names the port
+  the response goes to.
 ### Added
 
 - **Diameter: `diameter.originate` sends a request this node starts on a
