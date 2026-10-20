@@ -8468,6 +8468,12 @@ class MockRoSession:
         return (f"RoSession(session_id={self.session_id!r}, "
                 f"subscription_id={self.subscription_id!r}, open={self._open})")
 
+# AVPs `diameter.originate` sets itself, by name and by base code.
+_ORIGINATE_ENVELOPE_AVPS = {
+    "Session-Id", "Origin-Host", "Origin-Realm", "Destination-Host",
+    "Destination-Realm", 263, 264, 296, 293, 283,
+}
+
 
 class MockDiameter:
     """Mock Diameter namespace for testing scripts that use ``from siphon import diameter``.
@@ -10227,6 +10233,54 @@ class MockDiameter:
             destination_realm=destination_realm,
             auth_application_id=application_id, re_auth_request_type=0, **avps)
         return answer["result_code"]
+
+    async def originate(self, command, application: str, avps: list,
+                        destination_realm: str,
+                        destination_host: Optional[str] = None,
+                        peer: Optional[str] = None,
+                        session_id: Optional[str] = None,
+                        tenant: str = "default", proxiable: bool = True,
+                        timeout_ms: int = 10_000) -> "MockDiameterAnswer":
+        """Originate a request on a connection this node has.
+
+        The mock records each call on ``originated`` (command, application,
+        the ``avps`` tuples as given, the destination) and resolves to a
+        2001 ``MockDiameterAnswer``, or to what ``set_originate_outcome``
+        configured for ``(command, application)``: an answer, or an exception
+        (``LookupError`` for no connection, ``TimeoutError``,
+        ``ConnectionError``) to raise.
+        """
+        if not destination_realm or destination_host == "" or session_id == "":
+            raise ValueError("nonempty destination and session required")
+        if application.lower() not in _DIAMETER_APPLICATION_IDS and application.lower() != "s13":
+            raise ValueError(f"unknown Diameter application name: {application}")
+        if not isinstance(avps, list):
+            raise TypeError("avps must be a list of (code_or_name, value) tuples")
+        for item in avps:
+            if not isinstance(item, tuple) or not 2 <= len(item) <= 4:
+                raise TypeError("each AVP is a (code_or_name, value[, vendor[, mandatory]]) tuple")
+            if item[0] in _ORIGINATE_ENVELOPE_AVPS and (len(item) < 3 or not item[2]):
+                raise ValueError(f"AVP {item[0]} is set by the request itself and cannot be passed in avps")
+        if not hasattr(self, "originated"):
+            self.originated = []
+        self.originated.append({
+            "command": command, "application": application, "avps": list(avps),
+            "destination_realm": destination_realm,
+            "destination_host": destination_host, "peer": peer,
+            "session_id": session_id, "tenant": tenant,
+            "proxiable": proxiable, "timeout_ms": timeout_ms,
+        })
+        outcome = getattr(self, "_originate_outcomes", {}).get((command, application))
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome if outcome is not None else MockDiameterAnswer(result_code=2001)
+
+    def set_originate_outcome(self, command, application: str, outcome) -> None:
+        """What ``originate(command, application, ...)`` resolves to: a
+        ``MockDiameterAnswer``, or an exception it raises."""
+        if not hasattr(self, "_originate_outcomes"):
+            self._originate_outcomes = {}
+        self._originate_outcomes[(command, application)] = outcome
 
     async def send_request(self, command: str, application: str,
                      peer: Optional[str] = None,

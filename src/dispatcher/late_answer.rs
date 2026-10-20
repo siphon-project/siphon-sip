@@ -355,6 +355,7 @@ pub(super) fn forward_2xx_statelessly(
                         address: destination,
                         transport: Some(transport),
                         server_name: None,
+                        verify_server: None,
                     },
                     transport,
                     ConnectionId::default(),

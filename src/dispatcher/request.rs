@@ -800,6 +800,8 @@ pub(super) fn handle_request(
             &state.a_leg_advertised_host(Some(inbound.local_addr), &inbound.transport),
             state.a_leg_advertised_port(Some(inbound.local_addr), &inbound.transport),
             inbound.transport,
+            // The sender's gateway group `allow_methods`, when it has one.
+            allow_value(&allow_toward(state, || Some(inbound.remote_addr.ip()))),
         ) else {
             debug!(
                 method = %method,
@@ -1091,6 +1093,7 @@ pub(super) fn handle_request(
                     &state.a_leg_advertised_host(Some(inbound.local_addr), &inbound.transport),
                     state.a_leg_advertised_port(Some(inbound.local_addr), &inbound.transport),
                     inbound.transport,
+                    allow_value(&allow_toward(state, || Some(inbound.remote_addr.ip()))),
                 );
             }
 

@@ -35,6 +35,127 @@ entry, but a working config keeps working.
   carries the last failure's status, in `@registration.on_change` too. The
   Rust, Python and TypeScript control SDKs model the new fields, event and
   verbs.
+- **Gateway: `allow_methods` per gateway group.** The methods siphon advertises
+  in `Allow` to one group's peers, instead of every method it implements. For a
+  trunk that picks its transfer method from `Allow`: leave `REFER` out and it
+  transfers the call itself. Applies to responses relayed to a caller from the
+  group, siphon's own 18x/2xx and OPTIONS/405 answers to it, the group's probe
+  OPTIONS, and INVITEs sent to the group. A peer two groups admit gets the set
+  of the group configured first. A script's or controller's `Allow` still wins.
+  Checked at load: methods siphon implements only, each once, and `INVITE`,
+  `ACK`, `CANCEL`, `BYE` required. Unset, nothing changes.
+- **Opt-in server certificate verification on outbound SIP TLS.** Outbound TLS
+  to trunks was encrypted but never authenticated: caller identity and SDES keys
+  went to whoever answered on the address. `tls.verify_server: true` (or
+  `verify_server` on a gateway destination or group, or on a control `dial` /
+  `route` target, which win in that order) now checks the chain against
+  `tls.server_ca` (replacing the bundled Mozilla roots) and the host siphon
+  routed on, never the resolved address or an SRV target (RFC 5922 §4), as a SIP
+  domain per RFC 5922 §7: a `sip:` URI SAN beats dNSName, matching is exact, no
+  wildcards, and an IP-literal target needs an iPAddress SAN. Off by default;
+  worth turning on for any gateway reached by hostname. A refused certificate
+  fails the request like a refused connect and is logged with the destination
+  and reason. Verified and unverified connections to one address are never
+  shared, and a verified send no longer reuses a connection the peer opened
+  inbound. Client certificates are still presented. The gateway HTTP/database
+  source takes an optional `verify_server` column. Control SDKs:
+  `DialTarget::verify_server` / `RouteTarget::verify_server` (Rust; adds a field
+  to the `DialTarget` enum variants and `RouteTarget`, a breaking change for code
+  building them by struct literal), `verify_server` in Python target dicts,
+  `verifyServer` in TypeScript.
+
+- **Control plane: `reroute_after_progress` on `dial` targets.** A sequential
+  `dial` moves on when a target rings out or fails, which is right for a hunt
+  through phones and wrong for a hunt across several routes to one
+  destination (redundant SBCs or proxies in front of one PBX): the next route
+  rings the same person again, and a busy is retried. A `{uri}` or `{aor}`
+  target with `reroute_after_progress: false` now ends the dial once it has
+  sent a 101-199 (not the hop-by-hop 100): its ring timeout (`408`,
+  `timed_out: true`), busy, decline or any other failure is the dial's, in
+  `DialFailed`, and no later target is rung. A target that never rang (no
+  response before its ring timeout, an INVITE the transport would not take, a
+  failure before any 101-199) still moves the hunt on, and so does a `503`
+  carrying `Retry-After` even after progress: that is the element saying it is
+  unavailable (RFC 3261 §21.5.4), which is what the next redundant route is
+  for. Both forms, connecting and `on_answer: "bridge"`, follow the one rule.
+  The default is `true`, so a dial that does not name it behaves as before;
+  that is the opposite default of a `route` target's field of the same name,
+  which on `dial` also covers a target's final failures where a `route`
+  carrier that rang still fails over on its reroute causes. A parallel dial
+  ignores it. Anything but a boolean is `bad_request`. The control SDKs carry
+  it: `DialTarget::reroute_after_progress(bool)` in Rust (a new field on both
+  `DialTarget` variants, so code building a variant as a struct literal has to
+  name it), a `"reroute_after_progress"` key in a Python target dict (anything
+  but a `bool` raises `TypeError`), and `rerouteAfterProgress` in TypeScript,
+  each sent only when given.
+
+- **Mutual TLS per listener.** A `listen.tls` or `listen.wss` entry in the
+  object form can set `verify_client`, `client_ca` and `client_subject` for
+  itself, overriding the `tls:` block for that listener only. One listener can
+  serve phones behind a TLS front with no client certificate while another
+  requires one from a trunk peer. Each listener builds its own acceptor; a
+  plain string entry, or an object entry without these keys, behaves exactly as
+  before. Settings a listener cannot honour are refused at config load naming
+  it: the keys on a udp/tcp/ws/sctp entry, `client_ca` or `client_subject` on a
+  listener that ends up not verifying, `verify_client` without any `client_ca`,
+  an unreadable CA bundle, and a tls+wss pair on one shared address whose
+  settings differ. A reload reports a changed `listen` as `restart_required`.
+- **`client_subject`: check who a client certificate was issued to.** On top of
+  chaining to `client_ca`, the certificate must name one of the listed DNS
+  identities, exact or a whole-leftmost-label wildcard matching one label
+  (RFC 6125 §6.4.3), checked against its DNS subjectAltNames, or its subject CN
+  only when it has none. Right CA, wrong name is refused at the handshake with
+  an `access_denied` alert, logged at WARN with the presented and allowed names
+  and counted in `siphon_handshake_failures_total`. Valid in `tls:` and per
+  listener.
+
+### Fixed
+
+- **A TLS B-leg and an originate to a hostname now present that hostname as
+  SNI.** They sent the resolved address, so a hostname-vhost trunk could not
+  route the handshake. Outbound TLS REGISTERs present the registrar's domain the
+  same way, and the gateway OPTIONS probe no longer puts a `;transport=` URI
+  parameter into the SNI of a destination configured without a port. A
+  bracketed IPv6 host is accepted as a TLS server name.
+- **A `6xx` ends a sequential control-plane `dial`.** A bridging dial
+  (`on_answer: "bridge"`) and a sequential `originate {aor}` moved on to their
+  next target after a `600`/`603`/`604`/`606`, ringing the person who had just
+  declined through another route, and a parallel one let its other phones
+  ring on. A `6xx` is global: the callee will not take the call anywhere
+  (RFC 3261 §21.6), and a proxy MUST NOT start new branches after one and
+  SHOULD CANCEL the pending ones (§16.7 step 5). The dial now ends with that
+  `6xx` in `DialFailed`, and a parallel one CANCELs the phones still ringing
+  (reported `DialBranchFailed` cause `cancelled`). A connecting sequential
+  dial already stopped on a `6xx` with the default reroute causes; it now does
+  even where `lcr.reroute_causes` lists one.
+### Changed
+
+- `tls.verify_client: true` without `tls.client_ca`, on a TLS or WSS listener
+  that inherits it, is now refused at config load (and so on a reload) instead
+  of when the listener starts.
+- **Control plane: a `dial` target can name its own media profile.** `profile`
+  on a `dial` target (`{uri}` or `{aor}`) overrides the dial's `profile` for
+  that branch alone; a target naming none inherits the dial's. One ring can
+  now reach a phone behind NAT on a latching profile and a trunk on an
+  SDES-SRTP profile together. A connecting dial makes one media allocation
+  per profile its branches name, sends each branch its own profile's anchored
+  offer (each attempt of a sequential hunt too), answers early media and the
+  2xx through the answering branch's allocation, and releases the others once
+  a branch answers. An unknown target profile fails the dial exactly as an
+  unknown dial profile does, before anything is allocated or rung; a
+  connecting dial that anchors some branches and not others is `bad_request`.
+  On `on_answer: "bridge"` the target's profile anchors that phone's leg.
+- **Control plane: early offer on a bridging `dial`.** `offer: "early"` on
+  `dial {on_answer: "bridge"}`, or on one of its targets, sends each phone's
+  INVITE with an SDP offer instead of none, for peers that refuse a
+  delayed-offer INVITE: a ring after a prompt or menu, or a queue offer, to
+  such a peer used to fail. The offer is allocated on the media engine from
+  the caller's media under the phone's profile; the phone answers in its 2xx,
+  and the bridge then re-INVITEs only the caller. Every phone not bridged has
+  its allocation deleted. A 2xx without SDP is ACKed, BYEd and reported as a
+  failed branch with code 488 (RFC 3261 §13.2.1). `"delayed"` is the default
+  and unchanged. An unknown value, `offer` on a connecting dial, and `offer`
+  on `originate` are `bad_request`; `originate` has no caller to offer from.
 
 ### Fixed
 
@@ -54,6 +175,55 @@ entry, but a working config keeps working.
   registration's current state, `None` once removed), so a snapshot says
   whether a trunk is registered or failed. A shutdown-phase receiver that
   lagged now reads on instead of reporting shutdown over.
+
+- **A controller `dial` with a media profile no longer leaves its media
+  allocation behind when the caller cancels while it rings.** Nothing released
+  it on the caller's CANCEL; the engine held it until its own timeout.
+### Fixed
+
+- **P-CSCF: a UDP response to a UE over IPsec goes from the P-CSCF's protected
+  client port to the UE's protected server port.** It went back to the port the
+  request came from (port_ps to port_uc), so a UE that takes UDP responses only
+  on its protected server port, as TS 33.203 clause 7.1 has it ("The P-CSCF
+  sends requests and responses protected with ESP to a UE on the port
+  port_pc"; the UE "receives requests and responses protected with ESP on the
+  port port_us"), never saw them and retransmitted every UDP request until it
+  timed out. This covers responses siphon answers, relays, refuses and
+  retransmits, including the B2BUA's 2xx and reliable provisional
+  retransmissions. TCP is unchanged: the response goes on the connection the
+  request came in on. A pair that admits TCP only is logged at error and the
+  response is sent as before. `request.fix_nated_register()` on a request that
+  came over an IPsec UDP flow now writes the UE's protected server port into
+  `rport`, as TS 24.229 clause 5.2.6.3.1 requires, so the Via names the port
+  the response goes to.
+### Added
+
+- **Diameter: `diameter.originate` sends a request this node starts on a
+  connection it already has, and awaits its answer.** A node in server mode
+  can now run the procedures that begin at the server, such as an HSS's
+  Cancel-Location, Insert-Subscriber-Data, Delete-Subscriber-Data and Reset
+  (TS 29.272) or an S6c Alert-Service-Centre (TS 29.338). The connection is
+  the serving connection that last carried a request from the destination
+  host, else one that carried a request from its realm, else a named peer.
+  The caller gives the AVPs after the envelope as `set_avp` tuples, with an
+  optional fourth element to set or clear the M bit. The answer is a
+  `DiameterAnswer`; no connection, a timeout and a lost connection raise
+  `LookupError`, `TimeoutError` and `ConnectionError`.
+
+### Fixed
+
+- **B2BUA: siphon's own 18x and 2xx to the caller carry `Allow`.** `answer`,
+  `ring` and `progress` (control plane and `call.answer()`/`call.progress()`)
+  sent none, while the relayed ones always did; RFC 3261 §13.3.1.4 has a 2xx to
+  INVITE carry it. An `Allow` in `headers` still replaces it.
+- **`examples/teams_sbc.yaml` trusts the peer's documented signalling
+  ranges** (`52.112.0.0/14`, `52.120.0.0/14`, `2603:1063:400::/40`). It
+  trusted one /16 inside the first of them, so OPTIONS from the rest of the
+  peer's proxies could be rate-limited or banned.
+
+- **Diameter: a request waiting on a connection that closes fails at once**
+  instead of at its timeout, so a caller tells a lost connection from a peer
+  that does not answer.
 
 ## [1.15.0] — 2026-10-19
 

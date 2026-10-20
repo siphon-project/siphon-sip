@@ -65,6 +65,8 @@ mod intercept;
 mod ipsec_lifecycle;
 #[cfg(test)]
 mod ipsec_lifecycle_tests;
+#[cfg(test)]
+mod ipsec_response_flow_tests;
 mod late_answer;
 mod liveness;
 mod media_init;
@@ -149,11 +151,17 @@ mod control_dial_bridge_fallback_tests;
 #[cfg(test)]
 mod control_dial_bridge_from_host_tests;
 #[cfg(test)]
+mod control_dial_bridge_hunt_progress_tests;
+#[cfg(test)]
+mod control_dial_bridge_offer_tests;
+#[cfg(test)]
 mod control_dial_bridge_tests;
 #[cfg(test)]
 mod control_dial_contact_host_tests;
 #[cfg(test)]
 mod control_dial_identity_tests;
+#[cfg(test)]
+mod control_dial_reroute_after_progress_tests;
 #[cfg(test)]
 mod control_dial_route_tests;
 #[cfg(test)]
@@ -196,6 +204,8 @@ mod early_update_bridge_tests;
 mod early_update_tests;
 #[cfg(test)]
 mod failure_response_tests;
+#[cfg(test)]
+mod gateway_allow_methods_tests;
 #[cfg(test)]
 mod handover_no_controller_tests;
 #[cfg(test)]
@@ -343,6 +353,8 @@ mod test_dispatcher;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
+mod tls_verify_server_tests;
+#[cfg(test)]
 mod transfer_bye_tests;
 #[cfg(test)]
 mod transfer_ingress_tests;
@@ -378,7 +390,7 @@ pub use b2bua::{
 // `public_api_surface` all the same — the point of the count is that the module
 // does not grow a surface by accident, published or not.
 pub(crate) use b2bua::{
-    b2bua_accept_refer_call_dialling, b2bua_accept_refer_controller_with_state,
+    any_early_offer, b2bua_accept_refer_call_dialling, b2bua_accept_refer_controller_with_state,
     b2bua_accept_refer_script, b2bua_cancel_dial_with_state, b2bua_complete_refer,
     b2bua_complete_refer_with_state, b2bua_dial_call, b2bua_drop_call, b2bua_media_profile,
     b2bua_originate_group_create, b2bua_originate_group_start,
@@ -390,11 +402,11 @@ pub(crate) use b2bua::{
     dial_bridge_spec, dial_bridge_start, dial_targets_for_aor, forget_sent_info,
     set_caller_contact_host, CallerContactHostRefusal, ControllerReferRefusal, DialBridgeCaller,
     DialBridgeListener, DialBridgePlan, DialBridgeRefusal, DialBridgeSender, DialBridgeSignal,
-    DialBridgeStartError, DialCancelRefusal, DialError, DialShaping, DialTarget, DispatcherHandle,
-    DropOutcome, OriginateGroupAnswers, OriginateGroupFailure, OriginateGroupSink,
-    OriginateGroupSpec, OriginateGroupStrategy, OriginateGroupWinner, OriginateLegProgress,
-    ReplacementDial, RunningDispatcher, DIAL_BRIDGE_CALLER_GONE, DIAL_CANCELLED,
-    DIAL_RINGBACK_ORIGIN,
+    DialBridgeStartError, DialCancelRefusal, DialError, DialOffer, DialShaping, DialTarget,
+    DispatcherHandle, DropOutcome, OriginateGroupAnswers, OriginateGroupFailure,
+    OriginateGroupSink, OriginateGroupSpec, OriginateGroupStrategy, OriginateGroupWinner,
+    OriginateLegProgress, ReplacementDial, RunningDispatcher, DIAL_BRIDGE_CALLER_GONE,
+    DIAL_CANCELLED, DIAL_RINGBACK_ORIGIN,
 };
 pub(crate) use b2bua::{b2bua_dial_refusal, b2bua_progress_call_anchored_from};
 pub(crate) use charging::{ro_answer_ocs_request, ro_bind_call, RO_CONTROL};

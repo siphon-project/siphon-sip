@@ -65,10 +65,10 @@ pub enum GatewayBackendType {
 /// The query is the operator's. Columns are read by name: `group` (or
 /// `group_name`) and `uri` are required; `address`, `transport`, `weight`,
 /// `priority`, `username`, `password`, `ha1`, `ha1_algorithm`,
-/// `source_networks`, `enabled`, `registers` and `require_registration` are
-/// optional. When the statement references `$1`, the instance id
-/// (`server.instance_id`) is bound to it, so a deployment can shard its
-/// gateways across nodes.
+/// `source_networks`, `enabled`, `registers`, `require_registration` and
+/// `verify_server` are optional. When the statement references `$1`, the
+/// instance id (`server.instance_id`) is bound to it, so a deployment can shard
+/// its gateways across nodes.
 #[derive(Debug, Deserialize, Clone)]
 pub struct GatewayDatabaseConfig {
     /// libpq connection URI.
@@ -182,6 +182,37 @@ pub struct GatewayGroupConfig {
     /// ```
     #[serde(default)]
     pub inbound_limit: Option<super::InboundLimitConfig>,
+    /// Verify the server certificate on outbound TLS connections to this
+    /// group's destinations (see `tls.verify_server`), for each destination
+    /// that does not set its own. Unset: `tls.verify_server` decides.
+    #[serde(default)]
+    pub verify_server: Option<bool>,
+    /// The methods siphon advertises in `Allow` (RFC 3261 §20.5) on what it
+    /// sends to this group's peers or answers them with. **Unset by default**,
+    /// which advertises every method siphon implements.
+    ///
+    /// For a peer that decides how to transfer a call from the `Allow` it is
+    /// shown: leave `REFER` out and it transfers the call itself rather than
+    /// sending siphon a REFER. Applies to the responses relayed to a caller
+    /// from the group, siphon's own answers to it (`answer` / `ring` /
+    /// `progress`, OPTIONS), the health-probe OPTIONS sent to it, and INVITEs
+    /// siphon sends to it. A peer is in the group by the same membership
+    /// `call.from_gateway()` answers from; a peer two groups with a set admit
+    /// gets the set of the group configured first. An `Allow` a script or a
+    /// controller's `headers` sets still wins.
+    ///
+    /// Each entry is a method siphon implements, written in upper case, once;
+    /// `INVITE`, `ACK`, `CANCEL` and `BYE` are required. Anything else refuses
+    /// the configuration at load.
+    ///
+    /// ```yaml
+    /// gateway:
+    ///   groups:
+    ///     - name: "trunk-a"
+    ///       allow_methods: [INVITE, ACK, CANCEL, BYE, OPTIONS, PRACK, UPDATE]
+    /// ```
+    #[serde(default)]
+    pub allow_methods: Option<Vec<String>>,
 }
 
 impl GatewayGroupConfig {
@@ -191,6 +222,48 @@ impl GatewayGroupConfig {
         self.inbound_limit
             .as_ref()
             .map(super::InboundLimitConfig::resolved)
+    }
+
+    /// The group's `allow_methods` rendered as an `Allow` value, `Ok(None)`
+    /// when unset, or why the list is refused
+    /// ([`crate::sip::allow::render_allow_methods`]).
+    pub fn rendered_allow_methods(&self) -> std::result::Result<Option<String>, String> {
+        self.allow_methods
+            .as_deref()
+            .map(crate::sip::allow::render_allow_methods)
+            .transpose()
+    }
+
+    /// [`rendered_allow_methods`](Self::rendered_allow_methods) for building
+    /// the group. Load refuses an invalid list, so a refusal here means the
+    /// config was built some other way: it is logged and the full set kept.
+    pub fn allow_methods_value(&self) -> Option<String> {
+        self.rendered_allow_methods().unwrap_or_else(|reason| {
+            tracing::error!(
+                group = %self.name,
+                "gateway allow_methods refused ({reason}), advertising every method"
+            );
+            None
+        })
+    }
+}
+
+impl super::Config {
+    /// Refuse a `gateway.groups[].allow_methods` that is not a set siphon can
+    /// advertise: see [`GatewayGroupConfig::allow_methods`].
+    pub(super) fn validate_gateway_allow_methods(&self) -> crate::error::Result<()> {
+        let Some(gateway) = &self.gateway else {
+            return Ok(());
+        };
+        for group in &gateway.groups {
+            group.rendered_allow_methods().map_err(|reason| {
+                crate::error::SiphonError::Config(format!(
+                    "gateway.groups[{}].allow_methods: {reason}",
+                    group.name
+                ))
+            })?;
+        }
+        Ok(())
     }
 }
 
@@ -267,6 +340,13 @@ pub struct GatewayDestConfig {
     /// registered peer, where dialling it unregistered just earns a 403.
     #[serde(default)]
     pub require_registration: bool,
+    /// Verify this destination's server certificate on outbound TLS: the chain
+    /// against `tls.server_ca` (or the bundled Mozilla roots), and the host of
+    /// `uri` as a SIP domain (RFC 5922 §7), or an iPAddress subjectAltName for
+    /// an IP-literal `uri`. Wins over the group's `verify_server` and over
+    /// `tls.verify_server`. Unset: the group, then `tls.verify_server`, decide.
+    #[serde(default)]
+    pub verify_server: Option<bool>,
 }
 
 /// Digest credentials for one gateway destination.

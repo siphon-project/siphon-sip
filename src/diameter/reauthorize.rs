@@ -14,10 +14,28 @@ use dashmap::DashMap;
 use std::collections::HashSet;
 use std::sync::{Arc, LazyLock, Weak};
 
-/// (tenant, configured peer name, client Origin-Host).
-type ConnectionKey = (String, String, String);
-static CONNECTIONS: LazyLock<DashMap<ConnectionKey, Weak<DiameterPeer>>> =
-    LazyLock::new(DashMap::new);
+/// How a serving connection can be found again: by the configured peer name
+/// and a client's Origin-Host (what `diameter.reauthorize` asks for), or by the
+/// Origin-Host or Origin-Realm alone (what `diameter.originate` asks for when
+/// no peer is named). All three are scoped to the tenant.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum Route {
+    Peer {
+        tenant: String,
+        name: String,
+        host: String,
+    },
+    Host {
+        tenant: String,
+        host: String,
+    },
+    Realm {
+        tenant: String,
+        realm: String,
+    },
+}
+
+static CONNECTIONS: LazyLock<DashMap<Route, Weak<DiameterPeer>>> = LazyLock::new(DashMap::new);
 
 /// The registry entries one inbound serving connection owns. Owned by the
 /// connection loop; dropping it (the loop ends) removes its entries, unless a
@@ -26,7 +44,7 @@ pub(crate) struct ServingConnection {
     tenant: String,
     name: String,
     peer: Weak<DiameterPeer>,
-    hosts: HashSet<String>,
+    routes: HashSet<Route>,
 }
 
 impl ServingConnection {
@@ -35,47 +53,92 @@ impl ServingConnection {
             tenant: tenant.to_owned(),
             name: name.to_owned(),
             peer: Arc::downgrade(peer),
-            hosts: HashSet::new(),
+            routes: HashSet::new(),
         }
     }
 
-    /// Record the Origin-Host of a decoded inbound request. Returns whether
-    /// the shared registry was written, which happens only for a host not yet
-    /// seen on this connection.
+    /// Record the Origin-Host and Origin-Realm of a decoded inbound request.
+    /// Returns whether the shared registry was written, which happens only
+    /// for a host or realm not yet seen on this connection.
     pub(crate) fn observe(&mut self, avps: &serde_json::Value) -> bool {
-        let Some(host) = avps.get("Origin-Host").and_then(serde_json::Value::as_str) else {
-            return false;
+        let identity = |name: &str| {
+            avps.get(name)
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
         };
-        if host.is_empty() || self.hosts.contains(host) {
-            return false;
+        let mut routes = Vec::with_capacity(3);
+        if let Some(host) = identity("Origin-Host") {
+            routes.push(Route::Peer {
+                tenant: self.tenant.clone(),
+                name: self.name.clone(),
+                host: host.clone(),
+            });
+            routes.push(Route::Host {
+                tenant: self.tenant.clone(),
+                host,
+            });
         }
-        CONNECTIONS.insert(
-            (self.tenant.clone(), self.name.clone(), host.to_owned()),
-            Weak::clone(&self.peer),
-        );
-        self.hosts.insert(host.to_owned());
-        true
+        if let Some(realm) = identity("Origin-Realm") {
+            routes.push(Route::Realm {
+                tenant: self.tenant.clone(),
+                realm,
+            });
+        }
+        let mut written = false;
+        for route in routes {
+            if self.routes.contains(&route) {
+                continue;
+            }
+            CONNECTIONS.insert(route.clone(), Weak::clone(&self.peer));
+            self.routes.insert(route);
+            written = true;
+        }
+        written
     }
 }
 
 impl Drop for ServingConnection {
     fn drop(&mut self) {
-        for host in self.hosts.drain() {
-            CONNECTIONS.remove_if(
-                &(self.tenant.clone(), self.name.clone(), host),
-                |_, registered| Weak::ptr_eq(registered, &self.peer),
-            );
+        for route in self.routes.drain() {
+            CONNECTIONS.remove_if(&route, |_, registered| Weak::ptr_eq(registered, &self.peer));
         }
     }
+}
+
+fn open(route: &Route) -> Option<Arc<DiameterPeer>> {
+    CONNECTIONS
+        .get(route)
+        .and_then(|peer| peer.upgrade())
+        .filter(|peer| peer.is_open())
 }
 
 /// The open connection that last carried a request from `host` for the
 /// configured peer `name` in `tenant`.
 pub(crate) fn connection(tenant: &str, name: &str, host: &str) -> Option<Arc<DiameterPeer>> {
-    CONNECTIONS
-        .get(&(tenant.into(), name.into(), host.into()))
-        .and_then(|peer| peer.upgrade())
-        .filter(|peer| peer.is_open())
+    open(&Route::Peer {
+        tenant: tenant.into(),
+        name: name.into(),
+        host: host.into(),
+    })
+}
+
+/// The open connection that last carried a request from `host` in `tenant`,
+/// whichever configured peer it belongs to.
+pub(crate) fn connection_to_host(tenant: &str, host: &str) -> Option<Arc<DiameterPeer>> {
+    open(&Route::Host {
+        tenant: tenant.into(),
+        host: host.into(),
+    })
+}
+
+/// The open connection that last carried a request from a node of `realm` in
+/// `tenant`: a direct peer of that realm, or an agent relaying for it.
+pub(crate) fn connection_to_realm(tenant: &str, realm: &str) -> Option<Arc<DiameterPeer>> {
+    open(&Route::Realm {
+        tenant: tenant.into(),
+        realm: realm.into(),
+    })
 }
 
 /// AVPs the RAR builder sets itself; a caller cannot supply them again.
@@ -168,9 +231,17 @@ pub(crate) mod tests {
         json!({ "Origin-Host": host, "Session-Id": "s;1" })
     }
 
+    fn peer_route(tenant: &str, name: &str, host: &str) -> Route {
+        Route::Peer {
+            tenant: tenant.into(),
+            name: name.into(),
+            host: host.into(),
+        }
+    }
+
     fn registered(tenant: &str, name: &str, host: &str) -> Option<Weak<DiameterPeer>> {
         CONNECTIONS
-            .get(&(tenant.into(), name.into(), host.into()))
+            .get(&peer_route(tenant, name, host))
             .map(|entry| Weak::clone(&entry))
     }
 
@@ -207,7 +278,7 @@ pub(crate) mod tests {
         // Overwrite the entry behind the guard's back: a repeat sighting must
         // leave it as it is.
         CONNECTIONS.insert(
-            ("t-repeat".into(), "p".into(), "a.example".into()),
+            peer_route("t-repeat", "p", "a.example"),
             Arc::downgrade(&other),
         );
         assert!(!serving.observe(&request_from("a.example")));
@@ -263,6 +334,54 @@ pub(crate) mod tests {
         serving.observe(&request_from("a.example"));
         drop(peer);
         assert!(connection("t-gone", "p", "a.example").is_none());
+    }
+
+    #[test]
+    fn a_connection_is_found_by_host_and_by_realm_in_its_tenant() {
+        let peer = open_peer();
+        let mut serving = ServingConnection::new("t-routes", "agent", &peer);
+        assert!(serving.observe(&json!({
+            "Origin-Host": "mme1.epc.example",
+            "Origin-Realm": "epc.example",
+        })));
+        // Another host of the same realm adds its host only.
+        assert!(serving.observe(&json!({
+            "Origin-Host": "mme2.epc.example",
+            "Origin-Realm": "epc.example",
+        })));
+        assert!(!serving.observe(&json!({
+            "Origin-Host": "mme2.epc.example",
+            "Origin-Realm": "epc.example",
+        })));
+        for found in [
+            connection_to_host("t-routes", "mme1.epc.example"),
+            connection_to_host("t-routes", "mme2.epc.example"),
+            connection_to_realm("t-routes", "epc.example"),
+            connection("t-routes", "agent", "mme1.epc.example"),
+        ] {
+            assert!(Arc::ptr_eq(&found.unwrap(), &peer));
+        }
+        assert!(connection_to_host("t-other", "mme1.epc.example").is_none());
+        assert!(connection_to_realm("t-other", "epc.example").is_none());
+        assert!(connection_to_realm("t-routes", "other.example").is_none());
+        drop(serving);
+        assert!(connection_to_host("t-routes", "mme1.epc.example").is_none());
+        assert!(connection_to_realm("t-routes", "epc.example").is_none());
+    }
+
+    #[test]
+    fn a_newer_connection_of_a_realm_keeps_its_entry_when_the_older_one_ends() {
+        let old = open_peer();
+        let newer = open_peer();
+        let request = json!({ "Origin-Host": "a.realm.example", "Origin-Realm": "realm.example" });
+        let mut old_serving = ServingConnection::new("t-realm", "p", &old);
+        old_serving.observe(&request);
+        let mut newer_serving = ServingConnection::new("t-realm", "q", &newer);
+        newer_serving.observe(&request);
+        drop(old_serving);
+        let kept = connection_to_realm("t-realm", "realm.example").unwrap();
+        assert!(Arc::ptr_eq(&kept, &newer));
+        drop(newer_serving);
     }
 
     fn decoded(application_id: u32, extra: &[u8]) -> codec::DiameterMsg {

@@ -173,6 +173,24 @@ reported as a failure. That is damage control, not a substitute for closing.
   or of `route`) may carry `"contact_host"`, the host siphon presents in its own
   Contact on that leg in place of the address it advertises, for a peer that
   identifies the tenant or account by that host. Only the host changes.
+  Any target may also carry `"verify_server"` (a bool): verify the server
+  certificate when that leg opens a new outbound TLS connection, over the gateway it
+  routes to and the server's `tls.verify_server`.
+  A `dial` target of either form may carry `"reroute_after_progress": False`
+  (a `bool`, anything else raises `TypeError`; server default `True`): a
+  sequential dial then ends on that target once it has rung, its ring timeout,
+  busy or other failure being the dial's, for a hunt across several routes to
+  one destination. A target that never rang, and a 503 with Retry-After, still
+  move the hunt on; a 6xx ends a sequential dial either way.
+  A `dial` target of either form may also carry `"profile"`, the media profile for
+  that branch alone over the dial's own `profile`; a target without one inherits the
+  dial's. One ring can then reach a phone behind NAT that needs a latching relay and
+  a trunk that asks for SDES-SRTP. A connecting dial that names no `profile` anchors
+  every branch or none, so either every target names one or none does.
+  `offer="early"` (or `"offer"` on a target, which wins) sends each phone of an
+  `on_answer="bridge"` dial an SDP offer in its INVITE, allocated on the media engine
+  from the caller's media, for peers that refuse a delayed-offer INVITE; `"delayed"`
+  is the server's default. The server refuses `offer` on a connecting dial.
   With `on_answer="bridge"` it instead rings phones for a caller the app already
   answered and anchored (after a greeting or a menu), plays `ringback` (a tone
   preset or cadence, `True` for the default, `False` for none) while they alert, and

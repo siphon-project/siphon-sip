@@ -978,7 +978,7 @@ pub fn bridge_advance_to_anchor(
     response: &SipMessage,
     state: &DispatcherState,
 ) {
-    use crate::b2bua::bridge::{set_media_direction, BridgeStage, MediaDirection};
+    use crate::b2bua::bridge::{set_media_direction, MediaDirection};
 
     let Some(context) = state.call_actors.bridge(peer_call_id) else {
         return;
@@ -1005,7 +1005,7 @@ pub fn bridge_advance_to_anchor(
         .set_leg_last_sdp(peer_call_id, true, &response.body);
 
     // Anchored: complete the offer/answer on the pair's engine call — the
-    // anchor's live one when it already relayed, the fresh one the bridge
+    // anchor's live one when it already relays, the fresh one the bridge
     // offered on otherwise. Nothing is adopted or deleted here: the anchor has
     // not accepted yet. Raw: cross the peer's own description, restated as
     // siphon's direction.
@@ -1015,38 +1015,15 @@ pub fn bridge_advance_to_anchor(
         state.rtpengine_set.as_ref(),
     ) {
         (Some(media_call_id), Some(from_tag), Some(backend)) => {
-            let profile = context.media_profile.clone().unwrap_or_default();
-            let flags = state
-                .rtpengine_profiles
-                .as_ref()
-                .and_then(|registry| registry.get(&profile).map(|entry| entry.answer.clone()));
-            let Some(mut flags) = flags else {
-                warn!(%profile, "B2BUA bridge: unknown media profile for the anchor's answer");
-                bridge_fail(peer_call_id, "offering_peer", 500, state);
-                return;
-            };
-            // The SDP in this answer is the peer's, so its signalling source is
-            // the ingress to pin, and the policy that asks for it is the peer's
-            // own. The flags above are the anchor's and shape what the anchor
-            // is re-INVITEd with; read off them, a peer behind NAT joined to an
-            // anchor whose profile asks for no hint is gated on the address in
-            // its SDP, which its media never comes from.
-            if let (Some(ingress), Some(registry)) = (
-                context.media_peer_ingress.as_ref(),
-                state.rtpengine_profiles.as_ref(),
-            ) {
-                flags.carry_received_from = ingress.pins_ingress(registry);
-            }
-            if let Some(source) = state
-                .call_actors
-                .get_call(peer_call_id)
-                .map(|call| call.a_leg.transport.remote_addr.ip())
+            let sip_call_id = response.headers.call_id().cloned().unwrap_or_default();
+            let flags = match bridge_peer_answer_flags(&context, peer_call_id, &sip_call_id, state)
             {
-                flags.stamp_received_from(source);
-            }
-            // The peer's own dialog: this is the peer's answer, on the pair's
-            // engine call-id.
-            flags.stamp_sip_call_id_of(response);
+                Ok(flags) => flags,
+                Err(code) => {
+                    bridge_fail(peer_call_id, "offering_peer", code, state);
+                    return;
+                }
+            };
             let answered = tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(backend.answer(
                     media_call_id,
@@ -1068,27 +1045,83 @@ pub fn bridge_advance_to_anchor(
         _ => set_media_direction(&response.body, MediaDirection::SendRecv),
     };
 
+    if !bridge_offer_anchor(peer_call_id, &anchor_call_id, sdp_for_anchor, state) {
+        bridge_fail(peer_call_id, "offering_anchor", 500, state);
+    }
+}
+
+/// The flags the pair's engine call is given the peer's answer under: the
+/// `answer` half of the profile shaping what the anchor is re-INVITEd with,
+/// pinning the peer's media ingress by the peer's own policy. `Err` carries
+/// the status the bridge fails with when the profile is gone.
+pub(super) fn bridge_peer_answer_flags(
+    context: &crate::b2bua::bridge::BridgeContext,
+    peer_call_id: &str,
+    peer_sip_call_id: &str,
+    state: &DispatcherState,
+) -> Result<crate::rtpengine::NgFlags, u16> {
+    let profile = context.media_profile.clone().unwrap_or_default();
+    let flags = state
+        .rtpengine_profiles
+        .as_ref()
+        .and_then(|registry| registry.get(&profile).map(|entry| entry.answer.clone()));
+    let Some(mut flags) = flags else {
+        warn!(%profile, "B2BUA bridge: unknown media profile for the anchor's answer");
+        return Err(500);
+    };
+    // The SDP in this answer is the peer's, so its signalling source is the
+    // ingress to pin, and the policy that asks for it is the peer's own. The
+    // flags above are the anchor's and shape what the anchor is re-INVITEd
+    // with; read off them, a peer behind NAT joined to an anchor whose profile
+    // asks for no hint is gated on the address in its SDP, which its media
+    // never comes from.
+    if let (Some(ingress), Some(registry)) = (
+        context.media_peer_ingress.as_ref(),
+        state.rtpengine_profiles.as_ref(),
+    ) {
+        flags.carry_received_from = ingress.pins_ingress(registry);
+    }
+    if let Some(source) = state
+        .call_actors
+        .get_call(peer_call_id)
+        .map(|call| call.a_leg.transport.remote_addr.ip())
+    {
+        flags.stamp_received_from(source);
+    }
+    // The peer's own dialog: this is the peer's answer, on the pair's engine
+    // call-id.
+    flags.stamp_sip_call_id(peer_sip_call_id);
+    Ok(flags)
+}
+
+/// The peer has answered: move both halves on to the anchor's re-INVITE and
+/// send it, carrying `sdp_for_anchor`. `false` when it could not be sent.
+pub(super) fn bridge_offer_anchor(
+    peer_call_id: &str,
+    anchor_call_id: &str,
+    sdp_for_anchor: Vec<u8>,
+    state: &DispatcherState,
+) -> bool {
+    use crate::b2bua::bridge::BridgeStage;
+
     state
         .call_actors
         .set_bridge_stage(peer_call_id, BridgeStage::OfferingAnchor);
     state
         .call_actors
-        .set_bridge_stage(&anchor_call_id, BridgeStage::OfferingAnchor);
-    if let Some(mut call) = state.call_actors.get_call_mut(&anchor_call_id) {
+        .set_bridge_stage(anchor_call_id, BridgeStage::OfferingAnchor);
+    if let Some(mut call) = state.call_actors.get_call_mut(anchor_call_id) {
         if let Some(bridge) = call.bridge.as_mut() {
             bridge.last_local_offer = sdp_for_anchor.clone();
         }
     }
-
-    if !b2bua_send_reinvite_on_leg(
-        &anchor_call_id,
+    b2bua_send_reinvite_on_leg(
+        anchor_call_id,
         true,
         sdp_for_anchor,
         BRIDGE_TRACKING_ANSWER,
         state,
-    ) {
-        bridge_fail(peer_call_id, "offering_anchor", 500, state);
-    }
+    )
 }
 
 /// Both legs have renegotiated — the media meets.
@@ -1211,7 +1244,11 @@ pub fn bridge_adopt_media(
     // the call, so a later bridge reads the peer's own profile and policy
     // rather than its anchor's, or a pair profile's.
     if let Some(session) = store.retire_for_bridge(&context.peer_sip_call_id) {
-        retired.push((session.rtpengine_id().to_string(), session.from_tag.clone()));
+        // A peer offered early holds the pair's own engine call as its session
+        // (see `leg_offer`): it is the pair's from here, never deleted.
+        if session.rtpengine_id() != media_call_id {
+            retired.push((session.rtpengine_id().to_string(), session.from_tag.clone()));
+        }
     }
     let previous = store.get(&anchor_key);
     // The anchor keeps a session, but from here on it is the pair's, under

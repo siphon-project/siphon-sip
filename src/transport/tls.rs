@@ -535,20 +535,17 @@ pub(crate) fn protocol_versions(
 }
 
 /// Build a `TlsAcceptor` from the certificate and key paths in config.
+///
+/// `tls_config` is the listener's own view of the `tls:` block — the server
+/// certificates are shared, but `verify_client` / `client_ca` /
+/// `client_subject` may come from that listener's `listen.tls` / `listen.wss`
+/// entry ([`TlsServerConfig::for_listener`]), so two listeners built from the
+/// same block can still differ in whether they demand a client certificate.
 pub fn build_tls_acceptor(tls_config: &TlsServerConfig) -> io::Result<TlsAcceptor> {
-    use rustls_pki_types::pem::PemObject;
-    use rustls_pki_types::CertificateDer;
-    use std::fs::File;
-    use std::io::BufReader;
     use tokio_rustls::rustls;
 
     let resolver = Arc::new(build_cert_resolver(tls_config)?);
 
-    // Honor `verify_client` (mutual TLS). Previously this was hardcoded to
-    // `with_no_client_auth()`, so the config option was silently ignored —
-    // setting `verify_client: true` gave false assurance. When enabled we
-    // require a client certificate that chains to `client_ca`; a missing CA is
-    // a hard startup error (fail closed) rather than a silent downgrade.
     // Honor `tls.method` as the minimum protocol version. Previously this was a
     // bare `builder()` (rustls default = TLS 1.2 + 1.3) and the config value was
     // parsed but never read, so `method: TLSv1_3` claimed a floor nothing
@@ -559,62 +556,17 @@ pub fn build_tls_acceptor(tls_config: &TlsServerConfig) -> io::Result<TlsAccepto
         min_version = %tls_config.method,
         "TLS listener minimum protocol version"
     );
-    let server_config = if tls_config.verify_client {
-        let ca_path = tls_config.client_ca.as_ref().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "tls.verify_client is true but tls.client_ca (PEM CA bundle for \
-                 client certificates) is not set",
-            )
-        })?;
-        let ca_file = File::open(ca_path).map_err(|error| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("failed to open client CA file '{ca_path}': {error}"),
-            )
-        })?;
-        let ca_certs: Vec<_> = CertificateDer::pem_reader_iter(&mut BufReader::new(ca_file))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("failed to parse client CA PEM: {error}"),
-                )
-            })?;
-        if ca_certs.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "client CA file contains no certificates",
-            ));
-        }
-        let mut roots = rustls::RootCertStore::empty();
-        for ca in ca_certs {
-            roots.add(ca).map_err(|error| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("failed to add client CA to root store: {error}"),
-                )
-            })?;
-        }
-        let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
-            .build()
-            .map_err(|error| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("failed to build client-certificate verifier: {error}"),
-                )
-            })?;
-        info!(client_ca = %ca_path, "mutual TLS enabled — client certificate required");
-        // Client-certificate verification stays listener-wide: rustls can only
-        // vary it per SNI name via a custom `ServerConfig` per handshake, and a
-        // per-tenant trust anchor is a different feature from a per-tenant
-        // server certificate.
-        builder
-            .with_client_cert_verifier(verifier)
-            .with_cert_resolver(resolver)
-    } else {
-        builder.with_no_client_auth().with_cert_resolver(resolver)
-    };
+    // Honor `verify_client` (mutual TLS), failing closed: a missing or empty
+    // CA bundle is a hard error rather than a silent downgrade to accepting
+    // any client. It is per acceptor, and every listener builds its own, so a
+    // phone-facing listener and a trunk-facing one can differ.
+    let server_config =
+        match crate::transport::tls_client_auth::client_cert_verifier(tls_config, "tls")? {
+            Some(verifier) => builder
+                .with_client_cert_verifier(verifier)
+                .with_cert_resolver(resolver),
+            None => builder.with_no_client_auth().with_cert_resolver(resolver),
+        };
 
     Ok(TlsAcceptor::from(Arc::new(server_config)))
 }
@@ -1012,8 +964,11 @@ mod tests {
             method: TlsMethod::default(),
             verify_client: false,
             client_ca: None,
+            client_subject: Vec::new(),
             client_certificate: None,
             client_private_key: None,
+            verify_server: false,
+            server_ca: None,
         }
     }
 
@@ -1040,8 +995,11 @@ mod tests {
             method: TlsMethod::default(),
             verify_client: false,
             client_ca: None,
+            client_subject: Vec::new(),
             client_certificate: None,
             client_private_key: None,
+            verify_server: false,
+            server_ca: None,
         };
         let result = build_tls_acceptor(&tls_config);
         assert!(result.is_err());
@@ -1092,8 +1050,11 @@ mod tests {
             method: TlsMethod::default(),
             verify_client: false,
             client_ca: None,
+            client_subject: Vec::new(),
             client_certificate: None,
             client_private_key: None,
+            verify_server: false,
+            server_ca: None,
         };
         let result = build_tls_acceptor(&tls_config);
         assert!(result.is_err());

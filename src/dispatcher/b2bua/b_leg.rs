@@ -108,6 +108,7 @@ pub fn b2bua_send_b_leg_invite(
     branch_from_host: Option<&str>,
     branch_to: Option<&str>,
     branch_contact_host: Option<&str>,
+    verify_server: Option<bool>,
     extra_headers: &[(String, String)],
     state: &DispatcherState,
 ) -> bool {
@@ -127,6 +128,7 @@ pub fn b2bua_send_b_leg_invite(
         branch_from_host,
         branch_to,
         branch_contact_host,
+        verify_server,
         extra_headers,
         state,
     )
@@ -187,6 +189,10 @@ pub fn b2bua_dial_b_leg(
     // part stay as built below, and the leg keeps it as its dialog's local
     // Contact, so every in-dialog request siphon sends on the leg presents it.
     branch_contact_host: Option<&str>,
+    // Server verification on a new TLS connection for this branch alone: a
+    // controller `dial` target's `verify_server`. Wins over the gateway the
+    // branch routes to and over `tls.verify_server`; `None` leaves it to them.
+    verify_server: Option<bool>,
     extra_headers: &[(String, String)],
     state: &DispatcherState,
 ) -> Option<String> {
@@ -217,6 +223,8 @@ pub fn b2bua_dial_b_leg(
         routing_uri,
         mut destination,
         transport: mut outbound_transport,
+        server_name: tls_server_name,
+        verify_server: routed_verify_server,
     } = match resolve_leg_destination(target_uri, next_hop, flow, b_leg_route, &state.dns_resolver)
     {
         Ok(resolved) => resolved,
@@ -606,7 +614,15 @@ pub fn b2bua_dial_b_leg(
         // claimed whatever it happened to name — `outbound`, `path`, `gruu` —
         // for a leg where nothing implements them. Settled right after the
         // policy, so the per-carrier headers below still land last.
-        advertise_b_leg_capabilities(&mut b_leg_invite.headers, &script_shaped_headers, &policy);
+        // A destination in a gateway group that narrows `Allow` is shown that
+        // group's set (`gateway.groups[].allow_methods`).
+        let allow = allow_toward(state, || Some(destination.ip()));
+        advertise_b_leg_capabilities(
+            &mut b_leg_invite.headers,
+            &script_shaped_headers,
+            &policy,
+            allow_value(&allow),
+        );
 
         // The caller's security agreement belongs to its hop with siphon (RFC
         // 3329 §2.3.1): `sec-agree` leaves Require and Proxy-Require, and the
@@ -887,10 +903,14 @@ pub fn b2bua_dial_b_leg(
             return None;
         }
     } else {
+        // The routed host, so a TLS B-leg to a trunk named by hostname presents
+        // it as SNI and, when verified, checks the certificate against it
+        // rather than the address it resolved to.
         let relay_target = RelayTarget {
             address: destination,
             transport: Some(outbound_transport),
-            server_name: None,
+            server_name: tls_server_name,
+            verify_server: verify_server.or(routed_verify_server),
         };
         send_to_target(
             data,

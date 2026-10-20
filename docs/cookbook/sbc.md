@@ -370,6 +370,36 @@ call.set_header("Supported", call.get_header("Supported"))
 `replaces`, and `timer` when SIPhon runs the session timer, are still merged into a
 `Supported` the script set. `call.remove_header("Allow")` sends no `Allow` at all.
 
+#### A smaller `Allow` toward one trunk
+
+Some trunk peers pick their transfer method from the `Allow` they are shown: with
+`REFER` listed they send SIPhon a REFER, without it they transfer the call
+themselves. To keep `REFER` (or anything else) out of what one peer sees, give its
+gateway group `allow_methods`:
+
+```yaml
+gateway:
+  groups:
+    - name: "trunk-a"
+      allow_methods: [INVITE, ACK, CANCEL, BYE, OPTIONS, PRACK, UPDATE]
+      destinations:
+        - uri: "sip:198.51.100.7:5060"
+```
+
+That set replaces the full one on everything SIPhon sends that peer or answers it
+with: responses relayed to a caller from the group, SIPhon's own 18x/2xx
+(`answer`/`ring`/`progress`), its OPTIONS and 405 answers, the health-probe OPTIONS,
+and B-leg or originated INVITEs sent to the group. Every other peer keeps the full
+set. A peer is in the group by the membership `call.from_gateway()` uses (resolved
+destination addresses plus `source_networks`); a peer two groups with a set admit
+gets the set of the group listed first. An `Allow` a script sets, or one in a
+controller's `headers`, still wins.
+
+Each entry must be a method SIPhon implements, in upper case, listed once, and
+`INVITE`, `ACK`, `CANCEL` and `BYE` are required; anything else refuses the config.
+The set only changes what is advertised: a REFER the peer sends anyway is still
+handled.
+
 ### Preconditions before the answer
 
 With `precondition` crossing, the exchange itself runs on the early dialog
@@ -575,8 +605,24 @@ def on_invite(call):
 Both `client_certificate` and `client_private_key` must be set together (or
 neither); a one-sided setting or an unreadable file fails startup. The outbound
 handshake also sends the target hostname (`sbc.example.com`) as SNI, so a
-hostname-vhost trunk front-end can route it. Server-certificate verification is
-unchanged (permissive) — this only adds the client certificate siphon presents.
+hostname-vhost trunk front-end can route it.
+
+The client certificate proves siphon to the trunk; it says nothing about the
+trunk to siphon. To authenticate the trunk too, turn on server verification for
+it, globally or on the gateway that reaches it:
+
+```yaml
+tls:
+  # ...client_certificate / client_private_key as above...
+  verify_server: true          # check the certificate of every trunk dialled
+  # server_ca: "/etc/siphon/tls/trunk-ca.pem"   # only for a private CA
+```
+
+The trunk then has to present a certificate for `sbc.example.com` (the host you
+dial, never its resolved address) that chains to a trusted CA, or the call fails
+as an unreachable trunk would. See [Verifying the server siphon
+dials](../transports.md#verifying-the-server-siphon-dials) for the matching
+rules and per-gateway settings.
 
 !!! warning "Terminate strict peers (Teams) as a B2BUA, not a plain proxy"
     Microsoft Teams Direct Routing rejects any `Contact` or `Record-Route` whose

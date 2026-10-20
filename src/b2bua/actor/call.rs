@@ -441,6 +441,8 @@ pub struct CallActor {
     /// a later attempt may be built from: handing the next phone the caller's
     /// raw SDP would route its audio around the relay the profile asked for.
     pub control_dial_offer: Option<Vec<u8>>,
+    /// The offers of a dial whose branches name other profiles. See [`DialMedia`].
+    pub dial_media: DialMedia,
     /// The `From` a controller-issued `dial` asked this call to present, kept
     /// for the same reason as [`Self::control_dial_offer`]: the stored A-leg
     /// INVITE holds the caller's own identity (the caller's 2xx has to echo
@@ -496,6 +498,9 @@ pub struct CallActor {
     /// it the callee's offer stays unanswered. `None` until the 2xx is answered,
     /// and for every call whose INVITE carried the offer.
     pub originate_answer_sdp: Option<String>,
+    /// The allocation an anchored originate's INVITE offered (`offer: "early"`
+    /// on a bridging dial); `None` for an offerless one. See [`OriginateOffer`].
+    pub originate_offer: Option<OriginateOffer>,
     /// The SDP answer siphon's own 18x gave the caller, and whether the media
     /// engine anchors it. The 2xx that follows repeats that answer (RFC 3264
     /// §4), and a dial connects the callee behind it. `None` until siphon sends
@@ -612,6 +617,7 @@ impl CallActor {
             control_dial: false,
             control_dial_media: false,
             control_dial_offer: None,
+            dial_media: DialMedia::default(),
             control_dial_from_header: None,
             dial_branches: Vec::new(),
             control_dial_aors: Vec::new(),
@@ -622,6 +628,7 @@ impl CallActor {
             originated: false,
             originate_anchor: None,
             originate_answer_sdp: None,
+            originate_offer: None,
             early_media_anchor: None,
             bridge: None,
             fork_dispatching: false,

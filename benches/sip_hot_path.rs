@@ -501,6 +501,49 @@ fn bench_source_trust(criterion: &mut Criterion) {
     group.finish();
 }
 
+/// The `Allow` lookup a relayed B2BUA response, an OPTIONS answer and a B-leg
+/// INVITE pay (`gateway.groups[].allow_methods`). With no group narrowing
+/// `Allow` it is one atomic load; with one it is a membership check of the
+/// peer against that group, the same one `call.from_gateway()` makes.
+fn bench_allow_methods(criterion: &mut Criterion) {
+    use siphon::gateway::{Algorithm, Destination, DispatcherGroup, DispatcherManager};
+    use siphon::transport::Transport;
+    use std::net::IpAddr;
+
+    let group = |allow: Option<&str>| {
+        let destination = Destination::new(
+            "sip:198.51.100.7:5060".to_string(),
+            "198.51.100.7:5060".parse().expect("address"),
+            Transport::Udp,
+            1,
+            1,
+        );
+        DispatcherGroup::new("trunk".to_string(), Algorithm::Weighted, vec![destination])
+            .with_source_networks(vec!["203.0.113.0/24".parse().expect("CIDR")])
+            .with_allow_methods(allow.map(str::to_string))
+    };
+    let plain = DispatcherManager::new();
+    plain.add_group(group(None));
+    let narrowed = DispatcherManager::new();
+    narrowed.add_group(group(Some("INVITE, ACK, CANCEL, BYE, OPTIONS")));
+    let member: IpAddr = "203.0.113.40".parse().expect("address");
+    let stranger: IpAddr = "192.0.2.10".parse().expect("address");
+
+    let mut benchmarks = criterion.benchmark_group("allow_methods");
+    benchmarks.bench_function("no_group_narrows", |bencher| {
+        bencher.iter(|| {
+            black_box(plain.narrows_allow());
+        });
+    });
+    benchmarks.bench_function("narrowed_member", |bencher| {
+        bencher.iter(|| narrowed.allow_methods_for_peer(black_box(member)));
+    });
+    benchmarks.bench_function("narrowed_stranger", |bencher| {
+        bencher.iter(|| narrowed.allow_methods_for_peer(black_box(stranger)));
+    });
+    benchmarks.finish();
+}
+
 /// A locally built response stamping `Server`, read the way the dispatcher
 /// reads it since `POST /admin/config/reload` made it swappable.
 ///
@@ -597,6 +640,7 @@ criterion_group!(
     bench_framing,
     bench_traffic_counters,
     bench_source_trust,
+    bench_allow_methods,
     bench_build_response,
     bench_security_filter
 );

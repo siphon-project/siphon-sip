@@ -2,6 +2,8 @@
 
 use serde::{Deserialize, Deserializer};
 
+use super::listen::{ListenConfig, ListenEntry, ListenerClientAuth};
+
 // ---------------------------------------------------------------------------
 // TLS server config (certificates — listeners are under `listen.tls`)
 // ---------------------------------------------------------------------------
@@ -27,12 +29,25 @@ pub struct TlsServerConfig {
     pub method: TlsMethod,
     /// If true, client certificates are required and verified against
     /// `client_ca`. Requires `client_ca` to be set, else startup fails.
+    ///
+    /// The default for every `listen.tls` / `listen.wss` listener; an entry in
+    /// the object form can override it (and `client_ca` / `client_subject`)
+    /// for that listener alone.
     #[serde(default)]
     pub verify_client: bool,
     /// PEM bundle of CA certificates that client certificates must chain to,
     /// used only when `verify_client` is true (mutual TLS).
     #[serde(default)]
     pub client_ca: Option<String>,
+    /// DNS identities a client certificate must carry, on top of chaining to
+    /// `client_ca`: exact names or a whole-leftmost-label wildcard
+    /// (`*.sip.example.net`, one label, RFC 6125 §6.4.3). Matched against the
+    /// certificate's dNSName subjectAltNames, or its subject Common Name only
+    /// when it carries none (RFC 6125 §6.4.4). A certificate from the right CA
+    /// that names none of them is refused at the handshake. Empty (the
+    /// default) checks the chain only. Requires `verify_client: true`.
+    #[serde(default)]
+    pub client_subject: Vec<String>,
     /// PEM certificate chain siphon presents as a TLS *client* on OUTBOUND
     /// connections when the upstream peer requests one (mutual TLS — upstream
     /// SIP trunks that require client-certificate auth). Optional; when unset,
@@ -43,6 +58,216 @@ pub struct TlsServerConfig {
     /// `client_certificate` is set; a one-sided setting is a startup error.
     #[serde(default)]
     pub client_private_key: Option<String>,
+    /// Verify the server's certificate on OUTBOUND SIP TLS connections from
+    /// the connection pool: the chain, against `server_ca` or the bundled
+    /// Mozilla roots, and the name the connection was opened for (the host of
+    /// the URI siphon routed on, matched as a SIP domain per RFC 5922 §7; an
+    /// iPAddress subjectAltName for an IP-literal target). A connection that
+    /// fails is refused, and the request fails as a connect failure does.
+    ///
+    /// Off by default, which is what outbound SIP TLS has always done:
+    /// encrypted, not authenticated. A gateway destination or group, or a
+    /// control `dial` target, can set its own `verify_server` either way, which
+    /// wins over this one. Worth turning on for any trunk reached by hostname.
+    #[serde(default)]
+    pub verify_server: bool,
+    /// PEM bundle of CA certificates an outbound SIP TLS server must chain to
+    /// when it is verified. **Replaces** the bundled Mozilla roots rather than
+    /// adding to them, so naming a private CA does not also leave every public
+    /// CA acceptable. Unset: the Mozilla roots.
+    #[serde(default)]
+    pub server_ca: Option<String>,
+}
+
+impl TlsServerConfig {
+    /// Refuse a `server_ca` that cannot be loaded, at config load rather than
+    /// as a refused handshake on the first verified call.
+    pub fn validate_outbound_verification(&self) -> Result<(), String> {
+        match self.server_ca.as_deref() {
+            Some(path) => crate::transport::outbound_tls::ServerVerification::new(
+                self.verify_server,
+                Some(path),
+            )
+            .map(|_| ())
+            .map_err(|error| format!("tls.server_ca: {error}")),
+            None => Ok(()),
+        }
+    }
+}
+
+impl TlsServerConfig {
+    /// This block as one listener sees it: the server certificates unchanged,
+    /// and `verify_client` / `client_ca` / `client_subject` replaced by
+    /// whichever of them the listener's entry sets.
+    ///
+    /// A listener that sets none of them gets an identical copy, so it behaves
+    /// exactly as every listener did before the override existed.
+    pub fn for_listener(&self, overrides: Option<&ListenerClientAuth>) -> TlsServerConfig {
+        let mut effective = self.clone();
+        let Some(overrides) = overrides else {
+            return effective;
+        };
+        if let Some(verify_client) = overrides.verify_client {
+            effective.verify_client = verify_client;
+        }
+        if let Some(client_ca) = &overrides.client_ca {
+            effective.client_ca = Some(client_ca.clone());
+        }
+        match &overrides.client_subject {
+            Some(client_subject) => effective.client_subject = client_subject.clone(),
+            // A listener that turns verification off drops the inherited
+            // subject list with it: there is no certificate to check it on.
+            None if !effective.verify_client => effective.client_subject.clear(),
+            None => {}
+        }
+        effective
+    }
+}
+
+/// Refuse client-certificate settings on a listener that cannot honour them,
+/// naming the listener.
+///
+/// At load (and so on every config reload too), because the failure it
+/// replaces is quiet: an untagged listen entry ignores keys it does not know,
+/// so `verify_client: true` on a listener that could not apply it would read
+/// as mutual TLS and be none. Every rule fails closed:
+///
+/// - the overrides exist only on `listen.tls` and `listen.wss`;
+/// - they need the top-level `tls:` block (it holds the server certificate);
+/// - `client_ca` or `client_subject` on a listener that does not end up
+///   verifying clients is refused rather than ignored;
+/// - a verifying listener must have a readable, non-empty `client_ca` and
+///   well-formed `client_subject` patterns — built here exactly as the
+///   listener will build them;
+/// - a `listen.tls` and `listen.wss` entry sharing one address share one
+///   socket and one handshake, so their settings must agree.
+pub(super) fn validate_listener_client_auth(
+    listen: &ListenConfig,
+    tls: Option<&TlsServerConfig>,
+) -> Result<(), String> {
+    for (transport, entries) in [
+        ("udp", &listen.udp),
+        ("tcp", &listen.tcp),
+        ("ws", &listen.ws),
+        ("sctp", &listen.sctp),
+    ] {
+        if let Some(entry) = entries.iter().find(|entry| entry.client_auth().is_some()) {
+            return Err(format!(
+                "listen.{transport}[{}]: verify_client / client_ca / client_subject apply only \
+                 to listen.tls and listen.wss — a {transport} listener has no TLS handshake to \
+                 check a client certificate in",
+                entry.address()
+            ));
+        }
+    }
+
+    if let Some(tls) = tls {
+        if !tls.verify_client && !tls.client_subject.is_empty() {
+            return Err(
+                "tls.client_subject is set but tls.verify_client is not true — a \
+                 subject can only be checked on a certificate the client was required to \
+                 present"
+                    .to_string(),
+            );
+        }
+    }
+
+    for (transport, entries) in [("tls", &listen.tls), ("wss", &listen.wss)] {
+        for entry in entries {
+            validate_tls_listener(transport, entry, tls)?;
+        }
+    }
+
+    for tls_entry in &listen.tls {
+        let shared = listen
+            .wss
+            .iter()
+            .find(|wss_entry| same_socket(wss_entry.address(), tls_entry.address()));
+        if let Some(wss_entry) = shared {
+            if tls_entry.client_auth() != wss_entry.client_auth() {
+                return Err(format!(
+                    "listen.tls[{address}] and listen.wss[{address}] share one socket but set \
+                     different verify_client / client_ca / client_subject — the TLS handshake \
+                     happens before siphon can tell SIP from WebSocket, so both entries must \
+                     carry the same settings",
+                    address = tls_entry.address()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether two listen addresses name one socket, compared the way the server
+/// pairs tls+wss listeners for the mux (as parsed socket addresses).
+fn same_socket(left: &str, right: &str) -> bool {
+    match (
+        left.parse::<std::net::SocketAddr>(),
+        right.parse::<std::net::SocketAddr>(),
+    ) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left == right,
+    }
+}
+
+fn validate_tls_listener(
+    transport: &str,
+    entry: &ListenEntry,
+    tls: Option<&TlsServerConfig>,
+) -> Result<(), String> {
+    let overrides = entry.client_auth();
+    let Some(tls) = tls else {
+        if overrides.is_some() {
+            return Err(format!(
+                "listen.{transport}[{}]: client-certificate settings need the top-level tls: \
+                 block, which holds the server certificate this listener presents",
+                entry.address()
+            ));
+        }
+        return Ok(());
+    };
+    let Some(overrides) = overrides else {
+        // No override: the listener uses the `tls:` block as-is, whose
+        // certificate files are read when the listener starts, as before.
+        // Only the structural rules are checked here.
+        return validate_client_auth_shape(tls, "tls");
+    };
+    let label = format!("listen.{transport}[{}]", entry.address());
+    let effective = tls.for_listener(Some(overrides));
+    if !effective.verify_client && overrides.client_ca.is_some() {
+        return Err(format!(
+            "{label}.client_ca is set but this listener does not verify clients — set \
+             verify_client: true on it (or in tls:), or remove client_ca"
+        ));
+    }
+    crate::transport::tls_client_auth::client_cert_verifier(&effective, &label)
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+/// The rules on `verify_client` / `client_ca` / `client_subject` that need no
+/// file read.
+fn validate_client_auth_shape(tls: &TlsServerConfig, label: &str) -> Result<(), String> {
+    if !tls.verify_client {
+        if !tls.client_subject.is_empty() {
+            return Err(format!(
+                "{label}.client_subject is set but verify_client is not true — a subject can \
+                 only be checked on a certificate the client was required to present"
+            ));
+        }
+        return Ok(());
+    }
+    if tls.client_ca.is_none() {
+        return Err(format!(
+            "{label}.verify_client is true but no client_ca (PEM CA bundle for client \
+             certificates) is set"
+        ));
+    }
+    if !tls.client_subject.is_empty() {
+        crate::transport::tls_client_auth::ClientSubjectMatcher::new(&tls.client_subject)
+            .map_err(|error| format!("{label}.client_subject: {error}"))?;
+    }
+    Ok(())
 }
 
 /// One additional certificate/key pair, selected by the server name the client
@@ -150,3 +375,7 @@ impl<'de> Deserialize<'de> for TlsMethod {
         raw.parse().map_err(serde::de::Error::custom)
     }
 }
+
+#[cfg(test)]
+#[path = "tls_tests.rs"]
+mod tests;

@@ -238,7 +238,16 @@ impl UacSender {
         transport: Transport,
         request_uri: SipUri,
     ) -> oneshot::Receiver<UacResult> {
-        self.send_options_with_identity(destination, transport, request_uri, None, None, None)
+        self.send_options_with_identity(
+            destination,
+            transport,
+            request_uri,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
     }
 
     /// Send an OPTIONS request on a specific existing connection (TLS reuse).
@@ -258,6 +267,8 @@ impl UacSender {
             transport,
             request_uri,
             connection_id,
+            None,
+            None,
             None,
             None,
             None,
@@ -294,6 +305,8 @@ impl UacSender {
             None,
             Some(source_local_addr),
             None,
+            None,
+            None,
         )
     }
 
@@ -301,7 +314,16 @@ impl UacSender {
     ///
     /// `server_name` is the TLS SNI / certificate hostname to present when the
     /// probe opens a new outbound TLS connection (the gateway health probe knows
-    /// the configured hostname; an IP-addressed probe passes `None`).
+    /// the configured hostname; an IP-addressed probe passes `None`), and
+    /// `verify_server` the destination's own server verification setting
+    /// (`None` follows `tls.verify_server`), so a gateway that must be verified
+    /// is probed over a verified connection and a refused certificate counts
+    /// against its health.
+    ///
+    /// `allow_methods` is the `Allow` value to advertise, when the peer is
+    /// shown fewer methods than siphon implements (`gateway.groups[].allow_methods`);
+    /// `None` advertises [`crate::sip::SUPPORTED_METHODS`].
+    #[allow(clippy::too_many_arguments)]
     pub fn send_options_with_identity(
         &self,
         destination: SocketAddr,
@@ -310,6 +332,8 @@ impl UacSender {
         from_user: Option<&str>,
         from_domain: Option<&str>,
         server_name: Option<&str>,
+        verify_server: Option<bool>,
+        allow_methods: Option<&str>,
     ) -> oneshot::Receiver<UacResult> {
         self.send_options_on_connection_inner(
             destination,
@@ -320,6 +344,8 @@ impl UacSender {
             from_domain,
             None,
             server_name,
+            verify_server,
+            allow_methods,
         )
     }
 
@@ -341,6 +367,8 @@ impl UacSender {
         from_domain: Option<&str>,
         source_local_addr: Option<SocketAddr>,
         server_name: Option<&str>,
+        verify_server: Option<bool>,
+        allow_methods: Option<&str>,
     ) -> oneshot::Receiver<UacResult> {
         let branch = format!("z9hG4bK-uac-{}", uuid::Uuid::new_v4());
         let cseq = self
@@ -394,8 +422,14 @@ impl UacSender {
             .max_forwards(70)
             // Advertise our supported methods so a peer probing us via this
             // OPTIONS keepalive can discover the method set — a peer may select
-            // its transfer method from the Allow it is shown.
-            .header("Allow", crate::sip::SUPPORTED_METHODS.to_string())
+            // its transfer method from the Allow it is shown, which is also why
+            // a gateway group can narrow it toward its own peers.
+            .header(
+                "Allow",
+                allow_methods
+                    .unwrap_or(crate::sip::SUPPORTED_METHODS)
+                    .to_string(),
+            )
             .content_length(0);
 
         if let Some(ref user_agent) = self.identity.load().user_agent {
@@ -437,6 +471,7 @@ impl UacSender {
             data,
             source_local_addr,
             server_name: server_name.map(str::to_owned),
+            verify_server,
         };
 
         let (sender, receiver) = oneshot::channel();
@@ -568,6 +603,7 @@ impl UacSender {
             data,
             source_local_addr,
             server_name: None,
+            verify_server: None,
         };
 
         self.pending.insert(
@@ -628,6 +664,7 @@ impl UacSender {
             data,
             source_local_addr: None,
             server_name: None,
+            verify_server: None,
         };
 
         debug!(
@@ -660,6 +697,7 @@ impl UacSender {
             data,
             source_local_addr: None,
             server_name: None,
+            verify_server: None,
         };
 
         if let Err(error) = self.outbound.send(outbound_message) {
@@ -1192,6 +1230,8 @@ mod tests {
             Some("bgcf"),
             Some("sip.connect.example.com"),
             None,
+            None,
+            None,
         );
 
         let outbound = udp_rx.try_recv().unwrap();
@@ -1199,6 +1239,47 @@ mod tests {
         assert!(
             raw.contains("sip:bgcf@sip.connect.example.com"),
             "From should use configured user and domain: {raw}"
+        );
+    }
+
+    /// A gateway group's `allow_methods` replaces the full set on the probe
+    /// sent to it; no set keeps the full one byte for byte.
+    #[test]
+    fn send_options_with_identity_advertises_the_given_allow() {
+        let (sender, rxs) = make_uac_sender();
+        let narrowed = "INVITE, ACK, CANCEL, BYE, OPTIONS";
+        let _receiver = sender.send_options_with_identity(
+            "198.51.100.7:5060".parse().unwrap(),
+            Transport::Udp,
+            SipUri::new("198.51.100.7".to_string()),
+            None,
+            None,
+            None,
+            None,
+            Some(narrowed),
+        );
+        let outbound = rxs[0].try_recv().unwrap();
+        let message = crate::sip::parser::parse_sip_message_bytes(&outbound.data).unwrap();
+        assert_eq!(
+            message.headers.get_all("Allow"),
+            Some(&vec![narrowed.to_string()])
+        );
+
+        let _receiver = sender.send_options_with_identity(
+            "198.51.100.7:5060".parse().unwrap(),
+            Transport::Udp,
+            SipUri::new("198.51.100.7".to_string()),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let outbound = rxs[0].try_recv().unwrap();
+        let message = crate::sip::parser::parse_sip_message_bytes(&outbound.data).unwrap();
+        assert_eq!(
+            message.headers.get_all("Allow"),
+            Some(&vec![crate::sip::SUPPORTED_METHODS.to_string()])
         );
     }
 

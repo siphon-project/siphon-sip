@@ -21,6 +21,10 @@ pub(super) struct RelayTarget {
     /// bare-IP targets (RFC 6066 sends no SNI for an IP literal) and for
     /// in-dialog / failover paths that route by address.
     pub(super) server_name: Option<String>,
+    /// The destination's own server verification setting for a new outbound
+    /// TLS connection (a gateway's or a control `dial` target's
+    /// `verify_server`); `None` follows `tls.verify_server`.
+    pub(super) verify_server: Option<bool>,
 }
 
 /// Resolve a SIP target URI to its full ordered candidate set (RFC 3263).
@@ -79,6 +83,7 @@ pub(super) fn resolve_candidates_inner(
             address: addr,
             transport: None,
             server_name: None,
+            verify_server: gateway.and_then(|gateway| gateway.verify_server_for(uri_string, addr)),
         }];
     }
 
@@ -104,6 +109,7 @@ pub(super) fn resolve_candidates_inner(
                     address,
                     transport,
                     server_name: Some(uri.host.clone()),
+                    verify_server: gateway.verify_server_for(&host_port, address),
                 }];
             }
         }
@@ -116,6 +122,7 @@ pub(super) fn resolve_candidates_inner(
                 transport_hint.as_deref(),
             ))
         });
+        let host_port = crate::gateway::extract_address_from_uri(uri_string);
 
         return results
             .into_iter()
@@ -131,6 +138,8 @@ pub(super) fn resolve_candidates_inner(
                     address: r.address,
                     transport,
                     server_name: Some(uri.host.clone()),
+                    verify_server: gateway
+                        .and_then(|gateway| gateway.verify_server_for(&host_port, r.address)),
                 }
             })
             .collect();
@@ -268,6 +277,12 @@ pub(super) struct LegDestination<'a> {
     pub(super) destination: SocketAddr,
     /// The transport it goes over.
     pub(super) transport: Transport,
+    /// The host a new TLS connection presents and verifies: the routed URI's
+    /// host. `None` over a flow, which opens no connection.
+    pub(super) server_name: Option<String>,
+    /// The routed destination's own server verification setting (a gateway's
+    /// `verify_server`), `None` over a flow or when it sets none.
+    pub(super) verify_server: Option<bool>,
 }
 
 /// Why [`resolve_leg_destination`] found nowhere to send an INVITE.
@@ -349,6 +364,8 @@ pub(super) fn resolve_leg_destination<'a>(
             routing_uri,
             destination: flow.source_addr,
             transport,
+            server_name: None,
+            verify_server: None,
         });
     }
     match resolve_target(&routing_uri, resolver) {
@@ -357,6 +374,8 @@ pub(super) fn resolve_leg_destination<'a>(
             destination: resolved.address,
             transport: resolved.transport.unwrap_or(Transport::Udp),
             routing_uri,
+            server_name: resolved.server_name,
+            verify_server: resolved.verify_server,
         }),
         None => Err(LegDestinationError::Unresolvable { routing_uri }),
     }
@@ -422,6 +441,7 @@ pub(super) fn send_over_flow(
             data,
             source_local_addr: Some(flow.local_addr),
             server_name: None,
+            verify_server: None,
         })
         .map_err(|error| error.to_string())
 }
@@ -645,6 +665,7 @@ pub(super) fn send_to_target(
                         bind,
                         destination,
                         server_name.as_deref(),
+                        target.verify_server,
                         data_clone,
                     ))
                 }) {
@@ -669,7 +690,18 @@ pub(super) fn send_to_target(
             // connection reuse).  `reuse` tries an exact SocketAddr match, then
             // an IP-only fallback (handles NAT where the Contact-URI port
             // differs from the source port), filtered to TLS.
-            let connection_id = state.stream_connections.reuse(destination, Transport::Tls);
+            //
+            // Not when the server must be verified: the connection found here
+            // may be one the peer opened to us, or one the pool opened without
+            // verifying, and reusing it would skip the check this destination
+            // asked for. The pool keys verified connections by the name they
+            // verified, so it finds a reusable one itself.
+            let verify = state.connection_pool.verifies(target.verify_server);
+            let connection_id = if verify {
+                None
+            } else {
+                state.stream_connections.reuse(destination, Transport::Tls)
+            };
 
             if let Some(connection_id) = connection_id {
                 let outbound_message = OutboundMessage {
@@ -681,6 +713,7 @@ pub(super) fn send_to_target(
                     source_local_addr: None,
                     // Connection *reuse* — no TLS handshake, so no SNI needed.
                     server_name: None,
+                    verify_server: None,
                 };
                 if let Err(error) = state.outbound.send(outbound_message) {
                     error!(destination = %destination, "TLS connection reuse send failed: {error}");
@@ -698,9 +731,10 @@ pub(super) fn send_to_target(
                 let data_clone = data;
                 let server_name = target.server_name.clone();
                 match tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current().block_on(pool.send_tls(
+                    tokio::runtime::Handle::current().block_on(pool.send_tls_with_policy(
                         destination,
                         server_name.as_deref(),
+                        Some(verify),
                         data_clone,
                     ))
                 }) {
@@ -747,6 +781,7 @@ pub(super) fn send_to_target(
                         data,
                         source_local_addr: None,
                         server_name: None,
+                        verify_server: None,
                     };
                     if let Err(error) = state.outbound.send(outbound_message) {
                         error!(destination = %destination, %transport, "WS/WSS connection reuse send failed: {error}");
@@ -796,6 +831,7 @@ pub(super) fn send_to_target(
                 data,
                 source_local_addr,
                 server_name: None,
+                verify_server: None,
             };
             if let Err(error) = state.outbound.send(outbound_message) {
                 // The outbound router is gone (shutdown, or the task died).

@@ -443,7 +443,8 @@ pub(super) async fn init_gateway(config: &Config) -> Option<Arc<DispatcherManage
                 dest_config.weight,
                 dest_config.priority,
             )
-            .with_attrs(dest_config.attrs.clone());
+            .with_attrs(dest_config.attrs.clone())
+            .with_verify_server(dest_config.verify_server.or(group_config.verify_server));
             if is_hostname {
                 dest = dest.with_address_str(address_str.clone());
             }
@@ -513,6 +514,7 @@ pub(super) async fn init_gateway(config: &Config) -> Option<Arc<DispatcherManage
                 .with_source_networks(source_networks)
                 .with_reroute_causes(group_config.reroute_causes.clone())
                 .with_inbound_limits(group_config.resolved_inbound_limits())
+                .with_allow_methods(group_config.allow_methods_value())
                 .from_yaml(),
         );
     }

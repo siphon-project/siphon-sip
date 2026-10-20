@@ -93,6 +93,7 @@ destination; rows are gathered into groups by `group`.
 | `ha1_algorithm` | string | `"md5"` | Hash `ha1` was computed with |
 | `registers` | string | — | AoR of the outbound registration this destination belongs to |
 | `require_registration` | bool | `false` | Withhold from selection while `registers` is down |
+| `verify_server` | bool | `tls.verify_server` | Verify this destination's TLS server certificate (chain against `tls.server_ca`, the `uri` host as a SIP domain, RFC 5922 §7) |
 | `enabled` | bool | `true` | `false` drops the destination without removing the row |
 
 ## Probe policy

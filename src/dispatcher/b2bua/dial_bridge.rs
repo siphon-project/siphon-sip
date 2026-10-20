@@ -342,6 +342,9 @@ pub struct DialBridgeCaller {
     /// The caller's media session.
     pub media_call_id: String,
     pub from_tag: String,
+    /// What a leg with an early offer is offered from: the caller as a bridge
+    /// would offer it ([`LegOfferCaller`]).
+    pub offer_from: Option<LegOfferCaller>,
 }
 
 /// Why a caller cannot have phones rung for it.
@@ -358,6 +361,11 @@ pub enum DialBridgeRefusal {
     AlreadyBridged,
     /// The caller already has phones ringing for it.
     AlreadyDialling,
+    /// An early offer was asked for, and the caller's media session relays
+    /// to another party since an earlier bridge: a bridge renegotiates such a
+    /// session in place, which an offer made per phone before any answers
+    /// cannot be.
+    CallerRelaying,
     /// The controller cancelled the dial while it was being set up.
     Cancelled,
 }
@@ -371,6 +379,7 @@ impl DialBridgeRefusal {
             Self::NotAnchored => "not_anchored",
             Self::AlreadyBridged => "already_bridged",
             Self::AlreadyDialling => "dial_in_progress",
+            Self::CallerRelaying => "caller_relaying",
             Self::Cancelled => "dial_cancelled",
         }
     }
@@ -399,6 +408,10 @@ impl std::fmt::Display for DialBridgeRefusal {
             Self::Cancelled => write!(
                 formatter,
                 "the dial was cancelled before any phone was rung"
+            ),
+            Self::CallerRelaying => write!(
+                formatter,
+                "offer \"early\" needs the caller on a media session of its own, and this caller's relays to another party since an earlier bridge — dial with offer \"delayed\""
             ),
         }
     }
@@ -456,6 +469,9 @@ pub fn dial_bridge_caller(
         .as_ref()
         .and_then(|invite| invite.lock().ok().map(|invite| invite.clone()))
         .ok_or(DialBridgeRefusal::Gone)?;
+    let offer_from = bridge_leg_snapshot(state, sip_call_id, "target")
+        .ok()
+        .and_then(|snapshot| LegOfferCaller::of_snapshot(&snapshot));
     Ok(DialBridgeCaller {
         sip_call_id: sip_call_id.to_string(),
         template,
@@ -463,6 +479,7 @@ pub fn dial_bridge_caller(
         profile: session.profile.clone(),
         media_call_id: session.rtpengine_id().to_string(),
         from_tag: session.from_tag.clone(),
+        offer_from,
     })
 }
 
@@ -472,7 +489,8 @@ pub struct DialBridgePlan {
     /// The phones, `{aor}` targets already resolved to their contacts.
     pub targets: Vec<DialTarget>,
     /// The dial's identity arguments, and `profile`: the media profile each
-    /// phone is anchored with (the caller's own when it names none).
+    /// phone is anchored with, unless its target names its own (the caller's
+    /// own when neither names one).
     pub shaping: DialShaping,
     /// The dial's own headers, on every leg under each target's own.
     pub headers: Vec<(String, String)>,
@@ -481,14 +499,18 @@ pub struct DialBridgePlan {
     pub ring_timeout_secs: u32,
     /// How long the dial as a whole rings.
     pub total_timeout_secs: u32,
+    /// When each phone's INVITE carries its offer, unless its target names
+    /// its own: offerless when neither names one.
+    pub offer: Option<DialOffer>,
 }
 
 /// The originate group a bridge dial rings for `caller`.
 ///
-/// Every phone is anchored on the media engine (its offerless INVITE answered
-/// locally when it picks up), since the bridge that follows joins it to the
-/// caller's media session. Each leg presents the calling identity
-/// [`resolve_bridge_leg_identities`] settles for it.
+/// Every phone is anchored on the media engine, since the bridge that follows
+/// joins it to the caller's media session: offerless, its own offer answered
+/// locally when it picks up, or, with `offer: "early"`, offered from the
+/// caller's media in its INVITE ([`super::leg_offer`]). Each leg presents the
+/// calling identity [`resolve_bridge_leg_identities`] settles for it.
 pub fn dial_bridge_spec(
     caller: &DialBridgeCaller,
     mut plan: DialBridgePlan,
@@ -496,6 +518,22 @@ pub fn dial_bridge_spec(
     if plan.targets.is_empty() {
         return Err(DialError::NoTargets);
     }
+    // Each phone's offer mode, its own over the dial's, settled on its target.
+    for target in &mut plan.targets {
+        target.offer = Some(target.offer.or(plan.offer).unwrap_or_default());
+    }
+    let early_offer = if any_early_offer(&plan.targets, None) {
+        match caller.offer_from.clone() {
+            Some(offer_from) if !offer_from.relaying => Some(offer_from),
+            _ => {
+                return Err(DialError::Media(
+                    DialBridgeRefusal::CallerRelaying.to_string(),
+                ))
+            }
+        }
+    } else {
+        None
+    };
     resolve_bridge_leg_identities(&caller.template, &plan.shaping, &mut plan.targets)?;
     // A host pinned on the caller's call outranks the advertised address on a
     // leg that would otherwise be hidden behind it, as on a connecting dial.
@@ -553,6 +591,7 @@ pub fn dial_bridge_spec(
         // An answer is only kept once the phone is bridged: until then the
         // other phones ring on, to fall back on when the bridge fails.
         answers: OriginateGroupAnswers::Confirmed,
+        early_offer,
     })
 }
 
@@ -636,16 +675,32 @@ pub async fn dial_bridge_join(
     // profile — and re-INVITEs the caller with the caller's own, which is what
     // keeps an SRTP phone and a plain-RTP caller each on the media it took.
     // Naming it as a pair profile would hand its answer half to the caller.
-    let joined = bridge_calls_with_state(
-        state,
-        BridgeParams {
-            anchor_sip_call_id: caller_sip_call_id.to_string(),
-            peer_sip_call_id: winner.sip_call_id.clone(),
-            on_peer_hangup: crate::b2bua::bridge::PeerHangupPolicy::default(),
-        },
-        None,
-    )
-    .await;
+    //
+    // A phone offered early answered the bridge's offer in its own 2xx
+    // already: only the caller is left to re-INVITE.
+    let joined = match state.call_actors.originate_offer(&winner.internal_call_id) {
+        Some(offered) => {
+            super::bridge_offered::bridge_offered_with_state(
+                state,
+                caller_sip_call_id,
+                &winner.sip_call_id,
+                &offered,
+            )
+            .await
+        }
+        None => {
+            bridge_calls_with_state(
+                state,
+                BridgeParams {
+                    anchor_sip_call_id: caller_sip_call_id.to_string(),
+                    peer_sip_call_id: winner.sip_call_id.clone(),
+                    on_peer_hangup: crate::b2bua::bridge::PeerHangupPolicy::default(),
+                },
+                None,
+            )
+            .await
+        }
+    };
     if joined.is_err() {
         state.dial_bridges.forget_bridge(&winner.internal_call_id);
     }
@@ -1006,6 +1061,7 @@ mod tests {
                     target: "sip:201@192.0.2.20".to_string(),
                     aor: None,
                     outcome: None,
+                    media_profile: None,
                 },
             },
             signals,

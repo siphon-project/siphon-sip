@@ -63,11 +63,30 @@ Every verb the server's `sip` adapter describes has a typed method:
   name the host siphon presents in its own Contact on that leg, in place of the
   address it advertises, for a peer that identifies the tenant or account by
   that host. Only the host changes.
+  `DialTarget::verify_server(bool)` and `RouteTarget { verify_server, .. }` verify
+  (or not) the server certificate when that leg opens a new outbound TLS
+  connection, over the gateway it routes to and the server's `tls.verify_server`.
+  `DialTarget::profile(..)` (either form) is the media profile for that branch
+  alone, over `DialOptions::profile`; a target without one inherits the dial's.
+  One ring can then reach a phone behind NAT that needs a latching relay and a
+  trunk that asks for SDES-SRTP. A connecting dial that names no profile anchors
+  every branch or none, so either every target names one or none does.
+  `DialOptions::offer(DialOffer::Early)` (or `DialTarget::offer(..)`, which
+  wins) sends each phone of a `DialOnAnswer::Bridge` dial an SDP offer in its
+  INVITE, allocated on the media engine from the caller's media, for peers that
+  refuse a delayed-offer INVITE; `DialOffer::Delayed` is the server's default.
+  The server refuses `offer` on a connecting dial.
   The caller's side of the same: `ResponseOptions::contact_host` with
   `answer_with_options` / `progress_with_options` (anchored too),
   `ring_with_contact_host`, `DialOptions::caller_contact_host` and
   `route_with_caller_contact_host`, the host of siphon's Contact toward the
   caller, fixed once an 18x or 2xx went out.
+  `DialTarget::reroute_after_progress(false)` ends a sequential dial on that
+  target once it has rung (a 101-199): its ring timeout, busy or other failure
+  is the dial's and no later target is rung, for a hunt across several routes
+  to one destination. Left unset it stays off the wire (server default `true`).
+  A target that never rang, and a 503 with Retry-After, still move the hunt on;
+  a 6xx ends a sequential dial either way.
 - **Transfers:** `refer` / `transfer` / `refer_replaces` send a REFER.
   `accept_refer` and `reject_refer` decide a pending inbound one.
   `accept_refer_dialling(target, mode, profile, &TransferDial)` names who the

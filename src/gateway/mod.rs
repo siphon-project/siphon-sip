@@ -23,6 +23,7 @@ use dashmap::DashMap;
 use ipnet::IpNet;
 use tracing::{debug, error, info, warn};
 
+mod allow_methods;
 mod inbound_limit;
 #[cfg(test)]
 mod inbound_limit_tests;
@@ -101,6 +102,11 @@ pub struct Destination {
     /// Keep this destination out of [`DispatcherGroup::select`] while the
     /// registration named by `registers` is not registered.
     pub require_registration: bool,
+    /// Server verification on a new outbound TLS connection to this
+    /// destination (`verify_server` on the destination, else on its group):
+    /// `Some(true)` verifies, `Some(false)` does not, `None` follows
+    /// `tls.verify_server`.
+    pub verify_server: Option<bool>,
     /// Whether this destination is currently healthy.
     healthy: AtomicBool,
     /// Consecutive failure count.
@@ -132,6 +138,7 @@ impl Destination {
             credentials: None,
             registers: None,
             require_registration: false,
+            verify_server: None,
             healthy: AtomicBool::new(true),
             failures: AtomicU32::new(0),
             down_until: std::sync::Mutex::new(None),
@@ -141,6 +148,12 @@ impl Destination {
     /// Attach the digest credentials this destination challenges with.
     pub fn with_credentials(mut self, credentials: crate::auth::StoredCredentials) -> Self {
         self.credentials = Some(Arc::new(credentials));
+        self
+    }
+
+    /// Set this destination's own server verification setting.
+    pub fn with_verify_server(mut self, verify_server: Option<bool>) -> Self {
+        self.verify_server = verify_server;
         self
     }
 
@@ -365,6 +378,9 @@ pub struct DispatcherGroup {
     /// registered — see [`inbound_limit`]. They belong to the group's name, not
     /// to this object, so a refresh that rebuilds the group keeps the count.
     inbound_state: Option<Arc<crate::admission::LimitState>>,
+    /// `gateway.groups[].allow_methods` as an `Allow` value. `None` = every
+    /// method siphon implements — see [`allow_methods`].
+    allow_methods: Option<Arc<str>>,
 }
 
 /// Who created a [`DispatcherGroup`].
@@ -393,6 +409,7 @@ impl DispatcherGroup {
             origin: GroupOrigin::Script,
             inbound_limits: None,
             inbound_state: None,
+            allow_methods: None,
         };
         // Startup resolution — sync context, `to_socket_addrs` is fine here.
         group.refresh_member_ips();
@@ -422,6 +439,7 @@ impl DispatcherGroup {
             origin: GroupOrigin::Script,
             inbound_limits: None,
             inbound_state: None,
+            allow_methods: None,
         };
         group.refresh_member_ips();
         group
@@ -727,6 +745,8 @@ pub struct DispatcherManager {
     prober_runtime: std::sync::OnceLock<ProberRuntime>,
     /// Inbound call limits of the groups that have one.
     inbound: inbound_limit::InboundLimitRegistry,
+    /// `Allow` sets of the groups that narrow it.
+    allow: allow_methods::AllowMethodsRegistry,
 }
 
 /// What [`spawn_health_probers`] installs so later groups can start probing.
@@ -743,6 +763,7 @@ impl DispatcherManager {
             probers: DashMap::new(),
             prober_runtime: std::sync::OnceLock::new(),
             inbound: inbound_limit::InboundLimitRegistry::new(),
+            allow: allow_methods::AllowMethodsRegistry::new(),
         }
     }
 
@@ -754,8 +775,10 @@ impl DispatcherManager {
         // the calls already up still count against the new limit.
         group.inbound_state = self.inbound.bind(&name, group.inbound_limits);
         let group = Arc::new(group);
+        self.allow.register(&name);
         self.groups.insert(name.clone(), Arc::clone(&group));
         self.inbound.rebuild(&self.groups);
+        self.allow.rebuild(&self.groups);
         self.republish_view();
         self.start_prober(name, &group);
     }
@@ -771,6 +794,8 @@ impl DispatcherManager {
         if removed {
             self.inbound.forget(name);
             self.inbound.rebuild(&self.groups);
+            self.allow.forget(name);
+            self.allow.rebuild(&self.groups);
             self.republish_view();
         }
         removed
@@ -783,6 +808,22 @@ impl DispatcherManager {
     /// both, and counted against both.
     pub fn inbound_limits_admitting(&self, source: IpAddr) -> Vec<crate::admission::GroupLimit> {
         self.inbound.admitting(source)
+    }
+
+    /// The `Allow` value siphon advertises to `peer`: the
+    /// `gateway.groups[].allow_methods` of the first-configured group that
+    /// admits it and has one, or `None` for every method siphon implements.
+    ///
+    /// Read on the response and request paths: lock-free, no DNS, and one
+    /// atomic load when no group narrows `Allow`.
+    pub fn allow_methods_for_peer(&self, peer: IpAddr) -> Option<Arc<str>> {
+        self.allow.for_peer(peer)
+    }
+
+    /// Whether any group narrows `Allow`, so a caller can skip finding the
+    /// peer's address when none does.
+    pub fn narrows_allow(&self) -> bool {
+        self.allow.any()
     }
 
     /// Limits and calls up, per limited group, ordered by name.
@@ -996,6 +1037,18 @@ impl DispatcherManager {
         None
     }
 
+    /// The `verify_server` setting of the gateway destination a next hop
+    /// belongs to, matched the way an outbound leg finds its credentials: on
+    /// the configured hostname first (`host_port` as
+    /// [`extract_address_from_uri`] normalises it), then on the resolved
+    /// address, which is how a destination configured as a bare `IP:port` is
+    /// found. `None` when no destination matches or it sets nothing.
+    pub fn verify_server_for(&self, host_port: &str, address: SocketAddr) -> Option<bool> {
+        self.hostname_destination_for(host_port)
+            .or_else(|| self.destination_for_address(address))
+            .and_then(|(_, destination)| destination.verify_server)
+    }
+
     /// Select a destination from a named group.
     pub fn select(
         &self,
@@ -1157,7 +1210,15 @@ async fn probe_group(
     }
 
     for dest in group.all_destinations() {
-        probe_destination(dest, uac_sender, failure_threshold, from_user, from_domain).await;
+        probe_destination(
+            dest,
+            uac_sender,
+            failure_threshold,
+            from_user,
+            from_domain,
+            group.allow_methods().map(|allow| &**allow),
+        )
+        .await;
     }
 }
 
@@ -1167,6 +1228,7 @@ async fn probe_destination(
     failure_threshold: u32,
     from_user: Option<&str>,
     from_domain: Option<&str>,
+    allow_methods: Option<&str>,
 ) {
     // Build R-URI from the gateway's configured URI hostname (not the resolved IP).
     let host_part = dest
@@ -1186,7 +1248,11 @@ async fn probe_destination(
     // Keep the configured hostname for TLS SNI — the probe addresses the
     // resolved IP (`current_addr`), but a hostname-vhost peer routes the TLS
     // handshake on SNI, so a new outbound TLS connection must present it.
-    let server_name = host.clone();
+    // Taken from the parsed URI, so a `;transport=tls` parameter or a user part
+    // never reaches the SNI (or the name a verified certificate must carry).
+    let server_name = crate::sip::parser::parse_uri_standalone(&dest.uri)
+        .map(|uri| uri.host)
+        .unwrap_or_else(|_| host.clone());
     let mut request_uri = SipUri::new(host).with_port(port);
     if dest.transport != Transport::Udp {
         request_uri = request_uri.with_param(
@@ -1206,6 +1272,10 @@ async fn probe_destination(
         } else {
             None
         },
+        dest.verify_server,
+        // The group's `allow_methods`, so the peer reads the same `Allow` off
+        // the probe as off everything else siphon sends it.
+        allow_methods,
     );
 
     let result = tokio::time::timeout(Duration::from_secs(5), receiver).await;

@@ -233,6 +233,7 @@ mod tests {
             target: "sip:15550100077@198.51.100.7".to_string(),
             aor: None,
             outcome,
+            media_profile: None,
         }
     }
 

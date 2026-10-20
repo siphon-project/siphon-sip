@@ -7,6 +7,7 @@ pub mod hold;
 #[cfg(test)]
 mod late_response_tests;
 pub mod mux;
+pub mod outbound_tls;
 pub mod pool;
 mod pool_writer;
 pub mod proxy_protocol;
@@ -17,6 +18,7 @@ pub mod sctp;
 pub mod stream;
 pub mod tcp;
 pub mod tls;
+pub(crate) mod tls_client_auth;
 pub mod tls_listener;
 /// Transport layer — UDP, TCP, TLS, WebSocket, WSS, SCTP.
 /// Each transport sends inbound SIP messages to the core via a channel
@@ -800,6 +802,11 @@ pub struct OutboundMessage {
     /// destination IP literal (no SNI). Ignored for non-TLS transports and for
     /// TLS connection *reuse* (no handshake occurs).
     pub server_name: Option<String>,
+    /// Whether a new outbound TLS connection this message opens verifies the
+    /// server: `Some(true)` / `Some(false)` is the destination's own setting
+    /// (a gateway's `verify_server`), `None` follows `tls.verify_server`.
+    /// Ignored like `server_name` when no handshake happens.
+    pub verify_server: Option<bool>,
     /// Further messages that MUST leave after `data`, to the same destination,
     /// without anything interleaving between them.
     ///
@@ -1419,6 +1426,7 @@ mod tests {
             data: Bytes::from_static(b"SIP/2.0 200 OK\r\n\r\n"),
             source_local_addr: None,
             server_name: None,
+            verify_server: None,
             followups: None,
         };
         assert_eq!(message.connection_id, ConnectionId(99));
@@ -1434,6 +1442,7 @@ mod tests {
             data: Bytes::from_static(b"202"),
             source_local_addr: None,
             server_name: None,
+            verify_server: None,
             followups,
         }
     }
@@ -1706,6 +1715,7 @@ mod tests {
             data: Bytes::from_static(b"PING"),
             source_local_addr: source,
             server_name: None,
+            verify_server: None,
             followups: None,
         };
 
@@ -1786,6 +1796,7 @@ mod tests {
                 data: Bytes::from_static(b"INVITE"),
                 source_local_addr: Some(port_uc),
                 server_name: None,
+                verify_server: None,
                 followups: None,
             })
             .unwrap();
@@ -1829,6 +1840,7 @@ mod tests {
                 data: Bytes::from_static(b"INVITE"),
                 source_local_addr: Some(addr("192.0.2.10:6100")),
                 server_name: None,
+                verify_server: None,
                 followups: None,
             })
             .unwrap();
@@ -1861,6 +1873,7 @@ mod tests {
                 data: Bytes::from_static(b"OPTIONS"),
                 source_local_addr: None,
                 server_name: None,
+                verify_server: None,
                 followups: None,
             })
             .expect("the receiver is alive");
@@ -1924,6 +1937,7 @@ mod tests {
                 data: Bytes::from_static(b"REGISTER"),
                 source_local_addr: None,
                 server_name: None,
+                verify_server: None,
                 followups: None,
             })
             .expect_err("an unserved transport must refuse, not accept and discard");
@@ -1974,6 +1988,7 @@ mod tests {
                 data: Bytes::from_static(b"REGISTER"),
                 source_local_addr: None,
                 server_name: None,
+                verify_server: None,
                 followups: None,
             })
             .expect("a served SCTP egress accepts the message");

@@ -54,7 +54,9 @@ security:
   # signalling range, so it MUST be trusted. Confirm the range against
   # Microsoft's current published list.
   trusted_cidrs:
-    - "52.114.0.0/16"          # Microsoft Teams signalling
+    - "52.112.0.0/14"          # Microsoft Teams signalling
+    - "52.120.0.0/14"          # Microsoft Teams signalling
+    - "2603:1063:400::/40"     # Microsoft Teams signalling (IPv6)
     # - "10.0.0.0/8"           # your own infra / monitoring / carrier trunk
 
   rate_limit:

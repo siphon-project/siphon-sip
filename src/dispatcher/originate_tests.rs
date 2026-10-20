@@ -26,6 +26,7 @@ fn identity<'a>() -> OriginateIdentity<'a> {
         transport: Transport::Udp,
         contact: "<sip:198.51.100.10:5060;transport=udp>",
         user_agent: Some("siphon"),
+        allow: crate::sip::SUPPORTED_METHODS,
     }
 }
 
@@ -99,8 +100,55 @@ fn originate_invite_carries_the_uac_dialog_identity() {
         invite.headers.get("Contact").unwrap(),
         "<sip:198.51.100.10:5060;transport=udp>"
     );
-    assert!(invite.headers.has("Allow"));
+    assert_eq!(
+        invite.headers.get("Allow").map(String::as_str),
+        Some(crate::sip::SUPPORTED_METHODS)
+    );
     assert_eq!(invite.headers.get("User-Agent").unwrap(), "siphon");
+}
+
+/// The identity's `Allow` (a gateway group's `allow_methods`) goes out, and a
+/// caller's own `Allow` in `headers` still replaces it.
+#[test]
+fn originate_advertises_the_identitys_allow_and_headers_still_win() {
+    let narrowed = "INVITE, ACK, CANCEL, BYE, OPTIONS";
+    let mut params = params(OriginateMedia::Anchor {
+        profile: "rtp_passthrough".to_string(),
+        ws_uri: None,
+    });
+    let uri = parse_uri_standalone(&params.to).expect("target parses");
+    let invite = build_originate_invite(
+        &params,
+        uri.clone(),
+        OriginateIdentity {
+            allow: narrowed,
+            ..identity()
+        },
+        None,
+    )
+    .expect("invite builds");
+    assert_eq!(
+        invite.headers.get_all("Allow"),
+        Some(&vec![narrowed.to_string()])
+    );
+
+    params
+        .headers
+        .push(("Allow".to_string(), "INVITE, ACK, CANCEL, BYE".to_string()));
+    let invite = build_originate_invite(
+        &params,
+        uri,
+        OriginateIdentity {
+            allow: narrowed,
+            ..identity()
+        },
+        None,
+    )
+    .expect("invite builds");
+    assert_eq!(
+        invite.headers.get_all("Allow"),
+        Some(&vec!["INVITE, ACK, CANCEL, BYE".to_string()])
+    );
 }
 
 #[test]

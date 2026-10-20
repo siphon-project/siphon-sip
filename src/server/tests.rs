@@ -310,6 +310,7 @@ fn default_udp_egress_addr_honours_extended_form() {
         advertise: Some(config::AdvertisedAddress::host_only("sip.example.org")),
         dscp: None,
         proxy_protocol: None,
+        client_auth: config::ListenerClientAuth::default(),
     }];
     assert_eq!(
         default_udp_egress_addr(&entries),
@@ -395,4 +396,55 @@ fn register_task_accepts_move_closures_carrying_state() {
         COUNTER.fetch_add(owned.len(), Ordering::Relaxed);
     });
     assert_eq!(server.extension_task_count(), 1);
+}
+
+/// `verify_server` on a gateway destination wins over its group's, which wins
+/// over nothing, through the bootstrap that builds the live destinations.
+#[tokio::test]
+async fn gateway_verify_server_follows_destination_then_group() {
+    let yaml = r#"
+listen:
+  udp:
+    - "0.0.0.0:5060"
+domain:
+  local:
+    - "example.com"
+script:
+  path: "scripts/proxy_default.py"
+gateway:
+  groups:
+    - name: "verified"
+      verify_server: true
+      destinations:
+        - uri: "sip:198.51.100.10:5061;transport=tls"
+        - uri: "sip:198.51.100.11:5061;transport=tls"
+          verify_server: false
+    - name: "unspecified"
+      destinations:
+        - uri: "sip:198.51.100.12:5061;transport=tls"
+"#;
+    let config = crate::config::Config::from_str(yaml).expect("config");
+    let manager = init_gateway(&config).await.expect("gateway manager");
+    let setting = |address: &str| {
+        manager.verify_server_for(
+            &crate::gateway::extract_address_from_uri(&format!("sip:{address}")),
+            address.parse().expect("addr"),
+        )
+    };
+    assert_eq!(
+        setting("198.51.100.10:5061"),
+        Some(true),
+        "the group's setting"
+    );
+    assert_eq!(
+        setting("198.51.100.11:5061"),
+        Some(false),
+        "the destination's own wins"
+    );
+    assert_eq!(
+        setting("198.51.100.12:5061"),
+        None,
+        "nothing set: tls.verify_server decides"
+    );
+    assert_eq!(setting("198.51.100.99:5061"), None, "not a gateway");
 }

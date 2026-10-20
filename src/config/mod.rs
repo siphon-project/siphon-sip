@@ -68,6 +68,7 @@ pub use lawful_intercept::{
 };
 pub use listen::{
     dscp_to_tos, parse_dscp, AdvertisedAddress, DomainConfig, ListenConfig, ListenEntry,
+    ListenerClientAuth,
 };
 pub use media::{
     CodecFlagsConfig, MediaBackendKind, MediaConfig, MediaProfileConfig, NgFlagsConfig,
@@ -569,16 +570,23 @@ impl Config {
         config.validate_registrant_transports()?;
         config.validate_gateway_source()?;
         config.validate_gateway_transports()?;
+        config.validate_gateway_allow_methods()?;
         config.validate_media_profiles()?;
         config.validate_header_policies()?;
         config.validate_lawful_intercept()?;
         config.validate_max_message_bytes()?;
         config.validate_control_tls()?;
         config.validate_admin_tls()?;
+        if let Some(tls) = &config.tls {
+            tls.validate_outbound_verification()
+                .map_err(SiphonError::Config)?;
+        }
         config.validate_admin_listen()?;
         config.validate_admin_log_tail()?;
         config.validate_control_connect_urls()?;
         config.validate_listen()?;
+        tls::validate_listener_client_auth(&config.listen, config.tls.as_ref())
+            .map_err(SiphonError::Config)?;
         config.validate_timer_intervals()?;
         config.validate_advertised_address()?;
         config.validate_inbound_limits()?;

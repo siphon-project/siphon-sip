@@ -302,7 +302,7 @@ what lets a refused verb be lined up against a capture, a CDR and HEP.
 | `bridge` | sip | `{with, on_peer_hangup?, profile?}` | join this channel to another the app owns; the reply says the media was negotiated, `ChannelBridged` says the audio meets. `profile` names one media profile for the pair — see [`bridge`](#joining-two-legs-bridge) |
 | `unbridge` | sip | `{reason?}` | break a bridge — both legs stay answered, owned and held |
 | `replace_peer` | sip | `{target, next_hop?, replace_a_leg?, profile?, number_policy?, format?, timeout?, from?, from_display?, p_asserted_identity?, privacy?, headers?}` | swap one party of this answered call for a freshly dialed target, no REFER involved; the replaced leg stays up while the target rings, `PeerReplaced` says the swap landed |
-| `dial` | sip | `{targets, strategy?, timeout?, headers?, profile?, from?, from_display?, p_asserted_identity?, privacy?, on_answer?, ringback?}` (identity fields also per target, as is the called party `to?`) | ring B-legs while the caller stays **unanswered** and the app keeps the channel; refused (`invalid_state`) on an answered call with `error.details: {verb: "dial", reason: "already_answered", call_state}` — see [`dial`](#dial--ring-while-the-caller-waits). With `on_answer: "bridge"`, ring phones for a caller the app already **answered** and anchored, play `ringback` while they alert, and bridge the one that picks up — see [`on_answer`](#dial-on_answer-bridge--ring-phones-for-an-answered-caller) |
+| `dial` | sip | `{targets, strategy?, timeout?, headers?, profile?, from?, from_display?, p_asserted_identity?, privacy?, on_answer?, ringback?, offer?}` (identity fields, `profile?` and `offer?` also per target, as is the called party `to?`) | ring B-legs while the caller stays **unanswered** and the app keeps the channel; refused (`invalid_state`) on an answered call with `error.details: {verb: "dial", reason: "already_answered", call_state}` — see [`dial`](#dial--ring-while-the-caller-waits). With `on_answer: "bridge"`, ring phones for a caller the app already **answered** and anchored, play `ringback` while they alert, and bridge the one that picks up — see [`on_answer`](#dial-on_answer-bridge--ring-phones-for-an-answered-caller) |
 | `cancel_dial` | sip | `{reason?}` | give up on the dial ringing for this channel's caller and leave the caller alone: the phones are CANCELled and the dial ends in `DialFailed` with code 487 — see [`cancel_dial`](#cancel_dial--stop-a-dial-and-keep-the-caller) |
 | `route` | sip | `{targets, strategy?, headers?}` | return control to siphon: un-park the call and dial the B-leg via LCR sequential failover. Refused (`invalid_state`, `error.details: {verb: "route", reason: "dial_in_progress"}`) while a `dial` still rings for the call, since `route` releases the channel the dial reports on: `cancel_dial` first |
 | `set_header` / `remove_header` / `get_header` | sip | `{name, value?}` | on the stored A-leg INVITE |
@@ -1214,7 +1214,11 @@ connected call with no audio:
   `play` / `dtmf` / `hold` / `stream_start` all work against it exactly as they do
   for an inbound-anchored channel. `profile` (default `rtp_passthrough`) and
   `ws_uri` shape it. Requires the `siphon-rtp` backend — anything else answers
-  `unsupported_verb` at the command rather than connecting a mute call.
+  `unsupported_verb` at the command rather than connecting a mute call. An
+  originate cannot send an engine-allocated offer: the engine offers from a
+  party's media, and an originate has no caller. `offer` on `originate` is
+  `bad_request` (`reason: "no_caller"`); a controller that needs the INVITE to
+  carry an offer supplies `sdp`. A bridging `dial` can (see `offer: "early"`).
 
 **Identity.** `from` / `from_display` / `to_display` / `p_asserted_identity`
 (RFC 3325 §9.1) and arbitrary `headers` all land on the INVITE. `privacy:
@@ -1609,7 +1613,7 @@ was dialled for.
 
 A target is a URI string, `{uri, next_hop?, headers?}`, or `{aor}`, and either
 object form may also carry `from?`, `from_display?`, `p_asserted_identity?` and
-`privacy?` for that branch alone. Either form may also carry `to?`, the called
+`privacy?` for that branch alone, and `reroute_after_progress?` (see *when a sequential dial stops*, below). Either form may also carry `to?`, the called
 party the branch is addressed to, on every contact an `aor` forks to (see
 [naming the called party](#naming-the-called-party)), and `contact_host?`, the
 host siphon presents in its own Contact on the branch (see
@@ -1646,6 +1650,36 @@ binding's Path.
                            "route": ["<sip:term@scscf.example.test;lr;odi=4f1c>"] } ] } }
 ```
 
+**A media profile per branch.** `profile` anchors the call's media on the
+media engine with that profile, so the phones are offered the relay rather
+than the caller's own SDP. Either target form may carry its own `profile?`,
+which overrides the dial's for that branch alone; a target naming none inherits
+the dial's, as with every other per-branch field. The media a peer can take is
+a property of that peer, so one ring can reach a desk phone behind NAT on a
+latching profile and a trunk on an SDES-SRTP profile:
+
+```json
+{ "verb": "dial", "target": { "channel": "ch_caller" },
+  "args": { "profile": "latching",
+            "targets": [ { "aor": "sip:201@pbx.example.com" },
+                         { "uri": "sip:+15550100@trunk.example.com",
+                           "profile": "sdes_srtp" } ] } }
+```
+
+siphon makes one allocation per profile the branches name, each offered the
+caller's SDP, and sends every branch the anchored offer of its own profile; a
+sequential hunt offers each attempt its target's. A branch's early media and
+its answer go through its own allocation, shaped by its own profile, and the
+branch that answers settles the call on that allocation; the others are
+released. An unknown profile, on the dial or on any target, fails the dial as
+before (`unavailable`) with nothing allocated and nothing rung. A connecting
+dial anchors every branch or none: when the dial names no `profile`, either
+every target names one or none does, and a mix is `bad_request`. The caller
+sees one dialog whichever branch answers, as on any fork: early media from a
+branch on one profile and an answer from a branch on another reach it with
+different session descriptions, exactly as the raw SDP of two phones does on an
+unanchored fork.
+
 `strategy` is `parallel` (default) or `sequential`; `timeout` is the ring
 timeout in seconds (default 30). Dialling a call that is already answered is
 `invalid_state` — answering first is what the verb exists to avoid, since it
@@ -1655,6 +1689,55 @@ ringback. That refusal carries
 where `call_state` is the state the call was found in, so a controller can tell
 it from any other `invalid_state` without reading the message. A caller the app answered on purpose, to play it prompts first, is
 what `on_answer: "bridge"` is for.
+
+**When a sequential dial stops.** A `sequential` dial tries its targets one at
+a time and, by default, moves on when one ends unanswered. A connecting dial
+moves on when a target rings out or fails with a reroute cause (`408`, `500`,
+`502`, `503`, `504` unless `lcr.reroute_causes` says otherwise) and ends on any
+other failure, a `486` included; a bridging dial moves on from any failure.
+Two things end the dial on the target that just failed instead, with that
+target's own code in `DialFailed`, and no later target is rung:
+
+- **a `6xx`**, from any target, whatever it says. It is global: the callee is
+  known and will not take the call anywhere (RFC 3261 §21.6), and a proxy MUST
+  NOT start new branches after one (§16.7 step 5). On a `parallel` dial a `6xx`
+  also CANCELs the branches still ringing.
+- **a target that rang, with `reroute_after_progress: false`.** Either target
+  form (`{uri}` or `{aor}`, which hands it to every contact) may carry
+  `reroute_after_progress`, a boolean, default `true`. Set to `false`, a
+  target that has shown progress — a `101`-`199` from the far end, not the
+  hop-by-hop `100` — ends the dial on whatever comes next: its ring timeout
+  (`408`, `timed_out: true`), a busy, a decline, a `408` or a `503`. This is
+  the setting for a hunt across several routes to the **same** destination
+  (redundant SBCs or proxies in front of one PBX): once a route has rung the
+  person, the next route would only ring them again, and retry a busy.
+
+Two outcomes still move a `reroute_after_progress: false` target on:
+
+- a target that **never rang**: no response before its ring timeout, an
+  INVITE the transport would not take, or a failure before any `101`-`199`.
+  It reached nobody, which is exactly when the next route should be tried.
+- a **`503` carrying `Retry-After`**, even after progress. That is the element
+  saying it is overloaded or down for maintenance (RFC 3261 §21.5.4), the case
+  a redundant proxy is there for, not the callee's answer. A `503` without
+  `Retry-After` after progress ends the dial.
+
+The field is the one a [`route`](#route) target has, pointing the same way
+(`false` keeps the call on a target that rang). Two differences: its default on
+`dial` is `true`, since a hunt through phones moves on when a phone rings out,
+and on `dial` it also covers a target's final failures, where a `route` carrier
+that rang still fails over on its reroute causes. A `parallel` dial ignores it:
+there is no next target to stop. Anything but a boolean is `bad_request` before
+anything is rung.
+
+```json
+{ "verb": "dial", "target": { "channel": "ch_caller" },
+  "args": { "strategy": "sequential", "timeout": 25,
+            "targets": [ { "uri": "sip:204@pbx.example", "next_hop": "sip:192.0.2.21:5060",
+                           "reroute_after_progress": false },
+                         { "uri": "sip:204@pbx.example", "next_hop": "sip:192.0.2.22:5060",
+                           "reroute_after_progress": false } ] } }
+```
 
 ### `dial {on_answer: "bridge"}` — ring phones for an answered caller
 
@@ -1691,12 +1774,49 @@ the same rules as above and keeps the host it names. Unlike a connecting dial, n
 INVITE headers reach the phones: each leg is a fresh call. `timeout` is how long
 each phone rings; the dial as a whole rings for `timeout` (parallel) or
 `timeout` × the number of phones (sequential). `profile` names the media profile
-each phone is anchored with, the caller's own by default. It describes the
+each phone is anchored with, the caller's own by default, and a target's own
+`profile` anchors that phone's leg instead. It describes the
 **phone**, not the pair: it shapes the phone's answer when it picks up and the
 bridge's offer to it, while the caller is re-INVITEd with its own profile's
 answer half. So a caller answered with plain RTP and a dial naming an SRTP
 profile join an SRTP phone to a plain-RTP caller, each on the media it was
 anchored with.
+
+**Early offer.** By default each phone's INVITE goes out with no SDP (a delayed
+offer): the phone offers in its 2xx, siphon answers it locally on the ACK, and
+the bridge then re-INVITEs the phone with the pair's media. Some peers, trunks
+in particular, refuse an INVITE without SDP outright. `offer: "early"` makes
+each phone's INVITE carry an offer instead; `offer` may also be named per
+target, over the dial's, and `"delayed"` is today's behaviour:
+
+```json
+{ "verb": "dial", "target": { "channel": "ch_caller" },
+  "args": { "on_answer": "bridge", "offer": "early",
+            "targets": [ "sip:201@pbx.example.com",
+                         { "uri": "sip:+15550100@trunk.example.com",
+                           "profile": "sdes_srtp" } ] } }
+```
+
+The offer is what the bridge would have offered the phone, made before the
+INVITE instead of after the answer: the media engine offers the caller's media
+description, under the phone's profile, on an allocation of the phone's own
+beside the caller's session. The phone answers in its 2xx (RFC 3264 §5), the
+ACK carries no SDP, and when the phone is bridged its answer completes its
+allocation and only the caller is re-INVITEd: the phone keeps the offer/answer
+it made on its INVITE. A phone that is not bridged (it lost, failed, was
+cancelled, timed out, or the caller hung up) has its allocation deleted. The
+engine relays nothing on an allocation before its answer, so a phone's early
+media reaches nobody and the caller hears the ringback until the bridge; the
+2xx is the only response an answer is taken from, since siphon offers no
+`100rel` on these legs. A 2xx with no SDP leaves the offer unanswered (RFC 3261
+§13.2.1): the phone is ACKed and BYEd and reported as a `DialBranchFailed`
+with code `488`. An unknown `offer` value is `bad_request` (`reason:
+"unknown_value"`), as is `offer` on a connecting dial (`reason:
+"requires_bridge"`), whose branches carry the caller's own offer. An early
+offer is made from the caller's own session, so a caller whose session relays
+to another party since an earlier bridge is refused `invalid_state` with
+`reason: "caller_relaying"`; dial it with `offer: "delayed"`. The reply's
+`offer` names the dial's mode.
 
 **Ringback.** `ringback` is a tone preset or cadence (`"ringback_eu"`,
 `"425/1000,0/4000*inf"`, anything [`play {tone}`](#phase-1-verb-set) takes),
