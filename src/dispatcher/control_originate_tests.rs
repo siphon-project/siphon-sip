@@ -68,8 +68,13 @@ pub(super) fn controller_on(app: &str, dispatcher: TestDispatcher) -> Controller
         OriginateRail {
             bus: Arc::clone(&bus),
             dispatcher: Arc::clone(&dispatcher) as Arc<dyn DispatcherHandle>,
-            prepare: Box::new(move |params, contact_host| {
-                prepare_originate_with_contact_host(&staged_on.state, params, contact_host)
+            prepare: Box::new(move |params, contact_host, contact_user| {
+                prepare_originate_with_contact_host(
+                    &staged_on.state,
+                    params,
+                    contact_host,
+                    contact_user,
+                )
             }),
             dial: Box::new(move |prepared| dial_originate(&dialled_on.state, prepared)),
             create_group: Box::new(move |spec, sink| {

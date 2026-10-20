@@ -177,15 +177,18 @@ fn the_public_surface_is_pinned() {
     // `b2bua.originate(route=…)` pre-loads a route set through, plus the 2
     // crate-internal items a script dials behind siphon's own early answer
     // through: `b2bua_dial_refusal` and `b2bua_progress_call_anchored_from`,
+    // plus the 2 crate-internal items the `contact_user` twin of `contact_host`
+    // goes through: the check of that user and setting it on the caller's
+    // side of a call (the originate entry point and the refusal are shared),
     // plus the 2 crate-internal items a bridging dial's `offer` argument goes
     // through: the `DialOffer` mode and `any_early_offer`.
     // All additive, so a minor-compatible change — recorded here because that
     // is the tripwire.
     assert_eq!(
         declared + re_exported,
-        108,
+        110,
         "the dispatcher's public surface is {} items ({declared} declared here, \
-         {re_exported} re-exported), not 108. Adding one is a semver commitment on a \
+         {re_exported} re-exported), not 110. Adding one is a semver commitment on a \
          published crate; removing one breaks embedders. An extraction should move the \
          declaration and add a `pub use`, leaving this total unchanged.",
         declared + re_exported,

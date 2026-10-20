@@ -335,6 +335,11 @@ pub struct Route {
     /// controller's to know, not a rating decision.
     #[serde(skip)]
     pub contact_host: Option<String>,
+    /// The user part siphon presents in its own `Contact` on this attempt's
+    /// leg, when a controller `route` or sequential `dial` target named one
+    /// (`contact_user`). Not part of the LCR API, like `contact_host`.
+    #[serde(skip)]
+    pub contact_user: Option<String>,
     /// This attempt is a target of a sequential controller `dial` (a hunt),
     /// which ends on the hunt's own rule as well as on the reroute causes: a
     /// 6xx ends it, and so does any failure of a target that showed progress

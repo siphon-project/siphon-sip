@@ -121,9 +121,19 @@ impl ShutdownSignal {
         let _ = self.watch_rx.wait_for(|&v| v).await;
     }
 
-    /// Receive the next shutdown phase.
+    /// Receive the next shutdown phase. `None` only once the coordinator is
+    /// gone: a receiver that fell behind skips to the oldest phase still held
+    /// rather than reading the lag as the end of shutdown.
     pub async fn recv_phase(&mut self) -> Option<ShutdownPhase> {
-        self.broadcast_rx.recv().await.ok()
+        loop {
+            match self.broadcast_rx.recv().await {
+                Ok(phase) => return Some(phase),
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    warn!(skipped, "shutdown phase receiver fell behind, reading on");
+                }
+                Err(broadcast::error::RecvError::Closed) => return None,
+            }
+        }
     }
 
     /// Check if shutdown has been signalled (non-blocking).
@@ -233,6 +243,28 @@ mod tests {
         // Then ForceTerminate after timeout
         let phase = signal.recv_phase().await.unwrap();
         assert_eq!(phase, ShutdownPhase::ForceTerminate);
+    }
+
+    #[tokio::test]
+    async fn a_lagged_phase_receiver_reads_on_rather_than_ending() {
+        let coord = ShutdownCoordinator::new(Duration::from_secs(30));
+        let mut signal = coord.subscribe();
+        // More phases than the channel holds, so the receiver lags.
+        for _ in 0..20 {
+            let _ = coord.inner.broadcast_tx.send(ShutdownPhase::Draining);
+        }
+        let _ = coord.inner.broadcast_tx.send(ShutdownPhase::ForceTerminate);
+        let mut last = None;
+        while let Ok(Some(phase)) =
+            tokio::time::timeout(Duration::from_millis(50), signal.recv_phase()).await
+        {
+            last = Some(phase);
+        }
+        assert_eq!(
+            last,
+            Some(ShutdownPhase::ForceTerminate),
+            "the lag is skipped and the newest phase still arrives"
+        );
     }
 
     #[tokio::test]
