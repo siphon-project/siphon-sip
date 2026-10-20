@@ -82,6 +82,45 @@ pub struct DialTarget {
     /// others do not is offered an allocation of its own, and the branch that
     /// answers is answered through it (see `dial_media`).
     pub profile: Option<String>,
+    /// When this branch's INVITE carries its SDP offer, over the dial's own.
+    /// Only a bridging dial places its legs itself, so only it reads this.
+    pub offer: Option<DialOffer>,
+}
+
+/// When a leg a bridging `dial` places carries its SDP offer.
+///
+/// Every leg of a bridging dial is a call siphon places itself, with no
+/// caller's INVITE behind it to take an offer from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DialOffer {
+    /// The INVITE goes out with no SDP: the callee offers in its 2xx and siphon
+    /// answers in the ACK (RFC 3261 §13.2.1, RFC 3264 §5). What a bridging dial
+    /// has always done.
+    #[default]
+    Delayed,
+    /// The INVITE carries an offer the media engine allocated for the leg from
+    /// the caller's media description, and the callee answers in its 2xx. For
+    /// peers that refuse a delayed-offer INVITE.
+    Early,
+}
+
+impl DialOffer {
+    /// The offer mode named `text` (`early` / `delayed`).
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "early" => Some(Self::Early),
+            "delayed" => Some(Self::Delayed),
+            _ => None,
+        }
+    }
+
+    /// The name the control plane uses.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Delayed => "delayed",
+            Self::Early => "early",
+        }
+    }
 }
 
 impl DialTarget {

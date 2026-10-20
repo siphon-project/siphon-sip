@@ -150,6 +150,8 @@ mod control_dial_bridge_fallback_tests;
 #[cfg(test)]
 mod control_dial_bridge_from_host_tests;
 #[cfg(test)]
+mod control_dial_bridge_offer_tests;
+#[cfg(test)]
 mod control_dial_bridge_tests;
 #[cfg(test)]
 mod control_dial_contact_host_tests;
@@ -379,7 +381,7 @@ pub use b2bua::{
 // `public_api_surface` all the same — the point of the count is that the module
 // does not grow a surface by accident, published or not.
 pub(crate) use b2bua::{
-    b2bua_accept_refer_call_dialling, b2bua_accept_refer_controller_with_state,
+    any_early_offer, b2bua_accept_refer_call_dialling, b2bua_accept_refer_controller_with_state,
     b2bua_accept_refer_script, b2bua_cancel_dial_with_state, b2bua_complete_refer,
     b2bua_complete_refer_with_state, b2bua_dial_call, b2bua_drop_call, b2bua_media_profile,
     b2bua_originate_group_create, b2bua_originate_group_start,
@@ -391,11 +393,11 @@ pub(crate) use b2bua::{
     dial_bridge_spec, dial_bridge_start, dial_targets_for_aor, forget_sent_info,
     set_caller_contact_host, CallerContactHostRefusal, ControllerReferRefusal, DialBridgeCaller,
     DialBridgeListener, DialBridgePlan, DialBridgeRefusal, DialBridgeSender, DialBridgeSignal,
-    DialBridgeStartError, DialCancelRefusal, DialError, DialShaping, DialTarget, DispatcherHandle,
-    DropOutcome, OriginateGroupAnswers, OriginateGroupFailure, OriginateGroupSink,
-    OriginateGroupSpec, OriginateGroupStrategy, OriginateGroupWinner, OriginateLegProgress,
-    ReplacementDial, RunningDispatcher, DIAL_BRIDGE_CALLER_GONE, DIAL_CANCELLED,
-    DIAL_RINGBACK_ORIGIN,
+    DialBridgeStartError, DialCancelRefusal, DialError, DialOffer, DialShaping, DialTarget,
+    DispatcherHandle, DropOutcome, OriginateGroupAnswers, OriginateGroupFailure,
+    OriginateGroupSink, OriginateGroupSpec, OriginateGroupStrategy, OriginateGroupWinner,
+    OriginateLegProgress, ReplacementDial, RunningDispatcher, DIAL_BRIDGE_CALLER_GONE,
+    DIAL_CANCELLED, DIAL_RINGBACK_ORIGIN,
 };
 pub(crate) use b2bua::{b2bua_dial_refusal, b2bua_progress_call_anchored_from};
 pub(crate) use charging::{ro_answer_ocs_request, ro_bind_call, RO_CONTROL};

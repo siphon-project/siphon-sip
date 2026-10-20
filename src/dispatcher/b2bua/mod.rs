@@ -14,6 +14,7 @@
 mod ack;
 mod b_leg;
 mod bridge;
+mod bridge_offered;
 mod bridge_relay;
 mod builders;
 mod bye;
@@ -38,8 +39,10 @@ mod info;
 mod info_outbound;
 mod invite;
 mod late_prack_offer;
+mod leg_offer;
 mod on_failure;
 mod originate;
+mod originate_auth;
 mod originate_cancel;
 mod originate_group;
 mod originate_media;
@@ -96,6 +99,10 @@ pub use info::*;
 pub use info_outbound::*;
 pub use invite::*;
 pub use late_prack_offer::*;
+pub(crate) use leg_offer::{
+    allocate_leg_offer, leg_offer_session, offered_leg_answer, NO_ANSWER_STATUS,
+};
+pub use leg_offer::{any_early_offer, LegOfferCaller};
 pub use on_failure::*;
 pub use originate::*;
 pub use originate_cancel::*;

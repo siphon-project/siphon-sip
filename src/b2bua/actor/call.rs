@@ -498,6 +498,9 @@ pub struct CallActor {
     /// it the callee's offer stays unanswered. `None` until the 2xx is answered,
     /// and for every call whose INVITE carried the offer.
     pub originate_answer_sdp: Option<String>,
+    /// The allocation an anchored originate's INVITE offered (`offer: "early"`
+    /// on a bridging dial); `None` for an offerless one. See [`OriginateOffer`].
+    pub originate_offer: Option<OriginateOffer>,
     /// The SDP answer siphon's own 18x gave the caller, and whether the media
     /// engine anchors it. The 2xx that follows repeats that answer (RFC 3264
     /// §4), and a dial connects the callee behind it. `None` until siphon sends
@@ -625,6 +628,7 @@ impl CallActor {
             originated: false,
             originate_anchor: None,
             originate_answer_sdp: None,
+            originate_offer: None,
             early_media_anchor: None,
             bridge: None,
             fork_dispatching: false,
