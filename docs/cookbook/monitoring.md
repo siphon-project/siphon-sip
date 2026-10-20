@@ -37,6 +37,7 @@ SIPhon exports built-in gauges/counters; the ones worth alerting on:
 | `siphon_gateway_inbound_calls_refused_total{group,reason}` | sustained `rate() > 0` | A carrier is being turned away at its group's `inbound_limit`. Either it is sending more than was agreed, or the limit is set below what was |
 | `siphon_gateway_inbound_calls_active{group}` / `siphon_gateway_inbound_max_concurrent_calls{group}` | ratio above your headroom | A carrier is close to its ceiling. Only groups with an `inbound_limit` have these series, and they are refreshed every 30 s |
 | `siphon_registrant_source_last_success_timestamp_seconds` / `_failures_total` | same pair | Outbound trunk registrations, tracked separately — a node can route over stale carriers with current registrations, or the reverse |
+| `siphon_event_consumer_lagged_total{consumer}` | `increase() > 0` | A registration consumer fell more than its queue behind and lost events. `registrar` (`@registrar.on_change` + `RegistrationChanged`) and `registrant` (`@registration.on_change`) recover by re-reporting every AoR as a snapshot; `rf_register` cannot, so those registration changes went uncharged. Usually a slow `on_change` handler under a registration storm |
 
 See [Handler execution model](../handler-execution-model.md) for the pool internals.
 

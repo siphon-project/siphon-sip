@@ -734,6 +734,7 @@ pub(super) fn spawn_rf_register_emitter(
     mut events: tokio::sync::broadcast::Receiver<crate::registrar::RegistrationEvent>,
 ) {
     use crate::diameter::ro::{ImsChargingData, NodeRole};
+    use crate::metrics::event_lag::{record_lag, LaggedConsumer};
     use crate::registrar::RegistrationEvent;
 
     tokio::spawn(async move {
@@ -742,7 +743,9 @@ pub(super) fn spawn_rf_register_emitter(
             let event = match events.recv().await {
                 Ok(event) => event,
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                    warn!(skipped, "rf: registrar event emitter lagged");
+                    // A lost ACR-EVENT is a charging record, not state: count it.
+                    record_lag(LaggedConsumer::RfRegister, skipped);
+                    warn!(skipped, "rf: registrar events lagged, ACR-EVENTs lost");
                     continue;
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,

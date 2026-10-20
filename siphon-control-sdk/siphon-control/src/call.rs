@@ -8,7 +8,7 @@
 use pyo3::prelude::*;
 
 use siphon_control_client::sip::{
-    Call as RustCall, DialOptions, Dialing, DtmfOptions, PlayOptions, RecordOptions,
+    Call as RustCall, CallerContact, DialOptions, Dialing, DtmfOptions, PlayOptions, RecordOptions,
     ResponseOptions, Ringback, StreamOptions, TransferDial, TransferTarget,
 };
 
@@ -116,26 +116,39 @@ impl Call {
     /// host changes, and every later Contact siphon presents the caller carries
     /// it. Once an 18x or 2xx went out it is fixed: the same host again is
     /// accepted, another raises ``ControlError`` ``invalid_state``.
-    #[pyo3(signature = (*, contact_host=None))]
+    ///
+    /// ``contact_user`` (on the same verbs) is the user part of that
+    /// ``Contact``, which is otherwise userless
+    /// (``<sip:trunk-7@sbc.example.net:5061;transport=tls>``), for a peer that
+    /// identifies the trunk or account by it. An RFC 3261 SIP URI user: an
+    /// empty or invalid one raises ``bad_request``. It sticks exactly as
+    /// ``contact_host`` does: another one after an 18x or 2xx raises
+    /// ``invalid_state`` with ``details["reason"] == "contact_already_presented"``.
+    #[pyo3(signature = (*, contact_host=None, contact_user=None))]
     fn answer<'py>(
         &self,
         py: Python<'py>,
         contact_host: Option<String>,
+        contact_user: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let call = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            match contact_host {
-                Some(host) => {
-                    call.answer_with_options(&ResponseOptions::default().contact_host(host))
-                        .await
-                }
-                None => call.answer().await,
+            if contact_host.is_none() && contact_user.is_none() {
+                call.answer().await
+            } else {
+                call.answer_with_options(&ResponseOptions {
+                    contact_host,
+                    contact_user,
+                    ..ResponseOptions::default()
+                })
+                .await
             }
             .map_err(to_pyerr)
         })
     }
 
-    #[pyo3(signature = (code, reason=None, body=None, content_type=None, *, contact_host=None))]
+    #[pyo3(signature = (code, reason=None, body=None, content_type=None, *, contact_host=None, contact_user=None))]
+    #[allow(clippy::too_many_arguments)]
     fn answer_with<'py>(
         &self,
         py: Python<'py>,
@@ -144,6 +157,7 @@ impl Call {
         body: Option<String>,
         content_type: Option<String>,
         contact_host: Option<String>,
+        contact_user: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let call = self.inner.clone();
         let options = ResponseOptions {
@@ -152,6 +166,7 @@ impl Call {
             body,
             content_type,
             contact_host,
+            contact_user,
             ..ResponseOptions::default()
         };
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
@@ -190,31 +205,30 @@ impl Call {
     ///     agent = await pick_an_agent(call)      # only the app knows when
     ///     await call.answer_anchored(profile="voice_ai")
     /// ```
-    #[pyo3(signature = (profile=None, ws_uri=None, *, contact_host=None))]
+    #[pyo3(signature = (profile=None, ws_uri=None, *, contact_host=None, contact_user=None))]
     fn answer_anchored<'py>(
         &self,
         py: Python<'py>,
         profile: Option<String>,
         ws_uri: Option<String>,
         contact_host: Option<String>,
+        contact_user: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let call = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            match contact_host {
-                Some(host) => {
-                    call.answer_with_options(&ResponseOptions {
-                        anchor: true,
-                        profile,
-                        ws_uri,
-                        contact_host: Some(host),
-                        ..ResponseOptions::default()
-                    })
+            if contact_host.is_none() && contact_user.is_none() {
+                call.answer_anchored(profile.as_deref(), ws_uri.as_deref())
                     .await
-                }
-                None => {
-                    call.answer_anchored(profile.as_deref(), ws_uri.as_deref())
-                        .await
-                }
+            } else {
+                call.answer_with_options(&ResponseOptions {
+                    anchor: true,
+                    profile,
+                    ws_uri,
+                    contact_host,
+                    contact_user,
+                    ..ResponseOptions::default()
+                })
+                .await
             }
             .map_err(to_pyerr)
         })
@@ -226,38 +240,50 @@ impl Call {
     /// RFC 3960 §3.1 puts early media on a response that carries SDP — two
     /// different acts, so two verbs. Ring for as long as your own policy says,
     /// then ``answer()``; open an early-media path with ``progress_with()``.
-    #[pyo3(signature = (reason=None, *, contact_host=None))]
+    #[pyo3(signature = (reason=None, *, contact_host=None, contact_user=None))]
     fn ring<'py>(
         &self,
         py: Python<'py>,
         reason: Option<String>,
         contact_host: Option<String>,
+        contact_user: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let call = self.inner.clone();
+        let contact = CallerContact {
+            host: contact_host,
+            user: contact_user,
+        };
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            match (reason, contact_host) {
-                (reason, Some(host)) => call.ring_with_contact_host(reason.as_deref(), &host).await,
-                (Some(reason), None) => call.ring_with_reason(&reason).await,
-                (None, None) => call.ring().await,
+            if contact != CallerContact::default() {
+                call.ring_with_caller_contact(reason.as_deref(), &contact)
+                    .await
+            } else if let Some(reason) = reason {
+                call.ring_with_reason(&reason).await
+            } else {
+                call.ring().await
             }
             .map_err(to_pyerr)
         })
     }
 
-    #[pyo3(signature = (*, contact_host=None))]
+    #[pyo3(signature = (*, contact_host=None, contact_user=None))]
     fn progress<'py>(
         &self,
         py: Python<'py>,
         contact_host: Option<String>,
+        contact_user: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let call = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            match contact_host {
-                Some(host) => {
-                    call.progress_with_options(&ResponseOptions::default().contact_host(host))
-                        .await
-                }
-                None => call.progress().await,
+            if contact_host.is_none() && contact_user.is_none() {
+                call.progress().await
+            } else {
+                call.progress_with_options(&ResponseOptions {
+                    contact_host,
+                    contact_user,
+                    ..ResponseOptions::default()
+                })
+                .await
             }
             .map_err(to_pyerr)
         })
@@ -687,10 +713,11 @@ impl Call {
     /// `targets` is a non-empty list of carriers tried cheapest-first: each entry
     /// is a bare URI `str` or a dict
     /// `{"uri", "next_hop"?, "headers"?, "timeout"?, "reroute_after_progress"?, "route"?,
-    /// "contact_host"?}`. A target's `contact_host` is the host of siphon's own
-    /// Contact on that attempt, as for `dial`; `caller_contact_host` is the
-    /// host of siphon's Contact toward the caller, as `contact_host` is on
-    /// `answer()`.
+    /// "contact_host"?, "contact_user"?}`. A target's `contact_host` is the host
+    /// of siphon's own Contact on that attempt, as for `dial`, and its
+    /// `contact_user` the user part of that Contact; `caller_contact_host` /
+    /// `caller_contact_user` are the host and user part of siphon's Contact
+    /// toward the caller, as `contact_host` / `contact_user` are on `answer()`.
     /// A target's `route` is the route set its attempt's INVITE carries, a list
     /// of Route values in name-addr form (`"<sip:scscf.example;lr>"`), topmost
     /// first; the attempt goes to the topmost entry unless `next_hop` pins it.
@@ -705,7 +732,7 @@ impl Call {
     /// Returns the reply `result` (`{"channel", "state": "routing", "targets": N}`).
     /// An empty / invalid `targets` list raises `ControlError` (`code ==
     /// "bad_request"`); a call that is already gone raises `code == "not_found"`.
-    #[pyo3(signature = (targets, strategy="sequential".to_string(), headers=None, *, caller_contact_host=None))]
+    #[pyo3(signature = (targets, strategy="sequential".to_string(), headers=None, *, caller_contact_host=None, caller_contact_user=None))]
     fn route<'py>(
         &self,
         py: Python<'py>,
@@ -713,6 +740,7 @@ impl Call {
         strategy: String,
         headers: Option<Bound<'py, PyAny>>,
         caller_contact_host: Option<String>,
+        caller_contact_user: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let mut route_targets = Vec::with_capacity(targets.len());
         for item in targets {
@@ -724,20 +752,21 @@ impl Call {
         };
         let call = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let value = match caller_contact_host {
-                Some(host) => {
-                    call.route_with_caller_contact_host(
-                        route_targets,
-                        Some(strategy.as_str()),
-                        extra_headers,
-                        &host,
-                    )
+            let caller_contact = CallerContact {
+                host: caller_contact_host,
+                user: caller_contact_user,
+            };
+            let value = if caller_contact == CallerContact::default() {
+                call.route(route_targets, Some(strategy.as_str()), extra_headers)
                     .await
-                }
-                None => {
-                    call.route(route_targets, Some(strategy.as_str()), extra_headers)
-                        .await
-                }
+            } else {
+                call.route_with_caller_contact(
+                    route_targets,
+                    Some(strategy.as_str()),
+                    extra_headers,
+                    &caller_contact,
+                )
+                .await
             }
             .map_err(to_pyerr)?;
             attach_if_running(|py| json_to_py(py, &value))
@@ -1063,7 +1092,9 @@ impl Call {
     /// ``caller_contact_host`` is the host of siphon's own ``Contact`` toward the
     /// caller, as ``contact_host`` is on ``answer()``; on a bridging dial, whose
     /// caller is answered already, it can only repeat the host that answer
-    /// carried (another raises ``invalid_state``).
+    /// carried (another raises ``invalid_state``). ``caller_contact_user`` is
+    /// the user part of that ``Contact``, as ``contact_user`` is on
+    /// ``answer()``, and sticks the same way.
     ///
     /// Either form may carry ``"contact_host"``, the host siphon presents in its
     /// own ``Contact`` on the branch (every branch of an AoR) in place of the
@@ -1071,7 +1102,10 @@ impl Call {
     /// by that host. Only the host changes, so in-dialog requests still reach the
     /// listener that sent the INVITE, and siphon keeps it as the leg's dialog
     /// Contact. The server refuses anything but a hostname or an IP address
-    /// with ``bad_request``.
+    /// with ``bad_request``. Either form may also carry ``"contact_user"``, the
+    /// user part of that ``Contact``, which is otherwise userless
+    /// (``<sip:trunk-7@sbc.example.net:5061;transport=tls>``); an empty or
+    /// invalid RFC 3261 user raises ``bad_request``.
     ///
     /// Either form may carry ``"reroute_after_progress"``, a ``bool`` (anything
     /// else raises ``TypeError``), sent only when given. The server's default
@@ -1162,6 +1196,7 @@ impl Call {
         on_answer=None,
         ringback=None,
         caller_contact_host=None,
+        caller_contact_user=None,
         offer=None,
     ))]
     #[allow(clippy::too_many_arguments)]
@@ -1182,6 +1217,7 @@ impl Call {
         on_answer: Option<String>,
         ringback: Option<Bound<'py, PyAny>>,
         caller_contact_host: Option<String>,
+        caller_contact_user: Option<String>,
         offer: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let options = DialOptions {
@@ -1198,6 +1234,7 @@ impl Call {
             privacy: extract_privacy("dial", privacy)?,
             on_answer: extract_dial_on_answer(on_answer, ringback)?,
             caller_contact_host,
+            caller_contact_user,
             offer: extract_dial_offer(offer)?,
         };
         let dial_targets = extract_dial_targets(&targets)?;

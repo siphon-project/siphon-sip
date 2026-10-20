@@ -1224,6 +1224,7 @@ fn place_leg(
         route: target.route.clone(),
         hide_from_host: target.hide_from_host,
         contact_host: target.contact_host.clone(),
+        contact_user: target.contact_user.clone(),
         // Offered in its INVITE when its target resolved to an early offer.
         early_offer: legs
             .early_offer

@@ -132,10 +132,22 @@ only those and costs the same at any registration count.
 @registrar.on_change
 def on_reg_change(aor, event_type, contacts):
     # event_type: "registered" | "refreshed" | "deregistered" | "expired"
+    #             | "snapshot"
     log.info(f"{aor} {event_type}: {len(contacts)} contact(s)")
 ```
 
 Use this to push presence, notify an external system, or emit charging events.
+
+`"snapshot"` is not a change. The registrar hands its events to the handler
+through a queue that holds 1024; a handler that falls further behind than that
+(a registration storm after a restart, against a slow handler) loses events.
+siphon then re-reports every registered AoR under `"snapshot"`, with its
+current contacts, and carries on with the events still queued, so a script
+that keeps its own copy of the bindings is whole again. An AoR whose bindings
+went away among the lost events is not in the snapshot. Each loss is logged
+and counted in `siphon_event_consumer_lagged_total{consumer="registrar"}`.
+`@registration.on_change` (outbound registrations) recovers the same way, with
+`consumer="registrant"`.
 
 ## Test it
 
