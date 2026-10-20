@@ -54,6 +54,8 @@ pub enum DialTarget {
         /// Host of siphon's own Contact on this branch. See
         /// [`DialTarget::contact_host`].
         contact_host: Option<String>,
+        /// Media profile for this branch alone. See [`DialTarget::profile`].
+        profile: Option<String>,
     },
     /// An address of record, forked to every contact registered against it.
     ///
@@ -77,6 +79,9 @@ pub enum DialTarget {
         /// Host of siphon's own Contact on every branch the AoR expands to.
         /// See [`DialTarget::contact_host`].
         contact_host: Option<String>,
+        /// Media profile for every branch the AoR expands to. See
+        /// [`DialTarget::profile`].
+        profile: Option<String>,
     },
 }
 
@@ -110,6 +115,7 @@ impl DialTarget {
             to: None,
             route: Vec::new(),
             contact_host: None,
+            profile: None,
         }
     }
 
@@ -127,6 +133,7 @@ impl DialTarget {
             to: None,
             route: Vec::new(),
             contact_host: None,
+            profile: None,
         }
     }
 
@@ -157,6 +164,7 @@ impl DialTarget {
             to: None,
             route: route.into_iter().map(Into::into).collect(),
             contact_host: None,
+            profile: None,
         }
     }
 
@@ -169,6 +177,7 @@ impl DialTarget {
             identity: TargetIdentity::default(),
             to: None,
             contact_host: None,
+            profile: None,
         }
     }
 
@@ -259,9 +268,34 @@ impl DialTarget {
         self
     }
 
+    /// Media profile for this branch alone (every branch an AoR expands to),
+    /// over the dial's own. A target without one inherits the dial's.
+    ///
+    /// One ring can then reach a phone behind NAT that needs a latching relay
+    /// and a trunk that asks for SDES-SRTP. The server refuses an unknown
+    /// profile name the way it refuses an unknown dial-level one, and on a
+    /// connecting dial that names no profile of its own it anchors every
+    /// branch or none: either every target names a profile or none does, and
+    /// a mix is `bad_request`.
+    pub fn profile(mut self, profile: impl Into<String>) -> Self {
+        match &mut self {
+            Self::Uri {
+                profile: media_profile,
+                ..
+            }
+            | Self::Aor {
+                profile: media_profile,
+                ..
+            } => {
+                *media_profile = Some(profile.into());
+            }
+        }
+        self
+    }
+
     pub(crate) fn to_json(&self) -> serde_json::Value {
         let mut object = serde_json::Map::new();
-        let (headers, identity, to, contact_host) = match self {
+        let (headers, identity, to, contact_host, profile) = match self {
             Self::Uri {
                 uri,
                 next_hop,
@@ -270,6 +304,7 @@ impl DialTarget {
                 to,
                 route,
                 contact_host,
+                profile,
             } => {
                 // A bare URI with no overrides is a plain string on the wire —
                 // the shape the server's own examples use. An identity counts
@@ -281,6 +316,7 @@ impl DialTarget {
                     && to.is_none()
                     && route.is_empty()
                     && contact_host.is_none()
+                    && profile.is_none()
                 {
                     return json!(uri);
                 }
@@ -291,7 +327,7 @@ impl DialTarget {
                 if !route.is_empty() {
                     object.insert("route".to_string(), json!(route));
                 }
-                (headers, identity, to, contact_host)
+                (headers, identity, to, contact_host, profile)
             }
             Self::Aor {
                 aor,
@@ -299,9 +335,10 @@ impl DialTarget {
                 identity,
                 to,
                 contact_host,
+                profile,
             } => {
                 object.insert("aor".to_string(), json!(aor));
-                (headers, identity, to, contact_host)
+                (headers, identity, to, contact_host, profile)
             }
         };
         if let Some(to) = to {
@@ -309,6 +346,9 @@ impl DialTarget {
         }
         if let Some(contact_host) = contact_host {
             object.insert("contact_host".to_string(), json!(contact_host));
+        }
+        if let Some(profile) = profile {
+            object.insert("profile".to_string(), json!(profile));
         }
         if !headers.is_empty() {
             object.insert("headers".to_string(), headers_to_json(headers));
@@ -948,6 +988,7 @@ mod tests {
             to: None,
             route: vec!["<sip:scscf.example.test;lr>".to_string()],
             contact_host: None,
+            profile: None,
         };
         assert_eq!(
             target.to_json(),
@@ -1001,6 +1042,57 @@ mod tests {
                 "next_hop": "sip:192.0.2.9:5060",
                 "contact_host": "tenant-a.example.com"
             })
+        );
+    }
+
+    /// A media profile defeats the bare-string shortcut on either target form,
+    /// or the branch would fall back to the dial's profile after all.
+    #[test]
+    fn a_targets_profile_goes_out_on_either_form() {
+        assert_eq!(
+            DialTarget::uri("sip:+15550199@trunk.example")
+                .profile("sdes_srtp")
+                .to_json(),
+            json!({"uri": "sip:+15550199@trunk.example", "profile": "sdes_srtp"})
+        );
+        assert_eq!(
+            DialTarget::aor("sip:204@pbx.example")
+                .profile("latching")
+                .to_json(),
+            json!({"aor": "sip:204@pbx.example", "profile": "latching"})
+        );
+        assert_eq!(
+            DialTarget::uri_via("sip:+15550199@trunk.example", "sip:192.0.2.9:5060")
+                .profile("sdes_srtp")
+                .contact_host("tenant-a.example.com")
+                .to_json(),
+            json!({
+                "uri": "sip:+15550199@trunk.example",
+                "next_hop": "sip:192.0.2.9:5060",
+                "contact_host": "tenant-a.example.com",
+                "profile": "sdes_srtp"
+            })
+        );
+        // A target without one carries no profile key and inherits the dial's.
+        assert_eq!(
+            DialTarget::uri("sip:1001@pbx.example").to_json(),
+            json!("sip:1001@pbx.example")
+        );
+        assert!(DialTarget::aor("sip:204@pbx.example")
+            .to_json()
+            .get("profile")
+            .is_none());
+    }
+
+    /// The last profile named on a target wins, as with every other builder.
+    #[test]
+    fn a_targets_profile_replaces_an_earlier_one() {
+        assert_eq!(
+            DialTarget::aor("sip:204@pbx.example")
+                .profile("sdes_srtp")
+                .profile("latching")
+                .to_json(),
+            json!({"aor": "sip:204@pbx.example", "profile": "latching"})
         );
     }
 

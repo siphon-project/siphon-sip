@@ -373,3 +373,37 @@ def test_reauthorization_refuses_bad_arguments():
     with pytest.raises(RuntimeError):
         asyncio.run(diameter.reauthorize(
             'absent', 'pcef.example;1', 'pcef.example', 'example', 'Gx'))
+
+
+def test_originate_records_the_request_and_resolves_to_its_answer():
+    import asyncio
+    from siphon_sdk.mock_module import MockDiameterAnswer
+    diameter = _fresh_diameter()
+    answer = asyncio.run(diameter.originate(
+        'CLR', 'S6a', [('User-Name', '001010000000001'), (1638, b'\x00\x00\x00\x02', 10415, False)],
+        'epc.example', destination_host='mme1.epc.example'))
+    assert answer.result_code == 2001
+    sent = diameter.originated[-1]
+    assert sent['command'] == 'CLR'
+    assert sent['destination_host'] == 'mme1.epc.example'
+    assert sent['avps'][1] == (1638, b'\x00\x00\x00\x02', 10415, False)
+    diameter.set_originate_outcome('IDR', 'S6a', MockDiameterAnswer(result_code=5001))
+    answer = asyncio.run(diameter.originate('IDR', 'S6a', [], 'epc.example'))
+    assert answer.result_code == 5001
+
+
+def test_originate_refuses_bad_arguments_and_raises_the_configured_failure():
+    import asyncio
+    import pytest
+    diameter = _fresh_diameter()
+    with pytest.raises(ValueError):
+        asyncio.run(diameter.originate('CLR', 'S6a', [('Origin-Host', 'x')], 'epc.example'))
+    with pytest.raises(ValueError):
+        asyncio.run(diameter.originate('CLR', 'S6a', [], ''))
+    with pytest.raises(ValueError):
+        asyncio.run(diameter.originate('CLR', 'Bogus', [], 'epc.example'))
+    with pytest.raises(TypeError):
+        asyncio.run(diameter.originate('CLR', 'S6a', [('User-Name',)], 'epc.example'))
+    diameter.set_originate_outcome('ALR', 'S6c', LookupError('no open Diameter connection'))
+    with pytest.raises(LookupError):
+        asyncio.run(diameter.originate('ALR', 'S6c', [], 'ims.example'))

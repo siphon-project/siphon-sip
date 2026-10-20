@@ -173,6 +173,7 @@ pub fn b2bua_terminate_call_inner(
     if let (Some(rtpengine_set), Some(media_sessions)) =
         (&state.rtpengine_set, &state.rtpengine_sessions)
     {
+        release_dial_branch_media(&sip_call_id, state);
         if let Some(session) = media_sessions.remove(&sip_call_id) {
             let set = Arc::clone(rtpengine_set);
             tokio::spawn(async move {
@@ -245,6 +246,7 @@ pub fn b2bua_release_transferred_call(internal_call_id: &str, state: &Dispatcher
     if let (Some(rtpengine_set), Some(media_sessions)) =
         (&state.rtpengine_set, &state.rtpengine_sessions)
     {
+        release_dial_branch_media(&sip_call_id, state);
         if let Some(session) = media_sessions.remove(&sip_call_id) {
             let set = Arc::clone(rtpengine_set);
             tokio::spawn(async move {

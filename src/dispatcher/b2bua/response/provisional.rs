@@ -98,7 +98,7 @@ pub fn b_leg_provisional(
         let has_sdp_body = !message.body.is_empty();
         if has_sdp_body {
             if let Err(error) =
-                control_dial_media_answer(call_id, message, response_source.ip(), state)
+                control_dial_media_answer(call_id, branch, message, response_source.ip(), state)
             {
                 error!(%call_id, %error, "control dial early media failed");
                 // Never forward an unanchored answer after promising a media

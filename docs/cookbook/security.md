@@ -386,6 +386,15 @@ substantial flow — see [`examples/ims_pcscf.py`](https://github.com/siphon-pro
 and the `ipsec:` config block. The SA lifetime tracks the registration lifetime
 automatically.
 
+Over UDP the four SAs are used as TS 33.203 clause 7.1 lays them out: the UE
+sends its requests from its protected client port to the P-CSCF's protected
+server port, and SIPhon sends every response to it from the P-CSCF's protected
+client port to the UE's protected server port, whatever the
+`rport` of the request says (TS 24.229 clause 5.2.2.2 NOTE 3). Over TCP the
+response goes on the connection the request arrived on.
+`request.fix_nated_register()` on a protected UDP request writes the UE's
+protected server port as `rport` (TS 24.229 clause 5.2.6.3.1).
+
 A re-REGISTER or de-REGISTER over the SA is not challenged again, and that
 rests on a chain of trust worth knowing. AKA nonces are single-use, so the UE
 cannot reuse its old `Authorization`. Instead the P-CSCF calls
