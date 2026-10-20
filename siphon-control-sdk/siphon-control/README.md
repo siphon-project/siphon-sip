@@ -169,6 +169,15 @@ reported as a failure. That is damage control, not a substitute for closing.
   identifies the tenant or account by that host. Only the host changes. Any target
   may also carry `"contact_user"`, the user part of that Contact
   (`<sip:trunk-7@sbc.example.net:5061;transport=tls>`), alone or beside `"contact_host"`.
+  A `dial` target of either form may also carry `"profile"`, the media profile for
+  that branch alone over the dial's own `profile`; a target without one inherits the
+  dial's. One ring can then reach a phone behind NAT that needs a latching relay and
+  a trunk that asks for SDES-SRTP. A connecting dial that names no `profile` anchors
+  every branch or none, so either every target names one or none does.
+  `offer="early"` (or `"offer"` on a target, which wins) sends each phone of an
+  `on_answer="bridge"` dial an SDP offer in its INVITE, allocated on the media engine
+  from the caller's media, for peers that refuse a delayed-offer INVITE; `"delayed"`
+  is the server's default. The server refuses `offer` on a connecting dial.
   With `on_answer="bridge"` it instead rings phones for a caller the app already
   answered and anchored (after a greeting or a menu), plays `ringback` (a tone
   preset or cadence, `True` for the default, `False` for none) while they alert, and

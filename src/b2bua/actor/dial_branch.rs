@@ -79,6 +79,9 @@ pub struct DialBranch {
     pub aor: Option<String>,
     /// `None` while it may still answer.
     pub outcome: Option<DialBranchOutcome>,
+    /// The media profile the branch was offered, when the dial anchors its
+    /// media. Its answer is put through the allocation made for this profile.
+    pub media_profile: Option<String>,
 }
 
 impl DialBranch {
@@ -90,7 +93,38 @@ impl DialBranch {
             target: target.to_string(),
             aor,
             outcome: None,
+            media_profile: None,
         }
+    }
+}
+
+/// The per-branch media of a controller `dial` whose targets name more than
+/// one media profile.
+///
+/// The dial's first profile is anchored in the call's media session, as a
+/// single-profile dial is. Every other profile is offered from an allocation of
+/// its own, held by the media session store beside it until a branch answers;
+/// what the call keeps here is what the B-legs are built from.
+#[derive(Debug, Clone, Default)]
+pub struct DialMedia {
+    /// The profile the B-leg INVITE about to be sent is offered, entered on its
+    /// branch when the leg is created ([`CallActor::record_dial_branch`]).
+    /// Set before each send so the branch is named before anything it answers
+    /// can arrive.
+    pub sending_profile: Option<String>,
+    /// The anchored offer of each profile other than the call's own media
+    /// session's, by profile name.
+    pub branch_offers: Vec<(String, Vec<u8>)>,
+}
+
+impl DialMedia {
+    /// The anchored offer made for `profile`, when it has an allocation of its
+    /// own.
+    pub fn branch_offer(&self, profile: &str) -> Option<&[u8]> {
+        self.branch_offers
+            .iter()
+            .find(|(name, _)| name == profile)
+            .map(|(_, offer)| offer.as_slice())
     }
 }
 
@@ -105,7 +139,10 @@ impl CallActor {
             return None;
         }
         let aor = self.control_dial_aor(target);
-        let branch = DialBranch::of_leg(leg, target, aor);
+        let mut branch = DialBranch::of_leg(leg, target, aor);
+        branch
+            .media_profile
+            .clone_from(&self.dial_media.sending_profile);
         self.dial_branches.push(branch.clone());
         Some(branch)
     }
@@ -117,6 +154,19 @@ impl CallActor {
             .iter()
             .find(|(uri, _)| uri == target)
             .map(|(_, aor)| aor.clone())
+    }
+
+    /// The media profile the B-leg whose INVITE rides Via `via_branch` was
+    /// offered, when it is a branch of the controller's dial that named one.
+    pub fn dial_branch_media_profile(&self, via_branch: &str) -> Option<String> {
+        if self.dial_branches.is_empty() {
+            return None;
+        }
+        let leg_id = &self.find_b_leg_by_branch(via_branch)?.1.id.0;
+        self.dial_branches
+            .iter()
+            .find(|branch| &branch.leg_id == leg_id)
+            .and_then(|branch| branch.media_profile.clone())
     }
 
     /// Settle the branch for `leg_id` as ended on `code` / `reason` for `cause`,

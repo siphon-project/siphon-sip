@@ -154,6 +154,18 @@ pub(super) fn originate_on(
         Err(message) => return ControlResult::error(ControlErrorCode::BadRequest, message),
     };
 
+    // An early offer is made from a caller's media, and an originate has no
+    // caller: the engine has no verb to offer from nothing. Refused rather
+    // than ignored, so a controller is never left with an offerless INVITE it
+    // asked not to send. A controller that needs an offer supplies `sdp`.
+    if args.get("offer").is_some_and(|offer| !offer.is_null()) {
+        return ControlResult::error_with_details(
+            ControlErrorCode::BadRequest,
+            "originate takes no offer argument: an early offer is made from a caller's media, \
+             which only a bridging dial has — supply args.sdp to send an offer",
+            serde_json::json!({ "verb": "originate", "argument": "offer", "reason": "no_caller" }),
+        );
+    }
     let media = match parse_originate_media(args) {
         Ok(media) => media,
         Err(message) => return ControlResult::error(ControlErrorCode::BadRequest, message),
@@ -463,6 +475,8 @@ fn originate_aor(
         total_timeout_secs,
         // `originate {aor}`: the first phone to answer is the call.
         answers: crate::dispatcher::OriginateGroupAnswers::First,
+        // Each phone is a callee of its own, with no caller to offer from.
+        early_offer: None,
     };
     let sink = Arc::new(ChannelGroupSink {
         bus: Arc::clone(bus),

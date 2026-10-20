@@ -20,6 +20,7 @@ pub mod diameter;
 mod diameter_cx;
 mod diameter_gba;
 mod diameter_kwargs;
+mod diameter_originate;
 pub mod diameter_server;
 pub mod gateway;
 pub mod ipsec;

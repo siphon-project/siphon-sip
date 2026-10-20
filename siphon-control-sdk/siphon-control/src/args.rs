@@ -8,9 +8,9 @@ use pyo3::prelude::*;
 
 use siphon_control_client::proto::sip::{PeerHangupPolicy, PlayRepeat};
 use siphon_control_client::sip::{
-    AorRing, DialOnAnswer, DialStrategy, DialTarget, OriginateMedia, OriginatePrivacy, PlaySource,
-    RecordChannels, RecordDirection, Ringback, RouteTarget, SessionRefresher, SessionTimer,
-    StreamChannels, StreamDirection, StreamMode, TargetIdentity,
+    AorRing, DialOffer, DialOnAnswer, DialStrategy, DialTarget, OriginateMedia, OriginatePrivacy,
+    PlaySource, RecordChannels, RecordDirection, Ringback, RouteTarget, SessionRefresher,
+    SessionTimer, StreamChannels, StreamDirection, StreamMode, TargetIdentity,
 };
 
 /// Extract one `route` target: a bare URI `str`, or a dict
@@ -103,11 +103,13 @@ pub(crate) fn extract_dial_targets(items: &[Bound<'_, PyAny>]) -> PyResult<Vec<D
 }
 
 /// Extract one `dial` target: a dict `{uri, next_hop?, headers?, to?, route?,
-/// contact_host?, contact_user?}` dialed as written, or `{aor, headers?, to?,
-/// contact_host?, contact_user?}` forked to every registered contact.
-/// `contact_host` is the host of siphon's own Contact on the branch (every
-/// branch of an AoR), for a peer that identifies the tenant by that host, and
-/// `contact_user` the user part of that Contact, otherwise userless.
+/// contact_host?, contact_user?, profile?, offer?}` dialed as written, or `{aor,
+/// headers?, to?, contact_host?, contact_user?, profile?, offer?}` forked to every
+/// registered contact. `contact_host` is the host of siphon's own Contact on the
+/// branch (every branch of an AoR), for a peer that identifies the tenant by that
+/// host, and `contact_user` the user part of that Contact, otherwise userless. `profile` is the media
+/// profile for that branch alone, over the dial's own; a target without one
+/// inherits the dial's.
 ///
 /// A bare string is refused although the server accepts one as a URI. The two
 /// forms do entirely different things — an AoR forks to every contact over that
@@ -128,6 +130,8 @@ fn extract_dial_target(item: &Bound<'_, PyAny>) -> PyResult<DialTarget> {
     let to = optional_string(dict, "to")?;
     let contact_host = optional_string(dict, "contact_host")?;
     let contact_user = optional_string(dict, "contact_user")?;
+    let profile = optional_string(dict, "profile")?;
+    let offer = extract_dial_offer(optional_string(dict, "offer")?)?;
     let route = extract_route_set(dict)?;
     let headers = match dict.get_item("headers")? {
         Some(value) if !value.is_none() => extract_headers(&value)?,
@@ -155,6 +159,8 @@ fn extract_dial_target(item: &Bound<'_, PyAny>) -> PyResult<DialTarget> {
             route,
             contact_host: None,
             contact_user: None,
+            profile: None,
+            offer: None,
         },
         (None, Some(aor)) => {
             if next_hop.is_some() {
@@ -189,6 +195,12 @@ fn extract_dial_target(item: &Bound<'_, PyAny>) -> PyResult<DialTarget> {
     }
     if let Some(contact_user) = contact_user {
         target = target.contact_user(contact_user);
+    }
+    if let Some(profile) = profile {
+        target = target.profile(profile);
+    }
+    if let Some(offer) = offer {
+        target = target.offer(offer);
     }
     Ok(target)
 }
@@ -235,6 +247,20 @@ pub(crate) fn extract_dial_strategy(strategy: Option<String>) -> PyResult<Option
 ///
 /// A ringback is refused on a connecting dial, as the server refuses it
 /// (`requires_bridge`): it would otherwise be sent and fail the whole dial.
+/// A dial's or a target's `offer`: `"early"` or `"delayed"`, `None` for the
+/// server's default.
+pub(crate) fn extract_dial_offer(offer: Option<String>) -> PyResult<Option<DialOffer>> {
+    offer
+        .map(|name| {
+            DialOffer::from_name(&name).ok_or_else(|| {
+                PyValueError::new_err(format!(
+                    "dial offer must be \"early\" or \"delayed\", not {name:?}"
+                ))
+            })
+        })
+        .transpose()
+}
+
 pub(crate) fn extract_dial_on_answer(
     on_answer: Option<String>,
     ringback: Option<Bound<'_, PyAny>>,

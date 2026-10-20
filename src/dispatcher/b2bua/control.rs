@@ -928,6 +928,8 @@ pub enum DialError {
     Media(String),
     /// An identity argument siphon cannot put on the wire.
     InvalidIdentity(String),
+    /// Media arguments that cannot be honoured together.
+    InvalidMedia(String),
 }
 
 impl std::fmt::Display for DialError {
@@ -944,8 +946,9 @@ impl std::fmt::Display for DialError {
             DialError::NoContacts(aor) => {
                 write!(formatter, "no registered contact for {aor}")
             }
-            DialError::Media(reason) => write!(formatter, "{reason}"),
-            DialError::InvalidIdentity(reason) => write!(formatter, "{reason}"),
+            DialError::Media(reason)
+            | DialError::InvalidIdentity(reason)
+            | DialError::InvalidMedia(reason) => write!(formatter, "{reason}"),
         }
     }
 }
@@ -1102,29 +1105,27 @@ pub(crate) fn b2bua_dial_call_with_state(
     check_branch_contact_hosts(&mut targets).map_err(DialError::InvalidIdentity)?;
     check_branch_contact_users(&mut targets).map_err(DialError::InvalidIdentity)?;
 
-    if let Some(profile) = shaping.profile.as_deref() {
-        let source_ip = state
-            .call_actors
-            .get_call(&internal_call_id)
-            .map(|call| call.a_leg.transport.remote_addr.ip())
-            .ok_or_else(|| DialError::Media("call is gone".into()))?;
-        template = control_dial_media_offer(&template, source_ip, profile, state)
-            .map_err(DialError::Media)?;
-        let Some(mut call) = state.call_actors.get_call_mut(&internal_call_id) else {
-            release_failed_call_media(sip_call_id, state);
+    // Each branch's media profile, its own over the dial's: one allocation per
+    // profile, the first the call's own session (see `dial_media`).
+    let primary_profile = super::dial_media::resolve_branch_profiles(&mut targets, shaping)?;
+    if let Some(primary) = primary_profile.as_deref() {
+        let dial_profile = shaping.profile.as_deref();
+        let anchored = super::dial_media::anchor_dial_media(
+            &internal_call_id,
+            &mut template,
+            &targets,
+            primary,
+            dial_profile,
+            state,
+        )?;
+        if !anchored {
             return Ok(false);
-        };
-        call.control_dial_media = true;
-        // One allocation serves every branch: they are all offered this body,
-        // and the attempts a sequential hunt makes later are rebuilt from the
-        // stored A-leg INVITE, which keeps the caller's own offer so a failed
-        // dial is still answerable into voicemail.
-        call.control_dial_offer = Some(template.body.clone());
+        }
     }
 
     // Behind an early answer siphon already gave the caller, the callee is
     // offered the engine's far leg (see `early_dial`), one target at a time.
-    if shaping.profile.is_none() {
+    if primary_profile.is_none() {
         if let Some(refusal) = super::dial_refusal(state, &internal_call_id, parallel) {
             return Err(DialError::Media(refusal));
         }
@@ -1233,11 +1234,20 @@ fn dial_parallel(
         // name and pinned host — on a template of its own. The dial's identity
         // is already on the shared template, so only a target that asked to
         // differ costs a clone.
-        let branch_template = branch_from.as_ref().map(|shaped| {
+        let mut branch_template = branch_from.as_ref().map(|shaped| {
             let mut own = template.clone();
             crate::sip::privacy::present_calling_identity(&mut own, shaped.header.clone());
             own
         });
+        // And its media profile's anchored offer, when that is not the call's own.
+        let profile = target.profile.as_deref();
+        super::dial_media::offer_branch_media(
+            call_id,
+            profile,
+            &mut branch_template,
+            template,
+            state,
+        );
         // Its number also goes through the tag-preserving substitution a
         // per-carrier LCR route uses, which carries it onto an asserted
         // identity the header policy let through.
@@ -1337,6 +1347,8 @@ fn sequential_dial_routes(
                 // has to carry for the same reason its route set does.
                 contact_host: target.contact_host,
                 contact_user: target.contact_user,
+                // The media profile its attempt is offered (see `dial_media`).
+                media_profile: target.profile,
                 ..Default::default()
             }
         })

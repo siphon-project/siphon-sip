@@ -73,8 +73,8 @@ pub use server::{ControlServer, ServerConfig};
 
 // Ergonomic top-level re-exports of the common SIP facade.
 pub use sip::{
-    AppEvent, AppEventStream, Call, CallEvent, CallStream, DialOptions, DialStrategy, DialTarget,
-    Dialing, DtmfOptions, PeerHangupPolicy, PlayOptions, PlaySource, RecordChannels,
+    AppEvent, AppEventStream, Call, CallEvent, CallStream, DialOffer, DialOptions, DialStrategy,
+    DialTarget, Dialing, DtmfOptions, PeerHangupPolicy, PlayOptions, PlaySource, RecordChannels,
     RecordDirection, RecordOptions, Recording, RouteTarget, SipClient, SipServer, StreamChannels,
     StreamDirection, StreamMode, StreamOptions,
 };

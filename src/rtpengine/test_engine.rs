@@ -45,6 +45,17 @@ pub(crate) struct TestEngine {
 impl TestEngine {
     /// Start the engine on a loopback port.
     pub(crate) async fn start(refuse_answers: bool) -> TestEngine {
+        Self::start_with(refuse_answers, false).await
+    }
+
+    /// Start the engine so that every `offer` is answered with [`ENGINE_SDP`]
+    /// labelled (`a=label:`, RFC 4574) with the engine call-id offered, so a
+    /// test can tell which allocation's offer a B-leg INVITE carries.
+    pub(crate) async fn start_naming_offers() -> TestEngine {
+        Self::start_with(false, true).await
+    }
+
+    async fn start_with(refuse_answers: bool, name_offers: bool) -> TestEngine {
         let socket = UdpSocket::bind("127.0.0.1:0")
             .await
             .expect("a loopback socket");
@@ -81,6 +92,16 @@ impl TestEngine {
                         (
                             "error-reason",
                             BencodeValue::string("refused by the test engine"),
+                        ),
+                    ]),
+                    "offer" if name_offers => BencodeValue::dict(vec![
+                        ("result", BencodeValue::string("ok")),
+                        (
+                            "sdp",
+                            BencodeValue::string(&format!(
+                                "{ENGINE_SDP}a=label:{}\r\n",
+                                field("call-id").unwrap_or_default()
+                            )),
                         ),
                     ]),
                     "offer" | "answer" => BencodeValue::dict(vec![
