@@ -111,6 +111,8 @@ pub struct OriginateRoute {
     /// [`DialTarget::contact_host`]). Kept as the leg's dialog local Contact,
     /// so every in-dialog request siphon sends on the leg presents it too.
     pub contact_host: Option<String>,
+    /// User part of siphon's own `Contact` on this leg ([`DialTarget::contact_user`]).
+    pub contact_user: Option<String>,
     /// Offer the leg in its INVITE (`offer: "early"` on a bridging dial):
     /// the caller it is offered from. The leg's anchor profile shapes the
     /// offer, made on an engine allocation of the leg's own
@@ -289,15 +291,7 @@ pub fn prepare_originate_routed(
             })?;
         }
     }
-    let contact_host = route
-        .contact_host
-        .as_deref()
-        .map(checked_contact_host)
-        .transpose()
-        .map_err(|detail| OriginateError::InvalidUri {
-            field: "contact_host",
-            detail,
-        })?;
+    let (contact_host, contact_user) = super::contact_user::checked_originate_contact(route)?;
 
     // Validate the media plan against the *configured* backend before anything
     // is created: a plan this deployment cannot serve must fail visibly at the
@@ -345,13 +339,14 @@ pub fn prepare_originate_routed(
     // identity, never `0.0.0.0` (see `pinned_sent_by`).
     let (via_host, via_port) = b_leg_sent_by(flow_local_addr, state, &transport);
 
-    // A `contact_host` replaces the Contact's host alone: the port and transport
-    // stay the socket's, so the phone's in-dialog requests still reach it.
+    // A `contact_host` replaces the Contact's host alone and a `contact_user`
+    // adds a user part: the port and transport stay the socket's, so the
+    // phone's in-dialog requests still reach it.
     let contact = build_b_leg_contact(
         contact_host.as_deref().unwrap_or(&via_host),
         via_port,
         transport,
-        None,
+        contact_user.as_deref(),
         None,
     );
     let identity = state.identity.load();

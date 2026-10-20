@@ -184,6 +184,7 @@ fn b_leg_invite(dispatcher: &TestDispatcher, callee: &str) -> SipMessage {
         None,
         None,
         None,
+        None,
         &[],
         &dispatcher.state,
     ));

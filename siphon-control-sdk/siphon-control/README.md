@@ -116,7 +116,7 @@ reported as a failure. That is damage control, not a substitute for closing.
 - `await client.connect()` / `await client.run()` — connect / drive (reconnect + resync).
 - `await client.command(verb, module=None, target=None, args=None)` — the generic
   `{module, verb, target, args}` primitive for any adapter (SIP today; SMPP/SS7 later).
-- `await client.originate(channel, to=None, *, aor=None, strategy=None, total_timeout=None, media=False, sdp=None, body=None, content_type=None, …, session_timer=None, contact_host=None)`
+- `await client.originate(channel, to=None, *, aor=None, strategy=None, total_timeout=None, media=False, sdp=None, body=None, content_type=None, …, session_timer=None, contact_host=None, contact_user=None)`
   — place an outbound call under a channel id you choose; resolves to the `Call` it
   placed once the INVITE is on the wire, so the answer, a rejection or the ring timeout
   arrive on `await call.next_event()` and `await call.hangup()` CANCELs or BYEs it
@@ -126,7 +126,8 @@ reported as a failure. That is damage control, not a substitute for closing.
   "refresher"}` runs an RFC 4028 session timer on the call, each key left out taking the
   server's default. `contact_host="tenant-a.example.com"` presents that host in siphon's
   own Contact on the call (on every leg with `aor=`), for a peer that identifies the
-  tenant by it. What the server would refuse raises `ValueError` before a frame goes out.
+  tenant by it, and `contact_user="trunk-7"` the user part of that Contact, which is
+  otherwise userless (`<sip:trunk-7@sbc.example.net:5061;transport=tls>`). What the server would refuse raises `ValueError` before a frame goes out.
 - `await client.describe()` — adapter schema.
 - `client.shutdown()` — stop the client and unblock `run()`.
 - `client.close()` — shutdown, plus drop the handler so nothing else is
@@ -152,15 +153,18 @@ reported as a failure. That is damage control, not a substitute for closing.
 - `Call` verbs: `answer()`, `answer_with(code, …)`, `answer_anchored(profile=None,
   ws_uri=None)`, `ring(reason=None)`, `progress()`, `reject(code, reason)`,
   `hangup(reason=None)`, `refer(to)` / `transfer(to)`, `route(targets, strategy="sequential",
-  headers=None, *, caller_contact_host=None)`. `answer`, `answer_with`, `answer_anchored`,
+  headers=None, *, caller_contact_host=None, caller_contact_user=None)`. `answer`, `answer_with`, `answer_anchored`,
   `ring` and `progress` take `contact_host=`, the host siphon presents in its own Contact
   toward the caller (fixed once an 18x or 2xx went out; another host is `invalid_state`),
-  and `dial` / `route` take the same as `caller_contact_host=`. Also
+  and `dial` / `route` take the same as `caller_contact_host=`. `contact_user=` /
+  `caller_contact_user=` on the same verbs set the user part of that Contact, which is
+  otherwise userless, and stick the same way. Also
   `set_header(name, value)`, `get_header(name)`, `remove_header(name)`,
   `set_var(key, value)`, `get_var(key)`, `command(verb, args=None)`, `next_event()`.
 - `await call.dial(targets, strategy=None, timeout=None, headers=None, profile=None,
   from_uri=None, from_display=None, p_asserted_identity=None, privacy=None,
-  on_answer=None, ringback=None)` rings B-legs
+  on_answer=None, ringback=None, caller_contact_host=None, caller_contact_user=None)`
+  rings B-legs
   while the caller stays **unanswered** and this app keeps the channel. Each target
   is a dict: `{"uri": ...}` is dialed as written, `{"aor": ...}` is forked to every
   registered contact over that contact's own captured flow, which is the only way to
@@ -172,7 +176,9 @@ reported as a failure. That is damage control, not a substitute for closing.
   with the Route the S-CSCF gave it. Any target (of `dial`, `{"uri"}` or `{"aor"}`,
   or of `route`) may carry `"contact_host"`, the host siphon presents in its own
   Contact on that leg in place of the address it advertises, for a peer that
-  identifies the tenant or account by that host. Only the host changes.
+  identifies the tenant or account by that host. Only the host changes. Any target
+  may also carry `"contact_user"`, the user part of that Contact
+  (`<sip:trunk-7@sbc.example.net:5061;transport=tls>`), alone or beside `"contact_host"`.
   Any target may also carry `"verify_server"` (a bool): verify the server
   certificate when that leg opens a new outbound TLS connection, over the gateway it
   routes to and the server's `tls.verify_server`.

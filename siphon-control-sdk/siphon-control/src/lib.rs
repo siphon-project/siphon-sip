@@ -395,7 +395,10 @@ impl ControlClient {
     /// siphon advertises, for a peer that identifies the tenant or account by
     /// that host; only the host changes, and every in-dialog request on the call
     /// presents it too. The server refuses anything but a hostname or an IP
-    /// address with `bad_request`.
+    /// address with `bad_request`. `contact_user="trunk-7"` sets the user part
+    /// of that Contact, which is otherwise userless
+    /// (`<sip:trunk-7@sbc.example.net:5061;transport=tls>`), alone or beside
+    /// `contact_host`; an empty or invalid RFC 3261 user is `bad_request`.
     ///
     /// `aor=` in place of `to` rings every phone registered at the AoR, each over
     /// its own flow and Path (RFC 5626 §5.3, RFC 3327 §5.3), as a `dial` to an
@@ -443,6 +446,7 @@ impl ControlClient {
         vars=None,
         session_timer=None,
         contact_host=None,
+        contact_user=None,
     ))]
     fn originate<'py>(
         &self,
@@ -470,6 +474,7 @@ impl ControlClient {
         vars: Option<Bound<'py, PyAny>>,
         session_timer: Option<Bound<'py, PyAny>>,
         contact_host: Option<String>,
+        contact_user: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let destination = match (to, aor) {
             (Some(to), None) if strategy.is_none() && total_timeout.is_none() => {
@@ -510,6 +515,7 @@ impl ControlClient {
                 .map(|timer| extract_session_timer(&timer))
                 .transpose()?,
             contact_host,
+            contact_user,
         };
         let inner = Arc::clone(&self.inner);
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
