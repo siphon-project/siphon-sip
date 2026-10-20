@@ -148,11 +148,15 @@ mod control_dial_bridge_fallback_tests;
 #[cfg(test)]
 mod control_dial_bridge_from_host_tests;
 #[cfg(test)]
+mod control_dial_bridge_hunt_progress_tests;
+#[cfg(test)]
 mod control_dial_bridge_tests;
 #[cfg(test)]
 mod control_dial_contact_host_tests;
 #[cfg(test)]
 mod control_dial_identity_tests;
+#[cfg(test)]
+mod control_dial_reroute_after_progress_tests;
 #[cfg(test)]
 mod control_dial_route_tests;
 #[cfg(test)]

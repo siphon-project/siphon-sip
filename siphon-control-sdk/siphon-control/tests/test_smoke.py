@@ -2207,6 +2207,77 @@ def test_play_sources_gain_and_number_shaping_roundtrip():
     asyncio.run(scenario())
 
 
+def test_dial_reroute_after_progress_roundtrip():
+    """`reroute_after_progress` goes out on a `dial` target of either form as
+    given, `False` included, stays off the wire when not given, and anything but
+    a bool raises `TypeError` before anything is sent."""
+
+    async def scenario():
+        frames = []
+        recorded = {}
+
+        def reply(frame):
+            return {"channel": "ch1", "state": "dialing", "targets": 3}
+
+        stub = _verb_stub({"dial"}, reply, frames)
+        async with websockets.serve(
+            stub, "127.0.0.1", 0, subprotocols=[SUBPROTOCOL]
+        ) as server:
+            port = server.sockets[0].getsockname()[1]
+            url = f"ws://127.0.0.1:{port}/control/ws"
+            client = ControlClient(app=APP, token=TOKEN, url=url)
+            done = asyncio.get_event_loop().create_future()
+
+            @client.on_call
+            async def handle(call):
+                await call.dial(
+                    [
+                        {
+                            "uri": "sip:204@pbx.example",
+                            "next_hop": "sip:192.0.2.21:5060",
+                            "reroute_after_progress": False,
+                        },
+                        {"aor": "sip:204@pbx.example", "reroute_after_progress": True},
+                        {"uri": "sip:204@pbx.example", "reroute_after_progress": None},
+                    ],
+                    strategy="sequential",
+                )
+                try:
+                    call.dial(
+                        [{"uri": "sip:204@pbx.example", "reroute_after_progress": "no"}],
+                        strategy="sequential",
+                    )
+                except TypeError as error:
+                    recorded["refused"] = str(error)
+                if not done.done():
+                    done.set_result(True)
+
+            await client.connect()
+            run_task = asyncio.ensure_future(client.run())
+            await asyncio.sleep(0.3)
+            await client.command("test_push_stasis")
+            await asyncio.wait_for(done, timeout=5)
+
+            assert len(frames) == 1, frames
+            assert frames[0]["verb"] == "dial"
+            assert frames[0]["args"]["targets"] == [
+                {
+                    "uri": "sip:204@pbx.example",
+                    "next_hop": "sip:192.0.2.21:5060",
+                    "reroute_after_progress": False,
+                },
+                {"aor": "sip:204@pbx.example", "reroute_after_progress": True},
+                "sip:204@pbx.example",
+            ]
+            assert "reroute_after_progress" in recorded.get("refused", ""), recorded
+
+            client.shutdown()
+            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+                await asyncio.wait_for(run_task, timeout=5)
+
+    asyncio.run(scenario())
+
+
 def test_contact_host_roundtrip():
     """`contact_host` goes out on a `dial` target of either form, on a `route`
     target and on `originate` (to and aor), and stays off the wire when not given."""

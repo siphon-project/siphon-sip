@@ -100,10 +100,12 @@ pub(crate) fn extract_dial_targets(items: &[Bound<'_, PyAny>]) -> PyResult<Vec<D
 }
 
 /// Extract one `dial` target: a dict `{uri, next_hop?, headers?, to?, route?,
-/// contact_host?}` dialed as written, or `{aor, headers?, to?, contact_host?}`
-/// forked to every registered contact. `contact_host` is the host of siphon's
-/// own Contact on the branch (every branch of an AoR), for a peer that
-/// identifies the tenant by that host.
+/// contact_host?, reroute_after_progress?}` dialed as written, or `{aor,
+/// headers?, to?, contact_host?, reroute_after_progress?}` forked to every
+/// registered contact. `contact_host` is the host of siphon's own Contact on
+/// the branch (every branch of an AoR), for a peer that identifies the tenant
+/// by that host. `reroute_after_progress` (a `bool`, server default `True`)
+/// set `False` ends a sequential dial on this target once it has rung.
 ///
 /// A bare string is refused although the server accepts one as a URI. The two
 /// forms do entirely different things — an AoR forks to every contact over that
@@ -123,6 +125,14 @@ fn extract_dial_target(item: &Bound<'_, PyAny>) -> PyResult<DialTarget> {
     let next_hop = optional_string(dict, "next_hop")?;
     let to = optional_string(dict, "to")?;
     let contact_host = optional_string(dict, "contact_host")?;
+    // A policy flag: anything but a real bool is refused, as the server refuses
+    // it, rather than read as the default and quietly left on the old rule.
+    let reroute_after_progress = match dict.get_item("reroute_after_progress")? {
+        Some(value) if !value.is_none() => Some(value.extract::<bool>().map_err(|_| {
+            PyTypeError::new_err("dial target 'reroute_after_progress' must be a bool")
+        })?),
+        _ => None,
+    };
     let route = extract_route_set(dict)?;
     let headers = match dict.get_item("headers")? {
         Some(value) if !value.is_none() => extract_headers(&value)?,
@@ -149,6 +159,7 @@ fn extract_dial_target(item: &Bound<'_, PyAny>) -> PyResult<DialTarget> {
             to: None,
             route,
             contact_host: None,
+            reroute_after_progress: None,
         },
         (None, Some(aor)) => {
             if next_hop.is_some() {
@@ -180,6 +191,9 @@ fn extract_dial_target(item: &Bound<'_, PyAny>) -> PyResult<DialTarget> {
     }
     if let Some(contact_host) = contact_host {
         target = target.contact_host(contact_host);
+    }
+    if let Some(reroute) = reroute_after_progress {
+        target = target.reroute_after_progress(reroute);
     }
     Ok(target)
 }

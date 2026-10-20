@@ -12,7 +12,11 @@
 //!   dialog released, ACK then BYE (§13.2.2.4, §15);
 //! * `parallel` rings every target at once; `sequential` rings them one at a
 //!   time in the order given, moving on when a leg fails or its own ring
-//!   timeout ends it;
+//!   timeout ends it, unless the hunt stops there
+//!   ([`crate::b2bua::actor::hunt_stops_at`]): on a 6xx, or on a leg that
+//!   rang and whose target does not reroute after progress. A 6xx also
+//!   CANCELs the legs of a parallel group still ringing (RFC 3261 §16.7
+//!   step 5);
 //! * the group as a whole has a deadline, and when it passes every leg still
 //!   ringing is CANCELled.
 //!
@@ -29,6 +33,11 @@ use std::time::Instant;
 
 use crate::b2bua::actor::{DialBranch, DialBranchCause, DialBranchOutcome};
 use crate::dispatcher::*;
+
+mod hunt_stop;
+
+use hunt_stop::failure_from_outcome;
+pub use hunt_stop::{originate_group_leg_failed, originate_group_leg_rejected};
 
 /// How an originate group rings its targets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -212,6 +221,11 @@ struct GroupLeg {
     /// Answered, and awaiting its creator's confirmation (a group whose
     /// answers are confirmed).
     answered: bool,
+    /// The far end sent a 101-199 on this leg.
+    progressed: bool,
+    /// Its target moves a sequential group on even after it has shown
+    /// progress ([`DialTarget::reroutes_after_progress`]).
+    reroute_after_progress: bool,
 }
 
 impl GroupLeg {
@@ -251,6 +265,11 @@ struct OriginateGroup {
     /// legs were CANCELled and nothing more is placed, but the answers already
     /// in are still the creator's to confirm or reject.
     expired: bool,
+    /// The leg whose outcome ended the hunt
+    /// ([`crate::b2bua::actor::hunt_stops_at`]): nothing more is placed, and
+    /// once no leg is ringing or awaiting confirmation the group fails with
+    /// that leg's own outcome.
+    stopped_by: Option<String>,
 }
 
 impl OriginateGroup {
@@ -269,6 +288,7 @@ impl OriginateGroup {
         if self.strategy == OriginateGroupStrategy::Sequential
             && self.next_target < self.targets.len()
             && !self.expired
+            && self.stopped_by.is_none()
         {
             self.placing = true;
             return Next::Place;
@@ -279,10 +299,11 @@ impl OriginateGroup {
                 OriginateError::Unroutable("no target could be dialled".to_string())
             }));
         }
-        Next::Failed(
-            Arc::clone(&self.sink),
-            failure_from_branches(group_id, self.branches()),
-        )
+        let failure = match self.stopped_leg() {
+            Some(stopper) => failure_from_outcome(group_id, stopper, self.branches()),
+            None => failure_from_branches(group_id, self.branches()),
+        };
+        Next::Failed(Arc::clone(&self.sink), failure)
     }
 
     fn branches(&self) -> Vec<DialBranch> {
@@ -305,6 +326,16 @@ fn failure_from_branches(group_id: &str, branches: Vec<DialBranch>) -> Originate
             .find(|outcome| outcome.code == code)
             .cloned()
     });
+    failure_of(group_id, chosen, branches)
+}
+
+/// A group's failure on `chosen`, the outcome it reports; `None` when no leg
+/// has one (nothing went out).
+fn failure_of(
+    group_id: &str,
+    chosen: Option<DialBranchOutcome>,
+    branches: Vec<DialBranch>,
+) -> OriginateGroupFailure {
     let (reason, code, response) = match chosen {
         Some(outcome) => (
             match outcome.cause {
@@ -350,6 +381,9 @@ struct EndedLeg {
     sink: Arc<dyn OriginateGroupSink>,
     branch: DialBranch,
     next: Next,
+    /// Legs still ringing that the ending stopped, to CANCEL (a 6xx on a
+    /// parallel group). Already settled as cancelled and unindexed.
+    stopped: Vec<GroupLeg>,
 }
 
 /// What a leg is to its group, in the leg index.
@@ -543,7 +577,13 @@ impl OriginateGroupStore {
 
     /// Add a placed leg to its group and index it. `false` when the group
     /// ended while the leg was being staged, so its INVITE must not go out.
-    fn attach_leg(&self, group_id: &str, internal_call_id: &str, branch: DialBranch) -> bool {
+    fn attach_leg(
+        &self,
+        group_id: &str,
+        internal_call_id: &str,
+        branch: DialBranch,
+        reroute_after_progress: bool,
+    ) -> bool {
         let Some(mut group) = self.groups.get_mut(group_id) else {
             return false;
         };
@@ -554,6 +594,8 @@ impl OriginateGroupStore {
             internal_call_id: internal_call_id.to_string(),
             branch,
             answered: false,
+            progressed: false,
+            reroute_after_progress,
         });
         self.legs.insert(
             internal_call_id.to_string(),
@@ -571,31 +613,41 @@ impl OriginateGroupStore {
         group.next_step(group_id)
     }
 
-    /// The live branch of a leg and its group's sink, for a progress report.
-    fn live_branch(
+    /// A provisional `code` on a leg: noted as progress when it is a 101-199
+    /// (a 100 is hop by hop and says nothing of the far end), and the live
+    /// branch of the leg and its group's sink returned for the report.
+    fn leg_progress(
         &self,
         internal_call_id: &str,
+        code: u16,
     ) -> Option<(String, Arc<dyn OriginateGroupSink>, DialBranch)> {
         let group_id = self.member_group(internal_call_id)?;
-        let group = self.groups.get(&group_id)?;
+        let mut group = self.groups.get_mut(&group_id)?;
         if group.concluded {
             return None;
         }
         let leg = group
             .legs
-            .iter()
+            .iter_mut()
             .find(|leg| leg.internal_call_id == internal_call_id && leg.is_live())?;
-        Some((
-            group_id.clone(),
-            Arc::clone(&group.sink),
-            leg.branch.clone(),
-        ))
+        if (101..=199).contains(&code) {
+            leg.progressed = true;
+        }
+        let branch = leg.branch.clone();
+        Some((group_id.clone(), Arc::clone(&group.sink), branch))
     }
 
     /// A leg ended on `outcome`. `None` when it is no group's live leg: an
     /// ordinary originate, or a leg its group already settled (a loser the
     /// win CANCELled, a leg a cancel ended).
-    fn leg_ended(&self, internal_call_id: &str, outcome: DialBranchOutcome) -> Option<EndedLeg> {
+    /// `retry_elsewhere` is whether the outcome is a `503` carrying
+    /// `Retry-After` ([`crate::b2bua::actor::is_retry_elsewhere`]).
+    fn leg_ended(
+        &self,
+        internal_call_id: &str,
+        outcome: DialBranchOutcome,
+        retry_elsewhere: bool,
+    ) -> Option<EndedLeg> {
         let (_, role) = self.legs.remove_if(internal_call_id, |_, role| {
             matches!(role, LegRole::Member(_))
         })?;
@@ -606,12 +658,18 @@ impl OriginateGroupStore {
         if group.concluded {
             return None;
         }
-        let leg = group
+        let index = group
             .legs
-            .iter_mut()
-            .find(|leg| leg.internal_call_id == internal_call_id && leg.is_live())?;
-        leg.branch.outcome = Some(outcome);
+            .iter()
+            .position(|leg| leg.internal_call_id == internal_call_id && leg.is_live())?;
+        let leg = &mut group.legs[index];
+        leg.branch.outcome = Some(outcome.clone());
         let branch = leg.branch.clone();
+        let stopped = group.stop_on(index, &outcome, retry_elsewhere);
+        for leg in &stopped {
+            self.legs
+                .insert(leg.internal_call_id.clone(), LegRole::Loser);
+        }
         let next = if group.placing {
             Next::Continue
         } else {
@@ -622,6 +680,7 @@ impl OriginateGroupStore {
             group_id,
             branch,
             next,
+            stopped,
         })
     }
 
@@ -830,6 +889,7 @@ impl OriginateGroupStore {
             group_id: group_id.to_string(),
             branch,
             next,
+            stopped: Vec::new(),
         })
     }
 }
@@ -871,6 +931,7 @@ pub fn create_originate_group(
             last_refusal: None,
             answers: spec.answers,
             expired: false,
+            stopped_by: None,
         },
     );
     Ok(group_id)
@@ -1161,10 +1222,12 @@ fn place_leg(
         .call_actors
         .get_call(&prepared.internal_call_id)
         .map(|call| DialBranch::of_leg(&call.a_leg, &target.uri, target.aor.clone()))?;
-    if !state
-        .originate_groups
-        .attach_leg(group_id, &prepared.internal_call_id, branch.clone())
-    {
+    if !state.originate_groups.attach_leg(
+        group_id,
+        &prepared.internal_call_id,
+        branch.clone(),
+        target.reroutes_after_progress(),
+    ) {
         // The group ended while this leg was staged: its INVITE never goes.
         state.call_actors.remove_call(&prepared.internal_call_id);
         state
@@ -1191,7 +1254,10 @@ pub fn originate_group_leg_progress(
     internal_call_id: &str,
     progress: OriginateLegProgress,
 ) {
-    if let Some((group_id, sink, branch)) = state.originate_groups.live_branch(internal_call_id) {
+    if let Some((group_id, sink, branch)) = state
+        .originate_groups
+        .leg_progress(internal_call_id, progress.code)
+    {
         sink.branch_progress(&group_id, &branch, &progress);
     }
 }
@@ -1204,18 +1270,7 @@ pub fn originate_group_leg_ended(
     internal_call_id: &str,
     outcome: DialBranchOutcome,
 ) {
-    let Some(ended) = state.originate_groups.leg_ended(internal_call_id, outcome) else {
-        return;
-    };
-    ended.sink.branch_ended(&ended.group_id, &ended.branch);
-    if let Err(refusal) = drive(state, &ended.group_id, ended.next) {
-        // Only a group that never placed a leg can end this way, and this
-        // group had one — the leg that just ended.
-        error!(
-            group_id = %ended.group_id,
-            "B2BUA: originate group reported placing nothing after a leg ended: {refusal}"
-        );
-    }
+    originate_group_leg_failed(state, internal_call_id, outcome, false);
 }
 
 /// What a 2xx on an originated call means for its group.
@@ -1424,6 +1479,7 @@ mod tests {
             last_refusal: None,
             answers: OriginateGroupAnswers::First,
             expired: false,
+            stopped_by: None,
         }
     }
 
@@ -1438,6 +1494,7 @@ mod tests {
                 "group",
                 &format!("leg-{index}"),
                 branch(&format!("sip:201@198.51.100.{index}"), None),
+                true,
             ));
         }
         store
@@ -1526,7 +1583,7 @@ mod tests {
         }
         assert!(store.start("group", Instant::now()));
         let _ = store.targets_to_place("group");
-        assert!(store.attach_leg("group", "leg-0", branch("a", None)));
+        assert!(store.attach_leg("group", "leg-0", branch("a", None), true));
         assert!(matches!(store.finish_placement("group"), Next::Continue));
         assert!(matches!(store.claim_answer("leg-0", 200), Claim::Won(_)));
         let refused = store
@@ -1674,7 +1731,8 @@ mod tests {
         assert!(store
             .leg_ended(
                 "leg-2",
-                DialBranchOutcome::new(487, "Request Terminated", DialBranchCause::Cancelled)
+                DialBranchOutcome::new(487, "Request Terminated", DialBranchCause::Cancelled),
+                false
             )
             .is_none());
         assert!(!store.contains("group"));
@@ -1691,10 +1749,12 @@ mod tests {
         assert!(matches!(store.finish_placement("group"), Next::Continue));
         let rejected = DialBranchOutcome::new(486, "Busy Here", DialBranchCause::Rejected);
         let first = store
-            .leg_ended("leg-0", rejected.clone())
+            .leg_ended("leg-0", rejected.clone(), false)
             .expect("a live leg");
         assert!(matches!(first.next, Next::Continue));
-        let last = store.leg_ended("leg-1", rejected).expect("a live leg");
+        let last = store
+            .leg_ended("leg-1", rejected, false)
+            .expect("a live leg");
         assert!(matches!(last.next, Next::Failed(_, _)));
         // Each leg's index entry went as it ended.
         assert_eq!(store.leg_count(), 0);
@@ -1711,18 +1771,19 @@ mod tests {
         );
         assert!(store.start("group", Instant::now()));
         let _ = store.targets_to_place("group");
-        assert!(store.attach_leg("group", "leg-0", branch("a", None)));
+        assert!(store.attach_leg("group", "leg-0", branch("a", None), true));
         let ended = store
             .leg_ended(
                 "leg-0",
                 DialBranchOutcome::new(503, "Service Unavailable", DialBranchCause::Unsent),
+                false,
             )
             .expect("a live leg");
         assert!(
             matches!(ended.next, Next::Continue),
             "the sibling is not out yet"
         );
-        assert!(store.attach_leg("group", "leg-1", branch("b", None)));
+        assert!(store.attach_leg("group", "leg-1", branch("b", None), true));
         assert!(matches!(store.finish_placement("group"), Next::Continue));
     }
 
@@ -1737,12 +1798,13 @@ mod tests {
         assert!(!store.start("group", Instant::now()), "a group starts once");
         let (first, _, _) = store.targets_to_place("group").expect("a target");
         assert_eq!(first.len(), 1);
-        assert!(store.attach_leg("group", "leg-0", branch("a", None)));
+        assert!(store.attach_leg("group", "leg-0", branch("a", None), true));
         assert!(matches!(store.finish_placement("group"), Next::Continue));
         let ended = store
             .leg_ended(
                 "leg-0",
                 DialBranchOutcome::new(486, "Busy Here", DialBranchCause::Rejected),
+                false,
             )
             .expect("a live leg");
         assert!(matches!(ended.next, Next::Place));
@@ -1751,6 +1813,214 @@ mod tests {
         assert!(store
             .targets_to_place("group")
             .is_some_and(|(rest, _, _)| rest.is_empty()));
+    }
+
+    /// A sequential group of three with its first leg, `leg-0`, ringing; that
+    /// leg's target moves on after progress when `reroute_after_progress`.
+    fn hunt_ringing(reroute_after_progress: bool) -> OriginateGroupStore {
+        let store = OriginateGroupStore::new();
+        store.insert(
+            "group".to_string(),
+            group(OriginateGroupStrategy::Sequential, 3),
+        );
+        assert!(store.start("group", Instant::now()));
+        let _ = store.targets_to_place("group");
+        assert!(store.attach_leg("group", "leg-0", branch("a", None), reroute_after_progress));
+        assert!(matches!(store.finish_placement("group"), Next::Continue));
+        store
+    }
+
+    fn failed_code(next: &Next) -> Option<(u16, String)> {
+        match next {
+            Next::Failed(_, failure) => Some((failure.code, failure.reason.clone())),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn a_hunt_target_that_rang_and_does_not_reroute_ends_the_hunt_on_its_outcome() {
+        for (code, phrase, cause, reported) in [
+            (486, "Busy Here", DialBranchCause::Rejected, "rejected"),
+            (
+                480,
+                "Temporarily Unavailable",
+                DialBranchCause::Rejected,
+                "rejected",
+            ),
+            (
+                408,
+                "Request Timeout",
+                DialBranchCause::Timeout,
+                "ring timeout",
+            ),
+        ] {
+            let store = hunt_ringing(false);
+            assert!(store.leg_progress("leg-0", 180).is_some());
+            let ended = store
+                .leg_ended("leg-0", DialBranchOutcome::new(code, phrase, cause), false)
+                .expect("a live leg");
+            assert_eq!(
+                failed_code(&ended.next),
+                Some((code, reported.to_string())),
+                "{code}: the hunt ends on the target that rang"
+            );
+            assert!(ended.stopped.is_empty(), "nothing else was ringing");
+        }
+    }
+
+    #[test]
+    fn a_hunt_target_that_rang_and_reroutes_moves_the_hunt_on() {
+        let store = hunt_ringing(true);
+        assert!(store.leg_progress("leg-0", 180).is_some());
+        let ended = store
+            .leg_ended(
+                "leg-0",
+                DialBranchOutcome::new(486, "Busy Here", DialBranchCause::Rejected),
+                false,
+            )
+            .expect("a live leg");
+        assert!(matches!(ended.next, Next::Place));
+    }
+
+    #[test]
+    fn a_hunt_target_that_never_rang_moves_the_hunt_on_even_when_it_does_not_reroute() {
+        for outcome in [
+            DialBranchOutcome::new(408, "Request Timeout", DialBranchCause::Timeout),
+            DialBranchOutcome::new(503, "Service Unavailable", DialBranchCause::Rejected),
+            DialBranchOutcome::new(503, "Service Unavailable", DialBranchCause::Unsent),
+        ] {
+            let store = hunt_ringing(false);
+            // A 100 is hop by hop: it is no progress.
+            assert!(store.leg_progress("leg-0", 100).is_some());
+            let ended = store
+                .leg_ended("leg-0", outcome, false)
+                .expect("a live leg");
+            assert!(matches!(ended.next, Next::Place));
+        }
+    }
+
+    #[test]
+    fn a_503_with_retry_after_moves_the_hunt_on_from_a_target_that_rang() {
+        let store = hunt_ringing(false);
+        assert!(store.leg_progress("leg-0", 180).is_some());
+        let ended = store
+            .leg_ended(
+                "leg-0",
+                DialBranchOutcome::new(503, "Service Unavailable", DialBranchCause::Rejected),
+                true,
+            )
+            .expect("a live leg");
+        assert!(matches!(ended.next, Next::Place), "the next route is tried");
+    }
+
+    #[test]
+    fn a_6xx_ends_a_hunt_whatever_its_target_says() {
+        let store = hunt_ringing(true);
+        let ended = store
+            .leg_ended(
+                "leg-0",
+                DialBranchOutcome::new(603, "Decline", DialBranchCause::Rejected),
+                false,
+            )
+            .expect("a live leg");
+        assert_eq!(
+            failed_code(&ended.next),
+            Some((603, "rejected".to_string()))
+        );
+    }
+
+    #[test]
+    fn a_hunt_that_stopped_reports_its_stopper_not_the_best_of_its_legs() {
+        let store = hunt_ringing(false);
+        // The first target is down: the hunt moves on to the second.
+        let ended = store
+            .leg_ended(
+                "leg-0",
+                DialBranchOutcome::new(503, "Service Unavailable", DialBranchCause::Rejected),
+                false,
+            )
+            .expect("a live leg");
+        assert!(matches!(ended.next, Next::Place));
+        let _ = store.targets_to_place("group");
+        assert!(store.attach_leg("group", "leg-1", branch("b", None), false));
+        assert!(matches!(store.finish_placement("group"), Next::Continue));
+        assert!(store.leg_progress("leg-1", 183).is_some());
+        let ended = store
+            .leg_ended(
+                "leg-1",
+                DialBranchOutcome::new(408, "Request Timeout", DialBranchCause::Timeout),
+                false,
+            )
+            .expect("a live leg");
+        assert_eq!(
+            failed_code(&ended.next),
+            Some((408, "ring timeout".to_string()))
+        );
+    }
+
+    #[test]
+    fn a_6xx_cancels_the_rest_of_a_parallel_group_and_fails_it() {
+        let store = store_with(OriginateGroupStrategy::Parallel, 3);
+        assert!(matches!(store.finish_placement("group"), Next::Continue));
+        let ended = store
+            .leg_ended(
+                "leg-1",
+                DialBranchOutcome::new(603, "Decline", DialBranchCause::Rejected),
+                false,
+            )
+            .expect("a live leg");
+        let mut stopped: Vec<_> = ended
+            .stopped
+            .iter()
+            .map(|leg| leg.internal_call_id.clone())
+            .collect();
+        stopped.sort();
+        assert_eq!(stopped, ["leg-0", "leg-2"]);
+        assert!(ended.stopped.iter().all(|leg| leg
+            .branch
+            .outcome
+            .as_ref()
+            .map(|outcome| outcome.code)
+            == Some(487)));
+        assert_eq!(
+            failed_code(&ended.next),
+            Some((603, "rejected".to_string()))
+        );
+        // A late failure on a stopped leg moves nothing.
+        for leg in ["leg-0", "leg-2"] {
+            store.forget_leg(leg);
+            assert!(store
+                .leg_ended(
+                    leg,
+                    DialBranchOutcome::new(487, "Request Terminated", DialBranchCause::Cancelled),
+                    false
+                )
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn a_parallel_phone_that_rang_and_was_busy_leaves_the_others_ringing() {
+        let store = OriginateGroupStore::new();
+        store.insert(
+            "group".to_string(),
+            group(OriginateGroupStrategy::Parallel, 2),
+        );
+        assert!(store.start("group", Instant::now()));
+        let _ = store.targets_to_place("group");
+        assert!(store.attach_leg("group", "leg-0", branch("a", None), false));
+        assert!(store.attach_leg("group", "leg-1", branch("b", None), false));
+        assert!(matches!(store.finish_placement("group"), Next::Continue));
+        assert!(store.leg_progress("leg-0", 180).is_some());
+        let ended = store
+            .leg_ended(
+                "leg-0",
+                DialBranchOutcome::new(486, "Busy Here", DialBranchCause::Rejected),
+                false,
+            )
+            .expect("a live leg");
+        assert!(matches!(ended.next, Next::Continue));
+        assert!(ended.stopped.is_empty());
     }
 
     #[test]

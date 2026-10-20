@@ -163,6 +163,12 @@ reported as a failure. That is damage control, not a substitute for closing.
   or of `route`) may carry `"contact_host"`, the host siphon presents in its own
   Contact on that leg in place of the address it advertises, for a peer that
   identifies the tenant or account by that host. Only the host changes.
+  A `dial` target of either form may carry `"reroute_after_progress": False`
+  (a `bool`, anything else raises `TypeError`; server default `True`): a
+  sequential dial then ends on that target once it has rung, its ring timeout,
+  busy or other failure being the dial's, for a hunt across several routes to
+  one destination. A target that never rang, and a 503 with Retry-After, still
+  move the hunt on; a 6xx ends a sequential dial either way.
   With `on_answer="bridge"` it instead rings phones for a caller the app already
   answered and anchored (after a greeting or a menu), plays `ringback` (a tone
   preset or cadence, `True` for the default, `False` for none) while they alert, and

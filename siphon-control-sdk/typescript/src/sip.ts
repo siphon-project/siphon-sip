@@ -635,6 +635,18 @@ export type DialTarget =
        * IP address; the server refuses anything else with `bad_request`.
        */
       contactHost?: string;
+      /**
+       * Whether a sequential dial still moves on from this target once it has
+       * rung (sent the far end's 101-199). Sent only when given; the server's
+       * default is `true`, a hunt through phones moving on when one rings out
+       * or is busy. `false` ends a sequential dial on this target once it has
+       * rung: its ring timeout, busy or other failure is the dial's and no
+       * later target is rung, for a hunt across several routes to the same
+       * destination. A target that never rang, and a `503` carrying
+       * `Retry-After`, still move the hunt on; a `6xx` ends a sequential dial
+       * whatever this says. A parallel dial ignores it.
+       */
+      rerouteAfterProgress?: boolean;
     }
   | {
       /**
@@ -649,6 +661,8 @@ export type DialTarget =
       to?: string;
       /** Host of siphon's own `Contact` on every branch the AoR expands to (see the URI form). */
       contactHost?: string;
+      /** `rerouteAfterProgress` for every branch the AoR expands to (see the URI form). */
+      rerouteAfterProgress?: boolean;
     };
 
 /**
@@ -806,6 +820,13 @@ function dialTargetToWire(target: DialTarget): unknown {
   const to = (target as { to?: unknown }).to;
   const route = routeSetToWire((target as { route?: unknown }).route);
   const contactHost = contactHostToWire((target as { contactHost?: unknown }).contactHost);
+  const rerouteAfterProgress = (target as { rerouteAfterProgress?: unknown })
+    .rerouteAfterProgress;
+  // A policy flag: anything but a boolean is refused, as the server refuses
+  // it, rather than read as the default and quietly left on the old rule.
+  if (rerouteAfterProgress !== undefined && typeof rerouteAfterProgress !== "boolean") {
+    throw new TypeError('a dial target\'s "rerouteAfterProgress" is a boolean');
+  }
   if (to !== undefined && typeof to !== "string") {
     throw new TypeError('a dial target\'s "to" is a SIP URI string');
   }
@@ -832,6 +853,9 @@ function dialTargetToWire(target: DialTarget): unknown {
     if (headers !== undefined) object.headers = headers;
     if (to !== undefined) object.to = to;
     if (contactHost !== undefined) object.contact_host = contactHost;
+    if (rerouteAfterProgress !== undefined) {
+      object.reroute_after_progress = rerouteAfterProgress;
+    }
     return object;
   }
   if (typeof uri !== "string") {
@@ -843,7 +867,8 @@ function dialTargetToWire(target: DialTarget): unknown {
     headers === undefined &&
     to === undefined &&
     route === undefined &&
-    contactHost === undefined
+    contactHost === undefined &&
+    rerouteAfterProgress === undefined
   ) {
     return uri;
   }
@@ -853,6 +878,9 @@ function dialTargetToWire(target: DialTarget): unknown {
   if (to !== undefined) object.to = to;
   if (route !== undefined) object.route = route;
   if (contactHost !== undefined) object.contact_host = contactHost;
+  if (rerouteAfterProgress !== undefined) {
+    object.reroute_after_progress = rerouteAfterProgress;
+  }
   return object;
 }
 

@@ -335,6 +335,16 @@ pub struct Route {
     /// controller's to know, not a rating decision.
     #[serde(skip)]
     pub contact_host: Option<String>,
+    /// This attempt is a target of a sequential controller `dial` (a hunt),
+    /// which ends on the hunt's own rule as well as on the reroute causes: a
+    /// 6xx ends it, and so does any failure of a target that showed progress
+    /// and does not set `reroute_after_progress` (see
+    /// [`crate::b2bua::actor::hunt_stops_at`]).
+    ///
+    /// Not part of the LCR API: a carrier sequence fails over after progress
+    /// on its reroute causes, which the routing decision names.
+    #[serde(skip)]
+    pub hunt: bool,
 }
 
 impl Route {

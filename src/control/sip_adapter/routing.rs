@@ -502,6 +502,7 @@ pub(super) fn parse_dial_target(
             .map_err(|error| error.to_string())?,
         to: string_field("to"),
         contact_host: parse_contact_host(object).map_err(|error| format!("target {error}"))?,
+        reroute_after_progress: parse_reroute_after_progress(object)?,
         ..Default::default()
     };
 
@@ -531,6 +532,7 @@ pub(super) fn parse_dial_target(
                     branch.privacy = shaped.privacy;
                     branch.to.clone_from(&shaped.to);
                     branch.contact_host.clone_from(&shaped.contact_host);
+                    branch.reroute_after_progress = shaped.reroute_after_progress;
                 }
                 Ok(branches)
             }
@@ -592,14 +594,7 @@ pub(super) fn parse_route_target(
         .get("timeout")
         .and_then(|v| v.as_u64())
         .map(|t| t as u32);
-    // A policy flag: a value that is not a boolean is refused rather than read
-    // as `false`, which would quietly keep the carrier on the default rule.
-    let reroute_after_progress = match object.get("reroute_after_progress") {
-        None => false,
-        Some(value) => value
-            .as_bool()
-            .ok_or_else(|| "target 'reroute_after_progress' must be a boolean".to_string())?,
-    };
+    let reroute_after_progress = parse_reroute_after_progress(object)?.unwrap_or(false);
     let route = parse_route_set(object)?;
     let contact_host = parse_contact_host(object).map_err(|error| format!("target {error}"))?;
     Ok(crate::dispatcher::RouteTarget {
@@ -611,6 +606,26 @@ pub(super) fn parse_route_target(
         route,
         contact_host,
     })
+}
+
+/// Read a target's `reroute_after_progress`, the same flag on a `route` and a
+/// `dial` target: `None` when it is absent, for the verb to apply its own
+/// default (`false` for a `route` carrier, `true` for a `dial` target).
+///
+/// A policy flag: a value that is not a boolean, `null` included, is refused
+/// rather than read as the default, which would quietly keep the target on the
+/// rule the controller asked to change.
+fn parse_reroute_after_progress(
+    object: &serde_json::Map<String, serde_json::Value>,
+) -> Result<Option<bool>, String> {
+    object
+        .get("reroute_after_progress")
+        .map(|value| {
+            value
+                .as_bool()
+                .ok_or_else(|| "target 'reroute_after_progress' must be a boolean".to_string())
+        })
+        .transpose()
 }
 
 /// Read a `contact_host`: the host siphon presents in its own Contact on the
