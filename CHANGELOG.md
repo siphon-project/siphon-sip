@@ -13,6 +13,8 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
+## [1.15.1] — 2026-10-20
+
 ### Added
 
 - **Registration hooks are numbered.** `@registrar.on_change` is passed a
@@ -25,6 +27,7 @@ entry, but a working config keeps working.
   epoch is `registrar.instance_epoch` (the `instance_epoch` already on each
   binding), and `instance_epoch` is also on both events and in both state
   verbs' replies, so a consumer can tell the numbers restarted.
+
 - **Control plane: registration state a controller can rely on.**
   `RegistrationChanged` contacts now say where the REGISTER came from:
   `received` (byte for byte the script's `Contact.received`), `transport`,
@@ -45,6 +48,7 @@ entry, but a working config keeps working.
   carries the last failure's status, in `@registration.on_change` too. The
   Rust, Python and TypeScript control SDKs model the new fields, event and
   verbs.
+
 - **`rtpengine`: a script records a conference room.**
   `conference_start_recording` / `conference_stop_recording` /
   `conference_wait_recording` write a room's listener mix (its seats, any
@@ -52,6 +56,7 @@ entry, but a working config keeps working.
   (`path`, `duration_ms`, `reason`), bounded by `max_duration_ms` and
   `silence_ms`. A seat is not a call, so `start_recording` cannot reach a
   caller the script seated in a room; this can. siphon-rtp only.
+
 - **`POST /admin/auth/cache/invalidate`** drops cached digest credentials
   (`auth.http` / `auth.database`): `{"realm","username"}` for one user,
   `{"realm"}` for one realm, `{}` for all. `204`, or `404 {"error":"no
@@ -67,6 +72,7 @@ entry, but a working config keeps working.
   marked down. Checked at startup against the configured listeners: a listener
   of every destination's transport must be bound at that address. YAML groups
   only.
+
 - **Control plane: `contact_user` names the user part of siphon's own
   Contact**, beside `contact_host` and everywhere it can be named: on a `dial`
   target (`{uri}` or `{aor}`, connecting or `on_answer: "bridge"`), a `route`
@@ -87,6 +93,7 @@ entry, but a working config keeps working.
   `set_contact_user()`; the script's `set_contact_uri()` outranks both. The
   Rust, Python and TypeScript control SDKs take it as `contact_user` /
   `caller_contact_user` and `contactUser` / `callerContactUser`.
+
 - **Gateway: `allow_methods` per gateway group.** The methods siphon advertises
   in `Allow` to one group's peers, instead of every method it implements. For a
   trunk that picks its transfer method from `Allow`: leave `REFER` out and it
@@ -96,6 +103,7 @@ entry, but a working config keeps working.
   of the group configured first. A script's or controller's `Allow` still wins.
   Checked at load: methods siphon implements only, each once, and `INVITE`,
   `ACK`, `CANCEL`, `BYE` required. Unset, nothing changes.
+
 - **Opt-in server certificate verification on outbound SIP TLS.** Outbound TLS
   to trunks was encrypted but never authenticated: caller identity and SDES keys
   went to whoever answered on the address. `tls.verify_server: true` (or
@@ -152,6 +160,7 @@ entry, but a working config keeps working.
   listener that ends up not verifying, `verify_client` without any `client_ca`,
   an unreadable CA bundle, and a tls+wss pair on one shared address whose
   settings differ. A reload reports a changed `listen` as `restart_required`.
+
 - **`client_subject`: check who a client certificate was issued to.** On top of
   chaining to `client_ca`, the certificate must name one of the listed DNS
   identities, exact or a whole-leftmost-label wildcard matching one label
@@ -160,6 +169,49 @@ entry, but a working config keeps working.
   an `access_denied` alert, logged at WARN with the presented and allowed names
   and counted in `siphon_handshake_failures_total`. Valid in `tls:` and per
   listener.
+
+- **Control plane: a `dial` target can name its own media profile.** `profile`
+  on a `dial` target (`{uri}` or `{aor}`) overrides the dial's `profile` for
+  that branch alone; a target naming none inherits the dial's. One ring can
+  now reach a phone behind NAT on a latching profile and a trunk on an
+  SDES-SRTP profile together. A connecting dial makes one media allocation
+  per profile its branches name, sends each branch its own profile's anchored
+  offer (each attempt of a sequential hunt too), answers early media and the
+  2xx through the answering branch's allocation, and releases the others once
+  a branch answers. An unknown target profile fails the dial exactly as an
+  unknown dial profile does, before anything is allocated or rung; a
+  connecting dial that anchors some branches and not others is `bad_request`.
+  On `on_answer: "bridge"` the target's profile anchors that phone's leg.
+
+- **Control plane: early offer on a bridging `dial`.** `offer: "early"` on
+  `dial {on_answer: "bridge"}`, or on one of its targets, sends each phone's
+  INVITE with an SDP offer instead of none, for peers that refuse a
+  delayed-offer INVITE: a ring after a prompt or menu, or a queue offer, to
+  such a peer used to fail. The offer is allocated on the media engine from
+  the caller's media under the phone's profile; the phone answers in its 2xx,
+  and the bridge then re-INVITEs only the caller. Every phone not bridged has
+  its allocation deleted. A 2xx without SDP is ACKed, BYEd and reported as a
+  failed branch with code 488 (RFC 3261 §13.2.1). `"delayed"` is the default
+  and unchanged. An unknown value, `offer` on a connecting dial, and `offer`
+  on `originate` are `bad_request`; `originate` has no caller to offer from.
+
+- **Diameter: `diameter.originate` sends a request this node starts on a
+  connection it already has, and awaits its answer.** A node in server mode
+  can now run the procedures that begin at the server, such as an HSS's
+  Cancel-Location, Insert-Subscriber-Data, Delete-Subscriber-Data and Reset
+  (TS 29.272) or an S6c Alert-Service-Centre (TS 29.338). The connection is
+  the serving connection that last carried a request from the destination
+  host, else one that carried a request from its realm, else a named peer.
+  The caller gives the AVPs after the envelope as `set_avp` tuples, with an
+  optional fourth element to set or clear the M bit. The answer is a
+  `DiameterAnswer`; no connection, a timeout and a lost connection raise
+  `LookupError`, `TimeoutError` and `ConnectionError`.
+
+### Changed
+
+- `tls.verify_client: true` without `tls.client_ca`, on a TLS or WSS listener
+  that inherits it, is now refused at config load (and so on a reload) instead
+  of when the listener starts.
 
 ### Fixed
 
@@ -198,13 +250,13 @@ entry, but a working config keeps working.
   socket. Otherwise a configuration with one listener per transport is
   unchanged.
 
-## [1.15.0] — 2026-10-19
 - **A TLS B-leg and an originate to a hostname now present that hostname as
   SNI.** They sent the resolved address, so a hostname-vhost trunk could not
   route the handshake. Outbound TLS REGISTERs present the registrar's domain the
   same way, and the gateway OPTIONS probe no longer puts a `;transport=` URI
   parameter into the SNI of a destination configured without a port. A
   bracketed IPv6 host is accepted as a TLS server name.
+
 - **A `6xx` ends a sequential control-plane `dial`.** A bridging dial
   (`on_answer: "bridge"`) and a sequential `originate {aor}` moved on to their
   next target after a `600`/`603`/`604`/`606`, ringing the person who had just
@@ -216,36 +268,6 @@ entry, but a working config keeps working.
   (reported `DialBranchFailed` cause `cancelled`). A connecting sequential
   dial already stopped on a `6xx` with the default reroute causes; it now does
   even where `lcr.reroute_causes` lists one.
-### Changed
-
-- `tls.verify_client: true` without `tls.client_ca`, on a TLS or WSS listener
-  that inherits it, is now refused at config load (and so on a reload) instead
-  of when the listener starts.
-- **Control plane: a `dial` target can name its own media profile.** `profile`
-  on a `dial` target (`{uri}` or `{aor}`) overrides the dial's `profile` for
-  that branch alone; a target naming none inherits the dial's. One ring can
-  now reach a phone behind NAT on a latching profile and a trunk on an
-  SDES-SRTP profile together. A connecting dial makes one media allocation
-  per profile its branches name, sends each branch its own profile's anchored
-  offer (each attempt of a sequential hunt too), answers early media and the
-  2xx through the answering branch's allocation, and releases the others once
-  a branch answers. An unknown target profile fails the dial exactly as an
-  unknown dial profile does, before anything is allocated or rung; a
-  connecting dial that anchors some branches and not others is `bad_request`.
-  On `on_answer: "bridge"` the target's profile anchors that phone's leg.
-- **Control plane: early offer on a bridging `dial`.** `offer: "early"` on
-  `dial {on_answer: "bridge"}`, or on one of its targets, sends each phone's
-  INVITE with an SDP offer instead of none, for peers that refuse a
-  delayed-offer INVITE: a ring after a prompt or menu, or a queue offer, to
-  such a peer used to fail. The offer is allocated on the media engine from
-  the caller's media under the phone's profile; the phone answers in its 2xx,
-  and the bridge then re-INVITEs only the caller. Every phone not bridged has
-  its allocation deleted. A 2xx without SDP is ACKed, BYEd and reported as a
-  failed branch with code 488 (RFC 3261 §13.2.1). `"delayed"` is the default
-  and unchanged. An unknown value, `offer` on a connecting dial, and `offer`
-  on `originate` are `bad_request`; `originate` has no caller to offer from.
-
-### Fixed
 
 - **Registration events no longer stop for good after a burst.** The task that
   feeds registrar changes to `@registrar.on_change` and the control plane's
@@ -267,7 +289,6 @@ entry, but a working config keeps working.
 - **A controller `dial` with a media profile no longer leaves its media
   allocation behind when the caller cancels while it rings.** Nothing released
   it on the caller's CANCEL; the engine held it until its own timeout.
-### Fixed
 
 - **P-CSCF: a UDP response to a UE over IPsec goes from the P-CSCF's protected
   client port to the UE's protected server port.** It went back to the port the
@@ -284,26 +305,12 @@ entry, but a working config keeps working.
   came over an IPsec UDP flow now writes the UE's protected server port into
   `rport`, as TS 24.229 clause 5.2.6.3.1 requires, so the Via names the port
   the response goes to.
-### Added
-
-- **Diameter: `diameter.originate` sends a request this node starts on a
-  connection it already has, and awaits its answer.** A node in server mode
-  can now run the procedures that begin at the server, such as an HSS's
-  Cancel-Location, Insert-Subscriber-Data, Delete-Subscriber-Data and Reset
-  (TS 29.272) or an S6c Alert-Service-Centre (TS 29.338). The connection is
-  the serving connection that last carried a request from the destination
-  host, else one that carried a request from its realm, else a named peer.
-  The caller gives the AVPs after the envelope as `set_avp` tuples, with an
-  optional fourth element to set or clear the M bit. The answer is a
-  `DiameterAnswer`; no connection, a timeout and a lost connection raise
-  `LookupError`, `TimeoutError` and `ConnectionError`.
-
-### Fixed
 
 - **B2BUA: siphon's own 18x and 2xx to the caller carry `Allow`.** `answer`,
   `ring` and `progress` (control plane and `call.answer()`/`call.progress()`)
   sent none, while the relayed ones always did; RFC 3261 §13.3.1.4 has a 2xx to
   INVITE carry it. An `Allow` in `headers` still replaces it.
+
 - **`examples/teams_sbc.yaml` trusts the peer's documented signalling
   ranges** (`52.112.0.0/14`, `52.120.0.0/14`, `2603:1063:400::/40`). It
   trusted one /16 inside the first of them, so OPTIONS from the rest of the
