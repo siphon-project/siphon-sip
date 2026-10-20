@@ -234,6 +234,78 @@ async fn a_room_playback_is_the_documented_frame_and_returns_its_play_id() {
 }
 
 #[tokio::test]
+async fn a_room_recording_is_the_documented_frame_and_its_end_resolves_the_waiter() {
+    let finished = vec![json!({
+        "event": "recording_finished", "call_id": "", "conference_id": "msml-4412",
+        "from_tag": "", "recording_id": "rec-7", "path": "/var/spool/rec/rec-7.wav",
+        "duration_ms": 3000, "reason": "max_duration"
+    })];
+    let engine = FakeEngine::start(accept, finished).await;
+    let (event_tx, _events) = mpsc::channel(16);
+    let set = SiphonRtpClientSet::new(vec![(engine.address(), 2000, 1)], None, 5_000, event_tx)
+        .expect("a set");
+
+    let recording_id = set
+        .conference_start_recording(
+            "msml-4412",
+            Some("/var/spool/rec/rec-7.wav"),
+            Some(3000),
+            Some(5000),
+        )
+        .await
+        .expect("recording");
+    let ended = set
+        .conference_wait_recording("msml-4412", &recording_id, Duration::from_secs(2))
+        .await
+        .expect("the end in time");
+    set.conference_stop_recording("msml-4412", Some("rec-7"))
+        .await
+        .expect("stopped one");
+    set.conference_stop_recording("msml-4412", None)
+        .await
+        .expect("stopped all");
+
+    assert_eq!(recording_id, "rec-7");
+    assert_eq!(ended.path.as_deref(), Some("/var/spool/rec/rec-7.wav"));
+    assert_eq!(ended.duration_ms, 3000);
+    assert_eq!(ended.reason, "max_duration");
+    assert_eq!(
+        engine.frames("conference_start_recording"),
+        vec![
+            json!({ "command": "conference_start_recording", "conference_id": "msml-4412",
+                     "path": "/var/spool/rec/rec-7.wav", "max_duration_ms": 3000,
+                     "silence_ms": 5000 })
+        ]
+    );
+    assert_eq!(
+        engine.frames("conference_stop_recording"),
+        vec![
+            json!({ "command": "conference_stop_recording", "conference_id": "msml-4412",
+                     "recording_id": "rec-7" }),
+            json!({ "command": "conference_stop_recording", "conference_id": "msml-4412" }),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_room_recording_accept_without_an_id_is_a_protocol_error() {
+    fn idless(_: &Value) -> Value {
+        json!({"result": "ok"})
+    }
+    let engine = FakeEngine::start(idless, Vec::new()).await;
+    let (client, _events) = client(&engine);
+
+    let started = client
+        .conference_start_recording("room-1", None, None, None)
+        .await;
+
+    assert!(
+        matches!(started, Err(RtpEngineError::Protocol(_))),
+        "{started:?}"
+    );
+}
+
+#[tokio::test]
 async fn a_refusal_comes_back_as_the_engines_reason() {
     fn refuse(request: &Value) -> Value {
         match request["command"].as_str() {

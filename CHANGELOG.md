@@ -15,6 +15,13 @@ entry, but a working config keeps working.
 
 ### Added
 
+- **`rtpengine`: a script records a conference room.**
+  `conference_start_recording` / `conference_stop_recording` /
+  `conference_wait_recording` write a room's listener mix (its seats, any
+  bridged room, any room playback) to a 16 kHz WAV and return the closed file
+  (`path`, `duration_ms`, `reason`), bounded by `max_duration_ms` and
+  `silence_ms`. A seat is not a call, so `start_recording` cannot reach a
+  caller the script seated in a room; this can. siphon-rtp only.
 - **Gateway: `allow_methods` per gateway group.** The methods siphon advertises
   in `Allow` to one group's peers, instead of every method it implements. For a
   trunk that picks its transfer method from `Allow`: leave `REFER` out and it

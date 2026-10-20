@@ -255,3 +255,24 @@ class TestDialOut:
                 await engine.conference_unbridge("a", "b")
 
         asyncio.run(run())
+
+
+class TestRoomRecording:
+    def test_a_room_recording_returns_the_closed_file(self, harness):
+        run(harness.rtpengine.conference_join("room-1", participant(1)))
+        recording_id = run(harness.rtpengine.conference_start_recording(
+            "room-1", path="/spool/room-1.wav", max_duration_ms=5000))
+        assert run(harness.rtpengine.conference_wait_recording("room-1", recording_id)) is None
+        harness.rtpengine.finish_recording(recording_id, path="/spool/room-1.wav",
+                                           duration_ms=5000, reason="max_duration")
+        ended = run(harness.rtpengine.conference_wait_recording("room-1", recording_id))
+        assert ended["path"] == "/spool/room-1.wav"
+        assert ended["reason"] == "max_duration"
+        assert run(harness.rtpengine.conference_stop_recording("room-1"))
+
+    def test_an_unknown_room_or_a_zero_limit_is_refused(self, harness):
+        with pytest.raises(RuntimeError):
+            run(harness.rtpengine.conference_start_recording("nowhere"))
+        run(harness.rtpengine.conference_join("room-1", participant(1)))
+        with pytest.raises(ValueError):
+            run(harness.rtpengine.conference_start_recording("room-1", silence_ms=0))

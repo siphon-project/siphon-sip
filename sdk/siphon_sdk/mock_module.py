@@ -5934,6 +5934,53 @@ class MockRtpEngine:
         })
         return True
 
+    async def conference_start_recording(
+        self, conference_id: str, path: Optional[str] = None,
+        max_duration_ms: Optional[int] = None, silence_ms: Optional[int] = None,
+    ) -> str:
+        """Record a room's listener mix (its seats, any bridged room, any room
+        playback) to a 16 kHz 16-bit PCM WAV. Returns on the engine's accept
+        with the ``recording_id``; it runs until
+        :meth:`conference_stop_recording`, ``max_duration_ms``, ``silence_ms``
+        or the end of the room. ``path``'s directory must exist.
+
+        In the mock the id is ``"rec-<n>"`` and the recording is pending until
+        the test calls :meth:`finish_recording`.
+        """
+        if max_duration_ms == 0 or silence_ms == 0:
+            raise ValueError("max_duration_ms and silence_ms are positive when given")
+        self._conference_room(conference_id, "conference_start_recording")
+        self._recording_serial = getattr(self, "_recording_serial", 0) + 1
+        recording_id = f"rec-{self._recording_serial}"
+        self.operations.append(("conference_start_recording", conference_id))
+        self.media_calls.append({
+            "op": "conference_start_recording", "conference_id": conference_id,
+            "recording_id": recording_id, "path": path,
+            "max_duration_ms": max_duration_ms, "silence_ms": silence_ms,
+        })
+        return recording_id
+
+    async def conference_stop_recording(
+        self, conference_id: str, recording_id: Optional[str] = None
+    ) -> bool:
+        """Stop one room recording, or every recording of the room."""
+        self._conference_room(conference_id, "conference_stop_recording")
+        self.operations.append(("conference_stop_recording", conference_id))
+        self.media_calls.append({
+            "op": "conference_stop_recording", "conference_id": conference_id,
+            "recording_id": recording_id,
+        })
+        return True
+
+    async def conference_wait_recording(
+        self, conference_id: str, recording_id: str,
+        timeout_ms: Optional[int] = None,
+    ) -> Optional[dict]:
+        """Wait until a room recording has ended and its file is closed: the
+        dict :meth:`wait_recording` returns, or ``None`` after ``timeout_ms``
+        (default an hour). In the mock: what :meth:`finish_recording` set."""
+        return getattr(self, "finished_recordings", {}).get(recording_id)
+
     def set_conference_join_no_codec(self, no_codec: bool = True) -> None:
         """Prime :meth:`conference_join` to model an offer whose codec the
         room cannot encode (test helper): the next join raises
