@@ -31,6 +31,15 @@ impl CallActorStore {
             .is_some_and(|call| call.route_attempt_progressed())
     }
 
+    /// Whether a sequential controller `dial` ends on its attempt in flight
+    /// failing with `status_code`. See [`CallActor::hunt_stops_on`]. `false`
+    /// when the call is gone.
+    pub fn hunt_stops_on(&self, call_id: &str, status_code: u16, retry_elsewhere: bool) -> bool {
+        self.calls
+            .get(call_id)
+            .is_some_and(|call| call.hunt_stops_on(status_code, retry_elsewhere))
+    }
+
     /// Whether a call's carrier in flight keeps the call past its ring timeout.
     /// See [`CallActor::route_kept_by_progress`]. `false` when the call is gone.
     pub fn route_kept_by_progress(&self, call_id: &str) -> bool {
