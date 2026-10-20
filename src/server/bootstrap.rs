@@ -743,7 +743,6 @@ pub(super) fn spawn_rf_register_emitter(
             let event = match events.recv().await {
                 Ok(event) => event,
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                    // A lost ACR-EVENT is a charging record, not state: count it.
                     record_lag(LaggedConsumer::RfRegister, skipped);
                     warn!(skipped, "rf: registrar events lagged, ACR-EVENTs lost");
                     continue;
