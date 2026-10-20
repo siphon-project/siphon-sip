@@ -21,11 +21,13 @@ use super::string_arg;
 /// test's own dispatcher when it drives the verb end to end.
 pub(super) trait OriginatePlacer {
     /// Stage a call to one URI (`args.to`), presenting `contact_host` as the
-    /// host of siphon's own Contact when it names one.
+    /// host and `contact_user` as the user part of siphon's own Contact when
+    /// they name one.
     fn prepare(
         &self,
         params: OriginateParams,
         contact_host: Option<String>,
+        contact_user: Option<String>,
     ) -> Result<PreparedOriginate, OriginateError>;
     /// Send a staged call's INVITE.
     fn dial(&self, prepared: &PreparedOriginate) -> bool;
@@ -47,8 +49,13 @@ impl OriginatePlacer for RunningB2bua {
         &self,
         params: OriginateParams,
         contact_host: Option<String>,
+        contact_user: Option<String>,
     ) -> Result<PreparedOriginate, OriginateError> {
-        crate::dispatcher::b2bua_originate_prepare_with_contact_host(params, contact_host)
+        crate::dispatcher::b2bua_originate_prepare_with_contact_host(
+            params,
+            contact_host,
+            contact_user,
+        )
     }
 
     fn dial(&self, prepared: &PreparedOriginate) -> bool {
@@ -159,15 +166,17 @@ pub(super) fn originate_on(
         Ok(session_timer) => session_timer,
         Err(message) => return ControlResult::error(ControlErrorCode::BadRequest, message),
     };
-    // The host of siphon's own Contact on the call, or on every leg of an
-    // `{aor}` group: refused here, before anything is placed, when it is not
-    // one siphon can put there.
-    let contact_host = match args
-        .as_object()
-        .map(super::routing::parse_contact_host)
-        .transpose()
-    {
-        Ok(contact_host) => contact_host.flatten(),
+    // The host and user part of siphon's own Contact on the call, or on every
+    // leg of an `{aor}` group: refused here, before anything is placed, when
+    // either is not one siphon can put there.
+    let contact_parts = args.as_object().map(|object| {
+        Ok::<_, String>((
+            super::routing::parse_contact_host(object)?,
+            super::routing::parse_contact_user(object)?,
+        ))
+    });
+    let (contact_host, contact_user) = match contact_parts.transpose() {
+        Ok(parts) => parts.unwrap_or_default(),
         Err(error) => {
             return ControlResult::error(
                 ControlErrorCode::BadRequest,
@@ -258,12 +267,13 @@ pub(super) fn originate_on(
                 on_lost: &on_lost,
                 vars,
                 contact_host,
+                contact_user,
             },
         );
     }
     let params = OriginateParams { to, ..params };
 
-    let prepared = match placer.prepare(params, contact_host) {
+    let prepared = match placer.prepare(params, contact_host, contact_user) {
         Ok(prepared) => prepared,
         Err(error) => return originate_error(error),
     };
@@ -383,6 +393,9 @@ struct AorOriginate<'a> {
     /// Host of siphon's own Contact on every leg, when `args.contact_host`
     /// names one.
     contact_host: Option<String>,
+    /// User part of siphon's own Contact on every leg, when
+    /// `args.contact_user` names one.
+    contact_user: Option<String>,
 }
 
 /// The deadline of a whole group when the controller names none: one ring
@@ -426,9 +439,10 @@ fn originate_aor(
         }
     };
     // Every phone is a leg siphon places, and each presents the Contact host
-    // the controller named, as a single originate does.
+    // and user the controller named, as a single originate does.
     for target in &mut targets {
         target.contact_host.clone_from(&request.contact_host);
+        target.contact_user.clone_from(&request.contact_user);
     }
     // Every leg's To is the AoR as it is registered, however the controller
     // spelled it; each leg's Request-URI is its own contact.
@@ -768,7 +782,11 @@ pub(crate) mod staged {
 
     /// Stages an originate on the test's dispatcher.
     pub(crate) type Prepare = Box<
-        dyn Fn(OriginateParams, Option<String>) -> Result<PreparedOriginate, OriginateError>
+        dyn Fn(
+                OriginateParams,
+                Option<String>,
+                Option<String>,
+            ) -> Result<PreparedOriginate, OriginateError>
             + Send
             + Sync,
     >;
@@ -801,8 +819,9 @@ pub(crate) mod staged {
             &self,
             params: OriginateParams,
             contact_host: Option<String>,
+            contact_user: Option<String>,
         ) -> Result<PreparedOriginate, OriginateError> {
-            (self.prepare)(params, contact_host)
+            (self.prepare)(params, contact_host, contact_user)
         }
 
         fn dial(&self, prepared: &PreparedOriginate) -> bool {

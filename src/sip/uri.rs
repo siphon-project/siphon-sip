@@ -34,6 +34,45 @@ pub fn checked_uri_host(value: &str) -> Option<String> {
         .map(|_| format_sip_host(unbracketed))
 }
 
+/// A bare URI user part (RFC 3261 §25.1 `user`): one or more of `unreserved`
+/// (alphanumerics and `-_.!~*'()`), `escaped` (`%` and two hex digits) and
+/// `user-unreserved` (`&=+$,?/`), returned as given. `None` for anything else:
+/// an empty value, an `@`, a `:`, whitespace, a stray `%`, or a `;`.
+///
+/// The grammar admits `;` as `user-unreserved`, but a `;` in the userinfo is
+/// where user parameters start (RFC 3261 §19.1.1, RFC 4694 `npdi`/`rn`):
+/// siphon's own parser splits there, and so do most peers, so a user holding
+/// one would not read back as the user that was named. Refused rather than
+/// sent as something the peer reads differently.
+pub fn checked_uri_user(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    if bytes.is_empty() {
+        return None;
+    }
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte == b'%' {
+            let escaped = bytes
+                .get(index + 1..index + 3)
+                .is_some_and(|pair| pair.iter().all(u8::is_ascii_hexdigit));
+            if !escaped {
+                return None;
+            }
+            index += 3;
+            continue;
+        }
+        let allowed = byte.is_ascii_alphanumeric()
+            || b"-_.!~*'()".contains(&byte)
+            || b"&=+$,?/".contains(&byte);
+        if !allowed {
+            return None;
+        }
+        index += 1;
+    }
+    Some(value.to_string())
+}
+
 /// Split a SIP `host[:port]` authority into its host and optional port,
 /// IPv6-bracket aware.  The returned host keeps its brackets for a v6 literal.
 ///
@@ -373,6 +412,69 @@ impl fmt::Display for SipUri {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn checked_uri_user_takes_the_rfc_3261_user_alphabet() {
+        for accepted in [
+            "trunk",
+            "15550100077",
+            "+15550100077",
+            "a-b_c.d!e~f*g'h(i)j",
+            "x&y=z+$,?/",
+            "caf%C3%A9",
+            "%2a",
+        ] {
+            assert_eq!(
+                checked_uri_user(accepted).as_deref(),
+                Some(accepted),
+                "{accepted:?} is a user"
+            );
+        }
+        for refused in [
+            "",
+            "trunk@tenant.example.com",
+            "sip:trunk",
+            "trunk:secret",
+            "trunk;npdi",
+            "tr unk",
+            "trunk\r\n",
+            "<trunk>",
+            "\"trunk\"",
+            "100%",
+            "100%2",
+            "100%zz",
+            "caf\u{e9}",
+            "#21",
+            "[trunk]",
+        ] {
+            assert_eq!(
+                checked_uri_user(refused),
+                None,
+                "{refused:?} must be refused"
+            );
+        }
+    }
+
+    /// Every character the check lets through reads back as the same user once
+    /// it sits in a Contact siphon builds.
+    #[test]
+    fn a_checked_user_reads_back_from_a_contact() {
+        let user = "a-b_c.d!e~f*g'h(i)j&k=l+m$n,o?p/q%2A";
+        let checked = checked_uri_user(user).expect("a user");
+        let contact = format!("<sip:{checked}@tenant.example.com:5061;transport=tls>");
+        let parsed = crate::sip::headers::nameaddr::NameAddr::parse(&contact)
+            .expect("the Contact parses")
+            .uri;
+        assert_eq!(parsed.user.as_deref(), Some(user));
+        assert_eq!(parsed.host, "tenant.example.com");
+        assert_eq!(parsed.port, Some(5061));
+        assert!(parsed.user_params().is_empty());
+        assert_eq!(
+            format!("<{parsed}>"),
+            contact,
+            "the Contact serializes back unchanged"
+        );
+    }
 
     #[test]
     fn checked_uri_host_takes_a_host_alone_and_brackets_ipv6() {

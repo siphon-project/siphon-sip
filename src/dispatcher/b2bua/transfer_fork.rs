@@ -512,8 +512,10 @@ impl ReplacementPlan<'_> {
                 dial.shaping.privacy,
                 shaped.from_host.as_deref(),
                 shaped.to.as_deref(),
-                // A transfer's new leg presents the advertised Contact host:
-                // `replace_peer` and `accept_refer` refuse a `contact_host`.
+                // A transfer's new leg presents the advertised Contact host
+                // and no user part: `replace_peer` and `accept_refer` refuse a
+                // `contact_host` and a `contact_user`.
+                None,
                 None,
                 shaped.headers.as_slice(),
                 self.state,

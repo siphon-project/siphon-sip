@@ -186,8 +186,8 @@ pub(super) fn answer(
         Err(refusal) => return refusal,
     };
     let verb = if final_response { "answer" } else { "progress" };
-    let contact_host = match super::caller_contact::parse(verb, "contact_host", args) {
-        Ok(contact_host) => contact_host,
+    let contact = match super::caller_contact::parse(verb, "", args) {
+        Ok(contact) => contact,
         Err(refusal) => return refusal,
     };
     // Set once every argument has been checked, right before the response goes
@@ -197,8 +197,8 @@ pub(super) fn answer(
             &crate::dispatcher::RunningDispatcher,
             channel,
             verb,
-            "contact_host",
-            contact_host.as_deref(),
+            "",
+            &contact,
         )
     };
 
@@ -369,16 +369,16 @@ pub(super) fn ring(channel: &ChannelRef, args: &serde_json::Value) -> ControlRes
         Ok(headers) => headers,
         Err(refusal) => return refusal,
     };
-    let contact_host = match super::caller_contact::parse("ring", "contact_host", args) {
-        Ok(contact_host) => contact_host,
+    let contact = match super::caller_contact::parse("ring", "", args) {
+        Ok(contact) => contact,
         Err(refusal) => return refusal,
     };
     if let Err(refusal) = super::caller_contact::apply(
         &crate::dispatcher::RunningDispatcher,
         channel,
         "ring",
-        "contact_host",
-        contact_host.as_deref(),
+        "",
+        &contact,
     ) {
         return refusal;
     }

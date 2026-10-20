@@ -335,6 +335,11 @@ pub struct Route {
     /// controller's to know, not a rating decision.
     #[serde(skip)]
     pub contact_host: Option<String>,
+    /// The user part siphon presents in its own `Contact` on this attempt's
+    /// leg, when a controller `route` or sequential `dial` target named one
+    /// (`contact_user`). Not part of the LCR API, like `contact_host`.
+    #[serde(skip)]
+    pub contact_user: Option<String>,
 }
 
 impl Route {

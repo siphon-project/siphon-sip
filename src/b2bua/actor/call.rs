@@ -314,6 +314,9 @@ pub struct CallActor {
     /// (`contact_host` on `answer`/`ring`/`progress`, `caller_contact_host` on
     /// `dial`/`route`). Every Contact siphon presents the caller carries it.
     pub caller_contact_host: Option<String>,
+    /// User part of siphon's own Contact toward the caller, named by a
+    /// controller (`contact_user` / `caller_contact_user`), as for the host.
+    pub caller_contact_user: Option<String>,
     /// Whether the caller has been sent an 18x or 2xx carrying siphon's
     /// Contact, which it may have taken as its remote target: past this a
     /// different `caller_contact_host` is refused. Atomic so a response path
@@ -590,6 +593,7 @@ impl CallActor {
             contact_user_override: None,
             contact_override: None,
             caller_contact_host: None,
+            caller_contact_user: None,
             caller_contact_presented: std::sync::atomic::AtomicBool::new(false),
             script_shaped_headers: Vec::new(),
             delayed_offer_ack: None,

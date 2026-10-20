@@ -68,6 +68,12 @@ Every verb the server's `sip` adapter describes has a typed method:
   `ring_with_contact_host`, `DialOptions::caller_contact_host` and
   `route_with_caller_contact_host`, the host of siphon's Contact toward the
   caller, fixed once an 18x or 2xx went out.
+  `contact_user` works the same way for the user part of that Contact, which
+  is otherwise userless (`<sip:trunk-7@sbc.example.net:5061;transport=tls>`):
+  `DialTarget::contact_user(..)`, `RouteTarget { contact_user, .. }`,
+  `OriginateOptions::contact_user(..)`, `ResponseOptions::contact_user`,
+  `DialOptions::caller_contact_user`, and `ring_with_caller_contact` /
+  `route_with_caller_contact`, which take a `CallerContact { host, user }`.
 - **Transfers:** `refer` / `transfer` / `refer_replaces` send a REFER.
   `accept_refer` and `reject_refer` decide a pending inbound one.
   `accept_refer_dialling(target, mode, profile, &TransferDial)` names who the

@@ -2,6 +2,8 @@
 //! and classifying the responses that come back.
 use crate::dispatcher::*;
 
+use super::contact_user::presented_contact_user;
+
 /// Give a call the credentials of the gateway destination its B-leg is going
 /// to, when it has none of its own.
 ///
@@ -108,6 +110,7 @@ pub fn b2bua_send_b_leg_invite(
     branch_from_host: Option<&str>,
     branch_to: Option<&str>,
     branch_contact_host: Option<&str>,
+    branch_contact_user: Option<&str>,
     extra_headers: &[(String, String)],
     state: &DispatcherState,
 ) -> bool {
@@ -127,6 +130,7 @@ pub fn b2bua_send_b_leg_invite(
         branch_from_host,
         branch_to,
         branch_contact_host,
+        branch_contact_user,
         extra_headers,
         state,
     )
@@ -187,6 +191,11 @@ pub fn b2bua_dial_b_leg(
     // part stay as built below, and the leg keeps it as its dialog's local
     // Contact, so every in-dialog request siphon sends on the leg presents it.
     branch_contact_host: Option<&str>,
+    // The user part this branch alone presents in siphon's own `Contact`: a
+    // controller target's `contact_user` ([`DialTarget::contact_user`]). Over
+    // the script's `set_contact_user()`, under its `set_contact_uri()`, and
+    // kept with the rest of the Contact for every in-dialog request.
+    branch_contact_user: Option<&str>,
     extra_headers: &[(String, String)],
     state: &DispatcherState,
 ) -> Option<String> {
@@ -195,6 +204,13 @@ pub fn b2bua_dial_b_leg(
     // they get here, and anything else is refused now, before a leg exists.
     let branch_contact_host = match branch_contact_host.map(checked_contact_host).transpose() {
         Ok(host) => host,
+        Err(error) => {
+            warn!(call_id = %call_id, target = %target_uri, "B2BUA: cannot dial the B-leg: {error}");
+            return None;
+        }
+    };
+    let branch_contact_user = match branch_contact_user.map(checked_contact_user).transpose() {
+        Ok(user) => user,
         Err(error) => {
             warn!(call_id = %call_id, target = %target_uri, "B2BUA: cannot dial the B-leg: {error}");
             return None;
@@ -478,22 +494,32 @@ pub fn b2bua_dial_b_leg(
     // splicing a host into its URI would send them somewhere neither meant.
     let (b_contact_host, b_contact_port) =
         b_leg_sent_by(flow_local_addr, state, &outbound_transport);
-    if let (Some(pinned), Some(script_contact)) =
-        (branch_contact_host.as_deref(), contact_override.as_deref())
-    {
-        warn!(
-            call_id = %call_id,
-            contact_host = %pinned,
-            contact = %script_contact,
-            "B2BUA: the script pinned the whole B-leg Contact with set_contact_uri(); \
-             the target's contact_host is not applied"
-        );
+    if let Some(script_contact) = contact_override.as_deref() {
+        for (argument, pinned) in [
+            ("contact_host", branch_contact_host.as_deref()),
+            ("contact_user", branch_contact_user.as_deref()),
+        ] {
+            if let Some(pinned) = pinned {
+                warn!(
+                    call_id = %call_id,
+                    %argument,
+                    value = %pinned,
+                    contact = %script_contact,
+                    "B2BUA: the script pinned the whole B-leg Contact with set_contact_uri(); \
+                     the target's {argument} is not applied"
+                );
+            }
+        }
     }
+    // A target's `contact_user` outranks the script's `set_contact_user()`.
     let b_contact_value = build_b_leg_contact(
         branch_contact_host.as_deref().unwrap_or(&b_contact_host),
         b_contact_port,
         outbound_transport,
-        contact_user_override.as_deref(),
+        presented_contact_user(
+            branch_contact_user.as_deref(),
+            contact_user_override.as_deref(),
+        ),
         contact_override.as_deref(),
     );
     b_leg_invite.headers.set("Contact", b_contact_value.clone());

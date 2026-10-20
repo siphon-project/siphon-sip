@@ -176,6 +176,7 @@ async fn a_route_verb_target_presents_its_contact_host() {
             reroute_after_progress: false,
             route: Vec::new(),
             contact_host: Some(TENANT_HOST.to_string()),
+            contact_user: None,
         }],
         &[],
         &dispatcher.state,

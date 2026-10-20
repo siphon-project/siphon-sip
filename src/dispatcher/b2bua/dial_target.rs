@@ -70,6 +70,14 @@ pub struct DialTarget {
     /// Validated and stored bracketed when it is an IPv6 address
     /// ([`checked_contact_host`]).
     pub contact_host: Option<String>,
+    /// User part siphon presents in its own `Contact` on this branch's leg,
+    /// where the Contact is otherwise userless: a peer that keys the account on
+    /// the Contact user (`<sip:user@host>`). Host, port and transport stay as
+    /// for [`Self::contact_host`], and the leg keeps it for every in-dialog
+    /// request. Outranks a script's `call.set_contact_user()`; a script's
+    /// `call.set_contact_uri()` outranks both. Validated
+    /// ([`checked_contact_user`]).
+    pub contact_user: Option<String>,
     /// The registered AoR this target is a contact of, when it came from an
     /// `{aor}` target ([`dial_targets_for_aor`]). What the branch's events name
     /// as the AoR it was dialled for; `None` for a URI dialled as written.

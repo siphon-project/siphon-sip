@@ -3,6 +3,7 @@
 use crate::dispatcher::*;
 
 use super::contact_host::check_branch_contact_hosts;
+use super::contact_user::check_branch_contact_users;
 use super::dial_target::{
     apply_dial_identity, branch_called_parties, branch_identities, ShapedFrom,
 };
@@ -29,6 +30,9 @@ pub struct RouteTarget {
     /// Host siphon presents in its own `Contact` on this attempt's leg. See
     /// [`DialTarget::contact_host`].
     pub contact_host: Option<String>,
+    /// User part siphon presents in its own `Contact` on this attempt's leg.
+    /// See [`DialTarget::contact_user`].
+    pub contact_user: Option<String>,
 }
 
 /// The failover queue a `route` verb's targets become: R-URI carriers, as
@@ -57,6 +61,7 @@ fn route_verb_routes(
                 reroute_after_progress: target.reroute_after_progress,
                 route: target.route,
                 contact_host: target.contact_host,
+                contact_user: target.contact_user,
                 ..Default::default()
             }
         })
@@ -1095,6 +1100,7 @@ pub(crate) fn b2bua_dial_call_with_state(
     let branch_tos = branch_called_parties(&targets).map_err(DialError::InvalidIdentity)?;
     let mut targets = targets;
     check_branch_contact_hosts(&mut targets).map_err(DialError::InvalidIdentity)?;
+    check_branch_contact_users(&mut targets).map_err(DialError::InvalidIdentity)?;
 
     if let Some(profile) = shaping.profile.as_deref() {
         let source_ip = state
@@ -1258,6 +1264,7 @@ fn dial_parallel(
                 .and_then(|shaped| shaped.host.as_deref()),
             branch_to.as_deref(),
             target.contact_host.as_deref(),
+            target.contact_user.as_deref(),
             &headers,
             state,
         ) {
@@ -1329,6 +1336,7 @@ fn sequential_dial_routes(
                 // The Contact host this target presents, which every attempt
                 // has to carry for the same reason its route set does.
                 contact_host: target.contact_host,
+                contact_user: target.contact_user,
                 ..Default::default()
             }
         })
@@ -1492,6 +1500,7 @@ mod tests {
             reroute_after_progress,
             route: Vec::new(),
             contact_host: None,
+            contact_user: None,
         }
     }
 

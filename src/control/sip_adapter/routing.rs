@@ -40,19 +40,19 @@ pub(super) fn route(channel: &ChannelRef, args: &serde_json::Value) -> ControlRe
         .unwrap_or("sequential");
     let extra_headers = parse_extra_headers(args.get("headers"));
     let target_count = targets.len();
-    // The caller's own Contact host, which the 2xx relayed to it carries; the
-    // targets' `contact_host` is the one each attempt presents its carrier.
-    let caller_contact_host =
-        match super::caller_contact::parse("route", "caller_contact_host", args) {
-            Ok(host) => host,
-            Err(refusal) => return refusal,
-        };
+    // The caller's own Contact host and user, which the 2xx relayed to it
+    // carries; the targets' `contact_host` / `contact_user` are what each
+    // attempt presents its carrier.
+    let caller_contact = match super::caller_contact::parse("route", "caller_", args) {
+        Ok(contact) => contact,
+        Err(refusal) => return refusal,
+    };
     if let Err(refusal) = super::caller_contact::apply(
         &crate::dispatcher::RunningDispatcher,
         channel,
         "route",
-        "caller_contact_host",
-        caller_contact_host.as_deref(),
+        "caller_",
+        &caller_contact,
     ) {
         return refusal;
     }
@@ -203,13 +203,13 @@ pub(super) fn dial(channel: &ChannelRef, command: &AdapterCommand) -> ControlRes
         .clamp(1, 3600) as u32;
     let extra_headers = parse_extra_headers(args.get("headers"));
     let target_count = targets.len();
-    // The caller's own Contact host. The targets' `contact_host` belongs to the
-    // legs siphon places, so the caller side has a name of its own.
-    let caller_contact_host =
-        match super::caller_contact::parse("dial", "caller_contact_host", args) {
-            Ok(host) => host,
-            Err(refusal) => return refusal,
-        };
+    // The caller's own Contact host and user. The targets' `contact_host` and
+    // `contact_user` belong to the legs siphon places, so the caller side has
+    // names of its own.
+    let caller_contact = match super::caller_contact::parse("dial", "caller_", args) {
+        Ok(contact) => contact,
+        Err(refusal) => return refusal,
+    };
 
     if on_answer == OnAnswer::Bridge {
         return super::dial_bridge::dial_bridge(
@@ -222,7 +222,7 @@ pub(super) fn dial(channel: &ChannelRef, command: &AdapterCommand) -> ControlRes
                 strategy: strategy.to_string(),
                 timeout_secs,
                 ringback,
-                caller_contact_host,
+                caller_contact,
             },
         );
     }
@@ -231,8 +231,8 @@ pub(super) fn dial(channel: &ChannelRef, command: &AdapterCommand) -> ControlRes
         dispatcher.as_ref(),
         channel,
         "dial",
-        "caller_contact_host",
-        caller_contact_host.as_deref(),
+        "caller_",
+        &caller_contact,
     ) {
         return refusal;
     }
@@ -502,6 +502,7 @@ pub(super) fn parse_dial_target(
             .map_err(|error| error.to_string())?,
         to: string_field("to"),
         contact_host: parse_contact_host(object).map_err(|error| format!("target {error}"))?,
+        contact_user: parse_contact_user(object).map_err(|error| format!("target {error}"))?,
         ..Default::default()
     };
 
@@ -531,6 +532,7 @@ pub(super) fn parse_dial_target(
                     branch.privacy = shaped.privacy;
                     branch.to.clone_from(&shaped.to);
                     branch.contact_host.clone_from(&shaped.contact_host);
+                    branch.contact_user.clone_from(&shaped.contact_user);
                 }
                 Ok(branches)
             }
@@ -569,6 +571,7 @@ pub(super) fn parse_route_target(
             reroute_after_progress: false,
             route: Vec::new(),
             contact_host: None,
+            contact_user: None,
         });
     }
     let Some(object) = item.as_object() else {
@@ -602,6 +605,7 @@ pub(super) fn parse_route_target(
     };
     let route = parse_route_set(object)?;
     let contact_host = parse_contact_host(object).map_err(|error| format!("target {error}"))?;
+    let contact_user = parse_contact_user(object).map_err(|error| format!("target {error}"))?;
     Ok(crate::dispatcher::RouteTarget {
         uri: uri.to_string(),
         next_hop,
@@ -610,6 +614,7 @@ pub(super) fn parse_route_target(
         reroute_after_progress,
         route,
         contact_host,
+        contact_user,
     })
 }
 
@@ -631,6 +636,25 @@ pub(super) fn parse_contact_host(
             crate::dispatcher::checked_contact_host(host).map(Some)
         }
         Some(_) => Err("contact_host must be a string".to_string()),
+    }
+}
+
+/// Read a `contact_user`: the user part siphon presents in its own Contact on
+/// the leg, which is otherwise userless, for a peer that keys the account on
+/// the Contact user (`<sip:user@host>`).
+///
+/// Absent or `null` is none. Anything else must be an RFC 3261 `user` and
+/// nothing more; a value siphon cannot put there is refused before anything is
+/// sent, as for [`parse_contact_host`]. The error names the argument.
+pub(super) fn parse_contact_user(
+    object: &serde_json::Map<String, serde_json::Value>,
+) -> Result<Option<String>, String> {
+    match object.get("contact_user") {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(user)) => {
+            crate::dispatcher::checked_contact_user(user).map(Some)
+        }
+        Some(_) => Err("contact_user must be a string".to_string()),
     }
 }
 

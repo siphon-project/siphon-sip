@@ -15,7 +15,7 @@ use siphon_control_client::sip::{
 
 /// Extract one `route` target: a bare URI `str`, or a dict
 /// `{uri, next_hop?, headers?, timeout?, reroute_after_progress?, route?,
-/// contact_host?}`.
+/// contact_host?, contact_user?}`.
 pub(crate) fn extract_route_target(item: &Bound<'_, PyAny>) -> PyResult<RouteTarget> {
     if let Ok(uri) = item.extract::<String>() {
         return Ok(RouteTarget::uri(uri));
@@ -23,7 +23,8 @@ pub(crate) fn extract_route_target(item: &Bound<'_, PyAny>) -> PyResult<RouteTar
     let dict = item.cast::<pyo3::types::PyDict>().map_err(|_| {
         PyValueError::new_err(
             "each route target must be a URI str or a dict \
-             {uri, next_hop, headers, timeout, reroute_after_progress, route, contact_host}",
+             {uri, next_hop, headers, timeout, reroute_after_progress, route, contact_host, \
+             contact_user}",
         )
     })?;
     let uri: String = match dict.get_item("uri")? {
@@ -56,6 +57,7 @@ pub(crate) fn extract_route_target(item: &Bound<'_, PyAny>) -> PyResult<RouteTar
     };
     let route = extract_route_set(dict)?;
     let contact_host = optional_string(dict, "contact_host")?;
+    let contact_user = optional_string(dict, "contact_user")?;
     Ok(RouteTarget {
         uri,
         next_hop,
@@ -64,6 +66,7 @@ pub(crate) fn extract_route_target(item: &Bound<'_, PyAny>) -> PyResult<RouteTar
         reroute_after_progress,
         route,
         contact_host,
+        contact_user,
     })
 }
 
@@ -100,10 +103,11 @@ pub(crate) fn extract_dial_targets(items: &[Bound<'_, PyAny>]) -> PyResult<Vec<D
 }
 
 /// Extract one `dial` target: a dict `{uri, next_hop?, headers?, to?, route?,
-/// contact_host?}` dialed as written, or `{aor, headers?, to?, contact_host?}`
-/// forked to every registered contact. `contact_host` is the host of siphon's
-/// own Contact on the branch (every branch of an AoR), for a peer that
-/// identifies the tenant by that host.
+/// contact_host?, contact_user?}` dialed as written, or `{aor, headers?, to?,
+/// contact_host?, contact_user?}` forked to every registered contact.
+/// `contact_host` is the host of siphon's own Contact on the branch (every
+/// branch of an AoR), for a peer that identifies the tenant by that host, and
+/// `contact_user` the user part of that Contact, otherwise userless.
 ///
 /// A bare string is refused although the server accepts one as a URI. The two
 /// forms do entirely different things — an AoR forks to every contact over that
@@ -123,6 +127,7 @@ fn extract_dial_target(item: &Bound<'_, PyAny>) -> PyResult<DialTarget> {
     let next_hop = optional_string(dict, "next_hop")?;
     let to = optional_string(dict, "to")?;
     let contact_host = optional_string(dict, "contact_host")?;
+    let contact_user = optional_string(dict, "contact_user")?;
     let route = extract_route_set(dict)?;
     let headers = match dict.get_item("headers")? {
         Some(value) if !value.is_none() => extract_headers(&value)?,
@@ -149,6 +154,7 @@ fn extract_dial_target(item: &Bound<'_, PyAny>) -> PyResult<DialTarget> {
             to: None,
             route,
             contact_host: None,
+            contact_user: None,
         },
         (None, Some(aor)) => {
             if next_hop.is_some() {
@@ -180,6 +186,9 @@ fn extract_dial_target(item: &Bound<'_, PyAny>) -> PyResult<DialTarget> {
     }
     if let Some(contact_host) = contact_host {
         target = target.contact_host(contact_host);
+    }
+    if let Some(contact_user) = contact_user {
+        target = target.contact_user(contact_user);
     }
     Ok(target)
 }

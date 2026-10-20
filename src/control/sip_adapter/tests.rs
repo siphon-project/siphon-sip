@@ -3703,3 +3703,224 @@ fn a_caller_contact_host_the_caller_already_holds_otherwise_is_invalid_state() {
     assert_eq!(details["presented"], "192.0.2.1");
     assert_eq!(details["argument"], "caller_contact_host");
 }
+
+/// A target's `contact_user` reaches the dispatcher as the user its Contact
+/// carries, on a `{uri}` and on every contact an `{aor}` forks to, beside a
+/// `contact_host` or alone. A target naming none (or `null`) has none.
+#[test]
+fn dial_target_carries_its_contact_user() {
+    let parsed = parse_dial_target(&serde_json::json!({
+        "uri": "sip:201@198.51.100.7",
+        "contact_user": "trunk-7",
+    }))
+    .expect("the object form is a target");
+    assert_eq!(parsed[0].contact_user.as_deref(), Some("trunk-7"));
+    assert_eq!(parsed[0].contact_host, None);
+    let parsed = parse_dial_target(&serde_json::json!({
+        "uri": "sip:201@198.51.100.7",
+        "contact_host": "sbc.example.net",
+        "contact_user": "trunk-7",
+    }))
+    .expect("both together");
+    assert_eq!(parsed[0].contact_user.as_deref(), Some("trunk-7"));
+    assert_eq!(parsed[0].contact_host.as_deref(), Some("sbc.example.net"));
+    for bare in [
+        serde_json::json!("sip:201@198.51.100.7"),
+        serde_json::json!({"uri": "sip:201@198.51.100.7"}),
+        serde_json::json!({"uri": "sip:201@198.51.100.7", "contact_user": null}),
+    ] {
+        let parsed = parse_dial_target(&bare).expect("a target");
+        assert_eq!(parsed[0].contact_user, None, "{bare}");
+    }
+
+    let registrar = crate::script::api::test_registrar();
+    for (instance, host) in [("a", "198.51.100.133"), ("b", "198.51.100.134")] {
+        registrar
+            .save(
+                "sip:3204@siphon.example.com",
+                crate::sip::uri::SipUri::new(host.to_string()),
+                3600,
+                1.0,
+                format!("register-3204-{instance}"),
+                1,
+            )
+            .expect("the binding saves");
+    }
+    let parsed = parse_dial_target(&serde_json::json!({
+        "aor": "sip:3204@siphon.example.com",
+        "contact_user": "trunk-7",
+    }))
+    .expect("the AoR form is a target");
+    assert_eq!(parsed.len(), 2, "one branch per registered contact");
+    assert!(parsed
+        .iter()
+        .all(|branch| branch.contact_user.as_deref() == Some("trunk-7")));
+}
+
+/// A user siphon cannot put in its Contact is refused, not dropped, on a
+/// `dial` and on a `route` target, naming the argument.
+#[test]
+fn a_target_refuses_a_contact_user_it_cannot_present() {
+    for contact_user in [
+        serde_json::json!(""),
+        serde_json::json!("trunk@sbc.example.net"),
+        serde_json::json!("sip:trunk"),
+        serde_json::json!("trunk:5060"),
+        serde_json::json!("trunk;npdi"),
+        serde_json::json!("tr unk"),
+        serde_json::json!("100%"),
+        serde_json::json!(7),
+        serde_json::json!(["trunk"]),
+    ] {
+        let object = serde_json::json!({
+            "uri": "sip:201@198.51.100.7",
+            "contact_user": contact_user,
+        });
+        let error = parse_dial_target(&object).expect_err("a dial target must refuse it");
+        assert!(error.contains("contact_user"), "{contact_user}: {error}");
+        let error = parse_route_target(&object).expect_err("a route target must refuse it");
+        assert!(error.contains("contact_user"), "{contact_user}: {error}");
+    }
+}
+
+/// The `route` verb's targets carry a `contact_user` as `dial`'s do.
+#[test]
+fn route_target_carries_its_contact_user() {
+    let parsed = parse_route_target(&serde_json::json!({
+        "uri": "sip:+15550100@carrier.example",
+        "contact_user": "trunk-7",
+    }))
+    .expect("the object form is a target");
+    assert_eq!(parsed.contact_user.as_deref(), Some("trunk-7"));
+    assert_eq!(
+        parse_route_target(&serde_json::json!("sip:1@carrier.example"))
+            .expect("a URI string is a target")
+            .contact_user,
+        None
+    );
+}
+
+/// `dial` and `route` refuse an unusable target `contact_user` as
+/// `bad_request` through the adapter's dispatch, before anything is dialled.
+#[test]
+fn dial_and_route_refuse_an_unusable_contact_user_as_bad_request() {
+    for verb in ["dial", "route"] {
+        let result = sip_command(
+            verb,
+            serde_json::json!({"targets": [{
+                "uri": "sip:201@example.com",
+                "contact_user": "trunk@sbc.example.net",
+            }]}),
+        );
+        let ControlResult::Error { code, message, .. } = result else {
+            panic!("{verb} accepted it");
+        };
+        assert_eq!(code, ControlErrorCode::BadRequest, "{verb}");
+        assert!(message.contains("contact_user"), "{verb}: {message}");
+    }
+}
+
+/// A transfer's new leg presents siphon's userless Contact, so a
+/// `contact_user` on `replace_peer` or `accept_refer`, on the verb or its
+/// target, is refused rather than ignored.
+#[test]
+fn a_transfer_refuses_a_contact_user() {
+    for verb in ["replace_peer", "accept_refer"] {
+        for args in [
+            serde_json::json!({
+                "target": { "uri": "sip:204@198.51.100.7", "contact_user": "trunk-7" },
+            }),
+            serde_json::json!({
+                "target": "sip:204@198.51.100.7",
+                "contact_user": "trunk-7",
+            }),
+        ] {
+            let Err(ControlResult::Error { code, message, .. }) = parse_transfer_dial(verb, &args)
+            else {
+                panic!("{verb} accepted {args}");
+            };
+            assert_eq!(code, ControlErrorCode::BadRequest, "{verb}: {args}");
+            assert!(message.contains("contact_user"), "{verb}: {message}");
+        }
+    }
+}
+
+/// The caller's Contact user is checked through the adapter's dispatch before
+/// any verb sends anything: on `answer`, `ring` and `progress` as
+/// `contact_user`, on `dial` and `route` as `caller_contact_user`.
+#[test]
+fn a_caller_contact_user_siphon_cannot_present_is_bad_request() {
+    for (verb, argument) in [
+        ("answer", "contact_user"),
+        ("ring", "contact_user"),
+        ("progress", "contact_user"),
+        ("dial", "caller_contact_user"),
+        ("route", "caller_contact_user"),
+    ] {
+        for value in [
+            serde_json::json!(""),
+            serde_json::json!("trunk@sbc.example.net"),
+            serde_json::json!("trunk;npdi"),
+            serde_json::json!(7),
+        ] {
+            let mut args = serde_json::json!({ argument: value });
+            if matches!(verb, "dial" | "route") {
+                args["targets"] = serde_json::json!(["sip:201@example.com"]);
+            }
+            let ControlResult::Error { code, message, .. } = sip_command(verb, args) else {
+                panic!("{verb} accepted {argument} {value}");
+            };
+            assert_eq!(code, ControlErrorCode::BadRequest, "{verb} {value}");
+            assert!(message.contains(argument), "{verb}: {message}");
+        }
+    }
+}
+
+/// A valid caller Contact user passes the check on every verb and reaches the
+/// call: in this unit context no B2BUA runs, so the verb stops there as
+/// `unavailable`, where an invalid one stopped as `bad_request` above.
+#[test]
+fn a_valid_caller_contact_user_reaches_the_dispatcher() {
+    for (verb, argument) in [
+        ("answer", "contact_user"),
+        ("ring", "contact_user"),
+        ("progress", "contact_user"),
+        ("route", "caller_contact_user"),
+    ] {
+        let mut args = serde_json::json!({ argument: "trunk-7" });
+        if verb == "route" {
+            args["targets"] = serde_json::json!(["sip:201@example.com"]);
+        }
+        let ControlResult::Error { code, message, .. } = sip_command(verb, args) else {
+            panic!("{verb} succeeded with no B2BUA");
+        };
+        assert_eq!(code, ControlErrorCode::Unavailable, "{verb}: {message}");
+        assert!(
+            message.contains("b2bua is not running"),
+            "{verb}: {message}"
+        );
+    }
+}
+
+/// A different user once the caller holds a Contact is `invalid_state`, with
+/// the user it holds in the details, `null` for the userless Contact.
+#[test]
+fn a_caller_contact_user_the_caller_already_holds_otherwise_is_invalid_state() {
+    for presented in [None, Some("trunk-7".to_string())] {
+        let result = super::caller_contact::refused(
+            "answer",
+            "contact_user",
+            crate::dispatcher::CallerContactHostRefusal::UserAlreadyPresented {
+                presented: presented.clone(),
+            },
+        );
+        let ControlResult::Error { code, details, .. } = result else {
+            panic!("a refusal");
+        };
+        assert_eq!(code, ControlErrorCode::InvalidState);
+        let details = details.expect("details");
+        assert_eq!(details["reason"], "contact_already_presented");
+        assert_eq!(details["presented"], serde_json::json!(presented));
+        assert_eq!(details["argument"], "contact_user");
+    }
+}

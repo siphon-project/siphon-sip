@@ -1425,3 +1425,111 @@ describe("the caller's contact host rides the verbs whose subject is the caller"
     });
   });
 });
+
+describe("contactUser rides beside contactHost everywhere it does", () => {
+  it("a dial target sends contact_user alone, beside contact_host, and not when absent", () => {
+    expect(
+      dialArgs([
+        { uri: "sip:+15550199@trunk.example", contactUser: "trunk-7" },
+        {
+          uri: "sip:+15550199@trunk.example",
+          contactHost: "sbc.example.net",
+          contactUser: "trunk-7",
+        },
+        { aor: "sip:204@pbx.example", contactUser: "trunk-8" },
+        { uri: "sip:1001@pbx.example" },
+      ]),
+    ).toEqual({
+      targets: [
+        { uri: "sip:+15550199@trunk.example", contact_user: "trunk-7" },
+        {
+          uri: "sip:+15550199@trunk.example",
+          contact_host: "sbc.example.net",
+          contact_user: "trunk-7",
+        },
+        { aor: "sip:204@pbx.example", contact_user: "trunk-8" },
+        "sip:1001@pbx.example",
+      ],
+    });
+    expect(() =>
+      dialArgs([{ uri: "sip:1001@pbx.example", contactUser: 7 } as never]),
+    ).toThrow(/contactUser/);
+  });
+
+  it("a route target sends contact_user, and refuses a non-string", async () => {
+    const transport = new RecordingTransport({ channel: "ch1", state: "routing", targets: 1 });
+    const call = makeCall(transport);
+    await call.route([{ uri: "sip:+15550100@carrier.example", contactUser: "trunk-7" }]);
+    expect(transport.calls[0]?.args).toEqual({
+      targets: [{ uri: "sip:+15550100@carrier.example", contact_user: "trunk-7" }],
+      strategy: "sequential",
+    });
+    await expect(
+      call.route([{ uri: "sip:gw", contactUser: ["trunk-7"] } as never]),
+    ).rejects.toThrow(/contactUser/);
+    expect(transport.calls).toHaveLength(1);
+  });
+
+  it("originate sends contact_user on to and on aor", () => {
+    expect(
+      originateArgs("out-1", "sip:1001@pbx.example", { sdp: "v=0\r\n" }, {
+        contactHost: "sbc.example.net",
+        contactUser: "trunk-7",
+      }),
+    ).toEqual({
+      channel: "out-1",
+      to: "sip:1001@pbx.example",
+      sdp: "v=0\r\n",
+      contact_host: "sbc.example.net",
+      contact_user: "trunk-7",
+    });
+    expect(
+      originateAorArgs("wake-201", "sip:201@example.com", { anchor: true }, {
+        contactUser: "trunk-7",
+      }),
+    ).toEqual({
+      channel: "wake-201",
+      aor: "sip:201@example.com",
+      media: true,
+      contact_user: "trunk-7",
+    });
+  });
+
+  it("answer / answerAnchored / ring / progress send contact_user only when given", async () => {
+    const transport = new RecordingTransport({ channel: "ch1", state: "answered" });
+    const call = makeCall(transport);
+    await call.ring(undefined, { contactUser: "trunk-7" });
+    await call.progress({ code: 183, contactUser: "trunk-7" });
+    await call.answer({ contactHost: "sbc.example.net", contactUser: "trunk-7" });
+    await call.answerAnchored({ profile: "voice_ai", contactUser: "trunk-7" });
+    await call.answer({});
+    expect(transport.calls.map((sent) => [sent.verb, sent.args])).toEqual([
+      ["ring", { contact_user: "trunk-7" }],
+      ["progress", { code: 183, contact_user: "trunk-7" }],
+      ["answer", { contact_host: "sbc.example.net", contact_user: "trunk-7" }],
+      ["answer", { anchor: true, profile: "voice_ai", contact_user: "trunk-7" }],
+      ["answer", {}],
+    ]);
+  });
+
+  it("dial and route name it caller_contact_user, apart from each target's", async () => {
+    expect(
+      dialArgs([{ uri: "sip:204@pbx.example", contactUser: "trunk-8" }], {
+        callerContactUser: "trunk-7",
+      }),
+    ).toEqual({
+      targets: [{ uri: "sip:204@pbx.example", contact_user: "trunk-8" }],
+      caller_contact_user: "trunk-7",
+    });
+    const transport = new RecordingTransport({ channel: "ch1", state: "routing", targets: 1 });
+    const call = makeCall(transport);
+    await call.route(["sip:+15550100@carrier.example"], "sequential", undefined, {
+      callerContactUser: "trunk-7",
+    });
+    expect(transport.calls[0]?.args).toEqual({
+      targets: ["sip:+15550100@carrier.example"],
+      strategy: "sequential",
+      caller_contact_user: "trunk-7",
+    });
+  });
+});

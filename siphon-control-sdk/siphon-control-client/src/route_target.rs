@@ -12,7 +12,8 @@ use crate::sip::headers_to_json;
 ///
 /// A bare URI (no overrides) serializes to a plain string on the wire; a target
 /// carrying any override serializes to
-/// `{uri, next_hop?, headers?, timeout?, reroute_after_progress?, route?, contact_host?}` — both
+/// `{uri, next_hop?, headers?, timeout?, reroute_after_progress?, route?, contact_host?,
+/// contact_user?}` — both
 /// shapes the server's `route` verb accepts. Build a bare-URI target with
 /// [`RouteTarget::uri`], or from a `&str` / `String`, and set overrides with
 /// struct-update syntax: `RouteTarget { timeout_secs: Some(6), ..RouteTarget::uri(uri) }`.
@@ -52,6 +53,11 @@ pub struct RouteTarget {
     /// [`DialTarget::contact_host`](crate::DialTarget::contact_host). `None`
     /// (the default) presents the advertised host.
     pub contact_host: Option<String>,
+    /// User part of siphon's own Contact on this attempt's leg, which is
+    /// otherwise userless, for a peer that identifies the trunk or account by
+    /// it; see [`DialTarget::contact_user`](crate::DialTarget::contact_user).
+    /// `None` (the default) presents the userless Contact.
+    pub contact_user: Option<String>,
 }
 
 impl RouteTarget {
@@ -71,6 +77,7 @@ impl RouteTarget {
             && !self.reroute_after_progress
             && self.route.is_empty()
             && self.contact_host.is_none()
+            && self.contact_user.is_none()
     }
 
     pub(crate) fn to_json(&self) -> serde_json::Value {
@@ -97,6 +104,9 @@ impl RouteTarget {
         }
         if let Some(contact_host) = &self.contact_host {
             object.insert("contact_host".to_string(), json!(contact_host));
+        }
+        if let Some(contact_user) = &self.contact_user {
+            object.insert("contact_user".to_string(), json!(contact_user));
         }
         serde_json::Value::Object(object)
     }
@@ -157,6 +167,39 @@ mod tests {
                 "contact_host": "tenant-a.example.com"
             })
         );
+    }
+
+    #[test]
+    fn a_contact_user_goes_out_on_the_target_alone_or_beside_the_host() {
+        let target = RouteTarget {
+            contact_user: Some("trunk-7".to_string()),
+            ..RouteTarget::uri("sip:+15550100@carrier.example")
+        };
+        assert_eq!(
+            target.to_json(),
+            json!({
+                "uri": "sip:+15550100@carrier.example",
+                "contact_user": "trunk-7"
+            })
+        );
+        let target = RouteTarget {
+            contact_host: Some("sbc.example.net".to_string()),
+            contact_user: Some("trunk-7".to_string()),
+            ..RouteTarget::uri("sip:+15550100@carrier.example")
+        };
+        assert_eq!(
+            target.to_json(),
+            json!({
+                "uri": "sip:+15550100@carrier.example",
+                "contact_host": "sbc.example.net",
+                "contact_user": "trunk-7"
+            })
+        );
+        let target = RouteTarget {
+            timeout_secs: Some(6),
+            ..RouteTarget::uri("sip:+15550100@carrier.example")
+        };
+        assert!(target.to_json().get("contact_user").is_none());
     }
 
     #[test]

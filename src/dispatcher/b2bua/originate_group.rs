@@ -1144,6 +1144,7 @@ fn place_leg(
         route: target.route.clone(),
         hide_from_host: target.hide_from_host,
         contact_host: target.contact_host.clone(),
+        contact_user: target.contact_user.clone(),
     };
     let prepared = match prepare_originate_routed(state, params, &route) {
         Ok(prepared) => prepared,
