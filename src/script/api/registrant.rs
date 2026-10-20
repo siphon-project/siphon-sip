@@ -312,10 +312,13 @@ impl PyRegistration {
     ///
     /// The handler receives (aor, event_type, state) where:
     ///   - aor: str — Address of Record (e.g. "sip:trunk@carrier.com")
-    ///   - event_type: str — "registered", "refreshed", "failed", or "deregistered"
+    ///   - event_type: str — "registered", "refreshed", "failed",
+    ///     "deregistered", or "snapshot" (a re-report of every outbound
+    ///     registration after the handler fell behind and events were lost)
     ///   - state: dict — {"expires_in": int, "failure_count": int,
-    ///     "registrar": str, "status_code": int (only present when
-    ///     event_type is "failed")}
+    ///     "registrar": str, "state": str | None (the current state, None once
+    ///     removed), "status_code": int (only present when event_type is
+    ///     "failed")}
     ///
     /// Mirrors `registrar.on_change`. The dispatcher invokes these handlers on
     /// `RegistrantManager` state changes (`HandlerKind::RegistrantOnChange`).

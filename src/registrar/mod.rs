@@ -1243,6 +1243,22 @@ impl Registrar {
             .count()
     }
 
+    /// Every AoR holding at least one live UE binding, by its primary key —
+    /// the AoRs [`aor_count`](Self::aor_count) counts. What a consumer that
+    /// lost registration events is re-told the current state of.
+    pub fn registered_aors(&self) -> Vec<Aor> {
+        self.bindings
+            .iter()
+            .filter(|entry| {
+                entry
+                    .value()
+                    .iter()
+                    .any(|c| !c.is_expired() && c.kind == ContactKind::Ue)
+            })
+            .map(|entry| entry.key().clone())
+            .collect()
+    }
+
     /// Number of registered AoRs across the whole deployment.
     ///
     /// When a persistent backend (Redis, Postgres) is configured, this asks
@@ -5734,6 +5750,53 @@ mod tests {
         };
         registrar.bindings.entry(aor).or_default().push(as_only);
         assert_eq!(registrar.aor_count(), 0);
+        assert!(
+            registrar.registered_aors().is_empty(),
+            "an AS-only AoR is not one a lagged consumer is re-told about"
+        );
+    }
+
+    #[test]
+    fn registered_aors_names_each_aor_with_a_live_binding_once() {
+        let registrar = Registrar::default();
+        registrar
+            .save(
+                "sip:alice@example.com",
+                contact_uri("alice", "192.0.2.1"),
+                3600,
+                1.0,
+                "a1".into(),
+                1,
+            )
+            .expect("saved");
+        registrar
+            .save(
+                "sip:alice@example.com",
+                contact_uri("alice", "192.0.2.2"),
+                3600,
+                0.5,
+                "a2".into(),
+                1,
+            )
+            .expect("saved");
+        registrar
+            .save(
+                "sip:bob@example.com",
+                contact_uri("bob", "192.0.2.3"),
+                3600,
+                1.0,
+                "b1".into(),
+                1,
+            )
+            .expect("saved");
+        registrar.remove_all("sip:bob@example.com");
+
+        assert_eq!(
+            registrar.registered_aors(),
+            vec!["sip:alice@example.com".to_string()],
+            "one entry per AoR, none for an AoR whose bindings are gone"
+        );
+        assert_eq!(registrar.registered_aors().len(), registrar.aor_count());
     }
 
     /// Save one binding of `aor` at `contact`, from `source`, stored by a

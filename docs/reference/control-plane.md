@@ -687,7 +687,11 @@ control:
 The frame carries no `channel`, `call_id` or `sip_call_id` — there is no call
 for it to be about — and its payload is
 `{aor, event, contacts: [{uri, expires, q}]}`, where `event` is `registered`,
-`refreshed`, `deregistered` or `expired`. It reaches **every** connection of a
+`refreshed`, `deregistered`, `expired` or `snapshot`. `snapshot` is not a
+change: when siphon's registration event task fell so far behind the registrar
+that events were lost, it re-reports every registered AoR with its current
+contacts under `snapshot` (an AoR whose bindings went away among the lost
+events is not in it). It reaches **every** connection of a
 subscribed app rather than one picked round robin: a dashboard behind two
 replicas needs both to see it, and there is no call here whose ownership would
 decide which.

@@ -71,6 +71,7 @@ mod media_init;
 mod proxy_dialog_state;
 mod proxy_release;
 mod registrant;
+mod registration_events;
 mod relay;
 mod request;
 mod response;
