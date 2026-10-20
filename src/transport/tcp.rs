@@ -1229,6 +1229,7 @@ mod tests {
                 data: Bytes::from_static(MT_OPTIONS.as_bytes()),
                 source_local_addr: None,
                 server_name: None,
+                verify_server: None,
             })
             .unwrap();
         let mut received = vec![0u8; MT_OPTIONS.len()];

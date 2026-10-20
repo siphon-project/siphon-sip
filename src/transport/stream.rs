@@ -134,6 +134,7 @@ async fn send_via_pool(
 ) {
     let destination = outbound.destination;
     let server_name = outbound.server_name.clone();
+    let verify_server = outbound.verify_server;
     let requested_connection_id = outbound.connection_id;
     let source = pool_tcp_source(outbound.source_local_addr, destination, is_protected);
     for frame in outbound.into_frames() {
@@ -141,7 +142,7 @@ async fn send_via_pool(
         let attempted = frame.clone();
         let sent = match transport {
             Transport::Tls => {
-                pool.send_tls(destination, server_name.as_deref(), frame)
+                pool.send_tls_with_policy(destination, server_name.as_deref(), verify_server, frame)
                     .await
             }
             Transport::Tcp => match source {
@@ -1119,6 +1120,7 @@ mod tests {
                 data: Bytes::from_static(b"OPTIONS sip:ue.example.invalid SIP/2.0\r\n\r\n"),
                 source_local_addr: Some(source),
                 server_name: None,
+                verify_server: None,
                 followups: None,
             })
             .unwrap();
@@ -1142,6 +1144,7 @@ mod tests {
             data: Bytes::from_static(b"OPTIONS sip:ue.example.invalid SIP/2.0\r\n\r\n"),
             source_local_addr: None,
             server_name: None,
+            verify_server: None,
             followups: None,
         }
     }

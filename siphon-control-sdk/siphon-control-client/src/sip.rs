@@ -1777,6 +1777,7 @@ mod tests {
                         route: Vec::new(),
                         contact_host: None,
                         contact_user: None,
+                        verify_server: None,
                     },
                 ],
                 Some("sequential"),

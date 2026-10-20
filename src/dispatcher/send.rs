@@ -51,6 +51,7 @@ pub(super) fn send_outbound_from(
         data,
         source_local_addr,
         server_name: None,
+        verify_server: None,
         followups: None,
     };
 
@@ -249,6 +250,7 @@ pub(super) fn send_frames_in_order_from(
         data: first,
         source_local_addr,
         server_name: None,
+        verify_server: None,
         followups: if followups.is_empty() {
             None
         } else {

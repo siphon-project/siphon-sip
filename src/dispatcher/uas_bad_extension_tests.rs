@@ -258,6 +258,7 @@ fn route_target() -> RouteTarget {
         route: Vec::new(),
         contact_host: None,
         contact_user: None,
+        verify_server: None,
     }
 }
 

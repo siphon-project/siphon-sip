@@ -111,6 +111,7 @@ pub fn b2bua_send_b_leg_invite(
     branch_to: Option<&str>,
     branch_contact_host: Option<&str>,
     branch_contact_user: Option<&str>,
+    verify_server: Option<bool>,
     extra_headers: &[(String, String)],
     state: &DispatcherState,
 ) -> bool {
@@ -131,6 +132,7 @@ pub fn b2bua_send_b_leg_invite(
         branch_to,
         branch_contact_host,
         branch_contact_user,
+        verify_server,
         extra_headers,
         state,
     )
@@ -196,6 +198,10 @@ pub fn b2bua_dial_b_leg(
     // the script's `set_contact_user()`, under its `set_contact_uri()`, and
     // kept with the rest of the Contact for every in-dialog request.
     branch_contact_user: Option<&str>,
+    // Server verification on a new TLS connection for this branch alone: a
+    // controller `dial` target's `verify_server`. Wins over the gateway the
+    // branch routes to and over `tls.verify_server`; `None` leaves it to them.
+    verify_server: Option<bool>,
     extra_headers: &[(String, String)],
     state: &DispatcherState,
 ) -> Option<String> {
@@ -233,6 +239,8 @@ pub fn b2bua_dial_b_leg(
         routing_uri,
         mut destination,
         transport: mut outbound_transport,
+        server_name: tls_server_name,
+        verify_server: routed_verify_server,
     } = match resolve_leg_destination(target_uri, next_hop, flow, b_leg_route, &state.dns_resolver)
     {
         Ok(resolved) => resolved,
@@ -913,10 +921,14 @@ pub fn b2bua_dial_b_leg(
             return None;
         }
     } else {
+        // The routed host, so a TLS B-leg to a trunk named by hostname presents
+        // it as SNI and, when verified, checks the certificate against it
+        // rather than the address it resolved to.
         let relay_target = RelayTarget {
             address: destination,
             transport: Some(outbound_transport),
-            server_name: None,
+            server_name: tls_server_name,
+            verify_server: verify_server.or(routed_verify_server),
         };
         send_to_target(
             data,

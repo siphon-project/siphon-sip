@@ -35,6 +35,26 @@ entry, but a working config keeps working.
   `set_contact_user()`; the script's `set_contact_uri()` outranks both. The
   Rust, Python and TypeScript control SDKs take it as `contact_user` /
   `caller_contact_user` and `contactUser` / `callerContactUser`.
+- **Opt-in server certificate verification on outbound SIP TLS.** Outbound TLS
+  to trunks was encrypted but never authenticated: caller identity and SDES keys
+  went to whoever answered on the address. `tls.verify_server: true` (or
+  `verify_server` on a gateway destination or group, or on a control `dial` /
+  `route` target, which win in that order) now checks the chain against
+  `tls.server_ca` (replacing the bundled Mozilla roots) and the host siphon
+  routed on, never the resolved address or an SRV target (RFC 5922 §4), as a SIP
+  domain per RFC 5922 §7: a `sip:` URI SAN beats dNSName, matching is exact, no
+  wildcards, and an IP-literal target needs an iPAddress SAN. Off by default;
+  worth turning on for any gateway reached by hostname. A refused certificate
+  fails the request like a refused connect and is logged with the destination
+  and reason. Verified and unverified connections to one address are never
+  shared, and a verified send no longer reuses a connection the peer opened
+  inbound. Client certificates are still presented. The gateway HTTP/database
+  source takes an optional `verify_server` column. Control SDKs:
+  `DialTarget::verify_server` / `RouteTarget::verify_server` (Rust; adds a field
+  to the `DialTarget` enum variants and `RouteTarget`, a breaking change for code
+  building them by struct literal), `verify_server` in Python target dicts,
+  `verifyServer` in TypeScript.
+
 - **Control plane: `reroute_after_progress` on `dial` targets.** A sequential
   `dial` moves on when a target rings out or fails, which is right for a hunt
   through phones and wrong for a hunt across several routes to one
@@ -82,6 +102,12 @@ entry, but a working config keeps working.
 
 ### Fixed
 
+- **A TLS B-leg and an originate to a hostname now present that hostname as
+  SNI.** They sent the resolved address, so a hostname-vhost trunk could not
+  route the handshake. Outbound TLS REGISTERs present the registrar's domain the
+  same way, and the gateway OPTIONS probe no longer puts a `;transport=` URI
+  parameter into the SNI of a destination configured without a port. A
+  bracketed IPv6 host is accepted as a TLS server name.
 - **A `6xx` ends a sequential control-plane `dial`.** A bridging dial
   (`on_answer: "bridge"`) and a sequential `originate {aor}` moved on to their
   next target after a `600`/`603`/`604`/`606`, ringing the person who had just

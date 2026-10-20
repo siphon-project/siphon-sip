@@ -13,7 +13,7 @@ use crate::sip::headers_to_json;
 /// A bare URI (no overrides) serializes to a plain string on the wire; a target
 /// carrying any override serializes to
 /// `{uri, next_hop?, headers?, timeout?, reroute_after_progress?, route?, contact_host?,
-/// contact_user?}` — both
+/// contact_user?, verify_server?}` — both
 /// shapes the server's `route` verb accepts. Build a bare-URI target with
 /// [`RouteTarget::uri`], or from a `&str` / `String`, and set overrides with
 /// struct-update syntax: `RouteTarget { timeout_secs: Some(6), ..RouteTarget::uri(uri) }`.
@@ -58,6 +58,12 @@ pub struct RouteTarget {
     /// it; see [`DialTarget::contact_user`](crate::DialTarget::contact_user).
     /// `None` (the default) presents the userless Contact.
     pub contact_user: Option<String>,
+    /// Verify (`Some(true)`) or not (`Some(false)`) the server certificate when
+    /// this attempt opens a new outbound TLS connection, over the gateway it
+    /// routes to and the server's `tls.verify_server`; see
+    /// [`DialTarget::verify_server`](crate::DialTarget::verify_server). `None`
+    /// (the default) leaves it to the server.
+    pub verify_server: Option<bool>,
 }
 
 impl RouteTarget {
@@ -78,6 +84,7 @@ impl RouteTarget {
             && self.route.is_empty()
             && self.contact_host.is_none()
             && self.contact_user.is_none()
+            && self.verify_server.is_none()
     }
 
     pub(crate) fn to_json(&self) -> serde_json::Value {
@@ -108,6 +115,9 @@ impl RouteTarget {
         if let Some(contact_user) = &self.contact_user {
             object.insert("contact_user".to_string(), json!(contact_user));
         }
+        if let Some(verify_server) = self.verify_server {
+            object.insert("verify_server".to_string(), json!(verify_server));
+        }
         serde_json::Value::Object(object)
     }
 }
@@ -131,6 +141,23 @@ mod tests {
     #[test]
     fn a_bare_uri_is_a_plain_string() {
         assert_eq!(RouteTarget::uri("sip:gw").to_json(), json!("sip:gw"));
+    }
+
+    #[test]
+    fn verify_server_goes_out_either_way_once_set() {
+        for verify in [true, false] {
+            let target = RouteTarget {
+                verify_server: Some(verify),
+                ..RouteTarget::uri("sip:+15550100@trunk.example.net;transport=tls")
+            };
+            assert_eq!(
+                target.to_json(),
+                json!({
+                    "uri": "sip:+15550100@trunk.example.net;transport=tls",
+                    "verify_server": verify
+                })
+            );
+        }
     }
 
     #[test]

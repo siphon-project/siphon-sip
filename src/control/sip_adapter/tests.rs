@@ -2692,6 +2692,40 @@ fn dial_refuses_a_malformed_route_set_as_bad_request() {
     ));
 }
 
+/// A target's `verify_server` reaches the dispatcher as given, on a dial and
+/// a route target alike; absent or null is no opinion, and anything but a
+/// boolean is refused rather than read as `false`.
+#[test]
+fn a_target_carries_its_verify_server() {
+    for (value, expected) in [
+        (serde_json::json!(true), Some(true)),
+        (serde_json::json!(false), Some(false)),
+        (serde_json::Value::Null, None),
+    ] {
+        let target = serde_json::json!({
+            "uri": "sip:+15550100@trunk.example.net;transport=tls",
+            "verify_server": value,
+        });
+        let dial = parse_dial_target(&target).expect("a dial target");
+        assert_eq!(dial[0].verify_server, expected, "{target}");
+        let route = parse_route_target(&target).expect("a route target");
+        assert_eq!(route.verify_server, expected, "{target}");
+    }
+    let bare = parse_dial_target(&serde_json::json!("sip:+15550100@trunk.example.net"))
+        .expect("a bare URI");
+    assert_eq!(bare[0].verify_server, None);
+
+    for refused in [serde_json::json!("true"), serde_json::json!(1)] {
+        let target = serde_json::json!({
+            "uri": "sip:+15550100@trunk.example.net",
+            "verify_server": refused,
+        });
+        let error = parse_dial_target(&target).expect_err("not a boolean");
+        assert!(error.contains("verify_server"), "{error}");
+        assert!(parse_route_target(&target).is_err());
+    }
+}
+
 /// A target's `contact_host` reaches the dispatcher as the host its Contact
 /// carries, an IPv6 address bracketed, on a `{uri}` and on every contact an
 /// `{aor}` forks to. A target naming none has none.

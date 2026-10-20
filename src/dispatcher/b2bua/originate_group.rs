@@ -1230,6 +1230,7 @@ fn place_leg(
             .early_offer
             .clone()
             .filter(|_| target.offer == Some(DialOffer::Early)),
+        verify_server: target.verify_server,
     };
     let prepared = match prepare_originate_routed(state, params, &route) {
         Ok(prepared) => prepared,

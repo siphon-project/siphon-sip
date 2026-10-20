@@ -171,6 +171,7 @@ async fn a_route_verb_target_presents_its_contact_user() {
             route: Vec::new(),
             contact_host: None,
             contact_user: Some(TRUNK_USER.to_string()),
+            verify_server: None,
         }],
         &[],
         &dispatcher.state,

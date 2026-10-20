@@ -119,6 +119,10 @@ pub struct OriginateRoute {
     /// ([`allocate_leg_offer`]), and the callee answers in its 2xx. `None`
     /// sends an anchored originate offerless, as ever.
     pub early_offer: Option<LegOfferCaller>,
+    /// Server verification on a new TLS connection for this leg (see
+    /// [`DialTarget::verify_server`]). Wins over the gateway the leg routes to
+    /// and over `tls.verify_server`; `None` leaves it to them.
+    pub verify_server: Option<bool>,
 }
 
 /// Why an originate was refused. Each variant maps to its own control-plane
@@ -182,6 +186,11 @@ pub struct PreparedOriginate {
     pub invite: SipMessage,
     pub destination: SocketAddr,
     pub transport: Transport,
+    /// The routed host a new TLS connection presents and verifies.
+    pub tls_server_name: Option<String>,
+    /// The routed destination's own server verification setting (a gateway's
+    /// `verify_server`); `None` follows `tls.verify_server`.
+    pub verify_server: Option<bool>,
     pub timeout_secs: u32,
 }
 
@@ -301,6 +310,8 @@ pub fn prepare_originate_routed(
         routing_uri,
         destination,
         transport,
+        server_name: tls_server_name,
+        verify_server,
     } = resolve_leg_destination(
         request_uri,
         params.next_hop.as_deref(),
@@ -482,6 +493,8 @@ pub fn prepare_originate_routed(
         invite,
         destination,
         transport,
+        tls_server_name,
+        verify_server: route.verify_server.or(verify_server),
         timeout_secs: params.timeout_secs,
     })
 }
@@ -809,7 +822,8 @@ pub fn dial_originate(state: &DispatcherState, prepared: &PreparedOriginate) -> 
             let relay_target = RelayTarget {
                 address: prepared.destination,
                 transport: Some(prepared.transport),
-                server_name: None,
+                server_name: prepared.tls_server_name.clone(),
+                verify_server: prepared.verify_server,
             };
             send_to_target(
                 data,

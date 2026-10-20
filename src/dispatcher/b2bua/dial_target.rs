@@ -78,6 +78,12 @@ pub struct DialTarget {
     /// `call.set_contact_uri()` outranks both. Validated
     /// ([`checked_contact_user`]).
     pub contact_user: Option<String>,
+    /// Verify the server certificate on a new outbound TLS connection for this
+    /// branch: the chain against `tls.server_ca` (or the bundled Mozilla
+    /// roots) and the host of the URI it routes to (`next_hop`, else `uri`) as
+    /// a SIP domain (RFC 5922 §7). Wins over the gateway the branch routes to
+    /// and over `tls.verify_server`; `None` leaves it to them.
+    pub verify_server: Option<bool>,
     /// The registered AoR this target is a contact of, when it came from an
     /// `{aor}` target ([`dial_targets_for_aor`]). What the branch's events name
     /// as the AoR it was dialled for; `None` for a URI dialled as written.

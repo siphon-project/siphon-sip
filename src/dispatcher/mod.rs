@@ -354,6 +354,8 @@ mod test_dispatcher;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
+mod tls_verify_server_tests;
+#[cfg(test)]
 mod transfer_bye_tests;
 #[cfg(test)]
 mod transfer_ingress_tests;

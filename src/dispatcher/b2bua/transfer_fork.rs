@@ -517,6 +517,9 @@ impl ReplacementPlan<'_> {
                 // `contact_host` and a `contact_user`.
                 None,
                 None,
+                // Its own server verification comes from where it routes (a
+                // gateway's `verify_server`), else `tls.verify_server`.
+                None,
                 shaped.headers.as_slice(),
                 self.state,
             )

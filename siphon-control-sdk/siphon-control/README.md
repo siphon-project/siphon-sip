@@ -169,6 +169,9 @@ reported as a failure. That is damage control, not a substitute for closing.
   identifies the tenant or account by that host. Only the host changes. Any target
   may also carry `"contact_user"`, the user part of that Contact
   (`<sip:trunk-7@sbc.example.net:5061;transport=tls>`), alone or beside `"contact_host"`.
+  Any target may also carry `"verify_server"` (a bool): verify the server
+  certificate when that leg opens a new outbound TLS connection, over the gateway it
+  routes to and the server's `tls.verify_server`.
   A `dial` target of either form may carry `"reroute_after_progress": False`
   (a `bool`, anything else raises `TypeError`; server default `True`): a
   sequential dial then ends on that target once it has rung, its ring timeout,

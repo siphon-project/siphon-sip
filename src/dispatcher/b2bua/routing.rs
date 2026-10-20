@@ -527,6 +527,7 @@ pub fn b2bua_advance_route_with_numbers(
             route.presented_to.as_deref(),
             route.contact_host.as_deref(),
             route.contact_user.as_deref(),
+            route.verify_server,
             &extra_headers,
             state,
         );
