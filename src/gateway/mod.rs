@@ -23,6 +23,7 @@ use dashmap::DashMap;
 use ipnet::IpNet;
 use tracing::{debug, error, info, warn};
 
+mod allow_methods;
 mod inbound_limit;
 #[cfg(test)]
 mod inbound_limit_tests;
@@ -365,6 +366,9 @@ pub struct DispatcherGroup {
     /// registered — see [`inbound_limit`]. They belong to the group's name, not
     /// to this object, so a refresh that rebuilds the group keeps the count.
     inbound_state: Option<Arc<crate::admission::LimitState>>,
+    /// `gateway.groups[].allow_methods` as an `Allow` value. `None` = every
+    /// method siphon implements — see [`allow_methods`].
+    allow_methods: Option<Arc<str>>,
 }
 
 /// Who created a [`DispatcherGroup`].
@@ -393,6 +397,7 @@ impl DispatcherGroup {
             origin: GroupOrigin::Script,
             inbound_limits: None,
             inbound_state: None,
+            allow_methods: None,
         };
         // Startup resolution — sync context, `to_socket_addrs` is fine here.
         group.refresh_member_ips();
@@ -422,6 +427,7 @@ impl DispatcherGroup {
             origin: GroupOrigin::Script,
             inbound_limits: None,
             inbound_state: None,
+            allow_methods: None,
         };
         group.refresh_member_ips();
         group
@@ -727,6 +733,8 @@ pub struct DispatcherManager {
     prober_runtime: std::sync::OnceLock<ProberRuntime>,
     /// Inbound call limits of the groups that have one.
     inbound: inbound_limit::InboundLimitRegistry,
+    /// `Allow` sets of the groups that narrow it.
+    allow: allow_methods::AllowMethodsRegistry,
 }
 
 /// What [`spawn_health_probers`] installs so later groups can start probing.
@@ -743,6 +751,7 @@ impl DispatcherManager {
             probers: DashMap::new(),
             prober_runtime: std::sync::OnceLock::new(),
             inbound: inbound_limit::InboundLimitRegistry::new(),
+            allow: allow_methods::AllowMethodsRegistry::new(),
         }
     }
 
@@ -754,8 +763,10 @@ impl DispatcherManager {
         // the calls already up still count against the new limit.
         group.inbound_state = self.inbound.bind(&name, group.inbound_limits);
         let group = Arc::new(group);
+        self.allow.register(&name);
         self.groups.insert(name.clone(), Arc::clone(&group));
         self.inbound.rebuild(&self.groups);
+        self.allow.rebuild(&self.groups);
         self.republish_view();
         self.start_prober(name, &group);
     }
@@ -771,6 +782,8 @@ impl DispatcherManager {
         if removed {
             self.inbound.forget(name);
             self.inbound.rebuild(&self.groups);
+            self.allow.forget(name);
+            self.allow.rebuild(&self.groups);
             self.republish_view();
         }
         removed
@@ -783,6 +796,22 @@ impl DispatcherManager {
     /// both, and counted against both.
     pub fn inbound_limits_admitting(&self, source: IpAddr) -> Vec<crate::admission::GroupLimit> {
         self.inbound.admitting(source)
+    }
+
+    /// The `Allow` value siphon advertises to `peer`: the
+    /// `gateway.groups[].allow_methods` of the first-configured group that
+    /// admits it and has one, or `None` for every method siphon implements.
+    ///
+    /// Read on the response and request paths: lock-free, no DNS, and one
+    /// atomic load when no group narrows `Allow`.
+    pub fn allow_methods_for_peer(&self, peer: IpAddr) -> Option<Arc<str>> {
+        self.allow.for_peer(peer)
+    }
+
+    /// Whether any group narrows `Allow`, so a caller can skip finding the
+    /// peer's address when none does.
+    pub fn narrows_allow(&self) -> bool {
+        self.allow.any()
     }
 
     /// Limits and calls up, per limited group, ordered by name.
@@ -1157,7 +1186,15 @@ async fn probe_group(
     }
 
     for dest in group.all_destinations() {
-        probe_destination(dest, uac_sender, failure_threshold, from_user, from_domain).await;
+        probe_destination(
+            dest,
+            uac_sender,
+            failure_threshold,
+            from_user,
+            from_domain,
+            group.allow_methods().map(|allow| &**allow),
+        )
+        .await;
     }
 }
 
@@ -1167,6 +1204,7 @@ async fn probe_destination(
     failure_threshold: u32,
     from_user: Option<&str>,
     from_domain: Option<&str>,
+    allow_methods: Option<&str>,
 ) {
     // Build R-URI from the gateway's configured URI hostname (not the resolved IP).
     let host_part = dest
@@ -1206,6 +1244,9 @@ async fn probe_destination(
         } else {
             None
         },
+        // The group's `allow_methods`, so the peer reads the same `Allow` off
+        // the probe as off everything else siphon sends it.
+        allow_methods,
     );
 
     let result = tokio::time::timeout(Duration::from_secs(5), receiver).await;

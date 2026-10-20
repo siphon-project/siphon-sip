@@ -182,6 +182,32 @@ pub struct GatewayGroupConfig {
     /// ```
     #[serde(default)]
     pub inbound_limit: Option<super::InboundLimitConfig>,
+    /// The methods siphon advertises in `Allow` (RFC 3261 §20.5) on what it
+    /// sends to this group's peers or answers them with. **Unset by default**,
+    /// which advertises every method siphon implements.
+    ///
+    /// For a peer that decides how to transfer a call from the `Allow` it is
+    /// shown: leave `REFER` out and it transfers the call itself rather than
+    /// sending siphon a REFER. Applies to the responses relayed to a caller
+    /// from the group, siphon's own answers to it (`answer` / `ring` /
+    /// `progress`, OPTIONS), the health-probe OPTIONS sent to it, and INVITEs
+    /// siphon sends to it. A peer is in the group by the same membership
+    /// `call.from_gateway()` answers from; a peer two groups with a set admit
+    /// gets the set of the group configured first. An `Allow` a script or a
+    /// controller's `headers` sets still wins.
+    ///
+    /// Each entry is a method siphon implements, written in upper case, once;
+    /// `INVITE`, `ACK`, `CANCEL` and `BYE` are required. Anything else refuses
+    /// the configuration at load.
+    ///
+    /// ```yaml
+    /// gateway:
+    ///   groups:
+    ///     - name: "trunk-a"
+    ///       allow_methods: [INVITE, ACK, CANCEL, BYE, OPTIONS, PRACK, UPDATE]
+    /// ```
+    #[serde(default)]
+    pub allow_methods: Option<Vec<String>>,
 }
 
 impl GatewayGroupConfig {
@@ -191,6 +217,48 @@ impl GatewayGroupConfig {
         self.inbound_limit
             .as_ref()
             .map(super::InboundLimitConfig::resolved)
+    }
+
+    /// The group's `allow_methods` rendered as an `Allow` value, `Ok(None)`
+    /// when unset, or why the list is refused
+    /// ([`crate::sip::allow::render_allow_methods`]).
+    pub fn rendered_allow_methods(&self) -> std::result::Result<Option<String>, String> {
+        self.allow_methods
+            .as_deref()
+            .map(crate::sip::allow::render_allow_methods)
+            .transpose()
+    }
+
+    /// [`rendered_allow_methods`](Self::rendered_allow_methods) for building
+    /// the group. Load refuses an invalid list, so a refusal here means the
+    /// config was built some other way: it is logged and the full set kept.
+    pub fn allow_methods_value(&self) -> Option<String> {
+        self.rendered_allow_methods().unwrap_or_else(|reason| {
+            tracing::error!(
+                group = %self.name,
+                "gateway allow_methods refused ({reason}), advertising every method"
+            );
+            None
+        })
+    }
+}
+
+impl super::Config {
+    /// Refuse a `gateway.groups[].allow_methods` that is not a set siphon can
+    /// advertise: see [`GatewayGroupConfig::allow_methods`].
+    pub(super) fn validate_gateway_allow_methods(&self) -> crate::error::Result<()> {
+        let Some(gateway) = &self.gateway else {
+            return Ok(());
+        };
+        for group in &gateway.groups {
+            group.rendered_allow_methods().map_err(|reason| {
+                crate::error::SiphonError::Config(format!(
+                    "gateway.groups[{}].allow_methods: {reason}",
+                    group.name
+                ))
+            })?;
+        }
+        Ok(())
     }
 }
 

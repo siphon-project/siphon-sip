@@ -817,3 +817,50 @@ async fn turning_apiban_on_or_off_needs_a_restart() {
     assert_eq!(report.restart_required, ["security.apiban"]);
     assert_eq!(control.params(), before);
 }
+
+fn gateway_block(allow_methods: &str) -> String {
+    format!(
+        concat!(
+            "gateway:\n",
+            "  groups:\n",
+            "    - name: \"trunk\"\n",
+            "      probe:\n",
+            "        enabled: false\n",
+            "{}",
+            "      destinations:\n",
+            "        - uri: \"sip:198.51.100.7:5060\"\n",
+        ),
+        allow_methods
+    )
+}
+
+/// `gateway.groups[].allow_methods` is read when the groups are built, like the
+/// rest of a group: a change is reported as waiting for a restart, never taken
+/// silently, and an invalid set is refused outright.
+#[tokio::test]
+async fn a_gateway_allow_methods_change_is_restart_required_and_an_invalid_one_refused() {
+    let fixture = Fixture::new(&document(SERVER_A, &gateway_block("")));
+    fixture.rewrite(&document(
+        SERVER_A,
+        &gateway_block("      allow_methods: [INVITE, ACK, CANCEL, BYE, OPTIONS]\n"),
+    ));
+    let report = fixture
+        .reloader
+        .reload()
+        .await
+        .expect("the reload validates");
+    assert_eq!(status(&report, "gateway"), SectionStatus::RestartRequired);
+    assert_eq!(report.restart_required, ["gateway"]);
+
+    fixture.rewrite(&document(
+        SERVER_A,
+        &gateway_block("      allow_methods: [INVITE, ACK, OPTIONS]\n"),
+    ));
+    let error = fixture.reloader.reload().await.expect_err("refused");
+    assert!(
+        error
+            .to_string()
+            .contains("gateway.groups[trunk].allow_methods"),
+        "{error}"
+    );
+}

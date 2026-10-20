@@ -15,6 +15,16 @@ entry, but a working config keeps working.
 
 ### Added
 
+- **Gateway: `allow_methods` per gateway group.** The methods siphon advertises
+  in `Allow` to one group's peers, instead of every method it implements. For a
+  trunk that picks its transfer method from `Allow`: leave `REFER` out and it
+  transfers the call itself. Applies to responses relayed to a caller from the
+  group, siphon's own 18x/2xx and OPTIONS/405 answers to it, the group's probe
+  OPTIONS, and INVITEs sent to the group. A peer two groups admit gets the set
+  of the group configured first. A script's or controller's `Allow` still wins.
+  Checked at load: methods siphon implements only, each once, and `INVITE`,
+  `ACK`, `CANCEL`, `BYE` required. Unset, nothing changes.
+
 - **Diameter: `diameter.originate` sends a request this node starts on a
   connection it already has, and awaits its answer.** A node in server mode
   can now run the procedures that begin at the server, such as an HSS's
@@ -28,6 +38,11 @@ entry, but a working config keeps working.
   `LookupError`, `TimeoutError` and `ConnectionError`.
 
 ### Fixed
+
+- **B2BUA: siphon's own 18x and 2xx to the caller carry `Allow`.** `answer`,
+  `ring` and `progress` (control plane and `call.answer()`/`call.progress()`)
+  sent none, while the relayed ones always did; RFC 3261 §13.3.1.4 has a 2xx to
+  INVITE carry it. An `Allow` in `headers` still replaces it.
 
 - **Diameter: a request waiting on a connection that closes fails at once**
   instead of at its timeout, so a caller tells a lost connection from a peer

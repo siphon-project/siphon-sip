@@ -569,6 +569,7 @@ impl Config {
         config.validate_registrant_transports()?;
         config.validate_gateway_source()?;
         config.validate_gateway_transports()?;
+        config.validate_gateway_allow_methods()?;
         config.validate_media_profiles()?;
         config.validate_header_policies()?;
         config.validate_lawful_intercept()?;

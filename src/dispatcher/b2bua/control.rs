@@ -474,6 +474,14 @@ pub fn send_uas_response(
             .set("Content-Length", body_bytes.len().to_string());
         response.body = body_bytes;
     }
+    // siphon's method set on its own 18x and 2xx, as on the relayed ones (RFC
+    // 3261 §13.3.1.4: a 2xx to INVITE SHOULD carry Allow), or the caller's
+    // gateway group `allow_methods`. A script's or controller's `Allow` below
+    // replaces it.
+    if (101..300).contains(&code) {
+        let allow = allow_toward(state, || Some(remote_addr.ip()));
+        advertise_allow(&mut response.headers, allow_value(&allow));
+    }
     // The script's own headers (`P-Early-Media` on an announcement's 183, RFC
     // 5009 §8): precedence 1, as on a relayed response, so they go on last. The
     // ones siphon owns here were refused before this point, so nothing below
