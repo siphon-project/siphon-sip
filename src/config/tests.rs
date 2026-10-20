@@ -6031,3 +6031,69 @@ fn an_unreadable_server_ca_is_refused_at_load() {
         "{message}"
     );
 }
+
+fn gateway_with_allow(allow_methods: &str) -> String {
+    format!(
+        concat!(
+            "gateway:\n",
+            "  groups:\n",
+            "    - name: \"trunk\"\n",
+            "{}",
+            "      destinations:\n",
+            "        - uri: \"sip:198.51.100.7:5060\"\n",
+        ),
+        allow_methods
+    )
+}
+
+#[test]
+fn gateway_allow_methods_is_unset_by_default() {
+    let config = base_yaml(&gateway_with_allow("")).expect("a group with no allow_methods");
+    let group = &config.gateway.expect("gateway block").groups[0];
+    assert_eq!(group.allow_methods, None);
+    assert_eq!(group.rendered_allow_methods(), Ok(None));
+}
+
+#[test]
+fn gateway_allow_methods_parses_and_renders() {
+    let config = base_yaml(&gateway_with_allow(
+        "      allow_methods: [INVITE, ACK, CANCEL, BYE, OPTIONS, PRACK, UPDATE]\n",
+    ))
+    .expect("a valid allow_methods");
+    let group = &config.gateway.expect("gateway block").groups[0];
+    assert_eq!(
+        group.rendered_allow_methods(),
+        Ok(Some(
+            "INVITE, ACK, CANCEL, BYE, OPTIONS, PRACK, UPDATE".to_string()
+        ))
+    );
+}
+
+#[test]
+fn gateway_allow_methods_refuses_what_a_peer_cannot_use() {
+    for (list, expected) in [
+        ("[INVITE, ACK, CANCEL]", "missing BYE"),
+        ("[]", "missing INVITE, ACK, CANCEL, BYE"),
+        (
+            "[INVITE, ACK, CANCEL, BYE, REGISTER]",
+            "REGISTER is not a method siphon implements",
+        ),
+        (
+            "[INVITE, ACK, CANCEL, bye]",
+            "bye is not a method siphon implements",
+        ),
+        ("[INVITE, ACK, CANCEL, BYE, BYE]", "BYE is listed twice"),
+        (
+            "[INVITE, ACK, CANCEL, BYE, \"RE FER\"]",
+            "is not a SIP method token",
+        ),
+    ] {
+        let yaml = gateway_with_allow(&format!("      allow_methods: {list}\n"));
+        let error = base_yaml(&yaml).expect_err("an invalid allow_methods is refused");
+        let message = error.to_string();
+        assert!(
+            message.contains("gateway.groups[trunk].allow_methods") && message.contains(expected),
+            "{list}: {message}"
+        );
+    }
+}

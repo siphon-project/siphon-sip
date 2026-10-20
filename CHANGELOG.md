@@ -15,6 +15,15 @@ entry, but a working config keeps working.
 
 ### Added
 
+- **Gateway: `allow_methods` per gateway group.** The methods siphon advertises
+  in `Allow` to one group's peers, instead of every method it implements. For a
+  trunk that picks its transfer method from `Allow`: leave `REFER` out and it
+  transfers the call itself. Applies to responses relayed to a caller from the
+  group, siphon's own 18x/2xx and OPTIONS/405 answers to it, the group's probe
+  OPTIONS, and INVITEs sent to the group. A peer two groups admit gets the set
+  of the group configured first. A script's or controller's `Allow` still wins.
+  Checked at load: methods siphon implements only, each once, and `INVITE`,
+  `ACK`, `CANCEL`, `BYE` required. Unset, nothing changes.
 - **Opt-in server certificate verification on outbound SIP TLS.** Outbound TLS
   to trunks was encrypted but never authenticated: caller identity and SDES keys
   went to whoever answered on the address. `tls.verify_server: true` (or
@@ -166,6 +175,10 @@ entry, but a working config keeps working.
 
 ### Fixed
 
+- **B2BUA: siphon's own 18x and 2xx to the caller carry `Allow`.** `answer`,
+  `ring` and `progress` (control plane and `call.answer()`/`call.progress()`)
+  sent none, while the relayed ones always did; RFC 3261 §13.3.1.4 has a 2xx to
+  INVITE carry it. An `Allow` in `headers` still replaces it.
 - **`examples/teams_sbc.yaml` trusts the peer's documented signalling
   ranges** (`52.112.0.0/14`, `52.120.0.0/14`, `2603:1063:400::/40`). It
   trusted one /16 inside the first of them, so OPTIONS from the rest of the

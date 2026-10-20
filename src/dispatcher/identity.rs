@@ -8,18 +8,65 @@
 
 use super::*;
 
-/// Set `Allow` (RFC 3261 §20.5) to the methods siphon supports, but only when the
-/// header is absent — never overwrite a caller/script-set `Allow`. Used on
-/// siphon's own UA surfaces (OPTIONS 2xx responses, B2BUA responses) so a peer can
-/// discover the supported method set, including REFER/NOTIFY for transfer.
-pub(super) fn advertise_supported_methods(headers: &mut SipHeaders) {
+/// Set `Allow` (RFC 3261 §20.5) to `allow`, but only when the header is absent —
+/// never overwrite a caller/script-set `Allow`. Used on siphon's own UA surfaces
+/// (OPTIONS 2xx responses, B2BUA responses) so a peer can discover the method
+/// set, including REFER/NOTIFY for transfer. `allow` is
+/// [`crate::sip::SUPPORTED_METHODS`], or the narrower set a gateway group shows
+/// its peers ([`allow_toward`]).
+pub(super) fn advertise_allow(headers: &mut SipHeaders, allow: &str) {
     if !headers.has("Allow") {
-        headers.set("Allow", crate::sip::SUPPORTED_METHODS.to_string());
+        headers.set("Allow", allow.to_string());
     }
 }
 
+/// The `Allow` value siphon advertises to a peer: the `allow_methods` of the
+/// first-configured gateway group that admits it, or `None` for every method
+/// siphon implements ([`crate::sip::SUPPORTED_METHODS`]).
+///
+/// `peer` is only asked for when some group narrows `Allow`, so a caller can
+/// look the address up lazily (a call-store read on the response path) and pay
+/// nothing in the common case. Lock-free and DNS-free; membership is the one
+/// `call.from_gateway()` answers from.
+pub(super) fn allow_toward(
+    state: &DispatcherState,
+    peer: impl FnOnce() -> Option<std::net::IpAddr>,
+) -> Option<Arc<str>> {
+    let gateway = state.gateway.as_ref()?;
+    if !gateway.narrows_allow() {
+        return None;
+    }
+    gateway.allow_methods_for_peer(peer()?)
+}
+
+/// The last headers on a response siphon sends the caller as its UAS
+/// (`answer` / `ring` / `progress`): on an 18x or 2xx siphon's `Allow`, as on
+/// the relayed ones (RFC 3261 §13.3.1.4: a 2xx to INVITE SHOULD carry it), or
+/// the caller's gateway group `allow_methods`; then the script's or
+/// controller's `headers`, already checked, whose own `Allow` replaces it.
+pub(super) fn finish_uas_headers(
+    state: &DispatcherState,
+    response: &mut SipMessage,
+    caller: std::net::IpAddr,
+    headers: &[(String, String)],
+) {
+    if response
+        .status_code()
+        .is_some_and(|code| (101..300).contains(&code))
+    {
+        let allow = allow_toward(state, || Some(caller));
+        advertise_allow(&mut response.headers, allow_value(&allow));
+    }
+    crate::b2bua::uas_headers::apply(response, headers);
+}
+
+/// The `Allow` value [`allow_toward`] found, or the full set.
+pub(super) fn allow_value(allow: &Option<Arc<str>>) -> &str {
+    allow.as_deref().unwrap_or(crate::sip::SUPPORTED_METHODS)
+}
+
 /// Advertise the SIP extensions siphon implements as a UA, in `Supported`
-/// (RFC 3261 §20.37). The counterpart to [`advertise_supported_methods`]:
+/// (RFC 3261 §20.37). The counterpart to [`advertise_allow`]:
 /// `Allow` says which methods a peer may send, `Supported` says which
 /// extensions it may use inside them.
 ///
@@ -254,10 +301,14 @@ fn keep_claimable_option_tags(
 /// from `@b2bua.on_answer` / `@b2bua.on_early_media`) is left as the script
 /// left it, precedence 1 as on the B-leg INVITE; `replaces` is still merged
 /// into its `Supported`.
+///
+/// `allow` is the method set: [`crate::sip::SUPPORTED_METHODS`], or the
+/// caller's gateway group's `allow_methods` ([`allow_toward`]).
 pub(super) fn advertise_relayed_response_capabilities(
     headers: &mut SipHeaders,
     script_shaped_headers: &[String],
     policy: &crate::b2bua::header_policy::ResolvedPolicy,
+    allow: &str,
 ) {
     use crate::b2bua::header_policy::is_script_shaped;
     if !is_script_shaped(script_shaped_headers, "Supported") {
@@ -266,7 +317,7 @@ pub(super) fn advertise_relayed_response_capabilities(
     advertise_supported_options(headers);
     if !is_script_shaped(script_shaped_headers, "Allow") {
         headers.remove("Allow");
-        advertise_supported_methods(headers);
+        advertise_allow(headers, allow);
     }
 }
 
@@ -282,7 +333,9 @@ pub(super) fn advertise_relayed_response_capabilities(
 ///   The tags siphon claims unconditionally — `replaces`, and `timer` when it
 ///   runs the session timer — are merged at the end of the build, after the
 ///   per-carrier headers, as they always were.
-/// - `Allow`: siphon's method set, the one its responses advertise.
+/// - `Allow`: siphon's method set, the one its responses advertise — `allow`,
+///   which is the destination's gateway group `allow_methods` when it has one
+///   ([`allow_toward`]).
 ///
 /// A header the script set or removed is left exactly as it is: script headers
 /// are precedence 1, so the policy already kept the script's value, or its
@@ -291,6 +344,7 @@ pub(super) fn advertise_b_leg_capabilities(
     outbound: &mut SipHeaders,
     script_shaped_headers: &[String],
     policy: &crate::b2bua::header_policy::ResolvedPolicy,
+    allow: &str,
 ) {
     use crate::b2bua::header_policy::is_script_shaped;
     if !is_script_shaped(script_shaped_headers, "Supported") {
@@ -299,7 +353,7 @@ pub(super) fn advertise_b_leg_capabilities(
 
     if !is_script_shaped(script_shaped_headers, "Allow") {
         outbound.remove("Allow");
-        advertise_supported_methods(outbound);
+        advertise_allow(outbound, allow);
     }
 }
 
@@ -308,12 +362,14 @@ pub(super) fn advertise_b_leg_capabilities(
 /// `Allow`. Both are added only when absent, so a script-set `Contact`/`Allow`
 /// wins. `via_host`/`via_port` are the advertised sent-by for the transport the
 /// OPTIONS arrived on; some peers reject an OPTIONS answer that carries
-/// neither `Contact` nor `Record-Route`.
+/// neither `Contact` nor `Record-Route`. `allow` is the method set to
+/// advertise to the sender ([`allow_toward`]).
 pub(super) fn augment_options_response(
     response: &mut SipMessage,
     via_host: &str,
     via_port: u16,
     transport: Transport,
+    allow: &str,
 ) {
     if !response.headers.has("Contact") {
         response.headers.set(
@@ -326,7 +382,7 @@ pub(super) fn augment_options_response(
             ),
         );
     }
-    advertise_supported_methods(&mut response.headers);
+    advertise_allow(&mut response.headers, allow);
 }
 
 /// The response siphon sends when no `@proxy.on_request` handler claims the
@@ -359,7 +415,10 @@ pub(super) fn augment_options_response(
 /// genuinely will not handle owes the sender that answer.
 ///
 /// `via_host` / `via_port` / `transport` describe the socket the request
-/// arrived on, and are only read for the OPTIONS `Contact`.
+/// arrived on, and are only read for the OPTIONS `Contact`. `allow` is the
+/// method set advertised to the sender ([`allow_toward`]); whether a method is
+/// implemented is still judged against everything siphon implements.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn build_no_handler_response(
     request: &SipMessage,
     method: &str,
@@ -368,13 +427,14 @@ pub(super) fn build_no_handler_response(
     via_host: &str,
     via_port: u16,
     transport: Transport,
+    allow: &str,
 ) -> Option<SipMessage> {
     if method == "OPTIONS" {
         if !auto_options {
             return None;
         }
         let mut response = build_response(request, 200, "OK", server_header, &[]);
-        augment_options_response(&mut response, via_host, via_port, transport);
+        augment_options_response(&mut response, via_host, via_port, transport, allow);
         Some(response)
     } else if super::request::to_has_tag(request) && is_implemented_method(method) {
         Some(build_response(
@@ -386,19 +446,14 @@ pub(super) fn build_no_handler_response(
         ))
     } else {
         let mut response = build_response(request, 405, "Method Not Allowed", server_header, &[]);
-        advertise_supported_methods(&mut response.headers);
+        advertise_allow(&mut response.headers, allow);
         Some(response)
     }
 }
 
-/// Is `method` one siphon implements, as its `Allow` advertises?
-///
-/// Compared case-sensitively: the method is a case-sensitive token (RFC 3261
-/// §7.1), so `Bye` is a method siphon does not implement.
+/// Is `method` one siphon implements ([`crate::sip::allow::is_implemented_method`])?
 fn is_implemented_method(method: &str) -> bool {
-    crate::sip::SUPPORTED_METHODS
-        .split(',')
-        .any(|supported| supported.trim() == method)
+    crate::sip::allow::is_implemented_method(method)
 }
 
 /// The port siphon advertises to the A-leg (Contact) and anchors the A-leg

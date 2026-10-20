@@ -1732,6 +1732,20 @@ auth:
 #       #     max_calls_per_second: 30
 #       #     reject_code: 486        # default 503
 #       #     retry_after_secs: 0     # default 1; 0 omits Retry-After
+#       # The methods advertised in Allow to this group's peers, instead of
+#       # every method siphon implements. UNSET by default (the full set).
+#       # For a trunk that picks its transfer method from the Allow it is
+#       # shown: without REFER it transfers the call itself and never sends
+#       # siphon a REFER. Applies to the responses relayed to a caller from the
+#       # group, siphon's own 18x/2xx and OPTIONS/405 answers to it, the probe
+#       # OPTIONS sent to it, and INVITEs sent to it. Membership is the one
+#       # call.from_gateway() answers from; a peer two groups with a set admit
+#       # gets the set of the group listed first. A script's or a controller's
+#       # Allow still wins. Methods siphon implements only, upper case, each
+#       # once; INVITE, ACK, CANCEL and BYE are required. Anything else refuses
+#       # the config. Read at startup: a reload reports a change as needing a
+#       # restart.
+#       #   allow_methods: [INVITE, ACK, CANCEL, BYE, OPTIONS, PRACK, UPDATE]
 #       destinations:
 #         # A destination may carry the digest credentials it challenges with,
 #         # so any B-leg sent to it answers a 401/407 (RFC 3261 §22).  Supply a
