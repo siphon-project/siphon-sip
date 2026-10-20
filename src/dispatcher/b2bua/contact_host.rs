@@ -253,8 +253,7 @@ pub(crate) fn local_answer_contact(
             }
             AnsweringDialog::Callee { branch } => {
                 let (_, leg) = call.find_b_leg_by_branch(branch)?;
-                let (host, port) =
-                    b_leg_sent_by(leg.transport.local_addr, state, &leg.transport.transport);
+                let (host, port) = placed_leg_sent_by(leg, state);
                 let built = format!(
                     "<sip:{host}:{port};transport={}>",
                     leg.transport.transport.to_string().to_lowercase(),

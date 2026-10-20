@@ -1352,12 +1352,14 @@ fn pinned_sent_by_never_advertises_a_wildcard_bind() {
 }
 
 /// A wildcard-bound socket's sent-by: its own `advertise` (host and, when it
-/// names one, port), else the transport's advertised host on the bound port.
+/// names one, port), else the global `advertised_address` on the bound port.
 #[test]
 fn wildcard_pinned_sent_by_uses_the_sockets_advertised_port() {
     let mut dispatcher = super::test_dispatcher::test_dispatcher();
     let translated: SocketAddr = "0.0.0.0:15060".parse().unwrap();
     let plain: SocketAddr = "0.0.0.0:5070".parse().unwrap();
+    // `sip.example.com` is the global `advertised_address`: the fallback of a
+    // listener with no `advertise` of its own, never the sibling's name.
     dispatcher.state.advertised_addrs =
         std::collections::HashMap::from([(Transport::Udp, "sip.example.com".to_string())]);
     dispatcher.state.listener_registry = crate::transport::ListenerRegistry::from_entries(vec![
@@ -1367,7 +1369,8 @@ fn wildcard_pinned_sent_by_uses_the_sockets_advertised_port() {
             Some(crate::transport::AdvertisedAddress::parse("edge.example.com:5060").unwrap()),
         ),
         (Transport::Udp, plain, None),
-    ]);
+    ])
+    .with_global_advertised(Some("sip.example.com"));
     assert_eq!(
         dispatcher
             .state
@@ -1580,6 +1583,7 @@ fn record_route_uris_single_entry_when_both_legs_are_one_socket() {
             resolved.set(true);
             "192.0.2.10".to_string()
         },
+        false,
         Transport::Udp,
         5060,
         "192.0.2.10",
@@ -1603,6 +1607,7 @@ fn record_route_uris_two_entries_when_only_the_port_differs() {
         Transport::Udp,
         5066,
         || "192.0.2.10".to_string(),
+        false,
         Transport::Udp,
         5060,
         "192.0.2.10",
@@ -1624,6 +1629,7 @@ fn record_route_uris_two_entries_when_the_transport_differs() {
         Transport::Tls,
         5061,
         || "sip.example.com".to_string(),
+        false,
         Transport::Tcp,
         5060,
         "sip.example.com",
@@ -1647,6 +1653,7 @@ fn record_route_uris_returns_the_outbound_entry_second() {
         Transport::Udp,
         5066,
         || "192.0.2.10".to_string(),
+        false,
         Transport::Udp,
         5060,
         "192.0.2.10",
@@ -1678,6 +1685,7 @@ fn record_route_uris_stamps_a_bracketed_ipv6_host_verbatim() {
         Transport::Udp,
         5066,
         || "[2001:db8::10]".to_string(),
+        false,
         Transport::Udp,
         5060,
         "[2001:db8::10]",
@@ -1689,6 +1697,62 @@ fn record_route_uris_stamps_a_bracketed_ipv6_host_verbatim() {
             Some("sip:[2001:db8::10]:5060;transport=udp".to_string()),
         )
     );
+}
+
+// -----------------------------------------------------------------------
+/// Two UDP listeners on one port and two interfaces: a relay that arrives on
+/// one and leaves from the other crosses two sockets (RFC 5658 §4), which the
+/// port comparison alone cannot see.
+#[test]
+fn record_route_uris_two_entries_when_only_the_interface_differs() {
+    let entries = record_route_uris(
+        Transport::Udp,
+        5060,
+        || "198.51.100.10".to_string(),
+        true,
+        Transport::Udp,
+        5060,
+        "192.0.2.10",
+    );
+    assert_eq!(
+        entries,
+        (
+            "sip:198.51.100.10:5060;transport=udp".to_string(),
+            Some("sip:192.0.2.10:5060;transport=udp".to_string()),
+        )
+    );
+}
+
+/// Two interfaces advertising one name stamp it once.
+#[test]
+fn record_route_uris_single_entry_when_both_interfaces_advertise_one_name() {
+    let entries = record_route_uris(
+        Transport::Udp,
+        5060,
+        || "sip.example.test".to_string(),
+        true,
+        Transport::Udp,
+        5060,
+        "sip.example.test",
+    );
+    assert_eq!(
+        entries,
+        ("sip:sip.example.test:5060;transport=udp".to_string(), None)
+    );
+}
+
+#[test]
+fn crosses_interfaces_compares_the_ip_of_a_known_egress() {
+    let inbound: SocketAddr = "192.0.2.10:5060".parse().unwrap();
+    assert!(!crosses_interfaces(inbound, None));
+    assert!(!crosses_interfaces(
+        inbound,
+        Some("192.0.2.10:5064".parse().unwrap())
+    ));
+    assert!(crosses_interfaces(
+        inbound,
+        Some("198.51.100.10:5060".parse().unwrap())
+    ));
 }
 
 // -----------------------------------------------------------------------
@@ -1777,7 +1841,10 @@ fn resolve_advertised_host_filters_transport_advertised_by_family() {
     // The gap this closes: a transport-level advertised v4 literal must NOT be
     // stamped on a v6 UE's identity — it falls through to the v6 bind IP; a
     // same-family literal IS used.
-    let registry = dualstack_registry();
+    // The global `advertised_address`, which a listener without its own
+    // `advertise` falls back to (the transport map holds it too, as the
+    // server merges it there).
+    let registry = dualstack_registry().with_global_advertised(Some("198.51.100.1"));
     let mut advertised = std::collections::HashMap::new();
     advertised.insert(Transport::Udp, "198.51.100.1".to_string()); // public v4
     let default_ip: IpAddr = "192.0.2.10".parse().unwrap();
@@ -1809,7 +1876,7 @@ fn resolve_advertised_host_filters_transport_advertised_by_family() {
 fn resolve_advertised_host_fqdn_advertised_used_for_any_family() {
     // An FQDN advertised host resolves to both A and AAAA, so it's accepted
     // regardless of the UE's family.
-    let registry = dualstack_registry();
+    let registry = dualstack_registry().with_global_advertised(Some("pcscf.ims.example"));
     let mut advertised = std::collections::HashMap::new();
     advertised.insert(Transport::Udp, "pcscf.ims.example".to_string());
     let default_ip: IpAddr = "192.0.2.10".parse().unwrap();
@@ -1923,7 +1990,7 @@ fn secure_listener_advertised_hosts_reports_every_listener_sharing_advertised_ad
     advertised.insert(Transport::Tls, "198.51.100.1".to_string());
     advertised.insert(Transport::WebSocketSecure, "198.51.100.1".to_string());
     let hosts = secure_listener_advertised_hosts(
-        &secure_listener_registry(&listeners),
+        &secure_listener_registry(&listeners).with_global_advertised(Some("198.51.100.1")),
         &advertised,
         &first_listener_per_transport(&listeners),
         "192.0.2.10".parse().unwrap(),

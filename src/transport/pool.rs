@@ -944,27 +944,26 @@ impl ConnectionPool {
             .await
     }
 
-    /// Send over TLS, binding the outbound socket's source to `bind_addr`
-    /// (a script `send_socket=` egress pin selecting a specific local
-    /// interface).  The source is part of the pool key, so a source-bound
-    /// TLS connection stays distinct from a default (OS-picked-source) one to
-    /// the same destination.  Pass `bind_addr` with port `0` to keep the
-    /// source port ephemeral (binding the TLS listen port for an outbound
-    /// connection collides on the 4-tuple in `TIME_WAIT`).
+    /// Send over TLS from `listener` (a script `send_socket=` egress pin): the
+    /// socket binds the listener's IP with an ephemeral port (binding the TLS
+    /// listen port for an outbound connection collides on the 4-tuple in
+    /// `TIME_WAIT`). The listener is the pool key's source, so two listeners
+    /// sharing an IP keep separate connections, and the connection is recorded
+    /// as that listener's: its traffic advertises the listener's identity.
     pub async fn send_tls_from(
         &self,
-        bind_addr: SocketAddr,
+        listener: SocketAddr,
         destination: SocketAddr,
         server_name: Option<&str>,
         data: Bytes,
     ) -> Result<ConnectionId, std::io::Error> {
-        self.send_tls_inner(Some(bind_addr), destination, server_name, data)
+        self.send_tls_inner(Some(listener), destination, server_name, data)
             .await
     }
 
     async fn send_tls_inner(
         &self,
-        bind_addr: Option<SocketAddr>,
+        listener: Option<SocketAddr>,
         destination: SocketAddr,
         server_name: Option<&str>,
         data: Bytes,
@@ -972,7 +971,7 @@ impl ConnectionPool {
         let key = PoolKey {
             destination,
             transport: Transport::Tls,
-            bind: bind_addr,
+            bind: listener,
         };
 
         // Try existing connection first.  Bounded, and with the sender cloned
@@ -992,15 +991,16 @@ impl ConnectionPool {
         // Create new TCP connection, then wrap with TLS handshake.
         // The default outbound path does NOT bind a specific local port — the
         // TLS listen port (5061) is for inbound only; outbound uses ephemeral.
-        // A `send_socket=` egress pin (`bind_addr = Some`) binds the chosen
+        // A `send_socket=` egress pin (`listener = Some`) binds that listener's
         // interface IP (ephemeral port) so traffic leaves the intended NIC.
         //
         // Fail-fast on both the TCP connect and the TLS handshake: an
         // unreachable or silently-dropping peer would otherwise block the
         // calling worker indefinitely (same wedge class as the TCP path).
         let connect_future = async {
-            match bind_addr {
-                Some(source) => {
+            match listener {
+                Some(listener) => {
+                    let source = SocketAddr::new(listener.ip(), 0);
                     let socket = if destination.is_ipv6() {
                         tokio::net::TcpSocket::new_v6()?
                     } else {
@@ -1058,11 +1058,12 @@ impl ConnectionPool {
         };
 
         let connection_id = next_connection_id();
-        let local_addr = tls_stream
-            .get_ref()
-            .0
-            .local_addr()
-            .unwrap_or(self.local_addr);
+        // A pinned connection's traffic belongs to its listener, so what the
+        // peer sends over it is handled as having arrived there.
+        let local_addr = listener.unwrap_or_else(|| {
+            let socket = tls_stream.get_ref().0;
+            socket.local_addr().unwrap_or(self.local_addr)
+        });
         let (mut reader, mut writer) = tokio::io::split(tls_stream);
 
         // Per-connection write channel
@@ -1074,8 +1075,12 @@ impl ConnectionPool {
         // Register in the stream-connection registry so the dispatcher can
         // reuse this connection for inbound routing (e.g., INVITEs to
         // registered trunks).
-        if let Some(ref stream_connections) = self.stream_connections {
-            stream_connections.register(destination, Transport::Tls, connection_id);
+        match (&self.stream_connections, listener) {
+            (Some(registry), Some(listener)) => {
+                registry.register_on_listener(destination, Transport::Tls, connection_id, listener)
+            }
+            (Some(registry), None) => registry.register(destination, Transport::Tls, connection_id),
+            (None, _) => {}
         }
 
         debug!(

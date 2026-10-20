@@ -508,6 +508,74 @@ Only headers change: siphon still binds and sends from the listen `address`, and
 it recognises both the bound and the advertised port as its own on an in-dialog
 Route.
 
+### Several listeners of one transport
+
+An `advertise` belongs to its listener, not to its transport. With two TLS
+listeners, say one phones register on and one a trunk peer connects to, each
+message carries the identity of the listener it leaves on:
+
+```yaml
+listen:
+  tls:
+    - "192.0.2.10:5061"                       # phones: advertises its own IP
+    - address: "192.0.2.10:15068"
+      advertise: "sbc.example.test:5068"      # the trunk only accepts this name
+```
+
+- A response, the Contact of a B2BUA answer or of an answered OPTIONS, and the
+  inbound Record-Route name the listener the request **arrived on**.
+- A request sent over a live connection (a phone's TLS or WebSocket connection,
+  reused to reach it) names the listener that **accepted** that connection: Via,
+  Contact, outbound Record-Route, keepalive OPTIONS and NOTIFY alike.
+- A request over a captured flow (`relay(flow=…)`, `call.dial(flow=…)`) names
+  the flow's listener: a UDP or IPsec flow its exact socket, a stream flow that
+  listener's `advertise`.
+- A `send_socket=` pin names the pinned listener in the Via **and** the B2BUA
+  Contact and From, and a pinned TLS connection is remembered as that
+  listener's, so later requests on it say the same.
+- A UDP request with no pin leaves from the first `listen.udp` socket and names
+  that listener.
+- A relay that crosses two listeners stamps two Record-Route entries, one per
+  listener (RFC 5658), including two listeners on one port and two interfaces.
+
+A listener with no `advertise` falls back to `advertised_address` (when it is an
+FQDN or an address of the listener's family), then its own bound IP, then the
+host's routable IP for a wildcard bind. It never borrows another listener's
+`advertise`. In earlier releases it did: the first listener of a transport with
+an `advertise` lent it to every listener of that transport, which handed phones
+the trunk listener's name. If you relied on that, put the `advertise` on each
+listener that should present it.
+
+What is still decided per transport: a brand new outbound TCP or TLS connection
+from the default source (a trunk dialled with no `send_socket=`, a registrant, a
+`proxy.send_request` to a peer with no connection yet) leaves from an ephemeral
+port that belongs to no listener, so it advertises the transport's identity: the
+first listener of that transport with an `advertise`, else `advertised_address`.
+Pin it with `send_socket=` (or a gateway group's `probe_listener`, below) when the
+peer must see a particular listener. A new outbound TCP connection keeps the
+default source even when pinned; only TLS binds the pinned listener's IP.
+
+### Probing a gateway from a particular listener
+
+A gateway group's OPTIONS probes leave the default way and advertise the
+transport's identity. A peer that admits only one of siphon's names refuses
+them, and the group is marked down. `probe_listener` names the listener the
+probes leave from and advertise:
+
+```yaml
+gateway:
+  groups:
+    - name: "trunk"
+      probe_listener: "192.0.2.10:15068"    # a listener's bound address
+      destinations:
+        - uri: "sip:trunk.example.test:5061;transport=tls"
+```
+
+The probe's Via, From and Contact name that listener's identity. A UDP probe is
+written to its socket and a TLS probe opens its connection from its IP. The value
+is checked at startup: a listener of every destination's transport must be bound
+at that address, or siphon refuses to start.
+
 Top-level `advertised_address` takes a host only. It is the fallback for every
 transport at once, and one port cannot be right for UDP on 5060 and TLS on 5061,
 so a value with a port is refused at startup; put the port on the listener's
@@ -543,9 +611,10 @@ A few properties worth knowing:
   Inbound routing — “is this R-URI one of mine?”, loop detection — uses the actual
   bind addresses and the `domain.local` list, never the advertised address. Put
   your real served domains and local IPs in `domain.local`.
-- **Per-transport.** A bridged call (in on TLS, out on UDP) gets the *outbound*
-  transport's advertised address in its Via, and a Record-Route per side (see
-  [Inter-transport routing](#inter-transport-routing)).
+- **Per-listener.** A bridged call (in on TLS, out on UDP) gets the *outbound*
+  listener's advertised address in its Via, and a Record-Route per side (see
+  [Inter-transport routing](#inter-transport-routing) and
+  [Several listeners of one transport](#several-listeners-of-one-transport)).
 - **Load balancers:** put the LB/health-check sources in `security.trusted_cidrs`
   so probes aren't rate-limited. What to do about the *client's* source address
   depends on what the balancer does with the packets. A **forwarding** L4

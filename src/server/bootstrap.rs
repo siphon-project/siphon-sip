@@ -510,6 +510,7 @@ pub(super) async fn init_gateway(config: &Config) -> Option<Arc<DispatcherManage
         manager.add_group(
             DispatcherGroup::new(group_config.name.clone(), algorithm, destinations)
                 .with_probe_config(probe)
+                .with_probe_listener(group_config.probe_listener_addr())
                 .with_source_networks(source_networks)
                 .with_reroute_causes(group_config.reroute_causes.clone())
                 .with_inbound_limits(group_config.resolved_inbound_limits())

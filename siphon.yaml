@@ -97,8 +97,19 @@ listen:
   #                                                   # without one the bound port is used.
   #       dscp: EF                                    # per-listener override (default is global dscp)
   #
-  # The global `advertised_address` (below) serves as fallback for transports
+  # The global `advertised_address` (below) serves as fallback for listeners
   # that don't have a per-socket advertise.
+  #
+  # An advertise belongs to its listener, not to its transport.  With two
+  # listeners of one transport (TLS for phones, TLS for a trunk that only
+  # accepts its FQDN) each message names the listener it leaves on: an answer
+  # the one it arrived on, a request over a reused connection the one that
+  # accepted it, a send_socket= pin the pinned one.  A listener without an
+  # advertise never borrows another listener's.  A new outbound connection
+  # from the default source belongs to no listener and advertises the first
+  # listener of that transport with an advertise (else advertised_address);
+  # pin it with send_socket= or a gateway group's probe_listener when the peer
+  # must see a particular listener.
   #
   # TLS and WSS: advertise a DNS name the certificate carries.  A peer that
   # opens a new TLS connection to siphon's Contact or Record-Route (the ACK, or
@@ -1664,6 +1675,12 @@ auth:
 #         failure_threshold: 3    # mark down after 3 consecutive failures
 #         from_user: "siphon"     # user part in From URI of OPTIONS probes
 #         from_domain: "sip.example.com"  # host part in From URI (default: local IP)
+#       # The listener the probes leave from and advertise (Via, From, Contact),
+#       # by its bound address under listen:.  For a peer that only accepts one
+#       # of siphon's names.  Every destination's transport needs a listener
+#       # bound here, or startup fails.  Unset: default egress, the transport's
+#       # identity.
+#       # probe_listener: "192.0.2.10:15068"
 #       # Ceiling on the calls arriving FROM this group: from the addresses its
 #       # destinations resolve to plus source_networks, the same membership
 #       # call.from_gateway() answers from. B2BUA mode only. UNSET by default.

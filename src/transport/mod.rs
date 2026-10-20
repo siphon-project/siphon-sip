@@ -4,6 +4,8 @@ pub mod crlf_keepalive;
 pub(crate) mod disconnect;
 pub mod flow;
 pub mod hold;
+mod listener_identity;
+pub use listener_identity::cached_routable_local_ip;
 #[cfg(test)]
 mod late_response_tests;
 pub mod mux;
@@ -680,6 +682,13 @@ pub fn parse_send_socket(spec: &str) -> Result<(Transport, SocketAddr), String> 
 #[derive(Debug, Default, Clone)]
 pub struct ListenerRegistry {
     entries: Arc<std::collections::HashMap<(Transport, SocketAddr), Option<AdvertisedAddress>>>,
+    /// Transports with more than one listener. Only on those can two messages
+    /// of one transport leave from listeners with different identities, so only
+    /// there does a send look up which listener its connection belongs to.
+    shared_transports: Arc<std::collections::HashSet<Transport>>,
+    /// The global `advertised_address`: the host a listener with no `advertise`
+    /// of its own falls back to (see [`identity`](Self::identity)).
+    global_advertised: Option<Arc<str>>,
 }
 
 impl ListenerRegistry {
@@ -687,13 +696,33 @@ impl ListenerRegistry {
     pub fn from_entries(
         entries: impl IntoIterator<Item = (Transport, SocketAddr, Option<AdvertisedAddress>)>,
     ) -> Self {
-        let map = entries
+        let map: std::collections::HashMap<_, _> = entries
             .into_iter()
             .map(|(transport, addr, advertise)| ((transport, addr), advertise))
             .collect();
+        let mut seen = std::collections::HashSet::new();
+        let shared_transports = map
+            .keys()
+            .filter(|(transport, _)| !seen.insert(*transport))
+            .map(|(transport, _)| *transport)
+            .collect();
         Self {
             entries: Arc::new(map),
+            shared_transports: Arc::new(shared_transports),
+            global_advertised: None,
         }
+    }
+
+    /// Set the global `advertised_address`, the fallback host of a listener
+    /// that has no `advertise` of its own.
+    pub fn with_global_advertised(mut self, global_advertised: Option<&str>) -> Self {
+        self.global_advertised = global_advertised.map(Arc::from);
+        self
+    }
+
+    /// Whether `transport` has more than one listener.
+    pub fn is_shared(&self, transport: Transport) -> bool {
+        self.shared_transports.contains(&transport)
     }
 
     /// Resolve a parsed `(transport, addr)` to a [`SendSocket`] iff a listener
@@ -1012,12 +1041,18 @@ pub fn sctp_egress_channel(
 #[derive(Clone, Default)]
 pub struct StreamConnections {
     map: Arc<DashMap<(SocketAddr, Transport), ConnectionId>>,
+    /// The listener each connection belongs to, for the connections that have
+    /// one (see [`register_on_listener`](Self::register_on_listener)). Keyed by
+    /// connection rather than peer, so a connection whose peer registration was
+    /// taken over still finds its own entry to release when it closes.
+    listeners: Arc<DashMap<ConnectionId, SocketAddr>>,
 }
 
 impl StreamConnections {
     pub fn new() -> Self {
         Self {
             map: Arc::new(DashMap::new()),
+            listeners: Arc::new(DashMap::new()),
         }
     }
 
@@ -1042,6 +1077,9 @@ impl StreamConnections {
         self.map.remove_if(&(*peer, transport), |_, registered| {
             *registered == connection_id
         });
+        // The connection is gone whether or not it still held the peer's
+        // registration, so its listener record goes with it.
+        self.listeners.remove(&connection_id);
     }
 
     /// Exact-match lookup of the `transport` connection for `peer`, if any.

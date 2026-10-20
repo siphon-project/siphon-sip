@@ -239,7 +239,12 @@ pub fn absorb_completed_reinvite_retransmit(
                     // arrival socket on a multi-homed host; when it is the B-leg,
                     // the flow socket the leg was dialled over (`b_leg_sent_by`).
                     let (outbound_host, outbound_port) = if is_a2b {
-                        b_leg_sent_by(snapshot.b_leg_local_addr, state, &responder_transport)
+                        b_leg_sent_by(
+                            snapshot.b_leg_local_addr,
+                            responder_dest,
+                            state,
+                            &responder_transport,
+                        )
                     } else {
                         (
                             state.a_leg_advertised_host(

@@ -138,7 +138,12 @@ pub(crate) async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send +
     // UE — for WebSocket this is the *only* way back (client-initiated; RFC 7118
     // §5 / RFC 5626 §5.3).  Keyed by the UE source address, tagged with the
     // WS/WSS transport so a TLS relay never picks it up.
-    stream_connections.register(remote_addr, transport_variant, connection_id);
+    stream_connections.register_on_listener(
+        remote_addr,
+        transport_variant,
+        connection_id,
+        local_addr,
+    );
 
     // Read task: WebSocket frames → InboundMessage (with idle timeout)
     let inbound_tx_clone = inbound_tx.clone();

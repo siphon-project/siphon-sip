@@ -636,13 +636,13 @@ pub(super) fn send_to_target(
             // same peer.  We bypass the generic `reuse` below because that
             // ignores the source — reusing a connection off the wrong interface
             // would violate the operator's egress pin.
-            if let Some(bind) = send_bind_stream {
+            if let Some(listener) = send_source {
                 let pool = Arc::clone(&state.connection_pool);
                 let server_name = target.server_name.clone();
                 let data_clone = data;
                 return match tokio::task::block_in_place(|| {
                     tokio::runtime::Handle::current().block_on(pool.send_tls_from(
-                        bind,
+                        listener,
                         destination,
                         server_name.as_deref(),
                         data_clone,
@@ -652,7 +652,7 @@ pub(super) fn send_to_target(
                         debug!(
                             destination = %destination,
                             connection_id = ?connection_id,
-                            bind = %bind,
+                            listener = %listener,
                             "relayed via source-bound TLS pool (send_socket)"
                         );
                         SendOutcome::sent(connection_id)

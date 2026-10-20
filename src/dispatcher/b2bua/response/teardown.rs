@@ -385,7 +385,7 @@ pub fn b2bua_ack_and_bye_answered_leg(
     // The socket this leg was dialled from (flow-pinned legs) — the ACK and BYE
     // below have to leave from it and advertise it, exactly as the INVITE did.
     let local_addr = leg.transport.local_addr;
-    let (via_host, via_port) = b_leg_sent_by(local_addr, state, &transport);
+    let (via_host, via_port) = b_leg_sent_by(local_addr, destination, state, &transport);
 
     // The 2xx established a dialog and with it a route set (RFC 3261 §12.1.2) — the
     // ACK below carries it, and the BYE needs it on the leg, which predates this
@@ -614,7 +614,7 @@ pub fn handle_zombie_cancelled_non2xx(
     // leave from it and advertise it, exactly as the INVITE did, or the peer's
     // server transaction will not match it on sent-by (§17.2.3).
     let local_addr = leg.transport.local_addr;
-    let (via_host, via_port) = b_leg_sent_by(local_addr, state, &transport);
+    let (via_host, via_port) = b_leg_sent_by(local_addr, destination, state, &transport);
 
     let Some(ack) = build_cancelled_leg_ack(leg, invite_ruri, response, &via_host, via_port) else {
         // No Request-URI means the stashed INVITE could not be read back. Say

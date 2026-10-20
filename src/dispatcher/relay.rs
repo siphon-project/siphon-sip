@@ -362,12 +362,10 @@ pub(super) fn relay_request(
         // server port (e.g. 5066) is non-default — using the per-
         // transport via_host would emit a Via with the wrong port and
         // the UE's response would land on the wrong listener
-        // (3GPP TS 33.203 §7.4).  A wildcard-bound listener takes its
-        // advertised identity (its own port unless `advertise` names
-        // another), and a v6 literal is bracketed — see `pinned_sent_by`.
-        let (host, port) = pinned_sent_by(local, || {
-            state.wildcard_pinned_sent_by(&outbound_transport, local)
-        });
+        // (3GPP TS 33.203 §7.4).  A datagram flow names its socket, a
+        // stream flow the public identity of the listener that accepted
+        // it — see `flow_sent_by`.
+        let (host, port) = flow_sent_by(local, state, &outbound_transport);
         (host, Some(port))
     } else if let Some(local) = ipsec_source {
         // IPsec auto-source: same correctness invariant as the flow
@@ -382,8 +380,8 @@ pub(super) fn relay_request(
         // Script send_socket= egress pin: advertise the selected listener's
         // sent-by (its configured advertise host, else the bound IP) with the
         // listener's port, so the peer's response comes back to this socket.
-        let (host, port) = pin.via_sent_by();
-        (format_sip_host(&host), Some(port))
+        let (host, port) = state.pin_sent_by(pin);
+        (host, Some(port))
     } else if let Some(target_str) = send_via_target {
         // Script force_send_via override — bracket-aware split so a bare
         // bracketed v6 literal (`[2001:db8::1]`, no port) isn't truncated by a
@@ -392,10 +390,10 @@ pub(super) fn relay_request(
         let (host, port) = split_host_port(target_str);
         (format_sip_host(host), port)
     } else {
-        (
-            state.via_host(&outbound_transport),
-            Some(state.via_port(&outbound_transport)),
-        )
+        // No pin: the listener whose connection the send reuses, else the
+        // transport's identity.
+        let (host, port) = state.connection_sent_by(outbound_transport, destination);
+        (host, Some(port))
     };
     let branch = core::add_via(&mut relayed.headers, &transport_str, &via_host, via_port);
 
@@ -434,12 +432,20 @@ pub(super) fn relay_request(
         let outbound_rr_port = crate::script::api::ipsec::record_route_port_for(
             via_port.unwrap_or_else(|| state.via_port(&outbound_transport)),
         );
+        let egress_listener = flow_local_addr
+            .or(ipsec_source)
+            .or(send_socket.map(|pin| pin.addr))
+            .or_else(|| match send_via_target {
+                Some(_) => None,
+                None => state.default_egress_listener(outbound_transport, destination),
+            });
         let (mut first, mut second) = record_route_uris(
             inbound.transport,
             crate::script::api::ipsec::record_route_port_for(
                 state.a_leg_advertised_port(Some(inbound.local_addr), &inbound.transport),
             ),
             || state.a_leg_advertised_host(Some(inbound.local_addr), &inbound.transport),
+            crosses_interfaces(inbound.local_addr, egress_listener),
             outbound_transport,
             outbound_rr_port,
             &via_host,
@@ -1024,17 +1030,11 @@ pub(super) fn relay_fork_branch(
     // the send below), so the sent-by has to name *that* socket or the peer
     // answers somewhere we are not — on an IPsec-protected MT branch, to a port
     // with no SA covering it (3GPP TS 33.203 §7.4).
-    let (via_host, via_port) = egress_sent_by(
-        flow.map(|flow| flow.local_addr),
-        |local| state.wildcard_pinned_sent_by(&outbound_transport, local),
-        send_socket.map(|pin| pin.via_sent_by()),
-        || {
-            (
-                state.via_host(&outbound_transport),
-                state.via_port(&outbound_transport),
-            )
-        },
-    );
+    let (via_host, via_port) = match (flow, send_socket) {
+        (Some(flow), _) => flow_sent_by(flow.local_addr, state, &outbound_transport),
+        (None, Some(pin)) => state.pin_sent_by(pin),
+        (None, None) => state.connection_sent_by(outbound_transport, destination),
+    };
     let branch = core::add_via(
         &mut relayed.headers,
         &transport_str,
@@ -1052,12 +1052,17 @@ pub(super) fn relay_fork_branch(
     // One Record-Route entry per socket the dialog crosses — see the same block
     // in [`relay_request`] and [`record_route_uris`].
     if record_routed {
+        let egress_listener = flow
+            .map(|flow| flow.local_addr)
+            .or(send_socket.map(|pin| pin.addr))
+            .or_else(|| state.default_egress_listener(outbound_transport, destination));
         let (mut first, mut second) = record_route_uris(
             inbound.transport,
             crate::script::api::ipsec::record_route_port_for(
                 state.a_leg_advertised_port(Some(inbound.local_addr), &inbound.transport),
             ),
             || state.a_leg_advertised_host(Some(inbound.local_addr), &inbound.transport),
+            crosses_interfaces(inbound.local_addr, egress_listener),
             outbound_transport,
             crate::script::api::ipsec::record_route_port_for(via_port),
             &via_host,

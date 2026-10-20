@@ -140,7 +140,7 @@ pub fn ack_b_leg_non2xx(
         return false;
     };
     let (ack_via_host, ack_via_port) =
-        b_leg_sent_by(snapshot.b_leg_local_addr, state, &b_transport);
+        b_leg_sent_by(snapshot.b_leg_local_addr, b_dest, state, &b_transport);
     let ack = build_b2bua_ack_for_non2xx(
         message,
         branch,
@@ -431,8 +431,12 @@ pub fn retry_after_422(
                         // The retry continues the same B-leg, so it keeps the
                         // leg's sent-by: the flow socket when it was dialled
                         // over one.
-                        let (retry_via_host, retry_via_port) =
-                            b_leg_sent_by(snapshot.b_leg_local_addr, state, &transport);
+                        let (retry_via_host, retry_via_port) = b_leg_sent_by(
+                            snapshot.b_leg_local_addr,
+                            destination,
+                            state,
+                            &transport,
+                        );
                         let via_value = format!(
                             "SIP/2.0/{} {}:{};branch={}",
                             transport, retry_via_host, retry_via_port, new_branch,
@@ -511,7 +515,7 @@ pub fn retry_with_credentials(
                 // client transaction, so its Via sent-by must be the one the
                 // INVITE used: the leg's flow socket when it has one.
                 let (ack_via_host, ack_via_port) =
-                    b_leg_sent_by(snapshot.b_leg_local_addr, state, &b_transport);
+                    b_leg_sent_by(snapshot.b_leg_local_addr, b_dest, state, &b_transport);
                 let ack = build_b2bua_ack_for_non2xx(
                     message,
                     branch,
@@ -562,8 +566,12 @@ pub fn retry_with_credentials(
                             // RFC 3261 §17.1.1.3 — same client transaction as
                             // the INVITE, so the same sent-by (flow socket
                             // when the leg is pinned).
-                            let (ack_via_host, ack_via_port) =
-                                b_leg_sent_by(snapshot.b_leg_local_addr, state, &b_transport);
+                            let (ack_via_host, ack_via_port) = b_leg_sent_by(
+                                snapshot.b_leg_local_addr,
+                                b_dest,
+                                state,
+                                &b_transport,
+                            );
                             let ack = build_b2bua_ack_for_non2xx(
                                 message,
                                 branch,
@@ -697,8 +705,12 @@ pub fn retry_with_credentials(
                             // The credentialed retry continues the same B-leg,
                             // so it keeps the leg's sent-by (flow socket when
                             // it was dialled over one).
-                            let (retry_via_host, retry_via_port) =
-                                b_leg_sent_by(snapshot.b_leg_local_addr, state, &transport);
+                            let (retry_via_host, retry_via_port) = b_leg_sent_by(
+                                snapshot.b_leg_local_addr,
+                                destination,
+                                state,
+                                &transport,
+                            );
                             let via_value = format!(
                                 "SIP/2.0/{} {}:{};branch={}",
                                 transport, retry_via_host, retry_via_port, new_branch,
@@ -924,7 +936,7 @@ pub fn advance_route_sequence(
             if let Some((b_dest, b_transport)) = snapshot.b_leg_dest {
                 // RFC 3261 §17.1.1.3 — same client transaction as the INVITE.
                 let (ack_via_host, ack_via_port) =
-                    b_leg_sent_by(snapshot.b_leg_local_addr, state, &b_transport);
+                    b_leg_sent_by(snapshot.b_leg_local_addr, b_dest, state, &b_transport);
                 let ack = build_b2bua_ack_for_non2xx(
                     message,
                     branch,
