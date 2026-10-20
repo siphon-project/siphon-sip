@@ -35,7 +35,10 @@ jobs:
   # in-tree bump can never ship a mismatched crate/image. The SDK takes its
   # version from the tag directly (hatch-vcs), so it needs no separate check.
   verify-version:
-    runs-on: ubuntu-latest
+    # Every job pins its runner image instead of ubuntu-latest: at the 1.15.1
+    # cut the ubuntu-latest jobs sat queued ~50 minutes while the ubuntu-24.04
+    # ones started at once.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
       - name: Cargo.toml version must equal the tag
@@ -202,7 +205,7 @@ jobs:
 
   # ── Publish to crates.io (Trusted Publishing — OIDC, no token) ─────────
   crates-io:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: build
     # A republish never re-uploads the crate: crates.io refuses an existing
     # version, and the tag it was cut from is already published.
@@ -234,7 +237,7 @@ jobs:
 
   # ── Publish Python SDK to PyPI (Trusted Publishing — OIDC, no token) ───
   pypi:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: build
     permissions:
       id-token: write   # OIDC for PyPI Trusted Publishing
@@ -290,7 +293,7 @@ jobs:
       matrix:
         include:
           - platform: linux/amd64
-            os: ubuntu-latest
+            os: ubuntu-24.04
           - platform: linux/arm64
             os: ubuntu-24.04-arm
     runs-on: ${{ matrix.os }}
@@ -347,7 +350,7 @@ jobs:
   # ── Merge per-arch digests into one multi-arch manifest + tag it ──────
   docker-merge:
     needs: docker
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     if: github.event_name == 'push'
     steps:
       - name: Download digests
@@ -393,7 +396,7 @@ jobs:
 
   # ── SBOM (SPDX + CycloneDX), attached to the GitHub Release ───────────
   sbom:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: verify-version
     # The SBOMs are attached to the existing GitHub Release already.
     if: github.event_name == 'push'
@@ -416,7 +419,7 @@ jobs:
 
   # ── GitHub Release with artifacts ──────────────────────────────────────
   github-release:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [build, crates-io, pypi, docker-merge, sbom]
     # The release exists; a republish must not recreate it or regenerate notes.
     if: github.event_name == 'push'
