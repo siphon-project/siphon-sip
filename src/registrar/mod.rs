@@ -374,6 +374,19 @@ impl Contact {
         })
     }
 
+    /// Where the REGISTER came from, as a SIP URI:
+    /// `sip:<ip>:<port>;transport=<proto>` (the OpenSIPS `received_avp`
+    /// shape), the transport defaulting to UDP. `None` when the binding was
+    /// stored without a source address. The one rendering both
+    /// `Contact.received` in a script and `received` in a control-plane
+    /// `RegistrationChanged` read, so the two match byte for byte.
+    pub fn received_uri(&self) -> Option<String> {
+        self.source_addr.map(|addr| {
+            let transport = self.source_transport.unwrap_or(Transport::Udp).as_scheme();
+            format!("sip:{}:{};transport={}", addr.ip(), addr.port(), transport)
+        })
+    }
+
     /// Seconds remaining until this contact expires.
     pub fn remaining_seconds(&self) -> u64 {
         let elapsed = self.registered_at.elapsed();
@@ -557,6 +570,13 @@ impl Registrar {
     /// calls are ignored.
     pub fn set_instance_identity(&self, identity: InstanceIdentity) {
         let _ = self.instance_identity.set(Arc::new(identity));
+    }
+
+    /// This process's boot epoch: the `instance_epoch` stamped on every binding
+    /// it accepts, new at every start. `None` when no identity is set.
+    pub fn instance_epoch(&self) -> Option<String> {
+        self.instance_identity()
+            .map(|identity| identity.epoch.clone())
     }
 
     /// Returns the configured per-process identity, if any.
@@ -1247,16 +1267,23 @@ impl Registrar {
     /// the AoRs [`aor_count`](Self::aor_count) counts. What a consumer that
     /// lost registration events is re-told the current state of.
     pub fn registered_aors(&self) -> Vec<Aor> {
-        self.bindings
-            .iter()
-            .filter(|entry| {
-                entry
-                    .value()
-                    .iter()
-                    .any(|c| !c.is_expired() && c.kind == ContactKind::Ue)
-            })
-            .map(|entry| entry.key().clone())
-            .collect()
+        let mut aors = Vec::new();
+        self.visit_registered_aors(|aor| aors.push(aor.to_string()));
+        aors
+    }
+
+    /// Hand each registered AoR's key to `visit`, without copying the key set:
+    /// what a caller that keeps only a few of them (a page) walks.
+    pub fn visit_registered_aors(&self, mut visit: impl FnMut(&str)) {
+        for entry in self.bindings.iter() {
+            if entry
+                .value()
+                .iter()
+                .any(|c| !c.is_expired() && c.kind == ContactKind::Ue)
+            {
+                visit(entry.key());
+            }
+        }
     }
 
     /// Number of registered AoRs across the whole deployment.

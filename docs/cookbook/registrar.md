@@ -138,6 +138,24 @@ def on_reg_change(aor, event_type, contacts):
 
 Use this to push presence, notify an external system, or emit charging events.
 
+A handler that also takes a `sequence` keyword is passed a per-process number,
+one higher on every change, the same number the control plane's
+`RegistrationChanged` carries as `seq`. A three-argument handler is called as
+before. Handlers can overlap (one still running when siphon stops waiting on it
+after 10 s moves on to the next event), so a script that mirrors registrations
+somewhere else should keep the highest number per AoR rather than the last one
+it saw. The numbers restart with the process: `registrar.instance_epoch` is the
+boot epoch (the `instance_epoch` on every binding this process accepts), so a
+consumer that sees it change knows to start over. It identifies a boot, it does
+not order two of them. `@registration.on_change` gets the same as a `sequence`
+key in its `state` dict.
+
+```python
+@registrar.on_change
+def on_reg_change(aor, event_type, contacts, sequence=None):
+    push(aor, contacts, order=(registrar.instance_epoch, sequence))
+```
+
 `"snapshot"` is not a change. The registrar hands its events to the handler
 through a queue that holds 1024; a handler that falls further behind than that
 (a registration storm after a restart, against a slow handler) loses events.

@@ -10,8 +10,14 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::debug;
 
-use siphon_control_proto::sip::{DialogStateChangedPayload, SipEvent};
+use siphon_control_proto::sip::{
+    DialogStateChangedPayload, OutboundRegistrationsReply, RegistrantChangedPayload,
+    RegistrationChangedPayload, RegistrationsReply, SipEvent,
+};
+use siphon_control_proto::verbs::{OUTBOUND_REGISTRATIONS, REGISTRATIONS};
 use siphon_control_proto::EventFrame;
+
+use crate::error::ControlError;
 
 use super::{lock, SipClient, SipFacade};
 
@@ -48,9 +54,38 @@ impl AppEvent {
         }
         serde_json::from_value(self.payload.clone()).ok()
     }
+
+    /// The typed [`RegistrationChangedPayload`] when this is a
+    /// [`SipEvent::RegistrationChanged`] event, else `None`.
+    pub fn registration(&self) -> Option<RegistrationChangedPayload> {
+        if self.kind != SipEvent::RegistrationChanged {
+            return None;
+        }
+        serde_json::from_value(self.payload.clone()).ok()
+    }
+
+    /// The typed [`RegistrantChangedPayload`] when this is a
+    /// [`SipEvent::RegistrantChanged`] event, else `None`.
+    pub fn registrant(&self) -> Option<RegistrantChangedPayload> {
+        if self.kind != SipEvent::RegistrantChanged {
+            return None;
+        }
+        serde_json::from_value(self.payload.clone()).ok()
+    }
 }
 
 pub(super) type AppEventHandler = Arc<dyn Fn(AppEvent) + Send + Sync>;
+
+/// The `next` of a page that followed `after`: pages run in AoR order, so a
+/// `next` that does not move past `after` would ask for the same page forever.
+fn advancing(after: &str, next: Option<String>) -> Result<Option<String>, ControlError> {
+    match next {
+        Some(next) if next.as_str() <= after => Err(ControlError::Serde(format!(
+            "a state page after {after:?} named {next:?} as the next, which does not advance"
+        ))),
+        next => Ok(next),
+    }
+}
 
 /// A pull-style stream of application-level events (see
 /// [`SipClient::app_events`]).
@@ -93,6 +128,58 @@ impl SipClient {
         self.facade.set_app_handler(Arc::new(handler));
     }
 
+    /// Everything the registrar holds now, and the `seq` it is current to
+    /// (`registrations`; the app must subscribe to `registration`). Fetches
+    /// every page and returns them as one, with the first page's `seq`.
+    ///
+    /// Ask on connecting and whenever `RegistrationChanged.seq` skips a
+    /// number: replace your copy with the reply (an AoR not in it has no
+    /// binding) and apply only events numbered above [`RegistrationsReply::seq`].
+    pub async fn registrations(&self) -> Result<RegistrationsReply, ControlError> {
+        let mut whole: RegistrationsReply =
+            serde_json::from_value(self.state_page(REGISTRATIONS, None).await?)?;
+        while let Some(after) = whole.next.take() {
+            let page: RegistrationsReply =
+                serde_json::from_value(self.state_page(REGISTRATIONS, Some(&after)).await?)?;
+            whole.registrations.extend(page.registrations);
+            whole.next = advancing(&after, page.next)?;
+        }
+        Ok(whole)
+    }
+
+    /// Every outbound registration's state, and its `seq`
+    /// (`outbound_registrations`; the app must subscribe to
+    /// `outbound_registration`). Fetches every page, as
+    /// [`Self::registrations`] does.
+    pub async fn outbound_registrations(&self) -> Result<OutboundRegistrationsReply, ControlError> {
+        let mut whole: OutboundRegistrationsReply =
+            serde_json::from_value(self.state_page(OUTBOUND_REGISTRATIONS, None).await?)?;
+        while let Some(after) = whole.next.take() {
+            let page: OutboundRegistrationsReply = serde_json::from_value(
+                self.state_page(OUTBOUND_REGISTRATIONS, Some(&after))
+                    .await?,
+            )?;
+            whole.registrations.extend(page.registrations);
+            whole.next = advancing(&after, page.next)?;
+        }
+        Ok(whole)
+    }
+
+    /// One page of a state verb, from `after` (exclusive).
+    async fn state_page(
+        &self,
+        verb: &str,
+        after: Option<&str>,
+    ) -> Result<serde_json::Value, ControlError> {
+        let args = match after {
+            Some(after) => serde_json::json!({ "after": after }),
+            None => serde_json::Value::Null,
+        };
+        self.client
+            .command(None, verb, serde_json::Value::Null, args)
+            .await
+    }
+
     /// A pull-style stream of application-level events (alternative to
     /// [`Self::set_app_event_handler`], which it replaces).
     pub fn app_events(&self) -> AppEventStream {
@@ -129,6 +216,21 @@ mod tests {
 
     fn recorder(_result: serde_json::Value) -> Arc<Unused> {
         Arc::new(Unused)
+    }
+
+    #[test]
+    fn a_next_page_must_move_past_the_last() {
+        assert_eq!(
+            advancing("sip:a@example.com", Some("sip:b@example.com".to_string()))
+                .expect("advances"),
+            Some("sip:b@example.com".to_string())
+        );
+        assert_eq!(
+            advancing("sip:a@example.com", None).expect("last page"),
+            None
+        );
+        assert!(advancing("sip:b@example.com", Some("sip:b@example.com".to_string())).is_err());
+        assert!(advancing("sip:b@example.com", Some("sip:a@example.com".to_string())).is_err());
     }
 
     /// A frame with no channel is an application-level event: it reaches the
@@ -173,6 +275,35 @@ mod tests {
             siphon_control_proto::sip::DialogState::Confirmed
         );
 
+        let mut registration = EventFrame::new(
+            "RegistrationChanged",
+            "unused",
+            "presence",
+            "unused",
+            "unused",
+            json!({
+                "seq": 9,
+                "aor": "sip:201@example.com",
+                "event": "registered",
+                "contacts": [{"uri": "sip:201@203.0.113.40", "expires": 600, "q": 1.0,
+                              "received": "sip:192.0.2.50:5060;transport=udp"}],
+            }),
+        );
+        registration.channel = None;
+        registration.call_id = None;
+        registration.sip_call_id = None;
+        facade.handle_event(registration, &transport);
+        let events = lock(&received).clone();
+        assert_eq!(events.len(), 2);
+        let payload = events[1].registration().expect("typed payload");
+        assert_eq!(payload.seq, Some(9));
+        assert_eq!(
+            payload.contacts[0].received.as_deref(),
+            Some("sip:192.0.2.50:5060;transport=udp")
+        );
+        assert!(events[1].registrant().is_none());
+        assert!(events[1].dialog_state().is_none());
+
         // A channel event for a channel nobody holds is not an app event.
         let channel_frame = EventFrame::new(
             "ChannelStateChange",
@@ -183,6 +314,6 @@ mod tests {
             json!({"state": "answered"}),
         );
         facade.handle_event(channel_frame, &transport);
-        assert_eq!(lock(&received).len(), 1);
+        assert_eq!(lock(&received).len(), 2);
     }
 }

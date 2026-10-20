@@ -21,6 +21,12 @@ pub const DESCRIBE: &str = "describe";
 pub const SET_VAR: &str = "set_var";
 /// Substrate verb: read a per-channel variable.
 pub const GET_VAR: &str = "get_var";
+/// Substrate verb: every registered AoR and the `seq` the set is current to
+/// (an app subscribed to `registration`).
+pub const REGISTRATIONS: &str = "registrations";
+/// Substrate verb: every outbound registration and its `seq` (an app
+/// subscribed to `outbound_registration`).
+pub const OUTBOUND_REGISTRATIONS: &str = "outbound_registrations";
 
 #[cfg(test)]
 mod tests {
@@ -31,5 +37,7 @@ mod tests {
         assert_eq!(MODULE_SIP, "sip");
         assert_eq!(HELLO, "hello");
         assert_eq!(SET_VAR, "set_var");
+        assert_eq!(REGISTRATIONS, "registrations");
+        assert_eq!(OUTBOUND_REGISTRATIONS, "outbound_registrations");
     }
 }

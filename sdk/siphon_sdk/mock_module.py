@@ -76,6 +76,18 @@ class _HandlerRegistry:
 _registry = _HandlerRegistry()
 
 
+def _takes_sequence(fn: Callable) -> bool:
+    """Whether an ``on_change`` handler accepts a ``sequence`` keyword, as the
+    engine decides before passing one."""
+    import inspect
+
+    try:
+        inspect.signature(fn).bind(None, None, None, sequence=0)
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
 def _run_async(coroutine: Any) -> Any:
     """Drive an awaitable to completion from sync code.
 
@@ -2349,6 +2361,15 @@ class MockRegistrar:
         # (RFC 3327 §5 / TS 24.229 §5.2.7.2).
         self._tokens: dict[str, str] = {}
         self._on_change_callbacks: list[Callable] = []
+        # The number the last registration change was delivered with; see
+        # ``on_change``. Shared with nothing else, as in the engine.
+        self._sequence: int = 0
+        #: This process's boot epoch: the ``instance_epoch`` stamped on the
+        #: bindings it accepts, new at every start. ``sequence`` restarts with
+        #: it, so a consumer that sees it change knows the numbers began again.
+        #: An identifier, not an order. ``None`` in the engine without a
+        #: registrar identity.
+        self.instance_epoch: Optional[str] = str(uuid.uuid4())
         # The ``registrar:`` limits save() enforces; see configure().
         self._default_expires: int = _REGISTRAR_DEFAULTS["default_expires"]
         self._max_expires: int = _REGISTRAR_DEFAULTS["max_expires"]
@@ -3286,6 +3307,19 @@ class MockRegistrar:
             ``"deregistered"``, ``"expired"``, or ``"snapshot"``
           - ``contacts``: list[Contact] — current contact bindings
 
+        A handler that also takes a ``sequence`` keyword (named, or through
+        ``**kwargs``) is passed it: a per-process number, one higher on every
+        change, the same number the control plane's ``RegistrationChanged``
+        carries as ``seq``. Handlers can overlap (one still running past the
+        engine's 10 s event-handler window), so a script mirroring state keeps
+        the highest number per AoR. A three-argument handler is called as
+        before. The number restarts with the process; see
+        ``registrar.instance_epoch``::
+
+            @registrar.on_change
+            def on_reg_change(aor, event_type, contacts, sequence=None):
+                ...
+
         ``"snapshot"`` is not a change: when the handler fell so far behind
         the registrar that events were lost (a registration storm against a
         slow handler), siphon re-reports every registered AoR with its current
@@ -3418,11 +3452,13 @@ class MockRegistrar:
         how the harness drives ``@proxy.on_request`` async handlers).
         """
         contacts = self._store.get(aor, [])
+        self._sequence += 1
         for _, fn, is_async, _meta in _registry.handlers.get("registrar.on_change", []):
+            keywords = {"sequence": self._sequence} if _takes_sequence(fn) else {}
             if is_async:
-                _run_async(fn(aor, event_type, contacts))
+                _run_async(fn(aor, event_type, contacts, **keywords))
             else:
-                fn(aor, event_type, contacts)
+                fn(aor, event_type, contacts, **keywords)
 
 
 # ---------------------------------------------------------------------------
@@ -7845,6 +7881,7 @@ class MockRegistration:
 
     def __init__(self) -> None:
         self._entries: dict[str, dict] = {}
+        self._sequence: int = 0
 
     def add(self, aor: str, registrar: str, *, user: str, password: str = "",
             interval: Optional[int] = None, realm: Optional[str] = None,
@@ -8013,9 +8050,14 @@ class MockRegistration:
           - ``event_type``: str -- ``"registered"``, ``"refreshed"``,
             ``"failed"``, ``"deregistered"``, or ``"snapshot"``
           - ``state``: dict -- ``{"expires_in": int, "failure_count": int,
-            "registrar": str, "state": str | None, "status_code": int}``
-            (``status_code`` only present when ``event_type`` is
-            ``"failed"``; ``state`` is the registration's current state,
+            "registrar": str, "state": str | None, "sequence": int,
+            "status_code": int}`` (``sequence`` is a per-process number, one
+            higher on every change, the ``seq`` of the control plane's
+            ``RegistrantChanged``; keep the highest per AoR, since handlers can
+            overlap)
+            (``status_code`` present when ``event_type`` is ``"failed"``,
+            and on a ``"snapshot"`` of a registration whose last attempt
+            failed; ``state`` is the registration's current state,
             ``"unregistered"``, ``"registering"``, ``"challenging"``,
             ``"registered"`` or ``"failed"``, ``None`` once it was removed)
 
@@ -8049,6 +8091,8 @@ class MockRegistration:
             "registrar": entry["registrar"] if entry else "",
             "state": entry["state"] if entry else None,
         }
+        self._sequence += 1
+        state["sequence"] = self._sequence
         if status_code is not None:
             state["status_code"] = status_code
         for _, fn, _, _meta in _registry.handlers.get("registration.on_change", []):

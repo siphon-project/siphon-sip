@@ -9,7 +9,12 @@ import { describe, it, expect, afterEach } from "vitest";
 import WebSocket from "ws";
 
 import { SipClient, SipServer, SUBPROTOCOL } from "../src/index";
-import type { AppEvent, Call, DialogStateChangedPayload } from "../src/index";
+import type {
+  AppEvent,
+  Call,
+  DialogStateChangedPayload,
+  RegistrationChangedPayload,
+} from "../src/index";
 import { ControlStub, waitFor } from "./helpers";
 
 interface ReplyLike {
@@ -111,6 +116,117 @@ describe("application-level events on SipClient", () => {
     expect(payload.state).toBe("confirmed");
     expect(payload.remote_identity.display_name).toBeNull();
     expect(calls).toBe(0);
+
+    sip.shutdown();
+    await runPromise;
+  });
+});
+
+describe("registration state on SipClient", () => {
+  it("types a RegistrationChanged and reads both state verbs", async () => {
+    const stub = await ControlStub.start({
+      onCommand: (frame) => {
+        if (frame.verb === "registrations" && !frame.args?.after) {
+          return {
+            status: "ok",
+            result: {
+              seq: 41,
+              instance_epoch: "boot-1",
+              next: "sip:200@example.com",
+              registrations: [{ aor: "sip:200@example.com", contacts: [] }],
+            },
+          };
+        }
+        if (frame.verb === "registrations") {
+          return {
+            status: "ok",
+            result: {
+              seq: 45,
+              next: null,
+              registrations: [
+                {
+                  aor: "sip:201@example.com",
+                  contacts: [
+                    {
+                      uri: "sip:201@203.0.113.40",
+                      expires: 600,
+                      q: 1,
+                      received: "sip:192.0.2.50:41000;transport=tcp",
+                      transport: "tcp",
+                      path: [],
+                      call_id: "reg-1",
+                      cseq: 3,
+                    },
+                  ],
+                },
+              ],
+            },
+          };
+        }
+        if (frame.verb === "outbound_registrations") {
+          return {
+            status: "ok",
+            result: {
+              seq: 7,
+              registrations: [
+                {
+                  aor: "sip:trunk@example.net",
+                  registrar: "sip:registrar.example.net",
+                  state: "failed",
+                  expires_in: 0,
+                  failure_count: 2,
+                  status_code: 503,
+                },
+              ],
+            },
+          };
+        }
+        return { status: "ok", result: {} };
+      },
+    });
+    cleanup.push(() => stub.stop());
+    const sip = await SipClient.connect({ url: stub.url(), app: "dashboard", token: "t" });
+
+    const events: AppEvent[] = [];
+    sip.onAppEvent((event) => events.push(event));
+    const runPromise = sip.onCall(() => undefined);
+    await waitFor(() => stub.connectionCount() === 1);
+    stub.pushEvent({
+      event: "RegistrationChanged",
+      app: "dashboard",
+      payload: {
+        seq: 42,
+        aor: "sip:201@example.com",
+        event: "refreshed",
+        contacts: [
+          {
+            uri: "sip:201@203.0.113.40",
+            expires: 600,
+            q: 1,
+            received: "sip:192.0.2.50:41000;transport=tcp",
+          },
+        ],
+      },
+    });
+    await waitFor(() => events.length === 1);
+    expect(events[0]?.kind).toBe("RegistrationChanged");
+    const payload = events[0]?.payload as RegistrationChangedPayload;
+    expect(payload.seq).toBe(42);
+    expect(payload.contacts[0]?.received).toBe("sip:192.0.2.50:41000;transport=tcp");
+
+    const registrations = await sip.registrations();
+    expect(registrations.seq).toBe(41);
+    expect(registrations.instance_epoch).toBe("boot-1");
+    expect(registrations.registrations.length).toBe(2);
+    expect(registrations.registrations[1]?.contacts[0]?.cseq).toBe(3);
+    expect(
+      stub.received.some(
+        (frame) => frame.verb === "registrations" && frame.args?.after === "sip:200@example.com",
+      ),
+    ).toBe(true);
+    const outbound = await sip.outboundRegistrations();
+    expect(outbound.registrations[0]?.status_code).toBe(503);
+    expect(stub.received.some((frame) => frame.verb === "registrations")).toBe(true);
 
     sip.shutdown();
     await runPromise;

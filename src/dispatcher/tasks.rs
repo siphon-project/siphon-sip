@@ -217,6 +217,11 @@ pub(super) async fn deliver_registrar_change(
     // A snapshot re-reports held state: it is not a change, so it neither ends
     // dialogs nor owes a REGISTER CDR.
     let is_change = !change.is_snapshot();
+    // One number per change, taken before any state is read, shared by the
+    // control plane and the script so both see the same order. Handlers can
+    // overlap (a slow one is left running past EVENT_HANDLER_TIMEOUT), so a
+    // script that mirrors state keeps the highest number per AoR.
+    let sequence = crate::control::registration::next_registration_sequence();
     let super::registration_events::RegistrarChange {
         aor,
         event: event_type,
@@ -239,28 +244,9 @@ pub(super) async fn deliver_registrar_change(
     // (`control.apps[].events`). Emitted before the Python short-circuit below
     // so it fires whether or not a `@registrar.on_change` handler is registered
     // — a dashboard should not depend on a script existing.
-    if crate::control::app_event_wanted("registration") {
-        let bindings: Vec<serde_json::Value> = registrar
-            .lookup(&aor)
-            .into_iter()
-            .map(|contact| {
-                serde_json::json!({
-                    "uri": contact.uri.to_string(),
-                    "expires": contact.remaining_seconds(),
-                    "q": contact.q,
-                })
-            })
-            .collect();
-        crate::control::notify_app_event(
-            "registration",
-            "RegistrationChanged",
-            serde_json::json!({
-                "aor": aor,
-                "event": event_type,
-                "contacts": bindings,
-            }),
-        );
-    }
+    crate::control::registration::publish_registration_change(
+        &registrar, &aor, event_type, sequence,
+    );
 
     // Quick check if any handlers exist (avoids spawn_blocking overhead)
     if state
@@ -302,7 +288,13 @@ pub(super) async fn deliver_registrar_change(
 
             for handler in handlers {
                 let callable = handler.callable.bind(python);
-                let result = callable.call1((aor.as_str(), event_type, &py_contacts));
+                let arguments = (aor.as_str(), event_type, &py_contacts);
+                // `sequence=` only for a handler that takes it, so a 3-argument
+                // handler written before it existed keeps working.
+                let result = match sequence_keyword(python, callable, sequence) {
+                    Some(keywords) => callable.call(arguments, Some(&keywords)),
+                    None => callable.call1(arguments),
+                };
                 match result {
                     Ok(ret) => {
                         if handler.is_async {
@@ -355,6 +347,17 @@ pub(super) async fn deliver_registrant_change(
         event: event_type,
         status_code: failed_status_code,
     } = change;
+    let sequence = crate::control::registration::next_registrant_sequence();
+
+    // Control applications that asked for the outbound_registration class,
+    // whether or not a script handles the change.
+    crate::control::registration::publish_registrant_change(
+        &registrant,
+        &aor,
+        event_type,
+        failed_status_code,
+        sequence,
+    );
 
     // Quick check if any handlers exist (avoids spawn_blocking overhead)
     if state
@@ -366,10 +369,21 @@ pub(super) async fn deliver_registrant_change(
         return;
     }
 
-    // Build state dict for the callback
-    let (expires_in, failure_count, registrar_uri) =
-        registrant.entry_info(&aor).unwrap_or((0, 0, String::new()));
-    let registration_state = registrant.state(&aor).map(|state| state.to_string());
+    // Build state dict for the callback. A snapshot carries the status of the
+    // last failed attempt, so it says why a failed trunk failed.
+    let status = registrant.status(&aor);
+    let expires_in = status.as_ref().map_or(0, |status| status.expires_in);
+    let failure_count = status.as_ref().map_or(0, |status| status.failure_count);
+    let registrar_uri = status
+        .as_ref()
+        .map(|status| status.registrar_uri.clone())
+        .unwrap_or_default();
+    let registration_state = status.as_ref().map(|status| status.state.to_string());
+    let failed_status_code = if event_type == super::registration_events::SNAPSHOT {
+        status.and_then(|status| status.last_failure_status)
+    } else {
+        failed_status_code
+    };
 
     // Invoke Python handlers in a blocking context
     run_event_handler("registrant.on_change", move || {
@@ -386,6 +400,7 @@ pub(super) async fn deliver_registrant_change(
                 || py_state.set_item("failure_count", failure_count).is_err()
                 || py_state.set_item("registrar", &registrar_uri).is_err()
                 || py_state.set_item("state", &registration_state).is_err()
+                || py_state.set_item("sequence", sequence).is_err()
                 || !status_code_ok
             {
                 error!("PyDict creation failed for registration on_change state");
@@ -471,4 +486,27 @@ pub fn spawn_diameter_incoming(
             }
         });
     }
+}
+
+/// `{"sequence": sequence}` when `handler` accepts a `sequence` keyword (named,
+/// or through `**kwargs`), `None` when it does not, or when its signature cannot
+/// be read (a builtin): such a handler is called with the three arguments it
+/// always had.
+fn sequence_keyword<'py>(
+    python: pyo3::Python<'py>,
+    handler: &pyo3::Bound<'py, pyo3::PyAny>,
+    sequence: u64,
+) -> Option<pyo3::Bound<'py, pyo3::types::PyDict>> {
+    use pyo3::types::PyDictMethods;
+    let keywords = pyo3::types::PyDict::new(python);
+    keywords.set_item("sequence", sequence).ok()?;
+    let signature = python
+        .import("inspect")
+        .and_then(|inspect| inspect.call_method1("signature", (handler,)))
+        .ok()?;
+    let none = python.None();
+    signature
+        .call_method("bind", (&none, &none, &none), Some(&keywords))
+        .ok()
+        .map(|_| keywords)
 }

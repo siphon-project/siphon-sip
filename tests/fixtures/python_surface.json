@@ -1638,6 +1638,10 @@
         "kind": "method_descriptor",
         "sig": "($self, uri)"
       },
+      "instance_epoch": {
+        "doc": "This process's boot epoch (each binding's `instance_epoch`), new at every start: `sequence` restarts with it.",
+        "kind": "getset_descriptor"
+      },
       "is_registered": {
         "doc": "Check if a URI has any registered contacts.",
         "kind": "method_descriptor",

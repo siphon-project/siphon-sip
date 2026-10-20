@@ -84,6 +84,9 @@ async fn a_registrar_lag_is_counted_snapshotted_and_survived() {
     save(&registrar, "first");
     tokio::time::sleep(Duration::from_millis(20)).await;
     let lagged_before = lagged(LaggedConsumer::Registrar);
+    let seq_before = crate::control::registration::registrations_reply(&registrar, None, 1)["seq"]
+        .as_u64()
+        .expect("a seq");
     for index in 0..STORM {
         save(&registrar, &format!("storm{index}"));
     }
@@ -112,6 +115,16 @@ async fn a_registrar_lag_is_counted_snapshotted_and_survived() {
     assert!(
         lagged(LaggedConsumer::Registrar) > lagged_before,
         "the lost events are counted"
+    );
+    // ...and numbered: at least STORM - 1024 events were lost, and the next
+    // RegistrationChanged is numbered past them, which is the gap a controller
+    // sees and answers by asking for `registrations`.
+    let seq_after = crate::control::registration::registrations_reply(&registrar, None, 1)["seq"]
+        .as_u64()
+        .expect("a seq");
+    assert!(
+        seq_after >= seq_before + (STORM - 1024) as u64 - 1,
+        "the lost events leave a gap in seq: {seq_before} -> {seq_after}"
     );
 
     // The task is still alive: a change after the lag is delivered as one.
@@ -285,8 +298,8 @@ async fn a_snapshot_reaches_the_script_and_the_control_plane_as_snapshot() {
         "from siphon import registrar\n",
         "SEEN = []\n",
         "@registrar.on_change\n",
-        "def changed(aor, event, contacts):\n",
-        "    SEEN.append(f\"{aor} {event} {len(contacts)}\")\n",
+        "def changed(aor, event, contacts, sequence=None):\n",
+        "    SEEN.append(f\"{aor} {event} {len(contacts)} {sequence}\")\n",
     ));
     let state = Arc::new(dispatcher.state);
     let registrar = Arc::clone(crate::script::api::test_registrar());
@@ -318,14 +331,53 @@ async fn a_snapshot_reaches_the_script_and_the_control_plane_as_snapshot() {
     assert_eq!(published[0].0, "RegistrationChanged");
     assert_eq!(published[0].1["event"], "snapshot");
     assert_eq!(published[0].1["contacts"].as_array().map(Vec::len), Some(1));
+    assert_eq!(published[0].1["contacts"][0]["call_id"], "call-snapshot");
+    let sequence = published[0].1["seq"].as_u64().expect("a seq");
+    // The script is handed the number the control plane published.
     assert_eq!(
         script_seen(
             &state,
             crate::script::engine::HandlerKind::RegistrarOnChange
         ),
-        vec![format!("{aor} snapshot 1")]
+        vec![format!("{aor} snapshot 1 {sequence}")]
     );
     registrar.remove_all(aor);
+}
+
+#[tokio::test]
+async fn a_three_argument_handler_is_called_as_before_and_numbers_rise() {
+    let dispatcher = super::super::test_dispatcher::test_dispatcher_with_script(concat!(
+        "from siphon import registrar\n",
+        "SEEN = []\n",
+        "@registrar.on_change\n",
+        "def changed(aor, event, contacts):\n",
+        "    SEEN.append(f\"{aor} {event}\")\n",
+        "@registrar.on_change\n",
+        "def numbered(aor, event, contacts, **extra):\n",
+        "    SEEN.append(str(extra['sequence']))\n",
+    ));
+    let state = Arc::new(dispatcher.state);
+    let registrar = Arc::new(Registrar::default());
+    for event in ["registered", "refreshed"] {
+        super::super::tasks::deliver_registrar_change(
+            Arc::clone(&state),
+            Arc::clone(&registrar),
+            RegistrarChange {
+                aor: "sip:three-args@example.com".to_string(),
+                event,
+            },
+        )
+        .await;
+    }
+    let seen = script_seen(
+        &state,
+        crate::script::engine::HandlerKind::RegistrarOnChange,
+    );
+    assert_eq!(seen[0], "sip:three-args@example.com registered");
+    assert_eq!(seen[2], "sip:three-args@example.com refreshed");
+    let first: u64 = seen[1].parse().expect("a number through **kwargs");
+    let second: u64 = seen[3].parse().expect("a number through **kwargs");
+    assert!(second > first, "each change is numbered higher: {seen:?}");
 }
 
 #[tokio::test]
@@ -335,12 +387,13 @@ async fn a_registrant_snapshot_reaches_the_script_with_its_state() {
         "SEEN = []\n",
         "@registration.on_change\n",
         "def changed(aor, event, state):\n",
-        "    SEEN.append(f\"{aor} {event} {state['state']} {state['failure_count']}\")\n",
+        "    SEEN.append(f\"{aor} {event} {state['state']} {state['failure_count']} {state.get('status_code')} {state['sequence']}\")\n",
     ));
     let state = Arc::new(dispatcher.state);
     let registrant = Arc::new(registrant_manager());
     registrant.add(registrant_entry("sip:trunk-c@example.net"));
     registrant.handle_failure("sip:trunk-c@example.net", 403, None);
+    crate::control::app_event_capture::watch("sip:trunk-c@example.net");
 
     super::super::tasks::deliver_registrant_change(
         Arc::clone(&state),
@@ -353,11 +406,20 @@ async fn a_registrant_snapshot_reaches_the_script_with_its_state() {
     )
     .await;
 
+    let published = crate::control::app_event_capture::take("sip:trunk-c@example.net");
+    assert_eq!(published.len(), 1);
+    assert_eq!(published[0].0, "RegistrantChanged");
+    assert_eq!(published[0].1["event"], "snapshot");
+    assert_eq!(published[0].1["state"], "failed");
+    assert_eq!(published[0].1["status_code"], 403);
+    let sequence = published[0].1["seq"].as_u64().expect("a seq");
     assert_eq!(
         script_seen(
             &state,
             crate::script::engine::HandlerKind::RegistrantOnChange
         ),
-        vec!["sip:trunk-c@example.net snapshot failed 1".to_string()]
+        vec![format!(
+            "sip:trunk-c@example.net snapshot failed 1 403 {sequence}"
+        )]
     );
 }

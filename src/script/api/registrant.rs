@@ -317,8 +317,9 @@ impl PyRegistration {
     ///     registration after the handler fell behind and events were lost)
     ///   - state: dict — {"expires_in": int, "failure_count": int,
     ///     "registrar": str, "state": str | None (the current state, None once
-    ///     removed), "status_code": int (only present when event_type is
-    ///     "failed")}
+    ///     removed), "sequence": int (one higher per change, the `seq` of the
+    ///     control plane's RegistrantChanged), "status_code": int (present when event_type is "failed",
+    ///     and on a "snapshot" of a registration whose last attempt failed)}
     ///
     /// Mirrors `registrar.on_change`. The dispatcher invokes these handlers on
     /// `RegistrantManager` state changes (`HandlerKind::RegistrantOnChange`).

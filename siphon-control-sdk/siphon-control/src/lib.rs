@@ -283,7 +283,8 @@ impl ControlClient {
     /// decorator: `@client.on_app_event`.
     ///
     /// These are the events an app opts into with `control.apps[].events` —
-    /// `RegistrationChanged`, `DialogStateChanged` — which concern no channel
+    /// `RegistrationChanged`, `RegistrantChanged`, `DialogStateChanged` —
+    /// which concern no channel
     /// and so never reach an `on_call` handler. The handler is called as
     /// `handler(event, payload)` with the event name and its payload dict, and
     /// may be `async`. Installed by `run()`.
@@ -309,6 +310,40 @@ impl ControlClient {
             let value = client.describe().await.map_err(to_pyerr)?;
             attach_if_running(|py| json_to_py(py, &value))
                 .unwrap_or_else(|| Err(interpreter_gone()))
+        })
+    }
+
+    /// Everything the registrar holds now, as a dict
+    /// `{"seq": int, "registrations": [{"aor": str, "contacts": [...]}]}`
+    /// (`registrations`; the app must subscribe to `registration`).
+    ///
+    /// Each contact carries `uri`, `expires`, `q`, `received` (where the
+    /// REGISTER came from), `transport`, `client_transport` (only when a front
+    /// declared a different one), `instance`, `reg_id`, `path`, `call_id` and
+    /// `cseq`. Every page is fetched and merged, keeping the first page's
+    /// `seq`. Ask on connecting and whenever a `RegistrationChanged` `seq`
+    /// skips a number: replace your copy with the reply and apply only events
+    /// numbered above its `seq`.
+    fn registrations<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = Arc::clone(&self.inner);
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let client = ensure_client(&inner).await?;
+            let reply = client.registrations().await.map_err(to_pyerr)?;
+            reply_to_py(serde_json::to_value(&reply))
+        })
+    }
+
+    /// Every outbound registration's state, as a dict
+    /// `{"seq": int, "registrations": [{"aor", "registrar", "state",
+    /// "expires_in", "failure_count", "status_code"}]}`
+    /// (`outbound_registrations`; the app must subscribe to
+    /// `outbound_registration`).
+    fn outbound_registrations<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = Arc::clone(&self.inner);
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let client = ensure_client(&inner).await?;
+            let reply = client.outbound_registrations().await.map_err(to_pyerr)?;
+            reply_to_py(serde_json::to_value(&reply))
         })
     }
 
@@ -584,6 +619,12 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// A state verb's reply (every page merged) as the dict the server sent.
+fn reply_to_py(reply: Result<serde_json::Value, serde_json::Error>) -> PyResult<Py<PyAny>> {
+    let value = reply.map_err(|error| PyValueError::new_err(error.to_string()))?;
+    attach_if_running(|py| json_to_py(py, &value)).unwrap_or_else(|| Err(interpreter_gone()))
 }
 
 /// Connect the underlying [`SipClient`] once, caching it.

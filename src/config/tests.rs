@@ -2850,6 +2850,29 @@ fn the_dialog_event_class_loads() {
     );
 }
 
+/// `outbound_registration` is a class siphon publishes (`RegistrantChanged`),
+/// and a near miss of it is still refused with the list.
+#[test]
+fn the_outbound_registration_event_class_loads() {
+    let config = Config::from_str(&backend_yaml(
+        "control:\n  apps:\n    - name: trunks\n      token: \"t\"\n      events: [outbound_registration]\n",
+    ))
+    .expect("the outbound_registration event class must load");
+    assert_eq!(
+        config.control.as_ref().expect("control block").apps[0].events,
+        vec!["outbound_registration".to_string()]
+    );
+
+    let error = Config::from_str(&backend_yaml(
+        "control:\n  apps:\n    - name: trunks\n      token: \"t\"\n      events: [outbound_registrations]\n",
+    ))
+    .expect_err("a near miss must be rejected");
+    assert!(
+        error.to_string().contains("outbound_registration,"),
+        "the error lists the classes: {error}"
+    );
+}
+
 /// `control.dialog_state` loads with its defaults when absent and takes each
 /// knob when set.
 #[test]

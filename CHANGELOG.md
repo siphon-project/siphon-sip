@@ -15,6 +15,36 @@ entry, but a working config keeps working.
 
 ### Added
 
+- **Registration hooks are numbered.** `@registrar.on_change` is passed a
+  `sequence` keyword when the handler takes one (a three-argument handler is
+  called as before), and `@registration.on_change` gets `state["sequence"]`:
+  a per-process number, one higher per change, the same `seq` the control
+  plane's `RegistrationChanged` / `RegistrantChanged` carry. Handlers can
+  overlap once one runs past the event-handler window, so out-of-order
+  delivery is possible and the number is what orders them. The process boot
+  epoch is `registrar.instance_epoch` (the `instance_epoch` already on each
+  binding), and `instance_epoch` is also on both events and in both state
+  verbs' replies, so a consumer can tell the numbers restarted.
+- **Control plane: registration state a controller can rely on.**
+  `RegistrationChanged` contacts now say where the REGISTER came from:
+  `received` (byte for byte the script's `Contact.received`), `transport`,
+  `client_transport` when a PROXY-protocol front declared a different one,
+  `instance` (`+sip.instance`), `reg_id`, `path`, and the `call_id` / `cseq` of
+  the REGISTER that last wrote the binding. Every event carries a per-process
+  `seq`, so a lost event (a queue overflow, siphon's own event task falling
+  behind, a controller restart) shows as a gap. The new `registrations` verb
+  returns the registered AoRs with their contacts and the `seq` the set is
+  current to, for an app subscribed to `registration`, paged in AoR order
+  (`after`, `limit` up to 1000, `next`) so a large registrar never needs one
+  oversized frame: resync on connect or on a gap and apply only events
+  numbered above the first page's `seq`. A new
+  `outbound_registration` event class publishes `RegistrantChanged`
+  (`aor`, `event`, `registrar`, `state`, `expires_in`, `failure_count`,
+  `status_code`, `seq`) for the REGISTERs siphon sends upstream, with an
+  `outbound_registrations` verb in the same shape. A snapshot after a lag
+  carries the last failure's status, in `@registration.on_change` too. The
+  Rust, Python and TypeScript control SDKs model the new fields, event and
+  verbs.
 - **`rtpengine`: a script records a conference room.**
   `conference_start_recording` / `conference_stop_recording` /
   `conference_wait_recording` write a room's listener mix (its seats, any

@@ -20,6 +20,8 @@ import {
   MODULE_SIP,
   SET_VAR,
   GET_VAR,
+  REGISTRATIONS,
+  OUTBOUND_REGISTRATIONS,
   SipVerb,
   sipEventKind,
 } from "./protocol";
@@ -27,7 +29,9 @@ import type {
   ChannelSnapshot,
   DialBranchPayload,
   EventFrame,
+  OutboundRegistrationsReply,
   PeerHangupPolicy,
+  RegistrationsReply,
   SipEventKind,
 } from "./protocol";
 import type { ControlServer, ServerConfig } from "./server";
@@ -65,7 +69,9 @@ function callEventFromFrame(frame: EventFrame): CallEvent {
 /**
  * An application-level event: pushed to every connection of an app that opted
  * into its class (`control.apps[].events`), about the deployment rather than a
- * channel — `RegistrationChanged`, `DialogStateChanged` (cast `payload` to
+ * channel — `RegistrationChanged`, `RegistrantChanged`, `DialogStateChanged`
+ * (cast `payload` to {@link import("./protocol").RegistrationChangedPayload},
+ * {@link import("./protocol").RegistrantChangedPayload} or
  * {@link import("./protocol").DialogStateChangedPayload}). Its frame has no
  * channel, so it reaches {@link SipClient.onAppEvent}, never a call.
  */
@@ -2247,6 +2253,46 @@ export class SipClient {
   /** Fetch the registered adapters' schema (`describe`). */
   describe(): Promise<unknown> {
     return this.client.describe();
+  }
+
+  /**
+   * Everything the registrar holds now and the `seq` it is current to
+   * (`registrations`; the app must subscribe to `registration`). Fetches every
+   * page and merges them, keeping the first page's `seq`. Ask on connecting
+   * and whenever a `RegistrationChanged` `seq` skips a number: replace your
+   * copy with the reply and apply only events numbered above it.
+   */
+  async registrations(): Promise<RegistrationsReply> {
+    return this.everyPage<RegistrationsReply>(REGISTRATIONS);
+  }
+
+  /**
+   * Every outbound registration's state and its `seq`
+   * (`outbound_registrations`; the app must subscribe to `outbound_registration`).
+   * Fetches every page, as {@link SipClient.registrations} does.
+   */
+  async outboundRegistrations(): Promise<OutboundRegistrationsReply> {
+    return this.everyPage<OutboundRegistrationsReply>(OUTBOUND_REGISTRATIONS);
+  }
+
+  private async everyPage<Reply extends { registrations: unknown[]; next?: string | null }>(
+    verb: string,
+  ): Promise<Reply> {
+    const whole = (await this.client.command(null, verb, null, null)) as Reply;
+    let after = whole.next ?? null;
+    while (after !== null) {
+      const page = (await this.client.command(null, verb, null, { after })) as Reply;
+      whole.registrations.push(...page.registrations);
+      const next = page.next ?? null;
+      // Pages run in AoR order: a next that does not move past `after` would
+      // ask for the same page forever.
+      if (next !== null && next <= after) {
+        throw new Error(`${verb}: the page after ${after} named ${next} as the next`);
+      }
+      after = next;
+    }
+    whole.next = null;
+    return whole;
   }
 
   /**

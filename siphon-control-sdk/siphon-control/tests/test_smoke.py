@@ -110,6 +110,65 @@ async def _stub_handler(websocket):
                 )
             )
             await _reply_ok(websocket, frame_id, {})
+        elif verb == "registrations" and not (frame.get("args") or {}).get("after"):
+            # Two pages: the first names the second by `next`.
+            await _reply_ok(
+                websocket,
+                frame_id,
+                {
+                    "seq": 41,
+                    "instance_epoch": "boot-1",
+                    "next": "sip:200@example.com",
+                    "registrations": [{"aor": "sip:200@example.com", "contacts": []}],
+                },
+            )
+        elif verb == "registrations":
+            assert frame["args"]["after"] == "sip:200@example.com"
+            await _reply_ok(
+                websocket,
+                frame_id,
+                {
+                    "seq": 45,
+                    "next": None,
+                    "registrations": [
+                        {
+                            "aor": "sip:201@example.com",
+                            "contacts": [
+                                {
+                                    "uri": "sip:201@203.0.113.40",
+                                    "expires": 600,
+                                    "q": 1.0,
+                                    "received": "sip:192.0.2.50:41000;transport=tcp",
+                                    "transport": "tcp",
+                                    "instance": None,
+                                    "reg_id": None,
+                                    "path": [],
+                                    "call_id": "reg-1",
+                                    "cseq": 3,
+                                }
+                            ],
+                        }
+                    ],
+                },
+            )
+        elif verb == "outbound_registrations":
+            await _reply_ok(
+                websocket,
+                frame_id,
+                {
+                    "seq": 7,
+                    "registrations": [
+                        {
+                            "aor": "sip:trunk@example.net",
+                            "registrar": "sip:registrar.example.net",
+                            "state": "failed",
+                            "expires_in": 0,
+                            "failure_count": 2,
+                            "status_code": 503,
+                        }
+                    ],
+                },
+            )
         elif verb == "test_push_app_event":
             # Application-level: no channel, no call ids.
             await websocket.send(
@@ -180,6 +239,33 @@ def test_module_surface():
     ):
         assert hasattr(Call, verb), f"Call is missing {verb}"
     assert issubclass(ControlError, Exception)
+
+
+def test_registration_state_verbs():
+    assert hasattr(ControlClient, "registrations")
+    assert hasattr(ControlClient, "outbound_registrations")
+
+    async def scenario():
+        async with _serve_stub() as url:
+            client = ControlClient(app=APP, token=TOKEN, url=url)
+            await client.connect()
+
+            registrations = await client.registrations()
+            assert registrations["seq"] == 41, "the first page's seq is kept"
+            assert registrations["instance_epoch"] == "boot-1"
+            assert len(registrations["registrations"]) == 2, "both pages are merged"
+            assert registrations["next"] is None
+            contact = registrations["registrations"][1]["contacts"][0]
+            assert contact["received"] == "sip:192.0.2.50:41000;transport=tcp"
+            assert contact["cseq"] == 3
+
+            outbound = await client.outbound_registrations()
+            assert outbound["seq"] == 7
+            assert outbound["registrations"][0]["status_code"] == 503
+
+            client.shutdown()
+
+    asyncio.run(scenario())
 
 
 def test_command_roundtrip_and_typed_error():

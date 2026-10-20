@@ -33,6 +33,7 @@ pub mod outbound;
 pub mod protocol;
 #[cfg(test)]
 mod refusal_tests;
+pub mod registration;
 pub mod registry;
 pub mod sip_adapter;
 
@@ -481,9 +482,10 @@ fn log_command_outcome(
     }
 }
 
-/// Route one command: substrate verbs (`resync`/`describe`/`set_var`/`get_var`)
-/// are handled here; everything else routes to the adapter named by `module`
-/// after the target is resolved + ownership-checked.
+/// Route one command: substrate verbs (`resync`/`describe`/`set_var`/`get_var`,
+/// `registrations`/`outbound_registrations`) are handled here; everything else
+/// routes to the adapter named by `module` after the target is resolved +
+/// ownership-checked.
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_verb(
     bus: &Arc<ControlBus>,
@@ -503,6 +505,9 @@ async fn dispatch_verb(
                 .map(|channel| channel_snapshot(bus, &channel))
                 .collect();
             return ControlResult::Ok(serde_json::json!({ "channels": channels }));
+        }
+        "registrations" | "outbound_registrations" => {
+            return registration::state_verb(bus, app, verb, &args);
         }
         "describe" => {
             let schemas: Vec<AdapterSchema> = adapters.values().map(|a| a.describe()).collect();
