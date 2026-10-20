@@ -29,7 +29,8 @@ pub(crate) const ANSWER: &str = "v=0\r\no=- 2 2 IN IP4 203.0.113.7\r\ns=-\r\nc=I
 pub(crate) const SEAT_OFFER: &str = "v=0\r\no=- 3 3 IN IP4 203.0.113.7\r\ns=-\r\nc=IN IP4 203.0.113.7\r\nt=0 0\r\nm=audio 40002 RTP/AVP 9 0 8 101\r\na=rtpmap:9 G722/8000\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:8 PCMA/8000\r\na=rtpmap:101 telephone-event/8000\r\na=sendrecv\r\na=rtcp-mux\r\n";
 
 /// The engine's accept for every verb: `ok`, with an SDP for a join (and an
-/// `answer_local`) and a play id for a play, as the documented responses carry.
+/// `answer_local`), a play id for a play and a recording id for a room
+/// recording, as the documented responses carry.
 pub(crate) fn accept(request: &Value) -> Value {
     match request["command"].as_str() {
         Some("conference_join") => {
@@ -40,6 +41,7 @@ pub(crate) fn accept(request: &Value) -> Value {
             json!({"result": "ok", "sdp": SEAT_OFFER, "to_tag": request["from_tag"]})
         }
         Some("conference_play") => json!({"result": "ok", "play_id": 12, "duration_ms": 800}),
+        Some("conference_start_recording") => json!({"result": "ok", "recording_id": "rec-7"}),
         _ => json!({"result": "ok"}),
     }
 }

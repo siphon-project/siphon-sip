@@ -1885,6 +1885,56 @@ impl PyRtpEngine {
         conference::set_play_gain(self, python, conference_id, play_id, gain_decibels)
     }
 
+    /// Record a room's listener mix (its seats, any bridged room, any room
+    /// playback) to a 16 kHz 16-bit PCM WAV, returning the engine's
+    /// ``recording_id`` on its accept. ``path`` names the file (its directory
+    /// must exist). It runs until :meth:`conference_stop_recording`,
+    /// ``max_duration_ms``, ``silence_ms`` or the end of the room;
+    /// :meth:`conference_wait_recording` waits for the closed file.
+    #[pyo3(signature = (conference_id, path=None, max_duration_ms=None, silence_ms=None))]
+    fn conference_start_recording<'py>(
+        &self,
+        python: Python<'py>,
+        conference_id: String,
+        path: Option<String>,
+        max_duration_ms: Option<u64>,
+        silence_ms: Option<u64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        conference::start_recording(
+            self,
+            python,
+            conference_id,
+            path,
+            max_duration_ms,
+            silence_ms,
+        )
+    }
+
+    /// Stop one room recording by ``recording_id``, or all of them.
+    #[pyo3(signature = (conference_id, recording_id=None))]
+    fn conference_stop_recording<'py>(
+        &self,
+        python: Python<'py>,
+        conference_id: String,
+        recording_id: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        conference::stop_recording(self, python, conference_id, recording_id)
+    }
+
+    /// Wait until a room recording has ended and its file is closed: the dict
+    /// :meth:`wait_recording` returns, or ``None`` after ``timeout_ms``
+    /// (default an hour).
+    #[pyo3(signature = (conference_id, recording_id, timeout_ms=None))]
+    fn conference_wait_recording<'py>(
+        &self,
+        python: Python<'py>,
+        conference_id: String,
+        recording_id: String,
+        timeout_ms: Option<u64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        conference::wait_recording(self, python, conference_id, recording_id, timeout_ms)
+    }
+
     /// Send a `play DTMF` command — inject DTMF tone(s) into the call.
     ///
     /// Args:
