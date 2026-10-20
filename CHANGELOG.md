@@ -91,6 +91,11 @@ entry, but a working config keeps working.
 
 ### Fixed
 
+- **`examples/teams_sbc.yaml` trusts the peer's documented signalling
+  ranges** (`52.112.0.0/14`, `52.120.0.0/14`, `2603:1063:400::/40`). It
+  trusted one /16 inside the first of them, so OPTIONS from the rest of the
+  peer's proxies could be rate-limited or banned.
+
 - **Diameter: a request waiting on a connection that closes fails at once**
   instead of at its timeout, so a caller tells a lost connection from a peer
   that does not answer.
