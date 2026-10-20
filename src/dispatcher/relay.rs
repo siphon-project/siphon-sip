@@ -51,6 +51,7 @@ pub(super) fn flow_relay_egress(
 /// REGISTER.  Via host/port are derived from `flow.local_addr` so
 /// the UE's response routes back to the right port (load-bearing for
 /// IPSec sec-agree port pairs — 3GPP TS 33.203 §7.4).
+#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_lines)] // TODO(1.9.0 split): decomposed by the dispatcher module split. relay_request: shares most of its body with relay_fork_branch; dedupe pending
 pub(super) fn relay_request(
     message: &SipMessage,
@@ -65,6 +66,7 @@ pub(super) fn relay_request(
     send_via_target: Option<&str>,
     flow: Option<&crate::script::api::registrar::PyFlow>,
     send_socket: Option<&crate::transport::SendSocket>,
+    strip: &[String],
 ) {
     // Two ways to know where this request is going:
     //   a) flow=Some — use the captured inbound flow directly,
@@ -238,6 +240,8 @@ pub(super) fn relay_request(
 
     // Clone the message for modification
     let mut relayed = message.clone();
+    // The wire copy only: the session keeps `message` as the script left it.
+    strip_headers(&mut relayed, strip);
 
     // Decrement Max-Forwards
     if core::decrement_max_forwards(&mut relayed.headers).is_err() {
@@ -730,6 +734,7 @@ pub(super) fn relay_fork_request(
     send_socket: Option<&crate::transport::SendSocket>,
     on_reply_callback: Option<Py<PyAny>>,
     on_failure_callback: Option<Py<PyAny>>,
+    strip: &[String],
 ) {
     use crate::proxy::fork::ForkAggregator;
 
@@ -821,6 +826,7 @@ pub(super) fn relay_fork_request(
                     .and_then(|f| f.as_ref())
                     .filter(|_| !has_route_set),
                 send_socket,
+                strip,
             );
             return;
         }
@@ -839,6 +845,7 @@ pub(super) fn relay_fork_request(
     session.fork_flows = flows.to_vec();
     session.fork_routes = routes.to_vec();
     session.fork_send_socket = send_socket.cloned();
+    session.fork_strip = strip.to_vec();
 
     // Determine which branches to start now
     let branches_to_start: Vec<usize> = match strategy {
@@ -873,6 +880,7 @@ pub(super) fn relay_fork_request(
             routes.get(branch_index).map(Vec::as_slice).unwrap_or(&[]),
             send_socket,
             state,
+            strip,
         );
     }
 }
@@ -901,6 +909,7 @@ pub(super) fn relay_fork_branch(
     branch_path: &[String],
     send_socket: Option<&crate::transport::SendSocket>,
     state: &DispatcherState,
+    strip: &[String],
 ) {
     // This branch's own route set, from the Path stored with its registration
     // binding.  Two bindings of one AoR usually traverse different proxy chains
@@ -975,6 +984,8 @@ pub(super) fn relay_fork_branch(
 
     // Clone and modify message
     let mut relayed = message.clone();
+    // The wire copy only, as for a single relay.
+    strip_headers(&mut relayed, strip);
 
     // Give the branch its own route set (RFC 3327 §5.3).  This *replaces* any
     // Route on the request: the Path vector is the complete route set for
@@ -1321,6 +1332,15 @@ pub(super) fn relay_fork_branch(
 /// TCP only: it is the one transport whose pooled connections idle out. A
 /// pooled TLS connection has no idle timer, and a WebSocket connection is the
 /// client's to keep.
+/// Remove the `strip=` header fields from a request about to be forwarded.
+/// Names are matched case-insensitively (RFC 3261 §7.3.1); the script API has
+/// already refused the ones siphon routes on.
+fn strip_headers(relayed: &mut SipMessage, strip: &[String]) {
+    for name in strip {
+        relayed.headers.remove(name);
+    }
+}
+
 fn hold_client_connection(
     client_key: Option<&TransactionKey>,
     transport: Transport,

@@ -299,6 +299,7 @@ pub(super) fn start_next_fork_branch(
         branch_flow,
         branch_path,
         send_socket,
+        strip,
     ) = {
         let session = match session_arc.read() {
             Ok(s) => s,
@@ -320,6 +321,7 @@ pub(super) fn start_next_fork_branch(
                 .cloned()
                 .unwrap_or_default(),
             session.fork_send_socket.clone(),
+            session.fork_strip.clone(),
         )
     };
 
@@ -361,6 +363,7 @@ pub(super) fn start_next_fork_branch(
             &branch_path,
             send_socket.as_ref(),
             state,
+            &strip,
         );
     }
 }

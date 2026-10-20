@@ -18,6 +18,35 @@ from siphon_sdk.types import (
 _SEND_SOCKET_TRANSPORTS = {"udp", "tcp", "tls", "ws", "wss", "sctp"}
 
 
+# Header fields siphon builds or routes on, which ``strip=`` refuses (mirrors
+# UNSTRIPPABLE_HEADERS in the engine).
+_UNSTRIPPABLE_HEADERS = frozenset({
+    "via", "v", "route", "record-route", "call-id", "i", "cseq", "from", "f",
+    "to", "t", "max-forwards", "content-length", "l",
+})
+
+
+def _validate_strip(strip: Optional[list[str]]) -> list[str]:
+    """Validate a ``strip=`` list, mirroring the Rust engine: header field
+    names, none of the ones siphon needs to forward the request."""
+    if strip is None:
+        return []
+    if isinstance(strip, str):
+        raise TypeError("strip takes a list of header field names, not a string")
+    names = []
+    for name in strip:
+        trimmed = str(name).strip()
+        if not trimmed or ":" in trimmed or any(c.isspace() for c in trimmed):
+            raise ValueError(f"strip: {name!r} is not a header field name")
+        if trimmed.lower() in _UNSTRIPPABLE_HEADERS:
+            raise ValueError(
+                f"strip: {trimmed} is managed by siphon and cannot be stripped "
+                f"from a relayed request"
+            )
+        names.append(trimmed)
+    return names
+
+
 def _validate_send_socket(spec: Optional[str]) -> None:
     """Format-validate a ``send_socket=`` spec, mirroring the Rust engine.
 
@@ -457,6 +486,7 @@ class Request:
         on_failure: Optional[Callable] = None,
         flow: Optional[Flow] = None,
         send_socket: Optional[str] = None,
+        strip: Optional[list[str]] = None,
     ) -> None:
         """Forward the request to its destination.
 
@@ -487,6 +517,11 @@ class Request:
                   routed transport.  A malformed spec raises ``ValueError``; a
                   well-formed spec that names no configured listener is logged
                   and falls back to default routing (never dropped).
+            strip: Optional header field names left off the forwarded request
+                  only.  The request siphon keeps for the session, which Rf,
+                  Ro and CDRs read, still carries them.  Case-insensitive.
+                  Via, Route, Record-Route, Call-ID, CSeq, From, To,
+                  Max-Forwards and Content-Length raise ``ValueError``.
 
         Example::
 
@@ -497,15 +532,20 @@ class Request:
             # Path-token MT routing:
             binding = registrar.lookup_by_token(token)
             request.relay(flow=binding.flow)
+            # towards a UE: no charging headers on the wire, kept for Rf
+            request.relay(flow=binding.flow, strip=["P-Charging-Vector"])
         """
         _validate_send_socket(send_socket)
+        stripped = _validate_strip(strip)
         extras: Optional[dict] = None
-        if flow is not None or send_socket is not None:
+        if flow is not None or send_socket is not None or stripped:
             extras = {}
             if flow is not None:
                 extras["flow"] = flow
             if send_socket is not None:
                 extras["send_socket"] = send_socket
+            if stripped:
+                extras["strip"] = stripped
         self._actions.append(Action(
             kind="relay",
             next_hop=next_hop,
@@ -521,6 +561,7 @@ class Request:
         targets: list[Union[str, Contact]],
         strategy: str = "parallel",
         send_socket: Optional[str] = None,
+        strip: Optional[list[str]] = None,
     ) -> None:
         """Fork the request to multiple targets.
 
@@ -537,6 +578,8 @@ class Request:
                       (same ``"<transport>:<ip>:<port>"`` form as
                       :meth:`relay`).  A per-branch captured flow still takes
                       precedence over it for that branch.
+            strip: Optional header field names left off every branch, as
+                      for :meth:`relay`.
 
         Example::
 
@@ -547,14 +590,22 @@ class Request:
             request.fork(contacts, send_socket="udp:10.0.0.1:5060")
         """
         _validate_send_socket(send_socket)
+        stripped = _validate_strip(strip)
         uris = [t.uri if isinstance(t, Contact) else str(t) for t in targets]
+        extras: Optional[dict] = None
+        if send_socket is not None or stripped:
+            extras = {}
+            if send_socket is not None:
+                extras["send_socket"] = send_socket
+            if stripped:
+                extras["strip"] = stripped
         self._actions.append(Action(
             kind="fork",
             targets=uris,
             strategy=strategy,
             headers_set=dict(self._pending_headers()),
             headers_removed=list(self._pending_removed()),
-            extras={"send_socket": send_socket} if send_socket is not None else None,
+            extras=extras,
         ))
 
     def record_route(self) -> None:

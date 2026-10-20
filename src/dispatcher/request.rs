@@ -725,6 +725,7 @@ pub(super) fn handle_request(
             None,
             None,
             None,
+            &[],
         );
         return;
     }
@@ -1251,6 +1252,7 @@ pub(super) fn handle_request(
             next_hop,
             flow,
             send_socket,
+            strip,
         } => {
             // RFC 3261 §16.2: a stateful proxy SHOULD send 100 Trying
             // immediately upon receiving an INVITE to stop UAC retransmissions.
@@ -1288,6 +1290,7 @@ pub(super) fn handle_request(
                 send_via_target.as_deref(),
                 flow.as_ref(),
                 send_socket.as_ref(),
+                strip,
             );
             proxy_dialog_after_relay(&message_guard, state);
         }
@@ -1297,6 +1300,7 @@ pub(super) fn handle_request(
             routes,
             strategy,
             send_socket,
+            strip,
         } => {
             if targets.is_empty() {
                 warn!("fork with empty targets list");
@@ -1352,6 +1356,7 @@ pub(super) fn handle_request(
                     send_socket.as_ref(),
                     on_reply_cb,
                     on_failure_cb,
+                    strip,
                 );
                 proxy_dialog_after_relay(&message_guard, state);
             }
