@@ -618,7 +618,15 @@ pub fn b2bua_dial_b_leg(
         // claimed whatever it happened to name — `outbound`, `path`, `gruu` —
         // for a leg where nothing implements them. Settled right after the
         // policy, so the per-carrier headers below still land last.
-        advertise_b_leg_capabilities(&mut b_leg_invite.headers, &script_shaped_headers, &policy);
+        // A destination in a gateway group that narrows `Allow` is shown that
+        // group's set (`gateway.groups[].allow_methods`).
+        let allow = allow_toward(state, || Some(destination.ip()));
+        advertise_b_leg_capabilities(
+            &mut b_leg_invite.headers,
+            &script_shaped_headers,
+            &policy,
+            allow_value(&allow),
+        );
 
         // The caller's security agreement belongs to its hop with siphon (RFC
         // 3329 §2.3.1): `sec-agree` leaves Require and Proxy-Require, and the

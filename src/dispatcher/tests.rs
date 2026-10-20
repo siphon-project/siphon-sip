@@ -2989,9 +2989,9 @@ fn registrar_liveness_config_defaults_bias_toward_patience() {
 }
 
 #[test]
-fn advertise_supported_methods_sets_allow_when_absent() {
+fn advertise_allow_sets_allow_when_absent() {
     let mut headers = SipHeaders::new();
-    advertise_supported_methods(&mut headers);
+    advertise_allow(&mut headers, crate::sip::SUPPORTED_METHODS);
     let allow = headers.get("Allow").expect("Allow must be set");
     assert_eq!(allow, crate::sip::SUPPORTED_METHODS);
     // The whole point: peers read transfer capability from here.
@@ -2999,10 +2999,10 @@ fn advertise_supported_methods_sets_allow_when_absent() {
 }
 
 #[test]
-fn advertise_supported_methods_preserves_existing_allow() {
+fn advertise_allow_preserves_existing_allow() {
     let mut headers = SipHeaders::new();
     headers.set("Allow", "INVITE, ACK, BYE".to_string());
-    advertise_supported_methods(&mut headers);
+    advertise_allow(&mut headers, crate::sip::SUPPORTED_METHODS);
     assert_eq!(headers.get("Allow").unwrap(), "INVITE, ACK, BYE");
 }
 
@@ -3124,7 +3124,12 @@ fn builtin_policy(name: &str) -> crate::b2bua::header_policy::ResolvedPolicy {
 fn b_leg_supported(offered: &str, policy_name: &str) -> Option<String> {
     let mut outbound = SipHeaders::new();
     outbound.set("Supported", offered.to_string());
-    advertise_b_leg_capabilities(&mut outbound, &[], &builtin_policy(policy_name));
+    advertise_b_leg_capabilities(
+        &mut outbound,
+        &[],
+        &builtin_policy(policy_name),
+        crate::sip::SUPPORTED_METHODS,
+    );
     outbound.get("Supported").cloned()
 }
 
@@ -3161,6 +3166,7 @@ fn b_leg_capabilities_read_every_supported_line_and_the_compact_form() {
         &mut outbound,
         &[],
         &builtin_policy("ims-intra-trust-domain@2026"),
+        crate::sip::SUPPORTED_METHODS,
     );
     assert_eq!(
         outbound.get_all("Supported"),
@@ -3177,6 +3183,7 @@ fn b_leg_capabilities_replace_the_callers_allow_with_siphons_methods() {
         &mut outbound,
         &[],
         &builtin_policy("ims-trust-domain-boundary@2026"),
+        crate::sip::SUPPORTED_METHODS,
     );
     assert_eq!(
         outbound.get_all("Allow"),
@@ -3195,6 +3202,7 @@ fn b_leg_capabilities_leave_a_script_shaped_header_alone() {
         // Recorded as the script spelled them; `k` is `Supported`.
         &["k".to_string(), "ALLOW".to_string()],
         &builtin_policy("transparent-b2bua@2026"),
+        crate::sip::SUPPORTED_METHODS,
     );
     assert_eq!(
         outbound.get("Supported").map(String::as_str),
@@ -3213,6 +3221,7 @@ fn b_leg_capabilities_do_not_refill_a_header_the_script_removed() {
         &mut outbound,
         &["Supported".to_string(), "Allow".to_string()],
         &builtin_policy("transparent-b2bua@2026"),
+        crate::sip::SUPPORTED_METHODS,
     );
     assert!(!outbound.has("Supported"));
     assert!(!outbound.has("Allow"));
@@ -3230,6 +3239,7 @@ fn relayed_response_capabilities_mirror_the_b_leg_rule() {
         &mut headers,
         &[],
         &builtin_policy("ims-trust-domain-boundary@2026"),
+        crate::sip::SUPPORTED_METHODS,
     );
     assert_eq!(
         headers.get_all("Supported"),
@@ -3386,6 +3396,7 @@ fn relayed_response_capabilities_add_siphons_own_to_an_empty_response() {
         &mut headers,
         &[],
         &builtin_policy("transparent-b2bua@2026"),
+        crate::sip::SUPPORTED_METHODS,
     );
     assert_eq!(
         headers.get("Supported").map(String::as_str),
@@ -3403,7 +3414,13 @@ fn augment_options_response_adds_contact_and_allow() {
         .response(200, "OK".to_string())
         .build()
         .unwrap();
-    augment_options_response(&mut response, "sbc.example.org", 5061, Transport::Tls);
+    augment_options_response(
+        &mut response,
+        "sbc.example.org",
+        5061,
+        Transport::Tls,
+        crate::sip::SUPPORTED_METHODS,
+    );
     assert_eq!(
         response.headers.get("Contact").unwrap(),
         "<sip:sbc.example.org:5061;transport=tls>"
@@ -3421,7 +3438,13 @@ fn augment_options_response_preserves_script_contact() {
         .contact("<sip:custom@host:5060>".to_string())
         .build()
         .unwrap();
-    augment_options_response(&mut response, "sbc.example.org", 5061, Transport::Udp);
+    augment_options_response(
+        &mut response,
+        "sbc.example.org",
+        5061,
+        Transport::Udp,
+        crate::sip::SUPPORTED_METHODS,
+    );
     // Script-set Contact must not be clobbered; Allow is still advertised.
     assert_eq!(
         response.headers.get("Contact").unwrap(),
@@ -3467,6 +3490,7 @@ fn no_handler_options_is_answered_200_with_contact_and_allow() {
         "sbc.example.org",
         5060,
         Transport::Udp,
+        crate::sip::SUPPORTED_METHODS,
     )
     .expect("auto_options on must answer");
     assert_eq!(response.status_code(), Some(200));
@@ -3496,6 +3520,7 @@ fn no_handler_other_methods_are_answered_405_with_allow() {
             "sbc.example.org",
             5060,
             Transport::Udp,
+            crate::sip::SUPPORTED_METHODS,
         )
         .unwrap_or_else(|| panic!("{method}: only OPTIONS may be dropped"));
         assert_eq!(response.status_code(), Some(405), "{method}");
@@ -3523,6 +3548,7 @@ fn no_handler_response_echoes_the_dialog_identifiers() {
         "sbc.example.org",
         5060,
         Transport::Udp,
+        crate::sip::SUPPORTED_METHODS,
     )
     .expect("a 405 is never dropped");
     assert_eq!(
@@ -3552,6 +3578,7 @@ fn no_handler_options_match_is_case_sensitive_on_the_method_token() {
         "sbc.example.org",
         5060,
         Transport::Udp,
+        crate::sip::SUPPORTED_METHODS,
     )
     .expect("an unknown method is answered, not dropped");
     assert_eq!(response.status_code(), Some(405));
@@ -3573,6 +3600,7 @@ fn auto_options_off_drops_an_unclaimed_options_silently() {
         "sbc.example.org",
         5060,
         Transport::Udp,
+        crate::sip::SUPPORTED_METHODS,
     )
     .is_none());
 }
@@ -3592,6 +3620,7 @@ fn auto_options_off_does_not_suppress_the_405() {
             "sbc.example.org",
             5060,
             Transport::Udp,
+            crate::sip::SUPPORTED_METHODS,
         )
         .unwrap_or_else(|| panic!("{method}: auto_options must not gate the 405"));
         assert_eq!(response.status_code(), Some(405), "{method}");
@@ -3628,6 +3657,7 @@ fn no_handler_in_dialog_request_for_an_implemented_method_is_481() {
                 "sbc.example.org",
                 5060,
                 Transport::Udp,
+                crate::sip::SUPPORTED_METHODS,
             )
             .unwrap_or_else(|| panic!("{method}: a 481 is never dropped"));
             assert_eq!(response.status_code(), Some(481), "{method}");
@@ -3652,6 +3682,7 @@ fn no_handler_in_dialog_request_for_an_unimplemented_method_is_405() {
             "sbc.example.org",
             5060,
             Transport::Udp,
+            crate::sip::SUPPORTED_METHODS,
         )
         .expect("a 405 is never dropped");
         assert_eq!(response.status_code(), Some(405), "{method}");
@@ -3670,6 +3701,7 @@ fn no_handler_in_dialog_options_keeps_its_own_answer() {
         "sbc.example.org",
         5060,
         Transport::Udp,
+        crate::sip::SUPPORTED_METHODS,
     )
     .expect("auto_options on answers");
     assert_eq!(answered.status_code(), Some(200));
@@ -3681,6 +3713,7 @@ fn no_handler_in_dialog_options_keeps_its_own_answer() {
         "sbc.example.org",
         5060,
         Transport::Udp,
+        crate::sip::SUPPORTED_METHODS,
     )
     .is_none());
 }

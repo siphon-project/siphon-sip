@@ -515,6 +515,7 @@ pub(super) async fn init_gateway(config: &Config) -> Option<Arc<DispatcherManage
                 .with_source_networks(source_networks)
                 .with_reroute_causes(group_config.reroute_causes.clone())
                 .with_inbound_limits(group_config.resolved_inbound_limits())
+                .with_allow_methods(group_config.allow_methods_value())
                 .from_yaml(),
         );
     }
