@@ -108,6 +108,9 @@ pub(crate) fn abandon_originated_call(
         schedule_zombie_cancelled_cleanup(state.call_actors.clone());
     }
     state.call_event_receivers.remove(&internal_call_id);
+    // A leg whose INVITE carried an early offer holds its allocation from
+    // then on; nothing will answer it now.
+    originate_delete_media(sip_call_id, state);
     originate_group_leg_ended(state, &internal_call_id, outcome);
     true
 }
@@ -140,4 +143,6 @@ pub fn originate_release_losing_answer(
     );
     state.call_actors.remove_call(internal_call_id);
     state.call_event_receivers.remove(internal_call_id);
+    // And the allocation an early offer made for it.
+    originate_delete_media(&sip_call_id, state);
 }

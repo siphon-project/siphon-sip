@@ -335,6 +335,14 @@ pub struct Route {
     /// controller's to know, not a rating decision.
     #[serde(skip)]
     pub contact_host: Option<String>,
+    /// The media profile this attempt is offered, when it is a sequential
+    /// `dial` target on a dial that anchors its media. A profile other than the
+    /// call's own session's sends the attempt the anchored offer made for it.
+    ///
+    /// Not part of the LCR API, like `route`: an LCR route is dialled on the
+    /// call's own media.
+    #[serde(skip)]
+    pub media_profile: Option<String>,
 }
 
 impl Route {

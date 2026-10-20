@@ -13,6 +13,57 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
+### Added
+
+- **Mutual TLS per listener.** A `listen.tls` or `listen.wss` entry in the
+  object form can set `verify_client`, `client_ca` and `client_subject` for
+  itself, overriding the `tls:` block for that listener only. One listener can
+  serve phones behind a TLS front with no client certificate while another
+  requires one from a trunk peer. Each listener builds its own acceptor; a
+  plain string entry, or an object entry without these keys, behaves exactly as
+  before. Settings a listener cannot honour are refused at config load naming
+  it: the keys on a udp/tcp/ws/sctp entry, `client_ca` or `client_subject` on a
+  listener that ends up not verifying, `verify_client` without any `client_ca`,
+  an unreadable CA bundle, and a tls+wss pair on one shared address whose
+  settings differ. A reload reports a changed `listen` as `restart_required`.
+- **`client_subject`: check who a client certificate was issued to.** On top of
+  chaining to `client_ca`, the certificate must name one of the listed DNS
+  identities, exact or a whole-leftmost-label wildcard matching one label
+  (RFC 6125 §6.4.3), checked against its DNS subjectAltNames, or its subject CN
+  only when it has none. Right CA, wrong name is refused at the handshake with
+  an `access_denied` alert, logged at WARN with the presented and allowed names
+  and counted in `siphon_handshake_failures_total`. Valid in `tls:` and per
+  listener.
+
+### Changed
+
+- `tls.verify_client: true` without `tls.client_ca`, on a TLS or WSS listener
+  that inherits it, is now refused at config load (and so on a reload) instead
+  of when the listener starts.
+- **Control plane: a `dial` target can name its own media profile.** `profile`
+  on a `dial` target (`{uri}` or `{aor}`) overrides the dial's `profile` for
+  that branch alone; a target naming none inherits the dial's. One ring can
+  now reach a phone behind NAT on a latching profile and a trunk on an
+  SDES-SRTP profile together. A connecting dial makes one media allocation
+  per profile its branches name, sends each branch its own profile's anchored
+  offer (each attempt of a sequential hunt too), answers early media and the
+  2xx through the answering branch's allocation, and releases the others once
+  a branch answers. An unknown target profile fails the dial exactly as an
+  unknown dial profile does, before anything is allocated or rung; a
+  connecting dial that anchors some branches and not others is `bad_request`.
+  On `on_answer: "bridge"` the target's profile anchors that phone's leg.
+- **Control plane: early offer on a bridging `dial`.** `offer: "early"` on
+  `dial {on_answer: "bridge"}`, or on one of its targets, sends each phone's
+  INVITE with an SDP offer instead of none, for peers that refuse a
+  delayed-offer INVITE: a ring after a prompt or menu, or a queue offer, to
+  such a peer used to fail. The offer is allocated on the media engine from
+  the caller's media under the phone's profile; the phone answers in its 2xx,
+  and the bridge then re-INVITEs only the caller. Every phone not bridged has
+  its allocation deleted. A 2xx without SDP is ACKed, BYEd and reported as a
+  failed branch with code 488 (RFC 3261 §13.2.1). `"delayed"` is the default
+  and unchanged. An unknown value, `offer` on a connecting dial, and `offer`
+  on `originate` are `bad_request`; `originate` has no caller to offer from.
+
 ### Fixed
 
 - **Registration events no longer stop for good after a burst.** The task that
@@ -31,6 +82,51 @@ entry, but a working config keeps working.
   registration's current state, `None` once removed), so a snapshot says
   whether a trunk is registered or failed. A shutdown-phase receiver that
   lagged now reads on instead of reporting shutdown over.
+
+- **A controller `dial` with a media profile no longer leaves its media
+  allocation behind when the caller cancels while it rings.** Nothing released
+  it on the caller's CANCEL; the engine held it until its own timeout.
+### Fixed
+
+- **P-CSCF: a UDP response to a UE over IPsec goes from the P-CSCF's protected
+  client port to the UE's protected server port.** It went back to the port the
+  request came from (port_ps to port_uc), so a UE that takes UDP responses only
+  on its protected server port, as TS 33.203 clause 7.1 has it ("The P-CSCF
+  sends requests and responses protected with ESP to a UE on the port
+  port_pc"; the UE "receives requests and responses protected with ESP on the
+  port port_us"), never saw them and retransmitted every UDP request until it
+  timed out. This covers responses siphon answers, relays, refuses and
+  retransmits, including the B2BUA's 2xx and reliable provisional
+  retransmissions. TCP is unchanged: the response goes on the connection the
+  request came in on. A pair that admits TCP only is logged at error and the
+  response is sent as before. `request.fix_nated_register()` on a request that
+  came over an IPsec UDP flow now writes the UE's protected server port into
+  `rport`, as TS 24.229 clause 5.2.6.3.1 requires, so the Via names the port
+  the response goes to.
+### Added
+
+- **Diameter: `diameter.originate` sends a request this node starts on a
+  connection it already has, and awaits its answer.** A node in server mode
+  can now run the procedures that begin at the server, such as an HSS's
+  Cancel-Location, Insert-Subscriber-Data, Delete-Subscriber-Data and Reset
+  (TS 29.272) or an S6c Alert-Service-Centre (TS 29.338). The connection is
+  the serving connection that last carried a request from the destination
+  host, else one that carried a request from its realm, else a named peer.
+  The caller gives the AVPs after the envelope as `set_avp` tuples, with an
+  optional fourth element to set or clear the M bit. The answer is a
+  `DiameterAnswer`; no connection, a timeout and a lost connection raise
+  `LookupError`, `TimeoutError` and `ConnectionError`.
+
+### Fixed
+
+- **`examples/teams_sbc.yaml` trusts the peer's documented signalling
+  ranges** (`52.112.0.0/14`, `52.120.0.0/14`, `2603:1063:400::/40`). It
+  trusted one /16 inside the first of them, so OPTIONS from the rest of the
+  peer's proxies could be rate-limited or banned.
+
+- **Diameter: a request waiting on a connection that closes fails at once**
+  instead of at its timeout, so a caller tells a lost connection from a peer
+  that does not answer.
 
 ## [1.15.0] — 2026-10-19
 

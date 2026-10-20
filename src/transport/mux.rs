@@ -673,6 +673,7 @@ mod tests {
             method: crate::config::TlsMethod::Tls13,
             verify_client: false,
             client_ca: None,
+            client_subject: Vec::new(),
             client_certificate: None,
             client_private_key: None,
         }

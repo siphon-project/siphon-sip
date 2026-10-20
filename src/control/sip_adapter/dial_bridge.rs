@@ -117,6 +117,8 @@ pub(super) struct BridgeDialRequest {
     pub(super) ringback: Option<PlayMediaSource>,
     /// The caller's own Contact host (`caller_contact_host`), already checked.
     pub(super) caller_contact_host: Option<String>,
+    /// When each phone's INVITE carries its offer, where its target names none.
+    pub(super) offer: Option<crate::dispatcher::DialOffer>,
 }
 
 /// Where a bridge dial runs: the bus that owns the caller's channel and the
@@ -184,12 +186,24 @@ pub(super) fn dial_bridge(
             }
         },
     };
+    // An early offer is made from the caller's own media session: one that
+    // relays to another party is the bridge's to renegotiate in place.
+    if crate::dispatcher::any_early_offer(&request.targets, request.offer)
+        && caller
+            .offer_from
+            .as_ref()
+            .is_none_or(|offer_from| offer_from.relaying)
+    {
+        return refused(DialBridgeRefusal::CallerRelaying);
+    }
     let total_timeout_secs = super::originate::default_total_timeout(
         strategy,
         request.timeout_secs,
         request.targets.len(),
     );
     let target_count = request.targets.len();
+    // What a phone whose target names no `offer` of its own is sent.
+    let offer = request.offer.unwrap_or_default();
     let ring_timeout_secs = request.timeout_secs;
     let spec = match crate::dispatcher::dial_bridge_spec(
         &caller,
@@ -200,6 +214,7 @@ pub(super) fn dial_bridge(
             strategy,
             ring_timeout_secs: request.timeout_secs,
             total_timeout_secs,
+            offer: request.offer,
         },
     ) {
         Ok(spec) => spec,
@@ -260,6 +275,7 @@ pub(super) fn dial_bridge(
             "timeout": ring_timeout_secs,
             "total_timeout": total_timeout_secs,
             "ringback": ringback,
+            "offer": offer.as_str(),
             "branches": branches
                 .iter()
                 .map(crate::dispatcher::dial_branch_identity)
@@ -813,6 +829,7 @@ mod tests {
                 "Request Timeout",
                 DialBranchCause::Timeout,
             )),
+            media_profile: None,
         };
         let payload = dial_failed_payload(&OriginateGroupFailure {
             group_id: "group".to_string(),

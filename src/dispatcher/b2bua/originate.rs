@@ -111,6 +111,12 @@ pub struct OriginateRoute {
     /// [`DialTarget::contact_host`]). Kept as the leg's dialog local Contact,
     /// so every in-dialog request siphon sends on the leg presents it too.
     pub contact_host: Option<String>,
+    /// Offer the leg in its INVITE (`offer: "early"` on a bridging dial):
+    /// the caller it is offered from. The leg's anchor profile shapes the
+    /// offer, made on an engine allocation of the leg's own
+    /// ([`allocate_leg_offer`]), and the callee answers in its 2xx. `None`
+    /// sends an anchored originate offerless, as ever.
+    pub early_offer: Option<LegOfferCaller>,
 }
 
 /// Why an originate was refused. Each variant maps to its own control-plane
@@ -361,6 +367,33 @@ pub fn prepare_originate_routed(
     if !route.route.is_empty() {
         invite.headers.set_all("Route", route.route.clone());
     }
+    // An early offer is the last thing that can refuse the originate, so an
+    // allocation is never left behind by a refusal after it. From here it is
+    // the leg's media session, which every teardown of the leg deletes.
+    let early_offer = match (&route.early_offer, &params.media) {
+        (None, _) => None,
+        (Some(caller), OriginateMedia::Anchor { profile, .. }) => {
+            let (offer, offered) = allocate_leg_offer(caller, profile, state)?;
+            invite
+                .headers
+                .set("Content-Type", "application/sdp".to_string());
+            invite
+                .headers
+                .set("Content-Length", offer.len().to_string());
+            invite.body = offer;
+            if let Some(sessions) = state.rtpengine_sessions.as_ref() {
+                sessions.insert(leg_offer_session(&sip_call_id, profile, &offered));
+            }
+            Some(offered)
+        }
+        (Some(_), OriginateMedia::Offer { .. }) => {
+            return Err(OriginateError::Unsupported(
+                "an early offer is allocated on the media engine, and this originate carries \
+                 an offer of its own"
+                    .to_string(),
+            ))
+        }
+    };
 
     let mut leg = crate::b2bua::actor::Leg::new_originating_leg(
         sip_call_id.clone(),
@@ -403,6 +436,11 @@ pub fn prepare_originate_routed(
     // the slot from here, so whichever path removes the call releases it.
     if let Some(mut call) = state.call_actors.get_call_mut(&internal_call_id) {
         call.admission = Some(state.admission.admit_unrefused());
+    }
+    if let Some(offered) = early_offer {
+        state
+            .call_actors
+            .set_originate_offer(&internal_call_id, offered);
     }
     if let OriginateMedia::Anchor { profile, ws_uri } = &params.media {
         state.call_actors.set_originate_anchor(
@@ -767,6 +805,8 @@ pub fn dial_originate(state: &DispatcherState, prepared: &PreparedOriginate) -> 
                 state
                     .call_event_receivers
                     .remove(&prepared.internal_call_id);
+                // An early offer's allocation goes with it.
+                originate_delete_media(&prepared.sip_call_id, state);
                 return false;
             }
         }
@@ -973,18 +1013,40 @@ pub fn handle_originated_call_response(
         // the callee its answer *in* the ACK, so the engine round-trip has to
         // complete first. A failure is loud and terminal — a connected call with
         // no answer would be a call with no audio.
+        //
+        // An INVITE that carried the offer is owed the answer *in* this 2xx
+        // instead (RFC 3261 §13.2.1, RFC 3264 §5): it is kept for the bridge
+        // to give the leg's allocation, and a 2xx without one is a protocol
+        // error the leg is released over, ACK then BYE, as for a failed anchor.
+        let offered = state
+            .call_actors
+            .originate_offer(internal_call_id)
+            .is_some();
+        let mut offered_answer = None;
         let anchor_answer = match state.call_actors.originate_anchor(internal_call_id) {
             Some(anchor) => {
-                match originate_anchor_2xx(
-                    &sip_call_id,
-                    remote_tag.as_deref().unwrap_or_default(),
-                    message,
-                    &anchor,
-                    response_source,
-                    state,
-                ) {
-                    Ok(answer) => Some(answer),
-                    Err(reason) => {
+                let anchored = if offered {
+                    offered_leg_answer(message)
+                        .map(|answer| {
+                            offered_answer = Some(answer);
+                            None
+                        })
+                        .map_err(|reason| (NO_ANSWER_STATUS, reason))
+                } else {
+                    originate_anchor_2xx(
+                        &sip_call_id,
+                        remote_tag.as_deref().unwrap_or_default(),
+                        message,
+                        &anchor,
+                        response_source,
+                        state,
+                    )
+                    .map(Some)
+                    .map_err(|reason| (status_code, reason))
+                };
+                match anchored {
+                    Ok(answer) => answer,
+                    Err((failure_code, reason)) => {
                         error!(
                             call_id = %internal_call_id,
                             %sip_call_id,
@@ -1011,16 +1073,18 @@ pub fn handle_originated_call_response(
                         control_notify_terminated_with_cause(
                             &sip_call_id,
                             "media_failed",
-                            Some(status_code),
+                            Some(failure_code),
                             Some(&reason),
                         );
+                        // An early offer's allocation, never to be answered.
+                        originate_delete_media(&sip_call_id, state);
                         state.call_actors.remove_call(internal_call_id);
                         state.call_event_receivers.remove(internal_call_id);
                         // The group's winner cannot carry audio: a group whose
                         // first answer was final fails with it, one whose
                         // answers are confirmed carries on with its other legs.
                         if let Some(win) = group_win {
-                            win.media_failed(state, status_code, &reason);
+                            win.media_failed(state, failure_code, &reason);
                         }
                         return;
                     }
@@ -1039,6 +1103,11 @@ pub fn handle_originated_call_response(
             }
             if !message.body.is_empty() {
                 call.a_leg.last_sdp = Some(message.body.clone());
+            }
+            // The answer to siphon's offer, its SDP alone: what the bridge
+            // gives the leg's allocation.
+            if let Some(answer) = offered_answer {
+                call.a_leg.last_sdp = Some(answer);
             }
             // The INVITE used CSeq 1; every later in-dialog request (BYE,
             // re-INVITE) must exceed it (RFC 3261 §12.2.1.1).
@@ -1080,7 +1149,13 @@ pub fn handle_originated_call_response(
     // here rather than through the B-leg's `retry_with_credentials`, because an
     // originated call has no B-leg: siphon is the UAC on its A-leg, which is
     // why this response path is separate in the first place.
-    if retry_originate_with_credentials(internal_call_id, &leg, message, status_code, state) {
+    if super::originate_auth::retry_originate_with_credentials(
+        internal_call_id,
+        &leg,
+        message,
+        status_code,
+        state,
+    ) {
         return;
     }
 
@@ -1163,7 +1238,7 @@ pub fn handle_originated_call_response(
 /// §17.1.1.3: an ACK to a non-2xx final carries the INVITE's Route header
 /// fields, so an originate routed through a binding's Path has its ACK take the
 /// same path. A no-op for an INVITE that carried none.
-fn with_invite_route_set(
+pub(super) fn with_invite_route_set(
     mut ack: SipMessage,
     internal_call_id: &str,
     state: &DispatcherState,
@@ -1201,172 +1276,6 @@ fn originate_gateway_credentials(
         "originate: this gateway's configured credentials will answer its challenges"
     );
     Some(credentials)
-}
-
-/// Answer a `401`/`407` on a call siphon placed itself with a credentialed
-/// re-INVITE (RFC 3261 §22). Returns `true` when a retry went out, in which
-/// case the caller must not treat the response as a failure.
-///
-/// The B-leg twin is `retry_with_credentials` in `response/failed.rs`. This is
-/// a second implementation of the same rule rather than a shared one because an
-/// originated call has no B-leg — it is a UAC on its own A-leg — so none of the
-/// `BLegResponseSnapshot` the other path works from exists here. What is shared
-/// is the order (ACK the non-2xx first, §17.1.1.3), the retry cap, and the
-/// message builder.
-///
-/// Returning `false` falls through to the ordinary failure path, which ACKs and
-/// reports — so an uncredentialed call, an unparseable challenge and an
-/// exhausted retry budget all behave exactly as they did before.
-fn retry_originate_with_credentials(
-    internal_call_id: &str,
-    leg: &Leg,
-    message: &SipMessage,
-    status_code: u16,
-    state: &DispatcherState,
-) -> bool {
-    if status_code != 401 && status_code != 407 {
-        return false;
-    }
-
-    let Some(credentials) = state
-        .call_actors
-        .get_call(internal_call_id)
-        .and_then(|call| call.outbound_credentials.clone())
-    else {
-        // No credentials: the challenge is the call's final answer, as before.
-        return false;
-    };
-
-    // A trunk that rejects every fresh credentialed attempt (wrong password, or
-    // a new nonce each time) would otherwise be re-authed for ever, since each
-    // retry lands on a new branch and so never self-terminates.
-    if state.call_actors.auth_retry_count(internal_call_id) >= MAX_B2BUA_AUTH_RETRIES {
-        warn!(
-            call_id = %internal_call_id,
-            status = status_code,
-            limit = MAX_B2BUA_AUTH_RETRIES,
-            "originate: auth retry limit reached — failing the call instead of re-authing"
-        );
-        return false;
-    }
-
-    let challenge_header = if status_code == 401 {
-        message.headers.get("WWW-Authenticate")
-    } else {
-        message.headers.get("Proxy-Authenticate")
-    };
-    let Some(challenge) = challenge_header.and_then(|value| crate::auth::parse_challenge(value))
-    else {
-        return false;
-    };
-
-    let Some(target_uri) = leg.dialog.target_uri.clone() else {
-        return false;
-    };
-    let Some(stored_invite) = state
-        .call_actors
-        .get_call(internal_call_id)
-        .and_then(|call| call.a_leg_invite.clone())
-    else {
-        return false;
-    };
-    let Ok(original) = stored_invite.lock().map(|invite| invite.clone()) else {
-        return false;
-    };
-
-    // RFC 7616 §3.3: nc starts at 1 for a fresh nonce and increments on reuse.
-    // The per-call counter resets itself when the nonce changes.
-    let nc = state
-        .call_actors
-        .get_call(internal_call_id)
-        .map(|call| call.digest_nc.next_for(&challenge.nonce))
-        .unwrap_or(1);
-
-    let auth_header_name = if status_code == 401 {
-        "Authorization"
-    } else {
-        "Proxy-Authorization"
-    };
-    let auth_value = match crate::auth::format_stored_authorization_header(
-        &challenge,
-        &credentials.username,
-        &credentials.secret,
-        "INVITE",
-        &target_uri,
-        Some(nc),
-        None,
-    ) {
-        Ok(value) => value,
-        Err(mismatch) => {
-            error!(
-                call_id = %internal_call_id,
-                status = status_code,
-                realm = %challenge.realm,
-                error = %mismatch,
-                "originate: cannot answer the challenge with the stored credential"
-            );
-            return false;
-        }
-    };
-
-    // ACK the challenge on its own branch before anything else (§17.1.1.3):
-    // the callee's server transaction retransmits until it lands.
-    let (via_host, via_port) =
-        b_leg_sent_by(leg.transport.local_addr, state, &leg.transport.transport);
-    let ack = build_b2bua_ack_for_non2xx(
-        message,
-        &leg.branch,
-        Some(target_uri.as_str()),
-        leg.transport.transport,
-        &via_host,
-        via_port,
-    );
-    send_b2bua_to_bleg(
-        with_invite_route_set(ack, internal_call_id, state),
-        leg.transport.transport,
-        leg.transport.remote_addr,
-        leg.transport.local_addr,
-        state,
-    );
-
-    // A new transaction: new branch, next CSeq (§8.1.3.5).
-    let branch = format!("z9hG4bK-{}", uuid::Uuid::new_v4().simple());
-    let cseq = leg.dialog.local_cseq.saturating_add(1);
-    let via = format!(
-        "SIP/2.0/{} {}:{};branch={};rport",
-        leg.transport.transport.to_string().to_uppercase(),
-        via_host,
-        via_port,
-        branch
-    );
-    let retry = build_digest_retry_invite(&original, via, cseq, auth_header_name, auth_value);
-
-    // Index the new branch before sending: on loopback the answer can arrive
-    // before a post-send registration would finish, and an unindexed branch is
-    // a response for an unknown call.
-    state.call_actors.mark_originated(internal_call_id, &branch);
-    if let Some(mut call) = state.call_actors.get_call_mut(internal_call_id) {
-        call.a_leg.branch = branch.clone();
-        call.a_leg.dialog.local_cseq = cseq;
-        call.a_leg_invite = Some(Arc::new(Mutex::new(retry.clone())));
-    }
-    state.call_actors.incr_auth_retry_count(internal_call_id);
-
-    info!(
-        call_id = %internal_call_id,
-        status = status_code,
-        realm = %challenge.realm,
-        nc = nc,
-        "originate: {status_code} received, retrying with credentials"
-    );
-    send_b2bua_to_bleg(
-        retry,
-        leg.transport.transport,
-        leg.transport.remote_addr,
-        leg.transport.local_addr,
-        state,
-    );
-    true
 }
 
 /// What the callee's 2xx settles on the dialog of a call siphon placed besides

@@ -684,6 +684,7 @@ pub fn release_failed_call_media(a_sip_call_id: &str, state: &DispatcherState) {
     else {
         return;
     };
+    release_dial_branch_media(a_sip_call_id, state);
     if let Some(session) = media_sessions.remove(a_sip_call_id) {
         let set = Arc::clone(rtpengine_set);
         tokio::spawn(async move {
