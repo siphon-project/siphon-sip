@@ -2355,6 +2355,71 @@ def test_dial_target_profile_roundtrip():
     asyncio.run(scenario())
 
 
+def test_dial_offer_roundtrip():
+    """`offer` goes out on the dial and on either target form by its wire name,
+    the reply's `offer` comes back on a bridge dial, and an unknown mode raises
+    before anything is sent."""
+
+    async def scenario():
+        frames = []
+
+        def reply(frame):
+            return {
+                "channel": "ch1",
+                "state": "dialing",
+                "targets": 2,
+                "on_answer": "bridge",
+                "offer": frame["args"].get("offer", "delayed"),
+                "branches": [],
+            }
+
+        stub = _verb_stub({"dial"}, reply, frames)
+        async with websockets.serve(
+            stub, "127.0.0.1", 0, subprotocols=[SUBPROTOCOL]
+        ) as server:
+            port = server.sockets[0].getsockname()[1]
+            url = f"ws://127.0.0.1:{port}/control/ws"
+            client = ControlClient(app=APP, token=TOKEN, url=url)
+            done = asyncio.get_event_loop().create_future()
+
+            @client.on_call
+            async def handle(call):
+                with pytest.raises(ValueError):
+                    await call.dial(["sip:1@x"], on_answer="bridge", offer="late")
+                with pytest.raises(ValueError):
+                    await call.dial([{"uri": "sip:1@x", "offer": "late"}], on_answer="bridge")
+                dialing = await call.dial(
+                    [
+                        {"uri": "sip:+15550199@trunk.example", "offer": "early"},
+                        {"aor": "sip:204@pbx.example", "offer": "delayed"},
+                    ],
+                    on_answer="bridge",
+                    offer="early",
+                )
+                if not done.done():
+                    done.set_result(dialing)
+
+            await client.connect()
+            run_task = asyncio.ensure_future(client.run())
+            await asyncio.sleep(0.3)
+            await client.command("test_push_stasis")
+            dialing = await asyncio.wait_for(done, timeout=5)
+
+            assert len(frames) == 1, "an unknown mode never reaches the wire"
+            assert frames[0]["args"]["offer"] == "early"
+            assert frames[0]["args"]["targets"] == [
+                {"uri": "sip:+15550199@trunk.example", "offer": "early"},
+                {"aor": "sip:204@pbx.example", "offer": "delayed"},
+            ]
+            assert dialing["offer"] == "early"
+
+            client.shutdown()
+            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+                await asyncio.wait_for(run_task, timeout=5)
+
+    asyncio.run(scenario())
+
+
 def test_caller_contact_host_roundtrip():
     """The caller side: `contact_host` on answer / answer_with / answer_anchored /
     ring / progress, `caller_contact_host` on dial and route, each only when given."""

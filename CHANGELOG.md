@@ -52,6 +52,17 @@ entry, but a working config keeps working.
   unknown dial profile does, before anything is allocated or rung; a
   connecting dial that anchors some branches and not others is `bad_request`.
   On `on_answer: "bridge"` the target's profile anchors that phone's leg.
+- **Control plane: early offer on a bridging `dial`.** `offer: "early"` on
+  `dial {on_answer: "bridge"}`, or on one of its targets, sends each phone's
+  INVITE with an SDP offer instead of none, for peers that refuse a
+  delayed-offer INVITE: a ring after a prompt or menu, or a queue offer, to
+  such a peer used to fail. The offer is allocated on the media engine from
+  the caller's media under the phone's profile; the phone answers in its 2xx,
+  and the bridge then re-INVITEs only the caller. Every phone not bridged has
+  its allocation deleted. A 2xx without SDP is ACKed, BYEd and reported as a
+  failed branch with code 488 (RFC 3261 §13.2.1). `"delayed"` is the default
+  and unchanged. An unknown value, `offer` on a connecting dial, and `offer`
+  on `originate` are `bad_request`; `originate` has no caller to offer from.
 
 ### Fixed
 

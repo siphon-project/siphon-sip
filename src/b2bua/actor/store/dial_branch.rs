@@ -154,3 +154,19 @@ impl CallActorStore {
             .unwrap_or(false)
     }
 }
+
+impl CallActorStore {
+    /// Record the allocation an originated leg's INVITE offered.
+    pub fn set_originate_offer(&self, call_id: &str, offer: OriginateOffer) {
+        if let Some(mut call) = self.calls.get_mut(call_id) {
+            call.originate_offer = Some(offer);
+        }
+    }
+
+    /// The allocation an originated leg's INVITE offered, when it carried one.
+    pub fn originate_offer(&self, call_id: &str) -> Option<OriginateOffer> {
+        self.calls
+            .get(call_id)
+            .and_then(|call| call.originate_offer.clone())
+    }
+}

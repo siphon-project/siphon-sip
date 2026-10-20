@@ -30,6 +30,14 @@ use std::time::Instant;
 use crate::b2bua::actor::{DialBranch, DialBranchCause, DialBranchOutcome};
 use crate::dispatcher::*;
 
+/// The next legs a group places, and what each is placed with.
+struct LegsToPlace {
+    targets: Vec<DialTarget>,
+    params: OriginateParams,
+    sink: Arc<dyn OriginateGroupSink>,
+    early_offer: Option<LegOfferCaller>,
+}
+
 /// How an originate group rings its targets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OriginateGroupStrategy {
@@ -80,6 +88,9 @@ pub struct OriginateGroupSpec {
     pub total_timeout_secs: u32,
     /// Whether the first answer is final.
     pub answers: OriginateGroupAnswers,
+    /// The caller a bridging dial's legs are offered from, for the targets
+    /// whose `offer` is [`DialOffer::Early`]. `None` sends every leg offerless.
+    pub early_offer: Option<LegOfferCaller>,
 }
 
 /// When an answer settles a group.
@@ -247,6 +258,8 @@ struct OriginateGroup {
     /// Why the last target that could not be placed was refused.
     last_refusal: Option<OriginateError>,
     answers: OriginateGroupAnswers,
+    /// What an early-offer leg is offered from ([`OriginateGroupSpec::early_offer`]).
+    early_offer: Option<LegOfferCaller>,
     /// The deadline passed while an answer awaited confirmation: the ringing
     /// legs were CANCELled and nothing more is placed, but the answers already
     /// in are still the creator's to confirm or reject.
@@ -512,14 +525,7 @@ impl OriginateGroupStore {
     /// The targets to place now, with what their INVITEs carry: every target
     /// left for a parallel group, the next one for a sequential group. `None`
     /// for a group that is gone or concluded.
-    fn targets_to_place(
-        &self,
-        group_id: &str,
-    ) -> Option<(
-        Vec<DialTarget>,
-        OriginateParams,
-        Arc<dyn OriginateGroupSink>,
-    )> {
+    fn targets_to_place(&self, group_id: &str) -> Option<LegsToPlace> {
         let mut group = self.groups.get_mut(group_id)?;
         if group.concluded {
             group.placing = false;
@@ -531,7 +537,12 @@ impl OriginateGroupStore {
         };
         let targets = group.targets[group.next_target..end].to_vec();
         group.next_target = end;
-        Some((targets, group.params.clone(), Arc::clone(&group.sink)))
+        Some(LegsToPlace {
+            targets,
+            params: group.params.clone(),
+            sink: Arc::clone(&group.sink),
+            early_offer: group.early_offer.clone(),
+        })
     }
 
     /// Record why a target could not be placed.
@@ -870,6 +881,7 @@ pub fn create_originate_group(
             deadline: None,
             last_refusal: None,
             answers: spec.answers,
+            early_offer: spec.early_offer,
             expired: false,
         },
     );
@@ -1046,13 +1058,11 @@ fn drive(
         match next {
             Next::Nothing | Next::Continue => return Ok(placed),
             Next::Place => {
-                let Some((targets, params, sink)) =
-                    state.originate_groups.targets_to_place(group_id)
-                else {
+                let Some(legs) = state.originate_groups.targets_to_place(group_id) else {
                     return Ok(placed);
                 };
-                for target in targets {
-                    if let Some(branch) = place_leg(state, group_id, &target, &params, &sink) {
+                for target in &legs.targets {
+                    if let Some(branch) = place_leg(state, group_id, target, &legs) {
                         placed.push(branch);
                     }
                 }
@@ -1143,16 +1153,21 @@ fn place_leg(
     state: &DispatcherState,
     group_id: &str,
     target: &DialTarget,
-    template: &OriginateParams,
-    sink: &Arc<dyn OriginateGroupSink>,
+    legs: &LegsToPlace,
 ) -> Option<DialBranch> {
-    let params = leg_params(template, target);
+    let sink = &legs.sink;
+    let params = leg_params(&legs.params, target);
     let route = OriginateRoute {
         request_uri: Some(target.uri.clone()),
         flow: target.flow.clone(),
         route: target.route.clone(),
         hide_from_host: target.hide_from_host,
         contact_host: target.contact_host.clone(),
+        // Offered in its INVITE when its target resolved to an early offer.
+        early_offer: legs
+            .early_offer
+            .clone()
+            .filter(|_| target.offer == Some(DialOffer::Early)),
     };
     let prepared = match prepare_originate_routed(state, params, &route) {
         Ok(prepared) => prepared,
@@ -1174,11 +1189,13 @@ fn place_leg(
         .originate_groups
         .attach_leg(group_id, &prepared.internal_call_id, branch.clone())
     {
-        // The group ended while this leg was staged: its INVITE never goes.
+        // The group ended while this leg was staged: its INVITE never goes,
+        // and an early offer's allocation goes with it.
         state.call_actors.remove_call(&prepared.internal_call_id);
         state
             .call_event_receivers
             .remove(&prepared.internal_call_id);
+        originate_delete_media(&prepared.sip_call_id, state);
         return None;
     }
     sink.branch_created(group_id, &branch);
@@ -1433,6 +1450,7 @@ mod tests {
             deadline: None,
             last_refusal: None,
             answers: OriginateGroupAnswers::First,
+            early_offer: None,
             expired: false,
         }
     }
@@ -1745,7 +1763,7 @@ mod tests {
         );
         assert!(store.start("group", Instant::now()));
         assert!(!store.start("group", Instant::now()), "a group starts once");
-        let (first, _, _) = store.targets_to_place("group").expect("a target");
+        let first = store.targets_to_place("group").expect("a target").targets;
         assert_eq!(first.len(), 1);
         assert!(store.attach_leg("group", "leg-0", branch("a", None)));
         assert!(matches!(store.finish_placement("group"), Next::Continue));
@@ -1756,11 +1774,11 @@ mod tests {
             )
             .expect("a live leg");
         assert!(matches!(ended.next, Next::Place));
-        let (second, _, _) = store.targets_to_place("group").expect("a target");
+        let second = store.targets_to_place("group").expect("a target").targets;
         assert_eq!(second[0].uri, "sip:201@198.51.100.1");
         assert!(store
             .targets_to_place("group")
-            .is_some_and(|(rest, _, _)| rest.is_empty()));
+            .is_some_and(|rest| rest.targets.is_empty()));
     }
 
     #[test]
