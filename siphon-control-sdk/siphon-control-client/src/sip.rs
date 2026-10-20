@@ -39,7 +39,8 @@ pub use crate::originate::{
 // reachable under one path.
 pub use crate::caller_contact::ResponseOptions;
 pub use crate::dial::{
-    DialOnAnswer, DialOptions, DialStrategy, DialTarget, Dialing, Ringback, TargetIdentity,
+    DialOffer, DialOnAnswer, DialOptions, DialStrategy, DialTarget, Dialing, Ringback,
+    TargetIdentity,
 };
 pub use crate::recording::{RecordChannels, RecordDirection, RecordOptions, Recording};
 pub use crate::route_target::RouteTarget;

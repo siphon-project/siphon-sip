@@ -13,10 +13,10 @@ use siphon_control_client::sip::{
 };
 
 use crate::args::{
-    build_play_source, extract_dial_on_answer, extract_dial_strategy, extract_dial_targets,
-    extract_headers, extract_play_repeat, extract_privacy, extract_record_channels,
-    extract_record_direction, extract_route_target, extract_stream_channels,
-    extract_stream_direction, extract_stream_mode, parse_peer_hangup,
+    build_play_source, extract_dial_offer, extract_dial_on_answer, extract_dial_strategy,
+    extract_dial_targets, extract_headers, extract_play_repeat, extract_privacy,
+    extract_record_channels, extract_record_direction, extract_route_target,
+    extract_stream_channels, extract_stream_direction, extract_stream_mode, parse_peer_hangup,
 };
 use crate::{attach_if_running, interpreter_gone, json_to_py, optional_json, to_pyerr};
 
@@ -59,6 +59,11 @@ fn dialing_to_json(dialing: &Dialing) -> serde_json::Value {
             None => serde_json::Value::Null,
         };
         fields.insert("ringback".into(), ringback);
+        // Only when the server named one, so an older server's reply keeps the
+        // keys it always had.
+        if let Some(offer) = dialing.offer {
+            fields.insert("offer".into(), serde_json::json!(offer.as_str()));
+        }
         fields.insert("branches".into(), serde_json::json!(dialing.branches));
     }
     value
@@ -1088,6 +1093,25 @@ impl Call {
     /// hands over plain RTP at a routable address and every phone answers from
     /// an address on its own LAN.
     ///
+    /// Either target form may carry ``"profile"``, the media profile for that
+    /// branch alone (every branch of an AoR) over the dial's own; a target
+    /// without one inherits the dial's. One ring can then reach a phone behind
+    /// NAT that needs a latching relay and a trunk that asks for SDES-SRTP. An
+    /// unknown name fails the dial as an unknown dial-level ``profile`` does.
+    /// A connecting dial that names no ``profile`` anchors every branch or
+    /// none, so either every target names one or none does (a mix raises
+    /// ``bad_request``). On ``on_answer="bridge"`` each phone leg is anchored
+    /// with its target's profile over the dial's.
+    ///
+    /// ``offer="early"`` (on the dial, or ``"offer"`` on a target, which wins)
+    /// sends each phone of an ``on_answer="bridge"`` dial an SDP offer in its
+    /// INVITE, allocated on the media engine from the caller's media under the
+    /// phone's profile, for peers that refuse a delayed-offer INVITE. The phone
+    /// answers in its 2xx and only the caller is re-INVITEd at the bridge; a
+    /// 2xx without SDP fails that branch with 488. ``"delayed"`` (the server's
+    /// default) sends the INVITE offerless. Any other value raises
+    /// ``ValueError``; the server refuses ``offer`` on a connecting dial.
+    ///
     /// ``from`` / ``from_display`` / ``p_asserted_identity`` / ``privacy``
     /// present a calling identity of the app's choosing. Without them a B-leg
     /// presents the caller's own ``From``, which on a call out to a trunk is the
@@ -1117,7 +1141,8 @@ impl Call {
     /// Returns ``{"channel", "targets", "strategy", "timeout"}``, where
     /// ``targets`` counts the **branches** the server resolved — one AoR
     /// registered on three devices reports three. A bridge dial adds
-    /// ``"on_answer"``, ``"group_id"``, ``"total_timeout"``, ``"ringback"`` and
+    /// ``"on_answer"``, ``"group_id"``, ``"total_timeout"``, ``"ringback"``,
+    /// ``"offer"`` and
     /// ``"branches"`` (one dict per phone, as its ``DialBranch`` event names
     /// it). Raises ``ControlError`` with ``code == "not_found"`` (the call is
     /// gone, or no target yielded a branch), ``"invalid_state"`` (already
@@ -1137,6 +1162,7 @@ impl Call {
         on_answer=None,
         ringback=None,
         caller_contact_host=None,
+        offer=None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn dial<'py>(
@@ -1156,6 +1182,7 @@ impl Call {
         on_answer: Option<String>,
         ringback: Option<Bound<'py, PyAny>>,
         caller_contact_host: Option<String>,
+        offer: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let options = DialOptions {
             strategy: extract_dial_strategy(strategy)?,
@@ -1171,6 +1198,7 @@ impl Call {
             privacy: extract_privacy("dial", privacy)?,
             on_answer: extract_dial_on_answer(on_answer, ringback)?,
             caller_contact_host,
+            offer: extract_dial_offer(offer)?,
         };
         let dial_targets = extract_dial_targets(&targets)?;
         let call = self.inner.clone();

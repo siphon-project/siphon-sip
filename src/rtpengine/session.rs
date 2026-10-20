@@ -375,8 +375,14 @@ pub struct MediaSessionStore {
     /// exactly this answer is early media the engine can still connect a
     /// callee behind (`offer_far`).
     local_answers: DashMap<String, String>,
+    /// The allocations a controller `dial` made for the profiles its branches
+    /// name beyond the call's own session's, by SIP Call-ID, until a branch
+    /// answers. See [`dial_branches`].
+    dial_branches: DashMap<String, Vec<MediaSession>>,
 }
 
+mod dial_branches;
+pub use dial_branches::SettledDialMedia;
 mod own_media;
 pub use own_media::OwnMedia;
 
@@ -406,6 +412,7 @@ impl MediaSessionStore {
             parties: Default::default(),
             own_media: DashMap::new(),
             local_answers: DashMap::new(),
+            dial_branches: DashMap::new(),
         }
     }
 
@@ -634,6 +641,7 @@ impl MediaSessionStore {
     /// a session of its own, so it also drops what a bridge recorded for the
     /// call when it retired that session ([`own_media`]).
     pub fn remove(&self, call_id: &str) -> Option<MediaSession> {
+        self.forget_dial_branches(call_id);
         self.forget_own_media(call_id);
         self.local_answers.remove(call_id);
         self.take_session(call_id)
@@ -735,6 +743,7 @@ impl MediaSessionStore {
         for engine_call_id in swept {
             self.release_parties(&engine_call_id);
         }
+        self.sweep_dial_branches(cutoff);
         self.sweep_own_media(cutoff);
     }
 
@@ -745,10 +754,13 @@ impl MediaSessionStore {
     /// gives a call an engine id of its own. Comparing the wrong one would
     /// read every live call as an orphan.
     pub fn live_engine_call_ids(&self) -> std::collections::HashSet<String> {
-        self.sessions
+        let mut live: std::collections::HashSet<String> = self
+            .sessions
             .iter()
             .map(|entry| entry.value().rtpengine_id().to_string())
-            .collect()
+            .collect();
+        live.extend(self.dial_branch_engine_call_ids());
+        live
     }
 
     /// Number of active sessions.

@@ -261,6 +261,10 @@ pub fn handle_b2bua_cancel(inbound: InboundMessage, message: SipMessage, state: 
         Some("Request Terminated"),
     );
 
+    // A controller dial's media allocations — the call's own session and any
+    // a branch's profile was offered — which no BYE will ever release.
+    release_control_dial_media(&call_id, state);
+
     // LCR: the carrier that was ringing when the caller gave up, and every
     // carrier burned on the way to it, before the record is closed. The answer
     // path and the exhausted-sequence path both stamp these; this one did not,

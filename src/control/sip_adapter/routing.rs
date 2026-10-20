@@ -142,22 +142,20 @@ pub(super) fn dial(channel: &ChannelRef, command: &AdapterCommand) -> ControlRes
         Ok(ringback) => ringback,
         Err(refusal) => return refusal,
     };
-    let profile = match args.get("profile") {
-        None | Some(serde_json::Value::Null) => None,
-        Some(serde_json::Value::String(name)) if !name.trim().is_empty() => Some(name.as_str()),
-        Some(_) => {
-            return ControlResult::error(
-                ControlErrorCode::BadRequest,
-                "dial profile must be a non-empty profile name",
-            )
-        }
+    let profile = match parse_profile("dial", args.get("profile")) {
+        Ok(profile) => profile,
+        Err(message) => return ControlResult::error(ControlErrorCode::BadRequest, message),
+    };
+    let offer = match parse_offer("dial", args.get("offer")) {
+        Ok(offer) => offer,
+        Err(message) => return offer_refusal(message, "unknown_value"),
     };
     let privacy = match super::originate::parse_privacy("dial", args.get("privacy")) {
         Ok(privacy) => privacy,
         Err(message) => return ControlResult::error(ControlErrorCode::BadRequest, message),
     };
     let shaping = crate::dispatcher::DialShaping {
-        profile: profile.map(str::to_string),
+        profile,
         from: super::string_arg(args, "from"),
         from_display: super::string_arg(args, "from_display"),
         p_asserted_identity: super::string_arg(args, "p_asserted_identity"),
@@ -192,6 +190,20 @@ pub(super) fn dial(channel: &ChannelRef, command: &AdapterCommand) -> ControlRes
         );
     }
 
+    // Only a bridging dial places its legs itself: a connecting dial's
+    // branches carry the caller's own offer, so naming when they offer is
+    // refused rather than ignored.
+    if on_answer == OnAnswer::Connect
+        && (offer.is_some() || targets.iter().any(|target| target.offer.is_some()))
+    {
+        return offer_refusal(
+            "dial offer applies to on_answer \"bridge\" — a connecting dial's branches carry the \
+             caller's own offer"
+                .to_string(),
+            "requires_bridge",
+        );
+    }
+
     let strategy = args
         .get("strategy")
         .and_then(|v| v.as_str())
@@ -223,6 +235,7 @@ pub(super) fn dial(channel: &ChannelRef, command: &AdapterCommand) -> ControlRes
                 timeout_secs,
                 ringback,
                 caller_contact_host,
+                offer,
             },
         );
     }
@@ -408,7 +421,9 @@ pub(super) fn dial_error(error: crate::dispatcher::DialError) -> ControlResult {
         }
         DialError::UnsupportedStrategy(_) => ControlErrorCode::UnsupportedVerb,
         DialError::NoContacts(_) => ControlErrorCode::NotFound,
-        DialError::NoTargets | DialError::InvalidIdentity(_) => ControlErrorCode::BadRequest,
+        DialError::NoTargets | DialError::InvalidIdentity(_) | DialError::InvalidMedia(_) => {
+            ControlErrorCode::BadRequest
+        }
         DialError::Media(_) => ControlErrorCode::Unavailable,
     };
     ControlResult::error(code, error.to_string())
@@ -503,6 +518,8 @@ pub(super) fn parse_dial_target(
         to: string_field("to"),
         contact_host: parse_contact_host(object).map_err(|error| format!("target {error}"))?,
         reroute_after_progress: parse_reroute_after_progress(object)?,
+        profile: parse_profile("dial target", object.get("profile"))?,
+        offer: parse_offer("dial target", object.get("offer"))?,
         ..Default::default()
     };
 
@@ -533,6 +550,8 @@ pub(super) fn parse_dial_target(
                     branch.to.clone_from(&shaped.to);
                     branch.contact_host.clone_from(&shaped.contact_host);
                     branch.reroute_after_progress = shaped.reroute_after_progress;
+                    branch.profile.clone_from(&shaped.profile);
+                    branch.offer = shaped.offer;
                 }
                 Ok(branches)
             }
@@ -626,6 +645,45 @@ fn parse_reroute_after_progress(
                 .ok_or_else(|| "target 'reroute_after_progress' must be a boolean".to_string())
         })
         .transpose()
+}
+
+/// Read a media `profile` argument: absent or `null` is none, anything else
+/// must name a profile. Whether siphon defines it is the media layer's to say,
+/// at dial time, the same for a dial's own profile and a target's.
+fn parse_profile(whose: &str, value: Option<&serde_json::Value>) -> Result<Option<String>, String> {
+    match value {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(name)) if !name.trim().is_empty() => Ok(Some(name.clone())),
+        Some(_) => Err(format!("{whose} profile must be a non-empty profile name")),
+    }
+}
+
+/// Read an `offer` argument: absent or `null` is none (the dial's, or
+/// delayed), else `"early"` or `"delayed"`.
+fn parse_offer(
+    whose: &str,
+    value: Option<&serde_json::Value>,
+) -> Result<Option<crate::dispatcher::DialOffer>, String> {
+    match value {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(name)) => crate::dispatcher::DialOffer::parse(name)
+            .map(Some)
+            .ok_or_else(|| {
+                format!("{whose} offer must be \"early\" or \"delayed\", got \"{name}\"")
+            }),
+        Some(other) => Err(format!(
+            "{whose} offer must be \"early\" or \"delayed\", got {other}"
+        )),
+    }
+}
+
+/// A `dial` refused over its `offer` argument, with the typed reason.
+fn offer_refusal(message: String, reason: &str) -> ControlResult {
+    ControlResult::error_with_details(
+        ControlErrorCode::BadRequest,
+        message,
+        serde_json::json!({ "verb": "dial", "argument": "offer", "reason": reason }),
+    )
 }
 
 /// Read a `contact_host`: the host siphon presents in its own Contact on the

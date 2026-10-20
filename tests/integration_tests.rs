@@ -37,6 +37,9 @@ mod diameter_tests;
 #[path = "integration/transport_tests.rs"]
 mod transport_tests;
 
+#[path = "integration/tls_client_auth_tests.rs"]
+mod tls_client_auth_tests;
+
 #[path = "integration/li_tests.rs"]
 mod li_tests;
 

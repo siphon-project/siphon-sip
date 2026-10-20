@@ -217,15 +217,16 @@ pub fn pcscf_path_host() -> Option<String> {
 ///
 /// ```text
 ///   #1  UE:port_uc   → P-CSCF:port_ps   (UE → P-CSCF requests)
-///   #2  P-CSCF:port_ps → UE:port_uc     (P-CSCF → UE responses)
+///   #2  P-CSCF:port_ps → UE:port_uc     (P-CSCF → UE responses, TCP)
 ///   #3  P-CSCF:port_pc → UE:port_us     (P-CSCF → UE requests, e.g. MT INVITE)
 ///   #4  UE:port_us   → P-CSCF:port_pc   (UE → P-CSCF responses to MT)
 /// ```
 ///
-/// SA #2 fires automatically because the dispatcher's reply path pins
-/// `source_local_addr = Some(inbound.local_addr)` — that local addr
-/// IS `(pcscf_addr, port_ps)` and the kernel egress XFRM policy
-/// matches.  But there is no equivalent capture for an originated MT
+/// A response needs no help here: the dispatcher's reply path pins
+/// `source_local_addr = Some(inbound.local_addr)`, `(pcscf_addr, port_ps)`,
+/// which is SA #2 on TCP, and over UDP the send layer moves it onto SA #3
+/// (TS 33.203 §7.1, `IpsecManager::udp_response_flow`).  But there is no
+/// equivalent capture for an originated MT
 /// request (the script has no inbound to copy from), so without this
 /// helper the dispatcher defaults to the listen-port-5060 listener
 /// and the kernel selector for SA #3 (src=`port_pc`, dst=`port_us`)
@@ -333,6 +334,30 @@ pub(crate) fn outbound_for_sa(
         SaProtocol::Any => current_transport,
     };
     Some((source, transport))
+}
+
+/// The `rport` a P-CSCF writes on the top Via of a request it received from
+/// `source_port`, over UDP when `udp`, protected by `protected` when the
+/// request came over a security association.
+///
+/// RFC 3581 makes it the source port. Over an IPsec UDP flow that is not
+/// where the response goes: TS 24.229 clause 5.2.6.3.1, "If IMS AKA is used,
+/// the parameter value shall contain the UEs protected server port", matching
+/// TS 33.203 clause 7.1, under which the UE receives its UDP responses on
+/// port_us. The value follows [`SecurityAssociationPair::udp_response_flow`],
+/// the same decision the dispatcher sends the response by, so the two agree.
+pub(crate) fn received_rport(
+    source_port: u16,
+    udp: bool,
+    protected: Option<&SecurityAssociationPair>,
+) -> u16 {
+    let Some(sa) = protected.filter(|sa| udp && sa.ue_port_c == source_port) else {
+        return source_port;
+    };
+    match sa.udp_response_flow() {
+        crate::ipsec::UdpResponseFlow::Protected { destination, .. } => destination.port(),
+        _ => source_port,
+    }
 }
 
 /// Find the active SA pair (if any) matching the given UE address and
@@ -474,6 +499,44 @@ mod tests {
             impi: None,
             security_server: None,
         }
+    }
+
+    /// TS 24.229 clause 5.2.6.3.1: "If IMS AKA is used, the parameter value
+    /// shall contain the UEs protected server port", because that is where
+    /// the response goes over UDP (TS 33.203 clause 7.1).
+    #[test]
+    fn rport_of_a_protected_udp_request_is_the_ue_protected_server_port() {
+        let sa = ipsec_test_sa();
+        assert_eq!(received_rport(sa.ue_port_c, true, Some(&sa)), sa.ue_port_s);
+    }
+
+    #[test]
+    fn rport_is_the_source_port_without_a_pair() {
+        assert_eq!(received_rport(50000, true, None), 50000);
+    }
+
+    /// TCP answers on the connection, so `rport` stays what RFC 3581 says.
+    #[test]
+    fn rport_of_a_protected_tcp_request_is_the_source_port() {
+        let sa = ipsec_test_sa();
+        assert_eq!(received_rport(sa.ue_port_c, false, Some(&sa)), sa.ue_port_c);
+    }
+
+    /// A request from some other port of the UE is not on the
+    /// (port_uc, port_ps) flow, so nothing is rewritten.
+    #[test]
+    fn rport_of_a_request_off_the_client_port_is_the_source_port() {
+        let sa = ipsec_test_sa();
+        assert_eq!(received_rport(sa.ue_port_s, true, Some(&sa)), sa.ue_port_s);
+    }
+
+    /// A pair that cannot carry UDP leaves the response at the source port, so
+    /// `rport` names that port too.
+    #[test]
+    fn rport_over_a_tcp_only_pair_is_the_source_port() {
+        let mut sa = ipsec_test_sa();
+        sa.protocol = SaProtocol::Tcp;
+        assert_eq!(received_rport(sa.ue_port_c, true, Some(&sa)), sa.ue_port_c);
     }
 
     #[test]
