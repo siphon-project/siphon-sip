@@ -74,6 +74,14 @@ pub struct DialTarget {
     /// `{aor}` target ([`dial_targets_for_aor`]). What the branch's events name
     /// as the AoR it was dialled for; `None` for a URI dialled as written.
     pub aor: Option<String>,
+    /// Media profile for this branch alone, over the dial's own.
+    ///
+    /// The media a peer can take is a property of that peer, not of the call:
+    /// a desk phone behind NAT needs a latching relay while a trunk asks for
+    /// SDES-SRTP, and one ring can reach both. A branch naming a profile the
+    /// others do not is offered an allocation of its own, and the branch that
+    /// answers is answered through it (see `dial_media`).
+    pub profile: Option<String>,
 }
 
 impl DialTarget {
@@ -85,9 +93,7 @@ impl DialTarget {
     /// `headers`, which a target already layers over the command's.
     pub(super) fn shaping_over(&self, dial: &DialShaping) -> DialShaping {
         DialShaping {
-            // Media is allocated once for the whole dial, so a branch cannot
-            // pick its own profile.
-            profile: dial.profile.clone(),
+            profile: self.profile.clone().or_else(|| dial.profile.clone()),
             from: self.from.clone().or_else(|| dial.from.clone()),
             from_display: self
                 .from_display

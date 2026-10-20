@@ -13,6 +13,27 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
+### Added
+
+- **Control plane: a `dial` target can name its own media profile.** `profile`
+  on a `dial` target (`{uri}` or `{aor}`) overrides the dial's `profile` for
+  that branch alone; a target naming none inherits the dial's. One ring can
+  now reach a phone behind NAT on a latching profile and a trunk on an
+  SDES-SRTP profile together. A connecting dial makes one media allocation
+  per profile its branches name, sends each branch its own profile's anchored
+  offer (each attempt of a sequential hunt too), answers early media and the
+  2xx through the answering branch's allocation, and releases the others once
+  a branch answers. An unknown target profile fails the dial exactly as an
+  unknown dial profile does, before anything is allocated or rung; a
+  connecting dial that anchors some branches and not others is `bad_request`.
+  On `on_answer: "bridge"` the target's profile anchors that phone's leg.
+
+### Fixed
+
+- **A controller `dial` with a media profile no longer leaves its media
+  allocation behind when the caller cancels while it rings.** Nothing released
+  it on the caller's CANCEL; the engine held it until its own timeout.
+
 ## [1.15.0] — 2026-10-19
 
 ### Added

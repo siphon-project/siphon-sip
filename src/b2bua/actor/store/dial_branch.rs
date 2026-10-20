@@ -107,6 +107,45 @@ impl CallActorStore {
         }
     }
 
+    /// Name the media profile the next B-leg INVITE of the call's dial is
+    /// offered. See [`DialMedia::sending_profile`].
+    pub fn set_dial_sending_profile(&self, call_id: &str, profile: Option<String>) {
+        if let Some(mut call) = self.calls.get_mut(call_id) {
+            call.dial_media.sending_profile = profile;
+        }
+    }
+
+    /// Keep the anchored offer made for `profile`, for the branches of the
+    /// call's dial that name it.
+    pub fn add_dial_branch_offer(&self, call_id: &str, profile: String, offer: Vec<u8>) {
+        if let Some(mut call) = self.calls.get_mut(call_id) {
+            call.dial_media.branch_offers.push((profile, offer));
+        }
+    }
+
+    /// The anchored offer made for `profile`, when it has an allocation of its
+    /// own rather than being the call's media session's.
+    pub fn dial_branch_offer(&self, call_id: &str, profile: &str) -> Option<Vec<u8>> {
+        let call = self.calls.get(call_id)?;
+        call.dial_media.branch_offer(profile).map(<[u8]>::to_vec)
+    }
+
+    /// The media profile the B-leg on Via `via_branch` was offered. See
+    /// [`CallActor::dial_branch_media_profile`].
+    pub fn dial_branch_media_profile(&self, call_id: &str, via_branch: &str) -> Option<String> {
+        self.calls
+            .get(call_id)?
+            .dial_branch_media_profile(via_branch)
+    }
+
+    /// Forget the dial's per-branch media: its allocations are settled or
+    /// released, so no later attempt may be built from them.
+    pub fn clear_dial_media(&self, call_id: &str) {
+        if let Some(mut call) = self.calls.get_mut(call_id) {
+            call.dial_media = DialMedia::default();
+        }
+    }
+
     /// Whether a controller-issued `dial` is still awaiting its outcome.
     pub fn is_control_dial(&self, call_id: &str) -> bool {
         self.calls

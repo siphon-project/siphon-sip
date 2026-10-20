@@ -635,6 +635,15 @@ export type DialTarget =
        * IP address; the server refuses anything else with `bad_request`.
        */
       contactHost?: string;
+      /**
+       * Media profile for this branch alone, over the dial's own. A target
+       * without one inherits the dial's. One ring can then reach a phone behind
+       * NAT that needs a latching relay and a trunk that asks for SDES-SRTP. An
+       * unknown name fails the dial as an unknown dial-level `profile` does; a
+       * connecting dial that names no `profile` anchors every branch or none, so
+       * either every target names one or none does (a mix is `bad_request`).
+       */
+      profile?: string;
     }
   | {
       /**
@@ -649,6 +658,8 @@ export type DialTarget =
       to?: string;
       /** Host of siphon's own `Contact` on every branch the AoR expands to (see the URI form). */
       contactHost?: string;
+      /** Media profile for every branch the AoR expands to (see the URI form). */
+      profile?: string;
     };
 
 /**
@@ -806,6 +817,10 @@ function dialTargetToWire(target: DialTarget): unknown {
   const to = (target as { to?: unknown }).to;
   const route = routeSetToWire((target as { route?: unknown }).route);
   const contactHost = contactHostToWire((target as { contactHost?: unknown }).contactHost);
+  const profile = (target as { profile?: unknown }).profile ?? undefined;
+  if (profile !== undefined && typeof profile !== "string") {
+    throw new TypeError('a dial target\'s "profile" is a media profile name string');
+  }
   if (to !== undefined && typeof to !== "string") {
     throw new TypeError('a dial target\'s "to" is a SIP URI string');
   }
@@ -832,6 +847,7 @@ function dialTargetToWire(target: DialTarget): unknown {
     if (headers !== undefined) object.headers = headers;
     if (to !== undefined) object.to = to;
     if (contactHost !== undefined) object.contact_host = contactHost;
+    if (profile !== undefined) object.profile = profile;
     return object;
   }
   if (typeof uri !== "string") {
@@ -843,7 +859,8 @@ function dialTargetToWire(target: DialTarget): unknown {
     headers === undefined &&
     to === undefined &&
     route === undefined &&
-    contactHost === undefined
+    contactHost === undefined &&
+    profile === undefined
   ) {
     return uri;
   }
@@ -853,6 +870,7 @@ function dialTargetToWire(target: DialTarget): unknown {
   if (to !== undefined) object.to = to;
   if (route !== undefined) object.route = route;
   if (contactHost !== undefined) object.contact_host = contactHost;
+  if (profile !== undefined) object.profile = profile;
   return object;
 }
 

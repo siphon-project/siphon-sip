@@ -1274,6 +1274,29 @@ describe("dial args map to the target shapes the server parses", () => {
     ).toThrow(/contactHost/);
   });
 
+  it("sends a target's profile on either form, beside the dial's own", () => {
+    expect(
+      dialArgs(
+        [
+          { uri: "sip:+15550199@trunk.example", profile: "sdes_srtp" },
+          { aor: "sip:204@pbx.example", profile: "latching" },
+          { uri: "sip:1001@pbx.example" },
+        ],
+        { profile: "rtp_passthrough" },
+      ),
+    ).toEqual({
+      targets: [
+        { uri: "sip:+15550199@trunk.example", profile: "sdes_srtp" },
+        { aor: "sip:204@pbx.example", profile: "latching" },
+        "sip:1001@pbx.example",
+      ],
+      profile: "rtp_passthrough",
+    });
+    expect(() =>
+      dialArgs([{ aor: "sip:204@pbx.example", profile: 7 } as never]),
+    ).toThrow(/profile/);
+  });
+
   it("refuses a route set on an aor, and one that is not a list of strings", () => {
     // Each branch of an AoR follows its own binding's Path.
     expect(() =>

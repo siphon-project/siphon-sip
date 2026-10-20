@@ -100,10 +100,12 @@ pub(crate) fn extract_dial_targets(items: &[Bound<'_, PyAny>]) -> PyResult<Vec<D
 }
 
 /// Extract one `dial` target: a dict `{uri, next_hop?, headers?, to?, route?,
-/// contact_host?}` dialed as written, or `{aor, headers?, to?, contact_host?}`
-/// forked to every registered contact. `contact_host` is the host of siphon's
-/// own Contact on the branch (every branch of an AoR), for a peer that
-/// identifies the tenant by that host.
+/// contact_host?, profile?}` dialed as written, or `{aor, headers?, to?,
+/// contact_host?, profile?}` forked to every registered contact. `contact_host`
+/// is the host of siphon's own Contact on the branch (every branch of an AoR),
+/// for a peer that identifies the tenant by that host. `profile` is the media
+/// profile for that branch alone, over the dial's own; a target without one
+/// inherits the dial's.
 ///
 /// A bare string is refused although the server accepts one as a URI. The two
 /// forms do entirely different things — an AoR forks to every contact over that
@@ -123,6 +125,7 @@ fn extract_dial_target(item: &Bound<'_, PyAny>) -> PyResult<DialTarget> {
     let next_hop = optional_string(dict, "next_hop")?;
     let to = optional_string(dict, "to")?;
     let contact_host = optional_string(dict, "contact_host")?;
+    let profile = optional_string(dict, "profile")?;
     let route = extract_route_set(dict)?;
     let headers = match dict.get_item("headers")? {
         Some(value) if !value.is_none() => extract_headers(&value)?,
@@ -149,6 +152,7 @@ fn extract_dial_target(item: &Bound<'_, PyAny>) -> PyResult<DialTarget> {
             to: None,
             route,
             contact_host: None,
+            profile: None,
         },
         (None, Some(aor)) => {
             if next_hop.is_some() {
@@ -180,6 +184,9 @@ fn extract_dial_target(item: &Bound<'_, PyAny>) -> PyResult<DialTarget> {
     }
     if let Some(contact_host) = contact_host {
         target = target.contact_host(contact_host);
+    }
+    if let Some(profile) = profile {
+        target = target.profile(profile);
     }
     Ok(target)
 }
