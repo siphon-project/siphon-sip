@@ -95,6 +95,15 @@ export interface ResponseOptions {
    * the same host again is accepted, another rejects with `invalid_state`.
    */
   contactHost?: string;
+  /**
+   * User part siphon presents in its own `Contact` toward the caller, which is
+   * otherwise userless (`<sip:trunk-7@sbc.example.net:5061;transport=tls>`),
+   * for a peer that keys the account on the Contact user. An RFC 3261 SIP URI
+   * user; the server refuses an empty or invalid one with `bad_request`. Fixed
+   * as `contactHost` is: another one after an 18x or 2xx rejects with
+   * `invalid_state`.
+   */
+  contactUser?: string;
 }
 
 /** Options for {@link Call.ring}. */
@@ -107,6 +116,15 @@ export interface RingOptions {
    * the same host again is accepted, another rejects with `invalid_state`.
    */
   contactHost?: string;
+  /**
+   * User part siphon presents in its own `Contact` toward the caller, which is
+   * otherwise userless (`<sip:trunk-7@sbc.example.net:5061;transport=tls>`),
+   * for a peer that keys the account on the Contact user. An RFC 3261 SIP URI
+   * user; the server refuses an empty or invalid one with `bad_request`. Fixed
+   * as `contactHost` is: another one after an 18x or 2xx rejects with
+   * `invalid_state`.
+   */
+  contactUser?: string;
 }
 
 /** Options for {@link Call.route}. */
@@ -117,6 +135,12 @@ export interface RouteOptions {
    * presents the carrier.
    */
   callerContactHost?: string;
+  /**
+   * User part of siphon's own `Contact` toward the caller, as `contactUser` is
+   * on {@link Call.answer}. Each target's `contactUser` is the user its
+   * attempt presents the carrier.
+   */
+  callerContactUser?: string;
 }
 
 function responseArgs(options: ResponseOptions): Record<string, unknown> {
@@ -135,6 +159,9 @@ function responseArgs(options: ResponseOptions): Record<string, unknown> {
   }
   if (options.contactHost !== undefined) {
     args.contact_host = options.contactHost;
+  }
+  if (options.contactUser !== undefined) {
+    args.contact_user = options.contactUser;
   }
   return args;
 }
@@ -156,6 +183,8 @@ export interface AnchoredAnswerOptions {
   wsUri?: string;
   /** Host of siphon's own `Contact` toward the caller; see {@link ResponseOptions}. */
   contactHost?: string;
+  /** User part of siphon's own `Contact` toward the caller; see {@link ResponseOptions}. */
+  contactUser?: string;
 }
 
 /** The RFC 3891 `Replaces` triple for an attended transfer. */
@@ -309,6 +338,11 @@ export interface RouteTargetObject {
    */
   contactHost?: string;
   /**
+   * User part siphon presents in its own `Contact` on this attempt, which is
+   * otherwise userless. See {@link DialTarget}'s `contactUser`.
+   */
+  contactUser?: string;
+  /**
    * Verify (`true`) or not (`false`) the server certificate when this attempt
    * opens a new outbound TLS connection. See {@link DialTarget}'s
    * `verifyServer`.
@@ -343,6 +377,19 @@ function contactHostToWire(contactHost: unknown): string | undefined {
 }
 
 /**
+ * A target's `contactUser` as the wire carries it. Anything but a string is
+ * refused here; whether the string is an RFC 3261 user is the server's call,
+ * which answers `bad_request` when it is not.
+ */
+function contactUserToWire(contactUser: unknown): string | undefined {
+  if (contactUser === undefined || contactUser === null) return undefined;
+  if (typeof contactUser !== "string") {
+    throw new TypeError('a target\'s "contactUser" is a SIP URI user string');
+  }
+  return contactUser;
+}
+
+/**
  * A target's `route` as the wire carries it: the list as given, or nothing for
  * an absent or empty one. A lone string is refused rather than read as a
  * one-entry list, since a request sent with the wrong route set goes somewhere
@@ -369,6 +416,7 @@ function routeTargetToWire(target: RouteTarget): unknown {
   }
   const route = routeSetToWire(target.route);
   const contactHost = contactHostToWire(target.contactHost);
+  const contactUser = contactUserToWire(target.contactUser);
   const verifyServer = verifyServerToWire(target.verifyServer);
   const object: Record<string, unknown> = { uri: target.uri };
   if (target.nextHop !== undefined) {
@@ -389,6 +437,9 @@ function routeTargetToWire(target: RouteTarget): unknown {
   }
   if (contactHost !== undefined) {
     object.contact_host = contactHost;
+  }
+  if (contactUser !== undefined) {
+    object.contact_user = contactUser;
   }
   if (verifyServer !== undefined) {
     object.verify_server = verifyServer;
@@ -487,6 +538,13 @@ export interface OriginateOptions {
    * host changes, and every in-dialog request on the call presents it too.
    */
   contactHost?: string;
+  /**
+   * User part siphon presents in its own `Contact` on the call (on every leg
+   * of an {@link SipClient.originateAor}), which is otherwise userless, for a
+   * peer that keys the account on the Contact user. An RFC 3261 SIP URI user;
+   * the server refuses anything else with `bad_request`.
+   */
+  contactUser?: string;
 }
 
 /**
@@ -600,6 +658,7 @@ function originateCommonArgs(
   if (options.onLost !== undefined) args.on_lost = options.onLost;
   if (options.vars !== undefined) args.vars = options.vars;
   if (options.contactHost !== undefined) args.contact_host = options.contactHost;
+  if (options.contactUser !== undefined) args.contact_user = options.contactUser;
   if (options.sessionTimer !== undefined) {
     const timer: Record<string, unknown> = {};
     const { expires, minSe, refresher } = options.sessionTimer;
@@ -659,6 +718,15 @@ export type DialTarget =
        */
       contactHost?: string;
       /**
+       * User part siphon presents in its own `Contact` on this branch, which is
+       * otherwise userless (`<sip:trunk-7@sbc.example.net:5061;transport=tls>`),
+       * for a peer that keys the account on the Contact user. Composes with
+       * `contactHost`, sticks the same way, and outranks a script's
+       * `call.set_contact_user()`. An RFC 3261 SIP URI user; the server
+       * refuses anything else with `bad_request`.
+       */
+      contactUser?: string;
+      /**
        * Whether a sequential dial still moves on from this target once it has
        * rung (sent the far end's 101-199). Sent only when given; the server's
        * default is `true`, a hunt through phones moving on when one rings out
@@ -708,6 +776,8 @@ export type DialTarget =
       to?: string;
       /** Host of siphon's own `Contact` on every branch the AoR expands to (see the URI form). */
       contactHost?: string;
+      /** User part of siphon's own `Contact` on every branch the AoR expands to (see the URI form). */
+      contactUser?: string;
       /** `rerouteAfterProgress` for every branch the AoR expands to (see the URI form). */
       rerouteAfterProgress?: boolean;
       /** Media profile for every branch the AoR expands to (see the URI form). */
@@ -812,6 +882,12 @@ export interface DialOptions {
    */
   callerContactHost?: string;
   /**
+   * User part of siphon's own `Contact` toward the caller, as `contactUser` is
+   * on {@link Call.answer}; each target's `contactUser` is the user its leg
+   * presents. On a bridging dial it can only repeat what the answer carried.
+   */
+  callerContactUser?: string;
+  /**
    * When each phone of an `onAnswer: "bridge"` dial is sent its offer, where
    * its target names none ({@link DialOffer}). Bridge-only: naming it, on the
    * dial or on a target, without `onAnswer: "bridge"` throws a `TypeError`
@@ -893,6 +969,7 @@ function dialTargetToWire(target: DialTarget): unknown {
   const to = (target as { to?: unknown }).to;
   const route = routeSetToWire((target as { route?: unknown }).route);
   const contactHost = contactHostToWire((target as { contactHost?: unknown }).contactHost);
+  const contactUser = contactUserToWire((target as { contactUser?: unknown }).contactUser);
   const rerouteAfterProgress = (target as { rerouteAfterProgress?: unknown })
     .rerouteAfterProgress;
   // A policy flag: anything but a boolean is refused, as the server refuses
@@ -935,6 +1012,7 @@ function dialTargetToWire(target: DialTarget): unknown {
     if (headers !== undefined) object.headers = headers;
     if (to !== undefined) object.to = to;
     if (contactHost !== undefined) object.contact_host = contactHost;
+    if (contactUser !== undefined) object.contact_user = contactUser;
     if (rerouteAfterProgress !== undefined) {
       object.reroute_after_progress = rerouteAfterProgress;
     }
@@ -953,6 +1031,7 @@ function dialTargetToWire(target: DialTarget): unknown {
     to === undefined &&
     route === undefined &&
     contactHost === undefined &&
+    contactUser === undefined &&
     rerouteAfterProgress === undefined &&
     profile === undefined &&
     offer === undefined &&
@@ -966,6 +1045,7 @@ function dialTargetToWire(target: DialTarget): unknown {
   if (to !== undefined) object.to = to;
   if (route !== undefined) object.route = route;
   if (contactHost !== undefined) object.contact_host = contactHost;
+  if (contactUser !== undefined) object.contact_user = contactUser;
   if (rerouteAfterProgress !== undefined) {
     object.reroute_after_progress = rerouteAfterProgress;
   }
@@ -1014,6 +1094,9 @@ export function dialArgs(
   if (options.offer !== undefined) args.offer = options.offer;
   if (options.callerContactHost !== undefined) {
     args.caller_contact_host = options.callerContactHost;
+  }
+  if (options.callerContactUser !== undefined) {
+    args.caller_contact_user = options.callerContactUser;
   }
   return args;
 }
@@ -1279,6 +1362,9 @@ export class Call {
     if (options?.contactHost !== undefined) {
       args.contact_host = options.contactHost;
     }
+    if (options?.contactUser !== undefined) {
+      args.contact_user = options.contactUser;
+    }
     await this.sip(SipVerb.Answer, args);
   }
 
@@ -1295,6 +1381,9 @@ export class Call {
     const args: Record<string, unknown> = reason !== undefined ? { reason } : {};
     if (options?.contactHost !== undefined) {
       args.contact_host = options.contactHost;
+    }
+    if (options?.contactUser !== undefined) {
+      args.contact_user = options.contactUser;
     }
     await this.sip(SipVerb.Ring, args);
   }
@@ -1439,7 +1528,7 @@ export class Call {
    *
    * `targets` is a non-empty list of carriers tried cheapest-first: each entry
    * is a bare URI string or a {@link RouteTargetObject}
-   * (`{uri, nextHop?, headers?, timeout?, rerouteAfterProgress?, route?, contactHost?}`). A target
+   * (`{uri, nextHop?, headers?, timeout?, rerouteAfterProgress?, route?, contactHost?, contactUser?}`). A target
    * that has shown progress keeps the call past its `timeout` unless it sets
    * `rerouteAfterProgress`. `strategy` defaults to
    * `"sequential"` (v1 supports only sequential/single — anything else rejects
@@ -1465,6 +1554,9 @@ export class Call {
     }
     if (options?.callerContactHost !== undefined) {
       args.caller_contact_host = options.callerContactHost;
+    }
+    if (options?.callerContactUser !== undefined) {
+      args.caller_contact_user = options.callerContactUser;
     }
     return this.sip(SipVerb.Route, args);
   }

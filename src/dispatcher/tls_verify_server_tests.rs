@@ -227,6 +227,7 @@ async fn a_dial_branch_verify_server_reaches_the_pool() {
             None,
             None,
             None,
+            None,
             verify_server,
             &[],
             &dispatcher.state,

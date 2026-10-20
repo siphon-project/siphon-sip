@@ -554,7 +554,7 @@ pub fn dial_bridge_spec(
     // phone rings, as it does on a connecting dial; each leg then carries its
     // target's `to` as its `To` (see `leg_params`).
     super::dial_target::branch_called_parties(&plan.targets).map_err(DialError::InvalidIdentity)?;
-    // So does a Contact host; each leg then presents its target's own.
+    // So does a Contact host or user; each leg then presents its target's own.
     super::contact_host::check_branch_contact_hosts(&mut plan.targets)
         .map_err(DialError::InvalidIdentity)?;
     // An identity named as an argument is carried as one: a copy in the

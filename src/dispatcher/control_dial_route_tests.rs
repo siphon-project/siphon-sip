@@ -163,6 +163,7 @@ async fn a_route_verb_target_with_a_route_set_is_sent_through_it() {
             reroute_after_progress: false,
             route: vec![ROUTE_ENTRY.to_string()],
             contact_host: None,
+            contact_user: None,
             verify_server: None,
         }],
         &[],

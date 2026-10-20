@@ -15,6 +15,26 @@ entry, but a working config keeps working.
 
 ### Added
 
+- **Control plane: `contact_user` names the user part of siphon's own
+  Contact**, beside `contact_host` and everywhere it can be named: on a `dial`
+  target (`{uri}` or `{aor}`, connecting or `on_answer: "bridge"`), a `route`
+  target and `originate` (every leg of an `originate {aor}`), and for the
+  caller's side on `answer`, `ring` and `progress` (`contact_user`) or `dial`
+  and `route` (`caller_contact_user`). siphon's Contact is userless, and a
+  trunk peer that documents its Contact as `<sip:user@host;transport=tls>`
+  keys the account on that user, which until now only a script's
+  `call.set_contact_user()` could add. Host, port and transport stay as they
+  were (a `contact_host` composes), and the user sticks as the host does: the
+  leg's dialog Contact carries it on re-INVITE, UPDATE, session refresh and
+  PRACK, and the caller's side is fixed once an 18x or 2xx went out (another
+  user is `invalid_state`, `presented` is `null` for the userless Contact).
+  The value is an RFC 3261 `user`; an empty string, `@`, `:`, whitespace, a
+  bad `%` escape or a `;` (where user parameters start) is `bad_request`
+  before anything is sent, as is a `contact_user` on `replace_peer` or
+  `accept_refer`. A target's `contact_user` outranks the script's
+  `set_contact_user()`; the script's `set_contact_uri()` outranks both. The
+  Rust, Python and TypeScript control SDKs take it as `contact_user` /
+  `caller_contact_user` and `contactUser` / `callerContactUser`.
 - **Gateway: `allow_methods` per gateway group.** The methods siphon advertises
   in `Allow` to one group's peers, instead of every method it implements. For a
   trunk that picks its transfer method from `Allow`: leave `REFER` out and it

@@ -383,6 +383,7 @@ async fn a_silent_branch_on_a_reliable_transport_ends_at_timer_b_without_a_cance
             None,
             None,
             None,
+            None,
             &[],
             state,
         ));

@@ -37,7 +37,7 @@ pub use crate::originate::{
 // `dial`, the recording pair and the stream pair hang their verbs off `Call` from their own
 // modules; their argument types are re-exported here so every SIP type is
 // reachable under one path.
-pub use crate::caller_contact::ResponseOptions;
+pub use crate::caller_contact::{CallerContact, ResponseOptions};
 pub use crate::dial::{
     DialOffer, DialOnAnswer, DialOptions, DialStrategy, DialTarget, Dialing, Ringback,
     TargetIdentity,
@@ -898,7 +898,12 @@ impl Call {
         strategy: Option<&str>,
         headers: Vec<(String, String)>,
     ) -> Result<serde_json::Value, ControlError> {
-        let args = crate::caller_contact::route_args(&targets, strategy, &headers, None);
+        let args = crate::caller_contact::route_args(
+            &targets,
+            strategy,
+            &headers,
+            &crate::caller_contact::CallerContact::default(),
+        );
         self.sip(SipVerb::Route, args).await
     }
 
@@ -1771,6 +1776,7 @@ mod tests {
                         reroute_after_progress: false,
                         route: Vec::new(),
                         contact_host: None,
+                        contact_user: None,
                         verify_server: None,
                     },
                 ],
