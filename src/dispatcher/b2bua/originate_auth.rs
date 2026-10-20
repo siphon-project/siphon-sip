@@ -112,8 +112,7 @@ pub(super) fn retry_originate_with_credentials(
 
     // ACK the challenge on its own branch before anything else (§17.1.1.3):
     // the callee's server transaction retransmits until it lands.
-    let (via_host, via_port) =
-        b_leg_sent_by(leg.transport.local_addr, state, &leg.transport.transport);
+    let (via_host, via_port) = placed_leg_sent_by(leg, state);
     let ack = build_b2bua_ack_for_non2xx(
         message,
         &leg.branch,

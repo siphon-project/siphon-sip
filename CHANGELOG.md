@@ -15,6 +15,14 @@ entry, but a working config keeps working.
 
 ### Added
 
+- **`probe_listener` on a gateway group.** `gateway.groups[].probe_listener:
+  "192.0.2.10:15068"` sends the group's OPTIONS probes from that listener and
+  puts its identity in their Via, From and Contact: a UDP probe is written to
+  its socket, a TLS probe opens its connection from its IP. For a peer that
+  admits only one of siphon's names, whose probes were refused and the group
+  marked down. Checked at startup against the configured listeners: a listener
+  of every destination's transport must be bound at that address. YAML groups
+  only.
 - **Control plane: `contact_user` names the user part of siphon's own
   Contact**, beside `contact_host` and everywhere it can be named: on a `dial`
   target (`{uri}` or `{aor}`, connecting or `on_answer: "bridge"`), a `route`
@@ -111,6 +119,32 @@ entry, but a working config keeps working.
 
 ### Fixed
 
+- **A listener's `advertise` is that listener's, not its transport's.** The
+  first listener of a transport with an `advertise` lent it to every listener
+  of the transport, so with two TLS listeners (phones on one, a trunk that
+  requires its FQDN on the other) phones were handed the trunk listener's name
+  in Contact, Via and Record-Route and reconnected to the wrong listener, while
+  listing the listeners the other way round broke the trunk. Each message now
+  carries the identity of the listener it leaves on: an answer the listener the
+  request arrived on, a request over a reused TLS/WS/WSS connection (including
+  NAT keepalives, NOTIFY, `proxy.send_request`, B2BUA B-legs and their
+  in-dialog requests) the listener that accepted it, a stream flow its
+  listener's `advertise`, a `send_socket=` pin the pinned listener in the Via
+  and now also the B2BUA Contact and From, an unpinned UDP request the first UDP
+  listener (the socket it leaves from). A listener without `advertise` falls
+  back to `advertised_address`, then its own address, never a sibling's: if you
+  relied on the borrowing, put the `advertise` on each listener that should
+  present it. A relay crossing two listeners on one port but two interfaces now
+  stamps a Record-Route per listener (RFC 5658), as one crossing two ports
+  already did. A new outbound connection from the default source still
+  advertises the transport's identity. A proxy relay over a captured TLS, TCP
+  or WebSocket flow now advertises that listener's public identity
+  (`advertise`, else `advertised_address`) rather than the socket's own IP, as a
+  B2BUA leg over a flow already did; a UDP or IPsec flow still names its
+  socket. Otherwise a configuration with one listener per transport is
+  unchanged.
+
+## [1.15.0] — 2026-10-19
 - **A TLS B-leg and an originate to a hostname now present that hostname as
   SNI.** They sent the resolved address, so a hostname-vhost trunk could not
   route the handshake. Outbound TLS REGISTERs present the registrar's domain the

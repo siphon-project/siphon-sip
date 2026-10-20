@@ -337,7 +337,7 @@ pub fn prepare_originate_routed(
     // Contact alike, or the phone answers somewhere siphon is not listening on
     // its flow. A wildcard listener's flow names that socket's advertised
     // identity, never `0.0.0.0` (see `pinned_sent_by`).
-    let (via_host, via_port) = b_leg_sent_by(flow_local_addr, state, &transport);
+    let (via_host, via_port) = b_leg_sent_by(flow_local_addr, destination, state, &transport);
 
     // A `contact_host` replaces the Contact's host alone and a `contact_user`
     // adds a user part: the port and transport stay the socket's, so the
@@ -1179,8 +1179,7 @@ pub fn handle_originated_call_response(
         StartLine::Response(status_line) => status_line.reason_phrase.clone(),
         StartLine::Request(_) => String::new(),
     };
-    let (via_host, via_port) =
-        b_leg_sent_by(leg.transport.local_addr, state, &leg.transport.transport);
+    let (via_host, via_port) = placed_leg_sent_by(&leg, state);
     let ack = build_b2bua_ack_for_non2xx(
         message,
         &leg.branch,
@@ -1350,8 +1349,7 @@ pub fn originate_ack_2xx(
     answer_sdp: Option<&str>,
     state: &DispatcherState,
 ) {
-    let (via_host, via_port) =
-        b_leg_sent_by(leg.transport.local_addr, state, &leg.transport.transport);
+    let (via_host, via_port) = placed_leg_sent_by(leg, state);
     let Some(mut ack) =
         build_b2bua_ack_for_2xx(response, leg.transport.transport, &via_host, via_port)
     else {

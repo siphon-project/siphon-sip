@@ -143,6 +143,12 @@ pub struct UacSender {
     advertised_ports: HashMap<Transport, u16>,
     /// Global advertised address fallback from config.
     advertised_address: Option<String>,
+    /// Every listener and its `advertise`, for a request that leaves on a
+    /// known listener (see [`sent_by_for`](Self::sent_by_for)).
+    listener_registry: crate::transport::ListenerRegistry,
+    /// Which listener each live stream connection belongs to. `None` in
+    /// fixtures that wire no stream transport.
+    stream_connections: Option<crate::transport::StreamConnections>,
     /// HEP capture sender (if tracing is enabled).
     hep_sender: Option<Arc<HepSender>>,
     /// The live `User-Agent` value, shared with the dispatcher and swapped by
@@ -170,6 +176,8 @@ impl UacSender {
             advertised_addrs,
             advertised_ports: HashMap::new(),
             advertised_address,
+            listener_registry: crate::transport::ListenerRegistry::default(),
+            stream_connections: None,
             hep_sender,
             identity,
             pending: Arc::new(DashMap::new()),
@@ -183,6 +191,63 @@ impl UacSender {
     pub fn with_advertised_ports(mut self, advertised_ports: HashMap<Transport, u16>) -> Self {
         self.advertised_ports = advertised_ports;
         self
+    }
+
+    /// Give the sender the listener set and the stream-connection registry,
+    /// so a request leaving on a known listener advertises that listener.
+    /// Without it every request advertises the per-transport identity.
+    pub fn with_listeners(
+        mut self,
+        listener_registry: crate::transport::ListenerRegistry,
+        stream_connections: crate::transport::StreamConnections,
+    ) -> Self {
+        self.listener_registry = listener_registry;
+        self.stream_connections = Some(stream_connections);
+        self
+    }
+
+    /// The sent-by `(host, port)` the listener `local` belongs to advertises
+    /// ([`crate::transport::ListenerRegistry::identity`]), else the
+    /// per-transport identity with `local`'s port.
+    pub fn listener_sent_by(&self, transport: Transport, local: SocketAddr) -> (String, u16) {
+        self.listener_registry
+            .identity(transport, local)
+            .unwrap_or_else(|| (self.via_host_for(&transport), local.port()))
+    }
+
+    /// The sent-by `(host, port)` for a request to `destination` on
+    /// `transport`: the listener of the connection it goes out on, when the
+    /// transport has several listeners and the connection is known (the given
+    /// `connection_id`, else the live TLS / WS / WSS connection to
+    /// `destination`, which the stream transports reuse), else the
+    /// per-transport [`via_host_for`](Self::via_host_for) /
+    /// [`via_port_for`](Self::via_port_for).
+    pub fn sent_by_for(
+        &self,
+        transport: Transport,
+        destination: Option<SocketAddr>,
+        connection_id: ConnectionId,
+    ) -> (String, u16) {
+        let listener = match &self.stream_connections {
+            Some(connections) if self.listener_registry.is_shared(transport) => {
+                if connection_id != ConnectionId::default() {
+                    connections.listener_of(connection_id)
+                } else if matches!(
+                    transport,
+                    Transport::Tls | Transport::WebSocket | Transport::WebSocketSecure
+                ) {
+                    destination
+                        .and_then(|destination| connections.reuse_listener(destination, transport))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        match listener.and_then(|local| self.listener_registry.identity(transport, local)) {
+            Some(sent_by) => sent_by,
+            None => (self.via_host_for(&transport), self.via_port_for(&transport)),
+        }
     }
 
     /// Return the effective address for a given transport, resolving
@@ -247,6 +312,7 @@ impl UacSender {
             None,
             None,
             None,
+            None,
         )
     }
 
@@ -267,6 +333,7 @@ impl UacSender {
             transport,
             request_uri,
             connection_id,
+            None,
             None,
             None,
             None,
@@ -307,6 +374,7 @@ impl UacSender {
             None,
             None,
             None,
+            None,
         )
     }
 
@@ -323,6 +391,12 @@ impl UacSender {
     /// `allow_methods` is the `Allow` value to advertise, when the peer is
     /// shown fewer methods than siphon implements (`gateway.groups[].allow_methods`);
     /// `None` advertises [`crate::sip::SUPPORTED_METHODS`].
+    ///
+    /// `listener` (a gateway group's `probe_listener`) makes the probe leave
+    /// from that listener and advertise its identity in Via, From and Contact:
+    /// a UDP probe is written to that listener's socket, a TLS probe opens or
+    /// reuses a connection bound to its IP. `None` keeps the default egress
+    /// and the per-transport identity.
     #[allow(clippy::too_many_arguments)]
     pub fn send_options_with_identity(
         &self,
@@ -334,6 +408,7 @@ impl UacSender {
         server_name: Option<&str>,
         verify_server: Option<bool>,
         allow_methods: Option<&str>,
+        listener: Option<SocketAddr>,
     ) -> oneshot::Receiver<UacResult> {
         self.send_options_on_connection_inner(
             destination,
@@ -346,6 +421,7 @@ impl UacSender {
             server_name,
             verify_server,
             allow_methods,
+            listener,
         )
     }
 
@@ -369,6 +445,7 @@ impl UacSender {
         server_name: Option<&str>,
         verify_server: Option<bool>,
         allow_methods: Option<&str>,
+        listener: Option<SocketAddr>,
     ) -> oneshot::Receiver<UacResult> {
         let branch = format!("z9hG4bK-uac-{}", uuid::Uuid::new_v4());
         let cseq = self
@@ -383,10 +460,23 @@ impl UacSender {
         // captured-flow probe, else the advertised host — which may be an FQDN
         // (RFC 3261 §20.42) rather than the loopback `addr_for` collapses an
         // FQDN to — with the advertised port when one is configured.
-        let (via_host, via_port) = match source_local_addr {
-            Some(local) => (format_sip_host(&local.ip().to_string()), local.port()),
-            None => (self.via_host_for(&transport), self.via_port_for(&transport)),
+        // A flow on a wildcard listener carries `0.0.0.0`, which no peer can
+        // answer to: that listener's identity instead. A `listener` pin names
+        // its listener; anything else the connection it leaves on.
+        let (via_host, via_port) = match (source_local_addr, listener) {
+            (Some(local), _) if local.ip().is_unspecified() => {
+                self.listener_sent_by(transport, local)
+            }
+            (Some(local), _) => (format_sip_host(&local.ip().to_string()), local.port()),
+            (None, Some(listener)) => self.listener_sent_by(transport, listener),
+            (None, None) => self.sent_by_for(transport, Some(destination), connection_id),
         };
+        // The pinned listener is also where the probe leaves from: UDP writes
+        // it to that socket, TLS binds a pool connection to it.
+        let source_local_addr = source_local_addr.or(match transport {
+            Transport::Udp | Transport::Tls => listener,
+            _ => None,
+        });
         let via = format!(
             "SIP/2.0/{} {}:{};branch={}",
             transport, via_host, via_port, branch
@@ -1194,6 +1284,197 @@ mod tests {
         );
     }
 
+    /// Two UDP and two TLS listeners, the second of each advertising the FQDN
+    /// a trunk insists on; the per-transport identity is the first's.
+    fn two_listener_sender() -> (
+        UacSender,
+        flume::Receiver<OutboundMessage>,
+        flume::Receiver<OutboundMessage>,
+        crate::transport::StreamConnections,
+    ) {
+        let (udp_tx, udp_rx) = flume::unbounded();
+        let (other_tx, _other_rx) = flume::unbounded();
+        let (tls_tx, tls_rx) = flume::unbounded();
+        let router = Arc::new(OutboundRouter {
+            udp: udp_tx.into(),
+            udp_by_local: HashMap::new(),
+            tcp: other_tx.clone(),
+            tls: tls_tx,
+            ws: other_tx.clone(),
+            wss: other_tx.clone(),
+            sctp: Some(other_tx),
+        });
+        let trunk_name =
+            || Some(crate::transport::AdvertisedAddress::parse("sbc.example.test:5068").unwrap());
+        let registry = crate::transport::ListenerRegistry::from_entries(vec![
+            (Transport::Udp, "192.0.2.10:5060".parse().unwrap(), None),
+            (
+                Transport::Udp,
+                "192.0.2.10:15068".parse().unwrap(),
+                trunk_name(),
+            ),
+            (Transport::Tls, "192.0.2.10:5061".parse().unwrap(), None),
+            (
+                Transport::Tls,
+                "192.0.2.10:15069".parse().unwrap(),
+                trunk_name(),
+            ),
+        ]);
+        let connections = crate::transport::StreamConnections::new();
+        let sender = UacSender::new(
+            router,
+            "192.0.2.10:5060".parse().unwrap(),
+            HashMap::from([
+                (Transport::Udp, "192.0.2.10:5060".parse().unwrap()),
+                (Transport::Tls, "192.0.2.10:5061".parse().unwrap()),
+            ]),
+            HashMap::new(),
+            None,
+            None,
+            crate::config::IdentityHeaders::default().shared(),
+        )
+        .with_listeners(registry, connections.clone());
+        (sender, udp_rx, tls_rx, connections)
+    }
+
+    fn top_via_and_contact(outbound: &OutboundMessage) -> (String, String) {
+        let raw = String::from_utf8_lossy(&outbound.data).to_string();
+        let line = |name: &str| {
+            raw.lines()
+                .find(|line| line.starts_with(name))
+                .map(str::to_string)
+                .unwrap_or_default()
+        };
+        (line("Via:"), line("Contact:"))
+    }
+
+    #[test]
+    fn a_probe_listener_probe_leaves_from_and_advertises_that_listener() {
+        let (sender, udp_rx, tls_rx, _connections) = two_listener_sender();
+        let trunk_udp: SocketAddr = "192.0.2.10:15068".parse().unwrap();
+        let _receiver = sender.send_options_with_identity(
+            "203.0.113.30:5060".parse().unwrap(),
+            Transport::Udp,
+            SipUri::new("203.0.113.30".to_string()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(trunk_udp),
+        );
+        let outbound = udp_rx.try_recv().unwrap();
+        assert_eq!(outbound.source_local_addr, Some(trunk_udp));
+        let (via, contact) = top_via_and_contact(&outbound);
+        assert!(via.contains("SIP/2.0/UDP sbc.example.test:5068;"), "{via}");
+        assert!(contact.contains("@sbc.example.test:5068;"), "{contact}");
+
+        let trunk_tls: SocketAddr = "192.0.2.10:15069".parse().unwrap();
+        let _receiver = sender.send_options_with_identity(
+            "203.0.113.30:5061".parse().unwrap(),
+            Transport::Tls,
+            SipUri::new("203.0.113.30".to_string()),
+            None,
+            None,
+            Some("trunk.example.test"),
+            None,
+            None,
+            Some(trunk_tls),
+        );
+        let outbound = tls_rx.try_recv().unwrap();
+        assert_eq!(
+            outbound.source_local_addr,
+            Some(trunk_tls),
+            "a TLS probe's pool connection is opened from the listener"
+        );
+        let (via, _) = top_via_and_contact(&outbound);
+        assert!(via.contains("SIP/2.0/TLS sbc.example.test:5068;"), "{via}");
+    }
+
+    #[test]
+    fn a_probe_without_a_listener_keeps_the_default_egress_and_identity() {
+        let (sender, udp_rx, _tls_rx, _connections) = two_listener_sender();
+        let _receiver = sender.send_options_with_identity(
+            "203.0.113.30:5060".parse().unwrap(),
+            Transport::Udp,
+            SipUri::new("203.0.113.30".to_string()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let outbound = udp_rx.try_recv().unwrap();
+        assert_eq!(outbound.source_local_addr, None);
+        let (via, _) = top_via_and_contact(&outbound);
+        assert!(via.contains("SIP/2.0/UDP 192.0.2.10:5060;"), "{via}");
+    }
+
+    #[test]
+    fn a_keepalive_on_a_phone_connection_names_the_listener_that_accepted_it() {
+        let (sender, _udp_rx, tls_rx, connections) = two_listener_sender();
+        let phone: SocketAddr = "198.51.100.20:40000".parse().unwrap();
+        connections.register_on_listener(
+            phone,
+            Transport::Tls,
+            ConnectionId(77),
+            "192.0.2.10:5061".parse().unwrap(),
+        );
+        let _receiver = sender.send_options_on_connection(
+            phone,
+            Transport::Tls,
+            SipUri::new("198.51.100.20".to_string()),
+            ConnectionId(77),
+        );
+        let (via, contact) = top_via_and_contact(&tls_rx.try_recv().unwrap());
+        assert!(via.contains("SIP/2.0/TLS 192.0.2.10:5061;"), "{via}");
+        assert!(!contact.contains("sbc.example.test"), "{contact}");
+    }
+
+    #[test]
+    fn a_flow_probe_on_a_wildcard_listener_never_advertises_the_unspecified_address() {
+        let (udp_tx, udp_rx) = flume::unbounded();
+        let (other_tx, _other_rx) = flume::unbounded();
+        let router = Arc::new(OutboundRouter {
+            udp: udp_tx.into(),
+            udp_by_local: HashMap::new(),
+            tcp: other_tx.clone(),
+            tls: other_tx.clone(),
+            ws: other_tx.clone(),
+            wss: other_tx.clone(),
+            sctp: Some(other_tx),
+        });
+        let wildcard: SocketAddr = "0.0.0.0:5060".parse().unwrap();
+        let sender = UacSender::new(
+            router,
+            wildcard,
+            HashMap::from([(Transport::Udp, wildcard)]),
+            HashMap::new(),
+            Some("203.0.113.5".to_string()),
+            None,
+            crate::config::IdentityHeaders::default().shared(),
+        )
+        .with_listeners(
+            crate::transport::ListenerRegistry::from_entries(vec![(
+                Transport::Udp,
+                wildcard,
+                None,
+            )])
+            .with_global_advertised(Some("203.0.113.5")),
+            crate::transport::StreamConnections::new(),
+        );
+        let _receiver = sender.send_options_over_flow(
+            "198.51.100.20:5060".parse().unwrap(),
+            wildcard,
+            Transport::Udp,
+            ConnectionId::default(),
+            SipUri::new("198.51.100.20".to_string()),
+        );
+        let (via, _) = top_via_and_contact(&udp_rx.try_recv().unwrap());
+        assert!(via.contains("SIP/2.0/UDP 203.0.113.5:5060;"), "{via}");
+    }
+
     #[test]
     fn send_options_with_identity_overrides_from() {
         let (udp_tx, udp_rx) = flume::unbounded();
@@ -1232,6 +1513,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
 
         let outbound = udp_rx.try_recv().unwrap();
@@ -1257,6 +1539,7 @@ mod tests {
             None,
             None,
             Some(narrowed),
+            None,
         );
         let outbound = rxs[0].try_recv().unwrap();
         let message = crate::sip::parser::parse_sip_message_bytes(&outbound.data).unwrap();
@@ -1269,6 +1552,7 @@ mod tests {
             "198.51.100.7:5060".parse().unwrap(),
             Transport::Udp,
             SipUri::new("198.51.100.7".to_string()),
+            None,
             None,
             None,
             None,

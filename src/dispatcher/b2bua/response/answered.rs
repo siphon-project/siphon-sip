@@ -449,7 +449,12 @@ pub fn ack_b_leg_2xx(
         resolve_in_dialog_destination(&route_set, state, leg_destination, leg_transport);
     // Sent-by of the leg this ACK goes back on: the flow socket when the leg was
     // dialled over one, so the ACK leaves the way its INVITE did.
-    let (via_host, via_port) = b_leg_sent_by(snapshot.b_leg_local_addr, state, &leg_transport);
+    let (via_host, via_port) = b_leg_sent_by(
+        snapshot.b_leg_local_addr,
+        leg_destination,
+        state,
+        &leg_transport,
+    );
     let Some(mut ack) = build_b2bua_ack_for_2xx(message, transport, &via_host, via_port) else {
         return;
     };

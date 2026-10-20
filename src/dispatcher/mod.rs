@@ -227,6 +227,8 @@ mod lcr_ring_timeout_tests;
 #[cfg(test)]
 mod lcr_route_bookkeeping_tests;
 #[cfg(test)]
+mod listener_identity_tests;
+#[cfg(test)]
 mod local_answer_contact_tests;
 #[cfg(test)]
 mod media_started_event_tests;
@@ -336,6 +338,8 @@ mod session_timer_min_se_tests;
 mod session_timer_tests;
 #[cfg(test)]
 mod shutdown_teardown_tests;
+#[cfg(test)]
+mod single_listener_snapshot_tests;
 #[cfg(test)]
 mod spiral_invite_tests;
 #[cfg(test)]

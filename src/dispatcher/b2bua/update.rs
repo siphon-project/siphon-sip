@@ -395,7 +395,7 @@ pub fn handle_b2bua_update(inbound: InboundMessage, message: SipMessage, state: 
         // forward above for the A/B split).
         let transport_str = format!("{}", transport).to_uppercase();
         let (via_host, via_port) = if from_a_leg {
-            b_leg_sent_by(target_local_addr, state, &transport)
+            b_leg_sent_by(target_local_addr, destination, state, &transport)
         } else {
             (
                 state.a_leg_advertised_host(target_local_addr, &transport),

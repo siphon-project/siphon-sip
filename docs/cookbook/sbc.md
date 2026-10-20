@@ -637,6 +637,48 @@ rules and per-gateway settings.
     to Teams' OPTIONS already carry the advertised FQDN in `Contact` plus an
     `Allow` advertising the supported methods (including `REFER`/`NOTIFY`).
 
+## Phones and a strict trunk on separate TLS listeners
+
+A trunk peer that admits only its configured FQDN in `Contact`, `Via` and
+`Record-Route` and the phones registering on the same box need two identities.
+Give each its own TLS listener; each message names the listener it leaves on.
+
+```yaml
+listen:
+  tls:
+    - "192.0.2.10:5061"                     # phones
+    - address: "192.0.2.10:15068"
+      advertise: "sbc.example.test:5068"    # the name the trunk accepts
+
+gateway:
+  groups:
+    - name: "trunk"
+      probe_listener: "192.0.2.10:15068"    # probes advertise the trunk name
+      destinations:
+        - uri: "sip:trunk.example.test:5061;transport=tls"
+```
+
+```python
+@b2bua.on_invite
+def on_invite(call):
+    if call.from_gateway("trunk"):
+        # Toward a phone: its own connection is reused, so the B-leg names
+        # the phone listener.
+        call.dial(call.ruri)
+    else:
+        # Toward the trunk: pin the trunk listener, so Via, Contact and From
+        # name sbc.example.test:5068 whatever the listener order.
+        call.dial("sip:+15550100@trunk.example.test;transport=tls",
+                  send_socket="tls:192.0.2.10:15068")
+```
+
+Answers to the trunk's own requests (its INVITEs, its OPTIONS) name the trunk
+listener because that is where they arrived. Without the `send_socket=` pin a
+new connection to the trunk advertises the transport's identity, the first TLS
+listener with an `advertise`, which works here but breaks as soon as the phone
+listener gets an `advertise` of its own and is listed first. See
+[Several listeners of one transport](../transports.md#several-listeners-of-one-transport).
+
 ## See also
 
 - Real examples: [`scripts/b2bua_default.py`](https://github.com/siphon-project/siphon-sip/blob/main/scripts/b2bua_default.py), [`examples/b2bua_gateway.py`](https://github.com/siphon-project/siphon-sip/blob/main/examples/b2bua_gateway.py), [`examples/b2bua_rtpengine.py`](https://github.com/siphon-project/siphon-sip/blob/main/examples/b2bua_rtpengine.py).

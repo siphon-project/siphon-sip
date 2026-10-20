@@ -346,6 +346,9 @@ pub struct DispatcherGroup {
     pub algorithm: Algorithm,
     /// Health probe configuration.
     pub probe_config: ProbeConfig,
+    /// `gateway.groups[].probe_listener`: the listener the probes leave from
+    /// and advertise. `None` = the default egress and the transport's identity.
+    pub probe_listener: Option<std::net::SocketAddr>,
     /// Destinations in this group.
     destinations: Vec<Arc<Destination>>,
     /// Round-robin counter per priority level.
@@ -401,6 +404,7 @@ impl DispatcherGroup {
             name,
             algorithm,
             probe_config: ProbeConfig::default(),
+            probe_listener: None,
             destinations,
             counters: DashMap::new(),
             member_ips: ArcSwap::from_pointee(HashSet::new()),
@@ -431,6 +435,7 @@ impl DispatcherGroup {
             name,
             algorithm,
             probe_config: ProbeConfig::default(),
+            probe_listener: None,
             destinations,
             counters: DashMap::new(),
             member_ips: ArcSwap::from_pointee(HashSet::new()),
@@ -459,6 +464,12 @@ impl DispatcherGroup {
 
     pub fn with_probe_config(mut self, config: ProbeConfig) -> Self {
         self.probe_config = config;
+        self
+    }
+
+    /// Set the listener the group's probes leave from and advertise.
+    pub fn with_probe_listener(mut self, listener: Option<std::net::SocketAddr>) -> Self {
+        self.probe_listener = listener;
         self
     }
 
@@ -1158,6 +1169,7 @@ fn spawn_prober(
     let threshold = group.probe_config.failure_threshold;
     let from_user = group.probe_config.from_user.clone();
     let from_domain = group.probe_config.from_domain.clone();
+    let listener = group.probe_listener;
 
     info!(
         group = %group.name,
@@ -1176,8 +1188,11 @@ fn spawn_prober(
                     &uac_sender,
                     &membership,
                     threshold,
-                    from_user.as_deref(),
-                    from_domain.as_deref(),
+                    ProbeIdentity {
+                        from_user: from_user.as_deref(),
+                        from_domain: from_domain.as_deref(),
+                        listener,
+                    },
                 )
                 .await;
             }
@@ -1185,13 +1200,21 @@ fn spawn_prober(
         .abort_handle()
 }
 
+/// Who a probe says it is: the From user and domain, and the listener it
+/// leaves from and advertises (`probe_listener`).
+#[derive(Clone, Copy)]
+struct ProbeIdentity<'a> {
+    from_user: Option<&'a str>,
+    from_domain: Option<&'a str>,
+    listener: Option<std::net::SocketAddr>,
+}
+
 async fn probe_group(
     group: &Arc<DispatcherGroup>,
     uac_sender: &UacSender,
     membership: &Membership,
     failure_threshold: u32,
-    from_user: Option<&str>,
-    from_domain: Option<&str>,
+    identity: ProbeIdentity<'_>,
 ) {
     // Refresh the cached member-IP set so `from_gateway` tracks DNS changes on
     // the probe interval. `refresh_member_ips` does blocking DNS, so run it off
@@ -1214,8 +1237,7 @@ async fn probe_group(
             dest,
             uac_sender,
             failure_threshold,
-            from_user,
-            from_domain,
+            identity,
             group.allow_methods().map(|allow| &**allow),
         )
         .await;
@@ -1226,8 +1248,7 @@ async fn probe_destination(
     dest: &Destination,
     uac_sender: &UacSender,
     failure_threshold: u32,
-    from_user: Option<&str>,
-    from_domain: Option<&str>,
+    identity: ProbeIdentity<'_>,
     allow_methods: Option<&str>,
 ) {
     // Build R-URI from the gateway's configured URI hostname (not the resolved IP).
@@ -1265,8 +1286,8 @@ async fn probe_destination(
         current_addr,
         dest.transport,
         request_uri,
-        from_user,
-        from_domain,
+        identity.from_user,
+        identity.from_domain,
         if dest.transport == Transport::Tls {
             Some(server_name.as_str())
         } else {
@@ -1276,6 +1297,7 @@ async fn probe_destination(
         // The group's `allow_methods`, so the peer reads the same `Allow` off
         // the probe as off everything else siphon sends it.
         allow_methods,
+        identity.listener,
     );
 
     let result = tokio::time::timeout(Duration::from_secs(5), receiver).await;
@@ -1947,7 +1969,18 @@ pub(crate) mod tests {
 
         // Probe with threshold=1 — first failure should mark down
         let group = manager.get_group("test").unwrap();
-        probe_group(&group, &uac_sender, &manager.membership(), 1, None, None).await;
+        probe_group(
+            &group,
+            &uac_sender,
+            &manager.membership(),
+            1,
+            ProbeIdentity {
+                from_user: None,
+                from_domain: None,
+                listener: None,
+            },
+        )
+        .await;
 
         let status = group.status();
         assert!(!status[0].1);
