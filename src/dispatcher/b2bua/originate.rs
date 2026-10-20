@@ -355,6 +355,7 @@ pub fn prepare_originate_routed(
         None,
     );
     let identity = state.identity.load();
+    let allow = allow_toward(state, || Some(destination.ip()));
     let mut invite = build_originate_invite(
         &params,
         target_uri,
@@ -370,6 +371,7 @@ pub fn prepare_originate_routed(
                 .user_agent
                 .as_deref()
                 .or(identity.server.as_deref()),
+            allow: allow_value(&allow),
         },
         session_timer_policy_for(state, params.session_timer.as_ref()),
     )?;
@@ -516,6 +518,8 @@ pub struct OriginateIdentity<'a> {
     pub transport: Transport,
     pub contact: &'a str,
     pub user_agent: Option<&'a str>,
+    /// `Allow`: the destination's gateway group `allow_methods`, else every method.
+    pub allow: &'a str,
 }
 
 /// Build the INVITE an originate puts on the wire. Pure — no state, no I/O — so
@@ -558,7 +562,7 @@ pub fn build_originate_invite(
         .cseq("1 INVITE".to_string())
         .header("Max-Forwards", "70".to_string())
         .header("Contact", identity.contact.to_string())
-        .header("Allow", crate::sip::SUPPORTED_METHODS.to_string());
+        .header("Allow", identity.allow.to_string());
     if let Some(user_agent) = identity.user_agent {
         builder = builder.header("User-Agent", user_agent.to_string());
     }
