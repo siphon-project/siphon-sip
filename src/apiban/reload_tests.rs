@@ -124,7 +124,17 @@ async fn a_key_change_restarts_from_the_first_id_on_the_same_poller() {
         (KEY_B.to_owned(), INITIAL_ID.to_owned()),
         "from the first id, with the new key"
     );
-    assert!(banned.contains(&"198.51.100.66".parse().expect("an address")));
+    // The feed logs a request before it answers, so the ban lands a moment
+    // after the log shows the fetch.
+    let address = "198.51.100.66".parse().expect("an address");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !banned.contains(&address) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for the new key's ban"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(requests.snapshot().len(), 2, "one poller, one fetch each");
     assert_eq!(
