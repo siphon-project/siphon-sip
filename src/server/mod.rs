@@ -1426,15 +1426,23 @@ impl SiphonServer {
             if first_listen_addr.is_none() {
                 first_listen_addr = Some(addr);
             }
+            // An unpinned UDP send leaves from the first UDP listener (see
+            // `default_udp_egress_addr`), so that listener's advertise, and no
+            // other's, is the transport's: a later listener's advertise naming
+            // a socket the datagram does not leave from would send the answer
+            // somewhere else.
+            let first_udp = !listen_addrs.contains_key(&transport::Transport::Udp);
             listen_addrs
                 .entry(transport::Transport::Udp)
                 .or_insert(addr);
-            record_advertised(
-                &mut advertised_addrs,
-                &mut advertised_ports,
-                transport::Transport::Udp,
-                entry.advertise(),
-            );
+            if first_udp {
+                record_advertised(
+                    &mut advertised_addrs,
+                    &mut advertised_ports,
+                    transport::Transport::Udp,
+                    entry.advertise(),
+                );
+            }
             listener_registry_entries.push((
                 transport::Transport::Udp,
                 addr,
@@ -2133,6 +2141,12 @@ impl SiphonServer {
             }
         }
 
+        // Every listener and what it advertises, shared by the dispatcher and
+        // the UAC sender so both resolve a listener's identity the same way.
+        let listener_registry =
+            transport::ListenerRegistry::from_entries(listener_registry_entries)
+                .with_global_advertised(config.advertised_address.as_deref());
+
         // --- UAC sender ---
         let uac_sender = Arc::new(
             UacSender::new(
@@ -2144,7 +2158,8 @@ impl SiphonServer {
                 hep_sender.clone(),
                 Arc::clone(&identity),
             )
-            .with_advertised_ports(advertised_ports.clone()),
+            .with_advertised_ports(advertised_ports.clone())
+            .with_listeners(listener_registry.clone(), stream_connections.clone()),
         );
 
         // Wire UAC sender into proxy.send_request() Python API
@@ -2521,7 +2536,7 @@ impl SiphonServer {
             listen_addrs,
             advertised_addrs,
             advertised_ports,
-            transport::ListenerRegistry::from_entries(listener_registry_entries),
+            listener_registry,
             hep_sender,
             uac_sender,
             connection_pool,

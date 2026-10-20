@@ -828,11 +828,13 @@ impl PyProxyUtils {
             // Via sent-by = our advertised host (FQDN-aware) + advertised port, so
             // the peer's response comes back to us rather than the resolved
             // destination.
-            let local_sent_by = format!(
-                "{}:{}",
-                uac.via_host_for(&transport),
-                uac.via_port_for(&transport),
+            // ... of the listener whose connection carries it, when known.
+            let (local_host, local_port) = uac.sent_by_for(
+                transport,
+                Some(target.address),
+                crate::transport::ConnectionId::default(),
             );
+            let local_sent_by = format!("{local_host}:{local_port}");
             let (message, branch) = inputs
                 .build(uri, transport, &local_sent_by)
                 .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;

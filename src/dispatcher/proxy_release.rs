@@ -103,8 +103,8 @@ pub(super) fn release_bye_request(
 ) -> Option<SipMessage> {
     let transport = egress.transport;
     let (host, port) = match egress.source {
-        Some(local) => pinned_sent_by(local, || state.wildcard_pinned_sent_by(&transport, local)),
-        None => (state.via_host(&transport), state.via_port(&transport)),
+        Some(local) => flow_sent_by(local, state, &transport),
+        None => state.connection_sent_by(transport, egress.destination),
     };
     let mut raw = format!(
         "BYE {ruri} SIP/2.0\r\nVia: SIP/2.0/{transport} {host}:{port};branch={branch}\r\nMax-Forwards: 70\r\n",

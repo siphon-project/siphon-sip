@@ -6097,3 +6097,67 @@ fn gateway_allow_methods_refuses_what_a_peer_cannot_use() {
         );
     }
 }
+
+fn probe_listener_yaml(probe_listener: &str, destination_transport: &str) -> Result<Config> {
+    Config::from_str(&format!(
+        concat!(
+            "listen:\n",
+            "  udp: [\"192.0.2.10:5060\"]\n",
+            "  tls:\n",
+            "    - \"192.0.2.10:5061\"\n",
+            "    - address: \"192.0.2.10:15068\"\n",
+            "      advertise: \"sbc.example.test:5068\"\n",
+            "domain:\n  local: [\"example.com\"]\n",
+            "gateway:\n",
+            "  groups:\n",
+            "    - name: \"trunk\"\n",
+            "      probe_listener: \"{probe_listener}\"\n",
+            "      destinations:\n",
+            "        - uri: \"sip:trunk.example.test:5061;transport={transport}\"\n",
+            "          address: \"203.0.113.30:5061\"\n",
+        ),
+        probe_listener = probe_listener,
+        transport = destination_transport,
+    ))
+}
+
+#[test]
+fn a_probe_listener_naming_a_listener_of_the_destinations_transport_loads() {
+    let config = probe_listener_yaml("192.0.2.10:15068", "tls").expect("a valid probe_listener");
+    let group = &config.gateway.as_ref().expect("a gateway block").groups[0];
+    assert_eq!(
+        group.probe_listener_addr(),
+        Some("192.0.2.10:15068".parse().expect("literal"))
+    );
+}
+
+#[test]
+fn a_probe_listener_no_listener_binds_is_refused() {
+    let message = probe_listener_yaml("192.0.2.10:15099", "tls")
+        .expect_err("an address nothing listens on must be refused")
+        .to_string();
+    assert!(
+        message.contains("gateway.groups[trunk].probe_listener"),
+        "{message}"
+    );
+}
+
+#[test]
+fn a_probe_listener_of_another_transport_is_refused() {
+    // 192.0.2.10:5060 is a UDP listener; the destination is probed over TLS.
+    let message = probe_listener_yaml("192.0.2.10:5060", "tls")
+        .expect_err("a UDP listener cannot carry a TLS probe")
+        .to_string();
+    assert!(message.contains("no TLS listener"), "{message}");
+}
+
+#[test]
+fn a_probe_listener_that_is_not_an_address_is_refused() {
+    let message = probe_listener_yaml("sbc.example.test", "tls")
+        .expect_err("a name is not a listener address")
+        .to_string();
+    assert!(
+        message.contains("is not an <ip>:<port> address"),
+        "{message}"
+    );
+}
