@@ -441,6 +441,8 @@ pub struct CallActor {
     /// a later attempt may be built from: handing the next phone the caller's
     /// raw SDP would route its audio around the relay the profile asked for.
     pub control_dial_offer: Option<Vec<u8>>,
+    /// The offers of a dial whose branches name other profiles. See [`DialMedia`].
+    pub dial_media: DialMedia,
     /// The `From` a controller-issued `dial` asked this call to present, kept
     /// for the same reason as [`Self::control_dial_offer`]: the stored A-leg
     /// INVITE holds the caller's own identity (the caller's 2xx has to echo
@@ -612,6 +614,7 @@ impl CallActor {
             control_dial: false,
             control_dial_media: false,
             control_dial_offer: None,
+            dial_media: DialMedia::default(),
             control_dial_from_header: None,
             dial_branches: Vec::new(),
             control_dial_aors: Vec::new(),

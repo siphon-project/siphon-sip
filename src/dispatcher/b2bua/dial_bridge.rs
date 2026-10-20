@@ -472,7 +472,8 @@ pub struct DialBridgePlan {
     /// The phones, `{aor}` targets already resolved to their contacts.
     pub targets: Vec<DialTarget>,
     /// The dial's identity arguments, and `profile`: the media profile each
-    /// phone is anchored with (the caller's own when it names none).
+    /// phone is anchored with, unless its target names its own (the caller's
+    /// own when neither names one).
     pub shaping: DialShaping,
     /// The dial's own headers, on every leg under each target's own.
     pub headers: Vec<(String, String)>,
@@ -1006,6 +1007,7 @@ mod tests {
                     target: "sip:201@192.0.2.20".to_string(),
                     aor: None,
                     outcome: None,
+                    media_profile: None,
                 },
             },
             signals,

@@ -372,7 +372,7 @@ enum Claim {
     /// Not a group's leg.
     Ungrouped,
     /// The first to answer.
-    Won(GroupClaimed),
+    Won(Box<GroupClaimed>),
     /// This leg already won, and the first copy of its 2xx is being carried
     /// out.
     Duplicate,
@@ -674,13 +674,13 @@ impl OriginateGroupStore {
                 internal_call_id.to_string(),
                 LegRole::Answered(group_id.clone()),
             );
-            return Claim::Won(GroupClaimed {
+            return Claim::Won(Box::new(GroupClaimed {
                 sink: Arc::clone(&group.sink),
                 group_id,
                 winner: reported,
                 losers: Vec::new(),
                 provisional: true,
-            });
+            }));
         }
         winner.branch.outcome = Some(answered);
         let winner = winner.branch.clone();
@@ -696,13 +696,13 @@ impl OriginateGroupStore {
             losers.push(leg.clone());
         }
         group.concluded = true;
-        Claim::Won(GroupClaimed {
+        Claim::Won(Box::new(GroupClaimed {
             sink: Arc::clone(&group.sink),
             group_id,
             winner,
             losers,
             provisional: false,
-        })
+        }))
     }
 
     /// End a group from outside: settle every live leg on `end`'s outcome.
@@ -1084,6 +1084,8 @@ fn drive(
 ///   none either (a group of URIs dialled as written, each its own callee).
 /// * A target's `next_hop` and headers (in a stable order) replace the
 ///   group's.
+/// * A target that names a media `profile` anchors its leg with it, over the
+///   group's (a group that sends its own offer has no profile to replace).
 /// * A target that names a calling identity presents it: `from` and
 ///   `from_display` together (an empty display name presents none), and its
 ///   `p_asserted_identity` and `privacy` where it names them. A contact an AoR
@@ -1115,6 +1117,13 @@ fn leg_params(template: &OriginateParams, target: &DialTarget) -> OriginateParam
     }
     if target.privacy.is_some() {
         params.privacy = target.privacy;
+    }
+    // A media profile the target names anchors its own leg: each leg of a group
+    // is a call siphon placed, with a media session of its own.
+    if let (Some(own), OriginateMedia::Anchor { profile, .. }) =
+        (&target.profile, &mut params.media)
+    {
+        profile.clone_from(own);
     }
     let mut headers: Vec<(&String, &String)> = target.headers.iter().collect();
     headers.sort();
@@ -1301,7 +1310,7 @@ pub fn originate_group_claim_answer(
     code: u16,
 ) -> OriginateGroupClaim {
     let claimed = match state.originate_groups.claim_answer(internal_call_id, code) {
-        Claim::Won(claimed) => claimed,
+        Claim::Won(claimed) => *claimed,
         Claim::Ungrouped => return OriginateGroupClaim::Ungrouped,
         Claim::Duplicate => return OriginateGroupClaim::Duplicate,
         Claim::Lost => return OriginateGroupClaim::Lost,
@@ -1376,6 +1385,7 @@ mod tests {
             target: target.to_string(),
             aor: Some("sip:201@example.com".to_string()),
             outcome,
+            media_profile: None,
         }
     }
 
@@ -1807,6 +1817,38 @@ mod tests {
         assert_eq!(params.from, template.from);
         assert_eq!(params.from_display, template.from_display);
         assert_eq!(params.privacy, None);
+    }
+
+    /// A bridge dial's phone is a call of its own, so a target's media profile
+    /// anchors its leg, over the group's; one naming none takes the group's.
+    #[test]
+    fn a_target_that_names_a_media_profile_anchors_its_own_leg_with_it() {
+        let mut template = group(OriginateGroupStrategy::Parallel, 0).params;
+        template.media = OriginateMedia::Anchor {
+            profile: "latching".to_string(),
+            ws_uri: None,
+        };
+        let trunk = DialTarget {
+            uri: "sip:+15550100@trunk.example.com".to_string(),
+            profile: Some("sdes_srtp".to_string()),
+            ..Default::default()
+        };
+        let desk = DialTarget {
+            uri: "sip:201@198.51.100.7".to_string(),
+            ..Default::default()
+        };
+        let anchored = |params: OriginateParams| match params.media {
+            OriginateMedia::Anchor { profile, .. } => Some(profile),
+            OriginateMedia::Offer { .. } => None,
+        };
+        assert_eq!(
+            anchored(leg_params(&template, &trunk)).as_deref(),
+            Some("sdes_srtp")
+        );
+        assert_eq!(
+            anchored(leg_params(&template, &desk)).as_deref(),
+            Some("latching")
+        );
     }
 
     #[test]

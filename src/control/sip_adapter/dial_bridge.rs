@@ -813,6 +813,7 @@ mod tests {
                 "Request Timeout",
                 DialBranchCause::Timeout,
             )),
+            media_profile: None,
         };
         let payload = dial_failed_payload(&OriginateGroupFailure {
             group_id: "group".to_string(),
