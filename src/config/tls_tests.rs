@@ -150,6 +150,8 @@ fn a_listener_can_turn_verification_off_and_drops_the_inherited_subject() {
         client_subject: vec!["*.sip.example.net".to_string()],
         client_certificate: None,
         client_private_key: None,
+        verify_server: false,
+        server_ca: None,
     };
     let off = block.for_listener(Some(&ListenerClientAuth {
         verify_client: Some(false),

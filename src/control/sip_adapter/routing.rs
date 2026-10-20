@@ -517,8 +517,10 @@ pub(super) fn parse_dial_target(
             .map_err(|error| error.to_string())?,
         to: string_field("to"),
         contact_host: parse_contact_host(object).map_err(|error| format!("target {error}"))?,
+        reroute_after_progress: parse_reroute_after_progress(object)?,
         profile: parse_profile("dial target", object.get("profile"))?,
         offer: parse_offer("dial target", object.get("offer"))?,
+        verify_server: parse_verify_server(object)?,
         ..Default::default()
     };
 
@@ -548,8 +550,10 @@ pub(super) fn parse_dial_target(
                     branch.privacy = shaped.privacy;
                     branch.to.clone_from(&shaped.to);
                     branch.contact_host.clone_from(&shaped.contact_host);
+                    branch.reroute_after_progress = shaped.reroute_after_progress;
                     branch.profile.clone_from(&shaped.profile);
                     branch.offer = shaped.offer;
+                    branch.verify_server = shaped.verify_server;
                 }
                 Ok(branches)
             }
@@ -588,6 +592,7 @@ pub(super) fn parse_route_target(
             reroute_after_progress: false,
             route: Vec::new(),
             contact_host: None,
+            verify_server: None,
         });
     }
     let Some(object) = item.as_object() else {
@@ -611,14 +616,7 @@ pub(super) fn parse_route_target(
         .get("timeout")
         .and_then(|v| v.as_u64())
         .map(|t| t as u32);
-    // A policy flag: a value that is not a boolean is refused rather than read
-    // as `false`, which would quietly keep the carrier on the default rule.
-    let reroute_after_progress = match object.get("reroute_after_progress") {
-        None => false,
-        Some(value) => value
-            .as_bool()
-            .ok_or_else(|| "target 'reroute_after_progress' must be a boolean".to_string())?,
-    };
+    let reroute_after_progress = parse_reroute_after_progress(object)?.unwrap_or(false);
     let route = parse_route_set(object)?;
     let contact_host = parse_contact_host(object).map_err(|error| format!("target {error}"))?;
     Ok(crate::dispatcher::RouteTarget {
@@ -629,7 +627,28 @@ pub(super) fn parse_route_target(
         reroute_after_progress,
         route,
         contact_host,
+        verify_server: parse_verify_server(object)?,
     })
+}
+
+/// Read a target's `reroute_after_progress`, the same flag on a `route` and a
+/// `dial` target: `None` when it is absent, for the verb to apply its own
+/// default (`false` for a `route` carrier, `true` for a `dial` target).
+///
+/// A policy flag: a value that is not a boolean, `null` included, is refused
+/// rather than read as the default, which would quietly keep the target on the
+/// rule the controller asked to change.
+fn parse_reroute_after_progress(
+    object: &serde_json::Map<String, serde_json::Value>,
+) -> Result<Option<bool>, String> {
+    object
+        .get("reroute_after_progress")
+        .map(|value| {
+            value
+                .as_bool()
+                .ok_or_else(|| "target 'reroute_after_progress' must be a boolean".to_string())
+        })
+        .transpose()
 }
 
 /// Read a media `profile` argument: absent or `null` is none, anything else
@@ -669,6 +688,21 @@ fn offer_refusal(message: String, reason: &str) -> ControlResult {
         message,
         serde_json::json!({ "verb": "dial", "argument": "offer", "reason": reason }),
     )
+}
+
+/// Read a target's `verify_server`: whether a new TLS connection for its leg
+/// verifies the server's certificate, over the gateway it routes to and
+/// `tls.verify_server`. Absent or `null` is no opinion. Anything but a boolean
+/// is refused, because reading it as `false` would quietly send the call to an
+/// unauthenticated peer the controller asked to have authenticated.
+pub(super) fn parse_verify_server(
+    object: &serde_json::Map<String, serde_json::Value>,
+) -> Result<Option<bool>, String> {
+    match object.get("verify_server") {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::Bool(verify)) => Ok(Some(*verify)),
+        Some(_) => Err("target 'verify_server' must be a boolean".to_string()),
+    }
 }
 
 /// Read a `contact_host`: the host siphon presents in its own Contact on the

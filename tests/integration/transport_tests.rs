@@ -195,6 +195,7 @@ async fn udp_roundtrip() {
             data: Bytes::from_static(sip_200_ok().as_bytes()),
             source_local_addr: None,
             server_name: None,
+            verify_server: None,
         })
         .await
         .unwrap();
@@ -272,6 +273,7 @@ async fn tcp_roundtrip() {
             data: Bytes::from_static(sip_200_ok().as_bytes()),
             source_local_addr: None,
             server_name: None,
+            verify_server: None,
         })
         .await
         .unwrap();
@@ -441,6 +443,7 @@ async fn tcp_outbound_fallback_to_pool_when_no_connection() {
             data: notify_bytes.clone(),
             source_local_addr: None,
             server_name: None,
+            verify_server: None,
         })
         .await
         .unwrap();
@@ -621,6 +624,7 @@ async fn tls_roundtrip() {
             data: Bytes::from_static(sip_200_ok().as_bytes()),
             source_local_addr: None,
             server_name: None,
+            verify_server: None,
         })
         .await
         .unwrap();
@@ -701,6 +705,7 @@ async fn ws_roundtrip() {
             data: Bytes::from_static(sip_200_ok().as_bytes()),
             source_local_addr: None,
             server_name: None,
+            verify_server: None,
         })
         .await
         .unwrap();
@@ -801,6 +806,7 @@ async fn wss_roundtrip() {
             data: Bytes::from_static(sip_200_ok().as_bytes()),
             source_local_addr: None,
             server_name: None,
+            verify_server: None,
         })
         .await
         .unwrap();
@@ -1777,6 +1783,8 @@ fn generate_test_tls_config(directory: &tempfile::TempDir) -> siphon::config::Tl
         client_subject: Vec::new(),
         client_certificate: None,
         client_private_key: None,
+        verify_server: false,
+        server_ca: None,
     }
 }
 

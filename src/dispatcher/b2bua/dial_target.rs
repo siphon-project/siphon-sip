@@ -70,10 +70,32 @@ pub struct DialTarget {
     /// Validated and stored bracketed when it is an IPv6 address
     /// ([`checked_contact_host`]).
     pub contact_host: Option<String>,
+    /// Verify the server certificate on a new outbound TLS connection for this
+    /// branch: the chain against `tls.server_ca` (or the bundled Mozilla
+    /// roots) and the host of the URI it routes to (`next_hop`, else `uri`) as
+    /// a SIP domain (RFC 5922 §7). Wins over the gateway the branch routes to
+    /// and over `tls.verify_server`; `None` leaves it to them.
+    pub verify_server: Option<bool>,
     /// The registered AoR this target is a contact of, when it came from an
     /// `{aor}` target ([`dial_targets_for_aor`]). What the branch's events name
     /// as the AoR it was dialled for; `None` for a URI dialled as written.
     pub aor: Option<String>,
+    /// Whether a sequential dial still moves on from this target once it has
+    /// shown progress (a 101-199 from the far end). `None` is the verb's
+    /// default, which is `true`: a hunt through phones moves on when a phone
+    /// rings out or is busy.
+    ///
+    /// `Some(false)` makes this target's outcome the dial's once it has rung:
+    /// its ring timeout, busy, decline or any other failure ends the dial and
+    /// no later target is tried ([`crate::b2bua::actor::hunt_stops_at`]). For
+    /// a hunt across several routes to the same destination, where the next
+    /// target would ring the same person again. The field a `route` target
+    /// has, pointing the same way (`false` keeps the call on a target that
+    /// rang); on a `dial` it covers the target's final failures too, where a
+    /// `route` carrier still fails over on its reroute causes, and its default
+    /// is `true` rather than `false`. Ignored by a parallel dial, which has no
+    /// next target to stop.
+    pub reroute_after_progress: Option<bool>,
     /// Media profile for this branch alone, over the dial's own.
     ///
     /// The media a peer can take is a property of that peer, not of the call:
@@ -124,6 +146,11 @@ impl DialOffer {
 }
 
 impl DialTarget {
+    /// Whether this target, once it has rung, still moves a sequential dial on.
+    pub fn reroutes_after_progress(&self) -> bool {
+        self.reroute_after_progress.unwrap_or(true)
+    }
+
     /// This branch's effective identity: its own where it names one, the
     /// dial's otherwise.
     ///

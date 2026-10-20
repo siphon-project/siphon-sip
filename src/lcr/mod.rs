@@ -335,6 +335,16 @@ pub struct Route {
     /// controller's to know, not a rating decision.
     #[serde(skip)]
     pub contact_host: Option<String>,
+    /// This attempt is a target of a sequential controller `dial` (a hunt),
+    /// which ends on the hunt's own rule as well as on the reroute causes: a
+    /// 6xx ends it, and so does any failure of a target that showed progress
+    /// and does not set `reroute_after_progress` (see
+    /// [`crate::b2bua::actor::hunt_stops_at`]).
+    ///
+    /// Not part of the LCR API: a carrier sequence fails over after progress
+    /// on its reroute causes, which the routing decision names.
+    #[serde(skip)]
+    pub hunt: bool,
     /// The media profile this attempt is offered, when it is a sequential
     /// `dial` target on a dial that anchors its media. A profile other than the
     /// call's own session's sends the attempt the anchored offer made for it.
@@ -343,6 +353,12 @@ pub struct Route {
     /// call's own media.
     #[serde(skip)]
     pub media_profile: Option<String>,
+    /// Server verification on a new TLS connection for this attempt's leg,
+    /// when a controller `route` or sequential `dial` target named one
+    /// (`verify_server`). Not part of the LCR API: a carrier reached through a
+    /// gateway takes the gateway destination's own `verify_server`.
+    #[serde(skip)]
+    pub verify_server: Option<bool>,
 }
 
 impl Route {

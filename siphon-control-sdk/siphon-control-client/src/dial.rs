@@ -54,11 +54,17 @@ pub enum DialTarget {
         /// Host of siphon's own Contact on this branch. See
         /// [`DialTarget::contact_host`].
         contact_host: Option<String>,
+        /// Whether a sequential dial moves on from this target once it has
+        /// rung. See [`DialTarget::reroute_after_progress`].
+        reroute_after_progress: Option<bool>,
         /// Media profile for this branch alone. See [`DialTarget::profile`].
         profile: Option<String>,
         /// When this branch's INVITE carries its offer. See
         /// [`DialTarget::offer`].
         offer: Option<DialOffer>,
+        /// Server certificate verification on this branch's outbound TLS. See
+        /// [`DialTarget::verify_server`].
+        verify_server: Option<bool>,
     },
     /// An address of record, forked to every contact registered against it.
     ///
@@ -82,12 +88,18 @@ pub enum DialTarget {
         /// Host of siphon's own Contact on every branch the AoR expands to.
         /// See [`DialTarget::contact_host`].
         contact_host: Option<String>,
+        /// Whether a sequential dial moves on from any branch the AoR expands
+        /// to once it has rung. See [`DialTarget::reroute_after_progress`].
+        reroute_after_progress: Option<bool>,
         /// Media profile for every branch the AoR expands to. See
         /// [`DialTarget::profile`].
         profile: Option<String>,
         /// When every branch the AoR expands to carries its offer. See
         /// [`DialTarget::offer`].
         offer: Option<DialOffer>,
+        /// Server certificate verification on every branch the AoR expands
+        /// to. See [`DialTarget::verify_server`].
+        verify_server: Option<bool>,
     },
 }
 
@@ -121,8 +133,10 @@ impl DialTarget {
             to: None,
             route: Vec::new(),
             contact_host: None,
+            reroute_after_progress: None,
             profile: None,
             offer: None,
+            verify_server: None,
         }
     }
 
@@ -140,8 +154,10 @@ impl DialTarget {
             to: None,
             route: Vec::new(),
             contact_host: None,
+            reroute_after_progress: None,
             profile: None,
             offer: None,
+            verify_server: None,
         }
     }
 
@@ -172,8 +188,10 @@ impl DialTarget {
             to: None,
             route: route.into_iter().map(Into::into).collect(),
             contact_host: None,
+            reroute_after_progress: None,
             profile: None,
             offer: None,
+            verify_server: None,
         }
     }
 
@@ -186,8 +204,10 @@ impl DialTarget {
             identity: TargetIdentity::default(),
             to: None,
             contact_host: None,
+            reroute_after_progress: None,
             profile: None,
             offer: None,
+            verify_server: None,
         }
     }
 
@@ -278,6 +298,30 @@ impl DialTarget {
         self
     }
 
+    /// Whether a sequential dial still moves on from this target (from every
+    /// branch an AoR expands to) once it has rung: sent the far end's 101-199.
+    ///
+    /// The server's default is `true`, a hunt through phones moving on when
+    /// one rings out or is busy. `false` makes this target's outcome the
+    /// dial's once it has rung: its ring timeout, busy, decline or other
+    /// failure ends the dial and no later target is rung, for a hunt across
+    /// several routes to the same destination. A target that never rang, and
+    /// a `503` carrying `Retry-After`, still move the hunt on; a `6xx` ends a
+    /// sequential dial whatever this says. A parallel dial ignores it.
+    pub fn reroute_after_progress(mut self, reroute: bool) -> Self {
+        match &mut self {
+            Self::Uri {
+                reroute_after_progress,
+                ..
+            }
+            | Self::Aor {
+                reroute_after_progress,
+                ..
+            } => *reroute_after_progress = Some(reroute),
+        }
+        self
+    }
+
     /// Media profile for this branch alone (every branch an AoR expands to),
     /// over the dial's own. A target without one inherits the dial's.
     ///
@@ -323,9 +367,37 @@ impl DialTarget {
         self
     }
 
+    /// Verify (`true`) or do not verify (`false`) the server certificate when
+    /// this branch opens a new outbound TLS connection, over the gateway it
+    /// routes to and the server's `tls.verify_server`.
+    ///
+    /// Verified means the chain checks out against the server's `tls.server_ca`
+    /// (or its bundled public roots) and the certificate names the host this
+    /// branch routes to (`next_hop`, else the URI) as a SIP domain (RFC 5922
+    /// §7: exact match, no wildcards), or its IP address for an IP-literal
+    /// target. A branch that fails is not sent and fails as an unreachable one
+    /// does. Unset leaves it to the server.
+    pub fn verify_server(mut self, verify: bool) -> Self {
+        match &mut self {
+            Self::Uri { verify_server, .. } | Self::Aor { verify_server, .. } => {
+                *verify_server = Some(verify);
+            }
+        }
+        self
+    }
+
     pub(crate) fn to_json(&self) -> serde_json::Value {
         let mut object = serde_json::Map::new();
-        let (headers, identity, to, contact_host, profile, offer) = match self {
+        let (
+            headers,
+            identity,
+            to,
+            contact_host,
+            profile,
+            offer,
+            reroute_after_progress,
+            verify_server,
+        ) = match self {
             Self::Uri {
                 uri,
                 next_hop,
@@ -336,6 +408,8 @@ impl DialTarget {
                 contact_host,
                 profile,
                 offer,
+                reroute_after_progress,
+                verify_server,
             } => {
                 // A bare URI with no overrides is a plain string on the wire —
                 // the shape the server's own examples use. An identity counts
@@ -349,6 +423,8 @@ impl DialTarget {
                     && contact_host.is_none()
                     && profile.is_none()
                     && offer.is_none()
+                    && reroute_after_progress.is_none()
+                    && verify_server.is_none()
                 {
                     return json!(uri);
                 }
@@ -359,7 +435,16 @@ impl DialTarget {
                 if !route.is_empty() {
                     object.insert("route".to_string(), json!(route));
                 }
-                (headers, identity, to, contact_host, profile, offer)
+                (
+                    headers,
+                    identity,
+                    to,
+                    contact_host,
+                    profile,
+                    offer,
+                    reroute_after_progress,
+                    verify_server,
+                )
             }
             Self::Aor {
                 aor,
@@ -369,11 +454,28 @@ impl DialTarget {
                 contact_host,
                 profile,
                 offer,
+                reroute_after_progress,
+                verify_server,
             } => {
                 object.insert("aor".to_string(), json!(aor));
-                (headers, identity, to, contact_host, profile, offer)
+                (
+                    headers,
+                    identity,
+                    to,
+                    contact_host,
+                    profile,
+                    offer,
+                    reroute_after_progress,
+                    verify_server,
+                )
             }
         };
+        if let Some(verify_server) = verify_server {
+            object.insert("verify_server".to_string(), json!(verify_server));
+        }
+        if let Some(reroute) = reroute_after_progress {
+            object.insert("reroute_after_progress".to_string(), json!(reroute));
+        }
         if let Some(to) = to {
             object.insert("to".to_string(), json!(to));
         }
@@ -1063,6 +1165,27 @@ mod tests {
     }
 
     #[test]
+    fn verify_server_rides_on_the_wire_only_when_set() {
+        assert_eq!(
+            DialTarget::uri("sip:trunk.example.net;transport=tls")
+                .verify_server(true)
+                .to_json(),
+            json!({"uri": "sip:trunk.example.net;transport=tls", "verify_server": true})
+        );
+        assert_eq!(
+            DialTarget::aor("sip:204@pbx.example.test")
+                .verify_server(false)
+                .to_json(),
+            json!({"aor": "sip:204@pbx.example.test", "verify_server": false})
+        );
+        assert_eq!(
+            DialTarget::uri("sip:trunk.example.net").to_json(),
+            json!("sip:trunk.example.net"),
+            "an unset verify_server leaves a bare URI a plain string"
+        );
+    }
+
+    #[test]
     fn a_route_set_rides_beside_a_pinned_next_hop() {
         let target = DialTarget::Uri {
             uri: "sip:alice@ims.example.test".to_string(),
@@ -1072,8 +1195,10 @@ mod tests {
             to: None,
             route: vec!["<sip:scscf.example.test;lr>".to_string()],
             contact_host: None,
+            reroute_after_progress: None,
             profile: None,
             offer: None,
+            verify_server: None,
         };
         assert_eq!(
             target.to_json(),
@@ -1127,6 +1252,39 @@ mod tests {
                 "next_hop": "sip:192.0.2.9:5060",
                 "contact_host": "tenant-a.example.com"
             })
+        );
+    }
+
+    /// `reroute_after_progress` defeats the bare-string shortcut and goes out
+    /// on either form as given, `false` included; left unset it stays off the
+    /// wire and the server's default applies.
+    #[test]
+    fn a_targets_reroute_after_progress_goes_out_only_when_set() {
+        assert_eq!(
+            DialTarget::uri("sip:204@pbx.example").to_json(),
+            json!("sip:204@pbx.example")
+        );
+        assert_eq!(
+            DialTarget::uri_via("sip:204@pbx.example", "sip:192.0.2.21:5060")
+                .reroute_after_progress(false)
+                .to_json(),
+            json!({
+                "uri": "sip:204@pbx.example",
+                "next_hop": "sip:192.0.2.21:5060",
+                "reroute_after_progress": false
+            })
+        );
+        assert_eq!(
+            DialTarget::uri("sip:204@pbx.example")
+                .reroute_after_progress(true)
+                .to_json(),
+            json!({"uri": "sip:204@pbx.example", "reroute_after_progress": true})
+        );
+        assert_eq!(
+            DialTarget::aor("sip:204@pbx.example")
+                .reroute_after_progress(false)
+                .to_json(),
+            json!({"aor": "sip:204@pbx.example", "reroute_after_progress": false})
         );
     }
 

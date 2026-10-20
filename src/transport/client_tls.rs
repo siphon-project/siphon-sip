@@ -41,7 +41,7 @@ pub fn client_config(ca_path: Option<&str>) -> io::Result<ClientConfig> {
 /// The root store [`client_config`] builds on. Split out because a built
 /// `ClientConfig` does not expose its roots, and "which roots does naming a CA
 /// leave acceptable" is the question worth a test.
-fn root_store(ca_path: Option<&str>) -> io::Result<RootCertStore> {
+pub(crate) fn root_store(ca_path: Option<&str>) -> io::Result<RootCertStore> {
     let mut root_store = RootCertStore::empty();
 
     match ca_path {

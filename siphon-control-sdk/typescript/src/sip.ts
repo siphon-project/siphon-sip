@@ -308,6 +308,25 @@ export interface RouteTargetObject {
    * address it advertises. See {@link DialTarget}'s `contactHost`.
    */
   contactHost?: string;
+  /**
+   * Verify (`true`) or not (`false`) the server certificate when this attempt
+   * opens a new outbound TLS connection. See {@link DialTarget}'s
+   * `verifyServer`.
+   */
+  verifyServer?: boolean;
+}
+
+/**
+ * A target's `verifyServer` as the wire carries it. Anything but a boolean is
+ * refused, as the server refuses it: read as `false`, it would send the call to
+ * a peer the app asked to have authenticated without authenticating it.
+ */
+function verifyServerToWire(verifyServer: unknown): boolean | undefined {
+  if (verifyServer === undefined || verifyServer === null) return undefined;
+  if (typeof verifyServer !== "boolean") {
+    throw new TypeError('a target\'s "verifyServer" is a boolean');
+  }
+  return verifyServer;
 }
 
 /**
@@ -350,6 +369,7 @@ function routeTargetToWire(target: RouteTarget): unknown {
   }
   const route = routeSetToWire(target.route);
   const contactHost = contactHostToWire(target.contactHost);
+  const verifyServer = verifyServerToWire(target.verifyServer);
   const object: Record<string, unknown> = { uri: target.uri };
   if (target.nextHop !== undefined) {
     object.next_hop = target.nextHop;
@@ -369,6 +389,9 @@ function routeTargetToWire(target: RouteTarget): unknown {
   }
   if (contactHost !== undefined) {
     object.contact_host = contactHost;
+  }
+  if (verifyServer !== undefined) {
+    object.verify_server = verifyServer;
   }
   return object;
 }
@@ -636,6 +659,18 @@ export type DialTarget =
        */
       contactHost?: string;
       /**
+       * Whether a sequential dial still moves on from this target once it has
+       * rung (sent the far end's 101-199). Sent only when given; the server's
+       * default is `true`, a hunt through phones moving on when one rings out
+       * or is busy. `false` ends a sequential dial on this target once it has
+       * rung: its ring timeout, busy or other failure is the dial's and no
+       * later target is rung, for a hunt across several routes to the same
+       * destination. A target that never rang, and a `503` carrying
+       * `Retry-After`, still move the hunt on; a `6xx` ends a sequential dial
+       * whatever this says. A parallel dial ignores it.
+       */
+      rerouteAfterProgress?: boolean;
+      /**
        * Media profile for this branch alone, over the dial's own. A target
        * without one inherits the dial's. One ring can then reach a phone behind
        * NAT that needs a latching relay and a trunk that asks for SDES-SRTP. An
@@ -649,6 +684,16 @@ export type DialTarget =
        * `offer` (see {@link DialOptions.offer}). Bridge dials only.
        */
       offer?: DialOffer;
+      /**
+       * Verify (`true`) or not (`false`) the server certificate when this branch
+       * opens a new outbound TLS connection, over the gateway it routes to and
+       * the server's `tls.verify_server`: the chain against the server's
+       * `tls.server_ca` (or its bundled public roots), and the host this branch
+       * routes to (`nextHop`, else `uri`) as a SIP domain (RFC 5922 §7: exact
+       * match, no wildcards), or its IP address for an IP-literal target. A
+       * branch that fails is not sent. Unset leaves it to the server.
+       */
+      verifyServer?: boolean;
     }
   | {
       /**
@@ -663,10 +708,14 @@ export type DialTarget =
       to?: string;
       /** Host of siphon's own `Contact` on every branch the AoR expands to (see the URI form). */
       contactHost?: string;
+      /** `rerouteAfterProgress` for every branch the AoR expands to (see the URI form). */
+      rerouteAfterProgress?: boolean;
       /** Media profile for every branch the AoR expands to (see the URI form). */
       profile?: string;
       /** When every branch the AoR expands to carries its offer (see the URI form). */
       offer?: DialOffer;
+      /** Server certificate verification on every branch the AoR expands to (see the URI form). */
+      verifyServer?: boolean;
     };
 
 /**
@@ -844,6 +893,13 @@ function dialTargetToWire(target: DialTarget): unknown {
   const to = (target as { to?: unknown }).to;
   const route = routeSetToWire((target as { route?: unknown }).route);
   const contactHost = contactHostToWire((target as { contactHost?: unknown }).contactHost);
+  const rerouteAfterProgress = (target as { rerouteAfterProgress?: unknown })
+    .rerouteAfterProgress;
+  // A policy flag: anything but a boolean is refused, as the server refuses
+  // it, rather than read as the default and quietly left on the old rule.
+  if (rerouteAfterProgress !== undefined && typeof rerouteAfterProgress !== "boolean") {
+    throw new TypeError('a dial target\'s "rerouteAfterProgress" is a boolean');
+  }
   const profile = (target as { profile?: unknown }).profile ?? undefined;
   if (profile !== undefined && typeof profile !== "string") {
     throw new TypeError('a dial target\'s "profile" is a media profile name string');
@@ -852,6 +908,7 @@ function dialTargetToWire(target: DialTarget): unknown {
   if (offer !== undefined && offer !== "early" && offer !== "delayed") {
     throw new TypeError('a dial target\'s "offer" is "early" or "delayed"');
   }
+  const verifyServer = verifyServerToWire((target as { verifyServer?: unknown }).verifyServer);
   if (to !== undefined && typeof to !== "string") {
     throw new TypeError('a dial target\'s "to" is a SIP URI string');
   }
@@ -878,8 +935,12 @@ function dialTargetToWire(target: DialTarget): unknown {
     if (headers !== undefined) object.headers = headers;
     if (to !== undefined) object.to = to;
     if (contactHost !== undefined) object.contact_host = contactHost;
+    if (rerouteAfterProgress !== undefined) {
+      object.reroute_after_progress = rerouteAfterProgress;
+    }
     if (profile !== undefined) object.profile = profile;
     if (offer !== undefined) object.offer = offer;
+    if (verifyServer !== undefined) object.verify_server = verifyServer;
     return object;
   }
   if (typeof uri !== "string") {
@@ -892,8 +953,10 @@ function dialTargetToWire(target: DialTarget): unknown {
     to === undefined &&
     route === undefined &&
     contactHost === undefined &&
+    rerouteAfterProgress === undefined &&
     profile === undefined &&
-    offer === undefined
+    offer === undefined &&
+    verifyServer === undefined
   ) {
     return uri;
   }
@@ -903,8 +966,12 @@ function dialTargetToWire(target: DialTarget): unknown {
   if (to !== undefined) object.to = to;
   if (route !== undefined) object.route = route;
   if (contactHost !== undefined) object.contact_host = contactHost;
+  if (rerouteAfterProgress !== undefined) {
+    object.reroute_after_progress = rerouteAfterProgress;
+  }
   if (profile !== undefined) object.profile = profile;
   if (offer !== undefined) object.offer = offer;
+  if (verifyServer !== undefined) object.verify_server = verifyServer;
   return object;
 }
 

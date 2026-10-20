@@ -584,6 +584,16 @@ describe("Call verbs map to the in-process-mirrored wire verbs", () => {
     });
   });
 
+  it("route — a target's verifyServer rides the wire as verify_server", async () => {
+    const transport = new RecordingTransport({ channel: "ch1", state: "routing", targets: 1 });
+    const call = makeCall(transport);
+    await call.route([{ uri: "sip:+15550100@trunk.example.net", verifyServer: true }]);
+    expect(transport.calls[0]?.args).toEqual({
+      targets: [{ uri: "sip:+15550100@trunk.example.net", verify_server: true }],
+      strategy: "sequential",
+    });
+  });
+
   it("route — defaults strategy to sequential, omits headers when unset", async () => {
     const transport = new RecordingTransport({ channel: "ch1", state: "routing", targets: 1 });
     const call = makeCall(transport);
@@ -1274,6 +1284,39 @@ describe("dial args map to the target shapes the server parses", () => {
     ).toThrow(/contactHost/);
   });
 
+  it("sends a target's rerouteAfterProgress as reroute_after_progress, false included", () => {
+    expect(
+      dialArgs(
+        [
+          {
+            uri: "sip:204@pbx.example",
+            nextHop: "sip:192.0.2.21:5060",
+            rerouteAfterProgress: false,
+          },
+          { aor: "sip:204@pbx.example", rerouteAfterProgress: true },
+          { uri: "sip:204@pbx.example", rerouteAfterProgress: false },
+          { uri: "sip:1001@pbx.example" },
+        ],
+        { strategy: "sequential" },
+      ),
+    ).toEqual({
+      targets: [
+        {
+          uri: "sip:204@pbx.example",
+          next_hop: "sip:192.0.2.21:5060",
+          reroute_after_progress: false,
+        },
+        { aor: "sip:204@pbx.example", reroute_after_progress: true },
+        { uri: "sip:204@pbx.example", reroute_after_progress: false },
+        "sip:1001@pbx.example",
+      ],
+      strategy: "sequential",
+    });
+    expect(() =>
+      dialArgs([{ uri: "sip:1001@pbx.example", rerouteAfterProgress: "no" } as never]),
+    ).toThrow(/rerouteAfterProgress/);
+  });
+
   it("sends a target's profile on either form, beside the dial's own", () => {
     expect(
       dialArgs(
@@ -1334,6 +1377,25 @@ describe("dial args map to the target shapes the server parses", () => {
         offer: "late" as never,
       }),
     ).toThrow(/offer/);
+  });
+
+  it("sends a target's verifyServer as verify_server on either form", () => {
+    expect(
+      dialArgs([
+        { uri: "sip:+15550199@trunk.example.net;transport=tls", verifyServer: true },
+        { aor: "sip:204@pbx.example", verifyServer: false },
+        { uri: "sip:1001@pbx.example" },
+      ]),
+    ).toEqual({
+      targets: [
+        { uri: "sip:+15550199@trunk.example.net;transport=tls", verify_server: true },
+        { aor: "sip:204@pbx.example", verify_server: false },
+        "sip:1001@pbx.example",
+      ],
+    });
+    expect(() =>
+      dialArgs([{ uri: "sip:1001@pbx.example", verifyServer: "yes" } as never]),
+    ).toThrow(/verifyServer/);
   });
 
   it("refuses a route set on an aor, and one that is not a list of strings", () => {

@@ -2692,6 +2692,40 @@ fn dial_refuses_a_malformed_route_set_as_bad_request() {
     ));
 }
 
+/// A target's `verify_server` reaches the dispatcher as given, on a dial and
+/// a route target alike; absent or null is no opinion, and anything but a
+/// boolean is refused rather than read as `false`.
+#[test]
+fn a_target_carries_its_verify_server() {
+    for (value, expected) in [
+        (serde_json::json!(true), Some(true)),
+        (serde_json::json!(false), Some(false)),
+        (serde_json::Value::Null, None),
+    ] {
+        let target = serde_json::json!({
+            "uri": "sip:+15550100@trunk.example.net;transport=tls",
+            "verify_server": value,
+        });
+        let dial = parse_dial_target(&target).expect("a dial target");
+        assert_eq!(dial[0].verify_server, expected, "{target}");
+        let route = parse_route_target(&target).expect("a route target");
+        assert_eq!(route.verify_server, expected, "{target}");
+    }
+    let bare = parse_dial_target(&serde_json::json!("sip:+15550100@trunk.example.net"))
+        .expect("a bare URI");
+    assert_eq!(bare[0].verify_server, None);
+
+    for refused in [serde_json::json!("true"), serde_json::json!(1)] {
+        let target = serde_json::json!({
+            "uri": "sip:+15550100@trunk.example.net",
+            "verify_server": refused,
+        });
+        let error = parse_dial_target(&target).expect_err("not a boolean");
+        assert!(error.contains("verify_server"), "{error}");
+        assert!(parse_route_target(&target).is_err());
+    }
+}
+
 /// A target's `contact_host` reaches the dispatcher as the host its Contact
 /// carries, an IPv6 address bracketed, on a `{uri}` and on every contact an
 /// `{aor}` forks to. A target naming none has none.
@@ -2915,6 +2949,67 @@ fn dial_target_without_uri_or_aor_is_rejected() {
     );
     let error = parse_dial_target(&serde_json::json!(42)).expect_err("a number is not a target");
     assert!(error.contains("URI string"), "{error}");
+}
+
+/// `reroute_after_progress` on a `dial` target: absent is the verb's default
+/// (`None`, read as `true`), a boolean is taken as given, an `{aor}` hands it
+/// to every contact, and anything else is refused rather than read as the
+/// default.
+#[test]
+fn a_dial_targets_reroute_after_progress_is_parsed_and_checked() {
+    let bare = parse_dial_target(&serde_json::json!("sip:204@pbx.example")).expect("a target");
+    assert_eq!(bare[0].reroute_after_progress, None);
+    assert!(
+        bare[0].reroutes_after_progress(),
+        "a hunt moves on by default"
+    );
+    let absent =
+        parse_dial_target(&serde_json::json!({ "uri": "sip:204@pbx.example" })).expect("a target");
+    assert_eq!(absent[0].reroute_after_progress, None);
+    for flag in [true, false] {
+        let parsed = parse_dial_target(&serde_json::json!({
+            "uri": "sip:204@pbx.example",
+            "reroute_after_progress": flag,
+        }))
+        .expect("a target");
+        assert_eq!(parsed[0].reroute_after_progress, Some(flag));
+        assert_eq!(parsed[0].reroutes_after_progress(), flag);
+    }
+    for value in [
+        serde_json::json!("no"),
+        serde_json::json!(0),
+        serde_json::Value::Null,
+    ] {
+        let error = parse_dial_target(&serde_json::json!({
+            "uri": "sip:204@pbx.example",
+            "reroute_after_progress": value,
+        }))
+        .expect_err("not a boolean");
+        assert!(error.contains("reroute_after_progress"), "{error}");
+    }
+
+    let registrar = crate::script::api::test_registrar();
+    for (instance, host) in [("a", "198.51.100.131"), ("b", "198.51.100.132")] {
+        registrar
+            .save(
+                "sip:3205@siphon.example.com",
+                crate::sip::uri::SipUri::new(host.to_string()),
+                3600,
+                1.0,
+                format!("register-3205-{instance}"),
+                1,
+            )
+            .expect("the binding saves");
+    }
+    let contacts = parse_dial_target(&serde_json::json!({
+        "aor": "sip:3205@siphon.example.com",
+        "reroute_after_progress": false,
+    }))
+    .expect("the AoR form is a target");
+    assert_eq!(contacts.len(), 2, "one branch per registered contact");
+    assert!(contacts
+        .iter()
+        .all(|branch| branch.reroute_after_progress == Some(false)));
 }
 
 #[test]

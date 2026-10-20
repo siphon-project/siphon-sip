@@ -151,6 +151,8 @@ mod control_dial_bridge_fallback_tests;
 #[cfg(test)]
 mod control_dial_bridge_from_host_tests;
 #[cfg(test)]
+mod control_dial_bridge_hunt_progress_tests;
+#[cfg(test)]
 mod control_dial_bridge_offer_tests;
 #[cfg(test)]
 mod control_dial_bridge_tests;
@@ -158,6 +160,8 @@ mod control_dial_bridge_tests;
 mod control_dial_contact_host_tests;
 #[cfg(test)]
 mod control_dial_identity_tests;
+#[cfg(test)]
+mod control_dial_reroute_after_progress_tests;
 #[cfg(test)]
 mod control_dial_route_tests;
 #[cfg(test)]
@@ -346,6 +350,8 @@ mod teardown_race_tests;
 mod test_dispatcher;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tls_verify_server_tests;
 #[cfg(test)]
 mod transfer_bye_tests;
 #[cfg(test)]

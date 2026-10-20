@@ -730,6 +730,7 @@ mod tests {
                     data: Bytes::from(format!("{group}:0")),
                     source_local_addr: None,
                     server_name: None,
+                    verify_server: None,
                     followups: Some(vec![
                         Bytes::from(format!("{group}:1")),
                         Bytes::from(format!("{group}:2")),
@@ -836,6 +837,7 @@ mod tests {
                     data: Bytes::from(index.to_string()),
                     source_local_addr: None,
                     server_name: None,
+                    verify_server: None,
                     followups: None,
                 })
                 .unwrap();
@@ -866,6 +868,7 @@ mod tests {
             data: Bytes::from_static(b"OPTIONS"),
             source_local_addr: None,
             server_name: None,
+            verify_server: None,
             followups: None,
         }
     }

@@ -761,6 +761,7 @@ pub(super) fn handle_ack_via_session(
                 address: destination,
                 transport: Some(out_transport),
                 server_name: None,
+                verify_server: None,
             };
             send_to_target(
                 data,
