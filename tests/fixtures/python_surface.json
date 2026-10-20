@@ -743,6 +743,11 @@
         "kind": "builtin_function_or_method",
         "sig": "(func)"
       },
+      "originate": {
+        "doc": "Originate a request on a connection this node has, e.g. an HSS's",
+        "kind": "method_descriptor",
+        "sig": "($self, command, application, avps, destination_realm, destination_host=None, peer=None, session_id=None, tenant=\"default\", proxiable=True, timeout_ms=10000)"
+      },
       "peer_count": {
         "doc": "Get the number of connected peers.",
         "kind": "method_descriptor",

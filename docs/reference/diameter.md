@@ -609,3 +609,67 @@ clients over one connection, so one connection can serve several Origin-Hosts.
 The entries are dropped when the connection ends, and a newer connection for the
 same client replaces an older one. Client-mode peers under `diameter.peers` are
 never used here; reach those with `send_request(peer=...)`.
+
+
+### Requests this node originates
+
+```python
+answer = await diameter.originate(command, application, avps, destination_realm,
+                                  destination_host=None, peer=None,
+                                  session_id=None, tenant="default",
+                                  proxiable=True, timeout_ms=10000)
+```
+
+Sends a request this node starts on a connection it already has, and awaits
+its answer. A node in server mode needs it for the procedures that begin at
+the server: an HSS's Cancel-Location, Insert-Subscriber-Data,
+Delete-Subscriber-Data and Reset towards an MME (TS 29.272 clauses 5.2.1.2,
+5.2.2.1, 5.2.2.2 and 5.2.4.1), or an Alert-Service-Centre over S6c
+(TS 29.338 clause 5.2.2).
+
+`command` is a name as `send_request` takes it (`"CLR"`,
+`"Insert-Subscriber-Data"`) or a command code (`322` for the S6a Reset,
+whose acronym `RSR` is the S6c Report-SM-Delivery-Status). `application`
+is an application name; it goes in the header. The R bit is set, and the P
+bit unless `proxiable=False`.
+
+The request starts with Session-Id (`session_id`, or a new one of the
+connection's identity), Origin-Host and Origin-Realm of the connection,
+Destination-Host when given and Destination-Realm. `avps` follow in their
+order: each a `(code_or_name, value)`, `(code_or_name, value, vendor)` or
+`(code_or_name, value, vendor, mandatory)` tuple, the shape `set_avp` takes
+for the members of a group, and a list as value for a grouped AVP. An AVP
+can repeat. `mandatory` sets or clears the M bit the dictionary would give,
+for an AVP whose table marks it "must not" that the dictionary does not
+know. Auth-Session-State and Vendor-Specific-Application-Id are the
+caller's to add or leave out. Passing one of the envelope AVPs raises
+`ValueError`.
+
+```python
+answer = await diameter.originate("CLR", "S6a", [
+    ("Vendor-Specific-Application-Id", [("Vendor-Id", 10415),
+                                        ("Auth-Application-Id", 16777251)]),
+    ("Auth-Session-State", 1),
+    ("User-Name", "001010000000001"),
+    (1420, 2, 10415),                                  # Cancellation-Type
+    (1638, (2).to_bytes(4, "big"), 10415, False),      # CLR-Flags, no M bit
+], destination_realm="epc.mnc001.mcc001.3gppnetwork.org",
+   destination_host="mme1.epc.mnc001.mcc001.3gppnetwork.org")
+if answer.result_code == 2001: ...
+```
+
+The connection: with `peer`, the serving connection of that configured
+entry that carried requests from `destination_host`, else the client-mode
+peer of that name (`diameter.peers`). Without, the serving connection that
+last carried a request from `destination_host`, else one that carried a
+request from a node of `destination_realm` (a direct peer of the realm or
+an agent relaying for it, which routes on to the host). A serving
+connection becomes reachable once a request from that host or realm has
+arrived on it (`diameter.listen` or `connect_to`). All scoped to `tenant`.
+
+Resolves to a `DiameterAnswer` (`result_code`, `get_avp`, `avps()`),
+whatever its result. No open connection raises `LookupError` and nothing is
+sent; no answer within `timeout_ms` raises `TimeoutError`; a connection that
+closes before the answer raises `ConnectionError`. siphon does not resend:
+the script decides whether to repeat.
+
