@@ -534,5 +534,86 @@ pub(super) fn set_play_gain<'py>(
     })
 }
 
+/// How long `conference_wait_recording` waits by default: an hour, as
+/// `wait_recording` does.
+const DEFAULT_ROOM_RECORDING_WAIT_MS: u64 = 3_600_000;
+
+/// `rtpengine.conference_start_recording`.
+pub(super) fn start_recording<'py>(
+    engine: &PyRtpEngine,
+    python: Python<'py>,
+    conference_id: String,
+    path: Option<String>,
+    max_duration_ms: Option<u64>,
+    silence_ms: Option<u64>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let conference_id = room_id(conference_id, "conference_start_recording(conference_id)")?;
+    if max_duration_ms == Some(0) || silence_ms == Some(0) {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "max_duration_ms and silence_ms are positive when given",
+        ));
+    }
+    let client = Arc::clone(&engine.client);
+    pyo3_async_runtimes::tokio::future_into_py(python, async move {
+        let recording_id = client
+            .conference_start_recording(
+                &conference_id,
+                path.as_deref(),
+                max_duration_ms,
+                silence_ms,
+            )
+            .await
+            .map_err(|error| failure("conference_start_recording", error))?;
+        debug!(conference_id = %conference_id, recording_id = %recording_id, "rtpengine conference recording started");
+        Ok(recording_id)
+    })
+}
+
+/// `rtpengine.conference_stop_recording`.
+pub(super) fn stop_recording<'py>(
+    engine: &PyRtpEngine,
+    python: Python<'py>,
+    conference_id: String,
+    recording_id: Option<String>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let conference_id = room_id(conference_id, "conference_stop_recording(conference_id)")?;
+    let client = Arc::clone(&engine.client);
+    pyo3_async_runtimes::tokio::future_into_py(python, async move {
+        client
+            .conference_stop_recording(&conference_id, recording_id.as_deref())
+            .await
+            .map_err(|error| failure("conference_stop_recording", error))?;
+        Ok(true)
+    })
+}
+
+/// `rtpengine.conference_wait_recording`: the dict `wait_recording` returns,
+/// or `None` after `timeout_ms`.
+pub(super) fn wait_recording<'py>(
+    engine: &PyRtpEngine,
+    python: Python<'py>,
+    conference_id: String,
+    recording_id: String,
+    timeout_ms: Option<u64>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let conference_id = room_id(conference_id, "conference_wait_recording(conference_id)")?;
+    let deadline = std::time::Duration::from_millis(
+        timeout_ms.unwrap_or(DEFAULT_ROOM_RECORDING_WAIT_MS).max(1),
+    );
+    let client = Arc::clone(&engine.client);
+    pyo3_async_runtimes::tokio::future_into_py(python, async move {
+        let finished = client
+            .conference_wait_recording(&conference_id, &recording_id, deadline)
+            .await
+            .map_err(|error| failure("conference_wait_recording", error))?;
+        match finished {
+            Some(finished) => {
+                Python::attach(|python| super::capture::finished_dict(python, &finished)).map(Some)
+            }
+            None => Ok(None),
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests;

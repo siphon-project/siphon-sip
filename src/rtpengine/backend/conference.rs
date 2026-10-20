@@ -271,6 +271,60 @@ impl MediaBackend {
             }
         }
     }
+
+    /// Record a room's listener mix to a WAV; the engine's `recording_id`.
+    pub async fn conference_start_recording(
+        &self,
+        conference_id: &str,
+        path: Option<&str>,
+        max_duration_ms: Option<u64>,
+        silence_ms: Option<u64>,
+    ) -> Result<String, RtpEngineError> {
+        match self {
+            Self::SiphonRtp(set) => {
+                set.conference_start_recording(conference_id, path, max_duration_ms, silence_ms)
+                    .await
+            }
+            Self::RtpEngine(_) | Self::RtpProxy(_) => {
+                Err(self.no_mixer("conference_start_recording"))
+            }
+        }
+    }
+
+    /// Stop one room recording, or every recording of the room.
+    pub async fn conference_stop_recording(
+        &self,
+        conference_id: &str,
+        recording_id: Option<&str>,
+    ) -> Result<(), RtpEngineError> {
+        match self {
+            Self::SiphonRtp(set) => {
+                set.conference_stop_recording(conference_id, recording_id)
+                    .await
+            }
+            Self::RtpEngine(_) | Self::RtpProxy(_) => {
+                Err(self.no_mixer("conference_stop_recording"))
+            }
+        }
+    }
+
+    /// Wait until a room recording has ended and its file is closed, at most
+    /// `deadline`. `Ok(None)` when it had not.
+    pub async fn conference_wait_recording(
+        &self,
+        conference_id: &str,
+        recording_id: &str,
+        deadline: std::time::Duration,
+    ) -> Result<Option<crate::rtpengine::events::RecordingFinished>, RtpEngineError> {
+        match self {
+            Self::SiphonRtp(set) => Ok(set
+                .conference_wait_recording(conference_id, recording_id, deadline)
+                .await),
+            Self::RtpEngine(_) | Self::RtpProxy(_) => {
+                Err(self.no_mixer("conference_wait_recording"))
+            }
+        }
+    }
 }
 
 #[cfg(test)]

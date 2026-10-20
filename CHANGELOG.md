@@ -45,6 +45,13 @@ entry, but a working config keeps working.
   carries the last failure's status, in `@registration.on_change` too. The
   Rust, Python and TypeScript control SDKs model the new fields, event and
   verbs.
+- **`rtpengine`: a script records a conference room.**
+  `conference_start_recording` / `conference_stop_recording` /
+  `conference_wait_recording` write a room's listener mix (its seats, any
+  bridged room, any room playback) to a 16 kHz WAV and return the closed file
+  (`path`, `duration_ms`, `reason`), bounded by `max_duration_ms` and
+  `silence_ms`. A seat is not a call, so `start_recording` cannot reach a
+  caller the script seated in a room; this can. siphon-rtp only.
 - **`POST /admin/auth/cache/invalidate`** drops cached digest credentials
   (`auth.http` / `auth.database`): `{"realm","username"}` for one user,
   `{"realm"}` for one realm, `{}` for all. `204`, or `404 {"error":"no

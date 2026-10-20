@@ -648,3 +648,93 @@ fn a_join_refused_for_the_participants_codec_is_a_value_error_and_nothing_else_i
         assert!(timeout.is_instance_of::<pyo3::exceptions::PyRuntimeError>(python));
     });
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_script_records_a_room_and_gets_the_closed_file() {
+    let finished = vec![json!({
+        "event": "recording_finished", "call_id": "", "conference_id": "room-7",
+        "from_tag": "", "recording_id": "rec-7", "path": "/var/spool/rec/a.wav",
+        "duration_ms": 2980, "reason": "silence"
+    })];
+    let engine = FakeEngine::start(accept, finished).await;
+    let namespace = namespace(engine.backend(), ProfileRegistry::new());
+
+    let (started, ended, refused) = with_namespace(namespace, |python, namespace| {
+        let args = PyTuple::new(python, ["room-7"]).expect("args");
+        let kwargs = PyDict::new(python);
+        kwargs
+            .set_item("path", "/var/spool/rec/a.wav")
+            .expect("path");
+        kwargs.set_item("max_duration_ms", 10_000).expect("max");
+        kwargs.set_item("silence_ms", 3000).expect("silence");
+        let started = call(
+            python,
+            namespace,
+            "conference_start_recording",
+            &args,
+            &kwargs,
+        )
+        .and_then(|value| value.bind(python).extract::<String>())
+        .map_err(|error| error.to_string());
+
+        let args = PyTuple::new(python, ["room-7", "rec-7"]).expect("args");
+        let kwargs = PyDict::new(python);
+        kwargs.set_item("timeout_ms", 2000).expect("timeout");
+        let ended = call(
+            python,
+            namespace,
+            "conference_wait_recording",
+            &args,
+            &kwargs,
+        )
+        .map(|value| {
+            let dict = value.bind(python);
+            let item = |key: &str| {
+                dict.get_item(key)
+                    .map(|item| item.to_string())
+                    .unwrap_or_default()
+            };
+            (item("path"), item("duration_ms"), item("reason"))
+        })
+        .map_err(|error| error.to_string());
+
+        let args = PyTuple::new(python, ["room-7"]).expect("args");
+        let kwargs = PyDict::new(python);
+        kwargs.set_item("max_duration_ms", 0).expect("max");
+        let refused = call(
+            python,
+            namespace,
+            "conference_start_recording",
+            &args,
+            &kwargs,
+        )
+        .map(|_| ())
+        .map_err(|error| error.to_string());
+        (started, ended, refused)
+    })
+    .await;
+
+    assert_eq!(started, Ok("rec-7".to_string()));
+    assert_eq!(
+        ended,
+        Ok((
+            "/var/spool/rec/a.wav".to_string(),
+            "2980".to_string(),
+            "silence".to_string()
+        ))
+    );
+    assert!(
+        refused
+            .as_ref()
+            .is_err_and(|error| error.starts_with("ValueError")),
+        "{refused:?}"
+    );
+    assert_eq!(
+        engine.frames("conference_start_recording"),
+        vec![
+            json!({ "command": "conference_start_recording", "conference_id": "room-7",
+                     "path": "/var/spool/rec/a.wav", "max_duration_ms": 10000,
+                     "silence_ms": 3000 })
+        ]
+    );
+}

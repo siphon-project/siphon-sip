@@ -2507,15 +2507,30 @@
         "kind": "method_descriptor",
         "sig": "($self, conference_id, play_id, gain_decibels)"
       },
+      "conference_start_recording": {
+        "doc": "Record a room's listener mix (its seats, any bridged room, any room",
+        "kind": "method_descriptor",
+        "sig": "($self, conference_id, path=None, max_duration_ms=None, silence_ms=None)"
+      },
       "conference_stop_play": {
         "doc": "Stop one room playback by ``play_id``, or all of them.",
         "kind": "method_descriptor",
         "sig": "($self, conference_id, play_id=None)"
       },
+      "conference_stop_recording": {
+        "doc": "Stop one room recording by ``recording_id``, or all of them.",
+        "kind": "method_descriptor",
+        "sig": "($self, conference_id, recording_id=None)"
+      },
       "conference_unbridge": {
         "doc": "Unlink two rooms a :meth:`conference_bridge` linked, in both",
         "kind": "method_descriptor",
         "sig": "($self, conference_a, conference_b)"
+      },
+      "conference_wait_recording": {
+        "doc": "Wait until a room recording has ended and its file is closed: the dict",
+        "kind": "method_descriptor",
+        "sig": "($self, conference_id, recording_id, timeout_ms=None)"
       },
       "delete": {
         "doc": "Send an RTPEngine `delete` command to tear down the media session.",

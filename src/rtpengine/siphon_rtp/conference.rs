@@ -234,6 +234,51 @@ impl SiphonRtpClient {
             .await?,
         )
     }
+
+    /// Record the room's listener mix (every seat, any bridged room and any
+    /// room playback) to a WAV, returning the engine's `recording_id`.
+    /// Accept-on-start: the end arrives as a `recording_finished` naming the
+    /// room, which `wait_recording` resolves by that id.
+    pub async fn conference_start_recording(
+        &self,
+        conference_id: &str,
+        path: Option<&str>,
+        max_duration_ms: Option<u64>,
+        silence_ms: Option<u64>,
+    ) -> Result<String, RtpEngineError> {
+        let result = self
+            .conference_request(Command::ConferenceStartRecording {
+                conference_id: conference_id.to_string(),
+                path: path.map(str::to_string),
+                recording_dir: None,
+                max_duration_ms,
+                silence_ms,
+            })
+            .await?;
+        match result {
+            CmdResult::Ok {
+                recording_id: Some(id),
+                ..
+            } => Ok(id),
+            // The id is the only handle a stop and the end have on the file.
+            other => Err(unexpected_result("conference start recording", other)),
+        }
+    }
+
+    /// Stop one room recording, or every recording of the room.
+    pub async fn conference_stop_recording(
+        &self,
+        conference_id: &str,
+        recording_id: Option<&str>,
+    ) -> Result<(), RtpEngineError> {
+        expect_ok(
+            self.conference_request(Command::ConferenceStopRecording {
+                conference_id: conference_id.to_string(),
+                recording_id: recording_id.map(str::to_string),
+            })
+            .await?,
+        )
+    }
 }
 
 impl SiphonRtpClientSet {
@@ -389,6 +434,43 @@ impl SiphonRtpClientSet {
     ) -> Result<(), RtpEngineError> {
         self.select(&room_affinity_key(conference_id))
             .conference_set_play_gain(conference_id, play_id, gain_decibels)
+            .await
+    }
+
+    /// Record a room on the instance that holds it.
+    pub async fn conference_start_recording(
+        &self,
+        conference_id: &str,
+        path: Option<&str>,
+        max_duration_ms: Option<u64>,
+        silence_ms: Option<u64>,
+    ) -> Result<String, RtpEngineError> {
+        self.select(&room_affinity_key(conference_id))
+            .conference_start_recording(conference_id, path, max_duration_ms, silence_ms)
+            .await
+    }
+
+    /// Stop a room recording on the instance that holds the room.
+    pub async fn conference_stop_recording(
+        &self,
+        conference_id: &str,
+        recording_id: Option<&str>,
+    ) -> Result<(), RtpEngineError> {
+        self.select(&room_affinity_key(conference_id))
+            .conference_stop_recording(conference_id, recording_id)
+            .await
+    }
+
+    /// Wait for a room recording to end, on the instance that holds the room:
+    /// its `recording_finished` arrives on that instance's connection.
+    pub async fn conference_wait_recording(
+        &self,
+        conference_id: &str,
+        recording_id: &str,
+        deadline: std::time::Duration,
+    ) -> Option<crate::rtpengine::events::RecordingFinished> {
+        self.select(&room_affinity_key(conference_id))
+            .wait_recording(recording_id, deadline)
             .await
     }
 }
