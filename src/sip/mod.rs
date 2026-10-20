@@ -1,5 +1,6 @@
 //! SIP protocol implementation — parser, message types, URI, headers, builder.
 
+pub mod allow;
 pub mod best_response;
 pub mod builder;
 pub mod codec;
@@ -23,5 +24,8 @@ pub use uri::{Scheme, SipUri};
 /// is shown (RFC 3261 §20.5): without `REFER`/`NOTIFY` here such a peer never
 /// hands siphon a REFER, even though transfer is implemented. Keep this in
 /// sync with the methods the dispatcher/transaction layer actually handles.
+///
+/// A gateway group can advertise a subset of it toward its own peers
+/// (`gateway.groups[].allow_methods`, checked by [`allow`]).
 pub const SUPPORTED_METHODS: &str =
     "INVITE, ACK, CANCEL, BYE, OPTIONS, INFO, UPDATE, PRACK, SUBSCRIBE, NOTIFY, REFER, MESSAGE, PUBLISH";

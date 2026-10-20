@@ -419,12 +419,12 @@ pub fn send_uas_response(
             .set("Content-Length", body_bytes.len().to_string());
         response.body = body_bytes;
     }
-    // The script's own headers (`P-Early-Media` on an announcement's 183, RFC
-    // 5009 §8): precedence 1, as on a relayed response, so they go on last. The
-    // ones siphon owns here were refused before this point, so nothing below
-    // (the RSeq and Require of a reliable provisional, the 2xx's session timer)
-    // can collide with them.
-    crate::b2bua::uas_headers::apply(&mut response, headers);
+    // siphon's `Allow`, then the script's own headers (`P-Early-Media` on an
+    // announcement's 183, RFC 5009 §8): precedence 1, as on a relayed response,
+    // so they go on last. The ones siphon owns here were refused before this
+    // point, so nothing below (the RSeq and Require of a reliable provisional,
+    // the 2xx's session timer) can collide with them.
+    finish_uas_headers(state, &mut response, remote_addr.ip(), headers);
     if !final_response && (101..200).contains(&code) {
         // An SDP answer in siphon's own 18x is the caller's answer from now on.
         if sdp_in_body(content_type.unwrap_or_default(), &response.body).is_some() {

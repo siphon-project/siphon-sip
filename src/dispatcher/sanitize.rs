@@ -132,7 +132,21 @@ pub(super) fn sanitize_b2bua_response_keeping(
     // method this way and never send a REFER without it), and `Supported`
     // carries `replaces`, which RFC 5589 §7.3 has a transferor read off exactly
     // this response to decide whether it can offer an attended transfer.
-    advertise_relayed_response_capabilities(&mut response.headers, script_shaped_headers, &policy);
+    // Toward a caller from a gateway group that narrows `Allow`, that group's
+    // set (`gateway.groups[].allow_methods`): a peer reading its transfer method
+    // off `Allow` is shown no REFER when its operator chose that.
+    let allow = allow_toward(state, || {
+        state
+            .call_actors
+            .get_call(call_id)
+            .map(|call| call.a_leg.transport.remote_addr.ip())
+    });
+    advertise_relayed_response_capabilities(
+        &mut response.headers,
+        script_shaped_headers,
+        &policy,
+        allow_value(&allow),
+    );
 
     // Sanitize SDP: mask B-leg identity in o= and s= lines, and rewrite
     // the o= address to our advertised address for topology hiding.
