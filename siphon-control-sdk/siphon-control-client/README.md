@@ -84,6 +84,12 @@ Every verb the server's `sip` adapter describes has a typed method:
   `OriginateOptions::contact_user(..)`, `ResponseOptions::contact_user`,
   `DialOptions::caller_contact_user`, and `ring_with_caller_contact` /
   `route_with_caller_contact`, which take a `CallerContact { host, user }`.
+  `DialTarget::reroute_after_progress(false)` ends a sequential dial on that
+  target once it has rung (a 101-199): its ring timeout, busy or other failure
+  is the dial's and no later target is rung, for a hunt across several routes
+  to one destination. Left unset it stays off the wire (server default `true`).
+  A target that never rang, and a 503 with Retry-After, still move the hunt on;
+  a 6xx ends a sequential dial either way.
 - **Transfers:** `refer` / `transfer` / `refer_replaces` send a REFER.
   `accept_refer` and `reject_refer` decide a pending inbound one.
   `accept_refer_dialling(target, mode, profile, &TransferDial)` names who the

@@ -518,6 +518,7 @@ pub(super) fn parse_dial_target(
         to: string_field("to"),
         contact_host: parse_contact_host(object).map_err(|error| format!("target {error}"))?,
         contact_user: parse_contact_user(object).map_err(|error| format!("target {error}"))?,
+        reroute_after_progress: parse_reroute_after_progress(object)?,
         profile: parse_profile("dial target", object.get("profile"))?,
         offer: parse_offer("dial target", object.get("offer"))?,
         ..Default::default()
@@ -550,6 +551,7 @@ pub(super) fn parse_dial_target(
                     branch.to.clone_from(&shaped.to);
                     branch.contact_host.clone_from(&shaped.contact_host);
                     branch.contact_user.clone_from(&shaped.contact_user);
+                    branch.reroute_after_progress = shaped.reroute_after_progress;
                     branch.profile.clone_from(&shaped.profile);
                     branch.offer = shaped.offer;
                 }
@@ -614,14 +616,7 @@ pub(super) fn parse_route_target(
         .get("timeout")
         .and_then(|v| v.as_u64())
         .map(|t| t as u32);
-    // A policy flag: a value that is not a boolean is refused rather than read
-    // as `false`, which would quietly keep the carrier on the default rule.
-    let reroute_after_progress = match object.get("reroute_after_progress") {
-        None => false,
-        Some(value) => value
-            .as_bool()
-            .ok_or_else(|| "target 'reroute_after_progress' must be a boolean".to_string())?,
-    };
+    let reroute_after_progress = parse_reroute_after_progress(object)?.unwrap_or(false);
     let route = parse_route_set(object)?;
     let contact_host = parse_contact_host(object).map_err(|error| format!("target {error}"))?;
     let contact_user = parse_contact_user(object).map_err(|error| format!("target {error}"))?;
@@ -635,6 +630,26 @@ pub(super) fn parse_route_target(
         contact_host,
         contact_user,
     })
+}
+
+/// Read a target's `reroute_after_progress`, the same flag on a `route` and a
+/// `dial` target: `None` when it is absent, for the verb to apply its own
+/// default (`false` for a `route` carrier, `true` for a `dial` target).
+///
+/// A policy flag: a value that is not a boolean, `null` included, is refused
+/// rather than read as the default, which would quietly keep the target on the
+/// rule the controller asked to change.
+fn parse_reroute_after_progress(
+    object: &serde_json::Map<String, serde_json::Value>,
+) -> Result<Option<bool>, String> {
+    object
+        .get("reroute_after_progress")
+        .map(|value| {
+            value
+                .as_bool()
+                .ok_or_else(|| "target 'reroute_after_progress' must be a boolean".to_string())
+        })
+        .transpose()
 }
 
 /// Read a media `profile` argument: absent or `null` is none, anything else

@@ -103,13 +103,15 @@ pub(crate) fn extract_dial_targets(items: &[Bound<'_, PyAny>]) -> PyResult<Vec<D
 }
 
 /// Extract one `dial` target: a dict `{uri, next_hop?, headers?, to?, route?,
-/// contact_host?, contact_user?, profile?, offer?}` dialed as written, or `{aor,
-/// headers?, to?, contact_host?, contact_user?, profile?, offer?}` forked to every
-/// registered contact. `contact_host` is the host of siphon's own Contact on the
-/// branch (every branch of an AoR), for a peer that identifies the tenant by that
-/// host, and `contact_user` the user part of that Contact, otherwise userless. `profile` is the media
+/// contact_host?, contact_user?, profile?, offer?, reroute_after_progress?}` dialed
+/// as written, or `{aor, headers?, to?, contact_host?, contact_user?, profile?,
+/// offer?, reroute_after_progress?}` forked to every registered contact.
+/// `contact_host` is the host of siphon's own Contact on the branch (every branch
+/// of an AoR), for a peer that identifies the tenant by that host, and
+/// `contact_user` the user part of that Contact, otherwise userless. `profile` is the media
 /// profile for that branch alone, over the dial's own; a target without one
-/// inherits the dial's.
+/// inherits the dial's. `reroute_after_progress` (a `bool`, server default
+/// `True`) set `False` ends a sequential dial on this target once it has rung.
 ///
 /// A bare string is refused although the server accepts one as a URI. The two
 /// forms do entirely different things — an AoR forks to every contact over that
@@ -130,6 +132,14 @@ fn extract_dial_target(item: &Bound<'_, PyAny>) -> PyResult<DialTarget> {
     let to = optional_string(dict, "to")?;
     let contact_host = optional_string(dict, "contact_host")?;
     let contact_user = optional_string(dict, "contact_user")?;
+    // A policy flag: anything but a real bool is refused, as the server refuses
+    // it, rather than read as the default and quietly left on the old rule.
+    let reroute_after_progress = match dict.get_item("reroute_after_progress")? {
+        Some(value) if !value.is_none() => Some(value.extract::<bool>().map_err(|_| {
+            PyTypeError::new_err("dial target 'reroute_after_progress' must be a bool")
+        })?),
+        _ => None,
+    };
     let profile = optional_string(dict, "profile")?;
     let offer = extract_dial_offer(optional_string(dict, "offer")?)?;
     let route = extract_route_set(dict)?;
@@ -159,6 +169,7 @@ fn extract_dial_target(item: &Bound<'_, PyAny>) -> PyResult<DialTarget> {
             route,
             contact_host: None,
             contact_user: None,
+            reroute_after_progress: None,
             profile: None,
             offer: None,
         },
@@ -195,6 +206,9 @@ fn extract_dial_target(item: &Bound<'_, PyAny>) -> PyResult<DialTarget> {
     }
     if let Some(contact_user) = contact_user {
         target = target.contact_user(contact_user);
+    }
+    if let Some(reroute) = reroute_after_progress {
+        target = target.reroute_after_progress(reroute);
     }
     if let Some(profile) = profile {
         target = target.profile(profile);

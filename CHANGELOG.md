@@ -35,6 +35,31 @@ entry, but a working config keeps working.
   `set_contact_user()`; the script's `set_contact_uri()` outranks both. The
   Rust, Python and TypeScript control SDKs take it as `contact_user` /
   `caller_contact_user` and `contactUser` / `callerContactUser`.
+- **Control plane: `reroute_after_progress` on `dial` targets.** A sequential
+  `dial` moves on when a target rings out or fails, which is right for a hunt
+  through phones and wrong for a hunt across several routes to one
+  destination (redundant SBCs or proxies in front of one PBX): the next route
+  rings the same person again, and a busy is retried. A `{uri}` or `{aor}`
+  target with `reroute_after_progress: false` now ends the dial once it has
+  sent a 101-199 (not the hop-by-hop 100): its ring timeout (`408`,
+  `timed_out: true`), busy, decline or any other failure is the dial's, in
+  `DialFailed`, and no later target is rung. A target that never rang (no
+  response before its ring timeout, an INVITE the transport would not take, a
+  failure before any 101-199) still moves the hunt on, and so does a `503`
+  carrying `Retry-After` even after progress: that is the element saying it is
+  unavailable (RFC 3261 §21.5.4), which is what the next redundant route is
+  for. Both forms, connecting and `on_answer: "bridge"`, follow the one rule.
+  The default is `true`, so a dial that does not name it behaves as before;
+  that is the opposite default of a `route` target's field of the same name,
+  which on `dial` also covers a target's final failures where a `route`
+  carrier that rang still fails over on its reroute causes. A parallel dial
+  ignores it. Anything but a boolean is `bad_request`. The control SDKs carry
+  it: `DialTarget::reroute_after_progress(bool)` in Rust (a new field on both
+  `DialTarget` variants, so code building a variant as a struct literal has to
+  name it), a `"reroute_after_progress"` key in a Python target dict (anything
+  but a `bool` raises `TypeError`), and `rerouteAfterProgress` in TypeScript,
+  each sent only when given.
+
 - **Mutual TLS per listener.** A `listen.tls` or `listen.wss` entry in the
   object form can set `verify_client`, `client_ca` and `client_subject` for
   itself, overriding the `tls:` block for that listener only. One listener can
@@ -55,6 +80,19 @@ entry, but a working config keeps working.
   and counted in `siphon_handshake_failures_total`. Valid in `tls:` and per
   listener.
 
+### Fixed
+
+- **A `6xx` ends a sequential control-plane `dial`.** A bridging dial
+  (`on_answer: "bridge"`) and a sequential `originate {aor}` moved on to their
+  next target after a `600`/`603`/`604`/`606`, ringing the person who had just
+  declined through another route, and a parallel one let its other phones
+  ring on. A `6xx` is global: the callee will not take the call anywhere
+  (RFC 3261 §21.6), and a proxy MUST NOT start new branches after one and
+  SHOULD CANCEL the pending ones (§16.7 step 5). The dial now ends with that
+  `6xx` in `DialFailed`, and a parallel one CANCELs the phones still ringing
+  (reported `DialBranchFailed` cause `cancelled`). A connecting sequential
+  dial already stopped on a `6xx` with the default reroute causes; it now does
+  even where `lcr.reroute_causes` lists one.
 ### Changed
 
 - `tls.verify_client: true` without `tls.client_ca`, on a TLS or WSS listener

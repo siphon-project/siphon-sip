@@ -1107,6 +1107,16 @@ impl Call {
     /// (``<sip:trunk-7@sbc.example.net:5061;transport=tls>``); an empty or
     /// invalid RFC 3261 user raises ``bad_request``.
     ///
+    /// Either form may carry ``"reroute_after_progress"``, a ``bool`` (anything
+    /// else raises ``TypeError``), sent only when given. The server's default
+    /// is ``True``: a sequential dial moves on when a phone rings out or is
+    /// busy. ``False`` ends a sequential dial on that target once it has rung
+    /// (sent a 101-199): its ring timeout, busy or other failure is the dial's,
+    /// and no later target is rung. For a hunt across several routes to the
+    /// same destination. A target that never rang, and a ``503`` carrying
+    /// ``Retry-After``, still move the hunt on; a ``6xx`` ends a sequential dial
+    /// whatever the flag says. A parallel dial ignores it.
+    ///
     /// ``strategy`` is ``"parallel"`` or ``"sequential"`` and ``timeout`` is the
     /// ring timeout in seconds; each left out takes the server's own default
     /// (parallel, 30 s). ``headers`` is applied to every branch's INVITE.

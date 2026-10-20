@@ -1531,7 +1531,7 @@ was dialled for.
 
 A target is a URI string, `{uri, next_hop?, headers?}`, or `{aor}`, and either
 object form may also carry `from?`, `from_display?`, `p_asserted_identity?` and
-`privacy?` for that branch alone. Either form may also carry `to?`, the called
+`privacy?` for that branch alone, and `reroute_after_progress?` (see *when a sequential dial stops*, below). Either form may also carry `to?`, the called
 party the branch is addressed to, on every contact an `aor` forks to (see
 [naming the called party](#naming-the-called-party)), `contact_host?`, the
 host siphon presents in its own Contact on the branch (see
@@ -1609,6 +1609,55 @@ ringback. That refusal carries
 where `call_state` is the state the call was found in, so a controller can tell
 it from any other `invalid_state` without reading the message. A caller the app answered on purpose, to play it prompts first, is
 what `on_answer: "bridge"` is for.
+
+**When a sequential dial stops.** A `sequential` dial tries its targets one at
+a time and, by default, moves on when one ends unanswered. A connecting dial
+moves on when a target rings out or fails with a reroute cause (`408`, `500`,
+`502`, `503`, `504` unless `lcr.reroute_causes` says otherwise) and ends on any
+other failure, a `486` included; a bridging dial moves on from any failure.
+Two things end the dial on the target that just failed instead, with that
+target's own code in `DialFailed`, and no later target is rung:
+
+- **a `6xx`**, from any target, whatever it says. It is global: the callee is
+  known and will not take the call anywhere (RFC 3261 §21.6), and a proxy MUST
+  NOT start new branches after one (§16.7 step 5). On a `parallel` dial a `6xx`
+  also CANCELs the branches still ringing.
+- **a target that rang, with `reroute_after_progress: false`.** Either target
+  form (`{uri}` or `{aor}`, which hands it to every contact) may carry
+  `reroute_after_progress`, a boolean, default `true`. Set to `false`, a
+  target that has shown progress — a `101`-`199` from the far end, not the
+  hop-by-hop `100` — ends the dial on whatever comes next: its ring timeout
+  (`408`, `timed_out: true`), a busy, a decline, a `408` or a `503`. This is
+  the setting for a hunt across several routes to the **same** destination
+  (redundant SBCs or proxies in front of one PBX): once a route has rung the
+  person, the next route would only ring them again, and retry a busy.
+
+Two outcomes still move a `reroute_after_progress: false` target on:
+
+- a target that **never rang**: no response before its ring timeout, an
+  INVITE the transport would not take, or a failure before any `101`-`199`.
+  It reached nobody, which is exactly when the next route should be tried.
+- a **`503` carrying `Retry-After`**, even after progress. That is the element
+  saying it is overloaded or down for maintenance (RFC 3261 §21.5.4), the case
+  a redundant proxy is there for, not the callee's answer. A `503` without
+  `Retry-After` after progress ends the dial.
+
+The field is the one a [`route`](#route) target has, pointing the same way
+(`false` keeps the call on a target that rang). Two differences: its default on
+`dial` is `true`, since a hunt through phones moves on when a phone rings out,
+and on `dial` it also covers a target's final failures, where a `route` carrier
+that rang still fails over on its reroute causes. A `parallel` dial ignores it:
+there is no next target to stop. Anything but a boolean is `bad_request` before
+anything is rung.
+
+```json
+{ "verb": "dial", "target": { "channel": "ch_caller" },
+  "args": { "strategy": "sequential", "timeout": 25,
+            "targets": [ { "uri": "sip:204@pbx.example", "next_hop": "sip:192.0.2.21:5060",
+                           "reroute_after_progress": false },
+                         { "uri": "sip:204@pbx.example", "next_hop": "sip:192.0.2.22:5060",
+                           "reroute_after_progress": false } ] } }
+```
 
 ### `dial {on_answer: "bridge"}` — ring phones for an answered caller
 

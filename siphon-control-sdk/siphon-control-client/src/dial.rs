@@ -57,6 +57,9 @@ pub enum DialTarget {
         /// User part of siphon's own Contact on this branch. See
         /// [`DialTarget::contact_user`].
         contact_user: Option<String>,
+        /// Whether a sequential dial moves on from this target once it has
+        /// rung. See [`DialTarget::reroute_after_progress`].
+        reroute_after_progress: Option<bool>,
         /// Media profile for this branch alone. See [`DialTarget::profile`].
         profile: Option<String>,
         /// When this branch's INVITE carries its offer. See
@@ -88,6 +91,9 @@ pub enum DialTarget {
         /// User part of siphon's own Contact on every branch the AoR expands
         /// to. See [`DialTarget::contact_user`].
         contact_user: Option<String>,
+        /// Whether a sequential dial moves on from any branch the AoR expands
+        /// to once it has rung. See [`DialTarget::reroute_after_progress`].
+        reroute_after_progress: Option<bool>,
         /// Media profile for every branch the AoR expands to. See
         /// [`DialTarget::profile`].
         profile: Option<String>,
@@ -128,6 +134,7 @@ impl DialTarget {
             route: Vec::new(),
             contact_host: None,
             contact_user: None,
+            reroute_after_progress: None,
             profile: None,
             offer: None,
         }
@@ -148,6 +155,7 @@ impl DialTarget {
             route: Vec::new(),
             contact_host: None,
             contact_user: None,
+            reroute_after_progress: None,
             profile: None,
             offer: None,
         }
@@ -181,6 +189,7 @@ impl DialTarget {
             route: route.into_iter().map(Into::into).collect(),
             contact_host: None,
             contact_user: None,
+            reroute_after_progress: None,
             profile: None,
             offer: None,
         }
@@ -196,6 +205,7 @@ impl DialTarget {
             to: None,
             contact_host: None,
             contact_user: None,
+            reroute_after_progress: None,
             profile: None,
             offer: None,
         }
@@ -308,6 +318,30 @@ impl DialTarget {
         self
     }
 
+    /// Whether a sequential dial still moves on from this target (from every
+    /// branch an AoR expands to) once it has rung: sent the far end's 101-199.
+    ///
+    /// The server's default is `true`, a hunt through phones moving on when
+    /// one rings out or is busy. `false` makes this target's outcome the
+    /// dial's once it has rung: its ring timeout, busy, decline or other
+    /// failure ends the dial and no later target is rung, for a hunt across
+    /// several routes to the same destination. A target that never rang, and
+    /// a `503` carrying `Retry-After`, still move the hunt on; a `6xx` ends a
+    /// sequential dial whatever this says. A parallel dial ignores it.
+    pub fn reroute_after_progress(mut self, reroute: bool) -> Self {
+        match &mut self {
+            Self::Uri {
+                reroute_after_progress,
+                ..
+            }
+            | Self::Aor {
+                reroute_after_progress,
+                ..
+            } => *reroute_after_progress = Some(reroute),
+        }
+        self
+    }
+
     /// Media profile for this branch alone (every branch an AoR expands to),
     /// over the dial's own. A target without one inherits the dial's.
     ///
@@ -355,7 +389,16 @@ impl DialTarget {
 
     pub(crate) fn to_json(&self) -> serde_json::Value {
         let mut object = serde_json::Map::new();
-        let (headers, identity, to, contact_host, contact_user, profile, offer) = match self {
+        let (
+            headers,
+            identity,
+            to,
+            contact_host,
+            contact_user,
+            profile,
+            offer,
+            reroute_after_progress,
+        ) = match self {
             Self::Uri {
                 uri,
                 next_hop,
@@ -367,6 +410,7 @@ impl DialTarget {
                 contact_user,
                 profile,
                 offer,
+                reroute_after_progress,
             } => {
                 // A bare URI with no overrides is a plain string on the wire —
                 // the shape the server's own examples use. An identity counts
@@ -381,6 +425,7 @@ impl DialTarget {
                     && contact_user.is_none()
                     && profile.is_none()
                     && offer.is_none()
+                    && reroute_after_progress.is_none()
                 {
                     return json!(uri);
                 }
@@ -399,6 +444,7 @@ impl DialTarget {
                     contact_user,
                     profile,
                     offer,
+                    reroute_after_progress,
                 )
             }
             Self::Aor {
@@ -410,6 +456,7 @@ impl DialTarget {
                 contact_user,
                 profile,
                 offer,
+                reroute_after_progress,
             } => {
                 object.insert("aor".to_string(), json!(aor));
                 (
@@ -420,9 +467,13 @@ impl DialTarget {
                     contact_user,
                     profile,
                     offer,
+                    reroute_after_progress,
                 )
             }
         };
+        if let Some(reroute) = reroute_after_progress {
+            object.insert("reroute_after_progress".to_string(), json!(reroute));
+        }
         if let Some(to) = to {
             object.insert("to".to_string(), json!(to));
         }
@@ -1138,6 +1189,7 @@ mod tests {
             route: vec!["<sip:scscf.example.test;lr>".to_string()],
             contact_host: None,
             contact_user: None,
+            reroute_after_progress: None,
             profile: None,
             offer: None,
         };
@@ -1265,6 +1317,39 @@ mod tests {
             .to_json()
             .get("contact_user")
             .is_none());
+    }
+
+    /// `reroute_after_progress` defeats the bare-string shortcut and goes out
+    /// on either form as given, `false` included; left unset it stays off the
+    /// wire and the server's default applies.
+    #[test]
+    fn a_targets_reroute_after_progress_goes_out_only_when_set() {
+        assert_eq!(
+            DialTarget::uri("sip:204@pbx.example").to_json(),
+            json!("sip:204@pbx.example")
+        );
+        assert_eq!(
+            DialTarget::uri_via("sip:204@pbx.example", "sip:192.0.2.21:5060")
+                .reroute_after_progress(false)
+                .to_json(),
+            json!({
+                "uri": "sip:204@pbx.example",
+                "next_hop": "sip:192.0.2.21:5060",
+                "reroute_after_progress": false
+            })
+        );
+        assert_eq!(
+            DialTarget::uri("sip:204@pbx.example")
+                .reroute_after_progress(true)
+                .to_json(),
+            json!({"uri": "sip:204@pbx.example", "reroute_after_progress": true})
+        );
+        assert_eq!(
+            DialTarget::aor("sip:204@pbx.example")
+                .reroute_after_progress(false)
+                .to_json(),
+            json!({"aor": "sip:204@pbx.example", "reroute_after_progress": false})
+        );
     }
 
     /// A media profile defeats the bare-string shortcut on either target form,

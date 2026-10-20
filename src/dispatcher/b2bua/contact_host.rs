@@ -29,14 +29,16 @@ pub(crate) fn checked_contact_host(value: &str) -> Result<String, String> {
 
 /// Check every target's `contact_host` and store it as the Contact carries it,
 /// before any branch is sent: a host siphon cannot put on the wire refuses the
-/// dial before anything rings, as a `to` does ([`branch_called_parties`]).
+/// dial before anything rings, as a `to` does ([`branch_called_parties`]). Its
+/// `contact_user` is checked the same way, here, so no dial path can check one
+/// and not the other ([`super::contact_user::check_branch_contact_users`]).
 pub(super) fn check_branch_contact_hosts(targets: &mut [DialTarget]) -> Result<(), String> {
     for target in targets.iter_mut() {
         if let Some(host) = target.contact_host.as_deref() {
             target.contact_host = Some(checked_contact_host(host)?);
         }
     }
-    Ok(())
+    super::contact_user::check_branch_contact_users(targets)
 }
 
 /// [`b2bua_originate_prepare`] presenting `contact_host` as the host and
