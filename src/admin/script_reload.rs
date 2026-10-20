@@ -110,6 +110,7 @@ mod tests {
             script_engine: None,
             script_config: None,
             config_reloader: None,
+            credential_cache: None,
             ui_enabled: false,
         }
     }

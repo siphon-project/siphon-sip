@@ -115,6 +115,7 @@ pub(super) fn start_admin_api(
                     script_engine: Some(Arc::clone(engine)),
                     script_config: Some(Arc::clone(script_config)),
                     config_reloader,
+                    credential_cache: crate::auth::credential_cache::installed().cloned(),
                     // Overwritten by `router` from its own argument;
                     // set here only to satisfy the initializer.
                     ui_enabled: false,

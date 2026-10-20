@@ -6,8 +6,9 @@
 //!
 //! The *server* side (challenging incoming requests) lives in
 //! `crate::script::api::auth`; the credential sources it verifies against are
-//! in [`server`].
+//! in [`server`], and the cache in front of them in [`credential_cache`].
 
+pub mod credential_cache;
 pub(crate) mod server;
 
 use std::fmt;

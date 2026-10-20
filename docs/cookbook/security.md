@@ -314,7 +314,25 @@ user = request.auth_user        # the authenticated username afterwards
 ```
 
 The `auth.backend` can be `static`, `http` (REST credential lookup), `database`, or
-`diameter_cx` (IMS HSS). For REGISTER-time account-takeover protection, set
+`diameter_cx` (IMS HSS).
+
+With `http` or `database`, set `cache_ttl_secs` so a registration storm does not
+become one backend lookup per REGISTER. The cache is keyed by realm and username.
+When a credential changes you do not have to wait out the TTL: a digest that fails
+against a cached credential re-reads the backend once, so a reset password works on
+the next REGISTER and a user the backend no longer knows is refused. A deleted user
+whose old password still matches the cached entry is the one case that needs a flush.
+Have whatever writes credentials call the admin API as it writes:
+
+```bash
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  -d '{"realm":"example.com","username":"1001"}' \
+  http://127.0.0.1:9091/admin/auth/cache/invalidate     # one user
+# {"realm":"example.com"} flushes one realm, {} flushes everything.
+# 204 on success, 404 when caching is off.
+```
+
+For REGISTER-time account-takeover protection, set
 `registrar.enforce_auth_aor_match: true` so a subscriber can't bind a Contact under
 someone else's AoR.
 

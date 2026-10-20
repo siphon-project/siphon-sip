@@ -45,6 +45,13 @@ entry, but a working config keeps working.
   carries the last failure's status, in `@registration.on_change` too. The
   Rust, Python and TypeScript control SDKs model the new fields, event and
   verbs.
+- **`POST /admin/auth/cache/invalidate`** drops cached digest credentials
+  (`auth.http` / `auth.database`): `{"realm","username"}` for one user,
+  `{"realm"}` for one realm, `{}` for all. `204`, or `404 {"error":"no
+  credential cache"}` when caching is off. Behind the admin bearer token like the
+  other mutating routes. A controller can flush on every credential write and keep
+  a long `cache_ttl_secs`.
+
 - **`probe_listener` on a gateway group.** `gateway.groups[].probe_listener:
   "192.0.2.10:15068"` sends the group's OPTIONS probes from that listener and
   puts its identity in their Via, From and Contact: a UDP probe is written to
@@ -148,6 +155,16 @@ entry, but a working config keeps working.
   listener.
 
 ### Fixed
+
+- **Digest credential cache keyed without the realm, and stale for the whole
+  TTL.** The `auth.http` / `auth.database` cache keyed on the username alone while
+  the database query binds the realm, so two realms with the same username shared
+  one entry and one tenant's phone was checked against the other's hash. It is now
+  keyed by realm and username (and the H(A1) column). A changed password was
+  refused, and scored by `failed_auth_ban`, until the entry expired: a digest that
+  fails against a cached credential now re-reads the backend once, accepts the new
+  credential, and refuses and drops a user the backend no longer knows. A lookup
+  the cache missed is still made once.
 
 - **A listener's `advertise` is that listener's, not its transport's.** The
   first listener of a transport with an `advertise` lent it to every listener

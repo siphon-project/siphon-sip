@@ -926,6 +926,12 @@ pub fn inject_python_singletons(config: &Config) {
         );
     }
 
+    // Register the credential cache so `POST /admin/auth/cache/invalidate`
+    // can flush it. Absent when caching is off, which the route reports.
+    if let Some(cache) = py_auth.credential_cache() {
+        crate::auth::credential_cache::install(cache);
+    }
+
     // Wire AKA credentials for local Milenage auth (IMS P-CSCF)
     if !config.auth.aka_credentials.is_empty() {
         py_auth.set_aka_credentials(config.auth.aka_credentials.clone());
