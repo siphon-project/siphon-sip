@@ -13,6 +13,26 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
+### Added
+
+- **Diameter: `diameter.originate` sends a request this node starts on a
+  connection it already has, and awaits its answer.** A node in server mode
+  can now run the procedures that begin at the server, such as an HSS's
+  Cancel-Location, Insert-Subscriber-Data, Delete-Subscriber-Data and Reset
+  (TS 29.272) or an S6c Alert-Service-Centre (TS 29.338). The connection is
+  the serving connection that last carried a request from the destination
+  host, else one that carried a request from its realm, else a named peer.
+  The caller gives the AVPs after the envelope as `set_avp` tuples, with an
+  optional fourth element to set or clear the M bit. The answer is a
+  `DiameterAnswer`; no connection, a timeout and a lost connection raise
+  `LookupError`, `TimeoutError` and `ConnectionError`.
+
+### Fixed
+
+- **Diameter: a request waiting on a connection that closes fails at once**
+  instead of at its timeout, so a caller tells a lost connection from a peer
+  that does not answer.
+
 ## [1.15.0] — 2026-10-19
 
 ### Added

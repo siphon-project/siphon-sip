@@ -378,9 +378,12 @@ fn build_avp(code: u32, vendor: u32, value: &Bound<'_, PyAny>) -> PyResult<Avp> 
     Ok(Avp::raw(code, vendor, raw))
 }
 
-/// Parse one grouped child spec — a `(code_or_name, value)` or
-/// `(code_or_name, value, vendor)` tuple — into an [`Avp`].
-fn build_child_spec(spec: &Bound<'_, PyAny>) -> PyResult<Avp> {
+/// Parse one grouped child spec — a `(code_or_name, value)`,
+/// `(code_or_name, value, vendor)` or `(code_or_name, value, vendor,
+/// mandatory)` tuple — into an [`Avp`]. `mandatory` sets or clears the M bit
+/// the dictionary would give, for an AVP it does not know (a table that marks
+/// the M bit "must not" for it, TS 29.272 table 7.3.1/1 CLR-Flags for one).
+pub(crate) fn build_child_spec(spec: &Bound<'_, PyAny>) -> PyResult<Avp> {
     let tuple = spec.cast::<PyTuple>().map_err(|_| {
         pyo3::exceptions::PyTypeError::new_err(
             "grouped AVP children must be (code, value) or (code, value, vendor) tuples",
@@ -403,7 +406,16 @@ fn build_child_spec(spec: &Bound<'_, PyAny>) -> PyResult<Avp> {
     } else {
         name_vendor
     };
-    build_avp(code, vendor, &value)
+    let mut avp = build_avp(code, vendor, &value)?;
+    if tuple.len() >= 4 {
+        let mandatory: bool = tuple.get_item(3)?.extract()?;
+        avp.flags = if mandatory {
+            avp.flags | crate::diameter::codec::AVP_FLAG_MANDATORY
+        } else {
+            avp.flags & !crate::diameter::codec::AVP_FLAG_MANDATORY
+        };
+    }
+    Ok(avp)
 }
 
 // ── PyDiameterAnswer ────────────────────────────────────────────────────────
