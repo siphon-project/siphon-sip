@@ -33,6 +33,20 @@ entry, but a working config keeps working.
 
 ### Fixed
 
+- **QoS: `qos.media_flows_from_sdp` follows TS 29.213 table 6.2.1 for
+  Flow-Status.** Every component names it, `enabled` included: it was left out
+  for sendrecv or no direction attribute, and on an Rx update an absent
+  Flow-Status means unchanged (TS 29.214 §5.3.16), so a stream resumed from
+  hold kept its gates held. The direction comes from the offer and the answer
+  (NOTE 5: the answer's, but `a=inactive` in the offer wins) instead of the
+  UE's own SDP, with the session-level attribute for a media line without one.
+  A negotiated `a=rtcp-mux` and TCP, TCP/MSRP or UDP/DTLS/SCTP transport give
+  `enabled`. A port-0 line is reported as `removed` with no flows instead of
+  being skipped, and `number` is the ordinal of the `m=` line, so it no longer
+  renumbers the components after it. Rx and N5 (`fStatus`) carry the same
+  values. A script that counted on port-0 lines being left out, or on
+  `flow_status` being absent, sees the change.
+
 - **Diameter: an AVP value of the wrong shape is refused before sending.**
   `diameter.originate` and `set_avp` raise `TypeError` for a list given to an
   AVP the dictionary does not type as grouped, a str or int given to a grouped
