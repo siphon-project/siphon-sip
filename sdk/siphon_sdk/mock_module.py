@@ -8184,9 +8184,18 @@ class MockDiameterAvp:
             number has no name.
         value: The value as ``get_avp`` returns it, or for a grouped AVP a
             list of ``DiameterAvp``.
+        flags: The flags octet of the AVP header: V ``0x80``, M ``0x40``,
+            P ``0x20``. The mock gives every AVP the M bit and, for a
+            non-zero vendor, the V bit, unless the test says otherwise.
+        mandatory: Whether the M bit is set.
+        vendor_specific: Whether the V bit is set.
     """
 
-    def __init__(self, code: Union[int, str], vendor: int, value: Any) -> None:
+    def __init__(self, code: Union[int, str], vendor: int, value: Any,
+                 flags: Optional[int] = None) -> None:
+        if flags is None:
+            flags = 0x40 | (0x80 if vendor else 0)
+        self.flags = flags
         self.code = code
         self.vendor = vendor
         self.name = code if isinstance(code, str) else None
@@ -8196,6 +8205,14 @@ class MockDiameterAvp:
                 for child in value
             ]
         self.value = value
+
+    @property
+    def mandatory(self) -> bool:
+        return bool(self.flags & 0x40)
+
+    @property
+    def vendor_specific(self) -> bool:
+        return bool(self.flags & 0x80)
 
     def __repr__(self) -> str:
         return (f"DiameterAvp(name={self.name!r}, code={self.code!r}, "
@@ -8356,6 +8373,11 @@ class MockDiameterRequest:
     """Mock ``DiameterRequest`` passed to ``@diameter.on_request`` in tests.
 
     Construct one in your test and invoke your handler with it.
+
+    The mock has no dictionary, so the AVPs the real dictionary would not
+    know are given apart, as ``unknown_avps=[(code, vendor, value,
+    mandatory), ...]``: :meth:`unknown_avps` lists them and
+    :meth:`reject_unsupported_avps` refuses the ones with ``mandatory``.
     """
 
     def __init__(self, *, application_name: str = "S6c", command_code: int = 0,
@@ -8363,7 +8385,9 @@ class MockDiameterRequest:
                  dest_realm: Optional[str] = None, dest_host: Optional[str] = None,
                  origin_host: Optional[str] = None, origin_realm: Optional[str] = None,
                  peer: Optional[MockPeer] = None, avps: Optional[dict] = None,
-                 application_id: int = 0) -> None:
+                 application_id: int = 0,
+                 unknown_avps: Optional[list] = None) -> None:
+        self._unknown = [tuple(entry) for entry in (unknown_avps or [])]
         self.application_id = application_id
         self.application_name = application_name
         self.command_code = command_code
@@ -8420,6 +8444,37 @@ class MockDiameterRequest:
 
     def extract_imsi(self) -> Optional[str]:
         return self._avps.get((1, 0))
+
+    def unknown_avps(self) -> list:
+        """The AVPs the dictionary does not define, as :class:`MockDiameterAvp`
+        objects with ``name`` None and ``mandatory`` as given."""
+        return [
+            MockDiameterAvp(code, vendor, value,
+                            flags=(0x40 if mandatory else 0) | (0x80 if vendor else 0))
+            for code, vendor, value, mandatory in self._unknown
+        ]
+
+    def reject_unsupported_avps(self, understood: Optional[list] = None) -> Optional[MockDiameterAnswer]:
+        """The DIAMETER_AVP_UNSUPPORTED (5001) answer, with a Failed-AVP (279)
+        holding every unknown AVP with the M bit that ``understood`` does not
+        list, or ``None`` when there is none (RFC 6733 sections 4.1 and
+        7.1.5). ``understood`` lists codes (vendor 0) or ``(code, vendor)``
+        tuples."""
+        claimed = set()
+        for item in understood or []:
+            if isinstance(item, int):
+                claimed.add((item, 0))
+            elif isinstance(item, tuple) and len(item) == 2:
+                claimed.add((item[0], item[1]))
+            else:
+                raise TypeError("understood lists AVP codes or (code, vendor) tuples")
+        failed = [(code, value, vendor) for code, vendor, value, mandatory in self._unknown
+                  if mandatory and (code, vendor) not in claimed]
+        if not failed:
+            return None
+        answer = self.answer(5001)
+        answer.set_avp(279, failed)
+        return answer
 
     def answer(self, result_code: int = 2001, error_message: Optional[str] = None) -> MockDiameterAnswer:
         """Build a local answer to serve this request (HSS-style). Populate it

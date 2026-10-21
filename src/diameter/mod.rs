@@ -40,6 +40,7 @@ pub mod server;
 pub mod sgd;
 pub mod sh;
 pub mod transport;
+pub mod unknown_avp;
 
 use std::sync::Arc;
 

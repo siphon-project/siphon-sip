@@ -558,6 +558,47 @@ for avp in request.avps():
 
 ::: siphon_sdk.mock_module.MockDiameterAvp
 
+### AVP flags and AVPs the dictionary does not define
+
+Each `DiameterAvp` carries the flags octet it was received with (`flags`),
+and `mandatory` and `vendor_specific` read the M and V bits out of it.
+`request.unknown_avps()` lists the AVPs of the request the dictionary does
+not define, at the top level and inside the grouped AVPs it does define.
+
+RFC 6733 section 4.1 has a receiver that does not understand an AVP with the
+M bit refuse the message, with DIAMETER_AVP_UNSUPPORTED (5001) and the AVP in
+a Failed-AVP (section 7.1.5), and has relay and redirect agents let unknown
+AVPs through. siphon does not answer 5001 on its own: the same
+`@diameter.on_request` path carries relays, and a handler can read an AVP the
+dictionary does not define by its code. An end server asks for the answer
+instead, naming what it reads beyond the dictionary:
+
+```python
+@diameter.on_request("Gx:CCR")
+def credit_control(request):
+    refusal = request.reject_unsupported_avps(understood=[(4242, 10415)])
+    if refusal is not None:
+        return refusal
+    ...
+```
+
+`reject_unsupported_avps` returns `None` when there is nothing to refuse. The
+Failed-AVP holds each offending AVP as received; one inside a grouped AVP
+comes inside that group, holding it alone, so that the peer can tell where it
+was (section 7.5). An unknown AVP without the M bit is not refused.
+
+## Policy AVPs: Gx and Rx
+
+The dictionary holds every AVP of TS 29.212 and TS 29.214 table 5.3.0.1
+(Rel-18), and the 3GPP-* attributes of TS 29.061 their re-used tables take
+over (3GPP-SGSN-MCC-MNC, 3GPP-User-Location-Info, 3GPP-MS-TimeZone and the
+rest), each sent with the M bit its table gives it. So a PCRF sets
+Revalidation-Time, 3GPP-PS-Data-Off-Status, Usage-Monitoring-Information,
+RR-Bandwidth, RS-Bandwidth, Min-Requested-Bandwidth-DL/UL,
+SIP-Forking-Indication or Acceptable-Service-Info by name. Left out are the
+four Float32 AVPs (Max-PLR-DL/UL, Desired-Max-Latency/Loss), a type the
+dictionary does not encode, and the Gxx, Sd and St AVPs.
+
 ## `DiameterAnswer`
 
 The value a handler returns via `request.answer(...)` / `request.reject(...)`.
