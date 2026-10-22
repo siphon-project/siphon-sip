@@ -634,6 +634,14 @@
         "doc": "The AVP code.",
         "kind": "getset_descriptor"
       },
+      "flags": {
+        "doc": "The flags octet of the AVP header as received: V 0x80, M 0x40, P 0x20.",
+        "kind": "getset_descriptor"
+      },
+      "mandatory": {
+        "doc": "Whether the M bit is set: the receiver must understand the AVP or",
+        "kind": "getset_descriptor"
+      },
       "name": {
         "doc": "The dictionary name, or None for an AVP the dictionary does not know.",
         "kind": "getset_descriptor"
@@ -644,6 +652,10 @@
       },
       "vendor": {
         "doc": "The Vendor-Id, 0 for a base AVP.",
+        "kind": "getset_descriptor"
+      },
+      "vendor_specific": {
+        "doc": "Whether the V bit is set, so that the header carries `vendor`.",
         "kind": "getset_descriptor"
       }
     },
@@ -987,6 +999,11 @@
         "kind": "method_descriptor",
         "sig": "($self, result_code, error_message=None)"
       },
+      "reject_unsupported_avps": {
+        "doc": "The DIAMETER_AVP_UNSUPPORTED (5001) answer for a request carrying an",
+        "kind": "method_descriptor",
+        "sig": "($self, understood=None)"
+      },
       "remove_avp": {
         "kind": "method_descriptor",
         "sig": "($self, code_or_name, vendor=0)"
@@ -997,6 +1014,11 @@
       "set_avp": {
         "kind": "method_descriptor",
         "sig": "($self, code_or_name, value, vendor=0)"
+      },
+      "unknown_avps": {
+        "doc": "The AVPs of the request the dictionary does not define, as",
+        "kind": "method_descriptor",
+        "sig": "($self)"
       }
     },
     "EnumAnswer": {

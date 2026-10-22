@@ -31,6 +31,24 @@ entry, but a working config keeps working.
 - **Diameter: Flow-Information, Flow-Direction and Called-Station-Id in the
   dictionary**, so a Gx rule installation and a CCR-I are built by name.
 
+- **Diameter: every Gx and Rx AVP in the dictionary.** The AVPs of TS 29.212
+  and TS 29.214 table 5.3.0.1 (Rel-18) and the 3GPP-* attributes of TS 29.061
+  their re-used tables take over, among them Revalidation-Time,
+  3GPP-PS-Data-Off-Status, RR-Bandwidth, RS-Bandwidth,
+  Min-Requested-Bandwidth-DL/UL, SIP-Forking-Indication and
+  Acceptable-Service-Info, each with the M bit its table gives it. A PCRF no
+  longer writes them as raw octets. The four Float32 AVPs are not included.
+  A script that read one of the newly defined AVPs by code gets it typed now:
+  an int for the integer ones and a list for the grouped ones, where it got
+  bytes before.
+
+- **Diameter: AVP flags and unknown AVPs for scripts.** `DiameterAvp.flags`,
+  `.mandatory` and `.vendor_specific`; `DiameterRequest.unknown_avps()`;
+  and `DiameterRequest.reject_unsupported_avps(understood=None)`, the
+  DIAMETER_AVP_UNSUPPORTED (5001) answer with Failed-AVP for an unknown AVP
+  with the M bit (RFC 6733 sections 4.1 and 7.1.5), or `None`. siphon does not
+  answer 5001 by itself, since a relay must let unknown AVPs through.
+
 ### Fixed
 
 - **Awaitable script APIs no longer create a Python thread state per call.**

@@ -17,6 +17,13 @@
 #   frame 5   Gx Re-Auth-Request with a rule      (TS 29.212 clause 5.6.4)
 #   frames 6-8 Gx CCR-I, CCR-U, CCR-T on one session (TS 29.212 clause 5.6.2)
 #   frames 9-11 S6a CLR, IDR, DSR                 (TS 29.272 clauses 7.2.7, 7.2.9, 7.2.11)
+#   frame 12  Gx CCR-U reporting PS Data Off      (TS 29.212 clause 4.5.32)
+#   frame 13  Gx RAR with a revalidation time     (TS 29.212 clause 4.5.8)
+#   frame 14  Rx AA-Request with RTCP bandwidths  (TS 29.214 clause 5.6.1)
+#
+# The M and V bits of the policy AVPs are checked against TS 29.212 and
+# TS 29.214 table 5.3.0.1 and TS 29.061 table 9a (Rel-18), not against
+# Wireshark's dictionary, which has some of them wrong.
 #
 #   scripts/validate_diameter_originate.sh
 #
@@ -256,6 +263,60 @@ expect_flags 9 1638 "0x80"
 expect 10 diameter.Subscriber-Status 0
 expect 10 diameter.IDR-Flags 1
 expect 11 diameter.DSR-Flags 8
+
+echo "Gx CCR-U reporting PS Data Off"
+envelope 12 272 16777238 "$PGW" "$EPC" "" "$EPC"
+expect 12 diameter.CC-Request-Type 2
+expect 12 diameter.Event-Trigger 55
+expect 12 diameter.3GPP-PS-Data-Off-Status-Gx 1
+expect 12 diameter.3GPP-SGSN-MCC-MNC 00101
+expect 12 diameter.Monitoring-Key 6d6b2d31
+expect 12 diameter.Usage-Monitoring-Level 0
+# V must, M must not: TS 29.212 table 5.3.0.1 for 2847, 1067, 1066 and 1068;
+# TS 29.061 table 9a for 3GPP-SGSN-MCC-MNC (18), -User-Location-Info (22)
+# and -MS-TimeZone (23).
+for code in 2847 18 22 23 1067 1066 1068; do
+  expect_flags 12 "$code" "0x80"
+done
+expect_flags 12 1006 "0xc0"
+if [[ -z "$(field 12 diameter.3GPP-User-Location-Info)" || -z "$(field 12 diameter.3GPP-MS-TimeZone)" ]]; then
+  echo "  FAIL frame 12: 3GPP-User-Location-Info or 3GPP-MS-TimeZone not read" >&2
+  status=1
+fi
+
+echo "Gx RAR with a revalidation time"
+envelope 13 258 16777238 "$PCRF" "$EPC" "$PGW" "$EPC"
+expect 13 diameter.Event-Trigger 17
+# M,V must (TS 29.212 table 5.3.0.1).
+expect_flags 13 1042 "0xc0"
+expect_flags 13 1043 "0xc0"
+revalidation="$(tshark -r "$PCAP" -Y 'frame.number == 13' -V -O diameter 2>/dev/null | grep -m1 'Revalidation-Time: ' || true)"
+if [[ "$revalidation" == *"Jan  1, 2026 00:00:00"* ]]; then
+  echo "  ok   frame 13 Revalidation-Time is 2026-01-01 00:00:00 UTC"
+else
+  echo "  FAIL frame 13 Revalidation-Time read as '$revalidation'" >&2
+  status=1
+fi
+
+echo "Rx AA-Request with RTCP bandwidths"
+envelope 14 265 16777236 "pcscf.$IMS" "$IMS" "" "$EPC"
+expect 14 diameter.Session-Id "$RX_SESSION"
+expect 14 diameter.RR-Bandwidth 2000
+expect 14 diameter.RS-Bandwidth 600
+expect 14 diameter.Min-Requested-Bandwidth-DL 12650
+expect 14 diameter.Min-Requested-Bandwidth-UL 12650
+expect 14 diameter.SIP-Forking-Indication 0
+expect 14 diameter.AF-Signalling-Protocol 1
+expect 14 diameter.Required-Access-Info 0
+# TS 29.214 table 5.3.0.1: RR-Bandwidth 521, RS-Bandwidth 522 and
+# SIP-Forking-Indication 523 M,V must; Min-Requested-Bandwidth-DL/UL 534/535,
+# AF-Signalling-Protocol 529 and Required-Access-Info 536 V must, M must not.
+for code in 521 522 523 517; do
+  expect_flags 14 "$code" "0xc0"
+done
+for code in 534 535 529 536; do
+  expect_flags 14 "$code" "0x80"
+done
 
 if [[ -n "$(tshark -r "$PCAP" -Y '_ws.malformed || _ws.expert' 2>/dev/null)" ]]; then
   echo "  FAIL tshark flagged a request as malformed or raised expert info:" >&2
