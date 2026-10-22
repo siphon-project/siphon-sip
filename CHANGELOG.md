@@ -75,8 +75,46 @@ entry, but a working config keeps working.
 - **`registrant.event_capacity`.** Sizes the outbound-registration
   state-change buffer. Default: the larger of 1024 and four per configured
   entry; a consumer that falls behind gets a snapshot.
+- **Diameter: every Gx and Rx AVP in the dictionary.** The AVPs of TS 29.212
+  and TS 29.214 table 5.3.0.1 (Rel-18) and the 3GPP-* attributes of TS 29.061
+  their re-used tables take over, among them Revalidation-Time,
+  3GPP-PS-Data-Off-Status, RR-Bandwidth, RS-Bandwidth,
+  Min-Requested-Bandwidth-DL/UL, SIP-Forking-Indication and
+  Acceptable-Service-Info, each with the M bit its table gives it. A PCRF no
+  longer writes them as raw octets. The four Float32 AVPs are not included.
+  A script that read one of the newly defined AVPs by code gets it typed now:
+  an int for the integer ones and a list for the grouped ones, where it got
+  bytes before.
+
+- **Diameter: AVP flags and unknown AVPs for scripts.** `DiameterAvp.flags`,
+  `.mandatory` and `.vendor_specific`; `DiameterRequest.unknown_avps()`;
+  and `DiameterRequest.reject_unsupported_avps(understood=None)`, the
+  DIAMETER_AVP_UNSUPPORTED (5001) answer with Failed-AVP for an unknown AVP
+  with the M bit (RFC 6733 sections 4.1 and 7.1.5), or `None`. siphon does not
+  answer 5001 by itself, since a relay must let unknown AVPs through.
 
 ### Fixed
+
+- **QoS: `qos.media_flows_from_sdp` follows TS 29.213 table 6.2.1 for
+  Flow-Status.** Every component names it, `enabled` included: it was left out
+  for sendrecv or no direction attribute, and on an Rx update an absent
+  Flow-Status means unchanged (TS 29.214 §5.3.16), so a stream resumed from
+  hold kept its gates held. The direction comes from the offer and the answer
+  (NOTE 5: the answer's, but `a=inactive` in the offer wins) instead of the
+  UE's own SDP, with the session-level attribute for a media line without one.
+  A negotiated `a=rtcp-mux` and TCP, TCP/MSRP or UDP/DTLS/SCTP transport give
+  `enabled`. A port-0 line is reported as `removed` with no flows instead of
+  being skipped, and `number` is the ordinal of the `m=` line, so it no longer
+  renumbers the components after it. Rx and N5 (`fStatus`) carry the same
+  values. A script that counted on port-0 lines being left out, or on
+  `flow_status` being absent, sees the change.
+- **Awaitable script APIs no longer create a Python thread state per call.**
+  `future_into_py` completed on a runtime pyo3-async-runtimes built for itself,
+  whose threads had no pinned thread state, so every completion created and
+  destroyed one: on free-threaded Python a mimalloc heap set up and collected
+  per request, with `munmap`s, page zeroing and `mm` lock contention. The
+  server now hands its own runtime to pyo3-async-runtimes. In a relay doing a
+  Diameter request per script call this cut CPU per request by roughly 40 %.
 
 - **Diameter: an AVP value of the wrong shape is refused before sending.**
   `diameter.originate` and `set_avp` raise `TypeError` for a list given to an

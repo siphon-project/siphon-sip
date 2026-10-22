@@ -6,6 +6,7 @@
 mod admin_start;
 mod bootstrap;
 pub mod config_reload;
+mod python_thread;
 mod shutdown_sequence;
 use shutdown_sequence::run_shutdown_sequence;
 mod event_clock;
@@ -23,6 +24,7 @@ mod tests;
 pub use bootstrap::li_manager;
 
 use bootstrap::*;
+use python_thread::*;
 
 use std::sync::Arc;
 
@@ -363,6 +365,15 @@ impl SiphonServer {
                 eprintln!("Failed to create tokio runtime: {error}");
                 std::process::exit(1);
             });
+        // It lives for the process either way; 'static so pyo3-async-runtimes
+        // can complete awaitables on it. See `share_runtime_with_python`.
+        let runtime: &'static tokio::runtime::Runtime = Box::leak(Box::new(runtime));
+        if !share_runtime_with_python(runtime) {
+            tracing::warn!(
+                "pyo3-async-runtimes already had a runtime: awaitable script APIs \
+                 complete on threads without a pinned Python thread state"
+            );
+        }
 
         runtime.block_on(self.run_async());
     }

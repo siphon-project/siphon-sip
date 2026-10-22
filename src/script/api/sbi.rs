@@ -616,7 +616,7 @@ fn components_to_map(components: Vec<MediaComponent>) -> Option<IndexMap<String,
 /// Parse a Python list of dicts into a `Vec<sbi::npcf::MediaComponent>`.
 /// Mirrors the dict shape consumed by ``diameter.rx_aar`` but emits the
 /// camelCase / UPPER_SNAKE strings the Npcf API requires.
-fn parse_sbi_media_components(obj: &Bound<'_, PyAny>) -> PyResult<Vec<MediaComponent>> {
+pub(super) fn parse_sbi_media_components(obj: &Bound<'_, PyAny>) -> PyResult<Vec<MediaComponent>> {
     let list = obj.cast::<PyList>().map_err(|_| {
         pyo3::exceptions::PyTypeError::new_err("media_components must be a list of dicts")
     })?;

@@ -60,6 +60,14 @@ jobs:
             server::tests::reaped_thread_releases_its_python_thread_state \
             --test-threads=1 --nocapture
 
+      # pyo3-async-runtimes holds one runtime per process, so this one also
+      # needs the process to itself.
+      - name: Awaitables complete on pinned threads (needs the process to itself)
+        run: |
+          PYO3_PYTHON=python3.14 cargo test --lib ${{ matrix.flags }} -- --ignored --exact \
+            server::tests::awaitables_complete_on_pinned_threads \
+            --test-threads=1 --nocapture
+
   # ── Formatting gate ─────────────────────────────────────────────────────
   # `cargo fmt --all -- --check` on rustfmt defaults — no `rustfmt.toml`, which
   # is what siphon-rtp does, so the two repos format identically. Needs no
