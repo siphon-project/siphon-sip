@@ -8251,7 +8251,7 @@ class MockRegistration:
         entry = self._entries.get(aor)
         return list(entry.get("associated_uris", [])) if entry else []
 
-    def flow(self, aor: str, ue_ip: Optional[str] = None):
+    def flow(self, aor: str, ue_ip: Optional[str] = None) -> "Optional[Flow]":
         """A :class:`Flow` over the UE→P-CSCF IPsec SA for MO ``call.dial``.
 
         Args:

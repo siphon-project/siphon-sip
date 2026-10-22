@@ -802,6 +802,9 @@ impl RegistrantManager {
     /// run past `u32::MAX` it starts again at the base, never at 0, so no
     /// reserved SPI is ever offered.
     pub fn allocate_ue_spi_pair(&self) -> (u32, u32) {
+        // `fetch_update` is deprecated from Rust 1.99 for `try_update`, which
+        // the MSRV does not have. Same operation under either name.
+        #[allow(deprecated)]
         let previous = self
             .ue_spi_counter
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
