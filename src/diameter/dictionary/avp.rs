@@ -24,6 +24,7 @@ pub const TERMINATION_CAUSE: u32 = 295;
 pub const ORIGIN_REALM: u32 = 296;
 pub const EXPERIMENTAL_RESULT: u32 = 297;
 pub const EXPERIMENTAL_RESULT_CODE: u32 = 298;
+pub const FAILED_AVP: u32 = 279;
 
 // RFC 6733 §8.21 Event-Timestamp / §8.19 Acct-Interim-Interval
 pub const EVENT_TIMESTAMP: u32 = 55;
@@ -179,6 +180,8 @@ pub const PRE_EMPTION_CAPABILITY: u32 = 1047;
 pub const PRE_EMPTION_VULNERABILITY: u32 = 1048;
 pub const DEFAULT_EPS_BEARER_QOS: u32 = 1049;
 pub const AN_GW_ADDRESS: u32 = 1050;
+pub const REVALIDATION_TIME: u32 = 1042;
+pub const THREE_GPP_PS_DATA_OFF_STATUS: u32 = 2847;
 
 // 3GPP Rx (TS 29.214)
 pub const ABORT_CAUSE: u32 = 500;
@@ -198,10 +201,16 @@ pub const MEDIA_COMPONENT_DESCRIPTION: u32 = 517;
 pub const MEDIA_COMPONENT_NUMBER: u32 = 518;
 pub const MEDIA_SUB_COMPONENT: u32 = 519;
 pub const MEDIA_TYPE: u32 = 520;
+pub const RR_BANDWIDTH: u32 = 521;
+pub const RS_BANDWIDTH: u32 = 522;
+pub const SIP_FORKING_INDICATION: u32 = 523;
 pub const CODEC_DATA: u32 = 524;
 pub const SERVICE_URN: u32 = 525;
+pub const ACCEPTABLE_SERVICE_INFO: u32 = 526;
 pub const SERVICE_INFO_STATUS: u32 = 527;
 pub const RX_REQUEST_TYPE: u32 = 533;
+pub const MIN_REQUESTED_BANDWIDTH_DL: u32 = 534;
+pub const MIN_REQUESTED_BANDWIDTH_UL: u32 = 535;
 
 // 3GPP Ro/Rf Charging (TS 32.299)
 pub const EVENT_TYPE: u32 = 823;
