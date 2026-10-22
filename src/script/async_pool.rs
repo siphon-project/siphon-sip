@@ -1429,14 +1429,19 @@ mod tests {
         let _serial = pool_test_guard();
         test_runtime().block_on(async move {
             ensure_pool();
-            let before = count_pending_tasks_per_driver().await;
 
+            // The handler records its own task, so the check below looks at
+            // that task rather than at task counts across the driver loops:
+            // a task left over from an earlier test can settle in between,
+            // and the per-driver probes are not guaranteed to visit every loop.
             let factory = Python::attach(|python| {
                 Arc::new(build_factory(
                     python,
                     concat!(
                         "import asyncio\n",
+                        "WEDGED = []\n",
                         "async def wedged_handler():\n",
+                        "    WEDGED.append(asyncio.current_task())\n",
                         "    await asyncio.Event().wait()\n",
                         "def factory():\n",
                         "    return wedged_handler()\n",
@@ -1444,6 +1449,7 @@ mod tests {
                 ))
             });
 
+            let probe = Arc::clone(&factory);
             let started = std::time::Instant::now();
             let outcome = tokio::task::spawn_blocking(move || {
                 Python::attach(|python| {
@@ -1480,10 +1486,27 @@ mod tests {
             flush_drivers().await;
             force_python_gc();
             flush_drivers().await;
-            let after = count_pending_tasks_per_driver().await;
-            assert_eq!(
-                after.iter().sum::<usize>(),
-                before.iter().sum::<usize>(),
+            let (recorded, cancelled) = Python::attach(|python| {
+                let wedged = probe
+                    .bind(python)
+                    .getattr("__globals__")
+                    .unwrap()
+                    .get_item("WEDGED")
+                    .unwrap();
+                let recorded = wedged.len().unwrap();
+                let cancelled = recorded == 1
+                    && wedged
+                        .get_item(0)
+                        .unwrap()
+                        .call_method0("cancelled")
+                        .unwrap()
+                        .extract::<bool>()
+                        .unwrap();
+                (recorded, cancelled)
+            });
+            assert_eq!(recorded, 1, "the handler ran once on a driver loop");
+            assert!(
+                cancelled,
                 "the timed-out coroutine is still scheduled on a driver loop"
             );
         });
