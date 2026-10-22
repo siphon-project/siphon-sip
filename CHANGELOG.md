@@ -121,6 +121,15 @@ entry, but a working config keeps working.
   installed until their hard lifetime ran out. A replaced or source-updated
   entry's SAs go too.
 
+- **Diameter: `diameter.originate` no longer hands a request for a host to
+  another peer of its realm.** With `destination_host` and no connection that
+  carried requests from that host, the request went out on any connection of
+  the realm, so a Cancel-Location for one MME could reach another. It now goes
+  only through an agent that relays for the realm (a connection whose requests
+  carried Route-Record), else nothing is sent and `diameter.UnableToDeliver`
+  is raised, a `LookupError` meaning DIAMETER_UNABLE_TO_DELIVER (3002,
+  RFC 6733 §6.1). Without `destination_host`, and with `peer`, nothing
+  changes.
 - **QoS: `qos.media_flows_from_sdp` follows TS 29.213 table 6.2.1 for
   Flow-Status.** Every component names it, `enabled` included: it was left out
   for sendrecv or no direction attribute, and on an Rx update an absent

@@ -8,8 +8,18 @@ use pyo3::types::PyList;
 
 use super::diameter_server::{build_child_spec, PyDiameterAnswer};
 use crate::diameter::codec::{Avp, DiameterMsg};
-use crate::diameter::originate::{self, Failure, Refusal, Request};
+use crate::diameter::originate::{self, Failure, Refusal, Request, Unreachable};
 use crate::diameter::{dictionary, DiameterManager};
+
+pyo3::create_exception!(
+    siphon,
+    UnableToDeliver,
+    pyo3::exceptions::PyLookupError,
+    "Raised by diameter.originate() when destination_host has no connection \
+     and no agent relaying for its realm: DIAMETER_UNABLE_TO_DELIVER (3002, \
+     RFC 6733 section 6.1). Nothing is sent; the request is not handed to \
+     another peer of the realm."
+);
 
 /// Where a request goes: `peer` (None for any), `tenant`, Destination-Host
 /// (None to route on the realm alone) and Destination-Realm.
@@ -71,11 +81,16 @@ pub(crate) fn originate<'py>(
         destination.host,
         destination.realm,
     )
-    .ok_or_else(|| {
-        pyo3::exceptions::PyLookupError::new_err(format!(
+    .map_err(|unreachable| match unreachable {
+        Unreachable::Host => UnableToDeliver::new_err(format!(
+            "DIAMETER_UNABLE_TO_DELIVER (3002): no connection to {} and no agent relaying for {}",
+            destination.host.unwrap_or_default(),
+            destination.realm
+        )),
+        Unreachable::NoConnection => pyo3::exceptions::PyLookupError::new_err(format!(
             "no open Diameter connection towards {}",
-            destination.host.unwrap_or(destination.realm)
-        ))
+            destination.peer.unwrap_or(destination.realm)
+        )),
     })?;
     let request = Request {
         command_code,
@@ -185,30 +200,42 @@ mod tests {
         });
     }
 
+    /// No connection: nothing is sent and `LookupError` is raised. For a
+    /// Destination-Host it is `UnableToDeliver`, a `LookupError`, so a
+    /// script can tell DIAMETER_UNABLE_TO_DELIVER from a realm with no
+    /// connection at all.
     #[test]
     fn without_a_connection_nothing_is_sent_and_lookup_error_is_raised() {
         pyo3::Python::initialize();
         pyo3::Python::attach(|python| {
             let manager = DiameterManager::new();
             let avps = PyList::empty(python);
-            let error = originate(
-                python,
-                &manager,
-                &"CLR".into_pyobject(python).unwrap().into_any(),
-                "S6a",
-                avps.as_any(),
-                Destination {
-                    peer: None,
-                    tenant: "t-no-connection",
-                    host: Some("mme1.epc.example"),
-                    realm: "epc.example",
-                },
-                None,
-                true,
-                std::time::Duration::from_millis(100),
-            )
-            .unwrap_err();
-            assert!(error.is_instance_of::<pyo3::exceptions::PyLookupError>(python));
+            let fail = |host| {
+                originate(
+                    python,
+                    &manager,
+                    &"CLR".into_pyobject(python).unwrap().into_any(),
+                    "S6a",
+                    avps.as_any(),
+                    Destination {
+                        peer: None,
+                        tenant: "t-no-connection",
+                        host,
+                        realm: "epc.example",
+                    },
+                    None,
+                    true,
+                    std::time::Duration::from_millis(100),
+                )
+                .unwrap_err()
+            };
+            let to_host = fail(Some("mme1.epc.example"));
+            assert!(to_host.is_instance_of::<UnableToDeliver>(python));
+            assert!(to_host.is_instance_of::<pyo3::exceptions::PyLookupError>(python));
+            assert!(to_host.to_string().contains("3002"), "{to_host}");
+            let to_realm = fail(None);
+            assert!(to_realm.is_instance_of::<pyo3::exceptions::PyLookupError>(python));
+            assert!(!to_realm.is_instance_of::<UnableToDeliver>(python));
         });
     }
 
