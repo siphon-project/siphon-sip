@@ -959,6 +959,16 @@ fn request_timeout(timeout_ms: u64) -> std::time::Duration {
 
 #[pymethods]
 impl PyDiameter {
+    /// The `diameter.UnableToDeliver` exception type (a `LookupError`),
+    /// raised by `originate` when `destination_host` has no connection and
+    /// no agent relays for its realm. A class attribute so scripts can
+    /// `except diameter.UnableToDeliver:`.
+    #[classattr]
+    #[allow(non_snake_case)]
+    fn UnableToDeliver(python: Python<'_>) -> Bound<'_, pyo3::types::PyType> {
+        python.get_type::<super::diameter_originate::UnableToDeliver>()
+    }
+
     /// Check if a peer is connected.
     ///
     /// Args:
@@ -2067,9 +2077,11 @@ impl PyDiameter {
     /// Originate a request on a connection this node has, e.g. an HSS's
     /// Cancel-Location towards the MME that sent the Update Location.
     /// `avps` are `(code_or_name, value[, vendor[, mandatory]])` tuples after
-    /// the envelope; awaits the answer as a `DiameterAnswer`. No connection
-    /// raises LookupError, a timeout TimeoutError, a lost connection
-    /// ConnectionError.
+    /// the envelope; awaits the answer as a `DiameterAnswer`. A
+    /// `destination_host` with no connection and no agent relaying for its
+    /// realm raises UnableToDeliver (a LookupError; another peer of the realm
+    /// is not tried), no connection otherwise LookupError, a timeout
+    /// TimeoutError, a lost connection ConnectionError.
     ///
     /// **Awaitable** — returns a coroutine, so `await` it.
     #[pyo3(signature = (

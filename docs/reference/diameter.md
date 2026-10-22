@@ -702,19 +702,26 @@ backend of that name, else the client-mode peer of that name
 (`diameter.peers`). Client-mode peers belong to the node, not to a tenant,
 so only `tenant="default"` reaches them: a PCEF's Gx CCR to its PCRF is
 `originate("CCR", "Gx", ..., peer="pcrf")`. Without, the serving connection that
-last carried a request from `destination_host`, else one that carried a
-request from a node of `destination_realm` (a direct peer of the realm or
-an agent relaying for it, which routes on to the host). A serving
-connection becomes reachable once a request from that host or realm has
-arrived on it (`diameter.listen` or `connect_to`). All scoped to `tenant`.
+last carried a request from `destination_host`, else one of an agent that
+relayed requests from `destination_realm`, which routes on to the host
+(RFC 6733 §6.1.5). A request it relayed carries Route-Record, which is how
+an agent is told from a direct peer. Another direct peer of the realm is not
+the host and is never used for it: with no connection to the host and no
+agent, nothing is sent and `diameter.UnableToDeliver` is raised
+(DIAMETER_UNABLE_TO_DELIVER, RFC 6733 §6.1). Without `destination_host`,
+any connection that carried a request from a node of `destination_realm`.
+A serving connection becomes reachable once a request from that host or
+realm has arrived on it (`diameter.listen` or `connect_to`). All scoped to
+`tenant`.
 
 Resolves to a `DiameterAnswer` (`result_code`, `experimental_result_code`,
 `get_avp`, `avps()`), whatever its result: a negative answer is told from a
 failure to get one. `experimental_result_code` is the code inside
 Experimental-Result, where the 3GPP applications put the ones they define
 (5001 DIAMETER_ERROR_USER_UNKNOWN of TS 29.229, for one), and `None` when
-the answer carries a Result-Code. No open connection raises `LookupError` and nothing is
-sent; no answer within `timeout_ms` raises `TimeoutError`; a connection that
+the answer carries a Result-Code. No open connection raises `LookupError`
+(`diameter.UnableToDeliver`, a subclass, for a `destination_host`) and
+nothing is sent; no answer within `timeout_ms` raises `TimeoutError`; a connection that
 closes before the answer raises `ConnectionError`. siphon does not resend:
 the script decides whether to repeat.
 

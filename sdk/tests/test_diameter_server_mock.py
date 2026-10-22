@@ -407,6 +407,11 @@ def test_originate_refuses_bad_arguments_and_raises_the_configured_failure():
     diameter.set_originate_outcome('ALR', 'S6c', LookupError('no open Diameter connection'))
     with pytest.raises(LookupError):
         asyncio.run(diameter.originate('ALR', 'S6c', [], 'ims.example'))
+    diameter.set_originate_outcome('CLR', 'S6a', diameter.UnableToDeliver('no route to mme2'))
+    with pytest.raises(diameter.UnableToDeliver):
+        asyncio.run(diameter.originate('CLR', 'S6a', [], 'epc.example',
+                                       destination_host='mme2.epc.example'))
+    assert issubclass(diameter.UnableToDeliver, LookupError)
 
 
 def test_originate_takes_nested_groups_and_a_given_session_id():

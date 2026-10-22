@@ -8590,6 +8590,16 @@ def _check_originate_avps(avps: list) -> None:
             raise TypeError(f"AVP {item[0]}: a value is an int, str, bytes or a list of members")
 
 
+class UnableToDeliver(LookupError):
+    """Raised by ``diameter.originate()`` when ``destination_host`` has no
+    connection and no agent relaying for its realm: DIAMETER_UNABLE_TO_DELIVER
+    (3002, RFC 6733 section 6.1). Nothing is sent, and the request is not
+    handed to another peer of the realm. A ``LookupError``, so
+    ``except LookupError`` still catches it. Mirrors the Rust
+    ``diameter.UnableToDeliver`` exception.
+    """
+
+
 class MockDiameter:
     """Mock Diameter namespace for testing scripts that use ``from siphon import diameter``.
 
@@ -8611,6 +8621,10 @@ class MockDiameter:
         result = asyncio.run(diameter.cx_uar("sip:alice@ims.example.com"))
         assert result["server_name"] == "sip:scscf.ims.example.com:6060"
     """
+
+    #: The ``diameter.UnableToDeliver`` exception type, so scripts can
+    #: ``except diameter.UnableToDeliver``.
+    UnableToDeliver = UnableToDeliver
 
     def __init__(self) -> None:
         self._peers: dict[str, bool] = {}  # peer_name -> connected
@@ -10362,8 +10376,16 @@ class MockDiameter:
         the ``avps`` tuples as given, the destination) and resolves to a
         2001 ``MockDiameterAnswer``, or to what ``set_originate_outcome``
         configured for ``(command, application)``: an answer, or an exception
-        (``LookupError`` for no connection, ``TimeoutError``,
-        ``ConnectionError``) to raise.
+        (``UnableToDeliver`` for a ``destination_host`` with no connection and
+        no agent relaying for its realm, ``LookupError`` for no connection
+        otherwise, ``TimeoutError``, ``ConnectionError``) to raise.
+
+        In siphon the connection is the one that carried requests from
+        ``destination_host``, else one of an agent that relayed requests from
+        ``destination_realm`` (their Route-Record shows it). Another direct
+        peer of the realm is never used for a named host. Without
+        ``destination_host``, any connection that carried requests from the
+        realm.
         """
         if not destination_realm or destination_host == "" or session_id == "":
             raise ValueError("nonempty destination and session required")

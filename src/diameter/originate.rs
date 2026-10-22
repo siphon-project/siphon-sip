@@ -35,23 +35,37 @@ pub(crate) const ENVELOPE_AVPS: [u32; 5] = [
 /// tenant reaches them; any other tenant reaches its own connections alone.
 pub(crate) const DEFAULT_TENANT: &str = "default";
 
+/// Why no connection was found for a request.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Unreachable {
+    /// A Destination-Host this node has no connection to and no agent of its
+    /// realm to relay through: DIAMETER_UNABLE_TO_DELIVER (RFC 6733 section
+    /// 6.1). Another peer of the realm is not the host and is not asked.
+    Host,
+    /// No open connection towards the realm, or none of the named peer.
+    NoConnection,
+}
+
 /// The connection a request to `destination_host` / `destination_realm` of
 /// `tenant` leaves on. With `peer`, the serving connection of that configured
 /// peer that carried requests from the host, else the tenant's relay backend
 /// of that name, else (for [`DEFAULT_TENANT`] only) the client-mode peer of
-/// that name. Without, the serving connection that carried requests from the
-/// host, else one that carried requests from a node of the realm: an agent
-/// routes the request on to the host (RFC 6733 section 6.1.5). Only an open
-/// connection is returned.
+/// that name. Without, and with a host, the serving connection that carried
+/// requests from the host, else one that carried requests relayed from the
+/// realm: an agent routes the request on to the host (RFC 6733 section
+/// 6.1.5). A direct peer of the realm is not the host and does not route
+/// on, so a request for a host is never handed to it (RFC 6733 section 6.1):
+/// that is [`Unreachable::Host`]. Without a host, any connection that carried
+/// requests from the realm. Only an open connection is returned.
 pub(crate) fn connection(
     manager: &DiameterManager,
     tenant: &str,
     peer: Option<&str>,
     destination_host: Option<&str>,
     destination_realm: &str,
-) -> Option<Arc<DiameterPeer>> {
-    match peer {
-        Some(name) => destination_host
+) -> Result<Arc<DiameterPeer>, Unreachable> {
+    match (peer, destination_host) {
+        (Some(name), _) => destination_host
             .and_then(|host| reauthorize::connection(tenant, name, host))
             .or_else(|| {
                 manager
@@ -62,10 +76,13 @@ pub(crate) fn connection(
                             .flatten()
                     })
                     .map(|client| Arc::clone(client.peer()))
-            }),
-        None => destination_host
-            .and_then(|host| reauthorize::connection_to_host(tenant, host))
-            .or_else(|| reauthorize::connection_to_realm(tenant, destination_realm)),
+            })
+            .ok_or(Unreachable::NoConnection),
+        (None, Some(host)) => reauthorize::connection_to_host(tenant, host)
+            .or_else(|| reauthorize::agent_for_realm(tenant, destination_realm))
+            .ok_or(Unreachable::Host),
+        (None, None) => reauthorize::connection_to_realm(tenant, destination_realm)
+            .ok_or(Unreachable::NoConnection),
     }
 }
 
@@ -259,7 +276,7 @@ mod tests {
     }
 
     #[test]
-    fn a_host_is_preferred_and_a_realm_is_the_fallback() {
+    fn a_host_is_preferred_and_an_agent_of_the_realm_is_the_fallback() {
         let manager = DiameterManager::new();
         let direct = open_peer();
         let agent = open_peer();
@@ -267,8 +284,11 @@ mod tests {
         direct_serving
             .observe(&json!({"Origin-Host": "mme1.epc.example", "Origin-Realm": "epc.example"}));
         let mut agent_serving = ServingConnection::new("t-originate", "dra", &agent);
-        agent_serving
-            .observe(&json!({"Origin-Host": "mme2.epc.example", "Origin-Realm": "epc.example"}));
+        agent_serving.observe(&json!({
+            "Origin-Host": "mme2.epc.example",
+            "Origin-Realm": "epc.example",
+            "Route-Record": "mme2.epc.example",
+        }));
         let found = |peer, host| connection(&manager, "t-originate", peer, host, "epc.example");
         assert!(Arc::ptr_eq(
             &found(None, Some("mme1.epc.example")).unwrap(),
@@ -278,7 +298,8 @@ mod tests {
             &found(None, Some("mme2.epc.example")).unwrap(),
             &agent
         ));
-        // An unknown host of the realm goes where the realm was last seen.
+        // An unknown host of the realm goes through the agent relaying for
+        // the realm, which routes it on (RFC 6733 section 6.1.5).
         assert!(Arc::ptr_eq(
             &found(None, Some("mme3.epc.example")).unwrap(),
             &agent
@@ -288,16 +309,49 @@ mod tests {
             &direct
         ));
         // A named peer that never carried the host, with no client of that name.
-        assert!(found(Some("mme"), Some("mme2.epc.example")).is_none());
-        assert!(connection(&manager, "t-originate", None, None, "other.example").is_none());
-        assert!(connection(
-            &manager,
-            "t-elsewhere",
-            None,
-            Some("mme1.epc.example"),
-            "epc.example"
-        )
-        .is_none());
+        assert_eq!(
+            found(Some("mme"), Some("mme2.epc.example")).err(),
+            Some(Unreachable::NoConnection)
+        );
+        assert_eq!(
+            connection(&manager, "t-originate", None, None, "other.example").err(),
+            Some(Unreachable::NoConnection)
+        );
+        assert_eq!(
+            connection(
+                &manager,
+                "t-elsewhere",
+                None,
+                Some("mme1.epc.example"),
+                "epc.example"
+            )
+            .err(),
+            Some(Unreachable::Host)
+        );
+    }
+
+    /// A request for a host this node has no connection to is not handed to
+    /// another peer of the realm that is not an agent: that peer is not the
+    /// host and does not route on (RFC 6733 section 6.1). A realm-only
+    /// request still goes to any connection of the realm.
+    #[test]
+    fn a_host_without_a_connection_or_an_agent_is_unable_to_deliver() {
+        let manager = DiameterManager::new();
+        let direct = open_peer();
+        let mut direct_serving = ServingConnection::new("t-strict", "mme", &direct);
+        direct_serving
+            .observe(&json!({"Origin-Host": "mme1.epc.example", "Origin-Realm": "epc.example"}));
+        let found = |host| connection(&manager, "t-strict", None, host, "epc.example");
+        assert!(Arc::ptr_eq(
+            &found(Some("mme1.epc.example")).unwrap(),
+            &direct
+        ));
+        assert_eq!(
+            found(Some("mme2.epc.example")).err(),
+            Some(Unreachable::Host)
+        );
+        assert!(Arc::ptr_eq(&found(None).unwrap(), &direct));
+        drop(direct_serving);
     }
 
     fn connection_config() -> crate::diameter::peer::PeerConfig {
@@ -491,7 +545,7 @@ mod tests {
         let found = |tenant| connection(&manager, tenant, Some("pcrf"), None, "epc.example");
         assert!(Arc::ptr_eq(&found(DEFAULT_TENANT).unwrap(), &client));
         assert!(Arc::ptr_eq(&found("t-isolated").unwrap(), &backend));
-        assert!(found("t-other").is_none());
+        assert_eq!(found("t-other").err(), Some(Unreachable::NoConnection));
     }
 
     /// Answer `received` on `remote` with `result_code`, echoing its

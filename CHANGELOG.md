@@ -33,6 +33,16 @@ entry, but a working config keeps working.
 
 ### Fixed
 
+- **Diameter: `diameter.originate` no longer hands a request for a host to
+  another peer of its realm.** With `destination_host` and no connection that
+  carried requests from that host, the request went out on any connection of
+  the realm, so a Cancel-Location for one MME could reach another. It now goes
+  only through an agent that relays for the realm (a connection whose requests
+  carried Route-Record), else nothing is sent and `diameter.UnableToDeliver`
+  is raised, a `LookupError` meaning DIAMETER_UNABLE_TO_DELIVER (3002,
+  RFC 6733 §6.1). Without `destination_host`, and with `peer`, nothing
+  changes.
+
 - **Diameter: an AVP value of the wrong shape is refused before sending.**
   `diameter.originate` and `set_avp` raise `TypeError` for a list given to an
   AVP the dictionary does not type as grouped, a str or int given to a grouped
