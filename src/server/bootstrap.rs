@@ -1417,6 +1417,27 @@ pub(super) fn pin_python_thread_state() {
     }
 }
 
+/// Let pyo3-async-runtimes complete awaitables on `runtime`.
+///
+/// `future_into_py`, behind every awaitable script API, completes on the
+/// runtime pyo3-async-runtimes holds. Unless it is given one it builds its
+/// own, whose threads [`pin_python_thread_state`] never ran on, so the
+/// `Python::attach` of each completion creates a `PyThreadState` and destroys
+/// it again. On free-threaded Python that is a mimalloc heap set up and
+/// collected per call, with the `munmap`s and page zeroing that go with it.
+/// Handed this runtime, the completions run on pinned threads.
+///
+/// False when pyo3-async-runtimes already had a runtime.
+pub(super) fn share_runtime_with_python(runtime: &'static tokio::runtime::Runtime) -> bool {
+    pyo3_async_runtimes::tokio::init_with_runtime(runtime).is_ok()
+}
+
+/// Whether [`pin_python_thread_state`] pinned the current thread.
+#[cfg(test)]
+pub(super) fn python_thread_state_pinned() -> bool {
+    PINNED_PYTHON_ATTACH.with(|slot| slot.get().is_some())
+}
+
 /// Release the attach [`pin_python_thread_state`] took, so CPython frees this
 /// thread's `PyThreadState` when the OS thread goes away.
 ///
