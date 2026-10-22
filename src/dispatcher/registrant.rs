@@ -90,7 +90,7 @@ fn handle_answer(
                         .get("Contact")
                         .and_then(|contact| parse_contact_expires(contact))
                 })
-                .unwrap_or(registrant.default_interval);
+                .unwrap_or_else(|| registrant.interval_for(&aor));
 
             // IMS: capture the Service-Route / P-Associated-URI / Path the
             // S-CSCF granted, for MO call routing and implicit-set resolution
@@ -199,7 +199,7 @@ fn handle_answer(
                         &aor,
                         defaults,
                         &challenge,
-                        registrant.default_interval,
+                        registrant.interval_for(&aor),
                         None,
                     )
                 } else {
@@ -208,7 +208,7 @@ fn handle_answer(
                         defaults,
                         &challenge,
                         status_code == 407,
-                        registrant.default_interval,
+                        registrant.interval_for(&aor),
                     )
                 };
 
@@ -280,7 +280,7 @@ pub(super) fn handle_registrant_ipsec_challenge(
         aor,
         crate::registrant::EgressDefaults::new(state.local_addr, &state.listen_addrs),
         challenge,
-        registrant.default_interval,
+        registrant.interval_for(aor),
         verify.as_deref(),
     );
     let Some(built) = built else {

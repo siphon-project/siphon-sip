@@ -145,7 +145,8 @@ fn run_tick(
                 break;
             }
         }
-        let Some(built) = manager.build_register(&aor, egress.defaults(), manager.default_interval)
+        let Some(built) =
+            manager.build_register(&aor, egress.defaults(), manager.interval_for(&aor))
         else {
             continue;
         };

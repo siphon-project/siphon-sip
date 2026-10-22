@@ -15,6 +15,12 @@ entry, but a working config keeps working.
 
 ### Fixed
 
+- **Outbound registrations ask for their own `interval`.** Every REGISTER, the
+  first, the authenticated answer to a 401 and each refresh, carried the
+  manager's `default_interval` in `Expires`, so an entry's `interval` (YAML or
+  `registration.add(interval=...)`) never reached the registrar. They now ask
+  for the entry's own interval, as does the fallback for a 200 that grants none.
+
 - **IMS UE registrant: the Contact of a protected REGISTER names the protected
   server port.** The authenticated REGISTER after a 401 and every protected
   re- and de-REGISTER bound the plain port, so the S-CSCF sent MT requests
