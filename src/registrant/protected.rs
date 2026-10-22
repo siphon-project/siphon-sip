@@ -27,6 +27,8 @@
 //! one of its sets still uses (TS 33.203 7.1, rule 3).
 
 use super::*;
+use std::collections::HashSet;
+use std::sync::atomic::AtomicUsize;
 
 /// The protected client ports a UE rotates through: `ue_port_c`, then the two
 /// ports above the higher of the client and server ports (below the lower one
@@ -167,33 +169,83 @@ pub(super) struct Teardown {
 /// RFC 3261 Timer F, plus the loop tick that sends it.
 const TEARDOWN_WAIT: Duration = Duration::from_secs(32 + 5);
 
-/// Delete `deletions` from `ipsec`, in order, on one task. A pair is deleted
-/// only while the kernel still holds the installation the deletion names (the
-/// same SPIs): a later set re-installed on the same port is left alone.
-pub fn spawn_sa_deletions(
+/// The SIP level lifetime of a temporary set: the reg-await-auth timer, 4
+/// minutes (TS 24.229 clause 5.1.1.5.1 step 2, "The UE shall set a temporary
+/// SIP level lifetime for the temporary set of security associations to the
+/// value of reg-await-auth timer"; table 7.8.1 gives the timer 4 minutes, 2
+/// times the IM CN subsystem Timer F of 128 seconds). The 200 replaces it.
+pub const REG_AWAIT_AUTH_SECS: u64 = 4 * 60;
+
+/// What an established set lives beyond the registration it carries: "the
+/// lifetime of the just completed registration plus 30 seconds" (TS 24.229
+/// clauses 5.1.1.2.2, 5.1.1.4.2 and 5.1.1.5.1), unless what it had left was
+/// longer.
+pub const SA_LIFETIME_MARGIN_SECS: u64 = 30;
+
+/// A consecutive invalid challenge past this many goes unanswered: "A UE shall
+/// only respond to two consecutive invalid challenges" (TS 24.229 clause
+/// 5.1.1.5.12).
+const MAX_INVALID_CHALLENGES: u32 = 2;
+
+/// How many times one entry may move a protected client port it cannot bind
+/// to another port before it gives up on that port.
+const MAX_PORT_REPLACEMENTS: u32 = 8;
+
+/// Delete `deletions` from `ipsec`, in order. A pair is deleted only while the
+/// kernel still holds the installation the deletion names (the same SPIs): a
+/// later set re-installed on the same port is left alone. Returns how many
+/// pairs it deleted.
+pub async fn delete_sa_sets(
+    ipsec: &IpsecManager,
     deletions: Vec<SaDeletion>,
-    ipsec: &Arc<IpsecManager>,
     process_ue_ip: IpAddr,
-) {
-    if deletions.is_empty() {
-        return;
-    }
-    let ipsec = Arc::clone(ipsec);
-    tokio::spawn(async move {
-        for deletion in deletions {
-            let ue_addr = deletion.address.unwrap_or(process_ue_ip);
-            let key = deletion.key;
-            let installed = ipsec
-                .get_sa(&ue_addr, key.ue_port_c)
-                .is_some_and(|sa| sa.spi_uc == key.spi_uc && sa.spi_us == key.spi_us);
-            if !installed {
-                continue;
-            }
-            if let Err(error) = ipsec.delete_sa_pair(&ue_addr, key.ue_port_c).await {
+) -> usize {
+    let mut deleted = 0;
+    for deletion in deletions {
+        let ue_addr = deletion.address.unwrap_or(process_ue_ip);
+        let key = deletion.key;
+        let installed = ipsec
+            .get_sa(&ue_addr, key.ue_port_c)
+            .is_some_and(|sa| sa.spi_uc == key.spi_uc && sa.spi_us == key.spi_us);
+        if !installed {
+            continue;
+        }
+        match ipsec.delete_sa_pair(&ue_addr, key.ue_port_c).await {
+            Ok(()) => deleted += 1,
+            Err(error) => {
                 warn!(%ue_addr, ue_port_c = key.ue_port_c, %error, "IPsec UE: failed to delete an SA set");
             }
         }
-    });
+    }
+    deleted
+}
+
+/// Counts a deletion task in flight for as long as it lives, so shutdown can
+/// wait for the ones the dispatcher started.
+struct DeletionInFlight(Arc<AtomicUsize>);
+
+impl DeletionInFlight {
+    fn start(counter: &Arc<AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::AcqRel);
+        Self(Arc::clone(counter))
+    }
+}
+
+impl Drop for DeletionInFlight {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// What [`RegistrantManager::degrade_unbindable_ports`] made of the sockets an
+/// entry could not bind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PortDegradation {
+    /// A protected client port moved, so the socket plan changed.
+    pub moved: bool,
+    /// The entry cannot register this tick: its plain or protected server
+    /// port, or every client port it could offer, is unbound.
+    pub blocked: bool,
 }
 
 /// The key of the SA set the current handshake installs.
@@ -226,6 +278,120 @@ impl RegistrantManager {
         let _ = self.ipsec.set(ipsec);
     }
 
+    /// Delete the queued SA pairs from `ipsec` on a task of their own,
+    /// counted in flight until it ends (see [`Self::sa_deletions_settled`]).
+    pub fn spawn_sa_deletions(&self, ipsec: &Arc<IpsecManager>, process_ue_ip: IpAddr) {
+        let deletions = self.take_pending_sa_deletions();
+        if deletions.is_empty() {
+            return;
+        }
+        let ipsec = Arc::clone(ipsec);
+        let in_flight = DeletionInFlight::start(&self.sa_deletions_in_flight);
+        tokio::spawn(async move {
+            delete_sa_sets(&ipsec, deletions, process_ue_ip).await;
+            drop(in_flight);
+        });
+    }
+
+    /// Whether no SA set waits on a de-REGISTER's answer, none is queued for
+    /// deletion and no deletion task is still running.
+    pub fn sa_deletions_settled(&self) -> bool {
+        self.sa_deletions_in_flight.load(Ordering::Acquire) == 0
+            && self
+                .teardowns
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_empty()
+            && self
+                .pending_sa_deletions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_empty()
+    }
+
+    /// Hand every SA set still tracked to the deletion queue, for shutdown:
+    /// those of removed entries whose de-REGISTER went unanswered, and those
+    /// of any entry still live.
+    pub(super) fn surrender_all_sa_sets(&self) {
+        self.expire_teardowns(Instant::now() + TEARDOWN_WAIT * 2);
+        let mut deletions = Vec::new();
+        for mut entry in self.entries.iter_mut() {
+            let address = entry.local_addr;
+            if let Some(ipsec) = entry.ue_ipsec.as_mut() {
+                let sets = std::mem::take(&mut ipsec.sa_sets);
+                deletions.extend(
+                    sets.keys()
+                        .into_iter()
+                        .map(|key| SaDeletion { address, key }),
+                );
+            }
+        }
+        self.queue_sa_deletions(deletions);
+    }
+
+    /// Wait for deletion tasks still running, until `deadline`. `false` when
+    /// some were still running at it.
+    pub(super) async fn await_sa_deletions_in_flight(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> bool {
+        while self.sa_deletions_in_flight.load(Ordering::Acquire) > 0 {
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        true
+    }
+
+    /// Record the SPIs of the XFRM states the kernel held when the loop
+    /// started, states a previous process left among them: no offer uses one
+    /// (TS 33.203 clause 7.1, "The UE shall select the SPIs uniquely, and
+    /// different from any SPIs that might be used in any existing SAs").
+    pub fn note_kernel_spis(&self, spis: impl IntoIterator<Item = u32>) {
+        let _ = self.kernel_spis_at_start.set(spis.into_iter().collect());
+    }
+
+    /// A fresh SPI pair for an offer, different from every SPI in `avoid`,
+    /// from the kernel's states at start, and from those a live pair of the
+    /// IPsec manager owns (TS 33.203 clause 7.1).
+    fn allocate_unique_ue_spi_pair(&self, avoid: &HashSet<u32>) -> (u32, u32) {
+        let at_start = self.kernel_spis_at_start.get();
+        let taken = |spi: u32| {
+            avoid.contains(&spi)
+                || at_start.is_some_and(|spis| spis.contains(&spi))
+                || self.ipsec.get().is_some_and(|ipsec| ipsec.owns_spi(spi))
+        };
+        let mut pair = self.allocate_ue_spi_pair();
+        for _ in 0..1024 {
+            if !taken(pair.0) && !taken(pair.1) {
+                return pair;
+            }
+            pair = self.allocate_ue_spi_pair();
+        }
+        warn!(
+            spi_uc = pair.0,
+            "IPsec UE: no SPI pair clear of the existing SAs found; offering one anyway"
+        );
+        pair
+    }
+
+    /// Every SPI of the SA sets `ipsec` holds on `ue_addr`, both ends'.
+    fn held_spis(&self, ue_addr: IpAddr, ipsec: &UeIpsec) -> HashSet<u32> {
+        let mut spis = HashSet::new();
+        for key in ipsec.sa_sets.keys() {
+            spis.extend([key.spi_uc, key.spi_us]);
+            if let Some(pair) = self
+                .ipsec
+                .get()
+                .and_then(|manager| manager.get_sa(&ue_addr, key.ue_port_c))
+            {
+                spis.extend([pair.spi_pc, pair.spi_ps]);
+            }
+        }
+        spis
+    }
+
     /// Queue SA pairs for deletion.
     pub(super) fn queue_sa_deletions(&self, deletions: impl IntoIterator<Item = SaDeletion>) {
         let mut pending = self
@@ -255,8 +421,15 @@ impl RegistrantManager {
     }
 
     /// Point the offer at a client port no held set uses (TS 33.203 7.1, rule
-    /// 6; 7.4.0) and give it fresh SPIs.
-    fn renew_offer(&self, ipsec: &mut UeIpsec) {
+    /// 6; 7.4.0) and give it fresh SPIs, different from those of every set
+    /// held (rule: SPIs unique among the existing SAs, inbound and outbound).
+    ///
+    /// `replacing_offer`: the offer answers a challenge to the previous one,
+    /// whose port the P-CSCF set up SAs for at that 401 and deletes only once
+    /// this REGISTER arrives (TS 33.203 7.3.1.2, 7.3.1.3), so it takes another
+    /// port when one is free ("new values for ... port_uc", TS 24.229
+    /// 5.1.1.5.3).
+    fn renew_offer(&self, ue_addr: IpAddr, ipsec: &mut UeIpsec, replacing_offer: bool) {
         let held: Vec<u16> = ipsec
             .sa_sets
             .established
@@ -265,15 +438,19 @@ impl RegistrantManager {
             .into_iter()
             .chain(ipsec.sa_sets.retiring.map(|key| key.ue_port_c))
             .collect();
+        let previous = replacing_offer.then_some(ipsec.ue_port_c);
+        let free = |port: &u16| !held.contains(port);
         if let Some(port) = ipsec
             .client_ports
             .iter()
             .copied()
-            .find(|port| !held.contains(port))
+            .find(|port| free(port) && Some(*port) != previous)
+            .or_else(|| ipsec.client_ports.iter().copied().find(free))
         {
             ipsec.ue_port_c = port;
         }
-        let (spi_uc, spi_us) = self.allocate_ue_spi_pair();
+        let held_spis = self.held_spis(ue_addr, ipsec);
+        let (spi_uc, spi_us) = self.allocate_unique_ue_spi_pair(&held_spis);
         ipsec.spi_uc = spi_uc;
         ipsec.spi_us = spi_us;
     }
@@ -281,8 +458,14 @@ impl RegistrantManager {
     /// Start an unprotected REGISTER for `entry`: the sets of an earlier
     /// re-registration and of an incomplete authentication go (TS 33.203
     /// 7.4.1a), and the offer gets a free client port and fresh SPIs.
-    pub(super) fn begin_unprotected_offer(&self, entry: &mut RegistrantEntry) {
+    pub(super) fn begin_unprotected_offer(
+        &self,
+        entry: &mut RegistrantEntry,
+        defaults: EgressDefaults<'_>,
+        replacing_offer: bool,
+    ) {
         let address = entry.local_addr;
+        let ue_addr = address.unwrap_or(defaults.ue_ip);
         let Some(ipsec) = entry.ue_ipsec.as_mut() else {
             return;
         };
@@ -296,7 +479,7 @@ impl RegistrantManager {
         self.queue_sa_deletions(stale.into_iter().map(|key| SaDeletion { address, key }));
         ipsec.sa_sets.exchange = UeExchange::Unprotected;
         ipsec.sa_sets.pending_authorization = None;
-        self.renew_offer(ipsec);
+        self.renew_offer(ue_addr, ipsec, replacing_offer);
     }
 
     /// The established set `entry` can send a protected REGISTER over: usable,
@@ -326,11 +509,11 @@ impl RegistrantManager {
     /// can use; `None` leaves the caller to build an unprotected one.
     ///
     /// From the set's protected client port to the P-CSCF's protected server
-    /// port, the Via naming the protected server port (TS 24.229 5.1.1.4.2 c),
-    /// the Authorization of the last authentication repeated (a), new SA
-    /// parameters in Security-Client (d), the set's Security-Server mirrored
-    /// in Security-Verify (e). Same Call-ID, next CSeq. A de-REGISTER
-    /// (`expires` 0) takes the same form (5.1.1.6.2).
+    /// port, the Via and Contact naming the protected server port (TS 24.229
+    /// 5.1.1.4.2 b, c), the Authorization of the last authentication repeated
+    /// (a), new SA parameters in Security-Client (d), the set's Security-Server
+    /// mirrored in Security-Verify (e). Same Call-ID, next CSeq. A
+    /// de-REGISTER (`expires` 0) takes the same form (5.1.1.6.2).
     pub(super) fn build_protected_register(
         &self,
         entry: &mut RegistrantEntry,
@@ -338,6 +521,45 @@ impl RegistrantManager {
         expires: u32,
     ) -> Option<Option<BuiltRegister>> {
         let set = self.protected_set(entry, defaults)?;
+        let authorization = set.authorization.clone();
+        Some(self.register_over_set(entry, defaults, &set, expires, authorization, false))
+    }
+
+    /// Build the REGISTER that tells the network its challenge was invalid
+    /// (TS 24.229 clause 5.1.1.5.3: an "auts" for an SQN out of range, an empty
+    /// response for a bad MAC), carrying `authorization`. It goes "using an
+    /// existing set of security associations, if available", with a new
+    /// Security-Client ("new values for spi_uc, spi_us and port_uc"), and the
+    /// UE does "not create a temporary set of security associations" (TS
+    /// 33.203 clauses 7.3.1.2, 7.3.1.3: it "may pass through an already
+    /// established SA"). Without a usable set it goes unprotected, like the
+    /// initial REGISTER.
+    pub(super) fn build_challenge_rejection(
+        &self,
+        entry: &mut RegistrantEntry,
+        defaults: EgressDefaults<'_>,
+        expires: u32,
+        authorization: String,
+    ) -> Option<BuiltRegister> {
+        match self.protected_set(entry, defaults) {
+            Some(set) => {
+                self.register_over_set(entry, defaults, &set, expires, authorization, true)
+            }
+            None => self.build_unprotected_register(entry, defaults, expires, Some(authorization)),
+        }
+    }
+
+    /// A REGISTER over `set` carrying `authorization`; see
+    /// [`build_protected_register`](Self::build_protected_register).
+    fn register_over_set(
+        &self,
+        entry: &mut RegistrantEntry,
+        defaults: EgressDefaults<'_>,
+        set: &EstablishedSaSet,
+        expires: u32,
+        authorization: String,
+        challenge_rejected: bool,
+    ) -> Option<BuiltRegister> {
         let ue_addr = entry.local_addr.unwrap_or(defaults.ue_ip);
         let address = entry.local_addr;
         let ipsec = entry.ue_ipsec.as_mut()?;
@@ -347,7 +569,7 @@ impl RegistrantManager {
             self.queue_sa_deletions([SaDeletion { address, key }]);
         }
         ipsec.sa_sets.pending_authorization = None;
-        self.renew_offer(ipsec);
+        self.renew_offer(ue_addr, ipsec, challenge_rejected);
         let security_client = build_security_client(&ipsec.offer());
         if expires > 0 {
             ipsec.sa_sets.exchange = UeExchange::Protected;
@@ -357,8 +579,11 @@ impl RegistrantManager {
         let egress = messages::EntryEgress::of(entry, defaults);
         let cseq = entry.next_cseq();
         let branch = format!("z9hG4bK-reg-{}", uuid::Uuid::new_v4());
+        // The binding is the protected server port, where the P-CSCF sends
+        // the requests for this UE over the set (TS 24.229 5.1.1.4.2 b,
+        // 5.1.1.6.2 b; TS 33.203 7.1).
         let contact = entry.contact_uri.clone().unwrap_or_else(|| {
-            default_contact_uri(&entry.credentials.username, egress.sent_by, entry.transport)
+            default_contact_uri(&entry.credentials.username, sent_by, entry.transport)
         });
         let mut builder = SipMessageBuilder::new()
             .request(
@@ -378,7 +603,7 @@ impl RegistrantManager {
                 build_contact_header(&contact, entry.ims_contact.as_ref()),
             )
             .header("Expires", expires.to_string())
-            .header("Authorization", set.authorization.clone())
+            .header("Authorization", authorization)
             .header("Security-Client", security_client)
             .header("Security-Verify", set.security_server.clone())
             .header("Require", "sec-agree".to_string())
@@ -395,7 +620,7 @@ impl RegistrantManager {
             entry.last_sent_at = Some(Instant::now());
         }
         match builder.build() {
-            Ok(message) => Some(Some(BuiltRegister {
+            Ok(message) => Some(BuiltRegister {
                 message,
                 branch,
                 destination: SocketAddr::new(entry.destination.ip(), set.pcscf_port_s),
@@ -404,12 +629,30 @@ impl RegistrantManager {
                 sent_by,
                 own_address: egress.own_address,
                 protected: true,
-            })),
+                challenge_rejected,
+            }),
             Err(error) => {
                 warn!(aor = %entry.aor, %error, "failed to build protected REGISTER");
-                Some(None)
+                None
             }
         }
+    }
+
+    /// Count an invalid challenge (TS 24.229 clause 5.1.1.5.3) against
+    /// `entry`; `false` once it is past the two consecutive ones a UE answers
+    /// (clause 5.1.1.5.12), which ends the attempt.
+    pub(super) fn answer_invalid_challenge(entry: &mut RegistrantEntry) -> bool {
+        entry.invalid_challenges += 1;
+        if entry.invalid_challenges > MAX_INVALID_CHALLENGES {
+            warn!(
+                aor = %entry.aor,
+                consecutive = entry.invalid_challenges,
+                "AKA: a third consecutive invalid challenge goes unanswered (TS 24.229 5.1.1.5.12)"
+            );
+            entry.invalid_challenges = 0;
+            return false;
+        }
+        true
     }
 
     /// The exchange `aor` has in flight; `None` for an entry without IPsec.
@@ -658,6 +901,126 @@ impl RegistrantManager {
         live + waiting + queued
     }
 
+    /// Make what can be made of the protected ports of `aor` that would not
+    /// bind (`failed`, on its address), instead of leaving the entry stalled:
+    ///
+    /// - a rotation port no set holds moves to another free port (bounded,
+    ///   [`MAX_PORT_REPLACEMENTS`]), which the next socket pass binds;
+    /// - the established set's client port takes that set out of use, so the
+    ///   next REGISTER goes unprotected and sets up a new one on a port that
+    ///   binds (TS 33.203 7.4.0: "the UE may send unprotected REGISTER
+    ///   messages at any time");
+    /// - a retiring or temporary set's port changes nothing: neither sends.
+    ///
+    /// It is blocked (sits the tick out) only when its plain or protected
+    /// server port is unbound, which nothing replaces, or no client port is
+    /// left to offer. Each move and each set taken out of use is logged and
+    /// counted (`siphon_ipsec_ue_port_bind_failures_total`).
+    pub fn degrade_unbindable_ports(
+        &self,
+        aor: &str,
+        failed: &[u16],
+        plain_port: u16,
+    ) -> PortDegradation {
+        let taken = self.ports_taken_beside(aor);
+        let Some(mut entry) = self.entries.get_mut(aor) else {
+            return PortDegradation::default();
+        };
+        let own_address = entry.local_addr.is_some();
+        let aor = entry.aor.clone();
+        let Some(ipsec) = entry.ue_ipsec.as_mut() else {
+            return PortDegradation {
+                moved: false,
+                blocked: !failed.is_empty(),
+            };
+        };
+        let mut outcome = PortDegradation {
+            moved: false,
+            blocked: failed.contains(&ipsec.ue_port_s)
+                || (own_address && failed.contains(&plain_port)),
+        };
+        let held: Vec<u16> = ipsec
+            .sa_sets
+            .keys()
+            .iter()
+            .map(|key| key.ue_port_c)
+            .collect();
+        for &port in failed {
+            if !ipsec.client_ports.contains(&port) {
+                continue;
+            }
+            if let Some(set) = ipsec
+                .sa_sets
+                .established
+                .as_mut()
+                .filter(|set| set.key.ue_port_c == port)
+            {
+                if set.usable {
+                    set.usable = false;
+                    crate::metrics::ipsec::record_ue_port_bind_failure();
+                    warn!(
+                        aor = %aor,
+                        port,
+                        "IPsec UE: the established set's client port will not bind; re-registering unprotected"
+                    );
+                }
+                continue;
+            }
+            if held.contains(&port) || ipsec.port_replacements >= MAX_PORT_REPLACEMENTS {
+                continue;
+            }
+            let Some(replacement) = replacement_port(ipsec, &taken, plain_port) else {
+                continue;
+            };
+            if let Some(slot) = ipsec.client_ports.iter_mut().find(|slot| **slot == port) {
+                *slot = replacement;
+            }
+            if ipsec.ue_port_c == port {
+                ipsec.ue_port_c = replacement;
+            }
+            ipsec.port_replacements += 1;
+            outcome.moved = true;
+            crate::metrics::ipsec::record_ue_port_bind_failure();
+            warn!(
+                aor = %aor,
+                port,
+                replacement,
+                "IPsec UE: a protected client port will not bind; rotating through another"
+            );
+        }
+        let offerable = ipsec
+            .client_ports
+            .iter()
+            .any(|port| !failed.contains(port) && !held.contains(port));
+        if !offerable && !outcome.moved {
+            outcome.blocked = true;
+            if !ipsec.ports_exhausted {
+                ipsec.ports_exhausted = true;
+                error!(
+                    aor = %aor,
+                    client_ports = ?ipsec.client_ports,
+                    "IPsec UE: no protected client port left that binds; the registration waits until one does"
+                );
+            }
+        } else {
+            ipsec.ports_exhausted = false;
+        }
+        outcome
+    }
+
+    /// The protected ports every other entry on `aor`'s address holds or may
+    /// offer, which a moved port must avoid.
+    fn ports_taken_beside(&self, aor: &str) -> HashSet<u16> {
+        let Some(address) = self.entries.get(aor).map(|entry| entry.local_addr) else {
+            return HashSet::new();
+        };
+        self.entries
+            .iter()
+            .filter(|other| other.aor != aor && other.local_addr == address)
+            .flat_map(|other| Self::protected_ports(&other))
+            .collect()
+    }
+
     /// The established SA set's client and P-CSCF server ports, for the MO
     /// flow over it; `None` without one.
     pub(super) fn established_ports(entry: &RegistrantEntry) -> Option<(u16, u16)> {
@@ -681,6 +1044,29 @@ impl RegistrantManager {
             })
             .unwrap_or_default()
     }
+}
+
+/// A free port for a client port that would not bind: above every port of
+/// the entry's, else below, never a standard SIP port (TS 33.203 7.1), the
+/// plain port, one of the entry's own, or one of `taken`.
+fn replacement_port(ipsec: &UeIpsec, taken: &HashSet<u16>, plain_port: u16) -> Option<u16> {
+    let own: HashSet<u16> = ipsec
+        .client_ports
+        .iter()
+        .copied()
+        .chain([ipsec.ue_port_s])
+        .collect();
+    let free = |port: &u16| {
+        !matches!(*port, 0 | 5060 | 5061)
+            && *port != plain_port
+            && !own.contains(port)
+            && !taken.contains(port)
+    };
+    let highest = own.iter().copied().max().unwrap_or(ipsec.ue_port_s);
+    let lowest = own.iter().copied().min().unwrap_or(ipsec.ue_port_s);
+    (highest..=u16::MAX)
+        .find(free)
+        .or_else(|| (1..lowest).rev().find(free))
 }
 
 #[cfg(test)]

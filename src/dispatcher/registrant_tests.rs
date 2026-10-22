@@ -148,10 +148,13 @@ async fn a_ue_on_its_own_address_installs_its_sas_and_sends_protected_from_there
         ipsec
             .get_sa(&ip(UE_ADDR), 6100)
             .and_then(|sa| sa.hard_lifetime_secs)
-            .filter(|lifetime| *lifetime == 632)
+            .filter(|lifetime| *lifetime == 630)
     })
     .await;
-    assert_eq!(lifetime, 632);
+    assert_eq!(
+        lifetime, 630,
+        "the registration plus 30 s (TS 24.229 5.1.1.2.2 step 2)"
+    );
 }
 
 #[tokio::test]

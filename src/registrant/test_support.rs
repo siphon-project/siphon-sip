@@ -156,3 +156,10 @@ pub(crate) fn sa_sets(manager: &RegistrantManager, aor: &str) -> super::UeSaSets
         .and_then(|entry| entry.ue_ipsec.as_ref().map(|ipsec| ipsec.sa_sets.clone()))
         .unwrap_or_default()
 }
+
+/// Set the SQN the USIM of `aor` last accepted.
+pub(crate) fn set_sqn(manager: &RegistrantManager, aor: &str, sqn: [u8; 6]) {
+    if let Some(mut entry) = manager.entries.get_mut(aor) {
+        entry.sqn_ms = sqn;
+    }
+}

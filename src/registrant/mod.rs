@@ -28,11 +28,14 @@ pub(crate) mod test_support;
 
 pub use messages::{BuiltRegister, EgressDefaults};
 pub use pacing::RefreshWindow;
-pub use protected::{SaDeletion, UeExchange, UeSaKey, UeSaSets};
-pub use refresh::{deregister_all, registration_loop, RegistrationLoopContext};
+pub use protected::{PortDegradation, SaDeletion, UeExchange, UeSaKey, UeSaSets};
+pub use refresh::{
+    deregister_all, registration_loop, retire_ue_security_associations, RegistrationLoopContext,
+    SHUTDOWN_ANSWER_WAIT,
+};
 pub use status::RegistrantStatus;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -238,6 +241,11 @@ pub struct UeIpsec {
     pub spi_ps: u32,
     /// Raw Security-Server value, echoed verbatim in Security-Verify.
     pub security_server: Option<String>,
+    /// Client ports moved off a port that would not bind (see
+    /// [`RegistrantManager::degrade_unbindable_ports`]), and whether it ran
+    /// out of moves with no port left to offer.
+    pub port_replacements: u32,
+    pub ports_exhausted: bool,
 }
 
 /// The integrity algorithms a UE offers in Security-Client: the preferred one
@@ -278,6 +286,8 @@ impl UeIpsec {
             spi_pc: 0,
             spi_ps: 0,
             security_server: None,
+            port_replacements: 0,
+            ports_exhausted: false,
         }
     }
 
@@ -487,6 +497,8 @@ pub struct RegistrantEntry {
     pub last_failure_status: Option<u16>,
     /// When the last REGISTER was sent (for transaction timeout detection).
     pub last_sent_at: Option<Instant>,
+    /// Consecutive invalid AKA challenges answered (TS 24.229 5.1.1.5.12).
+    pub invalid_challenges: u32,
     /// Who created this entry.
     ///
     /// A source reconcile only ever adds, updates or removes entries it created
@@ -571,6 +583,7 @@ impl RegistrantEntry {
             failure_count: 0,
             last_failure_status: None,
             last_sent_at: None,
+            invalid_challenges: 0,
             origin: EntryOrigin::Script,
             source_fingerprint: None,
             auth_mode: AuthMode::Digest,
@@ -710,6 +723,10 @@ pub struct RegistrantManager {
     /// The kernel the UE SAs live in, installed by [`registration_loop`]: lets
     /// a REGISTER check that the SA set it would ride is still there.
     ipsec: std::sync::OnceLock<Arc<IpsecManager>>,
+    /// SA deletion tasks still running, which shutdown waits for.
+    sa_deletions_in_flight: Arc<std::sync::atomic::AtomicUsize>,
+    /// SPIs of the kernel's states when the loop started: never offered.
+    kernel_spis_at_start: std::sync::OnceLock<HashSet<u32>>,
     /// Serialises the address-uniqueness check with the write it guards, so
     /// two concurrent adds cannot both claim one address.
     address_lock: std::sync::Mutex<()>,
@@ -760,6 +777,8 @@ impl RegistrantManager {
             pending_sa_deletions: std::sync::Mutex::new(Vec::new()),
             teardowns: std::sync::Mutex::new(Vec::new()),
             ipsec: std::sync::OnceLock::new(),
+            sa_deletions_in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            kernel_spis_at_start: std::sync::OnceLock::new(),
             address_lock: std::sync::Mutex::new(()),
             refresh_window: RefreshWindow::HALF,
             max_registers_per_sec: None,
@@ -1144,6 +1163,7 @@ impl RegistrantManager {
             entry.last_failure_status = None;
             entry.backoff = Duration::from_secs(5);
             entry.last_sent_at = None;
+            entry.invalid_challenges = 0;
             info!(
                 aor = %entry.aor,
                 expires = granted_expires,
@@ -2584,8 +2604,13 @@ mod tests {
         assert!(raw.contains("auts="), "SQN mismatch must emit AUTS: {raw}");
     }
 
+    /// TS 24.229 5.1.1.5.3: a challenge whose MAC fails is answered with "no
+    /// "auts" Authorization header field parameter and an empty "response"
+    /// Authorization header field parameter", and 5.1.1.5.12: "A UE shall only
+    /// respond to two consecutive invalid challenges". It used to give up at
+    /// once, which left the network waiting out reg-await-auth.
     #[test]
-    fn build_register_aka_mac_failure_returns_none() {
+    fn build_register_aka_mac_failure_is_answered_twice_then_given_up() {
         use base64::Engine as _;
         let manager = make_manager();
         manager.add(make_aka_entry(AKA_AOR));
@@ -2601,15 +2626,44 @@ mod tests {
             ..good
         };
 
-        assert!(manager
-            .build_register_aka(
+        let attempt = || {
+            manager.build_register_aka(
                 AKA_AOR,
                 EgressDefaults::new("127.0.0.1:5060".parse().unwrap(), &HashMap::new()),
                 &corrupted,
                 600000,
                 None,
             )
-            .is_none());
+        };
+        for _ in 0..2 {
+            let built = attempt().expect("an invalid challenge is answered");
+            assert!(built.challenge_rejected);
+            let authorization = built
+                .message
+                .headers
+                .get("Authorization")
+                .cloned()
+                .expect("an Authorization");
+            assert!(authorization.contains("response=\"\""), "{authorization}");
+            assert!(!authorization.contains("auts="), "{authorization}");
+        }
+        assert!(attempt().is_none(), "the third goes unanswered");
+        // Having given up, the next attempt counts afresh.
+        assert!(attempt().is_some());
+    }
+
+    #[test]
+    fn an_empty_response_keeps_every_other_parameter() {
+        assert_eq!(
+            messages::empty_response(
+                "Digest username=\"u\", response=\"0123abcd\", nonce=\"n\", algorithm=AKAv1-MD5"
+            ),
+            "Digest username=\"u\", response=\"\", nonce=\"n\", algorithm=AKAv1-MD5"
+        );
+        assert_eq!(
+            messages::empty_response("Digest username=\"u\""),
+            "Digest username=\"u\""
+        );
     }
 
     #[test]

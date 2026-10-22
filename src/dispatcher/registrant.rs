@@ -33,11 +33,7 @@ pub(super) fn handle_registrant_response(
     handle_answer(registrant, message, status_code, branch, state);
     // The SA sets the answer superseded, abandoned or finished with.
     if let Some(ipsec) = state.ipsec_manager.as_ref() {
-        crate::registrant::protected::spawn_sa_deletions(
-            registrant.take_pending_sa_deletions(),
-            ipsec,
-            state.local_addr.ip(),
-        );
+        registrant.spawn_sa_deletions(ipsec, state.local_addr.ip());
     }
 }
 
@@ -110,9 +106,10 @@ fn handle_answer(
             }
 
             // IPsec: settle the SA sets the exchange produced (TS 33.203
-            // 7.4.1a), then set the established set's lifetime to the
-            // registration's plus Timer F grace, never shorter than what the
-            // set it took over from had left (TS 24.229 5.1.1.5.1; the
+            // 7.4.1a), then set the established set's lifetime to "the
+            // longest of either the previously existing security association
+            // lifetime, or the lifetime of the just completed registration
+            // plus 30 seconds" (TS 24.229 5.1.1.2.2, 5.1.1.4.2, 5.1.1.5.1; the
             // lifetime of an SA is never decreased).
             if is_aka && registrant.is_ipsec_entry(&aor) {
                 if let (Some(ipsec_manager), Some(concluded)) = (
@@ -124,7 +121,8 @@ fn handle_answer(
                     let ue_addr = registrant
                         .ue_addr(&aor)
                         .unwrap_or_else(|| state.local_addr.ip());
-                    let granted = (expires as u64) + 32;
+                    let granted =
+                        (expires as u64) + crate::registrant::protected::SA_LIFETIME_MARGIN_SECS;
                     tokio::spawn(async move {
                         let remaining = |port: u16| {
                             ipsec_manager
@@ -289,6 +287,20 @@ pub(super) fn handle_registrant_ipsec_challenge(
         registrant.handle_failure(aor, status_code, retry_after);
         return;
     };
+    // An invalid challenge is answered over the set the UE already has, or
+    // unprotected, and sets up no temporary set (TS 24.229 5.1.1.5.3).
+    if built.challenge_rejected {
+        let data = bytes::Bytes::from(built.message.to_bytes());
+        send_outbound_from(
+            data,
+            built.transport,
+            built.destination,
+            crate::transport::ConnectionId::default(),
+            built.source_local_addr,
+            state,
+        );
+        return;
+    }
     let (retry_message, destination, transport) =
         (built.message, built.destination, built.transport);
 
@@ -306,12 +318,13 @@ pub(super) fn handle_registrant_ipsec_challenge(
     });
     let ue_addr = source.ip();
     let pcscf_addr = destination.ip();
-    // Placeholder lifetime; tightened to the granted Expires on the 200 OK.
+    // A temporary set lives as long as the reg-await-auth timer (TS 24.229
+    // 5.1.1.5.1 step 2); the 200 sets the established lifetime.
     let sa = registrant.ue_sa_pair(
         aor,
         ue_addr,
         pcscf_addr,
-        Some(registrant.default_interval as u64),
+        Some(crate::registrant::protected::REG_AWAIT_AUTH_SECS),
         crate::ipsec::SaProtocol::Any,
     );
 
@@ -420,3 +433,11 @@ mod tests;
 #[cfg(test)]
 #[path = "registrant_protected_tests.rs"]
 mod protected_tests;
+
+#[cfg(test)]
+#[path = "registrant_sa_lifecycle_tests.rs"]
+mod sa_lifecycle_tests;
+
+#[cfg(test)]
+#[path = "registrant_mt_tests.rs"]
+mod mt_tests;

@@ -13,6 +13,53 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
+### Fixed
+
+- **IMS UE registrant: the Contact of a protected REGISTER names the protected
+  server port.** The authenticated REGISTER after a 401 and every protected
+  re- and de-REGISTER bound the plain port, so the S-CSCF sent MT requests
+  outside the SAs. They now bind `ue_port_s` (TS 24.229 5.1.1.2.2 b, 5.1.1.4.2
+  b, 5.1.1.6.2 b); the unprotected initial REGISTER keeps the plain port.
+
+- **IMS UE registrant: an invalid AKA challenge sets up no SA set.** An AUTS
+  re-synchronisation installed a temporary set from the previous keys, which
+  the P-CSCF could not read. It now goes over the established set, or
+  unprotected without one, with new SPIs and client port and no temporary set
+  (TS 24.229 5.1.1.5.3). A bad MAC is answered the same way with an empty
+  response instead of ending the registration, and a third consecutive
+  invalid challenge ends it (5.1.1.5.12).
+
+- **IMS UE registrant: SA sets are deleted at shutdown.** Shutdown removes every
+  entry, de-registers over each UE's set and deletes the sets as the answers
+  come, and the rest after 4 s, before the process exits (bounded, 5 s of
+  deletions at most). They used to stay in the kernel to their hard lifetime.
+  Removing the entries also stops the loop refreshing a binding during the
+  drain that shutdown had just cleared.
+
+- **IMS UE registrant: SA lifetimes.** A temporary set lives the 4-minute
+  reg-await-auth timer (TS 24.229 5.1.1.5.1), not the default interval, and an
+  established one the registration plus 30 s (was 32 s). Policy lifetimes are
+  now re-pinned with the states, for the P-CSCF too: a policy used to keep its
+  install lifetime and end under a live set.
+
+- **IMS UE registrant: make-before-break against a P-CSCF with a fixed
+  protected client port.** The old and new sets share the policies toward the
+  UE's server port, whose template named the newest set's SPI only, so a
+  request the P-CSCF sent over the old set during the overlap was dropped. The
+  UE's templates there now accept any SA of the selector, and installing or
+  deleting one set never removes the policy under the other. The P-CSCF role
+  is unchanged.
+
+- **IMS UE registrant: a protected port that will not bind no longer stalls the
+  entry.** A rotation port moves to another free port, and the established
+  set's own port sends the next REGISTER unprotected; both are logged and
+  counted in `siphon_ipsec_ue_port_bind_failures_total`.
+
+- **IMS UE registrant: SPIs unique among existing SAs.** An offer skips the SPIs
+  of the UE's own sets (both ends), of pairs the IPsec manager owns, and of
+  kernel states present at start, so a restart never offers an SPI a previous
+  process left in the kernel (TS 33.203 7.1).
+
 ## [1.15.2] — 2026-10-22
 
 ### Added
