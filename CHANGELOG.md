@@ -13,6 +13,8 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
+## [1.15.2] — 2026-10-22
+
 ### Added
 
 - **`strip=` on `request.relay()` and `request.fork()`.** Header fields left off
@@ -179,6 +181,13 @@ entry, but a working config keeps working.
   authenticated REGISTER answering a digest or non-IPsec AKA challenge was
   sent without a source pin, so on a host with several listeners it could
   leave from another address than the first REGISTER.
+
+### Security
+
+- **rustls-webpki 0.103.16 and webpki-roots 1.0.10** (RUSTSEC-2026-0382,
+  RUSTSEC-2026-0381: distrusted intermediates could be accepted) in siphon,
+  siphon-bin and the control SDK, whose 0.10.1 ships the fix in its Python
+  wheel.
 
 ## [1.15.1] — 2026-10-20
 
