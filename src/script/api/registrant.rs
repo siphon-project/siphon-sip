@@ -11,6 +11,13 @@
 //!
 //! for reg in registration.list():
 //!     log.info(f"{reg['aor']}: {reg['state']} expires_in={reg['expires_in']}")
+//!
+//! # One process, many IMS UEs, each from its own address:
+//! registration.add(impu, pcscf, user=impi, auth="aka", k=k, opc=opc,
+//!                  ipsec=True, ue_port_c=6100, ue_port_s=6101,
+//!                  local_addr="192.0.2.77")
+//! registration.set_local_addr(impu, "192.0.2.78")   # the UE moved
+//! aor = registration.find_by_local(call.flow.local_addr)  # MT: which UE?
 //! ```
 
 use std::sync::Arc;
@@ -76,10 +83,25 @@ impl PyRegistration {
     ///         instance tag.
     ///     ims_features: Contact feature tags to advertise so the S-CSCF
     ///         registers the implied services — any of "mmtel", "video", "smsip".
+    ///     local_addr: The IP this entry registers from (Via/Contact host, UDP
+    ///         source, and with ipsec the UE side of its SAs, its protected
+    ///         ports opened on this address). siphon opens the sockets itself,
+    ///         so the address need not exist on the host yet. UDP only. None
+    ///         (default): the process's own address.
+    ///     require_local_addr: Never register from the process's address:
+    ///         without a local_addr the entry waits as "awaiting_address" until
+    ///         set_local_addr() gives it one. Implied by local_addr.
+    ///     refresh_window: (low, high) fractions of the granted Expires to
+    ///         refresh within, drawn per refresh; 0 < low <= high < 1. None:
+    ///         the registrant default.
+    ///
+    /// Raises ValueError for an address another entry already registers from
+    /// with the same ue_port_c, a local_addr on a non-UDP transport, or a bad
+    /// refresh window. Secrets (password, k, op, opc) are never logged.
     // Wide by necessity: outbound registration exposes the full carrier-trunk
     // + AKA + IPsec credential set as keyword arguments to scripts.
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (aor, registrar, *, user, password="", interval=None, realm=None, contact=None, transport=None, auth=None, k=None, op=None, opc=None, amf=None, sqn=None, ipsec=false, ue_port_c=None, ue_port_s=None, ipsec_alg=None, ipsec_ealg=None, imei=None, ims_features=None))]
+    #[pyo3(signature = (aor, registrar, *, user, password="", interval=None, realm=None, contact=None, transport=None, auth=None, k=None, op=None, opc=None, amf=None, sqn=None, ipsec=false, ue_port_c=None, ue_port_s=None, ipsec_alg=None, ipsec_ealg=None, imei=None, ims_features=None, local_addr=None, require_local_addr=false, refresh_window=None))]
     fn add(
         &self,
         aor: &str,
@@ -103,6 +125,9 @@ impl PyRegistration {
         ipsec_ealg: Option<&str>,
         imei: Option<String>,
         ims_features: Option<Vec<String>>,
+        local_addr: Option<&str>,
+        require_local_addr: bool,
+        refresh_window: Option<(f64, f64)>,
     ) -> PyResult<()> {
         // The same set, from the same function, as the YAML validator — refused
         // rather than silently downgraded to UDP, which is how a script asking
@@ -224,8 +249,79 @@ impl PyRegistration {
             entry
         };
 
-        self.inner.add(entry);
-        Ok(())
+        // Its own address, or a promise of one (see `registrant::address`).
+        let entry = match local_addr {
+            Some(text) => entry.with_local_addr(parse_ip(text, "local_addr")?),
+            None if require_local_addr => entry.requiring_local_addr(),
+            None => entry,
+        };
+        let entry = match refresh_window {
+            Some((low, high)) => entry.with_refresh_window(
+                crate::registrant::RefreshWindow::new(low, high)
+                    .map_err(pyo3::exceptions::PyValueError::new_err)?,
+            ),
+            None => entry,
+        };
+
+        self.inner
+            .try_add(entry)
+            .map_err(pyo3::exceptions::PyValueError::new_err)
+    }
+
+    /// Move a registration to another address, or take its address away.
+    ///
+    /// Args:
+    ///     aor: The registration's AoR.
+    ///     local_addr: The IP it registers from now, or None for none.
+    ///
+    /// Restating the current address changes nothing, so this can run on a
+    /// timer for every UE. A real move tears down the IPsec SAs on the old
+    /// address and starts a fresh registration from the new one at the next
+    /// tick. None leaves an entry that has had an address (or was added with
+    /// require_local_addr) "awaiting_address" until it gets one; any other
+    /// entry falls back to the process's address.
+    ///
+    /// Returns False when there is no such registration. Raises ValueError for
+    /// an address another entry already uses with the same ue_port_c, or for a
+    /// non-UDP registration.
+    #[pyo3(signature = (aor, local_addr))]
+    fn set_local_addr(&self, aor: &str, local_addr: Option<&str>) -> PyResult<bool> {
+        let local_addr = local_addr
+            .map(|text| parse_ip(text, "local_addr"))
+            .transpose()?;
+        self.inner
+            .set_local_addr(aor, local_addr)
+            .map_err(pyo3::exceptions::PyValueError::new_err)
+    }
+
+    /// The AoR registering from an address, for routing an MT request to the
+    /// UE it arrived for.
+    ///
+    /// Args:
+    ///     local: "ip" or "ip:port" ("[v6]:port"), e.g. call.flow.local_addr.
+    ///         With a port, the entry owning that port on the address (its plain
+    ///         port, or its protected client or server port); without, the
+    ///         first entry on the address.
+    ///
+    /// Returns the AoR, or None when no entry registers from there. A linear
+    /// scan over the registrations, meant for once per call.
+    fn find_by_local(&self, local: &str) -> PyResult<Option<String>> {
+        let query = crate::registrant::address::LocalAddrQuery::parse(local)
+            .map_err(pyo3::exceptions::PyValueError::new_err)?;
+        Ok(self.inner.find_by_local(query))
+    }
+
+    /// How many registrations are in each state.
+    ///
+    /// Returns a dict with every state as a key ("unregistered",
+    /// "registering", "challenging", "registered", "failed",
+    /// "awaiting_address"), zero when none is in it.
+    fn counts<'py>(&self, python: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let dict = PyDict::new(python);
+        for (state, count) in self.inner.counts() {
+            dict.set_item(state, count)?;
+        }
+        Ok(dict)
     }
 
     /// Remove an outbound registration by AoR.
@@ -240,15 +336,30 @@ impl PyRegistration {
 
     /// List all registrations with their current state.
     ///
-    /// Returns a list of dicts with keys: aor, state, expires_in.
+    /// Returns a list of dicts with keys: aor, state, expires_in, local_addr
+    /// (str, or None on the process's address), failure_count, and
+    /// last_failure_status (int, or None once an attempt succeeded).
     fn list<'py>(&self, python: Python<'py>) -> PyResult<Vec<Bound<'py, PyDict>>> {
         let entries = self.inner.list();
         let mut result = Vec::with_capacity(entries.len());
         for (aor, state, expires_in) in entries {
             let dict = PyDict::new(python);
+            let status = self.inner.status(&aor);
+            let local_addr = self.inner.ue_addr(&aor).map(|ip| ip.to_string());
             dict.set_item("aor", aor)?;
             dict.set_item("state", state.to_string())?;
             dict.set_item("expires_in", expires_in)?;
+            dict.set_item("local_addr", local_addr)?;
+            dict.set_item(
+                "failure_count",
+                status.as_ref().map_or(0, |status| status.failure_count),
+            )?;
+            dict.set_item(
+                "last_failure_status",
+                status
+                    .as_ref()
+                    .and_then(|status| status.last_failure_status),
+            )?;
             result.push(dict);
         }
         Ok(result)
@@ -283,16 +394,28 @@ impl PyRegistration {
     /// Pass the result to ``call.dial(flow=...)``: the B-leg INVITE is sent to
     /// the P-CSCF protected server port sourced from the UE protected client
     /// port, so it rides the SA. `ue_ip` is siphon's own address on the SA
-    /// (the IP its protected ports are bound to). Returns ``None`` until the
-    /// sec-agree handshake has completed (no Security-Server recorded yet).
+    /// (the IP its protected ports are bound to); it defaults to the entry's
+    /// local_addr, and is required for an entry without one. Returns ``None``
+    /// until the sec-agree handshake has completed (no Security-Server
+    /// recorded yet).
+    #[pyo3(signature = (aor, ue_ip=None))]
     fn flow(
         &self,
         aor: &str,
-        ue_ip: &str,
+        ue_ip: Option<&str>,
     ) -> PyResult<Option<crate::script::api::registrar::PyFlow>> {
-        let ue_ip: std::net::IpAddr = ue_ip.parse().map_err(|_| {
-            pyo3::exceptions::PyValueError::new_err(format!("ue_ip '{ue_ip}' is not an IP address"))
-        })?;
+        let ue_ip: std::net::IpAddr = match ue_ip {
+            Some(text) => parse_ip(text, "ue_ip")?,
+            None => match self.inner.ue_addr(aor) {
+                Some(ip) => ip,
+                None if self.inner.state(aor).is_none() => return Ok(None),
+                None => {
+                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                        "{aor} registers from the process's address: pass ue_ip"
+                    )))
+                }
+            },
+        };
         Ok(self
             .inner
             .ue_flow_components(aor)
@@ -313,7 +436,8 @@ impl PyRegistration {
     /// The handler receives (aor, event_type, state) where:
     ///   - aor: str — Address of Record (e.g. "sip:trunk@carrier.com")
     ///   - event_type: str — "registered", "refreshed", "failed",
-    ///     "deregistered", or "snapshot" (a re-report of every outbound
+    ///     "deregistered", "awaiting_address" (it needs an address of its own
+    ///     and has none), or "snapshot" (a re-report of every outbound
     ///     registration after the handler fell behind and events were lost)
     ///   - state: dict — {"expires_in": int, "failure_count": int,
     ///     "registrar": str, "state": str | None (the current state, None once
@@ -346,6 +470,13 @@ impl PyRegistration {
         )?;
         Ok(func)
     }
+}
+
+/// Parse an IP address argument, naming the argument in the error.
+fn parse_ip(text: &str, argument: &str) -> PyResult<std::net::IpAddr> {
+    text.trim().parse().map_err(|_| {
+        pyo3::exceptions::PyValueError::new_err(format!("{argument} '{text}' is not an IP address"))
+    })
 }
 
 /// Parse an initial SQN_MS from a 12-hex-char string into 6 bytes.
@@ -438,6 +569,9 @@ mod tests {
             None,
             None,
             None,
+            None,
+            false,
+            None,
         )
     }
 
@@ -468,6 +602,9 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
+            false,
             None,
         )
     }
@@ -545,6 +682,9 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
+                false,
                 None,
             )
             .unwrap();
@@ -665,6 +805,9 @@ assert 'registration.on_change' in kinds, kinds
             None,
             None,
             None,
+            None,
+            false,
+            None,
         )
     }
 
@@ -705,11 +848,13 @@ assert 'registration.on_change' in kinds, kinds
         // One AoR, re-added each time; the last add won, so the entry is the
         // mixed-case TLS one.
         assert_eq!(py_reg.count(), 1);
-        let (_, _, _, transport) = manager
+        let crate::registrant::BuiltRegister { transport, .. } = manager
             .build_register(
                 "sip:trunk@carrier.example",
-                "127.0.0.1:5060".parse().expect("local addr"),
-                &std::collections::HashMap::new(),
+                crate::registrant::EgressDefaults::new(
+                    "127.0.0.1:5060".parse().expect("local addr"),
+                    &std::collections::HashMap::new(),
+                ),
                 600,
             )
             .expect("the entry must be registrable");
@@ -717,6 +862,187 @@ assert 'registration.on_change' in kinds, kinds
             transport,
             Transport::Tls,
             "a mixed-case token must not fall through to udp"
+        );
+    }
+
+    /// An IMS UE added from a script on an address of its own.
+    fn add_ue(
+        py_reg: &PyRegistration,
+        aor: &str,
+        local_addr: Option<&str>,
+        require_local_addr: bool,
+        refresh_window: Option<(f64, f64)>,
+    ) -> PyResult<()> {
+        py_reg.add(
+            aor,
+            "sip:198.51.100.10:5060",
+            "001010000000001@ims.mnc01.mcc001.3gppnetwork.org",
+            "",
+            None,
+            None,
+            None,
+            None,
+            Some("aka"),
+            Some(AKA_K),
+            None,
+            Some(AKA_OPC),
+            None,
+            None,
+            true,
+            Some(6100),
+            Some(6101),
+            None,
+            None,
+            Some("01234567-000001-0".to_string()),
+            Some(vec!["mmtel".to_string()]),
+            local_addr,
+            require_local_addr,
+            refresh_window,
+        )
+    }
+
+    const UE_TWO: &str = "sip:001010000000002@ims.mnc01.mcc001.3gppnetwork.org";
+
+    #[test]
+    fn add_takes_a_local_addr_and_refuses_a_shared_one() {
+        let manager = make_manager();
+        let py_reg = PyRegistration::new(Arc::clone(&manager), "127.0.0.1:5060".parse().unwrap());
+        add_ue(
+            &py_reg,
+            AKA_AOR,
+            Some("192.0.2.77"),
+            false,
+            Some((0.4, 0.6)),
+        )
+        .unwrap();
+        assert_eq!(
+            manager.ue_addr(AKA_AOR),
+            Some("192.0.2.77".parse().unwrap())
+        );
+        assert!(add_ue(&py_reg, UE_TWO, Some("192.0.2.77"), false, None).is_err());
+        assert!(add_ue(&py_reg, UE_TWO, Some("not-an-ip"), false, None).is_err());
+        assert!(add_ue(&py_reg, UE_TWO, Some("192.0.2.78"), false, Some((0.8, 0.2))).is_err());
+        assert_eq!(py_reg.count(), 1);
+    }
+
+    #[test]
+    fn set_local_addr_moves_and_takes_away() {
+        let manager = make_manager();
+        let py_reg = PyRegistration::new(Arc::clone(&manager), "127.0.0.1:5060".parse().unwrap());
+        add_ue(&py_reg, AKA_AOR, None, true, None).unwrap();
+        assert_eq!(py_reg.status(AKA_AOR).as_deref(), Some("awaiting_address"));
+
+        assert!(py_reg.set_local_addr(AKA_AOR, Some("192.0.2.77")).unwrap());
+        assert_eq!(py_reg.status(AKA_AOR).as_deref(), Some("unregistered"));
+        assert!(py_reg.set_local_addr(AKA_AOR, None).unwrap());
+        assert_eq!(py_reg.status(AKA_AOR).as_deref(), Some("awaiting_address"));
+        assert!(!py_reg.set_local_addr(UE_TWO, None).unwrap());
+        assert!(py_reg.set_local_addr(AKA_AOR, Some("bogus")).is_err());
+    }
+
+    #[test]
+    fn find_by_local_and_flow_use_the_entrys_address() {
+        let manager = make_manager();
+        let py_reg = PyRegistration::new(Arc::clone(&manager), "127.0.0.1:5060".parse().unwrap());
+        add_ue(&py_reg, AKA_AOR, Some("192.0.2.77"), false, None).unwrap();
+        add_ue(&py_reg, UE_TWO, Some("192.0.2.78"), false, None).unwrap();
+        assert_eq!(
+            py_reg.find_by_local("192.0.2.78:6101").unwrap().as_deref(),
+            Some(UE_TWO)
+        );
+        assert_eq!(py_reg.find_by_local("192.0.2.99").unwrap(), None);
+        assert!(py_reg.find_by_local("nonsense").is_err());
+
+        // No handshake yet: no flow, but no error either.
+        assert!(py_reg.flow(AKA_AOR, None).unwrap().is_none());
+        let server = crate::ipsec::parse_security_client(
+            "ipsec-3gpp; alg=hmac-sha-1-96; spi-c=1111; spi-s=2222; port-c=5064; port-s=5066",
+        )
+        .unwrap();
+        manager.store_security_server(AKA_AOR, &server, "raw");
+        let flow = py_reg.flow(AKA_AOR, None).unwrap().expect("a flow");
+        assert_eq!(flow.local_addr, "192.0.2.77:6100".parse().unwrap());
+        assert_eq!(flow.source_addr, "198.51.100.10:5066".parse().unwrap());
+        // An explicit ue_ip still wins.
+        let flow = py_reg
+            .flow(AKA_AOR, Some("192.0.2.5"))
+            .unwrap()
+            .expect("a flow");
+        assert_eq!(flow.local_addr, "192.0.2.5:6100".parse().unwrap());
+        // Unknown AoR: None.
+        assert!(py_reg
+            .flow("sip:nobody@example.invalid", None)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn flow_needs_ue_ip_for_an_entry_on_the_process_address() {
+        let manager = make_manager();
+        let py_reg = PyRegistration::new(Arc::clone(&manager), "127.0.0.1:5060".parse().unwrap());
+        add_ue(&py_reg, AKA_AOR, None, false, None).unwrap();
+        assert!(py_reg.flow(AKA_AOR, None).is_err());
+        assert!(py_reg.flow(AKA_AOR, Some("192.0.2.5")).is_ok());
+    }
+
+    #[test]
+    fn counts_and_list_report_the_new_fields() {
+        crate::own_process::run(
+            concat!(module_path!(), "::counts_and_list_report_the_new_fields"),
+            || {
+                pyo3::Python::initialize();
+                pyo3::Python::attach(|python| {
+                    let manager = make_manager();
+                    let py_reg = PyRegistration::new(
+                        Arc::clone(&manager),
+                        "127.0.0.1:5060".parse().unwrap(),
+                    );
+                    add_ue(&py_reg, AKA_AOR, Some("192.0.2.77"), false, None).unwrap();
+                    add_ue(&py_reg, UE_TWO, None, true, None).unwrap();
+                    let counts = py_reg.counts(python).unwrap();
+                    let count = |state: &str| -> usize {
+                        counts
+                            .get_item(state)
+                            .unwrap()
+                            .expect("every state is a key")
+                            .extract()
+                            .unwrap()
+                    };
+                    assert_eq!(count("unregistered"), 1);
+                    assert_eq!(count("awaiting_address"), 1);
+                    assert_eq!(count("registered"), 0);
+                    let listed = py_reg.list(python).unwrap();
+                    let own = listed
+                        .iter()
+                        .find(|row| {
+                            row.get_item("aor")
+                                .unwrap()
+                                .and_then(|aor| aor.extract::<String>().ok())
+                                .as_deref()
+                                == Some(AKA_AOR)
+                        })
+                        .expect("listed");
+                    let local: Option<String> = own
+                        .get_item("local_addr")
+                        .unwrap()
+                        .unwrap()
+                        .extract()
+                        .unwrap();
+                    assert_eq!(local.as_deref(), Some("192.0.2.77"));
+                    let failures: u32 = own
+                        .get_item("failure_count")
+                        .unwrap()
+                        .unwrap()
+                        .extract()
+                        .unwrap();
+                    assert_eq!(failures, 0);
+                    assert!(own
+                        .get_item("last_failure_status")
+                        .unwrap()
+                        .unwrap()
+                        .is_none());
+                });
+            },
         );
     }
 

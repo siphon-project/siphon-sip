@@ -303,6 +303,7 @@ fn capture_streams(sequence: &mut Sequence) -> flume::Receiver<OutboundMessage> 
     sequence.dispatcher.state.outbound = Arc::new(OutboundRouter {
         udp: router.udp.clone(),
         udp_by_local: router.udp_by_local.clone(),
+        udp_dynamic: router.udp_dynamic.clone(),
         tcp: sender.clone(),
         tls: sender.clone(),
         ws: sender.clone(),

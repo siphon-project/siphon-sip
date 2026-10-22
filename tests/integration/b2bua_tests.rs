@@ -3072,6 +3072,7 @@ fn soft_ue_router() -> (
         // The default channel is the first-configured listener — the plain one.
         udp: plain.0.clone().into(),
         udp_by_local,
+        udp_dynamic: None,
         tcp: dummy.clone(),
         tls: dummy.clone(),
         ws: dummy.clone(),

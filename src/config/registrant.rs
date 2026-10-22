@@ -23,6 +23,19 @@ use serde::Deserialize;
 ///       contact: "sip:alice@1.2.3.4"
 ///       transport: "udp"
 /// ```
+///
+/// A process registering many IMS UEs, each from an address of its own, sets
+/// `local_addr` per entry and usually paces itself:
+///
+/// ```yaml
+/// registrant:
+///   refresh_window: [0.4, 0.6]     # refresh at 40-60 % of the grant
+///   max_registers_per_sec: 50      # cap on new REGISTERs per second
+///   entries:
+///     - aor: "sip:001010000000001@ims.mnc01.mcc001.3gppnetwork.org"
+///       local_addr: "192.0.2.77"   # UDP only
+///       # ... auth: aka, aka:, ipsec:, ims: as for one UE
+/// ```
 #[derive(Debug, Deserialize, Clone)]
 pub struct RegistrantYamlConfig {
     /// Where the registering trunks come from. Default: `static`, the
@@ -51,6 +64,22 @@ pub struct RegistrantYamlConfig {
     /// Static registration entries.
     #[serde(default)]
     pub entries: Vec<RegistrantEntryConfig>,
+    /// When to refresh a binding, as `[low, high]` fractions of the granted
+    /// Expires, drawn uniformly per refresh. Default `[0.5, 0.5]`: exactly half,
+    /// as always. A wider window keeps a fleet registered together from
+    /// refreshing together for ever. Each entry may override it.
+    pub refresh_window: Option<[f64; 2]>,
+    /// Cap on new REGISTERs (initial, refresh, retry) the loop starts per
+    /// second, in any one-second window. The authenticated REGISTER answering a
+    /// 401 is not held back. Unset: no cap, and the loop ticks every 5 s; set,
+    /// it ticks every 200 ms and starts the longest-overdue entries first.
+    pub max_registers_per_sec: Option<u32>,
+    /// How many state-change events (`@registration.on_change`,
+    /// `RegistrantChanged`) may wait for a slow consumer before it lags and is
+    /// sent a snapshot instead. Default: the larger of 1024 and four per
+    /// configured entry; raise it to at least the number of entries a script
+    /// adds.
+    pub event_capacity: Option<usize>,
 }
 
 /// Where `registrant:` reads its registering trunks from.
@@ -167,6 +196,19 @@ pub struct RegistrantEntryConfig {
     /// IMS Contact feature tags (instance ID + MMTel/video/SMS) so the S-CSCF
     /// registers the implied services.
     pub ims: Option<RegistrantImsConfig>,
+    /// The address this entry registers from: Via and Contact host, the UDP
+    /// source of every REGISTER, and with `ipsec` the UE side of its SAs (its
+    /// protected ports opened on this address, so they may repeat across
+    /// entries). siphon opens the sockets itself, with IP_FREEBIND, so the
+    /// address need not exist yet. UDP only. Unset: the process's address.
+    pub local_addr: Option<std::net::IpAddr>,
+    /// Never register from the process's address: with no `local_addr` (or
+    /// once a script takes it away with `registration.set_local_addr(aor,
+    /// None)`) the entry waits as `awaiting_address`. Implied by `local_addr`.
+    #[serde(default)]
+    pub require_local_addr: bool,
+    /// This entry's refresh window, overriding `registrant.refresh_window`.
+    pub refresh_window: Option<[f64; 2]>,
 }
 
 /// IMS Contact feature tags for a registrant entry (TS 24.229 / GSMA IR.92).
@@ -242,6 +284,61 @@ fn default_registrant_max_retry() -> u64 {
 
 fn default_registrant_transport() -> String {
     "udp".to_string()
+}
+
+impl RegistrantYamlConfig {
+    /// Refuse what the per-UE address and pacing settings cannot honour: a
+    /// window outside `0 < low <= high < 1`, a zero start rate, a `local_addr`
+    /// on a stream transport, and two entries sharing one address and UE
+    /// protected client port.
+    pub fn validate_ue_entries(&self) -> std::result::Result<(), String> {
+        if let Some(pair) = self.refresh_window {
+            crate::registrant::RefreshWindow::from_pair(pair)
+                .map_err(|reason| format!("registrant.{reason}"))?;
+        }
+        if self.max_registers_per_sec == Some(0) {
+            return Err(
+                "registrant.max_registers_per_sec must be at least 1 (leave it unset for no cap)"
+                    .to_string(),
+            );
+        }
+        let mut seen: std::collections::HashMap<(std::net::IpAddr, Option<u16>), &str> =
+            std::collections::HashMap::new();
+        for entry in &self.entries {
+            if let Some(pair) = entry.refresh_window {
+                crate::registrant::RefreshWindow::from_pair(pair)
+                    .map_err(|reason| format!("registrant.entries[{}].{reason}", entry.aor))?;
+            }
+            let Some(local_addr) = entry.local_addr else {
+                continue;
+            };
+            if !entry.transport.eq_ignore_ascii_case("udp") {
+                return Err(format!(
+                    "registrant.entries[{}].local_addr needs transport udp, not {}",
+                    entry.aor, entry.transport
+                ));
+            }
+            let key = (
+                local_addr,
+                entry.ipsec.as_ref().map(|ipsec| ipsec.ue_port_c),
+            );
+            if let Some(holder) = seen.insert(key, &entry.aor) {
+                return Err(format!(
+                    "registrant.entries[{}].local_addr {local_addr} (ue_port_c {:?}) is already \
+                     used by {holder}",
+                    entry.aor, key.1
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The state-change channel capacity: `event_capacity`, else the larger of
+    /// 1024 and four per configured entry.
+    pub fn effective_event_capacity(&self) -> usize {
+        self.event_capacity
+            .unwrap_or_else(|| (self.entries.len().saturating_mul(4)).max(1024))
+    }
 }
 
 impl RegistrantEntryConfig {

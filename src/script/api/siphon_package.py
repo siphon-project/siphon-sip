@@ -1272,8 +1272,18 @@ class _RegistrationNamespace:
     def add(self, aor, registrar, *, user, password="", interval=None, realm=None,
             contact=None, transport=None, auth=None, k=None, op=None, opc=None,
             amf=None, sqn=None, ipsec=False, ue_port_c=None, ue_port_s=None,
-            ipsec_alg=None, ipsec_ealg=None, imei=None, ims_features=None):
+            ipsec_alg=None, ipsec_ealg=None, imei=None, ims_features=None,
+            local_addr=None, require_local_addr=False, refresh_window=None):
         raise NotImplementedError("registration.add() not available — no registrant in config")
+
+    def set_local_addr(self, aor, local_addr):
+        raise NotImplementedError("registration.set_local_addr() not available — no registrant in config")
+
+    def find_by_local(self, local):
+        raise NotImplementedError("registration.find_by_local() not available — no registrant in config")
+
+    def counts(self):
+        raise NotImplementedError("registration.counts() not available — no registrant in config")
 
     def remove(self, aor):
         raise NotImplementedError("registration.remove() not available — no registrant in config")
@@ -1296,7 +1306,7 @@ class _RegistrationNamespace:
     def associated_uris(self, aor):
         raise NotImplementedError("registration.associated_uris() not available — no registrant in config")
 
-    def flow(self, aor, ue_ip):
+    def flow(self, aor, ue_ip=None):
         raise NotImplementedError("registration.flow() not available — no registrant in config")
 
     @staticmethod
@@ -1305,7 +1315,8 @@ class _RegistrationNamespace:
 
         The handler receives (aor, event_type, state) where:
           - aor: str — Address of Record (e.g. "sip:trunk@carrier.com")
-          - event_type: str — "registered", "refreshed", "failed", or "deregistered"
+          - event_type: str — "registered", "refreshed", "failed", "deregistered",
+            or "awaiting_address" (the entry needs an address of its own and has none)
           - state: dict — {"expires_in": int, "failure_count": int, "registrar": str,
             "status_code": int (only present when event_type is "failed")}
 

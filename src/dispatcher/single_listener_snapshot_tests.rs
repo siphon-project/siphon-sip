@@ -57,6 +57,7 @@ fn one_listener_each(script: &str, advertise: bool) -> OneListenerEach {
     state.outbound = Arc::new(OutboundRouter {
         udp: udp_sender.into(),
         udp_by_local: std::collections::HashMap::new(),
+        udp_dynamic: None,
         tcp: other_sender.clone(),
         tls: tls_sender,
         ws: other_sender.clone(),

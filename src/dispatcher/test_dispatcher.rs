@@ -44,6 +44,7 @@ pub(super) fn test_dispatcher_with_script(source: &str) -> TestDispatcher {
     let outbound = Arc::new(OutboundRouter {
         udp: udp_sender.into(),
         udp_by_local: HashMap::new(),
+        udp_dynamic: None,
         tcp: stream_sender.clone(),
         tls: stream_sender.clone(),
         ws: stream_sender.clone(),

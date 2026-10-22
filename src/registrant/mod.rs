@@ -6,16 +6,28 @@
 //! all entries and runs a background refresh loop that:
 //!
 //! - Sends REGISTER at startup for every configured entry.
-//! - Re-registers at 50 % of the granted `expires` interval.
+//! - Re-registers inside `refresh_window` of the granted `expires` interval
+//!   (50 % unless configured, see [`pacing`]).
+//! - Registers each entry from an address of its own when it has a
+//!   `local_addr` (see [`address`]), opening sockets there at run time.
 //! - Handles 401/407 challenges using [`crate::auth`] digest computation.
 //! - Applies exponential backoff on failure.
 //! - Sends de-registration (Expires: 0) on shutdown.
 
+pub mod address;
 pub mod aka;
+pub mod entry_config;
 pub mod messages;
+pub mod pacing;
+mod refresh;
 pub mod source;
 mod status;
+#[cfg(test)]
+pub(crate) mod test_support;
 
+pub use messages::{BuiltRegister, EgressDefaults};
+pub use pacing::RefreshWindow;
+pub use refresh::{deregister_all, registration_loop, RegistrationLoopContext};
 pub use status::RegistrantStatus;
 
 use std::collections::HashMap;
@@ -25,10 +37,9 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use bytes::Bytes;
 use dashmap::DashMap;
 use tokio::sync::broadcast;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 use crate::auth::{self, DigestChallenge, NonceCounter};
 use std::net::IpAddr;
@@ -42,10 +53,11 @@ use crate::ipsec::{
 use crate::sip::builder::SipMessageBuilder;
 use crate::sip::message::{Method, SipMessage};
 use crate::sip::uri::SipUri;
-use crate::transport::outbound_tls::registrar_server_name;
-use crate::transport::pool::ConnectionPool;
-use crate::transport::{ConnectionId, OutboundMessage, OutboundRouter, Transport};
-use crate::uac::resolve_via_addr;
+use crate::transport::Transport;
+#[cfg(test)]
+use crate::transport::{OutboundMessage, OutboundRouter};
+#[cfg(test)]
+use refresh::{exempt_trunk_connections_from_idle_reap, force_refresh_lost_connections};
 
 // ---------------------------------------------------------------------------
 // Events
@@ -62,6 +74,9 @@ pub enum RegistrantEvent {
     Failed { aor: String, status_code: u16 },
     /// De-registration sent (shutdown or manual remove).
     Deregistered { aor: String },
+    /// The entry needs an address of its own and has none: it stopped
+    /// registering until [`RegistrantManager::set_local_addr`] gives it one.
+    AwaitingAddress { aor: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -81,6 +96,9 @@ pub enum RegistrantState {
     Registered,
     /// Last attempt failed (non-401/407 error or auth failure).
     Failed,
+    /// Registers only from an address of its own, and has none right now
+    /// (see [`RegistrantManager::set_local_addr`]). Never due.
+    AwaitingAddress,
 }
 
 impl fmt::Display for RegistrantState {
@@ -91,6 +109,7 @@ impl fmt::Display for RegistrantState {
             Self::Challenging => write!(formatter, "challenging"),
             Self::Registered => write!(formatter, "registered"),
             Self::Failed => write!(formatter, "failed"),
+            Self::AwaitingAddress => write!(formatter, "awaiting_address"),
         }
     }
 }
@@ -280,6 +299,24 @@ impl UeIpsec {
             }
         }
         self.security_server = Some(raw.to_string());
+    }
+
+    /// Forget the current sec-agree handshake (SPIs, CK/IK, the P-CSCF's
+    /// answer) and go back to offering the preferred transform, so the next
+    /// REGISTER starts a fresh one. For an entry that moved to another address.
+    pub fn reset_handshake(&mut self) {
+        if let Some(preferred) = self.offered_aalgs.first().copied() {
+            self.aalg = preferred;
+        }
+        self.spi_uc = 0;
+        self.spi_us = 0;
+        self.ck = None;
+        self.ik = None;
+        self.pcscf_port_c = 0;
+        self.pcscf_port_s = 0;
+        self.spi_pc = 0;
+        self.spi_ps = 0;
+        self.security_server = None;
     }
 
     /// Construct the four-SA descriptor for `create_ue_sa_pair`, deriving the
@@ -472,6 +509,19 @@ pub struct RegistrantEntry {
     /// IMS Contact feature tags (instance ID + MMTel/video/SMS). `Some` →
     /// appended to the Contact so the S-CSCF registers the implied services.
     pub ims_contact: Option<ImsContactParams>,
+
+    // --- Per-entry address (see `address`) ---
+    /// The address this entry registers from: its Via/Contact host, the UDP
+    /// source of every REGISTER, and with IPsec the UE side of its SAs.
+    /// `None` = the process's own address, as every entry used before.
+    pub local_addr: Option<IpAddr>,
+    /// Register only from an address of its own: with `local_addr` unset the
+    /// entry waits in [`RegistrantState::AwaitingAddress`] instead of falling
+    /// back to the process's address, which would register this UE from
+    /// somewhere it is not.
+    pub require_local_addr: bool,
+    /// This entry's refresh window; `None` takes the manager's.
+    pub refresh_window: Option<RefreshWindow>,
 }
 
 impl RegistrantEntry {
@@ -513,7 +563,33 @@ impl RegistrantEntry {
             path: Vec::new(),
             ue_ipsec: None,
             ims_contact: None,
+            local_addr: None,
+            require_local_addr: false,
+            refresh_window: None,
         }
+    }
+
+    /// Register from `local_addr` rather than the process's address (see
+    /// [`RegistrantManager::set_local_addr`]). Setting one also makes it
+    /// required: an entry given an address of its own never falls back to the
+    /// process's.
+    pub fn with_local_addr(mut self, local_addr: IpAddr) -> Self {
+        self.local_addr = Some(local_addr);
+        self.require_local_addr = true;
+        self
+    }
+
+    /// Wait for an address of its own instead of registering from the
+    /// process's while it has none.
+    pub fn requiring_local_addr(mut self) -> Self {
+        self.require_local_addr = true;
+        self
+    }
+
+    /// Refresh inside `window` instead of the manager's.
+    pub fn with_refresh_window(mut self, window: RefreshWindow) -> Self {
+        self.refresh_window = Some(window);
+        self
     }
 
     /// Record that this entry came from `siphon.yaml`.
@@ -604,7 +680,20 @@ pub struct RegistrantManager {
     /// De-registrations built by [`Self::remove`], waiting for the loop to send
     /// them. Holds finished messages rather than live entries, so a removed
     /// trunk is gone from `entries` immediately.
-    pending_deregistrations: std::sync::Mutex<Vec<(SipMessage, SocketAddr, Transport)>>,
+    pending_deregistrations: std::sync::Mutex<Vec<BuiltRegister>>,
+    /// UE SA pairs to tear down, `(ue_addr, ue_port_c)`, queued when an entry
+    /// moves off an address (see [`address`]). `None` for the address is the
+    /// process's own UE address, resolved by the loop. The manager has no
+    /// kernel access; the loop holds the IPsec manager.
+    pending_sa_deletions: std::sync::Mutex<Vec<(Option<IpAddr>, u16)>>,
+    /// Serialises the address-uniqueness check with the write it guards, so
+    /// two concurrent adds cannot both claim one address.
+    address_lock: std::sync::Mutex<()>,
+    /// Default refresh window (`registrant.refresh_window`).
+    refresh_window: RefreshWindow,
+    /// `registrant.max_registers_per_sec`: cap on new REGISTERs the loop
+    /// starts per second. `None` = no cap and the five-second tick.
+    max_registers_per_sec: Option<u32>,
 }
 
 /// Everything [`registration_loop`] needs to put a REGISTER on the wire.
@@ -619,6 +708,13 @@ struct RegistrantEgress {
     hep_sender: Option<Arc<HepSender>>,
 }
 
+impl RegistrantEgress {
+    /// The process-wide addressing an entry without a `local_addr` uses.
+    fn defaults(&self) -> EgressDefaults<'_> {
+        EgressDefaults::new(self.local_addr, &self.listen_addrs)
+    }
+}
+
 impl RegistrantManager {
     pub fn new(
         default_interval: u32,
@@ -626,7 +722,7 @@ impl RegistrantManager {
         max_retry_interval: Duration,
         identity: crate::config::SharedIdentityHeaders,
     ) -> Self {
-        let (event_sender, _) = broadcast::channel(64);
+        let (event_sender, _) = broadcast::channel(Self::MIN_EVENT_CAPACITY);
         Self {
             entries: DashMap::new(),
             default_interval,
@@ -637,7 +733,43 @@ impl RegistrantManager {
             ue_spi_counter: AtomicU32::new(Self::UE_SPI_BASE),
             egress: std::sync::OnceLock::new(),
             pending_deregistrations: std::sync::Mutex::new(Vec::new()),
+            pending_sa_deletions: std::sync::Mutex::new(Vec::new()),
+            address_lock: std::sync::Mutex::new(()),
+            refresh_window: RefreshWindow::HALF,
+            max_registers_per_sec: None,
         }
+    }
+
+    /// The smallest state-change channel: what every manager had before the
+    /// capacity could be set.
+    pub const MIN_EVENT_CAPACITY: usize = 64;
+
+    /// Hold up to `capacity` undelivered state-change events (at least
+    /// [`MIN_EVENT_CAPACITY`](Self::MIN_EVENT_CAPACITY)) before a slow consumer
+    /// lags. A fleet of entries changing state together (a restart, an address
+    /// pool moving) emits one event each, and a lag costs a full snapshot.
+    /// Call before anything subscribes.
+    pub fn with_event_capacity(mut self, capacity: usize) -> Self {
+        let (event_sender, _) = broadcast::channel(capacity.max(Self::MIN_EVENT_CAPACITY));
+        self.event_sender = event_sender;
+        self
+    }
+
+    /// Refresh every entry without a window of its own inside `window`.
+    pub fn with_refresh_window(mut self, window: RefreshWindow) -> Self {
+        self.refresh_window = window;
+        self
+    }
+
+    /// Start at most `per_second` new REGISTERs per second.
+    pub fn with_max_registers_per_sec(mut self, per_second: Option<u32>) -> Self {
+        self.max_registers_per_sec = per_second;
+        self
+    }
+
+    /// The configured start-rate cap.
+    pub fn max_registers_per_sec(&self) -> Option<u32> {
+        self.max_registers_per_sec
     }
 
     /// Record how REGISTERs egress. Called once by [`registration_loop`].
@@ -646,24 +778,58 @@ impl RegistrantManager {
     }
 
     /// Take the de-registrations queued by [`Self::remove`], leaving none.
-    fn take_pending_deregistrations(&self) -> Vec<(SipMessage, SocketAddr, Transport)> {
+    fn take_pending_deregistrations(&self) -> Vec<BuiltRegister> {
         match self.pending_deregistrations.lock() {
             Ok(mut pending) => std::mem::take(&mut *pending),
             Err(poisoned) => std::mem::take(&mut *poisoned.into_inner()),
         }
     }
 
-    /// Base for UE IPsec SPI allocation. Above the default P-CSCF SPI partition
-    /// (10000..18192) so a single host could run both roles without colliding,
-    /// and well clear of the RFC 4303 §2.1 reserved 1..255 range. Kept in a
-    /// normal, handset-like magnitude (not 0x20000000) — the value advertised
-    /// in Security-Client IS the value installed in the kernel inbound SA.
+    /// Base for UE IPsec SPI allocation, well clear of the RFC 4303 §2.1
+    /// reserved 0..255 range and kept in a normal, handset-like magnitude (not
+    /// 0x20000000): the value advertised in Security-Client IS the value
+    /// installed in the kernel inbound SA.
+    ///
+    /// It lies *inside* the default P-CSCF SPI partition (`ipsec.spi_range_start`
+    /// 10000, two-million-plus SPIs wide), so a host running a P-CSCF and a
+    /// UE registrant against one kernel must move the P-CSCF partition with
+    /// `ipsec.spi_range_start` to keep the two apart.
     const UE_SPI_BASE: u32 = 50_000;
 
     /// Allocate a fresh `(spi_uc, spi_us)` pair for a UE sec-agree offer.
+    ///
+    /// Monotonic from [`UE_SPI_BASE`](Self::UE_SPI_BASE); when the pair would
+    /// run past `u32::MAX` it starts again at the base, never at 0, so no
+    /// reserved SPI is ever offered.
     pub fn allocate_ue_spi_pair(&self) -> (u32, u32) {
-        let first = self.ue_spi_counter.fetch_add(2, Ordering::Relaxed);
-        (first, first.wrapping_add(1))
+        // `fetch_update` is deprecated from Rust 1.99 for `try_update`, which
+        // the MSRV does not have. Same operation under either name.
+        #[allow(deprecated)]
+        let previous = self
+            .ue_spi_counter
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(Self::next_spi_slot(current))
+            })
+            .unwrap_or(Self::UE_SPI_BASE);
+        let first = Self::spi_slot(previous);
+        (first, first + 1)
+    }
+
+    /// The pair a counter value hands out: the value itself while it and its
+    /// successor are valid SPIs, else the base.
+    fn spi_slot(counter: u32) -> u32 {
+        if counter < Self::UE_SPI_BASE || counter == u32::MAX {
+            Self::UE_SPI_BASE
+        } else {
+            counter
+        }
+    }
+
+    /// The counter value after handing out [`spi_slot`](Self::spi_slot)'s pair.
+    fn next_spi_slot(counter: u32) -> u32 {
+        Self::spi_slot(counter)
+            .checked_add(2)
+            .unwrap_or(Self::UE_SPI_BASE)
     }
 
     /// Subscribe to registrant state change events.
@@ -677,9 +843,15 @@ impl RegistrantManager {
     }
 
     /// Add a new registration entry.
+    ///
+    /// An entry whose `local_addr` cannot be used (another entry holds it, or
+    /// it is not UDP) is refused and logged; [`try_add`](Self::try_add) returns
+    /// the reason instead.
     pub fn add(&self, entry: RegistrantEntry) {
-        info!(aor = %entry.aor, registrar = %entry.registrar_uri, "registrant added");
-        self.entries.insert(entry.aor.clone(), entry);
+        let aor = entry.aor.clone();
+        if let Err(reason) = self.try_add(entry) {
+            error!(aor = %aor, "registrant refused: {reason}");
+        }
     }
 
     /// Remove a registration entry by AoR, clearing its binding upstream.
@@ -775,13 +947,12 @@ impl RegistrantManager {
     /// `None` when the entry is unknown, was never registered (nothing to
     /// clear), or the loop has not started yet, so there is no egress to build
     /// a Via and Contact from.
-    fn build_deregistration(&self, aor: &str) -> Option<(SipMessage, SocketAddr, Transport)> {
+    fn build_deregistration(&self, aor: &str) -> Option<BuiltRegister> {
         let egress = self.egress.get()?;
         if self.entries.get(aor)?.state != RegistrantState::Registered {
             return None;
         }
-        self.build_register(aor, egress.local_addr, &egress.listen_addrs, 0)
-            .map(|(message, _branch, destination, transport)| (message, destination, transport))
+        self.build_register(aor, egress.defaults(), 0)
     }
 
     /// Get number of entries.
@@ -930,9 +1101,17 @@ impl RegistrantManager {
 
     /// Handle a successful 200 OK response.
     pub fn handle_success(&self, aor: &str, granted_expires: u32) {
+        self.handle_success_with_draw(aor, granted_expires, pacing::unit_draw());
+    }
+
+    /// [`handle_success`](Self::handle_success) with the point inside the
+    /// refresh window chosen by `unit` (`[0, 1)`) rather than at random, so a
+    /// test can pin it.
+    pub fn handle_success_with_draw(&self, aor: &str, granted_expires: u32, unit: f64) {
         if let Some(mut entry) = self.entries.get_mut(aor) {
             let was_registered = entry.state == RegistrantState::Registered;
-            let refresh_at = Duration::from_secs((granted_expires as u64) / 2);
+            let window = entry.refresh_window.unwrap_or(self.refresh_window);
+            let refresh_at = window.delay(granted_expires, unit);
             entry.state = RegistrantState::Registered;
             entry.expires_at = Some(Instant::now() + Duration::from_secs(granted_expires as u64));
             entry.next_attempt = Instant::now() + refresh_at;
@@ -1029,8 +1208,12 @@ impl RegistrantManager {
     /// [`entries_due`](Self::entries_due) as of `now` — the schedule taken as a
     /// parameter, so a test can assert what a trunk owes hours from now without
     /// sleeping through it.
+    ///
+    /// Longest-overdue first, so a loop that may only start some of them per
+    /// tick (`max_registers_per_sec`) never starves the same few.
     pub fn entries_due_at(&self, now: Instant) -> Vec<String> {
-        self.entries
+        let mut due: Vec<(Instant, String)> = self
+            .entries
             .iter()
             .filter(|entry| entry.next_attempt <= now)
             .filter(|entry| {
@@ -1041,8 +1224,10 @@ impl RegistrantManager {
                         | RegistrantState::Failed
                 )
             })
-            .map(|entry| entry.aor.clone())
-            .collect()
+            .map(|entry| (entry.next_attempt, entry.aor.clone()))
+            .collect();
+        due.sort();
+        due.into_iter().map(|(_, aor)| aor).collect()
     }
 
     /// RFC 3261 Timer F — non-INVITE transaction timeout (32 seconds).
@@ -1069,11 +1254,7 @@ impl RegistrantManager {
     }
 
     /// Build de-registration (Expires: 0) for all active entries.
-    pub fn build_deregistrations(
-        &self,
-        local_addr: SocketAddr,
-        listen_addrs: &HashMap<Transport, SocketAddr>,
-    ) -> Vec<(SipMessage, SocketAddr, Transport)> {
+    pub fn build_deregistrations(&self, defaults: EgressDefaults<'_>) -> Vec<BuiltRegister> {
         // Collect AoRs first to avoid deadlock: iter() holds a read lock on
         // each DashMap shard, and build_register() needs a write lock (get_mut).
         let registered_aors: Vec<String> = self
@@ -1083,15 +1264,10 @@ impl RegistrantManager {
             .map(|entry| entry.aor.clone())
             .collect();
 
-        let mut result = Vec::new();
-        for aor in &registered_aors {
-            if let Some((message, _branch, destination, transport)) =
-                self.build_register(aor, local_addr, listen_addrs, 0)
-            {
-                result.push((message, destination, transport));
-            }
-        }
-        result
+        registered_aors
+            .iter()
+            .filter_map(|aor| self.build_register(aor, defaults, 0))
+            .collect()
     }
 
     /// Match an incoming response to a registrant entry by branch prefix.
@@ -1132,258 +1308,6 @@ impl fmt::Debug for RegistrantManager {
             .field("default_interval", &self.default_interval)
             .finish()
     }
-}
-
-/// Background registration refresh loop.
-///
-/// Runs for the life of the process. De-registration at shutdown is driven by
-/// `serve()` through [`deregister_all`] instead of from here: a loop signalled
-/// over a channel would be racing its own sleep against `std::process::exit`,
-/// which is why the sender used to be leaked rather than held.
-pub async fn registration_loop(
-    manager: Arc<RegistrantManager>,
-    outbound: Arc<OutboundRouter>,
-    local_addr: SocketAddr,
-    listen_addrs: HashMap<Transport, SocketAddr>,
-    advertised_addrs: HashMap<Transport, String>,
-    advertised_address: Option<String>,
-    hep_sender: Option<Arc<HepSender>>,
-    connection_pool: Arc<ConnectionPool>,
-) {
-    let tick_interval = Duration::from_secs(5);
-
-    // A de-registration is built at the moment an entry is removed, outside
-    // this loop, so the addressing a REGISTER needs is recorded on the manager.
-    manager.set_egress(RegistrantEgress {
-        local_addr,
-        listen_addrs: listen_addrs.clone(),
-        advertised_addrs: advertised_addrs.clone(),
-        advertised_address: advertised_address.clone(),
-        hep_sender: hep_sender.clone(),
-    });
-    let Some(egress) = manager.egress.get() else {
-        error!("registrant egress could not be installed — outbound registration is not running");
-        return;
-    };
-
-    loop {
-        tokio::time::sleep(tick_interval).await;
-
-        // Clear bindings for entries removed since the last tick. Sent before
-        // anything else so a trunk that was deleted stops receiving calls as
-        // soon as possible.
-        for (message, destination, transport) in manager.take_pending_deregistrations() {
-            debug!(%destination, "sending de-REGISTER for a removed registrant");
-            send_registrant_message(&outbound, egress, message, destination, transport);
-        }
-
-        // Stated before the liveness check below reads those connections, and
-        // before the first REGISTER of a trunk added since the last tick opens
-        // one.
-        exempt_trunk_connections_from_idle_reap(&manager, &connection_pool);
-
-        // Connection loss on TLS/TCP: re-register on this tick instead of at
-        // the refresh timer, which also re-opens the connection the registrar
-        // reaches this trunk over.
-        force_refresh_lost_connections(&manager, &connection_pool);
-
-        // Time out entries stuck in Registering/Challenging (RFC 3261
-        // Timer F — 32s).  Catches dead sockets where no response
-        // ever arrives.
-        let timed_out = manager.entries_timed_out();
-        for aor in &timed_out {
-            warn!(aor = %aor, "REGISTER transaction timed out — no response received");
-            manager.handle_failure(aor, 0, None);
-        }
-
-        let due = manager.entries_due();
-        for aor in due {
-            if let Some((message, branch, destination, transport)) =
-                manager.build_register(&aor, local_addr, &listen_addrs, manager.default_interval)
-            {
-                let data = Bytes::from(message.to_bytes());
-
-                // HEP capture — outbound REGISTER
-                if let Some(ref hep) = hep_sender {
-                    let via_addr = resolve_via_addr(
-                        local_addr,
-                        &transport,
-                        &advertised_addrs,
-                        advertised_address.as_deref(),
-                    );
-                    hep.capture_outbound(via_addr, destination, transport, &data);
-                }
-
-                // UDP only: egress from the same local address advertised
-                // in the Via (build_register uses the same listen_addrs
-                // lookup), so the source port matches the Via and the
-                // response / conntrack return path is consistent. With
-                // multiple UDP listeners + IPsec, a `None` source picks a
-                // non-deterministic udp_default — the initial REGISTER
-                // could egress from a protected port (e.g. 6100) while the
-                // Via said 5060, breaking the 401 return path. For TCP/TLS
-                // the outbound connection is separate from the listener,
-                // so leave the source unpinned.
-                let source_local_addr = if transport == Transport::Udp {
-                    Some(listen_addrs.get(&transport).copied().unwrap_or(local_addr))
-                } else {
-                    None
-                };
-                let outbound_message = OutboundMessage {
-                    followups: None,
-                    connection_id: ConnectionId::default(),
-                    transport,
-                    destination,
-                    data,
-                    source_local_addr,
-                    server_name: registrar_server_name(&message, transport),
-                    verify_server: None,
-                };
-                debug!(aor = %aor, branch = %branch, "sending REGISTER");
-                if let Err(error) = outbound.send(outbound_message) {
-                    warn!(aor = %aor, %error, "failed to send REGISTER");
-                    manager.handle_failure(&aor, 0, None);
-                }
-            }
-        }
-    }
-}
-
-/// Keep every stream-transport trunk's pooled connection out of the pool's idle
-/// reaper. Returns the exempted destinations.
-///
-/// A trunk's connection is long-lived by definition and
-/// [`force_refresh_lost_connections`] judges the trunk from it, so the pool
-/// closing it after 30 s of silence had an *idle* trunk read as dead ~5 s later
-/// and re-registering roughly every 35 s whatever its interval said. Detection
-/// is untouched — [`ConnectionPool::set_idle_exempt_destinations`] has both
-/// halves.
-///
-/// Every entry counts, not only the Registered ones: a trunk mid-401 needs the
-/// connection its next response comes back on. The set is re-stated in full each
-/// tick, so a removed trunk releases its destination.
-fn exempt_trunk_connections_from_idle_reap(
-    manager: &RegistrantManager,
-    connection_pool: &ConnectionPool,
-) -> Vec<(SocketAddr, Transport)> {
-    let destinations: Vec<(SocketAddr, Transport)> = manager
-        .entries
-        .iter()
-        .filter(|entry| matches!(entry.transport, Transport::Tls | Transport::Tcp))
-        .map(|entry| (entry.destination, entry.transport))
-        .collect();
-    connection_pool.set_idle_exempt_destinations(destinations.iter().copied());
-    destinations
-}
-
-/// Force an immediate re-register for every Registered TLS/TCP entry whose
-/// own outbound connection is gone. Returns the AoRs it refreshed.
-///
-/// Judged from the pool connection the REGISTERs actually go out on (a default
-/// pool send to exactly the entry's destination and transport), never from the
-/// shared stream registry: that one also holds inbound connections keyed by
-/// peer address, so a connection the registrar's host opened towards siphon
-/// would keep a dead trunk looking alive, and it holds no outbound TCP at all,
-/// which made every TCP trunk look dead on every tick.
-///
-/// SCTP is not checked: the pool has no outbound SCTP path, so there is no
-/// connection of the registrant's own to judge.
-fn force_refresh_lost_connections(
-    manager: &RegistrantManager,
-    connection_pool: &ConnectionPool,
-) -> Vec<String> {
-    let stale: Vec<String> = manager
-        .entries
-        .iter()
-        .filter(|entry| {
-            entry.state == RegistrantState::Registered
-                && matches!(entry.transport, Transport::Tls | Transport::Tcp)
-                && !connection_pool.has_live(entry.destination, entry.transport)
-        })
-        .map(|entry| entry.aor.clone())
-        .collect();
-    for aor in &stale {
-        warn!(aor = %aor, "connection lost — forcing immediate re-register");
-        manager.refresh(aor);
-    }
-    stale
-}
-
-/// Put one built registrant message on the wire, with HEP capture.
-///
-/// Shared by the two de-registration paths — an entry removed at run time, and
-/// shutdown. Both are fire-and-forget: the entry is already gone, so there is
-/// nothing left to record a failure against.
-fn send_registrant_message(
-    outbound: &OutboundRouter,
-    egress: &RegistrantEgress,
-    message: SipMessage,
-    destination: SocketAddr,
-    transport: Transport,
-) {
-    let data = Bytes::from(message.to_bytes());
-
-    if let Some(ref hep) = egress.hep_sender {
-        let via_addr = resolve_via_addr(
-            egress.local_addr,
-            &transport,
-            &egress.advertised_addrs,
-            egress.advertised_address.as_deref(),
-        );
-        hep.capture_outbound(via_addr, destination, transport, &data);
-    }
-
-    // UDP only: egress from the address advertised in the Via, as the REGISTER
-    // path does — see the note there on multiple UDP listeners with IPsec.
-    let source_local_addr = if transport == Transport::Udp {
-        Some(
-            egress
-                .listen_addrs
-                .get(&transport)
-                .copied()
-                .unwrap_or(egress.local_addr),
-        )
-    } else {
-        None
-    };
-
-    let _ = outbound.send(OutboundMessage {
-        followups: None,
-        connection_id: ConnectionId::default(),
-        transport,
-        destination,
-        data,
-        source_local_addr,
-        server_name: registrar_server_name(&message, transport),
-        verify_server: None,
-    });
-}
-
-/// Clear every outbound binding this node holds, for shutdown.
-///
-/// Driven by `serve()` when the signal arrives rather than by
-/// [`registration_loop`], so the caller knows the de-REGISTERs have reached the
-/// transport before the process exits. Signalling the loop instead would race
-/// its 5-second sleep against `std::process::exit`.
-///
-/// Returns how many de-registrations were sent.
-pub fn deregister_all(manager: &RegistrantManager, outbound: &OutboundRouter) -> usize {
-    let Some(egress) = manager.egress.get() else {
-        // The loop never started, so nothing ever registered.
-        return 0;
-    };
-
-    // Anything removed but not yet sent goes out too: this is the last chance
-    // to clear those bindings.
-    let pending = manager.take_pending_deregistrations();
-    let active = manager.build_deregistrations(egress.local_addr, &egress.listen_addrs);
-
-    let mut sent = 0;
-    for (message, destination, transport) in pending.into_iter().chain(active) {
-        send_registrant_message(outbound, egress, message, destination, transport);
-        sent += 1;
-    }
-    sent
 }
 
 /// Methods the soft-UE advertises in `Allow` on IMS REGISTERs (RFC 3261 §20.5)
@@ -1496,6 +1420,7 @@ fn rand_u32() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::outbound_tls::registrar_server_name;
     use std::sync::Arc;
 
     fn make_manager() -> RegistrantManager {
@@ -1603,13 +1528,18 @@ mod tests {
 
         let result = manager.build_register(
             "sip:alice@carrier.com",
-            "127.0.0.1:5060".parse().unwrap(),
-            &HashMap::new(),
+            EgressDefaults::new("127.0.0.1:5060".parse().unwrap(), &HashMap::new()),
             3600,
         );
         assert!(result.is_some());
 
-        let (message, branch, destination, transport) = result.unwrap();
+        let BuiltRegister {
+            message,
+            branch,
+            destination,
+            transport,
+            ..
+        } = result.unwrap();
         assert!(branch.starts_with("z9hG4bK-reg-"));
         assert_eq!(destination, "10.0.0.1:5060".parse::<SocketAddr>().unwrap());
         assert_eq!(transport, Transport::Udp);
@@ -1641,13 +1571,14 @@ mod tests {
 
         let result = manager.build_register(
             "sip:trunk@carrier.com",
-            "192.0.2.149:5060".parse().unwrap(),
-            &listen,
+            EgressDefaults::new("192.0.2.149:5060".parse().unwrap(), &listen),
             3600,
         );
         assert!(result.is_some());
 
-        let (message, _, _, transport) = result.unwrap();
+        let BuiltRegister {
+            message, transport, ..
+        } = result.unwrap();
         assert_eq!(transport, Transport::Tls);
 
         let bytes = message.to_bytes();
@@ -1672,8 +1603,7 @@ mod tests {
         // Simulate registration attempt
         let _ = manager.build_register(
             "sip:alice@carrier.com",
-            "127.0.0.1:5060".parse().unwrap(),
-            &HashMap::new(),
+            EgressDefaults::new("127.0.0.1:5060".parse().unwrap(), &HashMap::new()),
             3600,
         );
 
@@ -1912,15 +1842,16 @@ mod tests {
 
         let result = manager.build_register_with_auth(
             "sip:alice@carrier.com",
-            "127.0.0.1:5060".parse().unwrap(),
-            &HashMap::new(),
+            EgressDefaults::new("127.0.0.1:5060".parse().unwrap(), &HashMap::new()),
             &challenge,
             false,
             3600,
         );
         assert!(result.is_some());
 
-        let (message, branch, _, _) = result.unwrap();
+        let BuiltRegister {
+            message, branch, ..
+        } = result.unwrap();
         assert!(branch.starts_with("z9hG4bK-reg-"));
 
         let bytes = message.to_bytes();
@@ -2050,11 +1981,13 @@ mod tests {
         // Register only alice
         manager.handle_success("sip:alice@carrier.com", 3600);
 
-        let dereg =
-            manager.build_deregistrations("127.0.0.1:5060".parse().unwrap(), &HashMap::new());
+        let dereg = manager.build_deregistrations(EgressDefaults::new(
+            "127.0.0.1:5060".parse().unwrap(),
+            &HashMap::new(),
+        ));
         assert_eq!(dereg.len(), 1);
 
-        let bytes = dereg[0].0.to_bytes();
+        let bytes = dereg[0].message.to_bytes();
         let raw = String::from_utf8_lossy(&bytes);
         assert!(raw.contains("Expires: 0"));
     }
@@ -2083,6 +2016,7 @@ mod tests {
         let router = Arc::new(OutboundRouter {
             udp: udp_tx.into(),
             udp_by_local: HashMap::new(),
+            udp_dynamic: None,
             tcp: tcp_tx,
             tls: tls_tx,
             ws: ws_tx,
@@ -2107,7 +2041,7 @@ mod tests {
             1,
             "a removed trunk left its binding on the registrar"
         );
-        let raw = String::from_utf8_lossy(&pending[0].0.to_bytes()).into_owned();
+        let raw = String::from_utf8_lossy(&pending[0].message.to_bytes()).into_owned();
         assert!(raw.starts_with("REGISTER "), "not a REGISTER: {raw}");
         assert!(raw.contains("Expires: 0"), "not a de-registration: {raw}");
         assert!(raw.contains("sip:alice@carrier.com"), "wrong AoR: {raw}");
@@ -2131,7 +2065,7 @@ mod tests {
         manager.remove("sip:alice@carrier.com");
 
         let pending = manager.take_pending_deregistrations();
-        let raw = String::from_utf8_lossy(&pending[0].0.to_bytes()).into_owned();
+        let raw = String::from_utf8_lossy(&pending[0].message.to_bytes()).into_owned();
         assert!(raw.contains(&call_id), "Call-ID {call_id} not in: {raw}");
     }
 
@@ -2314,8 +2248,7 @@ mod tests {
 
         manager.build_register(
             "sip:alice@carrier.com",
-            "127.0.0.1:5060".parse().unwrap(),
-            &HashMap::new(),
+            EgressDefaults::new("127.0.0.1:5060".parse().unwrap(), &HashMap::new()),
             3600,
         );
 
@@ -2335,8 +2268,7 @@ mod tests {
 
         manager.build_register(
             "sip:alice@carrier.com",
-            "127.0.0.1:5060".parse().unwrap(),
-            &HashMap::new(),
+            EgressDefaults::new("127.0.0.1:5060".parse().unwrap(), &HashMap::new()),
             3600,
         );
         assert!(manager
@@ -2363,8 +2295,7 @@ mod tests {
         // Send a REGISTER (sets state to Registering + last_sent_at)
         manager.build_register(
             "sip:alice@carrier.com",
-            "127.0.0.1:5060".parse().unwrap(),
-            &HashMap::new(),
+            EgressDefaults::new("127.0.0.1:5060".parse().unwrap(), &HashMap::new()),
             3600,
         );
 
@@ -2379,8 +2310,7 @@ mod tests {
 
         manager.build_register(
             "sip:alice@carrier.com",
-            "127.0.0.1:5060".parse().unwrap(),
-            &HashMap::new(),
+            EgressDefaults::new("127.0.0.1:5060".parse().unwrap(), &HashMap::new()),
             3600,
         );
 
@@ -2403,11 +2333,10 @@ mod tests {
 
         let result = manager.build_register(
             "sip:alice@carrier.com",
-            "127.0.0.1:5060".parse().unwrap(),
-            &HashMap::new(),
+            EgressDefaults::new("127.0.0.1:5060".parse().unwrap(), &HashMap::new()),
             3600,
         );
-        let (message, _, _, _) = result.unwrap();
+        let BuiltRegister { message, .. } = result.unwrap();
         let bytes = message.to_bytes();
         let raw = String::from_utf8_lossy(&bytes);
         assert!(
@@ -2428,11 +2357,10 @@ mod tests {
 
         let result = manager.build_register(
             "sip:alice@carrier.com",
-            "127.0.0.1:5060".parse().unwrap(),
-            &HashMap::new(),
+            EgressDefaults::new("127.0.0.1:5060".parse().unwrap(), &HashMap::new()),
             3600,
         );
-        let (message, _, _, _) = result.unwrap();
+        let BuiltRegister { message, .. } = result.unwrap();
         let bytes = message.to_bytes();
         let raw = String::from_utf8_lossy(&bytes);
         assert!(
@@ -2457,13 +2385,12 @@ mod tests {
 
         let result = manager.build_register_with_auth(
             "sip:alice@carrier.com",
-            "127.0.0.1:5060".parse().unwrap(),
-            &HashMap::new(),
+            EgressDefaults::new("127.0.0.1:5060".parse().unwrap(), &HashMap::new()),
             &challenge,
             false,
             3600,
         );
-        let (message, _, _, _) = result.unwrap();
+        let BuiltRegister { message, .. } = result.unwrap();
         let bytes = message.to_bytes();
         let raw = String::from_utf8_lossy(&bytes);
         assert!(
@@ -2559,11 +2486,10 @@ mod tests {
         let manager = make_manager();
         manager.add(make_aka_entry(AKA_AOR));
 
-        let (message, _, _, _) = manager
+        let BuiltRegister { message, .. } = manager
             .build_register(
                 AKA_AOR,
-                "127.0.0.1:5060".parse().unwrap(),
-                &HashMap::new(),
+                EgressDefaults::new("127.0.0.1:5060".parse().unwrap(), &HashMap::new()),
                 600000,
             )
             .unwrap();
@@ -2585,15 +2511,16 @@ mod tests {
         let challenge = build_aka_challenge("ff9bb4d0b607");
         let result = manager.build_register_aka(
             AKA_AOR,
-            "127.0.0.1:5060".parse().unwrap(),
-            &HashMap::new(),
+            EgressDefaults::new("127.0.0.1:5060".parse().unwrap(), &HashMap::new()),
             &challenge,
             600000,
             None,
         );
         assert!(result.is_some());
 
-        let (message, branch, _, _) = result.unwrap();
+        let BuiltRegister {
+            message, branch, ..
+        } = result.unwrap();
         assert!(branch.starts_with("z9hG4bK-reg-"));
         let bytes = message.to_bytes();
         let raw = String::from_utf8_lossy(&bytes);
@@ -2617,11 +2544,10 @@ mod tests {
         manager.add(entry);
 
         let challenge = build_aka_challenge("000000000005");
-        let (message, _, _, _) = manager
+        let BuiltRegister { message, .. } = manager
             .build_register_aka(
                 AKA_AOR,
-                "127.0.0.1:5060".parse().unwrap(),
-                &HashMap::new(),
+                EgressDefaults::new("127.0.0.1:5060".parse().unwrap(), &HashMap::new()),
                 &challenge,
                 600000,
                 None,
@@ -2652,8 +2578,7 @@ mod tests {
         assert!(manager
             .build_register_aka(
                 AKA_AOR,
-                "127.0.0.1:5060".parse().unwrap(),
-                &HashMap::new(),
+                EgressDefaults::new("127.0.0.1:5060".parse().unwrap(), &HashMap::new()),
                 &corrupted,
                 600000,
                 None,
@@ -2767,11 +2692,10 @@ mod tests {
         .with_aka(credentials, [0u8; 6]);
         manager.add(entry);
 
-        let (message, _, _, _) = manager
+        let BuiltRegister { message, .. } = manager
             .build_register(
                 aor,
-                "100.65.0.3:5060".parse().unwrap(),
-                &HashMap::new(),
+                EgressDefaults::new("100.65.0.3:5060".parse().unwrap(), &HashMap::new()),
                 3600,
             )
             .unwrap();
@@ -2825,11 +2749,10 @@ mod tests {
         let manager = make_manager();
         manager.add(make_aka_ipsec_entry(AKA_AOR));
 
-        let (message, _, _, _) = manager
+        let BuiltRegister { message, .. } = manager
             .build_register(
                 AKA_AOR,
-                "127.0.0.1:5060".parse().unwrap(),
-                &HashMap::new(),
+                EgressDefaults::new("127.0.0.1:5060".parse().unwrap(), &HashMap::new()),
                 600000,
             )
             .unwrap();
@@ -2871,7 +2794,7 @@ mod tests {
 
         // Initial REGISTER allocates the SPIs.
         manager
-            .build_register(AKA_AOR, local, &HashMap::new(), 600000)
+            .build_register(AKA_AOR, EgressDefaults::new(local, &HashMap::new()), 600000)
             .unwrap();
         // Record server answer + run the challenge so the SA descriptor exists.
         let server = crate::ipsec::parse_security_client(SECURITY_SERVER).unwrap();
@@ -2880,8 +2803,7 @@ mod tests {
         manager
             .build_register_aka(
                 AKA_AOR,
-                local,
-                &HashMap::new(),
+                EgressDefaults::new(local, &HashMap::new()),
                 &challenge,
                 600000,
                 Some(SECURITY_SERVER),
@@ -2917,11 +2839,10 @@ mod tests {
         let manager = make_manager();
         manager.add(make_aka_entry(AKA_AOR)); // AKA but no IPsec
 
-        let (message, _, _, _) = manager
+        let BuiltRegister { message, .. } = manager
             .build_register(
                 AKA_AOR,
-                "127.0.0.1:5060".parse().unwrap(),
-                &HashMap::new(),
+                EgressDefaults::new("127.0.0.1:5060".parse().unwrap(), &HashMap::new()),
                 600000,
             )
             .unwrap();
@@ -2937,11 +2858,10 @@ mod tests {
         manager.add(make_aka_ipsec_entry(AKA_AOR));
 
         // expires == 0 → de-REGISTER must not carry a fresh Security-Client.
-        let (message, _, _, _) = manager
+        let BuiltRegister { message, .. } = manager
             .build_register(
                 AKA_AOR,
-                "127.0.0.1:5060".parse().unwrap(),
-                &HashMap::new(),
+                EgressDefaults::new("127.0.0.1:5060".parse().unwrap(), &HashMap::new()),
                 0,
             )
             .unwrap();
@@ -2963,7 +2883,7 @@ mod tests {
 
         // Initial REGISTER allocates the UE SPIs (stored on the entry).
         manager
-            .build_register(AKA_AOR, local, &HashMap::new(), 600000)
+            .build_register(AKA_AOR, EgressDefaults::new(local, &HashMap::new()), 600000)
             .unwrap();
 
         // Record the P-CSCF's Security-Server answer.
@@ -2972,11 +2892,14 @@ mod tests {
 
         // Protected re-REGISTER.
         let challenge = build_aka_challenge("ff9bb4d0b607");
-        let (message, _, destination, _) = manager
+        let BuiltRegister {
+            message,
+            destination,
+            ..
+        } = manager
             .build_register_aka(
                 AKA_AOR,
-                local,
-                &HashMap::new(),
+                EgressDefaults::new(local, &HashMap::new()),
                 &challenge,
                 600000,
                 Some(SECURITY_SERVER),
@@ -3012,7 +2935,7 @@ mod tests {
         manager.add(make_aka_ipsec_entry(AKA_AOR));
         let local = "127.0.0.1:5060".parse().unwrap();
         manager
-            .build_register(AKA_AOR, local, &HashMap::new(), 600000)
+            .build_register(AKA_AOR, EgressDefaults::new(local, &HashMap::new()), 600000)
             .unwrap();
 
         let ue_addr: IpAddr = "127.0.0.1".parse().unwrap();
@@ -3035,8 +2958,7 @@ mod tests {
         manager
             .build_register_aka(
                 AKA_AOR,
-                local,
-                &HashMap::new(),
+                EgressDefaults::new(local, &HashMap::new()),
                 &challenge,
                 600000,
                 Some(SECURITY_SERVER),
@@ -3080,11 +3002,10 @@ mod tests {
         // A digest entry's initial REGISTER must NOT gain an AKA Authorization.
         let manager = make_manager();
         manager.add(make_entry("sip:alice@carrier.com"));
-        let (message, _, _, _) = manager
+        let BuiltRegister { message, .. } = manager
             .build_register(
                 "sip:alice@carrier.com",
-                "127.0.0.1:5060".parse().unwrap(),
-                &HashMap::new(),
+                EgressDefaults::new("127.0.0.1:5060".parse().unwrap(), &HashMap::new()),
                 3600,
             )
             .unwrap();
@@ -3096,12 +3017,14 @@ mod tests {
         );
     }
 }
+
 /// Connection-loss detection for Registered trunks on stream transports.
 #[cfg(test)]
 mod liveness_tests {
     use super::*;
     use crate::transport::pool::{build_outbound_tls_config, ConnectionPool};
     use crate::transport::{ConnectionId, StreamConnections};
+    use bytes::Bytes;
     use tokio::net::{TcpListener, TcpStream};
 
     const AOR: &str = "sip:trunk@example.com";

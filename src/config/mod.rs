@@ -1061,7 +1061,9 @@ impl Config {
                 .outbound_transport(&field)
                 .map_err(SiphonError::Config)?;
         }
-        Ok(())
+        registrant
+            .validate_ue_entries()
+            .map_err(SiphonError::Config)
     }
 
     /// Reject a `gateway.groups[].destinations[].transport` siphon cannot dial.

@@ -1753,7 +1753,7 @@
       "add": {
         "doc": "Add a new outbound registration.",
         "kind": "method_descriptor",
-        "sig": "($self, aor, registrar, *, user, password=\"\", interval=None, realm=None, contact=None, transport=None, auth=None, k=None, op=None, opc=None, amf=None, sqn=None, ipsec=False, ue_port_c=None, ue_port_s=None, ipsec_alg=None, ipsec_ealg=None, imei=None, ims_features=None)"
+        "sig": "($self, aor, registrar, *, user, password=\"\", interval=None, realm=None, contact=None, transport=None, auth=None, k=None, op=None, opc=None, amf=None, sqn=None, ipsec=False, ue_port_c=None, ue_port_s=None, ipsec_alg=None, ipsec_ealg=None, imei=None, ims_features=None, local_addr=None, require_local_addr=False, refresh_window=None)"
       },
       "associated_uris": {
         "doc": "The P-Associated-URI list (implicit registration set) for this AoR.",
@@ -1765,10 +1765,20 @@
         "kind": "method_descriptor",
         "sig": "($self)"
       },
+      "counts": {
+        "doc": "How many registrations are in each state.",
+        "kind": "method_descriptor",
+        "sig": "($self)"
+      },
+      "find_by_local": {
+        "doc": "The AoR registering from an address, for routing an MT request to the",
+        "kind": "method_descriptor",
+        "sig": "($self, local)"
+      },
       "flow": {
         "doc": "A `Flow` over the established UE\u2192P-CSCF IPsec SA for MO B2BUA calls.",
         "kind": "method_descriptor",
-        "sig": "($self, aor, ue_ip)"
+        "sig": "($self, aor, ue_ip=None)"
       },
       "list": {
         "doc": "List all registrations with their current state.",
@@ -1794,6 +1804,11 @@
         "doc": "The Service-Route set (RFC 3608) the S-CSCF granted this AoR on the",
         "kind": "method_descriptor",
         "sig": "($self, aor)"
+      },
+      "set_local_addr": {
+        "doc": "Move a registration to another address, or take its address away.",
+        "kind": "method_descriptor",
+        "sig": "($self, aor, local_addr)"
       },
       "status": {
         "doc": "Get the state of a specific registration.",

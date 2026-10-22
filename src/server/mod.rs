@@ -1045,12 +1045,22 @@ impl SiphonServer {
         // are wired later in `init_registrant` using this same manager.
         let registrant_manager: Option<Arc<crate::registrant::RegistrantManager>> =
             config.registrant.as_ref().map(|registrant_config| {
-                let manager = Arc::new(crate::registrant::RegistrantManager::new(
-                    registrant_config.default_interval,
-                    std::time::Duration::from_secs(registrant_config.retry_interval),
-                    std::time::Duration::from_secs(registrant_config.max_retry_interval),
-                    Arc::clone(&identity),
-                ));
+                let manager = Arc::new(
+                    crate::registrant::RegistrantManager::new(
+                        registrant_config.default_interval,
+                        std::time::Duration::from_secs(registrant_config.retry_interval),
+                        std::time::Duration::from_secs(registrant_config.max_retry_interval),
+                        Arc::clone(&identity),
+                    )
+                    .with_event_capacity(registrant_config.effective_event_capacity())
+                    .with_refresh_window(
+                        registrant_config
+                            .refresh_window
+                            .and_then(|pair| crate::registrant::RefreshWindow::from_pair(pair).ok())
+                            .unwrap_or_default(),
+                    )
+                    .with_max_registers_per_sec(registrant_config.max_registers_per_sec),
+                );
                 // Reachable from the gateway's selection gate, which has no
                 // `Arc` in scope but must ask whether a linked registration is
                 // up.
@@ -1377,9 +1387,12 @@ impl SiphonServer {
             None => udp_default,
         };
 
+        // Per-UE sockets for outbound registrations with an address of their own.
+        let ue_sockets = registrant_ue_sockets(&config, &inbound_tx, &transport_acl);
         let outbound_senders = Arc::new(transport::OutboundRouter {
             udp: udp_default,
             udp_by_local,
+            udp_dynamic: ue_sockets.clone(),
             tcp: tcp_outbound_tx,
             tls: tls_outbound_tx,
             ws: ws_outbound_tx,
@@ -2156,7 +2169,8 @@ impl SiphonServer {
         // the UAC sender so both resolve a listener's identity the same way.
         let listener_registry =
             transport::ListenerRegistry::from_entries(listener_registry_entries)
-                .with_global_advertised(config.advertised_address.as_deref());
+                .with_global_advertised(config.advertised_address.as_deref())
+                .with_dynamic_udp(ue_sockets.clone());
 
         // --- UAC sender ---
         let uac_sender = Arc::new(
@@ -2344,12 +2358,17 @@ impl SiphonServer {
             init_registrant(
                 manager,
                 &config,
-                &outbound_senders,
-                local_addr,
-                &listen_addrs,
-                &advertised_addrs,
-                &hep_sender,
-                &connection_pool,
+                crate::registrant::RegistrationLoopContext {
+                    outbound: Arc::clone(&outbound_senders),
+                    local_addr,
+                    listen_addrs: listen_addrs.clone(),
+                    advertised_addrs: advertised_addrs.clone(),
+                    advertised_address: config.advertised_address.clone(),
+                    hep_sender: hep_sender.clone(),
+                    connection_pool: Arc::clone(&connection_pool),
+                    ue_sockets: ue_sockets.clone(),
+                    ipsec_manager: ipsec_manager.clone(),
+                },
             );
         }
 

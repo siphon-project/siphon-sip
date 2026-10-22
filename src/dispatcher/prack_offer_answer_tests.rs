@@ -1027,6 +1027,7 @@ fn place_with_split_egress(
     state.outbound = Arc::new(OutboundRouter {
         udp: to_callee.into(),
         udp_by_local: std::collections::HashMap::from([(state.local_addr, to_caller.into())]),
+        udp_dynamic: None,
         tcp: to_stream.clone(),
         tls: to_stream.clone(),
         ws: to_stream.clone(),

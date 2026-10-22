@@ -844,6 +844,7 @@ fn caller_gave_up_on_a_silent_stream_branch(
     dispatcher.state.outbound = Arc::new(OutboundRouter {
         udp: udp_sender.into(),
         udp_by_local: std::collections::HashMap::new(),
+        udp_dynamic: None,
         tcp: tcp_sender,
         tls: other_sender.clone(),
         ws: other_sender.clone(),
