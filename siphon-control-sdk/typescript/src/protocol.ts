@@ -1010,7 +1010,11 @@ export interface OutboundRegistration {
   aor: string;
   /** The registrar it registers with; `null` once removed. */
   registrar: string | null;
-  /** `unregistered`, `registering`, `challenging`, `registered` or `failed`; `null` once removed. */
+  /**
+   * `unregistered`, `registering`, `challenging`, `registered`, `failed` or
+   * `awaiting_address` (it needs an address of its own and has none); `null`
+   * once removed.
+   */
   state: string | null;
   /** Seconds left on the granted binding, `0` when none. */
   expires_in: number;
@@ -1030,7 +1034,7 @@ export interface RegistrantChangedPayload extends OutboundRegistration {
    * order; `null` without a registrar identity.
    */
   instance_epoch?: string | null;
-  /** `registered`, `refreshed`, `failed`, `deregistered` or `snapshot`. */
+  /** `registered`, `refreshed`, `failed`, `deregistered`, `awaiting_address` or `snapshot`. */
   event: string;
 }
 

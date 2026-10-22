@@ -454,6 +454,60 @@ registrar:
 #       password: "p33rsecret"
 #       transport: "tcp"
 #
+# Many IMS UEs in one process, each from its own address:
+#
+# Each entry registers as a handset (IMS-AKA + IPsec sec-agree, TS 33.203)
+# from the address in `local_addr`: the Via and Contact host, the UDP source of
+# every REGISTER (initial, 401 retry, de-REGISTER) and, with `ipsec`, the UE
+# side of its four SAs. siphon opens the sockets itself at run time on
+# (local_addr, first listen.udp port), (local_addr, ue_port_c) and
+# (local_addr, ue_port_s), bound with IP_FREEBIND so the address need not be on
+# the host yet. No listen.udp entries are needed for them; a listen.udp on the
+# exact address and port is used instead (static wins). The protected ports
+# may repeat across entries, two entries may not share (local_addr, ue_port_c).
+# UDP only: local_addr on a tcp/tls entry is refused at load. IPsec entries
+# need the top-level `ipsec:` block and CAP_NET_ADMIN.
+#
+# registrant:
+#   refresh_window: [0.4, 0.6]        # refresh at a uniform draw between 40 %
+#                                     # and 60 % of the granted Expires, per
+#                                     # refresh. Default [0.5, 0.5] (exactly
+#                                     # half). 0 < low <= high < 1.
+#   max_registers_per_sec: 20         # optional cap on new REGISTERs (initial,
+#                                     # refresh, retry) in any one-second
+#                                     # window. The REGISTER answering a 401 is
+#                                     # never held back. When set the loop ticks
+#                                     # every 200 ms (not 5 s) and starts the
+#                                     # longest-overdue entries first. 0 refused.
+#   event_capacity: 4096              # optional state-change event buffer for
+#                                     # @registration.on_change / control plane.
+#                                     # Default max(1024, 4 x entries). A slow
+#                                     # consumer that overruns it gets a
+#                                     # snapshot. Raise it when a script adds
+#                                     # the entries (they are not counted).
+#   entries:
+#     - aor: "sip:001010000000001@ims.mnc01.mcc001.3gppnetwork.org"
+#       registrar: "sip:pcscf.ims.mnc01.mcc001.3gppnetwork.org:5060"
+#       user: "001010000000001@ims.mnc01.mcc001.3gppnetwork.org"
+#       auth: aka
+#       aka: { k: "465b5ce8b199b49faa5f0a2ee238a6bc", opc: "cd63cb71954a9f4e48a5994e37a02baf" }
+#       ipsec: { ue_port_c: 6100, ue_port_s: 6101 }
+#       ims: { imei: "01234567-000001-0", features: [mmtel, smsip] }
+#       local_addr: "203.0.113.11"     # IP only, no port
+#       refresh_window: [0.3, 0.5]     # optional per-entry override
+#     - aor: "sip:001010000000002@ims.mnc01.mcc001.3gppnetwork.org"
+#       # ... same shape ...
+#       require_local_addr: true       # never register from the process's
+#                                      # address: with no local_addr the entry
+#                                      # waits as `awaiting_address` until a
+#                                      # script calls
+#                                      # registration.set_local_addr(aor, ip)
+#
+# When the address disappears from the host, sends fail in the kernel (no
+# spoofed source), the REGISTER times out at Timer F (32 s), the entry goes
+# `failed` with backoff and the process keeps running. A failed bind is logged
+# once and the entry waits for it. Cookbook: docs/cookbook/ims-multi-ue.md.
+#
 # Database- or HTTP-backed entries (the controller owns the trunks):
 #
 # With `backend: database` / `http`, siphon re-reads the source every

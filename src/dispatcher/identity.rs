@@ -754,6 +754,9 @@ pub(super) fn build_self_identity(
     via_addr: SocketAddr,
 ) -> core::SelfIdentity {
     let mut identity = core::SelfIdentity::new();
+    // Per-UE sockets come and go at run time, so they are asked live rather
+    // than copied in here.
+    identity.set_dynamic_udp(listener_registry.dynamic_udp().cloned());
 
     // The ports we answer on. A Route at one of our hosts but on a port outside
     // this set belongs to a different proxy co-located on the same address.

@@ -178,6 +178,7 @@ pub async fn listen(
                 inbound_tx.clone(),
                 outbound_rx,
                 Arc::clone(&acl),
+                SendFailureLog::new(SendFailureLogging::EveryFailure),
             ));
         }
         return Ok(bound);
@@ -226,6 +227,7 @@ pub async fn listen(
                     inbound_tx.clone(),
                     outbound_rx,
                     Arc::clone(&acl),
+                    SendFailureLog::new(SendFailureLogging::EveryFailure),
                 ));
             }
             // The destinations routed to this channel stay routed to it, so a
@@ -253,6 +255,7 @@ async fn run_worker(
     inbound_tx: flume::Sender<InboundMessage>,
     outbound_rx: flume::Receiver<OutboundMessage>,
     acl: Arc<TransportAcl>,
+    mut send_failures: SendFailureLog,
 ) {
     loop {
         // Use a reasonably large initial buffer; we'll grow it if needed.
@@ -318,7 +321,10 @@ async fn run_worker(
 
             outbound_result = outbound_rx.recv_async() => {
                 match outbound_result {
-                    Ok(outbound) => send_frames(worker_index, &socket, &outbound).await,
+                    Ok(outbound) => {
+                        send_frames(worker_index, local_addr, &socket, &outbound, &mut send_failures)
+                            .await
+                    }
                     // Outbound channel closed — clean shutdown
                     Err(_) => break,
                 }
@@ -329,7 +335,13 @@ async fn run_worker(
 
 /// Send every frame of `outbound` from `socket`, in order, before the caller
 /// takes anything else off its channel.
-async fn send_frames(worker_index: usize, socket: &UdpSocket, outbound: &OutboundMessage) {
+async fn send_frames(
+    worker_index: usize,
+    local_addr: SocketAddr,
+    socket: &UdpSocket,
+    outbound: &OutboundMessage,
+    send_failures: &mut SendFailureLog,
+) {
     let dest = SockAddr::from(outbound.destination);
     let Some(dest_addr) = dest.as_socket() else {
         warn!(
@@ -339,13 +351,93 @@ async fn send_frames(worker_index: usize, socket: &UdpSocket, outbound: &Outboun
         return;
     };
     for frame in outbound.frames() {
-        if let Err(e) = socket.send_to(frame, &dest_addr).await {
-            warn!(
-                "[udp-worker-{}] send_to {} failed: {}",
-                worker_index, outbound.destination, e
-            );
-            break;
+        if let Err(error) = socket.send_to(frame, &dest_addr).await {
+            send_failures.failed(worker_index, local_addr, outbound.destination, &error);
+            return;
         }
+    }
+    send_failures.succeeded(local_addr);
+}
+
+/// How a worker reports a datagram it could not send.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SendFailureLogging {
+    /// A `warn!` per failure: a configured listener failing to send is rare and
+    /// each one is worth seeing.
+    EveryFailure,
+    /// A `warn!` for the first failure of a run, `debug!` for the rest, and an
+    /// `info!` once a send succeeds again.
+    ///
+    /// For a socket bound to an address siphon does not own (a per-UE address
+    /// bound with `IP_FREEBIND`, see [`listen_one`]): when that address is
+    /// taken off the host, every send from it fails (the kernel refuses a
+    /// source address that is not local rather than spoofing it), and a
+    /// registration refreshing hundreds of them would otherwise flood the log
+    /// with one line per datagram.
+    FirstOfRun,
+}
+
+/// The send-failure state of one worker, see [`SendFailureLogging`].
+#[derive(Debug)]
+pub(crate) struct SendFailureLog {
+    logging: SendFailureLogging,
+    /// Consecutive failures since the last successful send.
+    consecutive: u64,
+}
+
+impl SendFailureLog {
+    pub(crate) fn new(logging: SendFailureLogging) -> Self {
+        Self {
+            logging,
+            consecutive: 0,
+        }
+    }
+
+    fn failed(
+        &mut self,
+        worker_index: usize,
+        local_addr: SocketAddr,
+        destination: SocketAddr,
+        error: &std::io::Error,
+    ) {
+        self.consecutive = self.consecutive.saturating_add(1);
+        match self.logging {
+            SendFailureLogging::EveryFailure => warn!(
+                "[udp-worker-{}] send_to {} failed: {}",
+                worker_index, destination, error
+            ),
+            SendFailureLogging::FirstOfRun if self.consecutive == 1 => warn!(
+                local = %local_addr,
+                %destination,
+                %error,
+                "UDP send from a per-UE socket failed (is its address still on the host?); \
+                 further failures from this socket are logged at debug until a send succeeds"
+            ),
+            SendFailureLogging::FirstOfRun => debug!(
+                local = %local_addr,
+                %destination,
+                %error,
+                failures = self.consecutive,
+                "UDP send from a per-UE socket failed again"
+            ),
+        }
+    }
+
+    fn succeeded(&mut self, local_addr: SocketAddr) {
+        if self.consecutive > 0 && self.logging == SendFailureLogging::FirstOfRun {
+            info!(
+                local = %local_addr,
+                failures = self.consecutive,
+                "UDP sends from a per-UE socket are succeeding again"
+            );
+        }
+        self.consecutive = 0;
+    }
+
+    /// Consecutive failures since the last success (tests).
+    #[cfg(test)]
+    pub(crate) fn consecutive(&self) -> u64 {
+        self.consecutive
     }
 }
 
@@ -356,9 +448,70 @@ async fn drain_outbound(
     socket: Arc<UdpSocket>,
     outbound_rx: flume::Receiver<OutboundMessage>,
 ) {
+    let local_addr = socket
+        .local_addr()
+        .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 0)));
+    let mut send_failures = SendFailureLog::new(SendFailureLogging::EveryFailure);
     while let Ok(outbound) = outbound_rx.recv_async().await {
-        send_frames(worker_index, &socket, &outbound).await;
+        send_frames(
+            worker_index,
+            local_addr,
+            &socket,
+            &outbound,
+            &mut send_failures,
+        )
+        .await;
     }
+}
+
+/// One socket, one worker, bound to exactly `local_addr`: a socket opened at
+/// run time for one address, as opposed to a configured `listen.udp` listener
+/// (see [`listen`]).
+///
+/// `freebind` sets `IP_FREEBIND` / `IPV6_FREEBIND` before the bind, so the
+/// socket binds even while `local_addr` is not (yet) configured on any
+/// interface: the per-UE addresses of an outbound registrant are brought up and
+/// moved by something else, and siphon must not have to win that race. With
+/// `freebind` the socket also sets `SO_REUSEADDR` (never `SO_REUSEPORT`), so it
+/// can sit on a specific address beside a configured wildcard listener of the
+/// same port (`0.0.0.0:5060`, which sets both); the kernel delivers a datagram
+/// to the most specific bound socket. Without `freebind` the port is held
+/// exclusively ([`PortSharing::Exclusive`]).
+///
+/// The worker exits, and the socket closes, when every sender of `outbound_rx`
+/// is dropped. Must be called from within a Tokio runtime.
+pub(crate) fn listen_one(
+    local_addr: SocketAddr,
+    inbound_tx: flume::Sender<InboundMessage>,
+    outbound_rx: flume::Receiver<OutboundMessage>,
+    acl: Arc<TransportAcl>,
+    tos: Option<u32>,
+    recv_buffer_bytes: usize,
+    freebind: bool,
+) -> std::io::Result<SocketAddr> {
+    let sharing = if freebind {
+        PortSharing::FreeBind
+    } else {
+        PortSharing::Exclusive
+    };
+    let socket = Arc::new(create_udp_socket(
+        local_addr,
+        tos,
+        recv_buffer_bytes,
+        sharing,
+    )?);
+    let bound = socket.local_addr()?;
+    debug!(addr = %bound, freebind, "started a single-socket UDP worker");
+    tokio::spawn(run_worker(
+        0,
+        bound,
+        socket,
+        inbound_tx,
+        outbound_rx,
+        acl,
+        SendFailureLog::new(SendFailureLogging::FirstOfRun),
+    ));
+    Ok(bound)
 }
 
 /// Compute a stable ConnectionId for a UDP (local, remote) pair.
@@ -384,6 +537,11 @@ enum PortSharing {
     /// listener, in this process or not) could land on the listener's port and
     /// take a share of its datagrams.
     Exclusive,
+    /// `IP_FREEBIND` / `IPV6_FREEBIND` and `SO_REUSEADDR`, no `SO_REUSEPORT`:
+    /// a socket on one specific address that may not be on the host yet, and
+    /// that has to coexist with a configured wildcard listener of the same
+    /// port. See [`listen_one`].
+    FreeBind,
 }
 
 /// A worker socket for a configured port; see [`PortSharing::Workers`].
@@ -415,10 +573,17 @@ fn create_udp_socket(
         ),
     }?;
 
-    if sharing == PortSharing::Workers {
-        socket.set_reuse_address(true)?;
-        #[cfg(not(target_os = "windows"))]
-        socket.set_reuse_port(true)?;
+    match sharing {
+        PortSharing::Workers => {
+            socket.set_reuse_address(true)?;
+            #[cfg(not(target_os = "windows"))]
+            socket.set_reuse_port(true)?;
+        }
+        PortSharing::Exclusive => {}
+        PortSharing::FreeBind => {
+            socket.set_reuse_address(true)?;
+            set_freebind(&socket, local_addr)?;
+        }
     }
     socket.set_nonblocking(true)?;
 
@@ -433,6 +598,49 @@ fn create_udp_socket(
     socket.bind(&SockAddr::from(local_addr))?;
 
     UdpSocket::from_std(socket.into())
+}
+
+/// Let `socket` bind an address that is not (yet) on any interface
+/// (`IP_FREEBIND`, `IPV6_FREEBIND`; ip(7), ipv6(7)).
+///
+/// Only the bind is relaxed. Sending from such a socket while its address is
+/// absent still fails: the route lookup refuses a source address that is not
+/// local unless the socket is `IP_TRANSPARENT`, which this never sets, so a
+/// datagram cannot leave with a source the host does not own.
+#[cfg(target_os = "linux")]
+fn set_freebind(socket: &socket2::Socket, local_addr: SocketAddr) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let (level, option) = if local_addr.is_ipv6() {
+        (libc::IPPROTO_IPV6, libc::IPV6_FREEBIND)
+    } else {
+        (libc::IPPROTO_IP, libc::IP_FREEBIND)
+    };
+    let enable: libc::c_int = 1;
+    // SAFETY: a valid fd owned by `socket` for the duration of the call, and a
+    // pointer to a live c_int of the length passed.
+    let result = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            level,
+            option,
+            (&enable as *const libc::c_int).cast(),
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// `IP_FREEBIND` is Linux-only; elsewhere the address has to exist first.
+#[cfg(not(target_os = "linux"))]
+fn set_freebind(_socket: &socket2::Socket, _local_addr: SocketAddr) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "binding an address that is not on the host needs IP_FREEBIND, which is Linux-only",
+    ))
 }
 
 /// Raise `SO_RCVBUF` to at least `requested` and report what the kernel granted.
@@ -501,9 +709,71 @@ fn apply_recv_buffer(socket: &socket2::Socket, local_addr: SocketAddr, requested
     }
 }
 
+/// Socket constructors for tests elsewhere in the transport layer.
+#[cfg(test)]
+pub(crate) mod tests_support {
+    use super::*;
+
+    /// A bare socket bound to `local_addr` with `IP_FREEBIND`.
+    pub(crate) fn freebind_socket(local_addr: SocketAddr) -> std::io::Result<UdpSocket> {
+        create_udp_socket(local_addr, None, 0, PortSharing::FreeBind)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_quiet_log_counts_a_run_of_failures_and_resets_on_success() {
+        let mut log = SendFailureLog::new(SendFailureLogging::FirstOfRun);
+        let local: SocketAddr = "192.0.2.77:5060".parse().expect("addr");
+        let peer: SocketAddr = "198.51.100.10:5060".parse().expect("addr");
+        let error = std::io::Error::from(std::io::ErrorKind::AddrNotAvailable);
+        for _ in 0..1000 {
+            log.failed(0, local, peer, &error);
+        }
+        assert_eq!(log.consecutive(), 1000);
+        log.succeeded(local);
+        assert_eq!(log.consecutive(), 0);
+    }
+
+    #[tokio::test]
+    async fn listen_one_serves_one_address_until_its_channel_closes() {
+        let (inbound_tx, inbound_rx) = flume::unbounded();
+        let (outbound, mut receivers) = UdpOutbound::channels(1);
+        let receiver = receivers.pop().expect("one channel");
+        let bound = listen_one(
+            "127.0.0.1:0".parse().expect("addr"),
+            inbound_tx,
+            receiver,
+            Arc::new(TransportAcl::new(Vec::new(), Vec::new())),
+            None,
+            0,
+            false,
+        )
+        .expect("binds");
+        let peer = std::net::UdpSocket::bind("127.0.0.1:0").expect("peer");
+        peer.send_to(b"PING", bound).expect("send");
+        let message =
+            tokio::time::timeout(std::time::Duration::from_secs(2), inbound_rx.recv_async())
+                .await
+                .expect("in time")
+                .expect("open");
+        assert_eq!(message.local_addr, bound);
+
+        drop(outbound);
+        // The worker exits and closes the socket: the port binds exclusively.
+        let mut free = false;
+        for _ in 0..200 {
+            if std::net::UdpSocket::bind(bound).is_ok() {
+                free = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(free, "the socket outlived its channel");
+    }
     /// A listener ends up with at least the configured floor, whether that
     /// took a `setsockopt` or the host already gave it that much.
     ///

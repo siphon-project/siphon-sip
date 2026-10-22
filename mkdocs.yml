@@ -51,6 +51,7 @@ nav:
       - Least-Cost Routing: cookbook/least-cost-routing.md
       - SBC (B2BUA): cookbook/sbc.md
       - WhatsApp calling: cookbook/whatsapp-calling.md
+      - IMS multi-UE: cookbook/ims-multi-ue.md
       - Call transfer (REFER): cookbook/call-transfer.md
       - Voice AI (WebSocket bridge): cookbook/voice-ai.md
       - Conference focus (mixing): cookbook/conference-focus.md

@@ -418,6 +418,7 @@ async fn uac_and_registrant_requests_carry_the_reloaded_user_agent() {
     let router = Arc::new(OutboundRouter {
         udp: udp_sender.into(),
         udp_by_local: std::collections::HashMap::new(),
+        udp_dynamic: None,
         tcp: stream_sender.clone(),
         tls: stream_sender.clone(),
         ws: stream_sender.clone(),
@@ -463,11 +464,15 @@ async fn uac_and_registrant_requests_carry_the_reloaded_user_agent() {
             .cloned()
     };
     let register_user_agent = || {
-        let (register, _, _, _) = registrant
+        let crate::registrant::BuiltRegister {
+            message: register, ..
+        } = registrant
             .build_register(
                 "sip:trunk@example.com",
-                "192.0.2.1:5060".parse().expect("an address"),
-                &std::collections::HashMap::new(),
+                crate::registrant::EgressDefaults::new(
+                    "192.0.2.1:5060".parse().expect("an address"),
+                    &std::collections::HashMap::new(),
+                ),
                 3600,
             )
             .expect("a REGISTER");

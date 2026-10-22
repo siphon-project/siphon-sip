@@ -10,25 +10,123 @@
 
 use super::*;
 
+/// The process-wide addressing a REGISTER falls back to: what every entry
+/// without a `local_addr` of its own registers from.
+#[derive(Clone, Copy, Debug)]
+pub struct EgressDefaults<'a> {
+    /// The process's primary listen address.
+    pub local_addr: SocketAddr,
+    /// The first listener of each transport.
+    pub listen_addrs: &'a HashMap<Transport, SocketAddr>,
+    /// The UE side of a process-address entry's IPsec SAs (the dispatcher's
+    /// resolved local address).
+    pub ue_ip: IpAddr,
+}
+
+impl<'a> EgressDefaults<'a> {
+    /// Defaults from the process's listen address and per-transport
+    /// listeners; the IPsec UE address is `local_addr`'s IP.
+    pub fn new(local_addr: SocketAddr, listen_addrs: &'a HashMap<Transport, SocketAddr>) -> Self {
+        Self {
+            local_addr,
+            listen_addrs,
+            ue_ip: local_addr.ip(),
+        }
+    }
+
+    /// The port an entry's plain (unprotected) SIP socket uses on its own
+    /// address: the first UDP listener's, else 5060.
+    pub fn plain_port(&self) -> u16 {
+        self.listen_addrs
+            .get(&Transport::Udp)
+            .map_or(5060, |addr| addr.port())
+    }
+}
+
+/// Where one entry's REGISTER says it is and leaves from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct EntryEgress {
+    /// The Via sent-by and default Contact host:port.
+    sent_by: SocketAddr,
+    /// The UDP socket the REGISTER is pinned to; `None` for TCP/TLS, whose
+    /// outbound connection is the pool's, not a listener's.
+    source: Option<SocketAddr>,
+    /// Whether this is the entry's own address rather than the process's.
+    own_address: bool,
+}
+
+impl EntryEgress {
+    fn of(entry: &RegistrantEntry, defaults: EgressDefaults<'_>) -> Self {
+        match entry.local_addr {
+            // The process's address: unchanged from before per-entry addresses.
+            // UDP egresses from the same local address advertised in the Via,
+            // so the source port matches the Via and the response / conntrack
+            // return path is consistent. With multiple UDP listeners + IPsec, a
+            // `None` source picks a non-deterministic default — the initial
+            // REGISTER could egress from a protected port while the Via said
+            // 5060, breaking the 401 return path.
+            None => Self {
+                sent_by: defaults
+                    .listen_addrs
+                    .get(&entry.transport)
+                    .copied()
+                    .unwrap_or(defaults.local_addr),
+                source: (entry.transport == Transport::Udp).then(|| {
+                    defaults
+                        .listen_addrs
+                        .get(&Transport::Udp)
+                        .copied()
+                        .unwrap_or(defaults.local_addr)
+                }),
+                own_address: false,
+            },
+            // An address of its own (UDP only, refused otherwise): Via, Contact
+            // and source all name the plain port on that address.
+            Some(ip) => {
+                let addr = SocketAddr::new(ip, defaults.plain_port());
+                Self {
+                    sent_by: addr,
+                    source: Some(addr),
+                    own_address: true,
+                }
+            }
+        }
+    }
+}
+
+/// A REGISTER ready to send, and how it has to leave.
+#[derive(Debug)]
+pub struct BuiltRegister {
+    pub message: SipMessage,
+    /// The Via branch.
+    pub branch: String,
+    pub destination: SocketAddr,
+    pub transport: Transport,
+    /// The UDP socket it must leave from. `None` only for a stream transport.
+    /// For a protected REGISTER, the UE protected client port (TS 33.203 §7.1).
+    pub source_local_addr: Option<SocketAddr>,
+    /// The Via sent-by.
+    pub sent_by: SocketAddr,
+    /// Whether the entry registers from an address of its own.
+    pub own_address: bool,
+}
+
 impl RegistrantManager {
     /// Build a REGISTER request for an entry.
     ///
-    /// `listen_addrs` maps each transport to its listen address. The entry's
-    /// transport is used to pick the correct local address (and port) for the
-    /// Contact and Via headers. Falls back to `local_addr` when no
-    /// transport-specific address is configured.
+    /// An entry with a `local_addr` names that address (on the plain UDP
+    /// port) in its Via and Contact and leaves from it. Every other entry uses
+    /// `defaults`: the listener of its transport for the Contact and Via,
+    /// falling back to `defaults.local_addr` when that transport has none.
     pub fn build_register(
         &self,
         aor: &str,
-        local_addr: SocketAddr,
-        listen_addrs: &HashMap<Transport, SocketAddr>,
+        defaults: EgressDefaults<'_>,
         expires: u32,
-    ) -> Option<(SipMessage, String, SocketAddr, Transport)> {
+    ) -> Option<BuiltRegister> {
         let mut entry = self.entries.get_mut(aor)?;
-        let effective_addr = listen_addrs
-            .get(&entry.transport)
-            .copied()
-            .unwrap_or(local_addr);
+        let egress = EntryEgress::of(&entry, defaults);
+        let effective_addr = egress.sent_by;
         let cseq = entry.next_cseq();
         let branch = format!("z9hG4bK-reg-{}", uuid::Uuid::new_v4());
 
@@ -115,7 +213,15 @@ impl RegistrantManager {
         }
 
         match message {
-            Ok(message) => Some((message, branch, destination, transport)),
+            Ok(message) => Some(BuiltRegister {
+                message,
+                branch,
+                destination,
+                transport,
+                source_local_addr: egress.source,
+                sent_by: egress.sent_by,
+                own_address: egress.own_address,
+            }),
             Err(error) => {
                 warn!(aor = %entry.aor, %error, "failed to build REGISTER");
                 None
@@ -127,17 +233,14 @@ impl RegistrantManager {
     pub fn build_register_with_auth(
         &self,
         aor: &str,
-        local_addr: SocketAddr,
-        listen_addrs: &HashMap<Transport, SocketAddr>,
+        defaults: EgressDefaults<'_>,
         challenge: &DigestChallenge,
         is_proxy_auth: bool,
         expires: u32,
-    ) -> Option<(SipMessage, String, SocketAddr, Transport)> {
+    ) -> Option<BuiltRegister> {
         let mut entry = self.entries.get_mut(aor)?;
-        let effective_addr = listen_addrs
-            .get(&entry.transport)
-            .copied()
-            .unwrap_or(local_addr);
+        let egress = EntryEgress::of(&entry, defaults);
+        let effective_addr = egress.sent_by;
         let cseq = entry.next_cseq();
         let branch = format!("z9hG4bK-reg-{}", uuid::Uuid::new_v4());
 
@@ -222,7 +325,15 @@ impl RegistrantManager {
         let transport = entry.transport;
 
         match message {
-            Ok(message) => Some((message, branch, destination, transport)),
+            Ok(message) => Some(BuiltRegister {
+                message,
+                branch,
+                destination,
+                transport,
+                source_local_addr: egress.source,
+                sent_by: egress.sent_by,
+                own_address: egress.own_address,
+            }),
             Err(error) => {
                 warn!(aor = %entry.aor, %error, "failed to build authenticated REGISTER");
                 None
@@ -244,12 +355,11 @@ impl RegistrantManager {
     pub fn build_register_aka(
         &self,
         aor: &str,
-        local_addr: SocketAddr,
-        listen_addrs: &HashMap<Transport, SocketAddr>,
+        defaults: EgressDefaults<'_>,
         challenge: &DigestChallenge,
         expires: u32,
         security_verify: Option<&str>,
-    ) -> Option<(SipMessage, String, SocketAddr, Transport)> {
+    ) -> Option<BuiltRegister> {
         let mut entry = self.entries.get_mut(aor)?;
 
         let credentials = entry.aka.clone()?;
@@ -290,10 +400,8 @@ impl RegistrantManager {
             }
         };
 
-        let effective_addr = listen_addrs
-            .get(&entry.transport)
-            .copied()
-            .unwrap_or(local_addr);
+        let egress = EntryEgress::of(&entry, defaults);
+        let effective_addr = egress.sent_by;
         let cseq = entry.next_cseq();
         let branch = format!("z9hG4bK-reg-{}", uuid::Uuid::new_v4());
 
@@ -377,9 +485,27 @@ impl RegistrantManager {
             }
             _ => entry.destination,
         };
+        // The protected REGISTER leaves from the UE protected client port on
+        // the entry's address, the source its outbound SA selector names
+        // (TS 33.203 §7.1); anything else from the plain socket.
+        let source_local_addr = match entry.ue_ipsec.as_ref() {
+            Some(ipsec) if security_verify.is_some() => Some(SocketAddr::new(
+                entry.local_addr.unwrap_or(defaults.ue_ip),
+                ipsec.ue_port_c,
+            )),
+            _ => egress.source,
+        };
 
         match message {
-            Ok(message) => Some((message, branch, destination, transport)),
+            Ok(message) => Some(BuiltRegister {
+                message,
+                branch,
+                destination,
+                transport,
+                source_local_addr,
+                sent_by: egress.sent_by,
+                own_address: egress.own_address,
+            }),
             Err(error) => {
                 warn!(aor = %entry.aor, %error, "failed to build AKA REGISTER");
                 None

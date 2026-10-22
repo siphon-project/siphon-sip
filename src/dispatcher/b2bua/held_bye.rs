@@ -447,6 +447,7 @@ mod tests {
             fixture.state.outbound = Arc::new(OutboundRouter {
                 udp: router.udp.clone(),
                 udp_by_local: router.udp_by_local.clone(),
+                udp_dynamic: router.udp_dynamic.clone(),
                 tcp: router.tcp.clone(),
                 tls: sender,
                 ws: router.ws.clone(),

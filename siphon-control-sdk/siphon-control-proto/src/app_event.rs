@@ -276,8 +276,9 @@ pub struct OutboundRegistration {
     /// The registrar it registers with; `None` once it was removed.
     #[serde(default)]
     pub registrar: Option<String>,
-    /// `unregistered`, `registering`, `challenging`, `registered` or `failed`;
-    /// `None` once it was removed.
+    /// `unregistered`, `registering`, `challenging`, `registered`, `failed` or
+    /// `awaiting_address` (it needs an address of its own and has none); `None`
+    /// once it was removed.
     #[serde(default)]
     pub state: Option<String>,
     /// Seconds left on the binding the registrar granted, `0` when none.
@@ -305,7 +306,8 @@ pub struct RegistrantChangedPayload {
     /// identity, or one that predates it.
     #[serde(default)]
     pub instance_epoch: Option<String>,
-    /// `registered`, `refreshed`, `failed`, `deregistered` or `snapshot`.
+    /// `registered`, `refreshed`, `failed`, `deregistered`, `awaiting_address`
+    /// or `snapshot`.
     pub event: String,
     /// The registration's state now.
     #[serde(flatten)]

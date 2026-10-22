@@ -94,7 +94,11 @@ pub(super) fn handle_registrant_response(
                     state.ipsec_manager.clone(),
                     registrant.ue_protected_client_port(&aor),
                 ) {
-                    let ue_addr = state.local_addr.ip();
+                    // The entry's own address when it has one: the SAs were
+                    // installed there (see `handle_registrant_ipsec_challenge`).
+                    let ue_addr = registrant
+                        .ue_addr(&aor)
+                        .unwrap_or_else(|| state.local_addr.ip());
                     let hard_lifetime = (expires as u64) + 32;
                     tokio::spawn(async move {
                         if let Err(error) = ipsec_manager
@@ -148,11 +152,12 @@ pub(super) fn handle_registrant_response(
                 // IMS AKA entries run Milenage over the RAND/AUTN in the nonce;
                 // carrier-trunk entries use password digest. The IMS challenge
                 // always arrives as a 401 (WWW-Authenticate).
+                let defaults =
+                    crate::registrant::EgressDefaults::new(state.local_addr, &state.listen_addrs);
                 let built = if is_aka {
                     registrant.build_register_aka(
                         &aor,
-                        state.local_addr,
-                        &state.listen_addrs,
+                        defaults,
                         &challenge,
                         registrant.default_interval,
                         None,
@@ -160,21 +165,25 @@ pub(super) fn handle_registrant_response(
                 } else {
                     registrant.build_register_with_auth(
                         &aor,
-                        state.local_addr,
-                        &state.listen_addrs,
+                        defaults,
                         &challenge,
                         status_code == 407,
                         registrant.default_interval,
                     )
                 };
 
-                if let Some((retry_message, _retry_branch, destination, transport)) = built {
-                    let data = bytes::Bytes::from(retry_message.to_bytes());
-                    send_outbound(
+                if let Some(built) = built {
+                    // Pinned to the socket the first REGISTER left from (the
+                    // entry's own address, or the first UDP listener), so the
+                    // retry carries the source its Via names; it used to leave
+                    // from whichever socket was the default.
+                    let data = bytes::Bytes::from(built.message.to_bytes());
+                    send_outbound_from(
                         data,
-                        transport,
-                        destination,
+                        built.transport,
+                        built.destination,
                         crate::transport::ConnectionId::default(),
+                        built.source_local_addr,
                         state,
                     );
                 } else {
@@ -229,25 +238,32 @@ pub(super) fn handle_registrant_ipsec_challenge(
     let verify = registrant.security_server_value(aor);
     let built = registrant.build_register_aka(
         aor,
-        state.local_addr,
-        &state.listen_addrs,
+        crate::registrant::EgressDefaults::new(state.local_addr, &state.listen_addrs),
         challenge,
         registrant.default_interval,
         verify.as_deref(),
     );
-    let (retry_message, destination, transport) = match built {
-        Some((retry_message, _branch, destination, transport)) => {
-            (retry_message, destination, transport)
-        }
-        None => {
-            registrant.handle_failure(aor, status_code, retry_after);
-            return;
-        }
+    let Some(built) = built else {
+        registrant.handle_failure(aor, status_code, retry_after);
+        return;
     };
+    let (retry_message, destination, transport) =
+        (built.message, built.destination, built.transport);
 
-    let ue_addr = state.local_addr.ip();
-    let pcscf_addr = destination.ip();
+    // The UE side of the SAs: the entry's own address when it has one, else the
+    // process's (TS 33.203 §7.1). The protected REGISTER leaves from its
+    // protected client port there, the source the outbound SA selector names.
     let ue_port_c = registrant.ue_protected_client_port(aor).unwrap_or(0);
+    let source = built.source_local_addr.unwrap_or_else(|| {
+        std::net::SocketAddr::new(
+            registrant
+                .ue_addr(aor)
+                .unwrap_or_else(|| state.local_addr.ip()),
+            ue_port_c,
+        )
+    });
+    let ue_addr = source.ip();
+    let pcscf_addr = destination.ip();
     // Placeholder lifetime; tightened to the granted Expires on the 200 OK.
     let sa = registrant.ue_sa_pair(
         aor,
@@ -266,7 +282,6 @@ pub(super) fn handle_registrant_ipsec_challenge(
         }
     };
 
-    let source = std::net::SocketAddr::new(ue_addr, ue_port_c);
     let data = bytes::Bytes::from(retry_message.to_bytes());
     let outbound = state.outbound.clone();
     // Sent from the task below, past `send_outbound_from`'s capture.
@@ -348,3 +363,7 @@ pub(super) fn collect_route_set(message: &SipMessage, header_name: &str) -> Vec<
     }
     values
 }
+
+#[cfg(test)]
+#[path = "registrant_tests.rs"]
+mod tests;

@@ -833,6 +833,34 @@ pub(super) fn init_ro_charging(
     Some(service)
 }
 
+/// The per-UE sockets outbound registrations with a `local_addr` of their own
+/// are opened in by the registration loop. Only when a registrant is
+/// configured, so every other deployment keeps `udp_dynamic: None` and the send
+/// path it always had.
+pub(super) fn registrant_ue_sockets(
+    config: &Config,
+    inbound_tx: &flume::Sender<transport::InboundMessage>,
+    transport_acl: &Arc<transport::acl::TransportAcl>,
+) -> Option<Arc<transport::ue_sockets::UeSockets>> {
+    config.registrant.as_ref().map(|_| {
+        Arc::new(transport::ue_sockets::UeSockets::new(
+            inbound_tx.clone(),
+            Arc::clone(transport_acl),
+            config
+                .listen
+                .dscp
+                .filter(|dscp| *dscp != 0)
+                .map(config::dscp_to_tos),
+            config.listen.udp_recv_buffer_bytes,
+            config
+                .listen
+                .udp
+                .iter()
+                .filter_map(|entry| entry.address().parse().ok()),
+        ))
+    })
+}
+
 /// Wire the config entries + background refresh loop onto the registrant
 /// `manager` that was created (and whose Python namespace was installed) early
 /// in `serve()` — before `ScriptEngine::new()` — so the script's
@@ -840,176 +868,27 @@ pub(super) fn init_ro_charging(
 pub(super) fn init_registrant(
     manager: &Arc<crate::registrant::RegistrantManager>,
     config: &Config,
-    outbound_senders: &Arc<transport::OutboundRouter>,
-    local_addr: std::net::SocketAddr,
-    listen_addrs: &std::collections::HashMap<transport::Transport, std::net::SocketAddr>,
-    advertised_addrs: &std::collections::HashMap<transport::Transport, String>,
-    hep_sender: &Option<Arc<HepSender>>,
-    connection_pool: &Arc<transport::pool::ConnectionPool>,
+    context: crate::registrant::RegistrationLoopContext,
 ) {
-    use crate::registrant::{RegistrantCredentials, RegistrantEntry};
-
     let registrant_config = match config.registrant.as_ref() {
         Some(config) => config,
         None => return,
     };
 
     for entry_config in &registrant_config.entries {
-        let registrar_host = entry_config
-            .registrar
-            .strip_prefix("sip:")
-            .or_else(|| entry_config.registrar.strip_prefix("sips:"))
-            .unwrap_or(&entry_config.registrar);
-
-        // Refused at load by `Config::validate_registrant_transports`; skipped
-        // loudly here rather than defaulting to UDP, which is how an `sctp` or
-        // mis-cased trunk registered on a transport nobody named.
-        let transport_type = match entry_config.outbound_transport("registrant transport") {
-            Ok(transport) => transport,
+        let entry = match crate::registrant::entry_config::entry_from_config(
+            entry_config,
+            registrant_config,
+        ) {
+            Ok(entry) => entry,
             Err(reason) => {
-                error!(aor = %entry_config.aor, "{reason}");
+                error!(aor = %entry_config.aor, "{reason}, skipping entry");
                 continue;
             }
         };
-
-        let default_port: u16 = if transport_type == transport::Transport::Tls {
-            5061
-        } else {
-            5060
-        };
-        let address_str = if registrar_host.contains(':') {
-            registrar_host.to_string()
-        } else {
-            format!("{registrar_host}:{default_port}")
-        };
-        let destination = match crate::gateway::resolve_address(&address_str) {
-            Ok(addr) => addr,
-            Err(error) => {
-                error!(
-                    host = %registrar_host,
-                    error = %error,
-                    "cannot resolve registrant host, skipping entry"
-                );
-                continue;
-            }
-        };
-
-        let is_hostname = address_str.parse::<std::net::SocketAddr>().is_err();
-        let mut entry = RegistrantEntry::new(
-            entry_config.aor.clone(),
-            entry_config.registrar.clone(),
-            destination,
-            transport_type,
-            RegistrantCredentials::password(
-                entry_config.user.clone(),
-                entry_config.password.clone(),
-                entry_config.realm.clone(),
-            ),
-            entry_config
-                .interval
-                .unwrap_or(registrant_config.default_interval),
-            entry_config.contact.clone(),
-        );
-        if is_hostname {
-            entry.address_str = Some(address_str.clone());
+        if let Err(reason) = manager.try_add(entry) {
+            error!(aor = %entry_config.aor, "{reason}, skipping entry");
         }
-
-        // IMS AKAv1-MD5 (3GPP TS 33.203): attach the USIM secrets so the 401
-        // runs through Milenage instead of password digest.
-        let entry = if entry_config
-            .auth
-            .as_deref()
-            .map(|mode| mode.eq_ignore_ascii_case("aka"))
-            .unwrap_or(false)
-        {
-            let aka_config = match &entry_config.aka {
-                Some(aka) => aka,
-                None => {
-                    error!(aor = %entry_config.aor, "auth: aka requires an `aka:` block, skipping entry");
-                    continue;
-                }
-            };
-            let credentials = match crate::registrant::aka::AkaCredentials::from_hex(
-                &aka_config.k,
-                aka_config.op.as_deref(),
-                aka_config.opc.as_deref(),
-                &aka_config.amf,
-            ) {
-                Ok(credentials) => credentials,
-                Err(error) => {
-                    error!(aor = %entry_config.aor, %error, "invalid AKA credentials, skipping entry");
-                    continue;
-                }
-            };
-            let initial_sqn = match crate::ipsec::milenage::hex_to_bytes(&aka_config.sqn) {
-                Some(bytes) if bytes.len() == 6 => {
-                    let mut sqn = [0u8; 6];
-                    sqn.copy_from_slice(&bytes);
-                    sqn
-                }
-                _ => {
-                    error!(aor = %entry_config.aor, "sqn must be 12 hex chars, skipping entry");
-                    continue;
-                }
-            };
-            entry.with_aka(credentials, initial_sqn)
-        } else {
-            entry
-        };
-
-        // IPsec sec-agree (UE side) — only meaningful alongside auth: aka.
-        let entry = if let Some(ipsec_config) = &entry_config.ipsec {
-            if entry.auth_mode != crate::registrant::AuthMode::Aka {
-                error!(aor = %entry_config.aor, "registrant ipsec requires auth: aka, skipping entry");
-                continue;
-            }
-            let aalg = match crate::ipsec::IntegrityAlgorithm::from_sec_agree_name(
-                &ipsec_config.alg,
-            ) {
-                Some(alg) => alg,
-                None => {
-                    error!(aor = %entry_config.aor, alg = %ipsec_config.alg, "unknown ipsec alg, skipping entry");
-                    continue;
-                }
-            };
-            let ealg = match crate::ipsec::EncryptionAlgorithm::from_sec_agree_name(
-                &ipsec_config.ealg,
-            ) {
-                Some(ealg) => ealg,
-                None => {
-                    error!(aor = %entry_config.aor, ealg = %ipsec_config.ealg, "unknown ipsec ealg, skipping entry");
-                    continue;
-                }
-            };
-            entry.with_ipsec(crate::registrant::UeIpsec::new(
-                ipsec_config.ue_port_c,
-                ipsec_config.ue_port_s,
-                aalg,
-                ealg,
-            ))
-        } else {
-            entry
-        };
-
-        // IMS Contact feature tags (instance ID + MMTel/video/SMS).
-        let entry = if let Some(ims_config) = &entry_config.ims {
-            let has = |tag: &str| {
-                ims_config
-                    .features
-                    .iter()
-                    .any(|f| f.eq_ignore_ascii_case(tag))
-            };
-            entry.with_ims_contact(crate::registrant::ImsContactParams {
-                instance_id: ims_config.imei.clone(),
-                mmtel: has("mmtel"),
-                video: has("video"),
-                smsip: has("smsip"),
-            })
-        } else {
-            entry
-        };
-
-        manager.add(entry);
     }
 
     info!(
@@ -1021,24 +900,8 @@ pub(super) fn init_registrant(
 
     // Spawn background registration loop
     let loop_manager = Arc::clone(manager);
-    let loop_outbound = Arc::clone(outbound_senders);
-    let loop_listen_addrs = listen_addrs.clone();
-    let loop_advertised_addrs = advertised_addrs.clone();
-    let loop_advertised_address = config.advertised_address.clone();
-    let loop_hep_sender = hep_sender.clone();
-    let loop_connection_pool = Arc::clone(connection_pool);
     tokio::spawn(async move {
-        crate::registrant::registration_loop(
-            loop_manager,
-            loop_outbound,
-            local_addr,
-            loop_listen_addrs,
-            loop_advertised_addrs,
-            loop_advertised_address,
-            loop_hep_sender,
-            loop_connection_pool,
-        )
-        .await;
+        crate::registrant::registration_loop(loop_manager, context).await;
     });
 
     // The `registration` Python namespace was already installed early in

@@ -891,6 +891,7 @@ mod tests {
         let router = Arc::new(OutboundRouter {
             udp: udp_tx.into(),
             udp_by_local: std::collections::HashMap::new(),
+            udp_dynamic: None,
             tcp: tcp_tx,
             tls: tls_tx,
             ws: ws_tx,
@@ -1249,6 +1250,7 @@ mod tests {
         let router = Arc::new(OutboundRouter {
             udp: udp_tx.into(),
             udp_by_local: HashMap::new(),
+            udp_dynamic: None,
             tcp: tcp_tx,
             tls: tls_tx,
             ws: ws_tx,
@@ -1298,6 +1300,7 @@ mod tests {
         let router = Arc::new(OutboundRouter {
             udp: udp_tx.into(),
             udp_by_local: HashMap::new(),
+            udp_dynamic: None,
             tcp: other_tx.clone(),
             tls: tls_tx,
             ws: other_tx.clone(),
@@ -1439,6 +1442,7 @@ mod tests {
         let router = Arc::new(OutboundRouter {
             udp: udp_tx.into(),
             udp_by_local: HashMap::new(),
+            udp_dynamic: None,
             tcp: other_tx.clone(),
             tls: other_tx.clone(),
             ws: other_tx.clone(),
@@ -1487,6 +1491,7 @@ mod tests {
         let router = Arc::new(OutboundRouter {
             udp: udp_tx.into(),
             udp_by_local: HashMap::new(),
+            udp_dynamic: None,
             tcp: tcp_tx,
             tls: tls_tx,
             ws: ws_tx,
@@ -1763,6 +1768,7 @@ mod tests {
         let router = Arc::new(OutboundRouter {
             udp: udp_tx.into(),
             udp_by_local: std::collections::HashMap::new(),
+            udp_dynamic: None,
             tcp: tcp_tx,
             tls: tls_tx,
             ws: ws_tx,
@@ -1825,6 +1831,7 @@ mod tests {
         let router = Arc::new(OutboundRouter {
             udp: udp_tx.into(),
             udp_by_local: std::collections::HashMap::new(),
+            udp_dynamic: None,
             tcp: stream_tx.clone(),
             tls: stream_tx.clone(),
             ws: stream_tx.clone(),

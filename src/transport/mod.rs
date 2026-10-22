@@ -26,6 +26,7 @@ pub mod tls_listener;
 /// Each transport sends inbound SIP messages to the core via a channel
 /// and receives outbound messages via a per-connection sender.
 pub mod udp;
+pub mod ue_sockets;
 pub mod ws;
 
 /// Test-only helpers shared by this module's unit tests.
@@ -691,6 +692,10 @@ pub struct ListenerRegistry {
     /// The global `advertised_address`: the host a listener with no `advertise`
     /// of its own falls back to (see [`identity`](Self::identity)).
     global_advertised: Option<Arc<str>>,
+    /// UDP sockets opened at run time for per-UE outbound registrations. Each
+    /// is its own identity: its concrete address, never the global
+    /// `advertised_address` (see [`identity`](Self::identity)).
+    dynamic_udp: Option<Arc<ue_sockets::UeSockets>>,
 }
 
 impl ListenerRegistry {
@@ -712,7 +717,31 @@ impl ListenerRegistry {
             entries: Arc::new(map),
             shared_transports: Arc::new(shared_transports),
             global_advertised: None,
+            dynamic_udp: None,
         }
+    }
+
+    /// Overlay the run-time per-UE UDP sockets, which are not in the
+    /// configured set but are listeners all the same.
+    pub fn with_dynamic_udp(mut self, dynamic_udp: Option<Arc<ue_sockets::UeSockets>>) -> Self {
+        self.dynamic_udp = dynamic_udp;
+        self
+    }
+
+    /// The run-time per-UE UDP sockets, when any can be opened.
+    pub fn dynamic_udp(&self) -> Option<&Arc<ue_sockets::UeSockets>> {
+        self.dynamic_udp.as_ref()
+    }
+
+    /// Whether `(transport, local)` is a run-time per-UE socket rather than a
+    /// configured listener.
+    pub(crate) fn is_dynamic(&self, transport: Transport, local: SocketAddr) -> bool {
+        transport == Transport::Udp
+            && !self.entries.contains_key(&(transport, local))
+            && self
+                .dynamic_udp
+                .as_ref()
+                .is_some_and(|dynamic| dynamic.contains(&local))
     }
 
     /// Set the global `advertised_address`, the fallback host of a listener
@@ -782,6 +811,10 @@ impl ListenerRegistry {
         self.entries
             .keys()
             .any(|(_, addr)| port == addr.port() && (ip == addr.ip() || ip.is_loopback()))
+            || self
+                .dynamic_udp
+                .as_ref()
+                .is_some_and(|dynamic| dynamic.contains(destination))
     }
 
     /// Every registered listener as `(transport, bound_addr, advertise)`.
@@ -887,6 +920,11 @@ pub struct OutboundRouter {
     /// Per-listener UDP channels keyed by local socket address.
     /// Populated at server startup; empty in test fixtures.
     pub udp_by_local: std::collections::HashMap<SocketAddr, udp::UdpOutbound>,
+    /// Sockets opened at run time for outbound registrations that each send
+    /// from an address of their own (see [`ue_sockets`]). Consulted only for a
+    /// pinned UDP send the static map did not serve; `None` (every deployment
+    /// without per-UE addresses) leaves the send path exactly as it was.
+    pub udp_dynamic: Option<Arc<ue_sockets::UeSockets>>,
     pub tcp: flume::Sender<OutboundMessage>,
     pub tls: flume::Sender<OutboundMessage>,
     pub ws: flume::Sender<OutboundMessage>,
@@ -967,6 +1005,15 @@ impl OutboundRouter {
                         }
                     }
                 }
+                // A configured listener wins; a per-UE socket is only asked
+                // for an address none of them is bound to.
+                let message = match &self.udp_dynamic {
+                    Some(dynamic) => match ue_sockets::route(dynamic, message) {
+                        Ok(sent) => return sent,
+                        Err(message) => message,
+                    },
+                    None => message,
+                };
                 self.udp.send(message)
             }
             Transport::Tcp => self.tcp.send(message),
@@ -1739,6 +1786,7 @@ mod tests {
         let router = OutboundRouter {
             udp: default.0.clone().into(),
             udp_by_local,
+            udp_dynamic: None,
             tcp: dummy.clone(),
             tls: dummy.clone(),
             ws: dummy.clone(),
@@ -1816,6 +1864,7 @@ mod tests {
             // exactly the socket a lost pin would silently fall back to.
             udp: plain.0.clone().into(),
             udp_by_local,
+            udp_dynamic: None,
             tcp: dummy.clone(),
             tls: dummy.clone(),
             ws: dummy.clone(),
@@ -1863,6 +1912,7 @@ mod tests {
         let router = OutboundRouter {
             udp: default.0.clone().into(),
             udp_by_local: std::collections::HashMap::new(),
+            udp_dynamic: None,
             tcp: dummy.clone(),
             tls: dummy.clone(),
             ws: dummy.clone(),
@@ -1959,6 +2009,7 @@ mod tests {
         let router = OutboundRouter {
             udp: default.0.clone().into(),
             udp_by_local: std::collections::HashMap::new(),
+            udp_dynamic: None,
             tcp: dummy.clone(),
             tls: dummy.clone(),
             ws: dummy.clone(),
@@ -2011,6 +2062,7 @@ mod tests {
         let router = OutboundRouter {
             udp: default.0.clone().into(),
             udp_by_local: std::collections::HashMap::new(),
+            udp_dynamic: None,
             tcp: dummy.clone(),
             tls: dummy.clone(),
             ws: dummy.clone(),

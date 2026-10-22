@@ -91,3 +91,8 @@ mod ipsec_tests;
 
 #[path = "integration/stir_tests.rs"]
 mod stir_tests;
+
+// One process registering many IMS UEs, each from its own address: YAML to
+// entries to REGISTERs, sources and the address lifecycle, on mock transports.
+#[path = "integration/registrant_multi_ue_tests.rs"]
+mod registrant_multi_ue_tests;

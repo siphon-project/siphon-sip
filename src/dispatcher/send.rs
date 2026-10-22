@@ -5,20 +5,8 @@
 
 use super::*;
 
-/// Send raw bytes to a specific destination via the outbound channel,
-/// with automatic HEP capture.  Used for connection-affine sends (CANCELs,
-/// in-dialog ACKs, registrant retries) that must reuse a specific connection.
-pub(super) fn send_outbound(
-    data: Bytes,
-    transport: Transport,
-    destination: SocketAddr,
-    connection_id: ConnectionId,
-    state: &DispatcherState,
-) {
-    send_outbound_from(data, transport, destination, connection_id, None, state);
-}
-
-/// Like [`send_outbound`] but pins the local egress address.  Reply
+/// Send raw bytes to a specific destination via the outbound channel, with
+/// automatic HEP capture, pinning the local egress address when given.  Reply
 /// paths set `source_local_addr = Some(inbound.local_addr)` so the
 /// response leaves on the same SA's local endpoint that the request
 /// arrived on (3GPP TS 33.203 §7.4 — required for IPsec-protected
