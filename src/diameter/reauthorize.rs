@@ -17,7 +17,10 @@ use std::sync::{Arc, LazyLock, Weak};
 /// How a serving connection can be found again: by the configured peer name
 /// and a client's Origin-Host (what `diameter.reauthorize` asks for), or by the
 /// Origin-Host or Origin-Realm alone (what `diameter.originate` asks for when
-/// no peer is named). All three are scoped to the tenant.
+/// no peer is named). `Agent` is the realm again, but only for a connection
+/// that carried a relayed request from it: one with Route-Record, which a
+/// relay or proxy agent appends (RFC 6733 section 6.7.1). All are scoped to
+/// the tenant.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum Route {
     Peer {
@@ -30,6 +33,10 @@ enum Route {
         host: String,
     },
     Realm {
+        tenant: String,
+        realm: String,
+    },
+    Agent {
         tenant: String,
         realm: String,
     },
@@ -57,9 +64,10 @@ impl ServingConnection {
         }
     }
 
-    /// Record the Origin-Host and Origin-Realm of a decoded inbound request.
-    /// Returns whether the shared registry was written, which happens only
-    /// for a host or realm not yet seen on this connection.
+    /// Record the Origin-Host and Origin-Realm of a decoded inbound request,
+    /// and the realm as one an agent relays for when the request carries
+    /// Route-Record. Returns whether the shared registry was written, which
+    /// happens only for a host or realm not yet seen on this connection.
     pub(crate) fn observe(&mut self, avps: &serde_json::Value) -> bool {
         let identity = |name: &str| {
             avps.get(name)
@@ -67,7 +75,7 @@ impl ServingConnection {
                 .filter(|value| !value.is_empty())
                 .map(str::to_owned)
         };
-        let mut routes = Vec::with_capacity(3);
+        let mut routes = Vec::with_capacity(4);
         if let Some(host) = identity("Origin-Host") {
             routes.push(Route::Peer {
                 tenant: self.tenant.clone(),
@@ -80,6 +88,12 @@ impl ServingConnection {
             });
         }
         if let Some(realm) = identity("Origin-Realm") {
+            if avps.get("Route-Record").is_some() {
+                routes.push(Route::Agent {
+                    tenant: self.tenant.clone(),
+                    realm: realm.clone(),
+                });
+            }
             routes.push(Route::Realm {
                 tenant: self.tenant.clone(),
                 realm,
@@ -136,6 +150,16 @@ pub(crate) fn connection_to_host(tenant: &str, host: &str) -> Option<Arc<Diamete
 /// `tenant`: a direct peer of that realm, or an agent relaying for it.
 pub(crate) fn connection_to_realm(tenant: &str, realm: &str) -> Option<Arc<DiameterPeer>> {
     open(&Route::Realm {
+        tenant: tenant.into(),
+        realm: realm.into(),
+    })
+}
+
+/// The open connection that last carried a relayed request from a node of
+/// `realm` in `tenant`: an agent that routes a request on to any host of the
+/// realm (RFC 6733 section 6.1.5), never a direct peer of the realm.
+pub(crate) fn agent_for_realm(tenant: &str, realm: &str) -> Option<Arc<DiameterPeer>> {
+    open(&Route::Agent {
         tenant: tenant.into(),
         realm: realm.into(),
     })
@@ -367,6 +391,38 @@ pub(crate) mod tests {
         drop(serving);
         assert!(connection_to_host("t-routes", "mme1.epc.example").is_none());
         assert!(connection_to_realm("t-routes", "epc.example").is_none());
+    }
+
+    /// Only a relayed request, one carrying Route-Record (RFC 6733 section
+    /// 6.7.1), makes its connection an agent's for the realm; a direct peer
+    /// of the realm stays a route to the realm alone.
+    #[test]
+    fn a_relayed_request_makes_its_connection_an_agent_for_the_realm() {
+        let direct = open_peer();
+        let agent = open_peer();
+        let mut direct_serving = ServingConnection::new("t-agent", "mme", &direct);
+        assert!(direct_serving.observe(&json!({
+            "Origin-Host": "mme1.epc.example",
+            "Origin-Realm": "epc.example",
+        })));
+        assert!(connection_to_realm("t-agent", "epc.example").is_some());
+        assert!(agent_for_realm("t-agent", "epc.example").is_none());
+        let mut agent_serving = ServingConnection::new("t-agent", "dra", &agent);
+        let relayed = json!({
+            "Origin-Host": "mme2.epc.example",
+            "Origin-Realm": "epc.example",
+            "Route-Record": "mme2.epc.example",
+        });
+        assert!(agent_serving.observe(&relayed));
+        assert!(!agent_serving.observe(&relayed));
+        assert!(Arc::ptr_eq(
+            &agent_for_realm("t-agent", "epc.example").unwrap(),
+            &agent
+        ));
+        assert!(agent_for_realm("t-other", "epc.example").is_none());
+        drop(agent_serving);
+        assert!(agent_for_realm("t-agent", "epc.example").is_none());
+        drop(direct_serving);
     }
 
     #[test]

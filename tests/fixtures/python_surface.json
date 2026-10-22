@@ -681,6 +681,10 @@
       }
     },
     "DiameterNamespace": {
+      "UnableToDeliver": {
+        "doc": "Raised by diameter.originate() when destination_host has no connection and no agent relaying for its realm: DIAMETER_UNABLE_TO_DELIVER (3002, RFC 6733 section 6.1). Nothing is sent; the request is not handed to another peer of the realm.",
+        "kind": "type"
+      },
       "config": {
         "doc": "Read-only view of the parsed `diameter` config (`tenants`, `listen`),",
         "kind": "getset_descriptor"
