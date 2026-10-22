@@ -6,6 +6,7 @@
 mod admin_start;
 mod bootstrap;
 pub mod config_reload;
+mod python_thread;
 mod shutdown_sequence;
 use shutdown_sequence::run_shutdown_sequence;
 mod event_clock;
@@ -23,6 +24,7 @@ mod tests;
 pub use bootstrap::li_manager;
 
 use bootstrap::*;
+use python_thread::*;
 
 use std::sync::Arc;
 
