@@ -151,6 +151,13 @@ build_network() {
     mkdir -p "/etc/netns/$UE_NS" "/etc/netns/$CORE_NS"
     printf '127.0.0.1 localhost\n%s %s\n' "$CORE_IP" "$HOME_DOMAIN" >"/etc/netns/$UE_NS/hosts"
     printf '127.0.0.1 localhost\n%s %s\n' "$SCSCF_IP" "$HOME_DOMAIN" >"/etc/netns/$CORE_NS/hosts"
+    # Without its own resolv.conf a namespace inherits the host's, whose
+    # nameserver (often a stub on 127.0.0.53) does not exist inside it: every
+    # RFC 3263 NAPTR/SRV query then waits out its timeout and the relay's DNS
+    # budget is gone before the hosts entry is read. Point both namespaces at
+    # their own loopback, where nothing listens, so those queries fail at once.
+    printf 'nameserver 127.0.0.1\noptions timeout:1 attempts:1\n' >"/etc/netns/$UE_NS/resolv.conf"
+    printf 'nameserver 127.0.0.1\noptions timeout:1 attempts:1\n' >"/etc/netns/$CORE_NS/resolv.conf"
 }
 
 # Put the UE /32s (shifted by $1) on the dummy interface, replacing any.
