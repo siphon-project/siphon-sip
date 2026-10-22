@@ -508,6 +508,17 @@ RTCP sub-component follows the same rule one port up. The same list goes to
 clause. A script that writes its own descriptions has to follow the same
 convention: siphon sends them as given.
 
+Every component it returns names its Flow-Status, derived per TS 29.213
+table 6.2.1 from the offer and the answer together: the answer's port and
+direction attribute, except that `a=inactive` in the offer wins (NOTE 5), and
+the session-level attribute for a media line without one. A port-0 line comes
+back as `removed` with no flows, and `number` is the ordinal of the `m=` line,
+so the lines after it keep their numbers. TCP transport and a negotiated
+`a=rtcp-mux` are `enabled` whatever the direction. `enabled` is always named:
+on an update an absent Flow-Status means unchanged (TS 29.214 §5.3.16), which
+would leave a stream resumed from hold gated. N5 gets the same values as
+`fStatus`.
+
 Subscribe in the first AAR for a session. Apart from one-time actions such as
 ACCESS_NETWORK_INFO_REPORT, a Specific-Action only counts there and then holds
 for the life of the Rx session.

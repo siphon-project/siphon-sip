@@ -51,6 +51,19 @@ entry, but a working config keeps working.
 
 ### Fixed
 
+- **QoS: `qos.media_flows_from_sdp` follows TS 29.213 table 6.2.1 for
+  Flow-Status.** Every component names it, `enabled` included: it was left out
+  for sendrecv or no direction attribute, and on an Rx update an absent
+  Flow-Status means unchanged (TS 29.214 §5.3.16), so a stream resumed from
+  hold kept its gates held. The direction comes from the offer and the answer
+  (NOTE 5: the answer's, but `a=inactive` in the offer wins) instead of the
+  UE's own SDP, with the session-level attribute for a media line without one.
+  A negotiated `a=rtcp-mux` and TCP, TCP/MSRP or UDP/DTLS/SCTP transport give
+  `enabled`. A port-0 line is reported as `removed` with no flows instead of
+  being skipped, and `number` is the ordinal of the `m=` line, so it no longer
+  renumbers the components after it. Rx and N5 (`fStatus`) carry the same
+  values. A script that counted on port-0 lines being left out, or on
+  `flow_status` being absent, sees the change.
 - **Awaitable script APIs no longer create a Python thread state per call.**
   `future_into_py` completed on a runtime pyo3-async-runtimes built for itself,
   whose threads had no pinned thread state, so every completion created and
