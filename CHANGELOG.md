@@ -33,6 +33,14 @@ entry, but a working config keeps working.
 
 ### Fixed
 
+- **Awaitable script APIs no longer create a Python thread state per call.**
+  `future_into_py` completed on a runtime pyo3-async-runtimes built for itself,
+  whose threads had no pinned thread state, so every completion created and
+  destroyed one: on free-threaded Python a mimalloc heap set up and collected
+  per request, with `munmap`s, page zeroing and `mm` lock contention. The
+  server now hands its own runtime to pyo3-async-runtimes. In a relay doing a
+  Diameter request per script call this cut CPU per request by roughly 40 %.
+
 - **Diameter: an AVP value of the wrong shape is refused before sending.**
   `diameter.originate` and `set_avp` raise `TypeError` for a list given to an
   AVP the dictionary does not type as grouped, a str or int given to a grouped
