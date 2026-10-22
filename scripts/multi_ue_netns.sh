@@ -152,12 +152,65 @@ build_network() {
     printf '127.0.0.1 localhost\n%s %s\n' "$CORE_IP" "$HOME_DOMAIN" >"/etc/netns/$UE_NS/hosts"
     printf '127.0.0.1 localhost\n%s %s\n' "$SCSCF_IP" "$HOME_DOMAIN" >"/etc/netns/$CORE_NS/hosts"
     # Without its own resolv.conf a namespace inherits the host's, whose
-    # nameserver (often a stub on 127.0.0.53) does not exist inside it: every
-    # RFC 3263 NAPTR/SRV query then waits out its timeout and the relay's DNS
-    # budget is gone before the hosts entry is read. Point both namespaces at
-    # their own loopback, where nothing listens, so those queries fail at once.
-    printf 'nameserver 127.0.0.1\noptions timeout:1 attempts:1\n' >"/etc/netns/$UE_NS/resolv.conf"
-    printf 'nameserver 127.0.0.1\noptions timeout:1 attempts:1\n' >"/etc/netns/$CORE_NS/resolv.conf"
+    # nameserver (often a stub on 127.0.0.53) does not exist inside it, and a
+    # query to a nameserver that never answers costs siphon its full per-query
+    # timeout. RFC 3263 makes up to four lookups per resolve (SRV _udp, SRV
+    # _tcp, A, AAAA), so every relay ran out its DNS budget. Each namespace
+    # gets a stub on its own loopback instead: A for the home domain is the
+    # next hop on that side, every other name is answered NXDOMAIN at once.
+    printf 'nameserver 127.0.0.1\n' >"/etc/netns/$UE_NS/resolv.conf"
+    printf 'nameserver 127.0.0.1\n' >"/etc/netns/$CORE_NS/resolv.conf"
+    write_dns_stub
+    start_dns_stub "$UE_NS" "$CORE_IP"
+    start_dns_stub "$CORE_NS" "$SCSCF_IP"
+}
+
+# A minimal DNS responder (RFC 1035): A <home domain> -> $2, anything else
+# NXDOMAIN, so the RFC 3263 SRV lookups fail at once and the A lookup succeeds.
+write_dns_stub() {
+    cat >"$SCRATCH/dns_stub.py" <<'PYEOF'
+import socket
+import struct
+import sys
+
+domain = sys.argv[1].lower().rstrip(".")
+address = socket.inet_aton(sys.argv[2])
+
+listener = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+listener.bind(("127.0.0.1", 53))
+while True:
+    query, peer = listener.recvfrom(512)
+    if len(query) < 12:
+        continue
+    identifier = query[:2]
+    labels, offset = [], 12
+    while offset < len(query) and query[offset] != 0:
+        length = query[offset]
+        labels.append(query[offset + 1 : offset + 1 + length].decode("ascii", "replace"))
+        offset += 1 + length
+    question = query[12 : offset + 5]
+    qtype = struct.unpack("!H", query[offset + 1 : offset + 3])[0] if offset + 3 <= len(query) else 0
+    name = ".".join(labels).lower()
+    if name == domain and qtype == 1:
+        header = identifier + struct.pack("!HHHHH", 0x8180, 1, 1, 0, 0)
+        answer = b"\xc0\x0c" + struct.pack("!HHIH", 1, 1, 60, 4) + address
+        listener.sendto(header + question + answer, peer)
+    elif name == domain:
+        # The name exists, just not with this type: NOERROR, no answers, so a
+        # resolver does not negative-cache the name the A record lives on.
+        header = identifier + struct.pack("!HHHHH", 0x8180, 1, 0, 0, 0)
+        listener.sendto(header + question, peer)
+    else:
+        header = identifier + struct.pack("!HHHHH", 0x8183, 1, 0, 0, 0)
+        listener.sendto(header + question, peer)
+PYEOF
+}
+
+# Run the DNS stub inside namespace $1, answering the home domain with $2.
+start_dns_stub() {
+    ip netns exec "$1" python3 -I "$SCRATCH/dns_stub.py" "$HOME_DOMAIN" "$2" \
+        >"$SCRATCH/dns_stub_$1.log" 2>&1 &
+    PIDS+=("$!")
 }
 
 # Put the UE /32s (shifted by $1) on the dummy interface, replacing any.
