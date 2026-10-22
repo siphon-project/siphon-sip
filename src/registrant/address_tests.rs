@@ -141,11 +141,13 @@ fn every_ue_registers_from_its_own_address_with_repeated_protected_ports() {
             Some(SocketAddr::new(ip(&own), 5070))
         );
     }
-    let plan = manager.ue_socket_plan(5070);
+    let plan = manager.ue_socket_plan(5070, ip("203.0.113.5"));
     assert_eq!(plan.len(), 3);
     for (_, addrs) in plan {
         let ports: Vec<u16> = addrs.iter().map(|addr| addr.port()).collect();
-        assert_eq!(ports, [5070, 6100, 6101]);
+        // The plain port, the three client ports the UE rotates through, the
+        // server port.
+        assert_eq!(ports, [5070, 6100, 6102, 6103, 6101]);
     }
 }
 
@@ -255,6 +257,13 @@ fn moving_an_entry_queues_its_old_sas_and_starts_over() {
         .expect("built");
     let server = crate::ipsec::parse_security_client(test_support::SECURITY_SERVER).expect("parse");
     manager.store_security_server(&impu(1), &server, test_support::SECURITY_SERVER);
+    // The authentication installed a set, established at its 200.
+    let established = manager
+        .begin_authentication(&impu(1), "Digest username=\"ue\"")
+        .expect("a temporary set");
+    manager
+        .conclude_ipsec_exchange(&impu(1))
+        .expect("established");
     manager.store_registration_routes(
         &impu(1),
         vec!["<sip:scscf>".to_string()],
@@ -277,7 +286,10 @@ fn moving_an_entry_queues_its_old_sas_and_starts_over() {
     );
     assert_eq!(
         manager.take_pending_sa_deletions(),
-        [(Some(ip("192.0.2.11")), 6100)]
+        [crate::registrant::SaDeletion {
+            address: Some(ip("192.0.2.11")),
+            key: established,
+        }]
     );
     assert_eq!(manager.state(&impu(1)), Some(RegistrantState::Unregistered));
     assert_eq!(manager.ue_addr(&impu(1)), Some(ip("192.0.2.12")));
@@ -293,10 +305,8 @@ fn moving_an_entry_queues_its_old_sas_and_starts_over() {
         manager.state(&impu(1)),
         Some(RegistrantState::AwaitingAddress)
     );
-    assert_eq!(
-        manager.take_pending_sa_deletions(),
-        [(Some(ip("192.0.2.12")), 6100)]
-    );
+    // Nothing was installed on the second address.
+    assert!(manager.take_pending_sa_deletions().is_empty());
     assert!(matches!(
         events.try_recv(),
         Ok(RegistrantEvent::AwaitingAddress { .. })
@@ -497,5 +507,5 @@ fn adding_moving_and_removing_entries_returns_the_queues_to_baseline() {
     }
     assert!(manager.is_empty());
     assert!(manager.take_pending_sa_deletions().is_empty());
-    assert!(manager.ue_socket_plan(5060).is_empty());
+    assert!(manager.ue_socket_plan(5060, ip("203.0.113.5")).is_empty());
 }

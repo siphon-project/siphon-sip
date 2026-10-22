@@ -1187,6 +1187,23 @@ impl IpsecManager {
         Ok(())
     }
 
+    /// Seconds the pair on `(ue_addr, ue_port_c)` has left before its hard
+    /// lifetime ends; `None` without such a pair or for one with no lifetime.
+    pub fn remaining_lifetime_secs(&self, ue_addr: &IpAddr, ue_port_c: u16) -> Option<u64> {
+        let entry = self
+            .associations
+            .get(&Self::contact_key(ue_addr, ue_port_c))?;
+        entry.hard_lifetime_secs?;
+        let sweep_at = entry.expires_at;
+        drop(entry);
+        Some(
+            sweep_at
+                .saturating_duration_since(Instant::now())
+                .as_secs()
+                .saturating_sub(SA_SWEEP_GRACE_SECS),
+        )
+    }
+
     /// Number of active SA pairs.
     pub fn active_count(&self) -> usize {
         self.associations.len()
@@ -2088,6 +2105,17 @@ impl IpsecManager {
             Self::with_partition(XfrmBackend::IpCommand, spi_range_start, spi_range_count);
         manager.kernel_mock = Some(std::sync::Mutex::new(KernelMock::default()));
         manager
+    }
+
+    /// The mock kernel's op log, for tests outside this module.
+    pub(crate) fn test_kernel_ops(&self) -> Vec<String> {
+        self.mock().ops.clone()
+    }
+
+    /// How many kernel objects the mock kernel holds, for tests outside this
+    /// module.
+    pub(crate) fn test_kernel_live_count(&self) -> usize {
+        self.mock().live.len()
     }
 
     /// Lock the mock kernel (test inspection helper).

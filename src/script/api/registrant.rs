@@ -960,6 +960,12 @@ assert 'registration.on_change' in kinds, kinds
         )
         .unwrap();
         manager.store_security_server(AKA_AOR, &server, "raw");
+        // A Security-Server alone is no SA set to send over.
+        assert!(py_reg.flow(AKA_AOR, None).unwrap().is_none());
+        manager
+            .begin_authentication(AKA_AOR, "Digest username=\"ue\"")
+            .unwrap();
+        manager.conclude_ipsec_exchange(AKA_AOR).unwrap();
         let flow = py_reg.flow(AKA_AOR, None).unwrap().expect("a flow");
         assert_eq!(flow.local_addr, "192.0.2.77:6100".parse().unwrap());
         assert_eq!(flow.source_addr, "198.51.100.10:5066".parse().unwrap());

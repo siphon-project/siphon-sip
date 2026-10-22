@@ -45,18 +45,18 @@ impl<'a> EgressDefaults<'a> {
 
 /// Where one entry's REGISTER says it is and leaves from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct EntryEgress {
+pub(super) struct EntryEgress {
     /// The Via sent-by and default Contact host:port.
-    sent_by: SocketAddr,
+    pub(super) sent_by: SocketAddr,
     /// The UDP socket the REGISTER is pinned to; `None` for TCP/TLS, whose
     /// outbound connection is the pool's, not a listener's.
-    source: Option<SocketAddr>,
+    pub(super) source: Option<SocketAddr>,
     /// Whether this is the entry's own address rather than the process's.
-    own_address: bool,
+    pub(super) own_address: bool,
 }
 
 impl EntryEgress {
-    fn of(entry: &RegistrantEntry, defaults: EgressDefaults<'_>) -> Self {
+    pub(super) fn of(entry: &RegistrantEntry, defaults: EgressDefaults<'_>) -> Self {
         match entry.local_addr {
             // The process's address: unchanged from before per-entry addresses.
             // UDP egresses from the same local address advertised in the Via,
@@ -109,6 +109,9 @@ pub struct BuiltRegister {
     pub sent_by: SocketAddr,
     /// Whether the entry registers from an address of its own.
     pub own_address: bool,
+    /// Whether it rides an established IPsec SA set (a protected re- or
+    /// de-REGISTER, see [`super::protected`]).
+    pub protected: bool,
 }
 
 impl RegistrantManager {
@@ -125,6 +128,11 @@ impl RegistrantManager {
         expires: u32,
     ) -> Option<BuiltRegister> {
         let mut entry = self.entries.get_mut(aor)?;
+        // A registered IMS UE re-registers and de-registers over the SA set it
+        // holds (TS 24.229 5.1.1.4.1, 5.1.1.6.1).
+        if let Some(built) = self.build_protected_register(&mut entry, defaults, expires) {
+            return built;
+        }
         let egress = EntryEgress::of(&entry, defaults);
         let effective_addr = egress.sent_by;
         let cseq = entry.next_cseq();
@@ -182,16 +190,14 @@ impl RegistrantManager {
         }
 
         // IMS IPsec sec-agree: the initial (unprotected) REGISTER offers the
-        // UE's transform, freshly allocated SPIs, and protected ports in
-        // Security-Client, and demands the extension via Require/Proxy-Require
-        // (RFC 3329 / TS 33.203 §7.2). The 401 answers with Security-Server.
-        // Deregistration (expires == 0) rides the existing SA and does not
-        // re-offer.
+        // UE's transform, freshly allocated SPIs, and a free protected client
+        // port in Security-Client, and demands the extension via
+        // Require/Proxy-Require (RFC 3329 / TS 33.203 §7.2). The 401 answers
+        // with Security-Server. An unprotected de-registration (no SA set left
+        // to ride) does not offer.
         if expires > 0 && entry.ue_ipsec.is_some() {
-            let (spi_uc, spi_us) = self.allocate_ue_spi_pair();
-            if let Some(ipsec) = entry.ue_ipsec.as_mut() {
-                ipsec.spi_uc = spi_uc;
-                ipsec.spi_us = spi_us;
+            self.begin_unprotected_offer(&mut entry);
+            if let Some(ipsec) = entry.ue_ipsec.as_ref() {
                 let security_client = build_security_client(&ipsec.offer());
                 builder = builder
                     .header("Security-Client", security_client)
@@ -221,6 +227,7 @@ impl RegistrantManager {
                 source_local_addr: egress.source,
                 sent_by: egress.sent_by,
                 own_address: egress.own_address,
+                protected: false,
             }),
             Err(error) => {
                 warn!(aor = %entry.aor, %error, "failed to build REGISTER");
@@ -333,6 +340,7 @@ impl RegistrantManager {
                 source_local_addr: egress.source,
                 sent_by: egress.sent_by,
                 own_address: egress.own_address,
+                protected: false,
             }),
             Err(error) => {
                 warn!(aor = %entry.aor, %error, "failed to build authenticated REGISTER");
@@ -415,9 +423,18 @@ impl RegistrantManager {
         let contact = entry.contact_uri.clone().unwrap_or_else(|| {
             default_contact_uri(&entry.credentials.username, effective_addr, entry.transport)
         });
+        // A REGISTER protected by an SA set names the UE protected server port
+        // in its Via sent-by, where the P-CSCF answers it (TS 24.229 5.1.1.4.2
+        // c, TS 33.203 7.1); any other names the plain port.
+        let via_sent_by = match entry.ue_ipsec.as_ref() {
+            Some(ipsec) if security_verify.is_some() => {
+                SocketAddr::new(entry.local_addr.unwrap_or(defaults.ue_ip), ipsec.ue_port_s)
+            }
+            _ => effective_addr,
+        };
         let via = format!(
             "SIP/2.0/{} {};branch={};rport",
-            entry.transport, effective_addr, branch
+            entry.transport, via_sent_by, branch
         );
 
         let nc = entry.nonce_counter.next_for(&challenge.nonce);
@@ -503,8 +520,9 @@ impl RegistrantManager {
                 destination,
                 transport,
                 source_local_addr,
-                sent_by: egress.sent_by,
+                sent_by: via_sent_by,
                 own_address: egress.own_address,
+                protected: false,
             }),
             Err(error) => {
                 warn!(aor = %entry.aor, %error, "failed to build AKA REGISTER");

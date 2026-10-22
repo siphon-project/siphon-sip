@@ -93,7 +93,33 @@ entry, but a working config keeps working.
   with the M bit (RFC 6733 sections 4.1 and 7.1.5), or `None`. siphon does not
   answer 5001 by itself, since a relay must let unknown AVPs through.
 
+### Changed
+
+- **An IMS UE registrant refreshes over the security association it holds.**
+  A registered IPsec entry re-registers and de-registers protected: from its
+  protected client port to the P-CSCF's protected server port, repeating the
+  Authorization of its last authentication, mirroring that Security-Server in
+  Security-Verify and offering new SA parameters (TS 24.229 5.1.1.4.2,
+  5.1.1.6.2). It used to send every refresh as a fresh unprotected REGISTER.
+  A refresh the S-CSCF challenges again sets up the new SA set beside the old
+  one on a new protected client port (TS 33.203 7.4.0), sends the answer over
+  it, and deletes the old set once the next answer arrives over the new one
+  (7.4.1a), where it used to delete the old set before installing the new. A
+  failed or unanswered re-registration falls back to an unprotected one. The
+  UE rotates through three protected client ports, `ue_port_c` and the two
+  above the higher of `ue_port_c`/`ue_port_s` (6100/6101 uses 6100, 6102,
+  6103), and siphon opens them itself, for an entry on the process's address
+  too; a protected port of 0, 5060 or 5061, or two entries on one address
+  sharing any of these ports, is refused. A protected REGISTER's Via names the
+  protected server port (5.1.1.4.2 c). Digest trunks are unchanged.
+
 ### Fixed
+
+- **Removing an IMS UE registrant deletes its IPsec SAs.** They go once the
+  protected de-REGISTER is answered, or after Timer F if it is not, and at once
+  when there is nothing to de-register (TS 24.229 5.1.1.6.1). They used to stay
+  installed until their hard lifetime ran out. A replaced or source-updated
+  entry's SAs go too.
 
 - **Diameter: `diameter.originate` no longer hands a request for a host to
   another peer of its realm.** With `destination_host` and no connection that

@@ -105,3 +105,54 @@ pub(crate) fn aka_challenge_value(sqn_hex: &str) -> String {
     let nonce = base64::engine::general_purpose::STANDARD.encode(&joined);
     format!("Digest realm=\"{REALM}\", nonce=\"{nonce}\", qop=\"auth\", algorithm=AKAv1-MD5")
 }
+
+/// A Security-Server answer with the P-CSCF's SPIs `spi_c`/`spi_s` on the
+/// fixed protected ports 5064/5066 (siphon's own P-CSCF keeps its ports).
+pub(crate) fn security_server(spi_c: u32, spi_s: u32) -> String {
+    format!(
+        "ipsec-3gpp; alg=hmac-sha-1-96; ealg=null; spi-c={spi_c}; spi-s={spi_s}; port-c=5064; port-s=5066"
+    )
+}
+
+/// Stand in for what `registration_loop` installs when it starts: the process
+/// on 192.0.2.1:5060.
+pub(crate) fn install_egress(manager: &RegistrantManager) {
+    manager.set_egress(super::RegistrantEgress {
+        local_addr: "192.0.2.1:5060".parse().expect("an address"),
+        listen_addrs: std::collections::HashMap::from([(
+            Transport::Udp,
+            "192.0.2.1:5060".parse().expect("an address"),
+        )]),
+        advertised_addrs: std::collections::HashMap::new(),
+        advertised_address: None,
+        hep_sender: None,
+    });
+}
+
+/// The de-registrations `remove` queued.
+pub(crate) fn take_deregistrations(manager: &RegistrantManager) -> Vec<super::BuiltRegister> {
+    manager.take_pending_deregistrations()
+}
+
+/// Pretend the last REGISTER of `aor` left `age` ago.
+pub(crate) fn backdate_last_sent(manager: &RegistrantManager, aor: &str, age: Duration) {
+    if let Some(mut entry) = manager.entries.get_mut(aor) {
+        entry.last_sent_at = Some(std::time::Instant::now() - age);
+    }
+}
+
+/// Make `aor` due now.
+pub(crate) fn make_due(manager: &RegistrantManager, aor: &str) {
+    if let Some(mut entry) = manager.entries.get_mut(aor) {
+        entry.next_attempt = std::time::Instant::now();
+    }
+}
+
+/// A copy of the SA sets `aor` holds.
+pub(crate) fn sa_sets(manager: &RegistrantManager, aor: &str) -> super::UeSaSets {
+    manager
+        .entries
+        .get(aor)
+        .and_then(|entry| entry.ue_ipsec.as_ref().map(|ipsec| ipsec.sa_sets.clone()))
+        .unwrap_or_default()
+}

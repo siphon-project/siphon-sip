@@ -111,7 +111,7 @@ impl UeSockets {
         self.bind_failures.retain(|addr, _| desired.contains(addr));
 
         for addr in desired {
-            if self.static_addrs.contains(addr) || self.sockets.contains_key(addr) {
+            if self.is_static(addr) || self.sockets.contains_key(addr) {
                 continue;
             }
             match self.open(*addr) {
@@ -185,9 +185,18 @@ impl UeSockets {
         self.ips.contains_key(&ip)
     }
 
-    /// Whether `addr` is served by a configured listener rather than here.
+    /// Whether `addr` is served by a configured listener rather than here:
+    /// one bound to exactly it, or to the wildcard address of its family on
+    /// its port, which a bind here would collide with.
     pub fn is_static(&self, addr: &SocketAddr) -> bool {
-        self.static_addrs.contains(addr)
+        let wildcard = SocketAddr::new(
+            match addr.ip() {
+                IpAddr::V4(_) => IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                IpAddr::V6(_) => IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
+            },
+            addr.port(),
+        );
+        self.static_addrs.contains(addr) || self.static_addrs.contains(&wildcard)
     }
 
     /// Number of open sockets (tests, diagnostics).
