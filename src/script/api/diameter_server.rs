@@ -162,6 +162,24 @@ fn resolve_code(arg: &Bound<'_, PyAny>) -> PyResult<(u32, u32)> {
     }
 }
 
+/// The `understood` argument of `reject_unsupported_avps`: codes, which are
+/// vendor 0, and `(code, vendor)` tuples.
+fn understood_avps(items: Vec<Bound<'_, PyAny>>) -> PyResult<Vec<(u32, u32)>> {
+    items
+        .iter()
+        .map(|item| {
+            item.extract::<u32>()
+                .map(|code| (code, 0))
+                .or_else(|_| item.extract::<(u32, u32)>())
+                .map_err(|_| {
+                    pyo3::exceptions::PyTypeError::new_err(
+                        "understood lists AVP codes or (code, vendor) tuples",
+                    )
+                })
+        })
+        .collect()
+}
+
 // ── PyInboundPeer (req.peer) ────────────────────────────────────────────────
 
 /// Identity of the authenticated peer that sent the inbound request.
@@ -292,10 +310,26 @@ pub struct PyDiameterAvp {
     /// `DiameterAvp`.
     #[pyo3(get)]
     value: Py<PyAny>,
+    /// The flags octet of the AVP header as received: V 0x80, M 0x40, P 0x20.
+    #[pyo3(get)]
+    flags: u8,
 }
 
 #[pymethods]
 impl PyDiameterAvp {
+    /// Whether the M bit is set: the receiver must understand the AVP or
+    /// refuse the message (RFC 6733 section 4.1).
+    #[getter]
+    fn mandatory(&self) -> bool {
+        self.flags & crate::diameter::codec::AVP_FLAG_MANDATORY != 0
+    }
+
+    /// Whether the V bit is set, so that the header carries `vendor`.
+    #[getter]
+    fn vendor_specific(&self) -> bool {
+        self.flags & crate::diameter::codec::AVP_FLAG_VENDOR != 0
+    }
+
     fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
         let name = match &self.name {
             Some(name) => format!("'{name}'"),
@@ -322,6 +356,7 @@ fn named_avp(py: Python<'_>, avp: &Avp) -> PyResult<Py<PyDiameterAvp>> {
             vendor: avp.vendor,
             name: dictionary::lookup_avp(avp.code, avp.vendor).map(|def| def.name.to_string()),
             value,
+            flags: avp.flags,
         },
     )
 }
@@ -835,6 +870,60 @@ impl PyDiameterRequest {
     fn avps<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
         let guard = self.lock()?;
         named_avps(py, &guard.avps)
+    }
+
+    /// The AVPs of the request the dictionary does not define, as
+    /// `DiameterAvp` objects in wire order (`.name` is None, `.mandatory`
+    /// says whether the M bit is set), at the top level and inside the
+    /// grouped AVPs the dictionary defines. An undefined grouped AVP is one
+    /// entry, its value the octets.
+    fn unknown_avps<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        let guard = self.lock()?;
+        let list = PyList::empty(py);
+        for avp in crate::diameter::unknown_avp::unknown_avps(&guard.avps) {
+            list.append(named_avp(py, avp)?)?;
+        }
+        Ok(list)
+    }
+
+    /// The DIAMETER_AVP_UNSUPPORTED (5001) answer for a request carrying an
+    /// AVP with the M bit that the dictionary does not define and that is not
+    /// in `understood`, or None when there is none (RFC 6733 sections 4.1 and
+    /// 7.1.5). Its Failed-AVP holds every such AVP as received; one inside a
+    /// grouped AVP comes inside that group, holding it alone. `understood`
+    /// lists the AVPs the handler reads by code although the dictionary does
+    /// not define them, as codes (vendor 0) or `(code, vendor)` tuples.
+    ///
+    /// For an end server only: a relay must let unknown AVPs through (RFC
+    /// 6733 section 4.1), so siphon never answers this on its own.
+    ///
+    /// ```python,ignore
+    /// refusal = request.reject_unsupported_avps(understood=[(4242, 10415)])
+    /// if refusal is not None:
+    ///     return refusal
+    /// ```
+    #[pyo3(signature = (understood=None))]
+    fn reject_unsupported_avps(
+        &self,
+        understood: Option<Vec<Bound<'_, PyAny>>>,
+    ) -> PyResult<Option<PyDiameterAnswer>> {
+        let understood = understood_avps(understood.unwrap_or_default())?;
+        let is_understood = |code: u32, vendor: u32| understood.contains(&(code, vendor));
+        let failed = {
+            let request = self.lock()?;
+            crate::diameter::unknown_avp::unsupported_mandatory_avps(&request.avps, &is_understood)
+        };
+        if failed.is_empty() {
+            return Ok(None);
+        }
+        let answer = self.answer(dictionary::DIAMETER_AVP_UNSUPPORTED, None)?;
+        answer.lock_mut()?.avps.push(Avp {
+            code: dictionary::avp::FAILED_AVP,
+            vendor: 0,
+            flags: crate::diameter::codec::AVP_FLAG_MANDATORY,
+            value: AvpData::Grouped(failed),
+        });
+        Ok(Some(answer))
     }
 
     #[pyo3(signature = (code_or_name, value, vendor=0))]
@@ -1652,6 +1741,286 @@ mod tests {
                 crate::diameter::codec::AVP_FLAG_MANDATORY
             );
         });
+    }
+
+    // ── AVP flags and DIAMETER_AVP_UNSUPPORTED (RFC 6733 4.1, 7.1.5) ───────
+
+    const UNKNOWN_MANDATORY: u32 = 64_000;
+    const UNKNOWN_OPTIONAL: u32 = 64_001;
+    const UNKNOWN_NESTED: u32 = 64_002;
+
+    fn unknown_avp(code: u32, flags: u8) -> Avp {
+        Avp {
+            code,
+            vendor: dictionary::VENDOR_3GPP,
+            flags,
+            value: AvpData::Raw(vec![0, 0, 0, 7]),
+        }
+    }
+
+    /// A Gx CCR-U carrying an unknown AVP with the M bit, one without it, and
+    /// one with it inside QoS-Information.
+    fn gx_request_with_unknown_avps() -> PyDiameterRequest {
+        use crate::diameter::codec::{AVP_FLAG_MANDATORY, AVP_FLAG_VENDOR};
+        let mandatory_vendor = AVP_FLAG_MANDATORY | AVP_FLAG_VENDOR;
+        let mut msg = sample_request_msg();
+        msg.application_id = dictionary::GX_APP_ID;
+        msg.avps.extend([
+            Avp {
+                code: dictionary::avp::VENDOR_SPECIFIC_APPLICATION_ID,
+                vendor: 0,
+                flags: AVP_FLAG_MANDATORY,
+                value: AvpData::Grouped(vec![
+                    Avp::u32(dictionary::avp::VENDOR_ID, 0, dictionary::VENDOR_3GPP),
+                    Avp::u32(
+                        dictionary::avp::AUTH_APPLICATION_ID,
+                        0,
+                        dictionary::GX_APP_ID,
+                    ),
+                ]),
+            },
+            Avp::raw(
+                dictionary::avp::THREE_GPP_PS_DATA_OFF_STATUS,
+                dictionary::VENDOR_3GPP,
+                1u32.to_be_bytes().to_vec(),
+            ),
+            unknown_avp(UNKNOWN_MANDATORY, mandatory_vendor),
+            unknown_avp(UNKNOWN_OPTIONAL, AVP_FLAG_VENDOR),
+            Avp {
+                code: dictionary::avp::QOS_INFORMATION,
+                vendor: dictionary::VENDOR_3GPP,
+                flags: mandatory_vendor,
+                value: AvpData::Grouped(vec![
+                    Avp::u32(
+                        dictionary::avp::QOS_CLASS_IDENTIFIER,
+                        dictionary::VENDOR_3GPP,
+                        9,
+                    ),
+                    unknown_avp(UNKNOWN_NESTED, mandatory_vendor),
+                ]),
+            },
+        ]);
+        PyDiameterRequest::new(
+            msg,
+            py_request().peer,
+            "pcrf.epc.example.org".into(),
+            "epc.example.org".into(),
+        )
+    }
+
+    #[test]
+    fn avps_carry_the_flags_they_were_received_with() {
+        pyo3::Python::initialize();
+        Python::attach(|py| {
+            let request = Py::new(py, gx_request_with_unknown_avps()).unwrap();
+            let avps = request.bind(py).call_method0("avps").unwrap();
+            let field =
+                |index: usize, name: &str| avps.get_item(index).unwrap().getattr(name).unwrap();
+            // Session-Id: M, no V.
+            assert!(field(0, "mandatory").extract::<bool>().unwrap());
+            assert!(!field(0, "vendor_specific").extract::<bool>().unwrap());
+            assert_eq!(field(0, "flags").extract::<u8>().unwrap(), 0x40);
+            // 3GPP-PS-Data-Off-Status: V, no M (TS 29.212 table 5.3.0.1).
+            assert_eq!(
+                field(5, "name").extract::<String>().unwrap(),
+                "3GPP-PS-Data-Off-Status"
+            );
+            assert_eq!(field(5, "value").extract::<u32>().unwrap(), 1);
+            assert!(!field(5, "mandatory").extract::<bool>().unwrap());
+            assert!(field(5, "vendor_specific").extract::<bool>().unwrap());
+            assert_eq!(field(5, "flags").extract::<u8>().unwrap(), 0x80);
+            // The unknown ones, as received.
+            assert!(field(6, "mandatory").extract::<bool>().unwrap());
+            assert!(!field(7, "mandatory").extract::<bool>().unwrap());
+            assert!(field(7, "vendor_specific").extract::<bool>().unwrap());
+        });
+    }
+
+    #[test]
+    fn unknown_avps_lists_what_the_dictionary_does_not_define_with_its_flags() {
+        pyo3::Python::initialize();
+        Python::attach(|py| {
+            let request = Py::new(py, gx_request_with_unknown_avps()).unwrap();
+            let unknown = request.bind(py).call_method0("unknown_avps").unwrap();
+            let rows: Vec<(u32, u32, bool)> = (0..unknown.len().unwrap())
+                .map(|index| {
+                    let avp = unknown.get_item(index).unwrap();
+                    assert!(avp.getattr("name").unwrap().is_none());
+                    (
+                        avp.getattr("code").unwrap().extract().unwrap(),
+                        avp.getattr("vendor").unwrap().extract().unwrap(),
+                        avp.getattr("mandatory").unwrap().extract().unwrap(),
+                    )
+                })
+                .collect();
+            let vendor = dictionary::VENDOR_3GPP;
+            assert_eq!(
+                rows,
+                [
+                    (UNKNOWN_MANDATORY, vendor, true),
+                    (UNKNOWN_OPTIONAL, vendor, false),
+                    (UNKNOWN_NESTED, vendor, true),
+                ]
+            );
+        });
+    }
+
+    #[test]
+    fn an_unknown_mandatory_avp_is_answered_5001_with_it_in_failed_avp() {
+        pyo3::Python::initialize();
+        Python::attach(|py| {
+            let request = Py::new(py, gx_request_with_unknown_avps()).unwrap();
+            let answer = request
+                .bind(py)
+                .call_method0("reject_unsupported_avps")
+                .unwrap();
+            let answer = answer.cast::<PyDiameterAnswer>().unwrap().borrow();
+            assert_eq!(
+                answer.result_code().unwrap(),
+                Some(dictionary::DIAMETER_AVP_UNSUPPORTED)
+            );
+            // A permanent failure of the command, not an answer-message.
+            assert!(!answer.is_error().unwrap());
+            let wire = answer.to_wire().unwrap();
+            let parsed = DiameterMsg::from_wire(&wire).unwrap();
+            let failed: Vec<&Avp> = parsed
+                .avps
+                .iter()
+                .filter(|avp| avp.code == dictionary::avp::FAILED_AVP)
+                .collect();
+            assert_eq!(failed.len(), 1, "one Failed-AVP");
+            assert_eq!(failed[0].flags, crate::diameter::codec::AVP_FLAG_MANDATORY);
+            let AvpData::Grouped(members) = &failed[0].value else {
+                panic!("Failed-AVP is grouped");
+            };
+            // The top-level one as received, the nested one inside its group
+            // alone; the one without the M bit is not a failure.
+            assert_eq!(members.len(), 2);
+            assert_eq!(members[0], unknown_avp(UNKNOWN_MANDATORY, 0xc0));
+            assert_eq!(members[1].code, dictionary::avp::QOS_INFORMATION);
+            assert_eq!(
+                members[1].value,
+                AvpData::Grouped(vec![unknown_avp(UNKNOWN_NESTED, 0xc0)])
+            );
+            // The answer of the command keeps the application id of the request.
+            assert!(parsed
+                .avps
+                .iter()
+                .any(|avp| avp.code == dictionary::avp::VENDOR_SPECIFIC_APPLICATION_ID));
+        });
+    }
+
+    #[test]
+    fn what_the_handler_understands_is_not_refused() {
+        pyo3::Python::initialize();
+        Python::attach(|py| {
+            let request = Py::new(py, gx_request_with_unknown_avps()).unwrap();
+            let understood = PyList::new(
+                py,
+                [
+                    (UNKNOWN_MANDATORY, dictionary::VENDOR_3GPP),
+                    (UNKNOWN_NESTED, dictionary::VENDOR_3GPP),
+                ],
+            )
+            .unwrap();
+            let answer = request
+                .bind(py)
+                .call_method1("reject_unsupported_avps", (understood,))
+                .unwrap();
+            assert!(answer.is_none());
+            // A bare code is vendor 0, which is not the vendor of these.
+            let answer = request
+                .bind(py)
+                .call_method1(
+                    "reject_unsupported_avps",
+                    (vec![UNKNOWN_MANDATORY, UNKNOWN_NESTED],),
+                )
+                .unwrap();
+            assert!(!answer.is_none());
+            let refused = request
+                .bind(py)
+                .call_method1("reject_unsupported_avps", (vec!["nope"],));
+            assert!(refused
+                .unwrap_err()
+                .is_instance_of::<pyo3::exceptions::PyTypeError>(py));
+        });
+    }
+
+    #[test]
+    fn a_request_of_known_avps_is_not_refused() {
+        pyo3::Python::initialize();
+        Python::attach(|py| {
+            let request = Py::new(py, py_request()).unwrap();
+            let answer = request
+                .bind(py)
+                .call_method0("reject_unsupported_avps")
+                .unwrap();
+            assert!(answer.is_none());
+            let unknown = request.bind(py).call_method0("unknown_avps").unwrap();
+            assert_eq!(unknown.len().unwrap(), 0);
+        });
+    }
+
+    /// Writes, for scripts/validate_diameter_avp_unsupported.sh, the 5001
+    /// answer `reject_unsupported_avps` builds and an Rx AA-Answer carrying
+    /// Acceptable-Service-Info, as text2pcap hex dumps.
+    #[test]
+    fn emit_avp_unsupported_answers_for_external_dissection() {
+        let Ok(path) = std::env::var("SIPHON_DIAMETER_AVP_UNSUPPORTED_HEX_OUT") else {
+            // Nothing to do in an ordinary test run.
+            return;
+        };
+        pyo3::Python::initialize();
+        let dump = Python::attach(|py| {
+            let request = Py::new(py, gx_request_with_unknown_avps()).unwrap();
+            let refusal = request
+                .bind(py)
+                .call_method0("reject_unsupported_avps")
+                .unwrap();
+            let refusal = refusal
+                .cast::<PyDiameterAnswer>()
+                .unwrap()
+                .borrow()
+                .to_wire()
+                .unwrap();
+
+            let mut aar = sample_request_msg();
+            aar.command_code = 265;
+            aar.application_id = dictionary::RX_APP_ID;
+            let aar = PyDiameterRequest::new(
+                aar,
+                py_request().peer,
+                "pcrf.epc.example.org".into(),
+                "epc.example.org".into(),
+            );
+            // DIAMETER_AUTHORIZATION_REJECTED, with what the PCRF would accept
+            // (TS 29.214 clause 4.4.1).
+            let answer = aar.answer(5003, None).unwrap();
+            let acceptable = py
+                .eval(
+                    c"[('Max-Requested-Bandwidth-DL', 64000), ('Max-Requested-Bandwidth-UL', 64000)]",
+                    None,
+                    None,
+                )
+                .unwrap();
+            answer
+                .set_avp(
+                    &"Acceptable-Service-Info"
+                        .into_pyobject(py)
+                        .unwrap()
+                        .into_any(),
+                    &acceptable,
+                    0,
+                )
+                .unwrap();
+            let acceptable = answer.to_wire().unwrap();
+            format!(
+                "{}{}",
+                crate::diameter::cx_test_support::hex_dump(&refusal),
+                crate::diameter::cx_test_support::hex_dump(&acceptable)
+            )
+        });
+        std::fs::write(&path, dump).expect("hex dump must be writable");
     }
 
     #[test]

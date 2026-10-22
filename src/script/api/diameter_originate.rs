@@ -451,6 +451,7 @@ mod tests {
         let hss = node("hss.ims.mnc001.mcc001.3gppnetwork.org", IMS_REALM);
         let pcrf = node("pcrf.epc.mnc001.mcc001.3gppnetwork.org", EPC_REALM);
         let pgw = node("pgw.epc.mnc001.mcc001.3gppnetwork.org", EPC_REALM);
+        let pcscf = node("pcscf.ims.mnc001.mcc001.3gppnetwork.org", IMS_REALM);
         let impi = "001010000000001@ims.mnc001.mcc001.3gppnetwork.org";
         let rtr = format!(
             r#"[
@@ -519,6 +520,45 @@ mod tests {
         let dsr = s6a(r#"[(1421, (8).to_bytes(4, "big"), 10415)]"#);
         let gx_session = "pgw.epc.mnc001.mcc001.3gppnetwork.org;1;1";
         let rx_session = "pcscf.ims.mnc001.mcc001.3gppnetwork.org;2;1";
+        // The policy AVPs a PCRF and its Rx client send (TS 29.212 and TS
+        // 29.214 table 5.3.0.1, TS 29.061 table 9a), all by name.
+        let gx_data_off_session = "pgw.epc.mnc001.mcc001.3gppnetwork.org;1;2";
+        let ccr_data_off = ccr(
+            2,
+            1,
+            r#"[
+            ("Event-Trigger", 55),
+            ("3GPP-PS-Data-Off-Status", 1),
+            ("3GPP-SGSN-MCC-MNC", "00101"),
+            ("3GPP-User-Location-Info", bytes([0x82, 0x00, 0xf1, 0x10, 0x00, 0x01, 0x00, 0xf1, 0x10, 0x00, 0x00, 0x01, 0x01])),
+            ("3GPP-MS-TimeZone", bytes([0x40, 0x00])),
+            ("Usage-Monitoring-Information", [("Monitoring-Key", b"mk-1"), ("Usage-Monitoring-Level", 0)]),
+        ]"#,
+        );
+        let gx_rar_revalidation = r#"[
+            ("Auth-Application-Id", 16777238),
+            ("Re-Auth-Request-Type", 0),
+            ("Event-Trigger", 17),
+            ("Revalidation-Time", 1767225600),
+            ("Charging-Rule-Install", [("Charging-Rule-Name", b"ims-voice"), ("Rule-Activation-Time", 1767225600)]),
+        ]"#;
+        let rx_aar = r#"[
+            ("Auth-Application-Id", 16777236),
+            ("AF-Application-Identifier", b"IMS Services"),
+            ("Media-Component-Description", [
+                ("Media-Component-Number", 1),
+                ("Media-Type", 0),
+                ("Max-Requested-Bandwidth-DL", 41000),
+                ("Max-Requested-Bandwidth-UL", 41000),
+                ("RR-Bandwidth", 2000),
+                ("RS-Bandwidth", 600),
+                ("Min-Requested-Bandwidth-DL", 12650),
+                ("Min-Requested-Bandwidth-UL", 12650),
+            ]),
+            ("SIP-Forking-Indication", 0),
+            ("AF-Signalling-Protocol", 1),
+            ("Required-Access-Info", 0),
+        ]"#;
         // From, command, application, AVPs, Session-Id, Destination-Host,
         // Destination-Realm.
         type Message<'a> = (
@@ -628,6 +668,33 @@ mod tests {
                 dsr,
                 None,
                 Some("mme.epc.mnc001.mcc001.3gppnetwork.org"),
+                EPC_REALM,
+            ),
+            (
+                &pgw,
+                272,
+                dictionary::GX_APP_ID,
+                ccr_data_off,
+                Some(gx_data_off_session),
+                None,
+                EPC_REALM,
+            ),
+            (
+                &pcrf,
+                258,
+                dictionary::GX_APP_ID,
+                gx_rar_revalidation.into(),
+                Some(gx_data_off_session),
+                Some("pgw.epc.mnc001.mcc001.3gppnetwork.org"),
+                EPC_REALM,
+            ),
+            (
+                &pcscf,
+                265,
+                dictionary::RX_APP_ID,
+                rx_aar.into(),
+                Some(rx_session),
+                None,
                 EPC_REALM,
             ),
         ];

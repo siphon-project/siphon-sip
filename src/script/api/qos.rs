@@ -53,9 +53,25 @@ impl PyQosNamespace {
     ///
     /// Returns:
     ///     A list of dicts shaped for ``diameter.rx_aar(media_components=…)``
-    ///     and ``sbi.create_session(media_components=…)``.  Each list entry
-    ///     corresponds to one ``m=`` section in the SDPs (sections with port
-    ///     ``0`` are skipped — RFC 4566 §5.14 "disabled stream").
+    ///     and ``sbi.create_session(media_components=…)``, one per ``m=``
+    ///     line.  ``number`` is the ordinal of the ``m=`` line, so a line
+    ///     keeps its number when an earlier one is disabled.
+    ///     Every entry names ``flow_status``, derived per TS 29.213 table
+    ///     6.2.1 from the offer and the answer (NOTE 5: the answer's port and
+    ///     direction, but ``a=inactive`` in the offer wins; a media line
+    ///     without a direction attribute takes the session-level one):
+    ///     - ``"removed"``: port ``0`` in the offer or the answer.  The entry
+    ///       has no flows.
+    ///     - ``"enabled"``: TCP transport (``TCP``, ``TCP/MSRP``,
+    ///       ``UDP/DTLS/SCTP``), ``a=rtcp-mux`` in offer and answer, or
+    ///       ``a=sendrecv`` / no direction attribute.
+    ///     - ``"disabled"``: ``a=inactive``.
+    ///     - ``"enabled-up"`` / ``"enabled-down"``: ``a=sendonly`` /
+    ///       ``a=recvonly``, read from the side of the SDP that carries it
+    ///       (``sendonly`` in the UE's SDP is uplink, in the network's SDP
+    ///       downlink; ``recvonly`` the other way round).
+    ///     ``"enabled"`` is named, not left out: on an update an absent
+    ///     Flow-Status means "unchanged" (TS 29.214 §5.3.16).
     ///     Each sub-component carries two descriptions, uplink first
     ///     (TS 29.214 clause 5.3.8: ``in`` is the uplink flow, ``out`` the
     ///     downlink flow; the UE is the source of ``in`` and the destination
@@ -104,15 +120,33 @@ impl PyQosNamespace {
         let answer_session_c = sdp_connection_ip(answer_sdp.connection());
 
         let components_list = PyList::empty(python);
-        let mut component_number: u32 = 0;
 
-        for (offer_media, answer_media) in offer_sdp
-            .media_sections
-            .iter()
-            .zip(answer_sdp.media_sections.iter())
-        {
-            if offer_media.port == 0 || answer_media.port == 0 {
-                continue; // RFC 4566 §5.14 — stream disabled.
+        // Media-Component-Number is the ordinal of the m= line (TS 29.213
+        // table 6.2.1), so it stays the same for a line across renegotiations
+        // whatever happens to the lines before it.
+        for (component_number, (offer_media, answer_media)) in (1u32..).zip(
+            offer_sdp
+                .media_sections
+                .iter()
+                .zip(answer_sdp.media_sections.iter()),
+        ) {
+            let flow_status = table_flow_status(
+                (&offer_sdp, offer_media),
+                (&answer_sdp, answer_media),
+                direction,
+            );
+
+            let component_dict = PyDict::new(python);
+            component_dict.set_item("number", component_number)?;
+            component_dict.set_item("media_type", sdp_media_type_alias(&offer_media.media_type))?;
+            component_dict.set_item("flow_status", flow_status)?;
+
+            if flow_status == "removed" {
+                // A port-0 line has no IP flows to describe; the component is
+                // still reported, so the PCRF releases what it had authorized.
+                component_dict.set_item("flows", PyList::empty(python))?;
+                components_list.append(component_dict)?;
+                continue;
             }
 
             let offer_ip = media_or_session_ip(offer_media, offer_session_c.as_deref())
@@ -151,15 +185,6 @@ impl PyQosNamespace {
                 };
 
             let proto_num = ip_proto_for_sdp_protocol(&offer_media.protocol);
-            let media_type_alias = sdp_media_type_alias(&offer_media.media_type);
-
-            component_number += 1;
-            let component_dict = PyDict::new(python);
-            component_dict.set_item("number", component_number)?;
-            component_dict.set_item("media_type", media_type_alias)?;
-            if let Some(status) = ue_media_flow_status(ue_media) {
-                component_dict.set_item("flow_status", status)?;
-            }
 
             let flows = PyList::empty(python);
 
@@ -179,8 +204,7 @@ impl PyQosNamespace {
             // RTCP sub-component (Flow-Number = 2) — unless rtcp-mux on
             // BOTH sides (a=rtcp-mux in offer + answer means agreed; RFC
             // 5761 §5.1.3 — answerer MUST agree before mux is in effect).
-            let mux_agreed = ue_media.has_attr("rtcp-mux") && remote_media.has_attr("rtcp-mux");
-            if !mux_agreed {
+            if !rtcp_mux_negotiated(ue_media, remote_media) {
                 let ue_rtcp_port = explicit_rtcp_port(ue_media).unwrap_or(ue_rtp_port + 1);
                 let remote_rtcp_port =
                     explicit_rtcp_port(remote_media).unwrap_or(remote_rtp_port + 1);
@@ -270,18 +294,89 @@ fn sdp_media_type_alias(sdp_media_type: &str) -> &'static str {
     }
 }
 
-/// Derive UE-perspective `flow_status` from the media-section direction
-/// attributes (RFC 3264 §6.1).  Returns `None` for sendrecv / unspecified —
-/// the binding defaults to "enabled" downstream.
-fn ue_media_flow_status(media: &MediaLine) -> Option<&'static str> {
-    if media.has_attr("inactive") {
-        Some("disabled")
-    } else if media.has_attr("sendonly") {
-        Some("enabled-up")
-    } else if media.has_attr("recvonly") {
-        Some("enabled-down")
-    } else {
-        None
+/// An SDP direction attribute (RFC 4566 §6, RFC 3264 §5.1).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SdpDirection {
+    SendRecv,
+    SendOnly,
+    RecvOnly,
+    Inactive,
+}
+
+/// The direction attribute in force for one m= line: its own, else the
+/// session-level one (RFC 4566 §6: a session-level attribute applies to every
+/// media line that does not override it). `None` when neither has one.
+fn media_direction(sdp: &SdpBody, media: &MediaLine) -> Option<SdpDirection> {
+    direction_attribute(|name| media.has_attr(name))
+        .or_else(|| direction_attribute(|name| sdp.session_has_attr(name)))
+}
+
+fn direction_attribute(has: impl Fn(&str) -> bool) -> Option<SdpDirection> {
+    [
+        ("sendrecv", SdpDirection::SendRecv),
+        ("sendonly", SdpDirection::SendOnly),
+        ("recvonly", SdpDirection::RecvOnly),
+        ("inactive", SdpDirection::Inactive),
+    ]
+    .into_iter()
+    .find(|(name, _)| has(name))
+    .map(|(_, direction)| direction)
+}
+
+/// `a=rtcp-mux` is negotiated once both offer and answer carry it (RFC 5761
+/// §5.1.1: the answerer includes it only when it agrees to multiplex).
+fn rtcp_mux_negotiated(one: &MediaLine, other: &MediaLine) -> bool {
+    one.has_attr("rtcp-mux") && other.has_attr("rtcp-mux")
+}
+
+/// "TCP", "TCP/MSRP" and "UDP/DTLS/SCTP" are the transports TS 29.213 table
+/// 6.2.1 enables in both directions whatever the direction attributes say;
+/// any other TCP-carried profile (TCP/TLS/MSRP, TCP/RTP/AVP) is TCP transport
+/// too.
+fn is_table_tcp_transport(sdp_protocol: &str) -> bool {
+    let upper = sdp_protocol.to_ascii_uppercase();
+    upper == "TCP" || upper.starts_with("TCP/") || upper == "UDP/DTLS/SCTP"
+}
+
+/// Flow-Status of one media component per TS 29.213 Rel-18 table 6.2.1.
+///
+/// NOTE 5 decides which SDP the direction comes from: the answer's port and
+/// direction attribute, except that `a=inactive` in the offer wins (for
+/// clients that ignore it). `<SDP direction>` (NOTE 8) is the direction of the
+/// SDP the attribute was read from: on the originating leg the offer is the
+/// UE's (uplink SDP) and the answer comes from the network, on the
+/// terminating leg the other way round.
+///
+/// Always names a status. TS 29.214 §5.3.16 lets an update omit an AVP that
+/// has not changed (table NOTE 7), so a PCRF reads an absent Flow-Status on an
+/// update as "unchanged": leaving ENABLED implicit kept a held stream's gates
+/// closed after it resumed.
+fn table_flow_status(
+    (offer_sdp, offer): (&SdpBody, &MediaLine),
+    (answer_sdp, answer): (&SdpBody, &MediaLine),
+    direction: Direction,
+) -> &'static str {
+    if offer.port == 0 || answer.port == 0 {
+        return "removed";
+    }
+    if is_table_tcp_transport(&answer.protocol) || is_table_tcp_transport(&offer.protocol) {
+        return "enabled";
+    }
+    // NOTE 12: multiplexed RTP/RTCP needs ENABLED so RTCP always passes.
+    if rtcp_mux_negotiated(offer, answer) {
+        return "enabled";
+    }
+    if media_direction(offer_sdp, offer) == Some(SdpDirection::Inactive) {
+        return "disabled";
+    }
+    let answer_is_uplink_sdp = matches!(direction, Direction::Terminating);
+    match media_direction(answer_sdp, answer) {
+        Some(SdpDirection::RecvOnly) if answer_is_uplink_sdp => "enabled-down",
+        Some(SdpDirection::RecvOnly) => "enabled-up",
+        Some(SdpDirection::SendOnly) if answer_is_uplink_sdp => "enabled-up",
+        Some(SdpDirection::SendOnly) => "enabled-down",
+        Some(SdpDirection::Inactive) => "disabled",
+        Some(SdpDirection::SendRecv) | None => "enabled",
     }
 }
 
@@ -660,35 +755,358 @@ mod tests {
         });
     }
 
-    #[test]
-    fn disabled_stream_is_skipped() {
+    /// `(number, media_type, flow_status, flow count)` of every component.
+    fn components(offer: &str, answer: &str, direction: &str) -> Vec<(u32, String, String, usize)> {
         pyo3::Python::initialize();
         let ns = PyQosNamespace::new();
         pyo3::Python::attach(|python| {
-            let disabled = concat!(
-                "v=0\r\n",
-                "o=- 1 1 IN IP4 100.65.0.2\r\n",
-                "s=-\r\n",
-                "c=IN IP4 100.65.0.2\r\n",
-                "t=0 0\r\n",
-                "m=video 0 RTP/AVP 96\r\n",
-                "m=audio 50000 RTP/AVP 0\r\n",
+            let offer = offer.into_pyobject(python).unwrap();
+            let answer = answer.into_pyobject(python).unwrap();
+            ns.media_flows_from_sdp(python, offer.as_any(), answer.as_any(), direction)
+                .unwrap()
+                .iter()
+                .map(|component| {
+                    let component: Bound<'_, PyDict> = component.cast_into().unwrap();
+                    let field = |key: &str| component.get_item(key).unwrap().unwrap();
+                    (
+                        field("number").extract().unwrap(),
+                        field("media_type").extract().unwrap(),
+                        field("flow_status").extract().unwrap(),
+                        field("flows").cast_into::<PyList>().unwrap().len(),
+                    )
+                })
+                .collect()
+        })
+    }
+
+    /// An SDP with the given session-level attributes and m= sections, the
+    /// lines of a section separated by `|`.
+    fn sdp(address: &str, session_attrs: &[&str], media: &[&str]) -> String {
+        let mut text =
+            format!("v=0\r\no=- 1 1 IN IP4 {address}\r\ns=-\r\nc=IN IP4 {address}\r\nt=0 0\r\n");
+        for attr in session_attrs {
+            text.push_str(&format!("a={attr}\r\n"));
+        }
+        for section in media {
+            for line in section.split('|') {
+                text.push_str(line);
+                text.push_str("\r\n");
+            }
+        }
+        text
+    }
+
+    fn flow_status(offer_media: &str, answer_media: &str, direction: &str) -> String {
+        let offer = sdp("192.0.2.2", &[], &[offer_media]);
+        let answer = sdp("198.51.100.10", &[], &[answer_media]);
+        components(&offer, &answer, direction).remove(0).2
+    }
+
+    const AUDIO_OFFER: &str = "m=audio 50000 RTP/AVP 0";
+    const AUDIO_ANSWER: &str = "m=audio 30000 RTP/AVP 0";
+
+    /// TS 29.213 table 6.2.1, Flow-Status, UDP / RTP/AVP branch without
+    /// rtcp-mux. With the answer available its direction attribute decides
+    /// (NOTE 5), read against the direction of the SDP that carries it
+    /// (NOTE 8): on "orig" the answer is downlink SDP (UE terminated), on
+    /// "term" it is uplink SDP (UE originated).
+    #[test]
+    fn table_6_2_1_direction_rows_from_offer_and_answer() {
+        // (offer attribute, answer attribute, direction, Flow-Status)
+        let rows = [
+            // a=recvonly: ENABLED_DOWNLINK in uplink SDP, else ENABLED_UPLINK.
+            ("sendonly", "recvonly", "orig", "enabled-up"),
+            ("sendonly", "recvonly", "term", "enabled-down"),
+            // a=sendonly: ENABLED_UPLINK in uplink SDP, else ENABLED_DOWNLINK.
+            ("recvonly", "sendonly", "orig", "enabled-down"),
+            ("recvonly", "sendonly", "term", "enabled-up"),
+            // a=inactive in the answer: DISABLED.
+            ("sendrecv", "inactive", "orig", "disabled"),
+            ("sendrecv", "inactive", "term", "disabled"),
+            ("sendonly", "inactive", "orig", "disabled"),
+            ("recvonly", "inactive", "term", "disabled"),
+            // a=sendrecv: ENABLED.
+            ("sendrecv", "sendrecv", "orig", "enabled"),
+            ("sendrecv", "sendrecv", "term", "enabled"),
+            // NOTE 5: a=inactive in the offer wins over an answer that
+            // ignored it.
+            ("inactive", "sendrecv", "orig", "disabled"),
+            ("inactive", "sendrecv", "term", "disabled"),
+            ("inactive", "recvonly", "orig", "disabled"),
+            ("inactive", "inactive", "term", "disabled"),
+            // The answer's attribute decides, not the offer's: a sendonly
+            // offer answered sendrecv is ENABLED.
+            ("sendonly", "sendrecv", "orig", "enabled"),
+            ("recvonly", "sendrecv", "term", "enabled"),
+        ];
+        for (offer_attr, answer_attr, direction, expected) in rows {
+            let offer = format!("{AUDIO_OFFER}|a={offer_attr}");
+            let answer = format!("{AUDIO_ANSWER}|a={answer_attr}");
+            assert_eq!(
+                flow_status(&offer, &answer, direction),
+                expected,
+                "offer a={offer_attr}, answer a={answer_attr}, {direction}"
             );
-            let disabled_answer = concat!(
-                "v=0\r\n",
-                "o=- 1 1 IN IP4 100.64.0.10\r\n",
-                "s=-\r\n",
-                "c=IN IP4 100.64.0.10\r\n",
-                "t=0 0\r\n",
-                "m=video 0 RTP/AVP 96\r\n",
-                "m=audio 30000 RTP/AVP 0\r\n",
+        }
+    }
+
+    /// "a=sendrecv or no direction attribute": ENABLED, named explicitly. On
+    /// an update an absent Flow-Status reads as unchanged (TS 29.214
+    /// §5.3.16), so a stream resumed from hold kept its gates held.
+    #[test]
+    fn table_6_2_1_no_direction_attribute_names_enabled() {
+        for direction in ["orig", "term"] {
+            assert_eq!(flow_status(AUDIO_OFFER, AUDIO_ANSWER, direction), "enabled");
+        }
+    }
+
+    /// (offer session attrs, offer media, answer session attrs, answer media,
+    /// direction, Flow-Status)
+    type SessionRow = (
+        &'static [&'static str],
+        &'static str,
+        &'static [&'static str],
+        &'static str,
+        &'static str,
+        &'static str,
+    );
+
+    /// A session-level direction attribute applies to a media line without
+    /// one (RFC 4566 §6); a media-level one overrides it.
+    #[test]
+    fn table_6_2_1_session_level_direction() {
+        let rows: [SessionRow; 6] = [
+            (
+                &["sendonly"],
+                AUDIO_OFFER,
+                &["recvonly"],
+                AUDIO_ANSWER,
+                "orig",
+                "enabled-up",
+            ),
+            (
+                &["sendonly"],
+                AUDIO_OFFER,
+                &["recvonly"],
+                AUDIO_ANSWER,
+                "term",
+                "enabled-down",
+            ),
+            (
+                &[],
+                AUDIO_OFFER,
+                &["inactive"],
+                AUDIO_ANSWER,
+                "orig",
+                "disabled",
+            ),
+            // NOTE 5 with the offer's inactive at session level.
+            (
+                &["inactive"],
+                AUDIO_OFFER,
+                &[],
+                AUDIO_ANSWER,
+                "term",
+                "disabled",
+            ),
+            // The media line's own attribute wins over the session's.
+            (
+                &["inactive"],
+                "m=audio 50000 RTP/AVP 0|a=sendrecv",
+                &["inactive"],
+                "m=audio 30000 RTP/AVP 0|a=sendrecv",
+                "orig",
+                "enabled",
+            ),
+            (
+                &[],
+                AUDIO_OFFER,
+                &["sendonly"],
+                "m=audio 30000 RTP/AVP 0|a=sendrecv",
+                "term",
+                "enabled",
+            ),
+        ];
+        for (offer_session, offer_media, answer_session, answer_media, direction, expected) in rows
+        {
+            let offer = sdp("192.0.2.2", offer_session, &[offer_media]);
+            let answer = sdp("198.51.100.10", answer_session, &[answer_media]);
+            assert_eq!(
+                components(&offer, &answer, direction)[0].2,
+                expected,
+                "offer {offer_session:?} {offer_media}, answer {answer_session:?} {answer_media}, {direction}"
             );
-            let offer = disabled.into_pyobject(python).unwrap();
-            let answer = disabled_answer.into_pyobject(python).unwrap();
-            let result = ns
+        }
+    }
+
+    /// "IF a=rtcp-mux is negotiated THEN Flow-Status := ENABLED" (NOTE 12),
+    /// ahead of the direction attributes. Negotiated means offer and answer.
+    #[test]
+    fn table_6_2_1_rtcp_mux_forces_enabled() {
+        for direction in ["orig", "term"] {
+            for (offer_attr, answer_attr) in [
+                ("sendonly", "recvonly"),
+                ("recvonly", "sendonly"),
+                ("sendrecv", "inactive"),
+                ("inactive", "inactive"),
+            ] {
+                let offer = format!("{AUDIO_OFFER}|a=rtcp-mux|a={offer_attr}");
+                let answer = format!("{AUDIO_ANSWER}|a=rtcp-mux|a={answer_attr}");
+                assert_eq!(
+                    flow_status(&offer, &answer, direction),
+                    "enabled",
+                    "rtcp-mux, offer a={offer_attr}, answer a={answer_attr}, {direction}"
+                );
+            }
+        }
+        // Offered but not accepted: not negotiated, the direction decides.
+        let offer = format!("{AUDIO_OFFER}|a=rtcp-mux|a=sendonly");
+        let answer = format!("{AUDIO_ANSWER}|a=recvonly");
+        assert_eq!(flow_status(&offer, &answer, "orig"), "enabled-up");
+    }
+
+    /// "IF Transport in m-line is TCP or TCP/MSRP or UDP/DTLS/SCTP THEN
+    /// Flow-Status := ENABLED", whatever the direction attributes.
+    #[test]
+    fn table_6_2_1_tcp_transport_is_enabled() {
+        for protocol in ["TCP", "TCP/MSRP", "UDP/DTLS/SCTP", "TCP/TLS/MSRP"] {
+            for direction in ["orig", "term"] {
+                for (offer_attr, answer_attr) in
+                    [("sendonly", "recvonly"), ("inactive", "inactive")]
+                {
+                    let offer = format!("m=message 50000 {protocol} *|a={offer_attr}");
+                    let answer = format!("m=message 30000 {protocol} *|a={answer_attr}");
+                    assert_eq!(
+                        flow_status(&offer, &answer, direction),
+                        "enabled",
+                        "{protocol}, offer a={offer_attr}, answer a={answer_attr}, {direction}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// "IF port in m-line = 0 THEN Flow-Status := REMOVED", and the
+    /// Media-Component-Number is the ordinal of the m= line, so the lines
+    /// after a disabled one keep their numbers.
+    #[test]
+    fn table_6_2_1_port_zero_is_removed_and_numbering_is_stable() {
+        let offer = sdp(
+            "192.0.2.2",
+            &[],
+            &[
+                "m=video 0 RTP/AVP 96",
+                "m=audio 50000 RTP/AVP 0",
+                "m=video 50002 RTP/AVP 96",
+            ],
+        );
+        // The answerer also rejects the second video stream.
+        let answer = sdp(
+            "198.51.100.10",
+            &[],
+            &[
+                "m=video 0 RTP/AVP 96",
+                "m=audio 30000 RTP/AVP 0",
+                "m=video 0 RTP/AVP 96",
+            ],
+        );
+        for direction in ["orig", "term"] {
+            assert_eq!(
+                components(&offer, &answer, direction),
+                vec![
+                    (1, "video".to_string(), "removed".to_string(), 0),
+                    (2, "audio".to_string(), "enabled".to_string(), 2),
+                    (3, "video".to_string(), "removed".to_string(), 0),
+                ],
+                "{direction}"
+            );
+        }
+    }
+
+    /// A rejected line needs no connection address (RFC 3264 §6: the answer
+    /// may leave it out), and there are no flows to describe.
+    #[test]
+    fn removed_line_without_connection_address_is_reported() {
+        let offer = sdp(
+            "192.0.2.2",
+            &[],
+            &["m=audio 50000 RTP/AVP 0", "m=video 50002 RTP/AVP 96"],
+        );
+        let answer = concat!(
+            "v=0\r\no=- 1 1 IN IP4 198.51.100.10\r\ns=-\r\nt=0 0\r\n",
+            "m=audio 30000 RTP/AVP 0\r\nc=IN IP4 198.51.100.10\r\n",
+            "m=video 0 RTP/AVP 96\r\n",
+        );
+        assert_eq!(
+            components(&offer, answer, "orig"),
+            vec![
+                (1, "audio".to_string(), "enabled".to_string(), 2),
+                (2, "video".to_string(), "removed".to_string(), 0),
+            ]
+        );
+    }
+
+    /// Rx and N5 read the same list: each Flow-Status reaches the
+    /// Media-Component-Description of the AAR and the `fStatus` of the
+    /// Npcf_PolicyAuthorization body, under the same component number.
+    #[test]
+    fn rx_and_n5_carry_the_table_flow_status() {
+        use crate::diameter::rx::FlowStatus;
+
+        let offer = sdp(
+            "192.0.2.2",
+            &[],
+            &[
+                "m=audio 50000 RTP/AVP 0|a=sendonly",
+                "m=video 0 RTP/AVP 96",
+                "m=video 50002 RTP/AVP 96|a=inactive",
+                "m=text 50004 RTP/AVP 98",
+                "m=audio 50006 RTP/AVP 0|a=recvonly",
+            ],
+        );
+        let answer = sdp(
+            "198.51.100.10",
+            &[],
+            &[
+                "m=audio 30000 RTP/AVP 0|a=recvonly",
+                "m=video 0 RTP/AVP 96",
+                "m=video 30002 RTP/AVP 96|a=inactive",
+                "m=text 30004 RTP/AVP 98",
+                "m=audio 30006 RTP/AVP 0|a=sendonly",
+            ],
+        );
+        let expected = [
+            (1, FlowStatus::EnabledUplink, "ENABLED-UPLINK"),
+            (2, FlowStatus::Removed, "REMOVED"),
+            (3, FlowStatus::Disabled, "DISABLED"),
+            (4, FlowStatus::Enabled, "ENABLED"),
+            (5, FlowStatus::EnabledDownlink, "ENABLED-DOWNLINK"),
+        ];
+
+        pyo3::Python::initialize();
+        let ns = PyQosNamespace::new();
+        pyo3::Python::attach(|python| {
+            let offer = offer.into_pyobject(python).unwrap();
+            let answer = answer.into_pyobject(python).unwrap();
+            let list = ns
                 .media_flows_from_sdp(python, offer.as_any(), answer.as_any(), "orig")
                 .unwrap();
-            assert_eq!(result.len(), 1, "port=0 should not emit a component");
+
+            let rx = super::super::diameter::parse_media_components(list.as_any()).unwrap();
+            let n5 = super::super::sbi::parse_sbi_media_components(list.as_any()).unwrap();
+            assert_eq!(rx.len(), expected.len());
+            assert_eq!(n5.len(), expected.len());
+            for ((number, rx_status, n5_status), (rx, n5)) in
+                expected.into_iter().zip(rx.iter().zip(n5.iter()))
+            {
+                assert_eq!(rx.number, number);
+                assert_eq!(rx.flow_status, Some(rx_status), "Rx component {number}");
+                assert_eq!(n5.med_comp_n, number);
+                assert_eq!(n5.f_status, n5_status, "N5 component {number}");
+            }
+            // A removed component carries no sub-components on either.
+            assert!(rx[1].flows.is_empty());
+            assert!(n5[1].med_sub_comps.is_none());
         });
     }
 
@@ -706,8 +1124,10 @@ mod tests {
                 "m=audio 50000 RTP/AVP 0\r\n",
                 "a=sendonly\r\n",
             );
+            // RFC 3264 §6.1: the answer to a sendonly stream is recvonly.
+            let held = ANSWER_REWRITTEN.replace("a=sendrecv", "a=recvonly");
             let offer = hold.into_pyobject(python).unwrap();
-            let answer = ANSWER_REWRITTEN.into_pyobject(python).unwrap();
+            let answer = held.into_pyobject(python).unwrap();
             let result = ns
                 .media_flows_from_sdp(python, offer.as_any(), answer.as_any(), "orig")
                 .unwrap();

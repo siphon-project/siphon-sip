@@ -8528,9 +8528,18 @@ class MockDiameterAvp:
             number has no name.
         value: The value as ``get_avp`` returns it, or for a grouped AVP a
             list of ``DiameterAvp``.
+        flags: The flags octet of the AVP header: V ``0x80``, M ``0x40``,
+            P ``0x20``. The mock gives every AVP the M bit and, for a
+            non-zero vendor, the V bit, unless the test says otherwise.
+        mandatory: Whether the M bit is set.
+        vendor_specific: Whether the V bit is set.
     """
 
-    def __init__(self, code: Union[int, str], vendor: int, value: Any) -> None:
+    def __init__(self, code: Union[int, str], vendor: int, value: Any,
+                 flags: Optional[int] = None) -> None:
+        if flags is None:
+            flags = 0x40 | (0x80 if vendor else 0)
+        self.flags = flags
         self.code = code
         self.vendor = vendor
         self.name = code if isinstance(code, str) else None
@@ -8540,6 +8549,14 @@ class MockDiameterAvp:
                 for child in value
             ]
         self.value = value
+
+    @property
+    def mandatory(self) -> bool:
+        return bool(self.flags & 0x40)
+
+    @property
+    def vendor_specific(self) -> bool:
+        return bool(self.flags & 0x80)
 
     def __repr__(self) -> str:
         return (f"DiameterAvp(name={self.name!r}, code={self.code!r}, "
@@ -8700,6 +8717,11 @@ class MockDiameterRequest:
     """Mock ``DiameterRequest`` passed to ``@diameter.on_request`` in tests.
 
     Construct one in your test and invoke your handler with it.
+
+    The mock has no dictionary, so the AVPs the real dictionary would not
+    know are given apart, as ``unknown_avps=[(code, vendor, value,
+    mandatory), ...]``: :meth:`unknown_avps` lists them and
+    :meth:`reject_unsupported_avps` refuses the ones with ``mandatory``.
     """
 
     def __init__(self, *, application_name: str = "S6c", command_code: int = 0,
@@ -8707,7 +8729,9 @@ class MockDiameterRequest:
                  dest_realm: Optional[str] = None, dest_host: Optional[str] = None,
                  origin_host: Optional[str] = None, origin_realm: Optional[str] = None,
                  peer: Optional[MockPeer] = None, avps: Optional[dict] = None,
-                 application_id: int = 0) -> None:
+                 application_id: int = 0,
+                 unknown_avps: Optional[list] = None) -> None:
+        self._unknown = [tuple(entry) for entry in (unknown_avps or [])]
         self.application_id = application_id
         self.application_name = application_name
         self.command_code = command_code
@@ -8764,6 +8788,37 @@ class MockDiameterRequest:
 
     def extract_imsi(self) -> Optional[str]:
         return self._avps.get((1, 0))
+
+    def unknown_avps(self) -> list:
+        """The AVPs the dictionary does not define, as :class:`MockDiameterAvp`
+        objects with ``name`` None and ``mandatory`` as given."""
+        return [
+            MockDiameterAvp(code, vendor, value,
+                            flags=(0x40 if mandatory else 0) | (0x80 if vendor else 0))
+            for code, vendor, value, mandatory in self._unknown
+        ]
+
+    def reject_unsupported_avps(self, understood: Optional[list] = None) -> Optional[MockDiameterAnswer]:
+        """The DIAMETER_AVP_UNSUPPORTED (5001) answer, with a Failed-AVP (279)
+        holding every unknown AVP with the M bit that ``understood`` does not
+        list, or ``None`` when there is none (RFC 6733 sections 4.1 and
+        7.1.5). ``understood`` lists codes (vendor 0) or ``(code, vendor)``
+        tuples."""
+        claimed = set()
+        for item in understood or []:
+            if isinstance(item, int):
+                claimed.add((item, 0))
+            elif isinstance(item, tuple) and len(item) == 2:
+                claimed.add((item[0], item[1]))
+            else:
+                raise TypeError("understood lists AVP codes or (code, vendor) tuples")
+        failed = [(code, value, vendor) for code, vendor, value, mandatory in self._unknown
+                  if mandatory and (code, vendor) not in claimed]
+        if not failed:
+            return None
+        answer = self.answer(5001)
+        answer.set_avp(279, failed)
+        return answer
 
     def answer(self, result_code: int = 2001, error_message: Optional[str] = None) -> MockDiameterAnswer:
         """Build a local answer to serve this request (HSS-style). Populate it
@@ -13281,10 +13336,11 @@ class MockQos:
     ``media_components`` structure consumed by ``diameter.rx_aar`` and
     ``sbi.create_session``.
 
-    The mock parses SDP just enough to produce a usable
-    ``media_components`` list with RTP + RTCP sub-components for each
-    ``m=`` section.  Disabled streams (port 0) are skipped and
-    ``a=rtcp-mux`` collapses RTCP into the RTP sub-component.
+    The mock parses SDP just enough to produce the same
+    ``media_components`` list siphon does: one entry per ``m=`` line with
+    RTP + RTCP sub-components, ``a=rtcp-mux`` in offer and answer
+    collapsing RTCP into the RTP one, and the Flow-Status of TS 29.213
+    table 6.2.1 named on every entry.
 
     Example::
 
@@ -13309,7 +13365,28 @@ class MockQos:
                 addresses flipped).
 
         Returns:
-            list[dict]: one entry per non-disabled ``m=`` section.
+            list[dict]: one entry per ``m=`` line.  ``number`` is the ordinal
+            of the ``m=`` line, so a line keeps its number when an earlier
+            one is disabled.
+
+        Every entry names ``flow_status``, derived per TS 29.213 table 6.2.1
+        from the offer and the answer (NOTE 5: the answer's port and
+        direction, but ``a=inactive`` in the offer wins; a media line
+        without a direction attribute takes the session-level one):
+
+        - ``"removed"``: port ``0`` in the offer or the answer.  The entry
+          has no flows.
+        - ``"enabled"``: TCP transport (``TCP``, ``TCP/MSRP``,
+          ``UDP/DTLS/SCTP``), ``a=rtcp-mux`` in offer and answer, or
+          ``a=sendrecv`` / no direction attribute.
+        - ``"disabled"``: ``a=inactive``.
+        - ``"enabled-up"`` / ``"enabled-down"``: ``a=sendonly`` /
+          ``a=recvonly``, read from the side of the SDP that carries it
+          (``sendonly`` in the UE's SDP is uplink, in the network's SDP
+          downlink; ``recvonly`` the other way round).
+
+        ``"enabled"`` is named, not left out: on an update an absent
+        Flow-Status means "unchanged" (TS 29.214 §5.3.16).
 
         Each sub-component carries two descriptions, uplink first
         (TS 29.214 clause 5.3.8: ``in`` is the uplink flow, ``out`` the
@@ -13334,9 +13411,17 @@ class MockQos:
             )
 
         results: list[dict] = []
-        component_number = 0
-        for offer_m, answer_m in zip(offer_sdp.media, answer_sdp.media):
-            if offer_m.port == 0 or answer_m.port == 0:
+        for component_number, (offer_m, answer_m) in enumerate(
+                zip(offer_sdp.media, answer_sdp.media), start=1):
+            status = _table_flow_status(offer_sdp, offer_m, answer_sdp,
+                                        answer_m, direction)
+            if status == "removed":
+                results.append({
+                    "number": component_number,
+                    "media_type": _media_type_alias(offer_m.media_type),
+                    "flow_status": status,
+                    "flows": [],
+                })
                 continue
 
             offer_ip = offer_m.connection_ip or offer_sdp.connection_ip
@@ -13357,10 +13442,10 @@ class MockQos:
 
             proto = _ip_proto(offer_m.protocol)
 
-            component_number += 1
             component: dict = {
                 "number": component_number,
                 "media_type": _media_type_alias(offer_m.media_type),
+                "flow_status": status,
                 "flows": [
                     {
                         "number": 1,
@@ -13371,10 +13456,6 @@ class MockQos:
                     },
                 ],
             }
-
-            status = _ue_flow_status(ue_media)
-            if status is not None:
-                component["flow_status"] = status
 
             mux_agreed = "rtcp-mux" in ue_media.flags and "rtcp-mux" in remote_media.flags
             if not mux_agreed:
@@ -13427,6 +13508,7 @@ class _MiniSdp:
 
     def __init__(self, text: str) -> None:
         self.connection_ip: Optional[str] = None
+        self.flags: set[str] = set()
         self.media: list[_MiniSdpMedia] = []
         current: Optional[_MiniSdpMedia] = None
         for raw in text.splitlines():
@@ -13438,6 +13520,8 @@ class _MiniSdp:
                 current.connection_ip = _parse_c_line(line)
             elif line.startswith("c=") and current is None:
                 self.connection_ip = _parse_c_line(line)
+            elif line.startswith("a=") and current is None:
+                self.flags.add(line[2:].split(":", 1)[0].strip())
             elif line.startswith("a=") and current is not None:
                 attr = line[2:]
                 if ":" in attr:
@@ -13486,14 +13570,44 @@ def _media_type_alias(sdp_media_type: str) -> str:
     return mapping.get(sdp_media_type.lower(), "other")
 
 
-def _ue_flow_status(media: _MiniSdpMedia) -> Optional[str]:
-    if "inactive" in media.flags:
-        return "disabled"
-    if "sendonly" in media.flags:
-        return "enabled-up"
-    if "recvonly" in media.flags:
-        return "enabled-down"
+_DIRECTIONS = ("sendrecv", "sendonly", "recvonly", "inactive")
+
+
+def _media_direction(sdp: _MiniSdp, media: _MiniSdpMedia) -> Optional[str]:
+    """The media line's direction attribute, else the session-level one."""
+    for flags in (media.flags, sdp.flags):
+        for name in _DIRECTIONS:
+            if name in flags:
+                return name
     return None
+
+
+def _is_table_tcp_transport(protocol: str) -> bool:
+    upper = protocol.upper()
+    return upper == "TCP" or upper.startswith("TCP/") or upper == "UDP/DTLS/SCTP"
+
+
+def _table_flow_status(offer_sdp: _MiniSdp, offer: _MiniSdpMedia,
+                       answer_sdp: _MiniSdp, answer: _MiniSdpMedia,
+                       direction: str) -> str:
+    """Flow-Status per TS 29.213 table 6.2.1, as siphon derives it."""
+    if offer.port == 0 or answer.port == 0:
+        return "removed"
+    if _is_table_tcp_transport(offer.protocol) or _is_table_tcp_transport(answer.protocol):
+        return "enabled"
+    if "rtcp-mux" in offer.flags and "rtcp-mux" in answer.flags:
+        return "enabled"
+    if _media_direction(offer_sdp, offer) == "inactive":
+        return "disabled"
+    answer_is_uplink_sdp = direction in ("term", "terminating")
+    attribute = _media_direction(answer_sdp, answer)
+    if attribute == "recvonly":
+        return "enabled-down" if answer_is_uplink_sdp else "enabled-up"
+    if attribute == "sendonly":
+        return "enabled-up" if answer_is_uplink_sdp else "enabled-down"
+    if attribute == "inactive":
+        return "disabled"
+    return "enabled"
 
 
 _qos = MockQos()

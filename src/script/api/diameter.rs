@@ -145,7 +145,7 @@ fn flow_usage_from_str(s: &str) -> PyResult<crate::diameter::rx::FlowUsage> {
 ///   "flows":               [ ... ]   (optional, default [])
 /// }
 /// ```
-fn parse_media_components(
+pub(super) fn parse_media_components(
     obj: &Bound<'_, PyAny>,
 ) -> PyResult<Vec<crate::diameter::rx::MediaComponent>> {
     use crate::diameter::rx::{MediaComponent, MediaFlow};

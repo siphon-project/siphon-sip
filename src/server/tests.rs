@@ -448,3 +448,45 @@ gateway:
     );
     assert_eq!(setting("198.51.100.99:5061"), None, "not a gateway");
 }
+
+/// Awaitable script APIs complete on pinned threads.
+///
+/// `future_into_py` completes on pyo3-async-runtimes' runtime. Before the
+/// server shared its own, that was a runtime pyo3-async-runtimes built itself,
+/// and each completion created and destroyed a Python thread state. The
+/// completion is a `spawn_blocking` on that runtime, so one is run here and
+/// must land on a pinned thread.
+///
+/// `#[ignore]`d because pyo3-async-runtimes holds one runtime per process:
+/// any other test that touches it first makes this one meaningless. CI runs
+/// it on its own.
+#[test]
+#[ignore = "process-global pyo3-async-runtimes runtime — run alone: cargo test --lib -- --ignored --exact server::tests::awaitables_complete_on_pinned_threads --test-threads=1"]
+fn awaitables_complete_on_pinned_threads() {
+    pyo3::Python::initialize();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .on_thread_start(pin_python_thread_state)
+        .on_thread_stop(unpin_python_thread_state)
+        .build()
+        .expect("runtime builds");
+    let runtime: &'static tokio::runtime::Runtime = Box::leak(Box::new(runtime));
+    assert!(share_runtime_with_python(runtime));
+    let shared = pyo3_async_runtimes::tokio::get_runtime();
+    assert!(std::ptr::eq(shared, runtime));
+    let pinned = shared.block_on(async {
+        shared
+            .spawn_blocking(python_thread_state_pinned)
+            .await
+            .expect("blocking task joins")
+    });
+    assert!(
+        pinned,
+        "a completion ran on a thread without a pinned Python thread state"
+    );
+    // Not vacuous: a thread the runtime did not start is not pinned.
+    assert!(!std::thread::spawn(python_thread_state_pinned)
+        .join()
+        .expect("thread joins"));
+}
