@@ -77,6 +77,9 @@ pub async fn registration_loop(manager: Arc<RegistrantManager>, context: Registr
         error!("registrant egress could not be installed — outbound registration is not running");
         return;
     };
+    if let Some(ipsec) = context.ipsec_manager.clone() {
+        manager.install_ipsec(ipsec);
+    }
 
     loop {
         tokio::time::sleep(tick_interval).await;
@@ -99,9 +102,11 @@ fn run_tick(
         send_registrant_message(&context.outbound, egress, built);
     }
 
-    // SAs of entries that moved off an address, before the new address's
-    // handshake installs fresh ones.
-    delete_moved_sas(manager, context, egress);
+    // SAs of entries that moved off an address (before the new address's
+    // handshake installs fresh ones), superseded or abandoned SA sets, and
+    // those of removed entries whose de-REGISTER went unanswered.
+    manager.expire_teardowns(std::time::Instant::now());
+    delete_queued_sas(manager, context, egress);
 
     // Sockets for every entry that registers from an address of its own. An
     // entry whose socket cannot bind sits this tick out.
@@ -123,6 +128,8 @@ fn run_tick(
         warn!(aor = %aor, "REGISTER transaction timed out — no response received");
         manager.handle_failure(&aor, 0, None);
     }
+    // The temporary SA sets the timeouts abandoned.
+    delete_queued_sas(manager, context, egress);
 
     let now = tokio::time::Instant::now();
     for aor in manager.entries_due() {
@@ -155,7 +162,7 @@ fn reconcile_ue_sockets(
     context: &RegistrationLoopContext,
     egress: &RegistrantEgress,
 ) -> HashSet<String> {
-    let plan = manager.ue_socket_plan(egress.defaults().plain_port());
+    let plan = manager.ue_socket_plan(egress.defaults().plain_port(), process_ue_ip(egress));
     let Some(sockets) = context.ue_sockets.as_ref() else {
         if !plan.is_empty() {
             debug!(
@@ -179,8 +186,8 @@ fn reconcile_ue_sockets(
         .collect()
 }
 
-/// Tear down the SA pairs [`RegistrantManager::set_local_addr`] queued.
-fn delete_moved_sas(
+/// Delete the SA pairs the manager queued.
+fn delete_queued_sas(
     manager: &RegistrantManager,
     context: &RegistrationLoopContext,
     egress: &RegistrantEgress,
@@ -189,19 +196,14 @@ fn delete_moved_sas(
     if deletions.is_empty() {
         return;
     }
-    let Some(ipsec_manager) = context.ipsec_manager.clone() else {
+    let Some(ipsec_manager) = context.ipsec_manager.as_ref() else {
+        debug!(
+            pairs = deletions.len(),
+            "SA deletions queued with no IPsec manager in this process"
+        );
         return;
     };
-    let process_ue_ip = process_ue_ip(egress);
-    for (address, ue_port_c) in deletions {
-        let ue_addr = address.unwrap_or(process_ue_ip);
-        let ipsec_manager = Arc::clone(&ipsec_manager);
-        tokio::spawn(async move {
-            if let Err(error) = ipsec_manager.delete_sa_pair(&ue_addr, ue_port_c).await {
-                warn!(%ue_addr, ue_port_c, %error, "IPsec UE: failed to delete the SAs of a moved registration");
-            }
-        });
-    }
+    super::protected::spawn_sa_deletions(deletions, ipsec_manager, process_ue_ip(egress));
 }
 
 /// The UE address a process-address entry's SAs carry: the dispatcher's
@@ -284,7 +286,7 @@ fn outbound_message(egress: &RegistrantEgress, built: BuiltRegister) -> Outbound
         // An entry on its own address is captured from that address; every
         // other one from the process's resolved Via address, as before.
         let via_addr = if built.own_address {
-            built.sent_by
+            built.source_local_addr.unwrap_or(built.sent_by)
         } else {
             resolve_via_addr(
                 egress.local_addr,

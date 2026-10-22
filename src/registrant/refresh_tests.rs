@@ -125,10 +125,14 @@ async fn a_tick_opens_each_ues_sockets_and_registers_it_from_them() {
         None,
     );
 
-    assert_eq!(sockets.len(), 9, "plain + port_c + port_s for three UEs");
+    assert_eq!(
+        sockets.len(),
+        15,
+        "plain + the three rotating client ports + port_s for three UEs"
+    );
     for index in 2..5u32 {
         let own = ip(&format!("127.0.0.{index}"));
-        for socket_port in [port, 6100, 6101] {
+        for socket_port in [port, 6100, 6102, 6103, 6101] {
             assert!(sockets.contains(&SocketAddr::new(own, socket_port)));
         }
         assert_eq!(

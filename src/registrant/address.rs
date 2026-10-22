@@ -56,13 +56,23 @@ impl LocalAddrQuery {
 }
 
 /// The identity two entries may not share: an address and the UE protected
-/// client port (`None` without IPsec). Two IPsec entries on one address with
-/// distinct ports are two UEs; two with the same port would install colliding
-/// SAs, and two plain entries would be indistinguishable to an MT request.
-fn address_key(entry: &RegistrantEntry) -> Option<(IpAddr, Option<u16>)> {
+/// ports (none without IPsec). Two IPsec entries on one address with disjoint
+/// protected ports (its three client ports and server port, see
+/// [`super::protected`]) are two UEs; two sharing a port would install
+/// colliding SAs, and two plain entries would be indistinguishable to an MT
+/// request.
+fn address_key(entry: &RegistrantEntry) -> Option<(IpAddr, Vec<u16>)> {
     entry
         .local_addr
-        .map(|ip| (ip, entry.ue_ipsec.as_ref().map(|ipsec| ipsec.ue_port_c)))
+        .map(|ip| (ip, RegistrantManager::protected_ports(entry)))
+}
+
+/// Whether two address keys collide: the same address, and both plain or
+/// sharing a protected port.
+fn keys_collide(ours: &(IpAddr, Vec<u16>), theirs: &(IpAddr, Vec<u16>)) -> bool {
+    ours.0 == theirs.0
+        && (ours.1.is_empty() && theirs.1.is_empty()
+            || ours.1.iter().any(|port| theirs.1.contains(port)))
 }
 
 impl RegistrantManager {
@@ -78,8 +88,15 @@ impl RegistrantManager {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         check_transport(&entry, entry.local_addr)?;
+        if let Some(ipsec) = entry.ue_ipsec.as_ref() {
+            if let Some(problem) =
+                super::protected::protected_ports_problem(ipsec.ue_port_c, ipsec.ue_port_s)
+            {
+                return Err(format!("{}: {problem}", entry.aor));
+            }
+        }
         if let Some(key) = address_key(&entry) {
-            self.refuse_taken(&entry.aor, key)?;
+            self.refuse_taken(&entry.aor, &key)?;
         }
         if entry.require_local_addr && entry.local_addr.is_none() {
             entry.state = RegistrantState::AwaitingAddress;
@@ -92,7 +109,10 @@ impl RegistrantManager {
         );
         let awaiting = entry.state == RegistrantState::AwaitingAddress;
         let aor = entry.aor.clone();
-        self.entries.insert(aor.clone(), entry);
+        if let Some(replaced) = self.entries.insert(aor.clone(), entry) {
+            // The replacement starts a fresh handshake; the old one's SAs go.
+            self.retire_sa_sets(&replaced, None);
+        }
         if awaiting {
             self.emit_event(RegistrantEvent::AwaitingAddress { aor });
         }
@@ -100,20 +120,23 @@ impl RegistrantManager {
     }
 
     /// `Err` when an entry other than `aor` holds `key`.
-    fn refuse_taken(&self, aor: &str, key: (IpAddr, Option<u16>)) -> Result<(), String> {
+    fn refuse_taken(&self, aor: &str, key: &(IpAddr, Vec<u16>)) -> Result<(), String> {
         let holder = self
             .entries
             .iter()
-            .find(|other| other.aor != aor && address_key(other) == Some(key))
+            .find(|other| {
+                other.aor != aor
+                    && address_key(other).is_some_and(|theirs| keys_collide(key, &theirs))
+            })
             .map(|other| other.aor.clone());
         match holder {
-            Some(holder) => Err(match key.1 {
-                Some(port) => format!(
-                    "local_addr {} with ue_port_c {port} is already used by {holder}",
-                    key.0
-                ),
-                None => format!("local_addr {} is already used by {holder}", key.0),
-            }),
+            Some(holder) if key.1.is_empty() => {
+                Err(format!("local_addr {} is already used by {holder}", key.0))
+            }
+            Some(holder) => Err(format!(
+                "local_addr {} with protected ports {:?} overlaps the ports {holder} uses there",
+                key.0, key.1
+            )),
             None => Ok(()),
         }
     }
@@ -150,11 +173,11 @@ impl RegistrantManager {
             .address_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let Some((current, transport, ue_port_c)) = self.entries.get(aor).map(|entry| {
+        let Some((current, transport, ports)) = self.entries.get(aor).map(|entry| {
             (
                 entry.local_addr,
                 entry.transport,
-                entry.ue_ipsec.as_ref().map(|ipsec| ipsec.ue_port_c),
+                RegistrantManager::protected_ports(&entry),
             )
         }) else {
             return Ok(false);
@@ -166,18 +189,21 @@ impl RegistrantManager {
             return Err(non_udp_error(aor, transport));
         }
         if let Some(ip) = local_addr {
-            self.refuse_taken(aor, (ip, ue_port_c))?;
+            self.refuse_taken(aor, &(ip, ports))?;
         }
 
         let Some(mut entry) = self.entries.get_mut(aor) else {
             return Ok(false);
         };
-        if let Some(port) = ue_port_c {
-            let mut pending = self
-                .pending_sa_deletions
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            pending.push((current, port));
+        // Every SA set on the old address goes: the UE deletes its SAs when its
+        // address changes and registers afresh (TS 33.203 7.5).
+        if let Some(ipsec) = entry.ue_ipsec.as_ref() {
+            self.queue_sa_deletions(ipsec.sa_sets.keys().into_iter().map(|key| {
+                super::SaDeletion {
+                    address: current,
+                    key,
+                }
+            }));
         }
         reset_for_new_address(&mut entry, local_addr);
         let awaiting = entry.state == RegistrantState::AwaitingAddress;
@@ -189,15 +215,6 @@ impl RegistrantManager {
             });
         }
         Ok(true)
-    }
-
-    /// Take the SA pairs [`set_local_addr`](Self::set_local_addr) queued.
-    pub(super) fn take_pending_sa_deletions(&self) -> Vec<(Option<IpAddr>, u16)> {
-        let mut pending = self
-            .pending_sa_deletions
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        std::mem::take(&mut *pending)
     }
 
     /// The AoR registering from `query`: the first entry on that address, or
@@ -216,9 +233,7 @@ impl RegistrantManager {
                 (LocalAddrQuery::Socket(socket), Some(own)) => {
                     own == socket.ip()
                         && (socket.port() == plain_port
-                            || entry.ue_ipsec.as_ref().is_some_and(|ipsec| {
-                                socket.port() == ipsec.ue_port_c || socket.port() == ipsec.ue_port_s
-                            }))
+                            || RegistrantManager::protected_ports(entry).contains(&socket.port()))
                 }
                 (_, None) => false,
             })
@@ -238,19 +253,38 @@ impl RegistrantManager {
         counts
     }
 
-    /// Every socket the entries with an address of their own need, per AoR:
-    /// the plain port on that address and, with IPsec, the protected client
-    /// and server ports (TS 33.203 §7.1).
-    pub(super) fn ue_socket_plan(&self, plain_port: u16) -> Vec<(String, Vec<SocketAddr>)> {
+    /// Every socket the entries need opened at run time, per AoR: for an
+    /// entry with an address of its own, the plain port there; with IPsec, its
+    /// protected client ports (all three it rotates through, TS 33.203 7.4.0)
+    /// and server port (TS 33.203 7.1), on its own address or else on the
+    /// process's UE address `process_ue_ip`. A port a configured `listen.udp`
+    /// listener serves is left to it by [`UeSockets`](crate::transport::ue_sockets::UeSockets).
+    pub(super) fn ue_socket_plan(
+        &self,
+        plain_port: u16,
+        process_ue_ip: IpAddr,
+    ) -> Vec<(String, Vec<SocketAddr>)> {
         self.entries
             .iter()
             .filter_map(|entry| {
-                let ip = entry.local_addr?;
-                let mut addrs = vec![SocketAddr::new(ip, plain_port)];
-                if let Some(ipsec) = entry.ue_ipsec.as_ref() {
-                    addrs.push(SocketAddr::new(ip, ipsec.ue_port_c));
-                    addrs.push(SocketAddr::new(ip, ipsec.ue_port_s));
-                }
+                let protected = RegistrantManager::protected_ports(&entry);
+                let ip = match entry.local_addr {
+                    Some(ip) => ip,
+                    // An entry waiting for an address of its own opens none.
+                    None if !protected.is_empty()
+                        && !entry.require_local_addr
+                        && !process_ue_ip.is_unspecified() =>
+                    {
+                        process_ue_ip
+                    }
+                    None => return None,
+                };
+                let mut addrs: Vec<SocketAddr> = entry
+                    .local_addr
+                    .map(|own| SocketAddr::new(own, plain_port))
+                    .into_iter()
+                    .collect();
+                addrs.extend(protected.into_iter().map(|port| SocketAddr::new(ip, port)));
                 Some((entry.aor.clone(), addrs))
             })
             .collect()

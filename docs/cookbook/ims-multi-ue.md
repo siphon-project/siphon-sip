@@ -23,9 +23,10 @@ For a single UE on the process's own address, see
 
 ## Addresses and sockets
 
-Each UE needs three UDP sockets on its address: the plain port (the first
-`listen.udp` port, 5060 by default), and with IPsec its protected client and
-server ports. siphon opens them itself at run time and closes them when the
+Each UE needs five UDP sockets on its address: the plain port (the first
+`listen.udp` port, 5060 by default), and with IPsec its three protected client
+ports (`ue_port_c` and the two above it, rotated through as re-authentication
+replaces SA sets, TS 33.203 7.4.0) and its protected server port. siphon opens them itself at run time and closes them when the
 entry moves or goes. They are bound with `IP_FREEBIND`, so an address does not
 have to be on the host when it is configured; until it is, sends from it fail
 in the kernel (siphon never spoofs a source), the REGISTER times out at
@@ -177,8 +178,10 @@ in `RegistrantChanged` and `outbound_registrations`.
 - **A move does not de-register the old binding.** The old address is usually
   gone already. A registrar keying on `+sip.instance` (RFC 5626, built from
   `imei`) replaces the binding; any other lets it lapse at its Expires.
-- **`registration.remove()` does not tear down an IPsec entry's SAs.** They
-  stay until their hard lifetime runs out, as before.
+- **Refreshes ride the SAs.** A registered UE re-registers over its SA set,
+  and a re-challenge sets up the new set beside the old one before deleting it
+  (see the registrar reference, "Protected re-registration").
+  `registration.remove()` de-registers over the set and then deletes it.
 - **The Contact port is the plain UDP port**, the same for every UE, as for a
   single UE.
 - **Not yet validated against a live IMS core.** The behaviour is unit and

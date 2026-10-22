@@ -241,9 +241,11 @@ pub struct RegistrantAkaConfig {
 /// IPsec sec-agree parameters for a registrant entry (UE side, TS 33.203).
 #[derive(Debug, Deserialize, Clone)]
 pub struct RegistrantIpsecConfig {
-    /// UE protected client port (must also be a `listen.udp` entry).
+    /// UE protected client port. The UE rotates through it and the two ports
+    /// above the higher of `ue_port_c` and `ue_port_s` across authenticated
+    /// re-registrations (TS 33.203 7.4.0); siphon opens all of them.
     pub ue_port_c: u16,
-    /// UE protected server port (must also be a `listen.udp` entry).
+    /// UE protected server port.
     pub ue_port_s: u16,
     /// Offered integrity algorithm: "hmac-sha-1-96" (default), "hmac-md5-96",
     /// or "hmac-sha-256-128".
@@ -302,13 +304,35 @@ impl RegistrantYamlConfig {
                     .to_string(),
             );
         }
-        let mut seen: std::collections::HashMap<(std::net::IpAddr, Option<u16>), &str> =
-            std::collections::HashMap::new();
+        // Per address: the protected ports each entry there holds or may
+        // offer (its three client ports and server port), or none.
+        let mut seen: Vec<(std::net::IpAddr, Vec<u16>, &str)> = Vec::new();
         for entry in &self.entries {
             if let Some(pair) = entry.refresh_window {
                 crate::registrant::RefreshWindow::from_pair(pair)
                     .map_err(|reason| format!("registrant.entries[{}].{reason}", entry.aor))?;
             }
+            let ports: Vec<u16> = match entry.ipsec.as_ref() {
+                Some(ipsec) => {
+                    if let Some(problem) = crate::registrant::protected::protected_ports_problem(
+                        ipsec.ue_port_c,
+                        ipsec.ue_port_s,
+                    ) {
+                        return Err(format!(
+                            "registrant.entries[{}].ipsec: {problem}",
+                            entry.aor
+                        ));
+                    }
+                    let mut ports = crate::registrant::protected::protected_client_ports(
+                        ipsec.ue_port_c,
+                        ipsec.ue_port_s,
+                    )
+                    .to_vec();
+                    ports.push(ipsec.ue_port_s);
+                    ports
+                }
+                None => Vec::new(),
+            };
             let Some(local_addr) = entry.local_addr else {
                 continue;
             };
@@ -318,17 +342,19 @@ impl RegistrantYamlConfig {
                     entry.aor, entry.transport
                 ));
             }
-            let key = (
-                local_addr,
-                entry.ipsec.as_ref().map(|ipsec| ipsec.ue_port_c),
-            );
-            if let Some(holder) = seen.insert(key, &entry.aor) {
+            let holder = seen.iter().find(|(address, theirs, _)| {
+                *address == local_addr
+                    && (ports.is_empty() && theirs.is_empty()
+                        || ports.iter().any(|port| theirs.contains(port)))
+            });
+            if let Some((_, _, holder)) = holder {
                 return Err(format!(
-                    "registrant.entries[{}].local_addr {local_addr} (ue_port_c {:?}) is already \
-                     used by {holder}",
-                    entry.aor, key.1
+                    "registrant.entries[{}].local_addr {local_addr} (protected ports {ports:?}) \
+                     is already used by {holder}",
+                    entry.aor
                 ));
             }
+            seen.push((local_addr, ports, &entry.aor));
         }
         Ok(())
     }

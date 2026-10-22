@@ -20,7 +20,9 @@
 #   1. every UE reaches `registered`
 #   2. 4 x N xfrm states in the UE namespace
 #   3. N distinct contact hosts at the S-CSCF (GET /admin/registrations)
-#   4. refreshes spread over refresh_window (from the script's event lines)
+#   4. refreshes spread over refresh_window (from the script's event lines),
+#      sent over each UE's SA set: still 4 x N xfrm states after them (a
+#      protected refresh the S-CSCF accepts installs no new set)
 #   5. the /32s are replaced by a shifted set and the address file rewritten:
 #      every UE re-registers from its new address, no restart
 #   6. optional (CALL_TEST=1, needs sipp): one call from UE 1 to UE 2 through
@@ -464,6 +466,7 @@ main() {
     check_contacts 0
     report_process "$ue_pid"
     check_refresh_spread
+    check_xfrm
 
     log "moving every UE: /32s shifted by $ADDR_SHIFT, address file rewritten"
     assign_addresses "$ADDR_SHIFT"

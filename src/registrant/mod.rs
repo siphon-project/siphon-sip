@@ -19,6 +19,7 @@ pub mod aka;
 pub mod entry_config;
 pub mod messages;
 pub mod pacing;
+pub mod protected;
 mod refresh;
 pub mod source;
 mod status;
@@ -27,6 +28,7 @@ pub(crate) mod test_support;
 
 pub use messages::{BuiltRegister, EgressDefaults};
 pub use pacing::RefreshWindow;
+pub use protected::{SaDeletion, UeExchange, UeSaKey, UeSaSets};
 pub use refresh::{deregister_all, registration_loop, RegistrationLoopContext};
 pub use status::RegistrantStatus;
 
@@ -184,20 +186,30 @@ pub struct ImsContactParams {
 
 /// UE-side IPsec sec-agree parameters for an AKA registration (3GPP TS 33.203).
 ///
-/// `ue_port_c`/`ue_port_s` are the UE's protected client/server ports — they
-/// must be declared as `listen.udp` entries so siphon can source the protected
-/// REGISTER from `ue_port_c` and receive MT requests on `ue_port_s`. The
-/// transform (`aalg`/`ealg`) is what the UE offers in Security-Client.
+/// `ue_port_c`/`ue_port_s` are the UE's protected client/server ports: the
+/// protected REGISTER leaves from a client port and MT requests arrive on
+/// `ue_port_s`. The client port changes on every authenticated
+/// re-registration while the server port stays (TS 33.203 §7.4.0), so the UE
+/// rotates through three client ports, [`client_ports`](Self::client_ports);
+/// siphon opens the sockets for all of them. The transform (`aalg`/`ealg`) is
+/// what the UE offers in Security-Client.
 ///
 /// `spi_uc`/`spi_us` and `ck`/`ik` are per-handshake runtime state: SPIs are
 /// freshly allocated each initial REGISTER (and echoed in Security-Client), and
 /// CK/IK are filled from the AKA challenge before the SAs are installed.
 #[derive(Debug, Clone)]
 pub struct UeIpsec {
-    /// UE protected client port (also a `listen.udp` listener).
+    /// The UE protected client port offered in the latest Security-Client:
+    /// the one the SA set being negotiated uses. One of
+    /// [`client_ports`](Self::client_ports).
     pub ue_port_c: u16,
-    /// UE protected server port (also a `listen.udp` listener).
+    /// UE protected server port, the same for every SA set.
     pub ue_port_s: u16,
+    /// The protected client ports the UE rotates through, the configured
+    /// `ue_port_c` first (see [`protected::protected_client_ports`]).
+    pub client_ports: [u16; 3],
+    /// The SA sets the UE holds and the REGISTER exchange in flight.
+    pub sa_sets: UeSaSets,
     /// Chosen integrity algorithm for the SA (the preferred one until the
     /// P-CSCF picks one in Security-Server, see [`record_server_answer`]).
     pub aalg: IntegrityAlgorithm,
@@ -252,6 +264,8 @@ impl UeIpsec {
         Self {
             ue_port_c,
             ue_port_s,
+            client_ports: protected::protected_client_ports(ue_port_c, ue_port_s),
+            sa_sets: UeSaSets::default(),
             aalg,
             offered_aalgs: offered_integrity_algs(aalg),
             ealg,
@@ -302,12 +316,16 @@ impl UeIpsec {
     }
 
     /// Forget the current sec-agree handshake (SPIs, CK/IK, the P-CSCF's
-    /// answer) and go back to offering the preferred transform, so the next
-    /// REGISTER starts a fresh one. For an entry that moved to another address.
+    /// answer) and the SA sets, and go back to offering the preferred
+    /// transform from the first client port, so the next REGISTER starts a
+    /// fresh one. For an entry that moved to another address; the caller
+    /// queues the SA sets for deletion first.
     pub fn reset_handshake(&mut self) {
         if let Some(preferred) = self.offered_aalgs.first().copied() {
             self.aalg = preferred;
         }
+        self.ue_port_c = self.client_ports[0];
+        self.sa_sets = UeSaSets::default();
         self.spi_uc = 0;
         self.spi_us = 0;
         self.ck = None;
@@ -681,11 +699,17 @@ pub struct RegistrantManager {
     /// them. Holds finished messages rather than live entries, so a removed
     /// trunk is gone from `entries` immediately.
     pending_deregistrations: std::sync::Mutex<Vec<BuiltRegister>>,
-    /// UE SA pairs to tear down, `(ue_addr, ue_port_c)`, queued when an entry
-    /// moves off an address (see [`address`]). `None` for the address is the
-    /// process's own UE address, resolved by the loop. The manager has no
-    /// kernel access; the loop holds the IPsec manager.
-    pending_sa_deletions: std::sync::Mutex<Vec<(Option<IpAddr>, u16)>>,
+    /// UE SA pairs to tear down: an entry moved off an address (see
+    /// [`address`]), a superseded or abandoned SA set (see [`protected`]), a
+    /// removed entry's sets. The manager has no kernel access; the loop and the
+    /// dispatcher drain this into the IPsec manager.
+    pending_sa_deletions: std::sync::Mutex<Vec<SaDeletion>>,
+    /// The SA sets of removed entries, deleted once their protected
+    /// de-REGISTER is answered or times out (see [`protected`]).
+    teardowns: std::sync::Mutex<Vec<protected::Teardown>>,
+    /// The kernel the UE SAs live in, installed by [`registration_loop`]: lets
+    /// a REGISTER check that the SA set it would ride is still there.
+    ipsec: std::sync::OnceLock<Arc<IpsecManager>>,
     /// Serialises the address-uniqueness check with the write it guards, so
     /// two concurrent adds cannot both claim one address.
     address_lock: std::sync::Mutex<()>,
@@ -734,6 +758,8 @@ impl RegistrantManager {
             egress: std::sync::OnceLock::new(),
             pending_deregistrations: std::sync::Mutex::new(Vec::new()),
             pending_sa_deletions: std::sync::Mutex::new(Vec::new()),
+            teardowns: std::sync::Mutex::new(Vec::new()),
+            ipsec: std::sync::OnceLock::new(),
             address_lock: std::sync::Mutex::new(()),
             refresh_window: RefreshWindow::HALF,
             max_registers_per_sec: None,
@@ -870,7 +896,8 @@ impl RegistrantManager {
     pub fn remove(&self, aor: &str) -> Option<RegistrantEntry> {
         let deregistration = self.build_deregistration(aor);
         let removed = self.entries.remove(aor).map(|(_, entry)| entry);
-        if removed.is_some() {
+        if let Some(entry) = removed.as_ref() {
+            self.retire_sa_sets(entry, deregistration.as_ref());
             if let Some(message) = deregistration {
                 match self.pending_deregistrations.lock() {
                     Ok(mut pending) => pending.push(message),
@@ -938,7 +965,10 @@ impl RegistrantManager {
         entry.next_attempt = Instant::now();
 
         info!(aor = %entry.aor, "registrant updated from source");
-        self.entries.insert(entry.aor.clone(), entry);
+        if let Some(replaced) = self.entries.insert(entry.aor.clone(), entry) {
+            // The replacement starts a fresh handshake; the old one's SAs go.
+            self.retire_sa_sets(&replaced, None);
+        }
         true
     }
 
@@ -1065,18 +1095,13 @@ impl RegistrantManager {
 
     /// Components for the UE→P-CSCF SA flow, used to build a `Flow` the B2BUA
     /// can dial over for MO calls: `(pcscf_addr, pcscf_port_s, ue_port_c)`.
-    /// Returns `None` until the handshake recorded a Security-Server (i.e.
-    /// `pcscf_port_s` is set). The MO B-leg sends to `pcscf_addr:pcscf_port_s`
-    /// sourced from `ue_port_c`, so it rides the established SA.
+    /// Returns `None` until an SA set is established. The MO B-leg sends to
+    /// `pcscf_addr:pcscf_port_s` sourced from the established set's client
+    /// port, so it rides that set.
     pub fn ue_flow_components(&self, aor: &str) -> Option<(IpAddr, u16, u16)> {
         self.entries.get(aor).and_then(|entry| {
-            entry.ue_ipsec.as_ref().and_then(|ipsec| {
-                if ipsec.pcscf_port_s == 0 {
-                    None
-                } else {
-                    Some((entry.destination.ip(), ipsec.pcscf_port_s, ipsec.ue_port_c))
-                }
-            })
+            Self::established_ports(&entry)
+                .map(|(ue_port_c, pcscf_port_s)| (entry.destination.ip(), pcscf_port_s, ue_port_c))
         })
     }
 
@@ -1146,6 +1171,7 @@ impl RegistrantManager {
     /// were rather than resetting.
     pub fn handle_failure(&self, aor: &str, status_code: u16, retry_after: Option<Duration>) {
         if let Some(mut entry) = self.entries.get_mut(aor) {
+            self.abandon_ipsec_exchange(&mut entry);
             entry.state = RegistrantState::Failed;
             entry.failure_count += 1;
             entry.last_failure_status = Some(status_code);

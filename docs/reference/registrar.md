@@ -90,13 +90,45 @@ Limits:
   gone, so nothing could carry the de-REGISTER. A registrar that keys on
   `+sip.instance` (RFC 5626, built from `imei`) replaces the binding with the
   new one; any other lets it lapse at its Expires.
-- **`remove()` of an IPsec entry leaves its SAs installed** until their hard
-  lifetime runs out, as it always has.
-- **Three sockets per IPsec UE** (plain, protected client, protected server),
-  so the descriptor limit has to cover three per UE plus the base set.
+- **Five sockets per IPsec UE** (plain, three protected client ports, protected
+  server), so the descriptor limit has to cover five per UE plus the base set.
 - **The Contact port is the plain UDP port**, the first `listen.udp` port, as
   for a single UE.
 - **Identity overlay:** an MT request that arrives on a per-UE socket is
   answered with that socket's own address in Contact and Via, not
   `advertised_address`, and the per-UE addresses count as this node when Route
   entries are consumed.
+
+### Protected re-registration (IMS UE)
+
+A registered IPsec entry re-registers and de-registers over the SA set it
+holds (TS 24.229 5.1.1.4, 5.1.1.6): from its protected client port to the
+P-CSCF's protected server port, with the Authorization of its last
+authentication, the Security-Server of that 401 in Security-Verify, and new SA
+parameters in Security-Client. The Via names the protected server port.
+
+- **Not challenged:** the 200 extends the set's lifetime to the grant plus 32 s,
+  never shortening it. No new SA.
+- **Challenged:** the new set is installed beside the old one on another
+  protected client port (TS 33.203 7.4.0: the client port changes, the server
+  port stays) and the authenticated REGISTER rides it. At its 200 the new set
+  takes over; the old one stays for the P-CSCF until the answer to the next
+  REGISTER arrives over the new one, then goes (TS 33.203 7.4.1a).
+- **Failed or unanswered (Timer F):** the new set, if any, goes and the next
+  REGISTER is an unprotected one (TS 24.229 5.1.1.4.1). Its authentication
+  deletes the set kept from before. A set the kernel no longer holds also sends
+  the next REGISTER unprotected.
+- **`remove()`:** the protected de-REGISTER goes out and the SAs are deleted
+  when it is answered, or after Timer F.
+
+The UE rotates through three protected client ports: `ue_port_c` and the two
+above the higher of `ue_port_c` and `ue_port_s` (6100/6101 uses 6100, 6102 and
+6103). Three, because it holds at most two sets at rest and a P-CSCF refuses an
+offered client port one of its sets still uses (TS 33.203 7.1). siphon opens
+them itself, on the entry's address or the process's. A protected port of 0,
+5060 or 5061, or two entries on one address sharing any protected port, is
+refused.
+
+Not covered: an AUTS re-synchronisation still installs a set from the previous
+keys instead of answering over the existing set without one (TS 24.229
+5.1.1.5.3), and SAs are left to their hard lifetime at shutdown.

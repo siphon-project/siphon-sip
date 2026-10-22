@@ -27,6 +27,24 @@ pub(super) fn handle_registrant_response(
     registrant: &Arc<crate::registrant::RegistrantManager>,
     message: &SipMessage,
     status_code: u16,
+    branch: &str,
+    state: &DispatcherState,
+) {
+    handle_answer(registrant, message, status_code, branch, state);
+    // The SA sets the answer superseded, abandoned or finished with.
+    if let Some(ipsec) = state.ipsec_manager.as_ref() {
+        crate::registrant::protected::spawn_sa_deletions(
+            registrant.take_pending_sa_deletions(),
+            ipsec,
+            state.local_addr.ip(),
+        );
+    }
+}
+
+fn handle_answer(
+    registrant: &Arc<crate::registrant::RegistrantManager>,
+    message: &SipMessage,
+    status_code: u16,
     _branch: &str,
     state: &DispatcherState,
 ) {
@@ -42,7 +60,13 @@ pub(super) fn handle_registrant_response(
     let aor = match registrant.find_by_call_id(&call_id) {
         Some(aor) => aor,
         None => {
-            debug!(call_id = %call_id, "registrant response: no matching entry");
+            // The answer to the de-REGISTER of a removed entry: its SA sets
+            // go now (TS 24.229 5.1.1.6.1). Any final answer ends it.
+            if status_code >= 200 && registrant.finish_teardown(&call_id) {
+                debug!(call_id = %call_id, "removed registrant's de-REGISTER answered, SA sets deleted");
+            } else {
+                debug!(call_id = %call_id, "registrant response: no matching entry");
+            }
             return;
         }
     };
@@ -85,27 +109,45 @@ pub(super) fn handle_registrant_response(
                 );
             }
 
-            // IPsec: tighten the kernel SA hard-lifetime from the placeholder
-            // installed on the 401 path down to the registrar's granted Expires
-            // (+ RFC 3261 Timer F grace), so the SAs track the registration
-            // lifetime (TS 33.203 §7.4).
+            // IPsec: settle the SA sets the exchange produced (TS 33.203
+            // 7.4.1a), then set the established set's lifetime to the
+            // registration's plus Timer F grace, never shorter than what the
+            // set it took over from had left (TS 24.229 5.1.1.5.1; the
+            // lifetime of an SA is never decreased).
             if is_aka && registrant.is_ipsec_entry(&aor) {
-                if let (Some(ipsec_manager), Some(ue_port_c)) = (
+                if let (Some(ipsec_manager), Some(concluded)) = (
                     state.ipsec_manager.clone(),
-                    registrant.ue_protected_client_port(&aor),
+                    registrant.conclude_ipsec_exchange(&aor),
                 ) {
                     // The entry's own address when it has one: the SAs were
                     // installed there (see `handle_registrant_ipsec_challenge`).
                     let ue_addr = registrant
                         .ue_addr(&aor)
                         .unwrap_or_else(|| state.local_addr.ip());
-                    let hard_lifetime = (expires as u64) + 32;
+                    let granted = (expires as u64) + 32;
                     tokio::spawn(async move {
+                        let remaining = |port: u16| {
+                            ipsec_manager
+                                .remaining_lifetime_secs(&ue_addr, port)
+                                .unwrap_or(0)
+                        };
+                        let own = if concluded.keeps_own_lifetime {
+                            remaining(concluded.established.ue_port_c)
+                        } else {
+                            0
+                        };
+                        let hard_lifetime = granted
+                            .max(own)
+                            .max(concluded.previous.map_or(0, |key| remaining(key.ue_port_c)));
                         if let Err(error) = ipsec_manager
-                            .update_sa_pair_lifetime(&ue_addr, ue_port_c, Some(hard_lifetime))
+                            .update_sa_pair_lifetime(
+                                &ue_addr,
+                                concluded.established.ue_port_c,
+                                Some(hard_lifetime),
+                            )
                             .await
                         {
-                            warn!(%error, "IPsec UE: failed to tighten SA lifetime");
+                            warn!(%error, "IPsec UE: failed to set the SA lifetime");
                         }
                     });
                 }
@@ -282,6 +324,16 @@ pub(super) fn handle_registrant_ipsec_challenge(
         }
     };
 
+    // The temporary set this REGISTER rides, alongside any established one
+    // (TS 33.203 7.4.1a); a retiring set goes, the 401 having arrived over
+    // its successor.
+    let authorization = retry_message
+        .headers
+        .get("Authorization")
+        .cloned()
+        .unwrap_or_default();
+    registrant.begin_authentication(aor, &authorization);
+
     let data = bytes::Bytes::from(retry_message.to_bytes());
     let outbound = state.outbound.clone();
     // Sent from the task below, past `send_outbound_from`'s capture.
@@ -298,14 +350,11 @@ pub(super) fn handle_registrant_ipsec_challenge(
                 return;
             }
         };
-        // Re-REGISTER rekey: tear down any prior SA pair on the same UE
-        // protected client port before installing the new one. The UE keeps
-        // fixed protected ports, so old and new cannot overlap (their XFRM
-        // policy selectors would collide) — delete-before-install avoids the
-        // collision and the leak; no-op on the first registration. (Full
-        // TS 33.203 §6.3 old/new overlap would need fresh ports per
-        // registration, i.e. runtime listener binding.)
-        let _ = ipsec_manager.delete_sa_pair(&ue_addr, ue_port_c).await;
+        // Make before break: the new set goes on a client port no held set
+        // uses (TS 33.203 7.4.0), so it installs beside the established one,
+        // which keeps protecting everything but this authentication. A stale
+        // pair on the same port (an earlier attempt) is replaced by the
+        // install.
         if let Err(error) = ipsec_manager.create_ue_sa_pair(sa).await {
             warn!(aor = %aor_task, %error, "IPsec UE: SA install failed, protected REGISTER not sent");
             registrant_task.handle_failure(&aor_task, 0, None);
@@ -367,3 +416,7 @@ pub(super) fn collect_route_set(message: &SipMessage, header_name: &str) -> Vec<
 #[cfg(test)]
 #[path = "registrant_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "registrant_protected_tests.rs"]
+mod protected_tests;

@@ -120,8 +120,10 @@ async fn a_ue_on_its_own_address_installs_its_sas_and_sends_protected_from_there
     );
     let raw = String::from_utf8_lossy(&protected.data).into_owned();
     assert!(raw.contains("Security-Verify:"), "{raw}");
+    // A REGISTER protected by an SA set names the protected server port in
+    // its Via (TS 24.229 5.1.1.4.2 c), where the P-CSCF answers it.
     assert!(
-        raw.contains(&format!("Via: SIP/2.0/UDP {UE_ADDR}:5060;")),
+        raw.contains(&format!("Via: SIP/2.0/UDP {UE_ADDR}:6101;")),
         "{raw}"
     );
 
