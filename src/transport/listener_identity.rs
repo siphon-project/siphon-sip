@@ -47,6 +47,12 @@ impl ListenerRegistry {
     /// listener of the same family and port, and step 3 names that interface
     /// address, the one the peer demonstrably reached.
     pub fn identity(&self, transport: Transport, local: SocketAddr) -> Option<(String, u16)> {
+        // A per-UE socket opened at run time names itself: it is one UE's
+        // address, and the global `advertised_address` is the process's, so a
+        // Contact or Via built from that would send the UE's traffic elsewhere.
+        if self.is_dynamic(transport, local) {
+            return Some((format_sip_host(&local.ip().to_string()), local.port()));
+        }
         let advertise = self.listener_advertise(transport, local)?;
         let port = advertise
             .and_then(|advertise| advertise.port)
@@ -62,6 +68,9 @@ impl ListenerRegistry {
     /// host: the `advertise` port when it names one, else `local`'s own port.
     /// `None` when `local` belongs to no listener.
     pub fn identity_port(&self, transport: Transport, local: SocketAddr) -> Option<u16> {
+        if self.is_dynamic(transport, local) {
+            return Some(local.port());
+        }
         let advertise = self.listener_advertise(transport, local)?;
         Some(
             advertise

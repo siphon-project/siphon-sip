@@ -306,6 +306,7 @@ fn with_stream_egress(proxy: Proxy, stream_sender: flume::Sender<OutboundMessage
     state.outbound = Arc::new(OutboundRouter {
         udp: udp_sender.into(),
         udp_by_local: std::collections::HashMap::new(),
+        udp_dynamic: None,
         tcp: stream_sender.clone(),
         tls: stream_sender.clone(),
         ws: stream_sender.clone(),

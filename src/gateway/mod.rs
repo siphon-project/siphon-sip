@@ -1943,6 +1943,7 @@ pub(crate) mod tests {
         let router = Arc::new(OutboundRouter {
             udp: udp_tx.into(),
             udp_by_local: std::collections::HashMap::new(),
+            udp_dynamic: None,
             tcp: tcp_tx,
             tls: tls_tx,
             ws: ws_tx,
@@ -2007,6 +2008,7 @@ pub(crate) mod tests {
         let router = Arc::new(OutboundRouter {
             udp: udp_tx.into(),
             udp_by_local: std::collections::HashMap::new(),
+            udp_dynamic: None,
             tcp: tcp_tx,
             tls: tls_tx,
             ws: ws_tx,

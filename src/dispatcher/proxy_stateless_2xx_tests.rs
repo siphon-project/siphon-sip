@@ -272,6 +272,7 @@ async fn every_answer_reaches_a_caller_on_a_stream_over_its_own_connection() {
     dispatcher.state.outbound = Arc::new(OutboundRouter {
         udp: udp_sender.into(),
         udp_by_local: std::collections::HashMap::new(),
+        udp_dynamic: None,
         tcp: tcp_sender,
         tls: other_sender.clone(),
         ws: other_sender.clone(),

@@ -454,3 +454,26 @@ def test_originate_refuses_a_bad_member_and_reports_an_experimental_result():
     assert answer.result_code is None
     assert answer.experimental_result_code == 5001
     assert not answer.is_error
+
+
+def test_avp_flags_and_unknown_mandatory_avps_answer_5001():
+    req = mock_module.MockDiameterRequest(
+        application_name="Gx", command_name="CCR",
+        avps={(2847, 10415): 1},
+        unknown_avps=[(64000, 10415, b"\x00", True), (64001, 10415, b"\x00", False)],
+    )
+    known = req.avps()[0]
+    assert known.mandatory and known.vendor_specific and known.flags == 0xC0
+
+    unknown = req.unknown_avps()
+    assert [(avp.code, avp.name, avp.mandatory, avp.flags) for avp in unknown] == [
+        (64000, None, True, 0xC0), (64001, None, False, 0x80),
+    ]
+
+    refusal = req.reject_unsupported_avps()
+    assert refusal.result_code == 5001
+    assert not refusal.is_error
+    assert refusal.get_avp(279) == [(64000, b"\x00", 10415)]
+
+    assert req.reject_unsupported_avps(understood=[(64000, 10415)]) is None
+    assert mock_module.MockDiameterRequest().reject_unsupported_avps() is None

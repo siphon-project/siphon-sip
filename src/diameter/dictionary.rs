@@ -655,139 +655,6 @@ static AVP_TABLE: &[AvpDef] = &[
         name: "SHA-256-Indication",
         data_type: AvpType::Enumerated,
     },
-    // Rx (TS 29.214)
-    AvpDef {
-        code: 500,
-        vendor_id: TGPP,
-        name: "Abort-Cause",
-        data_type: AvpType::Enumerated,
-    },
-    AvpDef {
-        code: 501,
-        vendor_id: TGPP,
-        name: "Access-Network-Charging-Address",
-        data_type: AvpType::Address,
-    },
-    AvpDef {
-        code: 502,
-        vendor_id: TGPP,
-        name: "Access-Network-Charging-Identifier",
-        data_type: AvpType::Grouped,
-    },
-    AvpDef {
-        code: 504,
-        vendor_id: TGPP,
-        name: "AF-Application-Identifier",
-        data_type: AvpType::OctetString,
-    },
-    AvpDef {
-        code: 505,
-        vendor_id: TGPP,
-        name: "AF-Charging-Identifier",
-        data_type: AvpType::OctetString,
-    },
-    AvpDef {
-        code: 507,
-        vendor_id: TGPP,
-        name: "Flow-Description",
-        data_type: AvpType::OctetString,
-    },
-    AvpDef {
-        code: 508,
-        vendor_id: TGPP,
-        name: "Flow-Grouping",
-        data_type: AvpType::Grouped,
-    },
-    AvpDef {
-        code: 509,
-        vendor_id: TGPP,
-        name: "Flow-Number",
-        data_type: AvpType::Unsigned32,
-    },
-    AvpDef {
-        code: 510,
-        vendor_id: TGPP,
-        name: "Flows",
-        data_type: AvpType::Grouped,
-    },
-    AvpDef {
-        code: 511,
-        vendor_id: TGPP,
-        name: "Flow-Status",
-        data_type: AvpType::Enumerated,
-    },
-    AvpDef {
-        code: 512,
-        vendor_id: TGPP,
-        name: "Flow-Usage",
-        data_type: AvpType::Enumerated,
-    },
-    AvpDef {
-        code: 513,
-        vendor_id: TGPP,
-        name: "Specific-Action",
-        data_type: AvpType::Enumerated,
-    },
-    AvpDef {
-        code: 515,
-        vendor_id: TGPP,
-        name: "Max-Requested-Bandwidth-DL",
-        data_type: AvpType::Unsigned32,
-    },
-    AvpDef {
-        code: 516,
-        vendor_id: TGPP,
-        name: "Max-Requested-Bandwidth-UL",
-        data_type: AvpType::Unsigned32,
-    },
-    AvpDef {
-        code: 517,
-        vendor_id: TGPP,
-        name: "Media-Component-Description",
-        data_type: AvpType::Grouped,
-    },
-    AvpDef {
-        code: 518,
-        vendor_id: TGPP,
-        name: "Media-Component-Number",
-        data_type: AvpType::Unsigned32,
-    },
-    AvpDef {
-        code: 519,
-        vendor_id: TGPP,
-        name: "Media-Sub-Component",
-        data_type: AvpType::Grouped,
-    },
-    AvpDef {
-        code: 520,
-        vendor_id: TGPP,
-        name: "Media-Type",
-        data_type: AvpType::Enumerated,
-    },
-    AvpDef {
-        code: 524,
-        vendor_id: TGPP,
-        name: "Codec-Data",
-        data_type: AvpType::OctetString,
-    },
-    AvpDef {
-        code: 525,
-        vendor_id: TGPP,
-        name: "Service-URN",
-        data_type: AvpType::OctetString,
-    },
-    AvpDef {
-        code: 527,
-        vendor_id: TGPP,
-        name: "Service-Info-Status",
-        data_type: AvpType::Enumerated,
-    },
-    AvpDef {
-        code: 533,
-        vendor_id: TGPP,
-        name: "Rx-Request-Type",
-        data_type: AvpType::Enumerated,
-    },
     // Cx/Dx (TS 29.228/229)
     AvpDef {
         code: 600,
@@ -1382,242 +1249,6 @@ static AVP_TABLE: &[AvpDef] = &[
         name: "Address-Type",
         data_type: AvpType::Enumerated,
     },
-    // Gx (TS 29.212) — codes per 3GPP / HSS crate reference
-    AvpDef {
-        code: 1000,
-        vendor_id: TGPP,
-        name: "Bearer-Usage",
-        data_type: AvpType::Enumerated,
-    },
-    AvpDef {
-        code: 1001,
-        vendor_id: TGPP,
-        name: "Charging-Rule-Install",
-        data_type: AvpType::Grouped,
-    },
-    AvpDef {
-        code: 1002,
-        vendor_id: TGPP,
-        name: "Charging-Rule-Remove",
-        data_type: AvpType::Grouped,
-    },
-    AvpDef {
-        code: 1003,
-        vendor_id: TGPP,
-        name: "Charging-Rule-Definition",
-        data_type: AvpType::Grouped,
-    },
-    AvpDef {
-        code: 1004,
-        vendor_id: TGPP,
-        name: "Charging-Rule-Base-Name",
-        data_type: AvpType::UTF8String,
-    },
-    AvpDef {
-        code: 1005,
-        vendor_id: TGPP,
-        name: "Charging-Rule-Name",
-        data_type: AvpType::OctetString,
-    },
-    AvpDef {
-        code: 1006,
-        vendor_id: TGPP,
-        name: "Event-Trigger",
-        data_type: AvpType::Enumerated,
-    },
-    AvpDef {
-        code: 1007,
-        vendor_id: TGPP,
-        name: "Metering-Method",
-        data_type: AvpType::Enumerated,
-    },
-    AvpDef {
-        code: 1008,
-        vendor_id: TGPP,
-        name: "Offline",
-        data_type: AvpType::Enumerated,
-    },
-    AvpDef {
-        code: 1009,
-        vendor_id: TGPP,
-        name: "Online",
-        data_type: AvpType::Enumerated,
-    },
-    AvpDef {
-        code: 1010,
-        vendor_id: TGPP,
-        name: "Precedence",
-        data_type: AvpType::Unsigned32,
-    },
-    AvpDef {
-        code: 1011,
-        vendor_id: TGPP,
-        name: "Reporting-Level",
-        data_type: AvpType::Enumerated,
-    },
-    AvpDef {
-        code: 1013,
-        vendor_id: TGPP,
-        name: "TFT-Packet-Filter-Information",
-        data_type: AvpType::Grouped,
-    },
-    AvpDef {
-        code: 1014,
-        vendor_id: TGPP,
-        name: "ToS-Traffic-Class",
-        data_type: AvpType::OctetString,
-    },
-    AvpDef {
-        code: 1016,
-        vendor_id: TGPP,
-        name: "QoS-Information",
-        data_type: AvpType::Grouped,
-    },
-    AvpDef {
-        code: 1018,
-        vendor_id: TGPP,
-        name: "Charging-Rule-Report",
-        data_type: AvpType::Grouped,
-    },
-    AvpDef {
-        code: 1019,
-        vendor_id: TGPP,
-        name: "PCC-Rule-Status",
-        data_type: AvpType::Enumerated,
-    },
-    AvpDef {
-        code: 1020,
-        vendor_id: TGPP,
-        name: "Bearer-Identifier",
-        data_type: AvpType::OctetString,
-    },
-    AvpDef {
-        code: 1021,
-        vendor_id: TGPP,
-        name: "Bearer-Operation",
-        data_type: AvpType::Enumerated,
-    },
-    AvpDef {
-        code: 1022,
-        vendor_id: TGPP,
-        name: "Access-Network-Charging-Identifier-Gx",
-        data_type: AvpType::Grouped,
-    },
-    AvpDef {
-        code: 1023,
-        vendor_id: TGPP,
-        name: "Bearer-Control-Mode",
-        data_type: AvpType::Enumerated,
-    },
-    AvpDef {
-        code: 1024,
-        vendor_id: TGPP,
-        name: "Network-Request-Support",
-        data_type: AvpType::Enumerated,
-    },
-    AvpDef {
-        code: 1025,
-        vendor_id: TGPP,
-        name: "Guaranteed-Bitrate-DL",
-        data_type: AvpType::Unsigned32,
-    },
-    AvpDef {
-        code: 1026,
-        vendor_id: TGPP,
-        name: "Guaranteed-Bitrate-UL",
-        data_type: AvpType::Unsigned32,
-    },
-    AvpDef {
-        code: 1027,
-        vendor_id: TGPP,
-        name: "IP-CAN-Type",
-        data_type: AvpType::Enumerated,
-    },
-    AvpDef {
-        code: 1028,
-        vendor_id: TGPP,
-        name: "QoS-Class-Identifier",
-        data_type: AvpType::Enumerated,
-    },
-    AvpDef {
-        code: 1031,
-        vendor_id: TGPP,
-        name: "Rule-Failure-Code",
-        data_type: AvpType::Enumerated,
-    },
-    AvpDef {
-        code: 1032,
-        vendor_id: TGPP,
-        name: "RAT-Type",
-        data_type: AvpType::Enumerated,
-    },
-    AvpDef {
-        code: 1034,
-        vendor_id: TGPP,
-        name: "Allocation-Retention-Priority",
-        data_type: AvpType::Grouped,
-    },
-    AvpDef {
-        code: 1040,
-        vendor_id: TGPP,
-        name: "APN-Aggregate-Max-Bitrate-DL",
-        data_type: AvpType::Unsigned32,
-    },
-    AvpDef {
-        code: 1041,
-        vendor_id: TGPP,
-        name: "APN-Aggregate-Max-Bitrate-UL",
-        data_type: AvpType::Unsigned32,
-    },
-    AvpDef {
-        code: 1045,
-        vendor_id: TGPP,
-        name: "Session-Release-Cause",
-        data_type: AvpType::Enumerated,
-    },
-    AvpDef {
-        code: 1046,
-        vendor_id: TGPP,
-        name: "Priority-Level",
-        data_type: AvpType::Unsigned32,
-    },
-    AvpDef {
-        code: 1047,
-        vendor_id: TGPP,
-        name: "Pre-emption-Capability",
-        data_type: AvpType::Enumerated,
-    },
-    AvpDef {
-        code: 1048,
-        vendor_id: TGPP,
-        name: "Pre-emption-Vulnerability",
-        data_type: AvpType::Enumerated,
-    },
-    AvpDef {
-        code: 1049,
-        vendor_id: TGPP,
-        name: "Default-EPS-Bearer-QoS",
-        data_type: AvpType::Grouped,
-    },
-    AvpDef {
-        code: 1050,
-        vendor_id: TGPP,
-        name: "AN-GW-Address",
-        data_type: AvpType::Address,
-    },
-    // The packet filters of a PCC rule (TS 29.212 clauses 5.3.53 and 5.3.65).
-    AvpDef {
-        code: 1058,
-        vendor_id: TGPP,
-        name: "Flow-Information",
-        data_type: AvpType::Grouped,
-    },
-    AvpDef {
-        code: 1080,
-        vendor_id: TGPP,
-        name: "Flow-Direction",
-        data_type: AvpType::Enumerated,
-    },
     // SMS-Information envelope: Recipient-Address (TS 32.299 §7.2.155)
     AvpDef {
         code: 1201,
@@ -2175,15 +1806,28 @@ static AVP_TABLE: &[AvpDef] = &[
 ///
 /// Uses binary search on the static table (sorted by vendor_id, then code).
 pub fn lookup_avp(code: u32, vendor_id: u32) -> Option<&'static AvpDef> {
+    if vendor_id == VENDOR_3GPP {
+        if let Some(entry) = policy::lookup(code) {
+            return Some(&entry.definition);
+        }
+    }
     AVP_TABLE
         .binary_search_by(|entry| entry.vendor_id.cmp(&vendor_id).then(entry.code.cmp(&code)))
         .ok()
         .map(|idx| &AVP_TABLE[idx])
 }
 
+/// Every definition: the main table, then the policy and charging control
+/// AVPs of TS 29.212 and TS 29.214 ([`policy`]).
+fn all_definitions() -> impl Iterator<Item = &'static AvpDef> {
+    AVP_TABLE
+        .iter()
+        .chain(policy::POLICY_AVPS.iter().map(|entry| &entry.definition))
+}
+
 /// Look up an AVP definition by name (linear scan — use sparingly).
 pub fn lookup_by_name(name: &str) -> Option<&'static AvpDef> {
-    AVP_TABLE.iter().find(|entry| entry.name == name)
+    all_definitions().find(|entry| entry.name == name)
 }
 
 /// Look up an AVP definition by a Python-style kwarg name. Translates
@@ -2204,7 +1848,7 @@ pub fn lookup_avp_by_python_name(name: &str) -> Option<&'static AvpDef> {
         let fold = |byte: u8| if byte == b'_' { b'-' } else { byte };
         fold(left).eq_ignore_ascii_case(&fold(right))
     };
-    AVP_TABLE.iter().find(|entry| {
+    all_definitions().find(|entry| {
         entry.name.len() == name.len()
             && entry
                 .name
@@ -2221,9 +1865,14 @@ pub fn lookup_avp_by_python_name(name: &str) -> Option<&'static AvpDef> {
 /// Firmware-Revision (267), Product-Name (269), Error-Message (281) and
 /// Error-Reporting-Host (294). The AVPs of IMS restoration, which TS 29.229
 /// Table 6.3.1 lists with "V" under Must and "M" under Must not, go without
-/// it too.
+/// it too. A Gx or Rx AVP goes with the bit its table gives it ([`policy`]).
 pub fn avp_is_mandatory(code: u32, vendor_id: u32) -> bool {
     const ERROR_REPORTING_HOST: u32 = 294;
+    if vendor_id == VENDOR_3GPP {
+        if let Some(entry) = policy::lookup(code) {
+            return entry.mandatory;
+        }
+    }
     match vendor_id {
         VENDOR_3GPP => !matches!(
             code,
@@ -2236,17 +1885,6 @@ pub fn avp_is_mandatory(code: u32, vendor_id: u32) -> bool {
                 | avp::PCSCF_SUBSCRIPTION_INFO
                 | avp::REGISTRATION_TIME_OUT
                 | avp::FAILED_PCSCF..=avp::PCSCF_IP_ADDRESS
-                // TS 29.212 table 5.3.1 and TS 29.214 table 5.3.1: V must,
-                // M must not. S6a overrides it for RAT-Type (TS 29.272 table
-                // 7.3.1/2), which its own encoder sets.
-                | avp::RX_REQUEST_TYPE
-                | avp::RAT_TYPE
-                | avp::ALLOCATION_RETENTION_PRIORITY
-                | avp::APN_AGGREGATE_MAX_BITRATE_DL
-                | avp::APN_AGGREGATE_MAX_BITRATE_UL
-                | avp::PRIORITY_LEVEL..=avp::AN_GW_ADDRESS
-                | avp::FLOW_INFORMATION
-                | avp::FLOW_DIRECTION
         ),
         0 => !matches!(
             code,
@@ -2265,7 +1903,7 @@ pub fn avp_name(code: u32) -> Option<&'static str> {
 
 /// Total number of AVP definitions in the dictionary.
 pub fn avp_count() -> usize {
-    AVP_TABLE.len()
+    AVP_TABLE.len() + policy::POLICY_AVPS.len()
 }
 
 // ── Application IDs ──────────────────────────────────────────────────────
@@ -2573,6 +2211,10 @@ pub const DIAMETER_NO_COMMON_APPLICATION: u32 = 5010;
 pub const DIAMETER_UNABLE_TO_COMPLY: u32 = 5012;
 /// RFC 6733 §7.1.5: a request for a session the receiver does not hold.
 pub const DIAMETER_UNKNOWN_SESSION_ID: u32 = 5002;
+/// RFC 6733 section 7.1.5: an AVP with the M bit the receiver does not
+/// support. The same number as DIAMETER_ERROR_USER_UNKNOWN, which TS 29.229
+/// sends as an Experimental-Result-Code.
+pub const DIAMETER_AVP_UNSUPPORTED: u32 = 5001;
 /// Malformed AVP length on an inbound message (RFC 6733 §7.1.5).
 pub const DIAMETER_INVALID_AVP_LENGTH: u32 = 5014;
 pub const DIAMETER_ERROR_USER_UNKNOWN: u32 = 5001;
@@ -2740,6 +2382,7 @@ pub fn result_code_is_success(code: u32) -> bool {
 // ── AVP Codes (for encoding) ─────────────────────────────────────────────
 
 pub mod avp;
+mod policy;
 
 #[cfg(test)]
 mod tests {
@@ -2779,6 +2422,93 @@ mod tests {
             avp::IP_CAN_TYPE,
         ] {
             assert!(avp_is_mandatory(code, VENDOR_3GPP), "AVP {code}");
+        }
+    }
+
+    /// The AVPs a PCRF used to write as raw octets, and the 3GPP-* ones the
+    /// Gx and Rx re-used tables take over, each with the code, type and M bit
+    /// of its Rel-18 table: TS 29.212 and TS 29.214 table 5.3.0.1, TS 29.061
+    /// table 9a.
+    #[test]
+    fn policy_avps_have_the_code_type_and_m_bit_of_their_table() {
+        for (name, code, data_type, mandatory) in [
+            ("Revalidation-Time", 1042, AvpType::Time, true),
+            ("Rule-Activation-Time", 1043, AvpType::Time, true),
+            ("Rule-Deactivation-Time", 1044, AvpType::Time, true),
+            ("3GPP-PS-Data-Off-Status", 2847, AvpType::Enumerated, false),
+            (
+                "Usage-Monitoring-Information",
+                1067,
+                AvpType::Grouped,
+                false,
+            ),
+            ("Monitoring-Key", 1066, AvpType::OctetString, false),
+            ("Packet-Filter-Information", 1061, AvpType::Grouped, false),
+            ("RR-Bandwidth", 521, AvpType::Unsigned32, true),
+            ("RS-Bandwidth", 522, AvpType::Unsigned32, true),
+            ("SIP-Forking-Indication", 523, AvpType::Enumerated, true),
+            ("Acceptable-Service-Info", 526, AvpType::Grouped, true),
+            (
+                "Min-Requested-Bandwidth-DL",
+                534,
+                AvpType::Unsigned32,
+                false,
+            ),
+            (
+                "Min-Requested-Bandwidth-UL",
+                535,
+                AvpType::Unsigned32,
+                false,
+            ),
+            ("AF-Signalling-Protocol", 529, AvpType::Enumerated, false),
+            (
+                "Access-Network-Charging-Identifier-Value",
+                503,
+                AvpType::OctetString,
+                true,
+            ),
+            ("Content-Version", 552, AvpType::Unsigned64, false),
+            ("3GPP-SGSN-MCC-MNC", 18, AvpType::UTF8String, false),
+            ("3GPP-User-Location-Info", 22, AvpType::OctetString, false),
+            ("3GPP-MS-TimeZone", 23, AvpType::OctetString, false),
+        ] {
+            let definition = lookup_by_name(name).unwrap_or_else(|| panic!("{name} is defined"));
+            assert_eq!(
+                (definition.code, definition.vendor_id),
+                (code, VENDOR_3GPP),
+                "{name}"
+            );
+            assert_eq!(definition.data_type, data_type, "{name}");
+            assert_eq!(
+                lookup_avp(code, VENDOR_3GPP).map(|found| found.name),
+                Some(name)
+            );
+            assert_eq!(avp_is_mandatory(code, VENDOR_3GPP), mandatory, "{name}");
+        }
+        assert_eq!(
+            lookup_avp_by_python_name("revalidation_time").map(|found| found.code),
+            Some(1042)
+        );
+    }
+
+    #[test]
+    fn the_policy_table_is_sorted_and_shares_no_code_with_the_main_table() {
+        for pair in policy::POLICY_AVPS.windows(2) {
+            assert!(
+                pair[0].definition.code < pair[1].definition.code,
+                "policy table not sorted at {}",
+                pair[1].definition.name
+            );
+        }
+        for entry in policy::POLICY_AVPS {
+            let code = entry.definition.code;
+            assert!(
+                !AVP_TABLE
+                    .iter()
+                    .any(|main| main.vendor_id == VENDOR_3GPP && main.code == code),
+                "{} is defined twice",
+                entry.definition.name
+            );
         }
     }
 

@@ -669,6 +669,7 @@ impl Call {
         state.outbound = Arc::new(OutboundRouter {
             udp: to_others.into(),
             udp_by_local: std::collections::HashMap::from([(caller_listener, to_caller.into())]),
+            udp_dynamic: None,
             tcp: to_stream.clone(),
             tls: to_stream.clone(),
             ws: to_stream.clone(),
@@ -807,6 +808,7 @@ async fn a_stream_flow_dial_advertises_the_public_listener_and_keeps_its_connect
         dispatcher.state.outbound = Arc::new(OutboundRouter {
             udp: router.udp.clone(),
             udp_by_local: router.udp_by_local.clone(),
+            udp_dynamic: router.udp_dynamic.clone(),
             tcp: sender.clone(),
             tls: sender.clone(),
             ws: sender.clone(),

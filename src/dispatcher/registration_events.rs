@@ -63,7 +63,8 @@ impl RegistrarChange {
 }
 
 /// One registrant (outbound REGISTER) delivery: which AoR, what happened
-/// (`registered`, `refreshed`, `failed`, `deregistered`, or [`SNAPSHOT`]), and
+/// (`registered`, `refreshed`, `failed`, `deregistered`, `awaiting_address`,
+/// or [`SNAPSHOT`]), and
 /// the status a `failed` carried.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RegistrantChange {
@@ -79,6 +80,7 @@ impl RegistrantChange {
             RegistrantEvent::Refreshed { aor } => (aor, "refreshed", None),
             RegistrantEvent::Failed { aor, status_code } => (aor, "failed", Some(status_code)),
             RegistrantEvent::Deregistered { aor } => (aor, "deregistered", None),
+            RegistrantEvent::AwaitingAddress { aor } => (aor, "awaiting_address", None),
         };
         Self {
             aor,

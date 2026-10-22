@@ -190,13 +190,27 @@ pub fn pop_top_route(headers: &mut SipHeaders) -> Option<RouteEntry> {
 pub struct SelfIdentity {
     /// `(host, ports)`.  An empty `ports` means "any port" (an alias).
     entries: Vec<(String, Vec<u16>)>,
+    /// UDP sockets opened at run time for per-UE outbound registrations: each
+    /// is an address siphon answers on, though none is known at startup. Only
+    /// asked when no static entry matched.
+    dynamic_udp: Option<std::sync::Arc<crate::transport::ue_sockets::UeSockets>>,
 }
 
 impl SelfIdentity {
     pub fn new() -> Self {
         Self {
             entries: Vec::new(),
+            dynamic_udp: None,
         }
+    }
+
+    /// Also recognise every run-time per-UE socket (host and port, or the host
+    /// alone for a Route with no port).
+    pub fn set_dynamic_udp(
+        &mut self,
+        dynamic_udp: Option<std::sync::Arc<crate::transport::ue_sockets::UeSockets>>,
+    ) {
+        self.dynamic_udp = dynamic_udp;
     }
 
     fn normalise(host: &str) -> String {
@@ -260,7 +274,22 @@ impl SelfIdentity {
                 Some(_) => continue,
             }
         }
-        false
+        self.matches_dynamic(&candidate, port)
+    }
+
+    /// The run-time half of [`matches`](Self::matches): `host` is an IP a
+    /// per-UE socket is bound to, on `port` when one is given.
+    fn matches_dynamic(&self, host: &str, port: Option<u16>) -> bool {
+        let Some(dynamic) = &self.dynamic_udp else {
+            return false;
+        };
+        let Ok(ip) = host.parse::<std::net::IpAddr>() else {
+            return false;
+        };
+        match port {
+            Some(port) => dynamic.contains(&std::net::SocketAddr::new(ip, port)),
+            None => dynamic.contains_ip(ip),
+        }
     }
 
     pub fn is_empty(&self) -> bool {

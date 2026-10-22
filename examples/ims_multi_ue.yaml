@@ -1,0 +1,66 @@
+# ---------------------------------------------------------------------------
+# Many IMS UEs in one process. Every UE registers into an IMS core as a
+# handset (IMS-AKA over IPsec sec-agree, 3GPP TS 33.203) from an address of
+# its own, and a plain-SIP tester calls through any of them both ways:
+#
+#     tester  <--plain SIP-->  siphon (UE 1..n)  <--IPsec / IMS-AKA-->  P-CSCF
+#
+# The UEs are added by the script (examples/ims_multi_ue.py), from an inline
+# list or the CSV in $MULTI_UE_CSV, and moved when their address changes.
+#
+# Run (CAP_NET_ADMIN is needed for the kernel IPsec SAs):
+#     sudo -E env "PATH=$PATH" PYO3_PYTHON=python3 \
+#         cargo run --release -- --config examples/ims_multi_ue.yaml
+#
+# Per-UE addresses need NO listen.udp entries: siphon opens three UDP sockets
+# per UE at run time, on (address, 5060), (address, ue_port_c) and
+# (address, ue_port_s), bound with IP_FREEBIND so the address does not have to
+# be on the host yet. Until it is, sends from it fail in the kernel and the
+# UE retries with backoff. UDP only.
+#
+# Count file descriptors: 3 per IPsec UE, so 1000 UEs need a `ulimit -n` well
+# above 3000.
+# ---------------------------------------------------------------------------
+
+server:
+  instance_id: "${POD_NAME:-ims-multi-ue-0}"
+
+# The process's own address: the tester talks to it, and nothing registers
+# from it (every UE has require_local_addr).
+advertised_address: "${PROCESS_IP:-192.0.2.20}"
+
+listen:
+  udp:
+    # Plain SIP toward the tester. Its port is also the plain port every UE
+    # registers from (Contact port) on its own address.
+    - "${PROCESS_IP:-192.0.2.20}:5060"
+
+domain:
+  local:
+    - "${PROCESS_IP:-192.0.2.20}"
+
+script:
+  path: "examples/ims_multi_ue.py"
+  reload: auto
+
+# Enables the IpsecManager the UE-side SAs are installed through. `netlink`
+# needs CAP_NET_ADMIN; `ip` shells out to /sbin/ip xfrm. A P-CSCF on the same
+# kernel needs a different `spi_range_start` from the UE side.
+ipsec:
+  backend: "${IPSEC_BACKEND:-netlink}"
+
+registrant:
+  # Refresh each binding at a uniform draw between 40 % and 60 % of the
+  # granted Expires, so UEs registered together do not refresh together.
+  refresh_window: [0.4, 0.6]
+  # At most 20 new REGISTERs a second, initial, refresh and retry alike. The
+  # REGISTER answering a 401 is never held back.
+  max_registers_per_sec: 20
+  # The UEs are added by the script, so the default (1024, or 4 per configured
+  # entry) does not grow with them. Size it for the fleet.
+  event_capacity: 4096
+  retry_interval: 30
+  max_retry_interval: 300
+
+log:
+  level: info

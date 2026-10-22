@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import ipaddress
+import math
 import re
 import sys
 import time
@@ -7865,7 +7866,9 @@ class MockLi:
 class MockRegistration:
     """Mock outbound registration namespace.
 
-    Manages outbound REGISTER bindings to upstream carriers/SBCs.
+    Manages outbound REGISTER bindings to upstream carriers/SBCs, and the
+    soft-UE case of one process registering many IMS UEs, each from its own
+    address (``local_addr``).
 
     Example::
 
@@ -7877,11 +7880,41 @@ class MockRegistration:
 
         for reg in registration.list():
             log.info(f"{reg['aor']}: {reg['state']}")
+
+    Many UEs, each from its own address::
+
+        # One entry per UE. The protected ports may repeat across entries:
+        # the SAs are told apart by address.
+        registration.add(
+            "sip:001010000000001@ims.mnc01.mcc001.3gppnetwork.org",
+            "sip:198.51.100.10:5060",
+            user="001010000000001@ims.mnc01.mcc001.3gppnetwork.org",
+            auth="aka", k=k, opc=opc,
+            ipsec=True, ue_port_c=6100, ue_port_s=6101,
+            local_addr="192.0.2.77",
+            refresh_window=(0.4, 0.6),   # spread refreshes over the fleet
+        )
+        registration.set_local_addr(impu, "192.0.2.78")   # the UE moved
+        aor = registration.find_by_local(call.flow.local_addr)  # MT: which UE?
+        log.info(str(registration.counts()))
     """
+
+    #: Every state ``status()`` / ``list()`` / ``counts()`` can report.
+    STATES: tuple[str, ...] = (
+        "unregistered",
+        "registering",
+        "challenging",
+        "registered",
+        "failed",
+        "awaiting_address",
+    )
 
     def __init__(self) -> None:
         self._entries: dict[str, dict] = {}
         self._sequence: int = 0
+        # The plain (unprotected) SIP port an entry with a local_addr uses:
+        # siphon's first UDP listener port. 5060 in the mock; a test can set it.
+        self._plain_port: int = 5060
 
     def add(self, aor: str, registrar: str, *, user: str, password: str = "",
             interval: Optional[int] = None, realm: Optional[str] = None,
@@ -7892,8 +7925,11 @@ class MockRegistration:
             ipsec: bool = False, ue_port_c: Optional[int] = None,
             ue_port_s: Optional[int] = None, ipsec_alg: Optional[str] = None,
             ipsec_ealg: Optional[str] = None, imei: Optional[str] = None,
-            ims_features: Optional[list[str]] = None) -> None:
-        """Add a new outbound registration.
+            ims_features: Optional[list[str]] = None,
+            local_addr: Optional[str] = None,
+            require_local_addr: bool = False,
+            refresh_window: Optional[tuple[float, float]] = None) -> None:
+        """Add a new outbound registration (re-adding an AoR replaces it).
 
         Args:
             aor: Address-of-Record (e.g. "sip:alice@carrier.com"). For IMS AKA
@@ -7926,12 +7962,46 @@ class MockRegistration:
                 "hmac-md5-96", or "hmac-sha-256-128" (a siphon extension, not
                 a 3GPP Annex H transform).
             ipsec_ealg: Offered encryption algorithm — "null" (default) or "aes-cbc".
+            imei: IMEI for the Contact +sip.instance (urn:gsma:imei), e.g.
+                "01234567-000001-0". None: no instance tag.
+            ims_features: Contact feature tags to advertise: any of "mmtel",
+                "video", "smsip".
+            local_addr: The IP this entry registers from (an address, no
+                port): the Via/Contact host, the UDP source, and with ipsec
+                the UE side of its SAs. siphon opens the sockets itself, so
+                the address need not exist on the host yet. UDP only. None
+                (default): the process's own address.
+            require_local_addr: Never register from the process's address.
+                Without a local_addr the entry waits in state
+                "awaiting_address" until :meth:`set_local_addr` gives it one.
+                Implied by local_addr.
+            refresh_window: ``(low, high)`` fractions of the granted Expires
+                to refresh within, drawn per refresh, with
+                ``0 < low <= high < 1``. Must be a tuple. None: the
+                registrant default (half the grant).
 
         Raises:
             ValueError: when `transport` is not udp/tcp/tls; when auth="aka"
-                but `k` or an operator key (`op`/`opc`) is missing; or when
-                ipsec=True without auth="aka" / ue_port_c / ue_port_s —
-                mirroring the Rust binding.
+                but `k` or an operator key (`op`/`opc`) is missing; when
+                ipsec=True without auth="aka" / ue_port_c / ue_port_s; when
+                `local_addr` is not an IP address, or is given with a
+                transport other than udp; when another AoR already registers
+                from the same ``(local_addr, ue_port_c)`` (``ue_port_c`` is
+                None without ipsec, so two non-ipsec entries cannot share an
+                address); or when `refresh_window` breaks
+                ``0 < low <= high < 1`` — mirroring the Rust binding.
+            TypeError: when `refresh_window` is not a tuple of two numbers.
+
+        Example::
+
+            # A UE whose address is not known yet: it waits, never
+            # registering from the process's own address.
+            registration.add(impu, "sip:198.51.100.10:5060", user=impi,
+                             auth="aka", k=k, opc=opc,
+                             ipsec=True, ue_port_c=6100, ue_port_s=6101,
+                             require_local_addr=True)
+            assert registration.status(impu) == "awaiting_address"
+            registration.set_local_addr(impu, "192.0.2.77")
         """
         if transport is not None and transport.lower() not in ("udp", "tcp", "tls"):
             raise ValueError(
@@ -7951,6 +8021,16 @@ class MockRegistration:
                 raise ValueError("ipsec=True requires ue_port_c")
             if ue_port_s is None:
                 raise ValueError("ipsec=True requires ue_port_s")
+        address = None if local_addr is None else self._parse_ip(local_addr, "local_addr")
+        window = None if refresh_window is None else self._check_refresh_window(refresh_window)
+        normalized_transport = (transport or "udp").lower()
+        if address is not None and normalized_transport != "udp":
+            raise ValueError(self._non_udp_error(aor, normalized_transport))
+        port_c = ue_port_c if ipsec else None
+        if address is not None:
+            self._refuse_taken(aor, address, port_c)
+        requires_address = bool(require_local_addr) or address is not None
+        awaiting = requires_address and address is None
         self._entries[aor] = {
             "aor": aor,
             "registrar": registrar,
@@ -7973,14 +8053,137 @@ class MockRegistration:
             "ipsec_ealg": ipsec_ealg or "null",
             "imei": imei,
             "ims_features": list(ims_features) if ims_features else [],
-            "state": "registered",
-            "expires_in": interval or 3600,
+            "local_addr": address,
+            "require_local_addr": requires_address,
+            "refresh_window": window,
+            "state": "awaiting_address" if awaiting else "registered",
+            "expires_in": 0 if awaiting else (interval or 3600),
             "failure_count": 0,
+            "last_failure_status": None,
             # Captured from the 200 OK on a real run (IMS); empty in the mock.
             "service_route": [],
             "associated_uris": [],
         }
-        self._fire_on_change(aor, "registered")
+        self._fire_on_change(aor, "awaiting_address" if awaiting else "registered")
+
+    def set_local_addr(self, aor: str, local_addr: Optional[str]) -> bool:
+        """Move a registration to another address, or take its address away.
+
+        Args:
+            aor: The registration's AoR.
+            local_addr: The IP it registers from now (no port), or None for
+                none.
+
+        Returns:
+            False when there is no such registration, else True.
+
+        Restating the current address changes nothing (returns True, state
+        untouched), so this can run on a timer for every UE. A real move
+        starts the entry over: state "unregistered" (due now), failure count,
+        Service-Route and P-Associated-URI cleared, and from then on the entry
+        requires an address of its own. ``None`` leaves an entry that has had
+        an address (or was added with ``require_local_addr=True``) in
+        "awaiting_address", firing ``@registration.on_change`` with that
+        event; any other entry falls back to the process's address as
+        "unregistered".
+
+        Raises:
+            ValueError: `local_addr` is not an IP address; another AoR already
+                registers from it with the same ``ue_port_c``; or the entry's
+                transport is not udp.
+
+        Example::
+
+            @timer.every(seconds=30)
+            def follow_addresses():
+                for impu, address in current_ue_addresses().items():
+                    registration.set_local_addr(impu, address)  # None: detached
+        """
+        address = None if local_addr is None else self._parse_ip(local_addr, "local_addr")
+        entry = self._entries.get(aor)
+        if entry is None:
+            return False
+        if entry.get("local_addr") == address:
+            return True
+        if address is not None and entry["transport"].lower() != "udp":
+            raise ValueError(self._non_udp_error(aor, entry["transport"].lower()))
+        if address is not None:
+            self._refuse_taken(aor, address, entry["ue_port_c"] if entry["ipsec"] else None)
+            entry["require_local_addr"] = True
+        entry["local_addr"] = address
+        awaiting = address is None and entry.get("require_local_addr", False)
+        entry["state"] = "awaiting_address" if awaiting else "unregistered"
+        entry["expires_in"] = 0
+        entry["failure_count"] = 0
+        entry["last_failure_status"] = None
+        entry["service_route"] = []
+        entry["associated_uris"] = []
+        if awaiting:
+            self._fire_on_change(aor, "awaiting_address")
+        return True
+
+    def find_by_local(self, local: str) -> Optional[str]:
+        """The AoR registering from an address, for routing an MT request to
+        the UE it arrived for.
+
+        Args:
+            local: ``"ip"``, ``"ip:port"`` or ``"[v6]:port"``, e.g.
+                ``call.flow.local_addr``. With a port: the entry on that
+                address owning that port (its plain port, the first UDP
+                listener port, 5060 in the mock; or its ``ue_port_c`` /
+                ``ue_port_s``). Without a port: the first entry on the
+                address.
+
+        Returns:
+            The AoR, or None when no entry registers from there.
+
+        Raises:
+            ValueError: `local` is not an IP address or IP:port.
+
+        Example::
+
+            @b2bua.on_invite
+            def on_invite(call):
+                impu = registration.find_by_local(call.flow.local_addr)
+                if impu is None:
+                    call.reject(404, "Not Found")
+                    return
+                call.dial(route_for(impu))
+        """
+        address, port = self._parse_local(local)
+        for entry in self._entries.values():
+            own = entry.get("local_addr")
+            if own is None or own != address:
+                continue
+            if port is None:
+                return entry["aor"]
+            owned = {self._plain_port}
+            if entry.get("ipsec"):
+                owned.update((entry.get("ue_port_c"), entry.get("ue_port_s")))
+            if port in owned:
+                return entry["aor"]
+        return None
+
+    def counts(self) -> dict[str, int]:
+        """How many registrations are in each state.
+
+        Returns:
+            A dict with every state as a key (``"unregistered"``,
+            ``"registering"``, ``"challenging"``, ``"registered"``,
+            ``"failed"``, ``"awaiting_address"``), zero when none is in it.
+
+        Example::
+
+            @timer.every(seconds=60)
+            def report():
+                states = registration.counts()
+                ue_registered.set(states["registered"])
+                ue_waiting.set(states["awaiting_address"])
+        """
+        result = {state: 0 for state in self.STATES}
+        for entry in self._entries.values():
+            result[entry["state"]] = result.get(entry["state"], 0) + 1
+        return result
 
     def remove(self, aor: str) -> bool:
         """Remove an outbound registration by AoR."""
@@ -7997,15 +8200,38 @@ class MockRegistration:
         """List all registrations with their current state.
 
         Returns:
-            List of dicts with keys: aor, state, expires_in.
+            List of dicts with keys: ``aor``, ``state``, ``expires_in``,
+            ``local_addr`` (str, or None on the process's address),
+            ``failure_count`` (int) and ``last_failure_status`` (int, or
+            None once an attempt succeeded).
+
+        Example::
+
+            for reg in registration.list():
+                if reg["state"] == "failed":
+                    log.warn(f"{reg['aor']} from {reg['local_addr']}: "
+                             f"{reg['last_failure_status']} "
+                             f"x{reg['failure_count']}")
         """
         return [
-            {"aor": e["aor"], "state": e["state"], "expires_in": e["expires_in"]}
-            for e in self._entries.values()
+            {
+                "aor": entry["aor"],
+                "state": entry["state"],
+                "expires_in": entry["expires_in"],
+                "local_addr": entry.get("local_addr"),
+                "failure_count": entry.get("failure_count", 0),
+                "last_failure_status": entry.get("last_failure_status"),
+            }
+            for entry in self._entries.values()
         ]
 
     def status(self, aor: str) -> Optional[str]:
-        """Get the state of a specific registration."""
+        """Get the state of a specific registration.
+
+        Returns:
+            One of :attr:`STATES` (including ``"awaiting_address"``), or None
+            when the AoR is unknown.
+        """
         entry = self._entries.get(aor)
         return entry["state"] if entry else None
 
@@ -8025,20 +8251,49 @@ class MockRegistration:
         entry = self._entries.get(aor)
         return list(entry.get("associated_uris", [])) if entry else []
 
-    def flow(self, aor: str, ue_ip: str):
+    def flow(self, aor: str, ue_ip: Optional[str] = None) -> "Optional[Flow]":
         """A :class:`Flow` over the UE→P-CSCF IPsec SA for MO ``call.dial``.
 
-        Real runtime returns ``None`` until the sec-agree handshake completes;
-        the mock returns a Flow whenever the entry was added with
-        ``ipsec=True`` (so MO handlers can be unit-tested), else ``None``.
+        Args:
+            aor: The registration's AoR.
+            ue_ip: siphon's own address on the SA (the IP the protected ports
+                are bound to). Defaults to the entry's ``local_addr``;
+                required for an entry without one.
+
+        Returns:
+            The Flow, or None for an unknown AoR. Real runtime also returns
+            None until the sec-agree handshake completes; the mock returns a
+            Flow whenever the entry was added with ``ipsec=True`` (so MO
+            handlers can be unit-tested), else None.
+
+        Raises:
+            ValueError: `ue_ip` is not an IP address, or is omitted for an
+                entry without a ``local_addr``.
+
+        Example::
+
+            flow = registration.flow(impu)   # the entry's own local_addr
+            if flow is None:
+                call.reject(503, "Service Unavailable")
+            else:
+                call.dial(target, flow=flow)
         """
         entry = self._entries.get(aor)
+        if ue_ip is not None:
+            address = self._parse_ip(ue_ip, "ue_ip")
+        elif entry is None:
+            return None
+        elif entry.get("local_addr") is None:
+            raise ValueError(f"{aor} registers from the process's address: pass ue_ip")
+        else:
+            address = entry["local_addr"]
         if not entry or not entry.get("ipsec"):
             return None
         from .types import Flow
+        host = f"[{address}]" if ":" in address else address
         return Flow(
             transport="udp",
-            local_addr=f"{ue_ip}:{entry.get('ue_port_c')}",
+            local_addr=f"{host}:{entry.get('ue_port_c')}",
         )
 
     @staticmethod
@@ -8048,7 +8303,10 @@ class MockRegistration:
         The handler receives ``(aor, event_type, state)`` where:
           - ``aor``: str -- Address of Record (e.g. "sip:trunk@carrier.com")
           - ``event_type``: str -- ``"registered"``, ``"refreshed"``,
-            ``"failed"``, ``"deregistered"``, or ``"snapshot"``
+            ``"failed"``, ``"deregistered"``, ``"awaiting_address"`` (the
+            entry needs an address of its own and has none: added with
+            ``require_local_addr=True`` and no ``local_addr``, or its address
+            taken away with ``set_local_addr(aor, None)``), or ``"snapshot"``
           - ``state``: dict -- ``{"expires_in": int, "failure_count": int,
             "registrar": str, "state": str | None, "sequence": int,
             "status_code": int}`` (``sequence`` is a per-process number, one
@@ -8059,7 +8317,8 @@ class MockRegistration:
             and on a ``"snapshot"`` of a registration whose last attempt
             failed; ``state`` is the registration's current state,
             ``"unregistered"``, ``"registering"``, ``"challenging"``,
-            ``"registered"`` or ``"failed"``, ``None`` once it was removed)
+            ``"registered"``, ``"failed"`` or ``"awaiting_address"``,
+            ``None`` once it was removed)
 
         ``"snapshot"`` is not a change: when the handler fell so far behind
         that events were lost, siphon re-reports every outbound registration
@@ -8069,7 +8328,8 @@ class MockRegistration:
 
             @registration.on_change
             def on_trunk_change(aor, event_type, state):
-                ...
+                if event_type == "awaiting_address":
+                    log.warn(f"{aor} has no address to register from")
         """
         is_async = asyncio.iscoroutinefunction(fn)
         _registry.register("registration.on_change", None, fn, is_async)
@@ -8081,6 +8341,90 @@ class MockRegistration:
         self._entries.clear()
         for aor in aors:
             self._fire_on_change(aor, "deregistered")
+
+    @staticmethod
+    def _parse_ip(text: str, argument: str) -> str:
+        """Normalise an IP argument, naming the argument in the error."""
+        try:
+            return str(ipaddress.ip_address(str(text).strip()))
+        except ValueError:
+            raise ValueError(f"{argument} '{text}' is not an IP address") from None
+
+    @staticmethod
+    def _parse_local(text: str) -> tuple[str, Optional[int]]:
+        """Parse ``ip``, ``[v6]``, ``ip:port`` or ``[v6]:port`` like the
+        runtime's LocalAddrQuery: ``(normalised ip, port or None)``."""
+        value = str(text).strip()
+        error = ValueError(f"'{value}' is not an IP address or IP:port")
+        if value.startswith("["):
+            closing = value.find("]")
+            if closing < 0:
+                raise error
+            host, rest = value[1:closing], value[closing + 1:]
+            if rest == "":
+                port_text = None
+            elif rest.startswith(":"):
+                port_text = rest[1:]
+            else:
+                raise error
+            try:
+                address = ipaddress.IPv6Address(host)
+            except ValueError:
+                raise error from None
+        else:
+            try:
+                return str(ipaddress.ip_address(value)), None
+            except ValueError:
+                pass
+            host, separator, port_text = value.rpartition(":")
+            if not separator:
+                raise error
+            try:
+                address = ipaddress.IPv4Address(host)
+            except ValueError:
+                raise error from None
+        if port_text is None:
+            return str(address), None
+        if not port_text.isdigit() or int(port_text) > 65535:
+            raise error
+        return str(address), int(port_text)
+
+    @staticmethod
+    def _check_refresh_window(window: Any) -> tuple[float, float]:
+        """Validate ``(low, high)`` as the runtime's RefreshWindow does."""
+        if not isinstance(window, tuple) or len(window) != 2:
+            raise TypeError("refresh_window must be a (low, high) tuple")
+        low, high = float(window[0]), float(window[1])
+        if (not (math.isfinite(low) and math.isfinite(high))
+                or low <= 0.0 or high >= 1.0 or low > high):
+            raise ValueError(
+                f"refresh_window [{low}, {high}] must satisfy 0 < low <= high < 1 "
+                "(fractions of the granted Expires)"
+            )
+        return (low, high)
+
+    @staticmethod
+    def _non_udp_error(aor: str, transport: str) -> str:
+        return (
+            f"{aor}: local_addr needs transport udp, not {transport}: a TCP or TLS "
+            "registration leaves over a pooled connection from an ephemeral source, "
+            "which the address would not name"
+        )
+
+    def _refuse_taken(self, aor: str, address: str, ue_port_c: Optional[int]) -> None:
+        """Raise when another AoR holds ``(address, ue_port_c)``."""
+        for other in self._entries.values():
+            if other["aor"] == aor or other.get("local_addr") != address:
+                continue
+            other_port = other.get("ue_port_c") if other.get("ipsec") else None
+            if other_port != ue_port_c:
+                continue
+            if ue_port_c is None:
+                raise ValueError(f"local_addr {address} is already used by {other['aor']}")
+            raise ValueError(
+                f"local_addr {address} with ue_port_c {ue_port_c} is already used "
+                f"by {other['aor']}"
+            )
 
     def _fire_on_change(self, aor: str, event_type: str, status_code: int | None = None) -> None:
         """Invoke all on_change handlers registered via decorator."""
@@ -8184,9 +8528,18 @@ class MockDiameterAvp:
             number has no name.
         value: The value as ``get_avp`` returns it, or for a grouped AVP a
             list of ``DiameterAvp``.
+        flags: The flags octet of the AVP header: V ``0x80``, M ``0x40``,
+            P ``0x20``. The mock gives every AVP the M bit and, for a
+            non-zero vendor, the V bit, unless the test says otherwise.
+        mandatory: Whether the M bit is set.
+        vendor_specific: Whether the V bit is set.
     """
 
-    def __init__(self, code: Union[int, str], vendor: int, value: Any) -> None:
+    def __init__(self, code: Union[int, str], vendor: int, value: Any,
+                 flags: Optional[int] = None) -> None:
+        if flags is None:
+            flags = 0x40 | (0x80 if vendor else 0)
+        self.flags = flags
         self.code = code
         self.vendor = vendor
         self.name = code if isinstance(code, str) else None
@@ -8196,6 +8549,14 @@ class MockDiameterAvp:
                 for child in value
             ]
         self.value = value
+
+    @property
+    def mandatory(self) -> bool:
+        return bool(self.flags & 0x40)
+
+    @property
+    def vendor_specific(self) -> bool:
+        return bool(self.flags & 0x80)
 
     def __repr__(self) -> str:
         return (f"DiameterAvp(name={self.name!r}, code={self.code!r}, "
@@ -8356,6 +8717,11 @@ class MockDiameterRequest:
     """Mock ``DiameterRequest`` passed to ``@diameter.on_request`` in tests.
 
     Construct one in your test and invoke your handler with it.
+
+    The mock has no dictionary, so the AVPs the real dictionary would not
+    know are given apart, as ``unknown_avps=[(code, vendor, value,
+    mandatory), ...]``: :meth:`unknown_avps` lists them and
+    :meth:`reject_unsupported_avps` refuses the ones with ``mandatory``.
     """
 
     def __init__(self, *, application_name: str = "S6c", command_code: int = 0,
@@ -8363,7 +8729,9 @@ class MockDiameterRequest:
                  dest_realm: Optional[str] = None, dest_host: Optional[str] = None,
                  origin_host: Optional[str] = None, origin_realm: Optional[str] = None,
                  peer: Optional[MockPeer] = None, avps: Optional[dict] = None,
-                 application_id: int = 0) -> None:
+                 application_id: int = 0,
+                 unknown_avps: Optional[list] = None) -> None:
+        self._unknown = [tuple(entry) for entry in (unknown_avps or [])]
         self.application_id = application_id
         self.application_name = application_name
         self.command_code = command_code
@@ -8420,6 +8788,37 @@ class MockDiameterRequest:
 
     def extract_imsi(self) -> Optional[str]:
         return self._avps.get((1, 0))
+
+    def unknown_avps(self) -> list:
+        """The AVPs the dictionary does not define, as :class:`MockDiameterAvp`
+        objects with ``name`` None and ``mandatory`` as given."""
+        return [
+            MockDiameterAvp(code, vendor, value,
+                            flags=(0x40 if mandatory else 0) | (0x80 if vendor else 0))
+            for code, vendor, value, mandatory in self._unknown
+        ]
+
+    def reject_unsupported_avps(self, understood: Optional[list] = None) -> Optional[MockDiameterAnswer]:
+        """The DIAMETER_AVP_UNSUPPORTED (5001) answer, with a Failed-AVP (279)
+        holding every unknown AVP with the M bit that ``understood`` does not
+        list, or ``None`` when there is none (RFC 6733 sections 4.1 and
+        7.1.5). ``understood`` lists codes (vendor 0) or ``(code, vendor)``
+        tuples."""
+        claimed = set()
+        for item in understood or []:
+            if isinstance(item, int):
+                claimed.add((item, 0))
+            elif isinstance(item, tuple) and len(item) == 2:
+                claimed.add((item[0], item[1]))
+            else:
+                raise TypeError("understood lists AVP codes or (code, vendor) tuples")
+        failed = [(code, value, vendor) for code, vendor, value, mandatory in self._unknown
+                  if mandatory and (code, vendor) not in claimed]
+        if not failed:
+            return None
+        answer = self.answer(5001)
+        answer.set_avp(279, failed)
+        return answer
 
     def answer(self, result_code: int = 2001, error_message: Optional[str] = None) -> MockDiameterAnswer:
         """Build a local answer to serve this request (HSS-style). Populate it
@@ -12959,10 +13358,11 @@ class MockQos:
     ``media_components`` structure consumed by ``diameter.rx_aar`` and
     ``sbi.create_session``.
 
-    The mock parses SDP just enough to produce a usable
-    ``media_components`` list with RTP + RTCP sub-components for each
-    ``m=`` section.  Disabled streams (port 0) are skipped and
-    ``a=rtcp-mux`` collapses RTCP into the RTP sub-component.
+    The mock parses SDP just enough to produce the same
+    ``media_components`` list siphon does: one entry per ``m=`` line with
+    RTP + RTCP sub-components, ``a=rtcp-mux`` in offer and answer
+    collapsing RTCP into the RTP one, and the Flow-Status of TS 29.213
+    table 6.2.1 named on every entry.
 
     Example::
 
@@ -12987,7 +13387,28 @@ class MockQos:
                 addresses flipped).
 
         Returns:
-            list[dict]: one entry per non-disabled ``m=`` section.
+            list[dict]: one entry per ``m=`` line.  ``number`` is the ordinal
+            of the ``m=`` line, so a line keeps its number when an earlier
+            one is disabled.
+
+        Every entry names ``flow_status``, derived per TS 29.213 table 6.2.1
+        from the offer and the answer (NOTE 5: the answer's port and
+        direction, but ``a=inactive`` in the offer wins; a media line
+        without a direction attribute takes the session-level one):
+
+        - ``"removed"``: port ``0`` in the offer or the answer.  The entry
+          has no flows.
+        - ``"enabled"``: TCP transport (``TCP``, ``TCP/MSRP``,
+          ``UDP/DTLS/SCTP``), ``a=rtcp-mux`` in offer and answer, or
+          ``a=sendrecv`` / no direction attribute.
+        - ``"disabled"``: ``a=inactive``.
+        - ``"enabled-up"`` / ``"enabled-down"``: ``a=sendonly`` /
+          ``a=recvonly``, read from the side of the SDP that carries it
+          (``sendonly`` in the UE's SDP is uplink, in the network's SDP
+          downlink; ``recvonly`` the other way round).
+
+        ``"enabled"`` is named, not left out: on an update an absent
+        Flow-Status means "unchanged" (TS 29.214 §5.3.16).
 
         Each sub-component carries two descriptions, uplink first
         (TS 29.214 clause 5.3.8: ``in`` is the uplink flow, ``out`` the
@@ -13012,9 +13433,17 @@ class MockQos:
             )
 
         results: list[dict] = []
-        component_number = 0
-        for offer_m, answer_m in zip(offer_sdp.media, answer_sdp.media):
-            if offer_m.port == 0 or answer_m.port == 0:
+        for component_number, (offer_m, answer_m) in enumerate(
+                zip(offer_sdp.media, answer_sdp.media), start=1):
+            status = _table_flow_status(offer_sdp, offer_m, answer_sdp,
+                                        answer_m, direction)
+            if status == "removed":
+                results.append({
+                    "number": component_number,
+                    "media_type": _media_type_alias(offer_m.media_type),
+                    "flow_status": status,
+                    "flows": [],
+                })
                 continue
 
             offer_ip = offer_m.connection_ip or offer_sdp.connection_ip
@@ -13035,10 +13464,10 @@ class MockQos:
 
             proto = _ip_proto(offer_m.protocol)
 
-            component_number += 1
             component: dict = {
                 "number": component_number,
                 "media_type": _media_type_alias(offer_m.media_type),
+                "flow_status": status,
                 "flows": [
                     {
                         "number": 1,
@@ -13049,10 +13478,6 @@ class MockQos:
                     },
                 ],
             }
-
-            status = _ue_flow_status(ue_media)
-            if status is not None:
-                component["flow_status"] = status
 
             mux_agreed = "rtcp-mux" in ue_media.flags and "rtcp-mux" in remote_media.flags
             if not mux_agreed:
@@ -13105,6 +13530,7 @@ class _MiniSdp:
 
     def __init__(self, text: str) -> None:
         self.connection_ip: Optional[str] = None
+        self.flags: set[str] = set()
         self.media: list[_MiniSdpMedia] = []
         current: Optional[_MiniSdpMedia] = None
         for raw in text.splitlines():
@@ -13116,6 +13542,8 @@ class _MiniSdp:
                 current.connection_ip = _parse_c_line(line)
             elif line.startswith("c=") and current is None:
                 self.connection_ip = _parse_c_line(line)
+            elif line.startswith("a=") and current is None:
+                self.flags.add(line[2:].split(":", 1)[0].strip())
             elif line.startswith("a=") and current is not None:
                 attr = line[2:]
                 if ":" in attr:
@@ -13164,14 +13592,44 @@ def _media_type_alias(sdp_media_type: str) -> str:
     return mapping.get(sdp_media_type.lower(), "other")
 
 
-def _ue_flow_status(media: _MiniSdpMedia) -> Optional[str]:
-    if "inactive" in media.flags:
-        return "disabled"
-    if "sendonly" in media.flags:
-        return "enabled-up"
-    if "recvonly" in media.flags:
-        return "enabled-down"
+_DIRECTIONS = ("sendrecv", "sendonly", "recvonly", "inactive")
+
+
+def _media_direction(sdp: _MiniSdp, media: _MiniSdpMedia) -> Optional[str]:
+    """The media line's direction attribute, else the session-level one."""
+    for flags in (media.flags, sdp.flags):
+        for name in _DIRECTIONS:
+            if name in flags:
+                return name
     return None
+
+
+def _is_table_tcp_transport(protocol: str) -> bool:
+    upper = protocol.upper()
+    return upper == "TCP" or upper.startswith("TCP/") or upper == "UDP/DTLS/SCTP"
+
+
+def _table_flow_status(offer_sdp: _MiniSdp, offer: _MiniSdpMedia,
+                       answer_sdp: _MiniSdp, answer: _MiniSdpMedia,
+                       direction: str) -> str:
+    """Flow-Status per TS 29.213 table 6.2.1, as siphon derives it."""
+    if offer.port == 0 or answer.port == 0:
+        return "removed"
+    if _is_table_tcp_transport(offer.protocol) or _is_table_tcp_transport(answer.protocol):
+        return "enabled"
+    if "rtcp-mux" in offer.flags and "rtcp-mux" in answer.flags:
+        return "enabled"
+    if _media_direction(offer_sdp, offer) == "inactive":
+        return "disabled"
+    answer_is_uplink_sdp = direction in ("term", "terminating")
+    attribute = _media_direction(answer_sdp, answer)
+    if attribute == "recvonly":
+        return "enabled-down" if answer_is_uplink_sdp else "enabled-up"
+    if attribute == "sendonly":
+        return "enabled-up" if answer_is_uplink_sdp else "enabled-down"
+    if attribute == "inactive":
+        return "disabled"
+    return "enabled"
 
 
 _qos = MockQos()
