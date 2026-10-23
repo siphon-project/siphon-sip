@@ -5896,6 +5896,7 @@ fn b_leg_flow_yields_to_a_path_route_set() {
         source_addr: "10.0.0.1:50000".parse().unwrap(),
         local_addr: "127.0.0.1:443".parse().unwrap(),
         connection_id: 0xc0ffee,
+        kind: crate::script::api::registrar::FlowKind::Inbound,
     };
     let route = vec!["<sip:TOKEN-A@edge.example.com;lr>".to_string()];
 
@@ -5911,12 +5912,57 @@ fn b_leg_flow_yields_to_a_path_route_set() {
     assert!(b_leg_flow(None, &route).is_none());
 }
 
+#[test]
+fn b_leg_flow_keeps_an_outbound_flow_under_its_route_set() {
+    // A UA's own flow to its first hop: the route set is the UA's, and its
+    // first entry is the far end of that flow, so the two go together.
+    let flow = crate::script::api::registrar::PyFlow {
+        transport: "udp".to_string(),
+        source_addr: "192.0.2.50:5066".parse().unwrap(),
+        local_addr: "192.0.2.10:6100".parse().unwrap(),
+        connection_id: 0,
+        kind: crate::script::api::registrar::FlowKind::Outbound,
+    };
+    let route = vec!["<sip:orig@scscf.example.net;lr>".to_string()];
+    assert!(b_leg_flow(Some(&flow), &route).is_some());
+    assert!(b_leg_flow(Some(&flow), &[]).is_some());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_outbound_flow_is_the_destination_with_a_route_set() {
+    let resolver = test_resolver();
+    let flow = crate::script::api::registrar::PyFlow {
+        transport: "udp".to_string(),
+        source_addr: "192.0.2.50:5066".parse().unwrap(),
+        local_addr: "192.0.2.10:6100".parse().unwrap(),
+        connection_id: 0,
+        kind: crate::script::api::registrar::FlowKind::Outbound,
+    };
+    let route = vec![
+        "<sip:pcscf.invalid:5066;lr>".to_string(),
+        "<sip:orig@scscf.invalid;lr>".to_string(),
+    ];
+    let resolved = resolve_leg_destination(
+        "sip:+15550100@ims.example.net",
+        None,
+        Some(&flow),
+        &route,
+        &resolver,
+    )
+    .expect("the flow is the destination; nothing is resolved");
+    assert_eq!(resolved.flow, Some(&flow));
+    assert_eq!(resolved.destination, flow.source_addr);
+    assert_eq!(resolved.transport, Transport::Udp);
+    assert_eq!(resolved.server_name, None);
+}
+
 fn registered_flow(transport: &str) -> crate::script::api::registrar::PyFlow {
     crate::script::api::registrar::PyFlow {
         transport: transport.to_string(),
         source_addr: "198.51.100.40:50000".parse().unwrap(),
         local_addr: "192.0.2.1:5061".parse().unwrap(),
         connection_id: 0xc0ffee,
+        kind: crate::script::api::registrar::FlowKind::Inbound,
     }
 }
 

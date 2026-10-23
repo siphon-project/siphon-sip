@@ -427,6 +427,7 @@ impl PyRegistration {
                     local_addr: std::net::SocketAddr::new(ue_ip, ue_port_c),
                     // UDP egress is selected by source_local_addr, not conn id.
                     connection_id: 0,
+                    kind: crate::script::api::registrar::FlowKind::Outbound,
                 }
             }))
     }

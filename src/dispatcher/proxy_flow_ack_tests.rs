@@ -92,6 +92,7 @@ async fn a_2xx_ack_to_a_phone_behind_nat_goes_over_the_flow_its_invite_took() {
         source_addr: socket(PHONE_PUBLIC),
         local_addr: socket(SIPHON),
         connection_id: PHONE_CONNECTION,
+        kind: crate::script::api::registrar::FlowKind::Inbound,
     };
 
     let invite = caller_invite();

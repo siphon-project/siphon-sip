@@ -1008,6 +1008,11 @@ class Call:
                 mandatory for a WebSocket callee (RFC 7118 §5) whose Contact
                 URI is unresolvable.  Bypasses DNS resolution of
                 ``uri``/``next_hop``; guard on ``contact.is_local`` first.
+                A callee's flow yields to a ``route=`` set, which is then its
+                Path (RFC 3327 §5.3).  A ``registration.flow(impu)`` is the
+                UE's own SA to the P-CSCF instead: the INVITE always leaves
+                over it, and ``route=`` goes on the wire as Route headers
+                (TS 24.229 §5.1.2A.1.1).
             header_policy: Qualified policy name selecting which header
                 policy the framework applies when building the B-leg
                 INVITE and forwarding responses back to the A-leg.
@@ -1050,10 +1055,14 @@ class Call:
             route: Route header set prepended to the B-leg INVITE *after* the
                 A-leg Route/Record-Route are stripped.  Carries the captured
                 IMS Service-Route on MO calls so the request traverses the
-                originating S-CSCF (RFC 3608) — pass the list returned by
-                ``registration.service_route(impu)``.  Each entry goes out as
-                one ``name-addr`` (RFC 3261 §20.34) whatever form it is
-                written in: a bare URI (``"sip:scscf.example.com:6060;lr"``,
+                originating S-CSCF (RFC 3608).  A UE's route set is the
+                P-CSCF's protected URI followed by the Service-Route (TS 24.229
+                §5.1.2A.1.1): ``[f"<sip:{flow.remote_addr};lr>"] +
+                registration.service_route(impu)``.  With a
+                ``registration.flow()`` the route set rides the flow; with a
+                callee's flow it replaces the flow (see ``flow``).  Each
+                entry goes out as one ``name-addr`` (RFC 3261 §20.34)
+                whatever form it is written in: a bare URI (``"sip:scscf.example.com:6060;lr"``,
                 every parameter the URI's), a bracketed one, a full
                 ``'"Name" <sip:...;lr>;param'``, or a received ``Route`` value
                 with several bracketed entries, which is taken apart at its
