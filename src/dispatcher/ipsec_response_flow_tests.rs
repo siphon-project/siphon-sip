@@ -298,7 +298,10 @@ fn install_unconfigured(ue: SocketAddr) -> crate::ipsec::SecurityAssociationPair
 }
 
 /// `proxy` with its stream egress readable through `stream_sender`'s receiver.
-fn with_stream_egress(proxy: Proxy, stream_sender: flume::Sender<OutboundMessage>) -> Proxy {
+pub(super) fn with_stream_egress(
+    proxy: Proxy,
+    stream_sender: flume::Sender<OutboundMessage>,
+) -> Proxy {
     let Proxy { state, udp } = proxy;
     let mut state = Arc::try_unwrap(state).unwrap_or_else(|_| panic!("the only handle"));
     let (udp_sender, udp_receiver) = flume::unbounded();

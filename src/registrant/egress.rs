@@ -46,7 +46,7 @@ impl RegistrantManager {
     /// port_ps". A request the P-CSCF sends arrives on (port_pc -> port_us),
     /// so answering it back to its source would use the pair the UE only
     /// receives on. The mirror of the P-CSCF's own rule (`IpsecManager::
-    /// udp_response_flow`). `None` when `local` is no IPsec entry's protected
+    /// udp_flow_to_ue`). `None` when `local` is no IPsec entry's protected
     /// server port, or the entry has no established set.
     pub fn ue_udp_response_egress(
         &self,
