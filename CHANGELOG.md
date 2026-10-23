@@ -172,6 +172,17 @@ entry, but a working config keeps working.
   P-Asserted-Identity, P-Associated-URI and aliases behind for good. It now
   goes through the same teardown as a REGISTER with `expires=0`, and never
   removes an AS capability record.
+- **Per-call media scope: `scope=` on `rtpengine.offer`, `answer` and
+  `delete`.** A proxy that anchors both the originating and the terminating
+  leg of one call sees both under one Call-ID (RFC 3261 §16.6), so the second
+  offer used to land on the first leg's engine call. Naming a scope per leg
+  makes each leg an engine call of its own, with its own profile, address
+  family and ports: siphon-rtp carries the scope in the frame in place of the
+  node's `media.siphon_rtp.scope`, rtpengine and rtpproxy key the leg as
+  `<call-id>;<scope>`. A re-offer and an answer reuse their own leg's session;
+  `delete(request)` and `rtpengine.delete_call(call_id)` without a scope end every leg of the Call-ID, each under the scope it was offered under; `delete_call(..., scope=)` ends one. Without
+  `scope=` every frame is unchanged. Validated like the node scope; refused on
+  a B2BUA call, whose legs have Call-IDs of their own.
 
 ## [1.15.2] — 2026-10-22
 

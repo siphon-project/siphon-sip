@@ -127,6 +127,12 @@ pub(crate) struct NativeCommand {
     pub(crate) ws_tee: Option<String>,
     /// Whether the engine refused the command because it holds no such call.
     pub(crate) refused: bool,
+    /// The frame's `scope`: the node's or a per-call one. The engine keys a
+    /// call by `(scope, call_id)`.
+    pub(crate) scope: Option<String>,
+    /// The profile's `address_family` on an `answer_local`, `offer`, `answer`
+    /// or `reoffer`.
+    pub(crate) address_family: Option<String>,
 }
 
 /// What a recorded command carried, before the engine decides on it.
@@ -234,8 +240,12 @@ pub(crate) const NATIVE_ENGINE_FIRST_PLAY_ID: u64 = 7001;
 pub(crate) struct NativeTestEngine {
     address: SocketAddr,
     commands: Arc<Mutex<Vec<NativeCommand>>>,
-    live: Arc<Mutex<HashSet<String>>>,
+    live: LiveCalls,
 }
+
+/// The calls the engine holds, keyed the way the engine keys a call:
+/// `(scope, call_id)`.
+type LiveCalls = Arc<Mutex<HashSet<(Option<String>, String)>>>;
 
 impl NativeTestEngine {
     /// Start the engine on a loopback port. Serves every connection the client
@@ -247,7 +257,7 @@ impl NativeTestEngine {
         let address = listener.local_addr().expect("the listener's address");
         let commands = Arc::new(Mutex::new(Vec::new()));
         let recorded = Arc::clone(&commands);
-        let live: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+        let live: LiveCalls = Arc::new(Mutex::new(HashSet::new()));
         let held = Arc::clone(&live);
         // The calls `offer_far` grew a far leg on, which `answer` completes
         // with the caller's own answer and a `delete` with a `to_tag` drops.
@@ -266,10 +276,17 @@ impl NativeTestEngine {
                     let mut chunk = [0u8; 4096];
                     loop {
                         let request = loop {
-                            match frame::decode::<Request>(&buffer) {
-                                Ok(Some((request, consumed))) => {
+                            match frame::decode::<serde_json::Value>(&buffer) {
+                                Ok(Some((value, consumed))) => {
                                     buffer.drain(..consumed);
-                                    break Some(request);
+                                    let scope = value
+                                        .get("scope")
+                                        .and_then(serde_json::Value::as_str)
+                                        .map(str::to_string);
+                                    match serde_json::from_value::<Request>(value) {
+                                        Ok(request) => break Some((request, scope)),
+                                        Err(_) => break None,
+                                    }
                                 }
                                 Ok(None) => {}
                                 Err(_) => break None,
@@ -279,9 +296,32 @@ impl NativeTestEngine {
                                 Ok(read) => buffer.extend_from_slice(&chunk[..read]),
                             }
                         };
-                        let Some(request) = request else {
+                        let Some((request, scope)) = request else {
                             return;
                         };
+                        // An engine that keys calls by scope says so.
+                        if matches!(request.command, Command::NodeInfo) {
+                            let node_info = serde_json::json!({
+                                "id": request.id,
+                                "result": "node_info",
+                                "node": {
+                                    "node_id": "engine-1",
+                                    "version": "0.14.0",
+                                    "media_addresses": ["192.0.2.10"],
+                                    "codecs": ["PCMU"],
+                                    "features": ["relay", "scope"],
+                                    "max_sessions": 0,
+                                    "draining": false,
+                                },
+                            });
+                            let Ok(bytes) = frame::encode(&node_info) else {
+                                return;
+                            };
+                            if stream.write_all(&bytes).await.is_err() {
+                                return;
+                            }
+                            continue;
+                        }
                         let mut play_id = None;
                         // What the command is, what SDP an accepted one answers
                         // with, and what it does to the calls the engine holds.
@@ -421,12 +461,13 @@ impl NativeTestEngine {
                         };
                         let mut refused = false;
                         if let (Some(record), Ok(mut live)) = (record.as_ref(), held.lock()) {
-                            if needs_call && !live.contains(&record.call_id) {
+                            let key = (scope.clone(), record.call_id.clone());
+                            if needs_call && !live.contains(&key) {
                                 refused = true;
                             } else if creates {
-                                live.insert(record.call_id.clone());
+                                live.insert(key);
                             } else if record.name == "delete" {
-                                live.remove(&record.call_id);
+                                live.remove(&key);
                             }
                         }
                         if !refused && matches!(request.command, Command::PlayMedia { .. }) {
@@ -466,6 +507,11 @@ impl NativeTestEngine {
                                         .as_ref()
                                         .and_then(|profile| profile.ws_tee.clone()),
                                     refused,
+                                    scope: scope.clone(),
+                                    address_family: record
+                                        .profile
+                                        .as_ref()
+                                        .and_then(|profile| profile.address_family.clone()),
                                 });
                             }
                         }
@@ -506,12 +552,23 @@ impl NativeTestEngine {
         }
     }
 
-    /// Whether the engine holds `call_id`: created and not deleted.
+    /// Whether the engine holds the unscoped `call_id`: created and not
+    /// deleted.
     pub(crate) fn holds(&self, call_id: &str) -> bool {
+        self.holds_in(None, call_id)
+    }
+
+    /// Whether the engine holds `call_id` under `scope`.
+    pub(crate) fn holds_in(&self, scope: Option<&str>, call_id: &str) -> bool {
         self.live
             .lock()
-            .map(|live| live.contains(call_id))
+            .map(|live| live.contains(&(scope.map(str::to_string), call_id.to_string())))
             .unwrap_or(false)
+    }
+
+    /// The engine's control address.
+    pub(crate) fn address(&self) -> SocketAddr {
+        self.address
     }
 
     /// How many calls the engine holds.
