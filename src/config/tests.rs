@@ -3805,6 +3805,7 @@ fn parses_lawful_intercept_config() {
         "    delivery_address: \"10.0.0.50:6543\"\n",
         "    transport: tls\n",
         "    reconnect_interval_secs: 10\n",
+        "    keepalive_secs: 0\n",
         "    channel_size: 5000\n",
         "    tls:\n",
         "      ca_cert: \"/etc/siphon/li/mediation-ca.pem\"\n",
@@ -3850,6 +3851,7 @@ fn parses_lawful_intercept_config() {
     assert_eq!(x2.delivery_address, "10.0.0.50:6543");
     assert_eq!(x2.transport, "tls");
     assert_eq!(x2.reconnect_interval_secs, 10);
+    assert_eq!(x2.keepalive_secs, 0, "an explicit zero disables keepalives");
     assert_eq!(x2.channel_size, 5000);
     assert_eq!(
         x2.tls.unwrap().ca_cert.unwrap(),
@@ -3894,6 +3896,7 @@ fn parses_lawful_intercept_defaults() {
     let x2 = li.x2.unwrap();
     assert_eq!(x2.transport, "tcp");
     assert_eq!(x2.reconnect_interval_secs, 5);
+    assert_eq!(x2.keepalive_secs, 30);
     assert_eq!(x2.channel_size, 10_000);
 
     // An empty block is enough to switch content delivery on.

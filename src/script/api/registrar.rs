@@ -72,7 +72,13 @@ pub struct PyFlow {
     /// is the deterministic `(local_addr, remote_addr)` hash; for stream
     /// transports it identifies the live write half in `connection_map`.
     pub connection_id: u64,
+    /// Which way the flow faces: toward a callee that reached siphon over it,
+    /// or from siphon to its own first hop. Decides whether a route set
+    /// replaces the flow or rides it ([`FlowKind`]).
+    pub kind: FlowKind,
 }
+
+pub use super::flow_kind::FlowKind;
 
 #[pymethods]
 impl PyFlow {
@@ -464,6 +470,7 @@ impl PyContact {
             source_addr: flow.source_addr,
             local_addr: flow.local_addr,
             connection_id: flow.connection_id,
+            kind: FlowKind::Inbound,
         });
         Self {
             uri_string: contact.uri.to_string(),
@@ -3048,6 +3055,7 @@ mod tests {
             source_addr: "10.0.0.1:5060".parse().unwrap(),
             local_addr: "127.0.0.1:5060".parse().unwrap(),
             connection_id: 1,
+            kind: FlowKind::Inbound,
         };
         assert!(udp.is_alive());
         // Stream transport with no process-global registry wired (the unit-test
@@ -3059,6 +3067,7 @@ mod tests {
             source_addr: "10.0.0.1:50000".parse().unwrap(),
             local_addr: "127.0.0.1:443".parse().unwrap(),
             connection_id: 2,
+            kind: FlowKind::Inbound,
         };
         assert!(wss.is_alive());
     }
@@ -3259,6 +3268,7 @@ mod tests {
             source_addr: "10.0.0.1:50000".parse().unwrap(),
             local_addr: "127.0.0.1:5066".parse().unwrap(),
             connection_id: 1,
+            kind: FlowKind::Inbound,
         };
         assert!(flow.is_alive());
     }

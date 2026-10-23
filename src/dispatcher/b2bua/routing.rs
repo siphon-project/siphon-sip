@@ -138,6 +138,7 @@ pub fn py_flow_from_inbound(
         source_addr: inbound.remote_addr,
         local_addr: inbound.local_addr,
         connection_id: inbound.connection_id.0,
+        kind: crate::script::api::registrar::FlowKind::Inbound,
     })
 }
 
@@ -156,6 +157,7 @@ pub fn py_flow_from_leg(
         source_addr: transport.remote_addr,
         local_addr: transport.local_addr?,
         connection_id: transport.connection_id.0,
+        kind: crate::script::api::registrar::FlowKind::Inbound,
     })
 }
 

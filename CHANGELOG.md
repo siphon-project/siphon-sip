@@ -13,6 +13,17 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
+### Added
+
+- **X2 keepalives on an idle connection (TS 103 221-2 clause 5.2.2).** A
+  delivery connection that has carried nothing for
+  `lawful_intercept.x2.keepalive_secs` (default 30, `0` disables) gets a
+  keepalive PDU, so the mediation function has a liveness signal on a quiet
+  interface. The MDF's KeepaliveAck PDUs are read and discarded so they cannot
+  fill the socket. A peer found closed or failing at the tick is dropped there,
+  and the next IRI record reconnects at once rather than being written into the
+  dead connection. The sequence number now also restarts on every new
+  connection, not only on a record's reconnect.
 ### Fixed
 
 - **An `async def` `@proxy.on_request` handler no longer holds a Python
@@ -28,6 +39,14 @@ entry, but a working config keeps working.
   counts the awaiting coroutines. Other handler kinds (`on_reply`,
   `on_failure`, B2BUA, Diameter, timers, SBI callbacks, RTPEngine events) still
   wait in place.
+- **`call.dial(flow=registration.flow(impu), route=...)` keeps the flow.** A
+  route set used to replace any flow, so a UE's MO INVITE was resolved from its
+  topmost Route and left from the process listener, outside the SA (or failed
+  when the S-CSCF name did not resolve from the UE side). A registrant flow is
+  now siphon's own flow to its first hop: the INVITE leaves over it and the
+  route set goes on the wire as Route headers (RFC 5626 §4.3, TS 24.229
+  §5.1.2A.1.1). A callee's flow still yields to a Path route set (RFC 3327
+  §5.3). Rust library: `PyFlow` gains a `kind: FlowKind` field.
 - **Lawful intercept: one Correlation ID per B2BUA call, not per leg.** X2 and
   X3 correlation was derived from the SIP Call-ID, so the two legs of one
   B2BUA call reached the mediation function as two sessions (TS 103 221-2

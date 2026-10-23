@@ -24,6 +24,7 @@ use serde::Deserialize;
 ///     delivery_address: "10.0.0.50:6543"
 ///     transport: tcp
 ///     reconnect_interval_secs: 5
+///     keepalive_secs: 30
 ///     channel_size: 10000
 ///   x3:
 ///     enabled: true
@@ -170,6 +171,15 @@ pub struct LiX2Config {
     /// Reconnect interval on connection loss. Default: 5.
     #[serde(default = "default_li_reconnect_interval")]
     pub reconnect_interval_secs: u64,
+    /// Idle keepalive interval in seconds (TS 103 221-2 clause 5.2.2). Zero
+    /// disables keepalives. Default: 30.
+    ///
+    /// A connection that has carried nothing for this long gets a keepalive
+    /// PDU, so the mediation function has a liveness signal on a quiet
+    /// interface and a dead peer is noticed before the next record is lost
+    /// to it.
+    #[serde(default = "default_li_x2_keepalive_secs")]
+    pub keepalive_secs: u64,
     /// Async channel buffer size. Default: 10000.
     #[serde(default = "default_li_channel_size")]
     pub channel_size: usize,
@@ -235,6 +245,9 @@ fn default_li_x2_transport() -> String {
 }
 fn default_li_reconnect_interval() -> u64 {
     5
+}
+fn default_li_x2_keepalive_secs() -> u64 {
+    30
 }
 fn default_li_channel_size() -> usize {
     10_000

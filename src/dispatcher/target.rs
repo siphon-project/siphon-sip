@@ -232,11 +232,24 @@ pub(super) fn resolve_tcp_path(
 /// A binding with **no** Path still routes over its flow, which is what keeps
 /// connection reuse (RFC 5626 §5.3, mandatory for a WebSocket callee per RFC
 /// 7118 §5) working for a UE that registered directly.
+///
+/// All of that is about a flow toward the callee ([`FlowKind::Inbound`]). A
+/// flow siphon holds to its own first hop as a UA ([`FlowKind::Outbound`], the
+/// registrant's SA to the P-CSCF) is kept whatever the route set: that route
+/// set is the UA's own, its first entry is the far end of the flow, and it goes
+/// on the wire as Route headers over the flow (RFC 5626 §4.3, TS 24.229
+/// §5.1.2A.1.1). Resolving its topmost Route instead would send the request
+/// from the process listener, outside the SA.
+///
+/// [`FlowKind::Inbound`]: crate::script::api::registrar::FlowKind::Inbound
+/// [`FlowKind::Outbound`]: crate::script::api::registrar::FlowKind::Outbound
 pub(super) fn b_leg_flow<'a>(
     flow: Option<&'a crate::script::api::registrar::PyFlow>,
     b_leg_route: &[String],
 ) -> Option<&'a crate::script::api::registrar::PyFlow> {
-    flow.filter(|_| b_leg_route.is_empty())
+    flow.filter(|flow| {
+        flow.kind == crate::script::api::registrar::FlowKind::Outbound || b_leg_route.is_empty()
+    })
 }
 
 /// Which URI a B-leg INVITE's wire destination is resolved from.
@@ -320,8 +333,10 @@ impl std::fmt::Display for LegDestinationError {
 ///
 /// In order:
 ///
-/// 1. A Path route set outranks the captured flow ([`b_leg_flow`], RFC 3327
-///    §5.3): the edge proxy said terminating traffic comes back through it.
+/// 1. A Path route set outranks a callee's captured flow ([`b_leg_flow`], RFC
+///    3327 §5.3): the edge proxy said terminating traffic comes back through
+///    it. siphon's own flow to its first hop is never outranked: the route set
+///    rides it.
 /// 2. With a route set and no explicit `next_hop`, the INVITE goes to the
 ///    topmost Route (RFC 3261 §16.6 step 6), not to the Request-URI. The Route
 ///    headers themselves are the caller's to put on the message.

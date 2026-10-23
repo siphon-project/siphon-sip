@@ -207,6 +207,7 @@ pub fn dial_targets_for_aor(aor: &str) -> Result<Vec<DialTarget>, DialError> {
                     source_addr: flow.source_addr,
                     local_addr: flow.local_addr,
                     connection_id: flow.connection_id,
+                    kind: crate::script::api::registrar::FlowKind::Inbound,
                 });
             DialTarget {
                 uri: contact.uri.to_string(),
