@@ -113,6 +113,43 @@ siphon never persists the keys, so a restored binding would point at ports the
 new process can't protect. They are dropped at startup; see
 [After a restart](reference/security.md#after-a-restart).
 
+### What siphon keeps in the backend, and for how long
+
+Everything the registrar writes expires with the registration it describes, so
+a backend shared by many nodes stays the size of the live registrations, not of
+every one it has ever seen. In Redis, under `registrar.redis.key_prefix`:
+
+| Key | Holds | TTL |
+|---|---|---|
+| `{prefix}{aor}` | hash, contact URI to binding | longest contact's remaining lifetime + `ttl_slack_secs`, set on every save |
+| `{prefix}state:{aor}` | Service-Route, P-Asserted-Identity, P-Associated-URI | the binding hash's, refreshed on every save; written before the AoR has a binding, `max_expires` + `ttl_slack_secs` |
+| `{prefix}index` | sorted set of AoRs, scored by the epoch second the last contact expires | none; members whose score has passed are dropped on every read and once a minute |
+| `{isc.ifc_key_prefix}{aor}` | the iFC profile XML | `max_expires` + `ttl_slack_secs`, renewed by every `isc.store_profile()` |
+
+`registrar.aor_count()` reads the index (one `ZREMRANGEBYSCORE` + `ZCARD` per
+shard), so polling it costs the same at a million AoRs as at ten, and nothing
+walks the keyspace at runtime. The index is updated in the same transaction as
+the binding hash on every save and removal, so it holds across nodes and
+restarts and does not depend on keyspace expiry events. Boot is the one place
+siphon walks keys, by cursor `SCAN` (never `KEYS`): the iFC and auxiliary-state
+restore, and building the index when a node finds none (a keyspace written by a
+version without it).
+
+Store the iFC profile from the SAR of every REGISTER, re-registrations
+included, as the example S-CSCF script does: a profile stored only at initial
+registration leaves Redis `max_expires` + `ttl_slack_secs` later even if the
+user is still registered, and a restart after that comes back without it.
+
+During a rolling upgrade, a node still on a version without the index writes
+bindings the index does not see until they are refreshed by an upgraded node,
+so the count reads low until the last node is upgraded and one registration
+interval has passed.
+
+With `backend: postgres`, rows carry no TTL, so the writer task purges once a
+minute: contact rows 30 seconds after they expire, and auxiliary-state rows
+with no live binding once they have gone unwritten for `max_expires` + 30
+seconds. A save also deletes the AoR's contacts that are no longer in its set.
+
 ---
 
 ## How you actually get redundancy: front LB + DNS SRV

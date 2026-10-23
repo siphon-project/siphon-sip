@@ -12,6 +12,7 @@ pub mod glibc;
 pub mod ipsec;
 pub mod rate_limit;
 pub mod send_queue;
+pub mod timer;
 
 use std::sync::{Arc, OnceLock};
 

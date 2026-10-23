@@ -242,6 +242,8 @@ pub(super) async fn init_registrar_backend(config: &Config) {
             };
             match backend::RedisBackend::connect(redis_config).await {
                 Ok(redis_backend) => {
+                    let redis_backend = redis_backend
+                        .with_max_binding_lifetime(u64::from(config.registrar.max_expires));
                     match backend::restore_from_backend(&redis_backend, registrar).await {
                         Ok((aors, contacts)) => {
                             if let Some(metrics) = crate::metrics::try_metrics() {
@@ -256,7 +258,12 @@ pub(super) async fn init_registrar_backend(config: &Config) {
                     registrar.set_backend_writer(backend::spawn_backend_writer(redis_backend));
 
                     // --- iFC profile persistence (shares the same Redis instance) ---
-                    init_ifc_redis_backend(&redis_cfg.url, config).await;
+                    init_ifc_redis_backend(
+                        &redis_cfg.url,
+                        u64::from(redis_cfg.ttl_slack_secs),
+                        config,
+                    )
+                    .await;
                 }
                 Err(err) => {
                     error!(%err, "failed to connect to Redis registrar backend");
@@ -278,6 +285,8 @@ pub(super) async fn init_registrar_backend(config: &Config) {
             };
             match backend::PostgresBackend::connect(pg_config).await {
                 Ok(pg_backend) => {
+                    let pg_backend = pg_backend
+                        .with_max_binding_lifetime(u64::from(config.registrar.max_expires));
                     match backend::restore_from_backend(&pg_backend, registrar).await {
                         Ok((aors, contacts)) => {
                             if let Some(metrics) = crate::metrics::try_metrics() {
@@ -308,7 +317,11 @@ pub(super) async fn init_registrar_backend(config: &Config) {
 /// contract as `sctp` and `ui`: the config still parses and the feature is
 /// skipped with a loud warning rather than silently doing nothing.
 #[cfg(not(feature = "redis-backend"))]
-pub(super) async fn init_ifc_redis_backend(_redis_url: &str, _config: &Config) {
+pub(super) async fn init_ifc_redis_backend(
+    _redis_url: &str,
+    _ttl_slack_secs: u64,
+    _config: &Config,
+) {
     warn!(
         "iFC profile persistence needs the redis-backend cargo feature, which this binary \
          was built without — profiles stay in memory and are lost on restart"
@@ -320,7 +333,7 @@ pub(super) async fn init_ifc_redis_backend(_redis_url: &str, _config: &Config) {
 /// Called from `init_registrar_backend` when the registrar uses a Redis backend,
 /// reusing the same Redis instance for iFC profile storage.
 #[cfg(feature = "redis-backend")]
-pub(super) async fn init_ifc_redis_backend(redis_url: &str, config: &Config) {
+pub(super) async fn init_ifc_redis_backend(redis_url: &str, ttl_slack_secs: u64, config: &Config) {
     use crate::script::api::ifc_store_arc;
 
     let ifc_store = match ifc_store_arc() {
@@ -362,8 +375,13 @@ pub(super) async fn init_ifc_redis_backend(redis_url: &str, config: &Config) {
         }
     }
 
-    // Wire the backend writer for ongoing persistence.
-    let writer = crate::ifc::spawn_ifc_backend_writer(connection, ifc_key_prefix);
+    // Wire the backend writer for ongoing persistence. A profile key lives as
+    // long as the longest registration this node grants plus the registrar's
+    // TTL slack, and every store of the profile (each SAR) renews it, so a
+    // profile outlives its registration by at most that and no longer.
+    let ttl_secs = u64::from(config.registrar.max_expires).saturating_add(ttl_slack_secs);
+    let writer =
+        crate::ifc::spawn_ifc_backend_writer_with_ttl(connection, ifc_key_prefix, ttl_secs);
     ifc_store.set_backend_writer(writer);
     info!("iFC Redis backend writer initialized");
 }
