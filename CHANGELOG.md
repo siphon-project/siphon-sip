@@ -13,6 +13,18 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
+### Added
+
+- **X2 keepalives on an idle connection (TS 103 221-2 clause 5.2.2).** A
+  delivery connection that has carried nothing for
+  `lawful_intercept.x2.keepalive_secs` (default 30, `0` disables) gets a
+  keepalive PDU, so the mediation function has a liveness signal on a quiet
+  interface. The MDF's KeepaliveAck PDUs are read and discarded so they cannot
+  fill the socket. A peer found closed or failing at the tick is dropped there,
+  and the next IRI record reconnects at once rather than being written into the
+  dead connection. The sequence number now also restarts on every new
+  connection, not only on a record's reconnect.
+
 ## [1.15.2] — 2026-10-22
 
 ### Added
