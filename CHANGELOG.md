@@ -26,6 +26,19 @@ entry, but a working config keeps working.
   connection, not only on a record's reconnect.
 ### Fixed
 
+- **An `async def` `@proxy.on_request` handler no longer holds a Python
+  executor worker while it awaits.** The worker used to block until the
+  coroutine settled, so a handler awaiting a slow downstream request (a
+  third-party REGISTER, Diameter, an `asyncio.wait` with a timeout) capped the
+  node at `sync_pool_max / handler latency`: the pool filled with threads doing
+  nothing, the queue grew and shed while the CPU sat idle. The worker now only
+  starts the coroutine; when it settles, the remaining handlers and the
+  reply/relay run as a new executor job. The coroutine timeout, the 500 on a
+  raising or timed-out handler, `stop_propagation()`, the reply gate and
+  deferred sends behave as before. New gauge `siphon_async_coroutines_pending`
+  counts the awaiting coroutines. Other handler kinds (`on_reply`,
+  `on_failure`, B2BUA, Diameter, timers, SBI callbacks, RTPEngine events) still
+  wait in place.
 - **`call.dial(flow=registration.flow(impu), route=...)` keeps the flow.** A
   route set used to replace any flow, so a UE's MO INVITE was resolved from its
   topmost Route and left from the process listener, outside the SA (or failed

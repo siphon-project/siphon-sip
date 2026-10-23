@@ -69,3 +69,45 @@ fn the_initial_notify_leaves_after_the_200_that_accepted_the_subscription() {
         "both go to the subscriber"
     );
 }
+
+/// The same order when the request runs as the dispatcher runs it, on the
+/// executor: the handler's await suspends the job, the request finishes on
+/// another worker, and the reply gate still holds the NOTIFY behind the 200.
+#[test]
+fn the_initial_notify_still_follows_the_200_when_the_handler_suspends_on_the_executor() {
+    let _serial = crate::script::async_pool::pool_test_guard();
+    super::async_request_handler_tests::ensure_pools();
+    let (_turn, harness) = subscribe_harness();
+
+    harness.receive_request_on_executor(
+        &subscribe()
+            .replace("z9hG4bK-order", "z9hG4bK-order-executor")
+            .replace("reply-order@", "reply-order-executor@"),
+        SUBSCRIBER,
+    );
+
+    let sent = harness.frames_awaiting(2, std::time::Duration::from_secs(10));
+    let starts: Vec<String> = sent
+        .iter()
+        .map(|(_, frame)| {
+            String::from_utf8_lossy(frame)
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect();
+    assert_eq!(
+        starts.len(),
+        2,
+        "exactly the 200 and the initial NOTIFY, got {starts:?}"
+    );
+    assert!(
+        starts[0].starts_with("SIP/2.0 200"),
+        "the 200 accepting the subscription goes first, got {starts:?}"
+    );
+    assert!(
+        starts[1].starts_with("NOTIFY "),
+        "the initial NOTIFY follows it, got {starts:?}"
+    );
+}
