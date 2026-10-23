@@ -832,10 +832,13 @@ impl IpsecManager {
         // colliding policy is never reaped. Clearing first makes allocate
         // self-heal.
         // A kernel object another live pair of the UE holds in exactly this
-        // form (a UE's shared policy, see `kernel_objects`) is neither cleared
-        // nor re-added: deleting it would leave that pair's traffic without a
-        // policy, in clear, until the add.
-        let kept = self.objects_held_identically(&sa);
+        // form (a shared policy with an open template, see `kernel_objects`)
+        // is neither cleared nor re-added: deleting it would leave that pair's
+        // traffic without a policy, in clear, until the add. Nor is the
+        // P-CSCF's outbound policy a pair in use holds: the challenge for
+        // this pair still goes over that one, and this pair is pending until
+        // taken into use (`take_into_use`).
+        let (kept, pending) = self.objects_left_to_siblings(&sa);
         self.teardown_sa_kernel_except(&sa, &kept).await;
 
         // Atomic: install all eight; on ANY failure, roll back THIS call's
@@ -870,6 +873,8 @@ impl IpsecManager {
         );
 
         let (new_states, new_spis) = (sa.state_keys(), sa.local_inbound_spis());
+        self.lifecycle
+            .set_pending(&key, retire::pair_spis(&sa), pending);
         if let Some(replaced) = self.associations.insert(key, sa) {
             self.retire_replaced_pair(replaced, new_states, new_spis)
                 .await;
@@ -901,6 +906,7 @@ impl IpsecManager {
     pub async fn delete_sa_pair(&self, ue_addr: &IpAddr, ue_port_c: u16) -> Result<(), IpsecError> {
         let key = Self::contact_key(ue_addr, ue_port_c);
         if let Some((_, sa)) = self.associations.remove(&key) {
+            let in_use = self.is_in_use(&sa);
             self.forget_lifecycle(&key);
             // Best-effort teardown — every delete is independent, so a single
             // missing key (e.g. an SA already reaped on hard-lifetime) can't
@@ -909,7 +915,7 @@ impl IpsecManager {
             // in-memory entry is already removed above, so the manager's view
             // stays authoritative regardless of kernel-side failures. A kernel
             // object another pair of the UE holds is left to it.
-            self.teardown_unshared(&sa).await;
+            self.teardown_unshared(&sa, in_use).await;
             // Only once the kernel states are gone may the SPIs be reused.
             self.release_pair_spis(&sa);
             info!(ue = %ue_addr, ue_port_c, "IPsec: SA pair deleted");

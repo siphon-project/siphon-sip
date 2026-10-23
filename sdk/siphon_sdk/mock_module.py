@@ -12725,6 +12725,12 @@ class MockPendingSA:
     def activate(self, *, hard_lifetime_secs: Optional[int] = None) -> None:
         """Mark the SA pair active.
 
+        On a re-authentication siphon keeps sending over the UE's set in
+        use until the 200 to the REGISTER that came over this pair leaves:
+        that 200, and what follows, go over this pair (TS 24.229 clause
+        5.2.2.2). The dispatcher does the switch, whether or not this is
+        called.
+
         ``hard_lifetime_secs`` (optional) re-pins the kernel
         hard-lifetime on all four SAs of the pair via ``XFRM_MSG_UPDSA``,
         without rekeying or disturbing selectors / SPIs.  Use on the

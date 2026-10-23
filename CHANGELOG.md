@@ -15,6 +15,22 @@ entry, but a working config keeps working.
 
 ### Fixed
 
+- **P-CSCF: a re-authentication challenge is sent over the existing SA set.**
+  The set `ipsec.allocate()` installs for a 401 replaced the kernel's outbound
+  policy of the selector it shares with the UE's set in use (the P-CSCF's
+  protected client port to the UE's protected server port, which stays across
+  a re-authentication, TS 33.203 clause 7.4.0). Since UDP responses go over
+  that selector, the 401 went out under the new SA, whose keys the UE can only
+  derive from that 401, so it dropped the challenge and the new set was deleted
+  unused 30 s later. Every UE re-authenticated on a protected re-registration
+  hit it. The new set now stays pending: the 401 and everything else go over
+  the set in use (TS 24.229 clause 5.2.2.2, TS 33.203 clause 7.4.2a), the
+  inbound policy of that selector accepts either set, and the new set is taken
+  into use as the 200 to the REGISTER that came over it leaves, so that 200
+  goes over it. The old set then goes after 64*T1. A pending set that is never
+  answered is deleted with the outbound policy left on the set in use; if the
+  set in use goes first, the pending one takes over.
+
 - **Local IMS AKA keeps a sequence number per subscriber and handles AUTS.**
   `auth.require_aka_digest()` put SQN 1 in every challenge, so a UE that checks
   freshness accepted the first and refused every later one, and its AUTS was
