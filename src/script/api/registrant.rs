@@ -416,20 +416,11 @@ impl PyRegistration {
                 }
             },
         };
-        Ok(self
-            .inner
-            .ue_flow_components(aor)
-            .map(|(pcscf_addr, pcscf_port_s, ue_port_c)| {
-                crate::script::api::registrar::PyFlow {
-                    transport: "udp".to_string(),
-                    // dial(flow=) routes to source_addr, sourced from local_addr.
-                    source_addr: std::net::SocketAddr::new(pcscf_addr, pcscf_port_s),
-                    local_addr: std::net::SocketAddr::new(ue_ip, ue_port_c),
-                    // UDP egress is selected by source_local_addr, not conn id.
-                    connection_id: 0,
-                    kind: crate::script::api::registrar::FlowKind::Outbound,
-                }
-            }))
+        Ok(crate::script::api::flow_kind::registrant_flow(
+            &self.inner,
+            aor,
+            ue_ip,
+        ))
     }
 
     /// Decorator to register a handler for outbound-registration state changes.

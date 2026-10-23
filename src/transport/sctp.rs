@@ -9,16 +9,16 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use bytes::{Bytes, BytesMut};
+use bytes::BytesMut;
 use dashmap::DashMap;
-use tokio::sync::mpsc;
 use tokio_sctp::{SctpListener, SendOptions};
 use tracing::{debug, error, info, warn};
 
 use crate::transport::acl::TransportAcl;
+use crate::transport::send_queue::{self, SendQueue, TrySendError};
 use crate::transport::{
     next_connection_id, ConnectionId, InboundMessage, OutboundMessage, Transport,
-    CONNECTION_IDLE_TIMEOUT, WRITE_TIMEOUT,
+    CONNECTION_IDLE_TIMEOUT,
 };
 
 /// Spawn an SCTP listener.
@@ -30,7 +30,7 @@ pub async fn listen(
     local_addr: SocketAddr,
     inbound_tx: flume::Sender<InboundMessage>,
     outbound_rx: flume::Receiver<OutboundMessage>,
-    connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>>,
+    connection_map: Arc<DashMap<ConnectionId, SendQueue>>,
     acl: Arc<TransportAcl>,
     _tos: Option<u32>,
 ) -> std::io::Result<SocketAddr> {
@@ -45,23 +45,21 @@ pub async fn listen(
     tokio::spawn(async move {
         while let Ok(outbound) = outbound_rx.recv_async().await {
             if let Some(sender) = connection_map_clone.get(&outbound.connection_id) {
-                // Non-blocking: NEVER park in `send().await` here (see tcp.rs for
-                // the full rationale). Awaiting a send to a non-reading peer's full
-                // bounded channel would park this single distributor while holding
-                // the `connection_map` shard guard — stalling all outbound and
-                // blocking accept's `insert` on the same shard. `try_send` sheds
-                // for a backed-up (stuck) peer instead.
+                // Non-blocking: NEVER await here (see stream.rs for the full
+                // rationale): this single distributor holds the `connection_map`
+                // shard guard. The queue is bounded by bytes, so a burst to an
+                // association that is draining is queued whole.
                 let connection_id = outbound.connection_id;
                 // Frames of one message keep their relative order — same
-                // per-connection channel, single distributor task.
+                // per-connection queue, single distributor task.
                 for frame in outbound.into_frames() {
                     match sender.try_send(frame) {
                         Ok(()) => {}
-                        Err(mpsc::error::TrySendError::Full(_)) => {
-                            warn!("SCTP outbound dropped: connection {:?} send buffer full (slow/stuck peer)", connection_id);
+                        Err(TrySendError::Full(_)) => {
+                            sender.log_refused("SCTP outbound");
                             break;
                         }
-                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                        Err(TrySendError::Closed(_)) => {
                             warn!(
                                 "SCTP outbound dropped: connection {:?} closed",
                                 connection_id
@@ -121,7 +119,8 @@ pub async fn listen(
                         }
 
                         // Per-connection outbound channel
-                        let (outbound_tx, mut outbound_rx) = mpsc::channel::<Bytes>(64);
+                        let (outbound_tx, mut outbound_rx) =
+                            send_queue::channel(Transport::Sctp, connection_id);
                         connection_map.insert(connection_id, outbound_tx);
 
                         // Read task — message-oriented: each recvmsg returns one SIP message
@@ -185,11 +184,12 @@ pub async fn listen(
                         });
 
                         // Write task
+                        let write_timeout = send_queue::write_timeout();
                         let mut write_task = tokio::spawn(async move {
                             let options = SendOptions::default();
                             while let Some(data) = outbound_rx.recv().await {
                                 match tokio::time::timeout(
-                                    WRITE_TIMEOUT,
+                                    write_timeout,
                                     writer.sendmsg(&data, None, &options),
                                 )
                                 .await
@@ -199,13 +199,10 @@ pub async fn listen(
                                         warn!("SCTP write error on {:?}: {}", connection_id, error);
                                         break;
                                     }
+                                    // The peer is not draining the
+                                    // association: close it as stuck.
                                     Err(_) => {
-                                        warn!(
-                                            connection_id = ?connection_id,
-                                            timeout = ?WRITE_TIMEOUT,
-                                            "SCTP write stalled — peer is not draining \
-                                             the association; closing it"
-                                        );
+                                        outbound_rx.stalled(remote_addr);
                                         break;
                                     }
                                 }
@@ -286,8 +283,7 @@ mod tests {
     async fn sctp_connection_lifecycle() {
         let (inbound_tx, inbound_rx) = flume::unbounded();
         let (_outbound_tx, outbound_rx) = flume::unbounded::<OutboundMessage>();
-        let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
-            Arc::new(DashMap::new());
+        let connection_map: Arc<DashMap<ConnectionId, SendQueue>> = Arc::new(DashMap::new());
 
         let addr = listen(
             any_loopback_port(),
@@ -344,8 +340,7 @@ mod tests {
     async fn sctp_connection_cleanup() {
         let (inbound_tx, inbound_rx) = flume::unbounded();
         let (_outbound_tx, outbound_rx) = flume::unbounded::<OutboundMessage>();
-        let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
-            Arc::new(DashMap::new());
+        let connection_map: Arc<DashMap<ConnectionId, SendQueue>> = Arc::new(DashMap::new());
 
         let addr = listen(
             any_loopback_port(),
@@ -392,8 +387,7 @@ mod tests {
     async fn sctp_message_boundaries() {
         let (inbound_tx, inbound_rx) = flume::unbounded();
         let (_outbound_tx, outbound_rx) = flume::unbounded::<OutboundMessage>();
-        let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
-            Arc::new(DashMap::new());
+        let connection_map: Arc<DashMap<ConnectionId, SendQueue>> = Arc::new(DashMap::new());
 
         let addr = listen(
             any_loopback_port(),

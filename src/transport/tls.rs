@@ -12,9 +12,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-use bytes::Bytes;
+
 use dashmap::DashMap;
-use tokio::sync::mpsc;
 use tokio_rustls::rustls::server::{ClientHello, ResolvesServerCert};
 use tokio_rustls::rustls::sign::CertifiedKey;
 use tokio_rustls::TlsAcceptor;
@@ -25,6 +24,7 @@ use crate::transport::acl::TransportAcl;
 use crate::transport::crlf_keepalive::CrlfPongTracker;
 use crate::transport::pool::ConnectionPool;
 use crate::transport::proxy_protocol::{accept_proxied, ProxyProtocolAcl};
+use crate::transport::send_queue::SendQueue;
 use crate::transport::stream::{
     bind_tcp_listener, serve_sip_stream, sniff_sip_or_drop, spawn_outbound_distributor,
     PrefixedStream, StreamContext,
@@ -708,7 +708,7 @@ pub async fn listen(
     tls_config: &TlsServerConfig,
     inbound_tx: flume::Sender<InboundMessage>,
     outbound_rx: flume::Receiver<OutboundMessage>,
-    connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>>,
+    connection_map: Arc<DashMap<ConnectionId, SendQueue>>,
     acl: Arc<TransportAcl>,
     stream_connections: StreamConnections,
     tos: Option<u32>,
@@ -1214,8 +1214,7 @@ mod tests {
 
         let (inbound_tx, inbound_rx) = flume::unbounded();
         let (_outbound_tx, outbound_rx) = flume::unbounded::<OutboundMessage>();
-        let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
-            Arc::new(DashMap::new());
+        let connection_map: Arc<DashMap<ConnectionId, SendQueue>> = Arc::new(DashMap::new());
 
         // Start the TLS listener on a port the kernel picks.
         let bound_addr = listen(
@@ -1304,8 +1303,7 @@ mod tests {
 
         let (inbound_tx, inbound_rx) = flume::unbounded();
         let (_outbound_tx, outbound_rx) = flume::unbounded::<OutboundMessage>();
-        let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
-            Arc::new(DashMap::new());
+        let connection_map: Arc<DashMap<ConnectionId, SendQueue>> = Arc::new(DashMap::new());
         let stream_connections = StreamConnections::new();
 
         let bound_addr = listen(

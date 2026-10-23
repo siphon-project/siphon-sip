@@ -24,7 +24,6 @@ use std::time::Duration;
 use bytes::Bytes;
 use dashmap::DashMap;
 use tokio::io::AsyncReadExt;
-use tokio::sync::mpsc;
 
 use crate::sip::builder::SipMessageBuilder;
 use crate::sip::message::{Method, SipMessage};
@@ -33,6 +32,7 @@ use crate::transaction::state::IctEvent;
 use crate::transaction::{ClientEvent, TransactionManager};
 use crate::transport::acl::TransportAcl;
 use crate::transport::pool::{build_outbound_tls_config, ConnectionPool};
+use crate::transport::send_queue::SendQueue;
 use crate::transport::stream::spawn_outbound_distributor;
 use crate::transport::{
     ConnectionId, InboundMessage, OutboundMessage, StreamConnections, Transport,
@@ -42,7 +42,7 @@ use crate::transport::{
 const IDLE: Duration = Duration::from_millis(40);
 
 fn pool_with(
-    connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>>,
+    connection_map: Arc<DashMap<ConnectionId, SendQueue>>,
     inbound_tx: flume::Sender<InboundMessage>,
 ) -> ConnectionPool {
     let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
@@ -68,13 +68,13 @@ struct Node {
     inbound: flume::Receiver<InboundMessage>,
     outbound: flume::Sender<OutboundMessage>,
     pool: Arc<ConnectionPool>,
-    connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>>,
+    connection_map: Arc<DashMap<ConnectionId, SendQueue>>,
 }
 
 async fn node() -> Node {
     let (inbound_tx, inbound) = flume::unbounded();
     let (outbound, outbound_rx) = flume::unbounded();
-    let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> = Arc::new(DashMap::new());
+    let connection_map: Arc<DashMap<ConnectionId, SendQueue>> = Arc::new(DashMap::new());
     let pool = Arc::new(pool_with(Arc::clone(&connection_map), inbound_tx.clone()));
     let addr = crate::transport::tcp::listen(
         "127.0.0.1:0".parse().expect("a literal address"),
@@ -373,13 +373,13 @@ async fn a_late_timeout_reaches_a_sender_that_closed_its_connection() {
 /// is closed and the connect is refused.
 struct Fallback {
     outbound: flume::Sender<OutboundMessage>,
-    connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>>,
+    connection_map: Arc<DashMap<ConnectionId, SendQueue>>,
     sent_by: tokio::net::TcpListener,
     source: tokio::net::TcpListener,
 }
 
 async fn fallback() -> Fallback {
-    let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> = Arc::new(DashMap::new());
+    let connection_map: Arc<DashMap<ConnectionId, SendQueue>> = Arc::new(DashMap::new());
     let pool = Arc::new(pool_with(Arc::new(DashMap::new()), flume::unbounded().0));
     let (outbound, outbound_rx) = flume::unbounded();
     spawn_outbound_distributor(
@@ -531,7 +531,7 @@ async fn a_response_for_a_connection_that_just_closed_goes_to_the_sent_by_port()
     let fallback = fallback().await;
     let branch = "z9hG4bK-fallback-closing";
     let closing = ConnectionId(4243);
-    let (sender, receiver) = mpsc::channel::<Bytes>(1);
+    let (sender, receiver) = crate::transport::send_queue::channel(Transport::Tcp, closing);
     drop(receiver);
     fallback.connection_map.insert(closing, sender);
     let data = response_with_via(

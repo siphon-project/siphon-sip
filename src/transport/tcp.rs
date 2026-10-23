@@ -1,7 +1,7 @@
 //! TCP transport with per-connection response routing.
 //!
 //! Each accepted connection gets a unique `ConnectionId` and a
-//! `mpsc::Sender<Bytes>` stored in a `DashMap`. When the core wants to
+//! `SendQueue` stored in a `DashMap`. When the core wants to
 //! send a response, it looks up the connection ID and sends to that sender.
 //!
 //! This fixes the broken "broadcast to all TCP connections" bug in the
@@ -10,15 +10,14 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use bytes::Bytes;
 use dashmap::DashMap;
-use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use crate::transport::acl::TransportAcl;
 use crate::transport::crlf_keepalive::CrlfPongTracker;
 use crate::transport::pool::ConnectionPool;
 use crate::transport::proxy_protocol::{accept_proxied, ProxyProtocolAcl};
+use crate::transport::send_queue::SendQueue;
 use crate::transport::stream::{
     bind_tcp_listener, serve_sip_stream, sniff_sip_or_drop, spawn_outbound_distributor,
     PrefixedStream, StreamContext,
@@ -42,7 +41,7 @@ pub async fn listen(
     local_addr: SocketAddr,
     inbound_tx: flume::Sender<InboundMessage>,
     outbound_rx: flume::Receiver<OutboundMessage>,
-    connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>>,
+    connection_map: Arc<DashMap<ConnectionId, SendQueue>>,
     acl: Arc<TransportAcl>,
     stream_connections: StreamConnections,
     tos: Option<u32>,
@@ -489,6 +488,7 @@ fn extract_content_length(headers: &[u8]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
     use std::sync::Arc;
 
     #[test]
@@ -503,14 +503,13 @@ mod tests {
 
     #[tokio::test]
     async fn connection_map_routes_to_correct_connection() {
-        let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
-            Arc::new(DashMap::new());
+        let connection_map: Arc<DashMap<ConnectionId, SendQueue>> = Arc::new(DashMap::new());
 
         let conn_a = ConnectionId(100);
         let conn_b = ConnectionId(200);
 
-        let (tx_a, mut rx_a) = mpsc::channel::<Bytes>(4);
-        let (tx_b, mut rx_b) = mpsc::channel::<Bytes>(4);
+        let (tx_a, mut rx_a) = crate::transport::send_queue::channel(Transport::Tcp, conn_a);
+        let (tx_b, mut rx_b) = crate::transport::send_queue::channel(Transport::Tcp, conn_b);
 
         connection_map.insert(conn_a, tx_a);
         connection_map.insert(conn_b, tx_b);
@@ -520,8 +519,7 @@ mod tests {
         connection_map
             .get(&conn_a)
             .unwrap()
-            .send(data_a.clone())
-            .await
+            .try_send(data_a.clone())
             .unwrap();
 
         // Send to conn_b
@@ -529,8 +527,7 @@ mod tests {
         connection_map
             .get(&conn_b)
             .unwrap()
-            .send(data_b.clone())
-            .await
+            .try_send(data_b.clone())
             .unwrap();
 
         // Verify A gets A's message
@@ -547,10 +544,9 @@ mod tests {
 
     #[tokio::test]
     async fn removed_connection_returns_none() {
-        let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
-            Arc::new(DashMap::new());
+        let connection_map: Arc<DashMap<ConnectionId, SendQueue>> = Arc::new(DashMap::new());
         let conn = ConnectionId(999);
-        let (tx, _rx) = mpsc::channel::<Bytes>(4);
+        let (tx, _rx) = crate::transport::send_queue::channel(Transport::Tcp, conn);
         connection_map.insert(conn, tx);
         connection_map.remove(&conn);
         assert!(connection_map.get(&conn).is_none());
@@ -1102,15 +1098,14 @@ mod tests {
         inbound_rx: flume::Receiver<InboundMessage>,
         outbound_tx: flume::Sender<OutboundMessage>,
         registry: StreamConnections,
-        connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>>,
+        connection_map: Arc<DashMap<ConnectionId, SendQueue>>,
     }
 
     async fn spawn_registered_listener() -> RegisteredListener {
         let (inbound_tx, inbound_rx) = flume::unbounded();
         let (outbound_tx, outbound_rx) = flume::unbounded::<OutboundMessage>();
         let registry = StreamConnections::new();
-        let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
-            Arc::new(DashMap::new());
+        let connection_map: Arc<DashMap<ConnectionId, SendQueue>> = Arc::new(DashMap::new());
         let addr = listen(
             "127.0.0.1:0".parse().unwrap(),
             inbound_tx,

@@ -36,6 +36,8 @@ pub use siphon_rtp_proto::X3TargetLeg;
 mod conference;
 mod release;
 pub use conference::{BridgeDirection, ConferenceRole, ConferenceSeat};
+mod scoped;
+pub use scoped::engine_call_id;
 
 /// The configured media-control backend.
 pub enum MediaBackend {

@@ -9,6 +9,7 @@
 use super::MediaBackend;
 use crate::rtpengine::error::RtpEngineError;
 use crate::rtpengine::session::MediaSessionStore;
+use crate::rtpengine::CallScope;
 
 impl MediaBackend {
     /// Tear down the media of the call `call_id` names, and forget its session.
@@ -24,28 +25,66 @@ impl MediaBackend {
     /// The session is forgotten whatever the engine answers: the call is over
     /// either way, and an entry kept for a failed delete would never be removed.
     ///
-    /// Returns `true` when the engine released the call, `false` when it no
-    /// longer held it (already reaped, or never anchored).
+    /// `scope` releases only the leg anchored under that per-call scope
+    /// (`rtpengine.offer(..., scope=)`). Without one, the call's own media goes
+    /// and so does every leg any per-call scope anchored under `call_id`, each
+    /// under the scope it was offered under: one release ends the call. Every
+    /// leg is attempted before the first refusal is returned.
+    ///
+    /// Returns `true` when the engine released the call (any leg of it),
+    /// `false` when it no longer held any (already reaped, or never anchored).
     pub async fn release_call(
         &self,
         sessions: &MediaSessionStore,
         call_id: &str,
         from_tag: Option<&str>,
+        scope: Option<&CallScope>,
     ) -> Result<bool, RtpEngineError> {
-        let session = sessions.get(call_id);
-        let engine_call_id = session
-            .as_ref()
-            .map_or(call_id, |session| session.rtpengine_id());
-        let tag = from_tag.or(session.as_ref().map(|session| session.from_tag.as_str()));
-        let outcome = match tag {
-            Some(tag) => self.delete(engine_call_id, tag).await,
-            None => self.delete_call(engine_call_id).await,
+        let outcomes = match scope {
+            Some(scope) => {
+                let session = sessions
+                    .scoped_existing(scope)
+                    .and_then(|store| store.remove(call_id));
+                let tag = from_tag.or(session.as_ref().map(|session| session.from_tag.as_str()));
+                vec![self.release_leg(Some(scope), call_id, tag).await]
+            }
+            None => {
+                let session = sessions.get(call_id);
+                let engine_call_id = session
+                    .as_ref()
+                    .map_or(call_id, |session| session.rtpengine_id());
+                let tag = from_tag.or(session.as_ref().map(|session| session.from_tag.as_str()));
+                let mut outcomes = vec![self.release_leg(None, engine_call_id, tag).await];
+                sessions.remove(call_id);
+                for (scope, session) in sessions.take_scoped(call_id) {
+                    let tag = from_tag.unwrap_or(session.from_tag.as_str());
+                    outcomes.push(self.release_leg(Some(&scope), call_id, Some(tag)).await);
+                }
+                outcomes
+            }
         };
-        sessions.remove(call_id);
-        match outcome {
-            Ok(()) => Ok(true),
-            Err(error) if error.is_call_not_found() => Ok(false),
-            Err(error) => Err(error),
+        let mut released = false;
+        for outcome in outcomes {
+            match outcome {
+                Ok(()) => released = true,
+                Err(error) if error.is_call_not_found() => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(released)
+    }
+
+    /// Delete one engine call under `scope`, naming `tag`, or the whole call by
+    /// id without one.
+    async fn release_leg(
+        &self,
+        scope: Option<&CallScope>,
+        call_id: &str,
+        tag: Option<&str>,
+    ) -> Result<(), RtpEngineError> {
+        match tag {
+            Some(tag) => self.delete_in(scope, call_id, tag).await,
+            None => self.delete_call_in(scope, call_id).await,
         }
     }
 }
@@ -88,7 +127,7 @@ mod tests {
         sessions.insert(session("sip-call", "reanchored-media", "caller-tag"));
 
         assert!(backend
-            .release_call(&sessions, "sip-call", None)
+            .release_call(&sessions, "sip-call", None, None)
             .await
             .unwrap());
 
@@ -107,7 +146,7 @@ mod tests {
         sessions.insert(session("sip-call", "", "caller-tag"));
 
         backend
-            .release_call(&sessions, "sip-call", Some("callee-tag"))
+            .release_call(&sessions, "sip-call", Some("callee-tag"), None)
             .await
             .unwrap();
 
@@ -124,7 +163,7 @@ mod tests {
         let backend = engine.backend().await;
 
         assert!(backend
-            .release_call(&MediaSessionStore::new(), "other-node-call", None)
+            .release_call(&MediaSessionStore::new(), "other-node-call", None, None)
             .await
             .unwrap());
 
@@ -148,13 +187,13 @@ mod tests {
         assert!(engine.holds("anchored"));
 
         assert!(backend
-            .release_call(&sessions, "anchored", None)
+            .release_call(&sessions, "anchored", None, None)
             .await
             .unwrap());
         assert!(!engine.holds("anchored"));
 
         assert!(!backend
-            .release_call(&sessions, "anchored", None)
+            .release_call(&sessions, "anchored", None, None)
             .await
             .unwrap());
     }
@@ -171,7 +210,9 @@ mod tests {
         let sessions = MediaSessionStore::new();
         sessions.insert(session("sip-call", "", "caller-tag"));
 
-        let outcome = backend.release_call(&sessions, "sip-call", None).await;
+        let outcome = backend
+            .release_call(&sessions, "sip-call", None, None)
+            .await;
 
         assert!(outcome.is_err());
         assert!(sessions.is_empty());
@@ -197,12 +238,80 @@ mod tests {
         for index in 0..64 {
             let call_id = format!("leak-release-{index}");
             assert!(backend
-                .release_call(&sessions, &call_id, None)
+                .release_call(&sessions, &call_id, None, None)
                 .await
                 .unwrap());
         }
 
         assert!(sessions.is_empty());
         assert_eq!(engine.held_count(), 0);
+    }
+
+    fn scope(name: &str) -> crate::rtpengine::CallScope {
+        crate::rtpengine::CallScope::per_call(name).unwrap()
+    }
+
+    /// Without a scope, a release ends every leg a per-call scope anchored
+    /// under the Call-ID, each under its own scope, and frees their sessions.
+    #[tokio::test]
+    async fn an_unscoped_release_ends_every_scoped_leg() {
+        let engine = NativeTestEngine::start().await;
+        let backend = engine.backend();
+        let sessions = MediaSessionStore::new();
+        for leg in ["orig", "term"] {
+            let leg_scope = scope(leg);
+            backend
+                .offer_in(
+                    Some(&leg_scope),
+                    "two-legs",
+                    "caller-tag",
+                    OFFER,
+                    &NgFlags::default(),
+                )
+                .await
+                .unwrap();
+            sessions.scoped(&leg_scope).unwrap().insert(session(
+                "two-legs",
+                "two-legs",
+                "caller-tag",
+            ));
+        }
+
+        assert!(backend
+            .release_call(&sessions, "two-legs", None, None)
+            .await
+            .unwrap());
+
+        assert_eq!(engine.held_count(), 0);
+        assert_eq!(sessions.scoped_len(), 0);
+    }
+
+    /// With a scope, only that leg goes, on both backends' keying.
+    #[tokio::test]
+    async fn a_scoped_release_ends_only_its_leg() {
+        let engine = TestEngine::start(false).await;
+        let backend = engine.backend().await;
+        let sessions = MediaSessionStore::new();
+        let orig = scope("orig");
+        sessions
+            .scoped(&orig)
+            .unwrap()
+            .insert(session("two-legs", "two-legs", "caller-tag"));
+        sessions.scoped(&scope("term")).unwrap().insert(session(
+            "two-legs",
+            "two-legs",
+            "caller-tag",
+        ));
+
+        assert!(backend
+            .release_call(&sessions, "two-legs", None, Some(&orig))
+            .await
+            .unwrap());
+
+        let deletes = engine.commands("delete");
+        assert_eq!(deletes.len(), 1);
+        assert_eq!(deletes[0].call_id.as_deref(), Some("two-legs;orig"));
+        assert_eq!(deletes[0].from_tag.as_deref(), Some("caller-tag"));
+        assert_eq!(sessions.scoped_len(), 1, "the term leg stays");
     }
 }

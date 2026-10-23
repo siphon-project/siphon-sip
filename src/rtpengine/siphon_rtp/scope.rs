@@ -19,6 +19,9 @@
 //! protect one from another.
 
 use std::fmt;
+use std::sync::atomic::AtomicBool;
+
+use dashmap::DashMap;
 
 use serde::{Deserialize, Serialize};
 use siphon_rtp_proto::{frame, CmdResult, Command, ProtoError, Request};
@@ -42,7 +45,7 @@ const SCOPE_FEATURE: &str = "scope";
 ///
 /// Checked when the configuration is read, so a node with a scope the engine
 /// would refuse fails at start instead of having every call refused.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
 #[serde(try_from = "String")]
 pub struct CallScope(String);
 
@@ -66,16 +69,35 @@ impl TryFrom<String> for CallScope {
                 "{SCOPE_KEY} is empty; leave the key out for an unscoped node"
             ));
         }
+        Self::checked(scope, SCOPE_KEY)
+    }
+}
+
+impl CallScope {
+    /// A scope a script names for one call (`scope=` on a media verb), held to
+    /// the rules a node's own scope is held to. Empty is refused: leaving the
+    /// argument out is how a script asks for the node's scope.
+    pub fn per_call(scope: &str) -> Result<Self, String> {
+        if scope.is_empty() {
+            return Err(
+                "scope= is empty; leave it out (or pass None) for the node's own scope".to_string(),
+            );
+        }
+        Self::checked(scope.to_string(), "scope=")
+    }
+
+    /// `scope` when it is one the engine accepts, else a refusal naming `key`.
+    fn checked(scope: String, key: &str) -> Result<Self, String> {
         if scope.len() > MAX_SCOPE_LENGTH {
             return Err(format!(
-                "{SCOPE_KEY} is {} bytes; the maximum is {MAX_SCOPE_LENGTH}",
+                "{key} is {} bytes; the maximum is {MAX_SCOPE_LENGTH}",
                 scope.len()
             ));
         }
         let allowed = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_';
         if !scope.bytes().all(allowed) {
             return Err(format!(
-                "{SCOPE_KEY} may hold only ASCII letters, digits, '-' and '_', got {scope:?}"
+                "{key} may hold only ASCII letters, digits, '-' and '_', got {scope:?}"
             ));
         }
         Ok(Self(scope))
@@ -162,6 +184,94 @@ pub(super) fn event_is_for(scope: Option<&CallScope>, event: &serde_json::Value)
     }
 }
 
+/// The most scopes scripts may name per call on one connection.
+///
+/// The names are kept, not the calls, so that an event a per-call scope raises
+/// is recognised as this node's; a script names a handful of them (one per leg
+/// role). The cap is what keeps a script deriving one name per call from
+/// growing the set without bound, and it is refused loudly rather than
+/// silently dropping that call's events.
+const MAX_NAMED_SCOPES: usize = 256;
+
+/// The scopes one control connection's frames carry: the node's own
+/// (`media.siphon_rtp.scope`), and the ones scripts named per call
+/// (`scope=` on `rtpengine.offer`, `answer`, `delete`, `delete_call`).
+pub(super) struct CallScopes {
+    node: Option<CallScope>,
+    /// Per-call scopes named on this connection, for [`CallScopes::accepts`].
+    named: DashMap<String, ()>,
+    /// The connected engine is known to key calls by scope: checked by the
+    /// hand-shake on a scoped node, and on first use on an unscoped one.
+    supported: AtomicBool,
+}
+
+impl CallScopes {
+    pub(super) fn new(node: Option<CallScope>) -> Self {
+        Self {
+            node,
+            named: DashMap::new(),
+            supported: AtomicBool::new(false),
+        }
+    }
+
+    /// The node's own scope.
+    pub(super) fn node(&self) -> Option<&CallScope> {
+        self.node.as_ref()
+    }
+
+    /// Whether an event frame may belong to this connection: one under the
+    /// node's scope or an unscoped one ([`event_is_for`]), or one under a scope
+    /// a script named per call.
+    pub(super) fn accepts(&self, event: &serde_json::Value) -> bool {
+        event_is_for(self.node.as_ref(), event)
+            || event
+                .get("scope")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|scope| self.named.contains_key(scope))
+    }
+
+    /// Note `scope` as named on this connection before a frame carries it, so
+    /// the events of its call are recognised. Refused past [`MAX_NAMED_SCOPES`].
+    pub(super) fn name(&self, scope: &CallScope) -> Result<(), RtpEngineError> {
+        if self.node.as_ref() == Some(scope) || self.named.contains_key(scope.as_str()) {
+            return Ok(());
+        }
+        if self.named.len() >= MAX_NAMED_SCOPES {
+            return Err(RtpEngineError::Protocol(format!(
+                "scope={scope:?} would be the {}th per-call scope on this engine connection; \
+                 the maximum is {MAX_NAMED_SCOPES} (a scope names a leg's role, not a call)",
+                MAX_NAMED_SCOPES + 1
+            )));
+        }
+        self.named.insert(scope.as_str().to_string(), ());
+        Ok(())
+    }
+
+    /// A connection was established: a scoped node's hand-shake has already
+    /// checked the engine keys calls by scope, an unscoped node's has not.
+    pub(super) fn connected(&self) {
+        self.supported
+            .store(self.node.is_some(), std::sync::atomic::Ordering::Release);
+    }
+
+    /// Whether the connected engine is known to key calls by scope.
+    pub(super) fn engine_supports(&self) -> bool {
+        self.supported.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// The connected engine listed the scope feature.
+    pub(super) fn mark_supported(&self) {
+        self.supported
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// How many per-call scopes are named (test observability).
+    #[cfg(test)]
+    pub(super) fn named_count(&self) -> usize {
+        self.named.len()
+    }
+}
+
 /// Ask a fresh connection's engine whether it keys calls by scope, and refuse
 /// the connection when it does not.
 ///
@@ -185,6 +295,12 @@ pub(super) async fn require_scope_support(
         timeout_ms,
     )
     .await?;
+    require_scope_feature(result, &format!("{SCOPE_KEY} is {scope:?}"))
+}
+
+/// Whether a `node_info` answer lists the scope feature; the refusal opens
+/// with `asked`, what needed it.
+pub(super) fn require_scope_feature(result: CmdResult, asked: &str) -> Result<(), RtpEngineError> {
     match result {
         CmdResult::NodeInfo { node }
             if node.features.iter().any(|feature| feature == SCOPE_FEATURE) =>
@@ -192,13 +308,13 @@ pub(super) async fn require_scope_support(
             Ok(())
         }
         CmdResult::NodeInfo { node } => Err(RtpEngineError::Protocol(format!(
-            "{SCOPE_KEY} is {scope:?} but the engine (version {}) does not list \
+            "{asked} but the engine (version {}) does not list \
              '{SCOPE_FEATURE}' in node_info features; scopes need siphon-rtp 0.14.0 \
              or later, and an older engine would anchor this node's calls unscoped",
             node.version
         ))),
         CmdResult::Error { reason } => Err(RtpEngineError::EngineError(format!(
-            "node_info refused while checking {SCOPE_KEY}: {reason}"
+            "node_info refused while checking {asked}: {reason}"
         ))),
         other => Err(RtpEngineError::Protocol(format!(
             "unexpected '{}' response for node_info",

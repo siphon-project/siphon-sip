@@ -93,6 +93,13 @@ still need engines that reach them. A scope keeps cooperating nodes apart; it
 does not protect one from another (see
 [Media engines](../media-engines.md#several-nodes-on-one-engine-scope)).
 
+One node anchoring **both legs of one call** (an edge proxy between two of its
+own users) is the other case: there is one node scope, so the script names a
+scope per leg with `rtpengine.offer(request, scope="orig")` / `scope="term"`,
+passes the same scope to that leg's `answer`, and a plain
+`rtpengine.delete(request)` on the BYE ends both. Works on every backend; see
+[Two legs of one call on one node](../media-engines.md#two-legs-of-one-call-on-one-node).
+
 ### Classic rtpproxy (keep your existing relay)
 
 Migrating an OpenSIPS / Kamailio / Sippy deployment? Point siphon at your existing

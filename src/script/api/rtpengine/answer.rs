@@ -22,7 +22,7 @@ use tracing::debug;
 
 use crate::rtpengine::profile::{NgFlags, ProfileEntry, ProfileRegistry};
 use crate::rtpengine::session::{MediaSession, MediaSessionStore, ProfileHalf};
-use crate::rtpengine::{MediaBackend, RtpEngineError};
+use crate::rtpengine::{CallScope, MediaBackend, RtpEngineError};
 use crate::sip::message::SipMessage;
 
 use super::{
@@ -55,6 +55,9 @@ pub(super) struct AnswerExchange {
     /// dialog, which on a B2BUA is not the INVITE's. `None` in raw mode, where
     /// the far side is not a SIP dialog.
     pub(super) answerer_sip_call_id: Option<String>,
+    /// The per-call scope the offer named; `None` for the node's. Set by the
+    /// caller after [`AnswerExchange::resolve`], which read the scope's store.
+    pub(super) scope: Option<CallScope>,
 }
 
 impl AnswerExchange {
@@ -92,6 +95,7 @@ impl AnswerExchange {
                     source_ip: None,
                     delayed_offer: false,
                     answerer_sip_call_id: None,
+                    scope: None,
                 })
             }
             None => {
@@ -152,6 +156,7 @@ impl AnswerExchange {
                         .and_then(|reply| reply.borrow().response_source_ip().map(str::to_string)),
                     delayed_offer,
                     answerer_sip_call_id: Some(reply_call_id),
+                    scope: None,
                 })
             }
         }
@@ -202,7 +207,13 @@ impl AnswerExchange {
     ) -> PyResult<Vec<u8>> {
         if self.delayed_offer {
             let rewritten_sdp = client
-                .offer(&self.engine_call_id, &self.to_tag, &self.sdp, flags)
+                .offer_in(
+                    self.scope.as_ref(),
+                    &self.engine_call_id,
+                    &self.to_tag,
+                    &self.sdp,
+                    flags,
+                )
                 .await
                 .map_err(engine_failure)?;
             debug!(
@@ -228,7 +239,8 @@ impl AnswerExchange {
             return Ok(rewritten_sdp);
         }
         let rewritten_sdp = client
-            .answer(
+            .answer_in(
+                self.scope.as_ref(),
                 &self.engine_call_id,
                 &self.from_tag,
                 &self.to_tag,
@@ -523,6 +535,7 @@ mod tests {
             sdp: CALLEE_SDP.as_bytes().to_vec(),
             engine_call_id: ANCHORED_CALL_ID.to_string(),
             answerer_sip_call_id: None,
+            scope: None,
         }
     }
 

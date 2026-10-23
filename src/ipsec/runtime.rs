@@ -225,7 +225,7 @@ pub fn pcscf_path_host() -> Option<String> {
 /// A response needs no help here: the dispatcher's reply path pins
 /// `source_local_addr = Some(inbound.local_addr)`, `(pcscf_addr, port_ps)`,
 /// which is SA #2 on TCP, and over UDP the send layer moves it onto SA #3
-/// (TS 33.203 §7.1, `IpsecManager::udp_response_flow`).  But there is no
+/// (TS 33.203 §7.1, `IpsecManager::udp_flow_to_ue`).  But there is no
 /// equivalent capture for an originated MT
 /// request (the script has no inbound to copy from), so without this
 /// helper the dispatcher defaults to the listen-port-5060 listener
@@ -344,7 +344,7 @@ pub(crate) fn outbound_for_sa(
 /// where the response goes: TS 24.229 clause 5.2.6.3.1, "If IMS AKA is used,
 /// the parameter value shall contain the UEs protected server port", matching
 /// TS 33.203 clause 7.1, under which the UE receives its UDP responses on
-/// port_us. The value follows [`SecurityAssociationPair::udp_response_flow`],
+/// port_us. The value follows [`SecurityAssociationPair::udp_flow_to_ue`],
 /// the same decision the dispatcher sends the response by, so the two agree.
 pub(crate) fn received_rport(
     source_port: u16,
@@ -354,8 +354,8 @@ pub(crate) fn received_rport(
     let Some(sa) = protected.filter(|sa| udp && sa.ue_port_c == source_port) else {
         return source_port;
     };
-    match sa.udp_response_flow() {
-        crate::ipsec::UdpResponseFlow::Protected { destination, .. } => destination.port(),
+    match sa.udp_flow_to_ue() {
+        crate::ipsec::UdpFlowToUe::Protected { destination, .. } => destination.port(),
         _ => source_port,
     }
 }

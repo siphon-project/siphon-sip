@@ -66,6 +66,8 @@ mod ipsec_lifecycle;
 #[cfg(test)]
 mod ipsec_lifecycle_tests;
 #[cfg(test)]
+mod ipsec_request_flow_tests;
+#[cfg(test)]
 mod ipsec_response_flow_tests;
 mod late_answer;
 mod liveness;
@@ -319,6 +321,8 @@ mod reply_script_header_tests;
 mod retransmit_capture_tests;
 #[cfg(test)]
 mod rf_reinvite_tests;
+#[cfg(test)]
+mod rf_unsuccessful_attempt_tests;
 #[cfg(test)]
 mod ro_orphan_backstop_tests;
 #[cfg(test)]

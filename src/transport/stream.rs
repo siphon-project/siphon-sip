@@ -32,10 +32,11 @@ use tracing::{debug, error, warn};
 use crate::transport::crlf_keepalive::{drain_leading_crlf_keepalives, CrlfPongTracker};
 use crate::transport::pool::ConnectionPool;
 use crate::transport::response_route;
+use crate::transport::send_queue::{self, SendQueue, TrySendError};
 use crate::transport::tcp::{frame_sip_message, FrameVerdict};
 use crate::transport::{
     ConnectionId, InboundMessage, OutboundMessage, StreamConnections, Transport,
-    CONNECTION_IDLE_TIMEOUT, WRITE_TIMEOUT,
+    CONNECTION_IDLE_TIMEOUT,
 };
 
 /// Create a listening TCP socket with `SO_REUSEADDR`/`SO_REUSEPORT` and the
@@ -407,7 +408,7 @@ fn retire_fallback_lane(
 /// listens on ([`readdress_response`]).
 pub(crate) fn spawn_outbound_distributor(
     outbound_rx: flume::Receiver<OutboundMessage>,
-    connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>>,
+    connection_map: Arc<DashMap<ConnectionId, SendQueue>>,
     transport: Transport,
     pool: Option<Arc<ConnectionPool>>,
 ) {
@@ -425,7 +426,7 @@ pub(crate) fn spawn_outbound_distributor(
 /// not depend on a real pool or the process-wide IPsec config.
 fn spawn_outbound_distributor_with(
     outbound_rx: flume::Receiver<OutboundMessage>,
-    connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>>,
+    connection_map: Arc<DashMap<ConnectionId, SendQueue>>,
     transport: Transport,
     fallback: Option<FallbackSend>,
 ) {
@@ -438,28 +439,28 @@ fn spawn_outbound_distributor_with(
                 .get(&outbound.connection_id)
                 .filter(|sender| !sender.is_closed());
             if let Some(sender) = live {
-                // Non-blocking: NEVER park in `send().await` here. This task is
-                // the single outbound distributor and it holds the
-                // `connection_map` shard read guard for the whole `if let`. A
-                // non-reading peer fills its bounded channel; an awaiting send
-                // would then park holding the guard — stalling outbound for
-                // every connection (head-of-line) and blocking the accept
-                // loop's `insert` on the same shard (accept stops, backlog
-                // fills, engine wedges). `try_send` keeps the guard for only
-                // the synchronous send and sheds for a backed-up (stuck) peer —
-                // it will retransmit or its connection will close.
+                // Non-blocking: NEVER await here. This task is the single
+                // outbound distributor and it holds the `connection_map` shard
+                // read guard for the whole `if let`; an awaiting send would park
+                // holding it, stalling outbound for every connection
+                // (head-of-line) and blocking the accept loop's `insert` on the
+                // same shard. `try_send` cannot park: the queue is bounded by
+                // bytes, not messages, so a burst to a peer that is reading is
+                // queued whole, and only a peer that has fallen a full
+                // `listen.stream_send_queue_bytes` behind sees a refusal. A peer
+                // that stops reading altogether is closed by its writer.
                 let connection_id = outbound.connection_id;
                 // Frames of one message keep their relative order: they enter
-                // the same per-connection channel back to back, and this is the
+                // the same per-connection queue back to back, and this is the
                 // only distributor task feeding it.
                 for frame in outbound.into_frames() {
                     match sender.try_send(frame) {
                         Ok(()) => {}
-                        Err(mpsc::error::TrySendError::Full(_)) => {
-                            warn!("{transport} outbound dropped: connection {connection_id:?} send buffer full (slow/stuck peer)");
+                        Err(TrySendError::Full(_)) => {
+                            sender.log_refused(&format!("{transport} outbound"));
                             break;
                         }
-                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                        Err(TrySendError::Closed(_)) => {
                             warn!(
                                 "{transport} outbound dropped: connection {connection_id:?} closed"
                             );
@@ -500,7 +501,7 @@ pub(crate) async fn serve_sip_stream<R, W>(
     context: StreamContext,
     seed: BytesMut,
     inbound_tx: flume::Sender<InboundMessage>,
-    connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>>,
+    connection_map: Arc<DashMap<ConnectionId, SendQueue>>,
     stream_connections: Option<StreamConnections>,
     crlf_pong_tracker: Option<Arc<CrlfPongTracker>>,
     close_tx: Option<flume::Sender<u64>>,
@@ -543,7 +544,7 @@ pub(crate) async fn serve_sip_stream<R, W>(
 
     // Per-connection outbound channel. Cloned for the read task so it can write
     // RFC 5626 §4.4.1 pong (`\r\n`) responses back over the same connection.
-    let (outbound_tx, mut outbound_rx) = mpsc::channel::<Bytes>(64);
+    let (outbound_tx, mut outbound_rx) = send_queue::channel(transport, connection_id);
     connection_map.insert(connection_id, outbound_tx.clone());
     if let Some(registry) = stream_connections.as_ref() {
         registry.register_on_listener(remote_addr, transport, connection_id, local_addr);
@@ -605,7 +606,7 @@ pub(crate) async fn serve_sip_stream<R, W>(
                                     513,
                                     "Message Too Large",
                                 );
-                                let _ = keepalive_writer.send(Bytes::from(reject.to_bytes())).await;
+                                let _ = keepalive_writer.try_send(Bytes::from(reject.to_bytes()));
                             }
                         }
                         crate::security::record_malformed_message(
@@ -673,20 +674,19 @@ pub(crate) async fn serve_sip_stream<R, W>(
     });
 
     // Write task.
+    let write_timeout = send_queue::write_timeout();
     let mut write_task = tokio::spawn(async move {
         while let Some(data) = outbound_rx.recv().await {
-            match tokio::time::timeout(WRITE_TIMEOUT, writer.write_all(&data)).await {
+            match tokio::time::timeout(write_timeout, writer.write_all(&data)).await {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => {
                     warn!("{transport} write error on {connection_id:?}: {error}");
                     break;
                 }
+                // The peer is not draining the connection (zero receive
+                // window): close it as stuck.
                 Err(_) => {
-                    warn!(
-                        "{transport} write stalled on {connection_id:?} after \
-                         {WRITE_TIMEOUT:?} — peer is not draining the connection \
-                         (zero receive window); closing it"
-                    );
+                    outbound_rx.stalled(remote_addr);
                     break;
                 }
             }
@@ -1193,7 +1193,7 @@ mod tests {
         });
         let connection_map = Arc::new(DashMap::new());
         let live = ConnectionId(42);
-        let (live_tx, mut live_rx) = mpsc::channel::<Bytes>(4);
+        let (live_tx, mut live_rx) = send_queue::channel(Transport::Tcp, live);
         connection_map.insert(live, live_tx);
         let (outbound_tx, outbound_rx) = flume::unbounded();
         spawn_outbound_distributor_with(
@@ -1422,8 +1422,7 @@ mod tests {
     /// reason.
     #[tokio::test(start_paused = true)]
     async fn a_peer_that_stops_reading_is_disconnected_rather_than_pinned_forever() {
-        let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
-            Arc::new(DashMap::new());
+        let connection_map: Arc<DashMap<ConnectionId, SendQueue>> = Arc::new(DashMap::new());
         let (inbound_tx, _inbound_rx) = flume::unbounded();
 
         let served = tokio::spawn(serve_sip_stream(
@@ -1446,8 +1445,7 @@ mod tests {
             tokio::task::yield_now().await;
         };
         sender
-            .send(Bytes::from_static(b"SIP/2.0 200 OK\r\n\r\n"))
-            .await
+            .try_send(Bytes::from_static(b"SIP/2.0 200 OK\r\n\r\n"))
             .expect("the writer task is live");
 
         let started = tokio::time::Instant::now();
@@ -1794,8 +1792,7 @@ mod tests {
         let (mut client, server) = tokio::io::duplex(4096);
         let (reader, writer) = tokio::io::split(server);
         let (inbound_tx, _inbound_rx) = flume::unbounded();
-        let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
-            Arc::new(DashMap::new());
+        let connection_map: Arc<DashMap<ConnectionId, SendQueue>> = Arc::new(DashMap::new());
         let tracker = Arc::new(crate::transport::crlf_keepalive::CrlfPongTracker::new());
         let (close_tx, close_rx) = flume::unbounded();
         // An id no other test uses: the closer registry is process-wide.
@@ -1930,8 +1927,7 @@ mod tests {
         let (mut client, server) = tokio::io::duplex(4096);
         let (reader, writer) = tokio::io::split(server);
         let (inbound_tx, _inbound_rx) = flume::unbounded();
-        let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
-            Arc::new(DashMap::new());
+        let connection_map: Arc<DashMap<ConnectionId, SendQueue>> = Arc::new(DashMap::new());
         tokio::spawn(serve_sip_stream(
             reader,
             writer,
@@ -1950,8 +1946,7 @@ mod tests {
             tokio::task::yield_now().await;
         };
         sender
-            .send(Bytes::from_static(b"SIP/2.0 200 OK\r\n\r\n"))
-            .await
+            .try_send(Bytes::from_static(b"SIP/2.0 200 OK\r\n\r\n"))
             .unwrap();
         let mut out = vec![0u8; 18];
         client.read_exact(&mut out).await.unwrap();
@@ -2047,8 +2042,7 @@ mod tests {
         let (mut client, server) = tokio::io::duplex(8192);
         let (reader, writer) = tokio::io::split(server);
         let (inbound_tx, inbound_rx) = flume::unbounded();
-        let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
-            Arc::new(DashMap::new());
+        let connection_map: Arc<DashMap<ConnectionId, SendQueue>> = Arc::new(DashMap::new());
         let registry = StreamConnections::new();
         let (close_tx, close_rx) = flume::unbounded();
         let served = tokio::spawn(serve_sip_stream(

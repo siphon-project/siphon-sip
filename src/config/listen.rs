@@ -58,6 +58,14 @@ fn default_udp_recv_buffer_bytes() -> usize {
     1024 * 1024
 }
 
+fn default_stream_send_queue_bytes() -> usize {
+    crate::transport::send_queue::DEFAULT_SEND_QUEUE_BYTES
+}
+
+fn default_stream_write_timeout_ms() -> u64 {
+    5000
+}
+
 pub fn dscp_to_tos(dscp: u8) -> u32 {
     (dscp as u32) << 2
 }
@@ -459,6 +467,17 @@ pub struct ListenConfig {
     /// warns when it was clamped. `0` leaves the kernel default in place.
     #[serde(default = "default_udp_recv_buffer_bytes")]
     pub udp_recv_buffer_bytes: usize,
+    /// Bound, in bytes, on what one TCP/TLS/WS/WSS/SCTP connection may have
+    /// queued for its writer. Default 4 MiB. A frame that would take the queue
+    /// past it is refused (a relayed request then fails at once with a
+    /// transport error) rather than queued; an empty queue always takes one
+    /// frame, so no single message is too large for it.
+    #[serde(default = "default_stream_send_queue_bytes")]
+    pub stream_send_queue_bytes: usize,
+    /// How long one write to a TCP/TLS/WS/WSS/SCTP peer may make no progress
+    /// before the connection is closed as stuck. Default 5000 ms.
+    #[serde(default = "default_stream_write_timeout_ms")]
+    pub stream_write_timeout_ms: u64,
     #[serde(default)]
     pub udp: Vec<ListenEntry>,
     #[serde(default)]
@@ -482,6 +501,8 @@ impl Default for ListenConfig {
             dscp: default_dscp(),
             mtu: None,
             udp_recv_buffer_bytes: default_udp_recv_buffer_bytes(),
+            stream_send_queue_bytes: default_stream_send_queue_bytes(),
+            stream_write_timeout_ms: default_stream_write_timeout_ms(),
             udp: Vec::new(),
             tcp: Vec::new(),
             tls: Vec::new(),
