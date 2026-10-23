@@ -4449,6 +4449,29 @@ script:
 }
 
 #[test]
+fn stream_send_queue_defaults_and_overrides() {
+    let config = Config::from_str(minimal_yaml()).unwrap();
+    assert_eq!(config.listen.stream_send_queue_bytes, 4 * 1024 * 1024);
+    assert_eq!(config.listen.stream_write_timeout_ms, 5000);
+
+    let yaml = r#"
+listen:
+  stream_send_queue_bytes: 1048576
+  stream_write_timeout_ms: 2000
+  udp:
+    - "0.0.0.0:5060"
+domain:
+  local:
+    - "example.com"
+script:
+  path: "scripts/proxy_default.py"
+"#;
+    let config = Config::from_str(yaml).unwrap();
+    assert_eq!(config.listen.stream_send_queue_bytes, 1024 * 1024);
+    assert_eq!(config.listen.stream_write_timeout_ms, 2000);
+}
+
+#[test]
 fn dscp_to_tos_conversion() {
     assert_eq!(dscp_to_tos(0), 0); // BE
     assert_eq!(dscp_to_tos(24), 96); // CS3 → signaling

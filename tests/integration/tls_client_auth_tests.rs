@@ -11,12 +11,11 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use bytes::Bytes;
 use dashmap::DashMap;
 use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+use siphon::transport::send_queue::SendQueue;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::mpsc;
 use tokio_rustls::rustls;
 
 use siphon::config::{Config, ListenEntry, TlsServerConfig};
@@ -143,7 +142,7 @@ struct SipListener {
 async fn start_tls(block: &TlsServerConfig, entry: &ListenEntry) -> SipListener {
     let (inbound_tx, inbound) = flume::unbounded();
     let (outbound, outbound_rx) = flume::unbounded::<OutboundMessage>();
-    let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> = Arc::new(DashMap::new());
+    let connection_map: Arc<DashMap<ConnectionId, SendQueue>> = Arc::new(DashMap::new());
     let address = tls::listen(
         entry.address().parse().expect("listen address"),
         &block.for_listener(entry.client_auth()),

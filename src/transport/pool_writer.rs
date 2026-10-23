@@ -29,13 +29,13 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use bytes::Bytes;
 use tokio::io::AsyncWriteExt;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
+use crate::transport::send_queue::SendQueueReceiver;
 use crate::transport::ConnectionId;
 
 /// Whether a connection bound to `bind_addr` leaves from a local port its
@@ -46,7 +46,7 @@ pub(crate) fn pins_local_port(bind_addr: SocketAddr) -> bool {
 
 /// What the writer task held when it ended: its half of the socket and the
 /// receiver the pool's senders feed.
-type WriterParts = (OwnedWriteHalf, mpsc::Receiver<Bytes>);
+type WriterParts = (OwnedWriteHalf, SendQueueReceiver);
 
 /// The writer task of one pooled TCP connection, as its reader holds it.
 pub(crate) struct PoolWriter {
@@ -72,7 +72,7 @@ impl PoolWriter {
     /// For a pinned port it hands both back to [`close`](Self::close).
     pub(crate) fn spawn(
         mut writer: OwnedWriteHalf,
-        mut write_rx: mpsc::Receiver<Bytes>,
+        mut write_rx: SendQueueReceiver,
         write_timeout: Duration,
         connection_id: ConnectionId,
         destination: SocketAddr,
@@ -89,15 +89,11 @@ impl PoolWriter {
                             warn!("pool: TCP write error on {:?}: {}", connection_id, error);
                             break;
                         }
+                        // Peer accepted the connection but is not draining
+                        // it (zero receive window): drop the connection so
+                        // callers stop queueing behind it.
                         Err(_) => {
-                            warn!(
-                                connection_id = ?connection_id,
-                                destination = %destination,
-                                timeout = ?write_timeout,
-                                "pool: TCP write stalled — peer accepted the connection \
-                                 but is not draining it (zero receive window); dropping \
-                                 the connection so callers stop queueing behind it"
-                            );
+                            write_rx.stalled(destination);
                             break;
                         }
                     }
@@ -157,7 +153,7 @@ impl PoolWriter {
         mut self,
         reader: OwnedReadHalf,
         peer_closed: bool,
-    ) -> Option<mpsc::Receiver<Bytes>> {
+    ) -> Option<SendQueueReceiver> {
         if !self.pinned {
             return None;
         }

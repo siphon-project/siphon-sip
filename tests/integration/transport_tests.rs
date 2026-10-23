@@ -14,9 +14,9 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use dashmap::DashMap;
+use siphon::transport::send_queue::SendQueue;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
-use tokio::sync::mpsc;
 
 use siphon::transport::acl::TransportAcl;
 use siphon::transport::mux::MuxChannels;
@@ -219,7 +219,7 @@ async fn udp_roundtrip() {
 async fn tcp_roundtrip() {
     let (inbound_tx, inbound_rx) = flume::unbounded();
     let (outbound_tx, outbound_rx) = flume::unbounded::<OutboundMessage>();
-    let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> = Arc::new(DashMap::new());
+    let connection_map: Arc<DashMap<ConnectionId, SendQueue>> = Arc::new(DashMap::new());
 
     let addr = tcp::listen(
         LOOPBACK_ANY_PORT,
@@ -298,7 +298,7 @@ async fn tcp_roundtrip() {
 async fn tcp_close_notifies_flow_failure() {
     let (inbound_tx, inbound_rx) = flume::unbounded();
     let (_outbound_tx, outbound_rx) = flume::unbounded::<OutboundMessage>();
-    let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> = Arc::new(DashMap::new());
+    let connection_map: Arc<DashMap<ConnectionId, SendQueue>> = Arc::new(DashMap::new());
     let (close_tx, close_rx) = flume::unbounded::<u64>();
 
     let addr = tcp::listen(
@@ -385,7 +385,7 @@ async fn tcp_outbound_fallback_to_pool_when_no_connection() {
     //    uses only the IP, to bind outbound connections, so port 0 stands in.
     let (inbound_tx, _inbound_rx) = flume::unbounded();
     let (outbound_tx, outbound_rx) = flume::unbounded::<OutboundMessage>();
-    let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> = Arc::new(DashMap::new());
+    let connection_map: Arc<DashMap<ConnectionId, SendQueue>> = Arc::new(DashMap::new());
     let pool = Arc::new(ConnectionPool::new(
         Arc::clone(&connection_map),
         inbound_tx.clone(),
@@ -487,7 +487,7 @@ async fn tcp_responds_to_peer_crlf_ping_with_pong() {
     use siphon::transport::crlf_keepalive::CrlfPongTracker;
     let (inbound_tx, inbound_rx) = flume::unbounded();
     let (_outbound_tx, outbound_rx) = flume::unbounded::<OutboundMessage>();
-    let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> = Arc::new(DashMap::new());
+    let connection_map: Arc<DashMap<ConnectionId, SendQueue>> = Arc::new(DashMap::new());
     let tracker = Arc::new(CrlfPongTracker::new());
 
     let addr = tcp::listen(
@@ -562,7 +562,7 @@ async fn tls_roundtrip() {
 
     let (inbound_tx, inbound_rx) = flume::unbounded();
     let (outbound_tx, outbound_rx) = flume::unbounded::<OutboundMessage>();
-    let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> = Arc::new(DashMap::new());
+    let connection_map: Arc<DashMap<ConnectionId, SendQueue>> = Arc::new(DashMap::new());
 
     let addr = tls::listen(
         LOOPBACK_ANY_PORT,
@@ -651,7 +651,7 @@ async fn ws_roundtrip() {
 
     let (inbound_tx, inbound_rx) = flume::unbounded();
     let (outbound_tx, outbound_rx) = flume::unbounded::<OutboundMessage>();
-    let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> = Arc::new(DashMap::new());
+    let connection_map: Arc<DashMap<ConnectionId, SendQueue>> = Arc::new(DashMap::new());
 
     let addr = ws::listen(
         LOOPBACK_ANY_PORT,
@@ -741,7 +741,7 @@ async fn wss_roundtrip() {
 
     let (inbound_tx, inbound_rx) = flume::unbounded();
     let (outbound_tx, outbound_rx) = flume::unbounded::<OutboundMessage>();
-    let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> = Arc::new(DashMap::new());
+    let connection_map: Arc<DashMap<ConnectionId, SendQueue>> = Arc::new(DashMap::new());
 
     let addr = ws::listen_secure(
         LOOPBACK_ANY_PORT,
@@ -842,10 +842,8 @@ async fn multi_transport_shared_inbound_channel() {
     let (_tcp_outbound_tx, tcp_outbound_rx) = flume::unbounded::<OutboundMessage>();
     let (_ws_outbound_tx, ws_outbound_rx) = flume::unbounded::<OutboundMessage>();
 
-    let tcp_connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
-        Arc::new(DashMap::new());
-    let ws_connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
-        Arc::new(DashMap::new());
+    let tcp_connection_map: Arc<DashMap<ConnectionId, SendQueue>> = Arc::new(DashMap::new());
+    let ws_connection_map: Arc<DashMap<ConnectionId, SendQueue>> = Arc::new(DashMap::new());
 
     // Start all three transports with the same inbound_tx
     let udp_addr = udp::listen(
@@ -1062,7 +1060,7 @@ struct ProxiedListener {
 async fn tcp_listener_with_proxy(proxy_protocol: Option<Arc<ProxyProtocolAcl>>) -> ProxiedListener {
     let (inbound_tx, inbound_rx) = flume::unbounded();
     let (outbound_tx, outbound_rx) = flume::unbounded::<OutboundMessage>();
-    let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> = Arc::new(DashMap::new());
+    let connection_map: Arc<DashMap<ConnectionId, SendQueue>> = Arc::new(DashMap::new());
     let addr = tcp::listen(
         LOOPBACK_ANY_PORT,
         inbound_tx,
@@ -1146,7 +1144,7 @@ async fn tls_proxy_protocol_substitutes_the_client_address() {
 
     let (inbound_tx, inbound_rx) = flume::unbounded();
     let (_outbound_tx, outbound_rx) = flume::unbounded::<OutboundMessage>();
-    let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> = Arc::new(DashMap::new());
+    let connection_map: Arc<DashMap<ConnectionId, SendQueue>> = Arc::new(DashMap::new());
 
     let addr = tls::listen(
         LOOPBACK_ANY_PORT,
@@ -1200,7 +1198,7 @@ async fn ws_proxy_protocol_substitutes_the_client_address() {
 
     let (inbound_tx, inbound_rx) = flume::unbounded();
     let (_outbound_tx, outbound_rx) = flume::unbounded::<OutboundMessage>();
-    let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> = Arc::new(DashMap::new());
+    let connection_map: Arc<DashMap<ConnectionId, SendQueue>> = Arc::new(DashMap::new());
 
     let addr = ws::listen(
         LOOPBACK_ANY_PORT,
@@ -1254,7 +1252,7 @@ async fn wss_proxy_protocol_substitutes_the_client_address() {
 
     let (inbound_tx, inbound_rx) = flume::unbounded();
     let (_outbound_tx, outbound_rx) = flume::unbounded::<OutboundMessage>();
-    let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> = Arc::new(DashMap::new());
+    let connection_map: Arc<DashMap<ConnectionId, SendQueue>> = Arc::new(DashMap::new());
 
     let addr = ws::listen_secure(
         LOOPBACK_ANY_PORT,

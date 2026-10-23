@@ -5,7 +5,7 @@
 //! reuses connections, keyed by `(SocketAddr, Transport)`.
 //!
 //! Architecture:
-//!   - Pool stores `mpsc::Sender<Bytes>` per destination (same pattern as inbound connections)
+//!   - Pool stores `SendQueue` per destination (same pattern as inbound connections)
 //!   - Each pooled connection has a read task that feeds responses back to the inbound channel
 //!   - Idle connections are closed after [`POOL_IDLE_TIMEOUT`], except to a
 //!     destination named in [`ConnectionPool::set_idle_exempt_destinations`]
@@ -26,7 +26,6 @@ use arc_swap::{ArcSwap, ArcSwapOption};
 use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::mpsc;
 use tokio_rustls::TlsConnector;
 use tracing::{debug, error, info, warn};
 
@@ -34,10 +33,11 @@ use crate::config::TlsMethod;
 use crate::transport::crlf_keepalive::{drain_leading_crlf_keepalives, CrlfPongTracker};
 use crate::transport::hold::{ConnectionHold, ConnectionHolds};
 use crate::transport::pool_writer::{pins_local_port, PoolWriter};
+use crate::transport::send_queue::{self, SendQueue, TrySendError};
 use crate::transport::tcp::{frame_sip_message, FrameVerdict};
 use crate::transport::{
     configure_tcp_socket, next_connection_id, ConnectionId, InboundMessage, StreamConnections,
-    Transport, WRITE_TIMEOUT,
+    Transport,
 };
 
 /// Idle timeout for pooled outbound connections (shorter than inbound).
@@ -73,18 +73,6 @@ const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// a process abort.
 const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Bound on handing a message to a connection's writer task.
-///
-/// The producers are SIP relays running *inside* a Python handler job, so a
-/// parked producer burns a script-executor worker; enough of them and the
-/// watchdog aborts the process.  This is deliberately a short park rather than
-/// [`tokio::sync::mpsc::Sender::try_send`]: the outbound distributor sheds
-/// instantly because a dropped *response* is cheap, but shedding a *request*
-/// costs the caller a 503 (RFC 3261 §16.9), so a scheduler hiccup on a healthy
-/// peer must not look like a dead one.  250 ms absorbs that and is still three
-/// orders of magnitude short of the 30 s watchdog window.
-const ENQUEUE_TIMEOUT: Duration = Duration::from_millis(250);
-
 /// Key for a pooled connection: destination address + transport type + the
 /// requested local *bind* address.
 ///
@@ -113,7 +101,7 @@ struct PoolKey {
 /// A pooled outbound connection.
 struct PoolEntry {
     connection_id: ConnectionId,
-    sender: mpsc::Sender<Bytes>,
+    sender: SendQueue,
 }
 
 /// Connection pool for outbound TCP/TLS connections.
@@ -131,7 +119,7 @@ pub struct ConnectionPool {
     /// Shared connection map (same one used by inbound connections).
     /// Pooled connections are also registered here so responses can be
     /// routed back via the same connection_id.
-    connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>>,
+    connection_map: Arc<DashMap<ConnectionId, SendQueue>>,
     /// Channel to feed inbound responses back to the dispatcher.
     inbound_tx: flume::Sender<InboundMessage>,
     /// Local address to use as source in InboundMessage.
@@ -167,13 +155,14 @@ pub struct ConnectionPool {
     /// A field rather than a bare const so tests can drive a short value and
     /// exercise the timeout branch in milliseconds.
     connect_timeout: Duration,
-    /// Per-write bound in the writer tasks (defaults to [`WRITE_TIMEOUT`]).
+    /// Per-write bound in the writer tasks (defaults to
+    /// `listen.stream_write_timeout_ms`, see [`send_queue::write_timeout`]).
     /// A field for the same reason as `connect_timeout`: a test needs to make a
     /// non-draining peer time out in milliseconds, not seconds.
     write_timeout: Duration,
-    /// Bound on handing a message to a writer task (defaults to
-    /// [`ENQUEUE_TIMEOUT`]).  A field for the same reason.
-    enqueue_timeout: Duration,
+    /// Byte bound on each connection's send queue (defaults to
+    /// `listen.stream_send_queue_bytes`).  A field for the same reason.
+    send_queue_bytes: usize,
     /// How long an outbound TCP connection may sit silent before its reader
     /// closes it (defaults to [`POOL_IDLE_TIMEOUT`]).  A field for the same
     /// reason as the three above: a test drives the reap in milliseconds rather
@@ -199,7 +188,7 @@ use crate::transport::outbound_tls::{
 /// per-destination lock so the enqueue can happen with the guard released.
 enum Coalesced {
     /// Another caller established the connection while we waited for the lock.
-    Reuse((ConnectionId, mpsc::Sender<Bytes>)),
+    Reuse((ConnectionId, SendQueue)),
     /// We established it ourselves; the message went out with the handshake.
     Established(Result<ConnectionId, std::io::Error>),
 }
@@ -211,23 +200,25 @@ enum Enqueued {
     /// The receiver is gone: the writer task exited, so the connection is dead.
     /// Evict the pool entry and establish a fresh one.
     Closed,
-    /// The channel stayed full for the whole window.  The peer is backed up but
-    /// the connection is not provably dead, so keep it — [`WRITE_TIMEOUT`] in
-    /// the writer task is what decides that — and shed this message.
+    /// The queue is at its byte bound.  The peer is backed up but the
+    /// connection is not provably dead, so keep it — the writer's own write
+    /// timeout is what decides that — and refuse this message.
     Backlogged,
 }
 
-/// Hand `data` to a connection's writer task without ever parking indefinitely.
+/// Hand `data` to a connection's writer task without waiting.
 ///
-/// The `Sender` is taken by value (cheap `Arc` clone) rather than borrowed out
-/// of the `connections` map, because awaiting while holding a `DashMap` read
-/// guard blocks every insert and remove landing on the same shard — a second
-/// way to wedge the pool, and the one `spawn_outbound_distributor` calls out.
-async fn enqueue(sender: &mpsc::Sender<Bytes>, data: Bytes, timeout: Duration) -> Enqueued {
-    match sender.send_timeout(data, timeout).await {
+/// The producers are SIP relays running *inside* a Python handler job, so a
+/// parked producer burns a script-executor worker.  The queue is bounded by
+/// bytes ([`send_queue`]), so a peer that is reading takes any burst, and one
+/// that has fallen the whole bound behind is refused at once: a relayed request
+/// then fails with a transport error the caller turns into a 503 or the next
+/// target (RFC 3261 §8.1.3.1, §16.9), instead of waiting out Timer B/F.
+fn enqueue(sender: &SendQueue, data: Bytes) -> Enqueued {
+    match sender.try_send(data) {
         Ok(()) => Enqueued::Sent,
-        Err(mpsc::error::SendTimeoutError::Closed(_)) => Enqueued::Closed,
-        Err(mpsc::error::SendTimeoutError::Timeout(_)) => Enqueued::Backlogged,
+        Err(TrySendError::Closed(_)) => Enqueued::Closed,
+        Err(TrySendError::Full(_)) => Enqueued::Backlogged,
     }
 }
 
@@ -237,18 +228,11 @@ async fn enqueue(sender: &mpsc::Sender<Bytes>, data: Bytes, timeout: Duration) -
 /// draining.  Callers treat any `Err` here the same way (RFC 3261 §16.9 — a
 /// transport refusal is a 503 on that branch), so this only has to be honest in
 /// the log.
-fn backlogged(destination: SocketAddr, timeout: Duration) -> std::io::Error {
-    warn!(
-        destination = %destination,
-        timeout = ?timeout,
-        "pool: peer is not draining its socket — outbound queue still full after \
-         the enqueue window; shedding this message rather than stranding the \
-         caller (the writer's own timeout will tear the connection down if it \
-         stays stuck)"
-    );
+fn backlogged(destination: SocketAddr, sender: &SendQueue) -> std::io::Error {
+    sender.log_refused(&format!("pool send to {destination}"));
     std::io::Error::new(
         std::io::ErrorKind::WouldBlock,
-        "pooled connection outbound queue full",
+        "pooled connection send queue full",
     )
 }
 
@@ -271,7 +255,7 @@ fn evict_if_current(
 
 impl ConnectionPool {
     pub fn new(
-        connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>>,
+        connection_map: Arc<DashMap<ConnectionId, SendQueue>>,
         inbound_tx: flume::Sender<InboundMessage>,
         local_addr: SocketAddr,
         tos: Option<u32>,
@@ -292,8 +276,8 @@ impl ConnectionPool {
             stream_connections,
             crlf_pong_tracker,
             connect_timeout: TCP_CONNECT_TIMEOUT,
-            write_timeout: WRITE_TIMEOUT,
-            enqueue_timeout: ENQUEUE_TIMEOUT,
+            write_timeout: send_queue::write_timeout(),
+            send_queue_bytes: send_queue::send_queue_bytes(),
             idle_timeout: POOL_IDLE_TIMEOUT,
             idle_exempt: Arc::new(DashMap::new()),
             holds: ConnectionHolds::new(),
@@ -365,11 +349,9 @@ impl ConnectionPool {
             // Fast path: reuse a live pooled connection without taking the
             // per-destination establishment lock.
             if let Some((connection_id, sender)) = self.pooled(&key) {
-                match enqueue(&sender, data.clone(), self.enqueue_timeout).await {
+                match enqueue(&sender, data.clone()) {
                     Enqueued::Sent => return Ok(connection_id),
-                    Enqueued::Backlogged => {
-                        return Err(backlogged(destination, self.enqueue_timeout))
-                    }
+                    Enqueued::Backlogged => return Err(backlogged(destination, &sender)),
                     // Writer task gone — drop the corpse and establish afresh.
                     Enqueued::Closed => {
                         evict_if_current(&self.connections, &key, connection_id);
@@ -419,11 +401,9 @@ impl ConnectionPool {
             match coalesced {
                 Coalesced::Established(result) => return result,
                 Coalesced::Reuse((connection_id, sender)) => {
-                    match enqueue(&sender, data.clone(), self.enqueue_timeout).await {
+                    match enqueue(&sender, data.clone()) {
                         Enqueued::Sent => return Ok(connection_id),
-                        Enqueued::Backlogged => {
-                            return Err(backlogged(destination, self.enqueue_timeout))
-                        }
+                        Enqueued::Backlogged => return Err(backlogged(destination, &sender)),
                         // Died in the window between the re-check and the
                         // enqueue.  Evict and take the second attempt, which
                         // will establish.
@@ -448,7 +428,7 @@ impl ConnectionPool {
     /// shard guard across it.  Holding one blocks every insert and remove that
     /// hashes to the same shard, which is a second way to wedge the pool and
     /// the one `spawn_outbound_distributor` documents.
-    fn pooled(&self, key: &PoolKey) -> Option<(ConnectionId, mpsc::Sender<Bytes>)> {
+    fn pooled(&self, key: &PoolKey) -> Option<(ConnectionId, SendQueue)> {
         self.connections
             .get(key)
             .map(|entry| (entry.connection_id, entry.sender.clone()))
@@ -555,7 +535,8 @@ impl ConnectionPool {
         let pinned = pins_local_port(bind_addr);
 
         // Per-connection write channel
-        let (write_tx, write_rx) = mpsc::channel::<Bytes>(64);
+        let (write_tx, write_rx) =
+            send_queue::channel_with_limit(Transport::Tcp, connection_id, self.send_queue_bytes);
 
         // Register in the shared connection map so the outbound distributor
         // can route responses back on this connection.
@@ -748,10 +729,10 @@ impl ConnectionPool {
             drop(write_rx);
         });
 
-        // Send the initial data.  Bounded like every other enqueue: the writer
+        // Send the initial data.  Never waits, like every other enqueue: the writer
         // task above is live but a peer that never reads still backs the
         // channel up, and this runs on a script-executor worker.
-        match enqueue(&write_tx, data, self.enqueue_timeout).await {
+        match enqueue(&write_tx, data) {
             Enqueued::Sent => {}
             Enqueued::Closed => {
                 return Err(std::io::Error::new(
@@ -760,7 +741,7 @@ impl ConnectionPool {
                 ));
             }
             Enqueued::Backlogged => {
-                return Err(backlogged(destination, self.enqueue_timeout));
+                return Err(backlogged(destination, &write_tx));
             }
         }
 
@@ -904,9 +885,9 @@ impl ConnectionPool {
         // out of the map so no shard guard is held across the await — same
         // reasoning as the TCP path.
         if let Some((connection_id, sender)) = self.pooled(&key) {
-            match enqueue(&sender, data.clone(), self.enqueue_timeout).await {
+            match enqueue(&sender, data.clone()) {
                 Enqueued::Sent => return Ok(connection_id),
-                Enqueued::Backlogged => return Err(backlogged(destination, self.enqueue_timeout)),
+                Enqueued::Backlogged => return Err(backlogged(destination, &sender)),
                 // Connection dead — remove and create new
                 Enqueued::Closed => {
                     evict_if_current(&self.connections, &key, connection_id);
@@ -1025,7 +1006,8 @@ impl ConnectionPool {
         let (mut reader, mut writer) = tokio::io::split(tls_stream);
 
         // Per-connection write channel
-        let (write_tx, mut write_rx) = mpsc::channel::<Bytes>(64);
+        let (write_tx, mut write_rx) =
+            send_queue::channel_with_limit(Transport::Tls, connection_id, self.send_queue_bytes);
 
         // Register in the shared connection map
         self.connection_map.insert(connection_id, write_tx.clone());
@@ -1165,23 +1147,18 @@ impl ConnectionPool {
                         warn!("pool: TLS write error on {:?}: {}", connection_id, error);
                         break;
                     }
+                    // Peer is not draining the connection: drop it so
+                    // callers stop queueing behind it.
                     Err(_) => {
-                        warn!(
-                            connection_id = ?connection_id,
-                            destination = %destination,
-                            timeout = ?write_timeout,
-                            "pool: TLS write stalled — peer is not draining the \
-                             connection; dropping it so callers stop queueing \
-                             behind it"
-                        );
+                        write_rx.stalled(destination);
                         break;
                     }
                 }
             }
         });
 
-        // Send the initial data (bounded — see the TCP path).
-        match enqueue(&write_tx, data, self.enqueue_timeout).await {
+        // Send the initial data (never waits — see the TCP path).
+        match enqueue(&write_tx, data) {
             Enqueued::Sent => {}
             Enqueued::Closed => {
                 return Err(std::io::Error::new(
@@ -1190,7 +1167,7 @@ impl ConnectionPool {
                 ));
             }
             Enqueued::Backlogged => {
-                return Err(backlogged(destination, self.enqueue_timeout));
+                return Err(backlogged(destination, &write_tx));
             }
         }
 
@@ -1505,6 +1482,7 @@ impl ConnectionPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::sync::mpsc;
 
     fn ensure_crypto_provider() {
         let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
@@ -1595,6 +1573,10 @@ mod tests {
                     Ok(connection_id) => {
                         carried_on.insert(connection_id);
                     }
+                    // A refusal only says the queue got ahead of the writer.
+                    // The peer is stuck once it is still refused after the
+                    // writer has had time to fill the socket buffers.
+                    Err(_) if writer_caught_up(pool, peer).await => {}
                     Err(_) => return (attempt, carried_on),
                 }
             }
@@ -1609,6 +1591,15 @@ mod tests {
              and every caller — each one a script-executor worker — parks \
              forever until the watchdog aborts the process.",
         )
+    }
+
+    /// Give a connection's writer time to drain its queue into the socket, and
+    /// say whether it did.
+    async fn writer_caught_up(pool: &ConnectionPool, peer: SocketAddr) -> bool {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let key = tcp_key(pool, peer);
+        pool.pooled(&key)
+            .is_some_and(|(_, sender)| sender.queued_bytes() == 0)
     }
 
     #[tokio::test]
@@ -2469,54 +2460,75 @@ mod tests {
     // A peer that stops draining must never park the caller
     // -----------------------------------------------------------------------
 
-    /// The unit half: the enqueue helper both the TCP and TLS paths share must
-    /// give up on a channel that stays full, rather than waiting for capacity
-    /// that a stalled writer will never release.
+    /// The unit half: the enqueue helper both the TCP and TLS paths share
+    /// refuses at once on a queue at its byte bound, rather than waiting for
+    /// room that a stalled writer will never make.
     #[tokio::test]
-    async fn enqueue_sheds_when_the_channel_stays_full() {
-        let (sender, _receiver) = mpsc::channel::<Bytes>(2);
-        sender.send(Bytes::from_static(b"one")).await.unwrap();
-        sender.send(Bytes::from_static(b"two")).await.unwrap();
-
-        let started = std::time::Instant::now();
-        let outcome = enqueue(
-            &sender,
-            Bytes::from_static(b"three"),
-            Duration::from_millis(50),
-        )
-        .await;
-
+    async fn enqueue_refuses_at_once_when_the_queue_is_at_its_bound() {
+        let (sender, _receiver) =
+            send_queue::channel_with_limit(Transport::Tcp, ConnectionId(1), 6);
+        assert!(matches!(
+            enqueue(&sender, Bytes::from_static(b"one")),
+            Enqueued::Sent
+        ));
+        assert!(matches!(
+            enqueue(&sender, Bytes::from_static(b"two")),
+            Enqueued::Sent
+        ));
         assert!(
-            matches!(outcome, Enqueued::Backlogged),
-            "a channel that never drains must report Backlogged, not park"
-        );
-        assert!(
-            started.elapsed() < Duration::from_secs(1),
-            "the enqueue must give up at its own timeout"
+            matches!(
+                enqueue(&sender, Bytes::from_static(b"three")),
+                Enqueued::Backlogged
+            ),
+            "a queue at its bound must report Backlogged, not park"
         );
     }
 
-    /// A closed channel is a dead connection, and has to stay distinguishable
+    /// A closed queue is a dead connection, and has to stay distinguishable
     /// from a merely backed-up one: `Closed` evicts and re-establishes, whereas
     /// `Backlogged` keeps the connection (the writer's own timeout is what
     /// decides a peer is stuck).
     #[tokio::test]
     async fn enqueue_reports_closed_when_the_writer_is_gone() {
-        let (sender, receiver) = mpsc::channel::<Bytes>(2);
+        let (sender, receiver) = send_queue::channel_with_limit(Transport::Tcp, ConnectionId(1), 6);
         drop(receiver);
-
-        let outcome = enqueue(
-            &sender,
-            Bytes::from_static(b"anything"),
-            Duration::from_secs(30),
-        )
-        .await;
-
         assert!(
-            matches!(outcome, Enqueued::Closed),
-            "a dropped receiver must report Closed immediately, not wait out the \
-             timeout"
+            matches!(
+                enqueue(&sender, Bytes::from_static(b"anything")),
+                Enqueued::Closed
+            ),
+            "a dropped receiver must report Closed"
         );
+    }
+
+    /// A burst far past the old 64-message bound, to a peer that reads, all
+    /// goes out on the one pooled connection, in order.
+    #[tokio::test]
+    async fn a_burst_of_pool_sends_to_a_reading_peer_all_arrive_in_order() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer = listener.local_addr().unwrap();
+        let pool = test_pool();
+        const BURST: usize = 500;
+        let mut connections = std::collections::HashSet::new();
+        for sequence in 0..BURST {
+            let frame = Bytes::from(format!("{sequence:08}\n"));
+            connections.insert(pool.send_tcp(peer, frame).await.expect("never refused"));
+        }
+        assert_eq!(
+            connections.len(),
+            1,
+            "one connection carries the whole burst"
+        );
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut received = vec![0u8; BURST * 9];
+        tokio::time::timeout(Duration::from_secs(5), socket.read_exact(&mut received))
+            .await
+            .expect("the whole burst arrives")
+            .unwrap();
+        let expected: Vec<u8> = (0..BURST)
+            .flat_map(|sequence| format!("{sequence:08}\n").into_bytes())
+            .collect();
+        assert!(received == expected, "every send arrives once, in order");
     }
 
     /// The regression for the process abort.
@@ -2529,7 +2541,7 @@ mod tests {
         let (peer, _accepted) = spawn_non_draining_peer().await;
 
         let mut pool = test_pool();
-        pool.enqueue_timeout = Duration::from_millis(50);
+        pool.send_queue_bytes = 64 * 1024;
         pool.write_timeout = Duration::from_millis(200);
 
         let (refused_at, _) = send_until_refused(&pool, peer).await;
@@ -2551,7 +2563,7 @@ mod tests {
         let (peer, mut accepted) = spawn_non_draining_peer().await;
 
         let mut pool = test_pool();
-        pool.enqueue_timeout = Duration::from_millis(50);
+        pool.send_queue_bytes = 64 * 1024;
         pool.write_timeout = Duration::from_millis(200);
         let key = tcp_key(&pool, peer);
 
@@ -2617,7 +2629,7 @@ mod tests {
         let (peer, mut accepted) = spawn_non_draining_peer().await;
 
         let mut pool = test_pool();
-        pool.enqueue_timeout = Duration::from_millis(50);
+        pool.send_queue_bytes = 64 * 1024;
         pool.write_timeout = Duration::from_millis(200);
         let key = tcp_key(&pool, peer);
 
@@ -3419,7 +3431,7 @@ mod tests {
         async fn a_connection_whose_writer_gave_up_frees_its_port_at_once() {
             let (destination, mut accepted) = spawn_non_draining_peer().await;
             let mut pool = test_pool();
-            pool.enqueue_timeout = Duration::from_millis(50);
+            pool.send_queue_bytes = 64 * 1024;
             pool.write_timeout = Duration::from_millis(200);
             let source = protected_source();
             let key = pinned_key(source, destination);
@@ -3427,11 +3439,25 @@ mod tests {
             let payload = Bytes::from(vec![b'x'; 8 * 1024]);
             let mut carried_on = std::collections::HashSet::new();
             tokio::time::timeout(Duration::from_secs(10), async {
-                while let Ok(connection_id) = pool
-                    .send_tcp_from(source, destination, payload.clone())
-                    .await
-                {
-                    carried_on.insert(connection_id);
+                loop {
+                    match pool
+                        .send_tcp_from(source, destination, payload.clone())
+                        .await
+                    {
+                        Ok(connection_id) => {
+                            carried_on.insert(connection_id);
+                        }
+                        // Refused while the writer was only behind, not stuck.
+                        Err(_) => {
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                            let caught_up = pool
+                                .pooled(&key)
+                                .is_some_and(|(_, sender)| sender.queued_bytes() == 0);
+                            if !caught_up {
+                                break;
+                            }
+                        }
+                    }
                 }
             })
             .await
