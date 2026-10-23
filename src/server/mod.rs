@@ -902,6 +902,7 @@ impl SiphonServer {
                 ));
                 // SAs a previous process left in the kernel keep their SPIs.
                 let surviving = manager.adopt_surviving_kernel_sas().await;
+                bootstrap::drop_restored_bindings_without_sa(&manager, ipsec_config);
                 // Register the process-wide handle so the dispatcher's 30 s
                 // cleanup tick can sweep abandoned SA pairs (states + policies +
                 // map entry) once they pass their own hard-lifetime + grace.

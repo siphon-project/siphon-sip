@@ -9,6 +9,7 @@
 pub mod backend;
 pub(crate) mod contact_index;
 pub mod reginfo;
+pub mod restore_eviction;
 pub(crate) mod update;
 
 use std::net::SocketAddr;

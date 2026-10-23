@@ -164,6 +164,34 @@ pub(crate) fn instance_id(config: &Config) -> String {
         .unwrap_or_else(|| "siphon".to_string())
 }
 
+/// Drop the restored bindings that were IPsec-protected and whose security
+/// associations did not survive the restart ([`crate::ipsec::restore`]).
+///
+/// Runs once the manager exists and before any traffic: the restore ran
+/// earlier, in [`init_registrar_backend`], when there was no manager to ask.
+/// The manager of a new process holds no pair, so every protected binding goes;
+/// each UE re-registers when its next protected request goes unanswered
+/// (TS 24.229 clause 5.1.1.4.1).
+pub(super) fn drop_restored_bindings_without_sa(
+    manager: &crate::ipsec::IpsecManager,
+    ipsec_config: &crate::config::IpsecConfig,
+) {
+    let Some(registrar) = crate::script::api::registrar_arc() else {
+        return;
+    };
+    let dropped = manager.drop_restored_bindings_without_sa(
+        registrar,
+        ipsec_config.pcscf_port_c,
+        ipsec_config.pcscf_port_s,
+    );
+    if dropped > 0 {
+        warn!(
+            dropped,
+            "IPsec: restored bindings without security associations dropped at startup"
+        );
+    }
+}
+
 pub(super) fn init_registrar_identity(config: &Config) {
     use crate::registrar::InstanceIdentity;
     use crate::script::api::registrar_arc;

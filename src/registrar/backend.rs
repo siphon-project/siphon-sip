@@ -1324,7 +1324,7 @@ impl RegistrarBackend for PostgresBackend {
 mod writer;
 
 #[cfg(test)]
-pub(crate) use writer::recording_writer;
+pub(crate) use writer::{recording_writer, RecordedWrites};
 pub use writer::{spawn_backend_writer, BackendWriter};
 
 // ---------------------------------------------------------------------------

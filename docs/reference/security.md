@@ -354,6 +354,37 @@ A pair goes only when no other identity of the UE is still registered over it.
 The old and new pair of a re-registration share the policies of the UE's
 protected server port; deleting one leaves the other's in place.
 
+### After a restart
+
+Security associations live and die with the P-CSCF process that negotiated
+them (TS 33.203). siphon never persists IK/CK, SPIs or any other SA material,
+so a restart can't reinstall them, even though the registrar bindings come back
+from a Redis or PostgreSQL backend. The UE still holds its side of the SAs.
+
+A restored binding that was protected (its REGISTER arrived on
+`ipsec.pcscf_port_c` or `ipsec.pcscf_port_s`) and has no SA pair in the new
+process is therefore not restored as live. At startup, before any traffic,
+siphon:
+
+- drops it from the registrar and removes it from the backend through the
+  normal de-registration path, so the next boot doesn't restore it again (a
+  binding another instance accepted on a shared backend leaves only this
+  node's memory; its row stays with the instance that holds the SAs);
+- logs one warning per binding (AoR, UE address and ports, no key material) and
+  counts it in `siphon_registrar_restored_without_sa_total`;
+- bars the UE's protected client and server ports from requests in clear until
+  the binding would have expired (plus 32 s). Any request that still targets
+  one of them while no SA pair covers it is refused at egress, logged at error
+  and counted in `siphon_ipsec_unprotected_sends_refused_total`. Responses are
+  not barred, and a new SA pair on those ports lifts the bar.
+
+With the binding gone, a terminating request finds no contact and the liveness
+sweep has nothing to probe. Recovery is the specified one: the UE's next
+protected request goes unanswered, and it performs an initial registration
+(TS 24.229 clause 5.1.1.4.1) with fresh AKA and new SAs. To get UEs back
+sooner, the network can run P-CSCF restoration (TS 23.380 clause 5); siphon
+doesn't implement it.
+
 ### `SecurityOffer`
 
 A `Security-Client` offer parsed from a REGISTER (`request.parse_security_client()`).
