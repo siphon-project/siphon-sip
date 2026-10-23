@@ -1,7 +1,8 @@
 //! X2 IRI delivery — ETSI TS 103 221-2 signalling export to the MDF.
 //!
 //! One persistent connection per delivery address, reconnecting on loss, fed by
-//! the bounded IRI channel.
+//! the bounded IRI channel. An idle connection carries a keepalive PDU
+//! (clause 5.2.2) so the MDF has a liveness signal on a quiet interface.
 //!
 //! The records are [`super::pdu`] PDUs carrying the SIP message verbatim, not
 //! the TS 102 232 BER that [`super::asn1`] encodes. Both are real interfaces
@@ -16,9 +17,11 @@ use crate::config::{LiTlsConfig, LiX2Config};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::io::{AsyncWrite, AsyncWriteExt};
+use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
+use tokio::time::Instant;
 use tokio_rustls::client::TlsStream;
 use tokio_rustls::TlsConnector;
 use tracing::{debug, error, info, warn};
@@ -40,6 +43,49 @@ impl Connection {
             Connection::Plain(stream) => write_and_flush(stream, bytes).await,
             Connection::Tls(stream) => write_and_flush(stream.as_mut(), bytes).await,
         }
+    }
+
+    /// Read and discard whatever the MDF has sent, without waiting for more.
+    ///
+    /// X2 is one-way for records, but the MDF answers every keepalive with a
+    /// KeepaliveAck. Nothing here needs the acks, yet they have to be read: an
+    /// undrained receive buffer fills, the MDF's own writes block, and a
+    /// collector blocked on us may stop reading what we send. The drain is also
+    /// where a peer that closed the connection shows up, as end of stream, which
+    /// a write into a half-closed socket would otherwise hide for a round.
+    ///
+    /// Bounded per call so a peer that floods the socket cannot hold the single
+    /// delivery task; whatever is left is read on the next tick.
+    async fn drain_inbound(&mut self) -> std::io::Result<()> {
+        const MAX_READS: usize = 64;
+        let mut scratch = [0u8; 1024];
+        for _ in 0..MAX_READS {
+            let read = match self {
+                Connection::Plain(stream) => match stream.try_read(&mut scratch) {
+                    Ok(length) => length,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
+                    Err(error) => return Err(error),
+                },
+                // TLS has no `try_read`: the plaintext may already sit in the
+                // session or still be a record on the socket. A zero-length
+                // timeout polls the read exactly once, and a read that would
+                // block comes back as elapsed. Dropping it loses nothing,
+                // because rustls keeps a partial record buffered.
+                Connection::Tls(stream) => {
+                    match tokio::time::timeout(Duration::ZERO, stream.read(&mut scratch)).await {
+                        Ok(result) => result?,
+                        Err(_) => return Ok(()),
+                    }
+                }
+            };
+            if read == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "mediation function closed the X2 connection",
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -78,6 +124,8 @@ struct Delivery {
     connection: Option<Connection>,
     /// Per-connection PDU counter for the sequence-number attribute.
     sequence: u32,
+    /// When the connection last carried a PDU, IRI or keepalive.
+    last_sent: Instant,
 }
 
 impl Delivery {
@@ -137,7 +185,7 @@ impl Delivery {
 
         let Some(connector) = self.connector.clone() else {
             info!(address = %self.address, transport = "tcp", "X2 connected to mediation function");
-            self.connection = Some(Connection::Plain(tcp_stream));
+            self.connected(Connection::Plain(tcp_stream));
             return true;
         };
 
@@ -157,7 +205,7 @@ impl Delivery {
         match connector.connect(server_name, tcp_stream).await {
             Ok(stream) => {
                 info!(address = %self.address, transport = "tls", "X2 connected to mediation function");
-                self.connection = Some(Connection::Tls(Box::new(stream)));
+                self.connected(Connection::Tls(Box::new(stream)));
                 true
             }
             Err(error) => {
@@ -170,12 +218,95 @@ impl Delivery {
             }
         }
     }
+
+    /// Adopt a freshly opened connection.
+    ///
+    /// The sequence number is per connection, so it restarts here whichever
+    /// path opened it: a record's reconnect, or the first record after a
+    /// keepalive found the peer gone.
+    fn connected(&mut self, connection: Connection) {
+        self.connection = Some(connection);
+        self.sequence = 0;
+        self.last_sent = Instant::now();
+    }
+
+    /// Send a keepalive if the connection has been quiet for a whole period.
+    ///
+    /// Idleness counts from the last PDU of any kind, so a busy connection
+    /// never carries one: its records already prove it alive. The tick runs at
+    /// the period, so a quiet connection sees its keepalive between one and two
+    /// periods after the last record.
+    ///
+    /// A connection that is gone is dropped here, never reopened. Opening one
+    /// can take a connect timeout and the retries behind it, and this is the
+    /// single task that delivers IRI for every warrant, so a reconnect on the
+    /// tick would hold up live records to reach a peer nothing is waiting for.
+    /// The next record reconnects through its own path.
+    async fn keepalive_if_idle(&mut self, period: Duration) {
+        if self.last_sent.elapsed() < period {
+            return;
+        }
+        let Some(connection) = self.connection.as_mut() else {
+            return;
+        };
+
+        if let Err(error) = connection.drain_inbound().await {
+            warn!(
+                address = %self.address,
+                error = %error,
+                "X2 connection to mediation function lost while idle, dropped"
+            );
+            self.connection = None;
+            return;
+        }
+
+        let encoded = match Pdu::keepalive(self.sequence).encode() {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                // As with a record that cannot be framed: a defect in this
+                // element, not in the connection.
+                error!(address = %self.address, error = %error, "X2 keepalive could not be framed");
+                return;
+            }
+        };
+        match connection.write_all(&encoded).await {
+            Ok(()) => {
+                self.sequence = self.sequence.wrapping_add(1);
+                self.last_sent = Instant::now();
+                debug!(address = %self.address, "X2 keepalive sent");
+            }
+            Err(error) => {
+                warn!(
+                    address = %self.address,
+                    error = %error,
+                    "X2 keepalive to mediation function failed, connection dropped"
+                );
+                self.connection = None;
+            }
+        }
+    }
+}
+
+/// The keepalive period a configured number of seconds means; zero is off.
+fn keepalive_period(seconds: u64) -> Option<Duration> {
+    (seconds > 0).then(|| Duration::from_secs(seconds))
 }
 
 /// Background task that drains the IRI channel and delivers to the MDF.
 ///
 /// Runs for the lifetime of the LI subsystem.
-pub async fn delivery_task(mut receiver: mpsc::Receiver<IriEvent>, config: Arc<LiX2Config>) {
+pub async fn delivery_task(receiver: mpsc::Receiver<IriEvent>, config: Arc<LiX2Config>) {
+    let keepalive = keepalive_period(config.keepalive_secs);
+    run_delivery(receiver, config, keepalive).await;
+}
+
+/// The delivery loop, with the keepalive period passed in rather than read as
+/// whole seconds, so a test can run it at a fraction of one.
+async fn run_delivery(
+    mut receiver: mpsc::Receiver<IriEvent>,
+    config: Arc<LiX2Config>,
+    keepalive: Option<Duration>,
+) {
     let use_tls = config.transport.eq_ignore_ascii_case("tls");
     info!(
         address = %config.delivery_address,
@@ -209,7 +340,36 @@ pub async fn delivery_task(mut receiver: mpsc::Receiver<IriEvent>, config: Arc<L
     let mut deliveries: HashMap<String, Delivery> = HashMap::new();
     let reconnect_interval = std::time::Duration::from_secs(config.reconnect_interval_secs);
 
-    while let Some(event) = receiver.recv().await {
+    // Delay rather than burst: a tick missed while a slow write held the task
+    // is one keepalive owed, not several back to back.
+    let mut keepalive_timer = keepalive.map(|period| {
+        let mut timer = tokio::time::interval(period);
+        timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        (period, timer)
+    });
+    if let Some((_, timer)) = keepalive_timer.as_mut() {
+        // The first tick completes immediately, and nothing is open yet.
+        timer.tick().await;
+    }
+
+    loop {
+        let received = match keepalive_timer.as_mut() {
+            // `recv` is cancel-safe, so a tick that wins the race loses no event.
+            Some((period, timer)) => tokio::select! {
+                received = receiver.recv() => received,
+                _ = timer.tick() => {
+                    for delivery in deliveries.values_mut() {
+                        delivery.keepalive_if_idle(*period).await;
+                    }
+                    continue;
+                }
+            },
+            None => receiver.recv().await,
+        };
+        let Some(event) = received else {
+            break;
+        };
+
         let addresses = delivery_addresses(&event, &config.delivery_address);
         if addresses.is_empty() {
             warn!(
@@ -230,6 +390,7 @@ pub async fn delivery_task(mut receiver: mpsc::Receiver<IriEvent>, config: Arc<L
                     server_name,
                     connection: None,
                     sequence: 0,
+                    last_sent: Instant::now(),
                 });
 
             if delivery.connection.is_none()
@@ -265,6 +426,7 @@ pub async fn delivery_task(mut receiver: mpsc::Receiver<IriEvent>, config: Arc<L
             match connection.write_all(&encoded).await {
                 Ok(()) => {
                     delivery.sequence = delivery.sequence.wrapping_add(1);
+                    delivery.last_sent = Instant::now();
                     debug!(
                         address = %address,
                         xid = %event.x_id,
@@ -299,8 +461,8 @@ pub async fn delivery_task(mut receiver: mpsc::Receiver<IriEvent>, config: Arc<L
                 );
                 continue;
             }
-            // The sequence number is per connection, so the retry restarts it.
-            delivery.sequence = 0;
+            // The sequence number is per connection, so adopting the new one
+            // restarted it.
             let retry = match encode_iri_event(&event, delivery.sequence) {
                 Ok(bytes) => bytes,
                 Err(error) => {
@@ -314,6 +476,7 @@ pub async fn delivery_task(mut receiver: mpsc::Receiver<IriEvent>, config: Arc<L
             match connection.write_all(&retry).await {
                 Ok(()) => {
                     delivery.sequence = delivery.sequence.wrapping_add(1);
+                    delivery.last_sent = Instant::now();
                     info!(
                         address = %address,
                         liid = %event.liid,
@@ -837,6 +1000,7 @@ mod tests {
             delivery_address: address,
             transport: "tcp".to_string(),
             reconnect_interval_secs: 1,
+            keepalive_secs: 30,
             channel_size: 100,
             tls: None,
         });
@@ -894,6 +1058,7 @@ mod tests {
             delivery_address: address.to_string(),
             transport: "tcp".to_string(),
             reconnect_interval_secs: 1,
+            keepalive_secs: 30,
             channel_size: 100,
             tls: None,
         });
@@ -934,6 +1099,7 @@ mod tests {
             delivery_address: "127.0.0.1:1".to_string(),
             transport: "tcp".to_string(),
             reconnect_interval_secs: 1,
+            keepalive_secs: 30,
             channel_size: 100,
             tls: None,
         });
@@ -961,5 +1127,261 @@ mod tests {
                 .expect("join");
             assert_eq!(&header[2..4], &[0x00, 0x01], "X2");
         }
+    }
+
+    /// Short enough to keep the tests quick, long enough that loopback
+    /// scheduling noise cannot pass for a period.
+    const TEST_KEEPALIVE: Duration = Duration::from_millis(150);
+
+    /// Generous: a missed PDU fails on this rather than hanging the run.
+    const RECEIVE_TIMEOUT: Duration = Duration::from_secs(5);
+
+    fn keepalive_test_config(address: String, reconnect_interval_secs: u64) -> Arc<LiX2Config> {
+        Arc::new(LiX2Config {
+            delivery_address: address,
+            transport: "tcp".to_string(),
+            reconnect_interval_secs,
+            keepalive_secs: 30,
+            channel_size: 100,
+            tls: None,
+        })
+    }
+
+    /// One PDU as the MDF reads it, split along the clause 5 layout: the
+    /// 40-octet mandatory header, the attribute TLVs, the payload.
+    async fn read_pdu(stream: &mut TcpStream) -> ([u8; 40], Vec<u8>, Vec<u8>) {
+        tokio::time::timeout(RECEIVE_TIMEOUT, async {
+            let mut header = [0u8; 40];
+            stream.read_exact(&mut header).await.expect("header");
+            let header_length =
+                u32::from_be_bytes([header[4], header[5], header[6], header[7]]) as usize;
+            let payload_length =
+                u32::from_be_bytes([header[8], header[9], header[10], header[11]]) as usize;
+            let mut attributes = vec![0u8; header_length - 40];
+            stream
+                .read_exact(&mut attributes)
+                .await
+                .expect("attributes");
+            let mut payload = vec![0u8; payload_length];
+            stream.read_exact(&mut payload).await.expect("payload");
+            (header, attributes, payload)
+        })
+        .await
+        .expect("no PDU arrived")
+    }
+
+    fn sequence_of(attributes: &[u8]) -> u32 {
+        let value = find_attribute(attributes, attribute_type::SEQUENCE_NUMBER)
+            .expect("every PDU carries a sequence number");
+        u32::from_be_bytes([value[0], value[1], value[2], value[3]])
+    }
+
+    async fn accept(listener: &TcpListener) -> TcpStream {
+        let (stream, _) = tokio::time::timeout(RECEIVE_TIMEOUT, listener.accept())
+            .await
+            .expect("no connection arrived")
+            .expect("accept");
+        stream
+    }
+
+    #[test]
+    fn zero_keepalive_seconds_disables_keepalives() {
+        assert_eq!(keepalive_period(0), None);
+        assert_eq!(keepalive_period(30), Some(Duration::from_secs(30)));
+    }
+
+    /// The liveness signal itself, read field by field off the wire against the
+    /// clause 5 layout rather than through our own encoder.
+    #[tokio::test]
+    async fn an_idle_connection_carries_keepalives_after_the_record() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("addr").to_string();
+        let (sender, receiver) = mpsc::channel(100);
+        tokio::spawn(run_delivery(
+            receiver,
+            keepalive_test_config(address, 1),
+            Some(TEST_KEEPALIVE),
+        ));
+
+        sender.send(test_iri_event()).await.expect("send");
+        let mut stream = accept(&listener).await;
+        let (header, attributes, _) = read_pdu(&mut stream).await;
+        assert_eq!(&header[2..4], &[0x00, 0x01], "the record comes first");
+        let record_sequence = sequence_of(&attributes);
+
+        for expected in 1..=2u32 {
+            let (header, attributes, payload) = read_pdu(&mut stream).await;
+            assert_eq!(&header[0..2], &[0x00, 0x05], "version 0.5");
+            assert_eq!(&header[2..4], &[0x00, 0x03], "PDU type keepalive");
+            assert_eq!(
+                u32::from_be_bytes([header[4], header[5], header[6], header[7]]),
+                48,
+                "header length: the mandatory 40 plus one sequence-number TLV"
+            );
+            assert_eq!(&header[8..12], &[0, 0, 0, 0], "no payload");
+            assert!(payload.is_empty());
+            assert_eq!(&header[14..16], &[0x00, 0x00], "direction reserved");
+            assert_eq!(&header[32..40], &[0u8; 8], "all-zero correlation");
+            assert_eq!(
+                sequence_of(&attributes),
+                record_sequence + expected,
+                "keepalives share the connection's sequence with its records"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn no_keepalive_is_sent_when_disabled() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("addr").to_string();
+        let (sender, receiver) = mpsc::channel(100);
+        tokio::spawn(run_delivery(
+            receiver,
+            keepalive_test_config(address, 1),
+            None,
+        ));
+
+        sender.send(test_iri_event()).await.expect("send");
+        let mut stream = accept(&listener).await;
+        let (header, _, _) = read_pdu(&mut stream).await;
+        assert_eq!(&header[2..4], &[0x00, 0x01], "X2");
+
+        let mut octet = [0u8; 1];
+        let idle = tokio::time::timeout(TEST_KEEPALIVE * 5, stream.read(&mut octet)).await;
+        assert!(
+            idle.is_err(),
+            "a disabled keepalive sent something: {idle:?}"
+        );
+    }
+
+    /// The MDF answers every keepalive. Unread, those answers fill our receive
+    /// buffer and block the MDF's writes; read, they must not cost the
+    /// connection either.
+    #[tokio::test]
+    async fn keepalive_acks_do_not_disturb_delivery() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("addr").to_string();
+        let (sender, receiver) = mpsc::channel(100);
+        tokio::spawn(run_delivery(
+            receiver,
+            keepalive_test_config(address, 1),
+            Some(TEST_KEEPALIVE),
+        ));
+
+        sender.send(test_iri_event()).await.expect("send");
+        let mut stream = accept(&listener).await;
+        let (_, attributes, _) = read_pdu(&mut stream).await;
+        assert_eq!(sequence_of(&attributes), 0);
+
+        for _ in 0..3 {
+            let (header, attributes, _) = read_pdu(&mut stream).await;
+            assert_eq!(&header[2..4], &[0x00, 0x03], "keepalive");
+            let mut acknowledgement = Pdu::keepalive(sequence_of(&attributes));
+            acknowledgement.pdu_type = PduType::KeepaliveAck;
+            let bytes = acknowledgement.encode().expect("ack must encode");
+            stream.write_all(&bytes).await.expect("ack");
+        }
+
+        sender.send(test_iri_event()).await.expect("send");
+        let (record, record_sequence) = loop {
+            let (header, attributes, payload) = read_pdu(&mut stream).await;
+            if header[2..4] == [0x00, 0x01] {
+                break (payload, sequence_of(&attributes));
+            }
+        };
+        assert_eq!(record, RAW_INVITE, "the later record arrives intact");
+        assert!(
+            record_sequence > 3,
+            "on the same connection, after the record and three keepalives: {record_sequence}"
+        );
+        assert!(
+            tokio::time::timeout(TEST_KEEPALIVE, listener.accept())
+                .await
+                .is_err(),
+            "the acks must not have cost the connection"
+        );
+    }
+
+    /// A collector that went away is noticed while idle, so the next record
+    /// opens a fresh connection at once instead of being written into the dead
+    /// one.
+    #[tokio::test]
+    async fn a_closed_mediation_function_is_dropped_at_the_tick() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("addr").to_string();
+        let (sender, receiver) = mpsc::channel(100);
+        // A long reconnect interval: the write-failure path sleeps it before
+        // reconnecting, so a record arriving well inside it can only have
+        // taken the immediate path a dropped connection gives.
+        let reconnect_interval_secs = 5;
+        tokio::spawn(run_delivery(
+            receiver,
+            keepalive_test_config(address, reconnect_interval_secs),
+            Some(TEST_KEEPALIVE),
+        ));
+
+        sender.send(test_iri_event()).await.expect("send");
+        let mut first = accept(&listener).await;
+        read_pdu(&mut first).await;
+        drop(first);
+
+        tokio::time::sleep(TEST_KEEPALIVE * 3).await;
+        sender.send(test_iri_event()).await.expect("send");
+
+        let (mut second, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
+            .await
+            .expect("the closed connection was not dropped at the tick")
+            .expect("accept");
+        let (header, attributes, payload) = read_pdu(&mut second).await;
+        assert_eq!(&header[2..4], &[0x00, 0x01], "X2");
+        assert_eq!(payload, RAW_INVITE);
+        assert_eq!(
+            sequence_of(&attributes),
+            0,
+            "the sequence restarts on the new connection"
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_reads_everything_pending_without_blocking() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("addr");
+        let client = TcpStream::connect(address).await.expect("connect");
+        let (mut peer, _) = listener.accept().await.expect("accept");
+
+        peer.write_all(&[0xAB; 4000]).await.expect("write");
+        peer.flush().await.expect("flush");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut connection = Connection::Plain(client);
+        tokio::time::timeout(Duration::from_secs(1), connection.drain_inbound())
+            .await
+            .expect("the drain must not wait for more")
+            .expect("an open peer is not an error");
+
+        let Connection::Plain(client) = &connection else {
+            panic!("plain connection");
+        };
+        let mut scratch = [0u8; 16];
+        let leftover = client.try_read(&mut scratch);
+        assert!(
+            leftover
+                .as_ref()
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::WouldBlock),
+            "everything pending was read: {leftover:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_reports_a_peer_that_closed() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("addr");
+        let client = TcpStream::connect(address).await.expect("connect");
+        let (peer, _) = listener.accept().await.expect("accept");
+        drop(peer);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut connection = Connection::Plain(client);
+        assert!(connection.drain_inbound().await.is_err());
     }
 }

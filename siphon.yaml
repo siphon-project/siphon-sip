@@ -2081,6 +2081,11 @@ auth:
 #     delivery_address: "192.0.2.50:6543" # mediation device IRI collector
 #     transport: tcp                      # tcp | tls
 #     reconnect_interval_secs: 5
+#     keepalive_secs: 30                  # idle keepalive PDU (TS 103 221-2
+#                                         # clause 5.2.2) after this many quiet
+#                                         # seconds; 0 disables. A dead MDF is
+#                                         # dropped at the tick and reconnected
+#                                         # by the next record.
 #     channel_size: 10000
 #     # TLS is refused rather than downgraded: if any of this is wrong the
 #     # delivery task stops and says so, because quietly sending a warrant's
