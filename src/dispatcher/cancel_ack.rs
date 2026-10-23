@@ -209,6 +209,10 @@ pub(super) fn reject_pending_invite(
     // now. Nothing later closes it, since what the branches answer is
     // absorbed.
     cdr_finalize_proxy_fail(state, original_request, code);
+    // Likewise its Rf ACR-EVENT (TS 32.260 table 5.2.1.1-1, an unsuccessful
+    // session set-up), with the status the caller is answered: the 487s the
+    // CANCELs draw back are absorbed and never reach the response path's own.
+    spawn_rf_proxy_event_on_failed_invite(state, server_key, original_request, code, session_arc);
 
     // 2b. Build and send the error response upstream via the server
     // transaction (handles retransmission + UAC-ACK absorption for INVITE).
@@ -985,6 +989,25 @@ pub(super) fn abandon_pending_invite(
     // open one would sit until the day-long backstop with no record written.
     if let Ok(session) = session_arc.read() {
         cdr_finalize_proxy_fail(state, &session.original_request, status);
+    }
+    // Its Rf ACR-EVENT goes now too: TS 32.260 table 5.2.1.1-1 gives "SIP
+    // CANCEL, indicating abortion of a SIP session set-up" an EVENT of its own,
+    // and the caller has its final response. The response path's EVENT never
+    // sees this attempt: what the branches answer from here on (their 487s, a
+    // timeout's 408) is absorbed as a straggler, and the latch above lets this
+    // run once per INVITE server transaction, however many branches it forked.
+    let original_request = session_arc
+        .read()
+        .ok()
+        .map(|session| session.original_request.clone());
+    if let Some(original_request) = original_request {
+        spawn_rf_proxy_event_on_failed_invite(
+            state,
+            &server_key,
+            &original_request,
+            status,
+            &session_arc,
+        );
     }
     release_cancelled_session(&session_arc, state);
     // A retransmitted CANCEL is answered 200 and does none of this again

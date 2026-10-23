@@ -128,6 +128,17 @@ entry, but a working config keeps working.
   and the next IRI record reconnects at once rather than being written into the
   dead connection. The sequence number now also restarts on every new
   connection, not only on a record's reconnect.
+### Changed
+
+- **`Cause-Code` follows TS 32.299 V18.0.0 clause 7.2.35.** Failures are the
+  SIP status itself, positive (486, 487, 408), where siphon sent the negated
+  pre-Release 8 form (-486); a 3xx is -3xx and a normal end 0, as before. This
+  covers the automatic Rf EVENT and STOP, the B2BUA records, and Ro
+  CCR-TERMINATION (out of credit is 402, the lifetime backstop 408). The
+  registrar's ACR-EVENTs send -1 (Successful transaction) for a registration
+  or refresh and -3 (End of REGISTER dialog) for a deregistration or expiry,
+  replacing 0, -200 and -487. A CDF or rating rule matching the negative
+  values must be updated.
 
 - **A UE sends MESSAGE and SUBSCRIBE over its own SA.** `proxy.send_request()`
   and `proxy.subscribe_state.send()` take `flow=` and `route=`. With
@@ -142,6 +153,17 @@ entry, but a working config keeps working.
   carries a `RegistrantFlow`, and `SubscribeDialog` gains `registrant_flow`.
 
 ### Fixed
+
+- **A cancelled call is reported on Rf, once, with Cause-Code 487.** When the
+  caller CANCELled a proxied INVITE, the proxy answered `487` itself and
+  absorbed the `487` the branch drew back, so no ACR was sent at all: TS 32.260
+  table 5.2.1.1-1 gives "SIP CANCEL, indicating abortion of a SIP session
+  set-up" an ACR EVENT. The caller's CANCEL, `reply.reject()` and
+  `proxy.release` of a ringing session now each send one EVENT per INVITE
+  server transaction, forked or not, with the status the caller got, and the
+  branches' later 487s or timeouts add nothing (a branch that never answers its
+  CANCEL is not reported as a 408). A 2xx that reached the proxy before the
+  CANCEL still makes a session (START), not a failure.
 
 - **An `async def` `@proxy.on_request` handler no longer holds a Python
   executor worker while it awaits.** The worker used to block until the

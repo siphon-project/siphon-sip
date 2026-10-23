@@ -126,15 +126,15 @@ pub enum Metering {
 /// because the OCS refused further credit.
 ///
 /// The convention is Rf's, shared via [`crate::diameter::rf::sip_status_to_cause_code`]:
-/// a successful end is `0`, anything else is the negated SIP status. `402
-/// Payment Required` is the status siphon already answers when the OCS denies
-/// at setup, so an out-of-credit teardown reports the same cause a denied setup
-/// does — the OCS sees one code for "no credit", whenever it ran out.
-const CAUSE_CODE_CREDIT_EXHAUSTED: i32 = -402;
+/// a successful end is `0`, a failure its SIP status (TS 32.299 V18.0.0 clause
+/// 7.2.35, failures >= 1). `402 Payment Required` is what siphon answers when
+/// the OCS denies at setup, so an out-of-credit teardown reports the cause a
+/// denied setup does: the OCS sees one code for "no credit", whenever it ran out.
+const CAUSE_CODE_CREDIT_EXHAUSTED: i32 = 402;
 
 /// `Cause-Code` for a session released by the max-lifetime backstop: no BYE
 /// ever arrived, so this is a timeout, reported as `408 Request Timeout`.
-const CAUSE_CODE_SESSION_LIFETIME_EXCEEDED: i32 = -408;
+const CAUSE_CODE_SESSION_LIFETIME_EXCEEDED: i32 = 408;
 
 /// Never re-authorize faster than this, so a pathological small grant can't
 /// hot-loop the OCS.
@@ -2402,9 +2402,9 @@ mod tests {
         let exhausted = cause_code_on_the_wire(Some(CAUSE_CODE_CREDIT_EXHAUSTED)).await;
 
         assert_eq!(normal, Some(0), "a normal hangup is cause 0");
-        assert_eq!(busy, Some(-486));
-        assert_eq!(no_answer, Some(-408));
-        assert_eq!(exhausted, Some(-402));
+        assert_eq!(busy, Some(486));
+        assert_eq!(no_answer, Some(408));
+        assert_eq!(exhausted, Some(402));
 
         let all = [normal, busy, no_answer, exhausted];
         let distinct: std::collections::HashSet<_> = all.iter().collect();
@@ -2700,7 +2700,7 @@ mod tests {
             ims_information(&terminate)
                 .and_then(|i| i.get("Cause-Code"))
                 .and_then(|v| v.as_i64()),
-            Some(-503),
+            Some(503),
             "the cause is the status the A-leg was answered with, from the same \
              mapping Rf's ACR-STOP uses, so the two interfaces cannot disagree",
         );
