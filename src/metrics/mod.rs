@@ -364,6 +364,10 @@ pub struct SiphonMetrics {
     /// called from inside an `async def`. Equal to the driver count means no
     /// coroutine in the process is progressing.
     pub async_drivers_stalled: IntGauge,
+    /// `async def` handler coroutines handed to an asyncio driver that have
+    /// not settled yet. A request handler awaiting costs one of these, not an
+    /// executor worker, so this is the figure that grows with slow backends.
+    pub async_coroutines_pending: IntGauge,
     /// Event-handler jobs whose caller stopped waiting but which are still
     /// running on a worker, and always will be if they never return.
     ///
@@ -883,6 +887,10 @@ impl SiphonMetrics {
             "siphon_async_drivers_stalled",
             "Asyncio driver loops pinned by a blocking call (no scheduled callback ran within the heartbeat deadline)",
         )?;
+        let async_coroutines_pending = IntGauge::new(
+            "siphon_async_coroutines_pending",
+            "Async handler coroutines running on an asyncio driver that have not settled yet",
+        )?;
         let pyexec_jobs_abandoned_total = IntCounter::new(
             "siphon_pyexec_jobs_abandoned_total",
             "Event-handler jobs whose caller gave up waiting; the job still holds its worker",
@@ -1293,6 +1301,7 @@ impl SiphonMetrics {
         registry.register(Box::new(pyexec_inflight.clone()))?;
         registry.register(Box::new(pyexec_queue_depth.clone()))?;
         registry.register(Box::new(async_drivers_stalled.clone()))?;
+        registry.register(Box::new(async_coroutines_pending.clone()))?;
         registry.register(Box::new(pyexec_jobs_abandoned_total.clone()))?;
         registry.register(Box::new(pyexec_jobs_completed_total.clone()))?;
         registry.register(Box::new(pyexec_jobs_shed_total.clone()))?;
@@ -1380,6 +1389,7 @@ impl SiphonMetrics {
             python_allocated_blocks,
             script_errors_total,
             async_drivers_stalled,
+            async_coroutines_pending,
             pyexec_jobs_abandoned_total,
             pyexec_pool_size,
             pyexec_pool_max,

@@ -26,6 +26,8 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use tracing::{debug, error};
 
+use crate::script::async_pool::PendingCoroutine;
+
 /// Verdicts for [`run_coroutine_inline`], keyed by code-object address.
 ///
 /// The value holds a strong reference to the code object itself, which is what
@@ -247,6 +249,51 @@ pub(crate) fn run_coroutine_value(
     if let Some(value) = run_coroutine_inline(python, coroutine)? {
         return Ok(value);
     }
+    drive_suspending_coroutine(python, coroutine)
+}
+
+/// What [`start_coroutine`] did with a coroutine.
+pub(crate) enum CoroutineStart {
+    /// It ran to the end here. A request handler's return value means
+    /// nothing, so it is not kept.
+    Finished,
+    /// It is running on an asyncio driver. The caller waits for it with
+    /// [`PendingCoroutine::resume_on_executor`] and continues from there.
+    Suspended(PendingCoroutine),
+}
+
+/// Start a handler's coroutine without waiting in place for it when it
+/// suspends — for a caller that can be resumed later.
+///
+/// One that cannot suspend still runs inline, and so does every coroutine when
+/// waiting in place is the only option: off an executor worker (a caller that
+/// expects the work done when it returns), with no async pool installed, or
+/// with no tokio runtime to wait on. Those keep [`run_coroutine_value`]'s
+/// behaviour exactly.
+pub(crate) fn start_coroutine(
+    python: Python<'_>,
+    coroutine: &Bound<'_, pyo3::PyAny>,
+) -> PyResult<CoroutineStart> {
+    if run_coroutine_inline(python, coroutine)?.is_some() {
+        return Ok(CoroutineStart::Finished);
+    }
+    if crate::script::py_executor::on_worker_thread()
+        && tokio::runtime::Handle::try_current().is_ok()
+    {
+        if let Some(pool) = crate::script::async_pool::AsyncPool::global() {
+            return PendingCoroutine::submit(&pool, python, coroutine)
+                .map(CoroutineStart::Suspended);
+        }
+    }
+    drive_suspending_coroutine(python, coroutine).map(|_| CoroutineStart::Finished)
+}
+
+/// Run a coroutine that may suspend to completion, blocking this thread: on
+/// the async pool when one is installed, else on this thread's own loop.
+fn drive_suspending_coroutine(
+    python: Python<'_>,
+    coroutine: &Bound<'_, pyo3::PyAny>,
+) -> PyResult<Py<PyAny>> {
     if let Some(value) = crate::script::async_pool::run_coroutine_via_pool(python, coroutine)? {
         return Ok(value);
     }
