@@ -379,9 +379,13 @@ pub struct MediaSessionStore {
     /// name beyond the call's own session's, by SIP Call-ID, until a branch
     /// answers. See [`dial_branches`].
     dial_branches: DashMap<String, Vec<MediaSession>>,
+    /// The sessions a script anchored under a per-call scope, one store per
+    /// scope. See [`scoped`].
+    scopes: DashMap<crate::rtpengine::CallScope, std::sync::Arc<MediaSessionStore>>,
 }
 
 mod dial_branches;
+mod scoped;
 pub use dial_branches::SettledDialMedia;
 mod own_media;
 pub use own_media::OwnMedia;
@@ -413,6 +417,7 @@ impl MediaSessionStore {
             own_media: DashMap::new(),
             local_answers: DashMap::new(),
             dial_branches: DashMap::new(),
+            scopes: DashMap::new(),
         }
     }
 
@@ -745,6 +750,7 @@ impl MediaSessionStore {
         }
         self.sweep_dial_branches(cutoff);
         self.sweep_own_media(cutoff);
+        self.sweep_scoped(max_age);
     }
 
     /// The engine-side call-ids of every session siphon currently holds.
@@ -760,6 +766,7 @@ impl MediaSessionStore {
             .map(|entry| entry.value().rtpengine_id().to_string())
             .collect();
         live.extend(self.dial_branch_engine_call_ids());
+        live.extend(self.scoped_engine_call_ids());
         live
     }
 

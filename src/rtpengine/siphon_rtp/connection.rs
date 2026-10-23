@@ -18,7 +18,7 @@ use tracing::{debug, error, info, trace, warn};
 
 use super::events::convert_event;
 use super::identity::{auth_frame_for, authenticate, controller_id};
-use super::scope::{event_is_for, require_scope_support, CallScope};
+use super::scope::{require_scope_support, CallScope, CallScopes};
 use super::waiters::Waiters;
 use super::{PlayWaiter, HANDSHAKE_REQUEST_ID, READ_CHUNK};
 use crate::rtpengine::error::RtpEngineError;
@@ -35,7 +35,7 @@ const MAX_BACKOFF: Duration = Duration::from_secs(5);
 pub(super) async fn connection_manager(
     address: SocketAddr,
     control_secret: Option<String>,
-    scope: Option<CallScope>,
+    scopes: Arc<CallScopes>,
     timeout_ms: u64,
     pending: Arc<DashMap<u64, oneshot::Sender<CmdResult>>>,
     play_pending: Arc<DashMap<u64, PlayWaiter>>,
@@ -101,7 +101,7 @@ pub(super) async fn connection_manager(
         // node's calls would meet another node's under one Call-ID; refusing
         // the connection keeps that from ever happening and keeps retrying, so
         // an engine upgraded in place is picked up.
-        if let Some(scope) = &scope {
+        if let Some(scope) = scopes.node() {
             if let Err(error) = require_scope_support(
                 &mut write_half,
                 &mut read_half,
@@ -124,6 +124,7 @@ pub(super) async fn connection_manager(
         // the TCP connection and then refuses it would otherwise be retried at
         // the initial backoff forever.
         backoff = INITIAL_BACKOFF;
+        scopes.connected();
         *writer.lock().await = Some(write_half);
         let _ = connected_tx.send(true);
         info!(%address, "siphon-rtp control connection established");
@@ -131,7 +132,7 @@ pub(super) async fn connection_manager(
         let outcome = read_loop(
             &mut read_half,
             &mut buffer,
-            scope.as_ref(),
+            &scopes,
             &pending,
             &play_pending,
             &waiters,
@@ -175,7 +176,7 @@ enum ReadOutcome {
 async fn read_loop(
     read_half: &mut OwnedReadHalf,
     buffer: &mut Vec<u8>,
-    scope: Option<&CallScope>,
+    scopes: &CallScopes,
     pending: &DashMap<u64, oneshot::Sender<CmdResult>>,
     play_pending: &DashMap<u64, PlayWaiter>,
     waiters: &Waiters,
@@ -189,7 +190,7 @@ async fn read_loop(
             match frame::decode::<serde_json::Value>(buffer) {
                 Ok(Some((value, consumed))) => {
                     buffer.drain(..consumed);
-                    route_frame(value, scope, pending, play_pending, waiters, event_tx).await;
+                    route_frame(value, scopes, pending, play_pending, waiters, event_tx).await;
                 }
                 Ok(None) => break,
                 Err(error) => {
@@ -321,7 +322,7 @@ fn forward_event(event_tx: &mpsc::Sender<RtpEngineEvent>, event: RtpEngineEvent)
 /// or an `Event` (has `event`) onto the event channel.
 async fn route_frame(
     value: serde_json::Value,
-    scope: Option<&CallScope>,
+    scopes: &CallScopes,
     pending: &DashMap<u64, oneshot::Sender<CmdResult>>,
     play_pending: &DashMap<u64, PlayWaiter>,
     waiters: &Waiters,
@@ -331,11 +332,11 @@ async fn route_frame(
         // The engine sends a call's events to the connection that created it,
         // so this is a guard rather than a sort: an event this node's scope did
         // not create is never acted on, whatever its Call-ID.
-        if !event_is_for(scope, &value) {
+        if !scopes.accepts(&value) {
             warn!(
                 call_id = value.get("call_id").and_then(serde_json::Value::as_str),
                 event_scope = value.get("scope").and_then(serde_json::Value::as_str),
-                node_scope = scope.map(CallScope::as_str),
+                node_scope = scopes.node().map(CallScope::as_str),
                 "siphon-rtp event for a call of another scope; skipping"
             );
             return;

@@ -84,7 +84,8 @@ pub(super) fn protected_udp_response_egress(
         state.ipsec_config.as_ref(),
         source_local_addr,
     ) else {
-        return unchanged;
+        return registrant_udp_response_egress(frame, destination, source_local_addr)
+            .unwrap_or(unchanged);
     };
     if local.port() != config.pcscf_port_s || !crate::transport::response_route::is_response(frame)
     {
@@ -114,6 +115,33 @@ pub(super) fn protected_udp_response_egress(
             unchanged
         }
     }
+}
+
+/// The UE side of [`protected_udp_response_egress`]: a UDP response siphon
+/// sends as a registrant, from a UE's protected server port to the P-CSCF,
+/// leaves from that UE's protected client port for the P-CSCF's protected
+/// server port (TS 33.203 clause 7.1, UDP case; see
+/// [`crate::registrant::RegistrantManager::ue_udp_response_egress`]). `None`
+/// leaves it where it was going: no registrant, no source pin, a request, or
+/// no IPsec entry answering from that socket.
+fn registrant_udp_response_egress(
+    frame: &[u8],
+    destination: SocketAddr,
+    source_local_addr: Option<SocketAddr>,
+) -> Option<(SocketAddr, Option<SocketAddr>)> {
+    let local = source_local_addr?;
+    let manager = crate::registrant::manager()?;
+    if !crate::transport::response_route::is_response(frame) {
+        return None;
+    }
+    let (protected, client) = manager.ue_udp_response_egress(local, destination)?;
+    debug!(
+        from = %local,
+        to = %protected,
+        local = %client,
+        "IPsec: UDP response from the UE's protected client port (TS 33.203 clause 7.1)"
+    );
+    Some((protected, Some(client)))
 }
 
 /// siphon's own endpoint on the HEP capture of a send leaving from

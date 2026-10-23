@@ -142,6 +142,19 @@ entry, but a working config keeps working.
   and the next IRI record reconnects at once rather than being written into the
   dead connection. The sequence number now also restarts on every new
   connection, not only on a record's reconnect.
+
+- **A UE sends MESSAGE and SUBSCRIBE over its own SA.** `proxy.send_request()`
+  and `proxy.subscribe_state.send()` take `flow=` and `route=`. With
+  `flow=registration.flow(impu)` the request leaves from the UE's protected
+  client port to the P-CSCF's protected server port, its Via (and a
+  SUBSCRIBE's Contact) names the UE's protected server port, and the route set
+  goes out as Route headers in order (TS 24.229 §5.1.2A.1.1, TS 33.203 §7.1).
+  A subscription made that way sends its refreshes and its unsubscribe over
+  the SA set the registration holds when each is sent, and raises when it has
+  none. `send_request` treats a callee's flow as `call.dial` does;
+  `subscribe_state.send` refuses one. Rust library: `FlowKind::Outbound` now
+  carries a `RegistrantFlow`, and `SubscribeDialog` gains `registrant_flow`.
+
 ### Fixed
 
 - **An `async def` `@proxy.on_request` handler no longer holds a Python
@@ -157,6 +170,24 @@ entry, but a working config keeps working.
   counts the awaiting coroutines. Other handler kinds (`on_reply`,
   `on_failure`, B2BUA, Diameter, timers, SBI callbacks, RTPEngine events) still
   wait in place.
+
+- **A UE's UDP responses to the P-CSCF leave from its protected client port.**
+  A response to a request the P-CSCF sent over the SA (an MT MESSAGE, a
+  NOTIFY, an MT INVITE) went back from the UE's protected server port to the
+  P-CSCF's protected client port. TS 33.203 clause 7.1 has the UE send requests
+  and responses from port_uc and the P-CSCF receive them on port_ps, so it now
+  goes there, the mirror of the P-CSCF rule fixed in 1.15.1.
+
+- **An in-dialog SUBSCRIBE names siphon in its Via.** A refresh or unsubscribe
+  of a subscription siphon made put the next hop's address in its own Via
+  sent-by, so the peer sent the response to itself and a refresh timed out.
+
+- **A Record-Route line with several entries is several route set entries.**
+  The route set of a subscription siphon made, read from the 2xx or the first
+  NOTIFY, kept a comma-joined Record-Route as one entry, so in-dialog requests
+  carried it as one Route value and the 2xx's was not reversed entry by entry
+  (RFC 3261 §7.3.1, §12.1.2).
+
 - **`call.dial(flow=registration.flow(impu), route=...)` keeps the flow.** A
   route set used to replace any flow, so a UE's MO INVITE was resolved from its
   topmost Route and left from the process listener, outside the SA (or failed
@@ -178,6 +209,35 @@ entry, but a working config keeps working.
   longer ends the session, a failed re-INVITE on an answered call no longer
   ends it, and the session state of a warranted call that failed unanswered
   is released when the call ends instead of waiting for the cap.
+### Fixed
+
+- **A burst on one TCP, TLS, WS or SCTP connection is no longer shed while the
+  peer is reading.** Each connection's send queue was bounded at 64 messages,
+  and the outbound distributor fills it far faster than the connection's writer
+  is scheduled to drain it, so a proxy-to-proxy connection carrying a few
+  hundred REGISTERs a second dropped the overflow ("send buffer full") with both
+  socket queues empty; every drop became a transaction timeout and a retry. The
+  queue is now bounded by bytes (`listen.stream_send_queue_bytes`, default
+  4 MiB), so a burst is queued whole and in order, and the distributor still
+  never waits on a connection. A peer is treated as stuck only when a write
+  makes no progress for `listen.stream_write_timeout_ms` (default 5000): the
+  connection is closed and logged at ERROR with what was still queued. A frame
+  past the byte bound is refused and logged with the queued bytes; on a relayed
+  request over the outbound pool that refusal is an immediate transport error
+  (RFC 3261 §8.1.3.1) instead of the former 250 ms park.
+
+### Added
+
+- **Send-queue metrics:** `siphon_stream_send_queue_bytes{transport}`,
+  `siphon_stream_send_queue_refused_total{transport}`,
+  `siphon_stream_stalled_closes_total{transport}` and
+  `siphon_stream_send_queue_discarded_total{transport}`.
+
+### Changed
+
+- **Rust API:** the connection maps the transport listeners and
+  `ConnectionPool` take are `DashMap<ConnectionId, transport::send_queue::SendQueue>`
+  instead of `DashMap<ConnectionId, mpsc::Sender<Bytes>>`.
 
 - **Per-contact removal reached the backend and drained the IMS state.** The
   removal behind the NAT keepalive and registrar liveness checks dropped the
@@ -186,6 +246,17 @@ entry, but a working config keeps working.
   P-Asserted-Identity, P-Associated-URI and aliases behind for good. It now
   goes through the same teardown as a REGISTER with `expires=0`, and never
   removes an AS capability record.
+- **Per-call media scope: `scope=` on `rtpengine.offer`, `answer` and
+  `delete`.** A proxy that anchors both the originating and the terminating
+  leg of one call sees both under one Call-ID (RFC 3261 §16.6), so the second
+  offer used to land on the first leg's engine call. Naming a scope per leg
+  makes each leg an engine call of its own, with its own profile, address
+  family and ports: siphon-rtp carries the scope in the frame in place of the
+  node's `media.siphon_rtp.scope`, rtpengine and rtpproxy key the leg as
+  `<call-id>;<scope>`. A re-offer and an answer reuse their own leg's session;
+  `delete(request)` and `rtpengine.delete_call(call_id)` without a scope end every leg of the Call-ID, each under the scope it was offered under; `delete_call(..., scope=)` ends one. Without
+  `scope=` every frame is unchanged. Validated like the node scope; refused on
+  a B2BUA call, whose legs have Call-IDs of their own.
 
 ## [1.15.2] — 2026-10-22
 

@@ -515,6 +515,68 @@ media:
   node's scope.
 - **Scripts.** Nothing changes: the scope is node configuration, scripts still
   name calls by their `Call-ID`, and the events they receive are this node's.
+- **Per-call scope.** A script can name a scope for one leg instead
+  (`rtpengine.offer(request, scope="orig")`, see
+  [Two legs of one call on one node](#two-legs-of-one-call-on-one-node)); that
+  frame carries the script's scope in place of the node's.
+
+#### Two legs of one call on one node
+
+A proxy that anchors both the originating and the terminating leg of one call
+(two of its own users calling each other) sees both legs under one `Call-ID`,
+since a proxy never changes it (RFC 3261 §16.6). The node scope cannot help: it
+is one per node. Name a scope per leg in the script instead:
+
+```python
+def leg(request):
+    return "term" if request.ruri.is_local else "orig"
+
+@proxy.on_request("INVITE")
+async def invite(request):
+    await rtpengine.offer(request, profile="access", scope=leg(request))
+    request.relay()
+
+@proxy.on_reply("INVITE")
+async def reply(request, reply):
+    if reply.status_code == 200:
+        await rtpengine.answer(reply, scope=leg(request))
+    reply.relay()
+
+@proxy.on_request("BYE")
+async def bye(request):
+    await rtpengine.delete(request)   # no scope: every leg of the Call-ID goes
+    request.relay()
+```
+
+- **What the engine sees.** siphon-rtp: the frame's top-level `scope` is the
+  script's, the `call_id` the SIP Call-ID, so each leg is its own engine call
+  keyed `(scope, call_id)`. rtpengine and rtpproxy have no scope, so the leg's
+  engine call-id is `<call-id>;<scope>`; no SIP Call-ID holds a `;` (RFC 3261
+  §25.1), so it never names another call. Each leg is a whole engine call, with
+  its own profile, address family and ports.
+- **Which verbs.** `offer`, `answer` and `delete` take `scope=`, and an
+  `offer` on a leg already anchored under that scope goes out as its re-offer.
+  The leg's session (profile, tags, WebSocket URI) is kept per scope, so an
+  `answer` reuses its own leg's offer profile. Other media verbs (prompts,
+  DTMF, gating, recording) still address the node-scope call.
+- **Delete.** `delete(request)` and `delete_call(call_id)` with no scope delete
+  the call's own session and every leg any scope anchored under that Call-ID,
+  each under its own scope; `delete(request, scope="orig")` and
+  `delete_call(call_id, scope="orig")` only that leg.
+- **Default.** Without `scope=`, every frame is byte for byte what it was. A
+  per-call scope equal to the node's configured scope is the node's call.
+- **Validation.** The node scope's rules (1 to 64 of `A-Z a-z 0-9 - _`);
+  anything else raises `ValueError` before the engine is asked. A B2BUA `Call`
+  (or a B2BUA reply) is refused too: its legs have Call-IDs of their own.
+- **Engine support.** On an unscoped siphon-rtp node, the first per-call scope
+  on a connection asks the engine for `node_info`; an engine without the
+  `scope` feature fails the verb rather than anchor the legs together.
+- **Events.** siphon-rtp events of a scoped leg reach the script under the SIP
+  Call-ID, without the scope; rtpengine reports the leg's engine call-id
+  (`<call-id>;<scope>`).
+- **Bounded.** A scope names a leg's role. siphon refuses a 257th distinct scope
+  name, so a script deriving one per call fails loudly instead of growing
+  siphon's bookkeeping with every call.
 
 A scope separates nodes that cooperate on one engine. It is a name, not a
 credential: any client that may reach the control port can name any scope, so

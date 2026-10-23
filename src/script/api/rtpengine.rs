@@ -34,6 +34,7 @@ mod decorators;
 mod message;
 mod offer;
 mod repeat;
+mod scope;
 
 use answer::AnswerExchange;
 use decorators::event_decorator;
@@ -639,10 +640,18 @@ impl PyRtpEngine {
     ///          mode. Blank raises ``ValueError``. No source address is carried,
     ///          so a profile's ``received_from`` does not gate the party's
     ///          media.
+    ///     scope: Anchor this leg as an engine call of its own, for a proxy that
+    ///          anchors both legs of one call under one Call-ID (the originating
+    ///          and the terminating leg of a call between two of its users),
+    ///          e.g. ``"orig"`` and ``"term"``. 1-64 ASCII letters, digits, ``-``
+    ///          and ``_``. Pass the same scope to that leg's ``answer`` and
+    ///          ``delete``. Omitted: the node's own scope, exactly as before.
+    ///          ``ValueError`` on a B2BUA Call, whose legs have Call-IDs of
+    ///          their own.
     ///
     /// Returns:
     ///     ``True``, or the rewritten SDP as ``str`` when ``sdp`` was passed.
-    #[pyo3(signature = (request, profile=None, ws_uri=None, beep_detection=None, beep_cadence_guard_ms=None, ws_sample_rate=None, ws_tee_sample_rate=None, ws_vad_engine=None, ws_vad_min_speech_ms=None, sdp=None))]
+    #[pyo3(signature = (request, profile=None, ws_uri=None, beep_detection=None, beep_cadence_guard_ms=None, ws_sample_rate=None, ws_tee_sample_rate=None, ws_vad_engine=None, ws_vad_min_speech_ms=None, sdp=None, scope=None))]
     #[allow(clippy::too_many_arguments)]
     fn offer<'py>(
         &self,
@@ -657,7 +666,10 @@ impl PyRtpEngine {
         ws_vad_engine: Option<&str>,
         ws_vad_min_speech_ms: Option<u32>,
         sdp: Option<&Bound<'py, PyAny>>,
+        scope: Option<&str>,
     ) -> PyResult<Bound<'py, PyAny>> {
+        let scope = scope::per_call_scope(scope, &[Some(request)], &self.client, "offer")?;
+        let sessions = scope::store_for(&self.sessions, scope.as_ref())?;
         let profile_name = profile.unwrap_or(DEFAULT_PROFILE);
         let entry = self.registry.get(profile_name).ok_or_else(|| {
             pyo3::exceptions::PyValueError::new_err(format!(
@@ -673,7 +685,7 @@ impl PyRtpEngine {
             identity,
             source_ip,
         } = offer::OfferInput::resolve(request, sdp)?;
-        let anchored = self.sessions.get(&call_id);
+        let anchored = sessions.get(&call_id);
         // Shaped for the party the rewritten offer is sent to: the callee of
         // the call under the `offer` half, and on a re-offer from the callee
         // the caller, under the `answer` half that has described it since the
@@ -701,12 +713,8 @@ impl PyRtpEngine {
         // Resolve + template the bridge URI, then finalise the flags. Both run
         // before the async block so a bad template or an unhonourable flag
         // raises to the script instead of failing a call already in flight.
-        let resolved_ws_uri = resolve_ws_uri(
-            ws_uri,
-            &self.sessions,
-            &call_id,
-            entry.offer.ws_uri.as_deref(),
-        );
+        let resolved_ws_uri =
+            resolve_ws_uri(ws_uri, &sessions, &call_id, entry.offer.ws_uri.as_deref());
         let overrides = MediaOverrides::parse(
             beep_detection,
             beep_cadence_guard_ms,
@@ -732,16 +740,16 @@ impl PyRtpEngine {
         }
         expand_stream_uris(&mut flags, &call_id, &from_tag, identity.as_ref())?;
         let command = offer::OfferCommand::new(
-            &self.sessions,
+            &sessions,
             call_id,
             from_tag,
             offer_sdp,
             profile_name.to_string(),
             flags.ws_uri.clone(),
-        );
+        )
+        .under(scope);
 
         let client = Arc::clone(&self.client);
-        let sessions = Arc::clone(&self.sessions);
         match body {
             // Message mode: the rewritten SDP replaces the message's body.
             Some(message) => pyo3_async_runtimes::tokio::future_into_py(python, async move {
@@ -847,10 +855,13 @@ impl PyRtpEngine {
     ///             ``reply`` if it carries one, else the tag an earlier answer on
     ///             this call recorded, so a re-answer reaches the same party, else
     ///             a new one.
+    ///     scope: The per-call scope the leg's ``offer`` named; its recorded
+    ///             profile and tags are that leg's own. Omitted: the node's own
+    ///             scope. ``ValueError`` on a B2BUA reply or Call.
     ///
     /// Returns:
     ///     ``True``, or the rewritten SDP as ``str`` when ``sdp`` was passed.
-    #[pyo3(signature = (reply, profile=None, call=None, ws_uri=None, beep_detection=None, beep_cadence_guard_ms=None, ws_sample_rate=None, ws_tee_sample_rate=None, ws_vad_engine=None, ws_vad_min_speech_ms=None, sdp=None, to_tag=None))]
+    #[pyo3(signature = (reply, profile=None, call=None, ws_uri=None, beep_detection=None, beep_cadence_guard_ms=None, ws_sample_rate=None, ws_tee_sample_rate=None, ws_vad_engine=None, ws_vad_min_speech_ms=None, sdp=None, to_tag=None, scope=None))]
     #[allow(clippy::too_many_arguments)]
     fn answer<'py>(
         &self,
@@ -867,10 +878,14 @@ impl PyRtpEngine {
         ws_vad_min_speech_ms: Option<u32>,
         sdp: Option<&Bound<'py, PyAny>>,
         to_tag: Option<&str>,
+        scope: Option<&str>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let mut exchange = AnswerExchange::resolve(reply, call, sdp, to_tag, &self.sessions)?;
+        let scope = scope::per_call_scope(scope, &[Some(reply), call], &self.client, "answer")?;
+        let sessions = scope::store_for(&self.sessions, scope.as_ref())?;
+        let mut exchange = AnswerExchange::resolve(reply, call, sdp, to_tag, &sessions)?;
+        exchange.scope = scope;
 
-        let profile_name = resolve_answer_profile(profile, &self.sessions, &exchange.call_id);
+        let profile_name = resolve_answer_profile(profile, &sessions, &exchange.call_id);
         let entry = self.registry.get(&profile_name).ok_or_else(|| {
             pyo3::exceptions::PyValueError::new_err(format!(
                 "unknown RTP profile '{profile_name}'; valid profiles: {}",
@@ -887,17 +902,13 @@ impl PyRtpEngine {
         let flags = exchange.command_flags(
             entry,
             &self.registry,
-            self.sessions.get(&exchange.call_id).as_ref(),
+            sessions.get(&exchange.call_id).as_ref(),
         );
 
         // The bridge belongs to the offerer's leg, so template against the A-leg
         // identifiers resolved above — not the reply's own tags.
-        let resolved_ws_uri = resolve_ws_uri(
-            ws_uri,
-            &self.sessions,
-            &exchange.call_id,
-            side.ws_uri.as_deref(),
-        );
+        let resolved_ws_uri =
+            resolve_ws_uri(ws_uri, &sessions, &exchange.call_id, side.ws_uri.as_deref());
         let overrides = MediaOverrides::parse(
             beep_detection,
             beep_cadence_guard_ms,
@@ -926,7 +937,6 @@ impl PyRtpEngine {
         let resolved_ws_uri = flags.ws_uri.clone();
 
         let client = Arc::clone(&self.client);
-        let sessions = Arc::clone(&self.sessions);
         let body = exchange.body.take();
         match body {
             // Reply mode: the rewritten SDP replaces the reply's body.
@@ -1135,14 +1145,23 @@ impl PyRtpEngine {
 
     /// Send an RTPEngine `delete` command to tear down the media session.
     ///
+    /// Without ``scope`` it also deletes every leg of the call that an
+    /// ``offer(..., scope=...)`` anchored, so one teardown ends both legs a
+    /// proxy anchored under one Call-ID. With ``scope`` only that leg goes.
+    /// Teardown is best-effort: an engine refusal is logged, not raised.
+    ///
     /// Args:
     ///     request: A Request or Call object (used to extract Call-ID/From-tag).
-    #[pyo3(signature = (request,))]
+    ///     scope: Delete only the leg anchored under this per-call scope.
+    ///            ``ValueError`` on a B2BUA Call.
+    #[pyo3(signature = (request, scope=None))]
     fn delete<'py>(
         &self,
         python: Python<'py>,
         request: &Bound<'py, PyAny>,
+        scope: Option<&str>,
     ) -> PyResult<Bound<'py, PyAny>> {
+        let scope = scope::per_call_scope(scope, &[Some(request)], &self.client, "delete")?;
         let message = extract_message(request)?;
         let (call_id, from_tag) = extract_delete_params(&message)?;
 
@@ -1150,6 +1169,10 @@ impl PyRtpEngine {
         let sessions = Arc::clone(&self.sessions);
 
         pyo3_async_runtimes::tokio::future_into_py(python, async move {
+            if let Some(scope) = scope {
+                scope::delete_leg(&client, &sessions, &call_id, &from_tag, &scope).await;
+                return Ok(true);
+            }
             match client.delete(&call_id, &from_tag).await {
                 Ok(()) => {
                     debug!(call_id = %call_id, "RTPEngine session deleted");
@@ -1176,6 +1199,7 @@ impl PyRtpEngine {
             }
 
             sessions.remove(&call_id);
+            scope::delete_scoped_legs(&client, &sessions, &call_id, &from_tag).await;
             Ok(true)
         })
     }
@@ -1196,29 +1220,34 @@ impl PyRtpEngine {
     /// Args:
     ///     call_id: The SIP Call-ID the media was anchored under.
     ///     from_tag: The From-tag to delete with, if not the tracked one.
+    ///     scope: Release only the leg an ``offer(..., scope=...)`` anchored
+    ///            under this scope. Omitted: the call's own media and every
+    ///            leg anchored under the Call-ID, each under its own scope.
     ///
     /// Returns:
     ///     ``True`` when the engine released the call, ``False`` when it no
     ///     longer held it (already timed out, or never anchored).
     ///
     /// Raises:
-    ///     ValueError: ``call_id`` is empty.
+    ///     ValueError: ``call_id`` is empty, or ``scope`` is invalid.
     ///     RuntimeError: the engine could not be reached or refused the delete.
-    #[pyo3(signature = (call_id, from_tag=None))]
+    #[pyo3(signature = (call_id, from_tag=None, scope=None))]
     fn delete_call<'py>(
         &self,
         python: Python<'py>,
         call_id: String,
         from_tag: Option<String>,
+        scope: Option<&str>,
     ) -> PyResult<Bound<'py, PyAny>> {
         if call_id.is_empty() {
             return Err(pyo3::exceptions::PyValueError::new_err("call_id is empty"));
         }
+        let scope = scope::per_call_scope(scope, &[], &self.client, "delete_call")?;
         let client = Arc::clone(&self.client);
         let sessions = Arc::clone(&self.sessions);
         pyo3_async_runtimes::tokio::future_into_py(python, async move {
             client
-                .release_call(&sessions, &call_id, from_tag.as_deref())
+                .release_call(&sessions, &call_id, from_tag.as_deref(), scope.as_ref())
                 .await
                 .map_err(|error| {
                     pyo3::exceptions::PyRuntimeError::new_err(format!(
@@ -3012,7 +3041,7 @@ impl PyRtpEngine {
     /// Number of active media sessions being tracked.
     #[getter]
     fn active_sessions(&self) -> usize {
-        self.sessions.len()
+        self.sessions.len() + self.sessions.scoped_len()
     }
 
     /// Number of configured RTPEngine instances.

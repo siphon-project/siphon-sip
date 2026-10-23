@@ -17,6 +17,9 @@ pub mod rate_limit;
 pub(crate) mod response_route;
 #[cfg(feature = "sctp")]
 pub mod sctp;
+pub mod send_queue;
+#[cfg(test)]
+mod send_queue_tests;
 pub mod stream;
 pub mod tcp;
 pub mod tls;
