@@ -34,6 +34,7 @@ use super::siphon_rtp::{PlayMediaOutcome, SiphonRtpClientSet};
 pub use siphon_rtp_proto::X3TargetLeg;
 
 mod conference;
+mod release;
 pub use conference::{BridgeDirection, ConferenceRole, ConferenceSeat};
 
 /// The configured media-control backend.

@@ -377,7 +377,9 @@ fn concurrent_mutation_leaves_the_index_in_step() {
                     match round % 5 {
                         0 | 1 => register(&registrar, &aor, &contact, 3600, None, None),
                         2 => register(&registrar, &aor, &contact, 0, None, None),
-                        3 => registrar.remove_contact(&aor, &contact),
+                        3 => {
+                            registrar.remove_contact(&aor, &contact);
+                        }
                         _ => registrar.remove_all(&aor),
                     }
                     let _ = registrar.lookup_contact(&contact);
