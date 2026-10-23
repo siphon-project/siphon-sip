@@ -171,6 +171,15 @@ set included, before the NOTIFY handler runs. So
 returns the same handle in either order, and `None` means the NOTIFY belongs to
 no subscription: answer it 481.
 
+A UE subscribes over its own security association with
+`send(..., flow=registration.flow(impu), route=[<P-CSCF protected URI>] +
+registration.service_route(impu))`: the SUBSCRIBE leaves from the UE's
+protected client port to the P-CSCF's protected server port with the route set
+as Route headers, and `handle.refresh()` / `handle.terminate()` go over the SA
+set the registration holds when each is sent (see the IMS multi-UE cookbook).
+`proxy.send_request()` takes the same `flow=` and `route=` for a MESSAGE or any
+other request.
+
 What the SUBSCRIBE transaction then decides, per the subscriber state machine of
 §4.1.2:
 

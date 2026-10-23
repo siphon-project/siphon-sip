@@ -247,9 +247,7 @@ pub(super) fn b_leg_flow<'a>(
     flow: Option<&'a crate::script::api::registrar::PyFlow>,
     b_leg_route: &[String],
 ) -> Option<&'a crate::script::api::registrar::PyFlow> {
-    flow.filter(|flow| {
-        flow.kind == crate::script::api::registrar::FlowKind::Outbound || b_leg_route.is_empty()
-    })
+    crate::script::api::flow_kind::flow_under_route_set(flow, b_leg_route.is_empty())
 }
 
 /// Which URI a B-leg INVITE's wire destination is resolved from.

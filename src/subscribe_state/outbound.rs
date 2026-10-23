@@ -101,7 +101,7 @@ impl RemoteParty {
             tag: extract_tag(from)?,
             uri: strip_nameaddr(from),
             target: contact(&notify.headers),
-            route_set: record_route(&notify.headers).cloned().unwrap_or_default(),
+            route_set: record_route(&notify.headers).unwrap_or_default(),
             expires: notify
                 .headers
                 .get("Subscription-State")
@@ -121,7 +121,7 @@ impl RemoteParty {
             uri: strip_nameaddr(to),
             target: contact(&response.headers),
             route_set: record_route(&response.headers)
-                .map(|entries| entries.iter().rev().cloned().collect())
+                .map(|entries| entries.into_iter().rev().collect())
                 .unwrap_or_default(),
             expires: response
                 .headers
@@ -160,8 +160,19 @@ fn contact(headers: &SipHeaders) -> Option<String> {
     header(headers, "Contact", "m").map(|value| strip_nameaddr(value))
 }
 
-fn record_route(headers: &SipHeaders) -> Option<&Vec<String>> {
-    headers.get_all("Record-Route")
+/// The Record-Route entries of `headers`, one per entry in the order they
+/// appear, whether each has a header line of its own or several share one
+/// (RFC 3261 §7.3.1). A value that does not parse is kept as it is.
+fn record_route(headers: &SipHeaders) -> Option<Vec<String>> {
+    headers.get_all("Record-Route").map(|values| {
+        values
+            .iter()
+            .flat_map(|value| {
+                crate::sip::headers::route::route_name_addrs(value)
+                    .unwrap_or_else(|_| vec![value.clone()])
+            })
+            .collect()
+    })
 }
 
 /// The event-type and the `id` parameter of an Event header value.
@@ -828,6 +839,7 @@ mod tests {
             event_version: 0,
             terminated: false,
             is_outbound: true,
+            registrant_flow: None,
         }
     }
 
@@ -897,6 +909,58 @@ mod tests {
 
     const ROUTE_OF_THE_NOTIFY: [&str; 2] =
         ["<sip:near.example.com;lr>", "<sip:far.example.com;lr>"];
+
+    /// Record-Route entries that share a header line are as many route set
+    /// entries as entries that each have one (RFC 3261 §7.3.1), reversed on
+    /// the 2xx (§12.1.2) and in order on a NOTIFY (§12.1.1).
+    #[test]
+    fn a_combined_record_route_is_one_route_set_entry_per_entry() {
+        let response = parse_sip_message_bytes(
+            concat!(
+                "SIP/2.0 200 OK\r\n",
+                "Via: SIP/2.0/UDP 192.0.2.1:5060;branch=z9hG4bK-uac-py-1\r\n",
+                "From: <sip:watcher@example.com>;tag=local\r\n",
+                "To: <sip:001010123456789@example.com>;tag=notifier\r\n",
+                "Call-ID: call-a\r\n",
+                "CSeq: 1 SUBSCRIBE\r\n",
+                "Record-Route: <sip:far.example.com;lr>, <sip:near.example.com;lr>\r\n",
+                "Content-Length: 0\r\n",
+                "\r\n",
+            )
+            .as_bytes(),
+        )
+        .expect("the 2xx parses");
+        assert_eq!(
+            RemoteParty::from_subscribe_response(&response)
+                .expect("a dialog")
+                .route_set,
+            ROUTE_OF_THE_NOTIFY
+        );
+
+        let notify = parse_sip_message_bytes(
+            concat!(
+                "NOTIFY sip:watcher@192.0.2.1 SIP/2.0\r\n",
+                "Via: SIP/2.0/UDP 198.51.100.1:5060;branch=z9hG4bK-n\r\n",
+                "From: <sip:001010123456789@example.com>;tag=notifier\r\n",
+                "To: <sip:watcher@example.com>;tag=local\r\n",
+                "Call-ID: call-a\r\n",
+                "CSeq: 1 NOTIFY\r\n",
+                "Record-Route: <sip:near.example.com;lr>, <sip:far.example.com;lr>\r\n",
+                "Event: reg\r\n",
+                "Subscription-State: active\r\n",
+                "Content-Length: 0\r\n",
+                "\r\n",
+            )
+            .as_bytes(),
+        )
+        .expect("the NOTIFY parses");
+        assert_eq!(
+            RemoteParty::from_notify(&notify)
+                .expect("a dialog")
+                .route_set,
+            ROUTE_OF_THE_NOTIFY
+        );
+    }
 
     #[test]
     fn a_registered_subscription_is_pending_and_not_yet_a_dialog() {

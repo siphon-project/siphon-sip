@@ -164,6 +164,47 @@ hop, so the route set rides it. A callee's flow (`contact.flow`) is the
 opposite case: there `route=` is the binding's Path and replaces the flow
 (RFC 3327 §5.3).
 
+**Requests outside a call** take the same flow and route set. A MESSAGE (an MO
+SMS over IP, or the RP-ACK a UE sends back for an MT one, TS 24.341):
+
+```python
+    reply = await proxy.send_request(
+        "MESSAGE", f"sip:{dialled}@{HOME}", body=rpdu,
+        headers={"From": f"<{impu}>", "To": f"<sip:{dialled}@{HOME}>",
+                 "Content-Type": "application/vnd.3gpp.sms"},
+        flow=flow, route=route, wait_for_response=True)
+```
+
+and the UE's subscription to its own reg event (TS 24.229 5.1.1.3), whose
+refreshes and unsubscribe follow the subscription over the SA:
+
+```python
+@registration.on_change
+async def on_registration_change(aor, event_type, state):
+    if event_type != "registered":
+        return
+    flow = registration.flow(aor)
+    handle = await proxy.subscribe_state.send(
+        aor, event="reg", expires=600000, accept="application/reginfo+xml",
+        headers={"From": f"<{aor}>"},
+        flow=flow, route=[f"<sip:{flow.remote_addr};lr>"] + registration.service_route(aor))
+    # later: await handle.refresh(), await handle.terminate()
+```
+
+Each request leaves from the UE's protected client port to the P-CSCF's
+protected server port, its Via (and a SUBSCRIBE's Contact) naming the UE's
+protected server port, with the route set as Route headers. A refresh or an
+unsubscribe looks the registration up again and goes over the SA set it holds
+then, since a re-registration replaces the set; when the registration has no
+SA left it raises instead of sending outside one. `subscribe_state.send`
+refuses a callee's flow. `proxy.send_request` takes one too and treats it as
+`call.dial` does: it is the destination with no route set, and yields to one.
+
+**Answers to the P-CSCF's requests** (a 200 to an MT MESSAGE, to a NOTIFY, to
+an MT INVITE) arrive on the UE's protected server port and leave, over UDP,
+from the UE's protected client port to the P-CSCF's protected server port
+(TS 33.203 clause 7.1).
+
 An MT request answered on a per-UE socket carries that socket's address in its
 Contact and Via, not `advertised_address`, and the per-UE addresses count as
 this node when siphon consumes Route entries.

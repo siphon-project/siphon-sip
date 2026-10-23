@@ -16,6 +16,9 @@
 
 pub mod address;
 pub mod aka;
+mod egress;
+#[cfg(test)]
+pub(crate) use egress::{established_ue, rotate_sa_set};
 pub mod entry_config;
 pub mod messages;
 pub mod pacing;
@@ -26,6 +29,7 @@ mod status;
 #[cfg(test)]
 pub(crate) mod test_support;
 
+pub use egress::UeEgress;
 pub use messages::{BuiltRegister, EgressDefaults};
 pub use pacing::RefreshWindow;
 pub use protected::{SaDeletion, UeExchange, UeSaKey, UeSaSets};
