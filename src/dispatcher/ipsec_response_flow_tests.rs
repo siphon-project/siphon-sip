@@ -318,3 +318,89 @@ fn with_stream_egress(proxy: Proxy, stream_sender: flume::Sender<OutboundMessage
         udp: udp_receiver,
     }
 }
+
+/// The UE side: siphon as a registrant answers a request the P-CSCF sent it
+/// over the SA (an MT MESSAGE, a NOTIFY of its reg-event subscription). The
+/// request arrives on the UE's protected server port from the P-CSCF's
+/// protected client port; over UDP the response leaves from the UE's
+/// protected client port for the P-CSCF's protected server port (TS 33.203
+/// clause 7.1: the UE "sends requests and responses protected with ESP on the
+/// port port_uc", the P-CSCF receives them "on the port port_ps").
+#[test]
+fn a_registrant_answers_a_request_over_the_sa_from_its_client_port() {
+    const SCRIPT: &str = concat!(
+        "from siphon import proxy\n",
+        "\n",
+        "@proxy.on_request(\"MESSAGE\")\n",
+        "def message(request):\n",
+        "    request.reply(200, \"OK\")\n",
+        "\n",
+        "@proxy.on_request(\"NOTIFY\")\n",
+        "def notify(request):\n",
+        "    request.reply(200, \"OK\")\n",
+    );
+    // The process-wide manager, with a UE of this test's own.
+    crate::registrant::set_manager(Arc::new(crate::registrant::test_support::manager()));
+    let manager = crate::registrant::manager().expect("a manager is installed");
+    let ue_ip: std::net::IpAddr = "192.0.2.141".parse().unwrap();
+    let aor = crate::registrant::established_ue(manager, 41, ue_ip);
+    let egress = manager.ue_egress(&aor, ue_ip).expect("an established set");
+    let ue_server = addr("192.0.2.141:6101");
+    let pcscf_client = addr("198.51.100.10:5064");
+
+    let super::test_dispatcher::TestDispatcher { state, udp } =
+        super::test_dispatcher::test_dispatcher_with_script(SCRIPT);
+    let state = Arc::new(state);
+    for (method, extra) in [
+        ("MESSAGE", "Content-Type: application/vnd.3gpp.sms\r\n"),
+        ("NOTIFY", "Event: reg\r\nSubscription-State: active\r\n"),
+    ] {
+        let raw = format!(
+            concat!(
+                "{method} sip:00101{index:010}@192.0.2.141:6101 SIP/2.0\r\n",
+                "Via: SIP/2.0/UDP 198.51.100.10:5064;branch=z9hG4bK-{method}\r\n",
+                "Max-Forwards: 69\r\n",
+                "From: <sip:+15550100@ims.example.invalid>;tag=far\r\n",
+                "To: <sip:00101{index:010}@ims.example.invalid>;tag=near\r\n",
+                "Call-ID: {method}@pcscf\r\n",
+                "CSeq: 1 {method}\r\n",
+                "{extra}",
+                "Content-Length: 0\r\n",
+                "\r\n",
+            ),
+            method = method,
+            index = 41,
+            extra = extra,
+        );
+        let message = parse_sip_message_bytes(raw.as_bytes()).expect("the request parses");
+        let inbound = InboundMessage {
+            client_transport: None,
+            connection_id: ConnectionId::default(),
+            transport: Transport::Udp,
+            local_addr: ue_server,
+            remote_addr: pcscf_client,
+            data: Bytes::from(raw.clone()),
+        };
+        handle_request(inbound, message, method.to_string(), &state);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let sent = loop {
+            let sent = drain(&udp);
+            if !sent.is_empty() || std::time::Instant::now() > deadline {
+                break sent;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(sent.len(), 1, "{method}: one response");
+        assert_eq!(sent[0].status_code, Some(200), "{method}");
+        assert_eq!(
+            sent[0].destination, egress.destination,
+            "{method}: to port_ps"
+        );
+        assert_eq!(
+            sent[0].source_local_addr,
+            Some(egress.local),
+            "{method}: from the UE's protected client port"
+        );
+    }
+    manager.remove(&aor);
+}

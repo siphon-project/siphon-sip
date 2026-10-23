@@ -34,6 +34,8 @@ pub(crate) struct EngineCommand {
     pub(crate) to_tag: Option<String>,
     pub(crate) sdp: Option<String>,
     pub(crate) transport_protocol: Option<String>,
+    /// The profile's `address family` (`IP4` / `IP6`).
+    pub(crate) address_family: Option<String>,
 }
 
 /// The engine: its address, and the commands it has been sent.
@@ -84,6 +86,7 @@ impl TestEngine {
                         to_tag: field("to-tag"),
                         sdp: field("sdp"),
                         transport_protocol: field("transport-protocol"),
+                        address_family: field("address family"),
                     });
                 let response = match name.as_str() {
                     "ping" => BencodeValue::dict(vec![("result", BencodeValue::string("pong"))]),

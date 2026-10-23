@@ -52,6 +52,7 @@ mod connection;
 mod events;
 mod far_leg;
 mod identity;
+mod per_call;
 mod scope;
 mod waiters;
 use connection::connection_manager;
@@ -61,6 +62,7 @@ use events::{
 };
 pub use identity::set_controller_id;
 pub use scope::CallScope;
+use scope::CallScopes;
 use waiters::Waiters;
 pub use waiters::{DigitRead, DigitReadEnd, DigitReadLimits};
 
@@ -233,8 +235,9 @@ pub struct SiphonRtpClient {
     /// startup or post-reconnect window blocks for the connection rather than
     /// failing instantly.
     connected: watch::Receiver<bool>,
-    /// The scope every frame naming a call carries (`media.siphon_rtp.scope`).
-    scope: Option<CallScope>,
+    /// The scope every frame naming a call carries (`media.siphon_rtp.scope`),
+    /// and the per-call scopes scripts named in its place.
+    scopes: Arc<CallScopes>,
     /// Active call-ids (offer→insert, delete→remove) — mirrors `RtpEngineSet`'s
     /// affinity count for the `rtpengine.active_sessions` Python getter.
     sessions: DashMap<String, ()>,
@@ -284,11 +287,12 @@ impl SiphonRtpClient {
         let writer: Arc<Mutex<Option<OwnedWriteHalf>>> = Arc::new(Mutex::new(None));
         let (connected_tx, connected_rx) = watch::channel(false);
         let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>(1);
+        let scopes = Arc::new(CallScopes::new(scope));
 
         tokio::spawn(connection_manager(
             address,
             control_secret,
-            scope.clone(),
+            Arc::clone(&scopes),
             timeout_ms,
             Arc::clone(&pending),
             Arc::clone(&play_pending),
@@ -309,7 +313,7 @@ impl SiphonRtpClient {
             waiters,
             writer,
             connected: connected_rx,
-            scope,
+            scopes,
             sessions: DashMap::new(),
             _shutdown_tx: shutdown_tx,
         })
@@ -322,8 +326,19 @@ impl SiphonRtpClient {
     /// for the connection instead of failing immediately. A genuinely
     /// unreachable engine surfaces as [`RtpEngineError::Timeout`].
     async fn request(&self, command: Command) -> Result<CmdResult, RtpEngineError> {
+        self.request_in(None, command).await
+    }
+
+    /// [`Self::request`] with the frame under `scope` in place of the node's
+    /// own; `None` is the node's.
+    async fn request_in(
+        &self,
+        scope: Option<&CallScope>,
+        command: Command,
+    ) -> Result<CmdResult, RtpEngineError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let bytes = scope::encode_request(self.scope.as_ref(), &Request { id, command })
+        let frame_scope = scope.or(self.scopes.node());
+        let bytes = scope::encode_request(frame_scope, &Request { id, command })
             .map_err(|error| RtpEngineError::Protocol(format!("frame encode failed: {error}")))?;
 
         let (sender, receiver) = oneshot::channel();
@@ -397,17 +412,7 @@ impl SiphonRtpClient {
         sdp: &[u8],
         flags: &NgFlags,
     ) -> Result<Vec<u8>, RtpEngineError> {
-        let result = self
-            .request(Command::Offer {
-                call_id: call_id.to_string(),
-                from_tag: from_tag.to_string(),
-                sdp: String::from_utf8_lossy(sdp).into_owned(),
-                profile: profile_flags_from_ng(flags),
-            })
-            .await?;
-        let rewritten = expect_sdp(result)?;
-        self.sessions.insert(call_id.to_string(), ());
-        Ok(rewritten)
+        self.offer_in(None, call_id, from_tag, sdp, flags).await
     }
 
     /// Send a `reoffer` — renegotiate a **live** call on the ports it already
@@ -431,15 +436,7 @@ impl SiphonRtpClient {
         sdp: &[u8],
         flags: &NgFlags,
     ) -> Result<Vec<u8>, RtpEngineError> {
-        let result = self
-            .request(Command::Reoffer {
-                call_id: call_id.to_string(),
-                from_tag: from_tag.to_string(),
-                sdp: String::from_utf8_lossy(sdp).into_owned(),
-                profile: profile_flags_from_ng(flags),
-            })
-            .await?;
-        expect_sdp(result)
+        self.reoffer_in(None, call_id, from_tag, sdp, flags).await
     }
 
     /// Send an `answer`, returning the rewritten SDP.
@@ -451,16 +448,8 @@ impl SiphonRtpClient {
         sdp: &[u8],
         flags: &NgFlags,
     ) -> Result<Vec<u8>, RtpEngineError> {
-        let result = self
-            .request(Command::Answer {
-                call_id: call_id.to_string(),
-                from_tag: from_tag.to_string(),
-                to_tag: to_tag.to_string(),
-                sdp: String::from_utf8_lossy(sdp).into_owned(),
-                profile: profile_flags_from_ng(flags),
-            })
-            .await?;
-        expect_sdp(result)
+        self.answer_in(None, call_id, from_tag, to_tag, sdp, flags)
+            .await
     }
 
     /// Single-leg UAS `answer_local` — the engine *is* the far side (IVR /
@@ -559,15 +548,7 @@ impl SiphonRtpClient {
 
     /// Send a `delete` to tear down a session and drop its active-session entry.
     pub async fn delete(&self, call_id: &str, from_tag: &str) -> Result<(), RtpEngineError> {
-        let result = self
-            .request(Command::Delete {
-                call_id: call_id.to_string(),
-                from_tag: from_tag.to_string(),
-                to_tag: None,
-            })
-            .await;
-        self.sessions.remove(call_id);
-        expect_ok(result?)
+        self.delete_in(None, call_id, from_tag).await
     }
 
     /// Tear down a whole call by id, for a call whose tags we no longer know.
@@ -577,15 +558,7 @@ impl SiphonRtpClient {
     /// deletable even though the session that knew its `from_tag` is gone —
     /// which is the whole point of the reap.
     pub async fn delete_call(&self, call_id: &str) -> Result<(), RtpEngineError> {
-        let result = self
-            .request(Command::Delete {
-                call_id: call_id.to_string(),
-                from_tag: String::new(),
-                to_tag: None,
-            })
-            .await;
-        self.sessions.remove(call_id);
-        expect_ok(result?)
+        self.delete_in(None, call_id, "").await
     }
 
     /// The live call-ids this engine instance is handling for us.
@@ -1251,12 +1224,7 @@ impl SiphonRtpClientSet {
         sdp: &[u8],
         flags: &NgFlags,
     ) -> Result<Vec<u8>, RtpEngineError> {
-        let result = self
-            .select(call_id)
-            .offer(call_id, from_tag, sdp, flags)
-            .await?;
-        self.bind_affinity(call_id);
-        Ok(result)
+        self.offer_in(None, call_id, from_tag, sdp, flags).await
     }
 
     /// Renegotiate a live call on the affinity-bound instance, keeping its ports
@@ -1276,29 +1244,7 @@ impl SiphonRtpClientSet {
         sdp: &[u8],
         flags: &NgFlags,
     ) -> Result<Vec<u8>, RtpEngineError> {
-        match self
-            .select(call_id)
-            .reoffer(call_id, from_tag, sdp, flags)
-            .await
-        {
-            Ok(rewritten) => Ok(rewritten),
-            Err(error) if is_codec_change_refusal(&error) => {
-                tracing::warn!(
-                    %call_id,
-                    %error,
-                    "re-offer changes the negotiated codec; replacing the media session — its \
-                     ports are re-allocated and any WebSocket bridge, tee or SIPREC subscription \
-                     on it is torn down"
-                );
-                let result = self
-                    .select(call_id)
-                    .offer(call_id, from_tag, sdp, flags)
-                    .await?;
-                self.bind_affinity(call_id);
-                Ok(result)
-            }
-            Err(error) => Err(error),
-        }
+        self.reoffer_in(None, call_id, from_tag, sdp, flags).await
     }
 
     /// Send an `answer` to the affinity-bound instance.
@@ -1310,8 +1256,7 @@ impl SiphonRtpClientSet {
         sdp: &[u8],
         flags: &NgFlags,
     ) -> Result<Vec<u8>, RtpEngineError> {
-        self.select(call_id)
-            .answer(call_id, from_tag, to_tag, sdp, flags)
+        self.answer_in(None, call_id, from_tag, to_tag, sdp, flags)
             .await
     }
 
@@ -1361,19 +1306,7 @@ impl SiphonRtpClientSet {
     /// Affinity may not know this call — a reap runs before any of them were
     /// offered here — so it is sent to each instance until one accepts.
     pub async fn delete_call(&self, call_id: &str) -> Result<(), RtpEngineError> {
-        let mut last: Option<RtpEngineError> = None;
-        for client in &self.clients {
-            match client.delete_call(call_id).await {
-                Ok(()) => {
-                    self.affinity.remove(call_id);
-                    return Ok(());
-                }
-                Err(error) => last = Some(error),
-            }
-        }
-        Err(last.unwrap_or_else(|| {
-            RtpEngineError::Protocol("no media engine to delete on".to_string())
-        }))
+        self.delete_call_in(None, call_id).await
     }
 
     /// Every live call-id across the set, de-duplicated.
@@ -1408,9 +1341,7 @@ impl SiphonRtpClientSet {
 
     /// Send a `delete` and drop affinity.
     pub async fn delete(&self, call_id: &str, from_tag: &str) -> Result<(), RtpEngineError> {
-        let result = self.select(call_id).delete(call_id, from_tag).await;
-        self.affinity.remove(call_id);
-        result
+        self.delete_in(None, call_id, from_tag).await
     }
 
     /// Inject an audio prompt via the affinity-bound instance.

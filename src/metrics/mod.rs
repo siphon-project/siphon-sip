@@ -10,6 +10,7 @@ pub mod enum_servers;
 pub mod event_lag;
 pub mod glibc;
 pub mod ipsec;
+pub mod send_queue;
 
 use std::sync::{Arc, OnceLock};
 

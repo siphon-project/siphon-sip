@@ -15,12 +15,22 @@ use crate::sip::builder::SipMessageBuilder;
 use crate::sip::message::Method;
 use crate::sip::parser::parse_uri_standalone;
 pub(crate) use crate::subscribe_state::strip_nameaddr;
-use crate::subscribe_state::{extract_tag, RemoteParty, SubscribeDialog, SubscribeStore};
+use crate::subscribe_state::{
+    extract_tag, DialogRegistrantFlow, RemoteParty, SubscribeDialog, SubscribeStore,
+};
 use crate::transport::Transport;
 use crate::uac::UacSender;
 
 use super::proxy_utils::ReplyGate;
+
+#[path = "subscribe_in_dialog.rs"]
+mod in_dialog;
 use super::request::PyRequest;
+#[cfg(test)]
+use in_dialog::send_in_dialog;
+use in_dialog::{
+    resolved_transport, send_in_dialog_subscribe, send_in_dialog_subscribe_with_timeout,
+};
 
 static UAC_SENDER: OnceLock<Arc<UacSender>> = OnceLock::new();
 static SEND_RESOLVER: OnceLock<Arc<SipResolver>> = OnceLock::new();
@@ -266,6 +276,20 @@ impl PySubscribeState {
     ///     headers: Optional dict of extra header name → value pairs to add
     ///              (e.g. ``P-Asserted-Identity``).
     ///     timeout_ms: Response timeout in milliseconds (default 2000).
+    ///     flow: A ``registration.flow(impu)``: subscribe as that UE, over its
+    ///           security association. The SUBSCRIBE leaves from the UE's
+    ///           protected client port to the P-CSCF's protected server port,
+    ///           its Via and Contact name the UE's protected server port, and
+    ///           ``route`` goes on the wire as Route headers (TS 24.229
+    ///           §5.1.2A.1.1). The refreshes and the unsubscribe go the same
+    ///           way, over the SA set the registration holds when each is
+    ///           sent. A callee's flow (``contact.flow``) raises
+    ///           ``ValueError``.
+    ///     route: The route set, each entry one Route header in order: a UE's
+    ///            is the P-CSCF's protected URI followed by the Service-Route.
+    ///            Without ``flow`` the SUBSCRIBE goes to its first entry.
+    ///            Cannot be combined with ``target_uri`` or a Route in
+    ///            ``headers``.
     ///
     /// Raises ``RuntimeError`` on a non-2xx response (§4.1.2.1: no
     /// subscription was created, even if a NOTIFY came first), on a timeout
@@ -280,6 +304,8 @@ impl PySubscribeState {
         target_uri=None,
         headers=None,
         timeout_ms=2000,
+        flow=None,
+        route=Vec::new(),
     ))]
     #[allow(clippy::too_many_arguments)]
     fn send<'py>(
@@ -292,6 +318,8 @@ impl PySubscribeState {
         target_uri: Option<&str>,
         headers: Option<&Bound<'_, pyo3::types::PyDict>>,
         timeout_ms: u64,
+        flow: Option<super::registrar::PyFlow>,
+        route: Vec<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
         // Read the header dict here: a `Bound` cannot cross into the future.
         let extra_headers: Vec<(String, String)> = match headers {
@@ -301,14 +329,44 @@ impl PySubscribeState {
                 .collect::<PyResult<_>>()?,
             None => Vec::new(),
         };
+        let headers_carry_route = extra_headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("Route"));
+        let route = super::uac_flow::route_set_argument(
+            &route,
+            if target_uri.is_some() {
+                Some("target_uri=")
+            } else if headers_carry_route {
+                Some("a Route in headers=")
+            } else {
+                None
+            },
+            "subscribe_state.send",
+        )?;
+        let flow = match flow {
+            Some(flow) if flow.kind.registrant().is_none() => {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "subscribe_state.send: flow= takes a registration.flow(); a callee's \
+                     flow cannot carry a subscription's later requests",
+                ))
+            }
+            flow => flow,
+        };
         let store = Arc::clone(&self.store);
         let (ruri, event) = (ruri.to_string(), event.to_string());
         let accept = accept.map(str::to_string);
         let target_uri = target_uri.map(str::to_string);
 
         crate::script::awaitable(python, async move {
+            let (uac, resolver) = initial_senders()?;
             Self::send_inner(
-                store,
+                SubscribeSend {
+                    store,
+                    uac,
+                    resolver,
+                    flow,
+                    route,
+                },
                 &ruri,
                 &event,
                 expires,
@@ -766,6 +824,7 @@ fn capture_incoming(
         event_version: 0,
         terminated: false,
         is_outbound: false,
+        registrant_flow: None,
     };
 
     drop(message);
@@ -970,160 +1029,40 @@ async fn send_notify(
     Ok(())
 }
 
-/// Send an in-dialog SUBSCRIBE (refresh or Expires:0 termination)
-/// without waiting for a response. Used by `terminate()` on outbound
-/// dialogs — the response carries no information we need.
-async fn send_in_dialog_subscribe(dialog: &SubscribeDialog, expires_secs: u64) -> PyResult<()> {
-    let (message, target_addr, transport) = build_in_dialog_subscribe(dialog, expires_secs).await?;
-    let uac_sender = UAC_SENDER.get().ok_or_else(|| {
+/// The UAC and resolver `send()` originates through.
+fn initial_senders() -> PyResult<(&'static UacSender, &'static SipResolver)> {
+    let uac = UAC_SENDER.get().ok_or_else(|| {
         pyo3::exceptions::PyRuntimeError::new_err(
-            "subscribe_state outbound unavailable: UAC sender not initialized",
+            "subscribe_state.send() unavailable: UAC sender not initialized",
         )
     })?;
-    uac_sender.send_request(message, target_addr, transport);
-    Ok(())
-}
-
-/// Send an in-dialog SUBSCRIBE and block until the peer responds.
-/// Used by `refresh()` so the script learns about a non-2xx refresh
-/// failure synchronously.
-async fn send_in_dialog_subscribe_with_timeout(
-    dialog: &SubscribeDialog,
-    expires_secs: u64,
-    timeout_ms: u64,
-) -> PyResult<()> {
-    let (message, target_addr, transport) = build_in_dialog_subscribe(dialog, expires_secs).await?;
-    let uac_sender = UAC_SENDER.get().ok_or_else(|| {
-        pyo3::exceptions::PyRuntimeError::new_err(
-            "subscribe_state refresh unavailable: UAC sender not initialized",
-        )
-    })?;
-    let receiver = uac_sender.send_request_with_response(message, target_addr, transport);
-    let timeout = std::time::Duration::from_millis(timeout_ms);
-    let result = tokio::time::timeout(timeout, receiver).await;
-    match result {
-        Ok(Ok(crate::uac::UacResult::Response(message))) => {
-            let status = message.status_code().unwrap_or(0);
-            if (200..300).contains(&status) {
-                Ok(())
-            } else {
-                Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
-                    "subscribe refresh got non-2xx response: {status}"
-                )))
-            }
-        }
-        _ => Err(pyo3::exceptions::PyRuntimeError::new_err(
-            "subscribe refresh timed out waiting for 2xx",
-        )),
-    }
-}
-
-/// Build a SUBSCRIBE message inside an established dialog. Used for
-/// both refresh (`Expires: <new>`) and termination (`Expires: 0`).
-async fn build_in_dialog_subscribe(
-    dialog: &SubscribeDialog,
-    expires_secs: u64,
-) -> PyResult<(
-    crate::sip::message::SipMessage,
-    std::net::SocketAddr,
-    Transport,
-)> {
     let resolver = SEND_RESOLVER.get().ok_or_else(|| {
         pyo3::exceptions::PyRuntimeError::new_err(
-            "subscribe_state outbound unavailable: DNS resolver not initialized",
+            "subscribe_state.send() unavailable: DNS resolver not initialized",
         )
     })?;
+    Ok((uac, resolver))
+}
 
-    // Same routing rules as send_notify() — first Route URI if present,
-    // otherwise the remote target.
-    let resolve_target: String = dialog
-        .route_set
-        .first()
-        .map(|route| {
-            route
-                .trim()
-                .trim_start_matches('<')
-                .trim_end_matches('>')
-                .to_string()
-        })
-        .unwrap_or_else(|| dialog.remote_target.clone());
+/// What `send()` sends a SUBSCRIBE through, and the flow and route set the
+/// script gave it.
+pub(super) struct SubscribeSend {
+    pub(super) store: Arc<SubscribeStore>,
+    pub(super) uac: &'static UacSender,
+    pub(super) resolver: &'static SipResolver,
+    /// A registration's flow: the SUBSCRIBE, and every later request of the
+    /// dialog, goes over its security association.
+    pub(super) flow: Option<super::registrar::PyFlow>,
+    /// The route set, one Route header per entry.
+    pub(super) route: Vec<String>,
+}
 
-    let resolve_uri = parse_uri_standalone(&resolve_target).map_err(|error| {
-        pyo3::exceptions::PyValueError::new_err(format!(
-            "invalid route/target URI '{resolve_target}': {error}"
-        ))
-    })?;
-    let ruri = parse_uri_standalone(&dialog.remote_target).map_err(|error| {
-        pyo3::exceptions::PyValueError::new_err(format!(
-            "invalid remote_target URI '{}': {error}",
-            dialog.remote_target
-        ))
-    })?;
-
-    let transport_hint = resolve_uri
-        .get_param("transport")
-        .map(|s: &str| s.to_string());
-    let resolver_clone = Arc::clone(resolver);
-    let host = resolve_uri.host.clone();
-    let port = resolve_uri.port;
-    let scheme = resolve_uri.scheme.clone();
-
-    let destination = resolver_clone
-        .resolve(&host, port, scheme.as_str(), transport_hint.as_deref())
-        .await;
-    let target = destination.into_iter().next().ok_or_else(|| {
-        pyo3::exceptions::PyRuntimeError::new_err(format!(
-            "cannot resolve destination for '{resolve_target}'"
-        ))
-    })?;
-
-    let transport = match target.transport.as_deref().or(transport_hint.as_deref()) {
-        Some(hint) => match hint.to_lowercase().as_str() {
-            "tcp" => Transport::Tcp,
-            "tls" => Transport::Tls,
-            "ws" => Transport::WebSocket,
-            "wss" => Transport::WebSocketSecure,
-            "sctp" => Transport::Sctp,
-            _ => Transport::Udp,
-        },
-        None => {
-            if scheme == "sips" {
-                Transport::Tls
-            } else {
-                Transport::Udp
-            }
-        }
-    };
-
-    let branch = format!("z9hG4bK-uac-py-{}", Uuid::new_v4());
-    let via = format!("SIP/2.0/{} {};branch={}", transport, target.address, branch);
-    let cseq_str = format!("{} SUBSCRIBE", dialog.cseq);
-
-    // Outbound watcher orientation: From = us (subscriber), To = peer.
-    let from_header = format!("<{}>;tag={}", dialog.local_uri, dialog.local_tag);
-    let to_header = format!("<{}>;tag={}", dialog.remote_uri, dialog.remote_tag);
-
-    let mut builder = SipMessageBuilder::new()
-        .request(Method::Subscribe, ruri)
-        .via(via)
-        .call_id(dialog.call_id.clone())
-        .cseq(cseq_str)
-        .max_forwards(70)
-        .from(from_header)
-        .to(to_header)
-        .header("Event", dialog.event.clone())
-        .header("Expires", expires_secs.to_string());
-
-    for route in &dialog.route_set {
-        builder = builder.header("Route", route.clone());
+/// An IP as the host of a `sent-by` or URI: an IPv6 literal bracketed.
+fn host_of(ip: std::net::IpAddr) -> String {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.to_string(),
+        std::net::IpAddr::V6(v6) => format!("[{v6}]"),
     }
-    builder = builder.content_length(0);
-
-    let message = builder.build().map_err(|error| {
-        pyo3::exceptions::PyRuntimeError::new_err(format!("failed to build SUBSCRIBE: {error}"))
-    })?;
-
-    Ok((message, target.address, transport))
 }
 
 /// Build the outbound SUBSCRIBE message originated by
@@ -1143,7 +1082,7 @@ fn build_outbound_subscribe(
     event: &str,
     expires: u64,
     accept: Option<&str>,
-    target_uri: Option<&str>,
+    route: &[String],
     transport: Transport,
     local_host: &str,
     local_port: u16,
@@ -1193,8 +1132,8 @@ fn build_outbound_subscribe(
     if let Some(accept_val) = accept {
         builder = builder.header("Accept", accept_val.to_string());
     }
-    if let Some(loose_route) = target_uri {
-        builder = builder.header("Route", format!("<{loose_route}>"));
+    for entry in route {
+        builder = builder.header("Route", entry.clone());
     }
 
     // Apply caller-supplied extra headers.  Single-value headers (RFC 3261
@@ -1321,8 +1260,8 @@ impl PySubscribeState {
     /// dialog. Awaitable because both the DNS lookup and the response wait are
     /// network waits an asyncio driver must not be held for.
     #[allow(clippy::too_many_arguments)]
-    async fn send_inner(
-        store: Arc<SubscribeStore>,
+    pub(super) async fn send_inner(
+        send: SubscribeSend,
         ruri: &str,
         event: &str,
         expires: u64,
@@ -1331,16 +1270,13 @@ impl PySubscribeState {
         extra_headers: Vec<(String, String)>,
         timeout_ms: u64,
     ) -> PyResult<PySubscribeHandle> {
-        let uac_sender = UAC_SENDER.get().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err(
-                "subscribe_state.send() unavailable: UAC sender not initialized",
-            )
-        })?;
-        let resolver = SEND_RESOLVER.get().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err(
-                "subscribe_state.send() unavailable: DNS resolver not initialized",
-            )
-        })?;
+        let SubscribeSend {
+            store,
+            uac: uac_sender,
+            resolver,
+            flow,
+            route,
+        } = send;
 
         let ruri_parsed = parse_uri_standalone(ruri).map_err(|error| {
             pyo3::exceptions::PyValueError::new_err(format!(
@@ -1348,47 +1284,55 @@ impl PySubscribeState {
             ))
         })?;
 
-        // Resolve the next-hop: explicit target_uri (pre-loaded Route)
-        // wins, else the Request-URI.
-        let resolve_target = target_uri.unwrap_or(ruri);
-        let resolve_uri = parse_uri_standalone(resolve_target).map_err(|error| {
-            pyo3::exceptions::PyValueError::new_err(format!(
-                "invalid target URI '{resolve_target}': {error}"
-            ))
-        })?;
-
-        let transport_hint = resolve_uri
-            .get_param("transport")
-            .map(|s: &str| s.to_string());
-        let resolver_clone = Arc::clone(resolver);
-        let host = resolve_uri.host.clone();
-        let port = resolve_uri.port;
-        let scheme = resolve_uri.scheme.clone();
-
-        let destination = resolver_clone
-            .resolve(&host, port, scheme.as_str(), transport_hint.as_deref())
-            .await;
-        let target = destination.into_iter().next().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "cannot resolve destination for '{resolve_target}'"
-            ))
-        })?;
-
-        let transport = match target.transport.as_deref().or(transport_hint.as_deref()) {
-            Some(hint) => match hint.to_lowercase().as_str() {
-                "tcp" => Transport::Tcp,
-                "tls" => Transport::Tls,
-                "ws" => Transport::WebSocket,
-                "wss" => Transport::WebSocketSecure,
-                "sctp" => Transport::Sctp,
-                _ => Transport::Udp,
-            },
+        // Over a registration's flow nothing is resolved: the SUBSCRIBE goes to
+        // the P-CSCF over the SA. Otherwise the next hop is an explicit
+        // target_uri (pre-loaded Route), else the route set's first entry, else
+        // the Request-URI.
+        let flow_egress = flow
+            .as_ref()
+            .map(|flow| super::uac_flow::FlowEgress::of(flow, uac_sender))
+            .transpose()?;
+        let (destination, transport) = match &flow_egress {
+            Some(egress) => (egress.destination, egress.transport),
             None => {
-                if scheme == "sips" {
-                    Transport::Tls
-                } else {
-                    Transport::Udp
-                }
+                let first_route = route.first().map(|entry| {
+                    entry
+                        .trim()
+                        .trim_start_matches('<')
+                        .split('>')
+                        .next()
+                        .unwrap_or_default()
+                        .to_string()
+                });
+                let resolve_target = target_uri
+                    .map(str::to_string)
+                    .or(first_route)
+                    .unwrap_or_else(|| ruri.to_string());
+                let resolve_uri = parse_uri_standalone(&resolve_target).map_err(|error| {
+                    pyo3::exceptions::PyValueError::new_err(format!(
+                        "invalid target URI '{resolve_target}': {error}"
+                    ))
+                })?;
+                let transport_hint = resolve_uri
+                    .get_param("transport")
+                    .map(|s: &str| s.to_string());
+                let scheme = resolve_uri.scheme.clone();
+                let destination = resolver
+                    .resolve(
+                        &resolve_uri.host,
+                        resolve_uri.port,
+                        scheme.as_str(),
+                        transport_hint.as_deref(),
+                    )
+                    .await;
+                let target = destination.into_iter().next().ok_or_else(|| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "cannot resolve destination for '{resolve_target}'"
+                    ))
+                })?;
+                let transport =
+                    resolved_transport(target.transport.as_deref(), transport_hint, &scheme);
+                (target.address, transport)
             }
         };
 
@@ -1398,21 +1342,33 @@ impl PySubscribeState {
         // Advertise our own reachable host (FQDN-aware) + advertised port in the
         // Via/Contact so the notifier can route the response and any in-dialog
         // NOTIFY back to us (the listen port unless `advertise` names another).
-        let local_host = uac_sender.via_host_for(&transport);
-        let local_port = uac_sender.via_port_for(&transport);
+        // Over a registration's flow, the UE's protected server port, where the
+        // P-CSCF sends the responses and the in-dialog requests.
+        let (local_host, local_port) = match flow.as_ref().and_then(|flow| flow.kind.registrant()) {
+            Some(registrant) => (host_of(registrant.sent_by.ip()), registrant.sent_by.port()),
+            None => (
+                uac_sender.via_host_for(&transport),
+                uac_sender.via_port_for(&transport),
+            ),
+        };
         let local_uri_default = strip_uri_params(ruri);
 
         // Pre-extract the script-supplied header dict into a Vec so the
         // builder can be assembled inside a non-Python helper that is unit
         // testable. The header pairs were read from Python by the caller.
 
+        // A target_uri is a route set of one entry (they are never both given).
+        let pre_loaded_route = match target_uri {
+            Some(loose_route) => vec![format!("<{loose_route}>")],
+            None => route,
+        };
         let (message, cseq_value, from_override) = build_outbound_subscribe(
             ruri,
             ruri_parsed,
             event,
             expires,
             accept,
-            target_uri,
+            &pre_loaded_route,
             transport,
             &local_host,
             local_port,
@@ -1449,10 +1405,20 @@ impl PySubscribeState {
             event_version: 0,
             terminated: false,
             is_outbound: true,
+            registrant_flow: flow.as_ref().and_then(|flow| {
+                flow.kind
+                    .registrant()
+                    .map(|registrant| DialogRegistrantFlow {
+                        aor: registrant.aor.clone(),
+                        ue_ip: flow.local_addr.ip(),
+                    })
+            }),
         });
 
-        let mut receiver =
-            uac_sender.send_request_with_response(message, target.address, transport);
+        let mut receiver = match &flow_egress {
+            Some(egress) => egress.send(uac_sender, message),
+            None => uac_sender.send_request_with_response(message, destination, transport),
+        };
 
         let timeout = std::time::Duration::from_millis(timeout_ms);
         let result = tokio::time::timeout(timeout, &mut receiver).await;
@@ -1495,6 +1461,10 @@ impl PySubscribeState {
         })
     }
 }
+
+#[cfg(test)]
+#[path = "subscribe_state_flow_tests.rs"]
+mod flow_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1727,6 +1697,7 @@ mod tests {
             event_version: 2,
             terminated: false,
             is_outbound: false,
+            registrant_flow: None,
         };
         dialog.event_version = 2;
         let json = serde_json::to_string(&dialog).expect("serialize dialog");
@@ -1934,7 +1905,7 @@ else:
             "reg",
             7200,
             Some("application/reginfo+xml"),
-            None,
+            &[],
             Transport::Udp,
             local_host(),
             local_port(),
@@ -1975,7 +1946,7 @@ else:
             "presence",
             3600,
             None,
-            None,
+            &[],
             Transport::Tcp,
             local_host(),
             local_port(),
@@ -2006,7 +1977,7 @@ else:
             "reg",
             3600,
             None,
-            None,
+            &[],
             Transport::Udp,
             local_host(),
             local_port(),
@@ -2054,7 +2025,7 @@ else:
             "reg",
             7200,
             Some("application/reginfo+xml"),
-            None,
+            &[],
             Transport::Udp,
             local_host(),
             local_port(),
@@ -2103,7 +2074,7 @@ else:
             "reg",
             3600,
             None,
-            Some("sip:scscf.example.org;lr"),
+            &["<sip:scscf.example.org;lr>".to_string()],
             Transport::Udp,
             local_host(),
             local_port(),
@@ -2139,7 +2110,7 @@ else:
             "reg",
             3600,
             None,
-            None,
+            &[],
             Transport::Udp,
             local_host(),
             local_port(),
@@ -2204,7 +2175,7 @@ else:
             "reg",
             3600,
             None,
-            None,
+            &[],
             Transport::Udp,
             "sbc.example.org",
             5060,
