@@ -200,10 +200,11 @@ async fn deleting_the_old_pair_leaves_the_new_pairs_shared_policies() {
 }
 
 /// The other way round: the new pair goes (its authentication failed, TS
-/// 33.203 clause 7.4.2a) while the old one still protects. The shared policies
-/// were the new pair's; the old pair's are put back.
+/// 33.203 clause 7.4.2a) while the old one still protects. The new pair was
+/// pending, so the shared policies stayed the old pair's throughout and are
+/// not touched: the old set keeps protecting without a gap.
 #[tokio::test]
-async fn deleting_the_newer_pair_gives_the_shared_policies_back_to_the_older() {
+async fn deleting_the_newer_pair_leaves_the_shared_policies_to_the_older() {
     let manager = manager();
     let old = install(&manager, ue(11), 6100, 6101).await;
     let new = install(&manager, ue(11), 6200, 6101).await;
@@ -221,15 +222,10 @@ async fn deleting_the_newer_pair_gives_the_shared_policies_back_to_the_older() {
     }
     let ops = manager.mock().ops.clone();
     for key in [shared_out, shared_in] {
-        let deleted = ops
-            .iter()
-            .position(|op| *op == format!("del_policy {key}"))
-            .expect("the new pair's version is deleted");
-        let given_back = ops
-            .iter()
-            .position(|op| *op == format!("add_policy {key}"))
-            .expect("the old pair's version is installed again");
-        assert!(deleted < given_back, "{key}: delete, then give back");
+        assert!(
+            !ops.iter().any(|op| op.ends_with(&key)),
+            "{key} is the old pair's throughout: {ops:?}"
+        );
     }
 }
 

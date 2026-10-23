@@ -68,12 +68,22 @@ pub(super) fn p_cscf(script: &str) -> (Proxy, Arc<IpsecManager>) {
 /// The pair a UE at `ue` (its protected client port) set up, with its own
 /// server port next to it.
 pub(super) async fn install(manager: &IpsecManager, ue: SocketAddr) -> SecurityAssociationPair {
+    install_with_server_port(manager, ue, ue.port() + 1).await
+}
+
+/// [`install`] with the UE's protected server port `ue_port_s`, which a UE
+/// keeps across a re-authentication (TS 33.203 clause 7.4.0).
+async fn install_with_server_port(
+    manager: &IpsecManager,
+    ue: SocketAddr,
+    ue_port_s: u16,
+) -> SecurityAssociationPair {
     let (spi_pc, spi_ps) = manager.allocate_spi_pair().expect("room in the partition");
     let sa = SecurityAssociationPair {
         ue_addr: ue.ip(),
         pcscf_addr: "192.0.2.1".parse().expect("an address"),
         ue_port_c: ue.port(),
-        ue_port_s: ue.port() + 1,
+        ue_port_s,
         pcscf_port_c: 5064,
         pcscf_port_s: 5060,
         spi_uc: 80_000 + u32::from(ue.port()),
@@ -309,4 +319,63 @@ async fn the_pair_a_re_register_came_over_is_kept_for_the_grace_after_activation
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(!manager.has_sa(&old.ip(), old.port()));
     assert!(manager.has_sa(&old.ip(), new.ue_port_c));
+}
+
+/// A re-authentication through the relaying P-CSCF: the set the challenge sets
+/// up is installed (what `ipsec.allocate` does) before the 401 leaves, yet the
+/// 401 leaves with the kernel's outbound policy of the shared selector still
+/// naming the old set, which the UE holds (TS 24.229 clause 5.2.2.2). The 200
+/// to the REGISTER that came over the new set leaves with that policy naming
+/// the new set (TS 33.203 clause 7.4.2a, SM12), and the old set is kept for
+/// its pending transactions.
+///
+/// Before: the install named the new set at once, so the 401 went over an SA
+/// the UE could not have yet, and the UE dropped it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_re_authentication_challenge_leaves_over_the_old_set_and_its_2xx_over_the_new() {
+    let (proxy, manager) = p_cscf(RELAY);
+    let old_ue: SocketAddr = "198.51.100.96:6100".parse().expect("an address");
+    let new_ue: SocketAddr = "198.51.100.96:6102".parse().expect("an address");
+    let outbound = "policy:192.0.2.1:5064->198.51.100.96:6101:out";
+    let old = install_with_server_port(&manager, old_ue, 6101).await;
+    let new = install_with_server_port(&manager, new_ue, 6101).await;
+    assert!(manager.is_pending(&new_ue.ip(), new_ue.port()));
+    let security_server = format!(
+        "Security-Server: ipsec-3gpp;alg=hmac-sha-1-96;ealg=null;spi-c={};spi-s={};port-c=5064;port-s=5060\r\n",
+        new.spi_pc, new.spi_ps
+    );
+
+    let to_ue = registrar_answers(
+        &proxy,
+        old_ue,
+        &register(old_ue, "reauth-96", 7, 600),
+        401,
+        &security_server,
+    );
+    assert_eq!(to_ue, [401]);
+    assert_eq!(
+        manager.test_kernel_policy_template(outbound),
+        Some(old.spi_us),
+        "the 401 leaves over the set the UE holds"
+    );
+    assert!(manager.is_pending(&new_ue.ip(), new_ue.port()));
+
+    let to_ue = registrar_answers(
+        &proxy,
+        new_ue,
+        &register(new_ue, "reauth-96", 8, 600),
+        200,
+        "Expires: 600\r\n",
+    );
+    assert!(to_ue.contains(&200), "{to_ue:?}");
+    assert_eq!(
+        manager.test_kernel_policy_template(outbound),
+        Some(new.spi_us),
+        "the 200 leaves over the new set"
+    );
+    assert!(!manager.is_pending(&new_ue.ip(), new_ue.port()));
+    assert!(
+        manager.has_sa(&old_ue.ip(), old_ue.port()),
+        "the old set stays for its pending transactions"
+    );
 }

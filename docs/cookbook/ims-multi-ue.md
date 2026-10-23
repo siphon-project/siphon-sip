@@ -231,9 +231,12 @@ in `RegistrantChanged` and `outbound_registrations`.
 - **Refreshes ride the SAs.** A registered UE re-registers over its SA set,
   and a re-challenge sets up the new set beside the old one before deleting it
   (see the registrar reference, "Protected re-registration").
-  `registration.remove()` de-registers over the set and then deletes it.
-- **The Contact port is the plain UDP port**, the same for every UE, as for a
-  single UE.
+  `registration.remove()` de-registers over the set and then deletes it, and
+  so does shutdown for every UE, before the process exits.
+- **The bound Contact is the protected server port** (`ue_port_s`), the same
+  for every UE, so MT requests arrive over each UE's SA set on its server-port
+  socket and are answered from it. Only the unprotected initial REGISTER names
+  the plain port.
 - **Not yet validated against a live IMS core.** The behaviour is unit and
   integration tested, and `scripts/multi_ue_netns.sh` is a manual acceptance
   harness (root, network namespaces) that runs this example against a siphon
@@ -251,5 +254,9 @@ It builds two namespaces joined by a veth pair, puts N /32s from
 namespace, and checks that every UE registers, that there are 4 x N xfrm
 states, that the S-CSCF holds N distinct contacts, that refreshes spread over
 the window, and that moving every /32 and rewriting the address file
-re-registers the fleet with no restart. It prints the UE process's descriptor
-count and RSS.
+re-registers the fleet with no restart. It then has the S-CSCF re-challenge
+UE 1's refresh and, while UE 1 holds its old and new SA sets, sends one
+datagram from the P-CSCF's protected client port over the old set, which the
+UE kernel must decrypt without a template mismatch (`OVERLAP_TEST=0` skips
+this). Last it stops the UE process and checks that no xfrm state or policy is
+left in the UE namespace. It prints the UE process's descriptor count and RSS.

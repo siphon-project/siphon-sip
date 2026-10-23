@@ -33,6 +33,17 @@ impl RegistrantManager {
         })
     }
 
+    /// The registration interval `aor` asks for in its REGISTER's `Expires`:
+    /// the entry's own `interval`, else the manager's default. Every REGISTER
+    /// the entry sends (the first, the answer to a 401, every refresh) asks for
+    /// the same; until this existed they all asked for the default, so a
+    /// per-entry `interval` was never sent.
+    pub fn interval_for(&self, aor: &str) -> u32 {
+        self.entries
+            .get(aor)
+            .map_or(self.default_interval, |entry| entry.interval_secs)
+    }
+
     /// [`status`](Self::status) as `(expires_in, failure_count,
     /// registrar_uri)`, the shape this lookup had before it carried the state.
     pub fn entry_info(&self, aor: &str) -> Option<(u64, u32, String)> {

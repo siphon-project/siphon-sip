@@ -3904,6 +3904,14 @@ class MockAuth:
         P-CSCF must strip them with ``reply.take_av()`` before relaying the 401
         to the UE.
 
+        Each subscriber has its own SQN, starting at the credential's optional
+        ``sqn`` (12 hex chars, default ``000000000001``) and advancing with every
+        challenge (TS 33.102 annex C). An ``Authorization`` carrying ``auts=``
+        (the UE found the SQN out of range) is checked against the RAND of the
+        challenge it answers: a valid MAC-S re-bases the SQN and a fresh 401
+        goes out, an invalid one is answered 403 (TS 33.102 6.3.5). The mock
+        does not model SQN or AUTS.
+
         Example::
 
             if not auth.require_aka_digest(request, realm="ims.test"):
@@ -3914,7 +3922,7 @@ class MockAuth:
         :meth:`require_ims_digest`.
 
         Returns:
-            ``True`` if credentials are valid, ``False`` if a 401 challenge was sent.
+            ``True`` if credentials are valid, ``False`` if a 401 or 403 was set.
         """
         self._reject_call_target(request, "require_aka_digest")
         # Not awaitable in siphon (local Milenage, no I/O), so it must not
@@ -4487,6 +4495,37 @@ def _resolve_media_target(
     return getattr(target, "call_id", None), getattr(target, "from_tag", None)
 
 
+_MEDIA_SCOPE = re.compile(r"[A-Za-z0-9_-]{1,64}")
+
+
+def _media_scope(scope: Optional[str], targets: tuple[Any, ...], verb: str) -> Optional[str]:
+    """Validate a media verb's ``scope=`` the way the runtime does.
+
+    A scope is 1-64 ASCII letters, digits, ``-`` and ``_`` (the rule
+    ``media.siphon_rtp.scope`` follows). It names one leg of a call a proxy
+    anchors twice under one Call-ID, so a B2BUA ``Call`` (whose legs have
+    Call-IDs of their own) is refused; the runtime also refuses a Reply that
+    carries a B2BUA A-leg reference.
+    """
+    if scope is None:
+        return None
+    if not isinstance(scope, str) or not _MEDIA_SCOPE.fullmatch(scope):
+        raise ValueError(
+            f"rtpengine.{verb}: scope= may hold only 1-64 ASCII letters, "
+            f"digits, '-' and '_', got {scope!r}"
+        )
+    from siphon_sdk.call import Call
+
+    for target in targets:
+        if isinstance(target, Call):
+            raise ValueError(
+                f"rtpengine.{verb}(scope=...) names one leg of a call a proxy "
+                "anchors twice under one Call-ID; a B2BUA call's legs have "
+                "Call-IDs of their own, so pass no scope"
+            )
+    return scope
+
+
 def _media_overrides(
     beep_detection: Optional[bool],
     beep_cadence_guard_ms: Optional[int],
@@ -4683,6 +4722,10 @@ class MockRtpEngine:
         )
         self._conference_join_no_codec: bool = False
         self._active_speaker_handlers: list[dict[str, Any]] = []
+        self.media_scopes: list[tuple[str, Optional[str]]] = []
+        """``(operation, scope)`` per offer/answer/delete/delete_call: the per-call scope
+        the script named, ``None`` for the node's own."""
+        self._scoped_profiles: dict[str, str] = {}
         self.media_overrides: list[tuple[str, dict[str, Any]]] = []
         """``(operation, overrides)`` per offer/answer/answer_local.
 
@@ -4766,7 +4809,8 @@ class MockRtpEngine:
                     ws_tee_sample_rate: Optional[int] = None,
                     ws_vad_engine: Optional[str] = None,
                     ws_vad_min_speech_ms: Optional[int] = None,
-                    sdp: Union[str, bytes, None] = None) -> Union[bool, str]:
+                    sdp: Union[str, bytes, None] = None,
+                    scope: Optional[str] = None) -> Union[bool, str]:
         """Send ``offer`` command to RTPEngine.
 
         Two ways to hand it the offer:
@@ -4824,12 +4868,27 @@ class MockRtpEngine:
                  raw mode. Blank raises ``ValueError``. No source address is
                  carried, so a profile's ``received_from`` does not gate the
                  party's media.
+            scope: Anchor this leg as an engine call of its own, for a proxy
+                   that anchors both legs of one call under one Call-ID (the
+                   originating and the terminating leg of a call between two
+                   of its users), e.g. ``"orig"`` and ``"term"``. 1-64 ASCII
+                   letters, digits, ``-`` and ``_``. Pass the same scope to
+                   that leg's ``answer``; a ``delete`` without one ends every
+                   leg. Omitted: the node's own scope, exactly as before.
+                   ``ValueError`` on a B2BUA ``Call``.
 
         Returns:
             ``True``, or the rewritten SDP as ``str`` when ``sdp=`` was passed.
             The mock rewrites nothing and returns ``sdp`` as given.
 
         Example::
+
+            # A proxy anchoring both legs of a call between two of its users.
+            @proxy.on_request("INVITE")
+            async def invite(request):
+                leg = "term" if request.ruri.is_local else "orig"
+                await rtpengine.offer(request, profile="access", scope=leg)
+                request.relay()
 
             @b2bua.on_invite
             async def on_invite(call):
@@ -4845,6 +4904,7 @@ class MockRtpEngine:
         """
         # Validate before recording anything: the runtime refuses these before
         # a command reaches the engine.
+        scope = _media_scope(scope, (request,), "offer")
         sdp_text: Optional[str] = None
         if sdp is not None:
             if isinstance(sdp, bytes):
@@ -4864,6 +4924,9 @@ class MockRtpEngine:
 
         resolved_profile = profile or "rtp_passthrough"
         self.operations.append(("offer", resolved_profile))
+        self.media_scopes.append(("offer", scope))
+        if scope is not None:
+            self._scoped_profiles[scope] = resolved_profile
         self.ws_uris.append(("offer", self._resolve_ws_uri(ws_uri, request)))
         self.media_overrides.append(("offer", _media_overrides(
             beep_detection, beep_cadence_guard_ms, ws_sample_rate,
@@ -4892,7 +4955,8 @@ class MockRtpEngine:
                      ws_vad_engine: Optional[str] = None,
                      ws_vad_min_speech_ms: Optional[int] = None,
                      sdp: Union[str, bytes, None] = None,
-                     to_tag: Optional[str] = None) -> Union[bool, str]:
+                     to_tag: Optional[str] = None,
+                     scope: Optional[str] = None) -> Union[bool, str]:
         """Send ``answer`` command to RTPEngine.
 
         Two ways to hand it the answer:
@@ -4966,6 +5030,9 @@ class MockRtpEngine:
                     answer on this call recorded (so a re-answer reaches the
                     same party), else a new one. The mock records what was
                     passed, ``None`` when omitted.
+            scope: The per-call scope the leg's ``offer`` named; its recorded
+                   profile and tags are that leg's own. Omitted: the node's
+                   own scope. ``ValueError`` on a B2BUA reply or ``Call``.
 
         Returns:
             ``True``, or the rewritten SDP as ``str`` when ``sdp=`` was passed.
@@ -4982,6 +5049,7 @@ class MockRtpEngine:
         """
         # Validate before recording anything: the runtime refuses these before
         # a command reaches the engine.
+        scope = _media_scope(scope, (reply, call), "answer")
         sdp_text: Optional[str] = None
         if sdp is None:
             if to_tag is not None:
@@ -5007,6 +5075,9 @@ class MockRtpEngine:
                     "not a bare call_id"
                 )
 
+        if profile is None and scope is not None:
+            # A scoped leg reuses its own leg's offer profile.
+            profile = self._scoped_profiles.get(scope)
         if profile is None:
             # Mirror real behavior: recover from last recorded offer.
             for op, recorded in reversed(self.operations):
@@ -5016,6 +5087,7 @@ class MockRtpEngine:
             else:
                 profile = "rtp_passthrough"
         self.operations.append(("answer", profile))
+        self.media_scopes.append(("answer", scope))
         self.ws_uris.append(("answer", self._resolve_ws_uri(ws_uri, call or reply)))
         self.media_overrides.append(("answer", _media_overrides(
             beep_detection, beep_cadence_guard_ms, ws_sample_rate,
@@ -5142,18 +5214,31 @@ class MockRtpEngine:
         })
         return self._answer_local_sdp
 
-    async def delete(self, request: Any) -> bool:
+    async def delete(self, request: Any, scope: Optional[str] = None) -> bool:
         """Send ``delete`` command to tear down media session.
 
         On a call seated in a conference room (:meth:`conference_join`) this
-        leaves the room.
+        leaves the room. Without ``scope`` it also ends every leg an
+        ``offer(..., scope=...)`` anchored under the Call-ID, so one BYE ends
+        both legs a proxy anchored; with ``scope`` only that leg goes.
 
         Args:
             request: Request or Call object (uses Call-ID + From-tag).
+            scope: Delete only the leg anchored under this per-call scope.
+                   ``ValueError`` on a B2BUA ``Call``.
 
         Returns:
             ``True`` on success.
+
+        Example::
+
+            @proxy.on_request("BYE")
+            async def bye(request):
+                await rtpengine.delete(request)  # both scoped legs go
+                request.relay()
         """
+        scope = _media_scope(scope, (request,), "delete")
+        self.media_scopes.append(("delete", scope))
         call_id, _ = _resolve_media_target(request)
         seated = self.conference_seat(call_id) if call_id else None
         if seated is not None:
@@ -5162,7 +5247,8 @@ class MockRtpEngine:
         self.operations.append(("delete", None))
         return True
 
-    async def delete_call(self, call_id: str, from_tag: Optional[str] = None) -> bool:
+    async def delete_call(self, call_id: str, from_tag: Optional[str] = None,
+                          scope: Optional[str] = None) -> bool:
         """Tear down a call's media by Call-ID, without a SIP message in hand.
 
         For a call that ends outside any SIP transaction: an Rx Abort-Session
@@ -5185,6 +5271,9 @@ class MockRtpEngine:
         Args:
             call_id: The SIP Call-ID the media was anchored under.
             from_tag: The From-tag to delete with, if not the tracked one.
+            scope: Release only the leg an ``offer(..., scope=...)`` anchored
+                   under this scope. Omitted: the call's own media and every
+                   leg anchored under the Call-ID, each under its own scope.
 
         Returns:
             ``True`` when the engine released the call, ``False`` when it no
@@ -5197,6 +5286,8 @@ class MockRtpEngine:
         """
         if not call_id:
             raise ValueError("call_id is empty")
+        scope = _media_scope(scope, (), "delete_call")
+        self.media_scopes.append(("delete_call", scope))
         seated = self.conference_seat(call_id)
         if seated is not None:
             self._leave_seat(*seated)
@@ -12860,6 +12951,12 @@ class MockPendingSA:
 
     def activate(self, *, hard_lifetime_secs: Optional[int] = None) -> None:
         """Mark the SA pair active.
+
+        On a re-authentication siphon keeps sending over the UE's set in
+        use until the 200 to the REGISTER that came over this pair leaves:
+        that 200, and what follows, go over this pair (TS 24.229 clause
+        5.2.2.2). The dispatcher does the switch, whether or not this is
+        called.
 
         ``hard_lifetime_secs`` (optional) re-pins the kernel
         hard-lifetime on all four SAs of the pair via ``XFRM_MSG_UPDSA``,

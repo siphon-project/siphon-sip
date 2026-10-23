@@ -48,6 +48,10 @@ const XFRM_MSG_DELSA: u16 = 0x11;
 const XFRM_MSG_GETSA: u16 = 0x12;
 const XFRM_MSG_NEWPOLICY: u16 = 0x13;
 const XFRM_MSG_DELPOLICY: u16 = 0x14;
+/// Add or replace a policy. The kernel inserts it without `EXCL`, so a policy
+/// with the same selector and direction is swapped in one step (no window
+/// without one), and the replacement counts its lifetime from now.
+const XFRM_MSG_UPDPOLICY: u16 = 0x19;
 /// Update an existing SA's mutable fields (notably `lft` lifetime config).
 /// Kernel maps to `xfrm_state_update()`, which preserves `add_time` so a
 /// tightened `hard_add_expires_seconds` produces deadline = original
@@ -580,6 +584,12 @@ pub async fn del_sa(daddr: &IpAddr, spi: u32) -> Result<(), IpsecError> {
 /// hard_add_expires_seconds` so the policy self-reaps on the same deadline
 /// as its states.  When `None` the policy lives until explicitly deleted —
 /// keep this for caller-managed lifetimes (dev/test, permanent SAs).
+///
+/// `spi` 0 leaves the template's SPI open: any SA of the selector satisfies
+/// it (the kernel's template match skips a zero SPI).
+///
+/// `replace` sends `XFRM_MSG_UPDPOLICY` (add or replace, lifetime from now)
+/// instead of an exclusive `XFRM_MSG_NEWPOLICY`.
 pub async fn add_policy(
     source: &IpAddr,
     source_port: u16,
@@ -589,7 +599,37 @@ pub async fn add_policy(
     spi: u32,
     selector_proto: u8,
     hard_lifetime_secs: Option<u64>,
+    replace: bool,
 ) -> Result<(), IpsecError> {
+    let payload = policy_payload(
+        source,
+        source_port,
+        destination,
+        destination_port,
+        direction,
+        spi,
+        selector_proto,
+        hard_lifetime_secs,
+    );
+    if replace {
+        send_and_ack(XFRM_MSG_UPDPOLICY, 0, &payload).await
+    } else {
+        send_and_ack(XFRM_MSG_NEWPOLICY, NLM_F_CREATE | NLM_F_EXCL, &payload).await
+    }
+}
+
+/// The body of a policy add or update: `xfrm_userpolicy_info` and one
+/// `XFRMA_TMPL` naming `spi` (0 = any SA of the selector).
+fn policy_payload(
+    source: &IpAddr,
+    source_port: u16,
+    destination: &IpAddr,
+    destination_port: u16,
+    direction: PolicyDirection,
+    spi: u32,
+    selector_proto: u8,
+    hard_lifetime_secs: Option<u64>,
+) -> Vec<u8> {
     let mut payload = Vec::with_capacity(256);
     encode_xfrm_userpolicy_info(
         source,
@@ -604,7 +644,7 @@ pub async fn add_policy(
     let mut tmpl = Vec::with_capacity(64);
     encode_xfrm_user_tmpl(source, destination, spi, &mut tmpl);
     push_nla(&mut payload, XFRMA_TMPL, &tmpl);
-    send_and_ack(XFRM_MSG_NEWPOLICY, NLM_F_CREATE | NLM_F_EXCL, &payload).await
+    payload
 }
 
 /// Delete an IPsec policy via XFRM netlink.
@@ -1377,5 +1417,57 @@ mod tests {
     fn parse_sa_use_time_rejects_short_body() {
         let info = vec![0u8; SA_INFO_MIN_LEN - 1];
         assert!(parse_sa_use_time(&info).is_none());
+    }
+
+    /// Where `xfrm_user_tmpl.id.spi` sits in a policy body: after the
+    /// 168-byte `xfrm_userpolicy_info`, the 4-byte attribute header and the
+    /// template's 16-byte `id.daddr`.
+    const TEMPLATE_SPI_OFFSET: usize = 168 + 4 + 16;
+
+    fn template_spi(payload: &[u8]) -> u32 {
+        u32::from_be_bytes(
+            payload[TEMPLATE_SPI_OFFSET..TEMPLATE_SPI_OFFSET + 4]
+                .try_into()
+                .expect("four bytes"),
+        )
+    }
+
+    #[test]
+    fn a_policy_template_names_its_spi_or_leaves_it_open() {
+        let ue = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 77));
+        let pcscf = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 10));
+        let pinned = policy_payload(
+            &pcscf,
+            5064,
+            &ue,
+            6101,
+            PolicyDirection::In,
+            0x0001_2345,
+            0,
+            Some(240),
+        );
+        assert_eq!(template_spi(&pinned), 0x0001_2345);
+        // Zero is "any SA of this selector": the kernel's template match
+        // (xfrm_state_ok) skips the SPI comparison for it.
+        let open = policy_payload(
+            &pcscf,
+            5064,
+            &ue,
+            6101,
+            PolicyDirection::In,
+            0,
+            0,
+            Some(240),
+        );
+        assert_eq!(template_spi(&open), 0);
+        assert_eq!(pinned.len(), open.len(), "same layout either way");
+        assert_eq!(&pinned[..TEMPLATE_SPI_OFFSET], &open[..TEMPLATE_SPI_OFFSET]);
+    }
+
+    #[test]
+    fn xfrm_msg_updpolicy_constant_matches_kernel_uapi() {
+        // linux/xfrm.h: XFRM_MSG_BASE 0x10, ..., UPDPOLICY 0x19, UPDSA 0x1a.
+        assert_eq!(XFRM_MSG_UPDPOLICY, 0x19);
+        assert_eq!(XFRM_MSG_UPDPOLICY + 1, XFRM_MSG_UPDSA);
     }
 }

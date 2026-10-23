@@ -194,6 +194,17 @@ impl SpiAllocator {
         adopted
     }
 
+    /// Whether a live pair owns `spi`.
+    pub(crate) fn is_owned(&self, spi: u32) -> bool {
+        self.lock().owners.contains_key(&spi)
+    }
+
+    /// How many SPIs live pairs own.
+    #[cfg(test)]
+    pub(crate) fn owner_count(&self) -> usize {
+        self.lock().owners.len()
+    }
+
     /// Whether any adopted SPI is still waiting for the kernel to drop it.
     pub(crate) fn has_orphans(&self) -> bool {
         !self.lock().orphans.is_empty()
@@ -410,6 +421,31 @@ impl IpsecManager {
                 0
             }
         }
+    }
+
+    /// The SPI of every XFRM state in the kernel now, for a caller choosing
+    /// its own SPIs: the UE registrant, which must pick SPIs "different from
+    /// any SPIs that might be used in any existing SAs" (3GPP TS 33.203 clause
+    /// 7.1), states a previous process left behind included. Empty, and
+    /// logged, when the kernel cannot be read.
+    pub async fn kernel_spi_snapshot(&self) -> Vec<u32> {
+        self.kernel_spis().await.unwrap_or_else(|error| {
+            tracing::warn!(%error, "IPsec: cannot read the kernel SAs; an SPI one of them uses may be offered again");
+            Vec::new()
+        })
+    }
+
+    /// Whether a live pair of this manager owns `spi` as one of its local
+    /// inbound SPIs.
+    pub fn owns_spi(&self, spi: u32) -> bool {
+        self.spis.is_owned(spi)
+    }
+
+    /// How many SPIs live pairs own: the SPI ownership map the leak gates
+    /// watch.
+    #[cfg(test)]
+    pub(crate) fn test_spi_owner_count(&self) -> usize {
+        self.spis.owner_count()
     }
 
     /// Release the SPIs adopted at startup whose kernel SA has since gone.

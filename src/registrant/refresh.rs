@@ -78,6 +78,8 @@ pub async fn registration_loop(manager: Arc<RegistrantManager>, context: Registr
         return;
     };
     if let Some(ipsec) = context.ipsec_manager.clone() {
+        // States a previous process left keep their SPIs out of every offer.
+        manager.note_kernel_spis(ipsec.kernel_spi_snapshot().await);
         manager.install_ipsec(ipsec);
     }
 
@@ -143,7 +145,8 @@ fn run_tick(
                 break;
             }
         }
-        let Some(built) = manager.build_register(&aor, egress.defaults(), manager.default_interval)
+        let Some(built) =
+            manager.build_register(&aor, egress.defaults(), manager.interval_for(&aor))
         else {
             continue;
         };
@@ -155,35 +158,63 @@ fn run_tick(
     }
 }
 
+/// How many times one tick re-plans the sockets after moving protected
+/// client ports that would not bind.
+const SOCKET_PLAN_ROUNDS: usize = 4;
+
 /// Converge the per-UE sockets on what the entries need; returns the AoRs
-/// whose sockets could not be bound this tick.
+/// that cannot register this tick.
+///
+/// A protected port that will not bind does not stall its entry: the entry
+/// moves a free rotation port elsewhere, or takes its established set out of
+/// use and re-registers unprotected
+/// ([`RegistrantManager::degrade_unbindable_ports`]), and the plan is re-run
+/// for the moved ports within the tick.
 fn reconcile_ue_sockets(
     manager: &RegistrantManager,
     context: &RegistrationLoopContext,
     egress: &RegistrantEgress,
 ) -> HashSet<String> {
-    let plan = manager.ue_socket_plan(egress.defaults().plain_port(), process_ue_ip(egress));
-    let Some(sockets) = context.ue_sockets.as_ref() else {
-        if !plan.is_empty() {
-            debug!(
-                entries = plan.len(),
-                "entries with a local_addr but no per-UE socket support in this process"
-            );
+    let plain_port = egress.defaults().plain_port();
+    let mut blocked = HashSet::new();
+    for _ in 0..SOCKET_PLAN_ROUNDS {
+        let plan = manager.ue_socket_plan(plain_port, process_ue_ip(egress));
+        let Some(sockets) = context.ue_sockets.as_ref() else {
+            if !plan.is_empty() {
+                debug!(
+                    entries = plan.len(),
+                    "entries with a local_addr but no per-UE socket support in this process"
+                );
+            }
+            return plan.into_iter().map(|(aor, _)| aor).collect();
+        };
+        let desired: HashSet<SocketAddr> = plan
+            .iter()
+            .flat_map(|(_, addrs)| addrs.iter().copied())
+            .collect();
+        let outcome = sockets.reconcile(&desired);
+        blocked.clear();
+        let mut moved = false;
+        for (aor, addrs) in plan {
+            let failed: Vec<u16> = addrs
+                .iter()
+                .filter(|addr| outcome.failed.contains(addr))
+                .map(|addr| addr.port())
+                .collect();
+            if failed.is_empty() {
+                continue;
+            }
+            let degradation = manager.degrade_unbindable_ports(&aor, &failed, plain_port);
+            moved |= degradation.moved;
+            if degradation.blocked {
+                blocked.insert(aor);
+            }
         }
-        return plan.into_iter().map(|(aor, _)| aor).collect();
-    };
-    let desired: HashSet<SocketAddr> = plan
-        .iter()
-        .flat_map(|(_, addrs)| addrs.iter().copied())
-        .collect();
-    let outcome = sockets.reconcile(&desired);
-    if outcome.failed.is_empty() {
-        return HashSet::new();
+        if !moved {
+            break;
+        }
     }
-    plan.into_iter()
-        .filter(|(_, addrs)| addrs.iter().any(|addr| outcome.failed.contains(addr)))
-        .map(|(aor, _)| aor)
-        .collect()
+    blocked
 }
 
 /// Delete the SA pairs the manager queued.
@@ -192,18 +223,17 @@ fn delete_queued_sas(
     context: &RegistrationLoopContext,
     egress: &RegistrantEgress,
 ) {
-    let deletions = manager.take_pending_sa_deletions();
-    if deletions.is_empty() {
-        return;
-    }
     let Some(ipsec_manager) = context.ipsec_manager.as_ref() else {
-        debug!(
-            pairs = deletions.len(),
-            "SA deletions queued with no IPsec manager in this process"
-        );
+        let dropped = manager.take_pending_sa_deletions();
+        if !dropped.is_empty() {
+            debug!(
+                pairs = dropped.len(),
+                "SA deletions queued with no IPsec manager in this process"
+            );
+        }
         return;
     };
-    super::protected::spawn_sa_deletions(deletions, ipsec_manager, process_ue_ip(egress));
+    manager.spawn_sa_deletions(ipsec_manager, process_ue_ip(egress));
 }
 
 /// The UE address a process-address entry's SAs carry: the dispatcher's
@@ -330,8 +360,13 @@ fn send_registrant_message(
 /// transport before the process exits. Signalling the loop instead would race
 /// its 5-second sleep against `std::process::exit`.
 ///
-/// Each entry's de-REGISTER leaves from the address it registered from, its own
-/// `local_addr` included.
+/// Every entry is removed, as [`RegistrantManager::remove`] does: a registered
+/// one queues its de-REGISTER, which leaves from the address it registered
+/// from (its own `local_addr` included), an IMS UE's over its SA set, whose
+/// sets then wait for the answer; the sets of any other go at once (see
+/// [`retire_ue_security_associations`]). Removing them also keeps the loop,
+/// which runs on through the drain, from refreshing a binding this just
+/// cleared.
 ///
 /// Returns how many de-registrations were sent.
 pub fn deregister_all(manager: &RegistrantManager, outbound: &OutboundRouter) -> usize {
@@ -340,17 +375,84 @@ pub fn deregister_all(manager: &RegistrantManager, outbound: &OutboundRouter) ->
         return 0;
     };
 
+    let aors: Vec<String> = manager
+        .entries
+        .iter()
+        .map(|entry| entry.aor.clone())
+        .collect();
+    for aor in aors {
+        manager.remove(&aor);
+    }
+
     // Anything removed but not yet sent goes out too: this is the last chance
     // to clear those bindings.
-    let pending = manager.take_pending_deregistrations();
-    let active = manager.build_deregistrations(egress.defaults());
-
     let mut sent = 0;
-    for built in pending.into_iter().chain(active) {
+    for built in manager.take_pending_deregistrations() {
         send_registrant_message(outbound, egress, built);
         sent += 1;
     }
     sent
+}
+
+/// How long shutdown waits, from the de-REGISTERs [`deregister_all`] sent, for
+/// their answers to release the SA sets the de-REGISTERs rode (TS 24.229
+/// 5.1.1.6.1: the UE deletes them once nothing is registered over them).
+pub const SHUTDOWN_ANSWER_WAIT: Duration = Duration::from_secs(4);
+
+/// The most shutdown spends deleting the SA sets left after that wait.
+const SHUTDOWN_DELETE_BOUND: Duration = Duration::from_secs(5);
+
+/// Delete every IMS UE SA set the registrant still holds, before the process
+/// exits, rather than leave them in the kernel to their hard lifetime (TS
+/// 33.203 7.4.1a: "The UE shall delete all SAs it holds once all the IMPUs are
+/// de-registered").
+///
+/// Waits until `answers_by` for the de-REGISTERs [`deregister_all`] sent to be
+/// answered (the dispatcher deletes a set when its answer arrives), then
+/// deletes whatever is left, unanswered or still live, itself, within
+/// [`SHUTDOWN_DELETE_BOUND`]. Bounded either way: it never holds shutdown
+/// beyond `answers_by` plus that bound. Returns how many SA pairs it deleted
+/// itself.
+pub async fn retire_ue_security_associations(
+    manager: &RegistrantManager,
+    answers_by: tokio::time::Instant,
+) -> usize {
+    let (Some(ipsec), Some(egress)) = (manager.ipsec.get().cloned(), manager.egress.get()) else {
+        return 0;
+    };
+    while !manager.sa_deletions_settled() && tokio::time::Instant::now() < answers_by {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    manager.surrender_all_sa_sets();
+    let deletions = manager.take_pending_sa_deletions();
+    let unanswered = deletions.len();
+    let deadline = tokio::time::Instant::now() + SHUTDOWN_DELETE_BOUND;
+    let deleted = tokio::time::timeout_at(
+        deadline,
+        super::protected::delete_sa_sets(&ipsec, deletions, process_ue_ip(egress)),
+    )
+    .await;
+    let settled = manager.await_sa_deletions_in_flight(deadline).await;
+    match deleted {
+        Ok(deleted) if settled => {
+            debug!(unanswered, deleted, "IMS UE SA sets deleted at shutdown");
+            deleted
+        }
+        Ok(deleted) => {
+            warn!(
+                deleted,
+                "IMS UE SA deletions still running at the shutdown bound; the rest go at their hard lifetime"
+            );
+            deleted
+        }
+        Err(_) => {
+            warn!(
+                unanswered,
+                "IMS UE SA sets not all deleted within the shutdown bound; the rest go at their hard lifetime"
+            );
+            0
+        }
+    }
 }
 
 #[cfg(test)]

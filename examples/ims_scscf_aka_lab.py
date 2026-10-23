@@ -15,12 +15,18 @@ Authorization header (TS 24.229). `auth.verify_integrity_protected` accepts it
 without a new challenge, but only when its IMPI is the one that registered the
 IMPU. AKA nonces are single-use, so anything else is challenged again.
 
+While the file named by the environment variable AKA_LAB_RECHALLENGE_FILE
+exists, protected REGISTERs are challenged too (re-authentication, TS 24.229
+5.1.1.5.1), so a test can drive a UE through make-before-break on demand.
+
 In a real deployment the S-CSCF fetches authentication vectors from the HSS over
 Cx (MAR) — see ims_scscf.py. This lab variant generates them locally so the
 IPsec/AKA path can be exercised standalone (e.g. the sipp-ipsec CI test).
 
 Config: sipp/ipsec/siphon-scscf.yaml
 """
+import os
+
 from siphon import proxy, registrar, auth, log
 
 REALM = "ims.test"
@@ -30,7 +36,12 @@ REALM = "ims.test"
 def handle_register(request):
     log.info(f"S-CSCF REGISTER from {request.from_uri}")
 
-    if auth.verify_integrity_protected(request):
+    rechallenge = os.environ.get("AKA_LAB_RECHALLENGE_FILE")
+    if rechallenge and os.path.exists(rechallenge):
+        if not auth.require_aka_digest(request, realm=REALM):
+            log.info(f"re-authenticating {request.from_uri}: sent 401 AKA challenge")
+            return
+    elif auth.verify_integrity_protected(request):
         # Protected re-/de-REGISTER from the IMPI that registered this IMPU:
         # verify_integrity_protected set request.auth_user, no challenge owed.
         log.info(

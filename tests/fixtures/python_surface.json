@@ -2495,7 +2495,7 @@
       "answer": {
         "doc": "Send an RTPEngine `answer` command.",
         "kind": "method_descriptor",
-        "sig": "($self, reply, profile=None, call=None, ws_uri=None, beep_detection=None, beep_cadence_guard_ms=None, ws_sample_rate=None, ws_tee_sample_rate=None, ws_vad_engine=None, ws_vad_min_speech_ms=None, sdp=None, to_tag=None)"
+        "sig": "($self, reply, profile=None, call=None, ws_uri=None, beep_detection=None, beep_cadence_guard_ms=None, ws_sample_rate=None, ws_tee_sample_rate=None, ws_vad_engine=None, ws_vad_min_speech_ms=None, sdp=None, to_tag=None, scope=None)"
       },
       "answer_local": {
         "doc": "Single-leg UAS answer \u2014 synthesise an RFC 3264 answer for the caller's",
@@ -2585,12 +2585,12 @@
       "delete": {
         "doc": "Send an RTPEngine `delete` command to tear down the media session.",
         "kind": "method_descriptor",
-        "sig": "($self, request)"
+        "sig": "($self, request, scope=None)"
       },
       "delete_call": {
         "doc": "Tear down a call's media by Call-ID, without a SIP message in hand.",
         "kind": "method_descriptor",
-        "sig": "($self, call_id, from_tag=None)"
+        "sig": "($self, call_id, from_tag=None, scope=None)"
       },
       "detach_ws_bridge": {
         "doc": "Detach a call's **WebSocket takeover bridge**, putting its media path",
@@ -2614,7 +2614,7 @@
       "offer": {
         "doc": "Send an RTPEngine `offer` command.",
         "kind": "method_descriptor",
-        "sig": "($self, request, profile=None, ws_uri=None, beep_detection=None, beep_cadence_guard_ms=None, ws_sample_rate=None, ws_tee_sample_rate=None, ws_vad_engine=None, ws_vad_min_speech_ms=None, sdp=None)"
+        "sig": "($self, request, profile=None, ws_uri=None, beep_detection=None, beep_cadence_guard_ms=None, ws_sample_rate=None, ws_tee_sample_rate=None, ws_vad_engine=None, ws_vad_min_speech_ms=None, sdp=None, scope=None)"
       },
       "on_active_speaker": {
         "doc": "Register a handler for a conference room's **active speaker**: called",

@@ -21,7 +21,7 @@ use tracing::debug;
 
 use crate::rtpengine::profile::NgFlags;
 use crate::rtpengine::session::{MediaSession, MediaSessionStore};
-use crate::rtpengine::MediaBackend;
+use crate::rtpengine::{CallScope, MediaBackend};
 use crate::sip::message::SipMessage;
 
 use super::{
@@ -142,6 +142,8 @@ pub(super) struct OfferCommand {
     /// Recorded on the session a first offer creates.
     pub(super) profile: String,
     pub(super) ws_uri: Option<String>,
+    /// The per-call scope the leg is anchored under; `None` for the node's.
+    pub(super) scope: Option<CallScope>,
 }
 
 impl OfferCommand {
@@ -177,7 +179,14 @@ impl OfferCommand {
             sdp,
             profile,
             ws_uri,
+            scope: None,
         }
+    }
+
+    /// The same offer for the leg anchored under `scope`. `sessions` given to
+    /// [`OfferCommand::new`] must be that scope's store.
+    pub(super) fn under(self, scope: Option<CallScope>) -> Self {
+        Self { scope, ..self }
     }
 
     /// Send the offer to the engine and return the SDP it rewrote. A first
@@ -190,7 +199,13 @@ impl OfferCommand {
     ) -> PyResult<Vec<u8>> {
         let rewritten_sdp = if self.is_reoffer {
             client
-                .reoffer(&self.engine_call_id, &self.from_tag, &self.sdp, flags)
+                .reoffer_in(
+                    self.scope.as_ref(),
+                    &self.engine_call_id,
+                    &self.from_tag,
+                    &self.sdp,
+                    flags,
+                )
                 .await
                 .map_err(|error| {
                     pyo3::exceptions::PyRuntimeError::new_err(format!(
@@ -199,7 +214,13 @@ impl OfferCommand {
                 })?
         } else {
             client
-                .offer(&self.engine_call_id, &self.from_tag, &self.sdp, flags)
+                .offer_in(
+                    self.scope.as_ref(),
+                    &self.engine_call_id,
+                    &self.from_tag,
+                    &self.sdp,
+                    flags,
+                )
                 .await
                 .map_err(|error| {
                     pyo3::exceptions::PyRuntimeError::new_err(format!(

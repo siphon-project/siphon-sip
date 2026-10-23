@@ -533,6 +533,7 @@ fn send_scripted_reply(
     // deletes its pair once this server transaction is over (TS 24.229
     // clause 5.2.5.1).
     if (200..300).contains(&code) && method == "REGISTER" {
+        super::ipsec_lifecycle::take_into_use_before_2xx(state, inbound.remote_addr);
         super::ipsec_lifecycle::on_register_2xx(
             state,
             message_guard,
