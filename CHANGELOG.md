@@ -15,6 +15,18 @@ entry, but a working config keeps working.
 
 ### Fixed
 
+- **Async Diameter server handlers and extension handlers no longer hold a
+  Python executor worker while they await.** `@diameter.on_request`,
+  `@diameter.on_reply`, `@diameter.on_request_completed` and every handler a
+  host extension calls through `ScriptHandle::call_handler` blocked a worker
+  until the coroutine settled, so a node could have at most as many of them in
+  flight as the executor has threads, and with a memory-sized executor a few
+  slow backends starved every other handler. The worker now only starts the
+  coroutine; it is awaited off the executor with nothing attached, and the
+  stage continues as a new job once it settles. Sync handlers and coroutines
+  that cannot suspend run exactly as before. A timed-out coroutine is
+  cancelled, its call fails as before, and it no longer counts in
+  `siphon_async_coroutines_pending`.
 - **IMS AKA over TCP: P-CSCF requests go on the P-CSCF's own connection.**
   A request the P-CSCF sent a UE over TCP (an MT request relayed with
   `flow=`, an in-dialog request on a leg, a NOTIFY, the registrar-liveness

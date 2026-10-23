@@ -148,7 +148,7 @@ pub(super) fn run_request_handlers(
             // If the handler is async, the return value is a coroutine.
             if handler.is_async {
                 match crate::script::inline_dispatch::start_coroutine(python, &returned) {
-                    Ok(crate::script::inline_dispatch::CoroutineStart::Finished) => {}
+                    Ok(crate::script::inline_dispatch::CoroutineStart::Finished(_)) => {}
                     Ok(crate::script::inline_dispatch::CoroutineStart::Suspended(pending)) => {
                         return HandlerStep::Suspended {
                             pending,

@@ -35,9 +35,11 @@ use crate::diameter::server::{CerDecision, ServerHandshake, ServerIdentity, Tena
 use crate::diameter::transport::DiameterListener;
 use crate::diameter::{forward, DiameterClient, DiameterManager};
 use crate::script::api::diameter_server::{PyDiameterAnswer, PyDiameterRequest, PyInboundPeer};
+use crate::script::async_pool::PendingCoroutine;
 use crate::script::engine::{
     run_coroutine_value, HandlerEntry, HandlerKind, ScriptEngine, ScriptState,
 };
+use crate::script::inline_dispatch::{start_coroutine, CoroutineStart};
 
 /// Global cap on concurrently in-flight inbound requests being relayed.
 const MAX_INFLIGHT: usize = 512;
@@ -667,48 +669,79 @@ pub(crate) async fn dispatch_request(
     let command_code = incoming.command_code;
 
     // Build the answer (and keep the Py request/answer for the completed hook)
-    // inside spawn_blocking — Python work must hold the GIL on a blocking
-    // thread, and `forward_to` awaits the backend via the async pool.
+    // on the Python executor. An `async def` handler that awaits — at any of
+    // the three stages — ends that job instead of holding its worker: its
+    // coroutine stays on an asyncio driver, this task awaits it with nothing
+    // attached, and the stage continues as a new job. Awaiting therefore costs
+    // a pending coroutine, not an executor thread.
     let engine_for_handler = Arc::clone(&engine);
-    let join = crate::script::py_executor::try_run(move || -> AnswerOutcome {
+    let join = crate::script::py_executor::try_run(move || -> DispatchStep {
         pyo3::Python::attach(|python| {
-            let mut outcome = build_answer_via_handler(
+            match build_answer_via_handler(
                 python,
                 &engine_for_handler,
                 &incoming,
                 &peer_info,
                 &local_origin_host,
                 &local_origin_realm,
-            );
-            // `@diameter.on_reply` — let the script rewrite the answer in place
-            // before it goes back upstream, then re-serialize the (possibly
-            // mutated) answer. Only runs when a handler is registered and the
-            // request actually reached a script handler (request/answer Py
-            // objects present); siphon's own error answers pass through.
-            let new_wire: Option<Vec<u8>> = match (&outcome.request_py, &outcome.answer_py) {
-                (Some(request_py), Some(answer_py)) => {
-                    if run_on_reply(python, &engine_for_handler, request_py, answer_py) {
-                        answer_py.borrow(python).to_wire().ok()
-                    } else {
-                        None
-                    }
+            ) {
+                AnswerStart::Done(outcome) => {
+                    reply_stage(python, &engine_for_handler.state(), outcome, 0)
                 }
-                _ => None,
-            };
-            if let Some(wire) = new_wire {
-                outcome.wire = wire;
+                AnswerStart::Awaiting(pending, suspended) => {
+                    DispatchStep::AwaitingRequestHandler { pending, suspended }
+                }
             }
-            outcome
         })
     })
     .await;
 
-    let outcome = match join {
-        Ok(outcome) => outcome,
+    let mut step = match join {
+        Ok(step) => step,
         Err(_panic) => {
             warn!("Diameter server: dispatch task panicked");
             return;
         }
+    };
+    let outcome = loop {
+        let resumed = match step {
+            DispatchStep::Answered(outcome) => break outcome,
+            DispatchStep::AwaitingRequestHandler { pending, suspended } => {
+                let result = pending.wait().await;
+                let engine = Arc::clone(&engine);
+                crate::script::py_executor::run_queued(move || {
+                    pyo3::Python::attach(|python| {
+                        let outcome = suspended.finish(python, result);
+                        reply_stage(python, &engine.state(), outcome, 0)
+                    })
+                })
+                .await
+            }
+            DispatchStep::AwaitingReplyHandler {
+                pending,
+                script,
+                outcome,
+                next,
+            } => {
+                let result = pending.wait().await;
+                crate::script::py_executor::run_queued(move || {
+                    pyo3::Python::attach(|python| {
+                        if let Err(error) = result {
+                            warn!(error = %crate::script::error_report::describe(python, &error), "Diameter server: async on_reply failed");
+                        }
+                        reply_stage(python, &script, outcome, next)
+                    })
+                })
+                .await
+            }
+        };
+        step = match resumed {
+            Ok(step) => step,
+            Err(_panic) => {
+                warn!("Diameter server: dispatch task panicked");
+                return;
+            }
+        };
     };
 
     // Read the label off the final wire before it moves into the send. Counted
@@ -730,29 +763,154 @@ pub(crate) async fn dispatch_request(
     let latency_us = start.elapsed().as_micros() as u64;
     if let (Some(request_py), Some(answer_py)) = (outcome.request_py, outcome.answer_py) {
         let engine = Arc::clone(&engine);
-        let _ = crate::script::py_executor::run(move || {
+        let mut step = crate::script::py_executor::run(move || {
             pyo3::Python::attach(|python| {
-                let state = engine.state();
-                for handler in state.handlers_for(&HandlerKind::DiameterOnRequestCompleted) {
-                    let call = handler.callable.bind(python).call1((
-                        request_py.bind(python),
-                        answer_py.bind(python),
+                run_on_request_completed(
+                    python,
+                    &engine.state(),
+                    CompletedHook {
+                        request_py,
+                        answer_py,
                         latency_us,
-                    ));
-                    match call {
-                        Ok(value) if handler.is_async => {
-                            if let Err(error) = run_coroutine_value(python, &value) {
-                                warn!(%error, "Diameter server: async on_request_completed failed");
-                            }
-                        }
-                        Ok(_) => {}
-                        Err(error) => warn!(%error, "Diameter server: on_request_completed failed"),
-                    }
-                }
-            });
+                    },
+                    0,
+                )
+            })
         })
         .await;
+        while let CompletedStep::Awaiting {
+            pending,
+            script,
+            hook,
+            next,
+        } = step
+        {
+            let result = pending.wait().await;
+            let resumed = crate::script::py_executor::run_queued(move || {
+                pyo3::Python::attach(|python| {
+                    if let Err(error) = result {
+                        warn!(%error, "Diameter server: async on_request_completed failed");
+                    }
+                    run_on_request_completed(python, &script, hook, next)
+                })
+            })
+            .await;
+            step = match resumed {
+                Ok(step) => step,
+                Err(_panic) => {
+                    warn!("Diameter server: on_request_completed task panicked");
+                    break;
+                }
+            };
+        }
     }
+}
+
+/// Where an inbound request's handling stopped: answered, or waiting for an
+/// async handler's coroutine on an asyncio driver.
+enum DispatchStep {
+    Answered(AnswerOutcome),
+    /// `@diameter.on_request` is awaiting.
+    AwaitingRequestHandler {
+        pending: PendingCoroutine,
+        suspended: SuspendedAnswer,
+    },
+    /// The `@diameter.on_reply` handler before `next` is awaiting.
+    AwaitingReplyHandler {
+        pending: PendingCoroutine,
+        /// The script the handlers come from, so a reload while one awaits
+        /// neither changes nor frees the handlers still to run.
+        script: Arc<ScriptState>,
+        outcome: AnswerOutcome,
+        next: usize,
+    },
+}
+
+/// Run the `@diameter.on_reply` handlers from index `from` on the answer, then
+/// re-serialize it if any ran — unless an async one suspends.
+///
+/// The handlers rewrite the answer in place before it goes back upstream.
+/// Only runs when the request reached a script handler (request/answer Py
+/// objects present); siphon's own error answers pass through.
+fn reply_stage(
+    python: Python<'_>,
+    script: &Arc<ScriptState>,
+    mut outcome: AnswerOutcome,
+    from: usize,
+) -> DispatchStep {
+    let (Some(request_py), Some(answer_py)) = (&outcome.request_py, &outcome.answer_py) else {
+        return DispatchStep::Answered(outcome);
+    };
+    match run_on_reply(python, script, request_py, answer_py, from) {
+        ReplyRun::Done { ran } => {
+            if ran {
+                if let Ok(wire) = answer_py.borrow(python).to_wire() {
+                    outcome.wire = wire;
+                }
+            }
+            DispatchStep::Answered(outcome)
+        }
+        ReplyRun::Awaiting { pending, next } => DispatchStep::AwaitingReplyHandler {
+            pending,
+            script: Arc::clone(script),
+            outcome,
+            next,
+        },
+    }
+}
+
+/// What `@diameter.on_request_completed` is called with.
+struct CompletedHook {
+    request_py: Py<PyDiameterRequest>,
+    answer_py: Py<PyDiameterAnswer>,
+    latency_us: u64,
+}
+
+/// Where the `@diameter.on_request_completed` handlers stopped.
+enum CompletedStep {
+    Done,
+    /// The handler before `next` is awaiting.
+    Awaiting {
+        pending: PendingCoroutine,
+        script: Arc<ScriptState>,
+        hook: CompletedHook,
+        next: usize,
+    },
+}
+
+/// Run the `@diameter.on_request_completed` handlers from index `from`, until
+/// one suspends.
+fn run_on_request_completed(
+    python: Python<'_>,
+    script: &Arc<ScriptState>,
+    hook: CompletedHook,
+    from: usize,
+) -> CompletedStep {
+    let handlers = script.handlers_for(&HandlerKind::DiameterOnRequestCompleted);
+    for (index, handler) in handlers.iter().enumerate().skip(from) {
+        let call = handler.callable.bind(python).call1((
+            hook.request_py.bind(python),
+            hook.answer_py.bind(python),
+            hook.latency_us,
+        ));
+        match call {
+            Ok(value) if handler.is_async => match start_coroutine(python, &value) {
+                Ok(CoroutineStart::Finished(_)) => {}
+                Ok(CoroutineStart::Suspended(pending)) => {
+                    return CompletedStep::Awaiting {
+                        pending,
+                        script: Arc::clone(script),
+                        hook,
+                        next: index + 1,
+                    };
+                }
+                Err(error) => warn!(%error, "Diameter server: async on_request_completed failed"),
+            },
+            Ok(_) => {}
+            Err(error) => warn!(%error, "Diameter server: on_request_completed failed"),
+        }
+    }
+    CompletedStep::Done
 }
 
 /// Bounded metric label for the Result-Code of an answer siphon is *emitting*.
@@ -809,7 +967,7 @@ fn build_answer_via_handler(
     peer_info: &PyInboundPeer,
     local_origin_host: &str,
     local_origin_realm: &str,
-) -> AnswerOutcome {
+) -> AnswerStart {
     // Parse the inbound request into the lossless tree.
     let request_msg = match DiameterMsg::from_wire(&incoming.raw) {
         Ok(msg) => msg,
@@ -823,11 +981,11 @@ fn build_answer_via_handler(
                 dictionary::DIAMETER_INVALID_AVP_LENGTH,
                 "malformed request",
             );
-            return AnswerOutcome {
+            return AnswerStart::Done(AnswerOutcome {
                 wire: answer.to_wire(),
                 request_py: None,
                 answer_py: None,
-            };
+            });
         }
     };
 
@@ -860,11 +1018,11 @@ fn build_answer_via_handler(
 
     let Some(handler) = selected else {
         let answer = no_route_answer();
-        return AnswerOutcome {
+        return AnswerStart::Done(AnswerOutcome {
             wire: answer.to_wire(),
             request_py: None,
             answer_py: None,
-        };
+        });
     };
 
     // Build the PyDiameterRequest and hand it to the script.
@@ -881,40 +1039,139 @@ fn build_answer_via_handler(
             // not build the object to hand it.
             error!(%error, "Diameter server: failed to build request object");
             let answer = cannot_comply("could not build the request object");
-            return AnswerOutcome {
+            return AnswerStart::Done(AnswerOutcome {
                 wire: answer.to_wire(),
                 request_py: None,
                 answer_py: None,
-            };
+            });
         }
     };
 
     let handler_callable = handler.callable.bind(python);
-    let result = handler_callable.call1((request_py.bind(python),));
-    let resolved = match result {
-        Ok(value) => {
-            if handler.is_async {
-                match run_coroutine_value(python, &value) {
-                    Ok(resolved) => resolved.into_bound(python),
-                    Err(error) => {
-                        error!(
-                            handler = %handler_name(handler_callable),
-                            error = %crate::script::error_report::describe(python, &error),
-                            "Diameter server: async on_request handler raised; answering 5012"
-                        );
-                        let answer = cannot_comply("on_request handler raised");
-                        return AnswerOutcome {
-                            wire: answer.to_wire(),
-                            request_py: Some(request_py),
-                            answer_py: None,
-                        };
-                    }
-                }
-            } else {
-                value
+    let resolved = match handler_callable.call1((request_py.bind(python),)) {
+        Ok(value) if handler.is_async => match start_coroutine(python, &value) {
+            Ok(CoroutineStart::Finished(resolved)) => Ok(resolved),
+            Ok(CoroutineStart::Suspended(pending)) => {
+                return AnswerStart::Awaiting(
+                    pending,
+                    SuspendedAnswer {
+                        request_msg,
+                        request_py,
+                        handler_callable: handler_callable.clone().unbind(),
+                        local_origin_host: local_origin_host.to_string(),
+                        local_origin_realm: local_origin_realm.to_string(),
+                    },
+                );
             }
+            Err(error) => Err(HandlerFailure::Coroutine(error)),
+        },
+        Ok(value) => Ok(value.unbind()),
+        Err(error) => Err(HandlerFailure::Call(error)),
+    };
+    AnswerStart::Done(finish_answer(
+        python,
+        &request_msg,
+        request_py,
+        handler_callable,
+        resolved,
+        local_origin_host,
+        local_origin_realm,
+    ))
+}
+
+/// What became of the request handler's answer: built here, or awaited on an
+/// asyncio driver.
+enum AnswerStart {
+    Done(AnswerOutcome),
+    Awaiting(PendingCoroutine, SuspendedAnswer),
+}
+
+#[cfg(test)]
+impl AnswerStart {
+    /// The answer built in place: off an executor worker, which is where tests
+    /// call this, a coroutine is waited for rather than suspended.
+    fn into_done(self) -> AnswerOutcome {
+        match self {
+            AnswerStart::Done(outcome) => outcome,
+            AnswerStart::Awaiting(..) => panic!("a handler suspended off an executor worker"),
         }
-        Err(error) => {
+    }
+}
+
+/// How an `@diameter.on_request` handler failed: raising when called, or in
+/// its coroutine.
+enum HandlerFailure {
+    Call(PyErr),
+    Coroutine(PyErr),
+}
+
+/// What building the answer needs once an awaiting request handler settles.
+struct SuspendedAnswer {
+    request_msg: DiameterMsg,
+    request_py: Py<PyDiameterRequest>,
+    handler_callable: Py<PyAny>,
+    local_origin_host: String,
+    local_origin_realm: String,
+}
+
+impl SuspendedAnswer {
+    /// Build the answer from the handler's settled coroutine.
+    fn finish(self, python: Python<'_>, result: PyResult<Py<PyAny>>) -> AnswerOutcome {
+        finish_answer(
+            python,
+            &self.request_msg,
+            self.request_py,
+            self.handler_callable.bind(python),
+            result.map_err(HandlerFailure::Coroutine),
+            &self.local_origin_host,
+            &self.local_origin_realm,
+        )
+    }
+}
+
+/// Turn what the request handler returned — or how it failed — into the answer.
+fn finish_answer(
+    python: Python<'_>,
+    request_msg: &DiameterMsg,
+    request_py: Py<PyDiameterRequest>,
+    handler_callable: &Bound<'_, PyAny>,
+    resolved: Result<Py<PyAny>, HandlerFailure>,
+    local_origin_host: &str,
+    local_origin_realm: &str,
+) -> AnswerOutcome {
+    let answer_with = |result_code: u32, error_message: &str| {
+        forward::build_error_answer(
+            request_msg,
+            local_origin_host,
+            local_origin_realm,
+            result_code,
+            error_message,
+        )
+    };
+    let no_route_answer = || {
+        answer_with(
+            dictionary::DIAMETER_UNABLE_TO_DELIVER,
+            "no on_request handler",
+        )
+    };
+    let cannot_comply = |reason: &str| answer_with(dictionary::DIAMETER_UNABLE_TO_COMPLY, reason);
+
+    let resolved = match resolved {
+        Ok(value) => value.into_bound(python),
+        Err(HandlerFailure::Coroutine(error)) => {
+            error!(
+                handler = %handler_name(handler_callable),
+                error = %crate::script::error_report::describe(python, &error),
+                "Diameter server: async on_request handler raised; answering 5012"
+            );
+            let answer = cannot_comply("on_request handler raised");
+            return AnswerOutcome {
+                wire: answer.to_wire(),
+                request_py: Some(request_py),
+                answer_py: None,
+            };
+        }
+        Err(HandlerFailure::Call(error)) => {
             error!(
                 handler = %handler_name(handler_callable),
                 error = %crate::script::error_report::describe(python, &error),
@@ -985,38 +1242,59 @@ fn build_answer_via_handler(
     }
 }
 
-/// Invoke every `@diameter.on_reply` handler on the answer before it goes
-/// upstream, letting the script rewrite AVPs in place (topology hiding,
-/// Origin-Host/Result-Code mapping). The handler's return value is ignored —
-/// it mutates `answer_py`. Returns whether any handler ran (so the caller can
-/// skip a redundant re-serialization when none are registered).
+/// Where the `@diameter.on_reply` handlers stopped.
+enum ReplyRun {
+    /// Every handler from the start index has returned; `ran` says whether
+    /// any handler ran at all, so the caller can skip a redundant
+    /// re-serialization when none are registered.
+    Done { ran: bool },
+    /// The handler before `next` is awaiting.
+    Awaiting {
+        pending: PendingCoroutine,
+        next: usize,
+    },
+}
+
+/// Invoke the `@diameter.on_reply` handlers from index `from` on the answer
+/// before it goes upstream, letting the script rewrite AVPs in place (topology
+/// hiding, Origin-Host/Result-Code mapping). The handler's return value is
+/// ignored — it mutates `answer_py`.
 fn run_on_reply(
     python: Python<'_>,
-    engine: &Arc<ScriptEngine>,
+    script: &ScriptState,
     request_py: &Py<PyDiameterRequest>,
     answer_py: &Py<PyDiameterAnswer>,
-) -> bool {
-    let state = engine.state();
-    let mut ran = false;
-    for handler in state.handlers_for(&HandlerKind::DiameterOnReply) {
+    from: usize,
+) -> ReplyRun {
+    // A handler before `from` already ran, before an await.
+    let mut ran = from > 0;
+    let handlers = script.handlers_for(&HandlerKind::DiameterOnReply);
+    for (index, handler) in handlers.iter().enumerate().skip(from) {
         ran = true;
         match handler
             .callable
             .bind(python)
             .call1((request_py.bind(python), answer_py.bind(python)))
         {
-            Ok(value) if handler.is_async => {
-                if let Err(error) = run_coroutine_value(python, &value) {
+            Ok(value) if handler.is_async => match start_coroutine(python, &value) {
+                Ok(CoroutineStart::Finished(_)) => {}
+                Ok(CoroutineStart::Suspended(pending)) => {
+                    return ReplyRun::Awaiting {
+                        pending,
+                        next: index + 1,
+                    };
+                }
+                Err(error) => {
                     warn!(error = %crate::script::error_report::describe(python, &error), "Diameter server: async on_reply failed");
                 }
-            }
+            },
             Ok(_) => {}
             Err(error) => {
                 warn!(error = %crate::script::error_report::describe(python, &error), "Diameter server: on_reply handler raised")
             }
         }
     }
-    ran
+    ReplyRun::Done { ran }
 }
 
 /// Pick the single best `@diameter.on_request` handler for an inbound
@@ -1504,6 +1782,7 @@ mod handler_failure_tests {
                 "siphon.example.net",
                 "example.net",
             )
+            .into_done()
             .wire
         });
         DiameterMsg::from_wire(&wire).expect("siphon's own answer should parse")
@@ -1880,6 +2159,7 @@ pub(crate) mod zn_serving_tests {
                 "bsf.mnc001.mcc001.pub.3gppnetwork.org",
                 "mnc001.mcc001.pub.3gppnetwork.org",
             )
+            .into_done()
             .wire
         })
     }
@@ -2053,6 +2333,7 @@ mod s13_serving_tests {
                 "eir.epc.mnc001.mcc001.3gppnetwork.org",
                 "epc.mnc001.mcc001.3gppnetwork.org",
             )
+            .into_done()
             .wire
         })
     }
@@ -2220,5 +2501,160 @@ mod s13_serving_tests {
         write("written_ecr", vectors::S13_ECR);
         write("written_eca", vectors::S13_ECA);
         write("written_eca_unknown", vectors::S13_ECA_UNKNOWN);
+    }
+}
+
+/// An `async def` Diameter handler that awaits gives its executor worker back
+/// for the wait, at each stage of an inbound request: `on_request`, `on_reply`
+/// and `on_request_completed`.
+#[cfg(test)]
+mod awaiting_handler_tests {
+    use super::*;
+
+    /// The registry calls `@diameter.on_request` and friends make once
+    /// `diameter:` is configured, which an embedded test script is not.
+    const SCRIPT: &str = concat!(
+        "import asyncio\n",
+        "import _siphon_registry\n",
+        "\n",
+        "completed = []\n",
+        "\n",
+        "async def handle(request):\n",
+        "    await asyncio.sleep(1.0)\n",
+        "    return request.answer(2001)\n",
+        "\n",
+        "async def rewrite(request, answer):\n",
+        "    await asyncio.sleep(0.05)\n",
+        "    answer.set_avp('Origin-Host', 'rewritten.example.net')\n",
+        "\n",
+        "async def done(request, answer, latency_us):\n",
+        "    await asyncio.sleep(0.05)\n",
+        "    completed.append(latency_us)\n",
+        "\n",
+        "_siphon_registry.register('diameter.on_request', None, handle, True)\n",
+        "_siphon_registry.register('diameter.on_reply', None, rewrite, True)\n",
+        "_siphon_registry.register('diameter.on_request_completed', None, done, True)\n",
+    );
+
+    /// A bare Credit-Control-Request header with the given end-to-end id.
+    fn incoming(end_to_end: u32) -> IncomingRequest {
+        let command_code = dictionary::CMD_CREDIT_CONTROL;
+        let application_id = dictionary::RO_APP_ID;
+        let mut raw = Vec::with_capacity(20);
+        raw.push(1);
+        raw.extend_from_slice(&20u32.to_be_bytes()[1..]);
+        raw.push(0x80);
+        raw.extend_from_slice(&command_code.to_be_bytes()[1..]);
+        raw.extend_from_slice(&application_id.to_be_bytes());
+        raw.extend_from_slice(&end_to_end.to_be_bytes());
+        raw.extend_from_slice(&end_to_end.to_be_bytes());
+        IncomingRequest {
+            command_code,
+            application_id,
+            hop_by_hop: end_to_end,
+            end_to_end,
+            avps: serde_json::Value::Null,
+            raw,
+        }
+    }
+
+    fn peer_config() -> PeerConfig {
+        PeerConfig {
+            host: "192.0.2.10".to_string(),
+            port: 3868,
+            origin_host: "siphon.example.net".to_string(),
+            origin_realm: "example.net".to_string(),
+            destination_host: None,
+            destination_realm: "example.net".to_string(),
+            local_ip: "192.0.2.1".parse().expect("a literal address"),
+            application_ids: vec![],
+            watchdog_interval: 30,
+            reconnect_delay: 5,
+            product_name: "SIPhon".to_string(),
+            firmware_revision: 100,
+        }
+    }
+
+    fn completed_count(engine: &ScriptEngine) -> usize {
+        Python::attach(|python| {
+            let state = engine.state();
+            let handlers = state.handlers_for(&HandlerKind::DiameterOnRequestCompleted);
+            let handler = handlers.first().expect("the completed hook is registered");
+            handler
+                .callable
+                .bind(python)
+                .getattr("__globals__")
+                .and_then(|globals| globals.get_item("completed"))
+                .and_then(|completed| completed.len())
+                .expect("the script keeps a completed list")
+        })
+    }
+
+    // A plain test that blocks on the pools' runtime: the serialising
+    // guard is a std mutex, which is not held across an await of this test's.
+    #[test]
+    fn awaiting_handlers_beyond_the_executor_size_are_answered_at_once() {
+        let _serial = crate::script::async_pool::pool_test_guard();
+        crate::script::async_pool::test_pools_runtime().block_on(async {
+            let (executor, _async_pool) = crate::script::async_pool::ensure_test_pools();
+            let engine =
+                Arc::new(ScriptEngine::new_embedded(SCRIPT).expect("the test script compiles"));
+            let (write_tx, mut write_rx) = mpsc::channel(64);
+            let inbound_peer = Arc::new(DiameterPeer::new_for_test(peer_config(), write_tx));
+
+            // Twice the executor's ceiling and one more: parked workers would run
+            // these in three waves of one second each.
+            let requests = 2 * executor.max_size() + 1;
+            let started = Instant::now();
+            for index in 0..requests {
+                tokio::spawn(dispatch_request(
+                    Arc::clone(&engine),
+                    Arc::clone(&inbound_peer),
+                    incoming(100 + index as u32),
+                    PyInboundPeer {
+                        name: "ocs".to_string(),
+                        tenant: "default".to_string(),
+                        addr: "192.0.2.10:3868".to_string(),
+                        transport: "tcp".to_string(),
+                    },
+                    "siphon.example.net".to_string(),
+                    "example.net".to_string(),
+                ));
+            }
+            let mut answers = Vec::new();
+            while answers.len() < requests {
+                let wire = tokio::time::timeout(Duration::from_secs(15), write_rx.recv())
+                    .await
+                    .expect("every request is answered")
+                    .expect("the peer's write channel stays open");
+                answers.push(DiameterMsg::from_wire(&wire).expect("siphon's answer parses"));
+            }
+            let elapsed = started.elapsed();
+
+            for answer in &answers {
+                assert_eq!(answer.answer_result_codes().0, Some(2001));
+                assert_eq!(
+                    answer.get_str(dictionary::avp::ORIGIN_HOST).as_deref(),
+                    Some("rewritten.example.net"),
+                    "the awaiting on_reply rewrote the answer before it went out"
+                );
+            }
+            assert!(
+                elapsed < Duration::from_secs(2),
+                "{requests} requests whose handlers each await 1 s on {} executor workers \
+                 took {elapsed:?}",
+                executor.max_size()
+            );
+
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while completed_count(&engine) < requests && Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert_eq!(
+                completed_count(&engine),
+                requests,
+                "the awaiting on_request_completed hook ran for every request"
+            );
+        });
     }
 }
