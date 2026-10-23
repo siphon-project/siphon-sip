@@ -629,7 +629,8 @@ pub(super) fn send_to_target(
             // IPsec's fixed-port source wins over a script send_socket pin (the
             // kernel XFRM selector requires it); otherwise use the pin's
             // interface IP with an ephemeral source port.
-            let source = crate::script::api::ipsec::outbound_local_addr_for(destination)
+            let source = protected_request(destination, transport, state)
+                .map(|protected| protected.source)
                 .or(send_bind_stream);
             let connect_result = tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(async {
@@ -838,8 +839,9 @@ pub(super) fn send_to_target(
             // IPsec auto-source wins over a script send_socket pin (kernel XFRM
             // selector); otherwise the pin selects the exact `(ip, port)` UDP
             // listener socket to egress from (routed via `udp_by_local`).
-            let source_local_addr =
-                crate::script::api::ipsec::outbound_local_addr_for(destination).or(send_source);
+            let source_local_addr = protected_request(destination, transport, state)
+                .map(|protected| protected.source)
+                .or(send_source);
             // A target that is a UE's protected client port (a Contact
             // rewritten to the source) gets the P-CSCF's flow instead.
             let (destination, source_local_addr) =

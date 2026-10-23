@@ -5,8 +5,10 @@
 //! TS 33.203 clause 7.1, UDP case). The captured flow is the one the UE sends
 //! on, from its protected client port to the P-CSCF's protected server port.
 //! The Via keeps naming the protected server port, where the P-CSCF receives
-//! the UE's responses. Over TCP and toward a peer with no security association
-//! nothing changes.
+//! the UE's responses, also on a request routed by its Contact to the UE's
+//! protected server port. Over TCP the request goes on the connection the
+//! P-CSCF opens to the UE's protected server port (clause 5.2.2.2 1A b).
+//! Toward a peer with no security association nothing changes.
 //!
 //! The harness listens on 192.0.2.1:5060, made the protected server port, with
 //! 5064 the protected client port.
@@ -33,7 +35,6 @@ struct Sent {
     destination: SocketAddr,
     source_local_addr: Option<SocketAddr>,
     transport: Transport,
-    connection_id: ConnectionId,
     message: SipMessage,
 }
 
@@ -45,7 +46,6 @@ fn drain(receiver: &flume::Receiver<OutboundMessage>) -> Vec<Sent> {
                 destination: outbound.destination,
                 source_local_addr: outbound.source_local_addr,
                 transport: outbound.transport,
-                connection_id: outbound.connection_id,
                 message: parse_sip_message_bytes(frame).expect("siphon sent a message that parses"),
             });
         }
@@ -238,9 +238,13 @@ async fn a_liveness_options_over_the_ue_flow_goes_from_port_pc_to_port_us() {
     assert_over_port_pc_to_port_us(drain(&proxy.udp), ue, Method::Options);
 }
 
-/// Over TCP the request rides the connection the UE registered over.
+/// Over TCP the dispatcher hands the request down on the UE's own connection
+/// (port_uc -> port_ps), and the outbound router's rule takes it onto the
+/// connection the P-CSCF opens from port_pc to port_us, with no connection id
+/// so the pool opens or reuses that one (TS 24.229 clause 5.2.2.2 1A b). The
+/// Via names the protected server port.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_tcp_flow_is_left_on_its_connection() {
+async fn a_tcp_request_over_the_ue_flow_goes_on_the_p_cscf_connection() {
     let (proxy, manager) = p_cscf(ANSWER);
     let (stream_sender, stream) = flume::unbounded();
     let proxy = super::ipsec_response_flow_tests::with_stream_egress(proxy, stream_sender);
@@ -251,12 +255,52 @@ async fn a_tcp_flow_is_left_on_its_connection() {
     tcp.connection_id = 124;
     let invite = terminating("INVITE", ue, "tcp-124", "");
     relay(&proxy, &invite, Some(&tcp));
-    let requests = requests_to_ue(drain(&stream), ue);
+    let mut handed_down = Vec::new();
+    while let Ok(outbound) = stream.try_recv() {
+        handed_down.push(outbound);
+    }
+    assert_eq!(handed_down.len(), 1, "one request to the UE");
+    let outbound = handed_down.remove(0);
+    assert_eq!(
+        (
+            outbound.destination,
+            outbound.source_local_addr,
+            outbound.connection_id
+        ),
+        (ue, Some(addr(PORT_PS)), ConnectionId(124)),
+        "the dispatcher addresses the UE's flow"
+    );
+    let moved = crate::ipsec::pcscf_tcp_request_egress(&manager, 5060, outbound);
+    assert_eq!(moved.transport, Transport::Tcp);
+    assert_eq!(moved.destination, SocketAddr::new(ue.ip(), 6101));
+    assert_eq!(moved.source_local_addr, Some(addr(PORT_PC)));
+    assert_eq!(moved.connection_id, ConnectionId::default());
+    let message = parse_sip_message_bytes(&moved.data).expect("parses");
+    let via = message.headers.get("Via").expect("a Via");
+    assert!(via.contains(PORT_PS), "{via}");
+}
+
+/// A request routed by its Contact to the UE's protected server port, with no
+/// flow, leaves from the protected client port but its Via names the
+/// protected server port, where the UE's response comes back (TS 24.229
+/// clause 5.2.6.4.3 step 6, 5.2.6.4.5 step 1; TS 33.203 clause 7.1).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_request_routed_to_the_ue_server_port_names_port_ps_in_its_via() {
+    let (proxy, manager) = p_cscf(ANSWER);
+    let ue = addr("198.51.100.126:6100");
+    install(&manager, ue).await;
+
+    let bye = terminating("BYE", ue, "contact-126", ";tag=ue-tag");
+    relay(&proxy, &bye, None);
+    let requests = requests_to_ue(drain(&proxy.udp), ue);
     assert_eq!(requests.len(), 1, "{requests:?}");
-    assert_eq!(requests[0].transport, Transport::Tcp);
-    assert_eq!(requests[0].destination, ue);
-    assert_eq!(requests[0].connection_id, ConnectionId(124));
-    assert_eq!(requests[0].source_local_addr, Some(addr(PORT_PS)));
+    assert_eq!(requests[0].destination, SocketAddr::new(ue.ip(), 6101));
+    assert_eq!(requests[0].source_local_addr, Some(addr(PORT_PC)));
+    let via = requests[0].message.headers.get("Via").expect("a Via");
+    assert!(
+        via.contains(PORT_PS) && !via.contains("5064"),
+        "the Via names the protected server port, not the client port: {via}"
+    );
 }
 
 /// A flow with no security association goes where it was captured.

@@ -341,7 +341,9 @@ pub fn b2bua_dial_b_leg(
             None,
             |local| state.wildcard_pinned_sent_by(&outbound_transport, local),
             send_socket.map(|pin| state.pin_sent_by(pin)),
-            || state.connection_sent_by(outbound_transport, destination),
+            // A UE's protected port: the pair's protected server port, where
+            // the UE's response comes back (TS 24.229 clause 5.2.6.4.3 step 6).
+            || unpinned_request_sent_by(destination, outbound_transport, state),
         )
     };
     let via_value = format!(

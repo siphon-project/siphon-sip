@@ -953,6 +953,17 @@ impl OutboundRouter {
     // rewrapping every caller. Allow the size lint here.
     #[allow(clippy::result_large_err)]
     pub fn send(&self, message: OutboundMessage) -> Result<(), flume::SendError<OutboundMessage>> {
+        // A P-CSCF's TCP request to a UE leaves on the connection the P-CSCF
+        // opens to the UE's protected server port, not on the UE's own (TS
+        // 24.229 clause 5.2.2.2 1A b). Done here, before the counters and the
+        // capture, because every producer (relays over a captured flow,
+        // in-dialog requests on a leg, the UAC's NOTIFY and liveness OPTIONS)
+        // reaches the wire through this call.
+        let message = if message.transport == Transport::Tcp {
+            crate::ipsec::runtime::pcscf_tcp_egress(message)
+        } else {
+            message
+        };
         // The `direction="out"` half of siphon_requests_total / siphon_responses_total.
         //
         // Counted here rather than at the typed reply helpers because this is the
