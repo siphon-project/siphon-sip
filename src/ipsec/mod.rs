@@ -5,9 +5,11 @@
 
 pub mod milenage;
 
-/// Which ports a P-CSCF's UDP message to a UE leaves from and goes to.
+/// Which ports a P-CSCF's message to a UE leaves from and goes to.
 mod egress;
-pub use egress::pcscf_udp_egress;
+pub use egress::{pcscf_tcp_request_egress, pcscf_udp_egress};
+#[cfg(test)]
+mod egress_tests;
 /// `ip xfrm policy` command lines of the `ip` backend.
 mod ip_policy;
 #[cfg(target_os = "linux")]
@@ -541,9 +543,11 @@ pub struct SecurityAssociationPair {
     pub security_server: Option<String>,
 }
 
-/// Where a UDP request or response to a UE goes, from [`IpsecManager::udp_flow_to_ue`].
+/// Where a request or response to a UE goes, from
+/// [`IpsecManager::udp_flow_to_ue`] (UDP) or [`IpsecManager::tcp_flow_to_ue`]
+/// (a TCP request).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UdpFlowToUe {
+pub enum FlowToUe {
     /// The destination is not the client port of a P-CSCF pair: send as is.
     NotProtected,
     /// Send from the P-CSCF's protected client port to the UE's protected
@@ -552,22 +556,33 @@ pub enum UdpFlowToUe {
         local: std::net::SocketAddr,
         destination: std::net::SocketAddr,
     },
-    /// The pair's selector does not admit UDP, so no UDP message can reach
-    /// the UE over it.
+    /// The pair's selector does not admit the transport, so no message over
+    /// it can reach the UE over this pair.
     Unusable(SaProtocol),
 }
 
 impl SecurityAssociationPair {
     /// [`IpsecManager::udp_flow_to_ue`] for this pair.
-    pub fn udp_flow_to_ue(&self) -> UdpFlowToUe {
+    pub fn udp_flow_to_ue(&self) -> FlowToUe {
+        self.flow_to_ue(SaProtocol::Tcp)
+    }
+
+    /// [`IpsecManager::tcp_flow_to_ue`] for this pair.
+    pub fn tcp_flow_to_ue(&self) -> FlowToUe {
+        self.flow_to_ue(SaProtocol::Udp)
+    }
+
+    /// (port_pc -> port_us), SA #3, unless siphon is the UE of this pair or
+    /// its selector admits only `other`, the transport not being sent.
+    fn flow_to_ue(&self, other: SaProtocol) -> FlowToUe {
         if self.role != SaRole::PCscf {
             // Siphon is the UE here and answers from its own client port.
-            return UdpFlowToUe::NotProtected;
+            return FlowToUe::NotProtected;
         }
-        if self.protocol == SaProtocol::Tcp {
-            return UdpFlowToUe::Unusable(self.protocol);
+        if self.protocol == other {
+            return FlowToUe::Unusable(self.protocol);
         }
-        UdpFlowToUe::Protected {
+        FlowToUe::Protected {
             local: std::net::SocketAddr::new(self.pcscf_addr, self.pcscf_port_c),
             destination: std::net::SocketAddr::new(self.ue_addr, self.ue_port_s),
         }
@@ -918,6 +933,20 @@ impl IpsecManager {
         if let Some((_, sa)) = self.associations.remove(&key) {
             let in_use = self.is_in_use(&sa);
             self.forget_lifecycle(&key);
+            // The connection the P-CSCF opened to the UE's protected server
+            // port for its own requests (TS 24.229 clause 5.2.2.2 1A b) is
+            // carried by this pair, and a connection from a pinned port is
+            // never closed for idleness, so it goes with the pair, before
+            // the kernel objects do. A retirement has closed it already; the
+            // liveness reaper and the expiry sweep delete directly.
+            if sa.role == SaRole::PCscf {
+                self.close_unshared_connections(
+                    &sa,
+                    &[sa.ue_port_s],
+                    "security association deleted",
+                )
+                .await;
+            }
             // Best-effort teardown — every delete is independent, so a single
             // missing key (e.g. an SA already reaped on hard-lifetime) can't
             // skip the rest. (The old code `?`-chained the four del_sa, so the
@@ -1194,18 +1223,43 @@ impl IpsecManager {
     /// (port_pc -> port_us), never back to its source port (TS 24.229
     /// clause 5.2.2.2 NOTE 3), and a request sent over the UE's flow takes the
     /// same (port_pc -> port_us) flow (TS 24.229 clause 5.2.2.2 1A a). TCP is
-    /// untouched: there the message goes on the connection.
+    /// [`tcp_flow_to_ue`](Self::tcp_flow_to_ue).
     ///
     /// Keyed on the pair's `(ue_addr, ue_port_c)`, so it is one map lookup
     /// and the pair a re-registration set up answers from its own entry.
-    pub fn udp_flow_to_ue(&self, destination: std::net::SocketAddr) -> UdpFlowToUe {
+    pub fn udp_flow_to_ue(&self, destination: std::net::SocketAddr) -> FlowToUe {
         let Some(entry) = self
             .associations
             .get(&Self::contact_key(&destination.ip(), destination.port()))
         else {
-            return UdpFlowToUe::NotProtected;
+            return FlowToUe::NotProtected;
         };
         entry.value().udp_flow_to_ue()
+    }
+
+    /// Where a TCP request siphon would send to `destination`, the client
+    /// port a UE's own connection comes from, must go instead: the connection
+    /// the P-CSCF opens from its protected client port to the UE's protected
+    /// server port.
+    ///
+    /// TS 24.229 clause 5.2.2.2 1A b): for TCP the IMS flow token identifies
+    /// the TCP connection "established by the P-CSCF, i.e. from the P-CSCF's
+    /// protected client port and the P-CSCF's IP address to the UE's protected
+    /// server port and the UE's IP address. This TCP connection is used to
+    /// send SIP requests from the P-CSCF to the UE and receive SIP responses
+    /// from the UE to the P-CSCF". The UE's own connection (port_uc ->
+    /// port_ps) carries the UE's requests and the P-CSCF's responses to them,
+    /// so responses never come here.
+    ///
+    /// Same key and cost as [`udp_flow_to_ue`](Self::udp_flow_to_ue).
+    pub fn tcp_flow_to_ue(&self, destination: std::net::SocketAddr) -> FlowToUe {
+        let Some(entry) = self
+            .associations
+            .get(&Self::contact_key(&destination.ip(), destination.port()))
+        else {
+            return FlowToUe::NotProtected;
+        };
+        entry.value().tcp_flow_to_ue()
     }
 
     /// Find an SA pair where the given UE address sends from either of
@@ -2905,7 +2959,7 @@ mod tests {
 
         assert_eq!(
             manager.udp_flow_to_ue(sock("198.51.100.30:6100")),
-            UdpFlowToUe::Protected {
+            FlowToUe::Protected {
                 local: sock("192.0.2.1:5064"),
                 destination: sock("198.51.100.30:6101"),
             }
@@ -2923,12 +2977,12 @@ mod tests {
 
         assert_eq!(
             manager.udp_flow_to_ue(sock("198.51.100.31:6101")),
-            UdpFlowToUe::NotProtected,
+            FlowToUe::NotProtected,
             "port_us is already where the UE listens"
         );
         assert_eq!(
             manager.udp_flow_to_ue(sock("198.51.100.32:6100")),
-            UdpFlowToUe::NotProtected,
+            FlowToUe::NotProtected,
             "no pair for this UE"
         );
     }
@@ -2945,7 +2999,7 @@ mod tests {
 
         assert_eq!(
             manager.udp_flow_to_ue(sock("198.51.100.33:6100")),
-            UdpFlowToUe::Unusable(SaProtocol::Tcp)
+            FlowToUe::Unusable(SaProtocol::Tcp)
         );
     }
 
@@ -2960,7 +3014,7 @@ mod tests {
 
         assert!(matches!(
             manager.udp_flow_to_ue(sock("198.51.100.34:6100")),
-            UdpFlowToUe::Protected { .. }
+            FlowToUe::Protected { .. }
         ));
     }
 
@@ -2977,7 +3031,7 @@ mod tests {
 
         assert_eq!(
             manager.udp_flow_to_ue(sock("198.51.100.35:6100")),
-            UdpFlowToUe::NotProtected
+            FlowToUe::NotProtected
         );
     }
 
@@ -2991,7 +3045,7 @@ mod tests {
 
         assert_eq!(
             manager.udp_flow_to_ue(sock("[2001:db8::30]:6100")),
-            UdpFlowToUe::Protected {
+            FlowToUe::Protected {
                 local: sock("[2001:db8::1]:5064"),
                 destination: sock("[2001:db8::30]:6101"),
             }

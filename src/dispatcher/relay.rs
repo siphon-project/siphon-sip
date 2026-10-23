@@ -61,6 +61,40 @@ fn captured_flow_egress(
     (destination, local)
 }
 
+/// [`crate::ipsec::runtime::protected_request`] against this dispatcher's
+/// P-CSCF manager: `None` without one, or for a destination of no pair.
+pub(super) fn protected_request(
+    destination: SocketAddr,
+    transport: Transport,
+    state: &DispatcherState,
+) -> Option<crate::ipsec::runtime::ProtectedRequest> {
+    let manager = state.ipsec_manager.as_deref()?;
+    crate::ipsec::runtime::protected_request(manager, destination, transport)
+}
+
+/// Sent-by of a request to `destination` with no flow and no egress pin: the
+/// pair's protected server port toward a UE's protected port, else the
+/// listener whose connection the send reuses, else the transport's identity.
+pub(super) fn unpinned_request_sent_by(
+    destination: SocketAddr,
+    transport: Transport,
+    state: &DispatcherState,
+) -> (String, u16) {
+    match protected_request(destination, transport, state) {
+        Some(protected) => protected_sent_by(protected.sent_by, &transport, state),
+        None => state.connection_sent_by(transport, destination),
+    }
+}
+
+/// The Via sent-by naming a P-CSCF's protected server port `server`.
+pub(super) fn protected_sent_by(
+    server: SocketAddr,
+    transport: &Transport,
+    state: &DispatcherState,
+) -> (String, u16) {
+    pinned_sent_by(server, || state.wildcard_pinned_sent_by(transport, server))
+}
+
 /// Relay a SIP request to its destination.
 ///
 /// 1. Determine target address (explicit next_hop, or Request-URI)
@@ -310,27 +344,27 @@ pub(super) fn relay_request(
     // and ordinary destinations — zero impact on the hot path when
     // no IpsecManager is wired.  Computed once here and reused for
     // Via construction and the outbound send.
-    let ipsec_source = match outbound_transport {
+    //
+    // The Via names the pair's protected server port, not the source: see
+    // `crate::ipsec::runtime::protected_request`.
+    let protected = match outbound_transport {
         Transport::Udp | Transport::Tcp => {
-            if let Some((source, sa_transport)) =
-                crate::script::api::ipsec::outbound_for(destination, outbound_transport)
-            {
-                if sa_transport != outbound_transport {
-                    debug!(
-                        %destination,
-                        from = %outbound_transport,
-                        to = %sa_transport,
-                        "IPsec: pinning outbound transport to SA protocol",
-                    );
-                    outbound_transport = sa_transport;
-                }
-                Some(source)
-            } else {
-                None
-            }
+            protected_request(destination, outbound_transport, state)
         }
         _ => None,
     };
+    if let Some(protected) = protected {
+        if protected.transport != outbound_transport {
+            debug!(
+                %destination,
+                from = %outbound_transport,
+                to = %protected.transport,
+                "IPsec: pinning outbound transport to SA protocol",
+            );
+            outbound_transport = protected.transport;
+        }
+    }
+    let ipsec_source = protected.map(|protected| protected.source);
 
     // RFC 3261 §18.1.1 — bias an over-MTU UDP request to TCP.  The length is
     // measured before our Via is added (`mtu - 200` leaves headroom for it plus
@@ -407,14 +441,12 @@ pub(super) fn relay_request(
         // it — see `flow_sent_by`.
         let (host, port) = flow_sent_by(local, state, &outbound_transport);
         (host, Some(port))
-    } else if let Some(local) = ipsec_source {
-        // IPsec auto-source: same correctness invariant as the flow
-        // path — the UE's response on SA #4 (UE → port_pc) must land
-        // on the Via we advertise, otherwise the kernel selector
-        // doesn't match and the response is silently dropped.
-        let (host, port) = pinned_sent_by(local, || {
-            state.wildcard_pinned_sent_by(&outbound_transport, local)
-        });
+    } else if let Some(protected) = protected {
+        // IPsec auto-source: the request leaves from the pair's port, but the
+        // Via names the protected server port, where the UE's response comes
+        // back (TS 24.229 clause 5.2.6.4.3 step 6, 5.2.6.4.5 step 1) — the
+        // same port the flow path names.
+        let (host, port) = protected_sent_by(protected.sent_by, &outbound_transport, state);
         (host, Some(port))
     } else if let Some(pin) = send_socket {
         // Script send_socket= egress pin: advertise the selected listener's
@@ -467,9 +499,9 @@ pub(super) fn relay_request(
     // above, so the two can never disagree about which listener this relay
     // used; the Gm port pair is the one place they are allowed to differ,
     // because a Record-Route advertises where requests *arrive* and a Via where
-    // the response comes back (see `record_route_port_for`).
+    // the response comes back (see `protected_server_port_for`).
     if adds_record_route {
-        let outbound_rr_port = crate::script::api::ipsec::record_route_port_for(
+        let outbound_rr_port = crate::script::api::ipsec::protected_server_port_for(
             via_port.unwrap_or_else(|| state.via_port(&outbound_transport)),
         );
         let egress_listener = flow_local_addr
@@ -481,7 +513,7 @@ pub(super) fn relay_request(
             });
         let (mut first, mut second) = record_route_uris(
             inbound.transport,
-            crate::script::api::ipsec::record_route_port_for(
+            crate::script::api::ipsec::protected_server_port_for(
                 state.a_leg_advertised_port(Some(inbound.local_addr), &inbound.transport),
             ),
             || state.a_leg_advertised_host(Some(inbound.local_addr), &inbound.transport),
@@ -1071,10 +1103,12 @@ pub(super) fn relay_fork_branch(
     // the send below), so the sent-by has to name *that* socket or the peer
     // answers somewhere we are not — on an IPsec-protected MT branch, to a port
     // with no SA covering it (3GPP TS 33.203 §7.4).
+    // A branch to a UE's protected port names the pair's protected server
+    // port, as `relay_request` does (TS 24.229 clause 5.2.6.4.3 step 6).
     let (via_host, via_port) = match (flow, send_socket) {
         (Some(flow), _) => flow_sent_by(flow.local_addr, state, &outbound_transport),
         (None, Some(pin)) => state.pin_sent_by(pin),
-        (None, None) => state.connection_sent_by(outbound_transport, destination),
+        (None, None) => unpinned_request_sent_by(destination, outbound_transport, state),
     };
     let branch = core::add_via(
         &mut relayed.headers,
@@ -1099,13 +1133,13 @@ pub(super) fn relay_fork_branch(
             .or_else(|| state.default_egress_listener(outbound_transport, destination));
         let (mut first, mut second) = record_route_uris(
             inbound.transport,
-            crate::script::api::ipsec::record_route_port_for(
+            crate::script::api::ipsec::protected_server_port_for(
                 state.a_leg_advertised_port(Some(inbound.local_addr), &inbound.transport),
             ),
             || state.a_leg_advertised_host(Some(inbound.local_addr), &inbound.transport),
             crosses_interfaces(inbound.local_addr, egress_listener),
             outbound_transport,
-            crate::script::api::ipsec::record_route_port_for(via_port),
+            crate::script::api::ipsec::protected_server_port_for(via_port),
             &via_host,
         );
         if siphon_record_routes {

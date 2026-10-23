@@ -344,12 +344,18 @@ impl IpsecManager {
         self.retire_now(&pair, retirement.reason).await;
     }
 
-    /// End the connections the pair carried, wait (bounded) until they are
-    /// closed, then delete it.
-    async fn retire_now(&self, pair: &SecurityAssociationPair, reason: &'static str) {
-        // A port another pair of the UE also uses (the protected server port
-        // stays across a re-registration, TS 33.203 clause 7.4.0) carries that
-        // pair's connections now.
+    /// Signal every stream connection with `pair`'s UE at one of `ports` to
+    /// close, and wait (bounded) until they have, so what they send the UE on
+    /// the way out (the FIN, a reset) still leaves in the pair. A port another
+    /// pair of the UE also uses (the protected server port stays across a
+    /// re-registration, TS 33.203 clause 7.4.0) carries that pair's
+    /// connections now and is left alone. Returns how many were signalled.
+    pub(super) async fn close_unshared_connections(
+        &self,
+        pair: &SecurityAssociationPair,
+        ports: &[u16],
+        reason: &'static str,
+    ) -> usize {
         let shared: Vec<u16> = self
             .associations
             .iter()
@@ -361,15 +367,17 @@ impl IpsecManager {
             .collect();
         let mut closed = 0;
         let mut closing = Vec::new();
-        for port in [pair.ue_port_c, pair.ue_port_s] {
-            if !shared.contains(&port) {
-                let peer = SocketAddr::new(pair.ue_addr, port);
-                closed += crate::transport::disconnect::close_peer(peer, reason);
-                closing.push(peer);
+        for port in ports {
+            if !shared.contains(port) {
+                let peer = SocketAddr::new(pair.ue_addr, *port);
+                let signalled = crate::transport::disconnect::close_peer(peer, reason);
+                if signalled > 0 {
+                    closing.push(peer);
+                }
+                closed += signalled;
             }
         }
-        // The connections close in their own tasks: wait for them, so what
-        // they send the UE on the way out (the FIN) still leaves in the pair.
+        // The connections close in their own tasks: wait for them.
         for peer in closing {
             if !crate::transport::disconnect::peer_closed_within(peer, CONNECTION_CLOSE_BOUND).await
             {
@@ -377,6 +385,15 @@ impl IpsecManager {
                     "IPsec: a connection still closing as its SA pair goes");
             }
         }
+        closed
+    }
+
+    /// End the connections the pair carried, wait (bounded) until they are
+    /// closed, then delete it.
+    async fn retire_now(&self, pair: &SecurityAssociationPair, reason: &'static str) {
+        let closed = self
+            .close_unshared_connections(pair, &[pair.ue_port_c, pair.ue_port_s], reason)
+            .await;
         if let Err(error) = self.delete_sa_pair(&pair.ue_addr, pair.ue_port_c).await {
             warn!(ue = %pair.ue_addr, ue_port_c = pair.ue_port_c, %error,
                 "IPsec: SA pair deletion failed");

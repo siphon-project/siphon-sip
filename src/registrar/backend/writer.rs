@@ -35,6 +35,14 @@ const WRITER_QUEUE_CAPACITY: usize = 16_384;
 /// which is the answer it had before the backend existed.
 const COUNT_AORS_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How often the writer task asks the backend to drop what has expired
+/// ([`RegistrarBackend::purge_expired`]).
+///
+/// Often enough that an index or table never holds more than a minute of
+/// expired AoRs beyond what any reader already filters out, rare enough to
+/// cost nothing next to the write-through traffic.
+const PURGE_INTERVAL: Duration = Duration::from_secs(60);
+
 /// Commands sent to the backend writer task.
 pub(super) enum BackendCommand {
     Save {
@@ -279,7 +287,30 @@ async fn backend_writer_loop<B: RegistrarBackend>(
     backend: B,
     mut rx: tokio::sync::mpsc::Receiver<BackendCommand>,
 ) {
-    while let Some(command) = rx.recv().await {
+    let mut purge =
+        tokio::time::interval_at(tokio::time::Instant::now() + PURGE_INTERVAL, PURGE_INTERVAL);
+    purge.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        // On the same task as the writes, so a purge never races one: the
+        // backend sees each AoR's operations in the order they were issued.
+        let command = tokio::select! {
+            command = rx.recv() => match command {
+                Some(command) => command,
+                None => break,
+            },
+            _ = purge.tick() => {
+                match backend.purge_expired().await {
+                    Ok(purged) if purged > 0 => {
+                        tracing::debug!(purged, "registrar backend dropped expired entries");
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::warn!(%error, "registrar backend purge of expired entries failed");
+                    }
+                }
+                continue;
+            }
+        };
         match command {
             BackendCommand::Save { aor, contacts } => {
                 if let Err(error) = backend.save(&aor, &contacts).await {
@@ -310,7 +341,7 @@ async fn backend_writer_loop<B: RegistrarBackend>(
                         .registrar_count_aors_queue_wait_seconds
                         .observe(queued_at.elapsed().as_secs_f64());
                 }
-                let result = backend.all_aors().await.map(|aors| aors.len());
+                let result = backend.count_aors().await;
                 let _ = reply.send(result);
             }
         }
@@ -411,5 +442,74 @@ mod tests {
         let writer = spawn_backend_writer(backend);
 
         assert_eq!(writer.count_aors().await.expect("count"), 2);
+    }
+
+    /// A backend whose count differs from the length of its list (empty), and
+    /// which counts the purges the writer runs.
+    #[derive(Debug, Default)]
+    struct Probe {
+        purged: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl RegistrarBackend for Probe {
+        async fn save(&self, _: &str, _: &[StoredContact]) -> Result<(), BackendError> {
+            Ok(())
+        }
+        async fn load(&self, _: &str) -> Result<Vec<StoredContact>, BackendError> {
+            Ok(Vec::new())
+        }
+        async fn remove(&self, _: &str) -> Result<(), BackendError> {
+            Ok(())
+        }
+        async fn exists(&self, _: &str) -> Result<bool, BackendError> {
+            Ok(false)
+        }
+        async fn all_aors(&self) -> Result<Vec<String>, BackendError> {
+            Ok(Vec::new())
+        }
+        async fn save_aor_state(&self, _: &str, _: &StoredAorState) -> Result<(), BackendError> {
+            Ok(())
+        }
+        async fn load_aor_state(&self, _: &str) -> Result<Option<StoredAorState>, BackendError> {
+            Ok(None)
+        }
+        async fn remove_aor_state(&self, _: &str) -> Result<(), BackendError> {
+            Ok(())
+        }
+        async fn all_aor_state_aors(&self) -> Result<Vec<String>, BackendError> {
+            Ok(Vec::new())
+        }
+        async fn count_aors(&self) -> Result<usize, BackendError> {
+            Ok(42)
+        }
+        async fn purge_expired(&self) -> Result<usize, BackendError> {
+            self.purged
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(0)
+        }
+    }
+
+    /// The count comes from the backend's own `count_aors`, not from listing
+    /// every AoR: listing is the keyspace walk an index exists to avoid.
+    #[tokio::test]
+    async fn count_aors_asks_the_backend_for_its_count_not_its_list() {
+        let writer = spawn_backend_writer(Probe::default());
+        assert_eq!(writer.count_aors().await.expect("count"), 42);
+    }
+
+    /// The writer purges on its own, every interval, so expired entries go
+    /// even when nothing ever asks for the count.
+    #[tokio::test(start_paused = true)]
+    async fn the_writer_purges_expired_entries_every_interval() {
+        let purged = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let probe = Probe {
+            purged: std::sync::Arc::clone(&purged),
+        };
+        let _writer = spawn_backend_writer(probe);
+
+        tokio::time::sleep(PURGE_INTERVAL / 2).await;
+        assert_eq!(purged.load(std::sync::atomic::Ordering::SeqCst), 0);
+        tokio::time::sleep(PURGE_INTERVAL * 3).await;
+        assert_eq!(purged.load(std::sync::atomic::Ordering::SeqCst), 3);
     }
 }

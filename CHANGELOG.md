@@ -27,6 +27,29 @@ entry, but a working config keeps working.
   that cannot suspend run exactly as before. A timed-out coroutine is
   cancelled, its call fails as before, and it no longer counts in
   `siphon_async_coroutines_pending`.
+- **IMS AKA over TCP: P-CSCF requests go on the P-CSCF's own connection.**
+  A request the P-CSCF sent a UE over TCP (an MT request relayed with
+  `flow=`, an in-dialog request on a leg, a NOTIFY, the registrar-liveness
+  OPTIONS) went on the UE's own connection, from the UE's protected client
+  port to the P-CSCF's protected server port. TS 24.229 clause 5.2.2.2 1A b)
+  has the P-CSCF send its requests on a connection it establishes from its
+  protected client port to the UE's protected server port, and read the UE's
+  responses off it. Such a request now goes there: the outbound pool opens
+  that connection bound to the protected client port (shared by every UE),
+  reuses it for the next request, and feeds the responses into the normal
+  inbound path. Responses to the UE's own requests stay on the UE's
+  connection. The connection is closed when the UE's SA pair is deleted,
+  including by the liveness reaper and the expiry sweep, unless a newer pair
+  of the UE shares the protected server port.
+
+- **IMS AKA: the Via of a P-CSCF request names the protected server port.**
+  A request the P-CSCF routed by a UE's Contact to its protected server port,
+  with no captured flow, put the P-CSCF's protected client port in its Via
+  sent-by (a fork branch or B2BUA leg the default listener's), so over UDP the
+  UE's response went to a port no SA covers. TS 24.229 clauses 5.2.6.4.3 and
+  5.2.6.4.5 have the Via name the protected server port of the SA, as the
+  flow path already did.
+
 - **Security, P-CSCF: a binding restored without its IPsec SAs is no longer
   live.** After a restart the registrar bindings came back from the backend,
   but the security associations had died with the old process. A restored
@@ -49,7 +72,7 @@ entry, but a working config keeps working.
   port (TS 33.203 clause 7.1, UDP case), as responses already did. Such a
   request, and one routed by address to a UE's protected client port, now
   takes that flow; its Via still names the protected server port, where the
-  UE's response arrives. TCP is unchanged.
+  UE's response arrives.
 
 - **P-CSCF: a re-authentication challenge is sent over the existing SA set.**
   The set `ipsec.allocate()` installs for a 401 replaced the kernel's outbound
@@ -204,6 +227,40 @@ entry, but a working config keeps working.
 
 ### Fixed
 
+- **Every Redis key the registrar and the iFC store write now has a TTL.** The
+  auxiliary-state key (`{key_prefix}state:{aor}`) was a plain SET and outlived
+  the binding it described for good, because the registrar's expiry sweep
+  leaves the backend alone and lets the binding hash expire by itself. It now
+  takes the binding hash's TTL when written and on every save of the binding
+  (`max_expires` + `ttl_slack_secs` when written before any binding). iFC
+  profile keys get `max_expires` + `ttl_slack_secs`, renewed by every
+  `isc.store_profile()`, and the iFC restore walks the prefix with a cursor
+  `SCAN` instead of `KEYS`. A save whose contacts have all expired removes the
+  AoR rather than writing a hash with no TTL. With `backend: postgres` the
+  writer task now purges expired contact rows and orphaned state rows once a
+  minute, and a save deletes the contacts no longer in the AoR's set (it only
+  upserted, so a removed contact was restored and counted until it expired).
+  New Rust API: `ifc::spawn_ifc_backend_writer_with_ttl`, and
+  `with_max_binding_lifetime` on both backends.
+- **`registrar.aor_count()` no longer scans the keyspace.** The Redis backend
+  keeps an AoR index (`{key_prefix}index`, a sorted set scored by the epoch
+  second the AoR's last contact expires), updated in the same transaction as
+  the binding hash on every save and removal, including a contact removed on
+  its own. The count drops the members that have expired and reads the rest,
+  so it stays exact across nodes and restarts without keyspace expiry events,
+  and `all_aors` (the boot-time restore) reads the same index. A node that
+  finds no index at connect builds it once from the binding hashes, so the
+  first boot after an upgrade restores every binding. `RegistrarBackend`
+  gains `count_aors` and `purge_expired`, both with defaults.
+- **A timer run the Python executor shed is no longer logged as "timer
+  callback panicked".** `timer_loop` logged every failure from the executor
+  that way, so a saturated pool skipping a timer read as a crash, and what the
+  timer maintains went stale with nothing saying why. It now logs `timer
+  callback shed` (the run was skipped), `not run` (the pool is shutting down),
+  `lost` (the worker went away) or `panicked` with the panic's message at
+  `error`, and counts shed runs in `siphon_timer_jobs_shed_total{timer}`. A
+  Python exception is still logged as `timer callback error`. New
+  `py_executor::try_run_classified` says why a job produced no value.
 - **A cancelled call is reported on Rf, once, with Cause-Code 487.** When the
   caller CANCELled a proxied INVITE, the proxy answered `487` itself and
   absorbed the `487` the branch drew back, so no ACR was sent at all: TS 32.260
