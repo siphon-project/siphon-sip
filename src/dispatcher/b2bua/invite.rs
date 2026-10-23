@@ -629,7 +629,7 @@ pub fn handle_b2bua_invite(inbound: InboundMessage, message: SipMessage, state: 
         a_leg.last_sdp = Some(message.body.clone());
     }
 
-    let call_id = state.call_actors.create_call(a_leg);
+    let call_id = create_b2bua_call(state, a_leg);
 
     // Create the event channel for B-leg actors → dispatcher.
     // All B-leg actors for this call share the same sender.
