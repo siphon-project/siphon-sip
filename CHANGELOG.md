@@ -15,6 +15,14 @@ entry, but a working config keeps working.
 
 ### Fixed
 
+- **Outbound registrations wait out a provisional answer.** A 1xx to a
+  REGISTER was handled as the final answer and failed the registration with
+  status 100. A siphon P-CSCF sends 100 Trying to an unanswered REGISTER after
+  3.5 s over UDP (RFC 4320), so a refresh the S-CSCF answered slowly failed,
+  the UE dropped its SA set and re-registered unprotected, drawing a new
+  challenge. A provisional now leaves the REGISTER in flight (RFC 3261
+  17.1.2.2) and Timer F still bounds it.
+
 - **Outbound registrations ask for their own `interval`.** Every REGISTER, the
   first, the authenticated answer to a 401 and each refresh, carried the
   manager's `default_interval` in `Expires`, so an entry's `interval` (YAML or

@@ -30,6 +30,17 @@ pub(super) fn handle_registrant_response(
     branch: &str,
     state: &DispatcherState,
 ) {
+    // A provisional only moves the client transaction to Proceeding (RFC 3261
+    // 17.1.2.2); the REGISTER is still in flight and Timer F still bounds it.
+    // A P-CSCF emits a 100 Trying once Timer E reaches T2 (RFC 4320 4.2), and
+    // reading that as the outcome failed the refresh and dropped its SA set.
+    if status_code < 200 {
+        debug!(
+            status_code,
+            "registrant: provisional answer, REGISTER still in flight"
+        );
+        return;
+    }
     handle_answer(registrant, message, status_code, branch, state);
     // The SA sets the answer superseded, abandoned or finished with.
     if let Some(ipsec) = state.ipsec_manager.as_ref() {

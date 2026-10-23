@@ -632,3 +632,40 @@ async fn sa_sets_drain_to_one_per_entry_across_500_challenge_cycles() {
     assert_eq!(harness.registrant.tracked_sa_sets(), 0);
     assert_eq!(harness.ipsec.test_kernel_live_count(), 0);
 }
+
+/// A provisional answer to a protected refresh is not its outcome (RFC 3261
+/// 17.1.2.2: Trying -> Proceeding, the transaction waits for the final
+/// response). A P-CSCF whose server transaction emits a 100 Trying once Timer
+/// E reaches T2 (RFC 4320 4.2, 3.5 s over UDP) used to fail the refresh with
+/// status 100, which dropped the established set and sent the next REGISTER
+/// unprotected, drawing a fresh challenge.
+#[tokio::test]
+async fn a_100_trying_to_a_protected_refresh_does_not_fail_it() {
+    let mut harness = Harness::new();
+    harness.add(1, UE_ADDR);
+    harness.register_initially(1, UE_ADDR).await;
+
+    let built = harness.register(&impu(1));
+    assert!(built.protected);
+    let call_id = harness.call_id(&built);
+    harness.answer("100 Trying", &call_id, "");
+    assert_eq!(
+        harness.registrant.state(&impu(1)),
+        Some(RegistrantState::Registering),
+        "a provisional leaves the refresh in flight"
+    );
+    assert!(
+        test_support::sa_sets(&harness.registrant, &impu(1))
+            .established
+            .is_some(),
+        "the established set survives the provisional"
+    );
+
+    harness.answer("200 OK", &call_id, "Expires: 600\r\n");
+    assert_eq!(
+        harness.registrant.state(&impu(1)),
+        Some(RegistrantState::Registered)
+    );
+    let next = harness.register(&impu(1));
+    assert!(next.protected, "the next refresh still rides the SA set");
+}
