@@ -285,10 +285,19 @@ Its result is unchanged: the coroutine timeout still fails the request with a
 `stop_propagation()` called after an await still stops the handlers after it.
 `siphon_async_coroutines_pending` counts the awaiting coroutines.
 
+The same holds for the Diameter server handlers (`@diameter.on_request`,
+`@diameter.on_reply`, `@diameter.on_request_completed`) and for every handler a
+host extension calls through `ScriptHandle::call_handler` (the handlers an
+add-on registers under its own kind: HTTP routes, GTP-C messages, peer
+events). An awaiting one gives its worker back; the stage it belongs to
+continues as a new job once the coroutine settles, and on the coroutine timeout
+it is cancelled and fails as before (5012 for `on_request`, `TimeoutError` from
+`call_handler`).
+
 The other handler kinds (`@proxy.on_reply` / `on_failure` callbacks, B2BUA
-handlers, Diameter, timers, SBI callbacks, RTPEngine events) still hold their
-worker until the coroutine settles, so for them the `max_rate` formula above
-applies to the await as well.
+handlers, `@diameter.on_inbound_cer`, built-in timers, SBI callbacks, RTPEngine
+events) still hold their worker until the coroutine settles, so for them the
+`max_rate` formula above applies to the await as well.
 
 ## Backpressure & liveness guarantees
 

@@ -15,6 +15,19 @@ entry, but a working config keeps working.
 
 ### Fixed
 
+- **Async Diameter server handlers and extension handlers no longer hold a
+  Python executor worker while they await.** `@diameter.on_request`,
+  `@diameter.on_reply`, `@diameter.on_request_completed` and every handler a
+  host extension calls through `ScriptHandle::call_handler` blocked a worker
+  until the coroutine settled, so a node could have at most as many of them in
+  flight as the executor has threads, and with a memory-sized executor a few
+  slow backends starved every other handler. The worker now only starts the
+  coroutine; it is awaited off the executor with nothing attached, and the
+  stage continues as a new job once it settles. Sync handlers and coroutines
+  that cannot suspend run exactly as before. A timed-out coroutine is
+  cancelled, its call fails as before, and it no longer counts in
+  `siphon_async_coroutines_pending`.
+
 - **P-CSCF: a re-authentication challenge is sent over the existing SA set.**
   The set `ipsec.allocate()` installs for a 401 replaced the kernel's outbound
   policy of the selector it shares with the UE's set in use (the P-CSCF's

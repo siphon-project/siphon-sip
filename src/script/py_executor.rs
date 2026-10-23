@@ -922,6 +922,29 @@ where
     sender.send_async(job).await.is_ok()
 }
 
+/// [`spawn_queued`], awaiting `f`'s result — for work that continues a job the
+/// pool already accepted and whose caller needs the outcome. Never shed: it
+/// waits for queue room. `Err` carries a panic in `f`, or a pool that shut
+/// down before running it.
+pub async fn run_queued<T, F>(f: F) -> std::thread::Result<T>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let (sender, receiver) = oneshot::channel();
+    let queued = spawn_queued(move || {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        let _ = sender.send(result);
+    })
+    .await;
+    if !queued {
+        return Err(boxed_message("Python executor channel closed"));
+    }
+    receiver
+        .await
+        .unwrap_or_else(|_| Err(boxed_message("Python executor worker dropped")))
+}
+
 /// Run `f` on a pool thread and await its result — the async analogue of
 /// `tokio::task::spawn_blocking(f).await.unwrap()`. A panic inside `f`
 /// propagates to the caller via `resume_unwind`, matching `spawn_blocking`.
