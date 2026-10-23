@@ -2927,6 +2927,7 @@ mod tests {
             source_addr: source.parse().expect("test source addr"),
             local_addr: local.parse().expect("test local addr"),
             connection_id,
+            kind: super::super::registrar::FlowKind::Inbound,
         }
     }
 

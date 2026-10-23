@@ -353,6 +353,7 @@ async fn a_silent_branch_on_a_reliable_transport_ends_at_timer_b_without_a_cance
         source_addr: socket(STREAM_CARRIER),
         local_addr: socket("192.0.2.1:5060"),
         connection_id: 73,
+        kind: crate::script::api::registrar::FlowKind::Inbound,
     };
     for (target, next_hop, flow) in [
         (

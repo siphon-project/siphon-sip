@@ -13,6 +13,17 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`call.dial(flow=registration.flow(impu), route=...)` keeps the flow.** A
+  route set used to replace any flow, so a UE's MO INVITE was resolved from its
+  topmost Route and left from the process listener, outside the SA (or failed
+  when the S-CSCF name did not resolve from the UE side). A registrant flow is
+  now siphon's own flow to its first hop: the INVITE leaves over it and the
+  route set goes on the wire as Route headers (RFC 5626 §4.3, TS 24.229
+  §5.1.2A.1.1). A callee's flow still yields to a Path route set (RFC 3327
+  §5.3). Rust library: `PyFlow` gains a `kind: FlowKind` field.
+
 ## [1.15.2] — 2026-10-22
 
 ### Added

@@ -207,8 +207,10 @@ def on_invite(call):
         call.reject(484, "Address Incomplete")
         return
     target = f"sip:{dialled}@{HOME}"
-    route = registration.service_route(impu)
-    log.info(f"[{call.id}] MO {impu} -> {target} (service-route entries: {len(route)})")
+    # A UE's route set: the P-CSCF's protected URI, then the Service-Route
+    # (TS 24.229 5.1.2A.1.1). It rides the SA flow as Route headers.
+    route = [f"<sip:{flow.remote_addr};lr>"] + registration.service_route(impu)
+    log.info(f"[{call.id}] MO {impu} -> {target} (route entries: {len(route)})")
     call.set_header("P-Preferred-Identity", f"<{impu}>")
     call.dial(
         target,

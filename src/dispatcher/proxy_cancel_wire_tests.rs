@@ -69,6 +69,7 @@ fn relayed_from_the_pinned_listener(
         source_addr: SILENT.parse().expect("a literal address"),
         local_addr: pinned_addr,
         connection_id: FLOW_CONNECTION,
+        kind: crate::script::api::registrar::FlowKind::Inbound,
     };
     let target = format!("sip:callee@{SILENT}");
     let (next_hop, flow, send_socket) = match pinned {

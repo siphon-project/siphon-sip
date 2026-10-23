@@ -909,7 +909,9 @@ Rules and fall-backs:
   you catch typos in tests).
 - A **well-formed but unknown** socket (no such listener) is logged and the
   request falls back to default routing — it is never dropped.
-- Ignored when a captured **`flow=`** is set (the flow already pins egress), and
+- Ignored when a captured **`flow=`** is set (the flow already pins egress; a
+  per-UE SA socket is reached with `flow=registration.flow(impu)`, which keeps
+  a `route=` set as Route headers), and
   when its **transport doesn't match** the routed transport (logged).
 - WS/WSS callees can't be dialed (client-initiated); reach them with `flow=`, not
   `send_socket`.

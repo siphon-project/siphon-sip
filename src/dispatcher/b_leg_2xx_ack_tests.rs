@@ -821,6 +821,7 @@ async fn a_stream_flow_dial_advertises_the_public_listener_and_keeps_its_connect
             source_addr: "198.51.100.20:42000".parse().unwrap(),
             local_addr: "192.0.2.10:5061".parse().unwrap(),
             connection_id: 73,
+            kind: crate::script::api::registrar::FlowKind::Inbound,
         };
         assert!(b2bua_send_b_leg_invite(
             &call_id,
@@ -866,6 +867,91 @@ async fn a_stream_flow_dial_advertises_the_public_listener_and_keeps_its_connect
             .contains(" 203.0.113.10:5061;"));
         assert_eq!(bye.headers.get("Contact"), invite.headers.get("Contact"));
     }
+}
+
+/// A UA-side MO dial: `call.dial(flow=registration.flow(impu),
+/// route=[<P-CSCF protected URI>] + registration.service_route(impu))`. The
+/// INVITE leaves over the SA (sourced from the UE's protected client port, to
+/// the P-CSCF's protected server port) and carries the whole route set as Route
+/// headers, in order (RFC 5626 §4.3, TS 24.229 §5.1.2A.1.1). Neither Route host
+/// resolves, so a route set that took the flow's place would fail the dial.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_registrant_flow_dial_rides_the_sa_and_carries_its_route_set() {
+    let route = vec![
+        "<sip:pcscf.invalid:5066;lr>".to_string(),
+        "<sip:orig@scscf.invalid;lr>".to_string(),
+    ];
+    let flow = crate::script::api::registrar::PyFlow {
+        transport: "udp".to_string(),
+        source_addr: "192.0.2.50:5066".parse().unwrap(),
+        local_addr: "192.0.2.10:6100".parse().unwrap(),
+        connection_id: 0,
+        kind: crate::script::api::registrar::FlowKind::Outbound,
+    };
+    let dial = |flow: &crate::script::api::registrar::PyFlow| {
+        let (state, udp, call_id) = Call::caller_on(test_dispatcher());
+        let dialled = b2bua_send_b_leg_invite(
+            &call_id,
+            "sip:+15550100@ims.example.net",
+            None,
+            Some(flow),
+            &route,
+            None,
+            None,
+            &caller_invite(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            &state,
+        );
+        (dialled, udp)
+    };
+
+    let (dialled, udp) = dial(&flow);
+    assert!(dialled, "the registrant flow is the B-leg's destination");
+    let sent = udp.try_recv().expect("the INVITE went out");
+    assert_eq!(
+        sent.destination, flow.source_addr,
+        "to the P-CSCF's protected server port"
+    );
+    assert_eq!(
+        sent.source_local_addr,
+        Some(flow.local_addr),
+        "from the UE's protected client port"
+    );
+    let invite = parse_sip_message_bytes(&sent.data).unwrap();
+    assert_eq!(
+        invite.headers.get_all("Route").cloned().unwrap_or_default(),
+        route,
+        "the whole route set, in order"
+    );
+    assert!(invite
+        .headers
+        .get("Via")
+        .unwrap()
+        .contains(" 192.0.2.10:6100;"));
+    assert_eq!(
+        invite.request_uri().map(|uri| uri.to_string()).as_deref(),
+        Some("sip:+15550100@ims.example.net"),
+        "the route set does not touch the Request-URI"
+    );
+
+    // Control: the same route set with a callee's inbound flow is a Path, which
+    // replaces the flow (RFC 3327 §5.3), and its topmost Route resolves nowhere.
+    let inbound = crate::script::api::registrar::PyFlow {
+        kind: crate::script::api::registrar::FlowKind::Inbound,
+        ..flow.clone()
+    };
+    let (dialled, udp) = dial(&inbound);
+    assert!(!dialled, "a Path route set still outranks an inbound flow");
+    assert!(udp.try_recv().is_err());
 }
 
 #[test]

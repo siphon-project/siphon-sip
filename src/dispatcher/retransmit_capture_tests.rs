@@ -219,6 +219,7 @@ async fn a_request_relayed_over_a_captured_flow_is_captured() {
         source_addr: address("198.51.100.77:5060"),
         local_addr: address(SIPHON),
         connection_id: 0,
+        kind: crate::script::api::registrar::FlowKind::Inbound,
     };
     relay_request(
         &message,

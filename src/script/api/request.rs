@@ -1847,6 +1847,7 @@ impl PyRequest {
             source_addr,
             local_addr,
             connection_id,
+            kind: crate::script::api::registrar::FlowKind::Inbound,
         })
     }
 
@@ -2580,6 +2581,7 @@ mod tests {
             source_addr: "10.0.0.1:50000".parse().unwrap(),
             local_addr: "127.0.0.1:5066".parse().unwrap(),
             connection_id: 0xabcdef,
+            kind: crate::script::api::registrar::FlowKind::Inbound,
         };
         request
             .relay(None, None, None, Some(flow.clone()), None, None)
@@ -2608,6 +2610,7 @@ mod tests {
             source_addr: "10.0.0.1:50000".parse().unwrap(),
             local_addr: "127.0.0.1:5066".parse().unwrap(),
             connection_id: 7,
+            kind: crate::script::api::registrar::FlowKind::Inbound,
         };
         request
             .relay(
