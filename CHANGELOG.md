@@ -13,6 +13,100 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
+## [1.15.3] — 2026-10-23
+
+### Added
+
+- **A rate-limit ban is no longer silent.** `security.rate_limit` used to drop
+  every request from a banned source with one `debug` line per request and
+  nothing when the ban went in, so a peer that went over the limit (the core
+  behind a P-CSCF, a trunk) just went quiet for the length of the ban. The
+  ban now logs one `WARN` when it goes in (source, requests in the window,
+  `max_requests`, `window_secs`, ban length) and one `INFO` when it ends, both
+  capped at 20 a minute with the rest counted. `GET /admin/rate-limit/bans`
+  lists the banned sources with the seconds left, and the
+  `siphon_rate_limit_banned_sources` gauge and `siphon_rate_limit_bans_total`
+  counter track them. `/admin/metrics.json` carries
+  `security.rate_limit_banned_sources` (`null` when the limit is off). Dropped
+  requests stay silent per request, and `siphon_rate_limited_total` is
+  unchanged. It has no per-source label, because the sources are whatever
+  addresses a scanner sends from.
+
+- **`rtpengine.delete_call(call_id, from_tag=None)`.** Frees a call's media by
+  Call-ID alone, for a call that ends outside any SIP transaction (an Rx
+  Abort-Session, an N5 termination notify, a periodic sweep). Before this the
+  media stayed anchored until the engine's own timeout. A call siphon anchored
+  is deleted with its own engine call-id and From-tag; otherwise the whole call
+  goes by id. Returns `False` when the engine no longer held it.
+
+- **`registrar.remove_contact(aor, contact)`.** Removes one binding of a
+  multi-contact AoR, for a reg-event NOTIFY or Cx RTR that terminates one
+  contact, where `registrar.remove()` drops them all. Works for `save()` and
+  `save_proxy()` bindings.
+
+- **X2 keepalives on an idle connection (TS 103 221-2 clause 5.2.2).** A
+  delivery connection that has carried nothing for
+  `lawful_intercept.x2.keepalive_secs` (default 30, `0` disables) gets a
+  keepalive PDU, so the mediation function has a liveness signal on a quiet
+  interface. The MDF's KeepaliveAck PDUs are read and discarded so they cannot
+  fill the socket. A peer found closed or failing at the tick is dropped there,
+  and the next IRI record reconnects at once rather than being written into the
+  dead connection. The sequence number now also restarts on every new
+  connection, not only on a record's reconnect.
+
+- **Send-queue metrics:** `siphon_stream_send_queue_bytes{transport}`,
+  `siphon_stream_send_queue_refused_total{transport}`,
+  `siphon_stream_stalled_closes_total{transport}` and
+  `siphon_stream_send_queue_discarded_total{transport}`.
+
+### Changed
+
+- **`Cause-Code` follows TS 32.299 V18.0.0 clause 7.2.35.** Failures are the
+  SIP status itself, positive (486, 487, 408), where siphon sent the negated
+  pre-Release 8 form (-486); a 3xx is -3xx and a normal end 0, as before. This
+  covers the automatic Rf EVENT and STOP, the B2BUA records, and Ro
+  CCR-TERMINATION (out of credit is 402, the lifetime backstop 408). The
+  registrar's ACR-EVENTs send -1 (Successful transaction) for a registration
+  or refresh and -3 (End of REGISTER dialog) for a deregistration or expiry,
+  replacing 0, -200 and -487. A CDF or rating rule matching the negative
+  values must be updated.
+
+- **A UE sends MESSAGE and SUBSCRIBE over its own SA.** `proxy.send_request()`
+  and `proxy.subscribe_state.send()` take `flow=` and `route=`. With
+  `flow=registration.flow(impu)` the request leaves from the UE's protected
+  client port to the P-CSCF's protected server port, its Via (and a
+  SUBSCRIBE's Contact) names the UE's protected server port, and the route set
+  goes out as Route headers in order (TS 24.229 §5.1.2A.1.1, TS 33.203 §7.1).
+  A subscription made that way sends its refreshes and its unsubscribe over
+  the SA set the registration holds when each is sent, and raises when it has
+  none. `send_request` treats a callee's flow as `call.dial` does;
+  `subscribe_state.send` refuses one. Rust library: `FlowKind::Outbound` now
+  carries a `RegistrantFlow`, and `SubscribeDialog` gains `registrant_flow`.
+
+- **Rust API:** the connection maps the transport listeners and
+  `ConnectionPool` take are `DashMap<ConnectionId, transport::send_queue::SendQueue>`
+  instead of `DashMap<ConnectionId, mpsc::Sender<Bytes>>`.
+
+- **Per-contact removal reached the backend and drained the IMS state.** The
+  removal behind the NAT keepalive and registrar liveness checks dropped the
+  binding in memory only, so a Redis or Postgres backend brought it back on the
+  next restart, and removing an AoR's last binding left its Service-Route,
+  P-Asserted-Identity, P-Associated-URI and aliases behind for good. It now
+  goes through the same teardown as a REGISTER with `expires=0`, and never
+  removes an AS capability record.
+
+- **Per-call media scope: `scope=` on `rtpengine.offer`, `answer` and
+  `delete`.** A proxy that anchors both the originating and the terminating
+  leg of one call sees both under one Call-ID (RFC 3261 §16.6), so the second
+  offer used to land on the first leg's engine call. Naming a scope per leg
+  makes each leg an engine call of its own, with its own profile, address
+  family and ports: siphon-rtp carries the scope in the frame in place of the
+  node's `media.siphon_rtp.scope`, rtpengine and rtpproxy key the leg as
+  `<call-id>;<scope>`. A re-offer and an answer reuse their own leg's session;
+  `delete(request)` and `rtpengine.delete_call(call_id)` without a scope end every leg of the Call-ID, each under the scope it was offered under; `delete_call(..., scope=)` ends one. Without
+  `scope=` every frame is unchanged. Validated like the node scope; refused on
+  a B2BUA call, whose legs have Call-IDs of their own.
+
 ### Fixed
 
 - **Async Diameter server handlers and extension handlers no longer hold a
@@ -62,6 +156,7 @@ entry, but a working config keeps working.
   in `siphon_ipsec_unprotected_sends_refused_total`. The UE recovers with an
   initial registration (TS 24.229 clause 5.1.1.4.1). SA material is still
   never persisted.
+
 - **IMS AKA over UDP: P-CSCF requests go to the UE's protected server port.**
   A request the P-CSCF sent over a UE's captured flow (an MT request relayed
   with `flow=`, an in-dialog request on that flow, the registrar-liveness
@@ -164,68 +259,6 @@ entry, but a working config keeps working.
   of the UE's own sets (both ends), of pairs the IPsec manager owns, and of
   kernel states present at start, so a restart never offers an SPI a previous
   process left in the kernel (TS 33.203 7.1).
-### Added
-
-- **A rate-limit ban is no longer silent.** `security.rate_limit` used to drop
-  every request from a banned source with one `debug` line per request and
-  nothing when the ban went in, so a peer that went over the limit (the core
-  behind a P-CSCF, a trunk) just went quiet for the length of the ban. The
-  ban now logs one `WARN` when it goes in (source, requests in the window,
-  `max_requests`, `window_secs`, ban length) and one `INFO` when it ends, both
-  capped at 20 a minute with the rest counted. `GET /admin/rate-limit/bans`
-  lists the banned sources with the seconds left, and the
-  `siphon_rate_limit_banned_sources` gauge and `siphon_rate_limit_bans_total`
-  counter track them. `/admin/metrics.json` carries
-  `security.rate_limit_banned_sources` (`null` when the limit is off). Dropped
-  requests stay silent per request, and `siphon_rate_limited_total` is
-  unchanged. It has no per-source label, because the sources are whatever
-  addresses a scanner sends from.
-- **`rtpengine.delete_call(call_id, from_tag=None)`.** Frees a call's media by
-  Call-ID alone, for a call that ends outside any SIP transaction (an Rx
-  Abort-Session, an N5 termination notify, a periodic sweep). Before this the
-  media stayed anchored until the engine's own timeout. A call siphon anchored
-  is deleted with its own engine call-id and From-tag; otherwise the whole call
-  goes by id. Returns `False` when the engine no longer held it.
-
-- **`registrar.remove_contact(aor, contact)`.** Removes one binding of a
-  multi-contact AoR, for a reg-event NOTIFY or Cx RTR that terminates one
-  contact, where `registrar.remove()` drops them all. Works for `save()` and
-  `save_proxy()` bindings.
-
-- **X2 keepalives on an idle connection (TS 103 221-2 clause 5.2.2).** A
-  delivery connection that has carried nothing for
-  `lawful_intercept.x2.keepalive_secs` (default 30, `0` disables) gets a
-  keepalive PDU, so the mediation function has a liveness signal on a quiet
-  interface. The MDF's KeepaliveAck PDUs are read and discarded so they cannot
-  fill the socket. A peer found closed or failing at the tick is dropped there,
-  and the next IRI record reconnects at once rather than being written into the
-  dead connection. The sequence number now also restarts on every new
-  connection, not only on a record's reconnect.
-### Changed
-
-- **`Cause-Code` follows TS 32.299 V18.0.0 clause 7.2.35.** Failures are the
-  SIP status itself, positive (486, 487, 408), where siphon sent the negated
-  pre-Release 8 form (-486); a 3xx is -3xx and a normal end 0, as before. This
-  covers the automatic Rf EVENT and STOP, the B2BUA records, and Ro
-  CCR-TERMINATION (out of credit is 402, the lifetime backstop 408). The
-  registrar's ACR-EVENTs send -1 (Successful transaction) for a registration
-  or refresh and -3 (End of REGISTER dialog) for a deregistration or expiry,
-  replacing 0, -200 and -487. A CDF or rating rule matching the negative
-  values must be updated.
-
-- **A UE sends MESSAGE and SUBSCRIBE over its own SA.** `proxy.send_request()`
-  and `proxy.subscribe_state.send()` take `flow=` and `route=`. With
-  `flow=registration.flow(impu)` the request leaves from the UE's protected
-  client port to the P-CSCF's protected server port, its Via (and a
-  SUBSCRIBE's Contact) names the UE's protected server port, and the route set
-  goes out as Route headers in order (TS 24.229 §5.1.2A.1.1, TS 33.203 §7.1).
-  A subscription made that way sends its refreshes and its unsubscribe over
-  the SA set the registration holds when each is sent, and raises when it has
-  none. `send_request` treats a callee's flow as `call.dial` does;
-  `subscribe_state.send` refuses one. Rust library: `FlowKind::Outbound` now
-  carries a `RegistrantFlow`, and `SubscribeDialog` gains `registrant_flow`.
-
-### Fixed
 
 - **Every Redis key the registrar and the iFC store write now has a TTL.** The
   auxiliary-state key (`{key_prefix}state:{aor}`) was a plain SET and outlived
@@ -242,6 +275,7 @@ entry, but a working config keeps working.
   upserted, so a removed contact was restored and counted until it expired).
   New Rust API: `ifc::spawn_ifc_backend_writer_with_ttl`, and
   `with_max_binding_lifetime` on both backends.
+
 - **`registrar.aor_count()` no longer scans the keyspace.** The Redis backend
   keeps an AoR index (`{key_prefix}index`, a sorted set scored by the epoch
   second the AoR's last contact expires), updated in the same transaction as
@@ -252,6 +286,7 @@ entry, but a working config keeps working.
   finds no index at connect builds it once from the binding hashes, so the
   first boot after an upgrade restores every binding. `RegistrarBackend`
   gains `count_aors` and `purge_expired`, both with defaults.
+
 - **A timer run the Python executor shed is no longer logged as "timer
   callback panicked".** `timer_loop` logged every failure from the executor
   that way, so a saturated pool skipping a timer read as a crash, and what the
@@ -261,6 +296,7 @@ entry, but a working config keeps working.
   `error`, and counts shed runs in `siphon_timer_jobs_shed_total{timer}`. A
   Python exception is still logged as `timer callback error`. New
   `py_executor::try_run_classified` says why a job produced no value.
+
 - **A cancelled call is reported on Rf, once, with Cause-Code 487.** When the
   caller CANCELled a proxied INVITE, the proxy answered `487` itself and
   absorbed the `487` the branch drew back, so no ACR was sent at all: TS 32.260
@@ -311,6 +347,7 @@ entry, but a working config keeps working.
   route set goes on the wire as Route headers (RFC 5626 §4.3, TS 24.229
   §5.1.2A.1.1). A callee's flow still yields to a Path route set (RFC 3327
   §5.3). Rust library: `PyFlow` gains a `kind: FlowKind` field.
+
 - **Lawful intercept: one Correlation ID per B2BUA call, not per leg.** X2 and
   X3 correlation was derived from the SIP Call-ID, so the two legs of one
   B2BUA call reached the mediation function as two sessions (TS 103 221-2
@@ -324,7 +361,6 @@ entry, but a working config keeps working.
   longer ends the session, a failed re-INVITE on an answered call no longer
   ends it, and the session state of a warranted call that failed unanswered
   is released when the call ends instead of waiting for the cap.
-### Fixed
 
 - **A burst on one TCP, TLS, WS or SCTP connection is no longer shed while the
   peer is reading.** Each connection's send queue was bounded at 64 messages,
@@ -341,37 +377,11 @@ entry, but a working config keeps working.
   request over the outbound pool that refusal is an immediate transport error
   (RFC 3261 §8.1.3.1) instead of the former 250 ms park.
 
-### Added
+### Security
 
-- **Send-queue metrics:** `siphon_stream_send_queue_bytes{transport}`,
-  `siphon_stream_send_queue_refused_total{transport}`,
-  `siphon_stream_stalled_closes_total{transport}` and
-  `siphon_stream_send_queue_discarded_total{transport}`.
-
-### Changed
-
-- **Rust API:** the connection maps the transport listeners and
-  `ConnectionPool` take are `DashMap<ConnectionId, transport::send_queue::SendQueue>`
-  instead of `DashMap<ConnectionId, mpsc::Sender<Bytes>>`.
-
-- **Per-contact removal reached the backend and drained the IMS state.** The
-  removal behind the NAT keepalive and registrar liveness checks dropped the
-  binding in memory only, so a Redis or Postgres backend brought it back on the
-  next restart, and removing an AoR's last binding left its Service-Route,
-  P-Asserted-Identity, P-Associated-URI and aliases behind for good. It now
-  goes through the same teardown as a REGISTER with `expires=0`, and never
-  removes an AS capability record.
-- **Per-call media scope: `scope=` on `rtpengine.offer`, `answer` and
-  `delete`.** A proxy that anchors both the originating and the terminating
-  leg of one call sees both under one Call-ID (RFC 3261 §16.6), so the second
-  offer used to land on the first leg's engine call. Naming a scope per leg
-  makes each leg an engine call of its own, with its own profile, address
-  family and ports: siphon-rtp carries the scope in the frame in place of the
-  node's `media.siphon_rtp.scope`, rtpengine and rtpproxy key the leg as
-  `<call-id>;<scope>`. A re-offer and an answer reuse their own leg's session;
-  `delete(request)` and `rtpengine.delete_call(call_id)` without a scope end every leg of the Call-ID, each under the scope it was offered under; `delete_call(..., scope=)` ends one. Without
-  `scope=` every frame is unchanged. Validated like the node scope; refused on
-  a B2BUA call, whose legs have Call-IDs of their own.
+- **ctutils 0.4.5** (RUSTSEC-2026-0385: non-constant-time mask generation
+  and `u128` comparisons in a dependency of the SHA-2/digest crates) in siphon
+  and siphon-bin.
 
 ## [1.15.2] — 2026-10-22
 
