@@ -256,24 +256,27 @@ CCR-TERMINATION — still covers them exactly once.
 
 ## Why a call ended
 
-CCR-TERMINATION carries `Cause-Code` (TS 32.299 §7.2.35), from the same
-disconnect cause Rf's ACR-STOP derives — the RFC 3326 `Reason` header, else the
-SIP status — so the two interfaces never disagree about a call.
+CCR-TERMINATION carries `Cause-Code` (TS 32.299 V18.0.0 clause 7.2.35), from
+the same disconnect cause Rf's ACR-STOP derives (the RFC 3326 `Reason` header,
+else the SIP status), so the two interfaces never disagree about a call.
 
 | Ending | `Cause-Code` |
 |---|---|
 | Normal hangup (BYE) | `0` |
-| Busy | `-486` |
-| Ring timeout / no answer | `-408` |
-| Cancelled before answer | `-487` |
-| OCS refused further credit | `-402` |
-| Max-session-lifetime backstop | `-408` |
+| Busy | `486` |
+| Ring timeout / no answer | `408` |
+| Cancelled before answer | `487` |
+| OCS refused further credit | `402` |
+| Max-session-lifetime backstop | `408` |
 
-Successful terminations map to `0` and failures pass through their negated SIP
-status, which is what TS 32.299 reserves the negative range for. The two
-siphon-initiated teardowns reuse the SIP status each corresponds to: `402
-Payment Required` is what a denied setup is already answered with, so an
-out-of-credit teardown reports the same cause whenever the balance ran out.
+Clause 7.2.35 reserves values <= 0 for successful causes and >= 1 for failures,
+and has a failure that ended on a known SIP error code report that code, so a
+4xx, 5xx or 6xx is sent as its own positive status. A 3xx is `-3xx`, which the
+clause lists with the successful causes. Before 1.15.3 siphon sent failures
+negated (`-486`), the pre-Release 8 convention. The two siphon-initiated
+teardowns reuse the SIP status each corresponds to: `402 Payment Required` is
+what a denied setup is already answered with, so an out-of-credit teardown
+reports the same cause whenever the balance ran out.
 
 ## Observability
 

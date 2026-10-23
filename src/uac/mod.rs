@@ -157,6 +157,11 @@ pub struct UacSender {
     /// Pending requests keyed by branch parameter.
     pending: Arc<DashMap<String, PendingRequest>>,
     cseq_counter: std::sync::atomic::AtomicU32,
+    /// The security associations and P-CSCF protected server port a UDP send
+    /// pinned to that port is checked against
+    /// ([`crate::ipsec::pcscf_udp_egress`]). `None` without a P-CSCF `ipsec:`
+    /// block.
+    ipsec_egress: Option<(Arc<crate::ipsec::IpsecManager>, u16)>,
 }
 
 impl UacSender {
@@ -182,6 +187,41 @@ impl UacSender {
             identity,
             pending: Arc::new(DashMap::new()),
             cseq_counter: std::sync::atomic::AtomicU32::new(1),
+            ipsec_egress: None,
+        }
+    }
+
+    /// Check UDP sends pinned to the P-CSCF's protected server port against
+    /// `manager`'s security associations, so a request over a UE's captured
+    /// flow (the registrar-liveness OPTIONS, an in-dialog probe) leaves from
+    /// the protected client port to the UE's protected server port, as the
+    /// dispatcher's own sends do (TS 33.203 clause 7.1). Either `None` leaves
+    /// every send as it is.
+    pub fn with_ipsec_egress(
+        mut self,
+        manager: Option<Arc<crate::ipsec::IpsecManager>>,
+        pcscf_port_s: Option<u16>,
+    ) -> Self {
+        self.ipsec_egress = manager.zip(pcscf_port_s);
+        self
+    }
+
+    /// `(destination, source_local_addr)` a send really uses.
+    fn egress(
+        &self,
+        transport: Transport,
+        destination: SocketAddr,
+        source_local_addr: Option<SocketAddr>,
+    ) -> (SocketAddr, Option<SocketAddr>) {
+        match &self.ipsec_egress {
+            Some((manager, pcscf_port_s)) => crate::ipsec::pcscf_udp_egress(
+                manager,
+                *pcscf_port_s,
+                transport,
+                destination,
+                source_local_addr,
+            ),
+            None => (destination, source_local_addr),
         }
     }
 
@@ -537,6 +577,15 @@ impl UacSender {
         };
 
         let data = Bytes::from(message.to_bytes());
+        // The Via above names the socket the flow landed on, where the answer
+        // comes back; the OPTIONS itself may leave on another flow.
+        let pinned = source_local_addr;
+        let (destination, source_local_addr) =
+            self.egress(transport, destination, source_local_addr);
+        let addr = match source_local_addr {
+            Some(moved) if source_local_addr != pinned => moved,
+            _ => addr,
+        };
 
         // HEP capture — outbound OPTIONS.  For a captured-flow probe `addr` is
         // the inbound flow's local socket, which is `0.0.0.0`/`[::]` when the
@@ -679,9 +728,12 @@ impl UacSender {
         };
 
         let data = Bytes::from(message.to_bytes());
+        let (destination, source_local_addr) =
+            self.egress(transport, destination, source_local_addr);
 
         if let Some(ref hep) = self.hep_sender {
-            let addr = self.addr_for(&transport);
+            // The pinned socket is the one the request leaves from.
+            let addr = source_local_addr.unwrap_or_else(|| self.addr_for(&transport));
             hep.capture_outbound(addr, destination, transport, &data);
         }
 
@@ -738,11 +790,25 @@ impl UacSender {
         transport: Transport,
         connection_id: ConnectionId,
     ) {
+        self.send_request_from(message, destination, transport, connection_id, None);
+    }
+
+    /// [`send_request_on_connection`](Self::send_request_on_connection) from a
+    /// pinned socket: a request over a flow, such as a UE's security
+    /// association, which only that socket's traffic rides.
+    pub fn send_request_from(
+        &self,
+        message: SipMessage,
+        destination: SocketAddr,
+        transport: Transport,
+        connection_id: ConnectionId,
+        source_local_addr: Option<SocketAddr>,
+    ) {
         let data = Bytes::from(message.to_bytes());
 
         // HEP capture — outbound fire-and-forget
         if let Some(ref hep) = self.hep_sender {
-            let addr = self.addr_for(&transport);
+            let addr = source_local_addr.unwrap_or_else(|| self.addr_for(&transport));
             hep.capture_outbound(addr, destination, transport, &data);
         }
 
@@ -752,7 +818,7 @@ impl UacSender {
             transport,
             destination,
             data,
-            source_local_addr: None,
+            source_local_addr,
             server_name: None,
             verify_server: None,
         };

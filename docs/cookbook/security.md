@@ -123,6 +123,19 @@ The rate-limit ban (`rate_limit`) deliberately does **not** slide. Being over a 
 limit is a capacity verdict, not evidence of intent, so a client that keeps retrying
 through its ban still serves it out on schedule.
 
+A rate-limit ban drops every request from the source without an answer, and says so
+per request only at `debug`. What it does say: one `WARN` when the ban goes in
+(`rate_limit: source banned`, with the source, the requests it sent in the window,
+`max_requests`, `window_secs` and `ban_secs`) and one `INFO` when it ends
+(`rate_limit: ban lifted`). Both are capped at 20 lines a minute each; past that the
+rest are counted and the count is logged when the minute is over, so a scanner wave
+cannot flood the log. While a ban lasts, `GET /admin/rate-limit/bans` lists it with
+the seconds left, and `siphon_rate_limit_banned_sources` counts the banned sources
+(`siphon_rate_limit_bans_total` counts bans raised). A peer that legitimately sends
+for many others, such as the core behind a P-CSCF or a trunk, belongs in
+`trusted_cidrs`: one per-source limit cannot fit both a handset and the node that
+carries all handsets' traffic.
+
 The last two rows of the table are the ones worth understanding, because both were
 once counted and both banned real subscribers:
 

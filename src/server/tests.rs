@@ -490,3 +490,28 @@ fn awaitables_complete_on_pinned_threads() {
         .join()
         .expect("thread joins"));
 }
+
+/// TS 32.299 V18.0.0 clause 7.2.35: the registrar's ACR-EVENTs report a
+/// successful REGISTER as "-1 Successful transaction" and a binding's end as
+/// "-3 End of REGISTER dialog", never a negated SIP status.
+#[test]
+fn registration_events_carry_the_release_18_register_causes() {
+    use crate::registrar::RegistrationEvent;
+    let aor = || "sip:001010000000001@ims.mnc001.mcc001.3gppnetwork.org".to_string();
+    assert_eq!(
+        registration_cause_code(&RegistrationEvent::Registered { aor: aor() }),
+        -1
+    );
+    assert_eq!(
+        registration_cause_code(&RegistrationEvent::Refreshed { aor: aor() }),
+        -1
+    );
+    assert_eq!(
+        registration_cause_code(&RegistrationEvent::Deregistered { aor: aor() }),
+        -3
+    );
+    assert_eq!(
+        registration_cause_code(&RegistrationEvent::Expired { aor: aor() }),
+        -3
+    );
+}

@@ -27,6 +27,17 @@ entry, but a working config keeps working.
   that cannot suspend run exactly as before. A timed-out coroutine is
   cancelled, its call fails as before, and it no longer counts in
   `siphon_async_coroutines_pending`.
+- **IMS AKA over UDP: P-CSCF requests go to the UE's protected server port.**
+  A request the P-CSCF sent over a UE's captured flow (an MT request relayed
+  with `flow=`, an in-dialog request on that flow, the registrar-liveness
+  OPTIONS, an in-dialog probe) reused that flow as captured: from the
+  P-CSCF's protected server port to the UE's protected client port, the flow
+  the UE sends on. TS 24.229 clause 5.2.2.2 has the P-CSCF send its requests
+  and responses from its protected client port to the UE's protected server
+  port (TS 33.203 clause 7.1, UDP case), as responses already did. Such a
+  request, and one routed by address to a UE's protected client port, now
+  takes that flow; its Via still names the protected server port, where the
+  UE's response arrives. TCP is unchanged.
 
 - **P-CSCF: a re-authentication challenge is sent over the existing SA set.**
   The set `ipsec.allocate()` installs for a 401 replaced the kernel's outbound
@@ -120,6 +131,20 @@ entry, but a working config keeps working.
   process left in the kernel (TS 33.203 7.1).
 ### Added
 
+- **A rate-limit ban is no longer silent.** `security.rate_limit` used to drop
+  every request from a banned source with one `debug` line per request and
+  nothing when the ban went in, so a peer that went over the limit (the core
+  behind a P-CSCF, a trunk) just went quiet for the length of the ban. The
+  ban now logs one `WARN` when it goes in (source, requests in the window,
+  `max_requests`, `window_secs`, ban length) and one `INFO` when it ends, both
+  capped at 20 a minute with the rest counted. `GET /admin/rate-limit/bans`
+  lists the banned sources with the seconds left, and the
+  `siphon_rate_limit_banned_sources` gauge and `siphon_rate_limit_bans_total`
+  counter track them. `/admin/metrics.json` carries
+  `security.rate_limit_banned_sources` (`null` when the limit is off). Dropped
+  requests stay silent per request, and `siphon_rate_limited_total` is
+  unchanged. It has no per-source label, because the sources are whatever
+  addresses a scanner sends from.
 - **`rtpengine.delete_call(call_id, from_tag=None)`.** Frees a call's media by
   Call-ID alone, for a call that ends outside any SIP transaction (an Rx
   Abort-Session, an N5 termination notify, a periodic sweep). Before this the
@@ -141,7 +166,42 @@ entry, but a working config keeps working.
   and the next IRI record reconnects at once rather than being written into the
   dead connection. The sequence number now also restarts on every new
   connection, not only on a record's reconnect.
+### Changed
+
+- **`Cause-Code` follows TS 32.299 V18.0.0 clause 7.2.35.** Failures are the
+  SIP status itself, positive (486, 487, 408), where siphon sent the negated
+  pre-Release 8 form (-486); a 3xx is -3xx and a normal end 0, as before. This
+  covers the automatic Rf EVENT and STOP, the B2BUA records, and Ro
+  CCR-TERMINATION (out of credit is 402, the lifetime backstop 408). The
+  registrar's ACR-EVENTs send -1 (Successful transaction) for a registration
+  or refresh and -3 (End of REGISTER dialog) for a deregistration or expiry,
+  replacing 0, -200 and -487. A CDF or rating rule matching the negative
+  values must be updated.
+
+- **A UE sends MESSAGE and SUBSCRIBE over its own SA.** `proxy.send_request()`
+  and `proxy.subscribe_state.send()` take `flow=` and `route=`. With
+  `flow=registration.flow(impu)` the request leaves from the UE's protected
+  client port to the P-CSCF's protected server port, its Via (and a
+  SUBSCRIBE's Contact) names the UE's protected server port, and the route set
+  goes out as Route headers in order (TS 24.229 §5.1.2A.1.1, TS 33.203 §7.1).
+  A subscription made that way sends its refreshes and its unsubscribe over
+  the SA set the registration holds when each is sent, and raises when it has
+  none. `send_request` treats a callee's flow as `call.dial` does;
+  `subscribe_state.send` refuses one. Rust library: `FlowKind::Outbound` now
+  carries a `RegistrantFlow`, and `SubscribeDialog` gains `registrant_flow`.
+
 ### Fixed
+
+- **A cancelled call is reported on Rf, once, with Cause-Code 487.** When the
+  caller CANCELled a proxied INVITE, the proxy answered `487` itself and
+  absorbed the `487` the branch drew back, so no ACR was sent at all: TS 32.260
+  table 5.2.1.1-1 gives "SIP CANCEL, indicating abortion of a SIP session
+  set-up" an ACR EVENT. The caller's CANCEL, `reply.reject()` and
+  `proxy.release` of a ringing session now each send one EVENT per INVITE
+  server transaction, forked or not, with the status the caller got, and the
+  branches' later 487s or timeouts add nothing (a branch that never answers its
+  CANCEL is not reported as a 408). A 2xx that reached the proxy before the
+  CANCEL still makes a session (START), not a failure.
 
 - **An `async def` `@proxy.on_request` handler no longer holds a Python
   executor worker while it awaits.** The worker used to block until the
@@ -156,6 +216,24 @@ entry, but a working config keeps working.
   counts the awaiting coroutines. Other handler kinds (`on_reply`,
   `on_failure`, B2BUA, Diameter, timers, SBI callbacks, RTPEngine events) still
   wait in place.
+
+- **A UE's UDP responses to the P-CSCF leave from its protected client port.**
+  A response to a request the P-CSCF sent over the SA (an MT MESSAGE, a
+  NOTIFY, an MT INVITE) went back from the UE's protected server port to the
+  P-CSCF's protected client port. TS 33.203 clause 7.1 has the UE send requests
+  and responses from port_uc and the P-CSCF receive them on port_ps, so it now
+  goes there, the mirror of the P-CSCF rule fixed in 1.15.1.
+
+- **An in-dialog SUBSCRIBE names siphon in its Via.** A refresh or unsubscribe
+  of a subscription siphon made put the next hop's address in its own Via
+  sent-by, so the peer sent the response to itself and a refresh timed out.
+
+- **A Record-Route line with several entries is several route set entries.**
+  The route set of a subscription siphon made, read from the 2xx or the first
+  NOTIFY, kept a comma-joined Record-Route as one entry, so in-dialog requests
+  carried it as one Route value and the 2xx's was not reversed entry by entry
+  (RFC 3261 §7.3.1, §12.1.2).
+
 - **`call.dial(flow=registration.flow(impu), route=...)` keeps the flow.** A
   route set used to replace any flow, so a UE's MO INVITE was resolved from its
   topmost Route and left from the process listener, outside the SA (or failed

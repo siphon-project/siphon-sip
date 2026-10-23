@@ -17,9 +17,22 @@ use std::sync::Mutex as StdMutex;
 
 pub(super) type ReceivedAcrs = Arc<StdMutex<Vec<serde_json::Value>>>;
 
+/// The octets of every ACR the loopback CDF was sent, for an outside decoder.
+pub(super) type ReceivedWire = Arc<StdMutex<Vec<Vec<u8>>>>;
+
 /// A loopback charging function that answers every ACR with 2001 and keeps
 /// the decoded AVPs of each one it was sent.
 pub(super) async fn mock_cdf() -> (Arc<crate::diameter::DiameterManager>, ReceivedAcrs) {
+    let (manager, received, _) = mock_cdf_with_wire().await;
+    (manager, received)
+}
+
+/// [`mock_cdf`], also keeping each ACR as it came off the wire.
+pub(super) async fn mock_cdf_with_wire() -> (
+    Arc<crate::diameter::DiameterManager>,
+    ReceivedAcrs,
+    ReceivedWire,
+) {
     use crate::diameter::codec::{self, encode_avp_u32, encode_avp_utf8, encode_diameter_message};
     use crate::diameter::dictionary::{self, avp};
     use tokio::io::{AsyncWriteExt, BufReader};
@@ -29,6 +42,8 @@ pub(super) async fn mock_cdf() -> (Arc<crate::diameter::DiameterManager>, Receiv
     let address = listener.local_addr().expect("the listener's address");
     let received: ReceivedAcrs = Arc::new(StdMutex::new(Vec::new()));
     let record = Arc::clone(&received);
+    let wire: ReceivedWire = Arc::new(StdMutex::new(Vec::new()));
+    let record_wire = Arc::clone(&wire);
     tokio::spawn(async move {
         let Ok((stream, _)) = listener.accept().await else {
             return;
@@ -58,6 +73,7 @@ pub(super) async fn mock_cdf() -> (Arc<crate::diameter::DiameterManager>, Receiv
                     avps.extend_from_slice(&encode_avp_u32(code, value as u32));
                 }
             }
+            record_wire.lock().unwrap().push(bytes.to_vec());
             record.lock().unwrap().push(message.avps.clone());
             let answer = encode_diameter_message(
                 0,
@@ -97,7 +113,7 @@ pub(super) async fn mock_cdf() -> (Arc<crate::diameter::DiameterManager>, Receiv
         "cdf".to_string(),
         Arc::new(crate::diameter::DiameterClient::new(peer)),
     );
-    (manager, received)
+    (manager, received, wire)
 }
 
 const CALLER: &str = "sip:001010000000001@ims.mnc001.mcc001.3gppnetwork.org";

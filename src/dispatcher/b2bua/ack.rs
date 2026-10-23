@@ -240,7 +240,7 @@ pub fn arm_reliable_provisional_retransmit_on(
     let bytes = bytes::Bytes::from(response.to_bytes());
     // Resolved once: the copies go where the first one went (TS 33.203 7.1).
     let mut route = route;
-    (route.destination, route.source_local_addr) = protected_udp_response_egress(
+    (route.destination, route.source_local_addr) = protected_udp_egress(
         &bytes,
         route.transport,
         route.destination,
@@ -401,7 +401,7 @@ pub fn start_2xx_retransmits(
     let bytes = bytes::Bytes::from(response.to_bytes());
     // Resolved once: the copies go where the first one went (TS 33.203 7.1).
     let (destination, source_local_addr) =
-        protected_udp_response_egress(&bytes, transport, destination, source_local_addr, state);
+        protected_udp_egress(&bytes, transport, destination, source_local_addr, state);
     // Each copy is captured to HEP as the first send was.
     let capture = TaskCapture::for_task(state, transport, source_local_addr);
     let key = unacked.internal_call_id.clone();

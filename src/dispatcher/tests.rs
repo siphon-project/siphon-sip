@@ -5931,7 +5931,12 @@ fn b_leg_flow_keeps_an_outbound_flow_under_its_route_set() {
         source_addr: "192.0.2.50:5066".parse().unwrap(),
         local_addr: "192.0.2.10:6100".parse().unwrap(),
         connection_id: 0,
-        kind: crate::script::api::registrar::FlowKind::Outbound,
+        kind: crate::script::api::registrar::FlowKind::Outbound(
+            crate::script::api::flow_kind::RegistrantFlow {
+                aor: "sip:001010000000001@ims.example.net".to_string(),
+                sent_by: "192.0.2.10:6101".parse().unwrap(),
+            },
+        ),
     };
     let route = vec!["<sip:orig@scscf.example.net;lr>".to_string()];
     assert!(b_leg_flow(Some(&flow), &route).is_some());
@@ -5946,7 +5951,12 @@ async fn an_outbound_flow_is_the_destination_with_a_route_set() {
         source_addr: "192.0.2.50:5066".parse().unwrap(),
         local_addr: "192.0.2.10:6100".parse().unwrap(),
         connection_id: 0,
-        kind: crate::script::api::registrar::FlowKind::Outbound,
+        kind: crate::script::api::registrar::FlowKind::Outbound(
+            crate::script::api::flow_kind::RegistrantFlow {
+                aor: "sip:001010000000001@ims.example.net".to_string(),
+                sent_by: "192.0.2.10:6101".parse().unwrap(),
+            },
+        ),
     };
     let route = vec![
         "<sip:pcscf.invalid:5066;lr>".to_string(),
