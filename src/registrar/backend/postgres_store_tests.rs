@@ -174,9 +174,9 @@ async fn the_count_matches_the_live_aors_across_replicas() {
 async fn the_purge_drains_expired_bindings_and_their_state() {
     let Some(url) = test_url() else { return };
     let table = unique_table("purge");
-    // A state window of 3 s: wide enough that a loaded machine still runs
+    // A state window of 5 s: wide enough that a loaded machine still runs
     // the first purge inside it.
-    let backend = backend(&url, &table, 3).await;
+    let backend = backend(&url, &table, 5).await;
 
     for user in 0..10 {
         let aor = format!("sip:user{user}@example.com");
@@ -191,12 +191,15 @@ async fn the_purge_drains_expired_bindings_and_their_state() {
         .save_aor_state("sip:early@example.com", &state())
         .await
         .expect("state first");
-    let early_kept = {
-        backend.purge_expired().await.expect("purge");
-        rows(&backend, &format!("{table}_aor_state")).await
+    let last_write = tokio::time::Instant::now();
+    let (first_purge, early_kept) = {
+        let purged = backend.purge_expired().await.expect("purge");
+        (purged, rows(&backend, &format!("{table}_aor_state")).await)
     };
 
-    tokio::time::sleep(Duration::from_millis(4_000)).await;
+    // Past the window as counted from the last write, however long the
+    // writes and the first purge took.
+    tokio::time::sleep_until(last_write + Duration::from_millis(6_500)).await;
     let purged = backend.purge_expired().await.expect("purge");
     let contacts_left = rows(&backend, &table).await;
     let state_left = rows(&backend, &format!("{table}_aor_state")).await;
@@ -204,7 +207,8 @@ async fn the_purge_drains_expired_bindings_and_their_state() {
     drop_tables(&backend, &table).await;
 
     assert_eq!(early_kept, 11, "a purge took state still inside its window");
-    assert_eq!(purged, 21);
+    // The first purge may already take contacts a slow write outlived.
+    assert_eq!(first_purge + purged, 21);
     assert_eq!(contacts_left, 0);
     assert_eq!(state_left, 0);
     assert_eq!(count, 0);
