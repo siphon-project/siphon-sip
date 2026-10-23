@@ -107,6 +107,20 @@ entry, but a working config keeps working.
   process left in the kernel (TS 33.203 7.1).
 ### Added
 
+- **A rate-limit ban is no longer silent.** `security.rate_limit` used to drop
+  every request from a banned source with one `debug` line per request and
+  nothing when the ban went in, so a peer that went over the limit (the core
+  behind a P-CSCF, a trunk) just went quiet for the length of the ban. The
+  ban now logs one `WARN` when it goes in (source, requests in the window,
+  `max_requests`, `window_secs`, ban length) and one `INFO` when it ends, both
+  capped at 20 a minute with the rest counted. `GET /admin/rate-limit/bans`
+  lists the banned sources with the seconds left, and the
+  `siphon_rate_limit_banned_sources` gauge and `siphon_rate_limit_bans_total`
+  counter track them. `/admin/metrics.json` carries
+  `security.rate_limit_banned_sources` (`null` when the limit is off). Dropped
+  requests stay silent per request, and `siphon_rate_limited_total` is
+  unchanged. It has no per-source label, because the sources are whatever
+  addresses a scanner sends from.
 - **`rtpengine.delete_call(call_id, from_tag=None)`.** Frees a call's media by
   Call-ID alone, for a call that ends outside any SIP transaction (an Rx
   Abort-Session, an N5 termination notify, a periodic sweep). Before this the
