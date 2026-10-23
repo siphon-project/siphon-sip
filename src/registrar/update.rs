@@ -97,7 +97,7 @@ pub(crate) fn clamp_retry_after(soonest_expiry_secs: Option<u64>, max_expires: u
 }
 
 /// Collect what the reverse indexes hold for a binding being dropped.
-fn retire(contact: &Contact, tokens: &mut Vec<String>, connections: &mut Vec<u64>) {
+pub(super) fn retire(contact: &Contact, tokens: &mut Vec<String>, connections: &mut Vec<u64>) {
     if let Some(token) = &contact.flow_token {
         tokens.push(token.to_string());
     }

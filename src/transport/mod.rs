@@ -953,6 +953,23 @@ impl OutboundRouter {
     // rewrapping every caller. Allow the size lint here.
     #[allow(clippy::result_large_err)]
     pub fn send(&self, message: OutboundMessage) -> Result<(), flume::SendError<OutboundMessage>> {
+        self.send_guarded(message, crate::ipsec::restore::egress_guard())
+    }
+
+    /// [`send`](Self::send), with `ipsec` as the manager whose barred UE
+    /// endpoints are checked first: a request that would reach a UE's protected
+    /// port in clear, because its security associations died with a previous
+    /// process, is refused here, the one point everything siphon emits passes
+    /// through ([`crate::ipsec::restore`]).
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn send_guarded(
+        &self,
+        message: OutboundMessage,
+        ipsec: Option<&crate::ipsec::IpsecManager>,
+    ) -> Result<(), flume::SendError<OutboundMessage>> {
+        if ipsec.is_some_and(|manager| manager.refuses_unprotected_send(&message)) {
+            return Err(flume::SendError(message));
+        }
         // The `direction="out"` half of siphon_requests_total / siphon_responses_total.
         //
         // Counted here rather than at the typed reply helpers because this is the

@@ -107,6 +107,12 @@ survive** a restart intact (their flow identity is derived from the address pair
 which is stable across reboots). For TCP/TLS/WS/WSS fleets, lean on the UE's normal
 re-REGISTER cadence (and `registrar.liveness`) to repopulate after a restart.
 
+IPsec-protected bindings on a P-CSCF don't survive either, over any transport.
+Their security associations lived in the process that negotiated them, and
+siphon never persists the keys, so a restored binding would point at ports the
+new process can't protect. They are dropped at startup; see
+[After a restart](reference/security.md#after-a-restart).
+
 ### What siphon keeps in the backend, and for how long
 
 Everything the registrar writes expires with the registration it describes, so

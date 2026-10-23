@@ -192,6 +192,7 @@ pub(super) async fn sweep_stale_entries(state: &DispatcherState) {
             // it just expired above — is shortened to what lets the NOTIFY to
             // the UE through, then deleted (TS 24.229 clause 5.2.5.2).
             manager.reconcile_registrations(state.transaction_manager.timers().timer_j_udp());
+            manager.prune_orphaned_flows();
             // Registrar-liveness Part B.4: an abandoned UE's SA pair just
             // aged out of the kernel — its SIP registration should go with it
             // rather than linger to its own Expires.  Only when liveness is on.

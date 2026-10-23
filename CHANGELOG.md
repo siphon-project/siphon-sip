@@ -15,6 +15,18 @@ entry, but a working config keeps working.
 
 ### Fixed
 
+- **Security, P-CSCF: a binding restored without its IPsec SAs is no longer
+  live.** After a restart the registrar bindings came back from the backend,
+  but the security associations had died with the old process. A restored
+  protected binding then had no SA pair behind it: the UE's refreshes were
+  dropped in the kernel, and anything sent to its protected ports (a
+  terminating request, a liveness probe, a NOTIFY) left unprotected. Such a
+  binding is now dropped at startup, removed from the backend, logged and
+  counted in `siphon_registrar_restored_without_sa_total`. Requests to the UE
+  ports it named are refused at egress while no SA pair covers them, counted
+  in `siphon_ipsec_unprotected_sends_refused_total`. The UE recovers with an
+  initial registration (TS 24.229 clause 5.1.1.4.1). SA material is still
+  never persisted.
 - **IMS AKA over UDP: P-CSCF requests go to the UE's protected server port.**
   A request the P-CSCF sent over a UE's captured flow (an MT request relayed
   with `flow=`, an in-dialog request on that flow, the registrar-liveness
