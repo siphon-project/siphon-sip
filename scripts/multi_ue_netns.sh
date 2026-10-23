@@ -23,6 +23,8 @@
 #   4. refreshes spread over refresh_window (from the script's event lines),
 #      sent over each UE's SA set: still 4 x N xfrm states after them (a
 #      protected refresh the S-CSCF accepts installs no new set)
+#   4b. policies survive two Expires of refreshes on both ends (4 x N each),
+#      and the P-CSCF de-registers nobody as ipsec idle
 #   5. the /32s are replaced by a shifted set and the address file rewritten:
 #      every UE re-registers from its new address, no restart
 #   6. optional (CALL_TEST=1, needs sipp): one call from UE 1 to UE 2 through
@@ -350,6 +352,31 @@ wait_registered() {
     fail "only ${registered:-0}/$N registered from the expected addresses after ${REGISTER_TIMEOUT}s"
 }
 
+# The XFRM policies must live exactly as long as their SAs. A policy whose
+# lifetime is not re-pinned with its SAs on a protected refresh is deleted by
+# the kernel one Expires after install, while the SAs live on: SIP on the
+# protected ports then goes out in clear, and a P-CSCF that reads idleness
+# from SA use de-registers the UE. Wait past two Expires of refreshes (no
+# re-challenge, so no new set replaces the first) and require every policy
+# on both ends, and no idle de-registration at the P-CSCF. $1 is SECONDS at
+# the moment all UEs were registered.
+check_policies_survive() {
+    local registered_at="$1" until ue_policies core_policies ue_states core_states idle
+    until=$(( registered_at + 2 * INTERVAL + 40 ))
+    log "waiting past two Expires (until +$(( until - registered_at ))s) for the policy lifetime check"
+    while (( SECONDS < until )); do sleep 5; done
+    ue_policies="$(ip netns exec "$UE_NS" ip xfrm policy | grep -c '^src' || true)"
+    core_policies="$(ip netns exec "$CORE_NS" ip xfrm policy | grep -c '^src' || true)"
+    ue_states="$(ip netns exec "$UE_NS" ip xfrm state | grep -c '^src' || true)"
+    core_states="$(ip netns exec "$CORE_NS" ip xfrm state | grep -c '^src' || true)"
+    idle="$(grep -c 'ipsec idle' "$SCRATCH/pcscf.log" || true)"
+    log "after two Expires: $UE_NS policies $ue_policies states $ue_states, $CORE_NS policies $core_policies states $core_states (expected $(( 4 * N )) each), P-CSCF ipsec-idle de-registrations $idle"
+    ip netns exec "$UE_NS" ip -s xfrm policy | grep -m 4 -E 'lifetime|add ' | sed 's/^/    /' || true
+    [[ "$ue_policies" -eq $(( 4 * N )) ]] || fail "UE side holds $ue_policies policies for $ue_states states: policies expired under live SAs"
+    [[ "$core_policies" -eq $(( 4 * N )) ]] || fail "P-CSCF side holds $core_policies policies for $core_states states: policies expired under live SAs"
+    [[ "$idle" -eq 0 ]] || fail "the P-CSCF de-registered $idle UEs as ipsec idle"
+}
+
 check_xfrm() {
     local states
     states="$(ip netns exec "$UE_NS" ip xfrm state | grep -c '^src' || true)"
@@ -626,11 +653,13 @@ main() {
     local ue_pid="${PIDS[-1]}"
 
     wait_registered 0
+    local registered_at=$SECONDS
     check_xfrm
     check_contacts 0
     report_process "$ue_pid"
     check_refresh_spread
     check_xfrm
+    check_policies_survive "$registered_at"
 
     log "moving every UE: /32s shifted by $ADDR_SHIFT, address file rewritten"
     assign_addresses "$ADDR_SHIFT"
