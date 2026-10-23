@@ -154,7 +154,13 @@ fn captured<T>(level: tracing::Level, work: impl FnOnce() -> T) -> (T, String) {
         .with_max_level(level)
         .with_writer(log.clone())
         .finish();
-    let result = tracing::subscriber::with_default(subscriber, work);
+    // A callsite another test thread reached first with no subscriber can stay
+    // cached as disabled; re-evaluate interest once this scoped subscriber is
+    // in place, or the WARN under test is silently filtered in a parallel run.
+    let result = tracing::subscriber::with_default(subscriber, || {
+        tracing::callsite::rebuild_interest_cache();
+        work()
+    });
     (result, log.rendered())
 }
 
