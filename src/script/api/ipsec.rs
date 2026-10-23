@@ -68,7 +68,7 @@ const DEFAULT_STASH_TTL: Duration = Duration::from_secs(30);
 pub(crate) use crate::ipsec::runtime::outbound_for_sa;
 pub use crate::ipsec::runtime::{
     find_sa_for_ue, is_protected_local_port, outbound_for, outbound_local_addr_for,
-    pcscf_path_host, record_route_port_for, repin_sa_for_ue,
+    pcscf_path_host, protected_server_port_for, repin_sa_for_ue,
 };
 
 // ---------------------------------------------------------------------------

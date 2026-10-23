@@ -15,6 +15,29 @@ entry, but a working config keeps working.
 
 ### Fixed
 
+- **IMS AKA over TCP: P-CSCF requests go on the P-CSCF's own connection.**
+  A request the P-CSCF sent a UE over TCP (an MT request relayed with
+  `flow=`, an in-dialog request on a leg, a NOTIFY, the registrar-liveness
+  OPTIONS) went on the UE's own connection, from the UE's protected client
+  port to the P-CSCF's protected server port. TS 24.229 clause 5.2.2.2 1A b)
+  has the P-CSCF send its requests on a connection it establishes from its
+  protected client port to the UE's protected server port, and read the UE's
+  responses off it. Such a request now goes there: the outbound pool opens
+  that connection bound to the protected client port (shared by every UE),
+  reuses it for the next request, and feeds the responses into the normal
+  inbound path. Responses to the UE's own requests stay on the UE's
+  connection. The connection is closed when the UE's SA pair is deleted,
+  including by the liveness reaper and the expiry sweep, unless a newer pair
+  of the UE shares the protected server port.
+
+- **IMS AKA: the Via of a P-CSCF request names the protected server port.**
+  A request the P-CSCF routed by a UE's Contact to its protected server port,
+  with no captured flow, put the P-CSCF's protected client port in its Via
+  sent-by (a fork branch or B2BUA leg the default listener's), so over UDP the
+  UE's response went to a port no SA covers. TS 24.229 clauses 5.2.6.4.3 and
+  5.2.6.4.5 have the Via name the protected server port of the SA, as the
+  flow path already did.
+
 - **Security, P-CSCF: a binding restored without its IPsec SAs is no longer
   live.** After a restart the registrar bindings came back from the backend,
   but the security associations had died with the old process. A restored
@@ -37,7 +60,7 @@ entry, but a working config keeps working.
   port (TS 33.203 clause 7.1, UDP case), as responses already did. Such a
   request, and one routed by address to a UE's protected client port, now
   takes that flow; its Via still names the protected server port, where the
-  UE's response arrives. TCP is unchanged.
+  UE's response arrives.
 
 - **P-CSCF: a re-authentication challenge is sent over the existing SA set.**
   The set `ipsec.allocate()` installs for a 401 replaced the kernel's outbound

@@ -1,5 +1,5 @@
-//! Which ports a UDP message a P-CSCF sends to a UE over a security
-//! association really leaves from and goes to.
+//! Which ports a message a P-CSCF sends to a UE over a security association
+//! really leaves from and goes to.
 //!
 //! 3GPP TS 33.203 clause 7.1, UDP case, and TS 24.229 clause 5.2.2.2 1A a):
 //! the flow from the P-CSCF's protected client port to the UE's protected
@@ -11,14 +11,19 @@
 //! on, the P-CSCF's protected server port. That is the flow the UE sends on,
 //! never the one it receives on, so both are moved here.
 //!
-//! TCP is not touched: there the message rides the connection.
+//! TCP, TS 24.229 clause 5.2.2.2 1A b): the P-CSCF's requests go on the
+//! connection it "established ... from the P-CSCF's protected client port and
+//! the P-CSCF's IP address to the UE's protected server port and the UE's IP
+//! address", which is also where the UE's responses to them come back. The
+//! UE's own connection (port_uc -> port_ps) carries the UE's requests and the
+//! responses to them, so a response is left on it ([`pcscf_tcp_request_egress`]).
 
 use std::net::SocketAddr;
 
 use tracing::{debug, error};
 
-use super::{IpsecManager, UdpFlowToUe};
-use crate::transport::Transport;
+use super::{FlowToUe, IpsecManager};
+use crate::transport::{ConnectionId, OutboundMessage, Transport};
 
 /// `(destination, source_local_addr)` for a send of `transport` from `local`
 /// to `destination` by a P-CSCF whose protected server port is
@@ -41,8 +46,8 @@ pub fn pcscf_udp_egress(
         return unchanged;
     }
     match manager.udp_flow_to_ue(destination) {
-        UdpFlowToUe::NotProtected => unchanged,
-        UdpFlowToUe::Protected {
+        FlowToUe::NotProtected => unchanged,
+        FlowToUe::Protected {
             local: protected_local,
             destination: protected,
         } => {
@@ -54,7 +59,7 @@ pub fn pcscf_udp_egress(
             );
             (protected, Some(protected_local))
         }
-        UdpFlowToUe::Unusable(protocol) => {
+        FlowToUe::Unusable(protocol) => {
             error!(
                 %destination,
                 %protocol,
@@ -64,6 +69,68 @@ pub fn pcscf_udp_egress(
             unchanged
         }
     }
+}
+
+/// `message` as it really goes out, for a P-CSCF whose protected server port
+/// is `pcscf_port_s`: a TCP request to a UE's protected client port, leaving
+/// from that port (or not pinned), is taken off the UE's connection and onto
+/// the one the P-CSCF opens from its protected client port to the UE's
+/// protected server port ([`IpsecManager::tcp_flow_to_ue`], one map lookup).
+/// The connection id is cleared, so the stream distributor finds no live
+/// connection and hands the message to the outbound pool, which opens that
+/// connection bound to the protected client port once and reuses it; the
+/// UE's responses on it are read into the inbound path like any pool
+/// connection's.
+///
+/// Anything else is returned unchanged: a response (it belongs on the
+/// connection its request came over), a CRLF keepalive, a send to an address
+/// with no pair, a UE-role pair. Nothing is dropped: a pair that cannot carry
+/// TCP is logged and the message goes where it was going.
+pub fn pcscf_tcp_request_egress(
+    manager: &IpsecManager,
+    pcscf_port_s: u16,
+    mut message: OutboundMessage,
+) -> OutboundMessage {
+    if message.transport != Transport::Tcp
+        || message
+            .source_local_addr
+            .is_some_and(|local| local.port() != pcscf_port_s)
+        || !is_request(&message.data)
+    {
+        return message;
+    }
+    match manager.tcp_flow_to_ue(message.destination) {
+        FlowToUe::NotProtected => message,
+        FlowToUe::Protected { local, destination } => {
+            debug!(
+                from = %message.destination,
+                to = %destination,
+                local = %local,
+                "IPsec: TCP request on the P-CSCF's own connection to the UE's protected \
+                 server port (TS 24.229 clause 5.2.2.2 1A b)"
+            );
+            message.destination = destination;
+            message.source_local_addr = Some(local);
+            message.connection_id = ConnectionId::default();
+            message
+        }
+        FlowToUe::Unusable(protocol) => {
+            error!(
+                destination = %message.destination,
+                %protocol,
+                "IPsec: the security association of this UE does not carry TCP, so the TCP \
+                 request cannot reach its protected server port; sending it unchanged"
+            );
+            message
+        }
+    }
+}
+
+/// Whether `frame` is a serialized SIP request: it starts with a method
+/// token, which a response (`SIP/2.0 ...`) and a CRLF keepalive do not.
+fn is_request(frame: &[u8]) -> bool {
+    frame.first().is_some_and(u8::is_ascii_uppercase)
+        && !crate::transport::response_route::is_response(frame)
 }
 
 #[cfg(test)]
@@ -183,5 +250,119 @@ mod tests {
             pcscf_udp_egress(&manager, 5066, Transport::Udp, destination, local),
             (destination, local)
         );
+    }
+
+    fn tcp_message(data: &'static [u8], destination: &str, local: Option<&str>) -> OutboundMessage {
+        OutboundMessage {
+            connection_id: ConnectionId(7),
+            transport: Transport::Tcp,
+            destination: sock(destination),
+            data: bytes::Bytes::from_static(data),
+            source_local_addr: local.map(sock),
+            server_name: None,
+            verify_server: None,
+            followups: None,
+        }
+    }
+
+    const INVITE: &[u8] = b"INVITE sip:001010000000001@198.51.100.40:6101 SIP/2.0\r\n\r\n";
+    const OK: &[u8] = b"SIP/2.0 200 OK\r\n\r\n";
+
+    /// (where, from, on which connection) a message leaves.
+    fn route(message: &OutboundMessage) -> (SocketAddr, Option<SocketAddr>, ConnectionId) {
+        (
+            message.destination,
+            message.source_local_addr,
+            message.connection_id,
+        )
+    }
+
+    /// A request on the UE's own connection (port_uc -> port_ps) moves to the
+    /// connection the P-CSCF opens, port_pc -> port_us (TS 24.229 clause
+    /// 5.2.2.2 1A b), with no connection id so the pool opens or reuses it;
+    /// unpinned the same.
+    #[test]
+    fn a_tcp_request_to_the_ue_client_port_goes_from_port_pc_to_port_us() {
+        let manager = manager_with(pair(SaRole::PCscf, "198.51.100.40"));
+        for local in [Some("192.0.2.1:5066"), None] {
+            let moved = pcscf_tcp_request_egress(
+                &manager,
+                5066,
+                tcp_message(INVITE, "198.51.100.40:6100", local),
+            );
+            assert_eq!(
+                route(&moved),
+                (
+                    sock("198.51.100.40:6101"),
+                    Some(sock("192.0.2.1:5064")),
+                    ConnectionId::default()
+                ),
+                "from {local:?}"
+            );
+        }
+    }
+
+    /// A response stays on the connection its request came over, and so do a
+    /// CRLF keepalive, a send from another socket, to a peer with no pair, to
+    /// the UE's server port already, over UDP, and a UE-role pair.
+    #[test]
+    fn other_tcp_sends_are_left_alone() {
+        let manager = manager_with(pair(SaRole::PCscf, "198.51.100.41"));
+        for (data, destination, local) in [
+            (OK, "198.51.100.41:6100", Some("192.0.2.1:5066")),
+            (
+                &b"\r\n\r\n"[..],
+                "198.51.100.41:6100",
+                Some("192.0.2.1:5066"),
+            ),
+            (INVITE, "198.51.100.41:6100", Some("192.0.2.1:5060")),
+            (INVITE, "198.51.100.42:6100", Some("192.0.2.1:5066")),
+            (INVITE, "198.51.100.41:6101", Some("192.0.2.1:5064")),
+        ] {
+            let message = tcp_message(data, destination, local);
+            let before = route(&message);
+            assert_eq!(
+                route(&pcscf_tcp_request_egress(&manager, 5066, message)),
+                before,
+                "{destination} from {local:?}"
+            );
+        }
+        let mut udp = tcp_message(INVITE, "198.51.100.41:6100", Some("192.0.2.1:5066"));
+        udp.transport = Transport::Udp;
+        let before = route(&udp);
+        assert_eq!(
+            route(&pcscf_tcp_request_egress(&manager, 5066, udp)),
+            before
+        );
+
+        let ue_role = manager_with(pair(SaRole::Ue, "198.51.100.43"));
+        let message = tcp_message(INVITE, "198.51.100.43:6100", Some("192.0.2.1:5066"));
+        let before = route(&message);
+        assert_eq!(
+            route(&pcscf_tcp_request_egress(&ue_role, 5066, message)),
+            before
+        );
+    }
+
+    /// A pair that cannot carry TCP keeps the request where it was going.
+    #[test]
+    fn a_udp_only_pair_keeps_the_tcp_request() {
+        let mut sa = pair(SaRole::PCscf, "198.51.100.44");
+        sa.protocol = SaProtocol::Udp;
+        let manager = manager_with(sa);
+        let message = tcp_message(INVITE, "198.51.100.44:6100", Some("192.0.2.1:5066"));
+        let before = route(&message);
+        assert_eq!(
+            route(&pcscf_tcp_request_egress(&manager, 5066, message)),
+            before
+        );
+    }
+
+    #[test]
+    fn a_request_is_told_from_a_response_and_a_keepalive() {
+        assert!(is_request(INVITE));
+        assert!(!is_request(OK));
+        assert!(!is_request(b"\r\n\r\n"));
+        assert!(!is_request(b""));
     }
 }

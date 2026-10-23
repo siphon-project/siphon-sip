@@ -163,32 +163,37 @@ pub fn is_protected_local_port(local_port: u16) -> bool {
     }
 }
 
-/// The Gm port a `Record-Route` entry must name, given the local socket a leg
-/// actually uses.  Returns `local_port` unchanged when it isn't `pcscf_port_c`,
-/// and always when no IPsec config is wired (siphon not running as P-CSCF).
+/// The Gm port a `Via` sent-by or a `Record-Route` entry must name, given the
+/// local socket a leg actually uses: `pcscf_port_s` for `pcscf_port_c`,
+/// `local_port` unchanged otherwise, and always when no IPsec config is wired
+/// (siphon not running as P-CSCF).
 ///
 /// The Gm port pair is asymmetric (3GPP TS 33.203 §6.3, the four SAs laid out
 /// on [`outbound_local_addr_for`]): the P-CSCF **sends** requests from
-/// `port_pc` (SA #3) but **receives** them on `port_ps` (SA #1).  That splits
-/// two things a proxy normally stamps with the same value:
+/// `port_pc` (SA #3) but **receives** on `port_ps` (SA #1), and both headers
+/// name where something comes back to:
 ///
-/// - a `Via` names where the *response* comes back, so it names the sending
-///   socket — `port_pc` on an MT relay, which is what SA #4 covers;
+/// - a `Via` names where the *response* comes back. Over UDP the UE sends its
+///   responses from port_uc to port_ps (TS 33.203 clause 7.1), and TS 24.229
+///   has the P-CSCF build its Via entry "in a format that contains the
+///   protected server port number of the security association" for a request
+///   it sends the UE (clause 5.2.6.4.3 step 6, clause 5.2.6.4.5 step 1),
+///   whichever socket the request left from;
 /// - a `Record-Route` names where future *requests* go, so on a Gm leg it is
 ///   always `port_ps`, whichever direction this particular relay ran.
 ///
-/// Stamping the egress port into the Record-Route instead hands the UE a route
-/// target it has no SA to transmit into — the kernel selector drops every
-/// in-dialog request it tries to send, and the dialog is one-way for its whole
-/// life.  Do not "simplify" this back to the sending socket.
-pub fn record_route_port_for(local_port: u16) -> u16 {
+/// Stamping the egress port instead hands the UE a target it has no SA to
+/// transmit into: the kernel selector drops the response, or every in-dialog
+/// request, it tries to send. Do not "simplify" this back to the sending
+/// socket.
+pub fn protected_server_port_for(local_port: u16) -> u16 {
     match IPSEC_CONFIG_REF.get() {
         Some(config) => record_route_port(local_port, config.pcscf_port_c, config.pcscf_port_s),
         None => local_port,
     }
 }
 
-/// Pure half of [`record_route_port_for`], split out so the mapping is
+/// Pure half of [`protected_server_port_for`], split out so the mapping is
 /// unit-testable without installing the process-wide `IpsecConfig`.
 fn record_route_port(local_port: u16, port_c: u16, port_s: u16) -> u16 {
     if local_port == port_c {
@@ -288,6 +293,42 @@ pub fn outbound_for(
     outbound_for_sa(&sa, destination.port(), current_transport)
 }
 
+/// How a request a P-CSCF sends to `destination`, an address of a UE's SA
+/// pair, goes out: [`outbound_for`] against `manager`, plus the sent-by its
+/// Via names, the pair's protected server port.
+///
+/// The Via is not the socket the request leaves from. TS 24.229 has the
+/// P-CSCF build its Via entry for a request to the UE "in a format that
+/// contains the protected server port number of the security association"
+/// (clause 5.2.6.4.3 step 6, clause 5.2.6.4.5 step 1): over UDP the UE sends
+/// its responses from port_uc to port_ps (TS 33.203 clause 7.1), so a Via
+/// naming port_pc, the port an MT request leaves from, sends them where no
+/// association carries them.
+pub(crate) fn protected_request(
+    manager: &IpsecManager,
+    destination: std::net::SocketAddr,
+    current_transport: crate::transport::Transport,
+) -> Option<ProtectedRequest> {
+    let sa = manager.find_sa_by_ue(&destination.ip(), destination.port())?;
+    let (source, transport) = outbound_for_sa(&sa, destination.port(), current_transport)?;
+    Some(ProtectedRequest {
+        source,
+        transport,
+        sent_by: std::net::SocketAddr::new(sa.pcscf_addr, sa.pcscf_port_s),
+    })
+}
+
+/// [`protected_request`]'s answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProtectedRequest {
+    /// The P-CSCF port the request leaves from.
+    pub source: std::net::SocketAddr,
+    /// The transport the pair's selector admits ([`outbound_for_sa`]).
+    pub transport: crate::transport::Transport,
+    /// What the Via names: the P-CSCF's protected server port.
+    pub sent_by: std::net::SocketAddr,
+}
+
 /// Pure resolution logic split out so tests can drive it with a
 /// synthetic `SecurityAssociationPair` without touching the global
 /// `IPSEC_MANAGER_REF`.  Encapsulates the TS 33.203 §6.3 SA-pair
@@ -336,6 +377,21 @@ pub(crate) fn outbound_for_sa(
     Some((source, transport))
 }
 
+/// [`crate::ipsec::pcscf_tcp_request_egress`] against the process-wide
+/// P-CSCF manager and config, for the one point every outbound message passes
+/// ([`crate::transport::OutboundRouter::send`]). Without an `ipsec:` block,
+/// two `OnceLock` reads and the message is returned as it was.
+pub(crate) fn pcscf_tcp_egress(
+    message: crate::transport::OutboundMessage,
+) -> crate::transport::OutboundMessage {
+    match (IPSEC_MANAGER_REF.get(), IPSEC_CONFIG_REF.get()) {
+        (Some(manager), Some(config)) => {
+            crate::ipsec::pcscf_tcp_request_egress(manager, config.pcscf_port_s, message)
+        }
+        _ => message,
+    }
+}
+
 /// The `rport` a P-CSCF writes on the top Via of a request it received from
 /// `source_port`, over UDP when `udp`, protected by `protected` when the
 /// request came over a security association.
@@ -355,7 +411,7 @@ pub(crate) fn received_rport(
         return source_port;
     };
     match sa.udp_flow_to_ue() {
-        crate::ipsec::UdpFlowToUe::Protected { destination, .. } => destination.port(),
+        crate::ipsec::FlowToUe::Protected { destination, .. } => destination.port(),
         _ => source_port,
     }
 }
@@ -720,7 +776,7 @@ mod tests {
         assert_eq!(record_route_port(5060, 5064, 5066), 5060);
     }
     #[test]
-    fn record_route_port_for_is_identity_without_config() {
+    fn protected_server_port_for_is_identity_without_config() {
         // No IpsecConfig wired (every non-P-CSCF deployment) — the port passes
         // through untouched.
         //
@@ -730,8 +786,8 @@ mod tests {
         // between, and the assertion then measures a configured P-CSCF. Read
         // it again afterwards and only assert if it was unset throughout.
         if !config_installed() {
-            let passthrough_5060 = record_route_port_for(5060);
-            let passthrough_5064 = record_route_port_for(5064);
+            let passthrough_5060 = protected_server_port_for(5060);
+            let passthrough_5064 = protected_server_port_for(5064);
             if !config_installed() {
                 assert_eq!(passthrough_5060, 5060);
                 assert_eq!(passthrough_5064, 5064);
