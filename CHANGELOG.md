@@ -13,6 +13,8 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
+## [1.15.3] — 2026-10-23
+
 ### Added
 
 - **A rate-limit ban is no longer silent.** `security.rate_limit` used to drop
@@ -374,6 +376,12 @@ entry, but a working config keeps working.
   past the byte bound is refused and logged with the queued bytes; on a relayed
   request over the outbound pool that refusal is an immediate transport error
   (RFC 3261 §8.1.3.1) instead of the former 250 ms park.
+
+### Security
+
+- **ctutils 0.4.5** (RUSTSEC-2026-0385: non-constant-time mask generation
+  and `u128` comparisons in a dependency of the SHA-2/digest crates) in siphon
+  and siphon-bin.
 
 ## [1.15.2] — 2026-10-22
 
