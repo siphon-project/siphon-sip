@@ -19,8 +19,8 @@ use std::time::Instant;
 use dashmap::mapref::entry::Entry;
 
 use super::{
-    backend, is_aor_key_safe, is_stream_transport, normalize_aor_cow, push_binding, Contact,
-    ContactKind, FlowCapture, Registrar, RegistrarError, RegistrationEvent,
+    backend, is_aor_key_safe, is_stream_transport, normalize_aor_cow, parse_contact_target,
+    push_binding, Contact, ContactKind, FlowCapture, Registrar, RegistrarError, RegistrationEvent,
 };
 use crate::sip::uri::SipUri;
 use crate::transport::Transport;
@@ -466,6 +466,93 @@ impl Registrar {
         self.drop_aor_state(aor);
     }
 
+    /// Remove the one UE binding of `aor` whose Contact URI is `contact_uri`,
+    /// leaving the AoR's other bindings in place. Returns whether a binding was
+    /// removed; an unknown AoR or Contact changes nothing and emits nothing.
+    ///
+    /// For an RFC 3680 reg-event or TS 29.228 Cx RTR that terminates one
+    /// contact of a multi-contact AoR, where `remove_all` would take every
+    /// device down. `aor` resolves through the implicit-set aliases, as a
+    /// lookup does. The Contact is matched the way a REGISTER's `expires=0`
+    /// matches the binding it deregisters (RFC 3261 §10.3 step 6): by the
+    /// stored URI as it serialises, after `contact_uri` is parsed (angle
+    /// brackets allowed), so the URI a lookup reported always matches.
+    ///
+    /// The change is carried out exactly as that `expires=0` is: the flow
+    /// token, connection and contact indexes forget the binding, the backend is
+    /// written through, and `Deregistered` fires. When no live UE binding
+    /// remains the AS capability records go with it (TS 24.229 §5.4.2.1.2) and
+    /// the AoR is removed the way `remove_all` removes it: backend entry,
+    /// auxiliary state, implicit-set aliases and the registrations gauge.
+    pub fn remove_contact(&self, aor: &str, contact_uri: &str) -> bool {
+        let raw = contact_uri
+            .trim()
+            .trim_start_matches('<')
+            .trim_end_matches('>');
+        let parsed = parse_contact_target(contact_uri).map(|uri| uri.to_string());
+        let matches = |uri: &SipUri| {
+            let stored = uri.to_string();
+            stored == raw || parsed.as_deref() == Some(stored.as_str())
+        };
+
+        let primary = self.resolve_alias(aor);
+        let aor = primary.as_str();
+        let Entry::Occupied(mut entry) = self.bindings.entry(aor.to_string()) else {
+            return false;
+        };
+        if !entry
+            .get()
+            .iter()
+            .any(|contact| contact.kind == ContactKind::Ue && matches(&contact.uri))
+        {
+            return false;
+        }
+
+        let indexed = self.contact_index.keys_of(entry.get());
+        let mut stale_tokens = Vec::new();
+        let mut stale_connections = Vec::new();
+        let contacts = entry.get_mut();
+        contacts.retain(|contact| {
+            let removed = contact.kind == ContactKind::Ue && matches(&contact.uri);
+            if removed {
+                retire(contact, &mut stale_tokens, &mut stale_connections);
+            }
+            !removed
+        });
+        if !contacts
+            .iter()
+            .any(|contact| contact.kind == ContactKind::Ue && !contact.is_expired())
+        {
+            for contact in contacts.iter() {
+                retire(contact, &mut stale_tokens, &mut stale_connections);
+            }
+            contacts.clear();
+        }
+        self.contact_index
+            .replace(aor, indexed, self.contact_index.keys_of(contacts));
+        let remaining = contacts
+            .iter()
+            .map(backend::StoredContact::from_contact)
+            .collect();
+        let emptied = contacts.is_empty();
+        if emptied {
+            entry.remove();
+        } else {
+            drop(entry);
+        }
+
+        self.carry_out(
+            aor,
+            Effect::Removed {
+                stale_tokens,
+                stale_connections,
+                remaining,
+                emptied,
+            },
+        );
+        true
+    }
+
     /// `Retry-After` for a REGISTER refused for too many contacts: the seconds
     /// until the soonest live binding on `aor` expires and frees a slot,
     /// clamped by [`clamp_retry_after`].
@@ -488,7 +575,9 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{clamp_retry_after, ContactUpdate};
-    use crate::registrar::{FlowCapture, Registrar, RegistrarConfig, RegistrarError};
+    use crate::registrar::{
+        backend, FlowCapture, Registrar, RegistrarConfig, RegistrarError, RegistrationEvent,
+    };
     use crate::sip::uri::SipUri;
     use crate::transport::Transport;
 
@@ -730,6 +819,256 @@ mod tests {
             registrar.tokens.is_empty(),
             "the cleared binding's token went too"
         );
+    }
+
+    const IMPU: &str = "sip:001010000000001@ims.example.com";
+
+    fn deregistrations(
+        receiver: &mut tokio::sync::broadcast::Receiver<RegistrationEvent>,
+    ) -> Vec<String> {
+        let mut seen = Vec::new();
+        while let Ok(event) = receiver.try_recv() {
+            if let RegistrationEvent::Deregistered { aor } = event {
+                seen.push(aor);
+            }
+        }
+        seen
+    }
+
+    fn hosts(registrar: &Registrar, aor: &str) -> Vec<String> {
+        registrar
+            .lookup(aor)
+            .into_iter()
+            .map(|contact| contact.uri.host)
+            .collect()
+    }
+
+    /// One device of a multi-device AoR goes; the others keep routing, and the
+    /// backend holds what is left rather than losing the AoR.
+    #[test]
+    fn remove_contact_drops_one_binding_and_keeps_the_rest() {
+        let registrar = Registrar::default();
+        let (writer, mut writes) = backend::recording_writer();
+        registrar.set_backend_writer(writer);
+        save_tagged(&registrar, IMPU, "192.0.2.10", 3600, "first", 1).unwrap();
+        save_tagged(&registrar, IMPU, "192.0.2.11", 3600, "second", 2).unwrap();
+        registrar.set_service_routes(IMPU, vec!["<sip:orig@scscf.example.com;lr>".into()]);
+        writes.drain();
+        let mut events = registrar.subscribe_events();
+
+        let removed = registrar.remove_contact(IMPU, "sip:001010000000001@192.0.2.10");
+
+        assert!(removed);
+        assert_eq!(hosts(&registrar, IMPU), vec!["192.0.2.11".to_string()]);
+        assert_eq!(
+            writes.drain(),
+            vec![format!("save {IMPU} [\"sip:001010000000001@192.0.2.11\"]")]
+        );
+        assert_eq!(deregistrations(&mut events), vec![IMPU.to_string()]);
+        assert!(registrar.lookup_by_token("first").is_none());
+        assert!(registrar.lookup_by_token("second").is_some());
+        assert_eq!(
+            registrar.unregister_flow(1),
+            0,
+            "the connection index forgot it"
+        );
+        assert!(
+            !registrar.service_routes(IMPU).is_empty(),
+            "the registration is still live, so its state stays"
+        );
+        assert!(registrar.contact_index_is_consistent());
+    }
+
+    /// Removing the last binding ends the registration exactly as `remove_all`
+    /// does: the same backend writes, the same event, the aliases and the
+    /// auxiliary state gone.
+    #[test]
+    fn removing_the_last_contact_removes_the_aor_like_remove_all() {
+        let alias = "sip:+15550100001@ims.example.com";
+        let prepare = || {
+            let registrar = Registrar::default();
+            let (writer, mut writes) = backend::recording_writer();
+            registrar.set_backend_writer(writer);
+            save_tagged(&registrar, IMPU, "192.0.2.10", 3600, "only", 1).unwrap();
+            registrar.set_service_routes(IMPU, vec!["<sip:orig@scscf.example.com;lr>".into()]);
+            registrar.set_associated_uris(IMPU, vec![IMPU.to_string(), alias.to_string()]);
+            writes.drain();
+            let events = registrar.subscribe_events();
+            (registrar, writes, events)
+        };
+        let (removed_one, mut one_writes, mut one_events) = prepare();
+        let (removed_all, mut all_writes, mut all_events) = prepare();
+
+        // Through the alias: it resolves to the primary as a lookup does.
+        assert!(removed_one.remove_contact(alias, "<sip:001010000000001@192.0.2.10>"));
+        removed_all.remove_all(IMPU);
+
+        assert_eq!(one_writes.drain(), all_writes.drain());
+        assert_eq!(
+            deregistrations(&mut one_events),
+            deregistrations(&mut all_events)
+        );
+        for registrar in [&removed_one, &removed_all] {
+            assert!(!registrar.is_registered(IMPU));
+            assert!(!registrar.is_registered(alias));
+            assert!(registrar.bindings.is_empty());
+            assert!(registrar.aliases.is_empty());
+            assert!(registrar.service_routes(IMPU).is_empty());
+            assert!(registrar.associated_uris.is_empty());
+            assert!(registrar.tokens.is_empty());
+            assert!(registrar.connection_index.is_empty());
+            assert_eq!(registrar.contact_index.len(), 0);
+        }
+    }
+
+    /// An unknown AoR or Contact is not an error, and it changes nothing.
+    #[test]
+    fn remove_contact_of_an_unknown_binding_changes_nothing() {
+        let registrar = Registrar::default();
+        let (writer, mut writes) = backend::recording_writer();
+        registrar.set_backend_writer(writer);
+        save_tagged(&registrar, IMPU, "192.0.2.10", 3600, "only", 1).unwrap();
+        writes.drain();
+        let mut events = registrar.subscribe_events();
+
+        assert!(!registrar.remove_contact(IMPU, "sip:001010000000001@192.0.2.99"));
+        assert!(!registrar.remove_contact(
+            "sip:001010000000002@ims.example.com",
+            "sip:001010000000001@192.0.2.10"
+        ));
+        assert!(!registrar.remove_contact(IMPU, "not a uri at all"));
+
+        assert!(writes.drain().is_empty());
+        assert!(deregistrations(&mut events).is_empty());
+        assert_eq!(hosts(&registrar, IMPU), vec!["192.0.2.10".to_string()]);
+        assert!(registrar
+            .bindings
+            .get("sip:001010000000002@ims.example.com")
+            .is_none());
+    }
+
+    /// A proxy-cached binding (`save_proxy`'s uncapped path) is removed the
+    /// same way, its flow token and connection with it.
+    #[test]
+    fn remove_contact_takes_a_proxy_cached_binding_and_its_flow() {
+        let registrar = Registrar::default();
+        let flow = |token: &str, id: u64| FlowCapture {
+            client_transport: None,
+            flow_token: Some(token.into()),
+            inbound_local_addr: None,
+            inbound_connection_id: Some(id),
+        };
+        for (host, token, id) in [("192.0.2.10", "kept", 1), ("192.0.2.11", "gone", 2)] {
+            registrar
+                .save_full_uncapped(
+                    IMPU,
+                    SipUri::new(host.to_string()).with_user("001010000000001".to_string()),
+                    600_000,
+                    1.0,
+                    format!("call-{token}"),
+                    1,
+                    None,
+                    Some(Transport::Tcp),
+                    None,
+                    None,
+                    vec![],
+                    flow(token, id),
+                    Vec::new(),
+                )
+                .unwrap();
+        }
+
+        assert!(registrar.remove_contact(IMPU, "sip:001010000000001@192.0.2.11"));
+
+        assert!(registrar.lookup_by_token("gone").is_none());
+        assert!(registrar.lookup_by_token("kept").is_some());
+        assert_eq!(registrar.unregister_flow(2), 0);
+        assert_eq!(hosts(&registrar, IMPU), vec!["192.0.2.10".to_string()]);
+    }
+
+    /// AS capability records only live while a UE binding does
+    /// (TS 24.229 §5.4.2.1.2), and a URI shared by an AS record is never the
+    /// binding removed.
+    #[test]
+    fn removing_the_last_ue_binding_takes_the_as_records_with_it() {
+        let registrar = Registrar::default();
+        save_tagged(&registrar, IMPU, "192.0.2.10", 3600, "ue", 1).unwrap();
+        let application_server =
+            SipUri::new("192.0.2.200".to_string()).with_user("mmtel".to_string());
+        assert_eq!(
+            registrar.save_as_contact(IMPU, application_server, 3600, 1.0, Vec::new()),
+            Ok(true)
+        );
+
+        assert!(
+            !registrar.remove_contact(IMPU, "sip:mmtel@192.0.2.200"),
+            "an AS record is not a binding remove_contact removes"
+        );
+        assert!(registrar.remove_contact(IMPU, "sip:001010000000001@192.0.2.10"));
+
+        assert!(registrar.bindings.is_empty());
+    }
+
+    /// Per-module leak rule: a batch of complete register → remove_contact
+    /// cycles leaves every per-AoR and per-contact store at its starting
+    /// length, whichever binding of the AoR goes first.
+    #[test]
+    fn register_then_remove_contact_cycles_leave_every_store_at_baseline() {
+        const BATCH: u64 = 200;
+
+        let registrar = Registrar::default();
+        let lengths = |registrar: &Registrar| {
+            [
+                ("bindings", registrar.bindings.len()),
+                ("service_routes", registrar.service_routes.len()),
+                ("asserted_identities", registrar.asserted_identities.len()),
+                ("associated_uris", registrar.associated_uris.len()),
+                ("aliases", registrar.aliases.len()),
+                ("tokens", registrar.tokens.len()),
+                ("connection_index", registrar.connection_index.len()),
+                ("contact_index", registrar.contact_index.len()),
+            ]
+        };
+        let baseline = lengths(&registrar);
+
+        for index in 0..BATCH {
+            let aor = format!("sip:0010100000{index:05}@ims.example.com");
+            let alias = format!("sip:+1555{index:07}@ims.example.com");
+            save_tagged(
+                &registrar,
+                &aor,
+                "192.0.2.10",
+                3600,
+                &format!("a{index}"),
+                index * 2,
+            )
+            .unwrap();
+            save_tagged(
+                &registrar,
+                &aor,
+                "192.0.2.11",
+                3600,
+                &format!("b{index}"),
+                index * 2 + 1,
+            )
+            .unwrap();
+            registrar.set_service_routes(&aor, vec!["<sip:orig@scscf.example.com;lr>".into()]);
+            registrar.set_associated_uris(&aor, vec![aor.clone(), alias.clone()]);
+            let (first, second) = if index % 2 == 0 {
+                ("192.0.2.10", "192.0.2.11")
+            } else {
+                ("192.0.2.11", "192.0.2.10")
+            };
+            assert!(registrar.remove_contact(&alias, &format!("sip:001010000000001@{first}")));
+            assert!(registrar.remove_contact(&aor, &format!("sip:001010000000001@{second}")));
+        }
+
+        for ((name, after), (_, before)) in lengths(&registrar).iter().zip(baseline.iter()) {
+            assert_eq!(
+                after, before,
+                "{name} grew over register/remove_contact cycles: {after} entries, started at {before}"
+            );
+        }
     }
 
     #[test]
