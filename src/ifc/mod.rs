@@ -990,15 +990,37 @@ impl IfcBackendWriter {
     }
 }
 
+/// TTL [`spawn_ifc_backend_writer`] gives a profile key: the default
+/// `registrar.max_expires` (7200) plus the default `ttl_slack_secs` (30).
+pub const DEFAULT_IFC_PROFILE_TTL_SECS: u64 = 7230;
+
+/// Spawn the iFC backend writer task using a Redis connection, writing each
+/// profile with [`DEFAULT_IFC_PROFILE_TTL_SECS`].
+#[cfg(feature = "redis-backend")]
+pub fn spawn_ifc_backend_writer(
+    connection: redis::aio::MultiplexedConnection,
+    key_prefix: String,
+) -> IfcBackendWriter {
+    spawn_ifc_backend_writer_with_ttl(connection, key_prefix, DEFAULT_IFC_PROFILE_TTL_SECS)
+}
+
 /// Spawn the iFC backend writer task using a Redis connection.
+///
+/// Every profile is written with a TTL of `ttl_secs`, renewed by each store,
+/// so a profile nobody stores again (its user stopped registering) leaves
+/// Redis by itself instead of staying for good. Pass the longest registration
+/// lifetime plus a grace: a script that stores the profile from the SAR of
+/// every REGISTER keeps it alive for as long as the registration.
 ///
 /// Returns an [`IfcBackendWriter`] handle. The task runs until the sender
 /// is dropped (i.e., until the `IfcStore` is dropped).
 #[cfg(feature = "redis-backend")]
-pub fn spawn_ifc_backend_writer(
+pub fn spawn_ifc_backend_writer_with_ttl(
     mut connection: redis::aio::MultiplexedConnection,
     key_prefix: String,
+    ttl_secs: u64,
 ) -> IfcBackendWriter {
+    let ttl_secs = ttl_secs.max(1);
     let (sender, mut receiver) = mpsc::channel(IFC_WRITER_QUEUE_CAPACITY);
 
     tokio::spawn(async move {
@@ -1009,7 +1031,7 @@ pub fn spawn_ifc_backend_writer(
                 IfcBackendCommand::Save { aor, xml } => {
                     let key = format!("{key_prefix}{aor}");
                     let result: Result<(), redis::RedisError> =
-                        connection.set(&key, xml.as_str()).await;
+                        connection.set_ex(&key, xml.as_str(), ttl_secs).await;
                     if let Err(error) = result {
                         warn!(aor, %error, "iFC backend write-through save failed");
                     }
@@ -1030,8 +1052,9 @@ pub fn spawn_ifc_backend_writer(
 
 /// Restore iFC profiles from Redis into an `IfcStore`.
 ///
-/// Scans for all keys with the given prefix, loads the raw XML, parses it,
-/// and stores the parsed profiles in the store.
+/// Walks the keys with the given prefix by cursor `SCAN` (never `KEYS`, which
+/// holds the server for the whole keyspace in one call), loads the raw XML,
+/// parses it, and stores the parsed profiles in the store.
 ///
 /// Returns `(profile_count, ifc_count)` — number of AoRs restored and total iFCs.
 #[cfg(feature = "redis-backend")]
@@ -1043,11 +1066,25 @@ pub async fn restore_ifc_profiles(
     use redis::AsyncCommands;
 
     let pattern = format!("{key_prefix}*");
-    let keys: Vec<String> = redis::cmd("KEYS")
-        .arg(&pattern)
-        .query_async(connection)
-        .await
-        .map_err(|error| format!("KEYS scan failed: {error}"))?;
+    // A set, because SCAN may return a key more than once.
+    let mut keys: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut cursor: u64 = 0;
+    loop {
+        let (next_cursor, batch): (u64, Vec<String>) = redis::cmd("SCAN")
+            .arg(cursor)
+            .arg("MATCH")
+            .arg(&pattern)
+            .arg("COUNT")
+            .arg(1000)
+            .query_async(connection)
+            .await
+            .map_err(|error| format!("SCAN failed: {error}"))?;
+        keys.extend(batch);
+        cursor = next_cursor;
+        if cursor == 0 {
+            break;
+        }
+    }
 
     let mut profile_count = 0usize;
     let mut ifc_count = 0usize;
@@ -1404,6 +1441,9 @@ impl IfcStore {
 
 #[cfg(test)]
 mod spec_tests;
+
+#[cfg(all(test, feature = "redis-backend"))]
+mod redis_tests;
 
 #[cfg(test)]
 mod tests {

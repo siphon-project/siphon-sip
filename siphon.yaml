@@ -391,6 +391,10 @@ registrar:
   #   url: "redis://127.0.0.1:6379"
   #   key_prefix: "siphon:reg:"   # namespace prefix (default: "siphon:reg:")
   #   ttl_slack_secs: 30          # extra seconds beyond expires for race safety
+  #   # Every key siphon writes here expires with its registration (state keys
+  #   # and iFC profiles too); registrar.aor_count() reads a maintained AoR
+  #   # index ({key_prefix}index), not the keyspace. See
+  #   # docs/scaling-and-redundancy.md.
 
   # PostgreSQL persistence (backend: postgres)
   # postgres:
@@ -2246,6 +2250,8 @@ auth:
 #   ifc_xml_path: "/etc/siphon/ifc.xml"     # path to ServiceProfile XML
 #   # ifc_xml: "<ServiceProfile>...</ServiceProfile>"  # inline XML (alternative)
 #   ifc_key_prefix: "siphon:ifc:"            # Redis key prefix (default)
+#   # Each profile key lives registrar.max_expires + registrar.redis.ttl_slack_secs,
+#   # renewed by every isc.store_profile(): store it from the SAR of every REGISTER.
 #   # Shared iFC sets (TS 29.228 Annex B.2, TS 29.229 SiFC): a service profile
 #   # may name a set by SharedIFCSetID instead of carrying its iFCs. Each file
 #   # holds <InitialFilterCriteria> elements in the HSS's own XML form. With at

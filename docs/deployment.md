@@ -299,6 +299,7 @@ Scrape `/metrics`. The handful that matter operationally:
 |---|---|---|
 | `siphon_memory_allocated_bytes` | `rate(...[30m]) > 0` while call rate is flat | A real leak. The per-structure gauges (`siphon_proxy_dialog_sessions`, `siphon_uac_pending_requests`) localize it. |
 | `siphon_pyexec_jobs_shed_total` | sustained `rate() > 0` | Handler pool saturated + queue full → SIP retransmits. Raise `sync_pool_max` or speed up handlers. |
+| `siphon_timer_jobs_shed_total{timer}` | any `increase() > 0` | A `@timer.every` run was skipped because the pool was full, so whatever that timer maintains (a periodic count, a cleanup) is one interval stale. Logged as `timer callback shed`, not as a panic. |
 | `siphon_pyexec_pool_size` vs `_pool_max` | `pool_size == pool_max` **and** `inflight == pool_size` for minutes | Pool fully grown and saturated, approaching the liveness watchdog. |
 | `siphon_proxy_dialog_sessions` | grows unbounded under flat completed-call load | Dialog state not draining — a leak signature. |
 | `siphon_gateway_source_last_success_timestamp_seconds` | `time() - <gauge> > 3 * refresh_secs`, or the gauge is `0` | The carriers this node routes over are stale — it kept the last set it read, correctly, and nothing else says the controller has been unreachable for hours. `0` means it has *never* been read, so a node that booted against a dead controller has no carriers from the source at all. |

@@ -26,6 +26,40 @@ entry, but a working config keeps working.
   connection, not only on a record's reconnect.
 ### Fixed
 
+- **Every Redis key the registrar and the iFC store write now has a TTL.** The
+  auxiliary-state key (`{key_prefix}state:{aor}`) was a plain SET and outlived
+  the binding it described for good, because the registrar's expiry sweep
+  leaves the backend alone and lets the binding hash expire by itself. It now
+  takes the binding hash's TTL when written and on every save of the binding
+  (`max_expires` + `ttl_slack_secs` when written before any binding). iFC
+  profile keys get `max_expires` + `ttl_slack_secs`, renewed by every
+  `isc.store_profile()`, and the iFC restore walks the prefix with a cursor
+  `SCAN` instead of `KEYS`. A save whose contacts have all expired removes the
+  AoR rather than writing a hash with no TTL. With `backend: postgres` the
+  writer task now purges expired contact rows and orphaned state rows once a
+  minute, and a save deletes the contacts no longer in the AoR's set (it only
+  upserted, so a removed contact was restored and counted until it expired).
+  New Rust API: `ifc::spawn_ifc_backend_writer_with_ttl`, and
+  `with_max_binding_lifetime` on both backends.
+- **`registrar.aor_count()` no longer scans the keyspace.** The Redis backend
+  keeps an AoR index (`{key_prefix}index`, a sorted set scored by the epoch
+  second the AoR's last contact expires), updated in the same transaction as
+  the binding hash on every save and removal, including a contact removed on
+  its own. The count drops the members that have expired and reads the rest,
+  so it stays exact across nodes and restarts without keyspace expiry events,
+  and `all_aors` (the boot-time restore) reads the same index. A node that
+  finds no index at connect builds it once from the binding hashes, so the
+  first boot after an upgrade restores every binding. `RegistrarBackend`
+  gains `count_aors` and `purge_expired`, both with defaults.
+- **A timer run the Python executor shed is no longer logged as "timer
+  callback panicked".** `timer_loop` logged every failure from the executor
+  that way, so a saturated pool skipping a timer read as a crash, and what the
+  timer maintains went stale with nothing saying why. It now logs `timer
+  callback shed` (the run was skipped), `not run` (the pool is shutting down),
+  `lost` (the worker went away) or `panicked` with the panic's message at
+  `error`, and counts shed runs in `siphon_timer_jobs_shed_total{timer}`. A
+  Python exception is still logged as `timer callback error`. New
+  `py_executor::try_run_classified` says why a job produced no value.
 - **An `async def` `@proxy.on_request` handler no longer holds a Python
   executor worker while it awaits.** The worker used to block until the
   coroutine settled, so a handler awaiting a slow downstream request (a

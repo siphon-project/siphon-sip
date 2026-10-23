@@ -1308,7 +1308,7 @@ async fn timer_loop(
         // without the thread being attached"). Mirrors the clone at the timer
         // registration site (`restart_timers`).
         let callback = Python::attach(|python| callable.clone_ref(python));
-        let result = crate::script::py_executor::try_run(move || {
+        let result = crate::script::py_executor::try_run_classified(move || {
             Python::attach(|python| {
                 let bound = callback.bind(python);
                 match bound.call0() {
@@ -1331,8 +1331,43 @@ async fn timer_loop(
         })
         .await;
 
-        if result.is_err() {
-            warn!(name = %name, "timer callback panicked");
+        if let Err(failure) = result {
+            report_timer_failure(&name, failure);
+        }
+    }
+}
+
+/// Log why a timer run produced nothing, and count the runs the executor shed.
+///
+/// A Python exception never gets here: the job catches it and logs "timer
+/// callback error" itself. What does is a run that never happened (the pool
+/// shed it, or is shutting down), one whose worker went away, and a real
+/// panic. They used to be logged alike as "timer callback panicked", so a
+/// saturated pool skipping a timer read as a crash, and the timer's work (a
+/// periodic count, say) went stale with nothing saying why.
+fn report_timer_failure(name: &str, failure: crate::script::py_executor::RunFailure) {
+    use crate::script::py_executor::RunFailure;
+    match &failure {
+        RunFailure::Shed => {
+            crate::metrics::timer::record_shed(name);
+            warn!(
+                name = %name,
+                "timer callback shed: the Python executor queue was full, so this run was \
+                 skipped and the timer fires again at its next interval"
+            );
+        }
+        RunFailure::Closed => {
+            warn!(name = %name, "timer callback not run: the Python executor is shutting down");
+        }
+        RunFailure::Lost => {
+            warn!(name = %name, "timer callback lost: its executor worker went away before answering");
+        }
+        RunFailure::Panicked(_) => {
+            error!(
+                name = %name,
+                panic = failure.panic_message().unwrap_or("non-string panic payload"),
+                "timer callback panicked"
+            );
         }
     }
 }
@@ -4287,6 +4322,44 @@ assert replay_probe.answer() == 7
             error.contains("failing_ext") && error.contains("extension mount blew up"),
             "unexpected error: {error}"
         );
+    }
+
+    /// A shed timer run is logged as shed and counted under the timer's name,
+    /// not logged as a panic; a real panic still is one, with its message.
+    #[test]
+    fn a_shed_timer_run_is_logged_and_counted_as_shed_not_panicked() {
+        use crate::script::py_executor::RunFailure;
+        crate::metrics::init().expect("the metrics registry builds");
+        let name = "shed-timer-test";
+        let before = crate::metrics::timer::shed(name).unwrap_or(0);
+
+        let log = crate::log_capture::LogBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(log.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            report_timer_failure(name, RunFailure::Shed);
+        });
+        let shed_log = log.rendered();
+        assert!(shed_log.contains("timer callback shed"), "{shed_log}");
+        assert!(!shed_log.contains("panicked"), "{shed_log}");
+        assert_eq!(crate::metrics::timer::shed(name), Some(before + 1));
+
+        let log = crate::log_capture::LogBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(log.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            report_timer_failure(name, RunFailure::Panicked(Box::new("boom")));
+        });
+        let panic_log = log.rendered();
+        assert!(panic_log.contains("timer callback panicked"), "{panic_log}");
+        assert!(panic_log.contains("boom"), "{panic_log}");
+        assert_eq!(crate::metrics::timer::shed(name), Some(before + 1));
     }
 }
 

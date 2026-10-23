@@ -338,6 +338,28 @@ pub trait RegistrarBackend: Send + Sync + std::fmt::Debug {
     fn all_aor_state_aors(
         &self,
     ) -> impl std::future::Future<Output = Result<Vec<String>, BackendError>> + Send;
+
+    /// Number of AoRs with at least one live binding.
+    ///
+    /// The default counts [`all_aors`](Self::all_aors). A backend that keeps
+    /// an index answers from it instead, so a caller polling the count does
+    /// not pay for a walk of everything stored.
+    fn count_aors(&self) -> impl std::future::Future<Output = Result<usize, BackendError>> + Send {
+        async move { Ok(self.all_aors().await?.len()) }
+    }
+
+    /// Drop what the backend still holds for bindings that have expired, and
+    /// return how many entries went.
+    ///
+    /// The registrar's own expiry sweep never tells the backend (see
+    /// `Registrar::expire_stale`), so this is how a backend whose storage does
+    /// not expire by itself stays bounded. Run periodically by the writer
+    /// task. The default does nothing, for a backend with nothing to purge.
+    fn purge_expired(
+        &self,
+    ) -> impl std::future::Future<Output = Result<usize, BackendError>> + Send {
+        async { Ok(0) }
+    }
 }
 
 /// Backend errors.
@@ -496,333 +518,15 @@ impl Default for RedisBackendConfig {
     }
 }
 
-#[cfg(feature = "redis-backend")]
-mod redis_real {
-    use super::*;
-    use redis::AsyncCommands;
-
-    /// Redis registrar backend.
-    ///
-    /// Stores contacts as JSON in Redis hashes, with TTL aligned to contact expiry.
-    /// Supports optional auto-sharding across multiple Redis instances.
-    #[derive(Debug)]
-    pub struct RedisBackend {
-        config: RedisBackendConfig,
-        /// Connections — single element when not sharding, multiple when sharding.
-        connections: Vec<redis::aio::MultiplexedConnection>,
-    }
-
-    /// How long a single Redis command may take before it fails.
-    ///
-    /// The same 500ms the `redis` crate happens to default to, pinned here so
-    /// it is siphon's choice rather than a dependency's. It is the only reason
-    /// an individual operation is bounded at all, and a bump that changed or
-    /// dropped that default would otherwise remove the bound silently, leaving
-    /// the write-through queue to back up behind commands that never return.
-    const REDIS_RESPONSE_TIMEOUT: Duration = Duration::from_millis(500);
-
-    impl RedisBackend {
-        /// Connect to Redis (single instance or sharded).
-        pub async fn connect(config: RedisBackendConfig) -> Result<Self, BackendError> {
-            let connections = if config.shard_count > 0 {
-                if config.urls.len() != config.shard_count {
-                    return Err(BackendError::Connection(format!(
-                        "shard_count is {} but {} URLs provided",
-                        config.shard_count,
-                        config.urls.len()
-                    )));
-                }
-                let mut connections = Vec::with_capacity(config.shard_count);
-                for url in &config.urls {
-                    let client = redis::Client::open(url.as_str())
-                        .map_err(|error| BackendError::Connection(error.to_string()))?;
-                    let mut connection = client
-                        .get_multiplexed_async_connection()
-                        .await
-                        .map_err(|error| BackendError::Connection(error.to_string()))?;
-                    connection.set_response_timeout(REDIS_RESPONSE_TIMEOUT);
-                    connections.push(connection);
-                }
-                tracing::info!(
-                    shard_count = config.shard_count,
-                    "redis registrar backend connected (sharded)"
-                );
-                connections
-            } else {
-                let client = redis::Client::open(config.url.as_str())
-                    .map_err(|error| BackendError::Connection(error.to_string()))?;
-                let mut connection = client
-                    .get_multiplexed_async_connection()
-                    .await
-                    .map_err(|error| BackendError::Connection(error.to_string()))?;
-                connection.set_response_timeout(REDIS_RESPONSE_TIMEOUT);
-                tracing::info!("redis registrar backend connected");
-                vec![connection]
-            };
-
-            Ok(Self {
-                config,
-                connections,
-            })
-        }
-
-        /// The Redis key for an AoR (contact bindings).
-        fn key(&self, aor: &str) -> String {
-            format!("{}{}", self.config.key_prefix, aor)
-        }
-
-        /// The Redis key for an AoR's auxiliary state.
-        fn state_key(&self, aor: &str) -> String {
-            format!("{}state:{}", self.config.key_prefix, aor)
-        }
-
-        /// Get a cloned connection for the given AoR (shard-aware).
-        fn connection_for(&self, aor: &str) -> redis::aio::MultiplexedConnection {
-            if self.connections.len() == 1 {
-                self.connections[0].clone()
-            } else {
-                let index = shard_index(aor, self.connections.len());
-                self.connections[index].clone()
-            }
-        }
-
-        /// Get all connections (for operations that span all shards).
-        fn all_connections(&self) -> Vec<redis::aio::MultiplexedConnection> {
-            self.connections.to_vec()
-        }
-    }
-
-    impl RegistrarBackend for RedisBackend {
-        async fn save(&self, aor: &str, contacts: &[StoredContact]) -> Result<(), BackendError> {
-            let key = self.key(aor);
-            let mut connection = self.connection_for(aor);
-
-            if contacts.is_empty() {
-                let _: () = connection
-                    .del(&key)
-                    .await
-                    .map_err(|error| BackendError::Query(error.to_string()))?;
-                return Ok(());
-            }
-
-            // Delete existing hash to replace all bindings, then set new ones.
-            let _: () = connection
-                .del(&key)
-                .await
-                .map_err(|error| BackendError::Query(error.to_string()))?;
-
-            let mut max_ttl: u64 = 0;
-            for contact in contacts {
-                let json = serde_json::to_string(contact)
-                    .map_err(|error| BackendError::Serialization(error.to_string()))?;
-                let _: () = connection
-                    .hset(&key, &contact.uri, &json)
-                    .await
-                    .map_err(|error| BackendError::Query(error.to_string()))?;
-                let remaining = contact.remaining_secs();
-                if remaining > max_ttl {
-                    max_ttl = remaining;
-                }
-            }
-
-            // Set TTL to the longest contact expiry + slack (minimum 1 second).
-            // The slack prevents the key from expiring moments before a refresh.
-            if max_ttl > 0 {
-                let ttl_with_slack = max_ttl + self.config.ttl_slack_secs;
-                let _: () = connection
-                    .expire(&key, ttl_with_slack as i64)
-                    .await
-                    .map_err(|error| BackendError::Query(error.to_string()))?;
-            }
-
-            Ok(())
-        }
-
-        async fn load(&self, aor: &str) -> Result<Vec<StoredContact>, BackendError> {
-            let key = self.key(aor);
-            let mut connection = self.connection_for(aor);
-
-            let entries: Vec<(String, String)> = connection
-                .hgetall(&key)
-                .await
-                .map_err(|error| BackendError::Query(error.to_string()))?;
-
-            let mut contacts = Vec::with_capacity(entries.len());
-            let mut expired_fields: Vec<String> = Vec::new();
-            for (field, value) in entries {
-                let contact: StoredContact = serde_json::from_str(&value)
-                    .map_err(|error| BackendError::Serialization(error.to_string()))?;
-                // Filter out individually expired contacts (the hash key TTL
-                // is set to the *longest* contact, so shorter ones may linger).
-                if contact.is_expired() {
-                    expired_fields.push(field);
-                } else {
-                    contacts.push(contact);
-                }
-            }
-
-            // Lazily delete expired fields from the hash.
-            if !expired_fields.is_empty() {
-                let fields: Vec<&str> = expired_fields.iter().map(|s| s.as_str()).collect();
-                let _: () = connection
-                    .hdel(&key, &fields[..])
-                    .await
-                    .map_err(|error| BackendError::Query(error.to_string()))?;
-            }
-
-            Ok(contacts)
-        }
-
-        async fn remove(&self, aor: &str) -> Result<(), BackendError> {
-            let key = self.key(aor);
-            let mut connection = self.connection_for(aor);
-            let _: () = connection
-                .del(&key)
-                .await
-                .map_err(|error| BackendError::Query(error.to_string()))?;
-            Ok(())
-        }
-
-        async fn exists(&self, aor: &str) -> Result<bool, BackendError> {
-            let key = self.key(aor);
-            let mut connection = self.connection_for(aor);
-            let result: bool = connection
-                .exists(&key)
-                .await
-                .map_err(|error| BackendError::Query(error.to_string()))?;
-            Ok(result)
-        }
-
-        async fn all_aors(&self) -> Result<Vec<String>, BackendError> {
-            let pattern = format!("{}*", self.config.key_prefix);
-            let state_prefix = format!("{}state:", self.config.key_prefix);
-            let prefix_len = self.config.key_prefix.len();
-            let mut all_aors = Vec::new();
-
-            for mut connection in self.all_connections() {
-                let mut cursor: u64 = 0;
-                loop {
-                    let (next_cursor, keys): (u64, Vec<String>) = redis::cmd("SCAN")
-                        .arg(cursor)
-                        .arg("MATCH")
-                        .arg(&pattern)
-                        .arg("COUNT")
-                        .arg(100)
-                        .query_async(&mut connection)
-                        .await
-                        .map_err(|error| BackendError::Query(error.to_string()))?;
-
-                    for key in keys {
-                        // Skip the auxiliary-state keys that share the prefix.
-                        if key.starts_with(&state_prefix) {
-                            continue;
-                        }
-                        if key.len() > prefix_len {
-                            all_aors.push(key[prefix_len..].to_string());
-                        }
-                    }
-
-                    cursor = next_cursor;
-                    if cursor == 0 {
-                        break;
-                    }
-                }
-            }
-
-            Ok(all_aors)
-        }
-
-        async fn save_aor_state(
-            &self,
-            aor: &str,
-            state: &StoredAorState,
-        ) -> Result<(), BackendError> {
-            let key = self.state_key(aor);
-            let mut connection = self.connection_for(aor);
-
-            if state.is_empty() {
-                let _: () = connection
-                    .del(&key)
-                    .await
-                    .map_err(|error| BackendError::Query(error.to_string()))?;
-                return Ok(());
-            }
-
-            let json = serde_json::to_string(state)
-                .map_err(|error| BackendError::Serialization(error.to_string()))?;
-            let _: () = connection
-                .set(&key, json)
-                .await
-                .map_err(|error| BackendError::Query(error.to_string()))?;
-            Ok(())
-        }
-
-        async fn load_aor_state(&self, aor: &str) -> Result<Option<StoredAorState>, BackendError> {
-            let key = self.state_key(aor);
-            let mut connection = self.connection_for(aor);
-            let value: Option<String> = connection
-                .get(&key)
-                .await
-                .map_err(|error| BackendError::Query(error.to_string()))?;
-            match value {
-                Some(json) => {
-                    let state: StoredAorState = serde_json::from_str(&json)
-                        .map_err(|error| BackendError::Serialization(error.to_string()))?;
-                    Ok(Some(state))
-                }
-                None => Ok(None),
-            }
-        }
-
-        async fn remove_aor_state(&self, aor: &str) -> Result<(), BackendError> {
-            let key = self.state_key(aor);
-            let mut connection = self.connection_for(aor);
-            let _: () = connection
-                .del(&key)
-                .await
-                .map_err(|error| BackendError::Query(error.to_string()))?;
-            Ok(())
-        }
-
-        async fn all_aor_state_aors(&self) -> Result<Vec<String>, BackendError> {
-            let state_prefix = format!("{}state:", self.config.key_prefix);
-            let prefix_len = state_prefix.len();
-            let pattern = format!("{state_prefix}*");
-            let mut aors = Vec::new();
-
-            for mut connection in self.all_connections() {
-                let mut cursor: u64 = 0;
-                loop {
-                    let (next_cursor, keys): (u64, Vec<String>) = redis::cmd("SCAN")
-                        .arg(cursor)
-                        .arg("MATCH")
-                        .arg(&pattern)
-                        .arg("COUNT")
-                        .arg(100)
-                        .query_async(&mut connection)
-                        .await
-                        .map_err(|error| BackendError::Query(error.to_string()))?;
-
-                    for key in keys {
-                        if key.len() > prefix_len {
-                            aors.push(key[prefix_len..].to_string());
-                        }
-                    }
-
-                    cursor = next_cursor;
-                    if cursor == 0 {
-                        break;
-                    }
-                }
-            }
-
-            Ok(aors)
-        }
-    }
-}
+/// The longest binding a backend assumes the registrar grants, until told
+/// otherwise with `with_max_binding_lifetime`: `registrar.max_expires`'s
+/// default.
+pub const DEFAULT_MAX_BINDING_LIFETIME_SECS: u64 = 7200;
 
 #[cfg(feature = "redis-backend")]
-pub use redis_real::RedisBackend;
+mod redis_store;
+#[cfg(feature = "redis-backend")]
+pub use redis_store::RedisBackend;
 
 /// Stub Redis backend when the `redis-backend` feature is not enabled.
 /// Stub Redis backend when the `redis-backend` feature is not enabled.
@@ -848,6 +552,11 @@ impl RedisBackend {
     pub async fn connect(config: RedisBackendConfig) -> Result<Self, BackendError> {
         tracing::warn!("redis backend stub: connect is a no-op (enable redis-backend feature)");
         Ok(Self::new(config))
+    }
+
+    /// Stub of the real backend's setter; nothing here reads it.
+    pub fn with_max_binding_lifetime(self, _secs: u64) -> Self {
+        self
     }
 
     /// The Redis key for an AoR.
@@ -929,328 +638,9 @@ impl Default for PostgresBackendConfig {
 }
 
 #[cfg(feature = "postgres-backend")]
-mod postgres_real {
-    use super::*;
-    use std::sync::Arc;
-
-    /// PostgreSQL registrar backend.
-    ///
-    /// Stores contacts in a table with `(aor, contact_uri)` as the primary key.
-    /// Contact data is stored as TEXT (JSON string). Expired rows are filtered
-    /// on read and can be cleaned up periodically.
-    ///
-    /// Supports optional auto-sharding across multiple PostgreSQL instances.
-    #[derive(Debug)]
-    pub struct PostgresBackend {
-        config: PostgresBackendConfig,
-        /// Clients — single element when not sharding, multiple when sharding.
-        clients: Vec<Arc<tokio_postgres::Client>>,
-    }
-
-    impl PostgresBackend {
-        /// Connect to PostgreSQL and create the registrations table if needed.
-        pub async fn connect(config: PostgresBackendConfig) -> Result<Self, BackendError> {
-            let clients = if config.shard_count > 0 {
-                if config.urls.len() != config.shard_count {
-                    return Err(BackendError::Connection(format!(
-                        "shard_count is {} but {} URLs provided",
-                        config.shard_count,
-                        config.urls.len()
-                    )));
-                }
-                let mut clients = Vec::with_capacity(config.shard_count);
-                for url in &config.urls {
-                    let client = Self::connect_one(url, &config.table).await?;
-                    clients.push(client);
-                }
-                tracing::info!(
-                    shard_count = config.shard_count,
-                    table = %config.table,
-                    "postgres registrar backend connected (sharded)"
-                );
-                clients
-            } else {
-                let client = Self::connect_one(&config.url, &config.table).await?;
-                tracing::info!(table = %config.table, "postgres registrar backend connected");
-                vec![client]
-            };
-
-            Ok(Self { config, clients })
-        }
-
-        /// Connect to a single PostgreSQL instance and ensure the table exists.
-        async fn connect_one(
-            url: &str,
-            table: &str,
-        ) -> Result<Arc<tokio_postgres::Client>, BackendError> {
-            let (client, connection) = tokio_postgres::connect(url, tokio_postgres::NoTls)
-                .await
-                .map_err(|error| BackendError::Connection(error.to_string()))?;
-
-            // Spawn the connection task so it runs in the background.
-            tokio::spawn(async move {
-                if let Err(error) = connection.await {
-                    tracing::error!("postgres connection error: {error}");
-                }
-            });
-
-            // Create the registrations table if it does not exist.
-            // Data is stored as TEXT (JSON string) to avoid requiring the
-            // `with-serde_json-1` feature on tokio-postgres.
-            let create_table_query = format!(
-                "CREATE TABLE IF NOT EXISTS {} (
-                    aor TEXT NOT NULL,
-                    contact_uri TEXT NOT NULL,
-                    data TEXT NOT NULL,
-                    expires_at TIMESTAMPTZ NOT NULL,
-                    PRIMARY KEY (aor, contact_uri)
-                )",
-                table
-            );
-            client
-                .execute(&create_table_query, &[])
-                .await
-                .map_err(|error| BackendError::Query(error.to_string()))?;
-
-            // Companion table for the per-AoR auxiliary state (Service-Route,
-            // P-Asserted-Identity, P-Associated-URI list).  Stored as JSON
-            // text, one row per AoR.
-            let create_state_table_query = format!(
-                "CREATE TABLE IF NOT EXISTS {}_aor_state (
-                    aor TEXT PRIMARY KEY,
-                    state TEXT NOT NULL
-                )",
-                table
-            );
-            client
-                .execute(&create_state_table_query, &[])
-                .await
-                .map_err(|error| BackendError::Query(error.to_string()))?;
-
-            Ok(Arc::new(client))
-        }
-
-        fn state_table(&self) -> String {
-            format!("{}_aor_state", self.config.table)
-        }
-
-        /// Get the client for the given AoR (shard-aware).
-        fn client_for(&self, aor: &str) -> &tokio_postgres::Client {
-            if self.clients.len() == 1 {
-                &self.clients[0]
-            } else {
-                let index = shard_index(aor, self.clients.len());
-                &self.clients[index]
-            }
-        }
-    }
-
-    impl RegistrarBackend for PostgresBackend {
-        async fn save(&self, aor: &str, contacts: &[StoredContact]) -> Result<(), BackendError> {
-            let client = self.client_for(aor);
-            let table = &self.config.table;
-
-            if contacts.is_empty() {
-                let query = format!("DELETE FROM {} WHERE aor = $1", table);
-                client
-                    .execute(&query, &[&aor])
-                    .await
-                    .map_err(|error| BackendError::Query(error.to_string()))?;
-                return Ok(());
-            }
-
-            // Upsert each contact individually.
-            let query = format!(
-                "INSERT INTO {} (aor, contact_uri, data, expires_at)
-                 VALUES ($1, $2, $3, NOW() + $4 * INTERVAL '1 second')
-                 ON CONFLICT (aor, contact_uri) DO UPDATE
-                 SET data = $3, expires_at = NOW() + $4 * INTERVAL '1 second'",
-                table
-            );
-
-            for contact in contacts {
-                let json = serde_json::to_string(contact)
-                    .map_err(|error| BackendError::Serialization(error.to_string()))?;
-                let expires_secs = contact.remaining_secs() as f64;
-
-                client
-                    .execute(&query, &[&aor, &contact.uri, &json, &expires_secs])
-                    .await
-                    .map_err(|error| BackendError::Query(error.to_string()))?;
-            }
-
-            Ok(())
-        }
-
-        async fn load(&self, aor: &str) -> Result<Vec<StoredContact>, BackendError> {
-            let client = self.client_for(aor);
-            let table = &self.config.table;
-
-            // Select remaining seconds so we can set accurate TTL on the
-            // deserialized StoredContact, regardless of when it was stored.
-            let query = format!(
-                "SELECT data, EXTRACT(EPOCH FROM (expires_at - NOW()))::bigint AS remaining \
-                 FROM {} WHERE aor = $1 AND expires_at > NOW()",
-                table
-            );
-            let rows = client
-                .query(&query, &[&aor])
-                .await
-                .map_err(|error| BackendError::Query(error.to_string()))?;
-
-            let now_epoch = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-
-            let mut contacts = Vec::with_capacity(rows.len());
-            for row in rows {
-                let data: &str = row.get(0);
-                let remaining: i64 = row.get(1);
-                let mut contact: StoredContact = serde_json::from_str(data)
-                    .map_err(|error| BackendError::Serialization(error.to_string()))?;
-                // Overwrite with the actual remaining TTL from the database.
-                let remaining = remaining.max(0) as u64;
-                contact.expires_secs = remaining;
-                contact.expires_at = Some(now_epoch + remaining);
-                contacts.push(contact);
-            }
-            Ok(contacts)
-        }
-
-        async fn remove(&self, aor: &str) -> Result<(), BackendError> {
-            let client = self.client_for(aor);
-            let table = &self.config.table;
-
-            let query = format!("DELETE FROM {} WHERE aor = $1", table);
-            client
-                .execute(&query, &[&aor])
-                .await
-                .map_err(|error| BackendError::Query(error.to_string()))?;
-            Ok(())
-        }
-
-        async fn exists(&self, aor: &str) -> Result<bool, BackendError> {
-            let client = self.client_for(aor);
-            let table = &self.config.table;
-
-            let query = format!(
-                "SELECT EXISTS(SELECT 1 FROM {} WHERE aor = $1 AND expires_at > NOW())",
-                table
-            );
-            let row = client
-                .query_one(&query, &[&aor])
-                .await
-                .map_err(|error| BackendError::Query(error.to_string()))?;
-            let result: bool = row.get(0);
-            Ok(result)
-        }
-
-        async fn all_aors(&self) -> Result<Vec<String>, BackendError> {
-            let mut all_aors = Vec::new();
-
-            for client in &self.clients {
-                let query = format!(
-                    "SELECT DISTINCT aor FROM {} WHERE expires_at > NOW()",
-                    self.config.table
-                );
-                let rows = client
-                    .query(&query, &[])
-                    .await
-                    .map_err(|error| BackendError::Query(error.to_string()))?;
-
-                for row in rows {
-                    let aor: String = row.get(0);
-                    all_aors.push(aor);
-                }
-            }
-
-            Ok(all_aors)
-        }
-
-        async fn save_aor_state(
-            &self,
-            aor: &str,
-            state: &StoredAorState,
-        ) -> Result<(), BackendError> {
-            let client = self.client_for(aor);
-            let table = self.state_table();
-
-            if state.is_empty() {
-                let query = format!("DELETE FROM {table} WHERE aor = $1");
-                client
-                    .execute(&query, &[&aor])
-                    .await
-                    .map_err(|error| BackendError::Query(error.to_string()))?;
-                return Ok(());
-            }
-
-            let json = serde_json::to_string(state)
-                .map_err(|error| BackendError::Serialization(error.to_string()))?;
-            let query = format!(
-                "INSERT INTO {table} (aor, state) VALUES ($1, $2)
-                 ON CONFLICT (aor) DO UPDATE SET state = $2"
-            );
-            client
-                .execute(&query, &[&aor, &json])
-                .await
-                .map_err(|error| BackendError::Query(error.to_string()))?;
-            Ok(())
-        }
-
-        async fn load_aor_state(&self, aor: &str) -> Result<Option<StoredAorState>, BackendError> {
-            let client = self.client_for(aor);
-            let table = self.state_table();
-            let query = format!("SELECT state FROM {table} WHERE aor = $1");
-            let rows = client
-                .query(&query, &[&aor])
-                .await
-                .map_err(|error| BackendError::Query(error.to_string()))?;
-
-            match rows.first() {
-                Some(row) => {
-                    let json: &str = row.get(0);
-                    let state: StoredAorState = serde_json::from_str(json)
-                        .map_err(|error| BackendError::Serialization(error.to_string()))?;
-                    Ok(Some(state))
-                }
-                None => Ok(None),
-            }
-        }
-
-        async fn remove_aor_state(&self, aor: &str) -> Result<(), BackendError> {
-            let client = self.client_for(aor);
-            let table = self.state_table();
-            let query = format!("DELETE FROM {table} WHERE aor = $1");
-            client
-                .execute(&query, &[&aor])
-                .await
-                .map_err(|error| BackendError::Query(error.to_string()))?;
-            Ok(())
-        }
-
-        async fn all_aor_state_aors(&self) -> Result<Vec<String>, BackendError> {
-            let table = self.state_table();
-            let mut aors = Vec::new();
-
-            for client in &self.clients {
-                let query = format!("SELECT aor FROM {table}");
-                let rows = client
-                    .query(&query, &[])
-                    .await
-                    .map_err(|error| BackendError::Query(error.to_string()))?;
-                for row in rows {
-                    aors.push(row.get::<_, String>(0));
-                }
-            }
-
-            Ok(aors)
-        }
-    }
-}
-
+mod postgres_store;
 #[cfg(feature = "postgres-backend")]
-pub use postgres_real::PostgresBackend;
+pub use postgres_store::PostgresBackend;
 
 /// Stub PostgreSQL backend when the `postgres-backend` feature is not enabled.
 #[cfg(not(feature = "postgres-backend"))]
@@ -1271,6 +661,11 @@ impl PostgresBackend {
             "postgres backend stub: connect is a no-op (enable postgres-backend feature)"
         );
         Ok(Self::new(config))
+    }
+
+    /// Stub of the real backend's setter; nothing here reads it.
+    pub fn with_max_binding_lifetime(self, _secs: u64) -> Self {
+        self
     }
 }
 
