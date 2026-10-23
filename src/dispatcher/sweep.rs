@@ -215,6 +215,14 @@ pub(super) async fn sweep_stale_entries(state: &DispatcherState) {
     // retransmitting. Keyed on values the peer chooses, like the table above.
     state.refused_invites.prune(now);
 
+    // Release warranted LI sessions whose call is over, after the grace that
+    // lets the stragglers of a teardown still correlate with it.
+    if let Some(li) = state.li_manager.as_ref() {
+        li.sweep_sessions(now, |session_id| {
+            state.call_actors.contains_call(session_id)
+        });
+    }
+
     // Registrar-liveness Part B: UDP+IPsec idle detection (kernel SA use-time
     // poll → one OPTIONS probe → deregister on no answer).  No-op unless
     // enabled and a P-CSCF IPsec role is configured.
