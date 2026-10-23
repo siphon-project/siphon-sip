@@ -292,6 +292,34 @@ and a task held for the whole handshake timeout. See
 [Hardening & security](cookbook/security.md#bounding-what-one-source-can-spend),
 including the note on carrier NAT and `max_connections_per_source`.
 
+### A peer that falls behind
+
+Every TCP, TLS, WS, WSS and SCTP connection has one writer, fed by a queue
+bounded by bytes, not messages: `listen.stream_send_queue_bytes`, 4 MiB by
+default. A burst to a peer that is reading is queued whole and leaves in order,
+and a connection that has fallen behind never holds up another one.
+
+```yaml
+listen:
+  stream_send_queue_bytes: 4194304   # per connection; an empty queue always takes one message
+  stream_write_timeout_ms: 5000      # no write progress for this long = stuck
+```
+
+- **A peer that stops reading** is closed once a write has made no progress for
+  `stream_write_timeout_ms`. siphon logs it at ERROR with the bytes and frames
+  still queued, which are discarded, and counts it in
+  `siphon_stream_stalled_closes_total`. Later sends to it open a new connection
+  (or, for a WebSocket, are dropped and logged).
+- **A message that would take the queue past its bound** is refused rather than
+  queued, logged at WARN with the queued bytes and the time since the writer
+  last made progress, and counted in `siphon_stream_send_queue_refused_total`.
+  A request relayed over an outbound connection then fails at once with a
+  transport error, which the proxy answers with 503 or turns into the next
+  target, instead of waiting for its transaction to time out.
+
+`siphon_stream_send_queue_bytes` shows what is queued per transport. siphon
+keeps one connection per peer and does not open more to spread a burst.
+
 ### How long a connection stays open
 
 An inbound TCP, TLS, WS or WSS connection is closed after 300 s in which the

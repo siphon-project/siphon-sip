@@ -31,10 +31,8 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use bytes::Bytes;
 use dashmap::DashMap;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use crate::config::TlsServerConfig;
@@ -42,6 +40,7 @@ use crate::transport::acl::TransportAcl;
 use crate::transport::crlf_keepalive::CrlfPongTracker;
 use crate::transport::pool::ConnectionPool;
 use crate::transport::proxy_protocol::{accept_proxied, EdgeTls, ProxyProtocolAcl};
+use crate::transport::send_queue::SendQueue;
 use crate::transport::stream::{
     bind_tcp_listener, serve_sip_stream, sniff_stream, spawn_outbound_distributor, PrefixedStream,
     StreamContext, StreamProtocol,
@@ -58,10 +57,10 @@ use crate::transport::{
 pub struct MuxChannels {
     /// Outbound messages addressed to the raw-SIP half (`tcp` / `tls`).
     pub sip_outbound_rx: flume::Receiver<OutboundMessage>,
-    pub sip_connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>>,
+    pub sip_connection_map: Arc<DashMap<ConnectionId, SendQueue>>,
     /// Outbound messages addressed to the WebSocket half (`ws` / `wss`).
     pub websocket_outbound_rx: flume::Receiver<OutboundMessage>,
-    pub websocket_connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>>,
+    pub websocket_connection_map: Arc<DashMap<ConnectionId, SendQueue>>,
 }
 
 /// Spawn a protocol-multiplexed listener on `local_addr`.
@@ -304,8 +303,8 @@ async fn dispatch<S>(
     // won.
     mut permit: crate::security::AcceptPermit,
     inbound_tx: flume::Sender<InboundMessage>,
-    sip_connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>>,
-    websocket_connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>>,
+    sip_connection_map: Arc<DashMap<ConnectionId, SendQueue>>,
+    websocket_connection_map: Arc<DashMap<ConnectionId, SendQueue>>,
     stream_connections: StreamConnections,
     crlf_pong_tracker: Option<Arc<CrlfPongTracker>>,
     close_tx: Option<flume::Sender<u64>>,
@@ -413,6 +412,7 @@ async fn dispatch<S>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
     use futures_util::{SinkExt, StreamExt};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio_tungstenite::tungstenite::Message;
@@ -431,8 +431,8 @@ mod tests {
     struct Harness {
         addr: SocketAddr,
         inbound_rx: flume::Receiver<InboundMessage>,
-        sip_connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>>,
-        websocket_connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>>,
+        sip_connection_map: Arc<DashMap<ConnectionId, SendQueue>>,
+        websocket_connection_map: Arc<DashMap<ConnectionId, SendQueue>>,
         registry: StreamConnections,
     }
 
@@ -441,9 +441,8 @@ mod tests {
         let (inbound_tx, inbound_rx) = flume::unbounded();
         let (_sip_outbound_tx, sip_outbound_rx) = flume::unbounded::<OutboundMessage>();
         let (_ws_outbound_tx, websocket_outbound_rx) = flume::unbounded::<OutboundMessage>();
-        let sip_connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
-            Arc::new(DashMap::new());
-        let websocket_connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
+        let sip_connection_map: Arc<DashMap<ConnectionId, SendQueue>> = Arc::new(DashMap::new());
+        let websocket_connection_map: Arc<DashMap<ConnectionId, SendQueue>> =
             Arc::new(DashMap::new());
 
         let registry = StreamConnections::new();
@@ -490,9 +489,9 @@ mod tests {
 
     /// Wait for the connection to appear in `map` and hand back its sender.
     async fn sender_for(
-        map: &Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>>,
+        map: &Arc<DashMap<ConnectionId, SendQueue>>,
         connection_id: ConnectionId,
-    ) -> mpsc::Sender<Bytes> {
+    ) -> SendQueue {
         for _ in 0..100 {
             if let Some(entry) = map.get(&connection_id) {
                 return entry.value().clone();
@@ -549,8 +548,7 @@ mod tests {
         // for WebSocket.
         let sip_sender = sender_for(&harness.sip_connection_map, sip_message.connection_id).await;
         sip_sender
-            .send(Bytes::from_static(b"SIP/2.0 200 OK\r\n\r\n"))
-            .await
+            .try_send(Bytes::from_static(b"SIP/2.0 200 OK\r\n\r\n"))
             .unwrap();
         let mut raw = vec![0u8; 18];
         sip_client.read_exact(&mut raw).await.unwrap();
@@ -562,8 +560,7 @@ mod tests {
         )
         .await;
         websocket_sender
-            .send(Bytes::from_static(b"SIP/2.0 200 OK\r\n\r\n"))
-            .await
+            .try_send(Bytes::from_static(b"SIP/2.0 200 OK\r\n\r\n"))
             .unwrap();
         match websocket.next().await.unwrap().unwrap() {
             Message::Text(text) => assert_eq!(text.as_str(), "SIP/2.0 200 OK\r\n\r\n"),
@@ -743,8 +740,7 @@ mod tests {
         // Responses go back on the framing each half expects.
         let sip_sender = sender_for(&harness.sip_connection_map, sip_message.connection_id).await;
         sip_sender
-            .send(Bytes::from_static(b"SIP/2.0 200 OK\r\n\r\n"))
-            .await
+            .try_send(Bytes::from_static(b"SIP/2.0 200 OK\r\n\r\n"))
             .unwrap();
         let mut raw = vec![0u8; 18];
         sip_client.read_exact(&mut raw).await.unwrap();
@@ -756,8 +752,7 @@ mod tests {
         )
         .await;
         websocket_sender
-            .send(Bytes::from_static(b"SIP/2.0 200 OK\r\n\r\n"))
-            .await
+            .try_send(Bytes::from_static(b"SIP/2.0 200 OK\r\n\r\n"))
             .unwrap();
         match websocket.next().await.unwrap().unwrap() {
             Message::Text(text) => assert_eq!(text.as_str(), "SIP/2.0 200 OK\r\n\r\n"),

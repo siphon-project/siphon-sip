@@ -164,6 +164,35 @@ entry, but a working config keeps working.
   longer ends the session, a failed re-INVITE on an answered call no longer
   ends it, and the session state of a warranted call that failed unanswered
   is released when the call ends instead of waiting for the cap.
+### Fixed
+
+- **A burst on one TCP, TLS, WS or SCTP connection is no longer shed while the
+  peer is reading.** Each connection's send queue was bounded at 64 messages,
+  and the outbound distributor fills it far faster than the connection's writer
+  is scheduled to drain it, so a proxy-to-proxy connection carrying a few
+  hundred REGISTERs a second dropped the overflow ("send buffer full") with both
+  socket queues empty; every drop became a transaction timeout and a retry. The
+  queue is now bounded by bytes (`listen.stream_send_queue_bytes`, default
+  4 MiB), so a burst is queued whole and in order, and the distributor still
+  never waits on a connection. A peer is treated as stuck only when a write
+  makes no progress for `listen.stream_write_timeout_ms` (default 5000): the
+  connection is closed and logged at ERROR with what was still queued. A frame
+  past the byte bound is refused and logged with the queued bytes; on a relayed
+  request over the outbound pool that refusal is an immediate transport error
+  (RFC 3261 §8.1.3.1) instead of the former 250 ms park.
+
+### Added
+
+- **Send-queue metrics:** `siphon_stream_send_queue_bytes{transport}`,
+  `siphon_stream_send_queue_refused_total{transport}`,
+  `siphon_stream_stalled_closes_total{transport}` and
+  `siphon_stream_send_queue_discarded_total{transport}`.
+
+### Changed
+
+- **Rust API:** the connection maps the transport listeners and
+  `ConnectionPool` take are `DashMap<ConnectionId, transport::send_queue::SendQueue>`
+  instead of `DashMap<ConnectionId, mpsc::Sender<Bytes>>`.
 
 - **Per-contact removal reached the backend and drained the IMS state.** The
   removal behind the NAT keepalive and registrar liveness checks dropped the

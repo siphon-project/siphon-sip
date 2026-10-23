@@ -13,9 +13,9 @@ use std::time::Duration;
 
 use bytes::{Buf, Bytes, BytesMut};
 use dashmap::DashMap;
-use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
+use super::send_queue::SendQueue;
 use super::ConnectionId;
 use crate::config::CrlfKeepaliveConfig;
 
@@ -93,7 +93,7 @@ const CRLF_PONG: &[u8] = b"\r\n";
 pub fn drain_leading_crlf_keepalives(
     accumulator: &mut BytesMut,
     connection_id: ConnectionId,
-    writer: &mpsc::Sender<Bytes>,
+    writer: &SendQueue,
     tracker: Option<&Arc<CrlfPongTracker>>,
 ) -> usize {
     let mut drained = 0;
@@ -120,7 +120,7 @@ pub fn drain_leading_crlf_keepalives(
 }
 
 /// A connection map that the keepalive task iterates.
-type ConnectionMap = Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>>;
+type ConnectionMap = Arc<DashMap<ConnectionId, SendQueue>>;
 
 /// Spawn the CRLF keepalive background task for TCP and TLS connections.
 pub fn spawn(
@@ -239,7 +239,10 @@ mod tests {
     #[tokio::test]
     async fn sends_crlf_ping_to_connections() {
         let map: ConnectionMap = Arc::new(DashMap::new());
-        let (tx, mut rx) = mpsc::channel(16);
+        let (tx, mut rx) = crate::transport::send_queue::channel(
+            crate::transport::Transport::Tcp,
+            ConnectionId::default(),
+        );
         let id = ConnectionId(1);
         map.insert(id, tx);
 
@@ -265,7 +268,10 @@ mod tests {
     #[tokio::test]
     async fn evicts_after_threshold_when_peer_supported_crlf() {
         let map: ConnectionMap = Arc::new(DashMap::new());
-        let (tx, _rx) = mpsc::channel(16);
+        let (tx, _rx) = crate::transport::send_queue::channel(
+            crate::transport::Transport::Tcp,
+            ConnectionId::default(),
+        );
         let id = ConnectionId(99);
         map.insert(id, tx);
 
@@ -293,7 +299,10 @@ mod tests {
 
     #[tokio::test]
     async fn drain_responds_to_peer_ping_with_pong() {
-        let (tx, mut rx) = mpsc::channel::<Bytes>(8);
+        let (tx, mut rx) = crate::transport::send_queue::channel(
+            crate::transport::Transport::Tcp,
+            ConnectionId::default(),
+        );
         let tracker = Arc::new(CrlfPongTracker::new());
         let id = ConnectionId(7);
         let mut buf = BytesMut::from(&b"\r\n\r\n"[..]);
@@ -310,7 +319,10 @@ mod tests {
 
     #[tokio::test]
     async fn drain_records_peer_pong_without_writing_back() {
-        let (tx, mut rx) = mpsc::channel::<Bytes>(8);
+        let (tx, mut rx) = crate::transport::send_queue::channel(
+            crate::transport::Transport::Tcp,
+            ConnectionId::default(),
+        );
         let tracker = Arc::new(CrlfPongTracker::new());
         let id = ConnectionId(11);
         // Prime the missed counter so record_pong has something to clear.
@@ -327,7 +339,10 @@ mod tests {
 
     #[tokio::test]
     async fn drain_leaves_sip_message_intact_after_keepalive() {
-        let (tx, _rx) = mpsc::channel::<Bytes>(8);
+        let (tx, _rx) = crate::transport::send_queue::channel(
+            crate::transport::Transport::Tcp,
+            ConnectionId::default(),
+        );
         let tracker = Arc::new(CrlfPongTracker::new());
         let id = ConnectionId(13);
 
@@ -343,7 +358,10 @@ mod tests {
 
     #[tokio::test]
     async fn drain_handles_multiple_back_to_back_pings() {
-        let (tx, mut rx) = mpsc::channel::<Bytes>(8);
+        let (tx, mut rx) = crate::transport::send_queue::channel(
+            crate::transport::Transport::Tcp,
+            ConnectionId::default(),
+        );
         let tracker = Arc::new(CrlfPongTracker::new());
         let id = ConnectionId(19);
 
@@ -359,7 +377,10 @@ mod tests {
 
     #[tokio::test]
     async fn drain_without_tracker_still_responds_to_pings() {
-        let (tx, mut rx) = mpsc::channel::<Bytes>(8);
+        let (tx, mut rx) = crate::transport::send_queue::channel(
+            crate::transport::Transport::Tcp,
+            ConnectionId::default(),
+        );
         let id = ConnectionId(23);
         let mut buf = BytesMut::from(&b"\r\n\r\n"[..]);
 
@@ -375,7 +396,10 @@ mod tests {
     #[tokio::test]
     async fn does_not_evict_peer_without_crlf_support() {
         let map: ConnectionMap = Arc::new(DashMap::new());
-        let (tx, _rx) = mpsc::channel(16);
+        let (tx, _rx) = crate::transport::send_queue::channel(
+            crate::transport::Transport::Tcp,
+            ConnectionId::default(),
+        );
         let id = ConnectionId(100);
         map.insert(id, tx);
 
