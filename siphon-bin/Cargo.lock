@@ -78,7 +78,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -89,7 +89,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -828,7 +828,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2015,7 +2015,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2931,7 +2931,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3281,9 +3281,9 @@ dependencies = [
 
 [[package]]
 name = "siphon-rtp-proto"
-version = "0.14.0"
+version = "0.15.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0bfffb7a6d46faf2b0f99ecf3f3f727180ff78d1bede52c6a801e3180a713a80"
+checksum = "7a6e227d724b51876b77beeedcd036fd9af79f58c235a9ebe1f36733297dcf87"
 dependencies = [
  "serde",
  "serde_json",
@@ -3292,8 +3292,8 @@ dependencies = [
 
 [[package]]
 name = "siphon-sigtran"
-version = "4.0.0"
-source = "git+https://github.com/siphon-project/siphon-sigtran?tag=v4.0.0#7b92460188b0980ae5d5f4616310d84ca70122b4"
+version = "4.1.0"
+source = "git+https://github.com/siphon-project/siphon-sigtran?tag=v4.1.0#68fe5c6d3b1518593d8ceb0033c0406bac9f247e"
 dependencies = [
  "async-sctp",
  "gsm_cap",
@@ -3319,8 +3319,8 @@ dependencies = [
 
 [[package]]
 name = "siphon-sip"
-version = "1.13.1"
-source = "git+https://github.com/siphon-project/siphon-sip?branch=main#010bb8dd82f067e384b71be2373daabd400abe77"
+version = "1.15.2"
+source = "git+https://github.com/siphon-project/siphon-sip?branch=main#6dbbe51899c35f50f63e365d10c89e3433129ade"
 dependencies = [
  "aes",
  "arc-swap",
@@ -3475,7 +3475,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "52d1cfed4120b4d927bf7c0f86d2087a4a7d6027c906d9f9d525a80573b9be51"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -3670,7 +3670,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3831,9 +3831,9 @@ dependencies = [
 
 [[package]]
 name = "tokio"
-version = "1.53.2"
+version = "1.54.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e95f91fcc7a621e8b030f6aa23c71fe9838ae2fb4d8118b75602a328f5144044"
+checksum = "b52fd3255258d26fac7264ab5a76b53c13367136dc011d3d6ad4f8ed070396a3"
 dependencies = [
  "bytes",
  "libc",
@@ -4417,7 +4417,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

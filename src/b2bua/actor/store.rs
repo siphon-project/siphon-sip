@@ -26,6 +26,7 @@ mod failure;
 pub use failure::FailureConclusion;
 mod fork;
 mod replacement;
+mod reserved_id;
 mod route_progress;
 mod session_timer;
 
@@ -186,22 +187,10 @@ impl CallActorStore {
         self.calls.len()
     }
 
-    /// Create a new call from an A-leg and return the internal call ID.
-    ///
-    /// Registers the A-leg's SIP Call-ID in the registry.
+    /// Create a new call from an A-leg and return the internal call ID. See
+    /// [`create_call_with_id`](Self::create_call_with_id).
     pub fn create_call(&self, a_leg: Leg) -> String {
-        let sip_call_id = a_leg.dialog.call_id.clone();
-        let a_branch = a_leg.branch.clone();
-        let call = CallActor::new(a_leg);
-        let id = call.id.clone();
-        // In the store before it is registered: a mapping to a call that is
-        // not in the store is taken for one a finished call left behind.
-        self.calls.insert(id.clone(), Box::new(call));
-        self.forget_ended_owners(&sip_call_id);
-        self.registry
-            .register_call_id(&sip_call_id, &id, LegSide::A);
-        self.registry.register_branch(&a_branch, &id);
-        id
+        self.create_call_with_id(a_leg, None)
     }
 
     /// Add a B-leg to a call. Registers branch in the registry.
