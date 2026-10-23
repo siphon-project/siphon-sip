@@ -3806,6 +3806,14 @@ class MockAuth:
         P-CSCF must strip them with ``reply.take_av()`` before relaying the 401
         to the UE.
 
+        Each subscriber has its own SQN, starting at the credential's optional
+        ``sqn`` (12 hex chars, default ``000000000001``) and advancing with every
+        challenge (TS 33.102 annex C). An ``Authorization`` carrying ``auts=``
+        (the UE found the SQN out of range) is checked against the RAND of the
+        challenge it answers: a valid MAC-S re-bases the SQN and a fresh 401
+        goes out, an invalid one is answered 403 (TS 33.102 6.3.5). The mock
+        does not model SQN or AUTS.
+
         Example::
 
             if not auth.require_aka_digest(request, realm="ims.test"):
@@ -3816,7 +3824,7 @@ class MockAuth:
         :meth:`require_ims_digest`.
 
         Returns:
-            ``True`` if credentials are valid, ``False`` if a 401 challenge was sent.
+            ``True`` if credentials are valid, ``False`` if a 401 or 403 was set.
         """
         self._reject_call_target(request, "require_aka_digest")
         # Not awaitable in siphon (local Milenage, no I/O), so it must not

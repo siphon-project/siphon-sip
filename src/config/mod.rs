@@ -562,6 +562,10 @@ impl Config {
         config.read_untyped_sections(&document)?;
         config.validate_backends()?;
         config.validate_auth_algorithms()?;
+        config
+            .auth
+            .validate_aka_credentials()
+            .map_err(SiphonError::Config)?;
         config.validate_cdr()?;
         config.validate_control_app_events()?;
         config.validate_control_apps()?;

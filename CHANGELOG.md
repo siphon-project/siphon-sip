@@ -15,6 +15,16 @@ entry, but a working config keeps working.
 
 ### Fixed
 
+- **Local IMS AKA keeps a sequence number per subscriber and handles AUTS.**
+  `auth.require_aka_digest()` put SQN 1 in every challenge, so a UE that checks
+  freshness accepted the first and refused every later one, and its AUTS was
+  ignored and answered with SQN 1 again until the UE gave up. Each subscriber
+  now has an SQN that advances with every challenge (next SEQ, IND 0, TS 33.102
+  annex C), starting from the new optional `auth.aka_credentials.<id>.sqn`
+  (12 hex chars, default `000000000001`). An `auts=` is checked against the
+  RAND of the challenge it answers: a valid MAC-S re-bases the SQN on the UE's
+  and a fresh 401 goes out, an invalid one is answered 403 (TS 33.102 6.3.5).
+
 - **Outbound registrations wait out a provisional answer.** A 1xx to a
   REGISTER was handled as the final answer and failed the registration with
   status 100. A siphon P-CSCF sends 100 Trying to an unanswered REGISTER after
