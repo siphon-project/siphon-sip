@@ -15,6 +15,10 @@ mod ip_policy;
 #[cfg(target_os = "linux")]
 mod kernel_objects;
 pub mod netlink;
+/// Registrations restored without their security associations.
+pub mod restore;
+#[cfg(test)]
+mod restore_tests;
 /// When a UE's security associations are deleted (TS 33.203 clause 7.4.2a).
 pub mod retire;
 #[cfg(test)]
@@ -754,6 +758,8 @@ pub struct IpsecManager {
     /// What is known of each pair's registration: which carry a binding, which
     /// protected the REGISTER that set up another, which are due to go.
     lifecycle: retire::Lifecycle,
+    /// UE endpoints of bindings restored without their SAs (see [`restore`]).
+    orphaned_flows: restore::OrphanedFlows,
     /// XFRM backend.  Picked at startup from `IpsecConfig.backend`.
     backend: XfrmBackend,
     /// Test-only in-memory kernel.  When set, the four kernel-op methods
@@ -798,6 +804,7 @@ impl IpsecManager {
             associations: DashMap::new(),
             spis: spi::SpiAllocator::new(spi_range_start, spi_range_count),
             lifecycle: retire::Lifecycle::default(),
+            orphaned_flows: restore::OrphanedFlows::default(),
             backend,
             #[cfg(test)]
             kernel_mock: None,

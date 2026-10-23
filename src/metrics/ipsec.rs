@@ -6,6 +6,12 @@
 //! the partition is full at about half its size in UEs; past that,
 //! `ipsec.allocate` fails and `siphon_ipsec_spi_allocation_failures_total`
 //! counts it.
+//!
+//! `siphon_registrar_restored_without_sa_total` and
+//! `siphon_ipsec_unprotected_sends_refused_total` cover a restart
+//! ([`crate::ipsec::restore`]): protected bindings dropped because their SAs
+//! died with the previous process, and requests refused that would have
+//! reached one of those UEs in clear.
 
 use std::sync::OnceLock;
 
@@ -18,6 +24,8 @@ struct IpsecMetrics {
     spi_partition_size: IntGauge,
     spi_allocation_failures_total: IntCounter,
     ue_port_bind_failures_total: IntCounter,
+    restored_without_sa_total: IntCounter,
+    unprotected_sends_refused_total: IntCounter,
 }
 
 /// Create and register the IPsec metrics. Called once from [`super::init`].
@@ -42,11 +50,23 @@ pub(super) fn init(registry: &Registry) -> Result<(), prometheus::Error> {
     )?;
     registry.register(Box::new(spi_allocation_failures_total.clone()))?;
     registry.register(Box::new(ue_port_bind_failures_total.clone()))?;
+    let restored_without_sa_total = IntCounter::new(
+        "siphon_registrar_restored_without_sa_total",
+        "Protected registrar bindings restored from the backend whose IPsec SAs did not survive the restart, dropped at startup instead of restored as live; each UE re-registers",
+    )?;
+    let unprotected_sends_refused_total = IntCounter::new(
+        "siphon_ipsec_unprotected_sends_refused_total",
+        "Requests refused at egress because they would have reached a UE protected port in clear: the UE's SAs died with a previous process and no new pair covers the port",
+    )?;
+    registry.register(Box::new(restored_without_sa_total.clone()))?;
+    registry.register(Box::new(unprotected_sends_refused_total.clone()))?;
     let _ = IPSEC_METRICS.set(IpsecMetrics {
         spis_in_use,
         spi_partition_size,
         spi_allocation_failures_total,
         ue_port_bind_failures_total,
+        restored_without_sa_total,
+        unprotected_sends_refused_total,
     });
     Ok(())
 }
@@ -71,6 +91,34 @@ pub fn record_ue_port_bind_failure() {
     if let Some(metrics) = IPSEC_METRICS.get() {
         metrics.ue_port_bind_failures_total.inc();
     }
+}
+
+/// Count one protected binding dropped at startup because its SAs are gone.
+pub fn record_restored_without_sa() {
+    if let Some(metrics) = IPSEC_METRICS.get() {
+        metrics.restored_without_sa_total.inc();
+    }
+}
+
+/// Count one request refused because it would have left unprotected.
+pub fn record_unprotected_send_refused() {
+    if let Some(metrics) = IPSEC_METRICS.get() {
+        metrics.unprotected_sends_refused_total.inc();
+    }
+}
+
+/// Protected bindings dropped at startup so far. `None` before [`super::init`].
+pub fn restored_without_sa() -> Option<u64> {
+    IPSEC_METRICS
+        .get()
+        .map(|metrics| metrics.restored_without_sa_total.get())
+}
+
+/// Unprotected requests refused so far. `None` before [`super::init`].
+pub fn unprotected_sends_refused() -> Option<u64> {
+    IPSEC_METRICS
+        .get()
+        .map(|metrics| metrics.unprotected_sends_refused_total.get())
 }
 
 /// UE port bind failures counted so far. `None` before [`super::init`].
