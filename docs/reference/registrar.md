@@ -105,21 +105,48 @@ A registered IPsec entry re-registers and de-registers over the SA set it
 holds (TS 24.229 5.1.1.4, 5.1.1.6): from its protected client port to the
 P-CSCF's protected server port, with the Authorization of its last
 authentication, the Security-Server of that 401 in Security-Verify, and new SA
-parameters in Security-Client. The Via names the protected server port.
+parameters in Security-Client. The Via and the Contact name the protected
+server port (TS 24.229 5.1.1.4.2 b, c), as does the authenticated REGISTER
+after any 401: that is the binding the S-CSCF keeps, so MT requests come over
+the set to the protected server port. Only the unprotected initial REGISTER
+names the plain port.
 
-- **Not challenged:** the 200 extends the set's lifetime to the grant plus 32 s,
-  never shortening it. No new SA.
+- **Not challenged:** the 200 extends the set's lifetime to the grant plus 30 s,
+  never shortening it (TS 24.229 5.1.1.4.2). No new SA.
 - **Challenged:** the new set is installed beside the old one on another
   protected client port (TS 33.203 7.4.0: the client port changes, the server
-  port stays) and the authenticated REGISTER rides it. At its 200 the new set
-  takes over; the old one stays for the P-CSCF until the answer to the next
-  REGISTER arrives over the new one, then goes (TS 33.203 7.4.1a).
+  port stays) and the authenticated REGISTER rides it. Until its 200 the new
+  set lives 240 s, the reg-await-auth timer (TS 24.229 5.1.1.5.1); at the 200
+  it takes over, for the grant plus 30 s or what the old set had left if that
+  is longer. The old one stays for the P-CSCF until the answer to the next
+  REGISTER arrives over the new one, then goes (TS 33.203 7.4.1a). A P-CSCF
+  that keeps its protected client port (siphon's own does) gives both sets
+  one selector toward the UE's server port; the UE's policies there accept
+  either set's SA, so a request the P-CSCF still sends over the old set during
+  the overlap is received. Policies are re-pinned with the states, so no
+  policy ends under a live set.
+- **Invalid challenge:** an SQN out of range (AUTS) or a bad MAC is answered
+  over the established set, or unprotected without one, with a new
+  Security-Client and no temporary set (TS 24.229 5.1.1.5.3). A third
+  consecutive invalid challenge ends the attempt (5.1.1.5.12).
 - **Failed or unanswered (Timer F):** the new set, if any, goes and the next
   REGISTER is an unprotected one (TS 24.229 5.1.1.4.1). Its authentication
   deletes the set kept from before. A set the kernel no longer holds also sends
   the next REGISTER unprotected.
 - **`remove()`:** the protected de-REGISTER goes out and the SAs are deleted
   when it is answered, or after Timer F.
+- **Shutdown:** every entry is removed as `remove()` does, and the sets are
+  deleted before the process exits: as each de-REGISTER is answered, and
+  4 s after they were sent for the rest, deletions bounded to 5 s more (TS
+  33.203 7.4.1a). Nothing is left to the hard lifetime.
+- **A protected port that will not bind:** a rotation port no set holds moves
+  to another free port; the established set's own client port takes that set
+  out of use, so the next REGISTER goes unprotected. Each is logged and
+  counted in `siphon_ipsec_ue_port_bind_failures_total`. Only an unbindable
+  plain or server port, or no client port left, holds the entry back.
+- **SPIs:** an offer never reuses an SPI of a set the UE holds, of a pair the
+  IPsec manager owns, or of a kernel state present when the loop started, one
+  a previous process left included (TS 33.203 7.1).
 
 The UE rotates through three protected client ports: `ue_port_c` and the two
 above the higher of `ue_port_c` and `ue_port_s` (6100/6101 uses 6100, 6102 and
@@ -129,6 +156,7 @@ them itself, on the entry's address or the process's. A protected port of 0,
 5060 or 5061, or two entries on one address sharing any protected port, is
 refused.
 
-Not covered: an AUTS re-synchronisation still installs a set from the previous
-keys instead of answering over the existing set without one (TS 24.229
-5.1.1.5.3), and SAs are left to their hard lifetime at shutdown.
+Not covered: the registrant does not subscribe to the reg event package, so a
+network-initiated de-registration (TS 24.229 5.1.1.7) is learned from the next
+refresh's answer, which starts an initial registration, rather than from a
+NOTIFY.

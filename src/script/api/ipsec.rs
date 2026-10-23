@@ -550,8 +550,8 @@ impl PyPendingSA {
     }
 
     /// Mark the SA pair active.  Call on receipt of the 200 OK to the auth
-    /// REGISTER (the SAs are already installed in the kernel — this is a
-    /// metadata-only transition).  Idempotent on repeated calls; raises
+    /// REGISTER; siphon sends over the pair from that 200 on (TS 24.229
+    /// 5.2.2.2), called or not.  Idempotent on repeated calls; raises
     /// :class:`ValueError` if the PendingSA was already cleaned up.
     ///
     /// ``hard_lifetime_secs`` (optional) — when set, also re-pins the

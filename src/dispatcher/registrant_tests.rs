@@ -148,10 +148,13 @@ async fn a_ue_on_its_own_address_installs_its_sas_and_sends_protected_from_there
         ipsec
             .get_sa(&ip(UE_ADDR), 6100)
             .and_then(|sa| sa.hard_lifetime_secs)
-            .filter(|lifetime| *lifetime == 632)
+            .filter(|lifetime| *lifetime == 630)
     })
     .await;
-    assert_eq!(lifetime, 632);
+    assert_eq!(
+        lifetime, 630,
+        "the registration plus 30 s (TS 24.229 5.1.1.2.2 step 2)"
+    );
 }
 
 #[tokio::test]
@@ -190,6 +193,56 @@ async fn two_ues_on_the_same_ports_get_two_sa_pairs() {
     assert!(ipsec.get_sa(&ip("192.0.2.77"), 6100).is_some());
     assert!(ipsec.get_sa(&ip("192.0.2.78"), 6100).is_some());
     assert_eq!(ipsec.active_count(), 2);
+}
+
+/// An entry's own `interval` is the `Expires` of every REGISTER it sends, the
+/// first and the authenticated answer to a 401 alike. Both used to ask for the
+/// manager's default, so a per-entry interval never reached the registrar.
+#[tokio::test]
+async fn every_register_asks_for_the_entrys_own_interval() {
+    let registrant = Arc::new(test_support::manager());
+    let mut entry = trunk("sip:short@carrier.example");
+    entry.interval_secs = 120;
+    registrant.try_add(entry).expect("added");
+    let (dispatcher, _ipsec) = dispatcher(&registrant);
+    assert_eq!(registrant.default_interval, 3600, "the default must differ");
+    assert_eq!(registrant.interval_for("sip:short@carrier.example"), 120);
+    assert_eq!(registrant.interval_for("sip:unknown@carrier.example"), 3600);
+
+    let listen = HashMap::from([(Transport::Udp, "192.0.2.1:5060".parse().expect("addr"))]);
+    let first = registrant
+        .build_register(
+            "sip:short@carrier.example",
+            EgressDefaults::new("192.0.2.1:5060".parse().expect("addr"), &listen),
+            registrant.interval_for("sip:short@carrier.example"),
+        )
+        .expect("built");
+    let first_raw = first.message.to_bytes();
+    let first_text = String::from_utf8_lossy(&first_raw);
+    assert!(first_text.contains("Expires: 120\r\n"), "{first_text}");
+
+    let call_id = first
+        .message
+        .headers
+        .get("Call-ID")
+        .cloned()
+        .expect("a Call-ID");
+    let challenge = response(
+        "401 Unauthorized",
+        &call_id,
+        "WWW-Authenticate: Digest realm=\"carrier.example\", nonce=\"abc\", qop=\"auth\"\r\n",
+    );
+    handle_registrant_response(
+        &registrant,
+        &challenge,
+        401,
+        "z9hG4bK-reg-test",
+        &dispatcher.state,
+    );
+    let retry = dispatcher.udp.try_recv().expect("the authenticated retry");
+    let retry_text = String::from_utf8_lossy(&retry.data);
+    assert!(retry_text.contains("Authorization: Digest"), "{retry_text}");
+    assert!(retry_text.contains("Expires: 120\r\n"), "{retry_text}");
 }
 
 #[tokio::test]

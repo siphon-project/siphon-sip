@@ -70,6 +70,8 @@ auth:
       k: "465b5ce8b199b49faa5f0a2ee238a6bc"
       op: "cdc202d5123e20f62b6d676ac72cb318"
       amf: "8000"
+      # sqn: "000000000020"   # optional SQN of the first challenge (default 000000000001);
+      #                       # later ones advance, and a UE's AUTS re-bases it
     "001010000000002":
       k: "0396eb317b6d1c36f19c1c84cd6ffd16"
       op: "ff9bb4d0b607f35029a9384c2e7eb8a3"

@@ -13,13 +13,13 @@ use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
-const UE_ADDR: &str = "192.0.2.77";
+pub(super) const UE_ADDR: &str = "192.0.2.77";
 
-fn ip(text: &str) -> IpAddr {
+pub(super) fn ip(text: &str) -> IpAddr {
     text.parse().expect("an IP literal")
 }
 
-fn response(status: &str, call_id: &str, extra: &str) -> SipMessage {
+pub(super) fn response(status: &str, call_id: &str, extra: &str) -> SipMessage {
     let raw = format!(
         concat!(
             "SIP/2.0 {status}\r\n",
@@ -39,7 +39,7 @@ fn response(status: &str, call_id: &str, extra: &str) -> SipMessage {
     crate::sip::parser::parse_sip_message_bytes(raw.as_bytes()).expect("a response that parses")
 }
 
-async fn wait_for<T>(mut probe: impl FnMut() -> Option<T>) -> T {
+pub(super) async fn wait_for<T>(mut probe: impl FnMut() -> Option<T>) -> T {
     for _ in 0..400 {
         if let Some(value) = probe() {
             return value;
@@ -49,7 +49,7 @@ async fn wait_for<T>(mut probe: impl FnMut() -> Option<T>) -> T {
     probe().expect("the condition came true in time")
 }
 
-fn header(message: &OutboundMessage, name: &str) -> Option<String> {
+pub(super) fn header(message: &OutboundMessage, name: &str) -> Option<String> {
     let parsed =
         crate::sip::parser::parse_sip_message_bytes(&message.data).expect("a message that parses");
     parsed.headers.get(name).cloned()
@@ -57,17 +57,17 @@ fn header(message: &OutboundMessage, name: &str) -> Option<String> {
 
 /// A registrant, the dispatcher under test (192.0.2.1:5060) and its
 /// mock-kernel IPsec manager, and the network SQN of the next challenge.
-struct Harness {
-    registrant: Arc<RegistrantManager>,
-    dispatcher: super::test_dispatcher::TestDispatcher,
-    ipsec: Arc<IpsecManager>,
-    listen: HashMap<Transport, SocketAddr>,
-    sqn: u64,
-    spi: u32,
+pub(super) struct Harness {
+    pub(super) registrant: Arc<RegistrantManager>,
+    pub(super) dispatcher: super::test_dispatcher::TestDispatcher,
+    pub(super) ipsec: Arc<IpsecManager>,
+    pub(super) listen: HashMap<Transport, SocketAddr>,
+    pub(super) sqn: u64,
+    pub(super) spi: u32,
 }
 
 impl Harness {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         let registrant = Arc::new(test_support::manager());
         test_support::install_egress(&registrant);
         let mut dispatcher = super::test_dispatcher::test_dispatcher();
@@ -90,24 +90,24 @@ impl Harness {
         }
     }
 
-    fn add(&self, index: u32, address: &str) {
+    pub(super) fn add(&self, index: u32, address: &str) {
         self.registrant
             .try_add(ue(index, Some(ip(address))))
             .expect("added");
     }
 
-    fn defaults(&self) -> EgressDefaults<'_> {
+    pub(super) fn defaults(&self) -> EgressDefaults<'_> {
         EgressDefaults::new("192.0.2.1:5060".parse().expect("addr"), &self.listen)
     }
 
     /// Build the REGISTER the loop would send now.
-    fn register(&self, aor: &str) -> crate::registrant::BuiltRegister {
+    pub(super) fn register(&self, aor: &str) -> crate::registrant::BuiltRegister {
         self.registrant
             .build_register(aor, self.defaults(), 600000)
             .expect("built")
     }
 
-    fn call_id(&self, built: &crate::registrant::BuiltRegister) -> String {
+    pub(super) fn call_id(&self, built: &crate::registrant::BuiltRegister) -> String {
         built
             .message
             .headers
@@ -116,7 +116,7 @@ impl Harness {
             .expect("a Call-ID")
     }
 
-    fn answer(&self, status: &str, call_id: &str, extra: &str) {
+    pub(super) fn answer(&self, status: &str, call_id: &str, extra: &str) {
         let code: u16 = status[..3].parse().expect("a status code");
         handle_registrant_response(
             &self.registrant,
@@ -129,7 +129,7 @@ impl Harness {
 
     /// A 401 with a fresh AKA challenge and a Security-Server with fresh
     /// P-CSCF SPIs.
-    fn challenge(&mut self, call_id: &str) {
+    pub(super) fn challenge(&mut self, call_id: &str) {
         self.sqn += 1;
         self.spi += 2;
         let extra = format!(
@@ -140,7 +140,7 @@ impl Harness {
         self.answer("401 Unauthorized", call_id, &extra);
     }
 
-    async fn sent(&self) -> OutboundMessage {
+    pub(super) async fn sent(&self) -> OutboundMessage {
         tokio::time::timeout(Duration::from_secs(2), self.dispatcher.udp.recv_async())
             .await
             .expect("sent in time")
@@ -148,7 +148,7 @@ impl Harness {
     }
 
     /// The pairs installed on `address`, by client port.
-    fn ports(&self, address: &str) -> Vec<u16> {
+    pub(super) fn ports(&self, address: &str) -> Vec<u16> {
         let mut ports: Vec<u16> = [6100, 6102, 6103]
             .into_iter()
             .filter(|port| self.ipsec.get_sa(&ip(address), *port).is_some())
@@ -158,13 +158,13 @@ impl Harness {
     }
 
     /// Wait until exactly `expected` pairs are installed on `address`.
-    async fn settle(&self, address: &str, expected: &[u16]) {
+    pub(super) async fn settle(&self, address: &str, expected: &[u16]) {
         wait_for(|| (self.ports(address) == expected).then_some(())).await;
     }
 
     /// Initial registration: unprotected REGISTER, 401, the authenticated
     /// REGISTER over the new set, 200.
-    async fn register_initially(&mut self, index: u32, address: &str) {
+    pub(super) async fn register_initially(&mut self, index: u32, address: &str) {
         let aor = impu(index);
         let built = self.register(&aor);
         assert!(!built.protected);
@@ -181,7 +181,7 @@ impl Harness {
 
     /// A protected refresh the S-CSCF re-challenges, through to its 200.
     /// Returns the authenticated REGISTER.
-    async fn rechallenged_refresh(&mut self, aor: &str) -> OutboundMessage {
+    pub(super) async fn rechallenged_refresh(&mut self, aor: &str) -> OutboundMessage {
         let built = self.register(aor);
         assert!(built.protected, "a registered UE refreshes over its SA set");
         let call_id = self.call_id(&built);
@@ -270,7 +270,7 @@ async fn a_200_to_a_protected_refresh_extends_the_set_and_installs_none() {
             .ipsec
             .get_sa(&ip(UE_ADDR), 6100)
             .and_then(|sa| sa.hard_lifetime_secs)
-            .filter(|lifetime| *lifetime == 3632)
+            .filter(|lifetime| *lifetime == 3630)
     })
     .await;
     let installs_after = harness
@@ -295,7 +295,7 @@ async fn a_lifetime_is_never_shortened_by_a_shorter_grant() {
             .ipsec
             .get_sa(&ip(UE_ADDR), 6100)
             .and_then(|sa| sa.hard_lifetime_secs)
-            .filter(|lifetime| *lifetime == 3632)
+            .filter(|lifetime| *lifetime == 3630)
     })
     .await;
     let built = harness.register(&impu(1));
@@ -542,9 +542,10 @@ async fn an_unanswered_de_register_still_deletes_the_set() {
     harness
         .registrant
         .expire_teardowns(std::time::Instant::now() + Duration::from_secs(60));
-    let deletions = harness.registrant.take_pending_sa_deletions();
-    assert_eq!(deletions.len(), 1);
-    crate::registrant::protected::spawn_sa_deletions(deletions, &harness.ipsec, ip("192.0.2.1"));
+    assert_eq!(harness.registrant.tracked_sa_sets(), 1, "now queued");
+    harness
+        .registrant
+        .spawn_sa_deletions(&harness.ipsec, ip("192.0.2.1"));
     harness.settle(UE_ADDR, &[]).await;
     assert_eq!(harness.registrant.tracked_sa_sets(), 0);
 }
@@ -562,11 +563,9 @@ async fn a_removed_ue_mid_authentication_deletes_both_sets_at_once() {
     // Not registered right now, so no de-REGISTER: the sets go at once.
     harness.registrant.remove(&impu(1));
     assert!(test_support::take_deregistrations(&harness.registrant).is_empty());
-    crate::registrant::protected::spawn_sa_deletions(
-        harness.registrant.take_pending_sa_deletions(),
-        &harness.ipsec,
-        ip("192.0.2.1"),
-    );
+    harness
+        .registrant
+        .spawn_sa_deletions(&harness.ipsec, ip("192.0.2.1"));
     harness.settle(UE_ADDR, &[]).await;
     assert_eq!(harness.ipsec.test_kernel_live_count(), 0);
 }
@@ -632,4 +631,41 @@ async fn sa_sets_drain_to_one_per_entry_across_500_challenge_cycles() {
     wait_for(|| (harness.ipsec.active_count() == 0).then_some(())).await;
     assert_eq!(harness.registrant.tracked_sa_sets(), 0);
     assert_eq!(harness.ipsec.test_kernel_live_count(), 0);
+}
+
+/// A provisional answer to a protected refresh is not its outcome (RFC 3261
+/// 17.1.2.2: Trying -> Proceeding, the transaction waits for the final
+/// response). A P-CSCF whose server transaction emits a 100 Trying once Timer
+/// E reaches T2 (RFC 4320 4.2, 3.5 s over UDP) used to fail the refresh with
+/// status 100, which dropped the established set and sent the next REGISTER
+/// unprotected, drawing a fresh challenge.
+#[tokio::test]
+async fn a_100_trying_to_a_protected_refresh_does_not_fail_it() {
+    let mut harness = Harness::new();
+    harness.add(1, UE_ADDR);
+    harness.register_initially(1, UE_ADDR).await;
+
+    let built = harness.register(&impu(1));
+    assert!(built.protected);
+    let call_id = harness.call_id(&built);
+    harness.answer("100 Trying", &call_id, "");
+    assert_eq!(
+        harness.registrant.state(&impu(1)),
+        Some(RegistrantState::Registering),
+        "a provisional leaves the refresh in flight"
+    );
+    assert!(
+        test_support::sa_sets(&harness.registrant, &impu(1))
+            .established
+            .is_some(),
+        "the established set survives the provisional"
+    );
+
+    harness.answer("200 OK", &call_id, "Expires: 600\r\n");
+    assert_eq!(
+        harness.registrant.state(&impu(1)),
+        Some(RegistrantState::Registered)
+    );
+    let next = harness.register(&impu(1));
+    assert!(next.protected, "the next refresh still rides the SA set");
 }

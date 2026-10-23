@@ -619,6 +619,17 @@ auth:
   #   domain (round-robin DNS) or cross-instance challenges re-issue. Omit for a
   #   single instance; timestamp-only replay bounding still applies.
 
+  # Local IMS AKA (Milenage, no HSS) for auth.require_aka_digest(), keyed by
+  # IMPI or its user part. Each subscriber keeps an SQN that advances with every
+  # challenge (TS 33.102 annex C); `sqn` (12 hex chars, optional, default
+  # 000000000001) is the first one. A UE's AUTS re-bases it (TS 33.102 6.3.5).
+  # aka_credentials:
+  #   "001010000000001":
+  #     k: "465b5ce8b199b49faa5f0a2ee238a6bc"
+  #     op: "cdc202d5123e20f62b6d676ac72cb318"
+  #     amf: "8000"
+  #     sqn: "000000000020"
+
   # Static credentials (dev / bring-up only)
   users:
     alice: "secret"

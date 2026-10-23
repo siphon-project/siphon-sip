@@ -23,10 +23,20 @@
 #   4. refreshes spread over refresh_window (from the script's event lines),
 #      sent over each UE's SA set: still 4 x N xfrm states after them (a
 #      protected refresh the S-CSCF accepts installs no new set)
+#   4b. policies survive two Expires of refreshes on both ends (4 x N each),
+#      and the P-CSCF de-registers nobody as ipsec idle
 #   5. the /32s are replaced by a shifted set and the address file rewritten:
 #      every UE re-registers from its new address, no restart
 #   6. optional (CALL_TEST=1, needs sipp): one call from UE 1 to UE 2 through
 #      the P-CSCF, bridged to a sipp UAS standing in for the tester
+#   7. make-before-break (OVERLAP_TEST=1, the default): the S-CSCF re-challenges
+#      UE 1's next protected refresh, so it holds an old and a new SA set on
+#      one protected server port. During that overlap a datagram is sent from
+#      the P-CSCF's protected client port over the OLD set (its outbound policy
+#      pointed at the old SPI for the one packet); the UE kernel must decrypt it
+#      on the old inbound SA with no XfrmInTmplMismatch
+#   8. shutdown: SIGTERM to the UE process; once it exits, 0 xfrm states and 0
+#      xfrm policies left in the UE namespace
 # and prints the UE process's fd count and RSS.
 #
 # Usage:
@@ -43,6 +53,8 @@
 #   CORE_NS/UE_NS  namespace names, default core / ue (refused if they exist)
 #   REGISTER_TIMEOUT seconds to wait for all UEs registered, default 120
 #   CALL_TEST      1 to run the optional call step
+#   OVERLAP_TEST   0 to skip the make-before-break step, default 1
+#   STOP_TIMEOUT   seconds to wait for the UE process to exit, default 60
 #   KEEP           1 to leave namespaces and processes up on exit
 set -euo pipefail
 
@@ -57,6 +69,8 @@ CORE_NS="${CORE_NS:-core}"
 UE_NS="${UE_NS:-ue}"
 REGISTER_TIMEOUT="${REGISTER_TIMEOUT:-120}"
 CALL_TEST="${CALL_TEST:-0}"
+OVERLAP_TEST="${OVERLAP_TEST:-1}"
+STOP_TIMEOUT="${STOP_TIMEOUT:-60}"
 KEEP="${KEEP:-0}"
 
 HOME_DOMAIN="ims.mnc01.mcc001.3gppnetwork.org"
@@ -139,6 +153,66 @@ build_network() {
     mkdir -p "/etc/netns/$UE_NS" "/etc/netns/$CORE_NS"
     printf '127.0.0.1 localhost\n%s %s\n' "$CORE_IP" "$HOME_DOMAIN" >"/etc/netns/$UE_NS/hosts"
     printf '127.0.0.1 localhost\n%s %s\n' "$SCSCF_IP" "$HOME_DOMAIN" >"/etc/netns/$CORE_NS/hosts"
+    # Without its own resolv.conf a namespace inherits the host's, whose
+    # nameserver (often a stub on 127.0.0.53) does not exist inside it, and a
+    # query to a nameserver that never answers costs siphon its full per-query
+    # timeout. RFC 3263 makes up to four lookups per resolve (SRV _udp, SRV
+    # _tcp, A, AAAA), so every relay ran out its DNS budget. Each namespace
+    # gets a stub on its own loopback instead: A for the home domain is the
+    # next hop on that side, every other name is answered NXDOMAIN at once.
+    printf 'nameserver 127.0.0.1\n' >"/etc/netns/$UE_NS/resolv.conf"
+    printf 'nameserver 127.0.0.1\n' >"/etc/netns/$CORE_NS/resolv.conf"
+    write_dns_stub
+    start_dns_stub "$UE_NS" "$CORE_IP"
+    start_dns_stub "$CORE_NS" "$SCSCF_IP"
+}
+
+# A minimal DNS responder (RFC 1035): A <home domain> -> $2, anything else
+# NXDOMAIN, so the RFC 3263 SRV lookups fail at once and the A lookup succeeds.
+write_dns_stub() {
+    cat >"$SCRATCH/dns_stub.py" <<'PYEOF'
+import socket
+import struct
+import sys
+
+domain = sys.argv[1].lower().rstrip(".")
+address = socket.inet_aton(sys.argv[2])
+
+listener = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+listener.bind(("127.0.0.1", 53))
+while True:
+    query, peer = listener.recvfrom(512)
+    if len(query) < 12:
+        continue
+    identifier = query[:2]
+    labels, offset = [], 12
+    while offset < len(query) and query[offset] != 0:
+        length = query[offset]
+        labels.append(query[offset + 1 : offset + 1 + length].decode("ascii", "replace"))
+        offset += 1 + length
+    question = query[12 : offset + 5]
+    qtype = struct.unpack("!H", query[offset + 1 : offset + 3])[0] if offset + 3 <= len(query) else 0
+    name = ".".join(labels).lower()
+    if name == domain and qtype == 1:
+        header = identifier + struct.pack("!HHHHH", 0x8180, 1, 1, 0, 0)
+        answer = b"\xc0\x0c" + struct.pack("!HHIH", 1, 1, 60, 4) + address
+        listener.sendto(header + question + answer, peer)
+    elif name == domain:
+        # The name exists, just not with this type: NOERROR, no answers, so a
+        # resolver does not negative-cache the name the A record lives on.
+        header = identifier + struct.pack("!HHHHH", 0x8180, 1, 0, 0, 0)
+        listener.sendto(header + question, peer)
+    else:
+        header = identifier + struct.pack("!HHHHH", 0x8183, 1, 0, 0, 0)
+        listener.sendto(header + question, peer)
+PYEOF
+}
+
+# Run the DNS stub inside namespace $1, answering the home domain with $2.
+start_dns_stub() {
+    ip netns exec "$1" python3 -I "$SCRATCH/dns_stub.py" "$HOME_DOMAIN" "$2" \
+        >"$SCRATCH/dns_stub_$1.log" 2>&1 &
+    PIDS+=("$!")
 }
 
 # Put the UE /32s (shifted by $1) on the dummy interface, replacing any.
@@ -276,6 +350,31 @@ wait_registered() {
     done
     log "counts: $(status_query "status['counts']")"
     fail "only ${registered:-0}/$N registered from the expected addresses after ${REGISTER_TIMEOUT}s"
+}
+
+# The XFRM policies must live exactly as long as their SAs. A policy whose
+# lifetime is not re-pinned with its SAs on a protected refresh is deleted by
+# the kernel one Expires after install, while the SAs live on: SIP on the
+# protected ports then goes out in clear, and a P-CSCF that reads idleness
+# from SA use de-registers the UE. Wait past two Expires of refreshes (no
+# re-challenge, so no new set replaces the first) and require every policy
+# on both ends, and no idle de-registration at the P-CSCF. $1 is SECONDS at
+# the moment all UEs were registered.
+check_policies_survive() {
+    local registered_at="$1" until ue_policies core_policies ue_states core_states idle
+    until=$(( registered_at + 2 * INTERVAL + 40 ))
+    log "waiting past two Expires (until +$(( until - registered_at ))s) for the policy lifetime check"
+    while (( SECONDS < until )); do sleep 5; done
+    ue_policies="$(ip netns exec "$UE_NS" ip xfrm policy | grep -c '^src' || true)"
+    core_policies="$(ip netns exec "$CORE_NS" ip xfrm policy | grep -c '^src' || true)"
+    ue_states="$(ip netns exec "$UE_NS" ip xfrm state | grep -c '^src' || true)"
+    core_states="$(ip netns exec "$CORE_NS" ip xfrm state | grep -c '^src' || true)"
+    idle="$(grep -c 'ipsec idle' "$SCRATCH/pcscf.log" || true)"
+    log "after two Expires: $UE_NS policies $ue_policies states $ue_states, $CORE_NS policies $core_policies states $core_states (expected $(( 4 * N )) each), P-CSCF ipsec-idle de-registrations $idle"
+    ip netns exec "$UE_NS" ip -s xfrm policy | grep -m 4 -E 'lifetime|add ' | sed 's/^/    /' || true
+    [[ "$ue_policies" -eq $(( 4 * N )) ]] || fail "UE side holds $ue_policies policies for $ue_states states: policies expired under live SAs"
+    [[ "$core_policies" -eq $(( 4 * N )) ]] || fail "P-CSCF side holds $core_policies policies for $core_states states: policies expired under live SAs"
+    [[ "$idle" -eq 0 ]] || fail "the P-CSCF de-registered $idle UEs as ipsec idle"
 }
 
 check_xfrm() {
@@ -434,10 +533,101 @@ EOF
     fi
 }
 
+# The SPIs of the inbound states in the UE namespace whose selector is
+# P-CSCF:5064 -> $1:6101 (SA #3 of each set the UE holds there), one per line.
+ue_server_spis() {
+    ip netns exec "$UE_NS" ip xfrm state list dst "$1" proto esp | python3 -c '
+import re, sys
+spi = None
+for line in sys.stdin:
+    if line.startswith("src "):
+        spi = None
+    match = re.search(r"proto esp spi (0x[0-9a-f]+)", line)
+    if match:
+        spi = match.group(1)
+    if spi and re.search(r"sel src \S+ dst \S+ .*sport 5064 dport 6101", line):
+        print(spi)
+'
+}
+
+xfrm_stat() {
+    ip netns exec "$UE_NS" awk -v name="$1" '$1 == name {print $2}' /proc/net/xfrm_stat
+}
+
+# Packets the UE namespace decrypted on the inbound state with SPI $2 to $1.
+state_packets() {
+    ip netns exec "$UE_NS" ip -s xfrm state get src "$CORE_IP" dst "$1" proto esp spi "$2" \
+        | awk '/lifetime current:/ {getline; if (match($0, /[0-9]+\(packets\)/)) print substr($0, RSTART, RLENGTH - 9); exit}'
+}
+
+check_overlap() {
+    local ue deadline spis old new before_mismatch after_mismatch before after
+    ue="$(ue_addr 1 "$ADDR_SHIFT")"
+    old="$(ue_server_spis "$ue" | head -n 1)"
+    [[ -n "$old" ]] || fail "OVERLAP: no inbound SA #3 for $ue"
+    log "OVERLAP: re-challenging protected refreshes; waiting for UE 1 ($ue) to hold two sets"
+    touch "$SCRATCH/rechallenge"
+    deadline=$(( SECONDS + INTERVAL ))
+    spis=""
+    while (( SECONDS < deadline )); do
+        spis="$(ue_server_spis "$ue")"
+        [[ "$(wc -l <<<"$spis")" -ge 2 ]] && break
+        sleep 1
+    done
+    rm -f "$SCRATCH/rechallenge"
+    [[ "$(wc -l <<<"$spis")" -ge 2 ]] || fail "OVERLAP: UE 1 never held two sets"
+    new="$(grep -v -x -- "$old" <<<"$spis" | head -n 1)"
+    log "OVERLAP: old SA #3 spi $old, new $new"
+
+    before_mismatch="$(xfrm_stat XfrmInTmplMismatch)"
+    before="$(state_packets "$ue" "$old")"
+    # One datagram from the P-CSCF's protected client port over the old set:
+    # its outbound policy points at the old SPI for this packet only.
+    ip netns exec "$CORE_NS" ip xfrm policy update src "$CORE_IP/32" dst "$ue/32" \
+        proto any sport 5064 dport 6101 dir out \
+        tmpl src "$CORE_IP" dst "$ue" proto esp spi "$old" mode transport
+    ip netns exec "$CORE_NS" python3 -c '
+import socket, sys
+probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+probe.bind((sys.argv[1], 5064))
+probe.sendto(b"OPTIONS sip:overlap-probe SIP/2.0\r\nContent-Length: 0\r\n\r\n", (sys.argv[2], 6101))
+' "$CORE_IP" "$ue"
+    ip netns exec "$CORE_NS" ip xfrm policy update src "$CORE_IP/32" dst "$ue/32" \
+        proto any sport 5064 dport 6101 dir out \
+        tmpl src "$CORE_IP" dst "$ue" proto esp spi "$new" mode transport
+    sleep 1
+    after="$(state_packets "$ue" "$old")"
+    after_mismatch="$(xfrm_stat XfrmInTmplMismatch)"
+    log "OVERLAP: old SA #3 packets $before -> $after, XfrmInTmplMismatch $before_mismatch -> $after_mismatch"
+    (( after > before )) || fail "OVERLAP: the old set did not receive the probe"
+    [[ "$after_mismatch" == "$before_mismatch" ]] \
+        || fail "OVERLAP: the UE dropped a packet on the old set (template mismatch)"
+}
+
+check_shutdown_cleanup() {
+    local pid="$1" deadline states policies
+    log "SHUTDOWN: SIGTERM to the UE process $pid"
+    kill -TERM "$pid"
+    deadline=$(( SECONDS + STOP_TIMEOUT ))
+    while kill -0 "$pid" 2>/dev/null && (( SECONDS < deadline )); do
+        sleep 1
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+        fail "SHUTDOWN: the UE process did not exit within ${STOP_TIMEOUT}s"
+    fi
+    states="$(ip netns exec "$UE_NS" ip xfrm state | grep -c '^src' || true)"
+    policies="$(ip netns exec "$UE_NS" ip xfrm policy | grep -c '^src' || true)"
+    log "SHUTDOWN: xfrm states $states, policies $policies left in $UE_NS (expected 0 and 0)"
+    [[ "$states" -eq 0 && "$policies" -eq 0 ]] \
+        || fail "SHUTDOWN: the UE left security associations in the kernel"
+}
+
 main() {
     preflight
     mkdir -p "$SCRATCH"
-    rm -f "$SCRATCH"/*.log "$SCRATCH/status.json"
+    rm -f "$SCRATCH"/*.log "$SCRATCH/status.json" "$SCRATCH/rechallenge"
     trap cleanup EXIT
     trap 'exit 130' INT TERM
 
@@ -445,7 +635,8 @@ main() {
     write_core_configs
     write_ue_csv 0
 
-    start_siphon "$CORE_NS" scscf "$SCRATCH/scscf.yaml"
+    start_siphon "$CORE_NS" scscf "$SCRATCH/scscf.yaml" \
+        "AKA_LAB_RECHALLENGE_FILE=$SCRATCH/rechallenge"
     start_siphon "$CORE_NS" pcscf "$SCRATCH/pcscf.yaml"
     sleep 2
     # The UE side runs the shipped example config from the repo root, so its
@@ -462,11 +653,13 @@ main() {
     local ue_pid="${PIDS[-1]}"
 
     wait_registered 0
+    local registered_at=$SECONDS
     check_xfrm
     check_contacts 0
     report_process "$ue_pid"
     check_refresh_spread
     check_xfrm
+    check_policies_survive "$registered_at"
 
     log "moving every UE: /32s shifted by $ADDR_SHIFT, address file rewritten"
     assign_addresses "$ADDR_SHIFT"
@@ -480,6 +673,10 @@ main() {
     if [[ "$CALL_TEST" == "1" ]]; then
         call_test
     fi
+    if [[ "$OVERLAP_TEST" == "1" ]]; then
+        check_overlap
+    fi
+    check_shutdown_cleanup "$ue_pid"
     log "PASS"
 }
 

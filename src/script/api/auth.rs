@@ -10,6 +10,7 @@
 mod credential_cache_tests;
 mod ims;
 mod integrity;
+mod local_aka;
 mod sip_digest;
 #[cfg(test)]
 mod test_support;
@@ -29,6 +30,7 @@ use crate::auth::server::{ha1_column_for, CredentialLookup, DatabaseCredentials}
 use crate::auth::DigestAlgorithm;
 use crate::config::{AkaCredential, AuthBackendType, DatabaseAuthConfig, HttpAuthConfig};
 use crate::diameter::DiameterManager;
+#[cfg(test)]
 use vectors::{store_auth_vector, take_auth_vector};
 
 /// A credential the script handed to a digest helper, in place of the
@@ -264,6 +266,8 @@ pub struct PyAuth {
     diameter_manager: Option<Arc<DiameterManager>>,
     /// AKA credentials: IMPI → (K, OP, AMF) for local Milenage computation.
     aka_credentials: Arc<HashMap<String, AkaCredential>>,
+    /// SQN of each local-AKA subscriber's next challenge (TS 33.102 6.3.2).
+    aka_sequence: Arc<local_aka::SqnStore>,
     /// HTTP auth backend config (url template, timeouts, ha1 flag).
     http_config: Option<HttpAuthConfig>,
     /// Shared reqwest client for HTTP auth lookups.
@@ -317,6 +321,7 @@ impl PyAuth {
             default_realm,
             diameter_manager: None,
             aka_credentials: Arc::new(HashMap::new()),
+            aka_sequence: Arc::default(),
             http_config: None,
             http_client: None,
             credential_cache: None,
@@ -336,6 +341,7 @@ impl PyAuth {
             default_realm: "siphon".to_string(),
             diameter_manager: None,
             aka_credentials: Arc::new(HashMap::new()),
+            aka_sequence: Arc::default(),
             http_config: None,
             http_client: None,
             credential_cache: None,
@@ -395,6 +401,7 @@ impl PyAuth {
     /// Set AKA credentials for local Milenage auth.
     pub fn set_aka_credentials(&mut self, credentials: HashMap<String, AkaCredential>) {
         self.aka_credentials = Arc::new(credentials);
+        self.aka_sequence = Arc::default();
     }
 
     /// Wire the registrar `verify_integrity_protected` checks bindings against.
@@ -680,128 +687,17 @@ impl PyAuth {
     /// for the P-CSCF: it must strip them with `reply.take_av()` before
     /// relaying the 401 to the UE, and sets up the IPsec SAs from them.
     ///
-    /// Returns True if credentials are valid, False if a 401 challenge was sent.
+    /// Each subscriber has its own SQN, starting at its credential's `sqn`
+    /// (default 000000000001) and advancing with every challenge (TS 33.102
+    /// annex C). An Authorization carrying `auts=` (the UE found the SQN out of
+    /// range) is checked against the RAND of the challenge it answers: a valid
+    /// MAC-S re-bases the SQN on the UE's and a fresh 401 goes out, an invalid
+    /// one is refused with 403 (TS 33.102 6.3.5).
+    ///
+    /// Returns True if credentials are valid, False if a 401 or 403 was set.
     #[pyo3(signature = (request, realm=None))]
     fn require_aka_digest(&self, request: &mut PyRequest, realm: Option<&str>) -> PyResult<bool> {
-        use crate::ipsec::milenage;
-
-        let realm = realm.unwrap_or(&self.default_realm);
-
-        // Extract username from the request (From header or Authorization)
-        let (existing_auth, from_user, method) = {
-            let message = request.message();
-            let guard = message.lock().map_err(|error| {
-                pyo3::exceptions::PyRuntimeError::new_err(format!("lock poisoned: {error}"))
-            })?;
-            let auth = guard.headers.get("Authorization").cloned();
-            let from = guard.headers.from().cloned().unwrap_or_default();
-            // Extract user part from From header for credential lookup
-            let user = extract_username_from_uri(&from);
-            // HA2 is H(method:uri), so the method has to be the one the UE
-            // actually sent rather than an assumed REGISTER.
-            let method = match &guard.start_line {
-                crate::sip::message::StartLine::Request(rl) => rl.method.as_str().to_string(),
-                _ => "REGISTER".to_string(),
-            };
-            (auth, user, method)
-        };
-
-        // Look up AKA credentials for this user
-        let impi = match &existing_auth {
-            Some(auth_value) => {
-                // Use username from Authorization header
-                extract_username(auth_value)
-                    .unwrap_or_else(|| from_user.clone().unwrap_or_default())
-            }
-            None => from_user.clone().unwrap_or_default(),
-        };
-
-        // Try lookup with full IMPI, then just username part
-        let credential = self
-            .aka_credentials
-            .get(&impi)
-            .or_else(|| {
-                // Try without domain: "001010000000001" if IMPI is "001010000000001@ims.test"
-                let bare = impi.split('@').next().unwrap_or(&impi);
-                self.aka_credentials.get(bare)
-            })
-            .or_else(|| {
-                // Try with domain appended
-                let with_domain = format!("{}@{}", impi, realm);
-                self.aka_credentials.get(&with_domain)
-            });
-
-        let credential = match credential {
-            Some(cred) => cred.clone(),
-            None => {
-                // No AKA credentials — reject
-                request.set_reply(403, "Forbidden".to_string());
-                return Ok(false);
-            }
-        };
-
-        // Parse hex keys
-        let k = milenage::hex_to_bytes(&credential.k)
-            .and_then(|b| <[u8; 16]>::try_from(b).ok())
-            .ok_or_else(|| {
-                pyo3::exceptions::PyRuntimeError::new_err("invalid AKA K (need 32 hex chars)")
-            })?;
-        let op = milenage::hex_to_bytes(&credential.op)
-            .and_then(|b| <[u8; 16]>::try_from(b).ok())
-            .ok_or_else(|| {
-                pyo3::exceptions::PyRuntimeError::new_err("invalid AKA OP (need 32 hex chars)")
-            })?;
-        let amf = milenage::hex_to_bytes(&credential.amf)
-            .and_then(|b| <[u8; 2]>::try_from(b).ok())
-            .ok_or_else(|| {
-                pyo3::exceptions::PyRuntimeError::new_err("invalid AKA AMF (need 4 hex chars)")
-            })?;
-
-        // SQN: use a simple counter (in production, track per-subscriber)
-        let sqn: [u8; 6] = [0, 0, 0, 0, 0, 1];
-
-        match existing_auth {
-            Some(auth_value) => {
-                // Second REGISTER — verify `response=` against the XRES cached
-                // when the challenge went out. RFC 3310 §3.3: for AKAv1-MD5 the
-                // digest password is the raw XRES bytes, so
-                // HA1 = MD5(username:realm:XRES).
-                //
-                // The vector is consumed whether or not it verifies, so a
-                // captured Authorization replayed against the same nonce finds
-                // nothing and is challenged afresh.
-                let stored = extract_nonce_field(&auth_value).and_then(|n| take_auth_vector(&n));
-
-                match (stored, DigestFields::parse(&auth_value)) {
-                    (Some(vector), Some(fields)) => {
-                        let ha1 = md5_ha1_aka(&fields.username, realm, &vector.expected_response);
-                        if fields.verify(&ha1, &method) {
-                            request.set_auth_user(fields.username);
-                            return Ok(true);
-                        }
-                        debug!(
-                            username = %fields.username,
-                            "AKA auth: digest response did not verify",
-                        );
-                    }
-                    (None, _) => debug!(
-                        "AKA auth: no live vector for this nonce (expired, replayed, or never issued)",
-                    ),
-                    (Some(_), None) => {
-                        debug!("AKA auth: Authorization header could not be parsed")
-                    }
-                }
-
-                // Wrong, stale or replayed — challenge again with a fresh vector.
-                self.send_aka_challenge(request, realm, &k, &op, &sqn, &amf)?;
-                Ok(false)
-            }
-            None => {
-                // First REGISTER — generate AKA challenge
-                self.send_aka_challenge(request, realm, &k, &op, &sqn, &amf)?;
-                Ok(false)
-            }
-        }
+        self.local_aka_digest(request, realm)
     }
 
     /// P-CSCF: stamp `integrity-protected` into every Authorization header.
@@ -1327,41 +1223,6 @@ impl PyAuth {
                 Ok(false)
             }
         }
-    }
-
-    /// Send a 401 challenge with AKA nonce (locally computed via Milenage).
-    fn send_aka_challenge(
-        &self,
-        request: &mut PyRequest,
-        realm: &str,
-        k: &[u8; 16],
-        op: &[u8; 16],
-        sqn: &[u8; 6],
-        amf: &[u8; 2],
-    ) -> PyResult<()> {
-        use crate::ipsec::milenage;
-
-        let vector = milenage::generate_vector(k, op, sqn, amf);
-
-        // AKA nonce = base64(RAND || AUTN) per 3GPP TS 33.203
-        let mut nonce_bytes = Vec::with_capacity(32);
-        nonce_bytes.extend_from_slice(&vector.rand);
-        nonce_bytes.extend_from_slice(&vector.autn);
-        let nonce = base64_encode(&nonce_bytes);
-
-        // The verification REGISTER has to check against *this* vector: a fresh
-        // one would carry a different RAND, so its XRES could never match.
-        store_auth_vector(nonce, vector.xres.clone());
-
-        // Same header as the HSS path, CK/IK included, so a P-CSCF in front of
-        // this S-CSCF can take them off the 401 and set up the SAs.
-        self.send_ims_challenge(
-            request,
-            realm,
-            &nonce_bytes,
-            Some(&vector.ck),
-            Some(&vector.ik),
-        )
     }
 
     /// Validate credentials by dispatching to the configured backend.
@@ -3761,7 +3622,15 @@ mod tests {
         let (k, op, amf, _) = aka_test_set_1();
         let mut auth = PyAuth::empty();
         let mut credentials = HashMap::new();
-        credentials.insert(impi.to_string(), AkaCredential { k, op, amf });
+        credentials.insert(
+            impi.to_string(),
+            AkaCredential {
+                k,
+                op,
+                amf,
+                sqn: None,
+            },
+        );
         auth.set_aka_credentials(credentials);
         auth
     }

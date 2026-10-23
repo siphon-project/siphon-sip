@@ -13,7 +13,111 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
+### Fixed
+
+- **P-CSCF: a re-authentication challenge is sent over the existing SA set.**
+  The set `ipsec.allocate()` installs for a 401 replaced the kernel's outbound
+  policy of the selector it shares with the UE's set in use (the P-CSCF's
+  protected client port to the UE's protected server port, which stays across
+  a re-authentication, TS 33.203 clause 7.4.0). Since UDP responses go over
+  that selector, the 401 went out under the new SA, whose keys the UE can only
+  derive from that 401, so it dropped the challenge and the new set was deleted
+  unused 30 s later. Every UE re-authenticated on a protected re-registration
+  hit it. The new set now stays pending: the 401 and everything else go over
+  the set in use (TS 24.229 clause 5.2.2.2, TS 33.203 clause 7.4.2a), the
+  inbound policy of that selector accepts either set, and the new set is taken
+  into use as the 200 to the REGISTER that came over it leaves, so that 200
+  goes over it. The old set then goes after 64*T1. A pending set that is never
+  answered is deleted with the outbound policy left on the set in use; if the
+  set in use goes first, the pending one takes over.
+
+- **Local IMS AKA keeps a sequence number per subscriber and handles AUTS.**
+  `auth.require_aka_digest()` put SQN 1 in every challenge, so a UE that checks
+  freshness accepted the first and refused every later one, and its AUTS was
+  ignored and answered with SQN 1 again until the UE gave up. Each subscriber
+  now has an SQN that advances with every challenge (next SEQ, IND 0, TS 33.102
+  annex C), starting from the new optional `auth.aka_credentials.<id>.sqn`
+  (12 hex chars, default `000000000001`). An `auts=` is checked against the
+  RAND of the challenge it answers: a valid MAC-S re-bases the SQN on the UE's
+  and a fresh 401 goes out, an invalid one is answered 403 (TS 33.102 6.3.5).
+
+- **Outbound registrations wait out a provisional answer.** A 1xx to a
+  REGISTER was handled as the final answer and failed the registration with
+  status 100. A siphon P-CSCF sends 100 Trying to an unanswered REGISTER after
+  3.5 s over UDP (RFC 4320), so a refresh the S-CSCF answered slowly failed,
+  the UE dropped its SA set and re-registered unprotected, drawing a new
+  challenge. A provisional now leaves the REGISTER in flight (RFC 3261
+  17.1.2.2) and Timer F still bounds it.
+
+- **Outbound registrations ask for their own `interval`.** Every REGISTER, the
+  first, the authenticated answer to a 401 and each refresh, carried the
+  manager's `default_interval` in `Expires`, so an entry's `interval` (YAML or
+  `registration.add(interval=...)`) never reached the registrar. They now ask
+  for the entry's own interval, as does the fallback for a 200 that grants none.
+
+- **A refresh is reported as `refreshed`.** `@registration.on_change`, the
+  control plane's `RegistrantChanged` and the Rust event stream reported every
+  re-registration as a new `registered`: the state the check read had already
+  moved to `registering` when the refresh was sent. A 200 now counts as a
+  refresh whenever the registrar still held the entry's binding.
+
+- **IMS UE registrant: the Contact of a protected REGISTER names the protected
+  server port.** The authenticated REGISTER after a 401 and every protected
+  re- and de-REGISTER bound the plain port, so the S-CSCF sent MT requests
+  outside the SAs. They now bind `ue_port_s` (TS 24.229 5.1.1.2.2 b, 5.1.1.4.2
+  b, 5.1.1.6.2 b); the unprotected initial REGISTER keeps the plain port.
+
+- **IMS UE registrant: an invalid AKA challenge sets up no SA set.** An AUTS
+  re-synchronisation installed a temporary set from the previous keys, which
+  the P-CSCF could not read. It now goes over the established set, or
+  unprotected without one, with new SPIs and client port and no temporary set
+  (TS 24.229 5.1.1.5.3). A bad MAC is answered the same way with an empty
+  response instead of ending the registration, and a third consecutive
+  invalid challenge ends it (5.1.1.5.12).
+
+- **IMS UE registrant: SA sets are deleted at shutdown.** Shutdown removes every
+  entry, de-registers over each UE's set and deletes the sets as the answers
+  come, and the rest after 4 s, before the process exits (bounded, 5 s of
+  deletions at most). They used to stay in the kernel to their hard lifetime.
+  Removing the entries also stops the loop refreshing a binding during the
+  drain that shutdown had just cleared.
+
+- **IMS UE registrant: SA lifetimes.** A temporary set lives the 4-minute
+  reg-await-auth timer (TS 24.229 5.1.1.5.1), not the default interval, and an
+  established one the registration plus 30 s (was 32 s). Policy lifetimes are
+  now re-pinned with the states, for the P-CSCF too: a policy used to keep its
+  install lifetime and end under a live set.
+
+- **IMS UE registrant: make-before-break against a P-CSCF with a fixed
+  protected client port.** The old and new sets share the policies toward the
+  UE's server port, whose template named the newest set's SPI only, so a
+  request the P-CSCF sent over the old set during the overlap was dropped. The
+  UE's templates there now accept any SA of the selector, and installing or
+  deleting one set never removes the policy under the other. The P-CSCF role
+  is unchanged.
+
+- **IMS UE registrant: a protected port that will not bind no longer stalls the
+  entry.** A rotation port moves to another free port, and the established
+  set's own port sends the next REGISTER unprotected; both are logged and
+  counted in `siphon_ipsec_ue_port_bind_failures_total`.
+
+- **IMS UE registrant: SPIs unique among existing SAs.** An offer skips the SPIs
+  of the UE's own sets (both ends), of pairs the IPsec manager owns, and of
+  kernel states present at start, so a restart never offers an SPI a previous
+  process left in the kernel (TS 33.203 7.1).
 ### Added
+
+- **`rtpengine.delete_call(call_id, from_tag=None)`.** Frees a call's media by
+  Call-ID alone, for a call that ends outside any SIP transaction (an Rx
+  Abort-Session, an N5 termination notify, a periodic sweep). Before this the
+  media stayed anchored until the engine's own timeout. A call siphon anchored
+  is deleted with its own engine call-id and From-tag; otherwise the whole call
+  goes by id. Returns `False` when the engine no longer held it.
+
+- **`registrar.remove_contact(aor, contact)`.** Removes one binding of a
+  multi-contact AoR, for a reg-event NOTIFY or Cx RTR that terminates one
+  contact, where `registrar.remove()` drops them all. Works for `save()` and
+  `save_proxy()` bindings.
 
 - **X2 keepalives on an idle connection (TS 103 221-2 clause 5.2.2).** A
   delivery connection that has carried nothing for
@@ -94,6 +198,14 @@ entry, but a working config keeps working.
   longer ends the session, a failed re-INVITE on an answered call no longer
   ends it, and the session state of a warranted call that failed unanswered
   is released when the call ends instead of waiting for the cap.
+
+- **Per-contact removal reached the backend and drained the IMS state.** The
+  removal behind the NAT keepalive and registrar liveness checks dropped the
+  binding in memory only, so a Redis or Postgres backend brought it back on the
+  next restart, and removing an AoR's last binding left its Service-Route,
+  P-Asserted-Identity, P-Associated-URI and aliases behind for good. It now
+  goes through the same teardown as a REGISTER with `expires=0`, and never
+  removes an AS capability record.
 
 ## [1.15.2] — 2026-10-22
 

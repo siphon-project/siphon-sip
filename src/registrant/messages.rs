@@ -112,6 +112,9 @@ pub struct BuiltRegister {
     /// Whether it rides an established IPsec SA set (a protected re- or
     /// de-REGISTER, see [`super::protected`]).
     pub protected: bool,
+    /// Whether it tells the network its AKA challenge was invalid (TS 24.229
+    /// 5.1.1.5.3): it goes as built, and no temporary SA set is made for it.
+    pub challenge_rejected: bool,
 }
 
 impl RegistrantManager {
@@ -133,7 +136,22 @@ impl RegistrantManager {
         if let Some(built) = self.build_protected_register(&mut entry, defaults, expires) {
             return built;
         }
-        let egress = EntryEgress::of(&entry, defaults);
+        self.build_unprotected_register(&mut entry, defaults, expires, None)
+    }
+
+    /// The unprotected REGISTER of [`build_register`](Self::build_register):
+    /// from the plain port, an IMS one with the empty Authorization of an
+    /// initial registration, or `authorization` when it answers an invalid
+    /// challenge (TS 24.229 5.1.1.5.3).
+    pub(super) fn build_unprotected_register(
+        &self,
+        entry: &mut RegistrantEntry,
+        defaults: EgressDefaults<'_>,
+        expires: u32,
+        authorization: Option<String>,
+    ) -> Option<BuiltRegister> {
+        let challenge_rejected = authorization.is_some();
+        let egress = EntryEgress::of(entry, defaults);
         let effective_addr = egress.sent_by;
         let cseq = entry.next_cseq();
         let branch = format!("z9hG4bK-reg-{}", uuid::Uuid::new_v4());
@@ -185,7 +203,9 @@ impl RegistrantManager {
             let digest_uri = format!("sip:{registrar_host}");
             builder = builder.header(
                 "Authorization",
-                initial_aka_authorization(&entry.credentials.username, &realm, &digest_uri),
+                authorization.unwrap_or_else(|| {
+                    initial_aka_authorization(&entry.credentials.username, &realm, &digest_uri)
+                }),
             );
         }
 
@@ -196,7 +216,7 @@ impl RegistrantManager {
         // with Security-Server. An unprotected de-registration (no SA set left
         // to ride) does not offer.
         if expires > 0 && entry.ue_ipsec.is_some() {
-            self.begin_unprotected_offer(&mut entry);
+            self.begin_unprotected_offer(entry, defaults, challenge_rejected);
             if let Some(ipsec) = entry.ue_ipsec.as_ref() {
                 let security_client = build_security_client(&ipsec.offer());
                 builder = builder
@@ -228,6 +248,7 @@ impl RegistrantManager {
                 sent_by: egress.sent_by,
                 own_address: egress.own_address,
                 protected: false,
+                challenge_rejected,
             }),
             Err(error) => {
                 warn!(aor = %entry.aor, %error, "failed to build REGISTER");
@@ -341,6 +362,7 @@ impl RegistrantManager {
                 sent_by: egress.sent_by,
                 own_address: egress.own_address,
                 protected: false,
+                challenge_rejected: false,
             }),
             Err(error) => {
                 warn!(aor = %entry.aor, %error, "failed to build authenticated REGISTER");
@@ -353,13 +375,15 @@ impl RegistrantManager {
     ///
     /// Runs Milenage over the challenge's RAND/AUTN (carried base64 in the
     /// nonce). On success, the Authorization response is computed from RES and
-    /// `SQN_MS` advances; on a sequence-number mismatch the REGISTER instead
-    /// carries an `auts=` re-synchronisation token (3GPP TS 33.102 §6.3.3); on
-    /// a MAC failure (untrusted network) it returns `None` so the caller fails
-    /// the registration.
+    /// `SQN_MS` advances, and CK/IK are stashed for the temporary SA set; with
+    /// `security_verify` the REGISTER is the one that rides that set.
     ///
-    /// This is the Phase-1 (no-IPsec) shape — it does not yet emit
-    /// `Security-Verify` or install SAs (Phase 2), and CK/IK are discarded.
+    /// An invalid challenge is answered as TS 24.229 5.1.1.5.3 has it: an SQN
+    /// out of range with an `auts=` re-synchronisation token (3GPP TS 33.102
+    /// §6.3.3), a MAC failure with an empty response and no `auts`; an IPsec
+    /// entry sends it over its established set, or unprotected, and never
+    /// sets up a temporary set for it ([`BuiltRegister::challenge_rejected`]).
+    /// A third consecutive invalid challenge returns `None` (5.1.1.5.12).
     pub fn build_register_aka(
         &self,
         aor: &str,
@@ -393,20 +417,31 @@ impl RegistrantManager {
                     ipsec.ck = Some(ck);
                     ipsec.ik = Some(ik);
                 }
+                entry.invalid_challenges = 0;
                 (res, None)
             }
             aka::AkaOutcome::SyncFailure { auts } => {
                 warn!(aor = %entry.aor, "AKA SQN out of range — sending AUTS re-synchronisation");
+                if !Self::answer_invalid_challenge(&mut entry) {
+                    return None;
+                }
                 // RFC 3310 §3.4: the resync REGISTER carries the auts token;
                 // the response is computed over an empty RES and the server
                 // re-bases SQN and re-challenges.
                 (Vec::new(), Some(aka::encode_auts(&auts)))
             }
             aka::AkaOutcome::MacFailure => {
-                warn!(aor = %entry.aor, "AKA AUTN MAC failed — untrusted network challenge, aborting");
-                return None;
+                // TS 24.229 5.1.1.5.3: "no "auts" Authorization header field
+                // parameter and an empty "response" Authorization header
+                // field parameter".
+                warn!(aor = %entry.aor, "AKA AUTN MAC failed — telling the network its challenge is invalid");
+                if !Self::answer_invalid_challenge(&mut entry) {
+                    return None;
+                }
+                (Vec::new(), None)
             }
         };
+        let challenge_rejected = res.is_empty();
 
         let egress = EntryEgress::of(&entry, defaults);
         let effective_addr = egress.sent_by;
@@ -420,18 +455,20 @@ impl RegistrantManager {
             .to_string();
         let request_uri = registrar_request_uri(&entry.registrar_uri);
 
-        let contact = entry.contact_uri.clone().unwrap_or_else(|| {
-            default_contact_uri(&entry.credentials.username, effective_addr, entry.transport)
-        });
         // A REGISTER protected by an SA set names the UE protected server port
-        // in its Via sent-by, where the P-CSCF answers it (TS 24.229 5.1.1.4.2
-        // c, TS 33.203 7.1); any other names the plain port.
+        // in its Via sent-by, where the P-CSCF answers it, and in its Contact,
+        // the binding the network then sends requests to over the set (TS
+        // 24.229 5.1.1.2.2 b, c; 5.1.1.4.2 b, c; TS 33.203 7.1); any other
+        // names the plain port.
         let via_sent_by = match entry.ue_ipsec.as_ref() {
             Some(ipsec) if security_verify.is_some() => {
                 SocketAddr::new(entry.local_addr.unwrap_or(defaults.ue_ip), ipsec.ue_port_s)
             }
             _ => effective_addr,
         };
+        let contact = entry.contact_uri.clone().unwrap_or_else(|| {
+            default_contact_uri(&entry.credentials.username, via_sent_by, entry.transport)
+        });
         let via = format!(
             "SIP/2.0/{} {};branch={};rport",
             entry.transport, via_sent_by, branch
@@ -441,7 +478,7 @@ impl RegistrantManager {
         let cnonce = format!("{:08x}", rand_u32());
         let digest_uri = format!("sip:{request_uri_str}");
 
-        let auth_header_value = auth::format_aka_authorization_header(
+        let mut auth_header_value = auth::format_aka_authorization_header(
             challenge,
             &entry.credentials.username,
             &res,
@@ -450,6 +487,19 @@ impl RegistrantManager {
             Some(&cnonce),
             auts.as_deref(),
         );
+        if challenge_rejected && auts.is_none() {
+            // A bad MAC is answered with no response at all, not a digest
+            // computed over an empty RES (TS 24.229 5.1.1.5.3).
+            auth_header_value = empty_response(&auth_header_value);
+        }
+        if challenge_rejected && entry.ue_ipsec.is_some() {
+            return self.build_challenge_rejection(
+                &mut entry,
+                defaults,
+                expires,
+                auth_header_value,
+            );
+        }
 
         entry.state = RegistrantState::Challenging;
         entry.last_sent_at = Some(Instant::now());
@@ -523,11 +573,29 @@ impl RegistrantManager {
                 sent_by: via_sent_by,
                 own_address: egress.own_address,
                 protected: false,
+                challenge_rejected,
             }),
             Err(error) => {
                 warn!(aor = %entry.aor, %error, "failed to build AKA REGISTER");
                 None
             }
         }
+    }
+}
+
+/// `authorization` with its `response` parameter emptied: the answer to a
+/// challenge whose MAC failed carries no response (TS 24.229 5.1.1.5.3).
+pub(super) fn empty_response(authorization: &str) -> String {
+    let Some(start) = authorization.find("response=\"") else {
+        return authorization.to_string();
+    };
+    let value_start = start + "response=\"".len();
+    match authorization[value_start..].find('"') {
+        Some(length) => format!(
+            "{}{}",
+            &authorization[..value_start],
+            &authorization[value_start + length..]
+        ),
+        None => authorization.to_string(),
     }
 }
