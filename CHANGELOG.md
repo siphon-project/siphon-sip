@@ -107,6 +107,18 @@ entry, but a working config keeps working.
   process left in the kernel (TS 33.203 7.1).
 ### Added
 
+- **`rtpengine.delete_call(call_id, from_tag=None)`.** Frees a call's media by
+  Call-ID alone, for a call that ends outside any SIP transaction (an Rx
+  Abort-Session, an N5 termination notify, a periodic sweep). Before this the
+  media stayed anchored until the engine's own timeout. A call siphon anchored
+  is deleted with its own engine call-id and From-tag; otherwise the whole call
+  goes by id. Returns `False` when the engine no longer held it.
+
+- **`registrar.remove_contact(aor, contact)`.** Removes one binding of a
+  multi-contact AoR, for a reg-event NOTIFY or Cx RTR that terminates one
+  contact, where `registrar.remove()` drops them all. Works for `save()` and
+  `save_proxy()` bindings.
+
 - **X2 keepalives on an idle connection (TS 103 221-2 clause 5.2.2).** A
   delivery connection that has carried nothing for
   `lawful_intercept.x2.keepalive_secs` (default 30, `0` disables) gets a
@@ -152,6 +164,14 @@ entry, but a working config keeps working.
   longer ends the session, a failed re-INVITE on an answered call no longer
   ends it, and the session state of a warranted call that failed unanswered
   is released when the call ends instead of waiting for the cap.
+
+- **Per-contact removal reached the backend and drained the IMS state.** The
+  removal behind the NAT keepalive and registrar liveness checks dropped the
+  binding in memory only, so a Redis or Postgres backend brought it back on the
+  next restart, and removing an AoR's last binding left its Service-Route,
+  P-Asserted-Identity, P-Associated-URI and aliases behind for good. It now
+  goes through the same teardown as a REGISTER with `expires=0`, and never
+  removes an AS capability record.
 
 ## [1.15.2] — 2026-10-22
 

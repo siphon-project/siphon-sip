@@ -3201,6 +3201,65 @@ class MockRegistrar:
         """
         self.expire(uri)
 
+    def remove_contact(
+        self,
+        aor: Union[str, SipUri],
+        contact: Union[str, SipUri, Contact],
+    ) -> bool:
+        """Remove one binding of an AoR, leaving its other contacts registered.
+
+        For a reg-event NOTIFY (RFC 3680) or a Cx RTR that ends one contact
+        of a multi-contact AoR, where :meth:`remove` would drop them all.
+        Covers bindings stored by :meth:`save` and :meth:`save_proxy` alike.
+
+        ``contact`` matches a UE binding the way a REGISTER's ``expires=0``
+        matches the binding it removes: by the stored Contact URI, angle
+        brackets allowed, so the ``contact.uri`` a :meth:`lookup` reported
+        always matches. AS capability records are never matched. The removal
+        is written through to the registrar backend and fires
+        ``@registrar.on_change`` with ``"deregistered"``. Removing the last
+        binding removes the AoR as :meth:`remove` does, its AS records,
+        Service-Route, P-Asserted-Identity, P-Associated-URI and aliases with
+        it::
+
+            # a reg-event NOTIFY reports one <contact state="terminated">
+            if not registrar.remove_contact(aor, contact_uri):
+                log.warn(f"no binding of {aor} at {contact_uri}")
+
+        Args:
+            aor: The AoR (or one of its implicit-set aliases).
+            contact: The Contact URI to remove, as string, :class:`SipUri` or
+                a :class:`Contact` from :meth:`lookup`.
+
+        Returns:
+            ``True`` when a binding was removed, ``False`` when none matched.
+        """
+        def bare(text: str) -> str:
+            return str(text).strip().lstrip("<").rstrip(">")
+
+        primary = self._resolve_alias(self._normalize_aor(str(aor)))
+        held = self._store.get(primary)
+        if not held:
+            return False
+        target = bare(getattr(contact, "uri", contact))
+        kept = [
+            c for c in held
+            if getattr(c, "kind", "ue") != "ue" or bare(c.uri) != target
+        ]
+        if len(kept) == len(held):
+            return False
+        removed = [c for c in held if c not in kept]
+        for gone in removed:
+            token = getattr(gone, "flow_token", None)
+            if token is not None:
+                self._tokens.pop(token, None)
+        if not any(getattr(c, "kind", "ue") == "ue" for c in kept):
+            self.expire(primary)
+        else:
+            self._store[primary] = kept
+        self._fire_on_change(primary, "deregistered")
+        return True
+
     def save_pending(self, request: Any) -> None:
         """Save contacts in pending state (IMS: awaiting SAR confirmation).
 
@@ -4553,6 +4612,7 @@ class MockRtpEngine:
         requested for that call.
         """
         self._healthy = True
+        self._released_call_ids: set[str] = set()
         self._play_media_duration_ms: Optional[int] = None
         self._answer_local_sdp: str = "v=0\r\nm=audio 40000 RTP/AVP 8 101\r\n"
         self._answer_local_no_codec: bool = False
@@ -5069,6 +5129,51 @@ class MockRtpEngine:
             self._leave_seat(*seated)
             self.operations.append(("conference_leave", seated[0]))
         self.operations.append(("delete", None))
+        return True
+
+    async def delete_call(self, call_id: str, from_tag: Optional[str] = None) -> bool:
+        """Tear down a call's media by Call-ID, without a SIP message in hand.
+
+        For a call that ends outside any SIP transaction: an Rx Abort-Session
+        (``@diameter.on_request``), an N5 termination (``@sbi.on_terminate``),
+        a periodic sweep. :meth:`delete` needs a request, reply or call to read
+        the tags from; this needs only the Call-ID::
+
+            @sbi.on_terminate
+            async def bearer_gone(termination):
+                call_id = await cache.fetch("n5", termination["resUri"])
+                if call_id:
+                    await rtpengine.delete_call(call_id)
+
+        A call this process anchored is deleted with its own engine call-id
+        and From-tag. ``from_tag`` overrides the tracked tag. With neither,
+        the whole call is deleted by id (rtpengine; siphon-rtp limits it to
+        calls this node created). rtpproxy cannot address a call without a
+        tag, so there an untracked call needs ``from_tag``.
+
+        Args:
+            call_id: The SIP Call-ID the media was anchored under.
+            from_tag: The From-tag to delete with, if not the tracked one.
+
+        Returns:
+            ``True`` when the engine released the call, ``False`` when it no
+            longer held it (already timed out, or never anchored). The mock
+            answers ``False`` for a Call-ID it already released.
+
+        Raises:
+            ValueError: ``call_id`` is empty.
+            RuntimeError: the engine could not be reached or refused the delete.
+        """
+        if not call_id:
+            raise ValueError("call_id is empty")
+        seated = self.conference_seat(call_id)
+        if seated is not None:
+            self._leave_seat(*seated)
+            self.operations.append(("conference_leave", seated[0]))
+        self.operations.append(("delete_call", call_id))
+        if call_id in self._released_call_ids:
+            return False
+        self._released_call_ids.add(call_id)
         return True
 
     async def ping(self) -> bool:

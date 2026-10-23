@@ -1712,6 +1712,11 @@
         "kind": "method_descriptor",
         "sig": "($self, uri)"
       },
+      "remove_contact": {
+        "doc": "Remove one binding of an AoR, leaving its other contacts registered.",
+        "kind": "method_descriptor",
+        "sig": "($self, aor, contact)"
+      },
       "restore": {
         "doc": "Rebuild a binding from S-CSCF restoration information, without a",
         "kind": "method_descriptor",
@@ -2581,6 +2586,11 @@
         "doc": "Send an RTPEngine `delete` command to tear down the media session.",
         "kind": "method_descriptor",
         "sig": "($self, request)"
+      },
+      "delete_call": {
+        "doc": "Tear down a call's media by Call-ID, without a SIP message in hand.",
+        "kind": "method_descriptor",
+        "sig": "($self, call_id, from_tag=None)"
       },
       "detach_ws_bridge": {
         "doc": "Detach a call's **WebSocket takeover bridge**, putting its media path",

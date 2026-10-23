@@ -1180,6 +1180,54 @@ impl PyRtpEngine {
         })
     }
 
+    /// Tear down a call's media by Call-ID, without a SIP message in hand.
+    ///
+    /// For a call that ends outside any SIP transaction: an Rx Abort-Session
+    /// (`@diameter.on_request`), an N5 termination (`@sbi.on_terminate`), a
+    /// periodic sweep. ``delete()`` needs a request, reply or call to read the
+    /// tags from; this needs only the Call-ID.
+    ///
+    /// A call this process anchored is deleted with its own engine call-id and
+    /// From-tag. ``from_tag`` overrides the tracked tag. With neither, the whole
+    /// call is deleted by id (rtpengine; siphon-rtp limits it to calls this node
+    /// created). rtpproxy cannot address a call without a tag, so there an
+    /// untracked call needs ``from_tag``.
+    ///
+    /// Args:
+    ///     call_id: The SIP Call-ID the media was anchored under.
+    ///     from_tag: The From-tag to delete with, if not the tracked one.
+    ///
+    /// Returns:
+    ///     ``True`` when the engine released the call, ``False`` when it no
+    ///     longer held it (already timed out, or never anchored).
+    ///
+    /// Raises:
+    ///     ValueError: ``call_id`` is empty.
+    ///     RuntimeError: the engine could not be reached or refused the delete.
+    #[pyo3(signature = (call_id, from_tag=None))]
+    fn delete_call<'py>(
+        &self,
+        python: Python<'py>,
+        call_id: String,
+        from_tag: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        if call_id.is_empty() {
+            return Err(pyo3::exceptions::PyValueError::new_err("call_id is empty"));
+        }
+        let client = Arc::clone(&self.client);
+        let sessions = Arc::clone(&self.sessions);
+        pyo3_async_runtimes::tokio::future_into_py(python, async move {
+            client
+                .release_call(&sessions, &call_id, from_tag.as_deref())
+                .await
+                .map_err(|error| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "media delete of {call_id} failed: {error}"
+                    ))
+                })
+        })
+    }
+
     /// Ping the RTPEngine instance(s). Returns True if healthy.
     fn ping<'py>(&self, python: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let client = Arc::clone(&self.client);
