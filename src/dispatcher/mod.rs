@@ -227,6 +227,8 @@ mod lcr_ring_timeout_tests;
 #[cfg(test)]
 mod lcr_route_bookkeeping_tests;
 #[cfg(test)]
+mod li_session_tests;
+#[cfg(test)]
 mod listener_identity_tests;
 #[cfg(test)]
 mod local_answer_contact_tests;

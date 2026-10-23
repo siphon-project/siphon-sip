@@ -32,6 +32,7 @@
 
 pub mod asn1;
 pub mod pdu;
+pub mod session;
 pub mod siprec;
 pub mod target;
 pub mod x1;
@@ -48,6 +49,10 @@ use tracing::{error, info, warn};
 use crate::config::{LawfulInterceptConfig, MediaBackendKind};
 use x1::store::{ContentCapability, DestinationStore, StoredTask, TaskMatch, TaskStore};
 use x1::types::{DeliveryType, XId};
+
+pub use session::{CallOwner, Identities, MessageFacts, SessionView, SESSION_GRACE};
+#[cfg(test)]
+use session::{MAX_REMEMBERED_SESSIONS, MAX_SEEN_PER_SESSION};
 
 /// Where in a session an IRI record falls.
 ///
@@ -86,7 +91,8 @@ pub struct IriEvent {
     /// Non-zero, stable for the life of the session, and identical to the value
     /// the media engine puts on the session's X3 PDUs.
     pub correlation_id: u64,
-    /// The SIP Call-ID the correlation was derived from.
+    /// The SIP Call-ID of the message the record carries. For a B2BUA call
+    /// this differs between legs; the correlation does not.
     pub call_id: String,
     /// Event type.
     pub event_type: IriEventType,
@@ -153,19 +159,21 @@ pub enum AuditOperation {
     SystemStopped,
 }
 
-/// Derive the per-session Correlation ID from a SIP Call-ID.
+/// Derive the per-session Correlation ID from a session id.
 ///
 /// TS 103 221-2 clause 6 requires a non-zero correlation that ties one
-/// session's X2 and X3 records together. Deriving it deterministically from the
-/// Call-ID means this process and the media engine reach the same value without
-/// having to exchange it, and it stays stable across the whole dialog.
+/// session's X2 and X3 records together. The input is the session id
+/// ([`session`]), not a leg's Call-ID: every leg of a B2BUA call resolves to
+/// the same one, the call's internal id, so the whole call carries one value.
+/// The media engine is handed the value with each X3 attachment rather than
+/// deriving its own.
 ///
 /// Used only when the ADMF did not provision a `correlationID`; when it did,
 /// that value is honoured, because we do not always own that number.
 pub fn correlation_from_call_id(call_id: &str) -> u64 {
     // FNV-1a: stable across processes and builds, unlike `DefaultHasher`,
-    // which is explicitly not guaranteed to be. That stability is the whole
-    // point — the media engine must derive the same value.
+    // which is explicitly not guaranteed to be. A restart or a second replica
+    // must give a session the value it had.
     const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
     const PRIME: u64 = 0x0000_0100_0000_01b3;
     let mut hash = OFFSET_BASIS;
@@ -211,64 +219,17 @@ pub struct LiManager {
     /// configured. Needed on the delivery path so a content-loss event can be
     /// reported rather than only logged.
     x1_client: Arc<std::sync::OnceLock<Arc<x1::client::X1Client>>>,
-    /// Live X3 interceptions, keyed by SIP Call-ID.
+    /// Live X3 interceptions, keyed by the call-id the media engine knows the
+    /// call by: the caller leg's SIP Call-ID, whichever leg asked.
     x3_attachments: Arc<DashMap<String, Vec<ActiveIntercept>>>,
-    /// Per-session matching decisions, keyed by SIP Call-ID.
+    /// Per-session matching decisions, keyed by session id.
     ///
-    /// See [`LiManager::check_session`].
-    decisions: Arc<DashMap<String, SessionDecision>>,
+    /// See [`LiManager::resolve_session`].
+    decisions: Arc<DashMap<Arc<str>, session::SessionDecision>>,
+    /// Leg Call-ID to the session it belongs to, for every leg whose session
+    /// is not keyed on its own Call-ID.
+    aliases: Arc<DashMap<Arc<str>, Arc<str>>>,
 }
-
-/// What was decided about one session, and when.
-#[derive(Debug, Clone)]
-struct SessionDecision {
-    /// The provisioning generation this was decided under. A decision taken
-    /// before a warrant was activated says nothing about the traffic after it.
-    generation: u64,
-    /// The warrants that matched, by XID and the party each names. Empty means
-    /// the session matched nothing, which is worth remembering too — it is the
-    /// common case and the one that costs the most to re-derive.
-    ///
-    /// Deliberately not the [`TaskMatch`] itself: that embeds a whole
-    /// `StoredTask`, so caching it would both duplicate the store and go stale
-    /// the moment a `ModifyTask` changed a delivery type or a DID. The task is
-    /// re-read by XID at delivery, which is one lookup and always current.
-    matched: Vec<(XId, crate::li::target::MatchedParty)>,
-    /// Message instances already recorded for this session.
-    ///
-    /// Interception runs before transaction matching, so a UDP retransmission
-    /// arrives here as an ordinary message and would produce a second record
-    /// of something the mediation function already has — up to seven times for
-    /// one INVITE under RFC 3261's timers. Worse, it would re-run the
-    /// session's lifecycle: a retransmitted INVITE would restart content
-    /// capture on a call already being captured.
-    ///
-    /// Held per session so it is evicted with the session and needs no
-    /// lifetime rule of its own. Hashes rather than the keys themselves,
-    /// because the only question asked of it is "seen this before".
-    seen: std::collections::HashSet<u64>,
-}
-
-/// How many message instances one session remembers having recorded.
-///
-/// A dialog is dozens of messages, not thousands; this is generous. Past it
-/// de-duplication stops and every message is recorded, because for a warrant a
-/// duplicated record is recoverable at the mediation function and a dropped one
-/// is not. The degraded mode is therefore the old behaviour, never a gap.
-const MAX_SEEN_PER_SESSION: usize = 512;
-
-/// How many sessions may have a remembered decision.
-///
-/// A bound rather than a hope: the key is the Call-ID, which is chosen by
-/// whoever sent the message. Without a cap, a flood of requests bearing
-/// distinct Call-IDs would grow this map until the process died, which is a
-/// remote memory-exhaustion vector on an interface that faces the network.
-///
-/// On overflow the map is cleared rather than evicted one entry at a time.
-/// Clearing costs a re-derivation for the sessions that were in it, which is
-/// exactly the behaviour before this cache existed — so the degraded mode is
-/// the old correct one, never a missed interception.
-const MAX_REMEMBERED_SESSIONS: usize = 100_000;
 
 impl LiManager {
     /// Build the subsystem.
@@ -296,6 +257,7 @@ impl LiManager {
             x1_client: Arc::new(std::sync::OnceLock::new()),
             x3_attachments: Arc::new(DashMap::new()),
             decisions: Arc::new(DashMap::new()),
+            aliases: Arc::new(DashMap::new()),
         };
 
         let _ = manager.audit_sender.try_send(AuditEntry {
@@ -357,149 +319,16 @@ impl LiManager {
             .match_message(request_uri, from_uri, to_uri, source_ip)
     }
 
-    /// The warrants covering one session, deciding once per session rather than
-    /// once per message.
-    ///
-    /// Two reasons, and the second is the important one.
-    ///
-    /// **It is cheaper.** Matching normalises the URIs and walks the index for
-    /// every warrant, and this runs on every message on every leg. A dialog is
-    /// dozens of messages about one pair of identities, so deciding it once and
-    /// remembering the answer turns all but the first into a map lookup.
-    ///
-    /// **It is more correct.** Matching each message on its own identities
-    /// quietly assumes every message of a session carries the target in a
-    /// matchable form, and they do not: a re-INVITE from the far end swaps From
-    /// and To, an in-dialog REFER or NOTIFY carries the identities of whoever
-    /// sent it, and a BYE can come from either side. Deciding per message is
-    /// how a warrant delivers the INVITE and then silently misses the BYE.
-    /// Once a session is warranted, everything in it is intercepted.
-    ///
-    /// A remembered decision is only used while the provisioning generation has
-    /// not moved: an `ActivateTask` must take effect on calls already in
-    /// progress, so a session decided as unwarranted before it arrived is
-    /// decided again after.
-    pub fn check_session(
-        &self,
-        call_id: &str,
-        request_uri: Option<&str>,
-        from_uri: Option<&str>,
-        to_uri: Option<&str>,
-        source_ip: Option<IpAddr>,
-    ) -> Vec<TaskMatch> {
-        if !self.config.enabled || self.tasks.is_empty() {
-            return Vec::new();
-        }
-
-        let generation = self.tasks.generation();
-        if let Some(decision) = self.decisions.get(call_id) {
-            if decision.generation == generation {
-                if decision.matched.is_empty() {
-                    return Vec::new();
-                }
-                // Re-read each task rather than trusting a cached copy, so a
-                // ModifyTask that changed a delivery type or a destination is
-                // honoured on the very next message.
-                return decision
-                    .matched
-                    .iter()
-                    .filter_map(|(x_id, party)| {
-                        self.tasks.get(*x_id).map(|task| TaskMatch {
-                            task,
-                            party: *party,
-                        })
-                    })
-                    .collect();
-            }
-        }
-
-        let matches = self
-            .tasks
-            .match_message(request_uri, from_uri, to_uri, source_ip);
-
-        // Bounded, because the key is attacker-supplied. Clearing on overflow
-        // costs a re-derivation, never a missed interception.
-        if self.decisions.len() >= MAX_REMEMBERED_SESSIONS {
-            warn!(
-                remembered = self.decisions.len(),
-                "LI session decisions hit the cap and were cleared; matching \
-                 falls back to per-message until they repopulate"
-            );
-            self.decisions.clear();
-        }
-        self.decisions.insert(
-            call_id.to_string(),
-            SessionDecision {
-                generation,
-                matched: matches
-                    .iter()
-                    .map(|matched| (matched.task.details.x_id, matched.party))
-                    .collect(),
-                seen: std::collections::HashSet::new(),
-            },
-        );
-
-        matches
-    }
-
-    /// Record that a message instance has been intercepted, once.
-    ///
-    /// Returns `false` when this exact instance has already been recorded for
-    /// the session — a retransmission — and the caller should do nothing
-    /// further with it.
-    ///
-    /// Interception is deliberately placed before transaction matching, so that
-    /// a script cannot drop a message before it is intercepted. The cost of
-    /// that placement is that retransmissions arrive here looking like new
-    /// messages: RFC 3261's timers resend an unanswered INVITE up to seven
-    /// times, and each would otherwise produce its own IRI record and re-run
-    /// the session's lifecycle, restarting content capture on a call already
-    /// being captured.
-    ///
-    /// The key is the message instance, not its content: the top `Via` branch
-    /// identifies the transaction (§8.1.1.7 requires a new branch for a new
-    /// one), and the CSeq, method and status separate the messages within it.
-    /// A re-INVITE, an ACK and a second provisional all key differently; only
-    /// a genuine resend of the same thing collides.
-    pub fn record_message_once(&self, call_id: &str, key: u64) -> bool {
-        let Some(mut session) = self.decisions.get_mut(call_id) else {
-            // No decision means nothing matched, so nothing is being recorded
-            // and there is nothing to de-duplicate.
-            return true;
-        };
-        if session.seen.len() >= MAX_SEEN_PER_SESSION {
-            // Fail open. A duplicate record is recoverable at the mediation
-            // function; a dropped one is not.
-            return true;
-        }
-        session.seen.insert(key)
-    }
-
-    /// Forget a session's decision, once the dialog it described is over.
-    ///
-    /// The cap exists for traffic that never reaches this; ordinary calls are
-    /// released here, as they end.
-    pub fn forget_session(&self, call_id: &str) {
-        self.decisions.remove(call_id);
-    }
-
-    /// How many sessions currently have a remembered decision.
-    ///
-    /// Exposed so the leak tests can assert this drains rather than grows.
-    pub fn remembered_session_count(&self) -> usize {
-        self.decisions.len()
-    }
-
     /// The Correlation ID to use for a task on a given session.
     ///
     /// Honours a value the ADMF provisioned; otherwise derives a stable
-    /// non-zero one from the Call-ID.
-    pub fn correlation_for(&self, task: &StoredTask, call_id: &str) -> u64 {
+    /// non-zero one from the session id.
+    pub fn correlation_for(&self, task: &StoredTask, session_id: &str) -> u64 {
         match task.details.correlation_id {
             // Zero is reserved on the wire, so a provisioned zero is treated as
             // "not provisioned" rather than emitted.
             Some(provisioned) if provisioned != 0 => provisioned,
-            _ => correlation_from_call_id(call_id),
+            _ => correlation_from_call_id(session_id),
         }
     }
 
@@ -517,13 +346,16 @@ impl LiManager {
     /// Build the IRI event for a task matching a message.
     ///
     /// Resolves the task's X2-capable destinations at match time, so an event
-    /// carries exactly the sinks the warrant named.
+    /// carries exactly the sinks the warrant named. `call_id` is the message's
+    /// own; the correlation comes from `session_id`, which every leg of the
+    /// call shares.
     #[allow(clippy::too_many_arguments)]
     pub fn build_iri_event(
         &self,
         matched: &TaskMatch,
         event_type: IriEventType,
         call_id: &str,
+        session_id: &str,
         sip_method: &str,
         status_code: Option<u16>,
         from_uri: &str,
@@ -543,7 +375,7 @@ impl LiManager {
         IriEvent {
             x_id: task.details.x_id,
             liid: Self::liid_for(task),
-            correlation_id: self.correlation_for(task, call_id),
+            correlation_id: self.correlation_for(task, session_id),
             call_id: call_id.to_string(),
             event_type,
             timestamp: SystemTime::now(),
@@ -685,7 +517,7 @@ mod tests {
         }
     }
 
-    fn manager() -> (
+    pub(super) fn manager() -> (
         LiManager,
         mpsc::Receiver<IriEvent>,
         mpsc::Receiver<AuditEntry>,
@@ -693,7 +525,11 @@ mod tests {
         LiManager::new(test_config(), 100, ContentCapability::Available)
     }
 
-    fn provision(manager: &LiManager, delivery: DeliveryType, liid: Option<&str>) -> XId {
+    pub(super) fn provision(
+        manager: &LiManager,
+        delivery: DeliveryType,
+        liid: Option<&str>,
+    ) -> XId {
         let d_id = DId::generate();
         manager
             .destinations()
@@ -1196,6 +1032,7 @@ mod tests {
             &matched,
             IriEventType::Begin,
             "call-1@example.com",
+            "call-1@example.com",
             "INVITE",
             None,
             "sip:alice@example.com",
@@ -1242,6 +1079,7 @@ mod tests {
         let event = manager.build_iri_event(
             &matched,
             IriEventType::Begin,
+            "call-1@example.com",
             "call-1@example.com",
             "INVITE",
             None,
