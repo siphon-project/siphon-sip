@@ -5,6 +5,10 @@ plain-SIP "tester" calls through any of them both ways.
     MO:  tester  ->  siphon (as UE n)  ->  P-CSCF / IMS
     MT:  IMS     ->  siphon (as UE n)  ->  tester
 
+Calls (INVITE) and pager-mode MESSAGEs are bridged both ways, and each UE
+subscribes to its own reg event once registered (TS 24.229 5.1.1.3). Every
+request a UE sends leaves over its own IPsec SA with its route set.
+
 The UE list is constant data: the inline UES tuple below, or a CSV file named
 by $MULTI_UE_CSV with the header
 
@@ -28,7 +32,7 @@ import json
 import os
 import time
 
-from siphon import b2bua, registration, timer, log
+from siphon import b2bua, log, proxy, registration, timer
 
 HOME = os.environ.get("IMS_HOME", "ims.mnc01.mcc001.3gppnetwork.org")
 PCSCF = os.environ.get("PCSCF", f"sip:pcscf.{HOME}:5060")
@@ -147,14 +151,96 @@ def sync_addresses():
     _write_status()
 
 
+def _ue_route(impu, flow):
+    """A UE's route set: the P-CSCF's protected URI, then the Service-Route
+    (TS 24.229 5.1.2A.1.1). Over the UE's flow it goes out as Route headers."""
+    return [f"<sip:{flow.remote_addr};lr>"] + registration.service_route(impu)
+
+
 @registration.on_change
-def on_registration_change(aor, event_type, state):
+async def on_registration_change(aor, event_type, state):
     # One line per change with a wall-clock stamp, so refresh spread can be
     # read straight off the log.
     log.info(
         f"multi-ue event={event_type} aor={aor} t={time.time():.3f} "
         f"expires_in={state.get('expires_in')} status={state.get('status_code')}"
     )
+    if event_type != "registered":
+        return
+    # Subscribe to the UE's own reg event over its SA. The refreshes and the
+    # unsubscribe of the handle go the same way, over whichever SA set the
+    # registration holds when each is sent. A deployment that runs longer than
+    # the subscription refreshes it from handle.expires.
+    flow = registration.flow(aor)
+    if flow is None:
+        return
+    try:
+        handle = await proxy.subscribe_state.send(
+            aor,
+            event="reg",
+            expires=600000,
+            accept="application/reginfo+xml",
+            headers={"From": f"<{aor}>", "P-Preferred-Identity": f"<{aor}>"},
+            flow=flow,
+            route=_ue_route(aor, flow),
+        )
+        log.info(f"multi-ue: {aor} subscribed to reg ({handle.id})")
+    except RuntimeError as error:
+        log.error(f"multi-ue: {aor} reg subscription failed: {error}")
+
+
+def _answer(request, reply):
+    """Answer a bridged MESSAGE with the far end's final status."""
+    if reply is None:
+        request.reply(408, "Request Timeout")
+    else:
+        request.reply(reply.status_code, reply.reason)
+
+
+@proxy.on_request("NOTIFY")
+def on_notify(request):
+    handle = proxy.subscribe_state.find(request.call_id, request.to_tag, request.from_tag)
+    if handle is None:
+        request.reply(481, "Subscription Does Not Exist")
+        return
+    request.reply(200, "OK")
+
+
+@proxy.on_request("MESSAGE")
+async def on_message(request):
+    # MT: arrived on a per-UE socket, so its address names the UE. Bridge it to
+    # the tester and answer with the tester's status.
+    flow = request.flow
+    called = registration.find_by_local(flow.local_addr) if flow is not None else None
+    if called is not None:
+        reply = await proxy.send_request(
+            "MESSAGE", TESTER, body=request.body,
+            headers={"Content-Type": request.get_header("Content-Type") or "text/plain"},
+            wait_for_response=True, timeout_ms=5000,
+        )
+        _answer(request, reply)
+        return
+
+    # MO: from the tester; its From userpart picks the UE, which sends the
+    # MESSAGE over its own SA with its route set.
+    impu = _impu_for_user(request.from_uri.user) if request.from_uri is not None else None
+    flow = registration.flow(impu) if impu is not None else None
+    if flow is None:
+        request.reply(403 if impu is None else 503, "UE Not Ready")
+        return
+    dialled = request.ruri.user if request.ruri is not None else None
+    reply = await proxy.send_request(
+        "MESSAGE", f"sip:{dialled}@{HOME}", body=request.body,
+        headers={
+            "From": f"<{impu}>",
+            "To": f"<sip:{dialled}@{HOME}>",
+            "P-Preferred-Identity": f"<{impu}>",
+            "Content-Type": request.get_header("Content-Type") or "text/plain",
+        },
+        flow=flow, route=_ue_route(impu, flow),
+        wait_for_response=True, timeout_ms=5000,
+    )
+    _answer(request, reply)
 
 
 def _userpart(uri):
@@ -207,9 +293,7 @@ def on_invite(call):
         call.reject(484, "Address Incomplete")
         return
     target = f"sip:{dialled}@{HOME}"
-    # A UE's route set: the P-CSCF's protected URI, then the Service-Route
-    # (TS 24.229 5.1.2A.1.1). It rides the SA flow as Route headers.
-    route = [f"<sip:{flow.remote_addr};lr>"] + registration.service_route(impu)
+    route = _ue_route(impu, flow)
     log.info(f"[{call.id}] MO {impu} -> {target} (route entries: {len(route)})")
     call.set_header("P-Preferred-Identity", f"<{impu}>")
     call.dial(

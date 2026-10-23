@@ -725,6 +725,18 @@ impl PyProxyUtils {
     /// first `Route` entry (its `;lr` loose-route target) per RFC 3261 §8.1.2 /
     /// §16.4 — the R-URI stays in the Request-Line and the `Route` rides along.
     /// Only when neither is present is the R-URI itself resolved (RFC 3263).
+    /// `route=` is the same route set as a list, each entry one Route header
+    /// in order; it cannot be combined with a `Route` in `headers`.
+    ///
+    /// `flow=` sends the request over a flow, with no DNS. A
+    /// ``registration.flow(impu)`` is the UE's own security association to
+    /// the P-CSCF: the request leaves from the UE's protected client port to
+    /// the P-CSCF's protected server port, its Via names the UE's protected
+    /// server port, and the route set goes on the wire as Route headers
+    /// (TS 24.229 §5.1.2A.1.1, TS 33.203 §7.1). A callee's flow
+    /// (``contact.flow``) is used when there is no route set, and yields to
+    /// one, which is then its Path (RFC 3327 §5.3), as in ``call.dial``.
+    /// ``flow`` and ``next_hop`` together raise ``ValueError``.
     ///
     /// Example (Python script):
     ///
@@ -738,7 +750,8 @@ impl PyProxyUtils {
     ///     wait_for_response=True, timeout_ms=5000,
     /// )
     /// ```
-    #[pyo3(signature = (method, ruri, headers=None, body=None, next_hop=None, wait_for_response=false, timeout_ms=2000))]
+    #[pyo3(signature = (method, ruri, headers=None, body=None, next_hop=None, wait_for_response=false, timeout_ms=2000, flow=None, route=Vec::new()))]
+    #[allow(clippy::too_many_arguments)]
     fn send_request<'py>(
         &self,
         python: Python<'py>,
@@ -749,6 +762,8 @@ impl PyProxyUtils {
         next_hop: Option<&str>,
         wait_for_response: bool,
         timeout_ms: u64,
+        flow: Option<super::registrar::PyFlow>,
+        route: Vec<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let uac_sender = UAC_SENDER.get().ok_or_else(|| {
             pyo3::exceptions::PyRuntimeError::new_err(
@@ -783,24 +798,63 @@ impl PyProxyUtils {
         //      instead of resolving the R-URI's home domain and taking the
         //      long way round.
         //   3. Otherwise, resolve the R-URI (RFC 3263).
-        let resolve_uri = resolve_send_target(&uri, next_hop, headers)?;
+        if flow.is_some() && next_hop.is_some() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "proxy.send_request: pass flow= or next_hop=, not both",
+            ));
+        }
+        let headers_route = route_next_hop(headers);
+        let route = super::uac_flow::route_set_argument(
+            &route,
+            headers_route.is_some().then_some("a Route in headers="),
+            "proxy.send_request",
+        )?;
+        let mut inputs = SendRequestInputs::extract(method, headers, body)?;
+        // The route set first, in order, ahead of the script's other headers.
+        inputs.other_headers.splice(
+            0..0,
+            route
+                .iter()
+                .map(|entry| ("Route".to_string(), entry.clone())),
+        );
+        let timeout = std::time::Duration::from_millis(timeout_ms);
+        let uac = Arc::clone(uac_sender);
+
+        // Over a flow: no resolve, and the response is awaited the same way.
+        let route_set_is_empty = route.is_empty() && headers_route.is_none();
+        if let Some(flow) =
+            super::flow_kind::flow_under_route_set(flow.as_ref(), route_set_is_empty)
+        {
+            let egress = super::uac_flow::FlowEgress::of(flow, &uac)?;
+            let (message, branch) = inputs
+                .build(uri, egress.transport, &egress.sent_by)
+                .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+            return crate::script::awaitable(python, async move {
+                let receiver = egress.send(&uac, message);
+                await_send_request_reply(uac, receiver, branch, wait_for_response, timeout).await
+            });
+        }
+
+        let resolve_uri = match (next_hop, route.first()) {
+            (None, Some(first)) => parse_first_route_uri(first).ok_or_else(|| {
+                pyo3::exceptions::PyValueError::new_err(format!("invalid route entry '{first}'"))
+            })?,
+            _ => resolve_send_target(&uri, next_hop, headers)?,
+        };
 
         let transport_hint = resolve_uri
             .get_param("transport")
             .map(|s: &str| s.to_string());
         let resolver_clone = Arc::clone(resolver);
-        let uac = Arc::clone(uac_sender);
         let host = resolve_uri.host.clone();
         let port = resolve_uri.port;
         let scheme = resolve_uri.scheme.clone();
         let resolve_target = resolve_uri.to_string();
 
-        // Everything the message needs from Python, read here because a
+        // Everything the message needs from Python was read above, because a
         // `Bound` cannot cross into a future. The build itself waits until
         // after the resolve: the Via sent-by depends on the transport the
         // resolve picks.
-        let inputs = SendRequestInputs::extract(method, headers, body)?;
-        let timeout = std::time::Duration::from_millis(timeout_ms);
 
         // The resolve used to run before the coroutine was handed back, so a
         // script that never awaited still got the message out. That cost a
@@ -858,33 +912,7 @@ impl PyProxyUtils {
             // silently consumes the matching response — without it, every
             // legitimate response logs "response for unknown branch (not ours)".
             let receiver = uac.send_request_with_response(message, target.address, transport);
-
-            if !wait_for_response {
-                // Clean up the pending entry after RFC 3261 §17.1.2.2 Timer F
-                // (32 s = 64 × T1) — no peer can sensibly respond after that,
-                // and the slot must self-evict. On a matched response the
-                // receiver fires first and `match_response` has already removed
-                // it.
-                let uac_for_cleanup = Arc::clone(&uac);
-                tokio::spawn(async move {
-                    if tokio::time::timeout(std::time::Duration::from_secs(32), receiver)
-                        .await
-                        .is_err()
-                    {
-                        uac_for_cleanup.expire_branch(&branch);
-                    }
-                });
-                return Ok(None);
-            }
-
-            match tokio::time::timeout(timeout, receiver).await {
-                Ok(Ok(crate::uac::UacResult::Response(message))) => Python::attach(|py| {
-                    let py_reply = PyReply::new(Arc::new(std::sync::Mutex::new(*message)));
-                    Py::new(py, py_reply).map(Some)
-                }),
-                // Timeout, channel closed, or explicit UacResult::Timeout
-                _ => Ok(None),
-            }
+            await_send_request_reply(uac, receiver, branch, wait_for_response, timeout).await
         })
     }
 
@@ -900,6 +928,43 @@ impl PyProxyUtils {
         {
             0
         }
+    }
+}
+
+/// What a `proxy.send_request()` awaitable resolves to once its request is on
+/// the wire: `None` straight away for fire-and-forget, else the response, or
+/// `None` after `timeout`.
+async fn await_send_request_reply(
+    uac: Arc<UacSender>,
+    receiver: tokio::sync::oneshot::Receiver<crate::uac::UacResult>,
+    branch: String,
+    wait_for_response: bool,
+    timeout: std::time::Duration,
+) -> PyResult<Option<Py<PyReply>>> {
+    if !wait_for_response {
+        // Clean up the pending entry after RFC 3261 §17.1.2.2 Timer F
+        // (32 s = 64 × T1) — no peer can sensibly respond after that,
+        // and the slot must self-evict. On a matched response the
+        // receiver fires first and `match_response` has already removed
+        // it.
+        tokio::spawn(async move {
+            if tokio::time::timeout(std::time::Duration::from_secs(32), receiver)
+                .await
+                .is_err()
+            {
+                uac.expire_branch(&branch);
+            }
+        });
+        return Ok(None);
+    }
+
+    match tokio::time::timeout(timeout, receiver).await {
+        Ok(Ok(crate::uac::UacResult::Response(message))) => Python::attach(|py| {
+            let py_reply = PyReply::new(Arc::new(std::sync::Mutex::new(*message)));
+            Py::new(py, py_reply).map(Some)
+        }),
+        // Timeout, channel closed, or explicit UacResult::Timeout
+        _ => Ok(None),
     }
 }
 
@@ -1278,6 +1343,10 @@ fn memory_pct_linux() -> u32 {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[path = "send_request_flow_tests.rs"]
+mod send_request_flow_tests;
 
 #[cfg(test)]
 mod deferred_send_tests {
@@ -2150,7 +2219,7 @@ mod tests {
 
     /// Call `proxy.send_request` from inside a running loop, the way a
     /// handler does, and drive it to completion.
-    fn run_send_request<'py>(
+    pub(super) fn run_send_request<'py>(
         python: Python<'py>,
         proxy: &Bound<'py, PyAny>,
         method: &str,
@@ -2172,14 +2241,81 @@ mod tests {
     /// Column-zero source: a Rust line continuation would indent the Python.
     const SEND_HELPER: &str = "import asyncio\ndef call(proxy, method, ruri, kwargs):\n    async def run():\n        return await proxy.send_request(method, ruri, **kwargs)\n    return asyncio.run(run())\n";
 
+    /// The UAC sender `proxy.send_request` sends through in this process, with
+    /// its UDP egress on a channel the tests read the wire off.
+    ///
+    /// `UAC_SENDER` is a `OnceLock`, so every test here shares the one sender
+    /// and takes turns on it ([`SendFixture::turn`]).
+    pub(super) struct SendFixture {
+        pub(super) udp: flume::Receiver<crate::transport::OutboundMessage>,
+        pub(super) resolver: Arc<SipResolver>,
+        _other: Vec<flume::Receiver<crate::transport::OutboundMessage>>,
+    }
+
+    static SEND_FIXTURE: std::sync::OnceLock<SendFixture> = std::sync::OnceLock::new();
+    static SEND_TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    impl SendFixture {
+        /// The installed fixture and the turn on it, with nothing left unread.
+        pub(super) fn turn() -> (std::sync::MutexGuard<'static, ()>, &'static SendFixture) {
+            let turn = SEND_TURN
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let fixture = SEND_FIXTURE.get_or_init(|| {
+                use crate::transport::OutboundRouter;
+                use crate::uac::UacSender;
+                use std::collections::HashMap;
+
+                pyo3::Python::initialize();
+                let (udp_tx, udp_rx) = flume::unbounded();
+                let (tcp_tx, tcp_rx) = flume::unbounded();
+                let (tls_tx, tls_rx) = flume::unbounded();
+                let (ws_tx, ws_rx) = flume::unbounded();
+                let (wss_tx, wss_rx) = flume::unbounded();
+                let (sctp_tx, sctp_rx) = flume::unbounded();
+                let router = Arc::new(OutboundRouter {
+                    udp: udp_tx.into(),
+                    udp_by_local: HashMap::new(),
+                    udp_dynamic: None,
+                    tcp: tcp_tx,
+                    tls: tls_tx,
+                    ws: ws_tx,
+                    wss: wss_tx,
+                    sctp: Some(sctp_tx),
+                });
+                let sender = Arc::new(UacSender::new(
+                    router,
+                    "127.0.0.1:5060".parse().unwrap(),
+                    HashMap::new(),
+                    HashMap::new(),
+                    None,
+                    None,
+                    crate::config::IdentityHeaders::default().shared(),
+                ));
+                let resolver = Arc::new(SipResolver::from_system().unwrap());
+                assert!(
+                    UAC_SENDER.set(sender).is_ok(),
+                    "only this fixture installs the send_request UAC"
+                );
+                let _ = SEND_RESOLVER.set(Arc::clone(&resolver));
+                SendFixture {
+                    udp: udp_rx,
+                    resolver,
+                    _other: vec![tcp_rx, tls_rx, ws_rx, wss_rx, sctp_rx],
+                }
+            });
+            while fixture.udp.try_recv().is_ok() {}
+            (turn, fixture)
+        }
+    }
+
     /// End-to-end PyO3 dispatch test: call `proxy_utils.send_request(...)`
     /// from Python with `body=` and `headers=` kwargs, then read the wire
     /// bytes off a flume channel.  This is what `build_send_request_message`
     /// tests *can't* catch — it exercises the kwarg-binding path that the
     /// 3PR bug report says is dropping the body.
     ///
-    /// Runs four scenarios back-to-back (UAC_SENDER is a OnceLock — only
-    /// one test per process can install it, so we cover everything here):
+    /// Runs four scenarios back-to-back on the shared [`SendFixture`]:
     /// 1. The reporter's 3PR shape: 9 headers including Content-Type,
     ///    1809-byte str body.
     /// 2. body=bytes (binary SDP-style).
@@ -2188,49 +2324,13 @@ mod tests {
     /// 4. Fire-and-forget registers a pending UAC entry (so dispatcher
     ///    silently consumes the response — no "unknown branch" log) and
     ///    `match_response` removes it on the matching reply.
-
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn send_request_python_kwargs_preserve_body_and_content_type() {
-        use crate::transport::OutboundRouter;
-        use crate::uac::UacSender;
-        use std::collections::HashMap;
-
-        pyo3::Python::initialize();
-
-        // Wire up a UAC sender whose UDP egress lands on a flume channel
-        // so the test can read back the bytes that would have hit the wire.
-        let (udp_tx, udp_rx) = flume::unbounded();
-        let (tcp_tx, _tcp_rx) = flume::unbounded();
-        let (tls_tx, _tls_rx) = flume::unbounded();
-        let (ws_tx, _ws_rx) = flume::unbounded();
-        let (wss_tx, _wss_rx) = flume::unbounded();
-        let (sctp_tx, _sctp_rx) = flume::unbounded();
-
-        let router = Arc::new(OutboundRouter {
-            udp: udp_tx.into(),
-            udp_by_local: HashMap::new(),
-            udp_dynamic: None,
-            tcp: tcp_tx,
-            tls: tls_tx,
-            ws: ws_tx,
-            wss: wss_tx,
-            sctp: Some(sctp_tx),
-        });
-        let sender = Arc::new(UacSender::new(
-            router,
-            "127.0.0.1:5060".parse().unwrap(),
-            HashMap::new(),
-            HashMap::new(),
-            None,
-            None,
-            crate::config::IdentityHeaders::default().shared(),
-        ));
-        let resolver = Arc::new(SipResolver::from_system().unwrap());
-
-        // OnceLock — first test to set wins.  Ignore the result; subsequent
-        // tests on the same process just reuse whatever is installed.
-        let _ = UAC_SENDER.set(sender);
-        let _ = SEND_RESOLVER.set(Arc::clone(&resolver));
+        // A UAC sender whose UDP egress lands on a flume channel, so the test
+        // can read back the bytes that would have hit the wire.
+        let (_turn, fixture) = SendFixture::turn();
+        let udp_rx = &fixture.udp;
+        let resolver = Arc::clone(&fixture.resolver);
 
         let utils = PyProxyUtils::new(resolver);
         let utils_py = Python::attach(|py| Py::new(py, utils).unwrap());

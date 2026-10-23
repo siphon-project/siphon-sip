@@ -36,6 +36,31 @@ pub(super) fn flow_relay_egress(
     )
 }
 
+/// Where a request sent over a captured flow leaves from and goes to, with the
+/// HEP capture `send_to_target` would have done (this path bypasses it, so a
+/// flow-pinned relay would otherwise never reach Homer). Over IPsec UDP the
+/// UE's flow is the one it sends on, so the request takes the P-CSCF's own
+/// (TS 24.229 5.2.2.2 1A a); the Via keeps naming the flow's socket.
+fn captured_flow_egress(
+    transport: Transport,
+    destination: SocketAddr,
+    flow_local: SocketAddr,
+    data: &[u8],
+    state: &DispatcherState,
+) -> (SocketAddr, Option<SocketAddr>) {
+    let (destination, local) =
+        protected_udp_egress(data, transport, destination, Some(flow_local), state);
+    if let Some(ref hep) = state.hep_sender {
+        hep.capture_outbound(
+            state.hep_local_addr(local.unwrap_or(flow_local), transport),
+            destination,
+            transport,
+            data,
+        );
+    }
+    (destination, local)
+}
+
 /// Relay a SIP request to its destination.
 ///
 /// 1. Determine target address (explicit next_hop, or Request-URI)
@@ -593,23 +618,15 @@ pub(super) fn relay_request(
     //     `connection_map`.  No DNS, no pool lookup.
     //   - URI-relay: the legacy path through `send_to_target`.
     let outcome = if let Some(local) = flow_local_addr {
-        // This branch bypasses `send_to_target`, so it has to do that helper's
-        // HEP capture itself, as the fork and B-leg flow paths do.
-        if let Some(ref hep) = state.hep_sender {
-            hep.capture_outbound(
-                state.hep_local_addr(local, outbound_transport),
-                destination,
-                outbound_transport,
-                &data,
-            );
-        }
+        let (destination, local) =
+            captured_flow_egress(outbound_transport, destination, local, &data, state);
         let outbound_message = OutboundMessage {
             followups: None,
             connection_id: ConnectionId(flow.map(|f| f.connection_id).unwrap_or(0)),
             transport: outbound_transport,
             destination,
             data,
-            source_local_addr: Some(local),
+            source_local_addr: local,
             server_name: None,
             verify_server: None,
         };
@@ -1202,24 +1219,20 @@ pub(super) fn relay_fork_branch(
     // — mirrors the relay(flow=...) path) when one is attached, else via the
     // normal resolver/pool path.
     let outcome = if let Some(flow) = flow {
-        // This branch bypasses `send_to_target`, so it has to do that helper's
-        // HEP capture itself — otherwise a flow-pinned relay is the one request
-        // that never reaches Homer.
-        if let Some(ref hep) = state.hep_sender {
-            hep.capture_outbound(
-                state.hep_local_addr(flow.local_addr, outbound_transport),
-                destination,
-                outbound_transport,
-                &data,
-            );
-        }
+        let (destination, local) = captured_flow_egress(
+            outbound_transport,
+            destination,
+            flow.local_addr,
+            &data,
+            state,
+        );
         let outbound_message = OutboundMessage {
             followups: None,
             connection_id: ConnectionId(flow.connection_id),
             transport: outbound_transport,
             destination,
             data,
-            source_local_addr: Some(flow.local_addr),
+            source_local_addr: local,
             server_name: None,
             verify_server: None,
         };

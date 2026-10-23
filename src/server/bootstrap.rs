@@ -752,11 +752,7 @@ pub(super) fn init_diameter(config: &Config) -> Option<Arc<crate::diameter::Diam
 /// emits an Rf ACR-EVENT for every registration state change.  Each
 /// event is a one-shot accounting record — no session state is held.
 ///
-/// `cause_code` per RFC 3326 / TS 32.299 §5.2.5:
-/// - `Registered` / `Refreshed` → 0 (success)
-/// - `Deregistered` → -200 (clean unbind, mapped from successful 200 OK)
-/// - `Expired` → -487 (Request Terminated semantically — the binding
-///   was torn down because no refresh arrived)
+/// `Cause-Code` from [`registration_cause_code`].
 pub(super) fn spawn_rf_register_emitter(
     service: Arc<crate::diameter::rf_service::RfChargingService>,
     mut events: tokio::sync::broadcast::Receiver<crate::registrar::RegistrationEvent>,
@@ -777,12 +773,12 @@ pub(super) fn spawn_rf_register_emitter(
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             };
-            let (aor, cause_code) = match &event {
-                RegistrationEvent::Registered { aor } | RegistrationEvent::Refreshed { aor } => {
-                    (aor.clone(), 0i32)
-                }
-                RegistrationEvent::Deregistered { aor } => (aor.clone(), -200),
-                RegistrationEvent::Expired { aor } => (aor.clone(), -487),
+            let cause_code = registration_cause_code(&event);
+            let aor = match &event {
+                RegistrationEvent::Registered { aor }
+                | RegistrationEvent::Refreshed { aor }
+                | RegistrationEvent::Deregistered { aor }
+                | RegistrationEvent::Expired { aor } => aor.clone(),
             };
             let ims_data = ImsChargingData {
                 calling_party: vec![aor.clone()],
@@ -796,6 +792,23 @@ pub(super) fn spawn_rf_register_emitter(
         }
         info!("rf: registrar ACR-EVENT emitter stopped");
     });
+}
+
+/// `Cause-Code` (TS 32.299 V18.0.0 clause 7.2.35) of the ACR-EVENT for a
+/// registration state change.
+///
+/// A registration or refresh is a REGISTER that drew its 200: "-1 Successful
+/// transaction", which the clause names for exactly that. A binding removed,
+/// by a REGISTER with expires 0 or by running out without a refresh, ends the
+/// REGISTER dialog: "-3 End of REGISTER dialog". 0 is "Normal end of session",
+/// a session's, and the -200 and -487 sent before were negated SIP statuses
+/// that a Release 18 CDF reads as successful causes it does not know.
+pub(super) fn registration_cause_code(event: &crate::registrar::RegistrationEvent) -> i32 {
+    use crate::registrar::RegistrationEvent;
+    match event {
+        RegistrationEvent::Registered { .. } | RegistrationEvent::Refreshed { .. } => -1,
+        RegistrationEvent::Deregistered { .. } | RegistrationEvent::Expired { .. } => -3,
+    }
 }
 
 /// Build the Rf offline-charging service from the `rf:` config block.

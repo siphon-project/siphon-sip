@@ -104,6 +104,22 @@ pub struct SubscribeDialog {
     /// notifier role.
     #[serde(default)]
     pub is_outbound: bool,
+    /// The registration whose security association an outbound subscription
+    /// was made over (`subscribe_state.send(flow=registration.flow(impu))`).
+    /// Its refreshes and its unsubscribe go over that registration's SA set
+    /// as it stands when each is sent: a re-registration replaces the set.
+    /// `None` for every other dialog, and for payloads cached before it.
+    #[serde(default)]
+    pub registrant_flow: Option<DialogRegistrantFlow>,
+}
+
+/// The registration an outbound subscription rides, kept with the dialog.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DialogRegistrantFlow {
+    /// The registration's AoR.
+    pub aor: String,
+    /// siphon's own address on the SA, which the client port is bound to.
+    pub ue_ip: std::net::IpAddr,
 }
 
 impl SubscribeDialog {
@@ -445,6 +461,7 @@ mod tests {
             event_version: 0,
             terminated: false,
             is_outbound: false,
+            registrant_flow: None,
         }
     }
 

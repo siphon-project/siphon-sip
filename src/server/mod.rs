@@ -1253,6 +1253,7 @@ impl SiphonServer {
             .and_then(|sec| sec.max_message_bytes)
             .unwrap_or(crate::security::DEFAULT_MAX_MESSAGE_BYTES);
         crate::security::set_max_message_bytes(max_message_bytes);
+        crate::transport::send_queue::install(&config.listen);
         debug!(max_message_bytes, "stream message-size ceiling installed");
 
         // --- Inbound connection ceilings ---
@@ -1562,10 +1563,10 @@ impl SiphonServer {
         // listener registers into the same per-transport map as the dedicated
         // one, so a WS connection is reachable identically either way.
         let ws_connection_map: Arc<
-            dashmap::DashMap<transport::ConnectionId, tokio::sync::mpsc::Sender<bytes::Bytes>>,
+            dashmap::DashMap<transport::ConnectionId, transport::send_queue::SendQueue>,
         > = Arc::new(dashmap::DashMap::new());
         let wss_connection_map: Arc<
-            dashmap::DashMap<transport::ConnectionId, tokio::sync::mpsc::Sender<bytes::Bytes>>,
+            dashmap::DashMap<transport::ConnectionId, transport::send_queue::SendQueue>,
         > = Arc::new(dashmap::DashMap::new());
 
         // TCP
@@ -1629,7 +1630,7 @@ impl SiphonServer {
         // do a real liveness lookup against the live connection set.
         crate::script::api::set_stream_connections(stream_connections.clone());
         let tls_connection_map: Arc<
-            dashmap::DashMap<transport::ConnectionId, tokio::sync::mpsc::Sender<bytes::Bytes>>,
+            dashmap::DashMap<transport::ConnectionId, transport::send_queue::SendQueue>,
         > = Arc::new(dashmap::DashMap::new());
 
         // --- Connection pool ---
@@ -2185,7 +2186,11 @@ impl SiphonServer {
                 Arc::clone(&identity),
             )
             .with_advertised_ports(advertised_ports.clone())
-            .with_listeners(listener_registry.clone(), stream_connections.clone()),
+            .with_listeners(listener_registry.clone(), stream_connections.clone())
+            .with_ipsec_egress(
+                ipsec_manager.clone(),
+                config.ipsec.as_ref().map(|ipsec| ipsec.pcscf_port_s),
+            ),
         );
 
         // Wire UAC sender into proxy.send_request() Python API

@@ -35,6 +35,7 @@ pub use serve::serve;
 use crate::config::CorsConfig;
 
 mod calls;
+mod rate_limit_bans;
 use crate::dispatcher::DrainState;
 use crate::registrar::Registrar;
 use calls::calls_json;
@@ -159,6 +160,10 @@ pub(super) fn router(mut state: AdminState, cors: Option<&CorsConfig>, ui_enable
         )
         .route("/admin/bans", get(bans_handler))
         .route("/admin/bans/{ip}", delete(ban_delete_handler))
+        .route(
+            "/admin/rate-limit/bans",
+            get(rate_limit_bans::rate_limit_bans_handler),
+        )
         .route("/admin/gateways", get(gateways_handler))
         .route(
             "/admin/gateways/{group}/{destination}/{action}",
@@ -1041,6 +1046,9 @@ async fn metrics_json_handler(State(state): State<AdminState>) -> impl IntoRespo
             // `null` when auto-ban is off: a zero would read as "watching, and
             // nothing banned". The rest of this block is live either way.
             "banned_ips": crate::security::auto_ban_enabled().is_some().then(|| metrics.banned_ips.get()),
+            // The same rule for the sources `rate_limit` has banned: `null` when it is off.
+            "rate_limit_banned_sources": crate::security::security_filter()
+                .filter(|filter| filter.rate_limit_enabled()).map(|filter| filter.rate_limit_bans()),
             // TLS/WS handshakes that failed outright, and connections refused by
             // the per-source ceilings. Both were live and both were invisible.
             "handshake_failures": metrics.handshake_failures_total.get(),

@@ -3,7 +3,7 @@
 //! swaps.
 
 use std::net::IpAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
@@ -104,6 +104,68 @@ pub(super) struct RateLimitState {
     /// under the policy at zero rather than with the count it ran up while
     /// trusted. Pruned with the rest; one row per busy gateway at most.
     exempt_windows: DashMap<IpAddr, FailureWindow>,
+    /// Budget for the WARN raised with each ban.
+    installed_log: BanLog,
+    /// Budget for the INFO raised when a ban ends.
+    lifted_log: BanLog,
+}
+
+/// Lines of each kind ([`BanLog`]) logged per [`BAN_LOG_WINDOW`] before the
+/// rest are only counted.
+pub(super) const BAN_LOG_BUDGET: u32 = 20;
+/// The window [`BAN_LOG_BUDGET`] applies to.
+pub(super) const BAN_LOG_WINDOW: Duration = Duration::from_secs(60);
+
+/// A budget for one kind of ban log line.
+///
+/// One line per ban is right for the case this exists for, a peer the operator
+/// forgot to trust going over the limit; a scanner fleet tripping it from
+/// thousands of addresses at once is the case it must not turn into a log
+/// flood. Past the budget a line is counted instead, and the count is said
+/// with the next line logged, or at the prune once the window rolls, so a
+/// wave shows as its size rather than as silence.
+#[derive(Default)]
+struct BanLog(Mutex<BanLogWindow>);
+
+#[derive(Default)]
+struct BanLogWindow {
+    started: Option<Instant>,
+    logged: u32,
+    unlogged: u32,
+}
+
+impl BanLog {
+    /// Whether to log one more line at `now`, and how many went unlogged
+    /// since the last one that was.
+    fn admit(&self, now: Instant) -> Option<u32> {
+        let mut window = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if window
+            .started
+            .is_none_or(|started| now.duration_since(started) >= BAN_LOG_WINDOW)
+        {
+            window.started = Some(now);
+            window.logged = 0;
+        }
+        if window.logged < BAN_LOG_BUDGET {
+            window.logged += 1;
+            Some(std::mem::take(&mut window.unlogged))
+        } else {
+            window.unlogged = window.unlogged.saturating_add(1);
+            None
+        }
+    }
+
+    /// The lines counted but not logged, once the window they fell in is
+    /// over; `0` otherwise, or when there were none.
+    fn take_unlogged(&self, now: Instant) -> u32 {
+        let mut window = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        match window.started {
+            Some(started) if now.duration_since(started) >= BAN_LOG_WINDOW => {
+                std::mem::take(&mut window.unlogged)
+            }
+            _ => 0,
+        }
+    }
 }
 
 impl RateLimitState {
@@ -125,13 +187,13 @@ impl RateLimitState {
         let ban_expiry = self.bans.get(&source).map(|entry| *entry.value());
         match ban_expiry {
             Some(expiry) if expiry > now => return false,
-            Some(_) => {
-                self.bans.remove(&source);
-            }
-            None => {}
+            // `remove` can find nothing: the prune lifted it meanwhile, and
+            // logged it there.
+            Some(_) if self.bans.remove(&source).is_some() => self.ban_lifted(source, now),
+            Some(_) | None => {}
         }
 
-        let over_limit = {
+        let (over_limit, count) = {
             let mut entry = self.windows.entry(source).or_insert(FailureWindow {
                 count: 0,
                 window_start: now,
@@ -141,16 +203,54 @@ impl RateLimitState {
                 entry.window_start = now;
             }
             entry.count += 1;
-            entry.count > policy.max_requests
+            (entry.count > policy.max_requests, entry.count)
             // shard write guard dropped here, before touching `bans`/`windows`.
         };
 
         if over_limit {
             self.windows.remove(&source);
             self.bans.insert(source, now + policy.ban_duration);
+            self.ban_installed(policy, source, count, now);
             return false;
         }
         true
+    }
+
+    /// Say that `source` is banned, once per ban: every request it sends from
+    /// here to the end of the ban is dropped without a word, so this line is
+    /// the only place the operator learns which peer went quiet and why.
+    fn ban_installed(&self, policy: &RateLimitPolicy, source: IpAddr, count: u32, now: Instant) {
+        crate::metrics::rate_limit::record_ban();
+        self.publish_bans();
+        let Some(unlogged) = self.installed_log.admit(now) else {
+            return;
+        };
+        tracing::warn!(
+            source = %source,
+            requests = count,
+            max_requests = policy.max_requests,
+            window_secs = policy.window.as_secs(),
+            ban_secs = policy.ban_duration.as_secs(),
+            unlogged_bans = unlogged,
+            "rate_limit: source banned, its requests are dropped unanswered until the ban ends \
+             (list: GET /admin/rate-limit/bans; exempt a peer with security.trusted_cidrs)"
+        );
+    }
+
+    /// Say that the ban on `source` is over.
+    fn ban_lifted(&self, source: IpAddr, now: Instant) {
+        self.publish_bans();
+        if let Some(unlogged) = self.lifted_log.admit(now) {
+            tracing::info!(
+                source = %source,
+                unlogged_lifts = unlogged,
+                "rate_limit: ban lifted"
+            );
+        }
+    }
+
+    fn publish_bans(&self) {
+        crate::metrics::rate_limit::publish_banned_sources(self.bans.len());
     }
 
     /// Count one request from an exempt gateway source. Returns `true` exactly
@@ -170,7 +270,33 @@ impl RateLimitState {
     }
 
     fn prune_at(&self, window: Duration, now: Instant) {
-        self.bans.retain(|_, expiry| *expiry > now);
+        let mut expired = Vec::new();
+        self.bans.retain(|source, expiry| {
+            let live = *expiry > now;
+            if !live {
+                expired.push(*source);
+            }
+            live
+        });
+        for source in expired {
+            self.ban_lifted(source, now);
+        }
+        let unlogged = self.installed_log.take_unlogged(now);
+        if unlogged > 0 {
+            tracing::warn!(
+                unlogged,
+                banned_now = self.bans.len(),
+                "rate_limit: further rate-limit bans went unlogged (budget per minute spent)"
+            );
+        }
+        let unlogged = self.lifted_log.take_unlogged(now);
+        if unlogged > 0 {
+            tracing::info!(
+                unlogged,
+                "rate_limit: further rate-limit ban lifts went unlogged"
+            );
+        }
+        self.publish_bans();
         self.windows
             .retain(|_, entry| now.duration_since(entry.window_start) <= window);
         self.exempt_windows
@@ -178,16 +304,47 @@ impl RateLimitState {
     }
 
     fn clear(&self) {
+        let lifted = self.bans.len();
         self.bans.clear();
         self.windows.clear();
         self.exempt_windows.clear();
+        if lifted > 0 {
+            tracing::info!(lifted, "rate_limit: off, every rate-limit ban lifted");
+        }
+        self.publish_bans();
     }
 
     /// Lift bans and windows on every source inside `trusted`.
     fn lift_trusted(&self, trusted: &[ipnet::IpNet]) {
         let outside = |source: &IpAddr| !trusted.iter().any(|network| network.contains(source));
-        self.bans.retain(|source, _| outside(source));
+        let mut lifted = Vec::new();
+        self.bans.retain(|source, _| {
+            let keep = outside(source);
+            if !keep {
+                lifted.push(*source);
+            }
+            keep
+        });
         self.windows.retain(|source, _| outside(source));
+        let now = Instant::now();
+        for source in lifted {
+            self.ban_lifted(source, now);
+        }
+    }
+
+    /// Banned sources with the whole seconds left on each ban at `now`; a
+    /// ban already past its expiry is left out, pruned or not.
+    fn banned_sources_at(&self, now: Instant) -> Vec<(IpAddr, u64)> {
+        let mut banned: Vec<(IpAddr, u64)> = self
+            .bans
+            .iter()
+            .filter_map(|entry| {
+                let remaining = entry.value().saturating_duration_since(now);
+                (!remaining.is_zero()).then(|| (*entry.key(), remaining.as_secs()))
+            })
+            .collect();
+        banned.sort_unstable();
+        banned
     }
 
     /// Rows held across the three maps. Test-only: each is keyed by a live
@@ -376,4 +533,23 @@ impl SecurityFilter {
     pub fn rate_limit_bans(&self) -> usize {
         self.rate.bans.len()
     }
+
+    /// Whether `rate_limit` is in force, so a list of its bans means something.
+    pub fn rate_limit_enabled(&self) -> bool {
+        self.policy.load().rate_limit.is_some()
+    }
+
+    /// Sources banned by `rate_limit` now, each with the seconds left on its
+    /// ban, ordered by address. For `GET /admin/rate-limit/bans`.
+    pub fn rate_limit_banned_sources(&self) -> Vec<(IpAddr, u64)> {
+        self.rate_limit_banned_sources_at(Instant::now())
+    }
+
+    pub(super) fn rate_limit_banned_sources_at(&self, now: Instant) -> Vec<(IpAddr, u64)> {
+        self.rate.banned_sources_at(now)
+    }
 }
+
+#[cfg(test)]
+#[path = "filter_tests.rs"]
+mod tests;

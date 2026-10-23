@@ -285,7 +285,9 @@ class MockProxy:
                            body: Optional[Any] = None,
                            next_hop: Optional[str] = None,
                            wait_for_response: bool = False,
-                           timeout_ms: int = 2000) -> Any:
+                           timeout_ms: int = 2000,
+                           flow: Optional[Any] = None,
+                           route: Optional[list[str]] = None) -> Any:
         """Originate an outbound SIP request.
 
         Always returns an awaitable — scripts must ``await`` it. Fire-and-forget
@@ -307,7 +309,24 @@ class MockProxy:
                 header for next-hop selection.
             wait_for_response: When ``True``, return the configured mock reply.
             timeout_ms: Response timeout (not meaningfully enforced in the mock).
+            flow: Send over a flow. A ``registration.flow(impu)`` is the UE's
+                own SA: the request leaves over it with ``route`` as its Route
+                headers (TS 24.229 5.1.2A.1.1). A callee's flow is used with
+                no route set and yields to one, as in ``call.dial``.
+            route: The route set, one Route header per entry, in order. Not
+                with a ``Route`` in ``headers``.
+
+        Raises:
+            ValueError: ``flow`` with ``next_hop``, or ``route`` with a
+                ``Route`` in ``headers``.
         """
+        if flow is not None and next_hop is not None:
+            raise ValueError("proxy.send_request: pass flow= or next_hop=, not both")
+        if route and any(name.lower() == "route" for name in (headers or {})):
+            raise ValueError(
+                "proxy.send_request: pass the route set as route= or as a Route "
+                "in headers=, not both"
+            )
         record = {
             "method": method,
             "ruri": ruri,
@@ -316,6 +335,8 @@ class MockProxy:
             "next_hop": next_hop,
             "wait_for_response": wait_for_response,
             "timeout_ms": timeout_ms,
+            "flow": flow,
+            "route": list(route or []),
         }
         self._sent_requests.append(record)
         if not wait_for_response:
@@ -681,8 +702,17 @@ class MockSubscribeState:
         target_uri: Optional[str] = None,
         headers: Optional[dict] = None,
         timeout_ms: int = 2000,
+        flow: Optional[Any] = None,
+        route: Optional[list[str]] = None,
     ) -> MockSubscribeHandle:
         """Mock outbound SUBSCRIBE — records the call and synthesises a dialog.
+
+        ``flow=registration.flow(impu)`` subscribes as that UE over its SA, with
+        ``route`` (the P-CSCF's protected URI, then the Service-Route) as the
+        SUBSCRIBE's Route headers; siphon sends the refreshes and the
+        unsubscribe over the SA set the registration holds at the time, and
+        refuses a callee's flow with ``ValueError``. ``route`` cannot be
+        combined with ``target_uri`` or a ``Route`` in ``headers``.
 
         Tests can assert on the recorded ``self.sends`` list to verify a
         script originated a SUBSCRIBE with the expected parameters.
@@ -739,6 +769,13 @@ class MockSubscribeState:
         with ``harness.send_request("NOTIFY", ...)``: the harness places them
         against the subscription the way siphon does.
         """
+        if route and (target_uri is not None
+                      or any(name.lower() == "route" for name in (headers or {}))):
+            raise ValueError(
+                "subscribe_state.send: pass the route set as route= or as "
+                "target_uri= / a Route in headers=, not both"
+            )
+
         async def _run():
             import uuid
             if not hasattr(self, "sends"):
@@ -765,6 +802,8 @@ class MockSubscribeState:
                 "target_uri": target_uri,
                 "headers": dict(headers or {}),
                 "timeout_ms": timeout_ms,
+                "flow": flow,
+                "route": list(route or []),
             })
             return MockSubscribeHandle(self, handle_id, dialog)
 

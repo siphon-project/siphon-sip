@@ -13,17 +13,17 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, error, info, warn};
 
 use crate::config::TlsServerConfig;
 use crate::transport::acl::TransportAcl;
 use crate::transport::proxy_protocol::{accept_proxied, ProxyProtocolAcl};
+use crate::transport::send_queue::SendQueue;
 use crate::transport::stream::{bind_tcp_listener, spawn_outbound_distributor, PrefixedStream};
 use crate::transport::{
     configure_tcp_socket, next_connection_id, ConnectionId, InboundMessage, OutboundMessage,
-    StreamConnections, Transport, CONNECTION_IDLE_TIMEOUT, WRITE_TIMEOUT,
+    StreamConnections, Transport, CONNECTION_IDLE_TIMEOUT,
 };
 
 /// Handle a single WebSocket connection after the upgrade handshake.
@@ -47,7 +47,7 @@ pub(crate) async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send +
     // so it covers the upgrade and then the whole connection.
     mut permit: crate::security::AcceptPermit,
     inbound_tx: flume::Sender<InboundMessage>,
-    connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>>,
+    connection_map: Arc<DashMap<ConnectionId, SendQueue>>,
     stream_connections: StreamConnections,
     close_tx: Option<flume::Sender<u64>>,
 ) {
@@ -132,7 +132,8 @@ pub(crate) async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send +
     }
 
     // Per-connection outbound channel
-    let (outbound_tx, mut outbound_rx) = mpsc::channel::<Bytes>(64);
+    let (outbound_tx, mut outbound_rx) =
+        crate::transport::send_queue::channel(transport_variant, connection_id);
     connection_map.insert(connection_id, outbound_tx);
     // Register in the unified stream registry so the relay path can reach this
     // UE — for WebSocket this is the *only* way back (client-initiated; RFC 7118
@@ -207,6 +208,7 @@ pub(crate) async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send +
     });
 
     // Write task: per-connection channel → WebSocket text frames
+    let write_timeout = crate::transport::send_queue::write_timeout();
     let mut write_task = tokio::spawn(async move {
         while let Some(data) = outbound_rx.recv().await {
             // SIP messages are text — send as text frame
@@ -214,19 +216,15 @@ pub(crate) async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send +
             // Bounded: a browser or gateway that stops reading its socket leaves
             // this send blocked forever, pinning the connection and its
             // `connection_map` entry for the life of the process.
-            match tokio::time::timeout(WRITE_TIMEOUT, ws_sink.send(Message::text(text))).await {
+            match tokio::time::timeout(write_timeout, ws_sink.send(Message::text(text))).await {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => {
                     warn!("WS write error on {:?}: {}", connection_id, error);
                     break;
                 }
+                // The peer is not draining the connection: close it as stuck.
                 Err(_) => {
-                    warn!(
-                        connection_id = ?connection_id,
-                        timeout = ?WRITE_TIMEOUT,
-                        "WS write stalled — peer is not draining the connection; \
-                         closing it"
-                    );
+                    outbound_rx.stalled(remote_addr);
                     break;
                 }
             }
@@ -271,7 +269,7 @@ pub async fn listen(
     local_addr: SocketAddr,
     inbound_tx: flume::Sender<InboundMessage>,
     outbound_rx: flume::Receiver<OutboundMessage>,
-    connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>>,
+    connection_map: Arc<DashMap<ConnectionId, SendQueue>>,
     acl: Arc<TransportAcl>,
     stream_connections: StreamConnections,
     tos: Option<u32>,
@@ -415,7 +413,7 @@ pub async fn listen_secure(
     tls_config: &TlsServerConfig,
     inbound_tx: flume::Sender<InboundMessage>,
     outbound_rx: flume::Receiver<OutboundMessage>,
-    connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>>,
+    connection_map: Arc<DashMap<ConnectionId, SendQueue>>,
     acl: Arc<TransportAcl>,
     stream_connections: StreamConnections,
     tos: Option<u32>,
@@ -608,8 +606,7 @@ mod tests {
     #[tokio::test]
     async fn a_closing_websocket_does_not_unregister_the_one_that_replaced_it() {
         let registry = StreamConnections::new();
-        let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
-            Arc::new(DashMap::new());
+        let connection_map: Arc<DashMap<ConnectionId, SendQueue>> = Arc::new(DashMap::new());
         let (inbound_tx, _inbound_rx) = flume::unbounded();
         let local_addr: SocketAddr = "127.0.0.1:5062".parse().unwrap();
         let remote_addr: SocketAddr = "198.51.100.231:50462".parse().unwrap();
@@ -685,8 +682,7 @@ mod tests {
             3600,
         ));
         let registry = StreamConnections::new();
-        let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
-            Arc::new(DashMap::new());
+        let connection_map: Arc<DashMap<ConnectionId, SendQueue>> = Arc::new(DashMap::new());
         let (inbound_tx, _inbound_rx) = flume::unbounded();
         let local_addr: SocketAddr = "127.0.0.1:5062".parse().expect("a test address");
         let remote_addr: SocketAddr = "203.0.113.24:50462".parse().expect("a test address");
@@ -743,8 +739,7 @@ mod tests {
     async fn ws_connection_lifecycle() {
         let (inbound_tx, inbound_rx) = flume::unbounded();
         let (_outbound_tx, outbound_rx) = flume::unbounded::<OutboundMessage>();
-        let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
-            Arc::new(DashMap::new());
+        let connection_map: Arc<DashMap<ConnectionId, SendQueue>> = Arc::new(DashMap::new());
 
         let addr = listen(
             any_loopback_port(),
@@ -809,8 +804,7 @@ mod tests {
         // and must clear on close so a stale flow reports dead.
         let (inbound_tx, inbound_rx) = flume::unbounded();
         let (_outbound_tx, outbound_rx) = flume::unbounded::<OutboundMessage>();
-        let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
-            Arc::new(DashMap::new());
+        let connection_map: Arc<DashMap<ConnectionId, SendQueue>> = Arc::new(DashMap::new());
         let registry = StreamConnections::new();
 
         let addr = listen(
@@ -874,8 +868,7 @@ mod tests {
 
         let (inbound_tx, _inbound_rx) = flume::unbounded();
         let (_outbound_tx, outbound_rx) = flume::unbounded::<OutboundMessage>();
-        let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
-            Arc::new(DashMap::new());
+        let connection_map: Arc<DashMap<ConnectionId, SendQueue>> = Arc::new(DashMap::new());
 
         let addr = listen(
             any_loopback_port(),
@@ -914,8 +907,7 @@ mod tests {
     async fn ws_connection_cleanup() {
         let (inbound_tx, inbound_rx) = flume::unbounded();
         let (_outbound_tx, outbound_rx) = flume::unbounded::<OutboundMessage>();
-        let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
-            Arc::new(DashMap::new());
+        let connection_map: Arc<DashMap<ConnectionId, SendQueue>> = Arc::new(DashMap::new());
 
         let addr = listen(
             any_loopback_port(),
@@ -965,8 +957,7 @@ mod tests {
     async fn ws_binary_frame_accepted() {
         let (inbound_tx, inbound_rx) = flume::unbounded();
         let (_outbound_tx, outbound_rx) = flume::unbounded::<OutboundMessage>();
-        let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
-            Arc::new(DashMap::new());
+        let connection_map: Arc<DashMap<ConnectionId, SendQueue>> = Arc::new(DashMap::new());
 
         let addr = listen(
             any_loopback_port(),
@@ -1013,8 +1004,7 @@ mod tests {
 
         let (inbound_tx, inbound_rx) = flume::unbounded();
         let (_outbound_tx, outbound_rx) = flume::unbounded::<OutboundMessage>();
-        let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
-            Arc::new(DashMap::new());
+        let connection_map: Arc<DashMap<ConnectionId, SendQueue>> = Arc::new(DashMap::new());
 
         let addr = listen_secure(
             any_loopback_port(),

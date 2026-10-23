@@ -4,7 +4,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use super::custom::CustomMetrics;
 use super::{
-    admission, enum_servers, event_lag, ipsec, SiphonMetrics, CUSTOM_METRICS, METRICS, STARTED_AT,
+    admission, enum_servers, event_lag, ipsec, rate_limit, send_queue, SiphonMetrics,
+    CUSTOM_METRICS, METRICS, STARTED_AT,
 };
 
 /// Initialize the global metrics. Call once at startup.
@@ -27,6 +28,8 @@ pub fn init() -> Result<(), prometheus::Error> {
     enum_servers::init(&metrics.registry)?;
     event_lag::init(&metrics.registry)?;
     ipsec::init(&metrics.registry)?;
+    rate_limit::init(&metrics.registry)?;
+    send_queue::init(&metrics.registry)?;
     let custom = Arc::new(CustomMetrics::new(&metrics.registry));
     let _ = CUSTOM_METRICS.set(custom);
     let _ = METRICS.set(metrics);
