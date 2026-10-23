@@ -1610,7 +1610,7 @@
       "send_request": {
         "doc": "Originate an outbound SIP request.",
         "kind": "method_descriptor",
-        "sig": "($self, method, ruri, headers=None, body=None, next_hop=None, wait_for_response=False, timeout_ms=2000)"
+        "sig": "($self, method, ruri, headers=None, body=None, next_hop=None, wait_for_response=False, timeout_ms=2000, flow=None, route=...)"
       }
     },
     "QosNamespace": {
@@ -3190,7 +3190,7 @@
       "send": {
         "doc": "Originate an outbound SUBSCRIBE and capture the resulting dialog.",
         "kind": "method_descriptor",
-        "sig": "($self, ruri, event, expires, accept=None, target_uri=None, headers=None, timeout_ms=2000)"
+        "sig": "($self, ruri, event, expires, accept=None, target_uri=None, headers=None, timeout_ms=2000, flow=None, route=...)"
       }
     },
     "TimerHandle": {

@@ -886,7 +886,12 @@ async fn a_registrant_flow_dial_rides_the_sa_and_carries_its_route_set() {
         source_addr: "192.0.2.50:5066".parse().unwrap(),
         local_addr: "192.0.2.10:6100".parse().unwrap(),
         connection_id: 0,
-        kind: crate::script::api::registrar::FlowKind::Outbound,
+        kind: crate::script::api::registrar::FlowKind::Outbound(
+            crate::script::api::flow_kind::RegistrantFlow {
+                aor: "sip:001010000000001@ims.example.net".to_string(),
+                sent_by: "192.0.2.10:6101".parse().unwrap(),
+            },
+        ),
     };
     let dial = |flow: &crate::script::api::registrar::PyFlow| {
         let (state, udp, call_id) = Call::caller_on(test_dispatcher());

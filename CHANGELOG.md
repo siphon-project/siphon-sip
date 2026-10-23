@@ -128,6 +128,19 @@ entry, but a working config keeps working.
   and the next IRI record reconnects at once rather than being written into the
   dead connection. The sequence number now also restarts on every new
   connection, not only on a record's reconnect.
+
+- **A UE sends MESSAGE and SUBSCRIBE over its own SA.** `proxy.send_request()`
+  and `proxy.subscribe_state.send()` take `flow=` and `route=`. With
+  `flow=registration.flow(impu)` the request leaves from the UE's protected
+  client port to the P-CSCF's protected server port, its Via (and a
+  SUBSCRIBE's Contact) names the UE's protected server port, and the route set
+  goes out as Route headers in order (TS 24.229 §5.1.2A.1.1, TS 33.203 §7.1).
+  A subscription made that way sends its refreshes and its unsubscribe over
+  the SA set the registration holds when each is sent, and raises when it has
+  none. `send_request` treats a callee's flow as `call.dial` does;
+  `subscribe_state.send` refuses one. Rust library: `FlowKind::Outbound` now
+  carries a `RegistrantFlow`, and `SubscribeDialog` gains `registrant_flow`.
+
 ### Fixed
 
 - **An `async def` `@proxy.on_request` handler no longer holds a Python
@@ -143,6 +156,24 @@ entry, but a working config keeps working.
   counts the awaiting coroutines. Other handler kinds (`on_reply`,
   `on_failure`, B2BUA, Diameter, timers, SBI callbacks, RTPEngine events) still
   wait in place.
+
+- **A UE's UDP responses to the P-CSCF leave from its protected client port.**
+  A response to a request the P-CSCF sent over the SA (an MT MESSAGE, a
+  NOTIFY, an MT INVITE) went back from the UE's protected server port to the
+  P-CSCF's protected client port. TS 33.203 clause 7.1 has the UE send requests
+  and responses from port_uc and the P-CSCF receive them on port_ps, so it now
+  goes there, the mirror of the P-CSCF rule fixed in 1.15.1.
+
+- **An in-dialog SUBSCRIBE names siphon in its Via.** A refresh or unsubscribe
+  of a subscription siphon made put the next hop's address in its own Via
+  sent-by, so the peer sent the response to itself and a refresh timed out.
+
+- **A Record-Route line with several entries is several route set entries.**
+  The route set of a subscription siphon made, read from the 2xx or the first
+  NOTIFY, kept a comma-joined Record-Route as one entry, so in-dialog requests
+  carried it as one Route value and the 2xx's was not reversed entry by entry
+  (RFC 3261 §7.3.1, §12.1.2).
+
 - **`call.dial(flow=registration.flow(impu), route=...)` keeps the flow.** A
   route set used to replace any flow, so a UE's MO INVITE was resolved from its
   topmost Route and left from the process listener, outside the SA (or failed

@@ -681,7 +681,8 @@ impl UacSender {
         let data = Bytes::from(message.to_bytes());
 
         if let Some(ref hep) = self.hep_sender {
-            let addr = self.addr_for(&transport);
+            // The pinned socket is the one the request leaves from.
+            let addr = source_local_addr.unwrap_or_else(|| self.addr_for(&transport));
             hep.capture_outbound(addr, destination, transport, &data);
         }
 
@@ -738,11 +739,25 @@ impl UacSender {
         transport: Transport,
         connection_id: ConnectionId,
     ) {
+        self.send_request_from(message, destination, transport, connection_id, None);
+    }
+
+    /// [`send_request_on_connection`](Self::send_request_on_connection) from a
+    /// pinned socket: a request over a flow, such as a UE's security
+    /// association, which only that socket's traffic rides.
+    pub fn send_request_from(
+        &self,
+        message: SipMessage,
+        destination: SocketAddr,
+        transport: Transport,
+        connection_id: ConnectionId,
+        source_local_addr: Option<SocketAddr>,
+    ) {
         let data = Bytes::from(message.to_bytes());
 
         // HEP capture — outbound fire-and-forget
         if let Some(ref hep) = self.hep_sender {
-            let addr = self.addr_for(&transport);
+            let addr = source_local_addr.unwrap_or_else(|| self.addr_for(&transport));
             hep.capture_outbound(addr, destination, transport, &data);
         }
 
@@ -752,7 +767,7 @@ impl UacSender {
             transport,
             destination,
             data,
-            source_local_addr: None,
+            source_local_addr,
             server_name: None,
             verify_server: None,
         };
