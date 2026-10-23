@@ -105,6 +105,53 @@ entry, but a working config keeps working.
   of the UE's own sets (both ends), of pairs the IPsec manager owns, and of
   kernel states present at start, so a restart never offers an SPI a previous
   process left in the kernel (TS 33.203 7.1).
+### Added
+
+- **X2 keepalives on an idle connection (TS 103 221-2 clause 5.2.2).** A
+  delivery connection that has carried nothing for
+  `lawful_intercept.x2.keepalive_secs` (default 30, `0` disables) gets a
+  keepalive PDU, so the mediation function has a liveness signal on a quiet
+  interface. The MDF's KeepaliveAck PDUs are read and discarded so they cannot
+  fill the socket. A peer found closed or failing at the tick is dropped there,
+  and the next IRI record reconnects at once rather than being written into the
+  dead connection. The sequence number now also restarts on every new
+  connection, not only on a record's reconnect.
+### Fixed
+
+- **An `async def` `@proxy.on_request` handler no longer holds a Python
+  executor worker while it awaits.** The worker used to block until the
+  coroutine settled, so a handler awaiting a slow downstream request (a
+  third-party REGISTER, Diameter, an `asyncio.wait` with a timeout) capped the
+  node at `sync_pool_max / handler latency`: the pool filled with threads doing
+  nothing, the queue grew and shed while the CPU sat idle. The worker now only
+  starts the coroutine; when it settles, the remaining handlers and the
+  reply/relay run as a new executor job. The coroutine timeout, the 500 on a
+  raising or timed-out handler, `stop_propagation()`, the reply gate and
+  deferred sends behave as before. New gauge `siphon_async_coroutines_pending`
+  counts the awaiting coroutines. Other handler kinds (`on_reply`,
+  `on_failure`, B2BUA, Diameter, timers, SBI callbacks, RTPEngine events) still
+  wait in place.
+- **`call.dial(flow=registration.flow(impu), route=...)` keeps the flow.** A
+  route set used to replace any flow, so a UE's MO INVITE was resolved from its
+  topmost Route and left from the process listener, outside the SA (or failed
+  when the S-CSCF name did not resolve from the UE side). A registrant flow is
+  now siphon's own flow to its first hop: the INVITE leaves over it and the
+  route set goes on the wire as Route headers (RFC 5626 §4.3, TS 24.229
+  §5.1.2A.1.1). A callee's flow still yields to a Path route set (RFC 3327
+  §5.3). Rust library: `PyFlow` gains a `kind: FlowKind` field.
+- **Lawful intercept: one Correlation ID per B2BUA call, not per leg.** X2 and
+  X3 correlation was derived from the SIP Call-ID, so the two legs of one
+  B2BUA call reached the mediation function as two sessions (TS 103 221-2
+  clause 6 wants one). Every leg now resolves to the call's internal id, the
+  key its CDR and Rf records carry, which interception reserves on the
+  caller's INVITE and the call adopts. The callee leg also inherits the
+  warrant instead of being matched on its own rewritten identities. Proxy
+  correlation values change once on upgrade. Following from the same change:
+  a re-INVITE from the far end no longer attaches a second X3 stream, a BYE
+  from the far end now detaches X3, a carrier or forked branch failing no
+  longer ends the session, a failed re-INVITE on an answered call no longer
+  ends it, and the session state of a warranted call that failed unanswered
+  is released when the call ends instead of waiting for the cap.
 
 ## [1.15.2] — 2026-10-22
 

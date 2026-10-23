@@ -520,10 +520,11 @@ fn every_send_path_still_stamps_where_the_call_went() {
 /// that is what has to stay wired.
 #[test]
 fn the_proxy_cdr_settle_is_still_wired_to_the_authenticated_identity() {
-    // `handle_request` lives in `request.rs` since the split.
-    let source = include_str!("request.rs");
+    // What `handle_request` does once the handlers have decided lives in
+    // `request_script.rs`, where an async handler resumes into it too.
+    let source = include_str!("request_script.rs");
 
-    // The block in `handle_request` that decides the outcome and settles.
+    // The block in `finish_request` that decides the outcome and settles.
     let block = source
         .split("    if let Some(cdr_key) = &cdr_key {")
         .nth(1)
@@ -549,18 +550,23 @@ fn the_proxy_cdr_settle_is_still_wired_to_the_authenticated_identity() {
 /// dispatcher and a live interpreter to drive.
 #[test]
 fn the_proxy_cdr_record_is_opened_before_the_script_handler_runs() {
-    // `handle_request` lives in `request.rs` since the split.
+    // `handle_request` lives in `request.rs` since the split; the handlers
+    // and what follows them in `request_script.rs`.
     let source = include_str!("request.rs");
+    let script = include_str!("request_script.rs");
 
     let opened = source
         .find("    let cdr_key = if method == \"INVITE\" {")
         .expect("the proxy CDR record is still opened in handle_request");
     let handlers = source
-        .find("    // Call Python handlers")
-        .expect("the script handlers are still dispatched in handle_request");
-    let settled = source
+        .find("    run_request_handlers(scripted, py_request, 0, Vec::new());")
+        .expect("the script handlers are still dispatched from handle_request");
+    let finish = script
+        .find("pub(super) fn finish_request(")
+        .expect("the post-handler work is still finish_request");
+    let settled = script
         .find("    if let Some(cdr_key) = &cdr_key {")
-        .expect("the proxy CDR record is still settled in handle_request");
+        .expect("the proxy CDR record is still settled in finish_request");
 
     assert!(
         opened < handlers,
@@ -568,8 +574,12 @@ fn the_proxy_cdr_record_is_opened_before_the_script_handler_runs() {
          cdr.write(request, extra=…) from a handler can no longer reach it"
     );
     assert!(
-        handlers < settled,
-        "the CDR record is settled before the script handlers run"
+        finish < settled,
+        "the CDR record is settled somewhere other than after the handlers decided"
+    );
+    assert!(
+        !source.contains("cdr_settle_proxy_start("),
+        "the CDR record is settled in handle_request, before the script handlers run"
     );
 }
 
@@ -5896,6 +5906,7 @@ fn b_leg_flow_yields_to_a_path_route_set() {
         source_addr: "10.0.0.1:50000".parse().unwrap(),
         local_addr: "127.0.0.1:443".parse().unwrap(),
         connection_id: 0xc0ffee,
+        kind: crate::script::api::registrar::FlowKind::Inbound,
     };
     let route = vec!["<sip:TOKEN-A@edge.example.com;lr>".to_string()];
 
@@ -5911,12 +5922,57 @@ fn b_leg_flow_yields_to_a_path_route_set() {
     assert!(b_leg_flow(None, &route).is_none());
 }
 
+#[test]
+fn b_leg_flow_keeps_an_outbound_flow_under_its_route_set() {
+    // A UA's own flow to its first hop: the route set is the UA's, and its
+    // first entry is the far end of that flow, so the two go together.
+    let flow = crate::script::api::registrar::PyFlow {
+        transport: "udp".to_string(),
+        source_addr: "192.0.2.50:5066".parse().unwrap(),
+        local_addr: "192.0.2.10:6100".parse().unwrap(),
+        connection_id: 0,
+        kind: crate::script::api::registrar::FlowKind::Outbound,
+    };
+    let route = vec!["<sip:orig@scscf.example.net;lr>".to_string()];
+    assert!(b_leg_flow(Some(&flow), &route).is_some());
+    assert!(b_leg_flow(Some(&flow), &[]).is_some());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_outbound_flow_is_the_destination_with_a_route_set() {
+    let resolver = test_resolver();
+    let flow = crate::script::api::registrar::PyFlow {
+        transport: "udp".to_string(),
+        source_addr: "192.0.2.50:5066".parse().unwrap(),
+        local_addr: "192.0.2.10:6100".parse().unwrap(),
+        connection_id: 0,
+        kind: crate::script::api::registrar::FlowKind::Outbound,
+    };
+    let route = vec![
+        "<sip:pcscf.invalid:5066;lr>".to_string(),
+        "<sip:orig@scscf.invalid;lr>".to_string(),
+    ];
+    let resolved = resolve_leg_destination(
+        "sip:+15550100@ims.example.net",
+        None,
+        Some(&flow),
+        &route,
+        &resolver,
+    )
+    .expect("the flow is the destination; nothing is resolved");
+    assert_eq!(resolved.flow, Some(&flow));
+    assert_eq!(resolved.destination, flow.source_addr);
+    assert_eq!(resolved.transport, Transport::Udp);
+    assert_eq!(resolved.server_name, None);
+}
+
 fn registered_flow(transport: &str) -> crate::script::api::registrar::PyFlow {
     crate::script::api::registrar::PyFlow {
         transport: transport.to_string(),
         source_addr: "198.51.100.40:50000".parse().unwrap(),
         local_addr: "192.0.2.1:5061".parse().unwrap(),
         connection_id: 0xc0ffee,
+        kind: crate::script::api::registrar::FlowKind::Inbound,
     }
 }
 

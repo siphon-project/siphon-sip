@@ -76,6 +76,7 @@ mod registrant;
 mod registration_events;
 mod relay;
 mod request;
+mod request_script;
 mod response;
 mod response_builder;
 mod rtpengine_events;
@@ -96,6 +97,8 @@ mod admission_tests;
 mod advertised_port_tests;
 #[cfg(test)]
 mod answer_after_preview_tests;
+#[cfg(test)]
+mod async_request_handler_tests;
 #[cfg(test)]
 mod b2bua_conclude_once_tests;
 #[cfg(test)]
@@ -226,6 +229,8 @@ mod lcr_number_policy_tests;
 mod lcr_ring_timeout_tests;
 #[cfg(test)]
 mod lcr_route_bookkeeping_tests;
+#[cfg(test)]
+mod li_session_tests;
 #[cfg(test)]
 mod listener_identity_tests;
 #[cfg(test)]
@@ -447,6 +452,7 @@ use proxy_release::*;
 use registrant::*;
 use relay::*;
 use request::*;
+use request_script::*;
 use response::*;
 use response_builder::*;
 use rtpengine_events::*;

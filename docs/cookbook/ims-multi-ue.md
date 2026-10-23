@@ -148,12 +148,21 @@ and its From userpart picks the UE. The B-leg rides that UE's SA:
 ```python
     impu = _impu_for_user(call.from_uri.user)
     flow = registration.flow(impu)           # defaults to the entry's address
+    # A UE's route set: the P-CSCF's protected URI, then the Service-Route
+    # (TS 24.229 5.1.2A.1.1).
+    route = [f"<sip:{flow.remote_addr};lr>"] + registration.service_route(impu)
     call.set_header("P-Preferred-Identity", f"<{impu}>")
-    call.dial(f"sip:{call.ruri.user}@{HOME}", flow=flow,
-              route=registration.service_route(impu),
+    call.dial(f"sip:{call.ruri.user}@{HOME}", flow=flow, route=route,
               header_policy="ims-intra-trust-domain@2026",
               copy=["P-Preferred-Identity"])
 ```
+
+The INVITE leaves from the UE's protected client port to the P-CSCF's
+protected server port, inside the SA, and carries the route set as Route
+headers in order. A `registration.flow()` is the UE's own flow to its first
+hop, so the route set rides it. A callee's flow (`contact.flow`) is the
+opposite case: there `route=` is the binding's Path and replaces the flow
+(RFC 3327 §5.3).
 
 An MT request answered on a per-UE socket carries that socket's address in its
 Contact and Via, not `advertised_address`, and the per-UE addresses count as

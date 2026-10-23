@@ -111,9 +111,49 @@ impl SubscribeHarness {
     /// Deliver `raw` to the dispatcher as a request received from `source`.
     /// Returns once every handler for it has returned.
     pub(super) fn receive_request(&self, raw: &str, source: &str) {
+        // Inside a runtime, so an async handler is driven the same way whether
+        // or not another test has installed the process-wide async pool by now:
+        // the pool's wait needs a runtime to block on, the per-thread loop does
+        // not care.
+        let _runtime = super::async_request_handler_tests::test_runtime()
+            .handle()
+            .enter();
         let message = parse_sip_message_bytes(raw.as_bytes()).expect("the request parses");
         let method = raw.split(' ').next().unwrap_or_default().to_string();
         handle_request(self.inbound(raw, source), message, method, &self.state);
+    }
+
+    /// Deliver `raw` the way the dispatcher's inbound loop does: as a job on
+    /// the Python executor, where an async handler that awaits frees its
+    /// worker and the request finishes on a later job. Returns at once.
+    pub(super) fn receive_request_on_executor(&'static self, raw: &str, source: &str) {
+        let message = parse_sip_message_bytes(raw.as_bytes()).expect("the request parses");
+        let method = raw.split(' ').next().unwrap_or_default().to_string();
+        let inbound = self.inbound(raw, source);
+        crate::script::py_executor::spawn(move || {
+            handle_request(inbound, message, method, &self.state);
+        });
+    }
+
+    /// The frames sent, waiting up to `within` until there are `count`.
+    pub(super) fn frames_awaiting(
+        &self,
+        count: usize,
+        within: Duration,
+    ) -> Vec<(SocketAddr, Bytes)> {
+        let deadline = Instant::now() + within;
+        let mut frames = Vec::new();
+        while frames.len() < count {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let Ok(message) = self.udp.recv_timeout(remaining) else {
+                break;
+            };
+            let destination = message.destination;
+            for frame in message.frames() {
+                frames.push((destination, frame.clone()));
+            }
+        }
+        frames
     }
 
     /// Deliver `raw` to the dispatcher as a response received from `source`.

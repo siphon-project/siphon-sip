@@ -847,6 +847,7 @@ fn worker_loop(
         let _gstate = pyo3::ffi::PyGILState_Ensure();
         let _tstate = pyo3::ffi::PyEval_SaveThread();
     }
+    ON_WORKER.with(|flag| flag.set(true));
 
     loop {
         // Mark this worker idle while it waits for a job, so `submit` can tell
@@ -874,6 +875,51 @@ fn worker_loop(
         }
     }
     debug!(worker = index, "Python executor worker exiting");
+}
+
+thread_local! {
+    /// Set on the pool's own worker threads, for [`on_worker_thread`].
+    static ON_WORKER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the calling thread is one of the installed pool's workers.
+///
+/// A job that finds it is can hand the rest of its work to a later job
+/// ([`spawn_queued`]) instead of waiting in place; anything else — a test
+/// calling a handler directly, a tokio worker, the `spawn_blocking` fallback —
+/// has a caller expecting the work done when it returns.
+pub fn on_worker_thread() -> bool {
+    ON_WORKER.with(std::cell::Cell::get)
+}
+
+/// Queue `f` on the pool, waiting for room in the queue rather than shedding
+/// it. Returns `false` only if the pool is shut down and `f` will never run.
+///
+/// For work that continues a job the pool already accepted — an async request
+/// handler resuming after its await — where shedding would strand a request
+/// that is owed an answer. New inbound work keeps going through [`spawn`],
+/// which sheds, so overload still lands on fresh messages first.
+///
+/// Falls back to `tokio::task::spawn_blocking` when no pool is installed.
+pub async fn spawn_queued<F>(f: F) -> bool
+where
+    F: FnOnce() + Send + 'static,
+{
+    let Some(pool) = PyExecutor::global() else {
+        tokio::task::spawn_blocking(f);
+        return true;
+    };
+    let sender = match pool.sender.lock() {
+        Ok(guard) => guard.clone(),
+        Err(_) => None,
+    };
+    let Some(sender) = sender else {
+        return false;
+    };
+    let job: Job = Box::new(move || {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+    });
+    sender.send_async(job).await.is_ok()
 }
 
 /// Run `f` on a pool thread and await its result — the async analogue of

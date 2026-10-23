@@ -221,7 +221,7 @@ Design accordingly:
   @b2bua.on_invite
   async def route(call):
       call.progress(180, "Ringing")     # on the wire here
-      await asyncio.sleep(2)            # ring, without holding a worker
+      await asyncio.sleep(2)            # ring (a B2BUA handler holds its worker here)
       call.handover("ai-app", answer=True, profile="voice_ai")
   ```
 
@@ -271,6 +271,25 @@ blocking HA1-fetch (Rust) path, another through a blocking `on_change` notify
 (Python) path, each on a single-worker (`cpus: 0.5`) siphon; the engine must
 complete the registrations.
 
+### Awaiting in an `async def` handler
+
+An `async def` `@proxy.on_request` handler that awaits does **not** hold a
+sync-pool worker for the wait. The worker calls the handler, hands the coroutine
+to an async driver and takes the next job; once the coroutine settles, the
+remaining handlers for the request and the reply/relay run as a new job on
+whichever worker is free. Awaiting a slow downstream (a third-party REGISTER, a
+Diameter answer, `asyncio.sleep`) costs a pending coroutine, not a thread, so
+the rate of such a handler is bounded by the backend, not by `sync_pool_max`.
+Its result is unchanged: the coroutine timeout still fails the request with a
+500 and cancels the coroutine, a raise still answers 500, and
+`stop_propagation()` called after an await still stops the handlers after it.
+`siphon_async_coroutines_pending` counts the awaiting coroutines.
+
+The other handler kinds (`@proxy.on_reply` / `on_failure` callbacks, B2BUA
+handlers, Diameter, timers, SBI callbacks, RTPEngine events) still hold their
+worker until the coroutine settles, so for them the `max_rate` formula above
+applies to the await as well.
+
 ## Backpressure & liveness guarantees
 
 Beyond elasticity, the pool is defended on two more fronts so a misbehaving
@@ -303,6 +322,7 @@ handler degrades gracefully instead of taking the node down silently:
 | `siphon_pyexec_queue_depth` | handler jobs waiting in the queue |
 | `siphon_pyexec_jobs_completed_total` | completed handler jobs |
 | `siphon_pyexec_jobs_shed_total` | jobs dropped because the queue was full |
+| `siphon_async_coroutines_pending` | `async def` handler coroutines on a driver, not yet settled |
 | `siphon_auth_ha1_cache_hits_total` | HTTP-auth lookups served from cache |
 
 **Alert on**: a sustained `rate(siphon_pyexec_jobs_shed_total)` > 0, or

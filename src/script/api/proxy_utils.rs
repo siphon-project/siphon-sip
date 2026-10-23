@@ -64,6 +64,20 @@ pub fn drain_deferred_sends() -> Vec<DeferredMessage> {
     DEFERRED_SENDS.with(|cell| cell.borrow_mut().take().unwrap_or_default())
 }
 
+/// Enable deferred sending mode for the current thread, starting from
+/// `carried` — messages an earlier part of the same request queued on the
+/// thread it ran on before its handler suspended.
+///
+/// An async request handler resumes on whichever executor worker is free, and
+/// this queue is per thread, so the dispatcher drains it when the handler
+/// suspends ([`drain_deferred_sends`], which also switches deferral off there)
+/// and hands it back here when the request continues.
+pub fn resume_deferred_sends(carried: Vec<DeferredMessage>) {
+    DEFERRED_SENDS.with(|cell| {
+        *cell.borrow_mut() = Some(carried);
+    });
+}
+
 /// Drain only the deferred messages addressed to `(destination, transport)`,
 /// preserving their relative order and leaving every other queued message in
 /// place for [`drain_deferred_sends`].

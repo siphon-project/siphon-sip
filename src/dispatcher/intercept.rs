@@ -19,6 +19,9 @@ pub(super) fn intercept_message(
     let Some(li) = state.li_manager.as_ref() else {
         return;
     };
+    if !li.is_intercepting() {
+        return;
+    }
 
     // Borrowed, not owned. This runs on every message, and the overwhelming
     // majority match nothing — building four Strings only to discard them is a
@@ -40,17 +43,46 @@ pub(super) fn intercept_message(
         return;
     };
 
-    // Decided once per session, not once per message. See `check_session`:
-    // this is what stops a warrant delivering the INVITE and then missing the
-    // BYE, because a later message need not carry the target in matchable form.
-    let matches = li.check_session(call_id, request_uri.as_deref(), from_uri, to_uri, source_ip);
-    if matches.is_empty() {
+    let method = match &message.start_line {
+        StartLine::Request(request_line) => request_line.method.as_str(),
+        // A response's method is the one its CSeq names, which is what the
+        // IRI record has to attribute it to.
+        StartLine::Response(_) => message
+            .headers
+            .get("CSeq")
+            .and_then(|cseq| cseq.split_whitespace().nth(1))
+            .unwrap_or("UNKNOWN"),
+    };
+    let status_code = match &message.start_line {
+        StartLine::Request(_) => None,
+        StartLine::Response(status_line) => Some(status_line.status_code),
+    };
+    let facts = crate::li::MessageFacts {
+        request: matches!(message.start_line, StartLine::Request(_)),
+        method,
+        status_code,
+        to_tagged: to_has_tag(message),
+    };
+    let identities = crate::li::Identities {
+        request_uri: request_uri.as_deref(),
+        from_uri,
+        to_uri,
+        source_ip,
+    };
+
+    // Decided once per session, not once per message, and per *session*
+    // rather than per dialog: every leg of a B2BUA call resolves to the same
+    // one. See `LiManager::resolve_session`. This is what stops a warrant
+    // delivering the INVITE and then missing the BYE, or the other leg, and
+    // what gives the whole call one Correlation ID.
+    let session = li.resolve_session(call_id, &facts, &identities, || b2bua_owner(state, call_id));
+    if session.matches.is_empty() {
         // An unwarranted session is remembered as unwarranted, and that
         // memory has to be released when the dialog ends or the map would
         // grow with every call the node ever handles and rely on the cap to
         // save it. The cap is for traffic that never reaches an end at all.
         if terminates_dialog(message) {
-            li.forget_session(call_id);
+            li.forget_session(&session.session_id);
         }
         return;
     }
@@ -59,7 +91,7 @@ pub(super) fn intercept_message(
     // Recording it twice would give the mediation function a duplicate and
     // re-run the session's lifecycle — a resent INVITE would restart content
     // capture on a call already being captured.
-    if !li.record_message_once(call_id, message_instance_key(message)) {
+    if !li.record_message_once(&session.session_id, message_instance_key(message)) {
         debug!(
             call_id = %call_id,
             "LI: message already recorded for this session, not recording the retransmission"
@@ -67,48 +99,20 @@ pub(super) fn intercept_message(
         return;
     }
 
-    let method = match &message.start_line {
-        StartLine::Request(request_line) => request_line.method.as_str().to_string(),
-        StartLine::Response(_) => message
-            // A response's method is the one its CSeq names, which is what the
-            // IRI record has to attribute it to.
-            .headers
-            .get("CSeq")
-            .and_then(|cseq| cseq.split_whitespace().nth(1).map(str::to_string))
-            .unwrap_or_else(|| "UNKNOWN".to_string()),
-    };
-    let status_code = match &message.start_line {
-        StartLine::Request(_) => None,
-        StartLine::Response(status_line) => Some(status_line.status_code),
-    };
+    // The event type follows the message, not the warrant: a mediation
+    // function reconstructs the session from the sequence.
+    let event_type = li.note_message(&session, &facts);
+    let method = method.to_string();
     let from_uri = from_uri.unwrap_or_default().to_string();
     let to_uri = to_uri.unwrap_or_default().to_string();
 
-    // The event type follows the message, not the warrant: a mediation
-    // function reconstructs the session from the sequence.
-    let event_type = match (&message.start_line, method.as_str()) {
-        (StartLine::Request(_), "INVITE") if !to_has_tag(message) => crate::li::IriEventType::Begin,
-        (StartLine::Request(_), "BYE") | (StartLine::Request(_), "CANCEL") => {
-            crate::li::IriEventType::End
-        }
-        (StartLine::Request(_), "REGISTER")
-        | (StartLine::Request(_), "MESSAGE")
-        | (StartLine::Request(_), "SUBSCRIBE")
-        | (StartLine::Request(_), "PUBLISH")
-        | (StartLine::Request(_), "OPTIONS") => crate::li::IriEventType::Report,
-        (StartLine::Request(_), _) => crate::li::IriEventType::Continue,
-        (StartLine::Response(_), _) => match status_code {
-            Some(code) if code >= 300 => crate::li::IriEventType::End,
-            _ => crate::li::IriEventType::Continue,
-        },
-    };
-
-    for matched in &matches {
+    for matched in &session.matches {
         let x_id = matched.task.details.x_id;
         let event = li.build_iri_event(
             matched,
             event_type,
             call_id,
+            &session.session_id,
             &method,
             status_code,
             &from_uri,
@@ -124,16 +128,18 @@ pub(super) fn intercept_message(
             crate::li::AuditOperation::InterceptMatch,
             Some(&x_id.to_string()),
             format!(
-                "method={method} call_id={call_id} delivery={} event={event_type:?} party={:?}",
-                matched.task.details.delivery_type, matched.party
+                "method={method} call_id={call_id} session={} delivery={} event={event_type:?} party={:?}",
+                session.session_id, matched.task.details.delivery_type, matched.party
             ),
         );
 
-        // Content capture stops when the dialog ends. There is no matching
-        // "start" here: the attachment is made at the ACK, below, because the
-        // engine has no call to intercept until the script has offered it one.
+        // Content capture stops when the session ends, on whichever leg the
+        // end arrives: a far end that hangs up sends its BYE on the callee
+        // leg. There is no matching "start" here: the attachment is made at
+        // the ACK, below, because the engine has no call to intercept until
+        // the script has offered it one.
         if event_type == crate::li::IriEventType::End {
-            detach_x3(call_id, state);
+            detach_x3(&session.engine_call_id, state);
         }
 
         // X3 attaches when the media session is established, not when the
@@ -158,20 +164,53 @@ pub(super) fn intercept_message(
         // confused with the INVITE. Attaching there means one attempt that
         // succeeds, which matters because a failed attempt is a compliance
         // signal reported to the ADMF and must not be routine.
+        //
+        // Only an ACK on the session's anchoring dialog. The engine knows the
+        // call by that dialog's Call-ID and keys the interception on its
+        // offerer's tag; an ACK on the callee leg, which a re-INVITE from the
+        // far end produces, names neither, and the call is already attached.
         if is_ack(message, &method) {
-            attach_x3(matched, call_id, message, state);
+            if session.on_primary_leg {
+                attach_x3(matched, &session, message, state);
+            } else {
+                debug!(
+                    call_id = %call_id,
+                    session = %session.session_id,
+                    "LI: ACK on a callee leg, X3 stays on the caller leg's attachment"
+                );
+            }
         }
     }
+}
 
-    // Released once, after the message has been recorded, and in one place for
-    // matched and unmatched sessions alike.
-    //
-    // Once per message rather than once per matching warrant, and *after* the
-    // loop rather than inside it: the session is one thing however many
-    // warrants cover it.
-    if terminates_dialog(message) {
-        li.forget_session(call_id);
-    }
+/// The B2BUA call a Call-ID is a leg of, if any.
+///
+/// Asked only for a Call-ID interception has not seen before, which is the
+/// first message of a leg.
+fn b2bua_owner(state: &DispatcherState, call_id: &str) -> Option<crate::li::CallOwner> {
+    let internal_id = state.call_actors.find_by_sip_call_id(call_id)?;
+    let a_leg_call_id = state
+        .call_actors
+        .get_call(&internal_id)?
+        .a_leg
+        .dialog
+        .call_id
+        .clone();
+    Some(crate::li::CallOwner {
+        internal_id,
+        a_leg_call_id,
+    })
+}
+
+/// Create a B2BUA call from its caller leg, under the session id interception
+/// already gave the caller's INVITE when a warrant covers it. The call's
+/// internal id and its Correlation ID then derive from one value.
+pub(super) fn create_b2bua_call(state: &DispatcherState, a_leg: Leg) -> String {
+    let reserved = state
+        .li_manager
+        .as_ref()
+        .and_then(|li| li.reserved_session_id(&a_leg.dialog.call_id));
+    state.call_actors.create_call_with_id(a_leg, reserved)
 }
 
 /// Tell the media engine to start ETSI TS 103 221-2 content delivery for a
@@ -184,10 +223,11 @@ pub(super) fn intercept_message(
 /// delivery fault and is reported to the ADMF rather than logged and forgotten.
 pub(super) fn attach_x3(
     matched: &crate::li::x1::store::TaskMatch,
-    call_id: &str,
+    session: &crate::li::SessionView,
     message: &SipMessage,
     state: &Arc<DispatcherState>,
 ) {
+    let call_id: &str = &session.engine_call_id;
     if !matched.task.details.delivery_type.includes_content() {
         return;
     }
@@ -251,7 +291,7 @@ pub(super) fn attach_x3(
         return;
     }
 
-    let correlation_id = li.correlation_for(&matched.task, call_id);
+    let correlation_id = li.correlation_for(&matched.task, &session.session_id);
     let xid = matched.task.details.x_id.as_bytes();
     // TS 103 221-2 §5.2.6 measures a delivered packet's direction against the
     // target, so which end the warrant names is load-bearing rather than

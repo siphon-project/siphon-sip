@@ -103,11 +103,15 @@ pub struct AsyncPool {
     /// Round-robin selector. `Relaxed` is fine — we only care about
     /// even-ish distribution, not strict ordering.
     next: AtomicUsize,
-    /// How long [`run_coroutine_via_pool`] waits for a coroutine before it
-    /// gives the worker thread back.
+    /// How long a caller waits for a coroutine before it fails the call and
+    /// cancels the coroutine.
     ///
-    /// Every inbound message becomes a pyexec job, and an `async def` handler
-    /// parks its worker here for as long as the coroutine takes. Unbounded,
+    /// Every inbound message becomes a pyexec job. An `async def` request
+    /// handler waits for its coroutine without holding that job's worker
+    /// ([`PendingCoroutine::resume_on_executor`]), but every other handler
+    /// kind parks its worker in [`run_coroutine_via_pool`] for as long as the
+    /// coroutine takes, and an unresumed request is still a transaction no
+    /// one answers. Unbounded,
     /// one handler that never settles costs that worker for the life of the
     /// process, and the `py_executor` watchdog — which trips on "work
     /// in-flight and nothing completed", independent of how full the pool is —
@@ -557,6 +561,26 @@ impl AsyncPoolBridge {
     }
 }
 
+/// Tests share one process-global `AsyncPool` (`GLOBAL`) and the harness
+/// runs them on parallel threads.  The leak probes (`pool_drains_*`,
+/// `pool_steady_state_*`) read the per-driver asyncio task tables / the
+/// process-global jemalloc `allocated` gauge — both of which a *sibling*
+/// test dispatching to the same pool perturbs mid-probe.  That is a
+/// cross-test race, not a leak.  Every test that dispatches to the global
+/// pool holds this guard for its whole duration, so exactly one runs at a
+/// time and the probes observe a quiescent pool.  Poison is recovered
+/// deliberately: a panicking test has already failed and must not cascade a
+/// poison error into the others.
+#[cfg(test)]
+static POOL_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+pub(crate) fn pool_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    POOL_SERIAL
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+}
+
 /// Convenience wrapper used by tests — fail fast if the pool isn't
 /// installed instead of silently falling back to the legacy path.
 #[cfg(test)]
@@ -564,9 +588,184 @@ pub(crate) fn require_global() -> Arc<AsyncPool> {
     AsyncPool::global().expect("AsyncPool::install was not called")
 }
 
+/// Coroutines handed to a driver that have not settled yet, for
+/// `siphon_async_coroutines_pending`.
+static PENDING_COROUTINES: AtomicUsize = AtomicUsize::new(0);
+
+/// Counts one coroutine in [`PENDING_COROUTINES`] for as long as it lives, so
+/// every way out — settled, timed out, dropped unresumed — gives the count
+/// back.
+struct PendingCount;
+
+impl PendingCount {
+    fn start() -> Self {
+        let pending = PENDING_COROUTINES.fetch_add(1, Ordering::Relaxed) + 1;
+        publish_pending(pending);
+        Self
+    }
+}
+
+impl Drop for PendingCount {
+    fn drop(&mut self) {
+        let pending = PENDING_COROUTINES
+            .fetch_sub(1, Ordering::Relaxed)
+            .saturating_sub(1);
+        publish_pending(pending);
+    }
+}
+
+fn publish_pending(pending: usize) {
+    if let Some(registry) = crate::metrics::try_metrics() {
+        registry.async_coroutines_pending.set(pending as i64);
+    }
+}
+
+/// Coroutines handed to a driver that have not settled yet.
+pub fn pending_coroutines() -> usize {
+    PENDING_COROUTINES.load(Ordering::Relaxed)
+}
+
+/// A coroutine running on a driver loop, not yet waited for.
+///
+/// Waiting is split from submitting so the wait need not cost a thread: the
+/// request dispatcher awaits [`PendingCoroutine::settle`] on a tokio task and
+/// resumes on the executor once it is over, while [`run_coroutine_via_pool`]
+/// blocks on the same future for callers that cannot be resumed.
+pub(crate) struct PendingCoroutine {
+    receiver: oneshot::Receiver<PyResult<Py<PyAny>>>,
+    /// The `concurrent.futures.Future` driving it, cancelled on timeout.
+    future: Py<PyAny>,
+    /// The coroutine itself, named in the log line if it wedges.
+    coroutine: Py<PyAny>,
+    timeout: Duration,
+    _count: PendingCount,
+}
+
+/// How waiting for a [`PendingCoroutine`] ended. Turned into the handler's
+/// result by [`SettledCoroutine::into_result`], which needs the interpreter.
+pub(crate) struct SettledCoroutine {
+    outcome:
+        Result<Result<PyResult<Py<PyAny>>, oneshot::error::RecvError>, tokio::time::error::Elapsed>,
+    future: Py<PyAny>,
+    coroutine: Py<PyAny>,
+    timeout: Duration,
+}
+
+impl PendingCoroutine {
+    /// Hand `coroutine` to one of `pool`'s drivers.
+    pub(crate) fn submit(
+        pool: &AsyncPool,
+        python: Python<'_>,
+        coroutine: &Bound<'_, PyAny>,
+    ) -> PyResult<Self> {
+        let (receiver, future) = pool.submit(python, coroutine)?;
+        Ok(Self {
+            receiver,
+            future,
+            coroutine: coroutine.clone().unbind(),
+            timeout: pool.coroutine_timeout(),
+            _count: PendingCount::start(),
+        })
+    }
+
+    /// Wait for the coroutine to settle, for at most the pool's coroutine
+    /// timeout. Touches no Python object, so it can run on any thread.
+    ///
+    /// Bounded, because the responder is a done-callback on the
+    /// `concurrent.futures.Future`: a coroutine that never settles never fires
+    /// it and never drops the sender either, so not even `RecvError` arrives and
+    /// the wait has no other way out.
+    pub(crate) async fn settle(self) -> SettledCoroutine {
+        let Self {
+            receiver,
+            future,
+            coroutine,
+            timeout,
+            _count,
+        } = self;
+        let outcome = tokio::time::timeout(timeout, receiver).await;
+        SettledCoroutine {
+            outcome,
+            future,
+            coroutine,
+            timeout,
+        }
+    }
+
+    /// Wait without holding an executor worker: [`settle`](Self::settle) on a
+    /// tokio task, then `resume` with the coroutine's result as a job on the
+    /// Python executor.
+    ///
+    /// The resume job waits for queue room rather than being shed: the request
+    /// it finishes has been accepted already, and dropping it would leave its
+    /// transaction unanswered.
+    ///
+    /// Must be called with a tokio runtime entered, which every executor
+    /// worker has.
+    pub(crate) fn resume_on_executor<F>(self, resume: F)
+    where
+        F: FnOnce(Python<'_>, PyResult<Py<PyAny>>) + Send + 'static,
+    {
+        tokio::spawn(async move {
+            let settled = self.settle().await;
+            let queued = crate::script::py_executor::spawn_queued(move || {
+                Python::attach(|python| {
+                    let result = settled.into_result(python);
+                    resume(python, result);
+                });
+            })
+            .await;
+            if !queued {
+                error!(
+                    "Python executor closed while an async handler was awaiting; \
+                     the work after its await cannot run"
+                );
+            }
+        });
+    }
+}
+
+impl SettledCoroutine {
+    /// The coroutine's value, or the error that ends the handler: its own
+    /// exception, a lost driver, or the timeout — on which the coroutine is
+    /// cancelled, since abandoning it alone would trade a wedged worker for a
+    /// task that lives for ever.
+    pub(crate) fn into_result(self, python: Python<'_>) -> PyResult<Py<PyAny>> {
+        match self.outcome {
+            Ok(Ok(result)) => result,
+            Ok(Err(_recv_err)) => Err(PyValueError::new_err(
+                "async pool driver dropped the coroutine sender before completion",
+            )),
+            Err(_elapsed) => {
+                let cancelled = self
+                    .future
+                    .bind(python)
+                    .call_method0("cancel")
+                    .and_then(|value| value.extract::<bool>())
+                    .unwrap_or(false);
+                let handler = coroutine_name(self.coroutine.bind(python));
+                error!(
+                    handler = %handler,
+                    timeout_secs = self.timeout.as_secs(),
+                    cancelled,
+                    "async script handler did not settle within the coroutine timeout; \
+                     failing this call. The handler is awaiting something that never \
+                     completes — an unbounded backend call, a DNS lookup, or a future \
+                     nothing resolves."
+                );
+                Err(PyTimeoutError::new_err(format!(
+                    "async handler '{handler}' did not settle within {}s",
+                    self.timeout.as_secs()
+                )))
+            }
+        }
+    }
+}
+
 /// Run a coroutine on the async pool, blocking the calling thread until
-/// it resolves.  Intended for synchronous callers (the script handler
-/// dispatcher) that are already on a tokio blocking-pool thread.
+/// it resolves.  For synchronous callers that cannot be resumed later; the
+/// request dispatcher instead waits through
+/// [`PendingCoroutine::resume_on_executor`] and keeps its worker free.
 ///
 /// Returns `Ok(None)` if no pool is installed — caller should fall back
 /// to the legacy per-thread `run_until_complete` path.
@@ -578,12 +777,7 @@ pub(crate) fn run_coroutine_via_pool(
         return Ok(None);
     };
 
-    // The handler's name is only needed if this wedges, so it is read lazily.
-    // Reading it eagerly cost a `__qualname__` getattr and a String allocation
-    // on every request to serve one log line on the rare timeout path. The
-    // coroutine object outlives the wait (the caller holds `future`), so it is
-    // still nameable afterwards.
-    let (receiver, future) = pool.submit(python, coroutine)?;
+    let pending = PendingCoroutine::submit(&pool, python, coroutine)?;
 
     // We need to await the oneshot synchronously.  `Handle::current()`
     // works inside `tokio::task::spawn_blocking`; if the caller isn't
@@ -611,48 +805,14 @@ pub(crate) fn run_coroutine_via_pool(
     // it is the same passthrough those callers use elsewhere (blocking.rs,
     // engine.rs, diameter.rs).
     //
-    // Bounded, because this is the one place every `async def` handler in the
-    // process funnels through. The responder is a done-callback on the
-    // `concurrent.futures.Future`; a coroutine that never settles never fires
-    // it and never drops the sender either, so not even `RecvError` arrives
-    // and the wait has no other way out. Unbounded, one such handler costs
-    // this worker for the life of the process, and the `py_executor` watchdog
-    // — which trips on "work in-flight, nothing completed" whatever the pool's
-    // fill — then aborts a node that still had idle workers and an empty
-    // queue.
-    let timeout = pool.coroutine_timeout();
-    let outcome = python.detach(|| {
-        tokio::task::block_in_place(|| runtime.block_on(tokio::time::timeout(timeout, receiver)))
-    });
-
-    match outcome {
-        Ok(Ok(Ok(value))) => Ok(Some(value)),
-        Ok(Ok(Err(py_err))) => Err(py_err),
-        Ok(Err(_recv_err)) => Err(PyValueError::new_err(
-            "async pool driver dropped the coroutine sender before completion",
-        )),
-        Err(_elapsed) => {
-            // Cancel on the way out: the coroutine is still scheduled on its
-            // driver, and abandoning it only would trade a wedged worker for a
-            // task that lives for ever.
-            let cancelled = future
-                .bind(python)
-                .call_method0("cancel")
-                .and_then(|value| value.extract::<bool>())
-                .unwrap_or(false);
-            let handler = coroutine_name(coroutine);
-            error!(
-                handler = %handler,
-                timeout_secs = timeout.as_secs(),
-                cancelled,
-                "async script handler did not settle within the coroutine timeout;                  giving the worker thread back and failing this call. The handler is                  awaiting something that never completes — an unbounded backend call,                  a DNS lookup, or a future nothing resolves."
-            );
-            Err(PyTimeoutError::new_err(format!(
-                "async handler '{handler}' did not settle within {}s",
-                timeout.as_secs()
-            )))
-        }
-    }
+    // The wait is bounded (see `PendingCoroutine::settle`). Unbounded, one
+    // handler that never settles costs this worker for the life of the process,
+    // and the `py_executor` watchdog — which trips on "work in-flight, nothing
+    // completed" whatever the pool's fill — then aborts a node that still had
+    // idle workers and an empty queue.
+    let settled =
+        python.detach(|| tokio::task::block_in_place(|| runtime.block_on(pending.settle())));
+    settled.into_result(python).map(Some)
 }
 
 /// The handler name behind a coroutine object, for the timeout log line.
@@ -780,22 +940,8 @@ mod tests {
         })
     }
 
-    /// Tests share one process-global `AsyncPool` (`GLOBAL`) and the harness
-    /// runs them on parallel threads.  The leak probes (`pool_drains_*`,
-    /// `pool_steady_state_*`) read the per-driver asyncio task tables / the
-    /// process-global jemalloc `allocated` gauge — both of which a *sibling*
-    /// test dispatching to the same pool perturbs mid-probe.  That is a
-    /// cross-test race, not a leak.  Every pool test holds this guard for its
-    /// whole duration, so exactly one runs at a time and the probes observe a
-    /// quiescent pool.  Poison is recovered deliberately: a panicking test has
-    /// already failed and must not cascade a poison error into the others.
-    static POOL_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    fn pool_test_guard() -> std::sync::MutexGuard<'static, ()> {
-        POOL_SERIAL
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-    }
+    // Serialises every test on the shared global pool; see the definition.
+    use super::pool_test_guard;
 
     /// Short enough that a wedged-coroutine test finishes, long enough that a
     /// normal coroutine in these tests never races it.
