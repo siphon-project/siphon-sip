@@ -15,6 +15,18 @@ entry, but a working config keeps working.
 
 ### Fixed
 
+- **IMS AKA over UDP: P-CSCF requests go to the UE's protected server port.**
+  A request the P-CSCF sent over a UE's captured flow (an MT request relayed
+  with `flow=`, an in-dialog request on that flow, the registrar-liveness
+  OPTIONS, an in-dialog probe) reused that flow as captured: from the
+  P-CSCF's protected server port to the UE's protected client port, the flow
+  the UE sends on. TS 24.229 clause 5.2.2.2 has the P-CSCF send its requests
+  and responses from its protected client port to the UE's protected server
+  port (TS 33.203 clause 7.1, UDP case), as responses already did. Such a
+  request, and one routed by address to a UE's protected client port, now
+  takes that flow; its Via still names the protected server port, where the
+  UE's response arrives. TCP is unchanged.
+
 - **P-CSCF: a re-authentication challenge is sent over the existing SA set.**
   The set `ipsec.allocate()` installs for a 401 replaced the kernel's outbound
   policy of the selector it shares with the UE's set in use (the P-CSCF's

@@ -428,9 +428,13 @@ pub(super) fn send_over_flow(
     destination: SocketAddr,
     state: &DispatcherState,
 ) -> Result<(), String> {
+    // Over IPsec UDP, onto the sending side's flow (TS 33.203 7.1).
+    let (destination, local) =
+        protected_udp_egress(&data, transport, destination, Some(flow.local_addr), state);
+    let local = local.unwrap_or(flow.local_addr);
     if let Some(ref hep) = state.hep_sender {
         hep.capture_outbound(
-            state.hep_local_addr(flow.local_addr, transport),
+            state.hep_local_addr(local, transport),
             destination,
             transport,
             &data,
@@ -439,7 +443,7 @@ pub(super) fn send_over_flow(
     debug!(
         call_id = %call_id,
         destination = %destination,
-        source = %flow.local_addr,
+        source = %local,
         transport = %transport,
         size = data.len(),
         "sending an INVITE over the callee's captured flow"
@@ -452,7 +456,7 @@ pub(super) fn send_over_flow(
             transport,
             destination,
             data,
-            source_local_addr: Some(flow.local_addr),
+            source_local_addr: Some(local),
             server_name: None,
             verify_server: None,
         })
@@ -836,6 +840,10 @@ pub(super) fn send_to_target(
             // listener socket to egress from (routed via `udp_by_local`).
             let source_local_addr =
                 crate::script::api::ipsec::outbound_local_addr_for(destination).or(send_source);
+            // A target that is a UE's protected client port (a Contact
+            // rewritten to the source) gets the P-CSCF's flow instead.
+            let (destination, source_local_addr) =
+                protected_udp_egress(&data, transport, destination, source_local_addr, state);
             let outbound_message = OutboundMessage {
                 followups: None,
                 connection_id: fallback_connection_id,

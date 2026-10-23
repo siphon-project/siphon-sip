@@ -20,7 +20,7 @@ pub(super) fn send_outbound_from(
     state: &DispatcherState,
 ) {
     let (destination, source_local_addr) =
-        protected_udp_response_egress(&data, transport, destination, source_local_addr, state);
+        protected_udp_egress(&data, transport, destination, source_local_addr, state);
 
     // HEP capture — outbound (sent to network)
     if let Some(ref hep) = state.hep_sender {
@@ -48,27 +48,29 @@ pub(super) fn send_outbound_from(
     }
 }
 
-/// Where a UDP response leaving from the P-CSCF's protected server port really
-/// goes: `(destination, source_local_addr)`, readdressed when `destination` is
-/// the protected client port of a UE's security association.
+/// Where a UDP message really goes: `(destination, source_local_addr)`,
+/// readdressed when `destination` is the protected client port of a UE's
+/// security association and it leaves from the P-CSCF's protected server port
+/// ([`crate::ipsec::pcscf_udp_egress`]).
 ///
-/// 3GPP TS 33.203 clause 7.1, UDP case: the P-CSCF "receives requests and
-/// responses protected with ESP from any UE on the port port_ps" and "sends
-/// requests and responses protected with ESP to a UE on the port port_pc"; the
-/// UE "receives requests and responses protected with ESP on the port
-/// port_us". TS 24.229 clause 5.2.2.2 NOTE 3: "in case of UDP the P-CSCF sends
-/// the responses to a different UE's port then the one from which the request
-/// was received from the UE", which is also why the `rport` of a protected
-/// request is ignored. Every reply path hands its response here with the
-/// request's source as `destination` and the socket it arrived on as
-/// `source_local_addr`, so this one point covers answered, relayed, refused
-/// and retransmitted responses alike. A UE that only takes UDP responses on its
-/// protected server port is otherwise never answered.
+/// 3GPP TS 33.203 clause 7.1, UDP case: the P-CSCF "sends requests and
+/// responses protected with ESP to a UE on the port port_pc"; the UE
+/// "receives requests and responses protected with ESP on the port port_us".
+/// TS 24.229 clause 5.2.2.2 NOTE 3: "in case of UDP the P-CSCF sends the
+/// responses to a different UE's port then the one from which the request was
+/// received from the UE", which is also why the `rport` of a protected request
+/// is ignored, and clause 5.2.2.2 1A a) puts the P-CSCF's own requests on the
+/// same flow. Every reply path hands its response here with the request's
+/// source as `destination` and the socket it arrived on as
+/// `source_local_addr`, and a request sent over a UE's captured flow is
+/// addressed the same way, so this one point covers answered, relayed,
+/// refused and retransmitted responses and requests alike. Without a P-CSCF
+/// setup, a registrant's response is handed to the UE side instead.
 ///
-/// Requests are left alone, as is everything not over UDP: a response over TCP
-/// goes on the connection its request came in on. Nothing is dropped: a pair
-/// that cannot carry UDP is logged and the response goes where it was going.
-pub(super) fn protected_udp_response_egress(
+/// Everything not over UDP is left alone: over TCP the message goes on the
+/// connection. Nothing is dropped: a pair that cannot carry UDP is logged and
+/// the message goes where it was going.
+pub(super) fn protected_udp_egress(
     frame: &[u8],
     transport: Transport,
     destination: SocketAddr,
@@ -79,45 +81,22 @@ pub(super) fn protected_udp_response_egress(
     if transport != Transport::Udp {
         return unchanged;
     }
-    let (Some(manager), Some(config), Some(local)) = (
-        state.ipsec_manager.as_deref(),
-        state.ipsec_config.as_ref(),
-        source_local_addr,
-    ) else {
+    let (Some(manager), Some(config)) =
+        (state.ipsec_manager.as_deref(), state.ipsec_config.as_ref())
+    else {
         return registrant_udp_response_egress(frame, destination, source_local_addr)
             .unwrap_or(unchanged);
     };
-    if local.port() != config.pcscf_port_s || !crate::transport::response_route::is_response(frame)
-    {
-        return unchanged;
-    }
-    match manager.udp_response_flow(destination) {
-        crate::ipsec::UdpResponseFlow::NotProtected => unchanged,
-        crate::ipsec::UdpResponseFlow::Protected {
-            local,
-            destination: protected,
-        } => {
-            debug!(
-                from = %destination,
-                to = %protected,
-                local = %local,
-                "IPsec: UDP response to the UE's protected server port (TS 33.203 clause 7.1)"
-            );
-            (protected, Some(local))
-        }
-        crate::ipsec::UdpResponseFlow::Unusable(protocol) => {
-            error!(
-                %destination,
-                %protocol,
-                "IPsec: the security association of this UE does not carry UDP, so the UDP \
-                 response cannot reach its protected server port; sending it unchanged"
-            );
-            unchanged
-        }
-    }
+    crate::ipsec::pcscf_udp_egress(
+        manager,
+        config.pcscf_port_s,
+        transport,
+        destination,
+        source_local_addr,
+    )
 }
 
-/// The UE side of [`protected_udp_response_egress`]: a UDP response siphon
+/// The UE side of [`protected_udp_egress`]: a UDP response siphon
 /// sends as a registrant, from a UE's protected server port to the P-CSCF,
 /// leaves from that UE's protected client port for the P-CSCF's protected
 /// server port (TS 33.203 clause 7.1, UDP case; see
@@ -241,7 +220,7 @@ pub(super) fn send_frames_in_order_from(
 ) {
     // The frames travel as one unit to one destination, so the first decides.
     let (destination, source_local_addr) =
-        protected_udp_response_egress(&first, transport, destination, source_local_addr, state);
+        protected_udp_egress(&first, transport, destination, source_local_addr, state);
 
     // HEP sees each frame individually — they are distinct SIP messages on the
     // wire, and a capture that merged them would not decode.

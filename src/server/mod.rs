@@ -2185,7 +2185,11 @@ impl SiphonServer {
                 Arc::clone(&identity),
             )
             .with_advertised_ports(advertised_ports.clone())
-            .with_listeners(listener_registry.clone(), stream_connections.clone()),
+            .with_listeners(listener_registry.clone(), stream_connections.clone())
+            .with_ipsec_egress(
+                ipsec_manager.clone(),
+                config.ipsec.as_ref().map(|ipsec| ipsec.pcscf_port_s),
+            ),
         );
 
         // Wire UAC sender into proxy.send_request() Python API
