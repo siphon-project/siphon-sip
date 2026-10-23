@@ -1541,7 +1541,22 @@ mod tests {
         let shed = test_runtime().block_on(run_on(&pool, || 1u32));
         let _ = unblock_tx.send(());
 
-        assert!(matches!(shed, Err(RunFailure::Shed)), "a full queue sheds");
+        let outcome = match &shed {
+            Ok(_) => "ran",
+            Err(RunFailure::Shed) => "shed",
+            Err(RunFailure::Closed) => "closed",
+            Err(RunFailure::Lost) => "lost",
+            Err(RunFailure::Panicked(_)) => "panicked",
+        };
+        assert_eq!(outcome, "shed", "a full queue sheds");
+
+        // Let the blocker and the queued job finish so the queue has room.
+        for _ in 0..200 {
+            if pool.metrics.completed.load(Ordering::Relaxed) >= 2 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
 
         let panicked = test_runtime().block_on(run_on(&pool, || -> u32 { panic!("job panic") }));
         assert!(matches!(panicked, Err(RunFailure::Panicked(_))));

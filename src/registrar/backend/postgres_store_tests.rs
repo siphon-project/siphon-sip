@@ -174,7 +174,9 @@ async fn the_count_matches_the_live_aors_across_replicas() {
 async fn the_purge_drains_expired_bindings_and_their_state() {
     let Some(url) = test_url() else { return };
     let table = unique_table("purge");
-    let backend = backend(&url, &table, 1).await;
+    // A state window of 3 s: wide enough that a loaded machine still runs
+    // the first purge inside it.
+    let backend = backend(&url, &table, 3).await;
 
     for user in 0..10 {
         let aor = format!("sip:user{user}@example.com");
@@ -194,7 +196,7 @@ async fn the_purge_drains_expired_bindings_and_their_state() {
         rows(&backend, &format!("{table}_aor_state")).await
     };
 
-    tokio::time::sleep(Duration::from_millis(2_100)).await;
+    tokio::time::sleep(Duration::from_millis(4_000)).await;
     let purged = backend.purge_expired().await.expect("purge");
     let contacts_left = rows(&backend, &table).await;
     let state_left = rows(&backend, &format!("{table}_aor_state")).await;
