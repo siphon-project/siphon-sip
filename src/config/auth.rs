@@ -75,6 +75,48 @@ pub struct AkaCredential {
     /// Authentication Management Field AMF (4 hex chars = 2 bytes).
     #[serde(default = "default_amf")]
     pub amf: String,
+    /// SQN of the first challenge `auth.require_aka_digest()` issues for this
+    /// subscriber (12 hex chars = 48 bits), default `000000000001`. Later
+    /// challenges advance it, and an AUTS from the UE re-bases it (TS 33.102
+    /// 6.3.5), so this only matters for the first challenge after a start.
+    #[serde(default)]
+    pub sqn: Option<String>,
+}
+
+impl AkaCredential {
+    /// The configured starting SQN as a 48-bit integer, `None` when unset.
+    ///
+    /// # Errors
+    /// When `sqn` is not exactly 12 hex characters.
+    pub fn starting_sqn(&self) -> Result<Option<u64>, String> {
+        let Some(text) = self.sqn.as_deref() else {
+            return Ok(None);
+        };
+        if text.len() != 12 || !text.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(format!(
+                "sqn {text:?} is not 12 hex characters (a 48-bit SQN, TS 33.102 C.1)"
+            ));
+        }
+        u64::from_str_radix(text, 16)
+            .map(Some)
+            .map_err(|error| format!("sqn {text:?}: {error}"))
+    }
+}
+
+impl AuthConfig {
+    /// Refuse an `aka_credentials` entry whose `sqn` is not a 48-bit hex value,
+    /// at load rather than at the first challenge.
+    ///
+    /// # Errors
+    /// Names the entry and what is wrong with its `sqn`.
+    pub fn validate_aka_credentials(&self) -> Result<(), String> {
+        for (identity, credential) in &self.aka_credentials {
+            credential
+                .starting_sqn()
+                .map_err(|error| format!("auth.aka_credentials.{identity}: {error}"))?;
+        }
+        Ok(())
+    }
 }
 
 fn default_amf() -> String {

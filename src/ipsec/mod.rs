@@ -5,6 +5,8 @@
 
 pub mod milenage;
 
+/// `ip xfrm policy` command lines of the `ip` backend.
+mod ip_policy;
 #[cfg(target_os = "linux")]
 mod kernel_objects;
 pub mod netlink;
@@ -829,7 +831,15 @@ impl IpsecManager {
         // the 200-OK-gated cleanup never runs after a failed allocate, so the
         // colliding policy is never reaped. Clearing first makes allocate
         // self-heal.
-        self.teardown_sa_kernel(&sa).await;
+        // A kernel object another live pair of the UE holds in exactly this
+        // form (a shared policy with an open template, see `kernel_objects`)
+        // is neither cleared nor re-added: deleting it would leave that pair's
+        // traffic without a policy, in clear, until the add. Nor is the
+        // P-CSCF's outbound policy a pair in use holds: the challenge for
+        // this pair still goes over that one, and this pair is pending until
+        // taken into use (`take_into_use`).
+        let (kept, pending) = self.objects_left_to_siblings(&sa);
+        self.teardown_sa_kernel_except(&sa, &kept).await;
 
         // Atomic: install all eight; on ANY failure, roll back THIS call's
         // partial state before propagating. Otherwise a failure partway through
@@ -839,8 +849,8 @@ impl IpsecManager {
         // permanent leak. Rollback guarantees a failed allocate leaves the
         // kernel exactly as it found it, so the failure degrades to a clean
         // retry instead of a wedge.
-        if let Err(error) = self.install_sa_kernel(&sa).await {
-            self.teardown_sa_kernel(&sa).await;
+        if let Err(error) = self.install_sa_kernel(&sa, &kept).await {
+            self.teardown_sa_kernel_except(&sa, &kept).await;
             self.release_claimed_spis(&sa, claimed);
             tracing::warn!(
                 ue = %sa.ue_addr,
@@ -863,142 +873,12 @@ impl IpsecManager {
         );
 
         let (new_states, new_spis) = (sa.state_keys(), sa.local_inbound_spis());
+        self.lifecycle
+            .set_pending(&key, retire::pair_spis(&sa), pending);
         if let Some(replaced) = self.associations.insert(key, sa) {
             self.retire_replaced_pair(replaced, new_states, new_spis)
                 .await;
         }
-        Ok(())
-    }
-
-    /// Install the four XFRM states + four policies for `sa` (all `EXCL`).
-    /// Returns on the first failure with partial state installed — the caller
-    /// ([`create_sa_pair`]) rolls it back via [`teardown_sa_kernel`].
-    async fn install_sa_kernel(&self, sa: &SecurityAssociationPair) -> Result<(), IpsecError> {
-        let proto = sa.protocol;
-
-        // SA1: UE:port_uc → PCSCF:port_ps, SPI=spi_ps (inbound to P-CSCF server)
-        self.add_sa(
-            &sa.ue_addr,
-            sa.ue_port_c,
-            &sa.pcscf_addr,
-            sa.pcscf_port_s,
-            sa.spi_ps,
-            &sa.ealg,
-            &sa.aalg,
-            &sa.encryption_key,
-            &sa.integrity_key,
-            proto,
-            sa.hard_lifetime_secs,
-        )
-        .await?;
-
-        // SA2: PCSCF:port_ps → UE:port_uc, SPI=spi_uc (outbound from P-CSCF server)
-        self.add_sa(
-            &sa.pcscf_addr,
-            sa.pcscf_port_s,
-            &sa.ue_addr,
-            sa.ue_port_c,
-            sa.spi_uc,
-            &sa.ealg,
-            &sa.aalg,
-            &sa.encryption_key,
-            &sa.integrity_key,
-            proto,
-            sa.hard_lifetime_secs,
-        )
-        .await?;
-
-        // SA3: PCSCF:port_pc → UE:port_us, SPI=spi_us (outbound from P-CSCF client)
-        self.add_sa(
-            &sa.pcscf_addr,
-            sa.pcscf_port_c,
-            &sa.ue_addr,
-            sa.ue_port_s,
-            sa.spi_us,
-            &sa.ealg,
-            &sa.aalg,
-            &sa.encryption_key,
-            &sa.integrity_key,
-            proto,
-            sa.hard_lifetime_secs,
-        )
-        .await?;
-
-        // SA4: UE:port_us → PCSCF:port_pc, SPI=spi_pc (inbound to P-CSCF client)
-        self.add_sa(
-            &sa.ue_addr,
-            sa.ue_port_s,
-            &sa.pcscf_addr,
-            sa.pcscf_port_c,
-            sa.spi_pc,
-            &sa.ealg,
-            &sa.aalg,
-            &sa.encryption_key,
-            &sa.integrity_key,
-            proto,
-            sa.hard_lifetime_secs,
-        )
-        .await?;
-
-        // Policies get the SAME hard lifetime as the states so they self-reap
-        // on the same deadline (3GPP TS 33.203 §7.4); `None` = permanent.
-        let policy_lifetime = sa.hard_lifetime_secs;
-        // Policy directions mirror by role: a UE-sourced flow is the P-CSCF's
-        // `In` and the UE's `Out` (and vice versa).
-        let role = sa.role;
-
-        // Policy 1: UE:port_uc → PCSCF:port_ps (UE-sourced)
-        self.add_policy(
-            &sa.ue_addr,
-            sa.ue_port_c,
-            &sa.pcscf_addr,
-            sa.pcscf_port_s,
-            role.policy_dir(true),
-            sa.spi_ps,
-            proto,
-            policy_lifetime,
-        )
-        .await?;
-
-        // Policy 2: PCSCF:port_ps → UE:port_uc (P-CSCF-sourced)
-        self.add_policy(
-            &sa.pcscf_addr,
-            sa.pcscf_port_s,
-            &sa.ue_addr,
-            sa.ue_port_c,
-            role.policy_dir(false),
-            sa.spi_uc,
-            proto,
-            policy_lifetime,
-        )
-        .await?;
-
-        // Policy 3: PCSCF:port_pc → UE:port_us (P-CSCF-sourced)
-        self.add_policy(
-            &sa.pcscf_addr,
-            sa.pcscf_port_c,
-            &sa.ue_addr,
-            sa.ue_port_s,
-            role.policy_dir(false),
-            sa.spi_us,
-            proto,
-            policy_lifetime,
-        )
-        .await?;
-
-        // Policy 4: UE:port_us → PCSCF:port_pc (UE-sourced)
-        self.add_policy(
-            &sa.ue_addr,
-            sa.ue_port_s,
-            &sa.pcscf_addr,
-            sa.pcscf_port_c,
-            role.policy_dir(true),
-            sa.spi_pc,
-            proto,
-            policy_lifetime,
-        )
-        .await?;
-
         Ok(())
     }
 
@@ -1026,6 +906,7 @@ impl IpsecManager {
     pub async fn delete_sa_pair(&self, ue_addr: &IpAddr, ue_port_c: u16) -> Result<(), IpsecError> {
         let key = Self::contact_key(ue_addr, ue_port_c);
         if let Some((_, sa)) = self.associations.remove(&key) {
+            let in_use = self.is_in_use(&sa);
             self.forget_lifecycle(&key);
             // Best-effort teardown — every delete is independent, so a single
             // missing key (e.g. an SA already reaped on hard-lifetime) can't
@@ -1034,7 +915,7 @@ impl IpsecManager {
             // in-memory entry is already removed above, so the manager's view
             // stays authoritative regardless of kernel-side failures. A kernel
             // object another pair of the UE holds is left to it.
-            self.teardown_unshared(&sa).await;
+            self.teardown_unshared(&sa, in_use).await;
             // Only once the kernel states are gone may the SPIs be reused.
             self.release_pair_spis(&sa);
             info!(ue = %ue_addr, ue_port_c, "IPsec: SA pair deleted");
@@ -1086,8 +967,6 @@ impl IpsecManager {
                 return Ok(());
             }
         };
-        let proto = sa.protocol;
-
         // `hard_lifetime_secs` is the desired lifetime measured **from now**
         // (e.g. the registrar's granted Expires + grace).  The kernel,
         // however, computes the hard-expiry as `add_time + value` and
@@ -1106,66 +985,13 @@ impl IpsecManager {
             requested.saturating_add(elapsed)
         });
 
-        // SA1: UE:port_uc → PCSCF:port_ps, SPI=spi_ps
-        self.update_sa_only(
-            &sa.ue_addr,
-            sa.ue_port_c,
-            &sa.pcscf_addr,
-            sa.pcscf_port_s,
-            sa.spi_ps,
-            &sa.ealg,
-            &sa.aalg,
-            &sa.encryption_key,
-            &sa.integrity_key,
-            proto,
-            kernel_lifetime_secs,
-        )
-        .await?;
-        // SA2: PCSCF:port_ps → UE:port_uc, SPI=spi_uc
-        self.update_sa_only(
-            &sa.pcscf_addr,
-            sa.pcscf_port_s,
-            &sa.ue_addr,
-            sa.ue_port_c,
-            sa.spi_uc,
-            &sa.ealg,
-            &sa.aalg,
-            &sa.encryption_key,
-            &sa.integrity_key,
-            proto,
-            kernel_lifetime_secs,
-        )
-        .await?;
-        // SA3: PCSCF:port_pc → UE:port_us, SPI=spi_us
-        self.update_sa_only(
-            &sa.pcscf_addr,
-            sa.pcscf_port_c,
-            &sa.ue_addr,
-            sa.ue_port_s,
-            sa.spi_us,
-            &sa.ealg,
-            &sa.aalg,
-            &sa.encryption_key,
-            &sa.integrity_key,
-            proto,
-            kernel_lifetime_secs,
-        )
-        .await?;
-        // SA4: UE:port_us → PCSCF:port_pc, SPI=spi_pc
-        self.update_sa_only(
-            &sa.ue_addr,
-            sa.ue_port_s,
-            &sa.pcscf_addr,
-            sa.pcscf_port_c,
-            sa.spi_pc,
-            &sa.ealg,
-            &sa.aalg,
-            &sa.encryption_key,
-            &sa.integrity_key,
-            proto,
-            kernel_lifetime_secs,
-        )
-        .await?;
+        // The four states take the install-anchored value, and the policies
+        // this pair holds the from-now one (an updated policy counts its
+        // lifetime from the update): left alone, a policy would end where the
+        // install put it, the outbound one first, and the next protected
+        // REGISTER would leave in clear.
+        self.repin_kernel_lifetimes(&sa, kernel_lifetime_secs, hard_lifetime_secs)
+            .await?;
 
         info!(
             ue = %sa.ue_addr,
@@ -1579,6 +1405,8 @@ impl IpsecManager {
         }
     }
 
+    /// Install a policy via the active backend: exclusively, or with
+    /// `replace` as an add-or-replace whose lifetime counts from now.
     async fn add_policy(
         &self,
         source: &IpAddr,
@@ -1589,14 +1417,16 @@ impl IpsecManager {
         spi: u32,
         protocol: SaProtocol,
         hard_lifetime_secs: Option<u64>,
+        replace: bool,
     ) -> Result<(), IpsecError> {
         #[cfg(test)]
-        if let Some(result) = self.mock_add(
+        if let Some(result) = self.mock_policy(
             format!(
                 "policy:{source}:{source_port}->{destination}:{destination_port}:{}",
                 policy_dir_str(direction)
             ),
-            "add_policy",
+            spi,
+            replace.then_some(hard_lifetime_secs),
         ) {
             return result;
         }
@@ -1616,6 +1446,7 @@ impl IpsecManager {
                     spi,
                     protocol.as_u8(),
                     hard_lifetime_secs,
+                    replace,
                 )
                 .await
             }
@@ -1624,21 +1455,18 @@ impl IpsecManager {
                 "XFRM netlink backend is Linux-only".to_string(),
             )),
             XfrmBackend::IpCommand => {
-                let dir_str = match direction {
-                    PolicyDir::In => "in",
-                    PolicyDir::Out => "out",
-                };
-                Self::xfrm_policy_add(
+                let arguments = ip_policy::policy_arguments(
+                    if replace { "update" } else { "add" },
                     source,
                     source_port,
                     destination,
                     destination_port,
-                    dir_str,
+                    ip_direction(direction),
                     spi,
                     protocol,
                     hard_lifetime_secs,
-                )
-                .await
+                );
+                Self::run_ip_arguments(&arguments).await
             }
         }
     }
@@ -1684,19 +1512,15 @@ impl IpsecManager {
                 "XFRM netlink backend is Linux-only".to_string(),
             )),
             XfrmBackend::IpCommand => {
-                let dir_str = match direction {
-                    PolicyDir::In => "in",
-                    PolicyDir::Out => "out",
-                };
-                Self::xfrm_policy_del(
+                let arguments = ip_policy::policy_delete_arguments(
                     source,
                     source_port,
                     destination,
                     destination_port,
-                    dir_str,
+                    ip_direction(direction),
                     protocol,
-                )
-                .await
+                );
+                Self::run_ip_arguments(&arguments).await
             }
         }
     }
@@ -1890,105 +1714,6 @@ impl IpsecManager {
         Self::run_ip_command(&args).await
     }
 
-    async fn xfrm_policy_add(
-        source: &IpAddr,
-        source_port: u16,
-        destination: &IpAddr,
-        destination_port: u16,
-        direction: &str,
-        spi: u32,
-        protocol: SaProtocol,
-        hard_lifetime_secs: Option<u64>,
-    ) -> Result<(), IpsecError> {
-        let source_cidr = format!("{}/{}", source, host_prefix(source));
-        let destination_cidr = format!("{}/{}", destination, host_prefix(destination));
-        let source_port_str = source_port.to_string();
-        let destination_port_str = destination_port.to_string();
-        let source_str = source.to_string();
-        let destination_str = destination.to_string();
-        let spi_str = format!("0x{:x}", spi);
-        let proto_str = protocol.as_str();
-        let lifetime_secs_str;
-
-        // `proto X` must precede `sport`/`dport` per the iproute2 UPSPEC
-        // grammar — see xfrm_sa_add for the same ordering constraint.
-        let mut args = vec![
-            "xfrm",
-            "policy",
-            "add",
-            "src",
-            &source_cidr,
-            "dst",
-            &destination_cidr,
-            "proto",
-            proto_str,
-            "sport",
-            &source_port_str,
-            "dport",
-            &destination_port_str,
-            "dir",
-            direction,
-            "tmpl",
-            "src",
-            &source_str,
-            "dst",
-            &destination_str,
-            "proto",
-            "esp",
-            "spi",
-            &spi_str,
-            "mode",
-            "transport",
-        ];
-
-        // Optional hard lifetime — mirrors xfrm_sa_add so a policy reaps
-        // on the same deadline as its states.  `limit time-hard <secs>`
-        // sets xfrm_userpolicy_info.lft.hard_add_expires_seconds.
-        if let Some(secs) = hard_lifetime_secs {
-            lifetime_secs_str = secs.to_string();
-            args.push("limit");
-            args.push("time-hard");
-            args.push(&lifetime_secs_str);
-        }
-
-        Self::run_ip_command(&args).await
-    }
-
-    async fn xfrm_policy_del(
-        source: &IpAddr,
-        source_port: u16,
-        destination: &IpAddr,
-        destination_port: u16,
-        direction: &str,
-        protocol: SaProtocol,
-    ) -> Result<(), IpsecError> {
-        let source_cidr = format!("{}/{}", source, host_prefix(source));
-        let destination_cidr = format!("{}/{}", destination, host_prefix(destination));
-        let source_port_str = source_port.to_string();
-        let destination_port_str = destination_port.to_string();
-        let proto_str = protocol.as_str();
-
-        // Same UPSPEC ordering as xfrm_policy_add — `proto X` first.
-        let args = vec![
-            "xfrm",
-            "policy",
-            "delete",
-            "src",
-            &source_cidr,
-            "dst",
-            &destination_cidr,
-            "proto",
-            proto_str,
-            "sport",
-            &source_port_str,
-            "dport",
-            &destination_port_str,
-            "dir",
-            direction,
-        ];
-        Self::run_ip_command(&args).await
-    }
-
     /// The IPsec integrity key for `aalg`, from the 128-bit IMS IK.
     ///
     /// HMAC-MD5-96 and HMAC-SHA-1-96 use the IK directly (SHA-1 zero-padded to
@@ -2049,14 +1774,19 @@ impl IpsecManager {
 // Test-only in-memory XFRM kernel
 // ---------------------------------------------------------------------------
 
-/// Render a [`PolicyDir`] the way the mock keys policies (matches the kernel's
-/// selector-by-direction).
-#[cfg(test)]
-fn policy_dir_str(direction: PolicyDir) -> &'static str {
+/// A [`PolicyDir`] as `ip xfrm` names it.
+fn ip_direction(direction: PolicyDir) -> &'static str {
     match direction {
         PolicyDir::In => "in",
         PolicyDir::Out => "out",
     }
+}
+
+/// Render a [`PolicyDir`] the way the mock keys policies (matches the kernel's
+/// selector-by-direction).
+#[cfg(test)]
+fn policy_dir_str(direction: PolicyDir) -> &'static str {
+    ip_direction(direction)
 }
 
 /// An in-memory stand-in for the XFRM kernel used only in tests.  Records every
@@ -2083,6 +1813,11 @@ struct KernelMock {
     /// Ordered log of `update_sa` calls as `(key, hard_lifetime_secs)`, so
     /// tests can assert the elapsed-adjusted kernel lifetime a re-pin sends.
     updates: Vec<(String, Option<u64>)>,
+    /// The SPI each live policy's template names (0 = any SA of the
+    /// selector), by policy key.
+    templates: std::collections::HashMap<String, u32>,
+    /// Ordered log of policy updates as `(key, hard_lifetime_secs)`.
+    policy_updates: Vec<(String, Option<u64>)>,
 }
 
 #[cfg(test)]
@@ -2116,6 +1851,72 @@ impl IpsecManager {
     /// module.
     pub(crate) fn test_kernel_live_count(&self) -> usize {
         self.mock().live.len()
+    }
+
+    /// The SPI the template of the live policy `key` names, 0 for any.
+    pub(crate) fn test_kernel_policy_template(&self, key: &str) -> Option<u32> {
+        self.mock().templates.get(key).copied()
+    }
+
+    /// The policy updates the mock kernel took, as `(key, lifetime)`.
+    pub(crate) fn test_kernel_policy_updates(&self) -> Vec<(String, Option<u64>)> {
+        self.mock().policy_updates.clone()
+    }
+
+    /// Whether the mock kernel would accept an ESP packet from
+    /// `source:source_port` to `destination:destination_port` under `spi`:
+    /// an inbound state `(destination, spi)` decrypts it, and the inbound
+    /// policy of that selector has a template the state satisfies (its SPI,
+    /// or 0 for any: the kernel's `xfrm_state_ok`). No policy at all fails
+    /// here too: a UE that holds SAs for the flow always has one.
+    pub(crate) fn test_kernel_accepts_inbound(
+        &self,
+        source: std::net::SocketAddr,
+        destination: std::net::SocketAddr,
+        spi: u32,
+    ) -> bool {
+        let mock = self.mock();
+        let policy = format!(
+            "policy:{}:{}->{}:{}:in",
+            source.ip(),
+            source.port(),
+            destination.ip(),
+            destination.port()
+        );
+        mock.live
+            .contains(&format!("sa:{}:{spi}", destination.ip()))
+            && mock.live.contains(&policy)
+            && mock
+                .templates
+                .get(&policy)
+                .is_some_and(|template| *template == 0 || *template == spi)
+    }
+
+    /// Mock policy add (`replace` = `None`) or update (`Some(lifetime)`),
+    /// recording the template's SPI.
+    fn mock_policy(
+        &self,
+        key: String,
+        spi: u32,
+        replace: Option<Option<u64>>,
+    ) -> Option<Result<(), IpsecError>> {
+        let Some(lifetime) = replace else {
+            let result = self.mock_add(key.clone(), "add_policy")?;
+            if result.is_ok() {
+                self.mock().templates.insert(key, spi);
+            }
+            return Some(result);
+        };
+        let mut state = self
+            .kernel_mock
+            .as_ref()?
+            .lock()
+            .expect("mock kernel lock poisoned");
+        state.ops.push(format!("update_policy {key}"));
+        state.policy_updates.push((key.clone(), lifetime));
+        state.live.insert(key.clone());
+        state.templates.insert(key, spi);
+        Some(Ok(()))
     }
 
     /// Lock the mock kernel (test inspection helper).
@@ -2172,6 +1973,7 @@ impl IpsecManager {
         let mock = self.kernel_mock.as_ref()?;
         let mut state = mock.lock().expect("mock kernel lock poisoned");
         state.ops.push(format!("{op} {key}"));
+        state.templates.remove(&key);
         state.live.remove(&key);
         Some(Ok(()))
     }

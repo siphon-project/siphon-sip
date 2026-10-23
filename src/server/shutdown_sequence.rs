@@ -3,8 +3,9 @@
 //! Split out of `server/mod.rs`, which is one long `run_async`. This is the part
 //! that runs once the node has stopped being useful, and the only part with a
 //! contract an operator has to configure around: the container runtime's stop
-//! timeout must exceed `drain_secs + teardown_secs`, or its `SIGKILL` lands
-//! first and none of it happens.
+//! timeout must exceed `drain_secs + teardown_secs` (plus up to 9 seconds when
+//! the registrant holds IMS UE security associations to delete), or its
+//! `SIGKILL` lands first and none of it happens.
 
 use super::*;
 
@@ -32,6 +33,9 @@ pub(super) async fn run_shutdown_sequence(
             info!(count = sent, "de-registered outbound bindings");
         }
     }
+    // The IMS UE SA sets those de-REGISTERs rode go once they are answered,
+    // or after this, whichever comes first (deleted below, before exit).
+    let sa_answers_by = tokio::time::Instant::now() + crate::registrant::SHUTDOWN_ANSWER_WAIT;
 
     let drain_secs = config.server.as_ref().map(|s| s.drain_secs).unwrap_or(30);
 
@@ -70,6 +74,19 @@ pub(super) async fn run_shutdown_sequence(
         }
     } else {
         info!("shutting down (drain disabled)");
+    }
+
+    // Before the dispatcher goes: it delivers the de-REGISTER answers that
+    // release the IMS UE SA sets. Bounded, so it never holds the exit.
+    if let Some(manager) = shutdown_registrant {
+        let deleted =
+            crate::registrant::retire_ue_security_associations(manager, sa_answers_by).await;
+        if deleted > 0 {
+            info!(
+                pairs = deleted,
+                "deleted the IMS UE security associations left at shutdown"
+            );
+        }
     }
 
     dispatcher_handle.abort();

@@ -240,6 +240,60 @@ async fn an_entry_whose_socket_cannot_bind_sits_the_tick_out() {
     );
 }
 
+/// Five consecutive free UDP ports on loopback, released before returning.
+fn free_port_run() -> u16 {
+    for _ in 0..200 {
+        let base = free_port();
+        if base > u16::MAX - 5 {
+            continue;
+        }
+        let held: Vec<std::net::UdpSocket> = (0..5)
+            .filter_map(|offset| std::net::UdpSocket::bind(("127.0.0.1", base + offset)).ok())
+            .collect();
+        if held.len() == 5 {
+            return base;
+        }
+    }
+    panic!("no run of five free ports");
+}
+
+/// A rotation port of a process-address IMS UE that another socket holds no
+/// longer stalls the entry: the tick moves it to a free port, binds that, and
+/// the entry registers.
+#[tokio::test]
+async fn a_process_ue_whose_rotation_port_is_taken_registers_anyway() {
+    let manager = test_support::manager();
+    let sockets = ue_sockets();
+    let (outbound, sent) = router_with(Some(Arc::clone(&sockets)));
+    let context = context(outbound, Some(Arc::clone(&sockets)), free_port());
+    install(&manager, &context);
+    let base = free_port_run();
+    let mut entry = ue(1, None);
+    entry.ue_ipsec = Some(crate::registrant::UeIpsec::new(
+        base,
+        base + 1,
+        crate::ipsec::IntegrityAlgorithm::HmacSha1,
+        crate::ipsec::EncryptionAlgorithm::Null,
+    ));
+    manager.try_add(entry).expect("added");
+    let taken = SocketAddr::new(ip("127.0.0.1"), base + 2);
+    let _holder = std::net::UdpSocket::bind(taken).expect("held by someone else");
+
+    run_tick(
+        &manager,
+        &context,
+        manager.egress.get().expect("egress"),
+        None,
+    );
+
+    assert_eq!(manager.state(&impu(1)), Some(RegistrantState::Registering));
+    let moved = SocketAddr::new(ip("127.0.0.1"), base + 4);
+    assert!(sockets.contains(&moved), "the replacement port is bound");
+    assert!(!sockets.contains(&taken));
+    let register = sent.try_recv().expect("the REGISTER");
+    assert!(String::from_utf8_lossy(&register.data).contains(&format!("port-c={base};")));
+}
+
 #[tokio::test]
 async fn a_removed_entry_is_de_registered_from_its_own_address() {
     let manager = test_support::manager();

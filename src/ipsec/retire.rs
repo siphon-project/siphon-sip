@@ -67,7 +67,7 @@ pub enum RetireCondition {
 
 /// The local inbound SPIs of a pair, which name that installation of it: a
 /// pair re-created under the same UE address and port has others.
-type PairSpis = (u32, u32);
+pub(super) type PairSpis = (u32, u32);
 
 fn spis_of(sa: &SecurityAssociationPair) -> PairSpis {
     (sa.spi_pc, sa.spi_ps)
@@ -94,6 +94,12 @@ pub(super) struct Lifecycle {
     /// Scheduled retirements, by contact key. Each is removed by its own task
     /// when it comes due.
     retiring: DashMap<String, Retirement>,
+    /// Pairs installed beside a set of the UE that is in use and not yet taken
+    /// into use themselves (TS 24.229 clause 5.2.2.2, the temporary set), by
+    /// contact key: the kernel's policy of the selector they share with that
+    /// set still names the set in use (see
+    /// [`kernel_objects`](super::kernel_objects)).
+    pending: DashMap<String, PairSpis>,
     generation: AtomicU64,
 }
 
@@ -106,6 +112,39 @@ impl Lifecycle {
             self.retiring.len(),
         )
     }
+
+    #[cfg(test)]
+    pub(super) fn pending_len(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// Mark the pair `spis` at `key` as not yet taken into use, or as in use.
+    pub(super) fn set_pending(&self, key: &str, spis: PairSpis, pending: bool) {
+        if pending {
+            self.pending.insert(key.to_string(), spis);
+        } else {
+            self.pending.remove(key);
+        }
+    }
+
+    /// Whether the pair `spis` at `key` is not yet taken into use.
+    pub(super) fn is_pending(&self, key: &str, spis: PairSpis) -> bool {
+        self.pending
+            .get(key)
+            .is_some_and(|entry| *entry.value() == spis)
+    }
+
+    /// Take the pair `spis` at `key` into use. Returns whether it was pending.
+    pub(super) fn take_pending(&self, key: &str, spis: PairSpis) -> bool {
+        self.pending
+            .remove_if(key, |_, pending| *pending == spis)
+            .is_some()
+    }
+}
+
+/// The local inbound SPIs that name this installation of `sa`.
+pub(super) fn pair_spis(sa: &SecurityAssociationPair) -> PairSpis {
+    spis_of(sa)
 }
 
 /// Whether the process registrar holds a live binding registered from
@@ -121,6 +160,7 @@ impl IpsecManager {
     pub(super) fn forget_lifecycle(&self, key: &str) {
         self.lifecycle.registered.remove(key);
         self.lifecycle.predecessors.remove(key);
+        self.lifecycle.pending.remove(key);
     }
 
     /// Note that a registrar binding was registered over the pair at
