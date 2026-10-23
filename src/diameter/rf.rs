@@ -41,17 +41,24 @@ pub mod termination_cause {
     pub const DIAMETER_SESSION_TIMEOUT: u32 = 8;
 }
 
-/// Map a SIP final response code to a Cause-Code value suitable for the
-/// IMS-Information `Cause-Code` AVP per TS 32.299 §5.2.5.  Successful
-/// terminations (2xx) map to 0; failures pass through their negative SIP
-/// code (e.g. 486 Busy → -486), matching the convention used by every
-/// open-source IMS charging client.  Returns `None` for codes outside the
-/// 100–699 range.
+/// Map a SIP final response code to the IMS-Information `Cause-Code`
+/// (TS 32.299 V18.0.0 clause 7.2.35) of the record that response ends.
+///
+/// Clause 7.2.35 puts successful causes at values <= 0 and failures at >= 1,
+/// and "in case of errors where the session has been terminated as a result of
+/// a specific known SIP error code, then the SIP error code is also used as the
+/// cause code": a 4xx, 5xx or 6xx is its own status, positive (486 Busy Here is
+/// 486). A 3xx is listed with the successful causes as `-3xx`. A 2xx ending a
+/// session is 0, "Normal end of session". The negated 4xx-6xx this used to
+/// send is the pre-Release 8 convention, which a Release 18 CDF reads as a
+/// successful cause it does not know.
+///
+/// Returns `None` for a provisional and for codes outside 100-699.
 pub fn sip_status_to_cause_code(status: u16) -> Option<i32> {
     match status {
-        100..=199 => None,
         200..=299 => Some(0),
-        300..=699 => Some(-(status as i32)),
+        300..=399 => Some(-i32::from(status)),
+        400..=699 => Some(i32::from(status)),
         _ => None,
     }
 }
@@ -1081,15 +1088,26 @@ mod tests {
     }
 
     #[test]
-    fn sip_status_to_cause_code_4xx_is_negative() {
-        assert_eq!(sip_status_to_cause_code(486), Some(-486));
-        assert_eq!(sip_status_to_cause_code(404), Some(-404));
+    fn sip_status_to_cause_code_4xx_is_the_positive_status() {
+        // TS 32.299 V18.0.0 clause 7.2.35: failures are >= 1, the SIP error
+        // code itself.
+        assert_eq!(sip_status_to_cause_code(486), Some(486));
+        assert_eq!(sip_status_to_cause_code(404), Some(404));
+        assert_eq!(sip_status_to_cause_code(487), Some(487));
+        assert_eq!(sip_status_to_cause_code(408), Some(408));
     }
 
     #[test]
-    fn sip_status_to_cause_code_5xx_6xx_is_negative() {
-        assert_eq!(sip_status_to_cause_code(503), Some(-503));
-        assert_eq!(sip_status_to_cause_code(603), Some(-603));
+    fn sip_status_to_cause_code_5xx_6xx_is_the_positive_status() {
+        assert_eq!(sip_status_to_cause_code(503), Some(503));
+        assert_eq!(sip_status_to_cause_code(603), Some(603));
+    }
+
+    #[test]
+    fn sip_status_to_cause_code_3xx_is_negative() {
+        // Clause 7.2.35 lists "-3xx 3xx Redirection" with the successful causes.
+        assert_eq!(sip_status_to_cause_code(302), Some(-302));
+        assert_eq!(sip_status_to_cause_code(380), Some(-380));
     }
 
     #[test]
@@ -1580,11 +1598,12 @@ mod tests {
         );
     }
 
-    /// An unsuccessful session establishment is reported as ACR-EVENT with a
-    /// negative Cause-Code (TS 32.299 §7.2.35) — the only record a failed call
-    /// produces, and the only one that ever distinguishes failure from success.
+    /// An unsuccessful session establishment is reported as ACR-EVENT with the
+    /// SIP status as a positive Cause-Code (TS 32.299 V18.0.0 clause 7.2.35):
+    /// the only record a failed call produces, and the only one that ever
+    /// distinguishes failure from success.
     #[test]
-    fn acr_event_for_failed_setup_carries_negative_cause_code() {
+    fn acr_event_for_failed_setup_carries_the_status_as_cause_code() {
         let ims = ImsChargingData {
             sip_method: Some("INVITE".into()),
             cause_code: sip_status_to_cause_code(486),
@@ -1599,7 +1618,13 @@ mod tests {
         let cause = first_avp(ims_info, avp::CAUSE_CODE)
             .map(|d| i32::from_be_bytes([d[0], d[1], d[2], d[3]]))
             .expect("Cause-Code");
-        assert_eq!(cause, -486);
+        assert_eq!(cause, 486);
+        // Integer32 486, big-endian (RFC 6733 §4.2): not the two's complement
+        // of -486 (ff ff fe 1a) a pre-Release 8 client sends.
+        assert_eq!(
+            first_avp(ims_info, avp::CAUSE_CODE).map(|d| d.to_vec()),
+            Some(vec![0x00, 0x00, 0x01, 0xe6])
+        );
         assert_eq!(
             first_avp(ims_info, avp::IMS_CHARGING_IDENTIFIER).map(utf8),
             Some("icid-failed-setup".to_string()),

@@ -291,7 +291,7 @@ async fn sessions_bound_to_a_call_end_with_it() {
         "a session ended on its own leaves the binding"
     );
 
-    service.end_bound("call-uuid-1", Some(-486)).await;
+    service.end_bound("call-uuid-1", Some(486)).await;
     assert_eq!(service.active_session_count(), 0);
     assert!(service.bound_call_ids().is_empty());
     let causes: Vec<i64> = seen(&log)
@@ -786,7 +786,7 @@ async fn emit_ro_sessions_for_external_dissection() {
         .await
         .expect("an answer");
     service.terminate_with_usage(&forwarder, 20, Some(0)).await;
-    service.terminate_call(&caller, Some(-486)).await;
+    service.terminate_call(&caller, Some(486)).await;
 
     // A Proxy Function's session (TS 32.276) for a forwarded CS call (MF):
     // MSISDN and IMSI, VCS-Information, Node-Functionality 16, Role-Of-Node
