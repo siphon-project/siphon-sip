@@ -21,6 +21,12 @@ entry, but a working config keeps working.
   `registration.add(interval=...)`) never reached the registrar. They now ask
   for the entry's own interval, as does the fallback for a 200 that grants none.
 
+- **A refresh is reported as `refreshed`.** `@registration.on_change`, the
+  control plane's `RegistrantChanged` and the Rust event stream reported every
+  re-registration as a new `registered`: the state the check read had already
+  moved to `registering` when the refresh was sent. A 200 now counts as a
+  refresh whenever the registrar still held the entry's binding.
+
 - **IMS UE registrant: the Contact of a protected REGISTER names the protected
   server port.** The authenticated REGISTER after a 401 and every protected
   re- and de-REGISTER bound the plain port, so the S-CSCF sent MT requests

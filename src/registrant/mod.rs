@@ -1153,7 +1153,12 @@ impl RegistrantManager {
     /// test can pin it.
     pub fn handle_success_with_draw(&self, aor: &str, granted_expires: u32, unit: f64) {
         if let Some(mut entry) = self.entries.get_mut(aor) {
-            let was_registered = entry.state == RegistrantState::Registered;
+            // A refresh, not a new registration, when the registrar still held
+            // a binding granted to this entry. Not read from the state: sending
+            // the refresh moved it to Registering (or Challenging on a 401),
+            // which is how the loop knows a REGISTER is in flight, so a state
+            // check reported every refresh as a fresh `registered`.
+            let was_registered = entry.expires_at.is_some_and(|at| at > Instant::now());
             let window = entry.refresh_window.unwrap_or(self.refresh_window);
             let refresh_at = window.delay(granted_expires, unit);
             entry.state = RegistrantState::Registered;
@@ -2238,6 +2243,32 @@ mod tests {
         let event = receiver.try_recv().unwrap();
         assert!(
             matches!(event, RegistrantEvent::Refreshed { ref aor } if aor == "sip:alice@carrier.com")
+        );
+    }
+
+    /// A real refresh: the REGISTER is built (which moves the entry to
+    /// Registering) before its 200 arrives. Still a refresh, not a new
+    /// registration, because the registrar's binding had not run out.
+    #[test]
+    fn a_refresh_that_was_sent_is_reported_as_refreshed() {
+        let manager = make_manager();
+        manager.add(make_entry("sip:alice@carrier.com"));
+        manager.handle_success("sip:alice@carrier.com", 3600);
+
+        let mut receiver = manager.subscribe_events();
+        manager
+            .build_register(
+                "sip:alice@carrier.com",
+                EgressDefaults::new("127.0.0.1:5060".parse().unwrap(), &HashMap::new()),
+                3600,
+            )
+            .expect("the refresh REGISTER");
+        manager.handle_success("sip:alice@carrier.com", 3600);
+
+        let event = receiver.try_recv().unwrap();
+        assert!(
+            matches!(event, RegistrantEvent::Refreshed { ref aor } if aor == "sip:alice@carrier.com"),
+            "{event:?}"
         );
     }
 
