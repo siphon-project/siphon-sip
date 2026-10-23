@@ -938,6 +938,46 @@ where
     }
 }
 
+/// Why a job given to [`try_run_classified`] did not return a value.
+///
+/// [`try_run`] folds all of these into one panic-shaped `Err`, which is right
+/// for a caller that only turns a failure into an error answer, and wrong for
+/// one that logs it: a job the pool shed was never run, and reporting it as a
+/// panic sends an operator looking for a crash that did not happen.
+pub enum RunFailure {
+    /// The queue was full, so the job was dropped without running.
+    Shed,
+    /// The pool is shutting down, so the job was dropped without running.
+    Closed,
+    /// The job was accepted but no result came back (the worker went away).
+    Lost,
+    /// The job ran and panicked; the payload is the panic's.
+    Panicked(Box<dyn Any + Send + 'static>),
+}
+
+impl RunFailure {
+    /// The panic's message, for a job that panicked with a string.
+    pub fn panic_message(&self) -> Option<&str> {
+        match self {
+            Self::Panicked(payload) => payload
+                .downcast_ref::<&'static str>()
+                .copied()
+                .or_else(|| payload.downcast_ref::<String>().map(String::as_str)),
+            _ => None,
+        }
+    }
+
+    /// The failure as the panic payload [`try_run`] has always returned.
+    fn into_payload(self) -> Box<dyn Any + Send + 'static> {
+        match self {
+            Self::Shed => boxed_message("Python executor queue full — load shed"),
+            Self::Closed => boxed_message("Python executor channel closed"),
+            Self::Lost => boxed_message("Python executor worker dropped"),
+            Self::Panicked(payload) => payload,
+        }
+    }
+}
+
 /// Like [`run`], but returns the panic payload as `Err` instead of propagating
 /// it — the analogue of `tokio::task::spawn_blocking(f).await` (where `Err`
 /// means the task panicked). Use at sites that turn a dispatch panic into an
@@ -947,34 +987,57 @@ where
     F: FnOnce() -> T + Send + 'static,
     T: Send + 'static,
 {
+    try_run_classified(f)
+        .await
+        .map_err(RunFailure::into_payload)
+}
+
+/// Like [`try_run`], but says why a job produced no value: shed, closed, lost,
+/// or panicked ([`RunFailure`]).
+pub async fn try_run_classified<T, F>(f: F) -> Result<T, RunFailure>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
     match PyExecutor::global() {
-        Some(pool) => {
-            let (sender, receiver) = oneshot::channel();
-            let job: Job = Box::new(move || {
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
-                // Receiver may already be gone if the caller dropped the future;
-                // that's fine — the work still ran.
-                let _ = sender.send(result);
-            });
-            match pool.submit(job) {
-                SubmitResult::Submitted => receiver
-                    .await
-                    .unwrap_or_else(|_| Err(boxed_message("Python executor worker dropped"))),
-                SubmitResult::Full => {
-                    record_shed();
-                    Err(boxed_message("Python executor queue full — load shed"))
-                }
-                SubmitResult::Closed => Err(boxed_message("Python executor channel closed")),
-            }
-        }
+        Some(pool) => run_on(&pool, f).await,
         None => {
             // No pool (tests / CLI): preserve the old blocking-pool behaviour.
             match tokio::task::spawn_blocking(f).await {
                 Ok(value) => Ok(value),
-                Err(join_error) if join_error.is_panic() => Err(join_error.into_panic()),
-                Err(_) => Err(boxed_message("spawn_blocking task cancelled")),
+                Err(join_error) if join_error.is_panic() => {
+                    Err(RunFailure::Panicked(join_error.into_panic()))
+                }
+                Err(_) => Err(RunFailure::Lost),
             }
         }
+    }
+}
+
+/// Run `f` on `pool` and await its result.
+async fn run_on<T, F>(pool: &PyExecutor, f: F) -> Result<T, RunFailure>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let (sender, receiver) = oneshot::channel();
+    let job: Job = Box::new(move || {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        // Receiver may already be gone if the caller dropped the future;
+        // that's fine — the work still ran.
+        let _ = sender.send(result);
+    });
+    match pool.submit(job) {
+        SubmitResult::Submitted => match receiver.await {
+            Ok(Ok(value)) => Ok(value),
+            Ok(Err(payload)) => Err(RunFailure::Panicked(payload)),
+            Err(_) => Err(RunFailure::Lost),
+        },
+        SubmitResult::Full => {
+            record_shed();
+            Err(RunFailure::Shed)
+        }
+        SubmitResult::Closed => Err(RunFailure::Closed),
     }
 }
 
@@ -1438,6 +1501,70 @@ mod tests {
             "E should shed (queue full)"
         );
 
+        drop(pool);
+    }
+
+    /// A job the pool sheds is reported as shed, not as the panic `try_run`
+    /// folds every failure into, and a job that panics is reported as one.
+    /// The timer loop logs from this, and a shed timer logged as "panicked"
+    /// sent operators looking for a crash that never happened.
+    #[test]
+    fn a_shed_job_reads_as_shed_and_a_panicking_one_as_a_panic() {
+        pyo3::Python::initialize();
+        let pool = PyExecutor::spawn(
+            test_runtime().handle().clone(),
+            ExecutorConfig {
+                core_threads: 1,
+                max_threads: 1,
+                queue_capacity: 1,
+                stall_abort: None,
+            },
+        );
+
+        // Pin the only worker, then fill the one queue slot.
+        let (unblock_tx, unblock_rx) = std::sync::mpsc::channel::<()>();
+        let blocker: Job = Box::new(move || {
+            let _ = unblock_rx.recv();
+        });
+        assert!(matches!(pool.submit(blocker), SubmitResult::Submitted));
+        let mut picked = false;
+        for _ in 0..200 {
+            if pool.metrics.inflight.load(Ordering::Relaxed) == 1 {
+                picked = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(picked, "worker never picked up the blocking job");
+        assert!(matches!(pool.submit(noop_job()), SubmitResult::Submitted));
+
+        let shed = test_runtime().block_on(run_on(&pool, || 1u32));
+        let _ = unblock_tx.send(());
+
+        let outcome = match &shed {
+            Ok(_) => "ran",
+            Err(RunFailure::Shed) => "shed",
+            Err(RunFailure::Closed) => "closed",
+            Err(RunFailure::Lost) => "lost",
+            Err(RunFailure::Panicked(_)) => "panicked",
+        };
+        assert_eq!(outcome, "shed", "a full queue sheds");
+
+        // Let the blocker and the queued job finish so the queue has room.
+        for _ in 0..200 {
+            if pool.metrics.completed.load(Ordering::Relaxed) >= 2 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        let panicked = test_runtime().block_on(run_on(&pool, || -> u32 { panic!("job panic") }));
+        assert!(matches!(panicked, Err(RunFailure::Panicked(_))));
+
+        assert_eq!(
+            test_runtime().block_on(run_on(&pool, || 7u32)).ok(),
+            Some(7)
+        );
         drop(pool);
     }
 

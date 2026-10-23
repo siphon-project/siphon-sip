@@ -28,6 +28,28 @@ jobs:
             flags: "--features sctp"
             sctp: true
     name: rust-tests (${{ matrix.name }})
+    # The registrar and iFC backend tests run against these (TTLs, the AoR
+    # index, the purge); without the URLs they skip.
+    services:
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 2s
+          --health-timeout 5s --health-retries 20
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: siphon
+          POSTGRES_PASSWORD: siphon
+          POSTGRES_DB: siphon
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U siphon" --health-interval 2s
+          --health-timeout 5s --health-retries 20
+    env:
+      SIPHON_TEST_REDIS_URL: redis://127.0.0.1:6379
+      SIPHON_TEST_POSTGRES_URL: postgresql://siphon:siphon@127.0.0.1:5432/siphon
     steps:
       - uses: actions/checkout@v7
 

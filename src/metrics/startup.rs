@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use super::custom::CustomMetrics;
 use super::{
-    admission, enum_servers, event_lag, ipsec, rate_limit, send_queue, SiphonMetrics,
+    admission, enum_servers, event_lag, ipsec, rate_limit, send_queue, timer, SiphonMetrics,
     CUSTOM_METRICS, METRICS, STARTED_AT,
 };
 
@@ -30,6 +30,7 @@ pub fn init() -> Result<(), prometheus::Error> {
     ipsec::init(&metrics.registry)?;
     rate_limit::init(&metrics.registry)?;
     send_queue::init(&metrics.registry)?;
+    timer::init(&metrics.registry)?;
     let custom = Arc::new(CustomMetrics::new(&metrics.registry));
     let _ = CUSTOM_METRICS.set(custom);
     let _ = METRICS.set(metrics);
