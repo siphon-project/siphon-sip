@@ -237,3 +237,186 @@ fn siphons_p_cscf_stamps_a_protected_refresh_integrity_protected() {
         Some(test_support::SECURITY_SERVER)
     );
 }
+
+fn established_on(manager: &RegistrantManager, aor: &str, port: u16) {
+    let mut entry = manager.entries.get_mut(aor).expect("an entry");
+    let ipsec = entry.ue_ipsec.as_mut().expect("IPsec");
+    ipsec.sa_sets.established = Some(EstablishedSaSet {
+        key: UeSaKey {
+            ue_port_c: port,
+            spi_uc: 50_000,
+            spi_us: 50_001,
+        },
+        pcscf_port_s: 5066,
+        security_server: test_support::SECURITY_SERVER.to_string(),
+        authorization: "Digest username=\"u\"".to_string(),
+        usable: true,
+    });
+}
+
+fn client_ports(manager: &RegistrantManager, aor: &str) -> [u16; 3] {
+    manager
+        .entries
+        .get(aor)
+        .and_then(|entry| entry.ue_ipsec.as_ref().map(|ipsec| ipsec.client_ports))
+        .expect("IPsec")
+}
+
+/// A rotation port another socket holds no longer stalls the entry: it moves
+/// to the next free port, past the other UE's on the address, and is counted.
+#[test]
+fn an_unbindable_rotation_port_moves_to_a_free_one() {
+    let manager = test_support::manager();
+    manager
+        .try_add(ue(1, Some(ip("192.0.2.77"))))
+        .expect("added");
+    let mut second = ue(2, Some(ip("192.0.2.77")));
+    second.ue_ipsec = Some(UeIpsec::new(
+        6104,
+        6105,
+        IntegrityAlgorithm::HmacSha1,
+        EncryptionAlgorithm::Null,
+    ));
+    manager.try_add(second).expect("added");
+    crate::metrics::init().expect("metrics");
+    let before = crate::metrics::ipsec::ue_port_bind_failures().expect("initialised");
+
+    let outcome = manager.degrade_unbindable_ports(&impu(1), &[6102], 5060);
+
+    assert_eq!(
+        outcome,
+        PortDegradation {
+            moved: true,
+            blocked: false
+        }
+    );
+    assert_eq!(
+        client_ports(&manager, &impu(1)),
+        [6100, 6108, 6103],
+        "past its own ports and every port of UE 2 (6104 to 6107)"
+    );
+    assert!(crate::metrics::ipsec::ue_port_bind_failures().expect("initialised") > before);
+    // The moved port is what the socket plan asks for next.
+    let plan: HashMap<String, Vec<SocketAddr>> = manager
+        .ue_socket_plan(5060, ip("192.0.2.1"))
+        .into_iter()
+        .collect();
+    assert!(plan[&impu(1)].contains(&SocketAddr::new(ip("192.0.2.77"), 6108)));
+}
+
+/// The established set's own client port will not bind: that set is taken out
+/// of use, so the next REGISTER goes unprotected (TS 33.203 7.4.0) from a port
+/// that binds, rather than the entry stalling.
+#[test]
+fn an_unbindable_established_port_falls_back_to_an_unprotected_register() {
+    let manager = test_support::manager();
+    manager.try_add(ue(1, None)).expect("added");
+    established_on(&manager, &impu(1), 6100);
+
+    let outcome = manager.degrade_unbindable_ports(&impu(1), &[6100], 5060);
+
+    assert_eq!(
+        outcome,
+        PortDegradation {
+            moved: false,
+            blocked: false
+        }
+    );
+    let sets = test_support::sa_sets(&manager, &impu(1));
+    assert!(sets.established.is_some_and(|set| !set.usable));
+    let listen = HashMap::from([(Transport::Udp, "192.0.2.1:5060".parse().expect("addr"))]);
+    let built = manager
+        .build_register(
+            &impu(1),
+            EgressDefaults::new("192.0.2.1:5060".parse().expect("addr"), &listen),
+            600000,
+        )
+        .expect("built");
+    assert!(!built.protected);
+    assert!(built
+        .message
+        .headers
+        .get("Security-Client")
+        .is_some_and(|client| client.contains("port-c=6102")));
+}
+
+/// Nothing replaces the plain or protected server port: the entry sits the
+/// tick out. Nor a client port once its moves are spent.
+#[test]
+fn an_unbindable_server_port_or_spent_moves_block_the_entry() {
+    let manager = test_support::manager();
+    manager
+        .try_add(ue(1, Some(ip("192.0.2.77"))))
+        .expect("added");
+    assert!(
+        manager
+            .degrade_unbindable_ports(&impu(1), &[6101], 5060)
+            .blocked
+    );
+    assert!(
+        manager
+            .degrade_unbindable_ports(&impu(1), &[5060], 5060)
+            .blocked
+    );
+
+    let mut rounds = 0;
+    loop {
+        let ports = client_ports(&manager, &impu(1));
+        let outcome = manager.degrade_unbindable_ports(&impu(1), &ports, 5060);
+        if !outcome.moved {
+            assert!(outcome.blocked, "out of moves, nothing left to offer");
+            break;
+        }
+        rounds += 1;
+        assert!(rounds <= MAX_PORT_REPLACEMENTS, "the moves are bounded");
+    }
+    // A trunk without IPsec: any failure is its plain port.
+    manager
+        .try_add(test_support::trunk("sip:t@carrier.example").with_local_addr(ip("192.0.2.90")))
+        .expect("added");
+    assert!(
+        manager
+            .degrade_unbindable_ports("sip:t@carrier.example", &[5060], 5060)
+            .blocked
+    );
+}
+
+/// TS 33.203 7.1: "The UE shall select the SPIs uniquely, and different from
+/// any SPIs that might be used in any existing SAs". The counter restarts at
+/// its base every boot, so the kernel's states at start, a previous process's
+/// among them, are skipped, as are the SPIs of the sets the UE holds.
+#[test]
+fn an_offer_never_reuses_an_spi_an_existing_sa_uses() {
+    let manager = test_support::manager();
+    manager.note_kernel_spis(50_000..50_010);
+    let (spi_uc, spi_us) = manager.allocate_unique_ue_spi_pair(&HashSet::new());
+    assert!(spi_uc >= 50_010, "{spi_uc}");
+    assert_eq!(spi_us, spi_uc + 1);
+    let avoid: HashSet<u32> = [spi_uc + 2, spi_uc + 5].into_iter().collect();
+    let (next_uc, next_us) = manager.allocate_unique_ue_spi_pair(&avoid);
+    assert!(!avoid.contains(&next_uc) && !avoid.contains(&next_us));
+
+    let manager = test_support::manager();
+    manager.note_kernel_spis([50_000, 50_001]);
+    manager
+        .try_add(ue(1, Some(ip("192.0.2.77"))))
+        .expect("added");
+    let listen = HashMap::from([(Transport::Udp, "192.0.2.1:5060".parse().expect("addr"))]);
+    let built = manager
+        .build_register(
+            &impu(1),
+            EgressDefaults::new("192.0.2.1:5060".parse().expect("addr"), &listen),
+            600000,
+        )
+        .expect("built");
+    let client = built
+        .message
+        .headers
+        .get("Security-Client")
+        .cloned()
+        .expect("a Security-Client");
+    assert!(
+        !client.contains("spi-c=50000;") && !client.contains("spi-s=50001;"),
+        "{client}"
+    );
+}

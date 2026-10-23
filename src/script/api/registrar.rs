@@ -1330,6 +1330,35 @@ impl PyRegistrar {
         self.expire(uri)
     }
 
+    /// Remove one binding of an AoR, leaving its other contacts registered.
+    ///
+    /// For a reg-event NOTIFY (RFC 3680) or a Cx RTR that ends one contact of
+    /// a multi-contact AoR, where `remove()` would drop them all. Covers
+    /// bindings stored by `save()` and by `save_proxy()` alike.
+    ///
+    /// `contact` matches a UE binding the way a REGISTER's ``expires=0``
+    /// matches the binding it removes: by the stored Contact URI, angle
+    /// brackets allowed, so the ``contact.uri`` a `lookup()` reported always
+    /// matches. AS capability records are never matched. The removal is
+    /// carried out as that ``expires=0`` is: written through to the registrar
+    /// backend, and `@registrar.on_change` fires with ``"deregistered"``.
+    /// Removing the last binding removes the AoR as `remove()` does, its AS
+    /// records, Service-Route, P-Asserted-Identity, P-Associated-URI and
+    /// aliases with it.
+    ///
+    /// Args:
+    ///     aor: The AoR (or one of its implicit-set aliases), str or SipUri.
+    ///     contact: The Contact URI to remove: str, SipUri or Contact.
+    ///
+    /// Returns:
+    ///     ``True`` when a binding was removed, ``False`` when none matched.
+    fn remove_contact(&self, aor: &Bound<'_, PyAny>, contact: &Bound<'_, PyAny>) -> PyResult<bool> {
+        let aor = normalize_aor(&extract_uri_string(aor)?);
+        Ok(self
+            .inner
+            .remove_contact(&aor, &extract_uri_string(contact)?))
+    }
+
     /// Check if a URI has any registered contacts.
     /// Accepts either a string or a SipUri object.
     fn is_registered(&self, uri: &Bound<'_, PyAny>) -> PyResult<bool> {
@@ -1971,6 +2000,60 @@ mod tests {
 
         // Unknown contact still misses on the reverse path.
         assert!(!py_reg.is_registered_contact_str("sip:1001@198.51.100.9:17514"));
+    }
+
+    /// A proxy-cached binding (`save_proxy`) of a two-contact AoR loses only
+    /// the contact named, whichever form the script names it in.
+    #[test]
+    fn remove_contact_drops_one_proxy_cached_binding() {
+        let registrar = make_registrar();
+        let py_reg = PyRegistrar::new(Arc::clone(&registrar));
+        let message = SipMessageBuilder::new()
+            .request(Method::Register, SipUri::new("ims.example.com".to_string()))
+            .via("SIP/2.0/UDP 192.0.2.10:5060;branch=z9hG4bK-reg".to_string())
+            .to("<sip:alice@ims.example.com>".to_string())
+            .from("<sip:alice@ims.example.com>;tag=reg-tag".to_string())
+            .call_id("reg-call@host".to_string())
+            .cseq("1 REGISTER".to_string())
+            .header(
+                "Contact",
+                "<sip:alice@192.0.2.10:5060>, <sip:alice@192.0.2.11:5060>".to_string(),
+            )
+            .content_length(0)
+            .build()
+            .unwrap();
+        let request = PyRequest::new(
+            Arc::new(Mutex::new(message)),
+            "udp".to_string(),
+            "192.0.2.10".to_string(),
+            5060,
+        );
+        py_reg
+            .save_proxy(&request, &make_reply_with_expires("3600"), vec![], None)
+            .unwrap();
+        assert_eq!(py_reg.lookup_str("sip:alice@ims.example.com").len(), 2);
+
+        Python::initialize();
+        Python::attach(|python| {
+            let aor = pyo3::types::PyString::new(python, "sip:alice@ims.example.com").into_any();
+            let gone = pyo3::types::PyString::new(python, "<sip:alice@192.0.2.10:5060>").into_any();
+            assert!(py_reg.remove_contact(&aor, &gone).unwrap());
+            assert!(
+                !py_reg.remove_contact(&aor, &gone).unwrap(),
+                "a second removal finds nothing"
+            );
+
+            let left = py_reg.lookup_str("sip:alice@ims.example.com");
+            assert_eq!(left.len(), 1);
+            assert!(left[0].uri().contains("192.0.2.11"));
+
+            // A Contact from lookup() is accepted as it stands.
+            let contact = Bound::new(python, left.into_iter().next().unwrap())
+                .unwrap()
+                .into_any();
+            assert!(py_reg.remove_contact(&aor, &contact).unwrap());
+        });
+        assert!(!registrar.is_registered("sip:alice@ims.example.com"));
     }
 
     #[test]

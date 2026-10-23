@@ -7,7 +7,11 @@
 //! response or answered the REGISTER itself.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
+
+use tokio::runtime::RuntimeFlavor;
+use tracing::error;
 
 use super::DispatcherState;
 use crate::ipsec::retire::RetireCondition;
@@ -51,7 +55,7 @@ pub(super) fn on_register_2xx(
 /// pair of the UE's (its source is that pair's client port, on the protected
 /// server port), the pair a re-registration keeps for a while (TS 33.203
 /// clause 7.4.2a).
-pub(super) fn record_challenge(
+fn record_challenge(
     state: &DispatcherState,
     challenge: &SipMessage,
     ue: SocketAddr,
@@ -72,6 +76,73 @@ pub(super) fn record_challenge(
         challenge,
         protected_by_port_c,
     );
+}
+
+/// A final response to a REGISTER `ue` sent, arriving on `local` (`flow`), is
+/// about to be relayed to it: a 401 with Security-Server records the challenge
+/// ([`record_challenge`]), and a 2xx first takes the pair the REGISTER came
+/// over into use ([`take_into_use_before_2xx`]).
+pub(super) fn before_register_final(
+    state: &DispatcherState,
+    response: &SipMessage,
+    status_code: u16,
+    (ue, local): (SocketAddr, SocketAddr),
+) {
+    if status_code == 401 && response.headers.has("Security-Server") {
+        record_challenge(state, response, ue, local);
+    } else if (200..300).contains(&status_code) {
+        take_into_use_before_2xx(state, ue);
+    }
+}
+
+/// A 2xx to a REGISTER `ue` sent is about to leave. When the REGISTER came over
+/// a pair still pending (the one a re-authentication's challenge set up), take
+/// it into use first, so the 2xx goes over it: TS 24.229 clause 5.2.2.2
+/// ("protect the 200 (OK) response to the REGISTER request within the same
+/// security association to that in which the REGISTER request was
+/// protected"), TS 33.203 clause 7.4.2a (SM12 "shall be protected using the new
+/// outbound SA").
+///
+/// The kernel policy update is awaited here, on the response path, since a
+/// 2xx that left before it would go over the old set. One update, once per
+/// re-authentication.
+pub(super) fn take_into_use_before_2xx(state: &DispatcherState, ue: SocketAddr) {
+    let Some(manager) = state.ipsec_manager.as_ref() else {
+        return;
+    };
+    if !manager.is_pending(&ue.ip(), ue.port()) {
+        return;
+    }
+    let switch = {
+        let manager = Arc::clone(manager);
+        async move { manager.take_into_use(&ue.ip(), ue.port()).await }
+    };
+    let result = match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(|| handle.block_on(switch))
+        }
+        Ok(handle) => {
+            error!(
+                ue = %ue,
+                "IPsec: a single-threaded runtime cannot wait for the new SA pair to be taken \
+                 into use; the 2xx to the REGISTER may leave over the old set"
+            );
+            handle.spawn(switch);
+            return;
+        }
+        Err(_) => {
+            error!(ue = %ue, "IPsec: no runtime to take the new SA pair into use on");
+            return;
+        }
+    };
+    if let Err(error) = result {
+        error!(
+            ue = %ue,
+            %error,
+            "IPsec: could not take the new SA pair into use; the 2xx to the REGISTER leaves \
+             over the old set"
+        );
+    }
 }
 
 /// How long the server transaction of a REGISTER answered over `transport`

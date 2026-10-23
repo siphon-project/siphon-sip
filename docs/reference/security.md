@@ -86,6 +86,27 @@ path. `require_ims_digest` also takes `server_name=`, the S-CSCF's own SIP URI,
 which the Multimedia-Auth-Request it sends to the HSS requires; see
 [Cx: registration](diameter.md#cx-registration).
 
+`require_aka_digest` computes the vector itself from `auth.aka_credentials`
+(Milenage), so it also keeps what an HSS would: a sequence number per
+subscriber. Each challenge carries a later SQN (the next SEQ, IND 0, TS 33.102
+annex C), starting from the credential's optional `sqn` (12 hex characters,
+default `000000000001`). A UE that finds the SQN out of range answers with
+`auts=`; siphon checks its MAC-S against the RAND of the challenge it answers,
+and on a match takes up the UE's SQN and sends a fresh 401, on a mismatch
+answers 403 (TS 33.102 6.3.5). The counters are in memory: after a restart the
+first challenge carries the configured `sqn` again, and a UE further along
+re-synchronises through that AUTS.
+
+```yaml
+auth:
+  aka_credentials:
+    "001010000000001":
+      k: "465b5ce8b199b49faa5f0a2ee238a6bc"
+      op: "cdc202d5123e20f62b6d676ac72cb318"
+      amf: "8000"
+      sqn: "000000000020"   # optional: SQN of the first challenge
+```
+
 ### IMS AKA or SIP Digest
 
 `require_ims_digest` authenticates a REGISTER against the HSS over Cx, with

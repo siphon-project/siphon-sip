@@ -283,6 +283,44 @@ pub fn compute_auts(key: &[u8; 16], opc: &[u8; 16], rand: &[u8; 16], sqn_ms: &[u
     auts
 }
 
+/// Check an AUTS re-synchronisation token and recover the SQN_MS it conceals
+/// (3GPP TS 33.102 §6.3.5: the HE/AuC side of [`compute_auts`]).
+///
+/// `rand` is the RAND of the challenge the AUTS answers. SQN_MS is
+/// `AUTS[0..6] XOR AK*` with AK* from [`f5star`], and the token is genuine only
+/// when `AUTS[6..14]` equals the MAC-S [`f1star`] gives over that SQN_MS with
+/// the dummy all-zero AMF (§6.3.3). Returns `None` when it is not.
+pub fn verify_auts(
+    key: &[u8; 16],
+    opc: &[u8; 16],
+    rand: &[u8; 16],
+    auts: &[u8; 14],
+) -> Option<[u8; 6]> {
+    verify_auts_with_amf(key, opc, rand, auts, &[0, 0])
+}
+
+/// [`verify_auts`] over an explicit AMF, so the check can be held to the
+/// TS 35.208 test sets, whose f1* outputs are computed over each set's AMF.
+fn verify_auts_with_amf(
+    key: &[u8; 16],
+    opc: &[u8; 16],
+    rand: &[u8; 16],
+    auts: &[u8; 14],
+    amf: &[u8; 2],
+) -> Option<[u8; 6]> {
+    let ak_star = f5star(key, opc, rand);
+    let mut sqn_ms = [0u8; 6];
+    for index in 0..6 {
+        sqn_ms[index] = auts[index] ^ ak_star[index];
+    }
+    let expected_mac_s = f1star(key, opc, rand, &sqn_ms, amf);
+    let mut difference = 0u8;
+    for (expected, received) in expected_mac_s.iter().zip(&auts[6..14]) {
+        difference |= expected ^ received;
+    }
+    (difference == 0).then_some(sqn_ms)
+}
+
 /// Generate an AKA authentication vector with a random RAND.
 ///
 /// This is the main entry point for the P-CSCF/HSS to create a
@@ -673,6 +711,97 @@ mod tests {
             recovered[index] = auts[index] ^ ak_star[index];
         }
         assert_eq!(recovered, sqn_ms);
+    }
+
+    /// AUTS assembled by hand from the TS 35.208 Test Set 1 outputs, not by
+    /// [`compute_auts`]: (SQN ff9bb4d0b607 XOR f5* 451e8beca43b) || f1*
+    /// 01cfaf9ec4e871e9, over the set's own AMF b9b9.
+    #[test]
+    fn verify_auts_recovers_sqn_ms_from_test_set_1() {
+        let key = test_set_1_key();
+        let opc: [u8; 16] = hex_array("cd63cb71954a9f4e48a5994e37a02baf");
+        let auts: [u8; 14] = hex_array("ba853f3c123c01cfaf9ec4e871e9");
+        assert_eq!(
+            verify_auts_with_amf(&key, &opc, &test_set_1_rand(), &auts, &test_set_1_amf()),
+            Some(test_set_1_sqn())
+        );
+    }
+
+    /// K, OPc, RAND, SQN, AMF of a TS 35.208 test set.
+    type TestSet = ([u8; 16], [u8; 16], [u8; 16], [u8; 6], [u8; 2]);
+
+    /// TS 35.208 Test Set 3: K fec86ba6eb707ed08905757b1bb44b8f, RAND
+    /// 9f7c8d021accf4db213ccff0c7f71a6a, SQN 9d0277595ffc, AMF 725c, OP
+    /// dbc59adcb6f9a0ef735477b7fadf8374 -> OPc 1006020f0a478bf6b699f15c062e42b3,
+    /// f1* 95814ba2b3044324, f5* deacdd848cc6.
+    fn test_set_3() -> TestSet {
+        (
+            hex_array("fec86ba6eb707ed08905757b1bb44b8f"),
+            hex_array("1006020f0a478bf6b699f15c062e42b3"),
+            hex_array("9f7c8d021accf4db213ccff0c7f71a6a"),
+            hex_array("9d0277595ffc"),
+            hex_array("725c"),
+        )
+    }
+
+    #[test]
+    fn opc_f1star_and_f5star_match_test_set_3() {
+        let (key, opc, rand, sqn, amf) = test_set_3();
+        let op: [u8; 16] = hex_array("dbc59adcb6f9a0ef735477b7fadf8374");
+        assert_eq!(compute_opc(&key, &op), opc);
+        assert_eq!(
+            f1star(&key, &opc, &rand, &sqn, &amf),
+            hex_array::<8>("95814ba2b3044324")
+        );
+        assert_eq!(f5star(&key, &opc, &rand), hex_array::<6>("deacdd848cc6"));
+    }
+
+    /// (SQN 9d0277595ffc XOR f5* deacdd848cc6) || f1* 95814ba2b3044324.
+    #[test]
+    fn verify_auts_recovers_sqn_ms_from_test_set_3() {
+        let (key, opc, rand, sqn, amf) = test_set_3();
+        let auts: [u8; 14] = hex_array("43aeaaddd33a95814ba2b3044324");
+        assert_eq!(
+            verify_auts_with_amf(&key, &opc, &rand, &auts, &amf),
+            Some(sqn)
+        );
+    }
+
+    #[test]
+    fn verify_auts_refuses_a_changed_mac_s_or_sqn() {
+        let key = test_set_1_key();
+        let opc: [u8; 16] = hex_array("cd63cb71954a9f4e48a5994e37a02baf");
+        let amf = test_set_1_amf();
+        let rand = test_set_1_rand();
+        let genuine: [u8; 14] = hex_array("ba853f3c123c01cfaf9ec4e871e9");
+        for index in 0..14 {
+            let mut altered = genuine;
+            altered[index] ^= 0x01;
+            assert_eq!(
+                verify_auts_with_amf(&key, &opc, &rand, &altered, &amf),
+                None,
+                "{index}"
+            );
+        }
+        // A RAND other than the challenge's, and the real AMF in place of the
+        // zero one the UE uses (TS 33.102 §6.3.3), both fail.
+        let mut other_rand = rand;
+        other_rand[0] ^= 0x80;
+        assert_eq!(
+            verify_auts_with_amf(&key, &opc, &other_rand, &genuine, &amf),
+            None
+        );
+        assert_eq!(verify_auts(&key, &opc, &rand, &genuine), None);
+    }
+
+    /// The server agrees with the UE side: what [`compute_auts`] builds (zero
+    /// AMF), [`verify_auts`] accepts, recovering the same SQN_MS.
+    #[test]
+    fn verify_auts_accepts_what_compute_auts_builds() {
+        let (key, opc, rand, _, _) = test_set_3();
+        let sqn_ms: [u8; 6] = hex_array("000000000a40");
+        let auts = compute_auts(&key, &opc, &rand, &sqn_ms);
+        assert_eq!(verify_auts(&key, &opc, &rand, &auts), Some(sqn_ms));
     }
 
     // -- generate_vector_with_rand tests --

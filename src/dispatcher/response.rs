@@ -1210,13 +1210,11 @@ pub(super) fn handle_response(
             };
 
             // RFC 3329 §2.3.1: a later Security-Verify must mirror the
-            // Security-Server on this 401, so it is recorded on the SA pair it
-            // was built from before it goes to the UE.
-            if status_code == 401
-                && server_key.method == crate::sip::message::Method::Register
-                && message.headers.has("Security-Server")
-            {
-                ipsec_lifecycle::record_challenge(state, &message, source_addr, inbound_local_addr);
+            // Security-Server on a 401, recorded before it goes to the UE; a
+            // 2xx goes over the pair the REGISTER came over (TS 24.229 5.2.2.2).
+            if server_key.method == Method::Register {
+                let flow = (source_addr, inbound_local_addr);
+                ipsec_lifecycle::before_register_final(state, &message, status_code, flow);
             }
 
             // What the caller is sent moves the caller's dialog state.

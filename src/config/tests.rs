@@ -6187,3 +6187,36 @@ fn a_probe_listener_that_is_not_an_address_is_refused() {
         "{message}"
     );
 }
+
+fn aka_credentials_yaml(sqn_line: &str) -> Result<Config> {
+    Config::from_str(&format!(
+        "listen:\n  udp: [\"0.0.0.0:5060\"]\ndomain:\n  local: [\"example.com\"]\n\
+         auth:\n  aka_credentials:\n    \"001010000000001\":\n      \
+         k: \"465b5ce8b199b49faa5f0a2ee238a6bc\"\n      \
+         op: \"cdc202d5123e20f62b6d676ac72cb318\"\n{sqn_line}"
+    ))
+}
+
+#[test]
+fn aka_credential_sqn_is_optional_and_read_as_48_bit_hex() {
+    let unset = aka_credentials_yaml("").expect("config loads");
+    let credential = &unset.auth.aka_credentials["001010000000001"];
+    assert_eq!(credential.starting_sqn(), Ok(None));
+
+    let set = aka_credentials_yaml("      sqn: \"0000000004e0\"\n").expect("config loads");
+    let credential = &set.auth.aka_credentials["001010000000001"];
+    assert_eq!(credential.starting_sqn(), Ok(Some(0x4e0)));
+}
+
+#[test]
+fn aka_credential_sqn_that_is_not_48_bit_hex_is_refused_at_load() {
+    for bad in ["\"4e0\"", "\"00000000000g\"", "\"0000000000001\""] {
+        let error = aka_credentials_yaml(&format!("      sqn: {bad}\n"))
+            .expect_err("a malformed sqn must be refused");
+        let message = error.to_string();
+        assert!(
+            message.contains("auth.aka_credentials.001010000000001"),
+            "{message}"
+        );
+    }
+}

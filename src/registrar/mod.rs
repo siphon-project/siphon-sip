@@ -1315,57 +1315,6 @@ impl Registrar {
         result
     }
 
-    /// Remove a specific contact URI from an AoR.
-    pub fn remove_contact(&self, aor: &str, contact_uri: &str) {
-        let primary = self.resolve_alias(aor);
-        let aor = primary.as_str();
-        let mut tokens_to_remove: Vec<String> = Vec::new();
-        let mut conns_to_deindex: Vec<u64> = Vec::new();
-        if let Some(mut entry) = self.bindings.get_mut(aor) {
-            let before = entry.value().len();
-            let indexed = self.contact_index.keys_of(entry.value());
-            entry.value_mut().retain(|c| {
-                if c.uri.to_string() == contact_uri {
-                    if let Some(token) = &c.flow_token {
-                        tokens_to_remove.push(token.to_string());
-                    }
-                    if is_stream_transport(c.source_transport) {
-                        if let Some(id) = c.inbound_connection_id {
-                            conns_to_deindex.push(id);
-                        }
-                    }
-                    false
-                } else {
-                    true
-                }
-            });
-            let removed = entry.value().len() < before;
-            self.contact_index
-                .replace(aor, indexed, self.contact_index.keys_of(entry.value()));
-            let aor_empty = entry.value().is_empty();
-            if aor_empty {
-                drop(entry);
-                self.bindings.remove(aor);
-            }
-            for token in &tokens_to_remove {
-                self.tokens.remove(token);
-            }
-            for id in &conns_to_deindex {
-                self.deindex_connection(*id, aor);
-            }
-            if removed {
-                if aor_empty {
-                    if let Some(metrics) = crate::metrics::try_metrics() {
-                        metrics.registrations_active.dec();
-                    }
-                }
-                self.emit_event(RegistrationEvent::Deregistered {
-                    aor: aor.to_string(),
-                });
-            }
-        }
-    }
-
     /// Save an application-server-side contact captured from a 3PR 200 OK
     /// (3GPP TS 24.229 §5.4.2.1.2).
     ///
