@@ -159,6 +159,9 @@ impl SendQueue {
         }
         let length = frame.len();
         let limit = self.shared.limit;
+        // `fetch_update` is deprecated from Rust 1.99 for `try_update`, which
+        // the MSRV does not have. Same operation under either name.
+        #[allow(deprecated)]
         let reserved =
             self.shared
                 .queued
