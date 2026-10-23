@@ -581,6 +581,44 @@ pub(crate) fn pool_test_guard() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(|poison| poison.into_inner())
 }
 
+/// Long-lived runtime the test pools' threads enter: a per-test runtime would
+/// be torn down underneath them.
+#[cfg(test)]
+pub(crate) fn test_pools_runtime() -> &'static tokio::runtime::Runtime {
+    static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .thread_name("test-pools-rt")
+            .build()
+            .expect("a test runtime")
+    })
+}
+
+/// The Python executor and the async pool, as a running server has them. The
+/// first test module to install a pool wins, so callers read sizes back rather
+/// than assume them.
+#[cfg(test)]
+pub(crate) fn ensure_test_pools() -> (Arc<crate::script::py_executor::PyExecutor>, Arc<AsyncPool>) {
+    Python::initialize();
+    let executor = crate::script::py_executor::PyExecutor::install(
+        test_pools_runtime().handle().clone(),
+        crate::script::py_executor::ExecutorConfig {
+            core_threads: 3,
+            max_threads: 3,
+            queue_capacity: 1024,
+            stall_abort: None,
+        },
+    );
+    let async_pool = AsyncPool::install(
+        2,
+        test_pools_runtime().handle().clone(),
+        Duration::from_secs(3),
+    );
+    (executor, async_pool)
+}
+
 /// Convenience wrapper used by tests — fail fast if the pool isn't
 /// installed instead of silently falling back to the legacy path.
 #[cfg(test)]
@@ -692,6 +730,14 @@ impl PendingCoroutine {
         }
     }
 
+    /// Wait for the coroutine's result from async code: no executor worker is
+    /// held and, unless it times out, the interpreter is not attached. On
+    /// timeout the coroutine is cancelled and this pending entry is gone, as
+    /// on every other way out.
+    pub(crate) async fn wait(self) -> PyResult<Py<PyAny>> {
+        self.settle().await.into_result()
+    }
+
     /// Wait without holding an executor worker: [`settle`](Self::settle) on a
     /// tokio task, then `resume` with the coroutine's result as a job on the
     /// Python executor.
@@ -710,7 +756,7 @@ impl PendingCoroutine {
             let settled = self.settle().await;
             let queued = crate::script::py_executor::spawn_queued(move || {
                 Python::attach(|python| {
-                    let result = settled.into_result(python);
+                    let result = settled.into_result();
                     resume(python, result);
                 });
             })
@@ -730,13 +776,17 @@ impl SettledCoroutine {
     /// exception, a lost driver, or the timeout — on which the coroutine is
     /// cancelled, since abandoning it alone would trade a wedged worker for a
     /// task that lives for ever.
-    pub(crate) fn into_result(self, python: Python<'_>) -> PyResult<Py<PyAny>> {
+    ///
+    /// Only the timeout attaches to the interpreter (to cancel the coroutine
+    /// and name it). A settled coroutine's result is handed back as it is, so
+    /// a caller awaiting on a tokio task pays no attach for the common case.
+    pub(crate) fn into_result(self) -> PyResult<Py<PyAny>> {
         match self.outcome {
             Ok(Ok(result)) => result,
             Ok(Err(_recv_err)) => Err(PyValueError::new_err(
                 "async pool driver dropped the coroutine sender before completion",
             )),
-            Err(_elapsed) => {
+            Err(_elapsed) => Python::attach(|python| {
                 let cancelled = self
                     .future
                     .bind(python)
@@ -757,7 +807,7 @@ impl SettledCoroutine {
                     "async handler '{handler}' did not settle within {}s",
                     self.timeout.as_secs()
                 )))
-            }
+            }),
         }
     }
 }
@@ -812,7 +862,7 @@ pub(crate) fn run_coroutine_via_pool(
     // idle workers and an empty queue.
     let settled =
         python.detach(|| tokio::task::block_in_place(|| runtime.block_on(pending.settle())));
-    settled.into_result(python).map(Some)
+    settled.into_result().map(Some)
 }
 
 /// The handler name behind a coroutine object, for the timeout log line.

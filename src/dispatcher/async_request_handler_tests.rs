@@ -14,39 +14,19 @@ use std::time::{Duration, Instant};
 use super::test_dispatcher::{test_dispatcher_with_script, TestDispatcher};
 use super::*;
 use crate::script::async_pool::AsyncPool;
-use crate::script::py_executor::{ExecutorConfig, PyExecutor};
+use crate::script::py_executor::PyExecutor;
 
 const SOURCE: &str = "192.0.2.40:5070";
 
 /// Long-lived runtime the pools' threads enter: a per-test runtime would be
 /// torn down underneath them.
 pub(super) fn test_runtime() -> &'static tokio::runtime::Runtime {
-    static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
-    RUNTIME.get_or_init(|| {
-        tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(4)
-            .enable_all()
-            .thread_name("async-request-test-rt")
-            .build()
-            .expect("a test runtime")
-    })
+    crate::script::async_pool::test_pools_runtime()
 }
 
-/// Both pools, as a running server has them. Whichever test module installs a
-/// pool first wins, so the sizes are read back rather than assumed.
+/// Both pools, as a running server has them.
 pub(super) fn ensure_pools() -> (Arc<PyExecutor>, Arc<AsyncPool>) {
-    Python::initialize();
-    let executor = PyExecutor::install(
-        test_runtime().handle().clone(),
-        ExecutorConfig {
-            core_threads: 3,
-            max_threads: 3,
-            queue_capacity: 1024,
-            stall_abort: None,
-        },
-    );
-    let async_pool = AsyncPool::install(2, test_runtime().handle().clone(), Duration::from_secs(3));
-    (executor, async_pool)
+    crate::script::async_pool::ensure_test_pools()
 }
 
 fn message(call_id: &str, extra_headers: &str) -> String {

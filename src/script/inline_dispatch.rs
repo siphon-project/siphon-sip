@@ -254,9 +254,8 @@ pub(crate) fn run_coroutine_value(
 
 /// What [`start_coroutine`] did with a coroutine.
 pub(crate) enum CoroutineStart {
-    /// It ran to the end here. A request handler's return value means
-    /// nothing, so it is not kept.
-    Finished,
+    /// It ran to the end here; this is its value.
+    Finished(Py<PyAny>),
     /// It is running on an asyncio driver. The caller waits for it with
     /// [`PendingCoroutine::resume_on_executor`] and continues from there.
     Suspended(PendingCoroutine),
@@ -274,8 +273,8 @@ pub(crate) fn start_coroutine(
     python: Python<'_>,
     coroutine: &Bound<'_, pyo3::PyAny>,
 ) -> PyResult<CoroutineStart> {
-    if run_coroutine_inline(python, coroutine)?.is_some() {
-        return Ok(CoroutineStart::Finished);
+    if let Some(value) = run_coroutine_inline(python, coroutine)? {
+        return Ok(CoroutineStart::Finished(value));
     }
     if crate::script::py_executor::on_worker_thread()
         && tokio::runtime::Handle::try_current().is_ok()
@@ -285,7 +284,7 @@ pub(crate) fn start_coroutine(
                 .map(CoroutineStart::Suspended);
         }
     }
-    drive_suspending_coroutine(python, coroutine).map(|_| CoroutineStart::Finished)
+    drive_suspending_coroutine(python, coroutine).map(CoroutineStart::Finished)
 }
 
 /// Run a coroutine that may suspend to completion, blocking this thread: on
