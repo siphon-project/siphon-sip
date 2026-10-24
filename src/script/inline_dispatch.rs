@@ -122,7 +122,12 @@ fn analyse_code_for_suspension(python: Python<'_>, code: &Bound<'_, PyAny>) -> P
 /// `_Py_DecRefShared` from objects crossing between the worker and driver
 /// threads. None of that is needed for a coroutine that completes on its first
 /// step.
-pub(crate) fn run_coroutine_inline<'py>(
+///
+/// Public for extension crates dispatching their own `async def` handlers: call
+/// it attached, on the thread that would otherwise hand the coroutine to an
+/// asyncio driver, and fall back to that driver on `Ok(None)`. Safe for any
+/// coroutine: one whose code can suspend is left untouched.
+pub fn run_coroutine_inline<'py>(
     python: Python<'py>,
     coroutine: &Bound<'py, PyAny>,
 ) -> PyResult<Option<Py<PyAny>>> {
@@ -289,6 +294,7 @@ pub(crate) fn start_coroutine(
 
 /// Run a coroutine that may suspend to completion, blocking this thread: on
 /// the async pool when one is installed, else on this thread's own loop.
+#[allow(clippy::disallowed_methods)] // drives an asyncio loop attached: bytecode reaches safe points
 fn drive_suspending_coroutine(
     python: Python<'_>,
     coroutine: &Bound<'_, pyo3::PyAny>,

@@ -58,7 +58,14 @@ where
 /// The awaitable counterpart of [`detach_block_on`]: the calling thread
 /// returns immediately, so an asyncio driver keeps turning its other
 /// coroutines while this runs.
-pub(crate) fn awaitable<'py, F, T>(python: Python<'py>, future: F) -> PyResult<Bound<'py, PyAny>>
+///
+/// Public for extension crates. `future` runs on a tokio worker, so it must
+/// not attach to the interpreter: return plain Rust (or a `#[pyclass]`), or a
+/// [`crate::script::Deferred`] that builds the Python value. The conversion
+/// runs in the completion step, off the workers. Called from a synchronous
+/// handler (no running event loop) it fails with an error that says to make
+/// the handler `async def`.
+pub fn awaitable<'py, F, T>(python: Python<'py>, future: F) -> PyResult<Bound<'py, PyAny>>
 where
     F: Future<Output = PyResult<T>> + Send + 'static,
     T: for<'a> IntoPyObject<'a> + Send + 'static,
@@ -115,7 +122,8 @@ fn explain_missing_loop(error: PyErr) -> PyErr {
 /// `Python::attach` re-attaches cheaply when one is already held. `future` and
 /// its output must not hold Python references (`Ungil`); blocking Rust-API
 /// futures never do.
-pub(crate) fn detach_block_on<F>(future: F) -> F::Output
+#[allow(clippy::disallowed_methods)] // the wait runs inside its own python.detach
+pub fn detach_block_on<F>(future: F) -> F::Output
 where
     F: Future + pyo3::marker::Ungil + Send,
     F::Output: pyo3::marker::Ungil + Send,
@@ -136,13 +144,14 @@ where
 /// caller. Attached and blocked is the stop-the-world deadlock
 /// [`detach_block_on`] describes; unlike it, this does not attach first, so a
 /// detached caller pays nothing on the hot path.
-pub(crate) fn blocking_released<T>(work: impl FnOnce() -> T) -> T {
+#[allow(clippy::disallowed_methods)] // the released helper itself
+pub fn blocking_released<T>(work: impl FnOnce() -> T) -> T {
     released(|| tokio::task::block_in_place(work))
 }
 
 /// Run `work` released from the interpreter if this thread is attached to it,
 /// as it is; for a wait that already happens off tokio's workers.
-pub(crate) fn released<T>(work: impl FnOnce() -> T) -> T {
+pub fn released<T>(work: impl FnOnce() -> T) -> T {
     // SAFETY: `PyGILState_Check` only reads this thread's own thread state and
     // is defined before the interpreter is initialised (it then reports 0).
     let attached = unsafe { pyo3::ffi::PyGILState_Check() } == 1;
@@ -163,7 +172,8 @@ pub(crate) fn released<T>(work: impl FnOnce() -> T) -> T {
 }
 
 /// [`blocking_released`] for a tokio future: `Handle::current().block_on`.
-pub(crate) fn block_on_released<F: Future>(future: F) -> F::Output {
+#[allow(clippy::disallowed_methods)] // the released helper itself
+pub fn block_on_released<F: Future>(future: F) -> F::Output {
     blocking_released(|| tokio::runtime::Handle::current().block_on(future))
 }
 
@@ -242,11 +252,34 @@ mod tests {
     #[test]
     fn no_dispatcher_or_transport_wait_can_block_while_attached() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        // Files still waiting to move onto the helpers. Empty: keep it so.
-        const PENDING: &[&str] = &[];
+        // Owned by the IPsec work that makes this hook non-blocking; it moves
+        // onto the helpers with that change.
+        const PENDING: &[&str] = &[
+            "src/ipsec/manager_async.rs",
+            "src/ipsec/runtime.rs",
+        ];
+        // Waits that are right as written, each with the reason. Matched on
+        // the file and a fragment of the line, so a new wait in the same file
+        // is still caught.
+        const EXEMPT: &[(&str, &str)] = &[
+            // The helpers themselves: the wait inside `detach_block_on` runs
+            // inside its own `python.detach`.
+            ("src/script/blocking.rs", "block_in_place(|| tokio::runtime::Handle::current().block_on(future))"),
+            // Inside `python.detach(...)` on the same line.
+            ("src/script/async_pool.rs", "python.detach(|| tokio::task::block_in_place(|| runtime.block_on(pending.settle())))"),
+            // Drives an asyncio loop with `run_until_complete`: the thread runs
+            // the loop's bytecode attached and reaches safe points; releasing
+            // the interpreter here would be wrong. Fallback without the pool.
+            ("src/script/inline_dispatch.rs", "tokio::task::block_in_place(|| {"),
+            // The process entry point: `run()` blocks the main thread on the
+            // server future before anything has attached.
+            ("src/server/mod.rs", "runtime.block_on(self.run_async())"),
+        ];
 
         let mut offenders = Vec::new();
-        let mut directories = vec![root.join("src/dispatcher"), root.join("src/transport")];
+        // The whole crate: any synchronous Rust can be reached from an
+        // attached caller (a script API, an extension, a resumed handler).
+        let mut directories = vec![root.join("src")];
         while let Some(directory) = directories.pop() {
             for entry in std::fs::read_dir(&directory).expect("source directory is readable") {
                 let path = entry.expect("directory entry is readable").path();
@@ -271,16 +304,20 @@ mod tests {
                 let source = std::fs::read_to_string(&path).expect("source file is readable");
                 // Inline `#[cfg(test)] mod tests` sit at the end of the file.
                 let production = source.split("#[cfg(test)]\nmod ").next().unwrap_or("");
-                // A wait counts as released when `released(` opens on its line
-                // or the one before (rustfmt breaks the closure after it).
                 let mut previous = "";
                 for (number, line) in production.lines().enumerate() {
                     let code = line.split("//").next().unwrap_or("");
                     let waits = code.contains("block_in_place(") || code.contains(".block_on(");
-                    if waits && !code.contains("released(") && !previous.contains("released(") {
+                    // `released(|| {` wrapping the wait from the line above.
+                    let wrapped = previous.trim_end().ends_with("released(|| {")
+                        || previous.trim_end().ends_with("released(move || {");
+                    previous = code;
+                    let exempt = EXEMPT
+                        .iter()
+                        .any(|(file, fragment)| *file == relative && code.contains(fragment));
+                    if waits && !code.contains("released(") && !wrapped && !exempt {
                         offenders.push(format!("{relative}:{}", number + 1));
                     }
-                    previous = code;
                 }
             }
         }

@@ -292,8 +292,10 @@ impl std::hash::Hash for RequestUriFilter {
 #[derive(Debug, Clone)]
 pub struct HandlerEntry {
     pub kind: HandlerKind,
-    /// The Python callable (function / coroutine function).
-    pub callable: Py<PyAny>,
+    /// The Python callable (function / coroutine function). Shared, so a
+    /// clone of the entry (or a [`crate::script::HandlerHandle`] of it) is an
+    /// `Arc` bump that needs no attach.
+    pub callable: Arc<Py<PyAny>>,
     /// `true` when `asyncio.iscoroutinefunction(callable)` returned `True`.
     pub is_async: bool,
     /// Optional per-handler metadata dict carried through from the
@@ -302,7 +304,10 @@ pub struct HandlerEntry {
     /// (e.g. HTTP route methods, audit-sink filters). Built-in kinds
     /// that carry their own typed fields inside the variant leave this
     /// `None`.
-    pub options: Option<Py<PyDict>>,
+    pub options: Option<Arc<Py<PyDict>>>,
+    /// [`Self::options`] as Rust data, captured at registration (see
+    /// [`crate::script::HandlerHandle::options_value`]).
+    pub options_value: Option<Arc<serde_json::Value>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -550,6 +555,35 @@ impl ScriptEngine {
     ///
     /// Called after every script load/reload and once at server startup.
     pub fn restart_timers(&self) {
+        // Clone the callbacks before taking the handle lock: attaching while
+        // holding a Rust lock is the lock-order half of the stop-the-world
+        // deadlock (see `crate::script::blocking`). Attach before cloning —
+        // `restart_timers` runs outside any attach scope (server startup / hot
+        // reload), and on free-threaded Python cloning a `Py<>` while detached
+        // panics ("Cannot clone pointer into Python heap without the thread
+        // being attached"), crashing any `@timer.every` script.
+        let state = self.state.load();
+        let timers: Vec<(Py<PyAny>, bool, String, u64, u64)> = Python::attach(|python| {
+            state
+                .timer_handlers()
+                .into_iter()
+                .filter_map(|handler| match handler.kind {
+                    HandlerKind::TimerEvery {
+                        interval_secs,
+                        ref name,
+                        jitter_secs,
+                    } => Some((
+                        handler.callable.clone_ref(python),
+                        handler.is_async,
+                        name.clone(),
+                        interval_secs,
+                        jitter_secs,
+                    )),
+                    _ => None,
+                })
+                .collect()
+        });
+
         let mut handles = self.timer_handles.lock().unwrap_or_else(|e| e.into_inner());
 
         // Abort all existing timer tasks.
@@ -557,37 +591,18 @@ impl ScriptEngine {
             handle.abort();
         }
 
-        let state = self.state.load();
-        for handler in state.timer_handlers() {
-            if let HandlerKind::TimerEvery {
-                interval_secs,
-                ref name,
-                jitter_secs,
-            } = handler.kind
-            {
-                // Attach before cloning the Py callback — `restart_timers`
-                // runs outside any attach scope (server startup / hot reload),
-                // and on free-threaded Python cloning a `Py<>` while detached
-                // panics ("Cannot clone pointer into Python heap without the
-                // thread being attached"), crashing any `@timer.every` script.
-                let callable = Python::attach(|python| handler.callable.clone_ref(python));
-                let is_async = handler.is_async;
-                let timer_name = name.clone();
-                let interval = interval_secs;
-                let jitter = jitter_secs;
+        for (callable, is_async, timer_name, interval, jitter) in timers {
+            info!(
+                name = %timer_name,
+                interval_secs = interval,
+                jitter_secs = jitter,
+                "starting timer"
+            );
 
-                info!(
-                    name = %timer_name,
-                    interval_secs = interval,
-                    jitter_secs = jitter,
-                    "starting timer"
-                );
-
-                let handle = tokio::spawn(async move {
-                    timer_loop(callable, is_async, interval, jitter, timer_name).await;
-                });
-                handles.push(handle);
-            }
+            let handle = tokio::spawn(async move {
+                timer_loop(callable, is_async, interval, jitter, timer_name).await;
+            });
+            handles.push(handle);
         }
     }
 
@@ -1001,7 +1016,7 @@ fn get_or_create_registry(python: Python<'_>) -> Result<Bound<'_, PyAny>> {
 }
 
 /// Read the handlers list from the Python registry and convert to Rust types.
-fn extract_handlers(_python: Python<'_>, registry: &Bound<'_, PyAny>) -> Result<Vec<HandlerEntry>> {
+fn extract_handlers(python: Python<'_>, registry: &Bound<'_, PyAny>) -> Result<Vec<HandlerEntry>> {
     let entries = registry
         .getattr("entries")
         .map_err(|error| SiphonError::Script(format!("registry.entries: {error}")))?
@@ -1255,19 +1270,46 @@ fn extract_handlers(_python: Python<'_>, registry: &Bound<'_, PyAny>) -> Result<
             HandlerKind::Custom { .. } => metadata
                 .as_ref()
                 .and_then(|m| m.cast::<PyDict>().ok())
-                .map(|d| d.clone().unbind()),
+                .cloned(),
             _ => None,
         };
+        let options_value = options
+            .as_ref()
+            .and_then(|dict| options_as_json(python, dict))
+            .map(Arc::new);
 
         handlers.push(HandlerEntry {
             kind,
-            callable,
+            callable: Arc::new(callable),
             is_async,
-            options,
+            options: options.map(|dict| Arc::new(dict.unbind())),
+            options_value,
         });
     }
 
     Ok(handlers)
+}
+
+/// A handler's options dict as JSON, any value JSON cannot hold given as its
+/// `repr()`. `None` only when even that fails (logged).
+fn options_as_json(python: Python<'_>, options: &Bound<'_, PyDict>) -> Option<serde_json::Value> {
+    let encoded = python
+        .import("json")
+        .and_then(|json| {
+            let kwargs = PyDict::new(python);
+            kwargs.set_item("default", python.import("builtins")?.getattr("repr")?)?;
+            json.call_method("dumps", (options,), Some(&kwargs))
+        })
+        .and_then(|text| text.extract::<String>());
+    match encoded {
+        Ok(text) => serde_json::from_str(&text)
+            .map_err(|error| warn!(%error, "handler options did not round-trip through JSON"))
+            .ok(),
+        Err(error) => {
+            warn!(%error, "handler options could not be read as JSON");
+            None
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -155,10 +155,11 @@ impl PyRegistration {
         };
 
         let destination: std::net::SocketAddr = host_with_port.parse().or_else(|_| {
-            // Not a raw IP:port — try DNS resolution
-            use std::net::ToSocketAddrs;
-            host_with_port
-                .to_socket_addrs()
+            // Not a raw IP:port — try DNS resolution, with the interpreter
+            // released for the lookup (this runs attached, often at script top
+            // level during a reload).
+            crate::script::waits::resolve_socket_addrs(&host_with_port)
+                .map(Vec::into_iter)
                 .map_err(|e| {
                     pyo3::exceptions::PyValueError::new_err(format!(
                         "cannot resolve registrar address '{registrar}': {e}"

@@ -435,9 +435,45 @@ fn resolve_raw_answer_to_tag(
         .unwrap_or_else(crate::transaction::state::generate_uas_to_tag)
 }
 
+/// Arm `answer_local`'s automatic 488 on the call.
+///
+/// `try_borrow_mut`, not `borrow_mut`: the call can be borrowed elsewhere at
+/// the moment the engine answers (a handler is inside one of its methods on
+/// another thread), and a panic here would leave the awaiting script hanging
+/// instead of told.
+pub(super) fn arm_auto_reject(call: &Bound<'_, PyCall>) -> PyResult<()> {
+    let mut call = call.try_borrow_mut().map_err(|error| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "answer_local could not arm the 488 Not Acceptable Here: the call is in use ({error})"
+        ))
+    })?;
+    call.set_reject(488, "Not Acceptable Here");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `answer_local`'s auto-488 is armed with `try_borrow_mut`: a call that is
+    /// borrowed elsewhere when the engine answers gets an error back, not a
+    /// panic in the completion step that would leave the script awaiting.
+    #[test]
+    fn auto_reject_on_a_borrowed_call_is_an_error_not_a_panic() {
+        pyo3::Python::initialize();
+        Python::attach(|py| {
+            let bound = &call_on(py, offerless_invite("borrowed-call@192.0.2.20"));
+            {
+                let _held = bound.borrow_mut();
+                assert!(arm_auto_reject(bound).is_err());
+            }
+            arm_auto_reject(bound).expect("armed once the call is free");
+            assert!(matches!(
+                bound.borrow().action(),
+                crate::script::api::call::CallAction::Reject { code: 488, .. }
+            ));
+        });
+    }
 
     use pyo3::types::{PyBytes, PyString, PyTuple};
 

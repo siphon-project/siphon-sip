@@ -6,6 +6,7 @@
 //! codec-filtered, and re-serialized on the INVITE/200 path. This is on the
 //! same per-call datapath as SIP parsing itself — string-heavy, siphon-owned,
 //! and run once (often twice) per call. Gated by `scripts/bench_regression.sh`.
+#![allow(clippy::disallowed_methods)] // test, bench and example code may block
 
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use siphon::media::sdp::{strip_attributes, SdpBody};

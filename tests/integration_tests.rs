@@ -2,9 +2,14 @@
 //!
 //! Includes cross-module integration tests that verify interactions between
 //! the SIP parser, builder, config, registrar, dialog store, and transaction layers.
+#![allow(clippy::disallowed_methods)] // test, bench and example code may block
 
 #[path = "integration/auth_tests.rs"]
 mod auth_tests;
+
+// The released-wait helpers extensions use.
+#[path = "integration/blocking_api_tests.rs"]
+mod blocking_api_tests;
 
 #[path = "integration/security_tests.rs"]
 mod security_tests;

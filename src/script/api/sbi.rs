@@ -111,10 +111,10 @@ impl PySbi {
 
         crate::script::awaitable(python, async move {
             match bsf.discover_binding(&query).await {
-                Ok(Some(binding)) => Python::attach(|python| {
+                Ok(Some(binding)) => Ok(crate::script::Deferred::build(move |python| {
                     binding_to_pydict(python, &binding, scheme).map(|dict| Some(dict.unbind()))
-                }),
-                Ok(None) => Ok(None),
+                })),
+                Ok(None) => Ok(crate::script::Deferred::none()),
                 Err(error) => Err(BsfError::new_err(format!(
                     "sbi.discover_pcf_binding failed: {error}"
                 ))),
@@ -227,13 +227,13 @@ impl PySbi {
                         sip_call_id = sip_call_id.as_deref(),
                         "sbi.create_session: app session created"
                     );
-                    Python::attach(|python| {
+                    Ok(crate::script::Deferred::build(move |python| {
                         let dict = PyDict::new(python);
                         dict.set_item("app_session_id", &created.app_session_id)?;
                         dict.set_item("authorized", created.authorized)?;
                         dict.set_item("app_session_uri", created.location)?;
                         Ok(Some(dict.unbind()))
-                    })
+                    }))
                 }
                 Err(error) => {
                     warn!(
@@ -241,7 +241,7 @@ impl PySbi {
                         sip_call_id = sip_call_id.as_deref(),
                         "sbi.create_session failed"
                     );
-                    Ok(None)
+                    Ok(crate::script::Deferred::none())
                 }
             }
         })
@@ -326,7 +326,7 @@ impl PySbi {
 
         crate::script::awaitable(python, async move {
             match client.update_app_session(&sid, &update_data).await {
-                Ok(()) => Python::attach(|python| {
+                Ok(()) => Ok(crate::script::Deferred::build(move |python| {
                     // The modify response (the updated AppSessionContext)
                     // carries no flat id; echo the bare id from the ref the
                     // caller passed.
@@ -334,10 +334,10 @@ impl PySbi {
                     dict.set_item("app_session_id", app_session_id_from_location(&sid))?;
                     dict.set_item("authorized", true)?;
                     Ok(Some(dict.unbind()))
-                }),
+                })),
                 Err(error) => {
                     warn!(error = %error, "sbi.update_session failed");
-                    Ok(None)
+                    Ok(crate::script::Deferred::none())
                 }
             }
         })

@@ -190,43 +190,35 @@ pub(super) fn handle_srs_invite(
             "SRS: parsed SIPREC metadata"
         );
 
-        // Invoke Python @srs.on_invite handler if registered.
-        let should_accept = {
-            let engine_state = state.engine.state();
-            let srs_handlers = engine_state.handlers_for(&HandlerKind::SrsOnInvite);
-            if !srs_handlers.is_empty() {
-                let py_metadata =
-                    crate::script::api::srs::PyRecordingMetadata::from_metadata(&metadata);
-                let result = pyo3::Python::attach(|python| {
-                    let py_meta = match pyo3::Py::new(python, py_metadata) {
-                        Ok(meta) => meta,
-                        Err(error) => {
-                            warn!(call_id = %call_id, error = %error, "SRS: failed to create PyRecordingMetadata");
-                            return true; // Accept on error
-                        }
-                    };
-                    for handler in &srs_handlers {
-                        match handler.callable.call1(python, (py_meta.clone_ref(python),)) {
-                            Ok(result) => {
-                                if let Ok(accepted) = result.extract::<bool>(python) {
-                                    if !accepted {
-                                        return false;
-                                    }
-                                }
-                            }
-                            Err(error) => {
-                                warn!(call_id = %call_id, error = %crate::script::error_report::describe(python, &error), "SRS: on_invite handler error");
-                            }
-                        }
-                    }
+        // Invoke Python @srs.on_invite handler if registered. On the Python
+        // executor, never on this tokio worker: an attach here parks the worker
+        // through every garbage collection's stop-the-world, and a handler
+        // that runs long stops whatever else the worker was driving.
+        let has_handlers = !state
+            .engine
+            .state()
+            .handlers_for(&HandlerKind::SrsOnInvite)
+            .is_empty();
+        let should_accept = if has_handlers {
+            let py_metadata =
+                crate::script::api::srs::PyRecordingMetadata::from_metadata(&metadata);
+            let job_state = Arc::clone(&state);
+            let job_call_id = call_id.clone();
+            match crate::script::py_executor::try_run(move || {
+                run_srs_invite_handlers(&job_state, py_metadata, &job_call_id)
+            })
+            .await
+            {
+                Ok(accepted) => accepted,
+                Err(_) => {
+                    // Accept, as a handler that raised does: the recording is
+                    // the safe default and the shed is already counted.
+                    warn!(call_id = %call_id, "SRS: on_invite handler did not run; accepting");
                     true
-                });
-                drop(engine_state);
-                result
-            } else {
-                drop(engine_state);
-                true
+                }
             }
+        } else {
+            true
         };
 
         if !should_accept {
@@ -541,27 +533,106 @@ pub(super) fn handle_srs_bye(
 
         // Store recording metadata via configured backend.
         if let Some(record) = record {
-            // Invoke @srs.on_session_end hook.
-            {
-                let engine_state = state.engine.state();
-                let end_handlers = engine_state.handlers_for(&HandlerKind::SrsOnSessionEnd);
-                if !end_handlers.is_empty() {
-                    let py_session = crate::script::api::srs::PySrsSession::from_record(&record);
-                    pyo3::Python::attach(|python| {
-                        if let Ok(py_sess) = pyo3::Py::new(python, py_session) {
-                            for handler in &end_handlers {
-                                if let Err(error) =
-                                    handler.callable.call1(python, (py_sess.clone_ref(python),))
-                                {
-                                    warn!(call_id = %call_id, error = %crate::script::error_report::describe(python, &error), "SRS: on_session_end handler error");
-                                }
-                            }
-                        }
-                    });
+            // Invoke @srs.on_session_end hook, on the Python executor (see
+            // the on_invite dispatch above for why not on this worker).
+            let has_handlers = !state
+                .engine
+                .state()
+                .handlers_for(&HandlerKind::SrsOnSessionEnd)
+                .is_empty();
+            if has_handlers {
+                let py_session = crate::script::api::srs::PySrsSession::from_record(&record);
+                let job_state = Arc::clone(&state);
+                let job_call_id = call_id.clone();
+                if crate::script::py_executor::try_run(move || {
+                    run_srs_session_end_handlers(&job_state, py_session, &job_call_id);
+                })
+                .await
+                .is_err()
+                {
+                    warn!(call_id = %call_id, "SRS: on_session_end handler did not run");
                 }
             }
 
             crate::srs::storage::store_recording(srs_manager.config(), &record).await;
+        }
+    });
+}
+
+/// Run the `@srs.on_invite` handlers on the Python executor. `false` when one
+/// declines the recording. An `async def` handler is awaited, with the thread
+/// released from the interpreter while its coroutine runs on an asyncio driver.
+fn run_srs_invite_handlers(
+    state: &DispatcherState,
+    metadata: crate::script::api::srs::PyRecordingMetadata,
+    call_id: &str,
+) -> bool {
+    let engine_state = state.engine.state();
+    let handlers = engine_state.handlers_for(&HandlerKind::SrsOnInvite);
+    crate::script::attach::attach(|python| {
+        let metadata = match pyo3::Py::new(python, metadata) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                warn!(call_id = %call_id, error = %error, "SRS: failed to create PyRecordingMetadata");
+                return true; // Accept on error
+            }
+        };
+        for handler in &handlers {
+            let returned = handler
+                .callable
+                .bind(python)
+                .call1((metadata.clone_ref(python),))
+                .and_then(|returned| {
+                    if handler.is_async {
+                        crate::script::engine::run_coroutine_value(python, &returned)
+                            .map(|value| value.into_bound(python))
+                    } else {
+                        Ok(returned)
+                    }
+                });
+            match returned {
+                Ok(result) => {
+                    if let Ok(false) = result.extract::<bool>() {
+                        return false;
+                    }
+                }
+                Err(error) => {
+                    warn!(call_id = %call_id, error = %crate::script::error_report::describe(python, &error), "SRS: on_invite handler error");
+                }
+            }
+        }
+        true
+    })
+}
+
+/// Run the `@srs.on_session_end` handlers on the Python executor, awaiting an
+/// `async def` one.
+fn run_srs_session_end_handlers(
+    state: &DispatcherState,
+    session: crate::script::api::srs::PySrsSession,
+    call_id: &str,
+) {
+    let engine_state = state.engine.state();
+    let handlers = engine_state.handlers_for(&HandlerKind::SrsOnSessionEnd);
+    crate::script::attach::attach(|python| {
+        let Ok(session) = pyo3::Py::new(python, session) else {
+            return;
+        };
+        for handler in &handlers {
+            let outcome = handler
+                .callable
+                .bind(python)
+                .call1((session.clone_ref(python),))
+                .and_then(|returned| {
+                    if handler.is_async {
+                        crate::script::engine::run_coroutine(python, &returned)
+                    } else {
+                        Ok(())
+                    }
+                });
+            if let Err(error) = outcome {
+                warn!(call_id = %call_id, error = %crate::script::error_report::describe(python, &error), "SRS: on_session_end handler error");
+            }
         }
     });
 }

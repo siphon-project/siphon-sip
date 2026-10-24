@@ -36,9 +36,20 @@ use crate::script::engine::run_coroutine;
 /// Per-process registry of live one-shot timers, keyed by user-supplied string.
 ///
 /// Setting the same key twice cancels the previous timer and reschedules.
+///
+/// Each arming gets a generation, so a timer that fires can only retire its
+/// own entry: a handler that re-arms its key (or another thread that does)
+/// keeps the new timer registered and cancellable.
 #[derive(Default)]
 pub struct TimerScheduler {
-    timers: DashMap<String, JoinHandle<()>>,
+    timers: DashMap<String, ArmedTimer>,
+    generations: std::sync::atomic::AtomicU64,
+}
+
+/// One armed timer: its task and the arming it belongs to.
+struct ArmedTimer {
+    generation: u64,
+    task: JoinHandle<()>,
 }
 
 impl TimerScheduler {
@@ -48,12 +59,44 @@ impl TimerScheduler {
 
     /// Cancel and remove any timer registered under `key`.
     fn cancel_key(&self, key: &str) -> bool {
-        if let Some((_, handle)) = self.timers.remove(key) {
-            handle.abort();
+        if let Some((_, armed)) = self.timers.remove(key) {
+            armed.task.abort();
             true
         } else {
             false
         }
+    }
+
+    /// Arm `key`, replacing (and cancelling) any timer already under it.
+    ///
+    /// The entry is written while its shard is held, before `spawn` can let
+    /// the task run, so a timer that fires at once still finds its own entry
+    /// to retire instead of leaving a finished task registered.
+    fn arm(&self, key: String, spawn: impl FnOnce(u64) -> JoinHandle<()>) {
+        let generation = self
+            .generations
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        match self.timers.entry(key) {
+            dashmap::Entry::Occupied(mut occupied) => {
+                let previous = occupied.insert(ArmedTimer {
+                    generation,
+                    task: spawn(generation),
+                });
+                previous.task.abort();
+            }
+            dashmap::Entry::Vacant(vacant) => {
+                vacant.insert(ArmedTimer {
+                    generation,
+                    task: spawn(generation),
+                });
+            }
+        }
+    }
+
+    /// Retire `key` if it is still the arming `generation` fired for.
+    fn retire(&self, key: &str, generation: u64) {
+        self.timers
+            .remove_if(key, |_, armed| armed.generation == generation);
     }
 }
 
@@ -136,41 +179,42 @@ def make_decorator(seconds, name, jitter):
             .call_method1("iscoroutinefunction", (handler.bind(python),))?
             .is_truthy()?;
 
-        // Cancel any prior timer under this key before rescheduling.
-        self.scheduler.cancel_key(&key);
-
         let scheduler = Arc::clone(&self.scheduler);
         let key_clone = key.clone();
         let duration = Duration::from_millis(delay_ms);
 
-        let join_handle: JoinHandle<()> = tokio::spawn(async move {
-            tokio::time::sleep(duration).await;
+        // Arming replaces (and cancels) any prior timer under this key.
+        self.scheduler.arm(key.clone(), move |generation| {
+            tokio::spawn(async move {
+                tokio::time::sleep(duration).await;
 
-            // Fire the callback inside Python::attach, then pop the registry
-            // entry so a subsequent set() under the same key works cleanly.
-            let _ = crate::script::py_executor::try_run(move || {
-                pyo3::Python::attach(|python| {
-                    let callable = handler.bind(python);
-                    match callable.call1((key_clone.as_str(),)) {
-                        Ok(returned) => {
-                            if is_async {
-                                if let Err(error) = run_coroutine(python, &returned) {
-                                    error!(error = %crate::script::error_report::describe(python, &error), key = %key_clone, "async timer handler error");
+                let fired_key = key_clone.clone();
+                let _ = crate::script::py_executor::try_run(move || {
+                    crate::script::attach::attach(|python| {
+                        let callable = handler.bind(python);
+                        match callable.call1((fired_key.as_str(),)) {
+                            Ok(returned) => {
+                                if is_async {
+                                    if let Err(error) = run_coroutine(python, &returned) {
+                                        error!(error = %crate::script::error_report::describe(python, &error), key = %fired_key, "async timer handler error");
+                                    }
                                 }
                             }
+                            Err(error) => {
+                                error!(error = %crate::script::error_report::describe(python, &error), key = %fired_key, "timer handler failed");
+                            }
                         }
-                        Err(error) => {
-                            error!(error = %crate::script::error_report::describe(python, &error), key = %key_clone, "timer handler failed");
-                        }
-                    }
-                });
+                    });
+                })
+                .await;
 
-                scheduler.timers.remove(&key_clone);
+                // Retire this arming only: the handler may have re-armed the
+                // key, and that timer stays registered. Done here rather than
+                // in the job so a job that never ran (shed) or panicked still
+                // retires its entry.
+                scheduler.retire(&key_clone, generation);
             })
-            .await;
         });
-
-        self.scheduler.timers.insert(key.clone(), join_handle);
         debug!(key = %key, delay_ms, "timer.set scheduled");
 
         Ok(PyTimerHandle {
@@ -228,6 +272,111 @@ impl PyTimerHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Run `source` (which defines `handler(key)`) and arm `key` with it.
+    /// Returns the script module, for reading what the handler recorded.
+    fn arm_from_script(
+        namespace: &Py<PyTimerNamespace>,
+        source: &str,
+        key: &str,
+        delay_ms: u64,
+    ) -> Py<pyo3::types::PyModule> {
+        Python::attach(|python| {
+            let module = pyo3::types::PyModule::from_code(
+                python,
+                &std::ffi::CString::new(source).expect("source"),
+                &std::ffi::CString::new(format!("timer_test_{key}.py")).expect("file"),
+                &std::ffi::CString::new(format!("timer_test_{key}")).expect("module"),
+            )
+            .expect("module");
+            module
+                .setattr("timer", namespace.clone_ref(python))
+                .expect("timer global");
+            let handler = module.getattr("handler").expect("handler").unbind();
+            namespace
+                .borrow(python)
+                .set(python, key.to_string(), delay_ms, handler)
+                .expect("armed");
+            module.unbind()
+        })
+    }
+
+    fn active(namespace: &Py<PyTimerNamespace>) -> usize {
+        Python::attach(|python| namespace.borrow(python).active_count())
+    }
+
+    /// A handler that re-arms its own key leaves that new timer registered.
+    ///
+    /// The fired task used to retire the key by name after the handler
+    /// returned, which removed the timer the handler had just armed: it kept
+    /// running, but `timer.cancel` could no longer reach it and
+    /// `active_count` said nothing was armed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_handler_that_rearms_its_key_keeps_the_new_timer() {
+        Python::initialize();
+        let namespace =
+            Python::attach(|python| Py::new(python, PyTimerNamespace::new())).expect("namespace");
+        let module = arm_from_script(
+            &namespace,
+            "fired = []\ndef handler(key):\n    timer.set(key, 600_000, handler)\n    fired.append(key)\n",
+            "rearm",
+            10,
+        );
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let fired = Python::attach(|python| {
+                module
+                    .bind(python)
+                    .getattr("fired")
+                    .and_then(|fired| fired.len())
+                    .unwrap_or(0)
+            });
+            if fired > 0 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the timer never fired"
+            );
+        }
+        // Give the fired task time to retire (it must not take the new entry).
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        assert_eq!(active(&namespace), 1, "the re-armed timer stays registered");
+        assert!(
+            Python::attach(|python| namespace.borrow(python).cancel("rearm")),
+            "and stays cancellable"
+        );
+        assert_eq!(active(&namespace), 0);
+    }
+
+    /// Timers that fire at once retire themselves: none is left registered
+    /// after it ran, whichever of the arming and the firing wins.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn timers_that_fire_at_once_leave_nothing_registered() {
+        Python::initialize();
+        let namespace =
+            Python::attach(|python| Py::new(python, PyTimerNamespace::new())).expect("namespace");
+        for index in 0..200 {
+            let _ = arm_from_script(
+                &namespace,
+                "def handler(key):\n    pass\n",
+                &format!("instant_{index}"),
+                0,
+            );
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while active(&namespace) != 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{} fired timers are still registered",
+                active(&namespace)
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
 
     #[test]
     fn scheduler_cancel_missing_key_returns_false() {

@@ -56,7 +56,7 @@ pub mod timer;
 mod uac_flow;
 
 use std::ffi::CString;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use pyo3::prelude::*;
 use pyo3::types::PyModule;
@@ -113,7 +113,7 @@ pub type ModuleExtension =
 /// duplicate rejection only — the name is not itself an attribute). Populated
 /// by `SiphonServer` at startup, replayed every time `install_siphon_module()`
 /// runs.
-static MODULE_EXTENSIONS: Mutex<Vec<(String, ModuleExtension)>> = Mutex::new(Vec::new());
+static MODULE_EXTENSIONS: Mutex<Vec<(String, Arc<ModuleExtension>)>> = Mutex::new(Vec::new());
 
 /// Tuple of (auth, registrar, log, proxy_utils, cache) singletons.
 type SingletonTuple = (Py<PyAny>, Py<PyAny>, Py<PyAny>, Py<PyAny>, Py<PyAny>);
@@ -624,7 +624,7 @@ pub fn set_module_extension(name: &str, hook: ModuleExtension) -> Result<()> {
             "module extension '{name}' is already registered"
         )));
     }
-    guard.push((name.to_owned(), hook));
+    guard.push((name.to_owned(), Arc::new(hook)));
     Ok(())
 }
 
@@ -1014,15 +1014,18 @@ pub fn install_siphon_module(python: Python<'_>) -> Result<()> {
     // namespaces plus shared types and exceptions (siphon-sigtran mounts `ss7`
     // / `gsm_map` / `gsm_cap` / `inap` + `SigtranError` + `configure` /
     // `metrics`). Runs last so an extension sees a fully-populated module.
-    {
-        let guard = MODULE_EXTENSIONS
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        for (name, hook) in guard.iter() {
-            hook(python, &module).map_err(|error| {
-                SiphonError::Script(format!("module extension '{name}': {error}"))
-            })?;
-        }
+    //
+    // The hooks run Python, so they run with the registry lock released: an
+    // attached thread holding a Rust lock while the interpreter can stop it
+    // for a collection deadlocks any other attached thread that waits for the
+    // same lock.
+    let extensions: Vec<(String, Arc<ModuleExtension>)> = MODULE_EXTENSIONS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    for (name, hook) in &extensions {
+        hook(python, &module)
+            .map_err(|error| SiphonError::Script(format!("module extension '{name}': {error}")))?;
     }
 
     let sys = python

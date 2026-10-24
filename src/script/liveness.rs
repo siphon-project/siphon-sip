@@ -300,6 +300,7 @@ pub(crate) fn run_liveness_watchdog(
 
 /// Attach to the interpreter and detach again, every `interval`, beating
 /// `beat` around each attach and publishing how long it waited.
+#[allow(clippy::disallowed_methods)] // dedicated probe thread; it sleeps detached, between attaches
 pub(crate) fn run_interpreter_probe(
     beat: Arc<Beat>,
     interval: Duration,
@@ -360,6 +361,7 @@ pub(crate) fn start_from_config(config: &crate::config::ScriptConfig) {
 /// Start the watchdog and the interpreter probe for `runtime`, aborting the
 /// process after `stall`. Neither thread is joined on shutdown: a wedged
 /// process must not also wedge its own exit.
+#[allow(clippy::disallowed_methods)] // dedicated watchdog thread, never attaches
 pub(crate) fn start(runtime: TokioHandle, stall: Duration) {
     const INTERVAL: Duration = Duration::from_secs(1);
     let shutdown = Arc::new(AtomicBool::new(false));

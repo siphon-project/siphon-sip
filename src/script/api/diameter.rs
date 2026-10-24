@@ -1114,12 +1114,12 @@ impl PyDiameter {
                 .await;
 
             match answer {
-                Ok(message) => Python::attach(|python| {
+                Ok(message) => Ok(crate::script::Deferred::build(move |python| {
                     super::diameter_cx::server_answer_dict(python, &message).map(Some)
-                }),
+                })),
                 Err(error) => {
                     warn!(error = %error, "cx_uar failed");
-                    Ok(None)
+                    Ok(crate::script::Deferred::none())
                 }
             }
         })
@@ -1191,12 +1191,12 @@ impl PyDiameter {
 
         crate::script::awaitable(python, async move {
             match client.send_mar(&arguments.request()).await {
-                Ok(message) => Python::attach(|python| {
+                Ok(message) => Ok(crate::script::Deferred::build(move |python| {
                     super::diameter_cx::mar_answer_dict(python, &message).map(Some)
-                }),
+                })),
                 Err(error) => {
                     warn!(error = %error, "cx_mar failed");
-                    Ok(None)
+                    Ok(crate::script::Deferred::none())
                 }
             }
         })
@@ -1273,12 +1273,12 @@ impl PyDiameter {
 
         crate::script::awaitable(python, async move {
             match client.send_zh_mar(&arguments.request()).await {
-                Ok(message) => Python::attach(|python| {
+                Ok(message) => Ok(crate::script::Deferred::build(move |python| {
                     super::diameter_gba::zh_mar_answer_dict(python, &message).map(Some)
-                }),
+                })),
                 Err(error) => {
                     warn!(error = %error, "zh_mar failed");
-                    Ok(None)
+                    Ok(crate::script::Deferred::none())
                 }
             }
         })
@@ -1360,12 +1360,12 @@ impl PyDiameter {
 
         crate::script::awaitable(python, async move {
             match client.send_zn_bir(&arguments.request()).await {
-                Ok(message) => Python::attach(|python| {
+                Ok(message) => Ok(crate::script::Deferred::build(move |python| {
                     super::diameter_gba::zn_bir_answer_dict(python, &message).map(Some)
-                }),
+                })),
                 Err(error) => {
                     warn!(error = %error, "zn_bir failed");
-                    Ok(None)
+                    Ok(crate::script::Deferred::none())
                 }
             }
         })
@@ -1512,12 +1512,12 @@ impl PyDiameter {
                 failed_pcscf: failed.as_ref(),
             };
             match client.send_sar(&request).await {
-                Ok(message) => Python::attach(|python| {
+                Ok(message) => Ok(crate::script::Deferred::build(move |python| {
                     super::diameter_cx::sar_answer_dict(python, &message).map(Some)
-                }),
+                })),
                 Err(error) => {
                     warn!(error = %error, "cx_sar failed");
-                    Ok(None)
+                    Ok(crate::script::Deferred::none())
                 }
             }
         })
@@ -1573,12 +1573,12 @@ impl PyDiameter {
                 .await;
 
             match answer {
-                Ok(message) => Python::attach(|python| {
+                Ok(message) => Ok(crate::script::Deferred::build(move |python| {
                     super::diameter_cx::server_answer_dict(python, &message).map(Some)
-                }),
+                })),
                 Err(error) => {
                     warn!(error = %error, "cx_lir failed");
-                    Ok(None)
+                    Ok(crate::script::Deferred::none())
                 }
             }
         })
@@ -1636,9 +1636,9 @@ impl PyDiameter {
             match answer {
                 Ok(message) => {
                     let Some(parsed) = crate::diameter::s6a::parse_aia(&message) else {
-                        return Ok(None);
+                        return Ok(crate::script::Deferred::none());
                     };
-                    Python::attach(|python| {
+                    Ok(crate::script::Deferred::build(move |python| {
                         let dict = PyDict::new(python);
                         dict.set_item("result_code", parsed.result_code)?;
                         let vectors = pyo3::types::PyList::empty(python);
@@ -1655,11 +1655,11 @@ impl PyDiameter {
                         }
                         dict.set_item("vectors", vectors)?;
                         Ok(Some(dict.unbind()))
-                    })
+                    }))
                 }
                 Err(error) => {
                     warn!(error = %error, "s6a_air failed");
-                    Ok(None)
+                    Ok(crate::script::Deferred::none())
                 }
             }
         })
@@ -1708,19 +1708,19 @@ impl PyDiameter {
             match answer {
                 Ok(message) => {
                     let Some(parsed) = crate::diameter::s6a::parse_ula(&message) else {
-                        return Ok(None);
+                        return Ok(crate::script::Deferred::none());
                     };
-                    Python::attach(|python| {
+                    Ok(crate::script::Deferred::build(move |python| {
                         let dict = PyDict::new(python);
                         dict.set_item("result_code", parsed.result_code)?;
                         dict.set_item("ula_flags", parsed.ula_flags)?;
                         dict.set_item("has_subscription_data", parsed.has_subscription_data)?;
                         Ok(Some(dict.unbind()))
-                    })
+                    }))
                 }
                 Err(error) => {
                     warn!(error = %error, "s6a_ulr failed");
-                    Ok(None)
+                    Ok(crate::script::Deferred::none())
                 }
             }
         })
@@ -1752,14 +1752,14 @@ impl PyDiameter {
 
         crate::script::awaitable(python, async move {
             match client.send_purge_ue(&imsi, pur_flags).await {
-                Ok(message) => Python::attach(|python| {
+                Ok(message) => Ok(crate::script::Deferred::build(move |python| {
                     let dict = PyDict::new(python);
                     dict.set_item("result_code", extract_result_code(&message.avps))?;
                     Ok(Some(dict.unbind()))
-                }),
+                })),
                 Err(error) => {
                     warn!(error = %error, "s6a_purge_ue failed");
-                    Ok(None)
+                    Ok(crate::script::Deferred::none())
                 }
             }
         })
@@ -1859,15 +1859,15 @@ impl PyDiameter {
             let answer = crate::diameter::rx::send_aar(client.peer(), &request.params()).await;
 
             match answer {
-                Ok(answer) => Python::attach(|python| {
+                Ok(answer) => Ok(crate::script::Deferred::build(move |python| {
                     let dict = PyDict::new(python);
                     dict.set_item("result_code", answer.result_code)?;
                     dict.set_item("session_id", answer.session_id)?;
                     Ok(Some(dict.unbind()))
-                }),
+                })),
                 Err(error) => {
                     warn!(error = %error, "rx_aar failed");
-                    Ok(None)
+                    Ok(crate::script::Deferred::none())
                 }
             }
         })
@@ -2266,16 +2266,16 @@ impl PyDiameter {
                     let result_code = extract_result_code(&message.avps);
                     let user_data = octet_string_as_utf8(&message.avps, "User-Data-Sh");
 
-                    Python::attach(|python| {
+                    Ok(crate::script::Deferred::build(move |python| {
                         let dict = PyDict::new(python);
                         dict.set_item("result_code", result_code)?;
                         dict.set_item("user_data", user_data)?;
                         Ok(Some(dict.unbind()))
-                    })
+                    }))
                 }
                 Err(error) => {
                     warn!(error = %error, "sh_udr failed");
-                    Ok(None)
+                    Ok(crate::script::Deferred::none())
                 }
             }
         })
@@ -2338,15 +2338,15 @@ impl PyDiameter {
             match answer {
                 Ok(message) => {
                     let result_code = extract_result_code(&message.avps);
-                    Python::attach(|python| {
+                    Ok(crate::script::Deferred::build(move |python| {
                         let dict = PyDict::new(python);
                         dict.set_item("result_code", result_code)?;
                         Ok(Some(dict.unbind()))
-                    })
+                    }))
                 }
                 Err(error) => {
                     warn!(error = %error, "sh_pur failed");
-                    Ok(None)
+                    Ok(crate::script::Deferred::none())
                 }
             }
         })
@@ -2411,15 +2411,15 @@ impl PyDiameter {
             match answer {
                 Ok(message) => {
                     let result_code = extract_result_code(&message.avps);
-                    Python::attach(|python| {
+                    Ok(crate::script::Deferred::build(move |python| {
                         let dict = PyDict::new(python);
                         dict.set_item("result_code", result_code)?;
                         Ok(Some(dict.unbind()))
-                    })
+                    }))
                 }
                 Err(error) => {
                     warn!(error = %error, "sh_snr failed");
-                    Ok(None)
+                    Ok(crate::script::Deferred::none())
                 }
             }
         })
@@ -2511,7 +2511,7 @@ impl PyDiameter {
         crate::script::awaitable(python, async move {
             match client.send_srr(&msisdn, &sc_address, sm_rp_mti).await {
                 Ok(message) => match crate::diameter::s6c::parse_sra(&message) {
-                    Some(sra) => Python::attach(|python| {
+                    Some(sra) => Ok(crate::script::Deferred::build(move |python| {
                         let dict = PyDict::new(python);
                         dict.set_item("result_code", sra.result_code)?;
                         dict.set_item("experimental_result_code", sra.experimental_result_code)?;
@@ -2524,15 +2524,15 @@ impl PyDiameter {
                         dict.set_item("sgsn_realm", sra.sgsn_realm)?;
                         dict.set_item("msc_number", sra.msc_number)?;
                         Ok(Some(dict.unbind()))
-                    }),
+                    })),
                     None => {
                         warn!("s6c_srr: HSS answer was not parseable as SRA");
-                        Ok(None)
+                        Ok(crate::script::Deferred::none())
                     }
                 },
                 Err(error) => {
                     warn!(error = %error, "s6c_srr failed");
-                    Ok(None)
+                    Ok(crate::script::Deferred::none())
                 }
             }
         })
@@ -2607,21 +2607,21 @@ impl PyDiameter {
                 .await
             {
                 Ok(message) => match crate::diameter::s6c::parse_rsa(&message) {
-                    Some(rsa) => Python::attach(|python| {
+                    Some(rsa) => Ok(crate::script::Deferred::build(move |python| {
                         let dict = PyDict::new(python);
                         dict.set_item("result_code", rsa.result_code)?;
                         dict.set_item("experimental_result_code", rsa.experimental_result_code)?;
                         dict.set_item("user_name", rsa.user_name)?;
                         Ok(Some(dict.unbind()))
-                    }),
+                    })),
                     None => {
                         warn!("s6c_rsr: HSS answer was not parseable as RSA");
-                        Ok(None)
+                        Ok(crate::script::Deferred::none())
                     }
                 },
                 Err(error) => {
                     warn!(error = %error, "s6c_rsr failed");
-                    Ok(None)
+                    Ok(crate::script::Deferred::none())
                 }
             }
         })
@@ -2700,21 +2700,21 @@ impl PyDiameter {
 
             match answer {
                 Ok(message) => match crate::diameter::sgd::parse_tfa(&message) {
-                    Some(tfa) => Python::attach(|python| {
+                    Some(tfa) => Ok(crate::script::Deferred::build(move |python| {
                         let dict = PyDict::new(python);
                         dict.set_item("result_code", tfa.result_code)?;
                         dict.set_item("experimental_result_code", tfa.experimental_result_code)?;
                         dict.set_item("absent_user_diagnostic", tfa.absent_user_diagnostic)?;
                         Ok(Some(dict.unbind()))
-                    }),
+                    })),
                     None => {
                         warn!("sgd_tfr: peer answer was not parseable as TFA");
-                        Ok(None)
+                        Ok(crate::script::Deferred::none())
                     }
                 },
                 Err(error) => {
                     warn!(error = %error, "sgd_tfr failed");
-                    Ok(None)
+                    Ok(crate::script::Deferred::none())
                 }
             }
         })
@@ -2853,14 +2853,14 @@ impl PyDiameter {
                 Ok(message) => message,
                 Err(error) => {
                     warn!(error = %error, command = command, "diameter.send_request failed");
-                    return Ok(None);
+                    return Ok(crate::script::Deferred::none());
                 }
             };
 
-            Python::attach(|python| {
+            Ok(crate::script::Deferred::build(move |python| {
                 let dict = decode_avps_to_pydict(python, &message.avps)?;
                 Ok(Some(dict.unbind()))
-            })
+            }))
         })
     }
 
@@ -3028,12 +3028,12 @@ impl PyDiameter {
             params.service_context_id = service_context_id.as_deref();
 
             match rf::send_acr(&peer_handle, &params).await {
-                Ok(answer) => Python::attach(|python| {
+                Ok(answer) => Ok(crate::script::Deferred::build(move |python| {
                     accounting_answer_to_dict(python, answer, None).map(|dict| Some(dict.unbind()))
-                }),
+                })),
                 Err(error) => {
                     warn!(error = %error, "rf_acr_start failed");
-                    Ok(None)
+                    Ok(crate::script::Deferred::none())
                 }
             }
         })
@@ -3186,13 +3186,13 @@ impl PyDiameter {
             params.service_context_id = service_context_id.as_deref();
 
             match rf::send_acr(&peer_handle, &params).await {
-                Ok(answer) => Python::attach(|python| {
+                Ok(answer) => Ok(crate::script::Deferred::build(move |python| {
                     accounting_answer_to_dict(python, answer, Some(session_id.as_str()))
                         .map(|dict| Some(dict.unbind()))
-                }),
+                })),
                 Err(error) => {
                     warn!(error = %error, "rf_acr_interim failed");
-                    Ok(None)
+                    Ok(crate::script::Deferred::none())
                 }
             }
         })
@@ -3351,13 +3351,13 @@ impl PyDiameter {
             params.termination_cause = Some(termination_cause);
 
             match rf::send_acr(&peer_handle, &params).await {
-                Ok(answer) => Python::attach(|python| {
+                Ok(answer) => Ok(crate::script::Deferred::build(move |python| {
                     accounting_answer_to_dict(python, answer, Some(session_id.as_str()))
                         .map(|dict| Some(dict.unbind()))
-                }),
+                })),
                 Err(error) => {
                     warn!(error = %error, "rf_acr_stop failed");
-                    Ok(None)
+                    Ok(crate::script::Deferred::none())
                 }
             }
         })
@@ -3504,12 +3504,12 @@ impl PyDiameter {
             params.service_context_id = service_context_id.as_deref();
 
             match rf::send_acr(&peer_handle, &params).await {
-                Ok(answer) => Python::attach(|python| {
+                Ok(answer) => Ok(crate::script::Deferred::build(move |python| {
                     accounting_answer_to_dict(python, answer, None).map(|dict| Some(dict.unbind()))
-                }),
+                })),
                 Err(error) => {
                     warn!(error = %error, "rf_acr_event failed");
-                    Ok(None)
+                    Ok(crate::script::Deferred::none())
                 }
             }
         })
@@ -3749,7 +3749,7 @@ impl PyDiameter {
         pyo3_async_runtimes::tokio::future_into_py(python, async move {
             let Some(client) = client else {
                 warn!("ro_ccr_initial: no Diameter peer connected");
-                return Python::attach(|py| Ok(py.None()));
+                return Ok(crate::script::Deferred::none());
             };
             let params = CreditControlParams {
                 request_type: CcRequestType::Initial,
@@ -3769,14 +3769,14 @@ impl PyDiameter {
                 vcs_data: None,
             };
             match ro::send_ccr(client.peer(), &params).await {
-                Ok(answer) => Python::attach(|py| {
+                Ok(answer) => Ok(crate::script::Deferred::build(move |py| {
                     Ok(credit_control_answer_to_dict(py, answer)?
                         .into_any()
                         .unbind())
-                }),
+                })),
                 Err(error) => {
                     warn!(error = %error, "ro_ccr_initial failed");
-                    Python::attach(|py| Ok(py.None()))
+                    Ok(crate::script::Deferred::none())
                 }
             }
         })
@@ -3942,7 +3942,7 @@ impl PyDiameter {
         pyo3_async_runtimes::tokio::future_into_py(python, async move {
             let Some(client) = client else {
                 warn!("ro_ccr_event: no Diameter peer connected");
-                return Python::attach(|py| Ok(py.None()));
+                return Ok(crate::script::Deferred::none());
             };
             let params = CreditControlParams {
                 request_type: CcRequestType::Event,
@@ -3962,14 +3962,14 @@ impl PyDiameter {
                 vcs_data: None,
             };
             match ro::send_ccr(client.peer(), &params).await {
-                Ok(answer) => Python::attach(|py| {
+                Ok(answer) => Ok(crate::script::Deferred::build(move |py| {
                     Ok(credit_control_answer_to_dict(py, answer)?
                         .into_any()
                         .unbind())
-                }),
+                })),
                 Err(error) => {
                     warn!(error = %error, "ro_ccr_event failed");
-                    Python::attach(|py| Ok(py.None()))
+                    Ok(crate::script::Deferred::none())
                 }
             }
         })
@@ -4008,7 +4008,7 @@ impl PyDiameter {
         pyo3_async_runtimes::tokio::future_into_py(python, async move {
             let Some(client) = client else {
                 warn!("ro_ccr: no Diameter peer connected");
-                return Python::attach(|py| Ok(py.None()));
+                return Ok(crate::script::Deferred::none());
             };
             let params = CreditControlParams {
                 request_type,
@@ -4028,14 +4028,14 @@ impl PyDiameter {
                 vcs_data: None,
             };
             match ro::send_ccr(client.peer(), &params).await {
-                Ok(answer) => Python::attach(|py| {
+                Ok(answer) => Ok(crate::script::Deferred::build(move |py| {
                     Ok(credit_control_answer_to_dict(py, answer)?
                         .into_any()
                         .unbind())
-                }),
+                })),
                 Err(error) => {
                     warn!(error = %error, "ro_ccr continuation failed");
-                    Python::attach(|py| Ok(py.None()))
+                    Ok(crate::script::Deferred::none())
                 }
             }
         })

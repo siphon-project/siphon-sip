@@ -20,6 +20,62 @@ entry, but a working config keeps working.
   verification.
 ### Fixed
 
+- **Blocking waits made while attached to the interpreter could deadlock a
+  free-threaded process under GC.** On free-threaded Python a thread attached
+  to the interpreter that parks in a Rust wait never reaches a garbage
+  collection's safe point, and every thread that touches Python stops behind
+  it; on a GIL build the parked thread keeps the GIL. Fixed outside the
+  dispatcher:
+  - `auth`'s Rust `check_credentials` no longer holds the request while its
+    HTTP or database backend lookup waits.
+  - The 34 awaitable script APIs that built their Python result inside the
+    future (Diameter Cx/Sh/Rx/Ro/Rf/S6a/Zh, `sbi.*`, `auth` digest,
+    `rtpengine.answer_local`, conference recording, `ipsec`, `b2bua`, `call`,
+    Ro sessions) now build it in the completion step, off the tokio workers.
+  - Script handlers that ran on a tokio worker now run on the script executor:
+    `@srs.on_invite` / `@srs.on_session_end`, `@diameter.on_inbound_cer`, the
+    control plane's synchronous SIP verbs, the SIGHUP and
+    `POST /admin/script/reload` reloads, and the `siphon_python_allocated_blocks`
+    sample.
+  - `registration.add`, `gateway.add_group` and the registrant and gateway
+    re-resolves release the interpreter for `getaddrinfo`, and no longer hold
+    the entry or group map while it runs.
+  - The STIR x5u fetch, the timer restart on reload and the extension module
+    hooks no longer wait or attach under a lock.
+  - Diameter server `get_avp` / `iter_avps` / `avps` / `unknown_avps` copy the
+    AVPs out before building Python objects.
+- **Console logging no longer blocks the logging thread.** Like the log file,
+  stdout is written from its own thread; a log pipe that cannot keep up now
+  drops lines (counted in `siphon_log_lines_dropped_total`) instead of stalling
+  whichever thread logged.
+- **An `async def` `@srs.on_invite` / `@srs.on_session_end` handler runs.** Its
+  coroutine was never awaited, so the hook did nothing and a decline was read
+  as an accept.
+- **`timer.set` from inside a timer's own handler keeps the new timer.** The
+  firing timer retired the key after its handler returned, which dropped the
+  timer the handler had just armed: it still fired, but `timer.cancel` could
+  not reach it and `active_count` did not count it. A timer that fired before
+  `timer.set` returned could also stay counted forever.
+- **`presence.notify` on a dialog whose SUBSCRIBE is still being handled waits
+  for the 2xx** (RFC 6665 §4.1.2.3). Since it became awaitable the NOTIFY could
+  overtake the 200 OK it follows.
+- **`rtpengine.answer_local(auto_reject=True)` on a call in use raises instead
+  of panicking** in the completion step, which left the script awaiting.
+
+### Added
+
+- **`ScriptHandle::call_handler_with`** for extensions: builds the handler's
+  arguments and reads its outcome inside the script executor's jobs, so a
+  per-event dispatch on a tokio worker never attaches.
+  `HandlerHandle::options_value` reads the handler's options as JSON without
+  the interpreter, and taking a `HandlerHandle` no longer attaches.
+  `call_handler` still works and is superseded.
+- **`siphon::script::blocking::{released, blocking_released, block_on_released,
+  detach_block_on}` are public**, for extension crates that block on Rust from
+  a thread that may be attached to the interpreter, and so are
+  `siphon::script::blocking::awaitable`, `siphon::script::Deferred` (build a
+  future's Python result in the completion step, off the tokio workers) and
+  `siphon::script::inline_dispatch::run_coroutine_inline`.
 - **P-CSCF: an over-MTU request to a protected UE goes over TCP on the
   P-CSCF's own connection.** A request too big for UDP (a reg-event NOTIFY
   listing a few contacts) to a UE that registered over UDP and holds a

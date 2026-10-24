@@ -864,20 +864,17 @@ impl PyAuth {
     /// Verify credentials without sending a challenge (Rust API).
     pub fn check_credentials(&self, request: &PyRequest, realm: Option<&str>) -> PyResult<bool> {
         let realm = realm.unwrap_or(&self.default_realm);
-        let message = request.message();
-        let message = message.lock().map_err(|error| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!("lock poisoned: {error}"))
-        })?;
-        let method = match &message.start_line {
-            crate::sip::message::StartLine::Request(rl) => rl.method.as_str().to_string(),
-            _ => "REGISTER".to_string(),
-        };
-        let auth_header = message
-            .headers
-            .get("Authorization")
-            .or_else(|| message.headers.get("Proxy-Authorization"));
-        match auth_header {
-            Some(value) => Ok(self.validate_credentials(value, realm, &method).is_valid()),
+        // Read what the check needs and let the message go before validating.
+        // The HTTP and database backends wait on the network with the
+        // interpreter released and re-attach afterwards; holding the message
+        // across that would leave an attached thread that touches the same
+        // request (another coroutine, a background task) blocked on the lock,
+        // which is the stop-the-world deadlock `detach_block_on` describes.
+        let read = Self::digest_read_message(&request.message())?;
+        match &read.auth_header {
+            Some(value) => Ok(self
+                .validate_credentials(value, realm, &read.method)
+                .is_valid()),
             None => Ok(false),
         }
     }
@@ -1006,7 +1003,7 @@ impl PyAuth {
                 None => CredentialCheck::Absent,
             };
 
-            Python::attach(|python| {
+            Ok(crate::script::Deferred::build(move |python| {
                 let bound = handle.bind(python);
                 let mut guard = AuthTargetGuard::extract(bound)?;
                 auth.digest_apply(
@@ -1016,7 +1013,7 @@ impl PyAuth {
                     &realm,
                     challenge_code,
                 )
-            })
+            }))
         })
     }
 
@@ -1025,7 +1022,14 @@ impl PyAuth {
     /// Separate because the awaitable driver must finish reading the Python
     /// object before it builds its future — a `Bound` cannot cross into one.
     fn digest_read(target: &mut AuthTarget<'_>) -> PyResult<DigestRead> {
-        let message = target.message();
+        Self::digest_read_message(&target.message())
+    }
+
+    /// [`Self::digest_read`] for a bare message. The lock is held only while
+    /// the two fields are copied out, never across the credential lookup.
+    fn digest_read_message(
+        message: &std::sync::Mutex<crate::sip::message::SipMessage>,
+    ) -> PyResult<DigestRead> {
         let message_guard = message.lock().map_err(|error| {
             pyo3::exceptions::PyRuntimeError::new_err(format!("lock poisoned: {error}"))
         })?;
@@ -3054,6 +3058,115 @@ mod tests {
                 reason: "Unauthorized".to_string(),
                 reliable: false,
             }
+        );
+    }
+
+    /// `check_credentials` must not hold the request's message while its HTTP
+    /// backend lookup waits.
+    ///
+    /// The lookup releases the interpreter for the network wait and re-attaches
+    /// after it. It used to do so with the message locked, so a second attached
+    /// thread touching the same request blocked on the lock without reaching a
+    /// safe point; the next stop-the-world (free-threaded) then never finished,
+    /// or on a GIL build the blocked thread kept the GIL the lookup needed to
+    /// come back. Either way the process froze. Runs in a child process so a
+    /// regression fails here instead of hanging the suite.
+    #[test]
+    fn credential_lookup_does_not_hold_the_message_while_it_waits() {
+        use crate::script::stop_the_world_tests::{collect_garbage_until, in_child};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        if !in_child(
+            concat!(
+                module_path!(),
+                "::credential_lookup_does_not_hold_the_message_while_it_waits"
+            ),
+            std::time::Duration::from_secs(60),
+        ) {
+            return;
+        }
+
+        pyo3::Python::initialize();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("runtime");
+
+        // A credential backend that answers only after a while, so the lookup
+        // is still waiting when the other thread reaches for the message.
+        let (asked_sender, asked) = std::sync::mpsc::channel::<()>();
+        let listener = runtime
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .expect("bind the backend");
+        let port = listener.local_addr().expect("backend address").port();
+        runtime.spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut buffer = [0u8; 2048];
+                let _ = stream.read(&mut buffer).await;
+                let _ = asked_sender.send(());
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                let _ = stream
+                    .write_all(b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n\r\n")
+                    .await;
+            }
+        });
+
+        let mut auth = PyAuth::empty();
+        auth.set_backend_type(AuthBackendType::Http);
+        auth.set_http_config(HttpAuthConfig {
+            url: format!("http://127.0.0.1:{port}/sip/auth/{{username}}"),
+            timeout_ms: 10_000,
+            connect_timeout_ms: 10_000,
+            ha1: true,
+            cache_ttl_secs: 0,
+        })
+        .expect("http backend");
+        let request = make_register_request();
+        request
+            .message()
+            .lock()
+            .expect("message")
+            .headers
+            .add("Authorization", well_formed_authorization("alice"));
+        let message = request.message();
+
+        // The lookup, attached the way a script API or an extension calls it.
+        let handle = runtime.handle().clone();
+        let checked = Arc::new(AtomicBool::new(false));
+        let checked_flag = Arc::clone(&checked);
+        let checker = std::thread::spawn(move || {
+            let _runtime = handle.enter();
+            let verdict =
+                pyo3::Python::attach(|_| auth.check_credentials(&request, Some("example.com")));
+            checked_flag.store(true, Ordering::SeqCst);
+            verdict
+        });
+        asked
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the lookup reached the backend");
+
+        // A second attached thread touching the same request, and garbage
+        // collections asking for a stop-the-world while both are in flight.
+        let stop = Arc::new(AtomicBool::new(false));
+        let collector = collect_garbage_until(Arc::clone(&stop));
+        let toucher = std::thread::spawn(move || {
+            pyo3::Python::attach(|_| message.lock().map(|guard| guard.headers.has("Via")).is_ok())
+        });
+
+        assert!(
+            toucher.join().expect("the toucher ran"),
+            "the message stays usable"
+        );
+        let verdict = checker.join().expect("the checker ran");
+        stop.store(true, Ordering::SeqCst);
+        collector.join().expect("the collector ran");
+
+        assert!(checked.load(Ordering::SeqCst));
+        assert!(
+            !verdict.expect("the check completes"),
+            "an unknown user is not authenticated"
         );
     }
 

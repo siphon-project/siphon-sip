@@ -12,6 +12,7 @@
 //!
 //! Fixtures use only RFC 5737 documentation addresses (192.0.2.0/24) and generic
 //! example.com hosts — never real IPs or subscriber identities.
+#![allow(clippy::disallowed_methods)] // test, bench and example code may block
 
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion, Throughput};
 use siphon::sip::parse_sip_message;

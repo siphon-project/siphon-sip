@@ -10,6 +10,8 @@ pub mod enum_servers;
 pub mod event_lag;
 pub mod glibc;
 pub mod ipsec;
+pub mod log_writer;
+mod python_stats;
 pub mod rate_limit;
 pub mod send_queue;
 pub mod timer;
@@ -49,6 +51,7 @@ pub fn try_metrics() -> Option<&'static SiphonMetrics> {
 }
 
 mod startup;
+pub use python_stats::update_python_stats;
 pub use startup::init;
 
 /// Access the custom metrics store (for script-defined metrics).
@@ -371,11 +374,6 @@ pub struct SiphonMetrics {
     /// not settled yet. A request handler awaiting costs one of these, not an
     /// executor worker, so this is the figure that grows with slow backends.
     pub async_coroutines_pending: IntGauge,
-    /// How long the liveness probe's last attach to the interpreter waited, in
-    /// milliseconds. Near zero normally; seconds mean some thread blocked while
-    /// attached and held a garbage collection's stop-the-world open, freezing
-    /// every thread that attaches meanwhile, tokio's workers included.
-    pub interpreter_attach_wait_ms: IntGauge,
     /// Event-handler jobs whose caller stopped waiting but which are still
     /// running on a worker, and always will be if they never return.
     ///
@@ -899,10 +897,6 @@ impl SiphonMetrics {
             "siphon_async_coroutines_pending",
             "Async handler coroutines running on an asyncio driver that have not settled yet",
         )?;
-        let interpreter_attach_wait_ms = IntGauge::new(
-            "siphon_interpreter_attach_wait_ms",
-            "How long the liveness probe's last attach to the Python interpreter waited (ms)",
-        )?;
         let pyexec_jobs_abandoned_total = IntCounter::new(
             "siphon_pyexec_jobs_abandoned_total",
             "Event-handler jobs whose caller gave up waiting; the job still holds its worker",
@@ -1314,7 +1308,6 @@ impl SiphonMetrics {
         registry.register(Box::new(pyexec_queue_depth.clone()))?;
         registry.register(Box::new(async_drivers_stalled.clone()))?;
         registry.register(Box::new(async_coroutines_pending.clone()))?;
-        registry.register(Box::new(interpreter_attach_wait_ms.clone()))?;
         registry.register(Box::new(pyexec_jobs_abandoned_total.clone()))?;
         registry.register(Box::new(pyexec_jobs_completed_total.clone()))?;
         registry.register(Box::new(pyexec_jobs_shed_total.clone()))?;
@@ -1403,7 +1396,6 @@ impl SiphonMetrics {
             script_errors_total,
             async_drivers_stalled,
             async_coroutines_pending,
-            interpreter_attach_wait_ms,
             pyexec_jobs_abandoned_total,
             pyexec_pool_size,
             pyexec_pool_max,
@@ -2023,28 +2015,6 @@ pub fn verify_global_allocator() {
 /// expected — a warning there would be misleading.
 #[cfg(target_env = "msvc")]
 pub fn verify_global_allocator() {}
-
-/// Refresh the Python-side allocation gauge from `sys.getallocatedblocks()`.
-///
-/// Python objects live in CPython's own allocator (mimalloc on free-threaded
-/// builds), which jemalloc — and therefore [`update_memory_stats`] — cannot
-/// see. This is the leak signal for the Python side: a script accumulating
-/// objects, or a leaked `Py<>` reference. Cheap; called on the cleanup tick.
-pub fn update_python_stats() {
-    let Some(metrics) = metrics() else {
-        return;
-    };
-    use pyo3::prelude::*;
-    let result = pyo3::Python::attach(|python| -> PyResult<i64> {
-        python
-            .import("sys")?
-            .call_method0("getallocatedblocks")?
-            .extract()
-    });
-    if let Ok(blocks) = result {
-        metrics.python_allocated_blocks.set(blocks);
-    }
-}
 
 /// Refresh the glibc allocator gauges from `malloc_info`. Call periodically (the
 /// dispatcher does so on its cleanup tick). This is the C-side / CPython

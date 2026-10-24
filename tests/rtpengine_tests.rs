@@ -4,6 +4,7 @@
 //! Uses mock UDP servers to simulate RTPEngine instances.
 //!
 //! Separated from integration_tests.rs to avoid coupling with other test modules.
+#![allow(clippy::disallowed_methods)] // test, bench and example code may block
 
 use std::net::SocketAddr;
 

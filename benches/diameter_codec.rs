@@ -8,6 +8,7 @@
 //! kind of per-message work criterion measures well. The benched message is a
 //! representative Cx Multimedia-Auth-Request (MAR). Fixtures use only the 3GPP
 //! test realm (`ims.example.com`), never real identities.
+#![allow(clippy::disallowed_methods)] // test, bench and example code may block
 
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use siphon::diameter::codec::{

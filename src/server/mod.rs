@@ -335,8 +335,8 @@ impl SiphonServer {
     }
 
     /// Run the siphon server. This blocks until shutdown (SIGINT/SIGTERM).
-    ///
     /// Creates its own tokio runtime, so callers do not need `#[tokio::main]`.
+    #[allow(clippy::disallowed_methods)] // process entry, before anything attaches
     pub fn run(self) {
         // Install rustls crypto provider before any TLS operations
         if tokio_rustls::rustls::crypto::ring::default_provider()
@@ -352,14 +352,14 @@ impl SiphonServer {
         // PyGILState_Ensure calls from workers create proper per-thread state.
         pyo3::Python::initialize();
 
-        // Build the Tokio runtime with hooks that pin each runtime thread
-        // (async worker + blocking) to the Python interpreter for the thread's
-        // lifetime, and unpin it when the thread is torn down. See
-        // `pin_python_thread_state` for why both halves matter.
+        // Build the Tokio runtime with hooks that pin each runtime thread (async
+        // worker + blocking) to the interpreter for the thread's lifetime and
+        // unpin it at teardown (see `pin_python_thread_state`), and mark workers.
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .on_thread_start(pin_python_thread_state)
             .on_thread_stop(unpin_python_thread_state)
+            .on_thread_park(crate::script::attach::mark_tokio_worker)
             .build()
             .unwrap_or_else(|error| {
                 eprintln!("Failed to create tokio runtime: {error}");
@@ -409,8 +409,8 @@ impl SiphonServer {
         .shared();
 
         // --- Initialise structured logging ---
-        let _log_guard = if self.skip_logging_init {
-            None
+        let _log_guards = if self.skip_logging_init {
+            Vec::new()
         } else {
             init_logging(&config.log)
         };

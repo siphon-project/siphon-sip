@@ -420,6 +420,7 @@ impl PyExecutor {
         self.max_threads
     }
 
+    #[allow(clippy::disallowed_methods)] // dedicated executor thread, never attaches
     fn spawn(tokio_handle: TokioHandle, config: ExecutorConfig) -> Self {
         let core_threads = config.core_threads.max(1);
         let max_threads = config.max_threads.max(core_threads);
@@ -573,6 +574,7 @@ fn grow_deficit(queue_len: usize, idle: usize, total: usize, max_threads: usize)
 /// submit path makes it robust to submission timing and CPU scheduling — a
 /// stranded backlog is always picked up within one interval. Runs until
 /// `shutdown` is set (on pool drop).
+#[allow(clippy::disallowed_methods)] // dedicated executor thread, never attaches
 fn run_grower(
     receiver: flume::Receiver<Job>,
     tokio_handle: TokioHandle,

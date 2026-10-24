@@ -472,10 +472,11 @@ impl VerificationContext {
             }
         }
 
-        let response = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(self.http_client.get(url).send())
-        })
-        .map_err(|error| format!("x5u fetch failed: {error}"))?;
+        // Released from the interpreter if this thread holds it: the only
+        // caller (`stir.verify`) already detaches, and this keeps it so for any
+        // later one.
+        let response = crate::script::blocking::block_on_released(self.http_client.get(url).send())
+            .map_err(|error| format!("x5u fetch failed: {error}"))?;
 
         if !response.status().is_success() {
             return Err(format!("x5u fetch returned HTTP {}", response.status()));
@@ -483,10 +484,8 @@ impl VerificationContext {
 
         let max_age = parse_max_age(&response);
 
-        let body = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(response.bytes())
-        })
-        .map_err(|error| format!("x5u body read failed: {error}"))?;
+        let body = crate::script::blocking::block_on_released(response.bytes())
+            .map_err(|error| format!("x5u body read failed: {error}"))?;
 
         if body.len() > self.max_cert_bytes {
             return Err(format!(

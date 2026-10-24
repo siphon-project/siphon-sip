@@ -165,8 +165,14 @@ pub fn spawn_sighup_reloader(engine: Arc<ScriptEngine>) {
         info!("SIGHUP reloads the script");
         while hangup.recv().await.is_some() {
             info!("SIGHUP received; reloading script");
-            if let Err(error) = engine.reload() {
-                warn!(%error, "SIGHUP reload failed");
+            // On the script executor: a reload runs the script's top level,
+            // and attached on this tokio worker it would park the worker
+            // through every collection the reload's own allocations trigger.
+            let reloading = Arc::clone(&engine);
+            match crate::script::py_executor::run_queued(move || reloading.reload()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => warn!(%error, "SIGHUP reload failed"),
+                Err(_) => warn!("SIGHUP reload did not run: the script executor is shut down"),
             }
         }
     });

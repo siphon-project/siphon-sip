@@ -15,6 +15,7 @@
 //!
 //! Run with:
 //!   cargo run --example audit_log_extension
+#![allow(clippy::disallowed_methods)] // test, bench and example code may block
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;

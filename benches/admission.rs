@@ -11,6 +11,7 @@
 //! The `gateway_*` ids are the per-group half: finding which limited gateway
 //! groups admit the caller's address, which also runs for every INVITE, and
 //! admitting a call against one.
+#![allow(clippy::disallowed_methods)] // test, bench and example code may block
 
 use criterion::{criterion_group, criterion_main, Criterion};
 use siphon::admission::refused::{RefusedAnswer, RefusedInvites};

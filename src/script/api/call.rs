@@ -1073,14 +1073,14 @@ impl PyCall {
                 role_of_node,
             )
             .await;
-            Python::attach(|py| {
+            Ok(crate::script::Deferred::build(move |py| {
                 let dict = pyo3::types::PyDict::new(py);
                 dict.set_item("authorized", outcome.authorized)?;
                 dict.set_item("result_code", outcome.result_code)?;
                 dict.set_item("granted_time", outcome.granted_time)?;
                 dict.set_item("session_id", outcome.session_id)?;
                 Ok(dict.into_any().unbind())
-            })
+            }))
         })
     }
 

@@ -71,15 +71,17 @@ fn recording(on_event_name: &str) -> Recording {
         let handlers = vec![
             HandlerEntry {
                 kind: HandlerKind::SbiOnEvent,
-                callable: function(on_event_name),
+                callable: Arc::new(function(on_event_name)),
                 is_async: false,
                 options: None,
+                options_value: None,
             },
             HandlerEntry {
                 kind: HandlerKind::SbiOnTerminate,
-                callable: function("on_terminate"),
+                callable: Arc::new(function("on_terminate")),
                 is_async: true,
                 options: None,
+                options_value: None,
             },
         ];
         let state = ScriptState {

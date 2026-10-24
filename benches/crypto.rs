@@ -16,6 +16,7 @@
 //!
 //! Fixtures use the 3GPP TS 35.208 Test Set 1 reference vector and the 3GPP
 //! test realm — never real subscriber secrets.
+#![allow(clippy::disallowed_methods)] // test, bench and example code may block
 
 use criterion::{criterion_group, criterion_main, Criterion};
 use siphon::auth::{

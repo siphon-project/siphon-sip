@@ -517,24 +517,47 @@ async fn serve_connection(
     // configured identity.
     let resolver_engine = Arc::clone(&engine);
     let resolver_identities = Arc::clone(&identities);
-    let resolve = move |acl_match: &AclMatch, asserted: &str| -> CerDecision {
-        resolve_cer_identity(
-            &resolver_engine,
-            &resolver_identities,
-            acl_match,
-            asserted,
-            peer_addr,
-        )
+    //
+    // On the script executor, never on this tokio worker: an attach here parks
+    // the worker through every garbage collection's stop-the-world, and an
+    // `async def` hook would hold it for as long as its coroutine runs. A
+    // reconnect storm opens many of these at once.
+    let resolve = move |acl_match: &AclMatch, asserted: &str| {
+        let acl_match = acl_match.clone();
+        let asserted = asserted.to_string();
+        async move {
+            let fallback_identities = Arc::clone(&resolver_identities);
+            let fallback_match = acl_match.clone();
+            match crate::script::py_executor::run_queued(move || {
+                resolve_cer_identity(
+                    &resolver_engine,
+                    &resolver_identities,
+                    &acl_match,
+                    &asserted,
+                    peer_addr,
+                )
+            })
+            .await
+            {
+                Ok(decision) => decision,
+                Err(_) => {
+                    warn!(%peer_addr, "Diameter server: on_inbound_cer did not run; using the tenant identity");
+                    tenant_identity(&fallback_identities, &fallback_match)
+                }
+            }
+        }
     };
 
-    let (admitted_peer, acl_match) =
-        match handshake.run(stream, peer_addr, incoming_tx, resolve).await {
-            Ok(result) => result,
-            Err(error) => {
-                warn!(%peer_addr, %transport, %error, "Diameter server: handshake rejected");
-                return;
-            }
-        };
+    let (admitted_peer, acl_match) = match handshake
+        .run_resolving(stream, peer_addr, incoming_tx, resolve)
+        .await
+    {
+        Ok(result) => result,
+        Err(error) => {
+            warn!(%peer_addr, %transport, %error, "Diameter server: handshake rejected");
+            return;
+        }
+    };
 
     let local_origin_host = admitted_peer.config().origin_host.clone();
     let local_origin_realm = admitted_peer.config().origin_realm.clone();
@@ -574,6 +597,17 @@ async fn serve_connection(
     }
 }
 
+/// The tenant's configured CEA identity, or a rejection when it has none.
+fn tenant_identity(identities: &TenantIdentities, acl_match: &AclMatch) -> CerDecision {
+    match identities.get(&acl_match.tenant) {
+        Some((origin_host, origin_realm)) => CerDecision::Accept {
+            origin_host: origin_host.clone(),
+            origin_realm: origin_realm.clone(),
+        },
+        None => CerDecision::Reject(dictionary::DIAMETER_UNKNOWN_PEER),
+    }
+}
+
 /// Resolve the CEA identity for an authenticated peer via `@on_inbound_cer`,
 /// falling back to the tenant's configured identity when no handler exists.
 fn resolve_cer_identity(
@@ -583,15 +617,9 @@ fn resolve_cer_identity(
     asserted: &str,
     peer_addr: SocketAddr,
 ) -> CerDecision {
-    let fallback = || match identities.get(&acl_match.tenant) {
-        Some((origin_host, origin_realm)) => CerDecision::Accept {
-            origin_host: origin_host.clone(),
-            origin_realm: origin_realm.clone(),
-        },
-        None => CerDecision::Reject(dictionary::DIAMETER_UNKNOWN_PEER),
-    };
+    let fallback = || tenant_identity(identities, acl_match);
 
-    pyo3::Python::attach(|python| {
+    crate::script::attach::attach(|python| {
         let state = engine.state();
         let handlers = state.handlers_for(&HandlerKind::DiameterOnInboundCer);
         let Some(handler) = handlers.first() else {
