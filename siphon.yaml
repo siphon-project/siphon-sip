@@ -431,6 +431,11 @@ registrar:
   #     #   registrar of record clears the binding too.
   #     # local_only: drop local state + emit on_change only (use on the box
   #     #   that IS the registrar of record).
+  #   network_dereg_sa_grace_ms: 4000  # network_dereg on a P-CSCF: keep the UE's
+  #     #   IPsec SA pair this long so the S-CSCF's NOTIFY reporting the
+  #     #   de-registration reaches it over the pair (TS 24.229 5.2.5.2 NOTE 2);
+  #     #   it goes as soon as the UE answers a NOTIFY. Without a pair, a request
+  #     #   to the UE's protected ports is refused, never sent in clear.
 
 # ---------------------------------------------------------------------------
 # Registrant — Outbound REGISTER Client (Carrier Trunk Registration)

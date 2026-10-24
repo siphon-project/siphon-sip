@@ -25,20 +25,20 @@ const PORT_PS: &str = "192.0.2.1:5060";
 /// The S-CSCF the terminating request comes from.
 const CORE: &str = "198.51.100.12:5060";
 
-fn addr(text: &str) -> SocketAddr {
+pub(super) fn addr(text: &str) -> SocketAddr {
     text.parse().expect("a socket address literal")
 }
 
 /// One message as the transport would have been handed it.
 #[derive(Debug)]
-struct Sent {
+pub(super) struct Sent {
     destination: SocketAddr,
     source_local_addr: Option<SocketAddr>,
     transport: Transport,
     message: SipMessage,
 }
 
-fn drain(receiver: &flume::Receiver<OutboundMessage>) -> Vec<Sent> {
+pub(super) fn drain(receiver: &flume::Receiver<OutboundMessage>) -> Vec<Sent> {
     let mut sent = Vec::new();
     while let Ok(outbound) = receiver.try_recv() {
         for frame in outbound.frames() {
@@ -71,7 +71,7 @@ fn flow(ue: SocketAddr, transport: &str) -> crate::script::api::registrar::PyFlo
     }
 }
 
-fn terminating(method: &str, ue: SocketAddr, call_id: &str, to_tag: &str) -> SipMessage {
+pub(super) fn terminating(method: &str, ue: SocketAddr, call_id: &str, to_tag: &str) -> SipMessage {
     let raw = format!(
         concat!(
             "{method} sip:001010000000001@{ue_ip}:{port_s} SIP/2.0\r\n",
@@ -107,7 +107,7 @@ fn from_core(message: &SipMessage) -> InboundMessage {
 }
 
 /// Relay `message` from the core to the UE, over `flow` when given.
-fn relay(
+pub(super) fn relay(
     proxy: &Proxy,
     message: &SipMessage,
     flow: Option<&crate::script::api::registrar::PyFlow>,
@@ -144,7 +144,7 @@ fn relay(
 
 /// The one request that went to the UE took SA #3 and still names the
 /// protected server port in its Via.
-fn assert_over_port_pc_to_port_us(sent: Vec<Sent>, ue: SocketAddr, method: Method) {
+pub(super) fn assert_over_port_pc_to_port_us(sent: Vec<Sent>, ue: SocketAddr, method: Method) {
     let requests = requests_to_ue(sent, ue);
     assert_eq!(requests.len(), 1, "one request to the UE: {requests:?}");
     let request = &requests[0];

@@ -149,6 +149,31 @@ pub(super) fn take_into_use_before_2xx(state: &DispatcherState, ue: SocketAddr) 
     });
 }
 
+/// A final response from `source` reached the dispatcher. One to a NOTIFY ends
+/// the transaction a pair kept through a network de-registration waited for,
+/// so the pair goes now rather than at the end of its grace (TS 24.229 clause
+/// 5.2.5.2, NOTE 2).
+pub(super) fn on_final_response(
+    state: &DispatcherState,
+    response: &SipMessage,
+    status_code: u16,
+    source: SocketAddr,
+) {
+    let Some(manager) = state.ipsec_manager.as_ref() else {
+        return;
+    };
+    let answers_notify = || {
+        response.headers.cseq().is_some_and(|cseq| {
+            cseq.split_whitespace()
+                .nth(1)
+                .is_some_and(|method| method.eq_ignore_ascii_case("NOTIFY"))
+        })
+    };
+    if status_code >= 200 && answers_notify() {
+        manager.notify_answered(source);
+    }
+}
+
 /// How long messages to a UE are held for its pair's policy update at most. An
 /// update takes milliseconds; one the kernel never answers must not keep the
 /// UE's messages, and their memory, for ever.

@@ -7,8 +7,14 @@ pub mod milenage;
 
 #[cfg(test)]
 mod concurrency_tests;
+/// UE ports of deleted pairs, refused at egress.
+mod deleted_flows;
+#[cfg(test)]
+mod deleted_flows_tests;
 /// Which ports a P-CSCF's message to a UE leaves from and goes to.
 mod egress;
+/// A pair kept through a network de-registration's NOTIFY.
+mod network_dereg;
 pub use egress::{pcscf_tcp_request_egress, pcscf_udp_egress};
 #[cfg(test)]
 mod egress_tests;
@@ -764,6 +770,11 @@ pub struct IpsecManager {
     lifecycle: retire::Lifecycle,
     /// UE endpoints of bindings restored without their SAs (see [`restore`]).
     orphaned_flows: restore::OrphanedFlows,
+    /// UE ports of deleted pairs (see [`deleted_flows`]).
+    deleted_flows: deleted_flows::DeletedFlows,
+    /// Pairs kept through a network de-registration until its NOTIFY is
+    /// answered (see [`network_dereg`]).
+    network_dereg: network_dereg::AwaitingNotify,
     /// XFRM backend.  Picked at startup from `IpsecConfig.backend`.
     backend: XfrmBackend,
     /// Test-only in-memory kernel.  When set, the four kernel-op methods
@@ -809,6 +820,8 @@ impl IpsecManager {
             spis: spi::SpiAllocator::new(spi_range_start, spi_range_count),
             lifecycle: retire::Lifecycle::default(),
             orphaned_flows: restore::OrphanedFlows::default(),
+            deleted_flows: deleted_flows::DeletedFlows::default(),
+            network_dereg: network_dereg::AwaitingNotify::default(),
             backend,
             #[cfg(test)]
             kernel_mock: None,
@@ -961,6 +974,8 @@ impl IpsecManager {
             self.teardown_unshared(&sa, in_use).await;
             // Only once the kernel states are gone may the SPIs be reused.
             self.release_pair_spis(&sa);
+            // A request still on its way to the UE must not leave in clear.
+            self.bar_deleted_pair(&sa);
             info!(ue = %ue_addr, ue_port_c, "IPsec: SA pair deleted");
         }
         Ok(())

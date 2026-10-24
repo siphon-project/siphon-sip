@@ -57,6 +57,21 @@ entry, but a working config keeps working.
   can attach to the interpreter, or the timer sweep stops turning. The handler
   pool's watchdog could not see a whole-process wedge, which starves the pool
   of work so it looks idle. New gauge `siphon_interpreter_attach_wait_ms`.
+- **A network de-registration's NOTIFY reaches the UE over its SA, and
+  nothing goes to a protected port in clear.** When registrar liveness
+  de-registered an idle protected binding with `network_dereg`, the UE's
+  SA pair was deleted a millisecond after the de-REGISTER left, and the
+  S-CSCF's NOTIFY for the UE's own reg-event subscription then went to the
+  UE's protected server port in clear, from the plaintext listener. The pair
+  is now shortened instead (TS 24.229 clause 5.2.5.2 NOTE 2), for
+  `registrar.liveness.network_dereg_sa_grace_ms` (default 4000), and goes
+  when the UE answers a NOTIFY or the grace is over. Separately, the egress
+  guard that refused requests to the protected ports of bindings restored
+  without their SAs now covers every deleted pair too: a request to a UE
+  port of a pair that is gone, with no live pair covering it, is refused
+  with a `WARN` (private identity, UE address, ports) and counted in
+  `siphon_ipsec_unprotected_sends_refused_total` (TS 33.203 clause 7.1).
+  Responses still go back where their request came from.
 
 ## [1.15.3] — 2026-10-23
 

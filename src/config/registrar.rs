@@ -94,6 +94,12 @@ pub struct RegistrarLivenessConfig {
     pub miss_threshold: u32,
     /// What to do once a binding is declared dead.
     pub dereg_mode: LivenessDeregMode,
+    /// Under `network_dereg`, how long (milliseconds) a de-registered UE's
+    /// IPsec SA pair is kept so the NOTIFY reporting the de-registration
+    /// reaches it over the pair (3GPP TS 24.229 clause 5.2.5.2 NOTE 2). The
+    /// pair goes as soon as the UE answers a NOTIFY, or once this is over.
+    /// Default 4000.
+    pub network_dereg_sa_grace_ms: u64,
 }
 
 impl Default for RegistrarLivenessConfig {
@@ -105,6 +111,7 @@ impl Default for RegistrarLivenessConfig {
             probe_timeout_ms: 4000,
             miss_threshold: 2,
             dereg_mode: LivenessDeregMode::NetworkDereg,
+            network_dereg_sa_grace_ms: 4000,
         }
     }
 }

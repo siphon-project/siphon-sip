@@ -31,6 +31,9 @@ pub(super) struct LivenessDeregCtx {
     /// Consecutive failed sweeps before a suspect binding is reaped
     /// (`registrar_liveness.miss_threshold`).
     pub(super) miss_threshold: u32,
+    /// How long a network de-registration keeps the UE's SA pair for its
+    /// NOTIFY (`registrar_liveness.network_dereg_sa_grace_ms`).
+    pub(super) network_dereg_sa_grace: std::time::Duration,
 }
 
 impl LivenessDeregCtx {
@@ -44,6 +47,9 @@ impl LivenessDeregCtx {
             last_seen: Arc::clone(&state.liveness_last_seen),
             misses: Arc::clone(&state.liveness_misses),
             miss_threshold: state.registrar_liveness.miss_threshold,
+            network_dereg_sa_grace: std::time::Duration::from_millis(
+                state.registrar_liveness.network_dereg_sa_grace_ms,
+            ),
         }
     }
 
@@ -64,6 +70,9 @@ impl LivenessDeregCtx {
             last_seen: Arc::new(DashMap::new()),
             misses: Arc::new(DashMap::new()),
             miss_threshold: crate::config::RegistrarLivenessConfig::default().miss_threshold,
+            network_dereg_sa_grace: std::time::Duration::from_millis(
+                crate::config::RegistrarLivenessConfig::default().network_dereg_sa_grace_ms,
+            ),
         })
     }
 }
@@ -647,10 +656,22 @@ pub(super) async fn liveness_dereg_contact(
     context.registrar.remove_contact(aor, &contact_uri);
 
     // 3. Tear down the UE's IPsec SA so the kernel state goes with the binding.
+    //    After a network de-REGISTER the S-CSCF's NOTIFY reporting it is on its
+    //    way to the UE: the pair is shortened, not deleted, so that NOTIFY goes
+    //    over it (TS 24.229 clause 5.2.5.2 NOTE 2), and goes once the UE
+    //    answers it or the grace is over.
     if let (Some(manager), Some(ue_addr), Some(ue_port_c)) =
         (&context.ipsec_manager, contact.source_addr, ue_port_c)
     {
-        if let Err(error) = manager.delete_sa_pair(&ue_addr.ip(), ue_port_c).await {
+        let kept = network_dereg
+            && manager.shorten_for_network_dereg(
+                ue_addr.ip(),
+                ue_port_c,
+                context.network_dereg_sa_grace,
+            );
+        if kept {
+            // Its scheduled retirement deletes it.
+        } else if let Err(error) = manager.delete_sa_pair(&ue_addr.ip(), ue_port_c).await {
             debug!(aor = %aor, %error, "registrar liveness: IPsec SA teardown failed (may already be gone)");
         }
     }
