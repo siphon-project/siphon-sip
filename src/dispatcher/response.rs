@@ -108,17 +108,15 @@ pub(super) fn handle_response(
                                             "SIPREC: sending subscribe_answer to RTPEngine"
                                         );
                                         let flags = crate::rtpengine::NgFlags::default();
-                                        match tokio::task::block_in_place(|| {
-                                            tokio::runtime::Handle::current().block_on(
-                                                rtpengine_set.subscribe_answer(
-                                                    &original_call_id,
-                                                    &original_from_tag,
-                                                    &original_to_tag,
-                                                    &message.body,
-                                                    &flags,
-                                                ),
-                                            )
-                                        }) {
+                                        match crate::script::blocking::block_on_released(
+                                            rtpengine_set.subscribe_answer(
+                                                &original_call_id,
+                                                &original_from_tag,
+                                                &original_to_tag,
+                                                &message.body,
+                                                &flags,
+                                            ),
+                                        ) {
                                             Ok(_rewritten_sdp) => {
                                                 info!(
                                                     session_id = %session_id,
@@ -522,10 +520,7 @@ pub(super) fn handle_response(
                         return;
                     }
                 };
-                // Free-threaded CPython (3.14t) requires an attached thread to
-                // touch a `Py<…>` refcount; clone the relay callbacks through a
-                // `Python` token rather than the bare `Clone` impl, which would
-                // panic on this (unattached) executor worker. See
+                // `Arc` copies: no attach under the session lock. See
                 // `ProxySession::clone_relay_callbacks`.
                 let (relay_on_reply, relay_on_failure) = session.clone_relay_callbacks();
                 (

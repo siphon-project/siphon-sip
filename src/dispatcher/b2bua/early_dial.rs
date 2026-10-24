@@ -45,7 +45,7 @@ struct HeldSession {
 /// Run a media engine round trip on the SIP-processing path, as the other
 /// B2BUA answer paths do (`anchor_a_leg`).
 fn engine_round_trip<T>(future: impl std::future::Future<Output = T>) -> T {
-    tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(future))
+    crate::script::blocking::block_on_released(future)
 }
 
 /// The SIP Call-ID the caller's media session is stored under.

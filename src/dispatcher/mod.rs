@@ -358,11 +358,15 @@ mod spiral_invite_tests;
 #[cfg(test)]
 mod stale_in_dialog_request_tests;
 #[cfg(test)]
+mod stop_the_world_tests;
+#[cfg(test)]
 mod subscribe_notify_before_2xx_tests;
 #[cfg(test)]
 mod subscribe_reply_order_tests;
 #[cfg(test)]
 mod subscribe_test_harness;
+#[cfg(test)]
+mod sweep_executor_tests;
 #[cfg(test)]
 mod take_over_tests;
 #[cfg(test)]

@@ -742,6 +742,16 @@ impl PendingCoroutine {
     /// tokio task, then `resume` with the coroutine's result as a job on the
     /// Python executor.
     ///
+    /// `resume` runs **detached** from the interpreter and attaches only for
+    /// its own Python calls. What follows an await is mostly Rust — the reply
+    /// or relay, DNS, a TCP connect, IPsec, the session and transaction maps —
+    /// and any of it may block. On free-threaded CPython a thread that blocks
+    /// while attached never reaches a safe point, so a garbage collection's
+    /// stop-the-world waits for it for ever; every thread that attaches after
+    /// that (executor workers, asyncio drivers, the tokio workers completing
+    /// script awaitables) parks behind the collection, nothing drives tokio
+    /// any more, and the future the blocked thread waits on never completes.
+    ///
     /// The resume job waits for queue room rather than being shed: the request
     /// it finishes has been accepted already, and dropping it would leave its
     /// transaction unanswered.
@@ -750,15 +760,13 @@ impl PendingCoroutine {
     /// worker has.
     pub(crate) fn resume_on_executor<F>(self, resume: F)
     where
-        F: FnOnce(Python<'_>, PyResult<Py<PyAny>>) + Send + 'static,
+        F: FnOnce(PyResult<Py<PyAny>>) + Send + 'static,
     {
         tokio::spawn(async move {
             let settled = self.settle().await;
             let queued = crate::script::py_executor::spawn_queued(move || {
-                Python::attach(|python| {
-                    let result = settled.into_result();
-                    resume(python, result);
-                });
+                // `into_result` attaches only on the timeout path.
+                resume(settled.into_result());
             })
             .await;
             if !queued {
@@ -1794,5 +1802,58 @@ mod tests {
                 }
             });
         }
+    }
+
+    /// The work after a suspended handler's await runs detached from the
+    /// interpreter. It is Rust work (the reply, the relay, IPsec, sends) that
+    /// may block on a lock or a round trip, and a thread blocked while
+    /// attached never reaches a safe point: a garbage collection's
+    /// stop-the-world then waits for it for ever, and every thread that
+    /// attaches after that waits behind the collection. Here the resumed job
+    /// blocks on a lock the test holds while another thread collects; the
+    /// collection has to finish anyway.
+    #[test]
+    fn a_resumed_job_blocking_does_not_stop_a_collection() {
+        let _serial = pool_test_guard();
+        let (_executor, pool) = crate::script::async_pool::ensure_test_pools();
+        let _runtime = crate::script::async_pool::test_pools_runtime().enter();
+
+        let gate = Arc::new(std::sync::Mutex::new(()));
+        let held = gate.lock().unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let pending = Python::attach(|python| {
+            let factory = build_factory(
+                python,
+                "import asyncio\nasync def factory():\n    await asyncio.sleep(0.01)\n",
+            );
+            let coroutine = factory.bind(python).call0().unwrap();
+            PendingCoroutine::submit(&pool, python, &coroutine).unwrap()
+        });
+        let blocked_on = Arc::clone(&gate);
+        pending.resume_on_executor(move |_result| {
+            let _ = entered_tx.send(());
+            let _released = blocked_on.lock();
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the resumed job ran");
+
+        let (collected_tx, collected_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            Python::attach(|python| {
+                let _ = python
+                    .import("gc")
+                    .and_then(|gc| gc.call_method0("collect"));
+            });
+            let _ = collected_tx.send(());
+        });
+        let collected = collected_rx.recv_timeout(Duration::from_secs(10)).is_ok();
+        // Let the resumed job go either way, so a failure does not leave the
+        // interpreter stopped for every test after this one.
+        drop(held);
+        assert!(
+            collected,
+            "a garbage collection waited on a resumed job that was blocked while attached"
+        );
     }
 }

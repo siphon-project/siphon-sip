@@ -629,8 +629,8 @@ pub(super) fn relay_request(
                         flow_request_uri: flow_request_uri.clone(),
                     },
                 );
-                session.on_reply_callback = on_reply_callback;
-                session.on_failure_callback = on_failure_callback;
+                session.on_reply_callback = on_reply_callback.map(Arc::new);
+                session.on_failure_callback = on_failure_callback.map(Arc::new);
                 let arc = state.session_store.insert(session);
                 inserted_session_arc = Some(arc);
             }

@@ -550,15 +550,13 @@ pub fn rewrite_reinvite_answer_sdp(
                         if let Some(responder_call_id) = responder_dialog_call_id {
                             answer_flags.stamp_sip_call_id(responder_call_id);
                         }
-                        match tokio::task::block_in_place(|| {
-                            tokio::runtime::Handle::current().block_on(rtpengine_set.answer(
-                                session.rtpengine_id(),
-                                answer_from,
-                                answer_to,
-                                &message.body,
-                                &answer_flags,
-                            ))
-                        }) {
+                        match crate::script::blocking::block_on_released(rtpengine_set.answer(
+                            session.rtpengine_id(),
+                            answer_from,
+                            answer_to,
+                            &message.body,
+                            &answer_flags,
+                        )) {
                             Ok(rewritten_sdp) => {
                                 message.body = rewritten_sdp;
                                 message

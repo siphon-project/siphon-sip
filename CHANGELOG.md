@@ -13,6 +13,40 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A node no longer stops dead under load when an `async def` request
+  handler awaits and a garbage collection runs.** The work after the handler's
+  await (the relay or reply, its DNS lookup, connects, sends) ran attached to
+  the interpreter. On free-threaded CPython a thread that blocks while attached
+  never reaches a garbage collection's safe point, so the collection waited for
+  it for ever; every thread that attached meanwhile parked behind it, tokio's
+  workers included, so the DNS answer or the connect it waited on was never
+  read. The process then served no SIP and no `/metrics`, with no CPU in use,
+  and no watchdog fired. That work now runs detached, as it does on the first
+  pass, and every blocking wait in the dispatcher releases the interpreter when
+  its thread holds it (a test-suite scan guards both).
+
+- **Timer expiries no longer run script handlers on the timer sweep's task.**
+  One task drives every SIP transaction timer; an `@proxy.on_failure` on Timer
+  B/F or an `@b2bua.on_failure` on a ring timeout that awaited held it for the
+  whole await, so every other timeout and retransmission in the process waited.
+  Each turn now runs on the executor, and each expiry that reaches a script is
+  an executor job of its own.
+
+- **The request's action no longer runs under the request's lock**, and the
+  response path no longer attaches to the interpreter under a proxy session's
+  lock: either could otherwise close the same stop-the-world deadlock with a
+  script task that still held the request.
+
+### Added
+
+- **Process liveness watchdog** (`script.process_stall_abort_secs`, default 30,
+  `0` disables): aborts for a supervisor restart when the tokio runtime runs no
+  timer, socket or task, most of its workers are stuck in one poll, no thread
+  can attach to the interpreter, or the timer sweep stops turning. The handler
+  pool's watchdog could not see a whole-process wedge, which starves the pool
+  of work so it looks idle. New gauge `siphon_interpreter_attach_wait_ms`.
 ### Added
 
 - **Per-call `media_flags` on the control plane.** `answer`, an anchored

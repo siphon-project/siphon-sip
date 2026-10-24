@@ -178,12 +178,17 @@ pub(super) fn run_request_handlers(
             // thread: take what the request queued so far with it, and leave
             // deferral off here for whatever runs next.
             let carried = crate::script::api::proxy_utils::drain_deferred_sends();
-            pending.resume_on_executor(move |_python, result| match result {
+            // Resumed detached: `run_request_handlers` attaches for the
+            // handlers only, and `finish_request` — the reply or relay, DNS,
+            // connects, IPsec — runs detached as on the first pass.
+            pending.resume_on_executor(move |result| match result {
+                // The handler's return value means nothing; dropped detached,
+                // its reference goes to pyo3's deferred pool.
                 Ok(_) => run_request_handlers(scripted, py_request, next, carried),
                 Err(error) => {
                     crate::script::api::proxy_utils::resume_deferred_sends(carried);
                     record_script_error("async Python", &error);
-                    drop(py_request);
+                    Python::attach(|_| drop(py_request));
                     finish_request(scripted, ScriptDecision::script_error());
                 }
             });
@@ -241,10 +246,19 @@ pub(super) fn finish_request(scripted: ScriptedRequest, decision: ScriptDecision
         }
     }
 
-    // Process the action
-    let Ok(message_guard) = message_arc.lock() else {
-        error!("message_arc lock poisoned");
-        return;
+    // Process the action, on a copy of the request rather than under its lock.
+    // The action waits (DNS, a connect, a send), and the request is still
+    // shared with the script: a task it left running can lock it through an
+    // auth, IPsec or QoS call, attached to the interpreter. Holding the lock
+    // across the wait would park that thread attached, and a garbage
+    // collection's stop-the-world would then wait on it while the wait needs
+    // the tokio workers the stop-the-world has parked.
+    let request_message = match message_arc.lock() {
+        Ok(guard) => guard.clone(),
+        Err(_) => {
+            error!("message_arc lock poisoned");
+            return;
+        }
     };
     match &action {
         RequestAction::None => {
@@ -273,7 +287,7 @@ pub(super) fn finish_request(scripted: ScriptedRequest, decision: ScriptDecision
             reason,
             reliable,
         } => send_scripted_reply(
-            &message_guard,
+            &request_message,
             ScriptedReply {
                 code: *code,
                 reason,
@@ -296,7 +310,7 @@ pub(super) fn finish_request(scripted: ScriptedRequest, decision: ScriptDecision
             // immediately upon receiving an INVITE to stop UAC retransmissions.
             if method == "INVITE" {
                 let trying = build_response(
-                    &message_guard,
+                    &request_message,
                     100,
                     "Trying",
                     state.identity.load().server.as_deref(),
@@ -314,9 +328,9 @@ pub(super) fn finish_request(scripted: ScriptedRequest, decision: ScriptDecision
             let send_socket = state.resolve_send_socket(send_socket.as_deref());
             // A registered phone's INVITE: its dialog is tracked from here,
             // with the identity the script authenticated.
-            proxy_dialog_begin(&message_guard, auth_user.as_deref(), &inbound, state);
+            proxy_dialog_begin(&request_message, auth_user.as_deref(), &inbound, state);
             relay_request(
-                &message_guard,
+                &request_message,
                 next_hop.as_deref(),
                 record_routed,
                 &inbound,
@@ -330,7 +344,7 @@ pub(super) fn finish_request(scripted: ScriptedRequest, decision: ScriptDecision
                 send_socket.as_ref(),
                 strip,
             );
-            proxy_dialog_after_relay(&message_guard, state);
+            proxy_dialog_after_relay(&request_message, state);
         }
         RequestAction::Fork {
             targets,
@@ -343,7 +357,7 @@ pub(super) fn finish_request(scripted: ScriptedRequest, decision: ScriptDecision
             if targets.is_empty() {
                 warn!("fork with empty targets list");
                 let response = build_response(
-                    &message_guard,
+                    &request_message,
                     500,
                     "No Targets",
                     state.identity.load().server.as_deref(),
@@ -360,7 +374,7 @@ pub(super) fn finish_request(scripted: ScriptedRequest, decision: ScriptDecision
             } else {
                 if method == "INVITE" {
                     let trying = build_response(
-                        &message_guard,
+                        &request_message,
                         100,
                         "Trying",
                         state.identity.load().server.as_deref(),
@@ -380,9 +394,9 @@ pub(super) fn finish_request(scripted: ScriptedRequest, decision: ScriptDecision
                     _ => crate::proxy::fork::ForkStrategy::Parallel,
                 };
                 let send_socket = state.resolve_send_socket(send_socket.as_deref());
-                proxy_dialog_begin(&message_guard, auth_user.as_deref(), &inbound, state);
+                proxy_dialog_begin(&request_message, auth_user.as_deref(), &inbound, state);
                 relay_fork_request(
-                    &message_guard,
+                    &request_message,
                     targets,
                     flows,
                     routes,
@@ -396,7 +410,7 @@ pub(super) fn finish_request(scripted: ScriptedRequest, decision: ScriptDecision
                     on_failure_cb,
                     strip,
                 );
-                proxy_dialog_after_relay(&message_guard, state);
+                proxy_dialog_after_relay(&request_message, state);
             }
         }
     }
@@ -436,7 +450,7 @@ struct ScriptedReply<'a> {
 /// Send the reply the script decided on through the server transaction, with
 /// the messages deferred to the same peer behind it.
 fn send_scripted_reply(
-    message_guard: &SipMessage,
+    request_message: &SipMessage,
     reply: ScriptedReply<'_>,
     method: &str,
     inbound: &InboundMessage,
@@ -450,7 +464,7 @@ fn send_scripted_reply(
         ..
     } = reply;
     let mut response = build_response(
-        message_guard,
+        request_message,
         code,
         reason,
         state.identity.load().server.as_deref(),
@@ -490,7 +504,7 @@ fn send_scripted_reply(
     // (32s = 64×T1) elapses.
     let mut reliable_provisional_armed = false;
     if reliable && (101..200).contains(&code) {
-        if !crate::sip::headers::rseq::supports_100rel(&message_guard.headers) {
+        if !crate::sip::headers::rseq::supports_100rel(&request_message.headers) {
             warn!(
                 method = %method, code = %code,
                 "reliable=True ignored: UAC didn't advertise 100rel in Supported/Require"
@@ -516,7 +530,7 @@ fn send_scripted_reply(
             response.headers.set("RSeq", rseq.to_string());
             arm_reliable_provisional_retransmit(
                 rseq,
-                message_guard,
+                request_message,
                 response.clone(),
                 inbound,
                 state,
@@ -536,7 +550,7 @@ fn send_scripted_reply(
         super::ipsec_lifecycle::take_into_use_before_2xx(state, inbound.remote_addr);
         super::ipsec_lifecycle::on_register_2xx(
             state,
-            message_guard,
+            request_message,
             inbound.remote_addr,
             inbound.transport,
         );

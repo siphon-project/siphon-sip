@@ -312,14 +312,12 @@ pub fn anchor_a_leg(
 
     // Media round-trip on the SIP-processing path (block_in_place is consistent
     // with the existing B2BUA answer paths — NOT the control-command path).
-    let answer_sdp = tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(backend.answer_local(
-            &plan.media_call_id,
-            &plan.from_tag,
-            &plan.offer_sdp,
-            &plan.flags,
-        ))
-    })
+    let answer_sdp = crate::script::blocking::block_on_released(backend.answer_local(
+        &plan.media_call_id,
+        &plan.from_tag,
+        &plan.offer_sdp,
+        &plan.flags,
+    ))
     .map_err(|error| format!("answer_local failed: {error}"))?;
 
     // Record the media session (so a later delete / control-app media correlation

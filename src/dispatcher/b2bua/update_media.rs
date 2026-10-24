@@ -124,15 +124,13 @@ pub fn update_answer_through_media_engine(
     if let Some(answerer_sip_call_id) = answerer_sip_call_id {
         answer_flags.stamp_sip_call_id(answerer_sip_call_id);
     }
-    match tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(rtpengine_set.answer(
-            session.rtpengine_id(),
-            answer_from,
-            answer_to,
-            answer,
-            &answer_flags,
-        ))
-    }) {
+    match crate::script::blocking::block_on_released(rtpengine_set.answer(
+        session.rtpengine_id(),
+        answer_from,
+        answer_to,
+        answer,
+        &answer_flags,
+    )) {
         Ok(rewritten_sdp) => UpdateAnswerOutcome::Rewritten(rewritten_sdp),
         Err(error) => UpdateAnswerOutcome::Failed(error.to_string()),
     }

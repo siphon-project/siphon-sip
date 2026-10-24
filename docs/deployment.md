@@ -363,9 +363,10 @@ and the blocking-handler contract that drives these.
   A binary that embeds SIPhon as a library can bake the same string in via
   `siphon::install_allocator!("narenas:4,background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:0")`.
 - **Stability over heroics:** if a node is unstable under load, fix the instability —
-  don't paper over it with more nodes. The liveness watchdog
-  (`script.handler_stall_abort_secs`) converts a hang into a fast supervised restart
-  rather than an indefinite outage.
+  don't paper over it with more nodes. The liveness watchdogs
+  (`script.handler_stall_abort_secs` for the handler pool,
+  `script.process_stall_abort_secs` for the whole process) convert a hang into a
+  fast supervised restart rather than an indefinite outage.
 
 ### State backup & DR
 

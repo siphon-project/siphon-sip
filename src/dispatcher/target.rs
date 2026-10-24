@@ -114,14 +114,12 @@ pub(super) fn resolve_candidates_inner(
             }
         }
 
-        let results = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(resolver.resolve(
-                &uri.host,
-                uri.port,
-                uri.scheme.as_str(),
-                transport_hint.as_deref(),
-            ))
-        });
+        let results = crate::script::blocking::block_on_released(resolver.resolve(
+            &uri.host,
+            uri.port,
+            uri.scheme.as_str(),
+            transport_hint.as_deref(),
+        ));
         let host_port = crate::gateway::extract_address_from_uri(uri_string);
 
         return results
@@ -198,19 +196,17 @@ pub(super) fn resolve_tcp_path(
             // Numeric host (v4 or bracketed v6) — same address, TCP.
             udp_destination
         } else {
-            let results = tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(resolver.resolve(
-                    &uri.host,
-                    uri.port,
-                    uri.scheme.as_str(),
-                    Some("tcp"),
-                ))
-            });
+            let results = crate::script::blocking::block_on_released(resolver.resolve(
+                &uri.host,
+                uri.port,
+                uri.scheme.as_str(),
+                Some("tcp"),
+            ));
             results.into_iter().next()?.address
         }
     };
     // The real reachability test: only switch if a TCP listener answers.
-    let reachable = tokio::task::block_in_place(|| {
+    let reachable = crate::script::blocking::blocking_released(|| {
         std::net::TcpStream::connect_timeout(&candidate, TCP_PROBE_TIMEOUT).is_ok()
     });
     reachable.then_some(candidate)
@@ -632,13 +628,11 @@ pub(super) fn send_to_target(
             let source = protected_request(destination, transport, state)
                 .map(|protected| protected.source)
                 .or(send_bind_stream);
-            let connect_result = tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(async {
-                    match source {
-                        Some(source) => pool.send_tcp_from(source, destination, data_clone).await,
-                        None => pool.send_tcp(destination, data_clone).await,
-                    }
-                })
+            let connect_result = crate::script::blocking::block_on_released(async {
+                match source {
+                    Some(source) => pool.send_tcp_from(source, destination, data_clone).await,
+                    None => pool.send_tcp(destination, data_clone).await,
+                }
             });
             match connect_result {
                 Ok(connection_id) => {
@@ -678,15 +672,13 @@ pub(super) fn send_to_target(
                 let pool = Arc::clone(&state.connection_pool);
                 let server_name = target.server_name.clone();
                 let data_clone = data;
-                return match tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current().block_on(pool.send_tls_from(
-                        listener,
-                        destination,
-                        server_name.as_deref(),
-                        target.verify_server,
-                        data_clone,
-                    ))
-                }) {
+                return match crate::script::blocking::block_on_released(pool.send_tls_from(
+                    listener,
+                    destination,
+                    server_name.as_deref(),
+                    target.verify_server,
+                    data_clone,
+                )) {
                     Ok(connection_id) => {
                         debug!(
                             destination = %destination,
@@ -748,14 +740,12 @@ pub(super) fn send_to_target(
                 let pool = Arc::clone(&state.connection_pool);
                 let data_clone = data;
                 let server_name = target.server_name.clone();
-                match tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current().block_on(pool.send_tls_with_policy(
-                        destination,
-                        server_name.as_deref(),
-                        Some(verify),
-                        data_clone,
-                    ))
-                }) {
+                match crate::script::blocking::block_on_released(pool.send_tls_with_policy(
+                    destination,
+                    server_name.as_deref(),
+                    Some(verify),
+                    data_clone,
+                )) {
                     Ok(connection_id) => {
                         debug!(
                             destination = %destination,

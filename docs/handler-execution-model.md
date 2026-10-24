@@ -301,7 +301,7 @@ events) still hold their worker until the coroutine settles, so for them the
 
 ## Backpressure & liveness guarantees
 
-Beyond elasticity, the pool is defended on two more fronts so a misbehaving
+Beyond elasticity, the pool is defended on three more fronts so a misbehaving
 handler degrades gracefully instead of taking the node down silently:
 
 1. **Bounded queue + load-shed.** When the pool is at its cap and the queue is
@@ -321,6 +321,55 @@ handler degrades gracefully instead of taking the node down silently:
    never fires — the abort turns an indefinite outage into a seconds-long
    restart and leaves a core for post-mortem.
 
+3. **Process liveness / fail-fast.** The pool watchdog above stays quiet while
+   the pool has idle capacity, and a wedge of the *whole process* looks exactly
+   like that: when every thread is parked, nothing reads the sockets and
+   nothing is queued. A second watchdog judges the process instead, from
+   signals that do not depend on the pool:
+   - a tokio task that sleeps on a tokio timer and round-trips a loopback
+     datagram, so it lands only when the scheduler, the timer driver and the
+     I/O driver all turn;
+   - tokio's per-worker park counters: more than half of the workers stuck in
+     one poll trips, before the last one goes;
+   - a thread that attaches to the interpreter and detaches every second, which
+     cannot complete while a garbage collection's stop-the-world never ends;
+   - the timer sweep, which drives every SIP transaction timer, stamping each
+     turn.
+
+   Any of them owed for `script.process_stall_abort_secs` (default 30 s; `0`
+   disables it, independently of `handler_stall_abort_secs`) writes one line
+   to stderr and aborts. The probe's attach wait is published as
+   `siphon_interpreter_attach_wait_ms`, so a stop-the-world held open for a
+   second or two, far too short to abort over, still shows.
+
+### Never block while attached
+
+On free-threaded CPython a garbage collection stops the world: it waits for
+every thread *attached* to the interpreter to reach a safe point. A thread that
+blocks in Rust while attached (on a lock, a channel, or a tokio future via
+`block_on`) never reaches one. The collection then waits for it for ever, and
+every thread that attaches meanwhile parks behind the collection: the executor
+workers, the asyncio drivers, and the tokio workers that complete script
+awaitables. Once every tokio worker is parked, the future the blocked thread
+waits on can never complete, and the process stops with no CPU in use.
+
+siphon keeps every such wait detached:
+
+- The work after an `async def` request handler's await (the reply or relay,
+  its DNS lookup, connects, sends) runs detached, as it does on the first pass;
+  only the handlers themselves run attached.
+- Every blocking wait in the dispatcher and the transport goes through a helper
+  that releases the interpreter when the thread holds it, and a source scan in
+  the test suite fails any that does not.
+- The timer sweep runs each turn on the executor, and each expiry that reaches
+  a script (`@proxy.on_failure` on Timer B/F, `@b2bua.on_failure` on a ring
+  timeout, and more) as an executor job of its own, so no script handler runs
+  on a tokio worker and one slow handler holds up only its own transaction.
+- The request's action runs on a copy of the request, not under its lock, so a
+  script task still holding the request never waits for that lock attached.
+- The proxy session's relay callbacks are shared, so the response path copies
+  them under the session lock without attaching.
+
 ## Metrics (`/metrics`)
 
 | Metric | Meaning |
@@ -332,6 +381,7 @@ handler degrades gracefully instead of taking the node down silently:
 | `siphon_pyexec_jobs_completed_total` | completed handler jobs |
 | `siphon_pyexec_jobs_shed_total` | jobs dropped because the queue was full |
 | `siphon_async_coroutines_pending` | `async def` handler coroutines on a driver, not yet settled |
+| `siphon_interpreter_attach_wait_ms` | how long the liveness probe's last attach to the interpreter waited |
 | `siphon_auth_ha1_cache_hits_total` | HTTP-auth lookups served from cache |
 
 **Alert on**: a sustained `rate(siphon_pyexec_jobs_shed_total)` > 0, or

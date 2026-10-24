@@ -95,6 +95,59 @@ pub fn install_charging_hooks(state: &Arc<DispatcherState>) {
     }
 }
 
+/// One turn of the sweep, run as a job on the Python executor rather than on
+/// this tokio task.
+///
+/// Expiries end in script handlers (`@proxy.on_failure` on Timer B/F,
+/// `@b2bua.on_failure` on a ring timeout, and more), and a script handler on a
+/// tokio worker is wrong twice over: it parks the worker behind every garbage
+/// collection's stop-the-world, and while it runs nothing else in the process
+/// times out or retransmits. On the executor, the turn finds the expiries and
+/// each one that reaches a script is posted as a job of its own
+/// ([`post_expiry`]), so one slow handler holds up only its own transaction.
+/// The turn is awaited, not fired and forgotten, so turns never overlap.
+async fn sweep_on_executor(state: &Arc<DispatcherState>, turn: fn(&DispatcherState)) {
+    let job_state = Arc::clone(state);
+    let ran = crate::script::py_executor::run_queued(move || {
+        SWEEP_STATE.with(|cell| *cell.borrow_mut() = Some(Arc::clone(&job_state)));
+        turn(&job_state);
+        SWEEP_STATE.with(|cell| *cell.borrow_mut() = None);
+    })
+    .await;
+    if ran.is_err() {
+        error!("timer sweep turn did not run: the Python executor is gone or the turn panicked");
+    }
+}
+
+thread_local! {
+    /// The dispatcher a sweep turn on this thread is for, so [`post_expiry`]
+    /// can hand an expiry to a job of its own.
+    static SWEEP_STATE: std::cell::RefCell<Option<Arc<DispatcherState>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Act on one expiry found by a sweep turn: as an executor job of its own when
+/// the turn is the dispatcher's sweep, and right here, on `state`, otherwise (a
+/// test or a caller driving the check directly, which expects the work done on
+/// return).
+///
+/// Queued without shedding: the expiry is owed an answer (a 408, a CANCEL).
+pub(crate) fn post_expiry(
+    state: &DispatcherState,
+    work: impl FnOnce(&DispatcherState) + Send + 'static,
+) {
+    let swept = SWEEP_STATE.with(|cell| cell.borrow().clone());
+    let (Some(swept), Ok(runtime)) = (swept, tokio::runtime::Handle::try_current()) else {
+        return work(state);
+    };
+    runtime.spawn(async move {
+        let queued = crate::script::py_executor::spawn_queued(move || work(&swept)).await;
+        if !queued {
+            error!("timer expiry dropped: the Python executor is gone");
+        }
+    });
+}
+
 /// Fire the transaction timers and sweep the stores: retransmissions every
 /// 100 ms, the B2BUA call-lifetime checks every 500 ms.
 pub fn spawn_timer_sweep(state: &Arc<DispatcherState>) {
@@ -114,24 +167,35 @@ pub fn spawn_timer_sweep(state: &Arc<DispatcherState>) {
             // Stale entry cleanup: every 30s
             let mut cleanup_interval = tokio::time::interval(std::time::Duration::from_secs(30));
 
+            // Stamped every turn, so the liveness watchdog sees this task stop
+            // even when the rest of the runtime is fine: it drives every
+            // transaction timer in the process.
+            let stamp = crate::script::liveness::register_loop("timer-sweep");
             loop {
+                stamp.tick();
                 tokio::select! {
                     _ = timer_interval.tick() => {
-                        fire_expired_timers(&state);
-                        sweep_b2bua_retransmits(&state);
-                        sweep_unacked_uas_2xx(&state);
-                        sweep_owed_reinvite_acks(&state);
+                        sweep_on_executor(&state, |state| {
+                            fire_expired_timers(state);
+                            sweep_b2bua_retransmits(state);
+                            sweep_unacked_uas_2xx(state);
+                            sweep_owed_reinvite_acks(state);
+                        })
+                        .await;
                     }
                     _ = answer_timeout_interval.tick() => {
-                        check_b2bua_answer_timeouts(&state);
-                        check_b2bua_prack_timeouts(&state);
-                        check_b2bua_max_call_durations(&state);
-                        check_b2bua_replacement_timeouts(&state);
-                        check_pending_inbound_refer_timeouts(&state);
-                        check_answered_refer_expiry(&state);
-                        check_controller_refer_timeouts(&state);
-                        check_orphaned_ro_sessions(&state);
-                        check_deferred_referrer_byes(&state);
+                        sweep_on_executor(&state, |state| {
+                            check_b2bua_answer_timeouts(state);
+                            check_b2bua_prack_timeouts(state);
+                            check_b2bua_max_call_durations(state);
+                            check_b2bua_replacement_timeouts(state);
+                            check_pending_inbound_refer_timeouts(state);
+                            check_answered_refer_expiry(state);
+                            check_controller_refer_timeouts(state);
+                            check_orphaned_ro_sessions(state);
+                            check_deferred_referrer_byes(state);
+                        })
+                        .await;
                     }
                     _ = cleanup_interval.tick() => {
                         sweep_stale_entries(&state).await;
