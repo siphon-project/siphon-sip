@@ -214,12 +214,14 @@ impl UacSender {
         source_local_addr: Option<SocketAddr>,
     ) -> (SocketAddr, Option<SocketAddr>) {
         match &self.ipsec_egress {
+            // Every send of a UacSender is a request.
             Some((manager, pcscf_port_s)) => crate::ipsec::pcscf_udp_egress(
                 manager,
                 *pcscf_port_s,
                 transport,
                 destination,
                 source_local_addr,
+                true,
             ),
             None => (destination, source_local_addr),
         }

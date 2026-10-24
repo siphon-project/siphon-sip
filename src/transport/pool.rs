@@ -582,6 +582,7 @@ impl ConnectionPool {
             connection_id,
             destination,
             Transport::Tcp,
+            (bind_addr.port() != 0).then_some(bind_addr.port()),
         );
         tokio::spawn(async move {
             let mut accumulator = BytesMut::with_capacity(65536);

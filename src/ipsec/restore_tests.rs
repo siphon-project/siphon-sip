@@ -182,7 +182,7 @@ async fn a_protected_binding_restored_without_its_sas_is_dropped() {
     let before = crate::metrics::ipsec::restored_without_sa().expect("initialised");
 
     let (dropped, log) = captured(tracing::Level::WARN, || {
-        manager.drop_restored_bindings_without_sa(&registrar, PORT_PC, PORT_PS)
+        manager.drop_restored_bindings_without_sa(&registrar, &[PORT_PC], PORT_PS)
     });
 
     assert_eq!(dropped, 1);
@@ -224,7 +224,7 @@ async fn a_protected_binding_with_its_sa_pair_is_kept() {
         .expect("installed");
 
     assert_eq!(
-        manager.drop_restored_bindings_without_sa(&registrar, PORT_PC, PORT_PS),
+        manager.drop_restored_bindings_without_sa(&registrar, &[PORT_PC], PORT_PS),
         0
     );
     assert_eq!(registrar.lookup(IMPU).len(), 1);
@@ -241,7 +241,7 @@ async fn an_unprotected_binding_is_kept() {
     let manager = manager();
 
     assert_eq!(
-        manager.drop_restored_bindings_without_sa(&registrar, PORT_PC, PORT_PS),
+        manager.drop_restored_bindings_without_sa(&registrar, &[PORT_PC], PORT_PS),
         0
     );
     assert_eq!(registrar.lookup(IMPU).len(), 1);
@@ -259,7 +259,7 @@ async fn a_request_to_a_barred_protected_port_never_leaves_in_clear() {
     let store = previous_process_backend(ue_addr, PORT_PS).await;
     let (registrar, _writes) = restored(&store).await;
     let manager = manager();
-    manager.drop_restored_bindings_without_sa(&registrar, PORT_PC, PORT_PS);
+    manager.drop_restored_bindings_without_sa(&registrar, &[PORT_PC], PORT_PS);
     let (router, wire) = router();
     let before = crate::metrics::ipsec::unprotected_sends_refused().expect("initialised");
 
@@ -296,7 +296,7 @@ async fn a_response_to_a_barred_port_is_sent() {
     let store = previous_process_backend(ue_addr, PORT_PS).await;
     let (registrar, _writes) = restored(&store).await;
     let manager = manager();
-    manager.drop_restored_bindings_without_sa(&registrar, PORT_PC, PORT_PS);
+    manager.drop_restored_bindings_without_sa(&registrar, &[PORT_PC], PORT_PS);
     let (router, wire) = router();
     let response = "SIP/2.0 401 Unauthorized\r\n\
                     Via: SIP/2.0/UDP 198.51.100.14:6100;branch=z9hG4bK-2\r\n\
@@ -319,7 +319,7 @@ async fn a_new_sa_pair_lifts_the_bar() {
     let store = previous_process_backend(ue_addr, PORT_PS).await;
     let (registrar, _writes) = restored(&store).await;
     let manager = manager();
-    manager.drop_restored_bindings_without_sa(&registrar, PORT_PC, PORT_PS);
+    manager.drop_restored_bindings_without_sa(&registrar, &[PORT_PC], PORT_PS);
     manager
         .create_sa_pair(pair(&manager, ue_addr))
         .await

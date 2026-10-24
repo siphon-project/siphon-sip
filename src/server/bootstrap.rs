@@ -203,7 +203,7 @@ pub(super) async fn reconcile_ipsec_restart(
     };
     let dropped = manager.drop_restored_bindings_without_sa(
         registrar,
-        ipsec_config.pcscf_port_c,
+        ipsec_config.pcscf_port_c.as_slice(),
         ipsec_config.pcscf_port_s,
     );
     if dropped > 0 {

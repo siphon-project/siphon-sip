@@ -13,6 +13,7 @@ mod deleted_flows;
 mod deleted_flows_tests;
 /// Which ports a P-CSCF's message to a UE leaves from and goes to.
 mod egress;
+pub(crate) use egress::is_request;
 /// A pair kept through a network de-registration's NOTIFY.
 mod network_dereg;
 pub use egress::{pcscf_tcp_request_egress, pcscf_udp_egress};
@@ -23,6 +24,11 @@ mod ip_policy;
 #[cfg(target_os = "linux")]
 mod kernel_objects;
 pub mod netlink;
+/// Which protected client port a pair takes, and when a pair with its own
+/// is taken into use (TS 33.203 clauses 7.4.0 and 7.4.2a).
+mod port_rotation;
+#[cfg(test)]
+mod port_rotation_tests;
 /// Registrations restored without their security associations.
 pub mod restore;
 #[cfg(test)]
@@ -880,7 +886,17 @@ impl IpsecManager {
         // P-CSCF's outbound policy a pair in use holds: the challenge for
         // this pair still goes over that one, and this pair is pending until
         // taken into use (`take_into_use`).
-        let (kept, pending) = self.objects_left_to_siblings(&sa);
+        let (kept, shares_policy) = self.objects_left_to_siblings(&sa);
+        // With a protected client port of its own (ipsec.pcscf_port_c lists
+        // several), the pair shares no kernel object with the set in use, yet
+        // is not in use either: it carries the authentication only, until the
+        // 2xx and a further message over it (TS 33.203 clause 7.4.2a).
+        let pending = if shares_policy {
+            Some(retire::Pending::SharedPolicy)
+        } else {
+            self.beside_a_set_in_use(&sa)
+                .then_some(retire::Pending::Challenged)
+        };
         self.teardown_sa_kernel_except(&sa, &kept).await;
 
         // Atomic: install all eight; on ANY failure, roll back THIS call's
@@ -950,6 +966,9 @@ impl IpsecManager {
         if let Some((_, sa)) = self.associations.remove(&key) {
             let in_use = self.is_in_use(&sa);
             self.forget_lifecycle(&key);
+            if in_use {
+                self.set_in_use_went(&sa);
+            }
             // The connection the P-CSCF opened to the UE's protected server
             // port for its own requests (TS 24.229 clause 5.2.2.2 1A b) is
             // carried by this pair, and a connection from a pinned port is
@@ -1271,14 +1290,27 @@ impl IpsecManager {
     /// so responses never come here.
     ///
     /// Same key and cost as [`udp_flow_to_ue`](Self::udp_flow_to_ue).
+    ///
+    /// A request goes over the set in use, so for a pair still pending (the
+    /// one an authentication in progress set up) it takes the set in use on
+    /// the same UE protected server port ([`request_pair`](Self::request_pair)).
     pub fn tcp_flow_to_ue(&self, destination: std::net::SocketAddr) -> FlowToUe {
-        let Some(entry) = self
-            .associations
-            .get(&Self::contact_key(&destination.ip(), destination.port()))
-        else {
+        let Some(pair) = self.get_sa(&destination.ip(), destination.port()) else {
             return FlowToUe::NotProtected;
         };
-        entry.value().tcp_flow_to_ue()
+        self.request_pair(pair).tcp_flow_to_ue()
+    }
+
+    /// [`udp_flow_to_ue`](Self::udp_flow_to_ue) for a request: over the set in
+    /// use, as [`tcp_flow_to_ue`](Self::tcp_flow_to_ue). A response stays on
+    /// the pair its request came over (TS 24.229 clause 5.2.2.2: the 200 to
+    /// the REGISTER "within the same security association to that in which
+    /// the REGISTER request was protected").
+    pub fn udp_request_flow_to_ue(&self, destination: std::net::SocketAddr) -> FlowToUe {
+        let Some(pair) = self.get_sa(&destination.ip(), destination.port()) else {
+            return FlowToUe::NotProtected;
+        };
+        self.request_pair(pair).udp_flow_to_ue()
     }
 
     /// Find an SA pair where the given UE address sends from either of
@@ -1286,14 +1318,29 @@ impl IpsecManager {
     /// inbound request's `(source_addr, source_port)` to the SA that
     /// just decrypted it.  Walks the DashMap — O(N) in number of
     /// currently active SAs.
+    ///
+    /// On the UE's protected server port, which an old and a new set share
+    /// (TS 33.203 clause 7.4.0), the pair is the one requests to the UE go
+    /// over: in use, not pending or being retired, then the newest
+    /// ([`request_pair`](Self::request_pair)).
     pub fn find_sa_by_ue(&self, ue_addr: &IpAddr, ue_port: u16) -> Option<SecurityAssociationPair> {
+        let mut on_server_port = None;
         for entry in self.associations.iter() {
             let sa = entry.value();
-            if sa.ue_addr == *ue_addr && (sa.ue_port_c == ue_port || sa.ue_port_s == ue_port) {
+            if sa.ue_addr != *ue_addr {
+                continue;
+            }
+            if sa.ue_port_c == ue_port {
                 return Some(sa.clone());
             }
+            if sa.ue_port_s == ue_port && on_server_port.is_none() {
+                on_server_port = Some(sa.clone());
+                if self.lifecycle.none_pending() && !self.is_retiring(sa) {
+                    break;
+                }
+            }
         }
-        None
+        on_server_port.map(|pair| self.request_pair(pair))
     }
 
     /// Snapshot the inbound SPIs of every active SA pair for the registrar's

@@ -97,7 +97,10 @@ auth:
 # IPsec — 3GPP TS 33.203 security associations
 # ---------------------------------------------------------------------------
 ipsec:
-  pcscf_port_c: 5064         # P-CSCF client port (protected, shared across UEs)
+  pcscf_port_c: 5064         # P-CSCF client port (protected). A list, e.g.
+                             # [5064, 5068], gives every re-authentication of a
+                             # UE a new port_pc (TS 33.203 7.4.0); siphon binds
+                             # the listed ports next to pcscf_port_s.
   pcscf_port_s: 5066         # P-CSCF server port (protected, shared across UEs)
   backend: netlink           # "netlink" (default, fastest) or "ip" (shell-out fallback)
   # spi_range_start: 10000   # set per-instance for multi-process P-CSCFs (>= 256)

@@ -162,6 +162,25 @@ entry, but a working config keeps working.
   and `originate`.** It used to be read as no profile at all, so the call was
   anchored on the default profile the controller never named. `stream_start`
   already refused it.
+- **The P-CSCF changes its protected client port on every authentication**
+  (TS 33.203 clause 7.4.0: "the protected client ports at the UE (port_uc) and
+  the P-CSCF (port_pc) shall change"). `ipsec.pcscf_port_c` now takes a list
+  as well as one port (`pcscf_port_c: [5064, 5068]`); each new SA pair takes a
+  port no other pair of the same UE holds, other UEs may share it. The old and
+  new set of a re-authentication then share no selector or kernel policy, so
+  the P-CSCF follows clause 7.4.2a as written: the 401 goes over the old set,
+  the 200 over the new, requests to the UE stay on the old set until a message
+  arrives over the new one (or the old set goes), and the old set is then kept
+  64*T1 for its pending transactions. The connection siphon opened to the UE
+  from the old port goes with the old set. `SecurityServerParams.port_c` and
+  `SAHandle.pcscf_port_c` are the pair's own port; `ipsec.pcscf_port_c` is the
+  first configured one and the new `ipsec.pcscf_ports_c` lists them all.
+  siphon binds every listed port, over UDP and (where `pcscf_port_s` has a TCP
+  listener) TCP, wherever `pcscf_port_s` is bound at a concrete address. A list
+  is refused at load with a port twice, `pcscf_port_s`, 5060/5061, a listed
+  port bound on a wildcard address, or no concrete `listen.udp` entry on
+  `pcscf_port_s`. A single port behaves exactly as in 1.15.3, sharing the
+  outbound policy of SA #3 between the sets.
 
 ## [1.15.3] — 2026-10-23
 
