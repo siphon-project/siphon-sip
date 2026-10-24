@@ -40,6 +40,9 @@ use crate::transport::{
     Transport,
 };
 
+/// Opening a pooled connection without sending on it.
+mod connect;
+
 /// Idle timeout for pooled outbound connections (shorter than inbound).
 ///
 /// Outbound pool connections carry one-shot traffic — a gateway health probe, a
@@ -386,7 +389,7 @@ impl ConnectionPool {
                             key.clone(),
                             bind_addr,
                             destination,
-                            data.clone(),
+                            Some(data.clone()),
                         )
                         .await,
                     ),
@@ -443,7 +446,7 @@ impl ConnectionPool {
         key: PoolKey,
         bind_addr: SocketAddr,
         destination: SocketAddr,
-        data: Bytes,
+        data: Option<Bytes>,
     ) -> Result<ConnectionId, std::io::Error> {
         // Create new connection.  Default bind (`port 0`) lets the OS
         // pick an ephemeral port — required for non-IPsec destinations
@@ -733,15 +736,16 @@ impl ConnectionPool {
         // Send the initial data.  Never waits, like every other enqueue: the writer
         // task above is live but a peer that never reads still backs the
         // channel up, and this runs on a script-executor worker.
-        match enqueue(&write_tx, data) {
-            Enqueued::Sent => {}
-            Enqueued::Closed => {
+        // A bare connect ([`connect_tcp_from`](Self::connect_tcp_from)) has none.
+        match data.map(|data| enqueue(&write_tx, data)) {
+            None | Some(Enqueued::Sent) => {}
+            Some(Enqueued::Closed) => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::BrokenPipe,
                     "pooled connection closed immediately",
                 ));
             }
-            Enqueued::Backlogged => {
+            Some(Enqueued::Backlogged) => {
                 return Err(backlogged(destination, &write_tx));
             }
         }
