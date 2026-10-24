@@ -153,8 +153,8 @@ fn send_uas_response(
 /// `answer` (`final_response`) and `progress` — the two UAS responses an
 /// application sends on a parked A-leg.
 ///
-/// `answer` additionally takes `anchor` (or a `profile` / `ws_uri`, which imply
-/// it), which turns it into the verb
+/// `answer` additionally takes `anchor` (or a `profile` / `ws_uri` /
+/// `media_flags`, which imply it), which turns it into the verb
 /// form of `call.handover(answer=True, profile=…, ws_uri=…)`: siphon synthesizes
 /// the RFC 3264 answer against the media engine and anchors the leg's audio to
 /// it in the same act. That is the only way an application that accepted an
@@ -208,17 +208,25 @@ pub(super) fn answer(
     // way to connect it — answering first and bridging afterwards is not the
     // same thing, because `received_from`, echo cancellation and the VAD engine
     // are properties of the answer.
-    let profile = args.get("profile").and_then(|value| value.as_str());
+    let profile = match super::media_flags::profile_name(verb, args) {
+        Ok(profile) => profile,
+        Err(refusal) => return refusal,
+    };
     let ws_uri = args.get("ws_uri").and_then(|value| value.as_str());
+    let media_flags = match super::media_flags::parse(verb, args) {
+        Ok(media_flags) => media_flags,
+        Err(refusal) => return refusal,
+    };
     // `anchor` on its own means "answer through the media engine on its default
     // profile" — without it, naming neither argument would be indistinguishable
-    // from a plain `answer`. Either named argument implies it.
+    // from a plain `answer`. Each named argument implies it.
     let anchor = args
         .get("anchor")
         .and_then(|value| value.as_bool())
         .unwrap_or(false)
         || profile.is_some()
-        || ws_uri.is_some();
+        || ws_uri.is_some()
+        || media_flags.is_some();
     if anchor {
         if arg_present(args, "body") {
             return ControlResult::error(
@@ -226,6 +234,30 @@ pub(super) fn answer(
                 "an anchored answer or progress synthesizes the SDP itself (RFC 3264) — a \
                  body passed alongside it would be discarded, so pass one or the other",
             );
+        }
+        if let Some(flags) = &media_flags {
+            // The flags shape the engine's answer, and an earlier anchored
+            // progress already made it: a 2xx (or a second 18x) repeats that
+            // answer rather than anchoring again, so the flags would have
+            // nothing to act on. Refused, not dropped.
+            if crate::dispatcher::b2bua_early_media_sdp(&channel.call_actor_id).is_some() {
+                return super::media_flags::out_of_place(
+                    verb,
+                    "already_anchored",
+                    format!(
+                        "{verb} args.media_flags shape the engine's answer, and this call's \
+                         anchored early media already sent it — set them on the progress that \
+                         anchors the call"
+                    ),
+                );
+            }
+            if let Err(refusal) = super::media_flags::check_against_profile(
+                verb,
+                flags,
+                profile.unwrap_or(crate::dispatcher::b2bua::ANSWER_FIRST_DEFAULT_PROFILE),
+            ) {
+                return refusal;
+            }
         }
         if !final_response {
             // Early media through the engine (RFC 3960 §3.1): the 18x carries
@@ -242,12 +274,13 @@ pub(super) fn answer(
             if let Err(refusal) = present_contact_host() {
                 return refusal;
             }
-            return match crate::dispatcher::b2bua_progress_call_anchored(
+            return match crate::dispatcher::b2bua_progress_call_anchored_with_flags(
                 &channel.call_actor_id,
                 code,
                 &reason,
                 profile,
                 ws_uri,
+                media_flags.as_ref(),
                 &headers,
             ) {
                 Ok(()) => ControlResult::Ok(serde_json::json!({
@@ -266,12 +299,13 @@ pub(super) fn answer(
         if let Err(refusal) = present_contact_host() {
             return refusal;
         }
-        return match crate::dispatcher::b2bua_answer_call_anchored(
+        return match crate::dispatcher::b2bua_answer_call_anchored_with_flags(
             &channel.call_actor_id,
             code,
             &reason,
             profile,
             ws_uri,
+            media_flags.as_ref(),
             &headers,
         ) {
             Ok(()) => ControlResult::Ok(serde_json::json!({

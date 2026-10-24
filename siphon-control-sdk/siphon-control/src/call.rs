@@ -16,7 +16,8 @@ use crate::args::{
     build_play_source, extract_dial_offer, extract_dial_on_answer, extract_dial_strategy,
     extract_dial_targets, extract_headers, extract_play_repeat, extract_privacy,
     extract_record_channels, extract_record_direction, extract_route_target,
-    extract_stream_channels, extract_stream_direction, extract_stream_mode, parse_peer_hangup,
+    extract_stream_channels, extract_stream_direction, extract_stream_mode, optional_media_flags,
+    parse_peer_hangup,
 };
 use crate::{attach_if_running, interpreter_gone, json_to_py, optional_json, to_pyerr};
 
@@ -205,7 +206,7 @@ impl Call {
     ///     agent = await pick_an_agent(call)      # only the app knows when
     ///     await call.answer_anchored(profile="voice_ai")
     /// ```
-    #[pyo3(signature = (profile=None, ws_uri=None, *, contact_host=None, contact_user=None))]
+    #[pyo3(signature = (profile=None, ws_uri=None, *, contact_host=None, contact_user=None, media_flags=None))]
     fn answer_anchored<'py>(
         &self,
         py: Python<'py>,
@@ -213,10 +214,12 @@ impl Call {
         ws_uri: Option<String>,
         contact_host: Option<String>,
         contact_user: Option<String>,
+        media_flags: Option<Bound<'py, PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
+        let media_flags = optional_media_flags(media_flags.as_ref())?;
         let call = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            if contact_host.is_none() && contact_user.is_none() {
+            if contact_host.is_none() && contact_user.is_none() && media_flags.is_none() {
                 call.answer_anchored(profile.as_deref(), ws_uri.as_deref())
                     .await
             } else {
@@ -226,6 +229,7 @@ impl Call {
                     ws_uri,
                     contact_host,
                     contact_user,
+                    media_flags,
                     ..ResponseOptions::default()
                 })
                 .await
@@ -964,7 +968,7 @@ impl Call {
     ///                             direction="caller", sample_rate=16000)
     ///     await call.stream_start("wss://ai.example/agent", mode="bridge",
     ///                             profile="voice_ai")
-    #[pyo3(signature = (ws_uri, direction=None, channels=None, *, mode="tee", sample_rate=None, profile=None))]
+    #[pyo3(signature = (ws_uri, direction=None, channels=None, *, mode="tee", sample_rate=None, profile=None, media_flags=None))]
     #[allow(clippy::too_many_arguments)]
     fn stream_start<'py>(
         &self,
@@ -975,6 +979,7 @@ impl Call {
         mode: &str,
         sample_rate: Option<u32>,
         profile: Option<String>,
+        media_flags: Option<Bound<'py, PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let options = StreamOptions {
             mode: extract_stream_mode(mode)?,
@@ -982,6 +987,7 @@ impl Call {
             channels: extract_stream_channels(channels)?,
             sample_rate,
             profile,
+            media_flags: optional_media_flags(media_flags.as_ref())?,
         };
         let call = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {

@@ -88,7 +88,7 @@ mod call;
 
 use args::{
     extract_aor_ring, extract_headers, extract_privacy, extract_session_timer,
-    extract_string_pairs, originate_media,
+    extract_string_pairs, optional_media_flags, originate_media,
 };
 use call::Call;
 
@@ -447,6 +447,7 @@ impl ControlClient {
         session_timer=None,
         contact_host=None,
         contact_user=None,
+        media_flags=None,
     ))]
     fn originate<'py>(
         &self,
@@ -475,6 +476,7 @@ impl ControlClient {
         session_timer: Option<Bound<'py, PyAny>>,
         contact_host: Option<String>,
         contact_user: Option<String>,
+        media_flags: Option<Bound<'py, PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let destination = match (to, aor) {
             (Some(to), None) if strategy.is_none() && total_timeout.is_none() => {
@@ -492,7 +494,8 @@ impl ControlClient {
                 ))
             }
         };
-        let plan = originate_media(media, profile, ws_uri, sdp, body, content_type)?;
+        let media_flags = optional_media_flags(media_flags.as_ref())?;
+        let plan = originate_media(media, profile, ws_uri, media_flags, sdp, body, content_type)?;
         let privacy = extract_privacy("originate", privacy)?;
         let options = OriginateOptions {
             from: from_uri,

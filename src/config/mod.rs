@@ -1370,22 +1370,16 @@ impl Config {
                 // error text named a range the engine did not accept. The
                 // bounds now come from the proto crate both sides already
                 // depend on: the two happen to coincide today, and restating
-                // the digits is exactly how they came to disagree before.
+                // the digits is exactly how they came to disagree before. The
+                // check is shared with the control rail's per-call
+                // `media_flags`, so a call cannot be let through on a rule boot
+                // has since tightened.
                 if let Some(window) = flags.echo_delay_search_ms {
-                    let (low, high, meaning) = if flags.echo_long_tail {
-                        (
-                            siphon_rtp_proto::ECHO_LONG_TAIL_MS_MIN,
-                            siphon_rtp_proto::ECHO_LONG_TAIL_MS_MAX,
-                            "a tail length, because echo_long_tail is set",
-                        )
-                    } else {
-                        (
-                            siphon_rtp_proto::ECHO_DELAY_SEARCH_MS_MIN,
-                            siphon_rtp_proto::ECHO_DELAY_SEARCH_MS_MAX,
-                            "a search window",
-                        )
-                    };
-                    if !(low..=high).contains(&window) {
+                    if let Err(bound) = crate::rtpengine::media_flags::check_echo_delay_search_ms(
+                        window,
+                        flags.echo_long_tail,
+                    ) {
+                        let (low, high, meaning) = (bound.low, bound.high, bound.meaning);
                         return Err(SiphonError::Config(format!(
                             "media profile {name:?} sets echo_delay_search_ms to {window} on its \
                              {direction} flags, outside the {low}-{high} ms the engine accepts \

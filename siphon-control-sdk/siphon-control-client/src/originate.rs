@@ -35,6 +35,9 @@ pub enum OriginateMedia {
         profile: Option<String>,
         /// Per-call WebSocket bridge URI for the anchored leg.
         ws_uri: Option<String>,
+        /// Overrides of the profile's processing settings for this call,
+        /// merged over its answer half when siphon answers the callee.
+        media_flags: Option<siphon_control_proto::media_flags::MediaFlags>,
     },
     /// Your own SDP offer. `application/sdp` by definition — pass
     /// [`OriginateMedia::Body`] for anything else.
@@ -54,6 +57,7 @@ impl OriginateMedia {
         Self::Anchor {
             profile: None,
             ws_uri: None,
+            media_flags: None,
         }
     }
 
@@ -62,6 +66,22 @@ impl OriginateMedia {
         Self::Anchor {
             profile: Some(profile.into()),
             ws_uri: None,
+            media_flags: None,
+        }
+    }
+
+    /// Anchor on `profile` (the server's default when `None`) with
+    /// `media_flags` over its processing settings for this call only. Only an
+    /// anchor plan takes them, which is why this is a constructor and not a
+    /// setter an offer plan could be handed.
+    pub fn anchor_with_flags(
+        profile: Option<String>,
+        media_flags: siphon_control_proto::media_flags::MediaFlags,
+    ) -> Self {
+        Self::Anchor {
+            profile,
+            ws_uri: None,
+            media_flags: Some(media_flags),
         }
     }
 
@@ -72,13 +92,20 @@ impl OriginateMedia {
 
     pub(crate) fn insert_into(&self, args: &mut serde_json::Map<String, serde_json::Value>) {
         match self {
-            OriginateMedia::Anchor { profile, ws_uri } => {
+            OriginateMedia::Anchor {
+                profile,
+                ws_uri,
+                media_flags,
+            } => {
                 args.insert("media".to_string(), json!(true));
                 if let Some(profile) = profile {
                     args.insert("profile".to_string(), json!(profile));
                 }
                 if let Some(ws_uri) = ws_uri {
                     args.insert("ws_uri".to_string(), json!(ws_uri));
+                }
+                if let Some(media_flags) = media_flags {
+                    args.insert("media_flags".to_string(), media_flags.to_json());
                 }
             }
             OriginateMedia::Sdp(sdp) => {
