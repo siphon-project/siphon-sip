@@ -347,7 +347,7 @@ pub(super) fn relay_request(
     //
     // The Via names the pair's protected server port, not the source: see
     // `crate::ipsec::runtime::protected_request`.
-    let protected = match outbound_transport {
+    let mut protected = match outbound_transport {
         Transport::Udp | Transport::Tcp => {
             protected_request(destination, outbound_transport, state)
         }
@@ -364,22 +364,23 @@ pub(super) fn relay_request(
             outbound_transport = protected.transport;
         }
     }
-    let ipsec_source = protected.map(|protected| protected.source);
+    let mut ipsec_source = protected.map(|protected| protected.source);
 
     // RFC 3261 §18.1.1 — bias an over-MTU UDP request to TCP.  The length is
     // measured before our Via is added (`mtu - 200` leaves headroom for it plus
-    // downstream Via additions).  Skipped for flow-/IPsec-pinned egress: a
-    // captured flow and an IPsec SA both pin the transport authoritatively (the
-    // kernel XFRM selector would drop a switched-transport frame).  The
-    // `state.mtu.is_some()` guard keeps the serialise off the default hot path.
-    if state.mtu.is_some() && flow.is_none() && ipsec_source.is_none() {
-        if let Some((tcp_transport, tcp_addr)) = mtu_tcp_upgrade(
-            state.mtu,
+    // downstream Via additions).  Skipped for flow-pinned egress, whose
+    // transport is the flow's.  Toward a UE with a security association the
+    // TCP path is the P-CSCF's own connection to the UE's protected server
+    // port (see `over_mtu_upgrade`), and the protected source and Via follow
+    // it.  The `state.mtu.is_some()` guard keeps the serialise off the default
+    // hot path.
+    if state.mtu.is_some() && flow.is_none() {
+        if let Some((tcp_transport, tcp_addr)) = over_mtu_upgrade(
+            state,
             outbound_transport,
             relayed.to_bytes().len(),
             &target_uri_string,
             destination,
-            &state.dns_resolver,
         ) {
             // A hostname's _sip._tcp path could point back at us — don't switch
             // into a loop (the UDP destination already passed is_own_address).
@@ -388,6 +389,10 @@ pub(super) fn relay_request(
             } else {
                 outbound_transport = tcp_transport;
                 destination = tcp_addr;
+                if protected.is_some() {
+                    protected = protected_request(destination, outbound_transport, state);
+                    ipsec_source = protected.map(|protected| protected.source);
+                }
             }
         }
     }
@@ -1051,13 +1056,12 @@ pub(super) fn relay_fork_branch(
     // RFC 3261 §18.1.1 — bias an over-MTU UDP fork branch to TCP.  Skipped for a
     // flow-pinned branch (its transport is fixed by connection reuse).
     if state.mtu.is_some() && flow.is_none() {
-        if let Some((tcp_transport, tcp_addr)) = mtu_tcp_upgrade(
-            state.mtu,
+        if let Some((tcp_transport, tcp_addr)) = over_mtu_upgrade(
+            state,
             outbound_transport,
             relayed.to_bytes().len(),
             target,
             destination,
-            &state.dns_resolver,
         ) {
             if state.is_own_address(&tcp_addr) {
                 warn!(%tcp_addr, "fork §18.1.1: TCP path loops back to us — keeping UDP");
