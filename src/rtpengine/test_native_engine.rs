@@ -133,6 +133,9 @@ pub(crate) struct NativeCommand {
     /// The profile's `address_family` on an `answer_local`, `offer`, `answer`
     /// or `reoffer`.
     pub(crate) address_family: Option<String>,
+    /// The whole profile a command carried, for a test asserting on a
+    /// processing setting (`echo_cancellation`, the VAD knobs).
+    pub(crate) profile: Option<siphon_rtp_proto::ProfileFlags>,
 }
 
 /// What a recorded command carried, before the engine decides on it.
@@ -512,6 +515,7 @@ impl NativeTestEngine {
                                         .profile
                                         .as_ref()
                                         .and_then(|profile| profile.address_family.clone()),
+                                    profile: record.profile,
                                 });
                             }
                         }

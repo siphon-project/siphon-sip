@@ -34,7 +34,18 @@ pub fn originate_anchor_2xx(
     let entry = registry
         .get(&anchor.profile)
         .ok_or_else(|| format!("unknown media profile '{}'", anchor.profile))?;
-    let mut flags = entry.answer.clone();
+    // The call's own `media_flags` over the profile's answer half, on a copy:
+    // the registry entry is what every other call naming the profile reads.
+    // They were checked against this profile when the originate was placed,
+    // and profiles do not change at runtime, so this cannot refuse what the
+    // verb accepted; it is checked again so the answer never runs on flags
+    // boot would refuse.
+    let mut flags = match &anchor.media_flags {
+        None => entry.answer.clone(),
+        Some(media_flags) => media_flags
+            .applied_to(&entry.answer)
+            .map_err(|refusal| refusal.message)?,
+    };
 
     let offer_sdp = std::str::from_utf8(&response.body)
         .map_err(|_| "the callee's 2xx body is not valid UTF-8 SDP".to_string())?
