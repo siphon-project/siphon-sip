@@ -557,10 +557,8 @@ impl SiphonServer {
         );
         let core_threads = sizing.core_threads;
         let max_threads = sizing.max_threads;
-        // Bound the queue (load-shed under overload instead of unbounded growth)
-        // and arm the liveness watchdog (abort + supervisor-restart only if the
-        // pool reaches the cap and still wedges). `handler_stall_abort_secs == 0`
-        // disables the watchdog.
+        // Bound the queue (load-shed, not unbounded growth) and arm the pool
+        // watchdog (`handler_stall_abort_secs`; 0 disables it).
         let executor_config = crate::script::py_executor::ExecutorConfig {
             core_threads,
             max_threads,
@@ -574,15 +572,8 @@ impl SiphonServer {
             tokio::runtime::Handle::current(),
             executor_config,
         );
-        // Whole-process liveness, which the pool watchdog above cannot judge:
-        // a wedge that parks every thread starves the pool of work too, so it
-        // looks idle. See `script::liveness`.
-        if config.script.process_stall_abort_secs > 0 {
-            crate::script::liveness::start(
-                tokio::runtime::Handle::current(),
-                std::time::Duration::from_secs(config.script.process_stall_abort_secs),
-            );
-        }
+        // Whole-process liveness, which the pool watchdog cannot judge.
+        crate::script::liveness::start_from_config(&config.script);
 
         dispatcher::inject_python_singletons(&config);
         // Media-engine async event channel (DTMF, media-timeout). Created before

@@ -312,10 +312,8 @@ pub(crate) fn run_interpreter_probe(
         probe();
         let waited = started.elapsed();
         beat.end();
-        if let Some(registry) = crate::metrics::try_metrics() {
-            registry
-                .interpreter_attach_wait_ms
-                .set(i64::try_from(waited.as_millis()).unwrap_or(i64::MAX));
+        if let Some(gauge) = attach_wait_gauge() {
+            gauge.set(i64::try_from(waited.as_millis()).unwrap_or(i64::MAX));
         }
         if waited >= Duration::from_secs(1) {
             // Off the probe's attach: this thread holds nothing here.
@@ -326,6 +324,36 @@ pub(crate) fn run_interpreter_probe(
             );
         }
         std::thread::sleep(interval);
+    }
+}
+
+/// `siphon_interpreter_attach_wait_ms`, registered on first use once the
+/// metrics registry exists.
+fn attach_wait_gauge() -> Option<&'static prometheus::IntGauge> {
+    static GAUGE: OnceLock<prometheus::IntGauge> = OnceLock::new();
+    if let Some(gauge) = GAUGE.get() {
+        return Some(gauge);
+    }
+    let metrics = crate::metrics::try_metrics()?;
+    let gauge = prometheus::IntGauge::new(
+        "siphon_interpreter_attach_wait_ms",
+        "How long the liveness probe's last attach to the Python interpreter waited (ms)",
+    )
+    .ok()?;
+    if GAUGE.set(gauge.clone()).is_ok() {
+        let _ = metrics.registry.register(Box::new(gauge));
+    }
+    GAUGE.get()
+}
+
+/// Start the process liveness watchdog for the current tokio runtime, unless
+/// `script.process_stall_abort_secs` is 0.
+pub(crate) fn start_from_config(config: &crate::config::ScriptConfig) {
+    if config.process_stall_abort_secs > 0 {
+        start(
+            TokioHandle::current(),
+            Duration::from_secs(config.process_stall_abort_secs),
+        );
     }
 }
 
