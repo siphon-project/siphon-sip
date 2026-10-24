@@ -123,7 +123,7 @@ aes = "0.9"
 # ATIS-1000074). RustCrypto, pure-Rust, no OpenSSL — fits the rustls posture.
 # ECDSA signing uses RFC 6979 deterministic nonces, so no RNG plumbing on the
 # sign path.
-p256 = { version = "0.13", features = ["ecdsa", "pem", "pkcs8"] }  # ES256 sign/verify + key load
+p256 = { version = "0.14", features = ["ecdsa", "pem", "pkcs8"] }  # ES256 sign/verify + key load
 x509-cert = { version = "0.3", features = ["pem"] }               # cert parse, SPKI, extensions, validity
 base64 = "0.23"                                                    # base64url (URL_SAFE_NO_PAD) for JWS
 

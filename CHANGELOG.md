@@ -13,6 +13,12 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
+### Security
+
+- **p256 0.14** (crypto-bigint 0.7.7, RUSTSEC-2026-0387: timing variability
+  in operations meant to be constant-time) for STIR/SHAKEN ES256 signing and
+  verification.
+
 ## [1.15.3] — 2026-10-23
 
 ### Added

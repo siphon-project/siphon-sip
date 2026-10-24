@@ -436,6 +436,95 @@ mod tests {
         assert!(!parsed.verify_signature(&other_vk));
     }
 
+    fn hex_bytes(hex: &str) -> Vec<u8> {
+        (0..hex.len())
+            .step_by(2)
+            .map(|index| u8::from_str_radix(&hex[index..index + 2], 16).unwrap())
+            .collect()
+    }
+
+    /// RFC 7515 Appendix A.3: a published ES256 JWS signed by an external
+    /// implementation must verify through the PASSporT verify path.
+    #[test]
+    fn es256_verifies_rfc7515_appendix_a3_signature() {
+        let x = B64
+            .decode("f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU")
+            .unwrap();
+        let y = B64
+            .decode("x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0")
+            .unwrap();
+        let mut point = vec![0x04];
+        point.extend_from_slice(&x);
+        point.extend_from_slice(&y);
+        let verifying = VerifyingKey::from_sec1_bytes(&point).unwrap();
+
+        let signing_input = concat!(
+            "eyJhbGciOiJFUzI1NiJ9",
+            ".",
+            "eyJpc3MiOiJqb2UiLA0KICJleHAiOjEzMDA4MTkzODAsDQogImh0dHA6Ly9leGFtcGxlLmNvbS9pc19yb290Ijp0cnVlfQ",
+        );
+        let signature = B64
+            .decode("DtEhU3ljbEg8L38VWAfUAqOyKAM6-Xx-F4GawxaepmXFCgfTjDxw5djxLa8ISlSApmWQxfKTUJqPP3-Kg6NU1Q")
+            .unwrap();
+        let passport = ParsedPassport {
+            alg: "ES256".to_string(),
+            ppt: String::new(),
+            typ: String::new(),
+            x5u: String::new(),
+            claims: serde_json::Value::Null,
+            signing_input: signing_input.to_string(),
+            signature: signature.clone(),
+        };
+        assert!(passport.verify_signature(&verifying));
+
+        let mut tampered = passport.clone();
+        tampered.signing_input.push('x');
+        assert!(!tampered.verify_signature(&verifying));
+    }
+
+    /// RFC 6979 Appendix A.2.5 (P-256, SHA-256): ES256 signing is
+    /// deterministic, so the signer must reproduce the published (r, s)
+    /// byte for byte, and our verifier must accept it.
+    #[test]
+    fn es256_signing_matches_rfc6979_appendix_a25_vectors() {
+        let scalar = hex_bytes("C9AFA9D845BA75166B5C215767B1D6934E50C3DB36E89B127B8A622B120F6721");
+        let signing = SigningKey::from_slice(&scalar).unwrap();
+        let verifying = VerifyingKey::from(&signing);
+        assert_eq!(
+            verifying.to_sec1_point(false).as_bytes(),
+            hex_bytes(concat!(
+                "04",
+                "60FED4BA255A9D31C961EB74C6356D68C049B8923B61FA6CE669622E60F29FB6",
+                "7903FE1008B8BC99A41AE9E95628BC64F2F1B20C2D7E9F5177A3C294D4462299",
+            ))
+            .as_slice()
+        );
+
+        let vectors = [
+            (
+                "sample",
+                "EFD48B2AACB6A8FD1140DD9CD45E81D69D2C877B56AAF991C34D0EA84EAF3716",
+                "F7CB1C942D657C41D436C7A1B6E29F65F3E900DBB9AFF4064DC4AB2F843ACDA8",
+            ),
+            (
+                "test",
+                "F1ABB023518351CD71D881567B1EA663ED3EFCF6C5132B354F28D3B0B7D38367",
+                "019F4113742A2B14BD25926B49C649155F267E60D3814B4C0CC84250E46F0083",
+            ),
+        ];
+        for (message, r, s) in vectors {
+            let signature: Signature = signing.try_sign(message.as_bytes()).unwrap();
+            let mut expected = hex_bytes(r);
+            expected.extend_from_slice(&hex_bytes(s));
+            assert_eq!(
+                signature.to_bytes().as_slice(),
+                expected.as_slice(),
+                "{message}"
+            );
+            assert!(verifying.verify(message.as_bytes(), &signature).is_ok());
+        }
+    }
+
     #[test]
     fn malformed_tokens_rejected() {
         assert!(parse_token("only-one-segment").is_err());
