@@ -9,9 +9,11 @@
 
 use super::*;
 
+/// Install the subscriber. The returned guards flush the log writer threads
+/// when dropped; the caller holds them for the life of the process.
 pub(super) fn init_logging(
     log_config: &crate::config::LogConfig,
-) -> Option<tracing_appender::non_blocking::WorkerGuard> {
+) -> Vec<tracing_appender::non_blocking::WorkerGuard> {
     use crate::config::{LogFormat, LogLevel};
     use event_clock::{EventClock, SharedTime};
     use tracing_subscriber::prelude::*;
@@ -27,24 +29,39 @@ pub(super) fn init_logging(
     });
 
     let is_json = log_config.format == LogFormat::Json;
+    let mut guards = Vec::with_capacity(2);
+
+    // Non-blocking, like the file writer below: the console writes on its own
+    // thread. Written directly, a full stdout pipe parked whichever thread
+    // logged, and a thread attached to the interpreter that parks there holds
+    // a garbage collection's stop-the-world open until the pipe drains, which
+    // stops every other thread that touches Python. Lossy when the buffer is
+    // full; `siphon_log_lines_dropped_total` counts what that drops.
+    let (console_writer, console_guard) = tracing_appender::non_blocking(std::io::stdout());
+    crate::metrics::log_writer::track(console_writer.error_counter());
+    guards.push(console_guard);
 
     let console_layer = if is_json {
         tracing_subscriber::fmt::layer()
             .json()
             .with_timer(SharedTime)
+            .with_writer(console_writer)
             .boxed()
     } else {
         tracing_subscriber::fmt::layer()
             .with_timer(SharedTime)
+            .with_writer(console_writer)
             .boxed()
     };
 
-    let (file_layer, guard) = if let Some(ref path) = log_config.file {
+    let file_layer = if let Some(ref path) = log_config.file {
         let file = crate::file_sink::open_append(path).unwrap_or_else(|error| {
             eprintln!("Failed to open log file {path}: {error}");
             std::process::exit(1);
         });
         let (non_blocking, guard) = tracing_appender::non_blocking(file);
+        crate::metrics::log_writer::track(non_blocking.error_counter());
+        guards.push(guard);
 
         let layer = if is_json {
             tracing_subscriber::fmt::layer()
@@ -61,9 +78,9 @@ pub(super) fn init_logging(
                 .boxed()
         };
 
-        (Some(layer), Some(guard))
+        Some(layer)
     } else {
-        (None, None)
+        None
     };
 
     // EventClock precedes both `fmt` layers deliberately: `Layered` dispatches
@@ -84,7 +101,7 @@ pub(super) fn init_logging(
         .with(file_layer)
         .init();
 
-    guard
+    guards
 }
 
 /// Compute the per-process identity tag from config + environment, then

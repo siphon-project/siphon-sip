@@ -10,6 +10,8 @@ pub mod enum_servers;
 pub mod event_lag;
 pub mod glibc;
 pub mod ipsec;
+pub mod log_writer;
+mod python_stats;
 pub mod rate_limit;
 pub mod send_queue;
 pub mod timer;
@@ -49,6 +51,7 @@ pub fn try_metrics() -> Option<&'static SiphonMetrics> {
 }
 
 mod startup;
+pub use python_stats::update_python_stats;
 pub use startup::init;
 
 /// Access the custom metrics store (for script-defined metrics).
@@ -2012,28 +2015,6 @@ pub fn verify_global_allocator() {
 /// expected — a warning there would be misleading.
 #[cfg(target_env = "msvc")]
 pub fn verify_global_allocator() {}
-
-/// Refresh the Python-side allocation gauge from `sys.getallocatedblocks()`.
-///
-/// Python objects live in CPython's own allocator (mimalloc on free-threaded
-/// builds), which jemalloc — and therefore [`update_memory_stats`] — cannot
-/// see. This is the leak signal for the Python side: a script accumulating
-/// objects, or a leaked `Py<>` reference. Cheap; called on the cleanup tick.
-pub fn update_python_stats() {
-    let Some(metrics) = metrics() else {
-        return;
-    };
-    use pyo3::prelude::*;
-    let result = pyo3::Python::attach(|python| -> PyResult<i64> {
-        python
-            .import("sys")?
-            .call_method0("getallocatedblocks")?
-            .extract()
-    });
-    if let Ok(blocks) = result {
-        metrics.python_allocated_blocks.set(blocks);
-    }
-}
 
 /// Refresh the glibc allocator gauges from `malloc_info`. Call periodically (the
 /// dispatcher does so on its cleanup tick). This is the C-side / CPython
