@@ -8,6 +8,7 @@
 
 use serde_json::json;
 
+use siphon_control_proto::media_flags::MediaFlags;
 use siphon_control_proto::sip::SipVerb;
 
 use crate::error::ControlError;
@@ -47,6 +48,10 @@ pub struct ResponseOptions {
     /// sent an 18x or 2xx: the same user again is accepted, another is
     /// `invalid_state`.
     pub contact_user: Option<String>,
+    /// Per-call overrides of the anchored response's media profile (its
+    /// answer half), for this call only. Implies `anchor` server-side; see
+    /// [`MediaFlags`].
+    pub media_flags: Option<MediaFlags>,
 }
 
 impl ResponseOptions {
@@ -59,6 +64,12 @@ impl ResponseOptions {
     /// Present this host in siphon's Contact toward the caller.
     pub fn contact_host(mut self, host: impl Into<String>) -> Self {
         self.contact_host = Some(host.into());
+        self
+    }
+
+    /// Anchor with these overrides of the profile's processing settings.
+    pub fn media_flags(mut self, flags: MediaFlags) -> Self {
+        self.media_flags = Some(flags);
         self
     }
 
@@ -82,6 +93,9 @@ impl ResponseOptions {
             if let Some(value) = value {
                 args.insert(name.to_string(), json!(value));
             }
+        }
+        if let Some(flags) = &self.media_flags {
+            args.insert("media_flags".to_string(), flags.to_json());
         }
         serde_json::Value::Object(args)
     }
@@ -259,6 +273,31 @@ mod tests {
                 "contact_host": "tenant-a.example.com",
             })
         );
+    }
+
+    #[test]
+    fn an_anchored_response_carries_its_media_flags() {
+        let options = ResponseOptions {
+            anchor: true,
+            profile: Some("voice_ai".to_string()),
+            ..ResponseOptions::default()
+        }
+        .media_flags(MediaFlags {
+            echo_cancellation: Some(false),
+            ..MediaFlags::default()
+        });
+        assert_eq!(
+            options.to_json(),
+            json!({
+                "anchor": true,
+                "profile": "voice_ai",
+                "media_flags": { "echo_cancellation": false },
+            })
+        );
+        assert!(ResponseOptions::default()
+            .to_json()
+            .get("media_flags")
+            .is_none());
     }
 
     #[test]
