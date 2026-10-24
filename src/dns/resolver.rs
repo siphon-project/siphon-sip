@@ -109,6 +109,27 @@ impl SipResolver {
         }
     }
 
+    /// A resolver asking only the nameserver at `address`, with no cache, for a
+    /// test that serves its own answers (and their timing).
+    #[cfg(test)]
+    pub(crate) fn with_test_nameserver(address: std::net::SocketAddr) -> Self {
+        use hickory_resolver::config::{ConnectionConfig, NameServerConfig, ResolverConfig};
+        use hickory_resolver::net::runtime::TokioRuntimeProvider;
+
+        let mut connection = ConnectionConfig::udp();
+        connection.port = address.port();
+        let mut config = ResolverConfig::default();
+        config.name_servers = vec![NameServerConfig::new(address.ip(), true, vec![connection])];
+        let mut builder =
+            TokioResolver::builder_with_config(config, TokioRuntimeProvider::default());
+        builder.options_mut().cache_size = 0;
+        builder.options_mut().attempts = QUERY_ATTEMPTS;
+        Self {
+            resolver: builder.build().expect("a resolver over a literal server"),
+            total_budget: TOTAL_BUDGET,
+        }
+    }
+
     /// Resolve a SIP target to one or more socket addresses.
     ///
     /// Follows RFC 3263 procedure:
