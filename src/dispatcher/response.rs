@@ -16,6 +16,8 @@ pub(super) fn handle_response(
     mut status_code: u16,
     state: &DispatcherState,
 ) {
+    // A UE answering its de-registration NOTIFY ends the grace of its pair.
+    ipsec_lifecycle::on_final_response(state, &message, status_code, inbound.remote_addr);
     // The response an `@proxy.on_failure` handler made with `request.reply()`
     // replaces the failure, status code and all.
     let mut script_replied = false;

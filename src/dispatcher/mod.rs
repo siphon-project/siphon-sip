@@ -71,6 +71,8 @@ mod ipsec_request_flow_tests;
 mod ipsec_response_flow_tests;
 mod late_answer;
 mod liveness;
+#[cfg(test)]
+mod liveness_network_dereg_tests;
 mod media_init;
 mod proxy_dialog_state;
 mod proxy_release;

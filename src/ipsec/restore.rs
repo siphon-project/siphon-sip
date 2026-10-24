@@ -93,8 +93,9 @@ impl IpsecManager {
     }
 
     /// Whether `message` must not leave: a request to a UE endpoint whose
-    /// security associations died with a previous process, while no SA pair
-    /// of this manager covers it. Logged at ERROR and counted
+    /// security associations died with a previous process, or to a UE port of
+    /// a pair this manager deleted ([`super::deleted_flows`], logged at WARN),
+    /// while no SA pair of this manager covers it. Logged at ERROR and counted
     /// (`siphon_ipsec_unprotected_sends_refused_total`) when refused.
     ///
     /// Only requests are refused. A response goes back to where its request
@@ -103,6 +104,9 @@ impl IpsecManager {
     /// that a new SA pair covers again, or whose binding would have expired by
     /// now, is forgotten.
     pub fn refuses_unprotected_send(&self, message: &OutboundMessage) -> bool {
+        if self.refuses_send_to_deleted_flow(message) {
+            return true;
+        }
         let endpoints = &self.orphaned_flows.endpoints;
         if endpoints.is_empty() {
             return false;
@@ -142,6 +146,7 @@ impl IpsecManager {
         self.orphaned_flows
             .endpoints
             .retain(|_, until| *until > now);
+        self.deleted_flows.prune(now);
     }
 
     /// How many UE endpoints are barred from unprotected requests.

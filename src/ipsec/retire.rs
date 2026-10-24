@@ -161,6 +161,7 @@ impl IpsecManager {
         self.lifecycle.registered.remove(key);
         self.lifecycle.predecessors.remove(key);
         self.lifecycle.pending.remove(key);
+        self.network_dereg.forget(key);
     }
 
     /// Note that a registrar binding was registered over the pair at

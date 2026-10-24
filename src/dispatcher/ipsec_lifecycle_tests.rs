@@ -164,18 +164,27 @@ fn registrar_answers(
             extra,
         ),
     );
-    proxy
-        .wire()
-        .into_iter()
-        // Over UDP the response goes to the UE's protected server port, not
-        // the client port the request came from (TS 33.203 clause 7.1).
-        .filter(|sent| {
-            sent.destination
-                .parse::<SocketAddr>()
-                .is_ok_and(|destination| destination.ip() == ue.ip())
-        })
-        .filter_map(|sent| sent.message.status_code())
-        .collect()
+    // A 2xx over a pending pair is held until the pair is taken into use, on
+    // a task of its own, so it can reach the wire a moment after this returns.
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let to_ue: Vec<u16> = proxy
+            .wire()
+            .into_iter()
+            // Over UDP the response goes to the UE's protected server port, not
+            // the client port the request came from (TS 33.203 clause 7.1).
+            .filter(|sent| {
+                sent.destination
+                    .parse::<SocketAddr>()
+                    .is_ok_and(|destination| destination.ip() == ue.ip())
+            })
+            .filter_map(|sent| sent.message.status_code())
+            .collect();
+        if !to_ue.is_empty() || std::time::Instant::now() >= deadline {
+            return to_ue;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
 }
 
 fn register_binding(aor: &str, from: SocketAddr) {
@@ -378,4 +387,149 @@ async fn a_re_authentication_challenge_leaves_over_the_old_set_and_its_2xx_over_
         manager.has_sa(&old_ue.ip(), old_ue.port()),
         "the old set stays for its pending transactions"
     );
+}
+
+/// The 2xx to a REGISTER over a pending pair does not wait, on the thread that
+/// forwards it, for the kernel to take the pair into use: it is held at the
+/// egress until the policy update is over, and then leaves over the new set.
+///
+/// Before: the response path blocked (`block_in_place` + `block_on`) on the
+/// netlink round trip. On an executor worker still attached to Python that
+/// holds up every free-threaded stop-the-world, and with it each thread that
+/// attaches, the blocking-pool thread the round trip runs on among them.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_2xx_over_a_pending_pair_does_not_wait_for_the_policy_update() {
+    let (proxy, manager) = p_cscf(RELAY);
+    let old_ue: SocketAddr = "198.51.100.97:6100".parse().expect("an address");
+    let new_ue: SocketAddr = "198.51.100.97:6102".parse().expect("an address");
+    let outbound = "policy:192.0.2.1:5064->198.51.100.97:6101:out";
+    let old = install_with_server_port(&manager, old_ue, 6101).await;
+    let new = install_with_server_port(&manager, new_ue, 6101).await;
+    assert!(manager.is_pending(&new_ue.ip(), new_ue.port()));
+
+    proxy.request(&new_ue.to_string(), &register(new_ue, "stall-97", 8, 600));
+    let relayed: Vec<SipMessage> = proxy
+        .wire()
+        .into_iter()
+        .filter(|sent| sent.destination == REGISTRAR)
+        .map(|sent| sent.message)
+        .collect();
+    assert_eq!(relayed.len(), 1, "the REGISTER is relayed");
+    let answer = response_to(
+        &relayed[0],
+        200,
+        "OK",
+        "scscf",
+        "sip:ue@198.51.100.1",
+        "Expires: 600\r\n",
+    );
+
+    let gate = manager.test_stall_policy_updates();
+    let state = Arc::clone(&proxy.state);
+    let forwarding = tokio::task::spawn_blocking(move || {
+        let raw = String::from_utf8(answer.to_bytes()).expect("UTF-8");
+        handle_response(
+            super::proxy_dialog_state_tests::inbound(REGISTRAR, &raw),
+            answer,
+            200,
+            &state,
+        );
+    });
+    let returned = tokio::time::timeout(Duration::from_secs(1), forwarding).await;
+    // Let a blocked forward finish either way, so a failure does not hang.
+    gate.add_permits(64);
+    assert!(
+        returned.is_ok(),
+        "forwarding the 2xx waited for the kernel policy update"
+    );
+
+    let mut to_ue = Vec::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !to_ue.contains(&200) && std::time::Instant::now() < deadline {
+        to_ue.extend(
+            proxy
+                .wire()
+                .into_iter()
+                .filter(|sent| {
+                    sent.destination
+                        .parse::<SocketAddr>()
+                        .is_ok_and(|destination| destination.ip() == new_ue.ip())
+                })
+                .filter_map(|sent| sent.message.status_code()),
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(to_ue, [200], "the 2xx leaves once, after the update");
+    assert_eq!(
+        manager.test_kernel_policy_template(outbound),
+        Some(new.spi_us),
+        "the 2xx leaves over the new set"
+    );
+    assert_ne!(old.spi_us, new.spi_us);
+    assert!(!manager.is_pending(&new_ue.ip(), new_ue.port()));
+    assert!(
+        !crate::ipsec::switch::is_held(new_ue.ip()),
+        "the UE's messages are not held once the 2xx is out"
+    );
+}
+
+/// While the policy update is held up, nothing to the UE leaves: the 2xx is
+/// held until the update is over, so it never goes out over the old set.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_2xx_is_held_until_the_policy_update_is_over() {
+    let (proxy, manager) = p_cscf(ANSWER);
+    let old_ue: SocketAddr = "198.51.100.98:6100".parse().expect("an address");
+    let new_ue: SocketAddr = "198.51.100.98:6102".parse().expect("an address");
+    let outbound = "policy:192.0.2.1:5064->198.51.100.98:6101:out";
+    let old = install_with_server_port(&manager, old_ue, 6101).await;
+    let new = install_with_server_port(&manager, new_ue, 6101).await;
+    let gate = manager.test_stall_policy_updates();
+
+    // The script answers the REGISTER itself (request_script.rs).
+    let state = Arc::clone(&proxy.state);
+    let answering = tokio::task::spawn_blocking(move || {
+        let raw = register(new_ue, "held-98", 8, 600);
+        let message = parse_sip_message_bytes(raw.as_bytes()).expect("the request parses");
+        handle_request(
+            super::proxy_dialog_state_tests::inbound(&new_ue.to_string(), &raw),
+            message,
+            "REGISTER".to_string(),
+            &state,
+        );
+    });
+    let returned = tokio::time::timeout(Duration::from_secs(1), answering).await;
+    if returned.is_err() {
+        gate.add_permits(64);
+        panic!("answering the REGISTER waited for the kernel policy update");
+    }
+    let early: Vec<u16> = proxy
+        .wire()
+        .into_iter()
+        .filter_map(|sent| sent.message.status_code())
+        .collect();
+    assert!(early.is_empty(), "sent before the update: {early:?}");
+    assert_eq!(
+        manager.test_kernel_policy_template(outbound),
+        Some(old.spi_us)
+    );
+    assert!(crate::ipsec::switch::is_held(new_ue.ip()));
+
+    gate.add_permits(64);
+    let mut sent = Vec::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while sent.is_empty() && std::time::Instant::now() < deadline {
+        sent.extend(
+            proxy
+                .wire()
+                .into_iter()
+                .filter_map(|sent| sent.message.status_code()),
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(sent, [200]);
+    assert_eq!(
+        manager.test_kernel_policy_template(outbound),
+        Some(new.spi_us)
+    );
+    assert!(!crate::ipsec::switch::is_held(new_ue.ip()));
 }
