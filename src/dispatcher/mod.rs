@@ -683,7 +683,7 @@ pub async fn run(
         config
             .ipsec
             .as_ref()
-            .map(|ipsec| (ipsec.pcscf_port_c, ipsec.pcscf_port_s)),
+            .map(|ipsec| (ipsec.pcscf_port_c.as_slice(), ipsec.pcscf_port_s)),
         config
             .ipsec
             .as_ref()

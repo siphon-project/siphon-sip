@@ -127,6 +127,37 @@ def test_allocate_v4_ue_without_v4_listener_raises():
         _allocate_for(ipsec, "10.0.0.1")
 
 
+# -- Protected client port per authentication (TS 33.203 §7.4.0) -------------
+
+def test_a_single_port_is_every_pairs_port_c():
+    ipsec = _fresh_ipsec()
+    assert ipsec.pcscf_ports_c == [5064]
+    first = _allocate_for(ipsec, "10.0.0.1")
+    second = _allocate_for(ipsec, "10.0.0.1")
+    assert first.security_server_params().port_c == 5064
+    assert second.security_server_params().port_c == 5064
+
+
+def test_a_pool_gives_a_re_authentication_another_port_c():
+    ipsec = _fresh_ipsec()
+    ipsec.pcscf_ports_c = [5064, 5068]
+    assert ipsec.pcscf_port_c == 5064
+    old = _allocate_for(ipsec, "10.0.0.1")
+    new = _allocate_for(ipsec, "10.0.0.1")
+    other_ue = _allocate_for(ipsec, "10.0.0.2")
+    assert old.security_server_params().port_c == 5064
+    assert new.security_server_params().port_c == 5068
+    assert other_ue.security_server_params().port_c == 5064
+    asyncio.run(old.cleanup())
+    assert _allocate_for(ipsec, "10.0.0.1").security_server_params().port_c == 5064
+
+
+def test_an_empty_pool_is_refused():
+    ipsec = _fresh_ipsec()
+    with pytest.raises(ValueError, match="names no port"):
+        ipsec.pcscf_ports_c = []
+
+
 def test_delete_cleans_the_ues_pairs_and_records_the_call():
     ipsec = _fresh_ipsec()
     pending = _allocate(ipsec)

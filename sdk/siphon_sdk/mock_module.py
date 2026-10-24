@@ -13000,7 +13000,10 @@ class MockIpsec:
     Transform = _TransformEnum
 
     def __init__(self) -> None:
+        #: First configured protected client port (``ipsec.pcscf_port_c``).
+        #: A pair's own is ``SecurityServerParams.port_c``.
         self.pcscf_port_c = 5064
+        self._pcscf_ports_c: Optional[list[int]] = None
         self.pcscf_port_s = 5066
         # Per-family P-CSCF local address (dual-stack).  Both present by default
         # so a correctly-configured P-CSCF allocates for either family; set one
@@ -13014,6 +13017,44 @@ class MockIpsec:
         self._allocated: list[MockPendingSA] = []
         #: Every ``delete()`` call, as ``(ue_addr, ue_port_c, delay_secs)``.
         self.deleted: list[tuple[str, Optional[int], float]] = []
+
+    @property
+    def pcscf_ports_c(self) -> list[int]:
+        """Every configured P-CSCF protected client port, in order.
+
+        ``ipsec.pcscf_port_c`` in ``siphon.yaml`` takes one port or a list.
+        Each new SA pair takes the first port no other live pair of the same
+        UE holds, so an authenticated re-registration changes port_pc (3GPP
+        TS 33.203 §7.4.0); another UE may hold the same port.  Advertise the
+        pair's own as ``port-c``::
+
+            p = pending.security_server_params()
+            reply.set_header("Security-Server", f"...; port-c={p.port_c}; port-s={p.port_s}")
+
+        In the mock, assign a list to model a pool; ``pcscf_port_c`` follows
+        its first entry.
+        """
+        return list(self._pcscf_ports_c or [self.pcscf_port_c])
+
+    @pcscf_ports_c.setter
+    def pcscf_ports_c(self, ports: list[int]) -> None:
+        if not ports:
+            raise ValueError("ipsec.pcscf_port_c names no port")
+        self._pcscf_ports_c = list(ports)
+        self.pcscf_port_c = ports[0]
+
+    def _pick_port_c(self, ue_addr: str) -> int:
+        """The client port a new pair of ``ue_addr`` takes (mirrors the engine)."""
+        ports = self.pcscf_ports_c
+        held = [p for p in self._allocated
+                if not p.is_cleaned and p._offer.ue_addr == ue_addr]
+        for port in ports:
+            if not any(p._params.port_c == port for p in held):
+                return port
+        for port in ports:
+            if not any(p._params.port_c == port and p.is_active for p in held):
+                return port
+        return held[0]._params.port_c if held else ports[0]
 
     @property
     def stash_size(self) -> int:
@@ -13079,7 +13120,7 @@ class MockIpsec:
         if self._allocate_should_fail is not None:
             raise self._allocate_should_fail(self._allocate_failure_message)
         pending = MockPendingSA(
-            transform, offer, self.pcscf_port_c, self.pcscf_port_s,
+            transform, offer, self._pick_port_c(offer.ue_addr), self.pcscf_port_s,
             expires_secs=expires_secs, protocol=params_protocol,
         )
         # Surface the *internal* SA selector mode for tests that want
@@ -13174,6 +13215,8 @@ class MockIpsec:
         self._allocate_should_fail = None
         self.pcscf_addr_v4 = "10.0.0.10"
         self.pcscf_addr_v6 = "2001:db8::10"
+        self.pcscf_port_c = 5064
+        self._pcscf_ports_c = None
         MockPendingSA._next_spi = 10000
 
 

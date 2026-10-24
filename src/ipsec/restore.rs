@@ -41,8 +41,8 @@ pub(super) struct OrphanedFlows {
 }
 
 impl IpsecManager {
-    /// Drop every binding of `registrar` that was protected, accepted on
-    /// `pcscf_port_c` or `pcscf_port_s`, and whose SA pair this manager does
+    /// Drop every binding of `registrar` that was protected, accepted on one
+    /// of `pcscf_ports_c` or on `pcscf_port_s`, and whose SA pair this manager does
     /// not hold. Returns how many were dropped.
     ///
     /// Run once at startup, after the backend restore and before any traffic.
@@ -56,13 +56,13 @@ impl IpsecManager {
     pub fn drop_restored_bindings_without_sa(
         &self,
         registrar: &Registrar,
-        pcscf_port_c: u16,
+        pcscf_ports_c: &[u16],
         pcscf_port_s: u16,
     ) -> usize {
         let evicted = registrar.evict_restored(|contact| {
             contact.kind == ContactKind::Ue
                 && contact.inbound_local_addr.is_some_and(|local| {
-                    local.port() == pcscf_port_c || local.port() == pcscf_port_s
+                    pcscf_ports_c.contains(&local.port()) || local.port() == pcscf_port_s
                 })
                 && !self.holds_pair_for(contact)
         });

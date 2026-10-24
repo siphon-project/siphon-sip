@@ -137,6 +137,13 @@ pub(super) fn handle_inbound(inbound: InboundMessage, state: &Arc<DispatcherStat
         }
     }
 
+    // A message over a new SA pair whose 2xx has left takes it into use for
+    // requests to the UE (TS 33.203 clause 7.4.2a). One atomic load while no
+    // pair waits for one.
+    if let Some(manager) = state.ipsec_manager.as_ref() {
+        manager.note_protected_inbound(inbound.remote_addr, inbound.local_addr.port());
+    }
+
     // --- Lawful interception (ETSI TS 103 221) ---
     //
     // Every message, every leg, every path — before routing, and before any

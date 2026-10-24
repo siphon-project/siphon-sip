@@ -2262,6 +2262,32 @@ auth:
 #   server_hold_down_secs: 30
 
 # ---------------------------------------------------------------------------
+# IPsec — P-CSCF security associations (3GPP TS 33.203)
+# ---------------------------------------------------------------------------
+# The P-CSCF side of sec-agree, driven from the script (siphon.ipsec). Bind
+# pcscf_port_s (and a single pcscf_port_c) under listen.udp/tcp at the concrete
+# address UEs send to: siphon uses that bind address as the P-CSCF side of
+# every SA, and a wildcard matches no ESP. Needs CAP_NET_ADMIN.
+#
+# ipsec:
+#   # Protected client port(s). One port (the default, 5064): every SA pair
+#   # sends from it, and the old and new set of a re-authentication share it.
+#   # A list: each new pair takes a port no other pair of the same UE holds, so
+#   # port_pc changes on every authenticated re-registration (TS 33.203 clause
+#   # 7.4.0; other UEs may hold the same port). siphon then binds every listed
+#   # port, over UDP, and over TCP where pcscf_port_s has a TCP listener, at each
+#   # concrete address pcscf_port_s is bound to; no listen entries needed. A list
+#   # is refused at load with a port twice, pcscf_port_s, 5060/5061, a listed
+#   # port bound on a wildcard address, or no concrete listen.udp on
+#   # pcscf_port_s. Advertise a pair's own port: SecurityServerParams.port_c.
+#   pcscf_port_c: [5064, 5068]
+#   pcscf_port_s: 5066         # protected server port, fixed for every UE
+#   backend: netlink           # "netlink" (default) or "ip" (shell-out)
+#   # spi_range_start: 10000   # per-instance partition for multi-process P-CSCFs (>= 256)
+#   # spi_range_count: 4194304 # 2 SPIs per registered UE; a full range fails ipsec.allocate
+#   # path_host: "pcscf-0.ims.example.com:5060"   # host of add_pcscf_path() Path URIs
+
+# ---------------------------------------------------------------------------
 # ISC — Initial Filter Criteria (3GPP TS 29.228)
 # ---------------------------------------------------------------------------
 # Initial Filter Criteria define which Application Servers a SIP request must

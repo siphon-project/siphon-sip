@@ -46,6 +46,11 @@ const T1: Duration = Duration::from_millis(2);
 const PAST_TIMER_J: Duration = Duration::from_millis(600);
 
 pub(super) fn p_cscf(script: &str) -> (Proxy, Arc<IpsecManager>) {
+    p_cscf_with_client_ports(script, "5064")
+}
+
+/// [`p_cscf`] with `ipsec.pcscf_port_c` set to `client_ports` (YAML).
+fn p_cscf_with_client_ports(script: &str, client_ports: &str) -> (Proxy, Arc<IpsecManager>) {
     let mut dispatcher = test_dispatcher_with_script(script);
     let timers = TimerConfig::new(T1, Duration::from_millis(8), Duration::from_millis(10));
     dispatcher.state.transaction_manager = Arc::new(TransactionManager::new(timers));
@@ -53,7 +58,7 @@ pub(super) fn p_cscf(script: &str) -> (Proxy, Arc<IpsecManager>) {
     dispatcher.state.ipsec_manager = Some(Arc::clone(&manager));
     // The harness listens on 5060: make that the protected server port.
     dispatcher.state.ipsec_config = Some(
-        crate::config::yaml::from_str("pcscf_port_s: 5060\npcscf_port_c: 5064")
+        crate::config::yaml::from_str(&format!("pcscf_port_s: 5060\npcscf_port_c: {client_ports}"))
             .expect("an ipsec block"),
     );
     (
@@ -78,13 +83,24 @@ async fn install_with_server_port(
     ue: SocketAddr,
     ue_port_s: u16,
 ) -> SecurityAssociationPair {
+    install_with_ports(manager, ue, ue_port_s, 5064).await
+}
+
+/// [`install_with_server_port`] with the P-CSCF protected client port
+/// `pcscf_port_c`.
+async fn install_with_ports(
+    manager: &IpsecManager,
+    ue: SocketAddr,
+    ue_port_s: u16,
+    pcscf_port_c: u16,
+) -> SecurityAssociationPair {
     let (spi_pc, spi_ps) = manager.allocate_spi_pair().expect("room in the partition");
     let sa = SecurityAssociationPair {
         ue_addr: ue.ip(),
         pcscf_addr: "192.0.2.1".parse().expect("an address"),
         ue_port_c: ue.port(),
         ue_port_s,
-        pcscf_port_c: 5064,
+        pcscf_port_c,
         pcscf_port_s: 5060,
         spi_uc: 80_000 + u32::from(ue.port()),
         spi_us: 90_000 + u32::from(ue.port()),
@@ -140,6 +156,21 @@ fn registrar_answers(
     status_code: u16,
     extra: &str,
 ) -> Vec<u16> {
+    registrar_answers_on_the_wire(proxy, ue, raw, status_code, extra)
+        .into_iter()
+        .map(|(status_code, ..)| status_code)
+        .collect()
+}
+
+/// [`registrar_answers`], with where each response to the UE went and the
+/// local socket it left from.
+fn registrar_answers_on_the_wire(
+    proxy: &Proxy,
+    ue: SocketAddr,
+    raw: &str,
+    status_code: u16,
+    extra: &str,
+) -> Vec<(u16, SocketAddr, Option<SocketAddr>)> {
     proxy.request(&ue.to_string(), raw);
     let relayed: Vec<SipMessage> = proxy
         .wire()
@@ -168,17 +199,21 @@ fn registrar_answers(
     // a task of its own, so it can reach the wire a moment after this returns.
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
     loop {
-        let to_ue: Vec<u16> = proxy
+        let to_ue: Vec<(u16, SocketAddr, Option<SocketAddr>)> = proxy
             .wire()
             .into_iter()
             // Over UDP the response goes to the UE's protected server port, not
             // the client port the request came from (TS 33.203 clause 7.1).
-            .filter(|sent| {
-                sent.destination
-                    .parse::<SocketAddr>()
-                    .is_ok_and(|destination| destination.ip() == ue.ip())
+            .filter_map(|sent| {
+                let destination = sent.destination.parse::<SocketAddr>().ok()?;
+                (destination.ip() == ue.ip())
+                    .then(|| {
+                        sent.message
+                            .status_code()
+                            .map(|code| (code, destination, sent.source))
+                    })
+                    .flatten()
             })
-            .filter_map(|sent| sent.message.status_code())
             .collect();
         if !to_ue.is_empty() || std::time::Instant::now() >= deadline {
             return to_ue;
@@ -532,4 +567,75 @@ async fn the_2xx_is_held_until_the_policy_update_is_over() {
         Some(new.spi_us)
     );
     assert!(!crate::ipsec::switch::is_held(new_ue.ip()));
+}
+
+/// With `ipsec.pcscf_port_c` listing two ports, a re-authentication's set has
+/// its own protected client port (TS 33.203 clause 7.4.0): the 401 to the
+/// REGISTER over the old set leaves from the old set's port_pc, the 200 to the
+/// REGISTER over the new set from the new one's (TS 33.203 clause 7.4.2a, SM6
+/// and SM12), and no kernel policy moves for either. The new set then waits
+/// for a further message over it before requests to the UE use it.
+#[tokio::test(flavor = "multi_thread")]
+async fn with_two_client_ports_the_challenge_and_the_2xx_leave_from_their_own_sets() {
+    let (proxy, manager) = p_cscf_with_client_ports(RELAY, "[5064, 5068]");
+    let old_ue: SocketAddr = "198.51.100.89:6100".parse().expect("an address");
+    let new_ue: SocketAddr = "198.51.100.89:6102".parse().expect("an address");
+    let port_us: SocketAddr = "198.51.100.89:6101".parse().expect("an address");
+    install_with_ports(&manager, old_ue, 6101, 5064).await;
+    let new = install_with_ports(&manager, new_ue, 6101, 5068).await;
+    assert_eq!(
+        manager.pending_how(&new_ue.ip(), new_ue.port()),
+        Some(crate::ipsec::retire::Pending::Challenged)
+    );
+    let security_server = format!(
+        "Security-Server: ipsec-3gpp;alg=hmac-sha-1-96;ealg=null;spi-c={};spi-s={};port-c=5068;port-s=5060\r\n",
+        new.spi_pc, new.spi_ps
+    );
+    let ops_before = manager.test_kernel_ops().len();
+
+    let to_ue = registrar_answers_on_the_wire(
+        &proxy,
+        old_ue,
+        &register(old_ue, "reauth-97", 7, 600),
+        401,
+        &security_server,
+    );
+    let from_old = "192.0.2.1:5064".parse().ok();
+    assert_eq!(to_ue, [(401, port_us, from_old)], "SM6 over the old set");
+
+    let to_ue = registrar_answers_on_the_wire(
+        &proxy,
+        new_ue,
+        &register(new_ue, "reauth-97", 8, 600),
+        200,
+        "Expires: 600\r\n",
+    );
+    let from_new = "192.0.2.1:5068".parse().ok();
+    assert!(
+        to_ue.contains(&(200, port_us, from_new)),
+        "SM12 over the new set: {to_ue:?}"
+    );
+    assert!(
+        !manager.test_kernel_ops()[ops_before..]
+            .iter()
+            .any(|op| op.starts_with("update_policy")),
+        "no shared policy to move"
+    );
+    assert_eq!(
+        manager.pending_how(&new_ue.ip(), new_ue.port()),
+        Some(crate::ipsec::retire::Pending::Registered)
+    );
+    assert_eq!(
+        manager.udp_request_flow_to_ue(new_ue),
+        crate::ipsec::FlowToUe::Protected {
+            local: "192.0.2.1:5064".parse().expect("an address"),
+            destination: port_us,
+        },
+        "requests stay on the old set for now"
+    );
+    assert!(manager.has_sa(&old_ue.ip(), old_ue.port()));
+    assert!(
+        !crate::ipsec::switch::is_held(new_ue.ip()),
+        "nothing to hold: no policy update to wait for"
+    );
 }

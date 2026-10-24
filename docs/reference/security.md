@@ -351,8 +351,16 @@ the protected ports and the UE's (its own are reset), when:
 | The script calls `await ipsec.delete(ue_addr, ue_port_c, delay_secs=...)` | After `delay_secs`, or at once |
 
 A pair goes only when no other identity of the UE is still registered over it.
-The old and new pair of a re-registration share the policies of the UE's
-protected server port; deleting one leaves the other's in place.
+
+With a single `ipsec.pcscf_port_c`, the old and new pair of a re-registration
+share the policies of the UE's protected server port; deleting one leaves the
+other's in place, and the shared outbound policy moves to the new pair as the
+200 leaves. With a list (`pcscf_port_c: [5064, 5068]`), each new pair takes a
+port no other pair of the UE holds (TS 33.203 clause 7.4.0), so nothing is
+shared: the 401 goes over the old pair, the 200 over the new, requests to the
+UE move to the new pair once a message arrives over it, and the old pair then
+goes after 32 s (clause 7.4.2a). If the old pair goes first, the new one is
+taken into use.
 
 ### After a restart
 
@@ -362,7 +370,7 @@ so a restart can't reinstall them, even though the registrar bindings come back
 from a Redis or PostgreSQL backend. The UE still holds its side of the SAs.
 
 A restored binding that was protected (its REGISTER arrived on
-`ipsec.pcscf_port_c` or `ipsec.pcscf_port_s`) and has no SA pair in the new
+any `ipsec.pcscf_port_c` or `ipsec.pcscf_port_s`) and has no SA pair in the new
 process is therefore not restored as live. At startup, before any traffic,
 siphon:
 

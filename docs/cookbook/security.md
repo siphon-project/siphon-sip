@@ -426,6 +426,31 @@ response goes on the connection the request arrived on.
 `request.fix_nated_register()` on a protected UDP request writes the UE's
 protected server port as `rport` (TS 24.229 clause 5.2.6.3.1).
 
+Give the P-CSCF more than one protected client port and every authenticated
+re-registration gets a new one, as TS 33.203 clause 7.4.0 asks ("the
+protected client ports at the UE (port_uc) and the P-CSCF (port_pc) shall
+change"):
+
+```yaml
+listen:
+  udp:
+    - "0.0.0.0:5060"
+    - "192.0.2.10:5066"           # pcscf_port_s; siphon binds the client ports next to it
+ipsec:
+  pcscf_port_c: [5064, 5068]      # one port (the default 5064) or a list
+  pcscf_port_s: 5066
+```
+
+Each new SA pair takes a port no other pair of the same UE holds, so the old
+and the new set have their own selectors. The 401 goes over the old set, the
+200 over the new one, requests to the UE stay on the old set until something
+arrives over the new one, and the old set then goes after 64*T1 (clause
+7.4.2a). Advertise the pair's own port: `port-c={p.port_c}` from
+`pending.security_server_params()`. siphon binds every listed port, over UDP and
+(when `pcscf_port_s` has a TCP listener) TCP, at each concrete address
+`pcscf_port_s` is bound to. With one port the old and new set share it, as
+before.
+
 A re-REGISTER or de-REGISTER over the SA is not challenged again, and that
 rests on a chain of trust worth knowing. AKA nonces are single-use, so the UE
 cannot reuse its old `Authorization`. Instead the P-CSCF calls

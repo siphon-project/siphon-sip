@@ -93,6 +93,7 @@ pub(super) fn protected_udp_egress(
         transport,
         destination,
         source_local_addr,
+        crate::ipsec::is_request(frame),
     )
 }
 

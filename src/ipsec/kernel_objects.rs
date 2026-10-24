@@ -1,10 +1,11 @@
 //! The eight kernel objects of a pair (four SA states, four policies):
 //! installing them, re-pinning their lifetimes, and taking them down without
 //! taking one another pair of the UE shares. A P-CSCF that keeps its protected
-//! ports fixed (siphon's own does) and a UE that keeps its protected server
-//! port across an authenticated re-registration (3GPP TS 33.203 clause 7.4.0)
-//! make an old and a new pair hold the policies of SA #3 and #4 under one
-//! kernel key.
+//! ports fixed (siphon's own with a single `ipsec.pcscf_port_c`; with a list
+//! each pair has its own, see [`port_rotation`](super::port_rotation)) and a
+//! UE that keeps its protected server port across an authenticated
+//! re-registration (3GPP TS 33.203 clause 7.4.0) make an old and a new pair
+//! hold the policies of SA #3 and #4 under one kernel key.
 //!
 //! At the P-CSCF the kernel's outbound policy of that key names one set, the
 //! one in use. A set installed beside it for a re-authentication is pending:
@@ -24,7 +25,7 @@ use std::sync::Arc;
 
 use tracing::{debug, info, warn};
 
-use super::retire::{pair_spis, RetireCondition, SA_RETIRE_GRACE};
+use super::retire::{pair_spis, Pending, RetireCondition, SA_RETIRE_GRACE};
 use super::{IpsecError, IpsecManager, PolicyDir, SaProtocol, SaRole, SecurityAssociationPair};
 
 /// One of the eight kernel objects of a pair, with what it takes to install it
@@ -370,6 +371,15 @@ impl IpsecManager {
         else {
             return Ok(false);
         };
+        match self.lifecycle.pending_how(&key, pair_spis(&sa)) {
+            None => return Ok(false),
+            // Its own protected client port: nothing in the kernel to move.
+            Some(Pending::Challenged | Pending::Registered) => {
+                self.promote(&sa, "taken into use");
+                return Ok(true);
+            }
+            Some(Pending::SharedPolicy) => {}
+        }
         if !self.lifecycle.take_pending(&key, pair_spis(&sa)) {
             return Ok(false);
         }
@@ -394,7 +404,8 @@ impl IpsecManager {
                 .install_kernel_object(&sa, &object, remaining_lifetime(&sa), true)
                 .await
             {
-                self.lifecycle.set_pending(&key, pair_spis(&sa), true);
+                self.lifecycle
+                    .set_pending(&key, pair_spis(&sa), Some(Pending::SharedPolicy));
                 return Err(error);
             }
         }

@@ -154,17 +154,20 @@ pub fn refusal_security_server_for(
 }
 
 /// Whether the given local port matches one of the configured P-CSCF
-/// protected ports (`pcscf_port_c` / `pcscf_port_s`).  Returns `false`
-/// when no IPsec config is wired (i.e. siphon is not running as P-CSCF).
+/// protected ports (any of `pcscf_port_c`, or `pcscf_port_s`).  Returns
+/// `false` when no IPsec config is wired (i.e. siphon is not running as
+/// P-CSCF).
 pub fn is_protected_local_port(local_port: u16) -> bool {
     match IPSEC_CONFIG_REF.get() {
-        Some(config) => local_port == config.pcscf_port_c || local_port == config.pcscf_port_s,
+        Some(config) => {
+            local_port == config.pcscf_port_s || config.pcscf_port_c.contains(local_port)
+        }
         None => false,
     }
 }
 
 /// The Gm port a `Via` sent-by or a `Record-Route` entry must name, given the
-/// local socket a leg actually uses: `pcscf_port_s` for `pcscf_port_c`,
+/// local socket a leg actually uses: `pcscf_port_s` for any `pcscf_port_c`,
 /// `local_port` unchanged otherwise, and always when no IPsec config is wired
 /// (siphon not running as P-CSCF).
 ///
@@ -188,15 +191,19 @@ pub fn is_protected_local_port(local_port: u16) -> bool {
 /// socket.
 pub fn protected_server_port_for(local_port: u16) -> u16 {
     match IPSEC_CONFIG_REF.get() {
-        Some(config) => record_route_port(local_port, config.pcscf_port_c, config.pcscf_port_s),
+        Some(config) => record_route_port(
+            local_port,
+            config.pcscf_port_c.as_slice(),
+            config.pcscf_port_s,
+        ),
         None => local_port,
     }
 }
 
 /// Pure half of [`protected_server_port_for`], split out so the mapping is
 /// unit-testable without installing the process-wide `IpsecConfig`.
-fn record_route_port(local_port: u16, port_c: u16, port_s: u16) -> u16 {
-    if local_port == port_c {
+fn record_route_port(local_port: u16, ports_c: &[u16], port_s: u16) -> u16 {
+    if ports_c.contains(&local_port) {
         port_s
     } else {
         local_port
@@ -766,14 +773,15 @@ mod tests {
         // an MT relay leaving port_pc must still advertise port_ps — otherwise
         // the UE's in-dialog request would have to leave an SA that does not
         // exist, and the dialog is unusable in that direction.
-        assert_eq!(record_route_port(5064, 5064, 5066), 5066);
+        assert_eq!(record_route_port(5064, &[5064], 5066), 5066);
+        assert_eq!(record_route_port(5068, &[5064, 5068], 5066), 5066);
     }
     #[test]
     fn record_route_port_leaves_every_other_socket_alone() {
         // port_ps is already the request-facing socket, and the core-facing
         // listener is not a Gm socket at all.
-        assert_eq!(record_route_port(5066, 5064, 5066), 5066);
-        assert_eq!(record_route_port(5060, 5064, 5066), 5060);
+        assert_eq!(record_route_port(5066, &[5064], 5066), 5066);
+        assert_eq!(record_route_port(5060, &[5064, 5068], 5066), 5060);
     }
     #[test]
     fn protected_server_port_for_is_identity_without_config() {
