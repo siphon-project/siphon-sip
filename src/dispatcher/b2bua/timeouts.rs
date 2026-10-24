@@ -32,13 +32,19 @@ pub fn check_b2bua_answer_timeouts(state: &DispatcherState) {
 /// The deadlines are `std::time::Instant`s, which a paused tokio clock does not
 /// move, so this is how a test steps past one without waiting it out.
 pub fn check_b2bua_answer_timeouts_at(state: &DispatcherState, now: std::time::Instant) {
+    // Each ends in script handlers (`@b2bua.on_failure`, route failure), so
+    // from the sweep each is a job of its own (see `post_expiry`).
     for timed_out in state.call_actors.take_timed_out_calls(now) {
-        fail_b2bua_call_on_timeout(&timed_out, state);
+        crate::dispatcher::post_expiry(state, move |state| {
+            fail_b2bua_call_on_timeout(&timed_out, state)
+        });
     }
     // An originate group's overall deadline bounds the whole hunt, however
     // many of its legs are still ringing on their own timeouts.
     for group_id in state.originate_groups.take_timed_out(now) {
-        cancel_originate_group(state, &group_id, OriginateGroupEnd::TimedOut);
+        crate::dispatcher::post_expiry(state, move |state| {
+            cancel_originate_group(state, &group_id, OriginateGroupEnd::TimedOut);
+        });
     }
 }
 
@@ -61,7 +67,9 @@ pub fn check_b2bua_max_call_durations(state: &DispatcherState) {
             call_id = %call_id,
             "B2BUA: maximum call duration reached, terminating call"
         );
-        b2bua_max_duration_terminate(&call_id, state);
+        crate::dispatcher::post_expiry(state, move |state| {
+            b2bua_max_duration_terminate(&call_id, state)
+        });
     }
 }
 
@@ -91,7 +99,9 @@ pub fn check_b2bua_max_call_durations(state: &DispatcherState) {
 pub fn check_b2bua_replacement_timeouts(state: &DispatcherState) {
     let now = std::time::Instant::now();
     for (call_id, _target_call_id) in state.call_actors.take_timed_out_replacements(now) {
-        b2bua_expire_leg_replacement(&call_id, state);
+        crate::dispatcher::post_expiry(state, move |state| {
+            b2bua_expire_leg_replacement(&call_id, state)
+        });
     }
 }
 

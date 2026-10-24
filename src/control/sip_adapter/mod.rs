@@ -19,6 +19,9 @@ mod call;
 mod caller_contact;
 mod dial_bridge;
 mod media;
+mod media_flags;
+#[cfg(test)]
+mod media_flags_tests;
 mod originate;
 mod routing;
 #[cfg(test)]

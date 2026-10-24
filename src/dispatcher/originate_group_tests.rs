@@ -153,6 +153,7 @@ fn ring_with(
             total_timeout_secs,
             answers: OriginateGroupAnswers::First,
             early_offer: None,
+            media_flags: None,
         },
         Arc::clone(&recorder) as Arc<dyn OriginateGroupSink>,
     )
@@ -1001,6 +1002,7 @@ async fn a_group_that_can_dial_nothing_is_refused_with_nothing_on_the_wire() {
             total_timeout_secs: 30,
             answers: OriginateGroupAnswers::First,
             early_offer: None,
+            media_flags: None,
         },
         Arc::clone(&recorder) as Arc<dyn OriginateGroupSink>,
     )

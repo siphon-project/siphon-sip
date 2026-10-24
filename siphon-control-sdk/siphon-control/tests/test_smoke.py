@@ -578,6 +578,9 @@ def test_media_header_refer_verbs_roundtrip():
                 await call.answer_anchored(
                     profile="voice_ai", ws_uri="wss://ai.test/{call_id}"
                 )
+                await call.answer_anchored(
+                    profile="voice_ai", media_flags={"ws_vad_min_speech_ms": 100}
+                )
                 # A policy the server would refuse is refused locally instead,
                 # before anything touches the two live calls.
                 with pytest.raises(ValueError):
@@ -646,6 +649,11 @@ def test_media_header_refer_verbs_roundtrip():
                 "anchor": True,
                 "profile": "voice_ai",
                 "ws_uri": "wss://ai.test/{call_id}",
+            }
+            assert answer_args[2] == {
+                "anchor": True,
+                "profile": "voice_ai",
+                "media_flags": {"ws_vad_min_speech_ms": 100},
             }
             for frame in recorded:
                 assert frame["module"] == "sip"
@@ -1170,6 +1178,36 @@ def test_originate_verb_roundtrip():
             await client.originate(
                 "out-2", "sip:1001@pbx.example", sdp="v=0\r\n"
             )
+            # Per-call media flags ride an anchored originate as `media_flags`.
+            await client.originate(
+                "out-6",
+                "sip:1001@pbx.example",
+                media=True,
+                profile="voice_ai",
+                media_flags={"echo_cancellation": False, "ws_vad_engine": "Neural"},
+            )
+            # A key the server does not take, a None, an int for a bool and an
+            # offer plan are refused before a frame goes out.
+            for media_flags, error in (
+                ({"ws_uri": "wss://x.invalid"}, ValueError),
+                ({"echo_cancellation": None}, ValueError),
+                ({"echo_cancellation": 0}, TypeError),
+                ({"ws_vad_engine": "webrtc"}, ValueError),
+            ):
+                with pytest.raises(error, match="media_flags"):
+                    await client.originate(
+                        "out-7",
+                        "sip:1001@pbx.example",
+                        media=True,
+                        media_flags=media_flags,
+                    )
+            with pytest.raises(ValueError, match="media_flags"):
+                await client.originate(
+                    "out-8",
+                    "sip:1001@pbx.example",
+                    sdp="v=0\r\n",
+                    media_flags={"ws_vad": True},
+                )
 
             # What the server would refuse is refused here, before a frame goes
             # out: a timer siphon cannot run, and a media plan that is not
@@ -1189,7 +1227,15 @@ def test_originate_verb_roundtrip():
                     "out-5", "sip:1001@pbx.example", media=True, sdp="v=0\r\n"
                 )
 
-            assert [frame["args"]["channel"] for frame in frames] == ["out-1", "out-2"]
+            assert [frame["args"]["channel"] for frame in frames] == [
+                "out-1",
+                "out-2",
+                "out-6",
+            ]
+            assert frames[2]["args"]["media_flags"] == {
+                "echo_cancellation": False,
+                "ws_vad_engine": "neural",
+            }
             first = frames[0]
             assert first["module"] == "sip"
             assert first["verb"] == "originate"
@@ -1912,6 +1958,12 @@ def test_stream_verbs_roundtrip():
                 await call.stream_start(
                     "wss://ai.example/agent", mode="bridge", profile="voice_ai"
                 )
+                await call.stream_start(
+                    "wss://ai.example/agent",
+                    mode="bridge",
+                    profile="voice_ai",
+                    media_flags={"echo_cancellation": False},
+                )
                 await call.stream_stop()
                 await call.stream_stop(mode="bridge")
                 for kwargs in (
@@ -1944,6 +1996,7 @@ def test_stream_verbs_roundtrip():
                 "stream_start",
                 "stream_start",
                 "stream_start",
+                "stream_start",
                 "stream_stop",
                 "stream_stop",
             ]
@@ -1969,8 +2022,14 @@ def test_stream_verbs_roundtrip():
                 "mode": "bridge",
                 "profile": "voice_ai",
             }
-            assert frames[4]["args"] == {"mode": "tee"}
-            assert frames[5]["args"] == {"mode": "bridge"}
+            assert frames[4]["args"] == {
+                "ws_uri": "wss://ai.example/agent",
+                "mode": "bridge",
+                "profile": "voice_ai",
+                "media_flags": {"echo_cancellation": False},
+            }
+            assert frames[5]["args"] == {"mode": "tee"}
+            assert frames[6]["args"] == {"mode": "bridge"}
             # Refused before a frame goes out: nothing past the five above.
             assert len(refused) == 4, refused
 

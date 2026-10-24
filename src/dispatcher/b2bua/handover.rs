@@ -92,6 +92,7 @@ pub fn control_handover(
             "OK",
             profile,
             ws_uri,
+            None,
             &[],
             state,
         ) {
@@ -226,6 +227,7 @@ pub fn answer_first_anchor(
     reason: &str,
     profile: Option<&str>,
     ws_uri: Option<&str>,
+    media_flags: Option<&crate::rtpengine::media_flags::MediaFlags>,
     headers: &[(String, String)],
     state: &DispatcherState,
 ) -> Result<(), String> {
@@ -251,7 +253,7 @@ pub fn answer_first_anchor(
     // it has already accepted.
     let answer_sdp = match state.call_actors.early_media_anchor(call_id) {
         Some(anchor) => anchor.answer_sdp,
-        None => anchor_a_leg(invite, source_ip, profile, ws_uri, state)?.answer_sdp,
+        None => anchor_a_leg(invite, source_ip, profile, ws_uri, media_flags, state)?.answer_sdp,
     };
 
     // Send the 2xx with the synthesized answer SDP (marks the A-leg Answered +
@@ -284,6 +286,7 @@ pub fn anchor_a_leg(
     source_ip: std::net::IpAddr,
     profile: Option<&str>,
     ws_uri: Option<&str>,
+    media_flags: Option<&crate::rtpengine::media_flags::MediaFlags>,
     state: &DispatcherState,
 ) -> Result<crate::b2bua::actor::EarlyMediaAnchor, String> {
     let Some(backend) = state.rtpengine_set.as_ref() else {
@@ -297,7 +300,15 @@ pub fn anchor_a_leg(
 
     // Resolve + validate the media plan (backend gate, profile, ws_uri template,
     // capability check) — pure, unit-tested. No I/O here.
-    let plan = answer_first_prepare(invite, source_ip, backend, registry, profile, ws_uri)?;
+    let plan = answer_first_prepare(
+        invite,
+        source_ip,
+        backend,
+        registry,
+        profile,
+        ws_uri,
+        media_flags,
+    )?;
 
     // Media round-trip on the SIP-processing path (block_in_place is consistent
     // with the existing B2BUA answer paths — NOT the control-command path).
@@ -352,13 +363,14 @@ pub fn early_media_anchor_progress(
     reason: &str,
     profile: Option<&str>,
     ws_uri: Option<&str>,
+    media_flags: Option<&crate::rtpengine::media_flags::MediaFlags>,
     headers: &[(String, String)],
     state: &DispatcherState,
 ) -> Result<(), String> {
     let anchor = match state.call_actors.early_media_anchor(call_id) {
         Some(anchor) => anchor,
         None => {
-            let anchor = anchor_a_leg(invite, source_ip, profile, ws_uri, state)?;
+            let anchor = anchor_a_leg(invite, source_ip, profile, ws_uri, media_flags, state)?;
             state
                 .call_actors
                 .set_early_media_anchor(call_id, anchor.clone());
@@ -391,11 +403,15 @@ pub struct AnswerFirstPlan {
     pub profile_name: String,
 }
 
+/// The media profile an answer-first anchor uses when none is named.
+pub const ANSWER_FIRST_DEFAULT_PROFILE: &str = "voice_ai";
+
 /// Pure decision for answer-first: gate the backend (siphon-rtp only), resolve
-/// the profile (default `voice_ai`), template the per-call `ws_uri` with #131's
-/// expander, apply the `received_from` gate, and run the backend-capability
-/// check. Returns `Err(reason)` on any failure so the caller rejects the
-/// handover visibly instead of faking a 200. No I/O — unit-testable.
+/// the profile (default [`ANSWER_FIRST_DEFAULT_PROFILE`]), merge the call's
+/// `media_flags` over its answer half, template the per-call `ws_uri` with
+/// #131's expander, apply the `received_from` gate, and run the
+/// backend-capability check. Returns `Err(reason)` on any failure so the caller
+/// rejects the handover visibly instead of faking a 200. No I/O — unit-testable.
 pub fn answer_first_prepare(
     invite: &SipMessage,
     source_ip: std::net::IpAddr,
@@ -403,6 +419,7 @@ pub fn answer_first_prepare(
     registry: &crate::rtpengine::ProfileRegistry,
     profile: Option<&str>,
     ws_uri: Option<&str>,
+    media_flags: Option<&crate::rtpengine::media_flags::MediaFlags>,
 ) -> Result<AnswerFirstPlan, String> {
     // answer_local is siphon-rtp only — fail visibly on rtpengine/rtpproxy.
     if !matches!(backend.kind(), crate::config::MediaBackendKind::SiphonRtp) {
@@ -411,13 +428,23 @@ pub fn answer_first_prepare(
             backend.kind().as_str()
         ));
     }
-    let profile_name = profile.unwrap_or("voice_ai");
+    let profile_name = profile.unwrap_or(ANSWER_FIRST_DEFAULT_PROFILE);
     let Some(entry) = registry.get(profile_name) else {
         return Err(format!(
             "unknown media profile '{profile_name}' for answer-first"
         ));
     };
-    let mut flags = entry.answer.clone();
+    // This call's `media_flags` over the profile's answer half, on a copy: the
+    // registry entry is what every other call naming the profile reads. The
+    // control verb has already refused a value boot would refuse; checking the
+    // merged flags again here costs nothing and keeps this plan honest for any
+    // caller.
+    let mut flags = match media_flags {
+        None => entry.answer.clone(),
+        Some(media_flags) => media_flags
+            .applied_to(&entry.answer)
+            .map_err(|refusal| refusal.message)?,
+    };
 
     // Identifiers off the A-leg INVITE (call_id / From-tag / From+To user parts).
     let media_call_id = invite.headers.call_id().cloned().unwrap_or_default();

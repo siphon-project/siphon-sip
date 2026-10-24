@@ -14,6 +14,7 @@ pub mod bencode;
 pub mod client;
 pub mod error;
 pub mod events;
+pub mod media_flags;
 pub mod profile;
 pub mod rtpproxy;
 pub mod session;

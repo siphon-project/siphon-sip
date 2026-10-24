@@ -2503,6 +2503,36 @@ fn the_echo_delay_search_refusal_names_the_reading_it_applied() {
     assert!(refuse(false).contains("search window"), "{}", refuse(false));
 }
 
+/// The boot refusal reads word for word as it did before its range check was
+/// shared with the control rail's per-call `media_flags`: sharing the rule must
+/// not move the text an operator greps their logs for.
+#[test]
+fn the_echo_delay_search_refusal_text_is_pinned() {
+    let refuse = |long_tail: bool| {
+        let yaml = ws_profile_yaml(
+            SIPHON_RTP_BACKEND,
+            &format!(
+                "      offer:\n        echo_cancellation: true\n        \
+                     echo_long_tail: {long_tail}\n        \
+                     echo_delay_search_ms: 1001\n      answer: {{}}\n"
+            ),
+        );
+        Config::from_str(&yaml)
+            .expect_err("out of range")
+            .to_string()
+    };
+    let window = "media profile \"voice_ai_custom\" sets echo_delay_search_ms to 1001 on its \
+                  offer flags, outside the 16-1000 ms the engine accepts for a search window — \
+                  it refuses the value on every offer, so a node carrying this config starts \
+                  healthy and then fails every call";
+    let tail = "media profile \"voice_ai_custom\" sets echo_delay_search_ms to 1001 on its \
+                offer flags, outside the 16-1000 ms the engine accepts for a tail length, \
+                because echo_long_tail is set — it refuses the value on every offer, so a node \
+                carrying this config starts healthy and then fails every call";
+    assert!(refuse(false).contains(window), "{}", refuse(false));
+    assert!(refuse(true).contains(tail), "{}", refuse(true));
+}
+
 /// The bounds themselves are accepted — the check is inclusive, so a config
 /// sitting exactly on 16 or 1000 is not refused by an off-by-one — and that
 /// holds for the tail reading too, which is the one that used to be checked

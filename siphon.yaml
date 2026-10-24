@@ -353,6 +353,15 @@ script:
   #                                # with idle workers and an empty queue is
   #                                # still serving and is never aborted, however
   #                                # long one handler has been parked.
+  # process_stall_abort_secs: 30   # whole-process liveness: abort when the
+  #                                # tokio runtime runs no timer/socket/task,
+  #                                # most tokio workers are stuck in one poll,
+  #                                # no thread can attach to the interpreter (a
+  #                                # GC stop-the-world that never ends), or the
+  #                                # timer sweep stops, for this long. Catches
+  #                                # the wedge the pool watchdog above cannot
+  #                                # see (nothing is fed to an idle-looking
+  #                                # pool). 0 disables it.
   # handler_timeout_secs: 300      # give a worker back if one async handler's
   #                                # coroutine has not settled in this long, and
   #                                # cancel it. A leak guard, not a deadline:
@@ -422,6 +431,11 @@ registrar:
   #     #   registrar of record clears the binding too.
   #     # local_only: drop local state + emit on_change only (use on the box
   #     #   that IS the registrar of record).
+  #   network_dereg_sa_grace_ms: 4000  # network_dereg on a P-CSCF: keep the UE's
+  #     #   IPsec SA pair this long so the S-CSCF's NOTIFY reporting the
+  #     #   de-registration reaches it over the pair (TS 24.229 5.2.5.2 NOTE 2);
+  #     #   it goes as soon as the UE answers a NOTIFY. Without a pair, a request
+  #     #   to the UE's protected ports is refused, never sent in clear.
 
 # ---------------------------------------------------------------------------
 # Registrant — Outbound REGISTER Client (Carrier Trunk Registration)

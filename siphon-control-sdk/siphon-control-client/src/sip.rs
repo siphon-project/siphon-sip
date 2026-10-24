@@ -609,6 +609,27 @@ impl Call {
         self.sip(SipVerb::Answer, args).await.map(drop)
     }
 
+    /// [`Call::answer_anchored`] with `media_flags` merged over the profile's
+    /// answer half for this call only: the bot that needs echo cancellation
+    /// off, while every other call on the profile keeps it. An unknown key or
+    /// a value the engine would refuse is `bad_request` naming the field, and
+    /// the call stays parked.
+    pub async fn answer_anchored_with_flags(
+        &self,
+        profile: Option<&str>,
+        ws_uri: Option<&str>,
+        media_flags: &siphon_control_proto::media_flags::MediaFlags,
+    ) -> Result<(), ControlError> {
+        let mut args = json!({ "anchor": true, "media_flags": media_flags.to_json() });
+        if let Some(profile) = profile {
+            args["profile"] = json!(profile);
+        }
+        if let Some(ws_uri) = ws_uri {
+            args["ws_uri"] = json!(ws_uri);
+        }
+        self.sip(SipVerb::Answer, args).await.map(drop)
+    }
+
     /// Send `180 Ringing`: alerting only, no early media.
     ///
     /// RFC 3261 §13.2.1 makes the 180 the "callee is being alerted" signal, and
@@ -1528,6 +1549,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_anchored_originate_carries_its_media_flags() {
+        let recorder = recorder(originate_result());
+        let transport: Arc<dyn CommandTransport> = recorder.clone();
+        originate_on(
+            &transport,
+            "out-1",
+            "sip:1001@pbx.example",
+            OriginateMedia::anchor_with_flags(
+                Some("voice_ai".to_string()),
+                siphon_control_proto::media_flags::MediaFlags {
+                    ws_vad_min_speech_ms: Some(100),
+                    ..Default::default()
+                },
+            ),
+            OriginateOptions::default(),
+        )
+        .await
+        .expect("originate");
+        let args = lock(&recorder.calls)[0].args.clone();
+        assert_eq!(args["media"], true);
+        assert_eq!(args["profile"], "voice_ai");
+        assert_eq!(args["media_flags"], json!({ "ws_vad_min_speech_ms": 100 }));
+    }
+
+    #[tokio::test]
     async fn an_sdp_originate_sends_the_offer_and_never_media_true() {
         let recorder = recorder(originate_result());
         let transport: Arc<dyn CommandTransport> = recorder.clone();
@@ -1696,6 +1742,7 @@ mod tests {
             "vars",
             "profile",
             "ws_uri",
+            "media_flags",
         ] {
             assert!(
                 args.get(absent).is_none(),
@@ -1731,6 +1778,32 @@ mod tests {
                 "anchor": true,
                 "profile": "voice_ai",
                 "ws_uri": "wss://ai.test/{call_id}",
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn answer_anchored_with_flags_sends_them_beside_the_profile() {
+        let recorder = Arc::new(RecordingTransport {
+            calls: Mutex::new(Vec::new()),
+            result: json!({ "channel": "ch1", "state": "answered", "code": 200, "media": "anchored" }),
+        });
+        let call = make_call(recorder.clone());
+        let flags = siphon_control_proto::media_flags::MediaFlags {
+            echo_cancellation: Some(false),
+            ws_vad_min_speech_ms: Some(100),
+            ..Default::default()
+        };
+        call.answer_anchored_with_flags(Some("voice_ai"), None, &flags)
+            .await
+            .expect("answer ok");
+        let recorded = lock(&recorder.calls).clone();
+        assert_eq!(
+            recorded[0].args,
+            json!({
+                "anchor": true,
+                "profile": "voice_ai",
+                "media_flags": { "echo_cancellation": false, "ws_vad_min_speech_ms": 100 },
             })
         );
     }
@@ -2627,6 +2700,33 @@ mod tests {
         assert_eq!(
             lock(&recorder.calls)[0].args,
             json!({ "ws_uri": "wss://ai.example/agent", "mode": "bridge", "profile": "voice_ai" })
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_start_with_bridge_media_flags_sends_them() {
+        let recorder = recorder(json!({ "channel": "ch1", "state": "bridged" }));
+        let transport: Arc<dyn CommandTransport> = recorder.clone();
+        let call = make_call(transport);
+        call.stream_start_with(
+            "wss://ai.example/agent",
+            StreamOptions::bridge().profile("voice_ai").media_flags(
+                siphon_control_proto::media_flags::MediaFlags {
+                    echo_cancellation: Some(false),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .expect("stream_start");
+        assert_eq!(
+            lock(&recorder.calls)[0].args,
+            json!({
+                "ws_uri": "wss://ai.example/agent",
+                "mode": "bridge",
+                "profile": "voice_ai",
+                "media_flags": { "echo_cancellation": false },
+            })
         );
     }
 

@@ -71,6 +71,97 @@ entry, but a working config keeps working.
   `siphon::script::blocking::awaitable`, `siphon::script::Deferred` (build a
   future's Python result in the completion step, off the tokio workers) and
   `siphon::script::inline_dispatch::run_coroutine_inline`.
+- **A P-CSCF no longer waits for the kernel on the thread that answers a
+  REGISTER.** Forwarding (or answering) the 2xx to a REGISTER that came over
+  a pending pair blocked that thread until the XFRM policy update taking the
+  pair into use was back from the blocking pool. On an executor worker still
+  attached to the free-threaded interpreter that held up every
+  stop-the-world, and every thread that then tried to attach parked behind
+  it, which could wedge the whole process. The update now runs on its own
+  task; messages to that UE are held at the egress until it is over (2 s at
+  most) and then sent in order, so the 2xx still leaves over the new pair
+  (TS 24.229 clause 5.2.2.2).
+- **A node no longer stops dead under load when an `async def` request
+  handler awaits and a garbage collection runs.** The work after the handler's
+  await (the relay or reply, its DNS lookup, connects, sends) ran attached to
+  the interpreter. On free-threaded CPython a thread that blocks while attached
+  never reaches a garbage collection's safe point, so the collection waited for
+  it for ever; every thread that attached meanwhile parked behind it, tokio's
+  workers included, so the DNS answer or the connect it waited on was never
+  read. The process then served no SIP and no `/metrics`, with no CPU in use,
+  and no watchdog fired. That work now runs detached, as it does on the first
+  pass, and every blocking wait in the dispatcher releases the interpreter when
+  its thread holds it (a test-suite scan guards both).
+
+- **Timer expiries no longer run script handlers on the timer sweep's task.**
+  One task drives every SIP transaction timer; an `@proxy.on_failure` on Timer
+  B/F or an `@b2bua.on_failure` on a ring timeout that awaited held it for the
+  whole await, so every other timeout and retransmission in the process waited.
+  Each turn now runs on the executor, and each expiry that reaches a script is
+  an executor job of its own.
+
+- **The request's action no longer runs under the request's lock**, and the
+  response path no longer attaches to the interpreter under a proxy session's
+  lock: either could otherwise close the same stop-the-world deadlock with a
+  script task that still held the request.
+
+### Added
+
+- **Process liveness watchdog** (`script.process_stall_abort_secs`, default 30,
+  `0` disables): aborts for a supervisor restart when the tokio runtime runs no
+  timer, socket or task, most of its workers are stuck in one poll, no thread
+  can attach to the interpreter, or the timer sweep stops turning. The handler
+  pool's watchdog could not see a whole-process wedge, which starves the pool
+  of work so it looks idle. New gauge `siphon_interpreter_attach_wait_ms`.
+- **A network de-registration's NOTIFY reaches the UE over its SA, and
+  nothing goes to a protected port in clear.** When registrar liveness
+  de-registered an idle protected binding with `network_dereg`, the UE's
+  SA pair was deleted a millisecond after the de-REGISTER left, and the
+  S-CSCF's NOTIFY for the UE's own reg-event subscription then went to the
+  UE's protected server port in clear, from the plaintext listener. The pair
+  is now shortened instead (TS 24.229 clause 5.2.5.2 NOTE 2), for
+  `registrar.liveness.network_dereg_sa_grace_ms` (default 4000), and goes
+  when the UE answers a NOTIFY or the grace is over. Separately, the egress
+  guard that refused requests to the protected ports of bindings restored
+  without their SAs now covers every deleted pair too: a request to a UE
+  port of a pair that is gone, with no live pair covering it, is refused
+  with a `WARN` (private identity, UE address, ports) and counted in
+  `siphon_ipsec_unprotected_sends_refused_total` (TS 33.203 clause 7.1).
+  Responses still go back where their request came from.
+### Added
+
+- **Per-call `media_flags` on the control plane.** `answer`, an anchored
+  `progress`, `stream_start` with `mode: "bridge"` and `originate` with
+  `media: true` take `media_flags` beside `profile`: up to twelve processing
+  settings (`echo_cancellation`, `echo_delay_search_ms`, `echo_long_tail`,
+  `echo_residual_suppression`, `noise_suppression`, `ws_vad`, `ws_vad_engine`,
+  `ws_vad_min_speech_ms`, `ws_vad_threshold`, `ws_vad_hangover_ms`,
+  `ws_barge_in`, `ws_sample_rate`) merged over the profile's answer half for
+  that call only. Turning echo cancellation off for one bot no longer takes a
+  second profile and a restart, and the profile itself is never changed. The
+  values are checked at the verb by the rules config load uses (the
+  `echo_delay_search_ms` range is picked by the merged `echo_long_tail`, through
+  one check shared with boot), and an unknown key, a `null`, a wrong type or a
+  bad value is `bad_request` with `error.details: {verb, argument:
+  "media_flags", field, reason, allowed?}` before anything is anchored. They are
+  refused on a tee, on a bridge without `profile`, on an originate carrying its
+  own offer and after anchored early media already sent the engine's answer.
+  An originate keeps them until the callee's 2xx is answered. Without
+  `media_flags` the engine gets the same frames as before. The Rust, Python and
+  TypeScript control SDKs carry them as a typed `MediaFlags`
+  (`Call::answer_anchored_with_flags`, `ResponseOptions::media_flags`,
+  `StreamOptions::media_flags`, `OriginateMedia::anchor_with_flags`;
+  `media_flags=` in Python; `mediaFlags` in TypeScript). In the Rust SDK,
+  `OriginateMedia::Anchor`, `StreamOptions` and `ResponseOptions` gain a
+  `media_flags` field, which breaks code that builds them as literals without
+  `..Default::default()`, so the SDK takes a minor bump.
+
+### Changed
+
+- **A `profile` that is not a string is `bad_request` on `answer`, `progress`
+  and `originate`.** It used to be read as no profile at all, so the call was
+  anchored on the default profile the controller never named. `stream_start`
+  already refused it.
 
 ## [1.15.3] — 2026-10-23
 

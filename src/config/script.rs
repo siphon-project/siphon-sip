@@ -59,6 +59,19 @@ pub struct ScriptConfig {
     /// `script::py_executor`.
     #[serde(default = "default_handler_stall_abort_secs")]
     pub handler_stall_abort_secs: u64,
+    /// Seconds the process may show no sign of life before SIPhon aborts it
+    /// so a supervisor restarts it: the tokio runtime running no task (timer
+    /// and socket included), most of its workers stuck in one poll, no thread
+    /// able to attach to the Python interpreter (a garbage collection's
+    /// stop-the-world that never ends), or the timer sweep not turning.
+    ///
+    /// Separate from `handler_stall_abort_secs`, which judges the executor
+    /// pool and stays quiet while the pool has idle capacity: a wedge of the
+    /// whole process starves the pool of work too, so the pool looks idle
+    /// while nothing is served. Defaults to 30; `0` disables it. See
+    /// `script::liveness`.
+    #[serde(default = "default_process_stall_abort_secs")]
+    pub process_stall_abort_secs: u64,
     /// Seconds a synchronous worker waits for one `async def` handler's
     /// coroutine before it gives the worker thread back and fails that call.
     ///
@@ -104,6 +117,10 @@ fn default_handler_stall_abort_secs() -> u64 {
     30
 }
 
+fn default_process_stall_abort_secs() -> u64 {
+    30
+}
+
 /// Seconds a worker waits for one coroutine when the operator sets nothing.
 ///
 /// A leak guard well clear of every legitimate long handler (a 30 s ring, a
@@ -141,6 +158,7 @@ impl Default for ScriptConfig {
             sync_pool_size: None,
             sync_pool_max: None,
             handler_stall_abort_secs: default_handler_stall_abort_secs(),
+            process_stall_abort_secs: default_process_stall_abort_secs(),
             handler_timeout_secs: None,
             executor_queue_capacity: default_executor_queue_capacity(),
             include_paths: Vec::new(),

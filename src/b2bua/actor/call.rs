@@ -546,16 +546,6 @@ pub struct CallActor {
     /// Last 101-199 sent to the caller, as wire bytes (`invite_retransmission`).
     pub a_leg_last_provisional: Option<bytes::Bytes>,
 }
-/// The media plan of an offerless originate, resolved when the callee's 2xx
-/// arrives. Names a profile in the media registry rather than carrying resolved
-/// engine flags, so the actor layer stays free of media types.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OriginateAnchor {
-    /// Media profile whose `answer` flags the local anchor uses.
-    pub profile: String,
-    /// Per-call WebSocket bridge URI (templated), overriding the profile's.
-    pub ws_uri: Option<String>,
-}
 impl CallActor {
     /// Whether one of this call's legs carries the dialog `sip_call_id`. A
     /// transfer or a takeover can release a party from the call, and move one to

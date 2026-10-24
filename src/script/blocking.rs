@@ -255,7 +255,6 @@ mod tests {
         // Owned by the IPsec work that makes this hook non-blocking; it moves
         // onto the helpers with that change.
         const PENDING: &[&str] = &[
-            "src/dispatcher/ipsec_lifecycle.rs",
             "src/ipsec/manager_async.rs",
             "src/ipsec/runtime.rs",
         ];

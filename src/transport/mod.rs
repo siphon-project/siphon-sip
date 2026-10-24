@@ -981,6 +981,22 @@ impl OutboundRouter {
         if ipsec.is_some_and(|manager| manager.refuses_unprotected_send(&message)) {
             return Err(flume::SendError(message));
         }
+        // Held while a pending pair of the UE is taken into use, and sent by
+        // the switch once it is over ([`crate::ipsec::switch`]).
+        let Some(message) = crate::ipsec::switch::hold_or_pass(message) else {
+            return Ok(());
+        };
+        self.deliver(message)
+    }
+
+    /// Put `message` on its transport's channel, past the IPsec checks of
+    /// [`send_guarded`](Self::send_guarded): a message it held is sent through
+    /// here once the switch it waited for is over.
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn deliver(
+        &self,
+        message: OutboundMessage,
+    ) -> Result<(), flume::SendError<OutboundMessage>> {
         // The `direction="out"` half of siphon_requests_total / siphon_responses_total.
         //
         // Counted here rather than at the typed reply helpers because this is the

@@ -604,6 +604,30 @@ pub fn b2bua_answer_call_anchored(
     ws_uri: Option<&str>,
     headers: &[(String, String)],
 ) -> Result<(), String> {
+    b2bua_answer_call_anchored_with_flags(
+        internal_call_id,
+        code,
+        reason,
+        profile,
+        ws_uri,
+        None,
+        headers,
+    )
+}
+
+/// [`b2bua_answer_call_anchored`] with the call's `media_flags` merged over the
+/// profile's answer half for this call only — the control verb's
+/// `answer {media_flags}`. The published entry point keeps its signature and
+/// sends none.
+pub(crate) fn b2bua_answer_call_anchored_with_flags(
+    internal_call_id: &str,
+    code: u16,
+    reason: &str,
+    profile: Option<&str>,
+    ws_uri: Option<&str>,
+    media_flags: Option<&crate::rtpengine::media_flags::MediaFlags>,
+    headers: &[(String, String)],
+) -> Result<(), String> {
     let Some(control) = B2BUA_CONTROL.get() else {
         return Err("B2BUA is not running".to_string());
     };
@@ -642,6 +666,7 @@ pub fn b2bua_answer_call_anchored(
         reason,
         profile,
         ws_uri,
+        media_flags,
         headers,
         state,
     )
@@ -661,6 +686,30 @@ pub fn b2bua_progress_call_anchored(
     reason: &str,
     profile: Option<&str>,
     ws_uri: Option<&str>,
+    headers: &[(String, String)],
+) -> Result<(), String> {
+    b2bua_progress_call_anchored_with_flags(
+        internal_call_id,
+        code,
+        reason,
+        profile,
+        ws_uri,
+        None,
+        headers,
+    )
+}
+
+/// [`b2bua_progress_call_anchored`] with the call's `media_flags` merged over
+/// the profile's answer half for this call only — the control verb's anchored
+/// `progress {media_flags}`. The published entry point keeps its signature and
+/// sends none.
+pub(crate) fn b2bua_progress_call_anchored_with_flags(
+    internal_call_id: &str,
+    code: u16,
+    reason: &str,
+    profile: Option<&str>,
+    ws_uri: Option<&str>,
+    media_flags: Option<&crate::rtpengine::media_flags::MediaFlags>,
     headers: &[(String, String)],
 ) -> Result<(), String> {
     let Some(control) = B2BUA_CONTROL.get() else {
@@ -694,6 +743,7 @@ pub fn b2bua_progress_call_anchored(
         reason,
         profile,
         ws_uri,
+        media_flags,
         headers,
         state,
     )
@@ -782,6 +832,7 @@ pub fn b2bua_progress_call_anchored_from(
         reason,
         profile,
         ws_uri,
+        None,
         headers,
         state,
     )
