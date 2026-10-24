@@ -71,6 +71,8 @@ mod ipsec_request_flow_tests;
 mod ipsec_response_flow_tests;
 mod late_answer;
 mod liveness;
+#[cfg(test)]
+mod liveness_network_dereg_tests;
 mod media_init;
 mod proxy_dialog_state;
 mod proxy_release;
@@ -238,6 +240,8 @@ mod listener_identity_tests;
 #[cfg(test)]
 mod local_answer_contact_tests;
 #[cfg(test)]
+mod media_flags_tests;
+#[cfg(test)]
 mod media_started_event_tests;
 #[cfg(test)]
 mod media_summary_bridge_tests;
@@ -356,11 +360,15 @@ mod spiral_invite_tests;
 #[cfg(test)]
 mod stale_in_dialog_request_tests;
 #[cfg(test)]
+mod stop_the_world_tests;
+#[cfg(test)]
 mod subscribe_notify_before_2xx_tests;
 #[cfg(test)]
 mod subscribe_reply_order_tests;
 #[cfg(test)]
 mod subscribe_test_harness;
+#[cfg(test)]
+mod sweep_executor_tests;
 #[cfg(test)]
 mod take_over_tests;
 #[cfg(test)]
@@ -410,9 +418,9 @@ pub use b2bua::{
 // does not grow a surface by accident, published or not.
 pub(crate) use b2bua::{
     any_early_offer, b2bua_accept_refer_call_dialling, b2bua_accept_refer_controller_with_state,
-    b2bua_accept_refer_script, b2bua_cancel_dial_with_state, b2bua_complete_refer,
-    b2bua_complete_refer_with_state, b2bua_dial_call, b2bua_drop_call, b2bua_media_profile,
-    b2bua_originate_group_create, b2bua_originate_group_start,
+    b2bua_accept_refer_script, b2bua_answer_call_anchored_with_flags, b2bua_cancel_dial_with_state,
+    b2bua_complete_refer, b2bua_complete_refer_with_state, b2bua_dial_call, b2bua_drop_call,
+    b2bua_media_profile, b2bua_originate_group_create, b2bua_originate_group_start,
     b2bua_originate_prepare_with_contact_host, b2bua_originate_with_route,
     b2bua_reject_call_with_headers, b2bua_replace_peer_dialling, b2bua_send_info,
     b2bua_set_local_contact, b2bua_set_session_timer, b2bua_take_over_is_anchored,
@@ -427,7 +435,9 @@ pub(crate) use b2bua::{
     OriginateGroupStrategy, OriginateGroupWinner, OriginateLegProgress, ReplacementDial,
     RunningDispatcher, DIAL_BRIDGE_CALLER_GONE, DIAL_CANCELLED, DIAL_RINGBACK_ORIGIN,
 };
-pub(crate) use b2bua::{b2bua_dial_refusal, b2bua_progress_call_anchored_from};
+pub(crate) use b2bua::{
+    b2bua_dial_refusal, b2bua_progress_call_anchored_from, b2bua_progress_call_anchored_with_flags,
+};
 pub(crate) use charging::{ro_answer_ocs_request, ro_bind_call, RO_CONTROL};
 pub use charging::{ro_authorize_b2bua, RoAuthorizeOutcome};
 pub(crate) use liveness::liveness_on_flow_close;
@@ -673,7 +683,7 @@ pub async fn run(
         config
             .ipsec
             .as_ref()
-            .map(|ipsec| (ipsec.pcscf_port_c, ipsec.pcscf_port_s)),
+            .map(|ipsec| (ipsec.pcscf_port_c.as_slice(), ipsec.pcscf_port_s)),
         config
             .ipsec
             .as_ref()

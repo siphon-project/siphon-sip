@@ -765,14 +765,12 @@ pub(super) fn anchored_caller_offer(
     let mut flags = profile.offer.clone();
     flags.stamp_received_from(inbound.remote_addr.ip());
     flags.stamp_sip_call_id_of(caller_prack);
-    match tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(backend.reoffer(
-            session.rtpengine_id(),
-            offer_tag,
-            &caller_prack.body,
-            &flags,
-        ))
-    }) {
+    match crate::script::blocking::block_on_released(backend.reoffer(
+        session.rtpengine_id(),
+        offer_tag,
+        &caller_prack.body,
+        &flags,
+    )) {
         Ok(offer) => Anchoring::Rewritten(offer),
         Err(error) => {
             warn!(call_id = %call_id, "RTPEngine offer for the caller's PRACK offer failed: {error}");
@@ -815,15 +813,13 @@ fn anchored_answer_to_caller_offer(
     let mut flags = profile.answer.clone();
     flags.stamp_received_from(source.ip());
     flags.stamp_sip_call_id_of(response);
-    match tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(backend.answer(
-            session.rtpengine_id(),
-            answer_from,
-            answer_to,
-            &response.body,
-            &flags,
-        ))
-    }) {
+    match crate::script::blocking::block_on_released(backend.answer(
+        session.rtpengine_id(),
+        answer_from,
+        answer_to,
+        &response.body,
+        &flags,
+    )) {
         Ok(answer) => Anchoring::Rewritten(answer),
         Err(error) => {
             warn!(call_id = %call_id, "RTPEngine answer for the callee's PRACK answer failed: {error}");

@@ -428,14 +428,12 @@ fn reoffer(
         sender_source,
         &media.sender_sip_call_id,
     )?;
-    tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(backend.reoffer(
-            &media.media_call_id,
-            &media.sender_tag,
-            sdp,
-            &flags,
-        ))
-    })
+    crate::script::blocking::block_on_released(backend.reoffer(
+        &media.media_call_id,
+        &media.sender_tag,
+        sdp,
+        &flags,
+    ))
     .map_err(|error| error.to_string())
 }
 
@@ -457,15 +455,13 @@ fn answer(
         receiver_source,
         &media.receiver_sip_call_id,
     )?;
-    tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(backend.answer(
-            &media.media_call_id,
-            &media.sender_tag,
-            &media.receiver_tag,
-            sdp,
-            &flags,
-        ))
-    })
+    crate::script::blocking::block_on_released(backend.answer(
+        &media.media_call_id,
+        &media.sender_tag,
+        &media.receiver_tag,
+        sdp,
+        &flags,
+    ))
     .map_err(|error| error.to_string())
 }
 

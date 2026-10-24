@@ -205,14 +205,12 @@ pub fn b2bua_transfer_rtpengine_offer(
     let mut offer_flags = profile.offer.clone();
     stamp_party_ingress(&mut offer_flags, profiles, ingress);
     offer_flags.stamp_sip_call_id(offerer_sip_call_id);
-    match tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(backend.offer(
-            cid_new,
-            survivor_tag,
-            survivor_sdp,
-            &offer_flags,
-        ))
-    }) {
+    match crate::script::blocking::block_on_released(backend.offer(
+        cid_new,
+        survivor_tag,
+        survivor_sdp,
+        &offer_flags,
+    )) {
         Ok(rewritten) => Some(rewritten),
         Err(error) => {
             warn!(rtpengine_call_id = %cid_new, "REFER terminate: rtpengine offer failed: {error}");
@@ -253,15 +251,13 @@ pub fn b2bua_transfer_rtpengine_answer(
     let mut answer_flags = shape.resolve(profiles)?;
     stamp_party_ingress(&mut answer_flags, profiles, ingress);
     answer_flags.stamp_sip_call_id(answerer_sip_call_id);
-    match tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(backend.answer(
-            cid_new,
-            survivor_tag,
-            target_tag,
-            target_sdp,
-            &answer_flags,
-        ))
-    }) {
+    match crate::script::blocking::block_on_released(backend.answer(
+        cid_new,
+        survivor_tag,
+        target_tag,
+        target_sdp,
+        &answer_flags,
+    )) {
         Ok(rewritten) => Some(rewritten),
         Err(error) => {
             warn!(rtpengine_call_id = %cid_new, "rtpengine answer failed: {error}");

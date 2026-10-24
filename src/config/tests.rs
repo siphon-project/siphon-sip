@@ -2503,6 +2503,36 @@ fn the_echo_delay_search_refusal_names_the_reading_it_applied() {
     assert!(refuse(false).contains("search window"), "{}", refuse(false));
 }
 
+/// The boot refusal reads word for word as it did before its range check was
+/// shared with the control rail's per-call `media_flags`: sharing the rule must
+/// not move the text an operator greps their logs for.
+#[test]
+fn the_echo_delay_search_refusal_text_is_pinned() {
+    let refuse = |long_tail: bool| {
+        let yaml = ws_profile_yaml(
+            SIPHON_RTP_BACKEND,
+            &format!(
+                "      offer:\n        echo_cancellation: true\n        \
+                     echo_long_tail: {long_tail}\n        \
+                     echo_delay_search_ms: 1001\n      answer: {{}}\n"
+            ),
+        );
+        Config::from_str(&yaml)
+            .expect_err("out of range")
+            .to_string()
+    };
+    let window = "media profile \"voice_ai_custom\" sets echo_delay_search_ms to 1001 on its \
+                  offer flags, outside the 16-1000 ms the engine accepts for a search window — \
+                  it refuses the value on every offer, so a node carrying this config starts \
+                  healthy and then fails every call";
+    let tail = "media profile \"voice_ai_custom\" sets echo_delay_search_ms to 1001 on its \
+                offer flags, outside the 16-1000 ms the engine accepts for a tail length, \
+                because echo_long_tail is set — it refuses the value on every offer, so a node \
+                carrying this config starts healthy and then fails every call";
+    assert!(refuse(false).contains(window), "{}", refuse(false));
+    assert!(refuse(true).contains(tail), "{}", refuse(true));
+}
+
 /// The bounds themselves are accepted — the check is inclusive, so a config
 /// sitting exactly on 16 or 1000 is not refused by an off-by-one — and that
 /// holds for the tail reading too, which is the one that used to be checked
@@ -5831,6 +5861,106 @@ fn the_default_spi_partition_holds_a_large_p_cscf() {
     assert_eq!(ipsec.spi_range_count, 1 << 22);
     // Two SPIs per UE: room for well over a million registered UEs.
     assert!(ipsec.spi_range_count / 2 >= 1_000_000);
+}
+
+/// A P-CSCF config with `listen` and `ipsec` blocks as given.
+fn p_cscf_yaml(listen: &str, ipsec: &str) -> Result<Config> {
+    Config::from_str(&format!(
+        "listen:\n{listen}domain:\n  local: [\"example.com\"]\nipsec:\n{ipsec}"
+    ))
+}
+
+fn listen_addresses(entries: &[crate::config::ListenEntry]) -> Vec<String> {
+    entries
+        .iter()
+        .map(|entry| entry.address().to_string())
+        .collect()
+}
+
+#[test]
+fn a_single_protected_client_port_loads_and_binds_nothing_more() {
+    let config = p_cscf_yaml(
+        "  udp: [\"0.0.0.0:5060\", \"192.0.2.10:5066\"]\n",
+        "  pcscf_port_c: 5064\n  pcscf_port_s: 5066\n",
+    )
+    .expect("a single port loads");
+    let ipsec = config.ipsec.expect("ipsec block");
+    assert_eq!(ipsec.pcscf_port_c.as_slice(), [5064]);
+    assert!(!ipsec.pcscf_port_c.rotates());
+    assert_eq!(
+        listen_addresses(&config.listen.udp),
+        ["0.0.0.0:5060", "192.0.2.10:5066"],
+        "a single port is left exactly as configured"
+    );
+    // The default is still the single port 5064.
+    let config = base_yaml("ipsec: {}\n").expect("an empty ipsec block loads");
+    assert_eq!(config.ipsec.expect("ipsec").pcscf_port_c.as_slice(), [5064]);
+}
+
+/// A list binds every port where the protected server port is bound, over UDP
+/// and, where it has a TCP listener, over TCP; one already listed is kept.
+#[test]
+fn a_protected_client_port_list_is_bound_on_the_protected_address() {
+    let config = p_cscf_yaml(
+        concat!(
+            "  udp: [\"0.0.0.0:5060\", \"192.0.2.10:5064\", \"192.0.2.10:5066\"]\n",
+            "  tcp: [\"0.0.0.0:5060\", \"192.0.2.10:5066\"]\n",
+        ),
+        "  pcscf_port_c: [5064, 5068]\n  pcscf_port_s: 5066\n",
+    )
+    .expect("a list loads");
+    let ipsec = config.ipsec.expect("ipsec block");
+    assert_eq!(ipsec.pcscf_port_c.as_slice(), [5064, 5068]);
+    assert_eq!(ipsec.pcscf_port_c.first(), 5064);
+    assert_eq!(
+        listen_addresses(&config.listen.udp),
+        [
+            "0.0.0.0:5060",
+            "192.0.2.10:5064",
+            "192.0.2.10:5066",
+            "192.0.2.10:5068"
+        ]
+    );
+    assert_eq!(
+        listen_addresses(&config.listen.tcp),
+        [
+            "0.0.0.0:5060",
+            "192.0.2.10:5066",
+            "192.0.2.10:5064",
+            "192.0.2.10:5068"
+        ]
+    );
+}
+
+#[test]
+fn a_protected_client_port_list_no_pair_can_use_is_refused() {
+    let listen = "  udp: [\"0.0.0.0:5060\", \"192.0.2.10:5066\"]\n";
+    for (ports, expected) in [
+        ("[]", "empty list"),
+        ("[5064, 5064]", "lists port 5064 twice"),
+        ("[5064, 5066]", "also ipsec.pcscf_port_s"),
+        ("[5064, 5060]", "standard SIP port"),
+        ("[5064, 0]", "port 0"),
+    ] {
+        let error = p_cscf_yaml(
+            listen,
+            &format!("  pcscf_port_c: {ports}\n  pcscf_port_s: 5066\n"),
+        )
+        .expect_err("refused");
+        assert!(error.to_string().contains(expected), "{ports}: {error}");
+    }
+    let error = p_cscf_yaml(
+        "  udp: [\"0.0.0.0:5060\", \"0.0.0.0:5068\", \"192.0.2.10:5066\"]\n",
+        "  pcscf_port_c: [5064, 5068]\n  pcscf_port_s: 5066\n",
+    )
+    .expect_err("a protected port on a wildcard address is refused");
+    assert!(error.to_string().contains("wildcard"), "{error}");
+    let error = p_cscf_yaml(
+        "  udp: [\"0.0.0.0:5060\", \"0.0.0.0:5066\"]\n",
+        "  pcscf_port_c: [5064, 5068]\n  pcscf_port_s: 5066\n",
+    )
+    .expect_err("no concrete protected address to bind the list at");
+    assert!(error.to_string().contains("concrete address"), "{error}");
 }
 
 #[test]

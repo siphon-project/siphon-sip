@@ -1024,15 +1024,13 @@ pub fn bridge_advance_to_anchor(
                     return;
                 }
             };
-            let answered = tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(backend.answer(
-                    media_call_id,
-                    from_tag,
-                    &peer_answer_tag,
-                    &response.body,
-                    &flags,
-                ))
-            });
+            let answered = crate::script::blocking::block_on_released(backend.answer(
+                media_call_id,
+                from_tag,
+                &peer_answer_tag,
+                &response.body,
+                &flags,
+            ));
             match answered {
                 Ok(sdp) => sdp,
                 Err(error) => {

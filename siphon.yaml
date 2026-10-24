@@ -353,6 +353,15 @@ script:
   #                                # with idle workers and an empty queue is
   #                                # still serving and is never aborted, however
   #                                # long one handler has been parked.
+  # process_stall_abort_secs: 30   # whole-process liveness: abort when the
+  #                                # tokio runtime runs no timer/socket/task,
+  #                                # most tokio workers are stuck in one poll,
+  #                                # no thread can attach to the interpreter (a
+  #                                # GC stop-the-world that never ends), or the
+  #                                # timer sweep stops, for this long. Catches
+  #                                # the wedge the pool watchdog above cannot
+  #                                # see (nothing is fed to an idle-looking
+  #                                # pool). 0 disables it.
   # handler_timeout_secs: 300      # give a worker back if one async handler's
   #                                # coroutine has not settled in this long, and
   #                                # cancel it. A leak guard, not a deadline:
@@ -422,6 +431,11 @@ registrar:
   #     #   registrar of record clears the binding too.
   #     # local_only: drop local state + emit on_change only (use on the box
   #     #   that IS the registrar of record).
+  #   network_dereg_sa_grace_ms: 4000  # network_dereg on a P-CSCF: keep the UE's
+  #     #   IPsec SA pair this long so the S-CSCF's NOTIFY reporting the
+  #     #   de-registration reaches it over the pair (TS 24.229 5.2.5.2 NOTE 2);
+  #     #   it goes as soon as the UE answers a NOTIFY. Without a pair, a request
+  #     #   to the UE's protected ports is refused, never sent in clear.
 
 # ---------------------------------------------------------------------------
 # Registrant — Outbound REGISTER Client (Carrier Trunk Registration)
@@ -2246,6 +2260,32 @@ auth:
 #   # still in use, back in order once this runs out. siphon_enum_server_up
 #   # shows the state.
 #   server_hold_down_secs: 30
+
+# ---------------------------------------------------------------------------
+# IPsec — P-CSCF security associations (3GPP TS 33.203)
+# ---------------------------------------------------------------------------
+# The P-CSCF side of sec-agree, driven from the script (siphon.ipsec). Bind
+# pcscf_port_s (and a single pcscf_port_c) under listen.udp/tcp at the concrete
+# address UEs send to: siphon uses that bind address as the P-CSCF side of
+# every SA, and a wildcard matches no ESP. Needs CAP_NET_ADMIN.
+#
+# ipsec:
+#   # Protected client port(s). One port (the default, 5064): every SA pair
+#   # sends from it, and the old and new set of a re-authentication share it.
+#   # A list: each new pair takes a port no other pair of the same UE holds, so
+#   # port_pc changes on every authenticated re-registration (TS 33.203 clause
+#   # 7.4.0; other UEs may hold the same port). siphon then binds every listed
+#   # port, over UDP, and over TCP where pcscf_port_s has a TCP listener, at each
+#   # concrete address pcscf_port_s is bound to; no listen entries needed. A list
+#   # is refused at load with a port twice, pcscf_port_s, 5060/5061, a listed
+#   # port bound on a wildcard address, or no concrete listen.udp on
+#   # pcscf_port_s. Advertise a pair's own port: SecurityServerParams.port_c.
+#   pcscf_port_c: [5064, 5068]
+#   pcscf_port_s: 5066         # protected server port, fixed for every UE
+#   backend: netlink           # "netlink" (default) or "ip" (shell-out)
+#   # spi_range_start: 10000   # per-instance partition for multi-process P-CSCFs (>= 256)
+#   # spi_range_count: 4194304 # 2 SPIs per registered UE; a full range fails ipsec.allocate
+#   # path_host: "pcscf-0.ims.example.com:5060"   # host of add_pcscf_path() Path URIs
 
 # ---------------------------------------------------------------------------
 # ISC — Initial Filter Criteria (3GPP TS 29.228)

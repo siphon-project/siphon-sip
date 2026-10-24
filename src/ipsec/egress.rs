@@ -30,14 +30,20 @@ use crate::transport::{ConnectionId, OutboundMessage, Transport};
 /// `pcscf_port_s`: a UDP send leaving that port (or no pinned socket) for a
 /// UE's protected client port goes from the P-CSCF's protected client port to the UE's protected
 /// server port instead ([`IpsecManager::udp_flow_to_ue`], one map lookup).
-/// Anything else is returned unchanged. Nothing is dropped: a pair that
-/// cannot carry UDP is logged and the message goes where it was going.
+/// The client port is the pair's own: a response goes over the pair its
+/// request came over, a `request` over the set in use
+/// ([`IpsecManager::udp_request_flow_to_ue`]), which differ while an
+/// authentication with a protected client port of its own is in progress
+/// (TS 33.203 clause 7.4.2a). Anything else is returned unchanged. Nothing is
+/// dropped: a pair that cannot carry UDP is logged and the message goes where
+/// it was going.
 pub fn pcscf_udp_egress(
     manager: &IpsecManager,
     pcscf_port_s: u16,
     transport: Transport,
     destination: SocketAddr,
     local: Option<SocketAddr>,
+    request: bool,
 ) -> (SocketAddr, Option<SocketAddr>) {
     let unchanged = (destination, local);
     // Unpinned, the send would leave from a default socket outside every
@@ -45,7 +51,12 @@ pub fn pcscf_udp_egress(
     if transport != Transport::Udp || local.is_some_and(|local| local.port() != pcscf_port_s) {
         return unchanged;
     }
-    match manager.udp_flow_to_ue(destination) {
+    let flow = if request {
+        manager.udp_request_flow_to_ue(destination)
+    } else {
+        manager.udp_flow_to_ue(destination)
+    };
+    match flow {
         FlowToUe::NotProtected => unchanged,
         FlowToUe::Protected {
             local: protected_local,
@@ -128,7 +139,7 @@ pub fn pcscf_tcp_request_egress(
 
 /// Whether `frame` is a serialized SIP request: it starts with a method
 /// token, which a response (`SIP/2.0 ...`) and a CRLF keepalive do not.
-fn is_request(frame: &[u8]) -> bool {
+pub(crate) fn is_request(frame: &[u8]) -> bool {
     frame.first().is_some_and(u8::is_ascii_uppercase)
         && !crate::transport::response_route::is_response(frame)
 }
@@ -194,6 +205,7 @@ mod tests {
                 Transport::Udp,
                 sock("198.51.100.30:6100"),
                 Some(sock("192.0.2.1:5066")),
+                true,
             ),
             (sock("198.51.100.30:6101"), Some(sock("192.0.2.1:5064")))
         );
@@ -213,7 +225,7 @@ mod tests {
             let destination = sock(destination);
             let local = local.map(sock);
             assert_eq!(
-                pcscf_udp_egress(&manager, 5066, transport, destination, local),
+                pcscf_udp_egress(&manager, 5066, transport, destination, local, true),
                 (destination, local),
                 "{transport} {destination} from {local:?}"
             );
@@ -224,7 +236,8 @@ mod tests {
                 5066,
                 Transport::Udp,
                 sock("198.51.100.31:6100"),
-                None
+                None,
+                true,
             ),
             (sock("198.51.100.31:6101"), Some(sock("192.0.2.1:5064"))),
             "unpinned, it would leave outside every security association"
@@ -233,7 +246,7 @@ mod tests {
         let destination = sock("198.51.100.33:6100");
         let local = Some(sock("192.0.2.1:5066"));
         assert_eq!(
-            pcscf_udp_egress(&ue_role, 5066, Transport::Udp, destination, local),
+            pcscf_udp_egress(&ue_role, 5066, Transport::Udp, destination, local, true),
             (destination, local)
         );
     }
@@ -247,7 +260,7 @@ mod tests {
         let destination = sock("198.51.100.34:6100");
         let local = Some(sock("192.0.2.1:5066"));
         assert_eq!(
-            pcscf_udp_egress(&manager, 5066, Transport::Udp, destination, local),
+            pcscf_udp_egress(&manager, 5066, Transport::Udp, destination, local, true),
             (destination, local)
         );
     }

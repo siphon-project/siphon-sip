@@ -41,8 +41,8 @@ pub(super) struct OrphanedFlows {
 }
 
 impl IpsecManager {
-    /// Drop every binding of `registrar` that was protected, accepted on
-    /// `pcscf_port_c` or `pcscf_port_s`, and whose SA pair this manager does
+    /// Drop every binding of `registrar` that was protected, accepted on one
+    /// of `pcscf_ports_c` or on `pcscf_port_s`, and whose SA pair this manager does
     /// not hold. Returns how many were dropped.
     ///
     /// Run once at startup, after the backend restore and before any traffic.
@@ -56,13 +56,13 @@ impl IpsecManager {
     pub fn drop_restored_bindings_without_sa(
         &self,
         registrar: &Registrar,
-        pcscf_port_c: u16,
+        pcscf_ports_c: &[u16],
         pcscf_port_s: u16,
     ) -> usize {
         let evicted = registrar.evict_restored(|contact| {
             contact.kind == ContactKind::Ue
                 && contact.inbound_local_addr.is_some_and(|local| {
-                    local.port() == pcscf_port_c || local.port() == pcscf_port_s
+                    pcscf_ports_c.contains(&local.port()) || local.port() == pcscf_port_s
                 })
                 && !self.holds_pair_for(contact)
         });
@@ -93,8 +93,9 @@ impl IpsecManager {
     }
 
     /// Whether `message` must not leave: a request to a UE endpoint whose
-    /// security associations died with a previous process, while no SA pair
-    /// of this manager covers it. Logged at ERROR and counted
+    /// security associations died with a previous process, or to a UE port of
+    /// a pair this manager deleted ([`super::deleted_flows`], logged at WARN),
+    /// while no SA pair of this manager covers it. Logged at ERROR and counted
     /// (`siphon_ipsec_unprotected_sends_refused_total`) when refused.
     ///
     /// Only requests are refused. A response goes back to where its request
@@ -103,6 +104,9 @@ impl IpsecManager {
     /// that a new SA pair covers again, or whose binding would have expired by
     /// now, is forgotten.
     pub fn refuses_unprotected_send(&self, message: &OutboundMessage) -> bool {
+        if self.refuses_send_to_deleted_flow(message) {
+            return true;
+        }
         let endpoints = &self.orphaned_flows.endpoints;
         if endpoints.is_empty() {
             return false;
@@ -142,6 +146,7 @@ impl IpsecManager {
         self.orphaned_flows
             .endpoints
             .retain(|_, until| *until > now);
+        self.deleted_flows.prune(now);
     }
 
     /// How many UE endpoints are barred from unprotected requests.

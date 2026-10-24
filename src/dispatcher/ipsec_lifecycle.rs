@@ -10,15 +10,14 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::runtime::RuntimeFlavor;
 use tracing::error;
 
 use super::DispatcherState;
-use crate::ipsec::retire::RetireCondition;
+use crate::ipsec::retire::{Pending, RetireCondition};
 use crate::sip::headers::nameaddr::NameAddr;
 use crate::sip::headers::SipHeaders;
 use crate::sip::message::SipMessage;
-use crate::transport::Transport;
+use crate::transport::{OutboundRouter, Transport};
 
 /// A 2xx to `register`, which `ue` sent over `transport`, has been sent to it.
 pub(super) fn on_register_2xx(
@@ -103,45 +102,112 @@ pub(super) fn before_register_final(
 /// protected"), TS 33.203 clause 7.4.2a (SM12 "shall be protected using the new
 /// outbound SA").
 ///
-/// The kernel policy update is awaited here, on the response path, since a
-/// 2xx that left before it would go over the old set. One update, once per
-/// re-authentication.
+/// With a single protected client port the pair shares the outbound policy of
+/// SA #3 with the set in use, so the kernel policy update must be over before
+/// the 2xx leaves. Never waits for it: the update runs on a task of its own,
+/// and until it is over every message to the UE, this 2xx first, is held at
+/// the egress and then sent in order ([`crate::ipsec::switch`]). Waiting here
+/// instead blocked the answering thread on a netlink round trip, which, on an
+/// executor worker attached to Python, held up every stop-the-world of the
+/// free-threaded interpreter and with it every thread that attaches.
+///
+/// With a protected client port of its own (`ipsec.pcscf_port_c` lists
+/// several) the 2xx goes over the pair anyway, a response to the request that
+/// came over it, and nothing in the kernel moves or is held: the pair is
+/// marked registered, and requests to the UE move to it once a further
+/// message arrives over it (TS 33.203 clause 7.4.2a,
+/// [`crate::ipsec::IpsecManager::note_protected_inbound`]).
 pub(super) fn take_into_use_before_2xx(state: &DispatcherState, ue: SocketAddr) {
     let Some(manager) = state.ipsec_manager.as_ref() else {
         return;
     };
-    if !manager.is_pending(&ue.ip(), ue.port()) {
-        return;
+    match manager.pending_how(&ue.ip(), ue.port()) {
+        None | Some(Pending::Registered) => return,
+        Some(Pending::Challenged) => {
+            manager.confirm_registration(&ue.ip(), ue.port());
+            return;
+        }
+        Some(Pending::SharedPolicy) => {}
     }
-    let switch = {
-        let manager = Arc::clone(manager);
-        async move { manager.take_into_use(&ue.ip(), ue.port()).await }
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        error!(ue = %ue, "IPsec: no runtime to take the new SA pair into use on");
+        return;
     };
-    let result = match tokio::runtime::Handle::try_current() {
-        Ok(handle) if handle.runtime_flavor() == RuntimeFlavor::MultiThread => {
-            tokio::task::block_in_place(|| handle.block_on(switch))
-        }
-        Ok(handle) => {
-            error!(
+    crate::ipsec::switch::hold(ue.ip());
+    let manager = Arc::clone(manager);
+    let outbound = Arc::clone(&state.outbound);
+    let switch = handle.spawn(async move { manager.take_into_use(&ue.ip(), ue.port()).await });
+    handle.spawn(async move {
+        match tokio::time::timeout(SWITCH_HOLD_BOUND, switch).await {
+            Ok(Ok(Ok(_))) => {}
+            Ok(Ok(Err(error))) => error!(
                 ue = %ue,
-                "IPsec: a single-threaded runtime cannot wait for the new SA pair to be taken \
-                 into use; the 2xx to the REGISTER may leave over the old set"
-            );
-            handle.spawn(switch);
-            return;
+                %error,
+                "IPsec: could not take the new SA pair into use; the 2xx to the REGISTER \
+                 leaves over the old set"
+            ),
+            Ok(Err(join_error)) => error!(
+                ue = %ue,
+                %join_error,
+                "IPsec: the task taking the new SA pair into use failed; the 2xx to the \
+                 REGISTER leaves over the old set"
+            ),
+            Err(_elapsed) => error!(
+                ue = %ue,
+                bound = ?SWITCH_HOLD_BOUND,
+                "IPsec: the kernel has not taken the new SA pair into use yet; the 2xx to \
+                 the REGISTER is not held any longer and may leave over the old set"
+            ),
         }
-        Err(_) => {
-            error!(ue = %ue, "IPsec: no runtime to take the new SA pair into use on");
-            return;
-        }
+        send_held(&outbound, ue);
+    });
+}
+
+/// A final response from `source` reached the dispatcher. One to a NOTIFY ends
+/// the transaction a pair kept through a network de-registration waited for,
+/// so the pair goes now rather than at the end of its grace (TS 24.229 clause
+/// 5.2.5.2, NOTE 2).
+pub(super) fn on_final_response(
+    state: &DispatcherState,
+    response: &SipMessage,
+    status_code: u16,
+    source: SocketAddr,
+) {
+    let Some(manager) = state.ipsec_manager.as_ref() else {
+        return;
     };
-    if let Err(error) = result {
-        error!(
-            ue = %ue,
-            %error,
-            "IPsec: could not take the new SA pair into use; the 2xx to the REGISTER leaves \
-             over the old set"
-        );
+    let answers_notify = || {
+        response.headers.cseq().is_some_and(|cseq| {
+            cseq.split_whitespace()
+                .nth(1)
+                .is_some_and(|method| method.eq_ignore_ascii_case("NOTIFY"))
+        })
+    };
+    if status_code >= 200 && answers_notify() {
+        manager.notify_answered(source);
+    }
+}
+
+/// How long messages to a UE are held for its pair's policy update at most. An
+/// update takes milliseconds; one the kernel never answers must not keep the
+/// UE's messages, and their memory, for ever.
+pub(super) const SWITCH_HOLD_BOUND: Duration = Duration::from_secs(2);
+
+/// Send what was held for `ue` while its pair was taken into use, in order,
+/// and stop holding.
+fn send_held(outbound: &OutboundRouter, ue: SocketAddr) {
+    crate::ipsec::switch::unhold(ue.ip());
+    while let Some(batch) = crate::ipsec::switch::release(ue.ip()) {
+        for message in batch {
+            if let Err(flume::SendError(message)) = outbound.deliver(message) {
+                error!(
+                    ue = %ue,
+                    destination = %message.destination,
+                    "IPsec: a message held while the new SA pair was taken into use could \
+                     not be sent"
+                );
+            }
+        }
     }
 }
 

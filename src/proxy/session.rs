@@ -51,6 +51,9 @@ pub struct ClientBranch {
 // ProxySession
 // ---------------------------------------------------------------------------
 
+/// A per-relay Python callback, shared so copying it needs no attach.
+pub type RelayCallback = Arc<Py<PyAny>>;
+
 /// A proxy session linking an inbound (server) transaction to one or more
 /// outbound (client) transactions.
 #[derive(Debug, Clone)]
@@ -128,9 +131,14 @@ pub struct ProxySession {
     /// B2BUA row, which drops its call state at teardown.
     pub acked_at: Option<Instant>,
     /// Per-relay on_reply Python callback (called with `(request, reply)`).
-    pub on_reply_callback: Option<Py<PyAny>>,
+    ///
+    /// Behind an `Arc` so the response path can take a copy under the session
+    /// lock without attaching to the interpreter: attaching while holding the
+    /// lock parks behind a garbage collection's stop-the-world, and a thread
+    /// attached and waiting for the lock is what that stop-the-world waits on.
+    pub on_reply_callback: Option<RelayCallback>,
     /// Per-relay on_failure Python callback (called with `(request, code, reason)`).
-    pub on_failure_callback: Option<Py<PyAny>>,
+    pub on_failure_callback: Option<RelayCallback>,
     /// Set once a final response has been committed upstream for this server
     /// transaction by a reply-time reject (`reply.reject(code, reason)` from
     /// `@proxy.on_reply`).  After a reject we send `code reason` to the UAC and
@@ -202,29 +210,18 @@ impl ProxySession {
         self.client_branches.get(key)
     }
 
-    /// Clone the per-relay `on_reply` / `on_failure` Python callbacks for use
+    /// Copy the per-relay `on_reply` / `on_failure` Python callbacks for use
     /// on the response path.
     ///
-    /// Free-threaded CPython (3.14t / PEP 703, pyo3 0.28) requires the calling
-    /// thread to be *attached* to the interpreter before a `Py<…>` refcount may
-    /// be touched: `Py::clone` panics with "Cannot clone pointer into Python
-    /// heap without the thread being attached" whenever it runs on a
-    /// dispatcher/executor worker that is not currently inside a
-    /// `Python::attach` scope. The dispatcher lifts these callbacks out of the
-    /// session read-guard on exactly such a worker, so the bare `Clone` impl is
-    /// unsound there. Clone through a `Python` token instead — matching the
-    /// request path (`script::handle::call_handler`, which uses `clone_ref`).
-    pub fn clone_relay_callbacks(&self) -> (Option<Py<PyAny>>, Option<Py<PyAny>>) {
-        Python::attach(|python| {
-            (
-                self.on_reply_callback
-                    .as_ref()
-                    .map(|callback| callback.clone_ref(python)),
-                self.on_failure_callback
-                    .as_ref()
-                    .map(|callback| callback.clone_ref(python)),
-            )
-        })
+    /// Copies the `Arc`s, so it touches no Python refcount and needs no attach.
+    /// The caller holds the session's read lock here, and must not attach under
+    /// it (see [`ProxySession::on_reply_callback`]). A bare `Py::clone` would
+    /// also panic on a thread that is not attached.
+    pub fn clone_relay_callbacks(&self) -> (Option<RelayCallback>, Option<RelayCallback>) {
+        (
+            self.on_reply_callback.clone(),
+            self.on_failure_callback.clone(),
+        )
     }
 }
 
@@ -1062,8 +1059,10 @@ mod tests {
     /// clone pointer into Python heap without the thread being attached" — and
     /// the panic check is thread-attachment based, so it reproduces on any
     /// build from a freshly spawned (never-attached) OS thread.
-    /// `clone_relay_callbacks` must attach first; if it regresses to a bare
-    /// clone, the worker thread panics and `join()` returns `Err` here.
+    /// `clone_relay_callbacks` copies `Arc`s, so it neither attaches (which it
+    /// must not do under the session lock) nor touches a refcount; if it
+    /// regresses to a bare `Py::clone`, the worker thread panics and `join()`
+    /// returns `Err` here.
     #[test]
     fn clone_relay_callbacks_from_unattached_worker_thread() {
         pyo3::Python::initialize();
@@ -1083,8 +1082,8 @@ mod tests {
         let original_reply_ptr = on_reply.as_ptr() as usize;
 
         let mut session = make_session();
-        session.on_reply_callback = Some(on_reply);
-        session.on_failure_callback = Some(on_failure);
+        session.on_reply_callback = Some(Arc::new(on_reply));
+        session.on_failure_callback = Some(Arc::new(on_failure));
         let session = Arc::new(session);
 
         // A freshly spawned OS thread has pyo3 ATTACH_COUNT == 0 — the exact

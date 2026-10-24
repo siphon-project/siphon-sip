@@ -592,6 +592,8 @@ pub fn dial_bridge_spec(
         // other phones ring on, to fall back on when the bridge fails.
         answers: OriginateGroupAnswers::Confirmed,
         early_offer,
+        // A bridging dial takes no per-call media flags.
+        media_flags: None,
     })
 }
 

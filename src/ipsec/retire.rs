@@ -32,7 +32,7 @@
 //! to another UE.
 
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -96,11 +96,37 @@ pub(super) struct Lifecycle {
     retiring: DashMap<String, Retirement>,
     /// Pairs installed beside a set of the UE that is in use and not yet taken
     /// into use themselves (TS 24.229 clause 5.2.2.2, the temporary set), by
-    /// contact key: the kernel's policy of the selector they share with that
-    /// set still names the set in use (see
-    /// [`kernel_objects`](super::kernel_objects)).
-    pending: DashMap<String, PairSpis>,
+    /// contact key, with how each gets there ([`Pending`]).
+    pending: DashMap<String, (PairSpis, Pending)>,
+    /// How many entries `pending` holds, and how many of them are
+    /// [`Pending::Registered`], so the checks a request to a UE and every
+    /// message arriving on a protected port make are one load while none is.
+    pending_count: AtomicUsize,
+    registered_pending: AtomicUsize,
     generation: AtomicU64,
+}
+
+/// Why a pair is not in use yet, and what takes it into use (TS 33.203 clause
+/// 7.4.2a).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pending {
+    /// It has the P-CSCF's protected client port of the set in use (a
+    /// single-port `ipsec.pcscf_port_c`), so the kernel holds one outbound
+    /// policy of SA #3 for both, naming the set in use (see
+    /// [`kernel_objects`](super::kernel_objects)). Taken into use, by moving
+    /// that policy, as the 2xx to the REGISTER that came over it leaves
+    /// ([`IpsecManager::take_into_use`]).
+    SharedPolicy,
+    /// It has a protected client port of its own, beside the set in use on
+    /// the UE's protected server port; the challenge is out, the 2xx not yet.
+    /// Responses over it go over it; requests to the UE go over the set in
+    /// use.
+    Challenged,
+    /// As `Challenged`, and the 2xx to the REGISTER that came over it has
+    /// left over it (SM12). Taken into use when "a further SIP message
+    /// protected with a new inbound SA is successfully received from the UE",
+    /// or when the set in use goes ([`IpsecManager::note_protected_inbound`]).
+    Registered,
 }
 
 impl Lifecycle {
@@ -118,27 +144,81 @@ impl Lifecycle {
         self.pending.len()
     }
 
-    /// Mark the pair `spis` at `key` as not yet taken into use, or as in use.
-    pub(super) fn set_pending(&self, key: &str, spis: PairSpis, pending: bool) {
-        if pending {
-            self.pending.insert(key.to_string(), spis);
-        } else {
-            self.pending.remove(key);
+    /// How many pending pairs wait for a message over them.
+    #[cfg(test)]
+    pub(super) fn registered_pending_len(&self) -> usize {
+        self.registered_pending.load(Ordering::Relaxed)
+    }
+
+    /// Mark the pair `spis` at `key` as not yet taken into use, `how`, or as
+    /// in use (`None`).
+    pub(super) fn set_pending(&self, key: &str, spis: PairSpis, how: Option<Pending>) {
+        let replaced = match how {
+            Some(how) => {
+                self.count_added(how);
+                self.pending.insert(key.to_string(), (spis, how))
+            }
+            None => self.pending.remove(key).map(|(_, value)| value),
+        };
+        self.count_removed(replaced);
+    }
+
+    /// Keep the counters in step with an entry put into `pending`.
+    fn count_added(&self, how: Pending) {
+        self.pending_count.fetch_add(1, Ordering::Relaxed);
+        if how == Pending::Registered {
+            self.registered_pending.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Keep the counters in step with an entry that left `pending`.
+    fn count_removed(&self, removed: Option<(PairSpis, Pending)>) {
+        let Some((_, how)) = removed else {
+            return;
+        };
+        self.pending_count.fetch_sub(1, Ordering::Relaxed);
+        if how == Pending::Registered {
+            self.registered_pending.fetch_sub(1, Ordering::Relaxed);
         }
     }
 
     /// Whether the pair `spis` at `key` is not yet taken into use.
     pub(super) fn is_pending(&self, key: &str, spis: PairSpis) -> bool {
+        self.pending_how(key, spis).is_some()
+    }
+
+    /// How the pair `spis` at `key` waits to be taken into use, if it does.
+    pub(super) fn pending_how(&self, key: &str, spis: PairSpis) -> Option<Pending> {
         self.pending
             .get(key)
-            .is_some_and(|entry| *entry.value() == spis)
+            .and_then(|entry| (entry.value().0 == spis).then_some(entry.value().1))
+    }
+
+    /// Whether any pending pair waits for a message over it: one load.
+    pub(super) fn any_registered_pending(&self) -> bool {
+        self.registered_pending.load(Ordering::Relaxed) > 0
+    }
+
+    /// Whether no pair is pending at all: one load.
+    pub(super) fn none_pending(&self) -> bool {
+        self.pending_count.load(Ordering::Relaxed) == 0
     }
 
     /// Take the pair `spis` at `key` into use. Returns whether it was pending.
     pub(super) fn take_pending(&self, key: &str, spis: PairSpis) -> bool {
-        self.pending
-            .remove_if(key, |_, pending| *pending == spis)
-            .is_some()
+        let removed = self
+            .pending
+            .remove_if(key, |_, (pending, _)| *pending == spis)
+            .map(|(_, value)| value);
+        let was = removed.is_some();
+        self.count_removed(removed);
+        was
+    }
+
+    /// Forget whatever is pending at `key`.
+    fn forget_pending(&self, key: &str) {
+        let removed = self.pending.remove(key).map(|(_, value)| value);
+        self.count_removed(removed);
     }
 }
 
@@ -160,7 +240,18 @@ impl IpsecManager {
     pub(super) fn forget_lifecycle(&self, key: &str) {
         self.lifecycle.registered.remove(key);
         self.lifecycle.predecessors.remove(key);
-        self.lifecycle.pending.remove(key);
+        self.lifecycle.forget_pending(key);
+        self.network_dereg.forget(key);
+    }
+
+    /// Whether `pair` is scheduled to be retired: an old set kept for its
+    /// pending transactions, or one being shortened.
+    pub(super) fn is_retiring(&self, pair: &SecurityAssociationPair) -> bool {
+        let key = Self::contact_key(&pair.ue_addr, pair.ue_port_c);
+        self.lifecycle
+            .retiring
+            .get(&key)
+            .is_some_and(|entry| entry.value().spis == spis_of(pair))
     }
 
     /// Note that a registrar binding was registered over the pair at
@@ -349,38 +440,73 @@ impl IpsecManager {
     /// the way out (the FIN, a reset) still leaves in the pair. A port another
     /// pair of the UE also uses (the protected server port stays across a
     /// re-registration, TS 33.203 clause 7.4.0) carries that pair's
-    /// connections now and is left alone. Returns how many were signalled.
+    /// connections now and is left alone, except for the connection the
+    /// P-CSCF opened to it from this pair's own protected client port when no
+    /// other pair there has that port (clause 7.4.0 changes port_pc too).
+    /// Returns how many were signalled.
     pub(super) async fn close_unshared_connections(
         &self,
         pair: &SecurityAssociationPair,
         ports: &[u16],
         reason: &'static str,
     ) -> usize {
-        let shared: Vec<u16> = self
+        let others: Vec<(u16, u16, u16)> = self
             .associations
             .iter()
             .filter(|entry| {
                 let other = entry.value();
                 other.ue_addr == pair.ue_addr && other.ue_port_c != pair.ue_port_c
             })
-            .flat_map(|entry| [entry.value().ue_port_c, entry.value().ue_port_s])
+            .map(|entry| {
+                let other = entry.value();
+                (other.ue_port_c, other.ue_port_s, other.pcscf_port_c)
+            })
             .collect();
+        let shared = |port: u16| {
+            others
+                .iter()
+                .any(|(port_c, port_s, _)| *port_c == port || *port_s == port)
+        };
+        let own_client_port = pair.role == super::SaRole::PCscf
+            && !others.iter().any(|(_, port_s, pcscf_port_c)| {
+                *port_s == pair.ue_port_s && *pcscf_port_c == pair.pcscf_port_c
+            });
         let mut closed = 0;
         let mut closing = Vec::new();
         for port in ports {
-            if !shared.contains(port) {
-                let peer = SocketAddr::new(pair.ue_addr, *port);
+            let peer = SocketAddr::new(pair.ue_addr, *port);
+            if !shared(*port) {
                 let signalled = crate::transport::disconnect::close_peer(peer, reason);
                 if signalled > 0 {
-                    closing.push(peer);
+                    closing.push((peer, None));
+                }
+                closed += signalled;
+            } else if *port == pair.ue_port_s && own_client_port {
+                let signalled =
+                    crate::transport::disconnect::close_peer_from(peer, pair.pcscf_port_c, reason);
+                if signalled > 0 {
+                    closing.push((peer, Some(pair.pcscf_port_c)));
                 }
                 closed += signalled;
             }
         }
         // The connections close in their own tasks: wait for them.
-        for peer in closing {
-            if !crate::transport::disconnect::peer_closed_within(peer, CONNECTION_CLOSE_BOUND).await
-            {
+        for (peer, local_port) in closing {
+            let closed_in_time = match local_port {
+                None => {
+                    crate::transport::disconnect::peer_closed_within(peer, CONNECTION_CLOSE_BOUND)
+                        .await
+                }
+                Some(local_port) => {
+                    crate::transport::disconnect::peer_closed_from_within(
+                        peer,
+                        local_port,
+                        CONNECTION_CLOSE_BOUND,
+                    )
+                    .await
+                }
+            };
+            if !closed_in_time {
                 debug!(ue = %pair.ue_addr, port = peer.port(),
                     "IPsec: a connection still closing as its SA pair goes");
             }

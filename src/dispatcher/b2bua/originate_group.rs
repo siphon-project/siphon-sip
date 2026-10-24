@@ -45,6 +45,7 @@ struct LegsToPlace {
     params: OriginateParams,
     sink: Arc<dyn OriginateGroupSink>,
     early_offer: Option<LegOfferCaller>,
+    media_flags: Option<crate::rtpengine::media_flags::MediaFlags>,
 }
 
 /// How an originate group rings its targets.
@@ -100,6 +101,9 @@ pub struct OriginateGroupSpec {
     /// The caller a bridging dial's legs are offered from, for the targets
     /// whose `offer` is [`DialOffer::Early`]. `None` sends every leg offerless.
     pub early_offer: Option<LegOfferCaller>,
+    /// Every leg's overrides of its anchor profile (`originate {aor}` with
+    /// `media_flags`), carried to each leg's [`OriginateRoute`].
+    pub media_flags: Option<crate::rtpengine::media_flags::MediaFlags>,
 }
 
 /// When an answer settles a group.
@@ -274,6 +278,8 @@ struct OriginateGroup {
     answers: OriginateGroupAnswers,
     /// What an early-offer leg is offered from ([`OriginateGroupSpec::early_offer`]).
     early_offer: Option<LegOfferCaller>,
+    /// What every leg is anchored with ([`OriginateGroupSpec::media_flags`]).
+    media_flags: Option<crate::rtpengine::media_flags::MediaFlags>,
     /// The deadline passed while an answer awaited confirmation: the ringing
     /// legs were CANCELled and nothing more is placed, but the answers already
     /// in are still the creator's to confirm or reject.
@@ -576,6 +582,7 @@ impl OriginateGroupStore {
             params: group.params.clone(),
             sink: Arc::clone(&group.sink),
             early_offer: group.early_offer.clone(),
+            media_flags: group.media_flags.clone(),
         })
     }
 
@@ -942,6 +949,7 @@ pub fn create_originate_group(
             last_refusal: None,
             answers: spec.answers,
             early_offer: spec.early_offer,
+            media_flags: spec.media_flags,
             expired: false,
             stopped_by: None,
         },
@@ -1231,6 +1239,7 @@ fn place_leg(
             .clone()
             .filter(|_| target.offer == Some(DialOffer::Early)),
         verify_server: target.verify_server,
+        media_flags: legs.media_flags.clone(),
     };
     let prepared = match prepare_originate_routed(state, params, &route) {
         Ok(prepared) => prepared,
@@ -1508,6 +1517,7 @@ mod tests {
             last_refusal: None,
             answers: OriginateGroupAnswers::First,
             early_offer: None,
+            media_flags: None,
             expired: false,
             stopped_by: None,
         }

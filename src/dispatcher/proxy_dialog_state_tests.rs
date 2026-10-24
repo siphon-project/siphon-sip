@@ -102,6 +102,8 @@ fn text<'a>(payload: &'a serde_json::Value, field: &str) -> &'a str {
 
 pub(super) struct Sent {
     pub(super) destination: String,
+    /// The local socket it leaves from, when pinned.
+    pub(super) source: Option<SocketAddr>,
     pub(super) message: SipMessage,
 }
 
@@ -175,6 +177,7 @@ impl Proxy {
             for frame in outbound.frames() {
                 sent.push(Sent {
                     destination: outbound.destination.to_string(),
+                    source: outbound.source_local_addr,
                     message: parse_sip_message_bytes(frame)
                         .expect("siphon sent a message that parses"),
                 });

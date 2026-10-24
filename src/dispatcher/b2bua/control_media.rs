@@ -117,14 +117,12 @@ fn allocate_dial_media(
     // A later voicemail anchor uses the SIP Call-ID. A late deletion of this
     // failed attempt must never delete that newly allocated media session.
     let engine_call_id = crate::b2bua::actor::generate_call_id();
-    let body = tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(backend.offer(
-            &engine_call_id,
-            &from_tag,
-            &invite.body,
-            &flags,
-        ))
-    })
+    let body = crate::script::blocking::block_on_released(backend.offer(
+        &engine_call_id,
+        &from_tag,
+        &invite.body,
+        &flags,
+    ))
     .map_err(|error| format!("dial media offer failed: {error}"))?;
     Ok((
         body,
@@ -212,15 +210,13 @@ pub fn control_dial_media_answer(
     let mut flags = profile.answer.clone();
     flags.stamp_received_from(source_ip);
     flags.stamp_sip_call_id_of(response);
-    let body = tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(backend.answer(
-            session.rtpengine_id(),
-            &session.from_tag,
-            &to_tag,
-            &response.body,
-            &flags,
-        ))
-    })
+    let body = crate::script::blocking::block_on_released(backend.answer(
+        session.rtpengine_id(),
+        &session.from_tag,
+        &to_tag,
+        &response.body,
+        &flags,
+    ))
     .map_err(|error| format!("dial media answer failed: {error}"))?;
     if on_held {
         sessions.set_dial_branch_to_tag(&sip_call_id, &session.profile, to_tag);

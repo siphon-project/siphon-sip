@@ -172,6 +172,68 @@ function responseArgs(options: ResponseOptions): Record<string, unknown> {
   return args;
 }
 
+/**
+ * Per-call overrides of a media profile's processing settings, merged over the
+ * profile (its answer half) for one call only and sent as `media_flags`, each
+ * key in snake_case. A key left unset keeps the profile's value. The server
+ * refuses an unknown key, a `null` or a value the engine would refuse with
+ * `bad_request` whose `details.field` names the key.
+ */
+export interface MediaFlags {
+  /** Echo cancellation on the leg's uplink. */
+  echoCancellation?: boolean;
+  /**
+   * How far the canceller searches for the echo, in ms: 16-1000 as a search
+   * window, or as a tail length when the merged `echoLongTail` is set.
+   */
+  echoDelaySearchMs?: number;
+  /** Span the echo path with the adaptive filter (a tail length). */
+  echoLongTail?: boolean;
+  /** Chain the residual-echo suppressor after the canceller. */
+  echoResidualSuppression?: boolean;
+  /** Noise suppression on the leg's uplink. */
+  noiseSuppression?: boolean;
+  /** The WebSocket uplink voice-activity detector. */
+  wsVad?: boolean;
+  /** Which detector `wsVad` runs. */
+  wsVadEngine?: "energy" | "neural";
+  /** Leading speech run, in ms, before `speech_started` (and barge-in). */
+  wsVadMinSpeechMs?: number;
+  /** Energy threshold for the energy detector; higher is less sensitive. */
+  wsVadThreshold?: number;
+  /** Trailing hangover, in ms, before `speech_stopped`. */
+  wsVadHangoverMs?: number;
+  /** Flush the queued downlink when the caller starts speaking. */
+  wsBargeIn?: boolean;
+  /** L16 wire rate of a WebSocket bridge in Hz: a multiple of 1000 in 8000-48000. */
+  wsSampleRate?: number;
+}
+
+const MEDIA_FLAG_WIRE_NAMES: ReadonlyArray<[keyof MediaFlags, string]> = [
+  ["echoCancellation", "echo_cancellation"],
+  ["echoDelaySearchMs", "echo_delay_search_ms"],
+  ["echoLongTail", "echo_long_tail"],
+  ["echoResidualSuppression", "echo_residual_suppression"],
+  ["noiseSuppression", "noise_suppression"],
+  ["wsVad", "ws_vad"],
+  ["wsVadEngine", "ws_vad_engine"],
+  ["wsVadMinSpeechMs", "ws_vad_min_speech_ms"],
+  ["wsVadThreshold", "ws_vad_threshold"],
+  ["wsVadHangoverMs", "ws_vad_hangover_ms"],
+  ["wsBargeIn", "ws_barge_in"],
+  ["wsSampleRate", "ws_sample_rate"],
+];
+
+/** `flags` as the `media_flags` argument: snake_case keys, unset ones left off. */
+export function mediaFlagsArg(flags: MediaFlags): Record<string, unknown> {
+  const wire: Record<string, unknown> = {};
+  for (const [name, wireName] of MEDIA_FLAG_WIRE_NAMES) {
+    const value = flags[name];
+    if (value !== undefined) wire[wireName] = value;
+  }
+  return wire;
+}
+
 /** Options for an anchored answer ({@link Call.answerAnchored}). */
 export interface AnchoredAnswerOptions {
   /** UAS 2xx code (default `200`). */
@@ -187,6 +249,8 @@ export interface AnchoredAnswerOptions {
    * `callId`.
    */
   wsUri?: string;
+  /** Overrides of the profile's processing settings for this call. */
+  mediaFlags?: MediaFlags;
   /** Host of siphon's own `Contact` toward the caller; see {@link ResponseOptions}. */
   contactHost?: string;
   /** User part of siphon's own `Contact` toward the caller; see {@link ResponseOptions}. */
@@ -483,7 +547,7 @@ function stringValue(result: unknown): string | null {
  */
 export type OriginateMedia =
   /** Offerless INVITE: siphon anchors the leg on the media engine. */
-  | { anchor: true; profile?: string; wsUri?: string }
+  | { anchor: true; profile?: string; wsUri?: string; mediaFlags?: MediaFlags }
   /** Your own SDP offer (`application/sdp` by definition). */
   | { sdp: string }
   /** Your own body with its own content type. */
@@ -641,6 +705,7 @@ function originateCommonArgs(
     args.media = true;
     if (media.profile !== undefined) args.profile = media.profile;
     if (media.wsUri !== undefined) args.ws_uri = media.wsUri;
+    if (media.mediaFlags !== undefined) args.media_flags = mediaFlagsArg(media.mediaFlags);
   } else if ("sdp" in media) {
     args.sdp = media.sdp;
   } else {
@@ -1229,6 +1294,11 @@ export interface StreamOptions {
    * and an unknown name rejects with `bad_request`.
    */
   profile?: string;
+  /**
+   * Bridge only: overrides of `profile`'s settings for this bridge. They need a
+   * `profile` to merge over; without one, or on a tee, the server refuses them.
+   */
+  mediaFlags?: MediaFlags;
 }
 
 /** Options for {@link Call.streamStop}. */
@@ -1364,6 +1434,9 @@ export class Call {
     }
     if (options?.wsUri !== undefined) {
       args.ws_uri = options.wsUri;
+    }
+    if (options?.mediaFlags !== undefined) {
+      args.media_flags = mediaFlagsArg(options.mediaFlags);
     }
     if (options?.contactHost !== undefined) {
       args.contact_host = options.contactHost;
@@ -1945,6 +2018,9 @@ export class Call {
     }
     if (options?.profile !== undefined) {
       args.profile = options.profile;
+    }
+    if (options?.mediaFlags !== undefined) {
+      args.media_flags = mediaFlagsArg(options.mediaFlags);
     }
     await this.sip(SipVerb.StreamStart, args);
   }

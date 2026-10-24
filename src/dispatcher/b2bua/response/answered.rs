@@ -587,15 +587,13 @@ pub fn start_li_recording(
                     }
                 };
 
-                let result = tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current().block_on(
-                        rtpengine_set.subscribe_request_siprec(
-                            &a_sip_call_id,
-                            &from_tags,
-                            siprec_src_flags,
-                        ),
-                    )
-                });
+                let result = crate::script::blocking::block_on_released(
+                    rtpengine_set.subscribe_request_siprec(
+                        &a_sip_call_id,
+                        &from_tags,
+                        siprec_src_flags,
+                    ),
+                );
                 match result {
                     Ok((sdp, to_tag)) => {
                         debug!(call_id = %call_id, sdp_len = sdp.len(), subscriber_to_tag = %to_tag, "SIPREC: subscribe_request_siprec OK");

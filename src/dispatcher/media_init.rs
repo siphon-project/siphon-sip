@@ -139,10 +139,9 @@ pub(super) fn build_rtpengine_backend(
     }
 
     let count = instance_tuples.len();
-    let handle = tokio::runtime::Handle::current();
-    match tokio::task::block_in_place(|| {
-        handle.block_on(crate::rtpengine::client::RtpEngineSet::new(instance_tuples))
-    }) {
+    match crate::script::blocking::block_on_released(crate::rtpengine::client::RtpEngineSet::new(
+        instance_tuples,
+    )) {
         Ok(set) => {
             info!(
                 instances = count,
@@ -241,13 +240,10 @@ pub(super) fn build_rtpproxy_backend(
 
     let count = instance_tuples.len();
     let retries = rtpproxy_config.retries;
-    let handle = tokio::runtime::Handle::current();
-    match tokio::task::block_in_place(|| {
-        handle.block_on(crate::rtpengine::RtpProxyClientSet::new(
-            instance_tuples,
-            retries,
-        ))
-    }) {
+    match crate::script::blocking::block_on_released(crate::rtpengine::RtpProxyClientSet::new(
+        instance_tuples,
+        retries,
+    )) {
         Ok(set) => {
             info!(
                 instances = count,
