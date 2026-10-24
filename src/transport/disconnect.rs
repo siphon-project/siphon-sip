@@ -53,6 +53,9 @@ struct LiveConnection {
     /// ban's business.
     inbound: bool,
     transport: Transport,
+    /// The local port siphon bound a connection it opened to, when it pinned
+    /// one: a P-CSCF's protected client port (TS 33.203 clause 7.1).
+    local_port: Option<u16>,
     /// Signalled once, by [`close_banned_source`]. The connection's own task
     /// waits on it and tears itself down; nothing here touches its socket.
     close: Arc<Notify>,
@@ -87,18 +90,20 @@ impl ConnectionCloser {
         peer: SocketAddr,
         transport: Transport,
     ) -> Self {
-        Self::register_with(connection_id, peer, transport, true)
+        Self::register_with(connection_id, peer, transport, true, None)
     }
 
-    /// Register a connection siphon opened to `peer` (the outbound pool's), so
-    /// it can be ended from outside its task by [`close_peer`] and
+    /// Register a connection siphon opened to `peer` (the outbound pool's)
+    /// from `local_port` when it pinned one, so it can be ended from outside
+    /// its task by [`close_peer`], [`close_peer_from`] and
     /// [`close_connection`]. A ban never closes it.
     pub(crate) fn register_outbound(
         connection_id: ConnectionId,
         peer: SocketAddr,
         transport: Transport,
+        local_port: Option<u16>,
     ) -> Self {
-        Self::register_with(connection_id, peer, transport, false)
+        Self::register_with(connection_id, peer, transport, false, local_port)
     }
 
     fn register_with(
@@ -106,6 +111,7 @@ impl ConnectionCloser {
         peer: SocketAddr,
         transport: Transport,
         inbound: bool,
+        local_port: Option<u16>,
     ) -> Self {
         let close = Arc::new(Notify::new());
         LIVE_CONNECTIONS.insert(
@@ -114,6 +120,7 @@ impl ConnectionCloser {
                 peer,
                 inbound,
                 transport,
+                local_port,
                 close: Arc::clone(&close),
             },
         );
@@ -191,9 +198,28 @@ pub(crate) fn close_banned_source(source: IpAddr, reason: &str) -> usize {
 /// is gone, toward an address the access network may have given to another UE.
 /// A connection siphon opened from a pinned port closes with a reset.
 pub(crate) fn close_peer(peer: SocketAddr, reason: &str) -> usize {
+    close_matching(peer, None, reason)
+}
+
+/// [`close_peer`] for only the connections siphon opened to `peer` from the
+/// pinned local port `local_port`: a P-CSCF deleting a UE's set whose
+/// protected client port is its own, while a newer set keeps the UE's
+/// protected server port and its own connection to it from another port_pc
+/// (TS 33.203 clause 7.4.0).
+pub(crate) fn close_peer_from(peer: SocketAddr, local_port: u16, reason: &str) -> usize {
+    close_matching(peer, Some(local_port), reason)
+}
+
+/// Whether `connection` is with `peer`, and from `local_port` when one is
+/// given.
+fn matches(connection: &LiveConnection, peer: SocketAddr, local_port: Option<u16>) -> bool {
+    connection.peer == peer && local_port.is_none_or(|port| connection.local_port == Some(port))
+}
+
+fn close_matching(peer: SocketAddr, local_port: Option<u16>, reason: &str) -> usize {
     let held: Vec<(ConnectionId, Transport, Arc<Notify>)> = LIVE_CONNECTIONS
         .iter()
-        .filter(|entry| entry.value().peer == peer)
+        .filter(|entry| matches(entry.value(), peer, local_port))
         .map(|entry| {
             (
                 *entry.key(),
@@ -225,10 +251,27 @@ pub(crate) fn close_peer(peer: SocketAddr, reason: &str) -> usize {
 /// plaintext on the protected port. Bounded, so a connection whose teardown
 /// stalls holds the caller up for `bound` and no longer.
 pub(crate) async fn peer_closed_within(peer: SocketAddr, bound: std::time::Duration) -> bool {
+    closed_within(peer, None, bound).await
+}
+
+/// [`peer_closed_within`] for the connections [`close_peer_from`] signals.
+pub(crate) async fn peer_closed_from_within(
+    peer: SocketAddr,
+    local_port: u16,
+    bound: std::time::Duration,
+) -> bool {
+    closed_within(peer, Some(local_port), bound).await
+}
+
+async fn closed_within(
+    peer: SocketAddr,
+    local_port: Option<u16>,
+    bound: std::time::Duration,
+) -> bool {
     let open = || {
         LIVE_CONNECTIONS
             .iter()
-            .any(|entry| entry.value().peer == peer)
+            .any(|entry| matches(entry.value(), peer, local_port))
     };
     tokio::time::timeout(bound, async {
         loop {
@@ -294,11 +337,13 @@ mod tests {
             ConnectionId(9202),
             "198.51.100.21:6100".parse().expect("an address"),
             Transport::Tcp,
+            None,
         );
         let other_port = ConnectionCloser::register_outbound(
             ConnectionId(9203),
             "198.51.100.21:6101".parse().expect("an address"),
             Transport::Tcp,
+            None,
         );
 
         assert_eq!(
@@ -321,6 +366,42 @@ mod tests {
         );
     }
 
+    /// `close_peer_from` ends only the connections siphon opened to the peer
+    /// from that pinned local port, and waiting for them ignores the others.
+    #[tokio::test]
+    async fn closing_a_peer_from_one_local_port_leaves_the_others() {
+        let peer: SocketAddr = "198.51.100.22:6101".parse().expect("an address");
+        let accepted = ConnectionCloser::register(ConnectionId(9211), peer, Transport::Tcp);
+        let from_old = ConnectionCloser::register_outbound(
+            ConnectionId(9212),
+            peer,
+            Transport::Tcp,
+            Some(5064),
+        );
+        let from_new = ConnectionCloser::register_outbound(
+            ConnectionId(9213),
+            peer,
+            Transport::Tcp,
+            Some(5068),
+        );
+
+        assert_eq!(close_peer_from(peer, 5064, "a test signal"), 1);
+        tokio::time::timeout(std::time::Duration::from_secs(5), from_old.closed())
+            .await
+            .expect("the connection from that port must be signalled");
+        drop(from_old);
+        assert!(peer_closed_from_within(peer, 5064, std::time::Duration::from_millis(50)).await);
+        assert!(!peer_closed_within(peer, std::time::Duration::from_millis(10)).await);
+        for kept in [&accepted, &from_new] {
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(50), kept.closed())
+                    .await
+                    .is_err(),
+                "a connection from another port must be left alone"
+            );
+        }
+    }
+
     /// A ban is about connections the banned source opened; one siphon opened
     /// to that host is not closed by it.
     #[tokio::test]
@@ -329,6 +410,7 @@ mod tests {
             ConnectionId(9301),
             peer("203.0.113.31"),
             Transport::Tcp,
+            None,
         );
         assert_eq!(close_banned_source(ip("203.0.113.31"), "a test signal"), 0);
         assert!(

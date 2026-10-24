@@ -150,7 +150,7 @@ fn register_binding(aor: &str, from: SocketAddr) {
 /// when it is signalled to close. The handle is finished once it has.
 fn connection(id: u64, peer: SocketAddr, outbound: bool) -> tokio::task::JoinHandle<()> {
     let closer = if outbound {
-        ConnectionCloser::register_outbound(ConnectionId(id), peer, Transport::Tcp)
+        ConnectionCloser::register_outbound(ConnectionId(id), peer, Transport::Tcp, None)
     } else {
         ConnectionCloser::register(ConnectionId(id), peer, Transport::Tcp)
     };

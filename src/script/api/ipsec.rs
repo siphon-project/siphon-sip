@@ -451,8 +451,11 @@ pub struct PySecurityServerParams {
     /// P-CSCF server SPI.
     #[pyo3(get)]
     pub spi_s: u32,
-    /// P-CSCF protected client port (shared across all UEs — see
-    /// ``ipsec.pcscf_port_c`` in ``siphon.yaml``).
+    /// P-CSCF protected client port of this pair: one of
+    /// ``ipsec.pcscf_port_c`` in ``siphon.yaml``, none another pair of the
+    /// same UE holds when that lists several (3GPP TS 33.203 §7.4.0: port_pc
+    /// changes on every authenticated re-registration).  Advertise it as
+    /// ``port-c``.
     #[pyo3(get)]
     pub port_c: u16,
     /// P-CSCF protected server port.
@@ -897,10 +900,18 @@ impl PyIpsec {
 
 #[pymethods]
 impl PyIpsec {
-    /// The configured P-CSCF protected client port (shared across all UEs).
+    /// The first configured P-CSCF protected client port.  A pair's own is
+    /// :attr:`SecurityServerParams.port_c` (or :attr:`SAHandle.pcscf_port_c`).
     #[getter]
     fn pcscf_port_c(&self) -> u16 {
-        self.config.pcscf_port_c
+        self.config.pcscf_port_c.first()
+    }
+
+    /// Every configured P-CSCF protected client port, in order: a new pair
+    /// takes one no other pair of the same UE holds.
+    #[getter]
+    fn pcscf_ports_c(&self) -> Vec<u16> {
+        self.config.pcscf_port_c.as_slice().to_vec()
     }
 
     /// The configured P-CSCF protected server port (shared across all UEs).
@@ -999,7 +1010,13 @@ impl PyIpsec {
                 family = if ue_addr.is_ipv6() { "IPv6" } else { "IPv4" },
             ))
         })?;
-        let pcscf_port_c = self.config.pcscf_port_c;
+        // A protected client port no other pair of this UE holds (TS 33.203
+        // clauses 7.1 and 7.4.0), so a re-authentication changes port_pc.
+        let pcscf_port_c = manager
+            .pick_pcscf_port_c(&ue_addr, self.config.pcscf_port_c.as_slice())
+            .ok_or_else(|| {
+                pyo3::exceptions::PyValueError::new_err("ipsec.pcscf_port_c names no port")
+            })?;
         let pcscf_port_s = self.config.pcscf_port_s;
 
         future_into_py(python, async move {
@@ -1184,7 +1201,10 @@ impl PyIpsec {
             "Ipsec(pcscf_addr_v4={}, pcscf_addr_v6={}, pcscf_port_c={}, pcscf_port_s={}, active={}, stashed={})",
             fmt(self.pcscf_addr_v4),
             fmt(self.pcscf_addr_v6),
-            self.config.pcscf_port_c,
+            match self.config.pcscf_port_c.as_slice() {
+                [one] => one.to_string(),
+                ports => format!("{ports:?}"),
+            },
             self.config.pcscf_port_s,
             self.manager.active_count(),
             self.stash.len(),
@@ -1691,7 +1711,7 @@ mod tests {
             8192,
         ));
         let config = Arc::new(IpsecConfig {
-            pcscf_port_c: 5064,
+            pcscf_port_c: 5064.into(),
             pcscf_port_s: 5066,
             backend: crate::config::IpsecBackend::Netlink,
             spi_range_start: None,

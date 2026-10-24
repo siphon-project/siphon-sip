@@ -1209,11 +1209,15 @@
         "sig": "($self, ue_addr, ue_port_c=None, *, delay_secs=0.0)"
       },
       "pcscf_port_c": {
-        "doc": "The configured P-CSCF protected client port (shared across all UEs).",
+        "doc": "The first configured P-CSCF protected client port.  A pair's own is",
         "kind": "getset_descriptor"
       },
       "pcscf_port_s": {
         "doc": "The configured P-CSCF protected server port (shared across all UEs).",
+        "kind": "getset_descriptor"
+      },
+      "pcscf_ports_c": {
+        "doc": "Every configured P-CSCF protected client port, in order: a new pair",
         "kind": "getset_descriptor"
       },
       "stash": {
@@ -2964,7 +2968,7 @@
         "kind": "getset_descriptor"
       },
       "port_c": {
-        "doc": "P-CSCF protected client port (shared across all UEs \u2014 see",
+        "doc": "P-CSCF protected client port of this pair: one of",
         "kind": "getset_descriptor"
       },
       "port_s": {

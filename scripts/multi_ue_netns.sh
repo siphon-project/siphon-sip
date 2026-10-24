@@ -31,10 +31,11 @@
 #      the P-CSCF, bridged to a sipp UAS standing in for the tester
 #   7. make-before-break (OVERLAP_TEST=1, the default): the S-CSCF re-challenges
 #      UE 1's next protected refresh, so it holds an old and a new SA set on
-#      one protected server port. During that overlap a datagram is sent from
-#      the P-CSCF's protected client port over the OLD set (its outbound policy
-#      pointed at the old SPI for the one packet); the UE kernel must decrypt it
-#      on the old inbound SA with no XfrmInTmplMismatch
+#      one protected server port. The P-CSCF has two protected client ports,
+#      so the new set's port_pc must differ from the old one's (TS 33.203
+#      7.4.0). During that overlap a datagram is sent from each port_pc; the UE
+#      kernel must decrypt each on its own set's inbound SA, with no policy
+#      rewritten and no XfrmInTmplMismatch
 #   8. shutdown: SIGTERM to the UE process; once it exits, 0 xfrm states and 0
 #      xfrm policies left in the UE namespace
 # and prints the UE process's fd count and RSS.
@@ -78,6 +79,8 @@ CORE_IP="198.51.100.1"
 UE_IP="198.51.100.2"
 SCSCF_IP="198.51.100.3"
 SCSCF_ADMIN="$SCSCF_IP:9091"
+# The P-CSCF's protected client ports (ipsec.pcscf_port_c), comma-separated.
+PCSCF_PORTS_C="5064,5068"
 TESTER_PORT=5070
 UAC_PORT=5080
 DUMMY_DEV="mue0"
@@ -260,7 +263,9 @@ registrar:
   default_expires: 600000
   max_expires: 600000
 ipsec:
-  pcscf_port_c: 5064
+  # Two protected client ports: a re-authentication takes the one the UE's
+  # set in use does not hold (TS 33.203 7.4.0). siphon binds both next to 5066.
+  pcscf_port_c: [$PCSCF_PORTS_C]
   pcscf_port_s: 5066
   backend: netlink
   path_host: "$CORE_IP:5060"
@@ -533,8 +538,8 @@ EOF
     fi
 }
 
-# The SPIs of the inbound states in the UE namespace whose selector is
-# P-CSCF:5064 -> $1:6101 (SA #3 of each set the UE holds there), one per line.
+# The inbound states in the UE namespace whose selector is P-CSCF:port_pc ->
+# $1:6101 (SA #3 of each set the UE holds there), one "spi port_pc" per line.
 ue_server_spis() {
     ip netns exec "$UE_NS" ip xfrm state list dst "$1" proto esp | python3 -c '
 import re, sys
@@ -545,9 +550,10 @@ for line in sys.stdin:
     match = re.search(r"proto esp spi (0x[0-9a-f]+)", line)
     if match:
         spi = match.group(1)
-    if spi and re.search(r"sel src \S+ dst \S+ .*sport 5064 dport 6101", line):
-        print(spi)
-'
+    selector = re.search(r"sel src \S+ dst \S+ .*sport (\d+) dport 6101", line)
+    if spi and selector and selector.group(1) in sys.argv[1].split(","):
+        print(spi, selector.group(1))
+' "$PCSCF_PORTS_C"
 }
 
 xfrm_stat() {
@@ -560,50 +566,58 @@ state_packets() {
         | awk '/lifetime current:/ {getline; if (match($0, /[0-9]+\(packets\)/)) print substr($0, RSTART, RLENGTH - 9); exit}'
 }
 
-check_overlap() {
-    local ue deadline spis old new before_mismatch after_mismatch before after
-    ue="$(ue_addr 1 "$ADDR_SHIFT")"
-    old="$(ue_server_spis "$ue" | head -n 1)"
-    [[ -n "$old" ]] || fail "OVERLAP: no inbound SA #3 for $ue"
-    log "OVERLAP: re-challenging protected refreshes; waiting for UE 1 ($ue) to hold two sets"
-    touch "$SCRATCH/rechallenge"
-    deadline=$(( SECONDS + INTERVAL ))
-    spis=""
-    while (( SECONDS < deadline )); do
-        spis="$(ue_server_spis "$ue")"
-        [[ "$(wc -l <<<"$spis")" -ge 2 ]] && break
-        sleep 1
-    done
-    rm -f "$SCRATCH/rechallenge"
-    [[ "$(wc -l <<<"$spis")" -ge 2 ]] || fail "OVERLAP: UE 1 never held two sets"
-    new="$(grep -v -x -- "$old" <<<"$spis" | head -n 1)"
-    log "OVERLAP: old SA #3 spi $old, new $new"
-
-    before_mismatch="$(xfrm_stat XfrmInTmplMismatch)"
-    before="$(state_packets "$ue" "$old")"
-    # One datagram from the P-CSCF's protected client port over the old set:
-    # its outbound policy points at the old SPI for this packet only.
-    ip netns exec "$CORE_NS" ip xfrm policy update src "$CORE_IP/32" dst "$ue/32" \
-        proto any sport 5064 dport 6101 dir out \
-        tmpl src "$CORE_IP" dst "$ue" proto esp spi "$old" mode transport
+# One datagram from the P-CSCF's protected client port $2 to UE $1's protected
+# server port: the kernel puts it on the set whose SA #3 has that port.
+probe_from() {
     ip netns exec "$CORE_NS" python3 -c '
 import socket, sys
 probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-probe.bind((sys.argv[1], 5064))
+probe.bind((sys.argv[1], int(sys.argv[3])))
 probe.sendto(b"OPTIONS sip:overlap-probe SIP/2.0\r\nContent-Length: 0\r\n\r\n", (sys.argv[2], 6101))
-' "$CORE_IP" "$ue"
-    ip netns exec "$CORE_NS" ip xfrm policy update src "$CORE_IP/32" dst "$ue/32" \
-        proto any sport 5064 dport 6101 dir out \
-        tmpl src "$CORE_IP" dst "$ue" proto esp spi "$new" mode transport
+' "$CORE_IP" "$1" "$2"
+}
+
+check_overlap() {
+    local ue deadline sets old old_port new new_port before_mismatch after_mismatch
+    local before after before_new after_new
+    ue="$(ue_addr 1 "$ADDR_SHIFT")"
+    read -r old old_port < <(ue_server_spis "$ue" | head -n 1)
+    [[ -n "${old:-}" ]] || fail "OVERLAP: no inbound SA #3 for $ue"
+    log "OVERLAP: re-challenging protected refreshes; waiting for UE 1 ($ue) to hold two sets"
+    touch "$SCRATCH/rechallenge"
+    deadline=$(( SECONDS + INTERVAL ))
+    sets=""
+    while (( SECONDS < deadline )); do
+        sets="$(ue_server_spis "$ue")"
+        [[ "$(wc -l <<<"$sets")" -ge 2 ]] && break
+        sleep 1
+    done
+    rm -f "$SCRATCH/rechallenge"
+    [[ "$(wc -l <<<"$sets")" -ge 2 ]] || fail "OVERLAP: UE 1 never held two sets"
+    read -r new new_port < <(awk -v old="$old" '$1 != old' <<<"$sets" | head -n 1)
+    log "OVERLAP: old SA #3 spi $old from port_pc $old_port, new spi $new from port_pc $new_port"
+    # TS 33.203 clause 7.4.0: the P-CSCF's protected client port changes.
+    [[ "$new_port" != "$old_port" ]] \
+        || fail "OVERLAP: the new set reuses port_pc $old_port (TS 33.203 7.4.0)"
+
+    # Each set has selectors of its own: a datagram from each port_pc lands on
+    # that set's SA #3, with no policy rewritten for it.
+    before_mismatch="$(xfrm_stat XfrmInTmplMismatch)"
+    before="$(state_packets "$ue" "$old")"
+    before_new="$(state_packets "$ue" "$new")"
+    probe_from "$ue" "$old_port"
+    probe_from "$ue" "$new_port"
     sleep 1
     after="$(state_packets "$ue" "$old")"
+    after_new="$(state_packets "$ue" "$new")"
     after_mismatch="$(xfrm_stat XfrmInTmplMismatch)"
-    log "OVERLAP: old SA #3 packets $before -> $after, XfrmInTmplMismatch $before_mismatch -> $after_mismatch"
-    (( after > before )) || fail "OVERLAP: the old set did not receive the probe"
+    log "OVERLAP: old SA #3 packets $before -> $after, new $before_new -> $after_new, XfrmInTmplMismatch $before_mismatch -> $after_mismatch"
+    (( after > before )) || fail "OVERLAP: the old set did not receive the probe from $old_port"
+    (( after_new > before_new )) || fail "OVERLAP: the new set did not receive the probe from $new_port"
     [[ "$after_mismatch" == "$before_mismatch" ]] \
-        || fail "OVERLAP: the UE dropped a packet on the old set (template mismatch)"
+        || fail "OVERLAP: the UE dropped a packet (template mismatch)"
 }
 
 check_shutdown_cleanup() {

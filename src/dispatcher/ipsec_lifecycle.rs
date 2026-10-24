@@ -13,7 +13,7 @@ use std::time::Duration;
 use tracing::error;
 
 use super::DispatcherState;
-use crate::ipsec::retire::RetireCondition;
+use crate::ipsec::retire::{Pending, RetireCondition};
 use crate::sip::headers::nameaddr::NameAddr;
 use crate::sip::headers::SipHeaders;
 use crate::sip::message::SipMessage;
@@ -102,18 +102,32 @@ pub(super) fn before_register_final(
 /// protected"), TS 33.203 clause 7.4.2a (SM12 "shall be protected using the new
 /// outbound SA").
 ///
-/// Never waits. The kernel policy update runs on a task of its own, and until
-/// it is over every message to the UE, this 2xx first, is held at the egress
-/// and then sent in order ([`crate::ipsec::switch`]). Waiting here instead
-/// blocked the answering thread on a netlink round trip, which, on an executor
-/// worker attached to Python, held up every stop-the-world of the
+/// With a single protected client port the pair shares the outbound policy of
+/// SA #3 with the set in use, so the kernel policy update must be over before
+/// the 2xx leaves. Never waits for it: the update runs on a task of its own,
+/// and until it is over every message to the UE, this 2xx first, is held at
+/// the egress and then sent in order ([`crate::ipsec::switch`]). Waiting here
+/// instead blocked the answering thread on a netlink round trip, which, on an
+/// executor worker attached to Python, held up every stop-the-world of the
 /// free-threaded interpreter and with it every thread that attaches.
+///
+/// With a protected client port of its own (`ipsec.pcscf_port_c` lists
+/// several) the 2xx goes over the pair anyway, a response to the request that
+/// came over it, and nothing in the kernel moves or is held: the pair is
+/// marked registered, and requests to the UE move to it once a further
+/// message arrives over it (TS 33.203 clause 7.4.2a,
+/// [`crate::ipsec::IpsecManager::note_protected_inbound`]).
 pub(super) fn take_into_use_before_2xx(state: &DispatcherState, ue: SocketAddr) {
     let Some(manager) = state.ipsec_manager.as_ref() else {
         return;
     };
-    if !manager.is_pending(&ue.ip(), ue.port()) {
-        return;
+    match manager.pending_how(&ue.ip(), ue.port()) {
+        None | Some(Pending::Registered) => return,
+        Some(Pending::Challenged) => {
+            manager.confirm_registration(&ue.ip(), ue.port());
+            return;
+        }
+        Some(Pending::SharedPolicy) => {}
     }
     let Ok(handle) = tokio::runtime::Handle::try_current() else {
         error!(ue = %ue, "IPsec: no runtime to take the new SA pair into use on");

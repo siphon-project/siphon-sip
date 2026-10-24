@@ -595,7 +595,7 @@ impl Config {
         config.validate_advertised_address()?;
         config.validate_inbound_limits()?;
         if let Some(ipsec) = &config.ipsec {
-            ipsec.validate().map_err(SiphonError::Config)?;
+            ipsec.load_into(&mut config.listen)?;
         }
         Ok((config, document))
     }

@@ -741,12 +741,12 @@ pub(super) fn leg_sent_by(
 ///   4. wildcard fallbacks                   → routable local IP, then loopback
 ///
 /// Ports come from the listeners we actually bind, plus the IPsec protected
-/// ports (`pcscf_port_c`/`pcscf_port_s`), which a P-CSCF stamps in place of the
+/// ports (every `pcscf_port_c`, and `pcscf_port_s`), which a P-CSCF stamps in place of the
 /// listen port.  Anything host-only (`domain.local`, `ipsec.path_host`) is added
 /// as an any-port alias.
 pub(super) fn build_self_identity(
     domain_local: &[String],
-    ipsec_ports: Option<(u16, u16)>,
+    ipsec_ports: Option<(&[u16], u16)>,
     path_host: Option<&str>,
     listener_registry: &crate::transport::ListenerRegistry,
     advertised_addrs: &std::collections::HashMap<Transport, String>,
@@ -778,9 +778,11 @@ pub(super) fn build_self_identity(
         add_port(&mut ports, addr.port());
     }
     add_port(&mut ports, via_addr.port());
-    if let Some((port_c, port_s)) = ipsec_ports {
+    if let Some((ports_c, port_s)) = ipsec_ports {
         // TS 33.203 §7.1: the protected ports a P-CSCF Record-Routes with.
-        add_port(&mut ports, port_c);
+        for port_c in ports_c {
+            add_port(&mut ports, *port_c);
+        }
         add_port(&mut ports, port_s);
     }
 
