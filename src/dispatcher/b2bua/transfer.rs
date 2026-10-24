@@ -881,9 +881,7 @@ pub fn b2bua_transfer_rtpengine_delete(state: &DispatcherState, cid_old: &str, f
     let Some(backend) = state.rtpengine_set.as_ref() else {
         return;
     };
-    match tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(backend.delete(cid_old, from_tag))
-    }) {
+    match crate::script::blocking::block_on_released(backend.delete(cid_old, from_tag)) {
         Ok(()) => {}
         Err(error) if error.is_call_not_found() => {}
         Err(error) => {

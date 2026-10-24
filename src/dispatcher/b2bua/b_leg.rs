@@ -1191,23 +1191,27 @@ pub fn recv_b_leg_classification_event(
     };
 
     let deadline = tokio::time::Instant::now() + CLASSIFICATION_WAIT;
-    handle.block_on(async {
-        loop {
-            match tokio::time::timeout_at(deadline, rx.recv()).await {
-                Ok(Some(CallEvent::Terminated { .. })) => continue,
-                Ok(other) => return other,
-                Err(_elapsed) => {
-                    warn!(
-                        wait = ?CLASSIFICATION_WAIT,
-                        "B2BUA: no classification event from the B-leg actor within its \
-                         window — classifying from the status code instead. The actor \
-                         most likely exited between accepting the response and reading \
-                         it; holding the worker any longer costs a whole call."
-                    );
-                    return None;
+    // Released, not just blocked: this thread may be attached to the
+    // interpreter (see `script::blocking::released`).
+    crate::script::blocking::released(|| {
+        handle.block_on(async {
+            loop {
+                match tokio::time::timeout_at(deadline, rx.recv()).await {
+                    Ok(Some(CallEvent::Terminated { .. })) => continue,
+                    Ok(other) => return other,
+                    Err(_elapsed) => {
+                        warn!(
+                            wait = ?CLASSIFICATION_WAIT,
+                            "B2BUA: no classification event from the B-leg actor within its \
+                             window — classifying from the status code instead. The actor \
+                             most likely exited between accepting the response and reading \
+                             it; holding the worker any longer costs a whole call."
+                        );
+                        return None;
+                    }
                 }
             }
-        }
+        })
     })
 }
 

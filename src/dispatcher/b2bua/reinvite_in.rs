@@ -844,14 +844,12 @@ pub fn answer_one_legged_reoffer(
     );
     answer_flags.stamp_sip_call_id_of(message);
 
-    let answer_sdp = tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(rtpengine_set.answer_local(
-            session.rtpengine_id(),
-            offer_tag,
-            &String::from_utf8_lossy(&offer),
-            &answer_flags,
-        ))
-    });
+    let answer_sdp = crate::script::blocking::block_on_released(rtpengine_set.answer_local(
+        session.rtpengine_id(),
+        offer_tag,
+        &String::from_utf8_lossy(&offer),
+        &answer_flags,
+    ));
 
     match answer_sdp {
         Ok(sdp) => {
@@ -988,14 +986,12 @@ pub fn reoffer_through_media_engine(
         .party_ingress(from_a_leg)
         .stamp_ingress(&mut offer_flags, profiles, received_from);
     offer_flags.stamp_sip_call_id(offerer_sip_call_id);
-    match tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(rtpengine_set.reoffer(
-            session.rtpengine_id(),
-            offer_tag,
-            offer,
-            &offer_flags,
-        ))
-    }) {
+    match crate::script::blocking::block_on_released(rtpengine_set.reoffer(
+        session.rtpengine_id(),
+        offer_tag,
+        offer,
+        &offer_flags,
+    )) {
         Ok(rewritten) => ReofferOutcome::Rewritten(rewritten),
         Err(error) => ReofferOutcome::Failed(error.to_string()),
     }

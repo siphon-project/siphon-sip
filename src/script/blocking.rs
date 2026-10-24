@@ -127,6 +127,62 @@ where
     })
 }
 
+/// Block this thread on `work` — Rust work that waits on I/O, a lock, or a
+/// tokio future — **released from the interpreter if this thread is attached
+/// to it**, and handed off from tokio's scheduler if it is a tokio worker.
+///
+/// For the dispatcher's synchronous paths (relay, reply, media, B2BUA), which
+/// run detached on the first pass but are reached attached from more than one
+/// caller. Attached and blocked is the stop-the-world deadlock
+/// [`detach_block_on`] describes; unlike it, this does not attach first, so a
+/// detached caller pays nothing on the hot path.
+pub(crate) fn blocking_released<T>(work: impl FnOnce() -> T) -> T {
+    released(|| tokio::task::block_in_place(work))
+}
+
+/// Run `work` released from the interpreter if this thread is attached to it,
+/// as it is; for a wait that already happens off tokio's workers.
+pub(crate) fn released<T>(work: impl FnOnce() -> T) -> T {
+    // SAFETY: `PyGILState_Check` only reads this thread's own thread state and
+    // is defined before the interpreter is initialised (it then reports 0).
+    let attached = unsafe { pyo3::ffi::PyGILState_Check() } == 1;
+    if !attached {
+        return work();
+    }
+    // SAFETY: the check just established that this thread is attached.
+    let python = unsafe { Python::assume_attached() };
+    // `detach` requires `Ungil` (`Send` on stable) of the closure and its
+    // output, for code that might move them to another thread. Both stay on
+    // this one: the closure runs here and its value comes back here.
+    let work = AssertUngil(work);
+    // `into_inner` takes the whole wrapper: destructuring it would have the
+    // closure capture only the inner field, which is not `Send`.
+    python
+        .detach(move || AssertUngil(work.into_inner()()))
+        .into_inner()
+}
+
+/// [`blocking_released`] for a tokio future: `Handle::current().block_on`.
+pub(crate) fn block_on_released<F: Future>(future: F) -> F::Output {
+    blocking_released(|| tokio::runtime::Handle::current().block_on(future))
+}
+
+/// Carries a closure, and its output, through [`Python::detach`] on the thread
+/// that made them.
+struct AssertUngil<T>(T);
+
+impl<T> AssertUngil<T> {
+    fn into_inner(self) -> T {
+        self.0
+    }
+}
+
+// SAFETY: only `released` builds one, and `Python::detach` runs the
+// closure on the calling thread and returns its output to it, so neither is
+// ever sent to another thread. The closures are Rust-side blocking work and
+// hold no `Python<'_>` token or `Bound` across the release.
+unsafe impl<T> Send for AssertUngil<T> {}
+
 #[cfg(test)]
 mod tests {
     /// Every blocking Rust-API call reachable from a script handler must go
@@ -172,6 +228,65 @@ mod tests {
              going through detach_block_on, so a handler parked in one of them \
              can never reach a GC safe point and the next thread to allocate \
              cyclic garbage deadlocks behind the stop-the-world: {offenders:?}"
+        );
+    }
+
+    /// The dispatcher and the transport are synchronous Rust reached from more
+    /// than one caller, some of them attached to the interpreter (an async
+    /// request handler's continuation was, until it was found deadlocking a
+    /// node under load). Every blocking wait in them goes through
+    /// [`super::blocking_released`] / [`super::block_on_released`] (or
+    /// [`super::released`]), which release the interpreter when the thread
+    /// holds it, so none of them can wait attached again. A bare
+    /// `block_in_place` or `Handle::block_on` outside tests fails this.
+    #[test]
+    fn no_dispatcher_or_transport_wait_can_block_while_attached() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        // Owned by the IPsec work that makes this hook non-blocking; it moves
+        // onto the helpers with that change.
+        const PENDING: &[&str] = &["src/dispatcher/ipsec_lifecycle.rs"];
+
+        let mut offenders = Vec::new();
+        let mut directories = vec![root.join("src/dispatcher"), root.join("src/transport")];
+        while let Some(directory) = directories.pop() {
+            for entry in std::fs::read_dir(&directory).expect("source directory is readable") {
+                let path = entry.expect("directory entry is readable").path();
+                if path.is_dir() {
+                    directories.push(path);
+                    continue;
+                }
+                let relative = path
+                    .strip_prefix(root)
+                    .expect("under the manifest directory")
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let is_test_file = relative.ends_with("tests.rs")
+                    || relative.ends_with("_harness.rs")
+                    || relative.ends_with("test_dispatcher.rs");
+                if path.extension().and_then(|ext| ext.to_str()) != Some("rs")
+                    || is_test_file
+                    || PENDING.contains(&relative.as_str())
+                {
+                    continue;
+                }
+                let source = std::fs::read_to_string(&path).expect("source file is readable");
+                // Inline `#[cfg(test)] mod tests` sit at the end of the file.
+                let production = source.split("#[cfg(test)]\nmod ").next().unwrap_or("");
+                for (number, line) in production.lines().enumerate() {
+                    let code = line.split("//").next().unwrap_or("");
+                    let waits = code.contains("block_in_place(") || code.contains(".block_on(");
+                    if waits && !code.contains("released(") {
+                        offenders.push(format!("{relative}:{}", number + 1));
+                    }
+                }
+            }
+        }
+        offenders.sort();
+        assert!(
+            offenders.is_empty(),
+            "these dispatcher/transport waits block without releasing the \
+             interpreter; on an attached thread one deadlocks the process behind \
+             a garbage collection's stop-the-world: {offenders:?}"
         );
     }
 }

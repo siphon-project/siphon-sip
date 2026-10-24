@@ -117,9 +117,8 @@ pub(crate) fn allocate_leg_offer(
         sip_call_id: caller.sip_call_id.clone(),
     };
     let profiles = state.rtpengine_profiles.as_ref();
-    let offered = tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(bridge_run_media_step(backend, profiles, &step))
-    });
+    let offered =
+        crate::script::blocking::block_on_released(bridge_run_media_step(backend, profiles, &step));
     match offered {
         Ok(Some(offer)) => Ok((
             offer,

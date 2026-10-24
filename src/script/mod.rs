@@ -10,6 +10,7 @@ pub mod error_report;
 pub mod handle;
 pub mod handler_select;
 pub mod inline_dispatch;
+pub(crate) mod liveness;
 pub mod py_executor;
 pub mod runtime_info;
 pub mod script_config;

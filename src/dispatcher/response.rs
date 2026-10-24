@@ -108,17 +108,15 @@ pub(super) fn handle_response(
                                             "SIPREC: sending subscribe_answer to RTPEngine"
                                         );
                                         let flags = crate::rtpengine::NgFlags::default();
-                                        match tokio::task::block_in_place(|| {
-                                            tokio::runtime::Handle::current().block_on(
-                                                rtpengine_set.subscribe_answer(
-                                                    &original_call_id,
-                                                    &original_from_tag,
-                                                    &original_to_tag,
-                                                    &message.body,
-                                                    &flags,
-                                                ),
-                                            )
-                                        }) {
+                                        match crate::script::blocking::block_on_released(
+                                            rtpengine_set.subscribe_answer(
+                                                &original_call_id,
+                                                &original_from_tag,
+                                                &original_to_tag,
+                                                &message.body,
+                                                &flags,
+                                            ),
+                                        ) {
                                             Ok(_rewritten_sdp) => {
                                                 info!(
                                                     session_id = %session_id,

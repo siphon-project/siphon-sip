@@ -75,14 +75,12 @@ pub fn originate_anchor_2xx(
     // The offerer here is the *callee* (it offered in its 2xx), so the engine's
     // monologue is keyed on the callee's tag — the same "key on the offerer's
     // tag" convention the inbound answer-first anchor uses.
-    let answer = tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(backend.answer_local(
-            sip_call_id,
-            remote_tag,
-            &offer_sdp,
-            &flags,
-        ))
-    })
+    let answer = crate::script::blocking::block_on_released(backend.answer_local(
+        sip_call_id,
+        remote_tag,
+        &offer_sdp,
+        &flags,
+    ))
     .map_err(|error| format!("answer_local failed: {error}"))?;
 
     if let Some(sessions) = state.rtpengine_sessions.as_ref() {

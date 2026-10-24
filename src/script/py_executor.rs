@@ -514,6 +514,13 @@ impl PyExecutor {
                 .expect("failed to spawn Python executor watchdog thread")
         };
 
+        // Process liveness: the pool watchdog above cannot see a wedge of the
+        // whole process, where nothing is fed to the pool and it looks idle.
+        // See `script::liveness`.
+        if let Some(stall) = config.stall_abort {
+            spawn_liveness_watchdog(tokio_handle.clone(), stall, Arc::clone(&shutdown));
+        }
+
         Self {
             sender: StdMutex::new(Some(sender)),
             threads,
@@ -540,6 +547,45 @@ impl PyExecutor {
             },
             Err(_) => SubmitResult::Closed,
         }
+    }
+}
+
+/// Start the tokio and interpreter heartbeats and the thread that judges them.
+/// Neither thread is joined on shutdown: a wedged process must not also wedge
+/// its own exit.
+fn spawn_liveness_watchdog(tokio_handle: TokioHandle, stall: Duration, shutdown: Arc<AtomicBool>) {
+    use crate::script::liveness;
+    const INTERVAL: Duration = Duration::from_secs(1);
+    let interpreter = Arc::new(liveness::Beat::default());
+    let probe = {
+        let interpreter = Arc::clone(&interpreter);
+        let shutdown = Arc::clone(&shutdown);
+        std::thread::Builder::new()
+            .name("siphon-attach-probe".to_string())
+            .spawn(move || {
+                liveness::run_interpreter_probe(interpreter, INTERVAL, shutdown, || {
+                    // `try_attach` never initialises the interpreter.
+                    let _ = pyo3::Python::try_attach(|_| ());
+                })
+            })
+    };
+    let watchdog = std::thread::Builder::new()
+        .name("siphon-liveness".to_string())
+        .spawn(move || {
+            let stall_samples = u32::try_from(stall.as_secs().max(1)).unwrap_or(u32::MAX);
+            liveness::run_liveness_watchdog(
+                tokio_handle,
+                interpreter,
+                stall_samples,
+                shutdown,
+                |which| liveness::abort_on_stall(which, stall),
+                || std::thread::sleep(INTERVAL),
+            )
+        });
+    if let Err(error) = probe.and(watchdog) {
+        // Not fatal: the node serves without it, but a whole-process wedge
+        // then goes unnoticed until someone looks.
+        error!(%error, "could not start the process liveness watchdog");
     }
 }
 

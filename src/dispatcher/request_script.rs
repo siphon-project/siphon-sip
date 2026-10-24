@@ -178,12 +178,17 @@ pub(super) fn run_request_handlers(
             // thread: take what the request queued so far with it, and leave
             // deferral off here for whatever runs next.
             let carried = crate::script::api::proxy_utils::drain_deferred_sends();
-            pending.resume_on_executor(move |_python, result| match result {
+            // Resumed detached: `run_request_handlers` attaches for the
+            // handlers only, and `finish_request` — the reply or relay, DNS,
+            // connects, IPsec — runs detached as on the first pass.
+            pending.resume_on_executor(move |result| match result {
+                // The handler's return value means nothing; dropped detached,
+                // its reference goes to pyo3's deferred pool.
                 Ok(_) => run_request_handlers(scripted, py_request, next, carried),
                 Err(error) => {
                     crate::script::api::proxy_utils::resume_deferred_sends(carried);
                     record_script_error("async Python", &error);
-                    drop(py_request);
+                    Python::attach(|_| drop(py_request));
                     finish_request(scripted, ScriptDecision::script_error());
                 }
             });
