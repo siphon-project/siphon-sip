@@ -6,6 +6,7 @@
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
 
+use siphon_control_client::proto::media_flags::{MediaFlags, VadEngine};
 use siphon_control_client::proto::sip::{PeerHangupPolicy, PlayRepeat};
 use siphon_control_client::sip::{
     AorRing, DialOffer, DialOnAnswer, DialStrategy, DialTarget, OriginateMedia, OriginatePrivacy,
@@ -496,21 +497,100 @@ pub(crate) fn extract_string_pairs(
     Ok(pairs)
 }
 
+/// `media_flags={...}`: a dict of the twelve processing settings the server
+/// merges over the profile for one call. `ValueError` for a key it does not
+/// take, a `None` value or a `ws_vad_engine` other than `"energy"` /
+/// `"neural"`; `TypeError` for a value of the wrong type. The server checks the
+/// ranges.
+pub(crate) fn extract_media_flags(object: &Bound<'_, PyAny>) -> PyResult<MediaFlags> {
+    let dict = object.cast::<pyo3::types::PyDict>().map_err(|_| {
+        PyTypeError::new_err("media_flags must be a dict of processing setting to value")
+    })?;
+    let mut flags = MediaFlags::default();
+    for (key, value) in dict.iter() {
+        let key: String = key.extract()?;
+        if value.is_none() {
+            return Err(PyValueError::new_err(format!(
+                "media_flags {key:?} is None; leave the key out to keep the profile's value"
+            )));
+        }
+        let flag = |value: &Bound<'_, PyAny>| -> PyResult<bool> {
+            // A Python int is not a bool here, whatever `bool(1)` says.
+            value
+                .cast::<pyo3::types::PyBool>()
+                .map(|flag| flag.is_true())
+                .map_err(|_| PyTypeError::new_err(format!("media_flags {key:?} must be a bool")))
+        };
+        match key.as_str() {
+            "echo_cancellation" => flags.echo_cancellation = Some(flag(&value)?),
+            "echo_long_tail" => flags.echo_long_tail = Some(flag(&value)?),
+            "echo_residual_suppression" => flags.echo_residual_suppression = Some(flag(&value)?),
+            "noise_suppression" => flags.noise_suppression = Some(flag(&value)?),
+            "ws_vad" => flags.ws_vad = Some(flag(&value)?),
+            "ws_barge_in" => flags.ws_barge_in = Some(flag(&value)?),
+            "echo_delay_search_ms" => flags.echo_delay_search_ms = Some(value.extract()?),
+            "ws_vad_min_speech_ms" => flags.ws_vad_min_speech_ms = Some(value.extract()?),
+            "ws_vad_hangover_ms" => flags.ws_vad_hangover_ms = Some(value.extract()?),
+            "ws_sample_rate" => flags.ws_sample_rate = Some(value.extract()?),
+            "ws_vad_threshold" => flags.ws_vad_threshold = Some(value.extract()?),
+            "ws_vad_engine" => {
+                let name: String = value.extract()?;
+                let engine = match name.to_ascii_lowercase().as_str() {
+                    "energy" => Some(VadEngine::Energy),
+                    "neural" => Some(VadEngine::Neural),
+                    _ => None,
+                };
+                let Some(engine) = engine else {
+                    let message = format!(
+                        "media_flags ws_vad_engine must be \"energy\" or \"neural\", not {name:?}"
+                    );
+                    return Err(PyValueError::new_err(message));
+                };
+                flags.ws_vad_engine = Some(engine);
+            }
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "media_flags takes echo_cancellation, echo_delay_search_ms, echo_long_tail, \
+                     echo_residual_suppression, noise_suppression, ws_vad, ws_vad_engine, \
+                     ws_vad_min_speech_ms, ws_vad_threshold, ws_vad_hangover_ms, ws_barge_in \
+                     and ws_sample_rate, not {other:?}"
+                )))
+            }
+        }
+    }
+    Ok(flags)
+}
+
+/// The optional `media_flags=` keyword, read with [`extract_media_flags`].
+pub(crate) fn optional_media_flags(
+    object: Option<&Bound<'_, PyAny>>,
+) -> PyResult<Option<MediaFlags>> {
+    object
+        .filter(|object| !object.is_none())
+        .map(extract_media_flags)
+        .transpose()
+}
+
 /// The media plan of `client.originate(...)`: exactly one of `media=True`
-/// (siphon anchors the leg, shaped by `profile` / `ws_uri`), `sdp` (your own
-/// offer) or `body` with its `content_type`. Anything else raises `ValueError`
-/// before a frame goes out, as the server would refuse it.
+/// (siphon anchors the leg, shaped by `profile` / `ws_uri` / `media_flags`),
+/// `sdp` (your own offer) or `body` with its `content_type`. Anything else
+/// raises `ValueError` before a frame goes out, as the server would refuse it.
 pub(crate) fn originate_media(
     media: bool,
     profile: Option<String>,
     ws_uri: Option<String>,
+    media_flags: Option<MediaFlags>,
     sdp: Option<String>,
     body: Option<String>,
     content_type: Option<String>,
 ) -> PyResult<OriginateMedia> {
     let plan = match (media, sdp, body) {
         (true, None, None) if content_type.is_none() => {
-            return Ok(OriginateMedia::Anchor { profile, ws_uri })
+            return Ok(OriginateMedia::Anchor {
+                profile,
+                ws_uri,
+                media_flags,
+            })
         }
         (false, Some(sdp), None) if content_type.is_none() => OriginateMedia::Sdp(sdp),
         (false, None, Some(body)) => OriginateMedia::Body {
@@ -528,9 +608,9 @@ pub(crate) fn originate_media(
             ))
         }
     };
-    if profile.is_some() || ws_uri.is_some() {
+    if profile.is_some() || ws_uri.is_some() || media_flags.is_some() {
         return Err(PyValueError::new_err(
-            "originate profile and ws_uri go with media=True, where siphon anchors the leg",
+            "originate profile, ws_uri and media_flags go with media=True, where siphon anchors the leg",
         ));
     }
     Ok(plan)

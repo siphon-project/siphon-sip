@@ -288,10 +288,10 @@ what lets a refused verb be lined up against a capture, a CDR and HEP.
 
 | verb | module | args | notes |
 |---|---|---|---|
-| `originate` | sip | `{channel, to \| aor, from?, from_display?, to_display?, next_hop?, p_asserted_identity?, privacy?, headers?, sdp \| body + content_type? \| media, profile?, ws_uri?, timeout?, on_lost?, vars?, session_timer?, strategy?, total_timeout?, contact_host?, contact_user?}` | place an outbound call under a **caller-supplied** channel id; returns as soon as the INVITE is on the wire. `aor` rings every phone registered at it, each over its own flow and Path, and the first to answer becomes the channel's call (`strategy` and `total_timeout` go with `aor` only). See [ringing a registered AoR](#ringing-a-registered-aor-originate-aor) |
-| `answer` | sip | `{code, reason?, body?, content_type?, headers?, anchor?, profile?, ws_uri?, contact_host?, contact_user?}` | UAS 2xx to the parked A-leg. `headers` (here and on `ring`, `progress` and `reject`) is an object of header name to string value added to the response; a header siphon owns on it (Via, From, To, Call-ID, CSeq, Contact, Record-Route, Route, Max-Forwards, Content-Length, Content-Type, RSeq, RAck, Require, Supported, Session-Expires, Min-SE) is refused `bad_request` and nothing is sent. With `anchor` (or a `profile` / `ws_uri`, which imply it) siphon synthesizes the RFC 3264 answer against the media engine and anchors the leg's audio to it in the same act — the verb form of `call.handover(answer=True, …)`, and the only way an app that took the call **un-answered** can connect it. Without a `ws_uri` the leg is anchored on the engine with **no bridge** — which is what `play`, DTMF and recording need, and what an IVR menu, a queue announcement, music on hold and a voicemail greeting all are. `siphon-rtp` only: on rtpengine / rtpproxy it answers `unavailable` rather than a 200 with nothing behind it, and on any media failure the 2xx is never sent, so the call stays parked and answerable |
+| `originate` | sip | `{channel, to \| aor, from?, from_display?, to_display?, next_hop?, p_asserted_identity?, privacy?, headers?, sdp \| body + content_type? \| media, profile?, ws_uri?, media_flags?, timeout?, on_lost?, vars?, session_timer?, strategy?, total_timeout?, contact_host?, contact_user?}` | place an outbound call under a **caller-supplied** channel id; returns as soon as the INVITE is on the wire. `aor` rings every phone registered at it, each over its own flow and Path, and the first to answer becomes the channel's call (`strategy` and `total_timeout` go with `aor` only). With `media: true`, `media_flags` are merged over the profile's answer half when siphon answers the callee's 2xx offer; beside an offer of your own (`sdp` / `body`) they are `bad_request` with `reason: not_anchored`, see [per-call media flags](#per-call-media-flags). See [ringing a registered AoR](#ringing-a-registered-aor-originate-aor) |
+| `answer` | sip | `{code, reason?, body?, content_type?, headers?, anchor?, profile?, ws_uri?, media_flags?, contact_host?, contact_user?}` | UAS 2xx to the parked A-leg. `headers` (here and on `ring`, `progress` and `reject`) is an object of header name to string value added to the response; a header siphon owns on it (Via, From, To, Call-ID, CSeq, Contact, Record-Route, Route, Max-Forwards, Content-Length, Content-Type, RSeq, RAck, Require, Supported, Session-Expires, Min-SE) is refused `bad_request` and nothing is sent. With `anchor` (or a `profile` / `ws_uri` / `media_flags`, which imply it) siphon synthesizes the RFC 3264 answer against the media engine and anchors the leg's audio to it in the same act — the verb form of `call.handover(answer=True, …)`, and the only way an app that took the call **un-answered** can connect it. Without a `ws_uri` the leg is anchored on the engine with **no bridge** — which is what `play`, DTMF and recording need, and what an IVR menu, a queue announcement, music on hold and a voicemail greeting all are. `siphon-rtp` only: on rtpengine / rtpproxy it answers `unavailable` rather than a 200 with nothing behind it, and on any media failure the 2xx is never sent, so the call stays parked and answerable. `media_flags` are merged over the profile's answer half for this call only (see [per-call media flags](#per-call-media-flags)); a `profile` that is not a string is `bad_request` |
 | `ring` | sip | `{reason?, headers?, contact_host?, contact_user?}` | `180 Ringing` — alerting only (RFC 3261 §13.2.1); a body is refused. `contact_host` and `contact_user` here and on `answer` / `progress` are the host and user part of siphon's Contact toward the caller (see [the caller's side](#the-callers-side)) |
-| `progress` | sip | `{code, reason?, body?, content_type?, headers?, anchor?, profile?, ws_uri?, contact_host?, contact_user?}` | a UAS 1xx, optionally opening an early-media path with SDP (RFC 3960 §3.1); defaults to `183 Session Progress`. `headers: {"P-Early-Media": "sendrecv"}` tells the caller's network to pass the early media it carries (RFC 5009). With `anchor` (or a `profile` / `ws_uri`, which imply it) siphon synthesizes the early-media SDP against the media engine instead of taking a `body` (pass one or the other), and the later 2xx repeats that answer. An anchored progress needs a 101-199 code, since a 100 carries no body. On a media failure nothing is sent and it answers `unavailable`, with the call still parked |
+| `progress` | sip | `{code, reason?, body?, content_type?, headers?, anchor?, profile?, ws_uri?, media_flags?, contact_host?, contact_user?}` | a UAS 1xx, optionally opening an early-media path with SDP (RFC 3960 §3.1); defaults to `183 Session Progress`. `headers: {"P-Early-Media": "sendrecv"}` tells the caller's network to pass the early media it carries (RFC 5009). With `anchor` (or a `profile` / `ws_uri` / `media_flags`, which imply it) siphon synthesizes the early-media SDP against the media engine instead of taking a `body` (pass one or the other), and the later 2xx repeats that answer. An anchored progress needs a 101-199 code, since a 100 carries no body. On a media failure nothing is sent and it answers `unavailable`, with the call still parked. `media_flags` set here shape the one anchor the call gets; on an `answer` or `progress` after it they are `bad_request` with `reason: already_anchored` |
 | `reject` | sip | `{code, reason?, headers?}` | final non-2xx + tear down |
 | `hangup` | sip | `{reason?}` | BYE an answered call, or reject an unanswered one |
 | `drop` | sip | `{reason?, ban?}` | abandon an **unanswered** call with no final response and no CANCEL on the wire (the `100 Trying` siphon sent when the INVITE arrived has already gone) and release it; `ban: true` also scores the caller's source toward an auto-ban; refused (`invalid_state`) on an answered call, whose dialog is owed a BYE, and on an `originate {aor}` whose phones are still ringing, whose INVITEs are owed a CANCEL (`hangup`). See [dropping unsolicited traffic](#drop--abandon-a-call-without-answering-it) |
@@ -310,7 +310,7 @@ what lets a refused verb be lined up against a capture, a CDR and HEP.
 | `stop` | sip | — | stop the announcement currently playing |
 | `dtmf` | sip | `{digits, duration_ms?, volume_dbm0?, pause_ms?, to_tag?}` | inject DTMF digits toward the A-leg |
 | `hold` / `unhold` | sip | — | silence the call's media on the engine, in both directions, and restore it; a media gate, not a SIP hold |
-| `stream_start` | sip | `{ws_uri, mode?, direction?, channels?, sample_rate?, profile?}` | attach a WebSocket audio tee (`mode: tee`, the default) or takeover bridge (`mode: bridge`) (siphon-rtp backend only) |
+| `stream_start` | sip | `{ws_uri, mode?, direction?, channels?, sample_rate?, profile?, media_flags?}` | attach a WebSocket audio tee (`mode: tee`, the default) or takeover bridge (`mode: bridge`) (siphon-rtp backend only). `media_flags` go with a bridge and its `profile` (see [per-call media flags](#per-call-media-flags)) |
 | `stream_stop` | sip | `{mode?}` | detach the WebSocket audio tee (`mode: tee`, the default) or bridge |
 | `set_var` / `get_var` | — | `{key, value?}` | per-call variables (drain with the call) |
 | `resync` | — | — | re-attach + enumerate this app's owned calls |
@@ -425,7 +425,12 @@ same way every other verb does — never a hang:
   `ws_uri` reads them. Without it the engine runs the bridge at the leg's own
   rate with uplink processing off, and a re-point keeps what the bridge had;
   neither shows in the `ok` reply. An unknown name is `bad_request` with
-  `reason: unknown_profile`, and nothing reaches the call. An absent `mode` means `tee`,
+  `reason: unknown_profile`, and nothing reaches the call. `media_flags` are
+  merged over that profile's bridge settings for this bridge only; without a
+  `profile` they are `bad_request` with `reason: needs_profile` (a fresh bridge
+  with no profile runs every stage off and a re-point keeps the old bridge's
+  settings, so there is nothing defined to merge over), and on a tee they are
+  `bad_request` with `reason: tee`. An absent `mode` means `tee`,
   but the SDKs always send it, so a controller that asked for a tee never gets
   a takeover from a server whose default differs.
 - **WebSocket URI placeholders.** A `ws_uri` may name `{call_id}`,
@@ -455,6 +460,66 @@ same way every other verb does — never a hang:
   (Previously an oversized blob reached the frame encoder and came back as
   `unavailable` — the code for an unreachable engine — so a controller retried a
   prompt that could never be played.)
+
+### Per-call media flags
+
+`answer`, an anchored `progress`, `stream_start` with `mode: "bridge"` and
+`originate` with `media: true` take `media_flags` beside `profile`: an object
+of processing settings merged over the profile for **this call only**. The
+profile in the registry is never changed, so the next call naming it gets it
+as configured. A key left out keeps the profile's value.
+
+```json
+{ "profile": "voice_ai", "media_flags": { "echo_cancellation": false, "ws_vad_min_speech_ms": 100 } }
+```
+
+Which half of the profile it is merged over is the one each path already
+uses: the **answer** half for `answer` / `progress`, for a `stream_start`
+bridge and for an `originate` (where the merge happens when siphon answers the
+callee's 2xx offer). `answer` / `progress` default to `voice_ai` and
+`originate` to `rtp_passthrough` when no `profile` is named, so the flags are
+merged over that.
+
+| key | type | accepted |
+|---|---|---|
+| `echo_cancellation` | boolean | |
+| `echo_delay_search_ms` | integer, ms | 16-1000 as a search window, or 16-1000 as a tail length when the **merged** `echo_long_tail` is set (the engine's own bounds, the same check config load runs) |
+| `echo_long_tail` | boolean | |
+| `echo_residual_suppression` | boolean | |
+| `noise_suppression` | boolean | |
+| `ws_vad` | boolean | |
+| `ws_vad_engine` | string | `energy` / `neural` |
+| `ws_vad_min_speech_ms` | integer, ms | |
+| `ws_vad_threshold` | integer | may be negative |
+| `ws_vad_hangover_ms` | integer, ms | |
+| `ws_barge_in` | boolean | |
+| `ws_sample_rate` | integer, Hz | a multiple of 1000 within 8000-48000 |
+
+Every refusal is `bad_request` with `error.details: {verb, argument:
+"media_flags", field?, reason, allowed?}`, sent before anything is anchored,
+attached or placed:
+
+- `unknown_field`: a key not in the table, with `allowed` listing the twelve.
+  That includes the profile fields that are not processing settings (`ws_uri`,
+  `ws_tee`, `flags`, `transport_protocol`, `ice`, `dtls`, `received_from`,
+  codec and recording), which would let a per-call argument change how a call
+  is keyed or widen a source gate.
+- `null`: a key set to `null`. Leave it out to keep the profile's value; a typo
+  must not mean "the engine's default". `media_flags: null` itself is the same
+  as not sending it.
+- `wrong_type`, `invalid_value` (with `allowed` for `ws_vad_engine`),
+  `out_of_range`, `not_an_object`.
+- `unsupported_by_backend`: a set key the configured media backend cannot
+  honour (`stream_start`; `answer` / `originate` anchoring is siphon-rtp only
+  and refused as before on other backends).
+- `needs_profile` (`stream_start` without `profile`), `tee` (a tee),
+  `not_anchored` (`originate` with an offer of its own), `already_anchored`
+  (an `answer` or `progress` after anchored early media already sent the
+  engine's answer). `originate` refuses `offer` altogether, so an early offer
+  never carries them.
+
+Without `media_flags` nothing changes: the engine is sent exactly the frame it
+was sent before the argument existed.
 
 ### `drop` — abandon a call without answering it
 

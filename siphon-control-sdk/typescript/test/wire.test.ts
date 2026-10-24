@@ -352,6 +352,36 @@ describe("Call verbs map to the in-process-mirrored wire verbs", () => {
     ]);
   });
 
+  it("answerAnchored and a bridge carry media flags in snake_case", async () => {
+    const transport = new RecordingTransport();
+    const call = makeCall(transport);
+    await call.answerAnchored({ profile: "voice_ai", mediaFlags: { echoCancellation: false } });
+    await call.streamStart("wss://ai.example/agent", {
+      mode: "bridge",
+      profile: "voice_ai",
+      mediaFlags: { wsSampleRate: 16000, echoDelaySearchMs: 300 },
+    });
+    expect(transport.calls).toEqual([
+      {
+        module: MODULE_SIP,
+        verb: "answer",
+        target: { channel: "ch1" },
+        args: { anchor: true, profile: "voice_ai", media_flags: { echo_cancellation: false } },
+      },
+      {
+        module: MODULE_SIP,
+        verb: "stream_start",
+        target: { channel: "ch1" },
+        args: {
+          ws_uri: "wss://ai.example/agent",
+          mode: "bridge",
+          profile: "voice_ai",
+          media_flags: { ws_sample_rate: 16000, echo_delay_search_ms: 300 },
+        },
+      },
+    ]);
+  });
+
   // Alerting and early media are two verbs on the wire, not one verb plus a
   // status code the app has to know: `ring` emits its own token and carries no
   // body, `progress` is the one that can (RFC 3960 §3.1).
@@ -971,6 +1001,22 @@ describe("originate args map to the names the server parses", () => {
       aor: "sip:201@example.com",
       media: true,
       contact_host: "tenant-a.example.com",
+    });
+  });
+
+  it("an anchor plan carries its media flags in snake_case", () => {
+    expect(
+      originateArgs("out-1", "sip:1001@pbx.example", {
+        anchor: true,
+        profile: "voice_ai",
+        mediaFlags: { echoCancellation: false, wsVadMinSpeechMs: 100, wsVadEngine: "neural" },
+      }),
+    ).toEqual({
+      channel: "out-1",
+      to: "sip:1001@pbx.example",
+      media: true,
+      profile: "voice_ai",
+      media_flags: { echo_cancellation: false, ws_vad_min_speech_ms: 100, ws_vad_engine: "neural" },
     });
   });
 

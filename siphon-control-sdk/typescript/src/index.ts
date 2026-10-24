@@ -160,6 +160,7 @@ export type {
   SessionTimer,
   ResponseOptions,
   AnchoredAnswerOptions,
+  MediaFlags,
   RingOptions,
   RouteOptions,
   ReferReplaces,

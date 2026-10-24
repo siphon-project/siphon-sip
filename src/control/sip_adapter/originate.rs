@@ -14,6 +14,8 @@ use crate::dispatcher::{
     PreparedOriginate,
 };
 
+use crate::rtpengine::media_flags::MediaFlags;
+
 use super::routing::parse_extra_headers;
 use super::string_arg;
 
@@ -22,12 +24,13 @@ use super::string_arg;
 pub(super) trait OriginatePlacer {
     /// Stage a call to one URI (`args.to`), presenting `contact_host` as the
     /// host and `contact_user` as the user part of siphon's own Contact when
-    /// they name one.
+    /// they name one, and anchoring it with `media_flags` over its profile.
     fn prepare(
         &self,
         params: OriginateParams,
         contact_host: Option<String>,
         contact_user: Option<String>,
+        media_flags: Option<MediaFlags>,
     ) -> Result<PreparedOriginate, OriginateError>;
     /// Send a staged call's INVITE.
     fn dial(&self, prepared: &PreparedOriginate) -> bool;
@@ -50,11 +53,13 @@ impl OriginatePlacer for RunningB2bua {
         params: OriginateParams,
         contact_host: Option<String>,
         contact_user: Option<String>,
+        media_flags: Option<MediaFlags>,
     ) -> Result<PreparedOriginate, OriginateError> {
         crate::dispatcher::b2bua_originate_prepare_with_contact_host(
             params,
             contact_host,
             contact_user,
+            media_flags,
         )
     }
 
@@ -170,6 +175,10 @@ pub(super) fn originate_on(
         Ok(media) => media,
         Err(message) => return ControlResult::error(ControlErrorCode::BadRequest, message),
     };
+    let media_flags = match originate_media_flags(args, &media) {
+        Ok(media_flags) => media_flags,
+        Err(refusal) => return refusal,
+    };
     let privacy = match parse_privacy("originate", args.get("privacy")) {
         Ok(privacy) => privacy,
         Err(message) => return ControlResult::error(ControlErrorCode::BadRequest, message),
@@ -280,12 +289,13 @@ pub(super) fn originate_on(
                 vars,
                 contact_host,
                 contact_user,
+                media_flags,
             },
         );
     }
     let params = OriginateParams { to, ..params };
 
-    let prepared = match placer.prepare(params, contact_host, contact_user) {
+    let prepared = match placer.prepare(params, contact_host, contact_user, media_flags) {
         Ok(prepared) => prepared,
         Err(error) => return originate_error(error),
     };
@@ -408,6 +418,8 @@ struct AorOriginate<'a> {
     /// User part of siphon's own Contact on every leg, when
     /// `args.contact_user` names one.
     contact_user: Option<String>,
+    /// Every leg's overrides of the anchor profile (`args.media_flags`).
+    media_flags: Option<MediaFlags>,
 }
 
 /// The deadline of a whole group when the controller names none: one ring
@@ -477,6 +489,7 @@ fn originate_aor(
         answers: crate::dispatcher::OriginateGroupAnswers::First,
         // Each phone is a callee of its own, with no caller to offer from.
         early_offer: None,
+        media_flags: request.media_flags,
     };
     let sink = Arc::new(ChannelGroupSink {
         bus: Arc::clone(bus),
@@ -658,11 +671,19 @@ pub(super) fn parse_originate_media(
                 .to_string(),
         ),
         (None, true) => Ok(crate::dispatcher::OriginateMedia::Anchor {
-            profile: args
-                .get("profile")
-                .and_then(|value| value.as_str())
-                .unwrap_or("rtp_passthrough")
-                .to_string(),
+            profile: match args.get("profile") {
+                None | Some(serde_json::Value::Null) => "rtp_passthrough",
+                Some(serde_json::Value::String(profile)) => profile,
+                // A name that is not a string is not the default profile the
+                // controller did not ask for.
+                Some(_) => {
+                    return Err(
+                        "originate args.profile must be a string naming a media profile"
+                            .to_string(),
+                    )
+                }
+            }
+            .to_string(),
             ws_uri: args
                 .get("ws_uri")
                 .and_then(|value| value.as_str())
@@ -673,6 +694,33 @@ pub(super) fn parse_originate_media(
                 .to_string(),
         ),
     }
+}
+
+/// Read `args.media_flags` for an originate whose media plan is `media`.
+///
+/// Only an anchored originate takes them: they are merged over the anchor
+/// profile's answer half when siphon answers the callee's 2xx offer, and an
+/// offer the controller supplied gets no answer from siphon. They are checked
+/// against that profile here, before anything is placed, rather than at the
+/// 2xx, where the only way left to refuse them is to hang up a connected call.
+pub(super) fn originate_media_flags(
+    args: &serde_json::Value,
+    media: &crate::dispatcher::OriginateMedia,
+) -> Result<Option<MediaFlags>, ControlResult> {
+    let Some(flags) = super::media_flags::parse("originate", args)? else {
+        return Ok(None);
+    };
+    let crate::dispatcher::OriginateMedia::Anchor { profile, .. } = media else {
+        return Err(super::media_flags::out_of_place(
+            "originate",
+            "not_anchored",
+            "originate args.media_flags shape the media siphon anchors, so they go with \
+             args.media=true, not with an offer of your own"
+                .to_string(),
+        ));
+    };
+    super::media_flags::check_against_profile("originate", &flags, profile)?;
+    Ok(Some(flags))
 }
 
 /// Parse the optional `privacy` argument (RFC 3323 §4.1 / TS 24.607). An
@@ -800,6 +848,7 @@ pub(crate) mod staged {
                 OriginateParams,
                 Option<String>,
                 Option<String>,
+                Option<crate::rtpengine::media_flags::MediaFlags>,
             ) -> Result<PreparedOriginate, OriginateError>
             + Send
             + Sync,
@@ -834,8 +883,9 @@ pub(crate) mod staged {
             params: OriginateParams,
             contact_host: Option<String>,
             contact_user: Option<String>,
+            media_flags: Option<crate::rtpengine::media_flags::MediaFlags>,
         ) -> Result<PreparedOriginate, OriginateError> {
-            (self.prepare)(params, contact_host, contact_user)
+            (self.prepare)(params, contact_host, contact_user, media_flags)
         }
 
         fn dial(&self, prepared: &PreparedOriginate) -> bool {

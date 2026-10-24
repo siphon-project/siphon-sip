@@ -42,28 +42,38 @@ pub(super) fn check_branch_contact_hosts(targets: &mut [DialTarget]) -> Result<(
 }
 
 /// [`b2bua_originate_prepare`] presenting `contact_host` as the host and
-/// `contact_user` as the user part of siphon's own Contact on the call (the
-/// `originate` verb's arguments of those names).
+/// `contact_user` as the user part of siphon's own Contact on the call, with
+/// `media_flags` over the anchor profile (the `originate` verb's arguments of
+/// those names).
 pub(crate) fn b2bua_originate_prepare_with_contact_host(
     params: OriginateParams,
     contact_host: Option<String>,
     contact_user: Option<String>,
+    media_flags: Option<crate::rtpengine::media_flags::MediaFlags>,
 ) -> Result<PreparedOriginate, OriginateError> {
     let Some(control) = B2BUA_CONTROL.get() else {
         return Err(OriginateError::Unavailable(
             "b2bua is not running — nothing to originate from".to_string(),
         ));
     };
-    prepare_originate_with_contact_host(&control.state, params, contact_host, contact_user)
+    prepare_originate_with_contact_host(
+        &control.state,
+        params,
+        contact_host,
+        contact_user,
+        media_flags,
+    )
 }
 
 /// [`prepare_originate`] presenting `contact_host` as the host and
-/// `contact_user` as the user part of siphon's own Contact on the call.
+/// `contact_user` as the user part of siphon's own Contact on the call, with
+/// `media_flags` over the anchor profile.
 pub(crate) fn prepare_originate_with_contact_host(
     state: &DispatcherState,
     params: OriginateParams,
     contact_host: Option<String>,
     contact_user: Option<String>,
+    media_flags: Option<crate::rtpengine::media_flags::MediaFlags>,
 ) -> Result<PreparedOriginate, OriginateError> {
     prepare_originate_routed(
         state,
@@ -71,6 +81,7 @@ pub(crate) fn prepare_originate_with_contact_host(
         &OriginateRoute {
             contact_host,
             contact_user,
+            media_flags,
             ..OriginateRoute::default()
         },
     )

@@ -47,6 +47,40 @@ entry, but a working config keeps working.
   can attach to the interpreter, or the timer sweep stops turning. The handler
   pool's watchdog could not see a whole-process wedge, which starves the pool
   of work so it looks idle. New gauge `siphon_interpreter_attach_wait_ms`.
+### Added
+
+- **Per-call `media_flags` on the control plane.** `answer`, an anchored
+  `progress`, `stream_start` with `mode: "bridge"` and `originate` with
+  `media: true` take `media_flags` beside `profile`: up to twelve processing
+  settings (`echo_cancellation`, `echo_delay_search_ms`, `echo_long_tail`,
+  `echo_residual_suppression`, `noise_suppression`, `ws_vad`, `ws_vad_engine`,
+  `ws_vad_min_speech_ms`, `ws_vad_threshold`, `ws_vad_hangover_ms`,
+  `ws_barge_in`, `ws_sample_rate`) merged over the profile's answer half for
+  that call only. Turning echo cancellation off for one bot no longer takes a
+  second profile and a restart, and the profile itself is never changed. The
+  values are checked at the verb by the rules config load uses (the
+  `echo_delay_search_ms` range is picked by the merged `echo_long_tail`, through
+  one check shared with boot), and an unknown key, a `null`, a wrong type or a
+  bad value is `bad_request` with `error.details: {verb, argument:
+  "media_flags", field, reason, allowed?}` before anything is anchored. They are
+  refused on a tee, on a bridge without `profile`, on an originate carrying its
+  own offer and after anchored early media already sent the engine's answer.
+  An originate keeps them until the callee's 2xx is answered. Without
+  `media_flags` the engine gets the same frames as before. The Rust, Python and
+  TypeScript control SDKs carry them as a typed `MediaFlags`
+  (`Call::answer_anchored_with_flags`, `ResponseOptions::media_flags`,
+  `StreamOptions::media_flags`, `OriginateMedia::anchor_with_flags`;
+  `media_flags=` in Python; `mediaFlags` in TypeScript). In the Rust SDK,
+  `OriginateMedia::Anchor`, `StreamOptions` and `ResponseOptions` gain a
+  `media_flags` field, which breaks code that builds them as literals without
+  `..Default::default()`, so the SDK takes a minor bump.
+
+### Changed
+
+- **A `profile` that is not a string is `bad_request` on `answer`, `progress`
+  and `originate`.** It used to be read as no profile at all, so the call was
+  anchored on the default profile the controller never named. `stream_start`
+  already refused it.
 
 ## [1.15.3] — 2026-10-23
 
