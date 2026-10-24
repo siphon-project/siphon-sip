@@ -130,9 +130,9 @@ pub fn entry_from_config(
 
     // Its own address, or a promise of one (see `registrant::address`).
     if let Some(local_addr) = entry_config.local_addr {
-        if transport_type != Transport::Udp {
+        if !matches!(transport_type, Transport::Udp | Transport::Tcp) {
             return Err(format!(
-                "local_addr needs transport udp, not {transport_type}"
+                "local_addr needs transport udp or tcp, not {transport_type}"
             ));
         }
         entry = entry.with_local_addr(local_addr);
@@ -225,17 +225,26 @@ mod tests {
     }
 
     #[test]
-    fn a_local_addr_on_a_stream_transport_is_refused() {
-        let config = registrant_config(concat!(
-            "entries:\n",
-            "  - aor: \"sip:trunk@carrier.example\"\n",
-            "    registrar: \"sip:198.51.100.20:5060\"\n",
-            "    user: \"trunk\"\n",
-            "    transport: tcp\n",
-            "    local_addr: \"192.0.2.77\"\n",
-        ));
-        let error = entry_from_config(&config.entries[0], &config).expect_err("refused");
-        assert!(error.contains("udp"), "{error}");
+    fn a_local_addr_on_tls_is_refused_and_on_tcp_accepted() {
+        let entry_on = |transport: &str| {
+            let config = registrant_config(&format!(
+                concat!(
+                    "entries:\n",
+                    "  - aor: \"sip:trunk@carrier.example\"\n",
+                    "    registrar: \"sip:198.51.100.20:5060\"\n",
+                    "    user: \"trunk\"\n",
+                    "    transport: {}\n",
+                    "    local_addr: \"192.0.2.77\"\n",
+                ),
+                transport
+            ));
+            entry_from_config(&config.entries[0], &config)
+        };
+        let error = entry_on("tls").expect_err("refused");
+        assert!(error.contains("udp or tcp"), "{error}");
+        let entry = entry_on("tcp").expect("a TCP entry on its own address");
+        assert_eq!(entry.transport, Transport::Tcp);
+        assert_eq!(entry.local_addr, Some("192.0.2.77".parse().unwrap()));
     }
 
     #[test]

@@ -40,6 +40,7 @@ TESTER = os.environ.get("TESTER", "sip:tester@192.0.2.100:5060")
 UE_CSV = os.environ.get("MULTI_UE_CSV")             # unset: the inline UES
 STATUS_FILE = os.environ.get("MULTI_UE_STATUS")     # optional JSON per tick
 INTERVAL = int(os.environ["MULTI_UE_INTERVAL"]) if os.environ.get("MULTI_UE_INTERVAL") else None
+TRANSPORT = os.environ.get("MULTI_UE_TRANSPORT", "udp")  # "udp" or "tcp"
 
 # Protected ports repeat across UEs, as they do across real handsets: the SAs
 # are told apart by address.
@@ -98,6 +99,7 @@ def _sync():
                     PCSCF,
                     user=row["impi"],
                     interval=INTERVAL,
+                    transport=TRANSPORT,
                     auth="aka",
                     k=row["k"],
                     op=row.get("op") or None,

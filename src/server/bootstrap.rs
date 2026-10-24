@@ -943,6 +943,31 @@ pub(super) fn registrant_ue_sockets(
     })
 }
 
+/// Give the per-UE sockets their TCP half: listeners for registrations over
+/// TCP from an address of their own, and the pool their own connections go
+/// through. A process with no `listen.tcp` has no TCP distributor (each TCP
+/// listener spawns one), so with a registrant one is spawned here, or a TCP
+/// UE's REGISTER would wait in the channel for a reader that never comes.
+pub(super) fn attach_registrant_tcp(
+    ue_sockets: Option<&Arc<transport::ue_sockets::UeSockets>>,
+    config: &Config,
+    context: transport::ue_streams::UeTcpContext,
+    tcp_outbound_rx: &flume::Receiver<transport::OutboundMessage>,
+) {
+    let Some(ue_sockets) = ue_sockets else {
+        return;
+    };
+    if config.listen.tcp.is_empty() {
+        transport::stream::spawn_outbound_distributor(
+            tcp_outbound_rx.clone(),
+            Arc::clone(&context.connection_map),
+            transport::Transport::Tcp,
+            Some(Arc::clone(&context.pool)),
+        );
+    }
+    ue_sockets.attach_tcp(context);
+}
+
 /// Wire the config entries + background refresh loop onto the registrant
 /// `manager` that was created (and whose Python namespace was installed) early
 /// in `serve()` — before `ScriptEngine::new()` — so the script's

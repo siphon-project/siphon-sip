@@ -178,7 +178,13 @@ pub struct ConnectionPool {
     /// Connections a client transaction is pending on, which the idle timeout
     /// leaves alone until the transaction ends: see [`hold`](Self::hold).
     holds: ConnectionHolds,
+    /// Local sources a pool-fallback send may bind besides the P-CSCF's
+    /// protected ports: see [`pinned`].
+    pinned_sources: ArcSwap<HashSet<SocketAddr>>,
 }
+
+#[path = "pool_pinned.rs"]
+pub(crate) mod pinned;
 
 pub use crate::transport::outbound_tls::{
     build_outbound_tls_config, load_outbound_client_identity, OutboundClientIdentity,
@@ -284,6 +290,7 @@ impl ConnectionPool {
             idle_timeout: POOL_IDLE_TIMEOUT,
             idle_exempt: Arc::new(DashMap::new()),
             holds: ConnectionHolds::new(),
+            pinned_sources: ArcSwap::from_pointee(HashSet::new()),
         }
     }
 

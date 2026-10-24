@@ -78,12 +78,18 @@ def test_add_rejects_local_addr_that_is_not_an_ip(registration):
     assert registration.count() == 0
 
 
-@pytest.mark.parametrize("transport", ["tcp", "TLS"])
-def test_add_rejects_local_addr_on_stream_transport(registration, transport):
-    with pytest.raises(ValueError, match="needs transport udp"):
+@pytest.mark.parametrize("transport", ["tls", "TLS"])
+def test_add_rejects_local_addr_on_tls(registration, transport):
+    with pytest.raises(ValueError, match="needs transport udp or tcp"):
         registration.add("sip:trunk@carrier.example", PCSCF, user="trunk",
                          transport=transport, local_addr="192.0.2.77")
     assert registration.count() == 0
+
+
+def test_add_takes_local_addr_on_tcp(registration):
+    add_ue(registration, 1, local_addr="192.0.2.77", transport="tcp")
+    assert registration.list()[0]["local_addr"] == "192.0.2.77"
+    assert registration.flow(impu(1)).transport == "tcp"
 
 
 def test_two_ipsec_ues_share_an_address_with_distinct_ports(registration):
@@ -225,10 +231,15 @@ def test_set_local_addr_refuses_a_bad_ip(registration):
         registration.set_local_addr(impu(1), "not-an-address")
 
 
-def test_set_local_addr_refuses_a_stream_entry(registration):
-    registration.add("sip:trunk@carrier.example", PCSCF, user="trunk", transport="tcp")
-    with pytest.raises(ValueError, match="needs transport udp"):
+def test_set_local_addr_refuses_a_tls_entry(registration):
+    registration.add("sip:trunk@carrier.example", PCSCF, user="trunk", transport="tls")
+    with pytest.raises(ValueError, match="needs transport udp or tcp"):
         registration.set_local_addr("sip:trunk@carrier.example", "192.0.2.77")
+
+
+def test_set_local_addr_moves_a_tcp_entry(registration):
+    registration.add("sip:trunk@carrier.example", PCSCF, user="trunk", transport="tcp")
+    assert registration.set_local_addr("sip:trunk@carrier.example", "192.0.2.77") is True
 
 
 # --- find_by_local ----------------------------------------------------------

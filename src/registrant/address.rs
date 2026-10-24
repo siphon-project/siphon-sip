@@ -13,9 +13,12 @@
 //! holds changes. An entry without one registers from the process's address,
 //! exactly as before.
 //!
-//! v1 is UDP only: a `local_addr` on a TCP or TLS entry is refused, because
-//! the outbound connection pool opens stream connections from an ephemeral
-//! source the entry's address would not name.
+//! UDP and TCP. Over TCP the entry listens on its address (its protected
+//! server port with IPsec, else its plain port) for the connection the P-CSCF
+//! opens to it, and its own connection to the P-CSCF leaves from its address
+//! (its protected client port, or the plain port for the unprotected initial
+//! REGISTER); see [`RegistrantManager::ue_stream_plan`]. TLS is refused: the
+//! UE side has no client certificate or TLS listener of its own.
 
 use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
@@ -24,6 +27,7 @@ use std::time::Instant;
 use tracing::info;
 
 use super::{RegistrantEntry, RegistrantEvent, RegistrantManager, RegistrantState};
+use crate::transport::ue_streams::UeTcpPlan;
 use crate::transport::Transport;
 
 /// What [`RegistrantManager::find_by_local`] matches: an address alone, or an
@@ -76,8 +80,8 @@ fn keys_collide(ours: &(IpAddr, Vec<u16>), theirs: &(IpAddr, Vec<u16>)) -> bool 
 }
 
 impl RegistrantManager {
-    /// Add an entry, refusing one whose `local_addr` cannot be used: it is not
-    /// UDP, or another entry (not one with the same AoR, which this replaces)
+    /// Add an entry, refusing one whose `local_addr` cannot be used: it is
+    /// neither UDP nor TCP, or another entry (not one with the same AoR, which this replaces)
     /// already registers from the same address and protected client port.
     ///
     /// An entry that requires an address and has none starts in
@@ -167,7 +171,7 @@ impl RegistrantManager {
     /// replaces it with the new one; otherwise it lapses at its `Expires`.
     ///
     /// `Ok(false)` when there is no such entry. `Err` for an address another
-    /// entry holds, or a non-UDP entry.
+    /// entry holds, or an entry on a transport other than UDP or TCP.
     pub fn set_local_addr(&self, aor: &str, local_addr: Option<IpAddr>) -> Result<bool, String> {
         let _guard = self
             .address_lock
@@ -185,8 +189,8 @@ impl RegistrantManager {
         if current == local_addr {
             return Ok(true);
         }
-        if local_addr.is_some() && transport != Transport::Udp {
-            return Err(non_udp_error(aor, transport));
+        if local_addr.is_some() && !own_address_transport(transport) {
+            return Err(transport_error(aor, transport));
         }
         if let Some(ip) = local_addr {
             self.refuse_taken(aor, &(ip, ports))?;
@@ -259,6 +263,8 @@ impl RegistrantManager {
     /// and server port (TS 33.203 7.1), on its own address or else on the
     /// process's UE address `process_ue_ip`. A port a configured `listen.udp`
     /// listener serves is left to it by [`UeSockets`](crate::transport::ue_sockets::UeSockets).
+    /// An entry with a `local_addr` over TCP opens none: it listens and
+    /// connects through [`ue_stream_plan`](Self::ue_stream_plan).
     pub(super) fn ue_socket_plan(
         &self,
         plain_port: u16,
@@ -267,6 +273,9 @@ impl RegistrantManager {
         self.entries
             .iter()
             .filter_map(|entry| {
+                if entry.local_addr.is_some() && entry.transport == Transport::Tcp {
+                    return None;
+                }
                 let protected = RegistrantManager::protected_ports(&entry);
                 let ip = match entry.local_addr {
                     Some(ip) => ip,
@@ -291,6 +300,71 @@ impl RegistrantManager {
     }
 }
 
+impl RegistrantManager {
+    /// What the per-UE TCP side must hold for every TCP entry with an address
+    /// of its own ([`UeTcpPlan`]), and each such AoR's listener, so a listener
+    /// that will not bind is laid at its owner's door.
+    ///
+    /// - With IPsec the entry listens on its protected server port, where the
+    ///   P-CSCF opens its connection "from the P-CSCF's protected client port
+    ///   ... to the UE's protected server port" (TS 24.229 5.2.2.2 1A b). Its
+    ///   own connection leaves "from the UE's protected client port and the
+    ///   UE's IP address to the P-CSCF's protected server port" (5.1.1.2.2 1
+    ///   b), so the three client ports it rotates through are sources, and the
+    ///   plain port for the unprotected initial REGISTER. A connection is kept
+    ///   from the client port of every SA set it holds, and from the plain port
+    ///   until a set is established; any other closes (a re-authentication
+    ///   moves to a new client port, TS 33.203 7.4).
+    /// - Without IPsec it listens on its plain port, its Contact port, and
+    ///   connects from it.
+    ///
+    /// A removed entry's sets awaiting the answer to its de-REGISTER keep their
+    /// connections: the answer comes back on them.
+    pub(super) fn ue_stream_plan(&self, plain_port: u16) -> (UeTcpPlan, Vec<(String, SocketAddr)>) {
+        let mut plan = UeTcpPlan::default();
+        let mut owners = Vec::new();
+        for entry in self.entries.iter() {
+            let Some(ip) = entry
+                .local_addr
+                .filter(|_| entry.transport == Transport::Tcp)
+            else {
+                continue;
+            };
+            let plain = SocketAddr::new(ip, plain_port);
+            plan.sources.insert(plain);
+            let listener = match entry.ue_ipsec.as_ref() {
+                Some(ipsec) => {
+                    let on_address = |port: u16| SocketAddr::new(ip, port);
+                    plan.sources
+                        .extend(ipsec.client_ports.iter().copied().map(on_address));
+                    plan.keep.extend(
+                        ipsec
+                            .sa_sets
+                            .keys()
+                            .into_iter()
+                            .map(|key| on_address(key.ue_port_c)),
+                    );
+                    if ipsec.sa_sets.usable().is_none() {
+                        plan.keep.insert(plain);
+                    }
+                    on_address(ipsec.ue_port_s)
+                }
+                None => {
+                    plan.keep.insert(plain);
+                    plain
+                }
+            };
+            plan.listeners.insert(listener);
+            owners.push((entry.aor.clone(), listener));
+        }
+        for source in self.teardown_client_sources() {
+            plan.sources.insert(source);
+            plan.keep.insert(source);
+        }
+        (plan, owners)
+    }
+}
+
 /// Every registration state, for [`RegistrantManager::counts`].
 const ALL_STATES: [RegistrantState; 6] = [
     RegistrantState::Unregistered,
@@ -312,17 +386,21 @@ fn state_name(state: RegistrantState) -> &'static str {
     }
 }
 
-fn non_udp_error(aor: &str, transport: Transport) -> String {
+/// Whether an entry on `transport` can register from an address of its own.
+fn own_address_transport(transport: Transport) -> bool {
+    matches!(transport, Transport::Udp | Transport::Tcp)
+}
+
+fn transport_error(aor: &str, transport: Transport) -> String {
     format!(
-        "{aor}: local_addr needs transport udp, not {transport}: a TCP or TLS registration \
-         leaves over a pooled connection from an ephemeral source, which the address would \
-         not name"
+        "{aor}: local_addr needs transport udp or tcp, not {transport}: the UE side has no \
+         TLS client identity or TLS listener of its own"
     )
 }
 
 fn check_transport(entry: &RegistrantEntry, local_addr: Option<IpAddr>) -> Result<(), String> {
-    if local_addr.is_some() && entry.transport != Transport::Udp {
-        return Err(non_udp_error(&entry.aor, entry.transport));
+    if local_addr.is_some() && !own_address_transport(entry.transport) {
+        return Err(transport_error(&entry.aor, entry.transport));
     }
     Ok(())
 }

@@ -2,7 +2,7 @@
 
 use std::net::{IpAddr, SocketAddr};
 
-use super::RegistrantManager;
+use super::{RegistrantEntry, RegistrantManager};
 
 /// The addresses of a request sent over a UE's established SA set (TS 33.203
 /// clause 7.1): from the UE's protected client port to the P-CSCF's protected
@@ -16,6 +16,9 @@ pub struct UeEgress {
     pub destination: SocketAddr,
     /// The UE's protected server port on `ue_ip`: the Via sent-by.
     pub sent_by: SocketAddr,
+    /// The entry's transport. Over TCP a request rides the UE's own connection
+    /// from `local` (TS 24.229 5.1.1.2.2 1 b).
+    pub transport: crate::transport::Transport,
 }
 
 impl RegistrantManager {
@@ -33,6 +36,7 @@ impl RegistrantManager {
             local: SocketAddr::new(ue_ip, ue_port_c),
             destination: SocketAddr::new(entry.destination.ip(), pcscf_port_s),
             sent_by: SocketAddr::new(ue_ip, ue_port_s),
+            transport: entry.transport,
         })
     }
 
@@ -68,6 +72,33 @@ impl RegistrantManager {
                 SocketAddr::new(local.ip(), ue_port_c),
             ))
         })
+    }
+}
+
+impl RegistrantManager {
+    /// The connection a TCP entry on an address of its own registers over:
+    /// `(source, destination)`, from its protected client port to the
+    /// P-CSCF's protected server port while it has a usable SA set (TS 24.229
+    /// 5.1.1.2.2 1 b), else from its plain port to the registrar. `None` for
+    /// any other entry.
+    pub(super) fn ue_tcp_connection(
+        entry: &RegistrantEntry,
+        plain_port: u16,
+    ) -> Option<(SocketAddr, SocketAddr)> {
+        let ip = entry
+            .local_addr
+            .filter(|_| entry.transport == crate::transport::Transport::Tcp)?;
+        let protected = entry
+            .ue_ipsec
+            .as_ref()
+            .and_then(|ipsec| ipsec.sa_sets.usable())
+            .map(|set| {
+                (
+                    SocketAddr::new(ip, set.key.ue_port_c),
+                    SocketAddr::new(entry.destination.ip(), set.pcscf_port_s),
+                )
+            });
+        Some(protected.unwrap_or((SocketAddr::new(ip, plain_port), entry.destination)))
     }
 }
 

@@ -239,6 +239,23 @@ entry, but a working config keeps working.
   leg's delivery ending leaves the other's record in place. The cost is that
   the mediation function receives one delivery per tapped leg of the same
   conversation.
+### Added
+
+- **Multi-UE IMS registration over TCP.** A registrant entry with its own
+  `local_addr` now takes `transport: tcp` (YAML and `registration.add`), where
+  it used to be refused as UDP only; TLS is still refused. Over TCP with IPsec
+  the UE opens its connection from `local_addr:ue_port_c` to the P-CSCF's
+  protected server port and sends its REGISTERs and MO requests on it (TS 24.229
+  5.1.1.2.2), and listens on `local_addr:ue_port_s` for the connection the
+  P-CSCF opens from its protected client port, answering the P-CSCF's requests
+  on it (5.2.2.2). The unprotected initial REGISTER leaves from the plain port.
+  The listener is bound with IP_FREEBIND and opened and closed with the entry
+  like the UDP sockets; moving or removing a UE, and shutdown, close its
+  listener and every connection it held. A re-authentication's new client port
+  opens a new connection and the old one closes with its SA set.
+  `registration.flow()` reports the entry's transport. A process with no
+  `listen.tcp` now gets a TCP outbound path when a registrant is configured.
+  `scripts/multi_ue_netns.sh` runs the lab over TCP with `TRANSPORT=tcp`.
 
 ## [1.15.3] — 2026-10-23
 

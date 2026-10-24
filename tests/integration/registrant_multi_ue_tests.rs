@@ -204,13 +204,16 @@ fn yaml_refuses_two_ues_on_one_address_and_port() {
 }
 
 #[test]
-fn yaml_refuses_a_local_addr_on_a_stream_transport() {
-    let yaml = ue_yaml(1).replace(
-        "      local_addr:",
-        "      transport: tcp\n      local_addr:",
-    );
-    let error = Config::from_str(&yaml).expect_err("refused at load");
-    assert!(error.to_string().contains("udp"), "{error}");
+fn yaml_refuses_a_local_addr_on_tls_and_takes_one_on_tcp() {
+    let on = |transport: &str| {
+        Config::from_str(&ue_yaml(1).replace(
+            "      local_addr:",
+            &format!("      transport: {transport}\n      local_addr:"),
+        ))
+    };
+    let error = on("tls").expect_err("refused at load");
+    assert!(error.to_string().contains("udp or tcp"), "{error}");
+    on("tcp").expect("a TCP UE on its own address loads");
 }
 
 #[test]

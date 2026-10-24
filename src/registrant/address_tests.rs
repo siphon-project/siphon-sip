@@ -7,6 +7,13 @@ fn ip(text: &str) -> IpAddr {
     text.parse().expect("an IP literal")
 }
 
+/// An IPsec UE of the shared fixtures, registering over TCP from `address`.
+fn tcp_ue(index: u32, address: IpAddr) -> RegistrantEntry {
+    let mut entry = ue(index, Some(address));
+    entry.transport = Transport::Tcp;
+    entry
+}
+
 fn listeners() -> HashMap<Transport, SocketAddr> {
     HashMap::from([(Transport::Udp, "203.0.113.5:5070".parse().expect("addr"))])
 }
@@ -208,18 +215,190 @@ fn two_entries_may_not_share_an_address_and_protected_port() {
 }
 
 #[test]
-fn an_address_needs_udp() {
+fn an_address_needs_udp_or_tcp() {
     let manager = test_support::manager();
     let mut entry = trunk("sip:trunk@carrier.example").with_local_addr(ip("192.0.2.77"));
     entry.transport = Transport::Tls;
-    assert!(manager.try_add(entry).expect_err("refused").contains("udp"));
-
-    let mut stream = trunk("sip:stream@carrier.example");
-    stream.transport = Transport::Tcp;
-    manager.add(stream);
     assert!(manager
-        .set_local_addr("sip:stream@carrier.example", Some(ip("192.0.2.78")))
+        .try_add(entry)
+        .expect_err("refused")
+        .contains("udp or tcp"));
+
+    let mut tls = trunk("sip:tls@carrier.example");
+    tls.transport = Transport::Tls;
+    manager.add(tls);
+    assert!(manager
+        .set_local_addr("sip:tls@carrier.example", Some(ip("192.0.2.78")))
         .is_err());
+
+    let mut stream = trunk("sip:stream@carrier.example").with_local_addr(ip("192.0.2.79"));
+    stream.transport = Transport::Tcp;
+    manager
+        .try_add(stream)
+        .expect("a TCP entry on its own address");
+    assert_eq!(
+        manager.set_local_addr("sip:stream@carrier.example", Some(ip("192.0.2.80"))),
+        Ok(true)
+    );
+}
+
+/// A TCP UE on its own address over TCP: initial, unprotected REGISTER from
+/// its plain port to the P-CSCF's unprotected port, Via naming that port
+/// (TS 24.229 5.1.1.2.3 c); the protected one from its protected client port
+/// to the P-CSCF's protected server port, with the protected server port in
+/// its Contact (5.1.1.2.2 b) and its Via (where the P-CSCF reconnects to if
+/// the connection fails, RFC 3261 18.2.2; over TCP the response rides the
+/// connection, 5.1.1.2.1 d).
+#[test]
+fn a_tcp_ue_registers_from_its_plain_then_its_protected_client_port() {
+    let manager = test_support::manager();
+    let aor = impu(1);
+    manager
+        .try_add(tcp_ue(1, ip("192.0.2.77")))
+        .expect("a TCP UE");
+    let listen = listeners();
+    let defaults = EgressDefaults::new("203.0.113.5:5060".parse().expect("addr"), &listen);
+
+    let initial = manager
+        .build_register(&aor, defaults, 600000)
+        .expect("built");
+    assert_eq!(initial.transport, Transport::Tcp);
+    assert_eq!(initial.destination, "198.51.100.10:5060".parse().unwrap());
+    assert_eq!(
+        initial.source_local_addr,
+        Some("192.0.2.77:5070".parse().unwrap())
+    );
+    let via = initial
+        .message
+        .headers
+        .get("Via")
+        .cloned()
+        .unwrap_or_default();
+    assert!(via.starts_with("SIP/2.0/TCP 192.0.2.77:5070;"), "{via}");
+    let contact = initial
+        .message
+        .headers
+        .get("Contact")
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        contact.contains("@192.0.2.77:5070;transport=tcp"),
+        "{contact}"
+    );
+
+    let server = crate::ipsec::parse_security_client(test_support::SECURITY_SERVER)
+        .expect("a Security-Server");
+    manager.store_security_server(&aor, &server, test_support::SECURITY_SERVER);
+    let challenge =
+        crate::auth::parse_challenge(&test_support::aka_challenge_value("000000000001"))
+            .expect("a challenge");
+    let protected = manager
+        .build_register_aka(
+            &aor,
+            defaults,
+            &challenge,
+            600000,
+            Some(test_support::SECURITY_SERVER),
+        )
+        .expect("the protected REGISTER");
+    assert_eq!(protected.transport, Transport::Tcp);
+    assert_eq!(protected.destination, "198.51.100.10:5066".parse().unwrap());
+    let client = protected.source_local_addr.expect("pinned");
+    assert_eq!(client.ip(), ip("192.0.2.77"));
+    assert_ne!(client.port(), 6101, "a client port");
+    let via = protected
+        .message
+        .headers
+        .get("Via")
+        .cloned()
+        .unwrap_or_default();
+    assert!(via.starts_with("SIP/2.0/TCP 192.0.2.77:6101;"), "{via}");
+    let contact = protected
+        .message
+        .headers
+        .get("Contact")
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        contact.contains("@192.0.2.77:6101;transport=tcp"),
+        "{contact}"
+    );
+}
+
+/// The TCP plan: a listener on the protected server port, every client port
+/// and the plain port bindable, and until an SA set is established only the
+/// plain port's connection kept. A TCP entry opens no UDP socket; a UDP one
+/// is not in the TCP plan.
+#[test]
+fn a_tcp_ue_listens_on_its_protected_server_port_and_connects_from_its_own() {
+    let manager = test_support::manager();
+    manager.try_add(tcp_ue(1, ip("192.0.2.77"))).expect("TCP");
+    manager.try_add(ue(2, Some(ip("192.0.2.78")))).expect("UDP");
+    let mut plain = trunk("sip:plain@carrier.example").with_local_addr(ip("192.0.2.79"));
+    plain.transport = Transport::Tcp;
+    manager.try_add(plain).expect("a plain TCP entry");
+
+    let (plan, owners) = manager.ue_stream_plan(5070);
+    let addr = |text: &str| -> SocketAddr { text.parse().expect("addr") };
+    assert_eq!(
+        plan.listeners,
+        [addr("192.0.2.77:6101"), addr("192.0.2.79:5070")]
+            .into_iter()
+            .collect()
+    );
+    assert_eq!(
+        plan.sources,
+        [
+            addr("192.0.2.77:5070"),
+            addr("192.0.2.77:6100"),
+            addr("192.0.2.77:6102"),
+            addr("192.0.2.77:6103"),
+            addr("192.0.2.79:5070"),
+        ]
+        .into_iter()
+        .collect()
+    );
+    assert_eq!(
+        plan.keep,
+        [addr("192.0.2.77:5070"), addr("192.0.2.79:5070")]
+            .into_iter()
+            .collect()
+    );
+    assert_eq!(owners.len(), 2);
+
+    let udp_plan = manager.ue_socket_plan(5070, ip("203.0.113.5"));
+    assert_eq!(udp_plan.len(), 1, "only the UDP UE opens UDP sockets");
+    assert_eq!(udp_plan[0].0, impu(2));
+}
+
+/// Once registered over its SA set, the UE keeps the connection from that
+/// set's client port and lets the plain port's go; a re-authentication's new
+/// set adds its own, and the connection the entry is judged by moves with it.
+#[test]
+fn the_kept_connection_follows_the_established_set() {
+    let manager = test_support::manager();
+    let aor = impu(1);
+    let ue_ip = ip("192.0.2.77");
+    manager.try_add(tcp_ue(1, ue_ip)).expect("TCP");
+    crate::registrant::egress::rotate_sa_set(&manager, &aor);
+    let established = manager.ue_egress(&aor, ue_ip).expect("an established set");
+    assert_eq!(established.transport, Transport::Tcp);
+
+    let (plan, _) = manager.ue_stream_plan(5070);
+    assert_eq!(plan.keep, [established.local].into_iter().collect());
+    let entry = manager.entries.get(&aor).expect("entry");
+    assert_eq!(
+        RegistrantManager::ue_tcp_connection(&entry, 5070),
+        Some((established.local, established.destination))
+    );
+    drop(entry);
+
+    crate::registrant::egress::rotate_sa_set(&manager, &aor);
+    let rotated = manager.ue_egress(&aor, ue_ip).expect("the new set");
+    assert_ne!(rotated.local, established.local);
+    let (plan, _) = manager.ue_stream_plan(5070);
+    assert!(plan.keep.contains(&rotated.local), "{plan:?}");
+    assert!(!plan.keep.contains(&SocketAddr::new(ue_ip, 5070)));
 }
 
 #[test]
