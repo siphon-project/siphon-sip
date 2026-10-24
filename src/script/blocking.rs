@@ -271,12 +271,16 @@ mod tests {
                 let source = std::fs::read_to_string(&path).expect("source file is readable");
                 // Inline `#[cfg(test)] mod tests` sit at the end of the file.
                 let production = source.split("#[cfg(test)]\nmod ").next().unwrap_or("");
+                // A wait counts as released when `released(` opens on its line
+                // or the one before (rustfmt breaks the closure after it).
+                let mut previous = "";
                 for (number, line) in production.lines().enumerate() {
                     let code = line.split("//").next().unwrap_or("");
                     let waits = code.contains("block_in_place(") || code.contains(".block_on(");
-                    if waits && !code.contains("released(") {
+                    if waits && !code.contains("released(") && !previous.contains("released(") {
                         offenders.push(format!("{relative}:{}", number + 1));
                     }
+                    previous = code;
                 }
             }
         }

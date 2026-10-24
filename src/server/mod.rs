@@ -574,6 +574,15 @@ impl SiphonServer {
             tokio::runtime::Handle::current(),
             executor_config,
         );
+        // Whole-process liveness, which the pool watchdog above cannot judge:
+        // a wedge that parks every thread starves the pool of work too, so it
+        // looks idle. See `script::liveness`.
+        if config.script.process_stall_abort_secs > 0 {
+            crate::script::liveness::start(
+                tokio::runtime::Handle::current(),
+                std::time::Duration::from_secs(config.script.process_stall_abort_secs),
+            );
+        }
 
         dispatcher::inject_python_singletons(&config);
         // Media-engine async event channel (DTMF, media-timeout). Created before
