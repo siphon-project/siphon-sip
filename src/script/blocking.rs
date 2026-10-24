@@ -254,10 +254,7 @@ mod tests {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         // Owned by the IPsec work that makes this hook non-blocking; it moves
         // onto the helpers with that change.
-        const PENDING: &[&str] = &[
-            "src/ipsec/manager_async.rs",
-            "src/ipsec/runtime.rs",
-        ];
+        const PENDING: &[&str] = &["src/ipsec/manager_async.rs", "src/ipsec/runtime.rs"];
         // Waits that are right as written, each with the reason. Matched on
         // the file and a fragment of the line, so a new wait in the same file
         // is still caught.

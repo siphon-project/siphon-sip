@@ -2504,22 +2504,22 @@
       "answer_local": {
         "doc": "Single-leg UAS answer \u2014 synthesise an RFC 3264 answer for the caller's",
         "kind": "method_descriptor",
-        "sig": "($self, call, profile=None, auto_reject=True, ws_uri=None, beep_detection=None, beep_cadence_guard_ms=None, ws_sample_rate=None, ws_tee_sample_rate=None, ws_vad_engine=None, ws_vad_min_speech_ms=None)"
+        "sig": "($self, call, profile=None, auto_reject=True, ws_uri=None, beep_detection=None, beep_cadence_guard_ms=None, ws_sample_rate=None, ws_tee_sample_rate=None, ws_vad_engine=None, ws_vad_min_speech_ms=None, scope=None)"
       },
       "attach_ws_bridge": {
         "doc": "Attach a **WebSocket takeover bridge** to a live call, or re-point an",
         "kind": "method_descriptor",
-        "sig": "($self, target, ws_uri, profile=None)"
+        "sig": "($self, target, ws_uri, profile=None, scope=None)"
       },
       "attach_ws_tee": {
         "doc": "Attach a **WebSocket tee** to a live call \u2014 stream a copy of its decoded",
         "kind": "method_descriptor",
-        "sig": "($self, target, ws_uri, direction=\"both\", channels=None, sample_rate=None)"
+        "sig": "($self, target, ws_uri, direction=\"both\", channels=None, sample_rate=None, scope=None)"
       },
       "block_media": {
         "doc": "Send a `block media` command \u2014 drop outgoing packets on the selected",
         "kind": "method_descriptor",
-        "sig": "($self, target)"
+        "sig": "($self, target, scope=None)"
       },
       "conference_answer": {
         "doc": "Seat a participant the focus called out, on its answer to the offer",
@@ -2599,17 +2599,17 @@
       "detach_ws_bridge": {
         "doc": "Detach a call's **WebSocket takeover bridge**, putting its media path",
         "kind": "method_descriptor",
-        "sig": "($self, target)"
+        "sig": "($self, target, scope=None)"
       },
       "detach_ws_tee": {
         "doc": "Detach a call's **WebSocket tee**, closing its stream.",
         "kind": "method_descriptor",
-        "sig": "($self, target)"
+        "sig": "($self, target, scope=None)"
       },
       "echo": {
         "doc": "Enable/disable echo-test mode on a call \u2014 reflect the caller's ingress",
         "kind": "method_descriptor",
-        "sig": "($self, target, enabled=True)"
+        "sig": "($self, target, enabled=True, scope=None)"
       },
       "instance_count": {
         "doc": "Number of configured RTPEngine instances.",
@@ -2683,82 +2683,82 @@
       "play_dtmf": {
         "doc": "Send a `play DTMF` command \u2014 inject DTMF tone(s) into the call.",
         "kind": "method_descriptor",
-        "sig": "($self, target, code, duration_ms=None, volume_dbm0=None, pause_ms=None, to_tag=None)"
+        "sig": "($self, target, code, duration_ms=None, volume_dbm0=None, pause_ms=None, to_tag=None, scope=None)"
       },
       "play_media": {
         "doc": "Send a `play media` command \u2014 inject an audio prompt into the call.",
         "kind": "method_descriptor",
-        "sig": "($self, target, file=None, blob=None, db_id=None, tone=None, url=None, repeat=None, start_ms=None, duration_ms=None, gain_decibels=None, to_tag=None, wait=True)"
+        "sig": "($self, target, file=None, blob=None, db_id=None, tone=None, url=None, repeat=None, start_ms=None, duration_ms=None, gain_decibels=None, to_tag=None, wait=True, scope=None)"
       },
       "play_overlay": {
         "doc": "Start an **overlay** playback \u2014 mix audio *under* the party's live egress",
         "kind": "method_descriptor",
-        "sig": "($self, target, file=None, blob=None, db_id=None, tone=None, url=None, repeat=None, start_ms=None, duration_ms=None, gain_decibels=None, to_tag=None)"
+        "sig": "($self, target, file=None, blob=None, db_id=None, tone=None, url=None, repeat=None, start_ms=None, duration_ms=None, gain_decibels=None, to_tag=None, scope=None)"
       },
       "read_digits": {
         "doc": "Collect the digits the caller keys (RFC 4733 telephone-events, as the",
         "kind": "method_descriptor",
-        "sig": "($self, target, terminators=..., max_digits=None, timeout_ms=5000, inter_digit_timeout_ms=3000)"
+        "sig": "($self, target, terminators=..., max_digits=None, timeout_ms=5000, inter_digit_timeout_ms=3000, scope=None)"
       },
       "record": {
         "doc": "Record what the caller says and wait until the file is closed: a dict",
         "kind": "method_descriptor",
-        "sig": "($self, target, path=None, direction=\"ingress\", channels=\"mono\", max_duration_ms=None, silence_ms=None, timeout_ms=None)"
+        "sig": "($self, target, path=None, direction=\"ingress\", channels=\"mono\", max_duration_ms=None, silence_ms=None, timeout_ms=None, scope=None)"
       },
       "set_play_gain": {
         "doc": "Retune the playout gain of a playback that is already running \u2014 how a",
         "kind": "method_descriptor",
-        "sig": "($self, target, play_id, gain_decibels, to_tag=None)"
+        "sig": "($self, target, play_id, gain_decibels, to_tag=None, scope=None)"
       },
       "silence_media": {
         "doc": "Send a `silence media` command \u2014 replace outgoing audio on the selected",
         "kind": "method_descriptor",
-        "sig": "($self, target)"
+        "sig": "($self, target, scope=None)"
       },
       "start_recording": {
         "doc": "Start recording what the caller says to a file, returning the engine's",
         "kind": "method_descriptor",
-        "sig": "($self, target, path=None, direction=\"ingress\", channels=\"mono\", max_duration_ms=None, silence_ms=None)"
+        "sig": "($self, target, path=None, direction=\"ingress\", channels=\"mono\", max_duration_ms=None, silence_ms=None, scope=None)"
       },
       "stop_media": {
         "doc": "Send a `stop media` command \u2014 stop prompt playback on the monologue",
         "kind": "method_descriptor",
-        "sig": "($self, target, play_id=None)"
+        "sig": "($self, target, play_id=None, scope=None)"
       },
       "stop_recording": {
         "doc": "Stop a recording: the one ``recording_id`` names, or every recording on",
         "kind": "method_descriptor",
-        "sig": "($self, target, recording_id=None)"
+        "sig": "($self, target, recording_id=None, scope=None)"
       },
       "subscribe_answer": {
         "doc": "Send a `subscribe answer` \u2014 complete the SDP negotiation for a",
         "kind": "method_descriptor",
-        "sig": "($self, call_id, from_tag, to_tag, sdp, profile=None)"
+        "sig": "($self, call_id, from_tag, to_tag, sdp, profile=None, scope=None)"
       },
       "subscribe_request": {
         "doc": "Send a `subscribe request` \u2014 create a new subscription to an existing",
         "kind": "method_descriptor",
-        "sig": "($self, call_id, from_tag, to_tag, sdp=None, profile=None)"
+        "sig": "($self, call_id, from_tag, to_tag, sdp=None, profile=None, scope=None)"
       },
       "unblock_media": {
         "doc": "Send an `unblock media` command \u2014 resume forwarding the selected",
         "kind": "method_descriptor",
-        "sig": "($self, target)"
+        "sig": "($self, target, scope=None)"
       },
       "unsilence_media": {
         "doc": "Send an `unsilence media` command \u2014 pass the original stream through",
         "kind": "method_descriptor",
-        "sig": "($self, target)"
+        "sig": "($self, target, scope=None)"
       },
       "unsubscribe": {
         "doc": "Send an `unsubscribe` command \u2014 tear down a subscription created via",
         "kind": "method_descriptor",
-        "sig": "($self, call_id, from_tag, to_tag)"
+        "sig": "($self, call_id, from_tag, to_tag, scope=None)"
       },
       "wait_recording": {
         "doc": "Wait until a recording :meth:`start_recording` started has ended and",
         "kind": "method_descriptor",
-        "sig": "($self, target, recording_id, timeout_ms=3600000)"
+        "sig": "($self, target, recording_id, timeout_ms=3600000, scope=None)"
       }
     },
     "SAHandle": {

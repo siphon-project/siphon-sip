@@ -205,6 +205,17 @@ pub struct ActiveIntercept {
     pub from_tag: String,
     /// The session correlation, shared with this session's X2 records.
     pub correlation_id: u64,
+    /// The per-call media scope of the leg the content is taken from
+    /// (`rtpengine.offer(..., scope=)`), `None` for the call's own media.
+    ///
+    /// A proxy that anchors both legs of one call has two engine calls under
+    /// one Call-ID, and an intercepted call taps every one of them, so content
+    /// is never lost to the leg the warrant did not happen to be attached to.
+    /// Every leg's delivery carries the session's one `correlation_id` (TS 103
+    /// 221-2 clause 6 wants one across a session's X2 and X3 records); the
+    /// scope is what tells the legs' deliveries, their loss reports and their
+    /// teardown apart.
+    pub scope: Option<crate::rtpengine::CallScope>,
 }
 
 /// The lawful-intercept subsystem.
@@ -467,6 +478,39 @@ impl LiManager {
             .get(call_id)
             .map(|entry| entry.clone())
             .unwrap_or_default()
+    }
+
+    /// The live interceptions on one leg of a call: its own media (`None`)
+    /// or the leg anchored under a per-call `scope`.
+    pub fn x3_attachments_for_leg(
+        &self,
+        call_id: &str,
+        scope: Option<&crate::rtpengine::CallScope>,
+    ) -> Vec<ActiveIntercept> {
+        self.x3_attachments_for(call_id)
+            .into_iter()
+            .filter(|attachment| attachment.scope.as_ref() == scope)
+            .collect()
+    }
+
+    /// Drop and return one leg's interceptions, when that leg's delivery
+    /// ended; the call's other legs keep theirs.
+    pub fn take_x3_attachments_for_leg(
+        &self,
+        call_id: &str,
+        scope: Option<&crate::rtpengine::CallScope>,
+    ) -> Vec<ActiveIntercept> {
+        let mut taken = Vec::new();
+        if let Some(mut attachments) = self.x3_attachments.get_mut(call_id) {
+            let (leg, others): (Vec<_>, Vec<_>) = std::mem::take(&mut *attachments)
+                .into_iter()
+                .partition(|attachment| attachment.scope.as_ref() == scope);
+            *attachments = others;
+            taken = leg;
+        }
+        self.x3_attachments
+            .remove_if(call_id, |_, attachments| attachments.is_empty());
+        taken
     }
 
     /// Drop and return a call's interceptions, at teardown.

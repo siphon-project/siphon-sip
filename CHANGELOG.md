@@ -20,6 +20,9 @@ entry, but a working config keeps working.
   verification.
 ### Fixed
 
+- **`rtpengine.record` and `rtpengine.wait_recording` no longer attach the
+  interpreter on a tokio worker.** The finished recording's dict is built in
+  the completion step, the way `conference_wait_recording` already did.
 - **Blocking waits made while attached to the interpreter could deadlock a
   free-threaded process under GC.** On free-threaded Python a thread attached
   to the interpreter that parks in a Rust wait never reaches a garbage
@@ -200,6 +203,42 @@ entry, but a working config keeps working.
   port bound on a wildcard address, or no concrete `listen.udp` entry on
   `pcscf_port_s`. A single port behaves exactly as in 1.15.3, sharing the
   outbound policy of SA #3 between the sets.
+- **`ScriptHandle::call_handler_with`** for extensions: builds the handler's
+  arguments and reads its outcome inside the script executor's jobs, so a
+  per-event dispatch on a tokio worker never attaches.
+  `HandlerHandle::options_value` reads the handler's options as JSON without
+  the interpreter, and taking a `HandlerHandle` no longer attaches.
+  `call_handler` still works and is superseded.
+- **`siphon::script::blocking::{released, blocking_released, block_on_released,
+  detach_block_on}` are public**, for extension crates that block on Rust from
+  a thread that may be attached to the interpreter, and so are
+  `siphon::script::blocking::awaitable`, `siphon::script::Deferred` (build a
+  future's Python result in the completion step, off the tokio workers) and
+  `siphon::script::inline_dispatch::run_coroutine_inline`.
+- **Per-call media scope on every media verb and event.** `scope=` now also
+  goes on `play_media`, `play_overlay`, `stop_media`, `set_play_gain`,
+  `play_dtmf`, `silence_media` / `unsilence_media`, `block_media` /
+  `unblock_media`, `echo`, `start_recording`, `record`, `wait_recording`,
+  `stop_recording`, `read_digits`, `subscribe_request` / `subscribe_answer` /
+  `unsubscribe`, `attach_ws_tee` / `detach_ws_tee`, `attach_ws_bridge` /
+  `detach_ws_bridge` and `answer_local`, and the verb addresses that leg's
+  engine call. Left out, a verb goes to the node's call as before, unless the
+  call has no session of its own and exactly one scoped leg: then that leg. With
+  two scoped legs and no `scope=`, the node's call (name the leg). Media events
+  of a scoped leg now reach scripts the same way on every backend: under the
+  SIP Call-ID (rtpengine used to report `<call-id>;<scope>`), with the scope as
+  a `scope=` keyword for a handler that takes one (`def on_dtmf(...,
+  scope=None)`); a handler without it is called as before. A digit read on a
+  scoped leg takes only that leg's digits.
+- **Lawful intercept taps every scoped leg.** When a proxy anchors both legs of
+  an intercepted call under per-call scopes, X3 content delivery is attached on
+  each leg's engine call, so no content goes undelivered because the warrant
+  was attached to one leg only. Every leg's delivery carries the session's one
+  Correlation ID (TS 103 221-2 clause 6), and siphon records the leg's scope
+  with it: delivery-loss and end reports to the ADMF name the leg, and one
+  leg's delivery ending leaves the other's record in place. The cost is that
+  the mediation function receives one delivery per tapped leg of the same
+  conversation.
 ### Added
 
 - **Multi-UE IMS registration over TCP.** A registrant entry with its own

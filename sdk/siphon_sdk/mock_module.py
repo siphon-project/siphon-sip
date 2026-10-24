@@ -15,6 +15,7 @@ import asyncio
 import hashlib
 import ipaddress
 import math
+import inspect
 import re
 import sys
 import time
@@ -4526,6 +4527,23 @@ def _media_scope(scope: Optional[str], targets: tuple[Any, ...], verb: str) -> O
     return scope
 
 
+def _call_media_handler(fn: Any, arguments: tuple, scope: Optional[str]) -> Any:
+    """Call a media event handler the way the runtime does.
+
+    A leg anchored under a per-call scope reports its events under the SIP
+    Call-ID; ``scope=`` is added only for such a leg and only to a handler that
+    accepts it (named, or through ``**kwargs``), so a handler written without
+    it is called exactly as before.
+    """
+    if scope is not None:
+        try:
+            inspect.signature(fn).bind(*arguments, scope=scope)
+        except (TypeError, ValueError):
+            return fn(*arguments)
+        return fn(*arguments, scope=scope)
+    return fn(*arguments)
+
+
 def _media_overrides(
     beep_detection: Optional[bool],
     beep_cadence_guard_ms: Optional[int],
@@ -4723,9 +4741,12 @@ class MockRtpEngine:
         self._conference_join_no_codec: bool = False
         self._active_speaker_handlers: list[dict[str, Any]] = []
         self.media_scopes: list[tuple[str, Optional[str]]] = []
-        """``(operation, scope)`` per offer/answer/delete/delete_call: the per-call scope
-        the script named, ``None`` for the node's own."""
+        """``(operation, scope)`` per media verb (offer, answer, delete, delete_call,
+        and every verb that addresses a call's media): the per-call scope the verb
+        addressed, ``None`` for the node's own. For a verb that names no scope it
+        is the scope the runtime resolves (the call's one scoped leg)."""
         self._scoped_profiles: dict[str, str] = {}
+        self._anchored_legs: dict[str, set[Optional[str]]] = {}
         self.media_overrides: list[tuple[str, dict[str, Any]]] = []
         """``(operation, overrides)`` per offer/answer/answer_local.
 
@@ -4784,6 +4805,32 @@ class MockRtpEngine:
                 )
             expanded = expanded.replace("{" + name + "}", str(values[name]))
         return expanded
+
+    def _forget_legs(self, call_id: Optional[str], scope: Optional[str]) -> None:
+        """A delete ends the leg ``scope`` names, or without one every leg."""
+        legs = self._anchored_legs.get(call_id or "")
+        if legs is None:
+            return
+        if scope is None:
+            legs.clear()
+        else:
+            legs.discard(scope)
+        if not legs:
+            self._anchored_legs.pop(call_id or "", None)
+
+    def _leg_scope(self, scope: Optional[str], target: Any, call_id: Optional[str],
+                   verb: str) -> Optional[str]:
+        """The per-call scope a media verb addresses, recorded in
+        :attr:`media_scopes`: ``scope`` (validated as the runtime does), or
+        without one the call's one scoped leg when it has no unscoped session,
+        else ``None`` (the node's call)."""
+        scope = _media_scope(scope, (target,) if target is not None else (), verb)
+        if scope is None:
+            legs = self._anchored_legs.get(call_id or "", set())
+            if len(legs) == 1 and None not in legs:
+                scope = next(iter(legs))
+        self.media_scopes.append((verb, scope))
+        return scope
 
     def _resolve_ws_uri(self, ws_uri: Optional[str], target: Any) -> Optional[str]:
         """Resolve the bridge URI for a call: explicit argument, else the one
@@ -4925,6 +4972,9 @@ class MockRtpEngine:
         resolved_profile = profile or "rtp_passthrough"
         self.operations.append(("offer", resolved_profile))
         self.media_scopes.append(("offer", scope))
+        offered_call_id, _ = _resolve_media_target(request)
+        if offered_call_id:
+            self._anchored_legs.setdefault(offered_call_id, set()).add(scope)
         if scope is not None:
             self._scoped_profiles[scope] = resolved_profile
         self.ws_uris.append(("offer", self._resolve_ws_uri(ws_uri, request)))
@@ -5118,6 +5168,7 @@ class MockRtpEngine:
         ws_tee_sample_rate: Optional[int] = None,
         ws_vad_engine: Optional[str] = None,
         ws_vad_min_speech_ms: Optional[int] = None,
+        scope: Optional[str] = None,
     ) -> Optional[str]:
         """Single-leg UAS answer — synthesise an RFC 3264 answer for the
         caller's **own** offer, with the media engine as the far side (IVR /
@@ -5157,6 +5208,9 @@ class MockRtpEngine:
                     answer takes, since the WS server *is* the far side.
                     Overrides the profile's own ``ws_uri``; supports the same
                     placeholders as :meth:`offer`.
+            scope: Answer this leg as an engine call of its own, as
+                   :meth:`offer` anchors one; pass it to the leg's later
+                   verbs. ``ValueError`` on a B2BUA ``Call``.
 
         Returns:
             The answer SDP as ``str`` on success, or ``None`` when the offer had
@@ -5171,6 +5225,10 @@ class MockRtpEngine:
                     call.answer(200, "OK", body=sdp, content_type="application/sdp")
                     await rtpengine.play_media(call, file="/prompts/welcome.wav")
         """
+        scope = _media_scope(scope, (call,), "answer_local")
+        self.media_scopes.append(("answer_local", scope))
+        if profile is None and scope is not None:
+            profile = self._scoped_profiles.get(scope)
         if profile is None:
             # Mirror real behavior: recover from the last recorded offer.
             for op, recorded in reversed(self.operations):
@@ -5200,6 +5258,9 @@ class MockRtpEngine:
             raise ValueError("no encodable codec in offer")
 
         self.operations.append(("answer_local", profile))
+        answered_call_id, _ = _resolve_media_target(call)
+        if answered_call_id:
+            self._anchored_legs.setdefault(answered_call_id, set()).add(scope)
         self.ws_uris.append(("answer_local", resolved_ws_uri))
         self.media_overrides.append(("answer_local", _media_overrides(
             beep_detection, beep_cadence_guard_ms, ws_sample_rate,
@@ -5240,6 +5301,7 @@ class MockRtpEngine:
         scope = _media_scope(scope, (request,), "delete")
         self.media_scopes.append(("delete", scope))
         call_id, _ = _resolve_media_target(request)
+        self._forget_legs(call_id, scope)
         seated = self.conference_seat(call_id) if call_id else None
         if seated is not None:
             self._leave_seat(*seated)
@@ -5288,6 +5350,7 @@ class MockRtpEngine:
             raise ValueError("call_id is empty")
         scope = _media_scope(scope, (), "delete_call")
         self.media_scopes.append(("delete_call", scope))
+        self._forget_legs(call_id, scope)
         seated = self.conference_seat(call_id)
         if seated is not None:
             self._leave_seat(*seated)
@@ -5320,6 +5383,7 @@ class MockRtpEngine:
         gain_decibels: Optional[int] = None,
         to_tag: Optional[str] = None,
         wait: bool = True,
+        scope: Optional[str] = None,
     ) -> Optional[int]:
         """Inject an audio prompt toward a party, replacing what it receives.
 
@@ -5372,6 +5436,12 @@ class MockRtpEngine:
                 the engine accepts the prompt (fire-and-forget). In this mock the
                 call always returns immediately (the completion event is a runtime
                 behavior); ``wait`` is recorded for assertions.
+            scope: The per-call scope the leg was offered under
+                (``offer(..., scope=)``), for a proxy anchoring two legs of
+                one Call-ID. Omitted: the node's call, or the call's one
+                scoped leg when only one is anchored and the call has no
+                session of its own. ``ValueError`` when invalid, or on a
+                B2BUA ``Call``.
 
         Returns:
             Prompt duration in ms if rtpengine reports one (mock returns
@@ -5389,6 +5459,7 @@ class MockRtpEngine:
         source = _resolve_play_source(file, blob, db_id, tone, url)
         repeat = _resolve_play_repeat(repeat, wait)
         call_id, resolved_from_tag = _resolve_media_target(target)
+        scope = self._leg_scope(scope, target, call_id, "play_media")
         self.operations.append(("play_media", source))
         self.media_calls.append({
             "op": "play_media",
@@ -5422,6 +5493,7 @@ class MockRtpEngine:
         duration_ms: Optional[int] = None,
         gain_decibels: Optional[int] = None,
         to_tag: Optional[str] = None,
+        scope: Optional[str] = None,
     ) -> Optional[int]:
         """Start an **overlay** playback and return its ``play_id`` handle.
 
@@ -5455,6 +5527,12 @@ class MockRtpEngine:
                 on an endless (``*inf``) tone.
             gain_decibels: Playout gain relative to the source's own level.
             to_tag: Optional peer tag for MPTY scoping.
+            scope: The per-call scope the leg was offered under
+                (``offer(..., scope=)``), for a proxy anchoring two legs of
+                one Call-ID. Omitted: the node's call, or the call's one
+                scoped leg when only one is anchored and the call has no
+                session of its own. ``ValueError`` when invalid, or on a
+                B2BUA ``Call``.
 
         Returns:
             The ``play_id`` of the started overlay (mock returns the value set
@@ -5471,6 +5549,7 @@ class MockRtpEngine:
         source = _resolve_play_source(file, blob, db_id, tone, url)
         repeat = _resolve_play_repeat(repeat)
         call_id, resolved_from_tag = _resolve_media_target(target)
+        scope = self._leg_scope(scope, target, call_id, "play_overlay")
         self.operations.append(("play_overlay", source))
         self.media_calls.append({
             "op": "play_overlay",
@@ -5493,7 +5572,7 @@ class MockRtpEngine:
     async def start_recording(self, target: Any, path: Optional[str] = None,
                               direction: str = "ingress", channels: str = "mono",
                               max_duration_ms: Optional[int] = None,
-                              silence_ms: Optional[int] = None) -> str:
+                              silence_ms: Optional[int] = None, scope: Optional[str] = None) -> str:
         """Start recording what the caller says to a 16-bit PCM WAV file.
 
         Returns on the engine's accept with the ``recording_id``; the recording
@@ -5505,6 +5584,11 @@ class MockRtpEngine:
 
         In the mock the id is ``"rec-<n>"`` and the recording is pending until
         the test calls :meth:`finish_recording`.
+
+        ``scope``: the per-call scope the leg was offered under
+        (``offer(..., scope=)``); omitted, the call's one scoped leg when
+        only one is anchored, else the node's call. ``ValueError`` when
+        invalid, or on a B2BUA ``Call``.
         """
         if direction not in ("ingress", "egress", "both"):
             raise ValueError(f"direction {direction!r} is ingress, egress or both")
@@ -5513,6 +5597,7 @@ class MockRtpEngine:
         call_id, from_tag = _resolve_media_target(target)
         self._recording_serial = getattr(self, "_recording_serial", 0) + 1
         recording_id = f"rec-{self._recording_serial}"
+        scope = self._leg_scope(scope, target, call_id, "start_recording")
         self.operations.append(("start_recording", recording_id))
         self.media_calls.append({
             "op": "start_recording", "call_id": call_id, "from_tag": from_tag,
@@ -5533,21 +5618,28 @@ class MockRtpEngine:
         self.finished_recordings = finished
 
     async def wait_recording(self, target: Any, recording_id: str,
-                             timeout_ms: int = 3_600_000) -> Optional[dict]:
+                             timeout_ms: int = 3_600_000, scope: Optional[str] = None) -> Optional[dict]:
         """Wait until a recording ended and its file is closed.
 
         Returns ``{"recording_id", "path", "duration_ms", "reason"}`` (reason
         ``"stopped"``, ``"max_duration"``, ``"silence"``, ``"call_ended"`` or
         ``"error"``), or ``None`` when no end was reported in ``timeout_ms``.
         In the mock: what :meth:`finish_recording` set, else ``None``.
+
+        ``scope``: the per-call scope the leg was offered under
+        (``offer(..., scope=)``); omitted, the call's one scoped leg when
+        only one is anchored, else the node's call. ``ValueError`` when
+        invalid, or on a B2BUA ``Call``.
         """
+        call_id, _ = _resolve_media_target(target)
+        scope = self._leg_scope(scope, target, call_id, "wait_recording")
         return getattr(self, "finished_recordings", {}).get(recording_id)
 
     async def record(self, target: Any, path: Optional[str] = None,
                      direction: str = "ingress", channels: str = "mono",
                      max_duration_ms: Optional[int] = None,
                      silence_ms: Optional[int] = None,
-                     timeout_ms: Optional[int] = None) -> Optional[dict]:
+                     timeout_ms: Optional[int] = None, scope: Optional[str] = None) -> Optional[dict]:
         """Record and wait for the closed file: :meth:`start_recording` then
         :meth:`wait_recording`.
 
@@ -5556,16 +5648,28 @@ class MockRtpEngine:
             message = await rtpengine.record(call, path="/spool/m1.wav",
                                              max_duration_ms=120000,
                                              silence_ms=5000)
+
+        ``scope``: the per-call scope the leg was offered under
+        (``offer(..., scope=)``); omitted, the call's one scoped leg when
+        only one is anchored, else the node's call. ``ValueError`` when
+        invalid, or on a B2BUA ``Call``.
         """
         recording_id = await self.start_recording(
             target, path=path, direction=direction, channels=channels,
-            max_duration_ms=max_duration_ms, silence_ms=silence_ms)
-        return await self.wait_recording(target, recording_id)
+            max_duration_ms=max_duration_ms, silence_ms=silence_ms, scope=scope)
+        return await self.wait_recording(target, recording_id, scope=scope)
 
     async def stop_recording(self, target: Any,
-                             recording_id: Optional[str] = None) -> bool:
-        """Stop one recording, or every recording on the call."""
+                             recording_id: Optional[str] = None, scope: Optional[str] = None) -> bool:
+        """Stop one recording, or every recording on the call.
+
+        ``scope``: the per-call scope the leg was offered under
+        (``offer(..., scope=)``); omitted, the call's one scoped leg when
+        only one is anchored, else the node's call. ``ValueError`` when
+        invalid, or on a B2BUA ``Call``.
+        """
         call_id, from_tag = _resolve_media_target(target)
+        scope = self._leg_scope(scope, target, call_id, "stop_recording")
         self.operations.append(("stop_recording", recording_id))
         self.media_calls.append({
             "op": "stop_recording", "call_id": call_id, "from_tag": from_tag,
@@ -5583,7 +5687,7 @@ class MockRtpEngine:
     async def read_digits(self, target: Any, terminators: str = "#",
                           max_digits: Optional[int] = None,
                           timeout_ms: int = 5000,
-                          inter_digit_timeout_ms: int = 3000) -> tuple:
+                          inter_digit_timeout_ms: int = 3000, scope: Optional[str] = None) -> tuple:
         """Collect the digits the caller keys (RFC 4733) until a terminator
         (not included), ``max_digits``, ``timeout_ms`` with nothing keyed or
         ``inter_digit_timeout_ms`` after the last digit.
@@ -5593,10 +5697,16 @@ class MockRtpEngine:
         ``"interrupted"``. Digits a read takes are not also
         ``@rtpengine.on_dtmf`` events. In the mock the digits come from
         :meth:`key_digits`.
+
+        ``scope``: the per-call scope the leg was offered under
+        (``offer(..., scope=)``); omitted, the call's one scoped leg when
+        only one is anchored, else the node's call. ``ValueError`` when
+        invalid, or on a B2BUA ``Call``.
         """
         if max_digits == 0:
             raise ValueError("max_digits is at least 1 when given")
         call_id, _ = _resolve_media_target(target)
+        scope = self._leg_scope(scope, target, call_id, "read_digits")
         queue = getattr(self, "keyed_digits", {}).get(call_id, [])
         digits = ""
         while queue:
@@ -5608,7 +5718,7 @@ class MockRtpEngine:
                 return digits, "max_digits"
         return digits, "inter_digit_timeout" if digits else "timeout"
 
-    async def stop_media(self, target: Any, play_id: Optional[int] = None) -> bool:
+    async def stop_media(self, target: Any, play_id: Optional[int] = None, scope: Optional[str] = None) -> bool:
         """Stop prompt playback on the selected monologue.
 
         Args:
@@ -5619,11 +5729,18 @@ class MockRtpEngine:
                 other backends have no handle on an individual playback and
                 raise rather than widening this into "stop everything", which
                 would kill playbacks the script meant to keep running.
+            scope: The per-call scope the leg was offered under
+                (``offer(..., scope=)``), for a proxy anchoring two legs of
+                one Call-ID. Omitted: the node's call, or the call's one
+                scoped leg when only one is anchored and the call has no
+                session of its own. ``ValueError`` when invalid, or on a
+                B2BUA ``Call``.
 
         Returns:
             ``True`` on success.
         """
         call_id, from_tag = _resolve_media_target(target)
+        scope = self._leg_scope(scope, target, call_id, "stop_media")
         self.operations.append(("stop_media", play_id))
         self.media_calls.append({
             "op": "stop_media",
@@ -5639,6 +5756,7 @@ class MockRtpEngine:
         play_id: int,
         gain_decibels: int,
         to_tag: Optional[str] = None,
+        scope: Optional[str] = None,
     ) -> bool:
         """Retune the playout gain of a playback that is already running.
 
@@ -5658,11 +5776,18 @@ class MockRtpEngine:
             gain_decibels: New gain in whole decibels, clamped engine-side to
                 -60..=+12.
             to_tag: Optional peer tag for MPTY scoping.
+            scope: The per-call scope the leg was offered under
+                (``offer(..., scope=)``), for a proxy anchoring two legs of
+                one Call-ID. Omitted: the node's call, or the call's one
+                scoped leg when only one is anchored and the call has no
+                session of its own. ``ValueError`` when invalid, or on a
+                B2BUA ``Call``.
 
         Returns:
             ``True`` on success.
         """
         call_id, from_tag = _resolve_media_target(target)
+        scope = self._leg_scope(scope, target, call_id, "set_play_gain")
         self.operations.append(("set_play_gain", play_id))
         self.media_calls.append({
             "op": "set_play_gain",
@@ -6280,6 +6405,7 @@ class MockRtpEngine:
         volume_dbm0: Optional[int] = None,
         pause_ms: Optional[int] = None,
         to_tag: Optional[str] = None,
+        scope: Optional[str] = None,
     ) -> bool:
         """Inject DTMF tone(s) into the call.
 
@@ -6291,12 +6417,19 @@ class MockRtpEngine:
             volume_dbm0: Tone volume in dBm0 (typically ``-8``).
             pause_ms: Inter-tone gap when ``code`` is a sequence.
             to_tag: Optional peer tag for MPTY scoping.
+            scope: The per-call scope the leg was offered under
+                (``offer(..., scope=)``), for a proxy anchoring two legs of
+                one Call-ID. Omitted: the node's call, or the call's one
+                scoped leg when only one is anchored and the call has no
+                session of its own. ``ValueError`` when invalid, or on a
+                B2BUA ``Call``.
 
         Example::
 
             await rtpengine.play_dtmf(call, "123#", duration_ms=100)
         """
         call_id, resolved_from_tag = _resolve_media_target(target)
+        scope = self._leg_scope(scope, target, call_id, "play_dtmf")
         self.operations.append(("play_dtmf", code))
         self.media_calls.append({
             "op": "play_dtmf",
@@ -6310,48 +6443,80 @@ class MockRtpEngine:
         })
         return True
 
-    async def silence_media(self, target: Any) -> bool:
+    async def silence_media(self, target: Any, scope: Optional[str] = None) -> bool:
         """Replace outgoing audio on the selected monologue with silence.
 
         Pair with :meth:`unsilence_media` to restore the original stream.
+
+        ``scope``: the per-call scope the leg was offered under
+        (``offer(..., scope=)``); omitted, the call's one scoped leg when
+        only one is anchored, else the node's call. ``ValueError`` when
+        invalid, or on a B2BUA ``Call``.
         """
         call_id, from_tag = _resolve_media_target(target)
+        scope = self._leg_scope(scope, target, call_id, "silence_media")
         self.operations.append(("silence_media", None))
         self.media_calls.append({"op": "silence_media", "call_id": call_id, "from_tag": from_tag})
         return True
 
-    async def unsilence_media(self, target: Any) -> bool:
-        """Stop replacing outgoing audio with silence (undo :meth:`silence_media`)."""
+    async def unsilence_media(self, target: Any, scope: Optional[str] = None) -> bool:
+        """Stop replacing outgoing audio with silence (undo :meth:`silence_media`).
+
+        ``scope``: the per-call scope the leg was offered under
+        (``offer(..., scope=)``); omitted, the call's one scoped leg when
+        only one is anchored, else the node's call. ``ValueError`` when
+        invalid, or on a B2BUA ``Call``.
+        """
         call_id, from_tag = _resolve_media_target(target)
+        scope = self._leg_scope(scope, target, call_id, "unsilence_media")
         self.operations.append(("unsilence_media", None))
         self.media_calls.append({"op": "unsilence_media", "call_id": call_id, "from_tag": from_tag})
         return True
 
-    async def block_media(self, target: Any) -> bool:
+    async def block_media(self, target: Any, scope: Optional[str] = None) -> bool:
         """Drop outgoing packets on the selected monologue entirely.
 
         Pair with :meth:`unblock_media` to resume.
+
+        ``scope``: the per-call scope the leg was offered under
+        (``offer(..., scope=)``); omitted, the call's one scoped leg when
+        only one is anchored, else the node's call. ``ValueError`` when
+        invalid, or on a B2BUA ``Call``.
         """
         call_id, from_tag = _resolve_media_target(target)
+        scope = self._leg_scope(scope, target, call_id, "block_media")
         self.operations.append(("block_media", None))
         self.media_calls.append({"op": "block_media", "call_id": call_id, "from_tag": from_tag})
         return True
 
-    async def unblock_media(self, target: Any) -> bool:
-        """Resume forwarding the selected monologue's packets."""
+    async def unblock_media(self, target: Any, scope: Optional[str] = None) -> bool:
+        """Resume forwarding the selected monologue's packets.
+
+        ``scope``: the per-call scope the leg was offered under
+        (``offer(..., scope=)``); omitted, the call's one scoped leg when
+        only one is anchored, else the node's call. ``ValueError`` when
+        invalid, or on a B2BUA ``Call``.
+        """
         call_id, from_tag = _resolve_media_target(target)
+        scope = self._leg_scope(scope, target, call_id, "unblock_media")
         self.operations.append(("unblock_media", None))
         self.media_calls.append({"op": "unblock_media", "call_id": call_id, "from_tag": from_tag})
         return True
 
-    async def echo(self, target: Any, enabled: bool = True) -> bool:
+    async def echo(self, target: Any, enabled: bool = True, scope: Optional[str] = None) -> bool:
         """Toggle echo-test mode on a call — reflect the caller's ingress audio
         back to itself (single-leg IVR echo).
 
         ``enabled=False`` stops echoing. Native ``siphon-rtp`` backend only;
         DTMF and media-timeout events still fire while echoing.
+
+        ``scope``: the per-call scope the leg was offered under
+        (``offer(..., scope=)``); omitted, the call's one scoped leg when
+        only one is anchored, else the node's call. ``ValueError`` when
+        invalid, or on a B2BUA ``Call``.
         """
         call_id, from_tag = _resolve_media_target(target)
+        scope = self._leg_scope(scope, target, call_id, "echo")
         self.operations.append(("echo", enabled))
         self.media_calls.append({
             "op": "echo",
@@ -6368,6 +6533,7 @@ class MockRtpEngine:
         to_tag: str,
         sdp: Optional[bytes] = None,
         profile: Optional[str] = None,
+        scope: Optional[str] = None,
     ) -> bytes:
         """Create a new subscription to an existing call's media (MPTY / MRF
         conference focus).
@@ -6378,10 +6544,17 @@ class MockRtpEngine:
             to_tag: subscriber tag to create.
             sdp: Optional inbound SDP for the subscriber.
             profile: RTP profile name (defaults to ``"rtp_passthrough"``).
+            scope: The per-call scope the leg was offered under
+                (``offer(..., scope=)``), for a proxy anchoring two legs of
+                one Call-ID. Omitted: the node's call, or the call's one
+                scoped leg when only one is anchored and the call has no
+                session of its own. ``ValueError`` when invalid, or on a
+                B2BUA ``Call``.
 
         Returns:
             The subscriber SDP as ``bytes``.
         """
+        scope = self._leg_scope(scope, None, call_id, "subscribe_request")
         self.operations.append(("subscribe_request", to_tag))
         self.media_calls.append({
             "op": "subscribe_request",
@@ -6400,13 +6573,20 @@ class MockRtpEngine:
         to_tag: str,
         sdp: bytes,
         profile: Optional[str] = None,
+        scope: Optional[str] = None,
     ) -> bytes:
         """Complete the SDP negotiation for a subscription created via
         :meth:`subscribe_request`.
 
         Returns:
             The rewritten SDP as ``bytes`` (may be empty).
+
+        ``scope``: the per-call scope the leg was offered under
+        (``offer(..., scope=)``); omitted, the call's one scoped leg when
+        only one is anchored, else the node's call. ``ValueError`` when
+        invalid, or on a B2BUA ``Call``.
         """
+        scope = self._leg_scope(scope, None, call_id, "subscribe_answer")
         self.operations.append(("subscribe_answer", to_tag))
         self.media_calls.append({
             "op": "subscribe_answer",
@@ -6423,8 +6603,16 @@ class MockRtpEngine:
         call_id: str,
         from_tag: str,
         to_tag: str,
+        scope: Optional[str] = None,
     ) -> bool:
-        """Tear down a subscription created via :meth:`subscribe_request`."""
+        """Tear down a subscription created via :meth:`subscribe_request`.
+
+        ``scope``: the per-call scope the leg was offered under
+        (``offer(..., scope=)``); omitted, the call's one scoped leg when
+        only one is anchored, else the node's call. ``ValueError`` when
+        invalid, or on a B2BUA ``Call``.
+        """
+        scope = self._leg_scope(scope, None, call_id, "unsubscribe")
         self.operations.append(("unsubscribe", to_tag))
         self.media_calls.append({
             "op": "unsubscribe",
@@ -6441,6 +6629,7 @@ class MockRtpEngine:
         direction: str = "both",
         channels: Optional[int] = None,
         sample_rate: Optional[int] = None,
+        scope: Optional[str] = None,
     ) -> bool:
         """Attach a **WebSocket tee** to a live call — stream a copy of its
         decoded audio to a WebSocket media server while the call keeps relaying.
@@ -6482,6 +6671,12 @@ class MockRtpEngine:
                 be a multiple of 1000 within 8000-48000; the engine *fails* the
                 attach on anything else rather than clamping, so it is checked
                 here first. ``None`` (default) leaves the engine's choice.
+            scope: The per-call scope the leg was offered under
+                (``offer(..., scope=)``), for a proxy anchoring two legs of
+                one Call-ID. Omitted: the node's call, or the call's one
+                scoped leg when only one is anchored and the call has no
+                session of its own. ``ValueError`` when invalid, or on a
+                B2BUA ``Call``.
 
         Returns:
             ``True`` on success.
@@ -6509,6 +6704,7 @@ class MockRtpEngine:
             _validate_ws_sample_rate("attach_ws_tee sample_rate", sample_rate)
         ws_uri = self._expand_ws_uri(ws_uri, target)
         call_id, from_tag = _resolve_media_target(target)
+        scope = self._leg_scope(scope, target, call_id, "attach_ws_tee")
         self.operations.append(("attach_ws_tee", ws_uri))
         self.media_calls.append({
             "op": "attach_ws_tee",
@@ -6521,7 +6717,7 @@ class MockRtpEngine:
         })
         return True
 
-    async def detach_ws_tee(self, target: Any) -> bool:
+    async def detach_ws_tee(self, target: Any, scope: Optional[str] = None) -> bool:
         """Detach a call's **WebSocket tee**, closing its stream.
 
         Idempotent — detaching a call with no tee is not an error. A tee is
@@ -6532,6 +6728,12 @@ class MockRtpEngine:
 
         Args:
             target: Request, Reply, or Call object.
+            scope: The per-call scope the leg was offered under
+                (``offer(..., scope=)``), for a proxy anchoring two legs of
+                one Call-ID. Omitted: the node's call, or the call's one
+                scoped leg when only one is anchored and the call has no
+                session of its own. ``ValueError`` when invalid, or on a
+                B2BUA ``Call``.
 
         Returns:
             ``True`` on success.
@@ -6541,6 +6743,7 @@ class MockRtpEngine:
             await rtpengine.detach_ws_tee(call)
         """
         call_id, from_tag = _resolve_media_target(target)
+        scope = self._leg_scope(scope, target, call_id, "detach_ws_tee")
         self.operations.append(("detach_ws_tee", None))
         self.media_calls.append({
             "op": "detach_ws_tee",
@@ -6551,6 +6754,7 @@ class MockRtpEngine:
 
     async def attach_ws_bridge(
         self, target: Any, ws_uri: str, profile: Optional[str] = None,
+        scope: Optional[str] = None,
     ) -> bool:
         """Attach a **WebSocket takeover bridge** to a live call, or re-point an
         existing one at a different server.
@@ -6582,6 +6786,12 @@ class MockRtpEngine:
             profile: Name of a media profile (built-in such as ``"voice_ai"``,
                 or one from ``media.profiles``). siphon raises ``ValueError``
                 for an unknown name before anything reaches the engine.
+            scope: The per-call scope the leg was offered under
+                (``offer(..., scope=)``), for a proxy anchoring two legs of
+                one Call-ID. Omitted: the node's call, or the call's one
+                scoped leg when only one is anchored and the call has no
+                session of its own. ``ValueError`` when invalid, or on a
+                B2BUA ``Call``.
 
         Returns:
             ``True`` on success.
@@ -6597,6 +6807,7 @@ class MockRtpEngine:
         """
         ws_uri = self._expand_ws_uri(ws_uri, target)
         call_id, from_tag = _resolve_media_target(target)
+        scope = self._leg_scope(scope, target, call_id, "attach_ws_bridge")
         self.operations.append(("attach_ws_bridge", ws_uri))
         self.media_calls.append({
             "op": "attach_ws_bridge",
@@ -6607,7 +6818,7 @@ class MockRtpEngine:
         })
         return True
 
-    async def detach_ws_bridge(self, target: Any) -> bool:
+    async def detach_ws_bridge(self, target: Any, scope: Optional[str] = None) -> bool:
         """Detach a call's **WebSocket takeover bridge**, putting its media path
         back the way it was.
 
@@ -6623,6 +6834,12 @@ class MockRtpEngine:
 
         Args:
             target: Request, Reply, or Call object.
+            scope: The per-call scope the leg was offered under
+                (``offer(..., scope=)``), for a proxy anchoring two legs of
+                one Call-ID. Omitted: the node's call, or the call's one
+                scoped leg when only one is anchored and the call has no
+                session of its own. ``ValueError`` when invalid, or on a
+                B2BUA ``Call``.
 
         Returns:
             ``True`` on success.
@@ -6632,6 +6849,7 @@ class MockRtpEngine:
             await rtpengine.detach_ws_bridge(call)   # back to relaying A<->B
         """
         call_id, from_tag = _resolve_media_target(target)
+        scope = self._leg_scope(scope, target, call_id, "detach_ws_bridge")
         self.operations.append(("detach_ws_bridge", None))
         self.media_calls.append({
             "op": "detach_ws_bridge",
@@ -6654,6 +6872,17 @@ class MockRtpEngine:
             @rtpengine.on_dtmf(call_id="abc", from_tag="ftag1")
             def handle_specific(call_id, from_tag, digit, duration_ms, volume):
                 ...
+
+        A digit on a leg anchored under a per-call scope
+        (``offer(..., scope=)``) arrives under the SIP Call-ID, and a handler
+        that takes a ``scope`` keyword is also given the scope. Every media
+        event decorator works this way; a handler without the keyword is
+        called as before::
+
+            @rtpengine.on_dtmf
+            def handle_leg(call_id, from_tag, digit, duration_ms, volume, scope=None):
+                if scope == "term":
+                    ...
         """
         def decorator(fn: Any) -> Any:
             self._dtmf_handlers.append({
@@ -6667,16 +6896,21 @@ class MockRtpEngine:
         return decorator
 
     def fire_dtmf(self, call_id: str, from_tag: str, digit: str,
-                  duration_ms: int = 0, volume: int = 0) -> int:
+                  duration_ms: int = 0, volume: int = 0, scope: Optional[str] = None) -> int:
         """Test helper: fire a DTMF event.  Returns the number of handlers
-        that matched (and were invoked)."""
+        that matched (and were invoked).
+
+        ``scope``: fire it as an event of a leg anchored under that
+        per-call scope; a handler that accepts a ``scope`` keyword is
+        given it, any other is called as before.
+        """
         fired = 0
         for entry in self._dtmf_handlers:
             if entry["call_id"] is not None and entry["call_id"] != call_id:
                 continue
             if entry["from_tag"] is not None and entry["from_tag"] != from_tag:
                 continue
-            entry["fn"](call_id, from_tag, digit, duration_ms, volume)
+            _call_media_handler(entry["fn"], (call_id, from_tag, digit, duration_ms, volume), scope)
             fired += 1
         return fired
 
@@ -6710,16 +6944,21 @@ class MockRtpEngine:
             return decorator(func_or_none)
         return decorator
 
-    def fire_media_timeout(self, call_id: str, from_tag: str) -> int:
+    def fire_media_timeout(self, call_id: str, from_tag: str, scope: Optional[str] = None) -> int:
         """Test helper: fire a media-timeout event.  Returns the number of
-        handlers that matched (and were invoked)."""
+        handlers that matched (and were invoked).
+
+        ``scope``: fire it as an event of a leg anchored under that
+        per-call scope; a handler that accepts a ``scope`` keyword is
+        given it, any other is called as before.
+        """
         fired = 0
         for entry in self._media_timeout_handlers:
             if entry["call_id"] is not None and entry["call_id"] != call_id:
                 continue
             if entry["from_tag"] is not None and entry["from_tag"] != from_tag:
                 continue
-            entry["fn"](call_id, from_tag)
+            _call_media_handler(entry["fn"], (call_id, from_tag), scope)
             fired += 1
         return fired
 
@@ -6763,16 +7002,21 @@ class MockRtpEngine:
 
     def fire_text(self, call_id: str, from_tag: str, text: str,
                   to_tag: Optional[str] = None,
-                  direction: Optional[str] = "a_to_b") -> int:
+                  direction: Optional[str] = "a_to_b", scope: Optional[str] = None) -> int:
         """Test helper: fire a real-time text event.  Returns the number of
-        handlers that matched (and were invoked)."""
+        handlers that matched (and were invoked).
+
+        ``scope``: fire it as an event of a leg anchored under that
+        per-call scope; a handler that accepts a ``scope`` keyword is
+        given it, any other is called as before.
+        """
         fired = 0
         for entry in self._text_handlers:
             if entry["call_id"] is not None and entry["call_id"] != call_id:
                 continue
             if entry["from_tag"] is not None and entry["from_tag"] != from_tag:
                 continue
-            entry["fn"](call_id, from_tag, to_tag, text, direction)
+            _call_media_handler(entry["fn"], (call_id, from_tag, to_tag, text, direction), scope)
             fired += 1
         return fired
 
@@ -6826,12 +7070,16 @@ class MockRtpEngine:
                   to_tag: Optional[str] = None,
                   frequency_hz: float = 1000.0,
                   duration_ms: int = 420,
-                  offset_ms: int = 7300) -> int:
+                  offset_ms: int = 7300, scope: Optional[str] = None) -> int:
         """Test helper: fire a record-tone event.  Returns the number of
         handlers that matched (and were invoked).
 
         The defaults describe a typical voicemail beep: a ~1 kHz tone a few
         hundred milliseconds long, several seconds into the leg's audio.
+
+        ``scope``: fire it as an event of a leg anchored under that
+        per-call scope; a handler that accepts a ``scope`` keyword is
+        given it, any other is called as before.
         """
         fired = 0
         for entry in self._beep_handlers:
@@ -6839,8 +7087,8 @@ class MockRtpEngine:
                 continue
             if entry["from_tag"] is not None and entry["from_tag"] != from_tag:
                 continue
-            entry["fn"](call_id, from_tag, to_tag, frequency_hz, duration_ms,
-                        offset_ms)
+            _call_media_handler(entry["fn"], (call_id, from_tag, to_tag, frequency_hz, duration_ms,
+                        offset_ms), scope)
             fired += 1
         return fired
 
@@ -6930,11 +7178,15 @@ class MockRtpEngine:
                            to_tag: Optional[str] = None,
                            leg: str = "near",
                            source: Optional[str] = None,
-                           signalled: Optional[str] = None) -> int:
+                           signalled: Optional[str] = None, scope: Optional[str] = None) -> int:
         """Test helper: fire a media-started event.  Returns the number of
         handlers that matched (and were invoked).
 
         ``leg`` must be ``"near"`` or ``"far"``, the only two the engine sends.
+
+        ``scope``: fire it as an event of a leg anchored under that
+        per-call scope; a handler that accepts a ``scope`` keyword is
+        given it, any other is called as before.
         """
         if leg not in ("near", "far"):
             raise ValueError(f"leg must be 'near' or 'far', got {leg!r}")
@@ -6944,7 +7196,7 @@ class MockRtpEngine:
                 continue
             if entry["from_tag"] is not None and entry["from_tag"] != from_tag:
                 continue
-            entry["fn"](call_id, from_tag, to_tag, leg, source, signalled)
+            _call_media_handler(entry["fn"], (call_id, from_tag, to_tag, leg, source, signalled), scope)
             fired += 1
         return fired
 
@@ -6984,17 +7236,22 @@ class MockRtpEngine:
 
     def fire_ws_tee_started(self, call_id: str, from_tag: str, stream_id: str,
                             ws_uri: str, direction: str = "both",
-                            channels: int = 2, sample_rate: int = 8000) -> int:
+                            channels: int = 2, sample_rate: int = 8000, scope: Optional[str] = None) -> int:
         """Test helper: fire a ws-tee-started event.  Returns the number of
-        handlers that matched (and were invoked)."""
+        handlers that matched (and were invoked).
+
+        ``scope``: fire it as an event of a leg anchored under that
+        per-call scope; a handler that accepts a ``scope`` keyword is
+        given it, any other is called as before.
+        """
         fired = 0
         for entry in self._ws_tee_started_handlers:
             if entry["call_id"] is not None and entry["call_id"] != call_id:
                 continue
             if entry["from_tag"] is not None and entry["from_tag"] != from_tag:
                 continue
-            entry["fn"](call_id, from_tag, stream_id, ws_uri, direction,
-                        channels, sample_rate)
+            _call_media_handler(entry["fn"], (call_id, from_tag, stream_id, ws_uri, direction,
+                        channels, sample_rate), scope)
             fired += 1
         return fired
 
@@ -7041,17 +7298,22 @@ class MockRtpEngine:
     def fire_ws_tee_ended(self, call_id: str, from_tag: str, stream_id: str,
                           reason: str = "detached",
                           frames_sent: Optional[int] = None,
-                          frames_dropped: Optional[int] = None) -> int:
+                          frames_dropped: Optional[int] = None, scope: Optional[str] = None) -> int:
         """Test helper: fire a ws-tee-ended event.  Returns the number of
-        handlers that matched (and were invoked)."""
+        handlers that matched (and were invoked).
+
+        ``scope``: fire it as an event of a leg anchored under that
+        per-call scope; a handler that accepts a ``scope`` keyword is
+        given it, any other is called as before.
+        """
         fired = 0
         for entry in self._ws_tee_ended_handlers:
             if entry["call_id"] is not None and entry["call_id"] != call_id:
                 continue
             if entry["from_tag"] is not None and entry["from_tag"] != from_tag:
                 continue
-            entry["fn"](call_id, from_tag, stream_id, reason, frames_sent,
-                        frames_dropped)
+            _call_media_handler(entry["fn"], (call_id, from_tag, stream_id, reason, frames_sent,
+                        frames_dropped), scope)
             fired += 1
         return fired
 
@@ -7092,16 +7354,21 @@ class MockRtpEngine:
 
     def fire_play_finished(self, call_id: str, from_tag: str, play_id: int,
                            reason: str = "completed",
-                           played_ms: Optional[int] = None) -> int:
+                           played_ms: Optional[int] = None, scope: Optional[str] = None) -> int:
         """Test helper: fire a play-finished event.  Returns the number of
-        handlers that matched (and were invoked)."""
+        handlers that matched (and were invoked).
+
+        ``scope``: fire it as an event of a leg anchored under that
+        per-call scope; a handler that accepts a ``scope`` keyword is
+        given it, any other is called as before.
+        """
         fired = 0
         for entry in self._play_finished_handlers:
             if entry["call_id"] is not None and entry["call_id"] != call_id:
                 continue
             if entry["from_tag"] is not None and entry["from_tag"] != from_tag:
                 continue
-            entry["fn"](call_id, from_tag, play_id, reason, played_ms)
+            _call_media_handler(entry["fn"], (call_id, from_tag, play_id, reason, played_ms), scope)
             fired += 1
         return fired
 
@@ -7141,16 +7408,21 @@ class MockRtpEngine:
 
     def fire_ws_bridge_started(self, call_id: str, from_tag: str,
                                stream_id: str, ws_uri: str,
-                               sample_rate: int = 8000) -> int:
+                               sample_rate: int = 8000, scope: Optional[str] = None) -> int:
         """Test helper: fire a ws-bridge-started event.  Returns the number of
-        handlers that matched (and were invoked)."""
+        handlers that matched (and were invoked).
+
+        ``scope``: fire it as an event of a leg anchored under that
+        per-call scope; a handler that accepts a ``scope`` keyword is
+        given it, any other is called as before.
+        """
         fired = 0
         for entry in self._ws_bridge_started_handlers:
             if entry["call_id"] is not None and entry["call_id"] != call_id:
                 continue
             if entry["from_tag"] is not None and entry["from_tag"] != from_tag:
                 continue
-            entry["fn"](call_id, from_tag, stream_id, ws_uri, sample_rate)
+            _call_media_handler(entry["fn"], (call_id, from_tag, stream_id, ws_uri, sample_rate), scope)
             fired += 1
         return fired
 
@@ -7192,16 +7464,21 @@ class MockRtpEngine:
         return decorator
 
     def fire_ws_bridge_ended(self, call_id: str, from_tag: str, stream_id: str,
-                             reason: str = "detached") -> int:
+                             reason: str = "detached", scope: Optional[str] = None) -> int:
         """Test helper: fire a ws-bridge-ended event.  Returns the number of
-        handlers that matched (and were invoked)."""
+        handlers that matched (and were invoked).
+
+        ``scope``: fire it as an event of a leg anchored under that
+        per-call scope; a handler that accepts a ``scope`` keyword is
+        given it, any other is called as before.
+        """
         fired = 0
         for entry in self._ws_bridge_ended_handlers:
             if entry["call_id"] is not None and entry["call_id"] != call_id:
                 continue
             if entry["from_tag"] is not None and entry["from_tag"] != from_tag:
                 continue
-            entry["fn"](call_id, from_tag, stream_id, reason)
+            _call_media_handler(entry["fn"], (call_id, from_tag, stream_id, reason), scope)
             fired += 1
         return fired
 

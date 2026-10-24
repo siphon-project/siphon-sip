@@ -265,17 +265,26 @@ pub(super) fn attach_x3(
     // this runs more than once per call by design. Attaching twice would open a
     // second interception on the same leg and deliver every packet to the
     // agency twice.
+    //
+    // Every leg of the call is tapped ([`intercepted_legs`]): on a proxy that
+    // anchored both legs of one call under per-call scopes there is no single
+    // engine call that carries all of its content, and a leg left untapped is
+    // content the agency never receives. So each destination is attached once
+    // per leg, keyed `(destination, leg)`.
     let already: std::collections::HashSet<_> = li
         .x3_attachments_for(call_id)
         .into_iter()
         .filter(|attachment| attachment.x_id == matched.task.details.x_id)
-        .map(|attachment| attachment.d_id)
+        .map(|attachment| (attachment.d_id, attachment.scope))
         .collect();
-    let destinations: Vec<_> = li
+    let legs = intercepted_legs(state, call_id);
+    let named = li
         .tasks()
-        .destinations_for_interface(matched.task.details.x_id, true)
-        .into_iter()
-        .filter(|destination| !already.contains(&destination.details.d_id))
+        .destinations_for_interface(matched.task.details.x_id, true);
+    let destinations: Vec<_> = named
+        .iter()
+        .flat_map(|destination| legs.iter().map(move |leg| (destination, leg.clone())))
+        .filter(|(destination, leg)| !already.contains(&(destination.details.d_id, leg.clone())))
         .collect();
     if !already.is_empty() && destinations.is_empty() {
         // Everything this warrant names is already attached; nothing to do and
@@ -305,10 +314,11 @@ pub(super) fn attach_x3(
         }
     };
 
-    for destination in destinations {
+    for (destination, scope) in destinations {
         let Some(delivery) = destination.details.delivery_address.socket_addr() else {
             continue;
         };
+        let leg = backend.leg(call_id, scope.as_ref());
         let backend = Arc::clone(backend);
         let li = li.clone();
         let call_id = call_id.to_string();
@@ -316,17 +326,16 @@ pub(super) fn attach_x3(
         let x_id = matched.task.details.x_id;
         let d_id = destination.details.d_id;
         tokio::spawn(async move {
-            match backend
-                .attach_x3(
-                    &call_id,
-                    &from_tag,
-                    &delivery.to_string(),
-                    xid,
-                    correlation_id,
-                    target_leg,
-                )
-                .await
-            {
+            let delivery_address = delivery.to_string();
+            let attached = leg.run(backend.attach_x3(
+                leg.call_id(),
+                &from_tag,
+                &delivery_address,
+                xid,
+                correlation_id,
+                target_leg,
+            ));
+            match attached.await {
                 Ok(()) => {
                     li.record_x3_attachment(
                         &call_id,
@@ -335,16 +344,21 @@ pub(super) fn attach_x3(
                             d_id,
                             from_tag: from_tag.clone(),
                             correlation_id,
+                            scope: leg.scope().cloned(),
                         },
                     );
                     info!(
                         %x_id, %d_id, %call_id, %delivery, correlation_id,
+                        scope = leg.scope().map(crate::rtpengine::CallScope::as_str),
                         "X3 content delivery attached"
                     );
                     li.audit(
                         crate::li::AuditOperation::MediaCaptureStarted,
                         Some(&x_id.to_string()),
-                        format!("X3 attached call_id={call_id} destination={delivery}"),
+                        format!(
+                            "X3 attached call_id={call_id} leg={} destination={delivery}",
+                            leg_name(leg.scope())
+                        ),
                     );
                 }
                 Err(error) => {
@@ -359,7 +373,10 @@ pub(super) fn attach_x3(
                     li.audit(
                         crate::li::AuditOperation::MediaCaptureStarted,
                         Some(&x_id.to_string()),
-                        format!("X3 attach FAILED call_id={call_id}: {error}"),
+                        format!(
+                            "X3 attach FAILED call_id={call_id} leg={}: {error}",
+                            leg_name(leg.scope())
+                        ),
                     );
                     report_destination_fault(
                         &li,
@@ -372,6 +389,42 @@ pub(super) fn attach_x3(
             }
         });
     }
+}
+
+/// The legs of the call `engine_call_id` names whose media an interception
+/// taps: the call's own media (`None`) when siphon anchored it, and every leg a
+/// script anchored under a per-call scope (`rtpengine.offer(..., scope=)`).
+/// With neither recorded, the call's own media, as before scopes existed: the
+/// engine then answers for itself whether it holds the call.
+///
+/// Every leg rather than one, by choice: on a proxy anchoring the originating
+/// and the terminating leg of one call each leg is an engine call of its own,
+/// and tapping only one could lose content the other carries (media a leg
+/// plays or bridges locally). Two deliveries of one conversation, each tagged
+/// with its leg and the session's one Correlation ID, are recoverable at the
+/// mediation function; a delivery never made is not.
+pub(super) fn intercepted_legs(
+    state: &DispatcherState,
+    engine_call_id: &str,
+) -> Vec<Option<crate::rtpengine::CallScope>> {
+    let Some(sessions) = state.rtpengine_sessions.as_ref() else {
+        return vec![None];
+    };
+    let mut legs: Vec<Option<crate::rtpengine::CallScope>> = sessions
+        .scopes_holding(engine_call_id)
+        .into_iter()
+        .map(Some)
+        .collect();
+    if legs.is_empty() || sessions.get(engine_call_id).is_some() {
+        legs.insert(0, None);
+    }
+    legs
+}
+
+/// How an audit record names a leg: its per-call scope, or `call` for the
+/// call's own media.
+fn leg_name(scope: Option<&crate::rtpengine::CallScope>) -> &str {
+    scope.map_or("call", crate::rtpengine::CallScope::as_str)
 }
 
 /// Stop content delivery for a call, if any was attached.
@@ -391,8 +444,11 @@ pub(super) fn detach_x3(call_id: &str, state: &Arc<DispatcherState>) {
     let call_id = call_id.to_string();
     tokio::spawn(async move {
         for attachment in attachments {
+            // Each leg's delivery is detached on the leg it was attached on.
+            let leg = backend.leg(&call_id, attachment.scope.as_ref());
             // Idempotent on the engine, so a duplicate teardown is harmless.
-            if let Err(error) = backend.detach_x3(&call_id, &attachment.from_tag).await {
+            let detached = leg.run(backend.detach_x3(leg.call_id(), &attachment.from_tag));
+            if let Err(error) = detached.await {
                 warn!(
                     x_id = %attachment.x_id, %call_id, %error,
                     "could not detach X3 content delivery"
@@ -401,7 +457,10 @@ pub(super) fn detach_x3(call_id: &str, state: &Arc<DispatcherState>) {
             li.audit(
                 crate::li::AuditOperation::MediaCaptureStopped,
                 Some(&attachment.x_id.to_string()),
-                format!("X3 detached call_id={call_id}"),
+                format!(
+                    "X3 detached call_id={call_id} leg={}",
+                    leg_name(attachment.scope.as_ref())
+                ),
             );
         }
     });

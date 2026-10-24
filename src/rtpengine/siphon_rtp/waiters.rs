@@ -209,7 +209,11 @@ impl super::SiphonRtpClient {
     /// Collect the digits keyed on a call (RFC 4733, as the engine detects
     /// them) until `limits` end the read.
     pub async fn read_digits(&self, call_id: &str, limits: &DigitReadLimits) -> DigitRead {
-        self.waiters.read_digits(call_id, limits).await
+        // Under a per-call scope the leg's digits arrive under its engine
+        // call-id, and so the read is keyed on that.
+        self.waiters
+            .read_digits(&super::per_call::leg_call_id(call_id), limits)
+            .await
     }
 }
 

@@ -73,16 +73,28 @@ impl PyRtpEngine {
         python: Python<'py>,
         target: &Bound<'py, PyAny>,
         method: &'static str,
+        scope: Option<&str>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let (call_id, from_tag) = resolve_call_from_tag(target)?;
+        let leg = self.leg(scope, Some(target), &call_id, method)?;
         let client = Arc::clone(&self.client);
 
         pyo3_async_runtimes::tokio::future_into_py(python, async move {
+            let engine_call_id = leg.call_id();
             let result = match method {
-                "silence_media" => client.silence_media(&call_id, &from_tag).await,
-                "unsilence_media" => client.unsilence_media(&call_id, &from_tag).await,
-                "block_media" => client.block_media(&call_id, &from_tag).await,
-                "unblock_media" => client.unblock_media(&call_id, &from_tag).await,
+                "silence_media" => {
+                    leg.run(client.silence_media(engine_call_id, &from_tag))
+                        .await
+                }
+                "unsilence_media" => {
+                    leg.run(client.unsilence_media(engine_call_id, &from_tag))
+                        .await
+                }
+                "block_media" => leg.run(client.block_media(engine_call_id, &from_tag)).await,
+                "unblock_media" => {
+                    leg.run(client.unblock_media(engine_call_id, &from_tag))
+                        .await
+                }
                 other => {
                     return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
                         "unknown simple media command: {other}"
@@ -1010,7 +1022,10 @@ impl PyRtpEngine {
     ///     ws_vad_engine: ``"energy"`` or ``"neural"`` uplink VAD.
     ///     ws_vad_min_speech_ms: Leading minimum continuous-speech run before the
     ///             speech-start edge fires (60-120 ms is the useful range).
-    #[pyo3(signature = (call, profile=None, auto_reject=true, ws_uri=None, beep_detection=None, beep_cadence_guard_ms=None, ws_sample_rate=None, ws_tee_sample_rate=None, ws_vad_engine=None, ws_vad_min_speech_ms=None))]
+    ///     scope: Answer this leg as an engine call of its own, as
+    ///             :meth:`offer` anchors one; pass it to the leg's later verbs.
+    ///             ``ValueError`` on a B2BUA Call.
+    #[pyo3(signature = (call, profile=None, auto_reject=true, ws_uri=None, beep_detection=None, beep_cadence_guard_ms=None, ws_sample_rate=None, ws_tee_sample_rate=None, ws_vad_engine=None, ws_vad_min_speech_ms=None, scope=None))]
     #[allow(clippy::too_many_arguments)]
     fn answer_local<'py>(
         &self,
@@ -1025,14 +1040,17 @@ impl PyRtpEngine {
         ws_tee_sample_rate: Option<u32>,
         ws_vad_engine: Option<&str>,
         ws_vad_min_speech_ms: Option<u32>,
+        scope: Option<&str>,
     ) -> PyResult<Bound<'py, PyAny>> {
+        let scope = scope::per_call_scope(scope, &[Some(call)], &self.client, "answer_local")?;
+        let sessions = scope::store_for(&self.sessions, scope.as_ref())?;
         let message = extract_message(call)?;
         let (call_id, from_tag, offer_sdp_bytes) = extract_offer_params(&message)?;
         let offer_sdp = String::from_utf8_lossy(&offer_sdp_bytes).into_owned();
 
         // Resolve the answer-side flags exactly as `answer` does (explicit
         // profile → offer-recorded profile → default).
-        let profile_name = resolve_answer_profile(profile, &self.sessions, &call_id);
+        let profile_name = resolve_answer_profile(profile, &sessions, &call_id);
         let entry = self.registry.get(&profile_name).ok_or_else(|| {
             pyo3::exceptions::PyValueError::new_err(format!(
                 "unknown RTP profile '{profile_name}'; valid profiles: {}",
@@ -1042,12 +1060,8 @@ impl PyRtpEngine {
         let flags = entry.answer.clone();
 
         let source_ip = extract_source_ip(call);
-        let resolved_ws_uri = resolve_ws_uri(
-            ws_uri,
-            &self.sessions,
-            &call_id,
-            entry.answer.ws_uri.as_deref(),
-        );
+        let resolved_ws_uri =
+            resolve_ws_uri(ws_uri, &sessions, &call_id, entry.answer.ws_uri.as_deref());
         let overrides = MediaOverrides::parse(
             beep_detection,
             beep_cadence_guard_ms,
@@ -1084,12 +1098,12 @@ impl PyRtpEngine {
         };
 
         let client = Arc::clone(&self.client);
-        let sessions = Arc::clone(&self.sessions);
         let profile_str = profile_name.clone();
+        let leg = self.client.leg(&call_id, scope.as_ref());
 
         pyo3_async_runtimes::tokio::future_into_py(python, async move {
-            let result = client
-                .answer_local(&call_id, &from_tag, &offer_sdp, &flags)
+            let result = leg
+                .run(client.answer_local(leg.call_id(), &from_tag, &offer_sdp, &flags))
                 .await;
             match classify_answer_local(result, reject_call.is_some()) {
                 AnswerLocalOutcome::Answered(answer_sdp) => {
@@ -1324,12 +1338,17 @@ impl PyRtpEngine {
     ///           (fire-and-forget — music-on-hold / background). Native
     ///           ``siphon-rtp`` backend only; the rtpengine / rtpproxy backends
     ///           have no completion signal and always return on accept.
+    ///     scope: The per-call scope the leg was offered under
+    ///           (``offer(..., scope=)``), for a proxy anchoring two legs of one
+    ///           Call-ID. Omitted: the node's call, or the call's one scoped leg
+    ///           when only one is anchored and the call has no session of its
+    ///           own. ``ValueError`` when invalid, or on a B2BUA Call.
     ///
     /// Returns:
     ///     The played duration in milliseconds if the engine reports one, else
     ///     ``None`` (also ``None`` when the prompt was stopped / superseded before
     ///     it finished, or the fallback timeout elapsed).
-    #[pyo3(signature = (target, file=None, blob=None, db_id=None, tone=None, url=None, repeat=None, start_ms=None, duration_ms=None, gain_decibels=None, to_tag=None, wait=true))]
+    #[pyo3(signature = (target, file=None, blob=None, db_id=None, tone=None, url=None, repeat=None, start_ms=None, duration_ms=None, gain_decibels=None, to_tag=None, wait=true, scope=None))]
     #[allow(clippy::too_many_arguments)]
     fn play_media<'py>(
         &self,
@@ -1346,19 +1365,21 @@ impl PyRtpEngine {
         gain_decibels: Option<i32>,
         to_tag: Option<String>,
         wait: bool,
+        scope: Option<&str>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let source = resolve_play_media_source(file, blob, db_id, tone, url)?;
         let repeat = repeat::parse_repeat(repeat.as_ref())?;
         repeat::refuse_endless_wait(repeat, wait)?;
 
         let (call_id, from_tag) = resolve_call_from_tag(target)?;
+        let leg = self.leg(scope, Some(target), &call_id, "play_media")?;
 
         let client = Arc::clone(&self.client);
 
         pyo3_async_runtimes::tokio::future_into_py(python, async move {
-            let outcome = client
-                .play_media(
-                    &call_id,
+            let outcome = leg
+                .run(client.play_media(
+                    leg.call_id(),
                     &from_tag,
                     &source,
                     repeat,
@@ -1369,7 +1390,7 @@ impl PyRtpEngine {
                     false,
                     gain_decibels,
                     wait,
-                )
+                ))
                 .await
                 .map_err(|error| {
                     pyo3::exceptions::PyRuntimeError::new_err(format!(
@@ -1421,11 +1442,12 @@ impl PyRtpEngine {
     ///     gain_decibels: Playout gain relative to the source's own level,
     ///         clamped engine-side to −60..=+12.
     ///     to_tag: Optional peer tag for MPTY scoping.
+    ///     scope: The leg's per-call scope, as for :meth:`play_media`.
     ///
     /// Returns:
     ///     The ``play_id`` of the started overlay, or ``None`` if the engine
     ///     assigned none.
-    #[pyo3(signature = (target, file=None, blob=None, db_id=None, tone=None, url=None, repeat=None, start_ms=None, duration_ms=None, gain_decibels=None, to_tag=None))]
+    #[pyo3(signature = (target, file=None, blob=None, db_id=None, tone=None, url=None, repeat=None, start_ms=None, duration_ms=None, gain_decibels=None, to_tag=None, scope=None))]
     #[allow(clippy::too_many_arguments)]
     fn play_overlay<'py>(
         &self,
@@ -1441,18 +1463,20 @@ impl PyRtpEngine {
         duration_ms: Option<u64>,
         gain_decibels: Option<i32>,
         to_tag: Option<String>,
+        scope: Option<&str>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let source = resolve_play_media_source(file, blob, db_id, tone, url)?;
         let repeat = repeat::parse_repeat(repeat.as_ref())?;
 
         let (call_id, from_tag) = resolve_call_from_tag(target)?;
+        let leg = self.leg(scope, Some(target), &call_id, "play_overlay")?;
 
         let client = Arc::clone(&self.client);
 
         pyo3_async_runtimes::tokio::future_into_py(python, async move {
-            let outcome = client
-                .play_media(
-                    &call_id,
+            let outcome = leg
+                .run(client.play_media(
+                    leg.call_id(),
                     &from_tag,
                     &source,
                     repeat,
@@ -1464,7 +1488,7 @@ impl PyRtpEngine {
                     // An overlay is background audio: blocking until it drains
                     // would defeat the point (and an endless tone never drains).
                     false,
-                )
+                ))
                 .await
                 .map_err(|error| {
                     pyo3::exceptions::PyRuntimeError::new_err(format!(
@@ -1488,21 +1512,22 @@ impl PyRtpEngine {
     /// A ``play_id`` is native **siphon-rtp** only — the other backends have no
     /// handle on an individual playback, and are refused rather than widened
     /// into "stop everything", which would kill playbacks the script meant to
-    /// keep running.
-    #[pyo3(signature = (target, play_id=None))]
+    /// keep running. ``scope`` names the leg as for :meth:`play_media`.
+    #[pyo3(signature = (target, play_id=None, scope=None))]
     fn stop_media<'py>(
         &self,
         python: Python<'py>,
         target: &Bound<'py, PyAny>,
         play_id: Option<u64>,
+        scope: Option<&str>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let (call_id, from_tag) = resolve_call_from_tag(target)?;
+        let leg = self.leg(scope, Some(target), &call_id, "stop_media")?;
 
         let client = Arc::clone(&self.client);
 
         pyo3_async_runtimes::tokio::future_into_py(python, async move {
-            client
-                .stop_media(&call_id, &from_tag, play_id)
+            leg.run(client.stop_media(leg.call_id(), &from_tag, play_id))
                 .await
                 .map_err(|error| {
                     pyo3::exceptions::PyRuntimeError::new_err(format!(
@@ -1524,9 +1549,9 @@ impl PyRtpEngine {
     /// voicemail box is. ``path`` names the file (its directory must exist);
     /// without one the engine picks a name in its recording directory.
     /// ``direction`` is ``"ingress"`` (what the caller sent, the default),
-    /// ``"egress"`` (what the engine played) or ``"both"``. Native
-    /// **siphon-rtp** backend only.
-    #[pyo3(signature = (target, path=None, direction="ingress", channels="mono", max_duration_ms=None, silence_ms=None))]
+    /// ``"egress"`` (what the engine played) or ``"both"``. ``scope`` names
+    /// the leg as for :meth:`play_media`. Native **siphon-rtp** backend only.
+    #[pyo3(signature = (target, path=None, direction="ingress", channels="mono", max_duration_ms=None, silence_ms=None, scope=None))]
     #[allow(clippy::too_many_arguments)]
     fn start_recording<'py>(
         &self,
@@ -1537,6 +1562,7 @@ impl PyRtpEngine {
         channels: &str,
         max_duration_ms: Option<u64>,
         silence_ms: Option<u64>,
+        scope: Option<&str>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let options = capture::RecordingOptions::parse(
             path,
@@ -1546,9 +1572,17 @@ impl PyRtpEngine {
             silence_ms,
         )?;
         let (call_id, from_tag) = resolve_call_from_tag(target)?;
+        let leg = self.leg(scope, Some(target), &call_id, "start_recording")?;
         let client = Arc::clone(&self.client);
         pyo3_async_runtimes::tokio::future_into_py(python, async move {
-            capture::start(&client, &call_id, &from_tag, &options, "start_recording").await
+            let verb = capture::start(
+                &client,
+                leg.call_id(),
+                &from_tag,
+                &options,
+                "start_recording",
+            );
+            leg.run(verb).await
         })
     }
 
@@ -1559,7 +1593,8 @@ impl PyRtpEngine {
     /// ``timeout_ms`` (default: ``max_duration_ms`` plus ten seconds, or an
     /// hour). Options as for :meth:`start_recording`. A coroutine running
     /// beside it (a :meth:`read_digits` for "press # to finish") ends it early
-    /// with :meth:`stop_recording`.
+    /// with :meth:`stop_recording`. ``scope`` names the leg as for
+    /// :meth:`play_media`.
     ///
     /// ```python,ignore
     /// message = await rtpengine.record(call, path=f"/spool/{call.call_id}.wav",
@@ -1567,7 +1602,7 @@ impl PyRtpEngine {
     /// if message and message["duration_ms"] > 0:
     ///     keep(message["path"])
     /// ```
-    #[pyo3(signature = (target, path=None, direction="ingress", channels="mono", max_duration_ms=None, silence_ms=None, timeout_ms=None))]
+    #[pyo3(signature = (target, path=None, direction="ingress", channels="mono", max_duration_ms=None, silence_ms=None, timeout_ms=None, scope=None))]
     #[allow(clippy::too_many_arguments)]
     fn record<'py>(
         &self,
@@ -1579,6 +1614,7 @@ impl PyRtpEngine {
         max_duration_ms: Option<u64>,
         silence_ms: Option<u64>,
         timeout_ms: Option<u64>,
+        scope: Option<&str>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let options = capture::RecordingOptions::parse(
             path,
@@ -1589,54 +1625,62 @@ impl PyRtpEngine {
         )?;
         let wait_ms = timeout_ms.unwrap_or_else(|| options.default_wait_ms());
         let (call_id, from_tag) = resolve_call_from_tag(target)?;
+        let leg = self.leg(scope, Some(target), &call_id, "record")?;
         let client = Arc::clone(&self.client);
         pyo3_async_runtimes::tokio::future_into_py(python, async move {
-            let recording_id =
-                capture::start(&client, &call_id, &from_tag, &options, "record").await?;
-            capture::wait(&client, &call_id, &recording_id, wait_ms, "record").await
+            leg.run(async {
+                let recording_id =
+                    capture::start(&client, leg.call_id(), &from_tag, &options, "record").await?;
+                capture::wait(&client, leg.call_id(), &recording_id, wait_ms, "record").await
+            })
+            .await
         })
     }
 
     /// Wait until a recording :meth:`start_recording` started has ended and
     /// its file is closed: the same dict as :meth:`record`, or ``None`` after
-    /// ``timeout_ms``.
-    #[pyo3(signature = (target, recording_id, timeout_ms=3_600_000))]
+    /// ``timeout_ms``. ``scope``: the leg the recording was started on.
+    #[pyo3(signature = (target, recording_id, timeout_ms=3_600_000, scope=None))]
     fn wait_recording<'py>(
         &self,
         python: Python<'py>,
         target: &Bound<'py, PyAny>,
         recording_id: String,
         timeout_ms: u64,
+        scope: Option<&str>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let (call_id, _from_tag) = resolve_call_from_tag(target)?;
+        let leg = self.leg(scope, Some(target), &call_id, "wait_recording")?;
         let client = Arc::clone(&self.client);
         pyo3_async_runtimes::tokio::future_into_py(python, async move {
-            capture::wait(
+            let verb = capture::wait(
                 &client,
-                &call_id,
+                leg.call_id(),
                 &recording_id,
                 timeout_ms,
                 "wait_recording",
-            )
-            .await
+            );
+            leg.run(verb).await
         })
     }
 
     /// Stop a recording: the one ``recording_id`` names, or every recording on
     /// the call. Returns on the engine's accept; the file is closed when
-    /// :meth:`record` / :meth:`wait_recording` return.
-    #[pyo3(signature = (target, recording_id=None))]
+    /// :meth:`record` / :meth:`wait_recording` return. ``scope`` names the leg
+    /// as for :meth:`play_media`.
+    #[pyo3(signature = (target, recording_id=None, scope=None))]
     fn stop_recording<'py>(
         &self,
         python: Python<'py>,
         target: &Bound<'py, PyAny>,
         recording_id: Option<String>,
+        scope: Option<&str>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let (call_id, from_tag) = resolve_call_from_tag(target)?;
+        let leg = self.leg(scope, Some(target), &call_id, "stop_recording")?;
         let client = Arc::clone(&self.client);
         pyo3_async_runtimes::tokio::future_into_py(python, async move {
-            client
-                .stop_recording(&call_id, &from_tag, recording_id.as_deref())
+            leg.run(client.stop_recording(leg.call_id(), &from_tag, recording_id.as_deref()))
                 .await
                 .map_err(|error| {
                     pyo3::exceptions::PyRuntimeError::new_err(format!(
@@ -1657,12 +1701,14 @@ impl PyRtpEngine {
     /// went away). While a read is active its digits are not also
     /// ``@rtpengine.on_dtmf`` events. Run it beside a ``play_media(...,
     /// wait=False)`` and stop the prompt on the first digit for barge-in.
+    /// ``scope`` names the leg as for :meth:`play_media`; only that leg's
+    /// digits are read.
     ///
     /// ```python,ignore
     /// pin, reason = await rtpengine.read_digits(call, terminators="#",
     ///                                           timeout_ms=10000)
     /// ```
-    #[pyo3(signature = (target, terminators="#".to_string(), max_digits=None, timeout_ms=5000, inter_digit_timeout_ms=3000))]
+    #[pyo3(signature = (target, terminators="#".to_string(), max_digits=None, timeout_ms=5000, inter_digit_timeout_ms=3000, scope=None))]
     fn read_digits<'py>(
         &self,
         python: Python<'py>,
@@ -1671,15 +1717,17 @@ impl PyRtpEngine {
         max_digits: Option<usize>,
         timeout_ms: u64,
         inter_digit_timeout_ms: u64,
+        scope: Option<&str>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let limits =
             capture::digit_limits(terminators, max_digits, timeout_ms, inter_digit_timeout_ms)?;
         let (call_id, _from_tag) = resolve_call_from_tag(target)?;
+        let leg = self.leg(scope, Some(target), &call_id, "read_digits")?;
         let client = Arc::clone(&self.client);
-        pyo3_async_runtimes::tokio::future_into_py(
-            python,
-            capture::read_digits(client, call_id, limits),
-        )
+        pyo3_async_runtimes::tokio::future_into_py(python, async move {
+            let verb = capture::read_digits(client, leg.call_id().to_string(), limits);
+            leg.run(verb).await
+        })
     }
 
     /// Retune the playout gain of a playback that is already running — how a
@@ -1699,7 +1747,8 @@ impl PyRtpEngine {
     ///     gain_decibels: New gain in whole decibels, clamped engine-side to
     ///         −60..=+12.
     ///     to_tag: Optional peer tag for MPTY scoping.
-    #[pyo3(signature = (target, play_id, gain_decibels, to_tag=None))]
+    ///     scope: The leg's per-call scope, as for :meth:`play_media`.
+    #[pyo3(signature = (target, play_id, gain_decibels, to_tag=None, scope=None))]
     fn set_play_gain<'py>(
         &self,
         python: Python<'py>,
@@ -1707,26 +1756,27 @@ impl PyRtpEngine {
         play_id: u64,
         gain_decibels: i32,
         to_tag: Option<String>,
+        scope: Option<&str>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let (call_id, from_tag) = resolve_call_from_tag(target)?;
+        let leg = self.leg(scope, Some(target), &call_id, "set_play_gain")?;
 
         let client = Arc::clone(&self.client);
 
         pyo3_async_runtimes::tokio::future_into_py(python, async move {
-            client
-                .set_play_gain(
-                    &call_id,
-                    &from_tag,
-                    play_id,
-                    gain_decibels,
-                    to_tag.as_deref(),
-                )
-                .await
-                .map_err(|error| {
-                    pyo3::exceptions::PyRuntimeError::new_err(format!(
-                        "rtpengine.set_play_gain failed: {error}"
-                    ))
-                })?;
+            leg.run(client.set_play_gain(
+                leg.call_id(),
+                &from_tag,
+                play_id,
+                gain_decibels,
+                to_tag.as_deref(),
+            ))
+            .await
+            .map_err(|error| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "rtpengine.set_play_gain failed: {error}"
+                ))
+            })?;
             debug!(
                 call_id = %call_id,
                 play_id,
@@ -2021,7 +2071,9 @@ impl PyRtpEngine {
     ///     volume_dbm0: Tone volume in dBm0 (typically ``-8``).
     ///     pause_ms: Inter-tone gap when ``code`` is a sequence.
     ///     to_tag: Optional peer tag for MPTY scoping.
-    #[pyo3(signature = (target, code, duration_ms=None, volume_dbm0=None, pause_ms=None, to_tag=None))]
+    ///     scope: The leg's per-call scope, as for :meth:`play_media`.
+    #[pyo3(signature = (target, code, duration_ms=None, volume_dbm0=None, pause_ms=None, to_tag=None, scope=None))]
+    #[allow(clippy::too_many_arguments)]
     fn play_dtmf<'py>(
         &self,
         python: Python<'py>,
@@ -2031,28 +2083,29 @@ impl PyRtpEngine {
         volume_dbm0: Option<i64>,
         pause_ms: Option<u64>,
         to_tag: Option<String>,
+        scope: Option<&str>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let (call_id, from_tag) = resolve_call_from_tag(target)?;
+        let leg = self.leg(scope, Some(target), &call_id, "play_dtmf")?;
 
         let client = Arc::clone(&self.client);
 
         pyo3_async_runtimes::tokio::future_into_py(python, async move {
-            client
-                .play_dtmf(
-                    &call_id,
-                    &from_tag,
-                    &code,
-                    duration_ms,
-                    volume_dbm0,
-                    pause_ms,
-                    to_tag.as_deref(),
-                )
-                .await
-                .map_err(|error| {
-                    pyo3::exceptions::PyRuntimeError::new_err(format!(
-                        "rtpengine.play_dtmf failed: {error}"
-                    ))
-                })?;
+            leg.run(client.play_dtmf(
+                leg.call_id(),
+                &from_tag,
+                &code,
+                duration_ms,
+                volume_dbm0,
+                pause_ms,
+                to_tag.as_deref(),
+            ))
+            .await
+            .map_err(|error| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "rtpengine.play_dtmf failed: {error}"
+                ))
+            })?;
             debug!(call_id = %call_id, code = %code, "rtpengine play_dtmf");
             Ok(true)
         })
@@ -2060,46 +2113,51 @@ impl PyRtpEngine {
 
     /// Send a `silence media` command — replace outgoing audio on the selected
     /// monologue with silence. Pair with :meth:`unsilence_media` to restore.
-    #[pyo3(signature = (target,))]
+    /// ``scope`` names the leg as for :meth:`play_media` (all four gating verbs).
+    #[pyo3(signature = (target, scope=None))]
     fn silence_media<'py>(
         &self,
         python: Python<'py>,
         target: &Bound<'py, PyAny>,
+        scope: Option<&str>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        self.simple_media_command(python, target, "silence_media")
+        self.simple_media_command(python, target, "silence_media", scope)
     }
 
     /// Send an `unsilence media` command — pass the original stream through
     /// again after a prior :meth:`silence_media`.
-    #[pyo3(signature = (target,))]
+    #[pyo3(signature = (target, scope=None))]
     fn unsilence_media<'py>(
         &self,
         python: Python<'py>,
         target: &Bound<'py, PyAny>,
+        scope: Option<&str>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        self.simple_media_command(python, target, "unsilence_media")
+        self.simple_media_command(python, target, "unsilence_media", scope)
     }
 
     /// Send a `block media` command — drop outgoing packets on the selected
     /// monologue (peer hears no audio at all, not even comfort silence).
-    #[pyo3(signature = (target,))]
+    #[pyo3(signature = (target, scope=None))]
     fn block_media<'py>(
         &self,
         python: Python<'py>,
         target: &Bound<'py, PyAny>,
+        scope: Option<&str>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        self.simple_media_command(python, target, "block_media")
+        self.simple_media_command(python, target, "block_media", scope)
     }
 
     /// Send an `unblock media` command — resume forwarding the selected
     /// monologue's packets after a prior :meth:`block_media`.
-    #[pyo3(signature = (target,))]
+    #[pyo3(signature = (target, scope=None))]
     fn unblock_media<'py>(
         &self,
         python: Python<'py>,
         target: &Bound<'py, PyAny>,
+        scope: Option<&str>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        self.simple_media_command(python, target, "unblock_media")
+        self.simple_media_command(python, target, "unblock_media", scope)
     }
 
     /// Enable/disable echo-test mode on a call — reflect the caller's ingress
@@ -2111,19 +2169,21 @@ impl PyRtpEngine {
     ///     target: A Request, Reply, or Call whose Call-ID / From-tag select
     ///         the leg to echo (the same message the offer used).
     ///     enabled: True to start echoing (default), False to stop.
-    #[pyo3(signature = (target, enabled=true))]
+    ///     scope: The leg's per-call scope, as for :meth:`play_media`.
+    #[pyo3(signature = (target, enabled=true, scope=None))]
     fn echo<'py>(
         &self,
         python: Python<'py>,
         target: &Bound<'py, PyAny>,
         enabled: bool,
+        scope: Option<&str>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let (call_id, from_tag) = resolve_call_from_tag(target)?;
+        let leg = self.leg(scope, Some(target), &call_id, "echo")?;
         let client = Arc::clone(&self.client);
 
         pyo3_async_runtimes::tokio::future_into_py(python, async move {
-            client
-                .echo(&call_id, &from_tag, enabled)
+            leg.run(client.echo(leg.call_id(), &from_tag, enabled))
                 .await
                 .map_err(|error| {
                     pyo3::exceptions::PyRuntimeError::new_err(format!(
@@ -2151,10 +2211,14 @@ impl PyRtpEngine {
     ///          rtpengine generates one.
     ///     profile: RTP profile name for flag composition (default
     ///              ``"rtp_passthrough"``).
+    ///     scope: The source leg's per-call scope, as for :meth:`play_media`;
+    ///            pass the same one to :meth:`subscribe_answer` and
+    ///            :meth:`unsubscribe`.
     ///
     /// Returns:
     ///     The subscriber SDP as ``bytes``.
-    #[pyo3(signature = (call_id, from_tag, to_tag, sdp=None, profile=None))]
+    #[pyo3(signature = (call_id, from_tag, to_tag, sdp=None, profile=None, scope=None))]
+    #[allow(clippy::too_many_arguments)]
     fn subscribe_request<'py>(
         &self,
         python: Python<'py>,
@@ -2163,7 +2227,9 @@ impl PyRtpEngine {
         to_tag: String,
         sdp: Option<Vec<u8>>,
         profile: Option<&str>,
+        scope: Option<&str>,
     ) -> PyResult<Bound<'py, PyAny>> {
+        let leg = self.leg(scope, None, &call_id, "subscribe_request")?;
         let profile_name = profile.unwrap_or(DEFAULT_PROFILE);
         let entry = self.registry.get(profile_name).ok_or_else(|| {
             pyo3::exceptions::PyValueError::new_err(format!(
@@ -2175,14 +2241,13 @@ impl PyRtpEngine {
         let client = Arc::clone(&self.client);
 
         pyo3_async_runtimes::tokio::future_into_py(python, async move {
-            let rewritten_sdp = client
-                .subscribe_request(&call_id, &from_tag, &to_tag, sdp.as_deref(), &flags)
-                .await
-                .map_err(|error| {
-                    pyo3::exceptions::PyRuntimeError::new_err(format!(
-                        "rtpengine.subscribe_request failed: {error}"
-                    ))
-                })?;
+            let verb =
+                client.subscribe_request(leg.call_id(), &from_tag, &to_tag, sdp.as_deref(), &flags);
+            let rewritten_sdp = leg.run(verb).await.map_err(|error| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "rtpengine.subscribe_request failed: {error}"
+                ))
+            })?;
             debug!(
                 call_id = %call_id,
                 from_tag = %from_tag,
@@ -2203,11 +2268,13 @@ impl PyRtpEngine {
     ///     to_tag: subscriber tag (same value used in subscribe_request).
     ///     sdp: Answer SDP for the subscription.
     ///     profile: RTP profile name (default ``"rtp_passthrough"``).
+    ///     scope: The scope :meth:`subscribe_request` named.
     ///
     /// Returns:
     ///     The rewritten SDP as ``bytes`` (may be empty — rtpengine does
     ///     not always echo SDP on subscribe answer).
-    #[pyo3(signature = (call_id, from_tag, to_tag, sdp, profile=None))]
+    #[pyo3(signature = (call_id, from_tag, to_tag, sdp, profile=None, scope=None))]
+    #[allow(clippy::too_many_arguments)]
     fn subscribe_answer<'py>(
         &self,
         python: Python<'py>,
@@ -2216,7 +2283,9 @@ impl PyRtpEngine {
         to_tag: String,
         sdp: Vec<u8>,
         profile: Option<&str>,
+        scope: Option<&str>,
     ) -> PyResult<Bound<'py, PyAny>> {
+        let leg = self.leg(scope, None, &call_id, "subscribe_answer")?;
         let profile_name = profile.unwrap_or(DEFAULT_PROFILE);
         let entry = self.registry.get(profile_name).ok_or_else(|| {
             pyo3::exceptions::PyValueError::new_err(format!(
@@ -2228,14 +2297,12 @@ impl PyRtpEngine {
         let client = Arc::clone(&self.client);
 
         pyo3_async_runtimes::tokio::future_into_py(python, async move {
-            let rewritten_sdp = client
-                .subscribe_answer(&call_id, &from_tag, &to_tag, &sdp, &flags)
-                .await
-                .map_err(|error| {
-                    pyo3::exceptions::PyRuntimeError::new_err(format!(
-                        "rtpengine.subscribe_answer failed: {error}"
-                    ))
-                })?;
+            let verb = client.subscribe_answer(leg.call_id(), &from_tag, &to_tag, &sdp, &flags);
+            let rewritten_sdp = leg.run(verb).await.map_err(|error| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "rtpengine.subscribe_answer failed: {error}"
+                ))
+            })?;
             debug!(
                 call_id = %call_id,
                 from_tag = %from_tag,
@@ -2254,19 +2321,21 @@ impl PyRtpEngine {
     ///     call_id: rtpengine call-id of the source session.
     ///     from_tag: source monologue tag.
     ///     to_tag: subscriber tag to remove.
-    #[pyo3(signature = (call_id, from_tag, to_tag))]
+    ///     scope: The scope :meth:`subscribe_request` named.
+    #[pyo3(signature = (call_id, from_tag, to_tag, scope=None))]
     fn unsubscribe<'py>(
         &self,
         python: Python<'py>,
         call_id: String,
         from_tag: String,
         to_tag: String,
+        scope: Option<&str>,
     ) -> PyResult<Bound<'py, PyAny>> {
+        let leg = self.leg(scope, None, &call_id, "unsubscribe")?;
         let client = Arc::clone(&self.client);
 
         pyo3_async_runtimes::tokio::future_into_py(python, async move {
-            client
-                .unsubscribe(&call_id, &from_tag, &to_tag)
+            leg.run(client.unsubscribe(leg.call_id(), &from_tag, &to_tag))
                 .await
                 .map_err(|error| {
                     pyo3::exceptions::PyRuntimeError::new_err(format!(
@@ -2333,7 +2402,10 @@ impl PyRtpEngine {
     ///         a multiple of 1000 within 8000–48000; the engine *fails* the
     ///         attach on anything else rather than clamping, so it is checked
     ///         here first. ``None`` (default) leaves the engine's choice.
-    #[pyo3(signature = (target, ws_uri, direction="both", channels=None, sample_rate=None))]
+    ///     scope: The leg's per-call scope, as for :meth:`play_media`. Its
+    ///         tee events carry the same scope.
+    #[pyo3(signature = (target, ws_uri, direction="both", channels=None, sample_rate=None, scope=None))]
+    #[allow(clippy::too_many_arguments)]
     fn attach_ws_tee<'py>(
         &self,
         python: Python<'py>,
@@ -2342,8 +2414,11 @@ impl PyRtpEngine {
         direction: &str,
         channels: Option<u8>,
         sample_rate: Option<u32>,
+        scope: Option<&str>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let (call_id, from_tag, ws_uri) = stream_target(target, &ws_uri)?;
+        let leg = self.leg(scope, Some(target), &call_id, "attach_ws_tee")?;
+        let sessions = scope::store_for(&self.sessions, leg.scope())?;
 
         let direction = WsTeeDirection::parse(direction).ok_or_else(|| {
             pyo3::exceptions::PyValueError::new_err(format!(
@@ -2374,24 +2449,21 @@ impl PyRtpEngine {
         }
 
         let client = Arc::clone(&self.client);
-        let sessions = Arc::clone(&self.sessions);
 
         pyo3_async_runtimes::tokio::future_into_py(python, async move {
-            client
-                .attach_ws_tee(
-                    &call_id,
-                    &from_tag,
-                    &ws_uri,
-                    direction,
-                    channels,
-                    sample_rate,
-                )
-                .await
-                .map_err(|error| {
-                    pyo3::exceptions::PyRuntimeError::new_err(format!(
-                        "rtpengine.attach_ws_tee failed: {error}"
-                    ))
-                })?;
+            let verb = client.attach_ws_tee(
+                leg.call_id(),
+                &from_tag,
+                &ws_uri,
+                direction,
+                channels,
+                sample_rate,
+            );
+            leg.run(verb).await.map_err(|error| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "rtpengine.attach_ws_tee failed: {error}"
+                ))
+            })?;
             // Recorded only after the engine accepted, so a failed attach never
             // leaves a bridge plan detaching a tee that was never there.
             sessions.set_ws_tee(&call_id, Some(ws_uri.clone()));
@@ -2422,19 +2494,21 @@ impl PyRtpEngine {
     ///
     /// Args:
     ///     target: Request, Reply or Call identifying the media session.
-    #[pyo3(signature = (target))]
+    ///     scope: The leg's per-call scope, as for :meth:`play_media`.
+    #[pyo3(signature = (target, scope=None))]
     fn detach_ws_tee<'py>(
         &self,
         python: Python<'py>,
         target: &Bound<'py, PyAny>,
+        scope: Option<&str>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let (call_id, from_tag) = resolve_call_from_tag(target)?;
+        let leg = self.leg(scope, Some(target), &call_id, "detach_ws_tee")?;
+        let sessions = scope::store_for(&self.sessions, leg.scope())?;
         let client = Arc::clone(&self.client);
-        let sessions = Arc::clone(&self.sessions);
 
         pyo3_async_runtimes::tokio::future_into_py(python, async move {
-            client
-                .detach_ws_tee(&call_id, &from_tag)
+            leg.run(client.detach_ws_tee(leg.call_id(), &from_tag))
                 .await
                 .map_err(|error| {
                     pyo3::exceptions::PyRuntimeError::new_err(format!(
@@ -2491,15 +2565,18 @@ impl PyRtpEngine {
     ///         templated as for :meth:`attach_ws_tee`.
     ///     profile: name of a media profile (built-in or ``media.profiles``).
     ///         Raises ``ValueError`` for an unknown name.
-    #[pyo3(signature = (target, ws_uri, profile=None))]
+    ///     scope: The leg's per-call scope, as for :meth:`play_media`.
+    #[pyo3(signature = (target, ws_uri, profile=None, scope=None))]
     fn attach_ws_bridge<'py>(
         &self,
         python: Python<'py>,
         target: &Bound<'py, PyAny>,
         ws_uri: String,
         profile: Option<String>,
+        scope: Option<&str>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let (call_id, from_tag, ws_uri) = stream_target(target, &ws_uri)?;
+        let leg = self.leg(scope, Some(target), &call_id, "attach_ws_bridge")?;
         // The answer half, as for `answer` with a `ws_uri`, and resolved before
         // anything is sent so an unknown name changes nothing on the call.
         let flags = match profile.as_deref() {
@@ -2516,12 +2593,11 @@ impl PyRtpEngine {
                     })?,
             ),
         };
+        let sessions = scope::store_for(&self.sessions, leg.scope())?;
         let client = Arc::clone(&self.client);
-        let sessions = Arc::clone(&self.sessions);
 
         pyo3_async_runtimes::tokio::future_into_py(python, async move {
-            client
-                .attach_ws_bridge(&call_id, &from_tag, &ws_uri, flags.as_ref())
+            leg.run(client.attach_ws_bridge(leg.call_id(), &from_tag, &ws_uri, flags.as_ref()))
                 .await
                 .map_err(|error| {
                     pyo3::exceptions::PyRuntimeError::new_err(format!(
@@ -2560,19 +2636,21 @@ impl PyRtpEngine {
     ///
     /// Args:
     ///     target: Request, Reply or Call identifying the media session.
-    #[pyo3(signature = (target))]
+    ///     scope: The leg's per-call scope, as for :meth:`play_media`.
+    #[pyo3(signature = (target, scope=None))]
     fn detach_ws_bridge<'py>(
         &self,
         python: Python<'py>,
         target: &Bound<'py, PyAny>,
+        scope: Option<&str>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let (call_id, from_tag) = resolve_call_from_tag(target)?;
+        let leg = self.leg(scope, Some(target), &call_id, "detach_ws_bridge")?;
+        let sessions = scope::store_for(&self.sessions, leg.scope())?;
         let client = Arc::clone(&self.client);
-        let sessions = Arc::clone(&self.sessions);
 
         pyo3_async_runtimes::tokio::future_into_py(python, async move {
-            client
-                .detach_ws_bridge(&call_id, &from_tag)
+            leg.run(client.detach_ws_bridge(leg.call_id(), &from_tag))
                 .await
                 .map_err(|error| {
                     pyo3::exceptions::PyRuntimeError::new_err(format!(
@@ -2605,6 +2683,12 @@ impl PyRtpEngine {
     /// def handle_any(call_id, from_tag, digit, duration_ms, volume):
     ///     ...
     /// ```
+    ///
+    /// A digit on a leg anchored under a per-call scope
+    /// (``offer(..., scope=)``) arrives under the SIP Call-ID, and a handler
+    /// that takes a ``scope`` keyword (``def handle(..., scope=None)``) is
+    /// also given the scope. Every media event decorator works this way; a
+    /// handler without the keyword is called as before.
     ///
     /// Args:
     ///     func_or_none: When applied directly (``@rtpengine.on_dtmf``) this

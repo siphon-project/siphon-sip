@@ -1,6 +1,7 @@
 //! The media backend's asynchronous event stream.
 
 use super::*;
+use crate::rtpengine::CallScope;
 
 /// Drain the media backend's asynchronous event stream — DTMF, the
 /// WebSocket tee's lifecycle, a call the engine tore down on its own — and
@@ -14,10 +15,14 @@ pub fn spawn_rtpengine_events(
         let mut events_rx = rtpengine_events_rx;
         let state_for_events = Arc::clone(state);
         tokio::spawn(async move {
-            while let Some(event) = events_rx.recv().await {
+            while let Some(mut event) = events_rx.recv().await {
+                // Every backend reports a leg a script anchored under a
+                // per-call scope under its engine call-id; the handlers see
+                // the SIP Call-ID, and the scope as a keyword of its own.
+                let scope = crate::rtpengine::backend::split_event_scope(&mut event);
                 match event {
                     crate::rtpengine::events::RtpEngineEvent::Dtmf(dtmf) => {
-                        on_dtmf(&state_for_events, dtmf).await;
+                        on_dtmf(&state_for_events, dtmf, scope).await;
                     }
                     crate::rtpengine::events::RtpEngineEvent::RecordingFinished(recording) => {
                         on_recording_finished(&state_for_events, recording);
@@ -27,43 +32,43 @@ pub fn spawn_rtpengine_events(
                         from_tag,
                         reason,
                     } => {
-                        on_media_timeout(&state_for_events, call_id, from_tag, reason).await;
+                        on_media_timeout(&state_for_events, call_id, from_tag, reason, scope).await;
                     }
                     crate::rtpengine::events::RtpEngineEvent::CallSummary(summary) => {
                         on_call_summary(&state_for_events, summary).await;
                     }
                     crate::rtpengine::events::RtpEngineEvent::Text(text_event) => {
-                        on_text(&state_for_events, text_event).await;
+                        on_text(&state_for_events, text_event, scope).await;
                     }
                     crate::rtpengine::events::RtpEngineEvent::WsTeeStarted(tee) => {
-                        on_ws_tee_started(&state_for_events, tee).await;
+                        on_ws_tee_started(&state_for_events, tee, scope).await;
                     }
                     crate::rtpengine::events::RtpEngineEvent::PlayFinished(play) => {
-                        on_play_finished(&state_for_events, play).await;
+                        on_play_finished(&state_for_events, play, scope).await;
                     }
                     crate::rtpengine::events::RtpEngineEvent::WsBridgeStarted(bridge) => {
-                        on_ws_bridge_started(&state_for_events, bridge).await;
+                        on_ws_bridge_started(&state_for_events, bridge, scope).await;
                     }
                     crate::rtpengine::events::RtpEngineEvent::WsBridgeEnded(bridge) => {
-                        on_ws_bridge_ended(&state_for_events, bridge).await;
+                        on_ws_bridge_ended(&state_for_events, bridge, scope).await;
                     }
                     crate::rtpengine::events::RtpEngineEvent::WsTeeEnded(tee) => {
-                        on_ws_tee_ended(&state_for_events, tee).await;
+                        on_ws_tee_ended(&state_for_events, tee, scope).await;
                     }
                     crate::rtpengine::events::RtpEngineEvent::BeepDetected(beep) => {
-                        on_beep_detected(&state_for_events, beep).await;
+                        on_beep_detected(&state_for_events, beep, scope).await;
                     }
                     crate::rtpengine::events::RtpEngineEvent::X3Started(started) => {
                         on_x3_started(&state_for_events, started).await;
                     }
                     crate::rtpengine::events::RtpEngineEvent::X3Loss(loss) => {
-                        on_x3_loss(&state_for_events, loss).await;
+                        on_x3_loss(&state_for_events, loss, scope).await;
                     }
                     crate::rtpengine::events::RtpEngineEvent::X3Ended(ended) => {
-                        on_x3_ended(&state_for_events, ended).await;
+                        on_x3_ended(&state_for_events, ended, scope).await;
                     }
                     crate::rtpengine::events::RtpEngineEvent::MediaStarted(started) => {
-                        on_media_started(&state_for_events, started).await;
+                        on_media_started(&state_for_events, started, scope).await;
                     }
                     crate::rtpengine::events::RtpEngineEvent::ActiveSpeaker(speaker) => {
                         on_active_speaker(&state_for_events, speaker).await;
@@ -93,17 +98,22 @@ pub async fn dispatch_dtmf_event(
     dtmf: crate::rtpengine::events::DtmfEvent,
 ) {
     control_forward_signalled_dtmf(&dtmf);
-    run_dtmf_handlers(&state, dtmf).await
+    // A digit signalled in SIP names the dialog, never a media leg's scope.
+    run_dtmf_handlers(&state, dtmf, None).await
 }
 
-async fn on_dtmf(state: &Arc<DispatcherState>, dtmf: crate::rtpengine::events::DtmfEvent) {
+async fn on_dtmf(
+    state: &Arc<DispatcherState>,
+    dtmf: crate::rtpengine::events::DtmfEvent,
+    scope: Option<CallScope>,
+) {
     // Additive control-plane forward: a controlled channel
     // gets the digit as a ChannelDtmfReceived event too, so an
     // external IVR / AI app collects digits from the event
     // stream. Runs before the Python-handler short-circuit so
     // it fires whether or not @rtpengine.on_dtmf is registered.
     control_forward_dtmf(state, &dtmf);
-    run_dtmf_handlers(state, dtmf).await
+    run_dtmf_handlers(state, dtmf, scope).await
 }
 
 /// The `@rtpengine.on_dtmf` handlers for one digit, keyed on the call-id and
@@ -111,6 +121,7 @@ async fn on_dtmf(state: &Arc<DispatcherState>, dtmf: crate::rtpengine::events::D
 async fn run_dtmf_handlers(
     state: &Arc<DispatcherState>,
     dtmf: crate::rtpengine::events::DtmfEvent,
+    scope: Option<CallScope>,
 ) {
     let engine_state = state.engine.state();
     let handlers = engine_state.dtmf_handlers(&dtmf.call_id, &dtmf.from_tag);
@@ -125,13 +136,20 @@ async fn run_dtmf_handlers(
         pyo3::Python::attach(|python| {
             for handler in handlers {
                 let callable = handler.callable.bind(python);
-                let result = callable.call1((
-                    dtmf_clone.call_id.as_str(),
-                    dtmf_clone.from_tag.as_str(),
-                    dtmf_clone.digit.as_str(),
-                    dtmf_clone.duration_ms,
-                    dtmf_clone.volume,
-                ));
+                let result = crate::script::handler_keyword::call_with_optional_keyword(
+                    python,
+                    callable,
+                    (
+                        dtmf_clone.call_id.as_str(),
+                        dtmf_clone.from_tag.as_str(),
+                        dtmf_clone.digit.as_str(),
+                        dtmf_clone.duration_ms,
+                        dtmf_clone.volume,
+                    ),
+                    5,
+                    "scope",
+                    scope.as_ref().map(CallScope::as_str),
+                );
                 match result {
                     Ok(ret) => {
                         if handler.is_async {
@@ -213,6 +231,7 @@ async fn on_media_timeout(
     call_id: String,
     from_tag: String,
     reason: &'static str,
+    scope: Option<CallScope>,
 ) {
     // The media engine owns the call and reaped it on timeout
     // (the reaper removes the call *before* emitting this
@@ -221,7 +240,21 @@ async fn on_media_timeout(
     // drives (e.g. b2bua.terminate) then finds no record and
     // issues no safety-net delete against a call the engine
     // already dropped — no wasted round-trip, no "unknown call".
-    clear_media_session_on_timeout(state.rtpengine_sessions.as_ref(), &call_id);
+    match &scope {
+        // A scoped leg's session sits in its scope's store.
+        Some(scope) => {
+            if let Some(store) = state
+                .rtpengine_sessions
+                .as_ref()
+                .and_then(|sessions| sessions.scoped_existing(scope))
+            {
+                store.remove(&call_id);
+            }
+        }
+        None => {
+            clear_media_session_on_timeout(state.rtpengine_sessions.as_ref(), &call_id);
+        }
+    }
     // The media engine tore down a dead-path call. Log it for
     // visibility regardless of whether a script handles it,
     // then invoke any @rtpengine.on_media_timeout handlers so
@@ -251,7 +284,14 @@ async fn on_media_timeout(
         pyo3::Python::attach(|python| {
             for handler in handlers {
                 let callable = handler.callable.bind(python);
-                let result = callable.call1((call_id_clone.as_str(), from_tag_clone.as_str()));
+                let result = crate::script::handler_keyword::call_with_optional_keyword(
+                    python,
+                    callable,
+                    (call_id_clone.as_str(), from_tag_clone.as_str()),
+                    2,
+                    "scope",
+                    scope.as_ref().map(CallScope::as_str),
+                );
                 match result {
                     Ok(ret) => {
                         if handler.is_async {
@@ -362,7 +402,11 @@ pub(super) fn deliver_media_summary(
     }
 }
 
-async fn on_text(state: &Arc<DispatcherState>, text_event: crate::rtpengine::events::TextEvent) {
+async fn on_text(
+    state: &Arc<DispatcherState>,
+    text_event: crate::rtpengine::events::TextEvent,
+    scope: Option<CallScope>,
+) {
     tracing::debug!(
         call_id = %text_event.call_id,
         from_tag = %text_event.from_tag,
@@ -383,13 +427,20 @@ async fn on_text(state: &Arc<DispatcherState>, text_event: crate::rtpengine::eve
         pyo3::Python::attach(|python| {
             for handler in handlers {
                 let callable = handler.callable.bind(python);
-                let result = callable.call1((
-                    text_clone.call_id.as_str(),
-                    text_clone.from_tag.as_str(),
-                    text_clone.to_tag.as_deref(),
-                    text_clone.text.as_str(),
-                    text_clone.direction.as_deref(),
-                ));
+                let result = crate::script::handler_keyword::call_with_optional_keyword(
+                    python,
+                    callable,
+                    (
+                        text_clone.call_id.as_str(),
+                        text_clone.from_tag.as_str(),
+                        text_clone.to_tag.as_deref(),
+                        text_clone.text.as_str(),
+                        text_clone.direction.as_deref(),
+                    ),
+                    5,
+                    "scope",
+                    scope.as_ref().map(CallScope::as_str),
+                );
                 match result {
                     Ok(ret) => {
                         if handler.is_async {
@@ -417,6 +468,7 @@ async fn on_text(state: &Arc<DispatcherState>, text_event: crate::rtpengine::eve
 async fn on_ws_tee_started(
     state: &Arc<DispatcherState>,
     tee: crate::rtpengine::events::WsTeeStarted,
+    scope: Option<CallScope>,
 ) {
     tracing::debug!(
         call_id = %tee.call_id,
@@ -443,15 +495,22 @@ async fn on_ws_tee_started(
         pyo3::Python::attach(|python| {
             for handler in handlers {
                 let callable = handler.callable.bind(python);
-                let result = callable.call1((
-                    tee_clone.call_id.as_str(),
-                    tee_clone.from_tag.as_str(),
-                    tee_clone.stream_id.as_str(),
-                    tee_clone.ws_uri.as_str(),
-                    tee_clone.direction.as_str(),
-                    tee_clone.channels,
-                    tee_clone.sample_rate,
-                ));
+                let result = crate::script::handler_keyword::call_with_optional_keyword(
+                    python,
+                    callable,
+                    (
+                        tee_clone.call_id.as_str(),
+                        tee_clone.from_tag.as_str(),
+                        tee_clone.stream_id.as_str(),
+                        tee_clone.ws_uri.as_str(),
+                        tee_clone.direction.as_str(),
+                        tee_clone.channels,
+                        tee_clone.sample_rate,
+                    ),
+                    7,
+                    "scope",
+                    scope.as_ref().map(CallScope::as_str),
+                );
                 match result {
                     Ok(ret) => {
                         if handler.is_async {
@@ -519,6 +578,7 @@ pub(super) fn publish_play_finished(
 async fn on_play_finished(
     state: &Arc<DispatcherState>,
     play: crate::rtpengine::events::PlayFinishedEvent,
+    scope: Option<CallScope>,
 ) {
     tracing::debug!(
         call_id = %play.call_id,
@@ -528,6 +588,14 @@ async fn on_play_finished(
         played_ms = ?play.played_ms,
         "media engine finished a playback"
     );
+    if let Some(scope) = &scope {
+        // A scoped leg's playback was recorded under the leg's engine call-id.
+        crate::rtpengine::MediaBackend::playback_finished(
+            &crate::rtpengine::backend::engine_call_id(&play.call_id, Some(scope)),
+            &play.from_tag,
+            play.play_id,
+        );
+    }
     publish_play_finished(state, &play);
     let engine_state = state.engine.state();
     let handlers = engine_state.play_finished_handlers(&play.call_id, &play.from_tag);
@@ -543,13 +611,20 @@ async fn on_play_finished(
         pyo3::Python::attach(|python| {
             for handler in handlers {
                 let callable = handler.callable.bind(python);
-                let result = callable.call1((
-                    play_clone.call_id.as_str(),
-                    play_clone.from_tag.as_str(),
-                    play_clone.play_id,
-                    play_clone.reason.as_str(),
-                    play_clone.played_ms,
-                ));
+                let result = crate::script::handler_keyword::call_with_optional_keyword(
+                    python,
+                    callable,
+                    (
+                        play_clone.call_id.as_str(),
+                        play_clone.from_tag.as_str(),
+                        play_clone.play_id,
+                        play_clone.reason.as_str(),
+                        play_clone.played_ms,
+                    ),
+                    5,
+                    "scope",
+                    scope.as_ref().map(CallScope::as_str),
+                );
                 match result {
                     Ok(ret) => {
                         if handler.is_async {
@@ -577,6 +652,7 @@ async fn on_play_finished(
 async fn on_ws_bridge_started(
     state: &Arc<DispatcherState>,
     bridge: crate::rtpengine::events::WsBridgeStarted,
+    scope: Option<CallScope>,
 ) {
     tracing::debug!(
         call_id = %bridge.call_id,
@@ -601,13 +677,20 @@ async fn on_ws_bridge_started(
         pyo3::Python::attach(|python| {
             for handler in handlers {
                 let callable = handler.callable.bind(python);
-                let result = callable.call1((
-                    bridge_clone.call_id.as_str(),
-                    bridge_clone.from_tag.as_str(),
-                    bridge_clone.stream_id.as_str(),
-                    bridge_clone.ws_uri.as_str(),
-                    bridge_clone.sample_rate,
-                ));
+                let result = crate::script::handler_keyword::call_with_optional_keyword(
+                    python,
+                    callable,
+                    (
+                        bridge_clone.call_id.as_str(),
+                        bridge_clone.from_tag.as_str(),
+                        bridge_clone.stream_id.as_str(),
+                        bridge_clone.ws_uri.as_str(),
+                        bridge_clone.sample_rate,
+                    ),
+                    5,
+                    "scope",
+                    scope.as_ref().map(CallScope::as_str),
+                );
                 match result {
                     Ok(ret) => {
                         if handler.is_async {
@@ -635,6 +718,7 @@ async fn on_ws_bridge_started(
 async fn on_ws_bridge_ended(
     state: &Arc<DispatcherState>,
     bridge: crate::rtpengine::events::WsBridgeEnded,
+    scope: Option<CallScope>,
 ) {
     // A bridge that ends for anything other than an explicit
     // detach, a re-point or its call ending leaves a *live call
@@ -674,12 +758,19 @@ async fn on_ws_bridge_ended(
         pyo3::Python::attach(|python| {
             for handler in handlers {
                 let callable = handler.callable.bind(python);
-                let result = callable.call1((
-                    bridge_clone.call_id.as_str(),
-                    bridge_clone.from_tag.as_str(),
-                    bridge_clone.stream_id.as_str(),
-                    bridge_clone.reason.as_str(),
-                ));
+                let result = crate::script::handler_keyword::call_with_optional_keyword(
+                    python,
+                    callable,
+                    (
+                        bridge_clone.call_id.as_str(),
+                        bridge_clone.from_tag.as_str(),
+                        bridge_clone.stream_id.as_str(),
+                        bridge_clone.reason.as_str(),
+                    ),
+                    4,
+                    "scope",
+                    scope.as_ref().map(CallScope::as_str),
+                );
                 match result {
                     Ok(ret) => {
                         if handler.is_async {
@@ -704,7 +795,11 @@ async fn on_ws_bridge_ended(
     .await;
 }
 
-async fn on_ws_tee_ended(state: &Arc<DispatcherState>, tee: crate::rtpengine::events::WsTeeEnded) {
+async fn on_ws_tee_ended(
+    state: &Arc<DispatcherState>,
+    tee: crate::rtpengine::events::WsTeeEnded,
+    scope: Option<CallScope>,
+) {
     // A tee that ends for anything other than an explicit
     // detach or its call ending means audio stopped reaching
     // the consumer while the call is still up — the AI backend went away and the
@@ -746,14 +841,21 @@ async fn on_ws_tee_ended(state: &Arc<DispatcherState>, tee: crate::rtpengine::ev
         pyo3::Python::attach(|python| {
             for handler in handlers {
                 let callable = handler.callable.bind(python);
-                let result = callable.call1((
-                    tee_clone.call_id.as_str(),
-                    tee_clone.from_tag.as_str(),
-                    tee_clone.stream_id.as_str(),
-                    tee_clone.reason.as_str(),
-                    tee_clone.frames_sent,
-                    tee_clone.frames_dropped,
-                ));
+                let result = crate::script::handler_keyword::call_with_optional_keyword(
+                    python,
+                    callable,
+                    (
+                        tee_clone.call_id.as_str(),
+                        tee_clone.from_tag.as_str(),
+                        tee_clone.stream_id.as_str(),
+                        tee_clone.reason.as_str(),
+                        tee_clone.frames_sent,
+                        tee_clone.frames_dropped,
+                    ),
+                    6,
+                    "scope",
+                    scope.as_ref().map(CallScope::as_str),
+                );
                 match result {
                     Ok(ret) => {
                         if handler.is_async {
@@ -781,6 +883,7 @@ async fn on_ws_tee_ended(state: &Arc<DispatcherState>, tee: crate::rtpengine::ev
 async fn on_beep_detected(
     state: &Arc<DispatcherState>,
     beep: crate::rtpengine::events::BeepDetectedEvent,
+    scope: Option<CallScope>,
 ) {
     tracing::debug!(
         call_id = %beep.call_id,
@@ -803,14 +906,21 @@ async fn on_beep_detected(
         pyo3::Python::attach(|python| {
             for handler in handlers {
                 let callable = handler.callable.bind(python);
-                let result = callable.call1((
-                    beep_clone.call_id.as_str(),
-                    beep_clone.from_tag.as_str(),
-                    beep_clone.to_tag.as_deref(),
-                    beep_clone.frequency_hz,
-                    beep_clone.duration_ms,
-                    beep_clone.offset_ms,
-                ));
+                let result = crate::script::handler_keyword::call_with_optional_keyword(
+                    python,
+                    callable,
+                    (
+                        beep_clone.call_id.as_str(),
+                        beep_clone.from_tag.as_str(),
+                        beep_clone.to_tag.as_deref(),
+                        beep_clone.frequency_hz,
+                        beep_clone.duration_ms,
+                        beep_clone.offset_ms,
+                    ),
+                    6,
+                    "scope",
+                    scope.as_ref().map(CallScope::as_str),
+                );
                 match result {
                     Ok(ret) => {
                         if handler.is_async {
@@ -840,6 +950,7 @@ async fn on_beep_detected(
 async fn on_media_started(
     state: &Arc<DispatcherState>,
     started: crate::rtpengine::events::MediaStartedEvent,
+    scope: Option<CallScope>,
 ) {
     tracing::debug!(
         call_id = %started.call_id,
@@ -864,14 +975,21 @@ async fn on_media_started(
         pyo3::Python::attach(|python| {
             for handler in handlers {
                 let callable = handler.callable.bind(python);
-                let result = callable.call1((
-                    started.call_id.as_str(),
-                    started.from_tag.as_str(),
-                    started.to_tag.as_deref(),
-                    started.leg.as_str(),
-                    source.as_deref(),
-                    signalled.as_deref(),
-                ));
+                let result = crate::script::handler_keyword::call_with_optional_keyword(
+                    python,
+                    callable,
+                    (
+                        started.call_id.as_str(),
+                        started.from_tag.as_str(),
+                        started.to_tag.as_deref(),
+                        started.leg.as_str(),
+                        source.as_deref(),
+                        signalled.as_deref(),
+                    ),
+                    6,
+                    "scope",
+                    scope.as_ref().map(CallScope::as_str),
+                );
                 match result {
                     Ok(ret) => {
                         if handler.is_async {
@@ -908,7 +1026,19 @@ async fn on_x3_started(
     );
 }
 
-async fn on_x3_loss(state: &Arc<DispatcherState>, loss: crate::rtpengine::events::X3LossEvent) {
+/// ` on leg <scope>` in an ADMF report for a leg anchored under a per-call
+/// scope, nothing for the call's own media.
+fn leg_suffix(scope: Option<&CallScope>) -> String {
+    scope.map_or_else(String::new, |scope| format!(" on leg {scope}"))
+}
+
+/// A delivery loss on one leg of an intercepted call: the leg the engine
+/// reported it on, `scope` for a leg anchored under a per-call scope.
+async fn on_x3_loss(
+    state: &Arc<DispatcherState>,
+    loss: crate::rtpengine::events::X3LossEvent,
+    scope: Option<CallScope>,
+) {
     // Warranted content did not reach the agency. This is a
     // reportable compliance failure, not a degraded
     // recording, so it goes to the ADMF as a
@@ -922,12 +1052,16 @@ async fn on_x3_loss(state: &Arc<DispatcherState>, loss: crate::rtpengine::events
          content did not reach the agency"
     );
     if let Some(li) = state.li_manager.as_ref() {
-        for attachment in li.x3_attachments_for(&loss.call_id) {
+        for attachment in li.x3_attachments_for_leg(&loss.call_id, scope.as_ref()) {
             let li = li.clone();
             let detail = format!(
-                "X3 delivery loss on task {}: {} packet(s) dropped, {} \
+                "X3 delivery loss on task {}{}: {} packet(s) dropped, {} \
              delivered, gap began {} ms into the interception",
-                attachment.x_id, loss.dropped, loss.delivered, loss.dropped_since_ms
+                attachment.x_id,
+                leg_suffix(attachment.scope.as_ref()),
+                loss.dropped,
+                loss.delivered,
+                loss.dropped_since_ms
             );
             let d_id = attachment.d_id;
             tokio::spawn(async move {
@@ -943,7 +1077,13 @@ async fn on_x3_loss(state: &Arc<DispatcherState>, loss: crate::rtpengine::events
     }
 }
 
-async fn on_x3_ended(state: &Arc<DispatcherState>, ended: crate::rtpengine::events::X3EndedEvent) {
+/// The end of one leg's delivery. Only that leg's record goes: on a call
+/// whose scoped legs are each tapped, the other legs are still delivering.
+async fn on_x3_ended(
+    state: &Arc<DispatcherState>,
+    ended: crate::rtpengine::events::X3EndedEvent,
+    scope: Option<CallScope>,
+) {
     // An orderly end is our own detach. Anything else means
     // delivery stopped for a reason the ADMF should hear,
     // and any drop at all means content was lost.
@@ -967,17 +1107,21 @@ async fn on_x3_ended(state: &Arc<DispatcherState>, ended: crate::rtpengine::even
         // The engine has stopped; drop our record either
         // way so the map does not grow across calls.
         let attachments = if ended.orderly && ended.dropped == 0 {
-            li.take_x3_attachments(&ended.call_id)
+            li.take_x3_attachments_for_leg(&ended.call_id, scope.as_ref())
         } else {
-            li.x3_attachments_for(&ended.call_id)
+            li.x3_attachments_for_leg(&ended.call_id, scope.as_ref())
         };
         if !(ended.orderly && ended.dropped == 0) {
             for attachment in attachments {
                 let li = li.clone();
                 let detail = format!(
-                    "X3 delivery ended for task {} ({}): {} delivered, {} \
+                    "X3 delivery ended for task {}{} ({}): {} delivered, {} \
                  dropped",
-                    attachment.x_id, ended.reason, ended.delivered, ended.dropped
+                    attachment.x_id,
+                    leg_suffix(attachment.scope.as_ref()),
+                    ended.reason,
+                    ended.delivered,
+                    ended.dropped
                 );
                 let d_id = attachment.d_id;
                 tokio::spawn(async move {
@@ -990,7 +1134,7 @@ async fn on_x3_ended(state: &Arc<DispatcherState>, ended: crate::rtpengine::even
                     .await;
                 });
             }
-            li.take_x3_attachments(&ended.call_id);
+            li.take_x3_attachments_for_leg(&ended.call_id, scope.as_ref());
         }
     }
 }

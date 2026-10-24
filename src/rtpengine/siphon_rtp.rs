@@ -61,6 +61,7 @@ use events::{
     convert_event, convert_leg_summary, play_end_reason_from_proto, ws_bridge_end_reason_from_proto,
 };
 pub use identity::set_controller_id;
+pub(crate) use per_call::{frame_scope, in_frame_scope};
 pub use scope::CallScope;
 use scope::CallScopes;
 use waiters::Waiters;
@@ -325,8 +326,11 @@ impl SiphonRtpClient {
     /// so a command issued during the startup or post-reconnect window blocks
     /// for the connection instead of failing immediately. A genuinely
     /// unreachable engine surfaces as [`RtpEngineError::Timeout`].
+    ///
+    /// Under a leg's per-call scope ([`per_call::in_frame_scope`]) the frame
+    /// carries that scope in place of the node's.
     async fn request(&self, command: Command) -> Result<CmdResult, RtpEngineError> {
-        self.request_in(None, command).await
+        self.request_in_frame(command).await
     }
 
     /// [`Self::request`] with the frame under `scope` in place of the node's
@@ -478,7 +482,10 @@ impl SiphonRtpClient {
             })
             .await?;
         let answer_sdp = expect_sdp(result)?;
-        self.sessions.insert(call_id.to_string(), ());
+        self.sessions.insert(
+            per_call::scoped_key(call_id, per_call::frame_scope().as_ref()).into_owned(),
+            (),
+        );
         Ok(String::from_utf8_lossy(&answer_sdp).into_owned())
     }
 
@@ -1183,8 +1190,18 @@ impl SiphonRtpClientSet {
         }))
     }
 
-    /// Select a client by call-id affinity or weighted round-robin.
+    /// Select a client by call-id affinity or weighted round-robin; under a
+    /// leg's per-call scope, by the leg's own affinity.
     fn select(&self, call_id: &str) -> &Arc<SiphonRtpClient> {
+        self.select_key(&per_call::scoped_key(
+            call_id,
+            per_call::frame_scope().as_ref(),
+        ))
+    }
+
+    /// Select a client by the affinity of `call_id`, a key as
+    /// [`per_call::scoped_key`] makes one, or weighted round-robin.
+    fn select_key(&self, call_id: &str) -> &Arc<SiphonRtpClient> {
         if self.clients.len() == 1 {
             return &self.clients[0];
         }
@@ -1201,8 +1218,18 @@ impl SiphonRtpClientSet {
         &self.clients[index]
     }
 
-    /// Record call-id affinity after the first command (multi-instance only).
+    /// Record call-id affinity after the first command (multi-instance only);
+    /// under a leg's per-call scope, the leg's.
     fn bind_affinity(&self, call_id: &str) {
+        self.bind_affinity_key(&per_call::scoped_key(
+            call_id,
+            per_call::frame_scope().as_ref(),
+        ));
+    }
+
+    /// Record the affinity of `call_id`, a key as [`per_call::scoped_key`]
+    /// makes one.
+    fn bind_affinity_key(&self, call_id: &str) {
         if self.clients.len() <= 1 || self.affinity.contains_key(call_id) {
             return;
         }

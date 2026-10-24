@@ -117,6 +117,36 @@ pub enum RtpEngineEvent {
     },
 }
 
+impl RtpEngineEvent {
+    /// The engine call-id the event names, for the one place that rewrites it:
+    /// a leg anchored under a per-call scope is reported under its engine
+    /// call-id (`<call-id>;<scope>`, see
+    /// [`crate::rtpengine::backend::engine_call_id`]) and the dispatcher splits
+    /// that back into the SIP Call-ID and the scope. `None` for an event that
+    /// names a conference room rather than a call.
+    pub fn call_id_mut(&mut self) -> Option<&mut String> {
+        match self {
+            Self::Dtmf(event) => Some(&mut event.call_id),
+            Self::RecordingFinished(event) => Some(&mut event.call_id),
+            Self::MediaTimeout { call_id, .. } => Some(call_id),
+            Self::CallSummary(event) => Some(&mut event.call_id),
+            Self::Text(event) => Some(&mut event.call_id),
+            Self::WsTeeStarted(event) => Some(&mut event.call_id),
+            Self::WsTeeEnded(event) => Some(&mut event.call_id),
+            Self::PlayFinished(event) => Some(&mut event.call_id),
+            Self::WsBridgeStarted(event) => Some(&mut event.call_id),
+            Self::WsBridgeEnded(event) => Some(&mut event.call_id),
+            Self::BeepDetected(event) => Some(&mut event.call_id),
+            Self::X3Started(event) => Some(&mut event.call_id),
+            Self::X3Loss(event) => Some(&mut event.call_id),
+            Self::X3Ended(event) => Some(&mut event.call_id),
+            Self::MediaStarted(event) => Some(&mut event.call_id),
+            Self::ActiveSpeaker(_) => None,
+            Self::Unknown { call_id, .. } => call_id.as_mut(),
+        }
+    }
+}
+
 /// The dominant speaker of a conference room, carried by
 /// [`RtpEngineEvent::ActiveSpeaker`].
 ///

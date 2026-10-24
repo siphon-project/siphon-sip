@@ -37,7 +37,7 @@ mod conference;
 mod release;
 pub use conference::{BridgeDirection, ConferenceRole, ConferenceSeat};
 mod scoped;
-pub use scoped::engine_call_id;
+pub use scoped::{engine_call_id, split_engine_call_id, split_event_scope, ScopedLeg};
 
 /// The configured media-control backend.
 pub enum MediaBackend {
@@ -360,7 +360,7 @@ impl MediaBackend {
             .await;
         if let Ok(accepted) = &outcome {
             let mut plays = ACTIVE_PLAYBACKS
-                .entry((call_id.to_string(), from_tag.to_string()))
+                .entry((scoped::leg_key(call_id).into_owned(), from_tag.to_string()))
                 .or_default();
             // A playback that is not an overlay supersedes whatever the leg was
             // playing, so it is the only one left.
@@ -389,7 +389,11 @@ impl MediaBackend {
         match self {
             Self::SiphonRtp(set) => {
                 let recording_id = set.start_recording(call_id, from_tag, request).await?;
-                Self::recording_started(&recording_id, call_id, std::time::Instant::now());
+                Self::recording_started(
+                    &recording_id,
+                    &scoped::leg_key(call_id),
+                    std::time::Instant::now(),
+                );
                 Ok(recording_id)
             }
             Self::RtpEngine(_) => Err(RtpEngineError::Unsupported {
@@ -619,9 +623,12 @@ impl MediaBackend {
         if outcome.is_ok() {
             match play_id {
                 None => {
-                    ACTIVE_PLAYBACKS.remove(&(call_id.to_string(), from_tag.to_string()));
+                    ACTIVE_PLAYBACKS
+                        .remove(&(scoped::leg_key(call_id).into_owned(), from_tag.to_string()));
                 }
-                Some(play_id) => Self::playback_finished(call_id, from_tag, play_id),
+                Some(play_id) => {
+                    Self::playback_finished(&scoped::leg_key(call_id), from_tag, play_id)
+                }
             }
         }
         outcome

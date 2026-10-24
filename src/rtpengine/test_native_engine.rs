@@ -235,6 +235,28 @@ impl Recorded {
     }
 }
 
+/// What the engine records of an X3 attach or detach, and whether it needs the
+/// call: an interception taps a call the engine holds.
+fn x3_command(command: &Command) -> (Option<Recorded>, Option<String>, bool, bool) {
+    match command {
+        Command::AttachX3 {
+            call_id, from_tag, ..
+        } => (
+            Some(Recorded::new("attach_x3", call_id, from_tag)),
+            None,
+            false,
+            true,
+        ),
+        Command::DetachX3 { call_id, from_tag } => (
+            Some(Recorded::new("detach_x3", call_id, from_tag)),
+            None,
+            false,
+            false,
+        ),
+        _ => (None, None, false, false),
+    }
+}
+
 /// The `play_id` the engine hands the first playback it accepts; each later one
 /// gets the next.
 pub(crate) const NATIVE_ENGINE_FIRST_PLAY_ID: u64 = 7001;
@@ -460,6 +482,9 @@ impl NativeTestEngine {
                                 false,
                                 true,
                             ),
+                            Command::AttachX3 { .. } | Command::DetachX3 { .. } => {
+                                x3_command(&request.command)
+                            }
                             _ => (None, None, false, false),
                         };
                         let mut refused = false;

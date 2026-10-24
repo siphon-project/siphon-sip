@@ -1088,4 +1088,110 @@ mod tests {
             assert!(frames[1].starts_with(r#"{"scope":"mrf","id":1,"command":"offer""#));
         }
     }
+
+    /// A verb run under a leg's per-call scope (`in_frame_scope`) carries that
+    /// scope on every frame naming a call, after one `node_info` asks whether
+    /// the engine keys calls by scope; the frames are otherwise byte for byte
+    /// an unscoped node's.
+    #[tokio::test]
+    async fn a_frame_scope_puts_the_per_call_scope_on_every_frame_that_names_a_call() {
+        let mut engine = FakeEngine::start().await;
+        let (client, _events) = client(&engine, None, 2_000);
+        let orig = CallScope::per_call("orig").expect("valid");
+        super::super::per_call::in_frame_scope(orig, drive_every_call_command(&client)).await;
+
+        let frames: Vec<Value> = engine
+            .frames()
+            .await
+            .iter()
+            .map(|frame| serde_json::from_str(frame).expect("json"))
+            .collect();
+        assert_eq!(frames[0], json!({"id": 1, "command": "node_info"}));
+        let expected: Vec<Value> = RECORDED_UNSCOPED_FRAMES
+            .iter()
+            .map(|frame| {
+                let mut value: Value = serde_json::from_str(frame).expect("json");
+                value["id"] = json!(value["id"].as_u64().expect("an id") + 1);
+                if value["command"] != "ping" {
+                    value["scope"] = json!("orig");
+                }
+                value
+            })
+            .collect();
+        assert_eq!(frames[1..], expected[..]);
+    }
+
+    /// A leg's events come back under its engine call-id, a read waiting on
+    /// the leg's digits takes them, and the node's call is untouched by both.
+    #[tokio::test]
+    async fn a_scoped_legs_events_are_reported_under_its_engine_call_id() {
+        let engine = FakeEngine::start().await;
+        let (client, mut events) = client(&engine, None, 2_000);
+        let orig = CallScope::per_call("orig").expect("valid");
+        super::super::per_call::in_frame_scope(
+            orig.clone(),
+            client.offer("call-1", "tag-a", b"v=0\r\n", &NgFlags::default()),
+        )
+        .await
+        .expect("orig offered");
+        client
+            .offer("call-1", "tag-a", b"v=0\r\n", &NgFlags::default())
+            .await
+            .expect("node call offered");
+
+        let digit = |digit: &str, scope: Option<&str>| {
+            let mut event = json!({
+                "event": "dtmf", "call_id": "call-1", "from_tag": "tag-a",
+                "digit": digit, "duration_ms": 80, "volume": -10,
+            });
+            if let Some(scope) = scope {
+                event["scope"] = json!(scope);
+            }
+            event
+        };
+        engine.broadcast(digit("1", Some("orig")));
+        match next_event(&mut events).await {
+            Some(RtpEngineEvent::Dtmf(dtmf)) => assert_eq!(dtmf.call_id, "call-1;orig"),
+            other => panic!("expected the leg's DTMF, got {other:?}"),
+        }
+        engine.broadcast(digit("2", None));
+        match next_event(&mut events).await {
+            Some(RtpEngineEvent::Dtmf(dtmf)) => assert_eq!(dtmf.call_id, "call-1"),
+            other => panic!("expected the node call's DTMF, got {other:?}"),
+        }
+
+        let reader = Arc::clone(&client);
+        let read = tokio::spawn(super::super::per_call::in_frame_scope(orig, async move {
+            reader
+                .read_digits(
+                    "call-1",
+                    &super::super::DigitReadLimits {
+                        terminators: "#".into(),
+                        max_digits: None,
+                        timeout: Duration::from_secs(2),
+                        inter_digit_timeout: Duration::from_secs(2),
+                    },
+                )
+                .await
+        }));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        engine.broadcast(digit("7", None));
+        engine.broadcast(digit("5", Some("orig")));
+        engine.broadcast(digit("#", Some("orig")));
+        let read = read.await.expect("the read");
+        assert_eq!(read.digits, "5", "only the leg's digits are read");
+        match next_event(&mut events).await {
+            Some(RtpEngineEvent::Dtmf(dtmf)) => {
+                assert_eq!(
+                    (dtmf.call_id.as_str(), dtmf.digit.as_str()),
+                    ("call-1", "7")
+                );
+            }
+            other => panic!("the node call's digit is still an event, got {other:?}"),
+        }
+        assert!(
+            next_event(&mut events).await.is_none(),
+            "the read took the leg's digits"
+        );
+    }
 }

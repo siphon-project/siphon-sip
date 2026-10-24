@@ -428,3 +428,165 @@ async def run(engine, invite_orig, invite_term, reply_orig, reply_term, bye):
     assert_eq!(sessions.len(), 0);
     assert_eq!(sessions.scoped_len(), 0);
 }
+
+/// The media verbs a script runs on each leg, after both legs are anchored.
+const MEDIA_VERBS: &str = "\
+async def run(engine, invite_orig, invite_term, reply_orig, reply_term, bye):
+    await engine.offer(invite_orig, profile='access_v4', scope='orig')
+    await engine.offer(invite_term, profile='access_v6', scope='term')
+    await engine.play_media(invite_orig, file='/prompts/a.wav', scope='orig')
+    await engine.play_dtmf(invite_term, '5', scope='term')
+    await engine.silence_media(invite_orig, scope='orig')
+    await engine.stop_media(invite_term, scope='term')
+    await engine.subscribe_request('uu-call-1@192.0.2.10', 'tag-a', 'tag-s', scope='orig')
+    await engine.unsubscribe('uu-call-1@192.0.2.10', 'tag-a', 'tag-s', scope='orig')
+    await engine.delete(bye)
+";
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rtpengine_media_verbs_reach_the_leg_their_scope_names() {
+    Python::initialize();
+    let engine = TestEngine::start(false).await;
+    let sessions = Arc::new(MediaSessionStore::new());
+    let namespace = PyRtpEngine::new(engine.backend().await, Arc::clone(&sessions), registry());
+
+    drive(namespace, MEDIA_VERBS).await.expect("the call runs");
+
+    let orig = format!("{CALL_ID};orig");
+    let term = format!("{CALL_ID};term");
+    let verbs: Vec<(String, String)> = engine
+        .all_commands()
+        .into_iter()
+        .filter(|command| !matches!(command.name.as_str(), "offer" | "answer" | "delete"))
+        .map(|command| (command.name, command.call_id.unwrap_or_default()))
+        .collect();
+    let on = |name: &str, call_id: &str| (name.to_string(), call_id.to_string());
+    assert_eq!(
+        verbs,
+        vec![
+            on("play media", &orig),
+            on("play DTMF", &term),
+            on("silence media", &orig),
+            on("stop media", &term),
+            on("subscribe request", &orig),
+            on("unsubscribe", &orig),
+        ]
+    );
+    assert_eq!(sessions.scoped_len(), 0, "the BYE ended both legs");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn siphon_rtp_media_verbs_reach_the_leg_their_scope_names() {
+    Python::initialize();
+    let engine = NativeTestEngine::start().await;
+    let sessions = Arc::new(MediaSessionStore::new());
+    let namespace = PyRtpEngine::new(engine.backend(), Arc::clone(&sessions), registry());
+
+    drive(
+        namespace,
+        "\
+async def run(engine, invite_orig, invite_term, reply_orig, reply_term, bye):
+    await engine.offer(invite_orig, profile='access_v4', scope='orig')
+    await engine.offer(invite_term, profile='access_v6', scope='term')
+    await engine.play_media(invite_orig, tone='ringback_eu', wait=False, scope='orig')
+    await engine.play_dtmf(invite_term, '5', scope='term')
+    await engine.silence_media(invite_orig, scope='orig')
+    await engine.stop_media(invite_term, scope='term')
+    await engine.delete(bye)
+",
+    )
+    .await
+    .expect("the call runs");
+
+    let on_leg = |name: &str| {
+        engine
+            .commands(name)
+            .into_iter()
+            .map(|command| (command.call_id, command.scope, command.refused))
+            .collect::<Vec<_>>()
+    };
+    let leg = |scope: &str| (CALL_ID.to_string(), Some(scope.to_string()), false);
+    assert_eq!(on_leg("play_media"), vec![leg("orig")]);
+    assert_eq!(on_leg("stop_media"), vec![leg("term")]);
+    assert_eq!(engine.held_count(), 0);
+    assert_eq!(sessions.scoped_len(), 0);
+}
+
+/// No `scope=`: the one scoped leg when it is the only one, the node's call
+/// (as before) once there are two.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_verb_without_a_scope_finds_the_only_scoped_leg_and_no_other() {
+    Python::initialize();
+    let engine = TestEngine::start(false).await;
+    let sessions = Arc::new(MediaSessionStore::new());
+    let namespace = PyRtpEngine::new(engine.backend().await, Arc::clone(&sessions), registry());
+
+    drive(
+        namespace,
+        "\
+async def run(engine, invite_orig, invite_term, reply_orig, reply_term, bye):
+    await engine.offer(invite_orig, profile='access_v4', scope='orig')
+    await engine.play_media(invite_orig, file='/prompts/a.wav')
+    await engine.offer(invite_term, profile='access_v6', scope='term')
+    await engine.play_media(invite_orig, file='/prompts/a.wav')
+    await engine.delete(bye)
+",
+    )
+    .await
+    .expect("the call runs");
+
+    let played: Vec<String> = engine
+        .commands("play media")
+        .into_iter()
+        .map(|command| command.call_id.unwrap_or_default())
+        .collect();
+    assert_eq!(played, vec![format!("{CALL_ID};orig"), CALL_ID.to_string()]);
+}
+
+/// A B2BUA call's legs have Call-IDs of their own: a scope on a media verb
+/// for one is refused before anything reaches the engine.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_media_verb_scope_on_a_b2bua_call_is_refused() {
+    Python::initialize();
+    let engine = TestEngine::start(false).await;
+    let sessions = Arc::new(MediaSessionStore::new());
+    let namespace = PyRtpEngine::new(engine.backend().await, Arc::clone(&sessions), registry());
+
+    let errors = tokio::task::spawn_blocking(move || {
+        Python::attach(|python| {
+            let engine = Bound::new(python, namespace).expect("namespace");
+            let call = Bound::new(
+                python,
+                PyCall::new(
+                    "id-1".to_string(),
+                    invite(),
+                    "192.0.2.10".to_string(),
+                    "udp".to_string(),
+                ),
+            )
+            .expect("call");
+            ["silence_media", "stop_media", "detach_ws_tee", "echo"]
+                .into_iter()
+                .map(|verb| {
+                    let kwargs = PyDict::new(python);
+                    kwargs.set_item("scope", "orig").expect("kwarg");
+                    engine
+                        .call_method(verb, (call.as_any(),), Some(&kwargs))
+                        .err()
+                        .map(|error| error.to_string())
+                })
+                .collect::<Vec<_>>()
+        })
+    })
+    .await
+    .expect("the handler thread");
+
+    for error in &errors {
+        let error = error.as_deref().expect("refused");
+        assert!(
+            error.contains("ValueError") && error.contains("B2BUA"),
+            "{error}"
+        );
+    }
+    assert!(engine.all_commands().is_empty());
+}

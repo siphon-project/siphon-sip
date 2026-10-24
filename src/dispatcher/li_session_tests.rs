@@ -129,6 +129,18 @@ fn intercepting() -> (
     mpsc::Receiver<IriEvent>,
     mpsc::Receiver<AuditEntry>,
 ) {
+    intercepting_on(test_dispatcher())
+}
+
+/// [`intercepting`] on a dispatcher the test prepared (a media engine, say).
+fn intercepting_on(
+    mut dispatcher: super::test_dispatcher::TestDispatcher,
+) -> (
+    Arc<DispatcherState>,
+    LiManager,
+    mpsc::Receiver<IriEvent>,
+    mpsc::Receiver<AuditEntry>,
+) {
     let (li, iri, audit) = LiManager::new(
         LawfulInterceptConfig {
             enabled: true,
@@ -170,7 +182,6 @@ fn intercepting() -> (
         })
         .expect("task must provision");
 
-    let mut dispatcher = test_dispatcher();
     dispatcher.state.li_manager = Some(li.clone());
     (Arc::new(dispatcher.state), li, iri, audit)
 }
@@ -341,6 +352,7 @@ async fn the_far_end_hanging_up_stops_content_capture() {
             d_id: li.tasks().list()[0].details.list_of_dids[0],
             from_tag: "caller-tag".to_string(),
             correlation_id: correlation_from_call_id(&internal_id),
+            scope: None,
         },
     );
 
@@ -436,4 +448,184 @@ async fn a_call_that_fails_unanswered_releases_its_session() {
     );
     assert_eq!(li.remembered_session_count(), 0);
     assert_eq!(li.session_alias_count(), 0);
+}
+
+/// A proxy call whose two legs a script anchored under per-call scopes, on a
+/// media engine that delivers X3.
+const PROXY_CALL_ID: &str = "proxy-scoped@192.0.2.10";
+
+fn proxy_scoped_message(raw: &str) -> String {
+    raw.replace("caller-call@192.0.2.10", PROXY_CALL_ID)
+}
+
+fn leg_scope(name: &str) -> crate::rtpengine::CallScope {
+    crate::rtpengine::CallScope::per_call(name).expect("a valid scope")
+}
+
+fn leg_session(call_id: &str) -> crate::rtpengine::MediaSession {
+    crate::rtpengine::MediaSession {
+        rtpengine_call_id: call_id.to_string(),
+        call_id: call_id.to_string(),
+        from_tag: "caller-tag".to_string(),
+        to_tag: None,
+        profile: "rtp_passthrough".to_string(),
+        ws_uri: None,
+        ws_tee: None,
+        ws_bridge_attached: false,
+        bridge_sides: None,
+        created_at: std::time::Instant::now(),
+    }
+}
+
+/// The scoped legs of an intercepted proxy call are each tapped, each with
+/// the session's one Correlation ID, recorded under its own scope, and each
+/// is detached on its own leg when the call ends.
+#[tokio::test]
+async fn every_scoped_leg_of_an_intercepted_proxy_call_is_tapped() {
+    let engine = crate::rtpengine::test_native_engine::NativeTestEngine::start().await;
+    let backend = engine.backend();
+    let sessions = Arc::new(crate::rtpengine::MediaSessionStore::new());
+    for name in ["orig", "term"] {
+        let scope = leg_scope(name);
+        backend
+            .offer_in(
+                Some(&scope),
+                PROXY_CALL_ID,
+                "caller-tag",
+                b"v=0\r\n",
+                &crate::rtpengine::NgFlags::default(),
+            )
+            .await
+            .expect("the leg is anchored");
+        sessions
+            .scoped(&scope)
+            .expect("a scope store")
+            .insert(leg_session(PROXY_CALL_ID));
+    }
+    let mut dispatcher = test_dispatcher();
+    dispatcher.state.rtpengine_set = Some(Arc::clone(&backend));
+    dispatcher.state.rtpengine_sessions = Some(Arc::clone(&sessions));
+    let (state, li, _iri, mut audit) = intercepting_on(dispatcher);
+    assert_eq!(
+        super::intercept::intercepted_legs(&state, PROXY_CALL_ID),
+        vec![Some(leg_scope("orig")), Some(leg_scope("term"))]
+    );
+
+    arrives(&state, CALLER, &proxy_scoped_message(CALLER_INVITE));
+    arrives(&state, CALLER, &proxy_scoped_message(CALLER_ACK));
+    assert_eq!(attach_attempts(&mut audit).await, 2, "one per leg");
+
+    let attached = engine.commands("attach_x3");
+    let mut scopes: Vec<(Option<String>, bool)> = attached
+        .iter()
+        .map(|command| (command.scope.clone(), command.refused))
+        .collect();
+    scopes.sort();
+    assert_eq!(
+        scopes,
+        vec![
+            (Some("orig".to_string()), false),
+            (Some("term".to_string()), false)
+        ]
+    );
+    let records = li.x3_attachments_for(PROXY_CALL_ID);
+    assert_eq!(records.len(), 2);
+    assert!(
+        records
+            .iter()
+            .all(|record| record.correlation_id == records[0].correlation_id),
+        "one Correlation ID across the session's legs"
+    );
+
+    // A second ACK finds every leg attached and attaches nothing more.
+    arrives(&state, CALLER, &proxy_scoped_message(CALLER_ACK));
+    assert_eq!(attach_attempts(&mut audit).await, 0);
+
+    let bye = proxy_scoped_message(CALLER_ACK)
+        .replace("ACK sip:", "BYE sip:")
+        .replace("CSeq: 1 ACK", "CSeq: 2 BYE")
+        .replace("z9hG4bK-caller-ack", "z9hG4bK-caller-bye");
+    arrives(&state, CALLER, &bye);
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let mut detached: Vec<Option<String>> = engine
+        .commands("detach_x3")
+        .into_iter()
+        .map(|command| command.scope)
+        .collect();
+    detached.sort();
+    assert_eq!(
+        detached,
+        vec![Some("orig".to_string()), Some("term".to_string())]
+    );
+    assert_eq!(li.x3_attachment_count(), 0, "the call's records drain");
+}
+
+/// Without per-call scopes the call's own media is the one tapped, as before.
+#[test]
+fn an_unscoped_call_taps_its_own_media() {
+    let mut dispatcher = test_dispatcher();
+    let sessions = Arc::new(crate::rtpengine::MediaSessionStore::new());
+    dispatcher.state.rtpengine_sessions = Some(Arc::clone(&sessions));
+    let state = dispatcher.state;
+    assert_eq!(
+        super::intercept::intercepted_legs(&state, "c-1"),
+        vec![None]
+    );
+    sessions.insert(leg_session("c-1"));
+    sessions
+        .scoped(&leg_scope("term"))
+        .expect("a scope store")
+        .insert(leg_session("c-1"));
+    assert_eq!(
+        super::intercept::intercepted_legs(&state, "c-1"),
+        vec![None, Some(leg_scope("term"))],
+        "a call with its own media and a scoped leg taps both"
+    );
+}
+
+/// One leg's delivery ending drops that leg's record only; the other leg is
+/// still delivering, and its loss reports still find their warrant.
+#[tokio::test]
+async fn one_legs_x3_end_leaves_the_other_legs_record() {
+    let (state, li, _iri, _audit) = intercepting();
+    let task = li.tasks().list()[0].details.clone();
+    for name in ["orig", "term"] {
+        li.record_x3_attachment(
+            PROXY_CALL_ID,
+            crate::li::ActiveIntercept {
+                x_id: task.x_id,
+                d_id: task.list_of_dids[0],
+                from_tag: "caller-tag".to_string(),
+                correlation_id: 7,
+                scope: Some(leg_scope(name)),
+            },
+        );
+    }
+    let (events, receiver) = mpsc::channel(4);
+    spawn_rtpengine_events(&state, receiver);
+    let ended = |leg: &str| {
+        crate::rtpengine::events::RtpEngineEvent::X3Ended(crate::rtpengine::events::X3EndedEvent {
+            call_id: format!("{PROXY_CALL_ID};{leg}"),
+            from_tag: "caller-tag".to_string(),
+            reason: "detached".to_string(),
+            orderly: true,
+            delivered: 10,
+            dropped: 0,
+        })
+    };
+    events
+        .send(ended("orig"))
+        .await
+        .expect("the event loop runs");
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let left = li.x3_attachments_for(PROXY_CALL_ID);
+    assert_eq!(left.len(), 1);
+    assert_eq!(left[0].scope, Some(leg_scope("term")));
+
+    events
+        .send(ended("term"))
+        .await
+        .expect("the event loop runs");
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(li.x3_attachment_count(), 0, "drains to baseline");
 }
