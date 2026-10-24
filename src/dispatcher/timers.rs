@@ -450,13 +450,18 @@ pub(super) fn process_timer_actions_with_followups(
                 // an ACK); `fail_branch_locally` no-ops for anything that is
                 // not a client branch of a live proxy session.
                 warn!(key = %key, "transaction timeout");
-                fail_branch_locally(
-                    key,
-                    408,
-                    "Request Timeout",
-                    "client transaction timed out (RFC 3261 §16.7)",
-                    state,
-                );
+                // `@proxy.on_failure` runs on this; from the sweep, as a job of
+                // its own (see `post_expiry`).
+                let key = key.clone();
+                super::tasks::post_expiry(state, move |state| {
+                    fail_branch_locally(
+                        &key,
+                        408,
+                        "Request Timeout",
+                        "client transaction timed out (RFC 3261 §16.7)",
+                        state,
+                    );
+                });
                 // Remaining session cleanup happens via sweep_stale_entries.
             }
             Action::ProtocolError(message) => {
