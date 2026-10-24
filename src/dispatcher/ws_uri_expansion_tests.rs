@@ -87,6 +87,7 @@ async fn answer_first_templates_the_profile_tee_like_its_bridge() {
         &registry,
         Some(TEMPLATED),
         None,
+        None,
     )
     .expect("the plan is made");
     assert_eq!(
@@ -122,6 +123,7 @@ async fn answer_first_refuses_a_misspelt_tee_placeholder() {
         &backend,
         &registry,
         Some("misspelt"),
+        None,
         None,
     )
     .map(|_| ());

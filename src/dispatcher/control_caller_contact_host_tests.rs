@@ -405,6 +405,7 @@ async fn an_originated_call_takes_no_new_caller_contact_host() {
         params,
         Some(TENANT_HOST.to_string()),
         None,
+        None,
     )
     .expect("the originate stages");
     let call_id = prepared.internal_call_id;

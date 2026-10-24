@@ -412,6 +412,7 @@ async fn an_originated_call_takes_no_new_caller_contact_user() {
         params,
         None,
         Some(TRUNK_USER.to_string()),
+        None,
     )
     .expect("the originate stages");
     let call_id = prepared.internal_call_id;

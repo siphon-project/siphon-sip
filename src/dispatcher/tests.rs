@@ -2401,6 +2401,7 @@ async fn answer_first_prepare_templates_ws_uri_on_siphon_rtp() {
         &registry,
         None, // default voice_ai
         Some("wss://ai.example/stream/{call_id}"),
+        None,
     )
     .expect("prepare must succeed on siphon-rtp with a ws_uri");
     assert_eq!(
@@ -2430,6 +2431,7 @@ async fn answer_first_prepare_rejects_non_siphon_rtp_backend() {
         &registry,
         None,
         Some("wss://ai/{call_id}"),
+        None,
     )
     .unwrap_err();
     assert!(
@@ -2449,7 +2451,7 @@ async fn answer_first_prepare_anchors_without_a_bridge() {
     let backend = siphon_rtp_backend();
     let registry = crate::rtpengine::ProfileRegistry::new();
     let invite = invite_with_offer(b"v=0\r\n");
-    let plan = answer_first_prepare(&invite, local_ip(), &backend, &registry, None, None)
+    let plan = answer_first_prepare(&invite, local_ip(), &backend, &registry, None, None, None)
         .expect("anchoring with no bridge is the IVR / voicemail case");
     assert!(
         plan.flags.ws_uri.is_none(),
@@ -2470,6 +2472,7 @@ async fn answer_first_prepare_unknown_profile() {
         &registry,
         Some("does-not-exist"),
         Some("wss://ai"),
+        None,
     )
     .unwrap_err();
     assert!(error.contains("unknown media profile"), "got: {error}");
@@ -2487,6 +2490,7 @@ async fn answer_first_prepare_requires_sdp_offer() {
         &registry,
         None,
         Some("wss://ai"),
+        None,
     )
     .unwrap_err();
     assert!(error.contains("SDP offer"), "got: {error}");

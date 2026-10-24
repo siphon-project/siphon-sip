@@ -123,6 +123,11 @@ pub struct OriginateRoute {
     /// [`DialTarget::verify_server`]). Wins over the gateway the leg routes to
     /// and over `tls.verify_server`; `None` leaves it to them.
     pub verify_server: Option<bool>,
+    /// The `originate` verb's `media_flags`: overrides of the anchor profile's
+    /// processing settings for this call, merged over its answer half when the
+    /// callee's 2xx is answered. Only an offerless [`OriginateMedia::Anchor`]
+    /// takes them; anything else is refused rather than placed without them.
+    pub media_flags: Option<crate::rtpengine::media_flags::MediaFlags>,
 }
 
 /// Why an originate was refused. Each variant maps to its own control-plane
@@ -299,6 +304,24 @@ pub fn prepare_originate_routed(
     if let OriginateMedia::Anchor { profile, .. } = &params.media {
         originate_validate_anchor(profile, state)?;
     }
+    // Per-call flags shape the local answer to the callee's 2xx offer. An
+    // offer the controller supplied gets no local answer, and an early offer
+    // is made from the profile's offer half, whose step carries a name only:
+    // either would place the call with the flags silently unapplied.
+    if route.media_flags.is_some() {
+        if !matches!(params.media, OriginateMedia::Anchor { .. }) {
+            return Err(OriginateError::Unsupported(
+                "media_flags shape the media siphon anchors, and this originate carries an \
+                 offer of its own"
+                    .to_string(),
+            ));
+        }
+        if route.early_offer.is_some() {
+            return Err(OriginateError::Unsupported(
+                "media_flags apply to an offerless anchor, not to a leg offered early".to_string(),
+            ));
+        }
+    }
 
     // Resolve the wire destination. `next_hop` steers egress without touching
     // the R-URI (the called party's shape is preserved on the wire) — the same
@@ -456,6 +479,7 @@ pub fn prepare_originate_routed(
             crate::b2bua::actor::OriginateAnchor {
                 profile: profile.clone(),
                 ws_uri: ws_uri.clone(),
+                media_flags: route.media_flags.clone(),
             },
         );
     }

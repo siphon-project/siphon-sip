@@ -134,6 +134,10 @@ pub struct StreamOptions {
     /// Unset, the bridge runs at the leg's own rate with uplink processing
     /// off. An unknown name is `bad_request`.
     pub profile: Option<String>,
+    /// A bridge's overrides of [`StreamOptions::profile`]'s settings, for this
+    /// bridge only. They need a `profile` to merge over: without one, or on a
+    /// tee, the server refuses them with `bad_request`.
+    pub media_flags: Option<siphon_control_proto::media_flags::MediaFlags>,
 }
 
 impl StreamOptions {
@@ -173,6 +177,12 @@ impl StreamOptions {
         self.profile = Some(name.into());
         self
     }
+
+    /// Override the profile's settings for this bridge.
+    pub fn media_flags(mut self, flags: siphon_control_proto::media_flags::MediaFlags) -> Self {
+        self.media_flags = Some(flags);
+        self
+    }
 }
 
 /// The `stream_start` args. The untyped [`Call::stream_start`] and the typed
@@ -185,6 +195,7 @@ fn stream_start_args(
     channels: Option<u8>,
     sample_rate: Option<u32>,
     profile: Option<&str>,
+    media_flags: Option<&siphon_control_proto::media_flags::MediaFlags>,
 ) -> serde_json::Value {
     let mut args = serde_json::Map::new();
     args.insert("ws_uri".to_string(), json!(ws_uri));
@@ -200,6 +211,9 @@ fn stream_start_args(
     }
     if let Some(profile) = profile {
         args.insert("profile".to_string(), json!(profile));
+    }
+    if let Some(media_flags) = media_flags {
+        args.insert("media_flags".to_string(), media_flags.to_json());
     }
     serde_json::Value::Object(args)
 }
@@ -229,7 +243,15 @@ impl Call {
         direction: Option<&str>,
         channels: Option<u8>,
     ) -> Result<(), ControlError> {
-        let args = stream_start_args(ws_uri, StreamMode::Tee, direction, channels, None, None);
+        let args = stream_start_args(
+            ws_uri,
+            StreamMode::Tee,
+            direction,
+            channels,
+            None,
+            None,
+            None,
+        );
         self.sip(SipVerb::StreamStart, args).await.map(drop)
     }
 
@@ -277,6 +299,7 @@ impl Call {
             options.channels.map(StreamChannels::count),
             options.sample_rate,
             options.profile.as_deref(),
+            options.media_flags.as_ref(),
         );
         self.sip(SipVerb::StreamStart, args).await.map(drop)
     }

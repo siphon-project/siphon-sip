@@ -101,6 +101,33 @@ fn stream_bridge_profile(
         })
 }
 
+/// The flags a `stream_start` bridge attaches with: the profile's bridge
+/// settings, with the call's `media_flags` merged over them.
+///
+/// `media_flags` need a `profile` to merge over. A fresh bridge with no profile
+/// runs every uplink stage off, and a re-pointed one keeps whatever the bridge
+/// it replaces had, so "merged over what" has no single answer there and the
+/// pair is refused rather than guessed at. Absent `media_flags` hand the
+/// profile through untouched, so the frame is the one sent before they existed.
+pub(super) fn bridge_flags(
+    profile: Option<crate::rtpengine::NgFlags>,
+    media_flags: Option<&crate::rtpengine::media_flags::MediaFlags>,
+) -> Result<Option<crate::rtpengine::NgFlags>, ControlResult> {
+    let Some(media_flags) = media_flags else {
+        return Ok(profile);
+    };
+    let Some(profile) = profile else {
+        return Err(super::media_flags::out_of_place(
+            "stream_start",
+            "needs_profile",
+            "stream_start args.media_flags needs args.profile: they are merged over a \
+             profile's bridge settings, and a bridge without one has none to merge over"
+                .to_string(),
+        ));
+    };
+    super::media_flags::merged("stream_start", media_flags, &profile).map(Some)
+}
+
 /// Map a [`crate::rtpengine::error::RtpEngineError`] to a typed control result —
 /// every media command answers, even on error, never a hang.
 ///   - the engine has no such call → `not_found` (the media session is gone),
@@ -702,10 +729,25 @@ pub(super) async fn stream_start(channel: &ChannelRef, args: &serde_json::Value)
             Ok(profile) => profile,
             Err(result) => return result,
         };
+        let media_flags = match super::media_flags::parse("stream_start", args) {
+            Ok(media_flags) => media_flags,
+            Err(result) => return result,
+        };
+        let profile = match bridge_flags(profile, media_flags.as_ref()) {
+            Ok(profile) => profile,
+            Err(result) => return result,
+        };
         let (backend, call_id, from_tag) = match media_target(channel) {
             Ok(target) => target,
             Err(result) => return result,
         };
+        // What this engine can honour is only known once the call's backend
+        // is; still before anything is sent.
+        if let (Some(flags), Some(merged)) = (&media_flags, &profile) {
+            if let Err(refusal) = flags.check_backend(&backend, merged) {
+                return super::media_flags::refused("stream_start", &refusal);
+            }
+        }
         let ws_uri = match channel_stream_uri(channel, &ws_uri, &from_tag) {
             Ok(ws_uri) => ws_uri,
             Err(result) => return result,
@@ -726,12 +768,25 @@ pub(super) async fn stream_start(channel: &ChannelRef, args: &serde_json::Value)
     }
     // A tee's processing is shaped by `direction` / `channels` / `sample_rate`;
     // a profile would be silently ignored, so it is refused, as the tee-only
-    // arguments are on a bridge.
+    // arguments are on a bridge. So are `media_flags`, which a tee has no
+    // uplink processing to apply to.
     if args.get("profile").is_some_and(|value| !value.is_null()) {
         return ControlResult::error(
             ControlErrorCode::BadRequest,
             "stream_start args.profile applies to mode=bridge only; a tee takes \
              direction, channels and sample_rate",
+        );
+    }
+    if args
+        .get("media_flags")
+        .is_some_and(|value| !value.is_null())
+    {
+        return super::media_flags::out_of_place(
+            "stream_start",
+            "tee",
+            "stream_start args.media_flags applies to mode=bridge only; a tee copies the \
+             call's audio and runs no uplink processing"
+                .to_string(),
         );
     }
     let direction = match args.get("direction").and_then(|value| value.as_str()) {
