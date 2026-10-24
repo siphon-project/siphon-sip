@@ -289,6 +289,7 @@ pub(crate) fn start_coroutine(
 
 /// Run a coroutine that may suspend to completion, blocking this thread: on
 /// the async pool when one is installed, else on this thread's own loop.
+#[allow(clippy::disallowed_methods)] // drives an asyncio loop attached: bytecode reaches safe points
 fn drive_suspending_coroutine(
     python: Python<'_>,
     coroutine: &Bound<'_, pyo3::PyAny>,

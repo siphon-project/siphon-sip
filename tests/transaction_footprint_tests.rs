@@ -14,6 +14,7 @@
 //!   * RSS reads 0 for every arm after the first. It does not shrink when an
 //!     arm drops, so the later arms allocate into pages the first one already
 //!     made resident. A counting allocator is order-independent and exact.
+#![allow(clippy::disallowed_methods)] // test, bench and example code may block
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};

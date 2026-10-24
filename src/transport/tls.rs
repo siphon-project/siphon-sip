@@ -580,6 +580,7 @@ pub fn build_tls_acceptor(tls_config: &TlsServerConfig) -> io::Result<TlsAccepto
 /// new handshakes pick up the new cert. That matches the standard cert-renewal
 /// model: ACME/cert-manager writes the new pair, siphon picks it up, sessions
 /// transition naturally over the renewal window.
+#[allow(clippy::disallowed_methods)] // dedicated cert-watcher thread, never attaches
 pub fn build_hot_reload_acceptor(tls_config: &TlsServerConfig) -> io::Result<SharedTlsAcceptor> {
     let initial = build_tls_acceptor(tls_config)?;
     let shared: SharedTlsAcceptor = Arc::new(ArcSwap::from(Arc::new(initial)));

@@ -1,5 +1,9 @@
 //! SIPhon — high-performance SIP proxy, B2BUA and IMS platform.
 
+// Tests may block freely: `clippy.toml`'s disallowed-methods guards the
+// threads production code runs on, and a test thread is not one of them.
+#![cfg_attr(test, allow(clippy::disallowed_methods))]
+
 pub mod admin;
 pub mod admission;
 pub mod apiban;

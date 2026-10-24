@@ -180,6 +180,7 @@ pub(super) const TCP_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::f
 /// there before we commit the Via/transaction to TCP: the resolver's A/AAAA
 /// fallback means a hostname almost always "resolves" for TCP even with no TCP
 /// service, so the connect — not the resolution — is the real reachability test.
+#[allow(clippy::disallowed_methods)] // inside blocking_released
 pub(super) fn resolve_tcp_path(
     uri_string: &str,
     udp_destination: SocketAddr,

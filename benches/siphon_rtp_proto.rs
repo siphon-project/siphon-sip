@@ -7,6 +7,7 @@
 //! `rtpengine_bencode` gate — same per-call media-control cost, different
 //! encoding — so the two can be compared head-to-head. The benched message is a
 //! representative `offer` carrying an SDP body (the realistic large value).
+#![allow(clippy::disallowed_methods)] // test, bench and example code may block
 
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use siphon_rtp_proto::{frame, CmdResult, Command, ProfileFlags, Request, Response};

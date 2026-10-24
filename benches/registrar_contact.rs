@@ -14,6 +14,7 @@
 //! a captured flow.
 //!
 //! Fixtures use RFC 5737 addresses and example.com AoRs.
+#![allow(clippy::disallowed_methods)] // test, bench and example code may block
 
 use std::hint::black_box;
 

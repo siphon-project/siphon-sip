@@ -1380,6 +1380,7 @@ impl ConnectionPool {
     /// parent-directory watch (so atomic rename by cert-manager/certbot is
     /// observed), 150 ms debounce for the key-then-cert write pair, and a `Weak`
     /// self-reference so the watcher exits when the pool is dropped.
+    #[allow(clippy::disallowed_methods)] // dedicated cert-watcher thread, never attaches
     pub fn spawn_client_cert_hot_reload(
         pool: &Arc<ConnectionPool>,
         certificate_path: &str,

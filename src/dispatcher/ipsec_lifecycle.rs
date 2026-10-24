@@ -106,6 +106,7 @@ pub(super) fn before_register_final(
 /// The kernel policy update is awaited here, on the response path, since a
 /// 2xx that left before it would go over the old set. One update, once per
 /// re-authentication.
+#[allow(clippy::disallowed_methods)] // pending the IPsec take-into-use rework on its own branch
 pub(super) fn take_into_use_before_2xx(state: &DispatcherState, ue: SocketAddr) {
     let Some(manager) = state.ipsec_manager.as_ref() else {
         return;

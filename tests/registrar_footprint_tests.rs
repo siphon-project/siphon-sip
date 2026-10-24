@@ -10,6 +10,7 @@
 //! governs the whole process. A counting allocator installed in the lib test
 //! binary would be shared with several thousand unrelated tests running
 //! concurrently and would count all of them.
+#![allow(clippy::disallowed_methods)] // test, bench and example code may block
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};

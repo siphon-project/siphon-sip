@@ -13,6 +13,7 @@
 //! Expected output: a line confirming jemalloc is the active global allocator.
 //! Verify the config symbol made it into the binary with:
 //!   nm target/debug/examples/embed_with_allocator | grep _rjem_malloc_conf
+#![allow(clippy::disallowed_methods)] // test, bench and example code may block
 
 // Override the decay config with, e.g.:
 //   siphon::install_allocator!("background_thread:true,dirty_decay_ms:0");

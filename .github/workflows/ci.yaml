@@ -116,6 +116,7 @@ jobs:
       - uses: actions/checkout@v7
       - run: scripts/check_file_size.py
       - run: scripts/check_too_many_lines_allows.py
+      - run: scripts/check_disallowed_methods_allows.py
 
   # ── Missing-`await` gate ────────────────────────────────────────────────
   # A forgotten `await` on an awaitable script API does not raise: the call

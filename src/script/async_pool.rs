@@ -270,6 +270,7 @@ impl AsyncPool {
     }
 
     /// Run the heartbeat monitor until the process ends.
+    #[allow(clippy::disallowed_methods)] // dedicated heartbeat thread, never attaches
     fn run_heartbeat(pool: Arc<AsyncPool>) {
         let mut reported = 0usize;
         loop {
@@ -827,6 +828,7 @@ impl SettledCoroutine {
 ///
 /// Returns `Ok(None)` if no pool is installed — caller should fall back
 /// to the legacy per-thread `run_until_complete` path.
+#[allow(clippy::disallowed_methods)] // inside python.detach on the same line
 pub(crate) fn run_coroutine_via_pool(
     python: Python<'_>,
     coroutine: &Bound<'_, PyAny>,

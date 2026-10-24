@@ -129,6 +129,7 @@ pub(crate) fn run_liveness_watchdog(
 
 /// Attach to the interpreter and detach again, every `interval`, beating
 /// `beat` around each attach.
+#[allow(clippy::disallowed_methods)] // dedicated liveness thread, never attaches
 pub(crate) fn run_interpreter_probe(
     beat: Arc<Beat>,
     interval: Duration,

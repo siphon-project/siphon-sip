@@ -1175,6 +1175,7 @@ const CLASSIFICATION_WAIT: std::time::Duration = std::time::Duration::from_milli
 /// status code instead. Draining still matters — the actors emit events with
 /// an awaiting `send` on a 64-deep channel, so a channel nobody drains parks
 /// the actor — but draining is not worth a worker held for a whole call.
+#[allow(clippy::disallowed_methods)] // blocking_recv only with no runtime (a unit test); block_on inside released
 pub fn recv_b_leg_classification_event(
     rx: &mut tokio::sync::mpsc::Receiver<CallEvent>,
 ) -> Option<CallEvent> {

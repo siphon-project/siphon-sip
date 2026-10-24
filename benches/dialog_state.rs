@@ -17,6 +17,7 @@
 //!   INVITE through the release and its answered BYEs (`release_proxied_call`).
 //!
 //! Fixtures use RFC 5737 addresses and example.com AoRs.
+#![allow(clippy::disallowed_methods)] // test, bench and example code may block
 
 use std::net::SocketAddr;
 use std::time::Instant;
