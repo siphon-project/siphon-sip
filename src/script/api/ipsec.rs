@@ -1067,8 +1067,8 @@ impl PyIpsec {
                 port_s: pcscf_port_s,
                 protocol: params_protocol,
             };
-            let pending = PyPendingSA::new(manager, sa, params);
-            Python::attach(|python| Py::new(python, pending))
+            // A `#[pyclass]` converts in the completion step, off the workers.
+            Ok(PyPendingSA::new(manager, sa, params))
         })
     }
 

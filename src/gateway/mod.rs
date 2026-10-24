@@ -655,12 +655,10 @@ impl DispatcherGroup {
     /// refresh, so a DNS change on such a group is not picked up until
     /// restart; static-IP and probed groups are always correct.
     pub fn refresh_member_ips(&self) {
-        use std::net::ToSocketAddrs;
-
         let mut set: HashSet<IpAddr> = HashSet::new();
         for dest in &self.destinations {
             if let Some(ref address_str) = dest.address_str {
-                if let Ok(addrs) = address_str.to_socket_addrs() {
+                if let Ok(addrs) = crate::script::waits::resolve_socket_addrs(address_str) {
                     for addr in addrs {
                         set.insert(addr.ip());
                     }
@@ -975,10 +973,17 @@ impl DispatcherManager {
     /// Blocking (`to_socket_addrs`), exactly like [`DispatcherGroup::refresh_member_ips`]:
     /// never call it from the request hot path.
     pub fn refresh_member_ips_for_unprobed(&self) {
-        for entry in self.groups.iter() {
-            if entry.value().probing_disabled() {
-                entry.value().refresh_member_ips();
-            }
+        // Resolve with the map let go: iterating holds every shard's read
+        // guard, and `gateway.add_group` / `remove_group` take them for write
+        // from attached script threads, which must not wait on DNS.
+        let unprobed: Vec<Arc<DispatcherGroup>> = self
+            .groups
+            .iter()
+            .filter(|entry| entry.value().probing_disabled())
+            .map(|entry| Arc::clone(entry.value()))
+            .collect();
+        for group in unprobed {
+            group.refresh_member_ips();
         }
         self.republish_view();
     }
@@ -1398,13 +1403,14 @@ fn record_probe_failure(dest: &Destination, failure_threshold: u32, cooldown: Op
 
     // Re-resolve DNS to try a different IP on next probe.
     if let Some(ref address_str) = dest.address_str {
-        use std::net::ToSocketAddrs;
-        if let Ok(mut addrs) = address_str.to_socket_addrs() {
+        if let Ok(addrs) = crate::script::waits::resolve_socket_addrs(address_str) {
             let old = dest.address();
             // Pick a different address than the current one if available.
             let new_addr = addrs
+                .iter()
+                .copied()
                 .find(|a| *a != old)
-                .or_else(|| address_str.to_socket_addrs().ok()?.next());
+                .or_else(|| addrs.first().copied());
             if let Some(new_addr) = new_addr {
                 if new_addr != old {
                     info!(
@@ -1458,11 +1464,11 @@ pub fn resolve_address(address: &str) -> Result<SocketAddr, String> {
         return Ok(addr);
     }
 
-    // Slow path: DNS resolution (hostname:port)
-    use std::net::ToSocketAddrs;
-    address
-        .to_socket_addrs()
+    // Slow path: DNS resolution (hostname:port). Released from the interpreter
+    // for the lookup: `gateway.add_group` reaches this attached.
+    crate::script::waits::resolve_socket_addrs(address)
         .map_err(|e| format!("{e}"))?
+        .into_iter()
         .next()
         .ok_or_else(|| "DNS returned no addresses".to_string())
 }

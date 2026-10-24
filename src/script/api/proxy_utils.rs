@@ -145,9 +145,53 @@ pub(crate) fn try_defer_send(
 /// 200. The gate travels with the handle instead: open while the handler runs,
 /// closed by the dispatcher once it has the script's decision, after which the
 /// held messages ride behind the reply and later sends go straight out.
+///
+/// A gate is also findable by the Call-ID of the request it belongs to
+/// ([`ReplyGate::register_dialog`], [`open_gate_for_dialog`]), for sends whose
+/// API names the dialog but not the request (`presence.notify` takes a
+/// subscription id): their future runs on a tokio worker, where neither the
+/// thread-local queue nor the request object is in reach.
 #[derive(Default)]
 pub struct ReplyGate {
     held: Mutex<Option<Vec<DeferredMessage>>>,
+    /// The Call-ID this gate is registered under in [`OPEN_GATES`], if any.
+    dialog: Mutex<Option<String>>,
+}
+
+/// Open gates by the Call-ID of the request they hold sends behind. Weak, and
+/// pruned on close and on drop, so an entry never outlives its gate.
+static OPEN_GATES: OnceLock<dashmap::DashMap<String, std::sync::Weak<ReplyGate>>> = OnceLock::new();
+
+fn open_gates() -> &'static dashmap::DashMap<String, std::sync::Weak<ReplyGate>> {
+    OPEN_GATES.get_or_init(dashmap::DashMap::new)
+}
+
+/// The open gate of the request with this Call-ID, if its handlers are still
+/// running.
+pub(crate) fn open_gate_for_dialog(call_id: &str) -> Option<Arc<ReplyGate>> {
+    open_gates().get(call_id).and_then(|entry| entry.upgrade())
+}
+
+/// Hold `message` behind the reply of the request on dialog `call_id` when
+/// that request's handlers are still running; otherwise defer it on this
+/// thread's queue if one is active, else hand it to `send`.
+pub(crate) fn hold_or_send(
+    call_id: &str,
+    message: SipMessage,
+    destination: std::net::SocketAddr,
+    transport: Transport,
+    send: impl FnOnce(SipMessage, std::net::SocketAddr, Transport),
+) {
+    let message = match open_gate_for_dialog(call_id) {
+        Some(gate) => match gate.hold(message, destination, transport) {
+            None => return,
+            Some(message) => message,
+        },
+        None => message,
+    };
+    if !try_defer_send(message.clone(), destination, transport) {
+        send(message, destination, transport);
+    }
 }
 
 impl ReplyGate {
@@ -155,7 +199,45 @@ impl ReplyGate {
     pub fn open() -> Arc<Self> {
         Arc::new(Self {
             held: Mutex::new(Some(Vec::new())),
+            dialog: Mutex::new(None),
         })
+    }
+
+    /// Make this gate findable by the Call-ID of its request while it is open.
+    pub(crate) fn register_dialog(self: &Arc<Self>, call_id: &str) {
+        open_gates().insert(call_id.to_string(), Arc::downgrade(self));
+        *self
+            .dialog
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(call_id.to_string());
+    }
+
+    /// [`Self::register_dialog`] under the Call-ID of `message`, the request
+    /// the gate belongs to.
+    pub(crate) fn register_dialog_of(self: &Arc<Self>, message: &Mutex<SipMessage>) {
+        let call_id = message
+            .lock()
+            .ok()
+            .and_then(|message| message.headers.get("Call-ID").cloned());
+        if let Some(call_id) = call_id {
+            self.register_dialog(&call_id);
+        }
+    }
+
+    /// Drop this gate's Call-ID registration, if it is still this gate's.
+    fn unregister_dialog(&self) {
+        let Some(call_id) = self
+            .dialog
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        else {
+            return;
+        };
+        let this: *const Self = self;
+        open_gates().remove_if(&call_id, |_, registered| {
+            registered.strong_count() == 0 || std::ptr::eq(registered.as_ptr(), this)
+        });
     }
 
     /// Hold `message` until the reply has gone. Returns it back (`Some`) when
@@ -186,11 +268,18 @@ impl ReplyGate {
     /// Close the gate and return what it held, in the order it was held.
     /// Idempotent: a second close returns nothing.
     pub fn close(&self) -> Vec<DeferredMessage> {
+        self.unregister_dialog();
         self.held
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take()
             .unwrap_or_default()
+    }
+}
+
+impl Drop for ReplyGate {
+    fn drop(&mut self) {
+        self.unregister_dialog();
     }
 }
 
@@ -1488,6 +1577,61 @@ mod deferred_send_tests {
         .join()
         .expect("holder thread");
         assert_eq!(gate.close().len(), 1);
+    }
+
+    /// A NOTIFY sent on the dialog of a SUBSCRIBE still being handled waits
+    /// for that request's reply, even from a thread with no deferral queue
+    /// (the tokio worker `presence.notify`'s future runs on).
+    #[test]
+    fn a_send_on_a_dialog_still_being_handled_waits_for_its_reply() {
+        let gate = ReplyGate::open();
+        gate.register_dialog("gate-dialog-held");
+        let sent = std::thread::spawn(|| {
+            let mut sent = false;
+            hold_or_send(
+                "gate-dialog-held",
+                notify_to("erin"),
+                addr("10.0.0.1:5060"),
+                Transport::Udp,
+                |_, _, _| sent = true,
+            );
+            sent
+        })
+        .join()
+        .expect("sender thread");
+        assert!(!sent, "held, not sent ahead of the reply");
+        assert_eq!(gate.close().len(), 1, "released with the reply");
+        assert!(open_gate_for_dialog("gate-dialog-held").is_none());
+    }
+
+    #[test]
+    fn a_send_on_a_dialog_with_no_open_request_goes_out() {
+        let mut sent = false;
+        hold_or_send(
+            "gate-dialog-none",
+            notify_to("frank"),
+            addr("10.0.0.1:5060"),
+            Transport::Udp,
+            |_, _, _| sent = true,
+        );
+        assert!(sent);
+    }
+
+    /// A gate never closed (its request failed before the reply) leaves no
+    /// registration behind once it is dropped.
+    #[test]
+    fn dropping_a_gate_releases_its_dialog_registration() {
+        for index in 0..100 {
+            let gate = ReplyGate::open();
+            gate.register_dialog(&format!("gate-dialog-dropped-{index}"));
+            if index % 2 == 0 {
+                gate.close();
+            }
+        }
+        let left = (0..100)
+            .filter(|index| open_gates().contains_key(&format!("gate-dialog-dropped-{index}")))
+            .count();
+        assert_eq!(left, 0, "every registration went with its gate");
     }
 }
 

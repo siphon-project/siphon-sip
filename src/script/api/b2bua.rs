@@ -440,20 +440,24 @@ impl PyB2buaControl {
                     None
                 }
             };
-            Python::attach(|python| -> PyResult<Py<PyAny>> {
-                Ok(match answered {
-                    None => python.None(),
-                    Some(response) if with_body => (
-                        response.status,
-                        pyo3::types::PyBytes::new(python, &response.body),
-                        response.content_type,
-                    )
-                        .into_pyobject(python)?
-                        .into_any()
-                        .unbind(),
-                    Some(response) => response.status.into_pyobject(python)?.into_any().unbind(),
-                })
-            })
+            Ok(crate::script::Deferred::build(
+                move |python| -> PyResult<Py<PyAny>> {
+                    Ok(match answered {
+                        None => python.None(),
+                        Some(response) if with_body => (
+                            response.status,
+                            pyo3::types::PyBytes::new(python, &response.body),
+                            response.content_type,
+                        )
+                            .into_pyobject(python)?
+                            .into_any()
+                            .unbind(),
+                        Some(response) => {
+                            response.status.into_pyobject(python)?.into_any().unbind()
+                        }
+                    })
+                },
+            ))
         })
     }
 

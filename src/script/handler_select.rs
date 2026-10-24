@@ -391,9 +391,10 @@ mod tests {
     fn entry(python: Python<'_>, kind: HandlerKind) -> HandlerEntry {
         HandlerEntry {
             kind,
-            callable: python.None(),
+            callable: std::sync::Arc::new(python.None()),
             is_async: false,
             options: None,
+            options_value: None,
         }
     }
 

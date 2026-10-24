@@ -276,18 +276,6 @@ impl PyPeerPool {
 
 // ── Shared AVP-accessor helpers over a DiameterMsg ──────────────────────────
 
-fn msg_get_avp<'py>(
-    py: Python<'py>,
-    msg: &DiameterMsg,
-    code: u32,
-    vendor: u32,
-) -> PyResult<Option<Bound<'py, PyAny>>> {
-    match msg.find(code, vendor) {
-        Some(avp) => Ok(Some(avp_to_py(py, code, vendor, avp)?)),
-        None => Ok(None),
-    }
-}
-
 /// One AVP of a message with its fields by name, as `avps()` lists them.
 ///
 /// `iter_avps` yields `(code, vendor, value)` tuples and the members of a
@@ -617,8 +605,12 @@ impl PyDiameterAnswer {
     ) -> PyResult<Option<Bound<'py, PyAny>>> {
         let (code, name_vendor) = resolve_code(code_or_name)?;
         let vendor = if vendor != 0 { vendor } else { name_vendor };
-        let guard = self.lock()?;
-        msg_get_avp(py, &guard, code, vendor)
+        // Copied out, then converted: building Python objects can stop for a
+        // garbage collection, and not with this message's lock held.
+        let found = self.lock()?.find(code, vendor).cloned();
+        found
+            .map(|avp| avp_to_py(py, code, vendor, &avp))
+            .transpose()
     }
 
     /// The top-level AVPs as `(code, vendor, value)` tuples, in wire order.
@@ -629,8 +621,8 @@ impl PyDiameterAnswer {
     /// with a vendor id and matches nothing. `avps()` lists the same AVPs
     /// with the fields by name.
     fn iter_avps<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
-        let guard = self.lock()?;
-        msg_iter_avps(py, &guard)
+        let message = self.lock()?.clone();
+        msg_iter_avps(py, &message)
     }
 
     /// The top-level AVPs as `DiameterAvp` objects, in wire order: `.code`,
@@ -643,8 +635,8 @@ impl PyDiameterAnswer {
     ///         reason = {member.name: member.value for member in avp.value}
     /// ```
     fn avps<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
-        let guard = self.lock()?;
-        named_avps(py, &guard.avps)
+        let avps = self.lock()?.avps.clone();
+        named_avps(py, &avps)
     }
 
     #[pyo3(signature = (code_or_name, value, vendor=0))]
@@ -842,8 +834,12 @@ impl PyDiameterRequest {
     ) -> PyResult<Option<Bound<'py, PyAny>>> {
         let (code, name_vendor) = resolve_code(code_or_name)?;
         let vendor = if vendor != 0 { vendor } else { name_vendor };
-        let guard = self.lock()?;
-        msg_get_avp(py, &guard, code, vendor)
+        // Copied out, then converted: building Python objects can stop for a
+        // garbage collection, and not with this message's lock held.
+        let found = self.lock()?.find(code, vendor).cloned();
+        found
+            .map(|avp| avp_to_py(py, code, vendor, &avp))
+            .transpose()
     }
 
     /// The top-level AVPs as `(code, vendor, value)` tuples, in wire order.
@@ -854,8 +850,8 @@ impl PyDiameterRequest {
     /// with a vendor id and matches nothing. `avps()` lists the same AVPs
     /// with the fields by name.
     fn iter_avps<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
-        let guard = self.lock()?;
-        msg_iter_avps(py, &guard)
+        let message = self.lock()?.clone();
+        msg_iter_avps(py, &message)
     }
 
     /// The top-level AVPs as `DiameterAvp` objects, in wire order: `.code`,
@@ -868,8 +864,8 @@ impl PyDiameterRequest {
     ///         reason = {member.name: member.value for member in avp.value}
     /// ```
     fn avps<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
-        let guard = self.lock()?;
-        named_avps(py, &guard.avps)
+        let avps = self.lock()?.avps.clone();
+        named_avps(py, &avps)
     }
 
     /// The AVPs of the request the dictionary does not define, as
@@ -878,9 +874,9 @@ impl PyDiameterRequest {
     /// grouped AVPs the dictionary defines. An undefined grouped AVP is one
     /// entry, its value the octets.
     fn unknown_avps<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
-        let guard = self.lock()?;
+        let avps = self.lock()?.avps.clone();
         let list = PyList::empty(py);
-        for avp in crate::diameter::unknown_avp::unknown_avps(&guard.avps) {
+        for avp in crate::diameter::unknown_avp::unknown_avps(&avps) {
             list.append(named_avp(py, avp)?)?;
         }
         Ok(list)

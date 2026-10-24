@@ -39,6 +39,29 @@ pub(crate) use originate::staged;
 use routing::{cancel_dial, dial, dial_concluded, route_unless_dialling, watch_dial_to_cancel};
 use transfer::{accept_refer_command, complete_refer, refer, reject_refer, replace_peer};
 
+/// Run a synchronous verb on the Python executor rather than this tokio
+/// worker.
+///
+/// These verbs act on the B2BUA rail, and the rail runs script hooks (a
+/// teardown's `on_bye`, a refused route's `on_failure`), so they attach to the
+/// interpreter. Attached on a tokio worker, every garbage collection's
+/// stop-the-world parks the worker and whatever it was driving; once all of
+/// them are parked nothing polls the reactor. Queued rather than shed: a
+/// controller is owed an answer for every command.
+async fn on_python_executor<F>(verb: F) -> ControlResult
+where
+    F: FnOnce() -> ControlResult + Send + 'static,
+{
+    match crate::script::py_executor::run_queued(verb).await {
+        Ok(result) => result,
+        Err(_) => ControlResult::error(
+            ControlErrorCode::Unavailable,
+            "the command did not complete: the script executor is shut down or the verb panicked"
+                .to_string(),
+        ),
+    }
+}
+
 /// The SIP adapter (`module() == "sip"`).
 #[derive(Debug, Default)]
 pub struct SipControlAdapter;
@@ -61,7 +84,7 @@ impl ControlAdapter for SipControlAdapter {
         Box::pin(async move {
             if command.verb == MODULE_VERB {
                 // Module-level: it creates the channel rather than addressing one.
-                originate(command)
+                on_python_executor(move || originate(command)).await
             } else if is_bridge_verb(&command.verb) {
                 // Addresses two channels and confirms the media teardown with
                 // the backend before it answers, so it runs on the async path.
@@ -72,7 +95,7 @@ impl ControlAdapter for SipControlAdapter {
                 // `cancel_dial` answers once the dial it ended has let go of
                 // the caller; every other verb here answers at once.
                 let cancelled_dial = watch_dial_to_cancel(&command);
-                let result = apply_sip(command);
+                let result = on_python_executor(move || apply_sip(command)).await;
                 dial_concluded(cancelled_dial, &result).await;
                 result
             } else {

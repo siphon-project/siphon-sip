@@ -247,7 +247,9 @@ impl PyRoSession {
                 Ok(answer) => Some(answer.result_code),
                 Err(_) => None,
             };
-            Python::attach(|py| answer_dict(py, &session, result_code))
+            Ok(crate::script::Deferred::build(move |py| {
+                answer_dict(py, &session, result_code)
+            }))
         })
     }
 

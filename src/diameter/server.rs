@@ -145,7 +145,7 @@ impl ServerHandshake {
     /// Python `@on_inbound_cer` callback in here; tests pass a closure).
     pub async fn run<S, F>(
         &self,
-        mut stream: S,
+        stream: S,
         peer_addr: SocketAddr,
         incoming_tx: mpsc::Sender<IncomingRequest>,
         resolve: F,
@@ -153,6 +153,30 @@ impl ServerHandshake {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
         F: FnOnce(&AclMatch, &str) -> CerDecision,
+    {
+        self.run_resolving(
+            stream,
+            peer_addr,
+            incoming_tx,
+            move |acl_match, asserted| std::future::ready(resolve(acl_match, asserted)),
+        )
+        .await
+    }
+
+    /// [`Self::run`] with an awaited identity decision, for a resolver that
+    /// has to leave this task to decide (the Python `@on_inbound_cer` hook
+    /// runs on the script executor, never on a tokio worker).
+    pub async fn run_resolving<S, F, Fut>(
+        &self,
+        mut stream: S,
+        peer_addr: SocketAddr,
+        incoming_tx: mpsc::Sender<IncomingRequest>,
+        resolve: F,
+    ) -> Result<(Arc<DiameterPeer>, AclMatch), HandshakeError>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+        F: FnOnce(&AclMatch, &str) -> Fut,
+        Fut: std::future::Future<Output = CerDecision>,
     {
         // ── Gate 1: source-IP ACL — before reading a single byte ────────────
         let acl_match = self
@@ -201,7 +225,7 @@ impl ServerHandshake {
         }
 
         // ── Identity decision (already-authenticated peer) ──────────────────
-        let (origin_host, origin_realm) = match resolve(&acl_match, &asserted) {
+        let (origin_host, origin_realm) = match resolve(&acl_match, &asserted).await {
             CerDecision::Accept {
                 origin_host,
                 origin_realm,

@@ -350,10 +350,10 @@ impl PyRequest {
         self.inbound_connection_id = Some(connection_id);
     }
 
-    /// Attach the gate that holds in-dialog messages behind this request's
-    /// reply. The dispatcher keeps its own clone and closes it once the
-    /// handlers have returned.
+    /// Attach the gate that holds in-dialog messages behind this request's reply
+    /// (the dispatcher closes its own clone once the handlers have returned).
     pub fn set_reply_gate(&mut self, gate: Arc<super::proxy_utils::ReplyGate>) {
+        gate.register_dialog_of(&self.message);
         self.reply_gate = Some(gate);
     }
 

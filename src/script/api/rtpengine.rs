@@ -36,7 +36,7 @@ mod offer;
 mod repeat;
 mod scope;
 
-use answer::AnswerExchange;
+use answer::{arm_auto_reject, AnswerExchange};
 use decorators::event_decorator;
 use message::{
     dialog_ids, extract_answer_params, extract_delete_params, extract_offer_params,
@@ -1117,21 +1117,20 @@ impl PyRtpEngine {
                     if !takeover {
                         sessions.record_local_answer(&call_id, &answer_sdp);
                     }
-                    Ok(Some(answer_sdp))
+                    Ok(crate::script::Deferred::build(move |_| {
+                        Ok(Some(answer_sdp))
+                    }))
                 }
                 AnswerLocalOutcome::Reject488 => {
-                    // reject_call is Some here (can_reject implied it).
-                    if let Some(reject_call) = reject_call {
-                        Python::attach(|py| {
-                            let mut call_ref = reject_call.bind(py).borrow_mut();
-                            call_ref.set_reject(488, "Not Acceptable Here");
-                        });
-                    }
                     debug!(
                         call_id = %call_id,
                         "rtpengine.answer_local: no encodable codec, deferred 488 Not Acceptable Here"
                     );
-                    Ok(None)
+                    // reject_call is Some here (can_reject implied it).
+                    Ok(crate::script::Deferred::build(move |py| {
+                        reject_call.map_or(Ok(()), |call| arm_auto_reject(call.bind(py)))?;
+                        Ok(None::<String>)
+                    }))
                 }
                 AnswerLocalOutcome::ValueError => Err(pyo3::exceptions::PyValueError::new_err(
                     "no encodable codec in offer",

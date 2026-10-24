@@ -53,7 +53,17 @@ pub(super) async fn script_reload_handler(State(state): State<AdminState>) -> Re
         }
     }
 
-    match engine.reload() {
+    // On the script executor, not this tokio worker: the reload runs the
+    // script's top level attached to the interpreter.
+    let reloading = std::sync::Arc::clone(engine);
+    let reloaded = crate::script::py_executor::run_queued(move || reloading.reload())
+        .await
+        .unwrap_or_else(|_| {
+            Err(crate::error::SiphonError::Script(
+                "the reload did not run: the script executor is shut down".to_string(),
+            ))
+        });
+    match reloaded {
         Ok(()) => {
             info!("admin: script reloaded");
             body.insert("reloaded".into(), true.into());

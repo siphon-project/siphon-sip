@@ -514,6 +514,7 @@ impl PyPresence {
             route_set,
             cseq,
         } = dialog;
+        let call_id_for_gate = call_id.clone();
 
         // Determine transport destination: first Route header, or subscriber URI
         let resolve_target: String = route_set
@@ -633,11 +634,20 @@ impl PyPresence {
             ))
         })?;
 
-        // If called within a request handler, defer until after the reply is
-        // sent (RFC 3265 §3.1.6.2: 200 OK to SUBSCRIBE before initial NOTIFY).
-        if !super::proxy_utils::try_defer_send(message.clone(), target.address, transport) {
-            uac_sender.send_request(message, target.address, transport);
-        }
+        // Called while the SUBSCRIBE that created the dialog is still being
+        // handled: hold it until that 200 OK is out (RFC 6665 §4.1.2.3, the
+        // initial NOTIFY follows the 2xx). This future runs on a tokio worker,
+        // so the request's gate is found by the dialog's Call-ID rather than
+        // the handler thread's queue, which it cannot see.
+        super::proxy_utils::hold_or_send(
+            &call_id_for_gate,
+            message,
+            target.address,
+            transport,
+            |message, destination, transport| {
+                uac_sender.send_request(message, destination, transport)
+            },
+        );
 
         // RFC 6665 §4.4.1: after the terminating NOTIFY, the subscription is
         // gone — drop the dialog state so subsequent state-change events for

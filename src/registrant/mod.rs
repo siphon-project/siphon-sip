@@ -1224,30 +1224,43 @@ impl RegistrantManager {
                 "registration failed"
             );
 
-            // Re-resolve DNS to try a different IP on next attempt
-            if let Some(ref address_str) = entry.address_str {
-                use std::net::ToSocketAddrs;
-                if let Ok(mut addrs) = address_str.to_socket_addrs() {
-                    let old = entry.destination;
+            let re_resolve = entry
+                .address_str
+                .clone()
+                .map(|address_str| (address_str, entry.destination));
+            let aor_owned = entry.aor.clone();
+            drop(entry);
+
+            // Re-resolve DNS to try a different IP on next attempt. With the
+            // entry let go: getaddrinfo can take seconds, and the script API
+            // (`registration.status`, `list`, `add`) reads these entries from
+            // attached threads, which must not wait on a lookup.
+            if let Some((address_str, old)) = re_resolve {
+                if let Ok(addrs) = crate::script::waits::resolve_socket_addrs(&address_str) {
                     let new_addr = addrs
+                        .iter()
+                        .copied()
                         .find(|a| *a != old)
-                        .or_else(|| address_str.to_socket_addrs().ok()?.next());
-                    if let Some(new_addr) = new_addr {
-                        if new_addr != old {
-                            info!(
-                                aor = %entry.aor,
-                                old = %old,
-                                new = %new_addr,
-                                "re-resolved registrar to different IP"
-                            );
-                            entry.destination = new_addr;
+                        .or_else(|| addrs.first().copied());
+                    if let Some(new_addr) = new_addr.filter(|new_addr| *new_addr != old) {
+                        if let Some(mut entry) = self.entries.get_mut(aor) {
+                            // Only if nothing re-pointed it meanwhile.
+                            if entry.destination == old
+                                && entry.address_str.as_deref() == Some(address_str.as_str())
+                            {
+                                info!(
+                                    aor = %entry.aor,
+                                    old = %old,
+                                    new = %new_addr,
+                                    "re-resolved registrar to different IP"
+                                );
+                                entry.destination = new_addr;
+                            }
                         }
                     }
                 }
             }
 
-            let aor_owned = entry.aor.clone();
-            drop(entry);
             self.emit_event(RegistrantEvent::Failed {
                 aor: aor_owned,
                 status_code,

@@ -607,10 +607,10 @@ pub(super) fn wait_recording<'py>(
             .await
             .map_err(|error| failure("conference_wait_recording", error))?;
         match finished {
-            Some(finished) => {
-                Python::attach(|python| super::capture::finished_dict(python, &finished)).map(Some)
-            }
-            None => Ok(None),
+            Some(finished) => Ok(crate::script::Deferred::build(move |python| {
+                super::capture::finished_dict(python, &finished)
+            })),
+            None => Ok(crate::script::Deferred::none()),
         }
     })
 }
