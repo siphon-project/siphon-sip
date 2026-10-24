@@ -13,6 +13,11 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
+### Security
+
+- **p256 0.14** (crypto-bigint 0.7.7, RUSTSEC-2026-0387: timing variability
+  in operations meant to be constant-time) for STIR/SHAKEN ES256 signing and
+  verification.
 ### Fixed
 
 - **A P-CSCF no longer waits for the kernel on the thread that answers a
