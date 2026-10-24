@@ -277,13 +277,12 @@ pub fn b2bua_dial_b_leg(
     // A/AAAA lookup replace the destination with the Contact's own address, so
     // an over-MTU B-leg would bypass the very Path the resolve above followed.
     if state.mtu.is_some() && flow.is_none() {
-        if let Some((tcp_transport, tcp_addr)) = mtu_tcp_upgrade(
-            state.mtu,
+        if let Some((tcp_transport, tcp_addr)) = over_mtu_upgrade(
+            state,
             outbound_transport,
             original_request.to_bytes().len(),
             routing_uri,
             destination,
-            &state.dns_resolver,
         ) {
             outbound_transport = tcp_transport;
             destination = tcp_addr;

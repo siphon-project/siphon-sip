@@ -5,6 +5,10 @@
 
 use super::*;
 
+/// The over-MTU UDP-to-TCP decision toward a UE with a security association.
+mod over_mtu;
+pub(super) use over_mtu::over_mtu_upgrade;
+
 /// Resolve a SIP URI string to a socket address using DNS (RFC 3263).
 ///
 /// Supports numeric IPs, bare `ip:port` strings, and full SIP URIs with

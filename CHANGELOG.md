@@ -13,6 +13,11 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
+### Security
+
+- **p256 0.14** (crypto-bigint 0.7.7, RUSTSEC-2026-0387: timing variability
+  in operations meant to be constant-time) for STIR/SHAKEN ES256 signing and
+  verification.
 ### Fixed
 
 - **Blocking waits made while attached to the interpreter could deadlock a
@@ -71,6 +76,20 @@ entry, but a working config keeps working.
   `siphon::script::blocking::awaitable`, `siphon::script::Deferred` (build a
   future's Python result in the completion step, off the tokio workers) and
   `siphon::script::inline_dispatch::run_coroutine_inline`.
+- **P-CSCF: an over-MTU request to a protected UE goes over TCP on the
+  P-CSCF's own connection.** A request too big for UDP (a reg-event NOTIFY
+  listing a few contacts) to a UE that registered over UDP and holds a
+  security association was probed for TCP at the UE's protected client port,
+  unprotected and from an ephemeral port. The probe could never succeed, so
+  the request went fragmented over UDP, was never answered, timed out, and
+  the UE's reg-event subscription ended on every such NOTIFY. The switch now
+  opens (or reuses) the P-CSCF's connection from its protected client port to
+  the UE's protected server port, sends the request there with its Via naming
+  the protected server port, and reads the answer off it, on the relay, fork
+  and B2BUA paths alike. Only when that connection cannot be opened, or the
+  association carries no TCP, does the request stay on UDP, with the reason
+  logged.
+
 - **A P-CSCF no longer waits for the kernel on the thread that answers a
   REGISTER.** Forwarding (or answering) the 2xx to a REGISTER that came over
   a pending pair blocked that thread until the XFRM policy update taking the
