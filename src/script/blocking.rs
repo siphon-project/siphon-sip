@@ -242,9 +242,8 @@ mod tests {
     #[test]
     fn no_dispatcher_or_transport_wait_can_block_while_attached() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        // Owned by the IPsec work that makes this hook non-blocking; it moves
-        // onto the helpers with that change.
-        const PENDING: &[&str] = &["src/dispatcher/ipsec_lifecycle.rs"];
+        // Files still waiting to move onto the helpers. Empty: keep it so.
+        const PENDING: &[&str] = &[];
 
         let mut offenders = Vec::new();
         let mut directories = vec![root.join("src/dispatcher"), root.join("src/transport")];

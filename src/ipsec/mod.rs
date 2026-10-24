@@ -5,6 +5,8 @@
 
 pub mod milenage;
 
+#[cfg(test)]
+mod concurrency_tests;
 /// Which ports a P-CSCF's message to a UE leaves from and goes to.
 mod egress;
 pub use egress::{pcscf_tcp_request_egress, pcscf_udp_egress};
@@ -31,6 +33,8 @@ pub mod sec_agree;
 mod spi;
 #[cfg(test)]
 mod spi_reuse_tests;
+/// Sends to a UE held while a pending pair of its is taken into use.
+pub(crate) mod switch;
 pub use spi::{MAX_SPI_RANGE_COUNT, MIN_SPI};
 
 pub mod ue;
@@ -1485,6 +1489,10 @@ impl IpsecManager {
         replace: bool,
     ) -> Result<(), IpsecError> {
         #[cfg(test)]
+        if replace {
+            self.mock_policy_update_gate().await;
+        }
+        #[cfg(test)]
         if let Some(result) = self.mock_policy(
             format!(
                 "policy:{source}:{source_port}->{destination}:{destination_port}:{}",
@@ -1883,6 +1891,9 @@ struct KernelMock {
     templates: std::collections::HashMap<String, u32>,
     /// Ordered log of policy updates as `(key, hard_lifetime_secs)`.
     policy_updates: Vec<(String, Option<u64>)>,
+    /// When set, each policy update waits for a permit of its own, so a test
+    /// can hold one up the way a slow kernel round trip would.
+    policy_update_gate: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 #[cfg(test)]
@@ -1921,6 +1932,27 @@ impl IpsecManager {
     /// The SPI the template of the live policy `key` names, 0 for any.
     pub(crate) fn test_kernel_policy_template(&self, key: &str) -> Option<u32> {
         self.mock().templates.get(key).copied()
+    }
+
+    /// Hold every policy update from now on until the returned semaphore
+    /// hands it a permit.
+    pub(crate) fn test_stall_policy_updates(&self) -> Arc<tokio::sync::Semaphore> {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        self.mock().policy_update_gate = Some(Arc::clone(&gate));
+        gate
+    }
+
+    /// Wait for a permit when policy updates are held up.
+    async fn mock_policy_update_gate(&self) {
+        let gate = self.kernel_mock.as_ref().and_then(|mock| {
+            mock.lock()
+                .expect("mock kernel lock poisoned")
+                .policy_update_gate
+                .clone()
+        });
+        if let Some(gate) = gate {
+            gate.acquire().await.expect("the gate stays open").forget();
+        }
     }
 
     /// The policy updates the mock kernel took, as `(key, lifetime)`.

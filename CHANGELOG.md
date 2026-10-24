@@ -13,6 +13,19 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A P-CSCF no longer waits for the kernel on the thread that answers a
+  REGISTER.** Forwarding (or answering) the 2xx to a REGISTER that came over
+  a pending pair blocked that thread until the XFRM policy update taking the
+  pair into use was back from the blocking pool. On an executor worker still
+  attached to the free-threaded interpreter that held up every
+  stop-the-world, and every thread that then tried to attach parked behind
+  it, which could wedge the whole process. The update now runs on its own
+  task; messages to that UE are held at the egress until it is over (2 s at
+  most) and then sent in order, so the 2xx still leaves over the new pair
+  (TS 24.229 clause 5.2.2.2).
+
 ## [1.15.3] — 2026-10-23
 
 ### Added
