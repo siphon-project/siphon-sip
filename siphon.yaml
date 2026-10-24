@@ -353,6 +353,15 @@ script:
   #                                # with idle workers and an empty queue is
   #                                # still serving and is never aborted, however
   #                                # long one handler has been parked.
+  # process_stall_abort_secs: 30   # whole-process liveness: abort when the
+  #                                # tokio runtime runs no timer/socket/task,
+  #                                # most tokio workers are stuck in one poll,
+  #                                # no thread can attach to the interpreter (a
+  #                                # GC stop-the-world that never ends), or the
+  #                                # timer sweep stops, for this long. Catches
+  #                                # the wedge the pool watchdog above cannot
+  #                                # see (nothing is fed to an idle-looking
+  #                                # pool). 0 disables it.
   # handler_timeout_secs: 300      # give a worker back if one async handler's
   #                                # coroutine has not settled in this long, and
   #                                # cancel it. A leak guard, not a deadline:
