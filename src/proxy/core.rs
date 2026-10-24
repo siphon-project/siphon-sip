@@ -190,8 +190,8 @@ pub fn pop_top_route(headers: &mut SipHeaders) -> Option<RouteEntry> {
 pub struct SelfIdentity {
     /// `(host, ports)`.  An empty `ports` means "any port" (an alias).
     entries: Vec<(String, Vec<u16>)>,
-    /// UDP sockets opened at run time for per-UE outbound registrations: each
-    /// is an address siphon answers on, though none is known at startup. Only
+    /// UDP sockets and TCP listeners opened at run time for per-UE outbound
+    /// registrations: each is an address siphon answers on, though none is known at startup. Only
     /// asked when no static entry matched.
     dynamic_udp: Option<std::sync::Arc<crate::transport::ue_sockets::UeSockets>>,
 }
@@ -287,7 +287,7 @@ impl SelfIdentity {
             return false;
         };
         match port {
-            Some(port) => dynamic.contains(&std::net::SocketAddr::new(ip, port)),
+            Some(port) => dynamic.contains_any(&std::net::SocketAddr::new(ip, port)),
             None => dynamic.contains_ip(ip),
         }
     }

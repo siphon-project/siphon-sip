@@ -209,6 +209,36 @@ An MT request answered on a per-UE socket carries that socket's address in its
 Contact and Via, not `advertised_address`, and the per-UE addresses count as
 this node when siphon consumes Route entries.
 
+## Over TCP
+
+Pass `transport="tcp"` to `registration.add` (or `transport: tcp` on a YAML
+entry) and the UE registers over TCP from its own address. With IPsec it
+holds two connections to the P-CSCF, as TS 24.229 has it:
+
+- its own, "from the UE's protected client port and the UE's IP address to the
+  P-CSCF's protected server port" (5.1.1.2.2), opened by siphon from
+  `local_addr:ue_port_c`. Its protected REGISTERs, its MO requests over
+  `registration.flow()` and the responses to them ride this one. After a
+  re-authentication the client port rotates, and the next request opens a new
+  connection from the new port; the old one closes once its SA set is gone.
+- the P-CSCF's, "from the P-CSCF's protected client port ... to the UE's
+  protected server port" (5.2.2.2). siphon listens on `local_addr:ue_port_s`
+  (IP_FREEBIND, opened and closed with the entry like the UDP sockets) and
+  answers the P-CSCF's requests on the connection they came in on.
+
+The unprotected initial REGISTER leaves from `local_addr` on the plain port,
+to the P-CSCF's unprotected port; that connection closes once an SA set is
+established. Contact and Via name the protected server port with
+`;transport=tcp` in the Contact. Over TCP the response rides the connection
+(5.1.1.2.1 d), so the Via port is only where the P-CSCF reconnects if it
+lost it. Without IPsec the entry listens on its plain port, its Contact.
+
+A process with no `listen.tcp` still gets a TCP outbound path when a
+registrant is configured. Moving or removing a UE, and shutdown, close its
+listener, the connections it accepted, and its own connections. Per IPsec UE
+that is one listener and two or three connections, in place of five UDP
+sockets.
+
 ## Watching the fleet
 
 ```python
@@ -223,8 +253,8 @@ in `RegistrantChanged` and `outbound_registrations`.
 
 ## Limits
 
-- **UDP only.** A `local_addr` on a `tcp` or `tls` entry is refused at load
-  and by `registration.add`.
+- **UDP or TCP, not TLS.** A `local_addr` on a `tls` entry is refused at load
+  and by `registration.add`. See "Over TCP" above.
 - **A move does not de-register the old binding.** The old address is usually
   gone already. A registrar keying on `+sip.instance` (RFC 5626, built from
   `imei`) replaces the binding; any other lets it lapse at its Expires.

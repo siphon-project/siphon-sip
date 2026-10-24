@@ -40,8 +40,18 @@
 #      xfrm policies left in the UE namespace
 # and prints the UE process's fd count and RSS.
 #
+# With TRANSPORT=tcp the UEs register over TCP (the P-CSCF and S-CSCF listen
+# on TCP too) and two more checks run after step 3:
+#   3b. every UE holds an established connection from its address to the
+#       P-CSCF's protected server port 5066 (TS 24.229 5.1.1.2.2)
+#   3c. a MESSAGE for UE 1 handed to the P-CSCF (over TCP from the core
+#       namespace) reaches the UE on a connection the P-CSCF opened from its
+#       protected client port 5064 to the UE's protected server port 6101
+#       (TS 24.229 5.2.2.2 1A b), checked with `ss -tn` in the UE namespace
+#
 # Usage:
 #   sudo -E N=20 scripts/multi_ue_netns.sh
+#   sudo -E N=20 TRANSPORT=tcp scripts/multi_ue_netns.sh
 #
 # Environment:
 #   N              UEs, default 20
@@ -57,6 +67,7 @@
 #   OVERLAP_TEST   0 to skip the make-before-break step, default 1
 #   STOP_TIMEOUT   seconds to wait for the UE process to exit, default 60
 #   KEEP           1 to leave namespaces and processes up on exit
+#   TRANSPORT      udp (default) or tcp: what the UEs register over
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -73,6 +84,7 @@ CALL_TEST="${CALL_TEST:-0}"
 OVERLAP_TEST="${OVERLAP_TEST:-1}"
 STOP_TIMEOUT="${STOP_TIMEOUT:-60}"
 KEEP="${KEEP:-0}"
+TRANSPORT="${TRANSPORT:-udp}"
 
 HOME_DOMAIN="ims.mnc01.mcc001.3gppnetwork.org"
 CORE_IP="198.51.100.1"
@@ -121,6 +133,7 @@ preflight() {
     (( N >= 2 )) || fail "N must be at least 2"
     (( ADDR_BASE + N - 1 + ADDR_SHIFT <= 254 )) || fail "ADDR_BASE + N + ADDR_SHIFT exceeds the /24"
     (( N <= 99999 )) || fail "N too large for the IMSI range"
+    [[ "$TRANSPORT" == "udp" || "$TRANSPORT" == "tcp" ]] || fail "TRANSPORT must be udp or tcp"
     local namespace existing
     existing="$(ip netns list)"
     for namespace in "$CORE_NS" "$UE_NS"; do
@@ -243,6 +256,17 @@ write_ue_csv() {
     mv "$SCRATCH/ues.csv.tmp" "$SCRATCH/ues.csv"
 }
 
+# The `tcp:` listen block for TRANSPORT=tcp on the addresses given, else
+# nothing (UDP mode writes the configs it always wrote).
+tcp_listen() {
+    [[ "$TRANSPORT" == "tcp" ]] || return 0
+    local address
+    echo "  tcp:"
+    for address in "$@"; do
+        echo "    - \"$address\""
+    done
+}
+
 write_core_configs() {
     local index
     cat >"$SCRATCH/pcscf.yaml" <<EOF
@@ -251,6 +275,7 @@ listen:
     - "$CORE_IP:5060"
     - "$CORE_IP:5064"
     - "$CORE_IP:5066"
+$(tcp_listen "$CORE_IP:5060" "$CORE_IP:5064" "$CORE_IP:5066")
 advertised_address: "$CORE_IP"
 domain:
   local:
@@ -287,6 +312,7 @@ EOF
 listen:
   udp:
     - "$SCSCF_IP:5060"
+$(tcp_listen "$SCSCF_IP:5060")
 advertised_address: "$SCSCF_IP"
 domain:
   local:
@@ -452,11 +478,73 @@ EOF
         "$low" "$high" || fail "refreshes at ${low}..${high}: not spread over [0.4, 0.6]"
 }
 
+# 3b: one established connection per UE from its own address to the P-CSCF's
+# protected server port, in the UE namespace.
+check_tcp_ue_connections() {
+    local connections
+    connections="$(ip netns exec "$UE_NS" ss -Htn state established "( dport = :5066 )" \
+        | awk -v core="$CORE_IP:5066" '$4 == core {split($3, part, ":"); print part[1]}' \
+        | sort -u | wc -l)"
+    log "TCP: UEs with a connection to the P-CSCF's protected server port: $connections (expected $N)"
+    [[ "$connections" -eq "$N" ]] || fail "TCP: $connections/$N UEs hold a connection to $CORE_IP:5066"
+}
+
+# 3c: a MESSAGE for UE 1 sent to the P-CSCF's unprotected port over TCP. The
+# P-CSCF relays it to the cached Contact, the UE's protected server port, on a
+# connection it opens from its protected client port. Whatever the UE answers
+# (the example bridges it to a tester that may not be there), that connection
+# has to exist.
+check_tcp_pcscf_connection() {
+    local ue status connection
+    ue="$(ue_addr 1 0)"
+    status="$(ip netns exec "$CORE_NS" python3 -I -c '
+import socket, sys, time
+core, user, domain = sys.argv[1], sys.argv[2], sys.argv[3]
+message = (
+    f"MESSAGE sip:{user}@{domain} SIP/2.0\r\n"
+    f"Via: SIP/2.0/TCP {core}:5999;branch=z9hG4bK-mt-probe-1\r\n"
+    "Max-Forwards: 70\r\n"
+    f"From: <sip:mt-probe@{domain}>;tag=mt-probe\r\n"
+    f"To: <sip:{user}@{domain}>\r\n"
+    "Call-ID: mt-probe@multi-ue\r\n"
+    "CSeq: 1 MESSAGE\r\n"
+    "Content-Type: text/plain\r\n"
+    "Content-Length: 5\r\n"
+    "\r\n"
+    "probe"
+)
+received = b""
+with socket.create_connection((core, 5060), timeout=2) as probe:
+    probe.sendall(message.encode())
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        try:
+            chunk = probe.recv(4096)
+        except socket.timeout:
+            continue
+        if not chunk:
+            break
+        received += chunk
+        for head in received.split(b"\r\n\r\n"):
+            line = head.split(b"\r\n", 1)[0]
+            if line.startswith(b"SIP/2.0 ") and line[8:9] != b"1":
+                print(line.decode(errors="replace"))
+                sys.exit(0)
+print("no final response")
+' "$CORE_IP" "$(imsi 1)" "$HOME_DOMAIN" || true)"
+    log "TCP: MT probe for UE 1 answered: $status"
+    connection="$(ip netns exec "$UE_NS" ss -Htn state established "( sport = :6101 )" \
+        | awk -v local_addr="$ue:6101" -v peer="$CORE_IP:5064" '$3 == local_addr && $4 == peer' \
+        | wc -l)"
+    log "TCP: connections $CORE_IP:5064 -> $ue:6101 in $UE_NS: $connection (expected 1)"
+    [[ "$connection" -ge 1 ]] || fail "TCP: no P-CSCF connection from port_pc to UE 1's port_us"
+}
+
 report_process() {
     local pid="$1" fds rss
     fds="$(find "/proc/$pid/fd" -mindepth 1 -maxdepth 1 | wc -l)"
     rss="$(awk '/^VmRSS/ {print $2, $3}' "/proc/$pid/status")"
-    log "UE process $pid: $fds fds (3 per UE plus the base set), RSS $rss"
+    log "UE process $pid: $fds fds (5 per UE over UDP, 2 to 4 over TCP, plus the base set), RSS $rss"
 }
 
 call_test() {
@@ -663,13 +751,18 @@ main() {
         "TESTER=sip:tester@$UE_IP:$TESTER_PORT" \
         "MULTI_UE_CSV=$SCRATCH/ues.csv" \
         "MULTI_UE_STATUS=$SCRATCH/status.json" \
-        "MULTI_UE_INTERVAL=$INTERVAL"
+        "MULTI_UE_INTERVAL=$INTERVAL" \
+        "MULTI_UE_TRANSPORT=$TRANSPORT"
     local ue_pid="${PIDS[-1]}"
 
     wait_registered 0
     local registered_at=$SECONDS
     check_xfrm
     check_contacts 0
+    if [[ "$TRANSPORT" == "tcp" ]]; then
+        check_tcp_ue_connections
+        check_tcp_pcscf_connection
+    fi
     report_process "$ue_pid"
     check_refresh_spread
     check_xfrm

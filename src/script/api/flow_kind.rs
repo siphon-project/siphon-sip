@@ -61,11 +61,12 @@ pub fn registrant_flow(
 ) -> Option<PyFlow> {
     let egress = manager.ue_egress(aor, ue_ip)?;
     Some(PyFlow {
-        transport: "udp".to_string(),
+        transport: egress.transport.as_scheme().to_string(),
         // A request over the flow goes to source_addr, from local_addr.
         source_addr: egress.destination,
         local_addr: egress.local,
-        // UDP egress is selected by source_local_addr, not a connection id.
+        // Selected by source_local_addr, not a connection id: the UDP socket
+        // there, or over TCP the pool's connection from it.
         connection_id: 0,
         kind: FlowKind::Outbound(RegistrantFlow {
             aor: aor.to_string(),

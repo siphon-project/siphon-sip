@@ -16,7 +16,9 @@
 # per UE at run time, on (address, 5060), (address, ue_port_c) and
 # (address, ue_port_s), bound with IP_FREEBIND so the address does not have to
 # be on the host yet. Until it is, sends from it fail in the kernel and the
-# UE retries with backoff. UDP only.
+# UE retries with backoff. MULTI_UE_TRANSPORT=tcp registers over TCP instead:
+# one listener per UE on (address, ue_port_s) and its own connection from
+# (address, ue_port_c), no UDP sockets.
 #
 # Count file descriptors: 3 per IPsec UE, so 1000 UEs need a `ulimit -n` well
 # above 3000.
