@@ -554,11 +554,23 @@ async def bye(request):
   engine call-id is `<call-id>;<scope>`; no SIP Call-ID holds a `;` (RFC 3261
   §25.1), so it never names another call. Each leg is a whole engine call, with
   its own profile, address family and ports.
-- **Which verbs.** `offer`, `answer` and `delete` take `scope=`, and an
-  `offer` on a leg already anchored under that scope goes out as its re-offer.
-  The leg's session (profile, tags, WebSocket URI) is kept per scope, so an
-  `answer` reuses its own leg's offer profile. Other media verbs (prompts,
-  DTMF, gating, recording) still address the node-scope call.
+- **Which verbs.** Every media verb that addresses a call takes `scope=`:
+  `offer`, `answer`, `answer_local`, `delete`, `delete_call`, and the prompts,
+  DTMF, gating, echo, recording, digit reads, subscriptions, tees and bridges.
+  An `offer` on a leg already anchored under that scope goes out as its
+  re-offer. The leg's session (profile, tags, WebSocket URI) is kept per
+  scope, so an `answer` reuses its own leg's offer profile.
+- **A verb without `scope=`.** The node's call, as before, except when the call
+  has no session of its own and exactly one leg was offered under a scope: then
+  that leg, the only one the verb can mean. With two scoped legs it still goes
+  to the node's call, which is neither leg, so the engine refuses it: name the
+  leg.
+
+  ```python
+  await rtpengine.play_media(request, file="/prompts/hold.wav", scope="term")
+  digits, reason = await rtpengine.read_digits(request, scope="orig")
+  ```
+
 - **Delete.** `delete(request)` and `delete_call(call_id)` with no scope delete
   the call's own session and every leg any scope anchored under that Call-ID,
   each under its own scope; `delete(request, scope="orig")` and
@@ -571,9 +583,27 @@ async def bye(request):
 - **Engine support.** On an unscoped siphon-rtp node, the first per-call scope
   on a connection asks the engine for `node_info`; an engine without the
   `scope` feature fails the verb rather than anchor the legs together.
-- **Events.** siphon-rtp events of a scoped leg reach the script under the SIP
-  Call-ID, without the scope; rtpengine reports the leg's engine call-id
-  (`<call-id>;<scope>`).
+- **Events.** A scoped leg's media events reach the script the same way on
+  every backend: under the SIP Call-ID, with the scope as a `scope=` keyword for
+  a handler that takes one. A handler without the keyword is called as before,
+  and an event of the node's own call passes no scope.
+
+  ```python
+  @rtpengine.on_dtmf
+  def digit(call_id, from_tag, digit, duration_ms, volume, scope=None):
+      if scope == "term":
+          ...
+  ```
+
+  On the wire rtpengine and rtpproxy report the leg's engine call-id
+  (`<call-id>;<scope>`) and siphon-rtp the frame's `scope`; siphon splits both
+  back. A `read_digits` on a leg takes only that leg's digits.
+- **Lawful intercept.** An intercepted call's X3 content is attached on every
+  leg siphon anchored for it, each scoped leg included, so no leg's content
+  goes undelivered. Each leg's delivery carries the session's one Correlation
+  ID, and siphon records which leg it came from, so a loss or end report names
+  the leg and one leg ending does not end the other's delivery. The mediation
+  function receives one delivery per tapped leg.
 - **Bounded.** A scope names a leg's role. siphon refuses a 257th distinct scope
   name, so a script deriving one per call fails loudly instead of growing
   siphon's bookkeeping with every call.

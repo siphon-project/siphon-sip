@@ -18,6 +18,7 @@ use tracing::{debug, error, info, trace, warn};
 
 use super::events::convert_event;
 use super::identity::{auth_frame_for, authenticate, controller_id};
+use super::per_call::{event_scope, report_under_leg};
 use super::scope::{require_scope_support, CallScope, CallScopes};
 use super::waiters::Waiters;
 use super::{PlayWaiter, HANDSHAKE_REQUEST_ID, READ_CHUNK};
@@ -341,6 +342,9 @@ async fn route_frame(
             );
             return;
         }
+        // A leg a script anchored under a per-call scope is reported under its
+        // engine call-id, as rtpengine and rtpproxy report one.
+        let leg_scope = event_scope(scopes.node(), &value);
         match serde_json::from_value::<Event>(value) {
             Ok(event @ Event::PlayFinished { .. }) => {
                 // Two consumers, and they are not alternatives. The waiter is a
@@ -363,11 +367,13 @@ async fn route_frame(
                         let _ = sender.send((*reason, *played_ms));
                     }
                 }
-                let converted = convert_event(event);
+                let mut converted = convert_event(event);
+                report_under_leg(&mut converted, leg_scope.as_ref());
                 forward_event(event_tx, converted);
             }
             Ok(event) => {
-                let converted = convert_event(event);
+                let mut converted = convert_event(event);
+                report_under_leg(&mut converted, leg_scope.as_ref());
                 debug!(?converted, "siphon-rtp event received");
                 match &converted {
                     // A digit a script's `read_digits` is collecting belongs

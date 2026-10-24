@@ -70,6 +70,37 @@ impl MediaSessionStore {
             .collect()
     }
 
+    /// Every per-call scope a leg of `call_id` is anchored under, in name
+    /// order.
+    pub fn scopes_holding(&self, call_id: &str) -> Vec<CallScope> {
+        let mut scopes: Vec<CallScope> = self
+            .scopes
+            .iter()
+            .filter(|entry| entry.value().get(call_id).is_some())
+            .map(|entry| entry.key().clone())
+            .collect();
+        scopes.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        scopes
+    }
+
+    /// The per-call scope a verb naming none addresses on `call_id`: the one
+    /// scope a leg of it is anchored under, when the call has no session of
+    /// its own. `None` (the node's call, as before) when it has one, or when
+    /// no leg or more than one is scoped: with two legs a verb has to say
+    /// which.
+    pub fn sole_scope_of(&self, call_id: &str) -> Option<CallScope> {
+        if self.scopes.is_empty() || self.get(call_id).is_some() {
+            return None;
+        }
+        let mut holding = self
+            .scopes
+            .iter()
+            .filter(|entry| entry.value().get(call_id).is_some())
+            .map(|entry| entry.key().clone());
+        let sole = holding.next()?;
+        holding.next().is_none().then_some(sole)
+    }
+
     /// How many sessions are held under per-call scopes, across every scope
     /// (drains to baseline — leak gate).
     pub fn scoped_len(&self) -> usize {

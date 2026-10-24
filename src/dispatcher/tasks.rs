@@ -561,16 +561,5 @@ fn sequence_keyword<'py>(
     handler: &pyo3::Bound<'py, pyo3::PyAny>,
     sequence: u64,
 ) -> Option<pyo3::Bound<'py, pyo3::types::PyDict>> {
-    use pyo3::types::PyDictMethods;
-    let keywords = pyo3::types::PyDict::new(python);
-    keywords.set_item("sequence", sequence).ok()?;
-    let signature = python
-        .import("inspect")
-        .and_then(|inspect| inspect.call_method1("signature", (handler,)))
-        .ok()?;
-    let none = python.None();
-    signature
-        .call_method("bind", (&none, &none, &none), Some(&keywords))
-        .ok()
-        .map(|_| keywords)
+    crate::script::handler_keyword::accepted_keyword(python, handler, 3, "sequence", sequence)
 }

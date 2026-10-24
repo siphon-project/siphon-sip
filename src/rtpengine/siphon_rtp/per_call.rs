@@ -13,8 +13,18 @@
 //!
 //! `None` is the node's scope, and the frame is byte for byte what it always
 //! was. A per-call scope equal to the node's is the node's.
+//!
+//! Every **other** verb that addresses a call (prompts, DTMF, gating,
+//! recording, digit reads, subscriptions, tees, bridges) runs under a leg's
+//! scope through [`in_frame_scope`]: the scope is set for the verb's task, and
+//! the one place every frame is written ([`SiphonRtpClient::request`]), the
+//! instance selection and the waiters read it there. That keeps those verbs'
+//! signatures (and their callers in the dispatcher, which never name a scope)
+//! as they were, rather than threading one more argument through each of them.
+//! A verb outside such a task carries the node's scope, exactly as before.
 
 use std::borrow::Cow;
+use std::future::Future;
 
 use siphon_rtp_proto::Command;
 use tracing::warn;
@@ -38,7 +48,86 @@ pub(crate) fn scoped_key<'a>(call_id: &'a str, scope: Option<&CallScope>) -> Cow
     }
 }
 
+tokio::task_local! {
+    /// The per-call scope the current task's media verb addresses; see the
+    /// module documentation.
+    static FRAME_SCOPE: CallScope;
+}
+
+/// Run `verb` with every frame it sends carrying `scope`, and with siphon's own
+/// bookkeeping for it (instance affinity, active sessions, digit reads) keyed
+/// on the leg rather than on the Call-ID alone.
+pub(crate) async fn in_frame_scope<F: Future>(scope: CallScope, verb: F) -> F::Output {
+    FRAME_SCOPE.scope(scope, verb).await
+}
+
+/// The per-call scope the current task runs under ([`in_frame_scope`]), if
+/// any.
+pub(crate) fn frame_scope() -> Option<CallScope> {
+    FRAME_SCOPE.try_with(CallScope::clone).ok()
+}
+
+/// `scope`, or without one the scope of the current task ([`in_frame_scope`]):
+/// a verb that takes a scope reads the task's when its caller named none.
+fn framed(scope: Option<&CallScope>) -> Option<CallScope> {
+    scope.cloned().or_else(frame_scope)
+}
+
+/// What a waiter keyed on a call (a digit read) and the event that resolves it
+/// both name the leg by: the Call-ID, or under a per-call scope its engine
+/// call-id (`<call-id>;<scope>`), which is how a scoped leg's events reach
+/// [`super::connection`]'s router (see [`report_under_leg`]).
+pub(super) fn leg_call_id(call_id: &str) -> Cow<'_, str> {
+    match frame_scope() {
+        Some(scope) => Cow::Owned(
+            crate::rtpengine::backend::engine_call_id(call_id, Some(&scope)).into_owned(),
+        ),
+        None => Cow::Borrowed(call_id),
+    }
+}
+
+/// The per-call scope an event frame was raised under: its `scope`, when that
+/// is not the node's own.
+pub(super) fn event_scope(
+    node: Option<&CallScope>,
+    event: &serde_json::Value,
+) -> Option<CallScope> {
+    let scope = event.get("scope").and_then(serde_json::Value::as_str)?;
+    if node.is_some_and(|node| node.as_str() == scope) {
+        return None;
+    }
+    CallScope::per_call(scope).ok()
+}
+
+/// Report an event of a leg anchored under the per-call `scope` under the
+/// leg's engine call-id (`<call-id>;<scope>`), the shape rtpengine and rtpproxy
+/// report a scoped leg's events in. The dispatcher splits it back into the SIP
+/// Call-ID and the scope for the script; a read waiting on the leg's digits
+/// meets it as it is.
+pub(super) fn report_under_leg(
+    event: &mut crate::rtpengine::events::RtpEngineEvent,
+    scope: Option<&CallScope>,
+) {
+    let Some(scope) = scope else {
+        return;
+    };
+    if let Some(call_id) = event.call_id_mut() {
+        *call_id = crate::rtpengine::backend::engine_call_id(call_id, Some(scope)).into_owned();
+    }
+}
+
 impl SiphonRtpClient {
+    /// Send `command` under the per-call scope of the current task
+    /// ([`in_frame_scope`]), or the node's outside one.
+    pub(super) async fn request_in_frame(
+        &self,
+        command: Command,
+    ) -> Result<siphon_rtp_proto::CmdResult, RtpEngineError> {
+        let scope = frame_scope();
+        let scope = self.per_call_scope(scope.as_ref()).await?;
+        self.request_in(scope, command).await
+    }
+
     /// Ready a frame to carry `scope`: `None` when it is the node's own (the
     /// frame then carries the node's, as every frame always has), else the
     /// scope, noted as named on this connection so its call's events are
@@ -56,7 +145,7 @@ impl SiphonRtpClient {
             return Ok(None);
         };
         if !self.scopes.engine_supports() {
-            let result = self.request(Command::NodeInfo).await?;
+            let result = self.request_in(None, Command::NodeInfo).await?;
             require_scope_feature(result, &format!("scope={scope:?} was named for one call"))?;
             self.scopes.mark_supported();
         }
@@ -74,7 +163,8 @@ impl SiphonRtpClient {
         sdp: &[u8],
         flags: &NgFlags,
     ) -> Result<Vec<u8>, RtpEngineError> {
-        let scope = self.per_call_scope(scope).await?;
+        let framed = framed(scope);
+        let scope = self.per_call_scope(framed.as_ref()).await?;
         let result = self
             .request_in(
                 scope,
@@ -101,7 +191,8 @@ impl SiphonRtpClient {
         sdp: &[u8],
         flags: &NgFlags,
     ) -> Result<Vec<u8>, RtpEngineError> {
-        let scope = self.per_call_scope(scope).await?;
+        let framed = framed(scope);
+        let scope = self.per_call_scope(framed.as_ref()).await?;
         let result = self
             .request_in(
                 scope,
@@ -126,7 +217,8 @@ impl SiphonRtpClient {
         sdp: &[u8],
         flags: &NgFlags,
     ) -> Result<Vec<u8>, RtpEngineError> {
-        let scope = self.per_call_scope(scope).await?;
+        let framed = framed(scope);
+        let scope = self.per_call_scope(framed.as_ref()).await?;
         let result = self
             .request_in(
                 scope,
@@ -153,7 +245,8 @@ impl SiphonRtpClient {
         call_id: &str,
         from_tag: &str,
     ) -> Result<(), RtpEngineError> {
-        let scope = self.per_call_scope(scope).await?;
+        let framed = framed(scope);
+        let scope = self.per_call_scope(framed.as_ref()).await?;
         let result = self
             .request_in(
                 scope,
@@ -186,12 +279,14 @@ impl SiphonRtpClientSet {
         sdp: &[u8],
         flags: &NgFlags,
     ) -> Result<Vec<u8>, RtpEngineError> {
+        let framed = framed(scope);
+        let scope = framed.as_ref();
         let key = scoped_key(call_id, scope);
         let result = self
-            .select(&key)
+            .select_key(&key)
             .offer_in(scope, call_id, from_tag, sdp, flags)
             .await?;
-        self.bind_affinity(&key);
+        self.bind_affinity_key(&key);
         Ok(result)
     }
 
@@ -212,9 +307,11 @@ impl SiphonRtpClientSet {
         sdp: &[u8],
         flags: &NgFlags,
     ) -> Result<Vec<u8>, RtpEngineError> {
+        let framed = framed(scope);
+        let scope = framed.as_ref();
         let key = scoped_key(call_id, scope);
         match self
-            .select(&key)
+            .select_key(&key)
             .reoffer_in(scope, call_id, from_tag, sdp, flags)
             .await
         {
@@ -243,7 +340,9 @@ impl SiphonRtpClientSet {
         sdp: &[u8],
         flags: &NgFlags,
     ) -> Result<Vec<u8>, RtpEngineError> {
-        self.select(&scoped_key(call_id, scope))
+        let framed = framed(scope);
+        let scope = framed.as_ref();
+        self.select_key(&scoped_key(call_id, scope))
             .answer_in(scope, call_id, from_tag, to_tag, sdp, flags)
             .await
     }
@@ -255,8 +354,13 @@ impl SiphonRtpClientSet {
         call_id: &str,
         from_tag: &str,
     ) -> Result<(), RtpEngineError> {
+        let framed = framed(scope);
+        let scope = framed.as_ref();
         let key = scoped_key(call_id, scope);
-        let result = self.select(&key).delete_in(scope, call_id, from_tag).await;
+        let result = self
+            .select_key(&key)
+            .delete_in(scope, call_id, from_tag)
+            .await;
         self.affinity.remove(key.as_ref());
         result
     }
@@ -271,6 +375,8 @@ impl SiphonRtpClientSet {
         scope: Option<&CallScope>,
         call_id: &str,
     ) -> Result<(), RtpEngineError> {
+        let framed = framed(scope);
+        let scope = framed.as_ref();
         let key = scoped_key(call_id, scope);
         let mut last: Option<RtpEngineError> = None;
         for client in &self.clients {

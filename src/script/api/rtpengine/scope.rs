@@ -1,4 +1,5 @@
-//! `scope=` on `rtpengine.offer` / `answer` / `delete`.
+//! `scope=` on `rtpengine.offer` / `answer` / `delete`, and on every other
+//! media verb that addresses a call ([`leg`]).
 //!
 //! A proxy that anchors both legs of one call (the originating and the
 //! terminating leg of a call between two of its own users, which arrive under
@@ -18,10 +19,11 @@ use std::sync::Arc;
 use pyo3::prelude::*;
 use tracing::{debug, warn};
 
+use crate::rtpengine::backend::ScopedLeg;
 use crate::rtpengine::session::MediaSessionStore;
 use crate::rtpengine::{CallScope, MediaBackend};
 
-use super::{PyCall, PyReply};
+use super::{PyCall, PyReply, PyRtpEngine};
 
 /// Read a verb's `scope=` argument: `None` for the node's own scope (left out,
 /// or equal to the node's configured one), else the per-call scope.
@@ -53,6 +55,44 @@ pub(super) fn per_call_scope(
         )));
     }
     Ok((!client.is_node_scope(&scope)).then_some(scope))
+}
+
+/// The leg of `call_id` a media verb other than `offer` / `answer` /
+/// `delete` addresses: prompts, DTMF, gating, recording, digit reads,
+/// subscriptions, tees and bridges.
+///
+/// With `scope=` it is that leg (checked as [`per_call_scope`] checks it).
+/// Without one it is the node's call, as it always was, except when the call
+/// has no session of its own and exactly one leg of it was offered under a
+/// scope: then that leg, since it is the only one the verb can mean. With two
+/// scoped legs and no `scope=` the verb still goes to the node's call, which
+/// is not either leg, so the engine refuses it rather than guess.
+pub(super) fn leg(
+    scope: Option<&str>,
+    target: Option<&Bound<'_, PyAny>>,
+    client: &MediaBackend,
+    sessions: &MediaSessionStore,
+    call_id: &str,
+    verb: &str,
+) -> PyResult<ScopedLeg> {
+    let scope = match scope {
+        Some(_) => per_call_scope(scope, &[target], client, verb)?,
+        None => sessions.sole_scope_of(call_id),
+    };
+    Ok(client.leg(call_id, scope.as_ref()))
+}
+
+impl PyRtpEngine {
+    /// [`leg`] against this namespace's engine and sessions.
+    pub(super) fn leg(
+        &self,
+        scope: Option<&str>,
+        target: Option<&Bound<'_, PyAny>>,
+        call_id: &str,
+        verb: &str,
+    ) -> PyResult<ScopedLeg> {
+        leg(scope, target, &self.client, &self.sessions, call_id, verb)
+    }
 }
 
 /// The session store a verb under `scope` reads and writes: the call's own

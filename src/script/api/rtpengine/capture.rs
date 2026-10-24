@@ -115,20 +115,26 @@ pub(super) async fn start(
 }
 
 /// Wait for a recording to end: its result as a dict, or `None`.
+///
+/// The dict is built in the completion step ([`crate::script::Deferred`]),
+/// never on the tokio worker the wait ran on: attaching there would hold a
+/// garbage collection's stop-the-world open behind a worker.
 pub(super) async fn wait(
     client: &MediaBackend,
     call_id: &str,
     recording_id: &str,
     wait_ms: u64,
     verb: &str,
-) -> PyResult<Option<Py<PyAny>>> {
+) -> PyResult<crate::script::Deferred> {
     let finished = client
         .wait_recording(call_id, recording_id, Duration::from_millis(wait_ms.max(1)))
         .await
         .map_err(|error| runtime_error(verb, error))?;
     match finished {
-        Some(finished) => Python::attach(|python| finished_dict(python, &finished)).map(Some),
-        None => Ok(None),
+        Some(finished) => Ok(crate::script::Deferred::build(move |python| {
+            finished_dict(python, &finished)
+        })),
+        None => Ok(crate::script::Deferred::none()),
     }
 }
 

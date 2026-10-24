@@ -12,6 +12,7 @@ pub mod diameter_dispatch;
 pub mod engine;
 pub mod error_report;
 pub mod handle;
+pub mod handler_keyword;
 pub mod handler_select;
 pub mod inline_dispatch;
 pub(crate) mod liveness;

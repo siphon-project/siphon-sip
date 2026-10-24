@@ -1,8 +1,8 @@
 //! A media engine speaking the rtpengine NG protocol inside the test process.
 //!
 //! A test that drives siphon's media commands end to end points a
-//! [`MediaBackend`] at it. It records every command it is sent, answers `offer`
-//! and `answer` with [`ENGINE_SDP`], and refuses every `answer` when started with
+//! [`MediaBackend`] at it. It records every command it is sent, answers `offer`,
+//! `answer` and the two subscription commands with [`ENGINE_SDP`], and refuses every `answer` when started with
 //! `refuse_answers`.
 
 use std::net::SocketAddr;
@@ -107,10 +107,12 @@ impl TestEngine {
                             )),
                         ),
                     ]),
-                    "offer" | "answer" => BencodeValue::dict(vec![
-                        ("result", BencodeValue::string("ok")),
-                        ("sdp", BencodeValue::string(ENGINE_SDP)),
-                    ]),
+                    "offer" | "answer" | "subscribe request" | "subscribe answer" => {
+                        BencodeValue::dict(vec![
+                            ("result", BencodeValue::string("ok")),
+                            ("sdp", BencodeValue::string(ENGINE_SDP)),
+                        ])
+                    }
                     _ => BencodeValue::dict(vec![("result", BencodeValue::string("ok"))]),
                 };
                 let mut reply = data[..space].to_vec();
