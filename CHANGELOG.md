@@ -13,57 +13,7 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
-### Security
-
-- **p256 0.14** (crypto-bigint 0.7.7, RUSTSEC-2026-0387: timing variability
-  in operations meant to be constant-time) for STIR/SHAKEN ES256 signing and
-  verification.
-### Fixed
-
-- **`rtpengine.record` and `rtpengine.wait_recording` no longer attach the
-  interpreter on a tokio worker.** The finished recording's dict is built in
-  the completion step, the way `conference_wait_recording` already did.
-- **Blocking waits made while attached to the interpreter could deadlock a
-  free-threaded process under GC.** On free-threaded Python a thread attached
-  to the interpreter that parks in a Rust wait never reaches a garbage
-  collection's safe point, and every thread that touches Python stops behind
-  it; on a GIL build the parked thread keeps the GIL. Fixed outside the
-  dispatcher:
-  - `auth`'s Rust `check_credentials` no longer holds the request while its
-    HTTP or database backend lookup waits.
-  - The 34 awaitable script APIs that built their Python result inside the
-    future (Diameter Cx/Sh/Rx/Ro/Rf/S6a/Zh, `sbi.*`, `auth` digest,
-    `rtpengine.answer_local`, conference recording, `ipsec`, `b2bua`, `call`,
-    Ro sessions) now build it in the completion step, off the tokio workers.
-  - Script handlers that ran on a tokio worker now run on the script executor:
-    `@srs.on_invite` / `@srs.on_session_end`, `@diameter.on_inbound_cer`, the
-    control plane's synchronous SIP verbs, the SIGHUP and
-    `POST /admin/script/reload` reloads, and the `siphon_python_allocated_blocks`
-    sample.
-  - `registration.add`, `gateway.add_group` and the registrant and gateway
-    re-resolves release the interpreter for `getaddrinfo`, and no longer hold
-    the entry or group map while it runs.
-  - The STIR x5u fetch, the timer restart on reload and the extension module
-    hooks no longer wait or attach under a lock.
-  - Diameter server `get_avp` / `iter_avps` / `avps` / `unknown_avps` copy the
-    AVPs out before building Python objects.
-- **Console logging no longer blocks the logging thread.** Like the log file,
-  stdout is written from its own thread; a log pipe that cannot keep up now
-  drops lines (counted in `siphon_log_lines_dropped_total`) instead of stalling
-  whichever thread logged.
-- **An `async def` `@srs.on_invite` / `@srs.on_session_end` handler runs.** Its
-  coroutine was never awaited, so the hook did nothing and a decline was read
-  as an accept.
-- **`timer.set` from inside a timer's own handler keeps the new timer.** The
-  firing timer retired the key after its handler returned, which dropped the
-  timer the handler had just armed: it still fired, but `timer.cancel` could
-  not reach it and `active_count` did not count it. A timer that fired before
-  `timer.set` returned could also stay counted forever.
-- **`presence.notify` on a dialog whose SUBSCRIBE is still being handled waits
-  for the 2xx** (RFC 6665 §4.1.2.3). Since it became awaitable the NOTIFY could
-  overtake the 200 OK it follows.
-- **`rtpengine.answer_local(auto_reject=True)` on a call in use raises instead
-  of panicking** in the completion step, which left the script awaiting.
+## [1.15.4] — 2026-10-24
 
 ### Added
 
@@ -73,12 +23,14 @@ entry, but a working config keeps working.
   `HandlerHandle::options_value` reads the handler's options as JSON without
   the interpreter, and taking a `HandlerHandle` no longer attaches.
   `call_handler` still works and is superseded.
+
 - **`siphon::script::blocking::{released, blocking_released, block_on_released,
   detach_block_on}` are public**, for extension crates that block on Rust from
   a thread that may be attached to the interpreter, and so are
   `siphon::script::blocking::awaitable`, `siphon::script::Deferred` (build a
   future's Python result in the completion step, off the tokio workers) and
   `siphon::script::inline_dispatch::run_coroutine_inline`.
+
 - **P-CSCF: an over-MTU request to a protected UE goes over TCP on the
   P-CSCF's own connection.** A request too big for UDP (a reg-event NOTIFY
   listing a few contacts) to a UE that registered over UDP and holds a
@@ -103,6 +55,7 @@ entry, but a working config keeps working.
   task; messages to that UE are held at the egress until it is over (2 s at
   most) and then sent in order, so the 2xx still leaves over the new pair
   (TS 24.229 clause 5.2.2.2).
+
 - **A node no longer stops dead under load when an `async def` request
   handler awaits and a garbage collection runs.** The work after the handler's
   await (the relay or reply, its DNS lookup, connects, sends) ran attached to
@@ -127,14 +80,13 @@ entry, but a working config keeps working.
   lock: either could otherwise close the same stop-the-world deadlock with a
   script task that still held the request.
 
-### Added
-
 - **Process liveness watchdog** (`script.process_stall_abort_secs`, default 30,
   `0` disables): aborts for a supervisor restart when the tokio runtime runs no
   timer, socket or task, most of its workers are stuck in one poll, no thread
   can attach to the interpreter, or the timer sweep stops turning. The handler
   pool's watchdog could not see a whole-process wedge, which starves the pool
   of work so it looks idle. New gauge `siphon_interpreter_attach_wait_ms`.
+
 - **A network de-registration's NOTIFY reaches the UE over its SA, and
   nothing goes to a protected port in clear.** When registrar liveness
   de-registered an idle protected binding with `network_dereg`, the UE's
@@ -150,7 +102,6 @@ entry, but a working config keeps working.
   with a `WARN` (private identity, UE address, ports) and counted in
   `siphon_ipsec_unprotected_sends_refused_total` (TS 33.203 clause 7.1).
   Responses still go back where their request came from.
-### Added
 
 - **Per-call `media_flags` on the control plane.** `answer`, an anchored
   `progress`, `stream_start` with `mode: "bridge"` and `originate` with
@@ -178,12 +129,29 @@ entry, but a working config keeps working.
   `media_flags` field, which breaks code that builds them as literals without
   `..Default::default()`, so the SDK takes a minor bump.
 
+- **Multi-UE IMS registration over TCP.** A registrant entry with its own
+  `local_addr` now takes `transport: tcp` (YAML and `registration.add`), where
+  it used to be refused as UDP only; TLS is still refused. Over TCP with IPsec
+  the UE opens its connection from `local_addr:ue_port_c` to the P-CSCF's
+  protected server port and sends its REGISTERs and MO requests on it (TS 24.229
+  5.1.1.2.2), and listens on `local_addr:ue_port_s` for the connection the
+  P-CSCF opens from its protected client port, answering the P-CSCF's requests
+  on it (5.2.2.2). The unprotected initial REGISTER leaves from the plain port.
+  The listener is bound with IP_FREEBIND and opened and closed with the entry
+  like the UDP sockets; moving or removing a UE, and shutdown, close its
+  listener and every connection it held. A re-authentication's new client port
+  opens a new connection and the old one closes with its SA set.
+  `registration.flow()` reports the entry's transport. A process with no
+  `listen.tcp` now gets a TCP outbound path when a registrant is configured.
+  `scripts/multi_ue_netns.sh` runs the lab over TCP with `TRANSPORT=tcp`.
+
 ### Changed
 
 - **A `profile` that is not a string is `bad_request` on `answer`, `progress`
   and `originate`.** It used to be read as no profile at all, so the call was
   anchored on the default profile the controller never named. `stream_start`
   already refused it.
+
 - **The P-CSCF changes its protected client port on every authentication**
   (TS 33.203 clause 7.4.0: "the protected client ports at the UE (port_uc) and
   the P-CSCF (port_pc) shall change"). `ipsec.pcscf_port_c` now takes a list
@@ -203,18 +171,21 @@ entry, but a working config keeps working.
   port bound on a wildcard address, or no concrete `listen.udp` entry on
   `pcscf_port_s`. A single port behaves exactly as in 1.15.3, sharing the
   outbound policy of SA #3 between the sets.
+
 - **`ScriptHandle::call_handler_with`** for extensions: builds the handler's
   arguments and reads its outcome inside the script executor's jobs, so a
   per-event dispatch on a tokio worker never attaches.
   `HandlerHandle::options_value` reads the handler's options as JSON without
   the interpreter, and taking a `HandlerHandle` no longer attaches.
   `call_handler` still works and is superseded.
+
 - **`siphon::script::blocking::{released, blocking_released, block_on_released,
   detach_block_on}` are public**, for extension crates that block on Rust from
   a thread that may be attached to the interpreter, and so are
   `siphon::script::blocking::awaitable`, `siphon::script::Deferred` (build a
   future's Python result in the completion step, off the tokio workers) and
   `siphon::script::inline_dispatch::run_coroutine_inline`.
+
 - **Per-call media scope on every media verb and event.** `scope=` now also
   goes on `play_media`, `play_overlay`, `stop_media`, `set_play_gain`,
   `play_dtmf`, `silence_media` / `unsilence_media`, `block_media` /
@@ -230,6 +201,7 @@ entry, but a working config keeps working.
   a `scope=` keyword for a handler that takes one (`def on_dtmf(...,
   scope=None)`); a handler without it is called as before. A digit read on a
   scoped leg takes only that leg's digits.
+
 - **Lawful intercept taps every scoped leg.** When a proxy anchors both legs of
   an intercepted call under per-call scopes, X3 content delivery is attached on
   each leg's engine call, so no content goes undelivered because the warrant
@@ -239,23 +211,65 @@ entry, but a working config keeps working.
   leg's delivery ending leaves the other's record in place. The cost is that
   the mediation function receives one delivery per tapped leg of the same
   conversation.
-### Added
 
-- **Multi-UE IMS registration over TCP.** A registrant entry with its own
-  `local_addr` now takes `transport: tcp` (YAML and `registration.add`), where
-  it used to be refused as UDP only; TLS is still refused. Over TCP with IPsec
-  the UE opens its connection from `local_addr:ue_port_c` to the P-CSCF's
-  protected server port and sends its REGISTERs and MO requests on it (TS 24.229
-  5.1.1.2.2), and listens on `local_addr:ue_port_s` for the connection the
-  P-CSCF opens from its protected client port, answering the P-CSCF's requests
-  on it (5.2.2.2). The unprotected initial REGISTER leaves from the plain port.
-  The listener is bound with IP_FREEBIND and opened and closed with the entry
-  like the UDP sockets; moving or removing a UE, and shutdown, close its
-  listener and every connection it held. A re-authentication's new client port
-  opens a new connection and the old one closes with its SA set.
-  `registration.flow()` reports the entry's transport. A process with no
-  `listen.tcp` now gets a TCP outbound path when a registrant is configured.
-  `scripts/multi_ue_netns.sh` runs the lab over TCP with `TRANSPORT=tcp`.
+### Fixed
+
+- **`rtpengine.record` and `rtpengine.wait_recording` no longer attach the
+  interpreter on a tokio worker.** The finished recording's dict is built in
+  the completion step, the way `conference_wait_recording` already did.
+
+- **Blocking waits made while attached to the interpreter could deadlock a
+  free-threaded process under GC.** On free-threaded Python a thread attached
+  to the interpreter that parks in a Rust wait never reaches a garbage
+  collection's safe point, and every thread that touches Python stops behind
+  it; on a GIL build the parked thread keeps the GIL. Fixed outside the
+  dispatcher:
+  - `auth`'s Rust `check_credentials` no longer holds the request while its
+    HTTP or database backend lookup waits.
+  - The 34 awaitable script APIs that built their Python result inside the
+    future (Diameter Cx/Sh/Rx/Ro/Rf/S6a/Zh, `sbi.*`, `auth` digest,
+    `rtpengine.answer_local`, conference recording, `ipsec`, `b2bua`, `call`,
+    Ro sessions) now build it in the completion step, off the tokio workers.
+  - Script handlers that ran on a tokio worker now run on the script executor:
+    `@srs.on_invite` / `@srs.on_session_end`, `@diameter.on_inbound_cer`, the
+    control plane's synchronous SIP verbs, the SIGHUP and
+    `POST /admin/script/reload` reloads, and the `siphon_python_allocated_blocks`
+    sample.
+  - `registration.add`, `gateway.add_group` and the registrant and gateway
+    re-resolves release the interpreter for `getaddrinfo`, and no longer hold
+    the entry or group map while it runs.
+  - The STIR x5u fetch, the timer restart on reload and the extension module
+    hooks no longer wait or attach under a lock.
+  - Diameter server `get_avp` / `iter_avps` / `avps` / `unknown_avps` copy the
+    AVPs out before building Python objects.
+
+- **Console logging no longer blocks the logging thread.** Like the log file,
+  stdout is written from its own thread; a log pipe that cannot keep up now
+  drops lines (counted in `siphon_log_lines_dropped_total`) instead of stalling
+  whichever thread logged.
+
+- **An `async def` `@srs.on_invite` / `@srs.on_session_end` handler runs.** Its
+  coroutine was never awaited, so the hook did nothing and a decline was read
+  as an accept.
+
+- **`timer.set` from inside a timer's own handler keeps the new timer.** The
+  firing timer retired the key after its handler returned, which dropped the
+  timer the handler had just armed: it still fired, but `timer.cancel` could
+  not reach it and `active_count` did not count it. A timer that fired before
+  `timer.set` returned could also stay counted forever.
+
+- **`presence.notify` on a dialog whose SUBSCRIBE is still being handled waits
+  for the 2xx** (RFC 6665 §4.1.2.3). Since it became awaitable the NOTIFY could
+  overtake the 200 OK it follows.
+
+- **`rtpengine.answer_local(auto_reject=True)` on a call in use raises instead
+  of panicking** in the completion step, which left the script awaiting.
+
+### Security
+
+- **p256 0.14** (crypto-bigint 0.7.7, RUSTSEC-2026-0387: timing variability
+  in operations meant to be constant-time) for STIR/SHAKEN ES256 signing and
+  verification.
 
 ## [1.15.3] — 2026-10-23
 

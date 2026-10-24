@@ -53,10 +53,14 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # `nogil: true` is what makes this the free-threaded build (python3.14t);
+      # without it the step installs the GIL build and the stop-the-world tests
+      # never run against the interpreter siphon ships with.
       - name: Install Python 3.14 (free-threaded)
         uses: deadsnakes/action@v3.2.0
         with:
           python-version: "3.14-dev"
+          nogil: true
 
       - name: Install SCTP system dependency
         if: ${{ matrix.sctp }}
@@ -67,7 +71,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Run tests
-        run: PYO3_PYTHON=python3.14 cargo test ${{ matrix.flags }}
+        run: PYO3_PYTHON=python3.14t cargo test ${{ matrix.flags }}
 
       # Runs alone because it measures a process-global counter: glibc in-use
       # bytes. Inside the parallel binary the other tests allocate on the same
@@ -78,7 +82,7 @@ jobs:
       # `siphon_memory_*`.
       - name: Python thread-state leak guard (needs the process to itself)
         run: |
-          PYO3_PYTHON=python3.14 cargo test --lib ${{ matrix.flags }} -- --ignored --exact \
+          PYO3_PYTHON=python3.14t cargo test --lib ${{ matrix.flags }} -- --ignored --exact \
             server::tests::reaped_thread_releases_its_python_thread_state \
             --test-threads=1 --nocapture
 
@@ -86,7 +90,7 @@ jobs:
       # needs the process to itself.
       - name: Awaitables complete on pinned threads (needs the process to itself)
         run: |
-          PYO3_PYTHON=python3.14 cargo test --lib ${{ matrix.flags }} -- --ignored --exact \
+          PYO3_PYTHON=python3.14t cargo test --lib ${{ matrix.flags }} -- --ignored --exact \
             server::tests::awaitables_complete_on_pinned_threads \
             --test-threads=1 --nocapture
 
