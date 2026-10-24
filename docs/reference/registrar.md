@@ -65,7 +65,7 @@ registration.add(
 
 | Argument / method | Meaning |
 |---|---|
-| `add(..., local_addr=None)` | The IP this entry registers from: Via and Contact host, the UDP source of every REGISTER (initial, 401 retry, de-REGISTER), and with `ipsec=True` the UE side of its SAs, the protected REGISTER leaving from `local_addr:ue_port_c`. siphon opens the sockets itself (IP_FREEBIND), so the address need not exist yet and no `listen.udp` entry is needed. UDP only. |
+| `add(..., local_addr=None)` | The IP this entry registers from: Via and Contact host, the UDP source of every REGISTER (initial, 401 retry, de-REGISTER), and with `ipsec=True` the UE side of its SAs, the protected REGISTER leaving from `local_addr:ue_port_c`. siphon opens the sockets itself (IP_FREEBIND), so the address need not exist yet and no `listen.udp` entry is needed. UDP or TCP: over TCP siphon listens on `local_addr:ue_port_s` (the plain port without IPsec) for the P-CSCF's connection and connects from `local_addr:ue_port_c` (the plain port for the unprotected initial REGISTER). |
 | `add(..., require_local_addr=False)` | `True`: never register from the process's address. Without `local_addr` the entry waits as `awaiting_address`. |
 | `add(..., refresh_window=None)` | `(low, high)` fractions of the granted Expires, drawn per refresh; `0 < low <= high < 1`. `None`: `registrant.refresh_window`. |
 | `set_local_addr(aor, ip_or_None) -> bool` | Move the entry. Restating the current address is a no-op, so it can run on a timer. A real move deletes the old SA pair and starts a fresh registration from the new address at once, keeping the Call-ID. `None` puts an entry that has had an address (or has `require_local_addr`) in `awaiting_address`; any other entry falls back to the process's address. `False` when there is no such AoR. |
@@ -76,7 +76,7 @@ registration.add(
 
 `add` and `set_local_addr` raise `ValueError` when another entry already
 registers from the same `(local_addr, ue_port_c)`, for a `local_addr` on a
-`tcp` or `tls` entry, and for a malformed window.
+`tls` entry, and for a malformed window.
 
 States are `unregistered`, `registering`, `challenging`, `registered`,
 `failed` and `awaiting_address`. `@registration.on_change` gets
@@ -84,8 +84,11 @@ States are `unregistered`, `registering`, `challenging`, `registered`,
 
 Limits:
 
-- **UDP only.** The outbound connection pool opens stream connections from an
-  ephemeral source the entry's address would not name.
+- **UDP or TCP, not TLS.** Over TCP the UE's own connection to the P-CSCF
+  leaves from its protected client port (TS 24.229 5.1.1.2.2) and the P-CSCF's
+  connection arrives on a per-UE listener on its protected server port
+  (5.2.2.2), answered on that connection. Moving, removing and shutdown close
+  both. The UE side has no TLS identity, so `tls` is refused.
 - **A move does not de-register the old binding.** The old address is usually
   gone, so nothing could carry the de-REGISTER. A registrar that keys on
   `+sip.instance` (RFC 5626, built from `imei`) replaces the binding with the

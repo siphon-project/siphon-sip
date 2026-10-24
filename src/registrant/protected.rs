@@ -872,6 +872,23 @@ impl RegistrantManager {
         self.queue_sa_deletions(expired.into_iter().flat_map(|teardown| teardown.deletions));
     }
 
+    /// The protected client sources, on an address of their own, of the sets
+    /// of removed entries still waiting for their de-REGISTER's answer: a TCP
+    /// UE's connection from there is where that answer comes back.
+    pub(super) fn teardown_client_sources(&self) -> Vec<std::net::SocketAddr> {
+        self.teardowns
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .flat_map(|teardown| teardown.deletions.iter())
+            .filter_map(|deletion| {
+                deletion
+                    .address
+                    .map(|ip| std::net::SocketAddr::new(ip, deletion.key.ue_port_c))
+            })
+            .collect()
+    }
+
     /// How many UE SA sets the manager tracks: every live entry's, those of
     /// removed entries awaiting their de-REGISTER's answer, and those queued
     /// for deletion. The per-entity store the leak gate watches.

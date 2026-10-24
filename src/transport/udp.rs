@@ -608,7 +608,10 @@ fn create_udp_socket(
 /// local unless the socket is `IP_TRANSPARENT`, which this never sets, so a
 /// datagram cannot leave with a source the host does not own.
 #[cfg(target_os = "linux")]
-fn set_freebind(socket: &socket2::Socket, local_addr: SocketAddr) -> std::io::Result<()> {
+pub(crate) fn set_freebind(
+    socket: &socket2::Socket,
+    local_addr: SocketAddr,
+) -> std::io::Result<()> {
     use std::os::fd::AsRawFd;
     let (level, option) = if local_addr.is_ipv6() {
         (libc::IPPROTO_IPV6, libc::IPV6_FREEBIND)
@@ -636,7 +639,10 @@ fn set_freebind(socket: &socket2::Socket, local_addr: SocketAddr) -> std::io::Re
 
 /// `IP_FREEBIND` is Linux-only; elsewhere the address has to exist first.
 #[cfg(not(target_os = "linux"))]
-fn set_freebind(_socket: &socket2::Socket, _local_addr: SocketAddr) -> std::io::Result<()> {
+pub(crate) fn set_freebind(
+    _socket: &socket2::Socket,
+    _local_addr: SocketAddr,
+) -> std::io::Result<()> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
         "binding an address that is not on the host needs IP_FREEBIND, which is Linux-only",

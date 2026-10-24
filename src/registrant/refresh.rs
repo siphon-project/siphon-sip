@@ -112,7 +112,8 @@ fn run_tick(
 
     // Sockets for every entry that registers from an address of its own. An
     // entry whose socket cannot bind sits this tick out.
-    let unbindable = reconcile_ue_sockets(manager, context, egress);
+    let mut unbindable = reconcile_ue_sockets(manager, context, egress);
+    unbindable.extend(reconcile_ue_streams(manager, context, egress));
 
     // Stated before the liveness check below reads those connections, and
     // before the first REGISTER of a trunk added since the last tick opens one.
@@ -217,6 +218,43 @@ fn reconcile_ue_sockets(
     blocked
 }
 
+/// Converge the per-UE TCP listeners and the pool's pinned UE sources on what
+/// the TCP entries with an address of their own need
+/// ([`RegistrantManager::ue_stream_plan`]); returns the AoRs that cannot
+/// register this tick.
+///
+/// A listener that will not bind blocks its entry the way an unbound protected
+/// server port does over UDP ([`RegistrantManager::degrade_unbindable_ports`]):
+/// the P-CSCF could not reach it.
+fn reconcile_ue_streams(
+    manager: &RegistrantManager,
+    context: &RegistrationLoopContext,
+    egress: &RegistrantEgress,
+) -> HashSet<String> {
+    let plain_port = egress.defaults().plain_port();
+    let (plan, owners) = manager.ue_stream_plan(plain_port);
+    let Some(sockets) = context.ue_sockets.as_ref() else {
+        if !owners.is_empty() {
+            debug!(
+                entries = owners.len(),
+                "TCP entries with a local_addr but no per-UE listener support in this process"
+            );
+        }
+        return owners.into_iter().map(|(aor, _)| aor).collect();
+    };
+    let outcome = sockets.reconcile_tcp(&plan);
+    owners
+        .into_iter()
+        .filter(|(_, listener)| outcome.failed.contains(listener))
+        .filter_map(|(aor, listener)| {
+            manager
+                .degrade_unbindable_ports(&aor, &[listener.port()], plain_port)
+                .blocked
+                .then_some(aor)
+        })
+        .collect()
+}
+
 /// Delete the SA pairs the manager queued.
 fn delete_queued_sas(
     manager: &RegistrantManager,
@@ -291,13 +329,23 @@ pub(super) fn force_refresh_lost_connections(
     manager: &RegistrantManager,
     connection_pool: &ConnectionPool,
 ) -> Vec<String> {
+    let plain_port = manager
+        .egress
+        .get()
+        .map_or(5060, |egress| egress.defaults().plain_port());
     let stale: Vec<String> = manager
         .entries
         .iter()
         .filter(|entry| {
             entry.state == RegistrantState::Registered
                 && matches!(entry.transport, Transport::Tls | Transport::Tcp)
-                && !connection_pool.has_live(entry.destination, entry.transport)
+                && match RegistrantManager::ue_tcp_connection(entry, plain_port) {
+                    // A UE on an address of its own: the connection from it.
+                    Some((source, destination)) => {
+                        !connection_pool.has_live_from(source, destination)
+                    }
+                    None => !connection_pool.has_live(entry.destination, entry.transport),
+                }
         })
         .map(|entry| entry.aor.clone())
         .collect();

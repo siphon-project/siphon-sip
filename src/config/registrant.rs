@@ -33,7 +33,7 @@ use serde::Deserialize;
 ///   max_registers_per_sec: 50      # cap on new REGISTERs per second
 ///   entries:
 ///     - aor: "sip:001010000000001@ims.mnc01.mcc001.3gppnetwork.org"
-///       local_addr: "192.0.2.77"   # UDP only
+///       local_addr: "192.0.2.77"   # UDP or TCP
 ///       # ... auth: aka, aka:, ipsec:, ims: as for one UE
 /// ```
 #[derive(Debug, Deserialize, Clone)]
@@ -200,7 +200,9 @@ pub struct RegistrantEntryConfig {
     /// source of every REGISTER, and with `ipsec` the UE side of its SAs (its
     /// protected ports opened on this address, so they may repeat across
     /// entries). siphon opens the sockets itself, with IP_FREEBIND, so the
-    /// address need not exist yet. UDP only. Unset: the process's address.
+    /// address need not exist yet. UDP or TCP (over TCP siphon listens on the
+    /// protected server port, or the plain port without IPsec, and connects
+    /// from the address); TLS is refused. Unset: the process's address.
     pub local_addr: Option<std::net::IpAddr>,
     /// Never register from the process's address: with no `local_addr` (or
     /// once a script takes it away with `registration.set_local_addr(aor,
@@ -336,9 +338,12 @@ impl RegistrantYamlConfig {
             let Some(local_addr) = entry.local_addr else {
                 continue;
             };
-            if !entry.transport.eq_ignore_ascii_case("udp") {
+            if !["udp", "tcp"]
+                .iter()
+                .any(|own| entry.transport.eq_ignore_ascii_case(own))
+            {
                 return Err(format!(
-                    "registrant.entries[{}].local_addr needs transport udp, not {}",
+                    "registrant.entries[{}].local_addr needs transport udp or tcp, not {}",
                     entry.aor, entry.transport
                 ));
             }

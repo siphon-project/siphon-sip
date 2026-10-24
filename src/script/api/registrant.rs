@@ -83,11 +83,13 @@ impl PyRegistration {
     ///         instance tag.
     ///     ims_features: Contact feature tags to advertise so the S-CSCF
     ///         registers the implied services — any of "mmtel", "video", "smsip".
-    ///     local_addr: The IP this entry registers from (Via/Contact host, UDP
+    ///     local_addr: The IP this entry registers from (Via/Contact host,
     ///         source, and with ipsec the UE side of its SAs, its protected
     ///         ports opened on this address). siphon opens the sockets itself,
-    ///         so the address need not exist on the host yet. UDP only. None
-    ///         (default): the process's own address.
+    ///         so the address need not exist on the host yet. transport "udp"
+    ///         or "tcp": over TCP siphon listens on ue_port_s (the plain port
+    ///         without ipsec) for the P-CSCF's connection and connects from
+    ///         ue_port_c. None (default): the process's own address.
     ///     require_local_addr: Never register from the process's address:
     ///         without a local_addr the entry waits as "awaiting_address" until
     ///         set_local_addr() gives it one. Implied by local_addr.
@@ -96,7 +98,7 @@ impl PyRegistration {
     ///         the registrant default.
     ///
     /// Raises ValueError for an address another entry already registers from
-    /// with the same ue_port_c, a local_addr on a non-UDP transport, or a bad
+    /// with the same ue_port_c, a local_addr on transport "tls", or a bad
     /// refresh window. Secrets (password, k, op, opc) are never logged.
     // Wide by necessity: outbound registration exposes the full carrier-trunk
     // + AKA + IPsec credential set as keyword arguments to scripts.
@@ -284,7 +286,7 @@ impl PyRegistration {
     ///
     /// Returns False when there is no such registration. Raises ValueError for
     /// an address another entry already uses with the same ue_port_c, or for a
-    /// non-UDP registration.
+    /// TLS registration.
     #[pyo3(signature = (aor, local_addr))]
     fn set_local_addr(&self, aor: &str, local_addr: Option<&str>) -> PyResult<bool> {
         let local_addr = local_addr

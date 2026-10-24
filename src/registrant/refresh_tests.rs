@@ -407,3 +407,240 @@ async fn the_loop_ramps_at_the_capped_rate_oldest_first() {
         tokio::time::Instant::now().duration_since(started) >= std::time::Duration::from_secs(4)
     );
 }
+
+// --- over TCP ----------------------------------------------------------------
+
+/// A registration loop wired as the server wires it for TCP: the router's TCP
+/// channel drained by the stream distributor into one pool, and the per-UE
+/// sockets' TCP half attached to the same pool and connection map.
+struct TcpLoop {
+    context: RegistrationLoopContext,
+    sockets: Arc<UeSockets>,
+    pool: Arc<ConnectionPool>,
+    connection_map: Arc<
+        dashmap::DashMap<crate::transport::ConnectionId, crate::transport::send_queue::SendQueue>,
+    >,
+    inbound: flume::Receiver<crate::transport::InboundMessage>,
+}
+
+fn tcp_loop(plain_port: u16) -> TcpLoop {
+    let (inbound_tx, inbound) = flume::unbounded();
+    let connection_map = Arc::new(dashmap::DashMap::new());
+    let pool = Arc::new(ConnectionPool::for_tests(
+        Arc::clone(&connection_map),
+        inbound_tx.clone(),
+    ));
+    let sockets = Arc::new(UeSockets::new(
+        inbound_tx,
+        Arc::new(TransportAcl::new(Vec::new(), Vec::new())),
+        None,
+        0,
+        Vec::new(),
+    ));
+    sockets.attach_tcp(crate::transport::ue_streams::UeTcpContext {
+        connection_map: Arc::clone(&connection_map),
+        stream_connections: crate::transport::StreamConnections::new(),
+        pool: Arc::clone(&pool),
+        crlf_pong_tracker: None,
+        static_addrs: HashSet::new(),
+    });
+    let (udp_tx, _udp_rx) = flume::unbounded();
+    let (tcp_tx, tcp_rx) = flume::unbounded();
+    crate::transport::stream::spawn_outbound_distributor(
+        tcp_rx,
+        Arc::clone(&connection_map),
+        Transport::Tcp,
+        Some(Arc::clone(&pool)),
+    );
+    let outbound = Arc::new(OutboundRouter {
+        udp: udp_tx.into(),
+        udp_by_local: HashMap::new(),
+        udp_dynamic: Some(Arc::clone(&sockets)),
+        tcp: tcp_tx,
+        tls: flume::unbounded().0,
+        ws: flume::unbounded().0,
+        wss: flume::unbounded().0,
+        sctp: None,
+    });
+    let mut context = context(outbound, Some(Arc::clone(&sockets)), plain_port);
+    context.connection_pool = Arc::clone(&pool);
+    TcpLoop {
+        context,
+        sockets,
+        pool,
+        connection_map,
+        inbound,
+    }
+}
+
+fn tick(manager: &RegistrantManager, context: &RegistrationLoopContext) {
+    run_tick(
+        manager,
+        context,
+        manager.egress.get().expect("egress"),
+        None,
+    );
+}
+
+async fn eventually(mut condition: impl FnMut() -> bool) -> bool {
+    for _ in 0..300 {
+        if condition() {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    condition()
+}
+
+/// Read one SIP message (headers, no body) off `stream`.
+async fn read_message(stream: &mut tokio::net::TcpStream) -> String {
+    use tokio::io::AsyncReadExt;
+    let mut received = Vec::new();
+    let mut buffer = [0u8; 4096];
+    while !received.windows(4).any(|window| window == b"\r\n\r\n") {
+        let read =
+            tokio::time::timeout(std::time::Duration::from_secs(3), stream.read(&mut buffer))
+                .await
+                .expect("a message within 3 s")
+                .expect("read");
+        assert_ne!(read, 0, "closed before a message");
+        received.extend_from_slice(&buffer[..read]);
+    }
+    String::from_utf8_lossy(&received).into_owned()
+}
+
+/// Two UEs over TCP, each on a loopback address of its own and the same
+/// ports: the tick opens a listener on each one's protected server port, and
+/// each initial REGISTER reaches the P-CSCF on a connection from that UE's own
+/// address and plain port. The P-CSCF's connection to a UE's protected server
+/// port is accepted, its request arrives as received on that port, and the
+/// answer, routed by connection id as the dispatcher routes it, goes back on
+/// that connection. Removing the UEs closes everything they held.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tcp_ues_register_from_their_own_address_and_take_the_pcscf_connection() {
+    use tokio::io::AsyncWriteExt;
+    let plain_port = free_port();
+    let harness = tcp_loop(plain_port);
+    let pcscf = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("a P-CSCF");
+    let pcscf_address = pcscf.local_addr().expect("its address");
+    let manager = test_support::manager();
+    install(&manager, &harness.context);
+    let addresses = [ip("127.0.0.71"), ip("127.0.0.72")];
+    for (index, address) in (1u32..).zip(addresses) {
+        let mut entry = ue(index, Some(address));
+        entry.transport = Transport::Tcp;
+        entry.destination = pcscf_address;
+        manager.try_add(entry).expect("a TCP UE");
+    }
+
+    tick(&manager, &harness.context);
+    for address in addresses {
+        assert!(harness
+            .sockets
+            .contains_tcp(&SocketAddr::new(address, 6101)));
+        assert!(
+            !harness.sockets.contains(&SocketAddr::new(address, 6101)),
+            "no UDP socket"
+        );
+    }
+
+    // Each REGISTER on its own connection, from its own plain port.
+    let mut registered_from = HashSet::new();
+    let mut held = Vec::new();
+    for _ in addresses {
+        let (mut connection, peer) =
+            tokio::time::timeout(std::time::Duration::from_secs(3), pcscf.accept())
+                .await
+                .expect("a connection within 3 s")
+                .expect("accepted");
+        let register = read_message(&mut connection).await;
+        assert!(register.starts_with("REGISTER "), "{register}");
+        assert!(
+            register.contains(&format!("Via: SIP/2.0/TCP {peer};")),
+            "Via names the source: {register}"
+        );
+        assert!(register.contains(";transport=tcp"), "{register}");
+        registered_from.insert(peer);
+        held.push(connection);
+    }
+    let expected: HashSet<SocketAddr> = addresses
+        .iter()
+        .map(|address| SocketAddr::new(*address, plain_port))
+        .collect();
+    assert_eq!(registered_from, expected);
+
+    // The P-CSCF's connection to UE 1's protected server port.
+    let ue_server = SocketAddr::new(addresses[0], 6101);
+    let mut towards_ue = tokio::net::TcpStream::connect(ue_server)
+        .await
+        .expect("the UE listens");
+    let request = concat!(
+        "OPTIONS sip:001010000000001@127.0.0.71:6101 SIP/2.0\r\n",
+        "Via: SIP/2.0/TCP 127.0.0.1:5066;branch=z9hG4bK-mt-1\r\n",
+        "Max-Forwards: 70\r\n",
+        "From: <sip:pcscf.ims.mnc01.mcc001.3gppnetwork.org>;tag=p1\r\n",
+        "To: <sip:001010000000001@ims.mnc01.mcc001.3gppnetwork.org>\r\n",
+        "Call-ID: tcp-mt@example.test\r\n",
+        "CSeq: 1 OPTIONS\r\n",
+        "Content-Length: 0\r\n",
+        "\r\n",
+    );
+    towards_ue
+        .write_all(request.as_bytes())
+        .await
+        .expect("written");
+    let inbound = loop {
+        let message = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            harness.inbound.recv_async(),
+        )
+        .await
+        .expect("the request arrives")
+        .expect("open");
+        if message.local_addr == ue_server {
+            break message;
+        }
+    };
+    assert_eq!(inbound.transport, Transport::Tcp);
+    assert_eq!(
+        manager.find_by_local(crate::registrant::address::LocalAddrQuery::Socket(
+            ue_server
+        )),
+        Some(impu(1))
+    );
+    harness
+        .context
+        .outbound
+        .send(OutboundMessage {
+            connection_id: inbound.connection_id,
+            transport: Transport::Tcp,
+            destination: inbound.remote_addr,
+            data: bytes::Bytes::from_static(b"SIP/2.0 200 OK\r\nContent-Length: 0\r\n\r\n"),
+            source_local_addr: Some(ue_server),
+            server_name: None,
+            verify_server: None,
+            followups: None,
+        })
+        .expect("sent");
+    let answer = read_message(&mut towards_ue).await;
+    assert!(answer.starts_with("SIP/2.0 200 OK"), "{answer}");
+
+    // Removed: the next tick closes the listeners, the accepted connection
+    // and the UEs' own connections.
+    for index in 1..=2u32 {
+        manager.remove(&impu(index));
+    }
+    tick(&manager, &harness.context);
+    assert!(
+        eventually(|| harness.sockets.tcp_len() == (0, 0)
+            && addresses
+                .iter()
+                .all(|address| harness.pool.connections_bound_on(*address) == 0))
+        .await,
+        "listeners/accepted {:?}",
+        harness.sockets.tcp_len()
+    );
+    assert!(eventually(|| harness.connection_map.is_empty()).await);
+}

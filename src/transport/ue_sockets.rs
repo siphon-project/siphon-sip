@@ -19,16 +19,21 @@
 //! The [`OutboundRouter`](super::OutboundRouter) consults this map only after
 //! its static per-listener map missed, so a deployment without per-UE
 //! addresses (`udp_dynamic: None`) sends exactly as before.
+//!
+//! A registration over TCP gets listeners instead, held by the stream half
+//! ([`super::ue_streams`]) once the server attaches it
+//! ([`UeSockets::attach_tcp`]); the identity checks here answer for both.
 
 use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use dashmap::DashMap;
 use tracing::{debug, error, info};
 
 use super::acl::TransportAcl;
 use super::udp::{self, UdpOutbound};
+use super::ue_streams::{UeListeners, UeTcpContext, UeTcpPlan};
 use super::{InboundMessage, OutboundMessage};
 
 /// The run-time UDP sockets, keyed by the exact address each is bound to.
@@ -48,6 +53,9 @@ pub struct UeSockets {
     acl: Arc<TransportAcl>,
     tos: Option<u32>,
     recv_buffer_bytes: usize,
+    /// The TCP listeners, once [`attach_tcp`](Self::attach_tcp) supplied what
+    /// they share with the configured TCP side.
+    tcp: OnceLock<UeListeners>,
 }
 
 /// What one [`UeSockets::reconcile`] did.
@@ -81,7 +89,57 @@ impl UeSockets {
             acl,
             tos,
             recv_buffer_bytes,
+            tcp: OnceLock::new(),
         }
+    }
+
+    /// Give the TCP half what it shares with the configured TCP listeners.
+    /// `false` when it was attached already (the first stays).
+    pub fn attach_tcp(&self, context: UeTcpContext) -> bool {
+        self.tcp
+            .set(UeListeners::new(
+                context,
+                self.inbound_tx.clone(),
+                Arc::clone(&self.acl),
+                self.tos,
+            ))
+            .is_ok()
+    }
+
+    /// Converge the TCP half on `plan` ([`UeListeners`]). Without
+    /// [`attach_tcp`](Self::attach_tcp) nothing can be opened, and every wanted
+    /// listener is reported failed.
+    pub fn reconcile_tcp(&self, plan: &UeTcpPlan) -> ReconcileOutcome {
+        match self.tcp.get() {
+            Some(tcp) => tcp.reconcile(plan),
+            None => ReconcileOutcome {
+                failed: plan.listeners.clone(),
+                ..ReconcileOutcome::default()
+            },
+        }
+    }
+
+    /// Whether a per-UE TCP listener is open on exactly `addr`.
+    pub fn contains_tcp(&self, addr: &SocketAddr) -> bool {
+        self.tcp.get().is_some_and(|tcp| tcp.contains(addr))
+    }
+
+    /// Whether a per-UE UDP socket or TCP listener is open on exactly `addr`.
+    pub fn contains_any(&self, addr: &SocketAddr) -> bool {
+        self.contains(addr) || self.contains_tcp(addr)
+    }
+
+    /// Open per-UE TCP listeners, and the connections they accepted that are
+    /// still open (leak gate, diagnostics).
+    pub fn tcp_len(&self) -> (usize, usize) {
+        self.tcp
+            .get()
+            .map_or((0, 0), |tcp| (tcp.len(), tcp.accepted_len()))
+    }
+
+    /// The pool the TCP half hands its sources to, once attached.
+    pub fn tcp_pool(&self) -> Option<&Arc<super::pool::ConnectionPool>> {
+        self.tcp.get().map(UeListeners::pool)
     }
 
     /// Converge on exactly `desired`: open every wanted address not yet open
@@ -180,9 +238,9 @@ impl UeSockets {
         self.sockets.contains_key(addr)
     }
 
-    /// Whether any socket is open on `ip`.
+    /// Whether any socket or TCP listener is open on `ip`.
     pub fn contains_ip(&self, ip: IpAddr) -> bool {
-        self.ips.contains_key(&ip)
+        self.ips.contains_key(&ip) || self.tcp.get().is_some_and(|tcp| tcp.contains_ip(ip))
     }
 
     /// Whether `addr` is served by a configured listener rather than here:

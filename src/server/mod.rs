@@ -1745,6 +1745,18 @@ impl SiphonServer {
             );
         }
 
+        attach_registrant_tcp(
+            ue_sockets.as_ref(),
+            &config,
+            transport::ue_streams::UeTcpContext {
+                connection_map: Arc::clone(&tcp_connection_map),
+                stream_connections: stream_connections.clone(),
+                pool: Arc::clone(&connection_pool),
+                crlf_pong_tracker: crlf_pong_tracker.clone(),
+                static_addrs: tcp_entries.iter().map(|entry| entry.0).collect(),
+            },
+            &tcp_outbound_rx,
+        );
         // Spawn TCP listeners now that the pool exists.
         for (addr, tos, dscp, proxy_protocol) in tcp_entries {
             if tcp_ws_mux.contains(&addr) {

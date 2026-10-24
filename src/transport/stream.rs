@@ -137,7 +137,15 @@ async fn send_via_pool(
     let server_name = outbound.server_name.clone();
     let verify_server = outbound.verify_server;
     let requested_connection_id = outbound.connection_id;
-    let source = pool_tcp_source(outbound.source_local_addr, destination, is_protected);
+    // A registrant UE's own source is bound too: its connection to the P-CSCF
+    // leaves from its protected client port (TS 24.229 5.1.1.2.2), see
+    // `pool::pinned`.
+    let source =
+        pool_tcp_source(outbound.source_local_addr, destination, is_protected).or_else(|| {
+            outbound.source_local_addr.filter(|source| {
+                source.is_ipv4() == destination.is_ipv4() && pool.binds_source(*source)
+            })
+        });
     let tls_listener = outbound
         .source_local_addr
         .filter(|listener| listener.is_ipv4() == destination.is_ipv4());
@@ -1156,6 +1164,59 @@ mod tests {
             peer, source,
             "the pool fallback must leave from the protected source, not an ephemeral port"
         );
+    }
+
+    /// Where a fallback send naming `source` connects from, through a pool
+    /// that pins `pinned`, with no P-CSCF protected port configured.
+    async fn fallback_peer(
+        source: SocketAddr,
+        pinned: std::collections::HashSet<SocketAddr>,
+    ) -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server = listener.local_addr().unwrap();
+        let pool = Arc::new(ConnectionPool::for_tests(
+            Arc::new(DashMap::new()),
+            flume::unbounded().0,
+        ));
+        pool.reconcile_pinned_sources(pinned.clone(), &pinned);
+        let (outbound_tx, outbound_rx) = flume::unbounded();
+        spawn_outbound_distributor_with(
+            outbound_rx,
+            Arc::new(DashMap::new()),
+            Transport::Tcp,
+            Some(pool_fallback_send(
+                Arc::clone(&pool),
+                Transport::Tcp,
+                |_| false,
+            )),
+        );
+        let mut message = fallback_message(server);
+        message.source_local_addr = Some(source);
+        outbound_tx.send(message).unwrap();
+        let (_socket, peer) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
+            .await
+            .expect("the pool fallback must connect within 2 s")
+            .unwrap();
+        peer
+    }
+
+    /// A registrant UE's REGISTER names the UE's own source (its plain port,
+    /// or its protected client port, TS 24.229 5.1.1.2.2): the pool connects
+    /// from exactly it once the registration loop pinned it, and from an
+    /// ephemeral port otherwise.
+    #[tokio::test]
+    async fn tcp_pool_fallback_binds_a_pinned_registrant_source() {
+        let reserve = tokio::net::TcpSocket::new_v4().unwrap();
+        reserve.set_reuseaddr(true).unwrap();
+        reserve.bind("127.0.0.2:0".parse().unwrap()).unwrap();
+        let source = reserve.local_addr().unwrap();
+        drop(reserve);
+
+        let pinned = fallback_peer(source, [source].into_iter().collect()).await;
+        assert_eq!(pinned, source);
+
+        let unpinned = fallback_peer(source, std::collections::HashSet::new()).await;
+        assert_ne!(unpinned.port(), source.port(), "not pinned: ephemeral");
     }
 
     /// A send with no live connection, bound for `destination`.

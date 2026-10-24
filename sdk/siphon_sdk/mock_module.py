@@ -8204,8 +8204,10 @@ class MockRegistration:
             local_addr: The IP this entry registers from (an address, no
                 port): the Via/Contact host, the UDP source, and with ipsec
                 the UE side of its SAs. siphon opens the sockets itself, so
-                the address need not exist on the host yet. UDP only. None
-                (default): the process's own address.
+                the address need not exist on the host yet. transport "udp"
+                or "tcp": over TCP siphon listens on ue_port_s (the plain
+                port without ipsec) for the P-CSCF's connection and connects
+                from ue_port_c. None (default): the process's own address.
             require_local_addr: Never register from the process's address.
                 Without a local_addr the entry waits in state
                 "awaiting_address" until :meth:`set_local_addr` gives it one.
@@ -8219,8 +8221,8 @@ class MockRegistration:
             ValueError: when `transport` is not udp/tcp/tls; when auth="aka"
                 but `k` or an operator key (`op`/`opc`) is missing; when
                 ipsec=True without auth="aka" / ue_port_c / ue_port_s; when
-                `local_addr` is not an IP address, or is given with a
-                transport other than udp; when another AoR already registers
+                `local_addr` is not an IP address, or is given with
+                transport tls (udp and tcp take one); when another AoR already registers
                 from the same ``(local_addr, ue_port_c)`` (``ue_port_c`` is
                 None without ipsec, so two non-ipsec entries cannot share an
                 address); or when `refresh_window` breaks
@@ -8259,8 +8261,8 @@ class MockRegistration:
         address = None if local_addr is None else self._parse_ip(local_addr, "local_addr")
         window = None if refresh_window is None else self._check_refresh_window(refresh_window)
         normalized_transport = (transport or "udp").lower()
-        if address is not None and normalized_transport != "udp":
-            raise ValueError(self._non_udp_error(aor, normalized_transport))
+        if address is not None and normalized_transport not in ("udp", "tcp"):
+            raise ValueError(self._transport_error(aor, normalized_transport))
         port_c = ue_port_c if ipsec else None
         if address is not None:
             self._refuse_taken(aor, address, port_c)
@@ -8325,7 +8327,7 @@ class MockRegistration:
         Raises:
             ValueError: `local_addr` is not an IP address; another AoR already
                 registers from it with the same ``ue_port_c``; or the entry's
-                transport is not udp.
+                transport is tls (udp and tcp take an address).
 
         Example::
 
@@ -8340,8 +8342,8 @@ class MockRegistration:
             return False
         if entry.get("local_addr") == address:
             return True
-        if address is not None and entry["transport"].lower() != "udp":
-            raise ValueError(self._non_udp_error(aor, entry["transport"].lower()))
+        if address is not None and entry["transport"].lower() not in ("udp", "tcp"):
+            raise ValueError(self._transport_error(aor, entry["transport"].lower()))
         if address is not None:
             self._refuse_taken(aor, address, entry["ue_port_c"] if entry["ipsec"] else None)
             entry["require_local_addr"] = True
@@ -8527,7 +8529,7 @@ class MockRegistration:
         from .types import Flow
         host = f"[{address}]" if ":" in address else address
         return Flow(
-            transport="udp",
+            transport=entry["transport"].lower(),
             local_addr=f"{host}:{entry.get('ue_port_c')}",
         )
 
@@ -8639,11 +8641,10 @@ class MockRegistration:
         return (low, high)
 
     @staticmethod
-    def _non_udp_error(aor: str, transport: str) -> str:
+    def _transport_error(aor: str, transport: str) -> str:
         return (
-            f"{aor}: local_addr needs transport udp, not {transport}: a TCP or TLS "
-            "registration leaves over a pooled connection from an ephemeral source, "
-            "which the address would not name"
+            f"{aor}: local_addr needs transport udp or tcp, not {transport}: the UE "
+            "side has no TLS client identity or TLS listener of its own"
         )
 
     def _refuse_taken(self, aor: str, address: str, ue_port_c: Optional[int]) -> None:

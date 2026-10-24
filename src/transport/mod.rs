@@ -30,6 +30,7 @@ pub mod tls_listener;
 /// and receives outbound messages via a per-connection sender.
 pub mod udp;
 pub mod ue_sockets;
+pub mod ue_streams;
 pub mod ws;
 
 /// Test-only helpers shared by this module's unit tests.
@@ -736,15 +737,18 @@ impl ListenerRegistry {
         self.dynamic_udp.as_ref()
     }
 
-    /// Whether `(transport, local)` is a run-time per-UE socket rather than a
-    /// configured listener.
+    /// Whether `(transport, local)` is a run-time per-UE UDP socket or TCP
+    /// listener rather than a configured listener.
     pub(crate) fn is_dynamic(&self, transport: Transport, local: SocketAddr) -> bool {
-        transport == Transport::Udp
-            && !self.entries.contains_key(&(transport, local))
+        !self.entries.contains_key(&(transport, local))
             && self
                 .dynamic_udp
                 .as_ref()
-                .is_some_and(|dynamic| dynamic.contains(&local))
+                .is_some_and(|dynamic| match transport {
+                    Transport::Udp => dynamic.contains(&local),
+                    Transport::Tcp => dynamic.contains_tcp(&local),
+                    _ => false,
+                })
     }
 
     /// Set the global `advertised_address`, the fallback host of a listener
@@ -817,7 +821,7 @@ impl ListenerRegistry {
             || self
                 .dynamic_udp
                 .as_ref()
-                .is_some_and(|dynamic| dynamic.contains(destination))
+                .is_some_and(|dynamic| dynamic.contains_any(destination))
     }
 
     /// Every registered listener as `(transport, bound_addr, advertise)`.
