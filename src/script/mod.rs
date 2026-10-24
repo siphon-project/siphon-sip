@@ -7,7 +7,7 @@ pub(crate) mod attach;
 #[cfg(test)]
 mod attached_scan_tests;
 pub mod blocking;
-pub(crate) mod deferred;
+pub mod deferred;
 pub mod diameter_dispatch;
 pub mod engine;
 pub mod error_report;
@@ -24,5 +24,5 @@ pub(crate) mod waits;
 pub mod watcher;
 
 pub(crate) use blocking::{awaitable, detach_block_on, ready};
-pub(crate) use deferred::Deferred;
+pub use deferred::Deferred;
 pub use handle::{HandlerHandle, ScriptHandle};

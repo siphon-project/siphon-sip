@@ -58,7 +58,14 @@ where
 /// The awaitable counterpart of [`detach_block_on`]: the calling thread
 /// returns immediately, so an asyncio driver keeps turning its other
 /// coroutines while this runs.
-pub(crate) fn awaitable<'py, F, T>(python: Python<'py>, future: F) -> PyResult<Bound<'py, PyAny>>
+///
+/// Public for extension crates. `future` runs on a tokio worker, so it must
+/// not attach to the interpreter: return plain Rust (or a `#[pyclass]`), or a
+/// [`crate::script::Deferred`] that builds the Python value. The conversion
+/// runs in the completion step, off the workers. Called from a synchronous
+/// handler (no running event loop) it fails with an error that says to make
+/// the handler `async def`.
+pub fn awaitable<'py, F, T>(python: Python<'py>, future: F) -> PyResult<Bound<'py, PyAny>>
 where
     F: Future<Output = PyResult<T>> + Send + 'static,
     T: for<'a> IntoPyObject<'a> + Send + 'static,

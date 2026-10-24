@@ -16,11 +16,11 @@ use pyo3::prelude::*;
 type Build = Box<dyn for<'py> FnOnce(Python<'py>) -> PyResult<Bound<'py, PyAny>> + Send>;
 
 /// A Python value to be built when the awaitable completes.
-pub(crate) struct Deferred(Build);
+pub struct Deferred(Build);
 
 impl Deferred {
     /// Build the value with `build`, in the completion step.
-    pub(crate) fn new<F>(build: F) -> Self
+    pub fn new<F>(build: F) -> Self
     where
         F: for<'py> FnOnce(Python<'py>) -> PyResult<Bound<'py, PyAny>> + Send + 'static,
     {
@@ -29,7 +29,7 @@ impl Deferred {
 
     /// Build a value of any convertible type with `build`, in the completion
     /// step: the body of what used to be a `Python::attach` in the future.
-    pub(crate) fn build<T, F>(build: F) -> Self
+    pub fn build<T, F>(build: F) -> Self
     where
         F: FnOnce(Python<'_>) -> PyResult<T> + Send + 'static,
         T: for<'py> IntoPyObject<'py>,
@@ -41,7 +41,7 @@ impl Deferred {
     }
 
     /// `None`.
-    pub(crate) fn none() -> Self {
+    pub fn none() -> Self {
         Self::new(|python| Ok(python.None().into_bound(python)))
     }
 }

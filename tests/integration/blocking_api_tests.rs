@@ -30,3 +30,59 @@ async fn the_blocking_helpers_wait_with_the_interpreter_released() {
     let detached = detach_block_on(async { gil_state_check() });
     assert_eq!(detached, 0);
 }
+
+#[test]
+fn awaitable_explains_a_missing_event_loop() {
+    pyo3::Python::initialize();
+    let error = pyo3::Python::attach(|python| {
+        siphon::script::blocking::awaitable(python, async { Ok(1_i64) })
+            .err()
+            .map(|error| error.to_string())
+    });
+    let error = error.expect("no running loop on a plain thread");
+    assert!(error.contains("async def"), "{error}");
+}
+
+#[test]
+fn deferred_builds_its_value_on_conversion() {
+    use pyo3::prelude::*;
+    pyo3::Python::initialize();
+    let value = pyo3::Python::attach(|python| {
+        siphon::script::Deferred::build(|_| Ok(5_i64))
+            .into_pyobject(python)
+            .and_then(|bound| bound.extract::<i64>())
+    });
+    assert_eq!(value.ok(), Some(5));
+}
+
+#[test]
+fn run_coroutine_inline_runs_only_what_cannot_suspend() {
+    use pyo3::prelude::*;
+    pyo3::Python::initialize();
+    pyo3::Python::attach(|python| {
+        let module = pyo3::types::PyModule::from_code(
+            python,
+            c"import asyncio\nasync def quick():\n    return 7\nasync def slow():\n    await asyncio.sleep(0)\n    return 8\n",
+            c"inline_api_test.py",
+            c"inline_api_test",
+        )
+        .expect("module");
+        let quick = module
+            .getattr("quick")
+            .and_then(|f| f.call0())
+            .expect("coroutine");
+        let ran = siphon::script::inline_dispatch::run_coroutine_inline(python, &quick)
+            .expect("inline")
+            .expect("cannot suspend, so it ran");
+        assert_eq!(ran.extract::<i64>(python).ok(), Some(7));
+
+        let slow = module
+            .getattr("slow")
+            .and_then(|f| f.call0())
+            .expect("coroutine");
+        let left =
+            siphon::script::inline_dispatch::run_coroutine_inline(python, &slow).expect("inline");
+        assert!(left.is_none(), "a suspending coroutine is left alone");
+        let _ = slow.call_method0("close");
+    });
+}

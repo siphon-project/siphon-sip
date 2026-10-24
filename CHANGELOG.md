@@ -67,7 +67,10 @@ entry, but a working config keeps working.
   `call_handler` still works and is superseded.
 - **`siphon::script::blocking::{released, blocking_released, block_on_released,
   detach_block_on}` are public**, for extension crates that block on Rust from
-  a thread that may be attached to the interpreter.
+  a thread that may be attached to the interpreter, and so are
+  `siphon::script::blocking::awaitable`, `siphon::script::Deferred` (build a
+  future's Python result in the completion step, off the tokio workers) and
+  `siphon::script::inline_dispatch::run_coroutine_inline`.
 
 ## [1.15.3] — 2026-10-23
 
