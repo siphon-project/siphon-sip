@@ -32,6 +32,7 @@ pub fn init() -> Result<(), prometheus::Error> {
     rate_limit::init(&metrics.registry)?;
     send_queue::init(&metrics.registry)?;
     timer::init(&metrics.registry)?;
+    crate::script::blocking_metrics::register(&metrics.registry)?;
     let custom = Arc::new(CustomMetrics::new(&metrics.registry));
     let _ = CUSTOM_METRICS.set(custom);
     let _ = METRICS.set(metrics);
