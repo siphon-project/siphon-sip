@@ -730,7 +730,10 @@ impl RegistrarBackend for PostgresBackend {
 // Backend writer — coalesced write-through, applied in batches
 // ---------------------------------------------------------------------------
 
+pub(crate) mod coalesce;
 mod writer;
+
+pub use coalesce::WriteSequence;
 
 #[cfg(test)]
 pub(crate) use writer::{recording_writer, RecordedWrites};

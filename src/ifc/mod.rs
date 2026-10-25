@@ -48,10 +48,14 @@ impl BytesTextExt for quick_xml::events::BytesText<'_> {
         ))
     }
 }
-use tokio::sync::mpsc;
-// Unconditional: the writer's drop path logs whether or not a Redis backend is
-// compiled in, since the queue and its bound exist either way.
 use tracing::warn;
+
+#[cfg(any(feature = "redis-backend", test))]
+use crate::registrar::backend::coalesce::{self, DrainEvent, QueueKind, WriteSink};
+use crate::registrar::backend::coalesce::{QueueHandle, QueuedWrite};
+#[cfg(feature = "redis-backend")]
+use crate::registrar::backend::BackendError;
+use crate::registrar::backend::WriteSequence;
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -915,79 +919,98 @@ impl From<&InitialFilterCriteria> for MatchedApplicationServer {
 }
 
 // ---------------------------------------------------------------------------
-// IfcBackendWriter — fire-and-forget Redis persistence for iFC profiles
+// IfcBackendWriter — coalesced write-through of iFC profiles to Redis
 // ---------------------------------------------------------------------------
 
-/// Commands sent to the iFC backend writer task.
-///
-/// The writer that reads these fields is behind `redis-backend`; without it the
-/// commands are still constructed and dropped, so the fields are dead rather
-/// than absent.
-#[cfg_attr(not(feature = "redis-backend"), allow(dead_code))]
-enum IfcBackendCommand {
-    Save { aor: String, xml: String },
-    Remove { aor: String },
+/// One iFC write-through: the desired Redis state of one AoR's profile key.
+#[derive(Debug)]
+pub enum IfcWrite {
+    /// Store the profile's raw XML.
+    Save(String),
+    /// Remove the profile.
+    Remove,
 }
 
-/// How many iFC write-through commands may be queued before new ones are
-/// dropped.
-///
-/// Bounded for the same reason the registrar's queue is: during a Redis outage
-/// every operation burns its full response timeout, so the drain rate collapses
-/// while a registration storm keeps filling the queue. Smaller than the
-/// registrar's because iFC profiles are written once per registration rather
-/// than per binding refresh.
-const IFC_WRITER_QUEUE_CAPACITY: usize = 4_096;
+impl QueuedWrite for IfcWrite {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Save(_) => "save",
+            Self::Remove => "remove",
+        }
+    }
+}
 
-/// Handle for sending write-through commands to the iFC backend task.
+/// Handle for the iFC store's write-through to Redis.
 ///
-/// Sends are fire-and-forget; failures are logged by the background task.
+/// The writes go through the same coalescing queue as the registrar's: the
+/// latest write per AoR is kept, a newer one replacing an older one still
+/// waiting, so a registration burst or a Redis outage holds one entry per
+/// profile and drops nothing (it used to be a FIFO of 4096 that dropped the
+/// next write when full). A write Redis refuses is retried with backoff.
+/// Methods never wait.
 #[derive(Debug, Clone)]
 pub struct IfcBackendWriter {
-    sender: mpsc::Sender<IfcBackendCommand>,
+    queue: QueueHandle<String, IfcWrite>,
 }
 
 impl IfcBackendWriter {
-    /// Enqueue a command, or drop it and say so.
-    ///
-    /// Never waits for space: the callers are on the registration path and are
-    /// not async, so the alternatives are blocking that path or growing without
-    /// limit. A dropped write leaves the in-memory profile without its backing
-    /// copy, so a restart re-fetches it from the HSS rather than restoring it —
-    /// survivable, but never silent.
-    fn enqueue(&self, command: IfcBackendCommand) {
-        let label = match &command {
-            IfcBackendCommand::Save { .. } => "save",
-            IfcBackendCommand::Remove { .. } => "remove",
-        };
-        if let Err(error) = self.sender.try_send(command) {
-            let reason = match error {
-                mpsc::error::TrySendError::Full(_) => "queue_full",
-                mpsc::error::TrySendError::Closed(_) => "closed",
-            };
-            warn!(
-                command = label,
-                reason,
-                capacity = IFC_WRITER_QUEUE_CAPACITY,
-                "iFC backend write-through dropped; the profile will be re-fetched                  from the HSS after a restart rather than restored"
-            );
-        }
+    /// The order of a profile write about to be issued: take it while holding
+    /// the lock that orders the profile (its `raw_xml` entry).
+    pub fn sequence(&self) -> WriteSequence {
+        self.queue.sequence()
     }
 
-    /// Enqueue a save (raw XML for an AoR) to the backend.
+    /// Store the raw XML for an AoR, ordered as of now.
     pub fn save(&self, aor: &str, xml: &str) {
-        self.enqueue(IfcBackendCommand::Save {
-            aor: aor.to_string(),
-            xml: xml.to_string(),
-        });
+        self.save_at(aor, xml, self.sequence());
     }
 
-    /// Enqueue a remove (iFC profile for an AoR) from the backend.
-    pub fn remove(&self, aor: &str) {
-        self.enqueue(IfcBackendCommand::Remove {
-            aor: aor.to_string(),
-        });
+    /// Store the raw XML for an AoR, a profile set at `sequence`. An older
+    /// write never replaces a newer one.
+    pub fn save_at(&self, aor: &str, xml: &str, sequence: WriteSequence) {
+        self.queue.enqueue(
+            aor.to_string(),
+            aor,
+            IfcWrite::Save(xml.to_string()),
+            sequence,
+        );
     }
+
+    /// Remove an AoR's profile, ordered as of now.
+    pub fn remove(&self, aor: &str) {
+        self.remove_at(aor, self.sequence());
+    }
+
+    /// Remove an AoR's profile, a removal decided at `sequence`.
+    pub fn remove_at(&self, aor: &str, sequence: WriteSequence) {
+        self.queue
+            .enqueue(aor.to_string(), aor, IfcWrite::Remove, sequence);
+    }
+
+    /// Profiles whose latest write has not been applied yet.
+    #[cfg(test)]
+    pub(crate) fn pending_writes(&self) -> usize {
+        self.queue.pending_writes()
+    }
+}
+
+/// Spawn the task that drains an iFC writer into `sink`. It runs until every
+/// handle is dropped.
+#[cfg(any(feature = "redis-backend", test))]
+pub(crate) fn spawn_ifc_writer<S: WriteSink<String, IfcWrite> + 'static>(
+    sink: S,
+) -> IfcBackendWriter {
+    let (queue, mut drainer) = coalesce::queue(QueueKind::Ifc);
+    tokio::spawn(async move {
+        loop {
+            drainer.attempt(&sink).await;
+            if let DrainEvent::Closed = drainer.next_event().await {
+                break;
+            }
+        }
+        drainer.finish(&sink).await;
+    });
+    IfcBackendWriter { queue }
 }
 
 /// TTL [`spawn_ifc_backend_writer`] gives a profile key: the default
@@ -1012,42 +1035,49 @@ pub fn spawn_ifc_backend_writer(
 /// lifetime plus a grace: a script that stores the profile from the SAR of
 /// every REGISTER keeps it alive for as long as the registration.
 ///
-/// Returns an [`IfcBackendWriter`] handle. The task runs until the sender
+/// Returns an [`IfcBackendWriter`] handle. The task runs until every handle
 /// is dropped (i.e., until the `IfcStore` is dropped).
 #[cfg(feature = "redis-backend")]
 pub fn spawn_ifc_backend_writer_with_ttl(
-    mut connection: redis::aio::MultiplexedConnection,
+    connection: redis::aio::MultiplexedConnection,
     key_prefix: String,
     ttl_secs: u64,
 ) -> IfcBackendWriter {
-    let ttl_secs = ttl_secs.max(1);
-    let (sender, mut receiver) = mpsc::channel(IFC_WRITER_QUEUE_CAPACITY);
+    spawn_ifc_writer(IfcRedisSink {
+        connection,
+        key_prefix,
+        ttl_secs: ttl_secs.max(1),
+    })
+}
 
-    tokio::spawn(async move {
+/// Applies iFC writes to Redis: `SET .. EX` for a profile, `DEL` for a
+/// removal, a batch at a time pipelined on the multiplexed connection.
+#[cfg(feature = "redis-backend")]
+struct IfcRedisSink {
+    connection: redis::aio::MultiplexedConnection,
+    key_prefix: String,
+    ttl_secs: u64,
+}
+
+#[cfg(feature = "redis-backend")]
+impl WriteSink<String, IfcWrite> for IfcRedisSink {
+    async fn apply_batch(&self, writes: &[(&String, &IfcWrite)]) -> Vec<Result<(), BackendError>> {
         use redis::AsyncCommands;
-
-        while let Some(command) = receiver.recv().await {
-            match command {
-                IfcBackendCommand::Save { aor, xml } => {
-                    let key = format!("{key_prefix}{aor}");
-                    let result: Result<(), redis::RedisError> =
-                        connection.set_ex(&key, xml.as_str(), ttl_secs).await;
-                    if let Err(error) = result {
-                        warn!(aor, %error, "iFC backend write-through save failed");
+        futures_util::future::join_all(writes.iter().map(|(aor, write)| {
+            let mut connection = self.connection.clone();
+            let key = format!("{}{aor}", self.key_prefix);
+            async move {
+                let result: Result<(), redis::RedisError> = match write {
+                    IfcWrite::Save(xml) => {
+                        connection.set_ex(&key, xml.as_str(), self.ttl_secs).await
                     }
-                }
-                IfcBackendCommand::Remove { aor } => {
-                    let key = format!("{key_prefix}{aor}");
-                    let result: Result<(), redis::RedisError> = connection.del(&key).await;
-                    if let Err(error) = result {
-                        warn!(aor, %error, "iFC backend write-through remove failed");
-                    }
-                }
+                    IfcWrite::Remove => connection.del(&key).await,
+                };
+                result.map_err(|error| BackendError::Query(error.to_string()))
             }
-        }
-    });
-
-    IfcBackendWriter { sender }
+        }))
+        .await
+    }
 }
 
 /// Restore iFC profiles from Redis into an `IfcStore`.
@@ -1241,11 +1271,16 @@ impl IfcStore {
         let profile = parse_user_profile(xml)?;
         let count = profile.ifcs.len() + self.note_shared_ids(aor, profile.shared_ifc_set_ids);
         self.profiles.insert(aor.to_string(), profile.ifcs);
-        self.raw_xml.insert(aor.to_string(), xml.to_string());
+        // The sequence is taken under the `raw_xml` entry (what is persisted),
+        // so two stores of one AoR racing to the writer end as memory does.
+        let sequence = {
+            let _entry = self.raw_xml.entry(aor.to_string()).insert(xml.to_string());
+            self.backend_writer.get().map(IfcBackendWriter::sequence)
+        };
 
         // Persist to Redis (fire-and-forget).
-        if let Some(writer) = self.backend_writer.get() {
-            writer.save(aor, xml);
+        if let (Some(writer), Some(sequence)) = (self.backend_writer.get(), sequence) {
+            writer.save_at(aor, xml, sequence);
         }
 
         Ok(count)
@@ -1257,12 +1292,21 @@ impl IfcStore {
     pub fn remove_profile(&self, aor: &str) -> bool {
         let removed = self.profiles.remove(aor).is_some();
         self.shared_ids.remove(aor);
-        self.raw_xml.remove(aor);
+        let sequence = match self.raw_xml.entry(aor.to_string()) {
+            dashmap::mapref::entry::Entry::Occupied(entry) => {
+                let sequence = self.backend_writer.get().map(IfcBackendWriter::sequence);
+                entry.remove();
+                sequence
+            }
+            dashmap::mapref::entry::Entry::Vacant(_vacant) => {
+                self.backend_writer.get().map(IfcBackendWriter::sequence)
+            }
+        };
 
         // Remove from Redis (fire-and-forget).
         if removed {
-            if let Some(writer) = self.backend_writer.get() {
-                writer.remove(aor);
+            if let (Some(writer), Some(sequence)) = (self.backend_writer.get(), sequence) {
+                writer.remove_at(aor, sequence);
             }
         }
 
@@ -1444,6 +1488,9 @@ mod spec_tests;
 
 #[cfg(all(test, feature = "redis-backend"))]
 mod redis_tests;
+
+#[cfg(test)]
+mod writer_tests;
 
 #[cfg(test)]
 mod tests {
