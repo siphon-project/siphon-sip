@@ -600,9 +600,9 @@ checksum = "d0a5c400df2834b80a4c3327b3aad3a4c4cd4de0629063962b03235697506a28"
 
 [[package]]
 name = "crypto-bigint"
-version = "0.7.7"
+version = "0.7.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cc907c45bb7e9ef8fc3778defd0f3cd8c81288f1b4e748eba064948f20c47122"
+checksum = "d811ea23fdfbcce2e2d5132344d471abdb8f901ac496a0893a3df92e70525e52"
 dependencies = [
  "cpubits",
  "ctutils",
@@ -3301,8 +3301,8 @@ dependencies = [
 
 [[package]]
 name = "siphon-sip"
-version = "1.15.3"
-source = "git+https://github.com/siphon-project/siphon-sip?branch=main#a6ceed36788cf2e28048263ba7260aa6476d6fea"
+version = "1.15.4"
+source = "git+https://github.com/siphon-project/siphon-sip?branch=main#64e35eb045d9dffca1c6fa5096c15a3e44be9c59"
 dependencies = [
  "aes",
  "arc-swap",
@@ -3370,8 +3370,8 @@ dependencies = [
 
 [[package]]
 name = "siphon-smpp"
-version = "2.0.0"
-source = "git+https://github.com/siphon-project/siphon-smpp?tag=v2.0.0#bf893e47f9ff68061e8e9f38a001539560c18b72"
+version = "2.0.2"
+source = "git+https://github.com/siphon-project/siphon-smpp?tag=v2.0.2#30fa45b391cc8965bd3e5a52599ca787b88644c5"
 dependencies = [
  "async-trait",
  "pyo3",
@@ -3639,7 +3639,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.4",
  "windows-sys 0.61.2",
