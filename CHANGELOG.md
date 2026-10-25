@@ -17,6 +17,13 @@ entry, but a working config keeps working.
 
 ### Added
 
+- **Blocking-wait metrics.** `siphon_blocking_waits_in_flight` is how many
+  threads are parked right now in a blocking wait through
+  `blocking_released`, `block_on_released` or `detach_block_on`, and
+  `siphon_blocking_waits_total` counts those waits. A gauge that stays high
+  means threads are stuck on a slow backend or a hang. Works without
+  `--cfg tokio_unstable`, which tokio's own blocking-pool metrics need.
+
 - **`ScriptHandle::call_handler_with`** for extensions: builds the handler's
   arguments and reads its outcome inside the script executor's jobs, so a
   per-event dispatch on a tokio worker never attaches.

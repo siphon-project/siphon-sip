@@ -7,6 +7,7 @@ pub(crate) mod attach;
 #[cfg(test)]
 mod attached_scan_tests;
 pub mod blocking;
+pub(crate) mod blocking_metrics;
 pub mod deferred;
 pub mod diameter_dispatch;
 pub mod engine;

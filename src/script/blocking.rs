@@ -128,6 +128,7 @@ where
     F: Future + pyo3::marker::Ungil + Send,
     F::Output: pyo3::marker::Ungil + Send,
 {
+    let _wait = super::blocking_metrics::track_wait();
     pyo3::Python::attach(|python| {
         python.detach(move || {
             tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(future))
@@ -146,6 +147,8 @@ where
 /// detached caller pays nothing on the hot path.
 #[allow(clippy::disallowed_methods)] // the released helper itself
 pub fn blocking_released<T>(work: impl FnOnce() -> T) -> T {
+    // `block_on_released` comes through here too, so each wait counts once.
+    let _wait = super::blocking_metrics::track_wait();
     released(|| tokio::task::block_in_place(work))
 }
 

@@ -382,6 +382,8 @@ siphon keeps every such wait detached:
 | `siphon_pyexec_jobs_shed_total` | jobs dropped because the queue was full |
 | `siphon_async_coroutines_pending` | `async def` handler coroutines on a driver, not yet settled |
 | `siphon_interpreter_attach_wait_ms` | how long the liveness probe's last attach to the interpreter waited |
+| `siphon_blocking_waits_in_flight` | threads parked right now in a blocking wait through siphon's released helpers; stuck high means a slow backend or a hang |
+| `siphon_blocking_waits_total` | blocking waits started through those helpers |
 | `siphon_auth_ha1_cache_hits_total` | HTTP-auth lookups served from cache |
 
 **Alert on**: a sustained `rate(siphon_pyexec_jobs_shed_total)` > 0, or

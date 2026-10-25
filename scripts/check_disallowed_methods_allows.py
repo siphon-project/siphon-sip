@@ -20,7 +20,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-BUDGET = 17
+BUDGET = 16
 NEEDLE = "#[allow(clippy::disallowed_methods)]"
 
 
