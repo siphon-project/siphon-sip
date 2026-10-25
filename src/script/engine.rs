@@ -4433,7 +4433,7 @@ mod async_runner_tests {
     /// hit `RuntimeError: Event loop is closed`.
     #[pyfunction]
     fn _ra_async_op(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        crate::script::awaitable(py, async move {
             tokio::time::sleep(Duration::from_millis(2)).await;
             Ok(42i64)
         })

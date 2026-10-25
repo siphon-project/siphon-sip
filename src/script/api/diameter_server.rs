@@ -1028,7 +1028,7 @@ impl PyDiameterRequest {
         let client = Arc::clone(&peer.client);
         let timeout = Duration::from_secs_f64(timeout_secs.max(0.1));
 
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        crate::script::awaitable(py, async move {
             // Optional topology hiding.
             if let Some((origin_host, origin_realm)) = identity {
                 forward::rewrite_origin(&mut tree, &origin_host, &origin_realm);

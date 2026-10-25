@@ -62,7 +62,9 @@ where
 /// Public for extension crates. `future` runs on a tokio worker, so it must
 /// not attach to the interpreter: return plain Rust (or a `#[pyclass]`), or a
 /// [`crate::script::Deferred`] that builds the Python value. The conversion
-/// runs in the completion step, off the workers. Called from a synchronous
+/// runs in the completion step, off the workers, on one of the fixed threads
+/// in [`super::completions`] (never on tokio's elastic blocking pool, whose
+/// threads come and go). Called from a synchronous
 /// handler (no running event loop) it fails with an error that says to make
 /// the handler `async def`.
 pub fn awaitable<'py, F, T>(python: Python<'py>, future: F) -> PyResult<Bound<'py, PyAny>>
@@ -70,7 +72,10 @@ where
     F: Future<Output = PyResult<T>> + Send + 'static,
     T: for<'a> IntoPyObject<'a> + Send + 'static,
 {
-    pyo3_async_runtimes::tokio::future_into_py(python, future).map_err(explain_missing_loop)
+    pyo3_async_runtimes::generic::future_into_py::<super::completions::AwaitableRuntime, _, _>(
+        python, future,
+    )
+    .map_err(explain_missing_loop)
 }
 
 /// Turn asyncio's `no running event loop` into an error that says what to do.

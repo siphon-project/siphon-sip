@@ -1064,7 +1064,7 @@ impl PyCall {
             Err(poisoned) => poisoned.into_inner().clone(),
         };
         let internal_call_id = self.id.clone();
-        pyo3_async_runtimes::tokio::future_into_py(python, async move {
+        crate::script::awaitable(python, async move {
             let outcome = crate::dispatcher::ro_authorize_b2bua(
                 internal_call_id,
                 invite,

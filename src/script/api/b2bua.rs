@@ -297,7 +297,7 @@ impl PyB2buaControl {
             peer_sip_call_id: with_call_id.to_string(),
             on_peer_hangup: policy,
         };
-        pyo3_async_runtimes::tokio::future_into_py(python, async move {
+        crate::script::awaitable(python, async move {
             crate::dispatcher::b2bua_bridge_calls(params)
                 .await
                 .map(|_| true)
@@ -322,7 +322,7 @@ impl PyB2buaControl {
         use pyo3::exceptions::PyValueError;
         let call_id = call_id.to_string();
         let reason = reason.to_string();
-        pyo3_async_runtimes::tokio::future_into_py(python, async move {
+        crate::script::awaitable(python, async move {
             crate::dispatcher::b2bua_unbridge_call(&call_id, &reason)
                 .await
                 .map(|_| true)
@@ -427,7 +427,7 @@ impl PyB2buaControl {
                 .map_err(|refusal| {
                     PyValueError::new_err(format!("b2bua.send_info(): {refusal}"))
                 })?;
-        pyo3_async_runtimes::tokio::future_into_py(python, async move {
+        crate::script::awaitable(python, async move {
             let waited =
                 tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), sent.response)
                     .await;

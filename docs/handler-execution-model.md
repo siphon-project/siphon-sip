@@ -299,6 +299,30 @@ handlers, `@diameter.on_inbound_cer`, built-in timers, SBI callbacks, RTPEngine
 events) still hold their worker until the coroutine settles, so for them the
 `max_rate` formula above applies to the await as well.
 
+### Where an awaitable API finishes
+
+An awaitable siphon API (`await diameter.cx_uar(...)`, `await cache.fetch(...)`,
+`await rtpengine.offer(...)`) runs its Rust half on tokio and then needs the
+interpreter once, to build its Python result and wake the coroutine. That last
+step runs on two fixed threads named `siphon-await-0` and `siphon-await-1`,
+which hold their Python thread state for the life of the process. It is
+microseconds of work per call, so two threads carry far more than any
+signalling load.
+
+tokio's own blocking pool never runs Python. It grows a thread per concurrent
+blocking wait (a peer that stops answering parks one per in-flight request, up
+to tokio's ceiling of 512) and reaps them after ten idle seconds; with no
+Python on those threads, each costs its stack and nothing more, and a pile-up
+of waits no longer brings a Python heap per thread with it. The pile-up itself
+still matters: once 512 waits are parked at once, the pool has no thread left
+to hand a worker's core to and the runtime stops until some wait ends.
+`siphon_blocking_waits_in_flight` is the gauge to alert on.
+
+Extension crates should create their awaitables with
+`siphon::script::blocking::awaitable`. One that calls
+`pyo3_async_runtimes::tokio::future_into_py` directly still completes on the
+blocking pool and sets up a Python thread state per call.
+
 ## Backpressure & liveness guarantees
 
 Beyond elasticity, the pool is defended on three more fronts so a misbehaving

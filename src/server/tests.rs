@@ -449,13 +449,15 @@ gateway:
     assert_eq!(setting("198.51.100.99:5061"), None, "not a gateway");
 }
 
-/// Awaitable script APIs complete on pinned threads.
+/// Awaitable script APIs complete on pinned threads, and the runtime pins its
+/// workers but not its elastic blocking pool.
 ///
-/// `future_into_py` completes on pyo3-async-runtimes' runtime. Before the
-/// server shared its own, that was a runtime pyo3-async-runtimes built itself,
-/// and each completion created and destroyed a Python thread state. The
-/// completion is a `spawn_blocking` on that runtime, so one is run here and
-/// must land on a pinned thread.
+/// The completion of `future_into_py` attaches to the interpreter. Run on a
+/// thread with no thread state of its own, each one creates and destroys one;
+/// run on the blocking pool, whose threads come and go, every thread the pool
+/// started kept a heap and every one it reaped dropped it. siphon's awaitables
+/// complete on `script::completions`' fixed threads instead, and the blocking
+/// pool, left to Rust waits, holds no thread state.
 ///
 /// `#[ignore]`d because pyo3-async-runtimes holds one runtime per process:
 /// any other test that touches it first makes this one meaningless. CI runs
@@ -463,30 +465,52 @@ gateway:
 #[test]
 #[ignore = "process-global pyo3-async-runtimes runtime — run alone: cargo test --lib -- --ignored --exact server::tests::awaitables_complete_on_pinned_threads --test-threads=1"]
 fn awaitables_complete_on_pinned_threads() {
+    use pyo3_async_runtimes::generic::Runtime as _;
+    /// Holds a thread state while detached: pinned, by whichever mechanism.
+    fn holds_thread_state() -> bool {
+        // SAFETY: reads this thread's own thread-state slot.
+        unsafe { !pyo3::ffi::PyGILState_GetThisThreadState().is_null() }
+    }
+
     pyo3::Python::initialize();
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .on_thread_start(pin_python_thread_state)
-        .on_thread_stop(unpin_python_thread_state)
-        .build()
-        .expect("runtime builds");
-    let runtime: &'static tokio::runtime::Runtime = Box::leak(Box::new(runtime));
-    assert!(share_runtime_with_python(runtime));
+    let runtime = build_runtime(|builder| {
+        builder.worker_threads(2);
+    })
+    .expect("runtime builds");
     let shared = pyo3_async_runtimes::tokio::get_runtime();
     assert!(std::ptr::eq(shared, runtime));
-    let pinned = shared.block_on(async {
-        shared
-            .spawn_blocking(python_thread_state_pinned)
+
+    let (worker_pinned, blocking_pinned) = runtime.block_on(async {
+        // Park once, so the hook has run on the workers.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let worker = tokio::spawn(async { python_thread_state_pinned() })
             .await
-            .expect("blocking task joins")
+            .expect("worker task joins");
+        let blocking = tokio::task::spawn_blocking(holds_thread_state)
+            .await
+            .expect("blocking task joins");
+        (worker, blocking)
     });
+    assert!(worker_pinned, "a worker is not pinned");
+    assert!(
+        !blocking_pinned,
+        "a blocking-pool thread holds a Python thread state"
+    );
+
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let handle = crate::script::completions::AwaitableRuntime::spawn_blocking(move || {
+        let _ = sender.send(holds_thread_state());
+    });
+    drop(handle);
+    let pinned = receiver
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the completion ran");
     assert!(
         pinned,
         "a completion ran on a thread without a pinned Python thread state"
     );
-    // Not vacuous: a thread the runtime did not start is not pinned.
-    assert!(!std::thread::spawn(python_thread_state_pinned)
+    // Not vacuous: a thread nobody pinned holds none.
+    assert!(!std::thread::spawn(holds_thread_state)
         .join()
         .expect("thread joins"));
 }

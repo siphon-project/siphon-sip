@@ -1410,7 +1410,7 @@ impl PyRegistrar {
     /// exceptions; fall back with `try/except` if you prefer best-effort.
     fn aor_count<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let registrar = Arc::clone(&self.inner);
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        crate::script::awaitable(py, async move {
             registrar.aor_count_distributed().await.map_err(|error| {
                 pyo3::exceptions::PyRuntimeError::new_err(format!(
                     "registrar backend aor_count failed: {error}"

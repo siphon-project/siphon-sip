@@ -285,7 +285,7 @@ impl PyLcr {
         }
         let request = call.lcr_request(trunk_group, attribute_map)?;
         let client = Arc::clone(&self.client);
-        pyo3_async_runtimes::tokio::future_into_py(python, async move {
+        crate::script::awaitable(python, async move {
             match client.route(&request).await {
                 LcrOutcome::Decision(response) => Ok(Some(PyLcrDecision::from_response(response))),
                 LcrOutcome::Unavailable => Ok(None),
