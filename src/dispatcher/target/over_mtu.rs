@@ -84,11 +84,25 @@ fn protected_over_mtu(
             local,
             destination: tcp,
         } => {
-            // A connect can take the pool's whole connect timeout, so it runs
-            // released from the interpreter (never blocking while attached).
+            // A connect to a dead UE can take the pool's whole connect timeout,
+            // so at most one runs per UE at a time and none for a window after
+            // one failed (see `probe_cache`). It runs released from the
+            // interpreter (never blocking while attached).
+            let probe = match probe_cache().claim(tcp, std::time::Instant::now()) {
+                Ok(probe) => probe,
+                Err(skip) => {
+                    debug!(
+                        serialized_len, mtu, %destination, to = %tcp, ?skip,
+                        "transport: forced UDP over-MTU send (the P-CSCF's connection to the \
+                         UE's protected server port failed recently, or is being opened)"
+                    );
+                    return ProtectedOverMtu::KeepUdp;
+                }
+            };
             let opened = crate::script::blocking::block_on_released(
                 state.connection_pool.connect_tcp_from(local, tcp),
             );
+            probe.finish(opened.is_ok(), std::time::Instant::now());
             match opened {
                 Ok(connection_id) => {
                     debug!(

@@ -245,6 +245,29 @@ entry, but a working config keeps working.
   now stalls only after `script.process_stall_abort_secs` consecutive watchdog
   samples without progress, and a sample that comes far later than its period
   starts the judgement afresh.
+- **An over-MTU request to a dead next hop no longer waits on a TCP probe
+  each time.** Before moving a request too big for UDP onto TCP, siphon
+  confirms a TCP path with a blocking connect. Against a peer that is up but
+  no longer accepting, every such connect ran its full timeout, and under a
+  REGISTER storm every over-MTU request and every re-route to that peer
+  started one, so script-executor jobs queued behind them seconds apiece and
+  tokio kept handing its cores to fresh blocking threads. A next hop whose
+  probe failed is now not probed again for 30 s: its requests go straight to
+  the UDP fallback, the warning is logged once per window instead of per
+  request, and while one probe to a next hop is running the others do not
+  start their own. The same applies to the P-CSCF's connection to a UE's
+  protected server port. The memory is bounded and swept. Measured with 2000
+  over-MTU requests to a peer that has stopped accepting: run as tokio tasks,
+  they added 512 threads (the blocking pool's cap) and took 4 s, and now add
+  at most one thread and take one probe timeout; to a refusing peer, 2000
+  warnings became one.
+
+- **`script::blocking::released` no longer crashes before the interpreter is
+  up.** On a thread of a process that had not initialised Python yet it took
+  the thread for attached and crashed releasing a thread state that did not
+  exist. It now runs the work directly, as for any detached thread. This
+  matters to an embedding binary that calls the released helpers before it
+  starts the interpreter.
 
 - **`rtpengine.record` and `rtpengine.wait_recording` no longer attach the
   interpreter on a tokio worker.** The finished recording's dict is built in

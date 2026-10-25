@@ -91,7 +91,10 @@ mod tests {
             .await
             .expect("a listener");
         let destination = listener.local_addr().expect("bound");
-        let accepted = tokio::spawn(async move { listener.accept().await.map(|(_, peer)| peer) });
+        // The accepted stream comes back with its peer and is held to the end:
+        // dropped, the pool's reader would see EOF and evict the connection,
+        // and the next connect or send could land on a new one.
+        let accepted = tokio::spawn(async move { listener.accept().await });
         let pool = pool();
         let source = free_source();
 
@@ -99,7 +102,7 @@ mod tests {
             .connect_tcp_from(source, destination)
             .await
             .expect("the connection opens");
-        let peer = accepted.await.expect("the accept task").expect("accepted");
+        let (_held, peer) = accepted.await.expect("the accept task").expect("accepted");
         assert_eq!(peer, source, "opened from the requested source");
         assert_eq!(
             pool.connect_tcp_from(source, destination)
