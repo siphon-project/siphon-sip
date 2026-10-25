@@ -278,9 +278,12 @@ pub(super) async fn sweep_stale_entries(state: &DispatcherState) {
     // count (jemalloc can't see CPython's allocator) for Python leak detection.
     crate::metrics::update_memory_stats();
     // On the executor, not here: it attaches to the interpreter, and this is a
-    // tokio worker, which must not park behind a stop-the-world. A shed sample
-    // is a skipped gauge refresh.
-    crate::script::py_executor::spawn(crate::metrics::update_python_stats);
+    // tokio worker, which must not park behind a stop-the-world. Skipped while
+    // the executor has a backlog: a gauge refresh is not worth a place in the
+    // queue, and the next sweep refreshes it.
+    if crate::script::py_executor::queue_depth() == 0 {
+        crate::script::py_executor::spawn(crate::metrics::update_python_stats);
+    }
     // Refresh the glibc allocator gauges — the C-side / CPython raw-domain pool
     // that jemalloc and CPython's mimalloc can't see (no-op off glibc).
     crate::metrics::update_glibc_stats();

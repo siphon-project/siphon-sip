@@ -2,6 +2,7 @@
 //! publishes for the layers that reach into it from outside.
 
 use super::*;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Publish the hooks the charging paths reach from outside the dispatcher:
 /// the Ro teardown, the Rf session lookup a CDR stamps itself from, the CDR
@@ -95,28 +96,64 @@ pub fn install_charging_hooks(state: &Arc<DispatcherState>) {
     }
 }
 
-/// One turn of the sweep, run as a job on the Python executor rather than on
-/// this tokio task.
+/// The part of a sweep turn that never reaches a script: the transaction timer
+/// wheel (retransmissions, Timer B/F/H and the rest) and the B2BUA request
+/// retransmissions. It runs right here, on the sweep's tokio task, so it keeps
+/// its 100 ms beat whatever the Python executor is doing. Expiries it finds
+/// that do reach a script are handed to the executor as jobs of their own
+/// ([`post_expiry`]), never awaited.
 ///
-/// Expiries end in script handlers (`@proxy.on_failure` on Timer B/F,
-/// `@b2bua.on_failure` on a ring timeout, and more), and a script handler on a
-/// tokio worker is wrong twice over: it parks the worker behind every garbage
-/// collection's stop-the-world, and while it runs nothing else in the process
-/// times out or retransmits. On the executor, the turn finds the expiries and
-/// each one that reaches a script is posted as a job of its own
-/// ([`post_expiry`]), so one slow handler holds up only its own transaction.
-/// The turn is awaited, not fired and forgotten, so turns never overlap.
-async fn sweep_on_executor(state: &Arc<DispatcherState>, turn: fn(&DispatcherState)) {
-    let job_state = Arc::clone(state);
-    let ran = crate::script::py_executor::run_queued(move || {
-        SWEEP_STATE.with(|cell| *cell.borrow_mut() = Some(Arc::clone(&job_state)));
-        turn(&job_state);
-        SWEEP_STATE.with(|cell| *cell.borrow_mut() = None);
-    })
-    .await;
-    if ran.is_err() {
-        error!("timer sweep turn did not run: the Python executor is gone or the turn panicked");
+/// It used to run as an executor job the sweep awaited, which put every
+/// retransmission and timeout in the process behind whatever the executor had
+/// queued: a storm of `@proxy.on_failure` handlers behind a dead next hop held
+/// the sweep for minutes, and the liveness watchdog then aborted a node that was
+/// merely busy.
+///
+/// Nothing here attaches to the interpreter (this is a tokio worker); a
+/// branch-failure expiry that would run no script is answered here too
+/// (see `fail_branch_locally`'s caller in `timers.rs`).
+fn sweep_turn(state: &Arc<DispatcherState>, turn: fn(&DispatcherState)) {
+    SWEEP_STATE.with(|cell| *cell.borrow_mut() = Some(Arc::clone(state)));
+    turn(state);
+    SWEEP_STATE.with(|cell| *cell.borrow_mut() = None);
+}
+
+/// The part of a sweep turn that can reach a script (a B2BUA call ending on an
+/// unacknowledged 2xx, a ring timeout, a REFER deadline), as one executor job,
+/// fired and not awaited. While one is still queued or running the next is
+/// skipped rather than queued behind it: each scans its stores afresh, so a
+/// skipped turn's work is found by the next one, and a backlog of identical
+/// scans cannot build up.
+fn post_script_turn(
+    state: &Arc<DispatcherState>,
+    lane: &Arc<AtomicBool>,
+    turn: fn(&DispatcherState),
+) {
+    if lane.swap(true, Ordering::AcqRel) {
+        debug!("timer sweep: the previous script-side turn is still queued or running; skipping");
+        return;
     }
+    /// Frees the lane however the turn ends, a panic included.
+    struct Release(Arc<AtomicBool>);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::Release);
+        }
+    }
+    let release = Release(Arc::clone(lane));
+    let job_state = Arc::clone(state);
+    tokio::spawn(async move {
+        let queued = crate::script::py_executor::spawn_queued(move || {
+            let _release = release;
+            SWEEP_STATE.with(|cell| *cell.borrow_mut() = Some(Arc::clone(&job_state)));
+            turn(&job_state);
+            SWEEP_STATE.with(|cell| *cell.borrow_mut() = None);
+        })
+        .await;
+        if !queued {
+            error!("timer sweep turn did not run: the Python executor is gone");
+        }
+    });
 }
 
 thread_local! {
@@ -150,10 +187,17 @@ pub(crate) fn post_expiry(
 
 /// Fire the transaction timers and sweep the stores: retransmissions every
 /// 100 ms, the B2BUA call-lifetime checks every 500 ms.
-pub fn spawn_timer_sweep(state: &Arc<DispatcherState>) {
+///
+/// Returns the stamp the sweep beats on each turn, which the liveness watchdog
+/// watches.
+pub(crate) fn spawn_timer_sweep(
+    state: &Arc<DispatcherState>,
+) -> Arc<crate::script::liveness::LoopStamp> {
+    let stamp = crate::script::liveness::register_loop("timer-sweep");
     // Spawn background task: fire transaction timers + sweep stale entries
     {
         let state = Arc::clone(state);
+        let stamp = Arc::clone(&stamp);
         tokio::spawn(async move {
             // Timer check interval: 100ms for responsive retransmissions
             let mut timer_interval = tokio::time::interval(std::time::Duration::from_millis(100));
@@ -167,24 +211,28 @@ pub fn spawn_timer_sweep(state: &Arc<DispatcherState>) {
             // Stale entry cleanup: every 30s
             let mut cleanup_interval = tokio::time::interval(std::time::Duration::from_secs(30));
 
-            // Stamped every turn, so the liveness watchdog sees this task stop
-            // even when the rest of the runtime is fine: it drives every
-            // transaction timer in the process.
-            let stamp = crate::script::liveness::register_loop("timer-sweep");
+            // Stamped each time the turn's Rust part has run, so the liveness
+            // watchdog sees this task stop even when the rest of the runtime
+            // is fine (it drives every transaction timer in the process), and
+            // never mistakes a deep executor queue for that.
+            let ack_lane = Arc::new(AtomicBool::new(false));
+            let check_lane = Arc::new(AtomicBool::new(false));
             loop {
-                stamp.tick();
                 tokio::select! {
                     _ = timer_interval.tick() => {
-                        sweep_on_executor(&state, |state| {
+                        sweep_turn(&state, |state| {
                             fire_expired_timers(state);
                             sweep_b2bua_retransmits(state);
+                        });
+                        // A 2xx never ACKed, or an ACK owed, can end the call,
+                        // and ending a call runs script hooks.
+                        post_script_turn(&state, &ack_lane, |state| {
                             sweep_unacked_uas_2xx(state);
                             sweep_owed_reinvite_acks(state);
-                        })
-                        .await;
+                        });
                     }
                     _ = answer_timeout_interval.tick() => {
-                        sweep_on_executor(&state, |state| {
+                        post_script_turn(&state, &check_lane, |state| {
                             check_b2bua_answer_timeouts(state);
                             check_b2bua_prack_timeouts(state);
                             check_b2bua_max_call_durations(state);
@@ -194,16 +242,17 @@ pub fn spawn_timer_sweep(state: &Arc<DispatcherState>) {
                             check_controller_refer_timeouts(state);
                             check_orphaned_ro_sessions(state);
                             check_deferred_referrer_byes(state);
-                        })
-                        .await;
+                        });
                     }
                     _ = cleanup_interval.tick() => {
                         sweep_stale_entries(&state).await;
                     }
                 }
+                stamp.tick();
             }
         });
     }
+    stamp
 }
 
 /// RFC 4028 §10: refresh each session whose refresh is due, and end the ones

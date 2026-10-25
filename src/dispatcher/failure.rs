@@ -421,6 +421,40 @@ pub(super) fn downgrade_503_for_upstream(
 /// and the handoff to the server transaction. A direct forward would need its
 /// own copy of all of it and would drift.
 ///
+/// Whether [`fail_branch_locally`] on `client_key` would run a script: the
+/// relay set `on_reply` / `on_failure` callbacks, or the script has
+/// `@proxy.on_reply` handlers for the request's method or `@proxy.on_failure`
+/// handlers. Without any, answering the branch is Rust only, and stays off the
+/// Python executor (and its queue) altogether.
+pub(super) fn branch_failure_reaches_script(
+    client_key: &TransactionKey,
+    state: &DispatcherState,
+) -> bool {
+    let Some(session_arc) = state.session_store.get_by_client_key(client_key) else {
+        // `fail_branch_locally` has nothing to answer.
+        return false;
+    };
+    let (has_callbacks, method) = match session_arc.read() {
+        Ok(session) => (
+            session.on_reply_callback.is_some() || session.on_failure_callback.is_some(),
+            session
+                .original_request
+                .method()
+                .map(|method| method.as_str().to_string()),
+        ),
+        // Let the executor path report it.
+        Err(_) => return true,
+    };
+    if has_callbacks {
+        return true;
+    }
+    let engine = state.engine.state();
+    !engine
+        .proxy_reply_handlers(method.as_deref().unwrap_or(""))
+        .is_empty()
+        || !engine.handlers_for(&HandlerKind::ProxyFailure).is_empty()
+}
+
 /// No-ops when the branch has no proxy session: a B2BUA leg registers no client
 /// transaction, and a session already torn down by a winning branch has nothing
 /// left to answer.

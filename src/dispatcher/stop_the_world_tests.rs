@@ -17,7 +17,6 @@
 //! node showed: REGISTERs no longer relayed, a fresh request no longer
 //! answered, and `/metrics` no longer served.
 
-use std::io::Read as _;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -155,13 +154,6 @@ fn receive(state: &Arc<DispatcherState>, source: SocketAddr, raw: String) {
     });
 }
 
-/// Set in the child process that runs the scenario.
-const CHILD: &str = "SIPHON_STOP_THE_WORLD_CHILD";
-
-/// This test's own name, for the child process to run.
-const NAME: &str =
-    "dispatcher::stop_the_world_tests::registrations_under_repeated_stop_the_world_keep_the_node_serving";
-
 /// Runs the scenario in a process of its own: back-to-back collections stop
 /// the world for every thread in the process, so in the shared test binary
 /// any other test that happens to block while attached would wedge with it.
@@ -169,68 +161,11 @@ const NAME: &str =
 /// which here fails this test after the deadline instead of hanging the run.
 #[test]
 fn registrations_under_repeated_stop_the_world_keep_the_node_serving() {
-    if std::env::var_os(CHILD).is_some() {
-        return scenario();
-    }
-    let mut child = std::process::Command::new(std::env::current_exe().expect("the test binary"))
-        .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
-        .env(CHILD, "1")
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .expect("the scenario's process starts");
-    // Drained on threads of their own, so a chatty child never blocks on a
-    // full pipe and looks wedged.
-    let drain = |stream: Option<Box<dyn std::io::Read + Send>>| {
-        std::thread::spawn(move || {
-            let mut text = String::new();
-            if let Some(mut stream) = stream {
-                let _ = stream.read_to_string(&mut text);
-            }
-            text
-        })
-    };
-    let stdout = drain(
-        child
-            .stdout
-            .take()
-            .map(|out| Box::new(out) as Box<dyn std::io::Read + Send>),
+    super::own_process_test::run_in_own_process(
+        "dispatcher::stop_the_world_tests::registrations_under_repeated_stop_the_world_keep_the_node_serving",
+        Duration::from_secs(45),
+        scenario,
     );
-    let stderr = drain(
-        child
-            .stderr
-            .take()
-            .map(|err| Box::new(err) as Box<dyn std::io::Read + Send>),
-    );
-    let deadline = Instant::now() + Duration::from_secs(45);
-    let status = loop {
-        if let Some(status) = child.try_wait().expect("the child can be waited on") {
-            break Some(status);
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            break None;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    };
-    let output = format!(
-        "{}{}",
-        stdout.join().unwrap_or_default(),
-        stderr.join().unwrap_or_default()
-    );
-    let output: String = output
-        .lines()
-        .filter(|line| !line.contains("SyntaxWarning"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    match status {
-        Some(status) => assert!(status.success(), "the scenario failed:\n{output}"),
-        None => panic!(
-            "the scenario's process was still running after 45 s: wedged (every thread \
-             parked behind a stop-the-world)\n{output}"
-        ),
-    }
 }
 
 fn scenario() {

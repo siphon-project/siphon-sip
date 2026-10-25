@@ -221,6 +221,31 @@ entry, but a working config keeps working.
 
 ### Fixed
 
+- **The timer sweep no longer queues behind script handlers, and an overloaded
+  node is no longer restarted for it.** Each 100 ms turn of the sweep (the
+  transaction timer wheel: retransmissions, Timer B/F/H) ran as a Python
+  executor job the sweep awaited, so behind a dead next hop, where every
+  relayed request ends in Timer F and an `@proxy.on_failure` handler, thousands
+  of handlers queued ahead of the next turn. Every retransmission and timeout in
+  the process then stood still, and the liveness watchdog aborted the node for
+  a stalled sweep; the restart dropped the UEs' security associations, they
+  re-registered into the same dead peer, and the cycle repeated. The turn's
+  Rust part now runs on its own tokio task and is what the watchdog watches;
+  only the expiries that reach a script are posted to the executor, never
+  awaited; a branch failure that reaches no script stays off the executor; the
+  B2BUA checks that can reach a script run as one executor job at a time,
+  skipped while the previous is still pending. New gauge
+  `siphon_pyexec_queue_wait_ms` (how long the job a worker last took had
+  waited) and a warning when it passes 5 s, so overload shows as overload.
+
+- **The liveness watchdog no longer aborts a process that was suspended.**
+  After a cgroup freeze, a paused VM or SIGSTOP, the watchdog compared the
+  time since a loop's last stamp with the wall clock, saw the whole suspension
+  as a stalled timer sweep and aborted within a second of every resume. A loop
+  now stalls only after `script.process_stall_abort_secs` consecutive watchdog
+  samples without progress, and a sample that comes far later than its period
+  starts the judgement afresh.
+
 - **`rtpengine.record` and `rtpengine.wait_recording` no longer attach the
   interpreter on a tokio worker.** The finished recording's dict is built in
   the completion step, the way `conference_wait_recording` already did.
