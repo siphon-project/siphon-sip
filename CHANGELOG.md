@@ -13,6 +13,10 @@ entry, but a working config keeps working.
 
 ## [Unreleased]
 
+### Security
+
+- **crypto-bigint 0.7.9.** 0.7.7 (pulled in by the p256 0.14 bump) was yanked; both lockfiles move to 0.7.9, a patch release.
+
 ## [1.15.4] — 2026-10-25
 
 ### Added
