@@ -360,6 +360,20 @@ pub trait RegistrarBackend: Send + Sync + std::fmt::Debug {
     ) -> impl std::future::Future<Output = Result<usize, BackendError>> + Send {
         async { Ok(0) }
     }
+
+    /// Apply a batch of write-throughs for distinct keys, and return one
+    /// result per write, in order. A write whose result is an error was not
+    /// applied (or may not have been) and is retried; each is a full
+    /// replacement of its key, so applying it twice is harmless.
+    ///
+    /// The default runs them concurrently, which both networked backends
+    /// pipeline on one connection, so a batch costs about one round trip.
+    fn apply_batch(
+        &self,
+        writes: &[(&str, &BackendWrite)],
+    ) -> impl std::future::Future<Output = Vec<Result<(), BackendError>>> + Send {
+        futures_util::future::join_all(writes.iter().map(|(aor, write)| write.apply(self, aor)))
+    }
 }
 
 /// Backend errors.
@@ -713,14 +727,14 @@ impl RegistrarBackend for PostgresBackend {
 }
 
 // ---------------------------------------------------------------------------
-// Backend writer — bounded write-through via channel
+// Backend writer — coalesced write-through, applied in batches
 // ---------------------------------------------------------------------------
 
 mod writer;
 
 #[cfg(test)]
 pub(crate) use writer::{recording_writer, RecordedWrites};
-pub use writer::{spawn_backend_writer, BackendWriter};
+pub use writer::{spawn_backend_writer, BackendWrite, BackendWriter};
 
 // ---------------------------------------------------------------------------
 // Restore — load contacts from backend into in-memory registrar

@@ -254,6 +254,34 @@ entry, but a working config keeps working.
   on its own as before. The `ip` backend runs at most four `ip` commands
   at once. Measured with 2000 pairs installed at once against a fake
   kernel with a 2 ms round trip: 6 -> 519 threads before, 6 -> 9 after.
+- **Registrar write-throughs to Redis or Postgres are never dropped.** The
+  writes queued for the backend in a bounded FIFO of 16384 commands, and a
+  full queue dropped the next one. A P-CSCF restart that evicts thousands of
+  restored bindings without an IPsec SA (two writes each, binding and
+  state) overflowed it in one go: deletes were lost, and those bindings came
+  back at the next restore or sat in the backend until their TTL. A REGISTER
+  or de-REGISTER landing in the same window could be lost too, and so could
+  anything written during a backend outage. Pending writes are now held per
+  key (an AoR's binding set, or its auxiliary state) with the latest one
+  winning, since each write is the key's full state. Memory follows the
+  number of AoRs written since the last drain rather than the write rate, so
+  nothing is ever dropped for room, and `registrar.save()` still never
+  waits. The writer applies them in concurrent batches (pipelined on the
+  Redis connection; one transaction per batch on Postgres, falling back to
+  one write at a time when the server refuses part of it), and a write the
+  backend refuses stays pending and is retried with backoff (100 ms up to
+  5 s). Measured on a local Redis, 10000 evictions plus 1000 concurrent
+  REGISTERs (22000 writes) drain in 0.36 s. On Postgres a 4400-write burst
+  drains in 0.28 s, where one commit per statement took 28 s.
+  `siphon_registrar_backend_queue_depth` now counts
+  keys with a write pending, the new
+  `siphon_registrar_backend_oldest_pending_seconds` is the outage alarm, and
+  `siphon_registrar_backend_coalesced_total` counts writes superseded before
+  they reached the backend. `siphon_registrar_backend_dropped_total` only
+  moves when the writer task is gone (`closed`) or a write cannot be encoded
+  (`unencodable`). `/admin/metrics.json` carries the two new values next to
+  the old ones. `count_aors` now applies the pending writes before it counts,
+  so the answer includes them.
 - **A TCP or TLS peer that stops accepting costs one connect timeout, not one
   per queued message.** Sends with no live connection queue per destination
   and ran in order, each paying its own 5 s connect timeout against a peer
