@@ -87,6 +87,7 @@ mod rtpengine_events;
 mod sanitize;
 mod send;
 mod srs;
+mod stale_shed;
 mod state;
 mod sweep;
 mod target;
@@ -363,6 +364,8 @@ mod single_listener_snapshot_tests;
 mod spiral_invite_tests;
 #[cfg(test)]
 mod stale_in_dialog_request_tests;
+#[cfg(test)]
+mod stale_shed_tests;
 #[cfg(test)]
 mod stop_the_world_tests;
 #[cfg(test)]
@@ -754,6 +757,7 @@ pub async fn run(
             config.b2bua.resolved_inbound_limits(),
         )),
         refused_invites: Arc::new(crate::admission::refused::RefusedInvites::default()),
+        stale_request_budget: stale_shed::STALE_REQUEST_BUDGET,
         // `init_gateway` runs before the dispatcher is built.
         gateway: crate::script::api::gateway_manager().cloned(),
         registrant_manager,
@@ -862,8 +866,13 @@ pub async fn run(
         // pool rather than tokio's elastic blocking pool — the latter reaps
         // idle threads mid-process and orphans their pinned free-threaded
         // CPython mimalloc heap (~2 MB each).  See `script::py_executor`.
-        crate::script::py_executor::spawn(move || {
-            handle_inbound(inbound, &state);
+        //
+        // The job learns how long it queued, so an initial request that
+        // waited past `stale_request_budget` is answered 503 instead of
+        // running the script for an answer that would arrive too late
+        // (see `stale_shed`).
+        crate::script::py_executor::spawn_with_queue_wait(move |queue_wait| {
+            inbound::handle_inbound_after_queue(inbound, queue_wait, &state);
         });
     }
 

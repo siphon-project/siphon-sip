@@ -932,14 +932,60 @@ where
 /// oldest job, the figure that says how far behind the executor runs.
 static LAST_QUEUE_WAIT_MS: AtomicU64 = AtomicU64::new(0);
 
+thread_local! {
+    /// How long the job now running on this worker waited in the queue, set by
+    /// [`stamped`] just before the job runs, for [`spawn_with_queue_wait`].
+    static JOB_QUEUE_WAIT: std::cell::Cell<Duration> = const { std::cell::Cell::new(Duration::ZERO) };
+}
+
 /// `job`, recording on pickup how long it waited in the queue.
+///
+/// The one clock read on pickup feeds both the backlog gauge and the job's own
+/// age ([`spawn_with_queue_wait`]), so knowing a job's age costs the hot path
+/// nothing beyond a thread-local store.
 fn stamped(job: Job) -> Job {
     let enqueued = std::time::Instant::now();
     Box::new(move || {
-        let waited = u64::try_from(enqueued.elapsed().as_millis()).unwrap_or(u64::MAX);
-        LAST_QUEUE_WAIT_MS.store(waited, Ordering::Relaxed);
+        let waited = enqueued.elapsed();
+        LAST_QUEUE_WAIT_MS.store(
+            u64::try_from(waited.as_millis()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        JOB_QUEUE_WAIT.with(|cell| cell.set(waited));
         job();
     })
+}
+
+/// Fire-and-forget like [`spawn`], handing `f` how long it waited in the queue
+/// before a worker took it.
+///
+/// For a job that can decide, once it runs, that it waited too long to be
+/// worth running: the dispatcher answers an initial SIP request that queued
+/// past its budget with a 503 instead of running the script for an answer the
+/// client has stopped waiting for. The age comes from the pickup stamp every
+/// job already carries, so this costs no extra clock read. Queue-full shedding
+/// is unchanged (counted in `siphon_pyexec_jobs_shed_total`).
+///
+/// Falls back to `tokio::task::spawn_blocking` with a zero wait when no pool is
+/// installed.
+pub fn spawn_with_queue_wait<F>(f: F)
+where
+    F: FnOnce(Duration) + Send + 'static,
+{
+    match PyExecutor::global() {
+        Some(pool) => spawn_with_queue_wait_on(&pool, f),
+        None => {
+            tokio::task::spawn_blocking(move || f(Duration::ZERO));
+        }
+    }
+}
+
+/// [`spawn_with_queue_wait`] on `pool`.
+pub(crate) fn spawn_with_queue_wait_on<F>(pool: &PyExecutor, f: F)
+where
+    F: FnOnce(Duration) + Send + 'static,
+{
+    spawn_on(pool, move || f(JOB_QUEUE_WAIT.with(std::cell::Cell::get)));
 }
 
 /// Jobs waiting in the installed pool's queue (0 with no pool).
@@ -1143,22 +1189,44 @@ where
     F: FnOnce() + Send + 'static,
 {
     match PyExecutor::global() {
-        Some(pool) => {
-            let job: Job = Box::new(move || {
-                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
-            });
-            match pool.submit(job) {
-                SubmitResult::Submitted => {}
-                SubmitResult::Full => record_shed(),
-                SubmitResult::Closed => {
-                    error!("Python executor channel closed — dropping fire-and-forget job");
-                }
-            }
-        }
+        Some(pool) => spawn_on(&pool, f),
         None => {
             tokio::task::spawn_blocking(f);
         }
     }
+}
+
+/// [`spawn`] on `pool`.
+fn spawn_on<F>(pool: &PyExecutor, f: F)
+where
+    F: FnOnce() + Send + 'static,
+{
+    let job: Job = Box::new(move || {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+    });
+    match pool.submit(job) {
+        SubmitResult::Submitted => {}
+        SubmitResult::Full => record_shed(),
+        SubmitResult::Closed => {
+            error!("Python executor channel closed — dropping fire-and-forget job");
+        }
+    }
+}
+
+/// A private pool of `threads` workers, for a test that needs a small executor
+/// it can saturate without starving the process-wide one. `tokio_handle` must
+/// outlive the pool, so drop the pool before the runtime.
+#[cfg(test)]
+pub(crate) fn test_pool(tokio_handle: TokioHandle, threads: usize) -> PyExecutor {
+    PyExecutor::spawn(
+        tokio_handle,
+        ExecutorConfig {
+            core_threads: threads,
+            max_threads: threads,
+            queue_capacity: 1024,
+            stall_abort: None,
+        },
+    )
 }
 
 /// Wrap a static message as a panic payload so callers see a meaningful value
@@ -1595,6 +1663,47 @@ mod tests {
         );
 
         drop(pool);
+    }
+
+    /// A job queued behind a busy worker is told how long it waited; one that
+    /// found the worker free is told it barely waited.
+    #[test]
+    fn a_job_is_told_how_long_it_queued() {
+        pyo3::Python::initialize();
+        let pool = test_pool(test_runtime().handle().clone(), 1);
+
+        let (waits_tx, waits_rx) = std::sync::mpsc::channel::<(&str, Duration)>();
+        let (unblock_tx, unblock_rx) = std::sync::mpsc::channel::<()>();
+        let first = waits_tx.clone();
+        spawn_with_queue_wait_on(&pool, move |waited| {
+            let _ = first.send(("blocker", waited));
+            let _ = unblock_rx.recv();
+        });
+        let (name, fresh) = waits_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the blocker ran");
+        assert_eq!(name, "blocker");
+
+        let queued = waits_tx.clone();
+        spawn_with_queue_wait_on(&pool, move |waited| {
+            let _ = queued.send(("queued", waited));
+        });
+        std::thread::sleep(Duration::from_millis(200));
+        let _ = unblock_tx.send(());
+        let (name, stale) = waits_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the queued job ran");
+        drop(pool);
+
+        assert_eq!(name, "queued");
+        assert!(
+            fresh < Duration::from_millis(150),
+            "a job a free worker took at once barely waited: {fresh:?}"
+        );
+        assert!(
+            stale >= Duration::from_millis(200),
+            "the job queued behind the blocker waited for it: {stale:?}"
+        );
     }
 
     /// A job the pool sheds is reported as shed, not as the panic `try_run`
