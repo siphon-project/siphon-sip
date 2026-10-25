@@ -221,6 +221,24 @@ entry, but a working config keeps working.
 
 ### Fixed
 
+- **Memory no longer scales with how many blocking waits are parked at once.**
+  Every thread of tokio's blocking pool was pinned to the interpreter when it
+  started, and awaitable script APIs finished on that pool, so each of the up
+  to 512 threads a pile-up of waits grows (a peer that stops answering parks
+  one per in-flight request) carried a Python thread state and the heap its
+  completions built, and every thread the pool reaped created and destroyed
+  one. Awaitables now finish on two fixed threads (`siphon-await-0/1`) that
+  keep their thread state for the life of the process, only tokio's async
+  workers are pinned, and the blocking pool runs no Python at all. Measured
+  with 2000 parked waits and 2000 awaitables in flight: peak RSS growth
+  160 MiB down to 57 MiB at the same 526 threads, and Python thread states
+  created per churn cycle down from about 206 to 4-6. The thread ceiling
+  stays tokio's 512: a lower one would stop the runtime sooner, since a
+  worker that blocks hands its core over through the same pool. Extensions
+  should create awaitables with `siphon::script::blocking::awaitable`; one
+  that calls `pyo3_async_runtimes::tokio::future_into_py` directly still
+  completes on the blocking pool.
+
 - **The timer sweep no longer queues behind script handlers, and an overloaded
   node is no longer restarted for it.** Each 100 ms turn of the sweep (the
   transaction timer wheel: retransmissions, Timer B/F/H) ran as a Python

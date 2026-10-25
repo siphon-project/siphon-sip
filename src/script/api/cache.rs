@@ -62,9 +62,7 @@ impl PyCacheNamespace {
         key: String,
     ) -> PyResult<Bound<'py, PyAny>> {
         let manager = Arc::clone(&self.manager);
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            Ok(manager.fetch(&name, &key).await)
-        })
+        crate::script::awaitable(py, async move { Ok(manager.fetch(&name, &key).await) })
     }
 
     /// Store a value in a named cache with optional TTL.
@@ -90,7 +88,7 @@ impl PyCacheNamespace {
     ) -> PyResult<Bound<'py, PyAny>> {
         validate_key(&key)?;
         let manager = Arc::clone(&self.manager);
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        crate::script::awaitable(py, async move {
             Ok(manager.store(&name, &key, &value, ttl).await)
         })
     }
@@ -107,9 +105,7 @@ impl PyCacheNamespace {
     ) -> PyResult<Bound<'py, PyAny>> {
         validate_key(&key)?;
         let manager = Arc::clone(&self.manager);
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            Ok(manager.delete(&name, &key).await)
-        })
+        crate::script::awaitable(py, async move { Ok(manager.delete(&name, &key).await) })
     }
 
     /// Check if a named cache exists in the configuration.
@@ -137,7 +133,7 @@ impl PyCacheNamespace {
     ) -> PyResult<Bound<'py, PyAny>> {
         validate_key(&key)?;
         let manager = Arc::clone(&self.manager);
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        crate::script::awaitable(py, async move {
             Ok(manager.list_push(&name, &key, &item).await)
         })
     }
@@ -156,9 +152,10 @@ impl PyCacheNamespace {
     ) -> PyResult<Bound<'py, PyAny>> {
         validate_key(&key)?;
         let manager = Arc::clone(&self.manager);
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            Ok(manager.list_pop_all(&name, &key).await)
-        })
+        crate::script::awaitable(
+            py,
+            async move { Ok(manager.list_pop_all(&name, &key).await) },
+        )
     }
 
     /// Set a TTL (seconds) on an existing key.
@@ -176,9 +173,10 @@ impl PyCacheNamespace {
     ) -> PyResult<Bound<'py, PyAny>> {
         validate_key(&key)?;
         let manager = Arc::clone(&self.manager);
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            Ok(manager.expire(&name, &key, ttl).await)
-        })
+        crate::script::awaitable(
+            py,
+            async move { Ok(manager.expire(&name, &key, ttl).await) },
+        )
     }
 
     /// Return the length of the Redis list under ``key`` (``LLEN``).
@@ -199,9 +197,7 @@ impl PyCacheNamespace {
     ) -> PyResult<Bound<'py, PyAny>> {
         validate_key(&key)?;
         let manager = Arc::clone(&self.manager);
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            Ok(manager.list_len(&name, &key).await)
-        })
+        crate::script::awaitable(py, async move { Ok(manager.list_len(&name, &key).await) })
     }
 
     /// Sum ``LLEN`` over every key matching ``{prefix}*`` — the live
@@ -236,9 +232,10 @@ impl PyCacheNamespace {
     ) -> PyResult<Bound<'py, PyAny>> {
         validate_prefix(&prefix)?;
         let manager = Arc::clone(&self.manager);
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            Ok(manager.list_len_sum(&name, &prefix).await)
-        })
+        crate::script::awaitable(
+            py,
+            async move { Ok(manager.list_len_sum(&name, &prefix).await) },
+        )
     }
 
     /// Check whether ``key`` exists in the named cache.
@@ -253,9 +250,7 @@ impl PyCacheNamespace {
     ) -> PyResult<Bound<'py, PyAny>> {
         validate_key(&key)?;
         let manager = Arc::clone(&self.manager);
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            Ok(manager.exists(&name, &key).await)
-        })
+        crate::script::awaitable(py, async move { Ok(manager.exists(&name, &key).await) })
     }
 }
 

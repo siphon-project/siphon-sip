@@ -3746,7 +3746,7 @@ impl PyDiameter {
             .unwrap_or(SERVICE_CONTEXT_ID_IMS)
             .to_string();
         let client = self.pick_peer(&DiameterApplication::Ro, peer);
-        pyo3_async_runtimes::tokio::future_into_py(python, async move {
+        crate::script::awaitable(python, async move {
             let Some(client) = client else {
                 warn!("ro_ccr_initial: no Diameter peer connected");
                 return Ok(crate::script::Deferred::none());
@@ -3939,7 +3939,7 @@ impl PyDiameter {
             .to_string();
         let requested_action = requested_action.unwrap_or(REQUESTED_ACTION_DIRECT_DEBITING);
         let client = self.pick_peer(&DiameterApplication::Ro, peer);
-        pyo3_async_runtimes::tokio::future_into_py(python, async move {
+        crate::script::awaitable(python, async move {
             let Some(client) = client else {
                 warn!("ro_ccr_event: no Diameter peer connected");
                 return Ok(crate::script::Deferred::none());
@@ -4005,7 +4005,7 @@ impl PyDiameter {
         let used = time_service_unit(used_seconds);
         let requested = time_service_unit(requested_seconds);
         let client = self.pick_peer(&DiameterApplication::Ro, peer);
-        pyo3_async_runtimes::tokio::future_into_py(python, async move {
+        crate::script::awaitable(python, async move {
             let Some(client) = client else {
                 warn!("ro_ccr: no Diameter peer connected");
                 return Ok(crate::script::Deferred::none());

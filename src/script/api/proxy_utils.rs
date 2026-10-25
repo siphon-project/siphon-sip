@@ -526,7 +526,7 @@ impl PyProxyUtils {
         let suffix = suffix.to_string();
         let service = service.to_string();
 
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        crate::script::awaitable(py, async move {
             Ok(resolver.enum_lookup(&number, &suffix, &service).await)
         })
     }
@@ -652,7 +652,7 @@ impl PyProxyUtils {
         let service = service.to_string();
         let timeout = timeout_ms.map_or(DEFAULT_TIMEOUT, std::time::Duration::from_millis);
         let attempts = attempts.unwrap_or(DEFAULT_ATTEMPTS);
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        crate::script::awaitable(py, async move {
             let result = match &servers {
                 Some(list) => {
                     let source = ServerList {
@@ -760,7 +760,7 @@ impl PyProxyUtils {
                 "proxy.release: status must be a final non-2xx status (300-699), not {status}"
             )));
         }
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        crate::script::awaitable(py, async move {
             // The release sends on the dispatcher's blocking paths (the TCP
             // pool), so it runs off the async worker.
             match tokio::task::spawn_blocking(move || {

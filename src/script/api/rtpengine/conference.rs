@@ -249,7 +249,7 @@ pub(super) fn join<'py>(
     let offer_sdp = String::from_utf8_lossy(&offer_sdp).into_owned();
     let client = Arc::clone(&engine.client);
 
-    pyo3_async_runtimes::tokio::future_into_py(python, async move {
+    crate::script::awaitable(python, async move {
         let seat = ConferenceSeat {
             conference_id,
             from_tag,
@@ -278,7 +278,7 @@ pub(super) fn leave<'py>(
     let conference_id = room_id(conference_id, "conference_leave(conference_id)")?;
     let (call_id, seat) = seat_of(conference_id, call)?;
     let client = Arc::clone(&engine.client);
-    pyo3_async_runtimes::tokio::future_into_py(python, async move {
+    crate::script::awaitable(python, async move {
         client
             .conference_leave(&call_id, &seat)
             .await
@@ -302,7 +302,7 @@ pub(super) fn route<'py>(
     let role = parse_role(role, target, whisper_target)?;
     let (_, seat) = seat_of(conference_id, call)?;
     let client = Arc::clone(&engine.client);
-    pyo3_async_runtimes::tokio::future_into_py(python, async move {
+    crate::script::awaitable(python, async move {
         client
             .conference_route(&seat, role)
             .await
@@ -328,7 +328,7 @@ pub(super) fn bridge<'py>(
     }
     let direction = parse_direction(direction)?;
     let client = Arc::clone(&engine.client);
-    pyo3_async_runtimes::tokio::future_into_py(python, async move {
+    crate::script::awaitable(python, async move {
         client
             .conference_bridge(&conference_a, &conference_b, direction)
             .await
@@ -352,7 +352,7 @@ pub(super) fn unbridge<'py>(
         ));
     }
     let client = Arc::clone(&engine.client);
-    pyo3_async_runtimes::tokio::future_into_py(python, async move {
+    crate::script::awaitable(python, async move {
         client
             .conference_unbridge(&conference_a, &conference_b)
             .await
@@ -404,7 +404,7 @@ pub(super) fn offer<'py>(
         )));
     }
     let client = Arc::clone(&engine.client);
-    pyo3_async_runtimes::tokio::future_into_py(python, async move {
+    crate::script::awaitable(python, async move {
         let seat = ConferenceSeat {
             conference_id,
             from_tag,
@@ -440,7 +440,7 @@ pub(super) fn answer<'py>(
     }
     let answer_sdp = String::from_utf8_lossy(&answer_sdp).into_owned();
     let client = Arc::clone(&engine.client);
-    pyo3_async_runtimes::tokio::future_into_py(python, async move {
+    crate::script::awaitable(python, async move {
         client
             .conference_answer(&call_id, seat.clone(), &answer_sdp)
             .await
@@ -480,7 +480,7 @@ pub(super) fn play<'py>(
     let source = resolve_play_media_source(file, blob, None, tone, None)?;
     let repeat = repeat::parse_repeat(repeat.as_ref())?;
     let client = Arc::clone(&engine.client);
-    pyo3_async_runtimes::tokio::future_into_py(python, async move {
+    crate::script::awaitable(python, async move {
         let outcome = client
             .conference_play(
                 &conference_id,
@@ -506,7 +506,7 @@ pub(super) fn stop_play<'py>(
 ) -> PyResult<Bound<'py, PyAny>> {
     let conference_id = room_id(conference_id, "conference_stop_play(conference_id)")?;
     let client = Arc::clone(&engine.client);
-    pyo3_async_runtimes::tokio::future_into_py(python, async move {
+    crate::script::awaitable(python, async move {
         client
             .conference_stop_play(&conference_id, play_id)
             .await
@@ -525,7 +525,7 @@ pub(super) fn set_play_gain<'py>(
 ) -> PyResult<Bound<'py, PyAny>> {
     let conference_id = room_id(conference_id, "conference_set_play_gain(conference_id)")?;
     let client = Arc::clone(&engine.client);
-    pyo3_async_runtimes::tokio::future_into_py(python, async move {
+    crate::script::awaitable(python, async move {
         client
             .conference_set_play_gain(&conference_id, play_id, gain_decibels)
             .await
@@ -554,7 +554,7 @@ pub(super) fn start_recording<'py>(
         ));
     }
     let client = Arc::clone(&engine.client);
-    pyo3_async_runtimes::tokio::future_into_py(python, async move {
+    crate::script::awaitable(python, async move {
         let recording_id = client
             .conference_start_recording(
                 &conference_id,
@@ -578,7 +578,7 @@ pub(super) fn stop_recording<'py>(
 ) -> PyResult<Bound<'py, PyAny>> {
     let conference_id = room_id(conference_id, "conference_stop_recording(conference_id)")?;
     let client = Arc::clone(&engine.client);
-    pyo3_async_runtimes::tokio::future_into_py(python, async move {
+    crate::script::awaitable(python, async move {
         client
             .conference_stop_recording(&conference_id, recording_id.as_deref())
             .await
@@ -601,7 +601,7 @@ pub(super) fn wait_recording<'py>(
         timeout_ms.unwrap_or(DEFAULT_ROOM_RECORDING_WAIT_MS).max(1),
     );
     let client = Arc::clone(&engine.client);
-    pyo3_async_runtimes::tokio::future_into_py(python, async move {
+    crate::script::awaitable(python, async move {
         let finished = client
             .conference_wait_recording(&conference_id, &recording_id, deadline)
             .await

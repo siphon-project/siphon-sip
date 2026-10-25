@@ -24,6 +24,8 @@ mod tests;
 pub use bootstrap::li_manager;
 
 use bootstrap::*;
+pub use python_thread::build_runtime;
+#[cfg(test)]
 use python_thread::*;
 
 use std::sync::Arc;
@@ -352,28 +354,12 @@ impl SiphonServer {
         // PyGILState_Ensure calls from workers create proper per-thread state.
         pyo3::Python::initialize();
 
-        // Build the Tokio runtime with hooks that pin each runtime thread (async
-        // worker + blocking) to the interpreter for the thread's lifetime and
-        // unpin it at teardown (see `pin_python_thread_state`), and mark workers.
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .on_thread_start(pin_python_thread_state)
-            .on_thread_stop(unpin_python_thread_state)
-            .on_thread_park(crate::script::attach::mark_tokio_worker)
-            .build()
-            .unwrap_or_else(|error| {
-                eprintln!("Failed to create tokio runtime: {error}");
-                std::process::exit(1);
-            });
-        // It lives for the process either way; 'static so pyo3-async-runtimes
-        // can complete awaitables on it. See `share_runtime_with_python`.
-        let runtime: &'static tokio::runtime::Runtime = Box::leak(Box::new(runtime));
-        if !share_runtime_with_python(runtime) {
-            tracing::warn!(
-                "pyo3-async-runtimes already had a runtime: awaitable script APIs \
-                 complete on threads without a pinned Python thread state"
-            );
-        }
+        // Build the Tokio runtime (thread hooks, and shared with
+        // pyo3-async-runtimes so awaitables complete on it). See `build_runtime`.
+        let runtime = build_runtime(|_| {}).unwrap_or_else(|error| {
+            eprintln!("Failed to create tokio runtime: {error}");
+            std::process::exit(1);
+        });
 
         runtime.block_on(self.run_async());
     }

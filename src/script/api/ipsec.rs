@@ -50,7 +50,6 @@ use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use pyo3::prelude::*;
-use pyo3_async_runtimes::tokio::future_into_py;
 use tracing::{debug, info, warn};
 
 use crate::config::IpsecConfig;
@@ -677,7 +676,7 @@ impl PyPendingSA {
     /// Idempotent — calling on an already-cleaned PendingSA is a no-op.
     fn cleanup<'py>(&self, python: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let inner = Arc::clone(&self.inner);
-        future_into_py(python, async move {
+        crate::script::awaitable(python, async move {
             let (manager, ue_addr, ue_port_c, already_cleaned) = {
                 let mut guard = inner.lock().map_err(|error| {
                     pyo3::exceptions::PyRuntimeError::new_err(format!(
@@ -721,7 +720,7 @@ impl PyPendingSA {
             pyo3::exceptions::PyValueError::new_err("AuthVectorHandle already consumed")
         })?;
         let inner = Arc::clone(&self.inner);
-        future_into_py(python, async move {
+        crate::script::awaitable(python, async move {
             let manager;
             let mut sa_new;
             {
@@ -1019,7 +1018,7 @@ impl PyIpsec {
             })?;
         let pcscf_port_s = self.config.pcscf_port_s;
 
-        future_into_py(python, async move {
+        crate::script::awaitable(python, async move {
             // A full partition fails the allocation (RuntimeError) rather than
             // reuse an SPI another UE's SA still holds.
             let (spi_pc, spi_ps) = manager.allocate_spi_pair().map_err(map_ipsec_error)?;
@@ -1137,7 +1136,7 @@ impl PyIpsec {
             ))
         })?;
         let manager = Arc::clone(&self.manager);
-        future_into_py(python, async move {
+        crate::script::awaitable(python, async move {
             if delay.is_zero() {
                 Ok(manager
                     .retire_ue_now(ue_addr, ue_port_c, "deleted by the script")

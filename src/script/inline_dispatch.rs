@@ -173,7 +173,7 @@ pub fn run_coroutine_inline<'py>(
 thread_local! {
     /// Per-thread asyncio event loop reused across `run_coroutine` calls.
     ///
-    /// `pyo3_async_runtimes::tokio::future_into_py(...)` captures the asyncio
+    /// `crate::script::awaitable(...)` captures the asyncio
     /// loop that is running at the moment a script `await`s the bridged
     /// awaitable, then later wakes the awaiter from a Tokio worker via
     /// `loop.call_soon_threadsafe(...)`.  Driving each handler with a fresh

@@ -79,7 +79,7 @@ impl PyRtpEngine {
         let leg = self.leg(scope, Some(target), &call_id, method)?;
         let client = Arc::clone(&self.client);
 
-        pyo3_async_runtimes::tokio::future_into_py(python, async move {
+        crate::script::awaitable(python, async move {
             let engine_call_id = leg.call_id();
             let result = match method {
                 "silence_media" => {
@@ -764,13 +764,13 @@ impl PyRtpEngine {
         let client = Arc::clone(&self.client);
         match body {
             // Message mode: the rewritten SDP replaces the message's body.
-            Some(message) => pyo3_async_runtimes::tokio::future_into_py(python, async move {
+            Some(message) => crate::script::awaitable(python, async move {
                 let rewritten_sdp = command.send(&client, &sessions, &flags).await?;
                 replace_body(&message, &rewritten_sdp)?;
                 Ok(true)
             }),
             // Raw mode: the script sends the rewritten SDP itself.
-            None => pyo3_async_runtimes::tokio::future_into_py(python, async move {
+            None => crate::script::awaitable(python, async move {
                 let rewritten_sdp = command.send(&client, &sessions, &flags).await?;
                 Ok(String::from_utf8_lossy(&rewritten_sdp).into_owned())
             }),
@@ -952,7 +952,7 @@ impl PyRtpEngine {
         let body = exchange.body.take();
         match body {
             // Reply mode: the rewritten SDP replaces the reply's body.
-            Some(message) => pyo3_async_runtimes::tokio::future_into_py(python, async move {
+            Some(message) => crate::script::awaitable(python, async move {
                 let rewritten_sdp = exchange
                     .send(&client, &sessions, &flags, &profile_name, resolved_ws_uri)
                     .await?;
@@ -960,7 +960,7 @@ impl PyRtpEngine {
                 Ok(true)
             }),
             // Raw mode: the script sends the rewritten SDP itself.
-            None => pyo3_async_runtimes::tokio::future_into_py(python, async move {
+            None => crate::script::awaitable(python, async move {
                 let rewritten_sdp = exchange
                     .send(&client, &sessions, &flags, &profile_name, resolved_ws_uri)
                     .await?;
@@ -1101,7 +1101,7 @@ impl PyRtpEngine {
         let profile_str = profile_name.clone();
         let leg = self.client.leg(&call_id, scope.as_ref());
 
-        pyo3_async_runtimes::tokio::future_into_py(python, async move {
+        crate::script::awaitable(python, async move {
             let result = leg
                 .run(client.answer_local(leg.call_id(), &from_tag, &offer_sdp, &flags))
                 .await;
@@ -1181,7 +1181,7 @@ impl PyRtpEngine {
         let client = Arc::clone(&self.client);
         let sessions = Arc::clone(&self.sessions);
 
-        pyo3_async_runtimes::tokio::future_into_py(python, async move {
+        crate::script::awaitable(python, async move {
             if let Some(scope) = scope {
                 scope::delete_leg(&client, &sessions, &call_id, &from_tag, &scope).await;
                 return Ok(true);
@@ -1258,7 +1258,7 @@ impl PyRtpEngine {
         let scope = scope::per_call_scope(scope, &[], &self.client, "delete_call")?;
         let client = Arc::clone(&self.client);
         let sessions = Arc::clone(&self.sessions);
-        pyo3_async_runtimes::tokio::future_into_py(python, async move {
+        crate::script::awaitable(python, async move {
             client
                 .release_call(&sessions, &call_id, from_tag.as_deref(), scope.as_ref())
                 .await
@@ -1274,7 +1274,7 @@ impl PyRtpEngine {
     fn ping<'py>(&self, python: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let client = Arc::clone(&self.client);
 
-        pyo3_async_runtimes::tokio::future_into_py(python, async move {
+        crate::script::awaitable(python, async move {
             match client.ping().await {
                 Ok(()) => Ok(true),
                 Err(error) => {
@@ -1376,7 +1376,7 @@ impl PyRtpEngine {
 
         let client = Arc::clone(&self.client);
 
-        pyo3_async_runtimes::tokio::future_into_py(python, async move {
+        crate::script::awaitable(python, async move {
             let outcome = leg
                 .run(client.play_media(
                     leg.call_id(),
@@ -1473,7 +1473,7 @@ impl PyRtpEngine {
 
         let client = Arc::clone(&self.client);
 
-        pyo3_async_runtimes::tokio::future_into_py(python, async move {
+        crate::script::awaitable(python, async move {
             let outcome = leg
                 .run(client.play_media(
                     leg.call_id(),
@@ -1526,7 +1526,7 @@ impl PyRtpEngine {
 
         let client = Arc::clone(&self.client);
 
-        pyo3_async_runtimes::tokio::future_into_py(python, async move {
+        crate::script::awaitable(python, async move {
             leg.run(client.stop_media(leg.call_id(), &from_tag, play_id))
                 .await
                 .map_err(|error| {
@@ -1574,7 +1574,7 @@ impl PyRtpEngine {
         let (call_id, from_tag) = resolve_call_from_tag(target)?;
         let leg = self.leg(scope, Some(target), &call_id, "start_recording")?;
         let client = Arc::clone(&self.client);
-        pyo3_async_runtimes::tokio::future_into_py(python, async move {
+        crate::script::awaitable(python, async move {
             let verb = capture::start(
                 &client,
                 leg.call_id(),
@@ -1627,7 +1627,7 @@ impl PyRtpEngine {
         let (call_id, from_tag) = resolve_call_from_tag(target)?;
         let leg = self.leg(scope, Some(target), &call_id, "record")?;
         let client = Arc::clone(&self.client);
-        pyo3_async_runtimes::tokio::future_into_py(python, async move {
+        crate::script::awaitable(python, async move {
             leg.run(async {
                 let recording_id =
                     capture::start(&client, leg.call_id(), &from_tag, &options, "record").await?;
@@ -1652,7 +1652,7 @@ impl PyRtpEngine {
         let (call_id, _from_tag) = resolve_call_from_tag(target)?;
         let leg = self.leg(scope, Some(target), &call_id, "wait_recording")?;
         let client = Arc::clone(&self.client);
-        pyo3_async_runtimes::tokio::future_into_py(python, async move {
+        crate::script::awaitable(python, async move {
             let verb = capture::wait(
                 &client,
                 leg.call_id(),
@@ -1679,7 +1679,7 @@ impl PyRtpEngine {
         let (call_id, from_tag) = resolve_call_from_tag(target)?;
         let leg = self.leg(scope, Some(target), &call_id, "stop_recording")?;
         let client = Arc::clone(&self.client);
-        pyo3_async_runtimes::tokio::future_into_py(python, async move {
+        crate::script::awaitable(python, async move {
             leg.run(client.stop_recording(leg.call_id(), &from_tag, recording_id.as_deref()))
                 .await
                 .map_err(|error| {
@@ -1724,7 +1724,7 @@ impl PyRtpEngine {
         let (call_id, _from_tag) = resolve_call_from_tag(target)?;
         let leg = self.leg(scope, Some(target), &call_id, "read_digits")?;
         let client = Arc::clone(&self.client);
-        pyo3_async_runtimes::tokio::future_into_py(python, async move {
+        crate::script::awaitable(python, async move {
             let verb = capture::read_digits(client, leg.call_id().to_string(), limits);
             leg.run(verb).await
         })
@@ -1763,7 +1763,7 @@ impl PyRtpEngine {
 
         let client = Arc::clone(&self.client);
 
-        pyo3_async_runtimes::tokio::future_into_py(python, async move {
+        crate::script::awaitable(python, async move {
             leg.run(client.set_play_gain(
                 leg.call_id(),
                 &from_tag,
@@ -2090,7 +2090,7 @@ impl PyRtpEngine {
 
         let client = Arc::clone(&self.client);
 
-        pyo3_async_runtimes::tokio::future_into_py(python, async move {
+        crate::script::awaitable(python, async move {
             leg.run(client.play_dtmf(
                 leg.call_id(),
                 &from_tag,
@@ -2182,7 +2182,7 @@ impl PyRtpEngine {
         let leg = self.leg(scope, Some(target), &call_id, "echo")?;
         let client = Arc::clone(&self.client);
 
-        pyo3_async_runtimes::tokio::future_into_py(python, async move {
+        crate::script::awaitable(python, async move {
             leg.run(client.echo(leg.call_id(), &from_tag, enabled))
                 .await
                 .map_err(|error| {
@@ -2240,7 +2240,7 @@ impl PyRtpEngine {
         let flags = entry.offer.clone();
         let client = Arc::clone(&self.client);
 
-        pyo3_async_runtimes::tokio::future_into_py(python, async move {
+        crate::script::awaitable(python, async move {
             let verb =
                 client.subscribe_request(leg.call_id(), &from_tag, &to_tag, sdp.as_deref(), &flags);
             let rewritten_sdp = leg.run(verb).await.map_err(|error| {
@@ -2296,7 +2296,7 @@ impl PyRtpEngine {
         let flags = entry.answer.clone();
         let client = Arc::clone(&self.client);
 
-        pyo3_async_runtimes::tokio::future_into_py(python, async move {
+        crate::script::awaitable(python, async move {
             let verb = client.subscribe_answer(leg.call_id(), &from_tag, &to_tag, &sdp, &flags);
             let rewritten_sdp = leg.run(verb).await.map_err(|error| {
                 pyo3::exceptions::PyRuntimeError::new_err(format!(
@@ -2334,7 +2334,7 @@ impl PyRtpEngine {
         let leg = self.leg(scope, None, &call_id, "unsubscribe")?;
         let client = Arc::clone(&self.client);
 
-        pyo3_async_runtimes::tokio::future_into_py(python, async move {
+        crate::script::awaitable(python, async move {
             leg.run(client.unsubscribe(leg.call_id(), &from_tag, &to_tag))
                 .await
                 .map_err(|error| {
@@ -2450,7 +2450,7 @@ impl PyRtpEngine {
 
         let client = Arc::clone(&self.client);
 
-        pyo3_async_runtimes::tokio::future_into_py(python, async move {
+        crate::script::awaitable(python, async move {
             let verb = client.attach_ws_tee(
                 leg.call_id(),
                 &from_tag,
@@ -2507,7 +2507,7 @@ impl PyRtpEngine {
         let sessions = scope::store_for(&self.sessions, leg.scope())?;
         let client = Arc::clone(&self.client);
 
-        pyo3_async_runtimes::tokio::future_into_py(python, async move {
+        crate::script::awaitable(python, async move {
             leg.run(client.detach_ws_tee(leg.call_id(), &from_tag))
                 .await
                 .map_err(|error| {
@@ -2596,7 +2596,7 @@ impl PyRtpEngine {
         let sessions = scope::store_for(&self.sessions, leg.scope())?;
         let client = Arc::clone(&self.client);
 
-        pyo3_async_runtimes::tokio::future_into_py(python, async move {
+        crate::script::awaitable(python, async move {
             leg.run(client.attach_ws_bridge(leg.call_id(), &from_tag, &ws_uri, flags.as_ref()))
                 .await
                 .map_err(|error| {
@@ -2649,7 +2649,7 @@ impl PyRtpEngine {
         let sessions = scope::store_for(&self.sessions, leg.scope())?;
         let client = Arc::clone(&self.client);
 
-        pyo3_async_runtimes::tokio::future_into_py(python, async move {
+        crate::script::awaitable(python, async move {
             leg.run(client.detach_ws_bridge(leg.call_id(), &from_tag))
                 .await
                 .map_err(|error| {
