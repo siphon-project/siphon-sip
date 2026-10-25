@@ -213,3 +213,62 @@ async fn the_purge_drains_expired_bindings_and_their_state() {
     assert_eq!(state_left, 0);
     assert_eq!(count, 0);
 }
+
+/// A batch runs as one transaction, and a write the server refuses aborts it;
+/// the writes the server would accept must still land, each on its own, so one
+/// bad key cannot hold every other AoR's persistence back.
+#[tokio::test]
+async fn a_batch_the_server_refuses_in_part_still_applies_the_rest() {
+    let Some(url) = test_url() else { return };
+    let table = unique_table("batch_fallback");
+    let backend = backend(&url, &table, 7200).await;
+    // Every state write now fails; binding writes do not.
+    backend.clients[0]
+        .batch_execute(&format!("DROP TABLE {table}_aor_state"))
+        .await
+        .expect("drop the state table");
+    let save = BackendWrite::Save(vec![sample_stored_contact()]);
+    let state = BackendWrite::SaveState(state());
+
+    let results = backend
+        .apply_batch(&[
+            ("sip:a@example.com", &save),
+            ("sip:a@example.com", &state),
+            ("sip:b@example.com", &save),
+        ])
+        .await;
+    let count = backend.count_aors().await.expect("count");
+    drop_tables(&backend, &table).await;
+
+    assert!(results[0].is_ok(), "{results:?}");
+    assert!(results[1].is_err(), "{results:?}");
+    assert!(results[2].is_ok(), "{results:?}");
+    assert_eq!(count, 2);
+}
+
+/// A batch the server accepts lands in full, in one commit.
+#[tokio::test]
+async fn a_batch_lands_in_full() {
+    let Some(url) = test_url() else { return };
+    let table = unique_table("batch_full");
+    let backend = backend(&url, &table, 7200).await;
+    let save = BackendWrite::Save(vec![sample_stored_contact()]);
+    let state = BackendWrite::SaveState(state());
+    let aors: Vec<String> = (0..300)
+        .map(|index| format!("sip:{index}@example.com"))
+        .collect();
+    let mut writes: Vec<(&str, &BackendWrite)> = Vec::new();
+    for aor in &aors {
+        writes.push((aor, &save));
+        writes.push((aor, &state));
+    }
+
+    let results = backend.apply_batch(&writes).await;
+    let count = backend.count_aors().await.expect("count");
+    let states = backend.all_aor_state_aors().await.expect("states").len();
+    drop_tables(&backend, &table).await;
+
+    assert!(results.iter().all(Result::is_ok));
+    assert_eq!(count, 300);
+    assert_eq!(states, 300);
+}

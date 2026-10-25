@@ -28,6 +28,10 @@ pub struct PostgresBackend {
     expired_row_grace_secs: u64,
 }
 
+/// One shard's share of a batch: each write's position in the batch, and the
+/// write.
+type ShardWrites<'a> = (Vec<usize>, Vec<(&'a str, &'a BackendWrite)>);
+
 /// [`PostgresBackend::expired_row_grace_secs`]: the Redis backend's default
 /// `ttl_slack_secs`.
 const EXPIRED_ROW_GRACE_SECS: u64 = 30;
@@ -147,11 +151,59 @@ impl PostgresBackend {
 
     /// Get the client for the given AoR (shard-aware).
     fn client_for(&self, aor: &str) -> &tokio_postgres::Client {
+        &self.clients[self.shard_of(aor)]
+    }
+
+    fn shard_of(&self, aor: &str) -> usize {
         if self.clients.len() == 1 {
-            &self.clients[0]
+            0
         } else {
-            let index = shard_index(aor, self.clients.len());
-            &self.clients[index]
+            shard_index(aor, self.clients.len())
+        }
+    }
+
+    /// Apply one shard's share of a batch in a single transaction, so the
+    /// batch pays one commit (one WAL flush) instead of one per statement.
+    ///
+    /// The writer task owns this backend, so nothing else can interleave a
+    /// statement into the transaction on the shared client. When the
+    /// transaction fails as a whole, each write is retried on its own: a
+    /// single key the server refuses then fails alone instead of taking the
+    /// rest of the batch with it.
+    async fn apply_in_transaction(
+        &self,
+        shard: usize,
+        writes: &[(&str, &BackendWrite)],
+    ) -> Vec<Result<(), BackendError>> {
+        let client = &self.clients[shard];
+        let committed: Result<(), BackendError> = async {
+            client
+                .batch_execute("BEGIN")
+                .await
+                .map_err(|error| BackendError::Query(error.to_string()))?;
+            let results = futures_util::future::join_all(
+                writes.iter().map(|(aor, write)| write.apply(self, aor)),
+            )
+            .await;
+            if let Some(error) = results.into_iter().find_map(Result::err) {
+                let _ = client.batch_execute("ROLLBACK").await;
+                return Err(error);
+            }
+            client
+                .batch_execute("COMMIT")
+                .await
+                .map_err(|error| BackendError::Query(error.to_string()))
+        }
+        .await;
+        match committed {
+            Ok(()) => writes.iter().map(|_| Ok(())).collect(),
+            Err(error) => {
+                tracing::debug!(%error, "registrar batch transaction failed; applying its writes one by one");
+                futures_util::future::join_all(
+                    writes.iter().map(|(aor, write)| write.apply(self, aor)),
+                )
+                .await
+            }
         }
     }
 }
@@ -398,6 +450,41 @@ impl RegistrarBackend for PostgresBackend {
                 .map_err(|error| BackendError::Query(error.to_string()))?;
         }
         Ok(purged as usize)
+    }
+
+    /// One transaction per shard instead of one commit per statement: with
+    /// autocommit the server flushes its WAL for every statement, which held a
+    /// single connection to a few hundred writes a second however well they
+    /// were pipelined.
+    async fn apply_batch(&self, writes: &[(&str, &BackendWrite)]) -> Vec<Result<(), BackendError>> {
+        let mut by_shard: Vec<ShardWrites<'_>> = (0..self.clients.len())
+            .map(|_| Default::default())
+            .collect();
+        for (position, write) in writes.iter().enumerate() {
+            let (positions, shard_writes) = &mut by_shard[self.shard_of(write.0)];
+            positions.push(position);
+            shard_writes.push(*write);
+        }
+        let shard_results = futures_util::future::join_all(
+            by_shard
+                .iter()
+                .enumerate()
+                .filter(|(_, (positions, _))| !positions.is_empty())
+                .map(|(shard, (positions, shard_writes))| async move {
+                    (
+                        positions,
+                        self.apply_in_transaction(shard, shard_writes).await,
+                    )
+                }),
+        )
+        .await;
+        let mut results: Vec<Result<(), BackendError>> = writes.iter().map(|_| Ok(())).collect();
+        for (positions, outcomes) in shard_results {
+            for (&position, outcome) in positions.iter().zip(outcomes) {
+                results[position] = outcome;
+            }
+        }
+        results
     }
 
     async fn all_aor_state_aors(&self) -> Result<Vec<String>, BackendError> {
