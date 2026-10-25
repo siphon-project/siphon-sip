@@ -1,5 +1,6 @@
-//! The registrar's write-through path: a pending map of the latest desired
-//! backend state per key, drained in concurrent batches by one writer task.
+//! The registrar's write-through path: the latest desired backend state per
+//! key, held in a [`coalesce`](super::coalesce) queue and drained in
+//! concurrent batches by one writer task.
 //!
 //! Split out of `backend.rs` (which is at its size budget) as the piece with a
 //! lifetime of its own: everything here is about getting the SIP path's writes
@@ -14,53 +15,29 @@
 //! binding rows and the `associated_uris` of the state row. So only the latest
 //! write to a key matters, and a newer one replaces an older one still waiting.
 //!
-//! That is what bounds the path. A FIFO queue grows with the write *rate*, so a
-//! burst (a restart evicting thousands of restored bindings) or an outage (every
-//! operation burning its timeout) had to either grow without limit or drop, and
-//! it dropped: deletes that never landed came back at the next restore. The
-//! pending map grows with the number of distinct keys written since the last
-//! drain, which the registrar itself bounds (two per AoR), so it never drops a
-//! write and never needs a cap. A write the backend refuses stays pending and is
-//! retried with backoff.
+//! "Latest" is the snapshot's order, not the order writes reach the queue: the
+//! registrar takes a [`WriteSequence`] while it holds the AoR's entry, so a save
+//! descheduled between its snapshot and its enqueue cannot land after a newer
+//! one.
 //!
-//! [`BackendWriter`]'s methods never wait: they take one short lock to replace
-//! a map entry, so they are safe from a thread attached to the interpreter and
-//! from a tokio worker.
+//! [`BackendWriter`]'s methods never wait, so they are safe from a thread
+//! attached to the interpreter and from a tokio worker.
 
-use std::collections::hash_map::Entry;
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
-use tokio::sync::{mpsc, oneshot, Notify};
+use tokio::sync::{mpsc, oneshot};
 
-use super::{BackendError, RegistrarBackend, StoredAorState, StoredContact};
+use super::coalesce::{self, DrainEvent, Drainer, QueueHandle, QueueKind, QueuedWrite, WriteSink};
+use super::{BackendError, RegistrarBackend, StoredAorState, StoredContact, WriteSequence};
+
+#[cfg(test)]
+use super::coalesce::EnqueueHook;
 
 /// How many `count_aors` reads may wait for the writer at once before a new
 /// one fails instead of queueing. Reads are rare (a script asking for the
 /// distributed count); the bound only keeps a stuck backend from collecting
 /// callers.
 const READ_QUEUE_CAPACITY: usize = 64;
-
-/// How many writes the writer has in flight against the backend at once.
-///
-/// Both backends pipeline concurrent operations on one connection (the Redis
-/// multiplexed connection, the tokio-postgres client), so a batch costs about
-/// one round trip rather than one per write. During an outage a batch costs at
-/// most one operation timeout, because the writer stops at the first batch in
-/// which nothing succeeds.
-const WRITE_CONCURRENCY: usize = 128;
-
-/// First retry delay after the backend refuses writes.
-const INITIAL_BACKOFF: Duration = Duration::from_millis(100);
-
-/// Longest retry delay: how stale the backend can get after it recovers.
-const MAX_BACKOFF: Duration = Duration::from_secs(5);
-
-/// A drained backlog keeping more slots than this gives them back, so the
-/// table a restart burst grew does not stay at its peak for the process's life.
-const BACKLOG_RETAINED_CAPACITY: usize = 1024;
 
 /// How long [`BackendWriter::count_aors`] waits for its answer.
 ///
@@ -89,7 +66,21 @@ enum Keyspace {
     State,
 }
 
-type WriteKey = (Keyspace, String);
+/// One backend key: an AoR's binding set or its auxiliary state.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct WriteKey {
+    keyspace: Keyspace,
+    aor: String,
+}
+
+impl std::fmt::Display for WriteKey {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.keyspace {
+            Keyspace::Bindings => formatter.write_str(&self.aor),
+            Keyspace::State => write!(formatter, "state:{}", self.aor),
+        }
+    }
+}
 
 /// One write-through: the desired backend state of one of an AoR's keys,
 /// applied as a full replacement of that key.
@@ -113,16 +104,6 @@ impl BackendWrite {
         }
     }
 
-    /// The label this write is counted under.
-    fn label(&self) -> &'static str {
-        match self {
-            Self::Save(_) => "save",
-            Self::Remove => "remove",
-            Self::SaveState(_) => "save_aor_state",
-            Self::RemoveState => "remove_aor_state",
-        }
-    }
-
     /// Apply this write to `backend` for `aor` with the matching trait method.
     pub async fn apply<B: RegistrarBackend + ?Sized>(
         &self,
@@ -138,40 +119,27 @@ impl BackendWrite {
     }
 }
 
-#[derive(Debug)]
-struct PendingWrite {
-    op: BackendWrite,
-    /// When this key's backend copy first fell behind: kept when a newer write
-    /// replaces the op, so the age gauge reports staleness, not churn.
-    since: Instant,
+impl QueuedWrite for BackendWrite {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Save(_) => "save",
+            Self::Remove => "remove",
+            Self::SaveState(_) => "save_aor_state",
+            Self::RemoveState => "remove_aor_state",
+        }
+    }
 }
 
-#[derive(Debug, Default)]
-struct PendingWrites {
-    writes: HashMap<WriteKey, PendingWrite>,
-    /// The earliest `since` in `writes`, so the age gauge needs no scan.
-    oldest: Option<Instant>,
-}
-
-/// What the SIP path and the writer task share.
-#[derive(Debug, Default)]
-struct Shared {
-    pending: Mutex<PendingWrites>,
-    /// Signalled on every write; a write landing while the writer is busy
-    /// leaves a permit, so it is never missed.
-    wake: Notify,
-    /// Writes the writer task has taken out of `pending` and not yet applied.
-    held: AtomicUsize,
-    /// The writer task is gone: nothing will apply a new write.
-    closed: AtomicBool,
-}
-
-impl Shared {
-    /// The pending map. A panic while it was held cannot leave it torn (every
-    /// critical section is one map operation), so poisoning is ignored rather
-    /// than turned into a lost write.
-    fn pending(&self) -> MutexGuard<'_, PendingWrites> {
-        self.pending.lock().unwrap_or_else(PoisonError::into_inner)
+impl<B: RegistrarBackend> WriteSink<WriteKey, BackendWrite> for B {
+    async fn apply_batch(
+        &self,
+        writes: &[(&WriteKey, &BackendWrite)],
+    ) -> Vec<Result<(), BackendError>> {
+        let writes: Vec<(&str, &BackendWrite)> = writes
+            .iter()
+            .map(|(key, write)| (key.aor.as_str(), *write))
+            .collect();
+        RegistrarBackend::apply_batch(self, &writes).await
     }
 }
 
@@ -192,108 +160,95 @@ struct CountRequest {
 /// writer task and propagate backend errors to the caller.
 #[derive(Debug, Clone)]
 pub struct BackendWriter {
-    shared: Arc<Shared>,
+    queue: QueueHandle<WriteKey, BackendWrite>,
     reads: mpsc::Sender<CountRequest>,
     /// Records every write instead of applying it ([`recording_writer`]).
     #[cfg(test)]
-    record: Option<Arc<Mutex<Vec<String>>>>,
+    record: Option<std::sync::Arc<std::sync::Mutex<Vec<String>>>>,
 }
 
 impl BackendWriter {
-    fn new(shared: Arc<Shared>, reads: mpsc::Sender<CountRequest>) -> Self {
+    fn new(queue: QueueHandle<WriteKey, BackendWrite>, reads: mpsc::Sender<CountRequest>) -> Self {
         Self {
-            shared,
+            queue,
             reads,
             #[cfg(test)]
             record: None,
         }
     }
 
-    /// Make `op` the desired backend state of its key for `aor`.
-    ///
-    /// Never waits and never drops for lack of room: a write to a key that is
-    /// already pending replaces the older one, which is correct because each
-    /// is the key's full state. Only a writer task that is gone loses a write,
-    /// and that is counted and logged.
-    fn enqueue(&self, aor: &str, op: BackendWrite) {
+    /// The order of a snapshot about to be written. Take it while holding the
+    /// lock that orders the state being snapshotted (the AoR's entry), and
+    /// pass it to the `*_at` method that writes the snapshot.
+    pub fn sequence(&self) -> WriteSequence {
+        self.queue.sequence()
+    }
+
+    fn enqueue(&self, aor: &str, write: BackendWrite, sequence: WriteSequence) {
         #[cfg(test)]
         if let Some(record) = &self.record {
             record
                 .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .push(describe(aor, &op));
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(describe(aor, &write));
             return;
         }
-        let label = op.label();
-        if self.shared.closed.load(Ordering::Acquire) {
-            tracing::warn!(
-                command = label,
-                aor,
-                "registrar backend writer task is gone; dropping the write — \
-                 this binding will not survive a restart"
-            );
-            if let Some(metrics) = crate::metrics::try_metrics() {
-                metrics
-                    .registrar_backend_dropped_total
-                    .with_label_values(&[label, "closed"])
-                    .inc();
-            }
-            return;
-        }
-        let key = (op.keyspace(), aor.to_string());
-        let now = Instant::now();
-        let (depth, replaced) = {
-            let mut pending = self.shared.pending();
-            let replaced = match pending.writes.entry(key) {
-                Entry::Occupied(mut entry) => {
-                    entry.get_mut().op = op;
-                    true
-                }
-                Entry::Vacant(entry) => {
-                    entry.insert(PendingWrite { op, since: now });
-                    false
-                }
-            };
-            pending.oldest.get_or_insert(now);
-            (pending.writes.len(), replaced)
+        let key = WriteKey {
+            keyspace: write.keyspace(),
+            aor: aor.to_string(),
         };
-        self.shared.wake.notify_one();
-        if let Some(metrics) = crate::metrics::try_metrics() {
-            if replaced {
-                metrics.registrar_backend_coalesced_total.inc();
-            }
-            let held = self.shared.held.load(Ordering::Relaxed);
-            metrics
-                .registrar_backend_queue_depth
-                .set(depth.saturating_add(held) as i64);
-        }
+        self.queue.enqueue(key, aor, write, sequence);
     }
 
     /// Keys whose latest write has not been applied yet, waiting or in flight.
     #[cfg(test)]
     pub(crate) fn pending_writes(&self) -> usize {
-        self.shared.pending().writes.len() + self.shared.held.load(Ordering::SeqCst)
+        self.queue.pending_writes()
     }
 
-    /// Replace the AoR's backend binding set with `contacts`.
+    /// Replace the AoR's backend binding set with `contacts`, ordered as of
+    /// now. A caller racing other writers to the AoR uses [`save_at`].
+    ///
+    /// [`save_at`]: Self::save_at
     pub fn save(&self, aor: &str, contacts: Vec<StoredContact>) {
-        self.enqueue(aor, BackendWrite::Save(contacts));
+        self.save_at(aor, contacts, self.sequence());
     }
 
-    /// Remove the AoR's backend binding set.
+    /// Replace the AoR's backend binding set with `contacts`, a snapshot taken
+    /// at `sequence`. An older snapshot never replaces a newer one.
+    pub fn save_at(&self, aor: &str, contacts: Vec<StoredContact>, sequence: WriteSequence) {
+        self.enqueue(aor, BackendWrite::Save(contacts), sequence);
+    }
+
+    /// Remove the AoR's backend binding set, ordered as of now.
     pub fn remove(&self, aor: &str) {
-        self.enqueue(aor, BackendWrite::Remove);
+        self.remove_at(aor, self.sequence());
+    }
+
+    /// Remove the AoR's backend binding set, a removal decided at `sequence`.
+    pub fn remove_at(&self, aor: &str, sequence: WriteSequence) {
+        self.enqueue(aor, BackendWrite::Remove, sequence);
     }
 
     /// Replace the AoR's auxiliary state (Service-Route, P-Asserted-Identity,
-    /// P-Associated-URI). An empty state removes the entry.
+    /// P-Associated-URI), ordered as of now. An empty state removes the entry.
     pub fn save_aor_state(&self, aor: &str, state: StoredAorState) {
-        self.enqueue(aor, BackendWrite::SaveState(state));
+        self.save_aor_state_at(aor, state, self.sequence());
     }
 
-    /// Remove the AoR's auxiliary state.
+    /// Replace the AoR's auxiliary state with a snapshot taken at `sequence`.
+    pub fn save_aor_state_at(&self, aor: &str, state: StoredAorState, sequence: WriteSequence) {
+        self.enqueue(aor, BackendWrite::SaveState(state), sequence);
+    }
+
+    /// Remove the AoR's auxiliary state, ordered as of now.
     pub fn remove_aor_state(&self, aor: &str) {
-        self.enqueue(aor, BackendWrite::RemoveState);
+        self.remove_aor_state_at(aor, self.sequence());
+    }
+
+    /// Remove the AoR's auxiliary state, a removal decided at `sequence`.
+    pub fn remove_aor_state_at(&self, aor: &str, sequence: WriteSequence) {
+        self.enqueue(aor, BackendWrite::RemoveState, sequence);
     }
 
     /// Ask the backend for the current number of registered AoRs.
@@ -352,25 +307,35 @@ impl BackendWriter {
 /// Returns a [`BackendWriter`] handle that can be cloned into the Registrar.
 /// The task runs until every handle is dropped.
 pub fn spawn_backend_writer<B: RegistrarBackend + 'static>(backend: B) -> BackendWriter {
-    let shared = Arc::new(Shared::default());
+    let (queue, drainer) = coalesce::queue(QueueKind::Registrar);
     let (reads, read_queue) = mpsc::channel(READ_QUEUE_CAPACITY);
-    let task = WriterTask {
-        backend,
-        shared: Arc::clone(&shared),
-        reads: read_queue,
-        backlog: HashMap::new(),
-        backoff: INITIAL_BACKOFF,
-        retry_at: None,
-    };
-    tokio::spawn(task.run());
-    BackendWriter::new(shared, reads)
+    tokio::spawn(
+        WriterTask {
+            backend,
+            drainer,
+            reads: read_queue,
+        }
+        .run(),
+    );
+    BackendWriter::new(queue, reads)
+}
+
+/// [`spawn_backend_writer`] with `hook` run at the start of every enqueue.
+#[cfg(test)]
+pub(crate) fn spawn_backend_writer_with_hook<B: RegistrarBackend + 'static>(
+    backend: B,
+    hook: EnqueueHook,
+) -> BackendWriter {
+    let writer = spawn_backend_writer(backend);
+    writer.queue.set_hook(hook);
+    writer
 }
 
 /// One write as a line, the operation, the AoR, and for a save the stored
 /// contact URIs in stored order.
 #[cfg(test)]
-fn describe(aor: &str, op: &BackendWrite) -> String {
-    match op {
+fn describe(aor: &str, write: &BackendWrite) -> String {
+    match write {
         BackendWrite::Save(contacts) => {
             let uris: Vec<&str> = contacts
                 .iter()
@@ -388,15 +353,17 @@ fn describe(aor: &str, op: &BackendWrite) -> String {
 /// exactly which write-throughs a registrar operation issued, and in what order.
 #[cfg(test)]
 pub(crate) fn recording_writer() -> (BackendWriter, RecordedWrites) {
+    let (queue, drainer) = coalesce::queue(QueueKind::Registrar);
     let (reads, read_queue) = mpsc::channel(READ_QUEUE_CAPACITY);
-    let record = Arc::new(Mutex::new(Vec::new()));
-    let mut writer = BackendWriter::new(Arc::new(Shared::default()), reads);
-    writer.record = Some(Arc::clone(&record));
+    let record = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut writer = BackendWriter::new(queue, reads);
+    writer.record = Some(std::sync::Arc::clone(&record));
     (
         writer,
         RecordedWrites {
             record,
             _reads: read_queue,
+            _drainer: drainer,
         },
     )
 }
@@ -405,8 +372,9 @@ pub(crate) fn recording_writer() -> (BackendWriter, RecordedWrites) {
 /// open (nothing answers it); dropping it closes the writer.
 #[cfg(test)]
 pub(crate) struct RecordedWrites {
-    record: Arc<Mutex<Vec<String>>>,
+    record: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     _reads: mpsc::Receiver<CountRequest>,
+    _drainer: Drainer<WriteKey, BackendWrite>,
 }
 
 #[cfg(test)]
@@ -414,31 +382,27 @@ impl RecordedWrites {
     /// Every write issued since the last drain, one line each (see
     /// [`describe`]).
     pub(crate) fn drain(&mut self) -> Vec<String> {
-        std::mem::take(&mut *self.record.lock().unwrap_or_else(PoisonError::into_inner))
+        std::mem::take(
+            &mut *self
+                .record
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
     }
 }
 
 /// The writer task's state.
 struct WriterTask<B> {
     backend: B,
-    shared: Arc<Shared>,
+    drainer: Drainer<WriteKey, BackendWrite>,
     reads: mpsc::Receiver<CountRequest>,
-    /// Writes taken out of the shared map and not yet applied. Only this task
-    /// touches it, so the SIP path's lock is held for a swap, never for a
-    /// backend round trip.
-    backlog: HashMap<WriteKey, PendingWrite>,
-    /// The delay before the next retry, doubled per failed attempt.
-    backoff: Duration,
-    /// Set while backing off: when the next attempt is due.
-    retry_at: Option<tokio::time::Instant>,
 }
 
 /// What woke the writer task.
 enum Wake {
     Read(Option<CountRequest>),
     Purge,
-    Retry,
-    Write,
+    Drain(DrainEvent),
 }
 
 impl<B: RegistrarBackend> WriterTask<B> {
@@ -446,159 +410,29 @@ impl<B: RegistrarBackend> WriterTask<B> {
         let mut purge =
             tokio::time::interval_at(tokio::time::Instant::now() + PURGE_INTERVAL, PURGE_INTERVAL);
         purge.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        let shared = Arc::clone(&self.shared);
         loop {
-            self.attempt().await;
-            self.publish();
+            self.drainer.attempt(&self.backend).await;
             // Reads and the purge first, so a steady stream of writes cannot
             // starve them; a read drains the pending writes itself.
-            let retry_at = self.retry_at;
             let wake = tokio::select! {
                 biased;
                 read = self.reads.recv() => Wake::Read(read),
                 _ = purge.tick() => Wake::Purge,
-                _ = sleep_until(retry_at), if retry_at.is_some() => Wake::Retry,
-                _ = shared.wake.notified(), if retry_at.is_none() => Wake::Write,
+                event = self.drainer.next_event() => Wake::Drain(event),
             };
             match wake {
                 Wake::Read(Some(request)) => {
-                    self.attempt().await;
+                    self.drainer.attempt(&self.backend).await;
                     self.answer(request).await;
                 }
                 // Every handle is gone: nothing more can be written.
-                Wake::Read(None) => break,
+                Wake::Read(None) | Wake::Drain(DrainEvent::Closed) => break,
                 // On the same task as the writes, so a purge never races one.
                 Wake::Purge => self.purge().await,
-                Wake::Retry => self.retry_at = None,
-                Wake::Write => {}
+                Wake::Drain(DrainEvent::Write | DrainEvent::Retry) => {}
             }
         }
-        self.retry_at = None;
-        self.attempt().await;
-    }
-
-    /// Apply everything pending, unless a retry is not due yet. A failure
-    /// keeps the writes and schedules the retry.
-    async fn attempt(&mut self) {
-        if self.retry_at.is_some() {
-            return;
-        }
-        match self.flush().await {
-            Ok(()) => self.backoff = INITIAL_BACKOFF,
-            Err(error) => {
-                tracing::warn!(
-                    %error,
-                    pending = self.backlog.len(),
-                    retry_in_ms = self.backoff.as_millis() as u64,
-                    "registrar backend write-through failed; keeping the writes and retrying"
-                );
-                self.retry_at = Some(tokio::time::Instant::now() + self.backoff);
-                self.backoff = (self.backoff * 2).min(MAX_BACKOFF);
-            }
-        }
-    }
-
-    /// Move the shared map's writes into the backlog, a newer write replacing
-    /// the op of an older one for the same key.
-    fn absorb(&mut self) {
-        let taken = {
-            let mut pending = self.shared.pending();
-            pending.oldest = None;
-            std::mem::take(&mut pending.writes)
-        };
-        if self.backlog.is_empty() {
-            self.backlog = taken;
-        } else {
-            for (key, write) in taken {
-                match self.backlog.entry(key) {
-                    Entry::Occupied(mut entry) => entry.get_mut().op = write.op,
-                    Entry::Vacant(entry) => {
-                        entry.insert(write);
-                    }
-                }
-            }
-        }
-        self.shared.held.store(self.backlog.len(), Ordering::SeqCst);
-    }
-
-    /// Apply the backlog in concurrent batches.
-    ///
-    /// A write the backend refuses goes back in the backlog for the next
-    /// attempt, and the attempt reports the error. A batch in which nothing
-    /// succeeded means the backend is down, so the attempt stops there rather
-    /// than spend an operation timeout on every remaining batch; a batch in
-    /// which some writes succeeded means the backend is up and those keys are
-    /// the problem, so the rest of the backlog still goes.
-    async fn flush(&mut self) -> Result<(), BackendError> {
-        self.absorb();
-        let mut refused = Vec::new();
-        let mut last_error = None;
-        while !self.backlog.is_empty() {
-            let keys: Vec<WriteKey> = self
-                .backlog
-                .keys()
-                .take(WRITE_CONCURRENCY)
-                .cloned()
-                .collect();
-            let batch: Vec<(WriteKey, PendingWrite)> = keys
-                .iter()
-                .filter_map(|key| self.backlog.remove_entry(key))
-                .collect();
-            let writes: Vec<(&str, &BackendWrite)> = batch
-                .iter()
-                .map(|((_, aor), write)| (aor.as_str(), &write.op))
-                .collect();
-            let mut results = self.backend.apply_batch(&writes).await;
-            drop(writes);
-            // A backend that answered for fewer writes than it was given has
-            // not applied the rest: they stay pending.
-            results.resize_with(batch.len(), || {
-                Err(BackendError::Query(
-                    "the backend returned no result for this write".to_string(),
-                ))
-            });
-            let mut succeeded = 0usize;
-            for ((key, write), result) in batch.into_iter().zip(results) {
-                match result {
-                    Ok(()) => succeeded += 1,
-                    // Retrying an encoding failure fails the same way forever.
-                    Err(BackendError::Serialization(error)) => {
-                        let label = write.op.label();
-                        tracing::error!(
-                            aor = key.1,
-                            command = label,
-                            %error,
-                            "registrar backend cannot encode the write; dropping it"
-                        );
-                        if let Some(metrics) = crate::metrics::try_metrics() {
-                            metrics
-                                .registrar_backend_dropped_total
-                                .with_label_values(&[label, "unencodable"])
-                                .inc();
-                        }
-                    }
-                    Err(error) => {
-                        refused.push((key, write));
-                        last_error = Some(error);
-                    }
-                }
-            }
-            self.shared
-                .held
-                .store(self.backlog.len() + refused.len(), Ordering::SeqCst);
-            if succeeded == 0 && last_error.is_some() {
-                break;
-            }
-        }
-        // Not re-tried in this attempt (they would fail the same way at once);
-        // nothing newer for these keys can be in the backlog, which has not
-        // absorbed since they were taken out of it.
-        self.backlog.extend(refused);
-        if self.backlog.is_empty() && self.backlog.capacity() > BACKLOG_RETAINED_CAPACITY {
-            self.backlog = HashMap::new();
-        }
-        self.shared.held.store(self.backlog.len(), Ordering::SeqCst);
-        last_error.map_or(Ok(()), Err)
+        self.drainer.finish(&self.backend).await;
     }
 
     async fn answer(&self, request: CountRequest) {
@@ -624,84 +458,34 @@ impl<B: RegistrarBackend> WriterTask<B> {
             }
         }
     }
-
-    /// The pending count and the age of the oldest pending write.
-    fn publish(&self) {
-        let Some(metrics) = crate::metrics::try_metrics() else {
-            return;
-        };
-        let (waiting, shared_oldest) = {
-            let pending = self.shared.pending();
-            (pending.writes.len(), pending.oldest)
-        };
-        // A scan, but of a backlog that is empty unless the backend is
-        // refusing writes, and then at most once per retry.
-        let oldest = self
-            .backlog
-            .values()
-            .map(|write| write.since)
-            .chain(shared_oldest)
-            .min();
-        metrics
-            .registrar_backend_queue_depth
-            .set(waiting.saturating_add(self.backlog.len()) as i64);
-        metrics
-            .registrar_backend_oldest_pending_seconds
-            .set(oldest.map_or(0, |since| since.elapsed().as_secs()) as i64);
-    }
-}
-
-impl<B> Drop for WriterTask<B> {
-    /// However the task ends (every handle dropped, a panic, the runtime
-    /// shutting down), later writes are refused loudly rather than left in a
-    /// map nobody drains, and what was still pending is counted as lost.
-    fn drop(&mut self) {
-        self.shared.closed.store(true, Ordering::Release);
-        let left = std::mem::take(&mut self.shared.pending().writes);
-        let lost = left.len() + self.backlog.len();
-        self.shared.held.store(0, Ordering::SeqCst);
-        if lost == 0 {
-            return;
-        }
-        tracing::error!(
-            lost,
-            "registrar backend writer stopped with write-throughs not applied; \
-             these bindings will not match the backend after a restart"
-        );
-        if let Some(metrics) = crate::metrics::try_metrics() {
-            for write in left.values().chain(self.backlog.values()) {
-                metrics
-                    .registrar_backend_dropped_total
-                    .with_label_values(&[write.op.label(), "closed"])
-                    .inc();
-            }
-            metrics.registrar_backend_queue_depth.set(0);
-        }
-        self.backlog.clear();
-    }
-}
-
-/// Sleep until `deadline`, or forever without one (its `select!` branch is
-/// disabled then, so this is never polled).
-async fn sleep_until(deadline: Option<tokio::time::Instant>) {
-    match deadline {
-        Some(deadline) => tokio::time::sleep_until(deadline).await,
-        None => std::future::pending().await,
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// A writer with no task behind it: writes stay pending, reads stay
-    /// queued in a queue of `read_capacity`.
-    fn idle_writer(read_capacity: usize) -> (BackendWriter, mpsc::Receiver<CountRequest>) {
+    /// A writer with no task behind it: writes stay pending (the drainer is
+    /// held, never run), reads stay queued in a queue of `read_capacity`.
+    fn idle_writer(
+        read_capacity: usize,
+    ) -> (
+        BackendWriter,
+        Drainer<WriteKey, BackendWrite>,
+        mpsc::Receiver<CountRequest>,
+    ) {
+        let (queue, drainer) = coalesce::queue(QueueKind::Registrar);
         let (reads, read_queue) = mpsc::channel(read_capacity);
-        (
-            BackendWriter::new(Arc::new(Shared::default()), reads),
-            read_queue,
-        )
+        (BackendWriter::new(queue, reads), drainer, read_queue)
+    }
+
+    fn pending_bindings(writer: &BackendWriter, aor: &str) -> Option<String> {
+        let key = WriteKey {
+            keyspace: Keyspace::Bindings,
+            aor: aor.to_string(),
+        };
+        writer
+            .queue
+            .inspect(&key, |write| write.map(|write| describe(aor, write)))
     }
 
     /// The point of the pending map. A backend that is not draining makes
@@ -709,7 +493,7 @@ mod tests {
     /// many writes that key has had: memory follows the AoRs, not the rate.
     #[tokio::test]
     async fn writes_nobody_drains_coalesce_per_key_rather_than_drop() {
-        let (writer, _reads) = idle_writer(1);
+        let (writer, _drainer, _reads) = idle_writer(1);
 
         for _ in 0..10_000 {
             writer.save("sip:a@example.com", Vec::new());
@@ -720,21 +504,34 @@ mod tests {
         writer.remove_aor_state("sip:c@example.com");
 
         assert_eq!(writer.pending_writes(), 4);
-        let pending = writer.shared.pending();
-        assert!(matches!(
-            pending
-                .writes
-                .get(&(Keyspace::Bindings, "sip:b@example.com".to_string()))
-                .map(|write| &write.op),
-            Some(BackendWrite::Remove)
-        ));
+        assert_eq!(
+            pending_bindings(&writer, "sip:b@example.com").as_deref(),
+            Some("remove sip:b@example.com")
+        );
+    }
+
+    /// The snapshot's order decides, not the order writes reach the queue: a
+    /// snapshot taken earlier and enqueued later never replaces a newer one.
+    #[tokio::test]
+    async fn an_older_snapshot_enqueued_later_does_not_replace_a_newer_one() {
+        let (writer, _drainer, _reads) = idle_writer(1);
+        let older = writer.sequence();
+        let newer = writer.sequence();
+
+        writer.remove_at("sip:a@example.com", newer);
+        writer.save_at("sip:a@example.com", Vec::new(), older);
+
+        assert_eq!(
+            pending_bindings(&writer, "sip:a@example.com").as_deref(),
+            Some("remove sip:a@example.com")
+        );
     }
 
     /// A read behind a full read queue fails immediately with a reason.
     /// Awaiting room would reintroduce the unbounded wait the deadline removes.
     #[tokio::test]
     async fn count_aors_on_a_full_read_queue_fails_instead_of_waiting() {
-        let (writer, _reads) = idle_writer(1);
+        let (writer, _drainer, _reads) = idle_writer(1);
         let (reply, _answer) = oneshot::channel();
         writer
             .reads
@@ -821,18 +618,9 @@ mod tests {
     /// map nothing will ever drain.
     #[tokio::test]
     async fn a_writer_whose_task_ended_holds_nothing() {
-        let shared = Arc::new(Shared::default());
-        let (reads, read_queue) = mpsc::channel(1);
-        let writer = BackendWriter::new(Arc::clone(&shared), reads);
+        let (writer, drainer, _reads) = idle_writer(1);
         writer.save("sip:before@example.com", Vec::new());
-        drop(WriterTask {
-            backend: crate::registrar::backend::MemoryBackend::new(),
-            shared,
-            reads: read_queue,
-            backlog: HashMap::new(),
-            backoff: INITIAL_BACKOFF,
-            retry_at: None,
-        });
+        drop(drainer);
 
         writer.save("sip:after@example.com", Vec::new());
 

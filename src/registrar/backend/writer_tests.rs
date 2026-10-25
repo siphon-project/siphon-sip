@@ -156,8 +156,13 @@ async fn divergence<B: RegistrarBackend>(store: &B, registrar: &Registrar) -> Op
             .keys()
             .filter(|aor| !memory.contains_key(*aor))
             .count();
+        let differing = memory
+            .iter()
+            .find(|(aor, uris)| stored.get(*aor).is_some_and(|held| held != *uris))
+            .map(|(aor, uris)| format!("; {aor}: {uris:?} in memory, {:?} stored", stored[aor]))
+            .unwrap_or_default();
         return Some(format!(
-            "bindings: {} in memory, {} in the backend ({missing} missing, {extra} extra)",
+            "bindings: {} in memory, {} in the backend ({missing} missing, {extra} extra){differing}",
             memory.len(),
             stored.len()
         ));
@@ -529,4 +534,63 @@ async fn an_eviction_burst_through_the_writer_reaches_postgres_in_full() {
         ))
         .await
         .expect("drop test tables");
+}
+
+/// Two saves of one AoR race: the first takes its snapshot under the AoR's
+/// lock, then is held up before its write reaches the writer, while the second
+/// takes a newer snapshot and gets its write in first. The older snapshot must
+/// not end up in the backend, whether it arrives while the newer write still
+/// waits or after the newer write was applied.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_save_overtaken_before_its_write_is_queued_never_lands_last() {
+    const RACED: &str = "sip:001010000000077@ims.example.com";
+    for newer_applied_first in [false, true] {
+        let store = Arc::new(MemoryBackend::new());
+        let (arrived, arrival) = std::sync::mpsc::channel::<()>();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let arrived = std::sync::Mutex::new(arrived);
+        let released = std::sync::Mutex::new(released);
+        let held_once = AtomicBool::new(false);
+        let hook = EnqueueHook(Arc::new(move || {
+            if std::thread::current().name() == Some("overtaken")
+                && !held_once.swap(true, Ordering::SeqCst)
+            {
+                let _ = arrived.lock().expect("arrived").send(());
+                let _ = released.lock().expect("released").recv();
+            }
+        }));
+        let registrar = Arc::new(Registrar::default());
+        registrar.set_backend_writer(spawn_backend_writer_with_hook(
+            SlowBackend::new(Arc::clone(&store), Duration::ZERO),
+            hook,
+        ));
+
+        let overtaken = std::thread::Builder::new()
+            .name("overtaken".to_string())
+            .spawn({
+                let registrar = Arc::clone(&registrar);
+                move || save(&registrar, RACED, "198.51.100.71")
+            })
+            .expect("spawn");
+        arrival.recv().expect("the first save took its snapshot");
+        save(&registrar, RACED, "198.51.100.72");
+        if newer_applied_first {
+            for _ in 0..500 {
+                if store.load(RACED).await.expect("load").len() == 2 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert_eq!(store.load(RACED).await.expect("load").len(), 2);
+        }
+        release.send(()).expect("release");
+        overtaken.join().expect("the first save");
+
+        assert_eq!(registrar.lookup_all(RACED).len(), 2);
+        // Give a stale write the time to land if it is going to.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        if let Some(divergence) = divergence(&*store, &registrar).await {
+            panic!("newer applied first: {newer_applied_first}: {divergence}");
+        }
+    }
 }

@@ -179,6 +179,10 @@ impl Registrar {
         self.contact_index
             .replace(&key, indexed, self.contact_index.keys_of(&contacts));
 
+        // Taken under the entry, so these writes order against every other
+        // write of the AoR by when the list was decided, not by when they reach
+        // the writer.
+        let sequence = self.write_sequence();
         let replaced = match entry {
             Entry::Occupied(occupied) if contacts.is_empty() => Some(occupied.remove()),
             Entry::Occupied(mut occupied) => Some(occupied.insert(contacts)),
@@ -191,17 +195,15 @@ impl Registrar {
         };
 
         if force {
-            let cleared = if clears_this_list {
-                replaced
+            let (cleared, cleared_at) = if clears_this_list {
+                (replaced, sequence)
             } else {
-                self.bindings
-                    .remove(primary.as_str())
-                    .map(|(_, contacts)| contacts)
+                self.take_bindings(primary.as_str())
             };
-            self.release_cleared(&primary, cleared);
+            self.release_cleared(&primary, cleared, cleared_at);
         }
         for effect in effects {
-            self.carry_out(&key, effect);
+            self.carry_out(&key, effect, sequence);
         }
         Ok(())
     }
@@ -372,8 +374,9 @@ impl Registrar {
     }
 
     /// Carry out what one committed Contact owes, in the order a lone save
-    /// always did.
-    fn carry_out(&self, aor: &str, effect: Effect) {
+    /// always did. `sequence` was taken under the entry the change was
+    /// committed in.
+    fn carry_out(&self, aor: &str, effect: Effect, sequence: backend::WriteSequence) {
         match effect {
             Effect::Removed {
                 stale_tokens,
@@ -387,7 +390,7 @@ impl Registrar {
                 for id in &stale_connections {
                     self.deindex_connection(*id, aor);
                 }
-                self.persist_aor(aor, remaining);
+                self.persist_aor(aor, remaining, sequence);
                 if emptied {
                     // The last binding is gone, so the registration is over and
                     // its auxiliary state goes with it: service route, asserted
@@ -427,7 +430,7 @@ impl Registrar {
                     self.deindex_connection(*id, aor);
                 }
                 self.index_connection(connection_id, is_stream, aor);
-                self.persist_aor(aor, stored);
+                self.persist_aor(aor, stored, sequence);
                 if refreshed {
                     self.emit_event(RegistrationEvent::Refreshed {
                         aor: aor.to_string(),
@@ -445,8 +448,14 @@ impl Registrar {
     }
 
     /// The index, backend and auxiliary-state half of clearing an AoR, for
-    /// bindings already taken out of the map. Emits no change event.
-    pub(super) fn release_cleared(&self, aor: &str, contacts: Option<Vec<Contact>>) {
+    /// bindings already taken out of the map at `sequence`. Emits no change
+    /// event.
+    pub(super) fn release_cleared(
+        &self,
+        aor: &str,
+        contacts: Option<Vec<Contact>>,
+        sequence: backend::WriteSequence,
+    ) {
         if let Some(cleared) = &contacts {
             self.contact_index.remove_all(aor, cleared);
         }
@@ -461,7 +470,7 @@ impl Registrar {
             }
         }
         if let Some(writer) = self.backend_writer.get() {
-            writer.remove(aor);
+            writer.remove_at(aor, sequence);
         }
         self.drop_aor_state(aor);
     }
@@ -535,6 +544,7 @@ impl Registrar {
             .map(backend::StoredContact::from_contact)
             .collect();
         let emptied = contacts.is_empty();
+        let sequence = self.write_sequence();
         if emptied {
             entry.remove();
         } else {
@@ -549,6 +559,7 @@ impl Registrar {
                 remaining,
                 emptied,
             },
+            sequence,
         );
         true
     }

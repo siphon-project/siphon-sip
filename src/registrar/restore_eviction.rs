@@ -99,6 +99,7 @@ impl Registrar {
                 .map(backend::StoredContact::from_contact)
                 .collect();
             let emptied = entry.get().is_empty();
+            let sequence = self.write_sequence();
             if emptied {
                 entry.remove();
             } else {
@@ -113,7 +114,7 @@ impl Registrar {
             }
             let backend_emptied = backend_rows.is_empty();
             if own_rows_removed {
-                self.persist_aor(&aor, backend_rows);
+                self.persist_aor(&aor, backend_rows, sequence);
             }
             if emptied {
                 if own_rows_removed && backend_emptied {

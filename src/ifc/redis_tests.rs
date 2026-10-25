@@ -135,3 +135,83 @@ async fn the_restore_finds_every_profile_by_cursor() {
     assert_eq!(restored, (1500, 1500));
     assert!(store.has_profile("sip:user1499@example.com"));
 }
+
+/// A registration burst stores more profiles at once than the writer drains
+/// before the next arrives. Every one of them must reach Redis: a profile that
+/// does not is re-fetched from the HSS after a restart instead of restored,
+/// and a removal that does not leaves a profile its user no longer has.
+#[tokio::test]
+async fn a_burst_of_profile_writes_reaches_redis_in_full() {
+    let Some(mut connection) = connection().await else {
+        return;
+    };
+    const USERS: usize = 6_000;
+    let prefix = unique_prefix("burst");
+    let store = IfcStore::new(Vec::new());
+    store.set_backend_writer(spawn_ifc_backend_writer_with_ttl(
+        connection.clone(),
+        prefix.clone(),
+        600,
+    ));
+
+    // All of it before the writer task runs once: the test runtime has one
+    // thread and this loop never yields.
+    for user in 0..USERS {
+        store
+            .store_profile_xml(&format!("sip:user{user}@example.com"), PROFILE)
+            .expect("store");
+    }
+    for user in 0..USERS / 2 {
+        store.remove_profile(&format!("sip:user{user}@example.com"));
+    }
+
+    let expected: std::collections::BTreeSet<String> = (USERS / 2..USERS)
+        .map(|user| format!("{prefix}sip:user{user}@example.com"))
+        .collect();
+    let mut stored = std::collections::BTreeSet::new();
+    for _ in 0..250 {
+        stored = keys_under(&mut connection, &prefix).await;
+        if stored == expected {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    if !stored.is_empty() {
+        let _: () = redis::cmd("DEL")
+            .arg(stored.iter().collect::<Vec<_>>())
+            .query_async(&mut connection)
+            .await
+            .expect("clean up");
+    }
+    let missing = expected.difference(&stored).count();
+    let extra = stored.difference(&expected).count();
+    assert!(
+        missing == 0 && extra == 0,
+        "Redis disagrees with the store: {missing} profiles missing, {extra} removed ones left"
+    );
+}
+
+/// Every key under `prefix`, by cursor.
+async fn keys_under(
+    connection: &mut redis::aio::MultiplexedConnection,
+    prefix: &str,
+) -> std::collections::BTreeSet<String> {
+    let mut keys = std::collections::BTreeSet::new();
+    let mut cursor: u64 = 0;
+    loop {
+        let (next, batch): (u64, Vec<String>) = redis::cmd("SCAN")
+            .arg(cursor)
+            .arg("MATCH")
+            .arg(format!("{prefix}*"))
+            .arg("COUNT")
+            .arg(1000)
+            .query_async(connection)
+            .await
+            .expect("scan");
+        keys.extend(batch);
+        cursor = next;
+        if cursor == 0 {
+            return keys;
+        }
+    }
+}

@@ -282,6 +282,25 @@ entry, but a working config keeps working.
   (`unencodable`). `/admin/metrics.json` carries the two new values next to
   the old ones. `count_aors` now applies the pending writes before it counts,
   so the answer includes them.
+- **iFC profile writes to Redis are never dropped either.** The S-CSCF's iFC
+  write-through was a FIFO of 4096 commands that dropped the next one when
+  full, so a registration burst or a Redis outage lost profile stores (the
+  profile was re-fetched from the HSS after a restart) and removals (a
+  profile the user no longer has stayed until its TTL). It now goes through
+  the same per-key queue as the registrar's: latest write per AoR, retried
+  with backoff, nothing dropped.
+- **Two writes to one AoR racing each other no longer leave the backend one
+  write behind.** A registrar change takes its snapshot under the AoR's lock
+  and queues the write after letting go, so a REGISTER descheduled in between
+  could queue its older snapshot after a newer one and the backend kept the
+  older (the binding came back wrong at the next restore). Each snapshot now
+  carries a sequence taken under that lock, and the queue keeps the newest
+  whatever order the writes arrive in, including one arriving after the
+  newer write was already applied. The auxiliary state (Service-Route,
+  P-Asserted-Identity, P-Associated-URI) gets the same ordering, and the iFC
+  store orders its profile writes the same way. An AoR emptied by a
+  de-registration, an expiry sweep or a closed flow is now only removed from
+  memory if no save refilled it in the meantime.
 - **A TCP or TLS peer that stops accepting costs one connect timeout, not one
   per queued message.** Sends with no live connection queue per destination
   and ran in order, each paying its own 5 s connect timeout against a peer

@@ -685,23 +685,60 @@ impl Registrar {
     }
 
     /// Write-through an AoR's contacts to the backend (if configured).
-    fn persist_aor(&self, aor: &str, contacts: Vec<backend::StoredContact>) {
+    fn persist_aor(
+        &self,
+        aor: &str,
+        contacts: Vec<backend::StoredContact>,
+        sequence: backend::WriteSequence,
+    ) {
         if let Some(writer) = self.backend_writer.get() {
             if contacts.is_empty() {
-                writer.remove(aor);
+                writer.remove_at(aor, sequence);
             } else {
-                writer.save(aor, contacts);
+                writer.save_at(aor, contacts, sequence);
             }
+        }
+    }
+
+    /// The order of a backend snapshot of an AoR's bindings.
+    ///
+    /// Take it while holding the AoR's `bindings` entry (occupied or vacant),
+    /// the lock that orders every change to the list, and hand it to
+    /// [`persist_aor`](Self::persist_aor) with the snapshot taken under the same
+    /// entry. The writer then keeps the newest snapshot however the writes
+    /// race to it after the entry is released.
+    fn write_sequence(&self) -> backend::WriteSequence {
+        self.backend_writer
+            .get()
+            .map_or(backend::WriteSequence::OLDEST, |writer| writer.sequence())
+    }
+
+    /// Take an AoR's bindings out of the map, with the sequence of that
+    /// removal taken under the same entry.
+    fn take_bindings(&self, aor: &str) -> (Option<Vec<Contact>>, backend::WriteSequence) {
+        match self.bindings.entry(aor.to_string()) {
+            dashmap::mapref::entry::Entry::Occupied(entry) => {
+                let sequence = self.write_sequence();
+                (Some(entry.remove()), sequence)
+            }
+            dashmap::mapref::entry::Entry::Vacant(_vacant) => (None, self.write_sequence()),
         }
     }
 
     /// Snapshot the auxiliary maps for an AoR and write through to the
     /// backend.  Removes the backend entry when no auxiliary data remains.
+    ///
+    /// The auxiliary state lives in three maps with no lock over all of them,
+    /// so the order is: the caller changes the maps, then the sequence is
+    /// taken, then the maps are read. A snapshot read after a higher sequence
+    /// then sees every change made before a lower one, and the writer keeps the
+    /// highest, so the backend ends as the maps are.
     fn persist_aor_state(&self, aor: &str) {
         let writer = match self.backend_writer.get() {
             Some(writer) => writer,
             None => return,
         };
+        let sequence = writer.sequence();
         let state = backend::StoredAorState {
             service_routes: self
                 .service_routes
@@ -719,9 +756,9 @@ impl Registrar {
                 .unwrap_or_default(),
         };
         if state.is_empty() {
-            writer.remove_aor_state(aor);
+            writer.remove_aor_state_at(aor, sequence);
         } else {
-            writer.save_aor_state(aor, state);
+            writer.save_aor_state_at(aor, state, sequence);
         }
     }
 
@@ -733,9 +770,10 @@ impl Registrar {
         self.prune_aliases_to(aor);
         let removed = self.remove_aor_state_entries(aor);
         if removed {
-            if let Some(writer) = self.backend_writer.get() {
-                writer.remove_aor_state(aor);
-            }
+            // A snapshot, not a blind removal: a state write racing this one
+            // may already have put something back, and the backend must end
+            // with it.
+            self.persist_aor_state(aor);
         }
     }
 
@@ -921,9 +959,9 @@ impl Registrar {
         let aor = primary.as_str();
         // Capture flow tokens before dropping the AoR so the reverse index
         // doesn't strand entries pointing at gone bindings.
-        let removed = self.bindings.remove(aor);
+        let (removed, sequence) = self.take_bindings(aor);
         let had_bindings = removed.is_some();
-        if let Some((_, contacts)) = removed {
+        if let Some(contacts) = removed {
             self.contact_index.remove_all(aor, &contacts);
             for contact in contacts {
                 if let Some(token) = contact.flow_token {
@@ -937,7 +975,7 @@ impl Registrar {
             }
         }
         if let Some(writer) = self.backend_writer.get() {
-            writer.remove(aor);
+            writer.remove_at(aor, sequence);
         }
         self.drop_aor_state(aor);
         if had_bindings {
@@ -956,11 +994,8 @@ impl Registrar {
     /// accepted; the Contacts stored afterwards emit their own events.
     pub fn clear_bindings(&self, aor: &str) {
         let primary = self.resolve_alias(aor);
-        let removed = self
-            .bindings
-            .remove(primary.as_str())
-            .map(|(_, contacts)| contacts);
-        self.release_cleared(&primary, removed);
+        let (removed, sequence) = self.take_bindings(primary.as_str());
+        self.release_cleared(&primary, removed, sequence);
     }
 
     /// Evict all connection-oriented contacts (TCP/TLS/WS/WSS) from the registrar.
@@ -981,6 +1016,7 @@ impl Registrar {
         for aor in aors {
             let before;
             let after;
+            let mut snapshot = None;
 
             if let Some(mut entry) = self.bindings.get_mut(&aor) {
                 before = entry.value().len();
@@ -1009,6 +1045,14 @@ impl Registrar {
                     indexed,
                     self.contact_index.keys_of(entry.value()),
                 );
+                if before != after {
+                    let stored: Vec<backend::StoredContact> = entry
+                        .value()
+                        .iter()
+                        .map(backend::StoredContact::from_contact)
+                        .collect();
+                    snapshot = Some((stored, self.write_sequence()));
+                }
             } else {
                 continue;
             }
@@ -1020,29 +1064,20 @@ impl Registrar {
             evicted += before - after;
 
             if after == 0 {
-                // All contacts were connection-oriented — remove the AoR.
-                self.bindings.remove(&aor);
-                if let Some(writer) = self.backend_writer.get() {
-                    writer.remove(&aor);
-                }
+                // All contacts were connection-oriented — remove the AoR,
+                // unless a save refilled it since.
+                self.bindings
+                    .remove_if(&aor, |_, contacts| contacts.is_empty());
                 if let Some(metrics) = crate::metrics::try_metrics() {
                     metrics.registrations_active.dec();
                 }
-                self.emit_event(RegistrationEvent::Deregistered { aor });
-            } else {
-                // Mixed: write back surviving contacts to backend.
-                if let Some(writer) = self.backend_writer.get() {
-                    if let Some(entry) = self.bindings.get(&aor) {
-                        let stored: Vec<backend::StoredContact> = entry
-                            .value()
-                            .iter()
-                            .map(backend::StoredContact::from_contact)
-                            .collect();
-                        writer.save(&aor, stored);
-                    }
-                }
-                self.emit_event(RegistrationEvent::Deregistered { aor });
             }
+            // An emptied snapshot writes as a removal; a mixed one writes back
+            // the surviving contacts.
+            if let Some((stored, sequence)) = snapshot {
+                self.persist_aor(&aor, stored, sequence);
+            }
+            self.emit_event(RegistrationEvent::Deregistered { aor });
         }
 
         for token in &tokens_to_remove {
@@ -1391,13 +1426,14 @@ impl Registrar {
                 .collect();
             let aor_owned = aor.to_string();
             let aor_empty = contacts.is_empty();
+            let sequence = self.write_sequence();
+            drop(entry);
             if aor_empty {
-                drop(entry);
-                self.bindings.remove(aor);
-            } else {
-                drop(entry);
+                // Unless a save refilled it since the entry was released.
+                self.bindings
+                    .remove_if(aor, |_, contacts| contacts.is_empty());
             }
-            self.persist_aor(&aor_owned, stored);
+            self.persist_aor(&aor_owned, stored, sequence);
             return Ok(true);
         }
 
@@ -1454,8 +1490,9 @@ impl Registrar {
             .map(backend::StoredContact::from_contact)
             .collect();
         let aor_owned = aor.to_string();
+        let sequence = self.write_sequence();
         drop(entry);
-        self.persist_aor(&aor_owned, stored);
+        self.persist_aor(&aor_owned, stored, sequence);
         Ok(true)
     }
 
@@ -1747,6 +1784,7 @@ impl Registrar {
             let stored: Vec<backend::StoredContact>;
             let emptied: bool;
             let changed: bool;
+            let sequence;
             {
                 let mut entry = match self.bindings.get_mut(&aor) {
                     Some(entry) => entry,
@@ -1805,9 +1843,12 @@ impl Registrar {
                     .iter()
                     .map(backend::StoredContact::from_contact)
                     .collect();
+                sequence = self.write_sequence();
             }
             if emptied {
-                self.bindings.remove(&aor);
+                // Unless a save refilled it since the entry was released.
+                self.bindings
+                    .remove_if(&aor, |_, contacts| contacts.is_empty());
                 emptied_count += 1;
             }
             // Only write through / announce a deregistration when a binding was
@@ -1817,7 +1858,7 @@ impl Registrar {
             // event — otherwise a benign flow recovery would look like a
             // deregistration to watchers and the backend.
             if changed || emptied {
-                self.persist_aor(&aor, stored);
+                self.persist_aor(&aor, stored, sequence);
                 deregistered.push(aor);
             }
         }
@@ -2064,7 +2105,8 @@ impl Registrar {
             }
         }
         for aor in &empty_aors {
-            self.bindings.remove(aor);
+            self.bindings
+                .remove_if(aor, |_, contacts| contacts.is_empty());
             // The auxiliary state follows the binding. Note this drops it from
             // memory without telling the backend, which is the same thing this
             // sweep does with the binding itself: a lookup is L1-only, so "this
