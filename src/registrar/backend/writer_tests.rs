@@ -320,7 +320,8 @@ async fn writes_during_an_outage_drain_once_the_backend_recovers() {
     let backend = SlowBackend::new(Arc::clone(&store), Duration::from_millis(1));
     let down = Arc::clone(&backend.down);
     let registrar = Registrar::default();
-    registrar.set_backend_writer(spawn_backend_writer(backend));
+    let writer = spawn_backend_writer(backend);
+    registrar.set_backend_writer(writer.clone());
 
     down.store(true, Ordering::SeqCst);
     for index in 0..200 {
@@ -335,10 +336,24 @@ async fn writes_during_an_outage_drain_once_the_backend_recovers() {
         store.all_aors().await.expect("aors").is_empty(),
         "nothing reaches a backend that is down"
     );
+    // What the oldest-pending gauge reports (wall-clock, so not the paused
+    // test clock): non-zero while the writes are stuck.
+    assert!(writer.oldest_pending() > Duration::ZERO);
 
     down.store(false, Ordering::SeqCst);
     converged(&*store, &registrar).await;
     assert_eq!(store.all_aors().await.expect("aors").len(), 150);
+    for _ in 0..100 {
+        if writer.pending_writes() == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        writer.oldest_pending(),
+        Duration::ZERO,
+        "the gauge drops back"
+    );
 }
 
 /// The per-module leak gate: after complete save/de-register cycles the

@@ -164,6 +164,9 @@ struct Shared<K, W> {
     closed: AtomicBool,
     /// The last [`WriteSequence`] handed out.
     sequence: AtomicU64,
+    /// When the oldest write still pending at the drainer's last pass first
+    /// fell behind: what the oldest-pending gauge reports.
+    oldest_published: Mutex<Option<Instant>>,
     #[cfg(test)]
     hook: std::sync::OnceLock<EnqueueHook>,
 }
@@ -215,6 +218,7 @@ pub(crate) fn queue<K, W: QueuedWrite>(kind: QueueKind) -> (QueueHandle<K, W>, D
         held: AtomicUsize::new(0),
         closed: AtomicBool::new(false),
         sequence: AtomicU64::new(0),
+        oldest_published: Mutex::new(None),
         #[cfg(test)]
         hook: std::sync::OnceLock::new(),
     });
@@ -305,6 +309,17 @@ impl<K: Eq + Hash, W: QueuedWrite> QueueHandle<K, W> {
             let held = self.shared.held.load(Ordering::Relaxed);
             metrics.depth.set(depth.saturating_add(held) as i64);
         }
+    }
+
+    /// How long the oldest pending write has waited, as of the drainer's last
+    /// pass: what the oldest-pending gauge reports. Zero when caught up.
+    #[cfg(test)]
+    pub(crate) fn oldest_pending(&self) -> Duration {
+        self.shared
+            .oldest_published
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .map_or(Duration::ZERO, |since| since.elapsed())
     }
 
     /// Keys whose latest write has not been applied yet, waiting or in flight.
@@ -534,9 +549,6 @@ where
 
     /// The pending count and the age of the oldest pending write.
     fn publish(&self) {
-        let Some(metrics) = self.shared.kind.metrics() else {
-            return;
-        };
         let (waiting, shared_oldest) = {
             let pending = self.shared.pending();
             (pending.writes.len(), pending.oldest)
@@ -549,6 +561,14 @@ where
             .map(|held| held.since)
             .chain(shared_oldest)
             .min();
+        *self
+            .shared
+            .oldest_published
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = oldest;
+        let Some(metrics) = self.shared.kind.metrics() else {
+            return;
+        };
         metrics
             .depth
             .set(waiting.saturating_add(self.backlog.len()) as i64);

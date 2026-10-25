@@ -538,6 +538,8 @@ impl Default for RedisBackendConfig {
 pub const DEFAULT_MAX_BINDING_LIFETIME_SECS: u64 = 7200;
 
 #[cfg(feature = "redis-backend")]
+pub(crate) mod redis_link;
+#[cfg(feature = "redis-backend")]
 mod redis_store;
 #[cfg(feature = "redis-backend")]
 pub use redis_store::RedisBackend;
@@ -731,6 +733,10 @@ impl RegistrarBackend for PostgresBackend {
 // ---------------------------------------------------------------------------
 
 pub(crate) mod coalesce;
+#[cfg(all(test, any(feature = "redis-backend", feature = "postgres-backend")))]
+pub(crate) mod link_cutter;
+#[cfg(all(test, any(feature = "redis-backend", feature = "postgres-backend")))]
+mod reconnect_tests;
 mod writer;
 
 pub use coalesce::WriteSequence;

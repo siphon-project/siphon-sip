@@ -42,7 +42,9 @@ async fn backend(url: &str, table: &str, max_lifetime: u64) -> PostgresBackend {
 }
 
 async fn rows(backend: &PostgresBackend, table: &str) -> i64 {
-    backend.clients[0]
+    backend
+        .first_client()
+        .await
         .query_one(&format!("SELECT COUNT(*) FROM {table}"), &[])
         .await
         .expect("count rows")
@@ -50,7 +52,9 @@ async fn rows(backend: &PostgresBackend, table: &str) -> i64 {
 }
 
 async fn drop_tables(backend: &PostgresBackend, table: &str) {
-    backend.clients[0]
+    backend
+        .first_client()
+        .await
         .batch_execute(&format!(
             "DROP TABLE IF EXISTS {table}; DROP TABLE IF EXISTS {table}_aor_state;"
         ))
@@ -223,7 +227,9 @@ async fn a_batch_the_server_refuses_in_part_still_applies_the_rest() {
     let table = unique_table("batch_fallback");
     let backend = backend(&url, &table, 7200).await;
     // Every state write now fails; binding writes do not.
-    backend.clients[0]
+    backend
+        .first_client()
+        .await
         .batch_execute(&format!("DROP TABLE {table}_aor_state"))
         .await
         .expect("drop the state table");
