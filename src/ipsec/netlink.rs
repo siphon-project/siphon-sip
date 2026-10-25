@@ -29,12 +29,28 @@
 //! `ipsec/mod.rs`, so no inner `#![cfg]` is needed here.
 
 use std::collections::HashMap;
-use std::io;
 use std::net::IpAddr;
 
-use netlink_sys::{protocols::NETLINK_XFRM, Socket, SocketAddr};
+use super::{EncryptionAlgorithm, IntegrityAlgorithm, IpsecError, PolicyDir};
 
-use super::{EncryptionAlgorithm, IntegrityAlgorithm, IpsecError};
+/// The fixed pool of threads that carry every XFRM netlink exchange.
+mod worker;
+pub(crate) use worker::XfrmWorkers;
+/// The kernel pool's worker count.
+#[cfg(test)]
+pub(crate) fn worker_count() -> usize {
+    worker::WORKER_COUNT
+}
+
+/// The kernel pool's queue capacity.
+#[cfg(test)]
+pub(crate) fn queue_capacity() -> usize {
+    worker::QUEUE_CAPACITY
+}
+
+/// A fake `NETLINK_XFRM` socket for the worker tests.
+#[cfg(test)]
+pub(crate) mod fake_kernel;
 
 // ---------------------------------------------------------------------------
 // XFRM constants — values taken verbatim from `/usr/include/linux/xfrm.h`.
@@ -458,16 +474,15 @@ fn xfrm_enc_name(ealg: EncryptionAlgorithm) -> &'static str {
 // Public backend API.
 // ---------------------------------------------------------------------------
 
-/// Add an IPsec SA via XFRM netlink.  Returns `Ok(())` on kernel ack,
-/// `Err(IpsecError::Command(...))` on netlink/kernel failure (parsed
-/// errno included in the error message).
+/// The `XFRM_MSG_NEWSA` message adding an IPsec SA (`NLM_F_EXCL`: an SA
+/// already under `(destination, spi)` fails with `EEXIST`).
 ///
 /// `selector_proto` is the upper-layer protocol number stamped into the
 /// XFRM selector — typically `IPPROTO_UDP` (17) for ESP-over-UDP IMS
 /// IPsec, or `IPPROTO_TCP` (6) for ESP-over-TCP (TS 33.203 §7.1).  The
 /// kernel only applies this SA to inner-protocol frames matching the
 /// selector, so a UDP-pinned selector silently drops TCP IPsec frames.
-pub async fn add_sa(
+pub(crate) fn add_sa_message(
     source: &IpAddr,
     source_port: u16,
     destination: &IpAddr,
@@ -479,7 +494,7 @@ pub async fn add_sa(
     integrity_key: &[u8],
     selector_proto: u8,
     hard_lifetime_secs: Option<u64>,
-) -> Result<(), IpsecError> {
+) -> Vec<u8> {
     let mut payload = Vec::with_capacity(256);
     encode_xfrm_usersa_info(
         source,
@@ -506,10 +521,10 @@ pub async fn add_sa(
         push_nla(&mut payload, XFRMA_ALG_CRYPT, &enc_attr);
     }
 
-    send_and_ack(XFRM_MSG_NEWSA, NLM_F_CREATE | NLM_F_EXCL, &payload).await
+    frame(XFRM_MSG_NEWSA, NLM_F_CREATE | NLM_F_EXCL, &payload)
 }
 
-/// Update an existing IPsec SA via XFRM netlink (`XFRM_MSG_UPDSA`).
+/// The `XFRM_MSG_UPDSA` message updating an existing IPsec SA.
 ///
 /// Re-installs the SA's mutable fields (lifetime, replay window) without
 /// disturbing keys, SPIs, selectors, or `add_time` — the kernel keys the
@@ -525,7 +540,7 @@ pub async fn add_sa(
 /// `integrity_key` / `encryption_key` change between install and update,
 /// the kernel rekeys the SA mid-flight (correct behaviour, but rarely
 /// what scripts intend).
-pub async fn update_sa(
+pub(crate) fn update_sa_message(
     source: &IpAddr,
     source_port: u16,
     destination: &IpAddr,
@@ -537,7 +552,7 @@ pub async fn update_sa(
     integrity_key: &[u8],
     selector_proto: u8,
     hard_lifetime_secs: Option<u64>,
-) -> Result<(), IpsecError> {
+) -> Vec<u8> {
     let mut payload = Vec::with_capacity(256);
     encode_xfrm_usersa_info(
         source,
@@ -564,17 +579,18 @@ pub async fn update_sa(
 
     // No NLM_F_CREATE / NLM_F_EXCL — UPDSA targets an existing SA;
     // requesting create-exclusive against a known SPI yields EEXIST.
-    send_and_ack(XFRM_MSG_UPDSA, 0, &payload).await
+    frame(XFRM_MSG_UPDSA, 0, &payload)
 }
 
-/// Delete an IPsec SA via XFRM netlink.
-pub async fn del_sa(daddr: &IpAddr, spi: u32) -> Result<(), IpsecError> {
+/// The `XFRM_MSG_DELSA` message deleting an IPsec SA.
+pub(crate) fn del_sa_message(daddr: &IpAddr, spi: u32) -> Vec<u8> {
     let mut payload = Vec::with_capacity(32);
     encode_xfrm_usersa_id(daddr, spi, &mut payload);
-    send_and_ack(XFRM_MSG_DELSA, 0, &payload).await
+    frame(XFRM_MSG_DELSA, 0, &payload)
 }
 
-/// Add an IPsec policy via XFRM netlink.
+/// The message adding an IPsec policy (`XFRM_MSG_NEWPOLICY`, or
+/// `XFRM_MSG_UPDPOLICY` with `replace`).
 ///
 /// `selector_proto` must match the corresponding SA's selector, otherwise
 /// the kernel will not bind the SA template to incoming/outgoing packets.
@@ -590,7 +606,7 @@ pub async fn del_sa(daddr: &IpAddr, spi: u32) -> Result<(), IpsecError> {
 ///
 /// `replace` sends `XFRM_MSG_UPDPOLICY` (add or replace, lifetime from now)
 /// instead of an exclusive `XFRM_MSG_NEWPOLICY`.
-pub async fn add_policy(
+pub(crate) fn add_policy_message(
     source: &IpAddr,
     source_port: u16,
     destination: &IpAddr,
@@ -600,7 +616,7 @@ pub async fn add_policy(
     selector_proto: u8,
     hard_lifetime_secs: Option<u64>,
     replace: bool,
-) -> Result<(), IpsecError> {
+) -> Vec<u8> {
     let payload = policy_payload(
         source,
         source_port,
@@ -612,9 +628,9 @@ pub async fn add_policy(
         hard_lifetime_secs,
     );
     if replace {
-        send_and_ack(XFRM_MSG_UPDPOLICY, 0, &payload).await
+        frame(XFRM_MSG_UPDPOLICY, 0, &payload)
     } else {
-        send_and_ack(XFRM_MSG_NEWPOLICY, NLM_F_CREATE | NLM_F_EXCL, &payload).await
+        frame(XFRM_MSG_NEWPOLICY, NLM_F_CREATE | NLM_F_EXCL, &payload)
     }
 }
 
@@ -647,19 +663,19 @@ fn policy_payload(
     payload
 }
 
-/// Delete an IPsec policy via XFRM netlink.
+/// The `XFRM_MSG_DELPOLICY` message deleting an IPsec policy.
 ///
 /// `selector_proto` must match the value used at policy install time; the
 /// kernel keys policies on the full selector tuple including the
 /// upper-layer protocol number.
-pub async fn del_policy(
+pub(crate) fn del_policy_message(
     source: &IpAddr,
     source_port: u16,
     destination: &IpAddr,
     destination_port: u16,
     direction: PolicyDirection,
     selector_proto: u8,
-) -> Result<(), IpsecError> {
+) -> Vec<u8> {
     let mut payload = Vec::with_capacity(96);
     encode_xfrm_userpolicy_id(
         source,
@@ -670,7 +686,7 @@ pub async fn del_policy(
         selector_proto,
         &mut payload,
     );
-    send_and_ack(XFRM_MSG_DELPOLICY, 0, &payload).await
+    frame(XFRM_MSG_DELPOLICY, 0, &payload)
 }
 
 /// Direction parameter for policies (in/out).
@@ -689,14 +705,145 @@ impl PolicyDirection {
     }
 }
 
+impl From<PolicyDir> for PolicyDirection {
+    fn from(direction: PolicyDir) -> Self {
+        match direction {
+            PolicyDir::In => PolicyDirection::In,
+            PolicyDir::Out => PolicyDirection::Out,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
-// Send + ack — common dispatch path used by all four operations.
+// The operations on the process's kernel pool. `IpsecManager` builds the same
+// messages and hands them to its own pool (the kernel's outside tests).
+// ---------------------------------------------------------------------------
+
+/// Add an IPsec SA ([`add_sa_message`]) and wait for the kernel's ack.
+pub async fn add_sa(
+    source: &IpAddr,
+    source_port: u16,
+    destination: &IpAddr,
+    destination_port: u16,
+    spi: u32,
+    ealg: EncryptionAlgorithm,
+    aalg: IntegrityAlgorithm,
+    encryption_key: &[u8],
+    integrity_key: &[u8],
+    selector_proto: u8,
+    hard_lifetime_secs: Option<u64>,
+) -> Result<(), IpsecError> {
+    let message = add_sa_message(
+        source,
+        source_port,
+        destination,
+        destination_port,
+        spi,
+        ealg,
+        aalg,
+        encryption_key,
+        integrity_key,
+        selector_proto,
+        hard_lifetime_secs,
+    );
+    XfrmWorkers::kernel().acknowledge_one(message).await
+}
+
+/// Update an existing IPsec SA ([`update_sa_message`]) and wait for the ack.
+pub async fn update_sa(
+    source: &IpAddr,
+    source_port: u16,
+    destination: &IpAddr,
+    destination_port: u16,
+    spi: u32,
+    ealg: EncryptionAlgorithm,
+    aalg: IntegrityAlgorithm,
+    encryption_key: &[u8],
+    integrity_key: &[u8],
+    selector_proto: u8,
+    hard_lifetime_secs: Option<u64>,
+) -> Result<(), IpsecError> {
+    let message = update_sa_message(
+        source,
+        source_port,
+        destination,
+        destination_port,
+        spi,
+        ealg,
+        aalg,
+        encryption_key,
+        integrity_key,
+        selector_proto,
+        hard_lifetime_secs,
+    );
+    XfrmWorkers::kernel().acknowledge_one(message).await
+}
+
+/// Delete an IPsec SA ([`del_sa_message`]) and wait for the ack.
+pub async fn del_sa(daddr: &IpAddr, spi: u32) -> Result<(), IpsecError> {
+    XfrmWorkers::kernel()
+        .acknowledge_one(del_sa_message(daddr, spi))
+        .await
+}
+
+/// Add or replace an IPsec policy ([`add_policy_message`]) and wait for the
+/// ack.
+pub async fn add_policy(
+    source: &IpAddr,
+    source_port: u16,
+    destination: &IpAddr,
+    destination_port: u16,
+    direction: PolicyDirection,
+    spi: u32,
+    selector_proto: u8,
+    hard_lifetime_secs: Option<u64>,
+    replace: bool,
+) -> Result<(), IpsecError> {
+    let message = add_policy_message(
+        source,
+        source_port,
+        destination,
+        destination_port,
+        direction,
+        spi,
+        selector_proto,
+        hard_lifetime_secs,
+        replace,
+    );
+    XfrmWorkers::kernel().acknowledge_one(message).await
+}
+
+/// Delete an IPsec policy ([`del_policy_message`]) and wait for the ack.
+pub async fn del_policy(
+    source: &IpAddr,
+    source_port: u16,
+    destination: &IpAddr,
+    destination_port: u16,
+    direction: PolicyDirection,
+    selector_proto: u8,
+) -> Result<(), IpsecError> {
+    let message = del_policy_message(
+        source,
+        source_port,
+        destination,
+        destination_port,
+        direction,
+        selector_proto,
+    );
+    XfrmWorkers::kernel().acknowledge_one(message).await
+}
+
+// ---------------------------------------------------------------------------
+// Framing + dispatch. Every operation is one netlink message with `NLM_F_ACK`,
+// handed to the fixed worker pool (see `worker`), which stamps its sequence
+// number and matches the kernel's ack to it.
 // ---------------------------------------------------------------------------
 
 const NLMSG_HDR_LEN: usize = 16;
 
-async fn send_and_ack(msg_type: u16, extra_flags: u16, payload: &[u8]) -> Result<(), IpsecError> {
-    // Build the netlink message: header (16 B) + payload, padded to 4 B.
+/// One netlink request: header (16 B, sequence 0 until a worker stamps it,
+/// pid 0 for the kernel to fill in) + payload, padded to 4 B.
+fn frame(msg_type: u16, extra_flags: u16, payload: &[u8]) -> Vec<u8> {
     let total_len = NLMSG_HDR_LEN + payload.len();
     let aligned_len = align_to(total_len, NLMSG_ALIGNTO);
     let mut buffer = Vec::with_capacity(aligned_len);
@@ -707,85 +854,8 @@ async fn send_and_ack(msg_type: u16, extra_flags: u16, payload: &[u8]) -> Result
     buffer.extend_from_slice(&0u32.to_ne_bytes()); // seq
     buffer.extend_from_slice(&0u32.to_ne_bytes()); // pid (kernel fills in)
     buffer.extend_from_slice(payload);
-    while buffer.len() < aligned_len {
-        buffer.push(0);
-    }
-
-    let buffer_len = buffer.len();
-
-    // The actual socket I/O is blocking; offload it to a tokio blocking
-    // pool so we don't stall the dispatcher.  XFRM operations are slow
-    // enough (~ms) that this is the right shape regardless.
-    let result = tokio::task::spawn_blocking(move || -> io::Result<()> {
-        let socket = Socket::new(NETLINK_XFRM)?;
-        let kernel_addr = SocketAddr::new(0, 0);
-        socket.connect(&kernel_addr)?;
-        let bytes_sent = socket.send(&buffer, 0)?;
-        if bytes_sent != buffer_len {
-            return Err(io::Error::other(format!(
-                "netlink: short send ({}/{})",
-                bytes_sent, buffer_len
-            )));
-        }
-        // Read the ack.  4 KiB is plenty for an XFRM ack.
-        let mut response = vec![0u8; 4096];
-        let bytes_received = socket.recv(&mut &mut response[..], 0)?;
-        parse_ack(&response[..bytes_received])
-    })
-    .await;
-
-    match result {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(error)) => Err(IpsecError::Command(format!("xfrm netlink: {error}"))),
-        Err(join_error) => Err(IpsecError::Command(format!(
-            "xfrm netlink task panic: {join_error}"
-        ))),
-    }
-}
-
-/// Parse a netlink ack reply.  Looks for an `NLMSG_ERROR` carrying
-/// errno 0 (success) or a non-zero kernel error.  Other message types
-/// in the response stream are silently ignored — XFRM acks always
-/// include exactly one NLMSG_ERROR.
-fn parse_ack(buffer: &[u8]) -> io::Result<()> {
-    let mut offset = 0;
-    while offset + NLMSG_HDR_LEN <= buffer.len() {
-        let len = u32::from_ne_bytes([
-            buffer[offset],
-            buffer[offset + 1],
-            buffer[offset + 2],
-            buffer[offset + 3],
-        ]) as usize;
-        let msg_type = u16::from_ne_bytes([buffer[offset + 4], buffer[offset + 5]]);
-        if len < NLMSG_HDR_LEN || offset + len > buffer.len() {
-            return Err(io::Error::other("netlink: malformed reply"));
-        }
-        match msg_type {
-            NLMSG_ERROR => {
-                if len < NLMSG_HDR_LEN + 4 {
-                    return Err(io::Error::other("netlink: short NLMSG_ERROR"));
-                }
-                let error = i32::from_ne_bytes([
-                    buffer[offset + NLMSG_HDR_LEN],
-                    buffer[offset + NLMSG_HDR_LEN + 1],
-                    buffer[offset + NLMSG_HDR_LEN + 2],
-                    buffer[offset + NLMSG_HDR_LEN + 3],
-                ]);
-                if error == 0 {
-                    return Ok(());
-                }
-                return Err(io::Error::from_raw_os_error(-error));
-            }
-            NLMSG_DONE => return Ok(()),
-            _ => {
-                // Skip — likely a multipart fragment.
-            }
-        }
-        offset += align_to(len, NLMSG_ALIGNTO);
-    }
-    Err(io::Error::other(
-        "netlink: no NLMSG_ERROR / NLMSG_DONE in reply",
-    ))
+    buffer.resize(aligned_len, 0);
+    buffer
 }
 
 // ---------------------------------------------------------------------------
@@ -805,89 +875,7 @@ fn parse_ack(buffer: &[u8]) -> io::Result<()> {
 /// reuses the map across every UE binding in a liveness sweep instead of
 /// querying per-SA.
 pub async fn dump_sa_use_times() -> Result<HashMap<u32, u64>, IpsecError> {
-    let result = tokio::task::spawn_blocking(move || -> io::Result<HashMap<u32, u64>> {
-        let socket = Socket::new(NETLINK_XFRM)?;
-        let kernel_addr = SocketAddr::new(0, 0);
-        socket.connect(&kernel_addr)?;
-
-        // Header-only GETSA dump request: no XFRMA_ADDRESS_FILTER attribute,
-        // so the kernel dumps every SA.
-        let mut request = Vec::with_capacity(NLMSG_HDR_LEN);
-        request.extend_from_slice(&(NLMSG_HDR_LEN as u32).to_ne_bytes()); // nlmsg_len
-        request.extend_from_slice(&XFRM_MSG_GETSA.to_ne_bytes());
-        request.extend_from_slice(&(NLM_F_REQUEST | NLM_F_DUMP).to_ne_bytes());
-        request.extend_from_slice(&0u32.to_ne_bytes()); // seq
-        request.extend_from_slice(&0u32.to_ne_bytes()); // pid (kernel fills in)
-        let sent = socket.send(&request, 0)?;
-        if sent != request.len() {
-            return Err(io::Error::other(format!(
-                "netlink: short send ({}/{})",
-                sent,
-                request.len()
-            )));
-        }
-
-        let mut use_times: HashMap<u32, u64> = HashMap::new();
-        let mut response = vec![0u8; 64 * 1024];
-        'recv: loop {
-            let received = socket.recv(&mut &mut response[..], 0)?;
-            if received == 0 {
-                break;
-            }
-            let mut offset = 0usize;
-            while offset + NLMSG_HDR_LEN <= received {
-                let len = u32::from_ne_bytes([
-                    response[offset],
-                    response[offset + 1],
-                    response[offset + 2],
-                    response[offset + 3],
-                ]) as usize;
-                let msg_type = u16::from_ne_bytes([response[offset + 4], response[offset + 5]]);
-                if len < NLMSG_HDR_LEN || offset + len > received {
-                    return Err(io::Error::other("netlink: malformed dump reply"));
-                }
-                match msg_type {
-                    NLMSG_DONE => break 'recv,
-                    NLMSG_ERROR => {
-                        let errno = if len >= NLMSG_HDR_LEN + 4 {
-                            i32::from_ne_bytes([
-                                response[offset + NLMSG_HDR_LEN],
-                                response[offset + NLMSG_HDR_LEN + 1],
-                                response[offset + NLMSG_HDR_LEN + 2],
-                                response[offset + NLMSG_HDR_LEN + 3],
-                            ])
-                        } else {
-                            0
-                        };
-                        if errno != 0 {
-                            return Err(io::Error::from_raw_os_error(-errno));
-                        }
-                        break 'recv; // errno 0 terminates the dump
-                    }
-                    XFRM_MSG_NEWSA => {
-                        let body = offset + NLMSG_HDR_LEN;
-                        if let Some((spi, last_active)) =
-                            parse_sa_use_time(&response[body..offset + len])
-                        {
-                            use_times.insert(spi, last_active);
-                        }
-                    }
-                    _ => {}
-                }
-                offset += align_to(len, NLMSG_ALIGNTO);
-            }
-        }
-        Ok(use_times)
-    })
-    .await;
-
-    match result {
-        Ok(Ok(map)) => Ok(map),
-        Ok(Err(error)) => Err(IpsecError::Command(format!("xfrm GETSA dump: {error}"))),
-        Err(join_error) => Err(IpsecError::Command(format!(
-            "xfrm GETSA dump task panic: {join_error}"
-        ))),
-    }
+    XfrmWorkers::kernel().dump_sa_use_times().await
 }
 
 /// Extract `(spi, last_active_secs)` from a `struct xfrm_usersa_info` body

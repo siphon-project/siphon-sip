@@ -487,7 +487,8 @@ impl IpsecManager {
         }
         #[cfg(target_os = "linux")]
         {
-            super::netlink::dump_sa_use_times()
+            self.xfrm()
+                .dump_sa_use_times()
                 .await
                 .map(|use_times| use_times.into_keys().collect())
         }
