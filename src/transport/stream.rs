@@ -200,6 +200,12 @@ async fn send_via_pool(
                     "{transport} outbound: sent via pool"
                 );
             }
+            // The pool counted and logged it, once per window, and every
+            // frame after it would fail the same way.
+            Err(error) if crate::transport::pool::is_destination_down(&error) => {
+                debug!(destination = %destination, "{transport} outbound dropped: {error}");
+                return;
+            }
             Err(error) => {
                 // A response has no retransmission of its own on a stream
                 // transport, so name the transaction that just lost it.
@@ -1430,6 +1436,57 @@ mod tests {
             !lanes.dispatch(fallback_message(destination)),
             "a send past the lane's bound must be shed"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_full_lane_behind_a_blackholed_peer_drains_in_about_one_connect_timeout() {
+        // The field failure: a peer slow to accept, a full lane of responses
+        // behind its connect. Each queued response used to run its own
+        // connect timeout, so the lane took 64 timeouts to drain and shed
+        // everything new meanwhile. Now the first pays the timeout, the rest
+        // fail at once, and a send after the backoff window connects again.
+        use crate::transport::pool::fail_fast_tests::{
+            blackholed_peer, pool, start_accepting, watchdog, CONNECT_TIMEOUT,
+        };
+        let _watchdog =
+            watchdog("a_full_lane_behind_a_blackholed_peer_drains_in_about_one_connect_timeout");
+        let Some((peer, _held, listener)) = blackholed_peer() else {
+            eprintln!("kernel completes connects past a full accept queue; nothing to show");
+            return;
+        };
+        let pool = Arc::new(pool());
+        let send = pool_fallback_send(Arc::clone(&pool), Transport::Tcp, |_| false);
+        let mut lanes = FallbackLanes::new(send, Duration::from_millis(50));
+        let started = std::time::Instant::now();
+        for _ in 0..FALLBACK_LANE_CAPACITY {
+            assert!(lanes.dispatch(fallback_message(peer)));
+        }
+        let drained = tokio::time::timeout(Duration::from_secs(3), async {
+            while lanes.len() != 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        let elapsed = started.elapsed();
+        eprintln!("a full lane to a blackholed peer drained in {elapsed:?}");
+        assert!(
+            drained.is_ok() && elapsed < CONNECT_TIMEOUT * 3,
+            "a lane of {FALLBACK_LANE_CAPACITY} sends to a blackholed peer took {elapsed:?} \
+             (or more than 3 s) to drain, one connect timeout is {CONNECT_TIMEOUT:?}"
+        );
+
+        // The peer catches up; once the window has passed a send connects.
+        let accepted = start_accepting(listener);
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        assert!(lanes.dispatch(fallback_message(peer)));
+        let connected = tokio::time::timeout(Duration::from_secs(3), async {
+            while !pool.has_live(peer, Transport::Tcp) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(connected.is_ok(), "the send after the window must connect");
+        assert!(accepted.load(std::sync::atomic::Ordering::SeqCst) >= 1);
     }
 
     const INVITE: &[u8] = concat!(
